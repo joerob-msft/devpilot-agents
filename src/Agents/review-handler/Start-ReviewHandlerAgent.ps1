@@ -707,7 +707,14 @@ if (-not $OperatorAlias -or $OperatorAlias.Trim() -eq "") {
         $OperatorAlias = [string]$operatorCfg.Value.defaultAlias
     }
 }
-if (-not $OperatorAlias -or $OperatorAlias.Trim() -eq "") { throw "-OperatorAlias is required (the PR-author alias to monitor)." }
+if (-not $OperatorAlias -or $OperatorAlias.Trim() -eq "") {
+    # -DryRun is offline and alias-independent: the self-checks that exercise
+    # alias-sensitive logic pin their own alias explicitly. Requiring one here
+    # would force a consumer to name an individual in a checked-in config just
+    # to validate an install.
+    if ($DryRun) { $OperatorAlias = 'operator' }
+    else { throw "-OperatorAlias is required (the PR-author alias to monitor)." }
+}
 if ($OperatorAlias -notmatch '^[A-Za-z0-9._-]+$') { throw "-OperatorAlias '$OperatorAlias' is not a safe alias." }
 
 # Resolve model (override validated the same way as config; never trusted).
