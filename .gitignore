@@ -1,0 +1,16 @@
+# PowerShell / module build output
+*.nupkg
+output/
+
+# Agent runtime state must never be committed: it contains repository
+# identifiers, PR numbers, and per-cycle activity logs.
+state/
+*.log.jsonl
+failed-cycles/
+
+# Editors / OS
+.vs/
+.vscode/
+*.user
+.DS_Store
+Thumbs.db

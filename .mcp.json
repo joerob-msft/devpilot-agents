@@ -1,0 +1,17 @@
+{
+  "_comment": "MCP servers used by the agents in this repository. All are agency-wrapped, matching the approved baseline. A CONSUMING repository must declare the servers its own agent config's allow-list references — the agents fail closed at startup if one is missing, because Copilot would otherwise start normally with the model holding none of those tools and every cycle would silently produce no result.",
+  "mcpServers": {
+    "ado": {
+      "type": "local",
+      "command": "agency",
+      "args": ["mcp", "ado"],
+      "tools": ["*"]
+    },
+    "bluebird": {
+      "type": "local",
+      "command": "agency",
+      "args": ["mcp", "bluebird", "--branch", "main"],
+      "tools": ["*"]
+    }
+  }
+}

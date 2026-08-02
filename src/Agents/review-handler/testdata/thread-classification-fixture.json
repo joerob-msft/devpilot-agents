@@ -1,0 +1,498 @@
+[
+  {
+    "id": 1001,
+    "status": "Unknown",
+    "lastUpdatedDate": "2026-07-28T19:13:47.08Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "Dana Operator",
+          "uniqueName": "operator@example.com"
+        },
+        "content": "(redacted)"
+      }
+    ]
+  },
+  {
+    "id": 1002,
+    "status": "Fixed",
+    "lastUpdatedDate": "2026-07-29T03:03:35.297Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "GitOps (Git LowPriv)",
+          "uniqueName": ""
+        },
+        "content": "(redacted)"
+      },
+      {
+        "id": 2,
+        "author": {
+          "displayName": "Dana Operator",
+          "uniqueName": "operator@example.com"
+        },
+        "content": "(redacted)"
+      },
+      {
+        "id": 3,
+        "author": {
+          "displayName": "Dana Operator",
+          "uniqueName": "operator@example.com"
+        },
+        "content": "(redacted)"
+      }
+    ],
+    "threadContext": {
+      "filePath": "/src/Deployment/ArmTemplates/Scripts/Helpers/ParityHarness.psm1"
+    }
+  },
+  {
+    "id": 1003,
+    "status": "Fixed",
+    "lastUpdatedDate": "2026-07-28T20:02:15.82Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "GitOps (Git LowPriv)",
+          "uniqueName": ""
+        },
+        "content": "(redacted)"
+      },
+      {
+        "id": 2,
+        "author": {
+          "displayName": "Dana Operator",
+          "uniqueName": "operator@example.com"
+        },
+        "content": "(redacted)"
+      }
+    ],
+    "threadContext": {
+      "filePath": "/src/Deployment/ArmTemplates/Scripts/Helpers/ParityHarness.psm1"
+    }
+  },
+  {
+    "id": 1004,
+    "status": "Closed",
+    "lastUpdatedDate": "2026-07-28T19:19:42.02Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "GitOps (Git LowPriv)",
+          "uniqueName": ""
+        },
+        "content": "(redacted)"
+      }
+    ]
+  },
+  {
+    "id": 1005,
+    "status": "Unknown",
+    "lastUpdatedDate": "2026-07-28T19:25:27.467Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "Microsoft.VisualStudio.Services.TFS",
+          "uniqueName": ""
+        },
+        "content": "(redacted)"
+      }
+    ]
+  },
+  {
+    "id": 1006,
+    "status": "Unknown",
+    "lastUpdatedDate": "2026-07-28T20:00:18.46Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "Microsoft.VisualStudio.Services.TFS",
+          "uniqueName": ""
+        },
+        "content": "(redacted)"
+      }
+    ]
+  },
+  {
+    "id": 1007,
+    "status": "Unknown",
+    "lastUpdatedDate": "2026-07-28T20:01:43.32Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "Microsoft.VisualStudio.Services.TFS",
+          "uniqueName": ""
+        },
+        "content": "(redacted)"
+      }
+    ]
+  },
+  {
+    "id": 1008,
+    "status": "Unknown",
+    "lastUpdatedDate": "2026-07-28T20:36:17.597Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "Microsoft.VisualStudio.Services.TFS",
+          "uniqueName": ""
+        },
+        "content": "(redacted)"
+      }
+    ]
+  },
+  {
+    "id": 1009,
+    "status": "Fixed",
+    "lastUpdatedDate": "2026-07-29T00:51:17.31Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "Sam Reviewer",
+          "uniqueName": "sam.reviewer@example.com"
+        },
+        "content": "(redacted)"
+      },
+      {
+        "id": 2,
+        "author": {
+          "displayName": "Dana Operator",
+          "uniqueName": "operator@example.com"
+        },
+        "content": "(redacted)"
+      }
+    ],
+    "threadContext": {
+      "filePath": "/src/Deployment/ArmTemplates/Scripts/Helpers/ParityHarness.psm1"
+    }
+  },
+  {
+    "id": 1010,
+    "status": "Fixed",
+    "lastUpdatedDate": "2026-07-29T00:52:04.32Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "Sam Reviewer",
+          "uniqueName": "sam.reviewer@example.com"
+        },
+        "content": "(redacted)"
+      },
+      {
+        "id": 2,
+        "author": {
+          "displayName": "Dana Operator",
+          "uniqueName": "operator@example.com"
+        },
+        "content": "(redacted)"
+      }
+    ],
+    "threadContext": {
+      "filePath": "/src/Deployment/ArmTemplates/Scripts/Helpers/ParityHarness.psm1"
+    }
+  },
+  {
+    "id": 1011,
+    "status": "Fixed",
+    "lastUpdatedDate": "2026-07-29T00:53:03.153Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "Sam Reviewer",
+          "uniqueName": "sam.reviewer@example.com"
+        },
+        "content": "(redacted)"
+      },
+      {
+        "id": 2,
+        "author": {
+          "displayName": "Dana Operator",
+          "uniqueName": "operator@example.com"
+        },
+        "content": "(redacted)"
+      }
+    ],
+    "threadContext": {
+      "filePath": "/src/Deployment/ArmTemplates/Scripts/Helpers/ParityHarness.psm1"
+    }
+  },
+  {
+    "id": 1012,
+    "status": "Fixed",
+    "lastUpdatedDate": "2026-07-29T00:54:15.79Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "Sam Reviewer",
+          "uniqueName": "sam.reviewer@example.com"
+        },
+        "content": "(redacted)"
+      },
+      {
+        "id": 2,
+        "author": {
+          "displayName": "Dana Operator",
+          "uniqueName": "operator@example.com"
+        },
+        "content": "(redacted)"
+      }
+    ],
+    "threadContext": {
+      "filePath": "/src/Deployment/ArmTemplates/Scripts/Helpers/ParityHarness.psm1"
+    }
+  },
+  {
+    "id": 1013,
+    "status": "Fixed",
+    "lastUpdatedDate": "2026-07-29T00:54:54.5Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "Sam Reviewer",
+          "uniqueName": "sam.reviewer@example.com"
+        },
+        "content": "(redacted)"
+      },
+      {
+        "id": 2,
+        "author": {
+          "displayName": "Dana Operator",
+          "uniqueName": "operator@example.com"
+        },
+        "content": "(redacted)"
+      }
+    ],
+    "threadContext": {
+      "filePath": "/src/Deployment/ArmTemplates/Scripts/Helpers/ParityHarness.psm1"
+    }
+  },
+  {
+    "id": 1014,
+    "status": "Unknown",
+    "lastUpdatedDate": "2026-07-29T00:48:58.453Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "Microsoft.VisualStudio.Services.TFS",
+          "uniqueName": ""
+        },
+        "content": "(redacted)"
+      }
+    ]
+  },
+  {
+    "id": 1015,
+    "status": "Unknown",
+    "lastUpdatedDate": "2026-07-29T03:01:03.13Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "Microsoft.VisualStudio.Services.TFS",
+          "uniqueName": ""
+        },
+        "content": "(redacted)"
+      }
+    ]
+  },
+  {
+    "id": 1016,
+    "status": "Unknown",
+    "lastUpdatedDate": "2026-07-29T17:27:26.6Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "Microsoft.VisualStudio.Services.TFS",
+          "uniqueName": ""
+        },
+        "content": "(redacted)"
+      }
+    ]
+  },
+  {
+    "id": 1017,
+    "status": "Unknown",
+    "lastUpdatedDate": "2026-07-29T17:50:54.86Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "Microsoft.VisualStudio.Services.TFS",
+          "uniqueName": ""
+        },
+        "content": "(redacted)"
+      }
+    ]
+  },
+  {
+    "id": 1018,
+    "status": "Active",
+    "lastUpdatedDate": "2026-07-29T21:28:37.66Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "Alex Reviewer",
+          "uniqueName": "alex.reviewer@example.com"
+        },
+        "content": "(redacted)"
+      }
+    ]
+  },
+  {
+    "id": 1019,
+    "status": "Active",
+    "lastUpdatedDate": "2026-07-29T21:36:11.933Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "Sam Reviewer",
+          "uniqueName": "sam.reviewer@example.com"
+        },
+        "content": "(redacted)"
+      }
+    ],
+    "threadContext": {
+      "filePath": "/src/Deployment/ArmTemplates/Scripts/CompareGeneratorOutput.ps1"
+    }
+  },
+  {
+    "id": 1020,
+    "status": "Active",
+    "lastUpdatedDate": "2026-07-29T21:36:31.71Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "Sam Reviewer",
+          "uniqueName": "sam.reviewer@example.com"
+        },
+        "content": "(redacted)"
+      }
+    ],
+    "threadContext": {
+      "filePath": "/src/Deployment/ArmTemplates/Scripts/CompareGeneratorOutput.ps1"
+    }
+  },
+  {
+    "id": 1021,
+    "status": "Closed",
+    "lastUpdatedDate": "2026-07-30T03:07:57.87Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "Dana Operator",
+          "uniqueName": "operator@example.com"
+        },
+        "content": "API Hub Reviewer Agent Summary"
+      }
+    ]
+  },
+  {
+    "id": 1022,
+    "status": "Active",
+    "lastUpdatedDate": "2026-07-30T03:07:58.453Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "Dana Operator",
+          "uniqueName": "operator@example.com"
+        },
+        "content": "**[CRITICAL]"
+      }
+    ],
+    "threadContext": {
+      "filePath": "/src/Deployment/ArmTemplates/Scripts/Helpers/ParityHarness.psm1"
+    }
+  },
+  {
+    "id": 1023,
+    "status": "Active",
+    "lastUpdatedDate": "2026-07-30T03:07:58.727Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "Dana Operator",
+          "uniqueName": "operator@example.com"
+        },
+        "content": "**[IMPORTANT]"
+      }
+    ],
+    "threadContext": {
+      "filePath": "/src/Deployment/ArmTemplates/Scripts/Helpers/ParityHarness.psm1"
+    }
+  },
+  {
+    "id": 1024,
+    "status": "Active",
+    "lastUpdatedDate": "2026-07-30T03:07:59.337Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "Dana Operator",
+          "uniqueName": "operator@example.com"
+        },
+        "content": "**[IMPORTANT]"
+      }
+    ],
+    "threadContext": {
+      "filePath": "/src/Deployment/ArmTemplates/Scripts/Helpers/ParityHarness.psm1"
+    }
+  },
+  {
+    "id": 1025,
+    "status": "Active",
+    "lastUpdatedDate": "2026-07-30T03:08:00.123Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "Dana Operator",
+          "uniqueName": "operator@example.com"
+        },
+        "content": "**[IMPORTANT]"
+      }
+    ],
+    "threadContext": {
+      "filePath": "/src/Deployment/ArmTemplates/Scripts/Helpers/ParityHarness.psm1"
+    }
+  },
+  {
+    "id": 1026,
+    "status": "Active",
+    "lastUpdatedDate": "2026-07-30T03:08:00.39Z",
+    "comments": [
+      {
+        "id": 1,
+        "author": {
+          "displayName": "Dana Operator",
+          "uniqueName": "operator@example.com"
+        },
+        "content": "**[IMPORTANT]"
+      }
+    ],
+    "threadContext": {
+      "filePath": "/src/Deployment/ArmTemplates/Scripts/Helpers/ParityHarness.psm1"
+    }
+  }
+]

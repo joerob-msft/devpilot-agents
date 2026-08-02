@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  hygiene:
+    name: Generic-toolkit invariant
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The premise of this repo is that it is generic. That claim erodes one
+      # commit at a time unless it is checked mechanically.
+      - name: No employer-specific values outside samples/
+        shell: pwsh
+        run: ./tools/Test-NoEmployerSpecifics.ps1
+
+  lint:
+    name: PSScriptAnalyzer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction Stop
+
+      - name: Analyze
+        shell: pwsh
+        run: |
+          $results = Invoke-ScriptAnalyzer -Path ./src -Recurse -Severity Error
+          if ($results) {
+              $results | Format-Table -AutoSize
+              throw "PSScriptAnalyzer reported $($results.Count) error-severity finding(s)."
+          }
+          Write-Host "PSScriptAnalyzer: clean at Error severity."
+
+  manifest:
+    name: Module manifest
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate manifest and import module
+        shell: pwsh
+        run: |
+          $manifest = './src/DevPilot.AgentHarness/DevPilot.AgentHarness.psd1'
+          $info = Test-ModuleManifest -Path $manifest
+          Write-Host "Manifest OK: $($info.Name) $($info.Version), $($info.ExportedFunctions.Count) exported function(s)."
+          Import-Module $manifest -Force
+          # The asset resolver is what lets a consumer find prompts and fixtures
+          # after installing the module; if it breaks, agents cannot start.
+          $agents = Get-DevPilotAgentPath
+          Write-Host "Agent assets resolved at: $agents"
+
+  selfcheck:
+    name: Agent self-checks (-DryRun)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Offline by design: no network, no Azure DevOps, no Copilot process.
+      - name: review-handler -DryRun
+        shell: pwsh
+        run: |
+          ./src/Agents/review-handler/Start-ReviewHandlerAgent.ps1 -DryRun `
+              -ConfigFile ./samples/apihub-ado.config.json

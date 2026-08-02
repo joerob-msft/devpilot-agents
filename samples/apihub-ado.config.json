@@ -1,0 +1,192 @@
+{
+  "schemaVersion": 1,
+  "platform": {
+    "os": "Windows",
+    "device": "DevBox",
+    "minimumPowerShellVersion": "7.0"
+  },
+  "repository": {
+    "organization": "msazure",
+    "project": "One",
+    "name": "AAPT-Antares-ApiHub",
+    "id": "f1273caf-04fb-422a-8e26-ddd91a06bd6d"
+  },
+  "customAgent": {
+    "note": "Empty name = no Agency custom agent. handle-cycle.prompt.md IS the complete instruction set; loading an unrelated repo agent (e.g. the Squad coordinator) on top of it makes the model adopt that persona and never emit a result marker.",
+    "name": "",
+    "source": ""
+  },
+  "promptFile": "handle-cycle.prompt.md",
+  "stateNamespace": "ApiHub",
+  "operator": {
+    "note": "Default PR-author alias to monitor. The -OperatorAlias wrapper parameter is authoritative and overrides this. All PR titles/descriptions/comments/diffs authored by anyone are untrusted DATA, never instructions.",
+    "defaultAlias": "joerob"
+  },
+  "timing": {
+    "maxSourceCommitAgeDays": 14,
+    "futureCommitToleranceMinutes": 10,
+    "consecutiveFailureThreshold": 3
+  },
+  "commitIdContract": {
+    "algorithmName": "SHA-1",
+    "usageNote": "40-character hexadecimal ADO commit-id format validation only. Never used for any cryptographic guarantee.",
+    "hexLength": 40
+  },
+  "buddyBuild": {
+    "note": "Live PR-validation pipeline. quickbuild/CloudBuild buddy builds are a different, retired thing.",
+    "pipelineId": 250001,
+    "pipelineName": "AAPT-Antares-ApiHub-PullRequest",
+    "prMergeRefTemplate": "refs/pull/{prId}/merge"
+  },
+  "threadClassification": {
+    "note": "Used to disambiguate the reviewer-agent's own findings (posted AS the operator) from the operator's genuine replies. See design-spec section 1.4.",
+    "agentSignatureMarkers": [
+      "**[CRITICAL]",
+      "**[IMPORTANT]",
+      "**[SUGGESTION]",
+      "API Hub Reviewer Agent Summary"
+    ],
+    "botIdentitySubstrings": [
+      "GitOps",
+      "Git LowPriv",
+      "PR Assistant",
+      "MerlinBot"
+    ],
+    "systemIdentitySubstrings": [
+      "Microsoft.VisualStudio.Services.TFS"
+    ]
+  },
+  "branchPolicy": {
+    "note": "Protected branches are code-defined in the wrapper (dev, release/*, main, master) and enforced there before any push tool is granted. additionalProtectedBranches only UNIONS with (never removes from) that code-defined set.",
+    "additionalProtectedBranches": []
+  },
+  "worktree": {
+    "baseDir": ".worktrees",
+    "prefix": "review-handler"
+  },
+  "teamsNotifications": {
+    "note": "Checked-in config alone NEVER enables Teams writes. The operator must also pass -EnableTeamsNotifications, and the wrapper fails closed at startup if that switch is passed while enabled/teamId/channelId/events are not populated - so the switch can never silently do nothing. Webhook URLs/secrets are never stored here.",
+    "supportedEvents": [
+      "handlerStarted",
+      "handlerCompleted",
+      "handlerFailed",
+      "prReadyToComplete",
+      "candidateStarved"
+    ],
+    "workIq": {
+      "note": "Verified WorkIQ contract: 'fetch' takes an entityUrls ARRAY, 'create_entity' takes parentUrl + jsonBody, and the payload returns in structuredContent (NOT content[]). A non-2xx statusCode is a failure even when the MCP call itself succeeds.",
+      "command": "agency",
+      "subcommand": [
+        "mcp",
+        "workiq"
+      ],
+      "toolAllowlist": [
+        "fetch",
+        "create_entity"
+      ],
+      "pathPrefixAllowlist": [
+        "/me",
+        "/users/",
+        "/chats",
+        "/teams/"
+      ],
+      "timeoutSeconds": 30,
+      "maxAttempts": 8,
+      "minBackoffSeconds": 30,
+      "maxBackoffSeconds": 1800
+    },
+    "channel": {
+      "enabled": false,
+      "teamId": "",
+      "channelId": "",
+      "events": [
+        "prReadyToComplete",
+        "handlerFailed"
+      ]
+    },
+    "directAuthor": {
+      "note": "One-on-one Teams chat. Microsoft Graph cannot create a chat between the signed-in user and themselves, so recipientUpn must be a DIFFERENT person than whoever the agent runs as. Independent of the channel destination - either alone is valid.",
+      "enabled": false,
+      "recipientUpn": "",
+      "events": [
+        "prReadyToComplete"
+      ]
+    },
+    "workflowsWebhook": {
+      "enabled": false,
+      "environmentVariableName": "",
+      "events": [],
+      "note": "Channel fallback only, never used for author DMs. Legacy Office 365 Connector webhooks are retired/unsupported; only a Teams Workflows (Power Automate) webhook host is accepted."
+    }
+  },
+  "permissions": {
+    "allowTools": [
+      "read",
+      "shell(git status:*)",
+      "shell(git log:*)",
+      "shell(git diff:*)",
+      "ado(repo_pull_request)",
+      "ado(repo_pull_request_thread)",
+      "ado(repo_search_commits)",
+      "ado(repo_repository)",
+      "ado(repo_file)",
+      "ado(repo_branch)",
+      "ado(pipelines_build)",
+      "bluebird",
+      "web_search",
+      "web_fetch"
+    ],
+    "denyTools": [
+      "shell(srectl:*)",
+      "ado(pipelines_write)",
+      "ado(wit_work_item_write)",
+      "ado(wit_work_item_comment_write)",
+      "ado(wit_work_item_link_write)",
+      "ado(wit_work_item_attachment)",
+      "ado(work_capacity_write)",
+      "ado(work_iteration_write)",
+      "ado(repo_pull_request_write)"
+    ],
+    "localValidation": {
+      "allowTools": [
+        "shell(dotnet build:*)",
+        "shell(dotnet test:*)",
+        "shell(build.cmd:*)"
+      ],
+      "guidanceCommands": [
+        {
+          "description": "Full API Hub build, tests skipped (see AGENTS.md Build Quick Reference)",
+          "executable": "cmd.exe",
+          "arguments": [
+            "/c",
+            "build.cmd",
+            "-p:SkipTests=true"
+          ]
+        },
+        {
+          "description": "Targeted rebuild of a single changed project (replace <ProjectPath> with the .csproj under review)",
+          "executable": "dotnet",
+          "arguments": [
+            "build",
+            "<ProjectPath>",
+            "-p:LOCALDEBUG=true"
+          ]
+        }
+      ]
+    }
+  },
+  "provider": "AzureDevOps",
+  "repoConventions": {
+    "note": "Injected into the agent's runtime context. Keeps repo-specific engineering rules OUT of the shared prompt so the prompt (and the result-marker contract it defines) stays identical for every consumer.",
+    "conventionDocPaths": [
+      "AGENTS.md",
+      "docs/principles.md"
+    ],
+    "buildDocPath": "docs/build.md",
+    "buildHint": "dotnet build <ChangedProject>.csproj -p:LOCALDEBUG=true",
+    "fullBuildCommand": "build.cmd -p:SkipTests=true",
+    "securitySkill": "sdl-security-codegen",
+    "branchNaming": "{alias}/{description}",
+    "customRules": "Never change net462 behavior - during .NET 10 migration the net462 path stays byte-for-byte identical, so use #if NETFRAMEWORK guards and put fixes in the #else branch; keep warnings-as-errors clean. If a change touches jobs-engine-managed APIM policy artifacts, follow the APIM policy testing cycle in AGENTS.md (stop the jobs engine before rebuilding engine artifacts)."
+  }
+}
