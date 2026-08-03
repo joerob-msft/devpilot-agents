@@ -1355,7 +1355,27 @@ $attemptsStatePath = Join-Path $StateDir "attempts.json"
 $artifactKeyPath = Join-Path $StateDir "artifact-signing.key"
 
 $ScriptSelfSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
-$SensitiveEnvironmentVariables = @("AZURE_DEVOPS_EXT_PAT", "SYSTEM_ACCESSTOKEN", "GITHUB_TOKEN")
+# Two children, two different scrubs, and the asymmetry is deliberate rather
+# than an oversight - it is worth stating because the "obviously stricter"
+# version of this is broken.
+#
+# The Copilot child AUTHENTICATES to GitHub with COPILOT_GITHUB_TOKEN, GH_TOKEN
+# or GITHUB_TOKEN. Stripping those does not harden it, it stops it starting: on
+# a host where GITHUB_TOKEN is the only one set, a stricter scrub is
+# indistinguishable from a broken agent, and the failure surfaces as an
+# authentication error nobody will connect to a credential-hygiene change. It
+# gets the ADO-PAT-shaped names, which it has no use for and must not carry.
+#
+# The `agency mcp ado` child is the reverse. It authenticates through agency's
+# own credential flow, so it needs neither family, and a GitHub token in its
+# environment is pure blast radius. It gets both.
+#
+# Neither list is a substitute for the tool grant: the model has no shell and no
+# outbound-network tool, so it cannot read an environment variable at all. This
+# bounds what a COMPROMISED CHILD PROCESS holds, not what the model can ask for.
+$CopilotSensitiveEnvironmentVariables = @("AZURE_DEVOPS_EXT_PAT", "SYSTEM_ACCESSTOKEN")
+$McpSensitiveEnvironmentVariables = $CopilotSensitiveEnvironmentVariables +
+@("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
 
 # Operator state inspection / recovery. These run before any cycle so a starved
 # or confusing state can be examined and cleared without hand-editing JSON.
@@ -2420,6 +2440,43 @@ function Invoke-DryRunSelfChecks {
     if ($isolationVars.Count -lt 1) { $failures.Add("The harness reported no session-isolation environment variables to strip.") }
     else { Write-Host "  OK - $($isolationVars.Count) session variable(s) will be stripped from the child process" -ForegroundColor Green }
 
+    # The two children get DIFFERENT credential scrubs, and the asymmetry is
+    # load-bearing in both directions. Making them the same is the obvious
+    # "cleanup", and it breaks something either way: strip GitHub tokens from
+    # Copilot and it cannot authenticate at all; leave them in the ADO MCP child
+    # and a process with no use for them carries them anyway. Neither failure is
+    # visible in a dry run, so assert the shape here.
+    $githubTokenNames = @('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')
+    $adoTokenNames = @('AZURE_DEVOPS_EXT_PAT', 'SYSTEM_ACCESSTOKEN')
+    $scrubFailed = $false
+    foreach ($name in $githubTokenNames) {
+        if ($CopilotSensitiveEnvironmentVariables -ccontains $name) {
+            $failures.Add("The Copilot child's scrub strips $name, which Copilot authenticates with; it would fail to start on a host where that is the token that is set.")
+            $scrubFailed = $true
+        }
+        if ($McpSensitiveEnvironmentVariables -cnotcontains $name) {
+            $failures.Add("The ADO MCP child's scrub keeps $name, a credential it has no use for.")
+            $scrubFailed = $true
+        }
+    }
+    foreach ($name in $adoTokenNames) {
+        if ($CopilotSensitiveEnvironmentVariables -cnotcontains $name) {
+            $failures.Add("The Copilot child's scrub keeps $name, a credential it has no use for.")
+            $scrubFailed = $true
+        }
+        if ($McpSensitiveEnvironmentVariables -cnotcontains $name) {
+            $failures.Add("The ADO MCP child's scrub keeps $name.")
+            $scrubFailed = $true
+        }
+    }
+    if ((Get-Content -LiteralPath $PSCommandPath -Raw) -cmatch '-EnvironmentVariablesToRemove\s+\$SensitiveEnvironmentVariables') {
+        $failures.Add("A child is still launched with the old undifferentiated scrub list.")
+        $scrubFailed = $true
+    }
+    if (-not $scrubFailed) {
+        Write-Host "  OK - the Copilot child keeps the token it authenticates with; the ADO MCP child carries neither family" -ForegroundColor Green
+    }
+
     Write-Host "[DRY-RUN] Self-check 16/$total : the prompt receives metadata only, never comment text" -ForegroundColor Cyan
     $secret = "ThisExactSentenceMustNeverReachTheModel"
     $digestThreads = @(
@@ -3134,7 +3191,7 @@ function Invoke-ReviewerPullRequest {
 
     $run = Invoke-TimedProcess -FilePath $AgencyPath -ArgumentList $agencyArgs -StandardInputContent $stdin `
         -CaptureStdOut -CaptureStdErr -WorkingDirectory $RepoPath `
-        -EnvironmentVariablesToRemove $SensitiveEnvironmentVariables -TimeoutSeconds $CycleTimeoutSeconds
+        -EnvironmentVariablesToRemove $CopilotSensitiveEnvironmentVariables -TimeoutSeconds $CycleTimeoutSeconds
 
     # -- Marker validation (hostile input) ------------------------------------
     $markerSource = [string]$run.StdOut
@@ -3514,7 +3571,8 @@ function Invoke-ReviewerPromotion {
     try {
         if ($ownsSession) {
             $session = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
-                -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds
+                -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
+                -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
         }
 
         $allFindings = @($marker['findings'])
@@ -3665,7 +3723,8 @@ function Invoke-ReviewerCycle {
     $session = $null
     try {
         $session = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
-            -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds
+            -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
+            -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
 
         # -- Step 1: candidate list (wrapper-owned, deterministic) ------------
         $rawPrs = Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
