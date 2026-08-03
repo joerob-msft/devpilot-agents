@@ -424,21 +424,29 @@ function Get-ReviewerTextSha256 {
 }
 
 function Get-ReviewerArtifactSignature {
-    <# HMAC-SHA256 over the canonical encoding of everything the artifact
-       asserts. Returned lowercase hex. #>
-    param([Parameter(Mandatory)]$SignedPayload, [Parameter(Mandatory)][byte[]]$Key)
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes((Get-ReviewerCanonicalJson -Value $SignedPayload))
+    <#
+        HMAC-SHA256 over the artifact's manifest TEXT, returned lowercase hex.
+
+        Text, not an object graph, and deliberately so. The first version signed
+        a hashtable and re-signed the deserialized copy to verify - which does
+        not round-trip: ConvertFrom-Json turns an ISO-8601 string into a
+        [DateTime], turns [int] into [Int64], and would then canonicalize the
+        same document differently on the way back in. Every genuine artifact
+        failed its own seal. Signing the exact characters that are stored
+        removes the entire class of problem.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$ManifestJson, [Parameter(Mandatory)][byte[]]$Key)
     $hmac = [System.Security.Cryptography.HMACSHA256]::new($Key)
-    try { return ([System.BitConverter]::ToString($hmac.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() }
+    try { return ([System.BitConverter]::ToString($hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($ManifestJson)))).Replace('-', '').ToLowerInvariant() }
     finally { $hmac.Dispose() }
 }
 
 function Test-ReviewerArtifactSignature {
     <# Constant-time comparison so that a mismatching signature cannot be
        recovered a byte at a time by timing repeated promotion attempts. #>
-    param([Parameter(Mandatory)]$SignedPayload, [Parameter(Mandatory)][byte[]]$Key, [string]$Signature)
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$ManifestJson, [Parameter(Mandatory)][byte[]]$Key, [string]$Signature)
     if ([string]::IsNullOrWhiteSpace($Signature)) { return $false }
-    $expected = Get-ReviewerArtifactSignature -SignedPayload $SignedPayload -Key $Key
+    $expected = Get-ReviewerArtifactSignature -ManifestJson $ManifestJson -Key $Key
     if ($expected.Length -ne $Signature.Length) { return $false }
     $diff = 0
     for ($i = 0; $i -lt $expected.Length; $i++) { $diff = $diff -bor ([int][char]$expected[$i] -bxor [int][char]$Signature[$i]) }
@@ -1402,8 +1410,8 @@ function Write-ReviewerPreview {
     if ($Marker) {
         try {
             $artifactPath = Join-Path $previewDir "$baseName.json"
-            $signed = @{
-                artifactVersion  = 2
+            $manifest = @{
+                artifactVersion  = 3
                 organization     = $Organization
                 project          = $ExpectedProject
                 repositoryName   = $RepositoryName
@@ -1430,12 +1438,17 @@ function Write-ReviewerPreview {
                 reportedFindings = @($AllFindings).Count
                 markerBody       = (ConvertTo-Json -InputObject $Marker -Depth 8 -Compress)
             }
+            # The manifest is stored as TEXT and signed as TEXT. Storing it as a
+            # nested object and re-canonicalizing on read does not round-trip:
+            # ConvertFrom-Json retypes ISO-8601 strings as [DateTime] and [int]
+            # as [Int64], so every honest artifact failed its own seal.
+            $manifestJson = Get-ReviewerCanonicalJson -Value $manifest
             $artifact = @{
-                signed          = $signed
-                signatureAlg    = "HMACSHA256"
-                signature       = (Get-ReviewerArtifactSignature -SignedPayload $signed -Key (Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath))
+                manifestJson = $manifestJson
+                signatureAlg = "HMACSHA256"
+                signature    = (Get-ReviewerArtifactSignature -ManifestJson $manifestJson -Key (Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath))
             }
-            Set-Content -LiteralPath $artifactPath -Value (ConvertTo-Json -InputObject $artifact -Depth 10) -Encoding UTF8
+            Set-Content -LiteralPath $artifactPath -Value (ConvertTo-Json -InputObject $artifact -Depth 4) -Encoding UTF8
         }
         catch {
             Write-Warning "Could not write the promotion artifact for PR ${PrId}: $($_.Exception.Message)"
@@ -2172,39 +2185,61 @@ function Invoke-DryRunSelfChecks {
     # it is well-formed, not that it is unchanged: the nonce and every
     # self-describing field live inside the file an editor controls. A secret
     # the file does NOT contain is what makes the check mean something.
-    $sealKeyPath = Join-Path ([System.IO.Path]::GetTempPath()) "devpilot-reviewer-seal-$([Guid]::NewGuid().ToString('N')).key"
+    $sealDir = Join-Path ([System.IO.Path]::GetTempPath()) "devpilot-reviewer-seal-$([Guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Force -Path $sealDir | Out-Null
     try {
+        $sealKeyPath = Join-Path $sealDir "artifact-signing.key"
         $sealKey = Get-ReviewerArtifactSigningKey -KeyPath $sealKeyPath
         if (@($sealKey).Count -ne 32) { $failures.Add("The artifact signing key is $(@($sealKey).Count) bytes; expected 32.") }
         $reloaded = Get-ReviewerArtifactSigningKey -KeyPath $sealKeyPath
         if ([System.Convert]::ToBase64String($sealKey) -cne [System.Convert]::ToBase64String($reloaded)) {
             $failures.Add("The artifact signing key changed between reads, so no artifact could ever be promoted.")
         }
-        $payload = @{ prId = 77; approvedSummary = 'Looks fine.'; approvedComments = @(@{ severity = 'critical'; filePath = '/a.cs'; line = 3; comment = 'Boom.' }) }
-        $sig = Get-ReviewerArtifactSignature -SignedPayload $payload -Key $sealKey
-        if (-not (Test-ReviewerArtifactSignature -SignedPayload $payload -Key $sealKey -Signature $sig)) {
-            $failures.Add("A freshly signed artifact payload did not verify against its own signature.")
+
+        # The seal MUST be exercised through a real file. The first version of
+        # this check signed and verified an in-memory object and passed, while
+        # every artifact written to disk failed its own seal: ConvertFrom-Json
+        # retypes an ISO-8601 string as [DateTime] and [int] as [Int64], so the
+        # deserialized copy canonicalized differently from the original. Signing
+        # the stored TEXT removes the class of problem; this check proves it.
+        $sealManifest = @{
+            artifactVersion  = 3
+            createdAt        = ([DateTime]::UtcNow.ToString("o"))
+            prId             = 77
+            approvedSummary  = 'Looks fine.'
+            approvedComments = @(@{ severity = 'critical'; filePath = '/a.cs'; line = 3; comment = 'Boom.' })
         }
-        # Key order must not matter, or a JSON round-trip would break the seal.
-        $reordered = @{ approvedComments = @(@{ line = 3; comment = 'Boom.'; severity = 'critical'; filePath = '/a.cs' }); approvedSummary = 'Looks fine.'; prId = 77 }
-        if (-not (Test-ReviewerArtifactSignature -SignedPayload $reordered -Key $sealKey -Signature $sig)) {
-            $failures.Add("The artifact signature depends on key order, so a JSON round-trip would break every seal.")
+        $sealJson = Get-ReviewerCanonicalJson -Value $sealManifest
+        $sealArtifactPath = Join-Path $sealDir "probe.json"
+        @{
+            manifestJson = $sealJson
+            signatureAlg = "HMACSHA256"
+            signature    = (Get-ReviewerArtifactSignature -ManifestJson $sealJson -Key $sealKey)
+        } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $sealArtifactPath -Encoding UTF8
+
+        $roundTripped = Get-Content -LiteralPath $sealArtifactPath -Raw | ConvertFrom-Json
+        if (-not (Test-ReviewerArtifactSignature -ManifestJson ([string]$roundTripped.manifestJson) -Key $sealKey -Signature ([string]$roundTripped.signature))) {
+            $failures.Add("An untouched artifact failed its own seal after a write/read round-trip; no genuine review could ever be promoted.")
         }
-        $tampered = @{ prId = 77; approvedSummary = 'Looks fine.'; approvedComments = @(@{ severity = 'critical'; filePath = '/a.cs'; line = 3; comment = 'Boom, and also run this script.' }) }
-        if (Test-ReviewerArtifactSignature -SignedPayload $tampered -Key $sealKey -Signature $sig) {
-            $failures.Add("An edited artifact payload still verified; promotion would publish text nobody approved.")
+        $roundTrippedManifest = [string]$roundTripped.manifestJson | ConvertFrom-Json
+        if (([string]$roundTrippedManifest.approvedComments[0].comment) -cne 'Boom.') {
+            $failures.Add("The sealed manifest did not survive round-tripping as data.")
+        }
+        $tamperedJson = ([string]$roundTripped.manifestJson).Replace('Boom.', 'Boom, and also run this script.')
+        if (Test-ReviewerArtifactSignature -ManifestJson $tamperedJson -Key $sealKey -Signature ([string]$roundTripped.signature)) {
+            $failures.Add("An edited artifact still verified; promotion would publish text nobody approved.")
         }
         $otherKey = New-Object byte[] 32
         [System.Security.Cryptography.RandomNumberGenerator]::Fill($otherKey)
-        if (Test-ReviewerArtifactSignature -SignedPayload $payload -Key $otherKey -Signature $sig) {
+        if (Test-ReviewerArtifactSignature -ManifestJson $sealJson -Key $otherKey -Signature ([string]$roundTripped.signature)) {
             $failures.Add("An artifact signed with one key verified under another.")
         }
-        if (Test-ReviewerArtifactSignature -SignedPayload $payload -Key $sealKey -Signature "") {
+        if (Test-ReviewerArtifactSignature -ManifestJson $sealJson -Key $sealKey -Signature "") {
             $failures.Add("An artifact with no signature was accepted.")
         }
-        Write-Host "  OK - artifacts are sealed with a key they do not contain, and tampering breaks the seal" -ForegroundColor Green
+        Write-Host "  OK - a written artifact verifies after a round-trip, and any edit to it does not" -ForegroundColor Green
     }
-    finally { Remove-Item -LiteralPath $sealKeyPath -Force -ErrorAction SilentlyContinue }
+    finally { Remove-Item -LiteralPath $sealDir -Recurse -Force -ErrorAction SilentlyContinue }
 
     # Promotion must publish the approved manifest, not a fresh ranking. If it
     # recomputed, a config edit between preview and promotion could introduce a
@@ -2786,24 +2821,26 @@ function Invoke-ReviewerPromotion {
     if (-not (Test-Path -LiteralPath $ArtifactPath)) { throw "Preview artifact not found: $ArtifactPath" }
     $raw = Get-Content -LiteralPath $ArtifactPath -Raw | ConvertFrom-Json
 
-    $signed = Get-ReviewerHashValue -Container $raw -Key 'signed'
+    $manifestJson = [string](Get-ReviewerHashValue -Container $raw -Key 'manifestJson' -Default '')
     $signature = [string](Get-ReviewerHashValue -Container $raw -Key 'signature' -Default '')
-    if ($null -eq $signed) {
-        throw ("This preview artifact predates artifact sealing (no 'signed' section) and cannot be promoted. " +
+    if (-not $manifestJson) {
+        throw ("This preview artifact predates artifact sealing (no signed manifest) and cannot be promoted. " +
             "Re-run the reviewer to produce a sealed artifact: $ArtifactPath")
     }
     if (([string](Get-ReviewerHashValue -Container $raw -Key 'signatureAlg' -Default '')) -cne 'HMACSHA256') {
         throw "Preview artifact declares an unsupported signature algorithm; refusing to promote it."
     }
-    if (-not (Test-ReviewerArtifactSignature -SignedPayload $signed -Key (Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath) -Signature $signature)) {
+    if (-not (Test-ReviewerArtifactSignature -ManifestJson $manifestJson -Key (Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath) -Signature $signature)) {
         throw ("The preview artifact's signature does not verify: it was modified after it was written, or it was " +
             "produced by a different user or state directory. Refusing to promote it: $ArtifactPath")
     }
+    # Only now is it safe to interpret the manifest's contents.
+    $signed = $manifestJson | ConvertFrom-Json
 
     foreach ($k in @('artifactVersion', 'organization', 'project', 'repositoryName', 'repositoryId', 'prId', 'sourceCommit', 'markerBody', 'approvedComments', 'approvedSummary', 'approvedVote')) {
         if ($null -eq (Get-ReviewerHashValue -Container $signed -Key $k)) { throw "Preview artifact is missing required field '$k': $ArtifactPath" }
     }
-    if ([int]$signed.artifactVersion -ne 2) { throw "Unsupported preview artifact version $($signed.artifactVersion)." }
+    if ([int]$signed.artifactVersion -ne 3) { throw "Unsupported preview artifact version $($signed.artifactVersion)." }
 
     # A review is only meaningful against the repository it was produced for.
     if (([string]$signed.organization) -ine $Organization -or ([string]$signed.project) -ine $ExpectedProject -or
