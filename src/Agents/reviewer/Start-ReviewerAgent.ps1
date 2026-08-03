@@ -85,6 +85,12 @@
     bound to, and only then posted. This is the only mode in which the text that
     is posted is guaranteed to be the text a human read.
 
+.PARAMETER AcceptUnverifiablePreviewDocument
+    Promote even though the Markdown preview the artifact was written alongside
+    is missing or no longer matches it. Off by default: without the document
+    there is no way to show that what is published is what a human read, which
+    is the entire point of the preview-then-promote workflow.
+
 .PARAMETER DryRun
     Validate config, harness, locks, state, marker/selection/formatting/vote
     helpers, and command construction WITHOUT invoking Copilot or ADO. Works
@@ -186,6 +192,11 @@ param(
     # guaranteed to be the text a human read: an ordinary posting run is a
     # fresh model run and may legitimately reach different conclusions.
     [string]$PromotePreview,
+
+    # Promote even though the Markdown the artifact was written alongside is
+    # missing or no longer matches it. Off by default, because without that
+    # document nothing can show that what is published is what a human read.
+    [switch]$AcceptUnverifiablePreviewDocument,
 
     [ValidateRange(5, 3600)]
     [int]$MinBackoffSeconds = 30,
@@ -376,6 +387,12 @@ function Get-ReviewerArtifactSigningKey {
         the file system's default per-user permissions and the weaker guarantee
         is stated plainly rather than papered over.
 
+        The stored file therefore records WHICH of the two it is, as a
+        "<format>:<base64>" line. It has to: a key written raw because DPAPI
+        failed would otherwise be fed to Unprotect on every subsequent read and
+        never decrypt, so the artifact it signed could never be promoted. A file
+        with no prefix predates this and is DPAPI-protected on Windows.
+
         This defends against an artifact edited on disk. It does NOT defend
         against an attacker who can already run code as this user - such an
         attacker can sign whatever they like, and could equally well post
@@ -383,21 +400,35 @@ function Get-ReviewerArtifactSigningKey {
     #>
     param([Parameter(Mandatory)][string]$KeyPath)
     if (Test-Path -LiteralPath $KeyPath) {
-        $stored = [System.Convert]::FromBase64String((Get-Content -LiteralPath $KeyPath -Raw).Trim())
-        if ($IsWindows) {
-            try { return [System.Security.Cryptography.ProtectedData]::Unprotect($stored, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser) }
-            catch { throw "The preview-artifact signing key at $KeyPath could not be decrypted for this user: $($_.Exception.Message)" }
+        $line = (Get-Content -LiteralPath $KeyPath -Raw).Trim()
+        $format = $(if ($IsWindows) { 'dpapi' } else { 'raw' })
+        $sep = $line.IndexOf(':')
+        if ($sep -gt 0) {
+            $format = $line.Substring(0, $sep)
+            $line = $line.Substring($sep + 1)
         }
-        return $stored
+        $stored = [System.Convert]::FromBase64String($line)
+        switch ($format) {
+            'raw' { return $stored }
+            'dpapi' {
+                try { return [System.Security.Cryptography.ProtectedData]::Unprotect($stored, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser) }
+                catch { throw "The preview-artifact signing key at $KeyPath could not be decrypted for this user: $($_.Exception.Message)" }
+            }
+            default { throw "The preview-artifact signing key at $KeyPath declares an unknown storage format '$format'." }
+        }
     }
     $key = New-Object byte[] 32
     [System.Security.Cryptography.RandomNumberGenerator]::Fill($key)
     $toStore = $key
+    $storedFormat = 'raw'
     if ($IsWindows) {
-        try { $toStore = [System.Security.Cryptography.ProtectedData]::Protect($key, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser) }
+        try {
+            $toStore = [System.Security.Cryptography.ProtectedData]::Protect($key, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+            $storedFormat = 'dpapi'
+        }
         catch { Write-Warning "DPAPI is unavailable; the signing key is stored unencrypted at $KeyPath and is only as private as that file." }
     }
-    Set-Content -LiteralPath $KeyPath -Value ([System.Convert]::ToBase64String($toStore)) -Encoding ascii
+    Set-Content -LiteralPath $KeyPath -Value ("${storedFormat}:" + [System.Convert]::ToBase64String($toStore)) -Encoding ascii
     return $key
 }
 
@@ -615,17 +646,44 @@ function Test-ReviewerAlreadyReviewed {
     if ($recCommit -ine $SourceCommit) { return $false }
     if (-not $WritesRequested) { return $true }
     # Records written before per-capability tracking existed carry only
-    # 'delivered'. Treat that as "comments and summary were delivered" - which
-    # is what the old bit was computed from - and as "no vote was resolved", so
-    # an upgrade re-attempts a vote rather than silently swallowing it.
-    $legacy = [bool](Get-ReviewerHashValue -Container $rec -Key 'delivered' -Default $false)
-    $comments = [bool](Get-ReviewerHashValue -Container $rec -Key 'commentsDelivered' -Default $legacy)
-    $summary = [bool](Get-ReviewerHashValue -Container $rec -Key 'summaryDelivered' -Default $legacy)
+    # 'delivered', which was set when whichever switches that run had enabled
+    # succeeded - NOT when both capabilities did. Inferring "comments and
+    # summary were delivered" from it would let a legacy summary-only run
+    # suppress comments forever. So a legacy record proves nothing about any
+    # individual capability and every one of them defaults to false. Re-checking
+    # is cheap and safe: comment fingerprints and the summary marker make a
+    # redundant attempt a no-op rather than a duplicate.
+    $comments = [bool](Get-ReviewerHashValue -Container $rec -Key 'commentsDelivered' -Default $false)
+    $summary = [bool](Get-ReviewerHashValue -Container $rec -Key 'summaryDelivered' -Default $false)
     $vote = [bool](Get-ReviewerHashValue -Container $rec -Key 'voteResolved' -Default $false)
     if ($WantComments -and -not $comments) { return $false }
     if ($WantSummary -and -not $summary) { return $false }
     if ($WantVote -and -not $vote) { return $false }
     return $true
+}
+
+function Merge-ReviewerCapabilityFlag {
+    <#
+        Whether a capability counts as delivered for this commit, given what
+        THIS run attempted and what an earlier run at the same commit recorded.
+
+        Prior success is inherited only when this run did not attempt the
+        capability. A run that did attempt it and failed must NOT inherit an
+        older success, because the older success was for whatever findings that
+        run produced and this run's findings are not the same set. Without this
+        rule the following loses a finding permanently: run A posts finding X
+        and records commentsDelivered; run B (summary now enabled) legitimately
+        re-opens the PR, the model returns X and Y, Y fails to post, and OR-ing
+        the old success back in marks comments delivered - so Y is never
+        retried and never seen.
+
+        Clearing on an attempted-but-failed capability errs toward retrying,
+        which is safe: comment fingerprints and the summary marker make a
+        redundant attempt a no-op rather than a duplicate.
+    #>
+    param([bool]$Attempted, [bool]$SucceededThisRun, [bool]$PriorValue)
+    if ($Attempted) { return $SucceededThisRun }
+    return $PriorValue
 }
 
 function Get-ReviewerLastReviewedSortKey {
@@ -1814,7 +1872,7 @@ function Invoke-DryRunSelfChecks {
     Write-Host "[DRY-RUN] Self-check 11/$total : already-reviewed identity is PR + exact commit + delivery" -ForegroundColor Cyan
     $commitOld = ("d" * 40)
     $commitNew = ("e" * 40)
-    $reviewedProbe = @{ "77" = @{ sourceCommit = $commitOld; delivered = $true } }
+    $reviewedProbe = @{ "77" = @{ sourceCommit = $commitOld; delivered = $true; commentsDelivered = $true; summaryDelivered = $true; voteResolved = $true } }
     if (-not (Test-ReviewerAlreadyReviewed -ReviewedState $reviewedProbe -PrId 77 -SourceCommit $commitOld)) { $failures.Add("The same PR at the same commit was not treated as already reviewed; re-running would double-post.") }
     elseif (Test-ReviewerAlreadyReviewed -ReviewedState $reviewedProbe -PrId 77 -SourceCommit $commitNew) { $failures.Add("A new push did not re-open the PR for review.") }
     elseif (Test-ReviewerAlreadyReviewed -ReviewedState $reviewedProbe -PrId 78 -SourceCommit $commitOld) { $failures.Add("An unrelated PR was reported as already reviewed.") }
@@ -1852,17 +1910,40 @@ function Invoke-DryRunSelfChecks {
         }
     }
     # A record written before per-capability tracking existed carries only
-    # 'delivered'. It must satisfy comments and summary but never a vote.
+    # 'delivered', which the old code set when whichever switches THAT run had
+    # enabled succeeded - not when both capabilities did. So it proves nothing
+    # about any single capability and must suppress none of them; otherwise a
+    # legacy summary-only run silently blocks finding comments forever.
     $legacyRecord = @{ "77" = @{ sourceCommit = $commitOld; delivered = $true } }
-    if (-not (Test-ReviewerAlreadyReviewed -ReviewedState $legacyRecord -PrId 77 -SourceCommit $commitOld -WritesRequested $true -WantComments $true)) {
-        $failures.Add("A legacy delivered record stopped satisfying finding comments, so an upgrade would re-post every review.")
+    foreach ($want in @(@{ WantComments = $true }, @{ WantSummary = $true }, @{ WantVote = $true })) {
+        $splat = @{ ReviewedState = $legacyRecord; PrId = 77; SourceCommit = $commitOld; WritesRequested = $true } + $want
+        if (Test-ReviewerAlreadyReviewed @splat) {
+            $failures.Add("A legacy delivered record suppressed '$($want.Keys -join ',')', which it cannot prove was ever delivered.")
+            $capabilityFailures++
+        }
+    }
+    # A legacy record must still stop a pointless second PREVIEW of the same commit.
+    if (-not (Test-ReviewerAlreadyReviewed -ReviewedState $legacyRecord -PrId 77 -SourceCommit $commitOld -WritesRequested $false)) {
+        $failures.Add("A legacy record stopped suppressing a redundant preview of the same commit.")
         $capabilityFailures++
     }
-    if (Test-ReviewerAlreadyReviewed -ReviewedState $legacyRecord -PrId 77 -SourceCommit $commitOld -WritesRequested $true -WantVote $true) {
-        $failures.Add("A legacy delivered record claimed a vote was resolved; no vote was ever recorded.")
-        $capabilityFailures++
+    # An attempted-but-failed capability must not inherit an earlier success at
+    # the same commit: the earlier success was for a different finding set, and
+    # inheriting it is how a finding that failed to post is never retried.
+    $mergeCases = @(
+        @{ Name = 'attempted and succeeded'; Attempted = $true; Succeeded = $true; Prior = $false; Expected = $true }
+        @{ Name = 'attempted and failed, with an earlier success'; Attempted = $true; Succeeded = $false; Prior = $true; Expected = $false }
+        @{ Name = 'not attempted, with an earlier success'; Attempted = $false; Succeeded = $false; Prior = $true; Expected = $true }
+        @{ Name = 'not attempted, never delivered'; Attempted = $false; Succeeded = $false; Prior = $false; Expected = $false }
+    )
+    foreach ($case in $mergeCases) {
+        $got = Merge-ReviewerCapabilityFlag -Attempted $case.Attempted -SucceededThisRun $case.Succeeded -PriorValue $case.Prior
+        if ([bool]$got -ne [bool]$case.Expected) {
+            $failures.Add("Capability merge is wrong for '$($case.Name)': expected $($case.Expected), got $got.")
+            $capabilityFailures++
+        }
     }
-    if ($capabilityFailures -eq 0) { Write-Host "  OK - delivery is tracked per capability, and legacy records upgrade safely" -ForegroundColor Green }
+    if ($capabilityFailures -eq 0) { Write-Host "  OK - delivery is per capability, a failed retry never inherits an older success, and legacy records suppress nothing" -ForegroundColor Green }
     if ((Get-ReviewerReviewKey -PrId 77 -SourceCommit $commitOld) -cne "77:$commitOld") { $failures.Add("The review key format changed.") }
     else { Write-Host "  OK - the review key is prId:sourceCommit" -ForegroundColor Green }
 
@@ -2215,6 +2296,23 @@ function Invoke-DryRunSelfChecks {
         if ([System.Convert]::ToBase64String($sealKey) -cne [System.Convert]::ToBase64String($reloaded)) {
             $failures.Add("The artifact signing key changed between reads, so no artifact could ever be promoted.")
         }
+        # A key stored raw (the documented fallback when DPAPI is unavailable)
+        # must be readable back. It was not: every read called Unprotect
+        # unconditionally, so a preview signed under the fallback could be
+        # written but never promoted.
+        $rawKeyPath = Join-Path $sealDir "raw.key"
+        $rawBytes = New-Object byte[] 32
+        [System.Security.Cryptography.RandomNumberGenerator]::Fill($rawBytes)
+        Set-Content -LiteralPath $rawKeyPath -Value ("raw:" + [System.Convert]::ToBase64String($rawBytes)) -Encoding ascii
+        $rawRead = Get-ReviewerArtifactSigningKey -KeyPath $rawKeyPath
+        if ([System.Convert]::ToBase64String(@($rawRead)) -cne [System.Convert]::ToBase64String($rawBytes)) {
+            $failures.Add("A signing key stored in the unencrypted fallback format could not be read back, so nothing signed with it could be promoted.")
+        }
+        $bogusKeyPath = Join-Path $sealDir "bogus.key"
+        Set-Content -LiteralPath $bogusKeyPath -Value ("rot13:" + [System.Convert]::ToBase64String($rawBytes)) -Encoding ascii
+        $unknownFormatRejected = $false
+        try { [void](Get-ReviewerArtifactSigningKey -KeyPath $bogusKeyPath) } catch { $unknownFormatRejected = $true }
+        if (-not $unknownFormatRejected) { $failures.Add("A signing key declaring an unknown storage format was accepted.") }
 
         # The seal MUST be exercised through a real file. The first version of
         # this check signed and verified an in-memory object and passed, while
@@ -2777,10 +2875,12 @@ function Invoke-ReviewerPullRequest {
         $candidate = $ReviewedState[[string]$prId]
         if (([string](Get-ReviewerHashValue -Container $candidate -Key 'sourceCommit' -Default '')) -ieq $sourceCommit) { $priorRecord = $candidate }
     }
-    $priorLegacy = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'delivered' -Default $false)
-    $commentsDelivered = ([bool]$delivery.CommentsDelivered) -or [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'commentsDelivered' -Default $priorLegacy)
-    $summaryDelivered = ([bool]$delivery.SummaryDelivered) -or [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'summaryDelivered' -Default $priorLegacy)
-    $voteResolved = ([bool]$delivery.VoteResolved) -or [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'voteResolved' -Default $false)
+    $priorComments = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'commentsDelivered' -Default $false)
+    $priorSummary = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'summaryDelivered' -Default $false)
+    $priorVote = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'voteResolved' -Default $false)
+    $commentsDelivered = Merge-ReviewerCapabilityFlag -Attempted $EnableFindingComments -SucceededThisRun ([bool]$delivery.CommentsDelivered) -PriorValue $priorComments
+    $summaryDelivered = Merge-ReviewerCapabilityFlag -Attempted $EnableSummaryComment -SucceededThisRun ([bool]$delivery.SummaryDelivered) -PriorValue $priorSummary
+    $voteResolved = Merge-ReviewerCapabilityFlag -Attempted $EnableApprovalVote -SucceededThisRun ([bool]$delivery.VoteResolved) -PriorValue $priorVote
 
     $ReviewedState[[string]$prId] = @{
         sourceCommit      = $sourceCommit
@@ -2892,17 +2992,34 @@ function Invoke-ReviewerPromotion {
     $sourceCommit = [string]$signed.sourceCommit
     $prTitle = [string](Get-ReviewerHashValue -Container $signed -Key 'prTitle' -Default "PR $prId")
 
-    # If the Markdown is still on disk, confirm it is the document that was
-    # approved. A missing preview is not fatal - the manifest is the authority -
-    # but a preview that no longer matches means the operator and the artifact
-    # disagree about what this review says.
+    # The Markdown is what the operator actually read. Publishing a manifest
+    # while that document says something else breaks the only guarantee this
+    # workflow makes, so both a mismatch and a missing document are fatal unless
+    # the operator explicitly accepts that the document cannot be verified.
     $previewPath = [string](Get-ReviewerHashValue -Container $signed -Key 'previewPath' -Default '')
     $previewSha = [string](Get-ReviewerHashValue -Container $signed -Key 'previewSha256' -Default '')
-    if ($previewPath -and $previewSha -and (Test-Path -LiteralPath $previewPath)) {
+    if (-not $previewPath -or -not $previewSha) {
+        throw ("This preview artifact does not record the document it was written alongside, so what was published " +
+            "cannot be shown to be what was read. Re-run the reviewer to produce a current artifact: $ArtifactPath")
+    }
+    if (-not (Test-Path -LiteralPath $previewPath)) {
+        if (-not $AcceptUnverifiablePreviewDocument) {
+            throw ("The Markdown preview this artifact was written alongside is gone ($previewPath), so what is about " +
+                "to be published cannot be shown to be what was reviewed. Re-run the reviewer, or pass " +
+                "-AcceptUnverifiablePreviewDocument to publish the sealed manifest anyway.")
+        }
+        Write-Warning "The Markdown preview at $previewPath is missing; publishing the sealed manifest on the operator's explicit instruction."
+    }
+    else {
         $onDisk = Get-ReviewerTextSha256 -Text (Get-ReviewerNormalizedDocumentText -Text (Get-Content -LiteralPath $previewPath -Raw))
         if ($onDisk -cne $previewSha) {
-            Write-Warning ("The Markdown preview at $previewPath no longer matches the sealed artifact. " +
-                "Publishing the sealed manifest, which is the review that was approved.")
+            if (-not $AcceptUnverifiablePreviewDocument) {
+                throw ("The Markdown preview at $previewPath no longer matches the sealed artifact, so the review that " +
+                    "was read and the review that would be published are not the same document. Refusing to promote " +
+                    "it. Re-run the reviewer, or pass -AcceptUnverifiablePreviewDocument to publish the sealed " +
+                    "manifest anyway.")
+            }
+            Write-Warning "The Markdown preview at $previewPath does not match the sealed artifact; publishing the sealed manifest on the operator's explicit instruction."
         }
     }
 
@@ -2963,7 +3080,6 @@ function Invoke-ReviewerPromotion {
             $candidate = $reviewedState[[string]$prId]
             if (([string](Get-ReviewerHashValue -Container $candidate -Key 'sourceCommit' -Default '')) -ieq $sourceCommit) { $priorRecord = $candidate }
         }
-        $priorLegacy = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'delivered' -Default $false)
         $reviewedState[[string]$prId] = @{
             sourceCommit      = $sourceCommit
             at                = ([DateTime]::UtcNow.ToString("o"))
@@ -2974,9 +3090,9 @@ function Invoke-ReviewerPromotion {
             summaryPosted     = [bool]$delivery.SummaryPosted
             vote              = $(if ($delivery.CastVote) { [string]$delivery.CastVote } else { "none" })
             delivered         = [bool]$delivery.Delivered
-            commentsDelivered = ([bool]$delivery.CommentsDelivered) -or [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'commentsDelivered' -Default $priorLegacy)
-            summaryDelivered  = ([bool]$delivery.SummaryDelivered) -or [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'summaryDelivered' -Default $priorLegacy)
-            voteResolved      = ([bool]$delivery.VoteResolved) -or [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'voteResolved' -Default $false)
+            commentsDelivered = (Merge-ReviewerCapabilityFlag -Attempted $EnableFindingComments -SucceededThisRun ([bool]$delivery.CommentsDelivered) -PriorValue ([bool](Get-ReviewerHashValue -Container $priorRecord -Key 'commentsDelivered' -Default $false)))
+            summaryDelivered  = (Merge-ReviewerCapabilityFlag -Attempted $EnableSummaryComment -SucceededThisRun ([bool]$delivery.SummaryDelivered) -PriorValue ([bool](Get-ReviewerHashValue -Container $priorRecord -Key 'summaryDelivered' -Default $false)))
+            voteResolved      = (Merge-ReviewerCapabilityFlag -Attempted $EnableApprovalVote -SucceededThisRun ([bool]$delivery.VoteResolved) -PriorValue ([bool](Get-ReviewerHashValue -Container $priorRecord -Key 'voteResolved' -Default $false)))
             promotedFrom      = $ArtifactPath
         }
         Set-JsonState -Path $reviewedStatePath -State $reviewedState

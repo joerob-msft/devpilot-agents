@@ -157,6 +157,11 @@ Running the agent twice, once to preview and once to post, does **not** give
 you any of this: the second run is an independent model run with a fresh nonce
 and may reach different conclusions.
 
+The Markdown is what you actually read, so promotion refuses to run if that
+document is missing or no longer matches the artifact beside it. Pass
+`-AcceptUnverifiablePreviewDocument` to publish the sealed manifest anyway,
+accepting that nothing can then show that what was published is what was read.
+
 Other properties worth knowing:
 
 - **A preview does not consume the commit.** It is recorded as *not delivered*,
@@ -164,6 +169,10 @@ Other properties worth knowing:
 - **Delivery is tracked per capability.** Comments, the summary and the vote are
   recorded separately, so adding `-EnableApprovalVote` to a PR that already
   received comments still casts the vote instead of skipping the PR as done.
+  A capability this run *attempted and failed* is never marked delivered on the
+  strength of an earlier run's success — that earlier success was for a
+  different set of findings, and inheriting it is how a finding that failed to
+  post would never be retried.
 - **Nothing is written until the PR is re-read.** If the author pushed, or the
   PR became a draft or was completed while the model was running, the whole
   delivery is abandoned rather than partially applied.
