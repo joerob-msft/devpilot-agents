@@ -972,7 +972,7 @@ function Get-ReviewerActivePullRequests {
     param(
         [Parameter(Mandatory)][hashtable]$Session,
         [Parameter(Mandatory)][string]$Project,
-        [Parameter(Mandatory)][string]$RepositoryId,
+        [Parameter(Mandatory)][string]$RepositoryName,
         [Parameter(Mandatory)][string]$TargetRefName,
         [ValidateRange(1, 1000)][int]$PageSize = 100,
         [ValidateRange(1, 100)][int]$MaxPages = 20,
@@ -983,7 +983,7 @@ function Get-ReviewerActivePullRequests {
     $seen = New-Object 'System.Collections.Generic.HashSet[int]'
     for ($pageNumber = 0; $pageNumber -lt $MaxPages; $pageNumber++) {
         $arguments = @{
-            action = 'list'; project = $Project; repositoryId = $RepositoryId
+            action = 'list'; project = $Project; repositoryId = $RepositoryName
             status = 'Active'; targetRefName = $TargetRefName
             top = $PageSize; skip = ($pageNumber * $PageSize)
         }
@@ -2735,7 +2735,7 @@ function Invoke-DryRunSelfChecks {
             default { return @() }
         }
     }
-    $paged = Get-ReviewerActivePullRequests -Session @{} -Project 'p' -RepositoryId 'r' `
+    $paged = Get-ReviewerActivePullRequests -Session @{} -Project 'p' -RepositoryName 'r' `
         -TargetRefName 'refs/heads/main' -PageInvoker $pageInvoker
     if (@($paged).Count -ne 205 -or ($pageOffsets.ToArray() -join ',') -cne '0,100,200') {
         $failures.Add("ADO pagination returned $(@($paged).Count) unique PR(s) at offsets '$($pageOffsets.ToArray() -join ',')'; expected 205 at 0,100,200.")
@@ -2746,7 +2746,7 @@ function Invoke-DryRunSelfChecks {
     else { Write-Host "  OK - ADO pagination advances by top, preserves 205 unique PRs and deduplicates a moving record" -ForegroundColor Green }
 
     $emptyOffsets = New-Object System.Collections.Generic.List[int]
-    $empty = Get-ReviewerActivePullRequests -Session @{} -Project 'p' -RepositoryId 'r' `
+    $empty = Get-ReviewerActivePullRequests -Session @{} -Project 'p' -RepositoryName 'r' `
         -TargetRefName 'refs/heads/main' -PageInvoker {
             param($arguments) [void]$emptyOffsets.Add([int]$arguments.skip); return @()
         }
@@ -2755,7 +2755,7 @@ function Invoke-DryRunSelfChecks {
     }
 
     $boundaryOffsets = New-Object System.Collections.Generic.List[int]
-    $boundary = Get-ReviewerActivePullRequests -Session @{} -Project 'p' -RepositoryId 'r' `
+    $boundary = Get-ReviewerActivePullRequests -Session @{} -Project 'p' -RepositoryName 'r' `
         -TargetRefName 'refs/heads/main' -PageInvoker {
             param($arguments)
             [void]$boundaryOffsets.Add([int]$arguments.skip)
@@ -2769,7 +2769,7 @@ function Invoke-DryRunSelfChecks {
 
     $limitRejected = $false
     try {
-        [void](Get-ReviewerActivePullRequests -Session @{} -Project 'p' -RepositoryId 'r' `
+        [void](Get-ReviewerActivePullRequests -Session @{} -Project 'p' -RepositoryName 'r' `
                 -TargetRefName 'refs/heads/main' -PageSize 2 -MaxPages 2 -PageInvoker {
                 param($arguments)
                 return @(@{ pullRequestId = ([int]$arguments.skip + 1) }, @{ pullRequestId = ([int]$arguments.skip + 2) })
@@ -2778,7 +2778,7 @@ function Invoke-DryRunSelfChecks {
     catch { $limitRejected = $_.Exception.Message -like '*silently truncated*' }
     $badIdRejected = $false
     try {
-        [void](Get-ReviewerActivePullRequests -Session @{} -Project 'p' -RepositoryId 'r' `
+        [void](Get-ReviewerActivePullRequests -Session @{} -Project 'p' -RepositoryName 'r' `
                 -TargetRefName 'refs/heads/main' -PageInvoker {
                 param($arguments) return @(@{ pullRequestId = '12' })
             })
@@ -3882,7 +3882,7 @@ function Invoke-ReviewerCycle {
         }
         else {
             $rawPrs = Get-ReviewerActivePullRequests -Session $session -Project $ExpectedProject `
-                -RepositoryId $RepositoryName -TargetRefName $TargetRefName
+                -RepositoryName $RepositoryName -TargetRefName $TargetRefName
             # Least-recently-reviewed first. Newest-first looked right - the
             # freshest work is the work a review can still change - but on a
             # repository with more open PRs than one cycle can review it means
