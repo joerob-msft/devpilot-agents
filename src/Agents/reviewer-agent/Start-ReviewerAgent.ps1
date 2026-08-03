@@ -1890,7 +1890,10 @@ function Set-JsonState {
     $tempPath = "$Path.tmp-$PID-$([Guid]::NewGuid().ToString('N'))"
     $backupPath = "$Path.bak-$PID-$([Guid]::NewGuid().ToString('N'))"
     try {
-        ($State | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $tempPath -Encoding UTF8
+        # Depth 12, matching the harness. At depth 6 a nested state record is
+        # silently truncated on write rather than failing, so the loss is only
+        # discovered when the state is read back and a field has vanished.
+        ($State | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath $tempPath -Encoding UTF8
         if (Test-Path -LiteralPath $Path) {
             [System.IO.File]::Replace($tempPath, $Path, $backupPath)
             Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
@@ -2370,8 +2373,19 @@ function Invoke-TimedProcess {
         # (OEM) code page.
         $psi.StandardInputEncoding = $utf8Encoding
     }
-    foreach ($variableName in $EnvironmentVariablesToRemove) {
+    foreach ($variableName in @($EnvironmentVariablesToRemove)) {
         $psi.EnvironmentVariables.Remove($variableName)
+    }
+    # Session-attachment variables are stripped UNCONDITIONALLY, not at the
+    # caller's discretion. A Copilot/Agency child that inherits
+    # COPILOT_AGENT_SESSION_ID or AGENCY_SESSION_ID joins the PARENT
+    # conversation instead of starting its own: the wrapper then reads the
+    # parent's own chatter back as "model output", never sees a result
+    # marker, and every cycle fails with no obvious cause. This bit
+    # review-handler and was fixed there; this copy of Invoke-TimedProcess
+    # predates that fix.
+    foreach ($variableName in @(Get-AgentSessionIsolationEnvVars)) {
+        [void]$psi.EnvironmentVariables.Remove($variableName)
     }
 
     # The execution deadline covers process start, stdin write, normal exit,
@@ -3014,7 +3028,7 @@ function ConvertTo-SelfTestMarkerStdOut {
 function Invoke-DryRunSelfChecks {
     $failures = New-Object System.Collections.Generic.List[string]
 
-    Write-Host "[DRY-RUN] Self-check 1/24: parser validation of this script" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 1/25: parser validation of this script" -ForegroundColor Cyan
     $parseErrors = Test-ParserValidity -Path $PSCommandPath
     if ($parseErrors.Count -gt 0) {
         $failures.Add("Parser errors: $($parseErrors -join '; ')")
@@ -3023,7 +3037,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - no parse errors" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 2/24: lock acquire/release + collision detection" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 2/25: lock acquire/release + collision detection" -ForegroundColor Cyan
     # Uses a fresh temp directory, not $StateDir, so a crash between create
     # and cleanup cannot leave selftest-* residue in the operator's live
     # state directory.
@@ -3053,7 +3067,7 @@ function Invoke-DryRunSelfChecks {
         Remove-Item -LiteralPath $probeLock -ErrorAction SilentlyContinue
     }
 
-    Write-Host "[DRY-RUN] Self-check 3/24: state isolation across agent names" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 3/25: state isolation across agent names" -ForegroundColor Cyan
     $otherState = Join-Path (Split-Path $StateDir -Parent) "selftest-other-agent"
     New-Item -ItemType Directory -Force -Path $otherState | Out-Null
     $otherLock = Join-Path $otherState "agent.lock"
@@ -3075,7 +3089,7 @@ function Invoke-DryRunSelfChecks {
         Remove-Item -Recurse -Force -LiteralPath $otherState -ErrorAction SilentlyContinue
     }
 
-    Write-Host "[DRY-RUN] Self-check 4/24: Agency command construction and permanent model PR-write denial in constrained/-Yolo modes" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 4/25: Agency command construction and permanent model PR-write denial in constrained/-Yolo modes" -ForegroundColor Cyan
     $withoutSignOff = Get-CopilotArgs -ModelName $null -VotingEnabled:$false
     $withSignOff = Get-CopilotArgs -ModelName $null -VotingEnabled:$true
     $shadowAllow = @($withoutSignOff | Where-Object { $_ -like '--allow-tool=*' }) -join ' '
@@ -3160,7 +3174,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - explicit Yolo mode retains Agency, Squad, and permanent model PR-write denial" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 5/24: prompt forbids model voting and wrapper request construction is fixed vote-only" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 5/25: prompt forbids model voting and wrapper request construction is fixed vote-only" -ForegroundColor Cyan
     $promptText = Get-Content -LiteralPath $PromptFile -Raw
     $requiredPromptTerms = @(
         'never call',
@@ -3198,7 +3212,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - wrapper request is fixed action=vote and accepts only Approved/WaitingForAuthor" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 6/24: obsolete PAT/helper/identity setup is absent and stale credential variables are scrubbed" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 6/25: obsolete PAT/helper/identity setup is absent and stale credential variables are scrubbed" -ForegroundColor Cyan
     $astTokens = $null
     $astErrors = $null
     $scriptAst = [System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$astTokens, [ref]$astErrors)
@@ -3253,7 +3267,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - no PAT, reviewer GUID, token acquisition, or direct REST path remains; stale credential variables cannot reach child processes" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 7/24: UTF-8 process capture, cycle timeout construction, and real process-tree termination" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 7/25: UTF-8 process capture, cycle timeout construction, and real process-tree termination" -ForegroundColor Cyan
     $psExe = (Get-Command pwsh -ErrorAction Stop).Source
     $utf8ProbeCommand = '$value = [char]::ConvertFromUtf32(0x1F916); ' +
         '[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); ' +
@@ -3339,7 +3353,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - Agency MCP JSON-RPC timeout fails closed and kills the proxy process" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 8/24: commit-scoped state round trip under StrictMode" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 8/25: commit-scoped state round trip under StrictMode" -ForegroundColor Cyan
     # Fresh temp path rather than $StateDir, same reasoning as self-check 2.
     $stateProbePath = Join-Path ([System.IO.Path]::GetTempPath()) "devpilot-reviewer-selftest-reviewed-state-$([Guid]::NewGuid().ToString('N')).json"
     try {
@@ -3357,7 +3371,7 @@ function Invoke-DryRunSelfChecks {
         Remove-Item -LiteralPath $stateProbePath -Force -ErrorAction SilentlyContinue
     }
 
-    Write-Host "[DRY-RUN] Self-check 9/24: valid result marker + nonce round trip is accepted" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 9/25: valid result marker + nonce round trip is accepted" -ForegroundColor Cyan
     $selfTestProject = "Self-Test-Project"
     $selfNonce = New-CryptoNonce
     $validMarker = New-SelfTestMarkerObject -Nonce $selfNonce -Project $selfTestProject -Vote "Approved"
@@ -3370,7 +3384,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - a well-formed marker round-trips correctly" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 10/24: every required marker field, individually missing, returns null (never throws)" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 10/25: every required marker field, individually missing, returns null (never throws)" -ForegroundColor Cyan
     $requiredFields = @("schemaVersion", "prId", "repositoryId", "project", "reviewedSourceCommit", "recommendedVote", "findingCounts", "nonce")
     $missingFieldFailures = 0
     foreach ($field in $requiredFields) {
@@ -3390,7 +3404,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - all $($requiredFields.Count) individually-missing-required-field cases returned `$null without throwing" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 11/24: vote recommendation/count invariants" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 11/25: vote recommendation/count invariants" -ForegroundColor Cyan
     $approvedWithCritical = New-SelfTestMarkerObject -Nonce $selfNonce -Project $selfTestProject -Vote "Approved" -Critical 1
     $r1 = ConvertFrom-ReviewerResultMarker -StdOutText (ConvertTo-SelfTestMarkerStdOut -Marker $approvedWithCritical) -ExpectedProjectName $selfTestProject -ExpectedNonce $selfNonce
     $approvedWithImportant = New-SelfTestMarkerObject -Nonce $selfNonce -Project $selfTestProject -Vote "Approved" -Important 1
@@ -3410,7 +3424,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - recommendation/count invariants hold" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 12/24: malformed finding counts and obsolete voteCast fields are rejected" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 12/25: malformed finding counts and obsolete voteCast fields are rejected" -ForegroundColor Cyan
     $countCases = @(
         @{ name = "overflow (10001)"; mutate = { param($m) $m.findingCounts = @{ critical = 10001; important = 0; suggestion = 0 } } }
         @{ name = "negative"; mutate = { param($m) $m.findingCounts = @{ critical = -1; important = 0; suggestion = 0 } } }
@@ -3437,7 +3451,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - all $($countCases.Count) malformed findingCounts/obsolete voteCast cases were rejected" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 13/24: repeated IDENTICAL markers are accepted, but two DIFFERENT markers are rejected (no 'last wins')" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 13/25: repeated IDENTICAL markers are accepted, but two DIFFERENT markers are rejected (no 'last wins')" -ForegroundColor Cyan
     $dupMarker = New-SelfTestMarkerObject -Nonce $selfNonce -Project $selfTestProject -Vote "None"
     $dupJson = ($dupMarker | ConvertTo-Json -Compress -Depth 6)
     # Real Copilot framing: the marker is repeated in a closing summary turn,
@@ -3461,7 +3475,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - two conflicting markers are rejected outright (no 'last wins')" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 14/24: a marker echoed out of hostile PR content alongside the real one fails closed" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 14/25: a marker echoed out of hostile PR content alongside the real one fails closed" -ForegroundColor Cyan
     # An injected marker cannot know this cycle's nonce, so it can only ever
     # differ from the genuine one - which must fail the whole cycle closed
     # rather than let either value be picked.
@@ -3480,7 +3494,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - a conflicting injected marker fails closed, while ordinary trailing log output after a single genuine marker is tolerated" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 15/24: a wrong/stale nonce is rejected (anti-replay)" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 15/25: a wrong/stale nonce is rejected (anti-replay)" -ForegroundColor Cyan
     $wrongNonceMarker = New-SelfTestMarkerObject -Nonce "not-the-real-nonce" -Project $selfTestProject -Vote "None"
     $wrongNonceResult = ConvertFrom-ReviewerResultMarker -StdOutText (ConvertTo-SelfTestMarkerStdOut -Marker $wrongNonceMarker) -ExpectedProjectName $selfTestProject -ExpectedNonce $selfNonce
     if ($null -ne $wrongNonceResult) {
@@ -3490,7 +3504,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - a mismatched nonce is rejected" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 16/24: lowercase project name, lowercase vote enum, and wrong-case WaitingForAuthor are all rejected (case-sensitive)" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 16/25: lowercase project name, lowercase vote enum, and wrong-case WaitingForAuthor are all rejected (case-sensitive)" -ForegroundColor Cyan
     $lowerProjectMarker = New-SelfTestMarkerObject -Nonce $selfNonce -Project ($selfTestProject.ToLowerInvariant()) -Vote "None"
     $lowerProjectResult = ConvertFrom-ReviewerResultMarker -StdOutText (ConvertTo-SelfTestMarkerStdOut -Marker $lowerProjectMarker) -ExpectedProjectName $selfTestProject -ExpectedNonce $selfNonce
     $lowerVoteMarker = New-SelfTestMarkerObject -Nonce $selfNonce -Project $selfTestProject -Vote "approved"
@@ -3510,7 +3524,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - lowercase project and lowercase vote enum values are all rejected" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 17/24: a legacy numeric-iteration-id-shaped commit value is rejected" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 17/25: a legacy numeric-iteration-id-shaped commit value is rejected" -ForegroundColor Cyan
     $numericCommitMarker = New-SelfTestMarkerObject -Nonce $selfNonce -Project $selfTestProject -Vote "None"
     $numericCommitMarker.reviewedSourceCommit = "7"
     $numericCommitResult = ConvertFrom-ReviewerResultMarker -StdOutText (ConvertTo-SelfTestMarkerStdOut -Marker $numericCommitMarker) -ExpectedProjectName $selfTestProject -ExpectedNonce $selfNonce
@@ -3521,7 +3535,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - a numeric/legacy-shaped commit value is rejected; only exact 40-hex commits are accepted" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 18/24: corrupt security-relevant JSON state is quarantined, including scalar/array top-level content" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 18/25: corrupt security-relevant JSON state is quarantined, including scalar/array top-level content" -ForegroundColor Cyan
     # Fresh temp directory rather than $StateDir, same reasoning as self-check 2.
     $corruptProbeDir = Join-Path ([System.IO.Path]::GetTempPath()) "devpilot-reviewer-selftest-corrupt-state-$([Guid]::NewGuid().ToString('N'))"
     New-Item -ItemType Directory -Force -Path $corruptProbeDir | Out-Null
@@ -3580,7 +3594,7 @@ function Invoke-DryRunSelfChecks {
         Remove-Item -Recurse -Force -LiteralPath $scalarArrayDir -ErrorAction SilentlyContinue
     }
 
-    Write-Host "[DRY-RUN] Self-check 19/24: exit-code and queue-drain delay decisions (pure/no subprocess)" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 19/25: exit-code and queue-drain delay decisions (pure/no subprocess)" -ForegroundColor Cyan
     $exitCases = @(
         @{ name = "Once + live + failed cycle -> 1"; IsOnce = $true; IsDryRun = $false; Last = 1; Expect = 1 }
         @{ name = "Once + live + timed-out cycle (-1) -> 1"; IsOnce = $true; IsDryRun = $false; Last = -1; Expect = 1 }
@@ -3608,7 +3622,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - successful reviews continue immediately; idle cycles use the configured polling interval" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 20/24: author/age-scoped selection, vote verification, and fail-closed state lifecycle" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 20/25: author/age-scoped selection, vote verification, and fail-closed state lifecycle" -ForegroundColor Cyan
     $selfTestNow = [DateTime]::UtcNow
     $selfTestCutoff = $selfTestNow.AddDays(-14)
     $selectionTerms = @(
@@ -4097,7 +4111,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - console text sanitization strips ESC/CR/LF/TAB and format characters, substitutes '(unknown)' for empty input, preserves ordinary titles, and bounds oversized values" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 21/24: reproducible-failure starvation guard and stale-approval absent-reviewer fail-closed" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 21/25: reproducible-failure starvation guard and stale-approval absent-reviewer fail-closed" -ForegroundColor Cyan
     $starvedSetProbe = New-Object System.Collections.Generic.HashSet[string]
     [void]$starvedSetProbe.Add("77:$('7' * 40)")
     $starvedSelectionProbe = Select-DeterministicPullRequestCandidate -Snapshots @(
@@ -4175,7 +4189,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - an absent tracked-reviewer entry on a fresh read fails closed instead of being treated as a proven reset" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 22/24: the Copilot JSONL transcript channel is parsed structurally (real event shapes) and falls back to raw stdout" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 22/25: the Copilot JSONL transcript channel is parsed structurally (real event shapes) and falls back to raw stdout" -ForegroundColor Cyan
     # These are the exact event shapes emitted by `copilot --output-format json`.
     $jsonlLines = @(
         '{"type":"session.mcp_server_status_changed","data":{"serverName":"ado","status":"connected"},"ephemeral":true}',
@@ -4238,7 +4252,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - the final answer, CLI-reported model, exit code, and modified-file list are parsed from real JSONL event shapes; ephemeral deltas and non-JSON banner lines are ignored; raw stdout falls back to the legacy path" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 23/24: infrastructure failures do not starve PRs, attempt pruning is bounded, and the credential pre-flight leaks nothing" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 23/25: infrastructure failures do not starve PRs, attempt pruning is bounded, and the credential pre-flight leaks nothing" -ForegroundColor Cyan
     $hardeningFailures = @()
 
     # Classification is inline in the cycle, so assert its structure the same
@@ -4335,7 +4349,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - a cycle where the model never ran is excluded from starvation counting (while still defaulting to counted), stale attempt records prune on age, the credential pre-flight names its source without exposing the token, the selection budget is operator-controlled, and budget exhaustion reports its real cause" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 24/24: a missing MCP server fails closed, and msbuild is available to local validation" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 24/25: a missing MCP server fails closed, and msbuild is available to local validation" -ForegroundColor Cyan
     $portingFailures = @()
     $mcpScratch = Join-Path ([System.IO.Path]::GetTempPath()) "devpilot-reviewer-selftest-mcp-$([Guid]::NewGuid().ToString('N'))"
     New-Item -ItemType Directory -Force -Path $mcpScratch | Out-Null
@@ -4379,6 +4393,55 @@ function Invoke-DryRunSelfChecks {
     }
     else {
         Write-Host "  OK - an allow-list naming an MCP server the repository does not declare fails closed at startup (built-in tools exempt, declared servers accepted, this repo's own list passes), and msbuild is selectable for local validation while arbitrary shell is still refused" -ForegroundColor Green
+    }
+
+    Write-Host "[DRY-RUN] Self-check 25/25: the model child cannot inherit this session, and state is written deep enough not to truncate" -ForegroundColor Cyan
+    # Both of these were found by comparing this script's copies of harness
+    # functions against the harness itself (tools/Compare-DuplicatedFunctions.ps1).
+    # Neither had a check, and both fail silently: an attached child produces no
+    # marker, and a truncated state record loses fields with no error.
+    $isolationFailures = @()
+
+    $isolationVars = @(Get-AgentSessionIsolationEnvVars)
+    foreach ($required in 'COPILOT_AGENT_SESSION_ID', 'AGENCY_SESSION_ID', 'COPILOT_CUSTOM_INSTRUCTIONS_DIRS') {
+        if ($isolationVars -notcontains $required) {
+            $isolationFailures += "the harness no longer reports '$required' as a session-attachment variable"
+        }
+    }
+    # Assert the stripping is in THIS script's Invoke-TimedProcess, not merely
+    # available from the harness - the whole defect was that it was available
+    # and not called.
+    $timedProcessAst = [System.Management.Automation.Language.Parser]::ParseFile(
+        $PSCommandPath, [ref]$null, [ref]$null).FindAll({
+            param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Invoke-TimedProcess'
+        }, $true)
+    if (@($timedProcessAst).Count -eq 0) {
+        $isolationFailures += "Invoke-TimedProcess was not found in this script"
+    }
+    elseif (@($timedProcessAst)[0].Body.Extent.Text -notmatch 'Get-AgentSessionIsolationEnvVars') {
+        $isolationFailures += "Invoke-TimedProcess does not strip session-attachment variables; a child Copilot would join this session instead of starting its own"
+    }
+
+    # Eight levels is the actual boundary: ConvertTo-Json -Depth 6 truncates at
+    # eight and Depth 12 does not, verified empirically. A seven-level probe
+    # passes under both and would prove nothing.
+    $depthProbe = @{ a = @{ b = @{ c = @{ d = @{ e = @{ f = @{ g = @{ h = 'deep' } } } } } } } }
+    $depthPath = Join-Path ([System.IO.Path]::GetTempPath()) "devpilot-reviewer-selftest-depth-$([Guid]::NewGuid().ToString('N')).json"
+    try {
+        Set-JsonState -Path $depthPath -State $depthProbe
+        $readBack = Get-JsonState -Path $depthPath
+        if ($readBack.a.b.c.d.e.f.g.h -cne 'deep') {
+            $isolationFailures += "state eight levels deep did not survive a write/read round-trip (ConvertTo-Json -Depth too shallow)"
+        }
+    }
+    catch { $isolationFailures += "deep state round-trip threw: $($_.Exception.Message)" }
+    finally { Remove-Item -LiteralPath $depthPath -Force -ErrorAction SilentlyContinue }
+
+    if ($isolationFailures.Count -gt 0) {
+        $failures.Add("Session-isolation/state-depth check failed: $($isolationFailures -join '; ').")
+    }
+    else {
+        Write-Host "  OK - Invoke-TimedProcess strips session-attachment variables so the model child starts its own session, and nested state survives a write/read round-trip" -ForegroundColor Green
     }
 
     return ,$failures
