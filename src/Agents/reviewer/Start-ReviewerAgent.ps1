@@ -1092,6 +1092,15 @@ function Test-ReviewerShouldVote {
     return @{ Vote = ""; Reason = "unrecognized recommendation" }
 }
 
+function Get-ReviewerVersionMismatchGuidance {
+    <# The recovery command is the ONLY way back for a plan the cycle skips, so
+       a wrong switch name here is not cosmetic - it strands the plan. Built in
+       one place so a self-check can verify every switch it names is real. #>
+    param([string]$ArtifactPath)
+    return ("Promote it deliberately with -PromotePreview '$ArtifactPath' -AcceptArtifactFromDifferentAgentVersion, " +
+        "or let a new commit supersede it.")
+}
+
 function Get-ReviewerArtifactScriptSha {
     <# The build identity lives INSIDE the signed manifest text, not on the
        artifact envelope, so it has to be read through manifestJson. Reading the
@@ -2152,6 +2161,26 @@ function Invoke-DryRunSelfChecks {
     if ((Get-ReviewerPublishableCount -SealedCount -1 -PostableCount 4) -ne 4) {
         $failures.Add("An original review did not fall back to its own postable count for the summary.")
         $summaryGateFailures++
+    }
+    # Operator guidance that names a switch this script does not have is worse
+    # than no guidance: the recovery command is the only way back for a skipped
+    # delivery plan, and a wrong name strands it. Checked against the real param
+    # block rather than a hand-maintained list.
+    $declaredParams = @([System.Management.Automation.Language.Parser]::ParseFile(
+            $PSCommandPath, [ref]$null, [ref]$null).ParamBlock.Parameters |
+        ForEach-Object { $_.Name.VariablePath.UserPath })
+    if (@($declaredParams).Count -lt 5) {
+        $failures.Add("Could not read this script's own parameter list, so operator guidance cannot be verified.")
+        $summaryGateFailures++
+    }
+    else {
+        $guidance = Get-ReviewerVersionMismatchGuidance -ArtifactPath "C:\probe.json"
+        foreach ($named in ([regex]::Matches($guidance, '(?<![\w-])-([A-Za-z][A-Za-z0-9]+)') | ForEach-Object { $_.Groups[1].Value })) {
+            if ($declaredParams -notcontains $named) {
+                $failures.Add("Recovery guidance tells the operator to pass -$named, which is not a parameter of this script.")
+                $summaryGateFailures++
+            }
+        }
     }
     # Comment text is rendered by the RUNNING script, so replaying a plan sealed
     # by another build can post a duplicate the fingerprint no longer matches.
@@ -3758,8 +3787,7 @@ function Invoke-ReviewerCycle {
                 if (-not (Test-ReviewerAgentVersionMatch -SealedSha (Get-ReviewerArtifactScriptSha -Path $pendingPlan) -RunningSha $ScriptSelfSha256)) {
                     Write-Warning ("PR $prId has an unfinished delivery sealed by a different version of the reviewer. " +
                         "Replaying it could duplicate comments and re-reviewing could lose a finding that never posted, " +
-                        "so this PR is skipped. Promote it deliberately with -PromoteArtifact '$pendingPlan' " +
-                        "-AcceptArtifactFromDifferentAgentVersion, or let a new commit supersede it.")
+                        "so this PR is skipped. " + (Get-ReviewerVersionMismatchGuidance -ArtifactPath $pendingPlan))
                     [void]$retried.Add("PR $prId skipped (delivery plan sealed by another build)")
                     continue
                 }
