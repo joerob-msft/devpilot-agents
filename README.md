@@ -90,7 +90,10 @@ must live inside that repository.
 The reviewer inverts the usual arrangement. The model is granted **no write tool
 of any kind** — not even the PR-comment tool the `review-handler` uses, and not
 `shell`, since an argument-prefix grant like `shell(git diff:*)` still admits
-`git diff --output=<path>` and is therefore a file-writing primitive. The model
+`git diff --output=<path>` and is therefore a file-writing primitive. It is also
+granted **no outbound-network tool**: this agent reads private source, private
+diffs and private review threads, and a `web_fetch` whose URL the model composes
+is an exfiltration channel that an injected diff only has to ask for. The model
 returns its findings as *structured data* in the result marker, the schema
 bounds them, and the **wrapper** performs every write.
 
@@ -132,23 +135,46 @@ review you have actually read is a first-class mode rather than a re-run:
     -OperatorAlias <your-alias> -EnableFindingComments -EnableSummaryComment
 ```
 
-`-PromotePreview` re-parses the stored review through the same schema that
-bounded it when it was produced, re-checks that it is bound to that PR and that
-exact commit, and re-reads the PR to confirm nothing moved — then posts. Running
-the agent twice, once to preview and once to post, does **not** give you this:
-the second run is an independent model run with a fresh nonce and may reach
-different conclusions.
+`-PromotePreview` publishes the artifact's **delivery manifest** — the exact
+comment list, summary and vote that appeared in the Markdown you read — and
+three things have to hold before any of it goes out. The artifact's HMAC seal
+must verify against a per-user key that is *not stored in the artifact*; the
+stored review must still parse under the same schema that bounded it and still
+be bound to that PR and commit; and everything about to be posted must be a
+**subset** of what you approved. Promotion may *drop* a comment that has since
+become unpublishable. It can never add one.
+
+The seal is the part that makes this more than ceremony. Re-validating a stored
+review against a schema proves it is well-formed, not that it is unchanged —
+the nonce and every self-describing field live inside the very file an attacker
+would be editing, so checking the document against itself is tautological. The
+key lives in the agent's state directory, DPAPI-protected to your user on
+Windows. It defends against an artifact edited on disk; it does **not** defend
+against an attacker who can already run code as you, who could equally well
+post comments directly.
+
+Running the agent twice, once to preview and once to post, does **not** give
+you any of this: the second run is an independent model run with a fresh nonce
+and may reach different conclusions.
 
 Other properties worth knowing:
 
 - **A preview does not consume the commit.** It is recorded as *not delivered*,
   so you can still publish it. A delivered review closes that commit.
+- **Delivery is tracked per capability.** Comments, the summary and the vote are
+  recorded separately, so adding `-EnableApprovalVote` to a PR that already
+  received comments still casts the vote instead of skipping the PR as done.
 - **Nothing is written until the PR is re-read.** If the author pushed, or the
   PR became a draft or was completed while the model was running, the whole
   delivery is abandoned rather than partially applied.
-- **Findings are anchored only inside the PR's change set.** A finding naming a
-  file this PR does not touch is withheld and shown in the preview, never
-  relocated to a PR-level comment.
+- **Findings are published at exactly the location they name, or not at all.**
+  A finding naming a file this PR does not touch, or carrying a file with no
+  line (or a line with no file), is withheld and shown in the preview. There is
+  no fallback to a PR-level comment: a relocated comment is a different comment,
+  and retrying one produces duplicate noise.
+- **An unreadable change set blocks publication.** Scoping fails *open* for a
+  preview, because a human reads that and an empty preview would hide real
+  findings; it fails *closed* for anything that posts.
 - **Scheduling is least-recently-reviewed first**, so a repository with more
   open PRs than one cycle can review does not re-examine its newest few forever.
 - It can never cast a `Rejected` vote; it refuses to vote when the findings that
@@ -213,6 +239,23 @@ See [`docs/adding-an-agent.md`](docs/adding-an-agent.md).
   injected prompt could aim at the host. Whole classes of defect are therefore
   outside what it can find, and it is an addition to human review, not a
   replacement for it.
+- **The change-set guard validates files, not lines.** A finding must name a
+  file the PR changes, but within that file the model can name any line. Right-
+  side changed-line ranges are not yet parsed.
+- **Withholding cross-file findings is a policy, not a free win.** A changed
+  caller that breaks an untouched implementation is a real defect, and the
+  agent will withhold a finding anchored in the untouched file rather than
+  relocate it. The intended shape is to anchor on the changed causal line and
+  describe the cross-file consequence there.
+- **Candidate selection sees the first 100 active PRs.** Scheduling within that
+  slice is least-recently-reviewed first; pagination beyond it is not
+  implemented. `-PullRequestId` reaches any single PR directly.
+- **`WaitingForAuthor` is a real blocker in most ADO branch policies**, and
+  there is no policy yet for neutralising a stale `-5` after the author pushes
+  a fix. Leave `-EnableApprovalVote` off unless you want that.
+- **Artifact sealing does not survive a compromised account.** The signing key
+  is DPAPI-protected to your user; an attacker who can run code as you can sign
+  anything — but could equally well post comments directly.
 
 ---
 

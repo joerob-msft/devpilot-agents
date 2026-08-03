@@ -44,7 +44,7 @@
     ]
   },
   "threadClassification": {
-    "note": "Identities whose comments are NOT human review feedback. Used only to build the metadata digest the model sees - comment text is never sent to the model, from any author.",
+    "note": "Identities whose comments are NOT human review feedback. Used to build the metadata digest the model sees, so that a bot's or a policy service's output is not mistaken for a reviewer's opinion.",
     "botIdentitySubstrings": [
       "PR Assistant",
       "Policy Bot"
@@ -62,7 +62,7 @@
     "customRules": "Public API changes require a corresponding entry in docs/api-changes.md. Prefer flagging a missing test over speculating about runtime behaviour the diff does not show."
   },
   "permissions": {
-    "note": "The wrapper's code-defined ceiling is read-only and this list may only NARROW it. Write tools - including ado(repo_pull_request_thread_write) and ado(repo_pull_request_write) - are mandatory denies that no config can grant: the model reports findings as structured data and the WRAPPER performs every write. shell(...) is rejected outright, even for commands that look read-only: `git diff --output=<path>` and `git log --output=<path>` write files, so no argument-prefix grant on a shell command is safe.",
+    "note": "The wrapper's code-defined ceiling is read-only and this list may only NARROW it. Write tools - including ado(repo_pull_request_thread_write) and ado(repo_pull_request_write) - are mandatory denies that no config can grant: the model reports findings as structured data and the WRAPPER performs every write. Two whole families are rejected outright no matter what is listed here. shell(...) is rejected even for commands that look read-only, because `git diff --output=<path>` and `git log --output=<path>` write files, so no argument-prefix grant on a shell command is safe. web_search and web_fetch are rejected because this agent reads private source and private review threads, and an outbound request whose URL the model composes is an exfiltration channel.",
     "allowTools": [
       "read",
       "ado(repo_pull_request)",
@@ -70,9 +70,7 @@
       "ado(repo_search_commits)",
       "ado(repo_repository)",
       "ado(repo_file)",
-      "ado(repo_branch)",
-      "web_search",
-      "web_fetch"
+      "ado(repo_branch)"
     ],
     "denyTools": [
       "shell(srectl:*)",

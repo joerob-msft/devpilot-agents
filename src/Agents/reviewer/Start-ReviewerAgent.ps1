@@ -16,8 +16,11 @@
         `ado(repo_pull_request_thread_write)`, and not `shell`, because an
         argument-prefix grant such as shell(git diff:*) still admits
         `git diff --output=<path>` and is therefore a file-writing primitive.
-        It reports findings as structured data in the result marker and the
-        WRAPPER performs every write.
+        It is likewise granted no web_search/web_fetch: this agent reads
+        private source and private review threads, and an outbound request
+        whose URL the model composes is an exfiltration channel. It reports
+        findings as structured data in the result marker and the WRAPPER
+        performs every write.
       - What that does and does not buy, stated precisely:
           * a successful prompt injection cannot reach the host or the
             repository: there is no tool to edit, run, post or vote with;
@@ -28,11 +31,23 @@
             validation cannot distinguish a genuine finding from a fabricated
             one, so an unattended posting run is NOT injection-proof. Use
             -PromotePreview to publish a review a human actually read.
+      - Every preview writes a sealed DELIVERY MANIFEST beside its Markdown:
+        the exact comments, summary and vote shown to the operator, HMAC'd with
+        a per-user key that is NOT stored in the artifact. -PromotePreview
+        verifies the seal and publishes only that manifest; it may drop an entry
+        that has since become unpublishable, never add one. Without the seal the
+        re-validation would be tautological - the nonce and every
+        self-describing field live inside the file an editor controls.
       - Every write is opt-in and independently gated; all default OFF. The
         agent therefore does nothing observable until an operator says so.
       - No write happens until the PR is re-read and confirmed unchanged since
         the reviewed commit; a PR that moved on is abandoned, not partly
-        commented.
+        commented. Delivery also refuses to publish when the PR's change set
+        could not be read, since no finding's location could then be verified.
+      - A finding is published at exactly the location it names or not at all.
+        There is no fallback from a rejected file anchor to a PR-level comment:
+        a relocated comment is a different comment, so retrying one would post
+        duplicate noise while never satisfying the anchored finding.
       - The agent NEVER casts a Rejected vote. It can approve, approve with
         suggestions, or ask for the author - nothing that blocks a PR outright.
       - Config may NARROW the code-defined allow-tool ceiling but never widen
@@ -248,6 +263,14 @@ $script:ReviewerMandatoryDenyTools = @(
 # takes arguments the wrapper controls and returns data. Self-check 3 enforces
 # the absence of the whole shell(...) family rather than a list of known-bad
 # command names, because that enumeration can never be complete.
+#
+# There is likewise NO web_search / web_fetch grant. This agent reads private
+# source, private diffs and private review threads; an outbound request whose
+# URL or query string the model composes is an exfiltration channel, and an
+# injected diff only has to say "look up <secret> on example.com" to use it. A
+# reviewer gains little from the open web and risks a lot, so the whole class
+# is denied. Self-check 3 enforces the absence of the network family in both
+# the ceiling and the consuming repo's config.
 $script:ReviewerAllowToolCeiling = @(
     "read",
     "ado(repo_pull_request)",
@@ -256,9 +279,17 @@ $script:ReviewerAllowToolCeiling = @(
     "ado(repo_repository)",
     "ado(repo_file)",
     "ado(repo_branch)",
-    "bluebird",
-    "web_search",
-    "web_fetch"
+    "bluebird"
+)
+
+# Tool-name families this agent refuses to grant no matter what a consuming
+# repo's config asks for. Assembled from fragments so that self-check 3, which
+# scans this script's own source for accidental grants, cannot match this
+# declaration and report itself as a violation.
+$script:ReviewerForbiddenToolFamilies = @(
+    ('sh' + 'ell('),
+    ('web_' + 'search'),
+    ('web_' + 'fetch')
 )
 
 # Votes this agent is permitted to cast. 'Rejected' is intentionally absent: an
@@ -292,6 +323,160 @@ function Get-ReviewerHashValue {
         return $Default
     }
     return $Default
+}
+
+function Get-ReviewerCanonicalJson {
+    <#
+        Deterministic JSON for signing: object keys sorted ordinally, arrays in
+        order, no insignificant whitespace. ConvertTo-Json is NOT deterministic
+        enough for this - hashtable enumeration order is not guaranteed - and a
+        signature over a non-canonical encoding is a signature that verifies by
+        luck.
+    #>
+    param($Value)
+    if ($null -eq $Value) { return 'null' }
+    if ($Value -is [bool]) { return $(if ($Value) { 'true' } else { 'false' }) }
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) {
+        return [string]([System.Convert]::ToString($Value, [System.Globalization.CultureInfo]::InvariantCulture))
+    }
+    if ($Value -is [string]) { return (ConvertTo-Json -InputObject $Value -Compress) }
+    if ($Value -is [hashtable] -or $Value -is [System.Management.Automation.PSCustomObject]) {
+        $keys = @()
+        if ($Value -is [hashtable]) { $keys = @($Value.Keys | ForEach-Object { [string]$_ }) }
+        else { $keys = @($Value.PSObject.Properties | ForEach-Object { $_.Name }) }
+        $parts = @($keys | Sort-Object -CaseSensitive | ForEach-Object {
+                $k = $_
+                "{0}:{1}" -f (ConvertTo-Json -InputObject $k -Compress), (Get-ReviewerCanonicalJson -Value (Get-ReviewerHashValue -Container $Value -Key $k))
+            })
+        return "{" + ($parts -join ",") + "}"
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $parts = @(@($Value) | ForEach-Object { Get-ReviewerCanonicalJson -Value $_ })
+        return "[" + ($parts -join ",") + "]"
+    }
+    return (ConvertTo-Json -InputObject ([string]$Value) -Compress)
+}
+
+function Get-ReviewerArtifactSigningKey {
+    <#
+        Returns the per-user HMAC key used to seal preview artifacts, creating
+        it on first use.
+
+        Why a key at all: promotion's whole purpose is to publish EXACTLY the
+        review a human read. Re-validating the stored marker against the schema
+        proves it is well-formed, not that it is the same text - and the nonce
+        cannot help, because it lives inside the very file an attacker would be
+        editing. Checking a self-describing document against itself is
+        tautological. A secret the document does not contain is what makes the
+        check mean something.
+
+        The key is stored under the agent's state directory, DPAPI-protected to
+        the current user on Windows so that another account on a shared machine
+        cannot read it. Where DPAPI is unavailable the raw key is written with
+        the file system's default per-user permissions and the weaker guarantee
+        is stated plainly rather than papered over.
+
+        This defends against an artifact edited on disk. It does NOT defend
+        against an attacker who can already run code as this user - such an
+        attacker can sign whatever they like, and could equally well post
+        comments directly.
+    #>
+    param([Parameter(Mandatory)][string]$KeyPath)
+    if (Test-Path -LiteralPath $KeyPath) {
+        $stored = [System.Convert]::FromBase64String((Get-Content -LiteralPath $KeyPath -Raw).Trim())
+        if ($IsWindows) {
+            try { return [System.Security.Cryptography.ProtectedData]::Unprotect($stored, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser) }
+            catch { throw "The preview-artifact signing key at $KeyPath could not be decrypted for this user: $($_.Exception.Message)" }
+        }
+        return $stored
+    }
+    $key = New-Object byte[] 32
+    [System.Security.Cryptography.RandomNumberGenerator]::Fill($key)
+    $toStore = $key
+    if ($IsWindows) {
+        try { $toStore = [System.Security.Cryptography.ProtectedData]::Protect($key, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser) }
+        catch { Write-Warning "DPAPI is unavailable; the signing key is stored unencrypted at $KeyPath and is only as private as that file." }
+    }
+    Set-Content -LiteralPath $KeyPath -Value ([System.Convert]::ToBase64String($toStore)) -Encoding ascii
+    return $key
+}
+
+function Get-ReviewerNormalizedDocumentText {
+    <# Line endings are not part of a document's meaning, and Set-Content adds a
+       trailing terminator, so the preview hash is taken over LF-normalized text
+       with trailing blank lines removed. Both the sealing and the verifying
+       side must use this or the check fails for a file nobody touched. #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    return (($Text -replace "`r`n", "`n").TrimEnd("`n"))
+}
+
+function Get-ReviewerTextSha256 {
+    <# SHA-256 of a UTF-8 string, lowercase hex. Used to bind the Markdown the
+       operator reads to the manifest that gets promoted, so an artifact cannot
+       be paired with a preview describing something else. #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Text))
+        return ([System.BitConverter]::ToString($bytes)).Replace('-', '').ToLowerInvariant()
+    }
+    finally { $sha.Dispose() }
+}
+
+function Get-ReviewerArtifactSignature {
+    <# HMAC-SHA256 over the canonical encoding of everything the artifact
+       asserts. Returned lowercase hex. #>
+    param([Parameter(Mandatory)]$SignedPayload, [Parameter(Mandatory)][byte[]]$Key)
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes((Get-ReviewerCanonicalJson -Value $SignedPayload))
+    $hmac = [System.Security.Cryptography.HMACSHA256]::new($Key)
+    try { return ([System.BitConverter]::ToString($hmac.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() }
+    finally { $hmac.Dispose() }
+}
+
+function Test-ReviewerArtifactSignature {
+    <# Constant-time comparison so that a mismatching signature cannot be
+       recovered a byte at a time by timing repeated promotion attempts. #>
+    param([Parameter(Mandatory)]$SignedPayload, [Parameter(Mandatory)][byte[]]$Key, [string]$Signature)
+    if ([string]::IsNullOrWhiteSpace($Signature)) { return $false }
+    $expected = Get-ReviewerArtifactSignature -SignedPayload $SignedPayload -Key $Key
+    if ($expected.Length -ne $Signature.Length) { return $false }
+    $diff = 0
+    for ($i = 0; $i -lt $expected.Length; $i++) { $diff = $diff -bor ([int][char]$expected[$i] -bxor [int][char]$Signature[$i]) }
+    return ($diff -eq 0)
+}
+
+function Get-ReviewerManifestKey {
+    <# Identity of one approved comment: severity, anchor and text. Promotion
+       uses it to prove that everything it is about to post was in the manifest
+       the operator read. #>
+    param($Finding)
+    return "{0}|{1}|{2}|{3}" -f `
+        ([string](Get-ReviewerHashValue -Container $Finding -Key 'severity' -Default '')).ToLowerInvariant(),
+        (Get-ReviewerNormalizedPath -Path ([string](Get-ReviewerHashValue -Container $Finding -Key 'filePath' -Default ''))),
+        ([int](Get-ReviewerHashValue -Container $Finding -Key 'line' -Default 0)),
+        ([string](Get-ReviewerHashValue -Container $Finding -Key 'comment' -Default ''))
+}
+
+function Select-ReviewerManifestSubset {
+    <#
+        Promotion may publish FEWER comments than the operator approved - a
+        finding whose file the PR no longer changes must still be dropped - but
+        it must never publish one they did not approve.
+
+        Enforcing that as a subset check rather than by recomputing the ranking
+        is the point: recomputation reads the CURRENT postSeverities, cap and
+        change set, so a config edit between preview and promotion could add a
+        comment that was never in the reviewed Markdown. Returns the approved
+        entries that survive $Allowed, preserving approval order.
+    #>
+    param([object[]]$Approved, [object[]]$Allowed)
+    $allowedKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    foreach ($a in @($Allowed)) { [void]$allowedKeys.Add((Get-ReviewerManifestKey -Finding $a)) }
+    $kept = New-Object System.Collections.Generic.List[object]
+    foreach ($f in @($Approved)) {
+        if ($allowedKeys.Contains((Get-ReviewerManifestKey -Finding $f))) { [void]$kept.Add($f) }
+    }
+    return , ($kept.ToArray())
 }
 
 function Get-ReviewerAlias {
@@ -385,9 +570,16 @@ function Get-ReviewerReviewKey {
 function Test-ReviewerAlreadyReviewed {
     <#
         A stored review only closes a PR to further work when it actually
-        DELIVERED everything the current run is being asked to deliver.
+        DELIVERED every capability the current run is being asked to deliver.
 
-        Without this distinction a preview run would consume the commit: the
+        Capabilities are tracked individually rather than by one 'delivered'
+        bit, because the write switches are independent. With a single bit, a
+        successful summary-only run recorded delivered=true, and a later run
+        adding -EnableFindingComments at the same commit skipped the PR: the
+        newly requested capability could never happen. The reverse (comments
+        first, summary later) failed the same way.
+
+        Without any of this a preview run would also consume the commit: the
         operator inspects the preview, re-runs with -EnableFindingComments to
         publish it, and the agent skips the PR as "already reviewed" - so the
         advertised preview-then-publish workflow could never publish anything.
@@ -399,8 +591,13 @@ function Test-ReviewerAlreadyReviewed {
         [int]$PrId,
         [string]$SourceCommit,
         # $true when this run has at least one write switch on. A preview run
-        # asks for nothing, so any prior record satisfies it.
-        [bool]$WritesRequested = $false
+        # asks for nothing, so any prior record at this commit satisfies it.
+        [bool]$WritesRequested = $false,
+        # The capabilities this run would deliver. Each must already be recorded
+        # as delivered for the PR to be skipped.
+        [bool]$WantComments = $false,
+        [bool]$WantSummary = $false,
+        [bool]$WantVote = $false
     )
     if ($null -eq $ReviewedState) { return $false }
     $key = [string]$PrId
@@ -409,7 +606,18 @@ function Test-ReviewerAlreadyReviewed {
     $recCommit = [string](Get-ReviewerHashValue -Container $rec -Key 'sourceCommit' -Default '')
     if ($recCommit -ine $SourceCommit) { return $false }
     if (-not $WritesRequested) { return $true }
-    return [bool](Get-ReviewerHashValue -Container $rec -Key 'delivered' -Default $false)
+    # Records written before per-capability tracking existed carry only
+    # 'delivered'. Treat that as "comments and summary were delivered" - which
+    # is what the old bit was computed from - and as "no vote was resolved", so
+    # an upgrade re-attempts a vote rather than silently swallowing it.
+    $legacy = [bool](Get-ReviewerHashValue -Container $rec -Key 'delivered' -Default $false)
+    $comments = [bool](Get-ReviewerHashValue -Container $rec -Key 'commentsDelivered' -Default $legacy)
+    $summary = [bool](Get-ReviewerHashValue -Container $rec -Key 'summaryDelivered' -Default $legacy)
+    $vote = [bool](Get-ReviewerHashValue -Container $rec -Key 'voteResolved' -Default $false)
+    if ($WantComments -and -not $comments) { return $false }
+    if ($WantSummary -and -not $summary) { return $false }
+    if ($WantVote -and -not $vote) { return $false }
+    return $true
 }
 
 function Get-ReviewerLastReviewedSortKey {
@@ -531,23 +739,45 @@ function Get-ReviewerNormalizedPath {
     return $p.TrimEnd('/').ToLowerInvariant()
 }
 
+function Test-ReviewerAnchorConsistent {
+    <#
+        The marker schema validates filePath and line independently, so
+        {path:"/src/a.ts", line:0} and {path:"", line:42} both parse. Neither is
+        a location: the first would post at PR level under a comment that names a
+        file, the second names a line in no file at all. Publishing either one
+        misrepresents where the agent believes the problem is, so the pair is
+        required to be all-or-nothing.
+    #>
+    param([string]$FilePath, [int]$Line)
+    $hasPath = -not [string]::IsNullOrWhiteSpace($FilePath)
+    if ($hasPath) { return ($Line -gt 0) }
+    return ($Line -le 0)
+}
+
 function Split-ReviewerFindingsByChangeSet {
     <#
         Separates findings the wrapper is willing to publish from findings whose
-        claimed location is not in this PR's change set.
+        claimed location cannot be trusted.
+
+        Two things are withheld. First, a finding whose file/line pair is
+        internally inconsistent (see Test-ReviewerAnchorConsistent): it has no
+        usable location, and choosing one for it would be the wrapper inventing
+        evidence. Second, a finding whose file is not in this PR's change set.
 
         The model is instructed to comment only on lines the PR touched, but an
         instruction is not an enforcement point: an injected or simply confused
         model can name any path, and the wrapper would then anchor a comment
-        onto a file the author never edited - or, when ADO rejects the anchor,
-        silently degrade it to a PR-level comment that reads as if it were about
-        this change. Both outcomes publish an unfounded claim under the
-        operator's identity, so an out-of-scope finding is withheld from posting
-        and surfaced in the preview instead of being quietly relocated.
+        onto a file the author never edited. That publishes an unfounded claim
+        under the operator's identity, so an out-of-scope finding is withheld
+        from posting and surfaced in the preview instead of being relocated.
 
         $ChangedPaths empty means "unknown" (the change-set read failed), and
-        unknown must not be treated as "nothing changed": enforcement is skipped
-        and every finding stays postable. Returns @{ Postable; Withheld }.
+        unknown must not be treated as "nothing changed": change-set enforcement
+        is skipped here. Callers that are about to WRITE must refuse to publish
+        on an unknown change set - see Invoke-ReviewerDelivery - because failing
+        open is only acceptable for a preview a human will read.
+
+        Returns @{ Postable; Withheld }.
     #>
     param([object[]]$Findings, [string[]]$ChangedPaths = @())
     $changed = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
@@ -559,6 +789,8 @@ function Split-ReviewerFindingsByChangeSet {
     $withheld = New-Object System.Collections.Generic.List[object]
     foreach ($f in @($Findings)) {
         $raw = [string](Get-ReviewerHashValue -Container $f -Key 'filePath' -Default '')
+        $ln = [int](Get-ReviewerHashValue -Container $f -Key 'line' -Default 0)
+        if (-not (Test-ReviewerAnchorConsistent -FilePath $raw -Line $ln)) { [void]$withheld.Add($f); continue }
         if ($changed.Count -eq 0 -or $raw.Trim() -eq "") { [void]$postable.Add($f); continue }
         if ($changed.Contains((Get-ReviewerNormalizedPath -Path $raw))) { [void]$postable.Add($f) }
         else { [void]$withheld.Add($f) }
@@ -684,7 +916,13 @@ function Get-ReviewerEffectiveAllowTools {
        the WRAPPER a permission, never the model. The model's tool list is the
        same on every cycle, which is exactly why a preview is faithful. #>
     param([string[]]$BaseAllow)
-    $tools = @(@($BaseAllow) | Where-Object { $script:ReviewerMandatoryDenyTools -cnotcontains $_ } | Select-Object -Unique)
+    $tools = @(@($BaseAllow) | Where-Object {
+            $entry = $_
+            if ($script:ReviewerMandatoryDenyTools -ccontains $entry) { return $false }
+            # Forbidden families are matched by prefix, not by exact name, so a
+            # config cannot smuggle one in by varying its arguments.
+            @($script:ReviewerForbiddenToolFamilies | Where-Object { $entry.StartsWith($_, [StringComparison]::Ordinal) }).Count -eq 0
+        } | Select-Object -Unique)
     return , @($tools)
 }
 
@@ -864,6 +1102,7 @@ $logPath = Join-Path $logDir "reviewer.log.jsonl"
 $lockPath = Join-Path $StateDir "agent.lock"
 $reviewedStatePath = Join-Path $StateDir "reviewed.json"
 $attemptsStatePath = Join-Path $StateDir "attempts.json"
+$artifactKeyPath = Join-Path $StateDir "artifact-signing.key"
 
 $ScriptSelfSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
 $SensitiveEnvironmentVariables = @("AZURE_DEVOPS_EXT_PAT", "SYSTEM_ACCESSTOKEN", "GITHUB_TOKEN")
@@ -1128,11 +1367,12 @@ function Write-ReviewerPreview {
         [void]$lines.Add("")
     }
     if (@($Withheld).Count -gt 0) {
-        [void]$lines.Add("## Withheld - the named file is not in this PR's change set ($(@($Withheld).Count))")
+        [void]$lines.Add("## Withheld - not publishable at the location claimed ($(@($Withheld).Count))")
         [void]$lines.Add("")
-        [void]$lines.Add("These are shown for the operator's judgement and are never posted: the agent may")
-        [void]$lines.Add("only comment on lines this pull request touches, and anchoring them elsewhere would")
-        [void]$lines.Add("publish a claim about code the author did not write here.")
+        [void]$lines.Add("These are shown for the operator's judgement and are never posted. A finding is")
+        [void]$lines.Add("withheld when it names a file this pull request does not change, or when its")
+        [void]$lines.Add("file/line pair is internally inconsistent. Anchoring either one somewhere else")
+        [void]$lines.Add("would publish a claim about code the author did not write here.")
         [void]$lines.Add("")
         foreach ($f in @($Withheld)) {
             $loc = [string](Get-ReviewerHashValue -Container $f -Key 'filePath' -Default '')
@@ -1150,29 +1390,52 @@ function Write-ReviewerPreview {
     $path = Join-Path $previewDir "$baseName.md"
     Set-Content -LiteralPath $path -Value $text -Encoding UTF8
 
-    # The artifact carries the marker as VALIDATED DATA, not as the model's raw
-    # output: promotion re-parses it through the same schema, so a hand-edited
-    # artifact is bounded by exactly the rules a live review is bounded by.
+    # The artifact is the DELIVERY MANIFEST, not a copy of the model's output.
+    # It records the exact comments, summary and vote the operator is being
+    # shown, plus the hash of the Markdown they read, and it is sealed with a
+    # per-user HMAC key that is not stored inside it. Promotion verifies the
+    # seal and publishes only what the manifest lists: it may drop an entry that
+    # has since become unpublishable, but it can never add one. The marker is
+    # kept alongside so promotion can still re-validate it against the schema,
+    # which bounds the text a second time.
     $artifactPath = ""
     if ($Marker) {
         try {
             $artifactPath = Join-Path $previewDir "$baseName.json"
-            $artifact = @{
-                artifactVersion = 1
-                organization    = $Organization
-                project         = $ExpectedProject
-                repositoryName  = $RepositoryName
-                repositoryId    = $cfgRepoId
-                prId            = $PrId
-                prTitle         = $PrTitle
-                sourceCommit    = $SourceCommit
-                markerPrefix    = $ResultMarkerPrefix
-                maxFindingItems = $EffectiveMaxFindings
-                createdAt       = ([DateTime]::UtcNow.ToString("o"))
-                scriptSha256    = $ScriptSelfSha256
-                markerBody      = (ConvertTo-Json -InputObject $Marker -Depth 8 -Compress)
+            $signed = @{
+                artifactVersion  = 2
+                organization     = $Organization
+                project          = $ExpectedProject
+                repositoryName   = $RepositoryName
+                repositoryId     = $cfgRepoId
+                prId             = $PrId
+                prTitle          = $PrTitle
+                sourceCommit     = $SourceCommit
+                markerPrefix     = $ResultMarkerPrefix
+                maxFindingItems  = $EffectiveMaxFindings
+                createdAt        = ([DateTime]::UtcNow.ToString("o"))
+                scriptSha256     = $ScriptSelfSha256
+                previewPath      = $path
+                previewSha256    = (Get-ReviewerTextSha256 -Text (Get-ReviewerNormalizedDocumentText -Text $text))
+                approvedComments = @(@($Postable) | ForEach-Object {
+                        @{
+                            severity = [string](Get-ReviewerHashValue -Container $_ -Key 'severity' -Default '')
+                            filePath = [string](Get-ReviewerHashValue -Container $_ -Key 'filePath' -Default '')
+                            line     = [int](Get-ReviewerHashValue -Container $_ -Key 'line' -Default 0)
+                            comment  = [string](Get-ReviewerHashValue -Container $_ -Key 'comment' -Default '')
+                        }
+                    })
+                approvedSummary  = [string]$Summary
+                approvedVote     = [string]$RecommendedVote
+                reportedFindings = @($AllFindings).Count
+                markerBody       = (ConvertTo-Json -InputObject $Marker -Depth 8 -Compress)
             }
-            Set-Content -LiteralPath $artifactPath -Value (ConvertTo-Json -InputObject $artifact -Depth 8) -Encoding UTF8
+            $artifact = @{
+                signed          = $signed
+                signatureAlg    = "HMACSHA256"
+                signature       = (Get-ReviewerArtifactSignature -SignedPayload $signed -Key (Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath))
+            }
+            Set-Content -LiteralPath $artifactPath -Value (ConvertTo-Json -InputObject $artifact -Depth 10) -Encoding UTF8
         }
         catch {
             Write-Warning "Could not write the promotion artifact for PR ${PrId}: $($_.Exception.Message)"
@@ -1202,10 +1465,17 @@ function Write-ReviewerPreview {
 
 function Add-ReviewerThread {
     <#
-        Creates one PR comment thread, anchored to file+line when the finding has
-        one. ADO rejects a file-anchored thread whose path does not exist in the
-        iteration, so a failure falls back to a PR-level comment rather than
-        losing the finding entirely.
+        Creates one PR comment thread at exactly the anchor the finding claims,
+        and nowhere else.
+
+        There is deliberately NO fallback from a file-anchored thread to a
+        PR-level one. A relocated comment is a different comment: it fingerprints
+        differently, so the post-write confirmation (which looks for the anchored
+        fingerprint) correctly refuses to count it, delivery stays incomplete,
+        and the next cycle posts another PR-level copy. Repeated identical
+        PR-level noise is a worse outcome than one clearly reported failure, and
+        a silent relocation also contradicts the documented promise that findings
+        are never moved off the line they name.
 
         The response is read as TEXT, never JSON-parsed: ADO write actions
         confirm in prose, and parsing them would throw AFTER the comment had
@@ -1218,30 +1488,33 @@ function Add-ReviewerThread {
         [string]$FilePath = "",
         [int]$Line = 0
     )
-    $attempts = New-Object System.Collections.Generic.List[hashtable]
-    if ($FilePath -and $Line -gt 0) {
-        $attempts.Add(@{
-                action = 'create'; project = $ExpectedProject; repositoryId = $RepositoryName
-                pullRequestId = $PrId; content = $Content; status = 'Active'
-                filePath = $FilePath
-                rightFileStartLine = $Line; rightFileStartOffset = 1
-                rightFileEndLine = $Line; rightFileEndOffset = 1
-            })
+    # The pair invariant is enforced at parse time, but it is cheap to refuse a
+    # malformed anchor here too rather than guess which half to believe.
+    if (($FilePath -and $Line -le 0) -or (-not $FilePath -and $Line -gt 0)) {
+        return @{ Attempted = $false; Error = "inconsistent anchor (path='$FilePath', line=$Line); refusing to guess a location"; Anchored = $false }
     }
-    $attempts.Add(@{
-            action = 'create'; project = $ExpectedProject; repositoryId = $RepositoryName
-            pullRequestId = $PrId; content = $Content; status = 'Active'
-        })
 
-    $lastError = $null
-    foreach ($attempt in $attempts) {
-        try {
-            Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request_thread" -RawText -Arguments $attempt | Out-Null
-            return @{ Attempted = $true; Error = $null; Anchored = $attempt.ContainsKey('filePath') }
-        }
-        catch { $lastError = $_.Exception.Message }
+    $arguments = @{
+        action = 'create'; project = $ExpectedProject; repositoryId = $RepositoryName
+        pullRequestId = $PrId; content = $Content; status = 'Active'
     }
-    return @{ Attempted = $true; Error = $lastError; Anchored = $false }
+    $anchored = $false
+    if ($FilePath -and $Line -gt 0) {
+        $anchored = $true
+        $arguments['filePath'] = $FilePath
+        $arguments['rightFileStartLine'] = $Line
+        $arguments['rightFileStartOffset'] = 1
+        $arguments['rightFileEndLine'] = $Line
+        $arguments['rightFileEndOffset'] = 1
+    }
+
+    try {
+        Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request_thread" -RawText -Arguments $arguments | Out-Null
+        return @{ Attempted = $true; Error = $null; Anchored = $anchored }
+    }
+    catch {
+        return @{ Attempted = $true; Error = $_.Exception.Message; Anchored = $anchored }
+    }
 }
 
 function Set-ReviewerVote {
@@ -1294,7 +1567,7 @@ function Set-ReviewerVote {
 
 function Invoke-DryRunSelfChecks {
     $failures = New-Object System.Collections.Generic.List[string]
-    $total = 19
+    $total = 20
 
     Write-Host "[DRY-RUN] Self-check 1/$total : parser validity + prompt presence" -ForegroundColor Cyan
     foreach ($p in @($PSCommandPath, $HarnessPath)) {
@@ -1328,12 +1601,31 @@ function Invoke-DryRunSelfChecks {
         })
     if ($writeShaped.Count -gt 0) { $failures.Add("The read-only ceiling contains write-shaped tool(s): $($writeShaped -join ', ').") }
     else { Write-Host "  OK - the ceiling itself contains no write-shaped tool" -ForegroundColor Green }
-    # shell(...) is banned outright rather than by naming write commands: an
-    # argument-prefix grant such as shell(git diff:*) still admits
-    # `git diff --output=<path>`, which creates and truncates files.
-    $shellGrants = @($ConfigAllowTools | Where-Object { $_ -match '^shell\(' })
-    if ($shellGrants.Count -gt 0) { $failures.Add("The configured allow-list grants shell tool(s), which are never argument-safe here: $($shellGrants -join ', ').") }
-    else { Write-Host "  OK - neither the ceiling nor the config grants any shell(...) tool" -ForegroundColor Green }
+    # shell(...) and the web_* family are banned outright rather than by naming
+    # write commands: an argument-prefix grant such as shell(git diff:*) still
+    # admits `git diff --output=<path>`, which creates and truncates files, and
+    # an outbound fetch whose URL the model composes exfiltrates private source.
+    $forbiddenInCeiling = @($script:ReviewerAllowToolCeiling | Where-Object {
+            $entry = $_
+            @($script:ReviewerForbiddenToolFamilies | Where-Object { $entry.StartsWith($_, [StringComparison]::Ordinal) }).Count -gt 0
+        })
+    if ($forbiddenInCeiling.Count -gt 0) { $failures.Add("The read-only ceiling grants forbidden tool family member(s): $($forbiddenInCeiling -join ', ').") }
+    else { Write-Host "  OK - the ceiling grants no shell(...) and no outbound-network tool" -ForegroundColor Green }
+    $shellGrants = @($ConfigAllowTools | Where-Object {
+            $entry = $_
+            @($script:ReviewerForbiddenToolFamilies | Where-Object { $entry.StartsWith($_, [StringComparison]::Ordinal) }).Count -gt 0
+        })
+    if ($shellGrants.Count -gt 0) { $failures.Add("The configured allow-list grants forbidden tool(s), which are never argument-safe here: $($shellGrants -join ', ').") }
+    else { Write-Host "  OK - the config grants no shell(...) and no outbound-network tool" -ForegroundColor Green }
+    # A forbidden family member must also be dropped by allow-list construction,
+    # not merely rejected by inspection of the config file.
+    $networkPolluted = Get-ReviewerEffectiveAllowTools -BaseAllow (@($script:ReviewerAllowToolCeiling) + @(('web_' + 'fetch'), ('sh' + 'ell(git diff:*)')))
+    $networkLeaked = @($networkPolluted | Where-Object {
+            $entry = $_
+            @($script:ReviewerForbiddenToolFamilies | Where-Object { $entry.StartsWith($_, [StringComparison]::Ordinal) }).Count -gt 0
+        })
+    if ($networkLeaked.Count -gt 0) { $failures.Add("Forbidden tool(s) survived allow-list construction: $($networkLeaked -join ', ').") }
+    else { Write-Host "  OK - forbidden families are subtracted even from a polluted allow-list" -ForegroundColor Green }
     $polluted = @($script:ReviewerAllowToolCeiling) + @("edit", "ado(repo_pull_request_thread_write)")
     $pollutedEffective = Get-ReviewerEffectiveAllowTools -BaseAllow $polluted
     $leaked = @($pollutedEffective | Where-Object { $script:ReviewerMandatoryDenyTools -ccontains $_ })
@@ -1521,13 +1813,43 @@ function Invoke-DryRunSelfChecks {
     if (-not (Test-ReviewerAlreadyReviewed -ReviewedState $previewOnly -PrId 77 -SourceCommit $commitOld -WritesRequested $false)) {
         $failures.Add("A second preview of an already-previewed commit would re-run the model for no reason.")
     }
-    elseif (Test-ReviewerAlreadyReviewed -ReviewedState $previewOnly -PrId 77 -SourceCommit $commitOld -WritesRequested $true) {
+    elseif (Test-ReviewerAlreadyReviewed -ReviewedState $previewOnly -PrId 77 -SourceCommit $commitOld -WritesRequested $true -WantComments $true) {
         $failures.Add("A preview consumed the commit: a later posting run would skip the PR as already reviewed and could never publish it.")
     }
-    elseif (-not (Test-ReviewerAlreadyReviewed -ReviewedState $reviewedProbe -PrId 77 -SourceCommit $commitOld -WritesRequested $true)) {
+    elseif (-not (Test-ReviewerAlreadyReviewed -ReviewedState $reviewedProbe -PrId 77 -SourceCommit $commitOld -WritesRequested $true -WantComments $true -WantSummary $true)) {
         $failures.Add("A delivered review did not close the PR, so posting would repeat on the next cycle.")
     }
     else { Write-Host "  OK - a preview leaves the commit publishable; a delivered review closes it" -ForegroundColor Green }
+    # Delivery is tracked PER CAPABILITY. A single boolean made a summary-only
+    # run close the PR to a later run that wanted finding comments, so the
+    # comments could never be posted at that commit.
+    $summaryOnlyRecord = @{ "77" = @{ sourceCommit = $commitOld; delivered = $true; commentsDelivered = $false; summaryDelivered = $true; voteResolved = $false } }
+    $capabilityCases = @(
+        @{ Name = 'summary again after a summary-only run'; Want = @{ WantSummary = $true }; Expected = $true }
+        @{ Name = 'comments after a summary-only run'; Want = @{ WantComments = $true }; Expected = $false }
+        @{ Name = 'a vote after a summary-only run'; Want = @{ WantVote = $true }; Expected = $false }
+        @{ Name = 'comments and summary after a summary-only run'; Want = @{ WantComments = $true; WantSummary = $true }; Expected = $false }
+    )
+    $capabilityFailures = 0
+    foreach ($case in $capabilityCases) {
+        $splat = @{ ReviewedState = $summaryOnlyRecord; PrId = 77; SourceCommit = $commitOld; WritesRequested = $true } + $case.Want
+        if ((Test-ReviewerAlreadyReviewed @splat) -ne $case.Expected) {
+            $failures.Add("Per-capability delivery is wrong for '$($case.Name)': expected already-reviewed=$($case.Expected).")
+            $capabilityFailures++
+        }
+    }
+    # A record written before per-capability tracking existed carries only
+    # 'delivered'. It must satisfy comments and summary but never a vote.
+    $legacyRecord = @{ "77" = @{ sourceCommit = $commitOld; delivered = $true } }
+    if (-not (Test-ReviewerAlreadyReviewed -ReviewedState $legacyRecord -PrId 77 -SourceCommit $commitOld -WritesRequested $true -WantComments $true)) {
+        $failures.Add("A legacy delivered record stopped satisfying finding comments, so an upgrade would re-post every review.")
+        $capabilityFailures++
+    }
+    if (Test-ReviewerAlreadyReviewed -ReviewedState $legacyRecord -PrId 77 -SourceCommit $commitOld -WritesRequested $true -WantVote $true) {
+        $failures.Add("A legacy delivered record claimed a vote was resolved; no vote was ever recorded.")
+        $capabilityFailures++
+    }
+    if ($capabilityFailures -eq 0) { Write-Host "  OK - delivery is tracked per capability, and legacy records upgrade safely" -ForegroundColor Green }
     if ((Get-ReviewerReviewKey -PrId 77 -SourceCommit $commitOld) -cne "77:$commitOld") { $failures.Add("The review key format changed.") }
     else { Write-Host "  OK - the review key is prId:sourceCommit" -ForegroundColor Green }
 
@@ -1705,13 +2027,17 @@ function Invoke-DryRunSelfChecks {
     # Both wrapper writes must read the reply as prose and confirm by re-reading:
     # JSON-parsing an ADO write reply throws AFTER the write already happened.
     $selfText = Get-Content -LiteralPath $PSCommandPath -Raw
-    foreach ($fn in @('function Add-ReviewerThread', 'function Set-ReviewerVote')) {
-        $at = $selfText.IndexOf($fn, [StringComparison]::Ordinal)
+    # The needle is assembled at runtime. A literal 'function Foo' in this file
+    # is found by IndexOf before the real declaration is, so a source-scanning
+    # check written the obvious way silently inspects ITSELF and passes.
+    $declOf = { param([string]$Name) $selfText.IndexOf(('func' + 'tion ' + $Name), [StringComparison]::Ordinal) }
+    foreach ($fn in @('Add-ReviewerThread', 'Set-ReviewerVote')) {
+        $at = & $declOf $fn
         if ($at -lt 0) { $failures.Add("Could not locate '$fn' to check its write-confirmation strategy."); continue }
         $slice = $selfText.Substring($at, [Math]::Min(3000, $selfText.Length - $at))
         if ($slice -cnotmatch '-RawText') { $failures.Add("'$fn' does not read the ADO write reply as raw text.") }
     }
-    $voteAt = $selfText.IndexOf('function Set-ReviewerVote', [StringComparison]::Ordinal)
+    $voteAt = & $declOf 'Set-ReviewerVote'
     if ($voteAt -lt 0 -or ($selfText.Substring($voteAt, [Math]::Min(3000, $selfText.Length - $voteAt)) -cnotmatch "action\s*=\s*'get'")) {
         $failures.Add("Set-ReviewerVote does not confirm the vote with an independent re-read of the PR.")
     }
@@ -1797,6 +2123,137 @@ function Invoke-DryRunSelfChecks {
     if ($kNever -ne 0 -or $kBad -ne 0) { $failures.Add("A never-reviewed or unparseable-timestamp PR did not sort first, so it can be starved by PRs that were just reviewed.") }
     elseif (-not ($kOld -lt $kRecent)) { $failures.Add("Least-recently-reviewed ordering is inverted; the newest PRs would be re-reviewed forever.") }
     else { Write-Host "  OK - never-reviewed PRs sort first and the least recently reviewed comes next" -ForegroundColor Green }
+
+    Write-Host "[DRY-RUN] Self-check 20/$total : anchor invariant, artifact sealing and manifest subsetting" -ForegroundColor Cyan
+    # The marker schema validates filePath and line independently, so a finding
+    # can arrive claiming a file with no line, or a line with no file. Neither
+    # is a location, and publishing one under the operator's identity would
+    # misrepresent where the agent believes the problem is.
+    $anchorCases = @(
+        @{ Path = '/src/a.ts'; Line = 42; Expect = $true; Why = 'a real anchor' },
+        @{ Path = ''; Line = 0; Expect = $true; Why = 'an honest PR-level finding' },
+        @{ Path = '/src/a.ts'; Line = 0; Expect = $false; Why = 'a file with no line' },
+        @{ Path = ''; Line = 42; Expect = $false; Why = 'a line in no file' },
+        @{ Path = '   '; Line = 7; Expect = $false; Why = 'a blank path with a line' }
+    )
+    $anchorFailures = 0
+    foreach ($case in $anchorCases) {
+        if ((Test-ReviewerAnchorConsistent -FilePath $case.Path -Line $case.Line) -ne $case.Expect) {
+            $failures.Add("The anchor invariant is wrong for $($case.Why) (path='$($case.Path)', line=$($case.Line)).")
+            $anchorFailures++
+        }
+    }
+    $mixedProbe = @(
+        @{ severity = 'critical'; filePath = '/src/Cache.cs'; line = 12; comment = 'Fine.' },
+        @{ severity = 'critical'; filePath = '/src/Cache.cs'; line = 0; comment = 'A file with no line.' },
+        @{ severity = 'important'; filePath = ''; line = 99; comment = 'A line in no file.' }
+    )
+    $mixedSplit = Split-ReviewerFindingsByChangeSet -Findings $mixedProbe -ChangedPaths $changeSet
+    if (@($mixedSplit.Postable).Count -ne 1 -or @($mixedSplit.Withheld).Count -ne 2) {
+        $failures.Add("An inconsistent file/line pair was not withheld: kept $(@($mixedSplit.Postable).Count) of 3.")
+        $anchorFailures++
+    }
+    # A relocating fallback is what made the inconsistent pair dangerous in the
+    # first place, so assert that the posting path no longer contains one.
+    $threadAt = & $declOf 'Add-ReviewerThread'
+    if ($threadAt -lt 0) { $failures.Add("Could not locate Add-ReviewerThread to check for an anchor fallback."); $anchorFailures++ }
+    else {
+        $threadSlice = $selfText.Substring($threadAt, [Math]::Min(3000, $selfText.Length - $threadAt))
+        # The old implementation queued several argument sets and posted the
+        # first that succeeded; a single-attempt implementation has no list.
+        if ($threadSlice -cmatch '\$attempts\s*\.\s*Add' -or $threadSlice -cmatch 'foreach\s*\(\s*\$attempt\s+in') {
+            $failures.Add("Add-ReviewerThread still retries at a different location, so a rejected anchor becomes repeated PR-level noise.")
+            $anchorFailures++
+        }
+    }
+    if ($anchorFailures -eq 0) { Write-Host "  OK - a finding is published at exactly the location it names, or not at all" -ForegroundColor Green }
+
+    # Artifact sealing. Re-validating a stored review against the schema proves
+    # it is well-formed, not that it is unchanged: the nonce and every
+    # self-describing field live inside the file an editor controls. A secret
+    # the file does NOT contain is what makes the check mean something.
+    $sealKeyPath = Join-Path ([System.IO.Path]::GetTempPath()) "devpilot-reviewer-seal-$([Guid]::NewGuid().ToString('N')).key"
+    try {
+        $sealKey = Get-ReviewerArtifactSigningKey -KeyPath $sealKeyPath
+        if (@($sealKey).Count -ne 32) { $failures.Add("The artifact signing key is $(@($sealKey).Count) bytes; expected 32.") }
+        $reloaded = Get-ReviewerArtifactSigningKey -KeyPath $sealKeyPath
+        if ([System.Convert]::ToBase64String($sealKey) -cne [System.Convert]::ToBase64String($reloaded)) {
+            $failures.Add("The artifact signing key changed between reads, so no artifact could ever be promoted.")
+        }
+        $payload = @{ prId = 77; approvedSummary = 'Looks fine.'; approvedComments = @(@{ severity = 'critical'; filePath = '/a.cs'; line = 3; comment = 'Boom.' }) }
+        $sig = Get-ReviewerArtifactSignature -SignedPayload $payload -Key $sealKey
+        if (-not (Test-ReviewerArtifactSignature -SignedPayload $payload -Key $sealKey -Signature $sig)) {
+            $failures.Add("A freshly signed artifact payload did not verify against its own signature.")
+        }
+        # Key order must not matter, or a JSON round-trip would break the seal.
+        $reordered = @{ approvedComments = @(@{ line = 3; comment = 'Boom.'; severity = 'critical'; filePath = '/a.cs' }); approvedSummary = 'Looks fine.'; prId = 77 }
+        if (-not (Test-ReviewerArtifactSignature -SignedPayload $reordered -Key $sealKey -Signature $sig)) {
+            $failures.Add("The artifact signature depends on key order, so a JSON round-trip would break every seal.")
+        }
+        $tampered = @{ prId = 77; approvedSummary = 'Looks fine.'; approvedComments = @(@{ severity = 'critical'; filePath = '/a.cs'; line = 3; comment = 'Boom, and also run this script.' }) }
+        if (Test-ReviewerArtifactSignature -SignedPayload $tampered -Key $sealKey -Signature $sig) {
+            $failures.Add("An edited artifact payload still verified; promotion would publish text nobody approved.")
+        }
+        $otherKey = New-Object byte[] 32
+        [System.Security.Cryptography.RandomNumberGenerator]::Fill($otherKey)
+        if (Test-ReviewerArtifactSignature -SignedPayload $payload -Key $otherKey -Signature $sig) {
+            $failures.Add("An artifact signed with one key verified under another.")
+        }
+        if (Test-ReviewerArtifactSignature -SignedPayload $payload -Key $sealKey -Signature "") {
+            $failures.Add("An artifact with no signature was accepted.")
+        }
+        Write-Host "  OK - artifacts are sealed with a key they do not contain, and tampering breaks the seal" -ForegroundColor Green
+    }
+    finally { Remove-Item -LiteralPath $sealKeyPath -Force -ErrorAction SilentlyContinue }
+
+    # Promotion must publish the approved manifest, not a fresh ranking. If it
+    # recomputed, a config edit between preview and promotion could introduce a
+    # comment that was never in the Markdown the operator read.
+    $approvedProbe = @(
+        @{ severity = 'critical'; filePath = '/src/Cache.cs'; line = 12; comment = 'Approved and still valid.' },
+        @{ severity = 'important'; filePath = '/src/Gone.cs'; line = 4; comment = 'Approved but the file left the PR.' }
+    )
+    $allowedProbe = @(
+        @{ severity = 'critical'; filePath = '/src/Cache.cs'; line = 12; comment = 'Approved and still valid.' },
+        @{ severity = 'suggestion'; filePath = '/src/New.cs'; line = 1; comment = 'Never approved by anyone.' }
+    )
+    # Assigned directly, never wrapped in @(): this function returns , @(...) to
+    # preserve a single-element array, and @( , @(x) ) nests it one level deeper.
+    $subset = Select-ReviewerManifestSubset -Approved $approvedProbe -Allowed $allowedProbe
+    $subsetEmpty = Select-ReviewerManifestSubset -Approved @() -Allowed $allowedProbe
+    if ($subset.Count -ne 1) { $failures.Add("Manifest subsetting produced $($subset.Count) comment(s); expected exactly the 1 that is both approved and still valid.") }
+    elseif (([string](Get-ReviewerHashValue -Container $subset[0] -Key 'filePath')) -cne '/src/Cache.cs') {
+        $failures.Add("Manifest subsetting kept the wrong comment.")
+    }
+    elseif ($subsetEmpty.Count -ne 0) {
+        $failures.Add("Manifest subsetting invented comments from an empty approval list.")
+    }
+    else { Write-Host "  OK - promotion can drop an approved comment but can never add an unapproved one" -ForegroundColor Green }
+
+    # The preview hash must survive the round-trip through Set-Content, or every
+    # promotion would warn that the Markdown no longer matches.
+    $docProbe = "line one`nline two"
+    $docCrlf = ($docProbe -replace "`n", "`r`n") + "`r`n"
+    if ((Get-ReviewerTextSha256 -Text (Get-ReviewerNormalizedDocumentText -Text $docProbe)) -cne
+        (Get-ReviewerTextSha256 -Text (Get-ReviewerNormalizedDocumentText -Text $docCrlf))) {
+        $failures.Add("The preview hash is sensitive to line endings and trailing newlines, so it would never match on disk.")
+    }
+    elseif ((Get-ReviewerTextSha256 -Text 'a') -ceq (Get-ReviewerTextSha256 -Text 'b')) {
+        $failures.Add("The preview hash collides across different documents.")
+    }
+    else { Write-Host "  OK - the preview hash ignores line endings but not content" -ForegroundColor Green }
+
+    # Delivery must fail CLOSED on an unknown change set. Failing open is only
+    # acceptable for a preview, which a human reads before anything is posted.
+    $deliveryAt = & $declOf 'Invoke-ReviewerDelivery'
+    if ($deliveryAt -lt 0) { $failures.Add("Could not locate Invoke-ReviewerDelivery to check its change-set gate.") }
+    else {
+        $deliverySlice = $selfText.Substring($deliveryAt, [Math]::Min(4000, $selfText.Length - $deliveryAt))
+        if ($deliverySlice -cnotmatch 'if\s*\(\s*-not\s+\$ChangeSetKnown\s*\)') {
+            $failures.Add("Invoke-ReviewerDelivery does not refuse to publish when the change set could not be read.")
+        }
+        else { Write-Host "  OK - an unreadable change set blocks publication but not the preview" -ForegroundColor Green }
+    }
 
     Write-Host ""
     if ($failures.Count -eq 0) {
@@ -1920,12 +2377,16 @@ function Invoke-ReviewerDelivery {
         identical guards.
 
         Returns @{ PostedCount; PostFailures; SummaryPosted; CastVote;
+                   CommentsDelivered; SummaryDelivered; VoteResolved;
                    Delivered; Aborted; Reason }.
 
         "Delivered" means every write this run was asked to perform was
         independently confirmed. It gates the reviewed-state record, so a
         transient ADO failure leaves the PR retryable instead of permanently
-        recorded as reviewed.
+        recorded as reviewed. The three per-capability flags are recorded
+        alongside it because the write switches are independent: a run that
+        delivered only a summary must not close the PR to a later run that also
+        wants finding comments.
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Session,
@@ -1936,15 +2397,31 @@ function Invoke-ReviewerDelivery {
         [Parameter(Mandatory)][hashtable]$Counts,
         [int]$ReportedFindingCount = 0,
         [Parameter(Mandatory)][string]$RecommendedVote,
-        [Parameter(Mandatory)]$ExistingFingerprints
+        [Parameter(Mandatory)]$ExistingFingerprints,
+        # $false when the change set could not be read. Scoping fails OPEN for a
+        # preview, because a human reads that and an empty preview would hide
+        # real findings. It must fail CLOSED here: publishing under the
+        # operator's identity without having verified that each finding names a
+        # file the PR actually changes is exactly the unfounded-claim risk that
+        # Split-ReviewerFindingsByChangeSet exists to prevent.
+        [bool]$ChangeSetKnown = $false
     )
     $outcome = @{
         PostedCount = 0; PostFailures = 0; SummaryPosted = $false
-        CastVote = ""; Delivered = $false; Aborted = $false; Reason = ""
+        CastVote = ""; CommentsDelivered = $false; SummaryDelivered = $false; VoteResolved = $false
+        Delivered = $false; Aborted = $false; Reason = ""
     }
     if (-not (Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote))) {
         $outcome.Delivered = $false
         $outcome.Reason = "preview run; no write was requested"
+        return $outcome
+    }
+
+    if (-not $ChangeSetKnown) {
+        $reason = "this PR's change set could not be read, so no finding's location could be verified"
+        Write-Warning "  not publishing on PR ${PrId}: $reason."
+        $outcome.Aborted = $true
+        $outcome.Reason = $reason
         return $outcome
     }
 
@@ -1980,8 +2457,8 @@ function Invoke-ReviewerDelivery {
         }
 
         # Confirm against the PR itself rather than trusting the write replies.
-        # The anchor is part of the fingerprint, so a comment that fell back to
-        # PR level is NOT counted as the anchored finding it was meant to be.
+        # The anchor is part of the fingerprint, so a comment that did not land
+        # at the anchor the finding names is NOT counted as that finding.
         $freshThreads = Get-ReviewerPullRequestThreads -Session $Session -PrId $PrId
         $freshFingerprints = Get-ReviewerExistingFingerprints -Threads $freshThreads
         $confirmed = 0
@@ -2021,21 +2498,38 @@ function Invoke-ReviewerDelivery {
             -PrIsDraft ([bool](Get-ReviewerHashValue -Container $freshness.Pr -Key 'isDraft' -Default $false)) `
             -CurrentSourceCommit (Get-ReviewerSourceCommit -Pr $freshness.Pr) -ReviewedSourceCommit $SourceCommit
         if (-not $decision.Vote) {
+            # A declined vote is a RESOLVED vote: the gate reached a decision
+            # from inputs that cannot change while the commit is the same, so a
+            # retry would decline again. Recording it as unresolved would make
+            # the PR permanently un-deliverable.
             Write-Host "  not voting: $($decision.Reason)." -ForegroundColor DarkGray
+            $outcome.VoteResolved = $true
         }
         else {
             $voteResult = Set-ReviewerVote -Session $Session -PrId $PrId -Vote $decision.Vote -VoterAlias $OperatorAlias
-            if ($voteResult.Cast) { $outcome.CastVote = $decision.Vote; Write-Host "  cast '$($decision.Vote)' ($($decision.Reason))." -ForegroundColor Green }
-            else { Write-Warning "  could not cast '$($decision.Vote)' on PR ${PrId}: $($voteResult.Error)" }
+            if ($voteResult.Cast) {
+                $outcome.CastVote = $decision.Vote
+                $outcome.VoteResolved = $true
+                Write-Host "  cast '$($decision.Vote)' ($($decision.Reason))." -ForegroundColor Green
+            }
+            else {
+                # An ATTEMPTED but unconfirmed vote is not resolved. Previously
+                # this only logged, and the run still recorded delivery, so the
+                # vote silently never happened.
+                Write-Warning "  could not cast '$($decision.Vote)' on PR ${PrId}: $($voteResult.Error)"
+            }
         }
     }
 
-    # A run is only "delivered" when every ENABLED write succeeded. A vote the
-    # gate declined is a success: the decision was made and it will not change
-    # on a retry at the same commit.
-    $commentsOk = (-not $EnableFindingComments) -or ($outcome.PostFailures -eq 0 -and $outcome.PostedCount -ge @($Postable).Count)
-    $summaryOk = (-not $EnableSummaryComment) -or $outcome.SummaryPosted
-    $outcome.Delivered = ($commentsOk -and $summaryOk)
+    # A run is only "delivered" when every ENABLED write succeeded. Each
+    # capability is also recorded on its own so that enabling a further write
+    # switch later re-opens the PR for exactly that write.
+    $outcome.CommentsDelivered = ($EnableFindingComments -and $outcome.PostFailures -eq 0 -and $outcome.PostedCount -ge @($Postable).Count)
+    $outcome.SummaryDelivered = ($EnableSummaryComment -and $outcome.SummaryPosted)
+    $commentsOk = (-not $EnableFindingComments) -or $outcome.CommentsDelivered
+    $summaryOk = (-not $EnableSummaryComment) -or $outcome.SummaryDelivered
+    $voteOk = (-not $EnableApprovalVote) -or $outcome.VoteResolved
+    $outcome.Delivered = ($commentsOk -and $summaryOk -and $voteOk)
     if (-not $outcome.Delivered) { $outcome.Reason = "one or more enabled writes did not land; the PR stays eligible for a retry" }
     return $outcome
 }
@@ -2186,30 +2680,49 @@ function Invoke-ReviewerPullRequest {
     $previewPath = [string]$preview.MarkdownPath
 
     # -- Wrapper-owned writes (each behind its own switch) --------------------
+    # An empty change set means the read failed; it is fine for a preview (the
+    # findings are shown to a human) but delivery must refuse it.
     $delivery = Invoke-ReviewerDelivery -Session $Session -PrId $prId -SourceCommit $sourceCommit `
         -Postable $postable -SummaryText $summaryText -Counts $counts -ReportedFindingCount $allFindings.Count `
-        -RecommendedVote $recommendedVote -ExistingFingerprints $Bound.ExistingFingerprints
+        -RecommendedVote $recommendedVote -ExistingFingerprints $Bound.ExistingFingerprints `
+        -ChangeSetKnown (@($Bound.ChangedPaths).Count -gt 0)
     $postedCount = [int]$delivery.PostedCount
     $postFailures = [int]$delivery.PostFailures
     $summaryPosted = [bool]$delivery.SummaryPosted
     $castVote = [string]$delivery.CastVote
 
     # -- Persist ---------------------------------------------------------------
-    # 'delivered' is what closes the PR to further work. A preview run and a run
-    # whose writes failed both leave it $false, so the next run with posting on
-    # can still publish this commit instead of skipping it as already reviewed.
+    # The per-capability flags are what close the PR to further work, and they
+    # are MERGED with any prior record at this same commit: a run that only
+    # posted comments must not erase the fact that an earlier run already
+    # delivered the summary. A preview run and a run whose writes failed both
+    # leave the relevant flag $false, so the next run with posting on can still
+    # publish this commit instead of skipping it as already reviewed.
+    $priorRecord = $null
+    if ($ReviewedState.ContainsKey([string]$prId)) {
+        $candidate = $ReviewedState[[string]$prId]
+        if (([string](Get-ReviewerHashValue -Container $candidate -Key 'sourceCommit' -Default '')) -ieq $sourceCommit) { $priorRecord = $candidate }
+    }
+    $priorLegacy = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'delivered' -Default $false)
+    $commentsDelivered = ([bool]$delivery.CommentsDelivered) -or [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'commentsDelivered' -Default $priorLegacy)
+    $summaryDelivered = ([bool]$delivery.SummaryDelivered) -or [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'summaryDelivered' -Default $priorLegacy)
+    $voteResolved = ([bool]$delivery.VoteResolved) -or [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'voteResolved' -Default $false)
+
     $ReviewedState[[string]$prId] = @{
-        sourceCommit  = $sourceCommit
-        at            = ([DateTime]::UtcNow.ToString("o"))
-        findingCount  = $allFindings.Count
-        postableCount = $postable.Count
-        withheldCount = $withheld.Count
-        postedCount   = $postedCount
-        summaryPosted = $summaryPosted
-        vote          = $(if ($castVote) { $castVote } else { "none" })
-        delivered     = [bool]$delivery.Delivered
-        previewPath   = $previewPath
-        artifactPath  = [string]$preview.ArtifactPath
+        sourceCommit      = $sourceCommit
+        at                = ([DateTime]::UtcNow.ToString("o"))
+        findingCount      = $allFindings.Count
+        postableCount     = $postable.Count
+        withheldCount     = $withheld.Count
+        postedCount       = $postedCount
+        summaryPosted     = $summaryPosted
+        vote              = $(if ($castVote) { $castVote } else { "none" })
+        delivered         = [bool]$delivery.Delivered
+        commentsDelivered = $commentsDelivered
+        summaryDelivered  = $summaryDelivered
+        voteResolved      = $voteResolved
+        previewPath       = $previewPath
+        artifactPath      = [string]$preview.ArtifactPath
     }
     Set-JsonState -Path $reviewedStatePath -State $ReviewedState
     if ($AttemptsState.ContainsKey([string]$prId)) {
@@ -2243,11 +2756,26 @@ function Invoke-ReviewerPromotion {
         This exists because an ordinary posting run cannot honour the preview
         contract. "Preview, read it, then run again with posting on" launches a
         second, independent model run against possibly-changed code with a fresh
-        nonce; nothing binds its conclusions to the ones a human approved. Here
-        the marker is re-parsed from the artifact through the SAME schema that
-        bounded it when it was produced, so a hand-edited artifact is subject to
-        exactly the limits a live review is subject to, and what gets posted is
-        what was read.
+        nonce; nothing binds its conclusions to the ones a human approved.
+
+        What is published here is the artifact's DELIVERY MANIFEST - the exact
+        comment list, summary and vote that appeared in the Markdown the
+        operator read - and three separate things have to hold before any of it
+        goes out:
+
+          1. The artifact's HMAC seal verifies against a per-user key that is
+             not stored in the artifact. Without this the checks below are
+             tautological, because an editor of the file also controls the nonce
+             and every field the file describes itself by.
+          2. The stored marker still parses under the same schema that bounded
+             it when the model produced it, and is still bound to this PR and
+             commit. This is defence in depth on the text itself.
+          3. Everything about to be posted is a SUBSET of the approved manifest.
+             Re-ranking is deliberately not used to decide what to post: it
+             reads the current postSeverities, cap and change set, so a config
+             edit between preview and promotion could otherwise introduce a
+             comment that was never in the reviewed Markdown. Dropping entries
+             is allowed; adding them is not.
 
         Returns an exit code.
     #>
@@ -2256,33 +2784,61 @@ function Invoke-ReviewerPromotion {
         [Parameter(Mandatory)][string]$ArtifactPath
     )
     if (-not (Test-Path -LiteralPath $ArtifactPath)) { throw "Preview artifact not found: $ArtifactPath" }
-    $artifact = Get-Content -LiteralPath $ArtifactPath -Raw | ConvertFrom-Json
-    foreach ($k in @('artifactVersion', 'organization', 'project', 'repositoryName', 'repositoryId', 'prId', 'sourceCommit', 'markerBody')) {
-        if ($null -eq (Get-ReviewerHashValue -Container $artifact -Key $k)) { throw "Preview artifact is missing required field '$k': $ArtifactPath" }
+    $raw = Get-Content -LiteralPath $ArtifactPath -Raw | ConvertFrom-Json
+
+    $signed = Get-ReviewerHashValue -Container $raw -Key 'signed'
+    $signature = [string](Get-ReviewerHashValue -Container $raw -Key 'signature' -Default '')
+    if ($null -eq $signed) {
+        throw ("This preview artifact predates artifact sealing (no 'signed' section) and cannot be promoted. " +
+            "Re-run the reviewer to produce a sealed artifact: $ArtifactPath")
     }
-    if ([int]$artifact.artifactVersion -ne 1) { throw "Unsupported preview artifact version $($artifact.artifactVersion)." }
+    if (([string](Get-ReviewerHashValue -Container $raw -Key 'signatureAlg' -Default '')) -cne 'HMACSHA256') {
+        throw "Preview artifact declares an unsupported signature algorithm; refusing to promote it."
+    }
+    if (-not (Test-ReviewerArtifactSignature -SignedPayload $signed -Key (Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath) -Signature $signature)) {
+        throw ("The preview artifact's signature does not verify: it was modified after it was written, or it was " +
+            "produced by a different user or state directory. Refusing to promote it: $ArtifactPath")
+    }
+
+    foreach ($k in @('artifactVersion', 'organization', 'project', 'repositoryName', 'repositoryId', 'prId', 'sourceCommit', 'markerBody', 'approvedComments', 'approvedSummary', 'approvedVote')) {
+        if ($null -eq (Get-ReviewerHashValue -Container $signed -Key $k)) { throw "Preview artifact is missing required field '$k': $ArtifactPath" }
+    }
+    if ([int]$signed.artifactVersion -ne 2) { throw "Unsupported preview artifact version $($signed.artifactVersion)." }
 
     # A review is only meaningful against the repository it was produced for.
-    if (([string]$artifact.organization) -ine $Organization -or ([string]$artifact.project) -ine $ExpectedProject -or
-        ([string]$artifact.repositoryName) -ine $RepositoryName -or ([string]$artifact.repositoryId) -ine $cfgRepoId) {
-        throw ("This preview artifact was produced for $($artifact.organization)/$($artifact.project)/$($artifact.repositoryName) " +
+    if (([string]$signed.organization) -ine $Organization -or ([string]$signed.project) -ine $ExpectedProject -or
+        ([string]$signed.repositoryName) -ine $RepositoryName -or ([string]$signed.repositoryId) -ine $cfgRepoId) {
+        throw ("This preview artifact was produced for $($signed.organization)/$($signed.project)/$($signed.repositoryName) " +
             "and cannot be promoted with the current configuration ($Organization/$ExpectedProject/$RepositoryName).")
     }
 
-    $prId = [int]$artifact.prId
-    $sourceCommit = [string]$artifact.sourceCommit
-    $prTitle = [string](Get-ReviewerHashValue -Container $artifact -Key 'prTitle' -Default "PR $prId")
+    $prId = [int]$signed.prId
+    $sourceCommit = [string]$signed.sourceCommit
+    $prTitle = [string](Get-ReviewerHashValue -Container $signed -Key 'prTitle' -Default "PR $prId")
 
-    # Re-validate the stored marker instead of trusting the file. The nonce
-    # comes from the artifact because there is no run to bind to; binding is
-    # instead re-checked against PR, repository and commit below.
-    $storedNonce = ""
-    $storedMarkerObject = ([string]$artifact.markerBody | ConvertFrom-Json)
+    # If the Markdown is still on disk, confirm it is the document that was
+    # approved. A missing preview is not fatal - the manifest is the authority -
+    # but a preview that no longer matches means the operator and the artifact
+    # disagree about what this review says.
+    $previewPath = [string](Get-ReviewerHashValue -Container $signed -Key 'previewPath' -Default '')
+    $previewSha = [string](Get-ReviewerHashValue -Container $signed -Key 'previewSha256' -Default '')
+    if ($previewPath -and $previewSha -and (Test-Path -LiteralPath $previewPath)) {
+        $onDisk = Get-ReviewerTextSha256 -Text (Get-ReviewerNormalizedDocumentText -Text (Get-Content -LiteralPath $previewPath -Raw))
+        if ($onDisk -cne $previewSha) {
+            Write-Warning ("The Markdown preview at $previewPath no longer matches the sealed artifact. " +
+                "Publishing the sealed manifest, which is the review that was approved.")
+        }
+    }
+
+    # Defence in depth on the text: re-parse the stored marker under the same
+    # schema. The nonce necessarily comes from the artifact, which is only
+    # meaningful because the seal above already proved the artifact is intact.
+    $storedMarkerObject = ([string]$signed.markerBody | ConvertFrom-Json)
     $storedNonce = [string](Get-ReviewerHashValue -Container $storedMarkerObject -Key 'nonce' -Default '')
     if (-not $storedNonce) { throw "Preview artifact carries no nonce; refusing to promote it." }
-    $maxItems = [int](Get-ReviewerHashValue -Container $artifact -Key 'maxFindingItems' -Default $EffectiveMaxFindings)
+    $maxItems = [int](Get-ReviewerHashValue -Container $signed -Key 'maxFindingItems' -Default $EffectiveMaxFindings)
     if ($maxItems -lt 1) { $maxItems = $EffectiveMaxFindings }
-    $marker = ConvertFrom-AgentResultMarker -StdOutText ("$ResultMarkerPrefix " + [string]$artifact.markerBody) `
+    $marker = ConvertFrom-AgentResultMarker -StdOutText ("$ResultMarkerPrefix " + [string]$signed.markerBody) `
         -MarkerPrefix $ResultMarkerPrefix `
         -Schema (Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $storedNonce -MaxFindingItems $maxItems)
     if (-not $marker) { throw "The stored review did not survive re-validation; refusing to promote it." }
@@ -2302,41 +2858,57 @@ function Invoke-ReviewerPromotion {
 
         $allFindings = @($marker['findings'])
         $counts = Get-ReviewerSeverityCounts -Findings $allFindings
-        $ranked = Get-ReviewerPostableFindings -Findings $allFindings -PostSeverities $PostSeverities -MaxFindings $EffectiveMaxFindings
+        $approved = @($signed.approvedComments)
         $changedPaths = Get-ReviewerChangedPaths -Session $session -PrId $prId
-        $scoped = Split-ReviewerFindingsByChangeSet -Findings $ranked -ChangedPaths $changedPaths
-        $postable = @($scoped.Postable)
+        # Re-scope the APPROVED list; this can only remove entries.
+        $stillPublishable = @((Split-ReviewerFindingsByChangeSet -Findings $approved -ChangedPaths $changedPaths).Postable)
+        # Assigned directly: Select-ReviewerManifestSubset returns , @(...) and
+        # wrapping that in @() would nest it, silently making Count 1 forever.
+        $postable = Select-ReviewerManifestSubset -Approved $approved -Allowed $stillPublishable
+        $dropped = @($approved).Count - @($postable).Count
         $threads = Get-ReviewerPullRequestThreads -Session $session -PrId $prId
 
-        Write-Host ("Promoting the stored review of PR {0} '{1}' at {2}: {3} finding(s), {4} to post." -f `
-                $prId, $prTitle, $sourceCommit.Substring(0, 12), $allFindings.Count, $postable.Count) -ForegroundColor Yellow
-        if (@($scoped.Withheld).Count -gt 0) {
-            Write-Warning "$(@($scoped.Withheld).Count) stored finding(s) name a file this PR no longer changes; they will not be posted."
+        Write-Host ("Promoting the stored review of PR {0} '{1}' at {2}: {3} approved comment(s), {4} to post." -f `
+                $prId, $prTitle, $sourceCommit.Substring(0, 12), @($approved).Count, @($postable).Count) -ForegroundColor Yellow
+        if ($dropped -gt 0) {
+            Write-Warning "$dropped approved comment(s) are no longer publishable at the location they name and will be skipped."
         }
 
         $delivery = Invoke-ReviewerDelivery -Session $session -PrId $prId -SourceCommit $sourceCommit `
-            -Postable $postable -SummaryText ([string]$marker['summary']) -Counts $counts `
-            -ReportedFindingCount $allFindings.Count -RecommendedVote ([string]$marker['recommendedVote']) `
-            -ExistingFingerprints (Get-ReviewerExistingFingerprints -Threads $threads)
+            -Postable $postable -SummaryText ([string]$signed.approvedSummary) -Counts $counts `
+            -ReportedFindingCount ([int](Get-ReviewerHashValue -Container $signed -Key 'reportedFindings' -Default $allFindings.Count)) `
+            -RecommendedVote ([string]$signed.approvedVote) `
+            -ExistingFingerprints (Get-ReviewerExistingFingerprints -Threads $threads) `
+            -ChangeSetKnown (@($changedPaths).Count -gt 0)
 
         $reviewedState = Get-JsonState -Path $reviewedStatePath
+        $priorRecord = $null
+        if ($reviewedState.ContainsKey([string]$prId)) {
+            $candidate = $reviewedState[[string]$prId]
+            if (([string](Get-ReviewerHashValue -Container $candidate -Key 'sourceCommit' -Default '')) -ieq $sourceCommit) { $priorRecord = $candidate }
+        }
+        $priorLegacy = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'delivered' -Default $false)
         $reviewedState[[string]$prId] = @{
-            sourceCommit  = $sourceCommit
-            at            = ([DateTime]::UtcNow.ToString("o"))
-            findingCount  = $allFindings.Count
-            postableCount = $postable.Count
-            withheldCount = @($scoped.Withheld).Count
-            postedCount   = [int]$delivery.PostedCount
-            summaryPosted = [bool]$delivery.SummaryPosted
-            vote          = $(if ($delivery.CastVote) { [string]$delivery.CastVote } else { "none" })
-            delivered     = [bool]$delivery.Delivered
-            promotedFrom  = $ArtifactPath
+            sourceCommit      = $sourceCommit
+            at                = ([DateTime]::UtcNow.ToString("o"))
+            findingCount      = $allFindings.Count
+            postableCount     = @($postable).Count
+            withheldCount     = $dropped
+            postedCount       = [int]$delivery.PostedCount
+            summaryPosted     = [bool]$delivery.SummaryPosted
+            vote              = $(if ($delivery.CastVote) { [string]$delivery.CastVote } else { "none" })
+            delivered         = [bool]$delivery.Delivered
+            commentsDelivered = ([bool]$delivery.CommentsDelivered) -or [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'commentsDelivered' -Default $priorLegacy)
+            summaryDelivered  = ([bool]$delivery.SummaryDelivered) -or [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'summaryDelivered' -Default $priorLegacy)
+            voteResolved      = ([bool]$delivery.VoteResolved) -or [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'voteResolved' -Default $false)
+            promotedFrom      = $ArtifactPath
         }
         Set-JsonState -Path $reviewedStatePath -State $reviewedState
 
         Write-ReviewerCycleMetadata -Fields @{
             cycle = 0; mode = "promote"; result = $(if ($delivery.Delivered) { "delivered" } else { "incomplete" })
             prId = $prId; sourceCommit = $sourceCommit; artifactPath = $ArtifactPath
+            approvedCount = @($approved).Count; droppedCount = $dropped
             postedCount = [int]$delivery.PostedCount; postFailures = [int]$delivery.PostFailures
             summaryPosted = [bool]$delivery.SummaryPosted; castVote = $(if ($delivery.CastVote) { [string]$delivery.CastVote } else { "none" })
             deliveryAborted = [bool]$delivery.Aborted; deliveryReason = [string]$delivery.Reason
@@ -2447,7 +3019,8 @@ function Invoke-ReviewerCycle {
             }
 
             if (Test-ReviewerAlreadyReviewed -ReviewedState $reviewedState -PrId $prId -SourceCommit $sourceCommit `
-                    -WritesRequested (Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote))) {
+                    -WritesRequested (Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)) `
+                    -WantComments ([bool]$EnableFindingComments) -WantSummary ([bool]$EnableSummaryComment) -WantVote ([bool]$EnableApprovalVote)) {
                 Write-Host "  PR $prId skipped (already reviewed and delivered at this commit)." -ForegroundColor DarkGray
                 continue
             }
