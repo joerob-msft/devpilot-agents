@@ -700,6 +700,48 @@ function Merge-ReviewerCapabilityFlag {
     return $PriorValue
 }
 
+function Get-ReviewerRequestedCapabilities {
+    <# The capability names a run is asking for, in a fixed order. #>
+    param([bool]$Comments, [bool]$Summary, [bool]$Vote)
+    $l = New-Object System.Collections.Generic.List[string]
+    if ($Comments) { [void]$l.Add('comments') }
+    if ($Summary) { [void]$l.Add('summary') }
+    if ($Vote) { [void]$l.Add('vote') }
+    return , ($l.ToArray())
+}
+
+function Get-ReviewerUnresolvedCapabilities {
+    <#
+        Which of a delivery plan's capabilities have still not landed.
+
+        A plan stays open until everything IT was created for has resolved, not
+        until whichever run happens to pick it up reports success. Otherwise:
+        run A enables comments, finding Y fails, a plan is left pending; run B
+        starts with only -EnableSummaryComment, promotes that plan, delivers the
+        summary, reports success and closes the plan - and Y is gone.
+    #>
+    param([string[]]$Requested, [bool]$CommentsDelivered, [bool]$SummaryDelivered, [bool]$VoteResolved)
+    $resolved = @{ comments = $CommentsDelivered; summary = $SummaryDelivered; vote = $VoteResolved }
+    $l = New-Object System.Collections.Generic.List[string]
+    foreach ($c in @($Requested)) {
+        if ($resolved.ContainsKey($c) -and -not [bool]$resolved[$c]) { [void]$l.Add($c) }
+    }
+    return , ($l.ToArray())
+}
+
+function Get-ReviewerPlanCapabilities {
+    <# Everything this delivery plan owes: what earlier attempts at the SAME
+       review still owed, plus what this run is adding. A plan from a superseded
+       review contributes nothing, because its findings are not these. #>
+    param([string[]]$PriorPending, [string[]]$Requested, [bool]$PriorAppliesToThisReview)
+    $l = New-Object System.Collections.Generic.List[string]
+    if ($PriorAppliesToThisReview) {
+        foreach ($c in @($PriorPending)) { if ($c -and -not $l.Contains([string]$c)) { [void]$l.Add([string]$c) } }
+    }
+    foreach ($c in @($Requested)) { if ($c -and -not $l.Contains([string]$c)) { [void]$l.Add([string]$c) } }
+    return , ($l.ToArray())
+}
+
 function Get-ReviewerPendingDeliveryPlan {
     <#
         The sealed artifact of a delivery this agent ATTEMPTED and did not
@@ -2013,6 +2055,32 @@ function Invoke-DryRunSelfChecks {
             }
         }
         if ($planFailures -eq 0) { Write-Host "  OK - only an unfinished attempted delivery is retried, and only from its own artifact" -ForegroundColor Green }
+        # A plan stays open until everything IT owes has landed. A run with
+        # different switches must not close it by succeeding at its own subset.
+        $maskCases = @(
+            @{ Name = 'a comments plan promoted by a summary-only run'; Plan = @('comments', 'summary'); C = $false; S = $true; V = $false; Expect = @('comments') }
+            @{ Name = 'everything the plan owed has landed'; Plan = @('comments', 'summary'); C = $true; S = $true; V = $false; Expect = @() }
+            @{ Name = 'a capability outside the plan does not reopen it'; Plan = @('summary'); C = $false; S = $true; V = $false; Expect = @() }
+        )
+        foreach ($case in $maskCases) {
+            $got = Get-ReviewerUnresolvedCapabilities -Requested ([string[]]$case.Plan) -CommentsDelivered $case.C -SummaryDelivered $case.S -VoteResolved $case.V
+            if ((@($got) -join ',') -cne (@($case.Expect) -join ',')) {
+                $failures.Add("Plan capability tracking is wrong for '$($case.Name)': expected '$(@($case.Expect) -join ',')', got '$(@($got) -join ',')'.")
+                $planFailures++
+            }
+        }
+        # A plan from a superseded review contributes nothing to the new one.
+        $carried = Get-ReviewerPlanCapabilities -PriorPending @('comments') -Requested @('summary') -PriorAppliesToThisReview $true
+        if ((@($carried) -join ',') -cne 'comments,summary') {
+            $failures.Add("A retried plan lost what an earlier attempt at the same review still owed: got '$(@($carried) -join ',')'.")
+            $planFailures++
+        }
+        $superseded = Get-ReviewerPlanCapabilities -PriorPending @('comments') -Requested @('summary') -PriorAppliesToThisReview $false
+        if ((@($superseded) -join ',') -cne 'summary') {
+            $failures.Add("A superseded review's outstanding capabilities leaked into a new review's plan: got '$(@($superseded) -join ',')'.")
+            $planFailures++
+        }
+        if ($planFailures -eq 0) { Write-Host "  OK - a delivery plan stays open until everything it owes lands, and superseded plans do not leak" -ForegroundColor Green }
     }
     finally { Remove-Item -LiteralPath $planDir -Recurse -Force -ErrorAction SilentlyContinue }
     if ((Get-ReviewerReviewKey -PrId 77 -SourceCommit $commitOld) -cne "77:$commitOld") { $failures.Add("The review key format changed.") }
@@ -2922,6 +2990,59 @@ function Invoke-ReviewerPullRequest {
         -RecommendedVote $recommendedVote -Marker $marker -Quiet:$writesRequested
     $previewPath = [string]$preview.MarkdownPath
 
+    # -- Record the delivery plan BEFORE writing anything ----------------------
+    # If the process dies after posting one comment and before the state write
+    # below, a plan recorded only afterwards would not exist, the next cycle
+    # would review again, and a second model run that happens to omit the
+    # finding that failed would leave it posted nowhere and marked delivered.
+    # So the retryable plan is durable before the first ADO write, and delivery
+    # does not start unless it is.
+    $priorRecord = $null
+    if ($ReviewedState.ContainsKey([string]$prId)) {
+        $candidate = $ReviewedState[[string]$prId]
+        if (([string](Get-ReviewerHashValue -Container $candidate -Key 'sourceCommit' -Default '')) -ieq $sourceCommit) { $priorRecord = $candidate }
+    }
+    $priorComments = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'commentsDelivered' -Default $false)
+    $priorSummary = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'summaryDelivered' -Default $false)
+    $priorVote = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'voteResolved' -Default $false)
+    # A recorded success belongs to one specific review. This run's review is
+    # the same one only if it is the same marker; a fresh model run gets a fresh
+    # nonce, so a new review never inherits an older run's successes.
+    $reviewDigest = Get-ReviewerTextSha256 -Text (ConvertTo-Json -InputObject $marker -Depth 8 -Compress)
+    $priorApplies = (([string](Get-ReviewerHashValue -Container $priorRecord -Key 'reviewDigest' -Default '')) -ceq $reviewDigest)
+    $artifactPath = [string]$preview.ArtifactPath
+    $planCapabilities = Get-ReviewerPlanCapabilities `
+        -PriorPending ([string[]]@(Get-ReviewerHashValue -Container $priorRecord -Key 'pendingCapabilities' -Default @())) `
+        -Requested (Get-ReviewerRequestedCapabilities -Comments ([bool]$EnableFindingComments) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)) `
+        -PriorAppliesToThisReview $priorApplies
+
+    if ($writesRequested) {
+        if (-not $artifactPath -or -not (Test-Path -LiteralPath $artifactPath)) {
+            throw ("No sealed delivery plan was written for PR $prId, so a failed or interrupted delivery could not be " +
+                "retried from the review that produced it. Refusing to post.")
+        }
+        $ReviewedState[[string]$prId] = @{
+            sourceCommit        = $sourceCommit
+            at                  = ([DateTime]::UtcNow.ToString("o"))
+            findingCount        = $allFindings.Count
+            postableCount       = $postable.Count
+            withheldCount       = $withheld.Count
+            postedCount         = 0
+            summaryPosted       = $false
+            vote                = "none"
+            delivered           = $false
+            commentsDelivered   = (Merge-ReviewerCapabilityFlag -Attempted $false -SucceededThisRun $false -PriorValue $priorComments -PriorAppliesToThisReview $priorApplies)
+            summaryDelivered    = (Merge-ReviewerCapabilityFlag -Attempted $false -SucceededThisRun $false -PriorValue $priorSummary -PriorAppliesToThisReview $priorApplies)
+            voteResolved        = (Merge-ReviewerCapabilityFlag -Attempted $false -SucceededThisRun $false -PriorValue $priorVote -PriorAppliesToThisReview $priorApplies)
+            reviewDigest        = $reviewDigest
+            previewPath         = $previewPath
+            artifactPath        = $artifactPath
+            pendingCapabilities = $planCapabilities
+            deliveryPending     = $true
+        }
+        Set-JsonState -Path $reviewedStatePath -State $ReviewedState
+    }
+
     # -- Wrapper-owned writes (each behind its own switch) --------------------
     # An empty change set means the read failed; it is fine for a preview (the
     # findings are shown to a human) but delivery must refuse it.
@@ -2941,40 +3062,33 @@ function Invoke-ReviewerPullRequest {
     # delivered the summary. A preview run and a run whose writes failed both
     # leave the relevant flag $false, so the next run with posting on can still
     # publish this commit instead of skipping it as already reviewed.
-    $priorRecord = $null
-    if ($ReviewedState.ContainsKey([string]$prId)) {
-        $candidate = $ReviewedState[[string]$prId]
-        if (([string](Get-ReviewerHashValue -Container $candidate -Key 'sourceCommit' -Default '')) -ieq $sourceCommit) { $priorRecord = $candidate }
-    }
-    $priorComments = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'commentsDelivered' -Default $false)
-    $priorSummary = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'summaryDelivered' -Default $false)
-    $priorVote = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'voteResolved' -Default $false)
-    # A recorded success belongs to one specific review. This run's review is
-    # the same one only if it is the same marker; a fresh model run gets a fresh
-    # nonce, so a new review never inherits an older run's successes.
-    $reviewDigest = Get-ReviewerTextSha256 -Text (ConvertTo-Json -InputObject $marker -Depth 8 -Compress)
-    $priorApplies = (([string](Get-ReviewerHashValue -Container $priorRecord -Key 'reviewDigest' -Default '')) -ceq $reviewDigest)
     $commentsDelivered = Merge-ReviewerCapabilityFlag -Attempted $EnableFindingComments -SucceededThisRun ([bool]$delivery.CommentsDelivered) -PriorValue $priorComments -PriorAppliesToThisReview $priorApplies
     $summaryDelivered = Merge-ReviewerCapabilityFlag -Attempted $EnableSummaryComment -SucceededThisRun ([bool]$delivery.SummaryDelivered) -PriorValue $priorSummary -PriorAppliesToThisReview $priorApplies
     $voteResolved = Merge-ReviewerCapabilityFlag -Attempted $EnableApprovalVote -SucceededThisRun ([bool]$delivery.VoteResolved) -PriorValue $priorVote -PriorAppliesToThisReview $priorApplies
 
+    $unresolved = Get-ReviewerUnresolvedCapabilities -Requested $planCapabilities `
+        -CommentsDelivered $commentsDelivered -SummaryDelivered $summaryDelivered -VoteResolved $voteResolved
+
     $ReviewedState[[string]$prId] = @{
-        sourceCommit      = $sourceCommit
-        at                = ([DateTime]::UtcNow.ToString("o"))
-        findingCount      = $allFindings.Count
-        postableCount     = $postable.Count
-        withheldCount     = $withheld.Count
-        postedCount       = $postedCount
-        summaryPosted     = $summaryPosted
-        vote              = $(if ($castVote) { $castVote } else { "none" })
-        delivered         = [bool]$delivery.Delivered
-        commentsDelivered = $commentsDelivered
-        summaryDelivered  = $summaryDelivered
-        voteResolved      = $voteResolved
-        previewPath       = $previewPath
-        artifactPath      = [string]$preview.ArtifactPath
-        reviewDigest      = $reviewDigest
-        deliveryPending   = ($writesRequested -and -not [bool]$delivery.Delivered -and -not [bool]$delivery.Aborted)
+        sourceCommit        = $sourceCommit
+        at                  = ([DateTime]::UtcNow.ToString("o"))
+        findingCount        = $allFindings.Count
+        postableCount       = $postable.Count
+        withheldCount       = $withheld.Count
+        postedCount         = $postedCount
+        summaryPosted       = $summaryPosted
+        vote                = $(if ($castVote) { $castVote } else { "none" })
+        delivered           = [bool]$delivery.Delivered
+        commentsDelivered   = $commentsDelivered
+        summaryDelivered    = $summaryDelivered
+        voteResolved        = $voteResolved
+        reviewDigest        = $reviewDigest
+        previewPath         = $previewPath
+        artifactPath        = $artifactPath
+        # The plan stays open until everything IT owes has landed, not until
+        # whichever run picked it up reports success with its own switches.
+        pendingCapabilities = $unresolved
+        deliveryPending     = ($writesRequested -and @($unresolved).Count -gt 0 -and -not [bool]$delivery.Aborted -and [bool]$artifactPath)
     }
     Set-JsonState -Path $reviewedStatePath -State $ReviewedState
     if ($AttemptsState.ContainsKey([string]$prId)) {
@@ -3169,26 +3283,40 @@ function Invoke-ReviewerPromotion {
         # that already landed on the first attempt stays landed.
         $reviewDigest = Get-ReviewerTextSha256 -Text ([string]$signed.markerBody)
         $priorApplies = (([string](Get-ReviewerHashValue -Container $priorRecord -Key 'reviewDigest' -Default '')) -ceq $reviewDigest)
+        $planCapabilities = Get-ReviewerPlanCapabilities `
+            -PriorPending ([string[]]@(Get-ReviewerHashValue -Container $priorRecord -Key 'pendingCapabilities' -Default @())) `
+            -Requested (Get-ReviewerRequestedCapabilities -Comments ([bool]$EnableFindingComments) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)) `
+            -PriorAppliesToThisReview $priorApplies
+        $promotedComments = (Merge-ReviewerCapabilityFlag -Attempted $EnableFindingComments -SucceededThisRun ([bool]$delivery.CommentsDelivered) -PriorValue ([bool](Get-ReviewerHashValue -Container $priorRecord -Key 'commentsDelivered' -Default $false)) -PriorAppliesToThisReview $priorApplies)
+        $promotedSummary = (Merge-ReviewerCapabilityFlag -Attempted $EnableSummaryComment -SucceededThisRun ([bool]$delivery.SummaryDelivered) -PriorValue ([bool](Get-ReviewerHashValue -Container $priorRecord -Key 'summaryDelivered' -Default $false)) -PriorAppliesToThisReview $priorApplies)
+        $promotedVote = (Merge-ReviewerCapabilityFlag -Attempted $EnableApprovalVote -SucceededThisRun ([bool]$delivery.VoteResolved) -PriorValue ([bool](Get-ReviewerHashValue -Container $priorRecord -Key 'voteResolved' -Default $false)) -PriorAppliesToThisReview $priorApplies)
+        $promotedUnresolved = Get-ReviewerUnresolvedCapabilities -Requested $planCapabilities `
+            -CommentsDelivered $promotedComments -SummaryDelivered $promotedSummary -VoteResolved $promotedVote
+        if (@($promotedUnresolved).Count -gt 0) {
+            Write-Warning ("This delivery plan still owes: $(@($promotedUnresolved) -join ', '). It stays retryable until " +
+                "those land; re-run with the matching switches.")
+        }
         $reviewedState[[string]$prId] = @{
-            sourceCommit      = $sourceCommit
-            at                = ([DateTime]::UtcNow.ToString("o"))
-            findingCount      = $allFindings.Count
-            postableCount     = @($postable).Count
-            withheldCount     = $dropped
-            postedCount       = [int]$delivery.PostedCount
-            summaryPosted     = [bool]$delivery.SummaryPosted
-            vote              = $(if ($delivery.CastVote) { [string]$delivery.CastVote } else { "none" })
-            delivered         = [bool]$delivery.Delivered
-            commentsDelivered = (Merge-ReviewerCapabilityFlag -Attempted $EnableFindingComments -SucceededThisRun ([bool]$delivery.CommentsDelivered) -PriorValue ([bool](Get-ReviewerHashValue -Container $priorRecord -Key 'commentsDelivered' -Default $false)) -PriorAppliesToThisReview $priorApplies)
-            summaryDelivered  = (Merge-ReviewerCapabilityFlag -Attempted $EnableSummaryComment -SucceededThisRun ([bool]$delivery.SummaryDelivered) -PriorValue ([bool](Get-ReviewerHashValue -Container $priorRecord -Key 'summaryDelivered' -Default $false)) -PriorAppliesToThisReview $priorApplies)
-            voteResolved      = (Merge-ReviewerCapabilityFlag -Attempted $EnableApprovalVote -SucceededThisRun ([bool]$delivery.VoteResolved) -PriorValue ([bool](Get-ReviewerHashValue -Container $priorRecord -Key 'voteResolved' -Default $false)) -PriorAppliesToThisReview $priorApplies)
-            reviewDigest      = $reviewDigest
-            promotedFrom      = $ArtifactPath
-            previewPath       = $previewPath
-            # The plan stays retryable until it fully lands, so an unattended
-            # retry republishes THIS review rather than a fresh model run.
-            artifactPath      = $ArtifactPath
-            deliveryPending   = (-not [bool]$delivery.Delivered -and -not [bool]$delivery.Aborted)
+            sourceCommit        = $sourceCommit
+            at                  = ([DateTime]::UtcNow.ToString("o"))
+            findingCount        = $allFindings.Count
+            postableCount       = @($postable).Count
+            withheldCount       = $dropped
+            postedCount         = [int]$delivery.PostedCount
+            summaryPosted       = [bool]$delivery.SummaryPosted
+            vote                = $(if ($delivery.CastVote) { [string]$delivery.CastVote } else { "none" })
+            delivered           = [bool]$delivery.Delivered
+            commentsDelivered   = $promotedComments
+            summaryDelivered    = $promotedSummary
+            voteResolved        = $promotedVote
+            reviewDigest        = $reviewDigest
+            promotedFrom        = $ArtifactPath
+            previewPath         = $previewPath
+            # The plan stays retryable until everything it owes has landed, so an
+            # unattended retry republishes THIS review rather than re-reviewing.
+            artifactPath        = $ArtifactPath
+            pendingCapabilities = $promotedUnresolved
+            deliveryPending     = (@($promotedUnresolved).Count -gt 0 -and -not [bool]$delivery.Aborted)
         }
         Set-JsonState -Path $reviewedStatePath -State $reviewedState
 
@@ -3321,6 +3449,15 @@ function Invoke-ReviewerCycle {
             # be mentioned again - it would look delivered because everything
             # the new run reported was already on the PR.
             $pendingPlan = Get-ReviewerPendingDeliveryPlan -ReviewedState $reviewedState -PrId $prId -SourceCommit $sourceCommit
+            if (-not $pendingPlan -and $reviewedState.ContainsKey([string]$prId)) {
+                $stale = $reviewedState[[string]$prId]
+                if ([bool](Get-ReviewerHashValue -Container $stale -Key 'deliveryPending' -Default $false) -and
+                    ([string](Get-ReviewerHashValue -Container $stale -Key 'sourceCommit' -Default '')) -ieq $sourceCommit) {
+                    Write-Warning ("PR $prId has an unfinished delivery whose sealed plan is no longer on disk " +
+                        "($([string](Get-ReviewerHashValue -Container $stale -Key 'artifactPath' -Default '<none>'))). " +
+                        "It will be reviewed again, and a finding that failed to post earlier may not be reported again.")
+                }
+            }
             if ($pendingPlan) {
                 Write-Host "  PR $prId has an unfinished delivery at this commit; retrying that exact review instead of re-reviewing." -ForegroundColor Yellow
                 $retryCode = Invoke-ReviewerPromotion -AgencyPath $AgencyPath -ArtifactPath $pendingPlan -ExistingSession $session
