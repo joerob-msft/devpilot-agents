@@ -119,9 +119,20 @@ function Get-DescendantProcessIds {
         and it keeps consuming a model budget nobody is watching. Descendants are
         collected by parent id - never by process name, which would match
         unrelated work the operator is doing in another window.
+
+        Discovery is best effort. Where the process table cannot be queried at
+        all, failing outright would take `stop` down with it and leave the
+        operator unable to kill even the parent - a strictly worse outcome than
+        killing the parent and saying plainly that any children may have
+        survived.
     #>
     param([Parameter(Mandatory)][int]$RootProcessId)
-    $all = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, CreationDate)
+    try { $all = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId -ErrorAction Stop) }
+    catch {
+        Write-Warning ("Could not read the process table ($($_.Exception.Message)); child processes cannot be " +
+            "identified. Any model process this agent spawned may keep running after it is stopped.")
+        return @()
+    }
     $result = New-Object System.Collections.Generic.List[int]
     $frontier = [System.Collections.Generic.Queue[int]]::new()
     $frontier.Enqueue($RootProcessId)
@@ -149,15 +160,21 @@ function Show-RecentCycles {
         The console log says what the agent printed; the JSONL cycle log says
         what it decided. The second is the one worth reading, because it is the
         agent's own structured record rather than prose meant for a human.
+
+        Each agent names its own log after itself, so the file is discovered
+        rather than assumed: hard-coding one agent's filename here would silently
+        report "no cycle log yet" for every other agent this script supervises.
     #>
     param([int]$Count = 5)
-    $jsonl = Join-Path $StateDir 'logs\reviewer.log.jsonl'
-    if (-not (Test-Path -LiteralPath $jsonl)) {
-        Write-Host "  (no cycle log yet at $jsonl)" -ForegroundColor DarkGray
+    $logDir = Join-Path $StateDir 'logs'
+    $jsonl = @(Get-ChildItem -LiteralPath $logDir -Filter '*.log.jsonl' -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+    if ($jsonl.Count -eq 0) {
+        Write-Host "  (no *.log.jsonl cycle log yet under $logDir)" -ForegroundColor DarkGray
         return
     }
-    $recent = @(Get-Content -LiteralPath $jsonl -Tail $Count -ErrorAction SilentlyContinue)
-    if ($recent.Count -eq 0) { Write-Host "  (cycle log is empty)" -ForegroundColor DarkGray; return }
+    $recent = @(Get-Content -LiteralPath $jsonl[0].FullName -Tail $Count -ErrorAction SilentlyContinue)
+    if ($recent.Count -eq 0) { Write-Host "  (cycle log $($jsonl[0].Name) is empty)" -ForegroundColor DarkGray; return }
     foreach ($line in $recent) {
         try { $r = $line | ConvertFrom-Json } catch { continue }
         $fields = @($r.PSObject.Properties |
@@ -247,7 +264,7 @@ switch ($Action) {
             Write-Host "  uptime  : $([int]$uptime.TotalHours)h $($uptime.Minutes)m"
             Write-Host "  command : $($current.Record.AgentScript) $(Get-AgentArgumentLine -Arguments @($current.Record.AgentArguments))"
             $children = @(Get-DescendantProcessIds -RootProcessId $current.Process.Id)
-            Write-Host "  children: $(if ($children.Count) { $children -join ', ' } else { 'none (between cycles)' })"
+            Write-Host "  children: $(if ($children.Count) { $children -join ', ' } else { 'none detected (between cycles)' })"
         }
 
         Write-Host ""
@@ -289,10 +306,23 @@ switch ($Action) {
             Stop-Process -Id $childPid -Force -ErrorAction SilentlyContinue
         }
         Stop-Process -Id $current.Process.Id -Force -ErrorAction SilentlyContinue
-        $current.Process.WaitForExit(10000) | Out-Null
+
+        # The record is the ONLY link back to this process, so it is deleted only
+        # once the process is confirmed gone. Deleting it optimistically is worse
+        # than leaving it: a still-running agent with no record is one `start`
+        # away from a second instance, and the operator has been told it stopped.
+        if (-not $current.Process.WaitForExit(10000)) {
+            Write-Warning ("Process $($current.Process.Id) did not exit within 10s. The record at $pidPath is kept " +
+                "so it can still be found - re-run -Action stop, or investigate before starting '$Name' again.")
+            exit 1
+        }
         Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
 
         Write-Host "Stopped '$Name' (process $($current.Process.Id)$(if ($children.Count) { " and $($children.Count) child process(es)" }))." -ForegroundColor Green
+        $survivors = @($children | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+        if ($survivors.Count -gt 0) {
+            Write-Warning "Child process(es) $($survivors -join ', ') outlived the agent and must be dealt with separately."
+        }
         # Worth stating plainly, because "I killed it mid-review" is the moment an
         # operator wonders what they broke. The agent's own single-writer lock is
         # released by the OS when the handle closes, its state writes are atomic,
