@@ -42,9 +42,8 @@ src/
     review-handler/          # an agent: script + prompt + fixtures
     reviewer/                # an agent: script + prompt
 samples/                     # example configs for real repositories
-schema/                      # JSON Schema for consumer configs
 tools/                       # repo hygiene checks
-tests/                       # Pester tests
+docs/                        # how to add an agent
 ```
 
 **Consumers keep only a config file.** Nothing employer-, repository-, or

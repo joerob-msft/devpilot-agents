@@ -47,8 +47,24 @@ $guidExemptLeaf = 'DevPilot.AgentHarness.psd1'
 # Likewise, the manifest's Project/License/Help/Icon URIs are this repository's
 # own address. They necessarily contain the owning account name.
 $manifestUriLine = "^\s*(ProjectUri|LicenseUri|HelpInfoURI|IconUri)\s*="
-# Obviously-synthetic GUIDs (one repeated character) are test fixtures.
-$syntheticGuid = '^([0-9a-fA-F])\1{7}-\1{4}-\1{4}-\1{4}-\1{12}$'
+# Obviously-synthetic GUIDs are test fixtures. A placeholder GUID is one where
+# every dash-separated group is a repetition of a one- or two-character unit
+# ("11111111-2222-3333-4444-555555555555", "aaaaaaaa-bbbb-cccc-dddd-eeee...",
+# "12121212-3434-5656-..."). A real resource GUID essentially never is, so this
+# stays tight while letting fixtures through.
+function Test-SyntheticGuid {
+    param([string]$Guid)
+    foreach ($group in ($Guid -split '-')) {
+        $isRepetition = $false
+        foreach ($unitLength in 1, 2) {
+            if ($group.Length % $unitLength -ne 0) { continue }
+            $unit = $group.Substring(0, $unitLength)
+            if ($group -eq ($unit * ($group.Length / $unitLength))) { $isRepetition = $true; break }
+        }
+        if (-not $isRepetition) { return $false }
+    }
+    return $true
+}
 # Sample configs are named after the consumer they demonstrate, so docs and CI
 # have to be able to cite them by path. Only a literal samples/ path reference
 # is exempt - the name on its own is still a leak.
@@ -78,7 +94,7 @@ foreach ($file in (Get-ChildItem -LiteralPath $RepoRoot -Recurse -File)) {
             $hit = $Matches[0]
             if ($rule.Name -eq 'Resource GUIDs') {
                 if ($file.Name -eq $guidExemptLeaf) { continue }
-                if ($hit -match $syntheticGuid) { continue }
+                if (Test-SyntheticGuid -Guid $hit) { continue }
             }
             if ($file.Name -eq $guidExemptLeaf -and $line -match $manifestUriLine) { continue }
             # A citation of a sample file path is documentation, not a leak.
