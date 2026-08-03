@@ -982,11 +982,15 @@ function Format-ReviewerSummaryComment {
     if ($Summary -and $Summary.Trim() -ne "") { [void]$parts.Add($Summary.Trim()); [void]$parts.Add("") }
     [void]$parts.Add(("Findings: {0} critical, {1} important, {2} suggestion." -f $Counts['critical'], $Counts['important'], $Counts['suggestion']))
     if ($Publishable -lt $Reported) {
-        # Deliberately does not attribute a single cause: a finding can be
-        # withheld by the severity threshold, by the per-PR cap, or because it
-        # names a location this PR does not change, and claiming one reason for
-        # all of them is a statement the agent cannot support.
-        [void]$parts.Add("$Publishable of $Reported finding(s) are published as inline comments; the rest are withheld by this repository's posting rules (severity threshold, per-PR cap, or a location this PR does not change).")
+        # Says ELIGIBLE, not published. What actually landed depends on which
+        # write switches this run carried and on whether each thread write
+        # confirmed, and neither is knowable here - nor stable across a retry,
+        # which is the whole reason this body quotes no delivery count.
+        # Deliberately does not attribute a single cause either: a finding can
+        # be withheld by the severity threshold, by the per-PR cap, or because
+        # it names a location this PR does not change, and claiming one reason
+        # for all of them is a statement the agent cannot support.
+        [void]$parts.Add("$Publishable of $Reported finding(s) are eligible to post as inline comments; the rest are withheld by this repository's posting rules (severity threshold, per-PR cap, or a location this PR does not change).")
     }
     [void]$parts.Add("")
     [void]$parts.Add($script:ReviewerSignatureFooter)
@@ -2082,8 +2086,8 @@ function Invoke-DryRunSelfChecks {
         $failures.Add("The summary body is not retry-stable, so a retry would post a second summary instead of being deduplicated.")
         $summaryGateFailures++
     }
-    if ($bodyPartial -match 'Posted \d+ of') {
-        $failures.Add("The summary body still quotes a delivery count, which changes between attempts and defeats fingerprint dedupe.")
+    if ($bodyPartial -match 'Posted \d+ of' -or $bodyPartial -match 'are published as') {
+        $failures.Add("The summary body claims a delivery outcome, which changes between attempts and is not knowable when it is composed.")
         $summaryGateFailures++
     }
     $summaryCases = @(

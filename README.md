@@ -183,9 +183,11 @@ Other properties worth knowing:
   written to state *before* the first ADO call, so a crash mid-delivery leaves a
   retryable plan rather than an invisible partial review.
 - **The summary describes the review, not the delivery.** Its body quotes what
-  was found and how much of it is eligible to post - never how much actually
-  posted. That makes the body identical on a retry, so fingerprint dedupe
-  against the PR's own threads collapses it instead of adding a second,
+  was found and how much of it is *eligible* to post - never how much actually
+  posted, and never a claim that anything was published. That is both honest
+  (what lands depends on which write switches the run carried and on whether
+  each thread write confirmed) and retry-stable, so fingerprint dedupe against
+  the PR's own threads collapses a re-post instead of adding a second,
   differently-worded summary. An earlier design deferred the summary until the
   comments landed; that had no terminal path, so one permanently unpostable
   comment would have suppressed the summary forever.
