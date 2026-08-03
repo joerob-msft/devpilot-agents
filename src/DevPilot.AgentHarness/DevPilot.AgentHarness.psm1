@@ -91,6 +91,72 @@ function Test-ParserValidity {
     return , @($errors)
 }
 
+function Test-AgentValidatedParamRebind {
+    <#
+        Detects a PowerShell footgun: a parameter carrying a validation
+        attribute that is later re-assigned in the same scope. The attribute
+        stays bound to the VARIABLE, and variable names are case-INSENSITIVE, so
+
+            param([ValidateSet("pending","confirmed")][string]$State)
+            $state = Get-JsonState -Path $p     # same variable!
+
+        re-validates the hashtable against the ValidateSet and throws at
+        runtime. This shipped undetected in a sibling agent and silently broke
+        an entire code path, so it is checked mechanically rather than by
+        review. Lives in the harness because every agent needs it and a copied
+        detector is a detector that drifts.
+
+        Returns a (possibly empty) array of human-readable findings.
+    #>
+    param([Parameter(Mandatory)][string[]]$ScriptPath)
+    $attrNames = @('ValidateSet', 'ValidateRange', 'ValidatePattern', 'ValidateLength', 'ValidateScript', 'ValidateCount')
+    $findings = New-Object System.Collections.Generic.List[string]
+
+    foreach ($file in $ScriptPath) {
+        $parseErrors = $null; $parseTokens = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path -LiteralPath $file).Path, [ref]$parseTokens, [ref]$parseErrors)
+        if (@($parseErrors).Count -gt 0) { continue }
+
+        $scopes = New-Object System.Collections.Generic.List[object]
+        [void]$scopes.Add([pscustomobject]@{ Label = '<script>'; ParamBlock = $ast.ParamBlock; Body = $ast })
+        foreach ($fn in $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+            [void]$scopes.Add([pscustomobject]@{ Label = $fn.Name; ParamBlock = $fn.Body.ParamBlock; Body = $fn.Body })
+        }
+
+        foreach ($scope in $scopes) {
+            if (-not $scope.ParamBlock) { continue }
+            $validated = @{}
+            foreach ($p in $scope.ParamBlock.Parameters) {
+                $attrs = @($p.Attributes | Where-Object { $attrNames -contains $_.TypeName.Name })
+                if ($attrs.Count -gt 0) { $validated[$p.Name.VariablePath.UserPath.ToLowerInvariant()] = ($attrs | ForEach-Object { $_.TypeName.Name }) -join ',' }
+            }
+            if ($validated.Count -eq 0) { continue }
+
+            $assignments = $scope.Body.FindAll({
+                    param($a)
+                    $a -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                    $a.Left -is [System.Management.Automation.Language.VariableExpressionAst]
+                }, $true)
+            foreach ($asn in $assignments) {
+                $key = $asn.Left.VariablePath.UserPath.ToLowerInvariant()
+                if (-not $validated.ContainsKey($key)) { continue }
+                # An assignment inside a NESTED function is a different scope.
+                $node = $asn; $nested = $false
+                while ($node.Parent) {
+                    $node = $node.Parent
+                    if ($node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ne $scope.Label) { $nested = $true; break }
+                }
+                if ($nested) { continue }
+                [void]$findings.Add("$(Split-Path $file -Leaf) L$($asn.Extent.StartLineNumber) in $($scope.Label): `$$($asn.Left.VariablePath.UserPath) carries [$($validated[$key])] and is re-assigned")
+            }
+        }
+    }
+    # NOT `return ,$array`: for an EMPTY array that emits a single element which
+    # is itself the empty array, so callers see one bogus finding. Returning the
+    # array plainly emits zero elements when empty and N when populated.
+    return $findings.ToArray()
+}
+
 function Get-OnceFinalExitCode {
     <#
         Pure decision function factored out so the "-Once must never mask a
@@ -521,6 +587,126 @@ function Write-AgentMetadata {
 # Result-marker parsing (generic, schema-driven; hostile input)
 # ---------------------------------------------------------------------------
 
+function ConvertTo-AgentMarkerFieldValue {
+    <#
+        Validates ONE marker field against its typed schema entry and returns
+        @{ Ok = $bool; Value = <converted> }. A hashtable result is used rather
+        than "$null means invalid" because $null is itself a legal value for the
+        nullable types.
+
+        Split out of ConvertFrom-AgentResultMarker so that objectArray items are
+        validated by exactly the same code as top-level fields - an array whose
+        elements were checked more loosely than scalars would be a silent hole
+        in the only boundary that treats model output as hostile.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Spec,
+        [AllowNull()]$Value,
+        [int]$Depth = 0
+    )
+    $bad = @{ Ok = $false; Value = $null }
+    # objectArray may not contain objectArray. Bounding the nesting keeps the
+    # validator's cost linear in the payload and stops a crafted marker from
+    # driving deep recursion.
+    if ($Depth -gt 1) { return $bad }
+
+    switch ([string]$Spec.Type) {
+        "int" {
+            if (-not (Test-StrictJsonInt -Value $Value -Min ([long]$Spec.Min) -Max ([long]$Spec.Max))) { return $bad }
+            return @{ Ok = $true; Value = [int]$Value }
+        }
+        "guid" {
+            if ($Value -isnot [string] -or $Value -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') { return $bad }
+            return @{ Ok = $true; Value = [string]$Value }
+        }
+        "exact" {
+            if ($Value -isnot [string] -or $Value -cne [string]$Spec.Expected) { return $bad }
+            return @{ Ok = $true; Value = [string]$Value }
+        }
+        "hex" {
+            if ($Value -isnot [string] -or $Value -notmatch "^[0-9a-fA-F]{$([int]$Spec.Length)}$") { return $bad }
+            return @{ Ok = $true; Value = [string]$Value }
+        }
+        "hexOrNull" {
+            if ($null -eq $Value) { return @{ Ok = $true; Value = $null } }
+            if ($Value -is [string] -and $Value -match "^[0-9a-fA-F]{$([int]$Spec.Length)}$") { return @{ Ok = $true; Value = [string]$Value } }
+            return $bad
+        }
+        "enum" {
+            if ($Value -isnot [string] -or (@($Spec.Values) -cnotcontains $Value)) { return $bad }
+            return @{ Ok = $true; Value = [string]$Value }
+        }
+        "bool" {
+            if ($Value -isnot [bool]) { return $bad }
+            return @{ Ok = $true; Value = [bool]$Value }
+        }
+        "string" {
+            # Free text authored by the model. Length is always bounded, and
+            # control characters are rejected outright: this text is destined
+            # for a PR comment, and an embedded CR/LF/NUL is the cheapest way to
+            # forge structure in something that reads it back line-by-line.
+            # Tab and newline are allowed only when the schema opts in.
+            if ($Value -isnot [string]) { return $bad }
+            $text = [string]$Value
+            $max = if ($Spec.ContainsKey('MaxLength')) { [int]$Spec.MaxLength } else { 1000 }
+            if ($text.Length -gt $max) { return $bad }
+            if (-not ($Spec.ContainsKey('AllowEmpty') -and [bool]$Spec.AllowEmpty) -and $text.Trim() -eq "") { return $bad }
+            $allowNewlines = ($Spec.ContainsKey('AllowNewlines') -and [bool]$Spec.AllowNewlines)
+            foreach ($ch in $text.ToCharArray()) {
+                if ([char]::IsControl($ch)) {
+                    if ($allowNewlines -and ($ch -eq "`n" -or $ch -eq "`r" -or $ch -eq "`t")) { continue }
+                    return $bad
+                }
+            }
+            if ($Spec.ContainsKey('Pattern') -and $Spec.Pattern) {
+                if ($text -notmatch [string]$Spec.Pattern) { return $bad }
+            }
+            return @{ Ok = $true; Value = $text }
+        }
+        "objectArray" {
+            # A bounded, homogeneous array of flat objects. This exists so a
+            # wrapper can receive STRUCTURED results (e.g. review findings) and
+            # perform the writes itself, instead of granting the model a write
+            # tool and trusting it to use it correctly. Every element is subject
+            # to the same exact-key-set rule as the top-level object.
+            if ($null -eq $Value) { return $bad }
+            # ConvertFrom-Json yields Object[]; a bare object or scalar is not an
+            # array and must not be silently promoted to a one-element list.
+            if ($Value -isnot [System.Object[]]) { return $bad }
+            $items = @($Value)
+            $maxItems = if ($Spec.ContainsKey('MaxItems')) { [int]$Spec.MaxItems } else { 25 }
+            if ($items.Count -gt $maxItems) { return $bad }
+            $itemSchema = $Spec.Item
+            if ($null -eq $itemSchema) { return $bad }
+            # $itemSchema.Keys must be the DECLARED key list. PowerShell's
+            # hashtable adapter returns the 'Keys' entry when one exists, but
+            # falls back to the hashtable's own key collection when it does not -
+            # which would silently validate elements against ('Keys','Fields').
+            # Require both entries so a malformed schema fails closed.
+            if ($itemSchema -isnot [hashtable] -or -not $itemSchema.ContainsKey('Keys') -or -not $itemSchema.ContainsKey('Fields')) { return $bad }
+            $itemKeys = @($itemSchema.Keys)
+            $out = New-Object System.Collections.Generic.List[hashtable]
+            foreach ($element in $items) {
+                if ($element -isnot [System.Management.Automation.PSCustomObject]) { return $bad }
+                $elementKeys = @($element.PSObject.Properties | ForEach-Object { $_.Name })
+                foreach ($name in $elementKeys) { if ($itemKeys -notcontains $name) { return $bad } }
+                foreach ($name in $itemKeys) { if (-not $element.PSObject.Properties[$name]) { return $bad } }
+                $record = @{}
+                foreach ($name in $itemKeys) {
+                    $fieldSpec = $itemSchema.Fields[$name]
+                    if ($null -eq $fieldSpec) { return $bad }
+                    $converted = ConvertTo-AgentMarkerFieldValue -Spec $fieldSpec -Value $element.PSObject.Properties[$name].Value -Depth ($Depth + 1)
+                    if (-not $converted.Ok) { return $bad }
+                    $record[$name] = $converted.Value
+                }
+                [void]$out.Add($record)
+            }
+            return @{ Ok = $true; Value = $out.ToArray() }
+        }
+        default { return $bad }
+    }
+}
+
 function ConvertFrom-AgentResultMarker {
     <#
         Parses a single strict `<PREFIX>: <json>` result line as HOSTILE input.
@@ -533,12 +719,21 @@ function ConvertFrom-AgentResultMarker {
             missing);
           - each field validates against its typed schema entry (strict int
             typing, exact-format GUID, case-sensitive string/enum/nonce
-            equality, fixed-length hex, nullable hex).
+            equality, fixed-length hex, nullable hex, bounded control-character
+            -free text, and bounded arrays of flat objects).
 
         $Schema = @{
             Keys   = @(<ordered allowed/required key names>)
-            Fields = @{ <name> = @{ Type = 'int'|'guid'|'exact'|'hex'|'hexOrNull'|'enum'|'bool'; ... } }
+            Fields = @{ <name> = @{ Type = 'int'|'guid'|'exact'|'hex'|'hexOrNull'|'enum'|'bool'|'string'|'objectArray'; ... } }
         }
+
+        'string'      = @{ MaxLength = <int>; AllowEmpty = <bool>; AllowNewlines = <bool>; Pattern = <regex> }
+        'objectArray' = @{ MaxItems = <int>; Item = @{ Keys = @(...); Fields = @{...} } }
+
+        'objectArray' exists so an agent can return STRUCTURED results that the
+        wrapper acts on itself. That is what lets a wrapper own every write
+        instead of handing the model a write tool: the model reports findings,
+        the schema bounds them, and the wrapper decides what to do with them.
     #>
     param(
         [Parameter(Mandatory)][string]$StdOutText,
@@ -575,11 +770,16 @@ function ConvertFrom-AgentResultMarker {
             if ($jsonStart -lt 0) { return $null }
             # Bounded brace-depth scan. String contents are respected so a brace
             # inside a JSON string value cannot terminate the object early.
+            # The bound is generous rather than tight because a marker carrying
+            # an objectArray of findings is legitimately tens of KB; the schema
+            # (MaxItems / MaxLength) is what actually constrains the payload,
+            # while this bound only stops an unterminated brace from scanning an
+            # entire multi-megabyte transcript.
             $depth = 0
             $inString = $false
             $escaped = $false
             $jsonEnd = -1
-            $limit = [Math]::Min($StdOutText.Length, $jsonStart + 20000)
+            $limit = [Math]::Min($StdOutText.Length, $jsonStart + 65536)
             for ($i = $jsonStart; $i -lt $limit; $i++) {
                 $ch = $StdOutText[$i]
                 if ($inString) {
@@ -621,39 +821,9 @@ function ConvertFrom-AgentResultMarker {
         foreach ($name in $allowedKeys) {
             $spec = $Schema.Fields[$name]
             if ($null -eq $spec) { return $null }
-            $value = $obj.PSObject.Properties[$name].Value
-            switch ([string]$spec.Type) {
-                "int" {
-                    if (-not (Test-StrictJsonInt -Value $value -Min ([long]$spec.Min) -Max ([long]$spec.Max))) { return $null }
-                    $out[$name] = [int]$value
-                }
-                "guid" {
-                    if ($value -isnot [string] -or $value -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') { return $null }
-                    $out[$name] = [string]$value
-                }
-                "exact" {
-                    if ($value -isnot [string] -or $value -cne [string]$spec.Expected) { return $null }
-                    $out[$name] = [string]$value
-                }
-                "hex" {
-                    if ($value -isnot [string] -or $value -notmatch "^[0-9a-fA-F]{$([int]$spec.Length)}$") { return $null }
-                    $out[$name] = [string]$value
-                }
-                "hexOrNull" {
-                    if ($null -eq $value) { $out[$name] = $null }
-                    elseif ($value -is [string] -and $value -match "^[0-9a-fA-F]{$([int]$spec.Length)}$") { $out[$name] = [string]$value }
-                    else { return $null }
-                }
-                "enum" {
-                    if ($value -isnot [string] -or (@($spec.Values) -cnotcontains $value)) { return $null }
-                    $out[$name] = [string]$value
-                }
-                "bool" {
-                    if ($value -isnot [bool]) { return $null }
-                    $out[$name] = [bool]$value
-                }
-                default { return $null }
-            }
+            $converted = ConvertTo-AgentMarkerFieldValue -Spec $spec -Value $obj.PSObject.Properties[$name].Value
+            if (-not $converted.Ok) { return $null }
+            $out[$name] = $converted.Value
         }
         return $out
     }
@@ -2226,6 +2396,7 @@ Export-ModuleMember -Function @(
     "Get-OnceFinalExitCode",
     "Test-StrictJsonInt",
     "New-AgentNonce",
+    "Test-AgentValidatedParamRebind",
     "Test-AgentProtectedBranch",
     "Get-AgentConfigProperty",
     "Get-AgentConfigString",

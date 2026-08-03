@@ -78,6 +78,7 @@ FunctionsToExport = 'Get-DevPilotAgentPath', 'Resolve-AgentRepositoryRoot', 'Get
                'Get-AgentRequiredProperty', 'Get-AgentDefaultModelSentinel', 
                'Assert-AgentSupportedModel', 'Test-ParserValidity', 
                'Get-OnceFinalExitCode', 'Test-StrictJsonInt', 'New-AgentNonce', 
+               'Test-AgentValidatedParamRebind', 
                'Test-AgentProtectedBranch', 'Get-AgentConfigProperty', 
                'Get-AgentConfigString', 'Get-AgentConfigInt', 'Get-AgentConfigBool', 
                'Get-AgentConfigObject', 'Get-AgentConfigStringArray', 
