@@ -2825,9 +2825,9 @@ function Invoke-ReviewerDelivery {
         # Split-ReviewerFindingsByChangeSet exists to prevent.
         [bool]$ChangeSetKnown = $false,
         # $true when the summary for THIS review already landed on a previous
-        # attempt. Its text embeds how many findings were posted, so re-posting
-        # it after a partial attempt would produce a second, differently-worded
-        # summary rather than being deduplicated by fingerprint.
+        # attempt. Fingerprint dedupe against the PR's threads would catch a
+        # re-post anyway (the body is retry-stable), but skipping the write
+        # avoids a pointless ADO call when we already know it landed.
         [bool]$SummaryAlreadyDelivered = $false
     )
     $outcome = @{
