@@ -86,6 +86,13 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Scheduled tasks, Win32_Process and the agents themselves are all Windows-only.
+# Said here, once, rather than letting it surface as a missing cmdlet halfway
+# through registering a task.
+if (-not $IsWindows) {
+    throw "Invoke-AgentControl.ps1 requires Windows: it uses the ScheduledTasks cmdlets and Win32_Process, and the agents it supervises are Windows-only."
+}
+
 $runnerDir = Join-Path $StateDir 'runner'
 $pidPath = Join-Path $runnerDir "$Name.pid.json"
 $logPath = Join-Path $runnerDir "$Name.console.log"
@@ -149,9 +156,16 @@ function Get-DescendantProcessIds {
 }
 
 function Get-AgentArgumentLine {
+    <#
+        For DISPLAY only. Quoted as PowerShell literals rather than with
+        backslash escapes, so what `status` prints can be pasted back into a
+        PowerShell prompt unchanged - backslash-escaping is a shell convention
+        PowerShell does not share, and a command line that looks copyable but
+        is not is worse than one that obviously needs editing.
+    #>
     param([string[]]$Arguments)
     return (@($Arguments | ForEach-Object {
-                if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+                if ([string]::IsNullOrEmpty($_) -or $_ -match '[\s''"`$]') { "'" + ($_ -replace "'", "''") + "'" } else { $_ }
             }) -join ' ')
 }
 
