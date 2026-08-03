@@ -78,6 +78,24 @@
     Review exactly this PR and nothing else. The safe way to try the agent on a
     repository for the first time.
 
+.PARAMETER SecondPassModel
+    Review every PR a SECOND time with a different model and publish the union of
+    what the two passes found. Requires -Model, which names the first pass.
+
+    This exists because model coverage of real defects is both incomplete and
+    poorly correlated: on a nine-PR benchmark of this agent against live PRs, the
+    best single model found 10 of 13 verified issues and the best partner found 5,
+    but the two together found all 13 - because they miss different things. A
+    second pass is therefore worth far more than a longer first one.
+
+    The passes are INDEPENDENT. Each gets its own nonce, is validated against the
+    marker schema on its own, and is bound to the same PR and commit on its own;
+    neither sees the other's output, so the second cannot be anchored by the
+    first. The wrapper - not a model - merges the results.
+
+    Cost and time roughly double: each pass is a separate model run with its own
+    -CycleTimeoutSeconds budget.
+
 .PARAMETER PromotePreview
     Publish the review stored in a preview artifact (.json) instead of running
     the model again. The stored review is re-parsed through the same schema that
@@ -115,6 +133,10 @@
 .EXAMPLE
     .\Start-ReviewerAgent.ps1 -Once -ConfigFile <path> -OperatorAlias operator -EnableFindingComments -EnableSummaryComment
     Unattended: review one PR and post the findings in the same run.
+
+.EXAMPLE
+    .\Start-ReviewerAgent.ps1 -ConfigFile <path> -OperatorAlias operator -Model claude-opus-5 -SecondPassModel gpt-5.6-sol
+    Two-pass preview: review each PR with both models and report the union.
 #>
 [CmdletBinding()]
 param(
@@ -142,6 +164,11 @@ param(
     # every unenumerated write tool - the exact opposite of its design.
 
     [string]$Model,
+
+    # A second, independent review pass by a different model, merged by the
+    # wrapper. See the .PARAMETER block: two models that miss different things
+    # cover far more together than either does alone.
+    [string]$SecondPassModel,
 
     [string]$Organization,
 
@@ -883,6 +910,145 @@ function Get-ReviewerPostableFindings {
     return , ($ordered.ToArray())
 }
 
+# ---------------------------------------------------------------------------
+# Two-pass merge (wrapper-owned; no model sees another model's output)
+# ---------------------------------------------------------------------------
+
+$script:ReviewerVoteConservatism = @('approve', 'approveWithSuggestions', 'none', 'waitForAuthor')
+
+function Get-ReviewerFindingMergeKey {
+    <#
+        Identity of a finding ACROSS passes: anchor plus whitespace- and
+        case-insensitive body. Severity is deliberately excluded, because the
+        same defect described at the same place is one finding even when two
+        models grade it differently - and posting it twice under two severities
+        would be the pairing's most obvious failure mode.
+
+        This is not Get-ReviewerCommentFingerprint: that one fingerprints the
+        RENDERED comment, severity prefix and footer included, because its job is
+        to recognize text already on the PR. Merging happens before rendering and
+        must ignore severity, so the two cannot share an implementation.
+    #>
+    param([Parameter(Mandatory)]$Finding)
+    $anchor = Get-ReviewerNormalizedPath -Path ([string](Get-ReviewerHashValue -Container $Finding -Key 'filePath' -Default ''))
+    $line = [int](Get-ReviewerHashValue -Container $Finding -Key 'line' -Default 0)
+    $body = ((([string](Get-ReviewerHashValue -Container $Finding -Key 'comment' -Default '')) -replace '\s+', ' ')).Trim().ToLowerInvariant()
+    return ("{0}|{1}|{2}" -f $anchor, $line, $body)
+}
+
+function Merge-ReviewerPassFindings {
+    <#
+        Merges the passes into the UNION of what they found, which is the entire
+        reason a second pass exists: on the benchmark that motivated this option
+        the two models' findings barely overlapped, so an intersection would have
+        thrown away most of the value and a "second model confirms" gate would
+        have suppressed the majority of the real defects.
+
+        Dedupe is EXACT on the merge key. Two differently worded findings at one
+        anchor are kept as two, because no similarity heuristic here could tell
+        "the same point, said differently" from "two distinct bugs on one line",
+        and silently dropping the second would lose a real finding to save a
+        duplicate comment. The wrapper's ranking cap still bounds what is posted.
+
+        Where both passes report the same finding, the MORE severe grade wins.
+        That is a choice between two model-supplied values, not a new claim, and
+        it is the fail-closed direction.
+
+        Findings are rebuilt as schema-pure records: the merged marker is
+        re-validated against the marker schema on promotion, and that schema
+        rejects any key it does not declare. Provenance therefore travels beside
+        the findings, keyed by merge key, and never inside them.
+
+        Returns @{ Findings; Provenance }.
+    #>
+    param([object[]]$Passes = @())
+    $order = New-Object System.Collections.Generic.List[string]
+    $byKey = @{}
+    $provenance = @{}
+    foreach ($pass in @($Passes)) {
+        $model = [string](Get-ReviewerHashValue -Container $pass -Key 'Model' -Default '')
+        foreach ($f in @(Get-ReviewerHashValue -Container $pass -Key 'Findings' -Default @())) {
+            $key = Get-ReviewerFindingMergeKey -Finding $f
+            $record = @{
+                severity = [string](Get-ReviewerHashValue -Container $f -Key 'severity' -Default 'suggestion')
+                filePath = [string](Get-ReviewerHashValue -Container $f -Key 'filePath' -Default '')
+                line     = [int](Get-ReviewerHashValue -Container $f -Key 'line' -Default 0)
+                comment  = [string](Get-ReviewerHashValue -Container $f -Key 'comment' -Default '')
+            }
+            if (-not $byKey.ContainsKey($key)) {
+                $byKey[$key] = $record
+                $provenance[$key] = @($model)
+                [void]$order.Add($key)
+                continue
+            }
+            $existing = $byKey[$key]
+            $rankExisting = [array]::IndexOf([object[]]$script:ReviewerSeverities, [string]$existing['severity'])
+            $rankNew = [array]::IndexOf([object[]]$script:ReviewerSeverities, [string]$record['severity'])
+            if ($rankNew -ge 0 -and ($rankExisting -lt 0 -or $rankNew -lt $rankExisting)) { $existing['severity'] = $record['severity'] }
+            if (@($provenance[$key]) -cnotcontains $model) { $provenance[$key] = @(@($provenance[$key]) + $model) }
+        }
+    }
+    $merged = New-Object System.Collections.Generic.List[hashtable]
+    foreach ($k in $order) { [void]$merged.Add($byKey[$k]) }
+    return @{ Findings = $merged.ToArray(); Provenance = $provenance }
+}
+
+function Get-ReviewerMergedVote {
+    <#
+        The merged recommendation is the least approving one offered, so a plain
+        approval requires EVERY pass to have approved. One model calling a PR
+        clean does not make it clean - the benchmark's single worst outcome was a
+        confident approval of a PR that broke two APIs, and the partner model
+        caught it.
+
+        An unrecognized recommendation collapses the whole vote to 'none': a
+        value that is not on the list is a value this function cannot rank, and
+        guessing its conservatism is exactly the kind of assumption that turns
+        into an unearned approval.
+    #>
+    param([string[]]$Votes = @())
+    $best = $null
+    $bestRank = -1
+    foreach ($v in @($Votes)) {
+        $idx = [array]::IndexOf([object[]]$script:ReviewerVoteConservatism, [string]$v)
+        if ($idx -lt 0) { return 'none' }
+        if ($idx -gt $bestRank) { $bestRank = $idx; $best = [string]$script:ReviewerVoteConservatism[$idx] }
+    }
+    if ($null -eq $best) { return 'none' }
+    return $best
+}
+
+function Get-ReviewerMergedSummary {
+    <#
+        Both passes' summaries, each attributed to the model that wrote it, so a
+        reader can see which one is making which claim rather than reading a
+        blended paragraph nobody actually wrote.
+
+        The result has to satisfy the marker schema's `summary` field exactly as a
+        model's own answer would: the merged review is stored as a marker and
+        re-parsed under that schema on promotion, so a merge the schema rejects
+        seals an artifact that can never be promoted. Two rules bite here - the
+        length cap, and the fact that a bounded schema string is
+        control-character free. Hence the inline separator: the obvious blank
+        line between the two summaries is a newline, and a newline would make
+        every two-pass review unpromotable.
+    #>
+    param([object[]]$Passes = @(), [int]$MaxLength = 1500)
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($pass in @($Passes)) {
+        $text = ([string](Get-ReviewerHashValue -Container $pass -Key 'Summary' -Default '')).Trim()
+        if (-not $text) { continue }
+        $model = [string](Get-ReviewerHashValue -Container $pass -Key 'Model' -Default '')
+        [void]$parts.Add($(if ($model -and @($Passes).Count -gt 1) { "${model}: $text" } else { $text }))
+    }
+    if ($parts.Count -eq 0) { return "" }
+    $joined = ($parts.ToArray() -join ' | ')
+    if ($joined.Length -le $MaxLength) { return $joined }
+    $suffix = " ... (truncated)"
+    $keep = [Math]::Max(0, $MaxLength - $suffix.Length)
+    return ($joined.Substring(0, $keep) + $suffix)
+}
+
 function Get-ReviewerNormalizedPath {
     <# ADO reports thread and change paths with a leading slash; the model is
        told to use the same form but a stray './' or backslash must not turn a
@@ -1041,8 +1207,22 @@ function Test-ReviewerShouldVote {
         [bool]$PrIsActive,
         [bool]$PrIsDraft,
         [string]$CurrentSourceCommit,
-        [string]$ReviewedSourceCommit
+        [string]$ReviewedSourceCommit,
+        # $false when the operator asked for a two-pass review and only one pass
+        # produced a usable result. The findings that DID arrive are still worth
+        # showing, but the verdict is not: an operator who configured two models
+        # because one is not enough must not be handed a vote decided by one.
+        [bool]$PassesComplete = $true
     )
+    if (-not $PassesComplete) {
+        # FINAL, not retryable. The shortfall is a property of the review, not of
+        # this delivery attempt: the sealed plan a retry would replay was
+        # produced by the same incomplete pass set, so every retry would decline
+        # again and the PR would stay pending forever. The findings still post -
+        # a real defect is worth reporting however many models saw it - but the
+        # verdict waits for a cycle that actually ran every configured pass.
+        return @{ Vote = ""; Reason = "a requested review pass did not complete, so this verdict would rest on fewer models than the operator configured" }
+    }
     if ($RecommendedVote -ceq 'none') { return @{ Vote = ""; Reason = "the model recommended no vote" } }
     if (-not $PrIsActive) { return @{ Vote = ""; Reason = "PR is no longer active" } }
     if ($PrIsDraft) { return @{ Vote = ""; Reason = "PR is a draft" } }
@@ -1320,6 +1500,33 @@ $ResolvedModel = $null
 if ($Model) { $ResolvedModel = Assert-AgentSupportedModel -ModelId $Model -Where "-Model parameter" }
 $EffectiveModel = if ($ResolvedModel) { $ResolvedModel } else { Get-AgentDefaultModelSentinel }
 
+# Second pass. Both models are named EXPLICITLY or there is no second pass: a
+# two-pass review whose first pass is "whatever the CLI defaults to today" is not
+# reproducible, and the whole value of the pairing is that the two models were
+# chosen to miss different things.
+$ResolvedSecondPassModel = $null
+if ($SecondPassModel) {
+    $ResolvedSecondPassModel = Assert-AgentSupportedModel -ModelId $SecondPassModel -Where "-SecondPassModel parameter"
+    if (-not $ResolvedModel) {
+        throw ("-SecondPassModel requires -Model. A second pass is only meaningful against a named first pass; " +
+            "pairing a chosen model with the CLI default makes the run unreproducible and the pairing arbitrary.")
+    }
+    if ($ResolvedSecondPassModel -ceq $ResolvedModel) {
+        throw ("-SecondPassModel '$ResolvedSecondPassModel' is the same model as -Model. Two passes by one model cost " +
+            "twice as much and add almost nothing: models miss the same things twice. Name a different model or drop " +
+            "-SecondPassModel.")
+    }
+}
+$EffectiveSecondPassModel = $ResolvedSecondPassModel
+# The ordered pass list is the single source of truth for how many model runs a
+# PR costs, so every consumer (launch loop, preview, manifest, log) agrees.
+$ReviewPassModels = if ($EffectiveSecondPassModel) { @($EffectiveModel, $EffectiveSecondPassModel) } else { @($EffectiveModel) }
+$IsTwoPass = (@($ReviewPassModels).Count -gt 1)
+# A merged review can legitimately carry up to one full cap per pass before the
+# wrapper's own ranking cap trims it. The stored marker is re-validated on
+# promotion against exactly this bound, so it has to account for the union.
+$MergedMarkerMaxFindingItems = $EffectiveMaxFindings * (@($ReviewPassModels).Count)
+
 if (-not $RepoPath) {
     # Resolve from the CONFIG's location, never from the script's. The script
     # lives in the toolkit (possibly an installed module); the config always
@@ -1573,6 +1780,7 @@ function Write-ReviewerCycleMetadata {
     $base = @{
         agent        = $AgentName
         model        = $EffectiveModel
+        reviewModels = @($ReviewPassModels)
         promptFile   = (Split-Path -Leaf $PromptFile)
         scriptSha256 = $ScriptSelfSha256
     }
@@ -1603,11 +1811,20 @@ function Write-ReviewerPreview {
         # so -PromotePreview can publish this exact review without a second
         # model run. Omitted only by the self-checks.
         $Marker = $null,
+        # The per-pass results and the merge-key -> models map produced by
+        # Merge-ReviewerPassFindings. Provenance is rendered here and sealed in
+        # the manifest, but it is deliberately kept OUT of the findings
+        # themselves: the marker schema rejects any key it does not declare, so a
+        # finding carrying an extra field could never be promoted.
+        [object[]]$PassResults = @(),
+        [hashtable]$FindingProvenance = @{},
         # The file is written either way; -Quiet suppresses only the console
         # echo, which is noise once the same text is being posted to the PR.
         [switch]$Quiet
     )
     $counts = Get-ReviewerSeverityCounts -Findings $AllFindings
+    $passCount = @($PassResults).Count
+    $passesComplete = ($passCount -eq 0) -or (@($PassResults | Where-Object { $null -eq $_.Marker }).Count -eq 0)
     $lines = New-Object System.Collections.Generic.List[string]
     [void]$lines.Add("# Review preview - PR $PrId")
     [void]$lines.Add("")
@@ -1618,6 +1835,33 @@ function Write-ReviewerPreview {
     [void]$lines.Add("- Recommended vote: $RecommendedVote")
     [void]$lines.Add($(if ($Quiet) { "- Posting was enabled for this run; see the agent log for what was actually posted." } else { "- Nothing was posted: this is a preview." }))
     [void]$lines.Add("")
+    if ($passCount -gt 1) {
+        # Which model said what is the first thing a reader of a two-pass review
+        # needs, and it is the only way to judge the pairing itself over time.
+        [void]$lines.Add("## Review passes")
+        [void]$lines.Add("")
+        $n = 0
+        foreach ($p in @($PassResults)) {
+            $n++
+            $model = [string](Get-ReviewerHashValue -Container $p -Key 'Model' -Default '(unknown)')
+            if ($null -eq (Get-ReviewerHashValue -Container $p -Key 'Marker')) {
+                [void]$lines.Add("- Pass ${n} (``$model``): DID NOT COMPLETE - $([string](Get-ReviewerHashValue -Container $p -Key 'Reason' -Default 'no reason recorded'))")
+            }
+            else {
+                $pf = @($p.Marker['findings'])
+                [void]$lines.Add("- Pass ${n} (``$model``): $($pf.Count) finding(s), recommended '$([string]$p.Marker['recommendedVote'])'")
+            }
+        }
+        [void]$lines.Add("")
+        [void]$lines.Add("The findings below are the UNION of the passes that completed. Each is labelled")
+        [void]$lines.Add("with the pass or passes that reported it; where both reported the same finding")
+        [void]$lines.Add("with different severities, the more severe grade is shown.")
+        [void]$lines.Add("")
+        if (-not $passesComplete) {
+            [void]$lines.Add("**A configured pass did not complete, so no vote will be cast for this review.**")
+            [void]$lines.Add("")
+        }
+    }
     [void]$lines.Add("## Summary the agent would post")
     [void]$lines.Add("")
     [void]$lines.Add($(if ($Summary.Trim()) { $Summary.Trim() } else { "(none)" }))
@@ -1633,6 +1877,10 @@ function Write-ReviewerPreview {
         $where = if ($loc) { "$loc`:$ln" } else { "(pr-level)" }
         [void]$lines.Add("### $where")
         [void]$lines.Add("")
+        if ($passCount -gt 1) {
+            $from = @($FindingProvenance[(Get-ReviewerFindingMergeKey -Finding $f)])
+            if ($from.Count -gt 0) { [void]$lines.Add("_reported by: $($from -join ', ')_"); [void]$lines.Add("") }
+        }
         [void]$lines.Add((Format-ReviewerFindingComment -Finding $f))
         [void]$lines.Add("")
     }
@@ -1682,7 +1930,10 @@ function Write-ReviewerPreview {
                 prTitle          = $PrTitle
                 sourceCommit     = $SourceCommit
                 markerPrefix     = $ResultMarkerPrefix
-                maxFindingItems  = $EffectiveMaxFindings
+                maxFindingItems  = $MergedMarkerMaxFindingItems
+                reviewModels     = @(@($PassResults) | ForEach-Object { [string](Get-ReviewerHashValue -Container $_ -Key 'Model' -Default '') })
+                passesRequested  = $passCount
+                passesCompleted  = @(@($PassResults) | Where-Object { $null -ne $_.Marker }).Count
                 createdAt        = ([DateTime]::UtcNow.ToString("o"))
                 scriptSha256     = $ScriptSelfSha256
                 previewPath      = $path
@@ -1842,7 +2093,7 @@ function Set-ReviewerVote {
 
 function Invoke-DryRunSelfChecks {
     $failures = New-Object System.Collections.Generic.List[string]
-    $total = 20
+    $total = 21
 
     Write-Host "[DRY-RUN] Self-check 1/$total : parser validity + prompt presence" -ForegroundColor Cyan
     foreach ($p in @($PSCommandPath, $HarnessPath)) {
@@ -2843,6 +3094,158 @@ function Invoke-DryRunSelfChecks {
         else { Write-Host "  OK - an unreadable change set blocks publication but not the preview" -ForegroundColor Green }
     }
 
+    Write-Host "[DRY-RUN] Self-check 21/$total : multi-pass merge, vote lattice and degraded-pass gating" -ForegroundColor Cyan
+    # The merge is the whole feature: if it intersects instead of unioning, a
+    # two-pass run is strictly WORSE than one pass, and nothing else in the agent
+    # would notice.
+    $passA = @{
+        Model    = 'model-a'
+        Findings = @(
+            @{ severity = 'important'; filePath = '/src/A.cs'; line = 10; comment = 'Shared finding' }
+            @{ severity = 'critical'; filePath = '/src/OnlyA.cs'; line = 4; comment = 'Only A saw this' }
+        )
+        Summary  = 'A summary.'
+        Vote     = 'approveWithSuggestions'
+    }
+    $passB = @{
+        Model    = 'model-b'
+        Findings = @(
+            # Same finding, differently spaced and cased, graded higher.
+            @{ severity = 'critical'; filePath = '/src/A.cs'; line = 10; comment = "shared   finding" }
+            @{ severity = 'suggestion'; filePath = '/src/OnlyB.cs'; line = 7; comment = 'Only B saw this' }
+            # Same anchor as A's unique finding, but a DIFFERENT point: must survive.
+            @{ severity = 'important'; filePath = '/src/OnlyA.cs'; line = 4; comment = 'A different problem on the same line' }
+        )
+        Summary  = 'B summary.'
+        Vote     = 'approve'
+    }
+    $mergeProbe = Merge-ReviewerPassFindings -Passes @($passA, $passB)
+    $mergedProbe = @($mergeProbe.Findings)
+    if ($mergedProbe.Count -ne 4) {
+        $failures.Add("Merging two passes produced $($mergedProbe.Count) finding(s); expected the union of 4 (2 unique to A, 2 unique to B, 1 shared).")
+    }
+    else {
+        $shared = @($mergedProbe | Where-Object { [string]$_['filePath'] -ceq '/src/A.cs' })
+        $onlyA = @($mergedProbe | Where-Object { [string]$_['filePath'] -ceq '/src/OnlyA.cs' })
+        if ($shared.Count -ne 1) { $failures.Add("The same finding reported by both passes was not deduplicated into one.") }
+        elseif ([string]$shared[0]['severity'] -cne 'critical') {
+            $failures.Add("A finding both passes reported kept the LOWER severity '$([string]$shared[0]['severity'])'; the merge must fail closed on the more severe grade.")
+        }
+        elseif ($onlyA.Count -ne 2) {
+            $failures.Add("Two different findings at one anchor were collapsed into $($onlyA.Count); a merge may not discard a distinct finding just because it shares a line.")
+        }
+        elseif (@($mergeProbe.Provenance[(Get-ReviewerFindingMergeKey -Finding $shared[0])]).Count -ne 2) {
+            $failures.Add("Provenance did not record both passes for a corroborated finding.")
+        }
+        else { Write-Host "  OK - passes merge to their union, corroboration takes the severer grade, distinct findings survive a shared anchor" -ForegroundColor Green }
+    }
+    # A merged finding must still be schema-pure, or the sealed marker could
+    # never be re-validated and every two-pass review would be unpromotable.
+    $strayKeys = @($mergedProbe | ForEach-Object { $_.Keys } | Where-Object { @('severity', 'filePath', 'line', 'comment') -cnotcontains $_ })
+    if ($strayKeys.Count -gt 0) { $failures.Add("Merged findings carry key(s) the marker schema rejects: $(($strayKeys | Select-Object -Unique) -join ', ').") }
+    else { Write-Host "  OK - merged findings carry no key the marker schema would reject" -ForegroundColor Green }
+    # An empty pass set must not invent findings, and one pass must merge to itself.
+    if (@((Merge-ReviewerPassFindings -Passes @()).Findings).Count -ne 0) { $failures.Add("Merging no passes produced findings.") }
+    elseif (@((Merge-ReviewerPassFindings -Passes @($passA)).Findings).Count -ne 2) { $failures.Add("Merging a single pass changed its finding count.") }
+    else { Write-Host "  OK - merging nothing yields nothing and merging one pass is the identity" -ForegroundColor Green }
+
+    # The vote lattice: a plain approval must require EVERY pass to approve.
+    $voteLattice = @(
+        @{ Name = 'both approve'; In = @('approve', 'approve'); Expect = 'approve' }
+        @{ Name = 'one approves, one wants changes'; In = @('approve', 'waitForAuthor'); Expect = 'waitForAuthor' }
+        @{ Name = 'one approves, one has suggestions'; In = @('approve', 'approveWithSuggestions'); Expect = 'approveWithSuggestions' }
+        @{ Name = 'one approves, one declines to say'; In = @('approve', 'none'); Expect = 'none' }
+        @{ Name = 'order does not matter'; In = @('waitForAuthor', 'approve'); Expect = 'waitForAuthor' }
+        @{ Name = 'an unrecognized value poisons the merge'; In = @('approve', 'Approve'); Expect = 'none' }
+        @{ Name = 'no votes at all'; In = @(); Expect = 'none' }
+    )
+    $latticeFailures = 0
+    foreach ($lc in $voteLattice) {
+        $got = Get-ReviewerMergedVote -Votes ([string[]]$lc.In)
+        if ($got -cne [string]$lc.Expect) {
+            $failures.Add("Merged vote wrong for '$($lc.Name)': got '$got', expected '$($lc.Expect)'.")
+            $latticeFailures++
+        }
+    }
+    if ($latticeFailures -eq 0) { Write-Host "  OK - a plain approval needs every pass to approve; anything else wins over it" -ForegroundColor Green }
+
+    # The merged summary must stay inside the marker schema's own limit, or the
+    # artifact it is sealed into could never be promoted.
+    $longSummary = Get-ReviewerMergedSummary -Passes @(
+        @{ Model = 'model-a'; Summary = ('a' * 1400) }, @{ Model = 'model-b'; Summary = ('b' * 1400) })
+    if ($longSummary.Length -gt 1500) { $failures.Add("A merged summary of $($longSummary.Length) chars exceeds the marker schema's 1500-char limit, so the artifact could never be promoted.") }
+    elseif ((Get-ReviewerMergedSummary -Passes @(@{ Model = 'model-a'; Summary = 'only one' })) -cne 'only one') {
+        $failures.Add("A single pass's summary was rewritten instead of passed through.")
+    }
+    elseif ((Get-ReviewerMergedSummary -Passes @(@{ Model = 'model-a'; Summary = '  ' })) -cne "") {
+        $failures.Add("A blank summary did not merge to an empty string.")
+    }
+    else { Write-Host "  OK - merged summaries are attributed and stay inside the schema's length bound" -ForegroundColor Green }
+
+    # The length bound above is only one of the schema's rules. The merged marker
+    # is re-parsed under that whole schema on promotion, so assert the real thing
+    # here: build a merged marker exactly as a live cycle does and push it through
+    # the actual validator. The first version of this feature joined the two
+    # summaries with a blank line, which is a control character the schema
+    # forbids - it sealed cleanly and was then unpromotable, and only a
+    # round-trip through the validator catches that.
+    $rtNonce = New-AgentNonce
+    $rtMerged = @{
+        schemaVersion        = 1
+        prId                 = 12345
+        repositoryId         = $cfgRepoId
+        project              = $ExpectedProject
+        reviewedSourceCommit = ('a' * 40)
+        findings             = @($mergeProbe.Findings)
+        recommendedVote      = (Get-ReviewerMergedVote -Votes @([string]$passA.Vote, [string]$passB.Vote))
+        summary              = (Get-ReviewerMergedSummary -Passes @($passA, $passB))
+        nonce                = $rtNonce
+    }
+    $rtParsed = ConvertFrom-AgentResultMarker -StdOutText ("$ResultMarkerPrefix " + (ConvertTo-Json -InputObject $rtMerged -Depth 8 -Compress)) `
+        -MarkerPrefix $ResultMarkerPrefix `
+        -Schema (Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $rtNonce -MaxFindingItems $MergedMarkerMaxFindingItems)
+    if (-not $rtParsed) {
+        $failures.Add("A merged marker built the way a live cycle builds it does not survive the marker schema, so every merged review would seal an artifact that can never be promoted.")
+    }
+    elseif (@($rtParsed['findings']).Count -ne @($mergeProbe.Findings).Count) {
+        $failures.Add("Re-parsing the merged marker changed its finding count from $(@($mergeProbe.Findings).Count) to $(@($rtParsed['findings']).Count).")
+    }
+    elseif ($selfText -cnotmatch '\$mergedRoundTrip') {
+        $failures.Add("The live merge path does not re-validate its merged marker, so an unpromotable artifact would be sealed rather than refused.")
+    }
+    else { Write-Host "  OK - a merged marker re-parses under the same schema promotion will hold it to" -ForegroundColor Green }
+
+    # An incomplete multi-pass review may report, but must never vote - and that
+    # decline must be FINAL, or the delivery plan would be retried forever
+    # against a sealed review that can never gain the missing pass.
+    $degraded = Test-ReviewerShouldVote -RecommendedVote 'approve' -CriticalCount 0 -ImportantCount 0 -SuggestionCount 0 `
+        -ReportedFindingCount 0 -FindingsPosted $true -PrIsActive $true -PrIsDraft $false `
+        -CurrentSourceCommit ('a' * 40) -ReviewedSourceCommit ('a' * 40) -PassesComplete $false
+    if ($degraded.Vote) { $failures.Add("A review missing one of its configured passes still cast '$($degraded.Vote)'.") }
+    elseif ([bool](Get-ReviewerHashValue -Container $degraded -Key 'Retryable' -Default $false)) {
+        $failures.Add("The decline for an incomplete pass set is retryable; the sealed plan can never gain the missing pass, so it would be retried forever.")
+    }
+    else { Write-Host "  OK - a review short a pass publishes its findings but never votes, and that decline is final" -ForegroundColor Green }
+
+    # -SecondPassModel must refuse the two configurations that make it pointless
+    # or unreproducible. Asserted against the resolution code itself, because a
+    # -DryRun cannot re-enter the parameter block.
+    $modelResolutionOk = 0
+    if ($selfText -cmatch '-SecondPassModel\s+requires\s+-Model') { $modelResolutionOk++ }
+    else { $failures.Add("Nothing refuses -SecondPassModel without -Model, so a pairing could be built on the CLI default.") }
+    if ($selfText -cmatch '\$ResolvedSecondPassModel\s+-ceq\s+\$ResolvedModel') { $modelResolutionOk++ }
+    else { $failures.Add("Nothing refuses a second pass by the SAME model, which doubles the cost for no coverage.") }
+    if (@($ReviewPassModels).Count -lt 1) { $failures.Add("The pass list is empty; no PR could ever be reviewed.") }
+    elseif (@($ReviewPassModels | Select-Object -Unique).Count -ne @($ReviewPassModels).Count) {
+        $failures.Add("The resolved pass list repeats a model: $($ReviewPassModels -join ', ').")
+    }
+    elseif ($MergedMarkerMaxFindingItems -lt ($EffectiveMaxFindings * @($ReviewPassModels).Count)) {
+        $failures.Add("The sealed marker bound ($MergedMarkerMaxFindingItems) is below what the passes may jointly report, so a full two-pass review would fail its own re-validation on promotion.")
+    }
+    elseif ($modelResolutionOk -eq 2) {
+        Write-Host "  OK - the pass list is distinct and the sealed marker bound covers every pass's cap" -ForegroundColor Green
+    }
+
     Write-Host ""
     if ($failures.Count -eq 0) {
         Write-Host "[DRY-RUN] All $total self-checks passed." -ForegroundColor Green
@@ -3020,7 +3423,10 @@ function Invoke-ReviewerDelivery {
         # The sealed count of findings eligible to post, taken from the signed
         # artifact on a promotion. -1 means "this is the original review", where
         # the live postable set IS the sealed set.
-        [int]$SealedPublishableCount = -1
+        [int]$SealedPublishableCount = -1,
+        # $false when the operator configured a multi-pass review and a pass did
+        # not produce a usable result. Findings still publish; the vote does not.
+        [bool]$PassesComplete = $true
     )
     $outcome = @{
         PostedCount = 0; PostFailures = 0; SummaryPosted = $false
@@ -3123,7 +3529,8 @@ function Invoke-ReviewerDelivery {
             -ReportedFindingCount $ReportedFindingCount -FindingsPosted $findingsVisible -FindingsRetryable $findingsRetryable `
             -PrIsActive ((([string](Get-ReviewerHashValue -Container $freshness.Pr -Key 'status' -Default '')) -ieq 'active')) `
             -PrIsDraft ([bool](Get-ReviewerHashValue -Container $freshness.Pr -Key 'isDraft' -Default $false)) `
-            -CurrentSourceCommit (Get-ReviewerSourceCommit -Pr $freshness.Pr) -ReviewedSourceCommit $SourceCommit
+            -CurrentSourceCommit (Get-ReviewerSourceCommit -Pr $freshness.Pr) -ReviewedSourceCommit $SourceCommit `
+            -PassesComplete $PassesComplete
         if (-not $decision.Vote) {
             # Most declines are RESOLVED: the gate reached its decision from
             # inputs that cannot change while the commit is the same, so a retry
@@ -3163,24 +3570,32 @@ function Invoke-ReviewerDelivery {
     return $outcome
 }
 
-function Invoke-ReviewerPullRequest {
+function Invoke-ReviewerModelPass {
     <#
-        Reviews exactly one bound pull request: one model run, then the
-        wrapper-owned writes. Returns @{ ExitCode; Summary }.
+        ONE model run over one bound pull request: build the payload, launch,
+        validate the marker as hostile input, and on failure write the transcript
+        that is the only way to diagnose a silent refusal.
+
+        Every pass gets its OWN nonce and is bound to the PR/repo/commit on its
+        own, and no pass is shown any other pass's output. That independence is
+        the point: two models that can see each other's conclusions stop being
+        two samples of the same code and become one, and the anchoring that
+        follows would quietly erase exactly the disagreement the second pass was
+        added to surface.
+
+        Returns @{ Model; Marker; Reason; EnvironmentFault } - Marker is $null
+        when this pass produced nothing usable.
     #>
     param(
-        [Parameter(Mandatory)][hashtable]$Session,
         [Parameter(Mandatory)][string]$AgencyPath,
         [Parameter(Mandatory)][int]$CycleNumber,
         [Parameter(Mandatory)][hashtable]$Bound,
-        [Parameter(Mandatory)][hashtable]$ReviewedState,
-        [Parameter(Mandatory)][hashtable]$AttemptsState
+        [Parameter(Mandatory)][string]$PassModel,
+        [Parameter(Mandatory)][int]$PassNumber,
+        [Parameter(Mandatory)][int]$PassCount
     )
     $prId = [int]$Bound.PrId
     $sourceCommit = [string]$Bound.SourceCommit
-    $prTitle = [string]$Bound.Title
-
-    Write-Host ("Reviewing PR {0}  '{1}'  author={2}  commit={3}" -f $prId, $prTitle, $Bound.AuthorAlias, $sourceCommit.Substring(0, 12)) -ForegroundColor Yellow
 
     # -- Build the bounded stdin payload -------------------------------------
     $nonce = New-AgentNonce
@@ -3191,14 +3606,16 @@ function Invoke-ReviewerPullRequest {
 
     # -- Launch the model -----------------------------------------------------
     # The tool grant does not depend on which write switches the OPERATOR
-    # passed: the model's privileges are identical on every run, which is what
-    # makes a preview a faithful rehearsal of a posting run.
+    # passed, nor on which pass this is: the model's privileges are identical on
+    # every run, which is what makes a preview a faithful rehearsal of a posting
+    # run.
     $allowTools = Get-ReviewerEffectiveAllowTools -BaseAllow $ConfigAllowTools
     $denyTools = Get-ReviewerEffectiveDenyTools -ConfigDeny $ConfigDenyTools
-    $modelArg = if ($EffectiveModel -eq (Get-AgentDefaultModelSentinel)) { $null } else { $EffectiveModel }
+    $modelArg = if ($PassModel -eq (Get-AgentDefaultModelSentinel)) { $null } else { $PassModel }
     $agencyArgs = Get-AgentCopilotArgs -AgentName $CopilotAgentName -Source $CopilotAgentSource `
         -AllowTools $allowTools -DenyTools $denyTools -Model $modelArg -JsonOutput
-    Write-Host "Launching Copilot (read-only, timeout=${CycleTimeoutSeconds}s)..." -ForegroundColor Cyan
+    $label = if ($PassCount -gt 1) { "pass $PassNumber of $PassCount, $PassModel, read-only" } else { "read-only" }
+    Write-Host "Launching Copilot ($label, timeout=${CycleTimeoutSeconds}s)..." -ForegroundColor Cyan
 
     $run = Invoke-TimedProcess -FilePath $AgencyPath -ArgumentList $agencyArgs -StandardInputContent $stdin `
         -CaptureStdOut -CaptureStdErr -WorkingDirectory $RepoPath `
@@ -3225,24 +3642,92 @@ function Invoke-ReviewerPullRequest {
         Write-Warning "The result marker did not match the bound PR/repository/commit; discarding it."
         $marker = $null
     }
+    if ($marker) { return @{ Model = $PassModel; Marker = $marker; Reason = ""; EnvironmentFault = $false } }
 
-    if (-not $marker) {
-        $reason = if ($run.TimedOut) { "cycle timed out after ${CycleTimeoutSeconds}s" }
-        elseif ($run.ExitCode -ne 0) { "copilot exited $($run.ExitCode)" }
-        else { "missing or invalid result marker" }
+    $reason = if ($run.TimedOut) { "cycle timed out after ${CycleTimeoutSeconds}s" }
+    elseif ($run.ExitCode -ne 0) { "copilot exited $($run.ExitCode)" }
+    else { "missing or invalid result marker" }
 
-        # A PR is not "unreviewable" because the host lost its credentials.
-        # Launch signatures are read from STDERR ONLY, and only when the model
-        # never produced a single assistant message - otherwise a hostile PR
-        # could induce the model to emit a recognized signature and exempt
-        # itself from starvation forever.
-        $modelActuallyRan = [bool]($cliOutcome -and $cliOutcome.ModelActuallyRan)
-        $launchFailureReason = $null
-        if (-not $modelActuallyRan) { $launchFailureReason = Get-AgentLaunchFailureReason -StdErrText ([string]$run.StdErr) }
+    # A PR is not "unreviewable" because the host lost its credentials.
+    # Launch signatures are read from STDERR ONLY, and only when the model
+    # never produced a single assistant message - otherwise a hostile PR
+    # could induce the model to emit a recognized signature and exempt
+    # itself from starvation forever.
+    $modelActuallyRan = [bool]($cliOutcome -and $cliOutcome.ModelActuallyRan)
+    $launchFailureReason = $null
+    if (-not $modelActuallyRan) { $launchFailureReason = Get-AgentLaunchFailureReason -StdErrText ([string]$run.StdErr) }
+    if ($launchFailureReason) { $reason = "environment: $launchFailureReason" }
+    if ($PassCount -gt 1) { $reason = "pass $PassNumber ($PassModel): $reason" }
 
-        if ($launchFailureReason) {
-            Write-Warning "PR $prId not reviewed - ENVIRONMENT fault, not counted toward starvation: $launchFailureReason"
-            $reason = "environment: $launchFailureReason"
+    # The transcript is the only way to diagnose a silent refusal, and it
+    # never leaves this machine.
+    try {
+        $failDir = Join-Path $logDir "failed-cycles"
+        New-Item -ItemType Directory -Force -Path $failDir | Out-Null
+        $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ")
+        $transcript = Join-Path $failDir ("pr{0}-cycle{1}-pass{2}-{3}.txt" -f $prId, $CycleNumber, $PassNumber, $stamp)
+        @(
+            "reason      : $reason"
+            "model       : $PassModel"
+            "pass        : $PassNumber of $PassCount"
+            "exitCode    : $($run.ExitCode)"
+            "timedOut    : $($run.TimedOut)"
+            "nonce       : $nonce"
+            "markerPrefix: $ResultMarkerPrefix"
+            "--------------- STDOUT ---------------"
+            [string]$run.StdOut
+            "--------------- STDERR ---------------"
+            [string]$run.StdErr
+        ) | Set-Content -LiteralPath $transcript -Encoding UTF8
+        Write-Host "Transcript written to $transcript" -ForegroundColor DarkYellow
+    }
+    catch { Write-Warning "Could not write the failure transcript: $($_.Exception.Message)" }
+
+    return @{ Model = $PassModel; Marker = $null; Reason = $reason; EnvironmentFault = [bool]$launchFailureReason }
+}
+
+function Invoke-ReviewerPullRequest {
+    <#
+        Reviews exactly one bound pull request: one model run per configured
+        pass, a wrapper-owned merge of what they found, then the wrapper-owned
+        writes. Returns @{ ExitCode; Summary }.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)][string]$AgencyPath,
+        [Parameter(Mandatory)][int]$CycleNumber,
+        [Parameter(Mandatory)][hashtable]$Bound,
+        [Parameter(Mandatory)][hashtable]$ReviewedState,
+        [Parameter(Mandatory)][hashtable]$AttemptsState
+    )
+    $prId = [int]$Bound.PrId
+    $sourceCommit = [string]$Bound.SourceCommit
+    $prTitle = [string]$Bound.Title
+
+    Write-Host ("Reviewing PR {0}  '{1}'  author={2}  commit={3}" -f $prId, $prTitle, $Bound.AuthorAlias, $sourceCommit.Substring(0, 12)) -ForegroundColor Yellow
+
+    # -- Run every configured pass -------------------------------------------
+    $passCount = @($ReviewPassModels).Count
+    $passResults = New-Object System.Collections.Generic.List[hashtable]
+    $passNumber = 0
+    foreach ($passModel in @($ReviewPassModels)) {
+        $passNumber++
+        [void]$passResults.Add((Invoke-ReviewerModelPass -AgencyPath $AgencyPath -CycleNumber $CycleNumber `
+                    -Bound $Bound -PassModel ([string]$passModel) -PassNumber $passNumber -PassCount $passCount))
+    }
+    $completedPasses = @($passResults | Where-Object { $null -ne $_.Marker })
+    $failedPasses = @($passResults | Where-Object { $null -eq $_.Marker })
+    $passesComplete = ($failedPasses.Count -eq 0)
+
+    if ($completedPasses.Count -eq 0) {
+        $reason = ($failedPasses | ForEach-Object { [string]$_.Reason }) -join '; '
+        # An environment fault is not the PR's fault, so it must not push the PR
+        # toward starvation. Every failure has to be one, though: a single
+        # genuine failure alongside a credentials problem still means this PR
+        # could not be reviewed for a reason a later cycle should count.
+        $environmentFault = (@($failedPasses | Where-Object { -not $_.EnvironmentFault }).Count -eq 0)
+        if ($environmentFault) {
+            Write-Warning "PR $prId not reviewed - ENVIRONMENT fault, not counted toward starvation: $reason"
         }
         else {
             Write-Warning "PR $prId not reviewed: $reason."
@@ -3252,47 +3737,101 @@ function Invoke-ReviewerPullRequest {
             Set-JsonState -Path $attemptsStatePath -State $AttemptsState
         }
 
-        # The transcript is the only way to diagnose a silent refusal, and it
-        # never leaves this machine.
-        try {
-            $failDir = Join-Path $logDir "failed-cycles"
-            New-Item -ItemType Directory -Force -Path $failDir | Out-Null
-            $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ")
-            $transcript = Join-Path $failDir ("pr{0}-cycle{1}-{2}.txt" -f $prId, $CycleNumber, $stamp)
-            @(
-                "reason      : $reason"
-                "exitCode    : $($run.ExitCode)"
-                "timedOut    : $($run.TimedOut)"
-                "nonce       : $nonce"
-                "markerPrefix: $ResultMarkerPrefix"
-                "--------------- STDOUT ---------------"
-                [string]$run.StdOut
-                "--------------- STDERR ---------------"
-                [string]$run.StdErr
-            ) | Set-Content -LiteralPath $transcript -Encoding UTF8
-            Write-Host "Transcript written to $transcript" -ForegroundColor DarkYellow
-        }
-        catch { Write-Warning "Could not write the failure transcript: $($_.Exception.Message)" }
-
         Write-ReviewerCycleMetadata -Fields @{
             cycle = $CycleNumber; mode = "live"; result = "failed"; prId = $prId
-            reason = $reason; environmentFault = [bool]$launchFailureReason
+            reason = $reason; environmentFault = $environmentFault
+        }
+        return @{ ExitCode = 1; Summary = "PR $prId failed: $reason" }
+    }
+
+    # A partially-completed multi-pass review still reports what it found - a
+    # real defect is worth publishing however many models happened to see it -
+    # but it is labelled everywhere and it does not vote.
+    if (-not $passesComplete) {
+        Write-Warning ("PR $prId was reviewed by $($completedPasses.Count) of $passCount configured pass(es): " +
+            (($failedPasses | ForEach-Object { [string]$_.Reason }) -join '; ') +
+            ". The findings below are published; the vote is withheld.")
+    }
+
+    # -- Wrapper-owned merge --------------------------------------------------
+    $passInputs = @($completedPasses | ForEach-Object {
+            @{
+                Model    = [string]$_.Model
+                Findings = @($_.Marker['findings'])
+                Summary  = [string]$_.Marker['summary']
+                Vote     = [string]$_.Marker['recommendedVote']
+            }
+        })
+    $merge = Merge-ReviewerPassFindings -Passes $passInputs
+    $allFindings = @($merge.Findings)
+    $findingProvenance = $merge.Provenance
+    $recommendedVote = Get-ReviewerMergedVote -Votes @($passInputs | ForEach-Object { [string]$_.Vote })
+    $summaryText = Get-ReviewerMergedSummary -Passes $passInputs
+
+    # The merged review is re-serialized as ONE marker so that everything
+    # downstream - the seal, the reviewed-state digest, promotion's re-validation
+    # - stays on the single code path it already had. It is rebuilt field by
+    # field rather than copied from a pass so that no key a pass invented can
+    # ride along into the artifact.
+    $marker = @{
+        schemaVersion        = 1
+        prId                 = $prId
+        repositoryId         = $cfgRepoId
+        project              = $ExpectedProject
+        reviewedSourceCommit = $sourceCommit
+        findings             = $allFindings
+        recommendedVote      = $recommendedVote
+        summary              = $summaryText
+        nonce                = [string]$completedPasses[0].Marker['nonce']
+    }
+
+    # The merged marker is stored and re-parsed under the SAME schema on
+    # promotion, so it has to satisfy that schema now - a merge is not exempt
+    # from the bounds a model's own answer is held to. Checking it here rather
+    # than trusting it turns a whole class of merge bug (an over-long summary, a
+    # control character the schema forbids, a finding count past the widened
+    # bound) from an artifact that seals fine and is then permanently
+    # unpromotable into a cycle that fails immediately, next to the code that
+    # caused it. It re-parses through the real validator, not a re-implementation
+    # of it, because only the real one can prove promotion will accept this.
+    $mergedRoundTrip = ConvertFrom-AgentResultMarker `
+        -StdOutText ("$ResultMarkerPrefix " + (ConvertTo-Json -InputObject $marker -Depth 8 -Compress)) `
+        -MarkerPrefix $ResultMarkerPrefix `
+        -Schema (Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject `
+            -ExpectedNonce ([string]$marker['nonce']) -MaxFindingItems $MergedMarkerMaxFindingItems)
+    if (-not $mergedRoundTrip) {
+        # Deterministic, so it will fail identically next cycle: count it as a
+        # real (non-environment) failure. That bounds the retry loop, and
+        # attempts.json records the reason where an operator will see it.
+        $reason = "the merged review does not satisfy the marker schema, so it could never be promoted; refusing to seal it"
+        Write-Warning "PR $prId not reviewed: $reason."
+        $prior = $AttemptsState[[string]$prId]
+        $priorCount = if ($prior -is [int]) { [int]$prior } else { [int](Get-ReviewerHashValue -Container $prior -Key 'count' -Default 0) }
+        $AttemptsState[[string]$prId] = @{ count = ($priorCount + 1); lastAt = ([DateTime]::UtcNow.ToString("o")); lastReason = $reason }
+        Set-JsonState -Path $attemptsStatePath -State $AttemptsState
+        Write-ReviewerCycleMetadata -Fields @{
+            cycle = $CycleNumber; mode = "live"; result = "failed"; prId = $prId
+            reason = $reason; environmentFault = $false
         }
         return @{ ExitCode = 1; Summary = "PR $prId failed: $reason" }
     }
 
     # -- Wrapper-owned decisions ----------------------------------------------
-    $allFindings = @($marker['findings'])
     $counts = Get-ReviewerSeverityCounts -Findings $allFindings
     $ranked = Get-ReviewerPostableFindings -Findings $allFindings -PostSeverities $PostSeverities -MaxFindings $EffectiveMaxFindings
     $scoped = Split-ReviewerFindingsByChangeSet -Findings $ranked -ChangedPaths $Bound.ChangedPaths
     $postable = @($scoped.Postable)
     $withheld = @($scoped.Withheld)
-    $summaryText = [string]$marker['summary']
-    $recommendedVote = [string]$marker['recommendedVote']
 
     Write-Host ("PR {0} reviewed: {1} critical, {2} important, {3} suggestion; {4} postable; recommended vote '{5}'." -f `
             $prId, $counts['critical'], $counts['important'], $counts['suggestion'], $postable.Count, $recommendedVote) -ForegroundColor Green
+    if ($passCount -gt 1) {
+        foreach ($p in $passInputs) {
+            Write-Host ("  {0}: {1} finding(s), recommended '{2}'" -f $p.Model, @($p.Findings).Count, $p.Vote) -ForegroundColor DarkGray
+        }
+        $corroborated = @(@($findingProvenance.Keys) | Where-Object { @($findingProvenance[$_]).Count -gt 1 }).Count
+        Write-Host ("  merged: $($allFindings.Count) distinct finding(s), $corroborated reported by more than one pass") -ForegroundColor DarkGray
+    }
     if ($withheld.Count -gt 0) {
         Write-Warning "$($withheld.Count) finding(s) name a file this PR does not change; they are in the preview but will not be posted."
     }
@@ -3305,7 +3844,8 @@ function Invoke-ReviewerPullRequest {
     $writesRequested = Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)
     $preview = Write-ReviewerPreview -PrId $prId -SourceCommit $sourceCommit -PrTitle $prTitle `
         -Summary $summaryText -Postable $postable -Withheld $withheld -AllFindings $allFindings `
-        -RecommendedVote $recommendedVote -Marker $marker -Quiet:$writesRequested
+        -RecommendedVote $recommendedVote -Marker $marker -Quiet:$writesRequested `
+        -PassResults $passResults -FindingProvenance $findingProvenance
     $previewPath = [string]$preview.MarkdownPath
 
     # -- Record the delivery plan BEFORE writing anything ----------------------
@@ -3368,7 +3908,8 @@ function Invoke-ReviewerPullRequest {
         -Postable $postable -SummaryText $summaryText -Counts $counts -ReportedFindingCount $allFindings.Count `
         -RecommendedVote $recommendedVote -ExistingFingerprints $Bound.ExistingFingerprints `
         -ChangeSetKnown (@($Bound.ChangedPaths).Count -gt 0) `
-        -SummaryAlreadyDelivered ($priorApplies -and $priorSummary)
+        -SummaryAlreadyDelivered ($priorApplies -and $priorSummary) `
+        -PassesComplete $passesComplete
     $postedCount = [int]$delivery.PostedCount
     $postFailures = [int]$delivery.PostFailures
     $summaryPosted = [bool]$delivery.SummaryPosted
@@ -3418,6 +3959,7 @@ function Invoke-ReviewerPullRequest {
     Write-ReviewerCycleMetadata -Fields @{
         cycle = $CycleNumber; mode = "live"; result = "reviewed"; prId = $prId
         sourceCommit = $sourceCommit; findingCount = $allFindings.Count
+        passesRequested = $passCount; passesCompleted = $completedPasses.Count
         critical = $counts['critical']; important = $counts['important']; suggestion = $counts['suggestion']
         postableCount = $postable.Count; withheldCount = $withheld.Count
         postedCount = $postedCount; postFailures = $postFailures
@@ -3564,6 +4106,19 @@ function Invoke-ReviewerPromotion {
     }
     $maxItems = [int](Get-ReviewerHashValue -Container $signed -Key 'maxFindingItems' -Default $EffectiveMaxFindings)
     if ($maxItems -lt 1) { $maxItems = $EffectiveMaxFindings }
+    # A review that was short a pass when it was sealed is still short a pass
+    # now. The operator promoting it has read and approved the FINDINGS; that is
+    # not the same as approving a verdict reached by fewer models than they
+    # configured, so the vote gate is told the truth the manifest recorded.
+    # Artifacts sealed before multi-pass existed record neither field, and a
+    # single-pass review that completed is complete.
+    $sealedRequested = [int](Get-ReviewerHashValue -Container $signed -Key 'passesRequested' -Default 0)
+    $sealedCompleted = [int](Get-ReviewerHashValue -Container $signed -Key 'passesCompleted' -Default 0)
+    $sealedPassesComplete = ($sealedRequested -le 0) -or ($sealedCompleted -ge $sealedRequested)
+    if (-not $sealedPassesComplete) {
+        Write-Warning ("This review was produced by $sealedCompleted of $sealedRequested configured pass(es); " +
+            "its findings will publish but no vote will be cast.")
+    }
     $marker = ConvertFrom-AgentResultMarker -StdOutText ("$ResultMarkerPrefix " + [string]$signed.markerBody) `
         -MarkerPrefix $ResultMarkerPrefix `
         -Schema (Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $storedNonce -MaxFindingItems $maxItems)
@@ -3655,7 +4210,8 @@ function Invoke-ReviewerPromotion {
             -ExistingFingerprints (Get-ReviewerExistingFingerprints -Threads $threads) `
             -ChangeSetKnown (@($changedPaths).Count -gt 0) `
             -SummaryAlreadyDelivered ($priorApplies -and $priorSummary) `
-            -SealedPublishableCount (@($approved).Count)
+            -SealedPublishableCount (@($approved).Count) `
+            -PassesComplete $sealedPassesComplete
 
         $reviewedState = Get-JsonState -Path $reviewedStatePath
         $priorRecord = $null
@@ -3960,6 +4516,13 @@ try {
 
     Write-Host "reviewer: operator=$OperatorAlias org=$Organization project=$ExpectedProject repo=$RepositoryName target=$TargetRefName" -ForegroundColor Cyan
     Write-Host "Scope: authors=$(if (@($AuthorAliases).Count -gt 0) { $AuthorAliases -join ',' } else { 'all except the operator' }) includeOwn=$([bool]$IncludeOwnPullRequests) perCycle=$PullRequestsPerCycle maxFindings=$EffectiveMaxFindings postSeverities=$($PostSeverities -join ',')" -ForegroundColor Cyan
+    if ($IsTwoPass) {
+        Write-Host ("Review: $($ReviewPassModels.Count) independent passes per PR - $($ReviewPassModels -join ' then ') - merged to their union by the wrapper. " +
+            "Budget $CycleTimeoutSeconds`s per pass, so up to $($CycleTimeoutSeconds * $ReviewPassModels.Count)`s per PR.") -ForegroundColor Cyan
+    }
+    else {
+        Write-Host "Review: 1 pass per PR - $EffectiveModel." -ForegroundColor Cyan
+    }
     if ($PullRequestId -gt 0) { Write-Host "Target: PR $PullRequestId only." -ForegroundColor Cyan }
 
     # Every write switch counts. Deciding this from -EnableFindingComments alone
