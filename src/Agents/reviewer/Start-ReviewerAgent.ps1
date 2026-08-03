@@ -1030,7 +1030,11 @@ function Test-ReviewerShouldVote {
     # an unexplained verdict. Silence about a clean PR is fine; silence about a
     # problem is not.
     if ($ReportedFindingCount -gt 0 -and -not $FindingsPosted) {
-        return @{ Vote = ""; Reason = "findings exist but were not posted, so a vote would be unexplained" }
+        # Retryable: this depends on whether the comments landed THIS run, not
+        # on anything fixed about the commit. Recording it as resolved would let
+        # a vote-only attempt permanently swallow the vote for a review whose
+        # comments a later attempt then delivers successfully.
+        return @{ Vote = ""; Reason = "findings exist but were not posted, so a vote would be unexplained"; Retryable = $true }
     }
 
     switch ($RecommendedVote) {
@@ -1061,6 +1065,29 @@ function Test-ReviewerShouldVote {
         }
     }
     return @{ Vote = ""; Reason = "unrecognized recommendation" }
+}
+
+function Test-ReviewerShouldPostSummary {
+    <# The summary states how many findings were posted, so its text - and so
+       its fingerprint - differs between a partial attempt and a complete one.
+       Fingerprint dedupe therefore CANNOT stop a retry from adding a second,
+       differently-worded summary. Two rules prevent that: never write it twice
+       for the same review, and never write it while the comment count it quotes
+       can still change. #>
+    param(
+        [bool]$SummaryEnabled,
+        [bool]$AlreadyDelivered,
+        [bool]$CommentsEnabled,
+        [int]$PostFailures = 0,
+        [int]$PostedCount = 0,
+        [int]$PostableCount = 0
+    )
+    if (-not $SummaryEnabled) { return @{ Post = $false; Resolved = $false; Reason = "the summary was not requested" } }
+    if ($AlreadyDelivered) { return @{ Post = $false; Resolved = $true; Reason = "the summary for this review was already delivered" } }
+    if ($CommentsEnabled -and ($PostFailures -gt 0 -or $PostedCount -lt $PostableCount)) {
+        return @{ Post = $false; Resolved = $false; Reason = "it reports how many findings were posted, and they are not all posted" }
+    }
+    return @{ Post = $true; Resolved = $false; Reason = "" }
 }
 
 function Get-ReviewerEffectiveAllowTools {
@@ -2031,6 +2058,47 @@ function Invoke-DryRunSelfChecks {
         }
     }
     if ($capabilityFailures -eq 0) { Write-Host "  OK - delivery is per capability, a failed retry never inherits an older success, and legacy records suppress nothing" -ForegroundColor Green }
+
+    # The summary quotes how many findings were posted, so fingerprint dedupe
+    # cannot stop a retry from adding a SECOND, differently-worded summary. It
+    # must therefore wait for the comments and never be written twice.
+    $summaryGateFailures = 0
+    $summaryCases = @(
+        @{ Name = 'comments complete'; Enabled = $true; Already = $false; Comments = $true; Failures = 0; Posted = 2; Postable = 2; Post = $true; Resolved = $false }
+        @{ Name = 'a finding failed to post'; Enabled = $true; Already = $false; Comments = $true; Failures = 1; Posted = 1; Postable = 2; Post = $false; Resolved = $false }
+        @{ Name = 'fewer confirmed than postable'; Enabled = $true; Already = $false; Comments = $true; Failures = 0; Posted = 1; Postable = 2; Post = $false; Resolved = $false }
+        @{ Name = 'already delivered for this review'; Enabled = $true; Already = $true; Comments = $true; Failures = 0; Posted = 2; Postable = 2; Post = $false; Resolved = $true }
+        @{ Name = 'summary-only run, comments disabled'; Enabled = $true; Already = $false; Comments = $false; Failures = 0; Posted = 0; Postable = 5; Post = $true; Resolved = $false }
+        @{ Name = 'summary not requested'; Enabled = $false; Already = $false; Comments = $true; Failures = 0; Posted = 2; Postable = 2; Post = $false; Resolved = $false }
+    )
+    foreach ($case in $summaryCases) {
+        $gate = Test-ReviewerShouldPostSummary -SummaryEnabled $case.Enabled -AlreadyDelivered $case.Already `
+            -CommentsEnabled $case.Comments -PostFailures $case.Failures -PostedCount $case.Posted -PostableCount $case.Postable
+        if ([bool]$gate.Post -ne [bool]$case.Post -or [bool]$gate.Resolved -ne [bool]$case.Resolved) {
+            $failures.Add("The summary gate is wrong for '$($case.Name)': expected post=$($case.Post)/resolved=$($case.Resolved), got post=$($gate.Post)/resolved=$($gate.Resolved).")
+            $summaryGateFailures++
+        }
+    }
+    if ($summaryGateFailures -eq 0) { Write-Host "  OK - the summary waits for the comments it counts and is never posted twice for one review" -ForegroundColor Green }
+
+    # A vote declined because THIS run did not get the findings up can succeed
+    # later, so it must stay open; a decline the commit itself forces is final.
+    $voteGateFailures = 0
+    $undelivered = Test-ReviewerShouldVote -RecommendedVote 'waitForAuthor' -CriticalCount 1 -ImportantCount 0 -SuggestionCount 0 `
+        -ReportedFindingCount 1 -FindingsPosted $false -PrIsActive $true -PrIsDraft $false `
+        -CurrentSourceCommit $commitNew -ReviewedSourceCommit $commitNew
+    if ($undelivered.Vote -or -not (Get-ReviewerHashValue -Container $undelivered -Key 'Retryable' -Default $false)) {
+        $failures.Add("A vote declined because the findings are not posted was not marked retryable, so it would be recorded as permanently resolved.")
+        $voteGateFailures++
+    }
+    $contradicted = Test-ReviewerShouldVote -RecommendedVote 'approve' -CriticalCount 1 -ImportantCount 0 -SuggestionCount 0 `
+        -ReportedFindingCount 1 -FindingsPosted $true -PrIsActive $true -PrIsDraft $false `
+        -CurrentSourceCommit $commitNew -ReviewedSourceCommit $commitNew
+    if ($contradicted.Vote -or (Get-ReviewerHashValue -Container $contradicted -Key 'Retryable' -Default $false)) {
+        $failures.Add("A vote declined by the commit's own facts was marked retryable, which would keep the PR pending forever.")
+        $voteGateFailures++
+    }
+    if ($voteGateFailures -eq 0) { Write-Host "  OK - only a decline this run can undo keeps the vote open; a decision the commit forces is final" -ForegroundColor Green }
     # An unfinished delivery must be retried from its own sealed plan. Reviewing
     # again instead would let a nondeterministic second model run omit exactly
     # the finding that failed to post, which then looks delivered forever.
@@ -2715,7 +2783,12 @@ function Invoke-ReviewerDelivery {
         # operator's identity without having verified that each finding names a
         # file the PR actually changes is exactly the unfounded-claim risk that
         # Split-ReviewerFindingsByChangeSet exists to prevent.
-        [bool]$ChangeSetKnown = $false
+        [bool]$ChangeSetKnown = $false,
+        # $true when the summary for THIS review already landed on a previous
+        # attempt. Its text embeds how many findings were posted, so re-posting
+        # it after a partial attempt would produce a second, differently-worded
+        # summary rather than being deduplicated by fingerprint.
+        [bool]$SummaryAlreadyDelivered = $false
     )
     $outcome = @{
         PostedCount = 0; PostFailures = 0; SummaryPosted = $false
@@ -2783,7 +2856,17 @@ function Invoke-ReviewerDelivery {
     }
 
     # -- Summary ---------------------------------------------------------------
-    if ($EnableSummaryComment) {
+    $summaryGate = Test-ReviewerShouldPostSummary -SummaryEnabled ([bool]$EnableSummaryComment) `
+        -AlreadyDelivered $SummaryAlreadyDelivered -CommentsEnabled ([bool]$EnableFindingComments) `
+        -PostFailures ([int]$outcome.PostFailures) -PostedCount ([int]$outcome.PostedCount) -PostableCount (@($Postable).Count)
+    if ($summaryGate.Resolved) {
+        Write-Host "  ($($summaryGate.Reason))" -ForegroundColor DarkGray
+        $outcome.SummaryPosted = $true
+    }
+    elseif ($EnableSummaryComment -and -not $summaryGate.Post) {
+        Write-Warning "  the summary is not posted yet: $($summaryGate.Reason)."
+    }
+    elseif ($summaryGate.Post) {
         $summaryBody = Format-ReviewerSummaryComment -Summary $SummaryText -Counts $Counts -Reported $ReportedFindingCount -Posted $outcome.PostedCount
         $summaryFingerprint = Get-ReviewerCommentFingerprint -Content $summaryBody
         if ($ExistingFingerprints.Contains($summaryFingerprint)) {
@@ -2809,12 +2892,14 @@ function Invoke-ReviewerDelivery {
             -PrIsDraft ([bool](Get-ReviewerHashValue -Container $freshness.Pr -Key 'isDraft' -Default $false)) `
             -CurrentSourceCommit (Get-ReviewerSourceCommit -Pr $freshness.Pr) -ReviewedSourceCommit $SourceCommit
         if (-not $decision.Vote) {
-            # A declined vote is a RESOLVED vote: the gate reached a decision
-            # from inputs that cannot change while the commit is the same, so a
-            # retry would decline again. Recording it as unresolved would make
-            # the PR permanently un-deliverable.
+            # Most declines are RESOLVED: the gate reached its decision from
+            # inputs that cannot change while the commit is the same, so a retry
+            # would decline again, and recording those as unresolved would make
+            # the PR permanently un-deliverable. A decline that depends on what
+            # THIS run managed to post is different - it can succeed later, so
+            # it must stay open.
             Write-Host "  not voting: $($decision.Reason)." -ForegroundColor DarkGray
-            $outcome.VoteResolved = $true
+            $outcome.VoteResolved = -not [bool](Get-ReviewerHashValue -Container $decision -Key 'Retryable' -Default $false)
         }
         else {
             $voteResult = Set-ReviewerVote -Session $Session -PrId $PrId -Vote $decision.Vote -VoterAlias $OperatorAlias
@@ -3049,7 +3134,8 @@ function Invoke-ReviewerPullRequest {
     $delivery = Invoke-ReviewerDelivery -Session $Session -PrId $prId -SourceCommit $sourceCommit `
         -Postable $postable -SummaryText $summaryText -Counts $counts -ReportedFindingCount $allFindings.Count `
         -RecommendedVote $recommendedVote -ExistingFingerprints $Bound.ExistingFingerprints `
-        -ChangeSetKnown (@($Bound.ChangedPaths).Count -gt 0)
+        -ChangeSetKnown (@($Bound.ChangedPaths).Count -gt 0) `
+        -SummaryAlreadyDelivered ($priorApplies -and $priorSummary)
     $postedCount = [int]$delivery.PostedCount
     $postFailures = [int]$delivery.PostFailures
     $summaryPosted = [bool]$delivery.SummaryPosted
@@ -3265,12 +3351,57 @@ function Invoke-ReviewerPromotion {
             Write-Warning "$dropped approved comment(s) are no longer publishable at the location they name and will be skipped."
         }
 
+        # Record the plan BEFORE writing anything, for the same reason the live
+        # path does: a crash midway through a manual promotion would otherwise
+        # leave no pending record, and the next cycle would review afresh and
+        # could lose an approved comment that never posted.
+        $reviewedState = Get-JsonState -Path $reviewedStatePath
+        $priorRecord = $null
+        if ($reviewedState.ContainsKey([string]$prId)) {
+            $candidate = $reviewedState[[string]$prId]
+            if (([string](Get-ReviewerHashValue -Container $candidate -Key 'sourceCommit' -Default '')) -ieq $sourceCommit) { $priorRecord = $candidate }
+        }
+        # Promoting the same artifact twice - which is exactly what an
+        # unfinished delivery's retry does - is the same review, so a capability
+        # that already landed on the first attempt stays landed.
+        $reviewDigest = Get-ReviewerTextSha256 -Text ([string]$signed.markerBody)
+        $priorApplies = (([string](Get-ReviewerHashValue -Container $priorRecord -Key 'reviewDigest' -Default '')) -ceq $reviewDigest)
+        $priorComments = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'commentsDelivered' -Default $false)
+        $priorSummary = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'summaryDelivered' -Default $false)
+        $priorVote = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'voteResolved' -Default $false)
+        $planCapabilities = Get-ReviewerPlanCapabilities `
+            -PriorPending ([string[]]@(Get-ReviewerHashValue -Container $priorRecord -Key 'pendingCapabilities' -Default @())) `
+            -Requested (Get-ReviewerRequestedCapabilities -Comments ([bool]$EnableFindingComments) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)) `
+            -PriorAppliesToThisReview $priorApplies
+        $reviewedState[[string]$prId] = @{
+            sourceCommit        = $sourceCommit
+            at                  = ([DateTime]::UtcNow.ToString("o"))
+            findingCount        = $allFindings.Count
+            postableCount       = @($postable).Count
+            withheldCount       = $dropped
+            postedCount         = 0
+            summaryPosted       = $false
+            vote                = "none"
+            delivered           = $false
+            commentsDelivered   = (Merge-ReviewerCapabilityFlag -Attempted $false -SucceededThisRun $false -PriorValue $priorComments -PriorAppliesToThisReview $priorApplies)
+            summaryDelivered    = (Merge-ReviewerCapabilityFlag -Attempted $false -SucceededThisRun $false -PriorValue $priorSummary -PriorAppliesToThisReview $priorApplies)
+            voteResolved        = (Merge-ReviewerCapabilityFlag -Attempted $false -SucceededThisRun $false -PriorValue $priorVote -PriorAppliesToThisReview $priorApplies)
+            reviewDigest        = $reviewDigest
+            promotedFrom        = $ArtifactPath
+            previewPath         = $previewPath
+            artifactPath        = $ArtifactPath
+            pendingCapabilities = $planCapabilities
+            deliveryPending     = $true
+        }
+        Set-JsonState -Path $reviewedStatePath -State $reviewedState
+
         $delivery = Invoke-ReviewerDelivery -Session $session -PrId $prId -SourceCommit $sourceCommit `
             -Postable $postable -SummaryText ([string]$signed.approvedSummary) -Counts $counts `
             -ReportedFindingCount ([int](Get-ReviewerHashValue -Container $signed -Key 'reportedFindings' -Default $allFindings.Count)) `
             -RecommendedVote ([string]$signed.approvedVote) `
             -ExistingFingerprints (Get-ReviewerExistingFingerprints -Threads $threads) `
-            -ChangeSetKnown (@($changedPaths).Count -gt 0)
+            -ChangeSetKnown (@($changedPaths).Count -gt 0) `
+            -SummaryAlreadyDelivered ($priorApplies -and $priorSummary)
 
         $reviewedState = Get-JsonState -Path $reviewedStatePath
         $priorRecord = $null

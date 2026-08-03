@@ -179,7 +179,20 @@ Other properties worth knowing:
   exact stored review rather than running the model again. A second model run is
   not deterministic: if it reported a smaller set of findings, everything it
   reported would already be on the PR, delivery would look complete, and the
-  finding that failed the first time would never be mentioned again.
+  finding that failed the first time would never be mentioned again. The plan is
+  written to state *before* the first ADO call, so a crash mid-delivery leaves a
+  retryable plan rather than an invisible partial review.
+- **The summary is withheld until the comments it counts have landed.** Its text
+  quotes how many findings were posted, so a summary written after a partial
+  attempt and one written after the retry are *different* comments that
+  fingerprint dedupe cannot collapse. It is deferred instead, and never written
+  twice for the same review. A summary-only run (no `-EnableFindingComments`)
+  posts immediately, since nothing it quotes is still moving.
+- **A vote declined for a reason this run can undo stays open.** Declining
+  because the findings did not post is retryable and leaves the vote unresolved;
+  declining because the commit's own facts forbid the vote - a stale commit, a
+  draft, or a recommendation the agent's own findings contradict - is final, so
+  the PR does not stay pending forever.
 - **Nothing is written until the PR is re-read.** If the author pushed, or the
   PR became a draft or was completed while the model was running, the whole
   delivery is abandoned rather than partially applied.
