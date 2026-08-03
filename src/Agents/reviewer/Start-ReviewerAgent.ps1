@@ -2436,9 +2436,20 @@ function Invoke-DryRunSelfChecks {
     if (($selfSourceForYolo -match $switchNeedle) -or ($selfSourceForYolo.IndexOf($forwardNeedle, [StringComparison]::Ordinal) -ge 0)) { $selfHasYolo = $true }
     if ($selfHasYolo) { $failures.Add("The agent still exposes or forwards a -Yolo switch; that mode cannot preserve the read-only grant.") }
     else { Write-Host "  OK - no -Yolo switch is exposed or forwarded" -ForegroundColor Green }
+    # A count is not enough. If the harness ever narrows this list, a child
+    # Copilot that inherits COPILOT_AGENT_SESSION_ID or AGENCY_SESSION_ID joins
+    # THIS conversation instead of starting its own: the wrapper then reads its
+    # own chatter back as model output, never sees a result marker, and every
+    # cycle fails with nothing obviously wrong. Name the variables that must be
+    # stripped, so shrinking the list fails here rather than in production.
+    # (Joe hit exactly this in the reviewer-agent port; see #14.)
     $isolationVars = @(Get-AgentSessionIsolationEnvVars)
-    if ($isolationVars.Count -lt 1) { $failures.Add("The harness reported no session-isolation environment variables to strip.") }
-    else { Write-Host "  OK - $($isolationVars.Count) session variable(s) will be stripped from the child process" -ForegroundColor Green }
+    $missingIsolation = @(@('COPILOT_AGENT_SESSION_ID', 'AGENCY_SESSION_ID', 'COPILOT_CUSTOM_INSTRUCTIONS_DIRS') |
+        Where-Object { $isolationVars -cnotcontains $_ })
+    if ($missingIsolation.Count -gt 0) {
+        $failures.Add("The harness no longer strips $($missingIsolation -join ', '); a child Copilot would join this session instead of starting its own.")
+    }
+    else { Write-Host "  OK - the child cannot inherit this session: $($isolationVars.Count) variable(s) stripped, including every attachment variable by name" -ForegroundColor Green }
 
     # The two children get DIFFERENT credential scrubs, and the asymmetry is
     # load-bearing in both directions. Making them the same is the obvious
