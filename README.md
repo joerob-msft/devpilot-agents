@@ -169,10 +169,17 @@ Other properties worth knowing:
 - **Delivery is tracked per capability.** Comments, the summary and the vote are
   recorded separately, so adding `-EnableApprovalVote` to a PR that already
   received comments still casts the vote instead of skipping the PR as done.
-  A capability this run *attempted and failed* is never marked delivered on the
-  strength of an earlier run's success — that earlier success was for a
-  different set of findings, and inheriting it is how a finding that failed to
-  post would never be retried.
+  A recorded success belongs to one specific review, not to the commit: a
+  capability this run *attempted and failed* is never marked delivered on the
+  strength of an earlier run's success, and a capability this run did not
+  attempt only keeps an earlier success if that success was for this same
+  review. Both rules err toward re-attempting, which fingerprints make a no-op.
+- **An unfinished delivery is retried from its own sealed plan, not re-reviewed.**
+  If some comments posted and others did not, the next cycle republishes that
+  exact stored review rather than running the model again. A second model run is
+  not deterministic: if it reported a smaller set of findings, everything it
+  reported would already be on the PR, delivery would look complete, and the
+  finding that failed the first time would never be mentioned again.
 - **Nothing is written until the PR is re-read.** If the author pushed, or the
   PR became a draft or was completed while the model was running, the whole
   delivery is abandoned rather than partially applied.

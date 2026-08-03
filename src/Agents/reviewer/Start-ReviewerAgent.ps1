@@ -667,23 +667,67 @@ function Merge-ReviewerCapabilityFlag {
         Whether a capability counts as delivered for this commit, given what
         THIS run attempted and what an earlier run at the same commit recorded.
 
-        Prior success is inherited only when this run did not attempt the
-        capability. A run that did attempt it and failed must NOT inherit an
-        older success, because the older success was for whatever findings that
-        run produced and this run's findings are not the same set. Without this
-        rule the following loses a finding permanently: run A posts finding X
-        and records commentsDelivered; run B (summary now enabled) legitimately
-        re-opens the PR, the model returns X and Y, Y fails to post, and OR-ing
-        the old success back in marks comments delivered - so Y is never
-        retried and never seen.
+        Two rules, and both exist because a recorded success belongs to one
+        specific review, not to the commit:
 
-        Clearing on an attempted-but-failed capability errs toward retrying,
-        which is safe: comment fingerprints and the summary marker make a
-        redundant attempt a no-op rather than a duplicate.
+        1. A capability this run ATTEMPTED records this run's outcome. It must
+           not fall back on an older success, because that success was for
+           whatever findings the older run produced. Run A posts finding X; run
+           B legitimately re-opens the PR for the summary, the model returns X
+           and Y, Y fails to post - OR-ing A's success back in would mark
+           comments delivered and Y would never be retried.
+
+        2. A capability this run did NOT attempt inherits the earlier success
+           only if that success was for THIS SAME review. Otherwise: run A
+           (comments on) posts X; run B (summary only) reviews afresh and finds
+           Y; inheriting A's comment success would record both capabilities as
+           delivered, and run C - wanting both - would skip the PR as done
+           although Y was never posted anywhere.
+
+        Both rules err toward re-attempting, which comment fingerprints and the
+        summary marker make a no-op rather than a duplicate.
     #>
-    param([bool]$Attempted, [bool]$SucceededThisRun, [bool]$PriorValue)
+    param(
+        [bool]$Attempted,
+        [bool]$SucceededThisRun,
+        [bool]$PriorValue,
+        # $true only when the prior record was written for the same review this
+        # run is delivering - the same marker, so the same findings.
+        [bool]$PriorAppliesToThisReview = $false
+    )
     if ($Attempted) { return $SucceededThisRun }
+    if (-not $PriorAppliesToThisReview) { return $false }
     return $PriorValue
+}
+
+function Get-ReviewerPendingDeliveryPlan {
+    <#
+        The sealed artifact of a delivery this agent ATTEMPTED and did not
+        complete at this PR and commit, or "" when there is none.
+
+        This is what makes an unattended retry safe. Without it, a run that
+        posted finding X and failed on finding Y would, on the next cycle, run
+        the model again - and the model is not deterministic. If the second run
+        reports only X, X's fingerprint is already on the PR, comments count as
+        delivered, and Y is lost permanently. Retrying the STORED plan instead
+        means the retry publishes the same review that was decided the first
+        time, however many attempts it takes.
+
+        Only plans from a run that actually attempted to write qualify. A plain
+        preview must still be followed by a fresh model run, because the
+        documented contract is that an ordinary posting run is an independent
+        review; only -PromotePreview publishes a preview verbatim.
+    #>
+    param([hashtable]$ReviewedState, [Parameter(Mandatory)][int]$PrId, [Parameter(Mandatory)][string]$SourceCommit)
+    if ($null -eq $ReviewedState) { return "" }
+    $key = [string]$PrId
+    if (-not $ReviewedState.ContainsKey($key)) { return "" }
+    $rec = $ReviewedState[$key]
+    if (([string](Get-ReviewerHashValue -Container $rec -Key 'sourceCommit' -Default '')) -ine $SourceCommit) { return "" }
+    if (-not [bool](Get-ReviewerHashValue -Container $rec -Key 'deliveryPending' -Default $false)) { return "" }
+    $path = [string](Get-ReviewerHashValue -Container $rec -Key 'artifactPath' -Default '')
+    if (-not $path -or -not (Test-Path -LiteralPath $path)) { return "" }
+    return $path
 }
 
 function Get-ReviewerLastReviewedSortKey {
@@ -1931,19 +1975,46 @@ function Invoke-DryRunSelfChecks {
     # the same commit: the earlier success was for a different finding set, and
     # inheriting it is how a finding that failed to post is never retried.
     $mergeCases = @(
-        @{ Name = 'attempted and succeeded'; Attempted = $true; Succeeded = $true; Prior = $false; Expected = $true }
-        @{ Name = 'attempted and failed, with an earlier success'; Attempted = $true; Succeeded = $false; Prior = $true; Expected = $false }
-        @{ Name = 'not attempted, with an earlier success'; Attempted = $false; Succeeded = $false; Prior = $true; Expected = $true }
-        @{ Name = 'not attempted, never delivered'; Attempted = $false; Succeeded = $false; Prior = $false; Expected = $false }
+        @{ Name = 'attempted and succeeded'; Attempted = $true; Succeeded = $true; Prior = $false; Same = $false; Expected = $true }
+        @{ Name = 'attempted and failed, with an earlier success'; Attempted = $true; Succeeded = $false; Prior = $true; Same = $true; Expected = $false }
+        @{ Name = 'not attempted, earlier success for THIS review'; Attempted = $false; Succeeded = $false; Prior = $true; Same = $true; Expected = $true }
+        @{ Name = 'not attempted, earlier success for a DIFFERENT review'; Attempted = $false; Succeeded = $false; Prior = $true; Same = $false; Expected = $false }
+        @{ Name = 'not attempted, never delivered'; Attempted = $false; Succeeded = $false; Prior = $false; Same = $true; Expected = $false }
     )
     foreach ($case in $mergeCases) {
-        $got = Merge-ReviewerCapabilityFlag -Attempted $case.Attempted -SucceededThisRun $case.Succeeded -PriorValue $case.Prior
+        $got = Merge-ReviewerCapabilityFlag -Attempted $case.Attempted -SucceededThisRun $case.Succeeded -PriorValue $case.Prior -PriorAppliesToThisReview $case.Same
         if ([bool]$got -ne [bool]$case.Expected) {
             $failures.Add("Capability merge is wrong for '$($case.Name)': expected $($case.Expected), got $got.")
             $capabilityFailures++
         }
     }
     if ($capabilityFailures -eq 0) { Write-Host "  OK - delivery is per capability, a failed retry never inherits an older success, and legacy records suppress nothing" -ForegroundColor Green }
+    # An unfinished delivery must be retried from its own sealed plan. Reviewing
+    # again instead would let a nondeterministic second model run omit exactly
+    # the finding that failed to post, which then looks delivered forever.
+    $planDir = Join-Path ([System.IO.Path]::GetTempPath()) "devpilot-reviewer-plan-$([Guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Force -Path $planDir | Out-Null
+    try {
+        $planPath = Join-Path $planDir "plan.json"
+        Set-Content -LiteralPath $planPath -Value "{}" -Encoding UTF8
+        $planCases = @(
+            @{ Name = 'an attempted delivery that did not land'; Rec = @{ sourceCommit = $commitOld; deliveryPending = $true; artifactPath = $planPath }; Commit = $commitOld; Expect = $planPath }
+            @{ Name = 'a plain preview'; Rec = @{ sourceCommit = $commitOld; deliveryPending = $false; artifactPath = $planPath }; Commit = $commitOld; Expect = "" }
+            @{ Name = 'a pending plan at a different commit'; Rec = @{ sourceCommit = $commitOld; deliveryPending = $true; artifactPath = $planPath }; Commit = $commitNew; Expect = "" }
+            @{ Name = 'a pending plan whose artifact is gone'; Rec = @{ sourceCommit = $commitOld; deliveryPending = $true; artifactPath = (Join-Path $planDir "missing.json") }; Commit = $commitOld; Expect = "" }
+            @{ Name = 'a record predating pending-plan tracking'; Rec = @{ sourceCommit = $commitOld; artifactPath = $planPath }; Commit = $commitOld; Expect = "" }
+        )
+        $planFailures = 0
+        foreach ($case in $planCases) {
+            $got = Get-ReviewerPendingDeliveryPlan -ReviewedState @{ "77" = $case.Rec } -PrId 77 -SourceCommit $case.Commit
+            if (([string]$got) -cne ([string]$case.Expect)) {
+                $failures.Add("Pending-plan detection is wrong for '$($case.Name)': expected '$($case.Expect)', got '$got'.")
+                $planFailures++
+            }
+        }
+        if ($planFailures -eq 0) { Write-Host "  OK - only an unfinished attempted delivery is retried, and only from its own artifact" -ForegroundColor Green }
+    }
+    finally { Remove-Item -LiteralPath $planDir -Recurse -Force -ErrorAction SilentlyContinue }
     if ((Get-ReviewerReviewKey -PrId 77 -SourceCommit $commitOld) -cne "77:$commitOld") { $failures.Add("The review key format changed.") }
     else { Write-Host "  OK - the review key is prId:sourceCommit" -ForegroundColor Green }
 
@@ -2878,9 +2949,14 @@ function Invoke-ReviewerPullRequest {
     $priorComments = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'commentsDelivered' -Default $false)
     $priorSummary = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'summaryDelivered' -Default $false)
     $priorVote = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'voteResolved' -Default $false)
-    $commentsDelivered = Merge-ReviewerCapabilityFlag -Attempted $EnableFindingComments -SucceededThisRun ([bool]$delivery.CommentsDelivered) -PriorValue $priorComments
-    $summaryDelivered = Merge-ReviewerCapabilityFlag -Attempted $EnableSummaryComment -SucceededThisRun ([bool]$delivery.SummaryDelivered) -PriorValue $priorSummary
-    $voteResolved = Merge-ReviewerCapabilityFlag -Attempted $EnableApprovalVote -SucceededThisRun ([bool]$delivery.VoteResolved) -PriorValue $priorVote
+    # A recorded success belongs to one specific review. This run's review is
+    # the same one only if it is the same marker; a fresh model run gets a fresh
+    # nonce, so a new review never inherits an older run's successes.
+    $reviewDigest = Get-ReviewerTextSha256 -Text (ConvertTo-Json -InputObject $marker -Depth 8 -Compress)
+    $priorApplies = (([string](Get-ReviewerHashValue -Container $priorRecord -Key 'reviewDigest' -Default '')) -ceq $reviewDigest)
+    $commentsDelivered = Merge-ReviewerCapabilityFlag -Attempted $EnableFindingComments -SucceededThisRun ([bool]$delivery.CommentsDelivered) -PriorValue $priorComments -PriorAppliesToThisReview $priorApplies
+    $summaryDelivered = Merge-ReviewerCapabilityFlag -Attempted $EnableSummaryComment -SucceededThisRun ([bool]$delivery.SummaryDelivered) -PriorValue $priorSummary -PriorAppliesToThisReview $priorApplies
+    $voteResolved = Merge-ReviewerCapabilityFlag -Attempted $EnableApprovalVote -SucceededThisRun ([bool]$delivery.VoteResolved) -PriorValue $priorVote -PriorAppliesToThisReview $priorApplies
 
     $ReviewedState[[string]$prId] = @{
         sourceCommit      = $sourceCommit
@@ -2897,6 +2973,8 @@ function Invoke-ReviewerPullRequest {
         voteResolved      = $voteResolved
         previewPath       = $previewPath
         artifactPath      = [string]$preview.ArtifactPath
+        reviewDigest      = $reviewDigest
+        deliveryPending   = ($writesRequested -and -not [bool]$delivery.Delivered -and -not [bool]$delivery.Aborted)
     }
     Set-JsonState -Path $reviewedStatePath -State $ReviewedState
     if ($AttemptsState.ContainsKey([string]$prId)) {
@@ -2955,7 +3033,10 @@ function Invoke-ReviewerPromotion {
     #>
     param(
         [Parameter(Mandatory)][string]$AgencyPath,
-        [Parameter(Mandatory)][string]$ArtifactPath
+        [Parameter(Mandatory)][string]$ArtifactPath,
+        # Supplied when a cycle is retrying its own failed delivery plan, so the
+        # retry reuses the cycle's session instead of opening a second one.
+        [hashtable]$ExistingSession
     )
     if (-not (Test-Path -LiteralPath $ArtifactPath)) { throw "Preview artifact not found: $ArtifactPath" }
     $raw = Get-Content -LiteralPath $ArtifactPath -Raw | ConvertFrom-Json
@@ -3044,10 +3125,13 @@ function Invoke-ReviewerPromotion {
             "-EnableFindingComments, -EnableSummaryComment or -EnableApprovalVote.")
     }
 
-    $session = $null
+    $session = $ExistingSession
+    $ownsSession = ($null -eq $session)
     try {
-        $session = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
-            -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds
+        if ($ownsSession) {
+            $session = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
+                -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds
+        }
 
         $allFindings = @($marker['findings'])
         $counts = Get-ReviewerSeverityCounts -Findings $allFindings
@@ -3080,6 +3164,11 @@ function Invoke-ReviewerPromotion {
             $candidate = $reviewedState[[string]$prId]
             if (([string](Get-ReviewerHashValue -Container $candidate -Key 'sourceCommit' -Default '')) -ieq $sourceCommit) { $priorRecord = $candidate }
         }
+        # Promoting the same artifact twice - which is exactly what an
+        # unfinished delivery's retry does - is the same review, so a capability
+        # that already landed on the first attempt stays landed.
+        $reviewDigest = Get-ReviewerTextSha256 -Text ([string]$signed.markerBody)
+        $priorApplies = (([string](Get-ReviewerHashValue -Container $priorRecord -Key 'reviewDigest' -Default '')) -ceq $reviewDigest)
         $reviewedState[[string]$prId] = @{
             sourceCommit      = $sourceCommit
             at                = ([DateTime]::UtcNow.ToString("o"))
@@ -3090,10 +3179,16 @@ function Invoke-ReviewerPromotion {
             summaryPosted     = [bool]$delivery.SummaryPosted
             vote              = $(if ($delivery.CastVote) { [string]$delivery.CastVote } else { "none" })
             delivered         = [bool]$delivery.Delivered
-            commentsDelivered = (Merge-ReviewerCapabilityFlag -Attempted $EnableFindingComments -SucceededThisRun ([bool]$delivery.CommentsDelivered) -PriorValue ([bool](Get-ReviewerHashValue -Container $priorRecord -Key 'commentsDelivered' -Default $false)))
-            summaryDelivered  = (Merge-ReviewerCapabilityFlag -Attempted $EnableSummaryComment -SucceededThisRun ([bool]$delivery.SummaryDelivered) -PriorValue ([bool](Get-ReviewerHashValue -Container $priorRecord -Key 'summaryDelivered' -Default $false)))
-            voteResolved      = (Merge-ReviewerCapabilityFlag -Attempted $EnableApprovalVote -SucceededThisRun ([bool]$delivery.VoteResolved) -PriorValue ([bool](Get-ReviewerHashValue -Container $priorRecord -Key 'voteResolved' -Default $false)))
+            commentsDelivered = (Merge-ReviewerCapabilityFlag -Attempted $EnableFindingComments -SucceededThisRun ([bool]$delivery.CommentsDelivered) -PriorValue ([bool](Get-ReviewerHashValue -Container $priorRecord -Key 'commentsDelivered' -Default $false)) -PriorAppliesToThisReview $priorApplies)
+            summaryDelivered  = (Merge-ReviewerCapabilityFlag -Attempted $EnableSummaryComment -SucceededThisRun ([bool]$delivery.SummaryDelivered) -PriorValue ([bool](Get-ReviewerHashValue -Container $priorRecord -Key 'summaryDelivered' -Default $false)) -PriorAppliesToThisReview $priorApplies)
+            voteResolved      = (Merge-ReviewerCapabilityFlag -Attempted $EnableApprovalVote -SucceededThisRun ([bool]$delivery.VoteResolved) -PriorValue ([bool](Get-ReviewerHashValue -Container $priorRecord -Key 'voteResolved' -Default $false)) -PriorAppliesToThisReview $priorApplies)
+            reviewDigest      = $reviewDigest
             promotedFrom      = $ArtifactPath
+            previewPath       = $previewPath
+            # The plan stays retryable until it fully lands, so an unattended
+            # retry republishes THIS review rather than a fresh model run.
+            artifactPath      = $ArtifactPath
+            deliveryPending   = (-not [bool]$delivery.Delivered -and -not [bool]$delivery.Aborted)
         }
         Set-JsonState -Path $reviewedStatePath -State $reviewedState
 
@@ -3112,7 +3207,7 @@ function Invoke-ReviewerPromotion {
         return 0
     }
     finally {
-        if ($session) { Close-AgentMcpSession -Session $session }
+        if ($session -and $ownsSession) { Close-AgentMcpSession -Session $session }
     }
 }
 
@@ -3172,6 +3267,8 @@ function Invoke-ReviewerCycle {
 
         # -- Step 2: bind up to -PullRequestsPerCycle reviewable PRs ----------
         $bound = New-Object System.Collections.Generic.List[hashtable]
+        # Unfinished deliveries retried from their own sealed plan this cycle.
+        $retried = New-Object System.Collections.Generic.List[string]
         foreach ($pr in $candidates) {
             if ($bound.Count -ge $PullRequestsPerCycle) { break }
             if ($selectionDeadline -and [DateTime]::UtcNow -gt $selectionDeadline) {
@@ -3217,6 +3314,22 @@ function Invoke-ReviewerCycle {
                 continue
             }
 
+            # A delivery this agent started and did not finish is retried from
+            # its own sealed plan, never by reviewing again. A second model run
+            # may legitimately report a different set of findings, and any
+            # finding that failed to post the first time would then simply never
+            # be mentioned again - it would look delivered because everything
+            # the new run reported was already on the PR.
+            $pendingPlan = Get-ReviewerPendingDeliveryPlan -ReviewedState $reviewedState -PrId $prId -SourceCommit $sourceCommit
+            if ($pendingPlan) {
+                Write-Host "  PR $prId has an unfinished delivery at this commit; retrying that exact review instead of re-reviewing." -ForegroundColor Yellow
+                $retryCode = Invoke-ReviewerPromotion -AgencyPath $AgencyPath -ArtifactPath $pendingPlan -ExistingSession $session
+                if ([int]$retryCode -ne 0) { $result.ExitCode = 1 }
+                [void]$retried.Add("PR $prId delivery retried")
+                $reviewedState = Get-JsonState -Path $reviewedStatePath
+                continue
+            }
+
             $threads = Get-ReviewerPullRequestThreads -Session $session -PrId $prId
             $digest = Build-ReviewerThreadDigest -Threads $threads -BotSubstrings $BotSubstrings -SystemSubstrings $SystemSubstrings
             $changedPaths = Get-ReviewerChangedPaths -Session $session -PrId $prId
@@ -3234,6 +3347,11 @@ function Invoke-ReviewerCycle {
         }
 
         if ($bound.Count -eq 0) {
+            if ($retried.Count -gt 0) {
+                $result.Summary = ($retried.ToArray() -join "; ")
+                Write-ReviewerCycleMetadata -Fields @{ cycle = $CycleNumber; mode = "live"; result = "retried"; retryCount = $retried.Count }
+                return $result
+            }
             Write-Host "No PR needs a review right now." -ForegroundColor Green
             Write-ReviewerCycleMetadata -Fields @{ cycle = $CycleNumber; mode = "live"; result = "idle" }
             return $result
@@ -3241,6 +3359,7 @@ function Invoke-ReviewerCycle {
 
         # -- Step 3: review each bound PR -------------------------------------
         $summaries = New-Object System.Collections.Generic.List[string]
+        foreach ($r in $retried) { [void]$summaries.Add([string]$r) }
         foreach ($b in $bound) {
             $one = Invoke-ReviewerPullRequest -Session $session -AgencyPath $AgencyPath -CycleNumber $CycleNumber `
                 -Bound $b -ReviewedState $reviewedState -AttemptsState $attemptsState
