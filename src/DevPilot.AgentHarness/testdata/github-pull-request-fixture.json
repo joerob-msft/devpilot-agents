@@ -1,0 +1,68 @@
+{
+  "_note": "Captured from a real GitHub API response, identities synthesized. The SHAPE is real; that is the point. Regenerate with tools/Test-GitHubProviderLive.ps1 against a live PR if GitHub changes its payload.",
+  "pullRequest": {
+    "number": 11,
+    "state": "open",
+    "draft": false,
+    "merged": false,
+    "title": "Add a widget cache",
+    "body": "Adds a cache in front of the widget service.",
+    "base": {
+      "ref": "main"
+    },
+    "head": {
+      "sha": "f28efdd1713424ec95d6119c4565f5cba6925d2d"
+    },
+    "user": {
+      "login": "sam-author"
+    }
+  },
+  "reviews": [
+    {
+      "id": 1,
+      "user": {
+        "login": "review-bot[bot]"
+      },
+      "submitted_at": "2026-08-03T02:00:26Z",
+      "state": "COMMENTED"
+    },
+    {
+      "id": 2,
+      "user": {
+        "login": "alex-reviewer"
+      },
+      "submitted_at": "2026-08-03T02:33:35Z",
+      "state": "CHANGES_REQUESTED"
+    },
+    {
+      "id": 3,
+      "user": {
+        "login": "alex-reviewer"
+      },
+      "submitted_at": "2026-08-03T09:10:00Z",
+      "state": "APPROVED"
+    },
+    {
+      "id": 4,
+      "user": {
+        "login": "casey-reviewer"
+      },
+      "submitted_at": null,
+      "state": "PENDING"
+    }
+  ],
+  "expected": {
+    "status": "Active",
+    "targetRefName": "refs/heads/main",
+    "sourceCommitId": "f28efdd1713424ec95d6119c4565f5cba6925d2d",
+    "authorAlias": "sam-author",
+    "reviewerVotes": {
+      "review-bot[bot]": 0,
+      "alex-reviewer": 10
+    },
+    "excludedReviewers": [
+      "casey-reviewer"
+    ],
+    "note": "alex-reviewer requested changes then approved: the LATEST review wins, so the vote is 10 not -10. casey-reviewer's PENDING review is invisible to everyone but its author and must not count."
+  }
+}

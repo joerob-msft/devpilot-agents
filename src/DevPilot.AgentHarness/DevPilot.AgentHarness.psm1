@@ -1543,6 +1543,667 @@ function Resolve-AgentRepositoryRoot {
         "or place the agent config inside the target repository so its root can be resolved from there.")
 }
 
+<#
+    Provider layer.
+
+    Both agents were written against Azure DevOps, and its assumptions reach
+    further than a transport: pull-request status vocabulary, review/vote
+    semantics, thread lifecycle, and how a validation run is located all differ
+    between hosts. This layer defines ONE normalized shape for each of those
+    and implements it per provider, so agent logic above it does not branch on
+    the host.
+
+    The normalized pull-request snapshot is deliberately the shape the Azure
+    DevOps path already produced, so that path can adopt this layer without any
+    behavioural change and its existing self-checks keep their meaning.
+
+    Transport per provider:
+      AzureDevOps - the caller's existing MCP invoker, passed in. Nothing about
+                    that path is reimplemented here.
+      GitHub      - the `gh` CLI, which already holds the operator's
+                    credentials. REST for most reads; GraphQL for review-thread
+                    resolution, which REST does not expose at all.
+#>
+
+$script:AgentSupportedProviders = @('AzureDevOps', 'GitHub')
+
+function Get-AgentSupportedProvider {
+    <#
+    .SYNOPSIS
+        Providers this harness can service.
+    #>
+    [CmdletBinding()]
+    param()
+    return , @($script:AgentSupportedProviders)
+}
+
+function Test-AgentProviderSupported {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Provider)
+    # Case-sensitive on purpose: config values are checked in, not typed, and a
+    # near-miss should be corrected rather than silently accepted.
+    return ($script:AgentSupportedProviders -ccontains $Provider)
+}
+
+function New-AgentProviderContext {
+    <#
+    .SYNOPSIS
+        Validates provider scope up front and returns the handle every provider
+        operation takes.
+
+    .DESCRIPTION
+        Fails closed on an unknown provider and on scope that cannot address a
+        repository. Doing it here means an operation never has to re-derive
+        scope from config, and a misconfiguration surfaces at startup rather
+        than mid-cycle.
+
+        AzureDevOps requires McpInvoker: a scriptblock taking (Name, Arguments,
+        RawText) that performs one MCP tool call. Passing the caller's existing
+        invoker is what keeps that path byte-identical.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Provider,
+        [Parameter(Mandatory)][string]$Organization,
+        [string]$Project = '',
+        [Parameter(Mandatory)][string]$RepositoryName,
+        [string]$RepositoryId = '',
+        [scriptblock]$McpInvoker,
+        [int]$TimeoutSeconds = 60
+    )
+
+    if (-not (Test-AgentProviderSupported -Provider $Provider)) {
+        throw "Provider '$Provider' is not supported. Supported providers: $($script:AgentSupportedProviders -join ', ')."
+    }
+    if ([string]::IsNullOrWhiteSpace($Organization)) { throw "Provider context requires a non-empty Organization." }
+    if ([string]::IsNullOrWhiteSpace($RepositoryName)) { throw "Provider context requires a non-empty RepositoryName." }
+    if ($TimeoutSeconds -lt 1 -or $TimeoutSeconds -gt 3600) { throw "Provider TimeoutSeconds must be between 1 and 3600." }
+
+    switch ($Provider) {
+        'AzureDevOps' {
+            if ([string]::IsNullOrWhiteSpace($Project)) { throw "The AzureDevOps provider requires a Project." }
+            if (-not $McpInvoker) { throw "The AzureDevOps provider requires -McpInvoker; this layer does not reimplement that transport." }
+        }
+        'GitHub' {
+            # 'owner/repo' is the only addressable form, and the owner is the
+            # organization. Project is accepted and ignored so one config shape
+            # serves both providers.
+            if ($Organization -notmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,38}$') {
+                throw "GitHub owner '$Organization' is not a valid account name."
+            }
+            if ($RepositoryName -notmatch '^[A-Za-z0-9._-]{1,100}$') {
+                throw "GitHub repository '$RepositoryName' is not a valid repository name."
+            }
+        }
+    }
+
+    return @{
+        Provider       = $Provider
+        Organization   = $Organization
+        Project        = $Project
+        RepositoryName = $RepositoryName
+        RepositoryId   = $RepositoryId
+        McpInvoker     = $McpInvoker
+        TimeoutSeconds = $TimeoutSeconds
+        Slug           = if ($Provider -eq 'GitHub') { "$Organization/$RepositoryName" } else { "$Organization/$Project/$RepositoryName" }
+    }
+}
+
+function Assert-AgentProviderContext {
+    param([Parameter(Mandatory)]$Context, [string]$RequiredProvider = '')
+    if ($Context -isnot [hashtable] -or -not $Context.ContainsKey('Provider')) {
+        throw "A provider context created by New-AgentProviderContext is required."
+    }
+    if ($RequiredProvider -and $Context.Provider -cne $RequiredProvider) {
+        throw "This operation requires the $RequiredProvider provider, but the context is $($Context.Provider)."
+    }
+}
+
+# ---------------------------------------------------------------------------
+# GitHub transport
+# ---------------------------------------------------------------------------
+
+function Invoke-AgentGitHubApi {
+    <#
+    .SYNOPSIS
+        One `gh api` call, returning parsed JSON.
+
+    .DESCRIPTION
+        Reads the exit code immediately and keeps stderr out of the value.
+        Piping a native command into something that stops the pipeline early can
+        leave $LASTEXITCODE stale, which turns a failed call into a plausible
+        looking result - a failure mode this project has already been bitten by.
+
+        Method is constrained to the verbs the agents actually need. There is no
+        way to reach a destructive verb through this function by argument alone.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [ValidateSet('GET', 'POST', 'PATCH')][string]$Method = 'GET',
+        [hashtable]$Body,
+        [int]$TimeoutSeconds = 60
+    )
+
+    $gh = Get-Command gh -ErrorAction SilentlyContinue
+    if (-not $gh) { throw "The GitHub provider requires the 'gh' CLI on PATH. Install it and run 'gh auth login'." }
+    # A path is always relative to the API root; an absolute URL would let a
+    # caller (or a value that came from repository content) reach another host.
+    if ($Path -match '^[a-z][a-z0-9+.-]*://' -or $Path.StartsWith('//')) {
+        throw "GitHub API path '$Path' must be relative to the API root, not an absolute URL."
+    }
+
+    $arguments = @('api', $Path, '--method', $Method)
+    if ($Body) {
+        $arguments += @('--input', '-')
+    }
+    $stdin = if ($Body) { ($Body | ConvertTo-Json -Depth 10 -Compress) } else { $null }
+
+    $result = Invoke-TimedProcess -FilePath $gh.Source -ArgumentList $arguments `
+        -StandardInputContent $stdin -CaptureStdOut -CaptureStdErr -TimeoutSeconds $TimeoutSeconds
+
+    if ($result.TimedOut) { throw "GitHub API call '$Method $Path' timed out after $TimeoutSeconds second(s)." }
+    if ($result.ExitCode -ne 0) {
+        $detail = if ($result.StdErr) { ($result.StdErr -split "`n" | Select-Object -First 3) -join ' ' } else { "exit code $($result.ExitCode)" }
+        throw "GitHub API call '$Method $Path' failed: $detail"
+    }
+    if ([string]::IsNullOrWhiteSpace($result.StdOut)) { return $null }
+    try { return ($result.StdOut | ConvertFrom-Json -ErrorAction Stop) }
+    catch { throw "GitHub API call '$Method $Path' returned malformed JSON." }
+}
+
+function Invoke-AgentGitHubGraphQl {
+    <#
+    .SYNOPSIS
+        One `gh api graphql` call. Needed because review-thread resolution
+        state is not exposed by the REST API at all.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Query,
+        [hashtable]$Variables = @{},
+        [int]$TimeoutSeconds = 60
+    )
+    $gh = Get-Command gh -ErrorAction SilentlyContinue
+    if (-not $gh) { throw "The GitHub provider requires the 'gh' CLI on PATH. Install it and run 'gh auth login'." }
+
+    $arguments = @('api', 'graphql', '-f', "query=$Query")
+    foreach ($key in $Variables.Keys) {
+        # -F coerces numbers/booleans; -f would send everything as a string and
+        # GraphQL rejects a string where Int! is declared.
+        $arguments += @('-F', "$key=$($Variables[$key])")
+    }
+
+    $result = Invoke-TimedProcess -FilePath $gh.Source -ArgumentList $arguments `
+        -CaptureStdOut -CaptureStdErr -TimeoutSeconds $TimeoutSeconds
+    if ($result.TimedOut) { throw "GitHub GraphQL call timed out after $TimeoutSeconds second(s)." }
+    if ($result.ExitCode -ne 0) {
+        $detail = if ($result.StdErr) { ($result.StdErr -split "`n" | Select-Object -First 3) -join ' ' } else { "exit code $($result.ExitCode)" }
+        throw "GitHub GraphQL call failed: $detail"
+    }
+    try { $parsed = $result.StdOut | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw "GitHub GraphQL call returned malformed JSON." }
+    # GraphQL reports errors in a 200 body, so a non-zero exit code is not
+    # sufficient to detect failure here.
+    if ($parsed.PSObject.Properties['errors'] -and $parsed.errors) {
+        $first = @($parsed.errors)[0]
+        $message = if ($first.PSObject.Properties['message']) { [string]$first.message } else { 'unspecified error' }
+        throw "GitHub GraphQL call reported an error: $message"
+    }
+    return $parsed
+}
+
+# ---------------------------------------------------------------------------
+# Normalization
+# ---------------------------------------------------------------------------
+
+function ConvertTo-AgentProviderPullRequestStatus {
+    <#
+    .SYNOPSIS
+        Normalizes a host's pull-request state to the shared vocabulary
+        (Active / Completed / Abandoned).
+
+    .DESCRIPTION
+        GitHub reports 'closed' for both a merged and an abandoned pull request,
+        and distinguishes them only by the merge flag. Collapsing those two into
+        one status would make an agent treat merged work as abandoned.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Provider,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$State,
+        [bool]$IsMerged = $false
+    )
+    switch ($Provider) {
+        'AzureDevOps' {
+            if (@('Active', 'Completed', 'Abandoned', 'NotSet') -cnotcontains $State) {
+                throw "Unrecognized Azure DevOps pull-request status '$State'."
+            }
+            return $State
+        }
+        'GitHub' {
+            switch ($State.ToLowerInvariant()) {
+                'open' { return 'Active' }
+                'closed' { if ($IsMerged) { return 'Completed' } else { return 'Abandoned' } }
+                default { throw "Unrecognized GitHub pull-request state '$State'." }
+            }
+        }
+        default { throw "Unrecognized provider '$Provider'." }
+    }
+}
+
+function ConvertTo-AgentProviderVote {
+    <#
+    .SYNOPSIS
+        Normalizes a review outcome to the Azure DevOps vote scale, which is
+        the one the agents' gating logic already speaks.
+
+        10 approved | 5 approved with suggestions | 0 no vote
+        -5 waiting for author | -10 rejected
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Provider,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$State
+    )
+    switch ($Provider) {
+        'GitHub' {
+            switch ($State.ToUpperInvariant()) {
+                'APPROVED' { return 10 }
+                'CHANGES_REQUESTED' { return -10 }
+                # A comment-only or dismissed review is explicitly NOT a signal
+                # either way; treating it as approval would let an agent
+                # auto-complete on a review that approved nothing.
+                'COMMENTED' { return 0 }
+                'DISMISSED' { return 0 }
+                'PENDING' { return 0 }
+                default { throw "Unrecognized GitHub review state '$State'." }
+            }
+        }
+        default { throw "ConvertTo-AgentProviderVote does not translate for provider '$Provider'." }
+    }
+}
+
+function ConvertTo-AgentProviderSnapshot {
+    <#
+    .SYNOPSIS
+        Normalizes a GitHub pull request (plus its reviews) into the shared
+        snapshot shape.
+
+    .DESCRIPTION
+        Validated rather than trusted: every field the agents gate on is
+        type- and range-checked here, because everything downstream treats a
+        snapshot as wrapper-owned truth.
+
+        Reviews collapse to one entry per reviewer using the LATEST submitted
+        review. GitHub keeps the whole history, so a reviewer who requested
+        changes and later approved appears twice; taking the newest is what
+        matches how a human reads the PR.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$PullRequest,
+        [AllowNull()]$Reviews,
+        [Parameter(Mandatory)][string]$ExpectedOwner,
+        [Parameter(Mandatory)][string]$ExpectedRepository
+    )
+
+    foreach ($required in 'number', 'state', 'draft', 'title', 'base', 'head', 'user') {
+        if (-not $PullRequest.PSObject.Properties[$required]) {
+            throw "GitHub pull-request response omitted '$required'."
+        }
+    }
+
+    $number = $PullRequest.number
+    if ($number -isnot [int] -and $number -isnot [long]) { throw "GitHub pull-request number is not an integer." }
+    if ([int]$number -le 0) { throw "GitHub pull-request number must be positive." }
+
+    $isMerged = [bool]($PullRequest.PSObject.Properties['merged'] -and $PullRequest.merged -eq $true)
+    $status = ConvertTo-AgentProviderPullRequestStatus -Provider 'GitHub' -State ([string]$PullRequest.state) -IsMerged $isMerged
+
+    $headSha = [string]$PullRequest.head.sha
+    if ($headSha -notmatch '^[0-9a-fA-F]{40}$') { throw "GitHub head commit '$headSha' is not a 40-character hexadecimal SHA." }
+
+    $baseRef = [string]$PullRequest.base.ref
+    if ([string]::IsNullOrWhiteSpace($baseRef)) { throw "GitHub pull request has an empty base ref." }
+
+    $title = [string]$PullRequest.title
+    if ($title.Length -gt 4000) { throw "GitHub pull-request title exceeds 4000 characters." }
+    $body = if ($PullRequest.PSObject.Properties['body'] -and $null -ne $PullRequest.body) { [string]$PullRequest.body } else { '' }
+    if ($body.Length -gt 1MB) { throw "GitHub pull-request body exceeds 1MB." }
+
+    $login = [string]$PullRequest.user.login
+    if ($login -notmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,38}(\[bot\])?$') {
+        throw "GitHub pull-request author login '$login' failed validation."
+    }
+
+    $latestByReviewer = @{}
+    foreach ($review in @($Reviews)) {
+        if ($null -eq $review) { continue }
+        if (-not $review.PSObject.Properties['user'] -or -not $review.user -or -not $review.PSObject.Properties['state']) { continue }
+        $reviewerLogin = [string]$review.user.login
+        if ([string]::IsNullOrWhiteSpace($reviewerLogin)) { continue }
+        $submitted = if ($review.PSObject.Properties['submitted_at'] -and $review.submitted_at) {
+            [DateTime]::Parse([string]$review.submitted_at, [System.Globalization.CultureInfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal)
+        }
+        else { [DateTime]::MinValue }
+        # A PENDING review is not visible to anyone but its author and must not
+        # count toward approval.
+        if ([string]$review.state -ceq 'PENDING') { continue }
+        if (-not $latestByReviewer.ContainsKey($reviewerLogin) -or $submitted -ge $latestByReviewer[$reviewerLogin].submittedAt) {
+            $latestByReviewer[$reviewerLogin] = @{ submittedAt = $submitted; state = [string]$review.state }
+        }
+    }
+
+    $reviewers = @()
+    foreach ($reviewerLogin in ($latestByReviewer.Keys | Sort-Object)) {
+        $reviewers += @{
+            id          = $reviewerLogin
+            vote        = ConvertTo-AgentProviderVote -Provider 'GitHub' -State $latestByReviewer[$reviewerLogin].state
+            isContainer = $false
+        }
+    }
+
+    return @{
+        prId             = [int]$number
+        repositoryId     = "$ExpectedOwner/$ExpectedRepository"
+        project          = $ExpectedOwner
+        status           = $status
+        isDraft          = [bool]$PullRequest.draft
+        targetRefName    = "refs/heads/$baseRef"
+        sourceCommitId   = $headSha.ToLowerInvariant()
+        authorAlias      = $login
+        # GitHub does not expose a verified address on the pull-request payload,
+        # and a public profile email is not an identity claim. Left null rather
+        # than synthesized, so nothing downstream mistakes it for one.
+        authorUniqueName = $null
+        title            = $title
+        description      = $body
+        reviewers        = $reviewers
+    }
+}
+
+function ConvertTo-AgentProviderThreadStatus {
+    <#
+    .SYNOPSIS
+        Normalizes review-thread state to the shared vocabulary the thread
+        classifier already uses (Active / Fixed / Closed).
+
+    .DESCRIPTION
+        An outdated-but-unresolved GitHub thread stays Active on purpose: the
+        code moved, the question was never answered.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][bool]$IsResolved, [bool]$IsOutdated = $false)
+    if ($IsResolved) { return 'Closed' }
+    return 'Active'
+}
+
+# ---------------------------------------------------------------------------
+# Provider operations
+# ---------------------------------------------------------------------------
+
+function Get-AgentProviderPullRequestSnapshot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Context,
+        [Parameter(Mandatory)][int]$PullRequestId
+    )
+    Assert-AgentProviderContext -Context $Context
+    if ($PullRequestId -le 0) { throw "PullRequestId must be positive." }
+
+    switch ($Context.Provider) {
+        'GitHub' {
+            $slug = $Context.Slug
+            $pr = Invoke-AgentGitHubApi -Path "repos/$slug/pulls/$PullRequestId" -TimeoutSeconds $Context.TimeoutSeconds
+            $reviews = Invoke-AgentGitHubApi -Path "repos/$slug/pulls/$PullRequestId/reviews?per_page=100" -TimeoutSeconds $Context.TimeoutSeconds
+            return ConvertTo-AgentProviderSnapshot -PullRequest $pr -Reviews $reviews `
+                -ExpectedOwner $Context.Organization -ExpectedRepository $Context.RepositoryName
+        }
+        default {
+            throw "Get-AgentProviderPullRequestSnapshot is not implemented for '$($Context.Provider)' in this layer; the Azure DevOps path uses its existing MCP invoker."
+        }
+    }
+}
+
+function Get-AgentProviderActivePullRequestIds {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Context,
+        [string]$TargetRefName = '',
+        [AllowEmptyCollection()][string[]]$AuthorAliases = @(),
+        [int]$MaxPages = 20
+    )
+    Assert-AgentProviderContext -Context $Context -RequiredProvider 'GitHub'
+
+    $slug = $Context.Slug
+    $baseFilter = if ($TargetRefName) { ($TargetRefName -replace '^refs/heads/', '') } else { '' }
+    $ids = New-Object System.Collections.Generic.List[int]
+    $pageSize = 100
+
+    for ($page = 1; $page -le $MaxPages; $page++) {
+        $path = "repos/$slug/pulls?state=open&per_page=$pageSize&page=$page"
+        if ($baseFilter) { $path += "&base=$baseFilter" }
+        $entries = @(Invoke-AgentGitHubApi -Path $path -TimeoutSeconds $Context.TimeoutSeconds)
+
+        foreach ($entry in $entries) {
+            if ($null -eq $entry) { continue }
+            if ($entry.PSObject.Properties['draft'] -and $entry.draft -eq $true) { continue }
+            $login = if ($entry.PSObject.Properties['user'] -and $entry.user) { [string]$entry.user.login } else { '' }
+            if (@($AuthorAliases).Count -gt 0 -and $AuthorAliases -notcontains $login) { continue }
+            $number = $entry.number
+            if ($number -isnot [int] -and $number -isnot [long]) { throw "GitHub pull-request list returned a non-integer number." }
+            [void]$ids.Add([int]$number)
+        }
+        if ($entries.Count -lt $pageSize) { return , (@($ids) | Sort-Object -Unique) }
+    }
+    throw "GitHub pull-request listing exceeded the safety page limit ($MaxPages)."
+}
+
+function Get-AgentProviderCommitDateUtc {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Context,
+        [Parameter(Mandatory)][string]$CommitId
+    )
+    Assert-AgentProviderContext -Context $Context -RequiredProvider 'GitHub'
+    if ($CommitId -notmatch '^[0-9a-fA-F]{40}$') { throw "Commit id '$CommitId' is not a 40-character hexadecimal SHA." }
+
+    $slug = $Context.Slug
+    $commit = Invoke-AgentGitHubApi -Path "repos/$slug/commits/$CommitId" -TimeoutSeconds $Context.TimeoutSeconds
+    # Committer date, not author date: a rebased or cherry-picked commit keeps
+    # its original author date, which would make fresh work look stale and be
+    # skipped by commit-age gating.
+    $raw = $commit.commit.committer.date
+    if ([string]::IsNullOrWhiteSpace([string]$raw)) { throw "GitHub commit '$CommitId' has no committer date." }
+    return [DateTime]::Parse([string]$raw, [System.Globalization.CultureInfo]::InvariantCulture,
+        [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal)
+}
+
+function Get-AgentProviderPullRequestThreads {
+    <#
+    .SYNOPSIS
+        Review threads with resolution state, normalized to the shape the
+        thread classifier consumes.
+
+    .DESCRIPTION
+        Uses GraphQL because REST has no concept of a review thread: it returns
+        a flat comment list whose structure must be inferred from
+        in_reply_to_id, and it never exposes whether a thread was resolved.
+        Resolution is exactly what separates an answered comment from an open
+        one, so REST alone cannot support the classifier.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Context,
+        [Parameter(Mandatory)][int]$PullRequestId,
+        [int]$MaxThreads = 100,
+        [int]$MaxCommentsPerThread = 50
+    )
+    Assert-AgentProviderContext -Context $Context -RequiredProvider 'GitHub'
+
+    $query = @'
+query($owner:String!,$repo:String!,$number:Int!,$threads:Int!,$comments:Int!){
+  repository(owner:$owner,name:$repo){
+    pullRequest(number:$number){
+      reviewThreads(first:$threads){
+        nodes{
+          id isResolved isOutdated path line
+          comments(first:$comments){ nodes{ databaseId author{login} body createdAt } }
+        }
+      }
+    }
+  }
+}
+'@
+    $response = Invoke-AgentGitHubGraphQl -Query $query -Variables @{
+        owner    = $Context.Organization
+        repo     = $Context.RepositoryName
+        number   = $PullRequestId
+        threads  = $MaxThreads
+        comments = $MaxCommentsPerThread
+    } -TimeoutSeconds $Context.TimeoutSeconds
+
+    $nodes = @($response.data.repository.pullRequest.reviewThreads.nodes)
+    $threads = @()
+    foreach ($node in $nodes) {
+        if ($null -eq $node) { continue }
+        $comments = @()
+        foreach ($comment in @($node.comments.nodes)) {
+            if ($null -eq $comment) { continue }
+            $author = if ($comment.PSObject.Properties['author'] -and $comment.author) { [string]$comment.author.login } else { '' }
+            $comments += @{
+                id           = if ($comment.PSObject.Properties['databaseId']) { $comment.databaseId } else { $null }
+                authorAlias  = $author
+                authorUnique = $author
+                content      = if ($comment.PSObject.Properties['body'] -and $null -ne $comment.body) { [string]$comment.body } else { '' }
+                publishedAt  = if ($comment.PSObject.Properties['createdAt']) { [string]$comment.createdAt } else { '' }
+            }
+        }
+        $threads += @{
+            id           = [string]$node.id
+            status       = ConvertTo-AgentProviderThreadStatus -IsResolved ([bool]$node.isResolved) -IsOutdated ([bool]$node.isOutdated)
+            isResolved   = [bool]$node.isResolved
+            isOutdated   = [bool]$node.isOutdated
+            filePath     = if ($node.PSObject.Properties['path']) { [string]$node.path } else { '' }
+            line         = if ($node.PSObject.Properties['line'] -and $null -ne $node.line) { [int]$node.line } else { $null }
+            comments     = $comments
+            commentCount = $comments.Count
+        }
+    }
+    return , $threads
+}
+
+function Get-AgentProviderValidationRun {
+    <#
+    .SYNOPSIS
+        The validation run for a pull request's head commit.
+
+    .DESCRIPTION
+        Azure DevOps locates this by pipeline id against a merge ref that
+        GitHub has no equivalent of. On GitHub, check runs are attached
+        directly to the head SHA, which is both simpler and more precise -
+        there is no ambiguity about which commit was validated.
+
+        Returns a normalized summary rather than the raw payload, so gating
+        logic does not learn either host's conclusion vocabulary.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Context,
+        [Parameter(Mandatory)][string]$HeadSha,
+        [string]$CheckNameFilter = ''
+    )
+    Assert-AgentProviderContext -Context $Context -RequiredProvider 'GitHub'
+    if ($HeadSha -notmatch '^[0-9a-fA-F]{40}$') { throw "HeadSha '$HeadSha' is not a 40-character hexadecimal SHA." }
+
+    $slug = $Context.Slug
+    $payload = Invoke-AgentGitHubApi -Path "repos/$slug/commits/$HeadSha/check-runs?per_page=100" -TimeoutSeconds $Context.TimeoutSeconds
+    $runs = @($payload.check_runs)
+    if ($CheckNameFilter) { $runs = @($runs | Where-Object { $_.name -like $CheckNameFilter }) }
+
+    if ($runs.Count -eq 0) {
+        return @{ found = $false; state = 'None'; isComplete = $false; isSuccess = $false; runs = @(); headSha = $HeadSha.ToLowerInvariant() }
+    }
+
+    $normalized = @()
+    foreach ($run in $runs) {
+        $normalized += @{
+            name       = [string]$run.name
+            status     = [string]$run.status
+            conclusion = if ($run.PSObject.Properties['conclusion'] -and $null -ne $run.conclusion) { [string]$run.conclusion } else { '' }
+            startedAt  = if ($run.PSObject.Properties['started_at']) { [string]$run.started_at } else { '' }
+        }
+    }
+
+    $allComplete = -not ($normalized | Where-Object { $_.status -ne 'completed' })
+    # 'neutral' and 'skipped' are not failures, but they are not evidence of a
+    # passing build either. Only 'success' counts as green, so a gate that
+    # requires green fails closed.
+    $allSuccess = $allComplete -and -not ($normalized | Where-Object { $_.conclusion -ne 'success' })
+
+    $state = if (-not $allComplete) { 'InProgress' } elseif ($allSuccess) { 'Succeeded' } else { 'Failed' }
+    return @{
+        found      = $true
+        state      = $state
+        isComplete = $allComplete
+        isSuccess  = $allSuccess
+        runs       = $normalized
+        headSha    = $HeadSha.ToLowerInvariant()
+    }
+}
+
+function Set-AgentProviderPullRequestVote {
+    <#
+    .SYNOPSIS
+        Casts a review on a pull request.
+
+    .DESCRIPTION
+        Deliberately narrow: only Approved and WaitingForAuthor are accepted,
+        matching what the agents are permitted to express. There is no path
+        here to merge, close, or otherwise alter a pull request.
+
+        The write is confirmed by re-reading the pull request's reviews rather
+        than by parsing the response body, because a response that is hard to
+        parse must never be mistaken for a write that did not land.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Context,
+        [Parameter(Mandatory)][int]$PullRequestId,
+        [Parameter(Mandatory)][ValidateSet('Approved', 'WaitingForAuthor')][string]$Vote,
+        [string]$Body = ''
+    )
+    Assert-AgentProviderContext -Context $Context -RequiredProvider 'GitHub'
+    if ($PullRequestId -le 0) { throw "PullRequestId must be positive." }
+
+    $event = switch ($Vote) {
+        'Approved' { 'APPROVE' }
+        'WaitingForAuthor' { 'REQUEST_CHANGES' }
+    }
+    # GitHub rejects REQUEST_CHANGES with an empty body.
+    if ($event -eq 'REQUEST_CHANGES' -and [string]::IsNullOrWhiteSpace($Body)) {
+        throw "A REQUEST_CHANGES review requires a non-empty body."
+    }
+
+    $slug = $Context.Slug
+    $payload = @{ event = $event }
+    if ($Body) { $payload['body'] = $Body }
+
+    $null = Invoke-AgentGitHubApi -Path "repos/$slug/pulls/$PullRequestId/reviews" -Method POST -Body $payload -TimeoutSeconds $Context.TimeoutSeconds
+
+    $after = Get-AgentProviderPullRequestSnapshot -Context $Context -PullRequestId $PullRequestId
+    $expectedState = if ($event -eq 'APPROVE') { 'APPROVED' } else { 'CHANGES_REQUESTED' }
+    $expected = ConvertTo-AgentProviderVote -Provider 'GitHub' -State $expectedState
+    $landed = @($after.reviewers | Where-Object { $_.vote -eq $expected }).Count -gt 0
+    return @{ requested = $Vote; confirmed = $landed; snapshot = $after }
+}
+
+# Exports are declared by the root module (DevPilot.AgentHarness.psm1), which
+# dot-sources this file. Declaring them here as well would replace the root's
+# export list rather than add to it.
+
 Export-ModuleMember -Function @(
     "Get-DevPilotAgentPath",
     "Resolve-AgentRepositoryRoot",
@@ -1590,7 +2251,23 @@ Export-ModuleMember -Function @(
     "Close-AgentMcpSession",
     "Send-AgentMcpRequest",
     "Send-AgentMcpNotification",
-    "Invoke-AgentMcpTool"
+    "Invoke-AgentMcpTool",
+    "Get-AgentSupportedProvider",
+    "Test-AgentProviderSupported",
+    "New-AgentProviderContext",
+    "Assert-AgentProviderContext",
+    "Invoke-AgentGitHubApi",
+    "Invoke-AgentGitHubGraphQl",
+    "ConvertTo-AgentProviderPullRequestStatus",
+    "ConvertTo-AgentProviderVote",
+    "ConvertTo-AgentProviderSnapshot",
+    "ConvertTo-AgentProviderThreadStatus",
+    "Get-AgentProviderPullRequestSnapshot",
+    "Get-AgentProviderActivePullRequestIds",
+    "Get-AgentProviderCommitDateUtc",
+    "Get-AgentProviderPullRequestThreads",
+    "Get-AgentProviderValidationRun",
+    "Set-AgentProviderPullRequestVote"
 )
 
 
