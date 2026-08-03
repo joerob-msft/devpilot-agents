@@ -969,14 +969,24 @@ function Format-ReviewerFindingComment {
 }
 
 function Format-ReviewerSummaryComment {
-    param([string]$Summary, [hashtable]$Counts, [int]$Reported, [int]$Posted)
+    <# The body must be RETRY-STABLE. It is deduplicated by fingerprint against
+       the PR's own threads, so any term that changes between a partial attempt
+       and its retry defeats that dedupe and produces a second, differently
+       worded summary. It therefore describes the REVIEW - what was found and
+       what is eligible to post - and never the delivery outcome, which is
+       exactly the value that moves. #>
+    param([string]$Summary, [hashtable]$Counts, [int]$Reported, [int]$Publishable)
     $parts = New-Object System.Collections.Generic.List[string]
     [void]$parts.Add($script:ReviewerSummaryHeading)
     [void]$parts.Add("")
     if ($Summary -and $Summary.Trim() -ne "") { [void]$parts.Add($Summary.Trim()); [void]$parts.Add("") }
     [void]$parts.Add(("Findings: {0} critical, {1} important, {2} suggestion." -f $Counts['critical'], $Counts['important'], $Counts['suggestion']))
-    if ($Posted -lt $Reported) {
-        [void]$parts.Add("Posted $Posted of $Reported finding(s); the remainder were below this repository's posting threshold or above its per-PR cap.")
+    if ($Publishable -lt $Reported) {
+        # Deliberately does not attribute a single cause: a finding can be
+        # withheld by the severity threshold, by the per-PR cap, or because it
+        # names a location this PR does not change, and claiming one reason for
+        # all of them is a statement the agent cannot support.
+        [void]$parts.Add("$Publishable of $Reported finding(s) are published as inline comments; the rest are withheld by this repository's posting rules (severity threshold, per-PR cap, or a location this PR does not change).")
     }
     [void]$parts.Add("")
     [void]$parts.Add($script:ReviewerSignatureFooter)
@@ -1015,6 +1025,11 @@ function Test-ReviewerShouldVote {
         [int]$SuggestionCount,
         [int]$ReportedFindingCount,
         [bool]$FindingsPosted,
+        # $true only when the reason the findings are not visible is a delivery
+        # gap a retry could close (a failed post, or a post that did not confirm
+        # at its anchor). Withheld findings and a comments-disabled run are NOT
+        # retryable: no future attempt of this plan can change them.
+        [bool]$FindingsRetryable = $false,
         [bool]$PrIsActive,
         [bool]$PrIsDraft,
         [string]$CurrentSourceCommit,
@@ -1030,11 +1045,13 @@ function Test-ReviewerShouldVote {
     # an unexplained verdict. Silence about a clean PR is fine; silence about a
     # problem is not.
     if ($ReportedFindingCount -gt 0 -and -not $FindingsPosted) {
-        # Retryable: this depends on whether the comments landed THIS run, not
-        # on anything fixed about the commit. Recording it as resolved would let
-        # a vote-only attempt permanently swallow the vote for a review whose
-        # comments a later attempt then delivers successfully.
-        return @{ Vote = ""; Reason = "findings exist but were not posted, so a vote would be unexplained"; Retryable = $true }
+        # Retryable ONLY when the caller says the shortfall is a delivery gap a
+        # later attempt could close. A finding that is deliberately withheld -
+        # below the threshold, over the cap, or naming a location this PR does
+        # not change - and a run with comments switched off can NEVER make the
+        # findings visible, so treating those as retryable would keep the plan
+        # pending on every cycle forever without ever changing the outcome.
+        return @{ Vote = ""; Reason = "findings exist but were not posted, so a vote would be unexplained"; Retryable = $FindingsRetryable }
     }
 
     switch ($RecommendedVote) {
@@ -1068,25 +1085,20 @@ function Test-ReviewerShouldVote {
 }
 
 function Test-ReviewerShouldPostSummary {
-    <# The summary states how many findings were posted, so its text - and so
-       its fingerprint - differs between a partial attempt and a complete one.
-       Fingerprint dedupe therefore CANNOT stop a retry from adding a second,
-       differently-worded summary. Two rules prevent that: never write it twice
-       for the same review, and never write it while the comment count it quotes
-       can still change. #>
+    <# The summary body is retry-stable (see Format-ReviewerSummaryComment), so
+       fingerprint dedupe against the PR's own threads is sufficient to make a
+       retry a no-op. It is therefore NOT deferred while comments are still
+       being delivered: deferring it had no terminal path, so a comment that
+       could never post - a permanently rejected anchor, say - would suppress
+       the summary forever, which is a worse outcome than the duplicate the
+       deferral was written to prevent. The only skip is a summary already known
+       to have landed for THIS review, which saves a pointless write. #>
     param(
         [bool]$SummaryEnabled,
-        [bool]$AlreadyDelivered,
-        [bool]$CommentsEnabled,
-        [int]$PostFailures = 0,
-        [int]$PostedCount = 0,
-        [int]$PostableCount = 0
+        [bool]$AlreadyDelivered
     )
     if (-not $SummaryEnabled) { return @{ Post = $false; Resolved = $false; Reason = "the summary was not requested" } }
     if ($AlreadyDelivered) { return @{ Post = $false; Resolved = $true; Reason = "the summary for this review was already delivered" } }
-    if ($CommentsEnabled -and ($PostFailures -gt 0 -or $PostedCount -lt $PostableCount)) {
-        return @{ Post = $false; Resolved = $false; Reason = "it reports how many findings were posted, and they are not all posted" }
-    }
     return @{ Post = $true; Resolved = $false; Reason = "" }
 }
 
@@ -2059,46 +2071,70 @@ function Invoke-DryRunSelfChecks {
     }
     if ($capabilityFailures -eq 0) { Write-Host "  OK - delivery is per capability, a failed retry never inherits an older success, and legacy records suppress nothing" -ForegroundColor Green }
 
-    # The summary quotes how many findings were posted, so fingerprint dedupe
-    # cannot stop a retry from adding a SECOND, differently-worded summary. It
-    # must therefore wait for the comments and never be written twice.
+    # The summary body must be RETRY-STABLE: it is deduplicated by fingerprint
+    # against the PR's own threads, so any term that moves between a partial
+    # attempt and its retry produces a second, differently-worded summary.
     $summaryGateFailures = 0
+    $stableCounts = @{ critical = 1; important = 1; suggestion = 0 }
+    $bodyPartial = Format-ReviewerSummaryComment -Summary "s" -Counts $stableCounts -Reported 3 -Publishable 2
+    $bodyRetry = Format-ReviewerSummaryComment -Summary "s" -Counts $stableCounts -Reported 3 -Publishable 2
+    if ((Get-ReviewerCommentFingerprint -Content $bodyPartial) -cne (Get-ReviewerCommentFingerprint -Content $bodyRetry)) {
+        $failures.Add("The summary body is not retry-stable, so a retry would post a second summary instead of being deduplicated.")
+        $summaryGateFailures++
+    }
+    if ($bodyPartial -match 'Posted \d+ of') {
+        $failures.Add("The summary body still quotes a delivery count, which changes between attempts and defeats fingerprint dedupe.")
+        $summaryGateFailures++
+    }
     $summaryCases = @(
-        @{ Name = 'comments complete'; Enabled = $true; Already = $false; Comments = $true; Failures = 0; Posted = 2; Postable = 2; Post = $true; Resolved = $false }
-        @{ Name = 'a finding failed to post'; Enabled = $true; Already = $false; Comments = $true; Failures = 1; Posted = 1; Postable = 2; Post = $false; Resolved = $false }
-        @{ Name = 'fewer confirmed than postable'; Enabled = $true; Already = $false; Comments = $true; Failures = 0; Posted = 1; Postable = 2; Post = $false; Resolved = $false }
-        @{ Name = 'already delivered for this review'; Enabled = $true; Already = $true; Comments = $true; Failures = 0; Posted = 2; Postable = 2; Post = $false; Resolved = $true }
-        @{ Name = 'summary-only run, comments disabled'; Enabled = $true; Already = $false; Comments = $false; Failures = 0; Posted = 0; Postable = 5; Post = $true; Resolved = $false }
-        @{ Name = 'summary not requested'; Enabled = $false; Already = $false; Comments = $true; Failures = 0; Posted = 2; Postable = 2; Post = $false; Resolved = $false }
+        @{ Name = 'first delivery'; Enabled = $true; Already = $false; Post = $true; Resolved = $false }
+        @{ Name = 'already delivered for this review'; Enabled = $true; Already = $true; Post = $false; Resolved = $true }
+        @{ Name = 'summary not requested'; Enabled = $false; Already = $false; Post = $false; Resolved = $false }
     )
     foreach ($case in $summaryCases) {
-        $gate = Test-ReviewerShouldPostSummary -SummaryEnabled $case.Enabled -AlreadyDelivered $case.Already `
-            -CommentsEnabled $case.Comments -PostFailures $case.Failures -PostedCount $case.Posted -PostableCount $case.Postable
+        $gate = Test-ReviewerShouldPostSummary -SummaryEnabled $case.Enabled -AlreadyDelivered $case.Already
         if ([bool]$gate.Post -ne [bool]$case.Post -or [bool]$gate.Resolved -ne [bool]$case.Resolved) {
             $failures.Add("The summary gate is wrong for '$($case.Name)': expected post=$($case.Post)/resolved=$($case.Resolved), got post=$($gate.Post)/resolved=$($gate.Resolved).")
             $summaryGateFailures++
         }
     }
-    if ($summaryGateFailures -eq 0) { Write-Host "  OK - the summary waits for the comments it counts and is never posted twice for one review" -ForegroundColor Green }
+    if ($summaryGateFailures -eq 0) { Write-Host "  OK - the summary describes the review, not the delivery, so a retry deduplicates instead of duplicating" -ForegroundColor Green }
 
-    # A vote declined because THIS run did not get the findings up can succeed
-    # later, so it must stay open; a decline the commit itself forces is final.
+    # A vote declined because THIS run's comment delivery fell short can succeed
+    # later, so it must stay open. A decline nothing can undo - the commit's own
+    # facts, findings withheld on purpose, or comments switched off - is final,
+    # because keeping it open would retry the same plan forever.
     $voteGateFailures = 0
-    $undelivered = Test-ReviewerShouldVote -RecommendedVote 'waitForAuthor' -CriticalCount 1 -ImportantCount 0 -SuggestionCount 0 `
-        -ReportedFindingCount 1 -FindingsPosted $false -PrIsActive $true -PrIsDraft $false `
-        -CurrentSourceCommit $commitNew -ReviewedSourceCommit $commitNew
-    if ($undelivered.Vote -or -not (Get-ReviewerHashValue -Container $undelivered -Key 'Retryable' -Default $false)) {
-        $failures.Add("A vote declined because the findings are not posted was not marked retryable, so it would be recorded as permanently resolved.")
-        $voteGateFailures++
+    $voteCases = @(
+        @{ Name = 'a comment failed to post'; Rec = 'waitForAuthor'; Crit = 1; Rep = 1; Posted = $false; Retryable = $true; ExpectRetryable = $true }
+        @{ Name = 'findings withheld on purpose, nothing left to deliver'; Rec = 'waitForAuthor'; Crit = 1; Rep = 2; Posted = $false; Retryable = $false; ExpectRetryable = $false }
+        @{ Name = 'comments switched off'; Rec = 'waitForAuthor'; Crit = 1; Rep = 1; Posted = $false; Retryable = $false; ExpectRetryable = $false }
+    )
+    foreach ($case in $voteCases) {
+        $got = Test-ReviewerShouldVote -RecommendedVote $case.Rec -CriticalCount $case.Crit -ImportantCount 0 -SuggestionCount 0 `
+            -ReportedFindingCount $case.Rep -FindingsPosted $case.Posted -FindingsRetryable $case.Retryable `
+            -PrIsActive $true -PrIsDraft $false -CurrentSourceCommit $commitNew -ReviewedSourceCommit $commitNew
+        if ($got.Vote -or [bool](Get-ReviewerHashValue -Container $got -Key 'Retryable' -Default $false) -ne [bool]$case.ExpectRetryable) {
+            $failures.Add("Vote retryability is wrong for '$($case.Name)': expected a decline with retryable=$($case.ExpectRetryable).")
+            $voteGateFailures++
+        }
     }
-    $contradicted = Test-ReviewerShouldVote -RecommendedVote 'approve' -CriticalCount 1 -ImportantCount 0 -SuggestionCount 0 `
-        -ReportedFindingCount 1 -FindingsPosted $true -PrIsActive $true -PrIsDraft $false `
-        -CurrentSourceCommit $commitNew -ReviewedSourceCommit $commitNew
-    if ($contradicted.Vote -or (Get-ReviewerHashValue -Container $contradicted -Key 'Retryable' -Default $false)) {
-        $failures.Add("A vote declined by the commit's own facts was marked retryable, which would keep the PR pending forever.")
-        $voteGateFailures++
+    # Every decline the commit itself forces must be FINAL, or the PR is pending forever.
+    $finalCases = @(
+        @{ Name = 'a plain approval contradicted by the agent''s own findings'; Rec = 'approve'; Crit = 1; Rep = 1; Posted = $true }
+        @{ Name = 'waitForAuthor with no critical finding'; Rec = 'waitForAuthor'; Crit = 0; Rep = 1; Posted = $true }
+        @{ Name = 'an unrecognized recommendation'; Rec = 'nonsense'; Crit = 0; Rep = 0; Posted = $true }
+    )
+    foreach ($case in $finalCases) {
+        $got = Test-ReviewerShouldVote -RecommendedVote $case.Rec -CriticalCount $case.Crit -ImportantCount 0 -SuggestionCount 0 `
+            -ReportedFindingCount $case.Rep -FindingsPosted $case.Posted -FindingsRetryable $true `
+            -PrIsActive $true -PrIsDraft $false -CurrentSourceCommit $commitNew -ReviewedSourceCommit $commitNew
+        if ($got.Vote -or [bool](Get-ReviewerHashValue -Container $got -Key 'Retryable' -Default $false)) {
+            $failures.Add("The decline for '$($case.Name)' is not final, so the plan would be retried forever.")
+            $voteGateFailures++
+        }
     }
-    if ($voteGateFailures -eq 0) { Write-Host "  OK - only a decline this run can undo keeps the vote open; a decision the commit forces is final" -ForegroundColor Green }
+    if ($voteGateFailures -eq 0) { Write-Host "  OK - only a delivery gap keeps the vote open; a decision nothing can undo is final" -ForegroundColor Green }
     # An unfinished delivery must be retried from its own sealed plan. Reviewing
     # again instead would let a nondeterministic second model run omit exactly
     # the finding that failed to post, which then looks delivered forever.
@@ -2212,9 +2248,9 @@ function Invoke-DryRunSelfChecks {
         $failures.Add("A thread at one anchor matched a finding at a different anchor.")
     }
     else { Write-Host "  OK - existing threads are matched at their own anchor, not by text alone" -ForegroundColor Green }
-    $summaryBody = Format-ReviewerSummaryComment -Summary "Adds a cache." -Counts $counts -Reported 4 -Posted 2
+    $summaryBody = Format-ReviewerSummaryComment -Summary "Adds a cache." -Counts $counts -Reported 4 -Publishable 2
     if ($summaryBody -cnotmatch [regex]::Escape($script:ReviewerSummaryHeading)) { $failures.Add("The summary comment lost its heading.") }
-    elseif ($summaryBody -cnotmatch 'Posted 2 of 4') { $failures.Add("The summary does not disclose that findings were withheld.") }
+    elseif ($summaryBody -cnotmatch '2 of 4 finding') { $failures.Add("The summary does not disclose that findings were withheld.") }
     else { Write-Host "  OK - the summary discloses how many findings were withheld" -ForegroundColor Green }
 
     Write-Host "[DRY-RUN] Self-check 14/$total : vote gating fails closed" -ForegroundColor Cyan
@@ -2857,17 +2893,13 @@ function Invoke-ReviewerDelivery {
 
     # -- Summary ---------------------------------------------------------------
     $summaryGate = Test-ReviewerShouldPostSummary -SummaryEnabled ([bool]$EnableSummaryComment) `
-        -AlreadyDelivered $SummaryAlreadyDelivered -CommentsEnabled ([bool]$EnableFindingComments) `
-        -PostFailures ([int]$outcome.PostFailures) -PostedCount ([int]$outcome.PostedCount) -PostableCount (@($Postable).Count)
+        -AlreadyDelivered $SummaryAlreadyDelivered
     if ($summaryGate.Resolved) {
         Write-Host "  ($($summaryGate.Reason))" -ForegroundColor DarkGray
         $outcome.SummaryPosted = $true
     }
-    elseif ($EnableSummaryComment -and -not $summaryGate.Post) {
-        Write-Warning "  the summary is not posted yet: $($summaryGate.Reason)."
-    }
     elseif ($summaryGate.Post) {
-        $summaryBody = Format-ReviewerSummaryComment -Summary $SummaryText -Counts $Counts -Reported $ReportedFindingCount -Posted $outcome.PostedCount
+        $summaryBody = Format-ReviewerSummaryComment -Summary $SummaryText -Counts $Counts -Reported $ReportedFindingCount -Publishable (@($Postable).Count)
         $summaryFingerprint = Get-ReviewerCommentFingerprint -Content $summaryBody
         if ($ExistingFingerprints.Contains($summaryFingerprint)) {
             Write-Host "  (the summary is already on the PR, not re-posted)" -ForegroundColor DarkGray
@@ -2885,9 +2917,13 @@ function Invoke-ReviewerDelivery {
         # "Posted" means the author can SEE everything the agent found. A
         # partially-posted review must not become a vote.
         $findingsVisible = ($EnableFindingComments -and $outcome.PostFailures -eq 0 -and $outcome.PostedCount -ge $ReportedFindingCount)
+        # A shortfall is only worth retrying when it is a DELIVERY gap. If every
+        # comment this run set out to post has landed, whatever is still missing
+        # was withheld on purpose and no retry will ever produce it.
+        $findingsRetryable = ([bool]$EnableFindingComments -and ($outcome.PostFailures -gt 0 -or $outcome.PostedCount -lt @($Postable).Count))
         $decision = Test-ReviewerShouldVote -RecommendedVote $RecommendedVote `
             -CriticalCount $Counts['critical'] -ImportantCount $Counts['important'] -SuggestionCount $Counts['suggestion'] `
-            -ReportedFindingCount $ReportedFindingCount -FindingsPosted $findingsVisible `
+            -ReportedFindingCount $ReportedFindingCount -FindingsPosted $findingsVisible -FindingsRetryable $findingsRetryable `
             -PrIsActive ((([string](Get-ReviewerHashValue -Container $freshness.Pr -Key 'status' -Default '')) -ieq 'active')) `
             -PrIsDraft ([bool](Get-ReviewerHashValue -Container $freshness.Pr -Key 'isDraft' -Default $false)) `
             -CurrentSourceCommit (Get-ReviewerSourceCommit -Pr $freshness.Pr) -ReviewedSourceCommit $SourceCommit

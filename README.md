@@ -182,17 +182,20 @@ Other properties worth knowing:
   finding that failed the first time would never be mentioned again. The plan is
   written to state *before* the first ADO call, so a crash mid-delivery leaves a
   retryable plan rather than an invisible partial review.
-- **The summary is withheld until the comments it counts have landed.** Its text
-  quotes how many findings were posted, so a summary written after a partial
-  attempt and one written after the retry are *different* comments that
-  fingerprint dedupe cannot collapse. It is deferred instead, and never written
-  twice for the same review. A summary-only run (no `-EnableFindingComments`)
-  posts immediately, since nothing it quotes is still moving.
-- **A vote declined for a reason this run can undo stays open.** Declining
-  because the findings did not post is retryable and leaves the vote unresolved;
-  declining because the commit's own facts forbid the vote - a stale commit, a
-  draft, or a recommendation the agent's own findings contradict - is final, so
-  the PR does not stay pending forever.
+- **The summary describes the review, not the delivery.** Its body quotes what
+  was found and how much of it is eligible to post - never how much actually
+  posted. That makes the body identical on a retry, so fingerprint dedupe
+  against the PR's own threads collapses it instead of adding a second,
+  differently-worded summary. An earlier design deferred the summary until the
+  comments landed; that had no terminal path, so one permanently unpostable
+  comment would have suppressed the summary forever.
+- **A vote declined for a reason a retry could fix stays open; every other
+  decline is final.** Only an actual comment-delivery gap - a failed post, or a
+  post that did not confirm at its anchor - leaves the vote unresolved. Findings
+  withheld on purpose, a run with comments switched off, a stale commit, a
+  draft, and a recommendation the agent's own findings contradict are all
+  permanent, so the plan is not retried forever over something no retry can
+  change.
 - **Nothing is written until the PR is re-read.** If the author pushed, or the
   PR became a draft or was completed while the model was running, the whole
   delivery is abandoned rather than partially applied.
