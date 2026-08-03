@@ -190,7 +190,10 @@ Other properties worth knowing:
   the PR's own threads collapses a re-post instead of adding a second,
   differently-worded summary. An earlier design deferred the summary until the
   comments landed; that had no terminal path, so one permanently unpostable
-  comment would have suppressed the summary forever.
+  comment would have suppressed the summary forever. The eligible count itself
+  comes from the **sealed** artifact, not from promotion's fresh re-scope of the
+  change set, which could otherwise legitimately shrink and render a different
+  body on a retry.
 - **A vote declined for a reason a retry could fix stays open; every other
   decline is final.** Only an actual comment-delivery gap - a failed post, or a
   post that did not confirm at its anchor - leaves the vote unresolved. Findings

@@ -1088,6 +1088,20 @@ function Test-ReviewerShouldVote {
     return @{ Vote = ""; Reason = "unrecognized recommendation" }
 }
 
+function Get-ReviewerPublishableCount {
+    <# The summary quotes how many findings are eligible to post. That number
+       must come from the SEALED artifact, never from the live re-scope, or the
+       body is not retry-stable after all: promotion re-reads the PR's change
+       set and re-scopes the approved manifest, which can legitimately drop an
+       entry, and a dropped entry would render a differently-worded summary that
+       fingerprint dedupe cannot collapse against the one already on the PR.
+       The approved manifest is covered by the artifact signature, so it cannot
+       be edited between two promotions without breaking the seal. #>
+    param([int]$SealedCount = -1, [int]$PostableCount = 0)
+    if ($SealedCount -ge 0) { return $SealedCount }
+    return $PostableCount
+}
+
 function Test-ReviewerShouldPostSummary {
     <# The summary body is retry-stable (see Format-ReviewerSummaryComment), so
        fingerprint dedupe against the PR's own threads is sufficient to make a
@@ -2090,6 +2104,23 @@ function Invoke-DryRunSelfChecks {
         $failures.Add("The summary body claims a delivery outcome, which changes between attempts and is not knowable when it is composed.")
         $summaryGateFailures++
     }
+    # The eligible count MUST come from the sealed artifact. Promotion re-reads
+    # the PR's change set and re-scopes the approved manifest, so deriving it
+    # from the live postable set would render a different body on a retry - the
+    # exact duplicate the stable body exists to prevent.
+    $rescoped = Format-ReviewerSummaryComment -Summary "s" -Counts $stableCounts -Reported 3 -Publishable 1
+    if ((Get-ReviewerCommentFingerprint -Content $rescoped) -ceq (Get-ReviewerCommentFingerprint -Content $bodyPartial)) {
+        $failures.Add("The summary body ignores the eligible count, so this check cannot prove the count must be sealed.")
+        $summaryGateFailures++
+    }
+    if ((Get-ReviewerPublishableCount -SealedCount 2 -PostableCount 1) -ne 2) {
+        $failures.Add("A sealed eligible count was overridden by the live re-scoped count, so a retry would post a second summary.")
+        $summaryGateFailures++
+    }
+    if ((Get-ReviewerPublishableCount -SealedCount -1 -PostableCount 4) -ne 4) {
+        $failures.Add("An original review did not fall back to its own postable count for the summary.")
+        $summaryGateFailures++
+    }
     $summaryCases = @(
         @{ Name = 'first delivery'; Enabled = $true; Already = $false; Post = $true; Resolved = $false }
         @{ Name = 'already delivered for this review'; Enabled = $true; Already = $true; Post = $false; Resolved = $true }
@@ -2828,7 +2859,11 @@ function Invoke-ReviewerDelivery {
         # attempt. Fingerprint dedupe against the PR's threads would catch a
         # re-post anyway (the body is retry-stable), but skipping the write
         # avoids a pointless ADO call when we already know it landed.
-        [bool]$SummaryAlreadyDelivered = $false
+        [bool]$SummaryAlreadyDelivered = $false,
+        # The sealed count of findings eligible to post, taken from the signed
+        # artifact on a promotion. -1 means "this is the original review", where
+        # the live postable set IS the sealed set.
+        [int]$SealedPublishableCount = -1
     )
     $outcome = @{
         PostedCount = 0; PostFailures = 0; SummaryPosted = $false
@@ -2903,7 +2938,8 @@ function Invoke-ReviewerDelivery {
         $outcome.SummaryPosted = $true
     }
     elseif ($summaryGate.Post) {
-        $summaryBody = Format-ReviewerSummaryComment -Summary $SummaryText -Counts $Counts -Reported $ReportedFindingCount -Publishable (@($Postable).Count)
+        $summaryBody = Format-ReviewerSummaryComment -Summary $SummaryText -Counts $Counts -Reported $ReportedFindingCount `
+            -Publishable (Get-ReviewerPublishableCount -SealedCount $SealedPublishableCount -PostableCount (@($Postable).Count))
         $summaryFingerprint = Get-ReviewerCommentFingerprint -Content $summaryBody
         if ($ExistingFingerprints.Contains($summaryFingerprint)) {
             Write-Host "  (the summary is already on the PR, not re-posted)" -ForegroundColor DarkGray
@@ -3350,6 +3386,16 @@ function Invoke-ReviewerPromotion {
     $storedMarkerObject = ([string]$signed.markerBody | ConvertFrom-Json)
     $storedNonce = [string](Get-ReviewerHashValue -Container $storedMarkerObject -Key 'nonce' -Default '')
     if (-not $storedNonce) { throw "Preview artifact carries no nonce; refusing to promote it." }
+    # The comment bodies this run renders come from THIS script's heading and
+    # footer. If the agent was upgraded since the artifact was sealed and those
+    # strings changed, a comment already on the PR would no longer fingerprint
+    # equal to the one about to be written, and dedupe would not collapse it.
+    $sealedScriptSha = [string](Get-ReviewerHashValue -Container $signed -Key 'scriptSha256' -Default '')
+    if ($sealedScriptSha -and $ScriptSelfSha256 -and ($sealedScriptSha -cne $ScriptSelfSha256)) {
+        Write-Warning ("This artifact was sealed by a different version of the reviewer. The manifest is intact, but if " +
+            "the comment heading or footer changed between the two versions, an already-posted comment may not be " +
+            "recognised as a duplicate. Re-run the reviewer if you would rather have a fresh artifact.")
+    }
     $maxItems = [int](Get-ReviewerHashValue -Container $signed -Key 'maxFindingItems' -Default $EffectiveMaxFindings)
     if ($maxItems -lt 1) { $maxItems = $EffectiveMaxFindings }
     $marker = ConvertFrom-AgentResultMarker -StdOutText ("$ResultMarkerPrefix " + [string]$signed.markerBody) `
@@ -3441,7 +3487,8 @@ function Invoke-ReviewerPromotion {
             -RecommendedVote ([string]$signed.approvedVote) `
             -ExistingFingerprints (Get-ReviewerExistingFingerprints -Threads $threads) `
             -ChangeSetKnown (@($changedPaths).Count -gt 0) `
-            -SummaryAlreadyDelivered ($priorApplies -and $priorSummary)
+            -SummaryAlreadyDelivered ($priorApplies -and $priorSummary) `
+            -SealedPublishableCount (@($approved).Count)
 
         $reviewedState = Get-JsonState -Path $reviewedStatePath
         $priorRecord = $null
