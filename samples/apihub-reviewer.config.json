@@ -1,0 +1,116 @@
+{
+  "schemaVersion": 1,
+  "provider": "AzureDevOps",
+  "platform": {
+    "os": "Windows",
+    "device": "DevBox",
+    "minimumPowerShellVersion": "7.0"
+  },
+  "repository": {
+    "organization": "msazure",
+    "project": "One",
+    "name": "AAPT-Antares-ApiHub",
+    "id": "f1273caf-04fb-422a-8e26-ddd91a06bd6d",
+    "targetBranchRef": "refs/heads/dev"
+  },
+  "customAgent": {
+    "name": "Squad",
+    "source": "repo"
+  },
+  "reviewPromptFile": "review-cycle.prompt.md",
+  "stateNamespace": "ApiHub",
+  "timing": {
+    "maxSourceCommitAgeDays": 14,
+    "futureCommitToleranceMinutes": 10,
+    "consecutiveFailureThreshold": 3
+  },
+  "commitIdContract": {
+    "algorithmName": "SHA-1",
+    "usageNote": "40-character hexadecimal identifier-format validation only (ADO commit IDs). Never used for any cryptographic guarantee.",
+    "hexLength": 40
+  },
+  "adoContract": {
+    "sourceCommitField": "lastMergeSourceCommit.commitId",
+    "commitLookupTool": "repo_search_commits"
+  },
+  "branchPolicy": {
+    "resetReviewerVotesOnSourcePush": true,
+    "note": "Requires the Azure DevOps branch policy 'Reset code reviewer votes when new changes are pushed' to be enabled on repository.targetBranchRef. When -EnableApprovalVote is used, the wrapper independently re-reads tracked approvals through Agency ADO MCP and fails closed (refuses to sign off / requires manual verification) if it cannot prove a stale approval was actually reset by this policy."
+  },
+  "teamsNotifications": {
+    "note": "Checked-in config alone NEVER enables Teams writes. The operator must also pass -EnableTeamsNotifications. Safe/disabled until teamId/channelId are intentionally populated. Webhook URLs/secrets are never stored here - only the NAME of an environment variable that holds one at runtime.",
+    "supportedEvents": ["startup", "shutdown", "reviewCompleted", "reviewFailed", "candidateStarved"],
+    "workIq": {
+      "command": "agency",
+      "subcommand": ["mcp", "workiq"],
+      "timeoutSeconds": 30,
+      "maxAttempts": 8,
+      "minBackoffSeconds": 30,
+      "maxBackoffSeconds": 1800
+    },
+    "channel": {
+      "enabled": false,
+      "teamId": "",
+      "channelId": "",
+      "events": []
+    },
+    "directAuthor": {
+      "enabled": true,
+      "events": ["reviewCompleted", "reviewFailed"]
+    },
+    "workflowsWebhook": {
+      "enabled": false,
+      "environmentVariableName": "",
+      "events": [],
+      "note": "Channel fallback only, never used for author DMs. Legacy Office 365 Connector webhooks are retired/unsupported; only a Teams Workflows (Power Automate) webhook host is accepted."
+    }
+  },
+  "permissions": {
+    "allowTools": [
+      "read",
+      "shell(git status:*)",
+      "ado(repo_pull_request)",
+      "ado(repo_pull_request_thread)",
+      "ado(repo_pull_request_thread_write)",
+      "ado(repo_search_commits)",
+      "ado(repo_repository)",
+      "ado(repo_file)",
+      "ado(repo_branch)",
+      "bluebird",
+      "web_search",
+      "web_fetch"
+    ],
+    "denyTools": [
+      "shell(git push:*)",
+      "shell(git fetch:*)",
+      "shell(srectl:*)",
+      "ado(pipelines_write)",
+      "ado(wit_work_item_write)",
+      "ado(wit_work_item_comment_write)",
+      "ado(wit_work_item_link_write)",
+      "ado(wit_work_item_attachment)",
+      "ado(work_capacity_write)",
+      "ado(work_iteration_write)",
+      "ado(repo_pull_request_write)"
+    ],
+    "localValidation": {
+      "allowTools": [
+        "shell(dotnet build:*)",
+        "shell(dotnet test:*)",
+        "shell(build.cmd:*)"
+      ],
+      "guidanceCommands": [
+        {
+          "description": "Full API Hub build, tests skipped (see AGENTS.md Build Quick Reference)",
+          "executable": "cmd.exe",
+          "arguments": ["/c", "build.cmd", "-p:SkipTests=true"]
+        },
+        {
+          "description": "Targeted rebuild of a single changed project (replace <ProjectPath> with the .csproj under review)",
+          "executable": "dotnet",
+          "arguments": ["build", "<ProjectPath>", "-p:LOCALDEBUG=true"]
+        }
+      ]
+    }
+  }
+}

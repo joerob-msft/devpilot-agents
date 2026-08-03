@@ -10,7 +10,7 @@ and binds the work, owns all state, performs every external write, and validates
 everything the model returns. The model never selects its own work and never
 writes to the PR host directly.
 
-> **Status: pilot.** One agent (`review-handler`) is implemented and running
+> **Status: pilot.** Two agents (`reviewer-agent`, `review-handler`) are implemented and running
 > against Azure DevOps. Interfaces will change.
 
 ---
@@ -39,7 +39,8 @@ marker. Anything else it prints is ignored.
 src/
   DevPilot.AgentHarness/     # the shared, provider-agnostic module
   Agents/
-    review-handler/          # an agent: script + prompt + fixtures
+    reviewer-agent/          # reviews other people's PRs
+    review-handler/          # answers feedback on your own PRs
 samples/                     # example configs for real repositories
 schema/                      # JSON Schema for consumer configs
 tools/                       # repo hygiene checks
