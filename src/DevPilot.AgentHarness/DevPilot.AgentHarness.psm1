@@ -678,6 +678,12 @@ function ConvertTo-AgentMarkerFieldValue {
             if ($items.Count -gt $maxItems) { return $bad }
             $itemSchema = $Spec.Item
             if ($null -eq $itemSchema) { return $bad }
+            # $itemSchema.Keys must be the DECLARED key list. PowerShell's
+            # hashtable adapter returns the 'Keys' entry when one exists, but
+            # falls back to the hashtable's own key collection when it does not -
+            # which would silently validate elements against ('Keys','Fields').
+            # Require both entries so a malformed schema fails closed.
+            if ($itemSchema -isnot [hashtable] -or -not $itemSchema.ContainsKey('Keys') -or -not $itemSchema.ContainsKey('Fields')) { return $bad }
             $itemKeys = @($itemSchema.Keys)
             $out = New-Object System.Collections.Generic.List[hashtable]
             foreach ($element in $items) {

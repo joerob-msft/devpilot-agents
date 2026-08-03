@@ -2105,6 +2105,26 @@ function Invoke-DryRunSelfChecks {
         $failures.Add("Change-entry extraction did not return exactly the changed FILE paths: got '$(@($shapeProbe) -join ', ')'.")
     }
     else { Write-Host "  OK - changed-file paths are extracted from the enveloped response and folders are ignored" -ForegroundColor Green }
+    # ADO's own collections are { count, value }, so the MCP server may nest the
+    # array a level deeper. Failing to descend yields no paths, which reads as
+    # "change set unknown" and blocks publication entirely.
+    $shapeCases = @(
+        @{ Name = 'bare array'; Response = @(@{ item = @{ path = '/a.cs' } }) },
+        @{ Name = 'changes/value'; Response = @{ changes = @{ count = 1; value = @(@{ item = @{ path = '/a.cs' } }) } } },
+        @{ Name = 'value only'; Response = @{ count = 1; value = @(@{ item = @{ path = '/a.cs' } }) } },
+        @{ Name = 'path without item'; Response = @{ changes = @(@{ path = '/a.cs' }) } },
+        @{ Name = 'many entries under value'; Response = @{ changes = @{ value = @(
+                        @{ item = @{ path = '/a.cs' } }, @{ item = @{ path = '/src'; isFolder = $true } }) } } }
+    )
+    foreach ($case in $shapeCases) {
+        $got = Get-ReviewerChangePathsFromResponse -Response $case.Response
+        if (@($got).Count -ne 1 -or @($got)[0] -cne '/a.cs') {
+            $failures.Add("Change-entry extraction failed for the '$($case.Name)' response shape, which would block publication: got '$(@($got) -join ', ')'.")
+        }
+    }
+    if ($failures.Count -eq 0 -or -not ($failures -match 'response shape')) {
+        Write-Host "  OK - the change set is found whether ADO wraps it, nests it, or returns it bare" -ForegroundColor Green
+    }
 
     # "Is this a preview?" must consider every write switch, or a summary-only
     # run tells the operator nothing will be posted and then posts.
@@ -2320,15 +2340,34 @@ function Get-ReviewerPullRequestThreads {
 function Get-ReviewerChangePathsFromResponse {
     <# Pure extraction of the changed-file paths from whatever shape the ADO MCP
        server returns for get_changes: a bare array of change entries, or an
-       envelope carrying one under changeEntries/changes/value. Kept separate
-       from the network call so the shape handling is covered by -DryRun. #>
+       envelope carrying one under changeEntries/changes/value, possibly nested
+       (ADO's own collections are { count, value }). Kept separate from the
+       network call so the shape handling is covered by -DryRun. #>
     param($Response)
+    # ADO commonly wraps collections as { count, value: [...] }, and the MCP
+    # server may wrap that again as { changes: { count, value: [...] } }. Walking
+    # only the top level would find a non-array under 'changes', wrap it as a
+    # one-element list, extract no path, and report the change set as unknown -
+    # which blocks publication. So unwrap until an actual array is in hand.
     $entries = @()
-    foreach ($key in @('changeEntries', 'changes', 'value')) {
-        $maybe = Get-ReviewerHashValue -Container $Response -Key $key
-        if ($maybe) { $entries = @($maybe); break }
+    $node = $Response
+    for ($depth = 0; $depth -lt 4; $depth++) {
+        if ($null -eq $node) { break }
+        # A node that names a file is a change entry, not another envelope.
+        if ($null -ne (Get-ReviewerHashValue -Container $node -Key 'item') -or
+            $null -ne (Get-ReviewerHashValue -Container $node -Key 'path')) { break }
+        $inner = $null
+        foreach ($key in @('changeEntries', 'changes', 'value')) {
+            $maybe = Get-ReviewerHashValue -Container $node -Key $key
+            if ($null -ne $maybe) { $inner = $maybe; break }
+        }
+        if ($null -eq $inner) { break }
+        # A single-element collection arrives here already unwrapped by
+        # PowerShell, so the wrapping below - not the type of $inner - is what
+        # makes one entry and many entries behave the same.
+        $node = $inner
     }
-    if ($entries.Count -eq 0) { $entries = @($Response) }
+    $entries = @($node)
     $paths = New-Object System.Collections.Generic.List[string]
     foreach ($c in $entries) {
         if ($null -eq $c) { continue }
