@@ -200,8 +200,11 @@ Other properties worth knowing:
   fingerprints equal to the one about to be written and would be posted twice.
   The manifest is still intact in that case, so the seal cannot catch it - the
   recorded `scriptSha256` does. `-AcceptArtifactFromDifferentAgentVersion`
-  overrides it; an unattended cycle instead abandons such a plan loudly and
-  reviews the PR again, so an upgrade cannot wedge the loop.
+  overrides it. An unattended cycle **skips** such a PR rather than replaying or
+  re-reviewing it: the plan is the only record of which findings still owe
+  delivery, so discarding it could lose one, and re-reviewing under a changed
+  comment format could duplicate one that already landed. A new commit
+  supersedes the plan naturally.
 - **A vote declined for a reason a retry could fix stays open; every other
   decline is final.** Only an actual comment-delivery gap - a failed post, or a
   post that did not confirm at its anchor - leaves the vote unresolved. Findings

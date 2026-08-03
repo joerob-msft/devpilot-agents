@@ -1092,6 +1092,23 @@ function Test-ReviewerShouldVote {
     return @{ Vote = ""; Reason = "unrecognized recommendation" }
 }
 
+function Get-ReviewerArtifactScriptSha {
+    <# The build identity lives INSIDE the signed manifest text, not on the
+       artifact envelope, so it has to be read through manifestJson. Reading the
+       envelope returns an empty string, and an empty string is deliberately
+       treated as "unknown build" - which would silently disable the version
+       gate entirely. Self-check 20 reads this back off a real file for exactly
+       that reason. #>
+    param([string]$Path)
+    try {
+        $envelope = (Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json)
+        $manifestText = [string](Get-ReviewerHashValue -Container $envelope -Key 'manifestJson' -Default '')
+        if (-not $manifestText) { return "" }
+        return [string](Get-ReviewerHashValue -Container ($manifestText | ConvertFrom-Json) -Key 'scriptSha256' -Default '')
+    }
+    catch { return "" }
+}
+
 function Test-ReviewerAgentVersionMatch {
     <# Comment text is rendered by the RUNNING script, not by the artifact, so
        replaying a plan sealed by another build can silently defeat duplicate
@@ -2632,6 +2649,7 @@ function Invoke-DryRunSelfChecks {
             artifactVersion  = 3
             createdAt        = ([DateTime]::UtcNow.ToString("o"))
             prId             = 77
+            scriptSha256     = 'deadbeefcafe'
             approvedSummary  = 'Looks fine.'
             approvedComments = @(@{ severity = 'critical'; filePath = '/a.cs'; line = 3; comment = 'Boom.' })
         }
@@ -2662,6 +2680,18 @@ function Invoke-DryRunSelfChecks {
         }
         if (Test-ReviewerArtifactSignature -ManifestJson $sealJson -Key $sealKey -Signature "") {
             $failures.Add("An artifact with no signature was accepted.")
+        }
+        # The build identity is INSIDE the signed manifest, not on the envelope.
+        # Reading the envelope returns "", which the version gate treats as an
+        # unknown build and therefore as a match - silently disabling the gate.
+        # That is exactly the bug this assertion exists to catch, and only a
+        # read back off a real file can catch it.
+        $sealedSha = Get-ReviewerArtifactScriptSha -Path $sealArtifactPath
+        if ($sealedSha -cne 'deadbeefcafe') {
+            $failures.Add("The agent build recorded in a written artifact read back as '$sealedSha'; the version gate would silently pass anything.")
+        }
+        if ((Get-ReviewerArtifactScriptSha -Path (Join-Path $sealDir "not-here.json")) -cne "") {
+            $failures.Add("Reading the build identity of a missing artifact did not return an empty string.")
         }
         Write-Host "  OK - a written artifact verifies after a round-trip, and any edit to it does not" -ForegroundColor Green
     }
@@ -3717,22 +3747,21 @@ function Invoke-ReviewerCycle {
             }
             if ($pendingPlan) {
                 # A plan sealed by an older build cannot be replayed safely (see
-                # Invoke-ReviewerPromotion), and an unattended cycle must not
-                # error on it forever. Abandon it loudly and review afresh -
-                # the same fallback used when the plan file has gone missing.
-                $planSha = ""
-                try { $planSha = [string](Get-ReviewerHashValue -Container (Get-Content -LiteralPath $pendingPlan -Raw -Encoding UTF8 | ConvertFrom-Json) -Key 'scriptSha256' -Default '') }
-                catch { $planSha = "" }
-                if (-not (Test-ReviewerAgentVersionMatch -SealedSha $planSha -RunningSha $ScriptSelfSha256)) {                    Write-Warning ("PR $prId has an unfinished delivery sealed by a different version of the reviewer; " +
-                        "replaying it could duplicate comments, so it is abandoned and the PR will be reviewed again. " +
-                        "Promote it manually with -AcceptArtifactFromDifferentAgentVersion if that is what you want.")
-                    if ($reviewedState.ContainsKey([string]$prId)) {
-                        $abandoned = $reviewedState[[string]$prId]
-                        $abandoned['deliveryPending'] = $false
-                        $reviewedState[[string]$prId] = $abandoned
-                        Set-JsonState -Path $reviewedStatePath -State $reviewedState
-                    }
-                    $pendingPlan = $null
+                # Invoke-ReviewerPromotion). It is NOT abandoned, though: the
+                # plan is the only record of which findings still owe delivery,
+                # and re-reviewing at the same commit could both LOSE one (a
+                # fresh model run is not deterministic) and DUPLICATE another
+                # (the changed format no longer fingerprints equal to what is
+                # already on the PR). The PR is skipped instead, loudly, and the
+                # rest of the queue continues. A new commit supersedes the plan
+                # naturally; an operator can still replay it deliberately.
+                if (-not (Test-ReviewerAgentVersionMatch -SealedSha (Get-ReviewerArtifactScriptSha -Path $pendingPlan) -RunningSha $ScriptSelfSha256)) {
+                    Write-Warning ("PR $prId has an unfinished delivery sealed by a different version of the reviewer. " +
+                        "Replaying it could duplicate comments and re-reviewing could lose a finding that never posted, " +
+                        "so this PR is skipped. Promote it deliberately with -PromoteArtifact '$pendingPlan' " +
+                        "-AcceptArtifactFromDifferentAgentVersion, or let a new commit supersede it.")
+                    [void]$retried.Add("PR $prId skipped (delivery plan sealed by another build)")
+                    continue
                 }
             }
             if ($pendingPlan) {
