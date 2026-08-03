@@ -197,6 +197,10 @@ param(
     # missing or no longer matches it. Off by default, because without that
     # document nothing can show that what is published is what a human read.
     [switch]$AcceptUnverifiablePreviewDocument,
+    # Promote an artifact sealed by a different build of this agent. Refused by
+    # default: comment text is rendered by the running script, so a format
+    # change between the two builds breaks duplicate detection.
+    [switch]$AcceptArtifactFromDifferentAgentVersion,
 
     [ValidateRange(5, 3600)]
     [int]$MinBackoffSeconds = 30,
@@ -1086,6 +1090,17 @@ function Test-ReviewerShouldVote {
         }
     }
     return @{ Vote = ""; Reason = "unrecognized recommendation" }
+}
+
+function Test-ReviewerAgentVersionMatch {
+    <# Comment text is rendered by the RUNNING script, not by the artifact, so
+       replaying a plan sealed by another build can silently defeat duplicate
+       detection. An absent sha on either side is treated as a match: it means
+       the identity is unknown, and refusing every artifact whose provenance
+       cannot be established would make the escape hatch the normal path. #>
+    param([string]$SealedSha = "", [string]$RunningSha = "")
+    if (-not $SealedSha -or -not $RunningSha) { return $true }
+    return ($SealedSha -ceq $RunningSha)
 }
 
 function Get-ReviewerPublishableCount {
@@ -2120,6 +2135,21 @@ function Invoke-DryRunSelfChecks {
     if ((Get-ReviewerPublishableCount -SealedCount -1 -PostableCount 4) -ne 4) {
         $failures.Add("An original review did not fall back to its own postable count for the summary.")
         $summaryGateFailures++
+    }
+    # Comment text is rendered by the RUNNING script, so replaying a plan sealed
+    # by another build can post a duplicate the fingerprint no longer matches.
+    $versionCases = @(
+        @{ Name = 'same build'; Sealed = 'aa'; Running = 'aa'; Expected = $true }
+        @{ Name = 'a different build'; Sealed = 'aa'; Running = 'bb'; Expected = $false }
+        @{ Name = 'case-different shas are different builds'; Sealed = 'aa'; Running = 'AA'; Expected = $false }
+        @{ Name = 'an artifact with no recorded build'; Sealed = ''; Running = 'aa'; Expected = $true }
+        @{ Name = 'a running script with no known sha'; Sealed = 'aa'; Running = ''; Expected = $true }
+    )
+    foreach ($case in $versionCases) {
+        if ((Test-ReviewerAgentVersionMatch -SealedSha $case.Sealed -RunningSha $case.Running) -ne $case.Expected) {
+            $failures.Add("The agent-version gate is wrong for '$($case.Name)': expected $($case.Expected).")
+            $summaryGateFailures++
+        }
     }
     $summaryCases = @(
         @{ Name = 'first delivery'; Enabled = $true; Already = $false; Post = $true; Resolved = $false }
@@ -3386,15 +3416,24 @@ function Invoke-ReviewerPromotion {
     $storedMarkerObject = ([string]$signed.markerBody | ConvertFrom-Json)
     $storedNonce = [string](Get-ReviewerHashValue -Container $storedMarkerObject -Key 'nonce' -Default '')
     if (-not $storedNonce) { throw "Preview artifact carries no nonce; refusing to promote it." }
-    # The comment bodies this run renders come from THIS script's heading and
-    # footer. If the agent was upgraded since the artifact was sealed and those
-    # strings changed, a comment already on the PR would no longer fingerprint
-    # equal to the one about to be written, and dedupe would not collapse it.
+    # Every comment this run writes - the summary and each finding - is rendered
+    # by THIS script's formatter, heading and footer. If the agent was upgraded
+    # since the artifact was sealed and any of that text changed, a comment
+    # already on the PR no longer fingerprints equal to the one about to be
+    # written, dedupe silently fails, and the retry of an interrupted delivery
+    # posts a duplicate. The manifest is intact in that case, so the seal cannot
+    # catch it - the script identity has to.
     $sealedScriptSha = [string](Get-ReviewerHashValue -Container $signed -Key 'scriptSha256' -Default '')
-    if ($sealedScriptSha -and $ScriptSelfSha256 -and ($sealedScriptSha -cne $ScriptSelfSha256)) {
-        Write-Warning ("This artifact was sealed by a different version of the reviewer. The manifest is intact, but if " +
-            "the comment heading or footer changed between the two versions, an already-posted comment may not be " +
-            "recognised as a duplicate. Re-run the reviewer if you would rather have a fresh artifact.")
+    if (-not (Test-ReviewerAgentVersionMatch -SealedSha $sealedScriptSha -RunningSha $ScriptSelfSha256)) {
+        if (-not $AcceptArtifactFromDifferentAgentVersion) {
+            throw ("This artifact was sealed by a different version of the reviewer (sealed " +
+                "$($sealedScriptSha.Substring(0, [Math]::Min(12, $sealedScriptSha.Length))), running " +
+                "$($ScriptSelfSha256.Substring(0, [Math]::Min(12, $ScriptSelfSha256.Length)))). The manifest is intact, " +
+                "but comment text is rendered by the running script, so a comment this artifact already posted may not " +
+                "be recognised as a duplicate and would be posted twice. Re-run the reviewer for a fresh artifact, or " +
+                "pass -AcceptArtifactFromDifferentAgentVersion if you know the comment format did not change.")
+        }
+        Write-Warning "This artifact was sealed by a different version of the reviewer; promoting it on the operator's explicit instruction. Watch for duplicated comments."
     }
     $maxItems = [int](Get-ReviewerHashValue -Container $signed -Key 'maxFindingItems' -Default $EffectiveMaxFindings)
     if ($maxItems -lt 1) { $maxItems = $EffectiveMaxFindings }
@@ -3674,6 +3713,26 @@ function Invoke-ReviewerCycle {
                     Write-Warning ("PR $prId has an unfinished delivery whose sealed plan is no longer on disk " +
                         "($([string](Get-ReviewerHashValue -Container $stale -Key 'artifactPath' -Default '<none>'))). " +
                         "It will be reviewed again, and a finding that failed to post earlier may not be reported again.")
+                }
+            }
+            if ($pendingPlan) {
+                # A plan sealed by an older build cannot be replayed safely (see
+                # Invoke-ReviewerPromotion), and an unattended cycle must not
+                # error on it forever. Abandon it loudly and review afresh -
+                # the same fallback used when the plan file has gone missing.
+                $planSha = ""
+                try { $planSha = [string](Get-ReviewerHashValue -Container (Get-Content -LiteralPath $pendingPlan -Raw -Encoding UTF8 | ConvertFrom-Json) -Key 'scriptSha256' -Default '') }
+                catch { $planSha = "" }
+                if (-not (Test-ReviewerAgentVersionMatch -SealedSha $planSha -RunningSha $ScriptSelfSha256)) {                    Write-Warning ("PR $prId has an unfinished delivery sealed by a different version of the reviewer; " +
+                        "replaying it could duplicate comments, so it is abandoned and the PR will be reviewed again. " +
+                        "Promote it manually with -AcceptArtifactFromDifferentAgentVersion if that is what you want.")
+                    if ($reviewedState.ContainsKey([string]$prId)) {
+                        $abandoned = $reviewedState[[string]$prId]
+                        $abandoned['deliveryPending'] = $false
+                        $reviewedState[[string]$prId] = $abandoned
+                        Set-JsonState -Path $reviewedStatePath -State $reviewedState
+                    }
+                    $pendingPlan = $null
                 }
             }
             if ($pendingPlan) {
