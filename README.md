@@ -42,9 +42,8 @@ src/
     reviewer-agent/          # reviews other people's PRs
     review-handler/          # answers feedback on your own PRs
 samples/                     # example configs for real repositories
-schema/                      # JSON Schema for consumer configs
 tools/                       # repo hygiene checks
-tests/                       # Pester tests
+docs/                        # how to add an agent
 ```
 
 **Consumers keep only a config file.** Nothing employer-, repository-, or

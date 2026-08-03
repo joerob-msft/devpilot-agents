@@ -487,33 +487,34 @@ $SensitiveEnvironmentVariables = @(
     "AZURE_DEVOPS_EXT_PAT",
     "SYSTEM_ACCESSTOKEN"
 )
-# Named variables alone were employer-specific and, worse, incomplete: a
-# consumer's own credential variable would have been passed straight through
-# to the child process. Matching credential-SHAPED names as well is both
-# generic and strictly stronger than any fixed list.
+# Deliberately NARROW. This list is applied to the Copilot child (see the
+# Invoke-TimedProcess call in the cycle below), and Copilot needs its own
+# GitHub credential to start at all - COPILOT_GITHUB_TOKEN / GH_TOKEN /
+# GITHUB_TOKEN must survive. So match only ADO PAT-shaped names here, which
+# covers a consumer's own "<SOMETHING>_ADO_PAT" without the employer-specific
+# literal this list used to carry.
+#
+# The broader credential-shaped scrub lives in Set-ReviewerVote.ps1, where the
+# child is `agency mcp ado` and has no business holding any token at all.
 $SensitiveEnvironmentVariablePatterns = @(
-    '_PAT$',
-    'ACCESSTOKEN',
-    '_TOKEN$',
-    'SECRET',
-    'PASSWORD',
-    'CLIENT_SECRET',
-    'APIKEY',
-    'API_KEY'
+    '_ADO_PAT$'
 )
 
 function Get-ReviewerSensitiveEnvironmentVariableNames {
     <#
-        Union of the explicitly named variables and anything whose NAME looks
-        like a credential. Case-insensitive: environment variable names are
-        case-insensitive on Windows, and a miss here leaks a secret.
+        Union of the explicitly named variables and any ADO PAT-shaped name
+        currently present in the environment. Case-insensitive: environment
+        variable names are case-insensitive on Windows, and a miss here leaks
+        a credential into the model's process.
     #>
-    param([Parameter(Mandatory)][System.Collections.IEnumerable]$CandidateNames)
+    param([AllowNull()][System.Collections.IEnumerable]$CandidateNames)
+    $names = if ($null -ne $CandidateNames) { @($CandidateNames) } else { @([Environment]::GetEnvironmentVariables("Process").Keys) }
     $matched = New-Object System.Collections.Generic.List[string]
-    foreach ($name in $CandidateNames) {
+    foreach ($n in $SensitiveEnvironmentVariables) { [void]$matched.Add($n) }
+    foreach ($name in $names) {
         if (-not $name) { continue }
         $n = [string]$name
-        if ($SensitiveEnvironmentVariables -contains $n) { [void]$matched.Add($n); continue }
+        if ($matched -contains $n) { continue }
         foreach ($pattern in $SensitiveEnvironmentVariablePatterns) {
             if ($n -imatch $pattern) { [void]$matched.Add($n); break }
         }
@@ -2679,7 +2680,7 @@ function Invoke-ReviewCycle {
     try {
         $procResult = Invoke-TimedProcess -FilePath $copilotCmd.Source -ArgumentList $copilotArgs `
             -StandardInputContent $stdinContent -CaptureStdOut -CaptureStdErr `
-            -WorkingDirectory $RepoPath -EnvironmentVariablesToRemove $SensitiveEnvironmentVariables `
+            -WorkingDirectory $RepoPath -EnvironmentVariablesToRemove (Get-ReviewerSensitiveEnvironmentVariableNames) `
             -TimeoutSeconds $CycleTimeoutSeconds
         $exitCode = $procResult.ExitCode
         $timedOut = $procResult.TimedOut
