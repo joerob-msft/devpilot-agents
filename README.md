@@ -40,6 +40,7 @@ src/
   DevPilot.AgentHarness/     # the shared, provider-agnostic module
   Agents/
     review-handler/          # an agent: script + prompt + fixtures
+    reviewer/                # an agent: script + prompt
 samples/                     # example configs for real repositories
 schema/                      # JSON Schema for consumer configs
 tools/                       # repo hygiene checks
@@ -82,7 +83,80 @@ must live inside that repository.
 | Agent | Watches | Does |
 |---|---|---|
 | `review-handler` | Your own open PRs | Finds reviewer feedback you have not answered, resumes the coding session where the code was written, makes the fix, replies, pushes, optionally requeues validation and sets auto-complete |
-| `reviewer` *(planned)* | Other people's PRs | Posts advisory findings, optionally signs off |
+| `reviewer` | Other people's PRs | Reviews the diff and reports findings; optionally posts them as PR comments and casts a non-blocking vote |
+
+### `reviewer` — a model with no write tools
+
+The reviewer inverts the usual arrangement. The model is granted **no write tool
+of any kind** — not even the PR-comment tool the `review-handler` uses, and not
+`shell`, since an argument-prefix grant like `shell(git diff:*)` still admits
+`git diff --output=<path>` and is therefore a file-writing primitive. The model
+returns its findings as *structured data* in the result marker, the schema
+bounds them, and the **wrapper** performs every write.
+
+What that does and does not buy you, stated precisely:
+
+- a successful prompt injection **cannot reach the host or the repository**:
+  there is no tool to edit a file, run a command, post a thread, or cast a vote;
+- everything the wrapper publishes is schema-bounded — severity is an enum, the
+  anchor is checked against the PR's real change set, comment text is length-
+  and character-limited, and the number of findings is capped;
+- **but the wrapper still publishes text the model wrote.** An injected model
+  cannot escape those bounds, and it can still emit a plausible, in-bounds
+  finding — or an empty one with `recommendedVote: approve`. Structural
+  validation cannot tell a genuine finding from a fabricated one.
+
+That last point is why the reviewer is preview-first, and why publishing a
+review you have actually read is a first-class mode rather than a re-run:
+
+```powershell
+# Offline validation
+./src/Agents/reviewer/Start-ReviewerAgent.ps1 -DryRun `
+    -ConfigFile <your-repo>/.github/copilot/agents/reviewer.config.json
+
+# 1. Preview one specific PR. Posts nothing; writes a .md to read and a .json beside it.
+./src/Agents/reviewer/Start-ReviewerAgent.ps1 -Once `
+    -ConfigFile <your-repo>/.github/copilot/agents/reviewer.config.json `
+    -OperatorAlias <your-alias> -PullRequestId 12345
+
+# 2. Read the .md. If you agree, publish EXACTLY that review - no second model run.
+./src/Agents/reviewer/Start-ReviewerAgent.ps1 `
+    -ConfigFile <your-repo>/.github/copilot/agents/reviewer.config.json `
+    -OperatorAlias <your-alias> `
+    -PromotePreview <state-dir>/previews/pr12345-<commit>-<stamp>.json `
+    -EnableFindingComments -EnableSummaryComment
+
+# Unattended alternative: review and post in one run. Faster, and nobody read it first.
+./src/Agents/reviewer/Start-ReviewerAgent.ps1 -Once `
+    -ConfigFile <your-repo>/.github/copilot/agents/reviewer.config.json `
+    -OperatorAlias <your-alias> -EnableFindingComments -EnableSummaryComment
+```
+
+`-PromotePreview` re-parses the stored review through the same schema that
+bounded it when it was produced, re-checks that it is bound to that PR and that
+exact commit, and re-reads the PR to confirm nothing moved — then posts. Running
+the agent twice, once to preview and once to post, does **not** give you this:
+the second run is an independent model run with a fresh nonce and may reach
+different conclusions.
+
+Other properties worth knowing:
+
+- **A preview does not consume the commit.** It is recorded as *not delivered*,
+  so you can still publish it. A delivered review closes that commit.
+- **Nothing is written until the PR is re-read.** If the author pushed, or the
+  PR became a draft or was completed while the model was running, the whole
+  delivery is abandoned rather than partially applied.
+- **Findings are anchored only inside the PR's change set.** A finding naming a
+  file this PR does not touch is withheld and shown in the preview, never
+  relocated to a PR-level comment.
+- **Scheduling is least-recently-reviewed first**, so a repository with more
+  open PRs than one cycle can review does not re-examine its newest few forever.
+- It can never cast a `Rejected` vote; it refuses to vote when the findings that
+  justify the vote were not posted; and a plain `Approved` requires *zero*
+  findings.
+
+Posted findings appear under **your** identity, since that is who the session is
+authenticated as. That is why every write is opt-in.
 
 ---
 
@@ -92,13 +166,17 @@ Non-negotiable, and enforced in code rather than prose:
 
 - **Code-defined tool ceiling.** Config can narrow it; nothing can widen it.
 - **Mandatory denies.** PR-write and pipeline-write are denied to the model
-  unconditionally — the wrapper performs those itself.
+  unconditionally — the wrapper performs those itself. The `reviewer` agent
+  extends this to *every* write, including PR comments, so the model it runs has
+  no write tool at all.
 - **Every mutating capability is a separate switch, defaulting OFF.** Pushing
   requires two independent flags.
 - **Protected branches** (`main`, `master`, `dev`, `release/*`) are rejected in
   the wrapper before push tooling is granted, not merely discouraged in a prompt.
-- **All PR text is untrusted input.** Comment bodies never reach the model as
-  instructions; it receives a structured metadata digest instead.
+- **All PR text is untrusted input.** Comment bodies are never interpolated into
+  the model's instructions; the prompt carries a structured metadata digest
+  instead. An agent that *chooses* to read a thread through a read tool gets
+  that text as tool output, which the prompt's ground rules classify as data.
 - **Writes are verified by re-reading state**, never by trusting a response —
   some hosts confirm writes in prose, and parsing that as JSON throws *after*
   the write has already landed.
@@ -125,6 +203,16 @@ See [`docs/adding-an-agent.md`](docs/adding-an-agent.md).
   requires a toolkit change and a security review — deliberately, since the
   ceiling is a security boundary.
 - **Telemetry is local JSONL.** Central aggregation and a dashboard are planned.
+- **An unattended `reviewer` posting run is not injection-proof.** The model
+  cannot write anything itself, but the wrapper publishes text the model wrote.
+  Schema validation bounds that text; it cannot establish that a finding is
+  genuine. Where that matters, preview and then `-PromotePreview` a review a
+  human has read.
+- **The reviewer judges from the diff.** It has no build, no tests and no
+  execution, deliberately — every build tool it gained would be a tool an
+  injected prompt could aim at the host. Whole classes of defect are therefore
+  outside what it can find, and it is an addition to human review, not a
+  replacement for it.
 
 ---
 

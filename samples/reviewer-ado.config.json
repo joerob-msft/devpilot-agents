@@ -1,0 +1,88 @@
+{
+  "schemaVersion": 1,
+  "provider": "AzureDevOps",
+  "platform": {
+    "os": "Windows",
+    "device": "DevBox",
+    "minimumPowerShellVersion": "7.0"
+  },
+  "repository": {
+    "note": "The repository this agent reviews pull requests in. This file lives IN that repository (typically .github/copilot/agents/reviewer.config.json), and its location is also what tells the agent where the repository root is.",
+    "organization": "contoso",
+    "project": "ExampleProject",
+    "name": "Example-Service",
+    "id": "11111111-1111-1111-1111-111111111111"
+  },
+  "customAgent": {
+    "note": "Empty name = no Agency custom agent. review-cycle.prompt.md IS the complete instruction set; loading an unrelated repo agent (for example a squad coordinator) on top of it makes the model adopt that persona and never emit a result marker.",
+    "name": "",
+    "source": ""
+  },
+  "promptFile": "review-cycle.prompt.md",
+  "stateNamespace": "ExampleService",
+  "operator": {
+    "note": "Default alias the agent runs AS. Its own pull requests are excluded from review. The -OperatorAlias wrapper parameter is authoritative and overrides this. Leave empty in a checked-in config so the repository does not name an individual.",
+    "defaultAlias": ""
+  },
+  "timing": {
+    "maxSourceCommitAgeDays": 14,
+    "consecutiveFailureThreshold": 3
+  },
+  "review": {
+    "note": "targetRefName scopes the agent to pull requests aimed at the mainline. maxFindings is the per-PR posting cap; the model is told the same number so it self-prioritizes instead of being truncated. postSeverities is what this repository is willing to have posted - findings at other severities are still reported in the preview file and counted in the summary.",
+    "targetRefName": "refs/heads/main",
+    "maxFindings": 8,
+    "postSeverities": [
+      "critical",
+      "important"
+    ],
+    "skipTitlePatterns": [
+      "WIP",
+      "DO NOT MERGE",
+      "DRAFT",
+      "[skip review]"
+    ]
+  },
+  "threadClassification": {
+    "note": "Identities whose comments are NOT human review feedback. Used only to build the metadata digest the model sees - comment text is never sent to the model, from any author.",
+    "botIdentitySubstrings": [
+      "PR Assistant",
+      "Policy Bot"
+    ],
+    "systemIdentitySubstrings": [
+      "Microsoft.VisualStudio.Services.TFS"
+    ]
+  },
+  "repoConventions": {
+    "note": "Injected into the agent's runtime context as DATA. Keeps repository-specific engineering rules OUT of the shared prompt, so the prompt - and the result-marker contract it defines - stays identical for every consumer.",
+    "conventionDocPaths": [
+      "AGENTS.md",
+      "docs/contributing.md"
+    ],
+    "customRules": "Public API changes require a corresponding entry in docs/api-changes.md. Prefer flagging a missing test over speculating about runtime behaviour the diff does not show."
+  },
+  "permissions": {
+    "note": "The wrapper's code-defined ceiling is read-only and this list may only NARROW it. Write tools - including ado(repo_pull_request_thread_write) and ado(repo_pull_request_write) - are mandatory denies that no config can grant: the model reports findings as structured data and the WRAPPER performs every write. shell(...) is rejected outright, even for commands that look read-only: `git diff --output=<path>` and `git log --output=<path>` write files, so no argument-prefix grant on a shell command is safe.",
+    "allowTools": [
+      "read",
+      "ado(repo_pull_request)",
+      "ado(repo_pull_request_thread)",
+      "ado(repo_search_commits)",
+      "ado(repo_repository)",
+      "ado(repo_file)",
+      "ado(repo_branch)",
+      "web_search",
+      "web_fetch"
+    ],
+    "denyTools": [
+      "shell(srectl:*)",
+      "ado(pipelines_write)",
+      "ado(wit_work_item_write)",
+      "ado(wit_work_item_comment_write)",
+      "ado(wit_work_item_link_write)",
+      "ado(wit_work_item_attachment)",
+      "ado(work_capacity_write)",
+      "ado(work_iteration_write)"
+    ]
+  }
+}

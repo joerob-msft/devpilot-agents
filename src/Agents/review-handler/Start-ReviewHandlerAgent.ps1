@@ -1303,14 +1303,14 @@ function Probe-Safe {
     return $other
 }
 '@ | Set-Content -LiteralPath $probePath -Encoding UTF8
-        $probeFindings = @(Test-HandlerValidatedParamRebind -ScriptPath @($probePath))
+        $probeFindings = @(Test-AgentValidatedParamRebind -ScriptPath @($probePath))
         if ($probeFindings.Count -ne 1) { $failures.Add("Rebind detector positive control found $($probeFindings.Count) issue(s), expected exactly 1 - the detector itself is broken.") }
         elseif ($probeFindings[0] -notmatch 'Probe-Bug') { $failures.Add("Rebind detector flagged the wrong function: $($probeFindings[0]).") }
         else { Write-Host "  OK - detector proven against a known-bad control (and ignores the safe case)" -ForegroundColor Green }
     }
     finally { Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue }
 
-    $realFindings = @(Test-HandlerValidatedParamRebind -ScriptPath @($PSCommandPath, $HarnessPath))
+    $realFindings = @(Test-AgentValidatedParamRebind -ScriptPath @($PSCommandPath, $HarnessPath))
     if ($realFindings.Count -gt 0) {
         foreach ($f in $realFindings) { $failures.Add("Validated parameter re-assigned: $f") }
     }
@@ -1502,69 +1502,6 @@ function Resolve-HandlerWorktree {
             "worktree or run the agent without -EnableCodeChanges.")
     }
     return (Resolve-Path -LiteralPath $wtPath).Path
-}
-
-function Test-HandlerValidatedParamRebind {
-    <#
-        Detects a PowerShell footgun: a parameter carrying a validation
-        attribute that is later re-assigned in the same scope. The attribute
-        stays bound to the VARIABLE, and variable names are case-INSENSITIVE, so
-
-            param([ValidateSet("pending","confirmed")][string]$State)
-            $state = Get-JsonState -Path $p     # same variable!
-
-        re-validates the hashtable against the ValidateSet and throws at
-        runtime. This shipped undetected in a sibling agent and silently broke
-        an entire code path, so it is checked mechanically here rather than by
-        review.
-    #>
-    param([Parameter(Mandatory)][string[]]$ScriptPath)
-    $attrNames = @('ValidateSet', 'ValidateRange', 'ValidatePattern', 'ValidateLength', 'ValidateScript', 'ValidateCount')
-    $findings = New-Object System.Collections.Generic.List[string]
-
-    foreach ($file in $ScriptPath) {
-        $parseErrors = $null; $parseTokens = $null
-        $ast = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path -LiteralPath $file).Path, [ref]$parseTokens, [ref]$parseErrors)
-        if (@($parseErrors).Count -gt 0) { continue }
-
-        $scopes = New-Object System.Collections.Generic.List[object]
-        [void]$scopes.Add([pscustomobject]@{ Label = '<script>'; ParamBlock = $ast.ParamBlock; Body = $ast })
-        foreach ($fn in $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
-            [void]$scopes.Add([pscustomobject]@{ Label = $fn.Name; ParamBlock = $fn.Body.ParamBlock; Body = $fn.Body })
-        }
-
-        foreach ($scope in $scopes) {
-            if (-not $scope.ParamBlock) { continue }
-            $validated = @{}
-            foreach ($p in $scope.ParamBlock.Parameters) {
-                $attrs = @($p.Attributes | Where-Object { $attrNames -contains $_.TypeName.Name })
-                if ($attrs.Count -gt 0) { $validated[$p.Name.VariablePath.UserPath.ToLowerInvariant()] = ($attrs | ForEach-Object { $_.TypeName.Name }) -join ',' }
-            }
-            if ($validated.Count -eq 0) { continue }
-
-            $assignments = $scope.Body.FindAll({
-                    param($a)
-                    $a -is [System.Management.Automation.Language.AssignmentStatementAst] -and
-                    $a.Left -is [System.Management.Automation.Language.VariableExpressionAst]
-                }, $true)
-            foreach ($asn in $assignments) {
-                $key = $asn.Left.VariablePath.UserPath.ToLowerInvariant()
-                if (-not $validated.ContainsKey($key)) { continue }
-                # An assignment inside a NESTED function is a different scope.
-                $node = $asn; $nested = $false
-                while ($node.Parent) {
-                    $node = $node.Parent
-                    if ($node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ne $scope.Label) { $nested = $true; break }
-                }
-                if ($nested) { continue }
-                [void]$findings.Add("$(Split-Path $file -Leaf) L$($asn.Extent.StartLineNumber) in $($scope.Label): `$$($asn.Left.VariablePath.UserPath) carries [$($validated[$key])] and is re-assigned")
-            }
-        }
-    }
-    # NOT `return ,$array`: for an EMPTY array that emits a single element which
-    # is itself the empty array, so callers see one bogus finding. Returning the
-    # array plainly emits zero elements when empty and N when populated.
-    return $findings.ToArray()
 }
 
 function Send-HandlerTeamsNotification {

@@ -85,6 +85,40 @@ Then parse it with `Get-AgentResultMarker`, which brace-matches the payload
 anywhere in the output, tolerates an identical marker repeated by streaming,
 and fails closed when two *different* markers appear.
 
+### Let the wrapper own the writes
+
+A marker field can be a scalar (`int`, `guid`, `exact`, `hex`, `hexOrNull`,
+`enum`, `bool`), a bounded `string`, or an `objectArray` — a bounded array of
+flat objects, each validated against its own `Keys`/`Fields` schema:
+
+```powershell
+findings = @{
+    Type     = 'objectArray'
+    MaxItems = 12
+    Item     = @{
+        Keys   = @('severity', 'filePath', 'line', 'comment')
+        Fields = @{
+            severity = @{ Type = 'enum'; Values = @('critical', 'important', 'suggestion') }
+            filePath = @{ Type = 'string'; MaxLength = 400; Pattern = '^/[^\\:*?"<>|]*$' }
+            line     = @{ Type = 'int'; Min = 0; Max = 1000000 }
+            comment  = @{ Type = 'string'; MaxLength = 1200 }
+        }
+    }
+}
+```
+
+`string` rejects every control character unless the field opts in with
+`AllowNewlines`, because this text usually ends up in a comment somewhere.
+
+`objectArray` exists so an agent can return *structured results the wrapper acts
+on itself*, and that is worth reaching for deliberately. The `reviewer` agent
+uses it to avoid granting the model any write tool at all: the model reports
+findings, the schema bounds them, and the wrapper posts them. The payoff is that
+a preview run and a real run are the same code path with the same model
+privileges — so a preview is a faithful rehearsal — and a prompt injection has
+no write tool to hijack. If your agent's output *is* data, prefer this over
+handing the model a write tool and asking it nicely.
+
 ## 3. Self-checks
 
 Every agent ships a `-DryRun` suite that runs with no network, no host, and no
