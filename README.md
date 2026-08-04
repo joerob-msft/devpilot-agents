@@ -228,6 +228,26 @@ Other properties worth knowing:
   justify the vote were not posted; and a plain `Approved` requires *zero*
   findings.
 
+#### Optional convention-specialist discovery
+
+Repositories with path-gated convention packs can opt into a separate
+discovery-only pass:
+
+```powershell
+./src/Agents/reviewer/Start-ReviewerAgent.ps1 -Once `
+    -ConfigFile <your-repo>/.github/copilot/agents/reviewer.config.json `
+    -OperatorAlias <your-alias> -PullRequestId 12345 `
+    -EnableConventionSpecialist -ConventionSpecialistModel claude-opus-5
+```
+
+The model must be named explicitly on the CLI or in
+`review.conventionSpecialistModel`; there is no default. This specialist receives
+sealed deterministic facts and commit/hash-verified matched convention sources,
+not either generalist's output. Its strict `CONVENTION_REVIEW_RESULT_V1`
+candidates are stored in separate sealed previews and are not merged, posted, or
+used for voting. Failures are recorded as degraded specialist diagnostics without
+changing the generalist review.
+
 #### Authoritative repository-source transport
 
 `repoConventions.authoritativeSources` is an optional, versioned transport for

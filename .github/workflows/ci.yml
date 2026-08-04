@@ -132,3 +132,7 @@ jobs:
       - name: deterministic review-fact schema and replay checks
         shell: pwsh
         run: ./tools/Test-ReviewFacts.ps1
+
+      - name: convention-specialist isolation and schema checks
+        shell: pwsh
+        run: ./tools/Test-ConventionSpecialist.ps1
