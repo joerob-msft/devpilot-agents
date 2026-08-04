@@ -242,6 +242,20 @@ Assert-ConventionThrows {
         -AuthoritativeSourcePolicy (ConvertTo-TestSourcePolicy -RawSources $negative.authoritativeSources)
 } "An empty convention pack list was accepted."
 
+$negative = Copy-ConventionObject $raw
+$negative.packs[0].authoritativeSourceRefs = @()
+$negative.packs[0].repositorySources = @(@{ path = "/docs/shared.md"; maxBytes = 512 })
+$negative.packs[0].maxBytes = 4096
+$conflictingLocal = Copy-ConventionObject $negative.packs[0]
+$conflictingLocal.name = "conflicting-local-cap"
+$conflictingLocal.changedPathGlobs = @("test/**/*.cs")
+$conflictingLocal.repositorySources[0].maxBytes = 1024
+$negative.packs = @($negative.packs[0], $conflictingLocal)
+Assert-ConventionThrows {
+    ConvertTo-ReviewerConventionPackPolicy -RawPolicy $negative `
+        -AuthoritativeSourcePolicy (ConvertTo-TestSourcePolicy -RawSources $negative.authoritativeSources)
+} "Conflicting cross-pack maxBytes for one repository source was deferred to runtime."
+
 $orderingRaw = Copy-ConventionObject $raw
 $second = Copy-ConventionObject $orderingRaw.packs[0]
 $orderingRaw.packs[0].name = "z-pack"
@@ -296,6 +310,17 @@ $plan = New-ReviewerConventionContextPlan -Policy $policy -Selection $selection 
     -AuthoritativeSnapshots @($snapshot) -RepositorySnapshots @() `
     -ScriptSha256 ("e" * 64) -ConfigSha256 ("f" * 64)
 $exactPackBytes = [int]$plan.selectedPacks[0].contextBytes
+$manyEntries = ConvertTo-ReviewerConventionChangeSet -Response (ConvertTo-TestChangeResponse -Paths @(
+        1..100 | ForEach-Object { "/src/Feature$_.cs" }
+    ))
+$manySelection = Select-ReviewerConventionPacks -Policy $policy -ChangeEntries $manyEntries
+$manyPlan = New-ReviewerConventionContextPlan -Policy $policy -Selection $manySelection -Binding $binding `
+    -AuthoritativeSnapshots @($snapshot) -RepositorySnapshots @() `
+    -ScriptSha256 ("e" * 64) -ConfigSha256 ("f" * 64)
+Assert-ConventionTest ($manyPlan.selectedPacks[0].contextBytes -eq $exactPackBytes) `
+    "Matched-path evidence incorrectly consumed source convention context bytes."
+Assert-ConventionTest ($manyPlan.selectedPacks[0].routingEvidenceBytes -gt $plan.selectedPacks[0].routingEvidenceBytes) `
+    "Routing evidence growth was not reported separately from convention context."
 $policy.Packs[0].MaxBytes = $exactPackBytes
 [void](New-ReviewerConventionContextPlan -Policy $policy -Selection $selection -Binding $binding `
         -AuthoritativeSnapshots @($snapshot) -RepositorySnapshots @() `

@@ -281,12 +281,14 @@ from a twice-checked target-branch commit, never from author-controlled PR sourc
 content.
 
 Each pack's `maxBytes` covers decoded source bytes plus the exact serialized
-matching/provenance descriptor. The code-defined total convention-context cap is
-131072 bytes. Exceeding either cap fails that PR's plan closed before its model
-launch; no source or rule is silently truncated. The saved plan records selected
-and withheld packs, matched paths and globs, source trust tiers, repository/path/
-ref/commit/hash/MIME/byte provenance, the pinned change-set digest, and exact byte
-counts. See [docs/convention-packs.md](docs/convention-packs.md) and the
+source-provenance descriptor. Matched-path/glob routing evidence is persisted and
+byte-counted separately, not treated as convention context. The code-defined
+total convention-context cap is 131072 bytes. Exceeding either context cap fails
+that PR's plan closed before its model launch; no source or rule is silently
+truncated. The saved plan records selected and withheld packs, matched paths and
+globs, source trust tiers, repository/path/ref/commit/hash/MIME/byte provenance,
+the pinned change-set digest, and exact byte counts. See
+[docs/convention-packs.md](docs/convention-packs.md) and the
 preview-only `samples/azureux-bpm-convention-packs.preview.json` replay profile.
 
 Posted findings appear under **your** identity, since that is who the session is

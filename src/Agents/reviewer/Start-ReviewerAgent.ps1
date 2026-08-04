@@ -1795,6 +1795,10 @@ if ($Organization -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { throw "Resolved Or
 if (@($AuthoritativeSourcePolicy.Sources | Where-Object { $_.Organization -cne $Organization }).Count -gt 0) {
     throw "Resolved Organization '$Organization' does not match the configured authoritative-source organization."
 }
+if ($ConventionPackPolicy -and
+    @($ConventionPackPolicy.AuthoritativeSourcePolicy.Sources | Where-Object { $_.Organization -cne $Organization }).Count -gt 0) {
+    throw "Resolved Organization '$Organization' does not match the configured convention-pack source organization."
+}
 if (-not $PSBoundParameters.ContainsKey('RepositoryName')) { $RepositoryName = $cfgRepoName }
 if ($RepositoryName -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { throw "Resolved RepositoryName '$RepositoryName' is not a safe ADO repo name." }
 if (-not $PSBoundParameters.ContainsKey('ExpectedProject')) { $ExpectedProject = $cfgProject }

@@ -45,14 +45,15 @@
         }
       ],
       "contentBytes": 7,
-      "provenanceBytes": 547,
-      "contextBytes": 554,
-      "maxBytes": 554,
+      "provenanceBytes": 436,
+      "routingEvidenceBytes": 112,
+      "contextBytes": 443,
+      "maxBytes": 443,
       "status": "selected",
       "reason": ""
     }
   ],
   "withheldPacks": [],
-  "totalContextBytes": 554,
-  "maxTotalBytes": 554
+  "totalContextBytes": 443,
+  "maxTotalBytes": 443
 }

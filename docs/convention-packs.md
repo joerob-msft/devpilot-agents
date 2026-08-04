@@ -107,11 +107,14 @@ stable target-branch commit. Plans label these tiers `pinned-external` and
 
 `maxBytes` is not a text-only allowance. It includes every selected source's
 decoded bytes plus the exact compact JSON descriptor containing the pack name,
-priority, matched paths/globs, and source provenance. Startup rejects a cap that
-cannot fit declared source maxima plus minimum required provenance. Runtime uses
-actual bytes and rejects a one-byte overflow. The total convention-context cap is
-code-defined at 131072 bytes and cannot be widened by config. Per-pack and total
-accounting conservatively charge a reused source to each selected pack.
+priority, and source provenance. Routing evidence (matched paths and globs) is
+persisted and byte-counted separately because it identifies why context was
+selected; it is not convention context and cannot consume or bypass a source
+context cap. Startup rejects a cap that cannot fit declared source maxima plus
+minimum required provenance. Runtime uses actual bytes and rejects a one-byte
+overflow. The total convention-context cap is code-defined at 131072 bytes and
+cannot be widened by config. Per-pack and total accounting conservatively charge
+a reused source to each selected pack.
 
 No rule is truncated. A cap or deterministic provenance failure writes a
 structured failed plan, increments that PR's bounded failure count, prevents that

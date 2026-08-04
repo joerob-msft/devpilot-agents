@@ -435,6 +435,7 @@ function ConvertTo-ReviewerConventionPackPolicy {
     $names = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $definitions = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $usedSourceNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $repositorySourceCaps = [System.Collections.Generic.Dictionary[string, int]]::new([StringComparer]::OrdinalIgnoreCase)
     for ($index = 0; $index -lt $items.Count; $index++) {
         $item = $items[$index]
         $where = "config.repoConventions.conventionPacks.packs[$index]"
@@ -484,6 +485,10 @@ function ConvertTo-ReviewerConventionPackPolicy {
             if (-not $localSeen.Add($path)) { throw "$localWhere.path '$path' duplicates an earlier repository source." }
             $sourceMaxBytes = Get-ReviewerConventionStrictInt -Object $local -Name "maxBytes" -Where $localWhere `
                 -Min 1 -Max $script:ReviewerConventionMaxPackBytes
+            if ($repositorySourceCaps.ContainsKey($path) -and $repositorySourceCaps[$path] -ne $sourceMaxBytes) {
+                throw "$localWhere.maxBytes conflicts with another pack's cap for repository source '$path'."
+            }
+            $repositorySourceCaps[$path] = $sourceMaxBytes
             [void]$localSources.Add(@{ Path = $path; MaxBytes = $sourceMaxBytes })
         }
         if ($sourceRefs.Count + $localSources.Count -eq 0) {
@@ -523,11 +528,9 @@ function ConvertTo-ReviewerConventionPackPolicy {
                 })
         }
         $minimalDescriptor = [ordered]@{
-            name         = $name
-            priority     = $priority
-            matchedPaths = @("x")
-            matchedGlobs = @($globs[0])
-            sources      = $minimalSources.ToArray()
+            name     = $name
+            priority = $priority
+            sources  = $minimalSources.ToArray()
         }
         $minimumProvenanceBytes = $script:ReviewerConventionUtf8.GetByteCount(($minimalDescriptor | ConvertTo-Json -Depth 8 -Compress))
         if ($declaredContentBytes + $minimumProvenanceBytes -gt $maxBytes) {
@@ -688,14 +691,15 @@ function New-ReviewerConventionContextPlan {
                     path = $_.path; role = $_.role; changeTypes = @($_.changeTypes); globs = @($_.globs)
                 }
             })
-        $descriptor = [ordered]@{
-            name         = $pack.Name
-            priority     = [int]$pack.Priority
-            matchedPaths = $matchedPaths
-            sources      = $resolved.ToArray()
+        $contextDescriptor = [ordered]@{
+            name     = $pack.Name
+            priority = [int]$pack.Priority
+            sources  = $resolved.ToArray()
         }
-        $descriptorJson = $descriptor | ConvertTo-Json -Depth 10 -Compress
-        $provenanceBytes = $script:ReviewerConventionUtf8.GetByteCount($descriptorJson)
+        $contextDescriptorJson = $contextDescriptor | ConvertTo-Json -Depth 10 -Compress
+        $provenanceBytes = $script:ReviewerConventionUtf8.GetByteCount($contextDescriptorJson)
+        $routingEvidenceJson = ([ordered]@{ matchedPaths = $matchedPaths } | ConvertTo-Json -Depth 10 -Compress)
+        $routingEvidenceBytes = $script:ReviewerConventionUtf8.GetByteCount($routingEvidenceJson)
         $contentBytes = [int](($resolved | Measure-Object -Property byteLength -Sum).Sum)
         $packBytes = $provenanceBytes + $contentBytes
         if ($packBytes -gt [int]$pack.MaxBytes) {
@@ -712,6 +716,7 @@ function New-ReviewerConventionContextPlan {
                 sources         = $resolved.ToArray()
                 contentBytes    = $contentBytes
                 provenanceBytes = $provenanceBytes
+                routingEvidenceBytes = $routingEvidenceBytes
                 contextBytes    = $packBytes
                 maxBytes        = [int]$pack.MaxBytes
                 status          = "selected"
