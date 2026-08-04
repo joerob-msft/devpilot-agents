@@ -5782,7 +5782,7 @@ function Get-ReviewerVerificationSourceHunks {
             }
             $normalizedPath = (ConvertTo-ReviewerVerificationPath -Path (
                     [string]$candidate.filePath)).TrimStart("/")
-            $path = $normalizedPath
+            $path = ConvertTo-ReviewerVerificationReadPath -Path ([string]$candidate.filePath)
             $segments = @($normalizedPath -split '/')
             if (-not $changed.Contains($normalizedPath) -or
                 $normalizedPath -notmatch '^[a-z0-9._ /-]+$' -or
@@ -5790,11 +5790,11 @@ function Get-ReviewerVerificationSourceHunks {
                 continue
             }
             try {
-                if (-not $fileCache.ContainsKey($path)) {
-                    $fileCache[$path] = Get-ReviewerFactSourceFile -Session $verificationSession `
+                if (-not $fileCache.ContainsKey($normalizedPath)) {
+                    $fileCache[$normalizedPath] = Get-ReviewerFactSourceFile -Session $verificationSession `
                         -Path $path -SourceCommit $SourceCommit -MaxBytes 131072
                 }
-                $content = [string]$fileCache[$path].Content
+                $content = [string]$fileCache[$normalizedPath].Content
                 $lines = @($content.Replace("`r`n", "`n").Replace("`r", "`n") -split "`n")
                 $line = [int]$candidate.line
                 if ($line -gt $lines.Count) { continue }

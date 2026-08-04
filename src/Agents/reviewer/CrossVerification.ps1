@@ -291,11 +291,20 @@ function ConvertTo-ReviewerVerificationPath {
     param([AllowEmptyString()][string]$Path = "")
     $value = $Path.Trim().Replace('\', '/')
     if (-not $value) { return "" }
-    while ($value.StartsWith("./", [StringComparison]::Ordinal)) {
+    if ($value.StartsWith("./", [StringComparison]::Ordinal)) {
         $value = $value.Substring(2)
     }
     if (-not $value.StartsWith("/", [StringComparison]::Ordinal)) { $value = "/$value" }
     return $value.TrimEnd('/').ToLowerInvariant()
+}
+
+function ConvertTo-ReviewerVerificationReadPath {
+    param([AllowEmptyString()][string]$Path = "")
+    $value = $Path.Trim().Replace('\', '/')
+    if ($value.StartsWith("./", [StringComparison]::Ordinal)) {
+        $value = $value.Substring(2)
+    }
+    return $value.TrimStart("/")
 }
 
 function Get-ReviewerVerificationTokens {

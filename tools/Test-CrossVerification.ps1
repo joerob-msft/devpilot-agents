@@ -236,6 +236,12 @@ foreach ($pathVariant in @("src/a.cs", "./src/a.cs", "\src\a.cs", " /src/a.cs ")
     Assert-Verification ((ConvertTo-ReviewerVerificationPath -Path $pathVariant) -ceq "/src/a.cs") `
         "Verification path normalization diverged for '$pathVariant'."
 }
+Assert-Verification ((ConvertTo-ReviewerVerificationPath -Path "././src/a.cs") -ceq "/./src/a.cs") `
+    "Verification comparison path diverged from baseline repeated-dot semantics."
+Assert-Verification ((ConvertTo-ReviewerVerificationReadPath `
+        -Path " ./Tools/Scripts/Test-ConfigSpecSettingsOrder.ps1 ") -ceq
+    "Tools/Scripts/Test-ConfigSpecSettingsOrder.ps1") `
+    "Verification source reads no longer preserve original path casing."
 $relativePathCandidate = Copy-VerificationObject $exactCandidates[0]
 $relativePathCandidate.filePath = "src/a.cs"
 $dotPathCandidate = Copy-VerificationObject $exactCandidates[1]
@@ -921,6 +927,12 @@ foreach ($emptyArrayParameter in @(
             '\[AllowEmptyCollection\(\)\]\[object\[\]\]\$' + [regex]::Escape($emptyArrayParameter))) `
         "Verifier model-run parameter '$emptyArrayParameter' rejects a valid empty array."
 }
+$sourceHunkText = Get-VerificationFunctionText -Text $wrapperText `
+    -Name "Get-ReviewerVerificationSourceHunks"
+Assert-Verification ($sourceHunkText -match 'ConvertTo-ReviewerVerificationReadPath' -and
+    $sourceHunkText -match '\$fileCache\[\$normalizedPath\]' -and
+    $sourceHunkText -match '-Path\s+\$path') `
+    "Source-hunk reads do not separate normalized cache identity from case-preserving request paths."
 foreach ($forbiddenName in @(
         "reviewedStatePath", "attemptsStatePath", "Set-JsonState", "Invoke-ReviewerDelivery",
         "Add-ReviewerThread", "Set-ReviewerVote", "EnableFindingComments", "EnableSummaryComment",
