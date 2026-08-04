@@ -453,9 +453,9 @@ $input = New-ReviewerConventionSpecialistInput -PromptText $prompt -Nonce "nonce
     -ChangeEntries $changes -ThreadDigestText "- no existing threads"
 Assert-Specialist ($input.Bytes -eq $script:ReviewerConventionSpecialistUtf8.GetByteCount($input.Text) -and
     $input.Bytes -le $script:ReviewerConventionSpecialistMaxInputBytes) "Specialist input byte accounting drifted."
-$generalistCanary = "GENERALIST-OUTPUT-CANARY-8D3D2A"
-Assert-Specialist ($input.Text.IndexOf($generalistCanary, [StringComparison]::Ordinal) -lt 0) `
-    "Specialist input unexpectedly contained a generalist-output canary."
+Assert-Specialist ($input.Text.Contains('```json', [StringComparison]::Ordinal) -and
+    $input.Text.EndsWith('```' + "`n", [StringComparison]::Ordinal)) `
+    "Specialist runtime data is not enclosed by the intended JSON fence."
 $inputBuilderText = Get-FunctionText -Text ([IO.File]::ReadAllText(
         (Join-Path $repoRoot "src\Agents\reviewer\ConventionSpecialist.ps1"))) `
     -Name "New-ReviewerConventionSpecialistInput"
@@ -517,12 +517,22 @@ try {
         artifactVersion = 1
         status = "complete"
         candidates = @($candidate)
+        emptyProbe = @()
     }
     $previewPath = Save-ReviewerConventionSpecialistPreview -Directory $tempDir `
         -BaseName "preview" -Manifest $manifest -MasterKey $masterKey
     $roundTripPreview = Read-ReviewerConventionSpecialistPreview -Path $previewPath -MasterKey $masterKey
     Assert-Specialist ([string]$roundTripPreview.kind -ceq $script:ReviewerConventionSpecialistArtifactKind) `
         "Sealed specialist preview did not round-trip."
+    $previewEnvelope = [IO.File]::ReadAllText(
+        $previewPath, $script:ReviewerConventionSpecialistUtf8) | ConvertFrom-Json
+    $previewManifest = [string]$previewEnvelope.manifestJson | ConvertFrom-Json -Depth 32
+    Assert-Specialist ($previewManifest.candidates -is [System.Object[]] -and
+        @($previewManifest.candidates).Count -eq 1) `
+        "A one-candidate sealed specialist manifest did not preserve its array shape."
+    Assert-Specialist ($previewManifest.emptyProbe -is [System.Object[]] -and
+        @($previewManifest.emptyProbe).Count -eq 0) `
+        "An empty array in the sealed specialist manifest collapsed to null."
     $planKey = Get-ReviewerConventionSpecialistDomainKey -MasterKey $masterKey -Domain plan
     $previewKey = Get-ReviewerConventionSpecialistDomainKey -MasterKey $masterKey -Domain preview
     Assert-Specialist (-not [Security.Cryptography.CryptographicOperations]::FixedTimeEquals($planKey, $previewKey)) `
@@ -618,15 +628,21 @@ $pullRequestFunction = Get-FunctionText -Text $wrapperText -Name "Invoke-Reviewe
 $deliveryAt = $pullRequestFunction.IndexOf("Invoke-ReviewerDelivery", [StringComparison]::Ordinal)
 $stateAt = $pullRequestFunction.LastIndexOf("Set-JsonState -Path `$reviewedStatePath", [StringComparison]::Ordinal)
 $exitAt = $pullRequestFunction.IndexOf("`$exit = if", [StringComparison]::Ordinal)
-$specialistAt = $pullRequestFunction.IndexOf("Invoke-ReviewerConventionSpecialistPass", [StringComparison]::Ordinal)
+$specialistAt = $pullRequestFunction.LastIndexOf("Invoke-ReviewerConventionSpecialistSafely", [StringComparison]::Ordinal)
 Assert-Specialist ($specialistAt -gt $deliveryAt -and $specialistAt -gt $stateAt -and $specialistAt -gt $exitAt) `
     "Specialist execution can run before generalist delivery, state, or exit is finalized."
+$safeInvokerText = Get-FunctionText -Text $wrapperText -Name "Invoke-ReviewerConventionSpecialistSafely"
 Assert-Specialist ($passText -match '\[AllowEmptyString\(\)\]\[string\]\$ConventionPlanPath' -and
     $passText -match '\[AllowEmptyString\(\)\]\[string\]\$FactPlanPath' -and
-    $pullRequestFunction -match 'Convention specialist escaped its degradation boundary') `
+    $safeInvokerText -match 'Convention specialist escaped its degradation boundary') `
     "Empty plan paths or an escaped specialist failure can still abort the generalist cycle."
 Assert-Specialist ($passText -match '65536' -and $passText -match 'Write-ReviewerConventionSpecialistPreview') `
     "Specialist pass no longer enforces its output cap or persists degraded previews."
+$zeroPassAt = $pullRequestFunction.IndexOf('if ($completedPasses.Count -eq 0)', [StringComparison]::Ordinal)
+$mergeFailureAt = $pullRequestFunction.IndexOf('if (-not $mergedRoundTrip)', [StringComparison]::Ordinal)
+$specialistCalls = [regex]::Matches($pullRequestFunction, 'Invoke-ReviewerConventionSpecialistSafely').Count
+Assert-Specialist ($zeroPassAt -ge 0 -and $mergeFailureAt -ge 0 -and $specialistCalls -eq 3) `
+    "Specialist discovery is not preserved across both generalist failure returns and the success path."
 Assert-Specialist ($wrapperText -match '\$EffectiveConventionSpecialistModel\s*=\s*""' -and
     $wrapperText -match '-EnableConventionSpecialist requires an explicit') `
     "Specialist model selection gained an implicit default."

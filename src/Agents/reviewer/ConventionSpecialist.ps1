@@ -45,9 +45,59 @@ function Get-ReviewerConventionSpecialistSha256 {
     finally { $sha.Dispose() }
 }
 
+function ConvertTo-ReviewerConventionSpecialistCanonicalJson {
+    param($Value, [int]$Depth = 0)
+    if ($Depth -gt 32) { throw "Convention specialist canonical JSON exceeded the maximum object depth of 32." }
+    if ($null -eq $Value) { return "null" }
+    if ($Value -is [bool]) { return $(if ($Value) { "true" } else { "false" }) }
+    if ($Value -is [byte] -or $Value -is [sbyte] -or $Value -is [int16] -or
+        $Value -is [uint16] -or $Value -is [int32] -or $Value -is [uint32] -or
+        $Value -is [int64] -or $Value -is [uint64] -or $Value -is [single] -or
+        $Value -is [double] -or $Value -is [decimal]) {
+        return [Convert]::ToString($Value, [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($Value -is [string]) {
+        [void]$script:ReviewerConventionSpecialistUtf8.GetByteCount($Value)
+        return ConvertTo-Json -InputObject $Value -Compress
+    }
+    if ($Value -is [System.Collections.IDictionary] -or
+        $Value -is [System.Management.Automation.PSCustomObject]) {
+        $names = [System.Collections.Generic.List[string]]::new()
+        if ($Value -is [System.Collections.IDictionary]) {
+            foreach ($key in $Value.Keys) {
+                if ($key -isnot [string]) { throw "Convention specialist canonical JSON keys must be strings." }
+                [void]$names.Add([string]$key)
+            }
+        }
+        else {
+            foreach ($property in $Value.PSObject.Properties) { [void]$names.Add($property.Name) }
+        }
+        $names.Sort([StringComparer]::Ordinal)
+        $parts = [System.Collections.Generic.List[string]]::new()
+        foreach ($name in $names) {
+            $rawValue = $null
+            if ($Value -is [System.Collections.IDictionary]) { $rawValue = $Value[$name] }
+            else { $rawValue = $Value.PSObject.Properties[$name].Value }
+            [void]$parts.Add(
+                (ConvertTo-Json -InputObject $name -Compress) + ":" +
+                (ConvertTo-ReviewerConventionSpecialistCanonicalJson -Value $rawValue -Depth ($Depth + 1)))
+        }
+        return "{" + ($parts.ToArray() -join ",") + "}"
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $parts = [System.Collections.Generic.List[string]]::new()
+        foreach ($item in $Value) {
+            [void]$parts.Add((ConvertTo-ReviewerConventionSpecialistCanonicalJson -Value $item -Depth ($Depth + 1)))
+        }
+        return "[" + ($parts.ToArray() -join ",") + "]"
+    }
+    throw "Convention specialist canonical JSON encountered unsupported type '$($Value.GetType().FullName)'."
+}
+
 function Get-ReviewerConventionSpecialistObjectSha256 {
     param([Parameter(Mandatory)]$Value)
-    return Get-ReviewerConventionSpecialistSha256 -Text (ConvertTo-ReviewerFactCanonicalJson -Value $Value)
+    return Get-ReviewerConventionSpecialistSha256 -Text (
+        ConvertTo-ReviewerConventionSpecialistCanonicalJson -Value $Value)
 }
 
 function Get-ReviewerConventionSpecialistDomainKey {
@@ -599,8 +649,8 @@ function New-ReviewerConventionSpecialistInput {
         changedFiles = @($ChangeEntries)
         sanitizedExistingThreads = $ThreadDigestText
     }
-    $inputText = $PromptText + "`n`n---`n## Wrapper runtime data (untrusted values, trusted binding)`n```json`n" +
-        ($runtime | ConvertTo-Json -Depth 32 -Compress) + "`n```n"
+    $inputText = $PromptText + "`n`n---`n## Wrapper runtime data (untrusted values, trusted binding)`n" +
+        '```json' + "`n" + ($runtime | ConvertTo-Json -Depth 32 -Compress) + "`n" + '```' + "`n"
     $bytes = $script:ReviewerConventionSpecialistUtf8.GetByteCount($inputText)
     if ($bytes -gt $MaxInputBytes) {
         throw "Convention specialist input is $bytes bytes, above the code-defined $MaxInputBytes-byte bound."
@@ -619,7 +669,7 @@ function Save-ReviewerConventionSpecialistPreview {
     if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
         throw "Convention specialist preview directory '$Directory' does not exist."
     }
-    $manifestJson = ConvertTo-ReviewerFactCanonicalJson -Value $Manifest
+    $manifestJson = ConvertTo-ReviewerConventionSpecialistCanonicalJson -Value $Manifest
     $key = Get-ReviewerConventionSpecialistDomainKey -MasterKey $MasterKey -Domain preview
     $envelope = [ordered]@{
         manifestJson = $manifestJson

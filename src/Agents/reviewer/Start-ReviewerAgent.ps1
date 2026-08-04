@@ -5122,6 +5122,24 @@ function Write-ReviewerConventionSpecialistPreview {
     return @{ MarkdownPath = $markdownPath; ArtifactPath = $artifactPath; Manifest = $manifest }
 }
 
+function Get-ReviewerConventionSpecialistDiagnosticText {
+    param(
+        [AllowNull()]$Value,
+        [ValidateRange(1, 262144)][int]$MaxBytes = 131072
+    )
+    $text = [string]$Value
+    if ($script:ReviewerUtf8.GetByteCount($text) -le $MaxBytes) { return $text }
+    $builder = [Text.StringBuilder]::new()
+    $bytes = 0
+    foreach ($character in $text.ToCharArray()) {
+        $width = $script:ReviewerUtf8.GetByteCount([string]$character)
+        if (($bytes + $width) -gt ($MaxBytes - 32)) { break }
+        [void]$builder.Append($character)
+        $bytes += $width
+    }
+    return $builder.ToString() + "`n[diagnostic text truncated]"
+}
+
 function Invoke-ReviewerConventionSpecialistPass {
     param(
         [Parameter(Mandatory)][string]$AgencyPath,
@@ -5306,11 +5324,11 @@ function Invoke-ReviewerConventionSpecialistPass {
                     "timedOut    : $($run.TimedOut)"
                     "markerPrefix: $script:ReviewerConventionSpecialistMarkerPrefix"
                     "--------------- PARSED ANSWER ---------------"
-                    $markerSource
+                    (Get-ReviewerConventionSpecialistDiagnosticText -Value $markerSource)
                     "--------------- STDOUT ---------------"
-                    [string]$run.StdOut
+                    (Get-ReviewerConventionSpecialistDiagnosticText -Value $run.StdOut)
                     "--------------- STDERR ---------------"
-                    [string]$run.StdErr
+                    (Get-ReviewerConventionSpecialistDiagnosticText -Value $run.StdErr)
                 ) | Set-Content -LiteralPath $failurePath -Encoding UTF8
                 Write-Host "Convention specialist failure transcript written to $failurePath" -ForegroundColor DarkYellow
             }
@@ -5335,6 +5353,33 @@ function Invoke-ReviewerConventionSpecialistPass {
         Write-Warning "Convention specialist preview could not be persisted for PR ${PrId}: $($_.Exception.Message)"
     }
     return @{ Status = $status; Candidates = @($candidates); Withheld = @($withheld); Diagnostic = $diagnostic }
+}
+
+function Invoke-ReviewerConventionSpecialistSafely {
+    param(
+        [Parameter(Mandatory)][string]$AgencyPath,
+        [Parameter(Mandatory)][int]$CycleNumber,
+        [Parameter(Mandatory)][hashtable]$Bound
+    )
+    if (-not $EnableConventionSpecialist) { return }
+    $prId = [int]$Bound.PrId
+    $sourceCommit = [string]$Bound.SourceCommit
+    try {
+        [void](Invoke-ReviewerConventionSpecialistPass -AgencyPath $AgencyPath -CycleNumber $CycleNumber `
+                -PrId $prId -SourceCommit $sourceCommit -ThreadDigestText ([string]$Bound.DigestText) `
+                -ConventionPlanPath ([string]$Bound.ConventionPlanPath) `
+                -FactPlanPath ([string]$Bound.FactPlanPath))
+    }
+    catch {
+        Write-Warning "Convention specialist escaped its degradation boundary for PR ${prId}; generalist result is unchanged: $($_.Exception.Message)"
+        try {
+            [void](Write-ReviewerConventionSpecialistPreview -PrId $prId -SourceCommit $sourceCommit `
+                    -Status "degraded" -Diagnostic $_.Exception.Message `
+                    -Model $EffectiveConventionSpecialistModel `
+                    -ConventionPlanSha256 ("0" * 64) -FactPlanSha256 ("0" * 64))
+        }
+        catch { Write-Warning "Emergency specialist diagnostic preview also failed: $($_.Exception.Message)" }
+    }
 }
 
 function Test-ReviewerDeliveryStillValid {
@@ -5752,6 +5797,8 @@ function Invoke-ReviewerPullRequest {
             cycle = $CycleNumber; mode = "live"; result = "failed"; prId = $prId
             reason = $reason; environmentFault = $environmentFault
         }
+        Invoke-ReviewerConventionSpecialistSafely -AgencyPath $AgencyPath `
+            -CycleNumber $CycleNumber -Bound $Bound
         return @{ ExitCode = 1; Summary = "PR $prId failed: $reason" }
     }
 
@@ -5824,6 +5871,8 @@ function Invoke-ReviewerPullRequest {
             cycle = $CycleNumber; mode = "live"; result = "failed"; prId = $prId
             reason = $reason; environmentFault = $false
         }
+        Invoke-ReviewerConventionSpecialistSafely -AgencyPath $AgencyPath `
+            -CycleNumber $CycleNumber -Bound $Bound
         return @{ ExitCode = 1; Summary = "PR $prId failed: $reason" }
     }
 
@@ -5985,29 +6034,10 @@ function Invoke-ReviewerPullRequest {
     # A write that was requested and did not land is a cycle failure: it drives
     # the backoff and is retried. An aborted delivery (the PR moved on) is not.
     $exit = if ($postFailures -gt 0 -or ($writesRequested -and -not $delivery.Delivered -and -not $delivery.Aborted)) { 1 } else { 0 }
-    if ($EnableConventionSpecialist) {
-        # Discovery-only and intentionally last: the generalist marker, preview,
-        # delivery, state, metadata, and exit code are already finalized.
-        try {
-            [void](Invoke-ReviewerConventionSpecialistPass -AgencyPath $AgencyPath -CycleNumber $CycleNumber `
-                    -PrId $prId -SourceCommit $sourceCommit -ThreadDigestText ([string]$Bound.DigestText) `
-                    -ConventionPlanPath ([string]$Bound.ConventionPlanPath) `
-                    -FactPlanPath ([string]$Bound.FactPlanPath))
-        }
-        catch {
-            # This guard is intentionally outside the pass. Parameter binding or
-            # a future regression before its internal catch must never change the
-            # already-finalized generalist result or abort the remaining PR queue.
-            Write-Warning "Convention specialist escaped its degradation boundary for PR ${prId}; generalist result is unchanged: $($_.Exception.Message)"
-            try {
-                [void](Write-ReviewerConventionSpecialistPreview -PrId $prId -SourceCommit $sourceCommit `
-                        -Status "degraded" -Diagnostic $_.Exception.Message `
-                        -Model $EffectiveConventionSpecialistModel `
-                        -ConventionPlanSha256 ("0" * 64) -FactPlanSha256 ("0" * 64))
-            }
-            catch { Write-Warning "Emergency specialist diagnostic preview also failed: $($_.Exception.Message)" }
-        }
-    }
+    # Discovery-only and intentionally last: the generalist marker, preview,
+    # delivery, state, metadata, and exit code are already finalized.
+    Invoke-ReviewerConventionSpecialistSafely -AgencyPath $AgencyPath `
+        -CycleNumber $CycleNumber -Bound $Bound
     return @{ ExitCode = $exit; Summary = "PR $prId reviewed ($($allFindings.Count) finding(s), $postedCount posted)" }
 }
 
