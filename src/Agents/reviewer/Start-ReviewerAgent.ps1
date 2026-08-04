@@ -1628,6 +1628,7 @@ function ConvertTo-ReviewerAuthoritativeSourcePolicy {
         $expectedSha256 = ""
         if ($item.PSObject.Properties["expectedSha256"]) {
             $expectedSha256 = Get-AgentConfigString -Object $item -Name "expectedSha256" -Where $where -MaxLength 64 -Pattern '^[0-9a-f]{64}$'
+            $expectedSha256 = $expectedSha256.ToLowerInvariant()
         }
         $expectedByteLength = 0
         if ($item.PSObject.Properties["expectedByteLength"]) {
@@ -4028,7 +4029,8 @@ function Invoke-DryRunSelfChecks {
       "repositoryId": "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
       "path": "/docs/conventions.md",
       "branch": "main",
-      "maxBytes": 32
+      "maxBytes": 32,
+      "expectedSha256": "AaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa"
     }
   ]
 }
@@ -4036,8 +4038,15 @@ function Invoke-DryRunSelfChecks {
     $positivePolicy = ConvertTo-ReviewerAuthoritativeSourcePolicy -RawPolicy $policyFixture -RepositoryOrganization "contoso"
     if (@($positivePolicy.Sources).Count -ne 1 -or
         [string]$positivePolicy.Sources[0].RepositoryId -cne "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" -or
-        [string]$positivePolicy.Sources[0].Path -cne "/docs/conventions.md") {
+        [string]$positivePolicy.Sources[0].Path -cne "/docs/conventions.md" -or
+        [string]$positivePolicy.Sources[0].ExpectedSha256 -cne ("a" * 64)) {
         $failures.Add("The unmodified authoritative source policy fixture did not parse to one normalized source.")
+    }
+    $uppercasePinFixture = $policyFixture | ConvertTo-Json -Depth 10 | ConvertFrom-Json
+    $uppercasePinFixture.sources[0].expectedSha256 = ("A" * 64)
+    $uppercasePinPolicy = ConvertTo-ReviewerAuthoritativeSourcePolicy -RawPolicy $uppercasePinFixture -RepositoryOrganization "contoso"
+    if ([string]$uppercasePinPolicy.Sources[0].ExpectedSha256 -cne ("a" * 64)) {
+        $failures.Add("An uppercase authoritative source SHA-256 pin was not normalized to lowercase.")
     }
     $policyNegatives = @(
         @{ Name = "unknown transport version"; Apply = { param($x) $x.transportVersion = 2 } },
@@ -4045,7 +4054,9 @@ function Invoke-DryRunSelfChecks {
         @{ Name = "duplicate source"; Apply = { param($x) $x.sources = @($x.sources[0], $x.sources[0]) } },
         @{ Name = "declared total overflow"; Apply = { param($x) $x.maxTotalBytes = 1 } },
         @{ Name = "path traversal"; Apply = { param($x) $x.sources[0].path = "/docs/../secret.md" } },
-        @{ Name = "cross-organization source"; Apply = { param($x) $x.sources[0].organization = "other" } }
+        @{ Name = "cross-organization source"; Apply = { param($x) $x.sources[0].organization = "other" } },
+        @{ Name = "non-hex SHA-256 pin"; Apply = { param($x) $x.sources[0].expectedSha256 = ("g" * 64) } },
+        @{ Name = "short SHA-256 pin"; Apply = { param($x) $x.sources[0].expectedSha256 = ("a" * 63) } }
     )
     foreach ($case in $policyNegatives) {
         $copy = $policyFixture | ConvertTo-Json -Depth 10 | ConvertFrom-Json
@@ -4090,6 +4101,7 @@ function Invoke-DryRunSelfChecks {
     catch { $failures.Add("Matching authoritative source hash and length pins were rejected.") }
     foreach ($badSource in @(
             @{ Path = "/docs/conventions.md"; ExpectedSha256 = ("b" * 64); ExpectedByteLength = 35 },
+            @{ Path = "/docs/conventions.md"; ExpectedSha256 = ("A" * 64); ExpectedByteLength = 35 },
             @{ Path = "/docs/conventions.md"; ExpectedSha256 = ("a" * 64); ExpectedByteLength = 34 }
         )) {
         $pinRejected = $false
