@@ -136,3 +136,7 @@ jobs:
       - name: convention-specialist isolation and schema checks
         shell: pwsh
         run: ./tools/Test-ConventionSpecialist.ps1
+
+      - name: cross-verification isolation, replay, and schema checks
+        shell: pwsh
+        run: ./tools/Test-CrossVerification.ps1

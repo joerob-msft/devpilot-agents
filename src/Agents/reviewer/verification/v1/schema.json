@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:devpilot:reviewer:verification-candidate:v1",
+  "title": "DevPilot normalized verification candidate v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "candidateId",
+    "candidateHash",
+    "schemaVersion",
+    "originKind",
+    "originModel",
+    "originArtifactSha256",
+    "originCandidateId",
+    "issueClass",
+    "affectedBehavior",
+    "anchorKind",
+    "filePath",
+    "line",
+    "severity",
+    "comment",
+    "evidence",
+    "ruleSourceId",
+    "ruleSourceSha256",
+    "ruleQuote",
+    "siblingStatus",
+    "siblingEvidence",
+    "siblingNotRequiredReason",
+    "factIds",
+    "rawCandidateSha256"
+  ],
+  "properties": {
+    "candidateId": { "type": "string", "pattern": "^cand1:[0-9a-f]{64}$" },
+    "candidateHash": { "$ref": "#/$defs/sha256" },
+    "schemaVersion": { "const": 1 },
+    "originKind": { "enum": ["generalist", "convention"] },
+    "originModel": { "type": "string", "minLength": 1 },
+    "originArtifactSha256": { "$ref": "#/$defs/sha256" },
+    "originCandidateId": { "type": "string" },
+    "issueClass": {
+      "enum": [
+        "security",
+        "buildTest",
+        "dataIntegrity",
+        "errorHandling",
+        "concurrency",
+        "compatibility",
+        "behavior",
+        "other"
+      ]
+    },
+    "affectedBehavior": { "type": "string" },
+    "anchorKind": { "enum": ["changedFile", "prMetadata"] },
+    "filePath": { "type": "string" },
+    "line": { "type": "integer", "minimum": 0 },
+    "severity": { "enum": ["critical", "important", "suggestion"] },
+    "comment": { "type": "string" },
+    "evidence": { "type": "string" },
+    "ruleSourceId": { "type": "string" },
+    "ruleSourceSha256": {
+      "oneOf": [
+        { "$ref": "#/$defs/sha256" },
+        { "const": "" }
+      ]
+    },
+    "ruleQuote": { "type": "string" },
+    "siblingStatus": { "enum": ["", "checked", "notRequired"] },
+    "siblingEvidence": { "type": "string" },
+    "siblingNotRequiredReason": { "type": "string" },
+    "factIds": { "type": "string" },
+    "rawCandidateSha256": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

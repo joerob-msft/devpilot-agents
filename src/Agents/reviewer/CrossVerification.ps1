@@ -1,0 +1,1451 @@
+#requires -Version 7.0
+
+Set-StrictMode -Version Latest
+
+$script:ReviewerVerificationMarkerPrefix = "VERIFICATION_RESULT_V1:"
+$script:ReviewerVerificationInputKind = "verification-input-preview"
+$script:ReviewerVerificationPreviewKind = "verification-decision-preview"
+$script:ReviewerVerificationArtifactVersion = 1
+$script:ReviewerVerificationMaxCandidates = 64
+$script:ReviewerVerificationMaxClusterSize = 8
+$script:ReviewerVerificationMaxInputBytes = 524288
+$script:ReviewerVerificationMaxArtifactBytes = 2097152
+$script:ReviewerVerificationUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+$script:ReviewerVerificationOutcomes = @(
+    "verified", "duplicate", "unsupported", "wrongSeverity", "needsHuman"
+)
+$script:ReviewerVerificationWithheldReasons = @(
+    "anchorInvalid", "candidateLimit", "clusterLimit", "degradedDiscovery",
+    "duplicateExistingThread", "duplicatePriorAgent", "duplicateCandidate",
+    "incompleteVerifier", "invalidMarker", "modelMismatch", "selfVerification",
+    "staleBinding", "timeout", "toolViolation", "unsupported", "needsHuman",
+    "missingEvidence", "wrongSeverity", "severityEscalation", "verifierDisagreement",
+    "sourceInvalid", "factInvalid", "siblingInvalid", "specialistDegraded"
+)
+
+function Get-ReviewerVerificationValue {
+    param($Object, [Parameter(Mandatory)][string]$Name, $Default = $null)
+    if ($null -eq $Object) { return $Default }
+    if ($Object -is [System.Collections.IDictionary]) {
+        $containsKey = $Object.PSObject.Methods["ContainsKey"]
+        if (($containsKey -and $Object.ContainsKey($Name)) -or
+            (-not $containsKey -and $Object.Contains($Name))) {
+            return $Object[$Name]
+        }
+        return $Default
+    }
+    if ($Object -is [System.Management.Automation.PSCustomObject]) {
+        $property = $Object.PSObject.Properties[$Name]
+        if ($property) { return $property.Value }
+    }
+    return $Default
+}
+
+function Get-ReviewerVerificationSha256 {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString(
+                $sha.ComputeHash($script:ReviewerVerificationUtf8.GetBytes($Text)))).Replace("-", "").ToLowerInvariant()
+    }
+    finally { $sha.Dispose() }
+}
+
+function ConvertTo-ReviewerVerificationCanonicalArray {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Items,
+        [int]$Depth = 0
+    )
+    $parts = [System.Collections.Generic.List[string]]::new()
+    foreach ($item in $Items) {
+        if ($item -is [System.Array]) {
+            [void]$parts.Add((ConvertTo-ReviewerVerificationCanonicalArray `
+                    -Items $item -Depth ($Depth + 1)))
+        }
+        else {
+            [void]$parts.Add((ConvertTo-ReviewerVerificationCanonicalJson `
+                    -Value $item -Depth ($Depth + 1)))
+        }
+    }
+    return "[" + ($parts.ToArray() -join ",") + "]"
+}
+
+function ConvertTo-ReviewerVerificationCanonicalJson {
+    param(
+        [AllowNull()][AllowEmptyCollection()][object]$Value,
+        [int]$Depth = 0
+    )
+    if ($Depth -gt 32) { throw "Verification canonical JSON exceeded the maximum object depth of 32." }
+    if ($null -eq $Value) { return "null" }
+    if ($Value -is [bool]) { return $(if ($Value) { "true" } else { "false" }) }
+    if ($Value -is [byte] -or $Value -is [sbyte] -or $Value -is [int16] -or
+        $Value -is [uint16] -or $Value -is [int32] -or $Value -is [uint32] -or
+        $Value -is [int64] -or $Value -is [uint64] -or $Value -is [single] -or
+        $Value -is [double] -or $Value -is [decimal]) {
+        if (($Value -is [single] -or $Value -is [double]) -and
+            ([double]::IsNaN([double]$Value) -or [double]::IsInfinity([double]$Value))) {
+            throw "Verification canonical JSON does not support non-finite numbers."
+        }
+        return [Convert]::ToString($Value, [Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($Value -is [string]) {
+        [void]$script:ReviewerVerificationUtf8.GetByteCount($Value)
+        return ConvertTo-Json -InputObject $Value -Compress
+    }
+    if ($Value -is [System.Collections.IDictionary] -or
+        $Value -is [System.Management.Automation.PSCustomObject]) {
+        $names = [System.Collections.Generic.List[string]]::new()
+        $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        if ($Value -is [System.Collections.IDictionary]) {
+            foreach ($key in $Value.Keys) {
+                if ($key -isnot [string]) { throw "Verification canonical JSON keys must be strings." }
+                if (-not $seen.Add([string]$key)) { throw "Verification canonical JSON contains a duplicate object key." }
+                [void]$names.Add([string]$key)
+            }
+        }
+        else {
+            foreach ($property in $Value.PSObject.Properties) {
+                if (-not $seen.Add($property.Name)) { throw "Verification canonical JSON contains a duplicate object key." }
+                [void]$names.Add($property.Name)
+            }
+        }
+        $names.Sort([StringComparer]::Ordinal)
+        $parts = [System.Collections.Generic.List[string]]::new()
+        foreach ($name in $names) {
+            $rawValue = $null
+            if ($Value -is [System.Collections.IDictionary]) { $rawValue = $Value[$name] }
+            else { $rawValue = $Value.PSObject.Properties[$name].Value }
+            $canonicalValue = if ($rawValue -is [System.Array]) {
+                ConvertTo-ReviewerVerificationCanonicalArray `
+                    -Items $rawValue -Depth ($Depth + 1)
+            }
+            else {
+                ConvertTo-ReviewerVerificationCanonicalJson `
+                    -Value $rawValue -Depth ($Depth + 1)
+            }
+            [void]$parts.Add(
+                (ConvertTo-Json -InputObject $name -Compress) + ":" + $canonicalValue)
+        }
+        return "{" + ($parts.ToArray() -join ",") + "}"
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        return ConvertTo-ReviewerVerificationCanonicalArray `
+            -Items @($Value) -Depth ($Depth + 1)
+    }
+    throw "Verification canonical JSON encountered unsupported type '$($Value.GetType().FullName)'."
+}
+
+function Get-ReviewerVerificationObjectSha256 {
+    param([Parameter(Mandatory)]$Value)
+    return Get-ReviewerVerificationSha256 -Text (
+        ConvertTo-ReviewerVerificationCanonicalJson -Value $Value)
+}
+
+function Get-ReviewerVerificationDomainKey {
+    param(
+        [Parameter(Mandatory)][byte[]]$MasterKey,
+        [Parameter(Mandatory)][ValidateSet("input", "preview")][string]$Domain
+    )
+    $label = "devpilot.reviewer.verification.$Domain.v1"
+    $hmac = [Security.Cryptography.HMACSHA256]::new($MasterKey)
+    try { return , $hmac.ComputeHash($script:ReviewerVerificationUtf8.GetBytes($label)) }
+    finally { $hmac.Dispose() }
+}
+
+function Get-ReviewerVerificationSignature {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Json,
+        [Parameter(Mandatory)][byte[]]$Key
+    )
+    $hmac = [Security.Cryptography.HMACSHA256]::new($Key)
+    try {
+        return ([BitConverter]::ToString(
+                $hmac.ComputeHash($script:ReviewerVerificationUtf8.GetBytes($Json)))).Replace("-", "").ToLowerInvariant()
+    }
+    finally { $hmac.Dispose() }
+}
+
+function Test-ReviewerVerificationSignature {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Json,
+        [Parameter(Mandatory)][byte[]]$Key,
+        [AllowEmptyString()][string]$Signature = ""
+    )
+    if ($Signature -notmatch '^[0-9a-f]{64}$') { return $false }
+    $expected = Get-ReviewerVerificationSignature -Json $Json -Key $Key
+    return [Security.Cryptography.CryptographicOperations]::FixedTimeEquals(
+        [Convert]::FromHexString($expected),
+        [Convert]::FromHexString($Signature))
+}
+
+function Save-ReviewerVerificationArtifact {
+    param(
+        [Parameter(Mandatory)]$Manifest,
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][string]$BaseName,
+        [Parameter(Mandatory)][byte[]]$MasterKey,
+        [Parameter(Mandatory)][ValidateSet("input", "preview")][string]$Domain
+    )
+    if ($BaseName -notmatch '^[A-Za-z0-9._-]+$') { throw "Verification artifact base name is unsafe." }
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
+        throw "Verification artifact directory '$Directory' does not exist."
+    }
+    $manifestJson = ConvertTo-ReviewerVerificationCanonicalJson -Value $Manifest
+    if ($script:ReviewerVerificationUtf8.GetByteCount($manifestJson) -gt $script:ReviewerVerificationMaxArtifactBytes) {
+        throw "Verification artifact exceeded the code-defined byte cap."
+    }
+    $key = Get-ReviewerVerificationDomainKey -MasterKey $MasterKey -Domain $Domain
+    $envelope = [ordered]@{
+        manifestJson = $manifestJson
+        signatureAlg = "HMACSHA256"
+        signature = Get-ReviewerVerificationSignature -Json $manifestJson -Key $key
+    }
+    $path = Join-Path $Directory ($BaseName + ".json")
+    $nonce = [Guid]::NewGuid().ToString("N")
+    $tempPath = "$path.$nonce.tmp"
+    try {
+        [IO.File]::WriteAllText(
+            $tempPath,
+            ($envelope | ConvertTo-Json -Depth 4),
+            $script:ReviewerVerificationUtf8)
+        Move-Item -LiteralPath $tempPath -Destination $path -Force
+    }
+    finally {
+        if (Test-Path -LiteralPath $tempPath) { Remove-Item -LiteralPath $tempPath -Force }
+    }
+    return $path
+}
+
+function Read-ReviewerVerificationArtifact {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][byte[]]$MasterKey,
+        [Parameter(Mandatory)][ValidateSet("input", "preview")][string]$Domain
+    )
+    $envelope = [IO.File]::ReadAllText($Path, $script:ReviewerVerificationUtf8) | ConvertFrom-Json -Depth 8
+    $manifestJson = [string](Get-ReviewerVerificationValue $envelope "manifestJson" "")
+    $signature = [string](Get-ReviewerVerificationValue $envelope "signature" "")
+    if ([string](Get-ReviewerVerificationValue $envelope "signatureAlg" "") -cne "HMACSHA256") {
+        throw "Verification artifact signature algorithm is invalid."
+    }
+    $key = Get-ReviewerVerificationDomainKey -MasterKey $MasterKey -Domain $Domain
+    if (-not $manifestJson -or
+        -not (Test-ReviewerVerificationSignature -Json $manifestJson -Key $key -Signature $signature)) {
+        throw "Verification artifact signature verification failed."
+    }
+    $manifest = $manifestJson | ConvertFrom-Json -Depth 32
+    $expectedKind = if ($Domain -ceq "input") {
+        $script:ReviewerVerificationInputKind
+    }
+    else {
+        $script:ReviewerVerificationPreviewKind
+    }
+    if ([string](Get-ReviewerVerificationValue $manifest "kind" "") -cne $expectedKind -or
+        [int](Get-ReviewerVerificationValue $manifest "artifactVersion" 0) -ne
+        $script:ReviewerVerificationArtifactVersion) {
+        throw "Verification artifact kind or version is invalid."
+    }
+    return $manifest
+}
+
+function Save-ReviewerVerificationInput {
+    param(
+        [Parameter(Mandatory)]$Manifest,
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][string]$BaseName,
+        [Parameter(Mandatory)][byte[]]$MasterKey
+    )
+    return Save-ReviewerVerificationArtifact -Manifest $Manifest -Directory $Directory `
+        -BaseName $BaseName -MasterKey $MasterKey -Domain input
+}
+
+function Read-ReviewerVerificationInput {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][byte[]]$MasterKey)
+    return Read-ReviewerVerificationArtifact -Path $Path -MasterKey $MasterKey -Domain input
+}
+
+function Save-ReviewerVerificationPreview {
+    param(
+        [Parameter(Mandatory)]$Manifest,
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][string]$BaseName,
+        [Parameter(Mandatory)][byte[]]$MasterKey
+    )
+    return Save-ReviewerVerificationArtifact -Manifest $Manifest -Directory $Directory `
+        -BaseName $BaseName -MasterKey $MasterKey -Domain preview
+}
+
+function Read-ReviewerVerificationPreview {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][byte[]]$MasterKey)
+    return Read-ReviewerVerificationArtifact -Path $Path -MasterKey $MasterKey -Domain preview
+}
+
+function ConvertTo-ReviewerVerificationNormalizedText {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $value = $Text.Normalize([Text.NormalizationForm]::FormKC).ToLowerInvariant()
+    $value = [regex]::Replace($value, '[^a-z0-9._/-]+', ' ', "CultureInvariant", [TimeSpan]::FromMilliseconds(250))
+    return ([regex]::Replace($value, '\s+', ' ', "CultureInvariant", [TimeSpan]::FromMilliseconds(250))).Trim()
+}
+
+function Get-ReviewerVerificationTokens {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $stop = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($word in @(
+            "a", "an", "and", "are", "as", "at", "be", "because", "by", "can", "does",
+            "for", "from", "if", "in", "into", "is", "it", "of", "on", "or", "should",
+            "that", "the", "this", "to", "was", "when", "which", "will", "with"
+        )) {
+        [void]$stop.Add($word)
+    }
+    $set = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($token in @((ConvertTo-ReviewerVerificationNormalizedText -Text $Text) -split ' ')) {
+        if ($token.Length -lt 3 -or $stop.Contains($token)) { continue }
+        $token = $token.Trim('.', '/', '-')
+        switch ($token) {
+            "lost" { $token = "lose" }
+            "loss" { $token = "lose" }
+            "previous" { $token = "prior" }
+        }
+        if ($token.Length -gt 6 -and $token.EndsWith("ing", [StringComparison]::Ordinal)) {
+            $token = $token.Substring(0, $token.Length - 3)
+        }
+        elseif ($token.Length -gt 5 -and $token.EndsWith("ed", [StringComparison]::Ordinal)) {
+            $token = $token.Substring(0, $token.Length - 2)
+        }
+        elseif ($token.Length -gt 4 -and $token.EndsWith("s", [StringComparison]::Ordinal)) {
+            $token = $token.Substring(0, $token.Length - 1)
+        }
+        if ($token.Length -gt 4 -and $token.EndsWith("e", [StringComparison]::Ordinal)) {
+            $token = $token.Substring(0, $token.Length - 1)
+        }
+        if ($token.Length -lt 3 -or $stop.Contains($token)) { continue }
+        [void]$set.Add($token)
+    }
+    $list = [System.Collections.Generic.List[string]]::new()
+    foreach ($token in $set) { [void]$list.Add($token) }
+    $list.Sort([StringComparer]::Ordinal)
+    return $list.ToArray()
+}
+
+function Get-ReviewerVerificationIssueClass {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $value = ConvertTo-ReviewerVerificationNormalizedText -Text $Text
+    foreach ($rule in @(
+            @("security", '\b(auth|authorization|credential|secret|security|token|permission|injection)\b'),
+            @("buildTest", '\b(build|compile|test|manifest|pipeline|validation)\b'),
+            @("dataIntegrity", '\b(data|database|serialize|state|corrupt|loss|persist)\b'),
+            @("errorHandling", '\b(error|exception|failure|timeout|retry|fallback)\b'),
+            @("concurrency", '\b(race|concurrent|lock|deadlock|atomic)\b'),
+            @("compatibility", '\b(api|compatib|breaking|contract|schema|version)\b'),
+            @("behavior", '\b(return|result|behavior|incorrect|wrong|missing|duplicate)\b')
+        )) {
+        if ($value -match [string]$rule[1]) { return [string]$rule[0] }
+    }
+    return "other"
+}
+
+function Get-ReviewerVerificationSimilarity {
+    param([string[]]$Left = @(), [string[]]$Right = @())
+    $leftSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $rightSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($item in @($Left)) { [void]$leftSet.Add([string]$item) }
+    foreach ($item in @($Right)) { [void]$rightSet.Add([string]$item) }
+    if ($leftSet.Count -eq 0 -and $rightSet.Count -eq 0) { return 1.0 }
+    $intersection = 0
+    foreach ($item in $leftSet) { if ($rightSet.Contains($item)) { $intersection++ } }
+    $union = $leftSet.Count + $rightSet.Count - $intersection
+    if ($union -eq 0) { return 0.0 }
+    return ([double]$intersection / [double]$union)
+}
+
+function New-ReviewerVerificationCandidate {
+    param(
+        [Parameter(Mandatory)][ValidateSet("generalist", "convention")][string]$OriginKind,
+        [Parameter(Mandatory)][string]$OriginModel,
+        [Parameter(Mandatory)][string]$OriginArtifactSha256,
+        [Parameter(Mandatory)]$RawCandidate,
+        [string]$OriginCandidateId = ""
+    )
+    $severity = [string](Get-ReviewerVerificationValue $RawCandidate "severity" "suggestion")
+    $filePath = [string](Get-ReviewerVerificationValue $RawCandidate "filePath" "")
+    $line = [int](Get-ReviewerVerificationValue $RawCandidate "line" 0)
+    $anchorKind = [string](Get-ReviewerVerificationValue $RawCandidate "anchorKind" "")
+    if (-not $anchorKind) { $anchorKind = $(if ($filePath) { "changedFile" } else { "prMetadata" }) }
+    $comment = if ($OriginKind -ceq "generalist") {
+        [string](Get-ReviewerVerificationValue $RawCandidate "comment" "")
+    }
+    else {
+        [string](Get-ReviewerVerificationValue $RawCandidate "impact" "")
+    }
+    $evidence = if ($OriginKind -ceq "generalist") {
+        $comment
+    }
+    else {
+        [string](Get-ReviewerVerificationValue $RawCandidate "diffEvidence" "")
+    }
+    $behaviorText = "$comment $evidence $([string](Get-ReviewerVerificationValue $RawCandidate 'expectedFixOrValidation' ''))"
+    $tokens = @(Get-ReviewerVerificationTokens -Text $behaviorText)
+    $rawJson = ConvertTo-ReviewerVerificationCanonicalJson -Value $RawCandidate
+    $record = [pscustomobject][ordered]@{
+        schemaVersion = 1
+        originKind = $OriginKind
+        originModel = $OriginModel
+        originArtifactSha256 = $OriginArtifactSha256.ToLowerInvariant()
+        originCandidateId = $OriginCandidateId
+        issueClass = Get-ReviewerVerificationIssueClass -Text $behaviorText
+        affectedBehavior = ($tokens -join " ")
+        anchorKind = $anchorKind
+        filePath = $filePath
+        line = $line
+        severity = $severity
+        comment = $comment
+        evidence = $evidence
+        ruleSourceId = [string](Get-ReviewerVerificationValue $RawCandidate "ruleSourceId" "")
+        ruleSourceSha256 = [string](Get-ReviewerVerificationValue $RawCandidate "ruleSourceSha256" "")
+        ruleQuote = [string](Get-ReviewerVerificationValue $RawCandidate "ruleQuote" "")
+        siblingStatus = [string](Get-ReviewerVerificationValue $RawCandidate "siblingStatus" "")
+        siblingEvidence = [string](Get-ReviewerVerificationValue $RawCandidate "siblingEvidence" "")
+        siblingNotRequiredReason = [string](Get-ReviewerVerificationValue $RawCandidate "siblingNotRequiredReason" "")
+        factIds = [string](Get-ReviewerVerificationValue $RawCandidate "factIds" "")
+        rawCandidateSha256 = Get-ReviewerVerificationSha256 -Text $rawJson
+    }
+    $hash = Get-ReviewerVerificationObjectSha256 -Value $record
+    return [pscustomobject][ordered]@{
+        candidateId = "cand1:$hash"
+        candidateHash = $hash
+        schemaVersion = $record.schemaVersion
+        originKind = $record.originKind
+        originModel = $record.originModel
+        originArtifactSha256 = $record.originArtifactSha256
+        originCandidateId = $record.originCandidateId
+        issueClass = $record.issueClass
+        affectedBehavior = $record.affectedBehavior
+        anchorKind = $record.anchorKind
+        filePath = $record.filePath
+        line = $record.line
+        severity = $record.severity
+        comment = $record.comment
+        evidence = $record.evidence
+        ruleSourceId = $record.ruleSourceId
+        ruleSourceSha256 = $record.ruleSourceSha256
+        ruleQuote = $record.ruleQuote
+        siblingStatus = $record.siblingStatus
+        siblingEvidence = $record.siblingEvidence
+        siblingNotRequiredReason = $record.siblingNotRequiredReason
+        factIds = $record.factIds
+        rawCandidateSha256 = $record.rawCandidateSha256
+    }
+}
+
+function ConvertTo-ReviewerVerificationCandidates {
+    param(
+        [object[]]$GeneralistPasses = @(),
+        [object[]]$ConventionCandidates = @(),
+        [string]$ConventionModel = "",
+        [string]$ConventionArtifactSha256 = ("0" * 64),
+        [int]$MaxCandidates = $script:ReviewerVerificationMaxCandidates
+    )
+    $result = [System.Collections.Generic.List[object]]::new()
+    foreach ($pass in @($GeneralistPasses)) {
+        $model = [string](Get-ReviewerVerificationValue $pass "model" (
+                Get-ReviewerVerificationValue $pass "Model" ""))
+        $marker = Get-ReviewerVerificationValue $pass "marker" (
+            Get-ReviewerVerificationValue $pass "Marker")
+        if (-not $marker) { continue }
+        $markerJson = ConvertTo-ReviewerVerificationCanonicalJson -Value $marker
+        $artifactSha = Get-ReviewerVerificationSha256 -Text $markerJson
+        $index = 0
+        foreach ($finding in @(Get-ReviewerVerificationValue $marker "findings" @())) {
+            $index++
+            [void]$result.Add((New-ReviewerVerificationCandidate -OriginKind generalist `
+                    -OriginModel $model -OriginArtifactSha256 $artifactSha `
+                    -RawCandidate $finding -OriginCandidateId "finding-$index"))
+        }
+    }
+    foreach ($candidate in @($ConventionCandidates)) {
+        [void]$result.Add((New-ReviewerVerificationCandidate -OriginKind convention `
+                -OriginModel $ConventionModel -OriginArtifactSha256 $ConventionArtifactSha256 `
+                -RawCandidate $candidate `
+                -OriginCandidateId ([string](Get-ReviewerVerificationValue $candidate "candidateId" ""))))
+    }
+    if ($result.Count -gt $MaxCandidates) {
+        throw "Verification candidate count $($result.Count) exceeds the code-defined $MaxCandidates-item cap."
+    }
+    $ordered = [System.Collections.Generic.List[object]]::new()
+    foreach ($candidate in $result) { [void]$ordered.Add($candidate) }
+    $ordered.Sort([System.Comparison[object]] {
+            param($left, $right)
+            return [StringComparer]::Ordinal.Compare(
+                [string](Get-ReviewerVerificationValue $left "candidateHash" ""),
+                [string](Get-ReviewerVerificationValue $right "candidateHash" ""))
+        })
+    return $ordered.ToArray()
+}
+
+function Get-ReviewerVerificationClusters {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Candidates,
+        [int]$MaxCandidates = $script:ReviewerVerificationMaxCandidates,
+        [int]$MaxClusterSize = $script:ReviewerVerificationMaxClusterSize
+    )
+    $items = @($Candidates)
+    if ($items.Count -gt $MaxCandidates) {
+        throw "Verification clustering input exceeds the code-defined candidate cap."
+    }
+    $parent = [int[]]::new($items.Count)
+    for ($i = 0; $i -lt $items.Count; $i++) { $parent[$i] = $i }
+    function Find-VerificationRoot {
+        param([int[]]$Parents, [int]$Index)
+        $current = $Index
+        while ($Parents[$current] -ne $current) { $current = $Parents[$current] }
+        return $current
+    }
+    for ($left = 0; $left -lt $items.Count; $left++) {
+        for ($right = $left + 1; $right -lt $items.Count; $right++) {
+            $a = $items[$left]
+            $b = $items[$right]
+            $aText = ConvertTo-ReviewerVerificationNormalizedText -Text (
+                [string](Get-ReviewerVerificationValue $a "comment" (
+                    Get-ReviewerVerificationValue $a "evidence" "")))
+            $bText = ConvertTo-ReviewerVerificationNormalizedText -Text (
+                [string](Get-ReviewerVerificationValue $b "comment" (
+                    Get-ReviewerVerificationValue $b "evidence" "")))
+            $aPath = ([string](Get-ReviewerVerificationValue $a "filePath" "")).Replace('\', '/').ToLowerInvariant()
+            $bPath = ([string](Get-ReviewerVerificationValue $b "filePath" "")).Replace('\', '/').ToLowerInvariant()
+            $aLine = [int](Get-ReviewerVerificationValue $a "line" 0)
+            $bLine = [int](Get-ReviewerVerificationValue $b "line" 0)
+            $sameAnchor = $aPath -ceq $bPath -and $aLine -eq $bLine
+            $aTokens = @(([string](Get-ReviewerVerificationValue $a "affectedBehavior" "")) -split ' ' | Where-Object { $_ })
+            $bTokens = @(([string](Get-ReviewerVerificationValue $b "affectedBehavior" "")) -split ' ' | Where-Object { $_ })
+            $similarity = Get-ReviewerVerificationSimilarity -Left $aTokens -Right $bTokens
+            $shared = 0
+            $bSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            foreach ($token in $bTokens) { [void]$bSet.Add($token) }
+            foreach ($token in $aTokens) { if ($bSet.Contains($token)) { $shared++ } }
+            $sameClass = [string](Get-ReviewerVerificationValue $a "issueClass" "") -ceq
+                [string](Get-ReviewerVerificationValue $b "issueClass" "")
+            $meaningfulClass = $sameClass -and
+                [string](Get-ReviewerVerificationValue $a "issueClass" "") -cne "other"
+            $merge = ($sameAnchor -and $aText -ceq $bText) -or
+                ($sameAnchor -and $shared -ge 4 -and $similarity -ge 0.70) -or
+                ($meaningfulClass -and $shared -ge 3 -and $similarity -ge 0.55)
+            if (-not $merge) { continue }
+            $leftRoot = Find-VerificationRoot -Parents $parent -Index $left
+            $rightRoot = Find-VerificationRoot -Parents $parent -Index $right
+            if ($leftRoot -ne $rightRoot) {
+                $high = [Math]::Max($leftRoot, $rightRoot)
+                $low = [Math]::Min($leftRoot, $rightRoot)
+                $parent[$high] = $low
+            }
+        }
+    }
+    $groups = @{}
+    for ($i = 0; $i -lt $items.Count; $i++) {
+        $root = Find-VerificationRoot -Parents $parent -Index $i
+        if (-not $groups.ContainsKey($root)) {
+            $groups[$root] = [System.Collections.Generic.List[object]]::new()
+        }
+        [void]$groups[$root].Add($items[$i])
+    }
+    $clusters = [System.Collections.Generic.List[object]]::new()
+    foreach ($root in @($groups.Keys)) {
+        $members = [System.Collections.Generic.List[object]]::new()
+        foreach ($member in $groups[$root]) { [void]$members.Add($member) }
+        $members.Sort([System.Comparison[object]] {
+                param($left, $right)
+                return [StringComparer]::Ordinal.Compare(
+                    [string](Get-ReviewerVerificationValue $left "candidateHash" ""),
+                    [string](Get-ReviewerVerificationValue $right "candidateHash" ""))
+            })
+        if ($members.Count -gt $MaxClusterSize) {
+            throw "Verification cluster exceeds the code-defined $MaxClusterSize-member cap."
+        }
+        $hashes = @($members | ForEach-Object {
+                [string](Get-ReviewerVerificationValue $_ "candidateHash" "")
+            })
+        $clusterHash = Get-ReviewerVerificationObjectSha256 -Value $hashes
+        $origins = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($member in $members) {
+            [void]$origins.Add([string](Get-ReviewerVerificationValue $member "originModel" ""))
+        }
+        $originList = [System.Collections.Generic.List[string]]::new()
+        foreach ($origin in $origins) { [void]$originList.Add($origin) }
+        $originList.Sort([StringComparer]::Ordinal)
+        [void]$clusters.Add([pscustomobject][ordered]@{
+                clusterId = "vc1:$clusterHash"
+                memberHashes = $hashes
+                origins = $originList.ToArray()
+                members = $members.ToArray()
+            })
+    }
+    $clusters.Sort([System.Comparison[object]] {
+            param($left, $right)
+            return [StringComparer]::Ordinal.Compare(
+                [string](Get-ReviewerVerificationValue $left "clusterId" ""),
+                [string](Get-ReviewerVerificationValue $right "clusterId" ""))
+        })
+    return $clusters.ToArray()
+}
+
+function Get-ReviewerVerificationThreadFacts {
+    param($FactPlan)
+    $records = [System.Collections.Generic.List[object]]::new()
+    foreach ($fact in @(Get-ReviewerVerificationValue $FactPlan "facts" @())) {
+        if ([string](Get-ReviewerVerificationValue $fact "domain" "") -cne "threads" -or
+            [string](Get-ReviewerVerificationValue $fact "kind" "") -cne "reviewThread" -or
+            [string](Get-ReviewerVerificationValue $fact "state" "") -cne "true") {
+            continue
+        }
+        $value = Get-ReviewerVerificationValue $fact "value"
+        [void]$records.Add([pscustomobject][ordered]@{
+                threadId = [string](Get-ReviewerVerificationValue $fact "subject" "")
+                fingerprint = [string](Get-ReviewerVerificationValue $value "fingerprint" "")
+                contentSha256 = [string](Get-ReviewerVerificationValue $value "contentSha256" "")
+                filePath = [string](Get-ReviewerVerificationValue $value "filePath" "")
+                line = [int](Get-ReviewerVerificationValue $value "line" 0)
+                status = [string](Get-ReviewerVerificationValue $value "status" "")
+                authorClasses = @((Get-ReviewerVerificationValue $value "authorClasses" @()))
+                sanitizedSubstance = [string](Get-ReviewerVerificationValue $value "sanitizedSubstance" "")
+                substanceTruncated = [bool](Get-ReviewerVerificationValue $value "substanceTruncated" $false)
+            })
+    }
+    $records.Sort([System.Comparison[object]] {
+            param($left, $right)
+            return [StringComparer]::Ordinal.Compare(
+                [string](Get-ReviewerVerificationValue $left "threadId" ""),
+                [string](Get-ReviewerVerificationValue $right "threadId" ""))
+        })
+    return $records.ToArray()
+}
+
+function Find-ReviewerVerificationExistingDuplicate {
+    param(
+        [Parameter(Mandatory)]$Candidate,
+        [object[]]$ThreadFacts = @()
+    )
+    $candidatePath = ([string](Get-ReviewerVerificationValue $Candidate "filePath" "")).Replace('\', '/').ToLowerInvariant()
+    $candidateLine = [int](Get-ReviewerVerificationValue $Candidate "line" 0)
+    $candidateText = [string](Get-ReviewerVerificationValue $Candidate "comment" (
+            Get-ReviewerVerificationValue $Candidate "evidence" ""))
+    $candidateTokens = @(Get-ReviewerVerificationTokens -Text $candidateText)
+    foreach ($thread in @($ThreadFacts)) {
+        $threadPath = ([string](Get-ReviewerVerificationValue $thread "filePath" "")).Replace('\', '/').ToLowerInvariant()
+        $threadLine = [int](Get-ReviewerVerificationValue $thread "line" 0)
+        if ($candidatePath -cne $threadPath -or $candidateLine -ne $threadLine) { continue }
+        $threadText = [string](Get-ReviewerVerificationValue $thread "sanitizedSubstance" "")
+        $threadTokens = @(Get-ReviewerVerificationTokens -Text $threadText)
+        if ($candidateTokens.Count -ge 3 -and
+            (Get-ReviewerVerificationSimilarity -Left $candidateTokens -Right $threadTokens) -ge 0.68) {
+            $authorClasses = @((Get-ReviewerVerificationValue $thread "authorClasses" @()))
+            return [pscustomobject][ordered]@{
+                duplicate = $true
+                targetId = "thread:" + [string](Get-ReviewerVerificationValue $thread "threadId" "")
+                evidenceSha256 = [string](Get-ReviewerVerificationValue $thread "contentSha256" "")
+                reason = $(if ($authorClasses -ccontains "agent") { "duplicatePriorAgent" } else { "duplicateExistingThread" })
+            }
+        }
+    }
+    return [pscustomobject][ordered]@{
+        duplicate = $false; targetId = ""; evidenceSha256 = ""; reason = ""
+    }
+}
+
+function Test-ReviewerVerificationThreadRelevant {
+    param(
+        [Parameter(Mandatory)]$Candidate,
+        [Parameter(Mandatory)]$Thread
+    )
+    $candidatePath = ([string](Get-ReviewerVerificationValue $Candidate "filePath" "")).Replace('\', '/').ToLowerInvariant()
+    $candidateLine = [int](Get-ReviewerVerificationValue $Candidate "line" 0)
+    $threadPath = ([string](Get-ReviewerVerificationValue $Thread "filePath" "")).Replace('\', '/').ToLowerInvariant()
+    $threadLine = [int](Get-ReviewerVerificationValue $Thread "line" 0)
+    if ($candidatePath -cne $threadPath -or $candidateLine -ne $threadLine) { return $false }
+    $candidateText = [string](Get-ReviewerVerificationValue $Candidate "comment" (
+            Get-ReviewerVerificationValue $Candidate "evidence" ""))
+    $threadText = [string](Get-ReviewerVerificationValue $Thread "sanitizedSubstance" "")
+    $candidateTokens = @(Get-ReviewerVerificationTokens -Text $candidateText)
+    $threadTokens = @(Get-ReviewerVerificationTokens -Text $threadText)
+    return ($candidateTokens.Count -ge 3 -and
+        (Get-ReviewerVerificationSimilarity -Left $candidateTokens -Right $threadTokens) -ge 0.68)
+}
+
+function Get-ReviewerVerificationAssignments {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Clusters,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$GeneralistModels,
+        [AllowEmptyString()][string]$ConventionVerifierModel = "",
+        [string[]]$ChangedPaths = @()
+    )
+    $models = @($GeneralistModels)
+    $changed = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($path in @($ChangedPaths)) {
+        $normalized = ([string]$path).Trim().Replace('\', '/').TrimStart('/').ToLowerInvariant()
+        if ($normalized) { [void]$changed.Add($normalized) }
+    }
+    $assignments = [System.Collections.Generic.List[object]]::new()
+    foreach ($cluster in @($Clusters)) {
+        foreach ($candidate in @(Get-ReviewerVerificationValue $cluster "members" @())) {
+            $originKind = [string](Get-ReviewerVerificationValue $candidate "originKind" "")
+            $originModel = [string](Get-ReviewerVerificationValue $candidate "originModel" "")
+            if ($changed.Count -gt 0 -and [string]$candidate.anchorKind -ceq "changedFile") {
+                $candidatePath = ([string]$candidate.filePath).Trim().Replace('\', '/').TrimStart('/').ToLowerInvariant()
+                if (-not $candidatePath -or [int]$candidate.line -lt 1 -or
+                    -not $changed.Contains($candidatePath)) {
+                    continue
+                }
+            }
+            $targets = [System.Collections.Generic.List[string]]::new()
+            if ($originKind -ceq "convention") {
+                if ($ConventionVerifierModel) { [void]$targets.Add($ConventionVerifierModel) }
+            }
+            else {
+                foreach ($model in $models) {
+                    if (-not [string]::Equals($model, $originModel, [StringComparison]::Ordinal)) {
+                        [void]$targets.Add($model)
+                    }
+                }
+            }
+            foreach ($target in $targets) {
+                if ($originKind -ceq "generalist" -and $models.Count -eq 1 -and
+                    [string]::Equals($target, $originModel, [StringComparison]::Ordinal)) {
+                    throw "A sole-origin generalist candidate cannot be assigned to its own model."
+                }
+                [void]$assignments.Add([pscustomobject][ordered]@{
+                        assignmentId = "va1:" + (Get-ReviewerVerificationObjectSha256 -Value @(
+                                [string](Get-ReviewerVerificationValue $cluster "clusterId" ""),
+                                [string](Get-ReviewerVerificationValue $candidate "candidateHash" ""),
+                                $target
+                            ))
+                        clusterId = [string](Get-ReviewerVerificationValue $cluster "clusterId" "")
+                        candidateId = [string](Get-ReviewerVerificationValue $candidate "candidateId" "")
+                        candidateHash = [string](Get-ReviewerVerificationValue $candidate "candidateHash" "")
+                        originModel = $originModel
+                        verifierModel = $target
+                    })
+            }
+        }
+    }
+    $assignments.Sort([System.Comparison[object]] {
+            param($left, $right)
+            return [StringComparer]::Ordinal.Compare(
+                [string](Get-ReviewerVerificationValue $left "assignmentId" ""),
+                [string](Get-ReviewerVerificationValue $right "assignmentId" ""))
+        })
+    return $assignments.ToArray()
+}
+
+function Get-ReviewerVerificationMarkerSchema {
+    param(
+        [Parameter(Mandatory)][string]$ExpectedProject,
+        [Parameter(Mandatory)][string]$ExpectedNonce,
+        [Parameter(Mandatory)][string]$ExpectedVerifierModel,
+        [int]$MaxVerdicts = $script:ReviewerVerificationMaxClusterSize
+    )
+    $ascii = '^[\x20-\x7E]*$'
+    return @{
+        Keys = @(
+            "schemaVersion", "prId", "repositoryId", "project", "reviewedSourceCommit",
+            "targetCommit", "changeSetDigest", "verificationInputSha256", "clusterId",
+            "configSha256", "scriptSha256", "promptSha256", "verifierModel",
+            "verdicts", "diagnostics", "nonce"
+        )
+        Fields = @{
+            schemaVersion = @{ Type = "int"; Min = 1; Max = 1 }
+            prId = @{ Type = "int"; Min = 1; Max = [int]::MaxValue }
+            repositoryId = @{ Type = "guid" }
+            project = @{ Type = "exact"; Expected = $ExpectedProject }
+            reviewedSourceCommit = @{ Type = "hex"; Length = 40 }
+            targetCommit = @{ Type = "hex"; Length = 40 }
+            changeSetDigest = @{ Type = "hex"; Length = 64 }
+            verificationInputSha256 = @{ Type = "hex"; Length = 64 }
+            clusterId = @{ Type = "string"; MaxLength = 68; Pattern = '^vc1:[0-9a-f]{64}$' }
+            configSha256 = @{ Type = "hex"; Length = 64 }
+            scriptSha256 = @{ Type = "hex"; Length = 64 }
+            promptSha256 = @{ Type = "hex"; Length = 64 }
+            verifierModel = @{ Type = "exact"; Expected = $ExpectedVerifierModel }
+            verdicts = @{
+                Type = "objectArray"; MaxItems = $MaxVerdicts
+                Item = @{
+                    Keys = @(
+                        "candidateId", "candidateHash", "outcome", "evidenceKind",
+                        "evidenceSha256", "factIds", "duplicateTargetId",
+                        "correctedSeverity", "rationale", "confidence"
+                    )
+                    Fields = @{
+                        candidateId = @{ Type = "string"; MaxLength = 70; Pattern = '^cand1:[0-9a-f]{64}$' }
+                        candidateHash = @{ Type = "hex"; Length = 64 }
+                        outcome = @{ Type = "enum"; Values = $script:ReviewerVerificationOutcomes }
+                        evidenceKind = @{
+                            Type = "enum"
+                            Values = @("diffHunk", "sourceQuote", "deterministicFact", "sibling", "existingThread", "siblingCandidate")
+                        }
+                        evidenceSha256 = @{ Type = "hex"; Length = 64 }
+                        factIds = @{
+                            Type = "string"; MaxLength = 600; AllowEmpty = $true
+                            Pattern = '^(|rf1:[0-9a-f]{64}(,rf1:[0-9a-f]{64}){0,7})$'
+                        }
+                        duplicateTargetId = @{ Type = "string"; MaxLength = 160; AllowEmpty = $true; Pattern = $ascii }
+                        correctedSeverity = @{
+                            Type = "enum"; Values = @("none", "suggestion", "important", "critical")
+                        }
+                        rationale = @{ Type = "string"; MaxLength = 900; Pattern = '^(?=.*\S)[\x20-\x7E]+$' }
+                        confidence = @{ Type = "enum"; Values = @("low", "medium", "high") }
+                    }
+                }
+            }
+            diagnostics = @{
+                Type = "objectArray"; MaxItems = 8
+                Item = @{
+                    Keys = @("candidateId", "reason", "detail")
+                    Fields = @{
+                        candidateId = @{ Type = "string"; MaxLength = 70; AllowEmpty = $true; Pattern = '^(|cand1:[0-9a-f]{64})$' }
+                        reason = @{ Type = "enum"; Values = @("none", "partialEvidence", "ambiguous", "toolUnavailable") }
+                        detail = @{ Type = "string"; MaxLength = 600; Pattern = $ascii }
+                    }
+                }
+            }
+            nonce = @{ Type = "exact"; Expected = $ExpectedNonce }
+        }
+    }
+}
+
+function Test-ReviewerVerificationBinding {
+    param(
+        [Parameter(Mandatory)][hashtable]$Marker,
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)][string]$RepositoryId,
+        [Parameter(Mandatory)][string]$SourceCommit,
+        [Parameter(Mandatory)][string]$TargetCommit,
+        [Parameter(Mandatory)][string]$ChangeSetDigest,
+        [Parameter(Mandatory)][string]$VerificationInputSha256,
+        [Parameter(Mandatory)][string]$ClusterId,
+        [Parameter(Mandatory)][string]$ConfigSha256,
+        [Parameter(Mandatory)][string]$ScriptSha256,
+        [Parameter(Mandatory)][string]$PromptSha256,
+        [Parameter(Mandatory)][string]$VerifierModel
+    )
+    foreach ($pair in @(
+            @("repositoryId", $RepositoryId), @("reviewedSourceCommit", $SourceCommit),
+            @("targetCommit", $TargetCommit), @("changeSetDigest", $ChangeSetDigest),
+            @("verificationInputSha256", $VerificationInputSha256), @("clusterId", $ClusterId),
+            @("configSha256", $ConfigSha256), @("scriptSha256", $ScriptSha256),
+            @("promptSha256", $PromptSha256), @("verifierModel", $VerifierModel)
+        )) {
+        if (-not [string]::Equals([string]$Marker[[string]$pair[0]], [string]$pair[1],
+                [StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+    }
+    return [int]$Marker.prId -eq $PrId
+}
+
+function Test-ReviewerVerificationForbiddenText {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    return $Text -match '(?i)(recommendedVote|approveWithSuggestions|waitForAuthor|approvedVote|"vote"\s*:|"comment"\s*:|"write"\s*:)'
+}
+
+function Get-ReviewerVerificationEvidenceOptions {
+    param(
+        [Parameter(Mandatory)]$Candidate,
+        $FactPlan = $null,
+        [object[]]$ThreadFacts = @(),
+        [object[]]$EvidenceHunks = @(),
+        [object[]]$SiblingCandidates = @()
+    )
+    $candidateId = [string](Get-ReviewerVerificationValue $Candidate "candidateId" "")
+    $options = [System.Collections.Generic.List[object]]::new()
+    $hunk = @($EvidenceHunks | Where-Object {
+            [string](Get-ReviewerVerificationValue $_ "candidateId" "") -ceq $candidateId
+        } | Select-Object -First 1)
+    if ($hunk.Count -eq 1 -and
+        [string](Get-ReviewerVerificationValue $hunk[0] "sha256" "") -match '^[0-9a-f]{64}$') {
+        [void]$options.Add([pscustomobject][ordered]@{
+                kind = "diffHunk"
+                sha256 = [string](Get-ReviewerVerificationValue $hunk[0] "sha256" "")
+                factIds = ""
+                duplicateTargetId = ""
+            })
+    }
+    $quote = [string](Get-ReviewerVerificationValue $Candidate "ruleQuote" "")
+    if ($quote) {
+        [void]$options.Add([pscustomobject][ordered]@{
+                kind = "sourceQuote"
+                sha256 = Get-ReviewerVerificationSha256 -Text $quote
+                factIds = ""
+                duplicateTargetId = ""
+            })
+    }
+    $siblingText = if ([string](Get-ReviewerVerificationValue $Candidate "siblingStatus" "") -ceq "checked") {
+        [string](Get-ReviewerVerificationValue $Candidate "siblingEvidence" "")
+    }
+    else {
+        [string](Get-ReviewerVerificationValue $Candidate "siblingNotRequiredReason" "")
+    }
+    if ($siblingText) {
+        [void]$options.Add([pscustomobject][ordered]@{
+                kind = "sibling"
+                sha256 = Get-ReviewerVerificationSha256 -Text $siblingText
+                factIds = ""
+                duplicateTargetId = ""
+            })
+    }
+    $factMap = @{}
+    foreach ($fact in @(Get-ReviewerVerificationValue $FactPlan "facts" @())) {
+        $id = [string](Get-ReviewerVerificationValue $fact "id" "")
+        if ($id) { $factMap[$id] = $fact }
+    }
+    $candidateFactIds = @(([string](Get-ReviewerVerificationValue $Candidate "factIds" "")) -split ',' |
+        Where-Object { $_ })
+    if ($candidateFactIds.Count -gt 0) {
+        $facts = [System.Collections.Generic.List[object]]::new()
+        foreach ($factId in $candidateFactIds) {
+            if ($factMap.ContainsKey($factId)) { [void]$facts.Add($factMap[$factId]) }
+        }
+        if ($facts.Count -eq $candidateFactIds.Count) {
+            [void]$options.Add([pscustomobject][ordered]@{
+                    kind = "deterministicFact"
+                    sha256 = Get-ReviewerVerificationSha256 -Text (
+                        ConvertTo-ReviewerVerificationCanonicalArray -Items $facts.ToArray())
+                    factIds = ($candidateFactIds -join ",")
+                    duplicateTargetId = ""
+                })
+        }
+    }
+    elseif ([string](Get-ReviewerVerificationValue $Candidate "anchorKind" "") -ceq "prMetadata") {
+        foreach ($fact in @(Get-ReviewerVerificationValue $FactPlan "facts" @())) {
+            if ([string](Get-ReviewerVerificationValue $fact "domain" "") -cne "metadata" -or
+                [string](Get-ReviewerVerificationValue $fact "state" "") -notin @("true", "false")) {
+                continue
+            }
+            $factId = [string](Get-ReviewerVerificationValue $fact "id" "")
+            [void]$options.Add([pscustomobject][ordered]@{
+                    kind = "deterministicFact"
+                    sha256 = Get-ReviewerVerificationSha256 -Text (
+                        ConvertTo-ReviewerVerificationCanonicalArray -Items @($fact))
+                    factIds = $factId
+                    duplicateTargetId = ""
+                })
+        }
+    }
+    foreach ($thread in @($ThreadFacts)) {
+        if (-not (Test-ReviewerVerificationThreadRelevant -Candidate $Candidate -Thread $thread)) {
+            continue
+        }
+        $threadId = [string](Get-ReviewerVerificationValue $thread "threadId" "")
+        $contentSha = [string](Get-ReviewerVerificationValue $thread "contentSha256" "")
+        if ($threadId -and $contentSha -match '^[0-9a-f]{64}$') {
+            [void]$options.Add([pscustomobject][ordered]@{
+                    kind = "existingThread"
+                    sha256 = $contentSha
+                    factIds = ""
+                    duplicateTargetId = "thread:$threadId"
+                })
+        }
+    }
+    foreach ($sibling in @($SiblingCandidates)) {
+        $siblingId = [string](Get-ReviewerVerificationValue $sibling "candidateId" "")
+        $siblingHash = [string](Get-ReviewerVerificationValue $sibling "candidateHash" "")
+        if ($siblingId -and $siblingId -cne
+                [string](Get-ReviewerVerificationValue $Candidate "candidateId" "") -and
+                $siblingHash -match '^[0-9a-f]{64}$') {
+                [void]$options.Add([pscustomobject][ordered]@{
+                        kind = "siblingCandidate"
+                        sha256 = $siblingHash
+                        factIds = ""
+                        duplicateTargetId = $siblingId
+                    })
+        }
+    }
+    return $options.ToArray()
+}
+
+function Resolve-ReviewerVerificationDecisions {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Clusters,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Assignments,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$VerifierRuns,
+        [object[]]$ThreadFacts = @(),
+        [string[]]$ChangedPaths = @(),
+        $FactPlan = $null,
+        [object[]]$ResolvedSources = @(),
+        [object[]]$EvidenceHunks = @(),
+        [bool]$SpecialistDegraded = $false
+    )
+    $eligible = [System.Collections.Generic.List[object]]::new()
+    $withheld = [System.Collections.Generic.List[object]]::new()
+    $decisions = [System.Collections.Generic.List[object]]::new()
+    $assignmentMap = @{}
+    foreach ($assignment in @($Assignments)) {
+        $candidateId = [string](Get-ReviewerVerificationValue $assignment "candidateId" "")
+        if (-not $assignmentMap.ContainsKey($candidateId)) {
+            $assignmentMap[$candidateId] = [System.Collections.Generic.List[object]]::new()
+        }
+        [void]$assignmentMap[$candidateId].Add($assignment)
+    }
+    $runMap = @{}
+    foreach ($run in @($VerifierRuns)) {
+        $assignmentId = [string](Get-ReviewerVerificationValue $run "assignmentId" "")
+        if ($assignmentId -and -not $runMap.ContainsKey($assignmentId)) { $runMap[$assignmentId] = $run }
+    }
+    $changed = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($path in @($ChangedPaths)) {
+        $normalized = ([string]$path).Trim().Replace('\', '/').TrimStart('/').ToLowerInvariant()
+        if ($normalized) { [void]$changed.Add($normalized) }
+    }
+    $factMap = @{}
+    foreach ($fact in @(Get-ReviewerVerificationValue $FactPlan "facts" @())) {
+        $factId = [string](Get-ReviewerVerificationValue $fact "id" "")
+        if ($factId) { $factMap[$factId] = $fact }
+    }
+    $sourceMap = @{}
+    foreach ($source in @($ResolvedSources)) {
+        $sourceId = [string](Get-ReviewerVerificationValue $source "SourceId" (
+                Get-ReviewerVerificationValue $source "sourceId" ""))
+        if ($sourceId -and -not $sourceMap.ContainsKey($sourceId)) { $sourceMap[$sourceId] = $source }
+    }
+    foreach ($cluster in @($Clusters)) {
+        $clusterId = [string](Get-ReviewerVerificationValue $cluster "clusterId" "")
+        $clusterCandidates = [System.Collections.Generic.List[object]]::new()
+        foreach ($candidate in @(Get-ReviewerVerificationValue $cluster "members" @())) {
+            $candidateFailed = $false
+            $candidateId = [string](Get-ReviewerVerificationValue $candidate "candidateId" "")
+            $candidateHash = [string](Get-ReviewerVerificationValue $candidate "candidateHash" "")
+            $originKind = [string](Get-ReviewerVerificationValue $candidate "originKind" "")
+            if ($originKind -ceq "convention" -and $SpecialistDegraded) {
+                [void]$withheld.Add([pscustomobject][ordered]@{
+                        candidateId = $candidateId; clusterId = $clusterId
+                        reason = "specialistDegraded"; detail = "The specialist discovery artifact was degraded."
+                    })
+                continue
+            }
+            $duplicate = Find-ReviewerVerificationExistingDuplicate -Candidate $candidate -ThreadFacts $ThreadFacts
+            if ([bool]$duplicate.duplicate) {
+                [void]$withheld.Add([pscustomobject][ordered]@{
+                        candidateId = $candidateId; clusterId = $clusterId
+                        reason = [string]$duplicate.reason; detail = [string]$duplicate.targetId
+                    })
+                continue
+            }
+            $path = ([string]$candidate.filePath).Trim().Replace('\', '/').TrimStart('/').ToLowerInvariant()
+            $anchorValid = if ([string]$candidate.anchorKind -ceq "prMetadata") {
+                [int]$candidate.line -eq 0 -and -not $candidate.filePath
+            }
+            else {
+                $path -and [int]$candidate.line -gt 0 -and $changed.Contains($path)
+            }
+            if (-not $anchorValid) {
+                [void]$withheld.Add([pscustomobject][ordered]@{
+                        candidateId = $candidateId; clusterId = $clusterId
+                        reason = "anchorInvalid"; detail = "The candidate anchor is not in the pinned change set."
+                    })
+                continue
+            }
+            $candidateAssignments = @(if ($assignmentMap.ContainsKey($candidateId)) {
+                @($assignmentMap[$candidateId])
+            }
+            else {
+                @()
+            })
+            if ($candidateAssignments.Count -eq 0) {
+                [void]$withheld.Add([pscustomobject][ordered]@{
+                        candidateId = $candidateId; clusterId = $clusterId
+                        reason = "selfVerification"; detail = "No independent verifier assignment was available."
+                    })
+                continue
+            }
+            $candidateVerdicts = [System.Collections.Generic.List[object]]::new()
+            foreach ($assignment in $candidateAssignments) {
+                $assignmentId = [string](Get-ReviewerVerificationValue $assignment "assignmentId" "")
+                if (-not $runMap.ContainsKey($assignmentId)) {
+                    $candidateFailed = $true
+                    [void]$withheld.Add([pscustomobject][ordered]@{
+                            candidateId = $candidateId; clusterId = $clusterId
+                            reason = "incompleteVerifier"; detail = "The assigned verifier did not produce a run record."
+                        })
+                    continue
+                }
+                $run = $runMap[$assignmentId]
+                $status = [string](Get-ReviewerVerificationValue $run "status" "")
+                if ($status -cne "complete") {
+                    $candidateFailed = $true
+                    $reason = [string](Get-ReviewerVerificationValue $run "reason" "incompleteVerifier")
+                    if ($script:ReviewerVerificationWithheldReasons -cnotcontains $reason) { $reason = "incompleteVerifier" }
+                    [void]$withheld.Add([pscustomobject][ordered]@{
+                            candidateId = $candidateId; clusterId = $clusterId
+                            reason = $reason; detail = [string](Get-ReviewerVerificationValue $run "detail" "")
+                        })
+                    continue
+                }
+                $marker = Get-ReviewerVerificationValue $run "marker"
+                $matching = @((Get-ReviewerVerificationValue $marker "verdicts" @()) | Where-Object {
+                        [string](Get-ReviewerVerificationValue $_ "candidateId" "") -ceq $candidateId
+                    })
+                if ($matching.Count -ne 1 -or
+                    [string](Get-ReviewerVerificationValue $matching[0] "candidateHash" "") -cne $candidateHash) {
+                    $candidateFailed = $true
+                    [void]$withheld.Add([pscustomobject][ordered]@{
+                            candidateId = $candidateId; clusterId = $clusterId
+                            reason = "invalidMarker"; detail = "The verdict was missing, duplicated, or bound to another candidate."
+                        })
+                    continue
+                }
+                $verdict = $matching[0]
+                if (Test-ReviewerVerificationForbiddenText -Text (
+                        [string](Get-ReviewerVerificationValue $verdict "rationale" ""))) {
+                    $candidateFailed = $true
+                    [void]$withheld.Add([pscustomobject][ordered]@{
+                            candidateId = $candidateId; clusterId = $clusterId
+                            reason = "toolViolation"; detail = "Verifier rationale contained a forbidden write or vote field."
+                        })
+                    continue
+                }
+                if ([string](Get-ReviewerVerificationValue $verdict "evidenceSha256" "") -notmatch '^[0-9a-f]{64}$') {
+                    $candidateFailed = $true
+                    [void]$withheld.Add([pscustomobject][ordered]@{
+                            candidateId = $candidateId; clusterId = $clusterId
+                            reason = "missingEvidence"; detail = "The verifier did not bind its rationale to evidence."
+                        })
+                    continue
+                }
+                $evidenceKind = [string](Get-ReviewerVerificationValue $verdict "evidenceKind" "")
+                $evidenceSha = [string](Get-ReviewerVerificationValue $verdict "evidenceSha256" "")
+                $verdictFactIds = [string](Get-ReviewerVerificationValue $verdict "factIds" "")
+                $verdictDuplicateTarget = [string](Get-ReviewerVerificationValue $verdict "duplicateTargetId" "")
+                $evidenceOptions = @(Get-ReviewerVerificationEvidenceOptions -Candidate $candidate `
+                    -FactPlan $FactPlan -ThreadFacts $ThreadFacts -EvidenceHunks $EvidenceHunks `
+                    -SiblingCandidates @(Get-ReviewerVerificationValue $cluster "members" @()))
+                $matchingEvidence = @($evidenceOptions | Where-Object {
+                        [string](Get-ReviewerVerificationValue $_ "kind" "") -ceq $evidenceKind -and
+                        [string]::Equals(
+                            [string](Get-ReviewerVerificationValue $_ "sha256" ""),
+                            $evidenceSha,
+                            [StringComparison]::OrdinalIgnoreCase) -and
+                        [string](Get-ReviewerVerificationValue $_ "factIds" "") -ceq $verdictFactIds -and
+                        [string](Get-ReviewerVerificationValue $_ "duplicateTargetId" "") -ceq $verdictDuplicateTarget
+                    })
+                if ($matchingEvidence.Count -ne 1) {
+                    $candidateFailed = $true
+                    [void]$withheld.Add([pscustomobject][ordered]@{
+                            candidateId = $candidateId; clusterId = $clusterId
+                            reason = "missingEvidence"; detail = "Verifier evidence hash does not bind to wrapper-supplied evidence."
+                        })
+                    continue
+                }
+                [void]$candidateVerdicts.Add($verdict)
+            }
+            if ($candidateVerdicts.Count -ne $candidateAssignments.Count) { continue }
+            $shapes = @($candidateVerdicts | ForEach-Object {
+                    [string](Get-ReviewerVerificationValue $_ "outcome" "") + "|" +
+                    [string](Get-ReviewerVerificationValue $_ "correctedSeverity" "none") + "|" +
+                    [string](Get-ReviewerVerificationValue $_ "duplicateTargetId" "")
+                } | Select-Object -Unique)
+            if ($shapes.Count -ne 1) {
+                $candidateFailed = $true
+                [void]$withheld.Add([pscustomobject][ordered]@{
+                        candidateId = $candidateId; clusterId = $clusterId
+                        reason = "verifierDisagreement"; detail = "Independent verifier outcomes disagree; no majority was computed."
+                    })
+                continue
+            }
+            $verdict = $candidateVerdicts[0]
+            $outcome = [string](Get-ReviewerVerificationValue $verdict "outcome" "")
+            $correctedSeverity = [string](Get-ReviewerVerificationValue $verdict "correctedSeverity" "none")
+            $duplicateTargetId = [string](Get-ReviewerVerificationValue $verdict "duplicateTargetId" "")
+            if ($outcome -cne "duplicate" -and $duplicateTargetId) {
+                $candidateFailed = $true
+                [void]$withheld.Add([pscustomobject][ordered]@{
+                        candidateId = $candidateId; clusterId = $clusterId
+                        reason = "invalidMarker"; detail = "Only a duplicate outcome may carry a duplicate target."
+                    })
+                continue
+            }
+            if ([string](Get-ReviewerVerificationValue $verdict "evidenceKind" "") -ceq "existingThread" -and
+                $outcome -cne "duplicate") {
+                $candidateFailed = $true
+                [void]$withheld.Add([pscustomobject][ordered]@{
+                        candidateId = $candidateId; clusterId = $clusterId
+                        reason = "invalidMarker"; detail = "Existing-thread evidence is valid only for duplicate outcomes."
+                    })
+                continue
+            }
+            if ($outcome -ceq "wrongSeverity") {
+                $severityOrder = @("critical", "important", "suggestion")
+                $oldRank = [array]::IndexOf([object[]]$severityOrder, [string]$candidate.severity)
+                $newRank = [array]::IndexOf([object[]]$severityOrder, $correctedSeverity)
+                if ($newRank -lt 0 -or $oldRank -lt 0 -or $newRank -le $oldRank) {
+                    $candidateFailed = $true
+                    [void]$withheld.Add([pscustomobject][ordered]@{
+                            candidateId = $candidateId; clusterId = $clusterId
+                            reason = "severityEscalation"; detail = "Severity correction was absent or did not lower severity."
+                        })
+                    continue
+                }
+            }
+            elseif ($correctedSeverity -cne "none") {
+                $candidateFailed = $true
+                [void]$withheld.Add([pscustomobject][ordered]@{
+                        candidateId = $candidateId; clusterId = $clusterId
+                        reason = "invalidMarker"; detail = "A non-severity verdict carried corrected severity."
+                    })
+                continue
+            }
+            if ($outcome -in @("unsupported", "needsHuman")) {
+                [void]$withheld.Add([pscustomobject][ordered]@{
+                        candidateId = $candidateId; clusterId = $clusterId
+                        reason = $outcome; detail = [string](Get-ReviewerVerificationValue $verdict "rationale" "")
+                    })
+                continue
+            }
+            if ($outcome -ceq "duplicate") {
+                $target = [string](Get-ReviewerVerificationValue $verdict "duplicateTargetId" "")
+                if (-not $target) {
+                    $candidateFailed = $true
+                    [void]$withheld.Add([pscustomobject][ordered]@{
+                            candidateId = $candidateId; clusterId = $clusterId
+                            reason = "invalidMarker"; detail = "Duplicate outcome omitted its target."
+                        })
+                    continue
+                }
+                [void]$withheld.Add([pscustomobject][ordered]@{
+                        candidateId = $candidateId; clusterId = $clusterId
+                        reason = "duplicateCandidate"; detail = $target
+                    })
+                continue
+            }
+            if ($originKind -ceq "convention") {
+                $sourceId = [string]$candidate.ruleSourceId
+                $sourceValid = $sourceMap.ContainsKey($sourceId)
+                if ($sourceValid) {
+                    $source = $sourceMap[$sourceId]
+                    $expectedHash = [string](Get-ReviewerVerificationValue $source "Sha256" (
+                            Get-ReviewerVerificationValue $source "sha256" ""))
+                    $sourceText = [string](Get-ReviewerVerificationValue $source "Text" (
+                            Get-ReviewerVerificationValue $source "text" ""))
+                    $sourceValid = [string]::Equals(
+                        $expectedHash, [string]$candidate.ruleSourceSha256,
+                        [StringComparison]::OrdinalIgnoreCase) -and
+                        $sourceText.IndexOf([string]$candidate.ruleQuote, [StringComparison]::Ordinal) -ge 0
+                }
+                if (-not $sourceValid -or
+                    [string]$candidate.ruleSourceSha256 -notmatch '^[0-9a-f]{64}$' -or
+                    [string]::IsNullOrWhiteSpace([string]$candidate.ruleQuote)) {
+                    $candidateFailed = $true
+                    [void]$withheld.Add([pscustomobject][ordered]@{
+                            candidateId = $candidateId; clusterId = $clusterId
+                            reason = "sourceInvalid"; detail = "Convention source hash or quote is invalid."
+                        })
+                    continue
+                }
+                if ([string]$candidate.siblingStatus -ceq "checked") {
+                    if ([string]::IsNullOrWhiteSpace([string]$candidate.siblingEvidence)) {
+                        $candidateFailed = $true
+                        [void]$withheld.Add([pscustomobject][ordered]@{
+                                candidateId = $candidateId; clusterId = $clusterId
+                                reason = "siblingInvalid"; detail = "Checked sibling evidence is empty."
+                            })
+                        continue
+                    }
+                }
+                elseif ([string]$candidate.siblingStatus -cne "notRequired" -or
+                    [string]::IsNullOrWhiteSpace([string]$candidate.siblingNotRequiredReason)) {
+                    $candidateFailed = $true
+                    [void]$withheld.Add([pscustomobject][ordered]@{
+                            candidateId = $candidateId; clusterId = $clusterId
+                            reason = "siblingInvalid"; detail = "Sibling evidence requirement is unsatisfied."
+                        })
+                    continue
+                }
+                foreach ($factId in @(([string]$candidate.factIds) -split ',' | Where-Object { $_ })) {
+                    if (-not $factMap.ContainsKey($factId) -or
+                        [string](Get-ReviewerVerificationValue $factMap[$factId] "state" "") -notin @("true", "false")) {
+                        $candidateFailed = $true
+                        [void]$withheld.Add([pscustomobject][ordered]@{
+                                candidateId = $candidateId; clusterId = $clusterId
+                                reason = "factInvalid"; detail = "A cited deterministic fact is missing or non-deterministic."
+                            })
+                        break
+                    }
+                }
+                if ($candidateFailed) { continue }
+            }
+            [void]$clusterCandidates.Add([pscustomobject][ordered]@{
+                    candidate = $candidate
+                    verifierOutcome = $outcome
+                    correctedSeverity = $correctedSeverity
+                    rationale = [string](Get-ReviewerVerificationValue $verdict "rationale" "")
+                    confidence = [string](Get-ReviewerVerificationValue $verdict "confidence" "")
+                })
+            [void]$decisions.Add([pscustomobject][ordered]@{
+                    candidateId = $candidateId; clusterId = $clusterId; outcome = $outcome
+                    correctedSeverity = $correctedSeverity
+                    verifierModels = @($candidateAssignments | ForEach-Object {
+                            [string](Get-ReviewerVerificationValue $_ "verifierModel" "")
+                        })
+                })
+        }
+        if ($clusterCandidates.Count -eq 0) { continue }
+        $representatives = [System.Collections.Generic.List[object]]::new()
+        foreach ($entry in $clusterCandidates) { [void]$representatives.Add($entry) }
+        $representatives.Sort([System.Comparison[object]] {
+                param($left, $right)
+                $leftKind = [string]$left.candidate.originKind
+                $rightKind = [string]$right.candidate.originKind
+                if ($leftKind -cne $rightKind) {
+                    if ($leftKind -ceq "generalist") { return -1 }
+                    if ($rightKind -ceq "generalist") { return 1 }
+                }
+                return [StringComparer]::Ordinal.Compare(
+                    [string]$left.candidate.candidateHash,
+                    [string]$right.candidate.candidateHash)
+            })
+        $winner = $representatives[0]
+        $severityOrder = @("critical", "important", "suggestion")
+        $finalSeverityRank = -1
+        foreach ($entry in $representatives) {
+            $entrySeverity = if ([string]$entry.correctedSeverity -cne "none") {
+                [string]$entry.correctedSeverity
+            }
+            else {
+                [string]$entry.candidate.severity
+            }
+            $entryRank = [array]::IndexOf([object[]]$severityOrder, $entrySeverity)
+            if ($entryRank -gt $finalSeverityRank) { $finalSeverityRank = $entryRank }
+        }
+        $finalSeverity = [string]$severityOrder[$finalSeverityRank]
+        [void]$eligible.Add([pscustomobject][ordered]@{
+                clusterId = $clusterId
+                candidateId = [string]$winner.candidate.candidateId
+                candidateHash = [string]$winner.candidate.candidateHash
+                originKind = [string]$winner.candidate.originKind
+                origins = @((Get-ReviewerVerificationValue $cluster "origins" @()))
+                severity = $finalSeverity
+                filePath = [string]$winner.candidate.filePath
+                line = [int]$winner.candidate.line
+                comment = [string]$winner.candidate.comment
+                evidence = [string]$winner.candidate.evidence
+                confidence = [string]$winner.confidence
+            })
+        for ($i = 1; $i -lt $representatives.Count; $i++) {
+            [void]$withheld.Add([pscustomobject][ordered]@{
+                    candidateId = [string]$representatives[$i].candidate.candidateId; clusterId = $clusterId
+                    reason = "duplicateCandidate"; detail = [string]$winner.candidate.candidateId
+                })
+        }
+    }
+    $eligibleIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($item in $eligible) { [void]$eligibleIds.Add([string]$item.candidateId) }
+    $withheldIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $finalWithheld = [System.Collections.Generic.List[object]]::new()
+    foreach ($item in $withheld) {
+        $candidateId = [string](Get-ReviewerVerificationValue $item "candidateId" "")
+        if (-not $candidateId -or $eligibleIds.Contains($candidateId) -or
+                -not $withheldIds.Add($candidateId)) {
+                continue
+        }
+        [void]$finalWithheld.Add($item)
+    }
+    foreach ($cluster in @($Clusters)) {
+        foreach ($candidate in @(Get-ReviewerVerificationValue $cluster "members" @())) {
+                $candidateId = [string](Get-ReviewerVerificationValue $candidate "candidateId" "")
+                if ($eligibleIds.Contains($candidateId) -or $withheldIds.Contains($candidateId)) { continue }
+                [void]$withheldIds.Add($candidateId)
+                [void]$finalWithheld.Add([pscustomobject][ordered]@{
+                        candidateId = $candidateId
+                        clusterId = [string](Get-ReviewerVerificationValue $cluster "clusterId" "")
+                        reason = "incompleteVerifier"
+                        detail = "No complete wrapper decision covered this candidate."
+                    })
+        }
+    }
+    return [pscustomobject][ordered]@{
+        eligible = $eligible.ToArray()
+        withheld = $finalWithheld.ToArray()
+        decisions = $decisions.ToArray()
+    }
+}
+
+function New-ReviewerVerificationModelInput {
+    param(
+        [Parameter(Mandatory)][string]$PromptText,
+        [Parameter(Mandatory)][string]$Nonce,
+        [Parameter(Mandatory)]$Binding,
+        [Parameter(Mandatory)][string]$VerificationInputSha256,
+        [Parameter(Mandatory)][string]$ClusterId,
+        [Parameter(Mandatory)][string]$VerifierModel,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Candidates,
+        [object[]]$SiblingEvidence = @(),
+        [object[]]$CandidateEvidence = @(),
+        [object[]]$DeterministicFacts = @(),
+        [object[]]$SanitizedThreads = @(),
+        [AllowEmptyString()][string]$MinimalDiffHunk = "",
+        [int]$MaxInputBytes = $script:ReviewerVerificationMaxInputBytes
+    )
+    $runtime = [pscustomobject][ordered]@{
+        contract = "cross-verification-v1"
+        nonce = $Nonce
+        verifierModel = $VerifierModel
+        verificationInputSha256 = $VerificationInputSha256
+        clusterId = $ClusterId
+        binding = $Binding
+        candidates = @($Candidates)
+        clusterSiblingEvidence = @($SiblingEvidence)
+        candidateEvidenceOptions = @($CandidateEvidence)
+        minimalDiffHunk = $MinimalDiffHunk
+        deterministicFacts = @($DeterministicFacts)
+        sanitizedExistingThreads = @($SanitizedThreads)
+    }
+    $inputText = $PromptText + "`n`n---`n## Wrapper runtime data (untrusted values, trusted binding)`n" +
+        '```json' + "`n" + ($runtime | ConvertTo-Json -Depth 32 -Compress) + "`n" + '```' + "`n"
+    $bytes = $script:ReviewerVerificationUtf8.GetByteCount($inputText)
+    if ($bytes -gt $MaxInputBytes) {
+        throw "Verification model input is $bytes bytes, above the code-defined $MaxInputBytes-byte bound."
+    }
+    return [pscustomobject][ordered]@{ text = $inputText; bytes = $bytes }
+}
+
+function Invoke-ReviewerVerificationReplay {
+    param(
+        [Parameter(Mandatory)]$InputManifest,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$VerifierRuns
+    )
+    $candidates = @((Get-ReviewerVerificationValue $InputManifest "candidates" @()))
+    $effectivePolicy = Get-ReviewerVerificationValue $InputManifest "effectivePolicy"
+    $maxCandidates = [int](Get-ReviewerVerificationValue $effectivePolicy "maxCandidates" `
+            $script:ReviewerVerificationMaxCandidates)
+    $maxClusterSize = [int](Get-ReviewerVerificationValue $effectivePolicy "maxClusterSize" `
+            $script:ReviewerVerificationMaxClusterSize)
+    $clusters = @(Get-ReviewerVerificationClusters -Candidates $candidates `
+        -MaxCandidates $maxCandidates -MaxClusterSize $maxClusterSize)
+    $assignments = @((Get-ReviewerVerificationValue $InputManifest "assignments" @()))
+    $threads = @((Get-ReviewerVerificationValue $InputManifest "threadFacts" @()))
+    $changedPaths = @((Get-ReviewerVerificationValue $InputManifest "changedPaths" @()))
+    $factPlan = Get-ReviewerVerificationValue $InputManifest "factPlan"
+    $resolvedSources = @((Get-ReviewerVerificationValue $InputManifest "resolvedSources" @()))
+    $evidenceHunks = @((Get-ReviewerVerificationValue $InputManifest "evidenceHunks" @()))
+    $specialistStatus = [string](Get-ReviewerVerificationValue $InputManifest "specialistStatus" "degraded")
+    $resolved = Resolve-ReviewerVerificationDecisions -Clusters $clusters -Assignments $assignments `
+        -VerifierRuns $VerifierRuns -ThreadFacts $threads -ChangedPaths $changedPaths `
+        -FactPlan $factPlan -ResolvedSources $resolvedSources `
+        -EvidenceHunks $evidenceHunks `
+        -SpecialistDegraded ($specialistStatus -cne "complete")
+    return [pscustomobject][ordered]@{
+        clusters = $clusters
+        assignments = $assignments
+        eligible = @($resolved.eligible)
+        withheld = @($resolved.withheld)
+        decisions = @($resolved.decisions)
+        replaySha256 = Get-ReviewerVerificationObjectSha256 -Value ([ordered]@{
+                clusters = @($clusters | ForEach-Object {
+                        [ordered]@{
+                            clusterId = [string]$_.clusterId
+                            memberHashes = @($_.memberHashes)
+                            origins = @($_.origins)
+                        }
+                    })
+                assignments = $assignments
+                eligible = @($resolved.eligible)
+                withheld = @($resolved.withheld)
+                decisions = @($resolved.decisions)
+            })
+    }
+}

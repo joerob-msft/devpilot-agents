@@ -248,6 +248,28 @@ candidates are stored in separate sealed previews and are not merged, posted, or
 used for voting. Failures are recorded as degraded specialist diagnostics without
 changing the generalist review.
 
+#### Optional cross-verification preview
+
+Layer 5 can independently verify the two generalist passes plus convention
+candidates without changing delivery:
+
+```powershell
+./src/Agents/reviewer/Start-ReviewerAgent.ps1 -Once `
+    -ConfigFile <your-repo>/.github/copilot/agents/reviewer.config.json `
+    -OperatorAlias <your-alias> -PullRequestId 12345 `
+    -Model claude-opus-5 -SecondPassModel gpt-5.6-sol `
+    -EnableConventionSpecialist -ConventionSpecialistModel claude-sonnet-5 `
+    -EnableVerificationPreview -ConventionVerifierModel gpt-5.6-sol
+```
+
+The wrapper preserves and seals every discovery artifact, normalizes candidates,
+clusters exact and semantic duplicates deterministically, cross-assigns
+generalist findings to the other model, and runs a named generalist verifier over
+convention findings. Closed verifier outcomes can retain, lower severity,
+deduplicate, or withhold; disagreement never becomes a vote. Input and decision
+artifacts use separate HMAC domains and cannot be promoted as delivery manifests.
+See [Cross-verification previews](docs/cross-verification.md).
+
 #### Authoritative repository-source transport
 
 `repoConventions.authoritativeSources` is an optional, versioned transport for

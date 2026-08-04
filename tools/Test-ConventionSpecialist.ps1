@@ -784,8 +784,13 @@ $specialistCalls = [regex]::Matches($pullRequestFunction, 'Invoke-ReviewerConven
 Assert-Specialist ($zeroPassAt -ge 0 -and $mergeFailureAt -ge 0 -and $specialistCalls -eq 3) `
     "Specialist discovery is not preserved across both generalist failure returns and the success path."
 Assert-Specialist ([regex]::Matches(
-        $pullRequestFunction, '\[void\]\(Invoke-ReviewerConventionSpecialistSafely').Count -eq 3) `
+        $pullRequestFunction, '\$specialistResult\s*=\s*Invoke-ReviewerConventionSpecialistSafely').Count -eq 3) `
     "One or more specialist safe-wrapper calls can leak output into the generalist return stream."
+$verificationCalls = [regex]::Matches(
+    $pullRequestFunction, '\[void\]\(Invoke-ReviewerCrossVerificationSafely').Count
+Assert-Specialist ($verificationCalls -eq 3 -and
+    $pullRequestFunction.LastIndexOf("Invoke-ReviewerCrossVerificationSafely", [StringComparison]::Ordinal) -gt $specialistAt) `
+    "Verification preview is not isolated after each specialist result."
 Assert-Specialist ($wrapperText -match '\$EffectiveConventionSpecialistModel\s*=\s*""' -and
     $wrapperText -match '-EnableConventionSpecialist requires an explicit') `
     "Specialist model selection gained an implicit default."
