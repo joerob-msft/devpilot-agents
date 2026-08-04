@@ -246,7 +246,7 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                         ruleSourceCommit = @{ Type = "hex"; Length = 40 }
                         ruleSourceSha256 = @{ Type = "hex"; Length = 64 }
                         ruleSection = @{ Type = "string"; MaxLength = 240; Pattern = $ascii }
-                        ruleQuote = @{ Type = "string"; MaxLength = 600; Pattern = $ascii }
+                        ruleQuote = @{ Type = "string"; MaxLength = 600; Pattern = '^(?=.{8,}$)(?=.*\S)[\x20-\x7E]+$' }
                         diffEvidence = @{ Type = "string"; MaxLength = 1200; Pattern = $ascii }
                         impactCategory = @{ Type = "enum"; Values = $script:ReviewerConventionSpecialistImpactCategories }
                         impact = @{ Type = "string"; MaxLength = 800; Pattern = $ascii }
@@ -441,9 +441,15 @@ function Resolve-ReviewerConventionSpecialistCandidates {
         [Parameter(Mandatory)][hashtable]$Marker,
         [Parameter(Mandatory)]$ConventionPlan,
         [Parameter(Mandatory)]$FactPlan,
-        [Parameter(Mandatory)][object[]]$ResolvedSources,
-        [Parameter(Mandatory)][object[]]$ChangeEntries
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ResolvedSources,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ChangeEntries
     )
+    if (@($ResolvedSources).Count -eq 0) {
+        throw "Convention specialist candidate validation requires at least one resolved convention source."
+    }
+    if (@($ChangeEntries).Count -eq 0) {
+        throw "Convention specialist candidate validation requires at least one pinned change entry."
+    }
     $sourceMap = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
     foreach ($source in @($ResolvedSources)) {
         $packName = [string](Get-ReviewerConventionSpecialistValue $source "PackName" "")
@@ -524,21 +530,30 @@ function Resolve-ReviewerConventionSpecialistCandidates {
             if ([string]$candidate.impactCategory -ceq "none") {
                 throw "Specialist candidate '$candidateId' escalated severity without a protected impact category."
             }
+            if ($facts.Count -eq 0 -and [string]$candidate.siblingStatus -cne "checked") {
+                throw "Specialist candidate '$candidateId' used important severity without a deterministic fact or checked sibling evidence."
+            }
+            if ($facts.Count -eq 0 -and ([string]$candidate.siblingEvidence).Trim().Length -lt 16) {
+                throw "Specialist candidate '$candidateId' used important severity without meaningful checked sibling evidence."
+            }
             if (@($facts | Where-Object {
-                        [string](Get-ReviewerConventionSpecialistValue $_ "state" "") -eq "unknown"
+                        @("true", "false") -cnotcontains
+                        [string](Get-ReviewerConventionSpecialistValue $_ "state" "")
                     }).Count -gt 0) {
-                throw "Specialist candidate '$candidateId' used an unknown fact to support important severity."
+                throw "Specialist candidate '$candidateId' used a non-deterministic fact to support important severity."
             }
         }
         elseif ([string]$candidate.impactCategory -cne "none") {
             throw "Specialist candidate '$candidateId' classified protected impact but did not use important severity."
         }
         if ([string]$candidate.siblingStatus -ceq "checked") {
-            if (-not [string]$candidate.siblingEvidence -or [string]$candidate.siblingNotRequiredReason) {
+            if ([string]::IsNullOrWhiteSpace([string]$candidate.siblingEvidence) -or
+                -not [string]::IsNullOrWhiteSpace([string]$candidate.siblingNotRequiredReason)) {
                 throw "Specialist candidate '$candidateId' has invalid sibling evidence."
             }
         }
-        elseif ([string]$candidate.siblingEvidence -or -not [string]$candidate.siblingNotRequiredReason) {
+        elseif (-not [string]::IsNullOrWhiteSpace([string]$candidate.siblingEvidence) -or
+            [string]::IsNullOrWhiteSpace([string]$candidate.siblingNotRequiredReason)) {
             throw "Specialist candidate '$candidateId' omitted the reason sibling evidence was not required."
         }
         foreach ($textField in @(
@@ -603,11 +618,17 @@ function New-ReviewerConventionSpecialistInput {
         [Parameter(Mandatory)][string]$PromptSha256,
         [Parameter(Mandatory)]$ConventionPlan,
         [Parameter(Mandatory)]$FactPlan,
-        [Parameter(Mandatory)][object[]]$ResolvedSources,
-        [Parameter(Mandatory)][object[]]$ChangeEntries,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ResolvedSources,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ChangeEntries,
         [Parameter(Mandatory)][AllowEmptyString()][string]$ThreadDigestText,
         [int]$MaxInputBytes = $script:ReviewerConventionSpecialistMaxInputBytes
     )
+    if (@($ResolvedSources).Count -eq 0) {
+        throw "Convention specialist input requires at least one resolved convention source."
+    }
+    if (@($ChangeEntries).Count -eq 0) {
+        throw "Convention specialist input requires at least one pinned change entry."
+    }
     $sourceRecords = @($ResolvedSources | ForEach-Object {
             [pscustomobject][ordered]@{
                 packName = [string](Get-ReviewerConventionSpecialistValue $_ "PackName" "")

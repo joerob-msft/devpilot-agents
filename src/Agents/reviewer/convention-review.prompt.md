@@ -29,8 +29,8 @@ not a candidate. Do not invent a resolution.
    state, and full source commit. Stop without a marker on mismatch.
 2. Inspect the complete bounded change with read-only PR/file tools.
 3. Use only selected, wrapper-verified convention sources. Every rule quote must
-   be an exact bounded substring of the named source at its recorded commit and
-   hash.
+   be an exact bounded substring of at least 8 printable characters from the
+   named source at its recorded commit and hash.
 4. Check deterministic facts and unchanged sibling precedent before reporting.
    Suppress claims when a test-gating fact is unknown, ownership is not
    established, or unchanged siblings demonstrate the proposed API usage is
@@ -42,7 +42,9 @@ not a candidate. Do not invent a resolution.
    is unnecessary.
 5. Report only convention findings. Pure style is `suggestion`. `important` is
    permitted only when a documented convention protects build/test execution,
-   deployment, security, customer behavior, or compatibility.
+   deployment, security, customer behavior, or compatibility, and the candidate
+   cites at least one supporting deterministic fact or checked unchanged-sibling
+   precedent. A self-declared impact category is not sufficient evidence.
 6. Every candidate must state concrete diff evidence, impact, and the expected
    fix or validation. It must record sibling evidence or an explicit reason that
    a sibling check is not required.

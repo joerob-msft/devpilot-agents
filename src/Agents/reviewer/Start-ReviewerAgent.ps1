@@ -5797,8 +5797,8 @@ function Invoke-ReviewerPullRequest {
             cycle = $CycleNumber; mode = "live"; result = "failed"; prId = $prId
             reason = $reason; environmentFault = $environmentFault
         }
-        Invoke-ReviewerConventionSpecialistSafely -AgencyPath $AgencyPath `
-            -CycleNumber $CycleNumber -Bound $Bound
+        [void](Invoke-ReviewerConventionSpecialistSafely -AgencyPath $AgencyPath `
+                -CycleNumber $CycleNumber -Bound $Bound)
         return @{ ExitCode = 1; Summary = "PR $prId failed: $reason" }
     }
 
@@ -5871,8 +5871,8 @@ function Invoke-ReviewerPullRequest {
             cycle = $CycleNumber; mode = "live"; result = "failed"; prId = $prId
             reason = $reason; environmentFault = $false
         }
-        Invoke-ReviewerConventionSpecialistSafely -AgencyPath $AgencyPath `
-            -CycleNumber $CycleNumber -Bound $Bound
+        [void](Invoke-ReviewerConventionSpecialistSafely -AgencyPath $AgencyPath `
+                -CycleNumber $CycleNumber -Bound $Bound)
         return @{ ExitCode = 1; Summary = "PR $prId failed: $reason" }
     }
 
@@ -6036,8 +6036,8 @@ function Invoke-ReviewerPullRequest {
     $exit = if ($postFailures -gt 0 -or ($writesRequested -and -not $delivery.Delivered -and -not $delivery.Aborted)) { 1 } else { 0 }
     # Discovery-only and intentionally last: the generalist marker, preview,
     # delivery, state, metadata, and exit code are already finalized.
-    Invoke-ReviewerConventionSpecialistSafely -AgencyPath $AgencyPath `
-        -CycleNumber $CycleNumber -Bound $Bound
+    [void](Invoke-ReviewerConventionSpecialistSafely -AgencyPath $AgencyPath `
+            -CycleNumber $CycleNumber -Bound $Bound)
     return @{ ExitCode = $exit; Summary = "PR $prId reviewed ($($allFindings.Count) finding(s), $postedCount posted)" }
 }
 

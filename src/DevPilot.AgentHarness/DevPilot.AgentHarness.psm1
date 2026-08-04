@@ -1385,28 +1385,28 @@ function Get-AgentCliJsonOutcome {
             $sawAssistantMessage = $true
             $contentProp = $data.PSObject.Properties["content"]
             $text = if ($contentProp -and $contentProp.Value -is [string]) { [string]$contentProp.Value } else { "" }
+            $toolProp = $data.PSObject.Properties["toolRequests"]
+            if ($toolProp -and $null -ne $toolProp.Value -and @($toolProp.Value).Count -gt 0) {
+                foreach ($request in @($toolProp.Value)) {
+                    if ($request -is [string] -and $request.Trim()) {
+                        [void]$toolRequests.Add([string]$request)
+                        continue
+                    }
+                    $nameProp = if ($request -is [System.Management.Automation.PSCustomObject]) {
+                        $request.PSObject.Properties["name"]
+                    }
+                    else { $null }
+                    if ($nameProp -and $nameProp.Value -is [string] -and $nameProp.Value.Trim()) {
+                        [void]$toolRequests.Add([string]$nameProp.Value)
+                    }
+                    else { [void]$toolRequests.Add("<unparsed>") }
+                }
+            }
             if ($text.Trim() -ne "") {
                 [void]$allMessages.Add($text)
                 # A message that requested NO tools is a terminal answer rather
                 # than commentary preceding a tool call.
-                $toolProp = $data.PSObject.Properties["toolRequests"]
                 if (-not $toolProp -or @($toolProp.Value).Count -eq 0) { [void]$noToolMessages.Add($text) }
-                else {
-                    foreach ($request in @($toolProp.Value)) {
-                        if ($request -is [string] -and $request.Trim()) {
-                            [void]$toolRequests.Add([string]$request)
-                            continue
-                        }
-                        $nameProp = if ($request -is [System.Management.Automation.PSCustomObject]) {
-                            $request.PSObject.Properties["name"]
-                        }
-                        else { $null }
-                        if ($nameProp -and $nameProp.Value -is [string] -and $nameProp.Value.Trim()) {
-                            [void]$toolRequests.Add([string]$nameProp.Value)
-                        }
-                        else { [void]$toolRequests.Add("<unparsed>") }
-                    }
-                }
                 # Honor an explicit phase when the CLI emits one, but never
                 # REQUIRE it: builds that omit the field would otherwise have
                 # every completed run discarded.

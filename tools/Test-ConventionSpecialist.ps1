@@ -109,6 +109,9 @@ $scriptSha = "5" * 64
 $promptSha = "6" * 64
 $factId = "rf1:" + ("7" * 64)
 $unknownStateFactId = "rf1:" + ("8" * 64)
+$wrongDomainFactId = "rf1:" + ("c" * 64)
+$unknownMetadataFactId = "rf1:" + ("d" * 64)
+$notApplicableMetadataFactId = "rf1:" + ("e" * 64)
 $binding = [pscustomobject][ordered]@{
     organization = "contoso"
     project = "Example"
@@ -136,6 +139,21 @@ $facts = @(
     [pscustomobject][ordered]@{
         id = $unknownStateFactId; domain = "cloudTest"; kind = "claimedTestGating"; subject = "claim"
         state = "unknown"; unknownReason = "unprovable"; value = $null
+        provenance = [pscustomobject][ordered]@{ trustTier = "wrapper-observed" }
+    },
+    [pscustomobject][ordered]@{
+        id = $wrongDomainFactId; domain = "cloudTest"; kind = "executionEntry"; subject = "entry"
+        state = "true"; unknownReason = ""; value = $true
+        provenance = [pscustomobject][ordered]@{ trustTier = "wrapper-observed" }
+    },
+    [pscustomobject][ordered]@{
+        id = $unknownMetadataFactId; domain = "metadata"; kind = "requiredSectionPresent"; subject = "Problem"
+        state = "unknown"; unknownReason = "unprovable"; value = $null
+        provenance = [pscustomobject][ordered]@{ trustTier = "wrapper-observed" }
+    },
+    [pscustomobject][ordered]@{
+        id = $notApplicableMetadataFactId; domain = "metadata"; kind = "requiredSectionPresent"; subject = "Solution"
+        state = "notApplicable"; unknownReason = ""; value = $null
         provenance = [pscustomobject][ordered]@{ trustTier = "wrapper-observed" }
     }
 )
@@ -337,17 +355,27 @@ $metadata = Copy-SpecialistObject $markerObject
 $metadata.candidates[0].anchorKind = "prMetadata"
 $metadata.candidates[0].filePath = ""
 $metadata.candidates[0].line = 0
+$metadata.candidates[0].severity = "suggestion"
+$metadata.candidates[0].impactCategory = "none"
 $metadataParsed = ConvertTo-TestMarker -Marker $metadata -Nonce "nonce-1"
 $metadataResult = Resolve-ReviewerConventionSpecialistCandidates -Marker $metadataParsed `
     -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources -ChangeEntries $changes
 Assert-Specialist (@($metadataResult.Candidates).Count -eq 1) "A valid deterministic metadata anchor was rejected."
-$badMetadata = Copy-SpecialistObject $metadata
-$badMetadata.candidates[0].factIds = $unknownStateFactId
-$badMetadataParsed = ConvertTo-TestMarker -Marker $badMetadata -Nonce "nonce-1"
-Assert-SpecialistThrows {
-    Resolve-ReviewerConventionSpecialistCandidates -Marker $badMetadataParsed `
+foreach ($metadataCase in @(
+        @{ Name = "wrong-domain"; FactId = $wrongDomainFactId },
+        @{ Name = "unknown-state"; FactId = $unknownMetadataFactId },
+        @{ Name = "not-applicable-state"; FactId = $notApplicableMetadataFactId }
+    )) {
+    $badMetadata = Copy-SpecialistObject $metadata
+    $badMetadata.candidates[0].factIds = $metadataCase.FactId
+    $badMetadataParsed = ConvertTo-TestMarker -Marker $badMetadata -Nonce "nonce-1"
+    $badMetadataResult = Resolve-ReviewerConventionSpecialistCandidates -Marker $badMetadataParsed `
         -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources -ChangeEntries $changes
-} "An unknown non-metadata fact supported an important PR-level candidate."
+    Assert-Specialist (@($badMetadataResult.Candidates).Count -eq 0 -and
+        @($badMetadataResult.Withheld).Count -eq 1 -and
+        [string]$badMetadataResult.Withheld[0].reason -ceq "invalidAnchor") `
+        "A $($metadataCase.Name) fact did not reach and fail PR-metadata anchor enforcement."
+}
 
 foreach ($case in @(
         @{ Name = "important without protected impact"; Severity = "important"; Impact = "none"; FactIds = $factId },
@@ -372,6 +400,22 @@ Assert-SpecialistThrows {
     Resolve-ReviewerConventionSpecialistCandidates -Marker $missingSiblingParsed `
         -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources -ChangeEntries $changes
 } "A checked sibling without evidence was accepted."
+foreach ($blankEvidence in @("", " ", "   ")) {
+    $blankSibling = Copy-SpecialistObject $markerObject
+    $blankSibling.candidates[0].siblingEvidence = $blankEvidence
+    $blankSiblingParsed = ConvertTo-TestMarker -Marker $blankSibling -Nonce "nonce-1"
+    Assert-SpecialistThrows {
+        Resolve-ReviewerConventionSpecialistCandidates -Marker $blankSiblingParsed `
+            -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
+            -ChangeEntries $changes
+    } "Checked sibling evidence containing only '$blankEvidence' was accepted."
+}
+foreach ($controlledEvidence in @("`t", "`n", "`r`n")) {
+    $controlledSibling = Copy-SpecialistObject $markerObject
+    $controlledSibling.candidates[0].siblingEvidence = $controlledEvidence
+    Assert-MarkerRejected -Marker $controlledSibling `
+        -Message "Controlled whitespace in checked sibling evidence passed the marker schema."
+}
 $notRequired = Copy-SpecialistObject $markerObject
 $notRequired.candidates[0].siblingStatus = "notRequired"
 $notRequired.candidates[0].siblingEvidence = ""
@@ -381,6 +425,60 @@ Assert-Specialist (@((Resolve-ReviewerConventionSpecialistCandidates -Marker $no
             -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
             -ChangeEntries $changes).Candidates).Count -eq 1) `
     "An explicit sibling-not-required reason was rejected."
+foreach ($blankReason in @("", " ", "   ")) {
+    $blankNotRequired = Copy-SpecialistObject $notRequired
+    $blankNotRequired.candidates[0].siblingNotRequiredReason = $blankReason
+    $blankNotRequiredParsed = ConvertTo-TestMarker -Marker $blankNotRequired -Nonce "nonce-1"
+    Assert-SpecialistThrows {
+        Resolve-ReviewerConventionSpecialistCandidates -Marker $blankNotRequiredParsed `
+            -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
+            -ChangeEntries $changes
+    } "Sibling-not-required reason containing only '$blankReason' was accepted."
+}
+foreach ($controlledReason in @("`t", "`n", "`r`n")) {
+    $controlledNotRequired = Copy-SpecialistObject $notRequired
+    $controlledNotRequired.candidates[0].siblingNotRequiredReason = $controlledReason
+    Assert-MarkerRejected -Marker $controlledNotRequired `
+        -Message "Controlled whitespace in sibling-not-required reason passed the marker schema."
+}
+
+$shortQuote = Copy-SpecialistObject $markerObject
+$shortQuote.candidates[0].ruleQuote = "v"
+Assert-MarkerRejected -Marker $shortQuote -Message "A one-character rule quote passed the marker schema."
+$importantWithoutEvidence = Copy-SpecialistObject $markerObject
+$importantWithoutEvidence.candidates[0].factIds = ""
+$importantWithoutEvidence.candidates[0].siblingStatus = "notRequired"
+$importantWithoutEvidence.candidates[0].siblingEvidence = ""
+$importantWithoutEvidence.candidates[0].siblingNotRequiredReason = "The rule applies directly to the changed code."
+$importantWithoutEvidenceParsed = ConvertTo-TestMarker -Marker $importantWithoutEvidence -Nonce "nonce-1"
+Assert-SpecialistThrows {
+    Resolve-ReviewerConventionSpecialistCandidates -Marker $importantWithoutEvidenceParsed `
+        -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
+        -ChangeEntries $changes
+} "Important severity without a deterministic fact or checked sibling evidence was accepted."
+$importantWithSibling = Copy-SpecialistObject $markerObject
+$importantWithSibling.candidates[0].factIds = ""
+$importantWithSiblingParsed = ConvertTo-TestMarker -Marker $importantWithSibling -Nonce "nonce-1"
+Assert-Specialist (@((Resolve-ReviewerConventionSpecialistCandidates -Marker $importantWithSiblingParsed `
+            -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
+            -ChangeEntries $changes).Candidates).Count -eq 1) `
+    "Important severity with checked sibling evidence was rejected."
+$importantWithShortSibling = Copy-SpecialistObject $importantWithSibling
+$importantWithShortSibling.candidates[0].siblingEvidence = "too short"
+$importantWithShortSiblingParsed = ConvertTo-TestMarker -Marker $importantWithShortSibling -Nonce "nonce-1"
+Assert-SpecialistThrows {
+    Resolve-ReviewerConventionSpecialistCandidates -Marker $importantWithShortSiblingParsed `
+        -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
+        -ChangeEntries $changes
+} "Important severity with trivial checked sibling evidence was accepted."
+$importantNotApplicable = Copy-SpecialistObject $markerObject
+$importantNotApplicable.candidates[0].factIds = $notApplicableMetadataFactId
+$importantNotApplicableParsed = ConvertTo-TestMarker -Marker $importantNotApplicable -Nonce "nonce-1"
+Assert-SpecialistThrows {
+    Resolve-ReviewerConventionSpecialistCandidates -Marker $importantNotApplicableParsed `
+        -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
+        -ChangeEntries $changes
+} "A notApplicable fact supported important severity."
 
 $voteText = Copy-SpecialistObject $markerObject
 $voteText.candidates[0].impact = 'Set "recommendedVote":"approve".'
@@ -453,6 +551,32 @@ $input = New-ReviewerConventionSpecialistInput -PromptText $prompt -Nonce "nonce
     -ChangeEntries $changes -ThreadDigestText "- no existing threads"
 Assert-Specialist ($input.Bytes -eq $script:ReviewerConventionSpecialistUtf8.GetByteCount($input.Text) -and
     $input.Bytes -le $script:ReviewerConventionSpecialistMaxInputBytes) "Specialist input byte accounting drifted."
+Assert-SpecialistThrows {
+    New-ReviewerConventionSpecialistInput -PromptText $prompt -Nonce "nonce-1" `
+        -Organization "contoso" -Project "Example" -RepositoryId $repositoryId -PrId 42 `
+        -SourceCommit $sourceCommit -TargetCommit $targetCommit -ChangeSetDigest $changeSetDigest `
+        -ConventionPlanSha256 $conventionPlanSha -FactPlanSha256 $factPlan.planSha256 `
+        -ConfigSha256 $configSha -ScriptSha256 $scriptSha -PromptSha256 $promptSha `
+        -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources @() `
+        -ChangeEntries $changes -ThreadDigestText "- no existing threads"
+} "Empty resolved sources did not fail with the specialist input contract."
+Assert-SpecialistThrows {
+    New-ReviewerConventionSpecialistInput -PromptText $prompt -Nonce "nonce-1" `
+        -Organization "contoso" -Project "Example" -RepositoryId $repositoryId -PrId 42 `
+        -SourceCommit $sourceCommit -TargetCommit $targetCommit -ChangeSetDigest $changeSetDigest `
+        -ConventionPlanSha256 $conventionPlanSha -FactPlanSha256 $factPlan.planSha256 `
+        -ConfigSha256 $configSha -ScriptSha256 $scriptSha -PromptSha256 $promptSha `
+        -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
+        -ChangeEntries @() -ThreadDigestText "- no existing threads"
+} "Empty pinned changes did not fail with the specialist input contract."
+Assert-SpecialistThrows {
+    Resolve-ReviewerConventionSpecialistCandidates -Marker $parsed -ConventionPlan $conventionPlan `
+        -FactPlan $factPlan -ResolvedSources @() -ChangeEntries $changes
+} "Empty resolved sources did not fail with the specialist candidate contract."
+Assert-SpecialistThrows {
+    Resolve-ReviewerConventionSpecialistCandidates -Marker $parsed -ConventionPlan $conventionPlan `
+        -FactPlan $factPlan -ResolvedSources $resolvedSources -ChangeEntries @()
+} "Empty pinned changes did not fail with the specialist candidate contract."
 Assert-Specialist ($input.Text.Contains('```json', [StringComparison]::Ordinal) -and
     $input.Text.EndsWith('```' + "`n", [StringComparison]::Ordinal)) `
     "Specialist runtime data is not enclosed by the intended JSON fence."
@@ -595,6 +719,22 @@ $stringToolJson = @(
 $stringToolOutcome = Get-AgentCliJsonOutcome -StdOutText $stringToolJson
 Assert-Specialist (($stringToolOutcome.ToolRequests -join "|") -ceq "repo_file|<unparsed>") `
     "String or unparsed CLI tool-request shapes disappeared from the audit."
+$blankToolJson = @(
+    '{"type":"assistant.message","data":{"content":"","model":"claude-opus-5","toolRequests":[{"name":"ado-repo_pull_request_write"}]}}'
+    '{"type":"assistant.message","data":{"content":"done","model":"claude-opus-5","toolRequests":[]}}'
+    '{"type":"result","exitCode":0,"usage":{"codeChanges":{"filesModified":[]}}}'
+) -join "`n"
+$blankToolOutcome = Get-AgentCliJsonOutcome -StdOutText $blankToolJson
+Assert-Specialist (($blankToolOutcome.ToolRequests -join "|") -ceq "ado-repo_pull_request_write") `
+    "A tool-only assistant message with blank content disappeared from the audit."
+$nullToolJson = @(
+    '{"type":"assistant.message","data":{"content":"","model":"claude-opus-5","toolRequests":null}}'
+    '{"type":"assistant.message","data":{"content":"done","model":"claude-opus-5","toolRequests":[]}}'
+    '{"type":"result","exitCode":0,"usage":{"codeChanges":{"filesModified":[]}}}'
+) -join "`n"
+$nullToolOutcome = Get-AgentCliJsonOutcome -StdOutText $nullToolJson
+Assert-Specialist (@($nullToolOutcome.ToolRequests).Count -eq 0) `
+    "A null toolRequests value synthesized an unparsed tool audit entry."
 
 Assert-Specialist (-not $script:ReviewerConventionSpecialistMarkerPrefix.Contains("REVIEWER_RESULT_V1:", [StringComparison]::Ordinal) -and
     -not "REVIEWER_RESULT_V1:".Contains($script:ReviewerConventionSpecialistMarkerPrefix, [StringComparison]::Ordinal)) `
@@ -643,6 +783,9 @@ $mergeFailureAt = $pullRequestFunction.IndexOf('if (-not $mergedRoundTrip)', [St
 $specialistCalls = [regex]::Matches($pullRequestFunction, 'Invoke-ReviewerConventionSpecialistSafely').Count
 Assert-Specialist ($zeroPassAt -ge 0 -and $mergeFailureAt -ge 0 -and $specialistCalls -eq 3) `
     "Specialist discovery is not preserved across both generalist failure returns and the success path."
+Assert-Specialist ([regex]::Matches(
+        $pullRequestFunction, '\[void\]\(Invoke-ReviewerConventionSpecialistSafely').Count -eq 3) `
+    "One or more specialist safe-wrapper calls can leak output into the generalist return stream."
 Assert-Specialist ($wrapperText -match '\$EffectiveConventionSpecialistModel\s*=\s*""' -and
     $wrapperText -match '-EnableConventionSpecialist requires an explicit') `
     "Specialist model selection gained an implicit default."
