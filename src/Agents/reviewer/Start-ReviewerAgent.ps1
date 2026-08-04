@@ -308,6 +308,11 @@ if (-not $importedHarness) {
         "or run this script from a checkout of the devpilot-agents repository.")
 }
 $HarnessPath = $importedHarness.Path
+$ConventionPackLibrary = Join-Path $PSScriptRoot "ConventionPacks.ps1"
+if (-not (Test-Path -LiteralPath $ConventionPackLibrary)) {
+    throw "Convention-pack library '$ConventionPackLibrary' does not exist."
+}
+. $ConventionPackLibrary
 
 $ResultMarkerPrefix = "REVIEWER_RESULT_V1:"
 
@@ -1567,7 +1572,8 @@ function Test-ReviewerAuthoritativeSourcePath {
 function ConvertTo-ReviewerAuthoritativeSourcePolicy {
     param(
         $RawPolicy,
-        [Parameter(Mandatory)][string]$RepositoryOrganization
+        [Parameter(Mandatory)][string]$RepositoryOrganization,
+        [string]$PolicyWhere = "config.repoConventions.authoritativeSources"
     )
     if ($null -eq $RawPolicy) {
         return @{ TransportVersion = $script:ReviewerAuthoritativeTransportVersion; MaxTotalBytes = 0; Sources = @() }
@@ -1575,32 +1581,37 @@ function ConvertTo-ReviewerAuthoritativeSourcePolicy {
     Assert-ReviewerExactObjectKeys -Object $RawPolicy `
         -Allowed @("note", "transportVersion", "maxTotalBytes", "sources") `
         -Required @("transportVersion", "maxTotalBytes", "sources") `
-        -Where "config.repoConventions.authoritativeSources"
+        -Where $PolicyWhere
     $transportVersion = Get-AgentConfigInt -Object $RawPolicy -Name "transportVersion" `
-        -Where "config.repoConventions.authoritativeSources" -Min 1 -Max 2147483647
+        -Where $PolicyWhere -Min 1 -Max 2147483647
     if ($transportVersion -ne $script:ReviewerAuthoritativeTransportVersion) {
-        throw "config.repoConventions.authoritativeSources.transportVersion $transportVersion is unsupported (expected $script:ReviewerAuthoritativeTransportVersion)."
+        throw "$PolicyWhere.transportVersion $transportVersion is unsupported (expected $script:ReviewerAuthoritativeTransportVersion)."
     }
     $maxTotalBytes = Get-AgentConfigInt -Object $RawPolicy -Name "maxTotalBytes" `
-        -Where "config.repoConventions.authoritativeSources" -Min 1 -Max $script:ReviewerAuthoritativeMaxTotalBytes
+        -Where $PolicyWhere -Min 1 -Max $script:ReviewerAuthoritativeMaxTotalBytes
     $rawSources = $RawPolicy.PSObject.Properties["sources"].Value
     if ($rawSources -is [string] -or $rawSources -is [System.Management.Automation.PSCustomObject] -or $null -eq $rawSources) {
-        throw "config.repoConventions.authoritativeSources.sources must be a JSON array."
+        throw "$PolicyWhere.sources must be a JSON array."
     }
     $sourceItems = @($rawSources)
     if ($sourceItems.Count -lt 1 -or $sourceItems.Count -gt $script:ReviewerAuthoritativeMaxSources) {
-        throw "config.repoConventions.authoritativeSources.sources must contain 1..$script:ReviewerAuthoritativeMaxSources entries."
+        throw "$PolicyWhere.sources must contain 1..$script:ReviewerAuthoritativeMaxSources entries."
     }
     $sources = New-Object System.Collections.Generic.List[hashtable]
-    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $seenNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $declaredBytes = 0
     for ($index = 0; $index -lt $sourceItems.Count; $index++) {
         $item = $sourceItems[$index]
-        $where = "config.repoConventions.authoritativeSources.sources[$index]"
+        $where = "$PolicyWhere.sources[$index]"
         Assert-ReviewerExactObjectKeys -Object $item `
-            -Allowed @("note", "organization", "project", "repositoryId", "path", "branch", "maxBytes", "expectedSha256", "expectedByteLength") `
+            -Allowed @("note", "name", "organization", "project", "repositoryId", "path", "branch", "maxBytes", "expectedSha256", "expectedByteLength") `
             -Required @("organization", "project", "repositoryId", "path", "branch", "maxBytes") `
             -Where $where
+        $name = ""
+        if ($item.PSObject.Properties["name"]) {
+            $name = Get-AgentConfigString -Object $item -Name "name" -Where $where -MaxLength 64 -Pattern '^[a-z][a-z0-9-]{0,63}$'
+        }
         $organization = Get-AgentConfigString -Object $item -Name "organization" -Where $where -MaxLength 64 -Pattern '^[A-Za-z0-9][A-Za-z0-9._-]*$'
         if ($organization -cne $RepositoryOrganization) {
             throw "$where.organization must exactly match config.repository.organization; cross-organization source transport is not supported."
@@ -1636,7 +1647,9 @@ function ConvertTo-ReviewerAuthoritativeSourcePolicy {
         }
         $key = "$organization`n$project`n$repositoryId`n$branch`n$path"
         if (-not $seen.Add($key)) { throw "$where duplicates an earlier authoritative source." }
+        if ($name -and -not $seenNames.Add($name)) { throw "$where.name '$name' duplicates an earlier authoritative source name." }
         [void]$sources.Add(@{
+                Name              = $name
                 Organization      = $organization
                 Project           = $project
                 RepositoryId      = $repositoryId
@@ -1727,6 +1740,7 @@ $SystemSubstrings = Get-AgentConfigStringArray -Object $threadCfg -Name "systemI
 # and the result-marker contract it defines - is identical for every consumer.
 $RepoConventionsText = ""
 $AuthoritativeSourcePolicy = @{ TransportVersion = $script:ReviewerAuthoritativeTransportVersion; MaxTotalBytes = 0; Sources = @() }
+$ConventionPackPolicy = $null
 $repoConvProp = $Cfg.PSObject.Properties["repoConventions"]
 if ($repoConvProp -and $repoConvProp.Value) {
     $rc = $repoConvProp.Value
@@ -1747,6 +1761,19 @@ if ($repoConvProp -and $repoConvProp.Value) {
     if ($sourcesProp) {
         $AuthoritativeSourcePolicy = ConvertTo-ReviewerAuthoritativeSourcePolicy `
             -RawPolicy $sourcesProp.Value -RepositoryOrganization $cfgOrganization
+    }
+    $packsProp = $rc.PSObject.Properties["conventionPacks"]
+    if ($packsProp) {
+        $rawPackSources = Get-ReviewerConventionValue -Object $packsProp.Value -Name "authoritativeSources"
+        $packSourcePolicy = ConvertTo-ReviewerAuthoritativeSourcePolicy `
+            -RawPolicy $rawPackSources -RepositoryOrganization $cfgOrganization `
+            -PolicyWhere "config.repoConventions.conventionPacks.authoritativeSources"
+        $ConventionPackPolicy = ConvertTo-ReviewerConventionPackPolicy `
+            -RawPolicy $packsProp.Value -AuthoritativeSourcePolicy $packSourcePolicy `
+            -RepositoryBinding @{
+                Organization = $cfgOrganization; Project = $cfgProject; RepositoryId = $cfgRepoId.ToLowerInvariant()
+                TargetRef = $TargetRefName
+            }
     }
 }
 
@@ -1872,6 +1899,8 @@ $logDir = Join-Path $StateDir "logs"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $previewDir = Join-Path $StateDir "previews"
 New-Item -ItemType Directory -Force -Path $previewDir | Out-Null
+$conventionPlanDir = Join-Path $StateDir "convention-plans"
+New-Item -ItemType Directory -Force -Path $conventionPlanDir | Out-Null
 $logPath = Join-Path $logDir "reviewer.log.jsonl"
 $lockPath = Join-Path $StateDir "agent.lock"
 $reviewedStatePath = Join-Path $StateDir "reviewed.json"
@@ -1879,6 +1908,7 @@ $attemptsStatePath = Join-Path $StateDir "attempts.json"
 $artifactKeyPath = Join-Path $StateDir "artifact-signing.key"
 
 $ScriptSelfSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
+$ConfigSha256 = (Get-FileHash -LiteralPath $ConfigFile -Algorithm SHA256).Hash
 # Two children, two different scrubs, and the asymmetry is deliberate rather
 # than an oversight - it is worth stating because the "obviously stricter"
 # version of this is broken.
@@ -1990,7 +2020,8 @@ function Assert-ReviewerAuthoritativeSourcePins {
 function Get-ReviewerAuthoritativeSourceSnapshots {
     param(
         [Parameter(Mandatory)][string]$AgencyPath,
-        [Parameter(Mandatory)][hashtable]$Policy
+        [Parameter(Mandatory)][hashtable]$Policy,
+        [switch]$ConventionPackMode
     )
     $sources = @($Policy.Sources)
     if ($sources.Count -eq 0) { return , @() }
@@ -1998,9 +2029,17 @@ function Get-ReviewerAuthoritativeSourceSnapshots {
     try {
         # A dedicated session keeps a convention-source failure from closing the
         # review session that owns pending deliveries and PR writes.
-        $sourceSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
-            -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
-            -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+        try {
+            $sourceSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
+                -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
+                -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+        }
+        catch {
+            if ($ConventionPackMode) {
+                throw (New-ReviewerConventionEnvironmentException -Operation "open authoritative-source MCP session" -InnerException $_.Exception)
+            }
+            throw
+        }
         if ([string]$sourceSession.Server -cne "ado" -or [string]$sourceSession.Organization -cne $Organization) {
             throw "Authoritative source MCP session was not bound to the wrapper-requested ADO organization."
         }
@@ -2012,10 +2051,18 @@ function Get-ReviewerAuthoritativeSourceSnapshots {
         foreach ($source in $sources) {
             $repositoryKey = "$($source.Project)`n$($source.RepositoryId)"
             if (-not $repositoryCache.ContainsKey($repositoryKey)) {
-                $repository = Invoke-AgentMcpTool -Session $sourceSession -Name "repo_repository" -Arguments @{
-                    action             = "get"
-                    project            = $source.Project
-                    repositoryNameOrId = $source.RepositoryId
+                try {
+                    $repository = Invoke-AgentMcpTool -Session $sourceSession -Name "repo_repository" -Arguments @{
+                        action             = "get"
+                        project            = $source.Project
+                        repositoryNameOrId = $source.RepositoryId
+                    }
+                }
+                catch {
+                    if ($ConventionPackMode) {
+                        throw (New-ReviewerConventionEnvironmentException -Operation "read authoritative repository identity" -InnerException $_.Exception)
+                    }
+                    throw
                 }
                 Assert-ReviewerAuthoritativeRepositoryIdentity -Repository $repository `
                     -ExpectedProject $source.Project -ExpectedRepositoryId $source.RepositoryId
@@ -2024,11 +2071,19 @@ function Get-ReviewerAuthoritativeSourceSnapshots {
 
             $commitKey = "$repositoryKey`n$($source.Branch)"
             if (-not $commitCache.ContainsKey($commitKey)) {
-                $branchResult = Invoke-AgentMcpTool -Session $sourceSession -Name "repo_branch" -Arguments @{
-                    action       = "get"
-                    project      = $source.Project
-                    repositoryId = $source.RepositoryId
-                    branchName   = $source.Branch
+                try {
+                    $branchResult = Invoke-AgentMcpTool -Session $sourceSession -Name "repo_branch" -Arguments @{
+                        action       = "get"
+                        project      = $source.Project
+                        repositoryId = $source.RepositoryId
+                        branchName   = $source.Branch
+                    }
+                }
+                catch {
+                    if ($ConventionPackMode) {
+                        throw (New-ReviewerConventionEnvironmentException -Operation "resolve authoritative source branch" -InnerException $_.Exception)
+                    }
+                    throw
                 }
                 $commitCache[$commitKey] = ConvertFrom-ReviewerAuthoritativeBranch `
                     -BranchResult $branchResult -ExpectedBranch $source.Branch
@@ -2038,16 +2093,24 @@ function Get-ReviewerAuthoritativeSourceSnapshots {
             # Agency ADO repo_file accepts versionType=Commit and version=<sha>.
             # Live smoke proved historical commits return distinct bytes and a
             # nonexistent 40-hex commit returns TF401029 rather than branch tip.
-            $toolResult = Send-AgentMcpRequest -Session $sourceSession -Method "tools/call" -Params @{
-                name      = "repo_file"
-                arguments = @{
-                    action       = "get_content"
-                    project      = $source.Project
-                    repositoryId = $source.RepositoryId
-                    path         = $source.Path
-                    versionType  = "Commit"
-                    version      = $commitSha
+            try {
+                $toolResult = Send-AgentMcpRequest -Session $sourceSession -Method "tools/call" -Params @{
+                    name      = "repo_file"
+                    arguments = @{
+                        action       = "get_content"
+                        project      = $source.Project
+                        repositoryId = $source.RepositoryId
+                        path         = $source.Path
+                        versionType  = "Commit"
+                        version      = $commitSha
+                    }
                 }
+            }
+            catch {
+                if ($ConventionPackMode) {
+                    throw (New-ReviewerConventionEnvironmentException -Operation "read authoritative source content" -InnerException $_.Exception)
+                }
+                throw
             }
             $resource = ConvertFrom-AgentMcpResourceContent -ToolResult $toolResult `
                 -ExpectedUri $source.Path -MaxBytes $source.MaxBytes `
@@ -2058,11 +2121,14 @@ function Get-ReviewerAuthoritativeSourceSnapshots {
                 throw "Authoritative source content exceeded the configured total of $($Policy.MaxTotalBytes) bytes."
             }
             [void]$snapshots.Add(@{
+                    SourceId     = $(if ($source.Name) { $source.Name } else { "legacy:$($source.RepositoryId):$($source.Path)" })
+                    TrustTier    = "pinned-external"
                     Organization = $source.Organization
                     Project      = $source.Project
                     RepositoryId = $source.RepositoryId
                     Path         = $source.Path
                     Branch       = $source.Branch
+                    Ref          = "refs/heads/$($source.Branch)"
                     CommitSha    = $commitSha
                     MimeType     = $resource.MimeType
                     ByteLength   = [int]$resource.ByteLength
@@ -2075,6 +2141,82 @@ function Get-ReviewerAuthoritativeSourceSnapshots {
     finally {
         if ($sourceSession) { Close-AgentMcpSession -Session $sourceSession }
     }
+}
+
+function Get-ReviewerConventionTargetCommit {
+    param([Parameter(Mandatory)][hashtable]$Session)
+    $targetBranch = $TargetRefName -replace '^refs/heads/', ''
+    try {
+        $branchResult = Invoke-AgentMcpTool -Session $Session -Name "repo_branch" -Arguments @{
+            action       = "get"
+            project      = $ExpectedProject
+            repositoryId = $cfgRepoId
+            branchName   = $targetBranch
+        }
+    }
+    catch {
+        throw (New-ReviewerConventionEnvironmentException -Operation "resolve reviewed target branch" -InnerException $_.Exception)
+    }
+    return ConvertFrom-ReviewerAuthoritativeBranch -BranchResult $branchResult -ExpectedBranch $targetBranch
+}
+
+function Get-ReviewerConventionRepositorySnapshots {
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)][object[]]$RepositorySources,
+        [Parameter(Mandatory)][string]$TargetCommit
+    )
+    if ($TargetCommit -notmatch '^[0-9a-f]{40}$') { throw "Convention repository sources require an exact 40-hex target commit." }
+    $snapshots = New-Object System.Collections.Generic.List[hashtable]
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($source in @($RepositorySources)) {
+        $path = [string]$source.Path
+        if (-not $seen.Add($path)) { continue }
+        try {
+            $toolResult = Send-AgentMcpRequest -Session $Session -Method "tools/call" -Params @{
+                name      = "repo_file"
+                arguments = @{
+                    action       = "get_content"
+                    project      = $ExpectedProject
+                    repositoryId = $cfgRepoId
+                    path         = $path
+                    versionType  = "Commit"
+                    version      = $TargetCommit
+                }
+            }
+        }
+        catch {
+            throw (New-ReviewerConventionEnvironmentException -Operation "read target-branch convention source" -InnerException $_.Exception)
+        }
+        $resource = ConvertFrom-AgentMcpResourceContent -ToolResult $toolResult `
+            -ExpectedUri $path -MaxBytes ([int]$source.MaxBytes) `
+            -AllowedMimeTypes $script:ReviewerAuthoritativeMimeTypes
+        [void]$snapshots.Add(@{
+                SourceId     = "repo:" + $path.ToLowerInvariant()
+                TrustTier    = "repo-target"
+                Organization = $Organization
+                Project      = $ExpectedProject
+                RepositoryId = $cfgRepoId.ToLowerInvariant()
+                Path         = $path
+                Ref          = $TargetRefName
+                CommitSha    = $TargetCommit
+                MimeType     = $resource.MimeType
+                ByteLength   = [int]$resource.ByteLength
+                Sha256       = $resource.Sha256
+            })
+    }
+    return , $snapshots.ToArray()
+}
+
+function Save-ReviewerConventionPlan {
+    param(
+        [Parameter(Mandatory)]$Plan,
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)][string]$SourceCommit
+    )
+    $path = Join-Path $conventionPlanDir "pr$PrId-$SourceCommit.json"
+    $Plan | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $path -Encoding UTF8
+    return $path
 }
 
 function Format-ReviewerAuthoritativeSources {
@@ -4226,6 +4368,72 @@ function Get-ReviewerChangedPaths {
     }
 }
 
+function Get-ReviewerPinnedConventionChangeSet {
+    <# Convention routing has a stricter contract than comment-anchor scoping.
+       It reads the change set twice around exact source/target validation and
+       requires both canonical digests to agree. A 1000-entry response is treated
+       as potentially truncated because the MCP transport exposes no continuation. #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)][string]$ExpectedSourceCommit
+    )
+    $targetBefore = Get-ReviewerConventionTargetCommit -Session $Session
+    try {
+        $firstRaw = Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments @{
+            action = "get_changes"; project = $ExpectedProject; repositoryId = $RepositoryName
+            pullRequestId = $PrId; top = 1000
+        }
+    }
+    catch {
+        throw (New-ReviewerConventionEnvironmentException -Operation "read first PR change set" -InnerException $_.Exception)
+    }
+    try {
+        $currentPr = Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments @{
+            action = "get"; project = $ExpectedProject; repositoryId = $RepositoryName; pullRequestId = $PrId
+        }
+    }
+    catch {
+        throw (New-ReviewerConventionEnvironmentException -Operation "re-read PR binding" -InnerException $_.Exception)
+    }
+    $currentSourceCommit = Get-ReviewerSourceCommit -Pr $currentPr
+    if (-not (Test-ReviewerConventionCommitEqual -Left $currentSourceCommit -Right $ExpectedSourceCommit)) {
+        throw (New-ReviewerConventionEnvironmentException -Operation "pin PR source commit" `
+                -InnerException ([InvalidOperationException]::new("PR $PrId moved while its convention change set was being pinned.")))
+    }
+    try {
+        $secondRaw = Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments @{
+            action = "get_changes"; project = $ExpectedProject; repositoryId = $RepositoryName
+            pullRequestId = $PrId; top = 1000
+        }
+    }
+    catch {
+        throw (New-ReviewerConventionEnvironmentException -Operation "read second PR change set" -InnerException $_.Exception)
+    }
+    $targetAfter = Get-ReviewerConventionTargetCommit -Session $Session
+    if ($targetBefore -cne $targetAfter) {
+        throw (New-ReviewerConventionEnvironmentException -Operation "pin target branch commit" `
+                -InnerException ([InvalidOperationException]::new("The target branch moved while PR $PrId's convention change set was being pinned.")))
+    }
+    if ((Test-ReviewerConventionResponseTruncated -Response $firstRaw -Limit 1000) -or
+        (Test-ReviewerConventionResponseTruncated -Response $secondRaw -Limit 1000)) {
+        throw "PR $PrId's convention change set may be truncated at the 1000-entry transport limit."
+    }
+    $first = @(ConvertTo-ReviewerConventionChangeSet -Response $firstRaw)
+    $second = @(ConvertTo-ReviewerConventionChangeSet -Response $secondRaw)
+    $firstDigest = Get-ReviewerConventionChangeSetDigest -Entries $first
+    $secondDigest = Get-ReviewerConventionChangeSetDigest -Entries $second
+    if ($firstDigest -cne $secondDigest) {
+        throw (New-ReviewerConventionEnvironmentException -Operation "pin PR change-set digest" `
+                -InnerException ([InvalidOperationException]::new("PR $PrId's convention change set changed while it was being pinned.")))
+    }
+    return @{
+        Entries      = $second
+        Digest       = $secondDigest
+        TargetCommit = $targetAfter
+    }
+}
+
 function Test-ReviewerDeliveryStillValid {
     <#
         Re-reads the PR immediately before the wrapper writes anything.
@@ -5355,6 +5563,89 @@ function Invoke-ReviewerCycle {
             $threads = Get-ReviewerPullRequestThreads -Session $session -PrId $prId
             $digest = Build-ReviewerThreadDigest -Threads $threads -BotSubstrings $BotSubstrings -SystemSubstrings $SystemSubstrings
             $changedPaths = Get-ReviewerChangedPaths -Session $session -PrId $prId
+            $conventionPlanPath = ""
+            if ($ConventionPackPolicy) {
+                try {
+                    $pinnedChanges = Get-ReviewerPinnedConventionChangeSet -Session $session -PrId $prId `
+                        -ExpectedSourceCommit $sourceCommit
+                    $selection = Select-ReviewerConventionPacks -Policy $ConventionPackPolicy `
+                        -ChangeEntries @($pinnedChanges.Entries)
+                    $sourceRequests = Get-ReviewerConventionSourceRequests -Selection $selection
+                    $selectedSourceNames = @($sourceRequests.AuthoritativeSourceNames)
+                    $selectedAuthoritativePolicy = @{
+                        TransportVersion = $ConventionPackPolicy.AuthoritativeSourcePolicy.TransportVersion
+                        MaxTotalBytes    = $ConventionPackPolicy.AuthoritativeSourcePolicy.MaxTotalBytes
+                        Sources          = @($ConventionPackPolicy.AuthoritativeSourcePolicy.Sources | Where-Object {
+                                $selectedSourceNames -ccontains $_.Name
+                            })
+                    }
+                    $packAuthoritativeSnapshots = @()
+                    if (@($selectedAuthoritativePolicy.Sources).Count -gt 0) {
+                        $packAuthoritativeSnapshots = @(Get-ReviewerAuthoritativeSourceSnapshots `
+                                -AgencyPath $AgencyPath -Policy $selectedAuthoritativePolicy -ConventionPackMode)
+                    }
+                    $selectedRepositorySources = @($sourceRequests.RepositorySources)
+                    $packRepositorySnapshots = @()
+                    if ($selectedRepositorySources.Count -gt 0) {
+                        $packRepositorySnapshots = @(Get-ReviewerConventionRepositorySnapshots `
+                                -Session $session -RepositorySources $selectedRepositorySources `
+                                -TargetCommit $pinnedChanges.TargetCommit)
+                    }
+                    $conventionPlan = New-ReviewerConventionContextPlan -Policy $ConventionPackPolicy `
+                        -Selection $selection -Binding @{
+                            Organization = $Organization; Project = $ExpectedProject; RepositoryId = $cfgRepoId
+                            PullRequestId = $prId; SourceCommit = $sourceCommit
+                            TargetCommit = $pinnedChanges.TargetCommit; ChangeSetDigest = $pinnedChanges.Digest
+                        } -AuthoritativeSnapshots $packAuthoritativeSnapshots `
+                        -RepositorySnapshots $packRepositorySnapshots `
+                        -ScriptSha256 $ScriptSelfSha256 -ConfigSha256 $ConfigSha256
+                    $conventionPlanPath = Save-ReviewerConventionPlan -Plan $conventionPlan `
+                        -PrId $prId -SourceCommit $sourceCommit
+                    Write-Host ("  PR {0} convention plan: {1} selected, {2} withheld, {3}/{4} bytes." -f `
+                            $prId, @($conventionPlan.selectedPacks).Count, @($conventionPlan.withheldPacks).Count,
+                            $conventionPlan.totalContextBytes, $conventionPlan.maxTotalBytes) -ForegroundColor Cyan
+                    Write-ReviewerCycleMetadata -Fields @{
+                        cycle = $CycleNumber; mode = "convention-plan"; result = "ready"; prId = $prId
+                        sourceCommit = $sourceCommit; changeSetDigest = $pinnedChanges.Digest
+                        selectedPackCount = @($conventionPlan.selectedPacks).Count
+                        totalContextBytes = $conventionPlan.totalContextBytes; planPath = $conventionPlanPath
+                    }
+                }
+                catch {
+                    $conventionEnvironmentFault = Test-ReviewerConventionEnvironmentException -Exception $_.Exception
+                    $reason = "convention context planning failed: $($_.Exception.Message)"
+                    $failedPlan = [pscustomobject][ordered]@{
+                        planVersion = $script:ReviewerConventionPlanVersion; schemaVersion = $script:ReviewerConventionPackSchemaVersion
+                        status = "failed"; failureReason = $reason; scriptSha256 = $ScriptSelfSha256.ToLowerInvariant()
+                        configSha256 = $ConfigSha256.ToLowerInvariant(); organization = $Organization
+                        project = $ExpectedProject; repositoryId = $cfgRepoId; pullRequestId = $prId
+                        sourceCommit = $sourceCommit; selectedPacks = @(); withheldPacks = @()
+                        environmentFault = $conventionEnvironmentFault
+                        totalContextBytes = 0; maxTotalBytes = $script:ReviewerConventionMaxTotalBytes
+                    }
+                    $conventionPlanPath = Save-ReviewerConventionPlan -Plan $failedPlan -PrId $prId -SourceCommit $sourceCommit
+                    if ($conventionEnvironmentFault) {
+                        Write-Warning "PR $prId not reviewed - ENVIRONMENT fault, not counted toward starvation: $reason"
+                    }
+                    else {
+                        Write-Warning "PR $prId not reviewed - $reason"
+                        $prior = $attemptsState[[string]$prId]
+                        $priorCount = if ($prior -is [int]) { [int]$prior } else { [int](Get-ReviewerHashValue -Container $prior -Key 'count' -Default 0) }
+                        $attemptsState[[string]$prId] = @{
+                            count = ($priorCount + 1); lastAt = ([DateTime]::UtcNow.ToString("o")); lastReason = $reason
+                        }
+                        Set-JsonState -Path $attemptsStatePath -State $attemptsState
+                    }
+                    Write-ReviewerCycleMetadata -Fields @{
+                        cycle = $CycleNumber; mode = "convention-plan"; result = "failed"; prId = $prId
+                        sourceCommit = $sourceCommit; reason = $reason; planPath = $conventionPlanPath
+                        environmentFault = $conventionEnvironmentFault
+                    }
+                    $result.ExitCode = 1
+                    [void]$retried.Add("PR $prId convention plan failed")
+                    continue
+                }
+            }
 
             [void]$bound.Add(@{
                     PrId                 = $prId
@@ -5364,6 +5655,7 @@ function Invoke-ReviewerCycle {
                     AuthorAlias          = (Get-ReviewerAlias -UniqueName ([string](Get-ReviewerHashValue -Container (Get-ReviewerHashValue -Container $prRecord -Key 'createdBy') -Key 'uniqueName' -Default '')))
                     DigestText           = $digest.Text
                     ChangedPaths         = $changedPaths
+                    ConventionPlanPath   = $conventionPlanPath
                     ExistingFingerprints = (Get-ReviewerExistingFingerprints -Threads $threads)
                 })
         }

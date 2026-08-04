@@ -76,6 +76,45 @@
           "expectedSha256": "82ae4e259f55c0fb1ac8aa1239e210ad0c3b2a43ab006b394affe94a10e16f72"
         }
       ]
+    },
+    "conventionPacks": {
+      "note": "Optional path-gated convention planning. This catalog is separate from authoritativeSources above so selected pack content is never added to the existing generalist context.",
+      "schemaVersion": 1,
+      "requireAllSourcesReferenced": true,
+      "authoritativeSources": {
+        "transportVersion": 1,
+        "maxTotalBytes": 1024,
+        "sources": [
+          {
+            "name": "shared-csharp",
+            "organization": "contoso",
+            "project": "ExampleProject",
+            "repositoryId": "22222222-2222-2222-2222-222222222222",
+            "path": "/docs/csharp-conventions.md",
+            "branch": "main",
+            "maxBytes": 1024
+          }
+        ]
+      },
+      "packs": [
+        {
+          "name": "csharp-core",
+          "priority": 100,
+          "changedPathGlobs": [
+            "src/**/*.cs"
+          ],
+          "authoritativeSourceRefs": [
+            "shared-csharp"
+          ],
+          "repositorySources": [
+            {
+              "path": "/docs/reviewer/csharp.md",
+              "maxBytes": 1024
+            }
+          ],
+          "maxBytes": 4096
+        }
+      ]
     }
   },
   "permissions": {

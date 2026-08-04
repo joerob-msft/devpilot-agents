@@ -1,0 +1,58 @@
+{
+  "planVersion": 1,
+  "schemaVersion": 1,
+  "status": "ready",
+  "failureReason": "",
+  "environmentFault": false,
+  "scriptSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "configSha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "organization": "contoso",
+  "project": "Example",
+  "repositoryId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+  "pullRequestId": 42,
+  "sourceCommit": "cccccccccccccccccccccccccccccccccccccccc",
+  "targetCommit": "dddddddddddddddddddddddddddddddddddddddd",
+  "changeSetDigest": "3f535a9e5766874ccbbb324fab39131581cac5a1e12ee1743fc8c7762c28ba8e",
+  "selectedPacks": [
+    {
+      "name": "selected-pack",
+      "priority": 100,
+      "matchedPaths": [
+        {
+          "path": "SRC/Api/Handler.cs",
+          "role": "current",
+          "changeTypes": [
+            "edit"
+          ],
+          "globs": [
+            "src/**/*.cs"
+          ]
+        }
+      ],
+      "sources": [
+        {
+          "sourceId": "selected-source",
+          "trustTier": "pinned-external",
+          "organization": "contoso",
+          "project": "Example",
+          "repositoryId": "11111111-2222-3333-4444-555555555555",
+          "path": "/rules/selected.md",
+          "ref": "refs/heads/main",
+          "commitSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "mimeType": "text/markdown",
+          "byteLength": 7
+        }
+      ],
+      "contentBytes": 7,
+      "provenanceBytes": 547,
+      "contextBytes": 554,
+      "maxBytes": 554,
+      "status": "selected",
+      "reason": ""
+    }
+  ],
+  "withheldPacks": [],
+  "totalContextBytes": 554,
+  "maxTotalBytes": 554
+}

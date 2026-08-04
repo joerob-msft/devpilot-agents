@@ -255,6 +255,40 @@ being ignored. It converts only configured wrapper-fetched sources; model-side
 an empty list is rejected rather than falling back to CLI-default discovery.
 `samples/reviewer-ado.config.json` contains the generic contract.
 
+#### Path-gated convention packs
+
+`repoConventions.conventionPacks` is a separate, versioned convention catalog for
+a later specialist reviewer. Layer 2 computes and saves a context plan before any
+model launch, but deliberately does **not** add the plan or its sources to either
+existing generalist pass. The catalog reuses the authoritative source transport's
+repository, commit, MIME, hash, and decoded-byte checks without sharing its
+generalist runtime-context destination.
+
+Selection is deterministic: changed paths use `/` separators, one leading slash
+is ignored, Windows `\` separators are normalized, and matching is ordinal
+case-insensitive because the reviewer is Windows-only. Globs support segment-local
+`*` and `?`, plus `**` only as a complete segment. Character classes, braces,
+extglobs, escaping, absolute/traversal paths, consecutive `**`, and a bare `**`
+are rejected. A rename considers both old and new paths; a delete considers the
+deleted path. Generated files are never hidden by a heuristic: they select only
+the packs whose explicit globs match them.
+
+Overlapping packs are retained and ordered by ascending `priority`, then exact
+pack name. Paths and source requests are deduplicated within the plan; the same
+source used by multiple selected packs is conservatively charged to every pack.
+Unmatched packs resolve no sources. Repository-local convention files are read
+from a twice-checked target-branch commit, never from author-controlled PR source
+content.
+
+Each pack's `maxBytes` covers decoded source bytes plus the exact serialized
+matching/provenance descriptor. The code-defined total convention-context cap is
+131072 bytes. Exceeding either cap fails that PR's plan closed before its model
+launch; no source or rule is silently truncated. The saved plan records selected
+and withheld packs, matched paths and globs, source trust tiers, repository/path/
+ref/commit/hash/MIME/byte provenance, the pinned change-set digest, and exact byte
+counts. See [docs/convention-packs.md](docs/convention-packs.md) and the
+preview-only `samples/azureux-bpm-convention-packs.preview.json` replay profile.
+
 Posted findings appear under **your** identity, since that is who the session is
 authenticated as. That is why every write is opt-in.
 
