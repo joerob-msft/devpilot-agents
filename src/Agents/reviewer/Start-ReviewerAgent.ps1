@@ -5768,7 +5768,7 @@ function Get-ReviewerVerificationSourceHunks {
     )
     $changed = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($changedPath in @($ChangedPaths)) {
-        $normalized = ([string]$changedPath).Trim().Replace('\', '/').TrimStart('/').ToLowerInvariant()
+        $normalized = (ConvertTo-ReviewerVerificationPath -Path ([string]$changedPath)).TrimStart("/")
         if ($normalized) { [void]$changed.Add($normalized) }
     }
     return Invoke-ReviewerConventionSession -AgencyPath $AgencyPath -Action {
@@ -5780,8 +5780,9 @@ function Get-ReviewerVerificationSourceHunks {
                 -not [string]$candidate.filePath -or [int]$candidate.line -lt 1) {
                 continue
             }
-            $path = ([string]$candidate.filePath).TrimStart("/")
-            $normalizedPath = $path.Replace('\', '/').ToLowerInvariant()
+            $normalizedPath = (ConvertTo-ReviewerVerificationPath -Path (
+                    [string]$candidate.filePath)).TrimStart("/")
+            $path = $normalizedPath
             $segments = @($normalizedPath -split '/')
             if (-not $changed.Contains($normalizedPath) -or
                 $normalizedPath -notmatch '^[a-z0-9._ /-]+$' -or

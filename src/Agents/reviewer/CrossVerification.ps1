@@ -287,6 +287,17 @@ function ConvertTo-ReviewerVerificationNormalizedText {
     return ([regex]::Replace($value, '\s+', ' ', "CultureInvariant", [TimeSpan]::FromMilliseconds(250))).Trim()
 }
 
+function ConvertTo-ReviewerVerificationPath {
+    param([AllowEmptyString()][string]$Path = "")
+    $value = $Path.Trim().Replace('\', '/')
+    if (-not $value) { return "" }
+    while ($value.StartsWith("./", [StringComparison]::Ordinal)) {
+        $value = $value.Substring(2)
+    }
+    if (-not $value.StartsWith("/", [StringComparison]::Ordinal)) { $value = "/$value" }
+    return $value.TrimEnd('/').ToLowerInvariant()
+}
+
 function Get-ReviewerVerificationTokens {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
     $stop = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -510,8 +521,10 @@ function Get-ReviewerVerificationClusters {
             $bText = ConvertTo-ReviewerVerificationNormalizedText -Text (
                 [string](Get-ReviewerVerificationValue $b "comment" (
                     Get-ReviewerVerificationValue $b "evidence" "")))
-            $aPath = ([string](Get-ReviewerVerificationValue $a "filePath" "")).Replace('\', '/').ToLowerInvariant()
-            $bPath = ([string](Get-ReviewerVerificationValue $b "filePath" "")).Replace('\', '/').ToLowerInvariant()
+            $aPath = ConvertTo-ReviewerVerificationPath -Path (
+                [string](Get-ReviewerVerificationValue $a "filePath" ""))
+            $bPath = ConvertTo-ReviewerVerificationPath -Path (
+                [string](Get-ReviewerVerificationValue $b "filePath" ""))
             $aLine = [int](Get-ReviewerVerificationValue $a "line" 0)
             $bLine = [int](Get-ReviewerVerificationValue $b "line" 0)
             $sameAnchor = $aPath -ceq $bPath -and $aLine -eq $bLine
@@ -623,13 +636,15 @@ function Find-ReviewerVerificationExistingDuplicate {
         [Parameter(Mandatory)]$Candidate,
         [object[]]$ThreadFacts = @()
     )
-    $candidatePath = ([string](Get-ReviewerVerificationValue $Candidate "filePath" "")).Replace('\', '/').ToLowerInvariant()
+    $candidatePath = ConvertTo-ReviewerVerificationPath -Path (
+        [string](Get-ReviewerVerificationValue $Candidate "filePath" ""))
     $candidateLine = [int](Get-ReviewerVerificationValue $Candidate "line" 0)
     $candidateText = [string](Get-ReviewerVerificationValue $Candidate "comment" (
             Get-ReviewerVerificationValue $Candidate "evidence" ""))
     $candidateTokens = @(Get-ReviewerVerificationTokens -Text $candidateText)
     foreach ($thread in @($ThreadFacts)) {
-        $threadPath = ([string](Get-ReviewerVerificationValue $thread "filePath" "")).Replace('\', '/').ToLowerInvariant()
+        $threadPath = ConvertTo-ReviewerVerificationPath -Path (
+            [string](Get-ReviewerVerificationValue $thread "filePath" ""))
         $threadLine = [int](Get-ReviewerVerificationValue $thread "line" 0)
         if ($candidatePath -cne $threadPath -or $candidateLine -ne $threadLine) { continue }
         $threadText = [string](Get-ReviewerVerificationValue $thread "sanitizedSubstance" "")
@@ -655,9 +670,11 @@ function Test-ReviewerVerificationThreadRelevant {
         [Parameter(Mandatory)]$Candidate,
         [Parameter(Mandatory)]$Thread
     )
-    $candidatePath = ([string](Get-ReviewerVerificationValue $Candidate "filePath" "")).Replace('\', '/').ToLowerInvariant()
+    $candidatePath = ConvertTo-ReviewerVerificationPath -Path (
+        [string](Get-ReviewerVerificationValue $Candidate "filePath" ""))
     $candidateLine = [int](Get-ReviewerVerificationValue $Candidate "line" 0)
-    $threadPath = ([string](Get-ReviewerVerificationValue $Thread "filePath" "")).Replace('\', '/').ToLowerInvariant()
+    $threadPath = ConvertTo-ReviewerVerificationPath -Path (
+        [string](Get-ReviewerVerificationValue $Thread "filePath" ""))
     $threadLine = [int](Get-ReviewerVerificationValue $Thread "line" 0)
     if ($candidatePath -cne $threadPath -or $candidateLine -ne $threadLine) { return $false }
     $candidateText = [string](Get-ReviewerVerificationValue $Candidate "comment" (
@@ -679,7 +696,7 @@ function Get-ReviewerVerificationAssignments {
     $models = @($GeneralistModels)
     $changed = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($path in @($ChangedPaths)) {
-        $normalized = ([string]$path).Trim().Replace('\', '/').TrimStart('/').ToLowerInvariant()
+        $normalized = ConvertTo-ReviewerVerificationPath -Path ([string]$path)
         if ($normalized) { [void]$changed.Add($normalized) }
     }
     $assignments = [System.Collections.Generic.List[object]]::new()
@@ -688,7 +705,7 @@ function Get-ReviewerVerificationAssignments {
             $originKind = [string](Get-ReviewerVerificationValue $candidate "originKind" "")
             $originModel = [string](Get-ReviewerVerificationValue $candidate "originModel" "")
             if ($changed.Count -gt 0 -and [string]$candidate.anchorKind -ceq "changedFile") {
-                $candidatePath = ([string]$candidate.filePath).Trim().Replace('\', '/').TrimStart('/').ToLowerInvariant()
+                $candidatePath = ConvertTo-ReviewerVerificationPath -Path ([string]$candidate.filePath)
                 if (-not $candidatePath -or [int]$candidate.line -lt 1 -or
                     -not $changed.Contains($candidatePath)) {
                     continue
@@ -989,7 +1006,7 @@ function Resolve-ReviewerVerificationDecisions {
     }
     $changed = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($path in @($ChangedPaths)) {
-        $normalized = ([string]$path).Trim().Replace('\', '/').TrimStart('/').ToLowerInvariant()
+        $normalized = ConvertTo-ReviewerVerificationPath -Path ([string]$path)
         if ($normalized) { [void]$changed.Add($normalized) }
     }
     $factMap = @{}
@@ -1026,7 +1043,7 @@ function Resolve-ReviewerVerificationDecisions {
                     })
                 continue
             }
-            $path = ([string]$candidate.filePath).Trim().Replace('\', '/').TrimStart('/').ToLowerInvariant()
+            $path = ConvertTo-ReviewerVerificationPath -Path ([string]$candidate.filePath)
             $anchorValid = if ([string]$candidate.anchorKind -ceq "prMetadata") {
                 [int]$candidate.line -eq 0 -and -not $candidate.filePath
             }
