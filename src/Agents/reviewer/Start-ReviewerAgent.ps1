@@ -4025,7 +4025,7 @@ function Invoke-DryRunSelfChecks {
     {
       "organization": "contoso",
       "project": "ExampleProject",
-      "repositoryId": "22222222-2222-2222-2222-222222222222",
+      "repositoryId": "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
       "path": "/docs/conventions.md",
       "branch": "main",
       "maxBytes": 32
@@ -4035,7 +4035,7 @@ function Invoke-DryRunSelfChecks {
 '@ | ConvertFrom-Json
     $positivePolicy = ConvertTo-ReviewerAuthoritativeSourcePolicy -RawPolicy $policyFixture -RepositoryOrganization "contoso"
     if (@($positivePolicy.Sources).Count -ne 1 -or
-        [string]$positivePolicy.Sources[0].RepositoryId -cne "22222222-2222-2222-2222-222222222222" -or
+        [string]$positivePolicy.Sources[0].RepositoryId -cne "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" -or
         [string]$positivePolicy.Sources[0].Path -cne "/docs/conventions.md") {
         $failures.Add("The unmodified authoritative source policy fixture did not parse to one normalized source.")
     }
