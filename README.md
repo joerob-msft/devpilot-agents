@@ -249,7 +249,11 @@ text still cannot alter the bound PR, tools, nonce, schema, or output contract.
 
 This transport targets the MCP embedded-resource shape verified with Agency
 `2026.7.31.2`. Additive or malformed resource fields fail closed rather than
-being ignored. `samples/reviewer-ado.config.json` contains the generic contract.
+being ignored. It converts only configured wrapper-fetched sources; model-side
+`repo_file get_content` may still be resource-shaped and unusable. Also,
+`permissions.allowTools` must contain at least one mapped read-only permission:
+an empty list is rejected rather than falling back to CLI-default discovery.
+`samples/reviewer-ado.config.json` contains the generic contract.
 
 Posted findings appear under **your** identity, since that is who the session is
 authenticated as. That is why every write is opt-in.

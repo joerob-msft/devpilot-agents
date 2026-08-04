@@ -1609,6 +1609,7 @@ function ConvertTo-ReviewerAuthoritativeSourcePolicy {
         if ($project -match '[\x00-\x1f\x7f/\\?#]') { throw "$where.project contains unsupported characters." }
         $repositoryId = Get-AgentConfigString -Object $item -Name "repositoryId" -Where $where -MaxLength 36 `
             -Pattern '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+        $repositoryId = $repositoryId.ToLowerInvariant()
         $path = Get-AgentConfigString -Object $item -Name "path" -Where $where -MaxLength 1024
         if (-not (Test-ReviewerAuthoritativeSourcePath -Path $path)) {
             throw "$where.path must be an absolute, canonical .md or .txt repository path without query, fragment, backslash, controls, or dot segments."
@@ -1972,6 +1973,19 @@ function ConvertFrom-ReviewerAuthoritativeBranch {
     return ([string]$BranchResult.objectId).ToLowerInvariant()
 }
 
+function Assert-ReviewerAuthoritativeSourcePins {
+        param(
+            [Parameter(Mandatory)][hashtable]$Resource,
+            [Parameter(Mandatory)][hashtable]$Source
+        )
+        if ($Source.ExpectedSha256 -and [string]$Resource.Sha256 -cne [string]$Source.ExpectedSha256) {
+            throw "Authoritative source '$($Source.Path)' SHA-256 did not match its configured pin."
+        }
+        if ($Source.ExpectedByteLength -gt 0 -and [int]$Resource.ByteLength -ne [int]$Source.ExpectedByteLength) {
+            throw "Authoritative source '$($Source.Path)' byte length did not match its configured pin."
+        }
+}
+
 function Get-ReviewerAuthoritativeSourceSnapshots {
     param(
         [Parameter(Mandatory)][string]$AgencyPath,
@@ -2037,12 +2051,7 @@ function Get-ReviewerAuthoritativeSourceSnapshots {
             $resource = ConvertFrom-AgentMcpResourceContent -ToolResult $toolResult `
                 -ExpectedUri $source.Path -MaxBytes $source.MaxBytes `
                 -AllowedMimeTypes $script:ReviewerAuthoritativeMimeTypes
-            if ($source.ExpectedSha256 -and [string]$resource.Sha256 -cne [string]$source.ExpectedSha256) {
-                throw "Authoritative source '$($source.Path)' SHA-256 did not match its configured pin."
-            }
-            if ($source.ExpectedByteLength -gt 0 -and [int]$resource.ByteLength -ne [int]$source.ExpectedByteLength) {
-                throw "Authoritative source '$($source.Path)' byte length did not match its configured pin."
-            }
+            Assert-ReviewerAuthoritativeSourcePins -Resource $resource -Source $source
             $totalBytes += [int]$resource.ByteLength
             if ($totalBytes -gt [int]$Policy.MaxTotalBytes) {
                 throw "Authoritative source content exceeded the configured total of $($Policy.MaxTotalBytes) bytes."
@@ -4019,11 +4028,17 @@ function Invoke-DryRunSelfChecks {
       "repositoryId": "22222222-2222-2222-2222-222222222222",
       "path": "/docs/conventions.md",
       "branch": "main",
-      "maxBytes": 4096
+      "maxBytes": 32
     }
   ]
 }
 '@ | ConvertFrom-Json
+    $positivePolicy = ConvertTo-ReviewerAuthoritativeSourcePolicy -RawPolicy $policyFixture -RepositoryOrganization "contoso"
+    if (@($positivePolicy.Sources).Count -ne 1 -or
+        [string]$positivePolicy.Sources[0].RepositoryId -cne "22222222-2222-2222-2222-222222222222" -or
+        [string]$positivePolicy.Sources[0].Path -cne "/docs/conventions.md") {
+        $failures.Add("The unmodified authoritative source policy fixture did not parse to one normalized source.")
+    }
     $policyNegatives = @(
         @{ Name = "unknown transport version"; Apply = { param($x) $x.transportVersion = 2 } },
         @{ Name = "unknown policy key"; Apply = { param($x) Add-Member -InputObject $x -NotePropertyName arbitrary -NotePropertyValue $true } },
@@ -4036,7 +4051,7 @@ function Invoke-DryRunSelfChecks {
         $copy = $policyFixture | ConvertTo-Json -Depth 10 | ConvertFrom-Json
         & $case.Apply $copy
         $rejected = $false
-        try { ConvertTo-ReviewerAuthoritativeSourcePolicy -RawPolicy $copy -RepositoryOrganization $cfgOrganization | Out-Null }
+        try { ConvertTo-ReviewerAuthoritativeSourcePolicy -RawPolicy $copy -RepositoryOrganization "contoso" | Out-Null }
         catch { $rejected = $true }
         if (-not $rejected) { $failures.Add("The authoritative source policy accepted $($case.Name).") }
     }
@@ -4068,6 +4083,19 @@ function Invoke-DryRunSelfChecks {
     $ordinalCommitCache["main"] = ("a" * 40)
     if ($ordinalCommitCache.ContainsKey("Main")) {
         $failures.Add("Authoritative branch commit caching is case-insensitive and can falsify branch provenance.")
+    }
+    $pinResource = @{ Sha256 = ("a" * 64); ByteLength = 35 }
+    $pinSource = @{ Path = "/docs/conventions.md"; ExpectedSha256 = ("a" * 64); ExpectedByteLength = 35 }
+    try { Assert-ReviewerAuthoritativeSourcePins -Resource $pinResource -Source $pinSource }
+    catch { $failures.Add("Matching authoritative source hash and length pins were rejected.") }
+    foreach ($badSource in @(
+            @{ Path = "/docs/conventions.md"; ExpectedSha256 = ("b" * 64); ExpectedByteLength = 35 },
+            @{ Path = "/docs/conventions.md"; ExpectedSha256 = ("a" * 64); ExpectedByteLength = 34 }
+        )) {
+        $pinRejected = $false
+        try { Assert-ReviewerAuthoritativeSourcePins -Resource $pinResource -Source $badSource }
+        catch { $pinRejected = $true }
+        if (-not $pinRejected) { $failures.Add("An authoritative source hash or length pin mismatch was accepted.") }
     }
 
     $renderSnapshot = @{
