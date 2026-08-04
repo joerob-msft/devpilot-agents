@@ -228,6 +228,29 @@ Other properties worth knowing:
   justify the vote were not posted; and a plain `Approved` requires *zero*
   findings.
 
+#### Authoritative repository-source transport
+
+`repoConventions.authoritativeSources` is an optional, versioned transport for
+convention text stored in another repository in the same Azure DevOps
+organization. The wrapper, not the model, verifies the repository GUID and
+project, resolves each branch once, reads every configured path at that exact
+commit, and accepts only bounded canonical base64 containing strict UTF-8
+`text/plain` or `text/markdown`. The runtime context carries the decoded text
+with organization/project/repository/path/branch/commit, byte-length, MIME, and
+SHA-256 provenance. No resource URI is fetched or followed.
+
+The source policy is fail-closed: version 1 requires exact keys, canonical
+absolute `.md`/`.txt` paths, per-file and total byte limits, and optional
+`expectedSha256`/`expectedByteLength` pins. A failed source read aborts only a
+fresh review; it uses a dedicated MCP session after pending-delivery retries, so
+it cannot strand an already sealed review. Source repositories and branches
+must be trusted to define conventions for the reviewed repository, but their
+text still cannot alter the bound PR, tools, nonce, schema, or output contract.
+
+This transport targets the MCP embedded-resource shape verified with Agency
+`2026.7.31.2`. Additive or malformed resource fields fail closed rather than
+being ignored. `samples/reviewer-ado.config.json` contains the generic contract.
+
 Posted findings appear under **your** identity, since that is who the session is
 authenticated as. That is why every write is opt-in.
 

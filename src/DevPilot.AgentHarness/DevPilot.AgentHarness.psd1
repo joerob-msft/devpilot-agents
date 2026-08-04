@@ -90,7 +90,7 @@ FunctionsToExport = 'Get-DevPilotAgentPath', 'Resolve-AgentRepositoryRoot', 'Get
                'Get-TaskTextBeforeDeadline', 'Invoke-TimedProcess', 
                'Open-AgentMcpSession', 'Close-AgentMcpSession', 
                'Send-AgentMcpRequest', 'Send-AgentMcpNotification', 
-               'Invoke-AgentMcpTool',
+               'Invoke-AgentMcpTool', 'ConvertFrom-AgentMcpResourceContent',
     'Get-AgentSupportedProvider', 'Test-AgentProviderSupported', 'New-AgentProviderContext', 'Assert-AgentProviderContext',
     'Invoke-AgentGitHubApi', 'Invoke-AgentGitHubGraphQl', 'ConvertTo-AgentProviderPullRequestStatus', 'ConvertTo-AgentProviderVote',
     'ConvertTo-AgentProviderSnapshot', 'ConvertTo-AgentProviderThreadStatus', 'Get-AgentProviderPullRequestSnapshot',
@@ -155,6 +155,5 @@ PrivateData = @{
 # DefaultCommandPrefix = ''
 
 }
-
 
 

@@ -59,7 +59,24 @@
       "AGENTS.md",
       "docs/contributing.md"
     ],
-    "customRules": "Public API changes require a corresponding entry in docs/api-changes.md. Prefer flagging a missing test over speculating about runtime behaviour the diff does not show."
+    "customRules": "Public API changes require a corresponding entry in docs/api-changes.md. Prefer flagging a missing test over speculating about runtime behaviour the diff does not show.",
+    "authoritativeSources": {
+      "note": "Optional cross-repository convention text. The wrapper verifies repository identity, resolves the branch once, reads each file at that exact commit, and injects bounded UTF-8 text with SHA-256 provenance. Every source must be in the same organization as the reviewed repository.",
+      "transportVersion": 1,
+      "maxTotalBytes": 4096,
+      "sources": [
+        {
+          "organization": "contoso",
+          "project": "ExampleProject",
+          "repositoryId": "22222222-2222-2222-2222-222222222222",
+          "path": "/docs/conventions.md",
+          "branch": "main",
+          "maxBytes": 4096,
+          "expectedByteLength": 35,
+          "expectedSha256": "82ae4e259f55c0fb1ac8aa1239e210ad0c3b2a43ab006b394affe94a10e16f72"
+        }
+      ]
+    }
   },
   "permissions": {
     "note": "The wrapper's code-defined ceiling is read-only and this list may only NARROW it. Write tools - including ado(repo_pull_request_thread_write) and ado(repo_pull_request_write) - are mandatory denies that no config can grant: the model reports findings as structured data and the WRAPPER performs every write. Two whole families are rejected outright no matter what is listed here. shell(...) is rejected even for commands that look read-only, because `git diff --output=<path>` and `git log --output=<path>` write files, so no argument-prefix grant on a shell command is safe. web_search and web_fetch are rejected because this agent reads private source and private review threads, and an outbound request whose URL the model composes is an exfiltration channel.",
