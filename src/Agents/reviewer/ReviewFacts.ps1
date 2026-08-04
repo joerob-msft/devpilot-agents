@@ -760,6 +760,8 @@ function Get-ReviewerFanOutFacts {
     $identifierRecords = [System.Collections.Generic.List[object]]::new()
     foreach ($file in $files) {
         $path = ([string](Get-ReviewerFactValue $file "Path" "")).TrimStart("/", "\").Replace("\", "/")
+        $content = [string](Get-ReviewerFactValue $file "Content" "")
+        $contentSha256 = Get-ReviewerFactSha256 -Text $content
         foreach ($record in @(Get-ReviewerFactIdentifiers -File $file)) {
             $entry = [pscustomobject]@{ Path = $path; Identifier = $record.Identifier; Line = $record.Line; Field = $record.Field }
             [void]$identifierRecords.Add($entry)
@@ -775,7 +777,7 @@ function Get-ReviewerFanOutFacts {
                     }) `
                     -Evidence @(New-ReviewerFactEvidence -SourceType "sourceCommitFile" -Path $path `
                         -LineStart $record.Line -LineEnd $record.Line -Field $record.Field `
-                        -Sha256 (Get-ReviewerFactSha256 -Text ([string](Get-ReviewerFactValue $file "Content" "")))) `
+                        -Sha256 $contentSha256) `
                     -TrustTier "source-commit"))
             if ($identifierObservation.truncated) {
                 [void]$facts.Add((New-ReviewerFact -Domain fanOut -Kind "observedValueTruncated" `
@@ -790,7 +792,8 @@ function Get-ReviewerFanOutFacts {
         }
     }
     foreach ($entry in $identifierRecords) {
-        $namespace = [IO.Path]::GetDirectoryName($entry.Path).Replace("\", "/").TrimStart("/")
+        $directory = [IO.Path]::GetDirectoryName($entry.Path)
+        $namespace = $(if ($null -eq $directory) { "" } else { $directory.Replace("\", "/").TrimStart("/") })
         $surfaceNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         foreach ($rule in @($Policy.companionRules)) {
             $identifierPattern = [string](Get-ReviewerFactValue $rule "identifierPattern" "")
@@ -1103,6 +1106,11 @@ function New-ReviewerFactPlan {
     )
     foreach ($name in @("organization", "project", "repositoryId", "sourceCommit", "targetCommit", "changeSetDigest")) {
         if (-not [string](Get-ReviewerFactValue $Binding $name "")) { throw "Fact plan binding '$name' is required." }
+    }
+    $pullRequestId = Get-ReviewerFactValue $Binding "pullRequestId" $null
+    if (($pullRequestId -isnot [int] -and $pullRequestId -isnot [long]) -or
+        [int64]$pullRequestId -lt 1 -or [int64]$pullRequestId -gt [int]::MaxValue) {
+        throw "Fact plan binding 'pullRequestId' must be a positive JSON integer."
     }
     foreach ($name in @("sourceCommit", "targetCommit")) {
         if ([string](Get-ReviewerFactValue $Binding $name "") -notmatch '^[0-9a-f]{40}$') {

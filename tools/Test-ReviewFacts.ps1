@@ -544,6 +544,14 @@ $replayPlan = New-ReviewerFactPlan -Binding $binding -Hashes $hashes -Inputs $re
 Assert-Fact ((ConvertTo-ReviewerFactCanonicalJson $plan) -ceq (ConvertTo-ReviewerFactCanonicalJson $replayPlan)) "Reordered domain/change input did not replay identically."
 
 Assert-Fact (Test-ReviewerFactPlanBinding -Plan $plan -ExpectedBinding $binding -ExpectedHashes $hashes) "Exact plan binding did not validate."
+foreach ($invalidPrId in @($null, 0, -1, "42")) {
+    $invalidBinding = Copy-FactObject $binding
+    if ($null -eq $invalidPrId) { $invalidBinding.PSObject.Properties.Remove("pullRequestId") }
+    else { $invalidBinding.pullRequestId = $invalidPrId }
+    Assert-FactThrows {
+        New-ReviewerFactPlan -Binding $invalidBinding -Hashes $hashes -Inputs $baseInputs -Policy $policy
+    } "Invalid pullRequestId '$invalidPrId' was accepted into a fact plan."
+}
 foreach ($movement in @("sourceCommit", "targetCommit", "changeSetDigest")) {
     $moved = Copy-FactObject $binding
     $moved.$movement = $(if ($movement -eq "changeSetDigest") { "9" * 64 } else { "9" * 40 })
@@ -631,6 +639,21 @@ $missingPrecedent = @(Get-Fact $precedentPlan fanOut companionSurfacePresent | W
         $_.value.surface -ceq $precedentCalibration.expectedMissingSurface
     })
 Assert-Fact ($missingPrecedent.Count -eq 1 -and $missingPrecedent[0].state -ceq "false") "Synthetic same-namespace precedent did not drive the real fan-out extractor to an exact missing surface."
+$rootFanOutInputs = Copy-FactObject $baseInputs
+$rootFanOutInputs.fanOut.Data.ChangedFiles = @(@{
+        Path = "service.settings.json"
+        Content = '{"Feature":{"Enabled":true}}'
+    })
+$rootFanOutInputs.fanOut.Data.Precedents = @(@{
+        namespace = ""
+        identifier = "Feature.Enabled"
+        surfaces = @("service.defaults.json")
+    })
+$rootFanOutInputs.fanOut.Data.SurfaceFiles = @(@{ Path = "service.defaults.json"; Exists = $true })
+$rootFanOutPlan = New-ReviewerFactPlan -Binding $binding -Hashes $hashes -Inputs $rootFanOutInputs -Policy $policy
+$rootCompanion = Get-Fact $rootFanOutPlan fanOut companionSurfacePresent
+Assert-Fact (($rootFanOutPlan.domains | Where-Object name -eq fanOut).status -ceq "complete" -and
+    $rootCompanion.Count -eq 1 -and $rootCompanion[0].value.namespace -ceq "") "Root-level fan-out path failed namespace extraction."
 
 $sourceText = Get-Content -LiteralPath (Join-Path $repoRoot "src\Agents\reviewer\ReviewFacts.ps1") -Raw
 Assert-Fact ($sourceText -notmatch 'Sort-Object') "ReviewFacts.ps1 uses culture-sensitive Sort-Object."
