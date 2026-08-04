@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "maxPlanBytes": 196608,
+  "maxPlanBytes": 262144,
   "metadata": {
     "maxFactBytes": 24576,
     "maxObservedValueBytes": 256,
@@ -17,8 +17,9 @@
     "changelogEnd": "<!-- CHANGELOG:END -->"
   },
   "cloudTest": {
-    "maxFactBytes": 32768,
+    "maxFactBytes": 65536,
     "maxObservedValueBytes": 256,
+    "maxClaims": 32,
     "maxSourceFiles": 32,
     "maxSourceBytesTotal": 131072,
     "testPathGlobs": [
@@ -53,6 +54,7 @@
   "threads": {
     "maxFactBytes": 32768,
     "maxThreads": 200,
+    "maxRawSubstanceBytesPerThread": 8192,
     "maxSubstanceBytesPerThread": 1024,
     "maxSubstanceBytesTotal": 8192
   },

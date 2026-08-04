@@ -2341,10 +2341,16 @@ function Get-ReviewerFactSourceFile {
 }
 
 function Get-ReviewerFactClaimsFromDescription {
-    param([AllowEmptyString()][string]$Description = "")
+    param(
+        [AllowEmptyString()][string]$Description = "",
+        [ValidateRange(0, [int]::MaxValue)][int]$PrId = 0
+    )
     $claims = [System.Collections.Generic.List[object]]::new()
     $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($line in @($Description -split "`r?`n", 0, "RegexMatch")) {
+    $descriptionSha256 = Get-ReviewerFactSha256 -Text $Description
+    $lines = @($Description -split "`r?`n", 0, "RegexMatch")
+    for ($lineIndex = 0; $lineIndex -lt $lines.Count; $lineIndex++) {
+        $line = $lines[$lineIndex]
         if ($line -match '^\s*Tests:\s*assembly=([A-Za-z0-9_.-]{1,256})(?:\s*;\s*category=([A-Za-z0-9_.-]{1,256}))?\s*$') {
             $category = $(if ($Matches.Count -gt 2) { $Matches[2] } else { "" })
             $key = $Matches[1] + "`n" + $category
@@ -2352,6 +2358,9 @@ function Get-ReviewerFactClaimsFromDescription {
             [void]$claims.Add([pscustomobject][ordered]@{
                     assembly = $Matches[1]
                     category = $category
+                    path = "pull-request:" + [string]$PrId
+                    line = $lineIndex + 1
+                    sha256 = $descriptionSha256
                 })
         }
     }
@@ -2383,6 +2392,7 @@ function ConvertTo-ReviewerFactThreadSet {
     return [pscustomobject]@{
         Entries = $entries
         Complete = $reportedComplete
+        CountObserved = ($null -ne $reportedCount)
         ReportedCount = $reportedCount
     }
 }
@@ -2469,7 +2479,7 @@ function Get-ReviewerFactInputs {
                 ChangeSetObserved = $true
                 ChangedFiles = $cloudFiles.ToArray()
                 Manifests = $cloudManifests.ToArray()
-                Claims = @(Get-ReviewerFactClaimsFromDescription -Description $description)
+                Claims = @(Get-ReviewerFactClaimsFromDescription -Description $description -PrId $PrId)
                 # A changed-file list cannot prove that every repository manifest was enumerated.
                 ManifestCorpusComplete = $false
             }
@@ -2530,6 +2540,8 @@ function Get-ReviewerFactInputs {
                 Threads = $normalizedThreads
                 Complete = ([bool]$threadSet.Complete -and
                     $threadSet.Entries.Count -lt [int]$ReviewFactPolicy.threads.maxThreads)
+                CountObserved = [bool]$threadSet.CountObserved
+                ReportedCount = $threadSet.ReportedCount
                 BotSubstrings = @($BotSubstrings)
                 SystemSubstrings = @($SystemSubstrings)
             }

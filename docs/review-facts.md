@@ -50,6 +50,11 @@ right-side line spans to the wrapper, so production plans retain explicit
 Each domain reports `complete`, `notApplicable`, or `failed`. Transport,
 truncation, malformed input, and cap failures remain explicit and do not abort
 unrelated domains. The total plan is `complete`, `partial`, or `failed`.
+Thread display substance is raw-byte capped before sanitization, strips Unicode
+format/invisible controls, and retains a hash of the complete original content.
+CloudTest author claims are separate bounded untrusted facts; wrapper-derived
+classifications reference those facts, and excess claims produce explicit
+truncation evidence without silently defaulting to a negative result.
 
 ## Persistence and invalidation
 

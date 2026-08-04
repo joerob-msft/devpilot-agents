@@ -35,7 +35,7 @@
       "items": { "$ref": "#/$defs/fact" }
     },
     "factCount": { "type": "integer", "minimum": 0 },
-    "canonicalBytes": { "type": "integer", "minimum": 0, "maximum": 196608 },
+    "canonicalBytes": { "type": "integer", "minimum": 0, "maximum": 262144 },
     "planSha256": { "$ref": "#/$defs/sha256" }
   },
   "$defs": {

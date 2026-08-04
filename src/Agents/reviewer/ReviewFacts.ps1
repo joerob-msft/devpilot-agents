@@ -312,7 +312,12 @@ function Get-ReviewerMetadataFacts {
             }
             [void]$facts.Add((New-ReviewerFact -Domain metadata -Kind "tagPresent" -Subject $tagName `
                     -State $(if ($tagPresent) { "true" } else { "false" }) `
-                    -Value ([ordered]@{ observedValue = $tagValue }) -Evidence $tagEvidence `
+                    -Value ([ordered]@{
+                        observedValue = $tagValue
+                        observedValueSha256 = $(if ($tagPresent) {
+                                Get-ReviewerFactSha256 -Text $match.Groups[1].Value.Trim()
+                            } else { "" })
+                    }) -Evidence $tagEvidence `
                     -TrustTier "untrusted-author-controlled"))
         }
         $markers = [System.Collections.Generic.List[string]]::new()
@@ -556,48 +561,108 @@ function Get-ReviewerCloudTestFacts {
         }
     }
     $corpusComplete = [bool](Get-ReviewerFactValue $data "ManifestCorpusComplete" $false)
-    foreach ($claim in $claims) {
+    $orderedClaims = [System.Collections.Generic.List[object]]::new()
+    foreach ($claim in $claims) { [void]$orderedClaims.Add($claim) }
+    $orderedClaims.Sort([System.Comparison[object]] {
+            param($left, $right)
+            return [StringComparer]::Ordinal.Compare(
+                (ConvertTo-ReviewerFactCanonicalJson -Value $left),
+                (ConvertTo-ReviewerFactCanonicalJson -Value $right))
+        })
+    $claimsToProcess = @($orderedClaims | Select-Object -First ([int]$Policy.maxClaims))
+    if ($orderedClaims.Count -gt [int]$Policy.maxClaims) {
+        [void]$facts.Add((New-ReviewerFact -Domain cloudTest -Kind "claimSetTruncated" -Subject cloudTest `
+                -State true -Value ([ordered]@{
+                    observedClaimCount = $orderedClaims.Count
+                    retainedClaimCount = $claimsToProcess.Count
+                    maxClaims = [int]$Policy.maxClaims
+                }) -TrustTier "wrapper-observed"))
+    }
+    foreach ($claim in $claimsToProcess) {
         $assembly = [string](Get-ReviewerFactValue $claim "assembly" "")
         $category = [string](Get-ReviewerFactValue $claim "category" "")
-        $subject = $assembly + $(if ($category) { ":" + $category } else { "" })
+        $claimIdentity = Get-ReviewerFactObjectSha256 -Value ([ordered]@{
+            assembly = $assembly
+            category = $category
+        })
+        $claimEvidence = @()
+        $claimPath = [string](Get-ReviewerFactValue $claim "path" "")
+        $claimLine = [int](Get-ReviewerFactValue $claim "line" 0)
+        $claimSha256 = [string](Get-ReviewerFactValue $claim "sha256" "")
+        if ($claimPath -or $claimLine -gt 0 -or $claimSha256) {
+            $claimEvidence = @(New-ReviewerFactEvidence -SourceType "pullRequestDescription" `
+                    -Path $claimPath -LineStart $claimLine -LineEnd $claimLine `
+                    -Field "Tests" -Sha256 $claimSha256)
+        }
+        $assemblyObservation = Get-ReviewerFactBoundedObservation -Text $assembly `
+            -MaxBytes ([int]$Policy.maxObservedValueBytes)
+        $categoryObservation = Get-ReviewerFactBoundedObservation -Text $category `
+            -MaxBytes ([int]$Policy.maxObservedValueBytes)
+        $claimFact = New-ReviewerFact -Domain cloudTest -Kind "claimedTestClaim" -Subject $claimIdentity `
+            -State true -Value ([ordered]@{
+                assembly = $assemblyObservation.text
+                assemblySha256 = Get-ReviewerFactSha256 -Text $assembly
+                category = $categoryObservation.text
+                categorySha256 = Get-ReviewerFactSha256 -Text $category
+                assemblyLevel = [string]::IsNullOrEmpty($category)
+                valueTruncated = ($assemblyObservation.truncated -or $categoryObservation.truncated)
+            }) -Evidence $claimEvidence -TrustTier "untrusted-author-controlled"
+        [void]$facts.Add($claimFact)
         $sameAssembly = @($executions | Where-Object {
                 [string]::Equals($_.assembly, $assembly, [StringComparison]::OrdinalIgnoreCase)
             })
         $included = $false
-        $allExplicitlyExclude = ($sameAssembly.Count -gt 0)
-        foreach ($execution in $sameAssembly) {
-            $required = @($execution.categories)
-            $filter = [string]$execution.filter
-            if ($filter -match '^\s*(?:TestCategory|Category)\s*=\s*([A-Za-z0-9_.-]+)\s*$') {
-                $required += @($Matches[1])
-            }
-            elseif ($filter) {
-                $allExplicitlyExclude = $false
-                continue
-            }
-            if ($required.Count -eq 0 -or @($required | Where-Object {
-                        [string]::Equals([string]$_, $category, [StringComparison]::OrdinalIgnoreCase)
-                    }).Count -gt 0) {
-                $included = $true
-                $allExplicitlyExclude = $false
+        $allExplicitlyExclude = $false
+        if (-not $category) {
+            # An assembly-only claim asks whether that assembly is discovered at
+            # all. Category filters cannot turn an observed exact assembly entry
+            # into a negative claim.
+            $included = ($sameAssembly.Count -gt 0)
+        }
+        else {
+            $allExplicitlyExclude = ($sameAssembly.Count -gt 0)
+            foreach ($execution in $sameAssembly) {
+                $required = @($execution.categories)
+                $filter = [string]$execution.filter
+                if ($filter -match '^\s*(?:TestCategory|Category)\s*=\s*([A-Za-z0-9_.-]+)\s*$') {
+                    $required += @($Matches[1])
+                }
+                elseif ($filter) {
+                    $allExplicitlyExclude = $false
+                    continue
+                }
+                if ($required.Count -eq 0 -or @($required | Where-Object {
+                            [string]::Equals([string]$_, $category, [StringComparison]::OrdinalIgnoreCase)
+                        }).Count -gt 0) {
+                    $included = $true
+                    $allExplicitlyExclude = $false
+                }
             }
         }
         if ($included) {
             $state = "true"; $reason = ""; $classification = "definitelyGated"
         }
-        elseif ($corpusComplete -and $allExplicitlyExclude) {
+        elseif ($corpusComplete -and ($sameAssembly.Count -eq 0 -or
+                ($category -and $allExplicitlyExclude))) {
             $state = "false"; $reason = ""; $classification = "definitelyNotGated"
         }
         else {
             $state = "unknown"; $reason = "unprovable"; $classification = "unknown"
         }
-        [void]$facts.Add((New-ReviewerFact -Domain cloudTest -Kind "claimedTestGating" -Subject $subject `
+        $classificationEvidence = [System.Collections.Generic.List[object]]::new()
+        foreach ($evidence in $claimEvidence) { [void]$classificationEvidence.Add($evidence) }
+        foreach ($execution in $sameAssembly) {
+            [void]$classificationEvidence.Add((New-ReviewerFactEvidence -SourceType "sourceCommitFile" `
+                    -Path $execution.path -LineStart $execution.line -LineEnd $execution.line -Field "Execution"))
+        }
+        [void]$facts.Add((New-ReviewerFact -Domain cloudTest -Kind "claimedTestGating" -Subject $claimIdentity `
                 -State $state -UnknownReason $reason -Value ([ordered]@{
                     classification = $classification
-                    assembly = $assembly
-                    category = $category
+                    claimFactId = $claimFact.id
+                    assemblyLevel = [string]::IsNullOrEmpty($category)
+                    exactAssemblyExecutionCount = $sameAssembly.Count
                     manifestCorpusComplete = $corpusComplete
-                }) -TrustTier "wrapper-observed"))
+                }) -Evidence $classificationEvidence.ToArray() -TrustTier "wrapper-observed"))
     }
     if ($testFiles.Count -eq 0 -and $projects.Count -eq 0 -and $claims.Count -eq 0 -and $manifests.Count -eq 0) {
         [void]$facts.Add((New-ReviewerFact -Domain cloudTest -Kind "domainApplicability" -Subject cloudTest `
@@ -694,7 +759,7 @@ function Get-ReviewerFanOutFacts {
     $facts = [System.Collections.Generic.List[object]]::new()
     $identifierRecords = [System.Collections.Generic.List[object]]::new()
     foreach ($file in $files) {
-        $path = [string](Get-ReviewerFactValue $file "Path" "")
+        $path = ([string](Get-ReviewerFactValue $file "Path" "")).TrimStart("/", "\").Replace("\", "/")
         foreach ($record in @(Get-ReviewerFactIdentifiers -File $file)) {
             $entry = [pscustomobject]@{ Path = $path; Identifier = $record.Identifier; Line = $record.Line; Field = $record.Field }
             [void]$identifierRecords.Add($entry)
@@ -725,7 +790,7 @@ function Get-ReviewerFanOutFacts {
         }
     }
     foreach ($entry in $identifierRecords) {
-        $namespace = [IO.Path]::GetDirectoryName($entry.Path).Replace("\", "/")
+        $namespace = [IO.Path]::GetDirectoryName($entry.Path).Replace("\", "/").TrimStart("/")
         $surfaceNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         foreach ($rule in @($Policy.companionRules)) {
             $identifierPattern = [string](Get-ReviewerFactValue $rule "identifierPattern" "")
@@ -736,7 +801,8 @@ function Get-ReviewerFanOutFacts {
             foreach ($surface in @(Get-ReviewerFactValue $rule "surfaces" @())) { [void]$surfaceNames.Add([string]$surface) }
         }
         foreach ($precedent in $precedents) {
-            if ([string]::Equals([string](Get-ReviewerFactValue $precedent "namespace" ""), $namespace, [StringComparison]::OrdinalIgnoreCase) -and
+            $precedentNamespace = ([string](Get-ReviewerFactValue $precedent "namespace" "")).Replace("\", "/").TrimStart("/")
+            if ([string]::Equals($precedentNamespace, $namespace, [StringComparison]::OrdinalIgnoreCase) -and
                 [string]::Equals([string](Get-ReviewerFactValue $precedent "identifier" ""), $entry.Identifier, [StringComparison]::Ordinal)) {
                 foreach ($surface in @(Get-ReviewerFactValue $precedent "surfaces" @())) { [void]$surfaceNames.Add([string]$surface) }
             }
@@ -789,10 +855,29 @@ function Get-ReviewerFactAuthorClass {
     return "unknown"
 }
 
+function Remove-ReviewerFactInvisibleFormatChars {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    Assert-ReviewerFactStrictText -Text $Text -Where "untrusted text"
+    $invisiblePattern = (
+        '[\p{Cf}\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u180f\u2800\u3164\uffa0\ufe00-\ufe0f]' +
+        '|\uD804[\uDCBD\uDCCD]' +
+        '|\uD80D[\uDC30-\uDC3F]' +
+        '|\uD82F[\uDCA0-\uDCA3]' +
+        '|\uD834[\uDD73-\uDD7A]' +
+        '|\uDB40[\uDC00-\uDC7F\uDD00-\uDDEF]'
+    )
+    return [regex]::Replace(
+        $Text, $invisiblePattern, "", "CultureInvariant", [TimeSpan]::FromMilliseconds(250))
+}
+
 function ConvertTo-ReviewerFactSanitizedSubstance {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
     Assert-ReviewerFactStrictText -Text $Text -Where "thread comment"
-    $value = $Text -replace '[\u202a-\u202e\u2066-\u2069\u061c\u200e\u200f]', ''
+    # The raw content hash retains every original code point. The bounded display
+    # substance removes Unicode Format characters first so invisible separators,
+    # bidi controls and supplementary tag characters cannot split credentials or
+    # turn stored text into visually deceptive instructions.
+    $value = Remove-ReviewerFactInvisibleFormatChars -Text $Text
     $value = $value -replace '[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' '
     $timeout = [TimeSpan]::FromMilliseconds(250)
     $value = [regex]::Replace($value, '<[^>]{0,2048}>', ' ', "CultureInvariant", $timeout)
@@ -868,7 +953,9 @@ function Get-ReviewerThreadFacts {
         $raw = $rawParts.ToArray() -join "`n"
         Assert-ReviewerFactStrictText -Text $raw -Where "thread content"
         $contentHash = Get-ReviewerFactSha256 -Text (($raw -replace "`r`n", "`n"))
-        $sanitized = ConvertTo-ReviewerFactSanitizedSubstance -Text $raw
+        $rawSubstance = Limit-ReviewerFactUtf8Text -Text $raw `
+            -MaxBytes ([int]$Policy.maxRawSubstanceBytesPerThread)
+        $sanitized = ConvertTo-ReviewerFactSanitizedSubstance -Text $rawSubstance.Text
         $threadCap = [Math]::Min([int]$Policy.maxSubstanceBytesPerThread, [Math]::Max(0, $totalRemaining))
         $bounded = Limit-ReviewerFactUtf8Text -Text $sanitized -MaxBytes $threadCap
         $totalRemaining -= $bounded.ByteLength
@@ -891,15 +978,20 @@ function Get-ReviewerThreadFacts {
                     contentSha256 = $contentHash
                     sanitizedSubstance = $bounded.Text
                     substanceBytes = $bounded.ByteLength
-                    substanceTruncated = [bool]$bounded.Truncated
+                    substanceTruncated = [bool]($rawSubstance.Truncated -or $bounded.Truncated)
+                    rawSubstanceBytesScanned = $rawSubstance.ByteLength
                     trustTier = "untrusted-author-controlled"
                 }) -Evidence @(New-ReviewerFactEvidence -SourceType "pullRequestThreadApi" -Path $path `
                     -LineStart $line -LineEnd $line -Field ("thread:" + [string]$threadId) -Sha256 $contentHash) `
                 -TrustTier "untrusted-author-controlled"))
-        if ($bounded.Truncated) {
+        if ($rawSubstance.Truncated -or $bounded.Truncated) {
             [void]$facts.Add((New-ReviewerFact -Domain threads -Kind "threadSubstanceTruncated" `
                     -Subject ([string]$threadId) -State true `
-                    -Value ([ordered]@{ maxBytes = $threadCap; retainedBytes = $bounded.ByteLength }) `
+                    -Value ([ordered]@{
+                        maxRawBytes = [int]$Policy.maxRawSubstanceBytesPerThread
+                        maxBytes = $threadCap
+                        retainedBytes = $bounded.ByteLength
+                    }) `
                     -TrustTier "wrapper-observed"))
         }
     }
@@ -915,7 +1007,12 @@ function Get-ReviewerThreadFacts {
             }
         })
     [void]$facts.Add((New-ReviewerFact -Domain threads -Kind "threadSetComplete" -Subject threads `
-            -State true -Value ([ordered]@{ threadCount = $threads.Count; threadSetDigest = $threadSetDigest }) `
+            -State true -Value ([ordered]@{
+                threadCount = $threads.Count
+                threadSetDigest = $threadSetDigest
+                countObserved = [bool](Get-ReviewerFactValue $data "CountObserved" $false)
+                reportedCount = Get-ReviewerFactValue $data "ReportedCount" $null
+            }) `
             -TrustTier "wrapper-observed"))
     return New-ReviewerFactDomainResult -Name threads -Status complete -Facts $facts.ToArray()
 }
@@ -1026,6 +1123,10 @@ function New-ReviewerFactPlan {
     foreach ($extractor in $extractors) {
         try {
             $domainResult = & $extractor.Action
+            $resolvedDomainFacts = @(Resolve-ReviewerFactIds -Facts @($domainResult.facts))
+            $domainResult = New-ReviewerFactDomainResult -Name $domainResult.name `
+                -Status $domainResult.status -Facts $resolvedDomainFacts `
+                -ErrorCode $domainResult.errorCode -ErrorMessage $domainResult.errorMessage
             $domainBytes = $script:ReviewerFactUtf8.GetByteCount(
                 (ConvertTo-ReviewerFactCanonicalJson -Value ([ordered]@{
                         name = $domainResult.name
@@ -1040,7 +1141,10 @@ function New-ReviewerFactPlan {
             [void]$results.Add($domainResult)
         }
         catch {
-            $errorCode = if ($_.Exception.Message -match 'invalid Unicode|malformed|has no exact|unsupported format|no explicit') {
+            $errorCode = if ($_.Exception.Message -match 'collided across different fact values') {
+                "collision"
+            }
+            elseif ($_.Exception.Message -match 'invalid Unicode|malformed|has no exact|unsupported format|no explicit') {
                 "malformed"
             }
             elseif ($_.Exception.Message -match 'above the versioned|exceeded') { "capExceeded" }
@@ -1053,7 +1157,13 @@ function New-ReviewerFactPlan {
             [void]$results.Add((New-ReviewerFactUnavailableDomain -Domain $extractor.Name -Envelope $envelope))
         }
     }
-    $allFacts = Resolve-ReviewerFactIds -Facts @($results | ForEach-Object { @($_.facts) })
+    $allFactList = [System.Collections.Generic.List[object]]::new()
+    foreach ($result in $results) {
+        foreach ($fact in @($result.facts)) {
+            if ($null -ne $fact) { [void]$allFactList.Add($fact) }
+        }
+    }
+    $allFacts = @(Sort-ReviewerFacts -Facts $allFactList.ToArray())
     $domainSummaries = @($results | ForEach-Object {
             [pscustomobject][ordered]@{
                 name = $_.name
