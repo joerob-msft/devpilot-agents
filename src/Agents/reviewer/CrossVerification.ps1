@@ -10,6 +10,11 @@ $script:ReviewerVerificationMaxCandidates = 64
 $script:ReviewerVerificationMaxClusterSize = 8
 $script:ReviewerVerificationMaxInputBytes = 524288
 $script:ReviewerVerificationMaxArtifactBytes = 2097152
+$script:ReviewerVerificationMaxVerifierRuns = 12
+$script:ReviewerVerificationMaxPhaseSeconds = 3600
+$script:ReviewerVerificationNearExactJaccard = 0.70
+$script:ReviewerVerificationSemanticJaccard = 0.55
+$script:ReviewerVerificationExistingThreadJaccard = 0.68
 $script:ReviewerVerificationUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
 $script:ReviewerVerificationOutcomes = @(
     "verified", "duplicate", "unsupported", "wrongSeverity", "needsHuman"
@@ -22,6 +27,50 @@ $script:ReviewerVerificationWithheldReasons = @(
     "missingEvidence", "wrongSeverity", "severityEscalation", "verifierDisagreement",
     "sourceInvalid", "factInvalid", "siblingInvalid", "specialistDegraded"
 )
+
+function ConvertTo-ReviewerVerificationEffectivePolicy {
+    param([Parameter(Mandatory)]$Policy)
+    foreach ($entry in @(
+            @("maxCandidates", 1), @("maxClusterSize", 1), @("maxInputBytes", 1024),
+            @("maxArtifactBytes", 1024), @("maxVerifierRuns", 1),
+            @("maxVerificationSeconds", 30)
+        )) {
+        $value = Get-ReviewerVerificationValue $Policy ([string]$entry[0]) $null
+        if ($null -eq $value -or [int64]$value -lt [int]$entry[1] -or
+            [int64]$value -gt [int]::MaxValue) {
+            throw "Verification policy '$($entry[0])' is outside its supported positive range."
+        }
+    }
+    foreach ($name in @("nearExactJaccard", "semanticJaccard", "existingThreadJaccard")) {
+        $value = Get-ReviewerVerificationValue $Policy $name $null
+        if ($null -eq $value -or [double]$value -lt 0.0 -or [double]$value -gt 1.0) {
+            throw "Verification policy '$name' must be a number from 0 through 1."
+        }
+    }
+    return [pscustomobject][ordered]@{
+        maxCandidates = [Math]::Min(
+            [int](Get-ReviewerVerificationValue $Policy "maxCandidates" 0),
+            $script:ReviewerVerificationMaxCandidates)
+        maxClusterSize = [Math]::Min(
+            [int](Get-ReviewerVerificationValue $Policy "maxClusterSize" 0),
+            $script:ReviewerVerificationMaxClusterSize)
+        maxInputBytes = [Math]::Min(
+            [int](Get-ReviewerVerificationValue $Policy "maxInputBytes" 0),
+            $script:ReviewerVerificationMaxInputBytes)
+        maxArtifactBytes = [Math]::Min(
+            [int](Get-ReviewerVerificationValue $Policy "maxArtifactBytes" 0),
+            $script:ReviewerVerificationMaxArtifactBytes)
+        maxVerifierRuns = [Math]::Min(
+            [int](Get-ReviewerVerificationValue $Policy "maxVerifierRuns" 0),
+            $script:ReviewerVerificationMaxVerifierRuns)
+        maxVerificationSeconds = [Math]::Min(
+            [int](Get-ReviewerVerificationValue $Policy "maxVerificationSeconds" 0),
+            $script:ReviewerVerificationMaxPhaseSeconds)
+        nearExactJaccard = [double](Get-ReviewerVerificationValue $Policy "nearExactJaccard" 0.0)
+        semanticJaccard = [double](Get-ReviewerVerificationValue $Policy "semanticJaccard" 0.0)
+        existingThreadJaccard = [double](Get-ReviewerVerificationValue $Policy "existingThreadJaccard" 0.0)
+    }
+}
 
 function Get-ReviewerVerificationValue {
     param($Object, [Parameter(Mandatory)][string]$Name, $Default = $null)
@@ -184,15 +233,18 @@ function Save-ReviewerVerificationArtifact {
         [Parameter(Mandatory)][string]$Directory,
         [Parameter(Mandatory)][string]$BaseName,
         [Parameter(Mandatory)][byte[]]$MasterKey,
-        [Parameter(Mandatory)][ValidateSet("input", "preview")][string]$Domain
+        [Parameter(Mandatory)][ValidateSet("input", "preview")][string]$Domain,
+        [ValidateRange(1024, [int]::MaxValue)][int]$MaxArtifactBytes = $script:ReviewerVerificationMaxArtifactBytes
     )
     if ($BaseName -notmatch '^[A-Za-z0-9._-]+$') { throw "Verification artifact base name is unsafe." }
     if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
         throw "Verification artifact directory '$Directory' does not exist."
     }
     $manifestJson = ConvertTo-ReviewerVerificationCanonicalJson -Value $Manifest
-    if ($script:ReviewerVerificationUtf8.GetByteCount($manifestJson) -gt $script:ReviewerVerificationMaxArtifactBytes) {
-        throw "Verification artifact exceeded the code-defined byte cap."
+    $effectiveMaxArtifactBytes = [Math]::Min(
+        $MaxArtifactBytes, $script:ReviewerVerificationMaxArtifactBytes)
+    if ($script:ReviewerVerificationUtf8.GetByteCount($manifestJson) -gt $effectiveMaxArtifactBytes) {
+        throw "Verification artifact exceeded the effective $effectiveMaxArtifactBytes-byte cap."
     }
     $key = Get-ReviewerVerificationDomainKey -MasterKey $MasterKey -Domain $Domain
     $envelope = [ordered]@{
@@ -253,10 +305,11 @@ function Save-ReviewerVerificationInput {
         [Parameter(Mandatory)]$Manifest,
         [Parameter(Mandatory)][string]$Directory,
         [Parameter(Mandatory)][string]$BaseName,
-        [Parameter(Mandatory)][byte[]]$MasterKey
+        [Parameter(Mandatory)][byte[]]$MasterKey,
+        [ValidateRange(1024, [int]::MaxValue)][int]$MaxArtifactBytes = $script:ReviewerVerificationMaxArtifactBytes
     )
     return Save-ReviewerVerificationArtifact -Manifest $Manifest -Directory $Directory `
-        -BaseName $BaseName -MasterKey $MasterKey -Domain input
+        -BaseName $BaseName -MasterKey $MasterKey -Domain input -MaxArtifactBytes $MaxArtifactBytes
 }
 
 function Read-ReviewerVerificationInput {
@@ -269,10 +322,11 @@ function Save-ReviewerVerificationPreview {
         [Parameter(Mandatory)]$Manifest,
         [Parameter(Mandatory)][string]$Directory,
         [Parameter(Mandatory)][string]$BaseName,
-        [Parameter(Mandatory)][byte[]]$MasterKey
+        [Parameter(Mandatory)][byte[]]$MasterKey,
+        [ValidateRange(1024, [int]::MaxValue)][int]$MaxArtifactBytes = $script:ReviewerVerificationMaxArtifactBytes
     )
     return Save-ReviewerVerificationArtifact -Manifest $Manifest -Directory $Directory `
-        -BaseName $BaseName -MasterKey $MasterKey -Domain preview
+        -BaseName $BaseName -MasterKey $MasterKey -Domain preview -MaxArtifactBytes $MaxArtifactBytes
 }
 
 function Read-ReviewerVerificationPreview {
@@ -502,86 +556,189 @@ function ConvertTo-ReviewerVerificationCandidates {
     return $ordered.ToArray()
 }
 
+function Get-ReviewerVerificationCandidatePlan {
+    param(
+        [object[]]$GeneralistPasses = @(),
+        [object[]]$ConventionCandidates = @(),
+        [string]$ConventionModel = "",
+        [string]$ConventionArtifactSha256 = ("0" * 64),
+        [int]$MaxCandidates = $script:ReviewerVerificationMaxCandidates
+    )
+    $MaxCandidates = [Math]::Min($MaxCandidates, $script:ReviewerVerificationMaxCandidates)
+    $allCandidates = @(ConvertTo-ReviewerVerificationCandidates `
+        -GeneralistPasses $GeneralistPasses -ConventionCandidates $ConventionCandidates `
+        -ConventionModel $ConventionModel -ConventionArtifactSha256 $ConventionArtifactSha256 `
+        -MaxCandidates ([int]::MaxValue))
+    $bounded = [System.Collections.Generic.List[object]]::new()
+    $withheld = [System.Collections.Generic.List[object]]::new()
+    for ($index = 0; $index -lt $allCandidates.Count; $index++) {
+        $candidate = $allCandidates[$index]
+        if ($index -lt $MaxCandidates) {
+            [void]$bounded.Add($candidate)
+            continue
+        }
+        [void]$withheld.Add([pscustomobject][ordered]@{
+                candidateId = [string]$candidate.candidateId
+                candidateHash = [string]$candidate.candidateHash
+                originKind = [string]$candidate.originKind
+                originModel = [string]$candidate.originModel
+                clusterId = ""
+                reason = "candidateLimit"
+                detail = "Candidate exceeded the versioned $MaxCandidates-item normalization cap."
+            })
+    }
+    return [pscustomobject][ordered]@{
+        candidates = $bounded.ToArray()
+        withheld = $withheld.ToArray()
+        totalCandidateCount = $allCandidates.Count
+    }
+}
+
+function Get-ReviewerVerificationClusteringKey {
+    param([Parameter(Mandatory)]$Candidate)
+    return (
+        [string](Get-ReviewerVerificationValue $Candidate "issueClass" "") + "|" +
+        (ConvertTo-ReviewerVerificationPath -Path (
+                [string](Get-ReviewerVerificationValue $Candidate "filePath" ""))) + "|" +
+        [Convert]::ToString(
+            [int](Get-ReviewerVerificationValue $Candidate "line" 0),
+            [Globalization.CultureInfo]::InvariantCulture) + "|" +
+        [string](Get-ReviewerVerificationValue $Candidate "affectedBehavior" "") + "|" +
+        (ConvertTo-ReviewerVerificationNormalizedText -Text (
+                [string](Get-ReviewerVerificationValue $Candidate "comment" (
+                    Get-ReviewerVerificationValue $Candidate "evidence" ""))))
+    )
+}
+
+function Get-ReviewerVerificationCandidatePairScore {
+    param(
+        [Parameter(Mandatory)]$Left,
+        [Parameter(Mandatory)]$Right,
+        [ValidateRange(0.0, 1.0)][double]$NearExactJaccard = $script:ReviewerVerificationNearExactJaccard,
+        [ValidateRange(0.0, 1.0)][double]$SemanticJaccard = $script:ReviewerVerificationSemanticJaccard
+    )
+    $leftText = ConvertTo-ReviewerVerificationNormalizedText -Text (
+        [string](Get-ReviewerVerificationValue $Left "comment" (
+            Get-ReviewerVerificationValue $Left "evidence" "")))
+    $rightText = ConvertTo-ReviewerVerificationNormalizedText -Text (
+        [string](Get-ReviewerVerificationValue $Right "comment" (
+            Get-ReviewerVerificationValue $Right "evidence" "")))
+    $leftPath = ConvertTo-ReviewerVerificationPath -Path (
+        [string](Get-ReviewerVerificationValue $Left "filePath" ""))
+    $rightPath = ConvertTo-ReviewerVerificationPath -Path (
+        [string](Get-ReviewerVerificationValue $Right "filePath" ""))
+    $leftLine = [int](Get-ReviewerVerificationValue $Left "line" 0)
+    $rightLine = [int](Get-ReviewerVerificationValue $Right "line" 0)
+    $sameAnchor = $leftPath -ceq $rightPath -and $leftLine -eq $rightLine
+    $leftTokens = @(([string](Get-ReviewerVerificationValue $Left "affectedBehavior" "")) -split ' ' |
+        Where-Object { $_ })
+    $rightTokens = @(([string](Get-ReviewerVerificationValue $Right "affectedBehavior" "")) -split ' ' |
+        Where-Object { $_ })
+    $similarity = Get-ReviewerVerificationSimilarity -Left $leftTokens -Right $rightTokens
+    $rightSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($token in $rightTokens) { [void]$rightSet.Add($token) }
+    $shared = 0
+    foreach ($token in $leftTokens) { if ($rightSet.Contains($token)) { $shared++ } }
+    if ($sameAnchor -and $leftText -ceq $rightText) { return 1.0 }
+    if ($sameAnchor -and $shared -ge 4 -and $similarity -ge $NearExactJaccard) {
+        return $similarity
+    }
+    $sameClass = [string](Get-ReviewerVerificationValue $Left "issueClass" "") -ceq
+        [string](Get-ReviewerVerificationValue $Right "issueClass" "")
+    if (-not $sameClass -or
+        [string](Get-ReviewerVerificationValue $Left "issueClass" "") -ceq "other") {
+        return -1.0
+    }
+    $requiredShared = if ($leftPath -cne $rightPath) { 4 } else { 3 }
+    if ($shared -ge $requiredShared -and $similarity -ge $SemanticJaccard) {
+        return $similarity
+    }
+    return -1.0
+}
+
+function Test-ReviewerVerificationCandidatePair {
+    param(
+        [Parameter(Mandatory)]$Left,
+        [Parameter(Mandatory)]$Right,
+        [ValidateRange(0.0, 1.0)][double]$NearExactJaccard = $script:ReviewerVerificationNearExactJaccard,
+        [ValidateRange(0.0, 1.0)][double]$SemanticJaccard = $script:ReviewerVerificationSemanticJaccard
+    )
+    return ((Get-ReviewerVerificationCandidatePairScore -Left $Left -Right $Right `
+            -NearExactJaccard $NearExactJaccard -SemanticJaccard $SemanticJaccard) -ge 0.0)
+}
+
 function Get-ReviewerVerificationClusters {
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Candidates,
         [int]$MaxCandidates = $script:ReviewerVerificationMaxCandidates,
-        [int]$MaxClusterSize = $script:ReviewerVerificationMaxClusterSize
+        [int]$MaxClusterSize = $script:ReviewerVerificationMaxClusterSize,
+        [ValidateRange(0.0, 1.0)][double]$NearExactJaccard = $script:ReviewerVerificationNearExactJaccard,
+        [ValidateRange(0.0, 1.0)][double]$SemanticJaccard = $script:ReviewerVerificationSemanticJaccard
     )
-    $items = @($Candidates)
-    if ($items.Count -gt $MaxCandidates) {
-        throw "Verification clustering input exceeds the code-defined candidate cap."
-    }
-    $parent = [int[]]::new($items.Count)
-    for ($i = 0; $i -lt $items.Count; $i++) { $parent[$i] = $i }
-    function Find-VerificationRoot {
-        param([int[]]$Parents, [int]$Index)
-        $current = $Index
-        while ($Parents[$current] -ne $current) { $current = $Parents[$current] }
-        return $current
-    }
-    for ($left = 0; $left -lt $items.Count; $left++) {
-        for ($right = $left + 1; $right -lt $items.Count; $right++) {
-            $a = $items[$left]
-            $b = $items[$right]
-            $aText = ConvertTo-ReviewerVerificationNormalizedText -Text (
-                [string](Get-ReviewerVerificationValue $a "comment" (
-                    Get-ReviewerVerificationValue $a "evidence" "")))
-            $bText = ConvertTo-ReviewerVerificationNormalizedText -Text (
-                [string](Get-ReviewerVerificationValue $b "comment" (
-                    Get-ReviewerVerificationValue $b "evidence" "")))
-            $aPath = ConvertTo-ReviewerVerificationPath -Path (
-                [string](Get-ReviewerVerificationValue $a "filePath" ""))
-            $bPath = ConvertTo-ReviewerVerificationPath -Path (
-                [string](Get-ReviewerVerificationValue $b "filePath" ""))
-            $aLine = [int](Get-ReviewerVerificationValue $a "line" 0)
-            $bLine = [int](Get-ReviewerVerificationValue $b "line" 0)
-            $sameAnchor = $aPath -ceq $bPath -and $aLine -eq $bLine
-            $aTokens = @(([string](Get-ReviewerVerificationValue $a "affectedBehavior" "")) -split ' ' | Where-Object { $_ })
-            $bTokens = @(([string](Get-ReviewerVerificationValue $b "affectedBehavior" "")) -split ' ' | Where-Object { $_ })
-            $similarity = Get-ReviewerVerificationSimilarity -Left $aTokens -Right $bTokens
-            $shared = 0
-            $bSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-            foreach ($token in $bTokens) { [void]$bSet.Add($token) }
-            foreach ($token in $aTokens) { if ($bSet.Contains($token)) { $shared++ } }
-            $sameClass = [string](Get-ReviewerVerificationValue $a "issueClass" "") -ceq
-                [string](Get-ReviewerVerificationValue $b "issueClass" "")
-            $meaningfulClass = $sameClass -and
-                [string](Get-ReviewerVerificationValue $a "issueClass" "") -cne "other"
-            $merge = ($sameAnchor -and $aText -ceq $bText) -or
-                ($sameAnchor -and $shared -ge 4 -and $similarity -ge 0.70) -or
-                ($meaningfulClass -and $shared -ge 3 -and $similarity -ge 0.55)
-            if (-not $merge) { continue }
-            $leftRoot = Find-VerificationRoot -Parents $parent -Index $left
-            $rightRoot = Find-VerificationRoot -Parents $parent -Index $right
-            if ($leftRoot -ne $rightRoot) {
-                $high = [Math]::Max($leftRoot, $rightRoot)
-                $low = [Math]::Min($leftRoot, $rightRoot)
-                $parent[$high] = $low
+    $MaxCandidates = [Math]::Min($MaxCandidates, $script:ReviewerVerificationMaxCandidates)
+    $MaxClusterSize = [Math]::Min($MaxClusterSize, $script:ReviewerVerificationMaxClusterSize)
+    $orderedItems = [System.Collections.Generic.List[object]]::new()
+    foreach ($candidate in @($Candidates)) { [void]$orderedItems.Add($candidate) }
+    $orderedItems.Sort([System.Comparison[object]] {
+            param($left, $right)
+            $semantic = [StringComparer]::Ordinal.Compare(
+                (Get-ReviewerVerificationClusteringKey -Candidate $left),
+                (Get-ReviewerVerificationClusteringKey -Candidate $right))
+            if ($semantic -ne 0) { return $semantic }
+            return [StringComparer]::Ordinal.Compare(
+                [string](Get-ReviewerVerificationValue $left "candidateHash" ""),
+                [string](Get-ReviewerVerificationValue $right "candidateHash" ""))
+        })
+    $activeItems = @($orderedItems | Select-Object -First $MaxCandidates)
+    $overflowItems = @($orderedItems | Select-Object -Skip $MaxCandidates)
+    $groups = [System.Collections.Generic.List[object]]::new()
+    foreach ($candidate in $activeItems) {
+        $matchedGroup = $null
+        $bestGroupScore = -1.0
+        $bestGroupKey = ""
+        foreach ($group in $groups) {
+            $cohesive = $true
+            $groupScore = 1.0
+            foreach ($member in $group) {
+                $pairScore = Get-ReviewerVerificationCandidatePairScore -Left $candidate -Right $member `
+                    -NearExactJaccard $NearExactJaccard -SemanticJaccard $SemanticJaccard
+                if ($pairScore -lt 0.0) {
+                    $cohesive = $false
+                    break
+                }
+                $groupScore = [Math]::Min($groupScore, $pairScore)
+            }
+            if (-not $cohesive) { continue }
+            $groupKey = Get-ReviewerVerificationClusteringKey -Candidate $group[0]
+            if ($null -eq $matchedGroup -or $groupScore -gt $bestGroupScore -or
+                ($groupScore -eq $bestGroupScore -and
+                    [StringComparer]::Ordinal.Compare($groupKey, $bestGroupKey) -lt 0)) {
+                $matchedGroup = $group
+                $bestGroupScore = $groupScore
+                $bestGroupKey = $groupKey
             }
         }
-    }
-    $groups = @{}
-    for ($i = 0; $i -lt $items.Count; $i++) {
-        $root = Find-VerificationRoot -Parents $parent -Index $i
-        if (-not $groups.ContainsKey($root)) {
-            $groups[$root] = [System.Collections.Generic.List[object]]::new()
+        if (-not $matchedGroup) {
+            $matchedGroup = [System.Collections.Generic.List[object]]::new()
+            [void]$groups.Add($matchedGroup)
         }
-        [void]$groups[$root].Add($items[$i])
+        [void]$matchedGroup.Add($candidate)
+    }
+    if ($overflowItems.Count -gt 0) {
+        $overflowGroup = [System.Collections.Generic.List[object]]::new()
+        foreach ($candidate in $overflowItems) { [void]$overflowGroup.Add($candidate) }
+        [void]$groups.Add($overflowGroup)
     }
     $clusters = [System.Collections.Generic.List[object]]::new()
-    foreach ($root in @($groups.Keys)) {
+    foreach ($group in $groups) {
         $members = [System.Collections.Generic.List[object]]::new()
-        foreach ($member in $groups[$root]) { [void]$members.Add($member) }
+        foreach ($member in $group) { [void]$members.Add($member) }
         $members.Sort([System.Comparison[object]] {
                 param($left, $right)
                 return [StringComparer]::Ordinal.Compare(
                     [string](Get-ReviewerVerificationValue $left "candidateHash" ""),
                     [string](Get-ReviewerVerificationValue $right "candidateHash" ""))
             })
-        if ($members.Count -gt $MaxClusterSize) {
-            throw "Verification cluster exceeds the code-defined $MaxClusterSize-member cap."
-        }
         $hashes = @($members | ForEach-Object {
                 [string](Get-ReviewerVerificationValue $_ "candidateHash" "")
             })
@@ -593,8 +750,20 @@ function Get-ReviewerVerificationClusters {
         $originList = [System.Collections.Generic.List[string]]::new()
         foreach ($origin in $origins) { [void]$originList.Add($origin) }
         $originList.Sort([StringComparer]::Ordinal)
+        $status = if (@($members | Where-Object {
+                    $overflowItems -contains $_
+                }).Count -gt 0) {
+            "candidateLimit"
+        }
+        elseif ($members.Count -gt $MaxClusterSize) {
+            "clusterLimit"
+        }
+        else {
+            "ready"
+        }
         [void]$clusters.Add([pscustomobject][ordered]@{
                 clusterId = "vc1:$clusterHash"
+                status = $status
                 memberHashes = $hashes
                 origins = $originList.ToArray()
                 members = $members.ToArray()
@@ -643,7 +812,8 @@ function Get-ReviewerVerificationThreadFacts {
 function Find-ReviewerVerificationExistingDuplicate {
     param(
         [Parameter(Mandatory)]$Candidate,
-        [object[]]$ThreadFacts = @()
+        [object[]]$ThreadFacts = @(),
+        [ValidateRange(0.0, 1.0)][double]$ExistingThreadJaccard = $script:ReviewerVerificationExistingThreadJaccard
     )
     $candidatePath = ConvertTo-ReviewerVerificationPath -Path (
         [string](Get-ReviewerVerificationValue $Candidate "filePath" ""))
@@ -659,7 +829,8 @@ function Find-ReviewerVerificationExistingDuplicate {
         $threadText = [string](Get-ReviewerVerificationValue $thread "sanitizedSubstance" "")
         $threadTokens = @(Get-ReviewerVerificationTokens -Text $threadText)
         if ($candidateTokens.Count -ge 3 -and
-            (Get-ReviewerVerificationSimilarity -Left $candidateTokens -Right $threadTokens) -ge 0.68) {
+            (Get-ReviewerVerificationSimilarity -Left $candidateTokens -Right $threadTokens) -ge
+            $ExistingThreadJaccard) {
             $authorClasses = @((Get-ReviewerVerificationValue $thread "authorClasses" @()))
             return [pscustomobject][ordered]@{
                 duplicate = $true
@@ -677,7 +848,8 @@ function Find-ReviewerVerificationExistingDuplicate {
 function Test-ReviewerVerificationThreadRelevant {
     param(
         [Parameter(Mandatory)]$Candidate,
-        [Parameter(Mandatory)]$Thread
+        [Parameter(Mandatory)]$Thread,
+        [ValidateRange(0.0, 1.0)][double]$ExistingThreadJaccard = $script:ReviewerVerificationExistingThreadJaccard
     )
     $candidatePath = ConvertTo-ReviewerVerificationPath -Path (
         [string](Get-ReviewerVerificationValue $Candidate "filePath" ""))
@@ -692,7 +864,8 @@ function Test-ReviewerVerificationThreadRelevant {
     $candidateTokens = @(Get-ReviewerVerificationTokens -Text $candidateText)
     $threadTokens = @(Get-ReviewerVerificationTokens -Text $threadText)
     return ($candidateTokens.Count -ge 3 -and
-        (Get-ReviewerVerificationSimilarity -Left $candidateTokens -Right $threadTokens) -ge 0.68)
+        (Get-ReviewerVerificationSimilarity -Left $candidateTokens -Right $threadTokens) -ge
+        $ExistingThreadJaccard)
 }
 
 function Get-ReviewerVerificationAssignments {
@@ -710,6 +883,9 @@ function Get-ReviewerVerificationAssignments {
     }
     $assignments = [System.Collections.Generic.List[object]]::new()
     foreach ($cluster in @($Clusters)) {
+        if ([string](Get-ReviewerVerificationValue $cluster "status" "ready") -cne "ready") {
+            continue
+        }
         foreach ($candidate in @(Get-ReviewerVerificationValue $cluster "members" @())) {
             $originKind = [string](Get-ReviewerVerificationValue $candidate "originKind" "")
             $originModel = [string](Get-ReviewerVerificationValue $candidate "originModel" "")
@@ -722,7 +898,10 @@ function Get-ReviewerVerificationAssignments {
             }
             $targets = [System.Collections.Generic.List[string]]::new()
             if ($originKind -ceq "convention") {
-                if ($ConventionVerifierModel) { [void]$targets.Add($ConventionVerifierModel) }
+                if ($ConventionVerifierModel -and -not [string]::Equals(
+                        $ConventionVerifierModel, $originModel, [StringComparison]::Ordinal)) {
+                    [void]$targets.Add($ConventionVerifierModel)
+                }
             }
             else {
                 foreach ($model in $models) {
@@ -758,6 +937,46 @@ function Get-ReviewerVerificationAssignments {
                 [string](Get-ReviewerVerificationValue $right "assignmentId" ""))
         })
     return $assignments.ToArray()
+}
+
+function Test-ReviewerVerificationReportedModel {
+    param(
+        [Parameter(Mandatory)][string]$ExpectedModel,
+        [AllowEmptyString()][string]$ReportedModel = ""
+    )
+    return (-not [string]::IsNullOrWhiteSpace($ReportedModel) -and
+        [string]::Equals($ExpectedModel, $ReportedModel, [StringComparison]::Ordinal))
+}
+
+function Get-ReviewerVerificationRunBudget {
+    param(
+        [ValidateRange(0, [int]::MaxValue)][int]$RunsLaunched,
+        [ValidateRange(1, [int]::MaxValue)][int]$MaxRuns,
+        [ValidateRange(0.0, [double]::MaxValue)][double]$ElapsedSeconds,
+        [ValidateRange(30, [int]::MaxValue)][int]$MaxPhaseSeconds,
+        [ValidateRange(30, 3600)][int]$ConfiguredRunTimeoutSeconds
+    )
+    $effectiveMaxRuns = [Math]::Min($MaxRuns, $script:ReviewerVerificationMaxVerifierRuns)
+    $effectiveMaxSeconds = [Math]::Min(
+        $MaxPhaseSeconds, $script:ReviewerVerificationMaxPhaseSeconds)
+    if ($RunsLaunched -ge $effectiveMaxRuns) {
+        return [pscustomobject][ordered]@{
+            canRun = $false; reason = "candidateLimit"; timeoutSeconds = 0; remainingSeconds = 0
+        }
+    }
+    $remaining = [int][Math]::Floor($effectiveMaxSeconds - $ElapsedSeconds)
+    if ($remaining -lt 30) {
+        return [pscustomobject][ordered]@{
+            canRun = $false; reason = "timeout"; timeoutSeconds = 0
+            remainingSeconds = [Math]::Max(0, $remaining)
+        }
+    }
+    return [pscustomobject][ordered]@{
+        canRun = $true
+        reason = ""
+        timeoutSeconds = [Math]::Min($ConfiguredRunTimeoutSeconds, $remaining)
+        remainingSeconds = $remaining
+    }
 }
 
 function Get-ReviewerVerificationMarkerSchema {
@@ -876,7 +1095,8 @@ function Get-ReviewerVerificationEvidenceOptions {
         $FactPlan = $null,
         [object[]]$ThreadFacts = @(),
         [object[]]$EvidenceHunks = @(),
-        [object[]]$SiblingCandidates = @()
+        [object[]]$SiblingCandidates = @(),
+        [ValidateRange(0.0, 1.0)][double]$ExistingThreadJaccard = $script:ReviewerVerificationExistingThreadJaccard
     )
     $candidateId = [string](Get-ReviewerVerificationValue $Candidate "candidateId" "")
     $options = [System.Collections.Generic.List[object]]::new()
@@ -954,7 +1174,8 @@ function Get-ReviewerVerificationEvidenceOptions {
         }
     }
     foreach ($thread in @($ThreadFacts)) {
-        if (-not (Test-ReviewerVerificationThreadRelevant -Candidate $Candidate -Thread $thread)) {
+        if (-not (Test-ReviewerVerificationThreadRelevant -Candidate $Candidate -Thread $thread `
+                -ExistingThreadJaccard $ExistingThreadJaccard)) {
             continue
         }
         $threadId = [string](Get-ReviewerVerificationValue $thread "threadId" "")
@@ -995,10 +1216,13 @@ function Resolve-ReviewerVerificationDecisions {
         $FactPlan = $null,
         [object[]]$ResolvedSources = @(),
         [object[]]$EvidenceHunks = @(),
+        [object[]]$PreVerificationWithheld = @(),
+        [ValidateRange(0.0, 1.0)][double]$ExistingThreadJaccard = $script:ReviewerVerificationExistingThreadJaccard,
         [bool]$SpecialistDegraded = $false
     )
     $eligible = [System.Collections.Generic.List[object]]::new()
     $withheld = [System.Collections.Generic.List[object]]::new()
+    foreach ($item in @($PreVerificationWithheld)) { [void]$withheld.Add($item) }
     $decisions = [System.Collections.Generic.List[object]]::new()
     $assignmentMap = @{}
     foreach ($assignment in @($Assignments)) {
@@ -1031,6 +1255,26 @@ function Resolve-ReviewerVerificationDecisions {
     }
     foreach ($cluster in @($Clusters)) {
         $clusterId = [string](Get-ReviewerVerificationValue $cluster "clusterId" "")
+        $clusterStatus = [string](Get-ReviewerVerificationValue $cluster "status" "ready")
+        if ($clusterStatus -cne "ready") {
+            foreach ($candidate in @(Get-ReviewerVerificationValue $cluster "members" @())) {
+                [void]$withheld.Add([pscustomobject][ordered]@{
+                        candidateId = [string]$candidate.candidateId
+                        candidateHash = [string]$candidate.candidateHash
+                        originKind = [string]$candidate.originKind
+                        originModel = [string]$candidate.originModel
+                        clusterId = $clusterId
+                        reason = $clusterStatus
+                        detail = $(if ($clusterStatus -ceq "clusterLimit") {
+                            "Candidate belongs to a semantic cluster above the versioned member cap."
+                        }
+                        else {
+                            "Candidate exceeds the versioned normalization cap."
+                        })
+                    })
+            }
+            continue
+        }
         $clusterCandidates = [System.Collections.Generic.List[object]]::new()
         foreach ($candidate in @(Get-ReviewerVerificationValue $cluster "members" @())) {
             $candidateFailed = $false
@@ -1044,7 +1288,8 @@ function Resolve-ReviewerVerificationDecisions {
                     })
                 continue
             }
-            $duplicate = Find-ReviewerVerificationExistingDuplicate -Candidate $candidate -ThreadFacts $ThreadFacts
+            $duplicate = Find-ReviewerVerificationExistingDuplicate -Candidate $candidate `
+                -ThreadFacts $ThreadFacts -ExistingThreadJaccard $ExistingThreadJaccard
             if ([bool]$duplicate.duplicate) {
                 [void]$withheld.Add([pscustomobject][ordered]@{
                         candidateId = $candidateId; clusterId = $clusterId
@@ -1139,7 +1384,8 @@ function Resolve-ReviewerVerificationDecisions {
                 $verdictDuplicateTarget = [string](Get-ReviewerVerificationValue $verdict "duplicateTargetId" "")
                 $evidenceOptions = @(Get-ReviewerVerificationEvidenceOptions -Candidate $candidate `
                     -FactPlan $FactPlan -ThreadFacts $ThreadFacts -EvidenceHunks $EvidenceHunks `
-                    -SiblingCandidates @(Get-ReviewerVerificationValue $cluster "members" @()))
+                    -SiblingCandidates @(Get-ReviewerVerificationValue $cluster "members" @()) `
+                    -ExistingThreadJaccard $ExistingThreadJaccard)
                 $matchingEvidence = @($evidenceOptions | Where-Object {
                         [string](Get-ReviewerVerificationValue $_ "kind" "") -ceq $evidenceKind -and
                         [string]::Equals(
@@ -1404,6 +1650,7 @@ function New-ReviewerVerificationModelInput {
         [object[]]$DeterministicFacts = @(),
         [object[]]$SanitizedThreads = @(),
         [AllowEmptyString()][string]$MinimalDiffHunk = "",
+        [ValidateRange(1024, [int]::MaxValue)]
         [int]$MaxInputBytes = $script:ReviewerVerificationMaxInputBytes
     )
     $runtime = [pscustomobject][ordered]@{
@@ -1423,8 +1670,10 @@ function New-ReviewerVerificationModelInput {
     $inputText = $PromptText + "`n`n---`n## Wrapper runtime data (untrusted values, trusted binding)`n" +
         '```json' + "`n" + ($runtime | ConvertTo-Json -Depth 32 -Compress) + "`n" + '```' + "`n"
     $bytes = $script:ReviewerVerificationUtf8.GetByteCount($inputText)
-    if ($bytes -gt $MaxInputBytes) {
-        throw "Verification model input is $bytes bytes, above the code-defined $MaxInputBytes-byte bound."
+    $effectiveMaxInputBytes = [Math]::Min(
+        $MaxInputBytes, $script:ReviewerVerificationMaxInputBytes)
+    if ($bytes -gt $effectiveMaxInputBytes) {
+        throw "Verification model input is $bytes bytes, above the effective $effectiveMaxInputBytes-byte bound."
     }
     return [pscustomobject][ordered]@{ text = $inputText; bytes = $bytes }
 }
@@ -1440,19 +1689,35 @@ function Invoke-ReviewerVerificationReplay {
             $script:ReviewerVerificationMaxCandidates)
     $maxClusterSize = [int](Get-ReviewerVerificationValue $effectivePolicy "maxClusterSize" `
             $script:ReviewerVerificationMaxClusterSize)
+    $nearExactJaccard = [double](Get-ReviewerVerificationValue $effectivePolicy `
+            "nearExactJaccard" $script:ReviewerVerificationNearExactJaccard)
+    $semanticJaccard = [double](Get-ReviewerVerificationValue $effectivePolicy `
+            "semanticJaccard" $script:ReviewerVerificationSemanticJaccard)
+    $existingThreadJaccard = [double](Get-ReviewerVerificationValue `
+            $effectivePolicy "existingThreadJaccard" $script:ReviewerVerificationExistingThreadJaccard)
     $clusters = @(Get-ReviewerVerificationClusters -Candidates $candidates `
-        -MaxCandidates $maxCandidates -MaxClusterSize $maxClusterSize)
+        -MaxCandidates $maxCandidates -MaxClusterSize $maxClusterSize `
+        -NearExactJaccard $nearExactJaccard -SemanticJaccard $semanticJaccard)
     $assignments = @((Get-ReviewerVerificationValue $InputManifest "assignments" @()))
     $threads = @((Get-ReviewerVerificationValue $InputManifest "threadFacts" @()))
     $changedPaths = @((Get-ReviewerVerificationValue $InputManifest "changedPaths" @()))
     $factPlan = Get-ReviewerVerificationValue $InputManifest "factPlan"
     $resolvedSources = @((Get-ReviewerVerificationValue $InputManifest "resolvedSources" @()))
     $evidenceHunks = @((Get-ReviewerVerificationValue $InputManifest "evidenceHunks" @()))
+    $preVerificationWithheld = @((Get-ReviewerVerificationValue `
+            $InputManifest "preVerificationWithheld" @()))
+    $sealedTotalCandidateCount = Get-ReviewerVerificationValue `
+        $InputManifest "totalCandidateCount" $null
+    if ($null -ne $sealedTotalCandidateCount -and
+        [int]$sealedTotalCandidateCount -ne ($candidates.Count + $preVerificationWithheld.Count)) {
+        throw "Verification replay candidate coverage does not match sealed totalCandidateCount."
+    }
     $specialistStatus = [string](Get-ReviewerVerificationValue $InputManifest "specialistStatus" "degraded")
     $resolved = Resolve-ReviewerVerificationDecisions -Clusters $clusters -Assignments $assignments `
         -VerifierRuns $VerifierRuns -ThreadFacts $threads -ChangedPaths $changedPaths `
         -FactPlan $factPlan -ResolvedSources $resolvedSources `
-        -EvidenceHunks $evidenceHunks `
+        -EvidenceHunks $evidenceHunks -PreVerificationWithheld $preVerificationWithheld `
+        -ExistingThreadJaccard $existingThreadJaccard `
         -SpecialistDegraded ($specialistStatus -cne "complete")
     return [pscustomobject][ordered]@{
         clusters = $clusters

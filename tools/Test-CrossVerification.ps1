@@ -331,9 +331,33 @@ foreach ($candidate in @($exactCandidates + $paraphraseCandidates + $sameLineCan
     Assert-Verification (Test-Json -Json ($candidate | ConvertTo-Json -Depth 32 -Compress) -SchemaFile $schemaPath) `
         "A normalized candidate failed the versioned schema."
 }
-Assert-Verification ([int]$policy.maxCandidates -eq $script:ReviewerVerificationMaxCandidates -and
-    [int]$policy.maxClusterSize -eq $script:ReviewerVerificationMaxClusterSize) `
-    "Versioned policy caps drifted from code-defined caps."
+Assert-Verification (
+    [int]$policy.maxCandidates -eq $script:ReviewerVerificationMaxCandidates -and
+    [int]$policy.maxClusterSize -eq $script:ReviewerVerificationMaxClusterSize -and
+    [int]$policy.maxInputBytes -eq $script:ReviewerVerificationMaxInputBytes -and
+    [int]$policy.maxArtifactBytes -eq $script:ReviewerVerificationMaxArtifactBytes -and
+    [int]$policy.maxVerifierRuns -eq $script:ReviewerVerificationMaxVerifierRuns -and
+    [int]$policy.maxVerificationSeconds -eq $script:ReviewerVerificationMaxPhaseSeconds -and
+    [double]$policy.nearExactJaccard -eq $script:ReviewerVerificationNearExactJaccard -and
+    [double]$policy.semanticJaccard -eq $script:ReviewerVerificationSemanticJaccard -and
+    [double]$policy.existingThreadJaccard -eq $script:ReviewerVerificationExistingThreadJaccard
+) "Versioned effective policy drifted from code-defined defaults."
+$widenedPolicy = Copy-VerificationObject $policy
+$widenedPolicy.maxCandidates = 640
+$widenedPolicy.maxClusterSize = 80
+$widenedPolicy.maxInputBytes = 900000
+$widenedPolicy.maxArtifactBytes = 3000000
+$widenedPolicy.maxVerifierRuns = 120
+$widenedPolicy.maxVerificationSeconds = 36000
+$clampedPolicy = ConvertTo-ReviewerVerificationEffectivePolicy -Policy $widenedPolicy
+Assert-Verification (
+    [int]$clampedPolicy.maxCandidates -eq $script:ReviewerVerificationMaxCandidates -and
+    [int]$clampedPolicy.maxClusterSize -eq $script:ReviewerVerificationMaxClusterSize -and
+    [int]$clampedPolicy.maxInputBytes -eq $script:ReviewerVerificationMaxInputBytes -and
+    [int]$clampedPolicy.maxArtifactBytes -eq $script:ReviewerVerificationMaxArtifactBytes -and
+    [int]$clampedPolicy.maxVerifierRuns -eq $script:ReviewerVerificationMaxVerifierRuns -and
+    [int]$clampedPolicy.maxVerificationSeconds -eq $script:ReviewerVerificationMaxPhaseSeconds
+) "Policy values widened a code-defined verification ceiling."
 
 # Assignment is cross-model for generalists and explicitly named for convention.
 $assignments = @(Get-ReviewerVerificationAssignments -Clusters $exactClusters `
@@ -357,6 +381,35 @@ $conventionAssignments = @(Get-ReviewerVerificationAssignments -Clusters $conven
 Assert-Verification ($conventionAssignments.Count -eq 1 -and
     $conventionAssignments[0].verifierModel -ceq $sol) `
     "Convention candidate did not use its explicitly named generalist verifier."
+$selfConventionAssignments = @(Get-ReviewerVerificationAssignments -Clusters $conventionClusters `
+    -GeneralistModels @($opus, $sol) -ConventionVerifierModel "claude-sonnet-5")
+Assert-Verification ($selfConventionAssignments.Count -eq 0) `
+    "Library assignment allowed a convention candidate to verify itself."
+Assert-Verification (
+    (Test-ReviewerVerificationReportedModel -ExpectedModel $sol -ReportedModel $sol) -and
+    -not (Test-ReviewerVerificationReportedModel -ExpectedModel $sol -ReportedModel "") -and
+    -not (Test-ReviewerVerificationReportedModel -ExpectedModel $sol -ReportedModel $opus)
+) "Verifier model identity accepted an empty or mismatched CLI report."
+$withinBudget = Get-ReviewerVerificationRunBudget -RunsLaunched 1 -MaxRuns 2 `
+    -ElapsedSeconds 20 -MaxPhaseSeconds 120 -ConfiguredRunTimeoutSeconds 90
+$runCapBudget = Get-ReviewerVerificationRunBudget -RunsLaunched 2 -MaxRuns 2 `
+    -ElapsedSeconds 20 -MaxPhaseSeconds 120 -ConfiguredRunTimeoutSeconds 90
+$deadlineBudget = Get-ReviewerVerificationRunBudget -RunsLaunched 1 -MaxRuns 2 `
+    -ElapsedSeconds 100 -MaxPhaseSeconds 120 -ConfiguredRunTimeoutSeconds 90
+$widenedRunBudget = Get-ReviewerVerificationRunBudget `
+    -RunsLaunched $script:ReviewerVerificationMaxVerifierRuns -MaxRuns 120 `
+    -ElapsedSeconds 0 -MaxPhaseSeconds 36000 -ConfiguredRunTimeoutSeconds 90
+$widenedTimeBudget = Get-ReviewerVerificationRunBudget -RunsLaunched 0 -MaxRuns 120 `
+    -ElapsedSeconds $script:ReviewerVerificationMaxPhaseSeconds `
+    -MaxPhaseSeconds 36000 -ConfiguredRunTimeoutSeconds 90
+Assert-Verification ([bool]$withinBudget.canRun -and $withinBudget.timeoutSeconds -eq 90 -and
+    -not [bool]$runCapBudget.canRun -and [string]$runCapBudget.reason -ceq "candidateLimit" -and
+    -not [bool]$deadlineBudget.canRun -and [string]$deadlineBudget.reason -ceq "timeout" -and
+    -not [bool]$widenedRunBudget.canRun -and
+    [string]$widenedRunBudget.reason -ceq "candidateLimit" -and
+    -not [bool]$widenedTimeBudget.canRun -and
+    [string]$widenedTimeBudget.reason -ceq "timeout") `
+    "Aggregate verifier run/deadline budget did not bound the phase."
 
 # Both-generalist clusters are independently assessed, not auto-accepted.
 $exactResolved = Resolve-ReviewerVerificationDecisions -Clusters $exactClusters -Assignments $assignments `
@@ -674,6 +727,16 @@ $unrelatedOptions = @(Get-ReviewerVerificationEvidenceOptions -Candidate $candid
     -EvidenceHunks (Get-TestEvidenceHunks -Clusters $singleCluster))
 Assert-Verification (@($unrelatedOptions | Where-Object kind -ceq "existingThread").Count -eq 0) `
     "An unrelated existing thread was offered as candidate evidence."
+$thresholdCandidate = Copy-VerificationObject $candidateForThread
+$thresholdCandidate.comment = "alpha beta gamma delta omega issue"
+$thresholdThread = Copy-VerificationObject $threadBase
+$thresholdThread.sanitizedSubstance = "alpha beta gamma delta sigma issue"
+Assert-Verification (
+    [bool](Find-ReviewerVerificationExistingDuplicate -Candidate $thresholdCandidate `
+        -ThreadFacts @($thresholdThread) -ExistingThreadJaccard 0.60).duplicate -and
+    -not [bool](Find-ReviewerVerificationExistingDuplicate -Candidate $thresholdCandidate `
+        -ThreadFacts @($thresholdThread) -ExistingThreadJaccard 0.90).duplicate
+) "Changing the versioned existing-thread threshold did not affect duplicate detection."
 $relevantThread = Copy-VerificationObject $threadBase
 $threadOption = @(Get-ReviewerVerificationEvidenceOptions -Candidate $candidateForThread `
     -FactPlan $factPlan -ThreadFacts @($relevantThread) `
@@ -752,25 +815,113 @@ $movedAnchor = Resolve-ReviewerVerificationDecisions -Clusters $singleCluster `
 Assert-Verification (@($movedAnchor.withheld | Where-Object reason -ceq "anchorInvalid").Count -eq 1) `
     "A candidate survived source/change-set movement."
 
-# Candidate and cluster caps fail closed.
+# Candidate and cluster caps isolate only the offending candidates.
 $tooManyFindings = @(1..65 | ForEach-Object {
         New-GeneralistFinding -Line $_ -Comment "Distinct retry state failure number $_ loses data."
     })
-Assert-VerificationThrows {
-    ConvertTo-ReviewerVerificationCandidates -GeneralistPasses @(
-        (New-GeneralistPass -Model $opus -Findings $tooManyFindings)
-    )
-} "Candidate normalization accepted more than the code-defined cap."
+$candidateLimitPlan = Get-ReviewerVerificationCandidatePlan -GeneralistPasses @(
+    (New-GeneralistPass -Model $opus -Findings $tooManyFindings)
+) -MaxCandidates 8
+Assert-Verification (@($candidateLimitPlan.candidates).Count -eq 8 -and
+    @($candidateLimitPlan.withheld).Count -eq 57 -and
+    @($candidateLimitPlan.withheld | Where-Object reason -cne "candidateLimit").Count -eq 0) `
+    "Candidate-limit overflow did not preserve a bounded set and enumerate every excess candidate."
+$widenedCandidatePlan = Get-ReviewerVerificationCandidatePlan -GeneralistPasses @(
+    (New-GeneralistPass -Model $opus -Findings $tooManyFindings)
+) -MaxCandidates 640
+Assert-Verification (@($widenedCandidatePlan.candidates).Count -eq
+    $script:ReviewerVerificationMaxCandidates -and
+    @($widenedCandidatePlan.withheld).Count -eq 1) `
+    "A policy value widened the code-defined candidate ceiling."
+$oversizedFindings = @(1..9 | ForEach-Object {
+        New-GeneralistFinding -Comment "The exact retry state failure loses data."
+    })
+$oversizedFindings += New-GeneralistFinding -FilePath "/src/independent.cs" -Line 7 `
+    -Comment "The authorization token is logged before redaction."
 $oversizedClusterCandidates = @(ConvertTo-ReviewerVerificationCandidates -GeneralistPasses @(
-        (New-GeneralistPass -Model $opus -Findings @(
-                1..9 | ForEach-Object {
-                    New-GeneralistFinding -Comment "The exact retry state failure loses data."
-                }
-            ))
+        (New-GeneralistPass -Model $opus -Findings $oversizedFindings)
     ))
-Assert-VerificationThrows {
-    Get-ReviewerVerificationClusters -Candidates $oversizedClusterCandidates -MaxClusterSize 8
-} "Semantic clustering accepted a cluster above its code-defined cap."
+$isolatedClusters = @(Get-ReviewerVerificationClusters -Candidates $oversizedClusterCandidates `
+    -MaxClusterSize 8)
+$widenedClusterCap = @(Get-ReviewerVerificationClusters -Candidates $oversizedClusterCandidates `
+    -MaxClusterSize 80)
+Assert-Verification ($isolatedClusters.Count -eq 2 -and
+    @($isolatedClusters | Where-Object status -ceq "clusterLimit").Count -eq 1 -and
+    @($isolatedClusters | Where-Object status -ceq "ready").Count -eq 1) `
+    "An oversized cluster was not isolated from an unrelated valid cluster."
+Assert-Verification (@($widenedClusterCap | Where-Object status -ceq "clusterLimit").Count -eq 1) `
+    "A policy value widened the code-defined cluster-size ceiling."
+$lowerClusterCap = @(Get-ReviewerVerificationClusters -Candidates $exactCandidates `
+    -MaxClusterSize 1)
+Assert-Verification (@($exactClusters | Where-Object status -ceq "ready").Count -eq 1 -and
+    @($lowerClusterCap | Where-Object status -ceq "clusterLimit").Count -eq 1) `
+    "Changing the effective cluster-size cap did not change cluster eligibility."
+$isolatedAssignments = @(Get-ReviewerVerificationAssignments -Clusters $isolatedClusters `
+    -GeneralistModels @($opus, $sol))
+$isolatedRuns = New-CompleteRuns -Assignments $isolatedAssignments
+$isolatedResolved = Resolve-ReviewerVerificationDecisions -Clusters $isolatedClusters `
+    -Assignments $isolatedAssignments -VerifierRuns $isolatedRuns `
+    -ChangedPaths @("src/a.cs", "src/independent.cs") -FactPlan $factPlan `
+    -EvidenceHunks (Get-TestEvidenceHunks -Clusters $isolatedClusters)
+Assert-Verification (@($isolatedResolved.eligible).Count -eq 1 -and
+    @($isolatedResolved.withheld | Where-Object reason -ceq "clusterLimit").Count -eq 9) `
+    "An oversized cluster degraded unrelated verification or failed to enumerate every member."
+
+# Complete-link cohesion prevents transitive same-family chains while retaining a true cross-file root cause.
+$chainA = Copy-VerificationObject $exactCandidates[0]
+$chainB = Copy-VerificationObject $exactCandidates[0]
+$chainC = Copy-VerificationObject $exactCandidates[0]
+$chainA.candidateId = "cand1:" + ("a" * 64); $chainA.candidateHash = "a" * 64
+$chainB.candidateId = "cand1:" + ("b" * 64); $chainB.candidateHash = "b" * 64
+$chainC.candidateId = "cand1:" + ("c" * 64); $chainC.candidateHash = "c" * 64
+$chainA.filePath = "/src/a.cs"; $chainB.filePath = "/src/b.cs"; $chainC.filePath = "/src/c.cs"
+$chainA.affectedBehavior = "alpha beta gamma delta omega"
+$chainB.affectedBehavior = "beta delta gamma omega sigma"
+$chainC.affectedBehavior = "delta gamma omega sigma theta"
+$chainA.issueClass = "behavior"; $chainB.issueClass = "behavior"; $chainC.issueClass = "behavior"
+$chainClusters = @(Get-ReviewerVerificationClusters -Candidates @($chainA, $chainB, $chainC) `
+    -SemanticJaccard 0.55)
+Assert-Verification ($chainClusters.Count -eq 2 -and
+    @($chainClusters | Where-Object { @($_.members).Count -eq 2 }).Count -eq 1) `
+    "Transitive semantic similarity chained distinct cross-file findings into one cluster."
+$chainRelabelA = Copy-VerificationObject $chainA
+$chainRelabelB = Copy-VerificationObject $chainB
+$chainRelabelC = Copy-VerificationObject $chainC
+$chainRelabelA.candidateHash = "f" * 64; $chainRelabelA.candidateId = "cand1:" + ("f" * 64)
+$chainRelabelB.candidateHash = "1" * 64; $chainRelabelB.candidateId = "cand1:" + ("1" * 64)
+$chainRelabelC.candidateHash = "8" * 64; $chainRelabelC.candidateId = "cand1:" + ("8" * 64)
+$chainRelabelClusters = @(Get-ReviewerVerificationClusters `
+    -Candidates @($chainRelabelA, $chainRelabelB, $chainRelabelC) -SemanticJaccard 0.55)
+$chainSignature = @($chainClusters | ForEach-Object {
+        @($_.members | ForEach-Object { [string]$_.affectedBehavior } | Sort-Object) -join "+"
+    } | Sort-Object) -join "|"
+$chainRelabelSignature = @($chainRelabelClusters | ForEach-Object {
+        @($_.members | ForEach-Object { [string]$_.affectedBehavior } | Sort-Object) -join "+"
+    } | Sort-Object) -join "|"
+Assert-Verification ($chainRelabelSignature -ceq $chainSignature) `
+    "Complete-link partition changed when only candidate hashes were relabelled."
+Assert-Verification (@(Get-ReviewerVerificationClusters -Candidates $crossFileCandidates `
+        -SemanticJaccard 0.55).Count -eq 1) `
+    "Complete-link cohesion lost intended cross-file same-root-cause clustering."
+$strictChainClusters = @(Get-ReviewerVerificationClusters -Candidates @($chainA, $chainB, $chainC) `
+    -SemanticJaccard 0.90)
+Assert-Verification ($strictChainClusters.Count -eq 3) `
+    "Changing the versioned semantic threshold did not change clustering."
+$nearLeft = Copy-VerificationObject $chainA
+$nearRight = Copy-VerificationObject $chainB
+$nearLeft.filePath = "/src/near.cs"; $nearRight.filePath = "/src/near.cs"
+$nearLeft.line = 9; $nearRight.line = 9
+$nearLeft.issueClass = "other"; $nearRight.issueClass = "other"
+$nearLeft.comment = "Alpha beta gamma delta omega behavior."
+$nearRight.comment = "Alpha beta gamma delta sigma behavior."
+$nearLeft.affectedBehavior = "alpha beta gamma delta omega"
+$nearRight.affectedBehavior = "alpha beta gamma delta sigma"
+Assert-Verification (
+    (Test-ReviewerVerificationCandidatePair -Left $nearLeft -Right $nearRight `
+        -NearExactJaccard 0.60) -and
+    -not (Test-ReviewerVerificationCandidatePair -Left $nearLeft -Right $nearRight `
+        -NearExactJaccard 0.80)
+) "Changing the versioned near-exact threshold did not affect pair clustering."
 
 # Domain-separated HMAC artifacts preserve empty, singleton, and multiple arrays.
 $tempDir = Join-Path ([IO.Path]::GetTempPath()) ("devpilot-verification-" + [Guid]::NewGuid().ToString("N"))
@@ -815,7 +966,7 @@ try {
         payload = "x" * 600000
     }
     $largePath = Save-ReviewerVerificationInput -Manifest $largeManifest -Directory $tempDir `
-        -BaseName "large-input" -MasterKey $masterKey
+        -BaseName "large-input" -MasterKey $masterKey -MaxArtifactBytes 700000
     Assert-Verification (Test-Path -LiteralPath $largePath -PathType Leaf) `
         "A valid artifact larger than the model-input cap was rejected."
     Assert-VerificationThrows {
@@ -823,8 +974,13 @@ try {
                 kind = $script:ReviewerVerificationInputKind
                 artifactVersion = 1
                 payload = "x" * ($script:ReviewerVerificationMaxArtifactBytes + 1)
-            }) -Directory $tempDir -BaseName "oversized-input" -MasterKey $masterKey
+            }) -Directory $tempDir -BaseName "oversized-input" -MasterKey $masterKey `
+            -MaxArtifactBytes 3000000
     } "An artifact above the independent artifact cap was accepted."
+    Assert-VerificationThrows {
+        Save-ReviewerVerificationInput -Manifest $largeManifest -Directory $tempDir `
+            -BaseName "policy-capped-input" -MasterKey $masterKey -MaxArtifactBytes 500000
+    } "Changing the effective artifact cap did not change persistence limits."
     $tamperedEnvelope = [IO.File]::ReadAllText($previewPath) | ConvertFrom-Json
     $tamperedEnvelope.manifestJson = ([string]$tamperedEnvelope.manifestJson).Replace(
         '"withheld":["withheld"]', '"withheld":[]')
@@ -847,8 +1003,13 @@ $replayInput = [pscustomobject][ordered]@{
     effectivePolicy = [pscustomobject][ordered]@{
         maxCandidates = 64
         maxClusterSize = 8
+        nearExactJaccard = 0.70
+        semanticJaccard = 0.55
+        existingThreadJaccard = 0.68
     }
     candidates = @($exactCandidates)
+    totalCandidateCount = 2
+    preVerificationWithheld = @()
     assignments = @($assignments)
     threadFacts = @()
     changedPaths = @("src/a.cs")
@@ -865,11 +1026,31 @@ $replayTwo = Invoke-ReviewerVerificationReplay -InputManifest (
 Assert-Verification ([string]$replayOne.replaySha256 -ceq [string]$replayTwo.replaySha256 -and
     @($replayOne.eligible).Count -eq @($replayTwo.eligible).Count) `
     "Saved-artifact replay did not deterministically reconstruct wrapper decisions."
+$incompleteCoverageReplay = Copy-VerificationObject $replayInput
+$incompleteCoverageReplay.totalCandidateCount = 3
+Assert-VerificationThrows {
+    Invoke-ReviewerVerificationReplay -InputManifest $incompleteCoverageReplay `
+        -VerifierRuns $replayRuns
+} "Replay accepted a sealed candidate total with missing withheld coverage."
 $replayCap = Copy-VerificationObject $replayInput
 $replayCap.effectivePolicy.maxCandidates = 1
-Assert-VerificationThrows {
-    Invoke-ReviewerVerificationReplay -InputManifest $replayCap -VerifierRuns $replayRuns
-} "Replay ignored the effective versioned candidate cap."
+$cappedReplay = Invoke-ReviewerVerificationReplay -InputManifest $replayCap -VerifierRuns $replayRuns
+Assert-Verification (@($cappedReplay.clusters | Where-Object status -ceq "candidateLimit").Count -eq 1 -and
+    @($cappedReplay.withheld | Where-Object reason -ceq "candidateLimit").Count -eq 1) `
+    "Replay ignored the effective versioned candidate cap or erased its withheld candidate."
+$thresholdReplayInput = Copy-VerificationObject $replayInput
+$thresholdReplayInput.candidates = @($chainA, $chainB, $chainC)
+$thresholdReplayInput.totalCandidateCount = 3
+$thresholdReplayInput.assignments = @()
+$thresholdReplayInput.evidenceHunks = @()
+$thresholdReplayInput.changedPaths = @("src/a.cs", "src/b.cs", "src/c.cs")
+$thresholdReplayInput.effectivePolicy.semanticJaccard = 0.55
+$thresholdReplayLow = Invoke-ReviewerVerificationReplay -InputManifest $thresholdReplayInput -VerifierRuns @()
+$thresholdReplayInput.effectivePolicy.semanticJaccard = 0.90
+$thresholdReplayHigh = Invoke-ReviewerVerificationReplay -InputManifest $thresholdReplayInput -VerifierRuns @()
+Assert-Verification (@($thresholdReplayLow.clusters).Count -eq 2 -and
+    @($thresholdReplayHigh.clusters).Count -eq 3) `
+    "Replay ignored the sealed semantic clustering threshold."
 
 # Prompt/runtime input stays cluster-scoped and bounded.
 $prompt = [IO.File]::ReadAllText((Join-Path $repoRoot "src\Agents\reviewer\cross-verify.prompt.md"))
@@ -898,6 +1079,18 @@ Assert-Verification ($modelInput.text.Contains('```json', [StringComparison]::Or
     $modelInput.text.Contains('"candidateEvidenceOptions"', [StringComparison]::Ordinal) -and
     $modelInput.text.EndsWith('```' + "`n", [StringComparison]::Ordinal)) `
     "Verifier runtime data is not fenced as untrusted JSON."
+Assert-VerificationThrows {
+    New-ReviewerVerificationModelInput -PromptText $prompt -Nonce "verify-nonce" `
+        -Binding ([pscustomobject][ordered]@{ pullRequestId = 42 }) `
+        -VerificationInputSha256 $inputSha -ClusterId ([string]$singleCluster[0].clusterId) `
+        -VerifierModel $sol -Candidates @($singleCluster[0].members[0]) -MaxInputBytes 1024
+} "Changing the effective input cap did not change verifier input limits."
+Assert-VerificationThrows {
+    New-ReviewerVerificationModelInput -PromptText ("x" * ($script:ReviewerVerificationMaxInputBytes + 1)) `
+        -Nonce "verify-nonce" -Binding ([pscustomobject][ordered]@{ pullRequestId = 42 }) `
+        -VerificationInputSha256 $inputSha -ClusterId ([string]$singleCluster[0].clusterId) `
+        -VerifierModel $sol -Candidates @() -MaxInputBytes 900000
+} "A policy value widened the code-defined verifier input ceiling."
 
 # Wrapper integration remains preview-only and structurally non-promotable.
 $pullRequestText = Get-VerificationFunctionText -Text $wrapperText -Name "Invoke-ReviewerPullRequest"
@@ -927,12 +1120,26 @@ foreach ($emptyArrayParameter in @(
             '\[AllowEmptyCollection\(\)\]\[object\[\]\]\$' + [regex]::Escape($emptyArrayParameter))) `
         "Verifier model-run parameter '$emptyArrayParameter' rejects a valid empty array."
 }
+Assert-Verification ($modelRunText -match 'Test-ReviewerVerificationReportedModel' -and
+    $modelRunText -match 'did not report an exact verifier model identity') `
+    "Production verifier runs accept an empty or unbound reported model identity."
 $sourceHunkText = Get-VerificationFunctionText -Text $wrapperText `
     -Name "Get-ReviewerVerificationSourceHunks"
 Assert-Verification ($sourceHunkText -match 'ConvertTo-ReviewerVerificationReadPath' -and
     $sourceHunkText -match '\$fileCache\[\$normalizedPath\]' -and
     $sourceHunkText -match '-Path\s+\$path') `
     "Source-hunk reads do not separate normalized cache identity from case-preserving request paths."
+$crossPassText = Get-VerificationFunctionText -Text $wrapperText `
+    -Name "Invoke-ReviewerCrossVerificationPass"
+foreach ($policyUse in @(
+        "Get-ReviewerVerificationCandidatePlan", "nearExactJaccard", "semanticJaccard",
+        "existingThreadJaccard", "maxInputBytes", "maxArtifactBytes",
+        "Get-ReviewerVerificationRunBudget", "preVerificationWithheld"
+    )) {
+    Assert-Verification ($crossPassText.IndexOf(
+            $policyUse, [StringComparison]::Ordinal) -ge 0) `
+        "Effective verification policy '$policyUse' is sealed but does not drive production behavior."
+}
 foreach ($forbiddenName in @(
         "reviewedStatePath", "attemptsStatePath", "Set-JsonState", "Invoke-ReviewerDelivery",
         "Add-ReviewerThread", "Set-ReviewerVote", "EnableFindingComments", "EnableSummaryComment",

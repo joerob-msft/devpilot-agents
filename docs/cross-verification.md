@@ -28,9 +28,22 @@ numeric formatting.
 Candidate clustering is wrapper-deterministic and advisory. Exact and near-exact
 findings cluster by normalized claim and anchor. A bounded semantic pass groups
 paraphrases and cross-file candidates only when issue class and behavior tokens
-substantially overlap. File/line overlap alone never merges candidates. Originals
-remain in the sealed input, and each cluster ID is the hash of its ordered member
-hashes.
+substantially overlap. Clusters use complete-link cohesion: every member must
+match every other member, so a chain of merely adjacent similarities cannot join
+unrelated same-family findings. Cross-file matching requires stronger shared
+root-cause evidence than same-file matching. File/line overlap alone never merges
+candidates. Originals remain in the sealed input, and each cluster ID is the hash
+of its ordered member hashes.
+
+Candidate and cluster caps isolate rather than erase work. Candidates beyond the
+normalization cap and every member of an oversized semantic cluster are listed
+individually as `candidateLimit` or `clusterLimit`; unrelated ready clusters still
+receive verifier assignments. The sealed effective policy drives candidate,
+cluster, input, artifact, run-count, deadline, near-exact, semantic, and existing-
+thread thresholds, and replay applies those same saved values.
+Policy may narrow code-defined candidate, cluster, input, artifact, verifier-run,
+and phase-time ceilings but cannot widen them; the sealed effective policy records
+the clamped values actually enforced.
 
 Generalist candidates discovered by Claude Opus 5 are assigned to GPT-5.6 Sol;
 Sol candidates are assigned to Opus 5. Convention candidates use the explicitly
@@ -48,10 +61,15 @@ discovery summaries, unrelated candidates, delivery state, or write tools.
 `unsupported`, `wrongSeverity`, and `needsHuman`. Every verdict binds the exact
 candidate, cluster, source snapshot, verifier model, prompt, and evidence hash.
 The schema has no comment, publication, write, summary, or vote fields.
+The wrapper requires the CLI to report the exact non-empty configured model for
+every verifier run. Convention candidates cannot be assigned back to their
+specialist discovery model even if startup validation is bypassed.
 
 Timeout, invalid marker, stale binding, model mismatch, tool violation, missing
 evidence, incomplete output, disagreement, or `needsHuman` withholds. There is no
 majority vote. Verification cannot add or expand a finding or raise severity.
+An absolute phase deadline and run-count cap bound aggregate verifier work; each
+process receives no more than the remaining phase budget.
 
 ## Eligibility and artifacts
 

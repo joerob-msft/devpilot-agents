@@ -374,6 +374,8 @@ foreach ($requiredVerificationAsset in @($CrossVerificationPolicyPath, $CrossVer
     }
 }
 $CrossVerificationPolicy = Get-Content -LiteralPath $CrossVerificationPolicyPath -Raw | ConvertFrom-Json -Depth 32
+$EffectiveCrossVerificationPolicy = ConvertTo-ReviewerVerificationEffectivePolicy `
+    -Policy $CrossVerificationPolicy
 $ReviewFactPolicyPath = Join-Path $PSScriptRoot "facts\v1\policy.json"
 $ReviewFactSchemaPath = Join-Path $PSScriptRoot "facts\v1\schema.json"
 foreach ($requiredFactAsset in @($ReviewFactPolicyPath, $ReviewFactSchemaPath)) {
@@ -5526,6 +5528,7 @@ function Write-ReviewerVerificationDecisionPreview {
         [object[]]$Withheld = @(),
         [object[]]$Eligible = @(),
         [object[]]$InputArtifactHashes = @(),
+        [ValidateRange(0, [int]::MaxValue)][int]$TotalCandidateCount = 0,
         [AllowEmptyString()][string]$ReplaySha256 = ""
     )
     $stamp = [DateTime]::UtcNow.ToString(
@@ -5537,6 +5540,7 @@ function Write-ReviewerVerificationDecisionPreview {
     [void]$lines.Add("")
     [void]$lines.Add("- Status: $Status")
     [void]$lines.Add("- Source commit: $SourceCommit")
+    [void]$lines.Add("- Total normalized candidates: $TotalCandidateCount")
     [void]$lines.Add("- Clusters: $(@($Clusters).Count)")
     [void]$lines.Add("- Assignments: $(@($Assignments).Count)")
     [void]$lines.Add("- Eligible preview candidates: $(@($Eligible).Count)")
@@ -5587,9 +5591,11 @@ function Write-ReviewerVerificationDecisionPreview {
         inputArtifactPath = $InputArtifactPath
         inputManifestSha256 = $InputManifestSha256
         inputArtifactHashes = @($InputArtifactHashes)
+        totalCandidateCount = $TotalCandidateCount
         clusters = @($Clusters | ForEach-Object {
                 [pscustomobject][ordered]@{
                     clusterId = [string]$_.clusterId
+                    status = [string](Get-ReviewerVerificationValue $_ "status" "ready")
                     memberHashes = @($_.memberHashes)
                     origins = @($_.origins)
                 }
@@ -5606,7 +5612,8 @@ function Write-ReviewerVerificationDecisionPreview {
     }
     $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
     $artifactPath = Save-ReviewerVerificationPreview -Manifest $manifest `
-        -Directory $verificationPreviewDir -BaseName $baseName -MasterKey $masterKey
+        -Directory $verificationPreviewDir -BaseName $baseName -MasterKey $masterKey `
+        -MaxArtifactBytes ([int]$EffectiveCrossVerificationPolicy.maxArtifactBytes)
     Write-Host "Cross-verification preview for PR $PrId saved to $markdownPath" -ForegroundColor DarkCyan
     return @{ MarkdownPath = $markdownPath; ArtifactPath = $artifactPath; Manifest = $manifest }
 }
@@ -5634,7 +5641,8 @@ function Invoke-ReviewerVerificationModelRun {
         -Candidates $AssignedCandidates -SiblingEvidence $SiblingEvidence `
         -CandidateEvidence $CandidateEvidence `
         -DeterministicFacts $DeterministicFacts -SanitizedThreads $ThreadFacts `
-        -MinimalDiffHunk (ConvertTo-ReviewerVerificationCanonicalArray -Items @($EvidenceHunks))
+        -MinimalDiffHunk (ConvertTo-ReviewerVerificationCanonicalArray -Items @($EvidenceHunks)) `
+        -MaxInputBytes ([int]$EffectiveCrossVerificationPolicy.maxInputBytes)
     $allowTools = @($script:ReviewerVerificationAllowToolCeiling)
     $availableTools = ConvertTo-ReviewerAvailableToolNames -PermissionTools $allowTools
     $denyTools = Get-ReviewerEffectiveDenyTools -ConfigDeny $ConfigDenyTools
@@ -5681,9 +5689,15 @@ function Invoke-ReviewerVerificationModelRun {
         $failureReason = "incompleteVerifier"
         $failureDetail = "Verifier process exited $([int]$run.ExitCode)."
     }
-    elseif ($reportedModel -and $reportedModel -cne $VerifierModel) {
+    elseif (-not (Test-ReviewerVerificationReportedModel `
+            -ExpectedModel $VerifierModel -ReportedModel $reportedModel)) {
         $failureReason = "modelMismatch"
-        $failureDetail = "CLI reported '$reportedModel' instead of '$VerifierModel'."
+        $failureDetail = if ($reportedModel) {
+            "CLI reported '$reportedModel' instead of '$VerifierModel'."
+        }
+        else {
+            "CLI did not report an exact verifier model identity."
+        }
     }
     elseif ($modifiedFiles.Count -gt 0) {
         $failureReason = "toolViolation"
@@ -5834,6 +5848,7 @@ function Invoke-ReviewerCrossVerificationPass {
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$PassResults,
         $SpecialistResult = $null
     )
+    $verificationPhaseStopwatch = [Diagnostics.Stopwatch]::StartNew()
     $prId = [int]$Bound.PrId
     $sourceCommit = [string]$Bound.SourceCommit
     $conventionPlan = $null
@@ -5941,21 +5956,32 @@ function Invoke-ReviewerCrossVerificationPass {
                 marker = $(if ($_.markerJson) { [string]$_.markerJson | ConvertFrom-Json -Depth 32 } else { $null })
             }
         })
-    $candidates = @(ConvertTo-ReviewerVerificationCandidates -GeneralistPasses $normalizedPasses `
+    $candidatePlan = Get-ReviewerVerificationCandidatePlan -GeneralistPasses $normalizedPasses `
         -ConventionCandidates $specialistCandidates -ConventionModel $EffectiveConventionSpecialistModel `
         -ConventionArtifactSha256 $specialistArtifactSha `
-        -MaxCandidates ([int]$CrossVerificationPolicy.maxCandidates))
+        -MaxCandidates ([int]$EffectiveCrossVerificationPolicy.maxCandidates)
+    $candidates = @($candidatePlan.candidates)
+    $preVerificationWithheld = @($candidatePlan.withheld)
     $clusters = @(Get-ReviewerVerificationClusters -Candidates $candidates `
-        -MaxCandidates ([int]$CrossVerificationPolicy.maxCandidates) `
-        -MaxClusterSize ([int]$CrossVerificationPolicy.maxClusterSize))
+        -MaxCandidates ([int]$EffectiveCrossVerificationPolicy.maxCandidates) `
+        -MaxClusterSize ([int]$EffectiveCrossVerificationPolicy.maxClusterSize) `
+        -NearExactJaccard ([double]$EffectiveCrossVerificationPolicy.nearExactJaccard) `
+        -SemanticJaccard ([double]$EffectiveCrossVerificationPolicy.semanticJaccard))
     $assignments = @(Get-ReviewerVerificationAssignments -Clusters $clusters `
         -GeneralistModels $ReviewPassModels -ConventionVerifierModel $EffectiveConventionVerifierModel `
         -ChangedPaths @($Bound.ChangedPaths))
+    $readyCandidateIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($cluster in @($clusters | Where-Object { [string]$_.status -ceq "ready" })) {
+        foreach ($member in @($cluster.members)) { [void]$readyCandidateIds.Add([string]$member.candidateId) }
+    }
+    $verifiableCandidates = @($candidates | Where-Object {
+            $readyCandidateIds.Contains([string]$_.candidateId)
+        })
     $evidenceHunks = @(Get-ReviewerVerificationSourceHunks -AgencyPath $AgencyPath `
-        -SourceCommit $sourceCommit -Candidates $candidates -ChangedPaths @($Bound.ChangedPaths))
+        -SourceCommit $sourceCommit -Candidates $verifiableCandidates -ChangedPaths @($Bound.ChangedPaths))
     $threadFacts = @(Get-ReviewerVerificationThreadFacts -FactPlan $factPlan)
     $candidateEvidenceOptions = [System.Collections.Generic.List[object]]::new()
-    foreach ($candidate in $candidates) {
+    foreach ($candidate in $verifiableCandidates) {
         $candidateCluster = @($clusters | Where-Object {
                 @($_.memberHashes) -ccontains [string]$candidate.candidateHash
             } | Select-Object -First 1)
@@ -5969,7 +5995,8 @@ function Invoke-ReviewerCrossVerificationPass {
                 candidateId = [string]$candidate.candidateId
                 options = @(Get-ReviewerVerificationEvidenceOptions -Candidate $candidate `
                     -FactPlan $factPlan -ThreadFacts $threadFacts -EvidenceHunks $evidenceHunks `
-                    -SiblingCandidates $siblingCandidates)
+                    -SiblingCandidates $siblingCandidates `
+                    -ExistingThreadJaccard ([double]$EffectiveCrossVerificationPolicy.existingThreadJaccard))
             })
     }
     $binding = [pscustomobject][ordered]@{
@@ -5988,12 +6015,15 @@ function Invoke-ReviewerCrossVerificationPass {
         kind = $script:ReviewerVerificationInputKind
         artifactVersion = $script:ReviewerVerificationArtifactVersion
         effectivePolicy = [pscustomobject][ordered]@{
-            maxCandidates = [int]$CrossVerificationPolicy.maxCandidates
-            maxClusterSize = [int]$CrossVerificationPolicy.maxClusterSize
-            maxVerifierRuns = [int]$CrossVerificationPolicy.maxVerifierRuns
-            maxVerificationSeconds = [int]$CrossVerificationPolicy.maxVerificationSeconds
-            maxInputBytes = [int]$CrossVerificationPolicy.maxInputBytes
-            maxArtifactBytes = [int]$CrossVerificationPolicy.maxArtifactBytes
+            maxCandidates = [int]$EffectiveCrossVerificationPolicy.maxCandidates
+            maxClusterSize = [int]$EffectiveCrossVerificationPolicy.maxClusterSize
+            maxVerifierRuns = [int]$EffectiveCrossVerificationPolicy.maxVerifierRuns
+            maxVerificationSeconds = [int]$EffectiveCrossVerificationPolicy.maxVerificationSeconds
+            maxInputBytes = [int]$EffectiveCrossVerificationPolicy.maxInputBytes
+            maxArtifactBytes = [int]$EffectiveCrossVerificationPolicy.maxArtifactBytes
+            nearExactJaccard = [double]$EffectiveCrossVerificationPolicy.nearExactJaccard
+            semanticJaccard = [double]$EffectiveCrossVerificationPolicy.semanticJaccard
+            existingThreadJaccard = [double]$EffectiveCrossVerificationPolicy.existingThreadJaccard
         }
         binding = $binding
         rawGeneralistPasses = $rawPasses.ToArray()
@@ -6010,6 +6040,8 @@ function Invoke-ReviewerCrossVerificationPass {
         threadFacts = @($threadFacts)
         candidateEvidenceOptions = $candidateEvidenceOptions.ToArray()
         candidates = @($candidates)
+        totalCandidateCount = [int]$candidatePlan.totalCandidateCount
+        preVerificationWithheld = @($preVerificationWithheld)
         clusters = @($clusters)
         assignments = @($assignments)
         allInputArtifactHashes = $inputHashes.ToArray()
@@ -6035,6 +6067,8 @@ function Invoke-ReviewerCrossVerificationPass {
         threadFacts = $inputBody.threadFacts
         candidateEvidenceOptions = $inputBody.candidateEvidenceOptions
         candidates = $inputBody.candidates
+        totalCandidateCount = $inputBody.totalCandidateCount
+        preVerificationWithheld = $inputBody.preVerificationWithheld
         clusters = $inputBody.clusters
         assignments = $inputBody.assignments
         allInputArtifactHashes = $inputBody.allInputArtifactHashes
@@ -6042,7 +6076,8 @@ function Invoke-ReviewerCrossVerificationPass {
     $baseName = "pr$prId-$($sourceCommit.Substring(0, 12))-$($inputManifestSha.Substring(0, 16))"
     $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
     $inputArtifactPath = Save-ReviewerVerificationInput -Manifest $inputManifest `
-        -Directory $verificationInputDir -BaseName $baseName -MasterKey $masterKey
+        -Directory $verificationInputDir -BaseName $baseName -MasterKey $masterKey `
+        -MaxArtifactBytes ([int]$EffectiveCrossVerificationPolicy.maxArtifactBytes)
     $runRecords = [System.Collections.Generic.List[object]]::new()
     $groups = @{}
     foreach ($assignment in $assignments) {
@@ -6055,32 +6090,22 @@ function Invoke-ReviewerCrossVerificationPass {
     $orderedGroupKeys = [System.Collections.Generic.List[string]]::new()
     foreach ($groupKey in $groups.Keys) { [void]$orderedGroupKeys.Add([string]$groupKey) }
     $orderedGroupKeys.Sort([StringComparer]::Ordinal)
-    $verificationStopwatch = [Diagnostics.Stopwatch]::StartNew()
     $verifierRunsLaunched = 0
     foreach ($key in $orderedGroupKeys) {
         $groupAssignments = @($groups[$key])
         $clusterId = [string]$groupAssignments[0].clusterId
         $verifierModel = [string]$groupAssignments[0].verifierModel
-        $budgetReason = ""
-        if ($verifierRunsLaunched -ge [int]$CrossVerificationPolicy.maxVerifierRuns) {
-            $budgetReason = "candidateLimit"
-        }
-        elseif ($verificationStopwatch.Elapsed.TotalSeconds -ge
-            [int]$CrossVerificationPolicy.maxVerificationSeconds) {
-            $budgetReason = "timeout"
-        }
-        $remainingVerificationSeconds = [int][Math]::Floor(
-            [int]$CrossVerificationPolicy.maxVerificationSeconds -
-            $verificationStopwatch.Elapsed.TotalSeconds)
-        if (-not $budgetReason -and $remainingVerificationSeconds -lt 30) {
-            $budgetReason = "timeout"
-        }
-        if ($budgetReason) {
+        $budget = Get-ReviewerVerificationRunBudget -RunsLaunched $verifierRunsLaunched `
+            -MaxRuns ([int]$EffectiveCrossVerificationPolicy.maxVerifierRuns) `
+            -ElapsedSeconds $verificationPhaseStopwatch.Elapsed.TotalSeconds `
+            -MaxPhaseSeconds ([int]$EffectiveCrossVerificationPolicy.maxVerificationSeconds) `
+            -ConfiguredRunTimeoutSeconds $EffectiveVerificationTimeoutSeconds
+        if (-not [bool]$budget.canRun) {
             foreach ($assignment in $groupAssignments) {
                 [void]$runRecords.Add([pscustomobject][ordered]@{
                         assignmentId = [string]$assignment.assignmentId
                         status = "degraded"
-                        reason = $budgetReason
+                        reason = [string]$budget.reason
                         detail = "Verification aggregate run/time budget was exhausted before this assignment."
                         model = $verifierModel
                         clusterId = $clusterId
@@ -6122,7 +6147,8 @@ function Invoke-ReviewerCrossVerificationPass {
         $relevantThreads = @($threadFacts | Where-Object {
                 $thread = $_
                 @($assignedCandidates | Where-Object {
-                        Test-ReviewerVerificationThreadRelevant -Candidate $_ -Thread $thread
+                        Test-ReviewerVerificationThreadRelevant -Candidate $_ -Thread $thread `
+                            -ExistingThreadJaccard ([double]$EffectiveCrossVerificationPolicy.existingThreadJaccard)
                     }).Count -gt 0
             })
         $relevantFactIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -6147,7 +6173,8 @@ function Invoke-ReviewerCrossVerificationPass {
                     candidateId = [string]$_.candidateId
                     options = @(Get-ReviewerVerificationEvidenceOptions -Candidate $_ `
                         -FactPlan $factPlan -ThreadFacts $relevantThreads -EvidenceHunks $assignedHunks `
-                        -SiblingCandidates $eligibleSiblingCandidates)
+                        -SiblingCandidates $eligibleSiblingCandidates `
+                        -ExistingThreadJaccard ([double]$EffectiveCrossVerificationPolicy.existingThreadJaccard))
                 }
             })
         $runResult = Invoke-ReviewerVerificationModelRun -AgencyPath $AgencyPath -Binding $binding `
@@ -6155,7 +6182,7 @@ function Invoke-ReviewerCrossVerificationPass {
             -AssignedCandidates $assignedCandidates -SiblingEvidence $siblingEvidence `
             -EvidenceHunks $assignedHunks -CandidateEvidence $assignedEvidence `
             -DeterministicFacts $relevantFacts -ThreadFacts $relevantThreads `
-            -TimeoutSeconds ([Math]::Min($EffectiveVerificationTimeoutSeconds, $remainingVerificationSeconds))
+            -TimeoutSeconds ([int]$budget.timeoutSeconds)
         $verifierRunsLaunched++
         foreach ($assignment in $groupAssignments) {
             [void]$runRecords.Add([pscustomobject][ordered]@{
@@ -6199,10 +6226,14 @@ function Invoke-ReviewerCrossVerificationPass {
         -InputManifestSha256 $inputManifestSha -Clusters $clusters -Assignments $assignments `
         -VerifierRuns $runRecords.ToArray() -Decisions @($replay.decisions) `
         -Withheld @($replay.withheld) -Eligible @($replay.eligible) `
-        -InputArtifactHashes $inputHashes.ToArray() -ReplaySha256 ([string]$replay.replaySha256)
+        -InputArtifactHashes $inputHashes.ToArray() `
+        -TotalCandidateCount ([int]$candidatePlan.totalCandidateCount) `
+        -ReplaySha256 ([string]$replay.replaySha256)
     Write-ReviewerCycleMetadata -Fields @{
         cycle = $CycleNumber; mode = "verification-preview"; result = $status; prId = $prId
-        sourceCommit = $sourceCommit; candidateCount = $candidates.Count
+        sourceCommit = $sourceCommit
+        candidateCount = [int]$candidatePlan.totalCandidateCount
+        boundedCandidateCount = $candidates.Count
         clusterCount = $clusters.Count; eligibleCount = @($replay.eligible).Count
         withheldCount = @($replay.withheld).Count; previewPath = $preview.MarkdownPath
         artifactPath = $preview.ArtifactPath; inputArtifactPath = $inputArtifactPath
