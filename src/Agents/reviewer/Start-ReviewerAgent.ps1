@@ -1773,7 +1773,7 @@ if ($repoConvProp -and $repoConvProp.Value) {
             -RepositoryBinding @{
                 Organization = $cfgOrganization; Project = $cfgProject; RepositoryId = $cfgRepoId.ToLowerInvariant()
                 TargetRef = $TargetRefName
-            }
+            } -AllowedMimeTypes $script:ReviewerAuthoritativeMimeTypes
     }
 }
 
@@ -1802,6 +1802,9 @@ if ($ConventionPackPolicy -and
 if (-not $PSBoundParameters.ContainsKey('RepositoryName')) { $RepositoryName = $cfgRepoName }
 if ($RepositoryName -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { throw "Resolved RepositoryName '$RepositoryName' is not a safe ADO repo name." }
 if (-not $PSBoundParameters.ContainsKey('ExpectedProject')) { $ExpectedProject = $cfgProject }
+if ($ConventionPackPolicy -and $ExpectedProject -cne $cfgProject) {
+    throw "Resolved ExpectedProject '$ExpectedProject' does not match the configured convention-pack repository project."
+}
 
 # -MaxFindings carries [ValidateRange]; assigning the resolved value to a NEW
 # variable avoids re-validating a parameter variable (see the footgun detector).
@@ -2021,28 +2024,71 @@ function Assert-ReviewerAuthoritativeSourcePins {
         }
 }
 
+function Invoke-ReviewerConventionSession {
+    param(
+        [Parameter(Mandatory)][string]$AgencyPath,
+        [Parameter(Mandatory)][scriptblock]$Action,
+        [scriptblock]$OpenSession,
+        [scriptblock]$CloseSession
+    )
+    if (-not $OpenSession) {
+        $OpenSession = {
+            param([string]$Path)
+            Open-AgentMcpSession -AgencyPath $Path -Server "ado" `
+                -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
+                -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+        }
+    }
+    if (-not $CloseSession) {
+        $CloseSession = { param([hashtable]$Session) Close-AgentMcpSession -Session $Session }
+    }
+    $conventionSession = $null
+    try {
+        try { $conventionSession = & $OpenSession $AgencyPath }
+        catch {
+            throw (New-ReviewerConventionEnvironmentException -Operation "open per-PR convention MCP session" -InnerException $_.Exception)
+        }
+        if ($conventionSession -isnot [hashtable] -or
+            [string]$conventionSession.Server -cne "ado" -or
+            [string]$conventionSession.Organization -cne $Organization) {
+            throw "Per-PR convention MCP session was not bound to the wrapper-requested ADO organization."
+        }
+        return (& $Action $conventionSession)
+    }
+    finally {
+        if ($conventionSession) {
+            try { & $CloseSession $conventionSession }
+            catch { Write-Warning "Could not close the isolated convention MCP session: $($_.Exception.Message)" }
+        }
+    }
+}
+
 function Get-ReviewerAuthoritativeSourceSnapshots {
     param(
         [Parameter(Mandatory)][string]$AgencyPath,
         [Parameter(Mandatory)][hashtable]$Policy,
-        [switch]$ConventionPackMode
+        [switch]$ConventionPackMode,
+        [hashtable]$ExistingSession
     )
     $sources = @($Policy.Sources)
     if ($sources.Count -eq 0) { return , @() }
-    $sourceSession = $null
+    $sourceSession = $ExistingSession
+    $ownsSession = ($null -eq $sourceSession)
     try {
         # A dedicated session keeps a convention-source failure from closing the
         # review session that owns pending deliveries and PR writes.
-        try {
-            $sourceSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
-                -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
-                -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
-        }
-        catch {
-            if ($ConventionPackMode) {
-                throw (New-ReviewerConventionEnvironmentException -Operation "open authoritative-source MCP session" -InnerException $_.Exception)
+        if ($ownsSession) {
+            try {
+                $sourceSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
+                    -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
+                    -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
             }
-            throw
+            catch {
+                if ($ConventionPackMode) {
+                    throw (New-ReviewerConventionEnvironmentException -Operation "open authoritative-source MCP session" -InnerException $_.Exception)
+                }
+                throw
+            }
         }
         if ([string]$sourceSession.Server -cne "ado" -or [string]$sourceSession.Organization -cne $Organization) {
             throw "Authoritative source MCP session was not bound to the wrapper-requested ADO organization."
@@ -2143,7 +2189,7 @@ function Get-ReviewerAuthoritativeSourceSnapshots {
         return , $snapshots.ToArray()
     }
     finally {
-        if ($sourceSession) { Close-AgentMcpSession -Session $sourceSession }
+        if ($sourceSession -and $ownsSession) { Close-AgentMcpSession -Session $sourceSession }
     }
 }
 
@@ -4279,6 +4325,95 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - resource decoding, policy parsing, identity binding, provenance rendering and negative probes fail closed" -ForegroundColor Green
     }
 
+    Write-Host "[DRY-RUN] Self-check 23/$total : isolated convention MCP session lifecycle" -ForegroundColor Cyan
+    $sessionCheckFailureCount = $failures.Count
+    $sessionLifecycle = @{ Opens = 0; Closes = 0; Actions = 0 }
+    $fakeOpen = {
+        param([string]$IgnoredAgencyPath)
+        [void]($sessionLifecycle.Opens++)
+        return @{ Server = "ado"; Organization = $Organization }
+    }
+    $fakeClose = {
+        param([hashtable]$IgnoredSession)
+        [void]($sessionLifecycle.Closes++)
+    }
+    $sessionResult = Invoke-ReviewerConventionSession -AgencyPath "fake-agency" `
+        -OpenSession $fakeOpen -CloseSession $fakeClose -Action {
+            param([hashtable]$IgnoredSession)
+            [void]($sessionLifecycle.Actions++)
+            return 17
+        }
+    if ([int]$sessionResult -ne 17 -or $sessionLifecycle.Opens -ne 1 -or
+        $sessionLifecycle.Closes -ne 1 -or $sessionLifecycle.Actions -ne 1) {
+        $failures.Add("The isolated convention session did not open, execute and close exactly once on success.")
+    }
+    $actionFailureObserved = $false
+    try {
+        Invoke-ReviewerConventionSession -AgencyPath "fake-agency" `
+            -OpenSession $fakeOpen -CloseSession $fakeClose -Action {
+                param([hashtable]$IgnoredSession)
+                throw "planned convention action failure"
+            } | Out-Null
+    }
+    catch { $actionFailureObserved = ($_.Exception.Message -match "planned convention action failure") }
+    if (-not $actionFailureObserved -or $sessionLifecycle.Opens -ne 2 -or $sessionLifecycle.Closes -ne 2) {
+        $failures.Add("The isolated convention session did not close exactly once when planning threw.")
+    }
+    $wrongBindingRejected = $false
+    try {
+        Invoke-ReviewerConventionSession -AgencyPath "fake-agency" `
+            -OpenSession { param([string]$IgnoredAgencyPath) return @{ Server = "ado"; Organization = "wrong-org" } } `
+            -CloseSession $fakeClose -Action { param([hashtable]$IgnoredSession) return 1 } | Out-Null
+    }
+    catch { $wrongBindingRejected = $_.Exception.Message -match "not bound" }
+    if (-not $wrongBindingRejected -or $sessionLifecycle.Closes -ne 3) {
+        $failures.Add("A supplied convention session with the wrong organization was accepted or not closed.")
+    }
+    $openFailureTagged = $false
+    try {
+        Invoke-ReviewerConventionSession -AgencyPath "fake-agency" `
+            -OpenSession { param([string]$IgnoredAgencyPath) throw [TimeoutException]::new("probe timeout") } `
+            -CloseSession $fakeClose -Action { param([hashtable]$IgnoredSession) return 1 } | Out-Null
+    }
+    catch { $openFailureTagged = Test-ReviewerConventionEnvironmentException -Exception $_.Exception }
+    if (-not $openFailureTagged) { $failures.Add("A convention MCP open failure was not tagged as an environment fault.") }
+    $priorWarningPreference = $WarningPreference
+    try {
+        $WarningPreference = "SilentlyContinue"
+        $closeFailureResult = Invoke-ReviewerConventionSession -AgencyPath "fake-agency" `
+            -OpenSession $fakeOpen `
+            -CloseSession { param([hashtable]$IgnoredSession) throw "probe close failure" } `
+            -Action { param([hashtable]$IgnoredSession) return 23 }
+    }
+    finally { $WarningPreference = $priorWarningPreference }
+    if ([int]$closeFailureResult -ne 23) {
+        $failures.Add("A convention-session close failure masked a successful planning result.")
+    }
+    $sessionHelperAt = & $declOf "Invoke-ReviewerConventionSession"
+    $sourceResolverAt = & $declOf "Get-ReviewerAuthoritativeSourceSnapshots"
+    if ($sessionHelperAt -lt 0 -or $sourceResolverAt -lt 0) {
+        $failures.Add("Could not locate convention session helpers for lifecycle invariant checks.")
+    }
+    else {
+        $sessionHelperEnd = $selfText.IndexOf("`nfunction ", $sessionHelperAt + 10, [StringComparison]::Ordinal)
+        if ($sessionHelperEnd -lt 0) { $sessionHelperEnd = $selfText.Length }
+        $sourceResolverEnd = $selfText.IndexOf("`nfunction ", $sourceResolverAt + 10, [StringComparison]::Ordinal)
+        if ($sourceResolverEnd -lt 0) { $sourceResolverEnd = $selfText.Length }
+        $sessionHelperSlice = $selfText.Substring($sessionHelperAt, $sessionHelperEnd - $sessionHelperAt)
+        $sourceResolverSlice = $selfText.Substring($sourceResolverAt, $sourceResolverEnd - $sourceResolverAt)
+        if ($sessionHelperSlice -cnotmatch 'Toolsets\s+@\("repos"\)' -or
+            $sessionHelperSlice -cnotmatch 'EnvironmentVariablesToRemove\s+\$McpSensitiveEnvironmentVariables') {
+            $failures.Add("The per-PR convention MCP session is not repos-only with the standard credential scrub.")
+        }
+        if ($sourceResolverSlice -cnotmatch '\$ownsSession\s*=\s*\(\s*\$null\s*-eq\s*\$sourceSession\s*\)' -or
+            $sourceResolverSlice -cnotmatch '\$sourceSession\s*-and\s*\$ownsSession') {
+            $failures.Add("Authoritative source session ownership is not derived from whether a session was supplied.")
+        }
+    }
+    if ($failures.Count -eq $sessionCheckFailureCount) {
+        Write-Host "  OK - convention reads use one bound, repos-only, scrubbed session that closes on every path" -ForegroundColor Green
+    }
+
     Write-Host ""
     if ($failures.Count -eq 0) {
         Write-Host "[DRY-RUN] All $total self-checks passed." -ForegroundColor Green
@@ -4425,6 +4560,8 @@ function Get-ReviewerPinnedConventionChangeSet {
     }
     $first = @(ConvertTo-ReviewerConventionChangeSet -Response $firstRaw)
     $second = @(ConvertTo-ReviewerConventionChangeSet -Response $secondRaw)
+    Assert-ReviewerConventionChangeSetKnown -Entries $first -Where "PR $PrId first convention change-set read"
+    Assert-ReviewerConventionChangeSetKnown -Entries $second -Where "PR $PrId second convention change-set read"
     $firstDigest = Get-ReviewerConventionChangeSetDigest -Entries $first
     $secondDigest = Get-ReviewerConventionChangeSetDigest -Entries $second
     if ($firstDigest -cne $secondDigest) {
@@ -5570,50 +5707,56 @@ function Invoke-ReviewerCycle {
             $conventionPlanPath = ""
             if ($ConventionPackPolicy) {
                 try {
-                    $pinnedChanges = Get-ReviewerPinnedConventionChangeSet -Session $session -PrId $prId `
-                        -ExpectedSourceCommit $sourceCommit
-                    $selection = Select-ReviewerConventionPacks -Policy $ConventionPackPolicy `
-                        -ChangeEntries @($pinnedChanges.Entries)
-                    $sourceRequests = Get-ReviewerConventionSourceRequests -Selection $selection
-                    $selectedSourceNames = @($sourceRequests.AuthoritativeSourceNames)
-                    $selectedAuthoritativePolicy = @{
-                        TransportVersion = $ConventionPackPolicy.AuthoritativeSourcePolicy.TransportVersion
-                        MaxTotalBytes    = $ConventionPackPolicy.AuthoritativeSourcePolicy.MaxTotalBytes
-                        Sources          = @($ConventionPackPolicy.AuthoritativeSourcePolicy.Sources | Where-Object {
-                                $selectedSourceNames -ccontains $_.Name
-                            })
+                    $conventionSessionResult = Invoke-ReviewerConventionSession -AgencyPath $AgencyPath -Action {
+                        param([hashtable]$conventionSession)
+                        $pinnedChanges = Get-ReviewerPinnedConventionChangeSet -Session $conventionSession -PrId $prId `
+                            -ExpectedSourceCommit $sourceCommit
+                        $selection = Select-ReviewerConventionPacks -Policy $ConventionPackPolicy `
+                            -ChangeEntries @($pinnedChanges.Entries)
+                        $sourceRequests = Get-ReviewerConventionSourceRequests -Selection $selection
+                        $selectedSourceNames = @($sourceRequests.AuthoritativeSourceNames)
+                        $selectedAuthoritativePolicy = @{
+                            TransportVersion = $ConventionPackPolicy.AuthoritativeSourcePolicy.TransportVersion
+                            MaxTotalBytes    = $ConventionPackPolicy.AuthoritativeSourcePolicy.MaxTotalBytes
+                            Sources          = @($ConventionPackPolicy.AuthoritativeSourcePolicy.Sources | Where-Object {
+                                    $selectedSourceNames -ccontains $_.Name
+                                })
+                        }
+                        $packAuthoritativeSnapshots = @()
+                        if (@($selectedAuthoritativePolicy.Sources).Count -gt 0) {
+                            $packAuthoritativeSnapshots = @(Get-ReviewerAuthoritativeSourceSnapshots `
+                                    -AgencyPath $AgencyPath -Policy $selectedAuthoritativePolicy `
+                                    -ConventionPackMode -ExistingSession $conventionSession)
+                        }
+                        $selectedRepositorySources = @($sourceRequests.RepositorySources)
+                        $packRepositorySnapshots = @()
+                        if ($selectedRepositorySources.Count -gt 0) {
+                            $packRepositorySnapshots = @(Get-ReviewerConventionRepositorySnapshots `
+                                    -Session $conventionSession -RepositorySources $selectedRepositorySources `
+                                    -TargetCommit $pinnedChanges.TargetCommit)
+                        }
+                        $conventionPlan = New-ReviewerConventionContextPlan -Policy $ConventionPackPolicy `
+                            -Selection $selection -Binding @{
+                                Organization = $Organization; Project = $ExpectedProject; RepositoryId = $cfgRepoId
+                                PullRequestId = $prId; SourceCommit = $sourceCommit
+                                TargetCommit = $pinnedChanges.TargetCommit; ChangeSetDigest = $pinnedChanges.Digest
+                            } -AuthoritativeSnapshots $packAuthoritativeSnapshots `
+                            -RepositorySnapshots $packRepositorySnapshots `
+                            -ScriptSha256 $ScriptSelfSha256 -ConfigSha256 $ConfigSha256
+                        $readyPlanPath = Save-ReviewerConventionPlan -Plan $conventionPlan `
+                            -PrId $prId -SourceCommit $sourceCommit
+                        Write-Host ("  PR {0} convention plan: {1} selected, {2} withheld, {3}/{4} bytes." -f `
+                                $prId, @($conventionPlan.selectedPacks).Count, @($conventionPlan.withheldPacks).Count,
+                                $conventionPlan.totalContextBytes, $conventionPlan.maxTotalBytes) -ForegroundColor Cyan
+                        Write-ReviewerCycleMetadata -Fields @{
+                            cycle = $CycleNumber; mode = "convention-plan"; result = "ready"; prId = $prId
+                            sourceCommit = $sourceCommit; changeSetDigest = $pinnedChanges.Digest
+                            selectedPackCount = @($conventionPlan.selectedPacks).Count
+                            totalContextBytes = $conventionPlan.totalContextBytes; planPath = $readyPlanPath
+                        }
+                        return @{ PlanPath = $readyPlanPath }
                     }
-                    $packAuthoritativeSnapshots = @()
-                    if (@($selectedAuthoritativePolicy.Sources).Count -gt 0) {
-                        $packAuthoritativeSnapshots = @(Get-ReviewerAuthoritativeSourceSnapshots `
-                                -AgencyPath $AgencyPath -Policy $selectedAuthoritativePolicy -ConventionPackMode)
-                    }
-                    $selectedRepositorySources = @($sourceRequests.RepositorySources)
-                    $packRepositorySnapshots = @()
-                    if ($selectedRepositorySources.Count -gt 0) {
-                        $packRepositorySnapshots = @(Get-ReviewerConventionRepositorySnapshots `
-                                -Session $session -RepositorySources $selectedRepositorySources `
-                                -TargetCommit $pinnedChanges.TargetCommit)
-                    }
-                    $conventionPlan = New-ReviewerConventionContextPlan -Policy $ConventionPackPolicy `
-                        -Selection $selection -Binding @{
-                            Organization = $Organization; Project = $ExpectedProject; RepositoryId = $cfgRepoId
-                            PullRequestId = $prId; SourceCommit = $sourceCommit
-                            TargetCommit = $pinnedChanges.TargetCommit; ChangeSetDigest = $pinnedChanges.Digest
-                        } -AuthoritativeSnapshots $packAuthoritativeSnapshots `
-                        -RepositorySnapshots $packRepositorySnapshots `
-                        -ScriptSha256 $ScriptSelfSha256 -ConfigSha256 $ConfigSha256
-                    $conventionPlanPath = Save-ReviewerConventionPlan -Plan $conventionPlan `
-                        -PrId $prId -SourceCommit $sourceCommit
-                    Write-Host ("  PR {0} convention plan: {1} selected, {2} withheld, {3}/{4} bytes." -f `
-                            $prId, @($conventionPlan.selectedPacks).Count, @($conventionPlan.withheldPacks).Count,
-                            $conventionPlan.totalContextBytes, $conventionPlan.maxTotalBytes) -ForegroundColor Cyan
-                    Write-ReviewerCycleMetadata -Fields @{
-                        cycle = $CycleNumber; mode = "convention-plan"; result = "ready"; prId = $prId
-                        sourceCommit = $sourceCommit; changeSetDigest = $pinnedChanges.Digest
-                        selectedPackCount = @($conventionPlan.selectedPacks).Count
-                        totalContextBytes = $conventionPlan.totalContextBytes; planPath = $conventionPlanPath
-                    }
+                    $conventionPlanPath = [string]$conventionSessionResult.PlanPath
                 }
                 catch {
                     $conventionEnvironmentFault = Test-ReviewerConventionEnvironmentException -Exception $_.Exception

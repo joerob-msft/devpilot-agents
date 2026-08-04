@@ -264,7 +264,10 @@ existing generalist pass. The catalog reuses the authoritative source transport'
 repository, commit, MIME, hash, and decoded-byte checks without sharing its
 generalist runtime-context destination.
 
-Selection is deterministic: changed paths use `/` separators, one leading slash
+Selection runs in a dedicated, repos-only per-PR MCP session opened only after
+pending delivery retries. Target/change/PR/source reads never share the review MCP
+session that owns later candidates and writes, and the isolated session closes in
+a `finally` path. Selection is deterministic: changed paths use `/` separators, one leading slash
 is ignored, Windows `\` separators are normalized, and matching is ordinal
 case-insensitive because the reviewer is Windows-only. Globs support segment-local
 `*` and `?`, plus `**` only as a complete segment. Character classes, braces,
@@ -281,7 +284,9 @@ from a twice-checked target-branch commit, never from author-controlled PR sourc
 content.
 
 Each pack's `maxBytes` covers decoded source bytes plus the exact serialized
-source-provenance descriptor. Matched-path/glob routing evidence is persisted and
+source-provenance descriptor. Startup computes that requirement from declared
+source maxima, exact configured provenance, and the longest allowed MIME; the
+accepted boundary therefore fits at runtime exactly. Matched-path/glob routing evidence is persisted and
 byte-counted separately, not treated as convention context. The code-defined
 total convention-context cap is 131072 bytes. Exceeding either context cap fails
 that PR's plan closed before its model launch; no source or rule is silently

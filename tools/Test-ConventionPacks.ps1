@@ -15,6 +15,12 @@ function Assert-ConventionTest {
     param([bool]$Condition, [Parameter(Mandatory)][string]$Message)
     if (-not $Condition) { [void]$failures.Add($Message) }
 }
+$worstCaseSnapshot = @{
+    SourceId = "selected-source"; TrustTier = "pinned-external"; Organization = "contoso"
+    Project = "Example"; RepositoryId = "11111111-2222-3333-4444-555555555555"
+    Path = "/rules/selected.md"; Ref = "refs/heads/main"; CommitSha = ("a" * 40)
+    Sha256 = ("b" * 64); MimeType = "text/markdown"; ByteLength = 16
+}
 function Assert-ConventionThrows {
     param([Parameter(Mandatory)][scriptblock]$Action, [Parameter(Mandatory)][string]$Message)
     $threw = $false
@@ -180,6 +186,22 @@ Assert-ConventionTest (Test-ReviewerConventionResponseTruncated -Response $trans
     "A transport response at the 1000-entry ceiling escaped truncation detection."
 Assert-ConventionTest (@(ConvertTo-ReviewerConventionChangeSet -Response $transportCeilingProbe).Count -eq 995) `
     "The truncation regression fixture no longer proves raw-entry counting is required."
+foreach ($unknownResponse in @(
+        @{ unexpectedEnvelope = @() },
+        @{ count = 0; value = @() }
+    )) {
+    $unknownEntries = @(ConvertTo-ReviewerConventionChangeSet -Response $unknownResponse)
+    Assert-ConventionThrows {
+        Assert-ReviewerConventionChangeSetKnown -Entries $unknownEntries -Where "test change set"
+    } "An unknown or empty change-set response was treated as a ready no-match plan."
+}
+try {
+    Assert-ReviewerConventionChangeSetKnown -Entries $renameEntries -Where "rename test"
+    Assert-ReviewerConventionChangeSetKnown -Entries $deleteEntries -Where "delete test"
+}
+catch {
+    [void]$failures.Add("A legitimate rename or delete change set was rejected as unknown: $($_.Exception.Message)")
+}
 
 $generatedEntries = ConvertTo-ReviewerConventionChangeSet -Response (ConvertTo-TestChangeResponse -Paths @("/src/Api/Generated/Client.g.cs"))
 $generatedSelection = Select-ReviewerConventionPacks -Policy $profilePolicy -ChangeEntries $generatedEntries
@@ -190,6 +212,19 @@ Assert-ConventionTest (($generatedNames -join "|") -ceq "csharp-core|generated-c
 $raw = New-TestRawPolicy
 $policy = ConvertTo-ReviewerConventionPackPolicy -RawPolicy $raw `
     -AuthoritativeSourcePolicy (ConvertTo-TestSourcePolicy -RawSources $raw.authoritativeSources)
+$requiredPackBytes = [int]$policy.Packs[0].RequiredMaxBytes
+$boundaryRaw = Copy-ConventionObject $raw
+$boundaryRaw.packs[0].maxBytes = $requiredPackBytes
+$boundaryPolicy = ConvertTo-ReviewerConventionPackPolicy -RawPolicy $boundaryRaw `
+    -AuthoritativeSourcePolicy (ConvertTo-TestSourcePolicy -RawSources $boundaryRaw.authoritativeSources)
+Assert-ConventionTest ($boundaryPolicy.Packs[0].RequiredMaxBytes -eq $requiredPackBytes) `
+    "The exact startup pack-cap boundary was not accepted."
+$underBoundaryRaw = Copy-ConventionObject $boundaryRaw
+$underBoundaryRaw.packs[0].maxBytes = $requiredPackBytes - 1
+Assert-ConventionThrows {
+    ConvertTo-ReviewerConventionPackPolicy -RawPolicy $underBoundaryRaw `
+        -AuthoritativeSourcePolicy (ConvertTo-TestSourcePolicy -RawSources $underBoundaryRaw.authoritativeSources)
+} "A pack cap one byte below worst-case source content and provenance was accepted at startup."
 $entries = ConvertTo-ReviewerConventionChangeSet -Response (ConvertTo-TestChangeResponse -Paths @("/SRC/Api/Handler.cs"))
 $selection = Select-ReviewerConventionPacks -Policy $policy -ChangeEntries $entries
 $requests = Get-ReviewerConventionSourceRequests -Selection $selection
@@ -309,6 +344,14 @@ $binding = @{
 $plan = New-ReviewerConventionContextPlan -Policy $policy -Selection $selection -Binding $binding `
     -AuthoritativeSnapshots @($snapshot) -RepositorySnapshots @() `
     -ScriptSha256 ("e" * 64) -ConfigSha256 ("f" * 64)
+$boundarySelection = Select-ReviewerConventionPacks -Policy $boundaryPolicy -ChangeEntries $entries
+$worstCasePlan = New-ReviewerConventionContextPlan -Policy $boundaryPolicy -Selection $boundarySelection -Binding $binding `
+    -AuthoritativeSnapshots @($worstCaseSnapshot) -RepositorySnapshots @() `
+    -ScriptSha256 ("e" * 64) -ConfigSha256 ("f" * 64)
+Assert-ConventionTest ($worstCasePlan.selectedPacks[0].contextBytes -eq $requiredPackBytes) `
+    "Startup pack-cap feasibility did not equal runtime bytes at declared source maxima and longest MIME."
+Assert-ConventionTest ($worstCaseSnapshot.CommitSha.Length -eq 40 -and $worstCaseSnapshot.Sha256.Length -eq 64) `
+    "Worst-case provenance width assumptions changed without updating startup feasibility."
 $exactPackBytes = [int]$plan.selectedPacks[0].contextBytes
 $manyEntries = ConvertTo-ReviewerConventionChangeSet -Response (ConvertTo-TestChangeResponse -Paths @(
         1..100 | ForEach-Object { "/src/Feature$_.cs" }

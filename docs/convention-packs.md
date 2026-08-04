@@ -63,10 +63,24 @@ into the existing generalist context.
 
 ## Matching and precedence
 
+After pending delivery retries, the wrapper opens one dedicated, repos-only MCP
+session for each PR's convention plan. Target resolution, both change-set reads,
+the intervening PR binding read, authoritative pack sources, and repository-local
+sources all use that owned session. A convention transport fault therefore cannot
+abort the shared review session that owns later candidates and delivery. The
+dedicated session is organization-bound, credential-scrubbed, and closed in a
+`finally` path before the wrapper handles success or failure.
+
 The wrapper reads the PR change set twice around exact source-commit and
 target-branch checks. Both normalized change-set digests must agree. A response at
 the transport's 1000-entry ceiling is treated as potentially truncated and fails
-closed.
+closed. An active PR response that normalizes to zero file entries also fails
+closed with an explicit unknown/empty-change-set reason; it is never converted
+into a ready plan that withholds every pack. This is an intentional hard gate:
+the PR receives no convention specialist or generalist model launch, and repeated
+deterministic failures count toward the configured starvation threshold. That
+trade-off prevents an anomalous empty transport response from silently weakening
+the review.
 
 Paths are repository-relative. ADO `/src/a.cs`, Windows `\src\a.cs`, and
 `src/a.cs` normalize to `src/a.cs`. Drive, UNC, control, empty, absolute config,
@@ -110,11 +124,16 @@ decoded bytes plus the exact compact JSON descriptor containing the pack name,
 priority, and source provenance. Routing evidence (matched paths and globs) is
 persisted and byte-counted separately because it identifies why context was
 selected; it is not convention context and cannot consume or bypass a source
-context cap. Startup rejects a cap that cannot fit declared source maxima plus
-minimum required provenance. Runtime uses actual bytes and rejects a one-byte
-overflow. The total convention-context cap is code-defined at 131072 bytes and
-cannot be widened by config. Per-pack and total accounting conservatively charge
-a reused source to each selected pack.
+context cap. Startup computes worst-case provenance with every source's declared
+maximum byte length, the longest allowed MIME representation, and the exact
+configured identities, paths, and refs. A cap equal to that required maximum is
+accepted and one byte less is rejected, which guarantees any individually valid
+source snapshot fits its pack at runtime. The total convention-context cap is
+code-defined at 131072 bytes and cannot be widened by config. Broader multi-pack
+overlap remains runtime fail-closed because a whole change set can co-select packs
+whose globs never intersect on one path; startup does not over-reject mutually
+exclusive packs. Per-pack and total accounting conservatively charge a reused
+source to each selected pack.
 
 No rule is truncated. A cap or deterministic provenance failure writes a
 structured failed plan, increments that PR's bounded failure count, prevents that

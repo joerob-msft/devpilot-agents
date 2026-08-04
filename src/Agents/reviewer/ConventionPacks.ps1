@@ -372,6 +372,16 @@ function Get-ReviewerConventionChangeSetDigest {
     return Get-ReviewerConventionSha256 -Text (($lines -join "`n") + $(if ($lines.Count -gt 0) { "`n" } else { "" }))
 }
 
+function Assert-ReviewerConventionChangeSetKnown {
+    param(
+        [object[]]$Entries = @(),
+        [string]$Where = "convention change set"
+    )
+    if (@($Entries).Count -eq 0) {
+        throw "$Where produced zero normalized file entries; refusing to treat an empty or unknown response as no matching conventions."
+    }
+}
+
 function Test-ReviewerConventionCommitEqual {
     param([string]$Left, [string]$Right)
     return ($Left -match '^[0-9a-fA-F]{40}$' -and $Right -match '^[0-9a-fA-F]{40}$' -and
@@ -395,8 +405,11 @@ function ConvertTo-ReviewerConventionPackPolicy {
         [hashtable]$RepositoryBinding = @{
             Organization = "x"; Project = "x"; RepositoryId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
             TargetRef = "refs/heads/main"
-        }
+        },
+        [string[]]$AllowedMimeTypes = @("text/plain", "text/markdown")
     )
+    if (@($AllowedMimeTypes).Count -eq 0) { throw "Convention pack MIME policy must not be empty." }
+    $longestMimeType = [string](@($AllowedMimeTypes | Sort-Object Length -Descending | Select-Object -First 1)[0])
     Assert-ReviewerConventionExactKeys -Object $RawPolicy `
         -Allowed @("note", "schemaVersion", "requireAllSourcesReferenced", "authoritativeSources", "packs") `
         -Required @("schemaVersion", "requireAllSourcesReferenced", "authoritativeSources", "packs") `
@@ -511,7 +524,7 @@ function ConvertTo-ReviewerConventionPackPolicy {
                     path = [string]$configuredSource.Path
                     ref = "refs/heads/$($configuredSource.Branch)"
                     commitSha = ("a" * 40); sha256 = ("a" * 64)
-                    mimeType = "text/markdown"; byteLength = 1
+                    mimeType = $longestMimeType; byteLength = [int]$configuredSource.MaxBytes
                 })
         }
         foreach ($local in $localSources) {
@@ -524,7 +537,7 @@ function ConvertTo-ReviewerConventionPackPolicy {
                     path = [string]$local.Path
                     ref = [string]$RepositoryBinding.TargetRef
                     commitSha = ("a" * 40); sha256 = ("a" * 64)
-                    mimeType = "text/markdown"; byteLength = 1
+                    mimeType = $longestMimeType; byteLength = [int]$local.MaxBytes
                 })
         }
         $minimalDescriptor = [ordered]@{
@@ -546,6 +559,7 @@ function ConvertTo-ReviewerConventionPackPolicy {
                 AuthoritativeSourceRefs = @($sourceRefs)
                 RepositorySources       = $localSources.ToArray()
                 MaxBytes                = $maxBytes
+                RequiredMaxBytes        = ($declaredContentBytes + $minimumProvenanceBytes)
             })
     }
     if ($requireAll) {
