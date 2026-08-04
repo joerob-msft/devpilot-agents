@@ -9,6 +9,11 @@ Set-StrictMode -Version Latest
 
 $repoRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repoRoot "src\Agents\reviewer\ConventionPacks.ps1")
+$reviewerWrapperPath = Join-Path $repoRoot "src\Agents\reviewer\Start-ReviewerAgent.ps1"
+$reviewerWrapperText = Get-Content -LiteralPath $reviewerWrapperPath -Raw
+if ($reviewerWrapperText -match 'return\s+,\s*\$snapshots\.ToArray\(\)') {
+    throw "Convention snapshot collectors return nested arrays instead of flat source records."
+}
 
 $failures = New-Object System.Collections.Generic.List[string]
 function Assert-ConventionTest {

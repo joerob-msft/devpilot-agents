@@ -128,3 +128,7 @@ jobs:
       - name: convention-pack schema and replay checks
         shell: pwsh
         run: ./tools/Test-ConventionPacks.ps1
+
+      - name: deterministic review-fact schema and replay checks
+        shell: pwsh
+        run: ./tools/Test-ReviewFacts.ps1

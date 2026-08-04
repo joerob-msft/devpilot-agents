@@ -147,3 +147,7 @@ coordinates, hashes, byte counts, selection evidence, script/config hashes, and
 the change-set digest needed for the later specialist layer to resolve and verify
 the same bytes. Plans are saved under the reviewer state directory's
 `convention-plans` folder and are not posted or voted on.
+
+The next wrapper-only layer extracts deterministic review facts from that same
+immutable snapshot. See [Deterministic review facts](review-facts.md). Fact plans
+remain separate artifacts and do not enter the current generalist prompt.
