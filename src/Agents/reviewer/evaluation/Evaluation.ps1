@@ -2173,6 +2173,19 @@ function Get-ReviewerEvalArmMetrics {
             })
     }
 
+    # Built here, as a local, and assigned plainly below. A $(...) subexpression
+    # writes its result to the pipeline, and PowerShell UNROLLS an enumerable
+    # written that way: a HashSet with zero members would arrive as $null, one
+    # member as a bare [string] (whose .Contains is SUBSTRING matching, so
+    # "e|i10" would "contain" "e|i1"), and only two or more as a collection.
+    # The paired-recall comparison calls .Contains on exactly this value, so
+    # that shape drift would crash on an empty match set and silently
+    # understate a recall regression on a single-match one.
+    $matchedCorrectnessKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($issueKey in @($correctnessIssueKeys)) {
+        if ($matchedIssueKeys.Contains($issueKey)) { [void]$matchedCorrectnessKeys.Add($issueKey) }
+    }
+
     $eligibleFindings = $eligibleTruePositives + $eligibleFalsePositives
     return [pscustomobject][ordered]@{
         arm                        = [string](Get-ReviewerVerificationValue $Run "arm" "")
@@ -2229,11 +2242,7 @@ function Get-ReviewerEvalArmMetrics {
         inputTokens                = $inputTokens
         outputTokens               = $outputTokens
         costMicroUsd               = $costMicroUsd
-        MatchedCorrectnessKeys     = $(
-            $matched = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-            foreach ($issueKey in @($correctnessIssueKeys)) { if ($matchedIssueKeys.Contains($issueKey)) { [void]$matched.Add($issueKey) } }
-            $matched
-        )
+        MatchedCorrectnessKeys     = $matchedCorrectnessKeys
         CorrectnessKeys            = $correctnessIssueKeys
     }
 }
@@ -2329,15 +2338,36 @@ function ConvertTo-ReviewerEvalEffectivePolicy {
 # independent point estimates.
 # ---------------------------------------------------------------------------
 
+function ConvertTo-ReviewerEvalOrdinalKeySet {
+    <# Rebuilds any shape a caller might hand over - a HashSet, an array, a
+       bare string, or nothing at all - into an ordinal [HashSet[string]].
+       Membership on this path must never fall through to [string]::Contains,
+       which is SUBSTRING matching and would report "e|i10" as containing
+       "e|i1", permissively understating a recall regression. #>
+    param([AllowNull()][AllowEmptyCollection()]$Value)
+    $set = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    if ($null -eq $Value) { return , $set }
+    if ($Value -is [string]) { [void]$set.Add([string]$Value); return , $set }
+    foreach ($item in @($Value)) {
+        if ($null -eq $item) { continue }
+        [void]$set.Add([string]$item)
+    }
+    # Comma-wrapped so PowerShell does not enumerate the set on the way out:
+    # a bare `return $set` would hand back $null at zero members and a bare
+    # [string] at one, which is the very shape hazard this helper exists to
+    # remove. Callers assign the result directly.
+    return , $set
+}
+
 function Get-ReviewerEvalRecallComparison {
     param(
         [Parameter(Mandatory)]$BaselineMetrics,
         [Parameter(Mandatory)]$CandidateMetrics,
         [Parameter(Mandatory)]$EffectivePolicy
     )
-    $baselineKeys = $BaselineMetrics.CorrectnessKeys
-    $candidateKeys = $CandidateMetrics.CorrectnessKeys
-    $inventoryCount = @($candidateKeys).Count
+    $baselineKeys = ConvertTo-ReviewerEvalOrdinalKeySet -Value $BaselineMetrics.CorrectnessKeys
+    $candidateKeys = ConvertTo-ReviewerEvalOrdinalKeySet -Value $CandidateMetrics.CorrectnessKeys
+    $inventoryCount = $candidateKeys.Count
     # Pairing requires the SAME items, not the same number of items: two
     # disjoint sets of equal size would otherwise be "paired" and every
     # discordant count derived from them would be meaningless.
@@ -2345,12 +2375,12 @@ function Get-ReviewerEvalRecallComparison {
         ((Get-ReviewerEvalOrdinalSorted -Values @($baselineKeys)) -join "|") -ceq
         ((Get-ReviewerEvalOrdinalSorted -Values @($candidateKeys)) -join "|")
     )
-    $baselineMatched = $BaselineMetrics.MatchedCorrectnessKeys
-    $candidateMatched = $CandidateMetrics.MatchedCorrectnessKeys
+    $baselineMatched = ConvertTo-ReviewerEvalOrdinalKeySet -Value $BaselineMetrics.MatchedCorrectnessKeys
+    $candidateMatched = ConvertTo-ReviewerEvalOrdinalKeySet -Value $CandidateMetrics.MatchedCorrectnessKeys
     $baselineOnly = 0
     $candidateOnly = 0
-    foreach ($key in @($baselineMatched)) { if (-not $candidateMatched.Contains($key)) { $baselineOnly++ } }
-    foreach ($key in @($candidateMatched)) { if (-not $baselineMatched.Contains($key)) { $candidateOnly++ } }
+    foreach ($key in @($baselineMatched)) { if (-not $candidateMatched.Contains([string]$key)) { $baselineOnly++ } }
+    foreach ($key in @($candidateMatched)) { if (-not $baselineMatched.Contains([string]$key)) { $candidateOnly++ } }
     $discordant = $baselineOnly + $candidateOnly
     $maxRegressionNumerator = ConvertTo-ReviewerEvalGridNumerator `
         -Value ([double]$EffectivePolicy.maxRecallRegression) -Role ceiling
@@ -2874,14 +2904,38 @@ function New-ReviewerEvalReport {
                 boundMethod           = [string]$scope.boundMethod
             })
     }
-    $approvalObserved = @(@($Qualification.requirements | Where-Object { [string]$_.id -ceq "approvalVote" }) |
+    $approvalRequirement = @(@($Qualification.requirements | Where-Object { [string]$_.id -ceq "approvalVote" }) |
             Select-Object -First 1)
-    if (@($approvalObserved).Count -eq 0) { throw "The qualification result is missing its approvalVote requirement." }
-    $approvalObserved = $approvalObserved[0].observed
+    if (@($approvalRequirement).Count -eq 0) { throw "The qualification result is missing its approvalVote requirement." }
+    $approvalRequirement = $approvalRequirement[0]
+    $approvalObserved = $approvalRequirement.observed
+    $commentRequirement = @(@($Qualification.requirements | Where-Object {
+                [string]$_.id -ceq "unattendedImportantCriticalComments"
+            }) | Select-Object -First 1)
+    if (@($commentRequirement).Count -eq 0) {
+        throw "The qualification result is missing its unattendedImportantCriticalComments requirement."
+    }
+    $commentRequirement = $commentRequirement[0]
+    # Transcription eligibility is decided PER SECTION, from the matching
+    # requirement. A single rollup would read "qualifying" whenever any one
+    # requirement passed, and layer 6 evaluates comment scopes and the approval
+    # block against its own, weaker, independent floors without ever consulting
+    # a rollup - so a comment scope copied out of a report whose comment
+    # requirement failed could be accepted there.
+    $commentQualifies = ((-not $anySeed) -and [bool]$commentRequirement.ok)
+    $approvalQualifies = ((-not $anySeed) -and [bool]$approvalRequirement.ok)
     $candidateHoldout = @(@($ArmMetrics) | Where-Object {
             [string]$_.arm -ceq $script:ReviewerEvalCandidateArm -and [string]$_.partition -ceq "holdout"
         } | Select-Object -First 1)
     $candidateHoldout = $(if (@($candidateHoldout).Count -gt 0) { $candidateHoldout[0] } else { $null })
+    # Hoisted out of the manifest literal: an EMPTY array inside a $(...)
+    # subexpression collapses to $null, which would emit `"scopes": null` and
+    # fail the report's own schema - and, worse, would be an ambiguous shape for
+    # anything reading it.
+    $emittedScopes = @()
+    if ($commentQualifies) { $emittedScopes = @($transcriptionScopes.ToArray()) }
+    $emittedByStratum = @()
+    if ($null -ne $population) { $emittedByStratum = @($population.byStratum) }
 
     $manifest = [ordered]@{
         kind                    = $script:ReviewerEvalReportKind
@@ -2908,7 +2962,7 @@ function New-ReviewerEvalReport {
             seedExamples        = $(if ($population) { [int]$population.seedExamples } else { 0 })
             calibrationExamples = $(if ($population) { [int]$population.calibrationExamples } else { 0 })
             holdoutExamples     = $(if ($population) { [int]$population.holdoutExamples } else { 0 })
-            byStratum           = $(if ($population) { @($population.byStratum) } else { @() })
+            byStratum           = $emittedByStratum
             required            = [ordered]@{
                 minExamples            = [int]$EffectivePolicy.minExamples
                 minCalibrationExamples = [int]$EffectivePolicy.minCalibrationExamples
@@ -2938,8 +2992,15 @@ function New-ReviewerEvalReport {
         # unsigned by any gate domain, carries no agent binding, and authorizes
         # nothing. Producing a signed qualification stays a deliberate human
         # act through tools/New-ReviewerGateQualification.ps1.
+        #
+        # A section whose own requirement failed emits NO consumable material:
+        # comment.scopes is empty (layer 6 then closes with
+        # qualificationScopeMissing) and every approval count is zeroed with its
+        # bounds nulled (layer 6 then closes on its sample floor). Copying from
+        # a failing section therefore cannot authorize anything even if the
+        # nonQualifying flags are ignored entirely.
         transcriptionInput      = [ordered]@{
-            nonQualifying = ($anySeed -or -not [bool]$Qualification.anyQualified)
+            nonQualifying = (-not ($commentQualifies -and $approvalQualifies))
             authorizes    = "none"
             corpus        = [ordered]@{
                 name         = [string](Get-ReviewerVerificationValue $Corpus "name" "")
@@ -2949,16 +3010,22 @@ function New-ReviewerEvalReport {
                 itemCount    = [int](Get-ReviewerVerificationValue $freeze "exampleCount" 0)
                 sha256       = [string](Get-ReviewerVerificationValue $freeze "corpusSha256" "")
             }
-            comment       = [ordered]@{ scopes = @($transcriptionScopes.ToArray()) }
+            comment       = [ordered]@{
+                nonQualifying = (-not $commentQualifies)
+                scopes        = $emittedScopes
+            }
             approval      = [ordered]@{
-                sampleCount               = [int]$approvalObserved.labeledDecisions
-                wouldApproveCount         = [int]$approvalObserved.wouldApproveCount
-                falseApprovalCount        = [int]$approvalObserved.falseApprovalCount
-                falseApprovalUpperBound95 = $approvalObserved.falseApprovalUpperBound95
+                nonQualifying             = (-not $approvalQualifies)
+                sampleCount               = $(if ($approvalQualifies) { [int]$approvalObserved.labeledDecisions } else { 0 })
+                wouldApproveCount         = $(if ($approvalQualifies) { [int]$approvalObserved.wouldApproveCount } else { 0 })
+                falseApprovalCount        = $(if ($approvalQualifies) { [int]$approvalObserved.falseApprovalCount } else { 0 })
+                falseApprovalUpperBound95 = $(if ($approvalQualifies) { $approvalObserved.falseApprovalUpperBound95 } else { $null })
                 boundMethod               = [string]$EffectivePolicy.boundMethod
-                recall                    = $(if ($candidateHoldout) { $candidateHoldout.approvalRecall } else { $null })
+                recall                    = $(
+                    if ($approvalQualifies -and $candidateHoldout) { $candidateHoldout.approvalRecall } else { $null }
+                )
                 recallLowerBound95        = $(
-                    if ($candidateHoldout -and [int]$candidateHoldout.shouldApproveDecisions -gt 0) {
+                    if ($approvalQualifies -and $candidateHoldout -and [int]$candidateHoldout.shouldApproveDecisions -gt 0) {
                         Get-ReviewerEvalLowerBoundGrid -Successes ([int]$candidateHoldout.approveCorrectDecisions) `
                             -Trials ([int]$candidateHoldout.shouldApproveDecisions) `
                             -AlphaNumerator ([int]$EffectivePolicy.alphaNumerator) `

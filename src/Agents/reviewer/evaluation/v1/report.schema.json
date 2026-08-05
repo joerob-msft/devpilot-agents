@@ -322,8 +322,9 @@
         "comment": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["scopes"],
+          "required": ["nonQualifying", "scopes"],
           "properties": {
+            "nonQualifying": { "type": "boolean" },
             "scopes": {
               "type": "array",
               "items": {
@@ -361,6 +362,7 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
+            "nonQualifying",
             "sampleCount",
             "wouldApproveCount",
             "falseApprovalCount",
@@ -370,6 +372,7 @@
             "recallLowerBound95"
           ],
           "properties": {
+            "nonQualifying": { "type": "boolean" },
             "sampleCount": { "type": "integer", "minimum": 0 },
             "wouldApproveCount": { "type": "integer", "minimum": 0 },
             "falseApprovalCount": { "type": "integer", "minimum": 0 },

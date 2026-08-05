@@ -1107,6 +1107,14 @@ try {
     Assert-Eval (-not [bool]$report.promotable -and ([string]$report.authorizes -ceq "none")) `
         "The report does not declare itself non-promotable."
     Assert-Eval ([bool]$report.transcriptionInput.nonQualifying) "A seed-corpus report did not mark its transcription block non-qualifying."
+    Assert-Eval ([bool]$report.transcriptionInput.comment.nonQualifying -and [bool]$report.transcriptionInput.approval.nonQualifying) `
+        "A seed-corpus report did not mark BOTH transcription sections non-qualifying."
+    Assert-Eval (@($report.transcriptionInput.comment.scopes).Count -eq 0) `
+        "A failing comment requirement still emitted transcribable scopes."
+    Assert-Eval ([int]$report.transcriptionInput.approval.sampleCount -eq 0 -and
+        [int]$report.transcriptionInput.approval.wouldApproveCount -eq 0 -and
+        $null -eq $report.transcriptionInput.approval.falseApprovalUpperBound95) `
+        "A failing approval requirement still emitted transcribable approval material."
     Assert-Eval (-not [bool]$report.qualification.anyQualified) "The end-to-end seed report qualified something."
     Assert-Eval (@($report.corpusPopulation.deficits) -contains "seedRecordsPresent") "The report omitted the seed-record deficit."
     Assert-Eval ([string]$report.toolBinding.evaluationToolSha256 -match '^[0-9a-f]{64}$') "The composite evaluation tool hash is missing."
@@ -1121,6 +1129,92 @@ try {
             -GeneratedAtEpochSeconds 1767484800 -ReviewerScriptSha256 ("3" * 64)
     } -Message "The harness scored runs bound to a reviewer build the operator did not expect." `
         -ExpectedMessageLike "reviewerScriptSha256 does not match"
+
+    # Mixed results: each transcription section must follow ITS OWN
+    # requirement, because layer 6 reads the sections independently against its
+    # own weaker floors and never consults a rollup.
+    $armMetricsForReport = @(
+        (Get-ReviewerEvalArmMetrics -Run $verifiedRun -Corpus $corpus -Verdicts $verdicts -Partition holdout),
+        (Get-ReviewerEvalArmMetrics -Run $baselineRun -Corpus $corpus -Verdicts $verdicts -Partition holdout)
+    )
+    function New-MixedReport {
+        param([bool]$CommentOk, [bool]$ApprovalOk, [switch]$Seeded)
+        $mixedQualification = [pscustomobject][ordered]@{
+            boundMethod      = [string]$effectivePolicy.boundMethod
+            alphaNumerator   = [int]$effectivePolicy.alphaNumerator
+            alphaDenominator = [int]$effectivePolicy.alphaDenominator
+            scopeCount       = [int]$effectivePolicy.scopeCount
+            globalVetoes     = @()
+            requirements     = @(
+                [pscustomobject][ordered]@{
+                    id = "unattendedImportantCriticalComments"; ok = $CommentOk
+                    reasonCodes = @(); observed = [pscustomobject]@{ eligibleHoldoutFindings = 800 }
+                },
+                [pscustomobject][ordered]@{
+                    id = "unattendedSuggestionComments"; ok = $false
+                    reasonCodes = @("suggestionsPreviewOnly"); observed = [pscustomobject]@{ separatelyQualified = $false }
+                },
+                [pscustomobject][ordered]@{
+                    id = "approvalVote"; ok = $ApprovalOk
+                    reasonCodes = @(); observed = [pscustomobject][ordered]@{
+                        labeledDecisions = 700; wouldApproveCount = 600; falseApprovalCount = 0
+                        falseApprovalUpperBound95 = 0.005; voteAccuracy = 1.0
+                    }
+                }
+            )
+            anyQualified     = ($CommentOk -or $ApprovalOk)
+            allQualified     = ($CommentOk -and $ApprovalOk)
+        }
+        $mixedIntegrity = Copy-EvalObject -Value ([pscustomobject]@{ Ok = $true; ReasonCodes = @(); Population = $integrity.Population })
+        if (-not $Seeded) { $mixedIntegrity.Population.seedExamples = 0 }
+        return New-ReviewerEvalReport -ReportVersion 1 -GeneratedAtEpochSeconds 1767484800 `
+            -ToolBinding $report.toolBinding -Corpus $corpus -CorpusIntegrity $mixedIntegrity `
+            -RunSetConsistency $runSet -AdjudicationResult $adjudicationResult `
+            -ArmMetrics @($armMetricsForReport) -Comparison $comparison -Qualification $mixedQualification `
+            -HoldoutScopes @($holdoutScopes) -EffectivePolicy $effectivePolicy
+    }
+    $commentOnly = New-MixedReport -CommentOk $true -ApprovalOk $false
+    Assert-Eval (-not [bool]$commentOnly.transcriptionInput.comment.nonQualifying) `
+        "A passing comment requirement was marked non-qualifying."
+    Assert-Eval ([bool]$commentOnly.transcriptionInput.approval.nonQualifying) `
+        "A FAILING approval requirement was not marked non-qualifying while comments passed."
+    Assert-Eval ([bool]$commentOnly.transcriptionInput.nonQualifying) `
+        "The transcription rollup claimed qualification while one section had failed."
+    Assert-Eval (@($commentOnly.transcriptionInput.comment.scopes).Count -gt 0) `
+        "A passing comment requirement emitted no transcribable scopes."
+    Assert-Eval ([int]$commentOnly.transcriptionInput.approval.sampleCount -eq 0 -and
+        [int]$commentOnly.transcriptionInput.approval.wouldApproveCount -eq 0 -and
+        $null -eq $commentOnly.transcriptionInput.approval.falseApprovalUpperBound95 -and
+        $null -eq $commentOnly.transcriptionInput.approval.recall) `
+        "A failing approval section still emitted material a human could transcribe into a qualification."
+
+    $approvalOnly = New-MixedReport -CommentOk $false -ApprovalOk $true
+    Assert-Eval ([bool]$approvalOnly.transcriptionInput.comment.nonQualifying) `
+        "A FAILING comment requirement was not marked non-qualifying while approval passed."
+    Assert-Eval (-not [bool]$approvalOnly.transcriptionInput.approval.nonQualifying) `
+        "A passing approval requirement was marked non-qualifying."
+    Assert-Eval (@($approvalOnly.transcriptionInput.comment.scopes).Count -eq 0) `
+        "A failing comment requirement still emitted scopes a human could transcribe into a qualification."
+    Assert-Eval ([int]$approvalOnly.transcriptionInput.approval.sampleCount -eq 700) `
+        "A passing approval requirement emitted no transcribable sample count."
+    Assert-Eval ([bool]$approvalOnly.transcriptionInput.nonQualifying) `
+        "The transcription rollup claimed qualification while the comment section had failed."
+
+    $bothPass = New-MixedReport -CommentOk $true -ApprovalOk $true
+    Assert-Eval (-not [bool]$bothPass.transcriptionInput.nonQualifying) `
+        "A report whose sections both qualify still reported a non-qualifying rollup."
+    $bothPassSeeded = New-MixedReport -CommentOk $true -ApprovalOk $true -Seeded
+    Assert-Eval ([bool]$bothPassSeeded.transcriptionInput.comment.nonQualifying -and
+        [bool]$bothPassSeeded.transcriptionInput.approval.nonQualifying -and
+        @($bothPassSeeded.transcriptionInput.comment.scopes).Count -eq 0 -and
+        [int]$bothPassSeeded.transcriptionInput.approval.sampleCount -eq 0) `
+        "A seed record did not withhold transcription material from otherwise-passing sections."
+    foreach ($mixed in @($commentOnly, $approvalOnly, $bothPass, $bothPassSeeded)) {
+        Assert-Eval ([bool](Test-Json -Json ($mixed | ConvertTo-Json -Depth 32) -SchemaFile $reportSchemaPath)) `
+            "A mixed-result report does not satisfy report.schema.json."
+        Assert-Eval ((-not [bool]$mixed.promotable) -and ([string]$mixed.authorizes -ceq "none")) `
+            "A mixed-result report did not declare itself non-promotable."
+    }
 
     # Byte-exact replay from identical inputs and an identical timestamp.
     $replayPath = Join-Path $sandbox "report-replay.json"
@@ -1191,6 +1285,278 @@ try {
         "The raw promotion path no longer rejects an artifact carrying a 'kind' property."
     Assert-Eval ($wrapperText.IndexOf($verifiedGuard, [StringComparison]::Ordinal) -ge 0) `
         "The verified promotion path no longer requires the exact gate-decision kind."
+
+    # -----------------------------------------------------------------------
+    # 12b. Paired-recall set shape, through the REAL metrics pipeline.
+    #
+    # MatchedCorrectnessKeys must be an ordinal HashSet at 0, 1 and 2+ matches.
+    # A PowerShell-unrolled set would arrive as $null (crashing .Contains before
+    # any fail-closed guard), as a bare [string] at one match (whose .Contains
+    # is SUBSTRING matching, so "X|i10" would "contain" "X|i1" and silently
+    # understate the regression), and only as a collection at two or more.
+    # -----------------------------------------------------------------------
+    $pairManifest = [ordered]@{
+        name                 = "reviewer-eval-pairing"
+        corpusVersion        = 1
+        corpusPin            = [ordered]@{ repositoryId = "example-org/example-pairing"; commitSha = "3" * 40 }
+        holdoutPercent       = 20
+        partitionSalt        = "pair-partition-salt-0001"
+        adjudicationSalt     = "pair-adjudication-salt-0001"
+        frozenAtEpochSeconds = 1767225600
+        records              = @(
+            [ordered]@{
+                status      = "seed"
+                stratum     = "csharp"
+                provenance  = [ordered]@{
+                    provider = "GitHub"; repositoryId = "example-org/example-pairing"; prId = "201"
+                    sourceCommitSha = "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1"
+                    targetCommitSha = "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1"
+                    changeSetSha256 = "a201a201a201a201a201a201a201a201a201a201a201a201a201a201a201a201"
+                    changedFilePathsSha256 = "b201b201b201b201b201b201b201b201b201b201b201b201b201b201b201b201"
+                    sourceRef = "refs/heads/pair/one"; importedAtEpochSeconds = 1767225600
+                }
+                # i1 and i10 collide as prefixes; that is the whole point.
+                inventory   = @(
+                    [ordered]@{ issueId = "i1"; issueClass = "nullReference"; severity = "important"; convention = $false; correctness = $true; path = "src/One.cs" },
+                    [ordered]@{ issueId = "i10"; issueClass = "nullReference"; severity = "important"; convention = $false; correctness = $true; path = "src/One.cs" }
+                )
+                labels      = @(
+                    [ordered]@{ labelerId = "pair-a"; labelerKind = "human"; blind = $true; labeledAtEpochSeconds = 1767225601; issueIds = @("i1", "i10"); decision = "reject" },
+                    [ordered]@{ labelerId = "pair-b"; labelerKind = "human"; blind = $true; labeledAtEpochSeconds = 1767225602; issueIds = @("i1", "i10"); decision = "reject" }
+                )
+                adjudication = $null
+            },
+            [ordered]@{
+                status      = "seed"
+                stratum     = "tests"
+                provenance  = [ordered]@{
+                    provider = "GitHub"; repositoryId = "example-org/example-pairing"; prId = "202"
+                    sourceCommitSha = "e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2"
+                    targetCommitSha = "f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2"
+                    changeSetSha256 = "a202a202a202a202a202a202a202a202a202a202a202a202a202a202a202a202"
+                    changedFilePathsSha256 = "b202b202b202b202b202b202b202b202b202b202b202b202b202b202b202b202"
+                    sourceRef = "refs/heads/pair/two"; importedAtEpochSeconds = 1767225600
+                }
+                inventory   = @(
+                    [ordered]@{ issueId = "i1"; issueClass = "testCoverage"; severity = "important"; convention = $false; correctness = $true; path = "test/Two.cs" }
+                )
+                labels      = @(
+                    [ordered]@{ labelerId = "pair-a"; labelerKind = "human"; blind = $true; labeledAtEpochSeconds = 1767225603; issueIds = @("i1"); decision = "reject" },
+                    [ordered]@{ labelerId = "pair-b"; labelerKind = "human"; blind = $true; labeledAtEpochSeconds = 1767225604; issueIds = @("i1"); decision = "reject" }
+                )
+                adjudication = $null
+            }
+        )
+    }
+    $pairManifestPath = Join-Path $sandbox "pair-import.json"
+    Set-Content -LiteralPath $pairManifestPath -Value ($pairManifest | ConvertTo-Json -Depth 32) -Encoding utf8NoBOM
+    $pairCorpusPath = Join-Path $sandbox "pair-corpus.json"
+    & $importToolPath -ImportManifest $pairManifestPath -OutputPath $pairCorpusPath `
+        -StateDir $stateDir -AllowSyntheticSeed | Out-Null
+    $pairCorpus = Read-ReviewerEvalArtifact -Path $pairCorpusPath -MasterKey $masterKey -Domain corpus
+    $pairIntegrity = Test-ReviewerEvalCorpusIntegrity -Corpus $pairCorpus
+    Assert-Eval ([bool]$pairIntegrity.Ok) "The pairing corpus failed integrity: $($pairIntegrity.ReasonCodes -join ', ')."
+    $pairSha = [string]$pairCorpus.freeze.corpusSha256
+    $pairExampleByPr = @{}
+    foreach ($example in @($pairCorpus.examples)) { $pairExampleByPr[[string]$example.provenance.prId] = $example }
+
+    function New-PairArmRun {
+        <# One arm over the pairing corpus. Each requested "prId|issueId" gets a
+           claim that the adjudication will resolve as a true positive matching
+           exactly that issue; every example also gets one claim resolved as a
+           false positive, so an arm with zero matches still produces resolved
+           claims. Claim text is arm-distinct so each arm gets its own blind
+           key and therefore its own verdict. #>
+        param([Parameter(Mandatory)][string]$Arm, [AllowEmptyCollection()][string[]]$MatchedKeys = @())
+        $matchedSet = [System.Collections.Generic.HashSet[string]]::new([string[]]@($MatchedKeys), [StringComparer]::Ordinal)
+        $results = [System.Collections.Generic.List[object]]::new()
+        $perExample = [System.Collections.Generic.List[object]]::new()
+        $script:pairVerdictPlan = $(if ($null -eq $script:pairVerdictPlan) { @{} } else { $script:pairVerdictPlan })
+        foreach ($prId in @("201", "202")) {
+            $example = $pairExampleByPr[$prId]
+            $claims = [System.Collections.Generic.List[object]]::new()
+            $index = 0
+            $issueIds = @(@($example.inventory) | ForEach-Object { [string]$_.issueId })
+            foreach ($issueId in $issueIds) {
+                if (-not $matchedSet.Contains("$prId|$issueId")) { continue }
+                $text = "$Arm finds $issueId in PR $prId"
+                $contentSha = Get-ReviewerEvalClaimContentSha256 -Text $text
+                $key = Get-ReviewerEvalBlindClaimKey -CorpusSha256 $pairSha -ExampleId ([string]$example.exampleId) `
+                    -Path "src/One.cs" -Severity "important" -ClaimContentSha256 $contentSha
+                $script:pairVerdictPlan[$key] = [pscustomobject]@{ Verdict = "truePositive"; Matched = @($issueId) }
+                [void]$claims.Add([pscustomobject][ordered]@{
+                        claimId = "$Arm-$prId-$index"; blindClaimKey = $key; claimContentSha256 = $contentSha
+                        issueClass = "nullReference"; severity = "important"; path = "src/One.cs"
+                        pack = "(generalist)"; clusterId = ""; text = $text
+                    })
+                $index++
+            }
+            $noiseText = "$Arm notes something unsupported in PR $prId"
+            $noiseSha = Get-ReviewerEvalClaimContentSha256 -Text $noiseText
+            $noiseKey = Get-ReviewerEvalBlindClaimKey -CorpusSha256 $pairSha -ExampleId ([string]$example.exampleId) `
+                -Path "src/One.cs" -Severity "important" -ClaimContentSha256 $noiseSha
+            $script:pairVerdictPlan[$noiseKey] = [pscustomobject]@{ Verdict = "falsePositive"; Matched = @() }
+            [void]$claims.Add([pscustomobject][ordered]@{
+                    claimId = "$Arm-$prId-noise"; blindClaimKey = $noiseKey; claimContentSha256 = $noiseSha
+                    issueClass = "readability"; severity = "important"; path = "src/One.cs"
+                    pack = "(generalist)"; clusterId = ""; text = $noiseText
+                })
+            [void]$results.Add([pscustomobject][ordered]@{
+                    exampleId = [string]$example.exampleId
+                    sourceCommitSha = [string]$example.provenance.sourceCommitSha
+                    targetCommitSha = [string]$example.provenance.targetCommitSha
+                    changeSetSha256 = [string]$example.provenance.changeSetSha256
+                    commitResolution = "resolved"; status = "complete"; vote = "none"
+                    claims = @($claims.ToArray())
+                })
+            [void]$perExample.Add([pscustomobject][ordered]@{
+                    exampleId = [string]$example.exampleId; latencyMs = 1000
+                    inputTokens = 100; outputTokens = 10; costMicroUsd = 450
+                })
+        }
+        return [pscustomobject][ordered]@{
+            kind = "reviewer-evaluation-run"; artifactVersion = 1; schemaVersion = 1
+            runId = "pair-$Arm"; arm = $Arm
+            derivation = [pscustomobject][ordered]@{
+                executedAtEpochSeconds = 1767312000
+                corpus = [pscustomobject][ordered]@{
+                    name = [string]$pairCorpus.name; corpusVersion = [int]$pairCorpus.corpusVersion
+                    corpusSha256 = $pairSha; exampleCount = @($pairCorpus.examples).Count
+                }
+                binding = $binding
+                models = [pscustomobject][ordered]@{
+                    generalists = @($arms.models.generalists | ForEach-Object { [string]$_ })
+                    conventionSpecialist = [string]$arms.models.conventionSpecialist
+                    conventionVerifier = [string]$arms.models.conventionVerifier
+                }
+                results = @($results.ToArray())
+            }
+            observations = [pscustomobject][ordered]@{
+                pricingTableVersion = [string]$arms.pricingTableVersion
+                rates = @(@($arms.rates) | ForEach-Object {
+                        [pscustomobject][ordered]@{
+                            model = [string]$_.model
+                            inputMicroUsdPerKiloToken = [int]$_.inputMicroUsdPerKiloToken
+                            outputMicroUsdPerKiloToken = [int]$_.outputMicroUsdPerKiloToken
+                        }
+                    })
+                perExample = @($perExample.ToArray())
+            }
+        }
+    }
+
+    function Get-PairComparison {
+        param([AllowEmptyCollection()][string[]]$BaselineMatched = @(), [AllowEmptyCollection()][string[]]$CandidateMatched = @())
+        $script:pairVerdictPlan = @{}
+        $pairRuns = @(
+            (New-PairArmRun -Arm "generalistOnly" -MatchedKeys $BaselineMatched),
+            (New-PairArmRun -Arm "multiPassDiscovery" -MatchedKeys $CandidateMatched),
+            (New-PairArmRun -Arm "verified" -MatchedKeys $CandidateMatched)
+        )
+        $pairRunSet = Test-ReviewerEvalRunSetConsistent -Runs $pairRuns -Corpus $pairCorpus
+        if (-not $pairRunSet.Ok) { throw "Pairing run set inconsistent: $($pairRunSet.ReasonCodes -join ', ')." }
+        $verdicts = [System.Collections.Generic.List[object]]::new()
+        $claimByKey = @{}
+        foreach ($run in $pairRuns) {
+            foreach ($result in @($run.derivation.results)) {
+                foreach ($claim in @($result.claims)) { $claimByKey[[string]$claim.blindClaimKey] = $claim }
+            }
+        }
+        foreach ($key in (Get-ReviewerEvalOrdinalSorted -Values @($claimByKey.Keys))) {
+            $plan = $script:pairVerdictPlan[$key]
+            [void]$verdicts.Add([pscustomobject][ordered]@{
+                    blindClaimKey = $key
+                    presentedSha256 = Get-ReviewerEvalPresentedSha256 -Claim $claimByKey[$key]
+                    labels = @(
+                        [pscustomobject][ordered]@{ labelerId = "pair-v-a"; labelerKind = "human"; verdict = [string]$plan.Verdict; matchedIssueIds = @($plan.Matched); verdictAtEpochSeconds = 1767398400 },
+                        [pscustomobject][ordered]@{ labelerId = "pair-v-b"; labelerKind = "human"; verdict = [string]$plan.Verdict; matchedIssueIds = @($plan.Matched); verdictAtEpochSeconds = 1767398401 }
+                    )
+                    adjudication = $null
+                })
+        }
+        $pairAdjudication = [pscustomobject][ordered]@{
+            kind = "reviewer-evaluation-adjudication"; artifactVersion = 1; schemaVersion = 1
+            adjudicationVersion = 1; corpusSha256 = $pairSha
+            presentationOrderSha256 = Get-ReviewerEvalPresentationOrderSha256 `
+                -AdjudicationSalt ([string]$pairCorpus.partitionPolicy.adjudicationSalt) `
+                -BlindClaimKeys @($claimByKey.Keys)
+            verdicts = @($verdicts.ToArray())
+        }
+        $pairAdjudicationResult = Test-ReviewerEvalAdjudication -Adjudication $pairAdjudication `
+            -RunSet $pairRunSet -Corpus $pairCorpus -AdjudicationSalt ([string]$pairCorpus.partitionPolicy.adjudicationSalt)
+        if (-not $pairAdjudicationResult.Ok) { throw "Pairing adjudication rejected: $($pairAdjudicationResult.ReasonCodes -join ', ')." }
+        $baselineMetrics = Get-ReviewerEvalArmMetrics -Run $pairRunSet.ByArm["generalistOnly"] -Corpus $pairCorpus `
+            -Verdicts $pairAdjudicationResult.Verdicts -Partition all
+        $candidateMetrics = Get-ReviewerEvalArmMetrics -Run $pairRunSet.ByArm["verified"] -Corpus $pairCorpus `
+            -Verdicts $pairAdjudicationResult.Verdicts -Partition all
+        return [pscustomobject]@{
+            Baseline   = $baselineMetrics
+            Candidate  = $candidateMetrics
+            Comparison = Get-ReviewerEvalRecallComparison -BaselineMetrics $baselineMetrics `
+                -CandidateMetrics $candidateMetrics -EffectivePolicy $effectivePolicy
+        }
+    }
+
+    # Zero matches on BOTH arms: must not throw, and must report no discordance.
+    $pairZero = Get-PairComparison -BaselineMatched @() -CandidateMatched @()
+    foreach ($side in @(@("baseline", $pairZero.Baseline), @("candidate", $pairZero.Candidate))) {
+        Assert-Eval ($side[1].MatchedCorrectnessKeys -is [System.Collections.Generic.HashSet[string]]) `
+            "A zero-match $($side[0]) arm did not carry an ordinal HashSet of matched keys."
+        Assert-Eval ($side[1].CorrectnessKeys -is [System.Collections.Generic.HashSet[string]]) `
+            "A zero-match $($side[0]) arm did not carry an ordinal HashSet of inventory keys."
+    }
+    Assert-Eval ([int]$pairZero.Comparison.inventoryCount -eq 3 -and [bool]$pairZero.Comparison.denominatorsAgree) `
+        "The pairing corpus did not present three shared correctness items."
+    Assert-Eval ([int]$pairZero.Comparison.baselineOnly -eq 0 -and [int]$pairZero.Comparison.candidateOnly -eq 0 -and
+        [int]$pairZero.Comparison.discordantPairs -eq 0) `
+        "A zero-match comparison reported discordant pairs."
+    Assert-Eval ([double]$pairZero.Comparison.regressionPointEstimate -eq 0.0 -and
+        [double]$pairZero.Comparison.regressionUpperBound95 -eq 0.0 -and [bool]$pairZero.Comparison.withinCeiling) `
+        "A zero-match comparison did not report an exactly-zero regression."
+
+    # One match on the baseline only.
+    $pairOne = Get-PairComparison -BaselineMatched @("201|i1") -CandidateMatched @()
+    Assert-Eval ($pairOne.Baseline.MatchedCorrectnessKeys -is [System.Collections.Generic.HashSet[string]] -and
+        $pairOne.Baseline.MatchedCorrectnessKeys.Count -eq 1) `
+        "A single-match arm did not carry a one-element ordinal HashSet."
+    Assert-Eval ([int]$pairOne.Comparison.baselineOnly -eq 1 -and [int]$pairOne.Comparison.candidateOnly -eq 0 -and
+        [int]$pairOne.Comparison.discordantPairs -eq 1) `
+        "A one-versus-zero match comparison miscounted discordant pairs."
+    Assert-Eval ([double]$pairOne.Comparison.regressionPointEstimate -gt 0.33 -and
+        [double]$pairOne.Comparison.regressionPointEstimate -lt 0.34) `
+        "A one-of-three recall regression was not reported as 1/3."
+
+    # THE regression case: one match on each side, prefix-colliding. Substring
+    # semantics would report baselineOnly = 0 here and understate the loss.
+    $pairCollision = Get-PairComparison -BaselineMatched @("201|i1") -CandidateMatched @("201|i10")
+    Assert-Eval ([int]$pairCollision.Comparison.baselineOnly -eq 1 -and [int]$pairCollision.Comparison.candidateOnly -eq 1 -and
+        [int]$pairCollision.Comparison.discordantPairs -eq 2) `
+        "Prefix-colliding single matches (i1 vs i10) were compared with substring semantics."
+    Assert-Eval ([double]$pairCollision.Comparison.regressionPointEstimate -eq 0.0) `
+        "A one-for-one swap did not net to a zero point regression."
+
+    # Two or more matches, candidate strictly ahead.
+    $pairTwo = Get-PairComparison -BaselineMatched @("201|i1", "201|i10") -CandidateMatched @("201|i1", "201|i10", "202|i1")
+    Assert-Eval ($pairTwo.Candidate.MatchedCorrectnessKeys.Count -eq 3 -and $pairTwo.Baseline.MatchedCorrectnessKeys.Count -eq 2) `
+        "A multi-match comparison lost members from its matched sets."
+    Assert-Eval ([int]$pairTwo.Comparison.baselineOnly -eq 0 -and [int]$pairTwo.Comparison.candidateOnly -eq 1 -and
+        [double]$pairTwo.Comparison.regressionPointEstimate -lt 0.0) `
+        "A recall improvement was not reported as a negative point regression."
+    # Three inventory items cannot certify anything: the exact discordant-pair
+    # bound refuses at that denominator even though the point estimate is an
+    # improvement. That conservatism is the intended behavior, not a defect.
+    Assert-Eval (-not [bool]$pairTwo.Comparison.withinCeiling) `
+        "A three-item denominator certified a regression ceiling it cannot support."
+
+    # The zero-match case must reach a fail-closed REPORT, not an exception.
+    $pairQualification = Test-ReviewerEvalRolloutQualification -EffectivePolicy $effectivePolicy `
+        -CorpusIntegrity $pairIntegrity -RunSetConsistency $runSet -AdjudicationResult $adjudicationResult `
+        -CandidateHoldoutMetrics $pairZero.Candidate -Comparison $pairZero.Comparison -HoldoutScopes @() `
+        -DegradedExamples 0 -UnknownExamples 0 -MissingExamples 0
+    Assert-Eval (-not [bool]$pairQualification.anyQualified) `
+        "A zero-match, seed-corpus qualification did not fail closed."
+    Assert-Eval ($pairQualification.globalVetoes -ccontains "seedCorpus") `
+        "A zero-match qualification lost its seed veto."
 
     # -----------------------------------------------------------------------
     # 13. Structural invariants: the agent never loads this layer, the library

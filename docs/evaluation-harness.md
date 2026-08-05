@@ -379,6 +379,29 @@ severity ceiling and no policy, artifact or report can restore it. Layer 7
 reports what the numbers are; layer 6 decides what is reachable, and it is
 strictly narrower.
 
+### Transcription material is withheld per section
+
+`transcriptionInput` mirrors the layer-6 qualification shape, but eligibility
+is decided **per section**, from that section's own requirement:
+
+| Key | Source |
+| --- | --- |
+| `transcriptionInput.comment.nonQualifying` | `unattendedImportantCriticalComments.ok` (and no seed record) |
+| `transcriptionInput.approval.nonQualifying` | `approvalVote.ok` (and no seed record) |
+| `transcriptionInput.nonQualifying` | conservative rollup: `false` only when **both** sections qualify |
+
+A single rollup would read "qualifying" whenever any one requirement passed,
+and layer 6 evaluates comment scopes and the approval block against its own,
+weaker, independent floors without ever consulting a rollup - so a comment
+scope copied out of a report whose comment requirement failed could be accepted
+there.
+
+The flags are not the protection. A section whose requirement failed emits **no
+consumable material**: `comment.scopes` is an empty array, and every approval
+count is zeroed with its bounds nulled. Layer 6 then closes with
+`qualificationScopeMissing` and on its approval sample floor respectively, even
+if an operator ignores the flags entirely.
+
 ## Running an evaluation
 
 ```powershell
