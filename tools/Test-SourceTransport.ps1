@@ -1134,6 +1134,17 @@ Assert-Source ([int]$hostileMimeRecord.readerExcusedFileCount -eq 3 -and
     ([string]@($hostileMimeRecord.files)[0].noSourceBasis) -ceq 'reader' -and
     ([string]@($hostileMimeRecord.files)[0].mimeType) -ceq 'application/octet-stream') `
     "the persisted coverage record carries what excused each path and on what evidence"
+
+# The accounting sentence is model-facing prose assembled in two branches, so
+# both are asserted: a stray period once shipped ".:" to every review.
+$noSourceSentence = @((Format-ReviewerSealedSourceBlock -Report $hostileMimeReport -NonceFactory { 'n' * 32 }) -split "`n" |
+        Where-Object { $_ -like 'Content accounting*' })[0]
+Assert-Source ($noSourceSentence -match 'or an empty file:$' -and $noSourceSentence -notmatch '\.:') `
+    "the accounting sentence ends in a single colon when some paths carry no source"
+$allSourceSentence = @((Format-ReviewerSealedSourceBlock -Report $refusedTextReport -NonceFactory { 'n' * 32 }) -split "`n" |
+        Where-Object { $_ -like 'Content accounting*' })[0]
+Assert-Source ($allSourceSentence -match 'as the pull request reports them:$' -and $allSourceSentence -notmatch 'further changed path') `
+    "and it omits the no-source clause entirely rather than announcing zero of them"
 $declaredDeleteOnlyReport = New-ReviewerSourceTransportReport -CommitSha $commit `
     -ChangedPaths @('/src/h1.cs', '/src/h2.cs') -SpansByPath ([ordered]@{}) -Policy $policy `
     -Reader { param([string]$Path) $null } `
@@ -1340,6 +1351,10 @@ Assert-Source (-not ($okResult.PSObject.Properties['Rejected'])) "an accepted re
 $binaryResult = Get-ReviewerSourceReaderResult -ToolResult (New-ResourceToolResult -Base64 $goodBase64 -MimeType 'image/png') `
     -Path '/src/a.png' -Policy $readerPolicy -Decoder $strictDecoder
 Assert-Source (([string]$binaryResult.Rejected) -ceq 'notTextual') "a binary MIME type is classified notTextual, not transportFailed"
+$longMimeResult = Get-ReviewerSourceReaderResult -ToolResult (New-ResourceToolResult -Base64 ([Convert]::ToBase64String([byte[]](1, 2, 3))) -MimeType ('x/' + ('m' * 5000))) `
+    -Path '/src/a.cs' -Policy $readerPolicy -Decoder $strictDecoder
+Assert-Source (([string]$longMimeResult.Rejected) -ceq 'notTextual' -and ([string]$longMimeResult.MimeType).Length -le 128) `
+    "a host-supplied MIME type is clamped before it is persisted into a sealed artifact"
 
 $bigBase64 = [Convert]::ToBase64String((New-Object byte[] 4096))
 $bigResult = Get-ReviewerSourceReaderResult -ToolResult (New-ResourceToolResult -Base64 $bigBase64) `
