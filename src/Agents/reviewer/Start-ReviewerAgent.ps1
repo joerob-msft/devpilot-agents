@@ -104,6 +104,12 @@
     Cost and time roughly double: each pass is a separate model run with its own
     -CycleTimeoutSeconds budget.
 
+.PARAMETER ConventionSpecialistModel
+    Explicit model for the optional, independent convention-specialist discovery
+    pass. Requires -EnableConventionSpecialist. There is intentionally no CLI
+    default: the pass is disabled unless the operator opts in and names a model
+    here or in config.review.conventionSpecialistModel.
+
 .PARAMETER PromotePreview
     Publish the review stored in a preview artifact (.json) instead of running
     the model again. The stored review is re-parsed through the same schema that
@@ -180,6 +186,10 @@ param(
     # cover far more together than either does alone.
     [string]$SecondPassModel,
 
+    [switch]$EnableConventionSpecialist,
+
+    [string]$ConventionSpecialistModel,
+
     [string]$Organization,
 
     [string]$RepositoryName,
@@ -246,7 +256,10 @@ param(
     [int]$MaxBackoffSeconds = 1800,
 
     [ValidateRange(30, 7200)]
-    [int]$CycleTimeoutSeconds = 1800
+    [int]$CycleTimeoutSeconds = 1800,
+
+    [ValidateRange(30, 3600)]
+    [int]$ConventionSpecialistTimeoutSeconds = 900
 )
 
 $ErrorActionPreference = "Stop"
@@ -318,6 +331,15 @@ if (-not (Test-Path -LiteralPath $ReviewFactLibrary)) {
     throw "Review-fact library '$ReviewFactLibrary' does not exist."
 }
 . $ReviewFactLibrary
+$ConventionSpecialistLibrary = Join-Path $PSScriptRoot "ConventionSpecialist.ps1"
+if (-not (Test-Path -LiteralPath $ConventionSpecialistLibrary)) {
+    throw "Convention-specialist library '$ConventionSpecialistLibrary' does not exist."
+}
+. $ConventionSpecialistLibrary
+$ConventionSpecialistPromptPath = Join-Path $PSScriptRoot "convention-review.prompt.md"
+if (-not (Test-Path -LiteralPath $ConventionSpecialistPromptPath)) {
+    throw "Convention-specialist prompt '$ConventionSpecialistPromptPath' does not exist."
+}
 $ReviewFactPolicyPath = Join-Path $PSScriptRoot "facts\v1\policy.json"
 $ReviewFactSchemaPath = Join-Path $PSScriptRoot "facts\v1\schema.json"
 foreach ($requiredFactAsset in @($ReviewFactPolicyPath, $ReviewFactSchemaPath)) {
@@ -386,6 +408,14 @@ $script:ReviewerAllowToolCeiling = @(
     "ado(repo_file)",
     "ado(repo_branch)",
     "bluebird"
+)
+
+# The specialist receives a strict, non-empty subset of the generalist ceiling.
+# Keeping this list code-defined prevents an empty grant from restoring Copilot
+# CLI default discovery and prevents config from widening the specialist.
+$script:ReviewerConventionSpecialistAllowToolCeiling = @(
+    "ado(repo_pull_request)",
+    "ado(repo_file)"
 )
 
 # Permission patterns and CLI availability names are different namespaces.
@@ -1805,6 +1835,11 @@ $TargetRefName = Get-AgentConfigString -Object $reviewCfg -Name "targetRefName" 
 $CfgMaxFindings = Get-AgentConfigInt -Object $reviewCfg -Name "maxFindings" -Where "config.review" -Min 1 -Max 12
 $PostSeverities = Get-AgentConfigStringArray -Object $reviewCfg -Name "postSeverities" -Where "config.review"
 $SkipTitlePatterns = Get-AgentConfigStringArray -Object $reviewCfg -Name "skipTitlePatterns" -Where "config.review"
+$CfgConventionSpecialistModel = ""
+if ($reviewCfg.PSObject.Properties["conventionSpecialistModel"]) {
+    $CfgConventionSpecialistModel = Get-AgentConfigString -Object $reviewCfg -Name "conventionSpecialistModel" `
+        -Where "config.review" -MaxLength 64 -AllowEmpty
+}
 foreach ($sev in @($PostSeverities)) {
     if ($script:ReviewerSeverities -cnotcontains $sev) {
         throw "config.review.postSeverities contains '$sev', which is not one of: $($script:ReviewerSeverities -join ', ')."
@@ -1960,6 +1995,40 @@ Assert-ReviewerDeliveryAuthorized -Authorization $DeliveryAuthorization `
 # promotion against exactly this bound, so it has to account for the union.
 $MergedMarkerMaxFindingItems = $EffectiveMaxFindings * (@($ReviewPassModels).Count)
 
+# The specialist is deliberately outside ReviewPassModels: it never participates
+# in merge, summary, delivery, pass-completion, or vote accounting.
+$selectedConventionSpecialistModel = if ($ConventionSpecialistModel) {
+    $ConventionSpecialistModel
+}
+else {
+    $CfgConventionSpecialistModel
+}
+$EffectiveConventionSpecialistModel = ""
+if ($EnableConventionSpecialist) {
+    if (-not $selectedConventionSpecialistModel) {
+        throw ("-EnableConventionSpecialist requires an explicit -ConventionSpecialistModel or " +
+            "config.review.conventionSpecialistModel. The CLI default is never used for this pass.")
+    }
+    $EffectiveConventionSpecialistModel = Assert-AgentSupportedModel -ModelId $selectedConventionSpecialistModel `
+        -Where "convention specialist model"
+    if (-not $ConventionPackPolicy) {
+        throw "-EnableConventionSpecialist requires config.repoConventions.conventionPacks."
+    }
+    Test-AgentAllowToolCeiling -Candidates $script:ReviewerConventionSpecialistAllowToolCeiling `
+        -Ceiling $script:ReviewerAllowToolCeiling -MandatoryDeny $script:ReviewerMandatoryDenyTools `
+        -Where "convention specialist code-defined allow list"
+    $missingSpecialistPermissions = @($script:ReviewerConventionSpecialistAllowToolCeiling | Where-Object {
+            $ConfigAllowTools -cnotcontains $_
+        })
+    if ($missingSpecialistPermissions.Count -gt 0) {
+        throw ("The convention specialist requires these read-only permissions to be present in " +
+            "config.permissions.allowTools: $($missingSpecialistPermissions -join ', ').")
+    }
+}
+elseif ($ConventionSpecialistModel) {
+    throw "-ConventionSpecialistModel requires -EnableConventionSpecialist."
+}
+
 if (-not $RepoPath) {
     # Resolve from the CONFIG's location, never from the script's. The script
     # lives in the toolkit (possibly an installed module); the config always
@@ -1992,6 +2061,8 @@ $conventionPlanDir = Join-Path $StateDir "convention-plans"
 New-Item -ItemType Directory -Force -Path $conventionPlanDir | Out-Null
 $factPlanDir = Join-Path $StateDir "fact-plans"
 New-Item -ItemType Directory -Force -Path $factPlanDir | Out-Null
+$conventionSpecialistPreviewDir = Join-Path $StateDir "convention-specialist-previews"
+New-Item -ItemType Directory -Force -Path $conventionSpecialistPreviewDir | Out-Null
 $logPath = Join-Path $logDir "reviewer.log.jsonl"
 $lockPath = Join-Path $StateDir "agent.lock"
 $reviewedStatePath = Join-Path $StateDir "reviewed.json"
@@ -2000,6 +2071,8 @@ $artifactKeyPath = Join-Path $StateDir "artifact-signing.key"
 
 $ScriptSelfSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
 $ConfigSha256 = (Get-FileHash -LiteralPath $ConfigFile -Algorithm SHA256).Hash
+$ConventionSpecialistPromptSha256 = (Get-FileHash -LiteralPath $ConventionSpecialistPromptPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$ConventionSpecialistLibrarySha256 = (Get-FileHash -LiteralPath $ConventionSpecialistLibrary -Algorithm SHA256).Hash.ToLowerInvariant()
 $ReviewFactPolicySha256 = (Get-FileHash -LiteralPath $ReviewFactPolicyPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $ReviewFactScriptClosure = @(
     [pscustomobject][ordered]@{
@@ -2363,9 +2436,17 @@ function Save-ReviewerConventionPlan {
         [Parameter(Mandatory)][int]$PrId,
         [Parameter(Mandatory)][string]$SourceCommit
     )
-    $path = Join-Path $conventionPlanDir "pr$PrId-$SourceCommit.json"
-    $Plan | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $path -Encoding UTF8
-    return $path
+    $planHash = Get-ReviewerConventionSpecialistObjectSha256 -Value $Plan
+    $baseName = "pr$PrId-$SourceCommit-$($planHash.Substring(0, 16))"
+    $key = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    return Save-ReviewerConventionPlanFile -Plan $Plan -Directory $conventionPlanDir `
+        -BaseName $baseName -MasterKey $key
+}
+
+function Read-ReviewerConventionPlan {
+    param([Parameter(Mandatory)][string]$Path)
+    $key = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    return Read-ReviewerConventionPlanFile -Path $Path -MasterKey $key
 }
 
 function Get-ReviewerFactSourceFile {
@@ -5011,6 +5092,425 @@ function Get-ReviewerPinnedConventionChangeSet {
     }
 }
 
+function Get-ReviewerConventionSpecialistResolvedSources {
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)]$ConventionPlan
+    )
+    $resolved = [System.Collections.Generic.List[object]]::new()
+    foreach ($pack in @(Get-ReviewerConventionSpecialistValue $ConventionPlan "selectedPacks" @())) {
+        $packName = [string](Get-ReviewerConventionSpecialistValue $pack "name" "")
+        foreach ($source in @(Get-ReviewerConventionSpecialistValue $pack "sources" @())) {
+            $path = [string](Get-ReviewerConventionSpecialistValue $source "path" "")
+            $project = [string](Get-ReviewerConventionSpecialistValue $source "project" "")
+            $repositoryId = [string](Get-ReviewerConventionSpecialistValue $source "repositoryId" "")
+            $commitSha = [string](Get-ReviewerConventionSpecialistValue $source "commitSha" "")
+            $expectedBytes = [int](Get-ReviewerConventionSpecialistValue $source "byteLength" 0)
+            if (-not $packName -or -not $path -or -not $project -or
+                $repositoryId -notmatch '^[0-9a-fA-F-]{36}$' -or
+                $commitSha -notmatch '^[0-9a-fA-F]{40}$' -or $expectedBytes -lt 1) {
+                throw "Convention specialist source provenance is incomplete."
+            }
+            $toolResult = Send-AgentMcpRequest -Session $Session -Method "tools/call" -Params @{
+                name = "repo_file"
+                arguments = @{
+                    action = "get_content"
+                    project = $project
+                    repositoryId = $repositoryId
+                    path = $path
+                    versionType = "Commit"
+                    version = $commitSha
+                }
+            }
+            $resource = ConvertFrom-AgentMcpResourceContent -ToolResult $toolResult `
+                -ExpectedUri $path -MaxBytes $expectedBytes `
+                -AllowedMimeTypes $script:ReviewerAuthoritativeMimeTypes
+            if ([int]$resource.ByteLength -ne $expectedBytes -or
+                [string]$resource.MimeType -cne [string](Get-ReviewerConventionSpecialistValue $source "mimeType" "") -or
+                [string]$resource.Sha256 -cne [string](Get-ReviewerConventionSpecialistValue $source "sha256" "")) {
+                throw "Convention specialist source '$path' no longer matches its recorded bytes, MIME type, or SHA-256."
+            }
+            [void]$resolved.Add([pscustomobject][ordered]@{
+                    PackName = $packName
+                    SourceId = [string](Get-ReviewerConventionSpecialistValue $source "sourceId" "")
+                    TrustTier = [string](Get-ReviewerConventionSpecialistValue $source "trustTier" "")
+                    Organization = [string](Get-ReviewerConventionSpecialistValue $source "organization" "")
+                    Project = $project
+                    RepositoryId = $repositoryId.ToLowerInvariant()
+                    Path = $path
+                    CommitSha = $commitSha.ToLowerInvariant()
+                    Sha256 = ([string]$resource.Sha256).ToLowerInvariant()
+                    MimeType = [string]$resource.MimeType
+                    ByteLength = [int]$resource.ByteLength
+                    Text = [string]$resource.Text
+                })
+        }
+    }
+    return $resolved.ToArray()
+}
+
+function Write-ReviewerConventionSpecialistPreview {
+    param(
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)][string]$SourceCommit,
+        [Parameter(Mandatory)][string]$Status,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Diagnostic,
+        [Parameter(Mandatory)][string]$Model,
+        [Parameter(Mandatory)][string]$ConventionPlanSha256,
+        [Parameter(Mandatory)][string]$FactPlanSha256,
+        [string[]]$PackNames = @(),
+        [int]$ContextBytes = 0,
+        [hashtable]$ToolAudit = @{},
+        [object[]]$Candidates = @(),
+        [object[]]$Withheld = @(),
+        [object[]]$ResidualRisks = @()
+    )
+    $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ")
+    $baseName = "pr$PrId-$($SourceCommit.Substring(0, 12))-$stamp-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $markdownPath = Join-Path $conventionSpecialistPreviewDir "$baseName.md"
+    $lines = [System.Collections.Generic.List[string]]::new()
+    [void]$lines.Add("# Convention specialist preview - PR $PrId")
+    [void]$lines.Add("")
+    [void]$lines.Add("- Status: $Status")
+    [void]$lines.Add("- Model: $Model")
+    [void]$lines.Add("- Source commit: $SourceCommit")
+    [void]$lines.Add("- Convention packs: $(if (@($PackNames).Count) { $PackNames -join ', ' } else { '(none)' })")
+    [void]$lines.Add("- Context bytes: $ContextBytes")
+    [void]$lines.Add("- Candidates: $(@($Candidates).Count)")
+    [void]$lines.Add("- Nothing in this preview was merged, posted, or voted.")
+    if ($Diagnostic) { [void]$lines.Add("- Diagnostic: $Diagnostic") }
+    [void]$lines.Add("")
+    [void]$lines.Add("## Candidates")
+    [void]$lines.Add("")
+    if (@($Candidates).Count -eq 0) { [void]$lines.Add("(none)") }
+    foreach ($candidate in @($Candidates)) {
+        $anchor = if ([string](Get-ReviewerConventionSpecialistValue $candidate "anchorKind" "") -ceq "prMetadata") {
+            "(PR metadata)"
+        }
+        else {
+            "$([string](Get-ReviewerConventionSpecialistValue $candidate 'filePath' '')):$([int](Get-ReviewerConventionSpecialistValue $candidate 'line' 0))"
+        }
+        [void]$lines.Add("### $([string](Get-ReviewerConventionSpecialistValue $candidate 'candidateId' '')) - $anchor")
+        [void]$lines.Add("")
+        [void]$lines.Add("- Severity: $([string](Get-ReviewerConventionSpecialistValue $candidate 'severity' ''))")
+        [void]$lines.Add("- Rule: $([string](Get-ReviewerConventionSpecialistValue $candidate 'ruleSourcePath' '')) at $([string](Get-ReviewerConventionSpecialistValue $candidate 'ruleSourceCommit' ''))")
+        [void]$lines.Add("- Quote: $([string](Get-ReviewerConventionSpecialistValue $candidate 'ruleQuote' ''))")
+        [void]$lines.Add("- Evidence: $([string](Get-ReviewerConventionSpecialistValue $candidate 'diffEvidence' ''))")
+        [void]$lines.Add("- Impact: $([string](Get-ReviewerConventionSpecialistValue $candidate 'impact' ''))")
+        [void]$lines.Add("- Expected fix or validation: $([string](Get-ReviewerConventionSpecialistValue $candidate 'expectedFixOrValidation' ''))")
+        [void]$lines.Add("")
+    }
+    if (@($Withheld).Count -gt 0) {
+        [void]$lines.Add("## Withheld")
+        [void]$lines.Add("")
+        foreach ($item in @($Withheld)) {
+            [void]$lines.Add("- $([string](Get-ReviewerConventionSpecialistValue $item 'candidateId' '(none)')): $([string](Get-ReviewerConventionSpecialistValue $item 'reason' 'unknown')) - $([string](Get-ReviewerConventionSpecialistValue $item 'detail' ''))")
+        }
+        [void]$lines.Add("")
+    }
+    if (@($ResidualRisks).Count -gt 0) {
+        [void]$lines.Add("## Residual risks")
+        [void]$lines.Add("")
+        foreach ($risk in @($ResidualRisks)) {
+            [void]$lines.Add("- $([string](Get-ReviewerConventionSpecialistValue $risk 'text' ''))")
+        }
+    }
+    $markdown = $lines.ToArray() -join "`n"
+    [IO.File]::WriteAllText($markdownPath, $markdown, $script:ReviewerConventionSpecialistUtf8)
+    $manifest = [pscustomobject][ordered]@{
+        kind = $script:ReviewerConventionSpecialistArtifactKind
+        artifactVersion = $script:ReviewerConventionSpecialistArtifactVersion
+        status = $Status
+        diagnostic = $Diagnostic
+        model = $Model
+        organization = $Organization
+        project = $ExpectedProject
+        repositoryId = $cfgRepoId
+        prId = $PrId
+        sourceCommit = $SourceCommit
+        configSha256 = $ConfigSha256.ToLowerInvariant()
+        scriptSha256 = $ScriptSelfSha256.ToLowerInvariant()
+        specialistLibrarySha256 = $ConventionSpecialistLibrarySha256
+        promptSha256 = $ConventionSpecialistPromptSha256
+        conventionPlanSha256 = $ConventionPlanSha256
+        factPlanSha256 = $FactPlanSha256
+        packNames = @($PackNames)
+        contextBytes = $ContextBytes
+        toolAudit = $ToolAudit
+        candidates = @($Candidates)
+        withheld = @($Withheld)
+        residualRisks = @($ResidualRisks)
+        markdownPath = $markdownPath
+        markdownSha256 = Get-ReviewerConventionSpecialistSha256 -Text $markdown
+        createdAt = [DateTime]::UtcNow.ToString("o")
+    }
+    $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $artifactPath = Save-ReviewerConventionSpecialistPreview -Directory $conventionSpecialistPreviewDir `
+        -BaseName $baseName -Manifest $manifest -MasterKey $masterKey
+    Write-Host "Convention specialist preview for PR $PrId saved to $markdownPath" -ForegroundColor DarkCyan
+    return @{ MarkdownPath = $markdownPath; ArtifactPath = $artifactPath; Manifest = $manifest }
+}
+
+function Get-ReviewerConventionSpecialistDiagnosticText {
+    param(
+        [AllowNull()]$Value,
+        [ValidateRange(1, 262144)][int]$MaxBytes = 131072
+    )
+    $text = [string]$Value
+    if ($script:ReviewerUtf8.GetByteCount($text) -le $MaxBytes) { return $text }
+    $builder = [Text.StringBuilder]::new()
+    $bytes = 0
+    foreach ($character in $text.ToCharArray()) {
+        $width = $script:ReviewerUtf8.GetByteCount([string]$character)
+        if (($bytes + $width) -gt ($MaxBytes - 32)) { break }
+        [void]$builder.Append($character)
+        $bytes += $width
+    }
+    return $builder.ToString() + "`n[diagnostic text truncated]"
+}
+
+function Invoke-ReviewerConventionSpecialistPass {
+    param(
+        [Parameter(Mandatory)][string]$AgencyPath,
+        [Parameter(Mandatory)][int]$CycleNumber,
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)][string]$SourceCommit,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$ThreadDigestText,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$ConventionPlanPath,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$FactPlanPath
+    )
+    $status = "degraded"
+    $diagnostic = ""
+    $conventionPlanSha256 = "0" * 64
+    $factPlanSha256 = "0" * 64
+    $packNames = @()
+    $contextBytes = 0
+    $candidates = @()
+    $withheld = @()
+    $residualRisks = @()
+    $run = $null
+    $markerSource = ""
+    $toolAudit = @{
+        grantedPermissions = @($script:ReviewerConventionSpecialistAllowToolCeiling)
+        availableTools = @()
+        deniedPermissions = @()
+        requestedTools = @()
+        unrecognizedTools = @()
+        toolRequestAuditTruncated = $false
+        modifiedFiles = @()
+    }
+    try {
+        if (-not $ConventionPlanPath -or -not $FactPlanPath) {
+            throw "A sealed convention plan and sealed fact plan are both required."
+        }
+        $conventionPlan = Read-ReviewerConventionPlan -Path $ConventionPlanPath
+        $factPlan = Read-ReviewerFactPlan -Path $FactPlanPath
+        $conventionPlanSha256 = Get-ReviewerConventionSpecialistObjectSha256 -Value $conventionPlan
+        $factPlanSha256 = [string](Get-ReviewerFactValue $factPlan "planSha256" "")
+        $packNames = @((Get-ReviewerConventionSpecialistValue $conventionPlan "selectedPacks" @()) | ForEach-Object {
+                [string](Get-ReviewerConventionSpecialistValue $_ "name" "")
+            })
+        $targetCommit = [string](Get-ReviewerConventionSpecialistValue $conventionPlan "targetCommit" "")
+        $changeSetDigest = [string](Get-ReviewerConventionSpecialistValue $conventionPlan "changeSetDigest" "")
+        [void](Test-ReviewerConventionSpecialistPlanBinding -ConventionPlan $conventionPlan -FactPlan $factPlan `
+                -PrId $PrId -RepositoryId $cfgRepoId -Project $ExpectedProject `
+                -SourceCommit $SourceCommit -TargetCommit $targetCommit -ChangeSetDigest $changeSetDigest `
+                -ConfigSha256 $ConfigSha256 -ScriptSha256 $ScriptSelfSha256)
+        if ($packNames.Count -eq 0) {
+            $status = "notApplicable"
+            $diagnostic = "No convention pack matched the pinned change set."
+        }
+        else {
+            $sessionData = Invoke-ReviewerConventionSession -AgencyPath $AgencyPath -Action {
+                param([hashtable]$specialistSession)
+                $pinned = Get-ReviewerPinnedConventionChangeSet -Session $specialistSession -PrId $PrId `
+                    -ExpectedSourceCommit $SourceCommit
+                if ($pinned.TargetCommit -cne $targetCommit -or $pinned.Digest -cne $changeSetDigest) {
+                    throw "The convention specialist binding moved after deterministic planning."
+                }
+                return @{
+                    Changes = @($pinned.Entries)
+                    Sources = @(Get-ReviewerConventionSpecialistResolvedSources `
+                            -Session $specialistSession -ConventionPlan $conventionPlan)
+                }
+            }
+            $nonce = New-AgentNonce
+            $promptText = [IO.File]::ReadAllText($ConventionSpecialistPromptPath, $script:ReviewerUtf8)
+            $specialistInput = New-ReviewerConventionSpecialistInput -PromptText $promptText -Nonce $nonce `
+                -Organization $Organization -Project $ExpectedProject -RepositoryId $cfgRepoId `
+                -PrId $PrId -SourceCommit $SourceCommit -TargetCommit $targetCommit `
+                -ChangeSetDigest $changeSetDigest -ConventionPlanSha256 $conventionPlanSha256 `
+                -FactPlanSha256 $factPlanSha256 -ConfigSha256 $ConfigSha256 `
+                -ScriptSha256 $ScriptSelfSha256 -PromptSha256 $ConventionSpecialistPromptSha256 `
+                -ConventionPlan $conventionPlan -FactPlan $factPlan `
+                -ResolvedSources @($sessionData.Sources) -ChangeEntries @($sessionData.Changes) `
+                -ThreadDigestText $ThreadDigestText
+            $contextBytes = [int]$specialistInput.Bytes
+            $allowTools = @($script:ReviewerConventionSpecialistAllowToolCeiling)
+            $availableTools = ConvertTo-ReviewerAvailableToolNames -PermissionTools $allowTools
+            $denyTools = Get-ReviewerEffectiveDenyTools -ConfigDeny $ConfigDenyTools
+            $toolAudit.availableTools = @($availableTools)
+            $toolAudit.deniedPermissions = @($denyTools)
+            $agencyArgs = Get-AgentCopilotArgs -AgentName "" -Source "" `
+                -AvailableTools $availableTools -AllowTools $allowTools -DenyTools $denyTools `
+                -Model $EffectiveConventionSpecialistModel -JsonOutput
+            Write-Host "Launching convention specialist ($EffectiveConventionSpecialistModel, discovery only, timeout=${ConventionSpecialistTimeoutSeconds}s)..." -ForegroundColor Cyan
+            $run = Invoke-TimedProcess -FilePath $AgencyPath -ArgumentList $agencyArgs `
+                -StandardInputContent $specialistInput.Text -CaptureStdOut -CaptureStdErr -WorkingDirectory $RepoPath `
+                -EnvironmentVariablesToRemove $CopilotSensitiveEnvironmentVariables `
+                -TimeoutSeconds $ConventionSpecialistTimeoutSeconds
+            $cliOutcome = Get-AgentCliJsonOutcome -StdOutText ([string]$run.StdOut)
+            $markerSource = [string]$run.StdOut
+            $boundedRawRequestedTools = @()
+            if ($cliOutcome) {
+                if ($cliOutcome.Answer) { $markerSource = [string]$cliOutcome.Answer }
+                $allRequestedTools = @($cliOutcome.ToolRequests)
+                $toolAudit.toolRequestAuditTruncated = ($allRequestedTools.Count -gt 64)
+                $boundedRawRequestedTools = @($allRequestedTools | Select-Object -First 64)
+                $toolAudit.requestedTools = @($boundedRawRequestedTools | ForEach-Object {
+                        Format-ReviewerConventionSpecialistAuditName -Name ([string]$_)
+                    })
+                $toolAudit.modifiedFiles = @($cliOutcome.ModifiedFiles)
+                if ($cliOutcome.Model -and [string]$cliOutcome.Model -cne $EffectiveConventionSpecialistModel) {
+                    throw "Copilot reported specialist model '$($cliOutcome.Model)' instead of '$EffectiveConventionSpecialistModel'."
+                }
+            }
+            if ($script:ReviewerUtf8.GetByteCount($markerSource) -gt 65536) {
+                throw "Convention specialist output exceeded the 65536-byte cap."
+            }
+            $processFailure = Get-ReviewerConventionSpecialistFailureReason -TimedOut ([bool]$run.TimedOut) `
+                -ExitCode ([int]$run.ExitCode) -MarkerValid $true `
+                -TimeoutSeconds $ConventionSpecialistTimeoutSeconds
+            if ($processFailure) { throw $processFailure }
+            if (@($toolAudit.modifiedFiles).Count -gt 0) {
+                throw "Convention specialist reported modified files despite its read-only grant."
+            }
+            $forbiddenRequestedTools = @($boundedRawRequestedTools | Where-Object {
+                    $rawName = [string]$_
+                    $script:ReviewerMandatoryDenyTools -ccontains $rawName -or
+                    @($script:ReviewerForbiddenToolFamilies | Where-Object {
+                            $rawName.StartsWith($_, [StringComparison]::OrdinalIgnoreCase)
+                        }).Count -gt 0 -or
+                    $rawName -match '(?i)(^|[_(-])(write|edit|create|task|shell|web)([_)-]|$)'
+                })
+            if ($forbiddenRequestedTools.Count -gt 0) {
+                throw "Convention specialist requested forbidden tool(s): $($forbiddenRequestedTools -join ', ')."
+            }
+            $toolAudit.unrecognizedTools = @($boundedRawRequestedTools | Where-Object {
+                    -not (ConvertTo-ReviewerConventionSpecialistToolIdentity -Name ([string]$_))
+                } | ForEach-Object {
+                    Format-ReviewerConventionSpecialistAuditName -Name ([string]$_)
+                })
+            $marker = ConvertFrom-AgentResultMarker -StdOutText $markerSource `
+                -MarkerPrefix $script:ReviewerConventionSpecialistMarkerPrefix `
+                -Schema (Get-ReviewerConventionSpecialistMarkerSchema `
+                    -ExpectedProject $ExpectedProject -ExpectedNonce $nonce)
+            $markerFailure = Get-ReviewerConventionSpecialistFailureReason -TimedOut $false -ExitCode 0 `
+                -MarkerValid ($null -ne $marker) -TimeoutSeconds $ConventionSpecialistTimeoutSeconds
+            if ($markerFailure) { throw $markerFailure }
+            if (-not (Test-ReviewerConventionSpecialistBinding -Marker $marker -PrId $PrId `
+                    -RepositoryId $cfgRepoId -SourceCommit $SourceCommit -TargetCommit $targetCommit `
+                    -ChangeSetDigest $changeSetDigest -ConventionPlanSha256 $conventionPlanSha256 `
+                    -FactPlanSha256 $factPlanSha256 -ConfigSha256 $ConfigSha256 `
+                    -ScriptSha256 $ScriptSelfSha256 -PromptSha256 $ConventionSpecialistPromptSha256)) {
+                throw "Convention specialist result marker binding is stale."
+            }
+            $validated = Resolve-ReviewerConventionSpecialistCandidates -Marker $marker `
+                -ConventionPlan $conventionPlan -FactPlan $factPlan `
+                -ResolvedSources @($sessionData.Sources) -ChangeEntries @($sessionData.Changes)
+            $candidates = @($validated.Candidates)
+            $withheld = @($validated.Withheld)
+            $residualRisks = @($validated.ResidualRisks)
+            foreach ($unknownTool in @($toolAudit.unrecognizedTools)) {
+                if (@($residualRisks).Count -ge 12) { break }
+                $residualRisks += [pscustomobject][ordered]@{
+                    text = "CLI tool audit reported an unrecognized request name '$unknownTool'; the enforced availability ceiling remained unchanged."
+                }
+            }
+            if ($toolAudit.toolRequestAuditTruncated -and @($residualRisks).Count -lt 12) {
+                $residualRisks += [pscustomobject][ordered]@{
+                    text = "CLI tool-request audit exceeded 64 entries and was truncated; the enforced availability ceiling remained unchanged."
+                }
+            }
+            $status = "complete"
+        }
+    }
+    catch {
+        $diagnostic = $_.Exception.Message
+        Write-Warning "Convention specialist degraded for PR ${PrId}; generalist review remains unchanged: $diagnostic"
+        $status = "degraded"
+        $candidates = @()
+        if ($run) {
+            try {
+                $failureDirectory = Join-Path $logDir "convention-specialist-failures"
+                New-Item -ItemType Directory -Force -Path $failureDirectory | Out-Null
+                $failurePath = Join-Path $failureDirectory (
+                    "pr{0}-cycle{1}-{2}.txt" -f $PrId, $CycleNumber, [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ"))
+                @(
+                    "diagnostic  : $diagnostic"
+                    "model       : $EffectiveConventionSpecialistModel"
+                    "exitCode    : $($run.ExitCode)"
+                    "timedOut    : $($run.TimedOut)"
+                    "markerPrefix: $script:ReviewerConventionSpecialistMarkerPrefix"
+                    "--------------- PARSED ANSWER ---------------"
+                    (Get-ReviewerConventionSpecialistDiagnosticText -Value $markerSource)
+                    "--------------- STDOUT ---------------"
+                    (Get-ReviewerConventionSpecialistDiagnosticText -Value $run.StdOut)
+                    "--------------- STDERR ---------------"
+                    (Get-ReviewerConventionSpecialistDiagnosticText -Value $run.StdErr)
+                ) | Set-Content -LiteralPath $failurePath -Encoding UTF8
+                Write-Host "Convention specialist failure transcript written to $failurePath" -ForegroundColor DarkYellow
+            }
+            catch { Write-Warning "Could not write the convention specialist failure transcript: $($_.Exception.Message)" }
+        }
+    }
+    try {
+        $preview = Write-ReviewerConventionSpecialistPreview -PrId $PrId -SourceCommit $SourceCommit `
+            -Status $status -Diagnostic $diagnostic -Model $EffectiveConventionSpecialistModel `
+            -ConventionPlanSha256 $conventionPlanSha256 -FactPlanSha256 $factPlanSha256 `
+            -PackNames $packNames -ContextBytes $contextBytes -ToolAudit $toolAudit `
+            -Candidates $candidates -Withheld $withheld -ResidualRisks $residualRisks
+        Write-ReviewerCycleMetadata -Fields @{
+            cycle = $CycleNumber; mode = "convention-specialist"; result = $status; prId = $PrId
+            sourceCommit = $SourceCommit; model = $EffectiveConventionSpecialistModel
+            candidateCount = @($candidates).Count; withheldCount = @($withheld).Count
+            previewPath = $preview.MarkdownPath; artifactPath = $preview.ArtifactPath
+            diagnostic = $diagnostic
+        }
+    }
+    catch {
+        Write-Warning "Convention specialist preview could not be persisted for PR ${PrId}: $($_.Exception.Message)"
+    }
+    return @{ Status = $status; Candidates = @($candidates); Withheld = @($withheld); Diagnostic = $diagnostic }
+}
+
+function Invoke-ReviewerConventionSpecialistSafely {
+    param(
+        [Parameter(Mandatory)][string]$AgencyPath,
+        [Parameter(Mandatory)][int]$CycleNumber,
+        [Parameter(Mandatory)][hashtable]$Bound
+    )
+    if (-not $EnableConventionSpecialist) { return }
+    $prId = [int]$Bound.PrId
+    $sourceCommit = [string]$Bound.SourceCommit
+    try {
+        [void](Invoke-ReviewerConventionSpecialistPass -AgencyPath $AgencyPath -CycleNumber $CycleNumber `
+                -PrId $prId -SourceCommit $sourceCommit -ThreadDigestText ([string]$Bound.DigestText) `
+                -ConventionPlanPath ([string]$Bound.ConventionPlanPath) `
+                -FactPlanPath ([string]$Bound.FactPlanPath))
+    }
+    catch {
+        Write-Warning "Convention specialist escaped its degradation boundary for PR ${prId}; generalist result is unchanged: $($_.Exception.Message)"
+        try {
+            [void](Write-ReviewerConventionSpecialistPreview -PrId $prId -SourceCommit $sourceCommit `
+                    -Status "degraded" -Diagnostic $_.Exception.Message `
+                    -Model $EffectiveConventionSpecialistModel `
+                    -ConventionPlanSha256 ("0" * 64) -FactPlanSha256 ("0" * 64))
+        }
+        catch { Write-Warning "Emergency specialist diagnostic preview also failed: $($_.Exception.Message)" }
+    }
+}
+
 function Test-ReviewerDeliveryStillValid {
     <#
         Re-reads the PR immediately before the wrapper writes anything.
@@ -5426,6 +5926,8 @@ function Invoke-ReviewerPullRequest {
             cycle = $CycleNumber; mode = "live"; result = "failed"; prId = $prId
             reason = $reason; environmentFault = $environmentFault
         }
+        [void](Invoke-ReviewerConventionSpecialistSafely -AgencyPath $AgencyPath `
+                -CycleNumber $CycleNumber -Bound $Bound)
         return @{ ExitCode = 1; Summary = "PR $prId failed: $reason" }
     }
 
@@ -5498,6 +6000,8 @@ function Invoke-ReviewerPullRequest {
             cycle = $CycleNumber; mode = "live"; result = "failed"; prId = $prId
             reason = $reason; environmentFault = $false
         }
+        [void](Invoke-ReviewerConventionSpecialistSafely -AgencyPath $AgencyPath `
+                -CycleNumber $CycleNumber -Bound $Bound)
         return @{ ExitCode = 1; Summary = "PR $prId failed: $reason" }
     }
 
@@ -5659,6 +6163,10 @@ function Invoke-ReviewerPullRequest {
     # A write that was requested and did not land is a cycle failure: it drives
     # the backoff and is retried. An aborted delivery (the PR moved on) is not.
     $exit = if ($postFailures -gt 0 -or ($writesRequested -and -not $delivery.Delivered -and -not $delivery.Aborted)) { 1 } else { 0 }
+    # Discovery-only and intentionally last: the generalist marker, preview,
+    # delivery, state, metadata, and exit code are already finalized.
+    [void](Invoke-ReviewerConventionSpecialistSafely -AgencyPath $AgencyPath `
+            -CycleNumber $CycleNumber -Bound $Bound)
     return @{ ExitCode = $exit; Summary = "PR $prId reviewed ($($allFindings.Count) finding(s), $postedCount posted)" }
 }
 
@@ -5719,6 +6227,10 @@ function Invoke-ReviewerPromotion {
     }
     # Only now is it safe to interpret the manifest's contents.
     $signed = $manifestJson | ConvertFrom-Json
+    $signedKind = [string](Get-ReviewerHashValue -Container $signed -Key 'kind' -Default '')
+    if ($signedKind -and $signedKind -cne "delivery") {
+        throw "Preview artifact kind '$signedKind' is not publishable."
+    }
 
     foreach ($k in @('artifactVersion', 'organization', 'project', 'repositoryName', 'repositoryId', 'prId', 'sourceCommit', 'markerBody', 'approvedComments', 'approvedSummary', 'approvedVote')) {
         if ($null -eq (Get-ReviewerHashValue -Container $signed -Key $k)) { throw "Preview artifact is missing required field '$k': $ArtifactPath" }
@@ -6407,6 +6919,10 @@ try {
     }
     else {
         Write-Host "Review: 1 pass per PR - $EffectiveModel." -ForegroundColor Cyan
+    }
+    if ($EnableConventionSpecialist) {
+        Write-Host ("Convention specialist: discovery-only model $EffectiveConventionSpecialistModel, " +
+            "independent from generalists, timeout ${ConventionSpecialistTimeoutSeconds}s; output is sealed separately and never delivered.") -ForegroundColor Cyan
     }
     if ($PullRequestId -gt 0) { Write-Host "Target: PR $PullRequestId only." -ForegroundColor Cyan }
 

@@ -31,6 +31,7 @@
   "review": {
     "note": "targetRefName scopes the agent to pull requests aimed at the mainline. maxFindings is the per-PR posting cap; the model is told the same number so it self-prioritizes instead of being truncated. postSeverities is what this repository is willing to have posted - findings at other severities are still reported in the preview file and counted in the summary.",
     "targetRefName": "refs/heads/main",
+    "conventionSpecialistModel": "",
     "maxFindings": 8,
     "postSeverities": [
       "critical",

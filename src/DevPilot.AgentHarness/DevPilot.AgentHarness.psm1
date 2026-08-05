@@ -1352,7 +1352,7 @@ function Get-AgentCliJsonOutcome {
         events are streaming fragments of the SAME message, so including them
         would duplicate the answer (and any result marker inside it).
 
-        Returns @{ Answer; Model; ModifiedFiles; ExitCode } or $null when the
+        Returns @{ Answer; Model; ModifiedFiles; ToolRequests; ExitCode } or $null when the
         output is not JSONL - an older CLI, or a run without --output-format -
         so the caller falls back to raw stdout instead of failing the cycle.
     #>
@@ -1362,6 +1362,7 @@ function Get-AgentCliJsonOutcome {
     $noToolMessages = New-Object System.Collections.Generic.List[string]
     $allMessages = New-Object System.Collections.Generic.List[string]
     $modified = New-Object System.Collections.Generic.List[string]
+    $toolRequests = New-Object System.Collections.Generic.List[string]
     $model = ""
     $exitCode = $null
     $sawJson = $false
@@ -1384,11 +1385,27 @@ function Get-AgentCliJsonOutcome {
             $sawAssistantMessage = $true
             $contentProp = $data.PSObject.Properties["content"]
             $text = if ($contentProp -and $contentProp.Value -is [string]) { [string]$contentProp.Value } else { "" }
+            $toolProp = $data.PSObject.Properties["toolRequests"]
+            if ($toolProp -and $null -ne $toolProp.Value -and @($toolProp.Value).Count -gt 0) {
+                foreach ($request in @($toolProp.Value)) {
+                    if ($request -is [string] -and $request.Trim()) {
+                        [void]$toolRequests.Add([string]$request)
+                        continue
+                    }
+                    $nameProp = if ($request -is [System.Management.Automation.PSCustomObject]) {
+                        $request.PSObject.Properties["name"]
+                    }
+                    else { $null }
+                    if ($nameProp -and $nameProp.Value -is [string] -and $nameProp.Value.Trim()) {
+                        [void]$toolRequests.Add([string]$nameProp.Value)
+                    }
+                    else { [void]$toolRequests.Add("<unparsed>") }
+                }
+            }
             if ($text.Trim() -ne "") {
                 [void]$allMessages.Add($text)
                 # A message that requested NO tools is a terminal answer rather
                 # than commentary preceding a tool call.
-                $toolProp = $data.PSObject.Properties["toolRequests"]
                 if (-not $toolProp -or @($toolProp.Value).Count -eq 0) { [void]$noToolMessages.Add($text) }
                 # Honor an explicit phase when the CLI emits one, but never
                 # REQUIRE it: builds that omit the field would otherwise have
@@ -1428,6 +1445,7 @@ function Get-AgentCliJsonOutcome {
         Answer         = ($selected.ToArray() -join "`n")
         Model          = $model
         ModifiedFiles  = @($modified.ToArray() | Select-Object -Unique)
+        ToolRequests   = @($toolRequests.ToArray())
         ExitCode       = $exitCode
         ModelActuallyRan = $sawAssistantMessage
     }
@@ -2557,4 +2575,3 @@ Export-ModuleMember -Function @(
     "Get-AgentProviderValidationRun",
     "Set-AgentProviderPullRequestVote"
 )
-

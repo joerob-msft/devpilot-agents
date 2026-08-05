@@ -144,10 +144,35 @@ starvation.
 
 Ready plans contain no decoded convention text. They contain exact source
 coordinates, hashes, byte counts, selection evidence, script/config hashes, and
-the change-set digest needed for the later specialist layer to resolve and verify
-the same bytes. Plans are saved under the reviewer state directory's
+the change-set digest needed by the optional specialist to resolve and verify the
+same bytes. Plans are HMAC-sealed under the reviewer state directory's
 `convention-plans` folder and are not posted or voted on.
 
 The next wrapper-only layer extracts deterministic review facts from that same
 immutable snapshot. See [Deterministic review facts](review-facts.md). Fact plans
 remain separate artifacts and do not enter the current generalist prompt.
+
+## Optional convention-specialist discovery
+
+`-EnableConventionSpecialist` adds a third, independent discovery pass only when
+an explicit model is supplied with `-ConventionSpecialistModel` or
+`review.conventionSpecialistModel`. There is no implicit CLI model. The
+specialist runs after the generalist review, delivery state, and exit result are
+finalized. Its candidates never enter the merged review artifact, comments,
+summary, vote, pass-completion accounting, or promotion path.
+
+The specialist receives only the dedicated prompt, the sealed fact and
+convention plans, exact convention text re-resolved at each recorded commit and
+SHA-256, the pinned changed-file records, sanitized thread metadata, and two
+read-only tools: pull-request and repository-file reads. Its nonce-bound
+`CONVENTION_REVIEW_RESULT_V1` marker permits `suggestion` and `important`
+convention candidates only. Wrapper validation rechecks source quotes, pack
+membership, fact IDs, severity rules, sibling evidence, and current changed-file
+anchors. Invalid anchors are withheld rather than relocated.
+
+Every run, including timeout, process failure, or invalid output, writes a
+separate Markdown preview and domain-separated HMAC artifact under
+`convention-specialist-previews`. The artifact records model, prompt/script/
+config/plan/fact hashes, pack names, context bytes, granted and observed tools,
+withheld reasons, and residual risks. Degradation is diagnostic in this layer;
+it does not change generalist publication or voting.
