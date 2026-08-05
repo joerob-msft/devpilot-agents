@@ -379,28 +379,33 @@ severity ceiling and no policy, artifact or report can restore it. Layer 7
 reports what the numbers are; layer 6 decides what is reachable, and it is
 strictly narrower.
 
-### Transcription material is withheld per section
+### Transcription material is withheld per section, and per scope
 
 `transcriptionInput` mirrors the layer-6 qualification shape, but eligibility
-is decided **per section**, from that section's own requirement:
+is decided **per section**, and inside the comment section **per scope**, from
+the requirement that actually governs it:
 
 | Key | Source |
 | --- | --- |
-| `transcriptionInput.comment.nonQualifying` | `unattendedImportantCriticalComments.ok` (and no seed record) |
+| `transcriptionInput.comment.scopes[]` with severity `important`/`critical` | emitted only when `unattendedImportantCriticalComments.ok` (and no seed record) |
+| `transcriptionInput.comment.scopes[]` with severity `suggestion` | emitted only when `unattendedSuggestionComments.ok` (and no seed record) |
+| `transcriptionInput.comment.nonQualifying` | `false` only when at least one scope is emitted and **none** was withheld |
 | `transcriptionInput.approval.nonQualifying` | `approvalVote.ok` (and no seed record) |
 | `transcriptionInput.nonQualifying` | conservative rollup: `false` only when **both** sections qualify |
 
 A single rollup would read "qualifying" whenever any one requirement passed,
 and layer 6 evaluates comment scopes and the approval block against its own,
-weaker, independent floors without ever consulting a rollup - so a comment
-scope copied out of a report whose comment requirement failed could be accepted
-there.
+weaker, independent floors without ever consulting a rollup - so a scope copied
+out of a report whose governing requirement failed could be accepted there.
+Suggestions matter specifically: layer 7's suggestion sample floor (200 by
+default) is **stronger** than layer 6's comment sample floor (100), so a
+suggestion scope that fails here would satisfy layer 6 unchanged.
 
-The flags are not the protection. A section whose requirement failed emits **no
-consumable material**: `comment.scopes` is an empty array, and every approval
-count is zeroed with its bounds nulled. Layer 6 then closes with
-`qualificationScopeMissing` and on its approval sample floor respectively, even
-if an operator ignores the flags entirely.
+The flags are not the protection. Material whose governing requirement failed
+is simply not emitted: those scopes are absent from `comment.scopes`, and every
+approval count is zeroed with its bounds nulled. Layer 6 then closes with
+`qualificationScopeMissing`, and on its approval sample and recall floors,
+even if an operator ignores the flags entirely.
 
 ## Running an evaluation
 

@@ -2350,6 +2350,12 @@ function ConvertTo-ReviewerEvalOrdinalKeySet {
     if ($Value -is [string]) { [void]$set.Add([string]$Value); return , $set }
     foreach ($item in @($Value)) {
         if ($null -eq $item) { continue }
+        # Fail closed rather than [string]-coercing something unexpected: a
+        # silent coercion on a safety path is how a comparison quietly starts
+        # meaning something else.
+        if ($item -isnot [string]) {
+            throw "Evaluation key sets accept strings only; got '$($item.GetType().FullName)'."
+        }
         [void]$set.Add([string]$item)
     }
     # Comma-wrapped so PowerShell does not enumerate the set on the way out:
@@ -2916,13 +2922,24 @@ function New-ReviewerEvalReport {
         throw "The qualification result is missing its unattendedImportantCriticalComments requirement."
     }
     $commentRequirement = $commentRequirement[0]
-    # Transcription eligibility is decided PER SECTION, from the matching
-    # requirement. A single rollup would read "qualifying" whenever any one
+    $suggestionRequirement = @(@($Qualification.requirements | Where-Object {
+                [string]$_.id -ceq "unattendedSuggestionComments"
+            }) | Select-Object -First 1)
+    if (@($suggestionRequirement).Count -eq 0) {
+        throw "The qualification result is missing its unattendedSuggestionComments requirement."
+    }
+    $suggestionRequirement = $suggestionRequirement[0]
+    # Transcription eligibility is decided PER SECTION and, inside the comment
+    # section, PER SCOPE - from the requirement that actually governs that
+    # scope's severity. A single rollup would read "qualifying" whenever any one
     # requirement passed, and layer 6 evaluates comment scopes and the approval
     # block against its own, weaker, independent floors without ever consulting
-    # a rollup - so a comment scope copied out of a report whose comment
-    # requirement failed could be accepted there.
+    # a rollup - so a scope copied out of a report whose governing requirement
+    # failed could be accepted there. Suggestions matter specifically: layer 7's
+    # suggestion sample floor is stronger than layer 6's, so a suggestion scope
+    # that fails here can still satisfy layer 6 unchanged.
     $commentQualifies = ((-not $anySeed) -and [bool]$commentRequirement.ok)
+    $suggestionQualifies = ((-not $anySeed) -and [bool]$suggestionRequirement.ok)
     $approvalQualifies = ((-not $anySeed) -and [bool]$approvalRequirement.ok)
     $candidateHoldout = @(@($ArmMetrics) | Where-Object {
             [string]$_.arm -ceq $script:ReviewerEvalCandidateArm -and [string]$_.partition -ceq "holdout"
@@ -2932,8 +2949,23 @@ function New-ReviewerEvalReport {
     # subexpression collapses to $null, which would emit `"scopes": null` and
     # fail the report's own schema - and, worse, would be an ambiguous shape for
     # anything reading it.
+    #
+    # Each scope is emitted only when the requirement governing ITS severity
+    # passed. The section flag then says "nothing here was withheld and there is
+    # something here", which is the only reading under which an operator can
+    # safely copy the whole block.
     $emittedScopes = @()
-    if ($commentQualifies) { $emittedScopes = @($transcriptionScopes.ToArray()) }
+    foreach ($scope in @($transcriptionScopes.ToArray())) {
+        $severity = [string]$scope.severity
+        $governingRequirementPassed = $(
+            if ($script:ReviewerEvalUnattendedCommentSeverities -ccontains $severity) { $commentQualifies }
+            else { $suggestionQualifies }
+        )
+        if ($governingRequirementPassed) { $emittedScopes += , $scope }
+    }
+    $emittedScopes = @($emittedScopes)
+    $withheldAnyScope = ($emittedScopes.Count -ne @($transcriptionScopes.ToArray()).Count)
+    $commentSectionQualifies = (($emittedScopes.Count -gt 0) -and (-not $withheldAnyScope))
     $emittedByStratum = @()
     if ($null -ne $population) { $emittedByStratum = @($population.byStratum) }
 
@@ -2969,7 +3001,7 @@ function New-ReviewerEvalReport {
                 minHoldoutExamples     = [int]$EffectivePolicy.minHoldoutExamples
                 minPerStratumExamples  = [int]$EffectivePolicy.minPerStratumExamples
             }
-            deficits            = @(Get-ReviewerEvalOrdinalSorted -Values $deficits.ToArray())
+            deficits            = @(Get-ReviewerEvalUniqueReasonCodes -Reasons @(Get-ReviewerEvalOrdinalSorted -Values $deficits.ToArray()))
         }
         adjudicationQuality     = [ordered]@{
             presentedClaims  = [int]$AdjudicationResult.Presented
@@ -3000,7 +3032,7 @@ function New-ReviewerEvalReport {
         # a failing section therefore cannot authorize anything even if the
         # nonQualifying flags are ignored entirely.
         transcriptionInput      = [ordered]@{
-            nonQualifying = (-not ($commentQualifies -and $approvalQualifies))
+            nonQualifying = (-not ($commentSectionQualifies -and $approvalQualifies))
             authorizes    = "none"
             corpus        = [ordered]@{
                 name         = [string](Get-ReviewerVerificationValue $Corpus "name" "")
@@ -3011,7 +3043,7 @@ function New-ReviewerEvalReport {
                 sha256       = [string](Get-ReviewerVerificationValue $freeze "corpusSha256" "")
             }
             comment       = [ordered]@{
-                nonQualifying = (-not $commentQualifies)
+                nonQualifying = (-not $commentSectionQualifies)
                 scopes        = $emittedScopes
             }
             approval      = [ordered]@{

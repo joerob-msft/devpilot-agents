@@ -233,6 +233,19 @@ try {
         @("truePositive", "truePositive"), @("truePositive", "truePositive"))
     Assert-Eval ($null -eq $degenerate) "A degenerate single-category distribution produced a kappa instead of null."
     Assert-Eval ($null -eq (Get-ReviewerEvalRatio -Numerator 3 -Denominator 0)) "A zero denominator produced a ratio instead of null."
+    # The key-set normalizer must accept every shape a caller could hand over
+    # and fail closed on anything that is not a string.
+    foreach ($shape in @(@($null), @("a|i1"), @(, @("a|i1", "a|i10")))) {
+        $normalized = ConvertTo-ReviewerEvalOrdinalKeySet -Value $shape[0]
+        Assert-Eval ($normalized -is [System.Collections.Generic.HashSet[string]]) `
+            "The key-set normalizer returned a non-HashSet for one of its accepted input shapes."
+    }
+    Assert-Eval ((ConvertTo-ReviewerEvalOrdinalKeySet -Value @("a|i1", "a|i10")).Contains("a|i1") -and
+        -not (ConvertTo-ReviewerEvalOrdinalKeySet -Value @("a|i10")).Contains("a|i1")) `
+        "The key-set normalizer does not use ordinal membership."
+    Assert-EvalThrows -Action { ConvertTo-ReviewerEvalOrdinalKeySet -Value @(1, 2) } `
+        -Message "The key-set normalizer silently coerced non-string members." `
+        -ExpectedMessageLike "accept strings only"
 
     # -----------------------------------------------------------------------
     # 4. Import the shipped seed corpus through the real operator tool.
@@ -1138,7 +1151,8 @@ try {
         (Get-ReviewerEvalArmMetrics -Run $baselineRun -Corpus $corpus -Verdicts $verdicts -Partition holdout)
     )
     function New-MixedReport {
-        param([bool]$CommentOk, [bool]$ApprovalOk, [switch]$Seeded)
+        param([bool]$CommentOk, [bool]$ApprovalOk, [bool]$SuggestionOk = $false, [switch]$Seeded, [object[]]$Scopes)
+        if (-not $PSBoundParameters.ContainsKey("Scopes")) { $Scopes = @($holdoutScopes) }
         $mixedQualification = [pscustomobject][ordered]@{
             boundMethod      = [string]$effectivePolicy.boundMethod
             alphaNumerator   = [int]$effectivePolicy.alphaNumerator
@@ -1151,8 +1165,8 @@ try {
                     reasonCodes = @(); observed = [pscustomobject]@{ eligibleHoldoutFindings = 800 }
                 },
                 [pscustomobject][ordered]@{
-                    id = "unattendedSuggestionComments"; ok = $false
-                    reasonCodes = @("suggestionsPreviewOnly"); observed = [pscustomobject]@{ separatelyQualified = $false }
+                    id = "unattendedSuggestionComments"; ok = $SuggestionOk
+                    reasonCodes = @(); observed = [pscustomobject]@{ separatelyQualified = $SuggestionOk }
                 },
                 [pscustomobject][ordered]@{
                     id = "approvalVote"; ok = $ApprovalOk
@@ -1162,8 +1176,8 @@ try {
                     }
                 }
             )
-            anyQualified     = ($CommentOk -or $ApprovalOk)
-            allQualified     = ($CommentOk -and $ApprovalOk)
+            anyQualified     = ($CommentOk -or $ApprovalOk -or $SuggestionOk)
+            allQualified     = ($CommentOk -and $ApprovalOk -and $SuggestionOk)
         }
         $mixedIntegrity = Copy-EvalObject -Value ([pscustomobject]@{ Ok = $true; ReasonCodes = @(); Population = $integrity.Population })
         if (-not $Seeded) { $mixedIntegrity.Population.seedExamples = 0 }
@@ -1171,7 +1185,7 @@ try {
             -ToolBinding $report.toolBinding -Corpus $corpus -CorpusIntegrity $mixedIntegrity `
             -RunSetConsistency $runSet -AdjudicationResult $adjudicationResult `
             -ArmMetrics @($armMetricsForReport) -Comparison $comparison -Qualification $mixedQualification `
-            -HoldoutScopes @($holdoutScopes) -EffectivePolicy $effectivePolicy
+            -HoldoutScopes @($Scopes) -EffectivePolicy $effectivePolicy
     }
     $commentOnly = New-MixedReport -CommentOk $true -ApprovalOk $false
     Assert-Eval (-not [bool]$commentOnly.transcriptionInput.comment.nonQualifying) `
@@ -1203,13 +1217,50 @@ try {
     $bothPass = New-MixedReport -CommentOk $true -ApprovalOk $true
     Assert-Eval (-not [bool]$bothPass.transcriptionInput.nonQualifying) `
         "A report whose sections both qualify still reported a non-qualifying rollup."
+    Assert-Eval ((@($report.corpusPopulation.deficits) -join ",") -ceq
+        ((@($report.corpusPopulation.deficits) | Select-Object -Unique) -join ",")) `
+        "The population deficit list carries duplicate reason codes."
     $bothPassSeeded = New-MixedReport -CommentOk $true -ApprovalOk $true -Seeded
     Assert-Eval ([bool]$bothPassSeeded.transcriptionInput.comment.nonQualifying -and
         [bool]$bothPassSeeded.transcriptionInput.approval.nonQualifying -and
         @($bothPassSeeded.transcriptionInput.comment.scopes).Count -eq 0 -and
         [int]$bothPassSeeded.transcriptionInput.approval.sampleCount -eq 0) `
         "A seed record did not withhold transcription material from otherwise-passing sections."
-    foreach ($mixed in @($commentOnly, $approvalOnly, $bothPass, $bothPassSeeded)) {
+
+    # Per-SCOPE gating: a suggestion scope is governed by the suggestion
+    # requirement, not by the important/critical one. Layer 7's suggestion
+    # sample floor is stronger than layer 6's comment floor, so a suggestion
+    # scope that fails here would satisfy layer 6 unchanged if it were emitted.
+    $suggestionScope = [pscustomobject][ordered]@{
+        pack = "(generalist)"; severity = "suggestion"; sampleCount = 150
+        truePositives = 148; falsePositives = 2; precision = 0.9867
+        precisionLowerBound95 = 0.95; recall = 0.7; recallLowerBound95 = 0.6
+        boundMethod = [string]$effectivePolicy.boundMethod
+    }
+    $withSuggestion = @(@($holdoutScopes) + @($suggestionScope))
+    $suggestionWithheld = New-MixedReport -CommentOk $true -ApprovalOk $true -SuggestionOk $false -Scopes $withSuggestion
+    Assert-Eval (@(@($suggestionWithheld.transcriptionInput.comment.scopes) |
+                Where-Object { [string]$_.severity -ceq "suggestion" }).Count -eq 0) `
+        "A suggestion scope was emitted for transcription while its own requirement had failed."
+    Assert-Eval (@($suggestionWithheld.transcriptionInput.comment.scopes).Count -eq @($holdoutScopes).Count) `
+        "Withholding a suggestion scope also dropped the important/critical scopes."
+    Assert-Eval ([bool]$suggestionWithheld.transcriptionInput.comment.nonQualifying -and
+        [bool]$suggestionWithheld.transcriptionInput.nonQualifying) `
+        "A comment section that silently withheld a declared scope still reported itself qualifying."
+    $suggestionEmitted = New-MixedReport -CommentOk $true -ApprovalOk $true -SuggestionOk $true -Scopes $withSuggestion
+    Assert-Eval (@(@($suggestionEmitted.transcriptionInput.comment.scopes) |
+                Where-Object { [string]$_.severity -ceq "suggestion" }).Count -eq 1) `
+        "A separately qualified suggestion scope was not emitted for transcription."
+    Assert-Eval ((-not [bool]$suggestionEmitted.transcriptionInput.comment.nonQualifying) -and
+        (-not [bool]$suggestionEmitted.transcriptionInput.nonQualifying)) `
+        "A fully qualified comment section reported itself non-qualifying."
+    $onlySuggestionPasses = New-MixedReport -CommentOk $false -ApprovalOk $true -SuggestionOk $true -Scopes $withSuggestion
+    Assert-Eval (@(@($onlySuggestionPasses.transcriptionInput.comment.scopes) |
+                Where-Object { $script:ReviewerEvalUnattendedCommentSeverities -ccontains [string]$_.severity }).Count -eq 0) `
+        "Important/critical scopes were emitted while their own requirement had failed."
+    Assert-Eval ([bool]$onlySuggestionPasses.transcriptionInput.comment.nonQualifying) `
+        "A comment section missing its important/critical scopes reported itself qualifying."
+    foreach ($mixed in @($commentOnly, $approvalOnly, $bothPass, $bothPassSeeded, $suggestionWithheld, $suggestionEmitted, $onlySuggestionPasses)) {
         Assert-Eval ([bool](Test-Json -Json ($mixed | ConvertTo-Json -Depth 32) -SchemaFile $reportSchemaPath)) `
             "A mixed-result report does not satisfy report.schema.json."
         Assert-Eval ((-not [bool]$mixed.promotable) -and ([string]$mixed.authorizes -ceq "none")) `

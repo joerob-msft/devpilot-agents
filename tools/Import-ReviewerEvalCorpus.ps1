@@ -304,7 +304,7 @@ $deficitReport = [pscustomobject][ordered]@{
         minHoldoutExamples     = $script:ReviewerEvalMinHoldoutExamples
         minPerStratumExamples  = $script:ReviewerEvalMinPerStratumExamples
     }
-    deficits           = @(Get-ReviewerEvalOrdinalSorted -Values $deficits.ToArray())
+    deficits           = @(Get-ReviewerEvalUniqueReasonCodes -Reasons @(Get-ReviewerEvalOrdinalSorted -Values $deficits.ToArray()))
     qualifiesAnything  = $false
 }
 if ($DeficitPath) {
