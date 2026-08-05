@@ -26,6 +26,24 @@ Set-StrictMode -Version Latest
 $repoRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repoRoot 'src/Agents/reviewer/SourceTransport.ps1')
 
+# The wrapper is parsed, never executed: these checks assert how the library is
+# WIRED IN, which no amount of library-level testing can establish.
+$wrapperPath = Join-Path $repoRoot 'src/Agents/reviewer/Start-ReviewerAgent.ps1'
+$wrapperText = [IO.File]::ReadAllText($wrapperPath)
+$wrapperTokens = $null
+$wrapperErrors = $null
+$wrapperAst = [Management.Automation.Language.Parser]::ParseInput($wrapperText, [ref]$wrapperTokens, [ref]$wrapperErrors)
+
+function Get-FunctionTextFromWrapper {
+    param([Parameter(Mandatory)][string]$Name)
+    $node = $wrapperAst.FindAll({
+            param($candidate)
+            $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -ceq $Name
+        }, $true) | Select-Object -First 1
+    if (-not $node) { return "" }
+    return $node.Extent.Text
+}
+
 $script:Failures = New-Object System.Collections.Generic.List[string]
 $script:Checks = 0
 
@@ -402,6 +420,17 @@ Assert-Source ($forgedRendered.Contains('rejected path #1', [StringComparison]::
     "a refused path is counted with a stable placeholder"
 Assert-Source ($forgedRendered.Contains('pathRejected', [StringComparison]::Ordinal)) `
     "a refused path is still accounted, never dropped"
+
+# The same rule has to hold in the human-facing preview: an unsafe path is
+# counted, never echoed, or a PR author could spoof what the reader sees.
+$previewCellSource = Get-FunctionTextFromWrapper -Name 'Format-ReviewerCoveragePathCell'
+Assert-Source ($previewCellSource -match 'ConvertTo-ReviewerSourcePath' -and $previewCellSource -match 'unsafe path, not shown') `
+    "the preview refuses to echo a path that failed normalization"
+$writePreviewSource = Get-FunctionTextFromWrapper -Name 'Write-ReviewerPreview'
+Assert-Source ($writePreviewSource -notmatch '``\$\(\[string\]\$_\.path\)``') `
+    "the preview never interpolates a raw coverage path into Markdown"
+Assert-Source (([regex]::Matches($writePreviewSource, 'Format-ReviewerCoveragePathCell')).Count -eq 2) `
+    "both coverage lists in the preview go through the safe path renderer"
 Assert-Source (Test-Throws {
         New-ReviewerSealedBoundary -Label 'PINNED_SOURCE' -Payloads @('PINNED_SOURCE_N') -NonceFactory { 'n' }
     }) "a boundary that always collides with the payload is refused rather than reused"
@@ -571,24 +600,11 @@ Write-Host "[12/12] The gate is actually wired into the review path" -Foreground
 # asks. Without these, deleting the skip branch or dropping the sealed block
 # from the model's context would leave the whole suite green while restoring
 # the exact production failure this layer exists to prevent.
-$wrapperPath = Join-Path $repoRoot 'src/Agents/reviewer/Start-ReviewerAgent.ps1'
-$wrapperText = [IO.File]::ReadAllText($wrapperPath)
-$wrapperTokens = $null
-$wrapperErrors = $null
-$wrapperAst = [Management.Automation.Language.Parser]::ParseInput($wrapperText, [ref]$wrapperTokens, [ref]$wrapperErrors)
+$wrapperPathForWiring = Join-Path $repoRoot 'src/Agents/reviewer/Start-ReviewerAgent.ps1'
 Assert-Source ($wrapperErrors.Count -eq 0) "the reviewer wrapper parses"
+Assert-Source ((Test-Path -LiteralPath $wrapperPathForWiring)) "the reviewer wrapper is where the wiring checks expect it"
 
-function Get-WrapperFunctionText {
-    param([Parameter(Mandatory)][string]$Name)
-    $node = $wrapperAst.FindAll({
-            param($candidate)
-            $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -ceq $Name
-        }, $true) | Select-Object -First 1
-    if (-not $node) { return "" }
-    return $node.Extent.Text
-}
-
-$cycleText = Get-WrapperFunctionText -Name 'Invoke-ReviewerCycle'
+$cycleText = Get-FunctionTextFromWrapper -Name 'Invoke-ReviewerCycle'
 Assert-Source ($cycleText.Length -gt 0) "Invoke-ReviewerCycle is present"
 $transportAt = $cycleText.IndexOf('Get-ReviewerSourceTransport', [StringComparison]::Ordinal)
 $reviewAt = $cycleText.IndexOf('Invoke-ReviewerPullRequest -Session', [StringComparison]::Ordinal)
@@ -603,7 +619,7 @@ Assert-Source ($cycleText -match 'PinnedSourceText\s*=' -and $cycleText -match '
 Assert-Source ($cycleText -match 'the pinned source transport failed[\s\S]{0,600}?continue') `
     "a transport exception also skips the pull request rather than reviewing without source"
 
-$transportText = Get-WrapperFunctionText -Name 'Get-ReviewerSourceTransport'
+$transportText = Get-FunctionTextFromWrapper -Name 'Get-ReviewerSourceTransport'
 Assert-Source ($transportText -match 'Assert-ReviewerSourceChangeSetAgreement') `
     "the wrapper cross-checks its two change-set extractions"
 Assert-Source ($transportText -match 'moved from .* while its pinned source was being read') `
@@ -611,9 +627,9 @@ Assert-Source ($transportText -match 'moved from .* while its pinned source was 
 Assert-Source ($transportText -notmatch '@\(Get-ReviewerChangePathsFromResponse') `
     "the wrapper does not re-introduce the array-nesting bug that collapsed the change set"
 
-$passText = Get-WrapperFunctionText -Name 'Invoke-ReviewerModelPass'
+$passText = Get-FunctionTextFromWrapper -Name 'Invoke-ReviewerModelPass'
 Assert-Source ($passText -match 'PinnedSourceText') "the generalist runtime context carries the sealed block"
-$prText = Get-WrapperFunctionText -Name 'Invoke-ReviewerPullRequest'
+$prText = Get-FunctionTextFromWrapper -Name 'Invoke-ReviewerPullRequest'
 Assert-Source ($prText -match 'ReviewerMarkerRetryAttempts') "the marker retry is wired into the pass loop"
 Assert-Source ($prText -match "notmatch 'missing or invalid result marker'") `
     "only a genuine marker parse failure is retried"

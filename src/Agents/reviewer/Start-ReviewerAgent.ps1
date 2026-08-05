@@ -3616,6 +3616,20 @@ function Get-ReviewerConventionSourceSummary {
     return ($authorityParts.ToArray() -join '; ')
 }
 
+function Format-ReviewerCoveragePathCell {
+    <# A changed path, rendered for a human-facing Markdown document.
+
+       A path is author-controlled, and a `pathRejected` entry is by definition
+       one that failed normalization - so it may carry backticks, pipes, or
+       angle brackets that would break the surrounding formatting or spoof what
+       the reader sees. The sealed model-facing block never echoes such a path;
+       neither does the preview. A path that normalizes cleanly cannot contain
+       any of those characters, so it is safe to quote. #>
+    param([AllowEmptyString()][string]$Path)
+    if ((ConvertTo-ReviewerSourcePath -Path $Path) -ceq $Path) { return "``$Path``" }
+    return "(unsafe path, not shown)"
+}
+
 function Write-ReviewerPreview {
     <#
         Writes the candidate comments to a file and to the console. This is what
@@ -3675,13 +3689,15 @@ function Write-ReviewerPreview {
         $uncovered = @(@($SourceCoverage.files) | Where-Object { [string]$_.status -ceq 'omitted' })
         if ($uncovered.Count -gt 0) {
             [void]$lines.Add("- Changed files whose source did NOT reach the model: " +
-                (@($uncovered | ForEach-Object { "``$([string]$_.path)`` ($([string]$_.reason))" }) -join ', '))
+                (@($uncovered | ForEach-Object {
+                        "$(Format-ReviewerCoveragePathCell -Path ([string]$_.path)) ($([string]$_.reason))"
+                    }) -join ', '))
         }
         $partial = @(@($SourceCoverage.files) | Where-Object { [string]$_.status -ceq 'partial' })
         if ($partial.Count -gt 0) {
             [void]$lines.Add("- Changed files the model saw only PART of: " +
                 (@($partial | ForEach-Object {
-                        "``$([string]$_.path)`` ($([int]$_.deliveredSpanCount) of $([int]$_.requestedSpanCount) region(s), $([string]$_.reason))"
+                        "$(Format-ReviewerCoveragePathCell -Path ([string]$_.path)) ($([int]$_.deliveredSpanCount) of $([int]$_.requestedSpanCount) region(s), $([string]$_.reason))"
                     }) -join ', '))
         }
     }

@@ -29,6 +29,10 @@
       {
         "sha256": "04d00e8e42cd0b0fc8f569f0bb51bfd8e8f74c465e2f67995be3961cdcebb69c",
         "reason": "Name partially delivered files too, with their delivered/requested region counts. A file the model saw one region of is not a file it read, and listing only fully omitted files hid that distinction from the human reading the preview."
+      },
+      {
+        "sha256": "4f5167290ad0a0e7c41a7e3fc779aebb9aff5e88381feb1f14cb03e38d22a7fb",
+        "reason": "Route coverage paths through a safe renderer. A pathRejected entry is by definition one that failed normalization, so echoing it into the preview's Markdown let a pull-request author spoof what the human reader sees."
       }
     ],
     "Invoke-ReviewerDelivery": [
