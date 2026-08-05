@@ -47,6 +47,48 @@ immediately before any gate write (below); running strictly after achieves a
 sequence up to and including cross-verification is identical *regardless of
 gate mode*.
 
+## Typed delivery authorization: raw stays PreviewOnly, the gate is the sole VerifiedMultiPass writer
+
+An independent multi-pass union (`-SecondPassModel`) is discovery-only until a
+code-defined `VerifiedMultiPass` authorization exists. **Raw two-pass delivery
+and raw `-PromotePreview` never obtain one and stay `PreviewOnly` permanently**
+- this layer does not reorder, weaken, or add an escape hatch to that rule.
+Single-pass raw delivery (`SinglePass`) is completely unaffected.
+
+This layer is the sole, code-defined producer of `VerifiedMultiPass`:
+`New-ReviewerVerifiedMultiPassAuthorization` in `Start-ReviewerAgent.ps1`,
+which is the *only* place in the script that constructs one. It is used to
+authorize exactly four write paths, and nothing else:
+
+1. gate comment/suggestion writes (`Invoke-ReviewerGateDelivery`);
+2. a gate replay of an incomplete delivery (`Invoke-ReviewerGateReplay`);
+3. `-PromoteVerifiedPreview` (`Invoke-ReviewerPromoteVerifiedPreview`);
+4. the gate's own independent approval vote (`Invoke-ReviewerGateDelivery`'s
+   approval branch), minted separately from comments, after they are
+   confirmed complete.
+
+The mint re-derives every input itself rather than trusting a caller-built
+object: it takes a **decision artifact path** (never a decision object),
+re-verifies it through `Read-ReviewerGateDecision` (HMAC domain + kind +
+binding + expiry), performs its **own** dedicated, fresh, isolated-session
+revalidation, and requires - among other things - that the *sealed* decision
+itself (never the live `-SecondPassModel`/config) records exactly two
+completed passes with the literal `claude-opus-5`/`gpt-5.6-sol` pair
+(`passesRequested`/`generalistPassModels`, part of the sealed binding). Policy,
+qualification, and CLI switches can only **narrow** what the mint is willing
+to grant - never supply positive evidence on their own - and gate mode `"off"`
+(the default) always refuses.
+
+Every grant this mint returns is bound, at mint time, to one exact
+purpose/PR/source-commit/coverage-key-set and stamped with a mint time; the
+assertion immediately before each write re-checks that binding *and* a
+code-defined maximum grant age (120 seconds), so a grant cannot be reused
+across PRs, commits, purposes, or a wider write set than it was minted for -
+live narrowing after the mint (e.g. an anchor moving out of the change set)
+causes a fresh, narrower mint rather than reusing the wider one. The grant is
+never written to a state file, artifact, or log; only its `Kind`/`Reason`
+scalars ever are.
+
 ## Enablement: three authorities, and a repository can only subtract
 
 No unattended gate behavior is reachable unless **all three** of the

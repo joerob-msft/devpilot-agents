@@ -119,6 +119,34 @@ jobs:
           # become the aggregate step result after every assertion passed.
           exit 0
 
+      - name: reviewer - PromoteVerifiedPreview is reachable regardless of the current process's pass count
+        shell: pwsh
+        run: |
+          # Opus finding 1 (blocking): -PromoteVerifiedPreview re-authorizes
+          # per its own sealed GATE artifact - it must never be gated by the
+          # startup raw-authorization check, which only ever covers raw
+          # direct delivery and raw -PromotePreview. Before the fix, a
+          # two-pass-configured process (raw authorization = PreviewOnly)
+          # threw at startup before ever reaching -PromoteVerifiedPreview,
+          # making it unreachable from the most common configuration. Proven
+          # here for both single-pass and two-pass startup configurations:
+          # -DryRun exits 0 (reaching self-checks) rather than throwing at
+          # parameter-resolution time, regardless of -SecondPassModel.
+          $scriptPath = './src/Agents/reviewer/Start-ReviewerAgent.ps1'
+          $configs = @(
+              @{ Name = 'single-pass'; Args = @('-Model', 'claude-opus-5') },
+              @{ Name = 'two-pass'; Args = @('-Model', 'claude-opus-5', '-SecondPassModel', 'gpt-5.6-sol') }
+          )
+          foreach ($config in $configs) {
+              $configArgs = [string[]]$config.Args
+              $output = & pwsh -NoProfile -File $scriptPath -DryRun `
+                  -ConfigFile ./samples/reviewer-ado.config.json @configArgs `
+                  -PromoteVerifiedPreview 'does-not-exist.json' -EnableFindingComments 2>&1 | Out-String
+              if ($LASTEXITCODE -ne 0) {
+                  throw "A $($config.Name) startup process rejected -PromoteVerifiedPreview before ever reaching it: $output"
+              }
+          }
+
       # Provider normalization, asserted against a fixture captured from a real
       # GitHub API response. Offline: no network, no host, no model.
       - name: provider self-checks

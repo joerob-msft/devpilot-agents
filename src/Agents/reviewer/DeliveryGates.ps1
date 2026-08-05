@@ -167,6 +167,11 @@ $script:ReviewerGateReasonCodes = @(
     # Monotonicity
     "promotionWouldAdd", "promotionWouldReword", "promotionWouldRaiseSeverity",
     "promotionWouldRelocate",
+    # VerifiedMultiPass mint preconditions (Test-ReviewerVerifiedMultiPassPreconditions)
+    "verificationNotStructurallyPossible", "prIdMismatch", "decisionSourceCommitMismatch",
+    "runNotOk", "runReasonCodesPresent", "verificationInputShaMissing",
+    "verificationDecisionShaMissing", "sealedPassCountBelowTwo", "revalidationFailed",
+    "coverageNotSealedSubset", "approvalCoverageMalformed", "authorizationRefused",
     # Safety net for an unrecognized string
     "unrecognizedReasonRewritten"
 )
@@ -894,7 +899,18 @@ function New-ReviewerGateDecision {
         gateLibrarySha256, gatePolicySha256, qualificationSha256,
         verificationLibrarySha256, verificationPromptSha256,
         verificationPolicySha256, verificationSchemaSha256, threadSetDigest,
-        checksSnapshotSha256, policySnapshotSha256.
+        checksSnapshotSha256, policySnapshotSha256, passesRequested,
+        generalistPassModels.
+
+        passesRequested/generalistPassModels seal how many raw generalist
+        passes this decision was actually built from and which of them
+        COMPLETED with the exact model pair - sourced by the caller from the
+        completed raw-pass artifacts, never from the caller's own live config.
+        A later verified-delivery mint reads these SEALED values (never
+        $ReviewPassModels) to decide whether this decision may ever back a
+        VerifiedMultiPass grant, so a decision sealed under a two-pass config
+        cannot be laundered through a process running with fewer configured
+        passes later.
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Binding,
@@ -915,7 +931,7 @@ function New-ReviewerGateDecision {
         "configSha256", "scriptSha256", "gateLibrarySha256", "gatePolicySha256",
         "qualificationSha256", "verificationLibrarySha256", "verificationPromptSha256",
         "verificationPolicySha256", "verificationSchemaSha256", "threadSetDigest",
-        "checksSnapshotSha256", "policySnapshotSha256"
+        "checksSnapshotSha256", "policySnapshotSha256", "passesRequested", "generalistPassModels"
     )
     foreach ($key in $bindingKeys) {
         if (-not $Binding.ContainsKey($key)) { throw "Gate decision binding is missing '$key'." }
@@ -1018,6 +1034,8 @@ function New-ReviewerGateDecision {
         threadSetDigest           = [string]$Binding.threadSetDigest
         checksSnapshotSha256      = [string]$Binding.checksSnapshotSha256
         policySnapshotSha256      = [string]$Binding.policySnapshotSha256
+        passesRequested           = [int]$Binding.passesRequested
+        generalistPassModels      = [string]$Binding.generalistPassModels
         runOk                     = [bool]$RunAccounting.Ok
         runReasonCodes            = $runReasonCodesValue
         candidates                = $candidateEntries.ToArray()
@@ -1272,6 +1290,142 @@ function Test-ReviewerGateDecisionBinding {
             }
         }
     }
+    $unique = Get-ReviewerGateUniqueReasonCodes -Reasons $reasons.ToArray()
+    if ($unique.Count -eq 0) { return [pscustomobject][ordered]@{ Ok = $true; ReasonCodes = @() } }
+    return [pscustomobject][ordered]@{ Ok = $false; ReasonCodes = $unique }
+}
+
+function Test-ReviewerVerifiedMultiPassPreconditions {
+    <#
+        Pure, no MCP: the full conjunctive precondition set a VerifiedMultiPass
+        grant must satisfy, extracted so tools/Test-DeliveryGates.ps1 can drive
+        every refusal reason directly, without a live MCP session, an on-disk
+        artifact, or a running wrapper process.
+
+        This is a REFUSAL matrix, never a positive-evidence one: every input
+        here can only ADD a reason code (never remove one another added), so
+        there is no code path by which policy, qualification, or a caller
+        argument alone can force Ok=$true - Ok is $true only when every single
+        conjunct independently holds. The caller (the wrapper's sole mint,
+        New-ReviewerVerifiedMultiPassAuthorization) is responsible for the
+        parts that cannot be pure: reading/verifying the artifact itself
+        (HMAC domain + kind), and performing the dedicated fresh revalidation
+        whose OUTCOME is passed in here as plain booleans/strings.
+
+        Returns @{ Ok; ReasonCodes }.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('gateComments', 'gateApproval', 'gatePromotion')][string]$Purpose,
+        [Parameter(Mandatory)]$Decision,
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)][string]$ExpectedSourceCommit,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$CoverageKeys,
+        [Parameter(Mandatory)][hashtable]$LiveBinding,
+        [Parameter(Mandatory)][DateTime]$NowUtc,
+        # Derived ONLY from $IsTwoPass, $EffectiveEnableVerificationPreview, the
+        # literal claude-opus-5/gpt-5.6-sol pair, and $EnableConventionSpecialist
+        # - never from gate policy (T10): the shape of what can even be
+        # ATTEMPTED must never be a function of an out-of-repo policy file.
+        [Parameter(Mandatory)][bool]$StructurallyPossible,
+        # Narrowing-only signal: gate policy mode 'off' always refuses: never a
+        # path to a POSITIVE grant, only ever a way to close one.
+        [Parameter(Mandatory)][bool]$GatePolicyIsOff,
+        [Parameter(Mandatory)][bool]$RevalidationOk,
+        [Parameter(Mandatory)][bool]$PrIsActive,
+        [Parameter(Mandatory)][bool]$PrIsDraft,
+        [Parameter(Mandatory)][bool]$SourceCommitUnchanged
+    )
+    $reasons = [System.Collections.Generic.List[string]]::new()
+    $allZero = ("0" * 64)
+
+    if (-not $StructurallyPossible) { [void]$reasons.Add("verificationNotStructurallyPossible") }
+    if ($GatePolicyIsOff) { [void]$reasons.Add("gateDisabled") }
+
+    if ([int](Get-ReviewerVerificationValue $Decision "prId" -1) -ne $PrId) { [void]$reasons.Add("prIdMismatch") }
+    if (-not [string]::Equals([string](Get-ReviewerVerificationValue $Decision "sourceCommit" ""), $ExpectedSourceCommit, [StringComparison]::OrdinalIgnoreCase)) {
+        [void]$reasons.Add("decisionSourceCommitMismatch")
+    }
+
+    if (Test-ReviewerGateDecisionExpired -Decision $Decision -NowUtc $NowUtc) { [void]$reasons.Add("decisionExpired") }
+
+    $bindingCheck = Test-ReviewerGateDecisionBinding -Decision $Decision -LiveBinding $LiveBinding
+    if (-not $bindingCheck.Ok) { foreach ($reason in @($bindingCheck.ReasonCodes)) { [void]$reasons.Add($reason) } }
+
+    if (-not [bool](Get-ReviewerVerificationValue $Decision "runOk" $false)) { [void]$reasons.Add("runNotOk") }
+    if (@(Get-ReviewerVerificationValue $Decision "runReasonCodes" @()).Count -gt 0) { [void]$reasons.Add("runReasonCodesPresent") }
+    $verificationInputSha256 = [string](Get-ReviewerVerificationValue $Decision "verificationInputSha256" "")
+    if (-not $verificationInputSha256 -or $verificationInputSha256 -ceq $allZero) { [void]$reasons.Add("verificationInputShaMissing") }
+    $verificationDecisionSha256 = [string](Get-ReviewerVerificationValue $Decision "verificationDecisionSha256" "")
+    if (-not $verificationDecisionSha256 -or $verificationDecisionSha256 -ceq $allZero) { [void]$reasons.Add("verificationDecisionShaMissing") }
+
+    # P2/T4/T5: sealed pass count and model pair, read from the DECISION's own
+    # sealed binding - never from the caller's live $ReviewPassModels/config, so
+    # a decision sealed under a two-pass config cannot be laundered through a
+    # process running fewer passes later, and a degraded/incomplete pair (only
+    # completion, not request, would miss this) always refuses.
+    if ([int](Get-ReviewerVerificationValue $Decision "passesRequested" 0) -lt 2) { [void]$reasons.Add("sealedPassCountBelowTwo") }
+    if (-not [bool](Get-ReviewerVerificationValue $Decision "generalistPairComplete" $false)) { [void]$reasons.Add("generalistPassIncomplete") }
+    $expectedModelPair = (@("claude-opus-5", "gpt-5.6-sol") | Sort-Object) -join '|'
+    if (([string](Get-ReviewerVerificationValue $Decision "generalistPassModels" "")) -cne $expectedModelPair) {
+        [void]$reasons.Add("generalistPairMismatch")
+    }
+
+    # P8: unexplored territory (an unsafe withheld reason) means the union is
+    # not fully verified - required for approval, where a false negative is
+    # unrecoverable once a human stops looking.
+    if ($Purpose -ceq "gateApproval" -and -not [bool](Get-ReviewerVerificationValue $Decision "allWithheldReasonsSafe" $false)) {
+        [void]$reasons.Add("unknownWithheldReason")
+    }
+
+    # P9: when the dedicated revalidation session itself could not read live
+    # state (RevalidationOk=$false), PrIsActive/PrIsDraft/SourceCommitUnchanged
+    # carry no real information at all - the caller has nothing live to report
+    # and any value it passes here is a placeholder, never an observation.
+    # Short-circuit to the single honest reason (revalidationFailed) rather
+    # than ALSO adding prNotActive/sourceCommitMoved fabricated from missing/
+    # placeholder data: a transient availability failure must never be
+    # reported as if it were a live fact about the PR's state.
+    if (-not $RevalidationOk) {
+        [void]$reasons.Add("revalidationFailed")
+    }
+    else {
+        if (-not $PrIsActive) { [void]$reasons.Add("prNotActive") }
+        if ($PrIsDraft) { [void]$reasons.Add("prIsDraft") }
+        if (-not $SourceCommitUnchanged) { [void]$reasons.Add("sourceCommitMoved") }
+    }
+
+    # P10: coverage can only ever be a subset of what THIS sealed decision
+    # already approved for THIS purpose - never a caller-declared set, and
+    # never widened afterward (Select-ReviewerGateSubset/remove-only narrowing
+    # is applied again, later, by the caller against LIVE eligibility; this
+    # only bounds against the SEALED candidate universe).
+    $allowedKeys = $null
+    if ($Purpose -ceq "gateComments") {
+        $allowedKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($entry in @(@(Get-ReviewerVerificationValue $Decision "unattendedComments" @()) + @(Get-ReviewerVerificationValue $Decision "unattendedSuggestions" @()))) {
+            [void]$allowedKeys.Add((Get-ReviewerGateManifestKey -Entry $entry))
+        }
+    }
+    elseif ($Purpose -ceq "gatePromotion") {
+        $allowedKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($entry in @(Get-ReviewerVerificationValue $Decision "humanPromotableComments" @())) {
+            [void]$allowedKeys.Add((Get-ReviewerGateManifestKey -Entry $entry))
+        }
+    }
+    if ($null -ne $allowedKeys) {
+        $outOfCoverage = @(@($CoverageKeys) | Where-Object { -not $allowedKeys.Contains($_) })
+        if ($outOfCoverage.Count -gt 0) { [void]$reasons.Add("coverageNotSealedSubset") }
+    }
+    elseif ($Purpose -ceq "gateApproval") {
+        # Approval coverage is not a candidate set at all - a single, fixed
+        # sentinel binding the grant to exactly one PR/commit/action, so it
+        # can never be reinterpreted as authorizing a comment write.
+        $expectedApprovalCoverage = "$PrId|$($ExpectedSourceCommit.ToLowerInvariant())|Approved"
+        if (@($CoverageKeys).Count -ne 1 -or ([string]@($CoverageKeys)[0]) -cne $expectedApprovalCoverage) {
+            [void]$reasons.Add("approvalCoverageMalformed")
+        }
+    }
+
     $unique = Get-ReviewerGateUniqueReasonCodes -Reasons $reasons.ToArray()
     if ($unique.Count -eq 0) { return [pscustomobject][ordered]@{ Ok = $true; ReasonCodes = @() } }
     return [pscustomobject][ordered]@{ Ok = $false; ReasonCodes = $unique }

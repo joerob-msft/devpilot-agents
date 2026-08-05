@@ -755,8 +755,13 @@ foreach ($property in $golden.functions.PSObject.Properties) {
     $actualText = Get-FunctionText -Text $wrapperText -Name $property.Name
     $actualText = $actualText.Replace("`r`n", "`n").Replace("`r", "`n")
     $actualHash = Get-ReviewerConventionSpecialistSha256 -Text $actualText
-    Assert-Specialist ($actualHash -ceq [string]$property.Value) `
-        "Disabled-path golden changed for generalist function '$($property.Name)' from base $($golden.baseCommit)."
+    $allowedHashes = @([string]$property.Value)
+    $authorizedDelta = $golden.authorizedFunctionDeltas.PSObject.Properties[$property.Name]
+    if ($authorizedDelta) {
+        $allowedHashes += [string]$authorizedDelta.Value.sha256
+    }
+    Assert-Specialist ($allowedHashes -ccontains $actualHash) `
+        "Disabled-path golden changed without authorization for generalist function '$($property.Name)' from base $($golden.baseCommit)."
 }
 $generalistPrompt = [IO.File]::ReadAllText(
     (Join-Path $repoRoot "src\Agents\reviewer\review-cycle.prompt.md")).Replace("`r`n", "`n").Replace("`r", "`n")

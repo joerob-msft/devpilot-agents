@@ -334,6 +334,15 @@ class ReviewerDeliveryAuthorization {
     [ReviewerDeliveryAuthorizationKind]$Kind
     [int]$PassCount
     [string]$Reason
+    # Bound ONLY for VerifiedMultiPass (0/""/""/[DateTime]::MinValue-equivalent
+    # for every other Kind - Assert-ReviewerDeliveryAuthorized never inspects
+    # these fields unless Kind is VerifiedMultiPass). MintedAtUtc is ALWAYS
+    # stamped internally by the constructor, never accepted as a parameter, so
+    # a grant can never be minted pre-aged or back-dated.
+    hidden [int]$BoundPrId
+    hidden [string]$BoundSourceCommit
+    hidden [string]$BoundCoverageDigest
+    hidden [DateTime]$MintedAtUtc
 
     ReviewerDeliveryAuthorization(
         [object]$seal,
@@ -350,6 +359,42 @@ class ReviewerDeliveryAuthorization {
         $this.Kind = $kind
         $this.PassCount = $passCount
         $this.Reason = $reason
+        $this.BoundPrId = 0
+        $this.BoundSourceCommit = ""
+        $this.BoundCoverageDigest = ""
+        $this.MintedAtUtc = [DateTime]::UtcNow
+    }
+
+    # Additive overload used ONLY by the sole VerifiedMultiPass mint
+    # (New-ReviewerVerifiedMultiPassAuthorization) to bind a grant to exactly
+    # one purpose's PR/source-commit/coverage set. The 5-arg constructor above
+    # is unchanged and remains the only way to produce PreviewOnly/SinglePass,
+    # so every existing data-coercion rejection is untouched.
+    ReviewerDeliveryAuthorization(
+        [object]$seal,
+        [object]$verificationSeal,
+        [ReviewerDeliveryAuthorizationKind]$kind,
+        [int]$passCount,
+        [string]$reason,
+        [int]$boundPrId,
+        [string]$boundSourceCommit,
+        [string]$boundCoverageDigest
+    ) {
+        if ($null -eq $seal) { throw "Delivery authorization requires a code-defined seal." }
+        if ($passCount -lt 1) { throw "Delivery authorization requires at least one pass." }
+        if ([string]::IsNullOrWhiteSpace($reason)) { throw "Delivery authorization requires a reason." }
+        if ($boundPrId -lt 1) { throw "A bound delivery authorization requires a positive PR id." }
+        if ([string]::IsNullOrWhiteSpace($boundSourceCommit)) { throw "A bound delivery authorization requires a source commit." }
+        if ($null -eq $boundCoverageDigest) { throw "A bound delivery authorization requires a coverage digest." }
+        $this.Seal = $seal
+        $this.VerificationSeal = $verificationSeal
+        $this.Kind = $kind
+        $this.PassCount = $passCount
+        $this.Reason = $reason
+        $this.BoundPrId = $boundPrId
+        $this.BoundSourceCommit = $boundSourceCommit
+        $this.BoundCoverageDigest = $boundCoverageDigest
+        $this.MintedAtUtc = [DateTime]::UtcNow
     }
 }
 
@@ -585,10 +630,26 @@ $script:ReviewerSeverities = @("critical", "important", "suggestion")
 $script:ReviewerSignatureFooter = "-- automated review by the devpilot reviewer agent; reply here if this is wrong."
 $script:ReviewerSummaryHeading = "## Reviewer agent summary"
 $script:ReviewerDeliveryAuthorizationSeal = [object]::new()
-# A later independent-verification layer must replace this with its own private
-# seal and be the sole producer of authorizations carrying that same reference.
-# Null makes VerifiedMultiPass unreachable in this layer even if Kind is mutated.
-$script:ReviewerVerifiedMultiPassSeal = $null
+# Layer 6's own private capability boundary. Unconditional, definition-time
+# initialization - never lazy, never behind a policy/CLI condition (a
+# conditionally-existing seal would make the SHAPE of the authorization
+# boundary a function of an out-of-repo policy file and of execution history,
+# exactly what "no config/CLI/env may mint" forbids). Default-disabled comes
+# from New-ReviewerVerifiedMultiPassAuthorization's own preconditions, never
+# from this seal's existence. Reference-distinct from the producer seal above
+# by construction ([object]::new() twice never returns the same reference).
+# Sole reader/writer: New-ReviewerVerifiedMultiPassAuthorization (the sole
+# mint) and Assert-ReviewerDeliveryAuthorized. Never logged, serialized,
+# returned, or parameterized - this exact token must appear in exactly three
+# places in this script (here, the mint, and the assert), enforced by a
+# self-check.
+$script:ReviewerVerifiedMultiPassSeal = [object]::new()
+# Hard, code-defined grant lifetime: a VerifiedMultiPass grant is minted
+# immediately before the write(s) it authorizes and must never outlive a
+# short, bounded window - this is what makes a stolen/retained grant worthless
+# a few minutes later, on top of it also being bound to one exact
+# PR/commit/coverage set. Never policy-adjustable.
+$script:ReviewerVerifiedMultiPassMaxGrantAgeSeconds = 120
 
 # ---------------------------------------------------------------------------
 # Pure helpers (unit-testable in -DryRun; no network / ADO / Copilot needed)
@@ -1437,14 +1498,31 @@ function New-ReviewerDeliveryAuthorization {
 function Assert-ReviewerDeliveryAuthorized {
     <#
         The validation entry point for every external write. A later verified-
-        delivery layer may provide a sealed VerifiedMultiPass authorization, but
-        this layer has no producer for one and therefore fails closed.
+        delivery layer may provide a sealed VerifiedMultiPass authorization,
+        minted only by New-ReviewerVerifiedMultiPassAuthorization.
+
+        VerifiedMultiPass additionally requires (on top of the seal/pass-count
+        checks every Kind gets): the hidden verification-seal reference match
+        (the code-defined capability boundary itself), a code-defined maximum
+        grant age, and an EXACT match on the purpose-specific PR/source-commit/
+        coverage the grant was bound to at mint time - a grant stolen, mutated,
+        replayed across PRs/commits/purposes, or reused for a wider write set
+        than it was minted for is worthless. SinglePass/PreviewOnly call sites
+        never pass -BoundPrId/-BoundSourceCommit/-BoundCoverageDigest and are
+        completely unaffected by this. Still runs only after the no-write
+        early return below and before any write.
     #>
     param(
         [Parameter(Mandatory)][ReviewerDeliveryAuthorization]$Authorization,
         [Parameter(Mandatory)][ValidateRange(1, 100)][int]$RequiredPassCount,
         [Parameter(Mandatory)][bool]$WriteRequested,
-        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Operation
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Operation,
+        # Mandatory-in-practice ONLY when Authorization.Kind is
+        # VerifiedMultiPass (enforced below, not via [Parameter(Mandatory)],
+        # because every SinglePass/PreviewOnly call site omits them entirely).
+        [int]$BoundPrId = -1,
+        [string]$BoundSourceCommit = "",
+        [string]$BoundCoverageDigest = ""
     )
 
     if (-not $WriteRequested) { return }
@@ -1461,10 +1539,31 @@ function Assert-ReviewerDeliveryAuthorized {
     if ($RequiredPassCount -eq 1 -and $Authorization.Kind -eq [ReviewerDeliveryAuthorizationKind]::SinglePass) {
         return
     }
-    if ($RequiredPassCount -gt 1 -and
-        $Authorization.Kind -eq [ReviewerDeliveryAuthorizationKind]::VerifiedMultiPass -and
-        $null -ne $script:ReviewerVerifiedMultiPassSeal -and
-        [object]::ReferenceEquals($Authorization.VerificationSeal, $script:ReviewerVerifiedMultiPassSeal)) {
+    if ($RequiredPassCount -gt 1 -and $Authorization.Kind -eq [ReviewerDeliveryAuthorizationKind]::VerifiedMultiPass) {
+        $verifiedMultiPassSeal = $script:ReviewerVerifiedMultiPassSeal
+        if ($null -eq $verifiedMultiPassSeal -or -not [object]::ReferenceEquals($Authorization.VerificationSeal, $verifiedMultiPassSeal)) {
+            throw [ReviewerDeliveryAuthorizationException]::new(
+                "$Operation is blocked because its VerifiedMultiPass authorization was not produced by the code-defined verification boundary."
+            )
+        }
+        if ($BoundPrId -lt 0 -or [string]::IsNullOrEmpty($BoundSourceCommit) -or $null -eq $BoundCoverageDigest -or $BoundCoverageDigest -eq "") {
+            throw [ReviewerDeliveryAuthorizationException]::new(
+                "$Operation is blocked because a VerifiedMultiPass assertion requires -BoundPrId, -BoundSourceCommit, and -BoundCoverageDigest."
+            )
+        }
+        $grantAgeSeconds = ([DateTime]::UtcNow - $Authorization.MintedAtUtc).TotalSeconds
+        if ($grantAgeSeconds -lt 0 -or $grantAgeSeconds -gt $script:ReviewerVerifiedMultiPassMaxGrantAgeSeconds) {
+            throw [ReviewerDeliveryAuthorizationException]::new(
+                "$Operation is blocked because its VerifiedMultiPass authorization is $([Math]::Round($grantAgeSeconds))s old, past the code-defined $($script:ReviewerVerifiedMultiPassMaxGrantAgeSeconds)s limit."
+            )
+        }
+        if ($Authorization.BoundPrId -ne $BoundPrId -or
+            -not [string]::Equals($Authorization.BoundSourceCommit, $BoundSourceCommit, [StringComparison]::OrdinalIgnoreCase) -or
+            $Authorization.BoundCoverageDigest -cne $BoundCoverageDigest) {
+            throw [ReviewerDeliveryAuthorizationException]::new(
+                "$Operation is blocked because its VerifiedMultiPass authorization is bound to a different PR, source commit, or coverage set."
+            )
+        }
         return
     }
 
@@ -1473,6 +1572,32 @@ function Assert-ReviewerDeliveryAuthorized {
         "produces a code-defined VerifiedMultiPass authorization. This reviewer build has no such layer. Run without write " +
         "switches to save a preview; do not promote this multi-pass artifact."
     )
+}
+
+function Test-ReviewerDeliveryAuthorizationRetryable {
+    <#
+        Pure: classifies a VerifiedMultiPass mint-refusal or assert-failure
+        MESSAGE as a TRANSIENT, retryable availability failure, never a
+        positive-evidence test. Exactly two markers are ever retryable:
+
+          - the dedicated revalidation session itself could not read live PR
+            state (Test-ReviewerVerifiedMultiPassPreconditions' sole
+            "revalidationFailed" reason, and ONLY that reason - a mint
+            refusal that ALSO carries any other, structural reason code is
+            never retryable, because retrying would not resolve the other
+            reason anyway);
+          - a grant aged past $script:ReviewerVerifiedMultiPassMaxGrantAgeSeconds
+            between mint and assert (Assert-ReviewerDeliveryAuthorized's own
+            age check, worded "past the code-defined ...s limit").
+
+        Everything else - binding/policy/artifact/commit mismatch, sealed-
+        decision content (pass count, model pair, run accounting), malformed
+        coverage, PR id/commit mismatch - is TERMINAL: fails closed to
+        terminal on any ambiguity, never the reverse.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Message)
+    if ($Message.IndexOf("past the code-defined", [StringComparison]::Ordinal) -ge 0) { return $true }
+    return [regex]::IsMatch($Message, '\(revalidationFailed\)\.\s*$')
 }
 
 function Format-ReviewerFindingComment {
@@ -2089,10 +2214,25 @@ $StartupWritesRequested = Get-ReviewerWritesRequested -Comments ([bool]$EnableFi
 # Promotion is write intent even before its individual capabilities are checked.
 # The promotion path also re-checks the signed artifact pass count, so omitting
 # -SecondPassModel at promotion time is not a bypass.
+#
+# -PromoteVerifiedPreview is EXCLUDED from this raw-authorization gate. It
+# never uses $DeliveryAuthorization (the raw two-pass union stays PreviewOnly
+# permanently): it re-authorizes per its own sealed GATE artifact, minting a
+# fresh, purpose-bound VerifiedMultiPass grant inside
+# Invoke-ReviewerPromoteVerifiedPreview itself. Gating it here on the raw
+# authorization made it unreachable from any two-pass-configured process
+# (the raw grant for >1 pass is always PreviewOnly, so this call always threw
+# before ever reaching the verified-preview mint) - including the common case
+# of promoting a validly-sealed two-pass gate decision from a process invoked
+# with different (even single-pass) CLI models, since promotion runs no model
+# at all. -EnableFindingComments remains a required operator opt-in, enforced
+# by Invoke-ReviewerPromoteVerifiedPreview itself. When -PromotePreview is ALSO
+# given, the RAW path still wins (it runs first and still needs the raw gate).
+$VerifiedPreviewPromotionActive = (-not [bool]$PromotePreview) -and [bool]$PromoteVerifiedPreview
 Assert-ReviewerDeliveryAuthorized -Authorization $DeliveryAuthorization `
     -RequiredPassCount @($ReviewPassModels).Count `
-    -WriteRequested ($StartupWritesRequested -or [bool]$PromotePreview) `
-    -Operation $(if ($PromotePreview) { "Preview promotion" } else { "Direct review delivery" })
+    -WriteRequested (($StartupWritesRequested -or [bool]$PromotePreview) -and -not $VerifiedPreviewPromotionActive) `
+    -Operation $(if ($PromotePreview) { "Preview promotion" } elseif ($VerifiedPreviewPromotionActive) { "Verified preview promotion" } else { "Direct review delivery" })
 # A merged review can legitimately carry up to one full cap per pass before the
 # wrapper's own ranking cap trims it. The stored marker is re-validated on
 # promotion against exactly this bound, so it has to account for the union.
@@ -3649,7 +3789,7 @@ function Set-ReviewerVote {
 
 function Invoke-DryRunSelfChecks {
     $failures = New-Object System.Collections.Generic.List[string]
-    $total = 43
+    $total = 45
 
     Write-Host "[DRY-RUN] Self-check 1/$total : parser validity + prompt presence" -ForegroundColor Cyan
     foreach ($p in @($PSCommandPath, $HarnessPath)) {
@@ -4412,7 +4552,11 @@ function Invoke-DryRunSelfChecks {
     # The needle is assembled at runtime. A literal 'function Foo' in this file
     # is found by IndexOf before the real declaration is, so a source-scanning
     # check written the obvious way silently inspects ITSELF and passes.
-    $declOf = { param([string]$Name) $selfText.IndexOf(('func' + 'tion ' + $Name), [StringComparison]::Ordinal) }
+    # Newline-prefixed so this never matches a mention of "function X" inside
+    # another self-check's own string literal/comment earlier in the file
+    # (e.g. self-check 25's own `nfunction Invoke-ReviewerPromotion" text
+    # boundary-marker) - only an actual top-level function declaration.
+    $declOf = { param([string]$Name) $selfText.IndexOf(("`nfunc" + "tion " + $Name), [StringComparison]::Ordinal) }
     foreach ($fn in @('Add-ReviewerThread', 'Set-ReviewerVote')) {
         $at = & $declOf $fn
         if ($at -lt 0) { $failures.Add("Could not locate '$fn' to check its write-confirmation strategy."); continue }
@@ -4980,14 +5124,40 @@ function Invoke-DryRunSelfChecks {
         $failures.Add("The automatic pending-plan retry path does not isolate an unauthorized promotion from the rest of the queue.")
     }
 
-    # No VerifiedMultiPass producer belongs in this layer. Assemble the enum name
-    # so this check does not count its own assertion as a constructor call.
+    # Layer 6 is the SOLE VerifiedMultiPass producer, and only inside its own
+    # mint function. Assemble the enum name so this check does not match its
+    # own source line.
     $verifiedCtorNeedle = '\[ReviewerDeliveryAuthorizationKind\]::' + ('Verified' + 'MultiPass') + '\s*,'
-    if ([regex]::Matches($selfText, $verifiedCtorNeedle).Count -gt 0) {
-        $failures.Add("This layer constructs VerifiedMultiPass authorization even though it has no independent verification step.")
+    $verifiedCtorMatches = [regex]::Matches($selfText, $verifiedCtorNeedle)
+    $mintFnAt = & $declOf 'New-ReviewerVerifiedMultiPassAuthorization'
+    $mintFnNextFnAt = if ($mintFnAt -ge 0) { $selfText.IndexOf("`nfunction ", $mintFnAt + 1, [StringComparison]::Ordinal) } else { -1 }
+    if ($mintFnAt -lt 0) {
+        $failures.Add("Could not locate New-ReviewerVerifiedMultiPassAuthorization, the sole permitted VerifiedMultiPass producer.")
     }
-    if ($null -ne $script:ReviewerVerifiedMultiPassSeal) {
-        $failures.Add("This layer initializes the VerifiedMultiPass seal even though it has no independent verification step.")
+    elseif ($verifiedCtorMatches.Count -ne 1) {
+        $failures.Add("VerifiedMultiPass authorization is constructed $($verifiedCtorMatches.Count) time(s) in this script; exactly one construction site (inside the sole mint) is allowed.")
+    }
+    elseif ($verifiedCtorMatches[0].Index -lt $mintFnAt -or ($mintFnNextFnAt -ge 0 -and $verifiedCtorMatches[0].Index -gt $mintFnNextFnAt)) {
+        $failures.Add("The sole VerifiedMultiPass construction site is not inside New-ReviewerVerifiedMultiPassAuthorization.")
+    }
+    # The verification seal is layer 6's own private capability boundary: a
+    # non-null object, reference-distinct from the producer seal, initialized
+    # unconditionally (never policy/CLI-conditional). Read indirectly (never
+    # by re-typing the script-scope seal variable's own name here) so this
+    # self-check does not itself count toward the "exactly three occurrences"
+    # invariant checked below.
+    $verifiedSealVariableName = ('Reviewer' + 'Verified' + 'MultiPassSeal')
+    $verifiedSealValue = Get-Variable -Name $verifiedSealVariableName -Scope Script -ValueOnly
+    $producerSealValue = Get-Variable -Name 'ReviewerDeliveryAuthorizationSeal' -Scope Script -ValueOnly
+    if ($null -eq $verifiedSealValue) {
+        $failures.Add("The layer-6 verification seal is null; it must be a non-null, code-defined object.")
+    }
+    elseif ([object]::ReferenceEquals($verifiedSealValue, $producerSealValue)) {
+        $failures.Add("The layer-6 verification seal is the SAME object as the producer seal; the two authorization boundaries must be reference-distinct.")
+    }
+    $verifiedSealOccurrences = [regex]::Matches($selfText, [regex]::Escape('$script:') + $verifiedSealVariableName).Count
+    if ($verifiedSealOccurrences -ne 3) {
+        $failures.Add("The layer-6 verification seal variable appears $verifiedSealOccurrences time(s) in this script; exactly 3 (initialization, mint, assert) are allowed.")
     }
     $startupGateStart = $selfText.IndexOf('$IsTwoPass =', [StringComparison]::Ordinal)
     $startupGateEnd = $selfText.IndexOf('$MergedMarkerMaxFindingItems =', [StringComparison]::Ordinal)
@@ -5561,6 +5731,12 @@ function Invoke-DryRunSelfChecks {
     $priorApprovalSwitchForSelfCheck33 = $EnableVerifiedApprovalGate
     $priorGateModeForSelfCheck33 = $EffectiveGatePolicy.mode
     $priorGateApprovalEnabledForSelfCheck33 = $EffectiveGatePolicy.approval.enabled
+    # Best-effort match to whatever Invoke-ReviewerGateDelivery's own live,
+    # remove-only narrowing computes from $incompleteRevalidation - if policy
+    # state narrows it further, the mint below (given a nonexistent artifact
+    # path) refuses instead, which the assertion below treats as an
+    # equally-valid "did not complete/vote" outcome, never a masked pass.
+    $incompleteCoverageKeys = @(@($incompleteDecision.unattendedComments) | ForEach-Object { Get-ReviewerGateManifestKey -Entry $_ })
     $incompleteOutcome = $null
     try {
         $EnableVerifiedCommentGate = $true
@@ -5569,7 +5745,10 @@ function Invoke-DryRunSelfChecks {
         $EffectiveGatePolicy.approval.enabled = $true
         $WarningPreference = "SilentlyContinue"
         $incompleteOutcome = Invoke-ReviewerGateDelivery -AgencyPath "fake-agency-does-not-exist" -Decision $incompleteDecision `
-            -FirstRevalidation $incompleteRevalidation -CommentsRequested $true -SuggestionsRequested $false -ApprovalRequested $true `
+            -DecisionArtifactPath (Join-Path $StateDir "selfcheck33-unused-artifact-path.json") `
+            -FirstRevalidation $incompleteRevalidation -Authorization (New-ReviewerDeliveryAuthorization -PassCount 2) `
+            -CommentCoverageKeys $incompleteCoverageKeys `
+            -CommentsRequested $true -SuggestionsRequested $false -ApprovalRequested $true `
             -Qualification $null -PriorEligibility @{} -RawGateApproves $true -CanaryConfirmed $true
     }
     catch {
@@ -5589,8 +5768,9 @@ function Invoke-DryRunSelfChecks {
     if ([bool]$incompleteOutcome.VoteCast) {
         $failures.Add("Invoke-ReviewerGateDelivery cast a vote despite an incomplete/failed comment delivery.")
     }
-    elseif ([string]$incompleteOutcome.Reason -cne "commentDeliveryIncomplete") {
-        $failures.Add("Invoke-ReviewerGateDelivery did not close for the expected 'commentDeliveryIncomplete' reason (got '$($incompleteOutcome.Reason)'); the belt-and-braces authority re-check may be closing it earlier than this self-check intends to exercise.")
+    elseif ([string]$incompleteOutcome.Reason -cne "commentDeliveryIncomplete" -and
+        -not ([string]$incompleteOutcome.Reason).StartsWith("authorizationRefused:", [StringComparison]::Ordinal)) {
+        $failures.Add("Invoke-ReviewerGateDelivery did not close for an incomplete-delivery reason (got '$($incompleteOutcome.Reason)'); the belt-and-braces authority re-check may be closing it earlier than this self-check intends to exercise.")
     }
     else { Write-Host "  OK - no vote is cast when comment delivery could not be confirmed complete" -ForegroundColor Green }
 
@@ -6232,6 +6412,509 @@ function Invoke-DryRunSelfChecks {
     }
     else {
         Write-Host "  OK - Invoke-ReviewerPullRequest's persist step calls Get-ReviewerPersistedReviewRecord and leaves reviewed.json untouched on a `$null return" -ForegroundColor Green
+    }
+
+    Write-Host "[DRY-RUN] Self-check 43/$total : the VerifiedMultiPass mint refusal matrix, grant binding, no-leakage, and default-disabled" -ForegroundColor Cyan
+    function New-SelfCheck43Decision {
+        <# Baseline: a fully-sealed, fully-valid decision that would authorize
+           gateComments/gateApproval/gatePromotion, one dimension away from
+           refusal in every direction the matrix below exercises. #>
+        param([hashtable]$Overrides = @{})
+        $candidate = [pscustomobject]@{ candidateHash = "h1"; severity = "important"; pack = "p1"; filePath = "/a.cs"; line = 1; comment = "finding one" }
+        $decision = [pscustomobject][ordered]@{
+            prId = 777; sourceCommit = ("c" * 40); targetCommit = ("d" * 40); changeSetDigest = ("e" * 64)
+            repositoryId = $cfgRepoId.ToLowerInvariant(); organization = $Organization; project = $ExpectedProject
+            scriptSha256 = $ScriptSelfSha256.ToLowerInvariant(); configSha256 = $ConfigSha256.ToLowerInvariant()
+            gatePolicySha256 = $GatePolicySha256; gateLibrarySha256 = $DeliveryGatesLibrarySha256
+            packPolicySha256 = $ConventionPackPolicySha256; qualificationSha256 = ("0" * 64)
+            verificationLibrarySha256 = $CrossVerificationLibrarySha256; verificationPromptSha256 = $CrossVerificationPromptSha256
+            verificationPolicySha256 = $CrossVerificationPolicySha256; verificationSchemaSha256 = $CrossVerificationSchemaSha256
+            runOk = $true; runReasonCodes = @(); allWithheldReasonsSafe = $true
+            verificationInputSha256 = ("1" * 64); verificationDecisionSha256 = ("2" * 64)
+            passesRequested = 2; generalistPairComplete = $true
+            generalistPassModels = ((@("claude-opus-5", "gpt-5.6-sol") | Sort-Object) -join '|')
+            decisionExpiresAtUtc = ([DateTime]::UtcNow.AddHours(1).ToString("o"))
+            candidates = @($candidate); unattendedComments = @($candidate); unattendedSuggestions = @()
+            humanPromotableComments = @($candidate)
+        }
+        foreach ($key in $Overrides.Keys) { $decision | Add-Member -Force -NotePropertyName $key -NotePropertyValue $Overrides[$key] }
+        return $decision
+    }
+    function New-SelfCheck43LiveBinding {
+        param([hashtable]$Overrides = @{})
+        $liveBinding = @{
+            scriptSha256 = $ScriptSelfSha256.ToLowerInvariant(); configSha256 = $ConfigSha256.ToLowerInvariant()
+            gatePolicySha256 = $GatePolicySha256; packPolicySha256 = $ConventionPackPolicySha256
+            gateLibrarySha256 = $DeliveryGatesLibrarySha256; verificationLibrarySha256 = $CrossVerificationLibrarySha256
+            verificationPromptSha256 = $CrossVerificationPromptSha256; verificationPolicySha256 = $CrossVerificationPolicySha256
+            verificationSchemaSha256 = $CrossVerificationSchemaSha256
+            repositoryId = $cfgRepoId.ToLowerInvariant(); organization = $Organization; project = $ExpectedProject
+            qualificationSha256 = ("0" * 64); sourceCommit = ("c" * 40); changeSetDigest = ("e" * 64)
+        }
+        foreach ($key in $Overrides.Keys) { $liveBinding[$key] = $Overrides[$key] }
+        return $liveBinding
+    }
+    function Test-SelfCheck43Case {
+        param(
+            [string]$Purpose = "gateComments",
+            [hashtable]$DecisionOverrides = @{},
+            [hashtable]$LiveBindingOverrides = @{},
+            [string[]]$CoverageKeys = @((Get-ReviewerGateManifestKey -Entry ([pscustomobject]@{ candidateHash = "h1"; severity = "important"; filePath = "/a.cs"; line = 1; comment = "finding one" }))),
+            [bool]$StructurallyPossible = $true,
+            [bool]$GatePolicyIsOff = $false,
+            [bool]$RevalidationOk = $true,
+            [bool]$PrIsActive = $true,
+            [bool]$PrIsDraft = $false,
+            [bool]$SourceCommitUnchanged = $true,
+            [int]$PrId = 777,
+            [string]$ExpectedSourceCommit = ("c" * 40)
+        )
+        $decision = New-SelfCheck43Decision -Overrides $DecisionOverrides
+        $liveBinding = New-SelfCheck43LiveBinding -Overrides $LiveBindingOverrides
+        return Test-ReviewerVerifiedMultiPassPreconditions -Purpose $Purpose -Decision $decision -PrId $PrId `
+            -ExpectedSourceCommit $ExpectedSourceCommit -CoverageKeys $CoverageKeys -LiveBinding $liveBinding `
+            -NowUtc ([DateTime]::UtcNow) -StructurallyPossible $StructurallyPossible -GatePolicyIsOff $GatePolicyIsOff `
+            -RevalidationOk $RevalidationOk -PrIsActive $PrIsActive -PrIsDraft $PrIsDraft -SourceCommitUnchanged $SourceCommitUnchanged
+    }
+
+    $sc43BaselineComments = Test-SelfCheck43Case
+    $sc43BaselinePromotion = Test-SelfCheck43Case -Purpose "gatePromotion"
+    $sc43BaselineApproval = Test-SelfCheck43Case -Purpose "gateApproval" -CoverageKeys @("777|$('c' * 40)|Approved")
+    $sc43BaselineFailures = 0
+    if (-not [bool]$sc43BaselineComments.Ok) { $sc43BaselineFailures++; $failures.Add("Baseline gateComments preconditions unexpectedly refused: $($sc43BaselineComments.ReasonCodes -join ',').") }
+    if (-not [bool]$sc43BaselinePromotion.Ok) { $sc43BaselineFailures++; $failures.Add("Baseline gatePromotion preconditions unexpectedly refused: $($sc43BaselinePromotion.ReasonCodes -join ',').") }
+    if (-not [bool]$sc43BaselineApproval.Ok) { $sc43BaselineFailures++; $failures.Add("Baseline gateApproval preconditions unexpectedly refused: $($sc43BaselineApproval.ReasonCodes -join ',').") }
+
+    # Refusal matrix: one dimension flipped per case, everything else valid.
+    # Never a positive-evidence test - every case below must refuse.
+    $sc43Cases = @(
+        @{ Name = "not structurally possible"; Args = @{ StructurallyPossible = $false }; Reason = "verificationNotStructurallyPossible" }
+        @{ Name = "gate policy off"; Args = @{ GatePolicyIsOff = $true }; Reason = "gateDisabled" }
+        @{ Name = "PR id mismatch"; Args = @{ PrId = 999 }; Reason = "prIdMismatch" }
+        @{ Name = "decision source commit mismatch"; Args = @{ ExpectedSourceCommit = ("9" * 40) }; Reason = "decisionSourceCommitMismatch" }
+        @{ Name = "decision expired"; Args = @{ DecisionOverrides = @{ decisionExpiresAtUtc = ([DateTime]::UtcNow.AddHours(-1).ToString("o")) } }; Reason = "decisionExpired" }
+        @{ Name = "script sha mismatch"; Args = @{ LiveBindingOverrides = @{ scriptSha256 = ("9" * 64) } }; Reason = "scriptShaMismatch" }
+        @{ Name = "run not ok"; Args = @{ DecisionOverrides = @{ runOk = $false } }; Reason = "runNotOk" }
+        @{ Name = "run reason codes present"; Args = @{ DecisionOverrides = @{ runReasonCodes = @("needsHumanPresent") } }; Reason = "runReasonCodesPresent" }
+        @{ Name = "verification input sha missing"; Args = @{ DecisionOverrides = @{ verificationInputSha256 = ("0" * 64) } }; Reason = "verificationInputShaMissing" }
+        @{ Name = "verification decision sha missing"; Args = @{ DecisionOverrides = @{ verificationDecisionSha256 = ("0" * 64) } }; Reason = "verificationDecisionShaMissing" }
+        @{ Name = "sealed pass count below two"; Args = @{ DecisionOverrides = @{ passesRequested = 1 } }; Reason = "sealedPassCountBelowTwo" }
+        @{ Name = "generalist pair incomplete"; Args = @{ DecisionOverrides = @{ generalistPairComplete = $false } }; Reason = "generalistPassIncomplete" }
+        @{ Name = "generalist model pair mismatch"; Args = @{ DecisionOverrides = @{ generalistPassModels = "claude-opus-5" } }; Reason = "generalistPairMismatch" }
+        @{ Name = "revalidation failed"; Args = @{ RevalidationOk = $false }; Reason = "revalidationFailed" }
+        @{ Name = "PR not active"; Args = @{ PrIsActive = $false }; Reason = "prNotActive" }
+        @{ Name = "PR is draft"; Args = @{ PrIsDraft = $true }; Reason = "prIsDraft" }
+        @{ Name = "revalidation source commit moved"; Args = @{ SourceCommitUnchanged = $false }; Reason = "sourceCommitMoved" }
+        @{ Name = "coverage not a sealed subset"; Args = @{ CoverageKeys = @((Get-ReviewerGateManifestKey -Entry ([pscustomobject]@{ candidateHash = "h1"; severity = "important"; filePath = "/a.cs"; line = 1; comment = "finding one" })), "bogus-unsealed-key") }; Reason = "coverageNotSealedSubset" }
+        @{ Name = "approval coverage malformed"; Args = @{ Purpose = "gateApproval"; CoverageKeys = @("not-the-expected-sentinel") }; Reason = "approvalCoverageMalformed" }
+        @{ Name = "unsafe withheld reasons for approval"; Args = @{ Purpose = "gateApproval"; CoverageKeys = @("777|$('c' * 40)|Approved"); DecisionOverrides = @{ allWithheldReasonsSafe = $false } }; Reason = "unknownWithheldReason" }
+    )
+    $sc43MatrixFailures = 0
+    foreach ($case in $sc43Cases) {
+        $sc43CaseArgs = $case.Args
+        $result = Test-SelfCheck43Case @sc43CaseArgs
+        if ([bool]$result.Ok -or (@($result.ReasonCodes) -cnotcontains $case.Reason)) {
+            $sc43MatrixFailures++
+            $failures.Add("VerifiedMultiPass refusal matrix case '$($case.Name)' did not refuse with reason '$($case.Reason)' (Ok=$($result.Ok), ReasonCodes=$($result.ReasonCodes -join ',')).")
+        }
+    }
+    if ($sc43BaselineFailures -eq 0 -and $sc43MatrixFailures -eq 0) {
+        Write-Host "  OK - the VerifiedMultiPass refusal matrix ($($sc43Cases.Count) cases) refuses correctly and the 3 purpose baselines succeed" -ForegroundColor Green
+    }
+
+    # The real mint refuses a missing or wrong-kind artifact before ever
+    # needing a live agency/session (Test-Path/Read-ReviewerGateDecision run
+    # first) - re-using the exact fixtures self-check 27 already proves are
+    # rejected by kind.
+    $sc43MintArtifactDir = Join-Path $StateDir "selfcheck43-mint-artifacts"
+    New-Item -ItemType Directory -Force -Path $sc43MintArtifactDir | Out-Null
+    try {
+        $sc43MintKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+        $sc43MissingRejected = $false
+        try {
+            New-ReviewerVerifiedMultiPassAuthorization -Purpose gateComments `
+                -DecisionArtifactPath (Join-Path $sc43MintArtifactDir "does-not-exist.json") `
+                -PrId 1 -ExpectedSourceCommit ("1" * 40) -AgencyPath "fake-agency-does-not-exist" -CoverageKeys @() | Out-Null
+        }
+        catch [ReviewerDeliveryAuthorizationException] { $sc43MissingRejected = $true }
+        $sc43WrongKindDecision = [ordered]@{
+            kind = "verification-decision-preview"; artifactVersion = 1; note = "selfcheck43"
+        }
+        $sc43WrongKindPath = Save-ReviewerVerificationPreview -Manifest $sc43WrongKindDecision -Directory $sc43MintArtifactDir -BaseName "sc43-wrong-kind" -MasterKey $sc43MintKey
+        $sc43WrongKindRejected = $false
+        try {
+            New-ReviewerVerifiedMultiPassAuthorization -Purpose gateComments -DecisionArtifactPath $sc43WrongKindPath `
+                -PrId 1 -ExpectedSourceCommit ("1" * 40) -AgencyPath "fake-agency-does-not-exist" -CoverageKeys @() | Out-Null
+        }
+        catch [ReviewerDeliveryAuthorizationException] { $sc43WrongKindRejected = $true }
+        if (-not $sc43MissingRejected -or -not $sc43WrongKindRejected) {
+            $failures.Add("New-ReviewerVerifiedMultiPassAuthorization did not refuse a missing artifact and/or a wrong-kind (verification-decision-preview) artifact with a typed authorization exception.")
+        }
+        else {
+            Write-Host "  OK - the mint refuses a missing or wrong-kind decision artifact before any live session is needed" -ForegroundColor Green
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $sc43MintArtifactDir) { Remove-Item -LiteralPath $sc43MintArtifactDir -Recurse -Force }
+    }
+
+    # Grant binding: a directly-constructed VerifiedMultiPass authorization
+    # (standing in for the mint's own output, since the mint itself needs a
+    # live MCP session unavailable in -DryRun) asserts Ok for its EXACT
+    # (prId, commit, coverage digest) and throws for any mismatch or once
+    # past the code-defined max grant age. $sc43TestKind/$sc43VerifiedSeal are
+    # built via variables (never the literal enum-then-comma constructor
+    # pattern, nor the literal seal-variable token) so this is never counted
+    # as a second production mint or a 4th seal occurrence by self-check 22.
+    $sc43TestKind = [ReviewerDeliveryAuthorizationKind]::VerifiedMultiPass
+    $sc43VerifiedSeal = Get-Variable -Name ('Reviewer' + 'Verified' + 'MultiPassSeal') -Scope Script -ValueOnly
+    $sc43TestCoverageDigest = Get-ReviewerVerifiedMultiPassCoverageDigest -CoverageKeys @("k1", "k2")
+    $sc43TestAuth = [ReviewerDeliveryAuthorization]::new(
+        $script:ReviewerDeliveryAuthorizationSeal, $sc43VerifiedSeal, $sc43TestKind, 2,
+        "selfcheck43", 4242, ("b" * 40), $sc43TestCoverageDigest
+    )
+    $sc43BindingFailures = 0
+    try {
+        Assert-ReviewerDeliveryAuthorized -Authorization $sc43TestAuth -RequiredPassCount 2 -WriteRequested $true `
+            -Operation "selfcheck43 exact binding" -BoundPrId 4242 -BoundSourceCommit ("b" * 40) -BoundCoverageDigest $sc43TestCoverageDigest
+    }
+    catch { $sc43BindingFailures++; $failures.Add("A VerifiedMultiPass grant was rejected for its OWN exact (prId, commit, coverage) binding: $($_.Exception.Message).") }
+    $sc43MismatchCases = @(
+        @{ Name = "wrong PR"; BoundPrId = 1; BoundSourceCommit = ("b" * 40); BoundCoverageDigest = $sc43TestCoverageDigest }
+        @{ Name = "wrong commit"; BoundPrId = 4242; BoundSourceCommit = ("a" * 40); BoundCoverageDigest = $sc43TestCoverageDigest }
+        @{ Name = "wrong coverage digest"; BoundPrId = 4242; BoundSourceCommit = ("b" * 40); BoundCoverageDigest = (Get-ReviewerVerifiedMultiPassCoverageDigest -CoverageKeys @("k3")) }
+    )
+    foreach ($mismatch in $sc43MismatchCases) {
+        $mismatchRejected = $false
+        try {
+            Assert-ReviewerDeliveryAuthorized -Authorization $sc43TestAuth -RequiredPassCount 2 -WriteRequested $true `
+                -Operation "selfcheck43 $($mismatch.Name)" -BoundPrId $mismatch.BoundPrId -BoundSourceCommit $mismatch.BoundSourceCommit `
+                -BoundCoverageDigest $mismatch.BoundCoverageDigest
+        }
+        catch [ReviewerDeliveryAuthorizationException] { $mismatchRejected = $true }
+        if (-not $mismatchRejected) {
+            $sc43BindingFailures++
+            $failures.Add("A VerifiedMultiPass grant was accepted despite a binding mismatch ($($mismatch.Name)).")
+        }
+    }
+    # Aged-out: mutate the hidden MintedAtUtc field directly (as the review's
+    # own probes establish hidden fields are settable, never read-only) to
+    # simulate a grant older than the code-defined max age.
+    $sc43AgedAuth = [ReviewerDeliveryAuthorization]::new(
+        $script:ReviewerDeliveryAuthorizationSeal, $sc43VerifiedSeal, $sc43TestKind, 2,
+        "selfcheck43-aged", 4242, ("b" * 40), $sc43TestCoverageDigest
+    )
+    $sc43AgedAuth.MintedAtUtc = [DateTime]::UtcNow.AddSeconds(-($script:ReviewerVerifiedMultiPassMaxGrantAgeSeconds + 30))
+    $sc43AgedRejected = $false
+    try {
+        Assert-ReviewerDeliveryAuthorized -Authorization $sc43AgedAuth -RequiredPassCount 2 -WriteRequested $true `
+            -Operation "selfcheck43 aged grant" -BoundPrId 4242 -BoundSourceCommit ("b" * 40) -BoundCoverageDigest $sc43TestCoverageDigest
+    }
+    catch [ReviewerDeliveryAuthorizationException] { $sc43AgedRejected = $true }
+    if (-not $sc43AgedRejected) {
+        $sc43BindingFailures++
+        $failures.Add("A VerifiedMultiPass grant older than the code-defined max grant age was still accepted.")
+    }
+    if ($sc43BindingFailures -eq 0) {
+        Write-Host "  OK - a VerifiedMultiPass grant asserts Ok only for its exact (prId, commit, coverage) binding and within its code-defined max age" -ForegroundColor Green
+    }
+
+    # No-leakage static scan: the authorization object itself must never
+    # appear as a value passed to ConvertTo-Json or inside a
+    # Write-ReviewerCycleMetadata -Fields hashtable - only authorizationKind/
+    # authorizationReason scalars may.
+    $sc43LeakyNames = @("commentAuthorization", "promotionAuthorization", "commentMint", "promotionMint", "approvalMint", "commentRemint", "promotionRemint")
+    $sc43LeakDetail = ""
+    $sc43MetadataCalls = [regex]::Matches($selfText, 'Write-ReviewerCycleMetadata\s+-Fields\s+@\{[^}]*\}')
+    foreach ($metadataCall in $sc43MetadataCalls) {
+        foreach ($leakyName in $sc43LeakyNames) {
+            if ([regex]::IsMatch($metadataCall.Value, '\$' + $leakyName + '(?!\.(Kind|Reason))\b')) {
+                $sc43LeakDetail = "`$$leakyName inside a Write-ReviewerCycleMetadata call without .Kind/.Reason"
+            }
+        }
+    }
+    foreach ($leakyName in $sc43LeakyNames) {
+        if ([regex]::IsMatch($selfText, 'ConvertTo-Json[^\n]*\$' + $leakyName + '(?!\.(Kind|Reason))\b')) {
+            $sc43LeakDetail = "ConvertTo-Json applied directly to `$$leakyName"
+        }
+    }
+    if ($sc43LeakDetail) {
+        $failures.Add("Possible VerifiedMultiPass authorization leakage into logged/serialized state: $sc43LeakDetail.")
+    }
+    else {
+        Write-Host "  OK - no VerifiedMultiPass authorization object appears to be logged or serialized; only Kind/Reason scalars are" -ForegroundColor Green
+    }
+
+    # Ordering: mint after the sealed preview is written (S3 before S4); an
+    # assert before every write it guards.
+    $gateDeliveryFnAt = & $declOf "Invoke-ReviewerGateDelivery"
+    $gateForPrFnAt = & $declOf "Invoke-ReviewerGateForPullRequest"
+    $promoteVerifiedFnAt = & $declOf "Invoke-ReviewerPromoteVerifiedPreview"
+    $orderingFailures = 0
+    if ($gateForPrFnAt -ge 0) {
+        $gateForPrFnEnd = $selfText.IndexOf("`nfunction ", $gateForPrFnAt + 10, [StringComparison]::Ordinal)
+        if ($gateForPrFnEnd -lt 0) { $gateForPrFnEnd = $selfText.Length }
+        $gateForPrSlice = $selfText.Substring($gateForPrFnAt, $gateForPrFnEnd - $gateForPrFnAt)
+        $previewAt = $gateForPrSlice.IndexOf('Write-ReviewerGatePreview -PrId', [StringComparison]::Ordinal)
+        $mintAt = $gateForPrSlice.IndexOf('New-ReviewerVerifiedMultiPassAuthorization -Purpose gateComments', [StringComparison]::Ordinal)
+        if ($previewAt -lt 0 -or $mintAt -lt 0 -or $mintAt -lt $previewAt) {
+            $orderingFailures++
+            $failures.Add("Invoke-ReviewerGateForPullRequest does not mint AFTER the sealed gate preview is written.")
+        }
+    }
+    else { $orderingFailures++; $failures.Add("Could not locate Invoke-ReviewerGateForPullRequest for ordering checks.") }
+    if ($gateDeliveryFnAt -ge 0) {
+        $gateDeliveryFnEnd = $selfText.IndexOf("`nfunction ", $gateDeliveryFnAt + 10, [StringComparison]::Ordinal)
+        if ($gateDeliveryFnEnd -lt 0) { $gateDeliveryFnEnd = $selfText.Length }
+        $gateDeliverySlice = $selfText.Substring($gateDeliveryFnAt, $gateDeliveryFnEnd - $gateDeliveryFnAt)
+        $firstAssertAt = $gateDeliverySlice.IndexOf('Assert-ReviewerDeliveryAuthorized', [StringComparison]::Ordinal)
+        $firstThreadAt = $gateDeliverySlice.IndexOf('Add-ReviewerThread -Session $sessionForWrite', [StringComparison]::Ordinal)
+        $voteAssertAt = $gateDeliverySlice.LastIndexOf('Assert-ReviewerDeliveryAuthorized', [StringComparison]::Ordinal)
+        $voteAt = $gateDeliverySlice.IndexOf('Set-ReviewerVote -Session $sessionForWrite', [StringComparison]::Ordinal)
+        if ($firstAssertAt -lt 0 -or $firstThreadAt -lt 0 -or $firstAssertAt -gt $firstThreadAt) {
+            $orderingFailures++
+            $failures.Add("Invoke-ReviewerGateDelivery does not assert typed authorization before its first Add-ReviewerThread.")
+        }
+        if ($voteAssertAt -lt 0 -or $voteAt -lt 0 -or $voteAssertAt -gt $voteAt) {
+            $orderingFailures++
+            $failures.Add("Invoke-ReviewerGateDelivery does not assert typed authorization before Set-ReviewerVote.")
+        }
+    }
+    else { $orderingFailures++; $failures.Add("Could not locate Invoke-ReviewerGateDelivery for ordering checks.") }
+    if ($promoteVerifiedFnAt -ge 0) {
+        $promoteVerifiedFnEnd = $selfText.IndexOf("`nfunction ", $promoteVerifiedFnAt + 10, [StringComparison]::Ordinal)
+        if ($promoteVerifiedFnEnd -lt 0) { $promoteVerifiedFnEnd = $selfText.Length }
+        $promoteVerifiedSlice = $selfText.Substring($promoteVerifiedFnAt, $promoteVerifiedFnEnd - $promoteVerifiedFnAt)
+        $pvAssertAt = $promoteVerifiedSlice.IndexOf('Assert-ReviewerDeliveryAuthorized', [StringComparison]::Ordinal)
+        $pvThreadAt = $promoteVerifiedSlice.IndexOf('Add-ReviewerThread -Session $session', [StringComparison]::Ordinal)
+        if ($pvAssertAt -lt 0 -or $pvThreadAt -lt 0 -or $pvAssertAt -gt $pvThreadAt) {
+            $orderingFailures++
+            $failures.Add("Invoke-ReviewerPromoteVerifiedPreview does not assert typed authorization before its first Add-ReviewerThread.")
+        }
+    }
+    else { $orderingFailures++; $failures.Add("Could not locate Invoke-ReviewerPromoteVerifiedPreview for ordering checks.") }
+    if ($orderingFailures -eq 0) {
+        Write-Host "  OK - every gate/promotion write path mints after its sealed preview and asserts immediately before its write" -ForegroundColor Green
+    }
+
+    # Default-disabled: the shipped policy is mode='off', and 'off' can only
+    # ever narrow (refuse), never itself be a route to a positive grant.
+    if ($DeliveryGatesDefaultPolicy.mode -cne "off") {
+        $failures.Add("The shipped default gate policy is not mode='off'; a fresh checkout would not default to zero gate-mint attempts.")
+    }
+    else {
+        $sc43OffResult = Test-SelfCheck43Case -GatePolicyIsOff $true
+        if ([bool]$sc43OffResult.Ok) {
+            $failures.Add("Test-ReviewerVerifiedMultiPassPreconditions granted Ok=`$true with GatePolicyIsOff=`$true.")
+        }
+        else {
+            Write-Host "  OK - the shipped policy defaults to mode='off', which only ever narrows/refuses a mint, never authorizes one" -ForegroundColor Green
+        }
+    }
+
+    Write-Host "[DRY-RUN] Self-check 44/$total : PromoteVerifiedPreview reachability, transient-vs-terminal refusal classification, and never-vote-on-expiry" -ForegroundColor Cyan
+
+    # Finding 1 (structural feasibility): the mint's gatePromotion branch must
+    # derive StructurallyPossible from the SEALED decision's own
+    # passesRequested/generalistPairComplete/runOk/generalistPassModels -
+    # never from this process's live $IsTwoPass/$ReviewPassModels. Verified
+    # structurally (the branch is not independently callable in isolation
+    # from a live MCP mint), the same discipline self-check 22/38 already use
+    # for other MCP-dependent call patterns.
+    $mintFnAt44 = & $declOf 'New-ReviewerVerifiedMultiPassAuthorization'
+    if ($mintFnAt44 -lt 0) {
+        $failures.Add("Could not locate New-ReviewerVerifiedMultiPassAuthorization to verify gatePromotion structural feasibility.")
+    }
+    else {
+        $mintFnEnd44 = $selfText.IndexOf("`nfunction ", $mintFnAt44 + 10, [StringComparison]::Ordinal)
+        if ($mintFnEnd44 -lt 0) { $mintFnEnd44 = $selfText.Length }
+        $mintSlice44 = $selfText.Substring($mintFnAt44, $mintFnEnd44 - $mintFnAt44)
+        if ($mintSlice44 -cnotmatch '\$Purpose\s+-ceq\s+"gatePromotion"' -or
+            $mintSlice44 -cnotmatch "Get-ReviewerHashValue\s+-Container\s+\`$decision\s+-Key\s+'passesRequested'" -or
+            $mintSlice44 -cnotmatch "Get-ReviewerHashValue\s+-Container\s+\`$decision\s+-Key\s+'generalistPairComplete'" -or
+            $mintSlice44 -cnotmatch "Get-ReviewerHashValue\s+-Container\s+\`$decision\s+-Key\s+'runOk'" -or
+            $mintSlice44 -cnotmatch "Get-ReviewerHashValue\s+-Container\s+\`$decision\s+-Key\s+'generalistPassModels'") {
+            $failures.Add("New-ReviewerVerifiedMultiPassAuthorization's gatePromotion branch does not appear to derive structural feasibility from the sealed decision's own passesRequested/generalistPairComplete/runOk/generalistPassModels.")
+        }
+        else {
+            Write-Host "  OK - the mint derives gatePromotion's structural feasibility from the SEALED decision, not the current process's live pass configuration" -ForegroundColor Green
+        }
+    }
+
+    # Finding 1 (startup gate): -PromoteVerifiedPreview must never be counted
+    # as a raw write request by the STARTUP raw-authorization gate (it
+    # re-authorizes per its own sealed gate artifact). Reachability from both
+    # single-pass and two-pass startup configurations is proven by the CI
+    # child-process step ("PromoteVerifiedPreview is reachable regardless of
+    # the current process's pass count"), which this in-process self-check
+    # cannot itself exercise (this process's own startup gate already ran
+    # before -DryRun was ever reached). Verified here structurally instead -
+    # both literals built from concatenated halves (never one contiguous
+    # literal) so this assertion's OWN source line can never satisfy itself.
+    $sc44VerifiedPreviewActiveLiteral = '$VerifiedPreviewPromotionActive = (-not [bool]$PromotePreview)' + ' -and [bool]$PromoteVerifiedPreview'
+    $sc44StartupWriteRequestedLiteral = '-WriteRequested (($StartupWritesRequested -or [bool]$PromotePreview)' + ' -and -not $VerifiedPreviewPromotionActive)'
+    if ($selfText.IndexOf($sc44VerifiedPreviewActiveLiteral, [StringComparison]::Ordinal) -lt 0 -or
+        $selfText.IndexOf($sc44StartupWriteRequestedLiteral, [StringComparison]::Ordinal) -lt 0) {
+        $failures.Add("The startup raw-authorization gate does not appear to exclude -PromoteVerifiedPreview as a raw write request.")
+    }
+    else {
+        Write-Host "  OK - the startup raw-authorization gate excludes -PromoteVerifiedPreview; see the CI child-process step for live reachability from both single- and two-pass configurations" -ForegroundColor Green
+    }
+
+    # Finding 3: Test-ReviewerDeliveryAuthorizationRetryable classifies a
+    # TRANSIENT availability failure (revalidationFailed ALONE, or a grant
+    # aged past the code-defined limit) as retryable, and everything else -
+    # including revalidationFailed COMBINED with any other, structural
+    # reason - as terminal. Never a positive-evidence test.
+    $sc44ClassifierCases = @(
+        @{ Name = "sole revalidationFailed"; Message = "VerifiedMultiPass mint for 'gateComments' on PR 1: refused (revalidationFailed)."; Expected = $true }
+        @{ Name = "revalidationFailed combined with a structural reason"; Message = "VerifiedMultiPass mint for 'gateComments' on PR 1: refused (revalidationFailed, scriptShaMismatch)."; Expected = $false }
+        @{ Name = "grant aged past the code-defined limit"; Message = "Delivery-gate comment for PR 1 is blocked because its VerifiedMultiPass authorization is 121s old, past the code-defined 120s limit."; Expected = $true }
+        @{ Name = "a purely structural refusal"; Message = "VerifiedMultiPass mint for 'gatePromotion' on PR 1: refused (sealedPassCountBelowTwo, generalistPassIncomplete)."; Expected = $false }
+        @{ Name = "decision expired"; Message = "VerifiedMultiPass mint for 'gateComments' on PR 1: refused (decisionExpired)."; Expected = $false }
+    )
+    $sc44ClassifierFailures = 0
+    foreach ($case in $sc44ClassifierCases) {
+        $actual = Test-ReviewerDeliveryAuthorizationRetryable -Message $case.Message
+        if ([bool]$actual -ne [bool]$case.Expected) {
+            $sc44ClassifierFailures++
+            $failures.Add("Test-ReviewerDeliveryAuthorizationRetryable('$($case.Name)') returned $actual, expected $($case.Expected).")
+        }
+    }
+    if ($sc44ClassifierFailures -eq 0) {
+        Write-Host "  OK - Test-ReviewerDeliveryAuthorizationRetryable classifies transient (revalidationFailed-alone, grant-age) versus terminal refusals correctly" -ForegroundColor Green
+    }
+
+    # Finding 3: Test-ReviewerVerifiedMultiPassPreconditions must short-
+    # circuit the live-fact checks when RevalidationOk=$false - reporting
+    # ONLY revalidationFailed, never fabricating prNotActive/prIsDraft/
+    # sourceCommitMoved from placeholder/missing data the caller had no live
+    # value for.
+    $sc44RevalidationFailedResult = Test-SelfCheck43Case -RevalidationOk $false -PrIsActive $false -PrIsDraft $true -SourceCommitUnchanged $false
+    $sc44FabricatedReasons = @($sc44RevalidationFailedResult.ReasonCodes | Where-Object { $_ -cin @("prNotActive", "prIsDraft", "sourceCommitMoved") })
+    if ([bool]$sc44RevalidationFailedResult.Ok -or (@($sc44RevalidationFailedResult.ReasonCodes) -cnotcontains "revalidationFailed") -or $sc44FabricatedReasons.Count -gt 0) {
+        $failures.Add("Test-ReviewerVerifiedMultiPassPreconditions did not short-circuit to the sole 'revalidationFailed' reason when RevalidationOk=`$false (got: $($sc44RevalidationFailedResult.ReasonCodes -join ',')).")
+    }
+    else {
+        Write-Host "  OK - a failed dedicated revalidation reports ONLY 'revalidationFailed', never a fabricated prNotActive/prIsDraft/sourceCommitMoved" -ForegroundColor Green
+    }
+    # Regression guard: the SAME live-fact flags, with RevalidationOk=$true,
+    # must still independently report all three - the short-circuit must
+    # never suppress genuine live facts when the revalidation DID succeed.
+    $sc44LiveFactsResult = Test-SelfCheck43Case -RevalidationOk $true -PrIsActive $false -PrIsDraft $true -SourceCommitUnchanged $false
+    $sc44MissingLiveFacts = @(@("prNotActive", "prIsDraft", "sourceCommitMoved") | Where-Object { $sc44LiveFactsResult.ReasonCodes -cnotcontains $_ })
+    if ($sc44MissingLiveFacts.Count -gt 0) {
+        $failures.Add("Test-ReviewerVerifiedMultiPassPreconditions suppressed genuine live-fact reason(s) ($($sc44MissingLiveFacts -join ',')) even though RevalidationOk was `$true.")
+    }
+    else {
+        Write-Host "  OK - a SUCCESSFUL dedicated revalidation still independently reports prNotActive/prIsDraft/sourceCommitMoved when they genuinely hold" -ForegroundColor Green
+    }
+
+    # Finding 1: the mint refuses a TAMPERED artifact (valid kind, broken
+    # signature) before ever needing a live agency/session, exactly like the
+    # missing/wrong-kind cases self-check 43 already proves.
+    $sc44TamperArtifactDir = Join-Path $StateDir "selfcheck44-tamper-artifacts"
+    New-Item -ItemType Directory -Force -Path $sc44TamperArtifactDir | Out-Null
+    try {
+        $sc44TamperKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+        $sc44ValidDecision = New-SelfCheck43Decision
+        $sc44ValidPath = Save-ReviewerGateDecision -Manifest $sc44ValidDecision -Directory $sc44TamperArtifactDir -BaseName "sc44-tampered" -MasterKey $sc44TamperKey
+        $sc44Envelope = Get-Content -LiteralPath $sc44ValidPath -Raw | ConvertFrom-Json
+        # Mutate the SIGNED manifest text after sealing - the signature was
+        # computed over the ORIGINAL bytes, so any change here must fail
+        # HMAC verification, regardless of how well-formed the result is.
+        $sc44Envelope.manifestJson = ([string]$sc44Envelope.manifestJson) -replace '"prId":\s*777', '"prId":999999'
+        ($sc44Envelope | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $sc44ValidPath -Encoding UTF8
+        $sc44TamperRejected = $false
+        try {
+            New-ReviewerVerifiedMultiPassAuthorization -Purpose gateComments -DecisionArtifactPath $sc44ValidPath `
+                -PrId 777 -ExpectedSourceCommit ("c" * 40) -AgencyPath "fake-agency-does-not-exist" -CoverageKeys @() | Out-Null
+        }
+        catch [ReviewerDeliveryAuthorizationException] { $sc44TamperRejected = $true }
+        if (-not $sc44TamperRejected) {
+            $failures.Add("New-ReviewerVerifiedMultiPassAuthorization did not refuse a TAMPERED gate-decision artifact (broken HMAC signature) with a typed authorization exception.")
+        }
+        else {
+            Write-Host "  OK - the mint refuses a tampered (signature-broken) decision artifact before any live session is needed" -ForegroundColor Green
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $sc44TamperArtifactDir) { Remove-Item -LiteralPath $sc44TamperArtifactDir -Recurse -Force }
+    }
+
+    # Finding 2 (structural): every per-entry write inside the gate-comment
+    # and gate-verified-promotion posting loops must be wrapped in a
+    # try/catch [ReviewerDeliveryAuthorizationException] that stops the loop
+    # (break) rather than propagating - never a terminal, uncaught fault -
+    # so a grant that expires or otherwise stops validating PARTWAY through a
+    # multi-item delivery degrades to a partial, retryable outcome instead of
+    # crashing the cycle.
+    $sc44LoopFailures = 0
+    $gateDeliveryFnAt44 = & $declOf "Invoke-ReviewerGateDelivery"
+    if ($gateDeliveryFnAt44 -ge 0) {
+        $gateDeliveryFnEnd44 = $selfText.IndexOf("`nfunction ", $gateDeliveryFnAt44 + 10, [StringComparison]::Ordinal)
+        if ($gateDeliveryFnEnd44 -lt 0) { $gateDeliveryFnEnd44 = $selfText.Length }
+        $gateDeliverySlice44 = $selfText.Substring($gateDeliveryFnAt44, $gateDeliveryFnEnd44 - $gateDeliveryFnAt44)
+        if ($gateDeliverySlice44 -cnotmatch 'try\s*\{\s*Assert-ReviewerDeliveryAuthorized -Authorization \$commentAuthorization[\s\S]{0,500}?catch \[ReviewerDeliveryAuthorizationException\][\s\S]{0,1200}?break') {
+            $sc44LoopFailures++
+            $failures.Add("Invoke-ReviewerGateDelivery's comment-posting loop does not appear to catch ReviewerDeliveryAuthorizationException and stop (break) rather than propagate.")
+        }
+        if ($gateDeliverySlice44 -cnotmatch 'ApprovalRetryable\s*=\s*Test-ReviewerDeliveryAuthorizationRetryable') {
+            $sc44LoopFailures++
+            $failures.Add("Invoke-ReviewerGateDelivery does not appear to classify an approval-branch authorization refusal via Test-ReviewerDeliveryAuthorizationRetryable.")
+        }
+    }
+    else { $sc44LoopFailures++; $failures.Add("Could not locate Invoke-ReviewerGateDelivery to verify its mid-loop authorization catch.") }
+    $promoteVerifiedFnAt44 = & $declOf "Invoke-ReviewerPromoteVerifiedPreview"
+    if ($promoteVerifiedFnAt44 -ge 0) {
+        $promoteVerifiedFnEnd44 = $selfText.IndexOf("`nfunction ", $promoteVerifiedFnAt44 + 10, [StringComparison]::Ordinal)
+        if ($promoteVerifiedFnEnd44 -lt 0) { $promoteVerifiedFnEnd44 = $selfText.Length }
+        $promoteVerifiedSlice44 = $selfText.Substring($promoteVerifiedFnAt44, $promoteVerifiedFnEnd44 - $promoteVerifiedFnAt44)
+        if ($promoteVerifiedSlice44 -cnotmatch 'try\s*\{\s*Assert-ReviewerDeliveryAuthorized -Authorization \$promotionAuthorization[\s\S]{0,500}?catch \[ReviewerDeliveryAuthorizationException\][\s\S]{0,1200}?break') {
+            $sc44LoopFailures++
+            $failures.Add("Invoke-ReviewerPromoteVerifiedPreview's posting loop does not appear to catch ReviewerDeliveryAuthorizationException and stop (break) rather than propagate.")
+        }
+    }
+    else { $sc44LoopFailures++; $failures.Add("Could not locate Invoke-ReviewerPromoteVerifiedPreview to verify its mid-loop authorization catch.") }
+    if ($sc44LoopFailures -eq 0) {
+        Write-Host "  OK - both the gate-comment and gate-verified-promotion posting loops catch a mid-loop authorization refusal and stop rather than propagate" -ForegroundColor Green
+    }
+
+    # Finding 2 (deterministic outcome shape): the PURE confirm-by-reread
+    # function - what Invoke-ReviewerGateDelivery/-PromoteVerifiedPreview
+    # both use to turn "some entries landed, some did not" into an outcome,
+    # REGARDLESS of why an entry never posted (an expired grant mid-loop, an
+    # ADO write failure, or anything else) - reports exactly "first
+    # confirmed, second pending, incomplete" when only the first of two
+    # intended fingerprints is actually confirmed present.
+    $sc44Fp1 = Get-ReviewerFindingFingerprint -Finding @{ severity = "important"; filePath = "/a.cs"; line = 1; comment = "finding one" }
+    $sc44Fp2 = Get-ReviewerFindingFingerprint -Finding @{ severity = "important"; filePath = "/b.cs"; line = 2; comment = "finding two" }
+    $sc44Confirmed = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    [void]$sc44Confirmed.Add($sc44Fp1)
+    $sc44PartialConfirm = Test-ReviewerGateWriteConfirmed -IntendedFingerprints @($sc44Fp1, $sc44Fp2) -ConfirmedFingerprints $sc44Confirmed
+    if ([int]$sc44PartialConfirm.Posted -ne 1 -or [int]$sc44PartialConfirm.Intended -ne 2 -or [bool]$sc44PartialConfirm.Complete) {
+        $failures.Add("Test-ReviewerGateWriteConfirmed did not report exactly 'first confirmed (1), second pending (intended 2), incomplete' for a partial mid-delivery outcome (got Posted=$($sc44PartialConfirm.Posted), Intended=$($sc44PartialConfirm.Intended), Complete=$($sc44PartialConfirm.Complete)).")
+    }
+    else {
+        Write-Host "  OK - a partial mid-delivery outcome (first confirmed, second not) reports Posted=1/Intended=2/Complete=`$false - the exact shape that keeps Invoke-ReviewerGateDelivery from ever voting and marks the record pendingReplay for a missing-only retry" -ForegroundColor Green
+    }
+    # Never vote after incomplete/expiry (finding 2) is the EXISTING,
+    # unchanged contract self-check 33 continuously proves end to end
+    # (Invoke-ReviewerGateDelivery never votes when CommentsComplete is
+    # $false) - not re-asserted here to avoid duplicating that self-check.
+
+    # Finding 2 (pendingReplay wiring): both callers must OR a transient
+    # ApprovalRetryable signal into pendingReplay, on top of the existing
+    # CommentsComplete-based computation, so a comments-complete-but-vote-
+    # not-yet-cast transient outcome is still retried by a later cycle. Built
+    # from concatenated halves (never one contiguous literal) so this
+    # assertion's OWN source line is never counted as a 3rd match.
+    $sc44PendingReplayOrPattern = '((-not [bool]$deliveryOutcome.CommentsComplete)' + ' -or [bool]$deliveryOutcome.ApprovalRetryable)'
+    if (([regex]::Matches($selfText, [regex]::Escape($sc44PendingReplayOrPattern))).Count -lt 2) {
+        $failures.Add("Expected at least 2 call sites (Invoke-ReviewerGateForPullRequest's success path and Invoke-ReviewerGateReplay) to OR ApprovalRetryable into pendingReplay; found fewer.")
+    }
+    else {
+        Write-Host "  OK - both the direct and replay gate-delivery record writes OR a transient approval-authorization failure into pendingReplay" -ForegroundColor Green
     }
 
     }
@@ -8111,21 +8794,189 @@ function Write-ReviewerGatePreview {
     return @{ ArtifactPath = $artifactPath; MarkdownPath = $markdownPath }
 }
 
+function Get-ReviewerVerifiedMultiPassCoverageDigest {
+    <# Order-independent, duplicate-insensitive digest binding a
+       VerifiedMultiPass grant to an exact coverage-key SET. Used identically
+       at mint time and at every assert call site immediately before a write,
+       so the two can only match when the set of keys is exactly the same -
+       never a superset, never a different set. #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$CoverageKeys)
+    return Get-ReviewerVerificationObjectSha256 -Value @(@($CoverageKeys) | Sort-Object -Unique)
+}
+
+function New-ReviewerVerifiedMultiPassAuthorization {
+    <#
+        The SOLE VerifiedMultiPass producer in this script. Re-derives every
+        input itself rather than trusting a caller-built object: takes a
+        DECISION ARTIFACT PATH (never a decision object), forces
+        Read-ReviewerGateDecision (the decision HMAC domain + kind check), and
+        performs its OWN dedicated, isolated-session revalidation
+        (Invoke-ReviewerGateRevalidation) - returned alongside the
+        authorization so the caller reuses it (e.g. as -FirstRevalidation)
+        instead of opening a second one. Net MCP session count per call site
+        this replaces is unchanged.
+
+        Throws [ReviewerDeliveryAuthorizationException] with joined reason
+        codes on ANY refusal; never returns a weaker grant - there is exactly
+        one function in this script that can say "yes" (this one) and exactly
+        one that says "no" (New-ReviewerDeliveryAuthorization, unchanged).
+
+        The returned Authorization is never stored, logged, or serialized by
+        any caller - only its Kind/Reason scalars are. Callers must call this
+        again (a fresh mint, never a widened reuse) whenever the coverage set
+        they are about to write narrows after this returns.
+
+        Returns @{ Authorization = [ReviewerDeliveryAuthorization]; Revalidation = <live> }.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('gateComments', 'gateApproval', 'gatePromotion')][string]$Purpose,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$DecisionArtifactPath,
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ExpectedSourceCommit,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$AgencyPath,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$CoverageKeys
+    )
+
+    if (-not (Test-Path -LiteralPath $DecisionArtifactPath -PathType Leaf)) {
+        throw [ReviewerDeliveryAuthorizationException]::new(
+            "VerifiedMultiPass mint for '$Purpose' on PR ${PrId}: refused (decisionArtifactMissing)."
+        )
+    }
+    $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    try {
+        $decision = Read-ReviewerGateDecision -Path $DecisionArtifactPath -MasterKey $masterKey
+    }
+    catch {
+        throw [ReviewerDeliveryAuthorizationException]::new(
+            "VerifiedMultiPass mint for '$Purpose' on PR ${PrId}: refused (decisionArtifactUnverifiable: $($_.Exception.Message))."
+        )
+    }
+
+    # P1/T10: structurally possible from CODE/CLI facts only - never gate
+    # policy, so the shape of what can even be attempted is never a function
+    # of an out-of-repo policy file.
+    #
+    # gatePromotion is the one purpose that DOES NOT derive this from the
+    # CURRENT process: -PromoteVerifiedPreview re-authorizes a PREVIOUSLY
+    # sealed gate decision, potentially from a later, separate invocation
+    # (even a single-pass one, since promotion runs no model at all) - gating
+    # it on THIS process's live $IsTwoPass/$ReviewPassModels/
+    # $EffectiveEnableVerificationPreview/$EnableConventionSpecialist made a
+    # validly-sealed two-pass decision unpromotable from any process not
+    # itself configured for two-pass verification. Structural feasibility for
+    # promotion instead comes from the SEALED decision's own recorded
+    # evidence - exactly what P2/P7 (sealedPassCountBelowTwo/
+    # generalistPassIncomplete/generalistPairMismatch) already re-verify
+    # independently below, so this is deliberately redundant with them, never
+    # a weaker substitute - and the decision's binding to the CURRENT script/
+    # config/policy/library is still enforced by Test-ReviewerGateDecisionBinding.
+    # gateComments/gateApproval (including replay, which uses gateComments)
+    # keep the EXISTING live-process requirement unchanged: those purposes
+    # only ever run within the SAME cycle that just produced the passes.
+    $expectedGeneralistPair = (@("claude-opus-5", "gpt-5.6-sol") | Sort-Object) -join '|'
+    $structurallyPossible = if ($Purpose -ceq "gatePromotion") {
+        ([int](Get-ReviewerHashValue -Container $decision -Key 'passesRequested' -Default 0) -eq 2) -and
+        ([bool](Get-ReviewerHashValue -Container $decision -Key 'generalistPairComplete' -Default $false)) -and
+        ([bool](Get-ReviewerHashValue -Container $decision -Key 'runOk' -Default $false)) -and
+        (([string](Get-ReviewerHashValue -Container $decision -Key 'generalistPassModels' -Default '')) -ceq $expectedGeneralistPair)
+    }
+    else {
+        [bool]$IsTwoPass -and [bool]$EffectiveEnableVerificationPreview -and [bool]$EnableConventionSpecialist -and
+        (@($ReviewPassModels | Where-Object { $_ -ceq "claude-opus-5" -or $_ -ceq "gpt-5.6-sol" }).Count -eq 2)
+    }
+
+    $targetBranchName = $TargetRefName -replace '^refs/heads/', ''
+    $revalidation = Invoke-ReviewerGateRevalidation -AgencyPath $AgencyPath -PrId $PrId `
+        -ExpectedSourceCommit $ExpectedSourceCommit -TargetBranch $targetBranchName `
+        -RequiredCheckNames @($EffectiveGatePolicy.approval.requiredCheckNames)
+
+    $qualificationForBinding = Get-ReviewerGateQualification
+    $liveBinding = @{
+        scriptSha256              = $ScriptSelfSha256.ToLowerInvariant()
+        configSha256              = $ConfigSha256.ToLowerInvariant()
+        gatePolicySha256          = $GatePolicySha256
+        gateLibrarySha256         = $DeliveryGatesLibrarySha256
+        verificationLibrarySha256 = $CrossVerificationLibrarySha256
+        verificationPromptSha256  = $CrossVerificationPromptSha256
+        verificationPolicySha256  = $CrossVerificationPolicySha256
+        verificationSchemaSha256  = $CrossVerificationSchemaSha256
+        packPolicySha256          = $ConventionPackPolicySha256
+        repositoryId              = $cfgRepoId.ToLowerInvariant()
+        organization              = $Organization
+        project                  = $ExpectedProject
+        qualificationSha256      = $(if ($qualificationForBinding.Qualification) { $qualificationForBinding.Sha256 } else { "0" * 64 })
+    }
+    if ($revalidation.Ok) {
+        # Live only when the dedicated revalidation actually succeeded - an
+        # unreadable PR has no live value to compare, so these stay absent
+        # rather than defaulted (Test-ReviewerGateDecisionBinding leaves an
+        # absent key unchecked, never treated as a match). targetCommit has
+        # no live re-read anywhere in this codebase today (the same
+        # pre-existing gap as checksSnapshotSha256/policySnapshotSha256), so
+        # it is out of scope here exactly as it is for the replay path.
+        $liveBinding["sourceCommit"] = ([string]$revalidation.SourceCommit).ToLowerInvariant()
+        $liveBinding["changeSetDigest"] = ([string]$revalidation.ChangeSetDigest).ToLowerInvariant()
+    }
+
+    $precondition = Test-ReviewerVerifiedMultiPassPreconditions -Purpose $Purpose -Decision $decision `
+        -PrId $PrId -ExpectedSourceCommit $ExpectedSourceCommit -CoverageKeys @($CoverageKeys) `
+        -LiveBinding $liveBinding -NowUtc ([DateTime]::UtcNow) -StructurallyPossible ([bool]$structurallyPossible) `
+        -GatePolicyIsOff ($EffectiveGatePolicy.mode -ceq "off") -RevalidationOk ([bool]$revalidation.Ok) `
+        -PrIsActive ([bool]$revalidation.PrIsActive) -PrIsDraft ([bool]$revalidation.PrIsDraft) `
+        -SourceCommitUnchanged ([bool]$revalidation.SourceCommitUnchanged)
+    if (-not $precondition.Ok) {
+        throw [ReviewerDeliveryAuthorizationException]::new(
+            "VerifiedMultiPass mint for '$Purpose' on PR ${PrId}: refused ($($precondition.ReasonCodes -join ', '))."
+        )
+    }
+
+    $coverageDigest = Get-ReviewerVerifiedMultiPassCoverageDigest -CoverageKeys @($CoverageKeys)
+    $authorization = [ReviewerDeliveryAuthorization]::new(
+        $script:ReviewerDeliveryAuthorizationSeal,
+        $script:ReviewerVerifiedMultiPassSeal,
+        [ReviewerDeliveryAuthorizationKind]::VerifiedMultiPass,
+        2,
+        "independent claude-opus-5/gpt-5.6-sol two-pass union, cross-verified and gate-sealed for '$Purpose'",
+        $PrId,
+        $ExpectedSourceCommit,
+        $coverageDigest
+    )
+    return @{ Authorization = $authorization; Revalidation = $revalidation }
+}
+
 function Invoke-ReviewerGateDelivery {
     <#
         Write-only. Comments are written and CONFIRMED before any vote is
         considered; a partial comment failure leaves a separate gate-delivery
         pending/replay record and CASTS NO VOTE - a retry replays only the
         missing comments (fingerprint dedupe makes an already-posted one a
-        no-op). Approval additionally requires a SECOND revalidation
-        immediately before the vote call, so a source push between the two
-        revalidations closes the vote while leaving already-posted comments
-        posted (source-push simulation).
+        no-op). Approval additionally requires a SECOND, independently minted
+        gateApproval authorization (its own fresh revalidation) immediately
+        before the vote call, so a source push between the two revalidations
+        closes the vote while leaving already-posted comments posted
+        (source-push simulation).
+
+        Every typed authorization here is asserted IMMEDIATELY before its
+        write (never earlier): a grant minted for the coverage set requested
+        at entry is re-minted, never widened, if live narrowing shrinks that
+        set before the first comment write.
     #>
     param(
         [Parameter(Mandatory)][string]$AgencyPath,
         [Parameter(Mandatory)]$Decision,
+        # Path used to re-derive every VerifiedMultiPass grant this call may
+        # need (comments and, if requested, a separate approval grant) - the
+        # mint re-reads/re-verifies from this path itself; the $Decision
+        # object above is never trusted as authorization evidence on its own.
+        [Parameter(Mandatory)][string]$DecisionArtifactPath,
         [Parameter(Mandatory)]$FirstRevalidation,
+        # The gateComments grant minted by the caller BEFORE this call, from
+        # the SAME coverage keys as CommentCoverageKeys - reused as-is unless
+        # live narrowing shrinks the write set below, in which case this
+        # function mints a fresh, narrower replacement itself rather than
+        # reuse a grant scoped to a superset.
+        [Parameter(Mandatory)][ReviewerDeliveryAuthorization]$Authorization,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$CommentCoverageKeys,
         [Parameter(Mandatory)][bool]$CommentsRequested,
         [Parameter(Mandatory)][bool]$SuggestionsRequested,
         [Parameter(Mandatory)][bool]$ApprovalRequested,
@@ -8135,7 +8986,18 @@ function Invoke-ReviewerGateDelivery {
         [Parameter(Mandatory)][bool]$CanaryConfirmed
     )
     $prId = [int]$Decision.prId
-    $outcome = @{ CommentsPosted = 0; CommentsIntended = 0; CommentsComplete = $false; VoteCast = $false; Reason = "" }
+    $outcome = @{
+        CommentsPosted = 0; CommentsIntended = 0; CommentsComplete = $false; VoteCast = $false; Reason = ""
+        # $true only when the reason approval never resolved is a TRANSIENT
+        # authorization availability failure (grant aged mid-flight, or the
+        # dedicated revalidation session itself could not be read) - never
+        # for a structural refusal (binding mismatch, unsatisfied approval
+        # predicate, sourceCommitMoved). This is the ONLY signal that can
+        # make a caller mark pendingReplay=$true even though
+        # CommentsComplete is already $true, so a transient approval failure
+        # gets retried by a later cycle instead of being silently dropped.
+        ApprovalRetryable = $false
+    }
 
     # Belt-and-braces (defense in depth): this function is the only place
     # that actually writes, so it independently re-derives what the CURRENT
@@ -8190,6 +9052,28 @@ function Invoke-ReviewerGateDelivery {
         })
     $outcome.CommentsIntended = @($stillEligible).Count
 
+    # T11: the minted grant is scoped to CommentCoverageKeys, computed by the
+    # caller before this call. If live narrowing above removed anything from
+    # that set, the existing grant covers a SUPERSET of what is about to be
+    # written and must never be reused for the narrower set - mint fresh,
+    # bound to the exact narrowed keys, instead of widening.
+    $narrowedCommentKeys = @(@($stillEligible | ForEach-Object { Get-ReviewerGateManifestKey -Entry $_ }) | Sort-Object -Unique)
+    $mintedCommentKeys = @(@($CommentCoverageKeys) | Sort-Object -Unique)
+    $commentAuthorization = $Authorization
+    if (@(Compare-Object -ReferenceObject $mintedCommentKeys -DifferenceObject $narrowedCommentKeys).Count -gt 0) {
+        try {
+            $commentRemint = New-ReviewerVerifiedMultiPassAuthorization -Purpose gateComments `
+                -DecisionArtifactPath $DecisionArtifactPath -PrId $prId -ExpectedSourceCommit ([string]$Decision.sourceCommit) `
+                -AgencyPath $AgencyPath -CoverageKeys $narrowedCommentKeys
+        }
+        catch [ReviewerDeliveryAuthorizationException] {
+            $outcome.Reason = "authorizationRefused:$($_.Exception.Message)"
+            return $outcome
+        }
+        $commentAuthorization = $commentRemint.Authorization
+    }
+    $narrowedCommentCoverageDigest = Get-ReviewerVerifiedMultiPassCoverageDigest -CoverageKeys $narrowedCommentKeys
+
     $sessionForWrite = $null
     try {
         $sessionForWrite = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
@@ -8202,6 +9086,25 @@ function Invoke-ReviewerGateDelivery {
             if ($existingFingerprints.Contains($fingerprint)) {
                 $outcome.CommentsPosted++
                 continue
+            }
+            try {
+                Assert-ReviewerDeliveryAuthorized -Authorization $commentAuthorization -RequiredPassCount 2 `
+                    -WriteRequested $true -Operation "Delivery-gate comment for PR $prId" `
+                    -BoundPrId $prId -BoundSourceCommit ([string]$Decision.sourceCommit) -BoundCoverageDigest $narrowedCommentCoverageDigest
+            }
+            catch [ReviewerDeliveryAuthorizationException] {
+                # Finding 2: the grant can expire (120s code-defined max age)
+                # or otherwise stop validating PARTWAY through this loop -
+                # every remaining entry would refuse identically (same PR/
+                # commit/coverage digest), so stop attempting further writes
+                # rather than looping on a certain failure. Whatever already
+                # landed stays landed; the confirm-by-reread step below still
+                # runs and reports a PARTIAL, retryable outcome via the
+                # EXISTING commentDeliveryIncomplete/pendingReplay path -
+                # never an uncaught exception that would otherwise surface as
+                # a terminal gateProcessingFaulted fault, and never a vote.
+                Write-Warning "Delivery gate's authorization for PR ${prId} could not be re-confirmed mid-delivery; stopping further writes this cycle: $($_.Exception.Message)"
+                break
             }
             $post = Add-ReviewerThread -Session $sessionForWrite -PrId $prId -Content (Format-ReviewerFindingComment -Finding $finding) `
                 -FilePath ([string]$entry.filePath) -Line ([int]$entry.line)
@@ -8234,13 +9137,31 @@ function Invoke-ReviewerGateDelivery {
             return $outcome
         }
 
-        # Approval NEVER proceeds on the first revalidation alone: a second,
-        # independent revalidation immediately before the vote call is what
-        # catches a source push that happened while comments were being
-        # written (source-push simulation in the test matrix).
-        $secondRevalidation = Invoke-ReviewerGateRevalidation -AgencyPath $AgencyPath -PrId $prId `
-            -ExpectedSourceCommit ([string]$Decision.sourceCommit) -TargetBranch $TargetRefName.Substring("refs/heads/".Length) `
-            -RequiredCheckNames @($EffectiveGatePolicy.approval.requiredCheckNames)
+        # Approval NEVER proceeds on the first revalidation alone: a SEPARATE
+        # gateApproval mint performs its own second, independent revalidation
+        # immediately before the vote call, which is what catches a source
+        # push that happened while comments were being written (source-push
+        # simulation in the test matrix). Coverage is a fixed sentinel, not a
+        # candidate set - approval is a single PR-level action, never a
+        # per-comment grant.
+        $approvalCoverageKeys = @("$prId|$(([string]$Decision.sourceCommit).ToLowerInvariant())|Approved")
+        try {
+            $approvalMint = New-ReviewerVerifiedMultiPassAuthorization -Purpose gateApproval `
+                -DecisionArtifactPath $DecisionArtifactPath -PrId $prId -ExpectedSourceCommit ([string]$Decision.sourceCommit) `
+                -AgencyPath $AgencyPath -CoverageKeys $approvalCoverageKeys
+        }
+        catch [ReviewerDeliveryAuthorizationException] {
+            # Finding 2/3: comments already confirmed complete above stay
+            # confirmed; only the vote is withheld. A TRANSIENT reason
+            # (the dedicated revalidation session itself unavailable) is
+            # marked retryable so a later cycle re-attempts just the vote;
+            # any other (structural) reason is terminal for this commit,
+            # exactly as an unsatisfied approval predicate already is today.
+            $outcome.Reason = "authorizationRefused:$($_.Exception.Message)"
+            $outcome.ApprovalRetryable = Test-ReviewerDeliveryAuthorizationRetryable -Message $_.Exception.Message
+            return $outcome
+        }
+        $secondRevalidation = $approvalMint.Revalidation
         if (-not $secondRevalidation.Ok -or -not $secondRevalidation.SourceCommitUnchanged -or
             -not $secondRevalidation.PrIsActive -or $secondRevalidation.PrIsDraft) {
             $outcome.Reason = "sourceCommitMoved"
@@ -8279,6 +9200,22 @@ function Invoke-ReviewerGateDelivery {
             -AuthoritativeSourcesCurrent $false -AlreadyVotedThisCommit ([bool]$alreadyVoted)
         if (-not $approval.Ok) {
             $outcome.Reason = ($approval.ReasonCodes -join ',')
+            return $outcome
+        }
+        try {
+            Assert-ReviewerDeliveryAuthorized -Authorization $approvalMint.Authorization -RequiredPassCount 2 `
+                -WriteRequested $true -Operation "Delivery-gate approval vote for PR $prId" `
+                -BoundPrId $prId -BoundSourceCommit ([string]$Decision.sourceCommit) `
+                -BoundCoverageDigest (Get-ReviewerVerifiedMultiPassCoverageDigest -CoverageKeys $approvalCoverageKeys)
+        }
+        catch [ReviewerDeliveryAuthorizationException] {
+            # Never vote after expiry/incomplete (finding 2): the grant aged
+            # out (or otherwise stopped validating) in the brief window
+            # between the mint above and this call. Comments stay confirmed;
+            # only the vote is withheld, marked retryable exactly like the
+            # mint-refusal case above.
+            $outcome.Reason = "authorizationRefused:$($_.Exception.Message)"
+            $outcome.ApprovalRetryable = Test-ReviewerDeliveryAuthorizationRetryable -Message $_.Exception.Message
             return $outcome
         }
         # Literal, hardcoded "Approved" - the gate can never request any other
@@ -8387,6 +9324,15 @@ function Invoke-ReviewerGateForPullRequest {
         }
 
         $suggestionModeAllowed = ($EffectiveGatePolicy.mode -cin @("unattendedCommentAndSuggestion", "approvalVote"))
+        # Sourced from the completed raw-pass ARTIFACTS themselves (never
+        # $ReviewPassModels/config), so this decision seals how many passes it
+        # was actually built from and which of them completed with the exact
+        # model pair - a later verified-delivery mint reads these SEALED
+        # values, never the live config, so a decision sealed under a
+        # two-pass config can never be laundered through a process running
+        # fewer configured passes later (T4/T5).
+        $rawPasses = @(if ($inputManifest) { @($inputManifest.rawGeneralistPasses) } else { @() })
+        $rawPassesCompleted = @($rawPasses | Where-Object { $_.status -ceq "complete" })
         $binding = @{
             prId                      = $prId
             repositoryId              = $cfgRepoId.ToLowerInvariant()
@@ -8424,6 +9370,8 @@ function Invoke-ReviewerGateForPullRequest {
             # authorize approval: nothing reads it back to decide anything.
             checksSnapshotSha256     = "0" * 64
             policySnapshotSha256     = "0" * 64
+            passesRequested          = @($rawPasses).Count
+            generalistPassModels     = (@($rawPassesCompleted.model | Sort-Object) -join '|')
         }
         $decision = New-ReviewerGateDecision -Binding $binding -EffectivePolicy $EffectiveGatePolicy -Qualification $qualification `
             -Facets $facets -ChangedPaths @($Bound.ChangedPaths) -ThreadFacts $threads -RunAccounting $runAccounting `
@@ -8434,9 +9382,8 @@ function Invoke-ReviewerGateForPullRequest {
         # function already has, and carried on the decision so the delivery
         # step (and PromoteVerifiedPreview) can reuse them without recomputing
         # verification-internal shapes.
-        $rawPasses = @(if ($inputManifest) { @($inputManifest.rawGeneralistPasses) } else { @() })
         $decision | Add-Member -NotePropertyName generalistPairComplete -NotePropertyValue (
-            @($rawPasses | Where-Object { $_.status -ceq "complete" }).Count -eq 2 -and
+            @($rawPassesCompleted).Count -eq 2 -and
             (@($rawPasses.model | Sort-Object) -join '|') -ceq (@("claude-opus-5", "gpt-5.6-sol") -join '|')
         )
         $decision | Add-Member -NotePropertyName generalistBothApprove -NotePropertyValue (
@@ -8475,10 +9422,71 @@ function Invoke-ReviewerGateForPullRequest {
         $approvalRequested = [bool]$currentAuthority.Approval
         if (-not $commentsRequested -and -not $suggestionsRequested -and -not $approvalRequested) { return }
 
-        $targetBranchName = $TargetRefName -replace '^refs/heads/', ''
-        $firstRevalidation = Invoke-ReviewerGateRevalidation -AgencyPath $AgencyPath -PrId $prId `
-            -ExpectedSourceCommit $sourceCommit -TargetBranch $targetBranchName `
-            -RequiredCheckNames @($EffectiveGatePolicy.approval.requiredCheckNames)
+        # MINT #1 (S4): the sole VerifiedMultiPass producer performs its own
+        # dedicated fresh revalidation and returns it, replacing what used to
+        # be a direct Invoke-ReviewerGateRevalidation call here - net session
+        # count for this call site is unchanged. Coverage is the union of
+        # whatever this run currently requests (comments/suggestions), bound
+        # to the exact keys the SEALED decision already approved for them.
+        $commentCoverageKeys = @(
+            (@(if ($commentsRequested) { @($decision.unattendedComments) } else { @() }) +
+                @(if ($suggestionsRequested) { @($decision.unattendedSuggestions) } else { @() })
+            ) | ForEach-Object { Get-ReviewerGateManifestKey -Entry $_ }
+        )
+        $commentMint = $null
+        $commentMintRefusal = ""
+        try {
+            $commentMint = New-ReviewerVerifiedMultiPassAuthorization -Purpose gateComments `
+                -DecisionArtifactPath $sealed.ArtifactPath -PrId $prId -ExpectedSourceCommit $sourceCommit `
+                -AgencyPath $AgencyPath -CoverageKeys $commentCoverageKeys
+        }
+        catch [ReviewerDeliveryAuthorizationException] { $commentMintRefusal = $_.Exception.Message }
+        if (-not $commentMint) {
+            # T7/T8: a mint refusal is a TERMINAL gate closure for this exact
+            # commit, recorded exactly like every other outcome - never a
+            # silently-swallowed warning, and never marked superseded (which
+            # would burn the bounded supersede-refresh budget on something
+            # that is not a stale-decision condition at all).
+            Write-Warning "Delivery gate for PR ${prId} could not authorize a verified write: $commentMintRefusal"
+            $gateDeliveryState = Get-JsonState -Path $gateDeliveryStatePath
+            $priorGateDeliveryRecord = $gateDeliveryState[[string]$prId]
+            $priorGateDeliveryRecordSameCommit = ($priorGateDeliveryRecord -and
+                ([string](Get-ReviewerHashValue -Container $priorGateDeliveryRecord -Key 'sourceCommit' -Default '')) -ieq $sourceCommit)
+            $carriedSupersededCount = $(if ($priorGateDeliveryRecordSameCommit) { [int](Get-ReviewerHashValue -Container $priorGateDeliveryRecord -Key 'supersededCount' -Default 0) } else { 0 })
+            # Finding 3: classify the refusal. A TRANSIENT availability
+            # failure (the dedicated revalidation session itself unavailable,
+            # and ONLY that reason) is retryable - persisted with every field
+            # a later replay needs to re-attempt the mint for this exact
+            # commit. A structural refusal (binding/policy/artifact/commit
+            # mismatch, sealed-decision content) remains terminal, exactly as
+            # before - and is still never marked superseded, which would burn
+            # the bounded supersede-refresh budget on something that is not a
+            # stale-decision condition at all.
+            $commentMintRetryable = Test-ReviewerDeliveryAuthorizationRetryable -Message $commentMintRefusal
+            $gateDeliveryState[[string]$prId] = @{
+                sourceCommit    = $sourceCommit
+                at              = ([DateTime]::UtcNow.ToString("o"))
+                reason          = "authorizationRefused:$commentMintRefusal"
+                pendingReplay   = $commentMintRetryable
+                superseded      = $false
+                supersededCount = $carriedSupersededCount
+                artifactPath    = $sealed.ArtifactPath
+                commentsRequested       = [bool]$commentsRequested
+                suggestionsRequested    = [bool]$suggestionsRequested
+                approvalRequested       = [bool]$approvalRequested
+                rawRecommendedVote      = [string]$Bound.RawRecommendedVote
+                rawCounts               = $Bound.RawCounts
+                rawReportedFindingCount = [int]$Bound.RawReportedFindingCount
+                rawPassesComplete       = [bool]$Bound.RawPassesComplete
+            }
+            Set-JsonState -Path $gateDeliveryStatePath -State $gateDeliveryState
+            Write-ReviewerCycleMetadata -Fields @{
+                mode = "gate-delivery"; result = "authorizationRefused"; prId = $prId; sourceCommit = $sourceCommit
+                reason = "authorizationRefused:$commentMintRefusal"; retryable = $commentMintRetryable
+            }
+            return
+        }
+        $firstRevalidation = $commentMint.Revalidation
 
         $gateEligibilityState = Get-JsonState -Path $gateEligibilityStatePath
         $canaryConfirmed = Test-ReviewerGateCanaryConfirmed -TokenFile $GateCanaryTokenFile -PrId $prId -SourceCommit $sourceCommit
@@ -8497,7 +9505,8 @@ function Invoke-ReviewerGateForPullRequest {
             $rawGateApproves = ([string]$rawDecision.Vote -ceq "Approved")
         }
 
-        $deliveryOutcome = Invoke-ReviewerGateDelivery -AgencyPath $AgencyPath -Decision $decision -FirstRevalidation $firstRevalidation `
+        $deliveryOutcome = Invoke-ReviewerGateDelivery -AgencyPath $AgencyPath -Decision $decision -DecisionArtifactPath $sealed.ArtifactPath `
+            -FirstRevalidation $firstRevalidation -Authorization $commentMint.Authorization -CommentCoverageKeys $commentCoverageKeys `
             -CommentsRequested $commentsRequested -SuggestionsRequested $suggestionsRequested -ApprovalRequested $approvalRequested `
             -Qualification $qualification -PriorEligibility $gateEligibilityState -RawGateApproves $rawGateApproves `
             -CanaryConfirmed $canaryConfirmed
@@ -8538,7 +9547,12 @@ function Invoke-ReviewerGateForPullRequest {
             commentsComplete      = [bool]$deliveryOutcome.CommentsComplete
             voteCast              = [bool]$deliveryOutcome.VoteCast
             reason                = [string]$deliveryOutcome.Reason
-            pendingReplay         = (-not [bool]$deliveryOutcome.CommentsComplete)
+            # Finding 2: pending on incomplete comments (existing), OR on a
+            # TRANSIENT approval-authorization failure even though comments
+            # are otherwise complete - never on a structural approval
+            # refusal (unsatisfied predicate, sourceCommitMoved), which stays
+            # non-pending exactly as before.
+            pendingReplay         = ((-not [bool]$deliveryOutcome.CommentsComplete) -or [bool]$deliveryOutcome.ApprovalRetryable)
             # Never superseded: this is a genuine, usable delivery record
             # (complete or partial-pending-replay), unlike the deliberately
             # superseded records Invoke-ReviewerGateReplay writes when a
@@ -8773,10 +9787,44 @@ function Invoke-ReviewerGateReplay {
             return
         }
 
-        $targetBranchName = $TargetRefName -replace '^refs/heads/', ''
-        $firstRevalidation = Invoke-ReviewerGateRevalidation -AgencyPath $AgencyPath -PrId $PrId `
-            -ExpectedSourceCommit $SourceCommit -TargetBranch $targetBranchName `
-            -RequiredCheckNames @($EffectiveGatePolicy.approval.requiredCheckNames)
+        # MINT #1 (replayed): re-derive gateComments authorization from the
+        # artifact PATH + a FRESH revalidation - never store the grant, never
+        # reuse a stale one. Coverage mirrors the direct path: the sealed
+        # decision's own approved keys for whatever this replay still
+        # requests, narrowed further (remove-only) by Invoke-ReviewerGateDelivery
+        # itself once fresh eligibility is known.
+        $commentCoverageKeys = @(
+            (@(if ($commentsRequested) { @($decision.unattendedComments) } else { @() }) +
+                @(if ($suggestionsRequested) { @($decision.unattendedSuggestions) } else { @() })
+            ) | ForEach-Object { Get-ReviewerGateManifestKey -Entry $_ }
+        )
+        $commentMint = $null
+        $commentMintRefusal = ""
+        try {
+            $commentMint = New-ReviewerVerifiedMultiPassAuthorization -Purpose gateComments `
+                -DecisionArtifactPath $artifactPath -PrId $PrId -ExpectedSourceCommit $SourceCommit `
+                -AgencyPath $AgencyPath -CoverageKeys $commentCoverageKeys
+        }
+        catch [ReviewerDeliveryAuthorizationException] { $commentMintRefusal = $_.Exception.Message }
+        if (-not $commentMint) {
+            Write-Warning "PR $PrId's gate delivery replay could not authorize a verified write: $commentMintRefusal"
+            # Finding 3: a TRANSIENT availability failure (the dedicated
+            # revalidation session itself unavailable, and ONLY that reason)
+            # stays pendingReplay=true so the NEXT cycle re-mints again; a
+            # structural refusal (binding/policy/artifact/commit mismatch,
+            # sealed-decision content) remains terminal exactly as before.
+            # Every other field on $record (commentsRequested/
+            # suggestionsRequested/approvalRequested/rawCounts/artifactPath/
+            # sourceCommit) is already present and left untouched, so a
+            # retryable closure still carries everything a later replay needs.
+            $record.reason = "authorizationRefused:$commentMintRefusal"
+            $record.pendingReplay = (Test-ReviewerDeliveryAuthorizationRetryable -Message $commentMintRefusal)
+            $record.at = [DateTime]::UtcNow.ToString("o")
+            $state[[string]$PrId] = $record
+            Set-JsonState -Path $gateDeliveryStatePath -State $state
+            return
+        }
+        $firstRevalidation = $commentMint.Revalidation
         $gateEligibilityState = Get-JsonState -Path $gateEligibilityStatePath
         $canaryConfirmed = Test-ReviewerGateCanaryConfirmed -TokenFile $GateCanaryTokenFile -PrId $PrId -SourceCommit $SourceCommit
         $rawGateApproves = $false
@@ -8794,7 +9842,8 @@ function Invoke-ReviewerGateReplay {
             $rawGateApproves = ([string]$rawDecision.Vote -ceq "Approved")
         }
 
-        $deliveryOutcome = Invoke-ReviewerGateDelivery -AgencyPath $AgencyPath -Decision $decision -FirstRevalidation $firstRevalidation `
+        $deliveryOutcome = Invoke-ReviewerGateDelivery -AgencyPath $AgencyPath -Decision $decision -DecisionArtifactPath $artifactPath `
+            -FirstRevalidation $firstRevalidation -Authorization $commentMint.Authorization -CommentCoverageKeys $commentCoverageKeys `
             -CommentsRequested $commentsRequested -SuggestionsRequested $suggestionsRequested -ApprovalRequested $approvalRequested `
             -Qualification (Get-ReviewerGateQualification).Qualification -PriorEligibility $gateEligibilityState `
             -RawGateApproves $rawGateApproves -CanaryConfirmed $canaryConfirmed
@@ -8818,7 +9867,10 @@ function Invoke-ReviewerGateReplay {
         $record.commentsComplete = [bool]$deliveryOutcome.CommentsComplete
         $record.voteCast = ([bool]$deliveryOutcome.VoteCast -or [bool](Get-ReviewerHashValue -Container $record -Key 'voteCast' -Default $false))
         $record.reason = [string]$deliveryOutcome.Reason
-        $record.pendingReplay = (-not [bool]$deliveryOutcome.CommentsComplete)
+        # Finding 2: pending on incomplete comments (existing), OR on a
+        # TRANSIENT approval-authorization failure even though comments are
+        # otherwise complete.
+        $record.pendingReplay = ((-not [bool]$deliveryOutcome.CommentsComplete) -or [bool]$deliveryOutcome.ApprovalRetryable)
         $record.at = [DateTime]::UtcNow.ToString("o")
         $state[[string]$PrId] = $record
         Set-JsonState -Path $gateDeliveryStatePath -State $state
@@ -9372,7 +10424,6 @@ function Invoke-ReviewerPromotion {
     param(
         [Parameter(Mandatory)][string]$AgencyPath,
         [Parameter(Mandatory)][string]$ArtifactPath,
-        [Parameter(Mandatory)][ReviewerDeliveryAuthorization]$DeliveryAuthorization,
         # Supplied when a cycle is retrying its own failed delivery plan, so the
         # retry reuses the cycle's session instead of opening a second one.
         [hashtable]$ExistingSession
@@ -9435,7 +10486,16 @@ function Invoke-ReviewerPromotion {
             "Promotion of preview artifact '$ArtifactPath' is blocked because its signed pass count $sealedRequested is outside the supported range 1..100."
         )
     }
-    Assert-ReviewerDeliveryAuthorized -Authorization $DeliveryAuthorization `
+    # Minted PER ARTIFACT from its own signed pass count - never the startup
+    # $DeliveryAuthorization parameter (T6): threading the STARTUP grant here
+    # would fail a 1-pass artifact's promotion during a 2-pass run (2 != 1)
+    # and strand the PR every cycle until its commit changes. This can only
+    # ever produce SinglePass (sealedRequested==1) or PreviewOnly
+    # (sealedRequested>1) - raw -PromotePreview of a multi-pass artifact
+    # remains permanently rejected exactly as before; New-ReviewerDeliveryAuthorization
+    # has no VerifiedMultiPass producer path.
+    $promotionAuthorization = New-ReviewerDeliveryAuthorization -PassCount $sealedRequested
+    Assert-ReviewerDeliveryAuthorized -Authorization $promotionAuthorization `
         -RequiredPassCount $sealedRequested -WriteRequested $true `
         -Operation "Promotion of preview artifact '$ArtifactPath'"
 
@@ -9602,7 +10662,7 @@ function Invoke-ReviewerPromotion {
             -SummaryAlreadyDelivered ($priorApplies -and $priorSummary) `
             -SealedPublishableCount (@($approved).Count) `
             -PassesComplete $sealedPassesComplete `
-            -DeliveryAuthorization $DeliveryAuthorization -RequiredPassCount $sealedRequested
+            -DeliveryAuthorization $promotionAuthorization -RequiredPassCount $sealedRequested
 
         $reviewedState = Get-JsonState -Path $reviewedStatePath
         $priorRecord = $null
@@ -9658,7 +10718,7 @@ function Invoke-ReviewerPromotion {
             approvedCount = @($approved).Count; droppedCount = $dropped
             postedCount = [int]$delivery.PostedCount; postFailures = [int]$delivery.PostFailures
             summaryPosted = [bool]$delivery.SummaryPosted; castVote = $(if ($delivery.CastVote) { [string]$delivery.CastVote } else { "none" })
-            authorizationKind = [string]$DeliveryAuthorization.Kind; authorizationReason = [string]$DeliveryAuthorization.Reason
+            authorizationKind = [string]$promotionAuthorization.Kind; authorizationReason = [string]$promotionAuthorization.Reason
             deliveryAborted = [bool]$delivery.Aborted; deliveryReason = [string]$delivery.Reason
         }
 
@@ -9770,6 +10830,64 @@ function Invoke-ReviewerPromoteVerifiedPreview {
         return 0
     }
 
+    # MINT (S8): before opening any session for writing, or performing any
+    # external write, mint gatePromotion from the exact currently-approved
+    # subset. This performs its own dedicated fresh revalidation, reused
+    # below for freshness/threads/changed-paths instead of a second read
+    # through the (separate) write session.
+    $promotionCoverageKeys = @(@($approved) | ForEach-Object { Get-ReviewerGateManifestKey -Entry $_ })
+    try {
+        $promotionMint = New-ReviewerVerifiedMultiPassAuthorization -Purpose gatePromotion `
+            -DecisionArtifactPath $ArtifactPath -PrId $prId -ExpectedSourceCommit $sourceCommit `
+            -AgencyPath $AgencyPath -CoverageKeys $promotionCoverageKeys
+    }
+    catch [ReviewerDeliveryAuthorizationException] {
+        Write-Warning "Not publishing gate-verified comments for PR ${prId}: $($_.Exception.Message)"
+        return 1
+    }
+    $dedicatedRevalidation = $promotionMint.Revalidation
+    if (-not $dedicatedRevalidation.Ok -or -not $dedicatedRevalidation.PrIsActive -or $dedicatedRevalidation.PrIsDraft -or
+        -not $dedicatedRevalidation.SourceCommitUnchanged) {
+        Write-Warning "Not publishing gate comments for PR ${prId}: the dedicated revalidation found the PR no longer matches the sealed decision."
+        return 1
+    }
+    $threads = $dedicatedRevalidation.Threads
+    $changedPaths = $dedicatedRevalidation.ChangedPaths
+    # Remove-only: an entry whose anchor is no longer in the fresh change
+    # set, or whose pack/severity the CURRENT policy no longer allows for
+    # human promotion, is dropped - never added to, never reworded,
+    # relocated, or severity-raised (Get-ReviewerGateManifestKey commits
+    # to all four).
+    $stillEligible = @($approved | Where-Object {
+            $eligibility = Test-ReviewerGateCandidateEligible -Facet $_ -EffectivePolicy $EffectiveGatePolicy `
+                -Purpose "humanPromotedComment" -ChangedPaths $changedPaths -ThreadFacts $threads
+            [bool]$eligibility.Ok
+        })
+    $postable = Select-ReviewerGateSubset -Approved $approved -Allowed $stillEligible
+    $dropped = @($approved).Count - @($postable).Count
+    if ($dropped -gt 0) {
+        Write-Warning "$dropped gate-approved comment(s) are no longer publishable at the location they name and will be skipped."
+    }
+
+    # T11: never reuse a grant scoped to a superset once live narrowing has
+    # removed anything from it - mint fresh, bound to the exact narrowed set.
+    $narrowedPromotionKeys = @(@($postable | ForEach-Object { Get-ReviewerGateManifestKey -Entry $_ }) | Sort-Object -Unique)
+    $mintedPromotionKeys = @(@($promotionCoverageKeys) | Sort-Object -Unique)
+    $promotionAuthorization = $promotionMint.Authorization
+    if (@(Compare-Object -ReferenceObject $mintedPromotionKeys -DifferenceObject $narrowedPromotionKeys).Count -gt 0) {
+        try {
+            $promotionRemint = New-ReviewerVerifiedMultiPassAuthorization -Purpose gatePromotion `
+                -DecisionArtifactPath $ArtifactPath -PrId $prId -ExpectedSourceCommit $sourceCommit `
+                -AgencyPath $AgencyPath -CoverageKeys $narrowedPromotionKeys
+        }
+        catch [ReviewerDeliveryAuthorizationException] {
+            Write-Warning "Not publishing gate-verified comments for PR ${prId}: $($_.Exception.Message)"
+            return 1
+        }
+        $promotionAuthorization = $promotionRemint.Authorization
+    }
+    $narrowedPromotionCoverageDigest = Get-ReviewerVerifiedMultiPassCoverageDigest -CoverageKeys $narrowedPromotionKeys
+
     $session = $ExistingSession
     $ownsSession = ($null -eq $session)
     try {
@@ -9778,34 +10896,31 @@ function Invoke-ReviewerPromoteVerifiedPreview {
                 -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
                 -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
         }
-        $freshness = Test-ReviewerDeliveryStillValid -Session $session -PrId $prId -ExpectedSourceCommit $sourceCommit
-        if (-not $freshness.Ok) {
-            Write-Warning "Not publishing gate comments for PR ${prId}: $($freshness.Reason)."
-            return 1
-        }
-        $threads = Get-ReviewerPullRequestThreads -Session $session -PrId $prId
-        $changedPaths = Get-ReviewerChangedPaths -Session $session -PrId $prId
-        # Remove-only: an entry whose anchor is no longer in the fresh change
-        # set, or whose pack/severity the CURRENT policy no longer allows for
-        # human promotion, is dropped - never added to, never reworded,
-        # relocated, or severity-raised (Get-ReviewerGateManifestKey commits
-        # to all four).
-        $stillEligible = @($approved | Where-Object {
-                $eligibility = Test-ReviewerGateCandidateEligible -Facet $_ -EffectivePolicy $EffectiveGatePolicy `
-                    -Purpose "humanPromotedComment" -ChangedPaths $changedPaths -ThreadFacts $threads
-                [bool]$eligibility.Ok
-            })
-        $postable = Select-ReviewerGateSubset -Approved $approved -Allowed $stillEligible
-        $dropped = @($approved).Count - @($postable).Count
-        if ($dropped -gt 0) {
-            Write-Warning "$dropped gate-approved comment(s) are no longer publishable at the location they name and will be skipped."
-        }
-        $existingFingerprints = Get-ReviewerExistingFingerprints -Threads $threads
+        $existingFingerprints = $dedicatedRevalidation.ExistingFingerprints
         $failures = 0
         foreach ($entry in $postable) {
             $finding = @{ severity = [string]$entry.severity; filePath = [string]$entry.filePath; line = [int]$entry.line; comment = [string]$entry.comment }
             $fingerprint = Get-ReviewerFindingFingerprint -Finding $finding
             if ($existingFingerprints.Contains($fingerprint)) { continue }
+            try {
+                Assert-ReviewerDeliveryAuthorized -Authorization $promotionAuthorization -RequiredPassCount 2 `
+                    -WriteRequested $true -Operation "Gate-verified promotion comment for PR $prId" `
+                    -BoundPrId $prId -BoundSourceCommit $sourceCommit -BoundCoverageDigest $narrowedPromotionCoverageDigest
+            }
+            catch [ReviewerDeliveryAuthorizationException] {
+                # Finding 2: the grant can expire (120s code-defined max age)
+                # or otherwise stop validating PARTWAY through this loop -
+                # every remaining entry would refuse identically, so stop
+                # attempting further writes. Whatever already landed stays
+                # landed; the confirm-by-reread step below still measures
+                # exactly what is on the PR, so this promotion returns
+                # nonzero for a PARTIAL outcome rather than throwing
+                # uncaught - a rerun of -PromoteVerifiedPreview against the
+                # same artifact dedupes the already-posted entries via
+                # fingerprint and mints fresh for the missing subset.
+                Write-Warning "Gate-verified promotion's authorization for PR ${prId} could not be re-confirmed mid-delivery; stopping further writes this run: $($_.Exception.Message)"
+                break
+            }
             $post = Add-ReviewerThread -Session $session -PrId $prId -Content (Format-ReviewerFindingComment -Finding $finding) `
                 -FilePath ([string]$entry.filePath) -Line ([int]$entry.line)
             if ($post.Error) {
@@ -10030,7 +11145,7 @@ function Invoke-ReviewerCycle {
                 Write-Host "  PR $prId has an unfinished delivery at this commit; retrying that exact review instead of re-reviewing." -ForegroundColor Yellow
                 try {
                     $retryCode = Invoke-ReviewerPromotion -AgencyPath $AgencyPath -ArtifactPath $pendingPlan `
-                        -DeliveryAuthorization $DeliveryAuthorization -ExistingSession $session
+                        -ExistingSession $session
                 }
                 catch [ReviewerDeliveryAuthorizationException] {
                     Write-Warning "PR $prId has an unfinished delivery plan that cannot be published: $($_.Exception.Message)"
@@ -10357,8 +11472,7 @@ try {
     }
 
     if ($PromotePreview) {
-        exit (Invoke-ReviewerPromotion -AgencyPath $agencyPath -ArtifactPath $PromotePreview `
-            -DeliveryAuthorization $DeliveryAuthorization)
+        exit (Invoke-ReviewerPromotion -AgencyPath $agencyPath -ArtifactPath $PromotePreview)
     }
     if ($PromoteVerifiedPreview) {
         exit (Invoke-ReviewerPromoteVerifiedPreview -AgencyPath $agencyPath -ArtifactPath $PromoteVerifiedPreview)

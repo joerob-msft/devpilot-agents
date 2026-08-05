@@ -173,6 +173,7 @@ function New-TestBinding {
         verificationLibrarySha256 = "vl" * 32; verificationPromptSha256 = "vp" * 32
         verificationPolicySha256 = "vpo" * 21 + "vp"; verificationSchemaSha256 = "vs" * 32
         threadSetDigest = "t" * 64; checksSnapshotSha256 = "0" * 64; policySnapshotSha256 = "0" * 64
+        passesRequested = 2; generalistPassModels = "claude-opus-5|gpt-5.6-sol"
     }
     foreach ($key in $Overrides.Keys) { $binding[$key] = $Overrides[$key] }
     return $binding

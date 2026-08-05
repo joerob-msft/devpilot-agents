@@ -97,3 +97,11 @@ a repository's own config can only disable it, never enable it. It uses its
 own HMAC domain, so a gate artifact can never be read back as, or promoted
 as, a raw delivery or verification artifact, and vice versa. See
 [Delivery gates](delivery-gates.md).
+
+Cross-verification never authorizes a raw write on its own: an independent
+two-pass union stays a code-defined `PreviewOnly` delivery authorization
+permanently, whether or not this layer is enabled. The gate is the sole,
+code-defined path by which a `VerifiedMultiPass` authorization is ever minted,
+and that grant authorizes only the gate's own comment/suggestion/approval/
+`-PromoteVerifiedPreview` writes - never the raw two-pass delivery or raw
+`-PromotePreview` path.

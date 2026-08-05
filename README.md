@@ -276,7 +276,11 @@ Layer 6 is a separate, fail-closed comment and approval-vote eligibility layer
 over the sealed cross-verification preview above. It is off by default, and
 nothing about it is reachable from repository config or PR content: enabling
 any unattended capability requires an out-of-repo policy file, a matching CLI
-switch, and a verified qualification artifact to agree, every run.
+switch, and a verified qualification artifact to agree, every run. Raw
+two-pass delivery and raw `-PromotePreview` remain permanently preview-only
+(discovery only, never posted) regardless of layer 6: the gate is the sole,
+code-defined path by which an independent two-pass union can ever reach a PR
+unattended.
 
 ```powershell
 ./src/Agents/reviewer/Start-ReviewerAgent.ps1 -Once `
@@ -394,12 +398,17 @@ scores well.
 
 How it works, and why it is arranged this way:
 
-- **The union is discovery-only in this layer.** The passes do not cross-review
-  or independently verify each other's findings. With `-SecondPassModel`,
-  finding comments, summary comments, approval votes and `-PromotePreview` are
-  all rejected before publication. There is no config or CLI override. A later
-  verified-delivery layer must produce the code-defined typed authorization
-  before any multi-pass output can leave the host.
+- **The union is discovery-only in this layer, permanently.** The passes do not
+  cross-review or independently verify each other's findings. With
+  `-SecondPassModel`, finding comments, summary comments, approval votes and
+  raw `-PromotePreview` are all rejected before publication, and stay that way
+  even with layer 6 (delivery gates) enabled - there is no config or CLI
+  override, and no reordering, that lets the raw union itself post. The only
+  way an independently-verified union reaches a PR unattended is through layer
+  6's own gate write paths (comments/suggestions/approval,
+  `-PromoteVerifiedPreview`), which mint their own short-lived, PR/commit/
+  coverage-bound typed authorization from a sealed cross-verification decision
+  - see [Delivery gates](docs/delivery-gates.md).
 - **The passes are independent.** Each gets its own nonce, is validated against
   the marker schema on its own, and is bound to the PR and commit on its own.
   Neither sees the other's output — a second model shown the first one's
