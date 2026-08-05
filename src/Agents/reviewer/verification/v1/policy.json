@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "maxCandidates": 64,
+  "maxClusterSize": 8,
+  "maxInputBytes": 524288,
+  "maxArtifactBytes": 2097152,
+  "maxVerifierRuns": 12,
+  "maxVerificationSeconds": 3600,
+  "nearExactJaccard": 0.7,
+  "semanticJaccard": 0.55,
+  "existingThreadJaccard": 0.68,
+  "outcomes": [
+    "verified",
+    "duplicate",
+    "unsupported",
+    "wrongSeverity",
+    "needsHuman"
+  ]
+}

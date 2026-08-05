@@ -110,6 +110,16 @@
     default: the pass is disabled unless the operator opts in and names a model
     here or in config.review.conventionSpecialistModel.
 
+.PARAMETER EnableVerificationPreview
+    Run independent cross-verification over the two generalist discovery passes
+    and convention-specialist candidates. Outputs are separately sealed preview
+    artifacts only; they never alter comments, summaries, delivery, or votes.
+
+.PARAMETER ConventionVerifierModel
+    Explicit named generalist model that verifies convention-specialist
+    candidates. Requires -EnableVerificationPreview and must differ from the
+    convention-specialist discovery model.
+
 .PARAMETER PromotePreview
     Publish the review stored in a preview artifact (.json) instead of running
     the model again. The stored review is re-parsed through the same schema that
@@ -190,6 +200,10 @@ param(
 
     [string]$ConventionSpecialistModel,
 
+    [switch]$EnableVerificationPreview,
+
+    [string]$ConventionVerifierModel,
+
     [string]$Organization,
 
     [string]$RepositoryName,
@@ -259,7 +273,10 @@ param(
     [int]$CycleTimeoutSeconds = 1800,
 
     [ValidateRange(30, 3600)]
-    [int]$ConventionSpecialistTimeoutSeconds = 900
+    [int]$ConventionSpecialistTimeoutSeconds = 900,
+
+    [ValidateRange(30, 3600)]
+    [int]$VerificationTimeoutSeconds = 900
 )
 
 $ErrorActionPreference = "Stop"
@@ -340,6 +357,25 @@ $ConventionSpecialistPromptPath = Join-Path $PSScriptRoot "convention-review.pro
 if (-not (Test-Path -LiteralPath $ConventionSpecialistPromptPath)) {
     throw "Convention-specialist prompt '$ConventionSpecialistPromptPath' does not exist."
 }
+$CrossVerificationLibrary = Join-Path $PSScriptRoot "CrossVerification.ps1"
+if (-not (Test-Path -LiteralPath $CrossVerificationLibrary)) {
+    throw "Cross-verification library '$CrossVerificationLibrary' does not exist."
+}
+. $CrossVerificationLibrary
+$CrossVerificationPromptPath = Join-Path $PSScriptRoot "cross-verify.prompt.md"
+if (-not (Test-Path -LiteralPath $CrossVerificationPromptPath)) {
+    throw "Cross-verification prompt '$CrossVerificationPromptPath' does not exist."
+}
+$CrossVerificationPolicyPath = Join-Path $PSScriptRoot "verification\v1\policy.json"
+$CrossVerificationSchemaPath = Join-Path $PSScriptRoot "verification\v1\schema.json"
+foreach ($requiredVerificationAsset in @($CrossVerificationPolicyPath, $CrossVerificationSchemaPath)) {
+    if (-not (Test-Path -LiteralPath $requiredVerificationAsset)) {
+        throw "Cross-verification asset '$requiredVerificationAsset' does not exist."
+    }
+}
+$CrossVerificationPolicy = Get-Content -LiteralPath $CrossVerificationPolicyPath -Raw | ConvertFrom-Json -Depth 32
+$EffectiveCrossVerificationPolicy = ConvertTo-ReviewerVerificationEffectivePolicy `
+    -Policy $CrossVerificationPolicy
 $ReviewFactPolicyPath = Join-Path $PSScriptRoot "facts\v1\policy.json"
 $ReviewFactSchemaPath = Join-Path $PSScriptRoot "facts\v1\schema.json"
 foreach ($requiredFactAsset in @($ReviewFactPolicyPath, $ReviewFactSchemaPath)) {
@@ -414,6 +450,11 @@ $script:ReviewerAllowToolCeiling = @(
 # Keeping this list code-defined prevents an empty grant from restoring Copilot
 # CLI default discovery and prevents config from widening the specialist.
 $script:ReviewerConventionSpecialistAllowToolCeiling = @(
+    "ado(repo_pull_request)",
+    "ado(repo_file)"
+)
+
+$script:ReviewerVerificationAllowToolCeiling = @(
     "ado(repo_pull_request)",
     "ado(repo_file)"
 )
@@ -1840,6 +1881,25 @@ if ($reviewCfg.PSObject.Properties["conventionSpecialistModel"]) {
     $CfgConventionSpecialistModel = Get-AgentConfigString -Object $reviewCfg -Name "conventionSpecialistModel" `
         -Where "config.review" -MaxLength 64 -AllowEmpty
 }
+$CfgVerificationEnabled = $false
+$CfgConventionVerifierModel = ""
+$CfgVerificationTimeoutSeconds = 900
+$verificationCfgProperty = $reviewCfg.PSObject.Properties["verification"]
+if ($verificationCfgProperty) {
+    $verificationCfg = $verificationCfgProperty.Value
+    Assert-ReviewerExactObjectKeys -Object $verificationCfg `
+        -Allowed @("schemaVersion", "enabled", "conventionVerifierModel", "timeoutSeconds") `
+        -Required @("schemaVersion", "enabled", "conventionVerifierModel", "timeoutSeconds") `
+        -Where "config.review.verification"
+    $verificationSchemaVersion = Get-AgentConfigInt -Object $verificationCfg -Name "schemaVersion" `
+        -Where "config.review.verification" -Min 1 -Max 1
+    $CfgVerificationEnabled = Get-AgentConfigBool -Object $verificationCfg -Name "enabled" `
+        -Where "config.review.verification"
+    $CfgConventionVerifierModel = Get-AgentConfigString -Object $verificationCfg `
+        -Name "conventionVerifierModel" -Where "config.review.verification" -MaxLength 64 -AllowEmpty
+    $CfgVerificationTimeoutSeconds = Get-AgentConfigInt -Object $verificationCfg `
+        -Name "timeoutSeconds" -Where "config.review.verification" -Min 30 -Max 3600
+}
 foreach ($sev in @($PostSeverities)) {
     if ($script:ReviewerSeverities -cnotcontains $sev) {
         throw "config.review.postSeverities contains '$sev', which is not one of: $($script:ReviewerSeverities -join ', ')."
@@ -2029,6 +2089,56 @@ elseif ($ConventionSpecialistModel) {
     throw "-ConventionSpecialistModel requires -EnableConventionSpecialist."
 }
 
+$EffectiveEnableVerificationPreview = ([bool]$EnableVerificationPreview -or $CfgVerificationEnabled)
+$selectedConventionVerifierModel = if ($ConventionVerifierModel) {
+    $ConventionVerifierModel
+}
+else {
+    $CfgConventionVerifierModel
+}
+$EffectiveConventionVerifierModel = ""
+$EffectiveVerificationTimeoutSeconds = if ($PSBoundParameters.ContainsKey("VerificationTimeoutSeconds")) {
+    $VerificationTimeoutSeconds
+}
+else {
+    $CfgVerificationTimeoutSeconds
+}
+if ($EffectiveEnableVerificationPreview) {
+    if (-not $IsTwoPass) {
+        throw "Verification preview requires two explicitly named independent generalist passes."
+    }
+    if (@($ReviewPassModels | Where-Object {
+                $_ -ceq "claude-opus-5" -or $_ -ceq "gpt-5.6-sol"
+            }).Count -ne 2) {
+        throw "Verification preview requires the explicit claude-opus-5 and gpt-5.6-sol generalist pairing."
+    }
+    if (-not $EnableConventionSpecialist) {
+        throw "Verification preview requires -EnableConventionSpecialist so all layer-5 inputs are present."
+    }
+    if (-not $selectedConventionVerifierModel) {
+        throw ("Verification preview requires an explicit -ConventionVerifierModel or " +
+            "config.review.verification.conventionVerifierModel.")
+    }
+    $EffectiveConventionVerifierModel = Assert-AgentSupportedModel `
+        -ModelId $selectedConventionVerifierModel -Where "convention verifier model"
+    if ($EffectiveConventionVerifierModel -ceq $EffectiveConventionSpecialistModel) {
+        throw "The convention verifier model must differ from the convention-specialist discovery model."
+    }
+    Test-AgentAllowToolCeiling -Candidates $script:ReviewerVerificationAllowToolCeiling `
+        -Ceiling $script:ReviewerAllowToolCeiling -MandatoryDeny $script:ReviewerMandatoryDenyTools `
+        -Where "cross-verification code-defined allow list"
+    $missingVerificationPermissions = @($script:ReviewerVerificationAllowToolCeiling | Where-Object {
+            $ConfigAllowTools -cnotcontains $_
+        })
+    if ($missingVerificationPermissions.Count -gt 0) {
+        throw ("Cross-verification requires these read-only permissions in config.permissions.allowTools: " +
+            ($missingVerificationPermissions -join ", ") + ".")
+    }
+}
+elseif ($ConventionVerifierModel) {
+    throw "-ConventionVerifierModel requires -EnableVerificationPreview."
+}
+
 if (-not $RepoPath) {
     # Resolve from the CONFIG's location, never from the script's. The script
     # lives in the toolkit (possibly an installed module); the config always
@@ -2063,6 +2173,10 @@ $factPlanDir = Join-Path $StateDir "fact-plans"
 New-Item -ItemType Directory -Force -Path $factPlanDir | Out-Null
 $conventionSpecialistPreviewDir = Join-Path $StateDir "convention-specialist-previews"
 New-Item -ItemType Directory -Force -Path $conventionSpecialistPreviewDir | Out-Null
+$verificationInputDir = Join-Path $StateDir "verification-inputs"
+New-Item -ItemType Directory -Force -Path $verificationInputDir | Out-Null
+$verificationPreviewDir = Join-Path $StateDir "verification-previews"
+New-Item -ItemType Directory -Force -Path $verificationPreviewDir | Out-Null
 $logPath = Join-Path $logDir "reviewer.log.jsonl"
 $lockPath = Join-Path $StateDir "agent.lock"
 $reviewedStatePath = Join-Path $StateDir "reviewed.json"
@@ -2073,6 +2187,10 @@ $ScriptSelfSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256)
 $ConfigSha256 = (Get-FileHash -LiteralPath $ConfigFile -Algorithm SHA256).Hash
 $ConventionSpecialistPromptSha256 = (Get-FileHash -LiteralPath $ConventionSpecialistPromptPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $ConventionSpecialistLibrarySha256 = (Get-FileHash -LiteralPath $ConventionSpecialistLibrary -Algorithm SHA256).Hash.ToLowerInvariant()
+$CrossVerificationPromptSha256 = (Get-FileHash -LiteralPath $CrossVerificationPromptPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$CrossVerificationLibrarySha256 = (Get-FileHash -LiteralPath $CrossVerificationLibrary -Algorithm SHA256).Hash.ToLowerInvariant()
+$CrossVerificationPolicySha256 = (Get-FileHash -LiteralPath $CrossVerificationPolicyPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$CrossVerificationSchemaSha256 = (Get-FileHash -LiteralPath $CrossVerificationSchemaPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $ReviewFactPolicySha256 = (Get-FileHash -LiteralPath $ReviewFactPolicyPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $ReviewFactScriptClosure = @(
     [pscustomobject][ordered]@{
@@ -5289,6 +5407,7 @@ function Invoke-ReviewerConventionSpecialistPass {
     $withheld = @()
     $residualRisks = @()
     $run = $null
+    $preview = $null
     $markerSource = ""
     $toolAudit = @{
         grantedPermissions = @($script:ReviewerConventionSpecialistAllowToolCeiling)
@@ -5481,7 +5600,14 @@ function Invoke-ReviewerConventionSpecialistPass {
     catch {
         Write-Warning "Convention specialist preview could not be persisted for PR ${PrId}: $($_.Exception.Message)"
     }
-    return @{ Status = $status; Candidates = @($candidates); Withheld = @($withheld); Diagnostic = $diagnostic }
+    return @{
+        Status = $status
+        Candidates = @($candidates)
+        Withheld = @($withheld)
+        Diagnostic = $diagnostic
+        ArtifactPath = $(if ($preview) { [string]$preview.ArtifactPath } else { "" })
+        Manifest = $(if ($preview) { $preview.Manifest } else { $null })
+    }
 }
 
 function Invoke-ReviewerConventionSpecialistSafely {
@@ -5490,24 +5616,801 @@ function Invoke-ReviewerConventionSpecialistSafely {
         [Parameter(Mandatory)][int]$CycleNumber,
         [Parameter(Mandatory)][hashtable]$Bound
     )
-    if (-not $EnableConventionSpecialist) { return }
+    if (-not $EnableConventionSpecialist) { return $null }
     $prId = [int]$Bound.PrId
     $sourceCommit = [string]$Bound.SourceCommit
     try {
-        [void](Invoke-ReviewerConventionSpecialistPass -AgencyPath $AgencyPath -CycleNumber $CycleNumber `
+        return Invoke-ReviewerConventionSpecialistPass -AgencyPath $AgencyPath -CycleNumber $CycleNumber `
                 -PrId $prId -SourceCommit $sourceCommit -ThreadDigestText ([string]$Bound.DigestText) `
                 -ConventionPlanPath ([string]$Bound.ConventionPlanPath) `
-                -FactPlanPath ([string]$Bound.FactPlanPath))
+                -FactPlanPath ([string]$Bound.FactPlanPath)
     }
     catch {
-        Write-Warning "Convention specialist escaped its degradation boundary for PR ${prId}; generalist result is unchanged: $($_.Exception.Message)"
+        $escapedDiagnostic = $_.Exception.Message
+        Write-Warning "Convention specialist escaped its degradation boundary for PR ${prId}; generalist result is unchanged: $escapedDiagnostic"
         try {
             [void](Write-ReviewerConventionSpecialistPreview -PrId $prId -SourceCommit $sourceCommit `
-                    -Status "degraded" -Diagnostic $_.Exception.Message `
+                    -Status "degraded" -Diagnostic $escapedDiagnostic `
                     -Model $EffectiveConventionSpecialistModel `
                     -ConventionPlanSha256 ("0" * 64) -FactPlanSha256 ("0" * 64))
         }
         catch { Write-Warning "Emergency specialist diagnostic preview also failed: $($_.Exception.Message)" }
+        return @{
+            Status = "degraded"; Candidates = @(); Withheld = @()
+            Diagnostic = $escapedDiagnostic; ArtifactPath = ""; Manifest = $null
+        }
+    }
+}
+
+function Write-ReviewerVerificationDecisionPreview {
+    param(
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)][string]$SourceCommit,
+        [Parameter(Mandatory)][ValidateSet("complete", "degraded")][string]$Status,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Diagnostic,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$InputArtifactPath,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$InputManifestSha256,
+        [object[]]$Clusters = @(),
+        [object[]]$Assignments = @(),
+        [object[]]$VerifierRuns = @(),
+        [object[]]$Decisions = @(),
+        [object[]]$Withheld = @(),
+        [object[]]$Eligible = @(),
+        [object[]]$InputArtifactHashes = @(),
+        [ValidateRange(0, [int]::MaxValue)][int]$TotalCandidateCount = 0,
+        [AllowEmptyString()][string]$ReplaySha256 = ""
+    )
+    $stamp = [DateTime]::UtcNow.ToString(
+        "yyyyMMddTHHmmssZ", [Globalization.CultureInfo]::InvariantCulture)
+    $baseName = "pr$PrId-$($SourceCommit.Substring(0, 12))-$stamp-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $markdownPath = Join-Path $verificationPreviewDir "$baseName.md"
+    $lines = [System.Collections.Generic.List[string]]::new()
+    [void]$lines.Add("# Cross-verification preview - PR $PrId")
+    [void]$lines.Add("")
+    [void]$lines.Add("- Status: $Status")
+    [void]$lines.Add("- Source commit: $SourceCommit")
+    [void]$lines.Add("- Total normalized candidates: $TotalCandidateCount")
+    [void]$lines.Add("- Clusters: $(@($Clusters).Count)")
+    [void]$lines.Add("- Assignments: $(@($Assignments).Count)")
+    [void]$lines.Add("- Eligible preview candidates: $(@($Eligible).Count)")
+    [void]$lines.Add("- Withheld: $(@($Withheld).Count)")
+    [void]$lines.Add("- Replay SHA-256: $ReplaySha256")
+    [void]$lines.Add("- Nothing in this artifact was delivered, summarized, posted, or voted.")
+    if ($Diagnostic) { [void]$lines.Add("- Diagnostic: $Diagnostic") }
+    [void]$lines.Add("")
+    [void]$lines.Add("## Eligible preview candidates")
+    [void]$lines.Add("")
+    if (@($Eligible).Count -eq 0) { [void]$lines.Add("(none)") }
+    foreach ($candidate in @($Eligible)) {
+        $anchor = if ([string](Get-ReviewerVerificationValue $candidate "filePath" "")) {
+            "$([string]$candidate.filePath):$([int]$candidate.line)"
+        }
+        else {
+            "(PR metadata)"
+        }
+        [void]$lines.Add("- $([string]$candidate.candidateId) [$([string]$candidate.severity)] at $anchor")
+    }
+    [void]$lines.Add("")
+    [void]$lines.Add("## Withheld")
+    [void]$lines.Add("")
+    if (@($Withheld).Count -eq 0) { [void]$lines.Add("(none)") }
+    foreach ($item in @($Withheld)) {
+        [void]$lines.Add("- $([string](Get-ReviewerVerificationValue $item 'candidateId' '(none)')): " +
+            "$([string](Get-ReviewerVerificationValue $item 'reason' 'unknown')) - " +
+            "$([string](Get-ReviewerVerificationValue $item 'detail' ''))")
+    }
+    $markdown = $lines.ToArray() -join "`n"
+    [IO.File]::WriteAllText($markdownPath, $markdown, $script:ReviewerVerificationUtf8)
+    $manifest = [pscustomobject][ordered]@{
+        kind = $script:ReviewerVerificationPreviewKind
+        artifactVersion = $script:ReviewerVerificationArtifactVersion
+        status = $Status
+        diagnostic = $Diagnostic
+        organization = $Organization
+        project = $ExpectedProject
+        repositoryId = $cfgRepoId
+        prId = $PrId
+        sourceCommit = $SourceCommit
+        configSha256 = $ConfigSha256.ToLowerInvariant()
+        scriptSha256 = $ScriptSelfSha256.ToLowerInvariant()
+        verificationLibrarySha256 = $CrossVerificationLibrarySha256
+        promptSha256 = $CrossVerificationPromptSha256
+        policySha256 = $CrossVerificationPolicySha256
+        schemaSha256 = $CrossVerificationSchemaSha256
+        inputArtifactPath = $InputArtifactPath
+        inputManifestSha256 = $InputManifestSha256
+        inputArtifactHashes = @($InputArtifactHashes)
+        totalCandidateCount = $TotalCandidateCount
+        clusters = @($Clusters | ForEach-Object {
+                [pscustomobject][ordered]@{
+                    clusterId = [string]$_.clusterId
+                    status = [string](Get-ReviewerVerificationValue $_ "status" "ready")
+                    memberHashes = @($_.memberHashes)
+                    origins = @($_.origins)
+                }
+            })
+        assignments = @($Assignments)
+        verifierRuns = @($VerifierRuns)
+        decisions = @($Decisions)
+        withheld = @($Withheld)
+        eligiblePreviewCandidates = @($Eligible)
+        replaySha256 = $ReplaySha256
+        markdownPath = $markdownPath
+        markdownSha256 = Get-ReviewerVerificationSha256 -Text $markdown
+        createdAt = [DateTime]::UtcNow.ToString("o", [Globalization.CultureInfo]::InvariantCulture)
+    }
+    $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $artifactPath = Save-ReviewerVerificationPreview -Manifest $manifest `
+        -Directory $verificationPreviewDir -BaseName $baseName -MasterKey $masterKey `
+        -MaxArtifactBytes ([int]$EffectiveCrossVerificationPolicy.maxArtifactBytes)
+    Write-Host "Cross-verification preview for PR $PrId saved to $markdownPath" -ForegroundColor DarkCyan
+    return @{ MarkdownPath = $markdownPath; ArtifactPath = $artifactPath; Manifest = $manifest }
+}
+
+function Invoke-ReviewerVerificationModelRun {
+    param(
+        [Parameter(Mandatory)][string]$AgencyPath,
+        [Parameter(Mandatory)]$Binding,
+        [Parameter(Mandatory)][string]$InputManifestSha256,
+        [Parameter(Mandatory)]$Cluster,
+        [Parameter(Mandatory)][string]$VerifierModel,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$AssignedCandidates,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$SiblingEvidence,
+        [AllowEmptyCollection()][object[]]$EvidenceHunks = @(),
+        [AllowEmptyCollection()][object[]]$CandidateEvidence = @(),
+        [AllowEmptyCollection()][object[]]$DeterministicFacts = @(),
+        [AllowEmptyCollection()][object[]]$ThreadFacts = @(),
+        [ValidateRange(30, 3600)][int]$TimeoutSeconds = 900
+    )
+    $nonce = New-AgentNonce
+    $promptText = [IO.File]::ReadAllText($CrossVerificationPromptPath, $script:ReviewerUtf8)
+    $modelInput = New-ReviewerVerificationModelInput -PromptText $promptText -Nonce $nonce `
+        -Binding $Binding -VerificationInputSha256 $InputManifestSha256 `
+        -ClusterId ([string]$Cluster.clusterId) -VerifierModel $VerifierModel `
+        -Candidates $AssignedCandidates -SiblingEvidence $SiblingEvidence `
+        -CandidateEvidence $CandidateEvidence `
+        -DeterministicFacts $DeterministicFacts -SanitizedThreads $ThreadFacts `
+        -MinimalDiffHunk (ConvertTo-ReviewerVerificationCanonicalArray -Items @($EvidenceHunks)) `
+        -MaxInputBytes ([int]$EffectiveCrossVerificationPolicy.maxInputBytes)
+    $allowTools = @($script:ReviewerVerificationAllowToolCeiling)
+    $availableTools = ConvertTo-ReviewerAvailableToolNames -PermissionTools $allowTools
+    $denyTools = Get-ReviewerEffectiveDenyTools -ConfigDeny $ConfigDenyTools
+    $agencyArgs = Get-AgentCopilotArgs -AgentName "" -Source "" `
+        -AvailableTools $availableTools -AllowTools $allowTools -DenyTools $denyTools `
+        -Model $VerifierModel -JsonOutput
+    Write-Host ("Launching cross-verifier {0} for {1} ({2} candidate(s), timeout={3}s)..." -f `
+            $VerifierModel, [string]$Cluster.clusterId, @($AssignedCandidates).Count,
+            $TimeoutSeconds) -ForegroundColor Cyan
+    $run = Invoke-TimedProcess -FilePath $AgencyPath -ArgumentList $agencyArgs `
+        -StandardInputContent $modelInput.text -CaptureStdOut -CaptureStdErr -WorkingDirectory $RepoPath `
+        -EnvironmentVariablesToRemove $CopilotSensitiveEnvironmentVariables `
+        -TimeoutSeconds $TimeoutSeconds
+    $cliOutcome = Get-AgentCliJsonOutcome -StdOutText ([string]$run.StdOut)
+    $markerSource = [string]$run.StdOut
+    $requestedTools = @()
+    $modifiedFiles = @()
+    $reportedModel = ""
+    $requestAuditTruncated = $false
+    if ($cliOutcome) {
+        if ($cliOutcome.Answer) { $markerSource = [string]$cliOutcome.Answer }
+        $requestedTools = @($cliOutcome.ToolRequests | Select-Object -First 64)
+        $modifiedFiles = @($cliOutcome.ModifiedFiles)
+        $reportedModel = [string]$cliOutcome.Model
+        $requestAuditTruncated = (@($cliOutcome.ToolRequests).Count -gt 64)
+    }
+    $toolAudit = [pscustomobject][ordered]@{
+        grantedPermissions = @($allowTools)
+        availableTools = @($availableTools)
+        deniedPermissions = @($denyTools)
+        requestedTools = @($requestedTools | ForEach-Object {
+                Format-ReviewerConventionSpecialistAuditName -Name ([string]$_)
+            })
+        requestAuditTruncated = $requestAuditTruncated
+        modifiedFiles = @($modifiedFiles)
+    }
+    $failureReason = ""
+    $failureDetail = ""
+    if ($run.TimedOut) {
+        $failureReason = "timeout"
+        $failureDetail = "Verifier timed out after $TimeoutSeconds seconds."
+    }
+    elseif ([int]$run.ExitCode -ne 0) {
+        $failureReason = "incompleteVerifier"
+        $failureDetail = "Verifier process exited $([int]$run.ExitCode)."
+    }
+    elseif (-not (Test-ReviewerVerificationReportedModel `
+            -ExpectedModel $VerifierModel -ReportedModel $reportedModel)) {
+        $failureReason = "modelMismatch"
+        $failureDetail = if ($reportedModel) {
+            "CLI reported '$reportedModel' instead of '$VerifierModel'."
+        }
+        else {
+            "CLI did not report an exact verifier model identity."
+        }
+    }
+    elseif ($modifiedFiles.Count -gt 0) {
+        $failureReason = "toolViolation"
+        $failureDetail = "Verifier reported modified files despite the read-only grant."
+    }
+    else {
+        $unrecognized = @($requestedTools | Where-Object {
+                -not (ConvertTo-ReviewerConventionSpecialistToolIdentity -Name ([string]$_))
+            })
+        $forbidden = @($requestedTools | Where-Object {
+                $rawName = [string]$_
+                $script:ReviewerMandatoryDenyTools -ccontains $rawName -or
+                @($script:ReviewerForbiddenToolFamilies | Where-Object {
+                        $rawName.StartsWith($_, [StringComparison]::OrdinalIgnoreCase)
+                    }).Count -gt 0 -or
+                $rawName -match '(?i)(^|[_(-])(write|edit|create|task|shell|web)([_)-]|$)'
+            })
+        if ($unrecognized.Count -gt 0 -or $forbidden.Count -gt 0 -or
+            [bool]$toolAudit.requestAuditTruncated) {
+            $failureReason = "toolViolation"
+            $failureDetail = "Verifier tool audit was unrecognized, forbidden, or incomplete."
+        }
+    }
+    $marker = $null
+    if (-not $failureReason) {
+        if ($script:ReviewerUtf8.GetByteCount($markerSource) -gt 65536) {
+            $failureReason = "invalidMarker"
+            $failureDetail = "Verifier output exceeded the 65536-byte cap."
+        }
+        else {
+            $marker = ConvertFrom-AgentResultMarker -StdOutText $markerSource `
+                -MarkerPrefix $script:ReviewerVerificationMarkerPrefix `
+                -Schema (Get-ReviewerVerificationMarkerSchema -ExpectedProject $ExpectedProject `
+                    -ExpectedNonce $nonce -ExpectedVerifierModel $VerifierModel `
+                    -MaxVerdicts @($AssignedCandidates).Count)
+            if (-not $marker) {
+                $failureReason = "invalidMarker"
+                $failureDetail = "Verifier produced a missing or invalid result marker."
+            }
+        }
+    }
+    if ($marker -and -not (Test-ReviewerVerificationBinding -Marker $marker `
+            -PrId ([int]$Binding.pullRequestId) -RepositoryId ([string]$Binding.repositoryId) `
+            -SourceCommit ([string]$Binding.sourceCommit) -TargetCommit ([string]$Binding.targetCommit) `
+            -ChangeSetDigest ([string]$Binding.changeSetDigest) `
+            -VerificationInputSha256 $InputManifestSha256 -ClusterId ([string]$Cluster.clusterId) `
+            -ConfigSha256 ([string]$Binding.configSha256) -ScriptSha256 ([string]$Binding.scriptSha256) `
+            -PromptSha256 ([string]$Binding.promptSha256) -VerifierModel $VerifierModel)) {
+        $marker = $null
+        $failureReason = "staleBinding"
+        $failureDetail = "Verifier result marker binding is stale."
+    }
+    if ($marker) {
+        $expectedIds = @($AssignedCandidates | ForEach-Object { [string]$_.candidateId } | Sort-Object)
+        $actualIds = @($marker.verdicts | ForEach-Object { [string]$_.candidateId } | Sort-Object)
+        if (($expectedIds -join "|") -cne ($actualIds -join "|")) {
+            $marker = $null
+            $failureReason = "invalidMarker"
+            $failureDetail = "Verifier verdict set did not exactly match its assigned candidates."
+        }
+    }
+    return [pscustomobject][ordered]@{
+        status = $(if ($marker) { "complete" } else { "degraded" })
+        reason = $failureReason
+        detail = $failureDetail
+        model = $VerifierModel
+        clusterId = [string]$Cluster.clusterId
+        nonceSha256 = Get-ReviewerVerificationSha256 -Text $nonce
+        promptSha256 = $CrossVerificationPromptSha256
+        inputBytes = [int]$modelInput.bytes
+        toolAudit = $toolAudit
+        marker = $marker
+    }
+}
+
+function Get-ReviewerVerificationSourceHunks {
+    param(
+        [Parameter(Mandatory)][string]$AgencyPath,
+        [Parameter(Mandatory)][string]$SourceCommit,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Candidates,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$ChangedPaths
+    )
+    $changed = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($changedPath in @($ChangedPaths)) {
+        $normalized = (ConvertTo-ReviewerVerificationPath -Path ([string]$changedPath)).TrimStart("/")
+        if ($normalized) { [void]$changed.Add($normalized) }
+    }
+    return Invoke-ReviewerConventionSession -AgencyPath $AgencyPath -Action {
+        param([hashtable]$verificationSession)
+        $fileCache = @{}
+        $hunks = [System.Collections.Generic.List[object]]::new()
+        foreach ($candidate in @($Candidates)) {
+            if ([string]$candidate.anchorKind -cne "changedFile" -or
+                -not [string]$candidate.filePath -or [int]$candidate.line -lt 1) {
+                continue
+            }
+            $normalizedPath = (ConvertTo-ReviewerVerificationPath -Path (
+                    [string]$candidate.filePath)).TrimStart("/")
+            $path = ConvertTo-ReviewerVerificationReadPath -Path ([string]$candidate.filePath)
+            $segments = @($normalizedPath -split '/')
+            if (-not $changed.Contains($normalizedPath) -or
+                $normalizedPath -notmatch '^[a-z0-9._ /-]+$' -or
+                @($segments | Where-Object { $_ -eq "" -or $_ -eq "." -or $_ -eq ".." }).Count -gt 0) {
+                continue
+            }
+            try {
+                if (-not $fileCache.ContainsKey($normalizedPath)) {
+                    $fileCache[$normalizedPath] = Get-ReviewerFactSourceFile -Session $verificationSession `
+                        -Path $path -SourceCommit $SourceCommit -MaxBytes 131072
+                }
+                $content = [string]$fileCache[$normalizedPath].Content
+                $lines = @($content.Replace("`r`n", "`n").Replace("`r", "`n") -split "`n")
+                $line = [int]$candidate.line
+                if ($line -gt $lines.Count) { continue }
+                $start = [Math]::Max(1, $line - 3)
+                $end = [Math]::Min($lines.Count, $line + 3)
+                $rendered = [System.Collections.Generic.List[string]]::new()
+                for ($index = $start; $index -le $end; $index++) {
+                    [void]$rendered.Add((
+                            [Convert]::ToString($index, [Globalization.CultureInfo]::InvariantCulture) +
+                            ": " + [string]$lines[$index - 1]))
+                }
+                $text = $rendered.ToArray() -join "`n"
+                [void]$hunks.Add([pscustomobject][ordered]@{
+                        candidateId = [string]$candidate.candidateId
+                        filePath = [string]$candidate.filePath
+                        line = $line
+                        startLine = $start
+                        endLine = $end
+                        sourceCommit = $SourceCommit
+                        text = $text
+                        sha256 = Get-ReviewerVerificationSha256 -Text $text
+                    })
+            }
+            catch {
+                Write-Warning "Could not build verifier source hunk for '$path': $($_.Exception.Message)"
+            }
+        }
+        return $hunks.ToArray()
+    }
+}
+
+function Invoke-ReviewerCrossVerificationPass {
+    param(
+        [Parameter(Mandatory)][string]$AgencyPath,
+        [Parameter(Mandatory)][int]$CycleNumber,
+        [Parameter(Mandatory)][hashtable]$Bound,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$PassResults,
+        $SpecialistResult = $null
+    )
+    $verificationPhaseStopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $prId = [int]$Bound.PrId
+    $sourceCommit = [string]$Bound.SourceCommit
+    $conventionPlan = $null
+    $factPlan = $null
+    $resolvedSources = @()
+    $changeEntries = @()
+    if ([string]$Bound.ConventionPlanPath) {
+        $conventionPlan = Read-ReviewerConventionPlan -Path ([string]$Bound.ConventionPlanPath)
+    }
+    if ([string]$Bound.FactPlanPath) {
+        $factPlan = Read-ReviewerFactPlan -Path ([string]$Bound.FactPlanPath)
+    }
+    if (-not $conventionPlan -or -not $factPlan) {
+        throw "Cross-verification requires sealed convention and fact plans."
+    }
+    $targetCommit = [string](Get-ReviewerVerificationValue $conventionPlan "targetCommit" "")
+    $changeSetDigest = [string](Get-ReviewerVerificationValue $conventionPlan "changeSetDigest" "")
+    if ($targetCommit -notmatch '^[0-9a-f]{40}$' -or $changeSetDigest -notmatch '^[0-9a-f]{64}$') {
+        throw "Cross-verification plans do not carry a complete immutable binding."
+    }
+    $sessionData = Invoke-ReviewerConventionSession -AgencyPath $AgencyPath -Action {
+        param([hashtable]$verificationSession)
+        $pinned = Get-ReviewerPinnedConventionChangeSet -Session $verificationSession -PrId $prId `
+            -ExpectedSourceCommit $sourceCommit
+        if ($pinned.TargetCommit -cne $targetCommit -or $pinned.Digest -cne $changeSetDigest) {
+            throw "Cross-verification source/change-set binding moved before verification."
+        }
+        $sources = @()
+        if ($SpecialistResult -and @($SpecialistResult.Candidates).Count -gt 0) {
+            $sources = @(Get-ReviewerConventionSpecialistResolvedSources `
+                    -Session $verificationSession -ConventionPlan $conventionPlan)
+        }
+        return @{ Changes = @($pinned.Entries); Sources = @($sources) }
+    }
+    $changeEntries = @($sessionData.Changes)
+    $resolvedSources = @($sessionData.Sources)
+    $rawPasses = [System.Collections.Generic.List[object]]::new()
+    $inputHashes = [System.Collections.Generic.List[object]]::new()
+    foreach ($pass in @($PassResults)) {
+        $marker = Get-ReviewerVerificationValue $pass "Marker"
+        $markerJson = if ($marker) {
+            ConvertTo-ReviewerVerificationCanonicalJson -Value $marker
+        }
+        else {
+            ""
+        }
+        $markerSha = if ($markerJson) { Get-ReviewerVerificationSha256 -Text $markerJson } else { "0" * 64 }
+        [void]$rawPasses.Add([pscustomobject][ordered]@{
+                model = [string](Get-ReviewerVerificationValue $pass "Model" "")
+                status = $(if ($marker) { "complete" } else { "degraded" })
+                reason = [string](Get-ReviewerVerificationValue $pass "Reason" "")
+                markerJson = $markerJson
+                markerSha256 = $markerSha
+            })
+        [void]$inputHashes.Add([pscustomobject][ordered]@{
+                kind = "generalist-pass"
+                id = [string](Get-ReviewerVerificationValue $pass "Model" "")
+                sha256 = $markerSha
+            })
+    }
+    $specialistStatus = [string](Get-ReviewerVerificationValue $SpecialistResult "Status" "degraded")
+    $specialistCandidates = @((Get-ReviewerVerificationValue $SpecialistResult "Candidates" @()))
+    $specialistManifest = Get-ReviewerVerificationValue $SpecialistResult "Manifest"
+    $specialistArtifactPath = [string](Get-ReviewerVerificationValue $SpecialistResult "ArtifactPath" "")
+    $specialistArtifactSha = if ($specialistArtifactPath -and
+        (Test-Path -LiteralPath $specialistArtifactPath -PathType Leaf)) {
+        (Get-FileHash -LiteralPath $specialistArtifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    else {
+        "0" * 64
+    }
+    [void]$inputHashes.Add([pscustomobject][ordered]@{
+            kind = "convention-specialist"; id = $EffectiveConventionSpecialistModel
+            sha256 = $specialistArtifactSha
+        })
+    foreach ($item in @(
+            @("convention-plan", [string]$Bound.ConventionPlanPath),
+            @("fact-plan", [string]$Bound.FactPlanPath)
+        )) {
+        $sha = if ([string]$item[1] -and (Test-Path -LiteralPath ([string]$item[1]))) {
+            (Get-FileHash -LiteralPath ([string]$item[1]) -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+        else {
+            "0" * 64
+        }
+        [void]$inputHashes.Add([pscustomobject][ordered]@{
+                kind = [string]$item[0]; id = [IO.Path]::GetFileName([string]$item[1]); sha256 = $sha
+            })
+    }
+    foreach ($item in @(
+            @("config", $ConfigSha256.ToLowerInvariant()),
+            @("reviewer-script", $ScriptSelfSha256.ToLowerInvariant()),
+            @("verification-library", $CrossVerificationLibrarySha256),
+            @("verification-prompt", $CrossVerificationPromptSha256),
+            @("verification-policy", $CrossVerificationPolicySha256),
+            @("verification-schema", $CrossVerificationSchemaSha256)
+        )) {
+        [void]$inputHashes.Add([pscustomobject][ordered]@{
+                kind = [string]$item[0]; id = [string]$item[0]; sha256 = [string]$item[1]
+            })
+    }
+    $normalizedPasses = @($rawPasses | ForEach-Object {
+            [pscustomobject][ordered]@{
+                model = [string]$_.model
+                marker = $(if ($_.markerJson) { [string]$_.markerJson | ConvertFrom-Json -Depth 32 } else { $null })
+            }
+        })
+    $candidatePlan = Get-ReviewerVerificationCandidatePlan -GeneralistPasses $normalizedPasses `
+        -ConventionCandidates $specialistCandidates -ConventionModel $EffectiveConventionSpecialistModel `
+        -ConventionArtifactSha256 $specialistArtifactSha `
+        -MaxCandidates ([int]$EffectiveCrossVerificationPolicy.maxCandidates)
+    $candidates = @($candidatePlan.candidates)
+    $preVerificationWithheld = @($candidatePlan.withheld)
+    $clusters = @(Get-ReviewerVerificationClusters -Candidates $candidates `
+        -MaxCandidates ([int]$EffectiveCrossVerificationPolicy.maxCandidates) `
+        -MaxClusterSize ([int]$EffectiveCrossVerificationPolicy.maxClusterSize) `
+        -NearExactJaccard ([double]$EffectiveCrossVerificationPolicy.nearExactJaccard) `
+        -SemanticJaccard ([double]$EffectiveCrossVerificationPolicy.semanticJaccard))
+    $assignments = @(Get-ReviewerVerificationAssignments -Clusters $clusters `
+        -GeneralistModels $ReviewPassModels -ConventionVerifierModel $EffectiveConventionVerifierModel `
+        -ChangedPaths @($Bound.ChangedPaths))
+    $readyCandidateIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($cluster in @($clusters | Where-Object { [string]$_.status -ceq "ready" })) {
+        foreach ($member in @($cluster.members)) { [void]$readyCandidateIds.Add([string]$member.candidateId) }
+    }
+    $verifiableCandidates = @($candidates | Where-Object {
+            $readyCandidateIds.Contains([string]$_.candidateId)
+        })
+    $evidenceHunks = @(Get-ReviewerVerificationSourceHunks -AgencyPath $AgencyPath `
+        -SourceCommit $sourceCommit -Candidates $verifiableCandidates -ChangedPaths @($Bound.ChangedPaths))
+    $threadFacts = @(Get-ReviewerVerificationThreadFacts -FactPlan $factPlan)
+    $candidateEvidenceOptions = [System.Collections.Generic.List[object]]::new()
+    foreach ($candidate in $verifiableCandidates) {
+        $candidateCluster = @($clusters | Where-Object {
+                @($_.memberHashes) -ccontains [string]$candidate.candidateHash
+            } | Select-Object -First 1)
+        $siblingCandidates = if ($candidateCluster.Count -eq 1) {
+            @($candidateCluster[0].members)
+        }
+        else {
+            @()
+        }
+        [void]$candidateEvidenceOptions.Add([pscustomobject][ordered]@{
+                candidateId = [string]$candidate.candidateId
+                options = @(Get-ReviewerVerificationEvidenceOptions -Candidate $candidate `
+                    -FactPlan $factPlan -ThreadFacts $threadFacts -EvidenceHunks $evidenceHunks `
+                    -SiblingCandidates $siblingCandidates `
+                    -ExistingThreadJaccard ([double]$EffectiveCrossVerificationPolicy.existingThreadJaccard))
+            })
+    }
+    $binding = [pscustomobject][ordered]@{
+        organization = $Organization
+        project = $ExpectedProject
+        repositoryId = $cfgRepoId.ToLowerInvariant()
+        pullRequestId = $prId
+        sourceCommit = $sourceCommit.ToLowerInvariant()
+        targetCommit = $targetCommit.ToLowerInvariant()
+        changeSetDigest = $changeSetDigest.ToLowerInvariant()
+        configSha256 = $ConfigSha256.ToLowerInvariant()
+        scriptSha256 = $ScriptSelfSha256.ToLowerInvariant()
+        promptSha256 = $CrossVerificationPromptSha256
+    }
+    $inputBody = [pscustomobject][ordered]@{
+        kind = $script:ReviewerVerificationInputKind
+        artifactVersion = $script:ReviewerVerificationArtifactVersion
+        effectivePolicy = [pscustomobject][ordered]@{
+            maxCandidates = [int]$EffectiveCrossVerificationPolicy.maxCandidates
+            maxClusterSize = [int]$EffectiveCrossVerificationPolicy.maxClusterSize
+            maxVerifierRuns = [int]$EffectiveCrossVerificationPolicy.maxVerifierRuns
+            maxVerificationSeconds = [int]$EffectiveCrossVerificationPolicy.maxVerificationSeconds
+            maxInputBytes = [int]$EffectiveCrossVerificationPolicy.maxInputBytes
+            maxArtifactBytes = [int]$EffectiveCrossVerificationPolicy.maxArtifactBytes
+            nearExactJaccard = [double]$EffectiveCrossVerificationPolicy.nearExactJaccard
+            semanticJaccard = [double]$EffectiveCrossVerificationPolicy.semanticJaccard
+            existingThreadJaccard = [double]$EffectiveCrossVerificationPolicy.existingThreadJaccard
+        }
+        binding = $binding
+        rawGeneralistPasses = $rawPasses.ToArray()
+        specialistStatus = $specialistStatus
+        specialistArtifactPath = $specialistArtifactPath
+        specialistArtifactSha256 = $specialistArtifactSha
+        specialistManifest = $specialistManifest
+        conventionPlan = $conventionPlan
+        factPlan = $factPlan
+        resolvedSources = @($resolvedSources)
+        evidenceHunks = @($evidenceHunks)
+        changedEntries = @($changeEntries)
+        changedPaths = @($Bound.ChangedPaths)
+        threadFacts = @($threadFacts)
+        candidateEvidenceOptions = $candidateEvidenceOptions.ToArray()
+        candidates = @($candidates)
+        totalCandidateCount = [int]$candidatePlan.totalCandidateCount
+        preVerificationWithheld = @($preVerificationWithheld)
+        clusters = @($clusters)
+        assignments = @($assignments)
+        allInputArtifactHashes = $inputHashes.ToArray()
+    }
+    $inputManifestSha = Get-ReviewerVerificationObjectSha256 -Value $inputBody
+    $inputManifest = [pscustomobject][ordered]@{
+        kind = $inputBody.kind
+        artifactVersion = $inputBody.artifactVersion
+        inputManifestSha256 = $inputManifestSha
+        effectivePolicy = $inputBody.effectivePolicy
+        binding = $inputBody.binding
+        rawGeneralistPasses = $inputBody.rawGeneralistPasses
+        specialistStatus = $inputBody.specialistStatus
+        specialistArtifactPath = $inputBody.specialistArtifactPath
+        specialistArtifactSha256 = $inputBody.specialistArtifactSha256
+        specialistManifest = $inputBody.specialistManifest
+        conventionPlan = $inputBody.conventionPlan
+        factPlan = $inputBody.factPlan
+        resolvedSources = $inputBody.resolvedSources
+        evidenceHunks = $inputBody.evidenceHunks
+        changedEntries = $inputBody.changedEntries
+        changedPaths = $inputBody.changedPaths
+        threadFacts = $inputBody.threadFacts
+        candidateEvidenceOptions = $inputBody.candidateEvidenceOptions
+        candidates = $inputBody.candidates
+        totalCandidateCount = $inputBody.totalCandidateCount
+        preVerificationWithheld = $inputBody.preVerificationWithheld
+        clusters = $inputBody.clusters
+        assignments = $inputBody.assignments
+        allInputArtifactHashes = $inputBody.allInputArtifactHashes
+    }
+    $baseName = "pr$prId-$($sourceCommit.Substring(0, 12))-$($inputManifestSha.Substring(0, 16))"
+    $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $inputArtifactPath = Save-ReviewerVerificationInput -Manifest $inputManifest `
+        -Directory $verificationInputDir -BaseName $baseName -MasterKey $masterKey `
+        -MaxArtifactBytes ([int]$EffectiveCrossVerificationPolicy.maxArtifactBytes)
+    $runRecords = [System.Collections.Generic.List[object]]::new()
+    $groups = @{}
+    foreach ($assignment in $assignments) {
+        $key = [string]$assignment.clusterId + "`n" + [string]$assignment.verifierModel
+        if (-not $groups.ContainsKey($key)) {
+            $groups[$key] = [System.Collections.Generic.List[object]]::new()
+        }
+        [void]$groups[$key].Add($assignment)
+    }
+    $orderedGroupKeys = [System.Collections.Generic.List[string]]::new()
+    foreach ($groupKey in $groups.Keys) { [void]$orderedGroupKeys.Add([string]$groupKey) }
+    $orderedGroupKeys.Sort([StringComparer]::Ordinal)
+    $verifierRunsLaunched = 0
+    foreach ($key in $orderedGroupKeys) {
+        $groupAssignments = @($groups[$key])
+        $clusterId = [string]$groupAssignments[0].clusterId
+        $verifierModel = [string]$groupAssignments[0].verifierModel
+        $budget = Get-ReviewerVerificationRunBudget -RunsLaunched $verifierRunsLaunched `
+            -MaxRuns ([int]$EffectiveCrossVerificationPolicy.maxVerifierRuns) `
+            -ElapsedSeconds $verificationPhaseStopwatch.Elapsed.TotalSeconds `
+            -MaxPhaseSeconds ([int]$EffectiveCrossVerificationPolicy.maxVerificationSeconds) `
+            -ConfiguredRunTimeoutSeconds $EffectiveVerificationTimeoutSeconds
+        if (-not [bool]$budget.canRun) {
+            foreach ($assignment in $groupAssignments) {
+                [void]$runRecords.Add([pscustomobject][ordered]@{
+                        assignmentId = [string]$assignment.assignmentId
+                        status = "degraded"
+                        reason = [string]$budget.reason
+                        detail = "Verification aggregate run/time budget was exhausted before this assignment."
+                        model = $verifierModel
+                        clusterId = $clusterId
+                        nonceSha256 = "0" * 64
+                        promptSha256 = $CrossVerificationPromptSha256
+                        inputBytes = 0
+                        toolAudit = [pscustomobject][ordered]@{
+                            grantedPermissions = @(); availableTools = @(); deniedPermissions = @()
+                            requestedTools = @(); requestAuditTruncated = $false; modifiedFiles = @()
+                        }
+                        marker = $null
+                    })
+            }
+            continue
+        }
+        $cluster = @($clusters | Where-Object { [string]$_.clusterId -ceq $clusterId })[0]
+        $candidateIds = @($groupAssignments | ForEach-Object { [string]$_.candidateId })
+        $assignedCandidates = @($cluster.members | Where-Object {
+                $candidateIds -ccontains [string]$_.candidateId
+            })
+        $siblingEvidence = @($cluster.members | Where-Object {
+                $candidateIds -cnotcontains [string]$_.candidateId -and
+                [string]$_.originModel -cne $verifierModel
+            } | ForEach-Object {
+                [pscustomobject][ordered]@{
+                    candidateId = [string]$_.candidateId
+                    candidateHash = [string]$_.candidateHash
+                    originKind = [string]$_.originKind
+                    originModel = [string]$_.originModel
+                    issueClass = [string]$_.issueClass
+                    filePath = [string]$_.filePath
+                    line = [int]$_.line
+                    evidenceSha256 = Get-ReviewerVerificationSha256 -Text ([string]$_.evidence)
+                }
+            })
+        $assignedHunks = @($evidenceHunks | Where-Object {
+                $candidateIds -ccontains [string]$_.candidateId
+            })
+        $relevantThreads = @($threadFacts | Where-Object {
+                $thread = $_
+                @($assignedCandidates | Where-Object {
+                        Test-ReviewerVerificationThreadRelevant -Candidate $_ -Thread $thread `
+                            -ExistingThreadJaccard ([double]$EffectiveCrossVerificationPolicy.existingThreadJaccard)
+                    }).Count -gt 0
+            })
+        $relevantFactIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($assignedCandidate in $assignedCandidates) {
+            foreach ($factId in @(([string]$assignedCandidate.factIds) -split ',' | Where-Object { $_ })) {
+                [void]$relevantFactIds.Add($factId)
+            }
+        }
+        $relevantFacts = @($factPlan.facts | Where-Object {
+                $fact = $_
+                $factId = [string]$fact.id
+                $relevantFactIds.Contains($factId) -or
+                (@($assignedCandidates | Where-Object {
+                            [string]$_.anchorKind -ceq "prMetadata"
+                        }).Count -gt 0 -and [string]$fact.domain -ceq "metadata")
+            })
+        $eligibleSiblingCandidates = @($cluster.members | Where-Object {
+                [string]$_.originModel -cne $verifierModel
+            })
+        $assignedEvidence = @($assignedCandidates | ForEach-Object {
+                [pscustomobject][ordered]@{
+                    candidateId = [string]$_.candidateId
+                    options = @(Get-ReviewerVerificationEvidenceOptions -Candidate $_ `
+                        -FactPlan $factPlan -ThreadFacts $relevantThreads -EvidenceHunks $assignedHunks `
+                        -SiblingCandidates $eligibleSiblingCandidates `
+                        -ExistingThreadJaccard ([double]$EffectiveCrossVerificationPolicy.existingThreadJaccard))
+                }
+            })
+        $runResult = Invoke-ReviewerVerificationModelRun -AgencyPath $AgencyPath -Binding $binding `
+            -InputManifestSha256 $inputManifestSha -Cluster $cluster -VerifierModel $verifierModel `
+            -AssignedCandidates $assignedCandidates -SiblingEvidence $siblingEvidence `
+            -EvidenceHunks $assignedHunks -CandidateEvidence $assignedEvidence `
+            -DeterministicFacts $relevantFacts -ThreadFacts $relevantThreads `
+            -TimeoutSeconds ([int]$budget.timeoutSeconds)
+        $verifierRunsLaunched++
+        foreach ($assignment in $groupAssignments) {
+            [void]$runRecords.Add([pscustomobject][ordered]@{
+                    assignmentId = [string]$assignment.assignmentId
+                    status = [string]$runResult.status
+                    reason = [string]$runResult.reason
+                    detail = [string]$runResult.detail
+                    model = [string]$runResult.model
+                    clusterId = [string]$runResult.clusterId
+                    nonceSha256 = [string]$runResult.nonceSha256
+                    promptSha256 = [string]$runResult.promptSha256
+                    inputBytes = [int]$runResult.inputBytes
+                    toolAudit = $runResult.toolAudit
+                    marker = $runResult.marker
+                })
+        }
+    }
+    $freshBinding = Invoke-ReviewerConventionSession -AgencyPath $AgencyPath -Action {
+        param([hashtable]$verificationSession)
+        return Get-ReviewerPinnedConventionChangeSet -Session $verificationSession -PrId $prId `
+            -ExpectedSourceCommit $sourceCommit
+    }
+    if ($freshBinding.TargetCommit -cne $targetCommit -or $freshBinding.Digest -cne $changeSetDigest) {
+        foreach ($runRecord in $runRecords) {
+            $runRecord.status = "degraded"
+            $runRecord.reason = "staleBinding"
+            $runRecord.detail = "The source/change-set binding moved during verification."
+            $runRecord.marker = $null
+        }
+    }
+    $replay = Invoke-ReviewerVerificationReplay -InputManifest $inputManifest `
+        -VerifierRuns $runRecords.ToArray()
+    $status = if (@($runRecords | Where-Object { $_.status -cne "complete" }).Count -eq 0) {
+        "complete"
+    }
+    else {
+        "degraded"
+    }
+    $preview = Write-ReviewerVerificationDecisionPreview -PrId $prId -SourceCommit $sourceCommit `
+        -Status $status -Diagnostic "" -InputArtifactPath $inputArtifactPath `
+        -InputManifestSha256 $inputManifestSha -Clusters $clusters -Assignments $assignments `
+        -VerifierRuns $runRecords.ToArray() -Decisions @($replay.decisions) `
+        -Withheld @($replay.withheld) -Eligible @($replay.eligible) `
+        -InputArtifactHashes $inputHashes.ToArray() `
+        -TotalCandidateCount ([int]$candidatePlan.totalCandidateCount) `
+        -ReplaySha256 ([string]$replay.replaySha256)
+    Write-ReviewerCycleMetadata -Fields @{
+        cycle = $CycleNumber; mode = "verification-preview"; result = $status; prId = $prId
+        sourceCommit = $sourceCommit
+        candidateCount = [int]$candidatePlan.totalCandidateCount
+        boundedCandidateCount = $candidates.Count
+        clusterCount = $clusters.Count; eligibleCount = @($replay.eligible).Count
+        withheldCount = @($replay.withheld).Count; previewPath = $preview.MarkdownPath
+        artifactPath = $preview.ArtifactPath; inputArtifactPath = $inputArtifactPath
+        replaySha256 = [string]$replay.replaySha256
+    }
+    return @{
+        Status = $status
+        Eligible = @($replay.eligible)
+        Withheld = @($replay.withheld)
+        ReplaySha256 = [string]$replay.replaySha256
+        InputArtifactPath = $inputArtifactPath
+        PreviewArtifactPath = [string]$preview.ArtifactPath
+    }
+}
+
+function Invoke-ReviewerCrossVerificationSafely {
+    param(
+        [Parameter(Mandatory)][string]$AgencyPath,
+        [Parameter(Mandatory)][int]$CycleNumber,
+        [Parameter(Mandatory)][hashtable]$Bound,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$PassResults,
+        $SpecialistResult = $null
+    )
+    if (-not $EffectiveEnableVerificationPreview) { return $null }
+    $prId = [int]$Bound.PrId
+    $sourceCommit = [string]$Bound.SourceCommit
+    try {
+        return Invoke-ReviewerCrossVerificationPass -AgencyPath $AgencyPath `
+            -CycleNumber $CycleNumber -Bound $Bound -PassResults $PassResults `
+            -SpecialistResult $SpecialistResult
+    }
+    catch {
+        $diagnostic = $_.Exception.Message
+        Write-Warning "Cross-verification degraded for PR ${prId}; current discovery and delivery remain unchanged: $diagnostic"
+        try {
+            [void](Write-ReviewerVerificationDecisionPreview -PrId $prId -SourceCommit $sourceCommit `
+                    -Status "degraded" -Diagnostic $diagnostic -InputArtifactPath "" `
+                    -InputManifestSha256 ("0" * 64) -Withheld @(
+                        [pscustomobject][ordered]@{
+                            candidateId = ""; clusterId = ""; reason = "incompleteVerifier"
+                            detail = $diagnostic
+                        }
+                    ))
+        }
+        catch {
+            Write-Warning "Emergency cross-verification diagnostic preview also failed: $($_.Exception.Message)"
+        }
+        return @{ Status = "degraded"; Eligible = @(); Withheld = @(); Diagnostic = $diagnostic }
     }
 }
 
@@ -5926,8 +6829,11 @@ function Invoke-ReviewerPullRequest {
             cycle = $CycleNumber; mode = "live"; result = "failed"; prId = $prId
             reason = $reason; environmentFault = $environmentFault
         }
-        [void](Invoke-ReviewerConventionSpecialistSafely -AgencyPath $AgencyPath `
-                -CycleNumber $CycleNumber -Bound $Bound)
+        $specialistResult = Invoke-ReviewerConventionSpecialistSafely -AgencyPath $AgencyPath `
+            -CycleNumber $CycleNumber -Bound $Bound
+        [void](Invoke-ReviewerCrossVerificationSafely -AgencyPath $AgencyPath `
+                -CycleNumber $CycleNumber -Bound $Bound -PassResults @($passResults) `
+                -SpecialistResult $specialistResult)
         return @{ ExitCode = 1; Summary = "PR $prId failed: $reason" }
     }
 
@@ -6000,8 +6906,11 @@ function Invoke-ReviewerPullRequest {
             cycle = $CycleNumber; mode = "live"; result = "failed"; prId = $prId
             reason = $reason; environmentFault = $false
         }
-        [void](Invoke-ReviewerConventionSpecialistSafely -AgencyPath $AgencyPath `
-                -CycleNumber $CycleNumber -Bound $Bound)
+        $specialistResult = Invoke-ReviewerConventionSpecialistSafely -AgencyPath $AgencyPath `
+            -CycleNumber $CycleNumber -Bound $Bound
+        [void](Invoke-ReviewerCrossVerificationSafely -AgencyPath $AgencyPath `
+                -CycleNumber $CycleNumber -Bound $Bound -PassResults @($passResults) `
+                -SpecialistResult $specialistResult)
         return @{ ExitCode = 1; Summary = "PR $prId failed: $reason" }
     }
 
@@ -6165,8 +7074,11 @@ function Invoke-ReviewerPullRequest {
     $exit = if ($postFailures -gt 0 -or ($writesRequested -and -not $delivery.Delivered -and -not $delivery.Aborted)) { 1 } else { 0 }
     # Discovery-only and intentionally last: the generalist marker, preview,
     # delivery, state, metadata, and exit code are already finalized.
-    [void](Invoke-ReviewerConventionSpecialistSafely -AgencyPath $AgencyPath `
-            -CycleNumber $CycleNumber -Bound $Bound)
+    $specialistResult = Invoke-ReviewerConventionSpecialistSafely -AgencyPath $AgencyPath `
+        -CycleNumber $CycleNumber -Bound $Bound
+    [void](Invoke-ReviewerCrossVerificationSafely -AgencyPath $AgencyPath `
+            -CycleNumber $CycleNumber -Bound $Bound -PassResults @($passResults) `
+            -SpecialistResult $specialistResult)
     return @{ ExitCode = $exit; Summary = "PR $prId reviewed ($($allFindings.Count) finding(s), $postedCount posted)" }
 }
 
@@ -6227,14 +7139,15 @@ function Invoke-ReviewerPromotion {
     }
     # Only now is it safe to interpret the manifest's contents.
     $signed = $manifestJson | ConvertFrom-Json
-    $signedKind = [string](Get-ReviewerHashValue -Container $signed -Key 'kind' -Default '')
-    if ($signedKind -and $signedKind -cne "delivery") {
-        throw "Preview artifact kind '$signedKind' is not publishable."
-    }
-
-    foreach ($k in @('artifactVersion', 'organization', 'project', 'repositoryName', 'repositoryId', 'prId', 'sourceCommit', 'markerBody', 'approvedComments', 'approvedSummary', 'approvedVote')) {
-        if ($null -eq (Get-ReviewerHashValue -Container $signed -Key $k)) { throw "Preview artifact is missing required field '$k': $ArtifactPath" }
-    }
+    $deliveryManifestKeys = @(
+        "artifactVersion", "organization", "project", "repositoryName", "repositoryId",
+        "prId", "prTitle", "sourceCommit", "markerPrefix", "maxFindingItems",
+        "reviewModels", "passesRequested", "passesCompleted", "createdAt", "scriptSha256",
+        "previewPath", "previewSha256", "approvedComments", "approvedSummary",
+        "approvedVote", "reportedFindings", "markerBody"
+    )
+    Assert-ReviewerExactObjectKeys -Object $signed -Allowed $deliveryManifestKeys `
+        -Required $deliveryManifestKeys -Where "delivery preview artifact"
     if ([int]$signed.artifactVersion -ne 3) { throw "Unsupported preview artifact version $($signed.artifactVersion)." }
 
     # A review is only meaningful against the repository it was produced for.
