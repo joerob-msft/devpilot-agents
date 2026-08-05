@@ -4554,7 +4554,7 @@ function Invoke-DryRunSelfChecks {
     # check written the obvious way silently inspects ITSELF and passes.
     # Newline-prefixed so this never matches a mention of "function X" inside
     # another self-check's own string literal/comment earlier in the file
-    # (e.g. self-check 25's own `nfunction Invoke-ReviewerPromotion" text
+    # (e.g. self-check 26's own `nfunction Invoke-ReviewerPromotion" text
     # boundary-marker) - only an actual top-level function declaration.
     $declOf = { param([string]$Name) $selfText.IndexOf(("`nfunc" + "tion " + $Name), [StringComparison]::Ordinal) }
     foreach ($fn in @('Add-ReviewerThread', 'Set-ReviewerVote')) {
@@ -5442,8 +5442,8 @@ function Invoke-DryRunSelfChecks {
     # on those functions) are reassigned here, BEFORE the first gate self-
     # check runs, to point entirely inside the sandbox, and restored in
     # 'finally' once the last one finishes. This means the real gate-
-    # delivery.json, gate-eligibility.json, artifact-signing.key and gate-
-    # decisions/ directory are never read OR written at any point during
+    # delivery.json, gate-eligibility.json, artifact-signing.key, reviewer
+    # JSONL log and gate-decisions/ directory are never read OR written at any point during
     # self-checks - not even briefly, and not even "carefully" via a save-
     # then-restore pattern on the real files. A kill at ANY moment during
     # this whole window - a normal exception, Ctrl+C, or a hard process
@@ -5457,6 +5457,7 @@ function Invoke-DryRunSelfChecks {
     $realGateEligibilityStatePathForGateSelfChecks = $gateEligibilityStatePath
     $realGateDeliveryStatePathForGateSelfChecks = $gateDeliveryStatePath
     $realArtifactKeyPathForGateSelfChecks = $artifactKeyPath
+    $realLogPathForGateSelfChecks = $logPath
     $gateSelfCheckSandboxDir = Join-Path $StateDir ("selfcheck-gate-sandbox-" + [Guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Force -Path $gateSelfCheckSandboxDir | Out-Null
     try {
@@ -5466,6 +5467,8 @@ function Invoke-DryRunSelfChecks {
         $script:gateEligibilityStatePath = Join-Path $gateSelfCheckSandboxDir "gate-eligibility.json"
         $script:gateDeliveryStatePath = Join-Path $gateSelfCheckSandboxDir "gate-delivery.json"
         $script:artifactKeyPath = Join-Path $gateSelfCheckSandboxDir "artifact-signing.key"
+        $script:logPath = Join-Path $gateSelfCheckSandboxDir "logs\reviewer.log.jsonl"
+        New-Item -ItemType Directory -Force -Path (Split-Path $script:logPath -Parent) | Out-Null
 
     Write-Host "[DRY-RUN] Self-check 25/$total : delivery-gate kill switch and three-authority enablement" -ForegroundColor Cyan
     $killSwitchPolicy = Resolve-ReviewerGatePolicy -RepoRoot $RepoPath -StateDirectory $StateDir `
@@ -5912,7 +5915,7 @@ function Invoke-DryRunSelfChecks {
         # Restore, never merely "write back the prior state": if
         # gate-delivery.json did not exist before this self-check ran,
         # writing it (even with empty/prior content) would CREATE a file
-        # that a later self-check 25 run (in a future, separate invocation
+        # that a later self-check 26 run (in a future, separate invocation
         # reusing this same persistent StateDir) would then find and
         # mistake for evidence of a real write while mode='off'.
         if ($gateDeliveryStateExistedBefore34) {
@@ -5999,9 +6002,9 @@ function Invoke-DryRunSelfChecks {
         }
     }
     finally {
-        # See self-check 34: restore-by-deleting when the file did not exist
+        # See self-check 35: restore-by-deleting when the file did not exist
         # before, never leave behind a file a future invocation's self-check
-        # 25 (reusing this same persistent StateDir) would misread.
+        # 26 (reusing this same persistent StateDir) would misread.
         if ($gateDeliveryStateExistedBefore37) {
             Set-JsonState -Path $gateDeliveryStatePath -State $priorGateDeliveryState37
         }
@@ -6222,7 +6225,7 @@ function Invoke-DryRunSelfChecks {
         # which again ended up incomplete/expired before its own replay
         # could land - the realistic sequence a persistently slow or flaky
         # delivery path could produce. New-SelfCheck34Decision/Record are
-        # defined by self-check 34 above, which always runs first in the
+        # defined by self-check 35 above, which always runs first in the
         # same invocation.
         $sc41DecisionPath1 = Save-ReviewerGateDecision -Manifest (New-SelfCheck34Decision -ExpiresAtUtcOverride ([DateTime]::UtcNow.AddHours(-1).ToString("o"))) -Directory $selfCheck41ArtifactDir -BaseName "sc41-expired-1" -MasterKey $selfCheck41Key
         $sc41DecisionPath2 = Save-ReviewerGateDecision -Manifest (New-SelfCheck34Decision -ExpiresAtUtcOverride ([DateTime]::UtcNow.AddHours(-1).ToString("o"))) -Directory $selfCheck41ArtifactDir -BaseName "sc41-expired-2" -MasterKey $selfCheck41Key
@@ -6543,7 +6546,7 @@ function Invoke-DryRunSelfChecks {
 
     # The real mint refuses a missing or wrong-kind artifact before ever
     # needing a live agency/session (Test-Path/Read-ReviewerGateDecision run
-    # first) - re-using the exact fixtures self-check 27 already proves are
+    # first) - re-using the exact fixtures self-check 28 already proves are
     # rejected by kind.
     $sc43MintArtifactDir = Join-Path $StateDir "selfcheck43-mint-artifacts"
     New-Item -ItemType Directory -Force -Path $sc43MintArtifactDir | Out-Null
@@ -6738,7 +6741,7 @@ function Invoke-DryRunSelfChecks {
     # passesRequested/generalistPairComplete/runOk/generalistPassModels -
     # never from this process's live $IsTwoPass/$ReviewPassModels. Verified
     # structurally (the branch is not independently callable in isolation
-    # from a live MCP mint), the same discipline self-check 22/38 already use
+    # from a live MCP mint), the same discipline self-check 22/39 already use
     # for other MCP-dependent call patterns.
     $mintFnAt44 = & $declOf 'New-ReviewerVerifiedMultiPassAuthorization'
     if ($mintFnAt44 -lt 0) {
@@ -6831,7 +6834,7 @@ function Invoke-DryRunSelfChecks {
 
     # Finding 1: the mint refuses a TAMPERED artifact (valid kind, broken
     # signature) before ever needing a live agency/session, exactly like the
-    # missing/wrong-kind cases self-check 43 already proves.
+    # missing/wrong-kind cases self-check 44 already proves.
     $sc44TamperArtifactDir = Join-Path $StateDir "selfcheck44-tamper-artifacts"
     New-Item -ItemType Directory -Force -Path $sc44TamperArtifactDir | Out-Null
     try {
@@ -6918,7 +6921,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - a partial mid-delivery outcome (first confirmed, second not) reports Posted=1/Intended=2/Complete=`$false - the exact shape that keeps Invoke-ReviewerGateDelivery from ever voting and marks the record pendingReplay for a missing-only retry" -ForegroundColor Green
     }
     # Never vote after incomplete/expiry (finding 2) is the EXISTING,
-    # unchanged contract self-check 33 continuously proves end to end
+    # unchanged contract self-check 34 continuously proves end to end
     # (Invoke-ReviewerGateDelivery never votes when CommentsComplete is
     # $false) - not re-asserted here to avoid duplicating that self-check.
 
@@ -7091,6 +7094,7 @@ function Invoke-DryRunSelfChecks {
         $script:gateEligibilityStatePath = $realGateEligibilityStatePathForGateSelfChecks
         $script:gateDeliveryStatePath = $realGateDeliveryStatePathForGateSelfChecks
         $script:artifactKeyPath = $realArtifactKeyPathForGateSelfChecks
+        $script:logPath = $realLogPathForGateSelfChecks
         # Clean only this one explicit, freshly-created sandbox directory -
         # never a broad delete of anything under the real -StateDir.
         Remove-Item -LiteralPath $gateSelfCheckSandboxDir -Recurse -Force -ErrorAction SilentlyContinue
