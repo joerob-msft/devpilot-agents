@@ -590,7 +590,7 @@ block reassigns `-StateDir` and the derived `gate-decisions/`,
 `gate-eligibility.json`, `gate-delivery.json`, and `artifact-signing.key`
 paths to a freshly created, uniquely named sandbox directory
 (`selfcheck-gate-sandbox-<guid>`, under the real `-StateDir` but never the
-real files themselves) for the whole duration of self-checks 24-39, and
+real files themselves) for the whole duration of self-checks 25-47, and
 restores the real paths in a `finally` block afterward. Because every gate
 function reads these as script-scope variables rather than parameters, this
 reassignment is what every self-check - including ones that call the real
@@ -737,7 +737,7 @@ test suite cannot mock; the cycle-loop's own decision to set
 `RawDeliveryAlreadySatisfied` (`Test-ReviewerAlreadyReviewed` combined with
 `Test-ReviewerGateDecisionEverAttempted`) is covered directly, and the
 gate-delivery state-machine transitions that trigger it (superseded,
-faulted) are covered end to end via `-DryRun` self-checks 34 and 39.
+faulted) are covered end to end via `-DryRun` self-checks 35 and 40.
 
 ## Live BPM sample remains preview/shadow only
 

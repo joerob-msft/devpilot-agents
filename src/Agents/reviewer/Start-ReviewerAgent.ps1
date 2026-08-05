@@ -5434,7 +5434,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - convention reads use one bound, repos-only, scrubbed session that closes on every path" -ForegroundColor Green
     }
 
-    # -- Self-checks 24-38: delivery gate --------------------------------------
+    # -- Self-checks 25-47: delivery gate --------------------------------------
     # Every gate self-check below runs entirely inside a FRESH, isolated
     # sandbox directory, never the operator's real -StateDir. The script-
     # scope path variables every gate function reads via scope inheritance
@@ -6157,7 +6157,7 @@ function Invoke-DryRunSelfChecks {
         $sc40AlreadyReviewedVacuously = Test-ReviewerAlreadyReviewed -ReviewedState $sc40ReviewedState -PrId 301 -SourceCommit ("f" * 40) `
             -WritesRequested $false -WantComments $false -WantSummary $false -WantVote $false
         if (-not $sc40PendingPlan -or -not $sc40AlreadyReviewedVacuously) {
-            $failures.Add("Self-check 40 scenario setup is not realistic: expected a non-empty pending plan AND Test-ReviewerAlreadyReviewed(-WritesRequested `$false) to return true despite deliveryPending=`$true.")
+            $failures.Add("Self-check 41 scenario setup is not realistic: expected a non-empty pending plan AND Test-ReviewerAlreadyReviewed(-WritesRequested `$false) to return true despite deliveryPending=`$true.")
         }
         else {
             $sc40NoRawSwitchesShouldReplay = Test-ReviewerRawPendingPlanShouldReplay -PendingPlan $sc40PendingPlan -RawDeliveryAlreadySatisfied $sc40AlreadyReviewedVacuously
@@ -7002,6 +7002,46 @@ function Invoke-DryRunSelfChecks {
     }
 
     Write-Host "[DRY-RUN] Self-check 47/$total : degraded or missing generalist pass arrays seal a designed failed gate decision without StrictMode faults" -ForegroundColor Cyan
+    $sc47PriorMode = $EffectiveGatePolicy.mode
+    $sc47IntegratedPrId = 947
+    $sc47IntegratedCommit = ("a" * 40)
+    $sc47ExistingArtifacts = @(
+        Get-ChildItem -LiteralPath $gateDecisionDir -Filter "pr$sc47IntegratedPrId-*.json" -File -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.FullName })
+    try {
+        $EffectiveGatePolicy.mode = "preview"
+        Invoke-ReviewerGateForPullRequest -Session @{} -AgencyPath "fake-agency-not-needed" `
+            -Bound @{
+                PrId = $sc47IntegratedPrId; SourceCommit = $sc47IntegratedCommit; ConventionPlanPath = ""
+                ChangedPaths = @()
+                RawRecommendedVote = "none"; RawCounts = @{ critical = 0; important = 0; suggestion = 0 }
+                RawReportedFindingCount = 0; RawPassesComplete = $false
+            } `
+            -VerificationResult @{ Status = "degraded"; Eligible = @(); Withheld = @() } `
+            -ThreadReader { param($IgnoredSession, $IgnoredPrId) return @() }
+        $sc47NewArtifact = Get-ChildItem -LiteralPath $gateDecisionDir -Filter "pr$sc47IntegratedPrId-*.json" -File |
+            Where-Object { $_.FullName -notin $sc47ExistingArtifacts } | Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+        $sc47IntegratedDecision = $null
+        if ($sc47NewArtifact) {
+            $sc47IntegratedDecision = Read-ReviewerGateDecision -Path $sc47NewArtifact.FullName `
+                -MasterKey (Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath)
+        }
+        $sc47FaultRecord = (Get-JsonState -Path $gateDeliveryStatePath)[[string]$sc47IntegratedPrId]
+        if (-not $sc47IntegratedDecision -or [bool]$sc47IntegratedDecision.runOk -or
+            @($sc47IntegratedDecision.runReasonCodes) -cnotcontains "verificationIncomplete" -or $sc47FaultRecord) {
+            $failures.Add("The integrated all-generalist-degraded path did not seal a runOk=false verificationIncomplete decision without a gateProcessingFaulted record.")
+        }
+        else {
+            Write-Host "  OK - the integrated degraded path reads threads successfully and seals verificationIncomplete instead of gateProcessingFaulted" -ForegroundColor Green
+        }
+    }
+    finally {
+        $EffectiveGatePolicy.mode = $sc47PriorMode
+        Get-ChildItem -LiteralPath $gateDecisionDir -Filter "pr$sc47IntegratedPrId-*" -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notin $sc47ExistingArtifacts } | Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+
     $sc47NullAccounting = Get-ReviewerGateGeneralistPassAccounting -InputManifest $null
     $sc47NullPassManifest = [pscustomobject]@{ rawGeneralistPasses = $null }
     $sc47NullPassAccounting = Get-ReviewerGateGeneralistPassAccounting -InputManifest $sc47NullPassManifest
@@ -9482,7 +9522,8 @@ function Invoke-ReviewerGateForPullRequest {
         [Parameter(Mandatory)][hashtable]$Session,
         [Parameter(Mandatory)][string]$AgencyPath,
         [Parameter(Mandatory)][hashtable]$Bound,
-        $VerificationResult
+        $VerificationResult,
+        [scriptblock]$ThreadReader = $null
     )
     if ($EffectiveGatePolicy.mode -ceq "off") { return }
     $prId = [int]$Bound.PrId
@@ -9523,7 +9564,10 @@ function Invoke-ReviewerGateForPullRequest {
             -InputArtifactPath $inputArtifactPath -InputManifestSha256 $verificationInputSha256 `
             -TotalCandidateCount $totalCandidateCount -Eligible $eligible -Withheld $withheld
         $facets = @(Get-ReviewerGateCandidateFacets -Eligible $eligible -InputManifest $inputManifest -ConventionPlan $conventionPlan)
-        $threads = @(Get-ReviewerPullRequestThreads -Session $Session -PrId $prId)
+        $threads = @(
+            if ($ThreadReader) { & $ThreadReader $Session $prId }
+            else { Get-ReviewerPullRequestThreads -Session $Session -PrId $prId }
+        )
 
         $qualificationResult = Get-ReviewerGateQualification
         $qualification = $qualificationResult.Qualification
@@ -9584,7 +9628,7 @@ function Invoke-ReviewerGateForPullRequest {
             verificationPromptSha256 = $CrossVerificationPromptSha256
             verificationPolicySha256 = $CrossVerificationPolicySha256
             verificationSchemaSha256 = $CrossVerificationSchemaSha256
-            threadSetDigest          = Get-ReviewerGateSafeObjectSha256 -Value (@($threads) | ForEach-Object {
+            threadSetDigest          = Get-ReviewerGateSafeObjectSha256 -Value @(@($threads) | ForEach-Object {
                     @{ id = [string](Get-ReviewerHashValue -Container $_ -Key 'threadId' -Default 0); status = [string](Get-ReviewerHashValue -Container $_ -Key 'status' -Default 'unknown')
                         filePath = [string](Get-ReviewerHashValue -Container $_ -Key 'filePath' -Default ''); line = [int](Get-ReviewerHashValue -Container $_ -Key 'line' -Default 0) }
                 }) -Label "thread set"

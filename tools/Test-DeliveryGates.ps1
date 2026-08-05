@@ -20,7 +20,7 @@
     vs. delivered/pending-replay), the no-second-raw-delivery gate refresh,
     the raw pending-plan replay guard, the verbatim preservation of a raw
     delivery-plan pointer across a gate-only refresh, and the
-    ADO-always-closes-approval property) is covered by self-checks 24-42 in
+    ADO-always-closes-approval property) is covered by self-checks 25-47 in
     Start-ReviewerAgent.ps1 -DryRun, the same way the existing
     verification/specialist integrations are proven there rather than here.
 

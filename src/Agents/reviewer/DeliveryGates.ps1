@@ -646,7 +646,7 @@ function Test-ReviewerGateQualificationSatisfies {
 function Get-ReviewerGateCandidateFacets {
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Eligible,
-        [Parameter(Mandatory)]$InputManifest,
+        [AllowNull()]$InputManifest = $null,
         $ConventionPlan = $null
     )
     $candidateById = @{}
