@@ -2799,7 +2799,7 @@ function Set-ReviewerVote {
 
 function Invoke-DryRunSelfChecks {
     $failures = New-Object System.Collections.Generic.List[string]
-    $total = 23
+    $total = 24
 
     Write-Host "[DRY-RUN] Self-check 1/$total : parser validity + prompt presence" -ForegroundColor Cyan
     foreach ($p in @($PSCommandPath, $HarnessPath)) {
@@ -4325,7 +4325,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - resource decoding, policy parsing, identity binding, provenance rendering and negative probes fail closed" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 23/$total : isolated convention MCP session lifecycle" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 24/$total : isolated convention MCP session lifecycle" -ForegroundColor Cyan
     $sessionCheckFailureCount = $failures.Count
     $sessionLifecycle = @{ Opens = 0; Closes = 0; Actions = 0 }
     $fakeOpen = {
