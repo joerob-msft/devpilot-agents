@@ -46,6 +46,7 @@ function ConvertTo-TestSourcePolicy {
                     Name = [string]$_.name; Organization = [string]$_.organization
                     Project = [string]$_.project; RepositoryId = ([string]$_.repositoryId).ToLowerInvariant()
                     Path = [string]$_.path; Branch = [string]$_.branch; MaxBytes = [int]$_.maxBytes
+                    Section = $(if ($_.PSObject.Properties['section']) { [string]$_.section } else { "" })
                     ExpectedSha256 = ""; ExpectedByteLength = 0
                 }
             })
@@ -410,6 +411,54 @@ else {
     $expectedSnapshot = (Get-Content -LiteralPath $snapshotPath -Raw).TrimEnd()
     Assert-ConventionTest ($snapshotJson.TrimEnd() -ceq $expectedSnapshot) "The exact selected convention context plan changed."
 }
+
+# ---------------------------------------------------------------------------
+# Section identity.
+#
+# Two rules routinely live in one engineering-guidance document, and naming a
+# section is the only way such a document is transportable at all - transporting
+# 60 KB whole exceeds any sane pack budget. So "two sections of one document"
+# has to be a legal catalog, while "the same section twice" must still be the
+# configuration error it always was.
+# ---------------------------------------------------------------------------
+
+$sectionRaw = New-TestRawPolicy
+$sectionRaw.authoritativeSources.maxTotalBytes = 64
+$sectionSourceTemplate = $sectionRaw.authoritativeSources.sources[0]
+$sectionRaw.authoritativeSources.sources = @(
+    (Copy-ConventionObject -Value $sectionSourceTemplate),
+    (Copy-ConventionObject -Value $sectionSourceTemplate)
+)
+$sectionRaw.authoritativeSources.sources[0].name = "rule-one"
+$sectionRaw.authoritativeSources.sources[1].name = "rule-two"
+foreach ($sectionSource in $sectionRaw.authoritativeSources.sources) {
+    $sectionSource | Add-Member -NotePropertyName 'section' -NotePropertyValue '' -Force
+}
+$sectionRaw.authoritativeSources.sources[0].section = "### First rule"
+$sectionRaw.authoritativeSources.sources[1].section = "### Second rule"
+$sectionRaw.packs = @((Copy-ConventionObject -Value $sectionRaw.packs[0]))
+$sectionRaw.packs[0].authoritativeSourceRefs = @("rule-one", "rule-two")
+$sectionRaw.packs[0].maxBytes = 4096
+
+$sectionPolicy = ConvertTo-ReviewerConventionPackPolicy -RawPolicy $sectionRaw `
+    -AuthoritativeSourcePolicy (ConvertTo-TestSourcePolicy -RawSources $sectionRaw.authoritativeSources)
+Assert-ConventionTest (@($sectionPolicy.Packs).Count -eq 1) `
+    "Two named sections of the same document are a legal convention catalog."
+
+$sameSectionRaw = Copy-ConventionObject -Value $sectionRaw
+$sameSectionRaw.authoritativeSources.sources[1].section = "### First rule"
+Assert-ConventionThrows {
+    ConvertTo-ReviewerConventionPackPolicy -RawPolicy $sameSectionRaw `
+        -AuthoritativeSourcePolicy (ConvertTo-TestSourcePolicy -RawSources $sameSectionRaw.authoritativeSources) `
+} "The same section of the same document declared twice is still a duplicate."
+
+$wholeFileTwiceRaw = Copy-ConventionObject -Value $sectionRaw
+$wholeFileTwiceRaw.authoritativeSources.sources[0].section = ""
+$wholeFileTwiceRaw.authoritativeSources.sources[1].section = ""
+Assert-ConventionThrows {
+    ConvertTo-ReviewerConventionPackPolicy -RawPolicy $wholeFileTwiceRaw `
+        -AuthoritativeSourcePolicy (ConvertTo-TestSourcePolicy -RawSources $wholeFileTwiceRaw.authoritativeSources) `
+} "The same whole document declared twice is still a duplicate."
 
 if ($failures.Count -gt 0) {
     Write-Host "FAIL - $($failures.Count) convention-pack test(s):" -ForegroundColor Red

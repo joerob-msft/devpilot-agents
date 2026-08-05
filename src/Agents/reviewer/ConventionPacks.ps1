@@ -389,13 +389,22 @@ function Test-ReviewerConventionCommitEqual {
 }
 
 function Get-ReviewerConventionSourceIdentity {
+    <# What makes two convention sources the same source.
+
+       The named SECTION is part of the identity. Two rules routinely live in
+       one engineering-guidance document - and naming a section is the only way
+       such a document is transportable at all, since transporting it whole
+       exceeds any sane pack budget. Identity without the section would make
+       "two rules from one document" a configuration error, which is the most
+       ordinary case there is. #>
     param([Parameter(Mandatory)]$Source)
-    return ("{0}`n{1}`n{2}`n{3}`n{4}" -f
+    return ("{0}`n{1}`n{2}`n{3}`n{4}`n{5}" -f
         [string](Get-ReviewerConventionValue $Source "Organization"),
         [string](Get-ReviewerConventionValue $Source "Project"),
         [string](Get-ReviewerConventionValue $Source "RepositoryId"),
         [string](Get-ReviewerConventionValue $Source "Branch"),
-        [string](Get-ReviewerConventionValue $Source "Path")).ToUpperInvariant()
+        [string](Get-ReviewerConventionValue $Source "Path"),
+        [string](Get-ReviewerConventionValue $Source "Section" "")).ToUpperInvariant()
 }
 
 function ConvertTo-ReviewerConventionPackPolicy {

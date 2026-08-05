@@ -80,6 +80,8 @@ function New-TestPolicy {
         minDeliveredFilePercent = 60
         minDeliveredSpanPercent = 60
         allowedMimeTypes        = @("text/plain")
+        siblingContextSlices    = 0
+        siblingContextLines     = 0
     }
     foreach ($key in $Overrides.Keys) { $base[$key] = $Overrides[$key] }
     return New-ReviewerSourceTransportPolicy -Policy ([pscustomobject]$base)
@@ -633,6 +635,153 @@ $prText = Get-FunctionTextFromWrapper -Name 'Invoke-ReviewerPullRequest'
 Assert-Source ($prText -match 'ReviewerMarkerRetryAttempts') "the marker retry is wired into the pass loop"
 Assert-Source ($prText -match "notmatch 'missing or invalid result marker'") `
     "only a genuine marker parse failure is retried"
+
+# ---------------------------------------------------------------------------
+Write-Host "[13/13] Unchanged sibling context travels with the change" -ForegroundColor Cyan
+# ---------------------------------------------------------------------------
+
+# The convention specialist may not report an adoption-dependent convention -
+# test ownership attributes being the obvious one - without unchanged-sibling
+# evidence. A transport that delivers only changed regions therefore starves
+# the rule it exists to enable, and a live run proved it: the specialist found
+# the missing attributes at the right lines and withheld every one of them for
+# want of sibling proof it was never given.
+$siblingPolicy = New-TestPolicy -Overrides @{
+    contextRadiusLines   = 0
+    siblingContextSlices = 2
+    siblingContextLines  = 5
+    maxSliceBytesPerFile = 4096
+}
+$siblingText = New-TestFileText -LineCount 60
+$siblingCut = New-ReviewerSourceFileSlices -Text $siblingText -Spans @(@{ Start = 30; End = 31 }) `
+    -Policy $siblingPolicy -RemainingTotalBytes 4096
+Assert-Source (@($siblingCut.Slices).Count -eq 1) "the changed span is still delivered"
+$siblingOnly = @($siblingCut.SiblingSlices)
+Assert-Source ($siblingOnly.Count -eq 2) "two sibling slices are delivered around a single changed span"
+Assert-Source ([int]$siblingOnly[0].EndLine -eq 29 -and [int]$siblingOnly[0].StartLine -eq 25) `
+    "the leading sibling slice ends immediately above the change"
+Assert-Source ([int]$siblingOnly[1].StartLine -eq 32 -and [int]$siblingOnly[1].EndLine -eq 36) `
+    "the trailing sibling slice starts immediately below the change"
+foreach ($siblingSlice in $siblingOnly) {
+    Assert-Source (([string]$siblingSlice.Kind) -ceq 'sibling') "a sibling slice is labelled as such"
+    Assert-Source (([string]$siblingSlice.Sha256) -ceq (Get-ReviewerSourceSha256 -Text ([string]$siblingSlice.Text))) `
+        "a sibling slice is hash-bound like any other"
+}
+Assert-Source ((@($siblingCut.Slices)[0].Kind) -ceq 'changed') "a changed slice is labelled as such"
+
+# Sibling context must never displace the change itself.
+# Sibling context must never displace the change itself. Sized so exactly one
+# of {changed slice, sibling slice} fits AND the sibling is the smaller of the
+# two - so the assertion fails if the cut order is ever inverted, rather than
+# passing because the sibling could not fit under any ordering.
+$starvedPolicy = New-TestPolicy -Overrides @{
+    contextRadiusLines   = 0
+    siblingContextSlices = 4
+    siblingContextLines  = 1
+    maxSliceBytesPerFile = 256
+}
+$changedSliceBytes = [System.Text.Encoding]::UTF8.GetByteCount((($siblingText -split "`n")[29..30] -join "`n"))
+$siblingSliceBytes = [System.Text.Encoding]::UTF8.GetByteCount(($siblingText -split "`n")[28])
+Assert-Source ($siblingSliceBytes -lt $changedSliceBytes) `
+    "the starvation case is set up with the sibling slice smaller than the changed slice"
+$starvedCut = New-ReviewerSourceFileSlices -Text $siblingText -Spans @(@{ Start = 30; End = 31 }) `
+    -Policy $starvedPolicy -RemainingTotalBytes $changedSliceBytes
+Assert-Source (@($starvedCut.Slices).Count -eq 1) "the changed span wins the budget over a smaller sibling slice"
+Assert-Source (@($starvedCut.SiblingSlices).Count -eq 0) "sibling context yields when the budget is exhausted"
+
+# A changed span dropped for budget must NOT reappear stamped as sibling text.
+# Re-delivering it would show the model changed code under a sentence telling it
+# never to report on those lines - converting a lost finding into a suppressed
+# one, on exactly the largest hunks.
+$partialPolicy = New-TestPolicy -Overrides @{
+    contextRadiusLines   = 0
+    siblingContextSlices = 4
+    siblingContextLines  = 5
+    maxSliceBytesPerFile = 256
+}
+$partialSpans = @(@{ Start = 15; End = 16 }, @{ Start = 18; End = 45 }, @{ Start = 50; End = 51 })
+$partialCut = New-ReviewerSourceFileSlices -Text $siblingText -Spans $partialSpans `
+    -Policy $partialPolicy -RemainingTotalBytes 60
+Assert-Source (@($partialCut.Slices).Count -lt [int]$partialCut.RequestedSpanCount) `
+    "the partial-delivery case really did drop a changed span"
+$changedLineNumbers = [System.Collections.Generic.HashSet[int]]::new()
+foreach ($changedSpan in $partialSpans) {
+    for ($lineNumber = [int]$changedSpan.Start; $lineNumber -le [int]$changedSpan.End; $lineNumber++) {
+        [void]$changedLineNumbers.Add($lineNumber)
+    }
+}
+$intersecting = 0
+foreach ($siblingSlice in @($partialCut.SiblingSlices)) {
+    for ($lineNumber = [int]$siblingSlice.StartLine; $lineNumber -le [int]$siblingSlice.EndLine; $lineNumber++) {
+        if ($changedLineNumbers.Contains($lineNumber)) { $intersecting++ }
+    }
+}
+Assert-Source ($intersecting -eq 0) `
+    "no sibling slice contains a changed line, even one the budget dropped"
+
+# Disabled by policy means disabled.
+$noSiblingCut = New-ReviewerSourceFileSlices -Text $siblingText -Spans @(@{ Start = 30; End = 31 }) `
+    -Policy (New-TestPolicy -Overrides @{ siblingContextSlices = 0 }) -RemainingTotalBytes 4096
+Assert-Source (@($noSiblingCut.SiblingSlices).Count -eq 0) "sibling context is off when the policy says zero"
+
+# A file whose change was not delivered gets no sibling context either: there is
+# nothing for the siblings to be evidence about.
+$undeliveredCut = New-ReviewerSourceFileSlices -Text $siblingText -Spans @(@{ Start = 500; End = 501 }) `
+    -Policy $siblingPolicy -RemainingTotalBytes 4096
+Assert-Source (@($undeliveredCut.Slices).Count -eq 0 -and @($undeliveredCut.SiblingSlices).Count -eq 0) `
+    "a file with no delivered change carries no sibling context"
+
+Assert-Source (@(Get-ReviewerSourceSiblingSpans -DeliveredSpans @(@{ Start = 1; End = 60 }) -LineCount 60 -MaxSlices 2 -LinesPerSlice 5).Count -eq 0) `
+    "a fully delivered file has no unchanged region left to sample"
+Assert-Source (@(Get-ReviewerSourceSiblingSpans -DeliveredSpans @(@{ Start = 5; End = 6 }) -LineCount 60 -MaxSlices 0 -LinesPerSlice 5).Count -eq 0) `
+    "a zero slice cap yields nothing"
+
+$siblingReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @('/src/ok.cs') `
+    -SpansByPath ([ordered]@{ '/src/ok.cs' = @(@{ Start = 20; End = 21 }) }) `
+    -Policy $siblingPolicy -Reader $reader
+$siblingRendered = Format-ReviewerSealedSourceBlock -Report $siblingReport -NonceFactory $nonceFactory
+Assert-Source ($siblingRendered.Contains('"kind":"sibling"', [StringComparison]::Ordinal)) `
+    "sibling slices carry their kind in provenance"
+Assert-Source ($siblingRendered.Contains('"kind":"changed"', [StringComparison]::Ordinal)) `
+    "changed slices carry their kind in provenance"
+Assert-Source ($siblingRendered.Contains('never report a finding on them', [StringComparison]::Ordinal)) `
+    "the block tells the model sibling lines are evidence, not part of the change"
+
+# Every byte the record counts as delivered must be covered by a recorded hash,
+# or the signed attestation claims content it cannot account for - and sibling
+# text is attacker-controlled too.
+$siblingRecord = ConvertTo-ReviewerSourceCoverageRecord -Report $siblingReport
+$siblingRecordJson = $siblingRecord | ConvertTo-Json -Depth 12
+Assert-Source (-not $siblingRecordJson.Contains('line 20', [StringComparison]::Ordinal)) `
+    "the coverage record still carries no slice text"
+foreach ($recordFile in @($siblingRecord.files)) {
+    if ([int]$recordFile.deliveredBytes -lt 1) { continue }
+    $hashCount = @($recordFile.sliceSha256).Count + @($recordFile.siblingSliceSha256).Count
+    $reportFile = @(@($siblingReport.Files) | Where-Object { [string]$_.Path -ceq [string]$recordFile.path })[0]
+    $sliceCount = @($reportFile.Slices).Count + @($reportFile.SiblingSlices).Count
+    Assert-Source ($hashCount -eq $sliceCount) `
+        "every delivered slice of $($recordFile.path), sibling or not, has a recorded hash"
+    $hashedBytes = 0
+    foreach ($countedSlice in (@($reportFile.Slices) + @($reportFile.SiblingSlices))) { $hashedBytes += [int]$countedSlice.ByteLength }
+    Assert-Source ($hashedBytes -eq [int]$recordFile.deliveredBytes) `
+        "the hashed bytes of $($recordFile.path) account for every byte the record calls delivered"
+}
+
+# The two independent constants - how many slice bytes the transport may emit,
+# and how large the specialist's stdin may be - must not drift apart silently.
+$specialistCapSource = [IO.File]::ReadAllText((Join-Path $repoRoot 'src/Agents/reviewer/ConventionSpecialist.ps1'))
+Assert-Source ($specialistCapSource -match 'ReviewerConventionSpecialistMaxInputBytes\s*=\s*(\d+)') `
+    "the specialist input cap is a readable constant"
+$specialistCap = [int]$Matches[1]
+$shippedTotal = [int]$shipped.maxTotalSliceBytes
+# Rendered overhead is provenance JSON plus two fence lines per slice; bound the
+# worst case at the shipped slice count across the shipped file cap.
+$worstCaseSlices = ([int]$shipped.maxSlicesPerFile + [int]$shipped.siblingContextSlices) * 4
+$renderOverhead = $worstCaseSlices * 512
+Assert-Source (($shippedTotal + $renderOverhead) -lt $specialistCap) `
+    "a saturated slice budget still renders inside the convention specialist's input bound"
+Assert-Source ($specialistCapSource -match 'PinnedSourceDropped') `
+    "a dropped pinned-source block is reported to the caller, not only to the model"
 
 # ---------------------------------------------------------------------------
 

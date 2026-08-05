@@ -683,12 +683,14 @@ function New-ReviewerConventionSpecialistInput {
     # that most needs source, so degrading it to "no candidates" because the
     # source pushed the payload over the cap would be exactly backwards: it is
     # better to run the specialist with less source than not at all.
+    $pinnedSourceDropped = $false
     if ($PinnedSourceText) {
         $candidate = $inputText + "`n---`n" + $PinnedSourceText.TrimEnd() + "`n"
         if ($script:ReviewerConventionSpecialistUtf8.GetByteCount($candidate) -le $MaxInputBytes) {
             $inputText = $candidate
         }
         else {
+            $pinnedSourceDropped = $true
             $inputText += ("`n---`n## Pinned changed-file source omitted`n`n" +
                 "The wrapper read this PR's changed files successfully, but their slices did not fit " +
                 "this pass's input bound. Treat every changed file as NOT read: do not emit a candidate " +
@@ -699,7 +701,10 @@ function New-ReviewerConventionSpecialistInput {
     if ($bytes -gt $MaxInputBytes) {
         throw "Convention specialist input is $bytes bytes, above the code-defined $MaxInputBytes-byte bound."
     }
-    return @{ Text = $inputText; Bytes = $bytes }
+    # The drop is reported to the MODEL above. It has to be reported to the
+    # artifact too, or a pass in which the model received no source at all is
+    # still sealed beside a coverage record claiming every file was delivered.
+    return @{ Text = $inputText; Bytes = $bytes; PinnedSourceDropped = $pinnedSourceDropped }
 }
 
 function Save-ReviewerConventionSpecialistPreview {

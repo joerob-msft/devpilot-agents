@@ -13,6 +13,8 @@
     "maxSliceBytesPerFile",
     "maxTotalSliceBytes",
     "maxSlicesPerFile",
+    "siblingContextSlices",
+    "siblingContextLines",
     "minDeliveredFiles",
     "minDeliveredFilePercent",
   "minDeliveredSpanPercent",
@@ -38,6 +40,13 @@
     "maxSliceBytesPerFile": { "type": "integer", "minimum": 256, "maximum": 1048576 },
     "maxTotalSliceBytes": { "type": "integer", "minimum": 1024, "maximum": 4194304 },
     "maxSlicesPerFile": { "type": "integer", "minimum": 1, "maximum": 200 },
+    "siblingContextSlices": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 16,
+      "description": "Slices of UNCHANGED text delivered next to the change, per file. Zero disables sibling evidence, which makes adoption-dependent conventions unreportable by a specialist that requires unchanged-sibling proof."
+    },
+    "siblingContextLines": { "type": "integer", "minimum": 0, "maximum": 400 },
     "minDeliveredFiles": {
       "type": "integer",
       "minimum": 0,

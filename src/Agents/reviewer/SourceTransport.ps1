@@ -139,7 +139,8 @@ function New-ReviewerSourceTransportPolicy {
     $required = @(
         "schemaVersion", "transportVersion", "contextRadiusLines", "maxFiles",
         "maxFetchBytesPerFile", "maxSliceBytesPerFile", "maxTotalSliceBytes",
-        "maxSlicesPerFile", "minDeliveredFiles", "minDeliveredFilePercent",
+        "maxSlicesPerFile", "siblingContextSlices", "siblingContextLines",
+        "minDeliveredFiles", "minDeliveredFilePercent",
         "minDeliveredSpanPercent", "allowedMimeTypes"
     )
     $names = @($Policy.PSObject.Properties.Name)
@@ -157,6 +158,8 @@ function New-ReviewerSourceTransportPolicy {
         maxSliceBytesPerFile    = @(256, 1048576)
         maxTotalSliceBytes      = @(1024, 4194304)
         maxSlicesPerFile        = @(1, 200)
+        siblingContextSlices    = @(0, 16)
+        siblingContextLines     = @(0, 400)
         minDeliveredFiles       = @(0, 500)
         minDeliveredFilePercent = @(0, 100)
         minDeliveredSpanPercent = @(0, 100)
@@ -298,6 +301,63 @@ function Merge-ReviewerSourceSpans {
     return @($merged)
 }
 
+function Get-ReviewerSourceSiblingSpans {
+    <#
+        Picks bounded slices of UNCHANGED text adjacent to the delivered ones.
+
+        The specialist's own contract requires unchanged-sibling evidence before
+        it may report an adoption-dependent convention - test ownership
+        attributes being the obvious case. A transport that delivers only
+        changed regions therefore starves the rule it was supposed to enable:
+        the specialist correctly refuses, every time, and the convention is
+        never reportable. That is not a hypothetical; it is what a live run did.
+
+        Selection is deterministic and semantically blind. For each gap around
+        the delivered spans, take the lines nearest the delivered text - the end
+        of a leading gap, the start of any other - because the members that
+        neighbour a change are the ones whose conventions the change should
+        match. Gaps are visited in line order and capped, so the result depends
+        only on the file and the change set.
+    #>
+    param(
+        [object[]]$DeliveredSpans = @(),
+        [Parameter(Mandatory)][ValidateRange(0, [int]::MaxValue)][int]$LineCount,
+        [Parameter(Mandatory)][ValidateRange(0, 16)][int]$MaxSlices,
+        [Parameter(Mandatory)][ValidateRange(0, 400)][int]$LinesPerSlice
+    )
+    if ($MaxSlices -lt 1 -or $LinesPerSlice -lt 1 -or $LineCount -lt 1) { return @() }
+    $ordered = @(@($DeliveredSpans) | Sort-Object -Property @{ Expression = { [int]$_.Start } })
+    $gaps = [System.Collections.Generic.List[object]]::new()
+    $cursor = 1
+    foreach ($span in $ordered) {
+        if ([int]$span.Start -gt $cursor) {
+            [void]$gaps.Add(@{ Start = $cursor; End = ([int]$span.Start - 1); Leading = ($cursor -eq 1) })
+        }
+        if (([int]$span.End + 1) -gt $cursor) { $cursor = [int]$span.End + 1 }
+    }
+    if ($cursor -le $LineCount) { [void]$gaps.Add(@{ Start = $cursor; End = $LineCount; Leading = $false }) }
+
+    $slices = [System.Collections.Generic.List[object]]::new()
+    foreach ($gap in $gaps) {
+        if ($slices.Count -ge $MaxSlices) { break }
+        $gapStart = [int]$gap.Start
+        $gapEnd = [int]$gap.End
+        if ($gapEnd -lt $gapStart) { continue }
+        if ([bool]$gap.Leading) {
+            # Nearest the first delivered span, so the members immediately
+            # above the change travel with it.
+            $start = [Math]::Max($gapStart, ($gapEnd - $LinesPerSlice + 1))
+            $end = $gapEnd
+        }
+        else {
+            $start = $gapStart
+            $end = [Math]::Min($gapEnd, ($gapStart + $LinesPerSlice - 1))
+        }
+        [void]$slices.Add(@{ Start = $start; End = $end })
+    }
+    return @($slices)
+}
+
 function New-ReviewerSourceFileSlices {
     <# Cuts one already-decoded file into bounded slices.
 
@@ -336,13 +396,49 @@ function New-ReviewerSourceFileSlices {
         [void]$slices.Add(@{
                 StartLine  = $startLine
                 EndLine    = $endLine
+                Kind       = "changed"
                 ByteLength = $sliceBytes
                 Sha256     = Get-ReviewerSourceSha256 -Text $sliceText
                 Text       = $sliceText
             })
     }
+    # Sibling context is cut only AFTER every changed span has had its chance at
+    # the budget, so unchanged text can never displace the change itself.
+    #
+    # The gap map is computed from $merged - EVERY changed span - not from the
+    # slices that survived the budget. A span dropped for budget or slice cap
+    # would otherwise vanish from the map, the gap beside it would swallow it,
+    # and its changed lines would be re-delivered stamped `sibling` under a
+    # sentence telling the model never to report on them. That is worse than
+    # not delivering them at all: it converts a lost finding into a suppressed
+    # one, on exactly the largest hunks.
+    $siblingSlices = [System.Collections.Generic.List[object]]::new()
+    if (@($slices).Count -gt 0) {
+        $siblingSpans = @(Get-ReviewerSourceSiblingSpans -DeliveredSpans @($merged) `
+                -LineCount $lines.Count -MaxSlices ([int]$Policy.siblingContextSlices) `
+                -LinesPerSlice ([int]$Policy.siblingContextLines))
+        foreach ($span in $siblingSpans) {
+            $startLine = [int]$span.Start
+            $endLine = [int]$span.End
+            $sliceText = ($lines[($startLine - 1)..($endLine - 1)] -join "`n")
+            $sliceBytes = $script:ReviewerSourceUtf8.GetByteCount($sliceText)
+            if (($deliveredBytes + $sliceBytes) -gt [int]$Policy.maxSliceBytesPerFile -or
+                ($deliveredBytes + $sliceBytes) -gt $RemainingTotalBytes) { continue }
+            if (-not (Test-ReviewerSourceSafeText -Text $sliceText)) { continue }
+            $deliveredBytes += $sliceBytes
+            [void]$siblingSlices.Add(@{
+                    StartLine  = $startLine
+                    EndLine    = $endLine
+                    Kind       = "sibling"
+                    ByteLength = $sliceBytes
+                    Sha256     = Get-ReviewerSourceSha256 -Text $sliceText
+                    Text       = $sliceText
+                })
+        }
+    }
     return @{
         Slices               = @($slices)
+        SiblingSlices        = @($siblingSlices)
         RequestedSpanCount   = $merged.Count
         DeliveredBytes       = $deliveredBytes
         DroppedForBudget     = $droppedForBudget
@@ -499,7 +595,8 @@ function New-ReviewerSourceTransportReport {
         $entry = New-ReviewerSourceFileEntry -Path $path -CommitSha $CommitSha -Status $status -Reason $reason `
             -FileByteLength $fileBytes -FileSha256 ([string](Get-ReviewerSourceValue -Object $resource -Name "Sha256" -Default "")) `
             -MimeType $mimeType -LineCount ([int]$cut.LineCount) `
-            -RequestedSpanCount ([int]$cut.RequestedSpanCount) -Slices @($cut.Slices)
+            -RequestedSpanCount ([int]$cut.RequestedSpanCount) -Slices @($cut.Slices) `
+            -SiblingSlices @($cut.SiblingSlices)
         [void]$files.Add($entry)
         $remainingTotal -= [int]$cut.DeliveredBytes
         $totalBytes += [int]$cut.DeliveredBytes
@@ -547,13 +644,15 @@ function New-ReviewerSourceFileEntry {
         [AllowEmptyString()][string]$MimeType = "",
         [int]$LineCount = 0,
         [int]$RequestedSpanCount = 0,
-        [object[]]$Slices = @()
+        [object[]]$Slices = @(),
+        [object[]]$SiblingSlices = @()
     )
     if ($Reason -and $script:ReviewerSourceOmissionReasons -cnotcontains $Reason) {
         throw "Unknown source-transport omission reason '$Reason'."
     }
     $deliveredBytes = 0
     foreach ($slice in @($Slices)) { $deliveredBytes += [int]$slice.ByteLength }
+    foreach ($slice in @($SiblingSlices)) { $deliveredBytes += [int]$slice.ByteLength }
     return @{
         Path               = $Path
         CommitSha          = $CommitSha.ToLowerInvariant()
@@ -567,6 +666,7 @@ function New-ReviewerSourceFileEntry {
         DeliveredSpanCount = @($Slices).Count
         DeliveredBytes     = $deliveredBytes
         Slices             = @($Slices)
+        SiblingSlices      = @($SiblingSlices)
     }
 }
 
@@ -646,6 +746,7 @@ function Format-ReviewerSealedSourceBlock {
     $payloads = [System.Collections.Generic.List[string]]::new()
     foreach ($file in @($Report.Files)) {
         foreach ($slice in @($file.Slices)) { [void]$payloads.Add([string]$slice.Text) }
+        foreach ($slice in @($file.SiblingSlices)) { [void]$payloads.Add([string]$slice.Text) }
     }
     $boundary = New-ReviewerSealedBoundary -Label "PINNED_SOURCE" -Payloads @($payloads) -NonceFactory $NonceFactory
 
@@ -684,12 +785,15 @@ function Format-ReviewerSealedSourceBlock {
     [void]$lines.Add("")
     [void]$lines.Add("You may not claim to have reviewed, verified, or cleared a path whose status is ``omitted``, and you may not treat a ``partial`` path as fully read. Say what you could not see.")
     [void]$lines.Add("")
+    [void]$lines.Add("Slices marked ``kind: sibling`` are UNCHANGED lines from the same file, delivered next to the change so you can see what this file's existing members already do. They are evidence of established practice; they are not part of this pull request and you must never report a finding on them.")
+    [void]$lines.Add("")
     foreach ($file in @($Report.Files)) {
-        foreach ($slice in @($file.Slices)) {
+        foreach ($slice in (@($file.Slices) + @($file.SiblingSlices))) {
             $provenance = [ordered]@{
                 transportVersion = [int]$Report.TransportVersion
                 path             = [string]$file.Path
                 commitSha        = [string]$file.CommitSha
+                kind             = [string](Get-ReviewerSourceValue -Object $slice -Name "Kind" -Default "changed")
                 mimeType         = [string]$file.MimeType
                 fileByteLength   = [int]$file.FileByteLength
                 fileSha256       = [string]$file.FileSha256
@@ -824,6 +928,7 @@ function ConvertTo-ReviewerSourceCoverageRecord {
                     deliveredSpanCount = [int]$_.DeliveredSpanCount
                     deliveredBytes     = [int]$_.DeliveredBytes
                     sliceSha256        = @(@($_.Slices) | ForEach-Object { [string]$_.Sha256 })
+                    siblingSliceSha256 = @(@($_.SiblingSlices) | ForEach-Object { [string]$_.Sha256 })
                 }
             })
     }

@@ -103,20 +103,52 @@ The preview a human reads carries the same numbers, and names the changed files
 whose source never arrived, so "no findings" can never be read as "every file
 was checked".
 
+## Sibling evidence
+
+The convention specialist may not report an **adoption-dependent** convention —
+a test-ownership attribute, say — without evidence that the repository's
+unchanged code already follows it. A transport that delivers only changed
+regions therefore starves the rule it was meant to enable.
+
+That is not hypothetical. A live run found missing ownership attributes at the
+right lines in two test files and withheld every one of them as
+`missingSiblingEvidence`, because the unchanged methods that carry the attribute
+sat outside the delivered spans. The specialist was right to refuse; it had been
+given no way to be right any other way.
+
+So each delivered file also carries up to `siblingContextSlices` slices of
+**unchanged** text, taken from the gaps immediately adjacent to the delivered
+spans — the members that neighbour a change are the ones whose conventions it
+should match. Selection is deterministic and semantically blind: gaps in line
+order, nearest lines first, capped.
+
+Sibling slices are hashed and fenced exactly like changed ones, carry
+`"kind":"sibling"` in their provenance, and are cut only **after** every changed
+span has had its chance at the budget, so unchanged text can never displace the
+change. The block tells the model what they are: evidence of established
+practice, never part of the pull request, and never something to report a
+finding on.
+
+Setting `siblingContextSlices` to zero disables this and restores the starved
+behaviour.
+
 ## Budgets
 
 Defaults are calibrated against a real ten-file change: 30 lines of context,
-32 KB of slices per file, 128 KB in total. That change transported 10/10 files
-in 83,608 bytes — against 1.6 MB for the raw diff channel and 0 bytes for the
-file-read tool.
+32 KB of slices per file, 192 KB in total, and two 80-line sibling slices per
+file. That change transported 10/10 files in 83,605 bytes of changed regions —
+against 1.6 MB for the raw diff channel and 0 bytes for the file-read tool — and
+147,583 bytes once sibling evidence is included.
 
 | key | default | what it bounds |
 |---|---|---|
 | `contextRadiusLines` | 30 | unchanged lines kept on each side of a changed span |
 | `maxFetchBytesPerFile` | 1048576 | largest file the wrapper will read; larger is `fileTooLarge` |
 | `maxSliceBytesPerFile` | 32768 | delivered slice bytes for one file |
-| `maxTotalSliceBytes` | 131072 | delivered slice bytes for the whole PR |
+| `maxTotalSliceBytes` | 196608 | delivered slice bytes for the whole PR |
 | `maxSlicesPerFile` | 24 | slices for one file |
+| `siblingContextSlices` | 2 | slices of UNCHANGED text delivered next to the change, per file |
+| `siblingContextLines` | 80 | lines in each sibling slice |
 | `maxFiles` | 60 | changed files considered before the cap is accounted |
 
 A slice that does not fit is **dropped whole**, never truncated, so a recorded

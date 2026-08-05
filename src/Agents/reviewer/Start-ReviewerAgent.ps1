@@ -7758,6 +7758,7 @@ function Invoke-ReviewerConventionSpecialistPass {
         unrecognizedTools = @()
         toolRequestAuditTruncated = $false
         modifiedFiles = @()
+        pinnedSourceDropped = $false
     }
     try {
         if (-not $ConventionPlanPath -or -not $FactPlanPath) {
@@ -7806,6 +7807,11 @@ function Invoke-ReviewerConventionSpecialistPass {
                 -ResolvedSources @($sessionData.Sources) -ChangeEntries @($sessionData.Changes) `
                 -ThreadDigestText $ThreadDigestText -PinnedSourceText $PinnedSourceText
             $contextBytes = [int]$specialistInput.Bytes
+            if ([bool]$specialistInput.PinnedSourceDropped) {
+                Write-Warning ("PR $PrId's pinned source did not fit the convention specialist's input bound; " +
+                    "the specialist was told to treat every changed file as unread.")
+                $toolAudit.pinnedSourceDropped = $true
+            }
             $allowTools = @($script:ReviewerConventionSpecialistAllowToolCeiling)
             $availableTools = ConvertTo-ReviewerAvailableToolNames -PermissionTools $allowTools
             $denyTools = Get-ReviewerEffectiveDenyTools -ConfigDeny $ConfigDenyTools
