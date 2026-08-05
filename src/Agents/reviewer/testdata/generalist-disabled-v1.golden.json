@@ -82,6 +82,10 @@
     {
       "sha256": "f09cb3ac58e021e47a48a95c69f239d85c20fe11d0f0ed678701912ca061786e",
       "reason": "Require the marker to be one compact line and tell the model to re-check its brackets. A live run lost a complete, correct review to a single stray bracket in several kilobytes of hand-written single-line JSON."
+    },
+    {
+      "sha256": "02ad8391d74c2a952cffd622ea57f93e0a9753ba175b3773a433ffc4c136c58c",
+      "reason": "Distinguish the one omission reason that is not a gap in what the model was given: a path with no added or edited lines at all has nothing in it to read, so treating it like an unread file made ordinary deletes and renames look like transport failures."
     }
   ]
 }

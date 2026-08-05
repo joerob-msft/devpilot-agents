@@ -7398,6 +7398,7 @@ function Get-ReviewerSourceTransport {
         pullRequestId = $PrId; includeDiffs = $true; includeLineContent = $true; top = 1000
     }
     $spansByPath = Get-ReviewerSourceChangedSpans -Response $changes
+    $changeKindsByPath = Get-ReviewerSourceChangeKindsByPath -Response $changes
     # Assign directly: Get-ReviewerChangePathsFromResponse returns its array
     # behind a unary comma so a one-path change set does not unroll to a bare
     # string. Wrapping that in @() NESTS the array instead of flattening it,
@@ -7435,7 +7436,8 @@ function Get-ReviewerSourceTransport {
         }
     }
     $report = New-ReviewerSourceTransportReport -CommitSha $SourceCommit -ChangedPaths $paths `
-        -SpansByPath $spansByPath -Policy $SourceTransportPolicy -Reader $reader
+        -SpansByPath $spansByPath -Policy $SourceTransportPolicy -Reader $reader `
+        -ChangeKindsByPath $changeKindsByPath
     # The spans come from the PR's CURRENT iteration while the bytes come from
     # the pinned commit. If the author pushed in between, the slices would be
     # correct bytes at the wrong lines, hashed cleanly, with nothing to notice
@@ -7449,7 +7451,12 @@ function Get-ReviewerSourceTransport {
         throw "PR $PrId moved from $SourceCommit to '$confirmCommit' while its pinned source was being read."
     }
     $blockText = ""
-    if ([int]$report.CoveredFiles -gt 0) {
+    if (@($report.Files).Count -gt 0) {
+        # Rendered whenever there is anything to account for, not only when
+        # something was delivered. The accounting table IS the property this
+        # layer sells; suppressing it exactly when the model has no source
+        # would leave the model with no source and no statement that any is
+        # missing - and both prompts promise the block is there.
         $blockText = Format-ReviewerSealedSourceBlock -Report $report -NonceFactory { New-AgentNonce }
     }
     return @{
@@ -11904,21 +11911,25 @@ function Invoke-ReviewerCycle {
                 $sourceTransport = Get-ReviewerSourceTransport -Session $session -PrId $prId -SourceCommit $sourceCommit
                 $pinnedSourceText = [string]$sourceTransport.BlockText
                 $sourceCoverageRecord = $sourceTransport.Record
-                Write-Host ("  PR {0} pinned source: {1}/{2} changed file(s) covered ({3}%), {4} slice byte(s)." -f `
-                        $prId, $sourceTransport.Report.CoveredFiles, $sourceTransport.Report.ChangedFileCount,
-                        $sourceTransport.Report.CoveragePercent, $sourceTransport.Report.TotalSliceBytes) -ForegroundColor Cyan
+                Write-Host ("  PR {0} pinned source: {1}/{2} changed file(s) with added or edited lines covered ({3}%), {4} path(s) with no such lines, {5} slice byte(s)." -f `
+                        $prId, $sourceTransport.Report.CoveredFiles, $sourceTransport.Report.SourceBearingFileCount,
+                        $sourceTransport.Report.CoveragePercent, $sourceTransport.Report.NoSourceFileCount,
+                        $sourceTransport.Report.TotalSliceBytes) -ForegroundColor Cyan
                 Write-ReviewerCycleMetadata -Fields @{
                     cycle = $CycleNumber; mode = "source-transport"; prId = $prId; sourceCommit = $sourceCommit
                     result = $(if ($sourceTransport.Gate.Ok) { "covered" } else { "insufficient" })
                     changedFileCount = [int]$sourceTransport.Report.ChangedFileCount
+                    sourceBearingFileCount = [int]$sourceTransport.Report.SourceBearingFileCount
+                    noSourceFileCount = [int]$sourceTransport.Report.NoSourceFileCount
                     coveredFiles = [int]$sourceTransport.Report.CoveredFiles
                     coveragePercent = [int]$sourceTransport.Report.CoveragePercent
+                    spanPercent = [int]$sourceTransport.Report.SpanPercent
                     totalSliceBytes = [int]$sourceTransport.Report.TotalSliceBytes
                     reasonCodes = @($sourceTransport.Gate.ReasonCodes)
                 }
                 if (-not $sourceTransport.Gate.Ok) {
-                    $coverageReason = "pinned source coverage is insufficient ({0}/{1} changed file(s), {2}%): {3}" -f `
-                        $sourceTransport.Report.CoveredFiles, $sourceTransport.Report.ChangedFileCount,
+                    $coverageReason = "pinned source coverage is insufficient ({0}/{1} changed file(s) with added or edited lines, {2}%): {3}" -f `
+                        $sourceTransport.Report.CoveredFiles, $sourceTransport.Report.SourceBearingFileCount,
                         $sourceTransport.Report.CoveragePercent, (@($sourceTransport.Gate.ReasonCodes) -join ', ')
                     Write-Warning "PR $prId not reviewed - $coverageReason"
                     $result.ExitCode = 1

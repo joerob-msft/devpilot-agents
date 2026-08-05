@@ -47,8 +47,8 @@ $script:ReviewerSourceUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
 # renderer, a gate, or a test can enumerate it instead of pattern-matching prose.
 $script:ReviewerSourceOmissionReasons = @(
     "budgetExhausted", "sliceCountCapExceeded", "fileTooLarge", "notTextual", "transportFailed",
-    "noChangedSpans", "fileCountCapExceeded", "pathRejected", "spanOutsideFile", "unsafeSliceText",
-    "decodeRejected"
+    "noChangedSpans", "spansUnavailable", "fileCountCapExceeded", "pathRejected", "spanOutsideFile",
+    "unsafeSliceText", "decodeRejected"
 )
 $script:ReviewerSourceStatuses = @("delivered", "partial", "omitted")
 $script:ReviewerSourceMaxSpansPerPath = 2000
@@ -216,6 +216,86 @@ function Resolve-ReviewerSourceChangeEntries {
         $node = $inner
     }
     return , (@($node))
+}
+
+function Get-ReviewerSourceChangeKinds {
+    <# Normalizes an entry-level changeType into lowercase kind tokens.
+
+       ADO reports this as a flag string ("Edit", "Delete", "Edit, Rename") or
+       as the underlying integer. It is the change set's own statement about
+       what happened to a path, and it is the only trustworthy way to know that
+       a path has no right-hand lines - as opposed to having right-hand lines
+       the transport failed to parse. #>
+    param($Value)
+    $kinds = New-Object System.Collections.Generic.List[string]
+    if ($Value -is [int] -or $Value -is [long]) {
+        $flags = [int]$Value
+        if ($flags -band 1) { [void]$kinds.Add("add") }
+        if ($flags -band 2) { [void]$kinds.Add("edit") }
+        if ($flags -band 8) { [void]$kinds.Add("encoding") }
+        if ($flags -band 16) { [void]$kinds.Add("rename") }
+        if ($flags -band 32) { [void]$kinds.Add("delete") }
+        if ($flags -band 64) { [void]$kinds.Add("undelete") }
+        if ($flags -band 128) { [void]$kinds.Add("branch") }
+        if ($flags -band 2048) { [void]$kinds.Add("sourcerename") }
+        return , $kinds.ToArray()
+    }
+    foreach ($token in @(([string]$Value) -split ',')) {
+        $trimmed = $token.Trim().ToLowerInvariant()
+        if ($trimmed) { [void]$kinds.Add($trimmed) }
+    }
+    return , $kinds.ToArray()
+}
+
+function Test-ReviewerSourceChangeCarriesRightHand {
+    <# Whether the change set says this path should have added or edited lines.
+
+       Unknown or missing change types are treated as YES, deliberately. This
+       answer decides whether a path stays in the coverage denominator, so the
+       conservative direction is the one that keeps an unrecognized path
+       counted: guessing "nothing to deliver" would silently excuse the
+       transport from delivering it. #>
+    param($ChangeTypeValue)
+    # Assign directly. Get-ReviewerSourceChangeKinds returns its array behind a
+    # unary comma so a single kind does not unroll to a bare string, and @()
+    # around that NESTS instead of flattening - which would leave one array
+    # inside one slot, match no kind, and quietly report every path as
+    # right-hand-bearing.
+    $kinds = Get-ReviewerSourceChangeKinds -Value $ChangeTypeValue
+    if ($null -eq $kinds -or @($kinds).Count -eq 0) { return $true }
+    $rightHand = @(@($kinds) | Where-Object { $_ -ceq "add" -or $_ -ceq "edit" -or $_ -ceq "undelete" -or $_ -ceq "branch" })
+    if ($rightHand.Count -gt 0) { return $true }
+    $known = @(@($kinds) | Where-Object { $_ -cin @("delete", "rename", "sourcerename", "encoding", "none") })
+    # Only a change set that is entirely accounted for by non-right-hand kinds
+    # may be excused. Anything unrecognized keeps the path in the denominator.
+    return ($known.Count -ne @($kinds).Count)
+}
+
+function Get-ReviewerSourceChangeKindsByPath {
+    <# Each changed path's own declared change kinds, so the report can tell
+       "this path has no right-hand lines" from "we failed to parse its right-
+       hand lines". Inferring the first from the absence of the second is a
+       fail-open: any condition that costs the line-diff blocks makes every
+       edited file look like a delete, and excluding deletes from the coverage
+       denominator then turns a loud refusal into a silent 100% pass. #>
+    param([Parameter(Mandatory)]$Response)
+    $kindsByPath = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
+    # Assign directly, then iterate: Resolve-ReviewerSourceChangeEntries returns
+    # its array behind a unary comma, and @() around that nests the whole change
+    # set into one slot - so every path would silently disappear from this map
+    # and every spanless path would be treated as unknown.
+    $changeEntries = Resolve-ReviewerSourceChangeEntries -Response $Response
+    foreach ($change in @($changeEntries)) {
+        if ($null -eq $change) { continue }
+        $item = Get-ReviewerSourceValue -Object $change -Name "item"
+        $rawPath = [string](Get-ReviewerSourceValue -Object $item -Name "path" -Default "")
+        if (-not $rawPath) { $rawPath = [string](Get-ReviewerSourceValue -Object $change -Name "path" -Default "") }
+        $path = ConvertTo-ReviewerSourcePath -Path $rawPath
+        if (-not $path) { continue }
+        if ([bool](Get-ReviewerSourceValue -Object $item -Name "isFolder" -Default $false)) { continue }
+        $kindsByPath[$path] = (Get-ReviewerSourceValue -Object $change -Name "changeType" -Default $null)
+    }
+    return $kindsByPath
 }
 
 function Get-ReviewerSourceChangedSpans {
@@ -702,7 +782,12 @@ function New-ReviewerSourceTransportReport {
         [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$ChangedPaths,
         [Parameter(Mandatory)]$SpansByPath,
         [Parameter(Mandatory)][hashtable]$Policy,
-        [Parameter(Mandatory)][scriptblock]$Reader
+        [Parameter(Mandatory)][scriptblock]$Reader,
+        # Each path's own declared change kinds. Without it every spanless path
+        # is assumed to be a delete, which is the fail-open this parameter
+        # exists to close; absent, every path is assumed to carry right-hand
+        # lines, which is the safe direction.
+        $ChangeKindsByPath = $null
     )
     $files = [System.Collections.Generic.List[object]]::new()
     $remainingTotal = [int]$Policy.maxTotalSliceBytes
@@ -737,8 +822,42 @@ function New-ReviewerSourceTransportReport {
             $spans = @($candidate)
         }
         if ($spans.Count -eq 0) {
+            # The change set's own statement decides this, not the absence of
+            # parsed spans. A path the change set says was deleted or renamed
+            # has nothing to deliver; a path it says was added or edited has
+            # right-hand lines the transport failed to obtain, and that must
+            # stay in the denominator so the coverage floor trips.
+            $declared = $null
+            if ($null -ne $ChangeKindsByPath) {
+                $declared = Get-ReviewerSourceValue -Object $ChangeKindsByPath -Name $path -Default $null
+            }
+            $carriesRightHand = Test-ReviewerSourceChangeCarriesRightHand -ChangeTypeValue $declared
+            if (-not $carriesRightHand) {
+                [void]$files.Add((New-ReviewerSourceFileEntry -Path $path -CommitSha $CommitSha `
+                            -Status "omitted" -Reason "noChangedSpans"))
+                continue
+            }
+            # It should have had lines. Read it anyway: an added file that is
+            # genuinely empty has nothing to deliver and is honestly
+            # `noChangedSpans`, while a file with content whose diff was lost
+            # is `spansUnavailable` and counts against coverage.
+            $spanlessResource = $null
+            try { $spanlessResource = & $Reader $path }
+            catch {
+                if ($_.Exception.Message -match 'session is closed|closed stdout|exited before returning|timed out') { throw }
+                $spanlessResource = $null
+            }
+            $spanlessReason = "spansUnavailable"
+            if ($null -eq $spanlessResource) { $spanlessReason = "transportFailed" }
+            elseif ([string](Get-ReviewerSourceValue -Object $spanlessResource -Name "Rejected" -Default "")) {
+                $spanlessReason = [string]$spanlessResource.Rejected
+            }
+            elseif ([string]::IsNullOrWhiteSpace([string](Get-ReviewerSourceValue -Object $spanlessResource -Name "Text" -Default ""))) {
+                $spanlessReason = "noChangedSpans"
+            }
             [void]$files.Add((New-ReviewerSourceFileEntry -Path $path -CommitSha $CommitSha `
-                        -Status "omitted" -Reason "noChangedSpans"))
+                        -Status "omitted" -Reason $spanlessReason `
+                        -RawRequestedSpanCount $(if ($spanlessReason -ceq "noChangedSpans") { 0 } else { 1 })))
             continue
         }
         $resource = $null

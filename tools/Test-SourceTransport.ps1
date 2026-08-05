@@ -283,8 +283,14 @@ $spansByPath = [ordered]@{
     '/src/nospan.cs'  = @()
 }
 $paths = @('/src/ok.cs', '/src/huge.cs', '/src/binary.png', '/src/gone.cs', '/src/nospan.cs', 'C:/evil.cs')
+# /src/nospan.cs is a delete: the change set says so, which is the only thing
+# that may excuse a path from the coverage denominator.
+$reportKinds = [ordered]@{
+    '/src/ok.cs' = 'Edit'; '/src/huge.cs' = 'Edit'; '/src/binary.png' = 'Edit'
+    '/src/gone.cs' = 'Edit'; '/src/nospan.cs' = 'Delete'; 'C:/evil.cs' = 'Edit'
+}
 $report = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $paths `
-    -SpansByPath $spansByPath -Policy $policy -Reader $reader
+    -SpansByPath $spansByPath -Policy $policy -Reader $reader -ChangeKindsByPath $reportKinds
 
 Assert-Source (@($report.Files).Count -eq $paths.Count) "every changed path appears in the report exactly once"
 $byPath = @{}
@@ -637,6 +643,27 @@ Assert-Source ($transportText -match 'moved from .* while its pinned source was 
     "the wrapper re-pins the source commit after reading"
 Assert-Source ($transportText -notmatch '@\(Get-ReviewerChangePathsFromResponse') `
     "the wrapper does not re-introduce the array-nesting bug that collapsed the change set"
+Assert-Source ($transportText -match 'Get-ReviewerSourceChangeKindsByPath' -and $transportText -match '-ChangeKindsByPath \$changeKindsByPath') `
+    "the wrapper hands each path's declared change kind to the report instead of inferring it"
+Assert-Source ($transportText -match 'if \(@\(\$report\.Files\)\.Count -gt 0\)' -and $transportText -notmatch 'if \(\[int\]\$report\.CoveredFiles -gt 0\)') `
+    "the accounting table is rendered even when nothing was delivered"
+
+$cycleTextForUnits = $cycleText
+Assert-Source ($cycleTextForUnits -match 'sourceBearingFileCount' -and $cycleTextForUnits -match 'noSourceFileCount') `
+    "the cycle log records how many changed paths actually had source to deliver"
+Assert-Source ($cycleTextForUnits -notmatch 'Report\.CoveredFiles, \$sourceTransport\.Report\.ChangedFileCount') `
+    "the operator-facing coverage fraction uses the same denominator the gate does"
+
+# A report with nothing delivered still renders: the accounting table is the
+# whole point, and a model given no source and no statement of that fact is
+# exactly the failure this layer exists to prevent.
+$emptyReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @('/src/a.cs', '/src/b.cs') `
+    -SpansByPath ([ordered]@{ '/src/a.cs' = @(@{ Start = 1; End = 2 }); '/src/b.cs' = @(@{ Start = 1; End = 2 }) }) `
+    -Policy $policy -Reader { param([string]$Path) $null }
+$emptyBlock = Format-ReviewerSealedSourceBlock -Report $emptyReport -NonceFactory { 'n' * 32 }
+Assert-Source ([int]$emptyReport.CoveredFiles -eq 0) "the zero-coverage report really delivered nothing"
+Assert-Source ($emptyBlock -match '/src/a\.cs' -and $emptyBlock -match '/src/b\.cs' -and $emptyBlock -match 'transportFailed') `
+    "the sealed block still names every unread path when coverage is zero"
 
 $passText = Get-FunctionTextFromWrapper -Name 'Invoke-ReviewerModelPass'
 Assert-Source ($passText -match 'PinnedSourceText') "the generalist runtime context carries the sealed block"
@@ -819,6 +846,7 @@ $zeroSpanShapes = @(
     @{ Name = "a binary change with no line blocks"; Response = [pscustomobject]@{ changes = @((New-ChangeEntry -Path '/src/logo.png')) } },
     @{ Name = "an empty added file"; Response = [pscustomobject]@{ changes = @([pscustomobject]@{ item = [pscustomobject]@{ path = '/src/empty.cs'; isFolder = $false } }) } }
 )
+$zeroSpanKinds = [ordered]@{ '/src/gone.cs' = 'Delete'; '/src/deadcode.cs' = 'Delete'; '/src/renamed.cs' = 'Rename'; '/src/logo.png' = 'Edit'; '/src/empty.cs' = 'Add' }
 foreach ($shape in $zeroSpanShapes) {
     $shapeSpans = Get-ReviewerSourceChangedSpans -Response $shape.Response
     $shapePaths = @(@($shape.Response.changes) | ForEach-Object { [string]$_.item.path })
@@ -832,13 +860,70 @@ foreach ($shape in $zeroSpanShapes) {
         Assert-Source $false "$($shape.Name) is accepted rather than treated as a parse failure"
     }
     $shapeReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $shapePaths `
-        -SpansByPath $shapeSpans -Policy $policy -Reader { param([string]$Path) $null }
-    Assert-Source ((@(@($shapeReport.Files) | Where-Object { [string]$_.Reason -ceq 'noChangedSpans' })).Count -eq $shapePaths.Count) `
-        "$($shape.Name) accounts every path as noChangedSpans"
+        -SpansByPath $shapeSpans -Policy $policy -Reader { param([string]$Path) $null } `
+        -ChangeKindsByPath $zeroSpanKinds
     $shapeGate = Test-ReviewerSourceCoverageGate -Report $shapeReport -Policy $policy
-    Assert-Source ($shapeGate.Ok -and @($shapeGate.ReasonCodes).Count -eq 0) `
-        "$($shape.Name) is reviewable: there was no source to deliver, so nothing failed to arrive"
+    if ([string]$shapePaths[0] -in @('/src/gone.cs', '/src/deadcode.cs', '/src/renamed.cs')) {
+        Assert-Source ((@(@($shapeReport.Files) | Where-Object { [string]$_.Reason -ceq 'noChangedSpans' })).Count -eq $shapePaths.Count) `
+            "$($shape.Name) accounts every path as noChangedSpans on its own declared change kind"
+        Assert-Source ($shapeGate.Ok -and @($shapeGate.ReasonCodes).Count -eq 0) `
+            "$($shape.Name) is reviewable: there was no source to deliver, so nothing failed to arrive"
+    }
+    else {
+        # An Add or Edit with no spans is NOT excused on inference: the change
+        # set says it should have lines, so it stays in the denominator.
+        Assert-Source (-not $shapeGate.Ok) `
+            "$($shape.Name) declares added or edited lines, so a missing span set still fails the gate"
+    }
 }
+
+# The fail-open this closes: a host that stops returning line-diff blocks makes
+# every edited file look like a delete, and excluding deletes from the
+# denominator then reports 100% coverage over files nobody read.
+$lostBlocksResponse = [pscustomobject]@{
+    changes = @(
+        [pscustomobject]@{ item = [pscustomobject]@{ path = '/src/e1.cs'; isFolder = $false }; changeType = 'Edit' },
+        [pscustomobject]@{ item = [pscustomobject]@{ path = '/src/e2.cs'; isFolder = $false }; changeType = 'Edit' },
+        [pscustomobject]@{ item = [pscustomobject]@{ path = '/src/e3.cs'; isFolder = $false }; changeType = 'Add' }
+    )
+}
+$lostKinds = Get-ReviewerSourceChangeKindsByPath -Response $lostBlocksResponse
+Assert-Source (@($lostKinds.Keys).Count -eq 3) "each changed path's declared change kind is carried alongside its spans"
+$lostReport = New-ReviewerSourceTransportReport -CommitSha $commit `
+    -ChangedPaths @('/src/e1.cs', '/src/e2.cs', '/src/e3.cs') `
+    -SpansByPath (Get-ReviewerSourceChangedSpans -Response $lostBlocksResponse) -Policy $policy `
+    -Reader { param([string]$Path)
+        $bodyText = New-TestFileText -LineCount 20
+        [pscustomobject]@{ Text = $bodyText; MimeType = 'text/plain'
+            ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($bodyText)
+            Sha256 = Get-ReviewerSourceSha256 -Text $bodyText }
+    } -ChangeKindsByPath $lostKinds
+Assert-Source ([int]$lostReport.SourceBearingFileCount -eq 3 -and [int]$lostReport.NoSourceFileCount -eq 0) `
+    "edited files whose line blocks were lost stay in the coverage denominator"
+Assert-Source ((@($lostReport.Files) | Where-Object { [string]$_.Reason -ceq 'spansUnavailable' }).Count -eq 3) `
+    "they are accounted spansUnavailable, not silently excused as deletes"
+$lostGate = Test-ReviewerSourceCoverageGate -Report $lostReport -Policy $policy
+Assert-Source (-not $lostGate.Ok -and ($lostGate.ReasonCodes -ccontains 'sourceCoverageEmpty')) `
+    "a response that lost every line-diff block fails the gate instead of passing at 100%"
+
+# An added file that is genuinely empty has nothing to deliver, and evidence -
+# not inference - is what says so.
+$emptyAddReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @('/src/empty.cs') `
+    -SpansByPath ([ordered]@{}) -Policy $policy `
+    -Reader { param([string]$Path) [pscustomobject]@{ Text = ''; MimeType = 'text/plain'; ByteLength = 1; Sha256 = ('a' * 64) } } `
+    -ChangeKindsByPath ([ordered]@{ '/src/empty.cs' = 'Add' })
+Assert-Source ((@($emptyAddReport.Files)[0].Reason) -ceq 'noChangedSpans') `
+    "an added file that really is empty is accounted noChangedSpans on evidence"
+Assert-Source (Test-ReviewerSourceChangeCarriesRightHand -ChangeTypeValue $null) `
+    "an unknown change kind is assumed to carry right-hand lines, which is the safe direction"
+Assert-Source (Test-ReviewerSourceChangeCarriesRightHand -ChangeTypeValue 'Edit, Rename') `
+    "a rename that also edits still carries right-hand lines"
+Assert-Source (-not (Test-ReviewerSourceChangeCarriesRightHand -ChangeTypeValue 'Delete')) `
+    "a delete does not carry right-hand lines"
+Assert-Source (-not (Test-ReviewerSourceChangeCarriesRightHand -ChangeTypeValue 'Rename, SourceRename')) `
+    "a pure rename does not carry right-hand lines"
+Assert-Source (Test-ReviewerSourceChangeCarriesRightHand -ChangeTypeValue 'Delete, Wat') `
+    "an unrecognized kind alongside a delete keeps the path in the denominator"
 
 # A normal edit and a mixed set must still behave, and a mis-parse must still
 # be caught: same input, right-hand blocks present, structured extractor blind.
@@ -920,25 +1005,29 @@ $mixedReader = {
 }
 $mixedGatePaths = @('/src/e1.cs', '/src/e2.cs', '/src/d1.cs', '/src/d2.cs', '/src/d3.cs', '/src/r1.cs')
 $mixedGateSpans = [ordered]@{ '/src/e1.cs' = @(@{ Start = 5; End = 6 }); '/src/e2.cs' = @(@{ Start = 5; End = 6 }) }
+$mixedGateKinds = [ordered]@{ '/src/e1.cs' = 'Edit'; '/src/e2.cs' = 'Edit'; '/src/d1.cs' = 'Delete'; '/src/d2.cs' = 'Delete'; '/src/d3.cs' = 'Delete'; '/src/r1.cs' = 'Rename, SourceRename' }
 $mixedGateReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $mixedGatePaths `
-    -SpansByPath $mixedGateSpans -Policy $policy -Reader $mixedReader
+    -SpansByPath $mixedGateSpans -Policy $policy -Reader $mixedReader -ChangeKindsByPath $mixedGateKinds
 Assert-Source ([int]$mixedGateReport.NoSourceFileCount -eq 4 -and [int]$mixedGateReport.SourceBearingFileCount -eq 2) `
     "deleted, renamed and binary paths are counted apart from the ones that carry source"
 Assert-Source ([int]$mixedGateReport.CoveragePercent -eq 100 -and [int]$mixedGateReport.SpanPercent -eq 100) `
     "a change set whose every editable hunk arrived scores 100%, whatever it deleted"
 Assert-Source ((Test-ReviewerSourceCoverageGate -Report $mixedGateReport -Policy $policy).Ok) `
     "two edits and four deletes is reviewed, not refused"
-Assert-Source ((@($mixedGateReport.Files) | Where-Object { [string]$_.Reason -ceq 'noChangedSpans' }).Count -eq 4) `
+Assert-Source (@(@($mixedGateReport.Files) | Where-Object { [string]$_.Reason -ceq 'noChangedSpans' }).Count -eq 4) `
     "the deleted and renamed paths are still named in the accounting"
 
 # A change set that is nothing but deletes has no source to deliver either, and
 # refusing it would make pure dead-code removals unreviewable.
 $allDeletePaths = @('/src/d1.cs', '/src/d2.cs')
 $allDeleteReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $allDeletePaths `
-    -SpansByPath ([ordered]@{}) -Policy $policy -Reader $mixedReader
+    -SpansByPath ([ordered]@{}) -Policy $policy -Reader $mixedReader `
+    -ChangeKindsByPath ([ordered]@{ '/src/d1.cs' = 32; '/src/d2.cs' = 32 })
 $allDeleteGate = Test-ReviewerSourceCoverageGate -Report $allDeleteReport -Policy $policy
 Assert-Source ($allDeleteGate.Ok -and @($allDeleteGate.ReasonCodes).Count -eq 0) `
     "a pure-deletion change set is reviewable rather than refused for zero coverage"
+Assert-Source (@(@($allDeleteReport.Files) | Where-Object { [string]$_.Reason -ceq 'noChangedSpans' }).Count -eq 2) `
+    "an integer changeType bitmask is understood as well as the flag string"
 $stillEmptyReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @('/src/e1.cs') `
     -SpansByPath ([ordered]@{ '/src/e1.cs' = @(@{ Start = 5; End = 6 }) }) -Policy $policy -Reader { param([string]$Path) $null }
 $stillEmptyGate = Test-ReviewerSourceCoverageGate -Report $stillEmptyReport -Policy $policy

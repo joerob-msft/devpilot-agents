@@ -59,8 +59,8 @@ The block opens with every changed path and whether its source actually arrived:
 
 `status` is `delivered`, `partial`, or `omitted`. `reason` comes from a closed
 set: `budgetExhausted`, `sliceCountCapExceeded`, `fileTooLarge`, `notTextual`,
-`decodeRejected`, `transportFailed`, `noChangedSpans`, `fileCountCapExceeded`,
-`pathRejected`, `spanOutsideFile`, `unsafeSliceText`.
+`decodeRejected`, `transportFailed`, `noChangedSpans`, `spansUnavailable`,
+`fileCountCapExceeded`, `pathRejected`, `spanOutsideFile`, `unsafeSliceText`.
 
 Those causes are told apart at the reader seam, before the strict decoder runs.
 The decoder's job is safety and it refuses everything it dislikes the same way,
@@ -71,16 +71,31 @@ now read structurally and judged against policy first; only content policy would
 accept reaches the decoder, and only the decoder's own refusals become
 `decodeRejected`. Nothing about its strictness changes.
 
-**A change set with no right-hand lines is not a failure.** Delete-only,
-rename-only, binary and empty-file changes legitimately have paths and no
-changed lines: those paths are accounted `noChangedSpans` and are **excluded
-from the coverage denominator**, because there is no source for the transport to
-deliver and they therefore cannot be uncovered. Leaving them in meant a pull
-request that edited two files and deleted four scored 33% and was never
-reviewed — on every cycle, forever — though every changed hunk in it had
-arrived. A change set that is nothing but deletes is reviewable on the diff
-alone; a file that does carry changed lines and did not arrive still fails the
-gate.
+**A change set with no right-hand lines is not a failure — but only the change
+set may say so.** Delete-only, rename-only, binary and empty-file changes
+legitimately have paths and no changed lines: those paths are accounted
+`noChangedSpans` and are **excluded from the coverage denominator**, because
+there is no source for the transport to deliver and they therefore cannot be
+uncovered. Leaving them in meant a pull request that edited two files and deleted
+four scored 33% and was never reviewed — on every cycle, forever — though every
+changed hunk in it had arrived. A change set that is nothing but deletes is
+reviewable on the diff alone; a file that does carry changed lines and did not
+arrive still fails the gate.
+
+What decides which case a spanless path is, is the change set's own `changeType`
+for that path — never the absence of parsed spans. Inferring the first from the
+second is a fail-open with a large blast radius: any condition that costs the
+line-diff blocks (a host change, a serialization change, a parser regression)
+makes *every edited file* look like a delete, and excluding deletes from the
+denominator then turns the loud refusal this layer exists to produce into a
+silent 100% pass over files nobody read. So a spanless path whose declared change
+kind carries right-hand lines — `add`, `edit`, `undelete`, `branch`, or anything
+unrecognized — is read anyway: if it is genuinely empty it is `noChangedSpans` on
+evidence, and if it has content its spans were lost and it is `spansUnavailable`,
+which stays **in** the denominator. Only a path whose declared kinds are entirely
+non-right-hand (`delete`, `rename`, `sourcerename`, `encoding`, `none`) is
+excused, and a missing or unreadable `changeType` is treated as right-hand
+bearing, because that is the direction that fails closed.
 
 The cross-check between the two extractions only calls mis-parse when a
 permissive independent scan finds right-hand-bearing line blocks in the response
@@ -91,8 +106,16 @@ and the extractor does not is the mis-parse it exists to catch.
 
 Both prompts bind the model to that table: it may not report on, clear, or claim
 to have reviewed an `omitted` path, and must describe a `partial` path as
-partially read. That is what stops structural metadata being mistaken for source
-text — the model is told, in the same document, exactly what it does not have.
+partially read. The one exception is `noChangedSpans`, which is not a gap in what
+the model was given — that path has no added or edited lines at all, so there is
+nothing in it to read and the change-set diff is all there is to judge it by.
+That is what stops structural metadata being mistaken for source text — the model
+is told, in the same document, exactly what it does not have.
+
+The table is rendered whenever there is any changed path to account for, even
+when nothing at all was delivered. Suppressing it at zero coverage would leave
+the model with no source *and* no statement that source is missing, which is
+precisely the condition this layer exists to make impossible.
 
 The block also names its own fence token and states that everything between a
 `<TOKEN> BEGIN` and its matching `<TOKEN> END` is quoted file bytes. Slice text
