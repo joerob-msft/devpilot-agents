@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:devpilot:reviewer:evaluation-adjudication:v1",
+  "title": "DevPilot reviewer evaluation adjudication v1",
+  "description": "Blind claim verdicts, filed against a content-derived blindClaimKey. There is deliberately no arm, model, run, pack, cluster, pass, partition, stratum, issue-class, or convention field anywhere in this schema: an adjudicator who can tell which arm produced a claim is not blind, and no amount of field-stripping elsewhere fixes that.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "artifactVersion",
+    "schemaVersion",
+    "adjudicationVersion",
+    "corpusSha256",
+    "presentationOrderSha256",
+    "verdicts"
+  ],
+  "properties": {
+    "kind": { "const": "reviewer-evaluation-adjudication" },
+    "artifactVersion": { "const": 1 },
+    "schemaVersion": { "const": 1 },
+    "adjudicationVersion": { "type": "integer", "minimum": 1 },
+    "corpusSha256": { "$ref": "#/$defs/sha256" },
+    "presentationOrderSha256": { "$ref": "#/$defs/sha256" },
+    "verdicts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["blindClaimKey", "presentedSha256", "labels", "adjudication"],
+        "properties": {
+          "blindClaimKey": { "$ref": "#/$defs/sha256" },
+          "presentedSha256": { "$ref": "#/$defs/sha256" },
+          "labels": {
+            "type": "array",
+            "minItems": 2,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["labelerId", "labelerKind", "verdict", "matchedIssueIds", "verdictAtEpochSeconds"],
+              "properties": {
+                "labelerId": { "type": "string", "minLength": 1 },
+                "labelerKind": { "const": "human" },
+                "verdict": { "enum": ["truePositive", "falsePositive", "abstain"] },
+                "matchedIssueIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+                "verdictAtEpochSeconds": { "$ref": "#/$defs/epochSeconds" }
+              }
+            }
+          },
+          "adjudication": {
+            "type": ["object", "null"],
+            "additionalProperties": false,
+            "required": ["adjudicatorId", "adjudicatorKind", "verdict", "matchedIssueIds", "adjudicatedAtEpochSeconds"],
+            "properties": {
+              "adjudicatorId": { "type": "string", "minLength": 1 },
+              "adjudicatorKind": { "const": "human" },
+              "verdict": { "enum": ["truePositive", "falsePositive", "abstain"] },
+              "matchedIssueIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+              "adjudicatedAtEpochSeconds": { "$ref": "#/$defs/epochSeconds" }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "epochSeconds": { "type": "integer", "minimum": 0 }
+  }
+}

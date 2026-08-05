@@ -704,14 +704,18 @@ neither can structurally ever authorize anything.
 
 **The qualification tool's `evaluationToolSha256` binding has no live
 counterpart unless an operator supplies one.** This script has no evaluation
-tool of its own to hash at runtime - the evaluation tool is inherently an
-external, operator-side artifact. By default this binding is accepted as
+tool of its own to hash at runtime. By default this binding is accepted as
 recorded provenance without independent re-verification. Supplying
 `-GateEvaluationToolSha256 <hex64>` gives it a real, live counterpart: a
 mismatch then closes the qualification (`qualificationToolMismatch`) exactly
 like every other qualification binding. Either way, this is a third
 out-of-band OPERATOR input, like `-GatePolicyFile`/`-GateQualificationFile` -
-never something repository config can set.
+never something repository config can set. Layer 7 now provides a value worth
+binding to: `tools/Invoke-ReviewerEvaluation.ps1` emits a composite
+`toolBinding.evaluationToolSha256` covering the evaluation library, both
+evaluation tools, the evaluation policy, and all four evaluation schemas, so
+the binding cannot cover a thin entry point while the scoring code changes
+underneath it. See [Evaluation harness](evaluation-harness.md).
 
 **No end-to-end mocked test exercises a live unattended approval vote call.**
 The approval *predicate* (`Test-ReviewerGateApproval`) has full boundary

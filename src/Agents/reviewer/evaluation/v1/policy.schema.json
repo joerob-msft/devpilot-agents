@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:devpilot:reviewer:evaluation-policy:v1",
+  "title": "DevPilot reviewer evaluation policy v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "policyVersion",
+    "minExamples",
+    "minCalibrationExamples",
+    "minHoldoutExamples",
+    "minPerStratumExamples",
+    "minEligibleHoldoutFindings",
+    "minCommentPrecision",
+    "minCommentPrecisionLowerBound95",
+    "minCriticalAdjudicatedClaims",
+    "minApprovalDecisions",
+    "minWouldApproveDecisions",
+    "minAdjudicationCoverage",
+    "minLabelAgreementKappa",
+    "maxRecallRegression",
+    "maxCriticalFalsePositiveRate",
+    "maxFalseApprovalRate",
+    "maxExactTrials",
+    "suggestionQualificationEnabled",
+    "qualifiableScopes"
+  ],
+  "properties": {
+    "_note": { "type": "string" },
+    "schemaVersion": { "const": 1 },
+    "policyVersion": { "type": "integer", "minimum": 1 },
+    "minExamples": { "type": "integer", "minimum": 0 },
+    "minCalibrationExamples": { "type": "integer", "minimum": 0 },
+    "minHoldoutExamples": { "type": "integer", "minimum": 0 },
+    "minPerStratumExamples": { "type": "integer", "minimum": 0 },
+    "minEligibleHoldoutFindings": { "type": "integer", "minimum": 0 },
+    "minCommentPrecision": { "type": "number", "minimum": 0, "maximum": 1 },
+    "minCommentPrecisionLowerBound95": { "type": "number", "minimum": 0, "maximum": 1 },
+    "minCriticalAdjudicatedClaims": { "type": "integer", "minimum": 0 },
+    "minApprovalDecisions": { "type": "integer", "minimum": 0 },
+    "minWouldApproveDecisions": { "type": "integer", "minimum": 0 },
+    "minAdjudicationCoverage": { "type": "number", "minimum": 0, "maximum": 1 },
+    "minLabelAgreementKappa": { "type": "number", "minimum": 0, "maximum": 1 },
+    "maxRecallRegression": { "type": "number", "minimum": 0, "maximum": 1 },
+    "maxCriticalFalsePositiveRate": { "type": "number", "minimum": 0, "maximum": 1 },
+    "maxFalseApprovalRate": { "type": "number", "minimum": 0, "maximum": 1 },
+    "maxExactTrials": { "type": "integer", "minimum": 1 },
+    "suggestionQualificationEnabled": { "type": "boolean" },
+    "qualifiableScopes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pack", "severity"],
+        "properties": {
+          "pack": { "type": "string", "minLength": 1 },
+          "severity": { "enum": ["critical", "important", "suggestion"] }
+        }
+      }
+    }
+  }
+}
