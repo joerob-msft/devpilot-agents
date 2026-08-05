@@ -441,8 +441,8 @@ The block opens with a **content accounting table** naming every changed path an
 whether its source arrived (`delivered`, `partial`, `omitted`, with a closed
 reason set). Both prompts bind the model to it: an `omitted` path may not be
 reported on, cleared, or counted as reviewed — unless its reason is
-`noChangedSpans`, which means the path has no added or edited lines at all and so
-has nothing in it to read. Below a configured coverage floor the PR is **not
+`noChangedSpans` or `notTextual`, which mean the path has no added or edited text
+for anyone to read. Below a configured coverage floor the PR is **not
 reviewed at all** - no preview, no comments, no vote - and the
 preview a human reads states the coverage and names the files whose source never
 arrived. See [docs/source-transport.md](docs/source-transport.md).

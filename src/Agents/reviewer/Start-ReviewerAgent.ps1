@@ -3685,9 +3685,13 @@ function Write-ReviewerPreview {
     [void]$lines.Add("- Findings: $($counts['critical']) critical, $($counts['important']) important, $($counts['suggestion']) suggestion")
     [void]$lines.Add("- Recommended vote: $RecommendedVote")
     if ($null -ne $SourceCoverage) {
-        [void]$lines.Add("- Pinned source coverage: $([int]$SourceCoverage.coveredFiles)/$([int]$SourceCoverage.sourceBearingFileCount) changed file(s) with added or edited lines ($([int]$SourceCoverage.coveragePercent)%), $([int]$SourceCoverage.totalSliceBytes) slice byte(s); $([int]$SourceCoverage.noSourceFileCount) further path(s) have no added or edited lines")
+        [void]$lines.Add("- Pinned source coverage: $([int]$SourceCoverage.coveredFiles)/$([int]$SourceCoverage.sourceBearingFileCount) changed file(s) with added or edited lines ($([int]$SourceCoverage.coveragePercent)%), $([int]$SourceCoverage.totalSliceBytes) slice byte(s); $([int]$SourceCoverage.noSourceFileCount) further path(s) have no added or edited text to read")
+        # `carriesSource` is the record's own statement that a path had nothing
+        # to deliver. Filtering on reason strings instead would silently start
+        # listing ordinary deletes and binaries as unread the moment a new
+        # no-source reason is introduced.
         $uncovered = @(@($SourceCoverage.files) | Where-Object {
-                [string]$_.status -ceq 'omitted' -and [string]$_.reason -cne 'noChangedSpans'
+                [string]$_.status -ceq 'omitted' -and [bool]$_.carriesSource
             })
         if ($uncovered.Count -gt 0) {
             [void]$lines.Add("- Changed files whose source did NOT reach the model: " +

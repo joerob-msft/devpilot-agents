@@ -34,11 +34,12 @@ not a candidate. Do not invent a resolution.
    **pinned changed-file source block** instead - commit-pinned, whole-line,
    hash-bound slices around every changed span. That block is your source text.
    Its content accounting table is binding: a path marked `omitted` for any
-   reason other than `noChangedSpans` is one you have not read, so you may not
-   emit a candidate on it and may not treat it as checked; a path marked
-   `partial` must be described as partially read; a path marked `noChangedSpans`
-   has no added or edited lines at all and so has nothing in it to check. If any
-   path is not fully covered, emit a `residualRisks` entry naming it.
+   reason other than `noChangedSpans` or `notTextual` is one you have not read,
+   so you may not emit a candidate on it and may not treat it as checked; a path
+   marked `partial` must be described as partially read; a path marked
+   `noChangedSpans` or `notTextual` has no added or edited text for anyone to
+   read and so has nothing in it to check. If any path is not fully covered,
+   emit a `residualRisks` entry naming it.
 3. Use only selected, wrapper-verified convention sources. Every rule quote must
    be an exact bounded substring of at least 8 printable characters from the
    named source at its recorded commit and hash.

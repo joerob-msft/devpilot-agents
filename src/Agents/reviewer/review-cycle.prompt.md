@@ -79,10 +79,10 @@ whether its source actually arrived. That table binds you:
 - a path shown as `delivered` — you have its changed regions and their context;
 - a path shown as `partial` — you have some regions and not others; say so
   rather than implying you read the file;
-- a path shown as `omitted` with reason `noChangedSpans` — that path has no
-  added or edited lines at all: it was deleted, renamed, or is not text. There
-  is nothing in it to read, and the change-set diff is all there is to judge it
-  by. It is not a gap in what you were given;
+- a path shown as `omitted` with reason `noChangedSpans` or `notTextual` — that
+  path has no added or edited text for anyone to read: it was deleted, renamed,
+  is empty, or is not a text file. The change-set diff is all there is to judge
+  it by. It is not a gap in what you were given;
 - a path shown as `omitted` for **any other reason** — **you have not read that
   file at all.** Do not report a finding on it, do not clear it, and do not let
   it count toward "I reviewed the change". Name it in your summary as unread.

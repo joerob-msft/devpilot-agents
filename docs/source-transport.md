@@ -71,16 +71,16 @@ now read structurally and judged against policy first; only content policy would
 accept reaches the decoder, and only the decoder's own refusals become
 `decodeRejected`. Nothing about its strictness changes.
 
-**A change set with no right-hand lines is not a failure — but only the change
-set may say so.** Delete-only, rename-only, binary and empty-file changes
-legitimately have paths and no changed lines: those paths are accounted
-`noChangedSpans` and are **excluded from the coverage denominator**, because
-there is no source for the transport to deliver and they therefore cannot be
-uncovered. Leaving them in meant a pull request that edited two files and deleted
-four scored 33% and was never reviewed — on every cycle, forever — though every
-changed hunk in it had arrived. A change set that is nothing but deletes is
-reviewable on the diff alone; a file that does carry changed lines and did not
-arrive still fails the gate.
+**A change set with no right-hand lines is not a failure — but only evidence may
+say so.** Delete-only, rename-only, binary and empty-file changes legitimately
+have paths and no changed lines: those paths are counted apart and are **excluded
+from the coverage denominator**, because there is no source for the transport to
+deliver and they therefore cannot be uncovered. Leaving them in meant a pull
+request that edited two files and deleted four scored 33% and was never
+reviewed — on every cycle, forever — though every changed hunk in it had
+arrived. A change set that is nothing but deletes is reviewable on the diff
+alone; a file that does carry changed lines and did not arrive still fails the
+gate.
 
 What decides which case a spanless path is, is the change set's own `changeType`
 for that path — never the absence of parsed spans. Inferring the first from the
@@ -89,13 +89,42 @@ line-diff blocks (a host change, a serialization change, a parser regression)
 makes *every edited file* look like a delete, and excluding deletes from the
 denominator then turns the loud refusal this layer exists to produce into a
 silent 100% pass over files nobody read. So a spanless path whose declared change
-kind carries right-hand lines — `add`, `edit`, `undelete`, `branch`, or anything
-unrecognized — is read anyway: if it is genuinely empty it is `noChangedSpans` on
-evidence, and if it has content its spans were lost and it is `spansUnavailable`,
-which stays **in** the denominator. Only a path whose declared kinds are entirely
-non-right-hand (`delete`, `rename`, `sourcerename`, `encoding`, `none`) is
-excused, and a missing or unreadable `changeType` is treated as right-hand
-bearing, because that is the direction that fails closed.
+kind carries content is read anyway, and what comes back decides:
+
+| what the read says | reason | in the denominator? |
+|---|---|---|
+| zero bytes | `noChangedSpans` | no — there is nothing to deliver |
+| not a text MIME type | `notTextual` | no — a binary has no lines to read |
+| real text content | `spansUnavailable` | **yes** — its diff was lost |
+| unreadable | `transportFailed` | **yes** |
+
+Emptiness is decided on the reported byte length, not on whitespace: a file of
+blank lines has content a reviewer could be shown. A reader that reports no byte
+length at all cannot excuse a path by omission. Every excusing decision records
+the MIME type, byte length and hash it was made on, so an operator auditing why a
+path left the denominator has the evidence in the coverage record.
+
+The kinds treated as carrying no content are `delete`, `rename`, `sourcerename`,
+`targetrename`, `encoding`, `lock` and `property`. A path is excused only when
+*every* one of its declared kinds is in that set; anything else — `add`, `edit`,
+`undelete`, `branch`, `merge`, `rollback`, or any value the layer does not
+recognize, including a missing one and Azure DevOps' `None`/`0` — is treated as
+content-bearing, because that is the direction that fails closed. Integer
+`changeType` values are decoded with Azure DevOps' own `VersionControlChangeType`
+bits and every bit is asserted in the tests, since a shifted bit would silently
+turn `Undelete` into `Delete` and excuse a restored file unread. Where a change
+set carries more than one entry for a path, the kinds are unioned, so a trailing
+`Delete` row cannot erase an earlier `Edit`.
+
+That read costs one whole-file fetch per spanless content-declaring path, so it
+is capped at 16 per pull request. Past the cap a path is counted uncovered
+without being read: a change set with that many spanless-but-editable paths is
+systematically broken and the coverage floor is going to refuse it anyway.
+
+No hunk is ever invented for these paths. The pull request reported no hunks for
+them, so they contribute nothing to the span numerator or denominator — the
+file-level floor is what carries them — and the block's sentence about "changed
+hunk(s) as the pull request reports them" stays literally true.
 
 The cross-check between the two extractions only calls mis-parse when a
 permissive independent scan finds right-hand-bearing line blocks in the response
@@ -106,11 +135,12 @@ and the extractor does not is the mis-parse it exists to catch.
 
 Both prompts bind the model to that table: it may not report on, clear, or claim
 to have reviewed an `omitted` path, and must describe a `partial` path as
-partially read. The one exception is `noChangedSpans`, which is not a gap in what
-the model was given — that path has no added or edited lines at all, so there is
-nothing in it to read and the change-set diff is all there is to judge it by.
-That is what stops structural metadata being mistaken for source text — the model
-is told, in the same document, exactly what it does not have.
+partially read. Two reasons are exceptions, because they are not gaps in what the
+model was given: `noChangedSpans` (deleted, renamed, or empty) and `notTextual`
+(not a text file) both mean there is nothing in that path for anyone to read, so
+the change-set diff is all there is to judge it by. That is what stops structural
+metadata being mistaken for source text — the model is told, in the same
+document, exactly what it does not have.
 
 The table is rendered whenever there is any changed path to account for, even
 when nothing at all was delivered. Suppressing it at zero coverage would leave

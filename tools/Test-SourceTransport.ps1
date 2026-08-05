@@ -900,7 +900,7 @@ $lostReport = New-ReviewerSourceTransportReport -CommitSha $commit `
     } -ChangeKindsByPath $lostKinds
 Assert-Source ([int]$lostReport.SourceBearingFileCount -eq 3 -and [int]$lostReport.NoSourceFileCount -eq 0) `
     "edited files whose line blocks were lost stay in the coverage denominator"
-Assert-Source ((@($lostReport.Files) | Where-Object { [string]$_.Reason -ceq 'spansUnavailable' }).Count -eq 3) `
+Assert-Source (@(@($lostReport.Files) | Where-Object { [string]$_.Reason -ceq 'spansUnavailable' }).Count -eq 3) `
     "they are accounted spansUnavailable, not silently excused as deletes"
 $lostGate = Test-ReviewerSourceCoverageGate -Report $lostReport -Policy $policy
 Assert-Source (-not $lostGate.Ok -and ($lostGate.ReasonCodes -ccontains 'sourceCoverageEmpty')) `
@@ -910,7 +910,7 @@ Assert-Source (-not $lostGate.Ok -and ($lostGate.ReasonCodes -ccontains 'sourceC
 # not inference - is what says so.
 $emptyAddReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @('/src/empty.cs') `
     -SpansByPath ([ordered]@{}) -Policy $policy `
-    -Reader { param([string]$Path) [pscustomobject]@{ Text = ''; MimeType = 'text/plain'; ByteLength = 1; Sha256 = ('a' * 64) } } `
+    -Reader { param([string]$Path) [pscustomobject]@{ Text = ''; MimeType = 'text/plain'; ByteLength = 0; Sha256 = ('a' * 64) } } `
     -ChangeKindsByPath ([ordered]@{ '/src/empty.cs' = 'Add' })
 Assert-Source ((@($emptyAddReport.Files)[0].Reason) -ceq 'noChangedSpans') `
     "an added file that really is empty is accounted noChangedSpans on evidence"
@@ -1022,12 +1022,123 @@ Assert-Source (@(@($mixedGateReport.Files) | Where-Object { [string]$_.Reason -c
 $allDeletePaths = @('/src/d1.cs', '/src/d2.cs')
 $allDeleteReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $allDeletePaths `
     -SpansByPath ([ordered]@{}) -Policy $policy -Reader $mixedReader `
-    -ChangeKindsByPath ([ordered]@{ '/src/d1.cs' = 32; '/src/d2.cs' = 32 })
+    -ChangeKindsByPath ([ordered]@{ '/src/d1.cs' = 16; '/src/d2.cs' = 16 })
 $allDeleteGate = Test-ReviewerSourceCoverageGate -Report $allDeleteReport -Policy $policy
 Assert-Source ($allDeleteGate.Ok -and @($allDeleteGate.ReasonCodes).Count -eq 0) `
     "a pure-deletion change set is reviewable rather than refused for zero coverage"
 Assert-Source (@(@($allDeleteReport.Files) | Where-Object { [string]$_.Reason -ceq 'noChangedSpans' }).Count -eq 2) `
     "an integer changeType bitmask is understood as well as the flag string"
+
+# Azure DevOps VersionControlChangeType. Getting one of these wrong is silent
+# and unsafe in exactly one direction, so every value is asserted rather than
+# trusted: an Undelete decoded as a Delete would excuse a restored file, with
+# real content, from the coverage floor without reading it.
+$changeTypeBits = @(
+    @{ Value = 1; Token = 'add'; Content = $true },
+    @{ Value = 2; Token = 'edit'; Content = $true },
+    @{ Value = 4; Token = 'encoding'; Content = $false },
+    @{ Value = 8; Token = 'rename'; Content = $false },
+    @{ Value = 16; Token = 'delete'; Content = $false },
+    @{ Value = 32; Token = 'undelete'; Content = $true },
+    @{ Value = 64; Token = 'branch'; Content = $true },
+    @{ Value = 128; Token = 'merge'; Content = $true },
+    @{ Value = 256; Token = 'lock'; Content = $false },
+    @{ Value = 512; Token = 'rollback'; Content = $true },
+    @{ Value = 1024; Token = 'sourcerename'; Content = $false },
+    @{ Value = 2048; Token = 'targetrename'; Content = $false },
+    @{ Value = 4096; Token = 'property'; Content = $false }
+)
+foreach ($bit in $changeTypeBits) {
+    $decoded = Get-ReviewerSourceChangeKinds -Value ([int]$bit.Value)
+    Assert-Source (@($decoded).Count -eq 1 -and ([string]@($decoded)[0]) -ceq [string]$bit.Token) `
+        "changeType $($bit.Value) decodes to '$($bit.Token)'"
+    Assert-Source ((Test-ReviewerSourceChangeCarriesRightHand -ChangeTypeValue ([int]$bit.Value)) -eq [bool]$bit.Content) `
+        "'$($bit.Token)' alone is $(if ($bit.Content) { '' } else { 'not ' })content-bearing"
+}
+Assert-Source ((Test-ReviewerSourceChangeCarriesRightHand -ChangeTypeValue 18)) `
+    "a combined edit+rename (18) keeps the path in the denominator"
+Assert-Source ((Test-ReviewerSourceChangeCarriesRightHand -ChangeTypeValue 0)) `
+    "changeType 0 names no kind, so the path is counted rather than excused"
+Assert-Source ((Test-ReviewerSourceChangeCarriesRightHand -ChangeTypeValue 'None')) `
+    "the string 'None' is treated the same way as the integer 0"
+Assert-Source ((Test-ReviewerSourceChangeCarriesRightHand -ChangeTypeValue @('delete', 'edit'))) `
+    "an already-normalized token array is understood, not stringified into one unknown token"
+
+# One path, two entries. Last-write-wins would let a trailing Delete row erase
+# the Edit that says this file has content.
+$dupResponse = [pscustomobject]@{
+    changes = @(
+        [pscustomobject]@{ item = [pscustomobject]@{ path = '/src/dup.cs'; isFolder = $false }; changeType = 'Edit' },
+        [pscustomobject]@{ item = [pscustomobject]@{ path = '/src/dup.cs'; isFolder = $false }; changeType = 'Delete' }
+    )
+}
+$dupKinds = Get-ReviewerSourceChangeKindsByPath -Response $dupResponse
+Assert-Source (Test-ReviewerSourceChangeCarriesRightHand -ChangeTypeValue $dupKinds['/src/dup.cs']) `
+    "duplicate change entries for one path union their kinds instead of overwriting"
+
+# An added binary has a path, an 'Add' change type and no line blocks. Counting
+# it would refuse every pull request that adds an icon, forever.
+$binaryAddReport = New-ReviewerSourceTransportReport -CommitSha $commit `
+    -ChangedPaths @('/src/e1.cs', '/assets/logo.png') `
+    -SpansByPath ([ordered]@{ '/src/e1.cs' = @(@{ Start = 5; End = 6 }) }) -Policy $policy `
+    -Reader { param([string]$Path)
+        if ($Path -clike '*.png') { return [pscustomobject]@{ Rejected = 'notTextual'; MimeType = 'image/png'; ByteLength = 4096; Sha256 = ('b' * 64) } }
+        $bodyText = New-TestFileText -LineCount 40
+        [pscustomobject]@{ Text = $bodyText; MimeType = 'text/plain'
+            ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($bodyText)
+            Sha256 = Get-ReviewerSourceSha256 -Text $bodyText }
+    } -ChangeKindsByPath ([ordered]@{ '/src/e1.cs' = 'Edit'; '/assets/logo.png' = 'Add' })
+Assert-Source ([int]$binaryAddReport.NoSourceFileCount -eq 1 -and [int]$binaryAddReport.SourceBearingFileCount -eq 1) `
+    "an added binary with no line blocks has no source to deliver and leaves the denominator"
+Assert-Source ((Test-ReviewerSourceCoverageGate -Report $binaryAddReport -Policy $policy).Ok) `
+    "adding a binary to a small pull request does not make it permanently unreviewable"
+Assert-Source ([int]$binaryAddReport.RequestedSpanCount -eq 1) `
+    "no hunk is invented for a path the pull request reported no hunks for"
+$binaryAddBlock = Format-ReviewerSealedSourceBlock -Report $binaryAddReport -NonceFactory { 'n' * 32 }
+Assert-Source ($binaryAddBlock -match '/assets/logo\.png' -and $binaryAddBlock -match 'notTextual') `
+    "the binary is still named in the accounting table with its own reason"
+
+# The excusing decision is made on bytes, and it records what it saw.
+$blankReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @('/src/blank.cs') `
+    -SpansByPath ([ordered]@{}) -Policy $policy `
+    -Reader { param([string]$Path) [pscustomobject]@{ Text = "   `n`n  "; MimeType = 'text/plain'; ByteLength = 8; Sha256 = ('c' * 64) } } `
+    -ChangeKindsByPath ([ordered]@{ '/src/blank.cs' = 'Edit' })
+Assert-Source (([string]@($blankReport.Files)[0].Reason) -ceq 'spansUnavailable' -and [int]$blankReport.SourceBearingFileCount -eq 1) `
+    "a file of blank lines has bytes, so it is not excused as empty"
+$emptyEvidenceReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @('/src/zero.cs') `
+    -SpansByPath ([ordered]@{}) -Policy $policy `
+    -Reader { param([string]$Path) [pscustomobject]@{ Text = ''; MimeType = 'text/plain'; ByteLength = 0; Sha256 = ('d' * 64) } } `
+    -ChangeKindsByPath ([ordered]@{ '/src/zero.cs' = 'Add' })
+$emptyEvidenceEntry = @($emptyEvidenceReport.Files)[0]
+Assert-Source (([string]$emptyEvidenceEntry.Reason) -ceq 'noChangedSpans' -and ([string]$emptyEvidenceEntry.FileSha256) -ceq ('d' * 64) -and ([string]$emptyEvidenceEntry.MimeType) -ceq 'text/plain') `
+    "excusing a path on evidence records the evidence it was excused on"
+$emptyNoLengthReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @('/src/zero.cs') `
+    -SpansByPath ([ordered]@{}) -Policy $policy `
+    -Reader { param([string]$Path) [pscustomobject]@{ Text = ''; MimeType = 'text/plain'; Sha256 = ('d' * 64) } } `
+    -ChangeKindsByPath ([ordered]@{ '/src/zero.cs' = 'Add' })
+Assert-Source (([string]@($emptyNoLengthReport.Files)[0].Reason) -ceq 'spansUnavailable') `
+    "a reader that reports no byte length cannot excuse a path by omission"
+
+# The probe is bounded: a response that lost every line block must not pay a
+# whole-file fetch for every path before the floor refuses it anyway.
+$probeCount = 0
+$manySpanlessPaths = @(1..25 | ForEach-Object { "/src/many$_.cs" })
+$manySpanlessKinds = [ordered]@{}
+foreach ($p in $manySpanlessPaths) { $manySpanlessKinds[$p] = 'Edit' }
+$manyReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $manySpanlessPaths `
+    -SpansByPath ([ordered]@{}) -Policy $policy `
+    -Reader { param([string]$Path)
+        $script:probeCount++
+        $bodyText = New-TestFileText -LineCount 20
+        [pscustomobject]@{ Text = $bodyText; MimeType = 'text/plain'
+            ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($bodyText)
+            Sha256 = Get-ReviewerSourceSha256 -Text $bodyText }
+    } -ChangeKindsByPath $manySpanlessKinds
+Assert-Source ($script:probeCount -le 16) "the spanless probe is bounded rather than one fetch per changed path"
+Assert-Source ([int]$manyReport.SourceBearingFileCount -eq 25 -and [int]$manyReport.CoveredFiles -eq 0) `
+    "every path past the probe budget is still counted uncovered, which is the fail-closed direction"
+Assert-Source (-not (Test-ReviewerSourceCoverageGate -Report $manyReport -Policy $policy).Ok) `
+    "and the gate still refuses"
 $stillEmptyReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @('/src/e1.cs') `
     -SpansByPath ([ordered]@{ '/src/e1.cs' = @(@{ Start = 5; End = 6 }) }) -Policy $policy -Reader { param([string]$Path) $null }
 $stillEmptyGate = Test-ReviewerSourceCoverageGate -Report $stillEmptyReport -Policy $policy

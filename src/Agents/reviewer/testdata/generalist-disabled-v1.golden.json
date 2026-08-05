@@ -34,6 +34,10 @@
       {
         "sha256": "e585d8a8642db378e712cc2a1e6046c1d763310c700267bc3a0e991d236a6d61",
         "reason": "Route coverage paths through a safe renderer, and report coverage against the changed files that actually carry added or edited lines so deletes and renames cannot sink the reported percentage."
+      },
+      {
+        "sha256": "977da64246625f50c15a267b86905d382c0034e04442d4c163a2e2bc81fb2287",
+        "reason": "Decide which paths to list as unread from the coverage record's own carriesSource flag rather than by matching one reason string, so a newly added no-source reason cannot start listing ordinary deletes and binaries as files the model failed to read."
       }
     ],
     "Invoke-ReviewerDelivery": [
@@ -86,6 +90,10 @@
     {
       "sha256": "02ad8391d74c2a952cffd622ea57f93e0a9753ba175b3773a433ffc4c136c58c",
       "reason": "Distinguish the one omission reason that is not a gap in what the model was given: a path with no added or edited lines at all has nothing in it to read, so treating it like an unread file made ordinary deletes and renames look like transport failures."
+    },
+    {
+      "sha256": "207f656dd6d0a548f7cf3a15a83a7b36c345452c0a92dda960f9278c230771d7",
+      "reason": "Say the same thing about a binary. A non-text changed file is now reported under its own reason rather than as no-changed-spans, and without this the prompt's list of what has nothing to read no longer matched the reasons the block actually emits."
     }
   ]
 }
