@@ -717,6 +717,47 @@ function ConvertTo-AgentMarkerFieldValue {
     }
 }
 
+function ConvertTo-AgentCanonicalMarkerJson {
+    <#
+        Order-preserving canonical rendering of a parsed marker payload, used to
+        compare two occurrences of the same marker for MEANING rather than for
+        byte equality.
+
+        Copilot's stdout carries the same marker more than once in practice, and
+        the two renderings are not always byte-identical: a model that prints a
+        pretty, fenced copy in its closing summary and a compact copy on the
+        final line has emitted one result, not two. Byte comparison rejected
+        those cycles. Canonical comparison accepts them while still rejecting
+        two markers that actually SAY different things, which is the property
+        that matters against an injected marker.
+
+        Object keys are sorted so key order cannot smuggle a difference, and the
+        depth is bounded so a hostile deeply nested payload cannot recurse.
+    #>
+    param($Value, [int]$Depth = 0)
+    if ($Depth -gt 24) { throw "Marker payload exceeded the maximum canonical depth." }
+    if ($null -eq $Value) { return "null" }
+    if ($Value -is [bool]) { return $(if ($Value) { "true" } else { "false" }) }
+    if ($Value -is [string]) { return (ConvertTo-Json -InputObject $Value -Compress) }
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) {
+        return [Convert]::ToString($Value, [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $names = @($Value.PSObject.Properties.Name | Sort-Object -CaseSensitive)
+        $parts = @($names | ForEach-Object {
+                (ConvertTo-Json -InputObject $_ -Compress) + ":" +
+                (ConvertTo-AgentCanonicalMarkerJson -Value $Value.PSObject.Properties[$_].Value -Depth ($Depth + 1))
+            })
+        return "{" + ($parts -join ",") + "}"
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $parts = @()
+        foreach ($item in $Value) { $parts += (ConvertTo-AgentCanonicalMarkerJson -Value $item -Depth ($Depth + 1)) }
+        return "[" + ($parts -join ",") + "]"
+    }
+    throw "Marker payload contained an unsupported JSON type."
+}
+
 function ConvertFrom-AgentResultMarker {
     <#
         Parses a single strict `<PREFIX>: <json>` result line as HOSTILE input.
@@ -746,7 +787,7 @@ function ConvertFrom-AgentResultMarker {
         the schema bounds them, and the wrapper decides what to do with them.
     #>
     param(
-        [Parameter(Mandatory)][string]$StdOutText,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$StdOutText,
         [Parameter(Mandatory)][string]$MarkerPrefix,
         [Parameter(Mandatory)][hashtable]$Schema
     )
@@ -761,22 +802,31 @@ function ConvertFrom-AgentResultMarker {
         # cycles even though the work had completed correctly.
         #
         # Extract EVERY marker occurrence by brace-matching the JSON that
-        # follows it, then require every occurrence to be byte-identical. This
-        # preserves the anti-injection property of the stricter rule:
-        #   - two DIFFERENT markers (e.g. one echoed out of hostile PR content)
-        #     still fail closed rather than "last wins";
-        #   - a marker the model never produced cannot match the expected nonce,
-        #     which is generated per cycle AFTER the PR content was authored.
+        # follows it, then require every occurrence to MEAN the same thing.
+        # Comparison is canonical rather than byte-for-byte, because a model
+        # that prints a pretty, fenced copy in its closing summary and a
+        # compact copy on the final line has emitted one result, not two. The
+        # anti-injection property survives:
+        #   - two markers that genuinely differ still fail closed;
+        #   - a marker the model never produced cannot match the expected
+        #     nonce, which is generated per cycle AFTER the PR content was
+        #     authored.
         $candidates = New-Object System.Collections.Generic.List[string]
         $quoteChar = [char]'"'
         $escapeChar = [char]'\'
         $openBrace = [char]'{'
         $closeBrace = [char]'}'
-        $searchIndex = 0
-        while ($true) {
-            $hit = $StdOutText.IndexOf($MarkerPrefix, $searchIndex, [StringComparison]::Ordinal)
-            if ($hit -lt 0) { break }
-            $jsonStart = $StdOutText.IndexOf($openBrace, $hit + $MarkerPrefix.Length)
+        # Anchored to a line start. Matching the prefix ANYWHERE would let a
+        # finding that quotes attacker-planted source such as
+        # "// REVIEWER_RESULT_V1: {...}" manufacture a second, different
+        # candidate and fail the whole review closed - an author-controlled
+        # kill switch on being reviewed. Leading whitespace and trailing text
+        # on the same line stay tolerated, which is what the relaxation was
+        # for in the first place.
+        $anchorPattern = "(?m)^[ `t]*" + [regex]::Escape($MarkerPrefix)
+        foreach ($anchor in [regex]::Matches($StdOutText, $anchorPattern)) {
+            $hit = $anchor.Index
+            $jsonStart = $StdOutText.IndexOf($openBrace, $hit + $anchor.Length)
             if ($jsonStart -lt 0) { return $null }
             # Bounded brace-depth scan. String contents are respected so a brace
             # inside a JSON string value cannot terminate the object early.
@@ -807,15 +857,32 @@ function ConvertFrom-AgentResultMarker {
             }
             if ($jsonEnd -lt 0) { return $null }
             [void]$candidates.Add($StdOutText.Substring($jsonStart, $jsonEnd - $jsonStart + 1))
-            $searchIndex = $jsonEnd + 1
+            # A transcript carrying an implausible number of marker occurrences
+            # is an attack surface, not a formatting quirk: stop rather than
+            # canonicalize thousands of payloads.
+            if ($candidates.Count -gt 16) { return $null }
         }
         if ($candidates.Count -eq 0) { return $null }
-        $jsonText = $candidates[0]
+        # Every occurrence must parse, and every occurrence must MEAN the same
+        # thing. Whitespace and key order are allowed to differ - a fenced,
+        # pretty-printed restatement of the same result is the same result - but
+        # any semantic difference, including one extra key or one changed
+        # character of nonce, fails the whole marker closed. Parsing every
+        # occurrence rather than only the first is deliberate: an unparseable
+        # second occurrence is ambiguity, not noise.
+        $obj = $null
+        $canonical = $null
         foreach ($candidate in $candidates) {
-            if ($candidate -cne $jsonText) { return $null }
+            $parsed = $candidate | ConvertFrom-Json -ErrorAction Stop
+            if ($parsed -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+            $parsedCanonical = ConvertTo-AgentCanonicalMarkerJson -Value $parsed
+            if ($null -eq $canonical) {
+                $canonical = $parsedCanonical
+                $obj = $parsed
+                continue
+            }
+            if ($parsedCanonical -cne $canonical) { return $null }
         }
-
-        $obj = $jsonText | ConvertFrom-Json -ErrorAction Stop
         if ($obj -isnot [System.Management.Automation.PSCustomObject]) { return $null }
 
         $allowedKeys = @($Schema.Keys)
@@ -2791,6 +2858,7 @@ Export-ModuleMember -Function @(
     "Set-JsonState",
     "Write-AgentMetadata",
     "ConvertFrom-AgentResultMarker",
+    "ConvertTo-AgentCanonicalMarkerJson",
     "Find-CopilotSessionForBranch",
     "Set-TimedProcessArguments",
     "Stop-ProcessTree",

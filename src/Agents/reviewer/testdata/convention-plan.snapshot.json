@@ -37,6 +37,7 @@
           "project": "Example",
           "repositoryId": "11111111-2222-3333-4444-555555555555",
           "path": "/rules/selected.md",
+          "section": "",
           "ref": "refs/heads/main",
           "commitSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -45,15 +46,15 @@
         }
       ],
       "contentBytes": 7,
-      "provenanceBytes": 436,
+      "provenanceBytes": 449,
       "routingEvidenceBytes": 112,
-      "contextBytes": 443,
-      "maxBytes": 443,
+      "contextBytes": 456,
+      "maxBytes": 456,
       "status": "selected",
       "reason": ""
     }
   ],
   "withheldPacks": [],
-  "totalContextBytes": 443,
-  "maxTotalBytes": 443
+  "totalContextBytes": 456,
+  "maxTotalBytes": 456
 }

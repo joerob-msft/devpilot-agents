@@ -522,6 +522,7 @@ function ConvertTo-ReviewerConventionPackPolicy {
                     project = [string]$configuredSource.Project
                     repositoryId = [string]$configuredSource.RepositoryId
                     path = [string]$configuredSource.Path
+                    section = [string](Get-ReviewerConventionValue $configuredSource "Section" "")
                     ref = "refs/heads/$($configuredSource.Branch)"
                     commitSha = ("a" * 40); sha256 = ("a" * 64)
                     mimeType = $longestMimeType; byteLength = [int]$configuredSource.MaxBytes
@@ -535,6 +536,7 @@ function ConvertTo-ReviewerConventionPackPolicy {
                     project = [string]$RepositoryBinding.Project
                     repositoryId = [string]$RepositoryBinding.RepositoryId
                     path = [string]$local.Path
+                    section = ""
                     ref = [string]$RepositoryBinding.TargetRef
                     commitSha = ("a" * 40); sha256 = ("a" * 64)
                     mimeType = $longestMimeType; byteLength = [int]$local.MaxBytes
@@ -693,6 +695,11 @@ function New-ReviewerConventionContextPlan {
                     project       = [string](Get-ReviewerConventionValue $snapshot "Project")
                     repositoryId  = [string](Get-ReviewerConventionValue $snapshot "RepositoryId")
                     path          = [string](Get-ReviewerConventionValue $snapshot "Path")
+                    # Empty for a whole-file source. When set, the specialist's
+                    # independent re-read must cut the SAME heading before its
+                    # byte/hash comparison, or a section-scoped rule would look
+                    # tampered with on every cycle.
+                    section       = [string](Get-ReviewerConventionValue $snapshot "Section" "")
                     ref           = [string](Get-ReviewerConventionValue $snapshot "Ref")
                     commitSha     = [string](Get-ReviewerConventionValue $snapshot "CommitSha")
                     sha256        = [string](Get-ReviewerConventionValue $snapshot "Sha256")

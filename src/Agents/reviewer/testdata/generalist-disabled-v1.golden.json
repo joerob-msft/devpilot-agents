@@ -1,4 +1,5 @@
 {
+  "_note": "Pins the generalist review path against unauthorized drift from the specialist layer. baseCommit is the pre-specialist baseline; every later change to a listed function or to the generalist prompt must be recorded here with a reason, so a generalist behaviour change is always a deliberate, documented act.",
   "baseCommit": "84767a0cc6744413f32f4d2f1036e717ba9552f6",
   "functions": {
     "Get-ReviewerMarkerSchema": "988d854172a387260134758f650c047330ba2560bf7bb90d7e14769334d4d1bb",
@@ -12,14 +13,56 @@
     "Invoke-ReviewerDelivery": "05a9813a6ed6c6e7e8992c3bb4587629da520ec1dc1ec81235d80f84623247eb"
   },
   "authorizedFunctionDeltas": {
-    "Write-ReviewerPreview": {
-      "sha256": "7a74199c73cca5c14bd20381dbf455bf68cbc70e450a3459febb8aa6634e368e",
-      "reason": "Seal the configured pass count so an incomplete multi-pass run cannot be promoted as single-pass."
-    },
-    "Invoke-ReviewerDelivery": {
-      "sha256": "05a9813a6ed6c6e7e8992c3bb4587629da520ec1dc1ec81235d80f84623247eb",
-      "reason": "Require code-defined typed delivery authorization before every raw wrapper write."
-    }
+    "Write-ReviewerPreview": [
+      {
+        "sha256": "7a74199c73cca5c14bd20381dbf455bf68cbc70e450a3459febb8aa6634e368e",
+        "reason": "Seal the configured pass count so an incomplete multi-pass run cannot be promoted as single-pass."
+      },
+      {
+        "sha256": "3ef22ae6e4084f842ca4c18ce544ab28ee0bbe4bb7ef974657099786cef668f2",
+        "reason": "State pinned source coverage in the preview a human reads, and name the changed files whose source never reached the model, so 'no findings' can never be read as 'every file was reviewed'."
+      },
+      {
+        "sha256": "eb37df741fdd4bfaebbcb3637d15a1976ec722f267c79bfb8bcc9bbb7c6a4a7d",
+        "reason": "Also state what documented convention authority the run consulted. A repository whose config declares no convention packs or authoritative sources cannot raise a convention finding at all, and that gap is invisible unless the artifact names it."
+      },
+      {
+        "sha256": "04d00e8e42cd0b0fc8f569f0bb51bfd8e8f74c465e2f67995be3961cdcebb69c",
+        "reason": "Name partially delivered files too, with their delivered/requested region counts. A file the model saw one region of is not a file it read, and listing only fully omitted files hid that distinction from the human reading the preview."
+      }
+    ],
+    "Invoke-ReviewerDelivery": [
+      {
+        "sha256": "05a9813a6ed6c6e7e8992c3bb4587629da520ec1dc1ec81235d80f84623247eb",
+        "reason": "Require code-defined typed delivery authorization before every raw wrapper write."
+      }
+    ],
+    "Get-ReviewerRuntimeContext": [
+      {
+        "sha256": "17f84ed0c785fd5408b87c84f153ca24ce8129b1dfed0fe82cda7cb0cb5cdb8c",
+        "reason": "Carry the sealed pinned changed-file source block. The host's file-read tool answers with a binary resource payload the model never receives, so without this the generalist reviews files it has not read."
+      }
+    ],
+    "Invoke-ReviewerModelPass": [
+      {
+        "sha256": "64690e2d892cd5a188e6a6dc070497d85e9d675af64d1dd994a39983a566ea5d",
+        "reason": "Pass the bound PR's sealed pinned-source block into the runtime context it builds; no other generalist behaviour changes."
+      },
+      {
+        "sha256": "11bba16aa7f88b61ab0ec284b88528ecd4244b6542e6b73449cebadce329291a",
+        "reason": "Report a marker rejected for wrong PR/repository/commit binding under its own reason, so the pass-level retry can distinguish a formatting slip from a marker bound to the wrong work and never retry the latter."
+      }
+    ]
   },
-  "promptSha256": "f9357af7ea2dc1f3f5929b2541bd9875c3e63fd8bee50894a88a4688fc05ebd1"
+  "promptSha256": "f9357af7ea2dc1f3f5929b2541bd9875c3e63fd8bee50894a88a4688fc05ebd1",
+  "authorizedPromptDeltas": [
+    {
+      "sha256": "c128c417bd3730c9430d5cbf38f934a50664add961fade7c466b08ba7f81d643",
+      "reason": "Stop directing the model at the repository file-read tool, which silently returns nothing on this host; point it at the sealed pinned-source block and its binding content accounting instead. Also forbid treating a documented invariant as proof the invariant is enforced."
+    },
+    {
+      "sha256": "f09cb3ac58e021e47a48a95c69f239d85c20fe11d0f0ed678701912ca061786e",
+      "reason": "Require the marker to be one compact line and tell the model to re-check its brackets. A live run lost a complete, correct review to a single stray bracket in several kilobytes of hand-written single-line JSON."
+    }
+  ]
 }

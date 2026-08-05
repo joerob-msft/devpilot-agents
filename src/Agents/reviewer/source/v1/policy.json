@@ -1,0 +1,21 @@
+{
+  "_note": "Versioned bounds for the sealed changed-file source transport. The wrapper reads the pinned bytes itself and hands the model exact, hashed line slices; these caps decide how much of that can travel and where the fail-closed coverage floor sits. Consumer config may narrow these, never widen them.",
+  "schemaVersion": 1,
+  "transportVersion": 1,
+  "contextRadiusLines": 30,
+  "maxFiles": 60,
+  "maxFetchBytesPerFile": 1048576,
+  "maxSliceBytesPerFile": 32768,
+  "maxTotalSliceBytes": 131072,
+  "maxSlicesPerFile": 24,
+  "minDeliveredFiles": 1,
+  "minDeliveredFilePercent": 60,
+  "minDeliveredSpanPercent": 60,
+  "allowedMimeTypes": [
+    "text/plain",
+    "text/markdown",
+    "text/xml",
+    "application/xml",
+    "application/json"
+  ]
+}

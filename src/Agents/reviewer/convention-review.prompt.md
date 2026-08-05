@@ -27,7 +27,16 @@ not a candidate. Do not invent a resolution.
 
 1. Re-read the exact PR and verify its repository, PR ID, active/non-draft
    state, and full source commit. Stop without a marker on mismatch.
-2. Inspect the complete bounded change with read-only PR/file tools.
+2. Inspect the complete bounded change with the read-only PR change-set tool.
+   **Do not attempt to read files with the repository file tool**: on this host
+   it returns a binary payload that never reaches you, so it yields an empty
+   result you cannot distinguish from an empty file. The wrapper supplies a
+   **pinned changed-file source block** instead - commit-pinned, whole-line,
+   hash-bound slices around every changed span. That block is your source text.
+   Its content accounting table is binding: a path marked `omitted` is one you
+   have not read, so you may not emit a candidate on it and may not treat it as
+   checked; a path marked `partial` must be described as partially read. If any
+   path is not fully covered, emit a `residualRisks` entry naming it.
 3. Use only selected, wrapper-verified convention sources. Every rule quote must
    be an exact bounded substring of at least 8 printable characters from the
    named source at its recorded commit and hash.
@@ -54,12 +63,21 @@ not a candidate. Do not invent a resolution.
    only for deterministic metadata/template facts, with empty file path and line
    zero.
 8. Never emit `critical`, a vote, a vote recommendation, or generalist findings.
+9. A comment that states an invariant is evidence of intent, never evidence of
+   enforcement. Do not author a candidate that contradicts a remark, summary, or
+   naming convention in the same file unless you cite the code that fails to
+   enforce it. If the enforcing code is not in what the wrapper gave you, the
+   question is unresolved: emit a `residualRisks` entry, not a candidate.
 
 ## Result marker
 
-Emit exactly one final `CONVENTION_REVIEW_RESULT_V1:` marker. Copy every binding,
-hash, and nonce from wrapper runtime data exactly. Use only the exact keys and
-types below. All authored strings must be printable ASCII with no controls or
+Emit exactly one final `CONVENTION_REVIEW_RESULT_V1:` marker. It must be a
+**single line**: the literal prefix, one space, then the whole JSON object
+compacted onto that one line. Do not pretty-print it, do not wrap it in a code
+fence, and do not restate it in different formatting - if you emit it more than
+once, every copy must say exactly the same thing. Copy every binding, hash, and
+nonce from wrapper runtime data exactly. Use only the exact keys and types
+below. All authored strings must be printable ASCII with no controls or
 newlines. Candidate IDs must be unique lowercase slugs.
 
 Each candidate has exactly:

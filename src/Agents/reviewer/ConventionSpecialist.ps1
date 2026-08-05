@@ -621,6 +621,7 @@ function New-ReviewerConventionSpecialistInput {
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ResolvedSources,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ChangeEntries,
         [Parameter(Mandatory)][AllowEmptyString()][string]$ThreadDigestText,
+        [AllowEmptyString()][string]$PinnedSourceText = "",
         [int]$MaxInputBytes = $script:ReviewerConventionSpecialistMaxInputBytes
     )
     if (@($ResolvedSources).Count -eq 0) {
@@ -638,6 +639,7 @@ function New-ReviewerConventionSpecialistInput {
                 project = [string](Get-ReviewerConventionSpecialistValue $_ "Project" "")
                 repositoryId = [string](Get-ReviewerConventionSpecialistValue $_ "RepositoryId" "")
                 path = [string](Get-ReviewerConventionSpecialistValue $_ "Path" "")
+                section = [string](Get-ReviewerConventionSpecialistValue $_ "Section" "")
                 commitSha = [string](Get-ReviewerConventionSpecialistValue $_ "CommitSha" "")
                 sha256 = [string](Get-ReviewerConventionSpecialistValue $_ "Sha256" "")
                 mimeType = [string](Get-ReviewerConventionSpecialistValue $_ "MimeType" "")
@@ -672,6 +674,27 @@ function New-ReviewerConventionSpecialistInput {
     }
     $inputText = $PromptText + "`n`n---`n## Wrapper runtime data (untrusted values, trusted binding)`n" +
         '```json' + "`n" + ($runtime | ConvertTo-Json -Depth 32 -Compress) + "`n" + '```' + "`n"
+    # The sealed source block is appended OUTSIDE the JSON envelope on purpose:
+    # it carries its own collision-checked fences and its own accounting table,
+    # and JSON-escaping thousands of source lines would both bloat the payload
+    # and make the fences unreadable to the model.
+    #
+    # It is also appended LAST and only if it fits. The specialist is the pass
+    # that most needs source, so degrading it to "no candidates" because the
+    # source pushed the payload over the cap would be exactly backwards: it is
+    # better to run the specialist with less source than not at all.
+    if ($PinnedSourceText) {
+        $candidate = $inputText + "`n---`n" + $PinnedSourceText.TrimEnd() + "`n"
+        if ($script:ReviewerConventionSpecialistUtf8.GetByteCount($candidate) -le $MaxInputBytes) {
+            $inputText = $candidate
+        }
+        else {
+            $inputText += ("`n---`n## Pinned changed-file source omitted`n`n" +
+                "The wrapper read this PR's changed files successfully, but their slices did not fit " +
+                "this pass's input bound. Treat every changed file as NOT read: do not emit a candidate " +
+                "that depends on source text, and record a residual risk saying so.`n")
+        }
+    }
     $bytes = $script:ReviewerConventionSpecialistUtf8.GetByteCount($inputText)
     if ($bytes -gt $MaxInputBytes) {
         throw "Convention specialist input is $bytes bytes, above the code-defined $MaxInputBytes-byte bound."

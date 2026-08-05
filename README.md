@@ -413,6 +413,38 @@ the pinned change-set digest, and exact byte counts. See
 [docs/convention-packs.md](docs/convention-packs.md) and the
 preview-only `samples/azureux-bpm-convention-packs.preview.json` replay profile.
 
+An authoritative source may name a `section` - the exact ATX heading of the
+governing rule - so that a large engineering-guidance document routes by rule
+rather than as a whole file. Without it a 60 KB rule document either exceeds its
+per-source cap, which fails the pack and means the rule silently never reaches
+the reviewer, or consumes an entire pack budget on its own.
+
+#### Sealed source transport (layer 8)
+
+**The model is given no working file-read tool. It is given the file's bytes.**
+
+On a real Azure DevOps MCP host, `get_content` answers with an embedded resource
+whose payload is a base64 `blob`. The wrapper decodes that correctly; a model
+transcript does not carry binary resource payloads, so the model receives an
+empty result - no text, no error, no way to distinguish "empty file" from "read
+failed". The remaining channel, the change-set tool with line content, is a
+single 1.6 MB tool result for a ten-file PR. The visible effect was a confident
+review of files nobody had read.
+
+So the wrapper reads them. It derives each changed file's right-hand line spans
+from the diff, reads the bytes itself at the exact source commit, cuts whole-line
+slices with a context radius, hashes each slice, and injects a sealed, bounded
+block. Nothing about the model's tool grant changes; it gains content, not
+capability.
+
+The block opens with a **content accounting table** naming every changed path and
+whether its source arrived (`delivered`, `partial`, `omitted`, with a closed
+reason set). Both prompts bind the model to it: an `omitted` path may not be
+reported on, cleared, or counted as reviewed. Below a configured coverage floor
+the PR is **not reviewed at all** - no preview, no comments, no vote - and the
+preview a human reads states the coverage and names the files whose source never
+arrived. See [docs/source-transport.md](docs/source-transport.md).
+
 Posted findings appear under **your** identity, since that is who the session is
 authenticated as. That is why every write is opt-in.
 

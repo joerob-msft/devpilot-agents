@@ -61,13 +61,35 @@ here.
 ## Step 2 — Read the change
 
 Use `ado(repo_pull_request)` with `action: get_changes` (with diffs and line
-content) to read the actual file changes for the bound PR. Use `ado(repo_file)`
-to read surrounding context when a hunk alone is not enough to judge
-correctness — most incorrect review comments come from reviewing a hunk without
-its context.
+content) to read the actual file changes for the bound PR.
 
-Read the **whole** change before writing any finding. Understand what the PR is
-trying to do; a finding that misunderstands the intent is worse than silence.
+**Do not try to read files with `ado(repo_file)`.** On this host that tool
+answers with a binary resource payload that never reaches you: you get an empty
+result, no error, and no way to tell "the file is empty" from "the read
+silently failed". A review built on that is a review of nothing.
+
+Surrounding context is supplied to you instead. Runtime context carries a
+**pinned changed-file source block**: the wrapper read the bytes itself at the
+exact bound commit, cut whole-line slices around every changed span, and hashed
+each one. Treat that block as the authoritative source text for this PR.
+
+It opens with a **content accounting table** listing every changed path and
+whether its source actually arrived. That table binds you:
+
+- a path shown as `delivered` — you have its changed regions and their context;
+- a path shown as `partial` — you have some regions and not others; say so
+  rather than implying you read the file;
+- a path shown as `omitted` — **you have not read that file at all.** Do not
+  report a finding on it, do not clear it, and do not let it count toward "I
+  reviewed the change". Name it in your summary as unread.
+
+If the accounting table shows files you could not see, your summary must say how
+many and which. An unqualified "no issues found" over an incomplete change set
+is a false statement, not a clean review.
+
+Read the **whole** delivered change before writing any finding. Understand what
+the PR is trying to do; a finding that misunderstands the intent is worse than
+silence.
 
 ## Step 3 — Read what has already been said
 
@@ -103,6 +125,14 @@ Rules that matter more than volume:
   and formatters own those.
 - **Do not report on lines the PR did not touch**, unless the change makes
   existing code incorrect.
+- **A comment that documents an invariant is not proof the invariant holds.**
+  If a remark, summary or naming convention states that a field is server-set,
+  validated, or otherwise constrained, that tells you what the author intended.
+  It does not tell you whether the code enforces it. Either cite the code that
+  enforces it, or cite the code that fails to — and if neither is in what you
+  were given, say the question is unresolved instead of asserting either side.
+  Writing a finding that contradicts a nearby authoritative comment without
+  citing enforcing code is the single most expensive mistake this agent makes.
 - **Say what is wrong, why it is wrong, and what to do instead**, in at most a
   few sentences. Reference the concrete symbol or value, not a generality.
 - If the change is correct and you have nothing worth saying, **report zero
@@ -154,6 +184,14 @@ Requirements:
   assessment. It is posted verbatim when summary posting is enabled.
 - Emit exactly **one** marker-prefixed line, and make it the final non-blank
   line. Do not add extra fields.
+- The marker must be **one line**: the literal prefix, one space, then the whole
+  JSON object compacted onto that line. Do not pretty-print it and do not wrap
+  it in a code fence.
+- **Re-read the JSON before you emit it.** It is several kilobytes of
+  hand-written JSON on a single line, and one stray bracket or missing comma
+  discards the entire review — the wrapper cannot repair it and will not guess.
+  Check that every `{` and `[` is closed, that `findings` closes with `}]`
+  before `"recommendedVote"`, and that the object ends with exactly one `}`.
 
 Before the marker, print a short plain-text summary: the bound PR and source
 commit, how many findings you are reporting at each severity, what you

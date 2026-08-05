@@ -157,6 +157,15 @@ jobs:
         shell: pwsh
         run: ./tools/Test-ConventionPacks.ps1
 
+      # Layer 8: the sealed changed-file source transport. The model has no
+      # working file-read tool on this host, so the wrapper reads the pinned
+      # bytes itself; these checks pin the slicing, the hash binding, the
+      # closed omission-reason set, and the fail-closed coverage floor that
+      # stops a review being reported from files nobody read.
+      - name: sealed source-transport slicing, accounting, and coverage floor
+        shell: pwsh
+        run: ./tools/Test-SourceTransport.ps1
+
       - name: deterministic review-fact schema and replay checks
         shell: pwsh
         run: ./tools/Test-ReviewFacts.ps1
