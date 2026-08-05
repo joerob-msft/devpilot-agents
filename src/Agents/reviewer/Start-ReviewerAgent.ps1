@@ -5889,21 +5889,21 @@ function Invoke-DryRunSelfChecks {
 
         # Scenario E: current authority, unexpired, matching bindings - the
         # replay must proceed PAST the new gates to an actual revalidation
-        # attempt (which then degrades gracefully against a nonexistent
-        # agency - Invoke-ReviewerGateRevalidation throws, caught by this
-        # function's own outer degrade-safe catch, leaving the record
-        # UNCHANGED from its seed rather than closed by any new-gate reason;
-        # the outer catch's own warning text is therefore the signal that
-        # execution reached that far, past authority/expiry/binding).
+        # attempt. The nonexistent agency produces a tagged environment fault,
+        # which remains pending under a hard retry ceiling rather than being
+        # abandoned or retried forever.
         $gateDeliveryState34e = @{ "105" = (New-SelfCheck34Record -ArtifactPath $validDecisionPath) }
         Set-JsonState -Path $gateDeliveryStatePath -State $gateDeliveryState34e
         $sc34eWarnings = $null
         Invoke-ReviewerGateReplay -AgencyPath "fake-agency-does-not-exist" -PrId 105 -SourceCommit ("1" * 40) -WarningVariable sc34eWarnings -WarningAction SilentlyContinue
         $reachedPastNewGates = (@(@($sc34eWarnings) | Where-Object { $_ -match 'degraded for PR 105' })).Count -gt 0
-        if (-not $reachedPastNewGates) {
-            $failures.Add("A CURRENTLY-authorized, unexpired, correctly-bound replay did not appear to proceed past the new gates to an actual revalidation attempt (no 'degraded for PR 105' warning observed).")
+        $afterEnvironmentFault = (Get-JsonState -Path $gateDeliveryStatePath)["105"]
+        if (-not $reachedPastNewGates -or -not [bool]$afterEnvironmentFault.pendingReplay -or
+            [int]$afterEnvironmentFault.replayEnvironmentFaultCount -ne 1 -or
+            [string]$afterEnvironmentFault.reason -cne "gateReplayEnvironmentFault") {
+            $failures.Add("A CURRENTLY-authorized replay did not preserve a tagged environment fault as bounded pending replay (warning=$reachedPastNewGates, pending=$($afterEnvironmentFault.pendingReplay), count=$($afterEnvironmentFault.replayEnvironmentFaultCount), reason=$($afterEnvironmentFault.reason)).")
         }
-        else { Write-Host "  OK - a currently-authorized, unexpired, correctly-bound replay is not blocked by the new gates" -ForegroundColor Green }
+        else { Write-Host "  OK - a currently-authorized replay reaches revalidation and preserves an environment fault as bounded pending replay" -ForegroundColor Green }
     }
     finally {
         $EnableVerifiedCommentGate = $priorCommentSwitch34
@@ -6960,6 +6960,22 @@ function Invoke-DryRunSelfChecks {
         }
         else {
             Write-Host "  OK - exactly two complete parsed markerJson values must independently recommend approve" -ForegroundColor Green
+        }
+
+        $sc45EnvironmentException = New-ReviewerConventionEnvironmentException -Operation "self-check replay" `
+            -InnerException ([TimeoutException]::new("synthetic timeout"))
+        $sc45FirstEnvironmentFault = Get-ReviewerGateReplayFaultDisposition -Exception $sc45EnvironmentException -CurrentEnvironmentFaultCount 0
+        $sc45ExhaustedEnvironmentFault = Get-ReviewerGateReplayFaultDisposition -Exception $sc45EnvironmentException `
+            -CurrentEnvironmentFaultCount $script:ReviewerGateMaxSupersededRefreshes
+        $sc45TerminalFault = Get-ReviewerGateReplayFaultDisposition -Exception ([InvalidOperationException]::new("synthetic deterministic fault")) `
+            -CurrentEnvironmentFaultCount 0
+        if (-not [bool]$sc45FirstEnvironmentFault.Retryable -or [int]$sc45FirstEnvironmentFault.NextEnvironmentFaultCount -ne 1 -or
+            [bool]$sc45ExhaustedEnvironmentFault.Retryable -or [string]$sc45ExhaustedEnvironmentFault.Reason -cne "gateReplayEnvironmentFaultBudgetExhausted" -or
+            [bool]$sc45TerminalFault.Retryable -or [string]$sc45TerminalFault.Reason -cne "gateProcessingFaulted") {
+            $failures.Add("Replay fault classification did not keep tagged environment faults pending only within the hard retry budget while closing deterministic faults terminally.")
+        }
+        else {
+            Write-Host "  OK - replay environment faults retry only within the hard code-defined budget; deterministic faults close terminally" -ForegroundColor Green
         }
     }
     finally {
@@ -9714,6 +9730,36 @@ function Invoke-ReviewerGateForPullRequest {
     }
 }
 
+function Get-ReviewerGateReplayFaultDisposition {
+    <# Environment failures retain the existing sealed replay record, but only
+       under the same hard, code-defined ceiling used for superseded refreshes.
+       Deterministic faults close immediately. Policy cannot widen either path. #>
+    param(
+        [Parameter(Mandatory)][Exception]$Exception,
+        [ValidateRange(0, [int]::MaxValue)][int]$CurrentEnvironmentFaultCount = 0
+    )
+    if (Test-ReviewerConventionEnvironmentException -Exception $Exception) {
+        $budget = Test-ReviewerGateSupersededBudget -CurrentSupersededCount $CurrentEnvironmentFaultCount
+        if ($budget.WithinBudget) {
+            return @{
+                Retryable = $true
+                NextEnvironmentFaultCount = [int]$budget.NextSupersededCount
+                Reason = "gateReplayEnvironmentFault"
+            }
+        }
+        return @{
+            Retryable = $false
+            NextEnvironmentFaultCount = $CurrentEnvironmentFaultCount
+            Reason = "gateReplayEnvironmentFaultBudgetExhausted"
+        }
+    }
+    return @{
+        Retryable = $false
+        NextEnvironmentFaultCount = $CurrentEnvironmentFaultCount
+        Reason = "gateProcessingFaulted"
+    }
+}
+
 function Invoke-ReviewerGateReplay {
     <#
         Retries an INCOMPLETE gate delivery from its own sealed decision -
@@ -9949,6 +9995,7 @@ function Invoke-ReviewerGateReplay {
         $record.commentsComplete = [bool]$deliveryOutcome.CommentsComplete
         $record.voteCast = ([bool]$deliveryOutcome.VoteCast -or [bool](Get-ReviewerHashValue -Container $record -Key 'voteCast' -Default $false))
         $record.reason = [string]$deliveryOutcome.Reason
+        $record.replayEnvironmentFaultCount = 0
         # Finding 2: pending on incomplete comments (existing), OR on a
         # TRANSIENT approval-authorization failure even though comments are
         # otherwise complete.
@@ -9973,9 +10020,13 @@ function Invoke-ReviewerGateReplay {
                 $faultRecord = $normalizedFaultRecord
             }
             if ($faultRecord) {
-                $faultRecord.reason = "gateProcessingFaulted"
-                $faultRecord.pendingReplay = $false
+                $currentEnvironmentFaultCount = [int](Get-ReviewerHashValue -Container $faultRecord -Key 'replayEnvironmentFaultCount' -Default 0)
+                $disposition = Get-ReviewerGateReplayFaultDisposition -Exception $_.Exception `
+                    -CurrentEnvironmentFaultCount $currentEnvironmentFaultCount
+                $faultRecord.reason = [string]$disposition.Reason
+                $faultRecord.pendingReplay = [bool]$disposition.Retryable
                 $faultRecord.superseded = $false
+                $faultRecord.replayEnvironmentFaultCount = [int]$disposition.NextEnvironmentFaultCount
                 $faultRecord.at = [DateTime]::UtcNow.ToString("o")
                 $faultState[[string]$PrId] = $faultRecord
                 Set-JsonState -Path $gateDeliveryStatePath -State $faultState
