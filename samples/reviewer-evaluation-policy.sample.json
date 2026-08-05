@@ -1,5 +1,5 @@
 {
-  "_note": "Sample OPERATOR-SIDE evaluation policy override for tools/Invoke-ReviewerEvaluation.ps1 -PolicyFile. It is STRICTER than the shipped default on every axis it touches, which is the only direction that has any effect: ConvertTo-ReviewerEvalEffectivePolicy clamps every cap DOWN to its code ceiling and every floor UP to its code floor, so a permissive value here is silently ignored. Note what is absent: partitionSalt, adjudicationSalt and holdoutPercent belong to the sealed corpus freeze and the harness throws if a policy file even mentions them. This file cannot enable a delivery gate, sign anything, or make suggestions unattended.",
+  "_note": "Sample OPERATOR-SIDE evaluation policy override for tools/Invoke-ReviewerEvaluation.ps1 -PolicyFile. Every floor and cap here is stricter than or equal to the shipped default, which is the only direction that has any effect: ConvertTo-ReviewerEvalEffectivePolicy clamps every cap DOWN to its code ceiling and every floor UP to its code floor, so a permissive value is silently ignored. One value is NOT clamped and is genuinely operator-chosen: the length of qualifiableScopes is the Bonferroni k, so a shorter list is a WEAKER multiplicity correction as well as narrower per-scope evidence. Declare every scope you intend to qualify, before looking at any numbers - this sample declares both important and critical, matching the shipped default. Note what is absent: partitionSalt, adjudicationSalt and holdoutPercent belong to the sealed corpus freeze and the harness throws if a policy file even mentions them. This file cannot enable a delivery gate, sign anything, or make suggestions unattended.",
   "schemaVersion": 1,
   "policyVersion": 2,
   "minExamples": 400,
@@ -20,6 +20,7 @@
   "maxExactTrials": 5000,
   "suggestionQualificationEnabled": false,
   "qualifiableScopes": [
-    { "pack": "(generalist)", "severity": "important" }
+    { "pack": "(generalist)", "severity": "important" },
+    { "pack": "(generalist)", "severity": "critical" }
   ]
 }

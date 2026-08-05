@@ -249,6 +249,7 @@ $corpus = [pscustomobject][ordered]@{
 }
 $corpus.freeze.corpusSha256 = Get-ReviewerEvalCorpusSha256 -Name ([string]$corpus.name) `
     -CorpusVersion ([int]$corpus.corpusVersion) -CorpusPin $corpus.corpusPin `
+    -FrozenAtEpochSeconds ([int64]$corpus.frozenAtEpochSeconds) `
     -PartitionPolicy $partitionPolicy -Strata @($corpus.strata) -Corrections @($corpus.corrections) `
     -RecordHashes $recordHashes.ToArray()
 

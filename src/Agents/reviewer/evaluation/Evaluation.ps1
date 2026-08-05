@@ -533,7 +533,7 @@ function Test-ReviewerEvalPromotable {
 # and P(X <= x | n, p) = P(Y >= n-x | n, 1-p), so one tail routine serves both.
 #
 # Reported bounds (the numbers an operator transcribes) are searched on a fixed
-# 1e-6 decimal grid and are therefore integers over a constant denominator.
+# 1e-4 decimal grid and are therefore integers over a constant denominator.
 # The search is deliberately one-sided-conservative: a reported lower bound is
 # the largest grid point that still satisfies the exact test (<= the true
 # bound), and a reported upper bound is the smallest grid point that fails it
@@ -911,19 +911,21 @@ function Get-ReviewerEvalCorpusSha256 {
         [Parameter(Mandatory)][AllowEmptyString()][string]$Name,
         [Parameter(Mandatory)][int]$CorpusVersion,
         [Parameter(Mandatory)]$CorpusPin,
+        [Parameter(Mandatory)][int64]$FrozenAtEpochSeconds,
         [Parameter(Mandatory)]$PartitionPolicy,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Strata,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Corrections,
         [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$RecordHashes
     )
     $value = [pscustomobject][ordered]@{
-        name            = $Name
-        corpusVersion   = $CorpusVersion
-        corpusPin       = $CorpusPin
-        partitionPolicy = $PartitionPolicy
-        strata          = @($Strata)
-        corrections     = @($Corrections)
-        recordHashes    = @(Get-ReviewerEvalOrdinalSorted -Values $RecordHashes)
+        name                 = $Name
+        corpusVersion        = $CorpusVersion
+        corpusPin            = $CorpusPin
+        frozenAtEpochSeconds = $FrozenAtEpochSeconds
+        partitionPolicy      = $PartitionPolicy
+        strata               = @($Strata)
+        corrections          = @($Corrections)
+        recordHashes         = @(Get-ReviewerEvalOrdinalSorted -Values $RecordHashes)
     }
     return Get-ReviewerEvalDomainSha256 -Domain "corpus" -Value $value
 }
@@ -1258,6 +1260,31 @@ function Test-ReviewerEvalCorpusIntegrity {
         if ($partition -ceq "holdout") { $stratumTotals[$stratum].Holdout++ } else { $stratumTotals[$stratum].Calibration++ }
     }
 
+    # An empty corpus is not a trivially valid one: with no examples there is
+    # nothing to derive a partition assignment from, so the freeze block would
+    # otherwise go entirely unverified.
+    if ($examples.Count -eq 0) { [void]$reasons.Add("corpusSchemaInvalid") }
+    $freeze = Get-ReviewerVerificationValue $Corpus "freeze"
+    if (-not (Test-ReviewerEvalExactKeys -Object $freeze -Allowed $script:ReviewerEvalFreezeKeys)) {
+        [void]$reasons.Add("corpusSchemaInvalid")
+    }
+    else {
+        $derivedCorpusSha = Get-ReviewerEvalCorpusSha256 `
+            -Name ([string](Get-ReviewerVerificationValue $Corpus "name" "")) `
+            -CorpusVersion ([int](Get-ReviewerVerificationValue $Corpus "corpusVersion" 0)) `
+            -CorpusPin (Get-ReviewerVerificationValue $Corpus "corpusPin") `
+            -FrozenAtEpochSeconds ([int64](Get-ReviewerVerificationValue $Corpus "frozenAtEpochSeconds" 0)) `
+            -PartitionPolicy $partitionPolicy `
+            -Strata @(Get-ReviewerVerificationValue $Corpus "strata" @()) `
+            -Corrections @(Get-ReviewerVerificationValue $Corpus "corrections" @()) `
+            -RecordHashes $recordHashes.ToArray()
+        if ([string](Get-ReviewerVerificationValue $freeze "corpusSha256" "") -cne $derivedCorpusSha) {
+            [void]$reasons.Add("corpusFreezeHashMismatch")
+        }
+        if ([int](Get-ReviewerVerificationValue $freeze "exampleCount" -1) -ne $examples.Count) {
+            [void]$reasons.Add("corpusFreezeHashMismatch")
+        }
+    }
     if ($examples.Count -gt 0 -and $partitionSalt -and $holdoutPercent -ge 1 -and $holdoutPercent -le 99) {
         $derivedAssignment = Get-ReviewerEvalPartitionAssignment -Examples $examples `
             -PartitionSalt $partitionSalt -HoldoutPercent $holdoutPercent
@@ -1268,28 +1295,8 @@ function Test-ReviewerEvalCorpusIntegrity {
                 [void]$reasons.Add("corpusPartitionMismatch")
             }
         }
-        $freeze = Get-ReviewerVerificationValue $Corpus "freeze"
-        if (-not (Test-ReviewerEvalExactKeys -Object $freeze -Allowed $script:ReviewerEvalFreezeKeys)) {
-            [void]$reasons.Add("corpusSchemaInvalid")
-        }
-        else {
-            if ([string](Get-ReviewerVerificationValue $freeze "partitionAssignmentSha256" "") -cne $derivedAssignment.AssignmentSha256) {
-                [void]$reasons.Add("corpusFreezeHashMismatch")
-            }
-            $derivedCorpusSha = Get-ReviewerEvalCorpusSha256 `
-                -Name ([string](Get-ReviewerVerificationValue $Corpus "name" "")) `
-                -CorpusVersion ([int](Get-ReviewerVerificationValue $Corpus "corpusVersion" 0)) `
-                -CorpusPin (Get-ReviewerVerificationValue $Corpus "corpusPin") `
-                -PartitionPolicy $partitionPolicy `
-                -Strata @(Get-ReviewerVerificationValue $Corpus "strata" @()) `
-                -Corrections @(Get-ReviewerVerificationValue $Corpus "corrections" @()) `
-                -RecordHashes $recordHashes.ToArray()
-            if ([string](Get-ReviewerVerificationValue $freeze "corpusSha256" "") -cne $derivedCorpusSha) {
-                [void]$reasons.Add("corpusFreezeHashMismatch")
-            }
-            if ([int](Get-ReviewerVerificationValue $freeze "exampleCount" -1) -ne $examples.Count) {
-                [void]$reasons.Add("corpusFreezeHashMismatch")
-            }
+        if ([string](Get-ReviewerVerificationValue $freeze "partitionAssignmentSha256" "") -cne $derivedAssignment.AssignmentSha256) {
+            [void]$reasons.Add("corpusFreezeHashMismatch")
         }
     }
 
@@ -1551,6 +1558,32 @@ function Test-ReviewerEvalRunSetConsistent {
         $observations = Get-ReviewerVerificationValue $run "observations"
         if (-not (Test-ReviewerEvalExactKeys -Object $observations -Allowed $script:ReviewerEvalRunObservationKeys)) {
             [void]$reasons.Add("runObservationsMissing")
+        }
+        else {
+            # Observations are operator-asserted wall-clock facts, not something
+            # this layer can recompute. What it CAN check is that the pricing
+            # table actually covers every model the arm declares, so a cost
+            # figure is at least attributable.
+            $ratedModels = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            foreach ($rate in @(Get-ReviewerVerificationValue $observations "rates" @())) {
+                if (-not (Test-ReviewerEvalExactKeys -Object $rate -Allowed $script:ReviewerEvalRunRateKeys)) {
+                    [void]$reasons.Add("runObservationsMissing")
+                    continue
+                }
+                [void]$ratedModels.Add([string](Get-ReviewerVerificationValue $rate "model" ""))
+            }
+            foreach ($entry in @(Get-ReviewerVerificationValue $observations "perExample" @())) {
+                if (-not (Test-ReviewerEvalExactKeys -Object $entry -Allowed $script:ReviewerEvalRunPerExampleKeys)) {
+                    [void]$reasons.Add("runObservationsMissing")
+                }
+            }
+            $models = Get-ReviewerVerificationValue $derivation "models"
+            $declaredModels = @(@(Get-ReviewerVerificationValue $models "generalists" @()) | ForEach-Object { [string]$_ }) +
+            @([string](Get-ReviewerVerificationValue $models "conventionSpecialist" ""),
+                [string](Get-ReviewerVerificationValue $models "conventionVerifier" ""))
+            foreach ($identity in $declaredModels) {
+                if ($identity -and -not $ratedModels.Contains($identity)) { [void]$reasons.Add("runObservationsMissing") }
+            }
         }
 
         $seenExamples = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)

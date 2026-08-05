@@ -525,6 +525,12 @@ try {
     $forgedKey = Test-ReviewerEvalRunSetConsistent -Runs $forgedKeyRuns -Corpus $corpus
     Assert-Eval ((-not $forgedKey.Ok) -and ($forgedKey.ReasonCodes -ccontains "runBlindClaimKeyMismatch")) `
         "A claim whose blind key does not match its own content was accepted."
+    $unratedRuns = @($runs | ForEach-Object { Copy-EvalObject -Value $_ })
+    $unratedRuns[2].observations.rates = @(@($unratedRuns[2].observations.rates)[0])
+    $unrated = Test-ReviewerEvalRunSetConsistent -Runs $unratedRuns -Corpus $corpus
+    Assert-Eval ((-not $unrated.Ok) -and ($unrated.ReasonCodes -ccontains "runObservationsMissing")) `
+        "A run whose pricing table does not cover every declared model was accepted."
+
     $forgedTextRuns = @($runs | ForEach-Object { Copy-EvalObject -Value $_ })
     $forgedTextRuns[2].derivation.results[0].claims[0].text = "Something an adjudicator never saw."
     $forgedText = Test-ReviewerEvalRunSetConsistent -Runs $forgedTextRuns -Corpus $corpus
@@ -615,7 +621,9 @@ try {
     # corpus - which is exactly why every prior run then reports a mismatch.
     $lateCorrection.freeze.corpusSha256 = Get-ReviewerEvalCorpusSha256 `
         -Name ([string]$lateCorrection.name) -CorpusVersion ([int]$lateCorrection.corpusVersion) `
-        -CorpusPin $lateCorrection.corpusPin -PartitionPolicy $lateCorrection.partitionPolicy `
+        -CorpusPin $lateCorrection.corpusPin `
+        -FrozenAtEpochSeconds ([int64]$lateCorrection.frozenAtEpochSeconds) `
+        -PartitionPolicy $lateCorrection.partitionPolicy `
         -Strata @($lateCorrection.strata) -Corrections @($lateCorrection.corrections) `
         -RecordHashes @(@($lateCorrection.examples) | ForEach-Object { [string]$_.recordHash })
     Assert-Eval ([string]$lateCorrection.freeze.corpusSha256 -cne [string]$corpus.freeze.corpusSha256) `
@@ -638,6 +646,29 @@ try {
     $renamedResult = Test-ReviewerEvalCorpusIntegrity -Corpus $renamed
     Assert-Eval ((-not $renamedResult.Ok) -and ($renamedResult.ReasonCodes -ccontains "corpusFreezeHashMismatch")) `
         "The corpus name is outside the freeze digest."
+    $refrozen = Copy-EvalObject -Value $corpus
+    $refrozen.frozenAtEpochSeconds = [int64]$refrozen.frozenAtEpochSeconds + 86400
+    $refrozenResult = Test-ReviewerEvalCorpusIntegrity -Corpus $refrozen
+    Assert-Eval ((-not $refrozenResult.Ok) -and ($refrozenResult.ReasonCodes -ccontains "corpusFreezeHashMismatch")) `
+        "The freeze time is outside the freeze digest."
+
+    # A zero-example corpus must not skip freeze verification entirely.
+    $emptyCorpus = Copy-EvalObject -Value $corpus
+    $emptyCorpus.examples = @()
+    $emptyCorpus.freeze.exampleCount = 4242
+    $emptyCorpus.freeze.corpusSha256 = "e" * 64
+    $emptyCorpus.freeze.partitionAssignmentSha256 = "f" * 64
+    $emptyResult = Test-ReviewerEvalCorpusIntegrity -Corpus $emptyCorpus
+    Assert-Eval (-not $emptyResult.Ok) "A zero-example corpus with a fabricated freeze block verified clean."
+    Assert-Eval ($emptyResult.ReasonCodes -ccontains "corpusFreezeHashMismatch") `
+        "A zero-example corpus skipped freeze-digest verification."
+    $emptyValid = $false
+    try {
+        $emptyValid = [bool](Test-Json -Json ($emptyCorpus | ConvertTo-Json -Depth 32) `
+                -SchemaFile $corpusSchemaPath -ErrorAction SilentlyContinue)
+    }
+    catch { $emptyValid = $false }
+    Assert-Eval (-not $emptyValid) "corpus.schema.json accepts a corpus with no examples."
 
     # -----------------------------------------------------------------------
     # 8. Blind adjudication: structure, blindness, independence, conflicts.
@@ -1080,6 +1111,16 @@ try {
     Assert-Eval (@($report.corpusPopulation.deficits) -contains "seedRecordsPresent") "The report omitted the seed-record deficit."
     Assert-Eval ([string]$report.toolBinding.evaluationToolSha256 -match '^[0-9a-f]{64}$') "The composite evaluation tool hash is missing."
     Assert-Eval (@($report.arms).Count -eq 6) "The report does not carry both partitions for all three arms."
+
+    # An operator-supplied expectation turns recorded provenance into a live
+    # cross-check; a mismatch must refuse rather than score a stale pair.
+    Assert-EvalThrows -Action {
+        & $harnessToolPath -CorpusFile $corpusPath -RunFiles $sealedRunPaths `
+            -AdjudicationFile $sealedAdjudicationPath -StateDir $stateDir `
+            -OutputPath (Join-Path $sandbox "report-stale-binding.json") -ReportVersion 1 `
+            -GeneratedAtEpochSeconds 1767484800 -ReviewerScriptSha256 ("3" * 64)
+    } -Message "The harness scored runs bound to a reviewer build the operator did not expect." `
+        -ExpectedMessageLike "reviewerScriptSha256 does not match"
 
     # Byte-exact replay from identical inputs and an identical timestamp.
     $replayPath = Join-Path $sandbox "report-replay.json"

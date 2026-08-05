@@ -99,8 +99,10 @@ to:
 - mark a record `qualifying` when its commit or change-set pin is an all-zero
   placeholder;
 - accept a record with fewer than two independent human labels;
-- import any synthetic record without an explicit `-AllowSyntheticSeed`, which
-  marks every produced record `seed`;
+- import any record whose `status` is `seed`, or whose pins are placeholders,
+  without an explicit `-AllowSyntheticSeed` acknowledgement. The switch does not
+  set `status` - the import manifest does - and any seed record trips the
+  `seedCorpus` global veto;
 - silently rewrite an existing frozen corpus without `-Force`.
 
 Identity is derived, never asserted:
@@ -108,7 +110,7 @@ Identity is derived, never asserted:
 - `exampleId = sha256(domain, {provider, repositoryId, prId, sourceCommitSha, targetCommitSha, changeSetSha256})`
 - `groupKey = sha256(domain, {repositoryId, changedFilePathsSha256})`
 - `recordHash = sha256(domain, <the record minus its own hash>)`
-- `freeze.corpusSha256 = sha256(domain, {name, corpusVersion, corpusPin, partitionPolicy, strata, corrections, ordinal-sorted record hashes})`
+- `freeze.corpusSha256 = sha256(domain, {name, corpusVersion, corpusPin, frozenAtEpochSeconds, partitionPolicy, strata, corrections, ordinal-sorted record hashes})`
 
 The freeze digest deliberately covers the corpus's own name, version and pin,
 not just its records. The pin is what an operator eventually transcribes into a
@@ -194,9 +196,11 @@ not a result.
 Each run manifest is split deliberately:
 
 - `derivation` is deterministic and is what replay equality compares;
-- `observations` records latency, token counts and cost, which a re-execution
-  will never reproduce, alongside the pinned pricing table version and rates so
-  cost is at least recomputable from tokens.
+- `observations` records latency, token counts and cost. These are
+  operator-asserted wall-clock facts that this layer cannot recompute - it does
+  not execute the arms - so what it checks instead is that the pinned pricing
+  table covers every model the arm declares, making a cost figure at least
+  attributable to a rate card.
 
 The report exposes `derivationSha256` and `observationsSha256` separately for
 exactly that reason.
@@ -419,6 +423,36 @@ closed. That is deliberate: an honest deficit beats a lowered gate.
 
 ## Residual limitations, stated plainly
 
+- **The harness scores; it does not run the arms.** Run manifests - including
+  model identities, latency, token counts and cost - are operator-authored and
+  sealed with `-SealOnly`. This layer verifies their structure, their pinning,
+  their mutual consistency, and that the pricing table covers every declared
+  model; it cannot verify that the numbers describe a real execution.
+- **Reviewer-side bindings are recorded provenance, not live verification.**
+  `derivation.binding` records which reviewer script, gate library,
+  verification library, prompt, policy and schema produced a run, and all three
+  arms must agree byte-for-byte with each other - but agreement among the arms
+  is not proof that any of them matches a real artifact. Supply
+  `-ConfigSha256`, `-ReviewerScriptSha256`, `-GateLibrarySha256`,
+  `-VerificationLibrarySha256` and/or `-VerificationPolicySha256` to turn a
+  recorded value into a live cross-check. They are operator inputs on purpose:
+  scoring an older reviewer build is a legitimate thing to do.
+- **"Untouched holdout" is a process guarantee, not an enforced one.**
+  Partitions are frozen, group-consistent and leakage-checked, and a
+  post-run ground-truth correction is detected - but nothing prevents an
+  operator from scoring repeatedly against the same holdout across successive
+  corpus versions. That discipline lives outside the repository.
+- **Per-scope evidence is only as wide as the declared scope list.** Declaring
+  only an `important` scope removes the per-`(pack, severity)` critical bound;
+  the aggregate critical-stratum checks still apply. The Bonferroni `k` is the
+  size of that declared list, so a shorter list is a weaker multiplicity
+  correction as well as narrower evidence - declare every scope you intend to
+  qualify, before you look at the numbers.
+- **Transcribe `corpus.sha256` explicitly.** The report's
+  `transcriptionInput.corpus.sha256` is the corpus FREEZE digest, which is not
+  what `New-ReviewerGateQualification.ps1 -CorpusPath` computes (that hashes
+  the sealed file on disk). Use `-CorpusSha256 <value>` with the transcribed
+  number, or the qualification will bind a different one.
 - **Eligibility here is not layer 6's live predicate.** `Test-ReviewerGateCandidateEligible`
   needs live pull-request world state (thread dedupe, anchor validity, check
   status) that a frozen offline corpus does not carry. Layer 7's "eligible

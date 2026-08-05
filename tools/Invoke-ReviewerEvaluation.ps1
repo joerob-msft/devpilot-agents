@@ -71,6 +71,20 @@
     Optional expected reviewer config hash; when supplied, a run set whose
     binding disagrees is rejected.
 
+.PARAMETER ReviewerScriptSha256
+    Optional expected Start-ReviewerAgent.ps1 hash. A run manifest RECORDS
+    which reviewer build produced it; only an operator-supplied expectation can
+    turn that recorded provenance into a live cross-check.
+
+.PARAMETER GateLibrarySha256
+    Optional expected DeliveryGates.ps1 hash.
+
+.PARAMETER VerificationLibrarySha256
+    Optional expected CrossVerification.ps1 hash.
+
+.PARAMETER VerificationPolicySha256
+    Optional expected cross-verification policy hash.
+
 .PARAMETER SealOnly
     Seal a plain-JSON run or adjudication manifest into the corresponding
     evaluation domain and exit. Requires -SealKind, -SealInput and -OutputPath.
@@ -99,6 +113,10 @@ param(
     [ValidateRange(1, [int]::MaxValue)][int]$ReportVersion = 1,
     [int64]$GeneratedAtEpochSeconds = -1,
     [ValidatePattern('^[0-9a-fA-F]{64}$')][string]$ConfigSha256,
+    [ValidatePattern('^[0-9a-fA-F]{64}$')][string]$ReviewerScriptSha256,
+    [ValidatePattern('^[0-9a-fA-F]{64}$')][string]$GateLibrarySha256,
+    [ValidatePattern('^[0-9a-fA-F]{64}$')][string]$VerificationLibrarySha256,
+    [ValidatePattern('^[0-9a-fA-F]{64}$')][string]$VerificationPolicySha256,
     [switch]$SealOnly,
     [ValidateSet("run", "adjudication")][string]$SealKind,
     [string]$SealInput
@@ -184,12 +202,26 @@ foreach ($run in $runs) {
 }
 
 $runSet = Test-ReviewerEvalRunSetConsistent -Runs $runs -Corpus $corpus
-if ($ConfigSha256) {
-    foreach ($arm in $script:ReviewerEvalArms) {
-        if (-not $runSet.ByArm.ContainsKey($arm)) { continue }
-        $binding = Get-ReviewerVerificationValue (Get-ReviewerVerificationValue $runSet.ByArm[$arm] "derivation") "binding"
-        if ([string](Get-ReviewerVerificationValue $binding "configSha256" "") -cne $ConfigSha256.ToLowerInvariant()) {
-            throw "A run's configSha256 does not match the expected -ConfigSha256; refusing to score a stale pair."
+# The run manifests RECORD which reviewer build produced them; nothing in a
+# sealed artifact can prove that on its own. These optional operator inputs are
+# the only way to turn recorded provenance into a live cross-check, and they
+# are deliberately operator-supplied rather than derived from this checkout,
+# because scoring an older reviewer build is a legitimate thing to do.
+$expectedBindings = @(
+    , @("configSha256", $ConfigSha256)
+    , @("reviewerScriptSha256", $ReviewerScriptSha256)
+    , @("gateLibrarySha256", $GateLibrarySha256)
+    , @("verificationLibrarySha256", $VerificationLibrarySha256)
+    , @("verificationPolicySha256", $VerificationPolicySha256)
+)
+foreach ($arm in $script:ReviewerEvalArms) {
+    if (-not $runSet.ByArm.ContainsKey($arm)) { continue }
+    $binding = Get-ReviewerVerificationValue (Get-ReviewerVerificationValue $runSet.ByArm[$arm] "derivation") "binding"
+    foreach ($pair in $expectedBindings) {
+        $expected = [string]$pair[1]
+        if (-not $expected) { continue }
+        if ([string](Get-ReviewerVerificationValue $binding ([string]$pair[0]) "") -cne $expected.ToLowerInvariant()) {
+            throw "A run's $($pair[0]) does not match the expected value; refusing to score a stale pair."
         }
     }
 }
