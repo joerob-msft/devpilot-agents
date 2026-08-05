@@ -1,9 +1,9 @@
 {
-  "baseCommit": "7cfcbf47debf430cb776946dea1837af323b86cd",
+  "baseCommit": "84767a0cc6744413f32f4d2f1036e717ba9552f6",
   "functions": {
     "Get-ReviewerMarkerSchema": "988d854172a387260134758f650c047330ba2560bf7bb90d7e14769334d4d1bb",
     "Invoke-ReviewerModelPass": "23f98b4a3159a0085ab6d9a32d209ae03c517fdf360e7d0a658350bdff2835c5",
-    "Write-ReviewerPreview": "1293955fc9cad9049dc8d6dbb640ef7d9130d4e90118a231df9ed19c292fc9da",
+    "Write-ReviewerPreview": "7a74199c73cca5c14bd20381dbf455bf68cbc70e450a3459febb8aa6634e368e",
     "Merge-ReviewerPassFindings": "3738ac27f5b8f4c491c39d5e622b868c1306dd805643b4d17390cae2d64c8ddb",
     "Get-ReviewerMergedVote": "1580a303e8ecaaf4c679113a76910789f52cee1774f411dc8659456c35e40534",
     "Get-ReviewerRuntimeContext": "3c5b58cc90a85fcf213f29db889e034c9378a3b498dce2ac2b2ec4c4d96f21ff"
