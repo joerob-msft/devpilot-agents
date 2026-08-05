@@ -134,7 +134,7 @@ review you have actually read is a first-class mode rather than a re-run:
     -OperatorAlias <your-alias> -EnableFindingComments -EnableSummaryComment
 ```
 
-`-PromotePreview` publishes the artifact's **delivery manifest** — the exact
+For single-pass reviews, `-PromotePreview` publishes the artifact's **delivery manifest** — the exact
 comment list, summary and vote that appeared in the Markdown you read — and
 three things have to hold before any of it goes out. The artifact's HMAC seal
 must verify against a per-user key that is *not stored in the artifact*; the
@@ -163,8 +163,8 @@ accepting that nothing can then show that what was published is what was read.
 
 Other properties worth knowing:
 
-- **A preview does not consume the commit.** It is recorded as *not delivered*,
-  so you can still publish it. A delivered review closes that commit.
+- **A single-pass preview does not consume the commit.** It is recorded as *not
+  delivered*, so you can still publish it. A delivered review closes that commit.
 - **Delivery is tracked per capability.** Comments, the summary and the vote are
   recorded separately, so adding `-EnableApprovalVote` to a PR that already
   received comments still casts the vote instead of skipping the PR as done.
@@ -235,7 +235,7 @@ authenticated as. That is why every write is opt-in.
 
 A single model's coverage of real defects is both incomplete and *idiosyncratic*
 — two models do not miss the same things. `-SecondPassModel` reviews every PR
-twice, with a different model each time, and publishes the **union**:
+twice, with a different model each time, and previews the **union**:
 
 ```powershell
 ./src/Agents/reviewer/Start-ReviewerAgent.ps1 `
@@ -260,6 +260,12 @@ scores well.
 
 How it works, and why it is arranged this way:
 
+- **The union is discovery-only in this layer.** The passes do not cross-review
+  or independently verify each other's findings. With `-SecondPassModel`,
+  finding comments, summary comments, approval votes and `-PromotePreview` are
+  all rejected before publication. There is no config or CLI override. A later
+  verified-delivery layer must produce the code-defined typed authorization
+  before any multi-pass output can leave the host.
 - **The passes are independent.** Each gets its own nonce, is validated against
   the marker schema on its own, and is bound to the PR and commit on its own.
   Neither sees the other's output — a second model shown the first one's
@@ -271,19 +277,18 @@ How it works, and why it is arranged this way:
   line are kept as two: no similarity heuristic can distinguish "the same point,
   said differently" from "two distinct bugs on one line", and dropping one to
   save a duplicate comment would lose a real finding.
-- **The union is not exempt from the posting rules.** The per-PR cap, the
-  severity threshold and the change-set anchor check all apply afterwards,
-  unchanged, so two passes cannot post twice as much noise.
+- **The union is still filtered as if it could be posted.** The per-PR cap, the
+  severity threshold and the change-set anchor check all apply before preview,
+  unchanged, so the discovery artifact reflects the eventual delivery shape.
 - **A plain approval requires *every* pass to approve.** The merged
   recommendation is the least approving one offered — an unrecognised value
   collapses it to "no vote". In the benchmark the single worst outcome was a
   confident approval of a PR that broke two APIs, and it was the partner model
   that caught it.
 - **A pass that fails degrades loudly.** If one pass produces nothing usable the
-  findings that *did* arrive are still published — a real defect is worth
-  reporting however many models saw it — but the preview says so, the sealed
-  manifest records `passesRequested`/`passesCompleted`, and **no vote is cast**,
-  including later via `-PromotePreview`.
+  findings that *did* arrive remain in the preview — a real defect is useful
+  discovery however many models saw it — the sealed manifest records
+  `passesRequested`/`passesCompleted`, and **no vote is available**.
 - **Cost and wall-clock roughly double.** Each pass is a full model run with its
   own `-CycleTimeoutSeconds` budget.
 

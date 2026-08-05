@@ -40,6 +40,9 @@
         self-describing field live inside the file an editor controls.
       - Every write is opt-in and independently gated; all default OFF. The
         agent therefore does nothing observable until an operator says so.
+        Multi-pass union output is discovery-only: no finding, summary, vote or
+        promotion may leave the host without a code-defined VerifiedMultiPass
+        authorization, and this reviewer build has no producer for one.
       - No write happens until the PR is re-read and confirmed unchanged since
         the reviewed commit; a PR that moved on is abandoned, not partly
         commented. Delivery also refuses to publish when the PR's change set
@@ -79,7 +82,7 @@
     repository for the first time.
 
 .PARAMETER SecondPassModel
-    Review every PR a SECOND time with a different model and publish the union of
+    Review every PR a SECOND time with a different model and preview the union of
     what the two passes found. Requires -Model, which names the first pass.
 
     This exists because model coverage of real defects is both incomplete and
@@ -93,6 +96,11 @@
     neither sees the other's output, so the second cannot be anchored by the
     first. The wrapper - not a model - merges the results.
 
+    The union is discovery-only in this reviewer build: the passes do not verify
+    each other's findings, and there is no independent verified-delivery layer.
+    Two-pass runs therefore reject every write switch and -PromotePreview. There
+    is no config or CLI override.
+
     Cost and time roughly double: each pass is a separate model run with its own
     -CycleTimeoutSeconds budget.
 
@@ -101,7 +109,9 @@
     the model again. The stored review is re-parsed through the same schema that
     bounded it when it was produced, re-checked against the PR and commit it was
     bound to, and only then posted. This is the only mode in which the text that
-    is posted is guaranteed to be the text a human read.
+    is posted is guaranteed to be the text a human read. This reviewer build can
+    promote single-pass artifacts only. Multi-pass artifacts require a
+    code-defined verified-delivery authorization that this layer does not issue.
 
 .PARAMETER AcceptUnverifiablePreviewDocument
     Promote even though the Markdown preview the artifact was written alongside
@@ -185,7 +195,7 @@ param(
     # solo operator piloting the agent has nobody else's PR to point it at.
     [switch]$IncludeOwnPullRequests,
 
-    # Opt-in write capabilities - ALL default OFF, ALL independently gated.
+    # Opt-in single-pass write capabilities - ALL default OFF, independently gated.
     # Without any of these the agent is a pure read-only reviewer that reports
     # its candidate comments to the console and a preview file.
     [switch]$EnableFindingComments,
@@ -244,6 +254,41 @@ Set-StrictMode -Version Latest
 $script:ReviewerUtf8 = New-Object System.Text.UTF8Encoding($false)
 [Console]::OutputEncoding = $script:ReviewerUtf8
 $OutputEncoding = $script:ReviewerUtf8
+
+enum ReviewerDeliveryAuthorizationKind {
+    PreviewOnly = 0
+    SinglePass = 1
+    VerifiedMultiPass = 2
+}
+
+class ReviewerDeliveryAuthorization {
+    hidden [object]$Seal
+    hidden [object]$VerificationSeal
+    [ReviewerDeliveryAuthorizationKind]$Kind
+    [int]$PassCount
+    [string]$Reason
+
+    ReviewerDeliveryAuthorization(
+        [object]$seal,
+        [object]$verificationSeal,
+        [ReviewerDeliveryAuthorizationKind]$kind,
+        [int]$passCount,
+        [string]$reason
+    ) {
+        if ($null -eq $seal) { throw "Delivery authorization requires a code-defined seal." }
+        if ($passCount -lt 1) { throw "Delivery authorization requires at least one pass." }
+        if ([string]::IsNullOrWhiteSpace($reason)) { throw "Delivery authorization requires a reason." }
+        $this.Seal = $seal
+        $this.VerificationSeal = $verificationSeal
+        $this.Kind = $kind
+        $this.PassCount = $passCount
+        $this.Reason = $reason
+    }
+}
+
+class ReviewerDeliveryAuthorizationException : System.InvalidOperationException {
+    ReviewerDeliveryAuthorizationException([string]$message) : base($message) {}
+}
 
 # One top-level try/catch so ANY uncaught error surfaces as a nonzero exit,
 # never a silently-masked exit 0. Explicit `exit N` bypasses this catch.
@@ -347,6 +392,11 @@ $script:ReviewerSeverities = @("critical", "important", "suggestion")
 # make the agent post comments that do not identify themselves as automated.
 $script:ReviewerSignatureFooter = "-- automated review by the devpilot reviewer agent; reply here if this is wrong."
 $script:ReviewerSummaryHeading = "## Reviewer agent summary"
+$script:ReviewerDeliveryAuthorizationSeal = [object]::new()
+# A later independent-verification layer must replace this with its own private
+# seal and be the sole producer of authorizations carrying that same reference.
+# Null makes VerifiedMultiPass unreachable in this layer even if Kind is mutated.
+$script:ReviewerVerifiedMultiPassSeal = $null
 
 # ---------------------------------------------------------------------------
 # Pure helpers (unit-testable in -DryRun; no network / ADO / Copilot needed)
@@ -1128,6 +1178,74 @@ function Get-ReviewerWritesRequested {
     return ($Comments -or $Summary -or $Vote)
 }
 
+function New-ReviewerDeliveryAuthorization {
+    <#
+        The sole authorization producer in this layer. One pass preserves the
+        existing delivery behavior. Multiple independent passes are discovery
+        only until a later verification layer explicitly mints VerifiedMultiPass.
+        There is deliberately no config, parameter or environment override.
+    #>
+    param([Parameter(Mandatory)][ValidateRange(1, 100)][int]$PassCount)
+
+    if ($PassCount -eq 1) {
+        return [ReviewerDeliveryAuthorization]::new(
+            $script:ReviewerDeliveryAuthorizationSeal,
+            $null,
+            [ReviewerDeliveryAuthorizationKind]::SinglePass,
+            1,
+            "single-pass delivery preserves the existing reviewed-output path"
+        )
+    }
+    return [ReviewerDeliveryAuthorization]::new(
+        $script:ReviewerDeliveryAuthorizationSeal,
+        $null,
+        [ReviewerDeliveryAuthorizationKind]::PreviewOnly,
+        $PassCount,
+        "independent multi-pass union has not been independently verified"
+    )
+}
+
+function Assert-ReviewerDeliveryAuthorized {
+    <#
+        The validation entry point for every external write. A later verified-
+        delivery layer may provide a sealed VerifiedMultiPass authorization, but
+        this layer has no producer for one and therefore fails closed.
+    #>
+    param(
+        [Parameter(Mandatory)][ReviewerDeliveryAuthorization]$Authorization,
+        [Parameter(Mandatory)][ValidateRange(1, 100)][int]$RequiredPassCount,
+        [Parameter(Mandatory)][bool]$WriteRequested,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Operation
+    )
+
+    if (-not $WriteRequested) { return }
+    if (-not [object]::ReferenceEquals($Authorization.Seal, $script:ReviewerDeliveryAuthorizationSeal)) {
+        throw [ReviewerDeliveryAuthorizationException]::new(
+            "$Operation is blocked because its delivery authorization was not produced by the code-defined authorization boundary."
+        )
+    }
+    if ($Authorization.PassCount -ne $RequiredPassCount) {
+        throw [ReviewerDeliveryAuthorizationException]::new(
+            "$Operation is blocked because its authorization is bound to $($Authorization.PassCount) pass(es), not $RequiredPassCount."
+        )
+    }
+    if ($RequiredPassCount -eq 1 -and $Authorization.Kind -eq [ReviewerDeliveryAuthorizationKind]::SinglePass) {
+        return
+    }
+    if ($RequiredPassCount -gt 1 -and
+        $Authorization.Kind -eq [ReviewerDeliveryAuthorizationKind]::VerifiedMultiPass -and
+        $null -ne $script:ReviewerVerifiedMultiPassSeal -and
+        [object]::ReferenceEquals($Authorization.VerificationSeal, $script:ReviewerVerifiedMultiPassSeal)) {
+        return
+    }
+
+    throw [ReviewerDeliveryAuthorizationException]::new(
+        "$Operation is blocked: a $RequiredPassCount-pass union is discovery-only until an independent verified-delivery layer " +
+        "produces a code-defined VerifiedMultiPass authorization. This reviewer build has no such layer. Run without write " +
+        "switches to save a preview; do not promote this multi-pass artifact."
+    )
+}
+
 function Format-ReviewerFindingComment {
     <# The severity prefix is not decoration: the sibling handler agent
        recognizes an automated finding by exactly this marker, so changing the
@@ -1522,6 +1640,16 @@ $EffectiveSecondPassModel = $ResolvedSecondPassModel
 # PR costs, so every consumer (launch loop, preview, manifest, log) agrees.
 $ReviewPassModels = if ($EffectiveSecondPassModel) { @($EffectiveModel, $EffectiveSecondPassModel) } else { @($EffectiveModel) }
 $IsTwoPass = (@($ReviewPassModels).Count -gt 1)
+$DeliveryAuthorization = New-ReviewerDeliveryAuthorization -PassCount @($ReviewPassModels).Count
+$StartupWritesRequested = Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) `
+    -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)
+# Promotion is write intent even before its individual capabilities are checked.
+# The promotion path also re-checks the signed artifact pass count, so omitting
+# -SecondPassModel at promotion time is not a bypass.
+Assert-ReviewerDeliveryAuthorized -Authorization $DeliveryAuthorization `
+    -RequiredPassCount @($ReviewPassModels).Count `
+    -WriteRequested ($StartupWritesRequested -or [bool]$PromotePreview) `
+    -Operation $(if ($PromotePreview) { "Preview promotion" } else { "Direct review delivery" })
 # A merged review can legitimately carry up to one full cap per pass before the
 # wrapper's own ranking cap trims it. The stored marker is re-validated on
 # promotion against exactly this bound, so it has to account for the union.
@@ -1824,6 +1952,10 @@ function Write-ReviewerPreview {
     )
     $counts = Get-ReviewerSeverityCounts -Findings $AllFindings
     $passCount = @($PassResults).Count
+    # Security decisions on promotion use the declared pass count, not how far a
+    # particular execution got. A short-circuited second pass must not turn a
+    # two-pass artifact into an authorized single-pass artifact.
+    $passesRequested = @($ReviewPassModels).Count
     $passesComplete = ($passCount -eq 0) -or (@($PassResults | Where-Object { $null -eq $_.Marker }).Count -eq 0)
     $lines = New-Object System.Collections.Generic.List[string]
     [void]$lines.Add("# Review preview - PR $PrId")
@@ -1932,7 +2064,7 @@ function Write-ReviewerPreview {
                 markerPrefix     = $ResultMarkerPrefix
                 maxFindingItems  = $MergedMarkerMaxFindingItems
                 reviewModels     = @(@($PassResults) | ForEach-Object { [string](Get-ReviewerHashValue -Container $_ -Key 'Model' -Default '') })
-                passesRequested  = $passCount
+                passesRequested  = $passesRequested
                 passesCompleted  = @(@($PassResults) | Where-Object { $null -ne $_.Marker }).Count
                 createdAt        = ([DateTime]::UtcNow.ToString("o"))
                 scriptSha256     = $ScriptSelfSha256
@@ -2093,7 +2225,7 @@ function Set-ReviewerVote {
 
 function Invoke-DryRunSelfChecks {
     $failures = New-Object System.Collections.Generic.List[string]
-    $total = 21
+    $total = 22
 
     Write-Host "[DRY-RUN] Self-check 1/$total : parser validity + prompt presence" -ForegroundColor Cyan
     foreach ($p in @($PSCommandPath, $HarnessPath)) {
@@ -3225,7 +3357,7 @@ function Invoke-DryRunSelfChecks {
     elseif ([bool](Get-ReviewerHashValue -Container $degraded -Key 'Retryable' -Default $false)) {
         $failures.Add("The decline for an incomplete pass set is retryable; the sealed plan can never gain the missing pass, so it would be retried forever.")
     }
-    else { Write-Host "  OK - a review short a pass publishes its findings but never votes, and that decline is final" -ForegroundColor Green }
+    else { Write-Host "  OK - a review short a pass retains its preview findings but never votes, and that decline is final" -ForegroundColor Green }
 
     # -SecondPassModel must refuse the two configurations that make it pointless
     # or unreproducible. Asserted against the resolution code itself, because a
@@ -3244,6 +3376,145 @@ function Invoke-DryRunSelfChecks {
     }
     elseif ($modelResolutionOk -eq 2) {
         Write-Host "  OK - the pass list is distinct and the sealed marker bound covers every pass's cap" -ForegroundColor Green
+    }
+
+    Write-Host "[DRY-RUN] Self-check 22/$total : typed delivery authorization gates every write and promotion path" -ForegroundColor Cyan
+    $authorizationFailuresBefore = $failures.Count
+    if ([int][ReviewerDeliveryAuthorizationKind]::PreviewOnly -ne 0) {
+        $failures.Add("PreviewOnly is not enum ordinal zero; an uninitialized authorization kind could become permissive.")
+    }
+
+    # PowerShell can coerce a hashtable or ConvertFrom-Json result into a class
+    # with a default constructor. This class intentionally has only an explicit
+    # constructor, so untrusted data cannot mint a typed grant.
+    $coercionAccepted = $false
+    try {
+        [ReviewerDeliveryAuthorization]$forged = @{
+            Kind = 'VerifiedMultiPass'; PassCount = 2; Reason = 'from data'
+        }
+        if ($forged) { $coercionAccepted = $true }
+    }
+    catch {}
+    if ($coercionAccepted) {
+        $failures.Add("A hashtable was coerced into ReviewerDeliveryAuthorization; config or artifact data could mint VerifiedMultiPass.")
+    }
+
+    $singleAuthorization = New-ReviewerDeliveryAuthorization -PassCount 1
+    $multiAuthorization = New-ReviewerDeliveryAuthorization -PassCount 2
+    if ($singleAuthorization.Kind -ne [ReviewerDeliveryAuthorizationKind]::SinglePass) {
+        $failures.Add("The code-defined single-pass path did not receive SinglePass authorization.")
+    }
+    if ($multiAuthorization.Kind -ne [ReviewerDeliveryAuthorizationKind]::PreviewOnly) {
+        $failures.Add("An unverified two-pass union received a write-capable authorization.")
+    }
+
+    $singlePassRejected = $false
+    try {
+        Assert-ReviewerDeliveryAuthorized -Authorization $singleAuthorization -RequiredPassCount 1 `
+            -WriteRequested $true -Operation "single-pass compatibility self-check"
+    }
+    catch { $singlePassRejected = $true }
+    if ($singlePassRejected) {
+        $failures.Add("Single-pass delivery was rejected, changing existing behavior.")
+    }
+
+    $writeCases = @(
+        @{ Name = 'finding comments'; C = $true; S = $false; V = $false },
+        @{ Name = 'summary comments'; C = $false; S = $true; V = $false },
+        @{ Name = 'approval vote'; C = $false; S = $false; V = $true },
+        @{ Name = 'all write switches'; C = $true; S = $true; V = $true }
+    )
+    foreach ($wc in $writeCases) {
+        $rejected = $false
+        try {
+            Assert-ReviewerDeliveryAuthorized -Authorization $multiAuthorization -RequiredPassCount 2 `
+                -WriteRequested (Get-ReviewerWritesRequested -Comments $wc.C -Summary $wc.S -Vote $wc.V) `
+                -Operation "two-pass $($wc.Name)"
+        }
+        catch [ReviewerDeliveryAuthorizationException] { $rejected = $true }
+        if (-not $rejected) {
+            $failures.Add("Unverified two-pass $($wc.Name) was authorized.")
+        }
+    }
+
+    $promotionRejected = $false
+    try {
+        Assert-ReviewerDeliveryAuthorized -Authorization $multiAuthorization -RequiredPassCount 2 `
+            -WriteRequested $true -Operation "two-pass preview promotion"
+    }
+    catch [ReviewerDeliveryAuthorizationException] { $promotionRejected = $true }
+    if (-not $promotionRejected) { $failures.Add("An unverified two-pass preview promotion was authorized.") }
+
+    $omittedSwitchRejected = $false
+    try {
+        Assert-ReviewerDeliveryAuthorized -Authorization $singleAuthorization -RequiredPassCount 2 `
+            -WriteRequested $true -Operation "two-pass artifact promoted without -SecondPassModel"
+    }
+    catch [ReviewerDeliveryAuthorizationException] { $omittedSwitchRejected = $true }
+    if (-not $omittedSwitchRejected) {
+        $failures.Add("A two-pass artifact could reuse single-pass authorization when -SecondPassModel was omitted during promotion.")
+    }
+
+    $previewDeliveryExercised = -not $StartupWritesRequested
+    if ($previewDeliveryExercised) {
+        $previewOutcome = Invoke-ReviewerDelivery -Session @{} -PrId 1 -SourceCommit ('a' * 40) `
+            -SummaryText '' -Counts @{ critical = 0; important = 0; suggestion = 0 } `
+            -RecommendedVote 'none' -ExistingFingerprints ([Collections.Generic.HashSet[string]]::new()) `
+            -DeliveryAuthorization $multiAuthorization -RequiredPassCount 2
+        if ($previewOutcome.Reason -cne "preview run; no write was requested") {
+            $failures.Add("A two-pass preview no longer reaches the side-effect-free delivery outcome.")
+        }
+    }
+
+    $typedDeliveryAt = & $declOf 'Invoke-ReviewerDelivery'
+    $promotionAt = & $declOf 'Invoke-ReviewerPromotion'
+    $cycleAt = & $declOf 'Invoke-ReviewerCycle'
+    if ($typedDeliveryAt -lt 0) {
+        $failures.Add("Could not locate Invoke-ReviewerDelivery to check authorization ordering.")
+    }
+    else {
+        $typedDeliverySlice = $selfText.Substring($typedDeliveryAt, [Math]::Min(12000, $selfText.Length - $typedDeliveryAt))
+        $deliveryAssertAt = $typedDeliverySlice.IndexOf('Assert-ReviewerDeliveryAuthorized', [StringComparison]::Ordinal)
+        $deliveryWriteAt = $typedDeliverySlice.IndexOf('Add-ReviewerThread -Session', [StringComparison]::Ordinal)
+        if ($deliveryAssertAt -lt 0 -or $deliveryWriteAt -lt 0 -or $deliveryAssertAt -gt $deliveryWriteAt) {
+            $failures.Add("Invoke-ReviewerDelivery does not enforce typed authorization before wrapper writes.")
+        }
+    }
+    if ($promotionAt -lt 0) {
+        $failures.Add("Could not locate Invoke-ReviewerPromotion to check authorization ordering.")
+    }
+    else {
+        $promotionSlice = $selfText.Substring($promotionAt, [Math]::Min(24000, $selfText.Length - $promotionAt))
+        $promotionSignedAt = $promotionSlice.IndexOf('$signed = $manifestJson | ConvertFrom-Json', [StringComparison]::Ordinal)
+        $promotionAssertAt = $promotionSlice.IndexOf('Assert-ReviewerDeliveryAuthorized', [StringComparison]::Ordinal)
+        $promotionSessionAt = $promotionSlice.IndexOf('Open-AgentMcpSession', [StringComparison]::Ordinal)
+        if ($promotionSignedAt -lt 0 -or $promotionAssertAt -lt $promotionSignedAt -or
+            $promotionSessionAt -lt 0 -or $promotionAssertAt -gt $promotionSessionAt) {
+            $failures.Add("Invoke-ReviewerPromotion does not authorize the signed artifact pass count before opening a live session.")
+        }
+    }
+    if ($cycleAt -lt 0 -or $selfText.Substring($cycleAt, [Math]::Min(30000, $selfText.Length - $cycleAt)) -cnotmatch 'ReviewerDeliveryAuthorizationException') {
+        $failures.Add("The automatic pending-plan retry path does not isolate an unauthorized promotion from the rest of the queue.")
+    }
+
+    # No VerifiedMultiPass producer belongs in this layer. Assemble the enum name
+    # so this check does not count its own assertion as a constructor call.
+    $verifiedCtorNeedle = '\[ReviewerDeliveryAuthorizationKind\]::' + ('Verified' + 'MultiPass') + '\s*,'
+    if ([regex]::Matches($selfText, $verifiedCtorNeedle).Count -gt 0) {
+        $failures.Add("This layer constructs VerifiedMultiPass authorization even though it has no independent verification step.")
+    }
+    if ($null -ne $script:ReviewerVerifiedMultiPassSeal) {
+        $failures.Add("This layer initializes the VerifiedMultiPass seal even though it has no independent verification step.")
+    }
+    $startupGateStart = $selfText.IndexOf('$IsTwoPass =', [StringComparison]::Ordinal)
+    $startupGateEnd = $selfText.IndexOf('$MergedMarkerMaxFindingItems =', [StringComparison]::Ordinal)
+    if ($startupGateStart -lt 0 -or $startupGateEnd -lt $startupGateStart -or
+        $selfText.Substring($startupGateStart, $startupGateEnd - $startupGateStart) -cnotmatch 'Assert-ReviewerDeliveryAuthorized') {
+        $failures.Add("Model resolution does not enforce the delivery authorization at startup.")
+    }
+    if ($failures.Count -eq $authorizationFailuresBefore) {
+        $previewNote = if ($previewDeliveryExercised) { "" } else { " (preview delivery path skipped because this DryRun requested writes)" }
+        Write-Host "  OK - every write switch, direct delivery and promotion fail closed for unverified multi-pass output; single-pass and preview remain compatible$previewNote" -ForegroundColor Green
     }
 
     Write-Host ""
@@ -3426,7 +3697,12 @@ function Invoke-ReviewerDelivery {
         [int]$SealedPublishableCount = -1,
         # $false when the operator configured a multi-pass review and a pass did
         # not produce a usable result. Findings still publish; the vote does not.
-        [bool]$PassesComplete = $true
+        [bool]$PassesComplete = $true,
+        # Every wrapper-owned external write requires this code-defined typed
+        # authorization. Multi-pass preview calls still enter this function, so
+        # the assertion runs only after the no-write early return below.
+        [Parameter(Mandatory)][ReviewerDeliveryAuthorization]$DeliveryAuthorization,
+        [Parameter(Mandatory)][ValidateRange(1, 100)][int]$RequiredPassCount
     )
     $outcome = @{
         PostedCount = 0; PostFailures = 0; SummaryPosted = $false
@@ -3438,6 +3714,8 @@ function Invoke-ReviewerDelivery {
         $outcome.Reason = "preview run; no write was requested"
         return $outcome
     }
+    Assert-ReviewerDeliveryAuthorized -Authorization $DeliveryAuthorization `
+        -RequiredPassCount $RequiredPassCount -WriteRequested $true -Operation "Reviewer delivery for PR $PrId"
 
     if (-not $ChangeSetKnown) {
         $reason = "this PR's change set could not be read, so no finding's location could be verified"
@@ -3744,13 +4022,13 @@ function Invoke-ReviewerPullRequest {
         return @{ ExitCode = 1; Summary = "PR $prId failed: $reason" }
     }
 
-    # A partially-completed multi-pass review still reports what it found - a
-    # real defect is worth publishing however many models happened to see it -
-    # but it is labelled everywhere and it does not vote.
+    # A partially-completed multi-pass review still previews what it found - a
+    # real defect remains useful discovery however many models happened to see
+    # it - but it is labelled everywhere and it does not vote.
     if (-not $passesComplete) {
         Write-Warning ("PR $prId was reviewed by $($completedPasses.Count) of $passCount configured pass(es): " +
             (($failedPasses | ForEach-Object { [string]$_.Reason }) -join '; ') +
-            ". The findings below are published; the vote is withheld.")
+            ". The findings below remain in the preview; no vote is available.")
     }
 
     # -- Wrapper-owned merge --------------------------------------------------
@@ -3909,7 +4187,8 @@ function Invoke-ReviewerPullRequest {
         -RecommendedVote $recommendedVote -ExistingFingerprints $Bound.ExistingFingerprints `
         -ChangeSetKnown (@($Bound.ChangedPaths).Count -gt 0) `
         -SummaryAlreadyDelivered ($priorApplies -and $priorSummary) `
-        -PassesComplete $passesComplete
+        -PassesComplete $passesComplete `
+        -DeliveryAuthorization $DeliveryAuthorization -RequiredPassCount $passCount
     $postedCount = [int]$delivery.PostedCount
     $postFailures = [int]$delivery.PostFailures
     $summaryPosted = [bool]$delivery.SummaryPosted
@@ -3965,6 +4244,7 @@ function Invoke-ReviewerPullRequest {
         postedCount = $postedCount; postFailures = $postFailures
         summaryPosted = $summaryPosted; recommendedVote = $recommendedVote; castVote = $(if ($castVote) { $castVote } else { "none" })
         commentsEnabled = [bool]$EnableFindingComments; summaryEnabled = [bool]$EnableSummaryComment; voteEnabled = [bool]$EnableApprovalVote
+        authorizationKind = [string]$DeliveryAuthorization.Kind; authorizationReason = [string]$DeliveryAuthorization.Reason
         delivered = [bool]$delivery.Delivered; deliveryAborted = [bool]$delivery.Aborted; deliveryReason = [string]$delivery.Reason
         previewPath = $previewPath; artifactPath = [string]$preview.ArtifactPath
     }
@@ -4009,6 +4289,7 @@ function Invoke-ReviewerPromotion {
     param(
         [Parameter(Mandatory)][string]$AgencyPath,
         [Parameter(Mandatory)][string]$ArtifactPath,
+        [Parameter(Mandatory)][ReviewerDeliveryAuthorization]$DeliveryAuthorization,
         # Supplied when a cycle is retrying its own failed delivery plan, so the
         # retry reuses the cycle's session instead of opening a second one.
         [hashtable]$ExistingSession
@@ -4047,6 +4328,19 @@ function Invoke-ReviewerPromotion {
     $prId = [int]$signed.prId
     $sourceCommit = [string]$signed.sourceCommit
     $prTitle = [string](Get-ReviewerHashValue -Container $signed -Key 'prTitle' -Default "PR $prId")
+    # Read only from the HMAC-verified manifest, never the unsigned envelope.
+    # Missing/zero means a pre-multi-pass artifact and therefore one pass. This
+    # authorization runs before any MCP session or state mutation.
+    $sealedRequested = [int](Get-ReviewerHashValue -Container $signed -Key 'passesRequested' -Default 1)
+    if ($sealedRequested -lt 1) { $sealedRequested = 1 }
+    if ($sealedRequested -gt 100) {
+        throw [ReviewerDeliveryAuthorizationException]::new(
+            "Promotion of preview artifact '$ArtifactPath' is blocked because its signed pass count $sealedRequested is outside the supported range 1..100."
+        )
+    }
+    Assert-ReviewerDeliveryAuthorized -Authorization $DeliveryAuthorization `
+        -RequiredPassCount $sealedRequested -WriteRequested $true `
+        -Operation "Promotion of preview artifact '$ArtifactPath'"
 
     # The Markdown is what the operator actually read. Publishing a manifest
     # while that document says something else breaks the only guarantee this
@@ -4112,9 +4406,8 @@ function Invoke-ReviewerPromotion {
     # configured, so the vote gate is told the truth the manifest recorded.
     # Artifacts sealed before multi-pass existed record neither field, and a
     # single-pass review that completed is complete.
-    $sealedRequested = [int](Get-ReviewerHashValue -Container $signed -Key 'passesRequested' -Default 0)
-    $sealedCompleted = [int](Get-ReviewerHashValue -Container $signed -Key 'passesCompleted' -Default 0)
-    $sealedPassesComplete = ($sealedRequested -le 0) -or ($sealedCompleted -ge $sealedRequested)
+    $sealedCompleted = [int](Get-ReviewerHashValue -Container $signed -Key 'passesCompleted' -Default $sealedRequested)
+    $sealedPassesComplete = ($sealedCompleted -ge $sealedRequested)
     if (-not $sealedPassesComplete) {
         Write-Warning ("This review was produced by $sealedCompleted of $sealedRequested configured pass(es); " +
             "its findings will publish but no vote will be cast.")
@@ -4211,7 +4504,8 @@ function Invoke-ReviewerPromotion {
             -ChangeSetKnown (@($changedPaths).Count -gt 0) `
             -SummaryAlreadyDelivered ($priorApplies -and $priorSummary) `
             -SealedPublishableCount (@($approved).Count) `
-            -PassesComplete $sealedPassesComplete
+            -PassesComplete $sealedPassesComplete `
+            -DeliveryAuthorization $DeliveryAuthorization -RequiredPassCount $sealedRequested
 
         $reviewedState = Get-JsonState -Path $reviewedStatePath
         $priorRecord = $null
@@ -4267,6 +4561,7 @@ function Invoke-ReviewerPromotion {
             approvedCount = @($approved).Count; droppedCount = $dropped
             postedCount = [int]$delivery.PostedCount; postFailures = [int]$delivery.PostFailures
             summaryPosted = [bool]$delivery.SummaryPosted; castVote = $(if ($delivery.CastVote) { [string]$delivery.CastVote } else { "none" })
+            authorizationKind = [string]$DeliveryAuthorization.Kind; authorizationReason = [string]$DeliveryAuthorization.Reason
             deliveryAborted = [bool]$delivery.Aborted; deliveryReason = [string]$delivery.Reason
         }
 
@@ -4420,7 +4715,15 @@ function Invoke-ReviewerCycle {
             }
             if ($pendingPlan) {
                 Write-Host "  PR $prId has an unfinished delivery at this commit; retrying that exact review instead of re-reviewing." -ForegroundColor Yellow
-                $retryCode = Invoke-ReviewerPromotion -AgencyPath $AgencyPath -ArtifactPath $pendingPlan -ExistingSession $session
+                try {
+                    $retryCode = Invoke-ReviewerPromotion -AgencyPath $AgencyPath -ArtifactPath $pendingPlan `
+                        -DeliveryAuthorization $DeliveryAuthorization -ExistingSession $session
+                }
+                catch [ReviewerDeliveryAuthorizationException] {
+                    Write-Warning "PR $prId has an unfinished delivery plan that cannot be published: $($_.Exception.Message)"
+                    [void]$retried.Add("PR $prId skipped (delivery plan is not authorized)")
+                    continue
+                }
                 if ([int]$retryCode -ne 0) { $result.ExitCode = 1 }
                 [void]$retried.Add("PR $prId delivery retried")
                 $reviewedState = Get-JsonState -Path $reviewedStatePath
@@ -4536,7 +4839,8 @@ try {
     }
 
     if ($PromotePreview) {
-        exit (Invoke-ReviewerPromotion -AgencyPath $agencyPath -ArtifactPath $PromotePreview)
+        exit (Invoke-ReviewerPromotion -AgencyPath $agencyPath -ArtifactPath $PromotePreview `
+            -DeliveryAuthorization $DeliveryAuthorization)
     }
 
     $consecutiveBackoff = $MinBackoffSeconds
