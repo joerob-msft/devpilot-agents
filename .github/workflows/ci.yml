@@ -124,3 +124,7 @@ jobs:
       - name: provider self-checks
         shell: pwsh
         run: ./tools/Test-Provider.ps1
+
+      - name: convention-pack schema and replay checks
+        shell: pwsh
+        run: ./tools/Test-ConventionPacks.ps1

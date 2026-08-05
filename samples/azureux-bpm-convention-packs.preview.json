@@ -1,0 +1,254 @@
+{
+  "previewOnly": true,
+  "description": "AzureUX-BPM convention-pack profile used only by offline routing and replay tests. It is not loaded by any deployed reviewer config.",
+  "repoConventions": {
+    "conventionPacks": {
+      "schemaVersion": 1,
+      "requireAllSourcesReferenced": true,
+      "authoritativeSources": {
+        "transportVersion": 1,
+        "maxTotalBytes": 8192,
+        "sources": [
+          {
+            "name": "core-guidance",
+            "organization": "contoso",
+            "project": "AzureUX",
+            "repositoryId": "11111111-2222-3333-4444-555555555555",
+            "path": "/reviewer/conventions/csharp-core.md",
+            "branch": "main",
+            "maxBytes": 2048
+          },
+          {
+            "name": "delivery-guidance",
+            "organization": "contoso",
+            "project": "AzureUX",
+            "repositoryId": "11111111-2222-3333-4444-555555555555",
+            "path": "/reviewer/conventions/delivery.md",
+            "branch": "main",
+            "maxBytes": 2048
+          },
+          {
+            "name": "security-guidance",
+            "organization": "contoso",
+            "project": "AzureUX",
+            "repositoryId": "11111111-2222-3333-4444-555555555555",
+            "path": "/reviewer/conventions/security-telemetry.md",
+            "branch": "main",
+            "maxBytes": 2048
+          },
+          {
+            "name": "provider-guidance",
+            "organization": "contoso",
+            "project": "AzureUX",
+            "repositoryId": "11111111-2222-3333-4444-555555555555",
+            "path": "/reviewer/conventions/service-providers.md",
+            "branch": "main",
+            "maxBytes": 2048
+          }
+        ]
+      },
+      "packs": [
+        {
+          "name": "csharp-core",
+          "priority": 100,
+          "changedPathGlobs": [
+            "src/**/*.cs"
+          ],
+          "authoritativeSourceRefs": [
+            "core-guidance"
+          ],
+          "repositorySources": [
+            {
+              "path": "/docs/conventions/csharp-core.md",
+              "maxBytes": 2048
+            }
+          ],
+          "maxBytes": 6144
+        },
+        {
+          "name": "tests-and-cloudtest",
+          "priority": 200,
+          "changedPathGlobs": [
+            "test/**/*.cs",
+            "tests/**/*.cs",
+            "**/*.Tests.cs",
+            "cloudtest/**/*"
+          ],
+          "authoritativeSourceRefs": [
+            "core-guidance"
+          ],
+          "repositorySources": [
+            {
+              "path": "/docs/conventions/testing.md",
+              "maxBytes": 2048
+            }
+          ],
+          "maxBytes": 7168
+        },
+        {
+          "name": "deployment-and-settings",
+          "priority": 300,
+          "changedPathGlobs": [
+            "deployment/**/*",
+            "config/**/*.json",
+            "**/*.settings.json",
+            "pipelines/**/*"
+          ],
+          "authoritativeSourceRefs": [
+            "delivery-guidance"
+          ],
+          "repositorySources": [
+            {
+              "path": "/docs/conventions/deployment.md",
+              "maxBytes": 2048
+            }
+          ],
+          "maxBytes": 7168
+        },
+        {
+          "name": "resources-and-localization",
+          "priority": 400,
+          "changedPathGlobs": [
+            "src/**/Resources/**/*",
+            "**/*.resx",
+            "localization/**/*"
+          ],
+          "authoritativeSourceRefs": [
+            "delivery-guidance"
+          ],
+          "repositorySources": [
+            {
+              "path": "/docs/conventions/resources.md",
+              "maxBytes": 2048
+            }
+          ],
+          "maxBytes": 7168
+        },
+        {
+          "name": "generated-code-and-packages",
+          "priority": 500,
+          "changedPathGlobs": [
+            "**/*.g.cs",
+            "**/*.generated.cs",
+            "src/**/Generated/**/*",
+            "**/packages.config",
+            "packages.lock.json"
+          ],
+          "authoritativeSourceRefs": [
+            "core-guidance"
+          ],
+          "repositorySources": [
+            {
+              "path": "/docs/conventions/generated-code.md",
+              "maxBytes": 2048
+            }
+          ],
+          "maxBytes": 7168
+        },
+        {
+          "name": "security-and-telemetry",
+          "priority": 600,
+          "changedPathGlobs": [
+            "src/**/Security/**/*",
+            "src/**/Telemetry/**/*",
+            "**/*Telemetry*.cs",
+            "**/*Auth*.cs"
+          ],
+          "authoritativeSourceRefs": [
+            "security-guidance"
+          ],
+          "repositorySources": [
+            {
+              "path": "/docs/conventions/security.md",
+              "maxBytes": 2048
+            }
+          ],
+          "maxBytes": 7168
+        },
+        {
+          "name": "service-providers-and-connector-gateway",
+          "priority": 700,
+          "changedPathGlobs": [
+            "src/**/ServiceProviders/**/*",
+            "src/**/ConnectorGateway/**/*"
+          ],
+          "authoritativeSourceRefs": [
+            "provider-guidance"
+          ],
+          "repositorySources": [
+            {
+              "path": "/docs/conventions/service-providers.md",
+              "maxBytes": 2048
+            }
+          ],
+          "maxBytes": 7168
+        },
+        {
+          "name": "docs-and-pr-metadata",
+          "priority": 800,
+          "changedPathGlobs": [
+            ".github/**/*",
+            "docs/**/*",
+            "README.md",
+            "pull_request_template.md"
+          ],
+          "authoritativeSourceRefs": [
+            "delivery-guidance"
+          ],
+          "repositorySources": [
+            {
+              "path": "/docs/conventions/documentation.md",
+              "maxBytes": 2048
+            }
+          ],
+          "maxBytes": 7168
+        }
+      ]
+    }
+  },
+  "replays": [
+    {
+      "name": "service-provider-change",
+      "changedPaths": [
+        "/src/Backend/ServiceProviders/StorageProvider.cs",
+        "\\tests\\Backend\\StorageProvider.Tests.cs"
+      ],
+      "expectedPacks": [
+        "csharp-core",
+        "tests-and-cloudtest",
+        "service-providers-and-connector-gateway"
+      ]
+    },
+    {
+      "name": "deployment-change",
+      "changedPaths": [
+        "/deployment/templates/service.json",
+        "/config/production/service.settings.json"
+      ],
+      "expectedPacks": [
+        "deployment-and-settings"
+      ]
+    },
+    {
+      "name": "generated-resource-change",
+      "changedPaths": [
+        "/src/Backend/Generated/Connector.g.cs",
+        "/src/Backend/Resources/Strings.resx"
+      ],
+      "expectedPacks": [
+        "csharp-core",
+        "resources-and-localization",
+        "generated-code-and-packages"
+      ]
+    },
+    {
+      "name": "documentation-change",
+      "changedPaths": [
+        "/docs/operators/connector-gateway.md"
+      ],
+      "expectedPacks": [
+        "docs-and-pr-metadata"
+      ]
+    }
+  ]
+}
