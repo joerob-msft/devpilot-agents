@@ -10,6 +10,7 @@
   "maxSlicesPerFile": 24,
   "siblingContextSlices": 2,
   "siblingContextLines": 80,
+  "maxTotalSiblingBytes": 49152,
   "minDeliveredFiles": 1,
   "minDeliveredFilePercent": 60,
   "minDeliveredSpanPercent": 60,

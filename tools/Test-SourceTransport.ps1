@@ -82,6 +82,7 @@ function New-TestPolicy {
         allowedMimeTypes        = @("text/plain")
         siblingContextSlices    = 0
         siblingContextLines     = 0
+        maxTotalSiblingBytes    = 2048
     }
     foreach ($key in $Overrides.Keys) { $base[$key] = $Overrides[$key] }
     return New-ReviewerSourceTransportPolicy -Policy ([pscustomobject]$base)
@@ -690,7 +691,7 @@ $siblingPolicy = New-TestPolicy -Overrides @{
 }
 $siblingText = New-TestFileText -LineCount 60
 $siblingCut = New-ReviewerSourceFileSlices -Text $siblingText -Spans @(@{ Start = 30; End = 31 }) `
-    -Policy $siblingPolicy -RemainingTotalBytes 4096
+    -Policy $siblingPolicy -RemainingTotalBytes 4096 -RemainingSiblingBytes 4096
 Assert-Source (@($siblingCut.Slices).Count -eq 1) "the changed span is still delivered"
 $siblingOnly = @($siblingCut.SiblingSlices)
 Assert-Source ($siblingOnly.Count -eq 2) "two sibling slices are delivered around a single changed span"
@@ -721,9 +722,15 @@ $siblingSliceBytes = [System.Text.Encoding]::UTF8.GetByteCount(($siblingText -sp
 Assert-Source ($siblingSliceBytes -lt $changedSliceBytes) `
     "the starvation case is set up with the sibling slice smaller than the changed slice"
 $starvedCut = New-ReviewerSourceFileSlices -Text $siblingText -Spans @(@{ Start = 30; End = 31 }) `
-    -Policy $starvedPolicy -RemainingTotalBytes $changedSliceBytes
-Assert-Source (@($starvedCut.Slices).Count -eq 1) "the changed span wins the budget over a smaller sibling slice"
-Assert-Source (@($starvedCut.SiblingSlices).Count -eq 0) "sibling context yields when the budget is exhausted"
+    -Policy $starvedPolicy -RemainingTotalBytes $changedSliceBytes -RemainingSiblingBytes 0
+Assert-Source (@($starvedCut.Slices).Count -eq 1) "the changed span is delivered on the changed-source budget alone"
+Assert-Source (@($starvedCut.SiblingSlices).Count -eq 0) "sibling context yields when its own budget is exhausted"
+# The two pools are separate, so an exhausted CHANGED budget must not be
+# rescued by sibling headroom either.
+$starvedChangedCut = New-ReviewerSourceFileSlices -Text $siblingText -Spans @(@{ Start = 30; End = 31 }) `
+    -Policy $starvedPolicy -RemainingTotalBytes 0 -RemainingSiblingBytes 4096
+Assert-Source (@($starvedChangedCut.Slices).Count -eq 0 -and @($starvedChangedCut.SiblingSlices).Count -eq 0) `
+    "a spare sibling budget cannot be spent on changed source, and siblings need a delivered change"
 
 # A changed span dropped for budget must NOT reappear stamped as sibling text.
 # Re-delivering it would show the model changed code under a sentence telling it
@@ -737,7 +744,7 @@ $partialPolicy = New-TestPolicy -Overrides @{
 }
 $partialSpans = @(@{ Start = 15; End = 16 }, @{ Start = 18; End = 45 }, @{ Start = 50; End = 51 })
 $partialCut = New-ReviewerSourceFileSlices -Text $siblingText -Spans $partialSpans `
-    -Policy $partialPolicy -RemainingTotalBytes 60
+    -Policy $partialPolicy -RemainingTotalBytes 60 -RemainingSiblingBytes 4096
 Assert-Source (@($partialCut.Slices).Count -lt [int]$partialCut.RequestedSpanCount) `
     "the partial-delivery case really did drop a changed span"
 $changedLineNumbers = [System.Collections.Generic.HashSet[int]]::new()
@@ -757,13 +764,13 @@ Assert-Source ($intersecting -eq 0) `
 
 # Disabled by policy means disabled.
 $noSiblingCut = New-ReviewerSourceFileSlices -Text $siblingText -Spans @(@{ Start = 30; End = 31 }) `
-    -Policy (New-TestPolicy -Overrides @{ siblingContextSlices = 0 }) -RemainingTotalBytes 4096
+    -Policy (New-TestPolicy -Overrides @{ siblingContextSlices = 0 }) -RemainingTotalBytes 4096 -RemainingSiblingBytes 4096
 Assert-Source (@($noSiblingCut.SiblingSlices).Count -eq 0) "sibling context is off when the policy says zero"
 
 # A file whose change was not delivered gets no sibling context either: there is
 # nothing for the siblings to be evidence about.
 $undeliveredCut = New-ReviewerSourceFileSlices -Text $siblingText -Spans @(@{ Start = 500; End = 501 }) `
-    -Policy $siblingPolicy -RemainingTotalBytes 4096
+    -Policy $siblingPolicy -RemainingTotalBytes 4096 -RemainingSiblingBytes 4096
 Assert-Source (@($undeliveredCut.Slices).Count -eq 0 -and @($undeliveredCut.SiblingSlices).Count -eq 0) `
     "a file with no delivered change carries no sibling context"
 
@@ -1447,6 +1454,100 @@ Assert-Source ($cycleText -match 'try \{[\s\S]{0,400}?Invoke-ReviewerPullRequest
     "the per-pull-request review is isolated so one failure cannot end the cycle"
 Assert-Source ($cycleText -match 'isolatedFailure') `
     "an escaped per-pull-request failure is recorded with its own result code"
+
+# ---------------------------------------------------------------------------
+Write-Host "[18/18] Sibling context cannot touch changed-source accounting" -ForegroundColor Cyan
+# ---------------------------------------------------------------------------
+
+# Sibling slices are UNCHANGED lines shipped as evidence of established
+# practice. They must be invisible to every number that says how much of the
+# CHANGE arrived - and, less obviously, they must not be able to spend the
+# budget a later file's changed hunks were entitled to.
+$isoPolicy = New-TestPolicy -Overrides @{
+    siblingContextSlices = 2; siblingContextLines = 20; contextRadiusLines = 1
+    maxSliceBytesPerFile = 4096; maxTotalSliceBytes = 8192; maxTotalSiblingBytes = 4096
+}
+$isoText = New-TestFileText -LineCount 120
+$isoCut = New-ReviewerSourceFileSlices -Text $isoText `
+    -Spans @(@{ Start = 50; End = 52 }, @{ Start = 90; End = 91 }) -Policy $isoPolicy `
+    -RemainingTotalBytes 8192 -RemainingSiblingBytes 4096
+Assert-Source (@($isoCut.SiblingSlices).Count -gt 0) "the sibling fixture actually produced sibling slices"
+Assert-Source ([int]$isoCut.RawRequestedSpanCount -eq 2 -and [int]$isoCut.DeliveredRawSpanCount -eq 2) `
+    "sibling slices leave the raw changed-hunk numerator and denominator untouched"
+Assert-Source (@(@($isoCut.Slices) | Where-Object { [string]$_.Kind -cne 'changed' }).Count -eq 0) `
+    "no sibling slice can appear in the changed-slice list the coverage measure reads"
+Assert-Source ([int]$isoCut.DeliveredSiblingBytes -gt 0 -and
+    [int]$isoCut.DeliveredBytes -eq ([int]$isoCut.DeliveredChangedBytes + [int]$isoCut.DeliveredSiblingBytes)) `
+    "changed and sibling bytes are accounted separately and sum to the whole"
+
+# The same spans with sibling context switched off must deliver identically.
+$isoNoSiblingCut = New-ReviewerSourceFileSlices -Text $isoText `
+    -Spans @(@{ Start = 50; End = 52 }, @{ Start = 90; End = 91 }) `
+    -Policy (New-TestPolicy -Overrides @{ siblingContextSlices = 0; siblingContextLines = 0; contextRadiusLines = 1; maxSliceBytesPerFile = 4096; maxTotalSliceBytes = 8192 }) `
+    -RemainingTotalBytes 8192 -RemainingSiblingBytes 4096
+Assert-Source ([int]$isoNoSiblingCut.DeliveredRawSpanCount -eq [int]$isoCut.DeliveredRawSpanCount -and
+    [int]$isoNoSiblingCut.DeliveredChangedBytes -eq [int]$isoCut.DeliveredChangedBytes -and
+    (@($isoNoSiblingCut.Slices) | ForEach-Object { "$($_.StartLine)-$($_.EndLine)" }) -join ',' -ceq
+    (@($isoCut.Slices) | ForEach-Object { "$($_.StartLine)-$($_.EndLine)" }) -join ',') `
+    "turning sibling context on changes nothing about which changed lines are delivered"
+
+# The cross-file hazard: a large early file's sibling context must not starve a
+# later file's changed hunks. With one shared pool it did.
+$starvePolicy = New-TestPolicy -Overrides @{
+    siblingContextSlices = 2; siblingContextLines = 30; contextRadiusLines = 30
+    maxSliceBytesPerFile = 1024; maxTotalSliceBytes = 1800; maxTotalSiblingBytes = 4096
+    minDeliveredFiles = 3; minDeliveredFilePercent = 100; minDeliveredSpanPercent = 100
+}
+$starveBody = New-TestFileText -LineCount 300
+$starveReader = { param([string]$Path)
+    [pscustomobject]@{ Text = $starveBody; MimeType = 'text/plain'
+        ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($starveBody)
+        Sha256 = Get-ReviewerSourceSha256 -Text $starveBody }
+}
+$starvePaths = @('/src/first.cs', '/src/second.cs', '/src/third.cs')
+$starveSpans = [ordered]@{
+    '/src/first.cs' = @(@{ Start = 100; End = 101 })
+    '/src/second.cs' = @(@{ Start = 100; End = 101 })
+    '/src/third.cs' = @(@{ Start = 100; End = 101 })
+}
+$starveKinds = [ordered]@{ '/src/first.cs' = 'Edit'; '/src/second.cs' = 'Edit'; '/src/third.cs' = 'Edit' }
+$starveReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $starvePaths `
+    -SpansByPath $starveSpans -Policy $starvePolicy -Reader $starveReader -ChangeKindsByPath $starveKinds
+Assert-Source ([int]$starveReport.TotalSiblingBytes -gt 0) "the starvation fixture really did deliver sibling context"
+Assert-Source ([int]$starveReport.DeliveredFiles -eq 3 -and [int]$starveReport.DeliveredSpanCount -eq 3) `
+    "every file's changed hunk still arrives, however much sibling context the earlier files took"
+Assert-Source ((Test-ReviewerSourceCoverageGate -Report $starveReport -Policy $starvePolicy).Ok) `
+    "so sibling evidence cannot push a pull request under the coverage floor"
+
+# And the sibling pool is genuinely bounded and separate.
+$cappedSiblingReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $starvePaths `
+    -SpansByPath $starveSpans -Reader $starveReader -ChangeKindsByPath $starveKinds `
+    -Policy (New-TestPolicy -Overrides @{
+        siblingContextSlices = 2; siblingContextLines = 30; contextRadiusLines = 30
+        maxSliceBytesPerFile = 1024; maxTotalSliceBytes = 1800; maxTotalSiblingBytes = 0
+        minDeliveredFiles = 3; minDeliveredFilePercent = 100; minDeliveredSpanPercent = 100
+    })
+Assert-Source ([int]$cappedSiblingReport.TotalSiblingBytes -eq 0 -and [int]$cappedSiblingReport.DeliveredFiles -eq 3) `
+    "a zero sibling budget delivers no sibling bytes and costs the change nothing"
+Assert-Source ([int]$cappedSiblingReport.DeliveredSpanCount -eq [int]$starveReport.DeliveredSpanCount) `
+    "and changed-hunk coverage is identical either way"
+$siblingRecord = ConvertTo-ReviewerSourceCoverageRecord -Report $starveReport
+Assert-Source ([int]$siblingRecord.totalSiblingBytes -eq [int]$starveReport.TotalSiblingBytes -and
+    [int]$siblingRecord.totalSliceBytes -ge [int]$siblingRecord.totalSiblingBytes) `
+    "the persisted record reports sibling bytes separately so an operator can see what was evidence"
+
+# The policy is closed: a consumer cannot silently inherit an unbounded sibling
+# pool by omitting the key.
+Assert-Source (Test-Throws {
+        $incomplete = [ordered]@{
+            schemaVersion = 1; transportVersion = 1; contextRadiusLines = 2; maxFiles = 10
+            maxFetchBytesPerFile = 4096; maxSliceBytesPerFile = 1024; maxTotalSliceBytes = 4096
+            maxSlicesPerFile = 8; siblingContextSlices = 2; siblingContextLines = 20
+            minDeliveredFiles = 1; minDeliveredFilePercent = 60; minDeliveredSpanPercent = 60
+            allowedMimeTypes = @("text/plain")
+        }
+        New-ReviewerSourceTransportPolicy -Policy ([pscustomobject]$incomplete)
+    }) "a policy that omits the sibling budget is refused rather than defaulted"
 
 # ---------------------------------------------------------------------------
 

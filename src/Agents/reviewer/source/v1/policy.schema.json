@@ -15,6 +15,7 @@
     "maxSlicesPerFile",
     "siblingContextSlices",
     "siblingContextLines",
+    "maxTotalSiblingBytes",
     "minDeliveredFiles",
     "minDeliveredFilePercent",
   "minDeliveredSpanPercent",
@@ -47,6 +48,12 @@
       "description": "Slices of UNCHANGED text delivered next to the change, per file. Zero disables sibling evidence, which makes adoption-dependent conventions unreportable by a specialist that requires unchanged-sibling proof."
     },
     "siblingContextLines": { "type": "integer", "minimum": 0, "maximum": 400 },
+    "maxTotalSiblingBytes": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1048576,
+      "description": "Separate whole-pull-request budget for UNCHANGED sibling context. Kept apart from maxTotalSliceBytes on purpose: when the two shared one pool, the sibling evidence attached to an early file could consume the allowance a later file's changed hunks needed, so adding established-practice context silently lowered changed-source coverage elsewhere in the same pull request."
+    },
     "minDeliveredFiles": {
       "type": "integer",
       "minimum": 0,

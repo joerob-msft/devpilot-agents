@@ -253,12 +253,27 @@ order, nearest lines first, capped.
 Sibling slices are hashed and fenced exactly like changed ones, carry
 `"kind":"sibling"` in their provenance, and are cut only **after** every changed
 span has had its chance at the budget, so unchanged text can never displace the
-change. The block tells the model what they are: evidence of established
-practice, never part of the pull request, and never something to report a
-finding on.
+change within a file. The block tells the model what they are: evidence of
+established practice, never part of the pull request, and never something to
+report a finding on.
 
-Setting `siblingContextSlices` to zero disables this and restores the starved
-behaviour.
+They also draw on a **separate whole-pull-request budget**, `maxTotalSiblingBytes`.
+Ordering alone was not enough: when both drew on `maxTotalSliceBytes`, the
+sibling context attached to the first file could consume the allowance the tenth
+file's changed hunks needed, so switching sibling evidence on quietly lowered
+changed-source coverage somewhere else in the same pull request — and could push
+it under the fail-closed floor. Changed bytes and sibling bytes are now tracked
+apart, reported apart (`totalSliceBytes` and `totalSiblingBytes` in the coverage
+record), and only changed bytes draw down the changed-source pool.
+
+Nothing about sibling context can move a coverage number. `RawRequestedSpanCount`
+counts raw hunks; `DeliveredRawSpanCount` is measured against the **changed**
+slice list only; and a file's `delivered`/`partial` status is decided before any
+sibling text is cut. Turning sibling context on or off delivers byte-identical
+changed slices.
+
+Setting `siblingContextSlices` or `maxTotalSiblingBytes` to zero disables this and
+restores the starved behaviour.
 
 ## Budgets
 
@@ -273,10 +288,11 @@ against 1.6 MB for the raw diff channel and 0 bytes for the file-read tool — a
 | `contextRadiusLines` | 30 | unchanged lines kept on each side of a changed span |
 | `maxFetchBytesPerFile` | 1048576 | largest file the wrapper will read; larger is `fileTooLarge` |
 | `maxSliceBytesPerFile` | 32768 | delivered slice bytes for one file |
-| `maxTotalSliceBytes` | 196608 | delivered slice bytes for the whole PR |
+| `maxTotalSliceBytes` | 196608 | delivered CHANGED slice bytes for the whole PR |
 | `maxSlicesPerFile` | 24 | slices for one file |
 | `siblingContextSlices` | 2 | slices of UNCHANGED text delivered next to the change, per file |
 | `siblingContextLines` | 80 | lines in each sibling slice |
+| `maxTotalSiblingBytes` | 49152 | delivered SIBLING bytes for the whole PR, kept apart so evidence cannot starve the change |
 | `maxFiles` | 60 | changed files considered before the cap is accounted |
 
 A slice that does not fit is **dropped whole**, never truncated, so a recorded

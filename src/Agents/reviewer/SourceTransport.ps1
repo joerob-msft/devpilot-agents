@@ -153,7 +153,7 @@ function New-ReviewerSourceTransportPolicy {
         "schemaVersion", "transportVersion", "contextRadiusLines", "maxFiles",
         "maxFetchBytesPerFile", "maxSliceBytesPerFile", "maxTotalSliceBytes",
         "maxSlicesPerFile", "siblingContextSlices", "siblingContextLines",
-        "minDeliveredFiles", "minDeliveredFilePercent",
+        "maxTotalSiblingBytes", "minDeliveredFiles", "minDeliveredFilePercent",
         "minDeliveredSpanPercent", "allowedMimeTypes"
     )
     $names = @($Policy.PSObject.Properties.Name)
@@ -173,6 +173,7 @@ function New-ReviewerSourceTransportPolicy {
         maxSlicesPerFile        = @(1, 200)
         siblingContextSlices    = @(0, 16)
         siblingContextLines     = @(0, 400)
+        maxTotalSiblingBytes    = @(0, 1048576)
         minDeliveredFiles       = @(0, 500)
         minDeliveredFilePercent = @(0, 100)
         minDeliveredSpanPercent = @(0, 100)
@@ -507,7 +508,13 @@ function New-ReviewerSourceFileSlices {
         [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
         [object[]]$Spans = @(),
         [Parameter(Mandatory)][hashtable]$Policy,
-        [Parameter(Mandatory)][ValidateRange(0, [int]::MaxValue)][int]$RemainingTotalBytes
+        [Parameter(Mandatory)][ValidateRange(0, [int]::MaxValue)][int]$RemainingTotalBytes,
+        # Sibling context draws on its OWN pool. Sharing the changed-source
+        # budget meant the unchanged neighbours of the first file could consume
+        # the allowance the tenth file's changed hunks needed, so adding
+        # established-practice evidence quietly lowered coverage somewhere else
+        # in the same pull request.
+        [ValidateRange(0, [int]::MaxValue)][int]$RemainingSiblingBytes = 0
     )
     $lines = Split-ReviewerSourceLines -Text $Text
     $requested = @($Spans)
@@ -555,6 +562,7 @@ function New-ReviewerSourceFileSlices {
     # not delivering them at all: it converts a lost finding into a suppressed
     # one, on exactly the largest hunks.
     $siblingSlices = [System.Collections.Generic.List[object]]::new()
+    $siblingBytes = 0
     if (@($slices).Count -gt 0) {
         $siblingSpans = @(Get-ReviewerSourceSiblingSpans -DeliveredSpans @($merged) `
                 -LineCount $lines.Count -MaxSlices ([int]$Policy.siblingContextSlices) `
@@ -564,10 +572,14 @@ function New-ReviewerSourceFileSlices {
             $endLine = [int]$span.End
             $sliceText = ($lines[($startLine - 1)..($endLine - 1)] -join "`n")
             $sliceBytes = $script:ReviewerSourceUtf8.GetByteCount($sliceText)
-            if (($deliveredBytes + $sliceBytes) -gt [int]$Policy.maxSliceBytesPerFile -or
-                ($deliveredBytes + $sliceBytes) -gt $RemainingTotalBytes) { continue }
+            # Measured against the sibling pool alone. The per-file ceiling still
+            # applies to the file's whole payload, so one file cannot become
+            # enormous, but a sibling slice can never take a byte that a changed
+            # hunk - in this file or any later one - was entitled to.
+            if (($siblingBytes + $sliceBytes) -gt $RemainingSiblingBytes) { continue }
+            if (($deliveredBytes + $siblingBytes + $sliceBytes) -gt [int]$Policy.maxSliceBytesPerFile) { continue }
             if (-not (Test-ReviewerSourceSafeText -Text $sliceText)) { continue }
-            $deliveredBytes += $sliceBytes
+            $siblingBytes += $sliceBytes
             [void]$siblingSlices.Add(@{
                     StartLine  = $startLine
                     EndLine    = $endLine
@@ -584,10 +596,14 @@ function New-ReviewerSourceFileSlices {
         RequestedSpanCount      = $merged.Count
         # Raw hunk counts, independent of the context radius: the coverage
         # percentage is computed raw-on-raw, so expanding the radius can merge
-        # slices together without ever moving the denominator.
+        # slices together without ever moving the denominator. Sibling slices are
+        # cut after this is measured and are excluded from the slice list it is
+        # measured against, so unchanged context can never inflate coverage.
         RawRequestedSpanCount   = $requested.Count
         DeliveredRawSpanCount   = (Measure-ReviewerSourceCoveredSpans -Spans $requested -Slices @($slices))
-        DeliveredBytes          = $deliveredBytes
+        DeliveredBytes          = ($deliveredBytes + $siblingBytes)
+        DeliveredChangedBytes   = $deliveredBytes
+        DeliveredSiblingBytes   = $siblingBytes
         DroppedForBudget        = $droppedForBudget
         DroppedForSliceCap      = $droppedForSliceCap
         DroppedForUnsafeText    = $droppedForUnsafeText
@@ -871,9 +887,11 @@ function New-ReviewerSourceTransportReport {
     )
     $files = [System.Collections.Generic.List[object]]::new()
     $remainingTotal = [int]$Policy.maxTotalSliceBytes
+    $remainingSibling = [int]$Policy.maxTotalSiblingBytes
     $deliveredFileCount = 0
     $partialFileCount = 0
     $totalBytes = 0
+    $totalSiblingBytes = 0
     $index = 0
     $spanlessProbes = 0
     foreach ($rawPath in @($ChangedPaths)) {
@@ -1026,7 +1044,7 @@ function New-ReviewerSourceTransportReport {
             continue
         }
         $cut = New-ReviewerSourceFileSlices -Text ([string](Get-ReviewerSourceValue -Object $resource -Name "Text" -Default "")) `
-            -Spans $spans -Policy $Policy -RemainingTotalBytes $remainingTotal
+            -Spans $spans -Policy $Policy -RemainingTotalBytes $remainingTotal -RemainingSiblingBytes $remainingSibling
         $deliveredSpanCount = @($cut.Slices).Count
         # Classified on RAW hunks, the same unit the accounting sentence, the
         # coverage record and the docs use. Classifying on merged spans hid a
@@ -1063,8 +1081,13 @@ function New-ReviewerSourceTransportReport {
             -DeliveredRawSpanCount ([int]$cut.DeliveredRawSpanCount) `
             -Slices @($cut.Slices) -SiblingSlices @($cut.SiblingSlices)
         [void]$files.Add($entry)
-        $remainingTotal -= [int]$cut.DeliveredBytes
+        # Only CHANGED bytes draw down the changed-source budget. Sibling
+        # context has its own pool, so unchanged evidence attached to an early
+        # file can never cost a later file the delivery of its actual change.
+        $remainingTotal -= [int]$cut.DeliveredChangedBytes
+        $remainingSibling -= [int]$cut.DeliveredSiblingBytes
         $totalBytes += [int]$cut.DeliveredBytes
+        $totalSiblingBytes += [int]$cut.DeliveredSiblingBytes
         if ($status -eq "delivered") { $deliveredFileCount++ }
         elseif ($status -eq "partial") { $partialFileCount++ }
     }
@@ -1112,6 +1135,7 @@ function New-ReviewerSourceTransportReport {
         DeliveredSpanCount     = $deliveredSpans
         SpanPercent            = $spanPercent
         TotalSliceBytes        = $totalBytes
+        TotalSiblingBytes      = $totalSiblingBytes
         Files                  = @($files)
     }
 }
@@ -1457,6 +1481,7 @@ function ConvertTo-ReviewerSourceCoverageRecord {
         deliveredSpanCount = [int]$Report.DeliveredSpanCount
         spanPercent      = [int]$Report.SpanPercent
         totalSliceBytes  = [int]$Report.TotalSliceBytes
+        totalSiblingBytes = [int]$Report.TotalSiblingBytes
         files            = @(@($Report.Files) | ForEach-Object {
                 [pscustomobject][ordered]@{
                     path               = [string]$_.Path
