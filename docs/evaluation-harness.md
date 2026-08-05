@@ -391,7 +391,15 @@ the requirement that actually governs it:
 | `transcriptionInput.comment.scopes[]` with severity `suggestion` | emitted only when `unattendedSuggestionComments.ok` (and no seed record) |
 | `transcriptionInput.comment.nonQualifying` | `false` only when at least one scope is emitted and **none** was withheld |
 | `transcriptionInput.approval.nonQualifying` | `approvalVote.ok` (and no seed record) |
-| `transcriptionInput.nonQualifying` | conservative rollup: `false` only when **both** sections qualify |
+| `transcriptionInput.nonQualifying` | conservative rollup: `false` only when the comment section is complete, `unattendedImportantCriticalComments.ok`, **and** the approval section qualifies |
+
+The rollup keeps `unattendedImportantCriticalComments` as an explicit term even
+though the comment section already reflects it, because a policy declaring only
+`suggestion` scopes could otherwise reach a complete comment section without
+that requirement ever passing - and the paired recall-regression bound and the
+critical-false-positive vetoes live there. The suggestion requirement carries
+the comparative endpoint too, so a recall regression past the ceiling fails
+both.
 
 A single rollup would read "qualifying" whenever any one requirement passed,
 and layer 6 evaluates comment scopes and the approval block against its own,

@@ -2688,6 +2688,15 @@ function Test-ReviewerEvalRolloutQualification {
             [void]$suggestionReasons.Add("precisionLowerBoundBelowFloor")
         }
     }
+    # The comparative endpoint gates EVERY comment-bearing requirement, not just
+    # the important/critical one. A suggestion-only policy would otherwise be
+    # able to report a qualifying section while the candidate arm's correctness
+    # recall had regressed past the declared ceiling, because the paired bound
+    # lives in requirement 1.
+    if ([int]$Comparison.inventoryCount -le 0 -or -not [bool]$Comparison.denominatorsAgree) {
+        [void]$suggestionReasons.Add("recallDenominatorZero")
+    }
+    if (-not [bool]$Comparison.withinCeiling) { [void]$suggestionReasons.Add("recallRegressionAboveCeiling") }
     $suggestionCodes = @(Get-ReviewerEvalUniqueReasonCodes -Reasons $suggestionReasons.ToArray())
 
     # --- Requirement 3: approval voting --------------------------------------
@@ -2957,10 +2966,16 @@ function New-ReviewerEvalReport {
     $emittedScopes = @()
     foreach ($scope in @($transcriptionScopes.ToArray())) {
         $severity = [string]$scope.severity
-        $governingRequirementPassed = $(
-            if ($script:ReviewerEvalUnattendedCommentSeverities -ccontains $severity) { $commentQualifies }
-            else { $suggestionQualifies }
-        )
+        # Explicit membership on both branches: an unrecognized severity must
+        # fail closed rather than inherit whichever requirement happens to be
+        # last in an else.
+        $governingRequirementPassed = $false
+        if ($script:ReviewerEvalUnattendedCommentSeverities -ccontains $severity) {
+            $governingRequirementPassed = $commentQualifies
+        }
+        elseif ($severity -ceq "suggestion") {
+            $governingRequirementPassed = $suggestionQualifies
+        }
         if ($governingRequirementPassed) { $emittedScopes += , $scope }
     }
     $emittedScopes = @($emittedScopes)
@@ -3025,14 +3040,22 @@ function New-ReviewerEvalReport {
         # nothing. Producing a signed qualification stays a deliberate human
         # act through tools/New-ReviewerGateQualification.ps1.
         #
-        # A section whose own requirement failed emits NO consumable material:
-        # comment.scopes is empty (layer 6 then closes with
-        # qualificationScopeMissing) and every approval count is zeroed with its
-        # bounds nulled (layer 6 then closes on its sample floor). Copying from
-        # a failing section therefore cannot authorize anything even if the
-        # nonQualifying flags are ignored entirely.
+        # Every emitted scope is backed by the requirement governing ITS
+        # severity, and every approval count is zeroed with its bounds nulled
+        # when the approval requirement failed. So material whose governing
+        # requirement failed is simply ABSENT - layer 6 then closes with
+        # qualificationScopeMissing, and on its own approval sample and recall
+        # floors - even if an operator ignores the flags entirely. Note this is
+        # per SCOPE, not per section: a section can legitimately carry backed
+        # important/critical scopes while reporting itself non-qualifying
+        # because a declared suggestion scope was withheld.
         transcriptionInput      = [ordered]@{
-            nonQualifying = (-not ($commentSectionQualifies -and $approvalQualifies))
+            # Strictly no weaker than gating on the important/critical
+            # requirement alone: a policy declaring only suggestion scopes must
+            # not be able to reach a qualifying rollup, since the paired
+            # recall-regression and critical-false-positive vetoes live in that
+            # requirement.
+            nonQualifying = (-not ($commentSectionQualifies -and $commentQualifies -and $approvalQualifies))
             authorizes    = "none"
             corpus        = [ordered]@{
                 name         = [string](Get-ReviewerVerificationValue $Corpus "name" "")

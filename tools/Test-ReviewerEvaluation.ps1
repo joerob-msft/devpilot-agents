@@ -973,6 +973,18 @@ try {
             -ccontains "recallDenominatorZero") "An empty recall denominator was treated as no regression."
     Assert-Eval ((Get-CommentReasons -Qualification (Test-CleanQualification -ComparisonOverrides @{ denominatorsAgree = $false })) `
             -ccontains "recallDenominatorZero") "Mismatched recall denominators were compared anyway."
+    # The comparative endpoint gates the suggestion requirement too, so a
+    # suggestion-only policy cannot dodge it.
+    function Get-SuggestionReasons {
+        param([Parameter(Mandatory)]$Qualification)
+        return @(@($Qualification.requirements | Where-Object { [string]$_.id -ceq "unattendedSuggestionComments" })[0].reasonCodes)
+    }
+    Assert-Eval ((Get-SuggestionReasons -Qualification (Test-CleanQualification -ComparisonOverrides @{ withinCeiling = $false })) `
+            -ccontains "recallRegressionAboveCeiling") `
+        "A recall regression above the ceiling did not veto the suggestion requirement."
+    Assert-Eval ((Get-SuggestionReasons -Qualification (Test-CleanQualification -ComparisonOverrides @{ inventoryCount = 0 })) `
+            -ccontains "recallDenominatorZero") `
+        "An empty recall denominator did not veto the suggestion requirement."
     # Unknown / degraded / missing evidence fails closed.
     Assert-Eval ((Get-CommentReasons -Qualification (Test-CleanQualification -Degraded 1)) -ccontains "evidenceDegraded") `
         "A degraded example did not fail qualification closed."
@@ -1260,7 +1272,17 @@ try {
         "Important/critical scopes were emitted while their own requirement had failed."
     Assert-Eval ([bool]$onlySuggestionPasses.transcriptionInput.comment.nonQualifying) `
         "A comment section missing its important/critical scopes reported itself qualifying."
-    foreach ($mixed in @($commentOnly, $approvalOnly, $bothPass, $bothPassSeeded, $suggestionWithheld, $suggestionEmitted, $onlySuggestionPasses)) {
+    # A suggestion-only scope list must never reach a qualifying rollup: the
+    # paired recall-regression and critical-false-positive vetoes live in the
+    # important/critical requirement, so the rollup keeps it as its own term.
+    $suggestionOnlyScopes = @(, $suggestionScope)
+    $suggestionOnly = New-MixedReport -CommentOk $false -ApprovalOk $true -SuggestionOk $true -Scopes $suggestionOnlyScopes
+    Assert-Eval (@($suggestionOnly.transcriptionInput.comment.scopes).Count -eq 1 -and
+        (-not [bool]$suggestionOnly.transcriptionInput.comment.nonQualifying)) `
+        "A separately qualified suggestion-only scope list was withheld or mis-flagged."
+    Assert-Eval ([bool]$suggestionOnly.transcriptionInput.nonQualifying) `
+        "A suggestion-only scope list reached a qualifying rollup without the important/critical requirement passing."
+    foreach ($mixed in @($commentOnly, $approvalOnly, $bothPass, $bothPassSeeded, $suggestionWithheld, $suggestionEmitted, $onlySuggestionPasses, $suggestionOnly)) {
         Assert-Eval ([bool](Test-Json -Json ($mixed | ConvertTo-Json -Depth 32) -SchemaFile $reportSchemaPath)) `
             "A mixed-result report does not satisfy report.schema.json."
         Assert-Eval ((-not [bool]$mixed.promotable) -and ([string]$mixed.authorizes -ceq "none")) `
