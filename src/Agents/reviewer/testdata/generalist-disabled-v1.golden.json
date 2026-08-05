@@ -60,6 +60,10 @@
       {
         "sha256": "5d302f8573f61798df3e36709dd79ebb67dc9f02970e4780d306d37a211873c2",
         "reason": "Refuse an oversized model input as a bounded pass failure instead of throwing. The throw escaped Invoke-ReviewerPullRequest and the cycle's own catch then abandoned every pull request queued behind it, so one unusually large change set ended the cycle for all of them."
+      },
+      {
+        "sha256": "497a364dba1f77dedecb46be80743ce69146fd9cf15f5d2de7e46ac4d371a1b1",
+        "reason": "Mark that oversized-input refusal an environment fault. The stdin size is deterministic for a commit, so counting it as the pull request's own failure retired the pull request from review after a few identical cycles - permanently and silently, for a wrapper budget the pull request cannot influence."
       }
     ],
     "Invoke-ReviewerPullRequest": [

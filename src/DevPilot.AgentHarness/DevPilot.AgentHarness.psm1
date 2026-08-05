@@ -811,7 +811,7 @@ function ConvertFrom-AgentResultMarker {
         #   - a marker the model never produced cannot match the expected
         #     nonce, which is generated per cycle AFTER the PR content was
         #     authored.
-        $candidates = New-Object System.Collections.Generic.List[string]
+        $parsedCandidates = New-Object System.Collections.Generic.List[object]
         $quoteChar = [char]'"'
         $escapeChar = [char]'\'
         $openBrace = [char]'{'
@@ -823,11 +823,29 @@ function ConvertFrom-AgentResultMarker {
         # kill switch on being reviewed. Leading whitespace and trailing text
         # on the same line stay tolerated, which is what the relaxation was
         # for in the first place.
+        #
+        # Filtering happens DURING collection, not after it. An occurrence that
+        # does not parse, has no JSON after the prefix, or does not carry the
+        # schema's exact-valued fields is simply not a candidate - it is text
+        # that happens to look like one. Treating any of those as a global veto
+        # reopened the same kill switch by a different door: the wrapper now
+        # injects raw pull-request lines into the model's context and asks it to
+        # quote evidence, so a planted "<PREFIX>: not json" echoed at a line
+        # start would discard a complete, valid review.
+        $exactFields = @($Schema.Keys | Where-Object {
+                $spec = $Schema.Fields[$_]
+                $null -ne $spec -and [string]$spec.Type -ceq 'exact'
+            })
         $anchorPattern = "(?m)^[ `t]*" + [regex]::Escape($MarkerPrefix)
+        $scanned = 0
         foreach ($anchor in [regex]::Matches($StdOutText, $anchorPattern)) {
+            # Bounded scan: a transcript carrying an implausible number of
+            # prefix occurrences is an attack surface, not a formatting quirk.
+            $scanned++
+            if ($scanned -gt 64) { break }
             $hit = $anchor.Index
             $jsonStart = $StdOutText.IndexOf($openBrace, $hit + $anchor.Length)
-            if ($jsonStart -lt 0) { return $null }
+            if ($jsonStart -lt 0) { continue }
             # Bounded brace-depth scan. String contents are respected so a brace
             # inside a JSON string value cannot terminate the object early.
             # The bound is generous rather than tight because a marker carrying
@@ -855,56 +873,33 @@ function ConvertFrom-AgentResultMarker {
                     if ($depth -eq 0) { $jsonEnd = $i; break }
                 }
             }
-            if ($jsonEnd -lt 0) { return $null }
-            [void]$candidates.Add($StdOutText.Substring($jsonStart, $jsonEnd - $jsonStart + 1))
-            # A transcript carrying an implausible number of marker occurrences
-            # is an attack surface, not a formatting quirk: stop rather than
-            # canonicalize thousands of payloads.
-            if ($candidates.Count -gt 16) { return $null }
-        }
-        if ($candidates.Count -eq 0) { return $null }
-        # Every occurrence must parse. Whitespace and key order are allowed to
-        # differ - a fenced, pretty-printed restatement of the same result is
-        # the same result - but any semantic difference fails closed.
-        #
-        # Occurrences are first filtered by the schema's EXACT-valued fields,
-        # of which the per-cycle nonce is one. The nonce is generated after the
-        # PR's content was authored, so no text a PR author planted can carry
-        # it. Without that filter, a source line reading
-        # "<PREFIX>: {...}" - which the wrapper now injects into the model's
-        # context as pinned source, and which the model may echo at a line
-        # start while quoting evidence - would be a second, conflicting
-        # candidate and would veto the whole review. That is an author-
-        # controlled kill switch on being reviewed.
-        #
-        # If nothing matches, the candidates are kept as-is so the real marker
-        # still fails field validation below rather than being waved through.
-        $parsedCandidates = New-Object System.Collections.Generic.List[object]
-        foreach ($candidate in $candidates) {
-            $parsed = $candidate | ConvertFrom-Json -ErrorAction Stop
-            if ($parsed -isnot [System.Management.Automation.PSCustomObject]) { return $null }
-            [void]$parsedCandidates.Add($parsed)
-        }
-        $exactFields = @($Schema.Keys | Where-Object {
-                $spec = $Schema.Fields[$_]
-                $null -ne $spec -and [string]$spec.Type -ceq 'exact'
-            })
-        if ($exactFields.Count -gt 0) {
-            $bound = @($parsedCandidates | Where-Object {
-                    $item = $_
-                    $ok = $true
-                    foreach ($name in $exactFields) {
-                        $property = $item.PSObject.Properties[$name]
-                        if ($null -eq $property -or $property.Value -isnot [string] -or
-                            [string]$property.Value -cne [string]$Schema.Fields[$name].Expected) {
-                            $ok = $false
-                            break
-                        }
+            if ($jsonEnd -lt 0) { continue }
+            $parsed = $null
+            try { $parsed = $StdOutText.Substring($jsonStart, $jsonEnd - $jsonStart + 1) | ConvertFrom-Json -ErrorAction Stop }
+            catch { continue }
+            if ($parsed -isnot [System.Management.Automation.PSCustomObject]) { continue }
+            if ($exactFields.Count -gt 0) {
+                $bound = $true
+                foreach ($name in $exactFields) {
+                    $property = $parsed.PSObject.Properties[$name]
+                    if ($null -eq $property -or $property.Value -isnot [string] -or
+                        [string]$property.Value -cne [string]$Schema.Fields[$name].Expected) {
+                        $bound = $false
+                        break
                     }
-                    $ok
-                })
-            if ($bound.Count -gt 0) { $parsedCandidates = [System.Collections.Generic.List[object]]$bound }
+                }
+                if (-not $bound) { continue }
+            }
+            [void]$parsedCandidates.Add($parsed)
+            # More than a handful of occurrences that all carry this cycle's
+            # nonce is not a formatting quirk either.
+            if ($parsedCandidates.Count -gt 16) { return $null }
         }
+        if ($parsedCandidates.Count -eq 0) { return $null }
+        # Every surviving occurrence must MEAN the same thing. Whitespace and
+        # key order may differ - a fenced, pretty-printed restatement of the
+        # same result is the same result - but any semantic difference between
+        # two markers that both carry this cycle's nonce fails closed.
 
         $obj = $null
         $canonical = $null

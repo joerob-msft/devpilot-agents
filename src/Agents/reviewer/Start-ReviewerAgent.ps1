@@ -9107,7 +9107,12 @@ function Invoke-ReviewerModelPass {
             result = "oversize"; model = $PassModel; pass = $PassNumber; stdinBytes = $stdinBytes
             limitBytes = $script:ReviewerMaxModelInputBytes
         }
-        return @{ Model = $PassModel; Marker = $null; Reason = $oversizeReason; EnvironmentFault = $false }
+        # Flagged as an environment fault so it does NOT consume the PR's
+        # starvation budget. The stdin size is deterministic for a given commit,
+        # so counting it as the PR's own failure would retire the PR from review
+        # after a few identical cycles - permanently, silently, and for a
+        # wrapper budget the pull request cannot influence.
+        return @{ Model = $PassModel; Marker = $null; Reason = $oversizeReason; EnvironmentFault = $true }
     }
 
     # -- Launch the model -----------------------------------------------------

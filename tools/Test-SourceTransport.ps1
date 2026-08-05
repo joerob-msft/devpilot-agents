@@ -809,10 +809,12 @@ function New-ChangeEntry {
     }
 }
 $deleteBlock = [pscustomobject]@{ changeType = 2; modifiedLineNumberStart = 0; modifiedLinesCount = 0 }
+$contextBlock = [pscustomobject]@{ changeType = 0; modifiedLineNumberStart = 1; modifiedLinesCount = 4 }
 $addBlock = [pscustomobject]@{ changeType = 1; modifiedLineNumberStart = 5; modifiedLinesCount = 3 }
 
 $zeroSpanShapes = @(
     @{ Name = "a delete-only change set"; Response = [pscustomobject]@{ changes = @((New-ChangeEntry -Path '/src/gone.cs' -Blocks @($deleteBlock))) } },
+    @{ Name = "a delete surrounded by context blocks"; Response = [pscustomobject]@{ changes = @((New-ChangeEntry -Path '/src/deadcode.cs' -Blocks @($contextBlock, $deleteBlock, ([pscustomobject]@{ changeType = 0; modifiedLineNumberStart = 5; modifiedLinesCount = 6 })))) } },
     @{ Name = "a rename-only change set"; Response = [pscustomobject]@{ changes = @((New-ChangeEntry -Path '/src/renamed.cs')) } },
     @{ Name = "a binary change with no line blocks"; Response = [pscustomobject]@{ changes = @((New-ChangeEntry -Path '/src/logo.png')) } },
     @{ Name = "an empty added file"; Response = [pscustomobject]@{ changes = @([pscustomobject]@{ item = [pscustomobject]@{ path = '/src/empty.cs'; isFolder = $false } }) } }
@@ -866,6 +868,36 @@ Assert-Source (Test-Throws {
     }) "right-hand blocks present with no extracted span is still a mis-parse"
 Assert-Source ((Measure-ReviewerSourceRightHandBlocks -Response ([pscustomobject]@{ weird = [pscustomobject]@{ nested = @($addBlock) } })) -eq 1) `
     "the permissive scan finds right-hand blocks the structured walk would miss"
+Assert-Source ((Measure-ReviewerSourceRightHandBlocks -Response ([pscustomobject]@{ changes = @($contextBlock, $contextBlock) })) -eq 0) `
+    "a context block is not counted as a right-hand block, however permissive the scan"
+Assert-Source ((Measure-ReviewerSourceRightHandBlocks -Response ([pscustomobject]@{ changes = @([pscustomobject]@{ changeType = 3; modifiedLineNumberStart = 2; modifiedLinesCount = 1 }) })) -eq 1) `
+    "an edit block is counted"
+
+# A file whose hunk runs past the pinned file's last line must not read as
+# fully delivered: the clamp drops it before the merge, so classifying on
+# merged spans reported `delivered` while the accounting sentence said 1 of 2.
+$shortText = New-TestFileText -LineCount 10
+$outsideCut = New-ReviewerSourceFileSlices -Text $shortText -Spans @(@{ Start = 2; End = 3 }, @{ Start = 9; End = 14 }) `
+    -Policy (New-TestPolicy -Overrides @{ contextRadiusLines = 0 }) -RemainingTotalBytes 4096
+Assert-Source ([int]$outsideCut.RawRequestedSpanCount -eq 2 -and [int]$outsideCut.DeliveredRawSpanCount -eq 1) `
+    "a hunk running past the end of the pinned file does not count as delivered"
+$outsideReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @('/src/short.cs') `
+    -SpansByPath ([ordered]@{ '/src/short.cs' = @(@{ Start = 2; End = 3 }, @{ Start = 9; End = 14 }) }) `
+    -Policy (New-TestPolicy -Overrides @{ contextRadiusLines = 0 }) -Reader {
+    param([string]$Path)
+    [pscustomobject]@{
+        Text = $shortText; MimeType = 'text/plain'
+        ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($shortText)
+        Sha256 = Get-ReviewerSourceSha256 -Text $shortText
+    }
+}
+$outsideEntry = @($outsideReport.Files)[0]
+Assert-Source (([string]$outsideEntry.Status) -ceq 'partial') `
+    "a file with an out-of-file hunk is reported partial, not delivered"
+Assert-Source (([string]$outsideEntry.Reason) -ceq 'spanOutsideFile') `
+    "its reason names the out-of-file hunk rather than a budget"
+Assert-Source ([int]$outsideReport.SpanPercent -eq 50) `
+    "the file status and the span percentage now speak the same unit"
 
 # ---------------------------------------------------------------------------
 Write-Host "[15/15] Span coverage is measured raw-hunk on raw-hunk" -ForegroundColor Cyan
@@ -1028,8 +1060,10 @@ Write-Host "[17/17] One pull request cannot end the cycle" -ForegroundColor Cyan
 $passText = Get-FunctionTextFromWrapper -Name 'Invoke-ReviewerModelPass'
 Assert-Source ($passText -notmatch 'throw "Reviewer model input is') `
     "an oversized model input is no longer thrown out of the pass"
-Assert-Source ($passText -match 'above the code-defined \$script:ReviewerMaxModelInputBytes-byte bound[\s\S]{0,600}?return @\{ Model') `
+Assert-Source ($passText -match 'above the code-defined \$script:ReviewerMaxModelInputBytes-byte bound[\s\S]{0,900}?return @\{ Model') `
     "an oversized model input returns a bounded pass failure instead"
+Assert-Source ($passText -match 'limitBytes = \$script:ReviewerMaxModelInputBytes[\s\S]{0,700}?EnvironmentFault = \$true') `
+    "an oversized model input is an environment fault, so a wrapper budget cannot starve the pull request"
 Assert-Source ($cycleText -match 'try \{[\s\S]{0,400}?Invoke-ReviewerPullRequest -Session[\s\S]{0,600}?catch') `
     "the per-pull-request review is isolated so one failure cannot end the cycle"
 Assert-Source ($cycleText -match 'isolatedFailure') `

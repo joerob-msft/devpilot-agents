@@ -751,28 +751,34 @@ Assert-Specialist ($prompt -match 'adoption-dependent annotations or metadata' -
     $prompt -match 'missingSiblingEvidence') `
     "The specialist prompt no longer suppresses unestablished metadata conventions through sibling evidence."
 
+function Get-ReviewerAuthorizedHashes {
+    <# The acceptance rule itself, so a test can assert on it rather than on the
+       source file. History is kept for audit; only the current authorized state
+       is accepted, or a change could be reverted to an earlier authorized shape
+       and still pass. #>
+    param([Parameter(Mandatory)]$Golden, [Parameter(Mandatory)][string]$Name)
+    $baseline = @([string]$Golden.functions.PSObject.Properties[$Name].Value)
+    $delta = $Golden.authorizedFunctionDeltas.PSObject.Properties[$Name]
+    if (-not $delta) { return $baseline }
+    $history = @($delta.Value)
+    if ($history.Count -eq 0) { return $baseline }
+    return @([string]$history[$history.Count - 1].sha256)
+}
+
 foreach ($property in $golden.functions.PSObject.Properties) {
     $actualText = Get-FunctionText -Text $wrapperText -Name $property.Name
     $actualText = $actualText.Replace("`r`n", "`n").Replace("`r", "`n")
     $actualHash = Get-ReviewerConventionSpecialistSha256 -Text $actualText
-    # History is kept for audit, but only the CURRENT authorized state is
-    # accepted. Accepting every historical hash would let a change be reverted
-    # to an earlier authorized shape - dropping, say, the source-coverage
-    # wiring - and still pass, which is the opposite of what a drift pin is for.
-    $allowedHashes = @([string]$property.Value)
     $authorizedDelta = $golden.authorizedFunctionDeltas.PSObject.Properties[$property.Name]
     if ($authorizedDelta) {
-        $deltaHistory = @($authorizedDelta.Value)
-        foreach ($delta in $deltaHistory) {
+        foreach ($delta in @($authorizedDelta.Value)) {
             $deltaHash = [string]$delta.sha256
             $deltaReason = [string]$delta.reason
             Assert-Specialist ($deltaHash -match '^[0-9a-f]{64}$' -and $deltaReason.Length -ge 24) `
                 "An authorized generalist delta for '$($property.Name)' must carry an exact hash and a stated reason."
         }
-        if ($deltaHistory.Count -gt 0) {
-            $allowedHashes = @([string]$deltaHistory[$deltaHistory.Count - 1].sha256)
-        }
     }
+    $allowedHashes = Get-ReviewerAuthorizedHashes -Golden $golden -Name $property.Name
     Assert-Specialist ($allowedHashes -ccontains $actualHash) `
         "Disabled-path golden changed without authorization for generalist function '$($property.Name)' from base $($golden.baseCommit)."
 }
@@ -794,19 +800,28 @@ if ($golden.PSObject.Properties['authorizedPromptDeltas']) {
 }
 Assert-Specialist ($allowedPromptHashes -ccontains (Get-ReviewerConventionSpecialistSha256 -Text $generalistPrompt)) `
     "Disabled-path golden changed for the generalist prompt."
-# A drift pin that accepts an older authorized hash is not a pin. Prove the
-# newest is the ONLY accepted value by checking a superseded one is refused.
+# A drift pin that accepts an older authorized hash is not a pin. Assert on the
+# ACCEPTANCE RULE, not on the source file: checking that the current function
+# text differs from a superseded hash would pass just as happily with the pin
+# removed, because it never consults the rule at all.
 foreach ($property in $golden.authorizedFunctionDeltas.PSObject.Properties) {
     $deltaHistory = @($property.Value)
     if ($deltaHistory.Count -lt 2) { continue }
     $supersededHash = [string]$deltaHistory[0].sha256
     $currentHash = [string]$deltaHistory[$deltaHistory.Count - 1].sha256
+    $accepted = Get-ReviewerAuthorizedHashes -Golden $golden -Name $property.Name
     Assert-Specialist ($supersededHash -cne $currentHash) `
         "A superseded authorized hash for '$($property.Name)' must differ from the current one."
-    $currentText = (Get-FunctionText -Text $wrapperText -Name $property.Name).Replace("`r`n", "`n").Replace("`r", "`n")
-    Assert-Specialist ((Get-ReviewerConventionSpecialistSha256 -Text $currentText) -cne $supersededHash) `
-        "Reverting '$($property.Name)' to a superseded authorized hash must not pass the drift pin."
+    Assert-Specialist ($accepted -ccontains $currentHash) `
+        "The current authorized hash for '$($property.Name)' is accepted."
+    Assert-Specialist (-not ($accepted -ccontains $supersededHash)) `
+        "A superseded authorized hash for '$($property.Name)' is REFUSED, so a revert cannot pass the drift pin."
+    Assert-Specialist (-not ($accepted -ccontains [string]$golden.functions.PSObject.Properties[$property.Name].Value)) `
+        "The pre-delta baseline hash for '$($property.Name)' is refused once a delta supersedes it."
 }
+$prPinned = $null -ne $golden.functions.PSObject.Properties['Invoke-ReviewerPullRequest']
+Assert-Specialist $prPinned `
+    "Invoke-ReviewerPullRequest is pinned, so the source-coverage call site cannot be dropped quietly."
 
 $pullRequestFunction = Get-FunctionText -Text $wrapperText -Name "Invoke-ReviewerPullRequest"
 $deliveryAt = $pullRequestFunction.IndexOf("Invoke-ReviewerDelivery", [StringComparison]::Ordinal)
@@ -888,8 +903,13 @@ $adversarialCases = @(
     @{ Name = "a marker missing a required key"; Ok = $false; Text = "$markerPrefix {`"schemaVersion`":1,`"prId`":42}" },
     @{ Name = "fenced JSON with no marker prefix at all"; Ok = $false; Text = "``````json`n{`"schemaVersion`":1,`"prId`":42,`"nonce`":`"NONCE1`"}`n``````" },
     @{ Name = "a marker whose payload is an array"; Ok = $false; Text = "$markerPrefix [{`"schemaVersion`":1}]" },
-    @{ Name = "no output at all"; Ok = $false; Text = "" }
+    @{ Name = "no output at all"; Ok = $false; Text = "   " },
+    @{ Name = "a planted marker whose payload is not JSON"; Ok = $true; Text = "$markerPrefix {oops not json}`n$compactMarker" },
+    @{ Name = "a planted prefix line with no JSON at all"; Ok = $true; Text = "$markerPrefix see above`n$compactMarker" },
+    @{ Name = "a planted unterminated payload"; Ok = $true; Text = "$markerPrefix {`"schemaVersion`":1`n$compactMarker" }
 )
+$floodPlant = ((1..20 | ForEach-Object { "$markerPrefix {oops $_}" }) -join "`n")
+$adversarialCases += @{ Name = "a flood of planted non-markers before the real one"; Ok = $true; Text = "$floodPlant`n$compactMarker" }
 foreach ($case in $adversarialCases) {
     $parsed = ConvertFrom-AgentResultMarker -StdOutText ([string]$case.Text) -MarkerPrefix $markerPrefix -Schema $markerSchema
     if ([bool]$case.Ok) {

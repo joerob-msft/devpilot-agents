@@ -374,7 +374,11 @@ function New-ReviewerSourceFileSlices {
     )
     $lines = Split-ReviewerSourceLines -Text $Text
     $requested = @($Spans)
-    $outsideFile = @($requested | Where-Object { [int]$_.Start -gt $lines.Count }).Count
+    # A hunk the pinned file cannot contain - because it starts past the last
+    # line, or runs past it - is out of file, not over budget. Counting only
+    # the wholly-past-the-end case left a partially-clamped hunk reported as a
+    # budget problem, which points an operator at the wrong lever.
+    $outsideFile = @($requested | Where-Object { [int]$_.Start -gt $lines.Count -or [int]$_.End -gt $lines.Count }).Count
     $merged = @(Merge-ReviewerSourceSpans -Spans $requested -ContextRadiusLines ([int]$Policy.contextRadiusLines) -LineCount $lines.Count)
     $slices = [System.Collections.Generic.List[object]]::new()
     $deliveredBytes = 0
@@ -521,7 +525,18 @@ function Measure-ReviewerSourceRightHandBlocks {
             $lineCount = Get-ReviewerSourceValue -Object $node -Name "modifiedLinesCount"
             if (($start -is [int] -or $start -is [long]) -and ($lineCount -is [int] -or $lineCount -is [long]) -and
                 [int]$start -ge 1 -and [int]$lineCount -ge 1) {
-                $count++
+                # A context block carries a full right-hand range too, so
+                # counting on the line fields alone would call every ordinary
+                # delete-only change set a mis-parse - the exact failure this
+                # scan exists to stop misreporting. Admissibility must match
+                # the structured extractor's: add and edit only. A block with
+                # no changeType at all is admitted, because the scan's job is
+                # to be permissive about SHAPE, not about meaning.
+                $changeType = Get-ReviewerSourceValue -Object $node -Name "changeType"
+                $admissible = if ($null -eq $changeType) { $true }
+                elseif ($changeType -is [int] -or $changeType -is [long]) { [int]$changeType -eq 1 -or [int]$changeType -eq 3 }
+                else { $false }
+                if ($admissible) { $count++ }
             }
             $children = if ($node -is [System.Collections.IDictionary]) { @($node.Values) }
             else { @($node.PSObject.Properties | ForEach-Object { $_.Value }) }
@@ -765,15 +780,22 @@ function New-ReviewerSourceTransportReport {
         $cut = New-ReviewerSourceFileSlices -Text ([string](Get-ReviewerSourceValue -Object $resource -Name "Text" -Default "")) `
             -Spans $spans -Policy $Policy -RemainingTotalBytes $remainingTotal
         $deliveredSpanCount = @($cut.Slices).Count
-        $status = if ($deliveredSpanCount -eq 0) { "omitted" }
-        elseif ($deliveredSpanCount -lt [int]$cut.RequestedSpanCount) { "partial" }
+        # Classified on RAW hunks, the same unit the accounting sentence, the
+        # coverage record and the docs use. Classifying on merged spans hid a
+        # hunk that ran past the pinned file's last line: the clamp dropped it
+        # before the merge, so the file reported `delivered` while the sentence
+        # directly above the table said 1 of 2 hunks.
+        $rawRequested = [int]$cut.RawRequestedSpanCount
+        $rawDelivered = [int]$cut.DeliveredRawSpanCount
+        $status = if ($rawDelivered -eq 0) { "omitted" }
+        elseif ($rawDelivered -lt $rawRequested) { "partial" }
         else { "delivered" }
         # Three different causes used to collapse into one reason code, which
         # left the accounting unable to explain itself. Report the dominant
         # cause instead, in the order that matters to a reader.
         $reason = ""
         if ($status -ne "delivered") {
-            $reason = if ([int]$cut.SpansOutsideFile -gt 0 -and $deliveredSpanCount -eq 0) { "spanOutsideFile" }
+            $reason = if ([int]$cut.SpansOutsideFile -gt 0) { "spanOutsideFile" }
             elseif ([int]$cut.DroppedForUnsafeText -gt 0 -and [int]$cut.DroppedForBudget -eq 0 -and [int]$cut.DroppedForSliceCap -eq 0) { "unsafeSliceText" }
             elseif ([int]$cut.DroppedForBudget -gt 0) { "budgetExhausted" }
             elseif ([int]$cut.DroppedForSliceCap -gt 0) { "sliceCountCapExceeded" }
