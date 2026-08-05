@@ -98,12 +98,22 @@ jobs:
               @{ Name = 'approval vote'; Args = @('-EnableFindingComments', '-EnableApprovalVote') },
               @{ Name = 'promotion'; Args = @('-PromotePreview', 'not-needed.json') }
           )
-          foreach ($case in $blocked) {
-              $caseArgs = [string[]]$case.Args
-              $output = & pwsh @common @caseArgs 2>&1 | Out-String
-              if ($LASTEXITCODE -eq 0 -or $output -notmatch 'discovery-only') {
-                  throw "Two-pass $($case.Name) did not fail closed at startup: $output"
+          $nativePreference = $PSNativeCommandUseErrorActionPreference
+          try {
+              # These child processes are expected to exit nonzero. Inspect that
+              # status explicitly instead of letting the runner turn the first
+              # expected rejection into a step-level NativeCommandError.
+              $PSNativeCommandUseErrorActionPreference = $false
+              foreach ($case in $blocked) {
+                  $caseArgs = [string[]]$case.Args
+                  $output = & pwsh @common @caseArgs 2>&1 | Out-String
+                  if ($LASTEXITCODE -eq 0 -or $output -notmatch 'discovery-only') {
+                      throw "Two-pass $($case.Name) did not fail closed at startup: $output"
+                  }
               }
+          }
+          finally {
+              $PSNativeCommandUseErrorActionPreference = $nativePreference
           }
 
       # Provider normalization, asserted against a fixture captured from a real
