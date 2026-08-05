@@ -1,0 +1,393 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:devpilot:reviewer:evaluation-report:v1",
+  "title": "DevPilot reviewer evaluation report v1",
+  "description": "Computed metrics, executable rollout qualification, and machine-readable deficit state. This artifact authorizes nothing: it is sealed under an evaluation-only HMAC domain, carries a 'kind', and is therefore rejected by both reviewer promotion paths. 'transcriptionInput' mirrors the layer-6 qualification shape so an operator transcribes rather than reshapes; producing a signed qualification remains a deliberate human act through tools/New-ReviewerGateQualification.ps1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "artifactVersion",
+    "schemaVersion",
+    "reportVersion",
+    "generatedAtEpochSeconds",
+    "toolBinding",
+    "corpusBinding",
+    "derivationSha256",
+    "observationsSha256",
+    "corpusPopulation",
+    "adjudicationQuality",
+    "arms",
+    "comparison",
+    "qualification",
+    "transcriptionInput",
+    "promotable",
+    "authorizes"
+  ],
+  "properties": {
+    "kind": { "const": "reviewer-evaluation-report" },
+    "artifactVersion": { "const": 1 },
+    "schemaVersion": { "const": 1 },
+    "reportVersion": { "type": "integer", "minimum": 1 },
+    "generatedAtEpochSeconds": { "$ref": "#/$defs/epochSeconds" },
+    "toolBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evaluationLibrarySha256",
+        "harnessToolSha256",
+        "importToolSha256",
+        "evaluationPolicySha256",
+        "corpusSchemaSha256",
+        "runSchemaSha256",
+        "adjudicationSchemaSha256",
+        "reportSchemaSha256",
+        "evaluationToolSha256"
+      ],
+      "properties": {
+        "evaluationLibrarySha256": { "$ref": "#/$defs/sha256" },
+        "harnessToolSha256": { "$ref": "#/$defs/sha256" },
+        "importToolSha256": { "$ref": "#/$defs/sha256" },
+        "evaluationPolicySha256": { "$ref": "#/$defs/sha256" },
+        "corpusSchemaSha256": { "$ref": "#/$defs/sha256" },
+        "runSchemaSha256": { "$ref": "#/$defs/sha256" },
+        "adjudicationSchemaSha256": { "$ref": "#/$defs/sha256" },
+        "reportSchemaSha256": { "$ref": "#/$defs/sha256" },
+        "evaluationToolSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "corpusBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "corpusVersion", "corpusSha256", "exampleCount"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "corpusVersion": { "type": "integer", "minimum": 0 },
+        "corpusSha256": { "$ref": "#/$defs/sha256" },
+        "exampleCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "derivationSha256": { "$ref": "#/$defs/sha256" },
+    "observationsSha256": { "$ref": "#/$defs/sha256" },
+    "corpusPopulation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "totalExamples",
+        "qualifyingExamples",
+        "seedExamples",
+        "calibrationExamples",
+        "holdoutExamples",
+        "byStratum",
+        "required",
+        "deficits"
+      ],
+      "properties": {
+        "totalExamples": { "type": "integer", "minimum": 0 },
+        "qualifyingExamples": { "type": "integer", "minimum": 0 },
+        "seedExamples": { "type": "integer", "minimum": 0 },
+        "calibrationExamples": { "type": "integer", "minimum": 0 },
+        "holdoutExamples": { "type": "integer", "minimum": 0 },
+        "byStratum": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["stratum", "total", "calibration", "holdout"],
+            "properties": {
+              "stratum": { "type": "string", "minLength": 1 },
+              "total": { "type": "integer", "minimum": 0 },
+              "calibration": { "type": "integer", "minimum": 0 },
+              "holdout": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        "required": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["minExamples", "minCalibrationExamples", "minHoldoutExamples", "minPerStratumExamples"],
+          "properties": {
+            "minExamples": { "type": "integer", "minimum": 0 },
+            "minCalibrationExamples": { "type": "integer", "minimum": 0 },
+            "minHoldoutExamples": { "type": "integer", "minimum": 0 },
+            "minPerStratumExamples": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "deficits": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "adjudicationQuality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "presentedClaims",
+        "resolvedClaims",
+        "abstainedClaims",
+        "disputedClaims",
+        "coverage",
+        "disagreementRate",
+        "fleissKappa",
+        "floors"
+      ],
+      "properties": {
+        "presentedClaims": { "type": "integer", "minimum": 0 },
+        "resolvedClaims": { "type": "integer", "minimum": 0 },
+        "abstainedClaims": { "type": "integer", "minimum": 0 },
+        "disputedClaims": { "type": "integer", "minimum": 0 },
+        "coverage": { "$ref": "#/$defs/nullableFraction" },
+        "disagreementRate": { "$ref": "#/$defs/nullableFraction" },
+        "fleissKappa": { "type": ["number", "null"] },
+        "floors": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["minAdjudicationCoverage", "minLabelAgreementKappa"],
+          "properties": {
+            "minAdjudicationCoverage": { "type": "number", "minimum": 0, "maximum": 1 },
+            "minLabelAgreementKappa": { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        }
+      }
+    },
+    "arms": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "arm", "partition", "completeExamples", "degradedExamples", "unknownExamples",
+          "missingExamples", "rawClaims", "rawResolvedClaims", "rawTruePositives",
+          "rawFalsePositives", "rawPrecision", "uniqueClaims", "uniqueResolvedClaims",
+          "uniqueTruePositives", "uniqueFalsePositives", "uniqueClaimPrecision",
+          "duplicateClaims", "duplicateRate", "severityComparableClaims",
+          "severityAccurateClaims", "severityAccuracy", "inventoryItems", "inventoryMatched",
+          "inventoryCorrectnessItems", "inventoryCorrectnessMatched", "correctnessRecall",
+          "inventoryConventionItems", "inventoryConventionMatched", "conventionRecall",
+          "issueClassRecall", "eligibleUnattendedFindings", "eligibleTruePositives",
+          "eligibleFalsePositives", "eligiblePrecision", "criticalAdjudicatedClaims",
+          "criticalFalsePositives", "voteDecisions", "voteCorrect", "voteAccuracy",
+          "wouldApproveCount", "falseApprovalCount", "shouldApproveDecisions",
+          "approveCorrectDecisions", "approvalRecall", "latencyMsMedian", "latencyMsP95",
+          "latencyMsTotal", "inputTokens", "outputTokens", "costMicroUsd"
+        ],
+        "properties": {
+          "arm": { "enum": ["generalistOnly", "multiPassDiscovery", "verified"] },
+          "partition": { "enum": ["calibration", "holdout", "all"] },
+          "completeExamples": { "$ref": "#/$defs/count" },
+          "degradedExamples": { "$ref": "#/$defs/count" },
+          "unknownExamples": { "$ref": "#/$defs/count" },
+          "missingExamples": { "$ref": "#/$defs/count" },
+          "rawClaims": { "$ref": "#/$defs/count" },
+          "rawResolvedClaims": { "$ref": "#/$defs/count" },
+          "rawTruePositives": { "$ref": "#/$defs/count" },
+          "rawFalsePositives": { "$ref": "#/$defs/count" },
+          "rawPrecision": { "$ref": "#/$defs/nullableFraction" },
+          "uniqueClaims": { "$ref": "#/$defs/count" },
+          "uniqueResolvedClaims": { "$ref": "#/$defs/count" },
+          "uniqueTruePositives": { "$ref": "#/$defs/count" },
+          "uniqueFalsePositives": { "$ref": "#/$defs/count" },
+          "uniqueClaimPrecision": { "$ref": "#/$defs/nullableFraction" },
+          "duplicateClaims": { "$ref": "#/$defs/count" },
+          "duplicateRate": { "$ref": "#/$defs/nullableFraction" },
+          "severityComparableClaims": { "$ref": "#/$defs/count" },
+          "severityAccurateClaims": { "$ref": "#/$defs/count" },
+          "severityAccuracy": { "$ref": "#/$defs/nullableFraction" },
+          "inventoryItems": { "$ref": "#/$defs/count" },
+          "inventoryMatched": { "$ref": "#/$defs/count" },
+          "inventoryCorrectnessItems": { "$ref": "#/$defs/count" },
+          "inventoryCorrectnessMatched": { "$ref": "#/$defs/count" },
+          "correctnessRecall": { "$ref": "#/$defs/nullableFraction" },
+          "inventoryConventionItems": { "$ref": "#/$defs/count" },
+          "inventoryConventionMatched": { "$ref": "#/$defs/count" },
+          "conventionRecall": { "$ref": "#/$defs/nullableFraction" },
+          "issueClassRecall": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["issueClass", "matched", "total", "recall"],
+              "properties": {
+                "issueClass": { "type": "string", "minLength": 1 },
+                "matched": { "$ref": "#/$defs/count" },
+                "total": { "$ref": "#/$defs/count" },
+                "recall": { "$ref": "#/$defs/nullableFraction" }
+              }
+            }
+          },
+          "eligibleUnattendedFindings": { "$ref": "#/$defs/count" },
+          "eligibleTruePositives": { "$ref": "#/$defs/count" },
+          "eligibleFalsePositives": { "$ref": "#/$defs/count" },
+          "eligiblePrecision": { "$ref": "#/$defs/nullableFraction" },
+          "criticalAdjudicatedClaims": { "$ref": "#/$defs/count" },
+          "criticalFalsePositives": { "$ref": "#/$defs/count" },
+          "voteDecisions": { "$ref": "#/$defs/count" },
+          "voteCorrect": { "$ref": "#/$defs/count" },
+          "voteAccuracy": { "$ref": "#/$defs/nullableFraction" },
+          "wouldApproveCount": { "$ref": "#/$defs/count" },
+          "falseApprovalCount": { "$ref": "#/$defs/count" },
+          "shouldApproveDecisions": { "$ref": "#/$defs/count" },
+          "approveCorrectDecisions": { "$ref": "#/$defs/count" },
+          "approvalRecall": { "$ref": "#/$defs/nullableFraction" },
+          "latencyMsMedian": { "type": ["number", "null"], "minimum": 0 },
+          "latencyMsP95": { "type": ["number", "null"], "minimum": 0 },
+          "latencyMsTotal": { "type": "integer", "minimum": 0 },
+          "inputTokens": { "type": "integer", "minimum": 0 },
+          "outputTokens": { "type": "integer", "minimum": 0 },
+          "costMicroUsd": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "comparison": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "primaryEndpoint",
+        "inventoryCount",
+        "denominatorsAgree",
+        "baselineOnly",
+        "candidateOnly",
+        "discordantPairs",
+        "regressionPointEstimate",
+        "regressionUpperBound95",
+        "withinCeiling"
+      ],
+      "properties": {
+        "primaryEndpoint": { "type": "string", "minLength": 1 },
+        "inventoryCount": { "type": "integer", "minimum": 0 },
+        "denominatorsAgree": { "type": "boolean" },
+        "baselineOnly": { "type": "integer", "minimum": 0 },
+        "candidateOnly": { "type": "integer", "minimum": 0 },
+        "discordantPairs": { "type": "integer", "minimum": 0 },
+        "regressionPointEstimate": { "type": ["number", "null"] },
+        "regressionUpperBound95": { "type": ["number", "null"] },
+        "withinCeiling": { "type": "boolean" }
+      }
+    },
+    "qualification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "boundMethod",
+        "alphaNumerator",
+        "alphaDenominator",
+        "scopeCount",
+        "globalVetoes",
+        "requirements",
+        "anyQualified",
+        "allQualified"
+      ],
+      "properties": {
+        "boundMethod": { "type": "string", "minLength": 1 },
+        "alphaNumerator": { "type": "integer", "minimum": 1 },
+        "alphaDenominator": { "type": "integer", "minimum": 1 },
+        "scopeCount": { "type": "integer", "minimum": 1 },
+        "globalVetoes": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "requirements": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "ok", "reasonCodes", "observed"],
+            "properties": {
+              "id": { "type": "string", "minLength": 1 },
+              "ok": { "type": "boolean" },
+              "reasonCodes": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+              "observed": { "type": "object" }
+            }
+          }
+        },
+        "anyQualified": { "type": "boolean" },
+        "allQualified": { "type": "boolean" }
+      }
+    },
+    "transcriptionInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nonQualifying", "authorizes", "corpus", "comment", "approval"],
+      "properties": {
+        "nonQualifying": { "type": "boolean" },
+        "authorizes": { "const": "none" },
+        "corpus": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "version", "repositoryId", "commitSha", "itemCount", "sha256"],
+          "properties": {
+            "name": { "type": "string", "minLength": 1 },
+            "version": { "type": "string", "minLength": 1 },
+            "repositoryId": { "type": "string" },
+            "commitSha": { "type": "string" },
+            "itemCount": { "type": "integer", "minimum": 0 },
+            "sha256": { "$ref": "#/$defs/sha256" }
+          }
+        },
+        "comment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["scopes"],
+          "properties": {
+            "scopes": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "pack",
+                  "severity",
+                  "sampleCount",
+                  "truePositives",
+                  "falsePositives",
+                  "precision",
+                  "precisionLowerBound95",
+                  "recall",
+                  "recallLowerBound95",
+                  "boundMethod"
+                ],
+                "properties": {
+                  "pack": { "type": "string", "minLength": 1 },
+                  "severity": { "enum": ["critical", "important", "suggestion"] },
+                  "sampleCount": { "type": "integer", "minimum": 0 },
+                  "truePositives": { "type": "integer", "minimum": 0 },
+                  "falsePositives": { "type": "integer", "minimum": 0 },
+                  "precision": { "$ref": "#/$defs/nullableFraction" },
+                  "precisionLowerBound95": { "$ref": "#/$defs/nullableFraction" },
+                  "recall": { "$ref": "#/$defs/nullableFraction" },
+                  "recallLowerBound95": { "$ref": "#/$defs/nullableFraction" },
+                  "boundMethod": { "type": "string", "minLength": 1 }
+                }
+              }
+            }
+          }
+        },
+        "approval": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "sampleCount",
+            "wouldApproveCount",
+            "falseApprovalCount",
+            "falseApprovalUpperBound95",
+            "boundMethod",
+            "recall",
+            "recallLowerBound95"
+          ],
+          "properties": {
+            "sampleCount": { "type": "integer", "minimum": 0 },
+            "wouldApproveCount": { "type": "integer", "minimum": 0 },
+            "falseApprovalCount": { "type": "integer", "minimum": 0 },
+            "falseApprovalUpperBound95": { "$ref": "#/$defs/nullableFraction" },
+            "boundMethod": { "type": "string", "minLength": 1 },
+            "recall": { "$ref": "#/$defs/nullableFraction" },
+            "recallLowerBound95": { "$ref": "#/$defs/nullableFraction" }
+          }
+        }
+      }
+    },
+    "promotable": { "const": false },
+    "authorizes": { "const": "none" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "epochSeconds": { "type": "integer", "minimum": 0 },
+    "count": { "type": "integer", "minimum": 0 },
+    "nullableFraction": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }
+  }
+}

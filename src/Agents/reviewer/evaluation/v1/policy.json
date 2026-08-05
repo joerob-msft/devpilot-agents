@@ -1,0 +1,26 @@
+{
+  "_note": "Shipped default is deliberately NON-QUALIFYING and cannot be made permissive from here. Every floor below is the code-defined floor and every cap is the code-defined ceiling: policy may only RAISE a floor and only NARROW a cap (see ConvertTo-ReviewerEvalEffectivePolicy). This file is read only by tools/, never by the reviewer agent, and it can neither enable a delivery gate nor sign anything. partitionSalt, adjudicationSalt and holdoutPercent are deliberately absent: they are frozen inside the signed corpus so no policy edit can reshuffle the holdout partition. See docs/evaluation-harness.md.",
+  "schemaVersion": 1,
+  "policyVersion": 1,
+  "minExamples": 100,
+  "minCalibrationExamples": 80,
+  "minHoldoutExamples": 20,
+  "minPerStratumExamples": 1,
+  "minEligibleHoldoutFindings": 200,
+  "minCommentPrecision": 0.98,
+  "minCommentPrecisionLowerBound95": 0.95,
+  "minCriticalAdjudicatedClaims": 30,
+  "minApprovalDecisions": 300,
+  "minWouldApproveDecisions": 30,
+  "minAdjudicationCoverage": 0.98,
+  "minLabelAgreementKappa": 0.6,
+  "maxRecallRegression": 0.02,
+  "maxCriticalFalsePositiveRate": 0.01,
+  "maxFalseApprovalRate": 0.01,
+  "maxExactTrials": 5000,
+  "suggestionQualificationEnabled": false,
+  "qualifiableScopes": [
+    { "pack": "(generalist)", "severity": "important" },
+    { "pack": "(generalist)", "severity": "critical" }
+  ]
+}

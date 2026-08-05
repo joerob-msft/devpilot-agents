@@ -176,3 +176,11 @@ jobs:
       - name: delivery-gate policy, qualification, and decision checks
         shell: pwsh
         run: ./tools/Test-DeliveryGates.ps1
+
+      # Layer 7: the evaluation harness over a frozen, blind-labeled corpus.
+      # Offline and deterministic: exact integer confidence bounds, sealed
+      # non-promotable artifacts, and a shipped seed corpus that must qualify
+      # nothing.
+      - name: evaluation corpus, adjudication, metric, and qualification checks
+        shell: pwsh
+        run: ./tools/Test-ReviewerEvaluation.ps1

@@ -1,0 +1,225 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:devpilot:reviewer:evaluation-corpus:v1",
+  "title": "DevPilot reviewer evaluation corpus v1",
+  "description": "Frozen, labeled, commit-pinned ground truth. Structurally forbidden from carrying model output: there is no claim, arm, model, run, pack, verdict, or matched-claim field anywhere in this schema, and every instant is an integer epoch-seconds value rather than an ISO-8601 string.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "artifactVersion",
+    "schemaVersion",
+    "corpusVersion",
+    "name",
+    "corpusPin",
+    "frozenAtEpochSeconds",
+    "partitionPolicy",
+    "strata",
+    "examples",
+    "corrections",
+    "freeze"
+  ],
+  "properties": {
+    "kind": { "const": "reviewer-evaluation-corpus" },
+    "artifactVersion": { "const": 1 },
+    "schemaVersion": { "const": 1 },
+    "corpusVersion": { "type": "integer", "minimum": 1 },
+    "name": { "type": "string", "minLength": 1 },
+    "corpusPin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repositoryId", "commitSha"],
+      "properties": {
+        "repositoryId": { "type": "string", "minLength": 1 },
+        "commitSha": { "$ref": "#/$defs/commitSha" }
+      }
+    },
+    "frozenAtEpochSeconds": { "$ref": "#/$defs/epochSeconds" },
+    "partitionPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "holdoutPercent", "partitionSalt", "adjudicationSalt"],
+      "properties": {
+        "method": { "const": "stratified-ordinal-group-hash-v1" },
+        "holdoutPercent": { "type": "integer", "minimum": 1, "maximum": 99 },
+        "partitionSalt": { "type": "string", "minLength": 16 },
+        "adjudicationSalt": { "type": "string", "minLength": 16 }
+      }
+    },
+    "strata": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/stratum" }
+    },
+    "examples": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/example" }
+    },
+    "corrections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "sequence",
+          "correctionVersion",
+          "exampleId",
+          "supersedesRecordHash",
+          "reasonCode",
+          "authorId",
+          "authorKind",
+          "appliedAtEpochSeconds"
+        ],
+        "properties": {
+          "sequence": { "type": "integer", "minimum": 1 },
+          "correctionVersion": { "type": "integer", "minimum": 1 },
+          "exampleId": { "$ref": "#/$defs/sha256" },
+          "supersedesRecordHash": { "$ref": "#/$defs/sha256" },
+          "reasonCode": {
+            "enum": ["labelError", "provenanceError", "inventoryOmission", "duplicateWithdrawal", "strataCorrection"]
+          },
+          "authorId": { "type": "string", "minLength": 1 },
+          "authorKind": { "const": "human" },
+          "appliedAtEpochSeconds": { "$ref": "#/$defs/epochSeconds" }
+        }
+      }
+    },
+    "freeze": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["partitionAssignmentSha256", "corpusSha256", "exampleCount"],
+      "properties": {
+        "partitionAssignmentSha256": { "$ref": "#/$defs/sha256" },
+        "corpusSha256": { "$ref": "#/$defs/sha256" },
+        "exampleCount": { "type": "integer", "minimum": 0 }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "commitSha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "epochSeconds": { "type": "integer", "minimum": 0 },
+    "severity": { "enum": ["critical", "important", "suggestion"] },
+    "decision": { "enum": ["approve", "reject", "abstain"] },
+    "stratum": {
+      "enum": [
+        "csharp",
+        "tests",
+        "deployment",
+        "settings",
+        "security",
+        "generatedCode",
+        "resources",
+        "serviceProviders",
+        "docs"
+      ]
+    },
+    "example": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "exampleId",
+        "status",
+        "stratum",
+        "partition",
+        "groupKey",
+        "provenance",
+        "inventory",
+        "labels",
+        "adjudication",
+        "groundTruth",
+        "recordHash"
+      ],
+      "properties": {
+        "exampleId": { "$ref": "#/$defs/sha256" },
+        "status": { "enum": ["qualifying", "seed"] },
+        "stratum": { "$ref": "#/$defs/stratum" },
+        "partition": { "enum": ["calibration", "holdout"] },
+        "groupKey": { "$ref": "#/$defs/sha256" },
+        "provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "provider",
+            "repositoryId",
+            "prId",
+            "sourceCommitSha",
+            "targetCommitSha",
+            "changeSetSha256",
+            "changedFilePathsSha256",
+            "sourceRef",
+            "importedAtEpochSeconds",
+            "importToolSha256"
+          ],
+          "properties": {
+            "provider": { "enum": ["AzureDevOps", "GitHub"] },
+            "repositoryId": { "type": "string", "minLength": 1 },
+            "prId": { "type": "string", "minLength": 1 },
+            "sourceCommitSha": { "$ref": "#/$defs/commitSha" },
+            "targetCommitSha": { "$ref": "#/$defs/commitSha" },
+            "changeSetSha256": { "$ref": "#/$defs/sha256" },
+            "changedFilePathsSha256": { "$ref": "#/$defs/sha256" },
+            "sourceRef": { "type": "string" },
+            "importedAtEpochSeconds": { "$ref": "#/$defs/epochSeconds" },
+            "importToolSha256": { "$ref": "#/$defs/sha256" }
+          }
+        },
+        "inventory": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["issueId", "issueClass", "severity", "convention", "correctness", "path"],
+            "properties": {
+              "issueId": { "type": "string", "minLength": 1 },
+              "issueClass": { "type": "string", "minLength": 1 },
+              "severity": { "$ref": "#/$defs/severity" },
+              "convention": { "type": "boolean" },
+              "correctness": { "type": "boolean" },
+              "path": { "type": "string" }
+            }
+          }
+        },
+        "labels": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["labelerId", "labelerKind", "blind", "labeledAtEpochSeconds", "issueIds", "decision"],
+            "properties": {
+              "labelerId": { "type": "string", "minLength": 1 },
+              "labelerKind": { "const": "human" },
+              "blind": { "const": true },
+              "labeledAtEpochSeconds": { "$ref": "#/$defs/epochSeconds" },
+              "issueIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+              "decision": { "$ref": "#/$defs/decision" }
+            }
+          }
+        },
+        "adjudication": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["adjudicatorId", "adjudicatorKind", "adjudicatedAtEpochSeconds", "issueIds", "decision"],
+          "properties": {
+            "adjudicatorId": { "type": "string", "minLength": 1 },
+            "adjudicatorKind": { "const": "human" },
+            "adjudicatedAtEpochSeconds": { "$ref": "#/$defs/epochSeconds" },
+            "issueIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+            "decision": { "$ref": "#/$defs/decision" }
+          }
+        },
+        "groundTruth": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["resolution", "issueIds", "decision"],
+          "properties": {
+            "resolution": { "enum": ["concordant", "adjudicated", "disputed"] },
+            "issueIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+            "decision": { "$ref": "#/$defs/decision" }
+          }
+        },
+        "recordHash": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}

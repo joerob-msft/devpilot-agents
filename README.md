@@ -298,6 +298,53 @@ gate decision - never more, never reworded, never at a raised severity - with
 `-PromoteVerifiedPreview <path>`; it never casts a vote. See
 [Delivery gates](docs/delivery-gates.md).
 
+#### Evaluation harness and frozen corpus (layer 7)
+
+Layer 6 will only open an unattended path when a signed qualification artifact
+carries precision, recall, sample-count and false-approval numbers that clear
+its code-defined floors. Layer 7 is where those numbers come from, and it is
+built so that producing them can never become a way to skip them.
+
+It measures and never delivers: no comment, no vote, no delivery
+authorization, no promotion, no write path. The reviewer agent never loads it -
+`Start-ReviewerAgent.ps1` contains no reference to the evaluation library, and
+a test asserts that. Only `tools/` loads it, and only a human runs `tools/`.
+
+Ground truth and claim verdicts are separate sealed artifacts on purpose. The
+corpus is authored from pull requests alone and is structurally forbidden from
+carrying any model output; blind claim verdicts live in their own artifact,
+keyed by a content-derived key that carries no arm, model or pack, presented
+through a field allowlist in a salted order. Partitions are frozen, grouped so
+near-twin changes cannot straddle the split, and stratified across C#, tests,
+deployment, settings, security, generated code, resources, service providers
+and docs.
+
+Three arms - generalist-only, multi-pass discovery, and independently verified -
+are compared on identical pinned commits; a mismatched or stale pair is
+rejected outright. Every qualification decision is an exact
+`System.Numerics.BigInteger` Clopper-Pearson comparison with Bonferroni
+adjustment over prespecified scopes, with a paired exact bound on recall
+regression; no transcendental function appears on any metric path, because
+those are not bit-identical across platforms. Zero-event vetoes always require
+a denominator, and anything unknown, degraded, missing or partially adjudicated
+fails closed.
+
+```powershell
+./tools/Import-ReviewerEvalCorpus.ps1 -ImportManifest <import.json> `
+    -OutputPath <corpus.json> -StateDir <eval-state> -DeficitPath <deficit.json>
+
+./tools/Invoke-ReviewerEvaluation.ps1 -CorpusFile <corpus.json> `
+    -RunFiles <baseline.json>,<multipass.json>,<verified.json> `
+    -AdjudicationFile <adjudication.json> -StateDir <eval-state> `
+    -OutputPath <report.json> -ReportVersion 1
+```
+
+The report is sealed under evaluation-only HMAC domains and is structurally
+rejected by both promotion paths. This repository ships **no real corpus**:
+the checked-in fixtures are explicitly synthetic seed records that qualify
+nothing, and the report emits machine-readable population deficits rather than
+lowering a gate. See [Evaluation harness](docs/evaluation-harness.md).
+
 #### Authoritative repository-source transport
 
 `repoConventions.authoritativeSources` is an optional, versioned transport for
