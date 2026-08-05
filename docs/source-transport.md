@@ -59,8 +59,9 @@ The block opens with every changed path and whether its source actually arrived:
 
 `status` is `delivered`, `partial`, or `omitted`. `reason` comes from a closed
 set: `budgetExhausted`, `sliceCountCapExceeded`, `fileTooLarge`, `notTextual`,
-`decodeRejected`, `transportFailed`, `noChangedSpans`, `spansUnavailable`,
-`fileCountCapExceeded`, `pathRejected`, `spanOutsideFile`, `unsafeSliceText`.
+`decodeRejected`, `transportFailed`, `noChangedSpans`, `binaryNoText`,
+`emptyFile`, `spansUnavailable`, `fileCountCapExceeded`, `pathRejected`,
+`spanOutsideFile`, `unsafeSliceText`.
 
 Those causes are told apart at the reader seam, before the strict decoder runs.
 The decoder's job is safety and it refuses everything it dislikes the same way,
@@ -93,16 +94,32 @@ kind carries content is read anyway, and what comes back decides:
 
 | what the read says | reason | in the denominator? |
 |---|---|---|
-| zero bytes | `noChangedSpans` | no — there is nothing to deliver |
-| not a text MIME type | `notTextual` | no — a binary has no lines to read |
+| zero bytes | `emptyFile` | no — there is nothing to deliver |
+| not a text MIME type | `binaryNoText` | no — a file with no line diff and no text has no lines to read |
 | real text content | `spansUnavailable` | **yes** — its diff was lost |
 | unreadable | `transportFailed` | **yes** |
+
+`binaryNoText` is deliberately a different reason from `notTextual`. The latter is
+emitted for a path the change set DID diff as text — it has added and edited
+lines — which the wrapper's MIME allowlist then refused to fetch. That is an
+unread file, not an unreadable one, and it stays in the denominator and is named
+to the model as unread. Sharing one reason code between the two would have told
+the model there was nothing in it to read.
 
 Emptiness is decided on the reported byte length, not on whitespace: a file of
 blank lines has content a reviewer could be shown. A reader that reports no byte
 length at all cannot excuse a path by omission. Every excusing decision records
-the MIME type, byte length and hash it was made on, so an operator auditing why a
-path left the denominator has the evidence in the coverage record.
+the MIME type, byte length and hash it was made on, plus **what said so** —
+`changeSet` or `reader` — so an operator auditing why a path left the denominator
+has the evidence in the coverage record.
+
+That last distinction is load-bearing. A change set that declares every path a
+delete is *vacuously* covered and is reviewed on its diff. A change set that only
+looks source-free because the reader called every path's bytes non-text is **not**:
+that is the same host whose misbehaviour lost the line-diff blocks in the first
+place, so if anything left the denominator on the reader's say-so and nothing was
+delivered, the gate refuses with `sourceCoverageEmpty` instead of passing at a
+vacuous 100%.
 
 The kinds treated as carrying no content are `delete`, `rename`, `sourcerename`,
 `targetrename`, `encoding`, `lock` and `property`. A path is excused only when
@@ -117,9 +134,13 @@ set carries more than one entry for a path, the kinds are unioned, so a trailing
 `Delete` row cannot erase an earlier `Edit`.
 
 That read costs one whole-file fetch per spanless content-declaring path, so it
-is capped at 16 per pull request. Past the cap a path is counted uncovered
-without being read: a change set with that many spanless-but-editable paths is
-systematically broken and the coverage floor is going to refuse it anyway.
+is capped at 16 per pull request — but the budget is spent only on reads that
+come back **content-bearing**. The case worth bounding is a response that lost
+every line-diff block, where every probe returns real text and the coverage floor
+is going to refuse the pull request anyway; a pull request that adds forty icons
+returns forty non-text answers, spends no budget, and stays reviewable. Past the
+cap a path is counted uncovered without being read, which is the fail-closed
+direction. All reads remain bounded by `maxFiles` and `maxFetchBytesPerFile`.
 
 No hunk is ever invented for these paths. The pull request reported no hunks for
 them, so they contribute nothing to the span numerator or denominator — the
@@ -135,12 +156,14 @@ and the extractor does not is the mis-parse it exists to catch.
 
 Both prompts bind the model to that table: it may not report on, clear, or claim
 to have reviewed an `omitted` path, and must describe a `partial` path as
-partially read. Two reasons are exceptions, because they are not gaps in what the
-model was given: `noChangedSpans` (deleted, renamed, or empty) and `notTextual`
-(not a text file) both mean there is nothing in that path for anyone to read, so
-the change-set diff is all there is to judge it by. That is what stops structural
-metadata being mistaken for source text — the model is told, in the same
-document, exactly what it does not have.
+partially read. Exactly three reasons are exceptions, because they are not gaps
+in what the model was given: `noChangedSpans` (deleted or renamed),
+`binaryNoText` (no line diff and not text) and `emptyFile` (no bytes). Every
+other reason is a file with changed text the model did not get. That set is
+enforced in code — `New-ReviewerSourceFileEntry` refuses to mark a path
+source-free under any other reason — so the flag the gate divides by and the
+sentence the model obeys cannot drift apart. That is what stops structural
+metadata being mistaken for source text.
 
 The table is rendered whenever there is any changed path to account for, even
 when nothing at all was delivered. Suppressing it at zero coverage would leave

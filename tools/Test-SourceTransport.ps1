@@ -912,8 +912,8 @@ $emptyAddReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedP
     -SpansByPath ([ordered]@{}) -Policy $policy `
     -Reader { param([string]$Path) [pscustomobject]@{ Text = ''; MimeType = 'text/plain'; ByteLength = 0; Sha256 = ('a' * 64) } } `
     -ChangeKindsByPath ([ordered]@{ '/src/empty.cs' = 'Add' })
-Assert-Source ((@($emptyAddReport.Files)[0].Reason) -ceq 'noChangedSpans') `
-    "an added file that really is empty is accounted noChangedSpans on evidence"
+Assert-Source ((@($emptyAddReport.Files)[0].Reason) -ceq 'emptyFile') `
+    "an added file that really is empty is accounted emptyFile on evidence"
 Assert-Source (Test-ReviewerSourceChangeCarriesRightHand -ChangeTypeValue $null) `
     "an unknown change kind is assumed to carry right-hand lines, which is the safe direction"
 Assert-Source (Test-ReviewerSourceChangeCarriesRightHand -ChangeTypeValue 'Edit, Rename') `
@@ -1095,8 +1095,73 @@ Assert-Source ((Test-ReviewerSourceCoverageGate -Report $binaryAddReport -Policy
 Assert-Source ([int]$binaryAddReport.RequestedSpanCount -eq 1) `
     "no hunk is invented for a path the pull request reported no hunks for"
 $binaryAddBlock = Format-ReviewerSealedSourceBlock -Report $binaryAddReport -NonceFactory { 'n' * 32 }
-Assert-Source ($binaryAddBlock -match '/assets/logo\.png' -and $binaryAddBlock -match 'notTextual') `
+Assert-Source ($binaryAddBlock -match '/assets/logo\.png' -and $binaryAddBlock -match 'binaryNoText') `
     "the binary is still named in the accounting table with its own reason"
+Assert-Source ($binaryAddBlock -match 'Exactly three reasons are different' -and
+    $binaryAddBlock -match '`noChangedSpans` \(deleted or renamed\), `binaryNoText` \(no line diff and not text\), and `emptyFile` \(no bytes\)') `
+    "the block's exception list is a closed set of exactly three reasons"
+Assert-Source ($binaryAddBlock -match 'Every OTHER reason - including `notTextual`, `fileTooLarge` and `spansUnavailable` - is a file that DOES have changed text you were not given') `
+    "and it says plainly that notTextual is an unread file, not an unreadable one"
+
+# The reason a spanless binary gets is NOT the reason a diffed-as-text file that
+# the MIME allowlist refused gets. The second one has real changed lines the
+# model never saw, and sharing a reason code would have told the model there was
+# nothing in it to read.
+$refusedTextReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @('/cfg/a.yml') `
+    -SpansByPath ([ordered]@{ '/cfg/a.yml' = @(@{ Start = 3; End = 4 }) }) -Policy $policy `
+    -Reader { param([string]$Path) [pscustomobject]@{ Rejected = 'notTextual'; MimeType = 'application/x-yaml'; ByteLength = 900; Sha256 = ('e' * 64) } } `
+    -ChangeKindsByPath ([ordered]@{ '/cfg/a.yml' = 'Edit' })
+$refusedTextEntry = @($refusedTextReport.Files)[0]
+Assert-Source (([string]$refusedTextEntry.Reason) -ceq 'notTextual' -and [bool]$refusedTextEntry.CarriesSource) `
+    "a text file the MIME allowlist refused keeps its changed lines and stays in the denominator"
+Assert-Source (-not (Test-ReviewerSourceCoverageGate -Report $refusedTextReport -Policy $policy).Ok) `
+    "and the gate refuses rather than reviewing it unread"
+
+# The fail-open the reason split closes: a host that BOTH loses the line blocks
+# and mislabels the MIME type would otherwise empty the denominator itself and
+# be rewarded with a vacuous 100% pass over three unread source files.
+$hostiletMimeReport = New-ReviewerSourceTransportReport -CommitSha $commit `
+    -ChangedPaths @('/src/h1.cs', '/src/h2.cs', '/src/h3.cs') -SpansByPath ([ordered]@{}) -Policy $policy `
+    -Reader { param([string]$Path) [pscustomobject]@{ Rejected = 'notTextual'; MimeType = 'application/octet-stream'; ByteLength = 4000; Sha256 = ('f' * 64) } } `
+    -ChangeKindsByPath ([ordered]@{ '/src/h1.cs' = 'Edit'; '/src/h2.cs' = 'Edit'; '/src/h3.cs' = 'Edit' })
+$hostileMimeGate = Test-ReviewerSourceCoverageGate -Report $hostiletMimeReport -Policy $policy
+Assert-Source ([int]$hostiletMimeReport.ReaderExcusedFileCount -eq 3) `
+    "paths excused on the reader's say-so are counted apart from paths the change set excused"
+Assert-Source (-not $hostileMimeGate.Ok -and ($hostileMimeGate.ReasonCodes -ccontains 'sourceCoverageEmpty')) `
+    "a denominator emptied by the reader is refused, not passed vacuously at 100%"
+$declaredDeleteOnlyReport = New-ReviewerSourceTransportReport -CommitSha $commit `
+    -ChangedPaths @('/src/h1.cs', '/src/h2.cs') -SpansByPath ([ordered]@{}) -Policy $policy `
+    -Reader { param([string]$Path) $null } `
+    -ChangeKindsByPath ([ordered]@{ '/src/h1.cs' = 'Delete'; '/src/h2.cs' = 'Delete' })
+Assert-Source ((Test-ReviewerSourceCoverageGate -Report $declaredDeleteOnlyReport -Policy $policy).Ok) `
+    "a denominator emptied by the CHANGE SET is still vacuously covered"
+
+# A hashtable-shaped change type must not be flattened: foreach over a
+# dictionary yields the dictionary itself, and an unbounded self-recursion or a
+# stack overflow takes the whole reviewer process down uncatchably.
+$dictionaryProbe = $null
+$dictionaryProbeJob = Start-Job -ScriptBlock {
+    param($LibraryPath)
+    . $LibraryPath
+    @(Get-ReviewerSourceChangeKinds -Value @{ a = 'delete' }).Count
+} -ArgumentList (Join-Path $repoRoot 'src/Agents/reviewer/SourceTransport.ps1')
+if (Wait-Job -Job $dictionaryProbeJob -Timeout 30) { $dictionaryProbe = Receive-Job -Job $dictionaryProbeJob }
+Remove-Job -Job $dictionaryProbeJob -Force
+Assert-Source ($null -ne $dictionaryProbe) "a dictionary-shaped change type terminates instead of recursing forever"
+Assert-Source (Test-ReviewerSourceChangeCarriesRightHand -ChangeTypeValue @{ a = 'delete' }) `
+    "and it is counted, because an unrecognized shape may not excuse a path"
+# Built with the unary comma so the nesting survives; @(@(@())) is flattened at
+# construction and would not exercise the depth bound at all.
+$deepKinds = , (, (, (, (, (@('delete', 'rename'))))))
+Assert-Source (Test-ReviewerSourceChangeCarriesRightHand -ChangeTypeValue $deepKinds) `
+    "a change type nested past the depth bound is counted rather than trusted"
+
+# A path may only leave the coverage denominator under a reason the prompts
+# publish as 'nothing to read', and it must record what said so.
+Assert-Source (Test-Throws { New-ReviewerSourceFileEntry -Path '/src/a.cs' -CommitSha $commit -Status 'omitted' -Reason 'spansUnavailable' -CarriesSource $false -NoSourceBasis 'reader' }) `
+    "a path cannot leave the denominator under a reason that means it was not read"
+Assert-Source (Test-Throws { New-ReviewerSourceFileEntry -Path '/src/a.cs' -CommitSha $commit -Status 'omitted' -Reason 'noChangedSpans' -CarriesSource $false }) `
+    "a path that leaves the denominator must record whether the change set or the reader said so"
 
 # The excusing decision is made on bytes, and it records what it saw.
 $blankReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @('/src/blank.cs') `
@@ -1110,7 +1175,7 @@ $emptyEvidenceReport = New-ReviewerSourceTransportReport -CommitSha $commit -Cha
     -Reader { param([string]$Path) [pscustomobject]@{ Text = ''; MimeType = 'text/plain'; ByteLength = 0; Sha256 = ('d' * 64) } } `
     -ChangeKindsByPath ([ordered]@{ '/src/zero.cs' = 'Add' })
 $emptyEvidenceEntry = @($emptyEvidenceReport.Files)[0]
-Assert-Source (([string]$emptyEvidenceEntry.Reason) -ceq 'noChangedSpans' -and ([string]$emptyEvidenceEntry.FileSha256) -ceq ('d' * 64) -and ([string]$emptyEvidenceEntry.MimeType) -ceq 'text/plain') `
+Assert-Source (([string]$emptyEvidenceEntry.Reason) -ceq 'emptyFile' -and ([string]$emptyEvidenceEntry.FileSha256) -ceq ('d' * 64) -and ([string]$emptyEvidenceEntry.MimeType) -ceq 'text/plain') `
     "excusing a path on evidence records the evidence it was excused on"
 $emptyNoLengthReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @('/src/zero.cs') `
     -SpansByPath ([ordered]@{}) -Policy $policy `
@@ -1276,6 +1341,28 @@ $bigResult = Get-ReviewerSourceReaderResult -ToolResult (New-ResourceToolResult 
     -Path '/src/big.cs' -Policy $readerPolicy -Decoder $strictDecoder
 Assert-Source (([string]$bigResult.Rejected) -ceq 'fileTooLarge') "an oversized file is classified fileTooLarge, not transportFailed"
 Assert-Source ([int]$bigResult.ByteLength -eq 4096) "the oversize classification reports the real decoded size"
+
+# An empty added file is an ordinary thing. Calling it "too large" sent an
+# operator to the wrong lever and, worse, kept it in the coverage denominator so
+# that adding a .gitkeep sank a pull request's coverage forever.
+$emptyResult = Get-ReviewerSourceReaderResult -ToolResult (New-ResourceToolResult -Base64 '') `
+    -Path '/src/empty.cs' -Policy $readerPolicy -Decoder $strictDecoder
+Assert-Source (([string]$emptyResult.Rejected) -ceq 'emptyFile' -and [int]$emptyResult.ByteLength -eq 0) `
+    "a zero-byte file is classified emptyFile through the real reader seam, not fileTooLarge"
+$emptySeamReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @('/src/ok.cs', '/src/empty.cs') `
+    -SpansByPath ([ordered]@{ '/src/ok.cs' = @(@{ Start = 5; End = 6 }) }) -Policy $policy `
+    -Reader { param([string]$Path)
+        if ($Path -ceq '/src/empty.cs') {
+            return Get-ReviewerSourceReaderResult -ToolResult (New-ResourceToolResult -Base64 '') -Path $Path -Policy $readerPolicy -Decoder $strictDecoder
+        }
+        $bodyText = New-TestFileText -LineCount 30
+        [pscustomobject]@{ Text = $bodyText; MimeType = 'text/plain'
+            ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($bodyText)
+            Sha256 = Get-ReviewerSourceSha256 -Text $bodyText }
+    } -ChangeKindsByPath ([ordered]@{ '/src/ok.cs' = 'Edit'; '/src/empty.cs' = 'Add' })
+Assert-Source ([int]$emptySeamReport.NoSourceFileCount -eq 1 -and [int]$emptySeamReport.SourceBearingFileCount -eq 1 -and
+    (Test-ReviewerSourceCoverageGate -Report $emptySeamReport -Policy $policy).Ok) `
+    "and the shipped reader can actually reach the empty-file excuse the report documents"
 
 $badUtf8Base64 = [Convert]::ToBase64String([byte[]](0xC3, 0x28, 0x41, 0x42))
 $badUtf8Result = Get-ReviewerSourceReaderResult -ToolResult (New-ResourceToolResult -Base64 $badUtf8Base64) `

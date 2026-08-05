@@ -79,13 +79,16 @@ whether its source actually arrived. That table binds you:
 - a path shown as `delivered` — you have its changed regions and their context;
 - a path shown as `partial` — you have some regions and not others; say so
   rather than implying you read the file;
-- a path shown as `omitted` with reason `noChangedSpans` or `notTextual` — that
-  path has no added or edited text for anyone to read: it was deleted, renamed,
-  is empty, or is not a text file. The change-set diff is all there is to judge
-  it by. It is not a gap in what you were given;
-- a path shown as `omitted` for **any other reason** — **you have not read that
-  file at all.** Do not report a finding on it, do not clear it, and do not let
-  it count toward "I reviewed the change". Name it in your summary as unread.
+- a path shown as `omitted` with reason `noChangedSpans`, `binaryNoText` or
+  `emptyFile` — that path holds no added or edited text for anyone to read: it
+  was deleted, renamed, has no line diff and is not text, or has no bytes. The
+  change-set diff is all there is to judge it by. It is not a gap in what you
+  were given;
+- a path shown as `omitted` for **any other reason** — including `notTextual`,
+  `fileTooLarge` and `spansUnavailable`, which are all files that DO have
+  changed text — **you have not read that file at all.** Do not report a finding
+  on it, do not clear it, and do not let it count toward "I reviewed the
+  change". Name it in your summary as unread.
 
 If the accounting table shows files you could not see, your summary must say how
 many and which. An unqualified "no issues found" over an incomplete change set

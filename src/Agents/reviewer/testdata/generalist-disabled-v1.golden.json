@@ -94,6 +94,10 @@
     {
       "sha256": "207f656dd6d0a548f7cf3a15a83a7b36c345452c0a92dda960f9278c230771d7",
       "reason": "Say the same thing about a binary. A non-text changed file is now reported under its own reason rather than as no-changed-spans, and without this the prompt's list of what has nothing to read no longer matched the reasons the block actually emits."
+    },
+    {
+      "sha256": "8f842c09604560be7955f15db18c6511e159d1ba78bfdd84c5a6f59db549c118",
+      "reason": "Name the exception list as a closed set of three reasons and say explicitly that notTextual is NOT one of them. That reason is also emitted for a file the change set diffed as text and the wrapper then refused to fetch, so the previous wording licensed the model to clear files with real changed lines it had never seen."
     }
   ]
 }
