@@ -115,6 +115,9 @@ jobs:
           finally {
               $PSNativeCommandUseErrorActionPreference = $nativePreference
           }
+          # The final child is expected to exit 1. Do not let its LASTEXITCODE
+          # become the aggregate step result after every assertion passed.
+          exit 0
 
       # Provider normalization, asserted against a fixture captured from a real
       # GitHub API response. Offline: no network, no host, no model.
