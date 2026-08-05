@@ -151,7 +151,7 @@ $script:ReviewerGateReasonCodes = @(
     "verificationDegraded", "verificationIncomplete", "candidateAccountingMismatch",
     "candidateNotVerified", "candidateWithheld", "needsHumanPresent",
     "unknownWithheldReason", "specialistDegraded", "generalistPassIncomplete",
-    "generalistPairMismatch", "generalistVoteNotApprove",
+    "generalistPairMismatch", "generalistVoteNotApprove", "gateFindingsUndelivered",
     # World freshness
     "sourceCommitMoved", "targetCommitMoved", "changeSetMoved", "changeSetUnreadable",
     "prNotActive", "prIsDraft", "anchorNotInChangeSet", "threadDedupeHit",
@@ -1000,6 +1000,8 @@ function New-ReviewerGateDecision {
             -MaxCount ([int]$EffectivePolicy.maxCommentsPerRun))
     $cappedSuggestions = @(Get-ReviewerGateCappedSubset -Entries @($unattendedComments | Where-Object { $_.severity -ceq "suggestion" }) `
             -MaxCount ([int]$EffectivePolicy.maxSuggestionsPerRun))
+    $importantOrHigher = @($candidateEntries.ToArray() | Where-Object { $_.severity -cin @("critical", "important") })
+    $importantOrHigherKeys = @($importantOrHigher | ForEach-Object { [string]$_.gateKey } | Sort-Object -Unique)
 
     $decisionExpiresAtUtc = $CreatedAtUtc.AddSeconds([Math]::Min([int]$EffectivePolicy.maxDecisionAgeSeconds, $script:ReviewerGateMaxDecisionAgeSeconds))
 
@@ -1042,6 +1044,9 @@ function New-ReviewerGateDecision {
         unattendedComments        = $cappedComments
         unattendedSuggestions     = $cappedSuggestions
         humanPromotableComments   = $humanPromotable.ToArray()
+        gateHumanPromotableCount  = $humanPromotable.Count
+        gateImportantOrHigherCount = $importantOrHigher.Count
+        gateImportantOrHigherKeys = $importantOrHigherKeys
         createdAtUtc              = $CreatedAtUtc.ToString("o", [Globalization.CultureInfo]::InvariantCulture)
         decisionExpiresAtUtc      = $decisionExpiresAtUtc.ToString("o", [Globalization.CultureInfo]::InvariantCulture)
         qualificationExpiresAtUtc = $QualificationExpiresAtUtc
@@ -1106,6 +1111,9 @@ function Test-ReviewerGateApproval {
         [Parameter(Mandatory)][bool]$GeneralistBothApprove,
         [Parameter(Mandatory)][bool]$SpecialistOkForApproval,
         [Parameter(Mandatory)][bool]$RawGateApproves,
+        [Parameter(Mandatory)][int]$GateHumanPromotableCount,
+        [Parameter(Mandatory)][int]$GateImportantOrHigherCount,
+        [Parameter(Mandatory)][int]$GateImportantOrHigherConfirmedCount,
         [Parameter(Mandatory)][bool]$ChecksKnown,
         [Parameter(Mandatory)][bool]$ChecksAllSuccess,
         [Parameter(Mandatory)][bool]$DismissalKnown,
@@ -1128,6 +1136,10 @@ function Test-ReviewerGateApproval {
     if ($GeneralistPairComplete -and -not $GeneralistBothApprove) { [void]$reasons.Add("generalistVoteNotApprove") }
     if (-not $SpecialistOkForApproval) { [void]$reasons.Add("specialistDegraded") }
     if (-not $RawGateApproves) { [void]$reasons.Add("generalistVoteNotApprove") }
+    if ($GateHumanPromotableCount -gt 0 -or $GateImportantOrHigherCount -gt 0 -or
+        $GateImportantOrHigherConfirmedCount -gt 0) {
+        [void]$reasons.Add("gateFindingsUndelivered")
+    }
     if ([bool]$EffectivePolicy.approval.requireChecks) {
         if (-not $ChecksKnown) { [void]$reasons.Add("checksUnavailable") }
         elseif (-not $ChecksAllSuccess) { [void]$reasons.Add("checksFailed") }
@@ -1178,6 +1190,30 @@ function Get-ReviewerGateEligibilityFingerprint {
             decisionSha256       = $DecisionSha256
             gatePolicySha256     = $GatePolicySha256
         })
+}
+
+function Get-ReviewerGateApprovalCoverageKey {
+    <# Binds an approval grant to the exact sealed gate-owned finding state and
+       to the important-or-higher findings confirmed present by the mint's own
+       fresh revalidation. Approval is still refused when any such finding
+       exists; this digest prevents a zero-finding grant from being replayed
+       against a different sealed or confirmed state. #>
+    param(
+        [Parameter(Mandatory)]$Decision,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$ConfirmedImportantOrHigherKeys
+    )
+    $digest = Get-ReviewerVerificationObjectSha256 -Value ([ordered]@{
+            prId                           = [int](Get-ReviewerVerificationValue $Decision "prId" 0)
+            sourceCommit                   = ([string](Get-ReviewerVerificationValue $Decision "sourceCommit" "")).ToLowerInvariant()
+            gateHumanPromotableCount       = [int](Get-ReviewerVerificationValue $Decision "gateHumanPromotableCount" 0)
+            gateImportantOrHigherCount     = [int](Get-ReviewerVerificationValue $Decision "gateImportantOrHigherCount" 0)
+            gateImportantOrHigherKeys      = @(
+                @(Get-ReviewerVerificationValue $Decision "gateImportantOrHigherKeys" @()) |
+                    ForEach-Object { [string]$_ } | Sort-Object -Unique)
+            confirmedImportantOrHigherKeys = @(
+                @($ConfirmedImportantOrHigherKeys) | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+        })
+    return "approval:$digest"
 }
 
 function Get-ReviewerGateWritesCurrentlyRequested {
@@ -1333,7 +1369,8 @@ function Test-ReviewerVerifiedMultiPassPreconditions {
         [Parameter(Mandatory)][bool]$RevalidationOk,
         [Parameter(Mandatory)][bool]$PrIsActive,
         [Parameter(Mandatory)][bool]$PrIsDraft,
-        [Parameter(Mandatory)][bool]$SourceCommitUnchanged
+        [Parameter(Mandatory)][bool]$SourceCommitUnchanged,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$ConfirmedImportantOrHigherKeys
     )
     $reasons = [System.Collections.Generic.List[string]]::new()
     $allZero = ("0" * 64)
@@ -1376,6 +1413,13 @@ function Test-ReviewerVerifiedMultiPassPreconditions {
     if ($Purpose -ceq "gateApproval" -and -not [bool](Get-ReviewerVerificationValue $Decision "allWithheldReasonsSafe" $false)) {
         [void]$reasons.Add("unknownWithheldReason")
     }
+    if ($Purpose -ceq "gateApproval") {
+        if ([int](Get-ReviewerVerificationValue $Decision "gateHumanPromotableCount" 0) -gt 0 -or
+            [int](Get-ReviewerVerificationValue $Decision "gateImportantOrHigherCount" 0) -gt 0 -or
+            @($ConfirmedImportantOrHigherKeys).Count -gt 0) {
+            [void]$reasons.Add("gateFindingsUndelivered")
+        }
+    }
 
     # P9: when the dedicated revalidation session itself could not read live
     # state (RevalidationOk=$false), PrIsActive/PrIsDraft/SourceCommitUnchanged
@@ -1417,10 +1461,11 @@ function Test-ReviewerVerifiedMultiPassPreconditions {
         if ($outOfCoverage.Count -gt 0) { [void]$reasons.Add("coverageNotSealedSubset") }
     }
     elseif ($Purpose -ceq "gateApproval") {
-        # Approval coverage is not a candidate set at all - a single, fixed
-        # sentinel binding the grant to exactly one PR/commit/action, so it
-        # can never be reinterpreted as authorizing a comment write.
-        $expectedApprovalCoverage = "$PrId|$($ExpectedSourceCommit.ToLowerInvariant())|Approved"
+        # Approval coverage is a single digest of the sealed gate-owned finding
+        # state plus important-or-higher findings confirmed by this mint's own
+        # fresh revalidation. It cannot be reinterpreted as a comment grant.
+        $expectedApprovalCoverage = Get-ReviewerGateApprovalCoverageKey -Decision $Decision `
+            -ConfirmedImportantOrHigherKeys $ConfirmedImportantOrHigherKeys
         if (@($CoverageKeys).Count -ne 1 -or ([string]@($CoverageKeys)[0]) -cne $expectedApprovalCoverage) {
             [void]$reasons.Add("approvalCoverageMalformed")
         }

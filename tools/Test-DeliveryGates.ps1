@@ -594,6 +594,9 @@ function New-PassingApprovalArgs {
         GeneralistBothApprove = $true
         SpecialistOkForApproval = $true
         RawGateApproves = $true
+        GateHumanPromotableCount = 0
+        GateImportantOrHigherCount = 0
+        GateImportantOrHigherConfirmedCount = 0
         ChecksKnown = $true
         ChecksAllSuccess = $true
         DismissalKnown = $true
@@ -619,6 +622,9 @@ $approvalFlipTable = @(
     , @("GeneralistBothApprove", $false, "generalistVoteNotApprove")
     , @("SpecialistOkForApproval", $false, "specialistDegraded")
     , @("RawGateApproves", $false, "generalistVoteNotApprove")
+    , @("GateHumanPromotableCount", 1, "gateFindingsUndelivered")
+    , @("GateImportantOrHigherCount", 1, "gateFindingsUndelivered")
+    , @("GateImportantOrHigherConfirmedCount", 1, "gateFindingsUndelivered")
     , @("ChecksKnown", $false, "checksUnavailable")
     , @("ChecksAllSuccess", $false, "checksFailed")
     , @("DismissalKnown", $false, "dismissStaleReviewsUnknown")
@@ -661,6 +667,15 @@ Assert-Gate ((ConvertTo-ReviewerGateReasonCode -Reason "totally-made-up-reason")
 $decisionA = New-Decision -Facets @(New-TestFacet) -EffectivePolicy $enabledEffective -Qualification $qualification
 Start-Sleep -Milliseconds 5
 $decisionB = New-Decision -Facets @(New-TestFacet) -EffectivePolicy $enabledEffective -Qualification $qualification
+$zeroCandidateDecision = New-Decision -Facets @() -EffectivePolicy $enabledEffective -Qualification $qualification
+Assert-Gate ([int]$decisionA.gateHumanPromotableCount -eq 1 -and
+    [int]$decisionA.gateImportantOrHigherCount -eq 1 -and
+    @($decisionA.gateImportantOrHigherKeys).Count -eq 1) `
+    "A verified specialist important finding was not sealed into approval-blocking gate-owned accounting."
+Assert-Gate ([int]$zeroCandidateDecision.gateHumanPromotableCount -eq 0 -and
+    [int]$zeroCandidateDecision.gateImportantOrHigherCount -eq 0 -and
+    @($zeroCandidateDecision.gateImportantOrHigherKeys).Count -eq 0) `
+    "A zero-candidate decision did not seal zero gate-owned approval-blocking accounting."
 # createdAtUtc/decisionExpiresAtUtc are the only time-dependent fields; strip
 # them before comparing so the rest of the seal is proven reproducible.
 $stripTimestamps = { param($d) [pscustomobject][ordered]@{ candidates = $d.candidates; unattendedComments = $d.unattendedComments; runOk = $d.runOk; mode = $d.mode } }

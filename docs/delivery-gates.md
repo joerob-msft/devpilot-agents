@@ -216,6 +216,13 @@ placeholders. Every candidate is carried with its own reason codes for both
 the unattended and human-promoted eligibility questions - there is no
 candidate the decision is silent about.
 
+The same manifest also seals approval-specific gate-owned accounting:
+`gateHumanPromotableCount`, `gateImportantOrHigherCount`, and the sorted
+`gateImportantOrHigherKeys`. These values are mechanically derived from the
+sealed candidate entries, not supplied by a model or config. They let the
+approval path prove that specialist/gate findings did not disappear behind
+the independent raw generalist vote.
+
 The manifest is sealed with `Save-ReviewerGateArtifact`, which canonicalizes it
 with the same strict, duplicate-key/non-finite-number-rejecting canonicalizer
 cross-verification uses, then signs it with an HMAC key derived from this
@@ -358,6 +365,13 @@ a later check:
   computed;
 - convention specialist discovery is either not enabled for this run or
   completed (not degraded);
+- the sealed gate decision contains **zero** human-promotable findings and
+  **zero** important-or-critical gate-owned findings, and the second
+  revalidation confirms zero important-or-critical gate findings already
+  present on the PR (`gateFindingsUndelivered` otherwise). This is deliberately
+  conservative: a verified specialist finding can veto approval but can never
+  help grant it. In particular, the agent cannot post an important finding and
+  approve in the same run;
 - required checks, if `policy.approval.requireChecks`, are positively known
   and all green (`Get-AgentProviderRequiredChecksSnapshot`) - unknown or
   absent checks close the gate exactly like a failing one;
@@ -403,6 +417,12 @@ commit movement between the two revalidations, or between either
 revalidation and the sealed decision, fails the vote closed
 (`sourceCommitMoved`).
 
+The second mint also re-derives the important-or-higher gate keys confirmed in
+the freshly read thread set. Its typed approval authorization is bound to a
+digest of that exact confirmed set plus the decision's sealed
+human-promotable/important accounting. A grant minted for a zero-finding state
+cannot be reused after a gate finding appears.
+
 ## Confirm-then-vote, never vote after a comment failure
 
 `Invoke-ReviewerGateDelivery` writes comments first and re-reads the PR's own
@@ -421,6 +441,11 @@ switches (`Get-ReviewerGateWritesCurrentlyRequested`) and against the
 decision's own expiry (`Test-ReviewerGateDecisionExpired`) - belt-and-braces,
 so a caller that ever computed a stale or wrong request still cannot cause a
 write beyond what is currently authorized.
+
+Even when every requested comment was confirmed, approval remains closed if
+the sealed decision contains any human-promotable or important-or-critical
+gate-owned finding. Confirmation is not treated as resolution: posting an
+important finding does not make it compatible with approval.
 
 **A replay never trusts its own persisted request.** On a later cycle, if raw
 delivery is already fully satisfied at this same commit (so the cycle would
@@ -609,7 +634,8 @@ Categories: policy (`gateDisabled`, `killSwitchEngaged`, `modeNotEnabled`,
 ...), artifact/binding (`artifactSignatureInvalid`, `artifactKindRejected`,
 `artifactDomainMismatch`, `decisionExpired`, `scriptShaMismatch`, ...),
 verification state (`verificationDegraded`, `candidateWithheld`,
-`needsHumanPresent`, `specialistDegraded`, `generalistVoteNotApprove`, ...),
+`needsHumanPresent`, `specialistDegraded`, `generalistVoteNotApprove`,
+`gateFindingsUndelivered`, ...),
 world freshness (`sourceCommitMoved`, `changeSetMoved`, `threadDedupeHit`,
 `blockingHumanThreadOpen`, `authoritativeSourceChanged`, ...), approval-only
 (`checksUnavailable`, `checksFailed`, `dismissStaleReviewsUnknown`,

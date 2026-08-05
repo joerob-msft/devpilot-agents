@@ -3789,7 +3789,7 @@ function Set-ReviewerVote {
 
 function Invoke-DryRunSelfChecks {
     $failures = New-Object System.Collections.Generic.List[string]
-    $total = 45
+    $total = 47
 
     Write-Host "[DRY-RUN] Self-check 1/$total : parser validity + prompt presence" -ForegroundColor Cyan
     foreach ($p in @($PSCommandPath, $HarnessPath)) {
@@ -5467,7 +5467,7 @@ function Invoke-DryRunSelfChecks {
         $script:gateDeliveryStatePath = Join-Path $gateSelfCheckSandboxDir "gate-delivery.json"
         $script:artifactKeyPath = Join-Path $gateSelfCheckSandboxDir "artifact-signing.key"
 
-    Write-Host "[DRY-RUN] Self-check 24/$total : delivery-gate kill switch and three-authority enablement" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 25/$total : delivery-gate kill switch and three-authority enablement" -ForegroundColor Cyan
     $killSwitchPolicy = Resolve-ReviewerGatePolicy -RepoRoot $RepoPath -StateDirectory $StateDir `
         -ExplicitPolicyFile "" -KillSwitchEngaged $true -DefaultPolicy $DeliveryGatesDefaultPolicy
     if ($killSwitchPolicy.Effective.mode -cne "off") {
@@ -5496,7 +5496,7 @@ function Invoke-DryRunSelfChecks {
     }
     else { Write-Host "  OK - this run's resolved gate policy is 'off' with no operator-supplied out-of-repo policy or CLI switch" -ForegroundColor Green }
 
-    Write-Host "[DRY-RUN] Self-check 25/$total : disabled-path call ordering is unchanged; the gate never runs before it" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 26/$total : disabled-path call ordering is unchanged; the gate never runs before it" -ForegroundColor Cyan
     $pullRequestAt = & $declOf "Invoke-ReviewerPullRequest"
     if ($pullRequestAt -lt 0) {
         $failures.Add("Could not locate Invoke-ReviewerPullRequest to verify call ordering.")
@@ -5549,7 +5549,7 @@ function Invoke-DryRunSelfChecks {
     }
     else { Write-Host "  OK - invoking the gate end-to-end with mode='off' writes nothing at all" -ForegroundColor Green }
 
-    Write-Host "[DRY-RUN] Self-check 26/$total : raw -PromotePreview rejects a sealed gate-decision artifact (H-7, pinned)" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 27/$total : raw -PromotePreview rejects a sealed gate-decision artifact (H-7, pinned)" -ForegroundColor Cyan
     $selfCheckKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
     $selfCheckArtifactDir = Join-Path $StateDir "selfcheck-artifacts"
     New-Item -ItemType Directory -Force -Path $selfCheckArtifactDir | Out-Null
@@ -5576,7 +5576,7 @@ function Invoke-DryRunSelfChecks {
         if (-not $rejected) { $failures.Add("-PromotePreview accepted a sealed gate-decision artifact.") }
         else { Write-Host "  OK - -PromotePreview rejects a sealed gate-decision artifact" -ForegroundColor Green }
 
-        Write-Host "[DRY-RUN] Self-check 27/$total : -PromoteVerifiedPreview rejects raw delivery and verification artifacts" -ForegroundColor Cyan
+        Write-Host "[DRY-RUN] Self-check 28/$total : -PromoteVerifiedPreview rejects raw delivery and verification artifacts" -ForegroundColor Cyan
         $fakeVerificationDecision = [ordered]@{ kind = "verification-decision-preview"; artifactVersion = 1; note = "selfcheck" }
         $fakeVerificationInput = [ordered]@{ kind = "verification-input-preview"; artifactVersion = 1; note = "selfcheck" }
         $fakeVerificationDecisionPath = Save-ReviewerVerificationPreview -Manifest $fakeVerificationDecision -Directory $selfCheckArtifactDir -BaseName "selfcheck-verif-decision" -MasterKey $selfCheckKey
@@ -5611,7 +5611,7 @@ function Invoke-DryRunSelfChecks {
         if (Test-Path -LiteralPath $selfCheckArtifactDir) { Remove-Item -LiteralPath $selfCheckArtifactDir -Recurse -Force }
     }
 
-    Write-Host "[DRY-RUN] Self-check 28/$total : the gate vote set is the closed singleton {Approved}; no rejection path exists" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 29/$total : the gate vote set is the closed singleton {Approved}; no rejection path exists" -ForegroundColor Cyan
     if (@($script:ReviewerGateAllowedVotes).Count -ne 1 -or $script:ReviewerGateAllowedVotes[0] -cne "Approved") {
         $failures.Add("ReviewerGateAllowedVotes is not the single-element closed set @('Approved').")
     }
@@ -5634,7 +5634,7 @@ function Invoke-DryRunSelfChecks {
         else { Write-Host "  OK - the only vote the gate can ever cast is the literal, hardcoded string 'Approved'" -ForegroundColor Green }
     }
 
-    Write-Host "[DRY-RUN] Self-check 29/$total : ADO fails the approval gate closed, unconditionally" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 30/$total : ADO fails the approval gate closed, unconditionally" -ForegroundColor Cyan
     $adoCapabilities = Get-ReviewerGateProviderCapabilities -Provider "AzureDevOps" -TargetBranch "main" -HeadSha ("a" * 40)
     if ([bool]$adoCapabilities.IsGitHub -or [bool]$adoCapabilities.Dismissal.known -or [bool]$adoCapabilities.Checks.known) {
         $failures.Add("Get-ReviewerGateProviderCapabilities did not fail closed for the AzureDevOps provider.")
@@ -5645,7 +5645,7 @@ function Invoke-DryRunSelfChecks {
     }
     else { Write-Host "  OK - this reviewer script's config.provider is restricted to AzureDevOps, so the approval gate is unconditionally closed today" -ForegroundColor Green }
 
-    Write-Host "[DRY-RUN] Self-check 30/$total : the gate library is a pure, network-free, MCP-free, self-contained file" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 31/$total : the gate library is a pure, network-free, MCP-free, self-contained file" -ForegroundColor Cyan
     $gateLibraryPath = Join-Path $PSScriptRoot "DeliveryGates.ps1"
     $gateLibraryErrs = Test-ParserValidity -Path $gateLibraryPath
     if ($gateLibraryErrs.Count -gt 0) { $failures.Add("Parse errors in DeliveryGates.ps1: $($gateLibraryErrs -join '; ')") }
@@ -5665,7 +5665,7 @@ function Invoke-DryRunSelfChecks {
     }
     Write-Host "  OK - DeliveryGates.ps1 makes no MCP, session, or provider-transport call of its own" -ForegroundColor Green
 
-    Write-Host "[DRY-RUN] Self-check 31/$total : gate state is namespaced separately from raw delivery state" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 32/$total : gate state is namespaced separately from raw delivery state" -ForegroundColor Cyan
     $gateStatePaths = @($gateDeliveryStatePath, $gateEligibilityStatePath)
     $rawStatePaths = @($reviewedStatePath, $attemptsStatePath)
     $overlap = @($gateStatePaths | Where-Object { $rawStatePaths -icontains $_ })
@@ -5684,7 +5684,7 @@ function Invoke-DryRunSelfChecks {
         else { Write-Host "  OK - the raw pending-delivery-plan lookup never references gate state" -ForegroundColor Green }
     }
 
-    Write-Host "[DRY-RUN] Self-check 32/$total : the dedicated gate revalidation session delegates to the proven isolated-session helper" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 33/$total : the dedicated gate revalidation session delegates to the proven isolated-session helper" -ForegroundColor Cyan
     $gateRevalidationAt = & $declOf "Invoke-ReviewerGateRevalidation"
     if ($gateRevalidationAt -lt 0) {
         $failures.Add("Could not locate Invoke-ReviewerGateRevalidation to verify its session lifecycle.")
@@ -5702,7 +5702,7 @@ function Invoke-DryRunSelfChecks {
         else { Write-Host "  OK - the dedicated gate revalidation session reuses Invoke-ReviewerConventionSession rather than reimplementing session lifecycle" -ForegroundColor Green }
     }
 
-    Write-Host "[DRY-RUN] Self-check 33/$total : Invoke-ReviewerGateDelivery never votes when comments are incomplete (never vote after comment failure)" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 34/$total : Invoke-ReviewerGateDelivery never votes when comments are incomplete (never vote after comment failure)" -ForegroundColor Cyan
     $incompleteDecision = [pscustomobject][ordered]@{
         prId = 1; sourceCommit = ("1" * 40); changeSetDigest = ("3" * 64)
         unattendedComments = @([pscustomobject]@{ severity = "important"; filePath = "/a.cs"; line = 1; comment = "one" },
@@ -5774,7 +5774,7 @@ function Invoke-DryRunSelfChecks {
     }
     else { Write-Host "  OK - no vote is cast when comment delivery could not be confirmed complete" -ForegroundColor Green }
 
-    Write-Host "[DRY-RUN] Self-check 34/$total : Invoke-ReviewerGateReplay re-derives CURRENT authority; a persisted request never outlives it" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 35/$total : Invoke-ReviewerGateReplay re-derives CURRENT authority; a persisted request never outlives it" -ForegroundColor Cyan
     $selfCheck34ArtifactDir = Join-Path $StateDir "selfcheck34-artifacts"
     New-Item -ItemType Directory -Force -Path $selfCheck34ArtifactDir | Out-Null
     $priorCommentSwitch34 = $EnableVerifiedCommentGate
@@ -5924,7 +5924,7 @@ function Invoke-DryRunSelfChecks {
         if (Test-Path -LiteralPath $selfCheck34ArtifactDir) { Remove-Item -LiteralPath $selfCheck34ArtifactDir -Recurse -Force }
     }
 
-    Write-Host "[DRY-RUN] Self-check 35/$total : Invoke-ReviewerPromoteVerifiedPreview re-verifies decision bindings fatally, before any write" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 36/$total : Invoke-ReviewerPromoteVerifiedPreview re-verifies decision bindings fatally, before any write" -ForegroundColor Cyan
     $selfCheck35ArtifactDir = Join-Path $StateDir "selfcheck35-artifacts"
     New-Item -ItemType Directory -Force -Path $selfCheck35ArtifactDir | Out-Null
     try {
@@ -5960,7 +5960,7 @@ function Invoke-DryRunSelfChecks {
         if (Test-Path -LiteralPath $selfCheck35ArtifactDir) { Remove-Item -LiteralPath $selfCheck35ArtifactDir -Recurse -Force }
     }
 
-    Write-Host "[DRY-RUN] Self-check 36/$total : the startup banner accounts for gate writes, never claims NONE while a gate write is possible" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 37/$total : the startup banner accounts for gate writes, never claims NONE while a gate write is possible" -ForegroundColor Cyan
     # Patterns are built via concatenation so this check's OWN source text
     # does not itself contain the literal substring being searched for -
     # otherwise this could never meaningfully fail even if the real banner
@@ -5972,7 +5972,7 @@ function Invoke-DryRunSelfChecks {
     }
     else { Write-Host "  OK - the banner's NONE branch is gated on both raw AND gate write authority" -ForegroundColor Green }
 
-    Write-Host "[DRY-RUN] Self-check 37/$total : a gate capability enabled after a commit was already raw-previewed still gets its first chance" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 38/$total : a gate capability enabled after a commit was already raw-previewed still gets its first chance" -ForegroundColor Cyan
     $gateDeliveryStateExistedBefore37 = Test-Path -LiteralPath $gateDeliveryStatePath -PathType Leaf
     $priorGateDeliveryState37 = Get-JsonState -Path $gateDeliveryStatePath
     try {
@@ -6010,7 +6010,7 @@ function Invoke-DryRunSelfChecks {
         }
     }
 
-    Write-Host "[DRY-RUN] Self-check 38/$total : AuthoritativeSourcesCurrent/checks-policy-snapshot/EvaluationToolSha256 never fabricate approval evidence" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 39/$total : AuthoritativeSourcesCurrent/checks-policy-snapshot/EvaluationToolSha256 never fabricate approval evidence" -ForegroundColor Cyan
     # Every pattern below is built via concatenation so this check's OWN
     # source text never contains the literal substring being searched for -
     # otherwise a -ge 0 (forbidden-pattern-present) check could never pass
@@ -6038,7 +6038,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - AuthoritativeSourcesCurrent closes approval, checks/policy snapshots cannot authorize it, and EvaluationToolSha256 has a real operator-supplied live path" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 39/$total : a gate refresh never re-delivers raw, and a gate-processing fault does not cause unbounded full re-review" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 40/$total : a gate refresh never re-delivers raw, and a gate-processing fault does not cause unbounded full re-review" -ForegroundColor Cyan
     # Finding 1 (Opus re-review round 3, part 2): the pure stand-in
     # Invoke-ReviewerPullRequest substitutes for a real Invoke-ReviewerDelivery
     # call when raw already fully delivered at this exact commit. It must
@@ -6114,7 +6114,7 @@ function Invoke-DryRunSelfChecks {
         }
     }
 
-    Write-Host "[DRY-RUN] Self-check 40/$total : a raw pending-delivery plan is never routed into Invoke-ReviewerPromotion once raw delivery is already satisfied under today's write switches" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 41/$total : a raw pending-delivery plan is never routed into Invoke-ReviewerPromotion once raw delivery is already satisfied under today's write switches" -ForegroundColor Cyan
     # Pure boundary check: the exact function used at both cycle-loop call
     # sites gating a pending-plan retry.
     $shouldReplayCases = @(
@@ -6188,7 +6188,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - both cycle-loop call sites that could route a pending plan into Invoke-ReviewerPromotion are gated by Test-ReviewerRawPendingPlanShouldReplay" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 41/$total : superseded expiry/binding refresh invitations are bounded by a hard, code-defined budget; exceeding it closes terminally; a new commit resets it" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 42/$total : superseded expiry/binding refresh invitations are bounded by a hard, code-defined budget; exceeding it closes terminally; a new commit resets it" -ForegroundColor Cyan
     $budgetCases = @(
         , @(0, $true, 1)
         , @(1, $true, 2)
@@ -6306,7 +6306,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - Invoke-ReviewerGateForPullRequest's success-path record write carries supersededCount forward for the same commit" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 42/$total : a gate refresh preserves the prior raw delivery-plan pointer in reviewed.json verbatim; a later raw-enabled cycle replays it instead of reviewing fresh" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 43/$total : a gate refresh preserves the prior raw delivery-plan pointer in reviewed.json verbatim; a later raw-enabled cycle replays it instead of reviewing fresh" -ForegroundColor Cyan
     # Seed a prior reviewed.json record for a raw delivery that posted SOME
     # comments but is still genuinely incomplete: deliveryPending=$true,
     # pendingCapabilities=["comments"], pointing at a real, on-disk sealed
@@ -6414,7 +6414,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - Invoke-ReviewerPullRequest's persist step calls Get-ReviewerPersistedReviewRecord and leaves reviewed.json untouched on a `$null return" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 43/$total : the VerifiedMultiPass mint refusal matrix, grant binding, no-leakage, and default-disabled" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 44/$total : the VerifiedMultiPass mint refusal matrix, grant binding, no-leakage, and default-disabled" -ForegroundColor Cyan
     function New-SelfCheck43Decision {
         <# Baseline: a fully-sealed, fully-valid decision that would authorize
            gateComments/gateApproval/gatePromotion, one dimension away from
@@ -6436,6 +6436,8 @@ function Invoke-DryRunSelfChecks {
             decisionExpiresAtUtc = ([DateTime]::UtcNow.AddHours(1).ToString("o"))
             candidates = @($candidate); unattendedComments = @($candidate); unattendedSuggestions = @()
             humanPromotableComments = @($candidate)
+            gateHumanPromotableCount = 0; gateImportantOrHigherCount = 0
+            gateImportantOrHigherKeys = @()
         }
         foreach ($key in $Overrides.Keys) { $decision | Add-Member -Force -NotePropertyName $key -NotePropertyValue $Overrides[$key] }
         return $decision
@@ -6459,7 +6461,8 @@ function Invoke-DryRunSelfChecks {
             [string]$Purpose = "gateComments",
             [hashtable]$DecisionOverrides = @{},
             [hashtable]$LiveBindingOverrides = @{},
-            [string[]]$CoverageKeys = @((Get-ReviewerGateManifestKey -Entry ([pscustomobject]@{ candidateHash = "h1"; severity = "important"; filePath = "/a.cs"; line = 1; comment = "finding one" }))),
+            [string[]]$CoverageKeys = $null,
+            [string[]]$ConfirmedImportantOrHigherKeys = @(),
             [bool]$StructurallyPossible = $true,
             [bool]$GatePolicyIsOff = $false,
             [bool]$RevalidationOk = $true,
@@ -6471,15 +6474,28 @@ function Invoke-DryRunSelfChecks {
         )
         $decision = New-SelfCheck43Decision -Overrides $DecisionOverrides
         $liveBinding = New-SelfCheck43LiveBinding -Overrides $LiveBindingOverrides
+        if (-not $PSBoundParameters.ContainsKey('CoverageKeys')) {
+            $CoverageKeys = if ($Purpose -ceq "gateApproval") {
+                @(Get-ReviewerGateApprovalCoverageKey -Decision $decision `
+                    -ConfirmedImportantOrHigherKeys $ConfirmedImportantOrHigherKeys)
+            }
+            else {
+                @((Get-ReviewerGateManifestKey -Entry ([pscustomobject]@{
+                            candidateHash = "h1"; severity = "important"; filePath = "/a.cs"
+                            line = 1; comment = "finding one"
+                        })))
+            }
+        }
         return Test-ReviewerVerifiedMultiPassPreconditions -Purpose $Purpose -Decision $decision -PrId $PrId `
             -ExpectedSourceCommit $ExpectedSourceCommit -CoverageKeys $CoverageKeys -LiveBinding $liveBinding `
             -NowUtc ([DateTime]::UtcNow) -StructurallyPossible $StructurallyPossible -GatePolicyIsOff $GatePolicyIsOff `
-            -RevalidationOk $RevalidationOk -PrIsActive $PrIsActive -PrIsDraft $PrIsDraft -SourceCommitUnchanged $SourceCommitUnchanged
+            -RevalidationOk $RevalidationOk -PrIsActive $PrIsActive -PrIsDraft $PrIsDraft `
+            -SourceCommitUnchanged $SourceCommitUnchanged -ConfirmedImportantOrHigherKeys $ConfirmedImportantOrHigherKeys
     }
 
     $sc43BaselineComments = Test-SelfCheck43Case
     $sc43BaselinePromotion = Test-SelfCheck43Case -Purpose "gatePromotion"
-    $sc43BaselineApproval = Test-SelfCheck43Case -Purpose "gateApproval" -CoverageKeys @("777|$('c' * 40)|Approved")
+    $sc43BaselineApproval = Test-SelfCheck43Case -Purpose "gateApproval"
     $sc43BaselineFailures = 0
     if (-not [bool]$sc43BaselineComments.Ok) { $sc43BaselineFailures++; $failures.Add("Baseline gateComments preconditions unexpectedly refused: $($sc43BaselineComments.ReasonCodes -join ',').") }
     if (-not [bool]$sc43BaselinePromotion.Ok) { $sc43BaselineFailures++; $failures.Add("Baseline gatePromotion preconditions unexpectedly refused: $($sc43BaselinePromotion.ReasonCodes -join ',').") }
@@ -6507,7 +6523,10 @@ function Invoke-DryRunSelfChecks {
         @{ Name = "revalidation source commit moved"; Args = @{ SourceCommitUnchanged = $false }; Reason = "sourceCommitMoved" }
         @{ Name = "coverage not a sealed subset"; Args = @{ CoverageKeys = @((Get-ReviewerGateManifestKey -Entry ([pscustomobject]@{ candidateHash = "h1"; severity = "important"; filePath = "/a.cs"; line = 1; comment = "finding one" })), "bogus-unsealed-key") }; Reason = "coverageNotSealedSubset" }
         @{ Name = "approval coverage malformed"; Args = @{ Purpose = "gateApproval"; CoverageKeys = @("not-the-expected-sentinel") }; Reason = "approvalCoverageMalformed" }
-        @{ Name = "unsafe withheld reasons for approval"; Args = @{ Purpose = "gateApproval"; CoverageKeys = @("777|$('c' * 40)|Approved"); DecisionOverrides = @{ allWithheldReasonsSafe = $false } }; Reason = "unknownWithheldReason" }
+        @{ Name = "unsafe withheld reasons for approval"; Args = @{ Purpose = "gateApproval"; DecisionOverrides = @{ allWithheldReasonsSafe = $false } }; Reason = "unknownWithheldReason" }
+        @{ Name = "human-promotable gate finding blocks approval"; Args = @{ Purpose = "gateApproval"; DecisionOverrides = @{ gateHumanPromotableCount = 1 } }; Reason = "gateFindingsUndelivered" }
+        @{ Name = "important gate finding blocks approval"; Args = @{ Purpose = "gateApproval"; DecisionOverrides = @{ gateImportantOrHigherCount = 1; gateImportantOrHigherKeys = @("blocking-key") } }; Reason = "gateFindingsUndelivered" }
+        @{ Name = "confirmed important gate finding blocks approval"; Args = @{ Purpose = "gateApproval"; ConfirmedImportantOrHigherKeys = @("blocking-key") }; Reason = "gateFindingsUndelivered" }
     )
     $sc43MatrixFailures = 0
     foreach ($case in $sc43Cases) {
@@ -6712,7 +6731,7 @@ function Invoke-DryRunSelfChecks {
         }
     }
 
-    Write-Host "[DRY-RUN] Self-check 44/$total : PromoteVerifiedPreview reachability, transient-vs-terminal refusal classification, and never-vote-on-expiry" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 45/$total : PromoteVerifiedPreview reachability, transient-vs-terminal refusal classification, and never-vote-on-expiry" -ForegroundColor Cyan
 
     # Finding 1 (structural feasibility): the mint's gatePromotion branch must
     # derive StructurallyPossible from the SEALED decision's own
@@ -6917,7 +6936,7 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - both the direct and replay gate-delivery record writes OR a transient approval-authorization failure into pendingReplay" -ForegroundColor Green
     }
 
-    Write-Host "[DRY-RUN] Self-check 45/$total : disk-round-tripped gate decisions hash from sealed manifest text and raw generalist approval JSON is parsed" -ForegroundColor Cyan
+    Write-Host "[DRY-RUN] Self-check 46/$total : disk-round-tripped gate decisions hash from sealed manifest text and raw generalist approval JSON is parsed" -ForegroundColor Cyan
     $sc45Dir = Join-Path $StateDir "selfcheck45-artifacts"
     New-Item -ItemType Directory -Force -Path $sc45Dir | Out-Null
     try {
@@ -6980,6 +6999,45 @@ function Invoke-DryRunSelfChecks {
     }
     finally {
         if (Test-Path -LiteralPath $sc45Dir) { Remove-Item -LiteralPath $sc45Dir -Recurse -Force }
+    }
+
+    Write-Host "[DRY-RUN] Self-check 47/$total : degraded or missing generalist pass arrays seal a designed failed gate decision without StrictMode faults" -ForegroundColor Cyan
+    $sc47NullAccounting = Get-ReviewerGateGeneralistPassAccounting -InputManifest $null
+    $sc47NullPassManifest = [pscustomobject]@{ rawGeneralistPasses = $null }
+    $sc47NullPassAccounting = Get-ReviewerGateGeneralistPassAccounting -InputManifest $sc47NullPassManifest
+    $sc47DegradedManifest = [pscustomobject]@{
+        rawGeneralistPasses = @(
+            [pscustomobject]@{ status = "degraded"; model = "claude-opus-5"; markerJson = "" },
+            [pscustomobject]@{ status = "degraded"; model = "gpt-5.6-sol"; markerJson = "" }
+        )
+    }
+    $sc47DegradedAccounting = Get-ReviewerGateGeneralistPassAccounting -InputManifest $sc47DegradedManifest
+    $sc47Binding = @{
+        prId = 47; repositoryId = $cfgRepoId.ToLowerInvariant(); organization = $Organization; project = $ExpectedProject
+        sourceCommit = ("4" * 40); targetCommit = ("5" * 40); changeSetDigest = ("6" * 64)
+        verificationDecisionSha256 = ("7" * 64); verificationInputSha256 = ("8" * 64)
+        conventionPlanSha256 = ("0" * 64); factPlanSha256 = ("0" * 64); specialistArtifactSha256 = ("0" * 64)
+        packPolicySha256 = $ConventionPackPolicySha256; configSha256 = $ConfigSha256.ToLowerInvariant()
+        scriptSha256 = $ScriptSelfSha256.ToLowerInvariant(); gateLibrarySha256 = $DeliveryGatesLibrarySha256
+        gatePolicySha256 = $GatePolicySha256; qualificationSha256 = ("0" * 64)
+        verificationLibrarySha256 = $CrossVerificationLibrarySha256; verificationPromptSha256 = $CrossVerificationPromptSha256
+        verificationPolicySha256 = $CrossVerificationPolicySha256; verificationSchemaSha256 = $CrossVerificationSchemaSha256
+        threadSetDigest = ("9" * 64); checksSnapshotSha256 = ("0" * 64); policySnapshotSha256 = ("0" * 64)
+        passesRequested = [int]$sc47DegradedAccounting.RequestedCount
+        generalistPassModels = (@($sc47DegradedAccounting.CompletedModels) -join '|')
+    }
+    $sc47Decision = New-ReviewerGateDecision -Binding $sc47Binding -EffectivePolicy $EffectiveGatePolicy `
+        -Qualification $null -Facets @() -ChangedPaths @() -ThreadFacts @() `
+        -RunAccounting ([pscustomobject]@{ Ok = $false; ReasonCodes = @("verificationDegraded") }) `
+        -SuggestionGateEnabled:$false -QualificationExpiresAtUtc "" -CreatedAtUtc ([DateTime]::UtcNow)
+    if ([int]$sc47NullAccounting.RequestedCount -ne 0 -or [int]$sc47NullPassAccounting.RequestedCount -ne 0 -or
+        [int]$sc47DegradedAccounting.RequestedCount -ne 2 -or @($sc47DegradedAccounting.Completed).Count -ne 0 -or
+        [bool]$sc47DegradedAccounting.PairComplete -or [bool]$sc47Decision.runOk -or
+        @($sc47Decision.runReasonCodes) -cnotcontains "verificationDegraded") {
+        $failures.Add("Missing/null/all-degraded generalist pass inputs did not produce zero completed passes and a sealed runOk=false verificationDegraded decision.")
+    }
+    else {
+        Write-Host "  OK - missing, null, and all-degraded pass arrays are StrictMode-safe and seal an explicit verificationDegraded decision" -ForegroundColor Green
     }
 
     }
@@ -8903,6 +8961,59 @@ function Test-ReviewerGeneralistPassesBothApprove {
     return $true
 }
 
+function Get-ReviewerGateGeneralistPassAccounting {
+    <# StrictMode-safe extraction: never use member enumeration such as
+       $passes.model, which throws when the array is empty. Missing manifests,
+       null pass arrays, and zero completed passes all return a designed
+       degraded accounting shape rather than an exception. #>
+    param($InputManifest = $null)
+    $passes = @(
+        if ($null -ne $InputManifest) {
+            @(Get-ReviewerVerificationValue $InputManifest "rawGeneralistPasses" @()) |
+                Where-Object { $null -ne $_ }
+        }
+    )
+    $completed = @($passes | Where-Object {
+            [string](Get-ReviewerHashValue -Container $_ -Key 'status' -Default '') -ceq "complete"
+        })
+    $requestedModels = @($passes | ForEach-Object {
+            [string](Get-ReviewerHashValue -Container $_ -Key 'model' -Default '')
+        } | Where-Object { $_ } | Sort-Object)
+    $completedModels = @($completed | ForEach-Object {
+            [string](Get-ReviewerHashValue -Container $_ -Key 'model' -Default '')
+        } | Where-Object { $_ } | Sort-Object)
+    $expectedModels = @("claude-opus-5", "gpt-5.6-sol") | Sort-Object
+    return @{
+        Passes          = $passes
+        Completed       = $completed
+        RequestedCount  = $passes.Count
+        RequestedModels = $requestedModels
+        CompletedModels = $completedModels
+        PairComplete    = ($completed.Count -eq 2 -and
+            ($requestedModels -join '|') -ceq ($expectedModels -join '|') -and
+            ($completedModels -join '|') -ceq ($expectedModels -join '|'))
+        BothApprove     = (Test-ReviewerGeneralistPassesBothApprove -RawPasses $passes)
+    }
+}
+
+function Get-ReviewerConfirmedImportantOrHigherGateKeys {
+    param(
+        [Parameter(Mandatory)]$Decision,
+        [Parameter(Mandatory)][System.Collections.Generic.HashSet[string]]$ConfirmedFingerprints
+    )
+    return @(@(Get-ReviewerHashValue -Container $Decision -Key 'candidates' -Default @()) |
+        Where-Object { [string]$_.severity -cin @("critical", "important") } |
+        Where-Object {
+            $fingerprint = Get-ReviewerFindingFingerprint -Finding @{
+                severity = [string]$_.severity; filePath = [string]$_.filePath
+                line = [int]$_.line; comment = [string]$_.comment
+            }
+            $ConfirmedFingerprints.Contains($fingerprint)
+        } |
+        ForEach-Object { Get-ReviewerGateManifestKey -Entry $_ } |
+        Sort-Object -Unique)
+}
+
 function New-ReviewerVerifiedMultiPassAuthorization {
     <#
         The SOLE VerifiedMultiPass producer in this script. Re-derives every
@@ -9016,13 +9127,19 @@ function New-ReviewerVerifiedMultiPassAuthorization {
         $liveBinding["sourceCommit"] = ([string]$revalidation.SourceCommit).ToLowerInvariant()
         $liveBinding["changeSetDigest"] = ([string]$revalidation.ChangeSetDigest).ToLowerInvariant()
     }
+    $confirmedImportantOrHigherKeys = @()
+    if ($Purpose -ceq "gateApproval" -and $revalidation.Ok) {
+        $confirmedImportantOrHigherKeys = @(Get-ReviewerConfirmedImportantOrHigherGateKeys -Decision $decision `
+            -ConfirmedFingerprints $revalidation.ExistingFingerprints)
+    }
 
     $precondition = Test-ReviewerVerifiedMultiPassPreconditions -Purpose $Purpose -Decision $decision `
         -PrId $PrId -ExpectedSourceCommit $ExpectedSourceCommit -CoverageKeys @($CoverageKeys) `
         -LiveBinding $liveBinding -NowUtc ([DateTime]::UtcNow) -StructurallyPossible ([bool]$structurallyPossible) `
         -GatePolicyIsOff ($EffectiveGatePolicy.mode -ceq "off") -RevalidationOk ([bool]$revalidation.Ok) `
         -PrIsActive ([bool]$revalidation.PrIsActive) -PrIsDraft ([bool]$revalidation.PrIsDraft) `
-        -SourceCommitUnchanged ([bool]$revalidation.SourceCommitUnchanged)
+        -SourceCommitUnchanged ([bool]$revalidation.SourceCommitUnchanged) `
+        -ConfirmedImportantOrHigherKeys $confirmedImportantOrHigherKeys
     if (-not $precondition.Ok) {
         throw [ReviewerDeliveryAuthorizationException]::new(
             "VerifiedMultiPass mint for '$Purpose' on PR ${PrId}: refused ($($precondition.ReasonCodes -join ', '))."
@@ -9040,7 +9157,11 @@ function New-ReviewerVerifiedMultiPassAuthorization {
         $ExpectedSourceCommit,
         $coverageDigest
     )
-    return @{ Authorization = $authorization; Revalidation = $revalidation }
+    return @{
+        Authorization = $authorization
+        Revalidation = $revalidation
+        ConfirmedImportantOrHigherKeys = $confirmedImportantOrHigherKeys
+    }
 }
 
 function Invoke-ReviewerGateDelivery {
@@ -9236,14 +9357,18 @@ function Invoke-ReviewerGateDelivery {
             return $outcome
         }
 
+        $confirmedImportantOrHigherKeys = @(Get-ReviewerConfirmedImportantOrHigherGateKeys -Decision $Decision `
+            -ConfirmedFingerprints $freshFingerprints)
+
         # Approval NEVER proceeds on the first revalidation alone: a SEPARATE
         # gateApproval mint performs its own second, independent revalidation
         # immediately before the vote call, which is what catches a source
         # push that happened while comments were being written (source-push
-        # simulation in the test matrix). Coverage is a fixed sentinel, not a
-        # candidate set - approval is a single PR-level action, never a
-        # per-comment grant.
-        $approvalCoverageKeys = @("$prId|$(([string]$Decision.sourceCommit).ToLowerInvariant())|Approved")
+        # simulation in the test matrix). Coverage binds the exact SEALED
+        # gate-owned finding state and important-or-higher findings confirmed
+        # present after comment writes; it is never a comment grant.
+        $approvalCoverageKeys = @(Get-ReviewerGateApprovalCoverageKey -Decision $Decision `
+            -ConfirmedImportantOrHigherKeys $confirmedImportantOrHigherKeys)
         try {
             $approvalMint = New-ReviewerVerifiedMultiPassAuthorization -Purpose gateApproval `
                 -DecisionArtifactPath $DecisionArtifactPath -PrId $prId -ExpectedSourceCommit ([string]$Decision.sourceCommit) `
@@ -9290,6 +9415,9 @@ function Invoke-ReviewerGateDelivery {
             -GeneralistBothApprove ([bool]$Decision.generalistBothApprove) `
             -SpecialistOkForApproval ([bool]$Decision.specialistOkForApproval) `
             -RawGateApproves $RawGateApproves `
+            -GateHumanPromotableCount ([int]$Decision.gateHumanPromotableCount) `
+            -GateImportantOrHigherCount ([int]$Decision.gateImportantOrHigherCount) `
+            -GateImportantOrHigherConfirmedCount @($approvalMint.ConfirmedImportantOrHigherKeys).Count `
             -ChecksKnown ([bool]$secondRevalidation.Capabilities.Checks.known) `
             -ChecksAllSuccess ([bool]$secondRevalidation.Capabilities.Checks.allSuccess) `
             -DismissalKnown ([bool]$secondRevalidation.Capabilities.Dismissal.known) `
@@ -9430,8 +9558,9 @@ function Invoke-ReviewerGateForPullRequest {
         # values, never the live config, so a decision sealed under a
         # two-pass config can never be laundered through a process running
         # fewer configured passes later (T4/T5).
-        $rawPasses = @(if ($inputManifest) { @($inputManifest.rawGeneralistPasses) } else { @() })
-        $rawPassesCompleted = @($rawPasses | Where-Object { $_.status -ceq "complete" })
+        $generalistAccounting = Get-ReviewerGateGeneralistPassAccounting -InputManifest $inputManifest
+        $rawPasses = @($generalistAccounting.Passes)
+        $rawPassesCompleted = @($generalistAccounting.Completed)
         $binding = @{
             prId                      = $prId
             repositoryId              = $cfgRepoId.ToLowerInvariant()
@@ -9469,8 +9598,8 @@ function Invoke-ReviewerGateForPullRequest {
             # authorize approval: nothing reads it back to decide anything.
             checksSnapshotSha256     = "0" * 64
             policySnapshotSha256     = "0" * 64
-            passesRequested          = @($rawPasses).Count
-            generalistPassModels     = (@($rawPassesCompleted.model | Sort-Object) -join '|')
+            passesRequested          = [int]$generalistAccounting.RequestedCount
+            generalistPassModels     = (@($generalistAccounting.CompletedModels) -join '|')
         }
         $decision = New-ReviewerGateDecision -Binding $binding -EffectivePolicy $EffectiveGatePolicy -Qualification $qualification `
             -Facets $facets -ChangedPaths @($Bound.ChangedPaths) -ThreadFacts $threads -RunAccounting $runAccounting `
@@ -9481,12 +9610,10 @@ function Invoke-ReviewerGateForPullRequest {
         # function already has, and carried on the decision so the delivery
         # step (and PromoteVerifiedPreview) can reuse them without recomputing
         # verification-internal shapes.
-        $decision | Add-Member -NotePropertyName generalistPairComplete -NotePropertyValue (
-            @($rawPassesCompleted).Count -eq 2 -and
-            (@($rawPasses.model | Sort-Object) -join '|') -ceq (@("claude-opus-5", "gpt-5.6-sol") -join '|')
-        )
+        $decision | Add-Member -NotePropertyName generalistPairComplete `
+            -NotePropertyValue ([bool]$generalistAccounting.PairComplete)
         $decision | Add-Member -NotePropertyName generalistBothApprove `
-            -NotePropertyValue (Test-ReviewerGeneralistPassesBothApprove -RawPasses $rawPasses)
+            -NotePropertyValue ([bool]$generalistAccounting.BothApprove)
         $specialistEnabledForRun = [bool]$EnableConventionSpecialist
         $specialistStatus = $(if ($inputManifest) { [string]$inputManifest.specialistStatus } else { "degraded" })
         $decision | Add-Member -NotePropertyName specialistOkForApproval -NotePropertyValue (
