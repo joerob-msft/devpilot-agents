@@ -755,19 +755,22 @@ foreach ($property in $golden.functions.PSObject.Properties) {
     $actualText = Get-FunctionText -Text $wrapperText -Name $property.Name
     $actualText = $actualText.Replace("`r`n", "`n").Replace("`r", "`n")
     $actualHash = Get-ReviewerConventionSpecialistSha256 -Text $actualText
+    # History is kept for audit, but only the CURRENT authorized state is
+    # accepted. Accepting every historical hash would let a change be reverted
+    # to an earlier authorized shape - dropping, say, the source-coverage
+    # wiring - and still pass, which is the opposite of what a drift pin is for.
     $allowedHashes = @([string]$property.Value)
-    # Authorized deltas accumulate rather than replace: every state this
-    # function has been deliberately moved to since the baseline stays on the
-    # record with the reason it was moved, so the audit trail is not lost the
-    # next time the function legitimately changes.
     $authorizedDelta = $golden.authorizedFunctionDeltas.PSObject.Properties[$property.Name]
     if ($authorizedDelta) {
-        foreach ($delta in @($authorizedDelta.Value)) {
+        $deltaHistory = @($authorizedDelta.Value)
+        foreach ($delta in $deltaHistory) {
             $deltaHash = [string]$delta.sha256
             $deltaReason = [string]$delta.reason
             Assert-Specialist ($deltaHash -match '^[0-9a-f]{64}$' -and $deltaReason.Length -ge 24) `
                 "An authorized generalist delta for '$($property.Name)' must carry an exact hash and a stated reason."
-            $allowedHashes += $deltaHash
+        }
+        if ($deltaHistory.Count -gt 0) {
+            $allowedHashes = @([string]$deltaHistory[$deltaHistory.Count - 1].sha256)
         }
     }
     Assert-Specialist ($allowedHashes -ccontains $actualHash) `
@@ -778,16 +781,32 @@ $generalistPrompt = [IO.File]::ReadAllText(
 if (-not $generalistPrompt.EndsWith("`n", [StringComparison]::Ordinal)) { $generalistPrompt += "`n" }
 $allowedPromptHashes = @([string]$golden.promptSha256)
 if ($golden.PSObject.Properties['authorizedPromptDeltas']) {
-    foreach ($delta in @($golden.authorizedPromptDeltas)) {
+    $promptHistory = @($golden.authorizedPromptDeltas)
+    foreach ($delta in $promptHistory) {
         $deltaHash = [string]$delta.sha256
         $deltaReason = [string]$delta.reason
         Assert-Specialist ($deltaHash -match '^[0-9a-f]{64}$' -and $deltaReason.Length -ge 24) `
             "An authorized generalist prompt delta must carry an exact hash and a stated reason."
-        $allowedPromptHashes += $deltaHash
+    }
+    if ($promptHistory.Count -gt 0) {
+        $allowedPromptHashes = @([string]$promptHistory[$promptHistory.Count - 1].sha256)
     }
 }
 Assert-Specialist ($allowedPromptHashes -ccontains (Get-ReviewerConventionSpecialistSha256 -Text $generalistPrompt)) `
     "Disabled-path golden changed for the generalist prompt."
+# A drift pin that accepts an older authorized hash is not a pin. Prove the
+# newest is the ONLY accepted value by checking a superseded one is refused.
+foreach ($property in $golden.authorizedFunctionDeltas.PSObject.Properties) {
+    $deltaHistory = @($property.Value)
+    if ($deltaHistory.Count -lt 2) { continue }
+    $supersededHash = [string]$deltaHistory[0].sha256
+    $currentHash = [string]$deltaHistory[$deltaHistory.Count - 1].sha256
+    Assert-Specialist ($supersededHash -cne $currentHash) `
+        "A superseded authorized hash for '$($property.Name)' must differ from the current one."
+    $currentText = (Get-FunctionText -Text $wrapperText -Name $property.Name).Replace("`r`n", "`n").Replace("`r", "`n")
+    Assert-Specialist ((Get-ReviewerConventionSpecialistSha256 -Text $currentText) -cne $supersededHash) `
+        "Reverting '$($property.Name)' to a superseded authorized hash must not pass the drift pin."
+}
 
 $pullRequestFunction = Get-FunctionText -Text $wrapperText -Name "Invoke-ReviewerPullRequest"
 $deliveryAt = $pullRequestFunction.IndexOf("Invoke-ReviewerDelivery", [StringComparison]::Ordinal)

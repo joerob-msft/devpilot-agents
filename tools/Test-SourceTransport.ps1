@@ -573,12 +573,21 @@ Assert-Source (Test-Throws {
         Assert-ReviewerSourceChangeSetAgreement -ChangedPaths @('/src/a.cs') -SpansByPath $agreementSpans
     }) "a path list missing a path the diff mentions is rejected"
 Assert-Source (Test-Throws {
-        Assert-ReviewerSourceChangeSetAgreement -ChangedPaths @('/src/a.cs', '/src/b.cs') -SpansByPath ([ordered]@{})
-    }) "a full path list against an empty span map is rejected as an unrecognized response shape"
+        Assert-ReviewerSourceChangeSetAgreement -ChangedPaths @('/src/a.cs', '/src/b.cs') -SpansByPath ([ordered]@{}) `
+            -ObservedRightHandBlockCount 2
+    }) "an empty span map is rejected when the response did carry right-hand blocks"
 Assert-Source (Test-Throws {
         Assert-ReviewerSourceChangeSetAgreement -ChangedPaths @('/src/a.cs', '/src/b.cs') `
-            -SpansByPath ([ordered]@{ '/src/a.cs' = @(); '/src/b.cs' = @() })
-    }) "a span map with a key per path but no spans at all is rejected too"
+            -SpansByPath ([ordered]@{ '/src/a.cs' = @(); '/src/b.cs' = @() }) -ObservedRightHandBlockCount 2
+    }) "a span map with a key per path but no spans is rejected on the same evidence"
+try {
+    Assert-ReviewerSourceChangeSetAgreement -ChangedPaths @('/src/a.cs', '/src/b.cs') -SpansByPath ([ordered]@{}) `
+        -ObservedRightHandBlockCount 0
+    Assert-Source $true "an empty span map is accepted when the response carried no right-hand block at all"
+}
+catch {
+    Assert-Source $false "an empty span map is accepted when the response carried no right-hand block at all"
+}
 try {
     Assert-ReviewerSourceChangeSetAgreement -ChangedPaths @('src/a.cs', '\src\b.cs', '/src/c.cs') -SpansByPath $agreementSpans
     Assert-Source $true "agreement tolerates separator and leading-slash differences, and extra non-diff paths"
@@ -782,6 +791,249 @@ Assert-Source (($shippedTotal + $renderOverhead) -lt $specialistCap) `
     "a saturated slice budget still renders inside the convention specialist's input bound"
 Assert-Source ($specialistCapSource -match 'PinnedSourceDropped') `
     "a dropped pinned-source block is reported to the caller, not only to the model"
+
+# ---------------------------------------------------------------------------
+Write-Host "[14/14] Change sets with no right-hand lines stay reviewable" -ForegroundColor Cyan
+# ---------------------------------------------------------------------------
+
+# A delete-only, rename-only, binary or empty-file change set legitimately has
+# paths and no right-hand lines. Treating that as a parse failure made whole
+# classes of ordinary pull request permanently unreviewable - and because the
+# cycle treats a transport throw as a skip, one such PR ended the cycle for
+# every PR behind it.
+function New-ChangeEntry {
+    param([string]$Path, [object[]]$Blocks = @(), [bool]$IsFolder = $false)
+    return [pscustomobject]@{
+        item = [pscustomobject]@{ path = $Path; isFolder = $IsFolder }
+        diff = [pscustomobject]@{ lineDiffBlocks = @($Blocks) }
+    }
+}
+$deleteBlock = [pscustomobject]@{ changeType = 2; modifiedLineNumberStart = 0; modifiedLinesCount = 0 }
+$addBlock = [pscustomobject]@{ changeType = 1; modifiedLineNumberStart = 5; modifiedLinesCount = 3 }
+
+$zeroSpanShapes = @(
+    @{ Name = "a delete-only change set"; Response = [pscustomobject]@{ changes = @((New-ChangeEntry -Path '/src/gone.cs' -Blocks @($deleteBlock))) } },
+    @{ Name = "a rename-only change set"; Response = [pscustomobject]@{ changes = @((New-ChangeEntry -Path '/src/renamed.cs')) } },
+    @{ Name = "a binary change with no line blocks"; Response = [pscustomobject]@{ changes = @((New-ChangeEntry -Path '/src/logo.png')) } },
+    @{ Name = "an empty added file"; Response = [pscustomobject]@{ changes = @([pscustomobject]@{ item = [pscustomobject]@{ path = '/src/empty.cs'; isFolder = $false } }) } }
+)
+foreach ($shape in $zeroSpanShapes) {
+    $shapeSpans = Get-ReviewerSourceChangedSpans -Response $shape.Response
+    $shapePaths = @(@($shape.Response.changes) | ForEach-Object { [string]$_.item.path })
+    $observed = Measure-ReviewerSourceRightHandBlocks -Response $shape.Response
+    Assert-Source ($observed -eq 0) "$($shape.Name) carries no right-hand line block"
+    try {
+        Assert-ReviewerSourceChangeSetAgreement -ChangedPaths $shapePaths -SpansByPath $shapeSpans -ObservedRightHandBlockCount $observed
+        Assert-Source $true "$($shape.Name) is accepted rather than treated as a parse failure"
+    }
+    catch {
+        Assert-Source $false "$($shape.Name) is accepted rather than treated as a parse failure"
+    }
+    $shapeReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $shapePaths `
+        -SpansByPath $shapeSpans -Policy $policy -Reader { param([string]$Path) $null }
+    Assert-Source ((@(@($shapeReport.Files) | Where-Object { [string]$_.Reason -ceq 'noChangedSpans' })).Count -eq $shapePaths.Count) `
+        "$($shape.Name) accounts every path as noChangedSpans"
+    $shapeGate = Test-ReviewerSourceCoverageGate -Report $shapeReport -Policy $policy
+    Assert-Source (-not $shapeGate.Ok -and ($shapeGate.ReasonCodes -ccontains 'sourceCoverageEmpty')) `
+        "$($shape.Name) reports sourceCoverageEmpty truthfully instead of throwing"
+}
+
+# A normal edit and a mixed set must still behave, and a mis-parse must still
+# be caught: same input, right-hand blocks present, structured extractor blind.
+$normalResponse = [pscustomobject]@{ changes = @((New-ChangeEntry -Path '/src/a.cs' -Blocks @($addBlock))) }
+Assert-Source ((Measure-ReviewerSourceRightHandBlocks -Response $normalResponse) -eq 1) `
+    "a normal edit is seen as carrying one right-hand block"
+$mixedResponse = [pscustomobject]@{
+    changes = @(
+        (New-ChangeEntry -Path '/src/gone.cs' -Blocks @($deleteBlock)),
+        (New-ChangeEntry -Path '/src/a.cs' -Blocks @($addBlock)),
+        (New-ChangeEntry -Path '/src/logo.png')
+    )
+}
+$mixedSpans = Get-ReviewerSourceChangedSpans -Response $mixedResponse
+$mixedPaths = @('/src/gone.cs', '/src/a.cs', '/src/logo.png')
+try {
+    Assert-ReviewerSourceChangeSetAgreement -ChangedPaths $mixedPaths -SpansByPath $mixedSpans `
+        -ObservedRightHandBlockCount (Measure-ReviewerSourceRightHandBlocks -Response $mixedResponse)
+    Assert-Source $true "a mixed delete/edit/binary change set is accepted"
+}
+catch { Assert-Source $false "a mixed delete/edit/binary change set is accepted" }
+Assert-Source (@($mixedSpans['/src/a.cs']).Count -eq 1 -and @($mixedSpans['/src/gone.cs']).Count -eq 0) `
+    "only the edited path in a mixed set carries a span"
+Assert-Source (Test-Throws {
+        Assert-ReviewerSourceChangeSetAgreement -ChangedPaths @('/src/a.cs') `
+            -SpansByPath ([ordered]@{ '/src/a.cs' = @() }) -ObservedRightHandBlockCount 3
+    }) "right-hand blocks present with no extracted span is still a mis-parse"
+Assert-Source ((Measure-ReviewerSourceRightHandBlocks -Response ([pscustomobject]@{ weird = [pscustomobject]@{ nested = @($addBlock) } })) -eq 1) `
+    "the permissive scan finds right-hand blocks the structured walk would miss"
+
+# ---------------------------------------------------------------------------
+Write-Host "[15/15] Span coverage is measured raw-hunk on raw-hunk" -ForegroundColor Cyan
+# ---------------------------------------------------------------------------
+
+# Mixing merged span counts for readable files with raw hunk counts for
+# unreadable ones made the percentage meaningless. The denominator is now the
+# pull request's own hunks, so the context radius cannot move it.
+$rawText = New-TestFileText -LineCount 200
+$rawSpans = @(@{ Start = 10; End = 11 }, @{ Start = 14; End = 15 }, @{ Start = 100; End = 101 })
+$narrowCut = New-ReviewerSourceFileSlices -Text $rawText -Spans $rawSpans `
+    -Policy (New-TestPolicy -Overrides @{ contextRadiusLines = 0 }) -RemainingTotalBytes 4096
+$wideCut = New-ReviewerSourceFileSlices -Text $rawText -Spans $rawSpans `
+    -Policy (New-TestPolicy -Overrides @{ contextRadiusLines = 20 }) -RemainingTotalBytes 4096
+Assert-Source ([int]$narrowCut.RawRequestedSpanCount -eq 3 -and [int]$wideCut.RawRequestedSpanCount -eq 3) `
+    "the raw hunk denominator is the same at every context radius"
+Assert-Source ([int]$narrowCut.RequestedSpanCount -eq 3 -and [int]$wideCut.RequestedSpanCount -eq 2) `
+    "merging really does change the merged-span count, which is why it is not the denominator"
+Assert-Source ([int]$narrowCut.DeliveredRawSpanCount -eq 3 -and [int]$wideCut.DeliveredRawSpanCount -eq 3) `
+    "every raw hunk counts as delivered under both radii"
+
+# Floors of 60/60 must pass exactly at 6 of 10 files and 30 of 50 hunks.
+$boundaryCorpus = @{}
+$boundaryPaths = @()
+$boundarySpans = [ordered]@{}
+for ($fileIndex = 1; $fileIndex -le 10; $fileIndex++) {
+    $boundaryPath = "/src/f$fileIndex.cs"
+    $boundaryPaths += $boundaryPath
+    $boundarySpans[$boundaryPath] = @(1..5 | ForEach-Object { @{ Start = ($_ * 10); End = ($_ * 10) } })
+    if ($fileIndex -le 6) { $boundaryCorpus[$boundaryPath] = (New-TestFileText -LineCount 60) }
+}
+$boundaryReader = {
+    param([string]$Path)
+    if (-not $boundaryCorpus.ContainsKey($Path)) { return $null }
+    $bodyText = [string]$boundaryCorpus[$Path]
+    [pscustomobject]@{
+        Text = $bodyText; MimeType = 'text/plain'
+        ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($bodyText)
+        Sha256 = Get-ReviewerSourceSha256 -Text $bodyText
+    }
+}
+$boundaryReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $boundaryPaths `
+    -SpansByPath $boundarySpans -Policy (New-TestPolicy -Overrides @{ contextRadiusLines = 0 }) -Reader $boundaryReader
+Assert-Source ([int]$boundaryReport.CoveragePercent -eq 60) "6 readable files of 10 is exactly 60% file coverage"
+Assert-Source ([int]$boundaryReport.RequestedSpanCount -eq 50 -and [int]$boundaryReport.DeliveredSpanCount -eq 30) `
+    "30 delivered hunks of 50 is counted raw on raw"
+Assert-Source ([int]$boundaryReport.SpanPercent -eq 60) "30 of 50 hunks is exactly 60% span coverage"
+Assert-Source ((Test-ReviewerSourceCoverageGate -Report $boundaryReport -Policy $policy).Ok) `
+    "floors of 60 and 60 pass exactly at the boundary"
+
+# Overlapping and adjacent hunks merge into fewer slices but must not shrink the
+# raw denominator or inflate the delivered count.
+$overlapCut = New-ReviewerSourceFileSlices -Text $rawText `
+    -Spans @(@{ Start = 20; End = 25 }, @{ Start = 24; End = 28 }, @{ Start = 29; End = 30 }) `
+    -Policy (New-TestPolicy -Overrides @{ contextRadiusLines = 0 }) -RemainingTotalBytes 4096
+Assert-Source ([int]$overlapCut.RawRequestedSpanCount -eq 3 -and [int]$overlapCut.DeliveredRawSpanCount -eq 3) `
+    "overlapping and adjacent hunks all count once, and all count as delivered"
+Assert-Source (@($overlapCut.Slices).Count -eq 1) "overlapping and adjacent hunks still merge into one slice"
+
+# ---------------------------------------------------------------------------
+Write-Host "[16/16] The real reader seam classifies its own refusals" -ForegroundColor Cyan
+# ---------------------------------------------------------------------------
+
+# Exercised through Get-ReviewerSourceReaderResult - the function the wrapper's
+# reader actually calls - not through a stub, because the bug was that the
+# strict decoder rejected everything first and every cause arrived as the same
+# opaque transportFailed.
+function New-ResourceToolResult {
+    param([string]$Base64, [string]$MimeType = 'text/plain')
+    return [pscustomobject]@{
+        content = @([pscustomobject]@{
+                type = 'resource'
+                resource = [pscustomobject]@{ blob = $Base64; mimeType = $MimeType; uri = '/src/a.cs' }
+            })
+    }
+}
+$goodText = "line 1`nline 2`nline 3"
+$goodBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($goodText))
+$strictDecoder = {
+    param($InnerToolResult, [string]$InnerPath)
+    $innerResource = @($InnerToolResult.content)[0].resource
+    $innerBytes = [Convert]::FromBase64String([string]$innerResource.blob)
+    $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+    $innerText = $strictUtf8.GetString($innerBytes)
+    if (-not (Test-ReviewerSourceSafeText -Text $innerText)) { throw "Agent MCP resource text contained a disallowed control character." }
+    [pscustomobject]@{
+        Text = $innerText; MimeType = [string]$innerResource.mimeType
+        ByteLength = $innerBytes.Length; Sha256 = Get-ReviewerSourceSha256 -Text $innerText
+    }
+}
+$readerPolicy = New-TestPolicy -Overrides @{ maxFetchBytesPerFile = 1024 }
+
+$okResult = Get-ReviewerSourceReaderResult -ToolResult (New-ResourceToolResult -Base64 $goodBase64) `
+    -Path '/src/a.cs' -Policy $readerPolicy -Decoder $strictDecoder
+Assert-Source (([string]$okResult.Text) -ceq $goodText) "the reader seam returns decoded text for acceptable content"
+Assert-Source (-not ($okResult.PSObject.Properties['Rejected'])) "an accepted read carries no rejection"
+
+$binaryResult = Get-ReviewerSourceReaderResult -ToolResult (New-ResourceToolResult -Base64 $goodBase64 -MimeType 'image/png') `
+    -Path '/src/a.png' -Policy $readerPolicy -Decoder $strictDecoder
+Assert-Source (([string]$binaryResult.Rejected) -ceq 'notTextual') "a binary MIME type is classified notTextual, not transportFailed"
+
+$bigBase64 = [Convert]::ToBase64String((New-Object byte[] 4096))
+$bigResult = Get-ReviewerSourceReaderResult -ToolResult (New-ResourceToolResult -Base64 $bigBase64) `
+    -Path '/src/big.cs' -Policy $readerPolicy -Decoder $strictDecoder
+Assert-Source (([string]$bigResult.Rejected) -ceq 'fileTooLarge') "an oversized file is classified fileTooLarge, not transportFailed"
+Assert-Source ([int]$bigResult.ByteLength -eq 4096) "the oversize classification reports the real decoded size"
+
+$badUtf8Base64 = [Convert]::ToBase64String([byte[]](0xC3, 0x28, 0x41, 0x42))
+$badUtf8Result = Get-ReviewerSourceReaderResult -ToolResult (New-ResourceToolResult -Base64 $badUtf8Base64) `
+    -Path '/src/a.cs' -Policy $readerPolicy -Decoder $strictDecoder
+Assert-Source (([string]$badUtf8Result.Rejected) -ceq 'decodeRejected') "invalid UTF-8 is classified decodeRejected"
+
+$controlBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes("a`u{0000}b"))
+$controlResult = Get-ReviewerSourceReaderResult -ToolResult (New-ResourceToolResult -Base64 $controlBase64) `
+    -Path '/src/a.cs' -Policy $readerPolicy -Decoder $strictDecoder
+Assert-Source (([string]$controlResult.Rejected) -ceq 'decodeRejected') "a control character is classified decodeRejected"
+
+Assert-Source ($null -eq (Get-ReviewerSourceReaderResult -ToolResult ([pscustomobject]@{ content = @() }) `
+            -Path '/src/a.cs' -Policy $readerPolicy -Decoder $strictDecoder)) `
+    "a response carrying no resource is a genuine transport failure"
+Assert-Source ($null -eq (Get-ReviewerSourceReaderResult -ToolResult ([pscustomobject]@{ isError = $true }) `
+            -Path '/src/a.cs' -Policy $readerPolicy -Decoder $strictDecoder)) `
+    "an error envelope is a genuine transport failure"
+Assert-Source (Test-Throws {
+        Get-ReviewerSourceReaderResult -ToolResult (New-ResourceToolResult -Base64 $goodBase64) -Path '/src/a.cs' `
+            -Policy $readerPolicy -Decoder { param($a, $b) throw "Agent MCP session is closed." }
+    }) "a session-fatal decode failure still propagates rather than being absorbed"
+
+# The report must honour those classifications end to end.
+$classifyingReader = {
+    param([string]$Path)
+    switch ($Path) {
+        '/src/bin.png' { return [pscustomobject]@{ Rejected = 'notTextual'; MimeType = 'image/png'; ByteLength = 0 } }
+        '/src/big.cs' { return [pscustomobject]@{ Rejected = 'fileTooLarge'; MimeType = 'text/plain'; ByteLength = 999999 } }
+        '/src/bad.cs' { return [pscustomobject]@{ Rejected = 'decodeRejected'; MimeType = 'text/plain'; ByteLength = 10 } }
+        default { return $null }
+    }
+}
+$classifyPaths = @('/src/bin.png', '/src/big.cs', '/src/bad.cs', '/src/gone.cs')
+$classifySpans = [ordered]@{}
+foreach ($classifyPath in $classifyPaths) { $classifySpans[$classifyPath] = @(@{ Start = 1; End = 2 }) }
+$classifyReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $classifyPaths `
+    -SpansByPath $classifySpans -Policy $policy -Reader $classifyingReader
+$classifyByPath = @{}
+foreach ($classifyFile in @($classifyReport.Files)) { $classifyByPath[[string]$classifyFile.Path] = $classifyFile }
+Assert-Source (([string]$classifyByPath['/src/bin.png'].Reason) -ceq 'notTextual') "the report records notTextual from the reader"
+Assert-Source (([string]$classifyByPath['/src/big.cs'].Reason) -ceq 'fileTooLarge') "the report records fileTooLarge from the reader"
+Assert-Source (([string]$classifyByPath['/src/bad.cs'].Reason) -ceq 'decodeRejected') "the report records decodeRejected from the reader"
+Assert-Source (([string]$classifyByPath['/src/gone.cs'].Reason) -ceq 'transportFailed') "a null read is still transportFailed"
+Assert-Source (Test-Throws {
+        New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @('/src/x.cs') `
+            -SpansByPath ([ordered]@{ '/src/x.cs' = @(@{ Start = 1; End = 2 }) }) -Policy $policy `
+            -Reader { param([string]$Path) [pscustomobject]@{ Rejected = 'inventedReason' } }
+    }) "an unknown reader rejection is refused rather than recorded"
+
+# ---------------------------------------------------------------------------
+Write-Host "[17/17] One pull request cannot end the cycle" -ForegroundColor Cyan
+# ---------------------------------------------------------------------------
+
+$passText = Get-FunctionTextFromWrapper -Name 'Invoke-ReviewerModelPass'
+Assert-Source ($passText -notmatch 'throw "Reviewer model input is') `
+    "an oversized model input is no longer thrown out of the pass"
+Assert-Source ($passText -match 'above the code-defined \$script:ReviewerMaxModelInputBytes-byte bound[\s\S]{0,600}?return @\{ Model') `
+    "an oversized model input returns a bounded pass failure instead"
+Assert-Source ($cycleText -match 'try \{[\s\S]{0,400}?Invoke-ReviewerPullRequest -Session[\s\S]{0,600}?catch') `
+    "the per-pull-request review is isolated so one failure cannot end the cycle"
+Assert-Source ($cycleText -match 'isolatedFailure') `
+    "an escaped per-pull-request failure is recorded with its own result code"
 
 # ---------------------------------------------------------------------------
 

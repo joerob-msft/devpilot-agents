@@ -59,8 +59,25 @@ The block opens with every changed path and whether its source actually arrived:
 
 `status` is `delivered`, `partial`, or `omitted`. `reason` comes from a closed
 set: `budgetExhausted`, `sliceCountCapExceeded`, `fileTooLarge`, `notTextual`,
-`transportFailed`, `noChangedSpans`, `fileCountCapExceeded`, `pathRejected`,
-`spanOutsideFile`, `unsafeSliceText`.
+`decodeRejected`, `transportFailed`, `noChangedSpans`, `fileCountCapExceeded`,
+`pathRejected`, `spanOutsideFile`, `unsafeSliceText`.
+
+Those causes are told apart at the reader seam, before the strict decoder runs.
+The decoder's job is safety and it refuses everything it dislikes the same way,
+so letting it go first made a binary file, an oversized file and a genuine
+transport fault all arrive as `transportFailed` — which sends an operator
+hunting a transport bug instead of raising a cap. MIME type and decoded size are
+now read structurally and judged against policy first; only content policy would
+accept reaches the decoder, and only the decoder's own refusals become
+`decodeRejected`. Nothing about its strictness changes.
+
+**A change set with no right-hand lines is not a failure.** Delete-only,
+rename-only, binary and empty-file changes legitimately have paths and no
+changed lines: every path is accounted `noChangedSpans` and the coverage gate
+reports `sourceCoverageEmpty` truthfully. The cross-check between the two
+extractions only calls mis-parse when a permissive independent scan finds
+right-hand-bearing line blocks in the response and the structured extractor
+still produced none.
 
 Both prompts bind the model to that table: it may not report on, clear, or claim
 to have reviewed an `omitted` path, and must describe a `partial` path as
@@ -94,6 +111,13 @@ arithmetic: a change set where every file delivered one region out of twenty-fou
 would otherwise score 100%. The file floor counts only **fully** delivered
 files for the same reason — a partially delivered file is one the model has seen
 part of, which is not the same as one it has read.
+
+Both span numbers are counted in the pull request's **own hunks**, not in the
+merged spans the transport happens to cut. A raw hunk counts as delivered when a
+delivered slice fully contains it. That keeps the units honest in both
+directions: expanding the context radius merges slices together without ever
+moving the denominator, and an unread file contributes its hunks to the
+denominator rather than being quietly excluded.
 
 A PR that trips any of these is **not reviewed**. No preview, no comments, no
 vote — the cycle records the reason and moves on. An unperformed review that
@@ -234,6 +258,11 @@ schema:
 
 - **It is still the model that reads.** Delivering the bytes proves the bytes
   arrived, not that they were understood.
+- **One pull request cannot end a cycle.** An oversized model input fails that
+  pass with a stated reason rather than throwing, and the per-pull-request
+  review is isolated, so a PR that cannot be reviewed does not take the ones
+  queued behind it with it. What it never does is run the model anyway: below
+  the coverage floor the review does not happen.
 - **Coverage is measured in files, not in judgement.** A `delivered` file whose
   changed span is a one-line edit inside a 3,000-line class still gives the model
   only a local view.

@@ -10,6 +10,7 @@
     "Get-ReviewerRuntimeContext": "3c5b58cc90a85fcf213f29db889e034c9378a3b498dce2ac2b2ec4c4d96f21ff",
     "Get-ReviewerPostableFindings": "df41352b7f8e49ef33b57a50ec76facf2d8cda0e3d80d6bc2bfe5f4f67ac39a7",
     "Split-ReviewerFindingsByChangeSet": "662dc52aefdaf9c5de7b9e8d7bf614a42a2030227495606ffb3e6fd9b941d6e0",
+    "Invoke-ReviewerPullRequest": "62432a88a734669cfe06220131db07429ea8940eb8eb35078ad925748efce719",
     "Invoke-ReviewerDelivery": "05a9813a6ed6c6e7e8992c3bb4587629da520ec1dc1ec81235d80f84623247eb"
   },
   "authorizedFunctionDeltas": {
@@ -55,6 +56,16 @@
       {
         "sha256": "11bba16aa7f88b61ab0ec284b88528ecd4244b6542e6b73449cebadce329291a",
         "reason": "Report a marker rejected for wrong PR/repository/commit binding under its own reason, so the pass-level retry can distinguish a formatting slip from a marker bound to the wrong work and never retry the latter."
+      },
+      {
+        "sha256": "5d302f8573f61798df3e36709dd79ebb67dc9f02970e4780d306d37a211873c2",
+        "reason": "Refuse an oversized model input as a bounded pass failure instead of throwing. The throw escaped Invoke-ReviewerPullRequest and the cycle's own catch then abandoned every pull request queued behind it, so one unusually large change set ended the cycle for all of them."
+      }
+    ],
+    "Invoke-ReviewerPullRequest": [
+      {
+        "sha256": "62432a88a734669cfe06220131db07429ea8940eb8eb35078ad925748efce719",
+        "reason": "Pinned so the source-coverage wiring cannot be dropped silently: this function carries the marker retry loop and the preview call that publishes pinned source coverage and the convention authority summary."
       }
     ]
   },

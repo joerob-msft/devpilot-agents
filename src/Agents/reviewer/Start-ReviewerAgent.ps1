@@ -7402,16 +7402,15 @@ function Get-ReviewerSourceTransport {
     # which collapses every path into one space-joined string - a shape that
     # still looks like a legal change set and shows up only as zero coverage.
     $paths = Get-ReviewerChangePathsFromResponse -Response $changes
-    Assert-ReviewerSourceChangeSetAgreement -ChangedPaths $paths -SpansByPath $spansByPath
+    Assert-ReviewerSourceChangeSetAgreement -ChangedPaths $paths -SpansByPath $spansByPath `
+        -ObservedRightHandBlockCount (Measure-ReviewerSourceRightHandBlocks -Response $changes)
     $reader = {
         param([string]$Path)
         # The request and the decode are separated deliberately. EVERY failure
         # Send-AgentMcpRequest raises has already aborted the session, and the
         # session is shared by every PR in this cycle - so absorbing one as
         # "this file was unreadable" would grind through the rest of the change
-        # set and then take out the whole cycle with a misleading reason. The
-        # decoder runs after the response is in hand and never touches the
-        # session, so only its failures are one file's problem.
+        # set and then take out the whole cycle with a misleading reason.
         $toolResult = Send-AgentMcpRequest -Session $Session -Method "tools/call" -Params @{
             name = "repo_file"
             arguments = @{
@@ -7423,21 +7422,14 @@ function Get-ReviewerSourceTransport {
                 version = $SourceCommit
             }
         }
-        try {
-            $resource = ConvertFrom-AgentMcpResourceContent -ToolResult $toolResult -ExpectedUri $Path `
+        # Classification lives in the library so the seam is exercisable
+        # offline; the strict decode is injected so nothing about its
+        # safety contract is duplicated or relaxed here.
+        return Get-ReviewerSourceReaderResult -ToolResult $toolResult -Path $Path -Policy $SourceTransportPolicy -Decoder {
+            param($InnerToolResult, [string]$InnerPath)
+            ConvertFrom-AgentMcpResourceContent -ToolResult $InnerToolResult -ExpectedUri $InnerPath `
                 -MaxBytes $script:ReviewerSourceDecoderCeilingBytes `
                 -AllowedMimeTypes @($SourceTransportPolicy.allowedMimeTypes)
-        }
-        catch {
-            # Unreadable content is this file's problem, not the cycle's. The
-            # report records it with a reason; the caller keeps going.
-            return $null
-        }
-        return [pscustomobject]@{
-            Text       = [string]$resource.Text
-            MimeType   = [string]$resource.MimeType
-            ByteLength = [int]$resource.ByteLength
-            Sha256     = [string]$resource.Sha256
         }
     }
     $report = New-ReviewerSourceTransportReport -CommitSha $SourceCommit -ChangedPaths $paths `
@@ -9102,7 +9094,20 @@ function Invoke-ReviewerModelPass {
     $stdin = (Get-Content -LiteralPath $PromptFile -Raw) + "`n`n---`n" + $runtimeContext + "`n"
     $stdinBytes = $script:ReviewerUtf8.GetByteCount($stdin)
     if ($stdinBytes -gt $script:ReviewerMaxModelInputBytes) {
-        throw "Reviewer model input is $stdinBytes bytes, above the code-defined $script:ReviewerMaxModelInputBytes-byte bound."
+        # A bounded refusal, not a throw. This escapes Invoke-ReviewerPullRequest
+        # otherwise, and the cycle's own catch then abandons every PR queued
+        # behind this one - so a single unusually large change set would take
+        # out the whole cycle. The pass-result shape already carries a failure
+        # the surrounding machinery knows how to record and move past.
+        $oversizeReason = "model input is $stdinBytes bytes, above the code-defined $script:ReviewerMaxModelInputBytes-byte bound"
+        if ($PassCount -gt 1) { $oversizeReason = "pass $PassNumber ($PassModel): $oversizeReason" }
+        Write-Warning "PR $prId not reviewed by this pass - $oversizeReason"
+        Write-ReviewerCycleMetadata -Fields @{
+            cycle = $CycleNumber; mode = "model-input"; prId = $prId; sourceCommit = $sourceCommit
+            result = "oversize"; model = $PassModel; pass = $PassNumber; stdinBytes = $stdinBytes
+            limitBytes = $script:ReviewerMaxModelInputBytes
+        }
+        return @{ Model = $PassModel; Marker = $null; Reason = $oversizeReason; EnvironmentFault = $false }
     }
 
     # -- Launch the model -----------------------------------------------------
@@ -12140,10 +12145,26 @@ function Invoke-ReviewerCycle {
         $summaries = New-Object System.Collections.Generic.List[string]
         foreach ($r in $retried) { [void]$summaries.Add([string]$r) }
         foreach ($b in $bound) {
-            $one = Invoke-ReviewerPullRequest -Session $session -AgencyPath $AgencyPath -CycleNumber $CycleNumber `
-                -Bound $b -ReviewedState $reviewedState -AttemptsState $attemptsState
-            if ([int]$one.ExitCode -ne 0) { $result.ExitCode = 1 }
-            [void]$summaries.Add([string]$one.Summary)
+            # One pull request must not be able to end the cycle for the ones
+            # queued behind it. Everything inside is already fail-closed, so an
+            # escape here is by definition unexpected - which is exactly why it
+            # is bounded and recorded rather than allowed to propagate.
+            try {
+                $one = Invoke-ReviewerPullRequest -Session $session -AgencyPath $AgencyPath -CycleNumber $CycleNumber `
+                    -Bound $b -ReviewedState $reviewedState -AttemptsState $attemptsState
+                if ([int]$one.ExitCode -ne 0) { $result.ExitCode = 1 }
+                [void]$summaries.Add([string]$one.Summary)
+            }
+            catch {
+                $isolatedReason = Get-ReviewerConventionSpecialistDiagnosticText -Value $_.Exception.Message -MaxBytes 4096
+                Write-Warning "PR $($b.PrId) not reviewed - the review escaped its own error handling: $isolatedReason"
+                Write-ReviewerCycleMetadata -Fields @{
+                    cycle = $CycleNumber; mode = "live"; prId = [int]$b.PrId
+                    sourceCommit = [string]$b.SourceCommit; result = "isolatedFailure"; reason = $isolatedReason
+                }
+                $result.ExitCode = 1
+                [void]$summaries.Add("PR $($b.PrId) skipped (isolated failure)")
+            }
         }
         $result.Summary = ($summaries.ToArray() -join "; ")
         return $result
