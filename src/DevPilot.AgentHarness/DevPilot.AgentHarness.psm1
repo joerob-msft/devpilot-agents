@@ -841,8 +841,13 @@ function ConvertFrom-AgentResultMarker {
         foreach ($anchor in [regex]::Matches($StdOutText, $anchorPattern)) {
             # Bounded scan: a transcript carrying an implausible number of
             # prefix occurrences is an attack surface, not a formatting quirk.
+            # The bound counts anchors EXAMINED and is set well above any
+            # plausible transcript, because a tight bound counted anchors that
+            # were then discarded for a wrong nonce - so quoting enough decoy
+            # prefix lines ahead of the real marker discarded a complete,
+            # correct review. The retained-candidate cap below is the tight one.
             $scanned++
-            if ($scanned -gt 64) { break }
+            if ($scanned -gt 512) { break }
             $hit = $anchor.Index
             $jsonStart = $StdOutText.IndexOf($openBrace, $hit + $anchor.Length)
             if ($jsonStart -lt 0) { continue }

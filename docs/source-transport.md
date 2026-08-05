@@ -223,6 +223,14 @@ directions: expanding the context radius merges slices together without ever
 moving the denominator, and an unread file contributes its hunks to the
 denominator rather than being quietly excluded.
 
+The span ratio has one deliberate blind spot, and the block states it. A path
+whose hunk list never arrived (`spansUnavailable`) contributes to neither side —
+there is no honest hunk count to contribute, and inventing one would put hunks
+into a sentence that attributes them to the pull request. The count of such paths
+travels beside the ratio instead, and the sentence says the ratio covers only the
+files whose hunk list the pull request reported. The file-level floor is what
+catches them.
+
 A PR that trips any of these is **not reviewed**. No preview, no comments, no
 vote — the cycle records the reason and moves on. An unperformed review that
 says so is strictly better than a clean-looking one that is silent about it.
@@ -262,9 +270,14 @@ Ordering alone was not enough: when both drew on `maxTotalSliceBytes`, the
 sibling context attached to the first file could consume the allowance the tenth
 file's changed hunks needed, so switching sibling evidence on quietly lowered
 changed-source coverage somewhere else in the same pull request — and could push
-it under the fail-closed floor. Changed bytes and sibling bytes are now tracked
-apart, reported apart (`totalSliceBytes` and `totalSiblingBytes` in the coverage
-record), and only changed bytes draw down the changed-source pool.
+it under the fail-closed floor. On the pinned ten-file snapshot the split moved
+changed-hunk coverage from 29/30 to 30/30.
+
+The two figures are **disjoint**. `totalSliceBytes` counts changed bytes only —
+it is named after `maxTotalSliceBytes` and must respect it — `totalSiblingBytes`
+counts sibling bytes only, and `totalDeliveredBytes` is their sum. The policy
+validator also refuses a pair whose sum could not fit the sealed block's
+rendered-byte bound.
 
 Nothing about sibling context can move a coverage number. `RawRequestedSpanCount`
 counts raw hunks; `DeliveredRawSpanCount` is measured against the **changed**

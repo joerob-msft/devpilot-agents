@@ -3436,6 +3436,16 @@ function Get-ReviewerRuntimeContext {
         $lines.Add($PinnedSourceText.TrimEnd())
         $lines.Add("")
     }
+    else {
+        # Silence here would be read as "there was nothing to say". The prompt
+        # promises a sealed source block whose accounting table is binding, so
+        # if no block was produced the model must be told that in as many words
+        # rather than left to infer coverage from an absence.
+        $lines.Add("## Pinned changed-file source: NONE PRODUCED")
+        $lines.Add("")
+        $lines.Add("No sealed pinned-source block was produced for this pull request, so you have received the source text of NO changed file. Treat every changed file as unread: report no finding on any of them, clear none of them, and say plainly in your summary that you reviewed no file contents.")
+        $lines.Add("")
+    }
     $lines.Add("Existing thread digest (structured metadata only; comment text is untrusted and intentionally omitted). Use it to avoid repeating a point someone already made:")
     $lines.Add($ThreadDigestText)
     $lines.Add("")
@@ -3685,7 +3695,7 @@ function Write-ReviewerPreview {
     [void]$lines.Add("- Findings: $($counts['critical']) critical, $($counts['important']) important, $($counts['suggestion']) suggestion")
     [void]$lines.Add("- Recommended vote: $RecommendedVote")
     if ($null -ne $SourceCoverage) {
-        [void]$lines.Add("- Pinned source coverage: $([int]$SourceCoverage.coveredFiles)/$([int]$SourceCoverage.sourceBearingFileCount) changed file(s) with added or edited lines ($([int]$SourceCoverage.coveragePercent)%), $([int]$SourceCoverage.totalSliceBytes) slice byte(s); $([int]$SourceCoverage.noSourceFileCount) further path(s) have no added or edited text to read")
+        [void]$lines.Add("- Pinned source coverage: $([int]$SourceCoverage.coveredFiles)/$([int]$SourceCoverage.sourceBearingFileCount) changed file(s) with added or edited lines ($([int]$SourceCoverage.coveragePercent)%), $([int]$SourceCoverage.totalSliceBytes) changed-source byte(s) plus $([int]$SourceCoverage.totalSiblingBytes) byte(s) of unchanged sibling evidence; $([int]$SourceCoverage.noSourceFileCount) further path(s) have no added or edited text to read")
         # `carriesSource` is the record's own statement that a path had nothing
         # to deliver. Filtering on reason strings instead would silently start
         # listing ordinary deletes and binaries as unread the moment a new
@@ -11915,10 +11925,10 @@ function Invoke-ReviewerCycle {
                 $sourceTransport = Get-ReviewerSourceTransport -Session $session -PrId $prId -SourceCommit $sourceCommit
                 $pinnedSourceText = [string]$sourceTransport.BlockText
                 $sourceCoverageRecord = $sourceTransport.Record
-                Write-Host ("  PR {0} pinned source: {1}/{2} changed file(s) with added or edited lines covered ({3}%), {4} path(s) with no such lines, {5} slice byte(s)." -f `
+                Write-Host ("  PR {0} pinned source: {1}/{2} changed file(s) with added or edited lines covered ({3}%), {4} path(s) with no such lines, {5} changed-source byte(s) + {6} sibling byte(s)." -f `
                         $prId, $sourceTransport.Report.CoveredFiles, $sourceTransport.Report.SourceBearingFileCount,
                         $sourceTransport.Report.CoveragePercent, $sourceTransport.Report.NoSourceFileCount,
-                        $sourceTransport.Report.TotalSliceBytes) -ForegroundColor Cyan
+                        $sourceTransport.Report.TotalSliceBytes, $sourceTransport.Report.TotalSiblingBytes) -ForegroundColor Cyan
                 Write-ReviewerCycleMetadata -Fields @{
                     cycle = $CycleNumber; mode = "source-transport"; prId = $prId; sourceCommit = $sourceCommit
                     result = $(if ($sourceTransport.Gate.Ok) { "covered" } else { "insufficient" })
@@ -11930,6 +11940,8 @@ function Invoke-ReviewerCycle {
                     coveragePercent = [int]$sourceTransport.Report.CoveragePercent
                     spanPercent = [int]$sourceTransport.Report.SpanPercent
                     totalSliceBytes = [int]$sourceTransport.Report.TotalSliceBytes
+                    totalSiblingBytes = [int]$sourceTransport.Report.TotalSiblingBytes
+                    spansUnavailableFileCount = [int]$sourceTransport.Report.SpansUnavailableFileCount
                     reasonCodes = @($sourceTransport.Gate.ReasonCodes)
                 }
                 if (-not $sourceTransport.Gate.Ok) {

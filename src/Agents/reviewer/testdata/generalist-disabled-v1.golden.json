@@ -38,6 +38,10 @@
       {
         "sha256": "977da64246625f50c15a267b86905d382c0034e04442d4c163a2e2bc81fb2287",
         "reason": "Decide which paths to list as unread from the coverage record's own carriesSource flag rather than by matching one reason string, so a newly added no-source reason cannot start listing ordinary deletes and binaries as files the model failed to read."
+      },
+      {
+        "sha256": "82496f5b1f480f3bf185f780e8f9e707b4aae3396b884d16abbf8915704494a1",
+        "reason": "Report changed-source bytes and unchanged sibling-evidence bytes as two separate figures. They were being summed under a name borrowed from the changed-source cap, which the sum could exceed."
       }
     ],
     "Invoke-ReviewerDelivery": [
@@ -50,6 +54,10 @@
       {
         "sha256": "17f84ed0c785fd5408b87c84f153ca24ce8129b1dfed0fe82cda7cb0cb5cdb8c",
         "reason": "Carry the sealed pinned changed-file source block. The host's file-read tool answers with a binary resource payload the model never receives, so without this the generalist reviews files it has not read."
+      },
+      {
+        "sha256": "24bfc80213e33e9ee61ce2eaeef1699faca371e5b0aa4de6b9dda4aeb4fef247",
+        "reason": "State it in as many words when NO sealed block was produced. The block was simply omitted when empty, so a one-line regression that blanked it left the model with no source and no notice of that, while the prompt still told it the accounting table was binding."
       }
     ],
     "Invoke-ReviewerModelPass": [

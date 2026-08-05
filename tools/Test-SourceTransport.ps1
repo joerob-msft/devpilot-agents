@@ -648,6 +648,19 @@ Assert-Source ($transportText -match 'Get-ReviewerSourceChangeKindsByPath' -and 
     "the wrapper hands each path's declared change kind to the report instead of inferring it"
 Assert-Source ($transportText -match 'if \(@\(\$report\.Files\)\.Count -gt 0\)' -and $transportText -notmatch 'if \(\[int\]\$report\.CoveredFiles -gt 0\)') `
     "the accounting table is rendered even when nothing was delivered"
+# These two lines ARE the property this layer sells. Neither function is hash
+# pinned, and without an explicit pin a one-word edit to either - blanking the
+# block, or hard-coding the gate to Ok - restores the production bug with every
+# suite still green.
+Assert-Source ($transportText -match 'Gate\s*=\s*\(Test-ReviewerSourceCoverageGate') `
+    "the gate decision is computed, never assumed"
+Assert-Source ($cycleText -match '\$pinnedSourceText\s*=\s*\[string\]\$sourceTransport\.BlockText') `
+    "the sealed block the model receives is the one the transport produced"
+Assert-Source ($cycleText -match 'PinnedSourceText\s*=\s*\$pinnedSourceText') `
+    "and it is bound onto the reviewed pull request rather than dropped"
+$runtimeText = Get-FunctionTextFromWrapper -Name 'Get-ReviewerRuntimeContext'
+Assert-Source ($runtimeText -match 'NONE PRODUCED' -and $runtimeText -match 'Treat every changed file as unread') `
+    "an absent sealed block is stated to the model instead of silently omitted"
 
 $cycleTextForUnits = $cycleText
 Assert-Source ($cycleTextForUnits -match 'sourceBearingFileCount' -and $cycleTextForUnits -match 'noSourceFileCount') `
@@ -1150,8 +1163,8 @@ Assert-Source ($noSourceSentence -match 'or an empty file:$' -and $noSourceSente
     "the accounting sentence ends in a single colon when some paths carry no source"
 $allSourceSentence = @((Format-ReviewerSealedSourceBlock -Report $refusedTextReport -NonceFactory { 'n' * 32 }) -split "`n" |
         Where-Object { $_ -like 'Content accounting*' })[0]
-Assert-Source ($allSourceSentence -match 'as the pull request reports them:$' -and $allSourceSentence -notmatch 'further changed path') `
-    "and it omits the no-source clause entirely rather than announcing zero of them"
+Assert-Source ($allSourceSentence -match 'whose hunk list the pull request reported:$' -and $allSourceSentence -notmatch 'further changed path' -and $allSourceSentence -notmatch 'does NOT cover') `
+    "and it omits the no-source and unavailable-hunk clauses entirely rather than announcing zero of them"
 $declaredDeleteOnlyReport = New-ReviewerSourceTransportReport -CommitSha $commit `
     -ChangedPaths @('/src/h1.cs', '/src/h2.cs') -SpansByPath ([ordered]@{}) -Policy $policy `
     -Reader { param([string]$Path) $null } `
@@ -1474,8 +1487,22 @@ $isoCut = New-ReviewerSourceFileSlices -Text $isoText `
 Assert-Source (@($isoCut.SiblingSlices).Count -gt 0) "the sibling fixture actually produced sibling slices"
 Assert-Source ([int]$isoCut.RawRequestedSpanCount -eq 2 -and [int]$isoCut.DeliveredRawSpanCount -eq 2) `
     "sibling slices leave the raw changed-hunk numerator and denominator untouched"
-Assert-Source (@(@($isoCut.Slices) | Where-Object { [string]$_.Kind -cne 'changed' }).Count -eq 0) `
-    "no sibling slice can appear in the changed-slice list the coverage measure reads"
+# The real guarantee is that no sibling slice can overlap ANY raw changed hunk -
+# including one the budget dropped. Asserting that every entry of $cut.Slices is
+# Kind='changed' would be a tautology; this is the property that can actually
+# break, and it holds because the gap map is built from every merged span.
+$isoChangedLines = [System.Collections.Generic.HashSet[int]]::new()
+foreach ($isoSpan in @(@{ Start = 50; End = 52 }, @{ Start = 90; End = 91 })) {
+    for ($n = [int]$isoSpan.Start; $n -le [int]$isoSpan.End; $n++) { [void]$isoChangedLines.Add($n) }
+}
+$isoOverlap = 0
+foreach ($isoSibling in @($isoCut.SiblingSlices)) {
+    for ($n = [int]$isoSibling.StartLine; $n -le [int]$isoSibling.EndLine; $n++) {
+        if ($isoChangedLines.Contains($n)) { $isoOverlap++ }
+    }
+}
+Assert-Source ($isoOverlap -eq 0) `
+    "no sibling slice overlaps any changed line, so unchanged evidence can never stand in for the change"
 Assert-Source ([int]$isoCut.DeliveredSiblingBytes -gt 0 -and
     [int]$isoCut.DeliveredBytes -eq ([int]$isoCut.DeliveredChangedBytes + [int]$isoCut.DeliveredSiblingBytes)) `
     "changed and sibling bytes are accounted separately and sum to the whole"
@@ -1533,8 +1560,56 @@ Assert-Source ([int]$cappedSiblingReport.DeliveredSpanCount -eq [int]$starveRepo
     "and changed-hunk coverage is identical either way"
 $siblingRecord = ConvertTo-ReviewerSourceCoverageRecord -Report $starveReport
 Assert-Source ([int]$siblingRecord.totalSiblingBytes -eq [int]$starveReport.TotalSiblingBytes -and
-    [int]$siblingRecord.totalSliceBytes -ge [int]$siblingRecord.totalSiblingBytes) `
-    "the persisted record reports sibling bytes separately so an operator can see what was evidence"
+    [int]$siblingRecord.totalSliceBytes -eq ([int]$siblingRecord.totalDeliveredBytes - [int]$siblingRecord.totalSiblingBytes)) `
+    "the persisted record reports changed and sibling bytes as disjoint figures that sum to the whole"
+# totalSliceBytes is named after maxTotalSliceBytes, so it must respect it.
+# Folding sibling bytes into it let the reported figure exceed its own cap.
+Assert-Source ([int]$starveReport.TotalSliceBytes -le 1800 -and [int]$starveReport.TotalSiblingBytes -gt 0 -and
+    [int]$starveReport.TotalDeliveredBytes -gt [int]$starveReport.TotalSliceBytes) `
+    "the changed-byte total stays within the changed-byte cap while the grand total is reported apart"
+
+# The span ratio is silent about a file whose hunk list never arrived, so the
+# sentence carrying it must say so rather than reading as a clean 100%.
+$unavailableReport = New-ReviewerSourceTransportReport -CommitSha $commit `
+    -ChangedPaths @('/src/ok1.cs', '/src/lost1.cs', '/src/lost2.cs') `
+    -SpansByPath ([ordered]@{ '/src/ok1.cs' = @(@{ Start = 100; End = 101 }) }) -Policy $policy `
+    -Reader $starveReader -ChangeKindsByPath ([ordered]@{ '/src/ok1.cs' = 'Edit'; '/src/lost1.cs' = 'Edit'; '/src/lost2.cs' = 'Edit' })
+Assert-Source ([int]$unavailableReport.SpansUnavailableFileCount -eq 2 -and [int]$unavailableReport.SpanPercent -eq 100) `
+    "a file whose hunk list never arrived contributes to neither side of the span ratio"
+$unavailableSentence = @((Format-ReviewerSealedSourceBlock -Report $unavailableReport -NonceFactory { 'n' * 32 }) -split "`n" |
+        Where-Object { $_ -like 'Content accounting*' })[0]
+Assert-Source ($unavailableSentence -match 'among the files whose hunk list the pull request reported' -and
+    $unavailableSentence -match 'does NOT cover 2 further changed file\(s\)') `
+    "so the sentence says which files the ratio does not cover instead of implying everything arrived"
+Assert-Source ((ConvertTo-ReviewerSourceCoverageRecord -Report $unavailableReport).spansUnavailableFileCount -eq 2) `
+    "and the persisted record carries that count for an operator"
+
+# Both budgets land in one rendered block, so their sum has to fit inside it.
+Assert-Source (Test-Throws { New-TestPolicy -Overrides @{ maxTotalSliceBytes = 4194304; maxTotalSiblingBytes = 1048576 } }) `
+    "a policy whose two budgets together exceed the render bound is refused"
+Assert-Source (-not (Test-Throws { New-TestPolicy -Overrides @{ maxTotalSliceBytes = 4194304; maxTotalSiblingBytes = 0 } })) `
+    "and the same changed budget alone is still accepted"
+
+# The shipped policy must keep sibling evidence switched on: turning it off
+# re-starves every adoption-dependent convention the specialist can report.
+$shippedRaw = Get-Content -LiteralPath (Join-Path $repoRoot 'src/Agents/reviewer/source/v1/policy.json') -Raw | ConvertFrom-Json
+Assert-Source ([int]$shippedRaw.siblingContextSlices -gt 0 -and [int]$shippedRaw.siblingContextLines -gt 0 -and
+    [int]$shippedRaw.maxTotalSiblingBytes -gt 0) `
+    "the shipped policy still delivers sibling evidence, so adoption-dependent rules stay reportable"
+
+# An array-shaped change type must flatten, not stringify. @() around a function
+# that returns ,$array nests instead of flattening - the trap that has now bitten
+# this codebase four times - and a nested token reads as one unknown kind.
+$arrayKinds = Get-ReviewerSourceChangeKinds -Value @('Delete', 'Rename, SourceRename')
+Assert-Source (@($arrayKinds) -ccontains 'delete' -and @($arrayKinds) -ccontains 'rename' -and @($arrayKinds) -ccontains 'sourcerename') `
+    "a multi-element array of multi-flag strings flattens to individual kinds"
+Assert-Source (-not (Test-ReviewerSourceChangeCarriesRightHand -ChangeTypeValue @('Delete', 'Rename, SourceRename'))) `
+    "so a rename delivered in that shape is still excused rather than re-entering the denominator"
+# Assign directly: @() around a function that returns ,$array nests it, which is
+# the very trap this assertion exists to guard against.
+$arrayIntKinds = Get-ReviewerSourceChangeKinds -Value @(3, 16)
+Assert-Source ((($arrayIntKinds | Sort-Object) -join ',') -ceq 'add,delete,edit') `
+    "multi-bit integers inside an array flatten too"
 
 # The policy is closed: a consumer cannot silently inherit an unbounded sibling
 # pool by omitting the key.
