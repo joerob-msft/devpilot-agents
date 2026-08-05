@@ -11,5 +11,15 @@
     "Split-ReviewerFindingsByChangeSet": "662dc52aefdaf9c5de7b9e8d7bf614a42a2030227495606ffb3e6fd9b941d6e0",
     "Invoke-ReviewerDelivery": "05a9813a6ed6c6e7e8992c3bb4587629da520ec1dc1ec81235d80f84623247eb"
   },
+  "authorizedFunctionDeltas": {
+    "Write-ReviewerPreview": {
+      "sha256": "7a74199c73cca5c14bd20381dbf455bf68cbc70e450a3459febb8aa6634e368e",
+      "reason": "Seal the configured pass count so an incomplete multi-pass run cannot be promoted as single-pass."
+    },
+    "Invoke-ReviewerDelivery": {
+      "sha256": "05a9813a6ed6c6e7e8992c3bb4587629da520ec1dc1ec81235d80f84623247eb",
+      "reason": "Require code-defined typed delivery authorization before every raw wrapper write."
+    }
+  },
   "promptSha256": "f9357af7ea2dc1f3f5929b2541bd9875c3e63fd8bee50894a88a4688fc05ebd1"
 }

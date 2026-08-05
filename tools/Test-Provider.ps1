@@ -142,6 +142,66 @@ Start-Check "vote requests are bounded and require a body when demanding changes
 Assert-Throws { Set-AgentProviderPullRequestVote -Context $gh -PullRequestId 1 -Vote 'Merge' } "an out-of-set vote cannot be requested"
 Assert-Throws { Set-AgentProviderPullRequestVote -Context $gh -PullRequestId 1 -Vote 'WaitingForAuthor' -Body '' } "requesting changes without a body is rejected before any call"
 
+# ---------------------------------------------------------------------------
+Start-Check "structured GitHub API result guards a path the same as the throwing variant"
+Assert-Throws { Invoke-AgentGitHubApiResult -Path 'https://evil.example/repos/x/y' } "an absolute URL cannot be passed off as a structured-result API path"
+Assert-Throws { Invoke-AgentGitHubApiResult -Path '//evil.example/x' } "a protocol-relative URL is rejected from the structured-result path"
+
+# ---------------------------------------------------------------------------
+Start-Check "review-dismissal policy normalization distinguishes known from unknown"
+Assert-Throws { Get-AgentProviderReviewDismissalPolicy -Context $ado -TargetBranch 'main' } "dismissal-policy lookup rejects an AzureDevOps context"
+Assert-Throws { Get-AgentProviderReviewDismissalPolicy -Context $gh -TargetBranch '' } "an empty target branch is rejected before any call"
+
+$dismissalFixturePath = Join-Path $PSScriptRoot '..\src\DevPilot.AgentHarness\testdata\github-branch-protection-fixture.json'
+Assert-True (Test-Path $dismissalFixturePath) "branch-protection fixture is present"
+$dismissalFixture = Get-Content $dismissalFixturePath -Raw | ConvertFrom-Json
+foreach ($caseName in @('protectedDismissesStale', 'protectedKeepsStale', 'protectedNoReviewRequirement')) {
+    $case = $dismissalFixture.$caseName
+    $apiResult = @{ Ok = $true; StatusCode = 200; Value = $case.response; Error = $null }
+    $policy = ConvertTo-AgentProviderReviewDismissalPolicy -ApiResult $apiResult
+    Assert-True ($policy.known -eq $case.expected.known) "$caseName - known matches fixture"
+    Assert-True ($policy.dismissesStaleReviews -eq $case.expected.dismissesStaleReviews) "$caseName - dismissesStaleReviews matches fixture ($($policy.dismissesStaleReviews))"
+    Assert-True ($policy.source -eq $case.expected.source) "$caseName - source matches fixture ($($policy.source))"
+}
+# A 404 is a DEFINITIVE "no rule", not an unknown - the whole point of the
+# structured result over Invoke-AgentGitHubApi's collapsed exception.
+$notFound = ConvertTo-AgentProviderReviewDismissalPolicy -ApiResult @{ Ok = $false; StatusCode = 404; Value = $null; Error = 'Not Found' }
+Assert-True ($notFound.known -eq $true -and $notFound.dismissesStaleReviews -eq $false -and $notFound.source -eq 'none') "a 404 on branch protection is a KNOWN, definite 'no rule' rather than unknown"
+# A 403 is genuinely unknown and must not be read as a plausible default.
+$forbidden = ConvertTo-AgentProviderReviewDismissalPolicy -ApiResult @{ Ok = $false; StatusCode = 403; Value = $null; Error = 'Forbidden' }
+Assert-True ($forbidden.known -eq $false -and $forbidden.dismissesStaleReviews -eq $false -and $forbidden.source -eq 'unknown') "a 403 on branch protection is unknown, distinct from a 404"
+$serverError = ConvertTo-AgentProviderReviewDismissalPolicy -ApiResult @{ Ok = $false; StatusCode = 500; Value = $null; Error = 'boom' }
+Assert-True ($serverError.known -eq $false -and $serverError.source -eq 'unknown') "any other failure is unknown, never a plausible-looking default"
+
+# ---------------------------------------------------------------------------
+Start-Check "required-checks snapshot normalization against a fixture, and unknown-vs-clean"
+Assert-Throws { Get-AgentProviderRequiredChecksSnapshot -Context $ado -HeadSha ('a' * 40) } "required-checks lookup rejects an AzureDevOps context"
+
+$checksFixturePath = Join-Path $PSScriptRoot '..\src\DevPilot.AgentHarness\testdata\github-check-runs-fixture.json'
+Assert-True (Test-Path $checksFixturePath) "check-runs fixture is present"
+$checksFixture = Get-Content $checksFixturePath -Raw | ConvertFrom-Json
+foreach ($caseName in @('allGreen', 'oneFailed', 'inProgress', 'neutralIsNotSuccess', 'none')) {
+    $case = $checksFixture.$caseName
+    $validationRun = ConvertTo-AgentProviderCheckRunsSnapshot -Payload $case.response -HeadSha ('a' * 40)
+    Assert-True ($validationRun.found -eq $case.expected.found) "$caseName - found matches fixture"
+    Assert-True ($validationRun.state -eq $case.expected.state) "$caseName - state matches fixture ($($validationRun.state))"
+    Assert-True ($validationRun.isComplete -eq $case.expected.isComplete) "$caseName - isComplete matches fixture"
+    Assert-True ($validationRun.isSuccess -eq $case.expected.isSuccess) "$caseName - isSuccess matches fixture"
+}
+# 'none' (zero check runs) must be UNKNOWN territory for the required-checks
+# gate, never "nothing required, so this passes".
+$noneRun = ConvertTo-AgentProviderCheckRunsSnapshot -Payload $checksFixture.none.response -HeadSha ('a' * 40)
+$noneSnapshot = ConvertTo-AgentProviderRequiredChecksSnapshot -ValidationRun $noneRun -RequiredNames @()
+Assert-True ($noneSnapshot.known -eq $false) "zero check runs is unknown, not a clean pass, even with no required names configured"
+$greenRun = ConvertTo-AgentProviderCheckRunsSnapshot -Payload $checksFixture.allGreen.response -HeadSha ('a' * 40)
+$greenSnapshot = ConvertTo-AgentProviderRequiredChecksSnapshot -ValidationRun $greenRun -RequiredNames @('ci/build', 'ci/test')
+Assert-True ($greenSnapshot.known -and $greenSnapshot.allComplete -and $greenSnapshot.allSuccess -and @($greenSnapshot.missingRequired).Count -eq 0) "every explicitly required check present and green is reported complete/successful"
+$missingNameSnapshot = ConvertTo-AgentProviderRequiredChecksSnapshot -ValidationRun $greenRun -RequiredNames @('ci/build', 'ci/deploy')
+Assert-True (@($missingNameSnapshot.missingRequired) -contains 'ci/deploy' -and -not $missingNameSnapshot.allComplete) "a required check name that never ran is reported missing, not silently passed"
+Assert-True ($greenSnapshot.sha256 -match '^[0-9a-f]{64}$') "the checks snapshot binds a deterministic sha256"
+$greenSnapshotAgain = ConvertTo-AgentProviderRequiredChecksSnapshot -ValidationRun $greenRun -RequiredNames @('ci/build', 'ci/test')
+Assert-True ($greenSnapshotAgain.sha256 -ceq $greenSnapshot.sha256) "the checks snapshot sha256 is deterministic across repeated calls"
+
 Write-Host ""
 if ($failures.Count -gt 0) {
     Write-Host "FAILED - $($failures.Count) provider self-check failure(s):" -ForegroundColor Red

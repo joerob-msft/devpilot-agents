@@ -86,3 +86,22 @@ severity, source/fact/thread bindings, all input hashes, and final eligible
 preview candidates. Input and decision artifacts derive different HMAC keys from
 the reviewer master key. Delivery promotion accepts only the exact delivery
 manifest key set and cannot authenticate either verification domain.
+
+## Layer 6: delivery gates
+
+An optional, separate, fail-closed layer reads this preview's sealed eligible
+candidates to decide - never to change - what may reach a PR as an unattended
+comment, suggestion, or approval vote. It is off unless an out-of-repo policy
+file, a matching CLI switch, and a verified qualification artifact all agree;
+a repository's own config can only disable it, never enable it. It uses its
+own HMAC domain, so a gate artifact can never be read back as, or promoted
+as, a raw delivery or verification artifact, and vice versa. See
+[Delivery gates](delivery-gates.md).
+
+Cross-verification never authorizes a raw write on its own: an independent
+two-pass union stays a code-defined `PreviewOnly` delivery authorization
+permanently, whether or not this layer is enabled. The gate is the sole,
+code-defined path by which a `VerifiedMultiPass` authorization is ever minted,
+and that grant authorizes only the gate's own comment/suggestion/approval/
+`-PromoteVerifiedPreview` writes - never the raw two-pass delivery or raw
+`-PromotePreview` path.

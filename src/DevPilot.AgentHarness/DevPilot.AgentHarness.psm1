@@ -2016,6 +2016,85 @@ function Invoke-AgentGitHubApi {
     catch { throw "GitHub API call '$Method $Path' returned malformed JSON." }
 }
 
+function Invoke-AgentGitHubApiResult {
+    <#
+    .SYNOPSIS
+        A structured-error variant of Invoke-AgentGitHubApi for callers that
+        must distinguish a definitive negative from an unknown one.
+
+    .DESCRIPTION
+        Invoke-AgentGitHubApi throws on any non-2xx response and collapses
+        stderr to three lines, which loses the status code entirely. That is
+        fine for a caller that only needs "did this work", but a fail-closed
+        capability read - "does this branch dismiss stale reviews on push" -
+        needs the distinction: a 404 on branch protection means the branch
+        DEFINITELY has no protection rule (known=$true), while a 403 means the
+        token cannot tell (known=$false). Collapsing both to "it failed" would
+        make an operator debugging a closed gate unable to tell "there is
+        genuinely no rule" from "grant the token more scope".
+
+        Never throws for a well-formed HTTP response, including non-2xx ones;
+        still throws for a missing 'gh' CLI, an unsafe path, or a transport
+        timeout, because none of those are a status this layer can normalize.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [ValidateSet('GET', 'POST', 'PATCH')][string]$Method = 'GET',
+        [hashtable]$Body,
+        [int]$TimeoutSeconds = 60
+    )
+
+    $gh = Get-Command gh -ErrorAction SilentlyContinue
+    if (-not $gh) { throw "The GitHub provider requires the 'gh' CLI on PATH. Install it and run 'gh auth login'." }
+    if ($Path -match '^[a-z][a-z0-9+.-]*://' -or $Path.StartsWith('//')) {
+        throw "GitHub API path '$Path' must be relative to the API root, not an absolute URL."
+    }
+
+    # -i prints the status line and headers ahead of the body so the status
+    # code can be recovered even though `gh api` exits non-zero on a non-2xx
+    # response (which is exactly the case this function exists to inspect).
+    $arguments = @('api', $Path, '--method', $Method, '-i')
+    if ($Body) { $arguments += @('--input', '-') }
+    $stdin = if ($Body) { ($Body | ConvertTo-Json -Depth 10 -Compress) } else { $null }
+
+    $result = Invoke-TimedProcess -FilePath $gh.Source -ArgumentList $arguments `
+        -StandardInputContent $stdin -CaptureStdOut -CaptureStdErr -TimeoutSeconds $TimeoutSeconds
+
+    if ($result.TimedOut) {
+        return @{ Ok = $false; StatusCode = 0; Value = $null; Error = "GitHub API call '$Method $Path' timed out after $TimeoutSeconds second(s)." }
+    }
+
+    $stdOutText = [string]$result.StdOut
+    $statusMatch = [Text.RegularExpressions.Regex]::Match(
+        $stdOutText, '^HTTP\/[\d.]+\s+(\d{3})', [Text.RegularExpressions.RegexOptions]::Multiline)
+    if (-not $statusMatch.Success) {
+        $detail = if ($result.StdErr) { (([string]$result.StdErr) -split "`n" | Select-Object -First 3) -join ' ' } else { "exit code $($result.ExitCode)" }
+        return @{ Ok = $false; StatusCode = 0; Value = $null; Error = "GitHub API call '$Method $Path' returned no recognizable HTTP status line: $detail" }
+    }
+    $statusCode = [int]$statusMatch.Groups[1].Value
+
+    # The body follows the header block after the first blank line; `gh`
+    # writes CRLF-terminated header lines regardless of host OS.
+    $headerBodySplit = $stdOutText.IndexOf("`r`n`r`n")
+    $bodyText = if ($headerBodySplit -ge 0) {
+        $stdOutText.Substring($headerBodySplit + 4)
+    }
+    else {
+        $altSplit = $stdOutText.IndexOf("`n`n")
+        if ($altSplit -ge 0) { $stdOutText.Substring($altSplit + 2) } else { "" }
+    }
+    $value = $null
+    if (-not [string]::IsNullOrWhiteSpace($bodyText)) {
+        try { $value = ($bodyText | ConvertFrom-Json -ErrorAction Stop) } catch { $value = $null }
+    }
+    if ($statusCode -ge 200 -and $statusCode -lt 300) {
+        return @{ Ok = $true; StatusCode = $statusCode; Value = $value; Error = $null }
+    }
+    $message = if ($value -and $value.PSObject.Properties['message']) { [string]$value.message } else { "HTTP $statusCode" }
+    return @{ Ok = $false; StatusCode = $statusCode; Value = $value; Error = $message }
+}
+
 function Invoke-AgentGitHubGraphQl {
     <#
     .SYNOPSIS
@@ -2399,6 +2478,56 @@ query($owner:String!,$repo:String!,$number:Int!,$threads:Int!,$comments:Int!){
     return , $threads
 }
 
+function ConvertTo-AgentProviderCheckRunsSnapshot {
+    <#
+    .SYNOPSIS
+        Pure normalization of a raw GitHub check-runs payload, separated from
+        Get-AgentProviderValidationRun's API call so it is unit-testable
+        against a fixture the same way ConvertTo-AgentProviderSnapshot is.
+
+    .DESCRIPTION
+        'found=$false' (no checks at all) is UNKNOWN, not clean - a gate that
+        requires green must not treat "nothing reported yet" as passing.
+        'neutral' and 'skipped' are not failures, but are not evidence of a
+        passing build either; only 'success' counts as green.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Payload,
+        [Parameter(Mandatory)][string]$HeadSha,
+        [string]$CheckNameFilter = ''
+    )
+    $runs = @($Payload.check_runs)
+    if ($CheckNameFilter) { $runs = @($runs | Where-Object { $_.name -like $CheckNameFilter }) }
+
+    if ($runs.Count -eq 0) {
+        return @{ found = $false; state = 'None'; isComplete = $false; isSuccess = $false; runs = @(); headSha = $HeadSha.ToLowerInvariant() }
+    }
+
+    $normalized = @()
+    foreach ($run in $runs) {
+        $normalized += @{
+            name       = [string]$run.name
+            status     = [string]$run.status
+            conclusion = if ($run.PSObject.Properties['conclusion'] -and $null -ne $run.conclusion) { [string]$run.conclusion } else { '' }
+            startedAt  = if ($run.PSObject.Properties['started_at']) { [string]$run.started_at } else { '' }
+        }
+    }
+
+    $allComplete = -not ($normalized | Where-Object { $_.status -ne 'completed' })
+    $allSuccess = $allComplete -and -not ($normalized | Where-Object { $_.conclusion -ne 'success' })
+
+    $state = if (-not $allComplete) { 'InProgress' } elseif ($allSuccess) { 'Succeeded' } else { 'Failed' }
+    return @{
+        found      = $true
+        state      = $state
+        isComplete = $allComplete
+        isSuccess  = $allSuccess
+        runs       = $normalized
+        headSha    = $HeadSha.ToLowerInvariant()
+    }
+}
+
 function Get-AgentProviderValidationRun {
     <#
     .SYNOPSIS
@@ -2424,38 +2553,153 @@ function Get-AgentProviderValidationRun {
 
     $slug = $Context.Slug
     $payload = Invoke-AgentGitHubApi -Path "repos/$slug/commits/$HeadSha/check-runs?per_page=100" -TimeoutSeconds $Context.TimeoutSeconds
-    $runs = @($payload.check_runs)
-    if ($CheckNameFilter) { $runs = @($runs | Where-Object { $_.name -like $CheckNameFilter }) }
+    return ConvertTo-AgentProviderCheckRunsSnapshot -Payload $payload -HeadSha $HeadSha -CheckNameFilter $CheckNameFilter
+}
 
-    if ($runs.Count -eq 0) {
-        return @{ found = $false; state = 'None'; isComplete = $false; isSuccess = $false; runs = @(); headSha = $HeadSha.ToLowerInvariant() }
-    }
-
-    $normalized = @()
-    foreach ($run in $runs) {
-        $normalized += @{
-            name       = [string]$run.name
-            status     = [string]$run.status
-            conclusion = if ($run.PSObject.Properties['conclusion'] -and $null -ne $run.conclusion) { [string]$run.conclusion } else { '' }
-            startedAt  = if ($run.PSObject.Properties['started_at']) { [string]$run.started_at } else { '' }
+function ConvertTo-AgentProviderReviewDismissalPolicy {
+    <#
+    .SYNOPSIS
+        Pure normalization of an Invoke-AgentGitHubApiResult-shaped branch-
+        protection read into the structured known/true/false shape, separated
+        from the API call so it is unit-testable against a fixture.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$ApiResult)
+    if (-not $ApiResult.Ok) {
+        if ($ApiResult.StatusCode -eq 404) {
+            return @{ known = $true; dismissesStaleReviews = $false; source = 'none'; reason = 'no branch protection rule exists for this branch' }
         }
+        if ($ApiResult.StatusCode -eq 403) {
+            return @{ known = $false; dismissesStaleReviews = $false; source = 'unknown'; reason = "insufficient permission to read branch protection: $($ApiResult.Error)" }
+        }
+        return @{ known = $false; dismissesStaleReviews = $false; source = 'unknown'; reason = "branch protection read failed: $($ApiResult.Error)" }
     }
+    $reviews = $null
+    if ($ApiResult.Value -and $ApiResult.Value.PSObject.Properties['required_pull_request_reviews']) {
+        $reviews = $ApiResult.Value.required_pull_request_reviews
+    }
+    if ($null -eq $reviews) {
+        return @{ known = $true; dismissesStaleReviews = $false; source = 'branchProtection'; reason = 'branch protection exists but does not require pull request reviews' }
+    }
+    $dismisses = [bool]($reviews.PSObject.Properties['dismiss_stale_reviews'] -and $reviews.dismiss_stale_reviews -eq $true)
+    return @{ known = $true; dismissesStaleReviews = $dismisses; source = 'branchProtection'; reason = 'read from required_pull_request_reviews.dismiss_stale_reviews' }
+}
 
-    $allComplete = -not ($normalized | Where-Object { $_.status -ne 'completed' })
-    # 'neutral' and 'skipped' are not failures, but they are not evidence of a
-    # passing build either. Only 'success' counts as green, so a gate that
-    # requires green fails closed.
-    $allSuccess = $allComplete -and -not ($normalized | Where-Object { $_.conclusion -ne 'success' })
+function Get-AgentProviderReviewDismissalPolicy {
+    <#
+    .SYNOPSIS
+        Whether pushing new commits to a branch resets (dismisses) stale
+        review approvals there, for GitHub classic branch protection.
 
-    $state = if (-not $allComplete) { 'InProgress' } elseif ($allSuccess) { 'Succeeded' } else { 'Failed' }
+    .DESCRIPTION
+        Returns a STRUCTURED known/true/false, never a plausible-looking
+        default: `known=$false` means the caller could not determine the
+        answer at all (an unattended approval gate must treat that as closed,
+        the same as an explicit $false). A 404 on the protection endpoint is a
+        definitive "no rule exists" and is therefore known=$true,
+        dismissesStaleReviews=$false. A 403 (a token without repository-admin
+        scope, which is common) is genuinely unknown.
+
+        Only GitHub's classic branch-protection API is read. GitHub's newer
+        repository-ruleset mechanism can also enforce dismissal and is NOT
+        checked here - `source` therefore only ever returns 'branchProtection',
+        'none', or 'unknown' in this version, never 'ruleset'. A repository
+        that dismisses stale reviews ONLY via a ruleset will read as 'none'
+        (dismissesStaleReviews=$false) here, which fails the approval gate
+        closed rather than open - the safe direction for an unimplemented
+        surface - but is not a positive proof either way. See
+        docs/delivery-gates.md.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Context, [Parameter(Mandatory)][string]$TargetBranch)
+    Assert-AgentProviderContext -Context $Context -RequiredProvider 'GitHub'
+    if ([string]::IsNullOrWhiteSpace($TargetBranch)) { throw "TargetBranch must be non-empty." }
+
+    $slug = $Context.Slug
+    $encodedBranch = [Uri]::EscapeDataString($TargetBranch)
+    $result = Invoke-AgentGitHubApiResult -Path "repos/$slug/branches/$encodedBranch/protection" -TimeoutSeconds $Context.TimeoutSeconds
+    return ConvertTo-AgentProviderReviewDismissalPolicy -ApiResult $result
+}
+
+function ConvertTo-AgentProviderRequiredChecksSnapshot {
+    <#
+    .SYNOPSIS
+        Pure normalization from an already-normalized checks snapshot (the
+        shape Get-AgentProviderValidationRun/ConvertTo-AgentProviderCheckRunsSnapshot
+        return) plus a required-name list, into known/allComplete/allSuccess/
+        missingRequired/runs/sha256.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$ValidationRun,
+        [AllowEmptyCollection()][string[]]$RequiredNames = @()
+    )
+    $runsByName = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($checkRun in @($ValidationRun.runs)) {
+        $rawName = if ($checkRun -is [hashtable]) { $checkRun.name } else { $checkRun.Name }
+        $name = [string]$rawName
+        if ($name -and -not $runsByName.ContainsKey($name)) { $runsByName.Add($name, $checkRun) }
+    }
+    $missingRequired = [System.Collections.Generic.List[string]]::new()
+    foreach ($requiredName in @($RequiredNames)) {
+        if (-not $runsByName.ContainsKey([string]$requiredName)) { [void]$missingRequired.Add([string]$requiredName) }
+    }
+    $known = [bool]$ValidationRun.found
+    $allComplete = $known -and [bool]$ValidationRun.isComplete -and $missingRequired.Count -eq 0
+    $allSuccess = $known -and [bool]$ValidationRun.isSuccess -and $missingRequired.Count -eq 0
+
+    $snapshotText = (@(@($ValidationRun.runs) | ForEach-Object {
+                $entry = $_
+                $name = if ($entry -is [hashtable]) { $entry.name } else { $entry.Name }
+                $status = if ($entry -is [hashtable]) { $entry.status } else { $entry.Status }
+                $conclusion = if ($entry -is [hashtable]) { $entry.conclusion } else { $entry.Conclusion }
+                "$([string]$name)|$([string]$status)|$([string]$conclusion)"
+            } | Sort-Object) -join "`n") + "`n" + (@($missingRequired) -join ',')
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $sha256 = ""
+    try {
+        $sha256 = ([BitConverter]::ToString(
+                $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($snapshotText)))).Replace('-', '').ToLowerInvariant()
+    }
+    finally { $sha.Dispose() }
+
     return @{
-        found      = $true
-        state      = $state
-        isComplete = $allComplete
-        isSuccess  = $allSuccess
-        runs       = $normalized
-        headSha    = $HeadSha.ToLowerInvariant()
+        known           = $known
+        allComplete     = $allComplete
+        allSuccess      = $allSuccess
+        missingRequired = @($missingRequired.ToArray())
+        runs            = @($ValidationRun.runs)
+        sha256          = $sha256
     }
+}
+
+function Get-AgentProviderRequiredChecksSnapshot {
+    <#
+    .SYNOPSIS
+        Whether every EXPLICITLY named required check for a commit is complete
+        and green, for GitHub check runs.
+
+    .DESCRIPTION
+        Builds on Get-AgentProviderValidationRun's normalized run list (which
+        already treats "no checks found" as 'None', not as "nothing to block
+        on", and 'InProgress' as incomplete) and additionally verifies every
+        name in -RequiredNames actually appears. A name that never ran at all
+        is reported in missingRequired rather than silently passing because it
+        was never contradicted.
+
+        `known=$false` when the commit reports no check runs at all - that is
+        unknown territory (checks may not have started), never treated as
+        "nothing required, so this passes".
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Context,
+        [Parameter(Mandatory)][string]$HeadSha,
+        [AllowEmptyCollection()][string[]]$RequiredNames = @()
+    )
+    Assert-AgentProviderContext -Context $Context -RequiredProvider 'GitHub'
+    $run = Get-AgentProviderValidationRun -Context $Context -HeadSha $HeadSha
+    return ConvertTo-AgentProviderRequiredChecksSnapshot -ValidationRun $run -RequiredNames $RequiredNames
 }
 
 function Set-AgentProviderPullRequestVote {
@@ -2573,5 +2817,11 @@ Export-ModuleMember -Function @(
     "Get-AgentProviderCommitDateUtc",
     "Get-AgentProviderPullRequestThreads",
     "Get-AgentProviderValidationRun",
-    "Set-AgentProviderPullRequestVote"
+    "Set-AgentProviderPullRequestVote",
+    "Invoke-AgentGitHubApiResult",
+    "ConvertTo-AgentProviderCheckRunsSnapshot",
+    "ConvertTo-AgentProviderReviewDismissalPolicy",
+    "ConvertTo-AgentProviderRequiredChecksSnapshot",
+    "Get-AgentProviderReviewDismissalPolicy",
+    "Get-AgentProviderRequiredChecksSnapshot"
 )

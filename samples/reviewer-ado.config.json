@@ -48,7 +48,11 @@
       "DO NOT MERGE",
       "DRAFT",
       "[skip review]"
-    ]
+    ],
+    "deliveryGates": {
+      "note": "Layer 6 fail-closed comment/approval-vote eligibility gates over the sealed cross-verification preview. This key has exactly one power: disabled:true forces gate mode 'off' no matter what. It can NEVER enable anything - repository config and PR content are never an enablement authority. Real enablement additionally requires an out-of-repo -GatePolicyFile the wrapper resolves outside this repository, the matching -Enable*Gate CLI switch(es), and a verified -GateQualificationFile meeting the code-defined precision/recall/sample/false-approval floors. See docs/delivery-gates.md. Shipped disabled:false here is a documentation no-op: with no out-of-repo policy or CLI switches supplied, gates remain off regardless of this value.",
+      "disabled": false
+    }
   },
   "threadClassification": {
     "note": "Identities whose comments are NOT human review feedback. Used to build the metadata digest the model sees, so that a bot's or a policy service's output is not mistaken for a reviewer's opinion.",

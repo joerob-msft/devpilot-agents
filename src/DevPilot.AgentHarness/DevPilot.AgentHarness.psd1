@@ -95,7 +95,10 @@ FunctionsToExport = 'Get-DevPilotAgentPath', 'Resolve-AgentRepositoryRoot', 'Get
     'Invoke-AgentGitHubApi', 'Invoke-AgentGitHubGraphQl', 'ConvertTo-AgentProviderPullRequestStatus', 'ConvertTo-AgentProviderVote',
     'ConvertTo-AgentProviderSnapshot', 'ConvertTo-AgentProviderThreadStatus', 'Get-AgentProviderPullRequestSnapshot',
     'Get-AgentProviderActivePullRequestIds', 'Get-AgentProviderCommitDateUtc', 'Get-AgentProviderPullRequestThreads',
-    'Get-AgentProviderValidationRun', 'Set-AgentProviderPullRequestVote'
+    'Get-AgentProviderValidationRun', 'Set-AgentProviderPullRequestVote',
+    'Invoke-AgentGitHubApiResult', 'ConvertTo-AgentProviderCheckRunsSnapshot',
+    'ConvertTo-AgentProviderReviewDismissalPolicy', 'ConvertTo-AgentProviderRequiredChecksSnapshot',
+    'Get-AgentProviderReviewDismissalPolicy', 'Get-AgentProviderRequiredChecksSnapshot'
 
 # Cmdlets to export from this module, for best performance, do not use wildcards and do not delete the entry, use an empty array if there are no cmdlets to export.
 CmdletsToExport = @()

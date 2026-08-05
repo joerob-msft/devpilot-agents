@@ -1092,10 +1092,13 @@ Assert-VerificationThrows {
         -VerifierModel $sol -Candidates @() -MaxInputBytes 900000
 } "A policy value widened the code-defined verifier input ceiling."
 
-# Wrapper integration remains preview-only and structurally non-promotable.
+# Wrapper integration remains preview-only and structurally non-promotable:
+# layer 6 legitimately consumes this sealed output (its own gate, never raw
+# delivery), so the call is now a bound variable rather than discarded - the
+# pairing and ordering invariants below are what actually matter.
 $pullRequestText = Get-VerificationFunctionText -Text $wrapperText -Name "Invoke-ReviewerPullRequest"
 $verificationCallCount = [regex]::Matches(
-    $pullRequestText, '\[void\]\(Invoke-ReviewerCrossVerificationSafely').Count
+    $pullRequestText, '\$verificationResult\s*=\s*Invoke-ReviewerCrossVerificationSafely').Count
 $specialistCallCount = [regex]::Matches(
     $pullRequestText, '\$specialistResult\s*=\s*Invoke-ReviewerConventionSpecialistSafely').Count
 Assert-Verification ($verificationCallCount -eq 3 -and $specialistCallCount -eq 3) `
