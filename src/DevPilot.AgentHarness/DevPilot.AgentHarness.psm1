@@ -405,10 +405,11 @@ function Get-AgentCopilotArgs {
         repo custom agent on top of a single-purpose autonomous prompt makes
         the model follow that agent's persona instead of the cycle contract.
         The literal `--` is REQUIRED so the engine-facing flags after it (-s,
-        --no-ask-user, --disallow-temp-dir, --allow-tool, --deny-tool,
-        --model, --resume) reach the Copilot engine and are not reinterpreted
-        by Agency's own parser. `--model` and its id are two SEPARATE argv
-        entries. Model is validated against a code-defined allowlist.
+        --no-ask-user, --disallow-temp-dir, --available-tools, --allow-tool,
+        --deny-tool, --model, --resume) reach the Copilot engine and are not
+        reinterpreted by Agency's own parser. `--model` and its id are two
+        SEPARATE argv entries. Model is validated against a code-defined
+        allowlist.
     #>
     param(
         [string]$AgentName,
@@ -419,12 +420,21 @@ function Get-AgentCopilotArgs {
         [switch]$UseYolo,
         [string]$ResumeSessionId,
         [string[]]$SupportedModels,
-        [switch]$JsonOutput
+        [switch]$JsonOutput,
+        [string[]]$AvailableTools = @()
     )
+    $available = @($AvailableTools)
     $allow = @($AllowTools)
     $deny = @($DenyTools)
+    $invalidAvailable = @($available | Where-Object { $_ -notmatch '^[A-Za-z0-9][A-Za-z0-9_-]*$' })
+    if ($invalidAvailable.Count -gt 0) {
+        throw "Get-AgentCopilotArgs: -AvailableTools accepts literal CLI tool names only, not permission patterns: $($invalidAvailable -join ', ')."
+    }
     $engineArgs = @("-s", "--no-ask-user", "--disallow-temp-dir")
     if ($JsonOutput) { $engineArgs += @("--output-format", "json") }
+    if ($available.Count -gt 0) {
+        $engineArgs += @("--available-tools=$($available -join ', ')")
+    }
     if ($UseYolo) {
         $engineArgs += "--yolo"
     }
@@ -1164,6 +1174,7 @@ function Open-AgentMcpSession {
         ErrorDrainTask = $process.StandardError.ReadToEndAsync()
         TimeoutSeconds = $TimeoutSeconds
         Server         = $Server
+        Organization   = $Organization
     }
     try {
         $initializeResult = Send-AgentMcpRequest -Session $session -Method "initialize" -Params @{
@@ -1219,6 +1230,111 @@ function Invoke-AgentMcpTool {
     if ($RawText) { return [string]$content[0].text }
     try { return ($content[0].text | ConvertFrom-Json -ErrorAction Stop) }
     catch { throw "Agent MCP tool '$Name' returned malformed JSON content." }
+}
+
+function ConvertFrom-AgentMcpResourceContent {
+        <#
+            Converts one MCP embedded-resource content item into bounded UTF-8 text.
+            This function never dereferences the resource URI. The caller supplies
+            the exact URI and MIME allow-list expected from its wrapper-owned tool
+            request; all other result shapes fail closed.
+        #>
+        param(
+            [Parameter(Mandatory)]$ToolResult,
+            [Parameter(Mandatory)][string]$ExpectedUri,
+            [ValidateRange(1, 5242880)][int]$MaxBytes,
+            [string[]]$AllowedMimeTypes = @("text/plain", "text/markdown")
+        )
+        if ($ToolResult -isnot [System.Management.Automation.PSCustomObject]) {
+            throw "Agent MCP resource response had an unexpected result shape."
+        }
+        if ($ToolResult.PSObject.Properties["isError"] -and $ToolResult.isError -eq $true) {
+            throw "Agent MCP resource response reported failure."
+        }
+        if ($ExpectedUri.Length -gt 2048 -or [string]::IsNullOrWhiteSpace($ExpectedUri)) {
+            throw "Agent MCP resource expected URI must be a non-empty string of at most 2048 characters."
+        }
+        $allowed = @($AllowedMimeTypes)
+        if ($allowed.Count -eq 0 -or @($allowed | Where-Object {
+                    $_ -isnot [string] -or [string]::IsNullOrWhiteSpace($_) -or $_.Length -gt 128
+                }).Count -gt 0) {
+            throw "Agent MCP resource MIME allow-list must contain non-empty strings of at most 128 characters."
+        }
+
+        $contentProperty = $ToolResult.PSObject.Properties["content"]
+        if (-not $contentProperty) { throw "Agent MCP resource response omitted content." }
+        $content = @($contentProperty.Value)
+        if ($content.Count -ne 1 -or $content[0] -isnot [System.Management.Automation.PSCustomObject]) {
+            throw "Agent MCP resource response must contain exactly one object."
+        }
+        $item = $content[0]
+        if (-not $item.PSObject.Properties["type"] -or [string]$item.type -cne "resource" -or
+            -not $item.PSObject.Properties["resource"] -or
+            $item.resource -isnot [System.Management.Automation.PSCustomObject]) {
+            throw "Agent MCP resource response did not contain one embedded resource."
+        }
+        $unexpectedItemProperties = @($item.PSObject.Properties.Name | Where-Object { @("resource", "type") -cnotcontains $_ })
+        if ($unexpectedItemProperties.Count -gt 0) {
+            throw "Agent MCP resource content contained unexpected property/properties: $($unexpectedItemProperties -join ', ')."
+        }
+
+        $resource = $item.resource
+        $requiredResourceProperties = @("blob", "mimeType", "uri")
+        $missingResourceProperties = @($requiredResourceProperties | Where-Object { -not $resource.PSObject.Properties[$_] })
+        if ($missingResourceProperties.Count -gt 0) {
+            throw "Agent MCP resource omitted required property/properties: $($missingResourceProperties -join ', ')."
+        }
+        $unexpectedResourceProperties = @($resource.PSObject.Properties.Name | Where-Object { $requiredResourceProperties -cnotcontains $_ })
+        if ($unexpectedResourceProperties.Count -gt 0) {
+            throw "Agent MCP resource contained unexpected property/properties: $($unexpectedResourceProperties -join ', ')."
+        }
+        if ($resource.uri -isnot [string] -or [string]$resource.uri -cne $ExpectedUri) {
+            throw "Agent MCP resource URI did not exactly match the wrapper-requested path."
+        }
+        if ($resource.mimeType -isnot [string] -or $allowed -cnotcontains [string]$resource.mimeType) {
+            throw "Agent MCP resource MIME type was not in the wrapper's case-sensitive allow-list."
+        }
+        if ($resource.blob -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$resource.blob)) {
+            throw "Agent MCP resource blob must be non-empty base64 text."
+        }
+        $blob = [string]$resource.blob
+        if (($blob.Length % 4) -ne 0 -or $blob -notmatch '^[A-Za-z0-9+/]*={0,2}$') {
+            throw "Agent MCP resource blob was not canonical base64."
+        }
+        try { $bytes = [Convert]::FromBase64String($blob) }
+        catch { throw "Agent MCP resource blob was not valid base64." }
+        if ([Convert]::ToBase64String($bytes) -cne $blob) {
+            throw "Agent MCP resource blob was not canonical base64."
+        }
+        if ($bytes.Length -lt 1 -or $bytes.Length -gt $MaxBytes) {
+            throw "Agent MCP resource decoded to $($bytes.Length) bytes; expected 1..$MaxBytes."
+        }
+        if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+            throw "Agent MCP resource text must be UTF-8 without a byte-order mark."
+        }
+        try {
+            $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+            $text = $strictUtf8.GetString($bytes)
+        }
+        catch {
+            throw "Agent MCP resource was not valid UTF-8 text."
+        }
+        foreach ($character in $text.ToCharArray()) {
+            $code = [int]$character
+            if (($code -lt 32 -and $code -notin @(9, 10, 13)) -or $code -eq 127) {
+                throw "Agent MCP resource text contained a disallowed control character."
+            }
+        }
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $hashBytes = $sha.ComputeHash($bytes) }
+        finally { $sha.Dispose() }
+        return @{
+            Uri        = [string]$resource.uri
+            MimeType   = [string]$resource.mimeType
+            ByteLength = [int]$bytes.Length
+            Sha256     = ([System.BitConverter]::ToString($hashBytes) -replace '-', '').ToLowerInvariant()
+            Text       = [string]$text
+        }
 }
 
 function Get-AgentCliJsonOutcome {
@@ -2423,6 +2539,7 @@ Export-ModuleMember -Function @(
     "Send-AgentMcpRequest",
     "Send-AgentMcpNotification",
     "Invoke-AgentMcpTool",
+    "ConvertFrom-AgentMcpResourceContent",
     "Get-AgentSupportedProvider",
     "Test-AgentProviderSupported",
     "New-AgentProviderContext",
@@ -2440,6 +2557,4 @@ Export-ModuleMember -Function @(
     "Get-AgentProviderValidationRun",
     "Set-AgentProviderPullRequestVote"
 )
-
-
 
