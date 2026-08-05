@@ -6917,6 +6917,55 @@ function Invoke-DryRunSelfChecks {
         Write-Host "  OK - both the direct and replay gate-delivery record writes OR a transient approval-authorization failure into pendingReplay" -ForegroundColor Green
     }
 
+    Write-Host "[DRY-RUN] Self-check 45/$total : disk-round-tripped gate decisions hash from sealed manifest text and raw generalist approval JSON is parsed" -ForegroundColor Cyan
+    $sc45Dir = Join-Path $StateDir "selfcheck45-artifacts"
+    New-Item -ItemType Directory -Force -Path $sc45Dir | Out-Null
+    try {
+        $sc45Key = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+        $sc45Manifest = New-SelfCheck43Decision
+        $sc45Manifest | Add-Member -NotePropertyName kind -NotePropertyValue $script:ReviewerGateDecisionKind
+        $sc45Manifest | Add-Member -NotePropertyName artifactVersion -NotePropertyValue $script:ReviewerGateArtifactVersion
+        $sc45DecisionPath = Save-ReviewerGateDecision -Manifest $sc45Manifest `
+            -Directory $sc45Dir -BaseName "sc45-decision" -MasterKey $sc45Key
+        $sc45Rehydrated = Read-ReviewerGateDecision -Path $sc45DecisionPath -MasterKey $sc45Key
+        $sc45Envelope = Get-Content -LiteralPath $sc45DecisionPath -Raw | ConvertFrom-Json -Depth 8
+        $sc45ExpectedHash = Get-ReviewerVerificationSha256 -Text ([string]$sc45Envelope.manifestJson)
+        $sc45ActualHash = Get-ReviewerGateDecisionManifestSha256 -ArtifactPath $sc45DecisionPath
+        $sc45Fingerprint = Get-ReviewerGateEligibilityFingerprint -SourceCommit ([string]$sc45Rehydrated.sourceCommit) `
+            -ChangeSetDigest ([string]$sc45Rehydrated.changeSetDigest) -TotalCandidateCount @($sc45Rehydrated.candidates).Count `
+            -DecisionSha256 $sc45ActualHash -GatePolicySha256 $GatePolicySha256
+        if ($sc45ActualHash -cne $sc45ExpectedHash -or $sc45Fingerprint -notmatch '^[0-9a-f]{64}$') {
+            $failures.Add("A disk-round-tripped gate decision did not hash from its exact sealed manifestJson text.")
+        }
+        else {
+            Write-Host "  OK - a disk-round-tripped decision hashes from exact sealed manifestJson text, without re-canonicalizing DateTime values" -ForegroundColor Green
+        }
+
+        $approvePasses = @(
+            [pscustomobject]@{ status = "complete"; markerJson = '{"recommendedVote":"approve"}' },
+            [pscustomobject]@{ status = "complete"; markerJson = '{"recommendedVote":"approve"}' }
+        )
+        $declinePasses = @(
+            $approvePasses[0],
+            [pscustomobject]@{ status = "complete"; markerJson = '{"recommendedVote":"none"}' }
+        )
+        $malformedPasses = @(
+            $approvePasses[0],
+            [pscustomobject]@{ status = "complete"; markerJson = '{not-json' }
+        )
+        if (-not (Test-ReviewerGeneralistPassesBothApprove -RawPasses $approvePasses) -or
+            (Test-ReviewerGeneralistPassesBothApprove -RawPasses $declinePasses) -or
+            (Test-ReviewerGeneralistPassesBothApprove -RawPasses $malformedPasses)) {
+            $failures.Add("Raw generalist markerJson approval parsing did not require exactly two complete, valid, independently approving pass markers.")
+        }
+        else {
+            Write-Host "  OK - exactly two complete parsed markerJson values must independently recommend approve" -ForegroundColor Green
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $sc45Dir) { Remove-Item -LiteralPath $sc45Dir -Recurse -Force }
+    }
+
     }
     finally {
         # Restored for any code that runs after self-checks (or a future
@@ -8804,6 +8853,40 @@ function Get-ReviewerVerifiedMultiPassCoverageDigest {
     return Get-ReviewerVerificationObjectSha256 -Value @(@($CoverageKeys) | Sort-Object -Unique)
 }
 
+function Get-ReviewerGateDecisionManifestSha256 {
+    <# Hashes the exact signed manifest text. Never re-canonicalize a parsed
+       decision: ConvertFrom-Json rehydrates ISO timestamps as DateTime, which
+       the strict verification canonicalizer intentionally rejects. #>
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ArtifactPath)
+    if (-not (Test-Path -LiteralPath $ArtifactPath -PathType Leaf)) {
+        throw "Gate decision artifact '$ArtifactPath' does not exist."
+    }
+    $envelope = Get-Content -LiteralPath $ArtifactPath -Raw | ConvertFrom-Json -Depth 8
+    $manifestJson = [string](Get-ReviewerHashValue -Container $envelope -Key 'manifestJson' -Default '')
+    if ([string]::IsNullOrWhiteSpace($manifestJson)) {
+        throw "Gate decision artifact '$ArtifactPath' has no signed manifestJson text."
+    }
+    return Get-ReviewerVerificationSha256 -Text $manifestJson
+}
+
+function Test-ReviewerGeneralistPassesBothApprove {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$RawPasses)
+    if (@($RawPasses).Count -ne 2) { return $false }
+    foreach ($pass in @($RawPasses)) {
+        if ([string](Get-ReviewerHashValue -Container $pass -Key 'status' -Default '') -cne "complete") {
+            return $false
+        }
+        $markerJson = [string](Get-ReviewerHashValue -Container $pass -Key 'markerJson' -Default '')
+        if ([string]::IsNullOrWhiteSpace($markerJson)) { return $false }
+        try { $marker = $markerJson | ConvertFrom-Json -Depth 32 -ErrorAction Stop }
+        catch { return $false }
+        if ([string](Get-ReviewerHashValue -Container $marker -Key 'recommendedVote' -Default '') -cne "approve") {
+            return $false
+        }
+    }
+    return $true
+}
+
 function New-ReviewerVerifiedMultiPassAuthorization {
     <#
         The SOLE VerifiedMultiPass producer in this script. Re-derives every
@@ -9169,7 +9252,7 @@ function Invoke-ReviewerGateDelivery {
         }
         $eligibilityFingerprint = Get-ReviewerGateEligibilityFingerprint -SourceCommit ([string]$Decision.sourceCommit) `
             -ChangeSetDigest ([string]$Decision.changeSetDigest) -TotalCandidateCount (@($Decision.candidates).Count) `
-            -DecisionSha256 (Get-ReviewerVerificationObjectSha256 -Value $Decision) -GatePolicySha256 $GatePolicySha256
+            -DecisionSha256 (Get-ReviewerGateDecisionManifestSha256 -ArtifactPath $DecisionArtifactPath) -GatePolicySha256 $GatePolicySha256
         $priorRecord = $PriorEligibility[[string]$Decision.prId]
         $priorMatches = ($priorRecord -and
             ([string](Get-ReviewerHashValue -Container $priorRecord -Key 'sourceCommit' -Default '')) -ieq [string]$Decision.sourceCommit -and
@@ -9386,9 +9469,8 @@ function Invoke-ReviewerGateForPullRequest {
             @($rawPassesCompleted).Count -eq 2 -and
             (@($rawPasses.model | Sort-Object) -join '|') -ceq (@("claude-opus-5", "gpt-5.6-sol") -join '|')
         )
-        $decision | Add-Member -NotePropertyName generalistBothApprove -NotePropertyValue (
-            @($rawPasses | Where-Object { $_.status -ceq "complete" -and [string](Get-ReviewerHashValue -Container $_.markerJson -Key 'recommendedVote' -Default '') -ceq "approve" }).Count -eq 2
-        )
+        $decision | Add-Member -NotePropertyName generalistBothApprove `
+            -NotePropertyValue (Test-ReviewerGeneralistPassesBothApprove -RawPasses $rawPasses)
         $specialistEnabledForRun = [bool]$EnableConventionSpecialist
         $specialistStatus = $(if ($inputManifest) { [string]$inputManifest.specialistStatus } else { "degraded" })
         $decision | Add-Member -NotePropertyName specialistOkForApproval -NotePropertyValue (
@@ -9513,7 +9595,7 @@ function Invoke-ReviewerGateForPullRequest {
 
         if ($approvalRequested) {
             $fingerprint = Get-ReviewerGateEligibilityFingerprint -SourceCommit $sourceCommit -ChangeSetDigest ([string]$decision.changeSetDigest) `
-                -TotalCandidateCount (@($decision.candidates).Count) -DecisionSha256 (Get-ReviewerVerificationObjectSha256 -Value $decision) `
+                -TotalCandidateCount (@($decision.candidates).Count) -DecisionSha256 (Get-ReviewerGateDecisionManifestSha256 -ArtifactPath $sealed.ArtifactPath) `
                 -GatePolicySha256 $GatePolicySha256
             $priorRecord = $gateEligibilityState[[string]$prId]
             $alreadyRecordedSameCommit = ($priorRecord -and
@@ -9850,7 +9932,7 @@ function Invoke-ReviewerGateReplay {
 
         if ($approvalRequested) {
             $fingerprint = Get-ReviewerGateEligibilityFingerprint -SourceCommit $SourceCommit -ChangeSetDigest ([string]$decision.changeSetDigest) `
-                -TotalCandidateCount (@($decision.candidates).Count) -DecisionSha256 (Get-ReviewerVerificationObjectSha256 -Value $decision) `
+                -TotalCandidateCount (@($decision.candidates).Count) -DecisionSha256 (Get-ReviewerGateDecisionManifestSha256 -ArtifactPath $artifactPath) `
                 -GatePolicySha256 $GatePolicySha256
             $priorRecord = $gateEligibilityState[[string]$PrId]
             $gateEligibilityState[[string]$PrId] = @{
@@ -9882,6 +9964,24 @@ function Invoke-ReviewerGateReplay {
     }
     catch {
         Write-Warning "Delivery-gate replay degraded for PR ${PrId}; the underlying review is unaffected: $($_.Exception.Message)"
+        try {
+            $faultState = Get-JsonState -Path $gateDeliveryStatePath
+            $faultRecord = $faultState[[string]$PrId]
+            if ($faultRecord -and $faultRecord -isnot [hashtable]) {
+                $normalizedFaultRecord = @{}
+                foreach ($prop in $faultRecord.PSObject.Properties) { $normalizedFaultRecord[$prop.Name] = $prop.Value }
+                $faultRecord = $normalizedFaultRecord
+            }
+            if ($faultRecord) {
+                $faultRecord.reason = "gateProcessingFaulted"
+                $faultRecord.pendingReplay = $false
+                $faultRecord.superseded = $false
+                $faultRecord.at = [DateTime]::UtcNow.ToString("o")
+                $faultState[[string]$PrId] = $faultRecord
+                Set-JsonState -Path $gateDeliveryStatePath -State $faultState
+            }
+        }
+        catch { Write-Warning "Delivery-gate replay could not persist its terminal fault record for PR ${PrId}: $($_.Exception.Message)" }
     }
 }
 
