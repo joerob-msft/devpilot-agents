@@ -42,7 +42,7 @@ src/
     review-handler/          # an agent: script + prompt + fixtures
     reviewer/                # an agent: script + prompt
 samples/                     # example configs for real repositories
-tools/                       # repo hygiene checks
+tools/                       # repo hygiene checks and operator tooling
 docs/                        # how to add an agent
 ```
 
@@ -134,7 +134,7 @@ review you have actually read is a first-class mode rather than a re-run:
     -OperatorAlias <your-alias> -EnableFindingComments -EnableSummaryComment
 ```
 
-`-PromotePreview` publishes the artifact's **delivery manifest** — the exact
+For single-pass reviews, `-PromotePreview` publishes the artifact's **delivery manifest** — the exact
 comment list, summary and vote that appeared in the Markdown you read — and
 three things have to hold before any of it goes out. The artifact's HMAC seal
 must verify against a per-user key that is *not stored in the artifact*; the
@@ -163,8 +163,8 @@ accepting that nothing can then show that what was published is what was read.
 
 Other properties worth knowing:
 
-- **A preview does not consume the commit.** It is recorded as *not delivered*,
-  so you can still publish it. A delivered review closes that commit.
+- **A single-pass preview does not consume the commit.** It is recorded as *not
+  delivered*, so you can still publish it. A delivered review closes that commit.
 - **Delivery is tracked per capability.** Comments, the summary and the vote are
   recorded separately, so adding `-EnableApprovalVote` to a PR that already
   received comments still casts the vote instead of skipping the PR as done.
@@ -231,6 +231,127 @@ Other properties worth knowing:
 Posted findings appear under **your** identity, since that is who the session is
 authenticated as. That is why every write is opt-in.
 
+### Two passes, two models
+
+A single model's coverage of real defects is both incomplete and *idiosyncratic*
+— two models do not miss the same things. `-SecondPassModel` reviews every PR
+twice, with a different model each time, and previews the **union**:
+
+```powershell
+./src/Agents/reviewer/Start-ReviewerAgent.ps1 `
+    -ConfigFile <your-repo>/.github/copilot/agents/reviewer.config.json `
+    -OperatorAlias <your-alias> `
+    -Model claude-opus-5 -SecondPassModel gpt-5.6-sol
+```
+
+Measured on nine live pull requests carrying thirteen defects that were then
+verified by hand against the source:
+
+| Reviewer | Defects found |
+|---|---|
+| best single model | 10 / 13 |
+| second-best single model | 5 / 13 |
+| the two together | **13 / 13** |
+
+The pairing beats either model not because the second one is good but because it
+is *different*: the five it found included two the first missed entirely, and it
+missed six the first caught. Pick a partner that fails differently, not one that
+scores well.
+
+How it works, and why it is arranged this way:
+
+- **The union is discovery-only in this layer.** The passes do not cross-review
+  or independently verify each other's findings. With `-SecondPassModel`,
+  finding comments, summary comments, approval votes and `-PromotePreview` are
+  all rejected before publication. There is no config or CLI override. A later
+  verified-delivery layer must produce the code-defined typed authorization
+  before any multi-pass output can leave the host.
+- **The passes are independent.** Each gets its own nonce, is validated against
+  the marker schema on its own, and is bound to the PR and commit on its own.
+  Neither sees the other's output — a second model shown the first one's
+  conclusions stops being a second sample and starts agreeing, which would erase
+  exactly the disagreement the pass was added to surface.
+- **The wrapper merges, not a model.** Findings are unioned; a finding both
+  passes report is deduplicated on its anchor and its normalised text, and keeps
+  the *more severe* of the two grades. Two differently worded findings on one
+  line are kept as two: no similarity heuristic can distinguish "the same point,
+  said differently" from "two distinct bugs on one line", and dropping one to
+  save a duplicate comment would lose a real finding.
+- **The union is still filtered as if it could be posted.** The per-PR cap, the
+  severity threshold and the change-set anchor check all apply before preview,
+  unchanged, so the discovery artifact reflects the eventual delivery shape.
+- **A plain approval requires *every* pass to approve.** The merged
+  recommendation is the least approving one offered — an unrecognised value
+  collapses it to "no vote". In the benchmark the single worst outcome was a
+  confident approval of a PR that broke two APIs, and it was the partner model
+  that caught it.
+- **A pass that fails degrades loudly.** If one pass produces nothing usable the
+  findings that *did* arrive remain in the preview — a real defect is useful
+  discovery however many models saw it — the sealed manifest records
+  `passesRequested`/`passesCompleted`, and **no vote is available**.
+- **Cost and wall-clock roughly double.** Each pass is a full model run with its
+  own `-CycleTimeoutSeconds` budget.
+
+Both models must be named explicitly: pairing a chosen model against "whatever
+the CLI defaults to today" is not reproducible, and naming the same model twice
+is refused outright — it doubles the cost to miss the same things twice.
+
+---
+
+## Running unattended
+
+An agent loop spends most of its life waiting on a model, so it wants to run
+detached — but a detached process you cannot question is not supervision, it is
+hope. `tools/Invoke-AgentControl.ps1` covers the three things an operator
+actually needs: start it, find out what it is doing, take it back.
+
+```powershell
+$state = "$env:LOCALAPPDATA\DevPilot\Reviewer\my-repo"
+
+# Start it. Nothing here grants a capability the agent's own parameters do not:
+# everything after -AgentArguments is passed through untouched.
+./tools/Invoke-AgentControl.ps1 -Action start -Name my-reviewer -StateDir $state `
+    -AgentScript ./src/Agents/reviewer/Start-ReviewerAgent.ps1 `
+    -AgentArguments @(
+        '-ConfigFile', 'C:\repos\my-repo\.github\copilot\agents\reviewer.config.json',
+        '-OperatorAlias', 'myalias',
+        '-StateDir', $state,
+        '-Model', 'claude-opus-5', '-SecondPassModel', 'gpt-5.6-sol')
+
+./tools/Invoke-AgentControl.ps1 -Action status -Name my-reviewer -StateDir $state
+./tools/Invoke-AgentControl.ps1 -Action tail   -Name my-reviewer -StateDir $state
+./tools/Invoke-AgentControl.ps1 -Action stop   -Name my-reviewer -StateDir $state
+
+# Survive a reboot. Starts the agent the same way, so status/tail/stop still work.
+./tools/Invoke-AgentControl.ps1 -Action install -Name my-reviewer -StateDir $state -AgentScript ... -AgentArguments ...
+```
+
+`status` answers "is it alive and what has it decided" together, because the
+first question is rarely the interesting one: it prints the process and its
+children, then the last few records from the agent's own structured cycle log,
+how many reviews are sitting unread, and how many cycles failed.
+
+Three details are worth knowing rather than discovering:
+
+- **`stop` is safe at any moment, including mid-review.** The single-writer lock
+  is released by the OS when the process dies, state writes are atomic, and an
+  interrupted cycle is discarded and re-attempted. A cycle killed *after* it had
+  already posted does not double-post, because posted comments are recognised
+  from the pull request itself rather than from local state.
+- **`stop` kills the model process too.** Terminating only the parent leaves the
+  model running, holding no lock, spending a budget nobody is watching.
+  Descendants are found by parent process id — never by process name, which
+  would match unrelated work in another window.
+- **A recorded process id is checked against its launch instant.** Windows reuses
+  process ids; a stale record from a machine that lost power will eventually name
+  a live process that is something else entirely, and `stop` would kill it.
+
+For unattended operation the preview-first mode is the point, not a limitation:
+leave the write switches off, let it accumulate reviews you can read, and promote
+the ones you agree with. `Invoke-AgentControl.ps1` says so at start time — it
+warns when the arguments it is about to pass through would let the agent post
+without anyone having read the result.
+
 ---
 
 ## Safety model
@@ -286,6 +407,13 @@ See [`docs/adding-an-agent.md`](docs/adding-an-agent.md).
   injected prompt could aim at the host. Whole classes of defect are therefore
   outside what it can find, and it is an addition to human review, not a
   replacement for it.
+- **A second pass raises coverage; it does not establish correctness.** Two
+  models that miss different things find more between them, but two models can
+  still be wrong the same way, and the merge unions their findings rather than
+  cross-examining them — a false positive from either pass survives to the
+  preview. Nor is the published pairing permanent: it was measured on one
+  repository at one point in time, and a model release invalidates it. Re-run
+  the comparison rather than inheriting the recommendation.
 - **The change-set guard validates files, not lines.** A finding must name a
   file the PR changes, but within that file the model can name any line. Right-
   side changed-line ranges are not yet parsed.
