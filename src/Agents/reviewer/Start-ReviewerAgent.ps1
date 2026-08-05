@@ -251,7 +251,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
-$script:ReviewerUtf8 = New-Object System.Text.UTF8Encoding($false)
+$script:ReviewerUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
 [Console]::OutputEncoding = $script:ReviewerUtf8
 $OutputEncoding = $script:ReviewerUtf8
 
@@ -313,6 +313,19 @@ if (-not (Test-Path -LiteralPath $ConventionPackLibrary)) {
     throw "Convention-pack library '$ConventionPackLibrary' does not exist."
 }
 . $ConventionPackLibrary
+$ReviewFactLibrary = Join-Path $PSScriptRoot "ReviewFacts.ps1"
+if (-not (Test-Path -LiteralPath $ReviewFactLibrary)) {
+    throw "Review-fact library '$ReviewFactLibrary' does not exist."
+}
+. $ReviewFactLibrary
+$ReviewFactPolicyPath = Join-Path $PSScriptRoot "facts\v1\policy.json"
+$ReviewFactSchemaPath = Join-Path $PSScriptRoot "facts\v1\schema.json"
+foreach ($requiredFactAsset in @($ReviewFactPolicyPath, $ReviewFactSchemaPath)) {
+    if (-not (Test-Path -LiteralPath $requiredFactAsset)) {
+        throw "Review-fact asset '$requiredFactAsset' does not exist."
+    }
+}
+$ReviewFactPolicy = Get-Content -LiteralPath $ReviewFactPolicyPath -Raw | ConvertFrom-Json -Depth 32
 
 $ResultMarkerPrefix = "REVIEWER_RESULT_V1:"
 
@@ -477,25 +490,33 @@ function Get-ReviewerCanonicalJson {
         signature over a non-canonical encoding is a signature that verifies by
         luck.
     #>
-    param($Value)
+    param($Value, [int]$Depth = 0)
+    if ($Depth -gt 32) { throw "Reviewer canonical JSON exceeded the maximum object depth of 32." }
     if ($null -eq $Value) { return 'null' }
     if ($Value -is [bool]) { return $(if ($Value) { 'true' } else { 'false' }) }
     if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) {
         return [string]([System.Convert]::ToString($Value, [System.Globalization.CultureInfo]::InvariantCulture))
     }
-    if ($Value -is [string]) { return (ConvertTo-Json -InputObject $Value -Compress) }
+    if ($Value -is [string]) {
+        [void]$script:ReviewerUtf8.GetByteCount($Value)
+        return (ConvertTo-Json -InputObject $Value -Compress)
+    }
     if ($Value -is [hashtable] -or $Value -is [System.Management.Automation.PSCustomObject]) {
         $keys = @()
         if ($Value -is [hashtable]) { $keys = @($Value.Keys | ForEach-Object { [string]$_ }) }
         else { $keys = @($Value.PSObject.Properties | ForEach-Object { $_.Name }) }
-        $parts = @($keys | Sort-Object -CaseSensitive | ForEach-Object {
+        $orderedKeys = [System.Collections.Generic.List[string]]::new()
+        foreach ($key in $keys) { [void]$orderedKeys.Add($key) }
+        $orderedKeys.Sort([StringComparer]::Ordinal)
+        $parts = @($orderedKeys | ForEach-Object {
                 $k = $_
-                "{0}:{1}" -f (ConvertTo-Json -InputObject $k -Compress), (Get-ReviewerCanonicalJson -Value (Get-ReviewerHashValue -Container $Value -Key $k))
+                (ConvertTo-Json -InputObject $k -Compress) + ":" +
+                    (Get-ReviewerCanonicalJson -Value (Get-ReviewerHashValue -Container $Value -Key $k) -Depth ($Depth + 1))
             })
         return "{" + ($parts -join ",") + "}"
     }
     if ($Value -is [System.Collections.IEnumerable]) {
-        $parts = @(@($Value) | ForEach-Object { Get-ReviewerCanonicalJson -Value $_ })
+        $parts = @(@($Value) | ForEach-Object { Get-ReviewerCanonicalJson -Value $_ -Depth ($Depth + 1) })
         return "[" + ($parts -join ",") + "]"
     }
     return (ConvertTo-Json -InputObject ([string]$Value) -Compress)
@@ -1969,6 +1990,8 @@ $previewDir = Join-Path $StateDir "previews"
 New-Item -ItemType Directory -Force -Path $previewDir | Out-Null
 $conventionPlanDir = Join-Path $StateDir "convention-plans"
 New-Item -ItemType Directory -Force -Path $conventionPlanDir | Out-Null
+$factPlanDir = Join-Path $StateDir "fact-plans"
+New-Item -ItemType Directory -Force -Path $factPlanDir | Out-Null
 $logPath = Join-Path $logDir "reviewer.log.jsonl"
 $lockPath = Join-Path $StateDir "agent.lock"
 $reviewedStatePath = Join-Path $StateDir "reviewed.json"
@@ -1977,6 +2000,21 @@ $artifactKeyPath = Join-Path $StateDir "artifact-signing.key"
 
 $ScriptSelfSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
 $ConfigSha256 = (Get-FileHash -LiteralPath $ConfigFile -Algorithm SHA256).Hash
+$ReviewFactPolicySha256 = (Get-FileHash -LiteralPath $ReviewFactPolicyPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$ReviewFactScriptClosure = @(
+    [pscustomobject][ordered]@{
+        path = "Start-ReviewerAgent.ps1"
+        sha256 = $ScriptSelfSha256.ToLowerInvariant()
+    },
+    [pscustomobject][ordered]@{
+        path = "ConventionPacks.ps1"
+        sha256 = (Get-FileHash -LiteralPath $ConventionPackLibrary -Algorithm SHA256).Hash.ToLowerInvariant()
+    },
+    [pscustomobject][ordered]@{
+        path = "ReviewFacts.ps1"
+        sha256 = (Get-FileHash -LiteralPath $ReviewFactLibrary -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+)
 # Two children, two different scrubs, and the asymmetry is deliberate rather
 # than an oversight - it is worth stating because the "obviously stricter"
 # version of this is broken.
@@ -2247,7 +2285,7 @@ function Get-ReviewerAuthoritativeSourceSnapshots {
                     Text         = $resource.Text
                 })
         }
-        return , $snapshots.ToArray()
+        return $snapshots.ToArray()
     }
     finally {
         if ($sourceSession -and $ownsSession) { Close-AgentMcpSession -Session $sourceSession }
@@ -2316,7 +2354,7 @@ function Get-ReviewerConventionRepositorySnapshots {
                 Sha256       = $resource.Sha256
             })
     }
-    return , $snapshots.ToArray()
+    return $snapshots.ToArray()
 }
 
 function Save-ReviewerConventionPlan {
@@ -2328,6 +2366,275 @@ function Save-ReviewerConventionPlan {
     $path = Join-Path $conventionPlanDir "pr$PrId-$SourceCommit.json"
     $Plan | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $path -Encoding UTF8
     return $path
+}
+
+function Get-ReviewerFactSourceFile {
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$SourceCommit,
+        [ValidateRange(1, 262144)][int]$MaxBytes = 65536
+    )
+    if ($SourceCommit -notmatch '^[0-9a-f]{40}$') {
+        throw "Review-fact source reads require an exact lowercase 40-hex commit."
+    }
+    $toolResult = Send-AgentMcpRequest -Session $Session -Method "tools/call" -Params @{
+        name = "repo_file"
+        arguments = @{
+            action = "get_content"
+            project = $ExpectedProject
+            repositoryId = $cfgRepoId
+            path = $Path
+            versionType = "Commit"
+            version = $SourceCommit
+        }
+    }
+    $resource = ConvertFrom-AgentMcpResourceContent -ToolResult $toolResult -ExpectedUri $Path `
+        -MaxBytes $MaxBytes -AllowedMimeTypes @(
+            "text/plain", "text/markdown", "application/json", "application/xml", "text/xml"
+        )
+    return [pscustomobject][ordered]@{
+        Path = $Path
+        Content = $resource.Text
+        Sha256 = $resource.Sha256
+        ByteLength = [int]$resource.ByteLength
+    }
+}
+
+function Get-ReviewerFactClaimsFromDescription {
+    param(
+        [AllowEmptyString()][string]$Description = "",
+        [ValidateRange(0, [int]::MaxValue)][int]$PrId = 0
+    )
+    $claims = [System.Collections.Generic.List[object]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $descriptionSha256 = Get-ReviewerFactSha256 -Text $Description
+    $lines = @($Description -split "`r?`n", 0, "RegexMatch")
+    for ($lineIndex = 0; $lineIndex -lt $lines.Count; $lineIndex++) {
+        $line = $lines[$lineIndex]
+        if ($line -match '^\s*Tests:\s*assembly=([A-Za-z0-9_.-]{1,256})(?:\s*;\s*category=([A-Za-z0-9_.-]{1,256}))?\s*$') {
+            $category = $(if ($Matches.Count -gt 2) { $Matches[2] } else { "" })
+            $key = $Matches[1] + "`n" + $category
+            if (-not $seen.Add($key)) { continue }
+            [void]$claims.Add([pscustomobject][ordered]@{
+                    assembly = $Matches[1]
+                    category = $category
+                    path = "pull-request:" + [string]$PrId
+                    line = $lineIndex + 1
+                    sha256 = $descriptionSha256
+                })
+        }
+    }
+    return $claims.ToArray()
+}
+
+function ConvertTo-ReviewerFactThreadSet {
+    param($Response)
+    $node = $Response
+    $reportedCount = $null
+    for ($depth = 0; $depth -lt 4; $depth++) {
+        if ($null -eq $node) { break }
+        $countValue = Get-ReviewerHashValue -Container $node -Key "count" -Default $null
+        if ($null -ne $countValue -and (Test-StrictJsonInt -Value $countValue)) {
+            $reportedCount = [int]$countValue
+        }
+        $comments = Get-ReviewerHashValue -Container $node -Key "comments" -Default $null
+        if ($null -ne $comments) { break }
+        $inner = $null
+        foreach ($key in @("threads", "value")) {
+            $candidate = Get-ReviewerHashValue -Container $node -Key $key -Default $null
+            if ($null -ne $candidate) { $inner = $candidate; break }
+        }
+        if ($null -eq $inner) { break }
+        $node = $inner
+    }
+    $entries = @($node)
+    $reportedComplete = ($null -eq $reportedCount -or $reportedCount -eq $entries.Count)
+    return [pscustomobject]@{
+        Entries = $entries
+        Complete = $reportedComplete
+        CountObserved = ($null -ne $reportedCount)
+        ReportedCount = $reportedCount
+    }
+}
+
+function Get-ReviewerFactInputs {
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)][string]$SourceCommit,
+        [Parameter(Mandatory)][object[]]$ChangeEntries
+    )
+    $inputs = [ordered]@{}
+    $metadataPr = $null
+    try {
+        $rawPr = Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments @{
+            action = "get"; project = $ExpectedProject; repositoryId = $RepositoryName; pullRequestId = $PrId
+        }
+        $metadataPr = [ordered]@{
+            pullRequestId = $PrId
+            description = Get-ReviewerHashValue -Container $rawPr -Key "description" -Default $null
+        }
+        foreach ($fieldName in @("isDraft", "autoCompleteSetBy")) {
+            $property = if ($rawPr -is [System.Management.Automation.PSCustomObject]) {
+                $rawPr.PSObject.Properties[$fieldName]
+            }
+            elseif ($rawPr -is [hashtable] -and $rawPr.ContainsKey($fieldName)) { $true }
+            else { $null }
+            if ($property) { $metadataPr[$fieldName] = Get-ReviewerHashValue -Container $rawPr -Key $fieldName }
+        }
+        $workItemRefs = Get-ReviewerHashValue -Container $rawPr -Key "workItemRefs" -Default $null
+        if ($null -ne $workItemRefs) { $metadataPr["linkedWorkItemCount"] = @($workItemRefs).Count }
+        $inputs.metadata = @{ Status = "available"; Data = $metadataPr }
+    }
+    catch {
+        $inputs.metadata = @{ Status = "failed"; ErrorCode = "metadataTransport"; Error = $_.Exception.Message }
+    }
+
+    $normalizedPaths = @($ChangeEntries | Where-Object { $_.Role -eq "current" } | ForEach-Object { [string]$_.Path })
+    $changeFiles = @($ChangeEntries | ForEach-Object {
+            [pscustomobject][ordered]@{
+                Path = [string]$_.Path
+                Role = [string]$_.Role
+                ChangeTypes = @($_.ChangeTypes)
+            }
+        })
+    $cloudFiles = [System.Collections.Generic.List[object]]::new()
+    $cloudManifests = [System.Collections.Generic.List[object]]::new()
+    try {
+        $manifestPaths = @($normalizedPaths | Where-Object {
+                $leaf = [IO.Path]::GetFileName($_)
+                @($ReviewFactPolicy.cloudTest.manifestFileNames | Where-Object {
+                        [string]::Equals([string]$_, $leaf, [StringComparison]::OrdinalIgnoreCase)
+                    }).Count -gt 0
+            })
+        if ($manifestPaths.Count -gt [int]$ReviewFactPolicy.cloudTest.maxSourceFiles) {
+            throw "CloudTest source file count exceeded the versioned cap."
+        }
+        $cloudBytes = 0
+        foreach ($path in $normalizedPaths) {
+            $leaf = [IO.Path]::GetFileName($path)
+            $isManifest = @($ReviewFactPolicy.cloudTest.manifestFileNames | Where-Object {
+                    [string]::Equals([string]$_, $leaf, [StringComparison]::OrdinalIgnoreCase)
+                }).Count -gt 0
+            $isTestOrProject = @($ReviewFactPolicy.cloudTest.testPathGlobs | Where-Object {
+                    Test-ReviewerFactPathPattern -Path $path -Pattern ([string]$_)
+                }).Count -gt 0 -or
+                @($ReviewFactPolicy.cloudTest.projectExtensions | Where-Object {
+                    [string]::Equals([string]$_, [IO.Path]::GetExtension($path), [StringComparison]::OrdinalIgnoreCase)
+                }).Count -gt 0
+            if ($isTestOrProject) { [void]$cloudFiles.Add([pscustomobject]@{ Path = $path }) }
+            if ($isManifest) {
+                $manifestFile = Get-ReviewerFactSourceFile -Session $Session -Path $path -SourceCommit $SourceCommit
+                $cloudBytes += [int]$manifestFile.ByteLength
+                if ($cloudBytes -gt [int]$ReviewFactPolicy.cloudTest.maxSourceBytesTotal) {
+                    throw "CloudTest source bytes exceeded the versioned total cap."
+                }
+                [void]$cloudManifests.Add($manifestFile)
+            }
+        }
+        $description = if ($metadataPr) { [string](Get-ReviewerFactValue $metadataPr "description" "") } else { "" }
+        $inputs.cloudTest = @{
+            Status = "available"
+            Data = @{
+                ChangeSetObserved = $true
+                ChangedFiles = $cloudFiles.ToArray()
+                Manifests = $cloudManifests.ToArray()
+                Claims = @(Get-ReviewerFactClaimsFromDescription -Description $description -PrId $PrId)
+                # A changed-file list cannot prove that every repository manifest was enumerated.
+                ManifestCorpusComplete = $false
+            }
+        }
+    }
+    catch {
+        $reason = $(if ($_.Exception.Message -match 'exceeded the versioned') { "capExceeded" } else { "cloudTestTransport" })
+        $inputs.cloudTest = @{ Status = "failed"; ErrorCode = $reason; Error = $_.Exception.Message }
+    }
+
+    try {
+        $fanOutFiles = [System.Collections.Generic.List[object]]::new()
+        $fanOutPaths = @($normalizedPaths | Where-Object {
+                $candidatePath = $_
+                @($ReviewFactPolicy.fanOut.filePathGlobs | Where-Object {
+                        Test-ReviewerFactPathPattern -Path $candidatePath -Pattern ([string]$_)
+                    }).Count -gt 0
+            })
+        if ($fanOutPaths.Count -gt [int]$ReviewFactPolicy.fanOut.maxSourceFiles) {
+            throw "Fan-out source file count exceeded the versioned cap."
+        }
+        $fanOutBytes = 0
+        foreach ($path in $fanOutPaths) {
+            $fanOutFile = Get-ReviewerFactSourceFile -Session $Session -Path $path -SourceCommit $SourceCommit
+            $fanOutBytes += [int]$fanOutFile.ByteLength
+            if ($fanOutBytes -gt [int]$ReviewFactPolicy.fanOut.maxSourceBytesTotal) {
+                throw "Fan-out source bytes exceeded the versioned total cap."
+            }
+            [void]$fanOutFiles.Add($fanOutFile)
+        }
+        $inputs.fanOut = @{
+            Status = "available"
+            Data = @{
+                ChangeSetObserved = $true
+                ChangedFiles = $fanOutFiles.ToArray()
+                SurfaceFiles = @()
+                Precedents = @()
+            }
+        }
+    }
+    catch {
+        $reason = $(if ($_.Exception.Message -match 'exceeded the versioned') { "capExceeded" } else { "fanOutTransport" })
+        $inputs.fanOut = @{ Status = "failed"; ErrorCode = $reason; Error = $_.Exception.Message }
+    }
+
+    try {
+        $rawThreads = Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request_thread" -Arguments @{
+            action = "list"; project = $ExpectedProject; repositoryId = $RepositoryName
+            pullRequestId = $PrId; top = [int]$ReviewFactPolicy.threads.maxThreads
+        }
+        $threadSet = ConvertTo-ReviewerFactThreadSet -Response $rawThreads
+        $normalizedThreads = @($threadSet.Entries | Where-Object { $null -ne $_ } | ForEach-Object {
+                ConvertTo-ReviewerThread -RawThread $_
+            })
+        $inputs.threads = @{
+            Status = "available"
+            Data = @{
+                Threads = $normalizedThreads
+                Complete = ([bool]$threadSet.Complete -and
+                    $threadSet.Entries.Count -lt [int]$ReviewFactPolicy.threads.maxThreads)
+                CountObserved = [bool]$threadSet.CountObserved
+                ReportedCount = $threadSet.ReportedCount
+                BotSubstrings = @($BotSubstrings)
+                SystemSubstrings = @($SystemSubstrings)
+            }
+        }
+    }
+    catch {
+        $inputs.threads = @{ Status = "failed"; ErrorCode = "threadTransport"; Error = $_.Exception.Message }
+    }
+    $inputs.changes = @{
+        Status = "available"
+        Data = @{ Entries = $ChangeEntries; Lines = @(); Complete = $true }
+    }
+    return $inputs
+}
+
+function Save-ReviewerFactPlan {
+    param(
+        [Parameter(Mandatory)]$Plan,
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)][string]$SourceCommit
+    )
+    $planHash = [string](Get-ReviewerFactValue $Plan "planSha256" "")
+    if ($planHash -notmatch '^[0-9a-f]{64}$') { throw "A persisted fact plan requires a valid planSha256." }
+    $baseName = "pr$PrId-$SourceCommit-$($planHash.Substring(0, 16))"
+    $key = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    return Save-ReviewerFactPlanFile -Plan $Plan -Directory $factPlanDir -BaseName $baseName -Key $key
+}
+
+function Read-ReviewerFactPlan {
+    param([Parameter(Mandatory)][string]$Path)
+    $key = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    return Read-ReviewerFactPlanFile -Path $Path -SchemaPath $ReviewFactSchemaPath -Key $key
 }
 
 function Format-ReviewerAuthoritativeSources {
@@ -5831,6 +6138,7 @@ function Invoke-ReviewerCycle {
             $digest = Build-ReviewerThreadDigest -Threads $threads -BotSubstrings $BotSubstrings -SystemSubstrings $SystemSubstrings
             $changedPaths = Get-ReviewerChangedPaths -Session $session -PrId $prId
             $conventionPlanPath = ""
+            $factPlanPath = ""
             if ($ConventionPackPolicy) {
                 try {
                     $conventionSessionResult = Invoke-ReviewerConventionSession -AgencyPath $AgencyPath -Action {
@@ -5871,6 +6179,70 @@ function Invoke-ReviewerCycle {
                             -ScriptSha256 $ScriptSelfSha256 -ConfigSha256 $ConfigSha256
                         $readyPlanPath = Save-ReviewerConventionPlan -Plan $conventionPlan `
                             -PrId $prId -SourceCommit $sourceCommit
+                        $factBinding = [pscustomobject][ordered]@{
+                            organization = $Organization
+                            project = $ExpectedProject
+                            repositoryId = $cfgRepoId.ToLowerInvariant()
+                            pullRequestId = $prId
+                            sourceCommit = $sourceCommit.ToLowerInvariant()
+                            targetCommit = $pinnedChanges.TargetCommit.ToLowerInvariant()
+                            changeSetDigest = $pinnedChanges.Digest.ToLowerInvariant()
+                        }
+                        $factHashes = [pscustomobject][ordered]@{
+                            configSha256 = $ConfigSha256.ToLowerInvariant()
+                            policySha256 = $ReviewFactPolicySha256
+                            scriptClosure = $ReviewFactScriptClosure
+                        }
+                        $factPlanPath = ""
+                        try {
+                            try {
+                                $factInputs = Get-ReviewerFactInputs -Session $conventionSession -PrId $prId `
+                                    -SourceCommit $sourceCommit -ChangeEntries @($pinnedChanges.Entries)
+                                $confirmedChanges = Get-ReviewerPinnedConventionChangeSet -Session $conventionSession `
+                                    -PrId $prId -ExpectedSourceCommit $sourceCommit
+                                if ($confirmedChanges.Digest -cne $pinnedChanges.Digest -or
+                                    $confirmedChanges.TargetCommit -cne $pinnedChanges.TargetCommit) {
+                                    throw "The immutable PR snapshot moved during fact extraction."
+                                }
+                                $factPlan = New-ReviewerFactPlan -Binding $factBinding -Hashes $factHashes `
+                                    -Inputs $factInputs -Policy $ReviewFactPolicy
+                                $factPlanPath = Save-ReviewerFactPlan -Plan $factPlan -PrId $prId -SourceCommit $sourceCommit
+                                Write-Host ("  PR {0} fact plan: {1}, {2} facts, {3} canonical bytes." -f `
+                                        $prId, $factPlan.status, $factPlan.factCount, $factPlan.canonicalBytes) -ForegroundColor Cyan
+                                Write-ReviewerCycleMetadata -Fields @{
+                                    cycle = $CycleNumber; mode = "fact-plan"; result = $factPlan.status; prId = $prId
+                                    sourceCommit = $sourceCommit; changeSetDigest = $pinnedChanges.Digest
+                                    factCount = $factPlan.factCount; planPath = $factPlanPath
+                                }
+                            }
+                            catch {
+                                $factFailureMessage = $_.Exception.Message
+                                $factFailureCode = if ($factFailureMessage -match 'snapshot moved|PR [0-9]+ moved|target branch moved|change set changed') {
+                                    "snapshotMoved"
+                                }
+                                elseif ($factFailureMessage -match 'above the versioned|exceeded') { "capExceeded" }
+                                elseif ($factFailureMessage -match 'invalid Unicode|malformed') { "malformed" }
+                                else { "transportFailed" }
+                                $factFailureInputs = [ordered]@{}
+                                foreach ($domainName in $script:ReviewerFactDomains) {
+                                    $factFailureInputs[$domainName] = @{
+                                        Status = "failed"; ErrorCode = $factFailureCode; Error = $factFailureMessage
+                                    }
+                                }
+                                $failedFactPlan = New-ReviewerFactPlan -Binding $factBinding -Hashes $factHashes `
+                                    -Inputs $factFailureInputs -Policy $ReviewFactPolicy
+                                $factPlanPath = Save-ReviewerFactPlan -Plan $failedFactPlan -PrId $prId -SourceCommit $sourceCommit
+                                Write-Warning "PR $prId fact plan failed closed without changing current model input: $factFailureMessage"
+                                Write-ReviewerCycleMetadata -Fields @{
+                                    cycle = $CycleNumber; mode = "fact-plan"; result = "failed"; prId = $prId
+                                    sourceCommit = $sourceCommit; reason = $factFailureMessage; planPath = $factPlanPath
+                                }
+                            }
+                        }
+                        catch {
+                            $factPlanPath = ""
+                            Write-Warning "PR $prId fact artifact could not be persisted; the existing review continues unchanged: $($_.Exception.Message)"
+                        }
                         Write-Host ("  PR {0} convention plan: {1} selected, {2} withheld, {3}/{4} bytes." -f `
                                 $prId, @($conventionPlan.selectedPacks).Count, @($conventionPlan.withheldPacks).Count,
                                 $conventionPlan.totalContextBytes, $conventionPlan.maxTotalBytes) -ForegroundColor Cyan
@@ -5880,9 +6252,10 @@ function Invoke-ReviewerCycle {
                             selectedPackCount = @($conventionPlan.selectedPacks).Count
                             totalContextBytes = $conventionPlan.totalContextBytes; planPath = $readyPlanPath
                         }
-                        return @{ PlanPath = $readyPlanPath }
+                        return @{ PlanPath = $readyPlanPath; FactPlanPath = $factPlanPath }
                     }
                     $conventionPlanPath = [string]$conventionSessionResult.PlanPath
+                    $factPlanPath = [string]$conventionSessionResult.FactPlanPath
                 }
                 catch {
                     $conventionEnvironmentFault = Test-ReviewerConventionEnvironmentException -Exception $_.Exception
@@ -5929,6 +6302,7 @@ function Invoke-ReviewerCycle {
                     DigestText           = $digest.Text
                     ChangedPaths         = $changedPaths
                     ConventionPlanPath   = $conventionPlanPath
+                    FactPlanPath         = $factPlanPath
                     ExistingFingerprints = (Get-ReviewerExistingFingerprints -Threads $threads)
                 })
         }

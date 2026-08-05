@@ -15,7 +15,7 @@ $script:ReviewerConventionMaxRepositorySourcesPerPack = 16
 $script:ReviewerConventionMaxPackBytes = 131072
 $script:ReviewerConventionMaxTotalBytes = 131072
 $script:ReviewerConventionMaxPathLength = 1024
-$script:ReviewerConventionUtf8 = New-Object System.Text.UTF8Encoding($false)
+$script:ReviewerConventionUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
 
 function Get-ReviewerConventionValue {
     param($Object, [Parameter(Mandatory)][string]$Name, $Default = $null)
