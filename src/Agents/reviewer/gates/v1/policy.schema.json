@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:devpilot:reviewer:gate-policy:v1",
+  "title": "DevPilot reviewer delivery-gate policy v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "policyVersion",
+    "mode",
+    "maxCommentsPerRun",
+    "maxSuggestionsPerRun",
+    "maxDecisionAgeSeconds",
+    "maxQualificationAgeDays",
+    "minPrecisionLowerBound95",
+    "minRecallLowerBound95",
+    "minCommentSampleCount",
+    "minApprovalSampleCount",
+    "maxApprovalFalsePositives",
+    "requirePriorRunEligibility",
+    "requireCanaryConfirmation",
+    "severities",
+    "packs",
+    "approval"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "policyVersion": { "type": "integer", "minimum": 1 },
+    "mode": {
+      "enum": [
+        "off",
+        "shadow",
+        "preview",
+        "humanPromote",
+        "unattendedComment",
+        "unattendedCommentAndSuggestion",
+        "approvalVote"
+      ]
+    },
+    "maxCommentsPerRun": { "type": "integer", "minimum": 0 },
+    "maxSuggestionsPerRun": { "type": "integer", "minimum": 0 },
+    "maxDecisionAgeSeconds": { "type": "integer", "minimum": 1 },
+    "maxQualificationAgeDays": { "type": "integer", "minimum": 1 },
+    "minPrecisionLowerBound95": { "type": "number", "minimum": 0, "maximum": 1 },
+    "minRecallLowerBound95": { "type": "number", "minimum": 0, "maximum": 1 },
+    "minCommentSampleCount": { "type": "integer", "minimum": 0 },
+    "minApprovalSampleCount": { "type": "integer", "minimum": 0 },
+    "maxApprovalFalsePositives": { "type": "integer", "minimum": 0 },
+    "requirePriorRunEligibility": { "type": "boolean" },
+    "requireCanaryConfirmation": { "type": "boolean" },
+    "severities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["critical", "important", "suggestion"],
+      "properties": {
+        "critical": { "$ref": "#/$defs/severityGate" },
+        "important": { "$ref": "#/$defs/severityGate" },
+        "suggestion": { "$ref": "#/$defs/severityGate" }
+      }
+    },
+    "packs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "unattendedComment", "humanPromotedComment"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "unattendedComment": { "type": "boolean" },
+          "humanPromotedComment": { "type": "boolean" }
+        }
+      }
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "requireChecks",
+        "requiredCheckNames",
+        "requireDismissStaleReviews",
+        "allowOperatorAttestedDismissal"
+      ],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "requireChecks": { "type": "boolean" },
+        "requiredCheckNames": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "requireDismissStaleReviews": { "type": "boolean" },
+        "allowOperatorAttestedDismissal": { "type": "boolean" }
+      }
+    }
+  },
+  "$defs": {
+    "severityGate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unattendedComment", "humanPromotedComment"],
+      "properties": {
+        "unattendedComment": { "type": "boolean" },
+        "humanPromotedComment": { "type": "boolean" }
+      }
+    }
+  }
+}

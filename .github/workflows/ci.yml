@@ -140,3 +140,11 @@ jobs:
       - name: cross-verification isolation, replay, and schema checks
         shell: pwsh
         run: ./tools/Test-CrossVerification.ps1
+
+      # Layer 6: fail-closed comment/approval-vote eligibility gates over the
+      # sealed cross-verification preview. Offline: no network, no ADO/GitHub,
+      # no Copilot process, no model - every gate decision is a pure function
+      # of sealed inputs.
+      - name: delivery-gate policy, qualification, and decision checks
+        shell: pwsh
+        run: ./tools/Test-DeliveryGates.ps1

@@ -270,6 +270,30 @@ deduplicate, or withhold; disagreement never becomes a vote. Input and decision
 artifacts use separate HMAC domains and cannot be promoted as delivery manifests.
 See [Cross-verification previews](docs/cross-verification.md).
 
+#### Optional delivery gates (layer 6)
+
+Layer 6 is a separate, fail-closed comment and approval-vote eligibility layer
+over the sealed cross-verification preview above. It is off by default, and
+nothing about it is reachable from repository config or PR content: enabling
+any unattended capability requires an out-of-repo policy file, a matching CLI
+switch, and a verified qualification artifact to agree, every run.
+
+```powershell
+./src/Agents/reviewer/Start-ReviewerAgent.ps1 -Once `
+    -ConfigFile <your-repo>/.github/copilot/agents/reviewer.config.json `
+    -OperatorAlias <your-alias> -PullRequestId 12345 `
+    -Model claude-opus-5 -SecondPassModel gpt-5.6-sol `
+    -EnableConventionSpecialist -ConventionSpecialistModel claude-sonnet-5 `
+    -EnableVerificationPreview -ConventionVerifierModel gpt-5.6-sol `
+    -GatePolicyFile C:\secure\gate-policy.json -GateQualificationFile C:\secure\qual.json `
+    -EnableVerifiedCommentGate
+```
+
+A human can also promote exactly the sealed, human-promotable subset of a
+gate decision - never more, never reworded, never at a raised severity - with
+`-PromoteVerifiedPreview <path>`; it never casts a vote. See
+[Delivery gates](docs/delivery-gates.md).
+
 #### Authoritative repository-source transport
 
 `repoConventions.authoritativeSources` is an optional, versioned transport for
@@ -541,6 +565,16 @@ See [`docs/adding-an-agent.md`](docs/adding-an-agent.md).
 - **Artifact sealing does not survive a compromised account.** The signing key
   is DPAPI-protected to your user; an attacker who can run code as you can sign
   anything — but could equally well post comments directly.
+- **The delivery-gate approval vote (layer 6) is unconditionally closed today.**
+  Its GitHub-only capability reads (required checks, review-dismissal-on-push)
+  are implemented and tested, including against a live read-only PR, but this
+  script still restricts `config.provider` to `AzureDevOps`, which the gate
+  always reports as lacking every capability it needs. Comment/suggestion
+  gating has no such restriction. See [docs/delivery-gates.md](docs/delivery-gates.md).
+- **A gate qualification's signature proves it was not edited after signing,
+  not that its corpus numbers are honest.** Who may run
+  `tools/New-ReviewerGateQualification.ps1` and publish its output is an
+  organizational boundary, not a cryptographic one.
 
 ---
 

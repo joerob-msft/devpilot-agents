@@ -787,7 +787,7 @@ Assert-Specialist ([regex]::Matches(
         $pullRequestFunction, '\$specialistResult\s*=\s*Invoke-ReviewerConventionSpecialistSafely').Count -eq 3) `
     "One or more specialist safe-wrapper calls can leak output into the generalist return stream."
 $verificationCalls = [regex]::Matches(
-    $pullRequestFunction, '\[void\]\(Invoke-ReviewerCrossVerificationSafely').Count
+    $pullRequestFunction, '\$verificationResult\s*=\s*Invoke-ReviewerCrossVerificationSafely').Count
 Assert-Specialist ($verificationCalls -eq 3 -and
     $pullRequestFunction.LastIndexOf("Invoke-ReviewerCrossVerificationSafely", [StringComparison]::Ordinal) -gt $specialistAt) `
     "Verification preview is not isolated after each specialist result."

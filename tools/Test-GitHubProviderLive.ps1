@@ -80,6 +80,22 @@ Assert-True ($run.isSuccess -eq ($run.state -eq 'Succeeded')) "isSuccess agrees 
 Assert-True (-not $run.isSuccess -or $run.isComplete) "a successful run is necessarily complete"
 Write-Host "    checks: $(@($run.runs).Count) -> $($run.state)"
 
+Write-Host "`n[6] Review-dismissal policy for the target branch (read-only)" -ForegroundColor Cyan
+$targetBranch = ($snapshot.targetRefName -replace '^refs/heads/', '')
+$dismissal = Get-AgentProviderReviewDismissalPolicy -Context $context -TargetBranch $targetBranch
+Assert-True ($dismissal.known -is [bool]) "known is a real boolean"
+Assert-True (@('branchProtection', 'none', 'unknown') -contains $dismissal.source) "source is in the documented vocabulary ($($dismissal.source))"
+Assert-True (-not $dismissal.known -or $dismissal.source -ne 'unknown') "a KNOWN answer never carries the 'unknown' source"
+Assert-True ($dismissal.known -or $dismissal.dismissesStaleReviews -eq $false) "an unknown answer never reports dismissesStaleReviews=true"
+Write-Host "    known=$($dismissal.known) dismissesStaleReviews=$($dismissal.dismissesStaleReviews) source=$($dismissal.source)"
+Write-Host "    reason: $($dismissal.reason)"
+
+Write-Host "`n[7] Required-checks snapshot for the head commit (read-only)" -ForegroundColor Cyan
+$checksSnapshot = Get-AgentProviderRequiredChecksSnapshot -Context $context -HeadSha $snapshot.sourceCommitId -RequiredNames @()
+Assert-True ($checksSnapshot.known -eq ($run.found)) "known agrees with the underlying validation run's 'found'"
+Assert-True ($checksSnapshot.sha256 -match '^[0-9a-f]{64}$') "the checks snapshot binds a sha256"
+Write-Host "    known=$($checksSnapshot.known) allComplete=$($checksSnapshot.allComplete) allSuccess=$($checksSnapshot.allSuccess) sha256=$($checksSnapshot.sha256.Substring(0,12))..."
+
 Write-Host ""
 if ($failures.Count -gt 0) {
     Write-Host "FAILED - $($failures.Count) live assertion(s):" -ForegroundColor Red

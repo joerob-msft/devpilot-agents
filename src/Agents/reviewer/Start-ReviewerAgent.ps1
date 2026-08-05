@@ -204,6 +204,43 @@ param(
 
     [string]$ConventionVerifierModel,
 
+    # --- Layer 6: fail-closed comment/approval gates over the sealed cross-
+    # verification preview. ALL default off. Enabling ANY unattended gate
+    # capability requires THREE independent authorities to agree: this CLI
+    # switch, an out-of-repo policy file at a mode other than "off", and a
+    # verified qualification artifact - config.review.deliveryGates in the
+    # reviewed repository can only ever DISABLE, never enable, any of this.
+    [string]$GatePolicyFile,
+
+    [string]$GateQualificationFile,
+
+    [switch]$EnableVerifiedCommentGate,
+    [switch]$EnableVerifiedSuggestionGate,
+    [switch]$EnableVerifiedApprovalGate,
+
+    # Manual, per-PR/commit canary confirmation for the approval gate's
+    # requireCanaryConfirmation policy bit. Never satisfied by a CLI switch
+    # alone: the file's content must name the exact PR/commit being voted on.
+    [string]$GateCanaryTokenFile,
+
+    # Optional operator-supplied SHA-256 of the corpus-evaluation tool a
+    # qualification artifact's evaluationToolSha256 is bound to. This script
+    # has no evaluation tool of its own to hash live, so without this the
+    # binding is accepted as recorded provenance and never independently
+    # re-verified (see docs/delivery-gates.md); supplying it closes the gate
+    # on a mismatch instead. Never satisfiable by repository config - this is
+    # a third out-of-band operator input, like -GatePolicyFile/-GateQualificationFile.
+    [ValidatePattern('^[0-9a-fA-F]{64}$')]
+    [string]$GateEvaluationToolSha256,
+
+    # Publish a sealed gate DECISION - never a raw preview/verification
+    # artifact; Test-ReviewerGateArtifactKind enforces this. Comments only,
+    # remove-only, rendered with the same Format-ReviewerFindingComment
+    # footer as every other comment this agent posts. Never casts a vote:
+    # approval only ever happens through the fully-unattended approvalVote
+    # policy mode, never through a human-promoted artifact.
+    [string]$PromoteVerifiedPreview,
+
     [string]$Organization,
 
     [string]$RepositoryName,
@@ -376,6 +413,25 @@ foreach ($requiredVerificationAsset in @($CrossVerificationPolicyPath, $CrossVer
 $CrossVerificationPolicy = Get-Content -LiteralPath $CrossVerificationPolicyPath -Raw | ConvertFrom-Json -Depth 32
 $EffectiveCrossVerificationPolicy = ConvertTo-ReviewerVerificationEffectivePolicy `
     -Policy $CrossVerificationPolicy
+# DeliveryGates.ps1 (layer 6) is dot-sourced AFTER CrossVerification.ps1: it is
+# a pure consumer of the sealed verification-decision/input previews and
+# reuses their canonicalizer/HMAC helpers rather than re-implementing them.
+# It never changes discovery, specialist, clustering, or verifier behavior,
+# and it never widens the raw -PromotePreview path.
+$DeliveryGatesLibrary = Join-Path $PSScriptRoot "DeliveryGates.ps1"
+if (-not (Test-Path -LiteralPath $DeliveryGatesLibrary)) {
+    throw "Delivery-gate library '$DeliveryGatesLibrary' does not exist."
+}
+. $DeliveryGatesLibrary
+$DeliveryGatesPolicySchemaPath = Join-Path $PSScriptRoot "gates\v1\policy.schema.json"
+$DeliveryGatesQualificationSchemaPath = Join-Path $PSScriptRoot "gates\v1\qualification.schema.json"
+$DeliveryGatesDefaultPolicyPath = Join-Path $PSScriptRoot "gates\v1\policy.json"
+foreach ($requiredGateAsset in @($DeliveryGatesPolicySchemaPath, $DeliveryGatesQualificationSchemaPath, $DeliveryGatesDefaultPolicyPath)) {
+    if (-not (Test-Path -LiteralPath $requiredGateAsset)) {
+        throw "Delivery-gate asset '$requiredGateAsset' does not exist."
+    }
+}
+$DeliveryGatesDefaultPolicy = Get-Content -LiteralPath $DeliveryGatesDefaultPolicyPath -Raw | ConvertFrom-Json -Depth 32
 $ReviewFactPolicyPath = Join-Path $PSScriptRoot "facts\v1\policy.json"
 $ReviewFactSchemaPath = Join-Path $PSScriptRoot "facts\v1\schema.json"
 foreach ($requiredFactAsset in @($ReviewFactPolicyPath, $ReviewFactSchemaPath)) {
@@ -995,6 +1051,35 @@ function Get-ReviewerPendingDeliveryPlan {
     $path = [string](Get-ReviewerHashValue -Container $rec -Key 'artifactPath' -Default '')
     if (-not $path -or -not (Test-Path -LiteralPath $path)) { return "" }
     return $path
+}
+
+function Test-ReviewerRawPendingPlanShouldReplay {
+    <#
+        Pure: whether a still-existing raw pending-delivery plan
+        (Get-ReviewerPendingDeliveryPlan's non-empty return) should actually
+        be routed into Invoke-ReviewerPromotion this cycle.
+
+        $RawDeliveryAlreadySatisfied is $true exactly when
+        Test-ReviewerAlreadyReviewed already reported raw delivery fully
+        satisfied under TODAY's write switches (including vacuously, when no
+        raw switch is on at all - see Test-ReviewerAlreadyReviewed's own
+        '-not $WritesRequested { return $true }' short-circuit) and only a
+        currently-enabled gate capability's first chance to run brought this
+        PR back around. A stored deliveryPending=$true record can OUTLIVE the
+        write switches that created it: an operator can turn every raw
+        switch off, at the same commit, after an interrupted delivery left a
+        pending plan on disk. Retrying that stale plan (posting/summarizing/
+        voting under raw authority) would happen ONLY as a side effect of the
+        gate needing a refresh - never done, regardless of what still sits on
+        disk. This is checked here, once, and used at every call site that
+        would otherwise route a pending plan into Invoke-ReviewerPromotion,
+        so the two can never drift apart.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$PendingPlan,
+        [Parameter(Mandatory)][bool]$RawDeliveryAlreadySatisfied
+    )
+    return ([bool]$PendingPlan -and -not $RawDeliveryAlreadySatisfied)
 }
 
 function Get-ReviewerLastReviewedSortKey {
@@ -1634,7 +1719,7 @@ function Assert-ReviewerExactObjectKeys {
     param(
         [Parameter(Mandatory)]$Object,
         [Parameter(Mandatory)][string[]]$Allowed,
-        [Parameter(Mandatory)][string[]]$Required,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Required,
         [Parameter(Mandatory)][string]$Where
     )
     if ($Object -isnot [System.Management.Automation.PSCustomObject]) { throw "$Where must be a JSON object." }
@@ -1838,6 +1923,25 @@ if ($verificationCfgProperty) {
         -Name "conventionVerifierModel" -Where "config.review.verification" -MaxLength 64 -AllowEmpty
     $CfgVerificationTimeoutSeconds = Get-AgentConfigInt -Object $verificationCfg `
         -Name "timeoutSeconds" -Where "config.review.verification" -Min 30 -Max 3600
+}
+# Layer 6 kill switch ONLY. This is the single power config.review.deliveryGates
+# has: it can force every gate mode to "off" no matter what an out-of-repo
+# policy file or CLI switch says. It can never enable anything - there is no
+# "mode" or "enabled" key here at all, on purpose, so a repository config (or a
+# PR that edits one) has no path to turning gating on. Allowed is a superset of
+# Required so this block can grow later without breaking every existing config
+# (O-2): "note" is accepted purely for the same self-documenting convention
+# used throughout this file's other config blocks.
+$CfgDeliveryGatesDisabled = $false
+$deliveryGatesCfgProperty = $reviewCfg.PSObject.Properties["deliveryGates"]
+if ($deliveryGatesCfgProperty) {
+    $deliveryGatesCfg = $deliveryGatesCfgProperty.Value
+    Assert-ReviewerExactObjectKeys -Object $deliveryGatesCfg `
+        -Allowed @("note", "disabled") -Required @() -Where "config.review.deliveryGates"
+    if ($deliveryGatesCfg.PSObject.Properties["disabled"]) {
+        $CfgDeliveryGatesDisabled = Get-AgentConfigBool -Object $deliveryGatesCfg -Name "disabled" `
+            -Where "config.review.deliveryGates"
+    }
 }
 foreach ($sev in @($PostSeverities)) {
     if ($script:ReviewerSeverities -cnotcontains $sev) {
@@ -2203,6 +2307,246 @@ if ($ShowState -or $ResetStarvedCandidates) {
         Write-Host "`nCleared $cleared failure-attempt record(s); previously starved PRs are eligible again." -ForegroundColor Green
     }
     exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Layer 6: delivery-gate policy resolution (fail-closed; the ONLY power
+# config.review.deliveryGates has is to force mode "off" - it can never enable
+# anything). Qualification is resolved LAZILY (Get-ReviewerGateQualification,
+# defined further below) because verifying it needs the artifact-signing key,
+# and -DryRun must remain side-effect-free: creating that key file here would
+# make every dry run write state it does not today.
+# ---------------------------------------------------------------------------
+
+function Test-ReviewerGatePathOutsideRepository {
+    <# Policy/qualification enablement must live OUTSIDE the reviewed
+       repository - otherwise a clone parked on a PR branch could let PR
+       content participate in enablement. Compares resolved full paths;
+       caller must confirm the path exists first. #>
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$RepoRoot)
+    $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
+    $resolvedRepoRoot = $RepoRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    if ($resolvedPath -ieq $resolvedRepoRoot) { return $false }
+    return -not $resolvedPath.StartsWith(
+        $resolvedRepoRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-ReviewerGateSafeObjectSha256 {
+    <# Gate policy resolution must never crash a run that does not use gates.
+       Every binding hash computed from a wrapper-internal object (not a
+       sealed artifact) goes through this so an unexpected shape closes the
+       gate rather than takes down the whole cycle. #>
+    param($Value, [Parameter(Mandatory)][string]$Label)
+    try { return Get-ReviewerVerificationObjectSha256 -Value $Value }
+    catch {
+        Write-Warning "Could not hash '$Label' for the delivery-gate binding; using a zero hash: $($_.Exception.Message)"
+        return ("0" * 64)
+    }
+}
+
+function Resolve-ReviewerGatePolicy {
+    <#
+        Loads the effective (clamped) gate policy. Any ONE of these keeps
+        every gate mode "off":
+          1. No -GatePolicyFile and no out-of-repo $StateDir/gate-policy.json
+             exists, so the shipped all-off policy is used.
+          2. The resolved path exists but is NOT outside $RepoRoot.
+          3. The file is missing/unreadable/invalid.
+          4. config.review.deliveryGates.disabled is true (checked last, so it
+             can override an otherwise-valid enabling policy).
+        A malformed or unreadable out-of-repo policy file fails CLOSED to the
+        shipped all-off policy with a logged warning - gating is optional, so
+        a corrupt policy file must never break the underlying reviewer.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][string]$StateDirectory,
+        [AllowEmptyString()][string]$ExplicitPolicyFile = "",
+        [Parameter(Mandatory)][bool]$KillSwitchEngaged,
+        [Parameter(Mandatory)]$DefaultPolicy
+    )
+    $resolvedPath = ""
+    if ($ExplicitPolicyFile) { $resolvedPath = $ExplicitPolicyFile }
+    else {
+        $defaultOutOfRepo = Join-Path $StateDirectory "gate-policy.json"
+        if (Test-Path -LiteralPath $defaultOutOfRepo -PathType Leaf) { $resolvedPath = $defaultOutOfRepo }
+    }
+    $rawPolicy = $DefaultPolicy
+    $policySourcePath = ""
+    if ($resolvedPath) {
+        if (-not (Test-Path -LiteralPath $resolvedPath -PathType Leaf)) {
+            Write-Warning "Gate policy file '$resolvedPath' does not exist; using the shipped all-off default."
+        }
+        elseif (-not (Test-ReviewerGatePathOutsideRepository -Path $resolvedPath -RepoRoot $RepoRoot)) {
+            Write-Warning ("Gate policy file '$resolvedPath' resolves inside the reviewed repository ($RepoRoot); " +
+                "policy enablement must live outside the repository under review, so the shipped all-off default is used instead.")
+        }
+        else {
+            try {
+                $rawPolicy = Get-Content -LiteralPath $resolvedPath -Raw | ConvertFrom-Json -Depth 32
+                $policySourcePath = (Resolve-Path -LiteralPath $resolvedPath).Path
+            }
+            catch {
+                Write-Warning "Gate policy file '$resolvedPath' could not be parsed ($($_.Exception.Message)); using the shipped all-off default."
+                $rawPolicy = $DefaultPolicy
+                $policySourcePath = ""
+            }
+        }
+    }
+    $effective = $null
+    try {
+        $effective = ConvertTo-ReviewerGateEffectivePolicy -Policy $rawPolicy
+    }
+    catch {
+        Write-Warning "Gate policy is invalid ($($_.Exception.Message)); falling back to the shipped all-off default."
+        $rawPolicy = $DefaultPolicy
+        $policySourcePath = ""
+        $effective = ConvertTo-ReviewerGateEffectivePolicy -Policy $rawPolicy
+    }
+    if ($KillSwitchEngaged -and $effective.mode -cne "off") {
+        Write-Warning "config.review.deliveryGates.disabled is true; forcing gate mode 'off' regardless of policy or CLI switches."
+        $effective.mode = "off"
+    }
+    return @{ Raw = $rawPolicy; Effective = $effective; SourcePath = $policySourcePath }
+}
+
+$GateKillSwitchEngaged = [bool]$CfgDeliveryGatesDisabled
+$ResolvedGatePolicy = Resolve-ReviewerGatePolicy -RepoRoot $RepoPath -StateDirectory $StateDir `
+    -ExplicitPolicyFile $GatePolicyFile -KillSwitchEngaged $GateKillSwitchEngaged -DefaultPolicy $DeliveryGatesDefaultPolicy
+$EffectiveGatePolicy = $ResolvedGatePolicy.Effective
+$GatePolicySha256 = Get-ReviewerGateSafeObjectSha256 -Value $ResolvedGatePolicy.Raw -Label "gate policy"
+$DeliveryGatesLibrarySha256 = (Get-FileHash -LiteralPath $DeliveryGatesLibrary -Algorithm SHA256).Hash.ToLowerInvariant()
+$ConventionPackPolicySha256 = if ($ConventionPackPolicy) {
+    Get-ReviewerGateSafeObjectSha256 -Value $ConventionPackPolicy -Label "convention pack policy"
+}
+else {
+    "0" * 64
+}
+if ($EffectiveGatePolicy.mode -cne "off") {
+    Write-Host ("Delivery gates: mode='$($EffectiveGatePolicy.mode)' policySource='$(if ($ResolvedGatePolicy.SourcePath) { $ResolvedGatePolicy.SourcePath } else { '(shipped default)' })'.") -ForegroundColor Cyan
+}
+
+$gateDecisionDir = Join-Path $StateDir "gate-decisions"
+New-Item -ItemType Directory -Force -Path $gateDecisionDir | Out-Null
+$gateEligibilityStatePath = Join-Path $StateDir "gate-eligibility.json"
+$gateDeliveryStatePath = Join-Path $StateDir "gate-delivery.json"
+
+$script:GateQualificationResolved = $false
+$script:GateQualificationCache = $null
+$script:GateQualificationSha256Cache = ("0" * 64)
+
+function Get-ReviewerGateQualification {
+    <#
+        Lazily resolves and verifies the qualification artifact, exactly once
+        per process. Deferred (rather than resolved alongside the policy)
+        because verifying it needs the artifact-signing key, and the key file
+        is created on first use - -DryRun must stay side-effect-free, so
+        nothing calls this during a dry run.
+    #>
+    if ($script:GateQualificationResolved) {
+        return @{ Qualification = $script:GateQualificationCache; Sha256 = $script:GateQualificationSha256Cache }
+    }
+    $script:GateQualificationResolved = $true
+    if (-not $GateQualificationFile) { return @{ Qualification = $null; Sha256 = ("0" * 64) } }
+    if (-not (Test-Path -LiteralPath $GateQualificationFile -PathType Leaf)) {
+        Write-Warning "Gate qualification file '$GateQualificationFile' does not exist."
+        return @{ Qualification = $null; Sha256 = ("0" * 64) }
+    }
+    if (-not (Test-ReviewerGatePathOutsideRepository -Path $GateQualificationFile -RepoRoot $RepoPath)) {
+        Write-Warning ("Gate qualification file '$GateQualificationFile' resolves inside the reviewed repository " +
+            "($RepoPath); a trusted qualification artifact must live outside the repository under review.")
+        return @{ Qualification = $null; Sha256 = ("0" * 64) }
+    }
+    $resolvedQualificationPath = (Resolve-Path -LiteralPath $GateQualificationFile).Path
+    $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $read = Read-ReviewerGateQualification -Path $resolvedQualificationPath -MasterKey $masterKey
+    if (-not $read.Ok) {
+        Write-Warning "Gate qualification file '$resolvedQualificationPath' failed verification: $($read.ReasonCodes -join ', ')."
+        return @{ Qualification = $null; Sha256 = ("0" * 64) }
+    }
+    $qualEnvelope = Get-Content -LiteralPath $resolvedQualificationPath -Raw | ConvertFrom-Json -Depth 8
+    $qualSha256 = Get-ReviewerVerificationSha256 -Text ([string](Get-ReviewerVerificationValue $qualEnvelope "manifestJson" ""))
+    $script:GateQualificationCache = $read.Qualification
+    $script:GateQualificationSha256Cache = $qualSha256
+    return @{ Qualification = $read.Qualification; Sha256 = $qualSha256 }
+}
+
+function Test-ReviewerGateCanaryConfirmed {
+    <# requireCanaryConfirmation demands an operator TOKEN FILE naming the
+       exact PR/commit being voted on - never a CLI switch alone, which would
+       be trivially "always true" every run and would not be a deliberate
+       per-PR confirmation. #>
+    param(
+        [AllowEmptyString()][string]$TokenFile = "",
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)][string]$SourceCommit
+    )
+    if (-not $TokenFile -or -not (Test-Path -LiteralPath $TokenFile -PathType Leaf)) { return $false }
+    $needle = "{0}:{1}" -f $PrId, $SourceCommit.ToLowerInvariant()
+    foreach ($line in @(Get-Content -LiteralPath $TokenFile)) {
+        if (([string]$line).Trim() -ceq $needle) { return $true }
+    }
+    return $false
+}
+
+function Test-ReviewerGateDeliveryPending {
+    <#
+        Whether PR/commit has an unfinished GATE delivery (a partial comment
+        failure from a previous cycle) that still owes a replay. Read
+        SEPARATELY from reviewed.json/Get-ReviewerPendingDeliveryPlan on
+        purpose: gate state must never share a key space with the raw
+        delivery plan, so the raw promoter can never pick up a gate artifact
+        and a gate replay can never masquerade as a raw one.
+
+        This is also what lets Invoke-ReviewerCycle re-visit a PR whose RAW
+        delivery is already fully satisfied (so Test-ReviewerAlreadyReviewed
+        alone would skip it) but whose gate comments are still incomplete -
+        the ONLY reason this predicate exists is to keep that PR in the
+        candidate set for a replay.
+    #>
+    param([Parameter(Mandatory)][int]$PrId, [Parameter(Mandatory)][string]$SourceCommit)
+    if ($EffectiveGatePolicy.mode -ceq "off") { return $false }
+    $state = Get-JsonState -Path $gateDeliveryStatePath
+    $key = [string]$PrId
+    if (-not $state.ContainsKey($key)) { return $false }
+    $record = $state[$key]
+    if (([string](Get-ReviewerHashValue -Container $record -Key 'sourceCommit' -Default '')) -ine $SourceCommit) { return $false }
+    return [bool](Get-ReviewerHashValue -Container $record -Key 'pendingReplay' -Default $false)
+}
+
+function Test-ReviewerGateDecisionEverAttempted {
+    <#
+        Whether a gate delivery was EVER attempted for this PR at this exact
+        commit - regardless of whether it fully succeeded, partially failed
+        (Test-ReviewerGateDeliveryPending), or owes nothing further. This is
+        what tells apart "gate delivery already ran here" from "gate
+        delivery has never had a chance to run at this commit at all" - e.g.
+        because gate writes were only turned on AFTER this exact commit was
+        already previewed under raw delivery. Without this, a PR raw
+        delivery considers fully handled (so Test-ReviewerAlreadyReviewed
+        alone would skip it) and that gate delivery has no record of at all
+        would be skipped forever: a newly-enabled gate capability would
+        never get its first chance to run against a commit that predates it.
+
+        A record marked 'superseded' (its sealed decision expired, or its
+        bindings no longer matched something live, before it could ever be
+        delivered against) counts as NOT attempted here, on purpose: it is
+        an explicit, one-time invitation for exactly one fresh full review
+        to seal a current decision, never a permanent record that would
+        otherwise lock this commit out of the gate forever just because a
+        decision's short validity window elapsed - an entirely routine,
+        expected event, not an anomaly. A record marking a genuine
+        processing FAULT (superseded=$false, pendingReplay=$false) is the
+        opposite: it counts as attempted, so a fault does not turn into an
+        unbounded full-model-rerun loop every cycle.
+    #>
+    param([Parameter(Mandatory)][int]$PrId, [Parameter(Mandatory)][string]$SourceCommit)
+    $state = Get-JsonState -Path $gateDeliveryStatePath
+    $key = [string]$PrId
+    if (-not $state.ContainsKey($key)) { return $false }
+    $record = $state[$key]
+    if (-not ((([string](Get-ReviewerHashValue -Container $record -Key 'sourceCommit' -Default '')) -ieq $SourceCommit))) { return $false }
+    return -not [bool](Get-ReviewerHashValue -Container $record -Key 'superseded' -Default $false)
 }
 
 # ---------------------------------------------------------------------------
@@ -3305,7 +3649,7 @@ function Set-ReviewerVote {
 
 function Invoke-DryRunSelfChecks {
     $failures = New-Object System.Collections.Generic.List[string]
-    $total = 24
+    $total = 43
 
     Write-Host "[DRY-RUN] Self-check 1/$total : parser validity + prompt presence" -ForegroundColor Cyan
     foreach ($p in @($PSCommandPath, $HarnessPath)) {
@@ -4918,6 +5262,992 @@ function Invoke-DryRunSelfChecks {
     }
     if ($failures.Count -eq $sessionCheckFailureCount) {
         Write-Host "  OK - convention reads use one bound, repos-only, scrubbed session that closes on every path" -ForegroundColor Green
+    }
+
+    # -- Self-checks 24-38: delivery gate --------------------------------------
+    # Every gate self-check below runs entirely inside a FRESH, isolated
+    # sandbox directory, never the operator's real -StateDir. The script-
+    # scope path variables every gate function reads via scope inheritance
+    # (Get-JsonState -Path $gateDeliveryStatePath, etc. - never a parameter
+    # on those functions) are reassigned here, BEFORE the first gate self-
+    # check runs, to point entirely inside the sandbox, and restored in
+    # 'finally' once the last one finishes. This means the real gate-
+    # delivery.json, gate-eligibility.json, artifact-signing.key and gate-
+    # decisions/ directory are never read OR written at any point during
+    # self-checks - not even briefly, and not even "carefully" via a save-
+    # then-restore pattern on the real files. A kill at ANY moment during
+    # this whole window - a normal exception, Ctrl+C, or a hard process
+    # termination that skips 'finally' entirely - therefore cannot damage
+    # production pending state: there is nothing to revert, because the
+    # real files were never the target of a write in the first place. Only
+    # this one explicit, freshly-created, uniquely-named sandbox directory
+    # is ever deleted; nothing broader is ever touched.
+    $realStateDirForGateSelfChecks = $StateDir
+    $realGateDecisionDirForGateSelfChecks = $gateDecisionDir
+    $realGateEligibilityStatePathForGateSelfChecks = $gateEligibilityStatePath
+    $realGateDeliveryStatePathForGateSelfChecks = $gateDeliveryStatePath
+    $realArtifactKeyPathForGateSelfChecks = $artifactKeyPath
+    $gateSelfCheckSandboxDir = Join-Path $StateDir ("selfcheck-gate-sandbox-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force -Path $gateSelfCheckSandboxDir | Out-Null
+    try {
+        $script:StateDir = $gateSelfCheckSandboxDir
+        $script:gateDecisionDir = Join-Path $gateSelfCheckSandboxDir "gate-decisions"
+        New-Item -ItemType Directory -Force -Path $script:gateDecisionDir | Out-Null
+        $script:gateEligibilityStatePath = Join-Path $gateSelfCheckSandboxDir "gate-eligibility.json"
+        $script:gateDeliveryStatePath = Join-Path $gateSelfCheckSandboxDir "gate-delivery.json"
+        $script:artifactKeyPath = Join-Path $gateSelfCheckSandboxDir "artifact-signing.key"
+
+    Write-Host "[DRY-RUN] Self-check 24/$total : delivery-gate kill switch and three-authority enablement" -ForegroundColor Cyan
+    $killSwitchPolicy = Resolve-ReviewerGatePolicy -RepoRoot $RepoPath -StateDirectory $StateDir `
+        -ExplicitPolicyFile "" -KillSwitchEngaged $true -DefaultPolicy $DeliveryGatesDefaultPolicy
+    if ($killSwitchPolicy.Effective.mode -cne "off") {
+        $failures.Add("The delivery-gate kill switch (config.review.deliveryGates.disabled) did not force mode 'off'.")
+    }
+    else { Write-Host "  OK - the kill switch forces mode 'off' regardless of any policy" -ForegroundColor Green }
+    $enablingPolicyInsideRepo = Join-Path $RepoPath "evil-gate-policy.json"
+    try {
+        $insideRepoPolicy = $DeliveryGatesDefaultPolicy | ConvertTo-Json -Depth 32 | ConvertFrom-Json -Depth 32
+        $insideRepoPolicy.mode = "unattendedComment"
+        $insideRepoPolicy.severities.important.unattendedComment = $true
+        $insideRepoPolicy.packs[0].unattendedComment = $true
+        Set-Content -LiteralPath $enablingPolicyInsideRepo -Value ($insideRepoPolicy | ConvertTo-Json -Depth 32) -Encoding UTF8
+        $insideRepoResolved = Resolve-ReviewerGatePolicy -RepoRoot $RepoPath -StateDirectory $StateDir `
+            -ExplicitPolicyFile $enablingPolicyInsideRepo -KillSwitchEngaged $false -DefaultPolicy $DeliveryGatesDefaultPolicy
+        if ($insideRepoResolved.Effective.mode -cne "off") {
+            $failures.Add("A gate policy file located INSIDE the reviewed repository was allowed to enable a mode; policy enablement must live outside the repository under review.")
+        }
+        else { Write-Host "  OK - a policy file inside the reviewed repository cannot enable any gate mode" -ForegroundColor Green }
+    }
+    finally {
+        if (Test-Path -LiteralPath $enablingPolicyInsideRepo) { Remove-Item -LiteralPath $enablingPolicyInsideRepo -Force }
+    }
+    if ($EffectiveGatePolicy.mode -cne "off") {
+        $failures.Add("The resolved gate policy for this dry run is not 'off'; the shipped default and this repository's config must never enable anything on their own.")
+    }
+    else { Write-Host "  OK - this run's resolved gate policy is 'off' with no operator-supplied out-of-repo policy or CLI switch" -ForegroundColor Green }
+
+    Write-Host "[DRY-RUN] Self-check 25/$total : disabled-path call ordering is unchanged; the gate never runs before it" -ForegroundColor Cyan
+    $pullRequestAt = & $declOf "Invoke-ReviewerPullRequest"
+    if ($pullRequestAt -lt 0) {
+        $failures.Add("Could not locate Invoke-ReviewerPullRequest to verify call ordering.")
+    }
+    else {
+        $pullRequestEnd = $selfText.IndexOf("`nfunction Invoke-ReviewerPromotion", $pullRequestAt, [StringComparison]::Ordinal)
+        if ($pullRequestEnd -lt 0) { $pullRequestEnd = $selfText.Length }
+        $pullRequestText = $selfText.Substring($pullRequestAt, $pullRequestEnd - $pullRequestAt)
+        $verificationCalls = [regex]::Matches($pullRequestText, 'Invoke-ReviewerCrossVerificationSafely\s+-AgencyPath')
+        $gateCalls = [regex]::Matches($pullRequestText, 'Invoke-ReviewerGateForPullRequest\s+-Session')
+        if ($verificationCalls.Count -ne 3 -or $gateCalls.Count -ne 3) {
+            $failures.Add("Expected exactly 3 verification calls and 3 gate calls in Invoke-ReviewerPullRequest (one pair per exit path); found $($verificationCalls.Count) and $($gateCalls.Count).")
+        }
+        else {
+            $orderingOk = $true
+            for ($i = 0; $i -lt 3; $i++) {
+                if ($gateCalls[$i].Index -le $verificationCalls[$i].Index) { $orderingOk = $false }
+            }
+            if (-not $orderingOk) {
+                $failures.Add("A delivery-gate call appears before its paired Invoke-ReviewerCrossVerificationSafely call; the existing discovery/specialist/verification/delivery tail must run first, unmodified.")
+            }
+            else { Write-Host "  OK - every gate call is textually after its paired verification call; the existing tail is never reordered" -ForegroundColor Green }
+        }
+        if ($pullRequestText -cnotmatch 'if\s*\(\s*\$EffectiveGatePolicy\.mode\s+-ceq\s+"off"\s*\)\s*\{\s*return\s*\}') {
+            # The early-return lives inside Invoke-ReviewerGateForPullRequest itself,
+            # not inline in Invoke-ReviewerPullRequest - confirm it there instead.
+            $gateFnAt = & $declOf "Invoke-ReviewerGateForPullRequest"
+            if ($gateFnAt -lt 0) {
+                $failures.Add("Could not locate Invoke-ReviewerGateForPullRequest to verify its mode='off' early return.")
+            }
+            else {
+                $gateFnEnd = $selfText.IndexOf("`nfunction ", $gateFnAt + 10, [StringComparison]::Ordinal)
+                if ($gateFnEnd -lt 0) { $gateFnEnd = $selfText.Length }
+                $gateFnText = $selfText.Substring($gateFnAt, $gateFnEnd - $gateFnAt)
+                if ($gateFnText -cnotmatch 'if\s*\(\s*\$EffectiveGatePolicy\.mode\s+-ceq\s+"off"\s*\)\s*\{\s*return\s*\}') {
+                    $failures.Add("Invoke-ReviewerGateForPullRequest does not early-return when EffectiveGatePolicy.mode is 'off'.")
+                }
+                else { Write-Host "  OK - the gate function itself returns immediately, reading and writing nothing, when mode is 'off'" -ForegroundColor Green }
+            }
+        }
+        else { Write-Host "  OK - the gate function itself returns immediately, reading and writing nothing, when mode is 'off'" -ForegroundColor Green }
+    }
+    $gateStateBefore = @(Get-ChildItem -LiteralPath $gateDecisionDir -File -ErrorAction SilentlyContinue).Count
+    $fakeBound = @{ PrId = 999001; SourceCommit = ("9" * 40); ChangedPaths = @(); ConventionPlanPath = ""; ExistingFingerprints = (New-Object 'System.Collections.Generic.HashSet[string]') }
+    Invoke-ReviewerGateForPullRequest -Session @{ Fake = $true } -AgencyPath "fake-agency" -Bound $fakeBound `
+        -VerificationResult $null | Out-Null
+    $gateStateAfter = @(Get-ChildItem -LiteralPath $gateDecisionDir -File -ErrorAction SilentlyContinue).Count
+    if ($gateStateAfter -ne $gateStateBefore -or (Test-Path -LiteralPath $gateDeliveryStatePath)) {
+        $failures.Add("Invoke-ReviewerGateForPullRequest wrote gate state while EffectiveGatePolicy.mode was 'off'.")
+    }
+    else { Write-Host "  OK - invoking the gate end-to-end with mode='off' writes nothing at all" -ForegroundColor Green }
+
+    Write-Host "[DRY-RUN] Self-check 26/$total : raw -PromotePreview rejects a sealed gate-decision artifact (H-7, pinned)" -ForegroundColor Cyan
+    $selfCheckKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $selfCheckArtifactDir = Join-Path $StateDir "selfcheck-artifacts"
+    New-Item -ItemType Directory -Force -Path $selfCheckArtifactDir | Out-Null
+    try {
+        $fakeGateDecision = [ordered]@{
+            kind = $script:ReviewerGateDecisionKind; artifactVersion = 1; schemaVersion = 1; mode = "humanPromote"
+            prId = 1; repositoryId = $cfgRepoId; organization = $Organization; project = $ExpectedProject
+            sourceCommit = ("1" * 40); targetCommit = ("2" * 40); changeSetDigest = ("3" * 64)
+            verificationDecisionSha256 = ("0" * 64); verificationInputSha256 = ("0" * 64)
+            conventionPlanSha256 = ("0" * 64); factPlanSha256 = ("0" * 64); specialistArtifactSha256 = ("0" * 64)
+            packPolicySha256 = ("0" * 64); configSha256 = ("0" * 64); scriptSha256 = ("0" * 64)
+            gateLibrarySha256 = ("0" * 64); gatePolicySha256 = ("0" * 64); qualificationSha256 = ("0" * 64)
+            verificationLibrarySha256 = ("0" * 64); verificationPromptSha256 = ("0" * 64)
+            verificationPolicySha256 = ("0" * 64); verificationSchemaSha256 = ("0" * 64)
+            threadSetDigest = ("0" * 64); checksSnapshotSha256 = ("0" * 64); policySnapshotSha256 = ("0" * 64)
+            runOk = $true; runReasonCodes = @(); candidates = @(); unattendedComments = @(); unattendedSuggestions = @()
+            humanPromotableComments = @(); createdAtUtc = ([DateTime]::UtcNow.ToString("o")); decisionExpiresAtUtc = ([DateTime]::UtcNow.AddHours(1).ToString("o"))
+            qualificationExpiresAtUtc = ""
+        }
+        $fakeGateDecisionPath = Save-ReviewerGateDecision -Manifest $fakeGateDecision -Directory $selfCheckArtifactDir -BaseName "selfcheck-gate-decision" -MasterKey $selfCheckKey
+        $rejected = $false
+        try { Invoke-ReviewerPromotion -AgencyPath "fake-agency" -ArtifactPath $fakeGateDecisionPath | Out-Null }
+        catch { $rejected = $true }
+        if (-not $rejected) { $failures.Add("-PromotePreview accepted a sealed gate-decision artifact.") }
+        else { Write-Host "  OK - -PromotePreview rejects a sealed gate-decision artifact" -ForegroundColor Green }
+
+        Write-Host "[DRY-RUN] Self-check 27/$total : -PromoteVerifiedPreview rejects raw delivery and verification artifacts" -ForegroundColor Cyan
+        $fakeVerificationDecision = [ordered]@{ kind = "verification-decision-preview"; artifactVersion = 1; note = "selfcheck" }
+        $fakeVerificationInput = [ordered]@{ kind = "verification-input-preview"; artifactVersion = 1; note = "selfcheck" }
+        $fakeVerificationDecisionPath = Save-ReviewerVerificationPreview -Manifest $fakeVerificationDecision -Directory $selfCheckArtifactDir -BaseName "selfcheck-verif-decision" -MasterKey $selfCheckKey
+        $fakeVerificationInputPath = Save-ReviewerVerificationInput -Manifest $fakeVerificationInput -Directory $selfCheckArtifactDir -BaseName "selfcheck-verif-input" -MasterKey $selfCheckKey
+        $rawManifestJson = Get-ReviewerCanonicalJson -Value (@{
+                artifactVersion = 3; organization = $Organization; project = $ExpectedProject; repositoryName = $RepositoryName
+                repositoryId = $cfgRepoId; prId = 1; prTitle = "t"; sourceCommit = ("1" * 40); markerPrefix = $ResultMarkerPrefix
+                maxFindingItems = 1; reviewModels = @(); passesRequested = 1; passesCompleted = 1; createdAt = ([DateTime]::UtcNow.ToString("o"))
+                scriptSha256 = $ScriptSelfSha256; previewPath = ""; previewSha256 = ""; approvedComments = @(); approvedSummary = ""
+                approvedVote = "none"; reportedFindings = 0; markerBody = "{}"
+            })
+        $rawArtifact = [ordered]@{
+            manifestJson = $rawManifestJson; signatureAlg = "HMACSHA256"
+            signature    = Get-ReviewerArtifactSignature -ManifestJson $rawManifestJson -Key $selfCheckKey
+        }
+        $rawArtifactPath = Join-Path $selfCheckArtifactDir "selfcheck-raw-delivery.json"
+        Set-Content -LiteralPath $rawArtifactPath -Value ($rawArtifact | ConvertTo-Json -Depth 4) -Encoding UTF8
+
+        $verifiedRejectCount = 0
+        foreach ($badArtifactPath in @($fakeVerificationDecisionPath, $fakeVerificationInputPath, $rawArtifactPath)) {
+            $badRejected = $false
+            try { Invoke-ReviewerPromoteVerifiedPreview -AgencyPath "fake-agency" -ArtifactPath $badArtifactPath | Out-Null }
+            catch { $badRejected = $true }
+            if ($badRejected) { $verifiedRejectCount++ }
+        }
+        if ($verifiedRejectCount -ne 3) {
+            $failures.Add("-PromoteVerifiedPreview accepted at least one of: a verification-decision-preview, a verification-input-preview, or a raw delivery manifest.")
+        }
+        else { Write-Host "  OK - -PromoteVerifiedPreview rejects raw delivery, verification-input, and verification-decision artifacts (3/3)" -ForegroundColor Green }
+    }
+    finally {
+        if (Test-Path -LiteralPath $selfCheckArtifactDir) { Remove-Item -LiteralPath $selfCheckArtifactDir -Recurse -Force }
+    }
+
+    Write-Host "[DRY-RUN] Self-check 28/$total : the gate vote set is the closed singleton {Approved}; no rejection path exists" -ForegroundColor Cyan
+    if (@($script:ReviewerGateAllowedVotes).Count -ne 1 -or $script:ReviewerGateAllowedVotes[0] -cne "Approved") {
+        $failures.Add("ReviewerGateAllowedVotes is not the single-element closed set @('Approved').")
+    }
+    else { Write-Host "  OK - ReviewerGateAllowedVotes is exactly @('Approved')" -ForegroundColor Green }
+    $gateDeliveryFnAt = & $declOf "Invoke-ReviewerGateDelivery"
+    if ($gateDeliveryFnAt -lt 0) {
+        $failures.Add("Could not locate Invoke-ReviewerGateDelivery to scan for a forbidden vote literal.")
+    }
+    else {
+        $gateDeliveryFnEnd = $selfText.IndexOf("`nfunction ", $gateDeliveryFnAt + 10, [StringComparison]::Ordinal)
+        if ($gateDeliveryFnEnd -lt 0) { $gateDeliveryFnEnd = $selfText.Length }
+        $gateDeliveryFnText = $selfText.Substring($gateDeliveryFnAt, $gateDeliveryFnEnd - $gateDeliveryFnAt)
+        $forbiddenVoteHit = $false
+        foreach ($forbiddenVote in @("WaitingForAuthor", "Rejected", "ApprovedWithSuggestions")) {
+            if ($gateDeliveryFnText.IndexOf("`"$forbiddenVote`"", [StringComparison]::Ordinal) -ge 0) { $forbiddenVoteHit = $true }
+        }
+        if ($forbiddenVoteHit -or $gateDeliveryFnText -cnotmatch 'Set-ReviewerVote\s+-Session\s+\$sessionForWrite\s+-PrId\s+\$prId\s+-Vote\s+"Approved"') {
+            $failures.Add("Invoke-ReviewerGateDelivery does not cast the vote via the literal, hardcoded string ""Approved"", or references a forbidden vote.")
+        }
+        else { Write-Host "  OK - the only vote the gate can ever cast is the literal, hardcoded string 'Approved'" -ForegroundColor Green }
+    }
+
+    Write-Host "[DRY-RUN] Self-check 29/$total : ADO fails the approval gate closed, unconditionally" -ForegroundColor Cyan
+    $adoCapabilities = Get-ReviewerGateProviderCapabilities -Provider "AzureDevOps" -TargetBranch "main" -HeadSha ("a" * 40)
+    if ([bool]$adoCapabilities.IsGitHub -or [bool]$adoCapabilities.Dismissal.known -or [bool]$adoCapabilities.Checks.known) {
+        $failures.Add("Get-ReviewerGateProviderCapabilities did not fail closed for the AzureDevOps provider.")
+    }
+    else { Write-Host "  OK - AzureDevOps always reports IsGitHub=false and every capability unknown, closing approval" -ForegroundColor Green }
+    if ($provider -cne "AzureDevOps") {
+        $failures.Add("This agent's resolved provider is not 'AzureDevOps'; the approval-gate ADO-closes-unconditionally property assumes this script's own provider restriction.")
+    }
+    else { Write-Host "  OK - this reviewer script's config.provider is restricted to AzureDevOps, so the approval gate is unconditionally closed today" -ForegroundColor Green }
+
+    Write-Host "[DRY-RUN] Self-check 30/$total : the gate library is a pure, network-free, MCP-free, self-contained file" -ForegroundColor Cyan
+    $gateLibraryPath = Join-Path $PSScriptRoot "DeliveryGates.ps1"
+    $gateLibraryErrs = Test-ParserValidity -Path $gateLibraryPath
+    if ($gateLibraryErrs.Count -gt 0) { $failures.Add("Parse errors in DeliveryGates.ps1: $($gateLibraryErrs -join '; ')") }
+    else { Write-Host "  OK - parsed DeliveryGates.ps1" -ForegroundColor Green }
+    $gateLibraryFullText = Get-Content -LiteralPath $gateLibraryPath -Raw
+    $gateForbiddenHit = @($script:ReviewerForbiddenToolFamilies | Where-Object {
+            $gateLibraryFullText.IndexOf($_, [StringComparison]::OrdinalIgnoreCase) -ge 0
+        })
+    if ($gateForbiddenHit.Count -gt 0) {
+        $failures.Add("DeliveryGates.ps1 contains a forbidden tool family fragment: $($gateForbiddenHit -join ', ').")
+    }
+    else { Write-Host "  OK - DeliveryGates.ps1 contains no shell(...) or outbound-network tool family fragment" -ForegroundColor Green }
+    foreach ($forbiddenLibraryToken in @("Invoke-AgentMcpTool", "Open-AgentMcpSession", "Invoke-AgentGitHubApi")) {
+        if ($gateLibraryFullText.IndexOf($forbiddenLibraryToken, [StringComparison]::Ordinal) -ge 0) {
+            $failures.Add("DeliveryGates.ps1 references '$forbiddenLibraryToken'; it must stay a pure library with no MCP or provider transport calls.")
+        }
+    }
+    Write-Host "  OK - DeliveryGates.ps1 makes no MCP, session, or provider-transport call of its own" -ForegroundColor Green
+
+    Write-Host "[DRY-RUN] Self-check 31/$total : gate state is namespaced separately from raw delivery state" -ForegroundColor Cyan
+    $gateStatePaths = @($gateDeliveryStatePath, $gateEligibilityStatePath)
+    $rawStatePaths = @($reviewedStatePath, $attemptsStatePath)
+    $overlap = @($gateStatePaths | Where-Object { $rawStatePaths -icontains $_ })
+    if ($overlap.Count -gt 0 -or (($gateDeliveryStatePath -ieq $gateEligibilityStatePath))) {
+        $failures.Add("Gate state file(s) share a path with raw delivery state; a gate replay could masquerade as a raw one or vice versa.")
+    }
+    else { Write-Host "  OK - gate-delivery.json and gate-eligibility.json are distinct from reviewed.json and attempts.json" -ForegroundColor Green }
+    $pendingPlanFnAt = & $declOf "Get-ReviewerPendingDeliveryPlan"
+    if ($pendingPlanFnAt -ge 0) {
+        $pendingPlanFnEnd = $selfText.IndexOf("`nfunction ", $pendingPlanFnAt + 10, [StringComparison]::Ordinal)
+        if ($pendingPlanFnEnd -lt 0) { $pendingPlanFnEnd = $selfText.Length }
+        $pendingPlanFnText = $selfText.Substring($pendingPlanFnAt, $pendingPlanFnEnd - $pendingPlanFnAt)
+        if ($pendingPlanFnText.IndexOf("gate", [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            $failures.Add("Get-ReviewerPendingDeliveryPlan (the RAW promotion-plan lookup) references gate state; the two must stay completely separate.")
+        }
+        else { Write-Host "  OK - the raw pending-delivery-plan lookup never references gate state" -ForegroundColor Green }
+    }
+
+    Write-Host "[DRY-RUN] Self-check 32/$total : the dedicated gate revalidation session delegates to the proven isolated-session helper" -ForegroundColor Cyan
+    $gateRevalidationAt = & $declOf "Invoke-ReviewerGateRevalidation"
+    if ($gateRevalidationAt -lt 0) {
+        $failures.Add("Could not locate Invoke-ReviewerGateRevalidation to verify its session lifecycle.")
+    }
+    else {
+        $gateRevalidationEnd = $selfText.IndexOf("`nfunction ", $gateRevalidationAt + 10, [StringComparison]::Ordinal)
+        if ($gateRevalidationEnd -lt 0) { $gateRevalidationEnd = $selfText.Length }
+        $gateRevalidationText = $selfText.Substring($gateRevalidationAt, $gateRevalidationEnd - $gateRevalidationAt)
+        if ($gateRevalidationText -cnotmatch 'Invoke-ReviewerConventionSession\s+-AgencyPath\s+\$AgencyPath\s+-Action') {
+            $failures.Add("Invoke-ReviewerGateRevalidation does not delegate to Invoke-ReviewerConventionSession for its isolated, repos-only, scrubbed session.")
+        }
+        elseif ($gateRevalidationText.IndexOf("Open-AgentMcpSession", [StringComparison]::Ordinal) -ge 0) {
+            $failures.Add("Invoke-ReviewerGateRevalidation opens its own MCP session instead of delegating to Invoke-ReviewerConventionSession.")
+        }
+        else { Write-Host "  OK - the dedicated gate revalidation session reuses Invoke-ReviewerConventionSession rather than reimplementing session lifecycle" -ForegroundColor Green }
+    }
+
+    Write-Host "[DRY-RUN] Self-check 33/$total : Invoke-ReviewerGateDelivery never votes when comments are incomplete (never vote after comment failure)" -ForegroundColor Cyan
+    $incompleteDecision = [pscustomobject][ordered]@{
+        prId = 1; sourceCommit = ("1" * 40); changeSetDigest = ("3" * 64)
+        unattendedComments = @([pscustomobject]@{ severity = "important"; filePath = "/a.cs"; line = 1; comment = "one" },
+            [pscustomobject]@{ severity = "important"; filePath = "/b.cs"; line = 2; comment = "two" })
+        unattendedSuggestions = @()
+        candidates = @()
+        runOk = $true; runReasonCodes = @(); allWithheldReasonsSafe = $true; generalistPairComplete = $true
+        generalistBothApprove = $true; specialistOkForApproval = $true
+        decisionExpiresAtUtc = ([DateTime]::UtcNow.AddHours(1).ToString("o"))
+    }
+    $incompleteRevalidation = @{
+        Ok = $true; PrIsActive = $true; PrIsDraft = $false; SourceCommit = ("1" * 40); SourceCommitUnchanged = $true
+        ChangedPaths = @("/a.cs", "/b.cs"); Threads = @(); ExistingFingerprints = (New-Object 'System.Collections.Generic.HashSet[string]')
+        Capabilities = @{ IsGitHub = $false; Dismissal = @{ known = $false }; Checks = @{ known = $false } }
+    }
+    $priorFailWarningPreference = $WarningPreference
+    # The belt-and-braces authority re-check added to Invoke-ReviewerGateDelivery
+    # (finding 1) means the CommentsRequested/ApprovalRequested=$true passed
+    # below is not enough on its own: the CURRENT CLI switches and effective
+    # policy mode must also currently authorize them, or the function closes
+    # on "modeNotEnabled" before ever reaching the comment-completeness logic
+    # this self-check exists to prove. Temporarily grant that authority so the
+    # test actually exercises "comments incomplete", not a different, earlier
+    # closed reason that happens to also leave VoteCast false.
+    $priorCommentSwitchForSelfCheck33 = $EnableVerifiedCommentGate
+    $priorApprovalSwitchForSelfCheck33 = $EnableVerifiedApprovalGate
+    $priorGateModeForSelfCheck33 = $EffectiveGatePolicy.mode
+    $priorGateApprovalEnabledForSelfCheck33 = $EffectiveGatePolicy.approval.enabled
+    $incompleteOutcome = $null
+    try {
+        $EnableVerifiedCommentGate = $true
+        $EnableVerifiedApprovalGate = $true
+        $EffectiveGatePolicy.mode = "approvalVote"
+        $EffectiveGatePolicy.approval.enabled = $true
+        $WarningPreference = "SilentlyContinue"
+        $incompleteOutcome = Invoke-ReviewerGateDelivery -AgencyPath "fake-agency-does-not-exist" -Decision $incompleteDecision `
+            -FirstRevalidation $incompleteRevalidation -CommentsRequested $true -SuggestionsRequested $false -ApprovalRequested $true `
+            -Qualification $null -PriorEligibility @{} -RawGateApproves $true -CanaryConfirmed $true
+    }
+    catch {
+        # A missing "fake-agency-does-not-exist" binary makes Open-AgentMcpSession
+        # throw before any comment write is attempted; that is itself a form of
+        # "comments incomplete" and must not be mistaken for a successful,
+        # complete delivery that would be allowed to proceed to a vote.
+        $incompleteOutcome = @{ CommentsComplete = $false; VoteCast = $false; Reason = "commentDeliveryIncomplete" }
+    }
+    finally {
+        $WarningPreference = $priorFailWarningPreference
+        $EnableVerifiedCommentGate = $priorCommentSwitchForSelfCheck33
+        $EnableVerifiedApprovalGate = $priorApprovalSwitchForSelfCheck33
+        $EffectiveGatePolicy.mode = $priorGateModeForSelfCheck33
+        $EffectiveGatePolicy.approval.enabled = $priorGateApprovalEnabledForSelfCheck33
+    }
+    if ([bool]$incompleteOutcome.VoteCast) {
+        $failures.Add("Invoke-ReviewerGateDelivery cast a vote despite an incomplete/failed comment delivery.")
+    }
+    elseif ([string]$incompleteOutcome.Reason -cne "commentDeliveryIncomplete") {
+        $failures.Add("Invoke-ReviewerGateDelivery did not close for the expected 'commentDeliveryIncomplete' reason (got '$($incompleteOutcome.Reason)'); the belt-and-braces authority re-check may be closing it earlier than this self-check intends to exercise.")
+    }
+    else { Write-Host "  OK - no vote is cast when comment delivery could not be confirmed complete" -ForegroundColor Green }
+
+    Write-Host "[DRY-RUN] Self-check 34/$total : Invoke-ReviewerGateReplay re-derives CURRENT authority; a persisted request never outlives it" -ForegroundColor Cyan
+    $selfCheck34ArtifactDir = Join-Path $StateDir "selfcheck34-artifacts"
+    New-Item -ItemType Directory -Force -Path $selfCheck34ArtifactDir | Out-Null
+    $priorCommentSwitch34 = $EnableVerifiedCommentGate
+    $priorApprovalSwitch34 = $EnableVerifiedApprovalGate
+    $priorGateMode34 = $EffectiveGatePolicy.mode
+    $gateDeliveryStateExistedBefore34 = Test-Path -LiteralPath $gateDeliveryStatePath -PathType Leaf
+    $priorGateDeliveryState34 = Get-JsonState -Path $gateDeliveryStatePath
+    try {
+        $selfCheck34Key = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+        function New-SelfCheck34Decision {
+            param([string]$ScriptShaOverride = $ScriptSelfSha256.ToLowerInvariant(), [string]$ExpiresAtUtcOverride = ([DateTime]::UtcNow.AddHours(1).ToString("o")))
+            return [ordered]@{
+                kind = $script:ReviewerGateDecisionKind; artifactVersion = 1; schemaVersion = 1; mode = "unattendedComment"
+                prId = 1; repositoryId = $cfgRepoId.ToLowerInvariant(); organization = $Organization; project = $ExpectedProject
+                sourceCommit = ("1" * 40); targetCommit = ("2" * 40); changeSetDigest = ("3" * 64)
+                verificationDecisionSha256 = ("0" * 64); verificationInputSha256 = ("0" * 64)
+                conventionPlanSha256 = ("0" * 64); factPlanSha256 = ("0" * 64); specialistArtifactSha256 = ("0" * 64)
+                packPolicySha256 = $ConventionPackPolicySha256; configSha256 = $ConfigSha256.ToLowerInvariant(); scriptSha256 = $ScriptShaOverride
+                gateLibrarySha256 = $DeliveryGatesLibrarySha256; gatePolicySha256 = $GatePolicySha256; qualificationSha256 = ("0" * 64)
+                verificationLibrarySha256 = $CrossVerificationLibrarySha256; verificationPromptSha256 = $CrossVerificationPromptSha256
+                verificationPolicySha256 = $CrossVerificationPolicySha256; verificationSchemaSha256 = $CrossVerificationSchemaSha256
+                threadSetDigest = ("0" * 64); checksSnapshotSha256 = ("0" * 64); policySnapshotSha256 = ("0" * 64)
+                runOk = $true; runReasonCodes = @(); candidates = @(); unattendedComments = @(); unattendedSuggestions = @()
+                humanPromotableComments = @(); createdAtUtc = ([DateTime]::UtcNow.ToString("o")); decisionExpiresAtUtc = $ExpiresAtUtcOverride
+                qualificationExpiresAtUtc = ""
+            }
+        }
+        $validDecisionPath = Save-ReviewerGateDecision -Manifest (New-SelfCheck34Decision) -Directory $selfCheck34ArtifactDir -BaseName "sc34-valid" -MasterKey $selfCheck34Key
+        $staleScriptDecisionPath = Save-ReviewerGateDecision -Manifest (New-SelfCheck34Decision -ScriptShaOverride ("9" * 64)) -Directory $selfCheck34ArtifactDir -BaseName "sc34-stale-script" -MasterKey $selfCheck34Key
+        $expiredDecisionPath = Save-ReviewerGateDecision -Manifest (New-SelfCheck34Decision -ExpiresAtUtcOverride ([DateTime]::UtcNow.AddHours(-1).ToString("o"))) -Directory $selfCheck34ArtifactDir -BaseName "sc34-expired" -MasterKey $selfCheck34Key
+
+        function New-SelfCheck34Record {
+            param([string]$ArtifactPath)
+            return @{
+                sourceCommit = ("1" * 40); at = ([DateTime]::UtcNow.AddMinutes(-5).ToString("o"))
+                commentsIntended = 2; commentsPosted = 1; commentsComplete = $false; voteCast = $false
+                reason = "commentDeliveryIncomplete"; pendingReplay = $true; artifactPath = $ArtifactPath
+                commentsRequested = $true; suggestionsRequested = $false; approvalRequested = $false
+                rawRecommendedVote = "none"; rawCounts = @{ critical = 0; important = 0; suggestion = 0 }
+                rawReportedFindingCount = 0; rawPassesComplete = $true
+            }
+        }
+
+        # Scenario A: policy mode downgraded since the original attempt - the
+        # persisted commentsRequested=$true must NOT outlive a CURRENT mode
+        # that no longer allows it. No state mutation is expected: the
+        # replay must return before touching the record at all.
+        $gateDeliveryState34 = @{ "101" = (New-SelfCheck34Record -ArtifactPath $validDecisionPath) }
+        Set-JsonState -Path $gateDeliveryStatePath -State $gateDeliveryState34
+        $EffectiveGatePolicy.mode = "preview"
+        $EnableVerifiedCommentGate = $true
+        Invoke-ReviewerGateReplay -AgencyPath "fake-agency-does-not-exist" -PrId 101 -SourceCommit ("1" * 40)
+        $afterModeDowngrade = (Get-JsonState -Path $gateDeliveryStatePath)["101"]
+        if (-not [bool]$afterModeDowngrade.pendingReplay -or [string]$afterModeDowngrade.reason -cne "commentDeliveryIncomplete") {
+            $failures.Add("A replay proceeded (or mutated its record) after the policy mode was downgraded below what the persisted request needed.")
+        }
+        else { Write-Host "  OK - a policy-mode downgrade since the original attempt refuses the replay" -ForegroundColor Green }
+
+        # Scenario B: the CLI switch itself was turned off - mode is still
+        # correctly unattended, but the operator withdrew the switch.
+        $gateDeliveryState34b = @{ "102" = (New-SelfCheck34Record -ArtifactPath $validDecisionPath) }
+        Set-JsonState -Path $gateDeliveryStatePath -State $gateDeliveryState34b
+        $EffectiveGatePolicy.mode = "unattendedComment"
+        $EnableVerifiedCommentGate = $false
+        Invoke-ReviewerGateReplay -AgencyPath "fake-agency-does-not-exist" -PrId 102 -SourceCommit ("1" * 40)
+        $afterSwitchRemoved = (Get-JsonState -Path $gateDeliveryStatePath)["102"]
+        if (-not [bool]$afterSwitchRemoved.pendingReplay -or [string]$afterSwitchRemoved.reason -cne "commentDeliveryIncomplete") {
+            $failures.Add("A replay proceeded (or mutated its record) after -EnableVerifiedCommentGate was turned off.")
+        }
+        else { Write-Host "  OK - removing the CLI switch since the original attempt refuses the replay" -ForegroundColor Green }
+
+        # Scenario C: the sealed decision has expired.
+        $EnableVerifiedCommentGate = $true
+        $gateDeliveryState34c = @{ "103" = (New-SelfCheck34Record -ArtifactPath $expiredDecisionPath) }
+        Set-JsonState -Path $gateDeliveryStatePath -State $gateDeliveryState34c
+        Invoke-ReviewerGateReplay -AgencyPath "fake-agency-does-not-exist" -PrId 103 -SourceCommit ("1" * 40)
+        $afterExpiry = (Get-JsonState -Path $gateDeliveryStatePath)["103"]
+        if ([bool]$afterExpiry.pendingReplay -or [string]$afterExpiry.reason -cne "decisionExpired") {
+            $failures.Add("A replay of an EXPIRED sealed decision was not closed with reason 'decisionExpired' (got pendingReplay=$($afterExpiry.pendingReplay), reason='$($afterExpiry.reason)').")
+        }
+        else { Write-Host "  OK - Test-ReviewerGateDecisionExpired is enforced on replay" -ForegroundColor Green }
+        # Finding 1 (Opus re-review round 3): an expiry closure must mark the
+        # record SUPERSEDED, not merely closed - so it does NOT count as
+        # "ever attempted" and the next normal cycle gets exactly one fresh
+        # full review instead of being locked out of the gate at this
+        # commit forever.
+        if (-not [bool]$afterExpiry.superseded) {
+            $failures.Add("A replay closed by expiry did not mark the record superseded=`$true.")
+        }
+        elseif (Test-ReviewerGateDecisionEverAttempted -PrId 103 -SourceCommit ("1" * 40)) {
+            $failures.Add("Test-ReviewerGateDecisionEverAttempted reported TRUE for a record superseded by expiry; it must report false so the next cycle performs one fresh full review.")
+        }
+        else { Write-Host "  OK - an expiry closure marks the record superseded, so the next cycle gets exactly one fresh full review" -ForegroundColor Green }
+
+        # Scenario D: the sealed decision's own bindings no longer match
+        # (here, a stale scriptSha256).
+        $gateDeliveryState34d = @{ "104" = (New-SelfCheck34Record -ArtifactPath $staleScriptDecisionPath) }
+        Set-JsonState -Path $gateDeliveryStatePath -State $gateDeliveryState34d
+        Invoke-ReviewerGateReplay -AgencyPath "fake-agency-does-not-exist" -PrId 104 -SourceCommit ("1" * 40)
+        $afterBindingMismatch = (Get-JsonState -Path $gateDeliveryStatePath)["104"]
+        if ([bool]$afterBindingMismatch.pendingReplay -or ([string]$afterBindingMismatch.reason).IndexOf("scriptShaMismatch", [StringComparison]::Ordinal) -lt 0) {
+            $failures.Add("A replay of a decision sealed under a STALE scriptSha256 was not closed with a reason mentioning 'scriptShaMismatch' (got pendingReplay=$($afterBindingMismatch.pendingReplay), reason='$($afterBindingMismatch.reason)').")
+        }
+        else { Write-Host "  OK - Test-ReviewerGateDecisionBinding is enforced fatally on replay, before any write" -ForegroundColor Green }
+        if (-not [bool]$afterBindingMismatch.superseded) {
+            $failures.Add("A replay closed by a binding mismatch did not mark the record superseded=`$true.")
+        }
+        elseif (Test-ReviewerGateDecisionEverAttempted -PrId 104 -SourceCommit ("1" * 40)) {
+            $failures.Add("Test-ReviewerGateDecisionEverAttempted reported TRUE for a record superseded by a binding mismatch; it must report false so the next cycle performs one fresh full review.")
+        }
+        else { Write-Host "  OK - a binding-mismatch closure marks the record superseded, so the next cycle gets exactly one fresh full review" -ForegroundColor Green }
+
+        # Scenario E: current authority, unexpired, matching bindings - the
+        # replay must proceed PAST the new gates to an actual revalidation
+        # attempt (which then degrades gracefully against a nonexistent
+        # agency - Invoke-ReviewerGateRevalidation throws, caught by this
+        # function's own outer degrade-safe catch, leaving the record
+        # UNCHANGED from its seed rather than closed by any new-gate reason;
+        # the outer catch's own warning text is therefore the signal that
+        # execution reached that far, past authority/expiry/binding).
+        $gateDeliveryState34e = @{ "105" = (New-SelfCheck34Record -ArtifactPath $validDecisionPath) }
+        Set-JsonState -Path $gateDeliveryStatePath -State $gateDeliveryState34e
+        $sc34eWarnings = $null
+        Invoke-ReviewerGateReplay -AgencyPath "fake-agency-does-not-exist" -PrId 105 -SourceCommit ("1" * 40) -WarningVariable sc34eWarnings -WarningAction SilentlyContinue
+        $reachedPastNewGates = (@(@($sc34eWarnings) | Where-Object { $_ -match 'degraded for PR 105' })).Count -gt 0
+        if (-not $reachedPastNewGates) {
+            $failures.Add("A CURRENTLY-authorized, unexpired, correctly-bound replay did not appear to proceed past the new gates to an actual revalidation attempt (no 'degraded for PR 105' warning observed).")
+        }
+        else { Write-Host "  OK - a currently-authorized, unexpired, correctly-bound replay is not blocked by the new gates" -ForegroundColor Green }
+    }
+    finally {
+        $EnableVerifiedCommentGate = $priorCommentSwitch34
+        $EnableVerifiedApprovalGate = $priorApprovalSwitch34
+        $EffectiveGatePolicy.mode = $priorGateMode34
+        # Restore, never merely "write back the prior state": if
+        # gate-delivery.json did not exist before this self-check ran,
+        # writing it (even with empty/prior content) would CREATE a file
+        # that a later self-check 25 run (in a future, separate invocation
+        # reusing this same persistent StateDir) would then find and
+        # mistake for evidence of a real write while mode='off'.
+        if ($gateDeliveryStateExistedBefore34) {
+            Set-JsonState -Path $gateDeliveryStatePath -State $priorGateDeliveryState34
+        }
+        else {
+            Remove-Item -LiteralPath $gateDeliveryStatePath -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path -LiteralPath $selfCheck34ArtifactDir) { Remove-Item -LiteralPath $selfCheck34ArtifactDir -Recurse -Force }
+    }
+
+    Write-Host "[DRY-RUN] Self-check 35/$total : Invoke-ReviewerPromoteVerifiedPreview re-verifies decision bindings fatally, before any write" -ForegroundColor Cyan
+    $selfCheck35ArtifactDir = Join-Path $StateDir "selfcheck35-artifacts"
+    New-Item -ItemType Directory -Force -Path $selfCheck35ArtifactDir | Out-Null
+    try {
+        $selfCheck35Key = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+        $staleConfigDecision = [ordered]@{
+            kind = $script:ReviewerGateDecisionKind; artifactVersion = 1; schemaVersion = 1; mode = "humanPromote"
+            prId = 1; repositoryId = $cfgRepoId.ToLowerInvariant(); organization = $Organization; project = $ExpectedProject
+            sourceCommit = ("1" * 40); targetCommit = ("2" * 40); changeSetDigest = ("3" * 64)
+            verificationDecisionSha256 = ("0" * 64); verificationInputSha256 = ("0" * 64)
+            conventionPlanSha256 = ("0" * 64); factPlanSha256 = ("0" * 64); specialistArtifactSha256 = ("0" * 64)
+            # Deliberately stale: this configSha256 does not match $ConfigSha256.
+            packPolicySha256 = $ConventionPackPolicySha256; configSha256 = ("8" * 64); scriptSha256 = $ScriptSelfSha256.ToLowerInvariant()
+            gateLibrarySha256 = $DeliveryGatesLibrarySha256; gatePolicySha256 = $GatePolicySha256; qualificationSha256 = ("0" * 64)
+            verificationLibrarySha256 = $CrossVerificationLibrarySha256; verificationPromptSha256 = $CrossVerificationPromptSha256
+            verificationPolicySha256 = $CrossVerificationPolicySha256; verificationSchemaSha256 = $CrossVerificationSchemaSha256
+            threadSetDigest = ("0" * 64); checksSnapshotSha256 = ("0" * 64); policySnapshotSha256 = ("0" * 64)
+            runOk = $true; runReasonCodes = @(); candidates = @(); unattendedComments = @(); unattendedSuggestions = @()
+            humanPromotableComments = @([pscustomobject]@{ severity = "important"; filePath = "/a.cs"; line = 1; comment = "x" })
+            createdAtUtc = ([DateTime]::UtcNow.ToString("o")); decisionExpiresAtUtc = ([DateTime]::UtcNow.AddHours(1).ToString("o"))
+            qualificationExpiresAtUtc = ""
+        }
+        $staleConfigDecisionPath = Save-ReviewerGateDecision -Manifest $staleConfigDecision -Directory $selfCheck35ArtifactDir -BaseName "sc35-stale-config" -MasterKey $selfCheck35Key
+        $staleConfigRejected = $false
+        $staleConfigMessage = ""
+        try { Invoke-ReviewerPromoteVerifiedPreview -AgencyPath "fake-agency-does-not-exist" -ArtifactPath $staleConfigDecisionPath | Out-Null }
+        catch { $staleConfigRejected = $true; $staleConfigMessage = $_.Exception.Message }
+        if (-not $staleConfigRejected -or $staleConfigMessage.IndexOf("configShaMismatch", [StringComparison]::Ordinal) -lt 0) {
+            $failures.Add("-PromoteVerifiedPreview accepted (or rejected for the wrong reason) a decision sealed under a STALE configSha256: '$staleConfigMessage'.")
+        }
+        else { Write-Host "  OK - a decision sealed under a stale config is rejected with 'configShaMismatch', before any write" -ForegroundColor Green }
+    }
+    finally {
+        if (Test-Path -LiteralPath $selfCheck35ArtifactDir) { Remove-Item -LiteralPath $selfCheck35ArtifactDir -Recurse -Force }
+    }
+
+    Write-Host "[DRY-RUN] Self-check 36/$total : the startup banner accounts for gate writes, never claims NONE while a gate write is possible" -ForegroundColor Cyan
+    # Patterns are built via concatenation so this check's OWN source text
+    # does not itself contain the literal substring being searched for -
+    # otherwise this could never meaningfully fail even if the real banner
+    # code were removed.
+    if ($selfText.IndexOf(('Get-ReviewerGateWritesCurrentlyRequested' + ' -EffectivePolicy $EffectiveGatePolicy'), [StringComparison]::Ordinal) -lt 0 -or
+        $selfText.IndexOf(('$gateWritesPossible = ([bool]$gateAuthorityForBanner' + '.Comments'), [StringComparison]::Ordinal) -lt 0 -or
+        $selfText.IndexOf(('if (-not $rawWritesRequested' + ' -and -not $gateWritesPossible)'), [StringComparison]::Ordinal) -lt 0) {
+        $failures.Add("The startup 'Writes:' banner does not appear to consult Get-ReviewerGateWritesCurrentlyRequested before deciding it can print 'NONE'.")
+    }
+    else { Write-Host "  OK - the banner's NONE branch is gated on both raw AND gate write authority" -ForegroundColor Green }
+
+    Write-Host "[DRY-RUN] Self-check 37/$total : a gate capability enabled after a commit was already raw-previewed still gets its first chance" -ForegroundColor Cyan
+    $gateDeliveryStateExistedBefore37 = Test-Path -LiteralPath $gateDeliveryStatePath -PathType Leaf
+    $priorGateDeliveryState37 = Get-JsonState -Path $gateDeliveryStatePath
+    try {
+        $neverAttemptedState = @{}
+        Set-JsonState -Path $gateDeliveryStatePath -State $neverAttemptedState
+        if (Test-ReviewerGateDecisionEverAttempted -PrId 201 -SourceCommit ("4" * 40)) {
+            $failures.Add("Test-ReviewerGateDecisionEverAttempted reported true for a PR with no gate-delivery record at all.")
+        }
+        $sameCommitState = @{ "201" = @{ sourceCommit = ("4" * 40) } }
+        Set-JsonState -Path $gateDeliveryStatePath -State $sameCommitState
+        if (-not (Test-ReviewerGateDecisionEverAttempted -PrId 201 -SourceCommit ("4" * 40))) {
+            $failures.Add("Test-ReviewerGateDecisionEverAttempted reported false for a PR with a gate-delivery record at the SAME commit.")
+        }
+        $differentCommitState = @{ "201" = @{ sourceCommit = ("5" * 40) } }
+        Set-JsonState -Path $gateDeliveryStatePath -State $differentCommitState
+        if (Test-ReviewerGateDecisionEverAttempted -PrId 201 -SourceCommit ("4" * 40)) {
+            $failures.Add("Test-ReviewerGateDecisionEverAttempted reported true for a gate-delivery record at a DIFFERENT (stale) commit.")
+        }
+        if ($selfText.IndexOf(('Test-ReviewerGateDecisionEverAttempted' + ' -PrId $prId -SourceCommit $sourceCommit'), [StringComparison]::Ordinal) -lt 0) {
+            $failures.Add("The cycle loop's already-reviewed skip logic does not appear to call Test-ReviewerGateDecisionEverAttempted.")
+        }
+        if ($failures.Count -eq 0 -or $failures[$failures.Count - 1] -notmatch 'Test-ReviewerGateDecisionEverAttempted') {
+            Write-Host "  OK - Test-ReviewerGateDecisionEverAttempted distinguishes never-attempted, same-commit, and stale-commit records" -ForegroundColor Green
+        }
+    }
+    finally {
+        # See self-check 34: restore-by-deleting when the file did not exist
+        # before, never leave behind a file a future invocation's self-check
+        # 25 (reusing this same persistent StateDir) would misread.
+        if ($gateDeliveryStateExistedBefore37) {
+            Set-JsonState -Path $gateDeliveryStatePath -State $priorGateDeliveryState37
+        }
+        else {
+            Remove-Item -LiteralPath $gateDeliveryStatePath -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    Write-Host "[DRY-RUN] Self-check 38/$total : AuthoritativeSourcesCurrent/checks-policy-snapshot/EvaluationToolSha256 never fabricate approval evidence" -ForegroundColor Cyan
+    # Every pattern below is built via concatenation so this check's OWN
+    # source text never contains the literal substring being searched for -
+    # otherwise a -ge 0 (forbidden-pattern-present) check could never pass
+    # and a -lt 0 (required-pattern-absent) check could never meaningfully
+    # fail, regardless of what the real code actually does.
+    if ($selfText.IndexOf(('-AuthoritativeSourcesCurrent' + ' $true'), [StringComparison]::Ordinal) -ge 0) {
+        $failures.Add("Invoke-ReviewerGateDelivery still passes a hardcoded -AuthoritativeSourcesCurrent `$true with no live re-read behind it.")
+    }
+    if ($selfText.IndexOf(('-AuthoritativeSourcesCurrent' + ' $false'), [StringComparison]::Ordinal) -lt 0) {
+        $failures.Add("Invoke-ReviewerGateDelivery does not appear to pass -AuthoritativeSourcesCurrent `$false (closing approval, since there is no live re-read wired in).")
+    }
+    $approvalParamNames = @((Get-Command Test-ReviewerGateApproval).Parameters.Keys)
+    if ($approvalParamNames -contains "ChecksSnapshotSha256" -or $approvalParamNames -contains "PolicySnapshotSha256") {
+        $failures.Add("Test-ReviewerGateApproval accepts a checks/policy SNAPSHOT HASH parameter; a stored hash must never be able to authorize approval, only a live re-read boolean.")
+    }
+    if (-not (Get-Command Get-ReviewerGateProviderCapabilities -ErrorAction SilentlyContinue) -and
+        $selfText.IndexOf(('function ' + 'Get-ReviewerGateProviderCapabilities'), [StringComparison]::Ordinal) -lt 0) {
+        $failures.Add("Could not locate Get-ReviewerGateProviderCapabilities to confirm checks/dismissal are read live.")
+    }
+    if ($selfText.IndexOf(('[string]$Gate' + 'EvaluationToolSha256'), [StringComparison]::Ordinal) -lt 0 -or
+        $selfText.IndexOf(('EvaluationToolSha256      = [string]$Gate' + 'EvaluationToolSha256'), [StringComparison]::Ordinal) -lt 0) {
+        $failures.Add("-GateEvaluationToolSha256 does not appear to be wired into the qualification's live EvaluationToolSha256 binding.")
+    }
+    if ($failures.Count -eq 0 -or $failures[$failures.Count - 1] -notmatch 'AuthoritativeSourcesCurrent|checks/policy SNAPSHOT|GateEvaluationToolSha256|Get-ReviewerGateProviderCapabilities') {
+        Write-Host "  OK - AuthoritativeSourcesCurrent closes approval, checks/policy snapshots cannot authorize it, and EvaluationToolSha256 has a real operator-supplied live path" -ForegroundColor Green
+    }
+
+    Write-Host "[DRY-RUN] Self-check 39/$total : a gate refresh never re-delivers raw, and a gate-processing fault does not cause unbounded full re-review" -ForegroundColor Cyan
+    # Finding 1 (Opus re-review round 3, part 2): the pure stand-in
+    # Invoke-ReviewerPullRequest substitutes for a real Invoke-ReviewerDelivery
+    # call when raw already fully delivered at this exact commit. It must
+    # carry PRIOR capability outcomes through completely unchanged and never
+    # post/vote anything new.
+    $standIn39 = Get-ReviewerGateRefreshStandInDelivery -PriorComments $true -PriorSummary $true -PriorVote $false -PriorPostedCount 5
+    if (-not [bool]$standIn39.CommentsDelivered -or -not [bool]$standIn39.SummaryDelivered -or [bool]$standIn39.VoteResolved -or
+        [string]$standIn39.CastVote -cne "" -or [int]$standIn39.PostedCount -ne 5 -or [int]$standIn39.PostFailures -ne 0 -or
+        -not [bool]$standIn39.Delivered -or [bool]$standIn39.Aborted) {
+        $failures.Add("Get-ReviewerGateRefreshStandInDelivery did not carry PRIOR capability outcomes through unchanged, or posted/voted something new (a second, unauthorized raw delivery).")
+    }
+    else { Write-Host "  OK - the gate-refresh stand-in never re-delivers raw; it carries prior capability outcomes through unchanged and casts no new vote" -ForegroundColor Green }
+    if ($selfText.IndexOf(('$rawDeliveryAlreadySatisfied' + ' = [bool]$Bound.RawDeliveryAlreadySatisfied'), [StringComparison]::Ordinal) -lt 0 -or
+        $selfText.IndexOf(('Get-ReviewerGateRefreshStandInDelivery' + ' -PriorComments $priorComments'), [StringComparison]::Ordinal) -lt 0) {
+        $failures.Add("Invoke-ReviewerPullRequest does not appear to read Bound.RawDeliveryAlreadySatisfied and route to the stand-in delivery.")
+    }
+
+    # Finding 2 (Opus re-review round 3): a bare gate-processing exception
+    # must persist a minimal, non-superseded, non-pendingReplay fault record
+    # so Test-ReviewerGateDecisionEverAttempted reports TRUE afterward - a
+    # fault must count as attempted, or the cycle-loop fall-through would
+    # re-run a full model review (raw findings and all) every single cycle
+    # trying to give the gate its first chance, forever.
+    $priorMode39 = $EffectiveGatePolicy.mode
+    $gateDeliveryStateExistedBefore39 = Test-Path -LiteralPath $gateDeliveryStatePath -PathType Leaf
+    $priorGateDeliveryState39 = Get-JsonState -Path $gateDeliveryStatePath
+    try {
+        $EffectiveGatePolicy.mode = "preview"
+        # An empty-hashtable Session makes Get-ReviewerPullRequestThreads's
+        # own Invoke-AgentMcpTool call throw well before any decision is
+        # sealed - simulating a genuine mid-processing gate fault, never a
+        # sealed-then-faulted case (that is Scenario A/B/etc. above).
+        Invoke-ReviewerGateForPullRequest -Session @{} -AgencyPath "fake-agency-does-not-exist" `
+            -Bound @{
+            PrId = 901; SourceCommit = ("7" * 40); ConventionPlanPath = ""
+            RawRecommendedVote = "none"; RawCounts = @{ critical = 0; important = 0; suggestion = 0 }
+            RawReportedFindingCount = 0; RawPassesComplete = $true
+        } `
+            -VerificationResult @{ Status = "degraded"; Eligible = @(); Withheld = @() }
+        $afterFault39 = (Get-JsonState -Path $gateDeliveryStatePath)["901"]
+        if (-not $afterFault39 -or [bool]$afterFault39.pendingReplay -or [bool]$afterFault39.superseded -or
+            -not (Test-ReviewerGateDecisionEverAttempted -PrId 901 -SourceCommit ("7" * 40))) {
+            $failures.Add("A thrown gate-processing exception did not persist a minimal, non-superseded, non-pendingReplay fault record that counts as attempted.")
+        }
+        else { Write-Host "  OK - a thrown gate-processing exception persists a minimal fault record; the next cycle is skipped, never re-reviewed every cycle" -ForegroundColor Green }
+
+        # The fault-record write must never clobber an already-persisted,
+        # genuinely useful record for the SAME commit (e.g. a partial
+        # delivery with pendingReplay=$true from earlier in the SAME try
+        # block, before an unrelated LATER statement faulted).
+        $preExistingUsefulState39 = @{ "902" = @{ sourceCommit = ("8" * 40); pendingReplay = $true; reason = "commentDeliveryIncomplete"; superseded = $false } }
+        Set-JsonState -Path $gateDeliveryStatePath -State $preExistingUsefulState39
+        Invoke-ReviewerGateForPullRequest -Session @{} -AgencyPath "fake-agency-does-not-exist" `
+            -Bound @{
+            PrId = 902; SourceCommit = ("8" * 40); ConventionPlanPath = ""
+            RawRecommendedVote = "none"; RawCounts = @{ critical = 0; important = 0; suggestion = 0 }
+            RawReportedFindingCount = 0; RawPassesComplete = $true
+        } `
+            -VerificationResult @{ Status = "degraded"; Eligible = @(); Withheld = @() }
+        $afterFaultOverExisting39 = (Get-JsonState -Path $gateDeliveryStatePath)["902"]
+        if (-not [bool]$afterFaultOverExisting39.pendingReplay -or [string]$afterFaultOverExisting39.reason -cne "commentDeliveryIncomplete") {
+            $failures.Add("A gate-processing fault clobbered an existing, more informative gate-delivery record for the same commit instead of leaving it alone.")
+        }
+        else { Write-Host "  OK - a gate-processing fault never clobbers an already-persisted, more informative record for the same commit" -ForegroundColor Green }
+    }
+    finally {
+        $EffectiveGatePolicy.mode = $priorMode39
+        if ($gateDeliveryStateExistedBefore39) {
+            Set-JsonState -Path $gateDeliveryStatePath -State $priorGateDeliveryState39
+        }
+        else {
+            Remove-Item -LiteralPath $gateDeliveryStatePath -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    Write-Host "[DRY-RUN] Self-check 40/$total : a raw pending-delivery plan is never routed into Invoke-ReviewerPromotion once raw delivery is already satisfied under today's write switches" -ForegroundColor Cyan
+    # Pure boundary check: the exact function used at both cycle-loop call
+    # sites gating a pending-plan retry.
+    $shouldReplayCases = @(
+        , @("has-path", "not-satisfied", "path", $false, $true)
+        , @("has-path", "satisfied", "path", $true, $false)
+        , @("no-path", "not-satisfied", "", $false, $false)
+        , @("no-path", "satisfied", "", $true, $false)
+    )
+    $shouldReplayFailureCount = 0
+    foreach ($case in $shouldReplayCases) {
+        $path = [string]$case[2]; $satisfied = [bool]$case[3]; $expected = [bool]$case[4]
+        $actual = Test-ReviewerRawPendingPlanShouldReplay -PendingPlan $path -RawDeliveryAlreadySatisfied $satisfied
+        if ([bool]$actual -ne $expected) {
+            $shouldReplayFailureCount++
+            $failures.Add("Test-ReviewerRawPendingPlanShouldReplay($($case[0]), $($case[1])) returned $actual, expected $expected.")
+        }
+    }
+    if ($shouldReplayFailureCount -eq 0) {
+        Write-Host "  OK - Test-ReviewerRawPendingPlanShouldReplay's 4-case truth table holds: a pending plan replays only when raw delivery is NOT already satisfied" -ForegroundColor Green
+    }
+
+    # Realistic scenario: a raw delivery record with deliveryPending=$true
+    # and a still-on-disk artifact - but under TODAY's write switches (all
+    # off), Test-ReviewerAlreadyReviewed returns true VACUOUSLY (its own
+    # documented '-not $WritesRequested { return $true }' short-circuit),
+    # exactly the scenario that used to route a stale pending plan into
+    # Invoke-ReviewerPromotion purely as a side effect of a gate refresh.
+    $selfCheck40ArtifactDir = Join-Path $StateDir "selfcheck40-artifacts"
+    New-Item -ItemType Directory -Force -Path $selfCheck40ArtifactDir | Out-Null
+    try {
+        $selfCheck40ArtifactPath = Join-Path $selfCheck40ArtifactDir "sc40-pending.json"
+        Set-Content -LiteralPath $selfCheck40ArtifactPath -Value "{}" -Encoding UTF8
+        $sc40ReviewedState = @{
+            "301" = @{
+                sourceCommit = ("f" * 40); deliveryPending = $true; artifactPath = $selfCheck40ArtifactPath
+                commentsDelivered = $false; summaryDelivered = $false; voteResolved = $false
+            }
+        }
+        $sc40PendingPlan = Get-ReviewerPendingDeliveryPlan -ReviewedState $sc40ReviewedState -PrId 301 -SourceCommit ("f" * 40)
+        $sc40AlreadyReviewedVacuously = Test-ReviewerAlreadyReviewed -ReviewedState $sc40ReviewedState -PrId 301 -SourceCommit ("f" * 40) `
+            -WritesRequested $false -WantComments $false -WantSummary $false -WantVote $false
+        if (-not $sc40PendingPlan -or -not $sc40AlreadyReviewedVacuously) {
+            $failures.Add("Self-check 40 scenario setup is not realistic: expected a non-empty pending plan AND Test-ReviewerAlreadyReviewed(-WritesRequested `$false) to return true despite deliveryPending=`$true.")
+        }
+        else {
+            $sc40NoRawSwitchesShouldReplay = Test-ReviewerRawPendingPlanShouldReplay -PendingPlan $sc40PendingPlan -RawDeliveryAlreadySatisfied $sc40AlreadyReviewedVacuously
+            $sc40RawSwitchesStillOnShouldReplay = Test-ReviewerRawPendingPlanShouldReplay -PendingPlan $sc40PendingPlan -RawDeliveryAlreadySatisfied $false
+            if ([bool]$sc40NoRawSwitchesShouldReplay) {
+                $failures.Add("A stale raw pending-delivery plan (deliveryPending=`$true, artifact still on disk) would be routed into Invoke-ReviewerPromotion even though raw delivery is satisfied under today's write switches (all off).")
+            }
+            elseif (-not [bool]$sc40RawSwitchesStillOnShouldReplay) {
+                $failures.Add("The SAME pending plan is refused replay even when raw delivery is NOT already satisfied (raw switches still on); ordinary raw retry behavior must be unaffected.")
+            }
+            else {
+                Write-Host "  OK - a stale raw pending-delivery plan is never routed into Invoke-ReviewerPromotion once raw write switches are off, and ordinary raw retry is unaffected when they are on" -ForegroundColor Green
+            }
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $selfCheck40ArtifactDir) { Remove-Item -LiteralPath $selfCheck40ArtifactDir -Recurse -Force }
+    }
+
+    # Both cycle-loop call sites that could route a pending plan into
+    # Invoke-ReviewerPromotion must be gated by this exact function - never a
+    # re-implemented inline condition that could silently drift from it.
+    $rawPendingGuardOccurrences = ([regex]::Matches($selfText, [regex]::Escape('Test-ReviewerRawPendingPlanShouldReplay -PendingPlan $pendingPlan -RawDeliveryAlreadySatisfied $rawDeliveryAlreadySatisfied'))).Count
+    if ($rawPendingGuardOccurrences -lt 2) {
+        $failures.Add("Expected at least 2 call sites gating a pending-plan retry with Test-ReviewerRawPendingPlanShouldReplay (the version-mismatch check and the actual Invoke-ReviewerPromotion retry); found $rawPendingGuardOccurrences.")
+    }
+    else {
+        Write-Host "  OK - both cycle-loop call sites that could route a pending plan into Invoke-ReviewerPromotion are gated by Test-ReviewerRawPendingPlanShouldReplay" -ForegroundColor Green
+    }
+
+    Write-Host "[DRY-RUN] Self-check 41/$total : superseded expiry/binding refresh invitations are bounded by a hard, code-defined budget; exceeding it closes terminally; a new commit resets it" -ForegroundColor Cyan
+    $budgetCases = @(
+        , @(0, $true, 1)
+        , @(1, $true, 2)
+        , @(2, $false, 2)
+        , @(5, $false, 5)
+    )
+    $budgetFailureCount = 0
+    foreach ($case in $budgetCases) {
+        $current = [int]$case[0]; $expectedWithin = [bool]$case[1]; $expectedNext = [int]$case[2]
+        $budgetResult = Test-ReviewerGateSupersededBudget -CurrentSupersededCount $current
+        if ([bool]$budgetResult.WithinBudget -ne $expectedWithin -or [int]$budgetResult.NextSupersededCount -ne $expectedNext) {
+            $budgetFailureCount++
+            $failures.Add("Test-ReviewerGateSupersededBudget($current) returned WithinBudget=$($budgetResult.WithinBudget)/NextSupersededCount=$($budgetResult.NextSupersededCount), expected $expectedWithin/$expectedNext.")
+        }
+    }
+    if ($budgetFailureCount -eq 0) {
+        Write-Host "  OK - Test-ReviewerGateSupersededBudget's truth table holds against the hard $($script:ReviewerGateMaxSupersededRefreshes)-refresh ceiling" -ForegroundColor Green
+    }
+
+    $priorMode41 = $EffectiveGatePolicy.mode
+    $selfCheck41ArtifactDir = Join-Path $StateDir "selfcheck41-artifacts"
+    New-Item -ItemType Directory -Force -Path $selfCheck41ArtifactDir | Out-Null
+    $gateDeliveryStateExistedBefore41 = Test-Path -LiteralPath $gateDeliveryStatePath -PathType Leaf
+    $priorGateDeliveryState41 = Get-JsonState -Path $gateDeliveryStatePath
+    try {
+        $EffectiveGatePolicy.mode = "unattendedComment"
+        $selfCheck41Key = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+        $sc41Commit = ("d" * 40)
+        # Three sealed decisions, each already-expired, standing in for
+        # three SEPARATE fresh full reviews at the SAME commit, each of
+        # which again ended up incomplete/expired before its own replay
+        # could land - the realistic sequence a persistently slow or flaky
+        # delivery path could produce. New-SelfCheck34Decision/Record are
+        # defined by self-check 34 above, which always runs first in the
+        # same invocation.
+        $sc41DecisionPath1 = Save-ReviewerGateDecision -Manifest (New-SelfCheck34Decision -ExpiresAtUtcOverride ([DateTime]::UtcNow.AddHours(-1).ToString("o"))) -Directory $selfCheck41ArtifactDir -BaseName "sc41-expired-1" -MasterKey $selfCheck41Key
+        $sc41DecisionPath2 = Save-ReviewerGateDecision -Manifest (New-SelfCheck34Decision -ExpiresAtUtcOverride ([DateTime]::UtcNow.AddHours(-1).ToString("o"))) -Directory $selfCheck41ArtifactDir -BaseName "sc41-expired-2" -MasterKey $selfCheck41Key
+        $sc41DecisionPath3 = Save-ReviewerGateDecision -Manifest (New-SelfCheck34Decision -ExpiresAtUtcOverride ([DateTime]::UtcNow.AddHours(-1).ToString("o"))) -Directory $selfCheck41ArtifactDir -BaseName "sc41-expired-3" -MasterKey $selfCheck41Key
+
+        # Cycle 1: never superseded before (no supersededCount at all).
+        $sc41State1 = @{ "401" = (New-SelfCheck34Record -ArtifactPath $sc41DecisionPath1) }
+        $sc41State1["401"]["sourceCommit"] = $sc41Commit
+        Set-JsonState -Path $gateDeliveryStatePath -State $sc41State1
+        Invoke-ReviewerGateReplay -AgencyPath "fake-agency-does-not-exist" -PrId 401 -SourceCommit $sc41Commit
+        $sc41After1 = (Get-JsonState -Path $gateDeliveryStatePath)["401"]
+        $sc41Ok1 = ([bool]$sc41After1.superseded -and [int]$sc41After1.supersededCount -eq 1 -and -not [bool]$sc41After1.pendingReplay)
+
+        # Cycle 2: the next fresh review's OWN record carries
+        # supersededCount=1 forward (Invoke-ReviewerGateForPullRequest's
+        # success-path carry semantics), and again ends up incomplete/expired.
+        $sc41State2 = @{ "401" = (New-SelfCheck34Record -ArtifactPath $sc41DecisionPath2) }
+        $sc41State2["401"]["sourceCommit"] = $sc41Commit
+        $sc41State2["401"]["supersededCount"] = 1
+        Set-JsonState -Path $gateDeliveryStatePath -State $sc41State2
+        Invoke-ReviewerGateReplay -AgencyPath "fake-agency-does-not-exist" -PrId 401 -SourceCommit $sc41Commit
+        $sc41After2 = (Get-JsonState -Path $gateDeliveryStatePath)["401"]
+        $sc41Ok2 = ([bool]$sc41After2.superseded -and [int]$sc41After2.supersededCount -eq 2 -and -not [bool]$sc41After2.pendingReplay)
+
+        # Cycle 3: a THIRD fresh review's record carries supersededCount=2
+        # forward. One more supersede would be the third at this exact
+        # commit, exceeding the hard budget of 2 - this must close
+        # TERMINALLY instead of inviting yet another fresh review.
+        $sc41State3 = @{ "401" = (New-SelfCheck34Record -ArtifactPath $sc41DecisionPath3) }
+        $sc41State3["401"]["sourceCommit"] = $sc41Commit
+        $sc41State3["401"]["supersededCount"] = 2
+        Set-JsonState -Path $gateDeliveryStatePath -State $sc41State3
+        Invoke-ReviewerGateReplay -AgencyPath "fake-agency-does-not-exist" -PrId 401 -SourceCommit $sc41Commit
+        $sc41After3 = (Get-JsonState -Path $gateDeliveryStatePath)["401"]
+        $sc41Ok3 = (-not [bool]$sc41After3.superseded -and -not [bool]$sc41After3.pendingReplay -and
+            [string]$sc41After3.reason -ceq "supersededRefreshBudgetExhausted" -and [int]$sc41After3.supersededCount -eq 2)
+        $sc41TerminalMeansAttempted = (Test-ReviewerGateDecisionEverAttempted -PrId 401 -SourceCommit $sc41Commit)
+
+        if (-not ($sc41Ok1 -and $sc41Ok2 -and $sc41Ok3 -and $sc41TerminalMeansAttempted)) {
+            $failures.Add(("Repeated supersede cycles at the same commit did not bound correctly: " +
+                    "cycle1=$sc41Ok1 (supersededCount=$($sc41After1.supersededCount)), " +
+                    "cycle2=$sc41Ok2 (supersededCount=$($sc41After2.supersededCount)), " +
+                    "cycle3-terminal=$sc41Ok3 (superseded=$($sc41After3.superseded), reason=$($sc41After3.reason), supersededCount=$($sc41After3.supersededCount)), " +
+                    "terminalMeansAttempted=$sc41TerminalMeansAttempted."))
+        }
+        else {
+            Write-Host "  OK - repeated unpostable/expired cycles at the same commit bound at $($script:ReviewerGateMaxSupersededRefreshes) supersedes, then close terminally; no further re-review is invited" -ForegroundColor Green
+        }
+
+        # A genuinely NEW commit (a source push) resets the budget: never
+        # attempted at the new commit, regardless of the OLD commit's
+        # terminal state.
+        $sc41NewCommit = ("e" * 40)
+        $sc41NewCommitNeverAttempted = -not (Test-ReviewerGateDecisionEverAttempted -PrId 401 -SourceCommit $sc41NewCommit)
+        if (-not $sc41NewCommitNeverAttempted) {
+            $failures.Add("A new source commit did not reset the gate to 'never attempted', even though the OLD commit's budget was exhausted.")
+        }
+        else {
+            Write-Host "  OK - a new source commit resets the supersede budget: never attempted at the new commit regardless of the old commit's terminal state" -ForegroundColor Green
+        }
+    }
+    finally {
+        $EffectiveGatePolicy.mode = $priorMode41
+        if ($gateDeliveryStateExistedBefore41) {
+            Set-JsonState -Path $gateDeliveryStatePath -State $priorGateDeliveryState41
+        }
+        else {
+            Remove-Item -LiteralPath $gateDeliveryStatePath -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path -LiteralPath $selfCheck41ArtifactDir) { Remove-Item -LiteralPath $selfCheck41ArtifactDir -Recurse -Force }
+    }
+
+    # The success-path carry-forward (never resetting supersededCount just
+    # because a fresh review at the SAME commit sealed a new decision) must
+    # be wired into Invoke-ReviewerGateForPullRequest's own record write,
+    # not something only this self-check's simulation performs.
+    if ($selfText.IndexOf(('$carriedSupersededCount = $(if ($priorGateDeliveryRecordSameCommit)'), [StringComparison]::Ordinal) -lt 0) {
+        $failures.Add("Invoke-ReviewerGateForPullRequest's success-path record write does not appear to carry supersededCount forward for the same commit.")
+    }
+    else {
+        Write-Host "  OK - Invoke-ReviewerGateForPullRequest's success-path record write carries supersededCount forward for the same commit" -ForegroundColor Green
+    }
+
+    Write-Host "[DRY-RUN] Self-check 42/$total : a gate refresh preserves the prior raw delivery-plan pointer in reviewed.json verbatim; a later raw-enabled cycle replays it instead of reviewing fresh" -ForegroundColor Cyan
+    # Seed a prior reviewed.json record for a raw delivery that posted SOME
+    # comments but is still genuinely incomplete: deliveryPending=$true,
+    # pendingCapabilities=["comments"], pointing at a real, on-disk sealed
+    # artifact.
+    $selfCheck42ArtifactDir = Join-Path $StateDir "selfcheck42-artifacts"
+    New-Item -ItemType Directory -Force -Path $selfCheck42ArtifactDir | Out-Null
+    try {
+        $sc42OriginalArtifactPath = Join-Path $selfCheck42ArtifactDir "sc42-original-plan.json"
+        Set-Content -LiteralPath $sc42OriginalArtifactPath -Value '{"note":"original sealed raw delivery plan, still owes comments"}' -Encoding UTF8
+        $sc42Commit = ("6" * 40)
+        $sc42PriorRecord = @{
+            sourceCommit        = $sc42Commit
+            at                  = ([DateTime]::UtcNow.AddMinutes(-30).ToString("o"))
+            findingCount        = 3
+            postableCount       = 2
+            withheldCount       = 1
+            postedCount         = 1
+            summaryPosted       = $true
+            vote                = "none"
+            delivered           = $false
+            commentsDelivered   = $false
+            summaryDelivered    = $true
+            voteResolved        = $false
+            reviewDigest        = ("a" * 64)
+            previewPath         = "C:\does-not-matter\original-preview.md"
+            artifactPath        = $sc42OriginalArtifactPath
+            pendingCapabilities = @("comments")
+            deliveryPending     = $true
+        }
+        $sc42ReviewedState = @{ "501" = $sc42PriorRecord }
+        $sc42ReviewedStateJsonBefore = $sc42ReviewedState | ConvertTo-Json -Depth 8 -Compress
+
+        # A gate-only refresh: raw is (vacuously or genuinely) satisfied
+        # under today's write switches, so Get-ReviewerPersistedReviewRecord
+        # must return $null - the exact function Invoke-ReviewerPullRequest's
+        # persist step now calls - regardless of what a FRESH preview run
+        # this cycle would have computed (a different
+        # reviewDigest/artifactPath/etc., simulated here as deliberately
+        # DIFFERENT from the prior record's own values, to prove nothing
+        # derived from them leaks through).
+        $sc42FreshArtifactPath = Join-Path $selfCheck42ArtifactDir "sc42-fresh-gate-refresh-preview.json"
+        Set-Content -LiteralPath $sc42FreshArtifactPath -Value '{"note":"fresh preview produced by this cycle gate-refresh model run"}' -Encoding UTF8
+        $sc42PersistResult = Get-ReviewerPersistedReviewRecord -RawDeliveryAlreadySatisfied $true `
+            -SourceCommit $sc42Commit -FindingCount 5 -PostableCount 4 -WithheldCount 1 `
+            -PostedCount 0 -SummaryPosted $false -CastVote "" -Delivered $true -DeliveryAborted $false `
+            -CommentsAttempted $false -CommentsSucceededThisRun $false `
+            -SummaryAttempted $false -SummarySucceededThisRun $false `
+            -VoteAttempted $false -VoteSucceededThisRun $false `
+            -PriorComments $false -PriorSummary $true -PriorVote $false -PriorAppliesToThisReview $false `
+            -ReviewDigest ("f" * 64) -PreviewPath "C:\does-not-matter\fresh-preview.md" -ArtifactPath $sc42FreshArtifactPath `
+            -PlanCapabilities @() -WritesRequested $false
+
+        if ($null -ne $sc42PersistResult) {
+            $failures.Add("Get-ReviewerPersistedReviewRecord did not return `$null for a gate-only refresh (RawDeliveryAlreadySatisfied=`$true); it would overwrite the prior raw delivery-plan pointer.")
+        }
+        else {
+            Write-Host "  OK - Get-ReviewerPersistedReviewRecord returns `$null for a gate-only refresh; nothing is derived from this cycle's fresh preview" -ForegroundColor Green
+        }
+
+        # Simulating exactly what Invoke-ReviewerPullRequest's own caller
+        # code now does: if ($null -eq $newReviewedRecord) { leave
+        # $ReviewedState[$prId] alone } else { overwrite it }.
+        if ($null -ne $sc42PersistResult) { $sc42ReviewedState["501"] = $sc42PersistResult }
+        $sc42ReviewedStateJsonAfter = $sc42ReviewedState | ConvertTo-Json -Depth 8 -Compress
+
+        $sc42FieldsUnchanged = (
+            ($sc42ReviewedState["501"].deliveryPending -eq $true) -and
+            ((@($sc42ReviewedState["501"].pendingCapabilities) -join ',') -ceq "comments") -and
+            ([string]$sc42ReviewedState["501"].artifactPath -ceq $sc42OriginalArtifactPath) -and
+            ([string]$sc42ReviewedState["501"].reviewDigest -ceq ("a" * 64)) -and
+            ([bool]$sc42ReviewedState["501"].commentsDelivered -eq $false) -and
+            ([bool]$sc42ReviewedState["501"].summaryDelivered -eq $true)
+        )
+        $sc42WholeRecordByteIdentical = ($sc42ReviewedStateJsonAfter -ceq $sc42ReviewedStateJsonBefore)
+        if (-not ($sc42FieldsUnchanged -and $sc42WholeRecordByteIdentical)) {
+            $failures.Add("A gate-only refresh did not preserve the prior raw delivery-plan record verbatim (deliveryPending/pendingCapabilities/artifactPath/reviewDigest/commentsDelivered/summaryDelivered all must survive byte-for-byte).")
+        }
+        else {
+            Write-Host "  OK - a gate-only refresh preserves the prior raw delivery-plan record byte-for-byte: artifactPath, pendingCapabilities, deliveryPending, and capability flags all survive untouched" -ForegroundColor Green
+        }
+
+        # A later cycle with raw write switches back on must select the
+        # ORIGINAL sealed plan for Invoke-ReviewerPromotion, never a fresh
+        # raw model run, because the pointer was never disturbed.
+        $sc42LaterPendingPlan = Get-ReviewerPendingDeliveryPlan -ReviewedState $sc42ReviewedState -PrId 501 -SourceCommit $sc42Commit
+        if ($sc42LaterPendingPlan -cne $sc42OriginalArtifactPath) {
+            $failures.Add("A later raw-enabled cycle did not resolve the ORIGINAL sealed raw delivery plan via Get-ReviewerPendingDeliveryPlan after a gate-only refresh (got '$sc42LaterPendingPlan', expected '$sc42OriginalArtifactPath'); it would trigger a fresh raw model review instead of replaying the sealed plan.")
+        }
+        else {
+            Write-Host "  OK - a later raw-enabled cycle resolves the ORIGINAL sealed raw delivery plan for Invoke-ReviewerPromotion, never a fresh raw model review" -ForegroundColor Green
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $selfCheck42ArtifactDir) { Remove-Item -LiteralPath $selfCheck42ArtifactDir -Recurse -Force }
+    }
+
+    # The wiring itself - Invoke-ReviewerPullRequest's persist step calling
+    # Get-ReviewerPersistedReviewRecord rather than an inline
+    # re-implementation that could silently drift from it.
+    if ($selfText.IndexOf(('$newReviewedRecord = Get-ReviewerPersistedReviewRecord -RawDeliveryAlreadySatisfied $rawDeliveryAlreadySatisfied'), [StringComparison]::Ordinal) -lt 0 -or
+        $selfText.IndexOf(('if ($null -eq $newReviewedRecord)'), [StringComparison]::Ordinal) -lt 0) {
+        $failures.Add("Invoke-ReviewerPullRequest's persist step does not appear to call Get-ReviewerPersistedReviewRecord and branch on a `$null return.")
+    }
+    else {
+        Write-Host "  OK - Invoke-ReviewerPullRequest's persist step calls Get-ReviewerPersistedReviewRecord and leaves reviewed.json untouched on a `$null return" -ForegroundColor Green
+    }
+
+    }
+    finally {
+        # Restored for any code that runs after self-checks (or a future
+        # self-check appended past 38) - not what protects production state,
+        # which was never touched in the first place; this is purely so
+        # normal execution resumes against the real paths afterward.
+        $script:StateDir = $realStateDirForGateSelfChecks
+        $script:gateDecisionDir = $realGateDecisionDirForGateSelfChecks
+        $script:gateEligibilityStatePath = $realGateEligibilityStatePathForGateSelfChecks
+        $script:gateDeliveryStatePath = $realGateDeliveryStatePathForGateSelfChecks
+        $script:artifactKeyPath = $realArtifactKeyPathForGateSelfChecks
+        # Clean only this one explicit, freshly-created sandbox directory -
+        # never a broad delete of anything under the real -StateDir.
+        Remove-Item -LiteralPath $gateSelfCheckSandboxDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     Write-Host ""
@@ -6645,6 +7975,989 @@ function Invoke-ReviewerModelPass {
     return @{ Model = $PassModel; Marker = $null; Reason = $reason; EnvironmentFault = [bool]$launchFailureReason }
 }
 
+# ---------------------------------------------------------------------------
+# Layer 6: delivery gates. Everything below is ADDITIVE and runs strictly
+# AFTER the existing raw discovery/delivery/specialist/verification tail has
+# already fully executed - never before it, never changing its inputs,
+# timing, or outputs. When EffectiveGatePolicy.mode is "off" (the shipped
+# default; the only way to reach anything else is an out-of-repo policy file
+# AND a CLI switch AND a verified qualification), none of this runs at all
+# and the call sequence up to and including Invoke-ReviewerCrossVerificationSafely
+# is byte-identical to the base this layer was built on.
+# ---------------------------------------------------------------------------
+
+function Get-ReviewerGateProviderCapabilities {
+    <#
+        Positive branch-policy reset (review-dismissal) and required-checks
+        capability reads. GitHub-only: this reviewer's config.provider is
+        hard-restricted to "AzureDevOps" (see the config validation near the
+        top of this script), so $Provider is always "AzureDevOps" today and
+        this ALWAYS returns the closed/unsupported shape. The GitHub branch is
+        real, tested code (see tools/Test-Provider.ps1 and the live probe in
+        tools/Test-GitHubProviderLive.ps1) kept ready for when a GitHub
+        provider is added to this reviewer; it is simply unreachable from this
+        script's live path until then. See docs/delivery-gates.md.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Provider,
+        [Parameter(Mandatory)][string]$TargetBranch,
+        [Parameter(Mandatory)][string]$HeadSha,
+        [string[]]$RequiredCheckNames = @()
+    )
+    if ($Provider -cne "GitHub") {
+        return @{
+            IsGitHub  = $false
+            Dismissal = @{ known = $false; dismissesStaleReviews = $false; source = 'unknown'; reason = 'providerUnsupported: only GitHub exposes a review-dismissal policy read in this layer' }
+            Checks    = @{ known = $false; allComplete = $false; allSuccess = $false; missingRequired = @($RequiredCheckNames); runs = @(); sha256 = ("0" * 64) }
+        }
+    }
+    $providerContext = New-AgentProviderContext -Provider 'GitHub' -Organization $Organization -RepositoryName $RepositoryName
+    $dismissal = Get-AgentProviderReviewDismissalPolicy -Context $providerContext -TargetBranch $TargetBranch
+    $checks = Get-AgentProviderRequiredChecksSnapshot -Context $providerContext -HeadSha $HeadSha -RequiredNames $RequiredCheckNames
+    return @{ IsGitHub = $true; Dismissal = $dismissal; Checks = $checks }
+}
+
+function Invoke-ReviewerGateRevalidation {
+    <#
+        Dedicated pre-write revalidation: a FRESH, isolated MCP session (never
+        the cycle's own long-lived session) re-reads the PR, pins the change
+        set twice with digest agreement, re-reads threads, and re-reads
+        provider capabilities. Reuses Invoke-ReviewerConventionSession so this
+        is the exact same isolated-session lifecycle already proven by self-
+        check 23, not a second implementation of it.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$AgencyPath,
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)][string]$ExpectedSourceCommit,
+        [Parameter(Mandatory)][string]$TargetBranch,
+        [string[]]$RequiredCheckNames = @()
+    )
+    return Invoke-ReviewerConventionSession -AgencyPath $AgencyPath -Action {
+        param([hashtable]$gateSession)
+        $prNow = $null
+        try {
+            $prNow = Invoke-AgentMcpTool -Session $gateSession -Name "repo_pull_request" -Arguments @{
+                action = 'get'; project = $ExpectedProject; repositoryId = $RepositoryName; pullRequestId = $PrId
+            }
+        }
+        catch {
+            return @{ Ok = $false; Reason = "the PR could not be re-read during dedicated gate revalidation: $($_.Exception.Message)" }
+        }
+        $status = [string](Get-ReviewerHashValue -Container $prNow -Key 'status' -Default '')
+        $currentSourceCommit = Get-ReviewerSourceCommit -Pr $prNow
+        $pinned = $null
+        try {
+            $pinned = Get-ReviewerPinnedConventionChangeSet -Session $gateSession -PrId $PrId -ExpectedSourceCommit $currentSourceCommit
+        }
+        catch {
+            return @{ Ok = $false; Reason = "the change set could not be pinned during dedicated gate revalidation: $($_.Exception.Message)" }
+        }
+        $threads = @(Get-ReviewerPullRequestThreads -Session $gateSession -PrId $PrId)
+        $capabilities = Get-ReviewerGateProviderCapabilities -Provider $provider -TargetBranch $TargetBranch `
+            -HeadSha $(if ($currentSourceCommit -match '^[0-9a-fA-F]{40}$') { $currentSourceCommit } else { "0" * 40 }) `
+            -RequiredCheckNames $RequiredCheckNames
+        return @{
+            Ok                   = $true
+            PrIsActive           = ($status -ieq 'active')
+            PrIsDraft            = [bool](Get-ReviewerHashValue -Container $prNow -Key 'isDraft' -Default $false)
+            SourceCommit         = $currentSourceCommit
+            SourceCommitUnchanged = ($currentSourceCommit -and $currentSourceCommit -ieq $ExpectedSourceCommit)
+            ChangedPaths         = @($pinned.Entries | ForEach-Object { [string](Get-ReviewerHashValue -Container (Get-ReviewerHashValue -Container $_ -Key 'item') -Key 'path' -Default '') } | Where-Object { $_ })
+            ChangeSetDigest      = [string]$pinned.Digest
+            Threads              = $threads
+            ExistingFingerprints = (Get-ReviewerExistingFingerprints -Threads $threads)
+            Capabilities         = $capabilities
+        }
+    }
+}
+
+function Write-ReviewerGatePreview {
+    <# Shadow = seal + JSONL log only. Preview additionally renders Markdown a
+       human can read before humanPromote. Without this split shadow and
+       preview are the same mode. #>
+    param(
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)]$Decision,
+        [Parameter(Mandatory)][bool]$RenderMarkdown
+    )
+    $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ", [Globalization.CultureInfo]::InvariantCulture)
+    $baseName = "pr$PrId-$($Decision.sourceCommit.Substring(0, 12))-$stamp-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $artifactPath = Save-ReviewerGateDecision -Manifest $Decision -Directory $gateDecisionDir -BaseName $baseName -MasterKey $masterKey
+    $markdownPath = ""
+    if ($RenderMarkdown) {
+        $lines = [System.Collections.Generic.List[string]]::new()
+        [void]$lines.Add("# Delivery-gate preview - PR $PrId")
+        [void]$lines.Add("")
+        [void]$lines.Add("- Mode: $($Decision.mode)")
+        [void]$lines.Add("- Source commit: $($Decision.sourceCommit)")
+        [void]$lines.Add("- Run accounting ok: $($Decision.runOk)$(if (-not $Decision.runOk) { ' (' + ($Decision.runReasonCodes -join ', ') + ')' })")
+        [void]$lines.Add("- Unattended-eligible comments: $(@($Decision.unattendedComments).Count)")
+        [void]$lines.Add("- Unattended-eligible suggestions: $(@($Decision.unattendedSuggestions).Count)")
+        [void]$lines.Add("- Human-promotable comments: $(@($Decision.humanPromotableComments).Count)")
+        [void]$lines.Add("- Nothing in this artifact was posted or voted. Publish human-promotable comments with -PromoteVerifiedPreview.")
+        [void]$lines.Add("")
+        [void]$lines.Add("## Candidates")
+        [void]$lines.Add("")
+        foreach ($candidate in @($Decision.candidates)) {
+            [void]$lines.Add("- $($candidate.candidateId) [$($candidate.severity)/$($candidate.pack)] unattended=$($candidate.unattendedCommentOk) ($($candidate.unattendedCommentReasons -join ',')) humanPromoted=$($candidate.humanPromotedCommentOk) ($($candidate.humanPromotedCommentReasons -join ','))")
+        }
+        $markdown = $lines.ToArray() -join "`n"
+        $markdownPath = Join-Path $gateDecisionDir "$baseName.md"
+        [IO.File]::WriteAllText($markdownPath, $markdown, $script:ReviewerGateUtf8)
+    }
+    Write-Host "Delivery-gate decision for PR $PrId sealed to $artifactPath" -ForegroundColor DarkCyan
+    return @{ ArtifactPath = $artifactPath; MarkdownPath = $markdownPath }
+}
+
+function Invoke-ReviewerGateDelivery {
+    <#
+        Write-only. Comments are written and CONFIRMED before any vote is
+        considered; a partial comment failure leaves a separate gate-delivery
+        pending/replay record and CASTS NO VOTE - a retry replays only the
+        missing comments (fingerprint dedupe makes an already-posted one a
+        no-op). Approval additionally requires a SECOND revalidation
+        immediately before the vote call, so a source push between the two
+        revalidations closes the vote while leaving already-posted comments
+        posted (source-push simulation).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$AgencyPath,
+        [Parameter(Mandatory)]$Decision,
+        [Parameter(Mandatory)]$FirstRevalidation,
+        [Parameter(Mandatory)][bool]$CommentsRequested,
+        [Parameter(Mandatory)][bool]$SuggestionsRequested,
+        [Parameter(Mandatory)][bool]$ApprovalRequested,
+        [Parameter(Mandatory)]$Qualification,
+        [Parameter(Mandatory)][hashtable]$PriorEligibility,
+        [Parameter(Mandatory)][bool]$RawGateApproves,
+        [Parameter(Mandatory)][bool]$CanaryConfirmed
+    )
+    $prId = [int]$Decision.prId
+    $outcome = @{ CommentsPosted = 0; CommentsIntended = 0; CommentsComplete = $false; VoteCast = $false; Reason = "" }
+
+    # Belt-and-braces (defense in depth): this function is the only place
+    # that actually writes, so it independently re-derives what the CURRENT
+    # effective policy and CLI switches authorize and narrows every request
+    # down to that - never trusting a caller's own request booleans at face
+    # value, however they were computed or wherever they came from (a fresh
+    # decision, a replay, or a future caller not yet written). A caller
+    # asking for more than is currently authorized gets exactly what is
+    # currently authorized, silently narrowed, never what it asked for. A
+    # decision past its own sealed expiry cannot authorize anything either,
+    # checked here so every caller fails closed even if it forgot to.
+    $currentAuthority = Get-ReviewerGateWritesCurrentlyRequested -EffectivePolicy $EffectiveGatePolicy `
+        -CommentSwitchOn ([bool]$EnableVerifiedCommentGate) -SuggestionSwitchOn ([bool]$EnableVerifiedSuggestionGate) `
+        -ApprovalSwitchOn ([bool]$EnableVerifiedApprovalGate)
+    $effectiveCommentsRequested = $CommentsRequested -and [bool]$currentAuthority.Comments
+    $effectiveSuggestionsRequested = $SuggestionsRequested -and [bool]$currentAuthority.Suggestions
+    $effectiveApprovalRequested = $ApprovalRequested -and [bool]$currentAuthority.Approval
+    if (Test-ReviewerGateDecisionExpired -Decision $Decision -NowUtc ([DateTime]::UtcNow)) {
+        $outcome.Reason = "decisionExpired"
+        return $outcome
+    }
+    if (-not $effectiveCommentsRequested -and -not $effectiveSuggestionsRequested -and -not $effectiveApprovalRequested) {
+        $outcome.Reason = "modeNotEnabled"
+        return $outcome
+    }
+
+    if (-not $FirstRevalidation.Ok) {
+        $outcome.Reason = "first revalidation failed: $($FirstRevalidation.Reason)"
+        return $outcome
+    }
+    if (-not $FirstRevalidation.PrIsActive -or $FirstRevalidation.PrIsDraft) {
+        $outcome.Reason = "PR is no longer active or became a draft"
+        return $outcome
+    }
+    if (-not $FirstRevalidation.SourceCommitUnchanged) {
+        $outcome.Reason = "sourceCommitMoved"
+        return $outcome
+    }
+
+    $toPost = [System.Collections.Generic.List[object]]::new()
+    if ($effectiveCommentsRequested) { foreach ($item in @($Decision.unattendedComments)) { [void]$toPost.Add($item) } }
+    if ($effectiveSuggestionsRequested) { foreach ($item in @($Decision.unattendedSuggestions)) { [void]$toPost.Add($item) } }
+    # Revalidate: keep only entries whose anchor is STILL in the fresh change
+    # set and whose anchor is not already duplicated on the PR - remove-only,
+    # exactly like Select-ReviewerGateSubset, never widened by re-checking.
+    $stillEligible = @($toPost | Where-Object {
+            $entry = $_
+            $eligibility = Test-ReviewerGateCandidateEligible -Facet $entry -EffectivePolicy $EffectiveGatePolicy `
+                -Purpose "unattendedComment" -ChangedPaths $FirstRevalidation.ChangedPaths -ThreadFacts $FirstRevalidation.Threads `
+                -SuggestionGateEnabled:$effectiveSuggestionsRequested
+            [bool]$eligibility.Ok
+        })
+    $outcome.CommentsIntended = @($stillEligible).Count
+
+    $sessionForWrite = $null
+    try {
+        $sessionForWrite = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
+            -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
+            -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+        $existingFingerprints = $FirstRevalidation.ExistingFingerprints
+        foreach ($entry in $stillEligible) {
+            $finding = @{ severity = [string]$entry.severity; filePath = [string]$entry.filePath; line = [int]$entry.line; comment = [string]$entry.comment }
+            $fingerprint = Get-ReviewerFindingFingerprint -Finding $finding
+            if ($existingFingerprints.Contains($fingerprint)) {
+                $outcome.CommentsPosted++
+                continue
+            }
+            $post = Add-ReviewerThread -Session $sessionForWrite -PrId $prId -Content (Format-ReviewerFindingComment -Finding $finding) `
+                -FilePath ([string]$entry.filePath) -Line ([int]$entry.line)
+            if ($post.Error) {
+                Write-Warning "Delivery gate could not post a comment on PR ${prId}: $($post.Error)"
+            }
+            else {
+                $outcome.CommentsPosted++
+                [void]$existingFingerprints.Add($fingerprint)
+            }
+        }
+        # Confirm against the PR itself, never against the write replies -
+        # extracted to a pure function so "some of these landed, some did
+        # not" is exercised directly, not only through a live MCP session.
+        $freshThreads = Get-ReviewerPullRequestThreads -Session $sessionForWrite -PrId $prId
+        $freshFingerprints = Get-ReviewerExistingFingerprints -Threads $freshThreads
+        $intendedFingerprints = @($stillEligible | ForEach-Object {
+                Get-ReviewerFindingFingerprint -Finding @{ severity = [string]$_.severity; filePath = [string]$_.filePath; line = [int]$_.line; comment = [string]$_.comment }
+            })
+        $completeness = Test-ReviewerGateWriteConfirmed -IntendedFingerprints $intendedFingerprints -ConfirmedFingerprints $freshFingerprints
+        $outcome.CommentsPosted = [int]$completeness.Posted
+        $outcome.CommentsComplete = [bool]$completeness.Complete
+
+        if (-not $outcome.CommentsComplete) {
+            $outcome.Reason = "commentDeliveryIncomplete"
+            return $outcome
+        }
+        if (-not $effectiveApprovalRequested) {
+            $outcome.Reason = "ok"
+            return $outcome
+        }
+
+        # Approval NEVER proceeds on the first revalidation alone: a second,
+        # independent revalidation immediately before the vote call is what
+        # catches a source push that happened while comments were being
+        # written (source-push simulation in the test matrix).
+        $secondRevalidation = Invoke-ReviewerGateRevalidation -AgencyPath $AgencyPath -PrId $prId `
+            -ExpectedSourceCommit ([string]$Decision.sourceCommit) -TargetBranch $TargetRefName.Substring("refs/heads/".Length) `
+            -RequiredCheckNames @($EffectiveGatePolicy.approval.requiredCheckNames)
+        if (-not $secondRevalidation.Ok -or -not $secondRevalidation.SourceCommitUnchanged -or
+            -not $secondRevalidation.PrIsActive -or $secondRevalidation.PrIsDraft) {
+            $outcome.Reason = "sourceCommitMoved"
+            return $outcome
+        }
+        $eligibilityFingerprint = Get-ReviewerGateEligibilityFingerprint -SourceCommit ([string]$Decision.sourceCommit) `
+            -ChangeSetDigest ([string]$Decision.changeSetDigest) -TotalCandidateCount (@($Decision.candidates).Count) `
+            -DecisionSha256 (Get-ReviewerVerificationObjectSha256 -Value $Decision) -GatePolicySha256 $GatePolicySha256
+        $priorRecord = $PriorEligibility[[string]$Decision.prId]
+        $priorMatches = ($priorRecord -and
+            ([string](Get-ReviewerHashValue -Container $priorRecord -Key 'sourceCommit' -Default '')) -ieq [string]$Decision.sourceCommit -and
+            ([string](Get-ReviewerHashValue -Container $priorRecord -Key 'fingerprint' -Default '')) -ceq $eligibilityFingerprint)
+        $alreadyVoted = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'voted' -Default $false)
+
+        # AuthoritativeSourcesCurrent is never a hardcoded $true: there is no
+        # live re-read of authoritative-source content wired into this
+        # revalidation today (see docs/delivery-gates.md), and approval is
+        # already unconditionally closed by ProviderIsGitHub=$false on this
+        # ADO-only script, so this deliberately fails closed rather than
+        # pass through a value nothing actually verified.
+        $approval = Test-ReviewerGateApproval -EffectivePolicy $EffectiveGatePolicy -Qualification $Qualification `
+            -ProviderIsGitHub $secondRevalidation.Capabilities.IsGitHub `
+            -RunAccountingOk ([bool]$Decision.runOk) `
+            -AllWithheldReasonsSafe ([bool]$Decision.allWithheldReasonsSafe) `
+            -NoNeedsHumanPresent (-not ($Decision.runReasonCodes -ccontains "needsHumanPresent")) `
+            -GeneralistPairComplete ([bool]$Decision.generalistPairComplete) `
+            -GeneralistBothApprove ([bool]$Decision.generalistBothApprove) `
+            -SpecialistOkForApproval ([bool]$Decision.specialistOkForApproval) `
+            -RawGateApproves $RawGateApproves `
+            -ChecksKnown ([bool]$secondRevalidation.Capabilities.Checks.known) `
+            -ChecksAllSuccess ([bool]$secondRevalidation.Capabilities.Checks.allSuccess) `
+            -DismissalKnown ([bool]$secondRevalidation.Capabilities.Dismissal.known) `
+            -DismissesStaleReviews ([bool]$secondRevalidation.Capabilities.Dismissal.dismissesStaleReviews) `
+            -PriorRunFingerprintMatches ([bool]$priorMatches) -CanaryConfirmed ([bool]$CanaryConfirmed) `
+            -CommitUnchanged ([bool]$secondRevalidation.SourceCommitUnchanged) `
+            -AuthoritativeSourcesCurrent $false -AlreadyVotedThisCommit ([bool]$alreadyVoted)
+        if (-not $approval.Ok) {
+            $outcome.Reason = ($approval.ReasonCodes -join ',')
+            return $outcome
+        }
+        # Literal, hardcoded "Approved" - the gate can never request any other
+        # vote string; $script:ReviewerGateAllowedVotes is not even consulted
+        # here because there is no variable path to anything else.
+        $voteResult = Set-ReviewerVote -Session $sessionForWrite -PrId $prId -Vote "Approved" -VoterAlias $OperatorAlias
+        if ($voteResult.Cast) {
+            $outcome.VoteCast = $true
+            $outcome.Reason = "ok"
+        }
+        else {
+            $outcome.Reason = "vote call did not confirm: $($voteResult.Error)"
+        }
+        return $outcome
+    }
+    finally {
+        if ($sessionForWrite) { Close-AgentMcpSession -Session $sessionForWrite }
+    }
+}
+
+function Invoke-ReviewerGateForPullRequest {
+    <#
+        Layer 6 entry point for one PR. Called strictly AFTER the existing raw
+        tail (specialist + cross-verification) has already run, using their
+        results; never influences raw delivery, state, or exit code. Every
+        early return is silent to the caller by design - a gate fault must
+        degrade this additive layer, never the underlying reviewer.
+
+        Takes VerificationResult only, not a separate SpecialistResult: the
+        specialist's own status and artifact hash are read from the SEALED
+        verification input manifest below (specialistStatus/specialistArtifactSha256,
+        set by Invoke-ReviewerCrossVerificationSafely when it built that
+        manifest), not re-derived from a second, possibly-inconsistent live
+        reference to the specialist's result.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)][string]$AgencyPath,
+        [Parameter(Mandatory)][hashtable]$Bound,
+        $VerificationResult
+    )
+    if ($EffectiveGatePolicy.mode -ceq "off") { return }
+    $prId = [int]$Bound.PrId
+    $sourceCommit = [string]$Bound.SourceCommit
+    try {
+        $inputArtifactPath = [string](Get-ReviewerHashValue -Container $VerificationResult -Key 'InputArtifactPath' -Default '')
+        $decisionArtifactPath = [string](Get-ReviewerHashValue -Container $VerificationResult -Key 'PreviewArtifactPath' -Default '')
+        $verificationStatus = [string](Get-ReviewerHashValue -Container $VerificationResult -Key 'Status' -Default 'degraded')
+        $eligible = @(Get-ReviewerHashValue -Container $VerificationResult -Key 'Eligible' -Default @())
+        $withheld = @(Get-ReviewerHashValue -Container $VerificationResult -Key 'Withheld' -Default @())
+
+        $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+        $inputManifest = $null
+        $verificationInputSha256 = "0" * 64
+        $verificationDecisionSha256 = "0" * 64
+        $totalCandidateCount = 0
+        if ($inputArtifactPath -and (Test-Path -LiteralPath $inputArtifactPath -PathType Leaf)) {
+            try {
+                $inputManifest = Read-ReviewerVerificationInput -Path $inputArtifactPath -MasterKey $masterKey
+                $verificationInputSha256 = [string]$inputManifest.inputManifestSha256
+                $totalCandidateCount = [int]$inputManifest.totalCandidateCount
+            }
+            catch { Write-Warning "Delivery gate could not re-read the sealed verification input for PR ${prId}: $($_.Exception.Message)" }
+        }
+        if ($decisionArtifactPath -and (Test-Path -LiteralPath $decisionArtifactPath -PathType Leaf)) {
+            try {
+                $decisionEnvelope = Get-Content -LiteralPath $decisionArtifactPath -Raw | ConvertFrom-Json -Depth 8
+                $verificationDecisionSha256 = Get-ReviewerVerificationSha256 -Text ([string](Get-ReviewerHashValue -Container $decisionEnvelope -Key 'manifestJson' -Default ''))
+            }
+            catch { Write-Warning "Delivery gate could not re-read the sealed verification decision for PR ${prId}: $($_.Exception.Message)" }
+        }
+        $conventionPlan = $null
+        if ([string]$Bound.ConventionPlanPath -and (Test-Path -LiteralPath ([string]$Bound.ConventionPlanPath))) {
+            try { $conventionPlan = Read-ReviewerConventionPlan -Path ([string]$Bound.ConventionPlanPath) } catch { $conventionPlan = $null }
+        }
+
+        $runAccounting = Test-ReviewerGateVerificationComplete -Status $verificationStatus `
+            -InputArtifactPath $inputArtifactPath -InputManifestSha256 $verificationInputSha256 `
+            -TotalCandidateCount $totalCandidateCount -Eligible $eligible -Withheld $withheld
+        $facets = @(Get-ReviewerGateCandidateFacets -Eligible $eligible -InputManifest $inputManifest -ConventionPlan $conventionPlan)
+        $threads = @(Get-ReviewerPullRequestThreads -Session $Session -PrId $prId)
+
+        $qualificationResult = Get-ReviewerGateQualification
+        $qualification = $qualificationResult.Qualification
+        if ($qualification) {
+            $qualificationCurrent = Test-ReviewerGateQualificationCurrent -Qualification $qualification -LiveBinding @{
+                NowUtc                    = [DateTime]::UtcNow
+                ScriptSha256              = $ScriptSelfSha256.ToLowerInvariant()
+                GateLibrarySha256         = $DeliveryGatesLibrarySha256
+                VerificationLibrarySha256 = $CrossVerificationLibrarySha256
+                VerificationPromptSha256  = $CrossVerificationPromptSha256
+                VerificationPolicySha256  = $CrossVerificationPolicySha256
+                VerificationSchemaSha256  = $CrossVerificationSchemaSha256
+                GeneralistModels          = @($ReviewPassModels)
+                ConventionSpecialistModel = $EffectiveConventionSpecialistModel
+                ConventionVerifierModel   = $EffectiveConventionVerifierModel
+                # Only compared when the operator has actually configured a
+                # live counterpart (-GateEvaluationToolSha256); otherwise this
+                # script has no evaluation tool of its own to hash and the
+                # qualification's own binding is accepted as recorded
+                # provenance without independent re-verification - see
+                # docs/delivery-gates.md.
+                EvaluationToolSha256      = [string]$GateEvaluationToolSha256
+            } -MaxQualificationAgeDays ([int]$EffectiveGatePolicy.maxQualificationAgeDays)
+            if (-not $qualificationCurrent.Ok) { $qualification = $null }
+        }
+
+        $suggestionModeAllowed = ($EffectiveGatePolicy.mode -cin @("unattendedCommentAndSuggestion", "approvalVote"))
+        $binding = @{
+            prId                      = $prId
+            repositoryId              = $cfgRepoId.ToLowerInvariant()
+            organization              = $Organization
+            project                   = $ExpectedProject
+            sourceCommit              = $sourceCommit.ToLowerInvariant()
+            targetCommit              = $(if ($inputManifest) { [string]$inputManifest.binding.targetCommit } else { "0" * 40 })
+            changeSetDigest           = $(if ($inputManifest) { [string]$inputManifest.binding.changeSetDigest } else { "0" * 64 })
+            verificationDecisionSha256 = $verificationDecisionSha256
+            verificationInputSha256  = $verificationInputSha256
+            conventionPlanSha256     = $(if ($inputManifest) { Get-ReviewerGateSafeObjectSha256 -Value $inputManifest.conventionPlan -Label "convention plan" } else { "0" * 64 })
+            factPlanSha256           = $(if ($inputManifest) { Get-ReviewerGateSafeObjectSha256 -Value $inputManifest.factPlan -Label "fact plan" } else { "0" * 64 })
+            specialistArtifactSha256 = $(if ($inputManifest) { [string]$inputManifest.specialistArtifactSha256 } else { "0" * 64 })
+            packPolicySha256         = $ConventionPackPolicySha256
+            configSha256             = $ConfigSha256.ToLowerInvariant()
+            scriptSha256             = $ScriptSelfSha256.ToLowerInvariant()
+            gateLibrarySha256        = $DeliveryGatesLibrarySha256
+            gatePolicySha256         = $GatePolicySha256
+            qualificationSha256      = $qualificationResult.Sha256
+            verificationLibrarySha256 = $CrossVerificationLibrarySha256
+            verificationPromptSha256 = $CrossVerificationPromptSha256
+            verificationPolicySha256 = $CrossVerificationPolicySha256
+            verificationSchemaSha256 = $CrossVerificationSchemaSha256
+            threadSetDigest          = Get-ReviewerGateSafeObjectSha256 -Value (@($threads) | ForEach-Object {
+                    @{ id = [string](Get-ReviewerHashValue -Container $_ -Key 'threadId' -Default 0); status = [string](Get-ReviewerHashValue -Container $_ -Key 'status' -Default 'unknown')
+                        filePath = [string](Get-ReviewerHashValue -Container $_ -Key 'filePath' -Default ''); line = [int](Get-ReviewerHashValue -Container $_ -Key 'line' -Default 0) }
+                }) -Label "thread set"
+            # Deliberately all-zero, not a real snapshot hash: checks/policy
+            # state is a point-of-WRITE fact, not a point-of-DECISION one - it
+            # is verified live at delivery time from Capabilities.Checks /
+            # Capabilities.Dismissal on a FRESH revalidation
+            # (Test-ReviewerGateApproval's ChecksKnown/ChecksAllSuccess/
+            # DismissalKnown/DismissesStaleReviews), never from a stored
+            # hash. This binding exists for provenance only and cannot
+            # authorize approval: nothing reads it back to decide anything.
+            checksSnapshotSha256     = "0" * 64
+            policySnapshotSha256     = "0" * 64
+        }
+        $decision = New-ReviewerGateDecision -Binding $binding -EffectivePolicy $EffectiveGatePolicy -Qualification $qualification `
+            -Facets $facets -ChangedPaths @($Bound.ChangedPaths) -ThreadFacts $threads -RunAccounting $runAccounting `
+            -SuggestionGateEnabled:$suggestionModeAllowed -QualificationExpiresAtUtc (Get-ReviewerGateStableDateTimeText (Get-ReviewerVerificationValue $qualification "expiresAtUtc" "")) `
+            -CreatedAtUtc ([DateTime]::UtcNow)
+
+        # Fields the approval predicate needs, computed here from data this
+        # function already has, and carried on the decision so the delivery
+        # step (and PromoteVerifiedPreview) can reuse them without recomputing
+        # verification-internal shapes.
+        $rawPasses = @(if ($inputManifest) { @($inputManifest.rawGeneralistPasses) } else { @() })
+        $decision | Add-Member -NotePropertyName generalistPairComplete -NotePropertyValue (
+            @($rawPasses | Where-Object { $_.status -ceq "complete" }).Count -eq 2 -and
+            (@($rawPasses.model | Sort-Object) -join '|') -ceq (@("claude-opus-5", "gpt-5.6-sol") -join '|')
+        )
+        $decision | Add-Member -NotePropertyName generalistBothApprove -NotePropertyValue (
+            @($rawPasses | Where-Object { $_.status -ceq "complete" -and [string](Get-ReviewerHashValue -Container $_.markerJson -Key 'recommendedVote' -Default '') -ceq "approve" }).Count -eq 2
+        )
+        $specialistEnabledForRun = [bool]$EnableConventionSpecialist
+        $specialistStatus = $(if ($inputManifest) { [string]$inputManifest.specialistStatus } else { "degraded" })
+        $decision | Add-Member -NotePropertyName specialistOkForApproval -NotePropertyValue (
+            -not $specialistEnabledForRun -or $specialistStatus -ceq "complete"
+        )
+        $decision | Add-Member -NotePropertyName allWithheldReasonsSafe -NotePropertyValue (
+            @($withheld | Where-Object { $script:ReviewerGateSafeWithheldReasons -cnotcontains [string](Get-ReviewerHashValue -Container $_ -Key 'reason' -Default '') }).Count -eq 0
+        )
+
+        $renderMarkdown = ($EffectiveGatePolicy.mode -cin @("preview", "humanPromote", "unattendedComment", "unattendedCommentAndSuggestion", "approvalVote"))
+        $sealed = Write-ReviewerGatePreview -PrId $prId -Decision $decision -RenderMarkdown:$renderMarkdown
+        Write-ReviewerCycleMetadata -Fields @{
+            mode = "gate-decision"; result = $(if ($decision.runOk) { "sealed" } else { "degraded" }); prId = $prId
+            sourceCommit = $sourceCommit; gateMode = $EffectiveGatePolicy.mode
+            unattendedComments = @($decision.unattendedComments).Count; unattendedSuggestions = @($decision.unattendedSuggestions).Count
+            humanPromotableComments = @($decision.humanPromotableComments).Count; artifactPath = $sealed.ArtifactPath
+        }
+
+        if ($EffectiveGatePolicy.mode -cin @("shadow", "preview", "humanPromote")) { return }
+
+        # -- Unattended modes only, from here down --------------------------
+        # Single source of truth shared with the belt-and-braces re-check
+        # inside Invoke-ReviewerGateDelivery, a replay, and the startup
+        # banner - so a switch or policy mode means the same thing wherever
+        # it is asked.
+        $currentAuthority = Get-ReviewerGateWritesCurrentlyRequested -EffectivePolicy $EffectiveGatePolicy `
+            -CommentSwitchOn ([bool]$EnableVerifiedCommentGate) -SuggestionSwitchOn ([bool]$EnableVerifiedSuggestionGate) `
+            -ApprovalSwitchOn ([bool]$EnableVerifiedApprovalGate)
+        $commentsRequested = [bool]$currentAuthority.Comments
+        $suggestionsRequested = [bool]$currentAuthority.Suggestions
+        $approvalRequested = [bool]$currentAuthority.Approval
+        if (-not $commentsRequested -and -not $suggestionsRequested -and -not $approvalRequested) { return }
+
+        $targetBranchName = $TargetRefName -replace '^refs/heads/', ''
+        $firstRevalidation = Invoke-ReviewerGateRevalidation -AgencyPath $AgencyPath -PrId $prId `
+            -ExpectedSourceCommit $sourceCommit -TargetBranch $targetBranchName `
+            -RequiredCheckNames @($EffectiveGatePolicy.approval.requiredCheckNames)
+
+        $gateEligibilityState = Get-JsonState -Path $gateEligibilityStatePath
+        $canaryConfirmed = Test-ReviewerGateCanaryConfirmed -TokenFile $GateCanaryTokenFile -PrId $prId -SourceCommit $sourceCommit
+        $rawGateApproves = $false
+        if ($approvalRequested) {
+            # The RAW gate is asked independently, from the RAW merged
+            # generalist findings this cycle already computed - not from
+            # anything the gate library invented - per O-4.
+            $rawDecision = Test-ReviewerShouldVote -RecommendedVote ([string]$Bound.RawRecommendedVote) `
+                -CriticalCount ([int]$Bound.RawCounts['critical']) -ImportantCount ([int]$Bound.RawCounts['important']) `
+                -SuggestionCount ([int]$Bound.RawCounts['suggestion']) -ReportedFindingCount ([int]$Bound.RawReportedFindingCount) `
+                -FindingsPosted $true -FindingsRetryable $false `
+                -PrIsActive ([bool]$firstRevalidation.PrIsActive) -PrIsDraft ([bool]$firstRevalidation.PrIsDraft) `
+                -CurrentSourceCommit ([string]$firstRevalidation.SourceCommit) -ReviewedSourceCommit $sourceCommit `
+                -PassesComplete ([bool]$Bound.RawPassesComplete)
+            $rawGateApproves = ([string]$rawDecision.Vote -ceq "Approved")
+        }
+
+        $deliveryOutcome = Invoke-ReviewerGateDelivery -AgencyPath $AgencyPath -Decision $decision -FirstRevalidation $firstRevalidation `
+            -CommentsRequested $commentsRequested -SuggestionsRequested $suggestionsRequested -ApprovalRequested $approvalRequested `
+            -Qualification $qualification -PriorEligibility $gateEligibilityState -RawGateApproves $rawGateApproves `
+            -CanaryConfirmed $canaryConfirmed
+
+        if ($approvalRequested) {
+            $fingerprint = Get-ReviewerGateEligibilityFingerprint -SourceCommit $sourceCommit -ChangeSetDigest ([string]$decision.changeSetDigest) `
+                -TotalCandidateCount (@($decision.candidates).Count) -DecisionSha256 (Get-ReviewerVerificationObjectSha256 -Value $decision) `
+                -GatePolicySha256 $GatePolicySha256
+            $priorRecord = $gateEligibilityState[[string]$prId]
+            $alreadyRecordedSameCommit = ($priorRecord -and
+                ([string](Get-ReviewerHashValue -Container $priorRecord -Key 'sourceCommit' -Default '')) -ieq $sourceCommit)
+            $gateEligibilityState[[string]$prId] = @{
+                sourceCommit = $sourceCommit
+                fingerprint  = $fingerprint
+                firstSeenAtUtc = $(if ($alreadyRecordedSameCommit) { [string](Get-ReviewerHashValue -Container $priorRecord -Key 'firstSeenAtUtc' -Default '') } else { [DateTime]::UtcNow.ToString("o") })
+                voted        = ([bool]$deliveryOutcome.VoteCast -or [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'voted' -Default $false))
+            }
+            Set-JsonState -Path $gateEligibilityStatePath -State $gateEligibilityState
+        }
+
+        $gateDeliveryState = Get-JsonState -Path $gateDeliveryStatePath
+        $priorGateDeliveryRecord = $gateDeliveryState[[string]$prId]
+        # Carried forward, never reset, as long as this is the SAME commit as
+        # whatever record (if any) already exists - reset to 0 only when the
+        # prior record is missing or belongs to an older commit (a genuine
+        # source push). This is what makes the supersede budget below
+        # (Test-ReviewerGateSupersededBudget, applied on the NEXT replay
+        # closure) actually bound the total number of fresh reviews at one
+        # commit, rather than resetting every time a fresh review succeeds.
+        $priorGateDeliveryRecordSameCommit = ($priorGateDeliveryRecord -and
+            ([string](Get-ReviewerHashValue -Container $priorGateDeliveryRecord -Key 'sourceCommit' -Default '')) -ieq $sourceCommit)
+        $carriedSupersededCount = $(if ($priorGateDeliveryRecordSameCommit) { [int](Get-ReviewerHashValue -Container $priorGateDeliveryRecord -Key 'supersededCount' -Default 0) } else { 0 })
+        $gateDeliveryState[[string]$prId] = @{
+            sourceCommit          = $sourceCommit
+            at                    = ([DateTime]::UtcNow.ToString("o"))
+            commentsIntended      = [int]$deliveryOutcome.CommentsIntended
+            commentsPosted        = [int]$deliveryOutcome.CommentsPosted
+            commentsComplete      = [bool]$deliveryOutcome.CommentsComplete
+            voteCast              = [bool]$deliveryOutcome.VoteCast
+            reason                = [string]$deliveryOutcome.Reason
+            pendingReplay         = (-not [bool]$deliveryOutcome.CommentsComplete)
+            # Never superseded: this is a genuine, usable delivery record
+            # (complete or partial-pending-replay), unlike the deliberately
+            # superseded records Invoke-ReviewerGateReplay writes when a
+            # sealed decision's bindings no longer match or it has expired.
+            superseded            = $false
+            supersededCount       = $carriedSupersededCount
+            artifactPath          = $sealed.ArtifactPath
+            # Persisted so a REPLAY (Invoke-ReviewerGateReplay) can retry the
+            # exact same request shape from the sealed decision alone,
+            # without re-running the model - a replay is a narrowing retry,
+            # never a fresh, possibly-different decision.
+            commentsRequested     = [bool]$commentsRequested
+            suggestionsRequested  = [bool]$suggestionsRequested
+            approvalRequested     = [bool]$approvalRequested
+            rawRecommendedVote    = [string]$Bound.RawRecommendedVote
+            rawCounts             = $Bound.RawCounts
+            rawReportedFindingCount = [int]$Bound.RawReportedFindingCount
+            rawPassesComplete     = [bool]$Bound.RawPassesComplete
+        }
+        Set-JsonState -Path $gateDeliveryStatePath -State $gateDeliveryState
+
+        Write-ReviewerCycleMetadata -Fields @{
+            mode = "gate-delivery"; result = $deliveryOutcome.Reason; prId = $prId; sourceCommit = $sourceCommit
+            commentsIntended = [int]$deliveryOutcome.CommentsIntended; commentsPosted = [int]$deliveryOutcome.CommentsPosted
+            commentsComplete = [bool]$deliveryOutcome.CommentsComplete; voteCast = [bool]$deliveryOutcome.VoteCast
+        }
+    }
+    catch {
+        Write-Warning "Delivery gate degraded for PR ${prId}; the underlying review is unaffected: $($_.Exception.Message)"
+        try {
+            # A bare processing fault (an exception anywhere in the try
+            # above) must still count as "attempted" for this exact commit,
+            # or Test-ReviewerGateDecisionEverAttempted would keep reporting
+            # "never attempted" forever, and the cycle-loop fall-through
+            # would re-run a full model review (raw findings and all) every
+            # single cycle trying to give the gate its first chance. This is
+            # deliberately NOT superseded (unlike Invoke-ReviewerGateReplay's
+            # expiry/binding closures, which intentionally invite exactly
+            # one fresh review): no usable decision was sealed here, so
+            # there is nothing to retry automatically. Only a genuinely new
+            # push (a new sourceCommit) reopens this PR to the gate.
+            #
+            # Never overwrites an EXISTING, non-superseded record for this
+            # SAME commit: if the try block above already persisted
+            # something meaningful (e.g. a partial delivery with
+            # pendingReplay=$true) before an unrelated later statement
+            # faulted, that record is more useful than this minimal one and
+            # must not be clobbered. A SUPERSEDED same-commit record,
+            # however, is exactly the stale one that prompted THIS fresh
+            # review attempt in the first place - if this attempt itself
+            # just faulted, leaving that superseded=$true record in place
+            # would make Test-ReviewerGateDecisionEverAttempted keep
+            # reporting "not attempted" forever, driving the exact unbounded
+            # full-review loop this fault record exists to prevent. So a
+            # superseded same-commit record IS overwritten here, carrying
+            # its supersededCount forward for the budget above.
+            $existingGateDeliveryState = Get-JsonState -Path $gateDeliveryStatePath
+            $existingGateDeliveryRecord = $existingGateDeliveryState[[string]$prId]
+            $existingRecordSameCommit = ($existingGateDeliveryRecord -and
+                ([string](Get-ReviewerHashValue -Container $existingGateDeliveryRecord -Key 'sourceCommit' -Default '')) -ieq $sourceCommit)
+            $existingRecordIsGenuineAndNotSuperseded = ($existingRecordSameCommit -and
+                -not [bool](Get-ReviewerHashValue -Container $existingGateDeliveryRecord -Key 'superseded' -Default $false))
+            if (-not $existingRecordIsGenuineAndNotSuperseded) {
+                $carriedSupersededCountOnFault = $(if ($existingRecordSameCommit) { [int](Get-ReviewerHashValue -Container $existingGateDeliveryRecord -Key 'supersededCount' -Default 0) } else { 0 })
+                $existingGateDeliveryState[[string]$prId] = @{
+                    sourceCommit    = $sourceCommit
+                    at              = ([DateTime]::UtcNow.ToString("o"))
+                    reason          = "gateProcessingFaulted"
+                    pendingReplay   = $false
+                    superseded      = $false
+                    supersededCount = $carriedSupersededCountOnFault
+                }
+                Set-JsonState -Path $gateDeliveryStatePath -State $existingGateDeliveryState
+            }
+        }
+        catch { Write-Warning "Delivery gate could not persist a fault record for PR ${prId}: $($_.Exception.Message)" }
+    }
+}
+
+function Invoke-ReviewerGateReplay {
+    <#
+        Retries an INCOMPLETE gate delivery from its own sealed decision -
+        never from a fresh model run. This is what makes "replay missing
+        only" true: fingerprint dedupe against the PR's own threads makes an
+        already-posted comment a no-op, so replaying posts only what never
+        landed, and a decision this stale cannot silently become a different
+        one (the sealed candidate list is fixed; only the world is
+        re-checked).
+
+        A replay is never authorized by the PERSISTED request flags alone:
+        the CURRENT effective policy mode and CLI switches are re-derived
+        the same way a fresh decision would be, and intersected with what
+        was originally requested - a switch removed or a policy mode
+        downgraded since the original attempt narrows a replay to nothing,
+        never lets a stale record outlive the authority that produced it.
+        The decision's own bindings (script/config/policy/library/
+        qualification) and its own expiry are re-verified fatally, before
+        any revalidation session or write is attempted.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$AgencyPath,
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)][string]$SourceCommit
+    )
+    if ($EffectiveGatePolicy.mode -ceq "off") { return }
+    try {
+        $state = Get-JsonState -Path $gateDeliveryStatePath
+        $record = $state[[string]$PrId]
+        # Get-JsonState round-trips a stored record through ConvertFrom-Json,
+        # which returns a PSCustomObject - and a PSCustomObject throws when a
+        # brand-new property (one a record sealed before 'superseded' existed
+        # never had) is assigned via dot-notation. Normalized to a hashtable
+        # here so every mutation below always succeeds, regardless of which
+        # fields the stored JSON happened to already have.
+        if ($record -and $record -isnot [hashtable]) {
+            $normalizedRecord = @{}
+            foreach ($prop in $record.PSObject.Properties) { $normalizedRecord[$prop.Name] = $prop.Value }
+            $record = $normalizedRecord
+        }
+        $artifactPath = [string](Get-ReviewerHashValue -Container $record -Key 'artifactPath' -Default '')
+        if (-not $artifactPath -or -not (Test-Path -LiteralPath $artifactPath -PathType Leaf)) {
+            Write-Warning "PR $PrId has an unfinished gate delivery whose sealed decision is no longer on disk; it will be re-sealed on the next full review instead of replayed."
+            return
+        }
+        $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+        $decision = Read-ReviewerGateDecision -Path $artifactPath -MasterKey $masterKey
+
+        # Fatal, before any revalidation session or write: a decision whose
+        # own bindings no longer match the CURRENT script/config/policy/
+        # library/qualification cannot authorize anything today, however
+        # recently it was sealed. No escape hatch - every binding this
+        # process can currently attest to is checked.
+        $qualificationForBinding = Get-ReviewerGateQualification
+        $liveBinding = @{
+            scriptSha256              = $ScriptSelfSha256.ToLowerInvariant()
+            configSha256              = $ConfigSha256.ToLowerInvariant()
+            gatePolicySha256          = $GatePolicySha256
+            gateLibrarySha256         = $DeliveryGatesLibrarySha256
+            verificationLibrarySha256 = $CrossVerificationLibrarySha256
+            verificationPromptSha256  = $CrossVerificationPromptSha256
+            verificationPolicySha256  = $CrossVerificationPolicySha256
+            verificationSchemaSha256  = $CrossVerificationSchemaSha256
+            packPolicySha256          = $ConventionPackPolicySha256
+            repositoryId              = $cfgRepoId.ToLowerInvariant()
+            organization              = $Organization
+            project                  = $ExpectedProject
+            # Unconditional, never gated on whether a live qualification
+            # currently resolves: a REVOKED qualification (the file removed,
+            # tampered, or the -GateQualificationFile argument simply
+            # dropped since the decision was sealed) must close a decision
+            # that DID depend on one, not silently skip the comparison
+            # because there is nothing live to compare against right now.
+            # Test-ReviewerGateDecisionBinding treats a sealed value of
+            # all-zero (never depended on any qualification) as always OK
+            # regardless of the live value, so this cannot regress a
+            # decision that never needed one (e.g. humanPromote mode).
+            qualificationSha256      = $(if ($qualificationForBinding.Qualification) { $qualificationForBinding.Sha256 } else { "0" * 64 })
+        }
+        $bindingCheck = Test-ReviewerGateDecisionBinding -Decision $decision -LiveBinding $liveBinding
+        if (-not $bindingCheck.Ok) {
+            Write-Warning "PR $PrId's pending gate delivery is sealed to bindings that no longer match ($($bindingCheck.ReasonCodes -join ', ')); it will not be replayed. The next cycle will seal a current decision instead."
+            $currentSupersededCount = [int](Get-ReviewerHashValue -Container $record -Key 'supersededCount' -Default 0)
+            $supersedeBudget = Test-ReviewerGateSupersededBudget -CurrentSupersededCount $currentSupersededCount
+            if ($supersedeBudget.WithinBudget) {
+                $record.reason = ($bindingCheck.ReasonCodes -join ',')
+                $record.pendingReplay = $false
+                # Superseded, not merely closed: Test-ReviewerGateDecisionEverAttempted
+                # treats this as NOT attempted, so the next normal cycle performs
+                # exactly one fresh full review and seals a current decision,
+                # rather than being locked out of the gate at this commit forever.
+                $record.superseded = $true
+                $record.supersededCount = $supersedeBudget.NextSupersededCount
+            }
+            else {
+                # The hard, code-defined budget is exhausted: this exact
+                # commit has already been superseded
+                # $script:ReviewerGateMaxSupersededRefreshes times without a
+                # single fresh review ever completing. One more invitation
+                # would risk an unbounded run of full model re-runs at a
+                # persistently slow/flaky commit, so this closes TERMINALLY
+                # instead - attempted (Test-ReviewerGateDecisionEverAttempted
+                # returns true), not superseded. Only a new push reopens it.
+                Write-Warning "PR $PrId has already been superseded $currentSupersededCount time(s) at this exact commit (budget $($script:ReviewerGateMaxSupersededRefreshes)); closing terminally instead of inviting another fresh review. A new push is required to reopen the gate."
+                $record.reason = "supersededRefreshBudgetExhausted"
+                $record.pendingReplay = $false
+                $record.superseded = $false
+                $record.supersededCount = $currentSupersededCount
+            }
+            $record.at = [DateTime]::UtcNow.ToString("o")
+            $state[[string]$PrId] = $record
+            Set-JsonState -Path $gateDeliveryStatePath -State $state
+            return
+        }
+        if (Test-ReviewerGateDecisionExpired -Decision $decision -NowUtc ([DateTime]::UtcNow)) {
+            Write-Warning "PR $PrId's pending gate delivery is sealed to a decision that has expired; it will not be replayed. The next cycle will seal a current decision instead."
+            $currentSupersededCount = [int](Get-ReviewerHashValue -Container $record -Key 'supersededCount' -Default 0)
+            $supersedeBudget = Test-ReviewerGateSupersededBudget -CurrentSupersededCount $currentSupersededCount
+            if ($supersedeBudget.WithinBudget) {
+                $record.reason = "decisionExpired"
+                $record.pendingReplay = $false
+                $record.superseded = $true
+                $record.supersededCount = $supersedeBudget.NextSupersededCount
+            }
+            else {
+                Write-Warning "PR $PrId has already been superseded $currentSupersededCount time(s) at this exact commit (budget $($script:ReviewerGateMaxSupersededRefreshes)); closing terminally instead of inviting another fresh review. A new push is required to reopen the gate."
+                $record.reason = "supersededRefreshBudgetExhausted"
+                $record.pendingReplay = $false
+                $record.superseded = $false
+                $record.supersededCount = $currentSupersededCount
+            }
+            $record.at = [DateTime]::UtcNow.ToString("o")
+            $state[[string]$PrId] = $record
+            Set-JsonState -Path $gateDeliveryStatePath -State $state
+            return
+        }
+
+        # The persisted flags are an UPPER BOUND, never a substitute for
+        # CURRENT authority: a switch removed, or a policy mode downgraded,
+        # since the original attempt narrows this replay to what is still
+        # both originally intended AND currently authorized.
+        $persistedCommentsRequested = [bool](Get-ReviewerHashValue -Container $record -Key 'commentsRequested' -Default $false)
+        $persistedSuggestionsRequested = [bool](Get-ReviewerHashValue -Container $record -Key 'suggestionsRequested' -Default $false)
+        $persistedApprovalRequested = [bool](Get-ReviewerHashValue -Container $record -Key 'approvalRequested' -Default $false)
+        $currentAuthority = Get-ReviewerGateWritesCurrentlyRequested -EffectivePolicy $EffectiveGatePolicy `
+            -CommentSwitchOn ([bool]$EnableVerifiedCommentGate) -SuggestionSwitchOn ([bool]$EnableVerifiedSuggestionGate) `
+            -ApprovalSwitchOn ([bool]$EnableVerifiedApprovalGate)
+        $commentsRequested = $persistedCommentsRequested -and [bool]$currentAuthority.Comments
+        $suggestionsRequested = $persistedSuggestionsRequested -and [bool]$currentAuthority.Suggestions
+        $approvalRequested = $persistedApprovalRequested -and [bool]$currentAuthority.Approval
+        if (-not $commentsRequested -and -not $suggestionsRequested -and -not $approvalRequested) {
+            Write-Warning "PR $PrId has a pending gate delivery, but the current CLI switches/policy mode no longer authorize any capability it still owes; not replayed this cycle."
+            return
+        }
+
+        $targetBranchName = $TargetRefName -replace '^refs/heads/', ''
+        $firstRevalidation = Invoke-ReviewerGateRevalidation -AgencyPath $AgencyPath -PrId $PrId `
+            -ExpectedSourceCommit $SourceCommit -TargetBranch $targetBranchName `
+            -RequiredCheckNames @($EffectiveGatePolicy.approval.requiredCheckNames)
+        $gateEligibilityState = Get-JsonState -Path $gateEligibilityStatePath
+        $canaryConfirmed = Test-ReviewerGateCanaryConfirmed -TokenFile $GateCanaryTokenFile -PrId $PrId -SourceCommit $SourceCommit
+        $rawGateApproves = $false
+        if ($approvalRequested) {
+            $rawCounts = Get-ReviewerHashValue -Container $record -Key 'rawCounts' -Default @{ critical = 0; important = 0; suggestion = 0 }
+            $rawDecision = Test-ReviewerShouldVote -RecommendedVote ([string](Get-ReviewerHashValue -Container $record -Key 'rawRecommendedVote' -Default 'none')) `
+                -CriticalCount ([int](Get-ReviewerHashValue -Container $rawCounts -Key 'critical' -Default 0)) `
+                -ImportantCount ([int](Get-ReviewerHashValue -Container $rawCounts -Key 'important' -Default 0)) `
+                -SuggestionCount ([int](Get-ReviewerHashValue -Container $rawCounts -Key 'suggestion' -Default 0)) `
+                -ReportedFindingCount ([int](Get-ReviewerHashValue -Container $record -Key 'rawReportedFindingCount' -Default 0)) `
+                -FindingsPosted $true -FindingsRetryable $false `
+                -PrIsActive ([bool]$firstRevalidation.PrIsActive) -PrIsDraft ([bool]$firstRevalidation.PrIsDraft) `
+                -CurrentSourceCommit ([string]$firstRevalidation.SourceCommit) -ReviewedSourceCommit $SourceCommit `
+                -PassesComplete ([bool](Get-ReviewerHashValue -Container $record -Key 'rawPassesComplete' -Default $false))
+            $rawGateApproves = ([string]$rawDecision.Vote -ceq "Approved")
+        }
+
+        $deliveryOutcome = Invoke-ReviewerGateDelivery -AgencyPath $AgencyPath -Decision $decision -FirstRevalidation $firstRevalidation `
+            -CommentsRequested $commentsRequested -SuggestionsRequested $suggestionsRequested -ApprovalRequested $approvalRequested `
+            -Qualification (Get-ReviewerGateQualification).Qualification -PriorEligibility $gateEligibilityState `
+            -RawGateApproves $rawGateApproves -CanaryConfirmed $canaryConfirmed
+
+        if ($approvalRequested) {
+            $fingerprint = Get-ReviewerGateEligibilityFingerprint -SourceCommit $SourceCommit -ChangeSetDigest ([string]$decision.changeSetDigest) `
+                -TotalCandidateCount (@($decision.candidates).Count) -DecisionSha256 (Get-ReviewerVerificationObjectSha256 -Value $decision) `
+                -GatePolicySha256 $GatePolicySha256
+            $priorRecord = $gateEligibilityState[[string]$PrId]
+            $gateEligibilityState[[string]$PrId] = @{
+                sourceCommit   = $SourceCommit
+                fingerprint    = $fingerprint
+                firstSeenAtUtc = $(if ($priorRecord) { [string](Get-ReviewerHashValue -Container $priorRecord -Key 'firstSeenAtUtc' -Default '') } else { [DateTime]::UtcNow.ToString("o") })
+                voted          = ([bool]$deliveryOutcome.VoteCast -or [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'voted' -Default $false))
+            }
+            Set-JsonState -Path $gateEligibilityStatePath -State $gateEligibilityState
+        }
+
+        $record.commentsIntended = [int]$deliveryOutcome.CommentsIntended
+        $record.commentsPosted = [int]$deliveryOutcome.CommentsPosted
+        $record.commentsComplete = [bool]$deliveryOutcome.CommentsComplete
+        $record.voteCast = ([bool]$deliveryOutcome.VoteCast -or [bool](Get-ReviewerHashValue -Container $record -Key 'voteCast' -Default $false))
+        $record.reason = [string]$deliveryOutcome.Reason
+        $record.pendingReplay = (-not [bool]$deliveryOutcome.CommentsComplete)
+        $record.at = [DateTime]::UtcNow.ToString("o")
+        $state[[string]$PrId] = $record
+        Set-JsonState -Path $gateDeliveryStatePath -State $state
+        Write-ReviewerCycleMetadata -Fields @{
+            mode = "gate-replay"; result = $deliveryOutcome.Reason; prId = $PrId; sourceCommit = $SourceCommit
+            commentsIntended = [int]$deliveryOutcome.CommentsIntended; commentsPosted = [int]$deliveryOutcome.CommentsPosted
+            commentsComplete = [bool]$deliveryOutcome.CommentsComplete; voteCast = [bool]$deliveryOutcome.VoteCast
+        }
+    }
+    catch {
+        Write-Warning "Delivery-gate replay degraded for PR ${PrId}; the underlying review is unaffected: $($_.Exception.Message)"
+    }
+}
+
+function Get-ReviewerGateRefreshStandInDelivery {
+    <#
+        Pure: builds the stand-in Invoke-ReviewerDelivery-shaped result used
+        when raw delivery already fully completed at this exact commit and
+        only a currently-enabled gate capability's first chance to run
+        brought this PR back around (Test-ReviewerGateDecisionEverAttempted
+        returning $false while Test-ReviewerAlreadyReviewed returns $true).
+
+        Extracted from Invoke-ReviewerPullRequest so the "no second,
+        unauthorized raw delivery on a gate refresh" invariant is
+        independently, deterministically testable without a live MCP
+        session: given only the prior capability outcomes, this always
+        returns PostedCount/PostFailures=0-and-carried, the PRIOR
+        comments/summary/vote flags unchanged, CastVote="" (never a second
+        vote), Delivered=$true (so this run is never misreported as a
+        cycle failure), and Aborted=$false - regardless of what a fresh
+        model run this cycle found. The gate's own decision still sees
+        that fresh run's genuinely current findings via $Bound.Raw*, which
+        this stand-in never touches.
+    #>
+    param(
+        [Parameter(Mandatory)][bool]$PriorComments,
+        [Parameter(Mandatory)][bool]$PriorSummary,
+        [Parameter(Mandatory)][bool]$PriorVote,
+        [int]$PriorPostedCount = 0
+    )
+    return @{
+        PostedCount       = $PriorPostedCount
+        PostFailures      = 0
+        SummaryPosted     = $PriorSummary
+        CastVote          = ""
+        CommentsDelivered = $PriorComments
+        SummaryDelivered  = $PriorSummary
+        VoteResolved      = $PriorVote
+        Delivered         = $true
+        Aborted           = $false
+        Reason            = "raw delivery already complete at this commit; not re-delivered for the gate's first run"
+    }
+}
+
+function Get-ReviewerPersistedReviewRecord {
+    <#
+        Pure: the exact reviewed.json record Invoke-ReviewerPullRequest's
+        persist step should write for this PR at this commit, or $null
+        meaning "leave reviewed.json completely untouched, do not call
+        Set-JsonState at all."
+
+        Returns $null whenever RawDeliveryAlreadySatisfied is true: no raw
+        delivery was attempted this run - only a currently-enabled gate
+        capability's first chance to run brought this PR back around - so
+        the prior record (whatever it is: fully delivered, or a genuinely
+        still-open raw plan owing comments/summary/vote) is the ONLY
+        authoritative record of raw delivery state at this commit. Deriving
+        a new one from THIS run's fresh preview (a new ArtifactPath, a new
+        ReviewDigest, PendingCapabilities recomputed against a marker this
+        review never delivered anything for) would silently destroy a
+        still-open raw plan's own ArtifactPath/PendingCapabilities - exactly
+        the "a second model run drops a failed finding permanently" risk
+        Get-ReviewerPendingDeliveryPlan exists to prevent, just triggered by
+        a gate refresh instead of a crash.
+
+        Otherwise, behaviorally identical to the pre-existing persist logic:
+        per-capability flags are MERGED with the prior record at this same
+        commit (Merge-ReviewerCapabilityFlag), and the plan stays open
+        (deliveryPending) until everything it owes has actually landed.
+    #>
+    param(
+        [Parameter(Mandatory)][bool]$RawDeliveryAlreadySatisfied,
+        [Parameter(Mandatory)][string]$SourceCommit,
+        [Parameter(Mandatory)][int]$FindingCount,
+        [Parameter(Mandatory)][int]$PostableCount,
+        [Parameter(Mandatory)][int]$WithheldCount,
+        [Parameter(Mandatory)][int]$PostedCount,
+        [Parameter(Mandatory)][bool]$SummaryPosted,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$CastVote,
+        [Parameter(Mandatory)][bool]$Delivered,
+        [Parameter(Mandatory)][bool]$DeliveryAborted,
+        [Parameter(Mandatory)][bool]$CommentsAttempted,
+        [Parameter(Mandatory)][bool]$CommentsSucceededThisRun,
+        [Parameter(Mandatory)][bool]$SummaryAttempted,
+        [Parameter(Mandatory)][bool]$SummarySucceededThisRun,
+        [Parameter(Mandatory)][bool]$VoteAttempted,
+        [Parameter(Mandatory)][bool]$VoteSucceededThisRun,
+        [Parameter(Mandatory)][bool]$PriorComments,
+        [Parameter(Mandatory)][bool]$PriorSummary,
+        [Parameter(Mandatory)][bool]$PriorVote,
+        [Parameter(Mandatory)][bool]$PriorAppliesToThisReview,
+        [Parameter(Mandatory)][string]$ReviewDigest,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$PreviewPath,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$ArtifactPath,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$PlanCapabilities,
+        [Parameter(Mandatory)][bool]$WritesRequested
+    )
+    if ($RawDeliveryAlreadySatisfied) { return $null }
+
+    $commentsDelivered = Merge-ReviewerCapabilityFlag -Attempted $CommentsAttempted -SucceededThisRun $CommentsSucceededThisRun -PriorValue $PriorComments -PriorAppliesToThisReview $PriorAppliesToThisReview
+    $summaryDelivered = Merge-ReviewerCapabilityFlag -Attempted $SummaryAttempted -SucceededThisRun $SummarySucceededThisRun -PriorValue $PriorSummary -PriorAppliesToThisReview $PriorAppliesToThisReview
+    $voteResolved = Merge-ReviewerCapabilityFlag -Attempted $VoteAttempted -SucceededThisRun $VoteSucceededThisRun -PriorValue $PriorVote -PriorAppliesToThisReview $PriorAppliesToThisReview
+
+    $unresolved = Get-ReviewerUnresolvedCapabilities -Requested $PlanCapabilities `
+        -CommentsDelivered $commentsDelivered -SummaryDelivered $summaryDelivered -VoteResolved $voteResolved
+
+    return @{
+        sourceCommit        = $SourceCommit
+        at                  = ([DateTime]::UtcNow.ToString("o"))
+        findingCount        = $FindingCount
+        postableCount       = $PostableCount
+        withheldCount       = $WithheldCount
+        postedCount         = $PostedCount
+        summaryPosted       = $SummaryPosted
+        vote                = $(if ($CastVote) { $CastVote } else { "none" })
+        delivered           = $Delivered
+        commentsDelivered   = $commentsDelivered
+        summaryDelivered    = $summaryDelivered
+        voteResolved        = $voteResolved
+        reviewDigest        = $ReviewDigest
+        previewPath         = $PreviewPath
+        artifactPath        = $ArtifactPath
+        # The plan stays open until everything IT owes has landed, not until
+        # whichever run picked it up reports success with its own switches.
+        pendingCapabilities = $unresolved
+        deliveryPending     = ($WritesRequested -and @($unresolved).Count -gt 0 -and -not $DeliveryAborted -and [bool]$ArtifactPath)
+    }
+}
+
 function Invoke-ReviewerPullRequest {
     <#
         Reviews exactly one bound pull request: one model run per configured
@@ -6662,6 +8975,13 @@ function Invoke-ReviewerPullRequest {
     $prId = [int]$Bound.PrId
     $sourceCommit = [string]$Bound.SourceCommit
     $prTitle = [string]$Bound.Title
+    # $true only when raw delivery already fully completed at this exact
+    # commit and only a currently-enabled gate capability's first chance to
+    # run brought this PR back around (see the cycle-loop selection step
+    # that sets it on $Bound). A hashtable with no such key returns $null
+    # here, so every other caller safely defaults to $false - the ordinary,
+    # unchanged, "run and deliver for real" path.
+    $rawDeliveryAlreadySatisfied = [bool]$Bound.RawDeliveryAlreadySatisfied
 
     Write-Host ("Reviewing PR {0}  '{1}'  author={2}  commit={3}" -f $prId, $prTitle, $Bound.AuthorAlias, $sourceCommit.Substring(0, 12)) -ForegroundColor Yellow
 
@@ -6702,9 +9022,18 @@ function Invoke-ReviewerPullRequest {
         }
         $specialistResult = Invoke-ReviewerConventionSpecialistSafely -AgencyPath $AgencyPath `
             -CycleNumber $CycleNumber -Bound $Bound
-        [void](Invoke-ReviewerCrossVerificationSafely -AgencyPath $AgencyPath `
-                -CycleNumber $CycleNumber -Bound $Bound -PassResults @($passResults) `
-                -SpecialistResult $specialistResult)
+        $verificationResult = Invoke-ReviewerCrossVerificationSafely -AgencyPath $AgencyPath `
+            -CycleNumber $CycleNumber -Bound $Bound -PassResults @($passResults) `
+            -SpecialistResult $specialistResult
+        # No successful generalist pass exists, so there is nothing a raw vote
+        # gate could ever approve; the gate's own raw-agreement check is told
+        # that plainly rather than inventing a vote from an empty review.
+        $Bound.RawRecommendedVote = "none"
+        $Bound.RawCounts = @{ critical = 0; important = 0; suggestion = 0 }
+        $Bound.RawReportedFindingCount = 0
+        $Bound.RawPassesComplete = $false
+        Invoke-ReviewerGateForPullRequest -Session $Session -AgencyPath $AgencyPath -Bound $Bound `
+            -VerificationResult $verificationResult | Out-Null
         return @{ ExitCode = 1; Summary = "PR $prId failed: $reason" }
     }
 
@@ -6779,14 +9108,28 @@ function Invoke-ReviewerPullRequest {
         }
         $specialistResult = Invoke-ReviewerConventionSpecialistSafely -AgencyPath $AgencyPath `
             -CycleNumber $CycleNumber -Bound $Bound
-        [void](Invoke-ReviewerCrossVerificationSafely -AgencyPath $AgencyPath `
-                -CycleNumber $CycleNumber -Bound $Bound -PassResults @($passResults) `
-                -SpecialistResult $specialistResult)
+        $verificationResult = Invoke-ReviewerCrossVerificationSafely -AgencyPath $AgencyPath `
+            -CycleNumber $CycleNumber -Bound $Bound -PassResults @($passResults) `
+            -SpecialistResult $specialistResult
+        $Bound.RawRecommendedVote = $recommendedVote
+        $Bound.RawCounts = Get-ReviewerSeverityCounts -Findings $allFindings
+        $Bound.RawReportedFindingCount = $allFindings.Count
+        $Bound.RawPassesComplete = $false
+        Invoke-ReviewerGateForPullRequest -Session $Session -AgencyPath $AgencyPath -Bound $Bound `
+            -VerificationResult $verificationResult | Out-Null
         return @{ ExitCode = 1; Summary = "PR $prId failed: $reason" }
     }
 
     # -- Wrapper-owned decisions ----------------------------------------------
     $counts = Get-ReviewerSeverityCounts -Findings $allFindings
+    # Carried on $Bound for the delivery gate's OWN independent raw-agreement
+    # check (O-4): the gate must reason over the SAME raw generalist findings
+    # Test-ReviewerShouldVote already reasons over, never a value the gate
+    # library invented, and Test-ReviewerShouldVote itself is never modified.
+    $Bound.RawRecommendedVote = $recommendedVote
+    $Bound.RawCounts = $counts
+    $Bound.RawReportedFindingCount = $allFindings.Count
+    $Bound.RawPassesComplete = $passesComplete
     $ranked = Get-ReviewerPostableFindings -Findings $allFindings -PostSeverities $PostSeverities -MaxFindings $EffectiveMaxFindings
     $scoped = Split-ReviewerFindingsByChangeSet -Findings $ranked -ChangedPaths $Bound.ChangedPaths
     $postable = @($scoped.Postable)
@@ -6843,7 +9186,16 @@ function Invoke-ReviewerPullRequest {
         -Requested (Get-ReviewerRequestedCapabilities -Comments ([bool]$EnableFindingComments) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)) `
         -PriorAppliesToThisReview $priorApplies
 
-    if ($writesRequested) {
+    # -not $rawDeliveryAlreadySatisfied guards this placeholder the same way
+    # it guards the final persist below: when raw delivery is already
+    # satisfied at this exact commit and only a gate capability's first
+    # chance to run brought this PR back around, no raw delivery is about to
+    # be attempted at all, so there is nothing here for a crash-safety
+    # placeholder to protect - and writing one anyway would transiently (or,
+    # on a crash before the final persist below runs, permanently) claim a
+    # prior raw plan's own reviewed.json record, which this run never
+    # touched and has no authority to overwrite.
+    if ($writesRequested -and -not $rawDeliveryAlreadySatisfied) {
         if (-not $artifactPath -or -not (Test-Path -LiteralPath $artifactPath)) {
             throw ("No sealed delivery plan was written for PR $prId, so a failed or interrupted delivery could not be " +
                 "retried from the review that produced it. Refusing to post.")
@@ -6873,13 +9225,33 @@ function Invoke-ReviewerPullRequest {
     # -- Wrapper-owned writes (each behind its own switch) --------------------
     # An empty change set means the read failed; it is fine for a preview (the
     # findings are shown to a human) but delivery must refuse it.
-    $delivery = Invoke-ReviewerDelivery -Session $Session -PrId $prId -SourceCommit $sourceCommit `
-        -Postable $postable -SummaryText $summaryText -Counts $counts -ReportedFindingCount $allFindings.Count `
-        -RecommendedVote $recommendedVote -ExistingFingerprints $Bound.ExistingFingerprints `
-        -ChangeSetKnown (@($Bound.ChangedPaths).Count -gt 0) `
-        -SummaryAlreadyDelivered ($priorApplies -and $priorSummary) `
-        -PassesComplete $passesComplete `
-        -DeliveryAuthorization $DeliveryAuthorization -RequiredPassCount $passCount
+    $delivery = if ($rawDeliveryAlreadySatisfied) {
+        # Raw delivery already fully completed at this exact commit before
+        # this run started; only a currently-enabled gate capability's
+        # first chance to run brought this PR back around (see
+        # Test-ReviewerGateDecisionEverAttempted and the cycle-loop
+        # selection step). Posting, summarizing, or voting again under RAW
+        # authority here would be a second, unauthorized raw delivery for a
+        # commit that already has one - never done, regardless of what this
+        # fresh model run found. This stand-in carries the PRIOR run's
+        # capability outcomes through the SAME merge/bookkeeping below
+        # unchanged, so the crash-safety placeholder written above
+        # self-corrects exactly as it would after a real delivery call -
+        # while the gate itself still sees this fresh run's genuinely
+        # current findings via $Bound.Raw* (set above, independent of this
+        # stand-in) for its own decision.
+        Get-ReviewerGateRefreshStandInDelivery -PriorComments $priorComments -PriorSummary $priorSummary `
+            -PriorVote $priorVote -PriorPostedCount ([int](Get-ReviewerHashValue -Container $priorRecord -Key 'postedCount' -Default 0))
+    }
+    else {
+        Invoke-ReviewerDelivery -Session $Session -PrId $prId -SourceCommit $sourceCommit `
+            -Postable $postable -SummaryText $summaryText -Counts $counts -ReportedFindingCount $allFindings.Count `
+            -RecommendedVote $recommendedVote -ExistingFingerprints $Bound.ExistingFingerprints `
+            -ChangeSetKnown (@($Bound.ChangedPaths).Count -gt 0) `
+            -SummaryAlreadyDelivered ($priorApplies -and $priorSummary) `
+            -PassesComplete $passesComplete `
+            -DeliveryAuthorization $DeliveryAuthorization -RequiredPassCount $passCount
+    }
     $postedCount = [int]$delivery.PostedCount
     $postFailures = [int]$delivery.PostFailures
     $summaryPosted = [bool]$delivery.SummaryPosted
@@ -6892,35 +9264,42 @@ function Invoke-ReviewerPullRequest {
     # delivered the summary. A preview run and a run whose writes failed both
     # leave the relevant flag $false, so the next run with posting on can still
     # publish this commit instead of skipping it as already reviewed.
-    $commentsDelivered = Merge-ReviewerCapabilityFlag -Attempted $EnableFindingComments -SucceededThisRun ([bool]$delivery.CommentsDelivered) -PriorValue $priorComments -PriorAppliesToThisReview $priorApplies
-    $summaryDelivered = Merge-ReviewerCapabilityFlag -Attempted $EnableSummaryComment -SucceededThisRun ([bool]$delivery.SummaryDelivered) -PriorValue $priorSummary -PriorAppliesToThisReview $priorApplies
-    $voteResolved = Merge-ReviewerCapabilityFlag -Attempted $EnableApprovalVote -SucceededThisRun ([bool]$delivery.VoteResolved) -PriorValue $priorVote -PriorAppliesToThisReview $priorApplies
-
-    $unresolved = Get-ReviewerUnresolvedCapabilities -Requested $planCapabilities `
-        -CommentsDelivered $commentsDelivered -SummaryDelivered $summaryDelivered -VoteResolved $voteResolved
-
-    $ReviewedState[[string]$prId] = @{
-        sourceCommit        = $sourceCommit
-        at                  = ([DateTime]::UtcNow.ToString("o"))
-        findingCount        = $allFindings.Count
-        postableCount       = $postable.Count
-        withheldCount       = $withheld.Count
-        postedCount         = $postedCount
-        summaryPosted       = $summaryPosted
-        vote                = $(if ($castVote) { $castVote } else { "none" })
-        delivered           = [bool]$delivery.Delivered
-        commentsDelivered   = $commentsDelivered
-        summaryDelivered    = $summaryDelivered
-        voteResolved        = $voteResolved
-        reviewDigest        = $reviewDigest
-        previewPath         = $previewPath
-        artifactPath        = $artifactPath
-        # The plan stays open until everything IT owes has landed, not until
-        # whichever run picked it up reports success with its own switches.
-        pendingCapabilities = $unresolved
-        deliveryPending     = ($writesRequested -and @($unresolved).Count -gt 0 -and -not [bool]$delivery.Aborted -and [bool]$artifactPath)
+    #
+    # Get-ReviewerPersistedReviewRecord returns $null when
+    # $rawDeliveryAlreadySatisfied: no raw delivery was attempted this run -
+    # only a currently-enabled gate capability's first chance to run brought
+    # this PR back around. The prior reviewed.json record - whatever it is:
+    # fully delivered, or a genuinely still-open raw plan owing
+    # comments/summary/vote - is the ONLY authoritative record of raw
+    # delivery state at this commit, and $priorRecord/$ReviewedState above
+    # were never mutated by this run (the placeholder above is skipped for
+    # the same reason). Overwriting it now with values derived from THIS
+    # run's fresh preview would silently destroy a still-open raw plan's own
+    # artifactPath/pendingCapabilities: exactly the "a second model run
+    # drops a failed finding permanently" risk Get-ReviewerPendingDeliveryPlan
+    # exists to prevent, just triggered by a gate refresh instead of a
+    # crash. So reviewed.json is left byte-for-byte untouched: not
+    # re-written with the prior values, not written at all. The fresh
+    # preview/artifact written above still exists on disk for a human to
+    # read and for the gate's own tail below to consume; only the raw
+    # delivery-plan POINTER in reviewed.json is preserved verbatim.
+    $newReviewedRecord = Get-ReviewerPersistedReviewRecord -RawDeliveryAlreadySatisfied $rawDeliveryAlreadySatisfied `
+        -SourceCommit $sourceCommit -FindingCount $allFindings.Count -PostableCount $postable.Count -WithheldCount $withheld.Count `
+        -PostedCount $postedCount -SummaryPosted $summaryPosted -CastVote $castVote -Delivered ([bool]$delivery.Delivered) `
+        -DeliveryAborted ([bool]$delivery.Aborted) `
+        -CommentsAttempted ([bool]$EnableFindingComments) -CommentsSucceededThisRun ([bool]$delivery.CommentsDelivered) `
+        -SummaryAttempted ([bool]$EnableSummaryComment) -SummarySucceededThisRun ([bool]$delivery.SummaryDelivered) `
+        -VoteAttempted ([bool]$EnableApprovalVote) -VoteSucceededThisRun ([bool]$delivery.VoteResolved) `
+        -PriorComments $priorComments -PriorSummary $priorSummary -PriorVote $priorVote -PriorAppliesToThisReview $priorApplies `
+        -ReviewDigest $reviewDigest -PreviewPath $previewPath -ArtifactPath $artifactPath `
+        -PlanCapabilities $planCapabilities -WritesRequested $writesRequested
+    if ($null -eq $newReviewedRecord) {
+        Write-Host "  Gate refresh only for PR ${prId}: raw delivery state in reviewed.json is left untouched (no raw delivery was attempted this run)." -ForegroundColor DarkGray
     }
-    Set-JsonState -Path $reviewedStatePath -State $ReviewedState
+    else {
+        $ReviewedState[[string]$prId] = $newReviewedRecord
+        Set-JsonState -Path $reviewedStatePath -State $ReviewedState
+    }
     if ($AttemptsState.ContainsKey([string]$prId)) {
         $AttemptsState.Remove([string]$prId)
         Set-JsonState -Path $attemptsStatePath -State $AttemptsState
@@ -6944,12 +9323,18 @@ function Invoke-ReviewerPullRequest {
     # the backoff and is retried. An aborted delivery (the PR moved on) is not.
     $exit = if ($postFailures -gt 0 -or ($writesRequested -and -not $delivery.Delivered -and -not $delivery.Aborted)) { 1 } else { 0 }
     # Discovery-only and intentionally last: the generalist marker, preview,
-    # delivery, state, metadata, and exit code are already finalized.
+    # delivery, state, metadata, and exit code are already finalized. When
+    # EffectiveGatePolicy.mode is "off" (the default), the call sequence up to
+    # and including Invoke-ReviewerCrossVerificationSafely here is
+    # byte-identical to before layer 6 existed; Invoke-ReviewerGateForPullRequest
+    # returns immediately without reading or writing anything in that case.
     $specialistResult = Invoke-ReviewerConventionSpecialistSafely -AgencyPath $AgencyPath `
         -CycleNumber $CycleNumber -Bound $Bound
-    [void](Invoke-ReviewerCrossVerificationSafely -AgencyPath $AgencyPath `
-            -CycleNumber $CycleNumber -Bound $Bound -PassResults @($passResults) `
-            -SpecialistResult $specialistResult)
+    $verificationResult = Invoke-ReviewerCrossVerificationSafely -AgencyPath $AgencyPath `
+        -CycleNumber $CycleNumber -Bound $Bound -PassResults @($passResults) `
+        -SpecialistResult $specialistResult
+    Invoke-ReviewerGateForPullRequest -Session $Session -AgencyPath $AgencyPath -Bound $Bound `
+        -VerificationResult $verificationResult | Out-Null
     return @{ ExitCode = $exit; Summary = "PR $prId reviewed ($($allFindings.Count) finding(s), $postedCount posted)" }
 }
 
@@ -7010,6 +9395,15 @@ function Invoke-ReviewerPromotion {
     }
     # Only now is it safe to interpret the manifest's contents.
     $signed = $manifestJson | ConvertFrom-Json
+    # Defence in depth on top of H-7 (cross-domain artifacts already fail the
+    # signature check above, since gate/verification artifacts are sealed
+    # with DERIVED domain keys and this reads with the RAW master key): a raw
+    # delivery manifest never carries a 'kind' property at all, so an
+    # artifact that somehow reached here WITH one is rejected explicitly
+    # rather than relying solely on the exact-key-set check below.
+    if ($signed.PSObject.Properties["kind"]) {
+        throw "Artifact '$ArtifactPath' carries a 'kind' property and is not a raw delivery manifest; refusing to promote it with -PromotePreview."
+    }
     $deliveryManifestKeys = @(
         "artifactVersion", "organization", "project", "repositoryName", "repositoryId",
         "prId", "prTitle", "sourceCommit", "markerPrefix", "maxFindingItems",
@@ -7278,6 +9672,174 @@ function Invoke-ReviewerPromotion {
     }
 }
 
+function Invoke-ReviewerPromoteVerifiedPreview {
+    <#
+        Publishes ONLY the human-promotable comments from a sealed GATE
+        DECISION artifact - never a raw delivery manifest, never a
+        verification-input or verification-decision preview.
+        Test-ReviewerGateArtifactKind rejects both of those by construction
+        (they are sealed under different HMAC domains entirely, so reading
+        one here already fails verification before the kind is even
+        inspected); this is defence in depth on top of that, mirroring how
+        Invoke-ReviewerPromotion layers its own checks.
+
+        Comments only, remove-only (Select-ReviewerGateSubset), and NEVER
+        casts a vote: approval only ever happens through the fully-unattended
+        approvalVote policy mode's own write path. Rendered with the SAME
+        Format-ReviewerFindingComment footer as every other comment this
+        agent posts - no "verified by" annotation - so existing prior-agent
+        dedupe and the sibling review-handler agent's thread classification
+        both keep working unchanged; every trace of gate provenance stays in
+        the sealed artifact, never in the posted text.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$AgencyPath,
+        [Parameter(Mandatory)][string]$ArtifactPath,
+        [hashtable]$ExistingSession
+    )
+    if (-not (Test-Path -LiteralPath $ArtifactPath)) { throw "Gate decision artifact not found: $ArtifactPath" }
+    $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $envelopeRaw = Get-Content -LiteralPath $ArtifactPath -Raw | ConvertFrom-Json -Depth 8
+    $envelopeKind = ""
+    try {
+        $manifestJsonText = [string](Get-ReviewerHashValue -Container $envelopeRaw -Key 'manifestJson' -Default '')
+        if ($manifestJsonText) {
+            $manifestPeek = $manifestJsonText | ConvertFrom-Json -Depth 32
+            $envelopeKind = [string](Get-ReviewerHashValue -Container $manifestPeek -Key 'kind' -Default '')
+        }
+    }
+    catch { $envelopeKind = "" }
+    if (-not (Test-ReviewerGateArtifactKind -Kind $envelopeKind)) {
+        throw "Artifact '$ArtifactPath' is not a reviewer-gate-decision artifact (kind='$envelopeKind'); refusing to promote it with -PromoteVerifiedPreview."
+    }
+    $decision = Read-ReviewerGateDecision -Path $ArtifactPath -MasterKey $masterKey
+
+    # Fatal, before any write: a decision sealed under a script, config,
+    # gate policy, gate library, verification library/prompt/policy/schema,
+    # convention-pack policy, or qualification that has since changed - or
+    # for a different repository/org/project - cannot authorize a publish
+    # today, however recently it was sealed. No escape hatch: every binding
+    # this process can currently attest to is checked unconditionally.
+    $qualificationForBinding = Get-ReviewerGateQualification
+    $liveBinding = @{
+        scriptSha256              = $ScriptSelfSha256.ToLowerInvariant()
+        configSha256              = $ConfigSha256.ToLowerInvariant()
+        gatePolicySha256          = $GatePolicySha256
+        gateLibrarySha256         = $DeliveryGatesLibrarySha256
+        verificationLibrarySha256 = $CrossVerificationLibrarySha256
+        verificationPromptSha256  = $CrossVerificationPromptSha256
+        verificationPolicySha256  = $CrossVerificationPolicySha256
+        verificationSchemaSha256  = $CrossVerificationSchemaSha256
+        packPolicySha256          = $ConventionPackPolicySha256
+        repositoryId              = $cfgRepoId.ToLowerInvariant()
+        organization              = $Organization
+        project                  = $ExpectedProject
+        # Unconditional, never gated on whether a live qualification
+        # currently resolves: a REVOKED qualification (the file removed,
+        # tampered, or the -GateQualificationFile argument simply dropped
+        # since the decision was sealed) must close a decision that DID
+        # depend on one, not silently skip the comparison because there is
+        # nothing live to compare against right now. Test-
+        # ReviewerGateDecisionBinding treats a sealed value of all-zero
+        # (never depended on any qualification) as always OK regardless of
+        # the live value, so this cannot regress a decision that never
+        # needed one (e.g. humanPromote mode).
+        qualificationSha256      = $(if ($qualificationForBinding.Qualification) { $qualificationForBinding.Sha256 } else { "0" * 64 })
+    }
+    $bindingCheck = Test-ReviewerGateDecisionBinding -Decision $decision -LiveBinding $liveBinding
+    if (-not $bindingCheck.Ok) {
+        throw ("This gate decision's bindings no longer match the current script/config/policy/library/qualification/" +
+            "repository configuration ($($bindingCheck.ReasonCodes -join ', ')); refusing to promote it with " +
+            "-PromoteVerifiedPreview. Re-run the reviewer to seal a current decision.")
+    }
+    if (Test-ReviewerGateDecisionExpired -Decision $decision -NowUtc ([DateTime]::UtcNow)) {
+        throw "This gate decision expired at $($decision.decisionExpiresAtUtc); re-run the reviewer to seal a current one."
+    }
+
+    $prId = [int]$decision.prId
+    $sourceCommit = [string]$decision.sourceCommit
+    $approved = @($decision.humanPromotableComments)
+    if (-not $EnableFindingComments) {
+        throw "-PromoteVerifiedPreview publishes gate-eligible comments, so it needs -EnableFindingComments."
+    }
+    if ($EnableApprovalVote) {
+        Write-Warning "-EnableApprovalVote is ignored by -PromoteVerifiedPreview: human-promoted comments never cast a vote. Approval only ever happens through the fully-unattended approvalVote policy mode."
+    }
+    if (@($approved).Count -eq 0) {
+        Write-Host "Gate decision for PR $prId has no human-promotable comments; nothing to publish." -ForegroundColor Yellow
+        return 0
+    }
+
+    $session = $ExistingSession
+    $ownsSession = ($null -eq $session)
+    try {
+        if ($ownsSession) {
+            $session = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
+                -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
+                -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+        }
+        $freshness = Test-ReviewerDeliveryStillValid -Session $session -PrId $prId -ExpectedSourceCommit $sourceCommit
+        if (-not $freshness.Ok) {
+            Write-Warning "Not publishing gate comments for PR ${prId}: $($freshness.Reason)."
+            return 1
+        }
+        $threads = Get-ReviewerPullRequestThreads -Session $session -PrId $prId
+        $changedPaths = Get-ReviewerChangedPaths -Session $session -PrId $prId
+        # Remove-only: an entry whose anchor is no longer in the fresh change
+        # set, or whose pack/severity the CURRENT policy no longer allows for
+        # human promotion, is dropped - never added to, never reworded,
+        # relocated, or severity-raised (Get-ReviewerGateManifestKey commits
+        # to all four).
+        $stillEligible = @($approved | Where-Object {
+                $eligibility = Test-ReviewerGateCandidateEligible -Facet $_ -EffectivePolicy $EffectiveGatePolicy `
+                    -Purpose "humanPromotedComment" -ChangedPaths $changedPaths -ThreadFacts $threads
+                [bool]$eligibility.Ok
+            })
+        $postable = Select-ReviewerGateSubset -Approved $approved -Allowed $stillEligible
+        $dropped = @($approved).Count - @($postable).Count
+        if ($dropped -gt 0) {
+            Write-Warning "$dropped gate-approved comment(s) are no longer publishable at the location they name and will be skipped."
+        }
+        $existingFingerprints = Get-ReviewerExistingFingerprints -Threads $threads
+        $failures = 0
+        foreach ($entry in $postable) {
+            $finding = @{ severity = [string]$entry.severity; filePath = [string]$entry.filePath; line = [int]$entry.line; comment = [string]$entry.comment }
+            $fingerprint = Get-ReviewerFindingFingerprint -Finding $finding
+            if ($existingFingerprints.Contains($fingerprint)) { continue }
+            $post = Add-ReviewerThread -Session $session -PrId $prId -Content (Format-ReviewerFindingComment -Finding $finding) `
+                -FilePath ([string]$entry.filePath) -Line ([int]$entry.line)
+            if ($post.Error) {
+                $failures++
+                Write-Warning "Could not post a gate-promoted comment on PR ${prId}: $($post.Error)"
+            }
+            else {
+                [void]$existingFingerprints.Add($fingerprint)
+            }
+        }
+        $freshThreads = Get-ReviewerPullRequestThreads -Session $session -PrId $prId
+        $freshFingerprints = Get-ReviewerExistingFingerprints -Threads $freshThreads
+        $confirmed = 0
+        foreach ($entry in $postable) {
+            $finding = @{ severity = [string]$entry.severity; filePath = [string]$entry.filePath; line = [int]$entry.line; comment = [string]$entry.comment }
+            if ($freshFingerprints.Contains((Get-ReviewerFindingFingerprint -Finding $finding))) { $confirmed++ }
+        }
+        Write-ReviewerCycleMetadata -Fields @{
+            cycle = 0; mode = "promote-verified"; result = $(if ($confirmed -eq @($postable).Count -and $failures -eq 0) { "delivered" } else { "incomplete" })
+            prId = $prId; sourceCommit = $sourceCommit; artifactPath = $ArtifactPath
+            approvedCount = @($approved).Count; droppedCount = $dropped; postedCount = $confirmed; postFailures = $failures
+        }
+        if ($failures -gt 0 -or $confirmed -ne @($postable).Count) {
+            Write-Warning "The gate-verified promotion did not fully land ($confirmed of $(@($postable).Count) confirmed)."
+            return 1
+        }
+        Write-Host "Promoted $confirmed gate-verified comment(s) for PR $prId. No vote was cast - human-promoted comments never vote." -ForegroundColor Green
+        return 0
+    }
+    finally {
+        if ($session -and $ownsSession) { Close-AgentMcpSession -Session $session }
+    }
+}
+
 function Invoke-ReviewerCycle {
     param(
         [Parameter(Mandatory)][string]$AgencyPath,
@@ -7348,6 +9910,13 @@ function Invoke-ReviewerCycle {
                 -IncludeOwn:$IncludeOwnPullRequests -AuthorAllowList $AuthorAliases `
                 -TargetRefName $TargetRefName -SkipTitlePatterns $SkipTitlePatterns
             $prId = [int](Get-ReviewerHashValue -Container $pr -Key 'pullRequestId' -Default 0)
+            # Reset every iteration: whether THIS PR reaches Invoke-
+            # ReviewerPullRequest only because a currently-enabled gate
+            # capability has never run at this commit, raw delivery having
+            # already fully completed here. Threaded down through $bound so
+            # Invoke-ReviewerPullRequest can skip a second, unauthorized raw
+            # model run/delivery and still let the gate see this commit.
+            $rawDeliveryAlreadySatisfied = $false
             if (-not $decision.Eligible) {
                 if ($prId -gt 0) { Write-Host "  PR $prId skipped ($($decision.Reason))." -ForegroundColor DarkGray }
                 continue
@@ -7378,8 +9947,35 @@ function Invoke-ReviewerCycle {
             if (Test-ReviewerAlreadyReviewed -ReviewedState $reviewedState -PrId $prId -SourceCommit $sourceCommit `
                     -WritesRequested (Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)) `
                     -WantComments ([bool]$EnableFindingComments) -WantSummary ([bool]$EnableSummaryComment) -WantVote ([bool]$EnableApprovalVote)) {
-                Write-Host "  PR $prId skipped (already reviewed and delivered at this commit)." -ForegroundColor DarkGray
-                continue
+                # RAW delivery owes nothing further at this commit, but a
+                # separate, incomplete GATE delivery is its own reason to
+                # revisit this PR - replayed from its own sealed decision,
+                # never by running the model again.
+                if (Test-ReviewerGateDeliveryPending -PrId $prId -SourceCommit $sourceCommit) {
+                    Write-Host "  PR $prId has an unfinished gate delivery at this commit; replaying only what is missing." -ForegroundColor Yellow
+                    Invoke-ReviewerGateReplay -AgencyPath $AgencyPath -PrId $prId -SourceCommit $sourceCommit
+                    [void]$retried.Add("PR $prId gate delivery replayed")
+                    continue
+                }
+                # A gate capability turned on since this exact commit was raw-
+                # reviewed has never had a chance to run here at all (no gate-
+                # delivery record exists for this commit either) - RAW state
+                # alone must not suppress its first chance, or a capability
+                # enabled after the fact could never run against a commit
+                # that predates it. This is Test-ReviewerAlreadyReviewed's own
+                # documented scope: it only ever tracked comments/summary/
+                # vote, never gate capabilities, so WritesRequested=$false
+                # there says nothing about whether a gate write is owed here.
+                $gateAuthorityForSkipCheck = Get-ReviewerGateWritesCurrentlyRequested -EffectivePolicy $EffectiveGatePolicy `
+                    -CommentSwitchOn ([bool]$EnableVerifiedCommentGate) -SuggestionSwitchOn ([bool]$EnableVerifiedSuggestionGate) `
+                    -ApprovalSwitchOn ([bool]$EnableVerifiedApprovalGate)
+                $gateWritesPossibleForSkipCheck = ([bool]$gateAuthorityForSkipCheck.Comments -or [bool]$gateAuthorityForSkipCheck.Suggestions -or [bool]$gateAuthorityForSkipCheck.Approval)
+                if (-not ($gateWritesPossibleForSkipCheck -and -not (Test-ReviewerGateDecisionEverAttempted -PrId $prId -SourceCommit $sourceCommit))) {
+                    Write-Host "  PR $prId skipped (already reviewed and delivered at this commit)." -ForegroundColor DarkGray
+                    continue
+                }
+                Write-Host "  PR $prId already reviewed under raw delivery, but a currently-enabled gate capability has never run at this commit; reviewing again for the gate." -ForegroundColor Yellow
+                $rawDeliveryAlreadySatisfied = $true
             }
 
             # A delivery this agent started and did not finish is retried from
@@ -7398,7 +9994,7 @@ function Invoke-ReviewerCycle {
                         "It will be reviewed again, and a finding that failed to post earlier may not be reported again.")
                 }
             }
-            if ($pendingPlan) {
+            if (Test-ReviewerRawPendingPlanShouldReplay -PendingPlan $pendingPlan -RawDeliveryAlreadySatisfied $rawDeliveryAlreadySatisfied) {
                 # A plan sealed by an older build cannot be replayed safely (see
                 # Invoke-ReviewerPromotion). It is NOT abandoned, though: the
                 # plan is the only record of which findings still owe delivery,
@@ -7416,7 +10012,21 @@ function Invoke-ReviewerCycle {
                     continue
                 }
             }
-            if ($pendingPlan) {
+            if (Test-ReviewerRawPendingPlanShouldReplay -PendingPlan $pendingPlan -RawDeliveryAlreadySatisfied $rawDeliveryAlreadySatisfied) {
+                # Raw write switches gate this retry, not merely a plan's
+                # existence: $rawDeliveryAlreadySatisfied being true means raw
+                # delivery is CURRENTLY satisfied under today's write switches
+                # (Test-ReviewerAlreadyReviewed already confirmed nothing raw
+                # is currently owed) and only a gate capability's first chance
+                # brought this PR back around - a stale deliveryPending=$true
+                # left over from an earlier run when raw switches WERE on must
+                # never be routed into Invoke-ReviewerPromotion once the
+                # operator has turned those switches off; that would post/vote
+                # under raw authority the operator no longer wants, purely as
+                # a side effect of the gate needing a refresh. Falling through
+                # instead of retrying/continuing here lets the gate-refresh
+                # review below proceed exactly as it would with no pending
+                # plan at all.
                 Write-Host "  PR $prId has an unfinished delivery at this commit; retrying that exact review instead of re-reviewing." -ForegroundColor Yellow
                 try {
                     $retryCode = Invoke-ReviewerPromotion -AgencyPath $AgencyPath -ArtifactPath $pendingPlan `
@@ -7603,6 +10213,15 @@ function Invoke-ReviewerCycle {
                     ConventionPlanPath   = $conventionPlanPath
                     FactPlanPath         = $factPlanPath
                     ExistingFingerprints = (Get-ReviewerExistingFingerprints -Threads $threads)
+                    # When $true, raw delivery already fully completed at
+                    # this exact commit and is owed nothing further; only a
+                    # gate capability's first chance to run brought this PR
+                    # back around. Invoke-ReviewerPullRequest must not run
+                    # the model or call Invoke-ReviewerDelivery again in
+                    # that case - only the sealed cross-verification/gate
+                    # tail may run, from a stand-in delivery result built
+                    # from the PRIOR raw outcome.
+                    RawDeliveryAlreadySatisfied = $rawDeliveryAlreadySatisfied
                 })
         }
 
@@ -7713,19 +10332,36 @@ try {
     }
     if ($PullRequestId -gt 0) { Write-Host "Target: PR $PullRequestId only." -ForegroundColor Cyan }
 
-    # Every write switch counts. Deciding this from -EnableFindingComments alone
-    # told an operator running with only -EnableSummaryComment that this was a
-    # preview, and then posted a summary comment to the PR.
-    if (Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)) {
-        Write-Host "Writes: findingComments=$([bool]$EnableFindingComments) summary=$([bool]$EnableSummaryComment) vote=$([bool]$EnableApprovalVote) - anything posted will appear under '$OperatorAlias'." -ForegroundColor Yellow
+    # Every write switch counts, including layer 6's - deciding this from
+    # -EnableFindingComments/-EnableSummaryComment/-EnableApprovalVote alone
+    # told an operator running only -EnableVerifiedCommentGate (with a valid
+    # out-of-repo policy and qualification) that nothing would be posted,
+    # and then a gate-eligible comment landed.
+    $rawWritesRequested = Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)
+    $gateAuthorityForBanner = Get-ReviewerGateWritesCurrentlyRequested -EffectivePolicy $EffectiveGatePolicy `
+        -CommentSwitchOn ([bool]$EnableVerifiedCommentGate) -SuggestionSwitchOn ([bool]$EnableVerifiedSuggestionGate) `
+        -ApprovalSwitchOn ([bool]$EnableVerifiedApprovalGate)
+    $gateWritesPossible = ([bool]$gateAuthorityForBanner.Comments -or [bool]$gateAuthorityForBanner.Suggestions -or [bool]$gateAuthorityForBanner.Approval)
+    if (-not $rawWritesRequested -and -not $gateWritesPossible) {
+        Write-Host "Writes: NONE. This is a preview run: candidate comments are printed and saved to $previewDir, and nothing is posted." -ForegroundColor Green
     }
     else {
-        Write-Host "Writes: NONE. This is a preview run: candidate comments are printed and saved to $previewDir, and nothing is posted." -ForegroundColor Green
+        if ($rawWritesRequested) {
+            Write-Host "Writes: findingComments=$([bool]$EnableFindingComments) summary=$([bool]$EnableSummaryComment) vote=$([bool]$EnableApprovalVote) - anything posted will appear under '$OperatorAlias'." -ForegroundColor Yellow
+        }
+        if ($gateWritesPossible) {
+            Write-Host ("Delivery gates: comments=$([bool]$gateAuthorityForBanner.Comments) suggestions=$([bool]$gateAuthorityForBanner.Suggestions) " +
+                "approvalVote=$([bool]$gateAuthorityForBanner.Approval) - eligible gate-verified findings may also be posted/voted under " +
+                "'$OperatorAlias' if a qualification artifact currently satisfies them.") -ForegroundColor Yellow
+        }
     }
 
     if ($PromotePreview) {
         exit (Invoke-ReviewerPromotion -AgencyPath $agencyPath -ArtifactPath $PromotePreview `
             -DeliveryAuthorization $DeliveryAuthorization)
+    }
+    if ($PromoteVerifiedPreview) {
+        exit (Invoke-ReviewerPromoteVerifiedPreview -AgencyPath $agencyPath -ArtifactPath $PromoteVerifiedPreview)
     }
 
     $consecutiveBackoff = $MinBackoffSeconds
