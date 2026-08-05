@@ -863,18 +863,52 @@ function ConvertFrom-AgentResultMarker {
             if ($candidates.Count -gt 16) { return $null }
         }
         if ($candidates.Count -eq 0) { return $null }
-        # Every occurrence must parse, and every occurrence must MEAN the same
-        # thing. Whitespace and key order are allowed to differ - a fenced,
-        # pretty-printed restatement of the same result is the same result - but
-        # any semantic difference, including one extra key or one changed
-        # character of nonce, fails the whole marker closed. Parsing every
-        # occurrence rather than only the first is deliberate: an unparseable
-        # second occurrence is ambiguity, not noise.
-        $obj = $null
-        $canonical = $null
+        # Every occurrence must parse. Whitespace and key order are allowed to
+        # differ - a fenced, pretty-printed restatement of the same result is
+        # the same result - but any semantic difference fails closed.
+        #
+        # Occurrences are first filtered by the schema's EXACT-valued fields,
+        # of which the per-cycle nonce is one. The nonce is generated after the
+        # PR's content was authored, so no text a PR author planted can carry
+        # it. Without that filter, a source line reading
+        # "<PREFIX>: {...}" - which the wrapper now injects into the model's
+        # context as pinned source, and which the model may echo at a line
+        # start while quoting evidence - would be a second, conflicting
+        # candidate and would veto the whole review. That is an author-
+        # controlled kill switch on being reviewed.
+        #
+        # If nothing matches, the candidates are kept as-is so the real marker
+        # still fails field validation below rather than being waved through.
+        $parsedCandidates = New-Object System.Collections.Generic.List[object]
         foreach ($candidate in $candidates) {
             $parsed = $candidate | ConvertFrom-Json -ErrorAction Stop
             if ($parsed -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+            [void]$parsedCandidates.Add($parsed)
+        }
+        $exactFields = @($Schema.Keys | Where-Object {
+                $spec = $Schema.Fields[$_]
+                $null -ne $spec -and [string]$spec.Type -ceq 'exact'
+            })
+        if ($exactFields.Count -gt 0) {
+            $bound = @($parsedCandidates | Where-Object {
+                    $item = $_
+                    $ok = $true
+                    foreach ($name in $exactFields) {
+                        $property = $item.PSObject.Properties[$name]
+                        if ($null -eq $property -or $property.Value -isnot [string] -or
+                            [string]$property.Value -cne [string]$Schema.Fields[$name].Expected) {
+                            $ok = $false
+                            break
+                        }
+                    }
+                    $ok
+                })
+            if ($bound.Count -gt 0) { $parsedCandidates = [System.Collections.Generic.List[object]]$bound }
+        }
+
+        $obj = $null
+        $canonical = $null
+        foreach ($parsed in $parsedCandidates) {
             $parsedCanonical = ConvertTo-AgentCanonicalMarkerJson -Value $parsed
             if ($null -eq $canonical) {
                 $canonical = $parsedCanonical

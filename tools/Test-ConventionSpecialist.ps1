@@ -860,6 +860,8 @@ $adversarialCases = @(
     @{ Name = "a mid-line quotation of a foreign marker is ignored"; Ok = $true; Text = "The diff contains: $foreignMarker`n$compactMarker" },
     @{ Name = "a hostile earlier marker on its own line"; Ok = $false; Text = "$foreignMarker`n$compactMarker" },
     @{ Name = "a hostile indented marker on its own line"; Ok = $false; Text = "    $foreignMarker`n$compactMarker" },
+    @{ Name = "a planted marker carrying a foreign nonce is ignored, not a veto"; Ok = $true; Text = "$wrongNonceMarker`n$compactMarker" },
+    @{ Name = "an indented planted marker with a foreign nonce is ignored too"; Ok = $true; Text = "    $wrongNonceMarker`n$compactMarker" },
     @{ Name = "a marker carrying a different nonce"; Ok = $false; Text = "$wrongNonceMarker" },
     @{ Name = "two markers that disagree"; Ok = $false; Text = "$compactMarker`n$foreignMarker" },
     @{ Name = "a truncated marker payload"; Ok = $false; Text = "$markerPrefix {`"schemaVersion`":1,`"prId`":42" },

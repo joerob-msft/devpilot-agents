@@ -179,6 +179,12 @@ $pathOnlyEntry = [pscustomobject]@{
 }
 $pathOnlySpans = Get-ReviewerSourceChangedSpans -Response @($pathOnlyEntry)
 Assert-Source (@($pathOnlySpans['/src/c.cs']).Count -eq 1) "an entry carrying its path without an item wrapper still yields spans"
+$blocksOutsideDiff = [pscustomobject]@{
+    item           = [pscustomobject]@{ path = '/src/d.cs'; isFolder = $false }
+    lineDiffBlocks = @([pscustomobject]@{ changeType = 1; modifiedLineNumberStart = 2; modifiedLinesCount = 2 })
+}
+$outsideSpans = Get-ReviewerSourceChangedSpans -Response @($blocksOutsideDiff)
+Assert-Source (@($outsideSpans['/src/d.cs']).Count -eq 1) "line blocks carried outside a diff wrapper still yield spans"
 
 # ---------------------------------------------------------------------------
 Write-Host "[4/9] Spans expand, clamp, and merge deterministically" -ForegroundColor Cyan
@@ -384,8 +390,16 @@ Assert-Source ((ConvertTo-ReviewerSourcePath -Path $forgedPath) -ceq '') `
 $forgedReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @($forgedPath, '/src/ok.cs') `
     -SpansByPath $spansByPath -Policy $policy -Reader $reader
 $forgedRendered = Format-ReviewerSealedSourceBlock -Report $forgedReport -NonceFactory $nonceFactory
-Assert-Source (([regex]::Matches($forgedRendered, '(?m)^\|')).Count -eq 4) `
-    "a hostile path cannot add rows or cells to the accounting table"
+# Count CELLS, not rows: a markdown renderer silently drops cells past the
+# header's column count, so extra cells - not extra rows - are how a forged
+# path would present an unread file as delivered.
+foreach ($row in @($forgedRendered -split "`n" | Where-Object { $_.StartsWith('|', [StringComparison]::Ordinal) })) {
+    Assert-Source ((@($row -split '\|')).Count -eq 6) "accounting row '$row' has exactly four cells"
+}
+Assert-Source (-not $forgedRendered.Contains($forgedPath, [StringComparison]::Ordinal)) `
+    "a refused path is never echoed into the model-facing block"
+Assert-Source ($forgedRendered.Contains('rejected path #1', [StringComparison]::Ordinal)) `
+    "a refused path is counted with a stable placeholder"
 Assert-Source ($forgedRendered.Contains('pathRejected', [StringComparison]::Ordinal)) `
     "a refused path is still accounted, never dropped"
 Assert-Source (Test-Throws {
@@ -530,6 +544,10 @@ Assert-Source (Test-Throws {
 Assert-Source (Test-Throws {
         Assert-ReviewerSourceChangeSetAgreement -ChangedPaths @('/src/a.cs', '/src/b.cs') -SpansByPath ([ordered]@{})
     }) "a full path list against an empty span map is rejected as an unrecognized response shape"
+Assert-Source (Test-Throws {
+        Assert-ReviewerSourceChangeSetAgreement -ChangedPaths @('/src/a.cs', '/src/b.cs') `
+            -SpansByPath ([ordered]@{ '/src/a.cs' = @(); '/src/b.cs' = @() })
+    }) "a span map with a key per path but no spans at all is rejected too"
 try {
     Assert-ReviewerSourceChangeSetAgreement -ChangedPaths @('src/a.cs', '\src\b.cs', '/src/c.cs') -SpansByPath $agreementSpans
     Assert-Source $true "agreement tolerates separator and leading-slash differences, and extra non-diff paths"
@@ -544,6 +562,61 @@ try {
 catch {
     Assert-Source $false "an empty change set agrees with an empty span map"
 }
+
+# ---------------------------------------------------------------------------
+Write-Host "[12/12] The gate is actually wired into the review path" -ForegroundColor Cyan
+# ---------------------------------------------------------------------------
+
+# Every check above proves the library refuses. None of them proves the WRAPPER
+# asks. Without these, deleting the skip branch or dropping the sealed block
+# from the model's context would leave the whole suite green while restoring
+# the exact production failure this layer exists to prevent.
+$wrapperPath = Join-Path $repoRoot 'src/Agents/reviewer/Start-ReviewerAgent.ps1'
+$wrapperText = [IO.File]::ReadAllText($wrapperPath)
+$wrapperTokens = $null
+$wrapperErrors = $null
+$wrapperAst = [Management.Automation.Language.Parser]::ParseInput($wrapperText, [ref]$wrapperTokens, [ref]$wrapperErrors)
+Assert-Source ($wrapperErrors.Count -eq 0) "the reviewer wrapper parses"
+
+function Get-WrapperFunctionText {
+    param([Parameter(Mandatory)][string]$Name)
+    $node = $wrapperAst.FindAll({
+            param($candidate)
+            $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -ceq $Name
+        }, $true) | Select-Object -First 1
+    if (-not $node) { return "" }
+    return $node.Extent.Text
+}
+
+$cycleText = Get-WrapperFunctionText -Name 'Invoke-ReviewerCycle'
+Assert-Source ($cycleText.Length -gt 0) "Invoke-ReviewerCycle is present"
+$transportAt = $cycleText.IndexOf('Get-ReviewerSourceTransport', [StringComparison]::Ordinal)
+$reviewAt = $cycleText.IndexOf('Invoke-ReviewerPullRequest -Session', [StringComparison]::Ordinal)
+Assert-Source ($transportAt -ge 0 -and $reviewAt -ge 0 -and $transportAt -lt $reviewAt) `
+    "the cycle reads pinned source before it reviews any pull request"
+Assert-Source ($cycleText -match '\$sourceTransport\.Gate\.Ok') `
+    "the cycle branches on the coverage gate"
+Assert-Source ($cycleText -match 'if \(-not \$sourceTransport\.Gate\.Ok\)[\s\S]{0,900}?continue') `
+    "a failed coverage gate skips the pull request instead of reviewing it"
+Assert-Source ($cycleText -match 'PinnedSourceText\s*=' -and $cycleText -match 'SourceCoverage\s*=') `
+    "the sealed block and its coverage record are bound onto the reviewed pull request"
+Assert-Source ($cycleText -match 'the pinned source transport failed[\s\S]{0,600}?continue') `
+    "a transport exception also skips the pull request rather than reviewing without source"
+
+$transportText = Get-WrapperFunctionText -Name 'Get-ReviewerSourceTransport'
+Assert-Source ($transportText -match 'Assert-ReviewerSourceChangeSetAgreement') `
+    "the wrapper cross-checks its two change-set extractions"
+Assert-Source ($transportText -match 'moved from .* while its pinned source was being read') `
+    "the wrapper re-pins the source commit after reading"
+Assert-Source ($transportText -notmatch '@\(Get-ReviewerChangePathsFromResponse') `
+    "the wrapper does not re-introduce the array-nesting bug that collapsed the change set"
+
+$passText = Get-WrapperFunctionText -Name 'Invoke-ReviewerModelPass'
+Assert-Source ($passText -match 'PinnedSourceText') "the generalist runtime context carries the sealed block"
+$prText = Get-WrapperFunctionText -Name 'Invoke-ReviewerPullRequest'
+Assert-Source ($prText -match 'ReviewerMarkerRetryAttempts') "the marker retry is wired into the pass loop"
+Assert-Source ($prText -match "notmatch 'missing or invalid result marker'") `
+    "only a genuine marker parse failure is retried"
 
 # ---------------------------------------------------------------------------
 

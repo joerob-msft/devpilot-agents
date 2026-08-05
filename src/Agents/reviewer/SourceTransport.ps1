@@ -239,7 +239,13 @@ function Get-ReviewerSourceChangedSpans {
         if ([bool](Get-ReviewerSourceValue -Object $item -Name "isFolder" -Default $false)) { continue }
         if (-not $spansByPath.Contains($path)) { $spansByPath[$path] = [System.Collections.Generic.List[object]]::new() }
         $diff = Get-ReviewerSourceValue -Object $change -Name "diff"
-        foreach ($block in @(Get-ReviewerSourceValue -Object $diff -Name "lineDiffBlocks" -Default @())) {
+        $blocks = @(Get-ReviewerSourceValue -Object $diff -Name "lineDiffBlocks" -Default @())
+        # Some shapes carry the line blocks on the entry itself rather than
+        # under a `diff` wrapper.
+        if ($blocks.Count -eq 0) {
+            $blocks = @(Get-ReviewerSourceValue -Object $change -Name "lineDiffBlocks" -Default @())
+        }
+        foreach ($block in $blocks) {
             if ($null -eq $block) { continue }
             # Bounded so a pathological diff cannot drive an unbounded sort.
             if ($spansByPath[$path].Count -ge $script:ReviewerSourceMaxSpansPerPath) { break }
@@ -377,13 +383,17 @@ function Assert-ReviewerSourceChangeSetAgreement {
             "$($missing.Count) path(s), so one of them mis-parsed the response: " +
             (($missing | Select-Object -First 5) -join ', ') + ".")
     }
-    # The check has to run in BOTH directions. A span map that came back empty
-    # while the path list is full satisfies the subset test trivially, and its
-    # symptom - every file accounted noChangedSpans, coverage zero, every PR
-    # skipped - is indistinguishable from a principled refusal.
-    if ($normalized.Count -gt 0 -and @($SpansByPath.Keys).Count -eq 0) {
-        throw ("The change set names $($normalized.Count) changed path(s) but the diff span map is " +
-            "empty, so the change-set response shape was not understood.")
+    # The check has to run in BOTH directions, and on SPANS rather than keys. A
+    # span map that has a key per path but no spans under any of them - which
+    # is what an unrecognized line-diff-block shape produces - satisfies the
+    # subset test trivially, and its symptom (every file noChangedSpans,
+    # coverage zero, every PR skipped) is indistinguishable from a principled
+    # refusal.
+    $totalSpans = 0
+    foreach ($spanPath in @($SpansByPath.Keys)) { $totalSpans += @($SpansByPath[$spanPath]).Count }
+    if ($normalized.Count -gt 0 -and $totalSpans -eq 0) {
+        throw ("The change set names $($normalized.Count) changed path(s) but not one changed line span was " +
+            "understood, so the change-set response shape was not recognized.")
     }
 }
 
@@ -652,18 +662,22 @@ function Format-ReviewerSealedSourceBlock {
     [void]$lines.Add("")
     [void]$lines.Add("| changed path | status | reason | lines delivered |")
     [void]$lines.Add("|---|---|---|---|")
+    $rejectedIndex = 0
     foreach ($file in @($Report.Files)) {
         $delivered = @($file.Slices | ForEach-Object { "$($_.StartLine)-$($_.EndLine)" })
         $deliveredText = if ($delivered.Count -gt 0) { $delivered -join ", " } else { "(none)" }
         $reasonText = if ([string]$file.Reason) { [string]$file.Reason } else { "-" }
-        # The path is the only attacker-controlled cell in this row. Table and
-        # fence metacharacters are already refused by path normalization; a
-        # rejected path is rendered as JSON so it cannot forge extra cells.
-        $pathCell = if ((ConvertTo-ReviewerSourcePath -Path ([string]$file.Path)) -ceq [string]$file.Path) {
-            "``$($file.Path)``"
-        }
+        # The path is the only attacker-controlled cell in this row, and a
+        # markdown renderer silently drops cells past the header's column
+        # count - so a path carrying pipes could present an unread file as
+        # `delivered` and hide its real status off the end of the row. Path
+        # normalization already refuses those characters; a path that failed
+        # normalization is NEVER echoed, only counted.
+        $normalizedPath = ConvertTo-ReviewerSourcePath -Path ([string]$file.Path)
+        $pathCell = if ($normalizedPath -ceq [string]$file.Path) { "``$($file.Path)``" }
         else {
-            ConvertTo-Json -InputObject ([string]$file.Path) -Compress
+            $rejectedIndex++
+            "(rejected path #$rejectedIndex, not shown)"
         }
         [void]$lines.Add("| $pathCell | $($file.Status) | $reasonText | $deliveredText |")
     }

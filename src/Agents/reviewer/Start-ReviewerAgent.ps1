@@ -1871,6 +1871,11 @@ $script:ReviewerAuthoritativeMaxTotalBytes = 262144
 # to a few. Without this split, naming a section in a large document still
 # failed the read, which is exactly how large rule documents ended up never
 # reaching the reviewer at all.
+# The decoder's own hard ceiling. The source transport reads up to this and
+# then applies its policy's per-file bound itself, so an oversized file is
+# accounted `fileTooLarge` - which is what the docs promise and what tells an
+# operator to raise the cap - instead of surfacing as an opaque decode failure.
+$script:ReviewerSourceDecoderCeilingBytes = 5242880
 $script:ReviewerAuthoritativeMaxDocumentBytes = 524288
 $script:ReviewerMaxModelInputBytes = 393216
 $script:ReviewerAuthoritativeMimeTypes = @("text/plain", "text/markdown")
@@ -7384,6 +7389,13 @@ function Get-ReviewerSourceTransport {
     Assert-ReviewerSourceChangeSetAgreement -ChangedPaths $paths -SpansByPath $spansByPath
     $reader = {
         param([string]$Path)
+        # The request and the decode are separated deliberately. EVERY failure
+        # Send-AgentMcpRequest raises has already aborted the session, and the
+        # session is shared by every PR in this cycle - so absorbing one as
+        # "this file was unreadable" would grind through the rest of the change
+        # set and then take out the whole cycle with a misleading reason. The
+        # decoder runs after the response is in hand and never touches the
+        # session, so only its failures are one file's problem.
         $toolResult = Send-AgentMcpRequest -Session $Session -Method "tools/call" -Params @{
             name = "repo_file"
             arguments = @{
@@ -7395,9 +7407,16 @@ function Get-ReviewerSourceTransport {
                 version = $SourceCommit
             }
         }
-        $resource = ConvertFrom-AgentMcpResourceContent -ToolResult $toolResult -ExpectedUri $Path `
-            -MaxBytes ([int]$SourceTransportPolicy.maxFetchBytesPerFile) `
-            -AllowedMimeTypes @($SourceTransportPolicy.allowedMimeTypes)
+        try {
+            $resource = ConvertFrom-AgentMcpResourceContent -ToolResult $toolResult -ExpectedUri $Path `
+                -MaxBytes $script:ReviewerSourceDecoderCeilingBytes `
+                -AllowedMimeTypes @($SourceTransportPolicy.allowedMimeTypes)
+        }
+        catch {
+            # Unreadable content is this file's problem, not the cycle's. The
+            # report records it with a reason; the caller keeps going.
+            return $null
+        }
         return [pscustomobject]@{
             Text       = [string]$resource.Text
             MimeType   = [string]$resource.MimeType

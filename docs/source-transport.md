@@ -186,9 +186,14 @@ schema:
   byte-for-byte, so a pretty-printed restatement alongside the required compact
   line is one result rather than a conflict — while two markers that genuinely
   disagree still fail closed;
-- marker extraction is anchored to line starts, so a finding that quotes
-  attacker-planted text such as `// REVIEWER_RESULT_V1: {...}` cannot
-  manufacture a conflicting second candidate and veto its own review;
+- extraction is anchored to line starts, and occurrences are then filtered by
+  the schema's exact-valued fields — the per-cycle nonce among them. The nonce
+  is generated after the PR's content was authored, so a marker a PR author
+  planted in a source file cannot carry it. That matters more now that the
+  wrapper injects raw file lines into the model's context: without the filter,
+  a source line reading `REVIEWER_RESULT_V1: {...}` that the model echoed while
+  quoting evidence would be a conflicting second candidate and would veto its
+  own review. Two nonce-matching markers that disagree still fail closed;
 - a pass whose run was otherwise clean but whose marker was unusable is retried
   **once**, in a fresh session with a fresh nonce. A timeout, a nonzero exit, an
   environment fault, or a marker bound to the wrong PR is never retried.
