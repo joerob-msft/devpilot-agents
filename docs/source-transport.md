@@ -118,7 +118,7 @@ delete is *vacuously* covered and is reviewed on its diff. A change set that onl
 looks source-free because the reader called every path's bytes non-text is **not**:
 that is the same host whose misbehaviour lost the line-diff blocks in the first
 place, so if anything left the denominator on the reader's say-so and nothing was
-delivered, the gate refuses with `sourceCoverageEmpty` instead of passing at a
+delivered, the gate refuses with `sourceReadableNothing` instead of passing at a
 vacuous 100%.
 
 The kinds treated as carrying no content are `delete`, `rename`, `sourcerename`,
@@ -138,9 +138,20 @@ is capped at 16 per pull request — but the budget is spent only on reads that
 come back **content-bearing**. The case worth bounding is a response that lost
 every line-diff block, where every probe returns real text and the coverage floor
 is going to refuse the pull request anyway; a pull request that adds forty icons
-returns forty non-text answers, spends no budget, and stays reviewable. Past the
-cap a path is counted uncovered without being read, which is the fail-closed
-direction. All reads remain bounded by `maxFiles` and `maxFetchBytesPerFile`.
+returns forty non-text answers and spends no budget. Past the cap a path is
+counted uncovered without being read, which is the fail-closed direction. All
+reads remain bounded by `maxFiles` and `maxFetchBytesPerFile`.
+
+One consequence is worth stating plainly. A pull request consisting of **nothing
+but** assets — an icon set, a fixture directory, a localization bundle — leaves
+every path excused on the reader's say-so, delivers no source at all, and is
+therefore refused under `sourceReadableNothing` rather than reviewed. That is
+deliberate and it is the fail-closed side of the rule above: the same shape is
+what a host that lost every line-diff block and mislabelled every MIME type
+produces, and nothing in the response distinguishes them. It has its own reason
+code so an operator reading the log sees *this* case rather than a transport
+fault, and a single text file anywhere in the change set is enough to make the
+pull request reviewable again.
 
 No hunk is ever invented for these paths. The pull request reported no hunks for
 them, so they contribute nothing to the span numerator or denominator — the
@@ -191,11 +202,13 @@ report into a pass/fail with explicit reason codes:
 | `sourceCoverageBelowPercentFloor` | covered share of source-bearing files below the policy percentage |
 | `sourceCoverageBelowSpanFloor` | delivered share of changed hunks below the policy percentage |
 | `sourceCoverageUnknown` | the change set could not be established at all |
+| `sourceReadableNothing` | nothing was delivered, and the only reason the denominator is empty is that the reader called every path's bytes unreadable |
 
 Every percentage is measured against the changed files that actually carry added
 or edited lines. A change set with no source-bearing files at all passes with no
-reason codes: there was nothing to deliver, which is a different thing from
-having failed to deliver something.
+reason codes **when the change set itself said so** — there was nothing to
+deliver, which is a different thing from having failed to deliver something. When
+the reader is what emptied it, `sourceReadableNothing` is raised instead.
 
 The span floor exists because a file-level count alone can be gamed by
 arithmetic: a change set where every file delivered one region out of twenty-four

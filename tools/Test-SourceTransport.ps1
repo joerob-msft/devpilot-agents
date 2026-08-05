@@ -1120,15 +1120,20 @@ Assert-Source (-not (Test-ReviewerSourceCoverageGate -Report $refusedTextReport 
 # The fail-open the reason split closes: a host that BOTH loses the line blocks
 # and mislabels the MIME type would otherwise empty the denominator itself and
 # be rewarded with a vacuous 100% pass over three unread source files.
-$hostiletMimeReport = New-ReviewerSourceTransportReport -CommitSha $commit `
+$hostileMimeReport = New-ReviewerSourceTransportReport -CommitSha $commit `
     -ChangedPaths @('/src/h1.cs', '/src/h2.cs', '/src/h3.cs') -SpansByPath ([ordered]@{}) -Policy $policy `
     -Reader { param([string]$Path) [pscustomobject]@{ Rejected = 'notTextual'; MimeType = 'application/octet-stream'; ByteLength = 4000; Sha256 = ('f' * 64) } } `
     -ChangeKindsByPath ([ordered]@{ '/src/h1.cs' = 'Edit'; '/src/h2.cs' = 'Edit'; '/src/h3.cs' = 'Edit' })
-$hostileMimeGate = Test-ReviewerSourceCoverageGate -Report $hostiletMimeReport -Policy $policy
-Assert-Source ([int]$hostiletMimeReport.ReaderExcusedFileCount -eq 3) `
+$hostileMimeGate = Test-ReviewerSourceCoverageGate -Report $hostileMimeReport -Policy $policy
+Assert-Source ([int]$hostileMimeReport.ReaderExcusedFileCount -eq 3) `
     "paths excused on the reader's say-so are counted apart from paths the change set excused"
-Assert-Source (-not $hostileMimeGate.Ok -and ($hostileMimeGate.ReasonCodes -ccontains 'sourceCoverageEmpty')) `
-    "a denominator emptied by the reader is refused, not passed vacuously at 100%"
+Assert-Source (-not $hostileMimeGate.Ok -and ($hostileMimeGate.ReasonCodes -ccontains 'sourceReadableNothing')) `
+    "a denominator emptied by the reader is refused under its own reason, not passed vacuously at 100%"
+$hostileMimeRecord = ConvertTo-ReviewerSourceCoverageRecord -Report $hostileMimeReport
+Assert-Source ([int]$hostileMimeRecord.readerExcusedFileCount -eq 3 -and
+    ([string]@($hostileMimeRecord.files)[0].noSourceBasis) -ceq 'reader' -and
+    ([string]@($hostileMimeRecord.files)[0].mimeType) -ceq 'application/octet-stream') `
+    "the persisted coverage record carries what excused each path and on what evidence"
 $declaredDeleteOnlyReport = New-ReviewerSourceTransportReport -CommitSha $commit `
     -ChangedPaths @('/src/h1.cs', '/src/h2.cs') -SpansByPath ([ordered]@{}) -Policy $policy `
     -Reader { param([string]$Path) $null } `

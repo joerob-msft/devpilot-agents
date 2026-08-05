@@ -11925,6 +11925,7 @@ function Invoke-ReviewerCycle {
                     changedFileCount = [int]$sourceTransport.Report.ChangedFileCount
                     sourceBearingFileCount = [int]$sourceTransport.Report.SourceBearingFileCount
                     noSourceFileCount = [int]$sourceTransport.Report.NoSourceFileCount
+                    readerExcusedFileCount = [int]$sourceTransport.Report.ReaderExcusedFileCount
                     coveredFiles = [int]$sourceTransport.Report.CoveredFiles
                     coveragePercent = [int]$sourceTransport.Report.CoveragePercent
                     spanPercent = [int]$sourceTransport.Report.SpanPercent
