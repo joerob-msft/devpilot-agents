@@ -3685,8 +3685,10 @@ function Write-ReviewerPreview {
     [void]$lines.Add("- Findings: $($counts['critical']) critical, $($counts['important']) important, $($counts['suggestion']) suggestion")
     [void]$lines.Add("- Recommended vote: $RecommendedVote")
     if ($null -ne $SourceCoverage) {
-        [void]$lines.Add("- Pinned source coverage: $([int]$SourceCoverage.coveredFiles)/$([int]$SourceCoverage.changedFileCount) changed file(s) ($([int]$SourceCoverage.coveragePercent)%), $([int]$SourceCoverage.totalSliceBytes) slice byte(s)")
-        $uncovered = @(@($SourceCoverage.files) | Where-Object { [string]$_.status -ceq 'omitted' })
+        [void]$lines.Add("- Pinned source coverage: $([int]$SourceCoverage.coveredFiles)/$([int]$SourceCoverage.sourceBearingFileCount) changed file(s) with added or edited lines ($([int]$SourceCoverage.coveragePercent)%), $([int]$SourceCoverage.totalSliceBytes) slice byte(s); $([int]$SourceCoverage.noSourceFileCount) further path(s) have no added or edited lines")
+        $uncovered = @(@($SourceCoverage.files) | Where-Object {
+                [string]$_.status -ceq 'omitted' -and [string]$_.reason -cne 'noChangedSpans'
+            })
         if ($uncovered.Count -gt 0) {
             [void]$lines.Add("- Changed files whose source did NOT reach the model: " +
                 (@($uncovered | ForEach-Object {
@@ -9107,12 +9109,15 @@ function Invoke-ReviewerModelPass {
             result = "oversize"; model = $PassModel; pass = $PassNumber; stdinBytes = $stdinBytes
             limitBytes = $script:ReviewerMaxModelInputBytes
         }
-        # Flagged as an environment fault so it does NOT consume the PR's
-        # starvation budget. The stdin size is deterministic for a given commit,
-        # so counting it as the PR's own failure would retire the PR from review
-        # after a few identical cycles - permanently, silently, and for a
-        # wrapper budget the pull request cannot influence.
-        return @{ Model = $PassModel; Marker = $null; Reason = $oversizeReason; EnvironmentFault = $true }
+        # PR-attributable, deliberately. The stdin size is driven by this pull
+        # request's own change set, and it is deterministic for a commit - so
+        # exempting it from the attempts budget would re-attempt forever,
+        # burning a full transport, the specialist and the gate every cycle,
+        # while never appearing in attempts state where an operator could see
+        # it. Counting it retires the pull request after the configured
+        # threshold, visibly, which is the honest outcome for a condition that
+        # cannot improve on its own.
+        return @{ Model = $PassModel; Marker = $null; Reason = $oversizeReason; EnvironmentFault = $false }
     }
 
     # -- Launch the model -----------------------------------------------------

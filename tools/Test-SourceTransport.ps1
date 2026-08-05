@@ -295,8 +295,8 @@ Assert-Source (([string]$byPath['/src/binary.png'].Reason) -ceq 'notTextual') "a
 Assert-Source (([string]$byPath['/src/gone.cs'].Reason) -ceq 'transportFailed') "an unreadable path is accounted transportFailed"
 Assert-Source (([string]$byPath['/src/nospan.cs'].Reason) -ceq 'noChangedSpans') "a file with no right-hand span is accounted noChangedSpans"
 Assert-Source (([string]$byPath['C:/evil.cs'].Reason) -ceq 'pathRejected') "an unsafe path is accounted pathRejected and never read"
-Assert-Source ([int]$report.CoveredFiles -eq 1 -and [int]$report.ChangedFileCount -eq 6) "coverage counts cover every changed path"
-Assert-Source ([int]$report.CoveragePercent -eq 16) "the coverage percentage floors rather than rounds up"
+Assert-Source ([int]$report.CoveredFiles -eq 1 -and [int]$report.ChangedFileCount -eq 6 -and [int]$report.SourceBearingFileCount -eq 5) "coverage counts every changed path, and the denominator is the ones with source"
+Assert-Source ([int]$report.CoveragePercent -eq 20) "the coverage percentage is measured against the files that carry source"
 foreach ($file in @($report.Files)) {
     if (-not [string]$file.Reason) { continue }
     Assert-Source (@("budgetExhausted", "sliceCountCapExceeded", "fileTooLarge", "notTextual", "transportFailed", "noChangedSpans", "fileCountCapExceeded", "pathRejected", "spanOutsideFile", "unsafeSliceText") -ccontains [string]$file.Reason) `
@@ -379,7 +379,7 @@ Write-Host "[8/9] The sealed block states what is missing and cannot be un-fence
 $rendered = Format-ReviewerSealedSourceBlock -Report $report -NonceFactory $nonceFactory
 Assert-Source ($rendered.Contains('/src/gone.cs', [StringComparison]::Ordinal)) "an unreadable path is still listed in the accounting table"
 Assert-Source ($rendered.Contains('transportFailed', [StringComparison]::Ordinal)) "its reason code is visible to the model"
-Assert-Source ($rendered.Contains('1 of 6 changed file(s)', [StringComparison]::Ordinal)) "the block leads with the coverage count"
+Assert-Source ($rendered.Contains('1 of 5 changed file(s) with added or edited lines', [StringComparison]::Ordinal)) "the block leads with the coverage count"
 Assert-Source ($rendered.Contains('may not claim to have reviewed', [StringComparison]::Ordinal)) "the block forbids claiming unread files"
 Assert-Source ($rendered.Contains('"sha256"', [StringComparison]::Ordinal)) "each slice carries hash provenance"
 Assert-Source (-not $rendered.Contains('image/png', [StringComparison]::Ordinal)) "a rejected file contributes no content"
@@ -836,8 +836,8 @@ foreach ($shape in $zeroSpanShapes) {
     Assert-Source ((@(@($shapeReport.Files) | Where-Object { [string]$_.Reason -ceq 'noChangedSpans' })).Count -eq $shapePaths.Count) `
         "$($shape.Name) accounts every path as noChangedSpans"
     $shapeGate = Test-ReviewerSourceCoverageGate -Report $shapeReport -Policy $policy
-    Assert-Source (-not $shapeGate.Ok -and ($shapeGate.ReasonCodes -ccontains 'sourceCoverageEmpty')) `
-        "$($shape.Name) reports sourceCoverageEmpty truthfully instead of throwing"
+    Assert-Source ($shapeGate.Ok -and @($shapeGate.ReasonCodes).Count -eq 0) `
+        "$($shape.Name) is reviewable: there was no source to deliver, so nothing failed to arrive"
 }
 
 # A normal edit and a mixed set must still behave, and a mis-parse must still
@@ -872,6 +872,78 @@ Assert-Source ((Measure-ReviewerSourceRightHandBlocks -Response ([pscustomobject
     "a context block is not counted as a right-hand block, however permissive the scan"
 Assert-Source ((Measure-ReviewerSourceRightHandBlocks -Response ([pscustomobject]@{ changes = @([pscustomobject]@{ changeType = 3; modifiedLineNumberStart = 2; modifiedLinesCount = 1 }) })) -eq 1) `
     "an edit block is counted"
+# Admissibility is shared with the structured extractor, and drift in either
+# direction is a live defect: a stricter scan misses a real mis-parse, a looser
+# one calls an ordinary delete-only change set a mis-parse and the pull request
+# becomes permanently unreviewable.
+$noChangeTypeBlock = [pscustomobject]@{ modifiedLineNumberStart = 1; modifiedLinesCount = 4 }
+Assert-Source (-not (Test-ReviewerSourceRightHandBlockAdmissible -Block $noChangeTypeBlock)) `
+    "a block with no changeType is not admissible, matching the extractor's default of zero"
+Assert-Source ((Measure-ReviewerSourceRightHandBlocks -Response ([pscustomobject]@{ changes = @($noChangeTypeBlock) })) -eq 0) `
+    "a serializer that drops changeType:0 does not resurrect the false positive"
+$stringChangeTypeBlock = [pscustomobject]@{ changeType = 'add'; modifiedLineNumberStart = 1; modifiedLinesCount = 4 }
+Assert-Source (Test-ReviewerSourceRightHandBlockAdmissible -Block $stringChangeTypeBlock -AdmitUnreadableChangeType) `
+    "a non-integer changeType IS admissible to the scan, because that is the mis-parse it exists to catch"
+Assert-Source (-not (Test-ReviewerSourceRightHandBlockAdmissible -Block $stringChangeTypeBlock)) `
+    "a non-integer changeType is NOT admissible to the extractor, which cannot read it"
+$stringResponse = [pscustomobject]@{ changes = @((New-ChangeEntry -Path '/src/a.cs' -Blocks @($stringChangeTypeBlock))) }
+Assert-Source (Test-Throws {
+        Assert-ReviewerSourceChangeSetAgreement -ChangedPaths @('/src/a.cs') `
+            -SpansByPath (Get-ReviewerSourceChangedSpans -Response $stringResponse) `
+            -ObservedRightHandBlockCount (Measure-ReviewerSourceRightHandBlocks -Response $stringResponse)
+    }) "a host that serializes changeType as a string is caught as a mis-parse"
+$deleteWithOmittedContext = [pscustomobject]@{
+    changes = @((New-ChangeEntry -Path '/src/gone.cs' -Blocks @($noChangeTypeBlock, $deleteBlock)))
+}
+try {
+    Assert-ReviewerSourceChangeSetAgreement -ChangedPaths @('/src/gone.cs') `
+        -SpansByPath (Get-ReviewerSourceChangedSpans -Response $deleteWithOmittedContext) `
+        -ObservedRightHandBlockCount (Measure-ReviewerSourceRightHandBlocks -Response $deleteWithOmittedContext)
+    Assert-Source $true "a delete whose context blocks omit changeType is still accepted"
+}
+catch { Assert-Source $false "a delete whose context blocks omit changeType is still accepted" }
+
+# Deleted, renamed and binary paths have no source to deliver, so they cannot be
+# uncovered. Leaving them in the denominator meant a pull request that edits two
+# files and deletes four scored 33% and was never reviewed - on every cycle,
+# forever - though every changed hunk in it had arrived.
+$mixedCorpus = @{ '/src/e1.cs' = (New-TestFileText -LineCount 40); '/src/e2.cs' = (New-TestFileText -LineCount 40) }
+$mixedReader = {
+    param([string]$Path)
+    if (-not $mixedCorpus.ContainsKey($Path)) { return $null }
+    $bodyText = [string]$mixedCorpus[$Path]
+    [pscustomobject]@{
+        Text = $bodyText; MimeType = 'text/plain'
+        ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($bodyText)
+        Sha256 = Get-ReviewerSourceSha256 -Text $bodyText
+    }
+}
+$mixedGatePaths = @('/src/e1.cs', '/src/e2.cs', '/src/d1.cs', '/src/d2.cs', '/src/d3.cs', '/src/r1.cs')
+$mixedGateSpans = [ordered]@{ '/src/e1.cs' = @(@{ Start = 5; End = 6 }); '/src/e2.cs' = @(@{ Start = 5; End = 6 }) }
+$mixedGateReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $mixedGatePaths `
+    -SpansByPath $mixedGateSpans -Policy $policy -Reader $mixedReader
+Assert-Source ([int]$mixedGateReport.NoSourceFileCount -eq 4 -and [int]$mixedGateReport.SourceBearingFileCount -eq 2) `
+    "deleted, renamed and binary paths are counted apart from the ones that carry source"
+Assert-Source ([int]$mixedGateReport.CoveragePercent -eq 100 -and [int]$mixedGateReport.SpanPercent -eq 100) `
+    "a change set whose every editable hunk arrived scores 100%, whatever it deleted"
+Assert-Source ((Test-ReviewerSourceCoverageGate -Report $mixedGateReport -Policy $policy).Ok) `
+    "two edits and four deletes is reviewed, not refused"
+Assert-Source ((@($mixedGateReport.Files) | Where-Object { [string]$_.Reason -ceq 'noChangedSpans' }).Count -eq 4) `
+    "the deleted and renamed paths are still named in the accounting"
+
+# A change set that is nothing but deletes has no source to deliver either, and
+# refusing it would make pure dead-code removals unreviewable.
+$allDeletePaths = @('/src/d1.cs', '/src/d2.cs')
+$allDeleteReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $allDeletePaths `
+    -SpansByPath ([ordered]@{}) -Policy $policy -Reader $mixedReader
+$allDeleteGate = Test-ReviewerSourceCoverageGate -Report $allDeleteReport -Policy $policy
+Assert-Source ($allDeleteGate.Ok -and @($allDeleteGate.ReasonCodes).Count -eq 0) `
+    "a pure-deletion change set is reviewable rather than refused for zero coverage"
+$stillEmptyReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @('/src/e1.cs') `
+    -SpansByPath ([ordered]@{ '/src/e1.cs' = @(@{ Start = 5; End = 6 }) }) -Policy $policy -Reader { param([string]$Path) $null }
+$stillEmptyGate = Test-ReviewerSourceCoverageGate -Report $stillEmptyReport -Policy $policy
+Assert-Source (-not $stillEmptyGate.Ok -and ($stillEmptyGate.ReasonCodes -ccontains 'sourceCoverageEmpty')) `
+    "a file that DOES carry source and did not arrive still fails the gate"
 
 # A file whose hunk runs past the pinned file's last line must not read as
 # fully delivered: the clamp drops it before the merge, so classifying on
@@ -1060,10 +1132,10 @@ Write-Host "[17/17] One pull request cannot end the cycle" -ForegroundColor Cyan
 $passText = Get-FunctionTextFromWrapper -Name 'Invoke-ReviewerModelPass'
 Assert-Source ($passText -notmatch 'throw "Reviewer model input is') `
     "an oversized model input is no longer thrown out of the pass"
-Assert-Source ($passText -match 'above the code-defined \$script:ReviewerMaxModelInputBytes-byte bound[\s\S]{0,900}?return @\{ Model') `
+Assert-Source ($passText -match 'above the code-defined \$script:ReviewerMaxModelInputBytes-byte bound[\s\S]{0,1400}?return @\{ Model') `
     "an oversized model input returns a bounded pass failure instead"
-Assert-Source ($passText -match 'limitBytes = \$script:ReviewerMaxModelInputBytes[\s\S]{0,700}?EnvironmentFault = \$true') `
-    "an oversized model input is an environment fault, so a wrapper budget cannot starve the pull request"
+Assert-Source ($passText -match 'limitBytes = \$script:ReviewerMaxModelInputBytes[\s\S]{0,900}?EnvironmentFault = \$false') `
+    "an oversized model input is attributed to the pull request, so it retires visibly instead of retrying forever"
 Assert-Source ($cycleText -match 'try \{[\s\S]{0,400}?Invoke-ReviewerPullRequest -Session[\s\S]{0,600}?catch') `
     "the per-pull-request review is isolated so one failure cannot end the cycle"
 Assert-Source ($cycleText -match 'isolatedFailure') `

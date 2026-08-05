@@ -32,8 +32,8 @@
         "reason": "Name partially delivered files too, with their delivered/requested region counts. A file the model saw one region of is not a file it read, and listing only fully omitted files hid that distinction from the human reading the preview."
       },
       {
-        "sha256": "4f5167290ad0a0e7c41a7e3fc779aebb9aff5e88381feb1f14cb03e38d22a7fb",
-        "reason": "Route coverage paths through a safe renderer. A pathRejected entry is by definition one that failed normalization, so echoing it into the preview's Markdown let a pull-request author spoof what the human reader sees."
+        "sha256": "e585d8a8642db378e712cc2a1e6046c1d763310c700267bc3a0e991d236a6d61",
+        "reason": "Route coverage paths through a safe renderer, and report coverage against the changed files that actually carry added or edited lines so deletes and renames cannot sink the reported percentage."
       }
     ],
     "Invoke-ReviewerDelivery": [
@@ -62,8 +62,8 @@
         "reason": "Refuse an oversized model input as a bounded pass failure instead of throwing. The throw escaped Invoke-ReviewerPullRequest and the cycle's own catch then abandoned every pull request queued behind it, so one unusually large change set ended the cycle for all of them."
       },
       {
-        "sha256": "497a364dba1f77dedecb46be80743ce69146fd9cf15f5d2de7e46ac4d371a1b1",
-        "reason": "Mark that oversized-input refusal an environment fault. The stdin size is deterministic for a commit, so counting it as the pull request's own failure retired the pull request from review after a few identical cycles - permanently and silently, for a wrapper budget the pull request cannot influence."
+        "sha256": "8c5e2be6e4b8827de4afdcf8892ea5b76821ae3c24b8cd9ad8ec68c88684f036",
+        "reason": "Mark that oversized-input refusal a pull-request failure rather than an environment fault. Exempting it re-attempted every cycle forever, burning a full transport, the specialist and the gate each time, while never appearing in attempts state where an operator could see it."
       }
     ],
     "Invoke-ReviewerPullRequest": [

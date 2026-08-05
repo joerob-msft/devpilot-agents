@@ -73,11 +73,21 @@ accept reaches the decoder, and only the decoder's own refusals become
 
 **A change set with no right-hand lines is not a failure.** Delete-only,
 rename-only, binary and empty-file changes legitimately have paths and no
-changed lines: every path is accounted `noChangedSpans` and the coverage gate
-reports `sourceCoverageEmpty` truthfully. The cross-check between the two
-extractions only calls mis-parse when a permissive independent scan finds
-right-hand-bearing line blocks in the response and the structured extractor
-still produced none.
+changed lines: those paths are accounted `noChangedSpans` and are **excluded
+from the coverage denominator**, because there is no source for the transport to
+deliver and they therefore cannot be uncovered. Leaving them in meant a pull
+request that edited two files and deleted four scored 33% and was never
+reviewed — on every cycle, forever — though every changed hunk in it had
+arrived. A change set that is nothing but deletes is reviewable on the diff
+alone; a file that does carry changed lines and did not arrive still fails the
+gate.
+
+The cross-check between the two extractions only calls mis-parse when a
+permissive independent scan finds right-hand-bearing line blocks in the response
+and the structured extractor still produced none. The two share one
+admissibility rule and differ in exactly one deliberate case: a `changeType` the
+extractor cannot read is admissible to the scan, because a block the scan sees
+and the extractor does not is the mis-parse it exists to catch.
 
 Both prompts bind the model to that table: it may not report on, clear, or claim
 to have reviewed an `omitted` path, and must describe a `partial` path as
@@ -102,9 +112,14 @@ report into a pass/fail with explicit reason codes:
 |---|---|
 | `sourceCoverageEmpty` | not one changed file's source reached the model |
 | `sourceCoverageBelowFileFloor` | fewer **fully** delivered files than the policy floor |
-| `sourceCoverageBelowPercentFloor` | covered share of files below the policy percentage |
-| `sourceCoverageBelowSpanFloor` | delivered share of changed regions below the policy percentage |
+| `sourceCoverageBelowPercentFloor` | covered share of source-bearing files below the policy percentage |
+| `sourceCoverageBelowSpanFloor` | delivered share of changed hunks below the policy percentage |
 | `sourceCoverageUnknown` | the change set could not be established at all |
+
+Every percentage is measured against the changed files that actually carry added
+or edited lines. A change set with no source-bearing files at all passes with no
+reason codes: there was nothing to deliver, which is a different thing from
+having failed to deliver something.
 
 The span floor exists because a file-level count alone can be gamed by
 arithmetic: a change set where every file delivered one region out of twenty-four
@@ -261,8 +276,10 @@ schema:
 - **One pull request cannot end a cycle.** An oversized model input fails that
   pass with a stated reason rather than throwing, and the per-pull-request
   review is isolated, so a PR that cannot be reviewed does not take the ones
-  queued behind it with it. What it never does is run the model anyway: below
-  the coverage floor the review does not happen.
+  queued behind it with it. That failure is attributed to the pull request, so
+  a change set too large to fit retires visibly through the attempts budget
+  rather than being retried forever. What it never does is run the model anyway:
+  below the coverage floor the review does not happen.
 - **Coverage is measured in files, not in judgement.** A `delivered` file whose
   changed span is a one-line edit inside a 3,000-line class still gives the model
   only a local view.

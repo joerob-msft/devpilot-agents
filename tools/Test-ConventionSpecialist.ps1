@@ -822,6 +822,12 @@ foreach ($property in $golden.authorizedFunctionDeltas.PSObject.Properties) {
 $prPinned = $null -ne $golden.functions.PSObject.Properties['Invoke-ReviewerPullRequest']
 Assert-Specialist $prPinned `
     "Invoke-ReviewerPullRequest is pinned, so the source-coverage call site cannot be dropped quietly."
+# The refusal assertions above are skipped for any function with fewer than two
+# recorded deltas, so squashing every history to one entry would silently turn
+# the pin-strength test into a no-op.
+$multiDeltaFunctions = @($golden.authorizedFunctionDeltas.PSObject.Properties | Where-Object { @($_.Value).Count -ge 2 })
+Assert-Specialist ($multiDeltaFunctions.Count -ge 1) `
+    "At least one function keeps two or more authorized deltas, so the revert-refusal assertions actually run."
 
 $pullRequestFunction = Get-FunctionText -Text $wrapperText -Name "Invoke-ReviewerPullRequest"
 $deliveryAt = $pullRequestFunction.IndexOf("Invoke-ReviewerDelivery", [StringComparison]::Ordinal)
