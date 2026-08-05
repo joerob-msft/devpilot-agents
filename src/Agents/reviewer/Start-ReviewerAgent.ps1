@@ -954,6 +954,67 @@ function Split-ReviewerFindingsByChangeSet {
     return @{ Postable = $postable.ToArray(); Withheld = $withheld.ToArray() }
 }
 
+function Get-ReviewerActivePullRequests {
+    <#
+        Fetches every active PR the ADO MCP list action exposes, in bounded
+        offset pages. A partial result is never returned: a malformed page, a
+        failed request, or MaxPages full pages throws and fails the cycle closed.
+
+        ADO exposes offset pagination (`top` + `skip`), not a stable snapshot.
+        Deduplication handles a record moving backward across a page boundary,
+        but no client can recover a record that moves forward across the same
+        boundary between requests. The caller logs that residual race rather
+        than presenting the resulting count as authoritative.
+
+        PageInvoker is a self-check seam. It receives the exact MCP arguments
+        hashtable and must return the same PR-record shape as Invoke-AgentMcpTool.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)][string]$Project,
+        [Parameter(Mandatory)][string]$RepositoryName,
+        [Parameter(Mandatory)][string]$TargetRefName,
+        [ValidateRange(1, 1000)][int]$PageSize = 100,
+        [ValidateRange(1, 100)][int]$MaxPages = 20,
+        [scriptblock]$PageInvoker
+    )
+
+    $records = New-Object System.Collections.Generic.List[object]
+    $seen = New-Object 'System.Collections.Generic.HashSet[int]'
+    for ($pageNumber = 0; $pageNumber -lt $MaxPages; $pageNumber++) {
+        $arguments = @{
+            action = 'list'; project = $Project; repositoryId = $RepositoryName
+            status = 'Active'; targetRefName = $TargetRefName
+            top = $PageSize; skip = ($pageNumber * $PageSize)
+        }
+        # ConvertFrom-Json unwraps a one-element JSON array. Wrapping at the
+        # boundary makes empty, singleton and full pages obey the same rules.
+        $page = @(
+            if ($PageInvoker) { & $PageInvoker $arguments }
+            else { Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments $arguments }
+        )
+        if ($page.Count -gt $PageSize) {
+            throw "ADO returned $($page.Count) pull requests for a page capped at $PageSize."
+        }
+        foreach ($pr in $page) {
+            if ($null -eq $pr) { throw "ADO returned a null pull-request record at offset $($arguments.skip)." }
+            $rawId = Get-ReviewerHashValue -Container $pr -Key 'pullRequestId'
+            if (-not (Test-StrictJsonInt -Value $rawId -Min 1 -Max ([long][int]::MaxValue))) {
+                throw "ADO returned a pull request with an invalid pullRequestId at offset $($arguments.skip)."
+            }
+            $prId = [int]$rawId
+            if ($seen.Add($prId)) { [void]$records.Add($pr) }
+        }
+        if ($page.Count -lt $PageSize) {
+            Write-Host (("Enumerated {0} unique active PR record(s) across {1} ADO page(s). " +
+                    "Offset pagination can still miss a PR that moves between pages while enumeration is running.") -f
+                $records.Count, ($pageNumber + 1)) -ForegroundColor DarkGray
+            return , ($records.ToArray())
+        }
+    }
+    throw "ADO pull-request listing filled all $MaxPages page(s) of $PageSize; refusing to return a silently truncated candidate set."
+}
+
 function Get-ReviewerWritesRequested {
     <# "Is this a preview?" must consider EVERY write switch. Deciding it from
        -EnableFindingComments alone told an operator running with only
@@ -2660,6 +2721,74 @@ function Invoke-DryRunSelfChecks {
     elseif (-not ($kOld -lt $kRecent)) { $failures.Add("Least-recently-reviewed ordering is inverted; the newest PRs would be re-reviewed forever.") }
     else { Write-Host "  OK - never-reviewed PRs sort first and the least recently reviewed comes next" -ForegroundColor Green }
 
+    # ADO's list action is offset-paginated. The wrapper must advance by the
+    # exact page size, deduplicate records that move backward while pages are
+    # fetched, and refuse a full safety window rather than silently truncating.
+    $pageOffsets = New-Object System.Collections.Generic.List[int]
+    $pageInvoker = {
+        param($arguments)
+        [void]$pageOffsets.Add([int]$arguments.skip)
+        switch ([int]$arguments.skip) {
+            0 { return (1..100 | ForEach-Object { @{ pullRequestId = $_ } }) }
+            100 { return (100..199 | ForEach-Object { @{ pullRequestId = $_ } }) }
+            200 { return (200..205 | ForEach-Object { @{ pullRequestId = $_ } }) }
+            default { return @() }
+        }
+    }
+    $paged = Get-ReviewerActivePullRequests -Session @{} -Project 'p' -RepositoryName 'r' `
+        -TargetRefName 'refs/heads/main' -PageInvoker $pageInvoker
+    if (@($paged).Count -ne 205 -or ($pageOffsets.ToArray() -join ',') -cne '0,100,200') {
+        $failures.Add("ADO pagination returned $(@($paged).Count) unique PR(s) at offsets '$($pageOffsets.ToArray() -join ',')'; expected 205 at 0,100,200.")
+    }
+    elseif ((@($paged) | Where-Object { [int](Get-ReviewerHashValue -Container $_ -Key 'pullRequestId') -eq 100 }).Count -ne 1) {
+        $failures.Add("ADO pagination did not deduplicate a PR repeated across adjacent pages.")
+    }
+    else { Write-Host "  OK - ADO pagination advances by top, preserves 205 unique PRs and deduplicates a moving record" -ForegroundColor Green }
+
+    $emptyOffsets = New-Object System.Collections.Generic.List[int]
+    $empty = Get-ReviewerActivePullRequests -Session @{} -Project 'p' -RepositoryName 'r' `
+        -TargetRefName 'refs/heads/main' -PageInvoker {
+            param($arguments) [void]$emptyOffsets.Add([int]$arguments.skip); return @()
+        }
+    if (@($empty).Count -ne 0 -or $emptyOffsets.Count -ne 1) {
+        $failures.Add("An empty ADO result required $($emptyOffsets.Count) request(s) and returned $(@($empty).Count) record(s); expected one request and none.")
+    }
+
+    $boundaryOffsets = New-Object System.Collections.Generic.List[int]
+    $boundary = Get-ReviewerActivePullRequests -Session @{} -Project 'p' -RepositoryName 'r' `
+        -TargetRefName 'refs/heads/main' -PageInvoker {
+            param($arguments)
+            [void]$boundaryOffsets.Add([int]$arguments.skip)
+            if ([int]$arguments.skip -eq 0) { return (1..100 | ForEach-Object { @{ pullRequestId = $_ } }) }
+            return @()
+        }
+    if (@($boundary).Count -ne 100 -or $boundaryOffsets.Count -ne 2) {
+        $failures.Add("An exact 100-record boundary required $($boundaryOffsets.Count) request(s) and returned $(@($boundary).Count); expected an empty second page and 100 records.")
+    }
+    else { Write-Host "  OK - empty and exact-page-boundary ADO listings terminate correctly" -ForegroundColor Green }
+
+    $limitRejected = $false
+    try {
+        [void](Get-ReviewerActivePullRequests -Session @{} -Project 'p' -RepositoryName 'r' `
+                -TargetRefName 'refs/heads/main' -PageSize 2 -MaxPages 2 -PageInvoker {
+                param($arguments)
+                return @(@{ pullRequestId = ([int]$arguments.skip + 1) }, @{ pullRequestId = ([int]$arguments.skip + 2) })
+            })
+    }
+    catch { $limitRejected = $_.Exception.Message -like '*silently truncated*' }
+    $badIdRejected = $false
+    try {
+        [void](Get-ReviewerActivePullRequests -Session @{} -Project 'p' -RepositoryName 'r' `
+                -TargetRefName 'refs/heads/main' -PageInvoker {
+                param($arguments) return @(@{ pullRequestId = '12' })
+            })
+    }
+    catch { $badIdRejected = $_.Exception.Message -like '*invalid pullRequestId*' }
+    if (-not $limitRejected -or -not $badIdRejected) {
+        $failures.Add("ADO pagination did not fail closed on a full safety window or a non-integer PR id.")
+    }
+    else { Write-Host "  OK - ADO pagination fails closed instead of returning a bounded or malformed partial set" -ForegroundColor Green }
+
     Write-Host "[DRY-RUN] Self-check 20/$total : anchor invariant, artifact sealing and manifest subsetting" -ForegroundColor Cyan
     # The marker schema validates filePath and line independently, so a finding
     # can arrive claiming a file with no line, or a line with no file. Neither
@@ -3738,25 +3867,22 @@ function Invoke-ReviewerCycle {
             -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
 
         # -- Step 1: candidate list (wrapper-owned, deterministic) ------------
-        $rawPrs = Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
-            action = 'list'; project = $ExpectedProject; repositoryId = $RepositoryName
-            status = 'Active'; targetRefName = $TargetRefName; top = 100
-        }
         $reviewedState = Get-JsonState -Path $reviewedStatePath
         $attemptsState = Get-JsonState -Path $attemptsStatePath
 
         if ($PullRequestId -gt 0) {
-            $candidates = @(@($rawPrs) | Where-Object { $_ -and [int](Get-ReviewerHashValue -Container $_ -Key 'pullRequestId' -Default 0) -eq $PullRequestId })
-            if ($candidates.Count -eq 0) {
-                # It may exist but not be in the listed slice; ask for it directly.
-                $direct = Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
-                    action = 'get'; project = $ExpectedProject; repositoryId = $RepositoryName; pullRequestId = $PullRequestId
-                }
-                if ($direct) { $candidates = @($direct) }
+            # A known PR never needs an offset scan. Direct lookup is one call,
+            # cannot drift between pages, and still passes through the ordinary
+            # eligibility/status/target checks below.
+            $direct = Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
+                action = 'get'; project = $ExpectedProject; repositoryId = $RepositoryName; pullRequestId = $PullRequestId
             }
+            $candidates = if ($direct) { @($direct) } else { @() }
             Write-Host "Candidates: restricted to PR $PullRequestId ($($candidates.Count) found)." -ForegroundColor Cyan
         }
         else {
+            $rawPrs = Get-ReviewerActivePullRequests -Session $session -Project $ExpectedProject `
+                -RepositoryName $RepositoryName -TargetRefName $TargetRefName
             # Least-recently-reviewed first. Newest-first looked right - the
             # freshest work is the work a review can still change - but on a
             # repository with more open PRs than one cycle can review it means

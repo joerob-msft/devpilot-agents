@@ -294,9 +294,13 @@ See [`docs/adding-an-agent.md`](docs/adding-an-agent.md).
   agent will withhold a finding anchored in the untouched file rather than
   relocate it. The intended shape is to anchor on the changed causal line and
   describe the cross-file consequence there.
-- **Candidate selection sees the first 100 active PRs.** Scheduling within that
-  slice is least-recently-reviewed first; pagination beyond it is not
-  implemented. `-PullRequestId` reaches any single PR directly.
+- **ADO candidate enumeration uses bounded offset pagination.** The reviewer
+  fetches up to 20 pages of 100 active PRs and fails the cycle rather than
+  silently truncate beyond 2,000. ADO does not expose a stable snapshot:
+  concurrent PR creation/completion can move records between `top`/`skip`
+  requests, so an unusually busy repository can still miss one during a cycle.
+  A later cycle normally sees it. `-PullRequestId` bypasses pagination and
+  reaches the requested PR directly.
 - **`WaitingForAuthor` is a real blocker in most ADO branch policies**, and
   there is no policy yet for neutralising a stale `-5` after the author pushes
   a fix. Leave `-EnableApprovalVote` off unless you want that.
