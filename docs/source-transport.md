@@ -79,12 +79,11 @@ from the coverage denominator**, because the change set itself says there is no
 source for the transport to deliver and they therefore cannot be uncovered. A
 binary or an empty file is *not* in that category — only the reader says those
 hold nothing, so they stay counted; see the denominator rule below. Leaving
-deletes in meant a pull
-request that edited two files and deleted four scored 33% and was never
-reviewed — on every cycle, forever — though every changed hunk in it had
-arrived. A change set that is nothing but deletes is reviewable on the diff
-alone; a file that does carry changed lines and did not arrive still fails the
-gate.
+deletes in meant a pull request that edited two files and deleted four scored
+33% and was never reviewed — on every cycle, forever — though every changed
+hunk in it had arrived. A change set that is nothing but deletes is reviewable
+on the diff alone; a file that does carry changed lines and did not arrive
+still fails the gate.
 
 What decides which case a spanless path is, is the change set's own `changeType`
 for that path — never the absence of parsed spans. Inferring the first from the

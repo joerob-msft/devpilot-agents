@@ -654,6 +654,8 @@ Assert-Source ($transportText -match 'if \(@\(\$report\.Files\)\.Count -gt 0\)' 
 # suite still green.
 Assert-Source ($transportText -match 'Gate\s*=\s*\(Test-ReviewerSourceCoverageGate') `
     "the gate decision is computed, never assumed"
+Assert-Source ($transportText -match 'BlockText\s*=\s*\$blockText') `
+    "the transport returns the block it rendered rather than a constant"
 Assert-Source ($cycleText -match '\$pinnedSourceText\s*=\s*\[string\]\$sourceTransport\.BlockText') `
     "the sealed block the model receives is the one the transport produced"
 Assert-Source ($cycleText -match 'PinnedSourceText\s*=\s*\$pinnedSourceText') `
