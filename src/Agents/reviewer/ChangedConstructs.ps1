@@ -279,6 +279,13 @@ function Get-ReviewerChangedInvocations {
         $callee = ""
         if ($calleeText -match '([A-Za-z_][A-Za-z0-9_]*)\s*(<[^<>]*>)?$') { $callee = $Matches[1] }
         if (-not $callee) { continue }
+        # A declaration's parameter list has the same shape as a call: a name,
+        # an open paren, and a wrap. It is not a call, and a rule about how
+        # arguments are passed does not reach it. Every run so far has produced
+        # candidates on declaration signatures that cross-verification then had
+        # to throw out one at a time - wasted work at best, and noise on a pull
+        # request at worst. Declarations are enumerated already, as `dc`.
+        if ($null -ne (Get-ReviewerConstructDeclarationAt -MaskedLines $MaskedLines -Index $index)) { continue }
 
         # Walk forward to the matching close paren, bounded. A RAW copy of the
         # same span is kept alongside the masked one: masking blanks string and

@@ -909,6 +909,20 @@ try {
     Assert-Replay ([bool]$spread.Truncated) `
         "A construct set that could not carry every construct must say so."
 
+    # A declaration's parameter list has a call's shape. Reading it as a call
+    # invents violations of a rule about how arguments are PASSED, and every
+    # replay so far produced candidates on signatures that cross-verification
+    # then threw out one at a time.
+    $signature = Get-Constructs -Code @(
+        'public class C', '{', '    public void Configure(', '        string first,', '        int second)',
+        '    {', '        Apply(', '            first,', '            second);', '    }', '}')
+    $signatureCalls = @(@($signature.Constructs) | Where-Object { [string]$_.kind -ceq "invocation" })
+    Assert-Replay (@($signatureCalls).Count -eq 1 -and [string]@($signatureCalls)[0].name -ceq "Apply") `
+        "A multi-line declaration signature must not be enumerated as a call (got $(@($signatureCalls | ForEach-Object { $_.name }) -join ','))."
+    $signatureDeclarations = @(@($signature.Constructs) | Where-Object { [string]$_.kind -ceq "declaration" -and [string]$_.name -ceq "Configure" })
+    Assert-Replay (@($signatureDeclarations).Count -eq 1) `
+        "The declaration itself must still be enumerated, as a declaration."
+
     # Ids are a function of the change set alone, so an anchor means the same
     # thing on every run.
     $twice = Get-Constructs -Code @('public void T()', '{', '    A(', '        x: 1);', '    B(', '        y: 2);', '}')
