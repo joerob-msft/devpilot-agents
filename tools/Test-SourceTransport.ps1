@@ -44,6 +44,78 @@ function Get-FunctionTextFromWrapper {
     return $node.Extent.Text
 }
 
+function Get-FunctionAstFromWrapper {
+    param([Parameter(Mandatory)][string]$Name)
+    return ($wrapperAst.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -ceq $Name
+            }, $true) | Select-Object -First 1)
+}
+
+function Measure-WrapperVariableWrite {
+    <# A text assertion constrains the lines that exist; it cannot bound lines
+       ADDED beside them. Appending a second write to the same line - or, since
+       PowerShell variable names are case-insensitive and may be braced or set
+       indirectly, a differently spelled write anywhere below - leaves every
+       pinned string intact while the model is handed a constant. So the number
+       of writes is counted from the AST rather than matched in text. #>
+    param([Parameter(Mandatory)]$FunctionAst, [Parameter(Mandatory)][string]$Name)
+    $direct = @($FunctionAst.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.AssignmentStatementAst]
+            }, $true) | Where-Object {
+            @($_.Left.FindAll({
+                        param($inner)
+                        $inner -is [Management.Automation.Language.VariableExpressionAst] -and
+                        $inner.VariablePath.UserPath -eq $Name
+                    }, $true)).Count -gt 0
+        })
+    $indirect = @($FunctionAst.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.CommandAst] -and
+                @('Set-Variable', 'New-Variable', 'Remove-Variable', 'Set-Item', 'Invoke-Expression') -contains $candidate.GetCommandName() -and
+                $candidate.Extent.Text -match [regex]::Escape($Name)
+            }, $true))
+    return (@($direct).Count + @($indirect).Count)
+}
+
+function Measure-WrapperMemberWrite {
+    <# The report and the transport result are hashtables, so one inserted line
+       can overwrite a coverage figure and let the gate be genuinely computed on
+       doctored numbers. Nothing in this file writes a member of either, so the
+       expected count is zero. #>
+    param([Parameter(Mandatory)]$FunctionAst, [Parameter(Mandatory)][string]$Name)
+    return @($FunctionAst.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $candidate.Left -is [Management.Automation.Language.MemberExpressionAst]
+            }, $true) | Where-Object {
+            @($_.Left.FindAll({
+                        param($inner)
+                        $inner -is [Management.Automation.Language.VariableExpressionAst] -and
+                        $inner.VariablePath.UserPath -eq $Name
+                    }, $true)).Count -gt 0
+        }).Count
+}
+
+function Measure-AstGuardDepth {
+    <# How many conditions stand between a statement and its function. Pinning
+       a guard's condition, message and `throw` in text is not enough: wrapping
+       the whole guard in `if ($false) { ... }` leaves all three intact and
+       skips it. #>
+    param([Parameter(Mandatory)]$Node, [Parameter(Mandatory)]$StopAt)
+    $depth = 0
+    $walker = $Node.Parent
+    while ($null -ne $walker -and -not [object]::ReferenceEquals($walker, $StopAt)) {
+        if ($walker -is [Management.Automation.Language.IfStatementAst] -or
+            $walker -is [Management.Automation.Language.SwitchStatementAst] -or
+            $walker -is [Management.Automation.Language.WhileStatementAst] -or
+            $walker -is [Management.Automation.Language.ForEachStatementAst]) { $depth++ }
+        $walker = $walker.Parent
+    }
+    return $depth
+}
+
 $script:Failures = New-Object System.Collections.Generic.List[string]
 $script:Checks = 0
 
@@ -664,10 +736,29 @@ Assert-Source ($cycleText -match '\$pinnedSourceText\s*=\s*\[string\]\$sourceTra
 # assignment on the same line overwrites it a character later. Appending
 # `; $pinnedSourceText = "no source"` passes every other check in this file:
 # the emptiness guard sees a non-empty string, the prompt emits the constant in
-# place of the block, and the preview still reports the real coverage. So the
-# count is pinned, not just the presence: one initializer, one assignment.
-Assert-Source (@([regex]::Matches($cycleText, '\$pinnedSourceText\s*=')).Count -eq 2) `
-    "and it is assigned exactly once from the transport, never overwritten afterwards"
+# place of the block, and the preview still reports the real coverage. Counting
+# writes in TEXT is not enough either - PowerShell variable names are
+# case-insensitive, so `$PinnedSourceText`, `${pinnedSourceText}` and
+# `Set-Variable pinnedSourceText` are all the same variable and all walk past a
+# case-sensitive regex. The count comes from the AST.
+$cycleAst = Get-FunctionAstFromWrapper -Name 'Invoke-ReviewerCycle'
+$transportAst = Get-FunctionAstFromWrapper -Name 'Get-ReviewerSourceTransport'
+Assert-Source ($null -ne $cycleAst -and $null -ne $transportAst) `
+    "both wired functions are present to be pinned at all"
+Assert-Source ((Measure-WrapperVariableWrite -FunctionAst $cycleAst -Name 'pinnedSourceText') -eq 2) `
+    "the sealed block is written exactly twice - initialized empty, then set from the transport - and never again (if you added a legitimate write, update this count and say why)"
+Assert-Source ((Measure-WrapperVariableWrite -FunctionAst $cycleAst -Name 'sourceCoverageRecord') -eq 2) `
+    "and the coverage record likewise, so nothing can null it out after the fact"
+Assert-Source ((Measure-WrapperVariableWrite -FunctionAst $cycleAst -Name 'sourceTransport') -eq 1) `
+    "and the transport result itself is assigned once, from the transport"
+Assert-Source ((Measure-WrapperVariableWrite -FunctionAst $transportAst -Name 'blockText') -eq 2) `
+    "the rendered block is written exactly twice inside the transport and never blanked afterwards"
+Assert-Source ((Measure-WrapperVariableWrite -FunctionAst $transportAst -Name 'report') -eq 1) `
+    "and the report is built once"
+Assert-Source ((Measure-WrapperMemberWrite -FunctionAst $transportAst -Name 'report') -eq 0) `
+    "no line mutates a member of the report, so the gate cannot be computed honestly over doctored coverage figures"
+Assert-Source ((Measure-WrapperMemberWrite -FunctionAst $cycleAst -Name 'sourceTransport') -eq 0) `
+    "and no line mutates a member of the transport result after the gate decided"
 Assert-Source ($cycleText -match 'PinnedSourceText\s*=\s*\$pinnedSourceText') `
     "and it is bound onto the reviewed pull request rather than dropped"
 Assert-Source ($cycleText -match 'SourceCoverage\s*=\s*\$sourceCoverageRecord') `
@@ -705,6 +796,17 @@ Assert-Source ($transportText -match 'New-ReviewerSourceTransportReport -CommitS
 # and passes the gate.
 Assert-Source ($transportText -match 'throw "PR \$PrId moved from \$SourceCommit') `
     "and a head move refuses the pull request rather than merely warning about it"
+# ...and the guard is not skipped wholesale. `if ($false) { <the whole guard> }`
+# leaves the condition, the message and the `throw` all intact in text while
+# never executing any of them, and the slices then come from the pre-push line
+# numbers, hashed cleanly. Exactly one condition may stand between that throw
+# and the function body: its own.
+$headMoveThrow = $transportAst.FindAll({
+        param($candidate)
+        $candidate -is [Management.Automation.Language.ThrowStatementAst]
+    }, $true) | Where-Object { $_.Extent.Text -match 'moved from' } | Select-Object -First 1
+Assert-Source ($null -ne $headMoveThrow -and (Measure-AstGuardDepth -Node $headMoveThrow -StopAt $transportAst) -eq 1) `
+    "and that refusal is nested under its own condition and nothing else"
 Assert-Source ($transportText -match 'Assert-ReviewerSourceChangeSetAgreement -ChangedPaths') `
     "the two change-set extractions are cross-checked at the call site, not merely available"
 $readerSeamText = (Get-Content -LiteralPath (Join-Path $repoRoot 'src/Agents/reviewer/SourceTransport.ps1') -Raw)
