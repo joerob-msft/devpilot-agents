@@ -692,7 +692,14 @@ function ConvertTo-AgentMarkerFieldValue {
                 # complete accounting was lost that way.
                 if (-not ($Spec.ContainsKey('Truncate') -and [bool]$Spec.Truncate)) { return $bad }
                 if ($max -le 3) { return $bad }
-                $text = $text.Substring(0, $max - 3) + "..."
+                $cut = $max - 3
+                # Never cut between a surrogate pair. A lone half is not a
+                # control character and has no pattern to fail, so it survives
+                # validation and then throws when the preview is written as
+                # strict UTF-8 - losing the whole pass to the very mechanism
+                # added to stop passes being lost.
+                if ($cut -gt 0 -and [char]::IsHighSurrogate($text[$cut - 1])) { $cut-- }
+                $text = $text.Substring(0, $cut) + "..."
             }
             if (-not ($Spec.ContainsKey('AllowEmpty') -and [bool]$Spec.AllowEmpty) -and $text.Trim() -eq "") { return $bad }
             $allowNewlines = ($Spec.ContainsKey('AllowNewlines') -and [bool]$Spec.AllowNewlines)
