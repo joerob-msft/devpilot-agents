@@ -614,6 +614,35 @@ try {
     Assert-Replay (-not [bool]$quoteRejected.Ok) `
         "A coverage row's rule quote must stay ASCII, because it has to match the transported source exactly."
 
+    # The scaffold: the top-level object handed to the model already built, so a
+    # long analysis cannot end with a marker missing its last key.
+    $inputResult = New-ReviewerConventionSpecialistInput -PromptText "prompt" -Nonce "n-scaffold" `
+        -Organization "org" -Project "Widgets" -RepositoryId "repo" -PrId 7 `
+        -SourceCommit ("1" * 40) -TargetCommit ("2" * 40) -ChangeSetDigest ("3" * 64) `
+        -ConventionPlanSha256 ("4" * 64) -FactPlanSha256 ("9" * 64) -ConfigSha256 ("8" * 64) `
+        -ScriptSha256 ("5" * 64) -PromptSha256 ("6" * 64) `
+        -ConventionPlan ([pscustomobject]@{}) -FactPlan ([pscustomobject]@{}) `
+        -ResolvedSources $sources -ChangeEntries @(
+        [pscustomobject][ordered]@{ Path = "src/a.cs"; Role = "current" }
+    ) -Constructs $constructs `
+        -ThreadDigestText "" -PinnedSourceText ""
+    $runtimeJson = [regex]::Match([string]$inputResult.Text, '(?s)```json\r?\n(\{.*?\})\r?\n```')
+    Assert-Replay ($runtimeJson.Success) "The specialist input must embed its runtime data as JSON."
+    $runtime = $runtimeJson.Groups[1].Value | ConvertFrom-Json
+
+    $scaffold = $runtime.markerScaffold
+    Assert-Replay ($null -ne $scaffold) "The specialist input must carry a prebuilt marker scaffold."
+    $scaffoldKeys = @($scaffold.PSObject.Properties | ForEach-Object { $_.Name })
+    $topKeys = @($schema.Keys)
+    Assert-Replay (($scaffoldKeys -join "|") -ceq ($topKeys -join "|")) `
+        "The marker scaffold must have exactly the schema's top-level keys, in order, or it teaches the wrong shape."
+    Assert-Replay ([string]$scaffold.nonce -ceq "n-scaffold" -and [string]$scaffold.scriptSha256 -ceq ("5" * 64)) `
+        "The scaffold must carry the real binding values, since transcribing them by hand is what was losing markers."
+    foreach ($arrayKey in @("candidates", "ruleCoverage", "withheld", "residualRisks")) {
+        Assert-Replay (@($scaffold.$arrayKey).Count -eq 0) `
+            "The scaffold's '$arrayKey' must be empty: it is a format aid and must never suggest a finding."
+    }
+
     # -- 10. Changed-construct enumeration -------------------------------------
     # The generic half of the calibration: what the wrapper can establish about
     # a change set WITHOUT knowing the language's testing framework, its
