@@ -1132,6 +1132,15 @@ try {
     Assert-Replay ($verifierBound.Success -and $documentBound.Success -and
         [int]$verifierBound.Groups[1].Value -gt [int]$documentBound.Groups[1].Value) `
         "The verifier must be able to open a source file larger than an authoritative document."
+    # And it must be a bound the reader will actually accept. Setting it above
+    # the reader's own ValidateRange does not widen anything - it makes EVERY
+    # hunk fail, which is how this was found: one file had been unreadable, and
+    # for one run all of them were.
+    $readerRange = [regex]::Match($reviewerText,
+        '(?s)function Get-ReviewerFactSourceFile \{.*?\[ValidateRange\(1, (\d+)\)\]\[int\]\$MaxBytes')
+    Assert-Replay ($readerRange.Success) "The fact-source reader's byte range must be findable."
+    Assert-Replay ([int]$verifierBound.Groups[1].Value -le [int]$readerRange.Groups[1].Value) `
+        "The verifier's read bound ($($verifierBound.Groups[1].Value)) must be within what the reader accepts ($($readerRange.Groups[1].Value)), or every hunk fails instead of one."
     Assert-Replay ($hunkFunction.Value -match '\$line - 3' -and $hunkFunction.Value -match '\$line \+ 3') `
         "Raising the read bound must not widen what a model is shown: the hunk stays seven lines."
 
