@@ -660,8 +660,18 @@ Assert-Source ($transportText -match '\$blockText = Format-ReviewerSealedSourceB
     "and the block it returns is the rendered accounting table, not an empty string"
 Assert-Source ($cycleText -match '\$pinnedSourceText\s*=\s*\[string\]\$sourceTransport\.BlockText') `
     "the sealed block the model receives is the one the transport produced"
+# An unanchored -match is satisfied by the pinned text even when a second
+# assignment on the same line overwrites it a character later. Appending
+# `; $pinnedSourceText = "no source"` passes every other check in this file:
+# the emptiness guard sees a non-empty string, the prompt emits the constant in
+# place of the block, and the preview still reports the real coverage. So the
+# count is pinned, not just the presence: one initializer, one assignment.
+Assert-Source (@([regex]::Matches($cycleText, '\$pinnedSourceText\s*=')).Count -eq 2) `
+    "and it is assigned exactly once from the transport, never overwritten afterwards"
 Assert-Source ($cycleText -match 'PinnedSourceText\s*=\s*\$pinnedSourceText') `
     "and it is bound onto the reviewed pull request rather than dropped"
+Assert-Source ($cycleText -match 'SourceCoverage\s*=\s*\$sourceCoverageRecord') `
+    "the coverage record bound to the pull request is the transport's, not an empty stand-in"
 Assert-Source ($cycleText -match 'the coverage gate passed but no sealed source block was produced[\s\S]{0,300}?continue') `
     "a passing gate with an empty block is a contradiction the cycle refuses, not one it publishes"
 # Order matters: the emptiness guard has to sit between the gate and the review,
@@ -675,11 +685,26 @@ Assert-Source ($gateAt -ge 0 -and $emptyGuardAt -gt $gateAt -and $reviewAt -gt $
     "and that refusal happens after the gate and before any model sees the pull request"
 Assert-Source ($cycleText -match '\$sourceCoverageRecord\s*=\s*\$sourceTransport\.Record') `
     "the persisted coverage record is the one the transport produced"
+Assert-Source ($transportText -match 'Record\s*=\s*\(ConvertTo-ReviewerSourceCoverageRecord') `
+    "and the transport computes that record rather than returning a placeholder"
+# The decoder's MIME allowlist has to come from the same validated policy the
+# rest of the layer is judged against. A literal list at this call site would
+# decode whatever it named while every policy assertion in this file still
+# passed.
+Assert-Source ($transportText -match '-AllowedMimeTypes @\(\$SourceTransportPolicy\.allowedMimeTypes\)') `
+    "the decoder's accepted content types come from the validated policy, never a literal list"
 # The one remaining way to present source as pinned when it is not: the author
 # pushes between the change-set read and the byte read, and the slices are
 # correct bytes at the wrong lines, hashed cleanly, with nothing to notice.
 Assert-Source ($transportText -match 'if \(\$confirmCommit\.ToLowerInvariant\(\) -cne \$SourceCommit\)') `
     "the mid-read head-move guard actually compares the commit it re-read"
+Assert-Source ($transportText -match 'New-ReviewerSourceTransportReport -CommitSha \$SourceCommit') `
+    "the report is built at the commit the caller pinned, not at some other variable in scope"
+# Pinning the condition and the message is not enough: downgrading the `throw`
+# to a `Write-Warning` leaves both intact, falls through to render the block,
+# and passes the gate.
+Assert-Source ($transportText -match 'throw "PR \$PrId moved from \$SourceCommit') `
+    "and a head move refuses the pull request rather than merely warning about it"
 Assert-Source ($transportText -match 'Assert-ReviewerSourceChangeSetAgreement -ChangedPaths') `
     "the two change-set extractions are cross-checked at the call site, not merely available"
 $readerSeamText = (Get-Content -LiteralPath (Join-Path $repoRoot 'src/Agents/reviewer/SourceTransport.ps1') -Raw)
