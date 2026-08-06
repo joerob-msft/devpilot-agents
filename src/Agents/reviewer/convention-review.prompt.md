@@ -151,6 +151,11 @@ exactly. Use only the exact keys and types below. All authored strings must be
 printable ASCII with no controls or newlines. Candidate IDs must be unique
 lowercase slugs.
 
+Your visible working is not the deliverable and nobody reads it. Do the
+per-construct accounting, then put the result in the marker; do not narrate
+each construct on the way. An answer that runs to hundreds of kilobytes of
+commentary is rejected before the marker in it is ever read.
+
 Each candidate has exactly:
 
 `candidateId`, `category` (`convention`), `severity` (`suggestion|important`),
