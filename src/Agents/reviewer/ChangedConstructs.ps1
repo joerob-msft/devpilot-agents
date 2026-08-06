@@ -325,7 +325,13 @@ function Get-ReviewerChangedInvocations {
         # candidates on declaration signatures that cross-verification then had
         # to throw out one at a time - wasted work at best, and noise on a pull
         # request at worst. Declarations are enumerated already, as `dc`.
-        if ($null -ne $DeclarationIndex[$index]) { continue }
+        # The declaration index is the same one the declarations use, so a
+        # signature is recognised by exactly one rule. A caller that did not
+        # supply it gets the line recognised here instead, rather than the
+        # guard silently doing nothing.
+        $atThisLine = $(if ($index -lt $DeclarationIndex.Count) { $DeclarationIndex[$index] }
+            else { Get-ReviewerConstructDeclarationAt -MaskedLines $MaskedLines -Index $index -Delivered $delivered })
+        if ($null -ne $atThisLine) { continue }
         # `if (`, `while (`, `foreach (` are not calls either, and the
         # declaration recogniser deliberately excludes them, so they would
         # otherwise arrive here unfiltered.

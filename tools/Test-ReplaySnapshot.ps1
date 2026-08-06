@@ -1158,6 +1158,15 @@ try {
         "The declaration index must be built by one pass over the file."
     Assert-Replay ($constructSource -notmatch 'Get-ReviewerConstructDeclarationAt -MaskedLines \$MaskedLines -Index \$scan') `
         "Nothing may recognise a line again once the index exists."
+    # A caller that supplies no index must still get the signature guard, not a
+    # bounds error and not a silently disabled check.
+    $noIndex = Get-ReviewerChangedInvocations -Path "src/a.cs" `
+        -Lines @('public void Configure(', '    string first,', '    int second)', '{', '}') `
+        -ChangedLines @(1, 2, 3) `
+        -MaskedLines @('public void Configure(', '    string first,', '    int second)', '{', '}') `
+        -DeliveredLines @()
+    Assert-Replay (@($noIndex.Constructs).Count -eq 0) `
+        "Without a prebuilt index the invocation walk must recognise the signature itself, not fall over or wave it through."
     $bigLines = [System.Collections.Generic.List[string]]::new()
     [void]$bigLines.Add('public class C')
     [void]$bigLines.Add('{')
