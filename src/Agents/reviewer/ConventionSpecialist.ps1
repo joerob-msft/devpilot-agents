@@ -11,7 +11,7 @@ $script:ReviewerConventionSpecialistMaxCandidates = 8
 # with tightly bounded fields. A transported set larger than this is not
 # silently sampled - the request states the cap and the reconciliation reports
 # the remainder as unaccounted by construction.
-$script:ReviewerConventionSpecialistMaxRuleCoverage = 17
+$script:ReviewerConventionSpecialistMaxRuleCoverage = 12
 $script:ReviewerConventionSpecialistMaxCoverageAnchors = 200
 $script:ReviewerConventionSpecialistMaxInputBytes = 327680
 $script:ReviewerConventionSpecialistUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
@@ -317,11 +317,32 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                             Type = "string"; MaxLength = 200; AllowEmpty = $true
                             Pattern = '^(|cf[0-9]{1,4}:[0-9]{1,7}(,cf[0-9]{1,4}:[0-9]{1,7}){0,15})$'
                         }
-                        codeEvidence = @{ Type = "string"; MaxLength = 400; AllowEmpty = $true; Pattern = $ascii }
+                        # No ASCII pattern on the three prose fields, and lengths
+                        # with real headroom rather than a cap that tracks the
+                        # last observed answer by thirty characters.
+                        #
+                        # Twice in a row a correct, complete accounting was
+                        # discarded whole - once for evidence twenty-five
+                        # characters over, once for a single curly quote inside
+                        # a sentence about code - and each time it took the
+                        # candidates down with it. A reporting section must not
+                        # be able to destroy the findings it reports on.
+                        #
+                        # This is not a loosening of the marker contract. The
+                        # marker validator refuses control characters in every
+                        # string regardless of pattern, so nothing here can
+                        # forge structure. The ASCII rule exists because
+                        # candidate text is rendered into a pull-request
+                        # comment; these three fields never are. They appear
+                        # only in the local preview and the sealed,
+                        # non-promotable artifact. ruleQuote keeps the strict
+                        # pattern, because it must be an exact substring of the
+                        # transported source and the wrapper checks that.
+                        codeEvidence = @{ Type = "string"; MaxLength = 600; AllowEmpty = $true }
                         siblingStatus = @{ Type = "enum"; Values = @("checked", "notRequired", "unavailable") }
-                        siblingEvidence = @{ Type = "string"; MaxLength = 400; AllowEmpty = $true; Pattern = $ascii }
+                        siblingEvidence = @{ Type = "string"; MaxLength = 600; AllowEmpty = $true }
                         candidateId = @{ Type = "string"; MaxLength = 64; AllowEmpty = $true; Pattern = '^(|[a-z][a-z0-9-]{0,63})$' }
-                        notes = @{ Type = "string"; MaxLength = 320; AllowEmpty = $true; Pattern = $ascii }
+                        notes = @{ Type = "string"; MaxLength = 600; AllowEmpty = $true }
                     }
                 }
             }
