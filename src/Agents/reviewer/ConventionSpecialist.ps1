@@ -853,9 +853,22 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         # the other: examined against the rule, or examined and judged outside
         # its reach. Silence about one is the miss this whole section exists to
         # make visible.
+        # Strays are computed over `checked` only. Saying "the rule does not
+        # reach this construct" is a meaningful statement about ANY construct
+        # the wrapper enumerated, including ones outside the declared scope -
+        # a row that names them is being more informative, not less. Weighing
+        # one against a rule whose scope excludes it is the actual error.
         $accountedConstructs = @(@($checked) + @($notInReach))
         $missingConstructs = @(@($required) | Where-Object { $accountedConstructs -cnotcontains $_ })
-        $strayConstructs = @(@($accountedConstructs) | Where-Object { $required -cnotcontains $_ })
+        $strayConstructs = @(@($checked) | Where-Object { $required -cnotcontains $_ })
+        $unknownAccounted = @(@($accountedConstructs) | Where-Object { -not $constructById.ContainsKey($_) })
+        if ($unknownAccounted.Count -gt 0) {
+            $status = "unknown"
+            if (-not $degradedReason) {
+                $degradedReason = "the row named constructs that do not exist: " +
+                (@($unknownAccounted | Select-Object -First 20) -join ",")
+            }
+        }
         if ($missingConstructs.Count -gt 0 -or $strayConstructs.Count -gt 0) {
             $status = "unknown"
             if (-not $degradedReason) {
@@ -867,7 +880,7 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
                         $(if ($missingConstructs.Count -gt 20) { " and $($missingConstructs.Count - 20) more" } else { "" })
                     }
                     else {
-                        "the row named constructs outside the scope it declared: " +
+                        "the row weighed constructs against a rule whose scope excludes them: " +
                         (@($strayConstructs | Select-Object -First 20) -join ",")
                     })
             }
