@@ -490,6 +490,36 @@ try {
     Assert-Replay ([string]@($allOutOfReachOk.Rows)[0].status -ceq "notApplicable" -and [bool]$allOutOfReachOk.Complete) `
         "A rule that reaches nothing in a scope it declared may say exactly that."
 
+    # Saying "this rule does not reach that construct" is informative about any
+    # construct, including one outside the scope. Weighing one against a rule
+    # whose scope excludes it is the actual error.
+    $outsideScope = Invoke-Coverage -WithConstructs @(
+        [pscustomobject][ordered]@{ constructId = "mi0"; kind = "invocation"; path = "src/a.cs"; line = 5; endLine = 5 }
+        [pscustomobject][ordered]@{ constructId = "dc0"; kind = "declaration"; path = "src/a.cs"; line = 9; endLine = 9 }
+    ) -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "notApplicable" -Scope "none" -Checked "" -NotInReach "mi0,dc0"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope "invocation" -Checked "mi0" -NotInReach "dc0")
+    )
+    Assert-Replay ([string]@($outsideScope.Rows)[0].status -ceq "notApplicable" -and [bool]$outsideScope.Complete) `
+        "A rule that governs no kind may still name the constructs it confirmed it does not reach."
+    $wrongKindChecked = Invoke-Coverage -WithConstructs @(
+        [pscustomobject][ordered]@{ constructId = "mi0"; kind = "invocation"; path = "src/a.cs"; line = 5; endLine = 5 }
+        [pscustomobject][ordered]@{ constructId = "dc0"; kind = "declaration"; path = "src/a.cs"; line = 9; endLine = 9 }
+    ) -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope "invocation" -Checked "mi0,dc0"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope "invocation" -Checked "mi0")
+    )
+    Assert-Replay ([string]@($wrongKindChecked.Rows)[0].status -ceq "unknown") `
+        "Weighing a construct against a rule whose declared scope excludes it must still degrade."
+    $ghostConstruct = Invoke-Coverage -WithConstructs @(
+        [pscustomobject][ordered]@{ constructId = "mi0"; kind = "invocation"; path = "src/a.cs"; line = 5; endLine = 5 }
+    ) -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope "invocation" -Checked "mi0" -NotInReach "dc7"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope "invocation" -Checked "mi0")
+    )
+    Assert-Replay ([string]@($ghostConstruct.Rows)[0].status -ceq "unknown") `
+        "A construct id the wrapper never enumerated must degrade the row wherever it appears."
+
     $vacuous = Invoke-Coverage -Rows @(
         (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope "none" -Checked ""),
         (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
