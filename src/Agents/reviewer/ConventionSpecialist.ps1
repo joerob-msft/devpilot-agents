@@ -38,6 +38,10 @@ $script:ReviewerConventionSpecialistCoverageScopePattern =
 $script:ReviewerConventionSpecialistConstructKinds = @(
     "invocation", "declaration", "comment", "assignment"
 )
+# One place for the id-list shape: ids and inclusive same-kind ranges. Four row
+# fields share it, and four copies of a regex is four chances to edit three.
+$script:ReviewerConventionSpecialistConstructListPattern =
+'^(|(mi|dc|cm|as)[0-9]{1,3}(-(mi|dc|cm|as)[0-9]{1,3})?(,(mi|dc|cm|as)[0-9]{1,3}(-(mi|dc|cm|as)[0-9]{1,3})?)*)$'
 $script:ReviewerConventionSpecialistConstructPrefixes = @{
     invocation = "mi"; declaration = "dc"; comment = "cm"; assignment = "as"
 }
@@ -373,18 +377,23 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
             # A row anchors on CONSTRUCT IDS, not on file and line. The wrapper
             # enumerated every changed construct itself, so an id resolves to an
             # exact path and line that the wrapper can check - and, more to the
-            # point, `checkedConstructs` has to name every construct in the
-            # declared scope. That is what stops "named parameters: compliant"
-            # from meaning "I looked at one call". Judging which constructs a
-            # rule applies to is still the model's job against the rule text;
-            # covering all of them is not optional.
+            # A row anchors on CONSTRUCT IDS, not on file and line. The wrapper
+            # enumerated every changed construct itself, so an id resolves to an
+            # exact path and line that the wrapper can check - and, more to the
+            # point, the row must give a VERDICT for every anchor in the kinds
+            # it declares: violating, compliant, out of the rule's reach, or
+            # unknown, disjoint and covering the set exactly. That is what stops
+            # "named parameters: compliant" from meaning "I looked at one call".
+            # The wrapper then derives the row's status from those verdicts.
+            # Judging which constructs a rule reaches is still the model's job
+            # against the rule text; giving each one an answer is not optional.
             ruleCoverage = @{
                 Type = "objectArray"; MaxItems = $script:ReviewerConventionSpecialistMaxRuleCoverage
                 Item = @{
                     Keys = @(
                         "ruleRef", "ruleSourceSha256", "ruleQuote", "status",
-                        "scope", "checkedConstructs", "notInReachConstructs",
-                        "violatingConstructs",
+                        "scope", "violatingConstructs", "compliantConstructs",
+                        "notInReachConstructs", "unknownConstructs",
                         "codeEvidence", "siblingStatus", "siblingEvidence",
                         "candidateId", "notes"
                     )
@@ -405,28 +414,43 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                             Type = "string"; MaxLength = 64
                             Pattern = $script:ReviewerConventionSpecialistCoverageScopePattern
                         }
-                        # 200 rather than 400: ranges make a complete list four
-                        # short spans, so the extra room bought nothing, and the
-                        # whole section has to stay well inside the marker's
-                        # scan window - which it shares with the candidates.
-                        checkedConstructs = @{
-                            Type = "string"; MaxLength = 200; AllowEmpty = $true
-                            Pattern = '^(|(mi|dc|cm|as)[0-9]{1,3}(-(mi|dc|cm|as)[0-9]{1,3})?(,(mi|dc|cm|as)[0-9]{1,3}(-(mi|dc|cm|as)[0-9]{1,3})?)*)$'
-                        }
-                        # Constructs the row looked at and judged outside the
-                        # rule's reach. Without this the model's only honest
-                        # options are to list a production method as "checked"
-                        # against a rule about tests, or to leave it out and be
-                        # degraded - and it kept choosing the second. Narrowing
-                        # is a real judgement and deserves somewhere to be
-                        # written down; what is NOT allowed is silence.
-                        notInReachConstructs = @{
-                            Type = "string"; MaxLength = 200; AllowEmpty = $true
-                            Pattern = '^(|(mi|dc|cm|as)[0-9]{1,3}(-(mi|dc|cm|as)[0-9]{1,3})?(,(mi|dc|cm|as)[0-9]{1,3}(-(mi|dc|cm|as)[0-9]{1,3})?)*)$'
-                        }
+                        # Four disjoint id lists that together must equal every
+                        # construct of the declared kinds. This is the whole
+                        # mechanism: a row does not assert an outcome for a rule
+                        # and then list some ids, it gives a verdict for EVERY
+                        # anchor, and the wrapper derives the row's status from
+                        # the partition. That is what stops one chosen method
+                        # standing in for a rule, and what stops silence reading
+                        # as compliance.
+                        #
+                        # 200 characters each: ranges make a complete list a few
+                        # short spans, and the section has to stay well inside
+                        # the marker scan window it shares with the candidates.
                         violatingConstructs = @{
                             Type = "string"; MaxLength = 200; AllowEmpty = $true
-                            Pattern = '^(|(mi|dc|cm|as)[0-9]{1,3}(-(mi|dc|cm|as)[0-9]{1,3})?(,(mi|dc|cm|as)[0-9]{1,3}(-(mi|dc|cm|as)[0-9]{1,3})?)*)$'
+                            Pattern = $script:ReviewerConventionSpecialistConstructListPattern
+                        }
+                        compliantConstructs = @{
+                            Type = "string"; MaxLength = 200; AllowEmpty = $true
+                            Pattern = $script:ReviewerConventionSpecialistConstructListPattern
+                        }
+                        # Anchors the row examined and judged outside the rule's
+                        # reach. Without this the model's only honest options
+                        # were to call a production method "checked" against a
+                        # rule about tests, or to leave it out and be degraded -
+                        # and it kept choosing the second. Narrowing is a real
+                        # judgement and deserves somewhere to be written down;
+                        # what is NOT allowed is silence.
+                        notInReachConstructs = @{
+                            Type = "string"; MaxLength = 200; AllowEmpty = $true
+                            Pattern = $script:ReviewerConventionSpecialistConstructListPattern
+                        }
+                        # Anchors the row could not decide about. A first-class
+                        # answer, and the only honest one when the source was
+                        # not delivered or the rule text does not settle it.
+                        unknownConstructs = @{
+                            Type = "string"; MaxLength = 200; AllowEmpty = $true
+                            Pattern = $script:ReviewerConventionSpecialistConstructListPattern
                         }
                         # No ASCII pattern on the three prose fields, lengths
                         # with real headroom rather than a cap that tracks the
@@ -456,11 +480,11 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                         # survive it. ruleQuote keeps the strict pattern and no
                         # truncation, because it must be an exact substring of
                         # the transported source and the wrapper checks that.
-                        codeEvidence = @{ Type = "string"; MaxLength = 600; AllowEmpty = $true; Truncate = $true }
+                        codeEvidence = @{ Type = "string"; MaxLength = 400; AllowEmpty = $true; Truncate = $true }
                         siblingStatus = @{ Type = "enum"; Values = @("checked", "notRequired", "unavailable") }
-                        siblingEvidence = @{ Type = "string"; MaxLength = 600; AllowEmpty = $true; Truncate = $true }
+                        siblingEvidence = @{ Type = "string"; MaxLength = 400; AllowEmpty = $true; Truncate = $true }
                         candidateId = @{ Type = "string"; MaxLength = 64; AllowEmpty = $true; Pattern = '^(|[a-z][a-z0-9-]{0,63})$' }
-                        notes = @{ Type = "string"; MaxLength = 600; AllowEmpty = $true; Truncate = $true }
+                        notes = @{ Type = "string"; MaxLength = 400; AllowEmpty = $true; Truncate = $true }
                     }
                 }
             }
@@ -810,43 +834,34 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         }
         $scope = [string](Get-ReviewerConventionSpecialistValue $row "scope" "none")
         $scopeKinds = @(@($scope -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -cne "none" })
-        $checkedResult = Expand-ReviewerConventionSpecialistConstructIds `
-            -Text ([string](Get-ReviewerConventionSpecialistValue $row "checkedConstructs" ""))
-        $checked = @($checkedResult.Ids)
-        $notInReachResult = Expand-ReviewerConventionSpecialistConstructIds `
-            -Text ([string](Get-ReviewerConventionSpecialistValue $row "notInReachConstructs" ""))
-        $notInReach = @($notInReachResult.Ids)
-        $violatingResult = Expand-ReviewerConventionSpecialistConstructIds `
-            -Text ([string](Get-ReviewerConventionSpecialistValue $row "violatingConstructs" ""))
-        $violating = @($violatingResult.Ids)
-        if ((-not $checkedResult.Ok) -or (-not $notInReachResult.Ok) -or (-not $violatingResult.Ok)) {
+
+        # THE PARTITION. A row does not assert an outcome for a rule and then
+        # name a few ids; it gives a verdict for EVERY anchor in the kinds it
+        # declared, and the four lists must be disjoint and cover exactly that
+        # set. The wrapper then DERIVES the row's status from the partition
+        # rather than taking the model's word for it.
+        #
+        # That is the whole mechanism. One chosen method can no longer stand in
+        # for a rule, silence can no longer read as compliance, and the status a
+        # reader sees is a function of the anchors rather than of a sentence.
+        $partition = [ordered]@{}
+        $partitionOk = $true
+        foreach ($field in @("violatingConstructs", "compliantConstructs", "notInReachConstructs", "unknownConstructs")) {
+            $expanded = Expand-ReviewerConventionSpecialistConstructIds `
+                -Text ([string](Get-ReviewerConventionSpecialistValue $row $field ""))
+            if (-not $expanded.Ok) { $partitionOk = $false }
+            $partition[$field] = @($expanded.Ids)
+        }
+        $violating = @($partition["violatingConstructs"])
+        $compliantIds = @($partition["compliantConstructs"])
+        $notInReach = @($partition["notInReachConstructs"])
+        $unknownIds = @($partition["unknownConstructs"])
+        if (-not $partitionOk) {
             $status = "unknown"
             if (-not $degradedReason) { $degradedReason = "the row wrote a construct range the wrapper could not read" }
         }
-        # A construct is either one the rule reaches or one it does not. Claiming
-        # both about the same construct is not an accounting, it is two.
-        $bothWays = @(@($checked) | Where-Object { $notInReach -ccontains $_ })
-        if ($bothWays.Count -gt 0) {
-            $status = "unknown"
-            if (-not $degradedReason) {
-                $degradedReason = "the row called the same construct both checked and out of reach: " +
-                (@($bothWays | Select-Object -First 20) -join ",")
-            }
-        }
-        # Out of reach is a judgement about the rule, not a place to file a
-        # violation.
-        $violatingOutOfReach = @(@($violating) | Where-Object { $notInReach -ccontains $_ })
-        if ($violatingOutOfReach.Count -gt 0) {
-            $status = "unknown"
-            if (-not $degradedReason) {
-                $degradedReason = "the row called a construct out of the rule's reach and a violation of it at the same time"
-            }
-        }
 
-        # The scope decides which constructs this row OWES an answer for. A row
-        # that says a rule is compliant while leaving constructs in its own
-        # declared scope unmentioned has not checked them, and saying so is the
-        # whole point of this section.
+        # The set this row owes a verdict for.
         $requiredList = [System.Collections.Generic.List[string]]::new()
         foreach ($kind in $scopeKinds) {
             if (-not $idsByKind.ContainsKey($kind)) {
@@ -857,70 +872,91 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
             foreach ($id in $idsByKind[$kind]) { [void]$requiredList.Add($id) }
         }
         $required = @($requiredList.ToArray())
-        # `none` cannot be a free pass, and neither can declaring a scope and
-        # then putting every construct in it out of reach. A row that examined
-        # nothing has checked nothing, however it spells that - which is the
-        # exact shape of the miss this section exists to make visible.
-        $reachedNothing = ($constructById.Count -gt 0 -and @($checked).Count -eq 0)
-        if ($reachedNothing -and @("notApplicable", "unknown") -cnotcontains $status) {
-            $status = "unknown"
-            if (-not $degradedReason) {
-                $degradedReason = $(if (@($required).Count -eq 0) {
-                        "the row claimed no construct was in reach while $($constructById.Count) were enumerated"
-                    }
-                    else {
-                        "the row declared scope '$scope' and then put every construct in it out of the rule's reach, which is an answer about nothing"
-                    })
+
+        # Disjoint. An anchor with two verdicts is not an accounting, it is two.
+        $seenInPartition = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $doubleCounted = [System.Collections.Generic.List[string]]::new()
+        $allAccounted = [System.Collections.Generic.List[string]]::new()
+        foreach ($field in @($partition.Keys)) {
+            foreach ($id in @($partition[$field])) {
+                if (-not $seenInPartition.Add($id)) { [void]$doubleCounted.Add($id) }
+                else { [void]$allAccounted.Add($id) }
             }
         }
-        # Every construct in the declared scope must be accounted for one way or
-        # the other: examined against the rule, or examined and judged outside
-        # its reach. Silence about one is the miss this whole section exists to
-        # make visible.
-        # Strays are computed over `checked` only. Saying "the rule does not
-        # reach this construct" is a meaningful statement about ANY construct
-        # the wrapper enumerated, including ones outside the declared scope -
-        # a row that names them is being more informative, not less. Weighing
-        # one against a rule whose scope excludes it is the actual error.
-        $accountedConstructs = @(@($checked) + @($notInReach))
-        $missingConstructs = @(@($required) | Where-Object { $accountedConstructs -cnotcontains $_ })
-        $strayConstructs = @(@($checked) | Where-Object { $required -cnotcontains $_ })
-        $unknownAccounted = @(@($accountedConstructs) | Where-Object { -not $constructById.ContainsKey($_) })
-        if ($unknownAccounted.Count -gt 0) {
+        if ($doubleCounted.Count -gt 0) {
             $status = "unknown"
             if (-not $degradedReason) {
-                $degradedReason = "the row named constructs that do not exist: " +
-                (@($unknownAccounted | Select-Object -First 20) -join ",")
+                $degradedReason = "the row gave the same anchor more than one verdict: " +
+                (@($doubleCounted | Select-Object -First 20) -join ",")
             }
         }
+        # Real anchors only.
+        $ghostAnchors = @(@($allAccounted) | Where-Object { -not $constructById.ContainsKey($_) })
+        if ($ghostAnchors.Count -gt 0) {
+            $status = "unknown"
+            if (-not $degradedReason) {
+                $degradedReason = "the row named anchors that do not exist: " +
+                (@($ghostAnchors | Select-Object -First 20) -join ",")
+            }
+        }
+        # Exact 1:1 coverage of the declared scope. Missing is silence; stray is
+        # a verdict about something the row said its rule does not govern -
+        # except for out-of-reach, which is meaningful about any anchor.
+        $verdictBearing = @(@($violating) + @($compliantIds) + @($unknownIds))
+        $missingConstructs = @(@($required) | Where-Object { $allAccounted -cnotcontains $_ })
+        $strayConstructs = @(@($verdictBearing) | Where-Object { $required -cnotcontains $_ })
         if ($missingConstructs.Count -gt 0 -or $strayConstructs.Count -gt 0) {
             $status = "unknown"
             if (-not $degradedReason) {
-                # Name them. "22 unaccounted" tells a reader that something went
-                # wrong; the ids tell them what was not looked at.
+                # Name them. "22 unaccounted" tells a reader something went
+                # wrong; the ids tell them which anchors nobody looked at.
                 $degradedReason = $(if ($missingConstructs.Count -gt 0) {
-                        "the row declared scope '$scope' but left these unaccounted: " +
+                        "the row declared scope '$scope' but gave no verdict for these anchors: " +
                         (@($missingConstructs | Select-Object -First 20) -join ",") +
                         $(if ($missingConstructs.Count -gt 20) { " and $($missingConstructs.Count - 20) more" } else { "" })
                     }
                     else {
-                        "the row weighed constructs against a rule whose scope excludes them: " +
+                        "the row judged anchors its own declared scope excludes: " +
                         (@($strayConstructs | Select-Object -First 20) -join ",")
                     })
             }
         }
-        $unknownViolating = @(@($violating) | Where-Object { -not $constructById.ContainsKey($_) -or $checked -cnotcontains $_ })
-        if ($unknownViolating.Count -gt 0) {
+        # `none` is only ever an answer when there is genuinely nothing to
+        # answer about, and a scope whose every anchor is out of reach is the
+        # same claim spelled differently.
+        $weighedAnything = (@($violating).Count + @($compliantIds).Count + @($unknownIds).Count) -gt 0
+        if ($constructById.Count -gt 0 -and -not $weighedAnything -and
+            @("notApplicable", "unknown") -cnotcontains $status) {
             $status = "unknown"
-            if (-not $degradedReason) { $degradedReason = "the row named a violating construct it did not check, or one that does not exist" }
+            if (-not $degradedReason) {
+                $degradedReason = $(if (@($required).Count -eq 0) {
+                        "the row claimed no anchor was in reach while $($constructById.Count) were enumerated"
+                    }
+                    else {
+                        "the row declared scope '$scope' and then put every anchor in it out of the rule's reach, which is an answer about nothing"
+                    })
+            }
         }
-        elseif ($status -ceq "violation" -and $violating.Count -eq 0) {
-            $status = "unknown"
-            if (-not $degradedReason) { $degradedReason = "the row reported a violation without naming the construct that violates" }
-        }
-        elseif ($status -cne "violation" -and $violating.Count -gt 0) {
-            $status = "unknown"
-            if (-not $degradedReason) { $degradedReason = "the row named violating constructs without reporting a violation" }
+
+        # The DERIVED status. Skipped only when the WRAPPER already degraded the
+        # row - a partition the wrapper could not trust has nothing worth
+        # deriving from. A row that merely called ITSELF unknown still gets its
+        # anchors read, which is the whole point.
+        if (-not $degradedReason) {
+            $derived = $(if (@($unknownIds).Count -gt 0) { "unknown" }
+                elseif (@($violating).Count -gt 0) { "violation" }
+                elseif (-not $weighedAnything) { "notApplicable" }
+                else { "compliant" })
+            if ($derived -cne $status) {
+                # Not a degrade: the partition is the answer, and the wrapper
+                # simply reads it. Recording the disagreement matters because a
+                # row that says "compliant" over a partition containing a
+                # violation is worth a reader's attention.
+                if (-not $degradedReason) {
+                    $degradedReason = "the row said '$status' while its own anchor verdicts say '$derived'; the anchors decide"
+                }
+                $status = $derived
+            }
         }
         $quote = [string](Get-ReviewerConventionSpecialistValue $row "ruleQuote" "")
         if ($quote) {
@@ -995,9 +1031,10 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
                 ruleQuote = $quote
                 status = $status
                 scope = $scope
-                checkedConstructs = @($checked)
-                notInReachConstructs = @($notInReach)
                 violatingConstructs = @($violating)
+                compliantConstructs = @($compliantIds)
+                notInReachConstructs = @($notInReach)
+                unknownConstructs = @($unknownIds)
                 codeEvidence = [string](Get-ReviewerConventionSpecialistValue $row "codeEvidence" "")
                 siblingStatus = [string](Get-ReviewerConventionSpecialistValue $row "siblingStatus" "unavailable")
                 siblingEvidence = [string](Get-ReviewerConventionSpecialistValue $row "siblingEvidence" "")
@@ -1040,7 +1077,9 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         # different claim from "checked 120", and a reader must be able to see
         # which one they are looking at.
         EnumeratedConstructCount = $constructById.Count
-        CheckedConstructCount = [int](@(@($normalized) | ForEach-Object { @($_.checkedConstructs).Count } | Measure-Object -Sum).Sum)
+        CheckedConstructCount = [int](@(@($normalized) | ForEach-Object {
+                    @($_.violatingConstructs).Count + @($_.compliantConstructs).Count + @($_.unknownConstructs).Count
+                } | Measure-Object -Sum).Sum)
         NotInReachConstructCount = [int](@(@($normalized) | ForEach-Object { @($_.notInReachConstructs).Count } | Measure-Object -Sum).Sum)
         UnemittedViolations = @($unemitted.ToArray())
         ConstructsIncomplete = $ConstructsIncomplete

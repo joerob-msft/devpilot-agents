@@ -191,12 +191,13 @@ anchor ids for the changed files the wrapper delivered, and the wrapper's own
 enumeration of every **changed construct** in the change set. Each row states:
 
 - the pack, source id and source hash it is about, and an exact quote from it;
-- a `status` of `violation`, `compliant`, `notApplicable` or `unknown`;
+- a `status` of `violation`, `compliant`, `notApplicable` or `unknown` - which
+  the wrapper **derives** from the verdicts below rather than taking on trust;
 - a `scope`: the construct kinds the rule governs, or `none`;
-- `checkedConstructs`: everything it weighed against the rule, and
-  `notInReachConstructs`: everything it examined and judged the rule does not
-  reach. Together they must cover every construct of the declared kinds;
-- `violatingConstructs`: the ones judged to break the rule;
+- a verdict for **every** anchor of those kinds, split across four disjoint
+  lists that together equal that set exactly: `violatingConstructs`,
+  `compliantConstructs`, `notInReachConstructs` (examined, and the rule does
+  not reach it) and `unknownConstructs` (could not decide);
 - the code evidence, and the sibling evidence or why none was needed;
 - the id of the candidate it produced, or a note saying why none was emitted.
 
@@ -246,14 +247,18 @@ computed itself:
   reported **unknown** and is not counted toward coverage;
 - a row whose source hash or quote does not match what was actually transported
   is degraded to `unknown` with the reason recorded;
-- a row that leaves any construct in its own declared scope out of **both**
-  `checkedConstructs` and `notInReachConstructs` is degraded, and the reason
-  names the exact ids it left out; so is a row that claims the same construct
-  both ways;
+- a row that leaves any anchor in its own declared scope out of **all four**
+  verdict lists is degraded, and the reason names the exact ids it left out; so
+  is a row that gives the same anchor two verdicts, or a verdict to an anchor
+  that does not exist;
+- the row's `status` is **derived from the verdicts**: `unknown` if any anchor
+  is undecided, else `violation` if any anchor violates, else `notApplicable`
+  if none was weighed, else `compliant`. Where the model's own `status`
+  disagrees, the anchors decide and the disagreement is recorded. This is what
+  stops one chosen method standing in for a rule;
 - a row that declares `scope: none` while constructs exist, or that puts every
-  construct in its scope out of reach, may only be `notApplicable` or
-  `unknown` - a `compliant` row that weighed nothing is an answer about
-  nothing;
+  anchor in its scope out of reach, may only be `notApplicable` or `unknown` -
+  a `compliant` row that weighed nothing is an answer about nothing;
 - a row whose linked candidate is anchored outside every construct it called
   violating is degraded: a row about one place cannot account for a finding
   about another. The anchor may fall anywhere inside the construct's
