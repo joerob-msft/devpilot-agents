@@ -147,9 +147,15 @@ Each `ruleCoverage` row has exactly `ruleRef`, `ruleSourceSha256`, `ruleQuote`
 in `ruleCoverageRequest.requiredRows`, in that order.
 
 **These rows are a checklist, not an essay, and the whole marker is rejected if
-any field runs over.** Keep `ruleQuote` under 200 characters, `codeEvidence`
-under 300, and `siblingEvidence` and `notes` under 280 each. Say the thing and
+any field runs over.** Keep `ruleQuote` under 200 characters, and keep it plain
+ASCII, since it has to match the transported source exactly. Keep
+`codeEvidence`, `siblingEvidence` and `notes` under 600 each. Say the thing and
 stop; the candidate is where a full argument belongs.
+
+**Every key listed above must be present on every object in every array.**
+Where a value is empty, send the empty string `""` - never omit the key. "Or
+empty" means an empty value, not an absent one: one missing key rejects the
+whole marker, taking the candidates alongside it.
 
 The top-level object has exactly:
 
