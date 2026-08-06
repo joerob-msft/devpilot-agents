@@ -78,6 +78,30 @@ function Expand-ReviewerConventionSpecialistConstructIds {
     return @{ Ok = $true; Ids = @($ids.ToArray()) }
 }
 
+function Get-ReviewerConventionSpecialistShortened {
+    <#
+        Cuts a string to a length without splitting a surrogate pair.
+
+        The text being cut here is model prose from a coverage row's `notes`,
+        which carries no ASCII pattern, so a non-BMP character in it is legal.
+        Half a surrogate pair is not a control character and has no pattern to
+        fail, so it survives every check and then throws when the preview is
+        written as strict UTF-8 - taking the whole pass, candidates included,
+        with an error that reads like corruption. The harness guards its own
+        truncation the same way; this is the one place the wrapper cuts text
+        itself.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory)][int]$MaxLength
+    )
+    if ($MaxLength -le 0) { return "" }
+    if ($Text.Length -le $MaxLength) { return $Text }
+    $cut = $MaxLength
+    if ($cut -gt 0 -and [char]::IsHighSurrogate($Text[$cut - 1])) { $cut-- }
+    return $Text.Substring(0, $cut)
+}
+
 function Get-ReviewerConventionSpecialistValue {
     param($Object, [Parameter(Mandatory)][string]$Name, $Default = $null)
     if ($null -eq $Object) { return $Default }
@@ -1011,6 +1035,13 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         Duplicates = @($duplicates.ToArray())
         Unknown = @($unknown.ToArray())
         UnaccountedCandidates = @($unaccountedCandidates)
+        # Every construct the row was given to account for, and how it split
+        # them. "Complete: True" beside "checked 1, out of reach 119" is a very
+        # different claim from "checked 120", and a reader must be able to see
+        # which one they are looking at.
+        EnumeratedConstructCount = $constructById.Count
+        CheckedConstructCount = [int](@(@($normalized) | ForEach-Object { @($_.checkedConstructs).Count } | Measure-Object -Sum).Sum)
+        NotInReachConstructCount = [int](@(@($normalized) | ForEach-Object { @($_.notInReachConstructs).Count } | Measure-Object -Sum).Sum)
         UnemittedViolations = @($unemitted.ToArray())
         ConstructsIncomplete = $ConstructsIncomplete
         # The construct table the rows were reconciled against, compactly. A
@@ -1218,7 +1249,7 @@ function Resolve-ReviewerConventionSpecialistCandidates {
         $detail = "Rule accounting reported a violation of '$([string]$unemitted.ruleSourceId)' in pack '$([string]$unemitted.packName)' but the pass emitted no candidate for it."
         $note = [string]$unemitted.notes
         if ($note) { $detail = "$detail Stated reason: $note" }
-        if ($detail.Length -gt 800) { $detail = $detail.Substring(0, 800) }
+        if ($detail.Length -gt 800) { $detail = Get-ReviewerConventionSpecialistShortened -Text $detail -MaxLength 800 }
         [void]$withheld.Add([pscustomobject][ordered]@{
                 candidateId = ""
                 reason = "accountedNotEmitted"

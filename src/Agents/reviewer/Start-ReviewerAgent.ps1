@@ -2925,8 +2925,10 @@ function Get-ReviewerGateQualification {
     # The RAW master key, deliberately: a qualification artifact is minted out
     # of band by tools/New-ReviewerGateQualification.ps1, so this reads someone
     # else's artifact, like the two promotion readers - not something this run
-    # sealed. Under the per-run key it would fail verification in every replay,
-    # with a message that reads like tampering.
+    # sealed, which is what the derived per-run domain is for. Under replay it
+    # fails verification regardless, because the redirected state directory
+    # holds a freshly generated master key of its own; that is fail-closed and
+    # harmless, since replay can never deliver anything anyway.
     $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
     $read = Read-ReviewerGateQualification -Path $resolvedQualificationPath -MasterKey $masterKey
     if (-not $read.Ok) {
@@ -8428,6 +8430,15 @@ function Write-ReviewerConventionSpecialistPreview {
         [void]$lines.Add("")
         [void]$lines.Add("- Transported rule sources: $([int]$RuleCoverage.ExpectedSourceCount); requested: $([int]$RuleCoverage.RequestedSourceCount); accounted for: $([int]$RuleCoverage.AccountedSourceCount)")
         [void]$lines.Add("- Complete: $([bool]$RuleCoverage.Complete)")
+        # Complete over what. "Complete: True" beside "weighed 1, ruled out of
+        # reach 119" is a very different claim from "weighed 120", and a reader
+        # has to be able to tell which one this is.
+        [void]$lines.Add(("- Changed constructs enumerated: {0}; row-construct pairs weighed against a rule: {1}; ruled out of the rule's reach: {2}" -f `
+                [int]$RuleCoverage.EnumeratedConstructCount, [int]$RuleCoverage.CheckedConstructCount,
+            [int]$RuleCoverage.NotInReachConstructCount))
+        if ([bool]$RuleCoverage.ConstructsIncomplete) {
+            [void]$lines.Add("- The construct enumeration itself was incomplete, so this accounting does not cover the whole change set.")
+        }
         if ([int]$RuleCoverage.DegradedRowCount -gt 0) {
             [void]$lines.Add("- Rows the wrapper degraded to unknown: $([int]$RuleCoverage.DegradedRowCount)")
         }
@@ -8509,6 +8520,9 @@ function Write-ReviewerConventionSpecialistPreview {
                     requestedSourceCount = [int]$RuleCoverage.RequestedSourceCount
                     accountedSourceCount = [int]$RuleCoverage.AccountedSourceCount
                     degradedRowCount = [int]$RuleCoverage.DegradedRowCount
+                    enumeratedConstructCount = [int]$RuleCoverage.EnumeratedConstructCount
+                    checkedConstructCount = [int]$RuleCoverage.CheckedConstructCount
+                    notInReachConstructCount = [int]$RuleCoverage.NotInReachConstructCount
                     missing = @($RuleCoverage.Missing)
                     duplicates = @($RuleCoverage.Duplicates)
                     unknown = @($RuleCoverage.Unknown)
