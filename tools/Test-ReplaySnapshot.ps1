@@ -1117,6 +1117,24 @@ try {
     Assert-Replay ($retryBlock.Value -match '\$toolAudit\.requestedTools = @\(\)') `
         "Each attempt must reset the tool audit, so a failed attempt's requests are neither reported nor hidden by a quieter retry."
 
+    # The verifier cuts seven lines out of a changed file to check a candidate
+    # against. The bound on what it may OPEN to do that is not the bound on a
+    # document: a source file larger than the document bound yielded no hunk,
+    # and the verifier was then asked to confirm a finding having been shown
+    # nothing - which it correctly refused, losing a real finding to a number.
+    $reviewerText = [IO.File]::ReadAllText((Join-Path $RepoRoot "src\Agents\reviewer\Start-ReviewerAgent.ps1"))
+    $hunkFunction = [regex]::Match($reviewerText, '(?s)function Get-ReviewerVerificationSourceHunks \{.*?\n\}')
+    Assert-Replay ($hunkFunction.Success) "The verifier source-hunk builder must be findable."
+    Assert-Replay ($hunkFunction.Value -match '-MaxBytes \$script:ReviewerVerificationMaxSourceFileBytes') `
+        "The verifier's file read must use its own named bound, not a literal shared with the document bound."
+    $verifierBound = [regex]::Match($reviewerText, '\$script:ReviewerVerificationMaxSourceFileBytes = (\d+)')
+    $documentBound = [regex]::Match($reviewerText, '\$script:ReviewerAuthoritativeMaxFileBytes = (\d+)')
+    Assert-Replay ($verifierBound.Success -and $documentBound.Success -and
+        [int]$verifierBound.Groups[1].Value -gt [int]$documentBound.Groups[1].Value) `
+        "The verifier must be able to open a source file larger than an authoritative document."
+    Assert-Replay ($hunkFunction.Value -match '\$line - 3' -and $hunkFunction.Value -match '\$line \+ 3') `
+        "Raising the read bound must not widen what a model is shown: the hunk stays seven lines."
+
     # -- 11. The replay tool grant -------------------------------------------    # Extracted from the reviewer's own source and evaluated here, because the
     # claim "the model has no usable tool in replay" is otherwise a comment.
     Write-Host "11/11 replay tool grant" -ForegroundColor Cyan
