@@ -543,12 +543,24 @@ try {
     Assert-Replay ([string]@($vacuous.Rows)[0].status -ceq "unknown" -and -not [bool]$vacuous.Complete) `
         "A row claiming nothing was in reach while constructs exist must degrade, not pass as compliant."
 
-    $vacuousOk = Invoke-Coverage -Rows @(
+    # "Not applicable" has to be earned against the anchors. An all-empty row is
+    # unfalsifiable, and `notApplicable` is exactly the word a model reaches for
+    # when it wants out - so it cannot also be the word that exempts it.
+    $vacuousNotApplicable = Invoke-Coverage -Rows @(
         (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "notApplicable" -Scope "none" -Checked ""),
         (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
     )
-    Assert-Replay ([string]@($vacuousOk.Rows)[0].status -ceq "notApplicable" -and [bool]$vacuousOk.Complete) `
-        "A rule that genuinely does not apply may say so with an empty scope."
+    Assert-Replay ([string]@($vacuousNotApplicable.Rows)[0].status -ceq "unknown" -and
+        -not [bool]$vacuousNotApplicable.Complete) `
+        "A row that names no anchor at all must degrade even when it calls itself notApplicable."
+    # The falsifiable way to say the same thing: name them, and put them out of
+    # the rule's reach.
+    $earnedNotApplicable = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "notApplicable" -Scope "invocation" -Checked "" -NotInReach "mi0,mi1"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
+    )
+    Assert-Replay ([string]@($earnedNotApplicable.Rows)[0].status -ceq "notApplicable" -and [bool]$earnedNotApplicable.Complete) `
+        "A rule that reaches none of its anchors may say so, provided it says which anchors it means."
 
     $wrongKind = Invoke-Coverage -WithConstructs @(
         [pscustomobject][ordered]@{ constructId = "mi0"; kind = "invocation"; path = "src/a.cs"; line = 12; endLine = 12 }
@@ -658,6 +670,15 @@ try {
     Assert-Replay ([string]@($narrowedPartition.Rows)[0].status -ceq "violation") `
         "A row may rule most anchors out of reach and still convict the one the rule does reach."
 
+    # A row that names a violating anchor must reach the unemitted record even
+    # when something else made the row unknown - otherwise one undecided anchor
+    # erases a violation the row stated outright.
+    $violationUnderUnknown = Invoke-Coverage -WithConstructs $threeAnchors -Rows @(
+        (New-PartitionRow -Ref "rs0" -Sha ("a" * 64) -Status "unknown" -Violating "mi0" -Compliant "mi1" -Unknown "mi2"), $filler)
+    Assert-Replay ([string]@($violationUnderUnknown.Rows)[0].status -ceq "unknown" -and
+        @($violationUnderUnknown.UnemittedViolations).Count -eq 1) `
+        "A violation the row named must be recorded even when an undecided anchor makes the row unknown."
+
     $index = Get-ReviewerConventionSpecialistChangedFileIndex -ChangeEntries @(        [pscustomobject][ordered]@{ Path = "src/z.cs"; Role = "current" },
         [pscustomobject][ordered]@{ Path = "src/a.cs"; Role = "current" },
         [pscustomobject][ordered]@{ Path = "src/gone.cs"; Role = "original" }
@@ -716,17 +737,27 @@ try {
     # the section would fail exactly the change sets it was built for. Ranges
     # are what make that possible: the whole set is four ranges, one per kind.
     . (Join-Path $RepoRoot "src\Agents\reviewer\ChangedConstructs.ps1")
+    # The worst case is an ALTERNATING partition, not a contiguous one. Ranges
+    # only compress runs, and a partition's verdicts interleave: measuring
+    # `mi0-mi119` and calling it "every id the enumerator can produce" is
+    # measuring the best case and reporting it as the bound.
     $widestIdList = 0
     foreach ($prefix in @("mi", "dc", "cm", "as")) {
         $kindIds = [string[]]@(0..($script:ReviewerConstructMaxTotal - 1) | ForEach-Object { "$prefix$_" })
         $widestIdList += (Get-ReviewerConstructIdRanges -Ids $kindIds).Length + 1
     }
-    # Every one of the four verdict lists has to be able to hold the whole
-    # enumerated set: a rule may legitimately find every anchor compliant, or
-    # every anchor out of its reach.
+    $alternating = [string[]]@(0..($script:ReviewerConstructMaxTotal - 1) |
+        Where-Object { $_ % 2 -eq 0 } | ForEach-Object { "mi$_" })
+    $worstOneList = (Get-ReviewerConstructIdRanges -Ids $alternating).Length
     foreach ($verdict in @("violatingConstructs", "compliantConstructs", "notInReachConstructs", "unknownConstructs")) {
-        Assert-Replay ($widestIdList -le [int]$coverageSpec.Item.Fields[$verdict].MaxLength) `
-            "The '$verdict' field ($([int]$coverageSpec.Item.Fields[$verdict].MaxLength) chars) must hold every id the enumerator can produce ($widestIdList chars)."
+        $cap = [int]$coverageSpec.Item.Fields[$verdict].MaxLength
+        Assert-Replay ($widestIdList -le $cap) `
+            "The '$verdict' field ($cap chars) must hold every id the enumerator can produce ($widestIdList chars)."
+        Assert-Replay ($worstOneList -le $cap) `
+            "The '$verdict' field ($cap chars) must hold an alternating partition of the largest construct set ($worstOneList chars) - ranges do not compress a verdict that changes every anchor."
+        Assert-Replay (-not ($coverageSpec.Item.Fields[$verdict].ContainsKey("Truncate") -and
+                [bool]$coverageSpec.Item.Fields[$verdict].Truncate)) `
+            "An id list must never be shortened: half a verdict set is worse than none."
     }
     $roundTrip = Expand-ReviewerConventionSpecialistConstructIds -Text (Get-ReviewerConstructIdRanges -Ids ([string[]]@("mi0", "mi1", "mi2", "mi7")))
     Assert-Replay ([bool]$roundTrip.Ok -and (@($roundTrip.Ids) -join ",") -ceq "mi0,mi1,mi2,mi7") `
@@ -1107,6 +1138,28 @@ try {
         Assert-Replay ($null -eq $call -or [string]$call.status -ceq "unknown") `
             "$($unclear.Name) must be reported unknown rather than given an argument shape."
     }
+
+    # A file whose language this enumerator does not model must be reported as
+    # not understood, not enumerated wrongly. It read `# a comment mentioning
+    # Log(` as a call and called every PowerShell argument positional, which is
+    # exactly the fact a naming rule consumes.
+    $unmodelled = Get-ReviewerChangedConstructs -Files @(@{
+            Path = "tools/Thing.ps1"
+            Lines = @('# We call Log(', '#   "the message") and then move on.', 'Get-Thing -Name $n -Value (Compute $x,', '    $y)')
+            ChangedLines = @(1, 2, 3, 4)
+        })
+    Assert-Replay (@($unmodelled.Constructs).Count -eq 0) `
+        "A file in a language this enumerator does not model must yield no constructs (got $(@($unmodelled.Constructs).Count))."
+    Assert-Replay (@($unmodelled.PartiallyUnderstoodFiles) -ccontains "tools/Thing.ps1") `
+        "An unmodelled file must be reported as only partly understood, which is what makes the accounting say it did not cover the change set."
+    $reviewerConstructWiring = [IO.File]::ReadAllText((Join-Path $RepoRoot "src\Agents\reviewer\Start-ReviewerAgent.ps1"))
+    Assert-Replay ($reviewerConstructWiring -match '\$constructsIncomplete = \(\[bool\]\$constructResult\.Truncated -or @\(\$constructResult\.PartiallyUnderstoodFiles\)\.Count -gt 0\)') `
+        "A partly understood file must feed the accounting's incompleteness, or reporting it changes nothing."
+    $modelled = Get-ReviewerChangedConstructs -Files @(@{
+            Path = "src/Thing.cs"; Lines = @('public void T()', '{', '    Log(', '        text: 1);', '}'); ChangedLines = @(1, 2, 3, 4, 5)
+        })
+    Assert-Replay (@($modelled.Constructs).Count -gt 0 -and @($modelled.PartiallyUnderstoodFiles).Count -eq 0) `
+        "A file in a language it does model must still be enumerated."
 
     # A statement that happens to open a call has the shape of a declaration.    # Counting those inflates the declaration set, which is the denominator of
     # the precedent fact a rule reads.

@@ -8428,6 +8428,13 @@ function Write-ReviewerConventionSpecialistPreview {
         # clean" and "never looked" visible without reading the JSON.
         [void]$lines.Add("## Rule accounting")
         [void]$lines.Add("")
+        # One lookup, built once. A degraded row's expanded id lists can hold
+        # thousands of entries, and resolving each with a fresh scan of the
+        # whole construct table made a hostile row both slow and enormous.
+        $constructLookup = @{}
+        foreach ($construct in @($ChangedConstructs)) {
+            $constructLookup[[string]$construct.constructId] = $construct
+        }
         [void]$lines.Add("- Transported rule sources: $([int]$RuleCoverage.ExpectedSourceCount); requested: $([int]$RuleCoverage.RequestedSourceCount); accounted for: $([int]$RuleCoverage.AccountedSourceCount)")
         [void]$lines.Add("- Complete: $([bool]$RuleCoverage.Complete)")
         # Complete over what. "Complete: True" beside "weighed 1, ruled out of
@@ -8480,13 +8487,17 @@ function Write-ReviewerConventionSpecialistPreview {
                 $ids = @($verdict.Ids)
                 if ($ids.Count -eq 0) { continue }
                 $rendered = $(if ([bool]$verdict.Locate) {
-                        @($ids | ForEach-Object {
+                        @($ids | Select-Object -First 60 | ForEach-Object {
                                 $id = [string]$_
-                                $construct = @(@($ChangedConstructs) | Where-Object { [string]$_.constructId -ceq $id })
-                                if ($construct.Count -gt 0) { "$id ($([string]$construct[0].path):$([int]$construct[0].line))" } else { $id }
+                                if ($constructLookup.ContainsKey($id)) {
+                                    $at = $constructLookup[$id]
+                                    "$id ($([string]$at.path):$([int]$at.line))"
+                                }
+                                else { $id }
                             }) -join ', '
                     }
-                    else { $ids -join ', ' })
+                    else { @($ids | Select-Object -First 60) -join ', ' })
+                if ($ids.Count -gt 60) { $rendered += ", and $($ids.Count - 60) more" }
                 [void]$lines.Add("- Anchors $($verdict.Label) ($($ids.Count)): $rendered")
             }
             [void]$lines.Add("- Code evidence: $([string](Get-ReviewerConventionSpecialistValue $row 'codeEvidence' ''))")
