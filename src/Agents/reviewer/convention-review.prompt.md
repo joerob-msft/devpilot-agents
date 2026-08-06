@@ -37,7 +37,8 @@ not a candidate. Do not invent a resolution.
    holds no added or edited text for anyone to read — `noChangedSpans`, which is
    the pull request's own statement that it deleted or renamed the file — and
    that one has nothing in it to check. A path marked `omitted` for any OTHER
-   reason, including `binaryNoText`, `emptyFile`, `notTextual`, `fileTooLarge`
+   reason, including `binaryNoText`, `readerReportedNonTextUncorroborated`,
+   `emptyFile`, `notTextual`, `fileTooLarge`
    and `spansUnavailable`, is a path whose source content could not be
    established: you have not read it, nobody has told you it is empty, you may
    not emit a candidate on it and you may not treat it as checked. A path marked

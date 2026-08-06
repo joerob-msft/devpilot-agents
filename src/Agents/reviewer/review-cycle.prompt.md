@@ -84,11 +84,14 @@ whether its source actually arrived. That table binds you:
   renamed. There is nothing in it for anyone to read, and the change-set diff is
   all there is to judge it by. It is not a gap in what you were given;
 - a path shown as `omitted` for **any other reason** — including `binaryNoText`,
-  `emptyFile`, `notTextual`, `fileTooLarge` and `spansUnavailable`, all of which
-  mean the source content could not be established — **you have not read that
-  file at all.** Nobody has told you it is empty. Do not report a finding on it,
-  do not clear it, and do not let it count toward "I reviewed the change". Name
-  it in your summary as unread.
+  `readerReportedNonTextUncorroborated`, `emptyFile`, `notTextual`,
+  `fileTooLarge` and `spansUnavailable`, all of which mean the source content
+  could not be established — **you have not read that file at all.** Nobody has
+  told you it is empty. Do not report a finding on it, do not clear it, and do
+  not let it count toward "I reviewed the change". Name it in your summary as
+  unread. `readerReportedNonTextUncorroborated` deserves particular care: the
+  repository host alone called that path non-text while the pull request's own
+  path for it looks like ordinary source.
 
 If the accounting table shows files you could not see, your summary must say how
 many and which. An unqualified "no issues found" over an incomplete change set

@@ -47,7 +47,8 @@ $script:ReviewerSourceUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
 # renderer, a gate, or a test can enumerate it instead of pattern-matching prose.
 $script:ReviewerSourceOmissionReasons = @(
     "budgetExhausted", "sliceCountCapExceeded", "fileTooLarge", "notTextual", "transportFailed",
-    "noChangedSpans", "binaryNoText", "emptyFile", "spansUnavailable", "fileCountCapExceeded",
+    "noChangedSpans", "binaryNoText", "readerReportedNonTextUncorroborated", "emptyFile",
+    "spansUnavailable", "fileCountCapExceeded",
     "pathRejected", "spanOutsideFile", "unsafeSliceText", "decodeRejected"
 )
 # Every reason that may mark a path as carrying no source at all. This is the
@@ -55,7 +56,7 @@ $script:ReviewerSourceOmissionReasons = @(
 # under any other reason. It is deliberately LARGER than the model-facing set
 # below - a binary really does hold no source, but only the pull request's own
 # word may be presented to a model as "nothing to check".
-$script:ReviewerSourceNoSourceReasons = @("noChangedSpans", "binaryNoText", "emptyFile")
+$script:ReviewerSourceNoSourceReasons = @("noChangedSpans", "binaryNoText", "readerReportedNonTextUncorroborated", "emptyFile")
 # The strictly smaller set a MODEL may be told means "there is nothing in this
 # path for anyone to read". Only the pull request's own statement qualifies. A
 # path the reader could not establish content for is an UNREAD path: telling the
@@ -1110,17 +1111,26 @@ function New-ReviewerSourceTransportReport {
             $spanlessRejected = [string](Get-ReviewerSourceValue -Object $spanlessResource -Name "Rejected" -Default "")
             $spanlessReason = "spansUnavailable"
             # A file with no line diff AND no text has nothing for this layer to
-            # deliver, so it cannot be uncovered - the same reasoning that
-            # excuses a delete. Adding an icon or a signing key to a small pull
-            # request must not make that pull request permanently unreviewable.
-            # This gets its own reason, never `notTextual`: that one is also
-            # emitted for a file the change set DID diff as text and the wrapper
-            # then refused to fetch, which is an unread file, not an unreadable
-            # one, and the two must not share a sentence in the prompt.
+            # deliver. Which reason it gets depends on whether anyone but the
+            # host says so. When the change set's own path ends in a non-text
+            # extension, two independent parties agree and the path is a plain
+            # binary: `binaryNoText`. When only the host says it, the path is
+            # `/src/Handler.cs` as far as the pull request is concerned and the
+            # claim rests entirely on the party this layer exists to distrust -
+            # that gets its own reason so the accounting table cannot present it
+            # as a settled fact, and so it can be counted and charged as itself.
+            #
+            # Neither is ever `notTextual`: that one is also emitted for a file
+            # the change set DID diff as text and the wrapper then refused to
+            # fetch, which is an unread file, not an unreadable one.
             $spanlessCarriesSource = $true
             if ($spanlessRejected) {
                 $spanlessReason = $spanlessRejected
-                if ($spanlessRejected -ceq "notTextual") { $spanlessReason = "binaryNoText"; $spanlessCarriesSource = $false }
+                if ($spanlessRejected -ceq "notTextual") {
+                    $spanlessReason = if (Test-ReviewerSourcePathLooksNonText -Path $path) { "binaryNoText" }
+                    else { "readerReportedNonTextUncorroborated" }
+                    $spanlessCarriesSource = $false
+                }
                 elseif ($spanlessRejected -ceq "emptyFile") { $spanlessCarriesSource = $false }
             }
             elseif ($spanlessBytes -eq 0) {
@@ -1255,6 +1265,7 @@ function New-ReviewerSourceTransportReport {
             -not [bool]$_.CarriesSource -and [string]$_.NoSourceBasis -ceq 'reader' -and
             -not (Test-ReviewerSourcePathLooksNonText -Path ([string]$_.Path))
         }).Count
+    $readerNonTextUncorroboratedCount = @(@($files) | Where-Object { [string]$_.Reason -ceq 'readerReportedNonTextUncorroborated' }).Count
     # Measured against the DISTINCT paths whose text status is actually
     # contested. Three looser denominators have each been a padding vector in
     # turn: all changed paths let a bulk move buy allowance, all source-capable
@@ -1327,6 +1338,7 @@ function New-ReviewerSourceTransportReport {
         NoSourceFileCount      = $changeSetExcusedFileCount
         ReaderExcusedFileCount = $readerExcusedFileCount
         ReaderExcusedUncorroboratedCount = $readerExcusedUncorroboratedCount
+        ReaderNonTextUncorroboratedCount = $readerNonTextUncorroboratedCount
         ChangeSetExcusedFileCount = $changeSetExcusedFileCount
         ReaderExcusedAllowance = $readerExcusedAllowance
         DeliveredFiles         = $deliveredFileCount
@@ -1556,6 +1568,10 @@ function Format-ReviewerSealedSourceBlock {
     # Backtick-escaped so "$accounting:" is not parsed as a scope qualifier.
     [void]$lines.Add("$accounting`:")
     [void]$lines.Add("")
+    if ([int]$Report.ReaderNonTextUncorroboratedCount -gt 0) {
+        [void]$lines.Add("A path marked ``readerReportedNonTextUncorroborated`` is one the REPOSITORY HOST ALONE reported as not being text. The pull request's own path for it does not say so - it looks like an ordinary source file - and no source was delivered for it. You have not read it. Do not review it, do not clear it, do not report a finding on it, and do not count it as checked. How much of this change set may be set aside this way is bounded, and $($Report.ReaderNonTextUncorroboratedCount) path(s) here are.")
+        [void]$lines.Add("")
+    }
     [void]$lines.Add("| changed path | status | reason | lines delivered |")
     [void]$lines.Add("|---|---|---|---|")
     $rejectedIndex = 0
@@ -1725,6 +1741,7 @@ function ConvertTo-ReviewerSourceCoverageRecord {
         noSourceFileCount      = [int]$Report.NoSourceFileCount
         readerExcusedFileCount = [int]$Report.ReaderExcusedFileCount
         readerExcusedUncorroboratedCount = [int]$Report.ReaderExcusedUncorroboratedCount
+        readerNonTextUncorroboratedCount = [int]$Report.ReaderNonTextUncorroboratedCount
         changeSetExcusedFileCount = [int]$Report.ChangeSetExcusedFileCount
         readerExcusedAllowance = [int]$Report.ReaderExcusedAllowance
         deliveredFiles   = [int]$Report.DeliveredFiles

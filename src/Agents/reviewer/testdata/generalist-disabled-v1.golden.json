@@ -58,6 +58,10 @@
       {
         "sha256": "77bed5a456b3d9c811220c909001eed1c2e3ac02560804f18807efba59940a5c",
         "reason": "Restore the uncorroborated count and the ceiling alongside it. Rewriting that line dropped both, so on a passing pull request a human could no longer see how close the host's unsupported non-text claims came to the refusal threshold."
+      },
+      {
+        "sha256": "e9b8d101c6e5d37f2b39bf4240866353b92ae758f950fcbd02a1d05b5dd4facc",
+        "reason": "Break out how many of those uncorroborated excusals are paths the host alone called non-text. That subset is the one where the pull request's own path says 'ordinary source' and only the untrusted party disagrees, and it now has its own reason code in the accounting table."
       }
     ],
     "Invoke-ReviewerDelivery": [
@@ -126,6 +130,10 @@
     {
       "sha256": "6eb9fe0f587bcf8572135b5c02e17d00886f75865468e6033f65d8e43737d08c",
       "reason": "Narrow that exception list to exactly ONE reason. Only the pull request's own statement that it deleted or renamed a path may be presented as nothing-to-read; a path the reader could not establish content for is an unread file, and telling the model otherwise was a claim the repository host could author at will over any file it chose."
+    },
+    {
+      "sha256": "965539c145efca0accecfe7ec962ce4c9884356b481dd9f7c62fdf3a18fe7fcd",
+      "reason": "Name the new reason for a path the repository host ALONE called non-text, and tell the model to treat it with particular care: the pull request's own path for it looks like ordinary source, so that omission rests entirely on the party this layer exists to distrust."
     }
   ]
 }

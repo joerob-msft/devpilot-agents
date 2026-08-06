@@ -3705,7 +3705,7 @@ function Write-ReviewerPreview {
             [void]$lines.Add("- $([int]$SourceCoverage.changeSetExcusedFileCount) further changed path(s) are ones the pull request itself says hold no added or edited text - a delete or a rename - so they are outside the percentage above")
         }
         if ([int]$SourceCoverage.readerExcusedFileCount -gt 0) {
-            [void]$lines.Add("- $([int]$SourceCoverage.readerExcusedFileCount) changed path(s) counted IN the percentage above are ones whose source content the repository host could not establish; nobody has confirmed they are empty, and they were not read ($([int]$SourceCoverage.readerExcusedUncorroboratedCount) of them uncorroborated by the file's own name; ceiling for this change set: $([int]$SourceCoverage.readerExcusedAllowance))")
+            [void]$lines.Add("- $([int]$SourceCoverage.readerExcusedFileCount) changed path(s) counted IN the percentage above are ones whose source content the repository host could not establish; nobody has confirmed they are empty, and they were not read ($([int]$SourceCoverage.readerExcusedUncorroboratedCount) of them uncorroborated by the file's own name, of which $([int]$SourceCoverage.readerNonTextUncorroboratedCount) are paths the host alone called non-text; ceiling for this change set: $([int]$SourceCoverage.readerExcusedAllowance))")
         }
         # A reader-excused path IS an unread file: only the change set's own
         # statement removes a path from what a human should be told nobody read.
@@ -11949,6 +11949,7 @@ function Invoke-ReviewerCycle {
                     noSourceFileCount = [int]$sourceTransport.Report.NoSourceFileCount
                     readerExcusedFileCount = [int]$sourceTransport.Report.ReaderExcusedFileCount
                     readerExcusedUncorroboratedCount = [int]$sourceTransport.Report.ReaderExcusedUncorroboratedCount
+                    readerNonTextUncorroboratedCount = [int]$sourceTransport.Report.ReaderNonTextUncorroboratedCount
                     changeSetExcusedFileCount = [int]$sourceTransport.Report.ChangeSetExcusedFileCount
                     readerExcusedAllowance = [int]$sourceTransport.Report.ReaderExcusedAllowance
                     coveredFiles = [int]$sourceTransport.Report.CoveredFiles

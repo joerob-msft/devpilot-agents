@@ -1291,8 +1291,65 @@ Assert-Source ([int]$paddedRecord.changeSetExcusedFileCount -eq 5 -and [int]$pad
 # An excusal the change set's OWN path corroborates costs nothing: an icon the
 # pull request calls .png and the reader calls non-text is two parties agreeing.
 $assetReport = New-MislabelReport -Excused 8 -Delivered 1 -ExcusedExtension '.png'
-Assert-Source ([int]$assetReport.ReaderExcusedFileCount -eq 8 -and [int]$assetReport.ReaderExcusedUncorroboratedCount -eq 0) `
-    "reader excusals corroborated by the file's own name are counted apart"
+Assert-Source ([int]$assetReport.ReaderExcusedFileCount -eq 8 -and [int]$assetReport.ReaderExcusedUncorroboratedCount -eq 0 -and
+    [int]$assetReport.ReaderNonTextUncorroboratedCount -eq 0 -and
+    (@(@($assetReport.Files) | Where-Object { [string]$_.Reason -ceq 'binaryNoText' }).Count -eq 8)) `
+    "a true .png the host calls non-text keeps binaryNoText and is corroborated"
+
+# A path the HOST ALONE calls non-text, while the pull request's own path for it
+# looks like ordinary source, gets its own reason. Sharing `binaryNoText` with a
+# genuine asset let the accounting table present the host's unsupported claim as
+# a settled fact about a .cs file.
+$uncorroboratedReport = New-MislabelReport -Excused 5 -Delivered 5
+$uncorroboratedRows = @(@($uncorroboratedReport.Files) | Where-Object { [string]$_.Reason -ceq 'readerReportedNonTextUncorroborated' })
+Assert-Source ($uncorroboratedRows.Count -eq 5 -and
+    (@(@($uncorroboratedReport.Files) | Where-Object { [string]$_.Reason -ceq 'binaryNoText' }).Count -eq 0)) `
+    "an uncorroborated .cs the host alone calls non-text is never labelled binaryNoText"
+Assert-Source ([int]$uncorroboratedReport.ReaderNonTextUncorroboratedCount -eq 5 -and
+    [int]$uncorroboratedReport.ReaderExcusedUncorroboratedCount -eq 5) `
+    "and it is counted as itself, separately from corroborated assets"
+$uncorroboratedBlock = Format-ReviewerSealedSourceBlock -Report $uncorroboratedReport -NonceFactory { 'n' * 32 }
+Assert-Source ($uncorroboratedBlock -match 'readerReportedNonTextUncorroborated' -and
+    $uncorroboratedBlock -match 'REPOSITORY HOST ALONE reported as not being text' -and
+    $uncorroboratedBlock -match 'You have not read it' -and
+    $uncorroboratedBlock -match 'How much of this change set may be set aside this way is bounded') `
+    "the block tells the model plainly that only the host said so, that it was not delivered, and that the share is bounded"
+Assert-Source ($uncorroboratedBlock -notmatch 'readerReportedNonTextUncorroborated`` \(deleted or renamed\)' -and
+    ($script:ReviewerSourceNothingToReadReasons -cnotcontains 'readerReportedNonTextUncorroborated')) `
+    "and the new reason is never in the authoritative nothing-to-check set"
+# No reason may bypass the allowance: the new one is charged like any other
+# uncorroborated reader excusal.
+Assert-Source ([int]$uncorroboratedReport.ReaderExcusedAllowance -eq 5 -and
+    (Test-ReviewerSourceCoverageGate -Report (New-MislabelReport -Excused 6 -Delivered 4) -Policy $policy).ReasonCodes -ccontains 'readerExcusedShareExceeded') `
+    "the new reason is charged against the allowance exactly like any other uncorroborated excusal"
+
+# A .png the change set DID report hunks for is a different thing again: the pull
+# request says it has changed text, so it stays source-bearing and must be
+# delivered or counted against coverage. It never reaches the spanless branch.
+$spannedAssetReport = New-ReviewerSourceTransportReport -CommitSha $commit `
+    -ChangedPaths @('/src/ok.cs', '/assets/sprite.png') `
+    -SpansByPath ([ordered]@{ '/src/ok.cs' = @(@{ Start = 20; End = 21 }); '/assets/sprite.png' = @(@{ Start = 3; End = 4 }) }) `
+    -Policy $policy -ChangeKindsByPath ([ordered]@{ '/src/ok.cs' = 'Edit'; '/assets/sprite.png' = 'Edit' }) `
+    -Reader { param([string]$Path)
+        if ($Path -clike '*.png') { return [pscustomobject]@{ Rejected = 'notTextual'; MimeType = 'image/png'; ByteLength = 900; Sha256 = ('7' * 64) } }
+        $bodyText = New-TestFileText -LineCount 40
+        [pscustomobject]@{ Text = $bodyText; MimeType = 'text/plain'
+            ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($bodyText)
+            Sha256 = Get-ReviewerSourceSha256 -Text $bodyText }
+    }
+$spannedAssetRow = @(@($spannedAssetReport.Files) | Where-Object { [string]$_.Path -ceq '/assets/sprite.png' })[0]
+Assert-Source (([string]$spannedAssetRow.Reason) -ceq 'notTextual' -and [bool]$spannedAssetRow.CarriesSource -and
+    [int]$spannedAssetReport.SourceBearingFileCount -eq 2 -and [int]$spannedAssetReport.ReaderExcusedFileCount -eq 0) `
+    "a .png the pull request reported hunks for stays source-bearing, whatever the reader says about its bytes"
+Assert-Source (-not (Test-ReviewerSourceCoverageGate -Report $spannedAssetReport -Policy $policy).Ok) `
+    "so it fails the gate when it is not delivered, rather than being excused as an asset"
+
+# Deliberate deviation, asserted so it cannot drift back: a CORROBORATED asset is
+# permitted to be treated as nothing-to-check, but this layer does not do that.
+# Only the pull request's own word is presented to a model that way, so
+# binaryNoText stays out of the authoritative set too.
+Assert-Source ($script:ReviewerSourceNothingToReadReasons -cnotcontains 'binaryNoText') `
+    "even a corroborated asset is not presented to the model as nothing to check"
 Assert-Source (-not (Test-ReviewerSourceCoverageGate -Report $assetReport -Policy $policy).Ok) `
     "one edited file plus eight icons the READER called non-text is refused: from this side an icon and a lie are the same answer"
 Assert-Source (Test-ReviewerSourcePathLooksNonText -Path '/assets/logo.PNG') `

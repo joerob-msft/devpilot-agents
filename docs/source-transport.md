@@ -60,8 +60,8 @@ The block opens with every changed path and whether its source actually arrived:
 `status` is `delivered`, `partial`, or `omitted`. `reason` comes from a closed
 set: `budgetExhausted`, `sliceCountCapExceeded`, `fileTooLarge`, `notTextual`,
 `decodeRejected`, `transportFailed`, `noChangedSpans`, `binaryNoText`,
-`emptyFile`, `spansUnavailable`, `fileCountCapExceeded`, `pathRejected`,
-`spanOutsideFile`, `unsafeSliceText`.
+`readerReportedNonTextUncorroborated`, `emptyFile`, `spansUnavailable`,
+`fileCountCapExceeded`, `pathRejected`, `spanOutsideFile`, `unsafeSliceText`.
 
 Those causes are told apart at the reader seam, before the strict decoder runs.
 The decoder's job is safety and it refuses everything it dislikes the same way,
@@ -94,18 +94,29 @@ kind carries content is read anyway, and what comes back decides:
 
 | what the read says | reason | in the denominator? |
 |---|---|---|
-| zero bytes | `emptyFile` | no — there is nothing to deliver |
-| not a text MIME type | `binaryNoText` | no — a file with no line diff and no text has no lines to read |
+| zero bytes | `emptyFile` | **yes** — a zero-length payload is the host's claim too |
+| not a text MIME type, and the path's own extension agrees | `binaryNoText` | **yes** — counted, but not charged against the ceiling |
+| not a text MIME type, and the path looks like ordinary source | `readerReportedNonTextUncorroborated` | **yes** — counted *and* charged |
 | a length that is not decodable | `decodeRejected` | **yes** — a malformed payload, not an oversized one |
 | real text content | `spansUnavailable` | **yes** — its diff was lost |
 | unreadable | `transportFailed` | **yes** |
 
-`binaryNoText` is deliberately a different reason from `notTextual`. The latter is
-emitted for a path the change set DID diff as text — it has added and edited
+`binaryNoText` and `readerReportedNonTextUncorroborated` are the same reader
+answer split by whether anyone else corroborates it. When the change set's own
+path ends in a non-text extension, two independent parties agree and the path is
+a plain binary. When only the host says it — the pull request calls the path
+`/src/Handler.cs` — the claim rests entirely on the party this layer exists to
+distrust, so it gets its own reason. The model-facing block then names it
+explicitly: the repository host alone reported it non-text, no source was
+delivered, the path may not be reviewed or cleared, and the share of a change set
+that may be set aside this way is bounded. Neither reason is ever presented to a
+model as "nothing to check" — only the pull request's own word is.
+
+`notTextual` is a third thing again, and is deliberately separate from both: it
+is emitted for a path the change set DID diff as text — it has added and edited
 lines — which the wrapper's MIME allowlist then refused to fetch. That is an
-unread file, not an unreadable one, and it stays in the denominator and is named
-to the model as unread. Sharing one reason code between the two would have told
-the model there was nothing in it to read.
+unread file, not an unreadable one, so it stays source-bearing and fails the gate
+if it is not delivered.
 
 Emptiness is decided on the reported byte length, not on whitespace: a file of
 blank lines has content a reviewer could be shown. A reader that reports no byte
