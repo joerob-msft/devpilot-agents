@@ -135,18 +135,21 @@ corroborates. When the reader says a path's bytes are not text **and the change
 set's own path for it ends in a non-text extension**, two independent parties
 agree and the excusal is free. When the reader alone says that about
 `/src/Handler.cs`, only the untrusted party is talking, and that is what the cap
-governs: at most `max(2, 50% of the paths that could bear source)` uncorroborated
-reader excusals, after which the gate refuses with `readerExcusedShareExceeded`
-rather than dividing by a number the host chose.
+governs: at most `max(2, 50% of the distinct paths whose text status is
+contested)` uncorroborated reader excusals, after which the gate refuses with
+`readerExcusedShareExceeded` rather than dividing by a number the host chose.
 
 Two details of that arithmetic are load-bearing:
 
-- The share is measured against the paths whose text status is actually
-  **contested** — the change set, minus what the change set itself excused, minus
-  the reader excusals the path name corroborates. Every looser denominator has
-  been a padding vector: dividing by all changed paths let a bulk move buy
-  allowance, and dividing by all source-capable paths let *icons* buy it, two
-  assets per free mislabelled source file.
+- The share is measured against the **distinct** paths whose text status is
+  actually contested — every path that carries source, plus every reader excusal
+  the path name does not corroborate, counted once each and with malformed paths
+  excluded. Every looser denominator has been a padding vector: all changed paths
+  let a bulk move buy allowance; all source-capable paths let *icons* buy it, two
+  assets per free mislabelled source file; and counting change-set *entries* let
+  a repeated `item.path`, or a path that can never be a reviewable location at
+  all, buy it. The charge is still counted per entry, so a duplicated mislabelled
+  path over-charges — the safe direction.
 - Unknown and extensionless paths count as **uncorroborated**, because the
   conservative direction is the one that keeps a path counted.
 

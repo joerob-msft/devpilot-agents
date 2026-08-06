@@ -847,7 +847,10 @@ function ConvertFrom-AgentResultMarker {
             # tight bounds are the payload-examination cap below and the
             # retained-candidate cap further down.
             $scanned++
-            if ($scanned -gt 200000) { break }
+            if ($scanned -gt 200000) {
+                Write-Verbose "Result-marker scan stopped after $scanned prefix occurrence(s); a marker beyond that point is not seen."
+                break
+            }
             $hit = $anchor.Index
             # The opening brace must be on the anchor's OWN line. Searching the
             # whole remaining transcript let a planted prefix line carrying no

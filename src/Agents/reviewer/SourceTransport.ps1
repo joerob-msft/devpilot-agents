@@ -1215,16 +1215,27 @@ function New-ReviewerSourceTransportReport {
             -not [bool]$_.CarriesSource -and [string]$_.NoSourceBasis -ceq 'reader' -and
             -not (Test-ReviewerSourcePathLooksNonText -Path ([string]$_.Path))
         }).Count
-    # Measured against the paths whose text status is actually contested - the
-    # change set minus what the change set itself excused, minus the reader
-    # excusals the change set's own path corroborates. Removing corroborated
-    # assets from the numerator but leaving them in the denominator just moved
-    # the padding vector: every two icons bought one free mislabelled source
-    # file, so ten edited files with nine mislabelled passed as soon as eight
-    # `.png` files sat beside them - and "some source plus some icons" needs no
-    # attacker at all.
-    $sourceCapableFileCount = $changedFileCount - $changeSetExcusedFileCount -
-        ($readerExcusedFileCount - $readerExcusedUncorroboratedCount)
+    # Measured against the DISTINCT paths whose text status is actually
+    # contested. Three looser denominators have each been a padding vector in
+    # turn: all changed paths let a bulk move buy allowance, all source-capable
+    # paths let icons buy it, and counting entries rather than distinct paths let
+    # a repeated `item.path` - or a malformed one that can never be a reviewable
+    # location at all - buy it. The change set is not de-duplicated anywhere
+    # upstream, so eight repeats of one delivered file raised the ceiling by
+    # eight while adding nothing to the charge.
+    #
+    # The charge is still counted per entry, so a duplicated mislabelled path
+    # over-charges. That is the safe direction.
+    $contestedPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($contestedFile in @($files)) {
+        if ([string]$contestedFile.Reason -ceq 'pathRejected') { continue }
+        if ([bool]$contestedFile.CarriesSource -or
+            ([string]$contestedFile.NoSourceBasis -ceq 'reader' -and
+                -not (Test-ReviewerSourcePathLooksNonText -Path ([string]$contestedFile.Path)))) {
+            [void]$contestedPaths.Add([string]$contestedFile.Path)
+        }
+    }
+    $sourceCapableFileCount = $contestedPaths.Count
     $readerExcusedAllowance = [Math]::Max($script:ReviewerSourceReaderExcusedFloor,
         [int][Math]::Floor(($sourceCapableFileCount * $script:ReviewerSourceMaxReaderExcusedPercent) / 100.0))
     $sourceBearingFileCount = $changedFileCount - $noSourceFileCount
@@ -1395,10 +1406,19 @@ function Test-ReviewerSourceCoverageGate {
     # host chose. The paths stay visible in the accounting table either way.
     # The charge falls back to the RAW reader-excusal count, never to zero. A
     # report missing the field is malformed, and a malformed report must
-    # over-charge rather than silently switch the ceiling off.
+    # over-charge rather than silently switch the ceiling off. A report missing
+    # BOTH is not a report this gate can reason about at all, so it is refused.
     $charged = Get-ReviewerSourceValue -Object $Report -Name 'ReaderExcusedUncorroboratedCount' -Default $null
-    if ($null -eq $charged) { $charged = Get-ReviewerSourceValue -Object $Report -Name 'ReaderExcusedFileCount' -Default 0 }
-    if ((Get-ReviewerSourceValue -Object $Report -Name 'ChangedFileCount' -Default 0) -ge 1 -and
+    $chargeKnown = ($null -ne $charged)
+    if (-not $chargeKnown) {
+        $charged = Get-ReviewerSourceValue -Object $Report -Name 'ReaderExcusedFileCount' -Default $null
+        $chargeKnown = ($null -ne $charged)
+    }
+    if (-not $chargeKnown) {
+        if ($reasons -cnotcontains "readerExcusedShareExceeded") { [void]$reasons.Add("readerExcusedShareExceeded") }
+        $charged = 0
+    }
+    elseif ((Get-ReviewerSourceValue -Object $Report -Name 'ChangedFileCount' -Default 0) -ge 1 -and
         [int]$charged -gt [int](Get-ReviewerSourceValue -Object $Report -Name 'ReaderExcusedAllowance' -Default 0)) {
         if ($reasons -cnotcontains "readerExcusedShareExceeded") { [void]$reasons.Add("readerExcusedShareExceeded") }
     }

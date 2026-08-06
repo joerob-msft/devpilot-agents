@@ -1314,6 +1314,44 @@ foreach ($key in @($assetPaddedReport.Keys)) {
 }
 Assert-Source (-not (Test-ReviewerSourceCoverageGate -Report $missingChargeReport -Policy $policy).Ok) `
     "a report missing the charge field falls back to the raw count rather than passing"
+$noChargeAtAll = @{}
+foreach ($key in @($assetPaddedReport.Keys)) {
+    if ($key -cne 'ReaderExcusedUncorroboratedCount' -and $key -cne 'ReaderExcusedFileCount') { $noChargeAtAll[$key] = $assetPaddedReport[$key] }
+}
+Assert-Source (-not (Test-ReviewerSourceCoverageGate -Report $noChargeAtAll -Policy $policy).Ok) `
+    "a report carrying no charge figure at all is refused, not passed"
+
+# The change set is not de-duplicated upstream, so a repeated item.path adds one
+# to the denominator and nothing to the charge - the same padding trick again,
+# and a plain correctness bug: the record claimed nine covered files where one
+# distinct file existed.
+function New-DuplicatePaddedReport {
+    param([int]$Duplicates, [int]$RejectedPads = 0)
+    $paths = @('/src/keep.cs')
+    $spans = [ordered]@{ '/src/keep.cs' = @(@{ Start = 20; End = 21 }) }
+    $kinds = [ordered]@{ '/src/keep.cs' = 'Edit' }
+    for ($i = 1; $i -le 5; $i++) { $paths += "/src/lie$i.cs"; $kinds["/src/lie$i.cs"] = 'Edit' }
+    for ($i = 1; $i -le $Duplicates; $i++) { $paths += '/src/keep.cs' }
+    for ($i = 1; $i -le $RejectedPads; $i++) { $paths += "C:/junk$i.cs" }
+    return New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $paths -SpansByPath $spans `
+        -Policy $policy -Reader { param([string]$Path)
+        if ($Path -clike '*lie*') { return [pscustomobject]@{ Rejected = 'notTextual'; MimeType = 'application/octet-stream'; ByteLength = 3000; Sha256 = ('9' * 64) } }
+        $bodyText = New-TestFileText -LineCount 60
+        [pscustomobject]@{ Text = $bodyText; MimeType = 'text/plain'
+            ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($bodyText)
+            Sha256 = Get-ReviewerSourceSha256 -Text $bodyText }
+    } -ChangeKindsByPath $kinds
+}
+$dupPaddedReport = New-DuplicatePaddedReport -Duplicates 4
+Assert-Source ([int]$dupPaddedReport.ReaderExcusedAllowance -eq 3) `
+    "repeating a delivered path in the change set does not raise the allowance"
+Assert-Source (-not (Test-ReviewerSourceCoverageGate -Report $dupPaddedReport -Policy $policy).Ok) `
+    "so duplicate change-set entries buy no room to mislabel source files"
+$rejectPaddedReport = New-DuplicatePaddedReport -Duplicates 0 -RejectedPads 3
+Assert-Source ([int]$rejectPaddedReport.ReaderExcusedAllowance -eq 3) `
+    "a malformed path is never a reviewable location, so it does not raise the allowance either"
+Assert-Source (-not (Test-ReviewerSourceCoverageGate -Report $rejectPaddedReport -Policy $policy).Ok) `
+    "and cannot be used to pad past the ceiling"
 
 # The exact boundary, both sides, at a change set where the share rounds cleanly.
 $atLimitReport = New-MislabelReport -Excused 5 -Delivered 5
