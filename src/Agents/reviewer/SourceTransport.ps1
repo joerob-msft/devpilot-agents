@@ -1003,6 +1003,10 @@ function New-ReviewerSourceTransportReport {
             $requestedForPath = @(Get-ReviewerSourceValue -Object $SpansByPath -Name $path -Default @()).Count
         }
         if (-not $path) {
+            # No read happens for a path that cannot be normalized, so it must
+            # not spend read budget either - a hundred malformed paths ahead of
+            # five real edits would otherwise cap every one of them.
+            $index--
             [void]$files.Add((New-ReviewerSourceFileEntry -Path ([string]$rawPath) -CommitSha $CommitSha `
                         -Status "omitted" -Reason "pathRejected"))
             continue
@@ -1018,7 +1022,13 @@ function New-ReviewerSourceTransportReport {
             if ($null -ne $ChangeKindsByPath) {
                 $cappedDeclared = Get-ReviewerSourceValue -Object $ChangeKindsByPath -Name $path -Default $null
             }
-            if (-not (Test-ReviewerSourceChangeCarriesRightHand -ChangeTypeValue $cappedDeclared)) {
+            # A path the change set calls a delete but for which it also reported
+            # hunks is contradicting itself. In cap it would be read and
+            # delivered on those hunks, so past the cap it must be counted, not
+            # excused - otherwise the cap position decides whether the change set
+            # gets away with the contradiction.
+            if ($requestedForPath -lt 1 -and
+                -not (Test-ReviewerSourceChangeCarriesRightHand -ChangeTypeValue $cappedDeclared)) {
                 $index--
                 [void]$files.Add((New-ReviewerSourceFileEntry -Path $path -CommitSha $CommitSha `
                             -Status "omitted" -Reason "noChangedSpans" -CarriesSource $false -NoSourceBasis "changeSet"))

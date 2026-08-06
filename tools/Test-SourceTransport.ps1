@@ -1446,6 +1446,60 @@ Assert-Source ((@(@($cappedAddReport.Files) | Where-Object { [string]$_.Reason -
     -not (Test-ReviewerSourceCoverageGate -Report $cappedAddReport -Policy $capPolicy).Ok) `
     "an added file past the cap still has content nobody read, so it is still counted and still refuses"
 
+# Fill the cap with content-bearing paths FIRST, so the deletions genuinely
+# reach the cap branch rather than being refunded before it.
+$deletesAfterCapPaths = @(1..6 | ForEach-Object { "/src/full$_.cs" }) + @(1..20 | ForEach-Object { "/old/tail$_.cs" })
+$deletesAfterCapSpans = [ordered]@{}
+$deletesAfterCapKinds = [ordered]@{}
+foreach ($p in @(1..6 | ForEach-Object { "/src/full$_.cs" })) { $deletesAfterCapSpans[$p] = @(@{ Start = 20; End = 21 }); $deletesAfterCapKinds[$p] = 'Edit' }
+foreach ($p in @(1..20 | ForEach-Object { "/old/tail$_.cs" })) { $deletesAfterCapKinds[$p] = 'Delete' }
+$deletesAfterCapReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $deletesAfterCapPaths `
+    -SpansByPath $deletesAfterCapSpans -Policy $capPolicy -Reader { param([string]$Path)
+        $bodyText = New-TestFileText -LineCount 60
+        [pscustomobject]@{ Text = $bodyText; MimeType = 'text/plain'
+            ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($bodyText)
+            Sha256 = Get-ReviewerSourceSha256 -Text $bodyText }
+    } -ChangeKindsByPath $deletesAfterCapKinds
+Assert-Source ([int]$deletesAfterCapReport.SourceBearingFileCount -eq 6 -and [int]$deletesAfterCapReport.CoveragePercent -eq 100 -and
+    (Test-ReviewerSourceCoverageGate -Report $deletesAfterCapReport -Policy $capPolicy).Ok) `
+    "deletions trailing a full cap are excused there too, so the cap branch consults the change kind"
+Assert-Source ((@(@($deletesAfterCapReport.Files) | Where-Object { [string]$_.Reason -ceq 'fileCountCapExceeded' }).Count -eq 0)) `
+    "and none of them is booked as unread source"
+
+# A change set that calls a path a delete while also reporting hunks for it is
+# contradicting itself; the cap position must not decide who wins.
+$contradictoryPaths = @(1..6 | ForEach-Object { "/src/full$_.cs" }) + @('/old/claims.cs')
+$contradictorySpans = [ordered]@{ '/old/claims.cs' = @(@{ Start = 5; End = 6 }) }
+foreach ($p in @(1..6 | ForEach-Object { "/src/full$_.cs" })) { $contradictorySpans[$p] = @(@{ Start = 20; End = 21 }) }
+$contradictoryKinds = [ordered]@{ '/old/claims.cs' = 'Delete' }
+foreach ($p in @(1..6 | ForEach-Object { "/src/full$_.cs" })) { $contradictoryKinds[$p] = 'Edit' }
+$contradictoryReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $contradictoryPaths `
+    -SpansByPath $contradictorySpans -Policy $capPolicy -Reader { param([string]$Path)
+        $bodyText = New-TestFileText -LineCount 60
+        [pscustomobject]@{ Text = $bodyText; MimeType = 'text/plain'
+            ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($bodyText)
+            Sha256 = Get-ReviewerSourceSha256 -Text $bodyText }
+    } -ChangeKindsByPath $contradictoryKinds
+Assert-Source (([string]@($contradictoryReport.Files)[6].Reason) -ceq 'fileCountCapExceeded' -and
+    [int]$contradictoryReport.RequestedSpanCount -eq 7) `
+    "a capped path the change set calls a delete while reporting hunks for it is counted, not excused"
+
+# A malformed path is never read either, so it must not cap the real files
+# behind it.
+$junkAheadPaths = @(1..20 | ForEach-Object { "C:/junk$_.cs" }) + @(1..3 | ForEach-Object { "/src/real$_.cs" })
+$junkAheadSpans = [ordered]@{}
+$junkAheadKinds = [ordered]@{}
+foreach ($p in @(1..3 | ForEach-Object { "/src/real$_.cs" })) { $junkAheadSpans[$p] = @(@{ Start = 20; End = 21 }); $junkAheadKinds[$p] = 'Edit' }
+$junkAheadReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $junkAheadPaths `
+    -SpansByPath $junkAheadSpans -Policy $capPolicy -Reader { param([string]$Path)
+        $bodyText = New-TestFileText -LineCount 60
+        [pscustomobject]@{ Text = $bodyText; MimeType = 'text/plain'
+            ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($bodyText)
+            Sha256 = Get-ReviewerSourceSha256 -Text $bodyText }
+    } -ChangeKindsByPath $junkAheadKinds
+Assert-Source ([int]$junkAheadReport.DeliveredFiles -eq 3) `
+    "twenty malformed paths ahead of three real edits do not cap the real edits"
+
 # The exact boundary, both sides, at a change set where the share rounds cleanly.
 $atLimitReport = New-MislabelReport -Excused 5 -Delivered 5
 Assert-Source ([int]$atLimitReport.ReaderExcusedAllowance -eq 5) "the allowance for a ten-path change set is five"
