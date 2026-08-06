@@ -155,16 +155,18 @@ function Measure-WrapperBareOutput {
        `return`s is not enough: a bare `@{ BlockText = "stub"; Gate = @{Ok=$true} }`
        standing on its own line joins the function's output. Emitted beside the
        real return it yields a two-element array whose `Gate.Ok` is `@($true,
-       $false)` - which `-not` reads as false, so the gate check passes. This
-       function emits nothing bare, so any such statement is the bug. Statements
-       inside `@(...)`, `$(...)` and `(...)` are excluded because there the value
-       is consumed, not returned. #>
-    param([Parameter(Mandatory)]$FunctionAst)
+       $false)` - which `-not` reads as false, so the gate check passes. Every
+       statement-position pipeline is therefore accounted for: a bare expression
+       is banned outright, an emitting command (`Write-Output` and its aliases)
+       is banned outright, and any other command call must be one this function
+       is known to make, so a newly introduced callee cannot emit into the
+       transport's result either. Statements inside `@(...)`, `$(...)` and
+       `(...)` are excluded because there the value is consumed, not returned. #>
+    param([Parameter(Mandatory)]$FunctionAst, [Parameter(Mandatory)][string[]]$AllowedCommands)
+    $emitters = @('Write-Output', 'echo', 'write')
     return @($FunctionAst.FindAll({
                 param($candidate)
-                $candidate -is [Management.Automation.Language.PipelineAst] -and
-                $candidate.PipelineElements.Count -eq 1 -and
-                $candidate.PipelineElements[0] -is [Management.Automation.Language.CommandExpressionAst]
+                $candidate -is [Management.Automation.Language.PipelineAst]
             }, $true) | Where-Object {
             $parent = $_.Parent
             # Top-level statements hang off a NamedBlockAst (the function's end
@@ -175,6 +177,13 @@ function Measure-WrapperBareOutput {
             -not ($parent.Parent -is [Management.Automation.Language.ArrayExpressionAst] -or
                 $parent.Parent -is [Management.Automation.Language.SubExpressionAst] -or
                 $parent.Parent -is [Management.Automation.Language.ParenExpressionAst])
+        } | Where-Object {
+            $last = $_.PipelineElements[-1]
+            if ($last -is [Management.Automation.Language.CommandAst]) {
+                ($emitters -contains $last.GetCommandName()) -or
+                ($AllowedCommands -cnotcontains $last.GetCommandName())
+            }
+            else { $true }
         }).Count
 }
 
@@ -982,8 +991,11 @@ Assert-Source (@($transportAst.FindAll({
 # value without one. A bare hashtable on its own line joins the output: emitted
 # beside the real return it makes `Gate.Ok` the array `@($true, $false)`, which
 # `-not` reads as false, so the gate check passes on a stub.
-Assert-Source ((Measure-WrapperBareOutput -FunctionAst $transportAst) -eq 0) `
-    "and it emits nothing bare, so no doctored value can join what it returns without being one of those two returns"
+Assert-Source ((Measure-WrapperBareOutput -FunctionAst $transportAst -AllowedCommands @(
+            'Assert-ReviewerSourceChangeSetAgreement',
+            'ConvertFrom-AgentMcpResourceContent',
+            'New-AgentNonce')) -eq 0) `
+    "and it emits nothing bare and calls nothing in statement position but the three commands listed here, so no doctored value can join what it returns without being one of those two returns"
 $transportStatements = @($transportAst.Body.EndBlock.Statements)
 Assert-Source ($transportStatements.Count -gt 0 -and
     $transportStatements[-1] -is [Management.Automation.Language.ReturnStatementAst]) `
