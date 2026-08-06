@@ -659,7 +659,18 @@ function ConvertTo-AgentMarkerFieldValue {
             if ($Value -isnot [string]) { return $bad }
             $text = [string]$Value
             $max = if ($Spec.ContainsKey('MaxLength')) { [int]$Spec.MaxLength } else { 1000 }
-            if ($text.Length -gt $max) { return $bad }
+            if ($text.Length -gt $max) {
+                # A field may opt into being SHORTENED rather than rejected. Only
+                # fields that never become external text may do so: a comment
+                # body must be exactly what the model wrote or nothing at all.
+                # For a reporting field, though, rejecting the whole marker over
+                # a long sentence throws away every finding the marker carries -
+                # the report destroying the thing it reports on. Twice now a
+                # complete accounting was lost that way.
+                if (-not ($Spec.ContainsKey('Truncate') -and [bool]$Spec.Truncate)) { return $bad }
+                if ($max -le 3) { return $bad }
+                $text = $text.Substring(0, $max - 3) + "..."
+            }
             if (-not ($Spec.ContainsKey('AllowEmpty') -and [bool]$Spec.AllowEmpty) -and $text.Trim() -eq "") { return $bad }
             $allowNewlines = ($Spec.ContainsKey('AllowNewlines') -and [bool]$Spec.AllowNewlines)
             foreach ($ch in $text.ToCharArray()) {

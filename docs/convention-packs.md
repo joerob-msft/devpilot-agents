@@ -186,12 +186,15 @@ outside.
 
 So the marker carries a bounded `ruleCoverage` array alongside `candidates`, and
 the wrapper tells the model exactly which rows it expects. `ruleCoverageRequest`
-in the runtime data names one required row per transported source, plus the
-`cf<n>` anchor ids for the changed files the wrapper delivered. Each row states:
+in the runtime data names one required row per transported source, the `cf<n>`
+anchor ids for the changed files the wrapper delivered, and the wrapper's own
+enumeration of every **changed construct** in the change set. Each row states:
 
 - the pack, source id and source hash it is about, and an exact quote from it;
 - a `status` of `violation`, `compliant`, `notApplicable` or `unknown`;
-- the changed anchors it checked, as `cf<n>:<line>`;
+- a `scope`: the construct kinds the rule governs, or `none`;
+- `checkedConstructs`: every construct id of those kinds, and
+  `violatingConstructs`: the ones judged to break the rule;
 - the code evidence, and the sibling evidence or why none was needed;
 - the id of the candidate it produced, or a note saying why none was emitted.
 
@@ -199,14 +202,58 @@ in the runtime data names one required row per transported source, plus the
 practice that could not be established and ambiguous rule text are all honest
 `unknown`s, and each says which in its note.
 
+### Changed constructs
+
+The wrapper enumerates four kinds of changed construct, lexically and without
+knowing anything about the repository, its language's testing framework, or what
+any attribute means:
+
+| Kind | Id | What it is | Shape facts carried |
+| --- | --- | --- | --- |
+| `invocation` | `mi<n>` | a call spanning more than one line | callee, argument count, and one character per argument: `n` syntactically named, `p` positional |
+| `declaration` | `dc<n>` | a changed declaration | the attributes on it, the attributes on its nearest unchanged neighbours |
+| `comment` | `cm<n>` | a run of contiguous changed comment lines | first and last line |
+| `assignment` | `as<n>` | a changed statement writing to a name that already exists | the target |
+
+`constructFileSummaries` additionally counts how often each attribute appears
+across each whole file, so "the surrounding code already does this" is a number
+rather than an impression.
+
+The enumeration decides *shape*, never *meaning*. It cannot declare a violation:
+only the transported rule text, read by the model, decides whether a construct
+is in a rule's reach and whether it breaks it. There are no employer-specific or
+framework-specific patterns anywhere in it.
+
+Budgets are split evenly across kinds and taken round-robin across files, so
+neither a call-heavy change set nor a file that sorts first can starve a kind or
+a file of anchors. When a cap or an unlexable file means the enumeration is
+incomplete, the accounting is reported incomplete too - a checklist that covers
+every rule over a construct set that is missing entries has not covered the
+change set.
+
+Construct id lists accept inclusive same-kind ranges (`mi0-mi37,dc0-dc18`).
+Without that a complete answer over a real change set does not fit in a field
+short enough to survive the marker's length bound, and an answer that cannot be
+written gets written incompletely.
+
 The wrapper then reconciles the rows against the set it transported, which it
 computed itself:
 
 - a source with no row is reported **missing**; a source with two rows is
   reported **duplicated**; a row naming a source that was never transported is
   reported **unknown** and is not counted toward coverage;
-- a row whose source hash, quote or anchor does not match what was actually
-  transported is degraded to `unknown` with the reason recorded;
+- a row whose source hash or quote does not match what was actually transported
+  is degraded to `unknown` with the reason recorded;
+- a row that leaves any construct in its own declared scope unaccounted is
+  degraded, and the reason names the exact ids it left out;
+- a row that declares `scope: none` while constructs exist may only be
+  `notApplicable` or `unknown` - a `compliant` row that checked nothing is an
+  answer about nothing;
+- a row whose linked candidate is anchored outside every construct it called
+  violating is degraded: a row about one place cannot account for a finding
+  about another. The anchor may fall anywhere inside the construct's
+  `line`..`endLine` span, because a comment about a multi-line call belongs on
+  the offending argument rather than on the line the call opens on;
 - a candidate whose rule has no row is reported as unaccounted.
 
 Any of those makes the accounting incomplete, and the preview says so. It never
@@ -221,9 +268,11 @@ lists that both mean "nearly a finding" is where a later edit promotes one.
 Sibling evidence describes unchanged code and can never be the subject of a
 candidate or the anchor of a row.
 
-The anchor ids are the only deterministic anchors the wrapper supplies: the
-changed files, ordinally sorted, from the change set it delivered. Pattern
-hints for particular rule shapes are deliberately **not** generated. They would
-steer the model toward exactly the categories the hint generator enumerates, so
-measured recall would become a property of that generator rather than of the
-specialist - which is the opposite of calibration.
+The anchor ids are deterministic and are the wrapper's own: the changed files,
+ordinally sorted, from the change set it delivered, and the changed constructs
+enumerated from them. Pattern hints for particular rule shapes are deliberately
+**not** generated. They would steer the model toward exactly the categories the
+hint generator enumerates, so measured recall would become a property of that
+generator rather than of the specialist - which is the opposite of calibration.
+Construct enumeration is the boundary: it says a call spans four lines and its
+last argument is positional; it never says that is wrong.

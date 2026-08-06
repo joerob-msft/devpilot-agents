@@ -380,32 +380,38 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                             Type = "string"; MaxLength = 200; AllowEmpty = $true
                             Pattern = '^(|(mi|dc|cm|as)[0-9]{1,3}(-(mi|dc|cm|as)[0-9]{1,3})?(,(mi|dc|cm|as)[0-9]{1,3}(-(mi|dc|cm|as)[0-9]{1,3})?)*)$'
                         }
-                        # No ASCII pattern on the three prose fields, and lengths
+                        # No ASCII pattern on the three prose fields, lengths
                         # with real headroom rather than a cap that tracks the
-                        # last observed answer by thirty characters.
+                        # last observed answer by thirty characters, and - since
+                        # headroom alone was not enough - permission for the
+                        # wrapper to SHORTEN them rather than reject the marker.
                         #
-                        # Twice in a row a correct, complete accounting was
+                        # Three times now a correct, complete accounting was
                         # discarded whole - once for evidence twenty-five
                         # characters over, once for a single curly quote inside
-                        # a sentence about code - and each time it took the
-                        # candidates down with it. A reporting section must not
-                        # be able to destroy the findings it reports on.
+                        # a sentence about code, once for a paragraph naming
+                        # every construct it had checked - and each time it took
+                        # the candidates down with it. A reporting section must
+                        # not be able to destroy the findings it reports on, and
+                        # a shortened sentence in a preview is a far smaller
+                        # loss than an entire pass.
                         #
                         # This is not a loosening of the marker contract. The
                         # marker validator refuses control characters in every
                         # string regardless of pattern, so nothing here can
-                        # forge structure. The ASCII rule exists because
-                        # candidate text is rendered into a pull-request
-                        # comment; these three fields never are. They appear
-                        # only in the local preview and the sealed,
-                        # non-promotable artifact. ruleQuote keeps the strict
-                        # pattern, because it must be an exact substring of the
-                        # transported source and the wrapper checks that.
-                        codeEvidence = @{ Type = "string"; MaxLength = 600; AllowEmpty = $true }
+                        # forge structure, and truncation is opt-in per field:
+                        # candidate text, which is rendered into a
+                        # pull-request comment, may never be silently altered.
+                        # These three appear only in the local preview and the
+                        # sealed, non-promotable artifact. ruleQuote keeps the
+                        # strict pattern and no truncation, because it must be
+                        # an exact substring of the transported source and the
+                        # wrapper checks that.
+                        codeEvidence = @{ Type = "string"; MaxLength = 600; AllowEmpty = $true; Truncate = $true }
                         siblingStatus = @{ Type = "enum"; Values = @("checked", "notRequired", "unavailable") }
-                        siblingEvidence = @{ Type = "string"; MaxLength = 600; AllowEmpty = $true }
+                        siblingEvidence = @{ Type = "string"; MaxLength = 600; AllowEmpty = $true; Truncate = $true }
                         candidateId = @{ Type = "string"; MaxLength = 64; AllowEmpty = $true; Pattern = '^(|[a-z][a-z0-9-]{0,63})$' }
-                        notes = @{ Type = "string"; MaxLength = 600; AllowEmpty = $true }
+                        notes = @{ Type = "string"; MaxLength = 600; AllowEmpty = $true; Truncate = $true }
                     }
                 }
             }

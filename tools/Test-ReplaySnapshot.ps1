@@ -581,6 +581,26 @@ try {
         Assert-Replay ([bool]$accepted.Ok) "Rule-coverage field '$prose' must accept ordinary typographic characters."
         $control = Test-MarkerField -Spec $spec -Value "line one`nline two"
         Assert-Replay (-not [bool]$control.Ok) "Rule-coverage field '$prose' must still refuse control characters."
+        # Over-length must SHORTEN, not reject. A row that names every construct
+        # it checked is exactly the row most likely to run long, and losing the
+        # marker over it loses every candidate the pass found.
+        $long = Test-MarkerField -Spec $spec -Value ("x" * ([int]$spec.MaxLength + 500))
+        Assert-Replay ([bool]$long.Ok) "Rule-coverage field '$prose' must be shortened when it runs long, not reject the whole marker."
+        Assert-Replay (([string]$long.Value).Length -le [int]$spec.MaxLength) `
+            "A shortened rule-coverage field must end up within its own bound."
+        Assert-Replay (([string]$long.Value).EndsWith("...")) `
+            "A shortened rule-coverage field must show that it was shortened."
+    }
+    # Truncation is opt-in, and comment text never opts in.
+    foreach ($strict in @("ruleQuote", "checkedConstructs", "violatingConstructs")) {
+        $spec = $coverageSpec.Item.Fields[$strict]
+        Assert-Replay (-not ($spec.ContainsKey("Truncate") -and [bool]$spec.Truncate)) `
+            "Rule-coverage field '$strict' must never be silently shortened: the wrapper checks it against something exact."
+    }
+    foreach ($commentField in @($candidateSpec.Item.Keys)) {
+        $spec = $candidateSpec.Item.Fields[$commentField]
+        Assert-Replay (-not ($spec.ContainsKey("Truncate") -and [bool]$spec.Truncate)) `
+            "Candidate field '$commentField' must never be silently shortened: it becomes pull-request comment text."
     }
     # The candidate fields, which DO become comment text, stay strict.
     $commentSpec = $candidateSpec.Item.Fields["diffEvidence"]
