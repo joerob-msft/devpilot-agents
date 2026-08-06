@@ -875,6 +875,8 @@ try {
         "A changed declaration must report exactly the attributes on it."
     Assert-Replay (@(@($second)[0].siblingAttributes) -ccontains "Owner") `
         "A changed declaration must report the attributes on its nearest unchanged neighbour, so precedent is a fact and not an impression."
+    Assert-Replay (@(@($second)[0].absentHere) -ccontains "Owner" -and @(@($second)[0].absentHere) -cnotcontains "TestMethod") `
+        "A changed declaration must report which attributes the file's unchanged declarations carry and it does not."
     $frequency = @(@($declarations.Files)[0].attributeFrequency | Where-Object { [string]$_.attribute -ceq "Owner" })
     Assert-Replay (@($frequency).Count -eq 1 -and [int]@($frequency)[0].declarations -eq 1) `
         "The per-file attribute count must say how much precedent there actually is."
@@ -883,6 +885,9 @@ try {
         '', '    [TestMethod]', '    public void Second() { }', '}') -Changed @(6, 7)
     Assert-Replay (@(@($noPrecedent.Files)[0].attributeFrequency | Where-Object { [string]$_.attribute -ceq "Owner" }).Count -eq 0) `
         "A file where the attribute never appears must report no precedent for it at all."
+    $noPrecedentDeclaration = @(@($noPrecedent.Constructs) | Where-Object { [string]$_.kind -ceq "declaration" })[0]
+    Assert-Replay (@($noPrecedentDeclaration.absentHere) -cnotcontains "Owner") `
+        "A file where nobody uses the attribute must not report it as absent HERE: there is no local precedent to be missing."
 
     # Dotted attribute names are reported whole: reporting
     # System.Diagnostics.CodeAnalysis.SuppressMessage as "System" tells a reader

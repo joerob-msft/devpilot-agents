@@ -213,7 +213,7 @@ any attribute means:
 | Kind | Id | What it is | Shape facts carried |
 | --- | --- | --- | --- |
 | `invocation` | `mi<n>` | a call spanning more than one line | callee, argument count, and one character per argument: `n` syntactically named, `p` positional |
-| `declaration` | `dc<n>` | a changed declaration | the attributes on it, the attributes on its nearest unchanged neighbours |
+| `declaration` | `dc<n>` | a changed declaration | the attributes on it, the attributes on its nearest unchanged neighbours, and `absentHere` - attribute names present on unchanged declarations elsewhere in the file but not on this one |
 | `comment` | `cm<n>` | a run of contiguous changed comment lines | first and last line |
 | `assignment` | `as<n>` | a changed statement writing to a name that already exists | the target |
 
