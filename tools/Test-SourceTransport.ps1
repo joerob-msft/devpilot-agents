@@ -658,6 +658,34 @@ Assert-Source ($cycleText -match '\$pinnedSourceText\s*=\s*\[string\]\$sourceTra
     "the sealed block the model receives is the one the transport produced"
 Assert-Source ($cycleText -match 'PinnedSourceText\s*=\s*\$pinnedSourceText') `
     "and it is bound onto the reviewed pull request rather than dropped"
+Assert-Source ($cycleText -match 'the coverage gate passed but no sealed source block was produced[\s\S]{0,300}?continue') `
+    "a passing gate with an empty block is a contradiction the cycle refuses, not one it publishes"
+# Order matters: the emptiness guard has to sit between the gate and the review,
+# or blanking the block one level up (in the transport's own return) would still
+# reach a model that is told it received nothing while the record claims full
+# coverage.
+$gateAt = $cycleText.IndexOf('if (-not $sourceTransport.Gate.Ok)', [StringComparison]::Ordinal)
+$emptyGuardAt = $cycleText.IndexOf('if (-not $pinnedSourceText)', [StringComparison]::Ordinal)
+$reviewAt = $cycleText.IndexOf('Invoke-ReviewerPullRequest -Session', [StringComparison]::Ordinal)
+Assert-Source ($gateAt -ge 0 -and $emptyGuardAt -gt $gateAt -and $reviewAt -gt $emptyGuardAt) `
+    "and that refusal happens after the gate and before any model sees the pull request"
+Assert-Source ($cycleText -match '\$sourceCoverageRecord\s*=\s*\$sourceTransport\.Record') `
+    "the persisted coverage record is the one the transport produced"
+# The one remaining way to present source as pinned when it is not: the author
+# pushes between the change-set read and the byte read, and the slices are
+# correct bytes at the wrong lines, hashed cleanly, with nothing to notice.
+Assert-Source ($transportText -match 'if \(\$confirmCommit\.ToLowerInvariant\(\) -cne \$SourceCommit\)') `
+    "the mid-read head-move guard actually compares the commit it re-read"
+Assert-Source ($transportText -match 'Assert-ReviewerSourceChangeSetAgreement -ChangedPaths') `
+    "the two change-set extractions are cross-checked at the call site, not merely available"
+$readerSeamText = (Get-Content -LiteralPath (Join-Path $repoRoot 'src/Agents/reviewer/SourceTransport.ps1') -Raw)
+Assert-Source ($readerSeamText -match "reported failure\|omitted content\|unexpected result shape") `
+    "a host-reported call failure is still classified as a transport failure, not a payload the decoder disliked"
+Assert-Source ($readerSeamText -match 'path\s+= \(ConvertTo-ReviewerSourcePath -Path') `
+    "the persisted record never carries a raw unnormalized path"
+$harnessText = (Get-Content -LiteralPath (Join-Path $repoRoot 'src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1') -Raw)
+Assert-Source ($harnessText -match '\$scanned -gt 512') `
+    "the marker anchor scan bound stays generous, so quoted decoy prefixes cannot discard a valid review"
 $runtimeText = Get-FunctionTextFromWrapper -Name 'Get-ReviewerRuntimeContext'
 Assert-Source ($runtimeText -match 'NONE PRODUCED' -and $runtimeText -match 'Treat every changed file as unread') `
     "an absent sealed block is stated to the model instead of silently omitted"
@@ -1477,7 +1505,7 @@ Write-Host "[18/18] Sibling context cannot touch changed-source accounting" -For
 # CHANGE arrived - and, less obviously, they must not be able to spend the
 # budget a later file's changed hunks were entitled to.
 $isoPolicy = New-TestPolicy -Overrides @{
-    siblingContextSlices = 2; siblingContextLines = 20; contextRadiusLines = 1
+    siblingContextSlices = 2; siblingContextLines = 20; contextRadiusLines = 0
     maxSliceBytesPerFile = 4096; maxTotalSliceBytes = 8192; maxTotalSiblingBytes = 4096
 }
 $isoText = New-TestFileText -LineCount 120
@@ -1510,7 +1538,7 @@ Assert-Source ([int]$isoCut.DeliveredSiblingBytes -gt 0 -and
 # The same spans with sibling context switched off must deliver identically.
 $isoNoSiblingCut = New-ReviewerSourceFileSlices -Text $isoText `
     -Spans @(@{ Start = 50; End = 52 }, @{ Start = 90; End = 91 }) `
-    -Policy (New-TestPolicy -Overrides @{ siblingContextSlices = 0; siblingContextLines = 0; contextRadiusLines = 1; maxSliceBytesPerFile = 4096; maxTotalSliceBytes = 8192 }) `
+    -Policy (New-TestPolicy -Overrides @{ siblingContextSlices = 0; siblingContextLines = 0; contextRadiusLines = 0; maxSliceBytesPerFile = 4096; maxTotalSliceBytes = 8192 }) `
     -RemainingTotalBytes 8192 -RemainingSiblingBytes 4096
 Assert-Source ([int]$isoNoSiblingCut.DeliveredRawSpanCount -eq [int]$isoCut.DeliveredRawSpanCount -and
     [int]$isoNoSiblingCut.DeliveredChangedBytes -eq [int]$isoCut.DeliveredChangedBytes -and
@@ -1584,11 +1612,33 @@ Assert-Source ($unavailableSentence -match 'among the files whose hunk list the 
 Assert-Source ((ConvertTo-ReviewerSourceCoverageRecord -Report $unavailableReport).spansUnavailableFileCount -eq 2) `
     "and the persisted record carries that count for an operator"
 
-# Both budgets land in one rendered block, so their sum has to fit inside it.
+# Both budgets land in one rendered block, so their sum PLUS per-slice overhead
+# has to fit inside it. Checking the payload alone let a legal policy render
+# about a megabyte past the bound.
 Assert-Source (Test-Throws { New-TestPolicy -Overrides @{ maxTotalSliceBytes = 4194304; maxTotalSiblingBytes = 1048576 } }) `
     "a policy whose two budgets together exceed the render bound is refused"
-Assert-Source (-not (Test-Throws { New-TestPolicy -Overrides @{ maxTotalSliceBytes = 4194304; maxTotalSiblingBytes = 0 } })) `
-    "and the same changed budget alone is still accepted"
+Assert-Source (Test-Throws { New-TestPolicy -Overrides @{ maxTotalSliceBytes = 4194304; maxTotalSiblingBytes = 0; maxFiles = 60; maxSlicesPerFile = 24; siblingContextSlices = 16 } }) `
+    "and so is one whose payload fits but whose per-slice overhead does not"
+Assert-Source (-not (Test-Throws { New-TestPolicy -Overrides @{ maxTotalSliceBytes = 3000000; maxTotalSiblingBytes = 0; maxFiles = 10; maxSlicesPerFile = 8; siblingContextSlices = 0 } })) `
+    "a policy that genuinely fits, overhead included, is still accepted"
+$shippedPolicyLoads = (-not (Test-Throws { New-ReviewerSourceTransportPolicy -Policy ([pscustomobject](& {
+                    $o = [ordered]@{}
+                    foreach ($prop in (Get-Content -LiteralPath (Join-Path $repoRoot 'src/Agents/reviewer/source/v1/policy.json') -Raw | ConvertFrom-Json).PSObject.Properties) {
+                        if ($prop.Name -ne '_note') { $o[$prop.Name] = $prop.Value }
+                    }
+                    $o
+                })) }))
+Assert-Source $shippedPolicyLoads "the shipped policy still satisfies the render bound with overhead counted"
+
+# A rejected path renders as an empty string, so several of them would be
+# indistinguishable in the record without a correlatable handle.
+$rejectedRecord = ConvertTo-ReviewerSourceCoverageRecord -Report (New-ReviewerSourceTransportReport `
+        -CommitSha $commit -ChangedPaths @('C:/evil/one.cs', '../../etc/two.cs') -SpansByPath ([ordered]@{}) `
+        -Policy $policy -Reader { param([string]$Path) $null })
+$rejectedHashes = @(@($rejectedRecord.files) | ForEach-Object { [string]$_.pathSha256 })
+Assert-Source ((@(@($rejectedRecord.files) | Where-Object { [string]$_.path -ceq '' }).Count -eq 2) -and
+    ($rejectedHashes[0] -cne $rejectedHashes[1]) -and (@($rejectedHashes | Where-Object { $_.Length -eq 64 }).Count -eq 2)) `
+    "two distinct rejected paths stay distinguishable in the record without either being echoed"
 
 # The shipped policy must keep sibling evidence switched on: turning it off
 # re-starves every adoption-dependent convention the specialist can report.

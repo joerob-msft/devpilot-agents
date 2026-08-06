@@ -194,12 +194,16 @@ function New-ReviewerSourceTransportPolicy {
     if ($result.maxSliceBytesPerFile -gt $result.maxTotalSliceBytes) {
         throw "The source-transport policy cannot allow more bytes per file than in total."
     }
-    # Both pools land in one rendered block, so their sum is what has to fit.
-    # Checking only the changed pool let a legal policy overflow the render
-    # bound, which surfaces as an unexplained throw and a skipped pull request.
-    if (($result.maxTotalSliceBytes + $result.maxTotalSiblingBytes) -gt $script:ReviewerSourceMaxRenderedBytes) {
-        throw ("The source-transport policy's changed and sibling budgets together " +
-            "($($result.maxTotalSliceBytes + $result.maxTotalSiblingBytes) bytes) exceed the " +
+    # Both pools land in one rendered block, so their sum is what has to fit -
+    # plus the per-slice table row and provenance line, measured at ~642 bytes
+    # and budgeted at 700. Checking the payload alone let a legal policy render
+    # about a megabyte over the bound, which surfaces as an unexplained throw
+    # and a skipped pull request.
+    $worstSliceCount = $result.maxFiles * ($result.maxSlicesPerFile + $result.siblingContextSlices)
+    $worstRendered = $result.maxTotalSliceBytes + $result.maxTotalSiblingBytes + ($worstSliceCount * 700)
+    if ($worstRendered -gt $script:ReviewerSourceMaxRenderedBytes) {
+        throw ("The source-transport policy could render up to $worstRendered byte(s) - its changed and " +
+            "sibling budgets plus per-slice overhead - which exceeds the " +
             "$($script:ReviewerSourceMaxRenderedBytes)-byte sealed-block render bound.")
     }
     $mimeTypes = @($Policy.allowedMimeTypes)
@@ -1518,6 +1522,12 @@ function ConvertTo-ReviewerSourceCoverageRecord {
         files            = @(@($Report.Files) | ForEach-Object {
                 [pscustomobject][ordered]@{
                     path               = (ConvertTo-ReviewerSourcePath -Path ([string]$_.Path))
+                    # A path that failed normalization renders as an empty string,
+                    # which makes several rejected paths indistinguishable in the
+                    # record. The hash is correlatable for an operator debugging
+                    # why a pull request is unreviewable, and is neither echoed
+                    # nor injectable.
+                    pathSha256         = (Get-ReviewerSourceSha256 -Text ([string]$_.Path))
                     status             = [string]$_.Status
                     reason             = [string]$_.Reason
                     carriesSource      = [bool]$_.CarriesSource

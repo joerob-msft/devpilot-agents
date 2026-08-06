@@ -11953,6 +11953,17 @@ function Invoke-ReviewerCycle {
                     [void]$retried.Add("PR $prId skipped (insufficient source coverage)")
                     continue
                 }
+                # A passing gate and an empty block is a contradiction, and the
+                # contradiction is the dangerous half: the gate says the source
+                # arrived, the record and the preview say the same, and the model
+                # is told it received nothing. Refuse rather than publish a review
+                # whose own audit trail disagrees with what the model was given.
+                if (-not $pinnedSourceText) {
+                    Write-Warning "PR $prId not reviewed - the coverage gate passed but no sealed source block was produced."
+                    $result.ExitCode = 1
+                    [void]$retried.Add("PR $prId skipped (no sealed source block)")
+                    continue
+                }
             }
             catch {
                 # An environment fault here is indistinguishable from a hostile
