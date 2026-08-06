@@ -85,6 +85,37 @@ $script:ReviewerSourceMaxRenderedBytes = 4194304
 $script:ReviewerSourceMaxReaderExcusedPercent = 50
 $script:ReviewerSourceReaderExcusedFloor = 2
 
+# Extensions whose files are not text, as the CHANGE SET names them. When the
+# reader says a path's bytes are not text and the pull request's own path says
+# the same, two independent statements agree and the excusal is corroborated -
+# it costs nothing against the allowance above. When the reader alone says so
+# about `/src/Handler.cs`, only the untrusted party is talking, and that is what
+# the allowance is for. Unknown and extensionless paths count as uncorroborated,
+# because the conservative direction is the one that keeps a path counted.
+$script:ReviewerSourceNonTextExtensions = @(
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".tif", ".tiff", ".psd",
+    ".pdf", ".zip", ".gz", ".tgz", ".tar", ".7z", ".rar", ".bz2", ".xz", ".cab",
+    ".dll", ".exe", ".pdb", ".so", ".dylib", ".lib", ".obj", ".bin", ".dat", ".class",
+    ".jar", ".nupkg", ".wasm", ".snk", ".pfx", ".cer", ".crt", ".p12", ".der",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".mp3", ".mp4", ".wav", ".avi", ".mov", ".wmv", ".ogg", ".webm", ".flac",
+    ".xlsx", ".docx", ".pptx", ".vsdx", ".ico", ".icns", ".dmg", ".msi", ".appx"
+)
+
+function Test-ReviewerSourcePathLooksNonText {
+    <# Whether the change set's OWN path for this file says it is not text.
+
+       The path comes from the pull request, not from the reader, so agreement
+       between the two is corroboration by an independent party. #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Path)
+    if (-not $Path) { return $false }
+    $lastSlash = $Path.LastIndexOf('/')
+    $name = if ($lastSlash -ge 0) { $Path.Substring($lastSlash + 1) } else { $Path }
+    $lastDot = $name.LastIndexOf('.')
+    if ($lastDot -lt 1) { return $false }
+    return ($script:ReviewerSourceNonTextExtensions -contains $name.Substring($lastDot).ToLowerInvariant())
+}
+
 function Get-ReviewerSourceValue {
     param($Object, [Parameter(Mandatory)][string]$Name, $Default = $null)
     if ($null -eq $Object) { return $Default }
@@ -1173,11 +1204,22 @@ function New-ReviewerSourceTransportReport {
     # host whose misbehaviour emptied the line-diff blocks in the first place.
     $readerExcusedFileCount = @(@($files) | Where-Object { -not [bool]$_.CarriesSource -and [string]$_.NoSourceBasis -ceq 'reader' }).Count
     $changeSetExcusedFileCount = $noSourceFileCount - $readerExcusedFileCount
-    # The most reader-derived excusals this change set may have before the
-    # denominator stops meaning anything. Computed here so the report carries the
-    # number an operator would otherwise have to reconstruct.
+    # Only the reader-excused paths the change set's OWN path does not corroborate
+    # are charged against the allowance. An icon the pull request calls `.png` and
+    # the reader calls non-text is two parties agreeing; `/src/Handler.cs` called
+    # non-text by the reader alone is the untrusted one talking on its own.
+    $readerExcusedUncorroboratedCount = @(@($files) | Where-Object {
+            -not [bool]$_.CarriesSource -and [string]$_.NoSourceBasis -ceq 'reader' -and
+            -not (Test-ReviewerSourcePathLooksNonText -Path ([string]$_.Path))
+        }).Count
+    # Measured against the paths that COULD bear source, never the whole change
+    # set. Dividing by every path let a bulk move or a directory rename buy
+    # allowance: eight deletes beside ten edited files raised the ceiling to
+    # thirteen, and nine of those ten could then be mislabelled while the gate
+    # reported a clean 100% over the one file that arrived.
+    $sourceCapableFileCount = $changedFileCount - $changeSetExcusedFileCount
     $readerExcusedAllowance = [Math]::Max($script:ReviewerSourceReaderExcusedFloor,
-        [int][Math]::Floor(($changedFileCount * $script:ReviewerSourceMaxReaderExcusedPercent) / 100.0))
+        [int][Math]::Floor(($sourceCapableFileCount * $script:ReviewerSourceMaxReaderExcusedPercent) / 100.0))
     $sourceBearingFileCount = $changedFileCount - $noSourceFileCount
     $percent = if ($sourceBearingFileCount -lt 1) { 100 }
     else { [int][Math]::Floor(($coveredFileCount * 100.0) / $sourceBearingFileCount) }
@@ -1204,6 +1246,7 @@ function New-ReviewerSourceTransportReport {
         SourceBearingFileCount = $sourceBearingFileCount
         NoSourceFileCount      = $noSourceFileCount
         ReaderExcusedFileCount = $readerExcusedFileCount
+        ReaderExcusedUncorroboratedCount = $readerExcusedUncorroboratedCount
         ChangeSetExcusedFileCount = $changeSetExcusedFileCount
         ReaderExcusedAllowance = $readerExcusedAllowance
         DeliveredFiles         = $deliveredFileCount
@@ -1343,8 +1386,9 @@ function Test-ReviewerSourceCoverageGate {
     # a clean 100% over a change set the model had seen a tenth of. Past the
     # allowance the gate refuses outright instead of dividing by a number the
     # host chose. The paths stay visible in the accounting table either way.
-    if ([int]$Report.ChangedFileCount -ge 1 -and
-        [int]$Report.ReaderExcusedFileCount -gt [int]$Report.ReaderExcusedAllowance) {
+    if ((Get-ReviewerSourceValue -Object $Report -Name 'ChangedFileCount' -Default 0) -ge 1 -and
+        [int](Get-ReviewerSourceValue -Object $Report -Name 'ReaderExcusedUncorroboratedCount' -Default 0) -gt
+        [int](Get-ReviewerSourceValue -Object $Report -Name 'ReaderExcusedAllowance' -Default 0)) {
         if ($reasons -cnotcontains "readerExcusedShareExceeded") { [void]$reasons.Add("readerExcusedShareExceeded") }
     }
     return @{
@@ -1354,9 +1398,10 @@ function Test-ReviewerSourceCoverageGate {
         DeliveredFiles      = [int]$Report.DeliveredFiles
         ChangedFiles        = [int]$Report.ChangedFileCount
         SourceBearingFiles  = [int]$Report.SourceBearingFileCount
-        ReaderExcusedFiles  = [int]$Report.ReaderExcusedFileCount
-        ReaderExcusedAllowed = [int]$Report.ReaderExcusedAllowance
-        ChangeSetExcusedFiles = [int]$Report.ChangeSetExcusedFileCount
+        ReaderExcusedFiles  = [int](Get-ReviewerSourceValue -Object $Report -Name 'ReaderExcusedFileCount' -Default 0)
+        ReaderExcusedCharged = [int](Get-ReviewerSourceValue -Object $Report -Name 'ReaderExcusedUncorroboratedCount' -Default 0)
+        ReaderExcusedAllowed = [int](Get-ReviewerSourceValue -Object $Report -Name 'ReaderExcusedAllowance' -Default 0)
+        ChangeSetExcusedFiles = [int](Get-ReviewerSourceValue -Object $Report -Name 'ChangeSetExcusedFileCount' -Default 0)
         CoveragePercent     = [int]$Report.CoveragePercent
         SpanPercent         = [int]$Report.SpanPercent
     }
@@ -1581,6 +1626,7 @@ function ConvertTo-ReviewerSourceCoverageRecord {
         sourceBearingFileCount = [int]$Report.SourceBearingFileCount
         noSourceFileCount      = [int]$Report.NoSourceFileCount
         readerExcusedFileCount = [int]$Report.ReaderExcusedFileCount
+        readerExcusedUncorroboratedCount = [int]$Report.ReaderExcusedUncorroboratedCount
         changeSetExcusedFileCount = [int]$Report.ChangeSetExcusedFileCount
         readerExcusedAllowance = [int]$Report.ReaderExcusedAllowance
         deliveredFiles   = [int]$Report.DeliveredFiles

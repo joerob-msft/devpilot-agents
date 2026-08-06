@@ -934,6 +934,14 @@ $adversarialCases += @{ Name = "braced and unbraced planted prefixes mixed"; Ok 
 $adversarialCases += @{ Name = "unbraced prefixes cannot launder a conflicting marker"; Ok = $false
     Text = "$markerPrefix see above`n$markerPrefix see above`n$compactMarker`n$foreignMarker"
 }
+# The brace may sit any distance along the prefix's own line. A four-character
+# search window - the accidental (char, int, int) IndexOf overload - discarded
+# every marker with more than three characters of lead-in.
+foreach ($lead in @('', ' ', '  ', '   ', '    ', '      ', 'result ', 'the answer is ')) {
+    $adversarialCases += @{ Name = "a marker with '$lead' between prefix and brace"; Ok = $true
+        Text = "work log`n$markerPrefix $lead{`"schemaVersion`":1,`"prId`":42,`"nonce`":`"NONCE1`"}"
+    }
+}
 foreach ($case in $adversarialCases) {
     $parsed = ConvertFrom-AgentResultMarker -StdOutText ([string]$case.Text) -MarkerPrefix $markerPrefix -Schema $markerSchema
     if ([bool]$case.Ok) {
@@ -955,6 +963,11 @@ Assert-Specialist ($null -ne (ConvertFrom-AgentResultMarker -StdOutText $reachFo
 $reachForwardOnly = "$markerPrefix`n{`"schemaVersion`":1,`"prId`":42,`"nonce`":`"NONCE1`"}"
 Assert-Specialist ($null -eq (ConvertFrom-AgentResultMarker -StdOutText $reachForwardOnly -MarkerPrefix $markerPrefix -Schema $markerSchema)) `
     "A bare prefix line adopts JSON from a later line it does not own."
+# Bare prefix lines cost no scan budget, so no quantity of them can starve a
+# genuine marker out of the transcript.
+$hugePlant = ((1..2000 | ForEach-Object { "$markerPrefix see above" }) -join "`n")
+Assert-Specialist ($null -ne (ConvertFrom-AgentResultMarker -StdOutText "$hugePlant`n$compactMarker" -MarkerPrefix $markerPrefix -Schema $markerSchema)) `
+    "Two thousand bare prefix lines discard a valid review."
 Assert-Specialist ((ConvertTo-AgentCanonicalMarkerJson -Value ([pscustomobject]@{ b = 1; a = 2 })) -ceq
     (ConvertTo-AgentCanonicalMarkerJson -Value ([pscustomobject]@{ a = 2; b = 1 }))) `
     "Canonical marker rendering is not key-order independent."

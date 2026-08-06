@@ -838,16 +838,16 @@ function ConvertFrom-AgentResultMarker {
             })
         $anchorPattern = "(?m)^[ `t]*" + [regex]::Escape($MarkerPrefix)
         $scanned = 0
+        $examined = 0
         foreach ($anchor in [regex]::Matches($StdOutText, $anchorPattern)) {
             # Bounded scan: a transcript carrying an implausible number of
             # prefix occurrences is an attack surface, not a formatting quirk.
-            # The bound counts anchors EXAMINED and is set well above any
-            # plausible transcript, because a tight bound counted anchors that
-            # were then discarded for a wrong nonce - so quoting enough decoy
-            # prefix lines ahead of the real marker discarded a complete,
-            # correct review. The retained-candidate cap below is the tight one.
+            # The outer bound is deliberately far above any plausible transcript
+            # because a bare prefix line costs one IndexOf and nothing else; the
+            # tight bounds are the payload-examination cap below and the
+            # retained-candidate cap further down.
             $scanned++
-            if ($scanned -gt 512) { break }
+            if ($scanned -gt 20000) { break }
             $hit = $anchor.Index
             # The opening brace must be on the anchor's OWN line. Searching the
             # whole remaining transcript let a planted prefix line carrying no
@@ -857,8 +857,18 @@ function ConvertFrom-AgentResultMarker {
             # discarded a complete, correct review.
             $lineEnd = $StdOutText.IndexOf("`n", $hit, [StringComparison]::Ordinal)
             if ($lineEnd -lt 0) { $lineEnd = $StdOutText.Length }
-            $jsonStart = $StdOutText.IndexOf($openBrace, $hit + $anchor.Length, [StringComparison]::Ordinal)
+            # Two-argument IndexOf deliberately. Passing a StringComparison here
+            # binds the (char, int, int) overload instead, coercing the enum to
+            # its numeric value and searching that many characters - four - so
+            # `PREFIX: result {json}` found no brace and a complete review was
+            # discarded. The line bound below is what limits the search.
+            $jsonStart = $StdOutText.IndexOf($openBrace, $hit + $anchor.Length)
             if ($jsonStart -lt 0 -or $jsonStart -ge $lineEnd) { continue }
+            # Only an anchor that really could carry a payload costs scan budget.
+            # Counting the ones discarded here made a review killable by quoting
+            # enough bare prefix lines, which is free for an attacker.
+            $examined++
+            if ($examined -gt 512) { break }
             # Bounded brace-depth scan. String contents are respected so a brace
             # inside a JSON string value cannot terminate the object early.
             # The bound is generous rather than tight because a marker carrying

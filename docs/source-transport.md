@@ -130,31 +130,49 @@ really is delivered, leave one source-bearing file of which one is covered — a
 clean **100%** over a change set the model has seen a tenth of, with every
 percentage floor satisfied.
 
-So reader-derived excusal is capped. A change set may have at most
-`max(2, 50% of changed paths)` paths excused on the reader's say-so; past that
-the gate refuses with `readerExcusedShareExceeded` rather than dividing by a
-number the host chose. Both bounds are **code constants, not policy keys** —
-a consumer config able to widen them could re-open the hole they close, and a
-policy naming them is rejected as unknown.
+So reader-derived excusal is capped — but only the part of it nobody else
+corroborates. When the reader says a path's bytes are not text **and the change
+set's own path for it ends in a non-text extension**, two independent parties
+agree and the excusal is free. When the reader alone says that about
+`/src/Handler.cs`, only the untrusted party is talking, and that is what the cap
+governs: at most `max(2, 50% of the paths that could bear source)` uncorroborated
+reader excusals, after which the gate refuses with `readerExcusedShareExceeded`
+rather than dividing by a number the host chose.
+
+Two details of that arithmetic are load-bearing:
+
+- The share is measured against the paths that **could** bear source — the change
+  set minus what the change set itself excused. Dividing by every changed path
+  let a bulk move buy allowance: eight deletes beside ten edited files raised the
+  ceiling to thirteen, and nine of those ten could then be mislabelled while the
+  gate reported a clean 100% over the one file that arrived.
+- Unknown and extensionless paths count as **uncorroborated**, because the
+  conservative direction is the one that keeps a path counted.
+
+Both bounds are **code constants, not policy keys** — a consumer config able to
+widen them could re-open the hole they close, and a policy naming one is rejected
+as unknown.
 
 Worked examples, all with the shipped policy:
 
-| change set | reader-excused | allowance | outcome |
-|---|---|---|---|
-| 1 edited file + 1 icon | 1 | 2 | reviewed |
-| 7 edited files + 3 icons | 3 | 5 | reviewed |
-| 5 edited files + 5 icons | 5 | 5 | reviewed — exactly at the allowance |
-| 4 edited files + 6 icons | 6 | 5 | refused, `readerExcusedShareExceeded` |
-| 1 delivered + 9 mislabelled | 9 | 5 | refused — the 100% case above |
-| 0 delivered + 4 excused | 4 | 2 | refused, `sourceReadableNothing` |
+| change set | reader-excused | of those uncorroborated | allowance | outcome |
+|---|---|---|---|---|
+| 1 edited file + 3 `.png` | 3 | 0 | 2 | reviewed — the names corroborate |
+| 1 edited file + 40 `.png` | 40 | 0 | 20 | reviewed |
+| 7 edited files + 3 `.png` | 3 | 0 | 5 | reviewed |
+| 1 delivered + 9 mislabelled `.cs` | 9 | 9 | 5 | refused, `readerExcusedShareExceeded` |
+| the same padded with 8 deletes + 8 renames | 9 | 9 | 5 | refused — padding buys nothing |
+| 5 delivered + 5 mislabelled `.cs` | 5 | 5 | 5 | reviewed — exactly at the allowance |
+| 4 delivered + 6 mislabelled `.cs` | 6 | 6 | 5 | refused |
+| 0 delivered + 4 excused | 4 | any | 2 | refused, `sourceReadableNothing` |
 
-An asset-heavy pull request therefore behaves the same way a pure-asset one
-does: refused, deliberately, because it is indistinguishable from a host lying
-about the same paths — and one or two assets beside real code changes nothing.
-Paths excused either way stay listed in the accounting table and are counted
-separately in the coverage record (`changeSetExcusedFileCount`,
-`readerExcusedFileCount`, `readerExcusedAllowance`), and the human preview states
-the two on separate lines so a reader can see which claim came from where.
+So a pull request of nothing but assets is still refused — it delivers no source
+at all — and a single text file anywhere in it makes it reviewable again. Paths
+excused either way stay listed in the accounting table and are counted separately
+in the coverage record (`changeSetExcusedFileCount`, `readerExcusedFileCount`,
+`readerExcusedUncorroboratedCount`, `readerExcusedAllowance`), and the human
+preview states the two kinds on separate lines so a reader can see which claim
+came from where.
 
 The kinds treated as carrying no content are `delete`, `rename`, `sourcerename`,
 `targetrename`, `encoding`, `lock` and `property`. A path is excused only when

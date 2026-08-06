@@ -46,6 +46,10 @@
       {
         "sha256": "210bdd9019013f905413e9ac6735c26d165e7ce211378395c296932ecb3f5fa2",
         "reason": "Split the two kinds of excluded path in the preview. A human deciding whether to trust a review needs to see that the pull request itself called a path a delete, separately from the host claiming a path's bytes are not text - the second is the claim that can be wrong at scale, and it now carries the allowance it was measured against."
+      },
+      {
+        "sha256": "7f12ca11a3424f0023bf6cf257a70c9ecd39e5f441d659776a9d447b30d07be6",
+        "reason": "Also state how many of the host's non-text claims the file's own name does not corroborate. That is the subset the allowance actually governs, and without it the preview implied every excluded asset counted against a ceiling it never touched."
       }
     ],
     "Invoke-ReviewerDelivery": [

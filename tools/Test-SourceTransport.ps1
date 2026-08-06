@@ -684,8 +684,8 @@ Assert-Source ($readerSeamText -match "reported failure\|omitted content\|unexpe
 Assert-Source ($readerSeamText -match 'path\s+= \(ConvertTo-ReviewerSourcePath -Path') `
     "the persisted record never carries a raw unnormalized path"
 $harnessText = (Get-Content -LiteralPath (Join-Path $repoRoot 'src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1') -Raw)
-Assert-Source ($harnessText -match '\$scanned -gt 512') `
-    "the marker anchor scan bound stays generous, so quoted decoy prefixes cannot discard a valid review"
+Assert-Source ($harnessText -match '\$examined -gt 512' -and $harnessText -match '\$scanned -gt 20000') `
+    "only anchors that could carry a payload cost scan budget, so bare decoy prefixes cannot discard a valid review"
 $runtimeText = Get-FunctionTextFromWrapper -Name 'Get-ReviewerRuntimeContext'
 Assert-Source ($runtimeText -match 'NONE PRODUCED' -and $runtimeText -match 'Treat every changed file as unread') `
     "an absent sealed block is stated to the model instead of silently omitted"
@@ -1178,10 +1178,15 @@ Assert-Source ([int]$hostileMimeReport.ReaderExcusedFileCount -eq 3) `
 Assert-Source (-not $hostileMimeGate.Ok -and ($hostileMimeGate.ReasonCodes -ccontains 'sourceReadableNothing')) `
     "a denominator emptied by the reader is refused under its own reason, not passed vacuously at 100%"
 $hostileMimeRecord = ConvertTo-ReviewerSourceCoverageRecord -Report $hostileMimeReport
+$hostiletMimeReportAllowance = [int]$hostileMimeReport.ReaderExcusedAllowance
+Assert-Source ($hostiletMimeReportAllowance -eq 2) "the allowance for a three-path all-excused change set is the absolute floor"
 Assert-Source ([int]$hostileMimeRecord.readerExcusedFileCount -eq 3 -and
+    [int]$hostileMimeRecord.readerExcusedUncorroboratedCount -eq 3 -and
+    [int]$hostileMimeRecord.changeSetExcusedFileCount -eq 0 -and
+    [int]$hostileMimeRecord.readerExcusedAllowance -eq [int]$hostiletMimeReportAllowance -and
     ([string]@($hostileMimeRecord.files)[0].noSourceBasis) -ceq 'reader' -and
     ([string]@($hostileMimeRecord.files)[0].mimeType) -ceq 'application/octet-stream') `
-    "the persisted coverage record carries what excused each path and on what evidence"
+    "the persisted coverage record carries what excused each path, on what evidence, and against what allowance"
 
 # The accounting sentence is model-facing prose assembled in two branches, so
 # both are asserted: a stray period once shipped ".:" to every review.
@@ -1208,7 +1213,7 @@ Assert-Source ((Test-ReviewerSourceCoverageGate -Report $declaredDeleteOnlyRepor
 # change set the model has seen a tenth of.
 # ---------------------------------------------------------------------------
 function New-MislabelReport {
-    param([int]$Excused, [int]$Delivered, [hashtable]$GatePolicy = $policy)
+    param([int]$Excused, [int]$Delivered, [int]$PadDeletes = 0, [string]$ExcusedExtension = '.cs', [hashtable]$GatePolicy = $policy)
     $paths = @()
     $spans = [ordered]@{}
     $kinds = [ordered]@{}
@@ -1216,7 +1221,10 @@ function New-MislabelReport {
         $paths += "/src/ok$i.cs"; $spans["/src/ok$i.cs"] = @(@{ Start = 20; End = 21 }); $kinds["/src/ok$i.cs"] = 'Edit'
     }
     for ($i = 1; $i -le $Excused; $i++) {
-        $paths += "/src/lie$i.cs"; $kinds["/src/lie$i.cs"] = 'Edit'
+        $paths += "/src/lie$i$ExcusedExtension"; $kinds["/src/lie$i$ExcusedExtension"] = 'Edit'
+    }
+    for ($i = 1; $i -le $PadDeletes; $i++) {
+        $paths += "/old/gone$i.cs"; $kinds["/old/gone$i.cs"] = 'Delete'
     }
     return New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $paths -SpansByPath $spans `
         -Policy $GatePolicy -Reader { param([string]$Path)
@@ -1244,6 +1252,38 @@ Assert-Source ([int]$benignReport.ReaderExcusedFileCount -eq 3 -and [int]$benign
     "a few assets beside real code sit inside the allowance"
 Assert-Source ((Test-ReviewerSourceCoverageGate -Report $benignReport -Policy $policy).Ok) `
     "so seven edited files plus three icons is still reviewed"
+
+# Padding with deletes and renames must not buy allowance. Dividing the share by
+# every changed path let a bulk move raise the ceiling far enough to cover nine
+# mislabelled source files, and the gate then reported a clean 100%.
+$paddedReport = New-MislabelReport -Excused 4 -Delivered 1 -PadDeletes 5
+Assert-Source ([int]$paddedReport.ChangeSetExcusedFileCount -eq 5 -and [int]$paddedReport.ReaderExcusedFileCount -eq 4) `
+    "the padding fixture really does carry both kinds of excusal"
+Assert-Source ([int]$paddedReport.ReaderExcusedAllowance -eq 2) `
+    "the allowance is measured against the paths that could bear source, not the whole change set"
+Assert-Source (-not (Test-ReviewerSourceCoverageGate -Report $paddedReport -Policy $policy).Ok) `
+    "so padding a change set with deletes buys no room to mislabel source files"
+$paddedRecord = ConvertTo-ReviewerSourceCoverageRecord -Report $paddedReport
+Assert-Source ([int]$paddedRecord.changeSetExcusedFileCount -eq 5 -and [int]$paddedRecord.readerExcusedFileCount -eq 4 -and
+    [int]$paddedRecord.readerExcusedUncorroboratedCount -eq 4 -and [int]$paddedRecord.readerExcusedAllowance -eq 2) `
+    "and the persisted record carries all four figures an operator needs to check that arithmetic"
+
+# An excusal the change set's OWN path corroborates costs nothing: an icon the
+# pull request calls .png and the reader calls non-text is two parties agreeing.
+$assetReport = New-MislabelReport -Excused 8 -Delivered 1 -ExcusedExtension '.png'
+Assert-Source ([int]$assetReport.ReaderExcusedFileCount -eq 8 -and [int]$assetReport.ReaderExcusedUncorroboratedCount -eq 0) `
+    "reader excusals corroborated by the file's own name are counted apart"
+Assert-Source ((Test-ReviewerSourceCoverageGate -Report $assetReport -Policy $policy).Ok) `
+    "so one edited file plus eight new icons is reviewed, not refused"
+Assert-Source (Test-ReviewerSourcePathLooksNonText -Path '/assets/logo.PNG') `
+    "the extension test is case-insensitive"
+Assert-Source (-not (Test-ReviewerSourcePathLooksNonText -Path '/src/Handler.cs') -and
+    -not (Test-ReviewerSourcePathLooksNonText -Path '/src/Makefile') -and
+    -not (Test-ReviewerSourcePathLooksNonText -Path '/src/.gitignore')) `
+    "source files, extensionless files and dotfiles are never treated as corroborated"
+$smallAssetReport = New-MislabelReport -Excused 3 -Delivered 1 -ExcusedExtension '.png'
+Assert-Source ((Test-ReviewerSourceCoverageGate -Report $smallAssetReport -Policy $policy).Ok) `
+    "and the smallest ordinary asset-adding pull request is reviewed too"
 
 # The exact boundary, both sides, at a change set where the share rounds cleanly.
 $atLimitReport = New-MislabelReport -Excused 5 -Delivered 5

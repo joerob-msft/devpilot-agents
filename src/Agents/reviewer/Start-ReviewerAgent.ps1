@@ -3705,7 +3705,7 @@ function Write-ReviewerPreview {
             [void]$lines.Add("- $([int]$SourceCoverage.changeSetExcusedFileCount) further changed path(s) have no added or edited text because the pull request itself says so - a delete, a rename, or an empty file")
         }
         if ([int]$SourceCoverage.readerExcusedFileCount -gt 0) {
-            [void]$lines.Add("- $([int]$SourceCoverage.readerExcusedFileCount) further changed path(s) were excluded because the repository host reported their bytes as non-text, not because the pull request said so (allowance for this change set: $([int]$SourceCoverage.readerExcusedAllowance))")
+            [void]$lines.Add("- $([int]$SourceCoverage.readerExcusedFileCount) further changed path(s) were excluded because the repository host reported their bytes as non-text; $([int]$SourceCoverage.readerExcusedUncorroboratedCount) of those are not corroborated by the file's own name (allowance for this change set: $([int]$SourceCoverage.readerExcusedAllowance))")
         }
         # `carriesSource` is the record's own statement that a path had nothing
         # to deliver. Filtering on reason strings instead would silently start
@@ -11947,6 +11947,7 @@ function Invoke-ReviewerCycle {
                     sourceBearingFileCount = [int]$sourceTransport.Report.SourceBearingFileCount
                     noSourceFileCount = [int]$sourceTransport.Report.NoSourceFileCount
                     readerExcusedFileCount = [int]$sourceTransport.Report.ReaderExcusedFileCount
+                    readerExcusedUncorroboratedCount = [int]$sourceTransport.Report.ReaderExcusedUncorroboratedCount
                     changeSetExcusedFileCount = [int]$sourceTransport.Report.ChangeSetExcusedFileCount
                     readerExcusedAllowance = [int]$sourceTransport.Report.ReaderExcusedAllowance
                     coveredFiles = [int]$sourceTransport.Report.CoveredFiles
