@@ -292,7 +292,7 @@ try {
     # rule-a sorts to rs0 and rule-b to rs1 under the request's ordinal order.
     function New-CoverageRow {
         param(
-            [string]$Ref, [string]$Sha, [string]$Status, [string]$Scope = "invocations",
+            [string]$Ref, [string]$Sha, [string]$Status, [string]$Scope = "invocation",
             [string]$Checked = "mi0,mi1", [string]$Violating = "", [string]$Candidate = "", [string]$Quote = ""
         )
         return [pscustomobject][ordered]@{
@@ -303,9 +303,14 @@ try {
         }
     }
     function Invoke-Coverage {
-        param([object[]]$Rows, [object[]]$Accepted = @(), [string[]]$Withheld = @())
+        param(
+            [object[]]$Rows, [object[]]$Accepted = @(), [string[]]$Withheld = @(),
+            [object[]]$WithConstructs = $null, [bool]$Incomplete = $false
+        )
+        $set = if ($null -eq $WithConstructs) { $constructs } else { $WithConstructs }
         return Resolve-ReviewerConventionSpecialistRuleCoverage -Rows $Rows -ResolvedSources $sources `
-            -ChangedFileIndex $anchors -AcceptedCandidates $Accepted -Constructs $constructs -WithheldCandidateIds $Withheld
+            -AcceptedCandidates $Accepted -Constructs $set `
+            -ConstructsIncomplete $Incomplete -WithheldCandidateIds $Withheld
     }
 
     $complete = Invoke-Coverage -Accepted $accepted -Rows @(
@@ -357,7 +362,7 @@ try {
         "A row that checks constructs outside its declared scope must degrade to unknown."
 
     $declarationScope = Invoke-Coverage -Rows @(
-        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope "declarations" -Checked "dc0"),
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope "declaration" -Checked "dc0"),
         (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
     )
     Assert-Replay ([string]@($declarationScope.Rows)[0].status -ceq "compliant") `
@@ -429,8 +434,64 @@ try {
     Assert-Replay (-not [bool]$unaccounted.Complete -and @($unaccounted.UnaccountedCandidates) -ccontains "x") `
         "A candidate whose rule has no accounting row must be reported."
 
-    $index = Get-ReviewerConventionSpecialistChangedFileIndex -ChangeEntries @(
-        [pscustomobject][ordered]@{ Path = "src/z.cs"; Role = "current" },
+    # `none` is the shape a row takes when the model wants out of the checklist
+    # without saying so. It has to cost something.
+    $vacuous = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope "none" -Checked ""),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
+    )
+    Assert-Replay ([string]@($vacuous.Rows)[0].status -ceq "unknown" -and -not [bool]$vacuous.Complete) `
+        "A row claiming nothing was in reach while constructs exist must degrade, not pass as compliant."
+
+    $vacuousOk = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "notApplicable" -Scope "none" -Checked ""),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
+    )
+    Assert-Replay ([string]@($vacuousOk.Rows)[0].status -ceq "notApplicable" -and [bool]$vacuousOk.Complete) `
+        "A rule that genuinely does not apply may say so with an empty scope."
+
+    $wrongKind = Invoke-Coverage -WithConstructs @(
+        [pscustomobject][ordered]@{ constructId = "mi0"; kind = "invocation"; path = "src/a.cs"; line = 12; endLine = 12 }
+    ) -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope "declaration" -Checked ""),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Checked "mi0")
+    )
+    Assert-Replay ([string]@($wrongKind.Rows)[0].status -ceq "unknown") `
+        "Narrowing scope to a kind the change set does not contain is the same empty answer and must degrade too."
+
+    # A comment on a multi-line call belongs on the offending argument, which is
+    # never the line the call opens on. Requiring exact equality here would
+    # reject precisely the rows that anchored correctly.
+    $spanned = Invoke-Coverage -WithConstructs @(
+        [pscustomobject][ordered]@{ constructId = "mi0"; kind = "invocation"; path = "SRC/a.cs"; line = 10; endLine = 14 }
+    ) -Accepted @([pscustomobject][ordered]@{
+            candidateId = "positional-message"; packName = "core"; ruleSourceId = "rule-a"; filePath = "/src/A.cs"; line = 13
+        }) -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "violation" -Scope "invocation" -Checked "mi0" -Violating "mi0" -Candidate "positional-message"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope "invocation" -Checked "mi0")
+    )
+    Assert-Replay ([string]@($spanned.Rows)[0].candidateId -ceq "positional-message" -and [bool]$spanned.Complete) `
+        "A candidate anchored inside a construct's span, on a path differing only in case, must count as linked."
+
+    $offSpan = Invoke-Coverage -WithConstructs @(
+        [pscustomobject][ordered]@{ constructId = "mi0"; kind = "invocation"; path = "src/a.cs"; line = 10; endLine = 14 }
+    ) -Accepted @([pscustomobject][ordered]@{
+            candidateId = "elsewhere"; packName = "core"; ruleSourceId = "rule-a"; filePath = "/src/a.cs"; line = 99
+        }) -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "violation" -Scope "invocation" -Checked "mi0" -Violating "mi0" -Candidate "elsewhere"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope "invocation" -Checked "mi0")
+    )
+    Assert-Replay ([string]@($offSpan.Rows)[0].status -ceq "unknown") `
+        "A candidate outside every construct the row called violating must still degrade the row."
+
+    $partial = Invoke-Coverage -Incomplete $true -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "violation" -Violating "mi0" -Candidate "reassigns-field"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
+    ) -Accepted $accepted
+    Assert-Replay (-not [bool]$partial.Complete -and [bool]$partial.ConstructsIncomplete) `
+        "An accounting over a construct set the wrapper could not finish enumerating is not complete."
+
+    $index = Get-ReviewerConventionSpecialistChangedFileIndex -ChangeEntries @(        [pscustomobject][ordered]@{ Path = "src/z.cs"; Role = "current" },
         [pscustomobject][ordered]@{ Path = "src/a.cs"; Role = "current" },
         [pscustomobject][ordered]@{ Path = "src/gone.cs"; Role = "original" }
     )
@@ -468,12 +529,13 @@ try {
     $wideRequest = Get-ReviewerConventionSpecialistRuleRequest -ResolvedSources $wide
     Assert-Replay (@($wideRequest.Requested).Count -eq [int]$coverageSpec.MaxItems -and @($wideRequest.Unrequested).Count -eq 4) `
         "A transported set larger than the row cap must be capped in the request and the remainder named."
-    $wideCoverage = Resolve-ReviewerConventionSpecialistRuleCoverage -ResolvedSources $wide -ChangedFileIndex $anchors `
+    $wideCoverage = Resolve-ReviewerConventionSpecialistRuleCoverage -ResolvedSources $wide `
         -AcceptedCandidates @() -Rows @(@($wideRequest.Requested) | ForEach-Object {
             [pscustomobject][ordered]@{
                 ruleRef = [string]$_.ruleRef; ruleSourceSha256 = ("c" * 64); ruleQuote = ""
-                status = "compliant"; changedAnchors = ""; codeEvidence = ""
-                siblingStatus = "notRequired"; siblingEvidence = ""; candidateId = ""; notes = ""
+                status = "notApplicable"; scope = "none"; checkedConstructs = ""; violatingConstructs = ""
+                codeEvidence = ""; siblingStatus = "notRequired"; siblingEvidence = ""
+                candidateId = ""; notes = ""
             }
         })
     Assert-Replay (-not [bool]$wideCoverage.Complete -and @($wideCoverage.Missing).Count -eq 4) `
@@ -482,6 +544,27 @@ try {
         "The withheld reason set must include the wrapper's unemitted-violation reason."
     Assert-Replay ($coverageSpec.Item.Fields["status"].Values.Count -eq 4) `
         "A coverage row's status must be one of exactly four values."
+    # The construct id list has to be able to hold EVERY construct the wrapper
+    # can enumerate. If it cannot, a complete accounting would be unwritable and
+    # the section would fail exactly the change sets it was built for. Ranges
+    # are what make that possible: the whole set is four ranges, one per kind.
+    . (Join-Path $RepoRoot "src\Agents\reviewer\ChangedConstructs.ps1")
+    $widestIdList = 0
+    foreach ($prefix in @("mi", "dc", "cm", "as")) {
+        $kindIds = [string[]]@(0..($script:ReviewerConstructMaxTotal - 1) | ForEach-Object { "$prefix$_" })
+        $widestIdList += (Get-ReviewerConstructIdRanges -Ids $kindIds).Length + 1
+    }
+    Assert-Replay ($widestIdList -le [int]$coverageSpec.Item.Fields["checkedConstructs"].MaxLength) `
+        "The checked-construct field ($([int]$coverageSpec.Item.Fields['checkedConstructs'].MaxLength) chars) must hold every id the enumerator can produce ($widestIdList chars)."
+    Assert-Replay ($widestIdList -le [int]$coverageSpec.Item.Fields["violatingConstructs"].MaxLength) `
+        "The violating-construct field must hold every id the enumerator can produce."
+    $roundTrip = Expand-ReviewerConventionSpecialistConstructIds -Text (Get-ReviewerConstructIdRanges -Ids ([string[]]@("mi0", "mi1", "mi2", "mi7")))
+    Assert-Replay ([bool]$roundTrip.Ok -and (@($roundTrip.Ids) -join ",") -ceq "mi0,mi1,mi2,mi7") `
+        "A range-compressed id list must expand back to exactly the ids it came from."
+    foreach ($bad in @("mi3-mi1", "mi0-dc4", "mi", "mi0,,mi1-", "xx0")) {
+        $rejected = Expand-ReviewerConventionSpecialistConstructIds -Text $bad
+        Assert-Replay (-not [bool]$rejected.Ok) "A construct list of '$bad' must be reported unreadable, not guessed at."
+    }
 
     # A reporting section must not be able to destroy the findings it reports
     # on. Twice a complete accounting was discarded whole - once for evidence a
@@ -559,7 +642,7 @@ try {
         'public void T()', '{', '    Outer(',
         '        first: Inner(a, b),', '        second: 2);', '}')
     $nestedCall = Get-Invocation -Result $nested
-    Assert-Replay ($null -ne $nestedCall -and [string]$nestedCall.callee -ceq "Outer" -and [int]$nestedCall.argumentCount -eq 2) `
+    Assert-Replay ($null -ne $nestedCall -and [string]$nestedCall.name -ceq "Outer" -and [int]$nestedCall.argumentCount -eq 2) `
         "A nested call must stay inside its argument: the outer call has two arguments, not three."
 
     # Commas, parentheses and colons inside comments and strings are text.
@@ -577,7 +660,7 @@ try {
         'public void T()', '{', '    Build<Alpha, Beta>(',
         '        left: 1,', '        right: 2);', '}')
     $genericCall = Get-Invocation -Result $generic
-    Assert-Replay ($null -ne $genericCall -and [int]$genericCall.argumentCount -eq 2 -and [string]$genericCall.callee -ceq "Build") `
+    Assert-Replay ($null -ne $genericCall -and [int]$genericCall.argumentCount -eq 2 -and [string]$genericCall.name -ceq "Build") `
         "A generic argument list must not be read as arguments."
 
     # Ternaries and qualified names contain colons that are not argument names.
@@ -604,7 +687,7 @@ try {
         '    public void First() { }', '', '    [TestMethod]',
         '    public void Second() { }', '}') -Changed @(7, 8)
     $second = @(@($declarations.Constructs) | Where-Object { [string]$_.kind -ceq "declaration" })
-    Assert-Replay (@($second).Count -eq 1 -and [string]@($second)[0].callee -ceq "Second") `
+    Assert-Replay (@($second).Count -eq 1 -and [string]@($second)[0].name -ceq "Second") `
         "Only the CHANGED declaration is enumerated."
     Assert-Replay (@(@($second)[0].attributes) -ccontains "TestMethod" -and @(@($second)[0].attributes) -cnotcontains "Owner") `
         "A changed declaration must report exactly the attributes on it."
@@ -628,6 +711,124 @@ try {
     $dottedDeclaration = @(@($dotted.Constructs) | Where-Object { [string]$_.kind -ceq "declaration" })[0]
     Assert-Replay (@($dottedDeclaration.attributes) -ccontains "System.Diagnostics.CodeAnalysis.SuppressMessage") `
         "An attribute's full dotted name must be reported, not its first segment."
+
+    # Comment runs. A rule about what documentation says needs somewhere of its
+    # own to anchor: the nearest declaration can be a hundred lines away, and a
+    # comment anchored on it is a comment about the wrong thing.
+    $comments = Get-Constructs -Code @(
+        'public class C', '{', '    /// <summary>', '    /// Does the thing.', '    /// </summary>',
+        '    public void First() { }', '', '    // a separate note', '    public void Second() { }', '}') -Changed @(3, 4, 5, 8)
+    $commentRuns = @(@($comments.Constructs) | Where-Object { [string]$_.kind -ceq "comment" })
+    Assert-Replay (@($commentRuns).Count -eq 2) `
+        "Contiguous changed comment lines must group into one construct per run (got $(@($commentRuns).Count))."
+    Assert-Replay ([int]@($commentRuns)[0].line -eq 3 -and [int]@($commentRuns)[0].endLine -eq 5) `
+        "A comment run must report the first and last line it covers, so a candidate can anchor anywhere inside it."
+    $codeNotComment = Get-Constructs -Code @('public void T()', '{', '    var s = "// not a comment";', '}')
+    Assert-Replay (@(@($codeNotComment.Constructs) | Where-Object { [string]$_.kind -ceq "comment" }).Count -eq 0) `
+        "A comment marker inside a string literal is not a comment."
+
+    # Assignments. An immutability rule is about writing to something that
+    # already exists; a declaration with an initializer is not that, and calling
+    # it one would invent violations the code does not commit.
+    $assignments = Get-Constructs -Code @(
+        'public void T(Config c)', '{', '    var local = 1;', '    c.Value = 2;',
+        '    this.field = 3;', '    map["k"] = 4;', '    if (a == b) { }', '    Func<int,int> f = x => x;', '}')
+    $writes = @(@($assignments.Constructs) | Where-Object { [string]$_.kind -ceq "assignment" })
+    $targets = @(@($writes) | ForEach-Object { [string]$_.name })
+    Assert-Replay ($targets -ccontains "c.Value" -and $targets -ccontains "this.field") `
+        "A write to an existing member must be enumerated as an assignment (got $($targets -join ','))."
+    Assert-Replay ($targets -cnotcontains "local" -and $targets -cnotcontains "f") `
+        "A declaration with an initializer is a declaration, not a reassignment."
+    Assert-Replay (@($writes | Where-Object { [string]$_.name -cmatch '^a' }).Count -eq 0) `
+        "An equality comparison must not be read as an assignment."
+    $initializer = Get-Constructs -Code @(
+        'public void T()', '{', '    var o = new Thing', '    {', '        Name = "x",', '        Size = 2', '    };', '}')
+    $initializerWrites = @(@($initializer.Constructs) | Where-Object { [string]$_.kind -ceq "assignment" })
+    Assert-Replay (@($initializerWrites).Count -eq 0) `
+        "Object-initializer entries are initialization, not reassignment (got $(@($initializerWrites | ForEach-Object { $_.name }) -join ','))."
+
+    # A statement that happens to open a call has the shape of a declaration.
+    # Counting those inflates the declaration set, which is the denominator of
+    # the precedent fact a rule reads.
+    $statements = Get-Constructs -Code @(
+        'public class C', '{', '    public async Task M()', '    {',
+        '        await Fetch(', '            id: 1);', '        yield return Make(', '            id: 2);', '    }', '}')
+    $statementDeclarations = @(@($statements.Constructs) | Where-Object { [string]$_.kind -ceq "declaration" -and @("Fetch", "Make") -ccontains [string]$_.name })
+    Assert-Replay (@($statementDeclarations).Count -eq 0) `
+        "`await Foo(` and `yield return Bar(` are statements, not declarations, and must not be counted as either."
+
+    # An attribute written on the same line as the member it decorates is still
+    # that member's attribute. Skipping those lines is a blind spot exactly
+    # where an attribute rule is looking.
+    $inline = Get-Constructs -Code @(
+        'public class C', '{', '    [TestMethod] public void First() { }', '}') -Changed @(3)
+    $inlineDeclaration = @(@($inline.Constructs) | Where-Object { [string]$_.kind -ceq "declaration" })
+    Assert-Replay (@($inlineDeclaration).Count -eq 1 -and [string]@($inlineDeclaration)[0].name -ceq "First") `
+        "A declaration with its attribute on the same line must still be enumerated."
+    Assert-Replay (@(@($inlineDeclaration)[0].attributes) -ccontains "TestMethod") `
+        "An attribute written inline must be reported as that declaration's attribute."
+
+    # A raw string literal's body is prose. Scanning it as code manufactures
+    # constructs out of documentation.
+    $rawString = Get-Constructs -Code @(
+        'public void T()', '{', '    var s = """', '    public void NotReal(', '        a: 1);', '    """;', '}')
+    Assert-Replay (@($rawString.PartiallyUnderstoodFiles).Count -eq 1) `
+        "A raw string literal must make the file partly understood rather than be scanned as code."
+
+    # Masking blanks literals, so a call whose only argument is a literal looks
+    # empty. Reading that as a no-argument call erases the argument a rule about
+    # arguments is asking about.
+    $literalOnly = Get-Constructs -Code @(
+        'public void T()', '{', '    Log(', '        "a message");', '}')
+    $literalCall = Get-Invocation -Result $literalOnly
+    Assert-Replay ($null -ne $literalCall -and [int]$literalCall.argumentCount -eq 1 -and [string]$literalCall.argumentNaming -ceq "p") `
+        "A call whose only argument is a string literal has one positional argument, not none (got $(if ($literalCall) { $literalCall.argumentCount } else { 'no call' }))."
+
+    # A call-heavy change set must not consume the whole budget before a single
+    # declaration is emitted, or an attribute rule gets no anchors at all.
+    $manyCalls = [System.Collections.Generic.List[string]]::new()
+    [void]$manyCalls.Add('public class C')
+    [void]$manyCalls.Add('{')
+    foreach ($i in 1..40) {
+        [void]$manyCalls.Add("    public void M$i()")
+        [void]$manyCalls.Add('    {')
+        [void]$manyCalls.Add('        Do(')
+        [void]$manyCalls.Add("            x: $i);")
+        [void]$manyCalls.Add('    }')
+    }
+    [void]$manyCalls.Add('}')
+    $budget = Get-Constructs -Code @($manyCalls.ToArray())
+    $budgetDeclarations = @(@($budget.Constructs) | Where-Object { [string]$_.kind -ceq "declaration" })
+    $budgetInvocations = @(@($budget.Constructs) | Where-Object { [string]$_.kind -ceq "invocation" })
+    Assert-Replay (@($budgetDeclarations).Count -gt 0 -and @($budgetInvocations).Count -gt 0) `
+        "A change set with more constructs than the budget must still carry both kinds, not only the first."
+    Assert-Replay ([bool]$budget.Truncated) `
+        "A construct set that hit a cap must say so, because an accounting over it is not complete."
+
+    # Breadth before depth. If the budget goes to whichever file sorts first,
+    # a rule about tests is judged against no test anchor at all on a change
+    # set where the tests sort last - and the row still reads as an answer.
+    $manyFiles = @(1..6 | ForEach-Object {
+            $index = $_
+            $code = [System.Collections.Generic.List[string]]::new()
+            [void]$code.Add('public class C')
+            [void]$code.Add('{')
+            foreach ($n in 1..25) {
+                [void]$code.Add("    public void M$n()")
+                [void]$code.Add('    {')
+                [void]$code.Add('        Do(')
+                [void]$code.Add("            x: $n);")
+                [void]$code.Add('    }')
+            }
+            [void]$code.Add('}')
+            @{ Path = ("src/f{0}.cs" -f $index); Lines = @($code.ToArray()); ChangedLines = @(1..$code.Count) }
+        })
+    $spread = Get-ReviewerChangedConstructs -Files $manyFiles
+    $filesReached = @(@($spread.Constructs) | ForEach-Object { [string]$_.path } | Sort-Object -Unique)
+    Assert-Replay (@($filesReached).Count -eq 6) `
+        "Every changed file must contribute constructs when the budget is short, not just the ones that sort first (reached $(@($filesReached).Count) of 6)."
+    Assert-Replay ([bool]$spread.Truncated) `
+        "A construct set that could not carry every construct must say so."
 
     # Ids are a function of the change set alone, so an anchor means the same
     # thing on every run.

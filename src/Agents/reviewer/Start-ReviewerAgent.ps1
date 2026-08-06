@@ -7941,6 +7941,7 @@ function Get-ReviewerConstructFilesFromReport {
         $lines = New-Object string[] $maxLine
         for ($index = 0; $index -lt $maxLine; $index++) { $lines[$index] = "" }
         $changedLines = [System.Collections.Generic.List[int]]::new()
+        $deliveredLines = [System.Collections.Generic.HashSet[int]]::new()
         foreach ($slice in ($slices + $siblings)) {
             $sliceLines = ([string]$slice.Text) -split "`n"
             $start = [int]$slice.StartLine
@@ -7948,17 +7949,37 @@ function Get-ReviewerConstructFilesFromReport {
                 $lineNumber = $start + $offset
                 if ($lineNumber -lt 1 -or $lineNumber -gt $maxLine) { continue }
                 $lines[$lineNumber - 1] = ([string]$sliceLines[$offset]).TrimEnd("`r")
+                [void]$deliveredLines.Add($lineNumber)
             }
         }
-        foreach ($slice in $slices) {
-            for ($lineNumber = [int]$slice.StartLine; $lineNumber -le [int]$slice.EndLine; $lineNumber++) {
-                [void]$changedLines.Add($lineNumber)
+        # The pull request's OWN hunks, intersected with what was delivered - not
+        # the whole slice. A slice is a hunk plus a context radius, so treating
+        # every delivered line as changed would hand the model sixty untouched
+        # lines per hunk to rule on, and would let a comment land on code this
+        # pull request never wrote.
+        $rawSpans = @($file.RawSpans)
+        foreach ($span in $rawSpans) {
+            $spanStart = [int]$span.Start
+            $spanEnd = [int]$span.End
+            for ($lineNumber = $spanStart; $lineNumber -le $spanEnd; $lineNumber++) {
+                if ($deliveredLines.Contains($lineNumber)) { [void]$changedLines.Add($lineNumber) }
+            }
+        }
+        if ($rawSpans.Count -eq 0) {
+            # No hunk record for this path: fall back to the delivered changed
+            # slices rather than enumerating nothing, and let the construct
+            # status carry the imprecision.
+            foreach ($slice in $slices) {
+                for ($lineNumber = [int]$slice.StartLine; $lineNumber -le [int]$slice.EndLine; $lineNumber++) {
+                    [void]$changedLines.Add($lineNumber)
+                }
             }
         }
         [void]$files.Add(@{
                 Path = ([string]$file.Path).TrimStart("/")
                 Lines = $lines
                 ChangedLines = $changedLines.ToArray()
+                DeliveredLines = @($deliveredLines)
             })
     }
     return , $files.ToArray()
@@ -7978,7 +7999,10 @@ function Get-ReviewerConstructFilesFromReportSafely {
     }
     catch {
         Write-Warning "Changed-construct enumeration failed; the specialist will account without construct anchors: $($_.Exception.Message)"
-        return @{ Constructs = @(); Files = @(); InvocationIds = @(); DeclarationIds = @(); Truncated = $false; PartiallyUnderstoodFiles = @() }
+        # Truncated, not clean-empty. The deterministic backstop did not run, so
+        # an accounting that covers every rule still has not been checked
+        # against the code, and the report must not claim otherwise.
+        return @{ Constructs = @(); Files = @(); IdRangesByKind = $null; Truncated = $true; PartiallyUnderstoodFiles = @() }
     }
 }
 
@@ -8349,6 +8373,7 @@ function Invoke-ReviewerConventionSpecialistPass {
                 -ResolvedSources @($sessionData.Sources) -ChangeEntries @($sessionData.Changes) `
                 -Constructs @(Get-ReviewerHashValue -Container $Bound -Key 'ChangedConstructs' -Default @()) `
                 -ConstructFiles @(Get-ReviewerHashValue -Container $Bound -Key 'ConstructFiles' -Default @()) `
+                -ConstructIdRanges (Get-ReviewerHashValue -Container $Bound -Key 'ConstructIdRanges' -Default $null) `
                 -ThreadDigestText $ThreadDigestText -PinnedSourceText $PinnedSourceText `
                 -ReplayNotice $(if ($script:ReviewerReplayActive) { $script:ReviewerReplayModelNotice } else { "" })
             $contextBytes = [int]$specialistInput.Bytes
@@ -8429,7 +8454,8 @@ function Invoke-ReviewerConventionSpecialistPass {
             $validated = Resolve-ReviewerConventionSpecialistCandidates -Marker $marker `
                 -ConventionPlan $conventionPlan -FactPlan $factPlan `
                 -ResolvedSources @($sessionData.Sources) -ChangeEntries @($sessionData.Changes) `
-                -Constructs @(Get-ReviewerHashValue -Container $Bound -Key 'ChangedConstructs' -Default @())
+                -Constructs @(Get-ReviewerHashValue -Container $Bound -Key 'ChangedConstructs' -Default @()) `
+                -ConstructsIncomplete ([bool](Get-ReviewerHashValue -Container $Bound -Key 'ConstructsIncomplete' -Default $false))
             $candidates = @($validated.Candidates)
             $withheld = @($validated.Withheld)
             $residualRisks = @($validated.ResidualRisks)
@@ -12491,6 +12517,8 @@ function Invoke-ReviewerCycle {
             $sourceCoverageRecord = $null
             $changedConstructs = @()
             $constructFileSummaries = @()
+            $constructIdRanges = $null
+            $constructsIncomplete = $false
             try {
                 $sourceTransport = Get-ReviewerSourceTransport -Session $session -PrId $prId -SourceCommit $sourceCommit
                 $pinnedSourceText = [string]$sourceTransport.BlockText
@@ -12498,6 +12526,8 @@ function Invoke-ReviewerCycle {
                 $constructResult = Get-ReviewerConstructFilesFromReportSafely -Report $sourceTransport.Report
                 $changedConstructs = @($constructResult.Constructs)
                 $constructFileSummaries = @($constructResult.Files)
+                $constructIdRanges = $constructResult.IdRangesByKind
+                $constructsIncomplete = ([bool]$constructResult.Truncated -or @($constructResult.PartiallyUnderstoodFiles).Count -gt 0)
                 Write-Host ("  PR {0} pinned source: {1}/{2} changed file(s) that could carry source text covered ({3}%), {4} path(s) the pull request itself calls source-free, {5} changed-source byte(s) + {6} sibling byte(s)." -f `
                         $prId, $sourceTransport.Report.CoveredFiles, $sourceTransport.Report.SourceBearingFileCount,
                         $sourceTransport.Report.CoveragePercent, $sourceTransport.Report.NoSourceFileCount,
@@ -12731,6 +12761,8 @@ function Invoke-ReviewerCycle {
                     # nobody opened.
                     ChangedConstructs    = $changedConstructs
                     ConstructFiles       = $constructFileSummaries
+                    ConstructIdRanges    = $constructIdRanges
+                    ConstructsIncomplete = $constructsIncomplete
                     ConventionPlanPath   = $conventionPlanPath
                     FactPlanPath         = $factPlanPath
                     ExistingFingerprints = (Get-ReviewerExistingFingerprints -Threads $threads)
