@@ -107,6 +107,8 @@ function Measure-WrapperIndirectWrite {
         'Set-Item', 'si',
         'New-Item', 'ni',
         'Invoke-Expression', 'iex',
+        'Set-Alias', 'sal',
+        'New-Alias', 'nal',
         'Add-Member', 'Set-PSBreakpoint', 'sbp'
     )
     $commands = @($FunctionAst.FindAll({
@@ -131,7 +133,32 @@ function Measure-WrapperIndirectWrite {
                 $candidate -is [Management.Automation.Language.InvokeMemberExpressionAst] -and
                 $candidate.Static -and $candidate.Expression.Extent.Text -match 'scriptblock'
             }, $true))
-    return (@($commands).Count + @($refCasts).Count + @($sessionState).Count + @($builtCode).Count)
+    # `${function:Test-ReviewerSourceCoverageGate} = { ... }` replaces a CALLEE
+    # for the rest of the scope. Nothing the pins count changes, and the gate
+    # returns whatever the replacement says.
+    $driveWrites = @($FunctionAst.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.AssignmentStatementAst]
+            }, $true) | Where-Object {
+            @($_.Left.FindAll({
+                        param($inner)
+                        $inner -is [Management.Automation.Language.VariableExpressionAst]
+                    }, $true) | Where-Object {
+                    $_.VariablePath.UserPath -match '^(function|alias|env|variable):'
+                }).Count -gt 0
+        })
+    return (@($commands).Count + @($refCasts).Count + @($sessionState).Count + @($builtCode).Count + @($driveWrites).Count)
+}
+
+function Measure-WrapperNestedFunction {
+    <# A `function Format-ReviewerSealedSourceBlock { "stub" }` declared inside
+       the pinned function shadows the real one for that scope. Every write count
+       stays correct; the block is a stub. Neither function declares one. #>
+    param([Parameter(Mandatory)]$FunctionAst)
+    return @($FunctionAst.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.FunctionDefinitionAst]
+            }, $true) | Where-Object { -not [object]::ReferenceEquals($_, $FunctionAst) }).Count
 }
 
 function Measure-WrapperTrap {
@@ -898,7 +925,31 @@ Assert-Source (@($cycleMemberTargets | Where-Object { $expectedCycleMemberTarget
     "and the cycle mutates only its own bookkeeping objects - a new one has to be declared here, so an alias of the transport result cannot appear silently"
 Assert-Source ((Measure-WrapperIndirectWrite -FunctionAst $transportAst) -eq 0 -and
     (Measure-WrapperIndirectWrite -FunctionAst $cycleAst) -eq 0) `
-    "and neither function writes a variable indirectly - no Set-Variable, no New-Item Variable:, no [ref] handle, no PSVariable.Set - so the counts above cannot be evaded by choosing the target at runtime"
+    "and neither function writes a variable, an alias or a function indirectly, nor calls a command that could - so the counts above cannot be evaded by choosing the target at runtime"
+# The counts bound what these functions WRITE. They say nothing about which
+# functions they CALL, so a nested declaration shadowing the renderer or the
+# gate leaves every count correct and returns whatever the stub says.
+Assert-Source ((Measure-WrapperNestedFunction -FunctionAst $transportAst) -eq 0 -and
+    (Measure-WrapperNestedFunction -FunctionAst $cycleAst) -eq 0) `
+    "and neither declares a nested function, which would shadow the renderer or the gate without changing a single count"
+# The pinned logic reads more than it writes. Reassigning an INPUT is as good as
+# rewriting the guard: `$SourceCommit = $confirmCommit` above the head-move check
+# makes the comparison trivially true while every pinned line stands.
+Assert-Source ((Measure-WrapperVariableWrite -FunctionAst $transportAst -Name 'SourceCommit') -eq 0 -and
+    (Measure-WrapperVariableWrite -FunctionAst $transportAst -Name 'SourceTransportPolicy') -eq 0) `
+    "the transport never reassigns the commit it was told to pin, nor the policy it is judged against"
+Assert-Source ((Measure-WrapperVariableWrite -FunctionAst $transportAst -Name 'confirmCommit') -eq 1 -and
+    (Measure-WrapperVariableWrite -FunctionAst $transportAst -Name 'paths') -eq 1 -and
+    (Measure-WrapperVariableWrite -FunctionAst $transportAst -Name 'spansByPath') -eq 1 -and
+    (Measure-WrapperVariableWrite -FunctionAst $transportAst -Name 'changeKindsByPath') -eq 1) `
+    "and the change set, its spans, its change kinds and the re-read head are each established once"
+# Counting writes says nothing about REACHABILITY: an inserted early return of a
+# doctored result leaves every pinned line intact and simply never runs it.
+Assert-Source (@($transportAst.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.ReturnStatementAst]
+            }, $true)).Count -eq 2) `
+    "and the transport has exactly two returns - the reader's and its own - so no earlier one can hand back a doctored result the pinned lines below never reach"
 # Guard depth is an ancestor walk, and a `trap` is a sibling of what it catches,
 # so `trap { continue }` swallows the head-move refusal at depth 1 where no
 # ancestor walk can ever see it.
