@@ -253,6 +253,11 @@ Non-negotiable, and enforced in code rather than prose:
 - **Writes are verified by re-reading state**, never by trusting a response —
   some hosts confirm writes in prose, and parsing that as JSON throws *after*
   the write has already landed.
+- **Configuration cannot silently do nothing.** A capability switch whose
+  config is not populated is a startup error, and a config key the agent does
+  not read is rejected rather than ignored. The failure this prevents is an
+  operator who believes something is enabled while it delivers nothing —
+  which is worse than the feature being absent, because absence is visible.
 - **`-DryRun` self-checks are mandatory** and run offline.
 
 ---
