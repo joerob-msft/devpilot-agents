@@ -658,6 +658,29 @@ function ConvertTo-AgentMarkerFieldValue {
             # Tab and newline are allowed only when the schema opts in.
             if ($Value -isnot [string]) { return $bad }
             $text = [string]$Value
+            if ($Spec.ContainsKey('NormalizeTypography') -and [bool]$Spec.NormalizeTypography) {
+                # A fixed, meaning-preserving transliteration of the typographic
+                # characters a model reaches for without thinking. Markers have
+                # been lost whole - candidates, accounting and all - over a
+                # single em dash inside an otherwise perfect sentence.
+                #
+                # This is not a relaxation of the ASCII rule. The rule exists so
+                # that text destined for a comment cannot carry structure or
+                # controls, and every one of these maps to the character a
+                # reader would have read anyway. Anything NOT in this table is
+                # still rejected, and so is every control character.
+                $text = $text.
+                Replace([string][char]0x2018, "'").Replace([string][char]0x2019, "'").
+                Replace([string][char]0x201A, "'").Replace([string][char]0x201B, "'").
+                Replace([string][char]0x201C, '"').Replace([string][char]0x201D, '"').
+                Replace([string][char]0x201E, '"').Replace([string][char]0x201F, '"').
+                Replace([string][char]0x2010, "-").Replace([string][char]0x2011, "-").
+                Replace([string][char]0x2012, "-").Replace([string][char]0x2013, "-").
+                Replace([string][char]0x2014, "-").Replace([string][char]0x2015, "-").
+                Replace([string][char]0x2026, "...").Replace([string][char]0x00A0, " ").
+                Replace([string][char]0x2032, "'").Replace([string][char]0x2033, '"').
+                Replace([string][char]0x00AB, '"').Replace([string][char]0x00BB, '"')
+            }
             $max = if ($Spec.ContainsKey('MaxLength')) { [int]$Spec.MaxLength } else { 1000 }
             if ($text.Length -gt $max) {
                 # A field may opt into being SHORTENED rather than rejected. Only
