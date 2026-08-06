@@ -141,10 +141,15 @@ must be exactly one of `sourceConflict`, `outsideChangedFile`, `invalidAnchor`,
 
 Each `ruleCoverage` row has exactly `ruleRef`, `ruleSourceSha256`, `ruleQuote`
 (or empty), `status` (`violation|compliant|notApplicable|unknown`),
-`changedAnchors` (comma-separated `cf<n>:<line>`, at most 8, or empty),
+`changedAnchors` (comma-separated `cf<n>:<line>`, at most 16, or empty),
 `codeEvidence`, `siblingStatus` (`checked|notRequired|unavailable`),
 `siblingEvidence`, `candidateId` (or empty), and `notes`. Send one row per entry
 in `ruleCoverageRequest.requiredRows`, in that order.
+
+**These rows are a checklist, not an essay, and the whole marker is rejected if
+any field runs over.** Keep `ruleQuote` under 200 characters, `codeEvidence`
+under 300, and `siblingEvidence` and `notes` under 280 each. Say the thing and
+stop; the candidate is where a full argument belongs.
 
 The top-level object has exactly:
 

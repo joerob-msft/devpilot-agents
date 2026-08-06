@@ -377,7 +377,7 @@ try {
     $schema = Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject "Widgets" -ExpectedNonce "n"
     Assert-Replay ($schema.Keys -ccontains "ruleCoverage") "The marker schema must declare ruleCoverage."
     $coverageSpec = $schema.Fields["ruleCoverage"]
-    Assert-Replay ([int]$coverageSpec.MaxItems -eq 24) "The rule-coverage array must be bounded at 24 rows."
+    Assert-Replay ([int]$coverageSpec.MaxItems -eq 19) "The rule-coverage array must be bounded at 19 rows."
     $rowFields = $coverageSpec.Item.Fields
     # Every field of a row must be individually bounded, and the whole section
     # must stay well inside the marker scan window - an unbounded accounting

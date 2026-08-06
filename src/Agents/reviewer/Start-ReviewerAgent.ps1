@@ -12393,6 +12393,10 @@ function Invoke-ReviewerCycle {
                     readerExcusedAllowance = [int]$sourceTransport.Report.ReaderExcusedAllowance
                     coveredFiles = [int]$sourceTransport.Report.CoveredFiles
                     coveragePercent = [int]$sourceTransport.Report.CoveragePercent
+                    # The percentage alone cannot be audited: 100% of nothing
+                    # and 100% of thirty hunks read the same in a log.
+                    requestedSpanCount = [int]$sourceTransport.Report.RequestedSpanCount
+                    deliveredSpanCount = [int]$sourceTransport.Report.DeliveredSpanCount
                     spanPercent = [int]$sourceTransport.Report.SpanPercent
                     totalSliceBytes = [int]$sourceTransport.Report.TotalSliceBytes
                     totalSiblingBytes = [int]$sourceTransport.Report.TotalSiblingBytes
