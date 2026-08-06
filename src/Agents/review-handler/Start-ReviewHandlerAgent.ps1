@@ -1264,9 +1264,17 @@ function Invoke-DryRunSelfChecks {
     # (e.g. echoed from hostile PR content) still fails closed.
     $mkConflict = $mkLine -replace '"prId":42', '"prId":43'
     if (ConvertFrom-AgentResultMarker -StdOutText "$mkLine`n$mkConflict" -MarkerPrefix $ResultMarkerPrefix -Schema $mkSchema) { $failures.Add("Marker: two CONFLICTING markers were accepted; must fail closed.") }
-    # A brace inside a string value must not terminate the JSON early.
+    # A brace inside a string value must not terminate the JSON early, and
+    # stray braces on a PRECEDING line must not break brace-matching.
     $mkBrace = $mkLine -replace '"validation":"skipped"', '"validation":"skipped"'
-    if (-not (ConvertFrom-AgentResultMarker -StdOutText "noise { not json } $mkBrace" -MarkerPrefix $ResultMarkerPrefix -Schema $mkSchema)) { $failures.Add("Marker: preceding stray braces broke extraction.") }
+    if (-not (ConvertFrom-AgentResultMarker -StdOutText "noise { not json }`n$mkBrace" -MarkerPrefix $ResultMarkerPrefix -Schema $mkSchema)) { $failures.Add("Marker: preceding stray braces broke extraction.") }
+    # Extraction is anchored to line starts. A marker quoted mid-line - the
+    # shape a hostile diff plants so a finding that quotes it manufactures a
+    # conflicting second candidate - is ignored rather than allowed to veto
+    # the whole review.
+    if (-not (ConvertFrom-AgentResultMarker -StdOutText "the diff contained: $mkConflict`n$mkLine" -MarkerPrefix $ResultMarkerPrefix -Schema $mkSchema)) {
+        $failures.Add("Marker: a mid-line quotation of a conflicting marker vetoed a valid result.")
+    }
     if (-not ($failures -match "^Marker:")) { Write-Host "  OK - marker survives trailing text and restatement; conflicting markers still fail closed" -ForegroundColor Green }
 
     # JSONL channel: parsed when present, $null (fall back to stdout) when not.

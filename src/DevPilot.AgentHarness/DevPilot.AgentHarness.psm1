@@ -717,6 +717,47 @@ function ConvertTo-AgentMarkerFieldValue {
     }
 }
 
+function ConvertTo-AgentCanonicalMarkerJson {
+    <#
+        Order-preserving canonical rendering of a parsed marker payload, used to
+        compare two occurrences of the same marker for MEANING rather than for
+        byte equality.
+
+        Copilot's stdout carries the same marker more than once in practice, and
+        the two renderings are not always byte-identical: a model that prints a
+        pretty, fenced copy in its closing summary and a compact copy on the
+        final line has emitted one result, not two. Byte comparison rejected
+        those cycles. Canonical comparison accepts them while still rejecting
+        two markers that actually SAY different things, which is the property
+        that matters against an injected marker.
+
+        Object keys are sorted so key order cannot smuggle a difference, and the
+        depth is bounded so a hostile deeply nested payload cannot recurse.
+    #>
+    param($Value, [int]$Depth = 0)
+    if ($Depth -gt 24) { throw "Marker payload exceeded the maximum canonical depth." }
+    if ($null -eq $Value) { return "null" }
+    if ($Value -is [bool]) { return $(if ($Value) { "true" } else { "false" }) }
+    if ($Value -is [string]) { return (ConvertTo-Json -InputObject $Value -Compress) }
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) {
+        return [Convert]::ToString($Value, [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $names = @($Value.PSObject.Properties.Name | Sort-Object -CaseSensitive)
+        $parts = @($names | ForEach-Object {
+                (ConvertTo-Json -InputObject $_ -Compress) + ":" +
+                (ConvertTo-AgentCanonicalMarkerJson -Value $Value.PSObject.Properties[$_].Value -Depth ($Depth + 1))
+            })
+        return "{" + ($parts -join ",") + "}"
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $parts = @()
+        foreach ($item in $Value) { $parts += (ConvertTo-AgentCanonicalMarkerJson -Value $item -Depth ($Depth + 1)) }
+        return "[" + ($parts -join ",") + "]"
+    }
+    throw "Marker payload contained an unsupported JSON type."
+}
+
 function ConvertFrom-AgentResultMarker {
     <#
         Parses a single strict `<PREFIX>: <json>` result line as HOSTILE input.
@@ -746,7 +787,7 @@ function ConvertFrom-AgentResultMarker {
         the schema bounds them, and the wrapper decides what to do with them.
     #>
     param(
-        [Parameter(Mandatory)][string]$StdOutText,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$StdOutText,
         [Parameter(Mandatory)][string]$MarkerPrefix,
         [Parameter(Mandatory)][hashtable]$Schema
     )
@@ -761,23 +802,81 @@ function ConvertFrom-AgentResultMarker {
         # cycles even though the work had completed correctly.
         #
         # Extract EVERY marker occurrence by brace-matching the JSON that
-        # follows it, then require every occurrence to be byte-identical. This
-        # preserves the anti-injection property of the stricter rule:
-        #   - two DIFFERENT markers (e.g. one echoed out of hostile PR content)
-        #     still fail closed rather than "last wins";
-        #   - a marker the model never produced cannot match the expected nonce,
-        #     which is generated per cycle AFTER the PR content was authored.
-        $candidates = New-Object System.Collections.Generic.List[string]
+        # follows it, then require every occurrence to MEAN the same thing.
+        # Comparison is canonical rather than byte-for-byte, because a model
+        # that prints a pretty, fenced copy in its closing summary and a
+        # compact copy on the final line has emitted one result, not two. The
+        # anti-injection property survives:
+        #   - two markers that genuinely differ still fail closed;
+        #   - a marker the model never produced cannot match the expected
+        #     nonce, which is generated per cycle AFTER the PR content was
+        #     authored.
+        $parsedCandidates = New-Object System.Collections.Generic.List[object]
         $quoteChar = [char]'"'
         $escapeChar = [char]'\'
         $openBrace = [char]'{'
         $closeBrace = [char]'}'
-        $searchIndex = 0
-        while ($true) {
-            $hit = $StdOutText.IndexOf($MarkerPrefix, $searchIndex, [StringComparison]::Ordinal)
-            if ($hit -lt 0) { break }
-            $jsonStart = $StdOutText.IndexOf($openBrace, $hit + $MarkerPrefix.Length)
-            if ($jsonStart -lt 0) { return $null }
+        # Anchored to a line start. Matching the prefix ANYWHERE would let a
+        # finding that quotes attacker-planted source such as
+        # "// REVIEWER_RESULT_V1: {...}" manufacture a second, different
+        # candidate and fail the whole review closed - an author-controlled
+        # kill switch on being reviewed. Leading whitespace and trailing text
+        # on the same line stay tolerated, which is what the relaxation was
+        # for in the first place.
+        #
+        # Filtering happens DURING collection, not after it. An occurrence that
+        # does not parse, has no JSON after the prefix, or does not carry the
+        # schema's exact-valued fields is simply not a candidate - it is text
+        # that happens to look like one. Treating any of those as a global veto
+        # reopened the same kill switch by a different door: the wrapper now
+        # injects raw pull-request lines into the model's context and asks it to
+        # quote evidence, so a planted "<PREFIX>: not json" echoed at a line
+        # start would discard a complete, valid review.
+        $exactFields = @($Schema.Keys | Where-Object {
+                $spec = $Schema.Fields[$_]
+                $null -ne $spec -and [string]$spec.Type -ceq 'exact'
+            })
+        $anchorPattern = "(?m)^[ `t]*" + [regex]::Escape($MarkerPrefix)
+        $scanned = 0
+        $examined = 0
+        foreach ($anchor in [regex]::Matches($StdOutText, $anchorPattern)) {
+            # Bounded scan: a transcript carrying an implausible number of
+            # prefix occurrences is an attack surface, not a formatting quirk.
+            # The outer bound is deliberately far above any plausible transcript
+            # because a bare prefix line costs one IndexOf and nothing else; the
+            # tight bounds are the payload-examination cap below and the
+            # retained-candidate cap further down.
+            $scanned++
+            if ($scanned -gt 200000) {
+                Write-Verbose "Result-marker scan stopped after $scanned prefix occurrence(s); a marker beyond that point is not seen."
+                break
+            }
+            $hit = $anchor.Index
+            # The opening brace must be on the anchor's OWN line. Searching the
+            # whole remaining transcript let a planted prefix line carrying no
+            # brace reach forward and adopt the JSON of a genuine marker further
+            # down: sixteen such lines filled the retained-candidate cap with
+            # duplicates of the real marker, and the duplicate-marker rule then
+            # discarded a complete, correct review.
+            $lineEnd = $StdOutText.IndexOf("`n", $hit, [StringComparison]::Ordinal)
+            if ($lineEnd -lt 0) { $lineEnd = $StdOutText.Length }
+            # Two-argument IndexOf would scan to the end of the transcript on
+            # every anchor that has no brace at all, which a hostile transcript
+            # can make quadratic - measured at 14 seconds on 8 MB. The (char,
+            # int, int) count overload bounds it to this anchor's own line. The
+            # anchor pattern cannot match a newline, so the count is never
+            # negative. Passing a StringComparison here instead would ALSO bind
+            # this overload and coerce the enum to 4, searching four characters
+            # and discarding every marker with a longer lead-in.
+            $searchStart = $hit + $anchor.Length
+            if ($searchStart -ge $lineEnd) { continue }
+            $jsonStart = $StdOutText.IndexOf($openBrace, $searchStart, $lineEnd - $searchStart)
+            if ($jsonStart -lt 0) { continue }
+            # Only an anchor that really could carry a payload costs scan budget.
+            # Counting the ones discarded here made a review killable by quoting
+            # enough bare prefix lines, which is free for an attacker.
+            $examined++
+            if ($examined -gt 512) { break }
             # Bounded brace-depth scan. String contents are respected so a brace
             # inside a JSON string value cannot terminate the object early.
             # The bound is generous rather than tight because a marker carrying
@@ -805,17 +904,45 @@ function ConvertFrom-AgentResultMarker {
                     if ($depth -eq 0) { $jsonEnd = $i; break }
                 }
             }
-            if ($jsonEnd -lt 0) { return $null }
-            [void]$candidates.Add($StdOutText.Substring($jsonStart, $jsonEnd - $jsonStart + 1))
-            $searchIndex = $jsonEnd + 1
+            if ($jsonEnd -lt 0) { continue }
+            $parsed = $null
+            try { $parsed = $StdOutText.Substring($jsonStart, $jsonEnd - $jsonStart + 1) | ConvertFrom-Json -ErrorAction Stop }
+            catch { continue }
+            if ($parsed -isnot [System.Management.Automation.PSCustomObject]) { continue }
+            if ($exactFields.Count -gt 0) {
+                $bound = $true
+                foreach ($name in $exactFields) {
+                    $property = $parsed.PSObject.Properties[$name]
+                    if ($null -eq $property -or $property.Value -isnot [string] -or
+                        [string]$property.Value -cne [string]$Schema.Fields[$name].Expected) {
+                        $bound = $false
+                        break
+                    }
+                }
+                if (-not $bound) { continue }
+            }
+            [void]$parsedCandidates.Add($parsed)
+            # More than a handful of occurrences that all carry this cycle's
+            # nonce is not a formatting quirk either.
+            if ($parsedCandidates.Count -gt 16) { return $null }
         }
-        if ($candidates.Count -eq 0) { return $null }
-        $jsonText = $candidates[0]
-        foreach ($candidate in $candidates) {
-            if ($candidate -cne $jsonText) { return $null }
-        }
+        if ($parsedCandidates.Count -eq 0) { return $null }
+        # Every surviving occurrence must MEAN the same thing. Whitespace and
+        # key order may differ - a fenced, pretty-printed restatement of the
+        # same result is the same result - but any semantic difference between
+        # two markers that both carry this cycle's nonce fails closed.
 
-        $obj = $jsonText | ConvertFrom-Json -ErrorAction Stop
+        $obj = $null
+        $canonical = $null
+        foreach ($parsed in $parsedCandidates) {
+            $parsedCanonical = ConvertTo-AgentCanonicalMarkerJson -Value $parsed
+            if ($null -eq $canonical) {
+                $canonical = $parsedCanonical
+                $obj = $parsed
+                continue
+            }
+            if ($parsedCanonical -cne $canonical) { return $null }
+        }
         if ($obj -isnot [System.Management.Automation.PSCustomObject]) { return $null }
 
         $allowedKeys = @($Schema.Keys)
@@ -2791,6 +2918,7 @@ Export-ModuleMember -Function @(
     "Set-JsonState",
     "Write-AgentMetadata",
     "ConvertFrom-AgentResultMarker",
+    "ConvertTo-AgentCanonicalMarkerJson",
     "Find-CopilotSessionForBranch",
     "Set-TimedProcessArguments",
     "Stop-ProcessTree",

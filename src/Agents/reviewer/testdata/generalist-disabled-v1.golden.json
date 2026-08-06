@@ -1,4 +1,5 @@
 {
+  "_note": "Pins the generalist review path against unauthorized drift from the specialist layer. baseCommit is the pre-specialist baseline; every later change to a listed function or to the generalist prompt must be recorded here with a reason, so a generalist behaviour change is always a deliberate, documented act.",
   "baseCommit": "84767a0cc6744413f32f4d2f1036e717ba9552f6",
   "functions": {
     "Get-ReviewerMarkerSchema": "988d854172a387260134758f650c047330ba2560bf7bb90d7e14769334d4d1bb",
@@ -9,17 +10,122 @@
     "Get-ReviewerRuntimeContext": "3c5b58cc90a85fcf213f29db889e034c9378a3b498dce2ac2b2ec4c4d96f21ff",
     "Get-ReviewerPostableFindings": "df41352b7f8e49ef33b57a50ec76facf2d8cda0e3d80d6bc2bfe5f4f67ac39a7",
     "Split-ReviewerFindingsByChangeSet": "662dc52aefdaf9c5de7b9e8d7bf614a42a2030227495606ffb3e6fd9b941d6e0",
+    "Invoke-ReviewerPullRequest": "62432a88a734669cfe06220131db07429ea8940eb8eb35078ad925748efce719",
     "Invoke-ReviewerDelivery": "05a9813a6ed6c6e7e8992c3bb4587629da520ec1dc1ec81235d80f84623247eb"
   },
   "authorizedFunctionDeltas": {
-    "Write-ReviewerPreview": {
-      "sha256": "7a74199c73cca5c14bd20381dbf455bf68cbc70e450a3459febb8aa6634e368e",
-      "reason": "Seal the configured pass count so an incomplete multi-pass run cannot be promoted as single-pass."
-    },
-    "Invoke-ReviewerDelivery": {
-      "sha256": "05a9813a6ed6c6e7e8992c3bb4587629da520ec1dc1ec81235d80f84623247eb",
-      "reason": "Require code-defined typed delivery authorization before every raw wrapper write."
-    }
+    "Write-ReviewerPreview": [
+      {
+        "sha256": "7a74199c73cca5c14bd20381dbf455bf68cbc70e450a3459febb8aa6634e368e",
+        "reason": "Seal the configured pass count so an incomplete multi-pass run cannot be promoted as single-pass."
+      },
+      {
+        "sha256": "3ef22ae6e4084f842ca4c18ce544ab28ee0bbe4bb7ef974657099786cef668f2",
+        "reason": "State pinned source coverage in the preview a human reads, and name the changed files whose source never reached the model, so 'no findings' can never be read as 'every file was reviewed'."
+      },
+      {
+        "sha256": "eb37df741fdd4bfaebbcb3637d15a1976ec722f267c79bfb8bcc9bbb7c6a4a7d",
+        "reason": "Also state what documented convention authority the run consulted. A repository whose config declares no convention packs or authoritative sources cannot raise a convention finding at all, and that gap is invisible unless the artifact names it."
+      },
+      {
+        "sha256": "04d00e8e42cd0b0fc8f569f0bb51bfd8e8f74c465e2f67995be3961cdcebb69c",
+        "reason": "Name partially delivered files too, with their delivered/requested region counts. A file the model saw one region of is not a file it read, and listing only fully omitted files hid that distinction from the human reading the preview."
+      },
+      {
+        "sha256": "e585d8a8642db378e712cc2a1e6046c1d763310c700267bc3a0e991d236a6d61",
+        "reason": "Route coverage paths through a safe renderer, and report coverage against the changed files that actually carry added or edited lines so deletes and renames cannot sink the reported percentage."
+      },
+      {
+        "sha256": "977da64246625f50c15a267b86905d382c0034e04442d4c163a2e2bc81fb2287",
+        "reason": "Decide which paths to list as unread from the coverage record's own carriesSource flag rather than by matching one reason string, so a newly added no-source reason cannot start listing ordinary deletes and binaries as files the model failed to read."
+      },
+      {
+        "sha256": "82496f5b1f480f3bf185f780e8f9e707b4aae3396b884d16abbf8915704494a1",
+        "reason": "Report changed-source bytes and unchanged sibling-evidence bytes as two separate figures. They were being summed under a name borrowed from the changed-source cap, which the sum could exceed."
+      },
+      {
+        "sha256": "210bdd9019013f905413e9ac6735c26d165e7ce211378395c296932ecb3f5fa2",
+        "reason": "Split the two kinds of excluded path in the preview. A human deciding whether to trust a review needs to see that the pull request itself called a path a delete, separately from the host claiming a path's bytes are not text - the second is the claim that can be wrong at scale, and it now carries the allowance it was measured against."
+      },
+      {
+        "sha256": "7f12ca11a3424f0023bf6cf257a70c9ecd39e5f441d659776a9d447b30d07be6",
+        "reason": "Also state how many of the host's non-text claims the file's own name does not corroborate. That is the subset the allowance actually governs, and without it the preview implied every excluded asset counted against a ceiling it never touched."
+      },
+      {
+        "sha256": "64f2aa99bb0217548df38f7791b00933aacdf31581c9bac7f1673168e6bd59e3",
+        "reason": "Tell the human what the model is now told: a path the host could not read is counted IN the coverage percentage and belongs in the list of files nobody read. The preview said those paths were excluded from the calculation and then omitted them from that list entirely, so four unread source files were described to a human as removed from the sum and named nowhere."
+      },
+      {
+        "sha256": "77bed5a456b3d9c811220c909001eed1c2e3ac02560804f18807efba59940a5c",
+        "reason": "Restore the uncorroborated count and the ceiling alongside it. Rewriting that line dropped both, so on a passing pull request a human could no longer see how close the host's unsupported non-text claims came to the refusal threshold."
+      }
+    ],
+    "Invoke-ReviewerDelivery": [
+      {
+        "sha256": "05a9813a6ed6c6e7e8992c3bb4587629da520ec1dc1ec81235d80f84623247eb",
+        "reason": "Require code-defined typed delivery authorization before every raw wrapper write."
+      }
+    ],
+    "Get-ReviewerRuntimeContext": [
+      {
+        "sha256": "17f84ed0c785fd5408b87c84f153ca24ce8129b1dfed0fe82cda7cb0cb5cdb8c",
+        "reason": "Carry the sealed pinned changed-file source block. The host's file-read tool answers with a binary resource payload the model never receives, so without this the generalist reviews files it has not read."
+      },
+      {
+        "sha256": "24bfc80213e33e9ee61ce2eaeef1699faca371e5b0aa4de6b9dda4aeb4fef247",
+        "reason": "State it in as many words when NO sealed block was produced. The block was simply omitted when empty, so a one-line regression that blanked it left the model with no source and no notice of that, while the prompt still told it the accounting table was binding."
+      }
+    ],
+    "Invoke-ReviewerModelPass": [
+      {
+        "sha256": "64690e2d892cd5a188e6a6dc070497d85e9d675af64d1dd994a39983a566ea5d",
+        "reason": "Pass the bound PR's sealed pinned-source block into the runtime context it builds; no other generalist behaviour changes."
+      },
+      {
+        "sha256": "11bba16aa7f88b61ab0ec284b88528ecd4244b6542e6b73449cebadce329291a",
+        "reason": "Report a marker rejected for wrong PR/repository/commit binding under its own reason, so the pass-level retry can distinguish a formatting slip from a marker bound to the wrong work and never retry the latter."
+      },
+      {
+        "sha256": "5d302f8573f61798df3e36709dd79ebb67dc9f02970e4780d306d37a211873c2",
+        "reason": "Refuse an oversized model input as a bounded pass failure instead of throwing. The throw escaped Invoke-ReviewerPullRequest and the cycle's own catch then abandoned every pull request queued behind it, so one unusually large change set ended the cycle for all of them."
+      },
+      {
+        "sha256": "8c5e2be6e4b8827de4afdcf8892ea5b76821ae3c24b8cd9ad8ec68c88684f036",
+        "reason": "Mark that oversized-input refusal a pull-request failure rather than an environment fault. Exempting it re-attempted every cycle forever, burning a full transport, the specialist and the gate each time, while never appearing in attempts state where an operator could see it."
+      }
+    ],
+    "Invoke-ReviewerPullRequest": [
+      {
+        "sha256": "62432a88a734669cfe06220131db07429ea8940eb8eb35078ad925748efce719",
+        "reason": "Pinned so the source-coverage wiring cannot be dropped silently: this function carries the marker retry loop and the preview call that publishes pinned source coverage and the convention authority summary."
+      }
+    ]
   },
-  "promptSha256": "f9357af7ea2dc1f3f5929b2541bd9875c3e63fd8bee50894a88a4688fc05ebd1"
+  "promptSha256": "f9357af7ea2dc1f3f5929b2541bd9875c3e63fd8bee50894a88a4688fc05ebd1",
+  "authorizedPromptDeltas": [
+    {
+      "sha256": "c128c417bd3730c9430d5cbf38f934a50664add961fade7c466b08ba7f81d643",
+      "reason": "Stop directing the model at the repository file-read tool, which silently returns nothing on this host; point it at the sealed pinned-source block and its binding content accounting instead. Also forbid treating a documented invariant as proof the invariant is enforced."
+    },
+    {
+      "sha256": "f09cb3ac58e021e47a48a95c69f239d85c20fe11d0f0ed678701912ca061786e",
+      "reason": "Require the marker to be one compact line and tell the model to re-check its brackets. A live run lost a complete, correct review to a single stray bracket in several kilobytes of hand-written single-line JSON."
+    },
+    {
+      "sha256": "02ad8391d74c2a952cffd622ea57f93e0a9753ba175b3773a433ffc4c136c58c",
+      "reason": "Distinguish the one omission reason that is not a gap in what the model was given: a path with no added or edited lines at all has nothing in it to read, so treating it like an unread file made ordinary deletes and renames look like transport failures."
+    },
+    {
+      "sha256": "207f656dd6d0a548f7cf3a15a83a7b36c345452c0a92dda960f9278c230771d7",
+      "reason": "Say the same thing about a binary. A non-text changed file is now reported under its own reason rather than as no-changed-spans, and without this the prompt's list of what has nothing to read no longer matched the reasons the block actually emits."
+    },
+    {
+      "sha256": "8f842c09604560be7955f15db18c6511e159d1ba78bfdd84c5a6f59db549c118",
+      "reason": "Name the exception list as a closed set of three reasons and say explicitly that notTextual is NOT one of them. That reason is also emitted for a file the change set diffed as text and the wrapper then refused to fetch, so the previous wording licensed the model to clear files with real changed lines it had never seen."
+    },
+    {
+      "sha256": "6eb9fe0f587bcf8572135b5c02e17d00886f75865468e6033f65d8e43737d08c",
+      "reason": "Narrow that exception list to exactly ONE reason. Only the pull request's own statement that it deleted or renamed a path may be presented as nothing-to-read; a path the reader could not establish content for is an unread file, and telling the model otherwise was a claim the repository host could author at will over any file it chose."
+    }
+  ]
 }

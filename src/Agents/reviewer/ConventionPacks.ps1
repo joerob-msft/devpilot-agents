@@ -389,13 +389,22 @@ function Test-ReviewerConventionCommitEqual {
 }
 
 function Get-ReviewerConventionSourceIdentity {
+    <# What makes two convention sources the same source.
+
+       The named SECTION is part of the identity. Two rules routinely live in
+       one engineering-guidance document - and naming a section is the only way
+       such a document is transportable at all, since transporting it whole
+       exceeds any sane pack budget. Identity without the section would make
+       "two rules from one document" a configuration error, which is the most
+       ordinary case there is. #>
     param([Parameter(Mandatory)]$Source)
-    return ("{0}`n{1}`n{2}`n{3}`n{4}" -f
+    return ("{0}`n{1}`n{2}`n{3}`n{4}`n{5}" -f
         [string](Get-ReviewerConventionValue $Source "Organization"),
         [string](Get-ReviewerConventionValue $Source "Project"),
         [string](Get-ReviewerConventionValue $Source "RepositoryId"),
         [string](Get-ReviewerConventionValue $Source "Branch"),
-        [string](Get-ReviewerConventionValue $Source "Path")).ToUpperInvariant()
+        [string](Get-ReviewerConventionValue $Source "Path"),
+        [string](Get-ReviewerConventionValue $Source "Section" "")).ToUpperInvariant()
 }
 
 function ConvertTo-ReviewerConventionPackPolicy {
@@ -522,6 +531,7 @@ function ConvertTo-ReviewerConventionPackPolicy {
                     project = [string]$configuredSource.Project
                     repositoryId = [string]$configuredSource.RepositoryId
                     path = [string]$configuredSource.Path
+                    section = [string](Get-ReviewerConventionValue $configuredSource "Section" "")
                     ref = "refs/heads/$($configuredSource.Branch)"
                     commitSha = ("a" * 40); sha256 = ("a" * 64)
                     mimeType = $longestMimeType; byteLength = [int]$configuredSource.MaxBytes
@@ -535,6 +545,7 @@ function ConvertTo-ReviewerConventionPackPolicy {
                     project = [string]$RepositoryBinding.Project
                     repositoryId = [string]$RepositoryBinding.RepositoryId
                     path = [string]$local.Path
+                    section = ""
                     ref = [string]$RepositoryBinding.TargetRef
                     commitSha = ("a" * 40); sha256 = ("a" * 64)
                     mimeType = $longestMimeType; byteLength = [int]$local.MaxBytes
@@ -693,6 +704,11 @@ function New-ReviewerConventionContextPlan {
                     project       = [string](Get-ReviewerConventionValue $snapshot "Project")
                     repositoryId  = [string](Get-ReviewerConventionValue $snapshot "RepositoryId")
                     path          = [string](Get-ReviewerConventionValue $snapshot "Path")
+                    # Empty for a whole-file source. When set, the specialist's
+                    # independent re-read must cut the SAME heading before its
+                    # byte/hash comparison, or a section-scoped rule would look
+                    # tampered with on every cycle.
+                    section       = [string](Get-ReviewerConventionValue $snapshot "Section" "")
                     ref           = [string](Get-ReviewerConventionValue $snapshot "Ref")
                     commitSha     = [string](Get-ReviewerConventionValue $snapshot "CommitSha")
                     sha256        = [string](Get-ReviewerConventionValue $snapshot "Sha256")
