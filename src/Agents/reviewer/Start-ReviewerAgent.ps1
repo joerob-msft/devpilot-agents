@@ -8361,86 +8361,116 @@ function Invoke-ReviewerConventionSpecialistPass {
                             -Session $specialistSession -ConventionPlan $conventionPlan)
                 }
             }
-            $nonce = New-AgentNonce
-            $promptText = [IO.File]::ReadAllText($ConventionSpecialistPromptPath, $script:ReviewerUtf8)
-            $specialistInput = New-ReviewerConventionSpecialistInput -PromptText $promptText -Nonce $nonce `
-                -Organization $Organization -Project $ExpectedProject -RepositoryId $cfgRepoId `
-                -PrId $PrId -SourceCommit $SourceCommit -TargetCommit $targetCommit `
-                -ChangeSetDigest $changeSetDigest -ConventionPlanSha256 $conventionPlanSha256 `
-                -FactPlanSha256 $factPlanSha256 -ConfigSha256 $ConfigSha256 `
-                -ScriptSha256 $ScriptSelfSha256 -PromptSha256 $ConventionSpecialistPromptSha256 `
-                -ConventionPlan $conventionPlan -FactPlan $factPlan `
-                -ResolvedSources @($sessionData.Sources) -ChangeEntries @($sessionData.Changes) `
-                -Constructs @(Get-ReviewerHashValue -Container $Bound -Key 'ChangedConstructs' -Default @()) `
-                -ConstructFiles @(Get-ReviewerHashValue -Container $Bound -Key 'ConstructFiles' -Default @()) `
-                -ConstructIdRanges (Get-ReviewerHashValue -Container $Bound -Key 'ConstructIdRanges' -Default $null) `
-                -ThreadDigestText $ThreadDigestText -PinnedSourceText $PinnedSourceText `
-                -ReplayNotice $(if ($script:ReviewerReplayActive) { $script:ReviewerReplayModelNotice } else { "" })
-            $contextBytes = [int]$specialistInput.Bytes
-            if ([bool]$specialistInput.PinnedSourceDropped) {
-                Write-Warning ("PR $PrId's pinned source did not fit the convention specialist's input bound; " +
-                    "the specialist was told to treat every changed file as unread.")
-                $toolAudit.pinnedSourceDropped = $true
-            }
-            $allowTools = Get-ReviewerLaunchAllowTools -Intended $script:ReviewerConventionSpecialistAllowToolCeiling
-            $availableTools = ConvertTo-ReviewerAvailableToolNames -PermissionTools $allowTools
-            $denyTools = Get-ReviewerEffectiveDenyTools -ConfigDeny $ConfigDenyTools
-            $toolAudit.availableTools = @($availableTools)
-            $toolAudit.deniedPermissions = @($denyTools)
-            $agencyArgs = Get-AgentCopilotArgs -AgentName "" -Source "" `
-                -AvailableTools $availableTools -AllowTools $allowTools -DenyTools $denyTools `
-                -Model $EffectiveConventionSpecialistModel -JsonOutput
-            Write-Host "Launching convention specialist ($EffectiveConventionSpecialistModel, discovery only, timeout=${ConventionSpecialistTimeoutSeconds}s)..." -ForegroundColor Cyan
-            $run = Invoke-TimedProcess -FilePath $AgencyPath -ArgumentList $agencyArgs `
-                -StandardInputContent $specialistInput.Text -CaptureStdOut -CaptureStdErr -WorkingDirectory $RepoPath `
-                -EnvironmentVariablesToRemove $CopilotSensitiveEnvironmentVariables `
-                -TimeoutSeconds $ConventionSpecialistTimeoutSeconds
-            $cliOutcome = Get-AgentCliJsonOutcome -StdOutText ([string]$run.StdOut)
-            $markerSource = [string]$run.StdOut
+            $marker = $null
+            $nonce = ""
+            $contextBytes = 0
+            $run = $null
+            $cliOutcome = $null
+            $markerSource = ""
             $boundedRawRequestedTools = @()
-            if ($cliOutcome) {
-                if ($cliOutcome.Answer) { $markerSource = [string]$cliOutcome.Answer }
-                $allRequestedTools = @($cliOutcome.ToolRequests)
-                $toolAudit.toolRequestAuditTruncated = ($allRequestedTools.Count -gt 64)
-                $boundedRawRequestedTools = @($allRequestedTools | Select-Object -First 64)
-                $toolAudit.requestedTools = @($boundedRawRequestedTools | ForEach-Object {
+            # The specialist emits by hand the largest marker this agent
+            # produces: a candidate array and a row for every transported rule,
+            # each naming the constructs it checked. A model that restates that
+            # marker in its closing summary and paraphrases one sentence while
+            # doing so has emitted two markers that disagree, and the harness
+            # correctly refuses to guess which one is the answer. That is a
+            # formatting slip on top of work that was done, and it is worth
+            # exactly one more attempt - the same allowance the generalist
+            # passes already get, for the same reason.
+            for ($specialistAttempt = 1; $specialistAttempt -le $script:ReviewerMarkerRetryAttempts; $specialistAttempt++) {
+                # A fresh nonce and a rebuilt input per attempt, so the second
+                # attempt is a new request rather than a second chance to answer
+                # the first one.
+                $nonce = New-AgentNonce
+                $promptText = [IO.File]::ReadAllText($ConventionSpecialistPromptPath, $script:ReviewerUtf8)
+                $specialistInput = New-ReviewerConventionSpecialistInput -PromptText $promptText -Nonce $nonce `
+                    -Organization $Organization -Project $ExpectedProject -RepositoryId $cfgRepoId `
+                    -PrId $PrId -SourceCommit $SourceCommit -TargetCommit $targetCommit `
+                    -ChangeSetDigest $changeSetDigest -ConventionPlanSha256 $conventionPlanSha256 `
+                    -FactPlanSha256 $factPlanSha256 -ConfigSha256 $ConfigSha256 `
+                    -ScriptSha256 $ScriptSelfSha256 -PromptSha256 $ConventionSpecialistPromptSha256 `
+                    -ConventionPlan $conventionPlan -FactPlan $factPlan `
+                    -ResolvedSources @($sessionData.Sources) -ChangeEntries @($sessionData.Changes) `
+                    -Constructs @(Get-ReviewerHashValue -Container $Bound -Key 'ChangedConstructs' -Default @()) `
+                    -ConstructFiles @(Get-ReviewerHashValue -Container $Bound -Key 'ConstructFiles' -Default @()) `
+                    -ConstructIdRanges (Get-ReviewerHashValue -Container $Bound -Key 'ConstructIdRanges' -Default $null) `
+                    -ThreadDigestText $ThreadDigestText -PinnedSourceText $PinnedSourceText `
+                    -ReplayNotice $(if ($script:ReviewerReplayActive) { $script:ReviewerReplayModelNotice } else { "" })
+                $contextBytes = [int]$specialistInput.Bytes
+                if ([bool]$specialistInput.PinnedSourceDropped) {
+                    Write-Warning ("PR $PrId's pinned source did not fit the convention specialist's input bound; " +
+                        "the specialist was told to treat every changed file as unread.")
+                    $toolAudit.pinnedSourceDropped = $true
+                }
+                $allowTools = Get-ReviewerLaunchAllowTools -Intended $script:ReviewerConventionSpecialistAllowToolCeiling
+                $availableTools = ConvertTo-ReviewerAvailableToolNames -PermissionTools $allowTools
+                $denyTools = Get-ReviewerEffectiveDenyTools -ConfigDeny $ConfigDenyTools
+                $toolAudit.availableTools = @($availableTools)
+                $toolAudit.deniedPermissions = @($denyTools)
+                $agencyArgs = Get-AgentCopilotArgs -AgentName "" -Source "" `
+                    -AvailableTools $availableTools -AllowTools $allowTools -DenyTools $denyTools `
+                    -Model $EffectiveConventionSpecialistModel -JsonOutput
+                Write-Host "Launching convention specialist ($EffectiveConventionSpecialistModel, discovery only, timeout=${ConventionSpecialistTimeoutSeconds}s)..." -ForegroundColor Cyan
+                $run = Invoke-TimedProcess -FilePath $AgencyPath -ArgumentList $agencyArgs `
+                    -StandardInputContent $specialistInput.Text -CaptureStdOut -CaptureStdErr -WorkingDirectory $RepoPath `
+                    -EnvironmentVariablesToRemove $CopilotSensitiveEnvironmentVariables `
+                    -TimeoutSeconds $ConventionSpecialistTimeoutSeconds
+                $cliOutcome = Get-AgentCliJsonOutcome -StdOutText ([string]$run.StdOut)
+                $markerSource = [string]$run.StdOut
+                $boundedRawRequestedTools = @()
+                if ($cliOutcome) {
+                    if ($cliOutcome.Answer) { $markerSource = [string]$cliOutcome.Answer }
+                    $allRequestedTools = @($cliOutcome.ToolRequests)
+                    $toolAudit.toolRequestAuditTruncated = ($allRequestedTools.Count -gt 64)
+                    $boundedRawRequestedTools = @($allRequestedTools | Select-Object -First 64)
+                    $toolAudit.requestedTools = @($boundedRawRequestedTools | ForEach-Object {
+                            Format-ReviewerConventionSpecialistAuditName -Name ([string]$_)
+                        })
+                    $toolAudit.modifiedFiles = @($cliOutcome.ModifiedFiles)
+                    if ($cliOutcome.Model -and [string]$cliOutcome.Model -cne $EffectiveConventionSpecialistModel) {
+                        throw "Copilot reported specialist model '$($cliOutcome.Model)' instead of '$EffectiveConventionSpecialistModel'."
+                    }
+                }
+                if ($script:ReviewerUtf8.GetByteCount($markerSource) -gt 65536) {
+                    throw "Convention specialist output exceeded the 65536-byte cap."
+                }
+                # A timeout or a nonzero exit is a real failure and is never
+                # retried: a second identical attempt would not fix it.
+                $processFailure = Get-ReviewerConventionSpecialistFailureReason -TimedOut ([bool]$run.TimedOut) `
+                    -ExitCode ([int]$run.ExitCode) -MarkerValid $true `
+                    -TimeoutSeconds $ConventionSpecialistTimeoutSeconds
+                if ($processFailure) { throw $processFailure }
+                if (@($toolAudit.modifiedFiles).Count -gt 0) {
+                    throw "Convention specialist reported modified files despite its read-only grant."
+                }
+                $forbiddenRequestedTools = @($boundedRawRequestedTools | Where-Object {
+                        $rawName = [string]$_
+                        $script:ReviewerMandatoryDenyTools -ccontains $rawName -or
+                        @($script:ReviewerForbiddenToolFamilies | Where-Object {
+                                $rawName.StartsWith($_, [StringComparison]::OrdinalIgnoreCase)
+                            }).Count -gt 0 -or
+                        $rawName -match '(?i)(^|[_(-])(write|edit|create|task|shell|web)([_)-]|$)'
+                    })
+                if ($forbiddenRequestedTools.Count -gt 0) {
+                    throw "Convention specialist requested forbidden tool(s): $($forbiddenRequestedTools -join ', ')."
+                }
+                $toolAudit.unrecognizedTools = @($boundedRawRequestedTools | Where-Object {
+                        -not (ConvertTo-ReviewerConventionSpecialistToolIdentity -Name ([string]$_))
+                    } | ForEach-Object {
                         Format-ReviewerConventionSpecialistAuditName -Name ([string]$_)
                     })
-                $toolAudit.modifiedFiles = @($cliOutcome.ModifiedFiles)
-                if ($cliOutcome.Model -and [string]$cliOutcome.Model -cne $EffectiveConventionSpecialistModel) {
-                    throw "Copilot reported specialist model '$($cliOutcome.Model)' instead of '$EffectiveConventionSpecialistModel'."
+                $marker = ConvertFrom-AgentResultMarker -StdOutText $markerSource `
+                    -MarkerPrefix $script:ReviewerConventionSpecialistMarkerPrefix `
+                    -Schema (Get-ReviewerConventionSpecialistMarkerSchema `
+                        -ExpectedProject $ExpectedProject -ExpectedNonce $nonce)
+                if ($null -ne $marker) { break }
+                if ($specialistAttempt -ge $script:ReviewerMarkerRetryAttempts) { break }
+                Write-Warning ("PR {0}'s convention specialist produced an unusable result marker; retrying once in a fresh session." -f $PrId)
+                Write-ReviewerCycleMetadata -Fields @{
+                    cycle = $CycleNumber; mode = "convention-specialist-marker-retry"; prId = $PrId
+                    sourceCommit = $SourceCommit; model = [string]$EffectiveConventionSpecialistModel
                 }
             }
-            if ($script:ReviewerUtf8.GetByteCount($markerSource) -gt 65536) {
-                throw "Convention specialist output exceeded the 65536-byte cap."
-            }
-            $processFailure = Get-ReviewerConventionSpecialistFailureReason -TimedOut ([bool]$run.TimedOut) `
-                -ExitCode ([int]$run.ExitCode) -MarkerValid $true `
-                -TimeoutSeconds $ConventionSpecialistTimeoutSeconds
-            if ($processFailure) { throw $processFailure }
-            if (@($toolAudit.modifiedFiles).Count -gt 0) {
-                throw "Convention specialist reported modified files despite its read-only grant."
-            }
-            $forbiddenRequestedTools = @($boundedRawRequestedTools | Where-Object {
-                    $rawName = [string]$_
-                    $script:ReviewerMandatoryDenyTools -ccontains $rawName -or
-                    @($script:ReviewerForbiddenToolFamilies | Where-Object {
-                            $rawName.StartsWith($_, [StringComparison]::OrdinalIgnoreCase)
-                        }).Count -gt 0 -or
-                    $rawName -match '(?i)(^|[_(-])(write|edit|create|task|shell|web)([_)-]|$)'
-                })
-            if ($forbiddenRequestedTools.Count -gt 0) {
-                throw "Convention specialist requested forbidden tool(s): $($forbiddenRequestedTools -join ', ')."
-            }
-            $toolAudit.unrecognizedTools = @($boundedRawRequestedTools | Where-Object {
-                    -not (ConvertTo-ReviewerConventionSpecialistToolIdentity -Name ([string]$_))
-                } | ForEach-Object {
-                    Format-ReviewerConventionSpecialistAuditName -Name ([string]$_)
-                })
-            $marker = ConvertFrom-AgentResultMarker -StdOutText $markerSource `
-                -MarkerPrefix $script:ReviewerConventionSpecialistMarkerPrefix `
-                -Schema (Get-ReviewerConventionSpecialistMarkerSchema `
-                    -ExpectedProject $ExpectedProject -ExpectedNonce $nonce)
             $markerFailure = Get-ReviewerConventionSpecialistFailureReason -TimedOut $false -ExitCode 0 `
                 -MarkerValid ($null -ne $marker) -TimeoutSeconds $ConventionSpecialistTimeoutSeconds
             if ($markerFailure) { throw $markerFailure }

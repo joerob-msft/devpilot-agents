@@ -856,8 +856,25 @@ try {
     $again = Get-Constructs -Code @('public void T()', '{', '    A(', '        x: 1);', '    B(', '        y: 2);', '}')
     Assert-Replay ((@($twice.Constructs | ForEach-Object { $_.constructId }) -join ',') -ceq (@($again.Constructs | ForEach-Object { $_.constructId }) -join ',')) `
         "Construct ids must be deterministic for the same change set."
-    # -- 11. The replay tool grant -------------------------------------------
-    # Extracted from the reviewer's own source and evaluated here, because the
+    # The specialist writes the largest hand-built marker this agent produces,
+    # and a model that restates it while paraphrasing one sentence has emitted
+    # two markers that disagree. That is a formatting slip on top of work that
+    # was done, and it gets exactly the allowance a generalist pass gets - and
+    # exactly the same refusal to retry a timeout or a nonzero exit.
+    $reviewerText = [IO.File]::ReadAllText((Join-Path $RepoRoot "src\Agents\reviewer\Start-ReviewerAgent.ps1"))
+    Assert-Replay ($reviewerText -match 'convention-specialist-marker-retry') `
+        "An unusable specialist marker must be retried once and the retry recorded."
+    $retryBlock = [regex]::Match($reviewerText,
+        '(?s)for \(\$specialistAttempt = 1.*?\n            \}\r?\n            \$markerFailure')
+    Assert-Replay ($retryBlock.Success) "The specialist launch must sit inside the retry loop."
+    Assert-Replay ($retryBlock.Value -match '\$nonce = New-AgentNonce') `
+        "Each specialist attempt must mint a fresh nonce, so the retry is a new request rather than a second answer to the first."
+    Assert-Replay ($retryBlock.Value -match 'if \(\$processFailure\) \{ throw \$processFailure \}') `
+        "A timeout or nonzero exit must still throw from inside the loop rather than be retried."
+    Assert-Replay ($retryBlock.Value -match 'if \(\$forbiddenRequestedTools\.Count -gt 0\)') `
+        "The forbidden-tool check must run on every attempt, not only the first."
+
+    # -- 11. The replay tool grant -------------------------------------------    # Extracted from the reviewer's own source and evaluated here, because the
     # claim "the model has no usable tool in replay" is otherwise a comment.
     Write-Host "11/11 replay tool grant" -ForegroundColor Cyan
     $reviewerSource = [IO.File]::ReadAllText((Join-Path $RepoRoot "src\Agents\reviewer\Start-ReviewerAgent.ps1"), $utf8)
