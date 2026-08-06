@@ -564,6 +564,13 @@ try {
     $roundTrip = Expand-ReviewerConventionSpecialistConstructIds -Text (Get-ReviewerConstructIdRanges -Ids ([string[]]@("mi0", "mi1", "mi2", "mi7")))
     Assert-Replay ([bool]$roundTrip.Ok -and (@($roundTrip.Ids) -join ",") -ceq "mi0,mi1,mi2,mi7") `
         "A range-compressed id list must expand back to exactly the ids it came from."
+    # The marker pattern and the expander both stop at three digits. Raising the
+    # construct budget past that would produce ids no row could legally name,
+    # with nothing anywhere to say so.
+    Assert-Replay ($script:ReviewerConstructMaxTotal -le 999) `
+        "The construct budget must stay inside the three-digit id space the marker pattern and the expander both enforce."
+    $tooWide = Expand-ReviewerConventionSpecialistConstructIds -Text "mi1000"
+    Assert-Replay (-not [bool]$tooWide.Ok) "A four-digit construct id must be refused rather than silently truncated."
     foreach ($bad in @("mi3-mi1", "mi0-dc4", "mi", "mi0,,mi1-", "xx0")) {
         $rejected = Expand-ReviewerConventionSpecialistConstructIds -Text $bad
         Assert-Replay (-not [bool]$rejected.Ok) "A construct list of '$bad' must be reported unreadable, not guessed at."
@@ -593,6 +600,18 @@ try {
             "A shortened rule-coverage field must end up within its own bound."
         Assert-Replay (([string]$long.Value).EndsWith("...")) `
             "A shortened rule-coverage field must show that it was shortened."
+        # A lone surrogate half is not a control character and has no pattern to
+        # fail, so it survives validation and then throws when the preview is
+        # written as strict UTF-8 - losing the pass to the mechanism that exists
+        # to stop passes being lost.
+        $astral = [string][char]0xD83D + [string][char]0xDE00
+        $pairCut = Test-MarkerField -Spec $spec -Value (("y" * ([int]$spec.MaxLength - 4)) + $astral + ("z" * 40))
+        Assert-Replay ([bool]$pairCut.Ok) "A shortened field containing an astral character must still validate."
+        $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+        $encoded = $null
+        try { $encoded = $strictUtf8.GetBytes([string]$pairCut.Value) } catch { $encoded = $null }
+        Assert-Replay ($null -ne $encoded) `
+            "Shortening must never cut a surrogate pair in half: the result has to survive being written as strict UTF-8."
     }
     # Truncation is opt-in, and comment text never opts in.
     foreach ($strict in @("ruleQuote", "checkedConstructs", "violatingConstructs")) {
@@ -826,8 +845,48 @@ try {
     Assert-Replay (@($initializerWrites).Count -eq 0) `
         "Object-initializer entries are initialization, not reassignment (got $(@($initializerWrites | ForEach-Object { $_.name }) -join ','))."
 
-    # A statement that happens to open a call has the shape of a declaration.
-    # Counting those inflates the declaration set, which is the denominator of
+    # `if (`, `while (` and friends have a call's shape and no arguments at
+    # all. A rule about how arguments are passed must not be handed one as a
+    # construct it has to account for, still less as one it may anchor on.
+    $control = Get-Constructs -Code @(
+        'public void T(int a, int b)', '{', '    if (a > 0 &&', '        b > 0)', '    {', '        Do(',
+        '            x: a);', '    }', '}')
+    $controlCalls = @(@($control.Constructs) | Where-Object { [string]$_.kind -ceq "invocation" })
+    Assert-Replay (@($controlCalls).Count -eq 1 -and [string]@($controlCalls)[0].name -ceq "Do") `
+        "A wrapped control-flow statement must not be enumerated as a call (got $(@($controlCalls | ForEach-Object { $_.name }) -join ','))."
+    Assert-Replay (@(@($control.Constructs) | Where-Object { [string]$_.name -ceq "if" }).Count -eq 0) `
+        "No construct of any kind may be named after a control-flow keyword."
+    $keywordPrefix = Get-Constructs -Code @('public void T()', '{', '    iffy(', '        x: 1);', '}')
+    $keywordCalls = @(@($keywordPrefix.Constructs) | Where-Object { [string]$_.kind -ceq "invocation" })
+    Assert-Replay (@($keywordCalls).Count -eq 1 -and [string]@($keywordCalls)[0].name -ceq "iffy") `
+        "A method whose name merely starts with a keyword is still a call."
+
+    # Attributes and neighbours must not be read across a gap the transport
+    # never delivered. The file image is sparse, so a blank line there is not
+    # evidence of anything - and these attributes are presented to the model as
+    # facts underpinning a precedent argument.
+    $sparse = [System.Collections.Generic.List[string]]::new()
+    [void]$sparse.Add('    [Owner("someone")]')
+    [void]$sparse.Add('    public void FarAway() { }')
+    foreach ($blank in 1..40) { [void]$sparse.Add('') }
+    [void]$sparse.Add('    public void Nearby() { }')
+    $gapFiles = @(@{
+            Path = "src/Sparse.cs"
+            Lines = @($sparse.ToArray())
+            ChangedLines = @(43)
+            DeliveredLines = @(43)
+        })
+    $gapped = Get-ReviewerChangedConstructs -Files $gapFiles
+    $gapDeclaration = @(@($gapped.Constructs) | Where-Object { [string]$_.kind -ceq "declaration" })
+    Assert-Replay (@($gapDeclaration).Count -eq 1 -and [string]@($gapDeclaration)[0].name -ceq "Nearby") `
+        "The changed declaration must still be enumerated when the rest of the file was not delivered."
+    Assert-Replay (@(@($gapDeclaration)[0].attributes).Count -eq 0 -and @(@($gapDeclaration)[0].siblingAttributes).Count -eq 0) `
+        "An attribute forty undelivered lines away is not this declaration's attribute, and not its neighbour's either."
+    $gapSummary = @($gapped.Files)[0]
+    Assert-Replay (@($gapSummary.attributeFrequency | Where-Object { [string]$_.attribute -ceq "Owner" }).Count -eq 0) `
+        "The per-file attribute count must count only what the transport delivered."
+
+    # A statement that happens to open a call has the shape of a declaration.    # Counting those inflates the declaration set, which is the denominator of
     # the precedent fact a rule reads.
     $statements = Get-Constructs -Code @(
         'public class C', '{', '    public async Task M()', '    {',
@@ -961,6 +1020,18 @@ try {
         "The specialist retry budget must be a named bound."
     Assert-Replay ($retryBlock.Value -notmatch '\$script:ReviewerMarkerRetryAttempts') `
         "No path in the specialist loop may fall back to the generalist retry budget."
+    # The overflow retry must not run ahead of the checks that must never be
+    # retried, or a run that timed out, modified a file or asked for a forbidden
+    # tool while ALSO overflowing gets a quiet second chance and its evidence
+    # overwritten.
+    $overflowAt = $retryBlock.Value.IndexOf('convention-specialist-output-overflow')
+    $failureAt = $retryBlock.Value.IndexOf('if ($processFailure) { throw $processFailure }')
+    $forbiddenAt = $retryBlock.Value.IndexOf('Convention specialist requested forbidden tool(s)')
+    $modifiedAt = $retryBlock.Value.IndexOf('reported modified files despite its read-only grant')
+    Assert-Replay ($overflowAt -gt $failureAt -and $overflowAt -gt $forbiddenAt -and $overflowAt -gt $modifiedAt) `
+        "The output-overflow retry must run after the timeout, modified-file and forbidden-tool checks, never before them."
+    Assert-Replay ($retryBlock.Value -match '\$toolAudit\.requestedTools = @\(\)') `
+        "Each attempt must reset the tool audit, so a failed attempt's requests are neither reported nor hidden by a quieter retry."
 
     # -- 11. The replay tool grant -------------------------------------------    # Extracted from the reviewer's own source and evaluated here, because the
     # claim "the model has no usable tool in replay" is otherwise a comment.

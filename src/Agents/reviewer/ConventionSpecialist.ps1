@@ -366,7 +366,15 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                     Fields = @{
                         ruleRef = @{ Type = "string"; MaxLength = 6; Pattern = '^rs[0-9]{1,3}$' }
                         ruleSourceSha256 = @{ Type = "hex"; Length = 64 }
-                        ruleQuote = @{ Type = "string"; MaxLength = 200; AllowEmpty = $true; Pattern = '^(|[\x20-\x7E]+)$' }
+                        ruleQuote = @{
+                            Type = "string"; MaxLength = 200; AllowEmpty = $true
+                            # At least eight characters when present, the same
+                            # floor a candidate's quote has. A one-character
+                            # "quote" satisfies a substring check against almost
+                            # any source and so proves nothing about whether the
+                            # row read the rule.
+                            Pattern = '^(|[\x20-\x7E]{8,})$'
+                        }
                         status = @{ Type = "enum"; Values = $script:ReviewerConventionSpecialistCoverageStatuses }
                         scope = @{
                             Type = "string"; MaxLength = 64
@@ -398,15 +406,16 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                         #
                         # This is not a loosening of the marker contract. The
                         # marker validator refuses control characters in every
-                        # string regardless of pattern, so nothing here can
-                        # forge structure, and truncation is opt-in per field:
-                        # candidate text, which is rendered into a
+                        # string regardless of pattern, and truncation is opt-in
+                        # per field: candidate text, which is rendered into a
                         # pull-request comment, may never be silently altered.
                         # These three appear only in the local preview and the
-                        # sealed, non-promotable artifact. ruleQuote keeps the
-                        # strict pattern and no truncation, because it must be
-                        # an exact substring of the transported source and the
-                        # wrapper checks that.
+                        # sealed, non-promotable artifact - which is why the
+                        # pattern-free spelling is acceptable here even though a
+                        # few non-control separators (U+2028, U+2029) would
+                        # survive it. ruleQuote keeps the strict pattern and no
+                        # truncation, because it must be an exact substring of
+                        # the transported source and the wrapper checks that.
                         codeEvidence = @{ Type = "string"; MaxLength = 600; AllowEmpty = $true; Truncate = $true }
                         siblingStatus = @{ Type = "enum"; Values = @("checked", "notRequired", "unavailable") }
                         siblingEvidence = @{ Type = "string"; MaxLength = 600; AllowEmpty = $true; Truncate = $true }
@@ -627,9 +636,31 @@ function Get-ReviewerConventionSpecialistRuleRequest {
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ResolvedSources,
         [int]$MaxRows = $script:ReviewerConventionSpecialistMaxRuleCoverage
     )
-    $ordered = @(@($ResolvedSources) | Sort-Object -Property `
-        @{ Expression = { [string](Get-ReviewerConventionSpecialistValue $_ "PackName" "") } },
-        @{ Expression = { [string](Get-ReviewerConventionSpecialistValue $_ "SourceId" "") } })
+    # Ordinal, not Sort-Object. This order does not merely number the rows: it
+    # decides WHICH rules are requested at all when the transported set is
+    # larger than the cap. A culture-sensitive comparison would mean the same
+    # set of rules is accounted for differently on two machines, which is the
+    # one thing an accounting section may not do.
+    $keyed = [System.Collections.Generic.List[object]]::new()
+    foreach ($source in @($ResolvedSources)) {
+        $sourceKey = "{0}/{1}" -f `
+            [string](Get-ReviewerConventionSpecialistValue $source "PackName" ""),
+        [string](Get-ReviewerConventionSpecialistValue $source "SourceId" "")
+        [void]$keyed.Add(@{ Key = $sourceKey; Source = $source })
+    }
+    $keys = [string[]]@(@($keyed) | ForEach-Object { [string]$_.Key })
+    [Array]::Sort($keys, [StringComparer]::Ordinal)
+    $ordered = [System.Collections.Generic.List[object]]::new()
+    $taken = [System.Collections.Generic.List[object]]::new()
+    foreach ($key in $keys) {
+        foreach ($entry in $keyed) {
+            if ([string]$entry.Key -cne $key) { continue }
+            if ($taken.Contains($entry)) { continue }
+            [void]$taken.Add($entry)
+            [void]$ordered.Add($entry.Source)
+            break
+        }
+    }
     $requested = [System.Collections.Generic.List[object]]::new()
     $unrequested = [System.Collections.Generic.List[string]]::new()
     for ($i = 0; $i -lt $ordered.Count; $i++) {

@@ -8435,6 +8435,15 @@ function Invoke-ReviewerConventionSpecialistPass {
                 $cliOutcome = Get-AgentCliJsonOutcome -StdOutText ([string]$run.StdOut)
                 $markerSource = [string]$run.StdOut
                 $boundedRawRequestedTools = @()
+                # Reset the audit at the top of every attempt. Carrying a failed
+                # attempt's requested tools into a clean one would either report
+                # a tool this attempt never asked for, or - worse - let an
+                # attempt that asked for a forbidden one disappear behind a
+                # quieter retry.
+                $toolAudit.requestedTools = @()
+                $toolAudit.unrecognizedTools = @()
+                $toolAudit.modifiedFiles = @()
+                $toolAudit.toolRequestAuditTruncated = $false
                 if ($cliOutcome) {
                     if ($cliOutcome.Answer) { $markerSource = [string]$cliOutcome.Answer }
                     $allRequestedTools = @($cliOutcome.ToolRequests)
@@ -8447,28 +8456,6 @@ function Invoke-ReviewerConventionSpecialistPass {
                     if ($cliOutcome.Model -and [string]$cliOutcome.Model -cne $EffectiveConventionSpecialistModel) {
                         throw "Copilot reported specialist model '$($cliOutcome.Model)' instead of '$EffectiveConventionSpecialistModel'."
                     }
-                }
-                # The wrapper will scan this much untrusted text for a marker and
-                # no more. Generous rather than tight: this pass is asked to
-                # account for every rule against every changed construct, and a
-                # model that narrates that work as it goes legitimately writes a
-                # long answer. The marker itself is bounded by its schema.
-                if ($script:ReviewerUtf8.GetByteCount($markerSource) -gt $script:ReviewerConventionSpecialistMaxOutputBytes) {
-                    # Overflow is not proof the work was not done - it is proof
-                    # the model talked too much on the way. That is the same
-                    # class of slip as an unusable marker, so it gets the same
-                    # one retry rather than costing the pass outright.
-                    if ($specialistAttempt -ge $script:ReviewerConventionSpecialistMarkerRetryAttempts) {
-                        throw "Convention specialist output exceeded the $($script:ReviewerConventionSpecialistMaxOutputBytes)-byte cap."
-                    }
-                    Write-Warning ("PR {0}'s convention specialist wrote more than the {1}-byte output cap; retrying once in a fresh session." -f `
-                            $PrId, $script:ReviewerConventionSpecialistMaxOutputBytes)
-                    Write-ReviewerCycleMetadata -Fields @{
-                        cycle = $CycleNumber; mode = "convention-specialist-output-overflow"; prId = $PrId
-                        sourceCommit = $SourceCommit; model = [string]$EffectiveConventionSpecialistModel
-                    }
-                    $marker = $null
-                    continue
                 }
                 # A timeout or a nonzero exit is a real failure and is never
                 # retried: a second identical attempt would not fix it.
@@ -8495,6 +8482,28 @@ function Invoke-ReviewerConventionSpecialistPass {
                     } | ForEach-Object {
                         Format-ReviewerConventionSpecialistAuditName -Name ([string]$_)
                     })
+                # The wrapper will scan this much untrusted text for a marker and
+                # no more. Generous rather than tight: this pass is asked to
+                # account for every rule against every changed construct, and a
+                # model that narrates that work as it goes legitimately writes a
+                # long answer. The marker itself is bounded by its schema.
+                if ($script:ReviewerUtf8.GetByteCount($markerSource) -gt $script:ReviewerConventionSpecialistMaxOutputBytes) {
+                    # Overflow is not proof the work was not done - it is proof
+                    # the model talked too much on the way. That is the same
+                    # class of slip as an unusable marker, so it gets the same
+                    # one retry rather than costing the pass outright.
+                    if ($specialistAttempt -ge $script:ReviewerConventionSpecialistMarkerRetryAttempts) {
+                        throw "Convention specialist output exceeded the $($script:ReviewerConventionSpecialistMaxOutputBytes)-byte cap."
+                    }
+                    Write-Warning ("PR {0}'s convention specialist wrote more than the {1}-byte output cap; retrying once in a fresh session." -f `
+                            $PrId, $script:ReviewerConventionSpecialistMaxOutputBytes)
+                    Write-ReviewerCycleMetadata -Fields @{
+                        cycle = $CycleNumber; mode = "convention-specialist-output-overflow"; prId = $PrId
+                        sourceCommit = $SourceCommit; model = [string]$EffectiveConventionSpecialistModel
+                    }
+                    $marker = $null
+                    continue
+                }
                 $marker = ConvertFrom-AgentResultMarker -StdOutText $markerSource `
                     -MarkerPrefix $script:ReviewerConventionSpecialistMarkerPrefix `
                     -Schema (Get-ReviewerConventionSpecialistMarkerSchema `
