@@ -689,6 +689,11 @@ Assert-Source ($harnessText -match '\$examined -gt 512' -and $harnessText -match
 $runtimeText = Get-FunctionTextFromWrapper -Name 'Get-ReviewerRuntimeContext'
 Assert-Source ($runtimeText -match 'NONE PRODUCED' -and $runtimeText -match 'Treat every changed file as unread') `
     "an absent sealed block is stated to the model instead of silently omitted"
+$previewText = Get-FunctionTextFromWrapper -Name 'Write-ReviewerPreview'
+Assert-Source ($previewText -match 'counted IN the percentage above' -and $previewText -notmatch 'were excluded because the repository host') `
+    "the human preview says reader-excused paths are counted, not excluded"
+Assert-Source ($previewText -match "noSourceBasis -ceq 'reader'") `
+    "and it lists them among the files whose source did not reach the model"
 
 $cycleTextForUnits = $cycleText
 Assert-Source ($cycleTextForUnits -match 'sourceBearingFileCount' -and $cycleTextForUnits -match 'noSourceFileCount') `
@@ -1145,10 +1150,18 @@ Assert-Source ([int]$binaryAddReport.RequestedSpanCount -eq 1) `
 $binaryAddBlock = Format-ReviewerSealedSourceBlock -Report $binaryAddReport -NonceFactory { 'n' * 32 }
 Assert-Source ($binaryAddBlock -match '/assets/logo\.png' -and $binaryAddBlock -match 'binaryNoText') `
     "the binary is still named in the accounting table with its own reason"
-Assert-Source ($binaryAddBlock -match 'EXACTLY ONE reason is different' -and
+Assert-Source ($binaryAddBlock -match 'EXACTLY 1 reason is different' -and
     $binaryAddBlock -match '`noChangedSpans` means the pull request itself says') `
     "only the pull request's own statement is presented to the model as nothing-to-read"
-Assert-Source ($binaryAddBlock -match 'Every OTHER reason, including `binaryNoText`, `emptyFile`, `notTextual`, `fileTooLarge` and `spansUnavailable`, means the source content of that path could NOT be established' -and
+# The sentence is generated from the closed set, so adding a reason to the set
+# without meaning to changes the model's instructions and fails here.
+Assert-Source (@($script:ReviewerSourceNothingToReadReasons) -join ',' -ceq 'noChangedSpans') `
+    "the nothing-to-read set the sentence is built from holds exactly noChangedSpans"
+foreach ($readerReason in @('binaryNoText', 'emptyFile', 'notTextual', 'fileTooLarge', 'spansUnavailable', 'decodeRejected', 'transportFailed')) {
+    Assert-Source ($binaryAddBlock -match "``$readerReason``") `
+        "the model is told '$readerReason' means the source content could not be established"
+}
+Assert-Source ($binaryAddBlock -match 'means the source content of that path could NOT be established' -and
     $binaryAddBlock -match 'Nobody has told you they are empty') `
     "and every reader-derived reason is described to the model as a file it has not read"
 

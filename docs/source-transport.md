@@ -118,9 +118,8 @@ That last distinction is load-bearing. A change set that declares every path a
 delete is *vacuously* covered and is reviewed on its diff. A change set that only
 looks source-free because the reader called every path's bytes non-text is **not**:
 that is the same host whose misbehaviour lost the line-diff blocks in the first
-place, so if anything left the denominator on the reader's say-so and nothing was
-delivered, the gate refuses with `sourceReadableNothing` instead of passing at a
-vacuous 100%.
+place, so those paths never leave the denominator, and the gate refuses them at
+0% under `sourceCoverageEmpty` rather than passing at a vacuous 100%.
 
 ### Only the change set may shrink the coverage denominator
 
@@ -188,27 +187,36 @@ Both bounds are **code constants, not policy keys** — a consumer config able t
 widen them could re-open the hole they close, and a policy naming one is rejected
 as unknown.
 
-Worked examples, all with the shipped policy:
+Worked examples, all with the shipped policy. Note the coverage percentage counts
+every path the change set did not itself declare source-free, so a reader excusal
+lowers it:
 
-| change set | reader-excused | of those charged | allowance | outcome |
-|---|---|---|---|---|
-| 1 edited file + 3 `.png` | 3 | 0 | 2 | reviewed — the names corroborate |
-| 1 edited file + 40 `.png` | 40 | 0 | 2 | reviewed |
-| 7 edited files + 3 `.png` | 3 | 0 | 3 | reviewed |
-| 1 delivered + 9 mislabelled `.cs` | 9 | 9 | 5 | refused, `readerExcusedShareExceeded` |
-| the same padded with 8 deletes + 8 renames | 9 | 9 | 5 | refused — padding buys nothing |
-| the same padded with 8 `.png` | 17 | 9 | 5 | refused — nor does asset padding |
-| 5 delivered + 5 mislabelled `.cs` | 5 | 5 | 5 | reviewed — exactly at the allowance |
-| 4 delivered + 6 mislabelled `.cs` | 6 | 6 | 5 | refused |
-| 0 delivered + 4 excused | 4 | any | 2 | refused, `sourceReadableNothing` |
+| change set | reader-excused | of those charged | allowance | file % | outcome |
+|---|---|---|---|---|---|
+| 1 edited file + 3 `.png` | 3 | 0 | 2 | 25 | refused — below the coverage floor |
+| 1 edited file + 40 `.png` | 40 | 0 | 2 | 2 | refused |
+| 7 edited files + 3 `.png` | 3 | 0 | 3 | 70 | reviewed |
+| 6 edited files + 4 `.png` | 4 | 0 | 3 | 60 | reviewed — exactly on the floor |
+| 1 delivered + 9 mislabelled `.cs` | 9 | 9 | 5 | 10 | refused, both floors and `readerExcusedShareExceeded` |
+| the same padded with 8 deletes + 8 renames | 9 | 9 | 5 | 10 | refused — padding buys nothing |
+| the same padded with 8 `.png` | 17 | 9 | 5 | 6 | refused — nor does asset padding |
+| 5 delivered + 5 mislabelled `.cs` | 5 | 5 | 5 | 50 | refused — at the allowance, under the floor |
+| 4 delivered + 6 mislabelled `.cs` | 6 | 6 | 5 | 40 | refused |
+| 9 change-set deletes + 1 delivered | 0 | 0 | 2 | 100 | reviewed — the change set's own statement |
+| 0 delivered + 4 reader-excused | 4 | any | 2 | 0 | refused, `sourceCoverageEmpty` |
 
-So a pull request of nothing but assets is still refused — it delivers no source
-at all — and a single text file anywhere in it makes it reviewable again. Paths
-excused either way stay listed in the accounting table and are counted separately
-in the coverage record (`changeSetExcusedFileCount`, `readerExcusedFileCount`,
-`readerExcusedUncorroboratedCount`, `readerExcusedAllowance`), and the human
-preview states the two kinds on separate lines so a reader can see which claim
-came from where.
+So an asset-heavy pull request is refused unless its text files alone clear the
+coverage floor: from this side an icon and a source file the host is lying about
+are the same answer, and only one of them may be believed. An added empty file
+counts against coverage for the same reason — a zero-length payload is a claim by
+the same host that supplies the MIME type, and forging it is no harder.
+
+Paths excused either way stay listed in the accounting table and are counted
+separately in the coverage record (`changeSetExcusedFileCount`,
+`readerExcusedFileCount`, `readerExcusedUncorroboratedCount`,
+`readerExcusedAllowance`), and the human preview states the two kinds on separate
+lines — reader-excused ones as counted in the percentage and among the files
+nobody read — so a reader can see which claim came from where.
 
 The kinds treated as carrying no content are `delete`, `rename`, `sourcerename`,
 `targetrename`, `encoding`, `lock` and `property`. A path is excused only when
@@ -234,11 +242,11 @@ reads remain bounded by `maxFiles` and `maxFetchBytesPerFile`.
 One consequence is worth stating plainly. A pull request consisting of **nothing
 but** assets — an icon set, a fixture directory, a localization bundle — leaves
 every path excused on the reader's say-so, delivers no source at all, and is
-therefore refused under `sourceReadableNothing` rather than reviewed. That is
+therefore refused at 0% under `sourceCoverageEmpty` rather than reviewed. That is
 deliberate and it is the fail-closed side of the rule above: the same shape is
 what a host that lost every line-diff block and mislabelled every MIME type
-produces, and nothing in the response distinguishes them. It has its own reason
-code so an operator reading the log sees *this* case rather than a transport
+produces, and nothing in the response distinguishes them. An operator reading the
+log sees a coverage figure of 0% naming every path, rather than a transport
 fault, and a single text file anywhere in the change set is enough to make the
 pull request reviewable again.
 
@@ -256,14 +264,16 @@ and the extractor does not is the mis-parse it exists to catch.
 
 Both prompts bind the model to that table: it may not report on, clear, or claim
 to have reviewed an `omitted` path, and must describe a `partial` path as
-partially read. Exactly three reasons are exceptions, because they are not gaps
-in what the model was given: `noChangedSpans` (deleted or renamed),
-`binaryNoText` (no line diff and not text) and `emptyFile` (no bytes). Every
-other reason is a file with changed text the model did not get. That set is
-enforced in code — `New-ReviewerSourceFileEntry` refuses to mark a path
-source-free under any other reason — so the flag the gate divides by and the
-sentence the model obeys cannot drift apart. That is what stops structural
-metadata being mistaken for source text.
+partially read. **Exactly one** reason is an exception, because it is the only
+one that is not a gap in what the model was given: `noChangedSpans`, the pull
+request's own statement that it deleted or renamed the path. Every other reason —
+`binaryNoText`, `emptyFile`, `notTextual`, `fileTooLarge`, `spansUnavailable`,
+`decodeRejected`, `transportFailed` — means the source content could not be
+established: a file the model has not read and that nobody has confirmed is
+empty. That sentence is **generated from** the closed set in code rather than
+written beside it, so the prose the model obeys cannot drift from the rule the
+gate applies. That is what stops structural metadata being mistaken for source
+text.
 
 The table is rendered whenever there is any changed path to account for, even
 when nothing at all was delivered. Suppressing it at zero coverage would leave
@@ -291,14 +301,13 @@ report into a pass/fail with explicit reason codes:
 | `sourceCoverageBelowPercentFloor` | covered share of source-bearing files below the policy percentage |
 | `sourceCoverageBelowSpanFloor` | delivered share of changed hunks below the policy percentage |
 | `sourceCoverageUnknown` | the change set could not be established at all |
-| `sourceReadableNothing` | nothing was delivered, and the only reason the denominator is empty is that the reader called every path's bytes unreadable |
-| `readerExcusedShareExceeded` | more paths left the denominator on the reader's say-so than the code ceiling allows |
+| `readerExcusedShareExceeded` | more paths were excused on the reader's unsupported word than the code ceiling allows |
 
-Every percentage is measured against the changed files that actually carry added
-or edited lines. A change set with no source-bearing files at all passes with no
-reason codes **when the change set itself said so** — there was nothing to
-deliver, which is a different thing from having failed to deliver something. When
-the reader is what emptied it, `sourceReadableNothing` is raised instead.
+Every percentage is measured against the changed files the **pull request itself**
+did not declare source-free. A change set with no such files at all passes with
+no reason codes — there was nothing to deliver, which is a different thing from
+having failed to deliver something. A change set the reader alone calls
+source-free keeps every path counted and is refused at 0%.
 
 The span floor exists because a file-level count alone can be gamed by
 arithmetic: a change set where every file delivered one region out of twenty-four

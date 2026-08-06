@@ -50,6 +50,10 @@
       {
         "sha256": "7f12ca11a3424f0023bf6cf257a70c9ecd39e5f441d659776a9d447b30d07be6",
         "reason": "Also state how many of the host's non-text claims the file's own name does not corroborate. That is the subset the allowance actually governs, and without it the preview implied every excluded asset counted against a ceiling it never touched."
+      },
+      {
+        "sha256": "64f2aa99bb0217548df38f7791b00933aacdf31581c9bac7f1673168e6bd59e3",
+        "reason": "Tell the human what the model is now told: a path the host could not read is counted IN the coverage percentage and belongs in the list of files nobody read. The preview said those paths were excluded from the calculation and then omitted them from that list entirely, so four unread source files were described to a human as removed from the sum and named nowhere."
       }
     ],
     "Invoke-ReviewerDelivery": [

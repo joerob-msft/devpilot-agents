@@ -3695,24 +3695,25 @@ function Write-ReviewerPreview {
     [void]$lines.Add("- Findings: $($counts['critical']) critical, $($counts['important']) important, $($counts['suggestion']) suggestion")
     [void]$lines.Add("- Recommended vote: $RecommendedVote")
     if ($null -ne $SourceCoverage) {
-        [void]$lines.Add("- Pinned source coverage: $([int]$SourceCoverage.coveredFiles)/$([int]$SourceCoverage.sourceBearingFileCount) changed file(s) with added or edited lines ($([int]$SourceCoverage.coveragePercent)%), $([int]$SourceCoverage.totalSliceBytes) changed-source byte(s) plus $([int]$SourceCoverage.totalSiblingBytes) byte(s) of unchanged sibling evidence")
+        [void]$lines.Add("- Pinned source coverage: $([int]$SourceCoverage.coveredFiles)/$([int]$SourceCoverage.sourceBearingFileCount) changed file(s) that could carry source text ($([int]$SourceCoverage.coveragePercent)%), $([int]$SourceCoverage.totalSliceBytes) changed-source byte(s) plus $([int]$SourceCoverage.totalSiblingBytes) byte(s) of unchanged sibling evidence")
         # The two kinds of "no source here" are stated separately on purpose. The
         # first is the pull request's own statement about its own change; the
         # second is the host's claim about bytes nobody else has seen, and a
         # human deciding whether to trust this review needs to know which is
         # which rather than reading one merged figure.
         if ([int]$SourceCoverage.changeSetExcusedFileCount -gt 0) {
-            [void]$lines.Add("- $([int]$SourceCoverage.changeSetExcusedFileCount) further changed path(s) have no added or edited text because the pull request itself says so - a delete, a rename, or an empty file")
+            [void]$lines.Add("- $([int]$SourceCoverage.changeSetExcusedFileCount) further changed path(s) are ones the pull request itself says hold no added or edited text - a delete or a rename - so they are outside the percentage above")
         }
         if ([int]$SourceCoverage.readerExcusedFileCount -gt 0) {
-            [void]$lines.Add("- $([int]$SourceCoverage.readerExcusedFileCount) further changed path(s) were excluded because the repository host reported their bytes as non-text; $([int]$SourceCoverage.readerExcusedUncorroboratedCount) of those are not corroborated by the file's own name (allowance for this change set: $([int]$SourceCoverage.readerExcusedAllowance))")
+            [void]$lines.Add("- $([int]$SourceCoverage.readerExcusedFileCount) changed path(s) counted IN the percentage above are ones whose source content the repository host could not establish; nobody has confirmed they are empty, and they were not read")
         }
-        # `carriesSource` is the record's own statement that a path had nothing
-        # to deliver. Filtering on reason strings instead would silently start
-        # listing ordinary deletes and binaries as unread the moment a new
-        # no-source reason is introduced.
+        # A reader-excused path IS an unread file: only the change set's own
+        # statement removes a path from what a human should be told nobody read.
+        # Filtering on carriesSource alone hid four unread source files from this
+        # list while the model-facing block named all four.
         $uncovered = @(@($SourceCoverage.files) | Where-Object {
-                [string]$_.status -ceq 'omitted' -and [bool]$_.carriesSource
+                [string]$_.status -ceq 'omitted' -and
+                ([bool]$_.carriesSource -or [string]$_.noSourceBasis -ceq 'reader')
             })
         if ($uncovered.Count -gt 0) {
             [void]$lines.Add("- Changed files whose source did NOT reach the model: " +
@@ -11936,7 +11937,7 @@ function Invoke-ReviewerCycle {
                 $sourceTransport = Get-ReviewerSourceTransport -Session $session -PrId $prId -SourceCommit $sourceCommit
                 $pinnedSourceText = [string]$sourceTransport.BlockText
                 $sourceCoverageRecord = $sourceTransport.Record
-                Write-Host ("  PR {0} pinned source: {1}/{2} changed file(s) with added or edited lines covered ({3}%), {4} path(s) with no such lines, {5} changed-source byte(s) + {6} sibling byte(s)." -f `
+                Write-Host ("  PR {0} pinned source: {1}/{2} changed file(s) that could carry source text covered ({3}%), {4} path(s) the pull request itself calls source-free, {5} changed-source byte(s) + {6} sibling byte(s)." -f `
                         $prId, $sourceTransport.Report.CoveredFiles, $sourceTransport.Report.SourceBearingFileCount,
                         $sourceTransport.Report.CoveragePercent, $sourceTransport.Report.NoSourceFileCount,
                         $sourceTransport.Report.TotalSliceBytes, $sourceTransport.Report.TotalSiblingBytes) -ForegroundColor Cyan
@@ -11959,7 +11960,7 @@ function Invoke-ReviewerCycle {
                     reasonCodes = @($sourceTransport.Gate.ReasonCodes)
                 }
                 if (-not $sourceTransport.Gate.Ok) {
-                    $coverageReason = "pinned source coverage is insufficient ({0}/{1} changed file(s) with added or edited lines, {2}%): {3}" -f `
+                    $coverageReason = "pinned source coverage is insufficient ({0}/{1} changed file(s) that could carry source text, {2}%): {3}" -f `
                         $sourceTransport.Report.CoveredFiles, $sourceTransport.Report.SourceBearingFileCount,
                         $sourceTransport.Report.CoveragePercent, (@($sourceTransport.Gate.ReasonCodes) -join ', ')
                     Write-Warning "PR $prId not reviewed - $coverageReason"

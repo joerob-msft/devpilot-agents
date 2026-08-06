@@ -846,9 +846,9 @@ function Assert-ReviewerSourceChangeSetAgreement {
     # right-hand lines, and it is perfectly reviewable on its diff: every path
     # is accounted `noChangedSpans` on the change set's own statement and the
     # coverage gate passes with no reason codes. (A change set whose paths only
-    # look source-free because the READER refused their bytes is refused
-    # instead, under `sourceReadableNothing` - but that is the gate's decision,
-    # not this function's.) Throwing here would make whole classes of ordinary
+    # look source-free because the READER refused their bytes stays in the
+    # coverage denominator and is refused there - but that is the gate's
+    # decision, not this function's.) Throwing here would make whole classes of ordinary
     # pull request permanently unreviewable, and - because the cycle treats a
     # transport throw as a skip - one such PR would end the cycle for every PR
     # behind it.
@@ -936,7 +936,12 @@ function Get-ReviewerSourceReaderResult {
     if ([int]$peek.ByteLength -eq 0) {
         # A file with no bytes. There is nothing to slice and nothing to decode,
         # and reporting it as an oversized file sent operators to the wrong
-        # lever while making an added .gitkeep sink a pull request's coverage.
+        # lever.
+        #
+        # It does NOT leave the coverage denominator. A zero-length payload is a
+        # claim by the same host that supplies the MIME type, and forging it is
+        # no harder, so an added .gitkeep does lower a pull request's coverage.
+        # That is the accepted cost of believing only the change set.
         return [pscustomobject]@{ Rejected = "emptyFile"; MimeType = [string]$peek.MimeType; ByteLength = 0 }
     }
     if ([int]$peek.ByteLength -lt 0) {
@@ -1230,14 +1235,11 @@ function New-ReviewerSourceTransportReport {
     }
     $changedFileCount = @($ChangedPaths).Count
     $coveredFileCount = $deliveredFileCount + $partialFileCount
-    # A deleted, renamed, binary or empty path has no right-hand lines, so there
-    # is no source for the transport to deliver and it cannot be "uncovered".
-    # Leaving such paths in the denominator meant a pull request that edits two
-    # files and deletes four scored 33% and was never reviewed - on every cycle,
-    # forever - even though every changed hunk in it had been delivered. Bulk
-    # moves, dead-code removals and asset additions are the most ordinary shapes
-    # there are.
-    $noSourceFileCount = @(@($files) | Where-Object { -not [bool]$_.CarriesSource }).Count
+    # Only what the PULL REQUEST itself declares source-free leaves the
+    # denominator. Anything the reader merely could not read stays counted: its
+    # source was not established, which is not the same as there being nothing
+    # to establish, and letting the host shrink the denominator is how nine
+    # mislabelled files beside one delivered one reported 100%.
     # Split by who said so. A change set that declares every path a delete is
     # vacuously covered; a change set whose paths only LOOK source-free because
     # the reader said their bytes are not text is not, because that is the same
@@ -1419,24 +1421,17 @@ function Test-ReviewerSourceCoverageGate {
         [void]$reasons.Add("sourceCoverageUnknown")
     }
     elseif ([int]$Report.SourceBearingFileCount -lt 1) {
-        # Every path is a delete, a rename or a binary. There is no source to
-        # deliver, so coverage is vacuously complete - which is a different
-        # thing from having failed to deliver source that existed, and must not
-        # be refused as though it were.
+        # Every path is one the pull request ITSELF declared source-free - a
+        # delete or a rename. There is nothing to deliver, so coverage is
+        # vacuously complete, which is a different thing from having failed to
+        # deliver source that existed.
         #
-        # But only the CHANGE SET may put a change set in this state. If any
-        # path left the denominator because the reader called its bytes
-        # unreadable, then a host that both loses the line-diff blocks and
-        # mislabels a MIME type would empty the denominator itself and be
-        # rewarded with a vacuous pass over files nobody read.
-        #
-        # This gets its own reason rather than the generic empty-coverage one.
-        # It is the only refusal that can repeat forever with nothing an
-        # operator can raise or retune - a pull request of nothing but images
-        # lands here legitimately - so it must be legible as itself in the log
-        # rather than looking like a transport fault.
-        if ([int]$Report.ReaderExcusedFileCount -gt 0) { [void]$reasons.Add("sourceReadableNothing") }
-        else { $reasons.Clear() }
+        # Only the change set can put a change set in this state: a
+        # reader-derived excusal no longer leaves the denominator, so
+        # SourceBearingFileCount cannot reach zero while any path was excused on
+        # the host's word. A hostile host that mislabels everything now lands on
+        # sourceCoverageEmpty at 0%, not here.
+        $reasons.Clear()
     }
     else {
         # The floor counts FULLY delivered files. A partially delivered file is
@@ -1581,7 +1576,15 @@ function Format-ReviewerSealedSourceBlock {
         [void]$lines.Add("| $pathCell | $($file.Status) | $reasonText | $deliveredText |")
     }
     [void]$lines.Add("")
-    [void]$lines.Add("You may not claim to have reviewed, verified, or cleared a path whose status is ``omitted``, and you may not treat a ``partial`` path as fully read. Say what you could not see. EXACTLY ONE reason is different: ``noChangedSpans`` means the pull request itself says that path holds no added or edited text - a delete or a rename - so there is nothing in it for anyone to read. Every OTHER reason, including ``binaryNoText``, ``emptyFile``, ``notTextual``, ``fileTooLarge`` and ``spansUnavailable``, means the source content of that path could NOT be established. Those are files you have not read. Nobody has told you they are empty, and you may not treat them as checked.")
+    # Built FROM the constant, never hand-written beside it. An authoritative
+    # comment on a constant nothing reads is worse than no constant: the prose
+    # and the rule could drift, and the prose is what the model obeys.
+    $nothingToRead = @($script:ReviewerSourceNothingToReadReasons | ForEach-Object { "``$_``" })
+    $stillUnread = @(@($script:ReviewerSourceOmissionReasons | Where-Object {
+                $script:ReviewerSourceNothingToReadReasons -cnotcontains $_ -and
+                $_ -cnotin @('pathRejected', 'fileCountCapExceeded', 'budgetExhausted', 'sliceCountCapExceeded', 'spanOutsideFile', 'unsafeSliceText')
+            }) | ForEach-Object { "``$_``" })
+    [void]$lines.Add("You may not claim to have reviewed, verified, or cleared a path whose status is ``omitted``, and you may not treat a ``partial`` path as fully read. Say what you could not see. EXACTLY $($nothingToRead.Count) reason is different: $($nothingToRead -join ', ') means the pull request itself says that path holds no added or edited text - a delete or a rename - so there is nothing in it for anyone to read. Every OTHER reason, including $($stillUnread -join ', '), means the source content of that path could NOT be established. Those are files you have not read. Nobody has told you they are empty, and you may not treat them as checked.")
     [void]$lines.Add("")
     [void]$lines.Add("Slices marked ``kind: sibling`` are UNCHANGED lines from the same file, delivered next to the change so you can see what this file's existing members already do. They are evidence of established practice; they are not part of this pull request and you must never report a finding on them.")
     [void]$lines.Add("")
