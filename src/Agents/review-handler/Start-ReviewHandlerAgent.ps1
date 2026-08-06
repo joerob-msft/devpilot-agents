@@ -94,6 +94,16 @@ param(
     [switch]$EnableThreadReplies,
     [switch]$EnableBuddyRequeue,
     [switch]$EnableTeamsNotifications,
+
+    # Authoritative over config.teamsNotifications.directAuthor.recipientUpn,
+    # for the same reason -OperatorAlias overrides its config counterpart: a
+    # checked-in file should not name an individual, and the recipient is a
+    # property of who is running the agent rather than of the repository.
+    #
+    # Microsoft Graph cannot create a one-on-one chat between the signed-in
+    # user and themselves, so this must be a different person than whoever the
+    # agent authenticates as.
+    [string]$TeamsRecipientUpn,
     [switch]$EnableAutoComplete,
     [switch]$LocalValidation,
     [switch]$ResumeCodingSession,
@@ -652,6 +662,12 @@ $TeamsDirectEvents = Get-AgentConfigStringArray -Object $teamsDirectCfg -Name "e
 $TeamsDirectRecipient = ""
 $directRecipientProp = $teamsDirectCfg.PSObject.Properties["recipientUpn"]
 if ($directRecipientProp -and $directRecipientProp.Value -is [string]) { $TeamsDirectRecipient = ([string]$directRecipientProp.Value).Trim() }
+# The command line wins, so a repository can ship directAuthor.enabled = true
+# without naming a person in a checked-in file.
+if ($PSBoundParameters.ContainsKey('TeamsRecipientUpn')) { $TeamsDirectRecipient = $TeamsRecipientUpn.Trim() }
+if ($TeamsDirectRecipient -and $TeamsDirectRecipient -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
+    throw "Teams direct recipient '$TeamsDirectRecipient' is not a valid UPN."
+}
 
 foreach ($evt in (@($TeamsChannelEvents) + @($TeamsDirectEvents))) {
     if ($TeamsSupportedEvents -cnotcontains $evt) {
@@ -674,7 +690,7 @@ if ($EnableTeamsNotifications) {
     }
     if ($TeamsDirectEnabled) {
         if ([string]::IsNullOrWhiteSpace($TeamsDirectRecipient)) {
-            throw ("config.teamsNotifications.directAuthor is enabled but recipientUpn is empty. Set it to the UPN to message. " +
+            throw ("config.teamsNotifications.directAuthor is enabled but no recipient is set. Pass -TeamsRecipientUpn <upn>, or populate config.teamsNotifications.directAuthor.recipientUpn. " +
                 "Note: Microsoft Graph cannot create a one-on-one chat with yourself, so this must be a different person than the signed-in user.")
         }
         if (@($TeamsDirectEvents).Count -eq 0) {

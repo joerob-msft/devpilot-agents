@@ -165,6 +165,22 @@ param(
     [switch]$EnableSummaryComment,
     [switch]$EnableApprovalVote,
 
+    # Out-of-band notification. Like every other capability here, checked-in
+    # config alone never enables it: the operator must pass this switch AND the
+    # config must name at least one enabled destination, or startup fails.
+    [switch]$EnableTeamsNotifications,
+
+    # Who the direct message goes to. Authoritative over
+    # config.teamsNotifications.directAuthor.recipientUpn, for the same reason
+    # -OperatorAlias overrides its config counterpart: a checked-in file should
+    # not name an individual, and the recipient is a property of who is running
+    # the agent rather than of the repository.
+    #
+    # Microsoft Graph cannot create a one-on-one chat between the signed-in user
+    # and themselves, so this must be a different person than whoever the agent
+    # authenticates as.
+    [string]$TeamsRecipientUpn,
+
     # Operator controls for busy repositories and unattended hosts.
     # Each PR costs one full model run, so the per-cycle count is bounded and
     # low by default; a repository with 70 open PRs must not turn one cycle
@@ -1331,9 +1347,110 @@ if ($repoConvProp -and $repoConvProp.Value) {
     if ($convLines.Count -gt 0) { $RepoConventionsText = ($convLines.ToArray() -join "`n") }
 }
 
+# ---------------------------------------------------------------------------
+# Teams notifications
+#
+# An unattended reviewer is exactly the case where out-of-band signal matters:
+# an agent looping without accomplishing anything looks identical to an agent
+# with nothing to do, and nobody reads a state file on a hunch.
+#
+# Checked-in config alone NEVER delivers anything. The operator must also pass
+# -EnableTeamsNotifications. When that switch IS passed but nothing is
+# configured, startup fails rather than running a whole pilot while the
+# operator believes notifications are being delivered.
+# ---------------------------------------------------------------------------
+$TeamsSupportedEventNames = @('reviewCompleted', 'reviewFailed', 'previewReady', 'candidateStarved')
+
+$teamsCfg = Get-AgentConfigObject -Object $Cfg -Name "teamsNotifications" -Where "config"
+$TeamsSupportedEvents = Get-AgentConfigStringArray -Object $teamsCfg -Name "supportedEvents" -Where "config.teamsNotifications"
+$teamsChannelCfg = Get-AgentConfigObject -Object $teamsCfg -Name "channel" -Where "config.teamsNotifications"
+$TeamsChannelEnabled = Get-AgentConfigBool -Object $teamsChannelCfg -Name "enabled" -Where "config.teamsNotifications.channel"
+$TeamsTeamId = Get-AgentConfigString -Object $teamsChannelCfg -Name "teamId" -Where "config.teamsNotifications.channel" -MaxLength 256 -AllowEmpty
+$TeamsChannelId = Get-AgentConfigString -Object $teamsChannelCfg -Name "channelId" -Where "config.teamsNotifications.channel" -MaxLength 256 -AllowEmpty
+$TeamsChannelEvents = Get-AgentConfigStringArray -Object $teamsChannelCfg -Name "events" -Where "config.teamsNotifications.channel"
+$teamsDirectCfg = Get-AgentConfigObject -Object $teamsCfg -Name "directAuthor" -Where "config.teamsNotifications"
+$TeamsDirectEnabled = Get-AgentConfigBool -Object $teamsDirectCfg -Name "enabled" -Where "config.teamsNotifications.directAuthor"
+$TeamsDirectEvents = Get-AgentConfigStringArray -Object $teamsDirectCfg -Name "events" -Where "config.teamsNotifications.directAuthor"
+$TeamsDirectRecipient = ""
+$teamsDirectRecipientProp = $teamsDirectCfg.PSObject.Properties["recipientUpn"]
+if ($teamsDirectRecipientProp -and $teamsDirectRecipientProp.Value -is [string]) {
+    $TeamsDirectRecipient = ([string]$teamsDirectRecipientProp.Value).Trim()
+}
+# The command line wins, so a repository can ship directAuthor.enabled = true
+# without naming a person in a checked-in file.
+if ($PSBoundParameters.ContainsKey('TeamsRecipientUpn')) {
+    $TeamsDirectRecipient = $TeamsRecipientUpn.Trim()
+}
+if ($TeamsDirectRecipient -and $TeamsDirectRecipient -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
+    throw "Teams direct recipient '$TeamsDirectRecipient' is not a valid UPN."
+}
+
+# An event this agent never raises would be configured, look enabled, and
+# deliver nothing - the exact failure this whole section exists to prevent.
+foreach ($evt in @($TeamsSupportedEvents)) {
+    if ($TeamsSupportedEventNames -cnotcontains $evt) {
+        throw "config.teamsNotifications.supportedEvents contains '$evt', which this agent never raises. Supported events: $($TeamsSupportedEventNames -join ', ')."
+    }
+}
+foreach ($evt in (@($TeamsChannelEvents) + @($TeamsDirectEvents))) {
+    if ($TeamsSupportedEvents -cnotcontains $evt) {
+        throw "config.teamsNotifications events contain '$evt', which is not in supportedEvents ($($TeamsSupportedEvents -join ', '))."
+    }
+}
+
+if ($EnableTeamsNotifications) {
+    # Channel and direct message are INDEPENDENT destinations: either alone is
+    # a valid configuration, so only validate the ones actually enabled.
+    if (-not $TeamsChannelEnabled -and -not $TeamsDirectEnabled) {
+        throw "-EnableTeamsNotifications was passed but neither config.teamsNotifications.channel.enabled nor .directAuthor.enabled is true. Enable at least one destination, or drop the switch."
+    }
+    if ($TeamsChannelEnabled) {
+        if ([string]::IsNullOrWhiteSpace($TeamsTeamId) -or [string]::IsNullOrWhiteSpace($TeamsChannelId)) {
+            throw "config.teamsNotifications.channel is enabled but teamId/channelId are empty. Populate them, or disable the channel destination."
+        }
+        if (@($TeamsChannelEvents).Count -eq 0) {
+            throw "config.teamsNotifications.channel is enabled but its events list is empty, so nothing would ever be sent there."
+        }
+    }
+    if ($TeamsDirectEnabled) {
+        if ([string]::IsNullOrWhiteSpace($TeamsDirectRecipient)) {
+            throw ("config.teamsNotifications.directAuthor is enabled but no recipient is set. Pass -TeamsRecipientUpn <upn>, " +
+                "or populate config.teamsNotifications.directAuthor.recipientUpn. " +
+                "Note: Microsoft Graph cannot create a one-on-one chat with yourself, so this must be a different person than the signed-in user.")
+        }
+        if (@($TeamsDirectEvents).Count -eq 0) {
+            throw "config.teamsNotifications.directAuthor is enabled but its events list is empty, so nothing would ever be sent there."
+        }
+    }
+}
+
 $permissions = Get-AgentConfigObject -Object $Cfg -Name "permissions" -Where "config"
 $ConfigAllowTools = Get-AgentConfigStringArray -Object $permissions -Name "allowTools" -Where "config.permissions"
 $ConfigDenyTools = Get-AgentConfigStringArray -Object $permissions -Name "denyTools" -Where "config.permissions"
+
+# A key this agent does not read is silently inert, which is how a config comes
+# to look enabled while delivering nothing. Reject unrecognized keys instead, so
+# a config that cannot work says so at startup rather than at no point at all.
+#
+# Documentation keys are exempt by shape: '_'-prefixed, or ending in 'note' /
+# 'Note'. They plainly do not claim to enable anything, and configs use them
+# heavily to record intent next to the setting they describe.
+$RecognizedConfigKeys = @(
+    'schemaVersion', 'provider', 'platform', 'repository', 'customAgent', 'promptFile',
+    'stateNamespace', 'operator', 'timing', 'review', 'threadClassification',
+    'repoConventions', 'teamsNotifications', 'permissions'
+)
+$unrecognizedConfigKeys = @(
+    $Cfg.PSObject.Properties.Name |
+    Where-Object { $RecognizedConfigKeys -cnotcontains $_ } |
+    Where-Object { -not ($_.StartsWith('_') -or $_ -cmatch '[Nn]ote$') }
+)
+if ($unrecognizedConfigKeys.Count -gt 0) {
+    throw ("config contains key(s) this agent does not read: $($unrecognizedConfigKeys -join ', '). " +
+        "They would have no effect, so a setting placed there would look configured and do nothing. " +
+        "Recognized keys: $($RecognizedConfigKeys -join ', '). " +
+        "For a comment, use a key ending in 'note' or prefixed with '_'.")
+}
 
 # Fail closed: config allow-lists may NARROW the ceiling but never widen it,
 # and may never name a mandatory-denied tool.
@@ -1413,6 +1530,7 @@ $logPath = Join-Path $logDir "reviewer.log.jsonl"
 $lockPath = Join-Path $StateDir "agent.lock"
 $reviewedStatePath = Join-Path $StateDir "reviewed.json"
 $attemptsStatePath = Join-Path $StateDir "attempts.json"
+$notificationsStatePath = Join-Path $StateDir "notifications.json"
 $artifactKeyPath = Join-Path $StateDir "artifact-signing.key"
 
 $ScriptSelfSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
@@ -1903,7 +2021,7 @@ function Set-ReviewerVote {
 
 function Invoke-DryRunSelfChecks {
     $failures = New-Object System.Collections.Generic.List[string]
-    $total = 20
+    $total = 22
 
     Write-Host "[DRY-RUN] Self-check 1/$total : parser validity + prompt presence" -ForegroundColor Cyan
     foreach ($p in @($PSCommandPath, $HarnessPath)) {
@@ -2972,6 +3090,100 @@ function Invoke-DryRunSelfChecks {
         else { Write-Host "  OK - an unreadable change set blocks publication but not the preview" -ForegroundColor Green }
     }
 
+    Write-Host "[DRY-RUN] Self-check 21/$total : Teams notification gating cannot silently do nothing" -ForegroundColor Cyan
+    # Every failure this checks for is silent by nature: an operator who thinks
+    # notifications are on, and no message that ever arrives to contradict them.
+    $teamsFailures = @()
+
+    # 1. The switch must be validated against config at STARTUP, not at the
+    #    first event - a pilot that only discovers this hours later has already
+    #    missed the notifications it was run for.
+    foreach ($guard in @(
+            '-EnableTeamsNotifications was passed but neither',
+            'channel is enabled but teamId/channelId are empty',
+            'is enabled but its events list is empty',
+            'no recipient is set')) {
+        if ($selfText -cnotmatch [regex]::Escape($guard)) {
+            $teamsFailures += "startup validation is missing the guard: '$guard'"
+        }
+    }
+
+    # 2. Destinations must be INDEPENDENT. A shared try, or a single combined
+    #    condition, means one broken destination silences the other.
+    $notifyAt = & $declOf 'Send-ReviewerTeamsNotification'
+    if ($notifyAt -lt 0) { $teamsFailures += "Send-ReviewerTeamsNotification was not found." }
+    else {
+        $notifySlice = $selfText.Substring($notifyAt, [Math]::Min(4500, $selfText.Length - $notifyAt))
+        if ($notifySlice -cnotmatch '\$wantChannel\s*=' -or $notifySlice -cnotmatch '\$wantDirect\s*=') {
+            $teamsFailures += "channel and direct destinations are not evaluated independently."
+        }
+        if (([regex]::Matches($notifySlice, 'catch \{ Write-Warning "Teams')).Count -lt 2) {
+            $teamsFailures += "a failure in one destination is not isolated from the other."
+        }
+        # 3. The dedupe record must be written only after something was actually
+        #    accepted, or a total failure is remembered as a success and never
+        #    retried.
+        if ($notifySlice -cnotmatch '\$delivered\.Count -gt 0') {
+            $teamsFailures += "the dedupe record is not gated on at least one successful delivery."
+        }
+        # 4. A notification failure must never fail the review that succeeded.
+        if ($notifySlice -cnotmatch 'review work is unaffected') {
+            $teamsFailures += "a notification failure is not explicitly isolated from review work."
+        }
+    }
+
+    # 5. Every event this agent can raise must be declared, and every declared
+    #    event must be raisable. A name on only one side is config that looks
+    #    enabled and delivers nothing.
+    $raisedEvents = @([regex]::Matches($selfText, "-NotificationEvent '(\w+)'") | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+    $declaredEvents = @($TeamsSupportedEventNames | Sort-Object)
+    foreach ($e in $raisedEvents) {
+        if ($declaredEvents -cnotcontains $e) { $teamsFailures += "event '$e' is raised but not declared in TeamsSupportedEventNames." }
+    }
+    foreach ($e in $declaredEvents) {
+        if ($raisedEvents -cnotcontains $e) { $teamsFailures += "event '$e' is declared but never raised, so subscribing to it would deliver nothing." }
+    }
+
+    # 6. Links must be wrapper-built. A model-supplied URL in an outbound
+    #    message is a destination a human is inclined to trust.
+    $linkAt = & $declOf 'Get-ReviewerPullRequestLink'
+    if ($linkAt -lt 0) { $teamsFailures += "Get-ReviewerPullRequestLink was not found." }
+    else {
+        $linkSlice = $selfText.Substring($linkAt, [Math]::Min(900, $selfText.Length - $linkAt))
+        if ($linkSlice -cnotmatch '\$Organization' -or $linkSlice -cnotmatch '\$RepositoryName') {
+            $teamsFailures += "the pull-request link is not built from wrapper-validated config."
+        }
+    }
+
+    if ($teamsFailures.Count -gt 0) { foreach ($tf in $teamsFailures) { $failures.Add("Teams notifications: $tf") } }
+    else {
+        Write-Host "  OK - the switch fails closed at startup, destinations are independent, dedupe requires a real delivery, and declared events match raised events exactly" -ForegroundColor Green
+    }
+
+    Write-Host "[DRY-RUN] Self-check 22/$total : an unreadable config key is rejected, not ignored" -ForegroundColor Cyan
+    # A key the agent does not read is inert. Ignoring it is how a config comes
+    # to look configured while doing nothing - exactly what happened when a
+    # teamsNotifications block was added to an agent with no notification code
+    # path: -DryRun exited 0 and nothing was ever delivered.
+    $keyFailures = @()
+    if ($selfText -cnotmatch '\$RecognizedConfigKeys\s*=') { $keyFailures += "no recognized-key list exists." }
+    if ($selfText -cnotmatch 'config contains key\(s\) this agent does not read') { $keyFailures += "an unrecognized key does not throw." }
+    # Documentation keys must stay allowed, or every explanatory note in a
+    # consumer's config becomes a startup failure.
+    foreach ($docKey in @('teamsNotificationsNote', '_comment', 'note')) {
+        if (-not ($docKey.StartsWith('_') -or $docKey -cmatch '[Nn]ote$')) {
+            $keyFailures += "'$docKey' should be treated as documentation but is not."
+        }
+    }
+    # And a real typo must NOT be waved through as documentation.
+    foreach ($typo in @('teamsNotification', 'permission', 'reviewX')) {
+        if ($typo.StartsWith('_') -or $typo -cmatch '[Nn]ote$') {
+            $keyFailures += "'$typo' would be wrongly exempted as documentation."
+        }
+    }
+    if ($keyFailures.Count -gt 0) { foreach ($kf in $keyFailures) { $failures.Add("Config key strictness: $kf") } }
+    else { Write-Host "  OK - unrecognized keys throw, documentation keys are exempt by shape, and a typo is not mistaken for a comment" -ForegroundColor Green }
+
     Write-Host ""
     if ($failures.Count -eq 0) {
         Write-Host "[DRY-RUN] All $total self-checks passed." -ForegroundColor Green
@@ -3292,6 +3504,99 @@ function Invoke-ReviewerDelivery {
     return $outcome
 }
 
+function Get-ReviewerPullRequestLink {
+    <#
+        Built ONLY from wrapper-validated config (organization / project /
+        repository, all regex-validated at config load) plus the wrapper's own
+        numeric PR id. Never from a model-supplied URL: a link in an outbound
+        message is a place a fabricated destination could otherwise reach a
+        human who is inclined to trust it.
+    #>
+    param([Parameter(Mandatory)][int]$PrId)
+    if ($PrId -le 0) { return "" }
+    return "https://dev.azure.com/$Organization/$ExpectedProject/_git/$RepositoryName/pullrequest/$PrId"
+}
+
+function Send-ReviewerTeamsNotification {
+    <#
+        Delivers one notification to every enabled destination that subscribes
+        to this event.
+
+        Three properties matter here, all learned the hard way:
+
+        Destinations are INDEPENDENT. One failing must not suppress the other,
+        so each send is wrapped separately rather than sharing a try.
+
+        Delivery is DEDUPED on (event, PR, source commit). The reviewer loops,
+        and a repeated cycle over unchanged state must not re-notify. The
+        dedupe record is written only when at least one destination actually
+        accepted the message, so a total failure is retried next cycle rather
+        than being recorded as delivered.
+
+        Failure is a WARNING, never a cycle failure. A missed notification must
+        not fail a review that already succeeded, or mark a PR as needing
+        another attempt.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('reviewCompleted', 'reviewFailed', 'previewReady', 'candidateStarved')][string]$NotificationEvent,
+        [Parameter(Mandatory)][string]$AgencyPath,
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string]$Body,
+        [int]$PrId = 0,
+        [string]$SourceCommit = "",
+        [string[]]$Links = @()
+    )
+    if (-not $EnableTeamsNotifications) { return }
+    $wantChannel = $TeamsChannelEnabled -and ($TeamsChannelEvents -ccontains $NotificationEvent)
+    $wantDirect = $TeamsDirectEnabled -and ($TeamsDirectEvents -ccontains $NotificationEvent)
+    if (-not $wantChannel -and -not $wantDirect) { return }
+
+    $dedupeKey = "$NotificationEvent|$PrId|$SourceCommit"
+    $notifState = Get-JsonState -Path $notificationsStatePath
+    if ($notifState.ContainsKey($dedupeKey)) {
+        Write-Host "Teams '$NotificationEvent' already delivered for this PR/commit; skipping." -ForegroundColor DarkGray
+        return
+    }
+
+    $workIqSession = $null
+    $delivered = New-Object System.Collections.Generic.List[string]
+    try {
+        $workIqSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "workiq" -TimeoutSeconds 60
+        if ($wantChannel) {
+            try {
+                Send-AgentTeamsChannelMessage -Session $workIqSession -TeamId $TeamsTeamId -ChannelId $TeamsChannelId `
+                    -Title $Title -Body $Body -Links $Links | Out-Null
+                [void]$delivered.Add("channel")
+            }
+            catch { Write-Warning "Teams '$NotificationEvent' channel delivery failed: $($_.Exception.Message)" }
+        }
+        if ($wantDirect) {
+            try {
+                Send-AgentTeamsDirectMessage -Session $workIqSession -RecipientUpn $TeamsDirectRecipient `
+                    -Title $Title -Body $Body -Links $Links | Out-Null
+                [void]$delivered.Add("direct")
+            }
+            catch { Write-Warning "Teams '$NotificationEvent' direct delivery failed: $($_.Exception.Message)" }
+        }
+        if ($delivered.Count -gt 0) {
+            $notifState[$dedupeKey] = @{
+                event        = $NotificationEvent
+                prId         = $PrId
+                destinations = @($delivered.ToArray())
+                at           = (Get-Date).ToUniversalTime().ToString("o")
+            }
+            Set-JsonState -Path $notificationsStatePath -State $notifState
+            Write-Host "Teams '$NotificationEvent' delivered to: $($delivered.ToArray() -join ', ')." -ForegroundColor Green
+        }
+    }
+    catch {
+        Write-Warning "Teams '$NotificationEvent' notification failed (review work is unaffected): $($_.Exception.Message)"
+    }
+    finally {
+        if ($workIqSession) { Close-AgentMcpSession -Session $workIqSession }
+    }
+}
+
 function Invoke-ReviewerPullRequest {
     <#
         Reviews exactly one bound pull request: one model run, then the
@@ -3407,6 +3712,13 @@ function Invoke-ReviewerPullRequest {
             cycle = $CycleNumber; mode = "live"; result = "failed"; prId = $prId
             reason = $reason; environmentFault = [bool]$launchFailureReason
         }
+        # An environment fault is the operator's own machine, not a bad PR, and
+        # it is exempt from starvation accounting for that reason - but it is
+        # exactly the thing an unattended operator most needs to hear about.
+        Send-ReviewerTeamsNotification -NotificationEvent 'reviewFailed' -AgencyPath $AgencyPath `
+            -Title "Review failed on PR $prId" `
+            -Body ("$reason" + $(if ($launchFailureReason) { " This is an environment fault on the agent host, not a problem with the pull request." } else { "" })) `
+            -PrId $prId -SourceCommit $sourceCommit -Links @(Get-ReviewerPullRequestLink -PrId $prId)
         return @{ ExitCode = 1; Summary = "PR $prId failed: $reason" }
     }
 
@@ -3559,6 +3871,26 @@ function Invoke-ReviewerPullRequest {
     # A write that was requested and did not land is a cycle failure: it drives
     # the backoff and is retried. An aborted delivery (the PR moved on) is not.
     $exit = if ($postFailures -gt 0 -or ($writesRequested -and -not $delivery.Delivered -and -not $delivery.Aborted)) { 1 } else { 0 }
+
+    # Two different things happened, so they are two different events. A run
+    # that posted is news about someone else's PR; a run that only previewed is
+    # a request for the operator's attention before anything is published.
+    $prLink = Get-ReviewerPullRequestLink -PrId $prId
+    if ($postedCount -gt 0 -or $summaryPosted -or $castVote) {
+        Send-ReviewerTeamsNotification -NotificationEvent 'reviewCompleted' -AgencyPath $AgencyPath `
+            -Title "Review posted on PR $prId" `
+            -Body ("$($allFindings.Count) finding(s): $($counts['critical']) critical, $($counts['important']) important, $($counts['suggestion']) suggestion. " +
+                "$postedCount posted, $($withheld.Count) withheld by config. Vote: $(if ($castVote) { $castVote } else { 'none' }).") `
+            -PrId $prId -SourceCommit $sourceCommit -Links @($prLink)
+    }
+    elseif ($allFindings.Count -gt 0) {
+        Send-ReviewerTeamsNotification -NotificationEvent 'previewReady' -AgencyPath $AgencyPath `
+            -Title "Preview ready for PR $prId" `
+            -Body ("$($allFindings.Count) finding(s) were produced but nothing was posted: $($counts['critical']) critical, $($counts['important']) important, $($counts['suggestion']) suggestion. " +
+                "Read the preview, then publish it with -PromotePreview. Preview: $previewPath") `
+            -PrId $prId -SourceCommit $sourceCommit -Links @($prLink)
+    }
+
     return @{ ExitCode = $exit; Summary = "PR $prId reviewed ($($allFindings.Count) finding(s), $postedCount posted)" }
 }
 
@@ -3929,6 +4261,15 @@ function Invoke-ReviewerCycle {
             $attempts = if ($attemptRecord -is [int]) { [int]$attemptRecord } else { [int](Get-ReviewerHashValue -Container $attemptRecord -Key 'count' -Default 0) }
             if ($attempts -ge $ConsecutiveFailureThreshold) {
                 Write-Host "  PR $prId skipped (starved: $attempts consecutive failures). Clear with -ResetStarvedCandidates." -ForegroundColor DarkYellow
+                # The most valuable notification this agent sends. A starved PR
+                # is silent by construction: the loop keeps running, exits 0,
+                # and reviews nothing - indistinguishable from having no work,
+                # unless somebody happens to read the state file.
+                Send-ReviewerTeamsNotification -NotificationEvent 'candidateStarved' -AgencyPath $AgencyPath `
+                    -Title "PR $prId is starved and will be skipped" `
+                    -Body ("$attempts consecutive failures reached the threshold of $ConsecutiveFailureThreshold, so this pull request is no longer being attempted. " +
+                        "The agent keeps running and will look otherwise healthy. Investigate, then clear it with -ResetStarvedCandidates.") `
+                    -PrId $prId -Links @(Get-ReviewerPullRequestLink -PrId $prId)
                 continue
             }
 
