@@ -52,13 +52,21 @@ function Get-FunctionAstFromWrapper {
             }, $true) | Select-Object -First 1)
 }
 
+function Split-WrapperVariableName {
+    <# `$local:x`, `$private:x` and `$x` are the same variable to the engine but
+       different UserPaths to the parser, so a scoped write walks past a pin that
+       compares the whole path. Only the last segment identifies the variable. #>
+    param([Parameter(Mandatory)][string]$Path)
+    return ($Path -split ':')[-1]
+}
+
 function Measure-WrapperVariableWrite {
     <# A text assertion constrains the lines that exist; it cannot bound lines
        ADDED beside them. Appending a second write to the same line - or, since
-       PowerShell variable names are case-insensitive and may be braced or set
-       indirectly, a differently spelled write anywhere below - leaves every
-       pinned string intact while the model is handed a constant. So the number
-       of writes is counted from the AST rather than matched in text. #>
+       PowerShell variable names are case-insensitive and may be braced, scoped
+       or set indirectly, a differently spelled write anywhere below - leaves
+       every pinned string intact while the model is handed a constant. So the
+       number of writes is counted from the AST rather than matched in text. #>
     param([Parameter(Mandatory)]$FunctionAst, [Parameter(Mandatory)][string]$Name)
     $direct = @($FunctionAst.FindAll({
                 param($candidate)
@@ -66,9 +74,10 @@ function Measure-WrapperVariableWrite {
             }, $true) | Where-Object {
             @($_.Left.FindAll({
                         param($inner)
-                        $inner -is [Management.Automation.Language.VariableExpressionAst] -and
-                        $inner.VariablePath.UserPath -eq $Name
-                    }, $true)).Count -gt 0
+                        $inner -is [Management.Automation.Language.VariableExpressionAst]
+                    }, $true) | Where-Object {
+                    (Split-WrapperVariableName -Path $_.VariablePath.UserPath) -eq $Name
+                }).Count -gt 0
         })
     $indirect = @($FunctionAst.FindAll({
                 param($candidate)
@@ -77,6 +86,57 @@ function Measure-WrapperVariableWrite {
                 $candidate.Extent.Text -match [regex]::Escape($Name)
             }, $true))
     return (@($direct).Count + @($indirect).Count)
+}
+
+function Measure-WrapperIndirectWrite {
+    <# The counts above are per-variable, so they cannot see a write whose target
+       is decided at runtime: `Set-Variable -Name $n`, a splatted `@sv`,
+       `New-Item Variable:`, a `[ref]` handle, or
+       `$ExecutionContext.SessionState.PSVariable.Set(...)`. None of these belongs
+       in either function, so the expected count is zero and the shape is banned
+       outright rather than pinned per name. #>
+    param([Parameter(Mandatory)]$FunctionAst)
+    $commands = @($FunctionAst.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.CommandAst] -and
+                @('Set-Variable', 'New-Variable', 'Remove-Variable', 'Clear-Variable', 'Set-Item', 'New-Item', 'Invoke-Expression') -contains $candidate.GetCommandName()
+            }, $true))
+    $refCasts = @($FunctionAst.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.ConvertExpressionAst] -and
+                $candidate.Type.TypeName.Name -eq 'ref'
+            }, $true))
+    $sessionState = @($FunctionAst.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.MemberExpressionAst] -and
+                $candidate.Member.Extent.Text -eq 'PSVariable'
+            }, $true))
+    return (@($commands).Count + @($refCasts).Count + @($sessionState).Count)
+}
+
+function Get-WrapperMemberWriteTargets {
+    <# Every variable whose member or index is written inside a function. A
+       per-variable pin cannot see an aliasing write - `$a = $sourceTransport`
+       followed by `$a.Gate.Ok = $true` - so the whole SET of mutated names is
+       pinned instead, and a new one has to be declared here to pass. #>
+    param([Parameter(Mandatory)]$FunctionAst)
+    $names = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($node in $FunctionAst.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.AssignmentStatementAst] -and
+                ($candidate.Left -is [Management.Automation.Language.MemberExpressionAst] -or
+                $candidate.Left -is [Management.Automation.Language.IndexExpressionAst])
+            }, $true)) {
+        foreach ($variable in $node.Left.FindAll({
+                    param($inner)
+                    $inner -is [Management.Automation.Language.VariableExpressionAst]
+                }, $true)) {
+            [void]$names.Add((Split-WrapperVariableName -Path $variable.VariablePath.UserPath))
+        }
+    }
+    # The comma keeps an empty set from unrolling to $null on the way out; call
+    # sites must assign it directly rather than wrapping it in @().
+    return , ([string[]]@($names))
 }
 
 function Measure-WrapperMemberWrite {
@@ -92,9 +152,10 @@ function Measure-WrapperMemberWrite {
             }, $true) | Where-Object {
             @($_.Left.FindAll({
                         param($inner)
-                        $inner -is [Management.Automation.Language.VariableExpressionAst] -and
-                        $inner.VariablePath.UserPath -eq $Name
-                    }, $true)).Count -gt 0
+                        $inner -is [Management.Automation.Language.VariableExpressionAst]
+                    }, $true) | Where-Object {
+                    (Split-WrapperVariableName -Path $_.VariablePath.UserPath) -eq $Name
+                }).Count -gt 0
         }).Count
 }
 
@@ -102,7 +163,9 @@ function Measure-AstGuardDepth {
     <# How many conditions stand between a statement and its function. Pinning
        a guard's condition, message and `throw` in text is not enough: wrapping
        the whole guard in `if ($false) { ... }` leaves all three intact and
-       skips it. #>
+       skips it, and wrapping it in `try { ... } catch { }` swallows the refusal
+       just as completely. A `try` with no catch clause changes nothing about
+       whether the throw escapes, so only a catching one counts. #>
     param([Parameter(Mandatory)]$Node, [Parameter(Mandatory)]$StopAt)
     $depth = 0
     $walker = $Node.Parent
@@ -111,6 +174,8 @@ function Measure-AstGuardDepth {
             $walker -is [Management.Automation.Language.SwitchStatementAst] -or
             $walker -is [Management.Automation.Language.WhileStatementAst] -or
             $walker -is [Management.Automation.Language.ForEachStatementAst]) { $depth++ }
+        elseif ($walker -is [Management.Automation.Language.TryStatementAst] -and
+            @($walker.CatchClauses).Count -gt 0) { $depth++ }
         $walker = $walker.Parent
     }
     return $depth
@@ -759,6 +824,20 @@ Assert-Source ((Measure-WrapperMemberWrite -FunctionAst $transportAst -Name 'rep
     "no line mutates a member of the report, so the gate cannot be computed honestly over doctored coverage figures"
 Assert-Source ((Measure-WrapperMemberWrite -FunctionAst $cycleAst -Name 'sourceTransport') -eq 0) `
     "and no line mutates a member of the transport result after the gate decided"
+# Per-variable counts cannot see an alias (`$a = $report; $a.CoveredFiles = ...`)
+# or a target chosen at runtime. So the whole set of member-mutated names is
+# pinned, and every indirect write shape is banned outright.
+$transportMemberTargets = Get-WrapperMemberWriteTargets -FunctionAst $transportAst
+Assert-Source ($transportMemberTargets.Count -eq 0) `
+    "nothing inside the transport mutates any object's member, so no alias can reach the report"
+$cycleMemberTargets = Get-WrapperMemberWriteTargets -FunctionAst $cycleAst
+$expectedCycleMemberTargets = @('result', 'factFailureInputs', 'domainName', 'attemptsState', 'prId', 'item')
+Assert-Source (@($cycleMemberTargets | Where-Object { $expectedCycleMemberTargets -notcontains $_ }).Count -eq 0 -and
+    $cycleMemberTargets.Count -eq $expectedCycleMemberTargets.Count) `
+    "and the cycle mutates only its own bookkeeping objects - a new one has to be declared here, so an alias of the transport result cannot appear silently"
+Assert-Source ((Measure-WrapperIndirectWrite -FunctionAst $transportAst) -eq 0 -and
+    (Measure-WrapperIndirectWrite -FunctionAst $cycleAst) -eq 0) `
+    "and neither function writes a variable indirectly - no Set-Variable, no New-Item Variable:, no [ref] handle, no PSVariable.Set - so the counts above cannot be evaded by choosing the target at runtime"
 Assert-Source ($cycleText -match 'PinnedSourceText\s*=\s*\$pinnedSourceText') `
     "and it is bound onto the reviewed pull request rather than dropped"
 Assert-Source ($cycleText -match 'SourceCoverage\s*=\s*\$sourceCoverageRecord') `
