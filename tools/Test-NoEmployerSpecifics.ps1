@@ -36,6 +36,14 @@ $rules = @(
     @{ Name = 'Resource GUIDs'; Pattern = '\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b' }
     @{ Name = 'Employer-specific tech conventions'; Pattern = '\b(net462|NETFRAMEWORK)\b' }
     @{ Name = 'Hardcoded pipeline identifiers'; Pattern = '"pipelineId"\s*:\s*[1-9][0-9]{3,}' }
+    # Internal bot/service display names. These reached src/ through a self-check
+    # fixture, which also silently coupled that check to one organization's config.
+    @{ Name = 'Internal bot identities'; Pattern = '\b(MerlinBot|GitOps|Git LowPriv)\b' }
+    # Employer-specific build properties and skill names belong in a consumer's
+    # config, not in toolkit defaults or examples. (build.cmd is deliberately NOT
+    # listed: it is a generic Windows convention and is part of the code-defined
+    # local-validation ceiling that consumers narrow.)
+    @{ Name = 'Employer-specific build/skill names'; Pattern = '\b(LOCALDEBUG|sdl-security-codegen)\b' }
     # A real person's alias in toolkit code is as much of a leak as an org name;
     # it belongs in a consumer's config and on the command line, not in defaults,
     # examples, or fixtures.

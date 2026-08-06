@@ -10,7 +10,7 @@ Both checks are fast and run offline:
 
 # 2. The agent's own self-check suite
 ./src/Agents/review-handler/Start-ReviewHandlerAgent.ps1 -DryRun `
-    -ConfigFile ./samples/apihub-ado.config.json
+    -ConfigFile ./samples/handler-ado.config.json
 ```
 
 ## Principles

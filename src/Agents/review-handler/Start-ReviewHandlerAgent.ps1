@@ -1080,7 +1080,10 @@ function Invoke-DryRunSelfChecks {
     $humanLastThread = @{ threadId = 4; status = 'active'; comments = @(@{ authorDisplayName = 'Alex Reviewer'; authorUniqueName = 'alex.reviewer@example.com'; content = 'Open question about the retry.' }) }
     $fixedThread = @{ threadId = 5; status = 'fixed'; comments = @(@{ authorDisplayName = 'Sam Reviewer'; authorUniqueName = 'sam.reviewer@example.com'; content = 'Old finding.' }) }
     $systemThread = @{ threadId = 6; status = 'active'; comments = @(@{ authorDisplayName = 'Microsoft.VisualStudio.Services.TFS'; authorUniqueName = 'tfs'; content = 'system note' }) }
-    $botThread = @{ threadId = 7; status = 'active'; comments = @(@{ authorDisplayName = 'GitOps (Git LowPriv)'; authorUniqueName = 'gitops@example.com'; content = 'PR Assistant suggestion.' }) }
+    # Derived from the configured substrings so this asserts the config-to-classifier
+    # wiring for ANY consumer, instead of only one organization's bot display names.
+    $botDisplayName = if ($BotSubstrings.Count -gt 0) { "$($BotSubstrings[0]) (automation)" } else { 'Example Bot (automation)' }
+    $botThread = @{ threadId = 7; status = 'active'; comments = @(@{ authorDisplayName = $botDisplayName; authorUniqueName = 'bot@example.com'; content = 'Automated suggestion.' }) }
     $cls = Get-HandlerClassifiedThreads -Threads @($agentFindingThread, $operatorReplyThread, $agentThenReply, $humanLastThread, $fixedThread, $systemThread, $botThread) -OperatorAlias 'operator' -AgentSignatureMarkers $AgentSignatureMarkers -BotSubstrings $BotSubstrings -SystemSubstrings $SystemSubstrings
     $byId = @{}; foreach ($c in $cls) { $byId[[int]$c.ThreadId] = $c }
     if (-not $byId[1].Actionable) { $failures.Add("Agent finding posted as operator was not actionable.") } else { Write-Host "  OK - agent finding (as operator) is actionable" -ForegroundColor Green }
