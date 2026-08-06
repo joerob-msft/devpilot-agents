@@ -386,7 +386,7 @@ Write-Host "[8/9] The sealed block states what is missing and cannot be un-fence
 $rendered = Format-ReviewerSealedSourceBlock -Report $report -NonceFactory $nonceFactory
 Assert-Source ($rendered.Contains('/src/gone.cs', [StringComparison]::Ordinal)) "an unreadable path is still listed in the accounting table"
 Assert-Source ($rendered.Contains('transportFailed', [StringComparison]::Ordinal)) "its reason code is visible to the model"
-Assert-Source ($rendered.Contains('1 of 5 changed file(s) with added or edited lines', [StringComparison]::Ordinal)) "the block leads with the coverage count"
+Assert-Source ($rendered.Contains('1 of 5 changed file(s) that could carry source text', [StringComparison]::Ordinal)) "the block leads with the coverage count"
 Assert-Source ($rendered.Contains('may not claim to have reviewed', [StringComparison]::Ordinal)) "the block forbids claiming unread files"
 Assert-Source ($rendered.Contains('"sha256"', [StringComparison]::Ordinal)) "each slice carries hash provenance"
 Assert-Source (-not $rendered.Contains('image/png', [StringComparison]::Ordinal)) "a rejected file contributes no content"
@@ -1136,20 +1136,21 @@ $binaryAddReport = New-ReviewerSourceTransportReport -CommitSha $commit `
             ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($bodyText)
             Sha256 = Get-ReviewerSourceSha256 -Text $bodyText }
     } -ChangeKindsByPath ([ordered]@{ '/src/e1.cs' = 'Edit'; '/assets/logo.png' = 'Add' })
-Assert-Source ([int]$binaryAddReport.NoSourceFileCount -eq 1 -and [int]$binaryAddReport.SourceBearingFileCount -eq 1) `
-    "an added binary with no line blocks has no source to deliver and leaves the denominator"
-Assert-Source ((Test-ReviewerSourceCoverageGate -Report $binaryAddReport -Policy $policy).Ok) `
-    "adding a binary to a small pull request does not make it permanently unreviewable"
+Assert-Source ([int]$binaryAddReport.NoSourceFileCount -eq 0 -and [int]$binaryAddReport.SourceBearingFileCount -eq 2) `
+    "an added binary the READER called non-text stays in the coverage denominator: nobody but the host said it has nothing in it"
+Assert-Source (-not (Test-ReviewerSourceCoverageGate -Report $binaryAddReport -Policy $policy).Ok) `
+    "so one edited file beside one such path scores 50% and is refused, deliberately"
 Assert-Source ([int]$binaryAddReport.RequestedSpanCount -eq 1) `
     "no hunk is invented for a path the pull request reported no hunks for"
 $binaryAddBlock = Format-ReviewerSealedSourceBlock -Report $binaryAddReport -NonceFactory { 'n' * 32 }
 Assert-Source ($binaryAddBlock -match '/assets/logo\.png' -and $binaryAddBlock -match 'binaryNoText') `
     "the binary is still named in the accounting table with its own reason"
-Assert-Source ($binaryAddBlock -match 'Exactly three reasons are different' -and
-    $binaryAddBlock -match '`noChangedSpans` \(deleted or renamed\), `binaryNoText` \(no line diff and not text\), and `emptyFile` \(no bytes\)') `
-    "the block's exception list is a closed set of exactly three reasons"
-Assert-Source ($binaryAddBlock -match 'Every OTHER reason - including `notTextual`, `fileTooLarge` and `spansUnavailable` - is a file that DOES have changed text you were not given') `
-    "and it says plainly that notTextual is an unread file, not an unreadable one"
+Assert-Source ($binaryAddBlock -match 'EXACTLY ONE reason is different' -and
+    $binaryAddBlock -match '`noChangedSpans` means the pull request itself says') `
+    "only the pull request's own statement is presented to the model as nothing-to-read"
+Assert-Source ($binaryAddBlock -match 'Every OTHER reason, including `binaryNoText`, `emptyFile`, `notTextual`, `fileTooLarge` and `spansUnavailable`, means the source content of that path could NOT be established' -and
+    $binaryAddBlock -match 'Nobody has told you they are empty') `
+    "and every reader-derived reason is described to the model as a file it has not read"
 
 # The reason a spanless binary gets is NOT the reason a diffed-as-text file that
 # the MIME allowlist refused gets. The second one has real changed lines the
@@ -1175,8 +1176,10 @@ $hostileMimeReport = New-ReviewerSourceTransportReport -CommitSha $commit `
 $hostileMimeGate = Test-ReviewerSourceCoverageGate -Report $hostileMimeReport -Policy $policy
 Assert-Source ([int]$hostileMimeReport.ReaderExcusedFileCount -eq 3) `
     "paths excused on the reader's say-so are counted apart from paths the change set excused"
-Assert-Source (-not $hostileMimeGate.Ok -and ($hostileMimeGate.ReasonCodes -ccontains 'sourceReadableNothing')) `
-    "a denominator emptied by the reader is refused under its own reason, not passed vacuously at 100%"
+Assert-Source (-not $hostileMimeGate.Ok -and ($hostileMimeGate.ReasonCodes -ccontains 'sourceCoverageEmpty')) `
+    "a change set the reader excused entirely still has every path in the denominator, so it is refused at 0%"
+Assert-Source ([int]$hostileMimeReport.SourceBearingFileCount -eq 3 -and [int]$hostileMimeReport.CoveragePercent -eq 0) `
+    "and the percentage a human reads is 0%, not a vacuous 100%"
 $hostileMimeRecord = ConvertTo-ReviewerSourceCoverageRecord -Report $hostileMimeReport
 $hostiletMimeReportAllowance = [int]$hostileMimeReport.ReaderExcusedAllowance
 Assert-Source ($hostiletMimeReportAllowance -eq 2) "the allowance for a three-path all-excused change set is the absolute floor"
@@ -1192,8 +1195,8 @@ Assert-Source ([int]$hostileMimeRecord.readerExcusedFileCount -eq 3 -and
 # both are asserted: a stray period once shipped ".:" to every review.
 $noSourceSentence = @((Format-ReviewerSealedSourceBlock -Report $hostileMimeReport -NonceFactory { 'n' * 32 }) -split "`n" |
         Where-Object { $_ -like 'Content accounting*' })[0]
-Assert-Source ($noSourceSentence -match 'or an empty file:$' -and $noSourceSentence -notmatch '\.:') `
-    "the accounting sentence ends in a single colon when some paths carry no source"
+Assert-Source ($noSourceSentence -match 'could NOT be established' -and $noSourceSentence -match ':$' -and $noSourceSentence -notmatch '\.:') `
+    "the accounting sentence names the reader-excused paths and ends in a single colon"
 $allSourceSentence = @((Format-ReviewerSealedSourceBlock -Report $refusedTextReport -NonceFactory { 'n' * 32 }) -split "`n" |
         Where-Object { $_ -like 'Content accounting*' })[0]
 Assert-Source ($allSourceSentence -match 'whose hunk list the pull request reported:$' -and $allSourceSentence -notmatch 'further changed path' -and $allSourceSentence -notmatch 'does NOT cover') `
@@ -1241,9 +1244,10 @@ function New-MislabelReport {
 
 $mislabelReport = New-MislabelReport -Excused 9 -Delivered 1
 $mislabelGate = Test-ReviewerSourceCoverageGate -Report $mislabelReport -Policy $policy
-Assert-Source ([int]$mislabelReport.CoveragePercent -eq 100 -and [int]$mislabelReport.SourceBearingFileCount -eq 1) `
-    "the mislabel fixture really does produce the flattering 1-of-1 shape"
-Assert-Source (-not $mislabelGate.Ok -and ($mislabelGate.ReasonCodes -ccontains 'readerExcusedShareExceeded')) `
+Assert-Source ([int]$mislabelReport.CoveragePercent -eq 10 -and [int]$mislabelReport.SourceBearingFileCount -eq 10) `
+    "nine mislabelled paths beside one delivered file reports 10 percent, not a flattering 1-of-1"
+Assert-Source (-not $mislabelGate.Ok -and ($mislabelGate.ReasonCodes -ccontains 'readerExcusedShareExceeded') -and
+    ($mislabelGate.ReasonCodes -ccontains 'sourceCoverageBelowPercentFloor')) `
     "nine reader-excused paths beside one delivered file are refused, not reported as 100%"
 Assert-Source ([int]$mislabelReport.ReaderExcusedFileCount -eq 9 -and [int]$mislabelReport.ChangeSetExcusedFileCount -eq 0) `
     "and the two kinds of excusal are counted apart"
@@ -1276,8 +1280,8 @@ Assert-Source ([int]$paddedRecord.changeSetExcusedFileCount -eq 5 -and [int]$pad
 $assetReport = New-MislabelReport -Excused 8 -Delivered 1 -ExcusedExtension '.png'
 Assert-Source ([int]$assetReport.ReaderExcusedFileCount -eq 8 -and [int]$assetReport.ReaderExcusedUncorroboratedCount -eq 0) `
     "reader excusals corroborated by the file's own name are counted apart"
-Assert-Source ((Test-ReviewerSourceCoverageGate -Report $assetReport -Policy $policy).Ok) `
-    "so one edited file plus eight new icons is reviewed, not refused"
+Assert-Source (-not (Test-ReviewerSourceCoverageGate -Report $assetReport -Policy $policy).Ok) `
+    "one edited file plus eight icons the READER called non-text is refused: from this side an icon and a lie are the same answer"
 Assert-Source (Test-ReviewerSourcePathLooksNonText -Path '/assets/logo.PNG') `
     "the extension test is case-insensitive"
 Assert-Source (-not (Test-ReviewerSourcePathLooksNonText -Path '/src/Handler.cs') -and
@@ -1292,9 +1296,9 @@ Assert-Source (-not (Test-ReviewerSourcePathLooksNonText -Path '/src/Handler.cs'
 Assert-Source ((Test-ReviewerSourcePathLooksNonText -Path '/assets/logo.png.png') -and
     (Test-ReviewerSourcePathLooksNonText -Path '/src/Handler.cs.png')) `
     "corroboration reads the LAST extension, so a name ending in a binary extension counts"
-$smallAssetReport = New-MislabelReport -Excused 3 -Delivered 1 -ExcusedExtension '.png'
+$smallAssetReport = New-MislabelReport -Excused 3 -Delivered 7 -ExcusedExtension '.png'
 Assert-Source ((Test-ReviewerSourceCoverageGate -Report $smallAssetReport -Policy $policy).Ok) `
-    "and the smallest ordinary asset-adding pull request is reviewed too"
+    "and a pull request whose text files still clear the coverage floor is reviewed with its assets counted against it"
 
 # Corroborated assets must not inflate the allowance either. Removing them from
 # the charge but leaving them in the denominator just moved the padding vector:
@@ -1393,7 +1397,7 @@ Assert-Source ([int]$cappedReport.ReaderExcusedAllowance -eq 3) `
     "paths dropped by the file cap were never read, so they buy no allowance"
 Assert-Source (-not (Test-ReviewerSourceCoverageGate -Report $cappedReport -Policy $cappedPolicy).Ok) `
     "so overflowing the file cap cannot raise the ceiling past what arrived"
-Assert-Source ([int]$cappedReport.SourceBearingFileCount -eq 7) `
+Assert-Source ([int]$cappedReport.SourceBearingFileCount -eq 12) `
     "while those paths still count against coverage, which is a different question"
 
 # The file cap bounds READS. A path the change set says has no right-hand
@@ -1503,8 +1507,11 @@ Assert-Source ([int]$junkAheadReport.DeliveredFiles -eq 3) `
 # The exact boundary, both sides, at a change set where the share rounds cleanly.
 $atLimitReport = New-MislabelReport -Excused 5 -Delivered 5
 Assert-Source ([int]$atLimitReport.ReaderExcusedAllowance -eq 5) "the allowance for a ten-path change set is five"
-Assert-Source ((Test-ReviewerSourceCoverageGate -Report $atLimitReport -Policy $policy).Ok) `
-    "exactly at the allowance is accepted"
+Assert-Source (-not (Test-ReviewerSourceCoverageGate -Report $atLimitReport -Policy $policy).Ok) `
+    "exactly at the allowance still fails the coverage floor, because the excused paths never left the denominator"
+$underLimitReport = New-MislabelReport -Excused 4 -Delivered 6
+Assert-Source ((Test-ReviewerSourceCoverageGate -Report $underLimitReport -Policy $policy).Ok) `
+    "and six delivered of ten clears both the allowance and the floor"
 $overLimitReport = New-MislabelReport -Excused 6 -Delivered 4
 Assert-Source (-not (Test-ReviewerSourceCoverageGate -Report $overLimitReport -Policy $policy).Ok) `
     "one past the allowance is refused"
@@ -1512,14 +1519,16 @@ Assert-Source (-not (Test-ReviewerSourceCoverageGate -Report $overLimitReport -P
 # The small-change-set floor: two paths must not be governed by a 50% share
 # alone, or a single icon beside a single edited file would be refused.
 $tinyReport = New-MislabelReport -Excused 1 -Delivered 1
-Assert-Source ([int]$tinyReport.ReaderExcusedAllowance -eq 2 -and (Test-ReviewerSourceCoverageGate -Report $tinyReport -Policy $policy).Ok) `
-    "one icon beside one edited file is still reviewed, because the allowance has an absolute floor"
+Assert-Source ([int]$tinyReport.ReaderExcusedAllowance -eq 2 -and
+    -not (Test-ReviewerSourceCoverageGate -Report $tinyReport -Policy $policy).Ok) `
+    "one icon beside one edited file clears the allowance but not the coverage floor - half the change set was never read"
 
 # Everything excused is still the older, more specific refusal.
 $allExcusedReport = New-MislabelReport -Excused 4 -Delivered 0
 $allExcusedGate = Test-ReviewerSourceCoverageGate -Report $allExcusedReport -Policy $policy
-Assert-Source (-not $allExcusedGate.Ok -and ($allExcusedGate.ReasonCodes -ccontains 'sourceReadableNothing')) `
-    "a change set the reader excused entirely is still refused as sourceReadableNothing"
+Assert-Source (-not $allExcusedGate.Ok -and ($allExcusedGate.ReasonCodes -ccontains 'sourceCoverageEmpty') -and
+    [int]$allExcusedReport.CoveragePercent -eq 0) `
+    "a change set the reader excused entirely is refused at 0%, every path still in the denominator"
 
 # A host that lost every line-diff block AND mislabels the MIME type is the
 # original attack; it must be refused on both counts.
@@ -1788,9 +1797,10 @@ $emptySeamReport = New-ReviewerSourceTransportReport -CommitSha $commit -Changed
             ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($bodyText)
             Sha256 = Get-ReviewerSourceSha256 -Text $bodyText }
     } -ChangeKindsByPath ([ordered]@{ '/src/ok.cs' = 'Edit'; '/src/empty.cs' = 'Add' })
-Assert-Source ([int]$emptySeamReport.NoSourceFileCount -eq 1 -and [int]$emptySeamReport.SourceBearingFileCount -eq 1 -and
-    (Test-ReviewerSourceCoverageGate -Report $emptySeamReport -Policy $policy).Ok) `
-    "and the shipped reader can actually reach the empty-file excuse the report documents"
+Assert-Source ([int]$emptySeamReport.NoSourceFileCount -eq 0 -and [int]$emptySeamReport.SourceBearingFileCount -eq 2 -and
+    ([string]@($emptySeamReport.Files)[1].Reason) -ceq 'emptyFile' -and
+    -not (Test-ReviewerSourceCoverageGate -Report $emptySeamReport -Policy $policy).Ok) `
+    "the shipped reader reaches the empty-file classification, and it is still counted because only the reader said so"
 
 $badUtf8Base64 = [Convert]::ToBase64String([byte[]](0xC3, 0x28, 0x41, 0x42))
 $badUtf8Result = Get-ReviewerSourceReaderResult -ToolResult (New-ResourceToolResult -Base64 $badUtf8Base64) `

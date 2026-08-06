@@ -33,14 +33,16 @@ not a candidate. Do not invent a resolution.
    result you cannot distinguish from an empty file. The wrapper supplies a
    **pinned changed-file source block** instead - commit-pinned, whole-line,
    hash-bound slices around every changed span. That block is your source text.
-   Its content accounting table is binding. Exactly three reasons mean the path
-   holds no added or edited text for anyone to read — `noChangedSpans`,
-   `binaryNoText` and `emptyFile` — and those have nothing in them to check. A
-   path marked `omitted` for any OTHER reason, including `notTextual`,
-   `fileTooLarge` and `spansUnavailable`, is a file with changed text that you
-   have not read: you may not emit a candidate on it and may not treat it as
-   checked. A path marked `partial` must be described as partially read. If any
-   path is not fully covered, emit a `residualRisks` entry naming it.
+   Its content accounting table is binding. Exactly ONE reason means the path
+   holds no added or edited text for anyone to read — `noChangedSpans`, which is
+   the pull request's own statement that it deleted or renamed the file — and
+   that one has nothing in it to check. A path marked `omitted` for any OTHER
+   reason, including `binaryNoText`, `emptyFile`, `notTextual`, `fileTooLarge`
+   and `spansUnavailable`, is a path whose source content could not be
+   established: you have not read it, nobody has told you it is empty, you may
+   not emit a candidate on it and you may not treat it as checked. A path marked
+   `partial` must be described as partially read. If any path is not fully
+   covered, emit a `residualRisks` entry naming it.
 3. Use only selected, wrapper-verified convention sources. Every rule quote must
    be an exact bounded substring of at least 8 printable characters from the
    named source at its recorded commit and hash.

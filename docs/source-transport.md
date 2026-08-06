@@ -122,7 +122,36 @@ place, so if anything left the denominator on the reader's say-so and nothing wa
 delivered, the gate refuses with `sourceReadableNothing` instead of passing at a
 vacuous 100%.
 
-### The reader may only shrink the denominator so far
+### Only the change set may shrink the coverage denominator
+
+A path leaves the coverage denominator **only** when the pull request itself says
+it holds no added or edited text — a delete or a rename. That statement is the
+PR's own; it is true for everyone, and nothing the host does can manufacture it.
+
+A path that merely came back unreadable — the host said its bytes are not text,
+or its length was not decodable, or its hunk list never arrived — stays counted.
+Its source was not established, and that is not the same as there being nothing
+to establish. Letting the reader shrink the denominator is how one delivered file
+beside nine the host mislabelled reported **100%**: the number now reads **10%**,
+which is what actually happened.
+
+`readerExcusedShareExceeded` remains as a second, independent refusal when
+uncorroborated reader excusals exceed `max(2, 50%)` of the distinct contested
+paths, so a mislabelling host is refused on two counts rather than one. Both
+bounds are code constants, not policy keys.
+
+**The cost is deliberate.** A pull request that adds files the host reports as
+non-text scores against them, because from this side "an icon" and "a source file
+the host is lying about" are the same answer, and only one of those may be
+believed. One text file plus three icons is refused; seven text files plus three
+icons is reviewed. If a repository needs asset-heavy pull requests reviewed, that
+is a `minDeliveredFilePercent` decision made with the trade in view, not
+something this layer should infer.
+
+The model is never told a reader-excused path has nothing to check. Exactly one
+reason — `noChangedSpans` — is presented that way, and every other omission
+reason is described as a path whose source content could not be established,
+which the model must treat as unread.
 
 Emptying the denominator is the extreme case; shrinking it is the same attack at
 lower volume. Nine paths a host mislabels as non-text, beside one file that

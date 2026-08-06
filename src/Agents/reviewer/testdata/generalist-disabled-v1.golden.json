@@ -114,6 +114,10 @@
     {
       "sha256": "8f842c09604560be7955f15db18c6511e159d1ba78bfdd84c5a6f59db549c118",
       "reason": "Name the exception list as a closed set of three reasons and say explicitly that notTextual is NOT one of them. That reason is also emitted for a file the change set diffed as text and the wrapper then refused to fetch, so the previous wording licensed the model to clear files with real changed lines it had never seen."
+    },
+    {
+      "sha256": "6eb9fe0f587bcf8572135b5c02e17d00886f75865468e6033f65d8e43737d08c",
+      "reason": "Narrow that exception list to exactly ONE reason. Only the pull request's own statement that it deleted or renamed a path may be presented as nothing-to-read; a path the reader could not establish content for is an unread file, and telling the model otherwise was a claim the repository host could author at will over any file it chose."
     }
   ]
 }
