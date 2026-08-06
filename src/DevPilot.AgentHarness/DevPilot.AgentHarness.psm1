@@ -1170,6 +1170,593 @@ function Invoke-TimedProcess {
 }
 
 # ---------------------------------------------------------------------------
+# Offline snapshot replay of the MCP read seam.
+#
+# Every repository read in this toolkit funnels through Send-AgentMcpRequest,
+# so a snapshot served THERE drives the entire stack above it - transport,
+# convention packs, facts, model passes, verification, gates and previews -
+# without changing a line of it, and without the tool response shapes those
+# layers validate differing by a byte from a live run.
+#
+# The snapshot is operator-supplied local input, so it is treated as hostile:
+# named as a single child of an explicit replay root, canonicalized, refused
+# if any component is a reparse point, hashed at load, held in memory so
+# nothing on disk can change under it, and re-hashed at every serve. A
+# resource that was not recorded is a failure, never a reason to reach the
+# network.
+# ---------------------------------------------------------------------------
+
+# Code-defined, not manifest-defined: a bound a snapshot can raise is not a bound.
+$script:AgentReplaySchemaVersion = 1
+$script:AgentReplayKind = "agent-replay-snapshot"
+$script:AgentReplayMaxResources = 4096
+$script:AgentReplayMaxPayloadBytes = 25165824
+$script:AgentReplayMaxTotalPayloadBytes = 67108864
+$script:AgentReplayMaxManifestBytes = 8388608
+$script:AgentReplaySnapshotNamePattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
+$script:AgentReplayPayloadSegmentPattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+$script:AgentReplayHexPattern = '^[0-9a-f]{64}$'
+# Reference-identity seal, not a string: a constant that a hand-built hashtable
+# can carry would let any in-process caller present itself as a loaded snapshot
+# and skip every check in New-AgentReplaySnapshot. Same pattern as the
+# reviewer's delivery-authorization seal.
+$script:AgentReplaySnapshotSeal = [object]::new()
+# A code-defined CEILING of the exact {tool, action} pairs the wrappers in this
+# toolkit issue as reads - not a blocklist of writes. A tool or action this
+# table does not name cannot be recorded in a snapshot and cannot be served
+# from one, so a new write action added upstream is refused by default rather
+# than admitted until someone notices.
+$script:AgentReplayReadCeiling = [System.Collections.Generic.Dictionary[string, string[]]]::new([StringComparer]::Ordinal)
+$script:AgentReplayReadCeiling.Add("repo_pull_request", @("get", "get_changes", "list"))
+$script:AgentReplayReadCeiling.Add("repo_pull_request_thread", @("list"))
+$script:AgentReplayReadCeiling.Add("repo_file", @("get_content"))
+$script:AgentReplayReadCeiling.Add("repo_branch", @("get"))
+$script:AgentReplayReadCeiling.Add("repo_repository", @("get", "list"))
+
+function ConvertTo-AgentReplayJsonString {
+    <#
+        Explicit JSON string escaping. Delegating this to ConvertTo-Json would
+        make every lookup key and the manifest digest a function of the host
+        PowerShell build's serializer choices; a snapshot has to survive that.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+    $builder = [System.Text.StringBuilder]::new($Value.Length + 2)
+    [void]$builder.Append('"')
+    foreach ($character in $Value.ToCharArray()) {
+        $code = [int]$character
+        switch ($character) {
+            '"' { [void]$builder.Append('\"'); continue }
+            '\' { [void]$builder.Append('\\'); continue }
+            "`b" { [void]$builder.Append('\b'); continue }
+            "`f" { [void]$builder.Append('\f'); continue }
+            "`n" { [void]$builder.Append('\n'); continue }
+            "`r" { [void]$builder.Append('\r'); continue }
+            "`t" { [void]$builder.Append('\t'); continue }
+            default {
+                if ($code -lt 32 -or $code -eq 127) { [void]$builder.AppendFormat('\u{0:x4}', $code) }
+                else { [void]$builder.Append($character) }
+            }
+        }
+    }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function Get-AgentReplaySortedNames {
+    <#
+        ORDINAL ordering. Sort-Object is a culture comparison: 'aa','Aa','ab'
+        orders differently under da-DK than under en-US, which would make both
+        the lookup key and the manifest digest depend on the locale of the host
+        that computed them. A snapshot captured on one machine has to load on
+        another.
+    #>
+    param([string[]]$Names)
+    $sorted = [string[]]@($Names)
+    [Array]::Sort($sorted, [StringComparer]::Ordinal)
+    return , $sorted
+}
+
+function ConvertTo-AgentReplayCanonicalJson {
+    <#
+        Deterministic JSON rendering used for BOTH the resource lookup key and
+        the manifest digest. Object keys are sorted ordinally, so key order can
+        never change a key or a digest, and dictionaries are rendered as objects
+        rather than as the DictionaryEntry sequence a generic enumerable walk
+        would produce.
+    #>
+    param($Value, [int]$Depth = 0)
+    if ($Depth -gt 24) { throw "Replay payload exceeded the maximum canonical depth." }
+    if ($null -eq $Value) { return "null" }
+    if ($Value -is [bool]) { return $(if ($Value) { "true" } else { "false" }) }
+    if ($Value -is [string]) { return (ConvertTo-AgentReplayJsonString -Value $Value) }
+    if ($Value -is [int] -or $Value -is [long]) { return [Convert]::ToString([long]$Value, [System.Globalization.CultureInfo]::InvariantCulture) }
+    if ($Value -is [double] -or $Value -is [decimal]) {
+        # A non-integral number in a lookup key or a digest would make the key
+        # depend on round-tripping; refuse rather than render one ambiguously.
+        throw "Replay canonical JSON does not accept non-integral numbers."
+    }
+    if ($Value -is [DateTime] -or $Value -is [DateTimeOffset]) {
+        # PowerShell's JSON reader turns extended-format ISO-8601 strings into
+        # DateTime objects. Rendering one here would make the digest depend on
+        # a formatting choice the manifest never stated, so it is refused: a
+        # timestamp that must survive a snapshot is written in the basic form
+        # this schema requires, which stays a string on both sides.
+        throw "Replay canonical JSON does not accept date values; write timestamps in the basic yyyyMMddTHHmmssZ form."
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $names = Get-AgentReplaySortedNames -Names @($Value.Keys | ForEach-Object { [string]$_ })
+        $parts = @($names | ForEach-Object {
+                (ConvertTo-AgentReplayJsonString -Value $_) + ":" +
+                (ConvertTo-AgentReplayCanonicalJson -Value $Value[$_] -Depth ($Depth + 1))
+            })
+        return "{" + ($parts -join ",") + "}"
+    }
+    if ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $names = Get-AgentReplaySortedNames -Names @($Value.PSObject.Properties.Name)
+        $parts = @($names | ForEach-Object {
+                (ConvertTo-AgentReplayJsonString -Value $_) + ":" +
+                (ConvertTo-AgentReplayCanonicalJson -Value $Value.PSObject.Properties[$_].Value -Depth ($Depth + 1))
+            })
+        return "{" + ($parts -join ",") + "}"
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $parts = @()
+        foreach ($item in $Value) { $parts += (ConvertTo-AgentReplayCanonicalJson -Value $item -Depth ($Depth + 1)) }
+        return "[" + ($parts -join ",") + "]"
+    }
+    throw "Replay canonical JSON encountered an unsupported type."
+}
+
+function Get-AgentReplayTextSha256 {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $bytes = ([System.Text.UTF8Encoding]::new($false, $true)).GetBytes($Text)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $hash = $sha.ComputeHash($bytes) } finally { $sha.Dispose() }
+    return ([System.BitConverter]::ToString($hash) -replace '-', '').ToLowerInvariant()
+}
+
+function Get-AgentReplayBytesSha256 {
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $hash = $sha.ComputeHash($Bytes) } finally { $sha.Dispose() }
+    return ([System.BitConverter]::ToString($hash) -replace '-', '').ToLowerInvariant()
+}
+
+function Get-AgentReplayRequestKey {
+    <#
+        The identity of one recorded read: the tool name and the EXACT argument
+        set the wrapper asked with. Two calls that differ in any argument are
+        two different resources, so a snapshot can never answer a question it
+        was not asked at capture time.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)]$Arguments
+    )
+    $canonical = ConvertTo-AgentReplayCanonicalJson -Value ([ordered]@{ arguments = $Arguments; name = $Name })
+    return @{ Canonical = $canonical; Key = (Get-AgentReplayTextSha256 -Text $canonical) }
+}
+
+function Test-AgentReplayToolPermitted {
+    <#
+        Fail-closed read CEILING. Applied when a snapshot is LOADED (so a
+        recorded write cannot sit in a snapshot at all) and again when a call is
+        SERVED (so no code path can ask replay to answer a write). A tool the
+        ceiling does not name, or an action it does not name for that tool, is
+        refused - including a call that carries no action at all.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)]$Arguments
+    )
+    if ([string]::IsNullOrWhiteSpace($Name)) { return @{ Permitted = $false; Reason = "an unnamed tool" } }
+    if (-not $script:AgentReplayReadCeiling.ContainsKey($Name)) {
+        return @{ Permitted = $false; Reason = "'$Name' is not in the replay read ceiling" }
+    }
+    $action = $null
+    $actionSeen = $false
+    if ($Arguments -is [System.Collections.IDictionary]) {
+        foreach ($key in @($Arguments.Keys)) {
+            if ([string]$key -ceq "action") { $action = $Arguments[$key]; $actionSeen = $true }
+        }
+    }
+    elseif ($Arguments -is [System.Management.Automation.PSCustomObject] -and $Arguments.PSObject.Properties["action"]) {
+        $action = $Arguments.PSObject.Properties["action"].Value
+        $actionSeen = $true
+    }
+    if (-not $actionSeen) {
+        return @{ Permitted = $false; Reason = "'$Name' was asked without an action" }
+    }
+    if ($action -isnot [string] -or $script:AgentReplayReadCeiling[$Name] -cnotcontains [string]$action) {
+        return @{ Permitted = $false; Reason = "'$Name' was asked for an action outside the replay read ceiling" }
+    }
+    return @{ Permitted = $true; Reason = "" }
+}
+
+function Assert-AgentReplayPathSafe {
+    <#
+        Windows-shaped path defence. A snapshot is operator input, and the
+        interesting attack here is not "../.." in the manifest - it is a
+        junction or symlink that makes a name inside the replay root resolve to
+        bytes outside it. Hard links are deliberately NOT chased: a hard link
+        can only ever supply the exact bytes the manifest already pins by
+        SHA-256, so aliasing buys nothing that content pinning does not already
+        cover.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Within,
+        [Parameter(Mandatory)][ValidateSet("Directory", "File")][string]$Kind
+    )
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($Kind -eq "Directory" -and -not $item.PSIsContainer) { throw "Replay path '$Path' is not a directory." }
+    if ($Kind -eq "File" -and $item.PSIsContainer) { throw "Replay path '$Path' is not a file." }
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint) {
+        throw "Replay path '$Path' is a reparse point; a replay snapshot may not redirect outside its own root."
+    }
+    if ($item.PSObject.Properties["LinkType"] -and $item.LinkType) {
+        throw "Replay path '$Path' is a $($item.LinkType); a replay snapshot may not alias other content."
+    }
+    # Resolve through the filesystem's own casing/short-name normalization, then
+    # confirm the resolved name is still strictly inside the boundary. Comparing
+    # the manifest string alone would accept an 8.3 short name or a name that
+    # only becomes an escape after resolution.
+    $resolved = [System.IO.Path]::GetFullPath($item.FullName)
+    $boundary = [System.IO.Path]::GetFullPath($Within).TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $resolved.StartsWith($boundary, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Replay path '$Path' resolved outside the replay boundary '$Within'."
+    }
+    return $resolved
+}
+
+function Get-AgentReplayManifestField {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][ValidateSet("string", "sha256", "int", "bool", "object", "array")][string]$Type,
+        [long]$Min = 0,
+        [long]$Max = 2147483647,
+        [string]$Pattern
+    )
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) { throw "Replay manifest is missing required field '$Name'." }
+    $value = $property.Value
+    switch ($Type) {
+        "string" {
+            if ($value -isnot [string]) { throw "Replay manifest field '$Name' must be a string." }
+            if ($Pattern -and [string]$value -cnotmatch $Pattern) { throw "Replay manifest field '$Name' does not match its required shape." }
+            return [string]$value
+        }
+        "sha256" {
+            if ($value -isnot [string] -or [string]$value -cnotmatch $script:AgentReplayHexPattern) {
+                throw "Replay manifest field '$Name' must be a lowercase SHA-256 hex digest."
+            }
+            return [string]$value
+        }
+        "int" {
+            if (-not (Test-StrictJsonInt -Value $value -Min $Min -Max $Max)) {
+                throw "Replay manifest field '$Name' must be an integer in [$Min,$Max]."
+            }
+            return [long]$value
+        }
+        "bool" {
+            if ($value -isnot [bool]) { throw "Replay manifest field '$Name' must be a boolean." }
+            return [bool]$value
+        }
+        "object" {
+            if ($value -isnot [System.Management.Automation.PSCustomObject]) { throw "Replay manifest field '$Name' must be an object." }
+            return $value
+        }
+        "array" {
+            if ($value -isnot [System.Object[]]) { throw "Replay manifest field '$Name' must be an array." }
+            return @($value)
+        }
+    }
+}
+
+function Assert-AgentReplayExactKeys {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string[]]$Expected,
+        [Parameter(Mandatory)][string]$Where
+    )
+    $actual = @($Object.PSObject.Properties.Name)
+    $unexpected = @($actual | Where-Object { $Expected -cnotcontains $_ })
+    if ($unexpected.Count -gt 0) { throw "$Where carries unexpected field(s): $($unexpected -join ', ')." }
+    $missing = @($Expected | Where-Object { -not $Object.PSObject.Properties[$_] })
+    if ($missing.Count -gt 0) { throw "$Where is missing field(s): $($missing -join ', ')." }
+}
+
+function New-AgentReplaySnapshot {
+    <#
+        Loads and seals one replay snapshot. Every payload is read into memory
+        here: a snapshot verified on disk and re-read later is a snapshot that
+        can change between the check and the use, and holding the bytes removes
+        that window entirely. Returns a hashtable the MCP session layer serves
+        from; it carries a fresh per-run nonce so two replays of the same
+        snapshot are distinguishable, and a domain-separated seal so a replay
+        artifact can be recognized as one wherever it surfaces.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ReplayRoot,
+        [Parameter(Mandatory)][string]$SnapshotName,
+        [string]$ExpectedManifestDigest
+    )
+    if ($SnapshotName -cnotmatch $script:AgentReplaySnapshotNamePattern) {
+        throw "Replay snapshot name '$SnapshotName' must be a single path-free name of at most 64 characters."
+    }
+    if (-not (Test-Path -LiteralPath $ReplayRoot -PathType Container)) {
+        throw "Replay root '$ReplayRoot' does not exist."
+    }
+    $rootFull = [System.IO.Path]::GetFullPath((Get-Item -LiteralPath $ReplayRoot -Force -ErrorAction Stop).FullName)
+    $rootItem = Get-Item -LiteralPath $rootFull -Force -ErrorAction Stop
+    if (($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint) {
+        throw "Replay root '$rootFull' is a reparse point."
+    }
+    $snapshotPath = Join-Path $rootFull $SnapshotName
+    if (-not (Test-Path -LiteralPath $snapshotPath -PathType Container)) {
+        throw "Replay snapshot '$SnapshotName' does not exist under '$rootFull'."
+    }
+    $snapshotFull = Assert-AgentReplayPathSafe -Path $snapshotPath -Within $rootFull -Kind Directory
+
+    $manifestPath = Join-Path $snapshotFull "manifest.json"
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        throw "Replay snapshot '$SnapshotName' has no manifest.json."
+    }
+    [void](Assert-AgentReplayPathSafe -Path $manifestPath -Within $snapshotFull -Kind File)
+    $manifestBytes = [System.IO.File]::ReadAllBytes($manifestPath)
+    if ($manifestBytes.Length -lt 2 -or $manifestBytes.Length -gt $script:AgentReplayMaxManifestBytes) {
+        throw "Replay manifest is $($manifestBytes.Length) bytes; expected 2..$script:AgentReplayMaxManifestBytes."
+    }
+    $manifestText = ([System.Text.UTF8Encoding]::new($false, $true)).GetString($manifestBytes)
+    try { $manifest = $manifestText | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw "Replay manifest is not valid JSON." }
+    if ($manifest -isnot [System.Management.Automation.PSCustomObject]) { throw "Replay manifest must be a JSON object." }
+
+    Assert-AgentReplayExactKeys -Object $manifest -Where "Replay manifest" -Expected @(
+        "schemaVersion", "kind", "snapshotId", "capturedUtc", "provider",
+        "binding", "bindings", "resources", "manifestDigest"
+    )
+    $schemaVersion = Get-AgentReplayManifestField -Object $manifest -Name "schemaVersion" -Type int -Min 1 -Max 1
+    if ($schemaVersion -ne $script:AgentReplaySchemaVersion) {
+        throw "Replay manifest declares schema version $schemaVersion; this build reads version $script:AgentReplaySchemaVersion."
+    }
+    $kind = Get-AgentReplayManifestField -Object $manifest -Name "kind" -Type string
+    if ($kind -cne $script:AgentReplayKind) { throw "Replay manifest kind '$kind' is not '$script:AgentReplayKind'." }
+    $snapshotId = Get-AgentReplayManifestField -Object $manifest -Name "snapshotId" -Type string -Pattern $script:AgentReplaySnapshotNamePattern
+    if ($snapshotId -cne $SnapshotName) {
+        throw "Replay manifest declares snapshotId '$snapshotId' but was loaded as '$SnapshotName'."
+    }
+    $capturedUtc = Get-AgentReplayManifestField -Object $manifest -Name "capturedUtc" -Type string -Pattern '^\d{8}T\d{6}Z$'
+    $provider = Get-AgentReplayManifestField -Object $manifest -Name "provider" -Type string -Pattern '^[a-z][a-z0-9-]{0,31}$'
+
+    $binding = Get-AgentReplayManifestField -Object $manifest -Name "binding" -Type object
+    Assert-AgentReplayExactKeys -Object $binding -Where "Replay manifest binding" -Expected @(
+        "organization", "project", "repositoryId", "pullRequestId",
+        "sourceCommit", "targetCommit", "changeSetSha256"
+    )
+    $bindingRecord = [ordered]@{
+        Organization    = Get-AgentReplayManifestField -Object $binding -Name "organization" -Type string -Pattern '^[^\s]{1,128}$'
+        Project         = Get-AgentReplayManifestField -Object $binding -Name "project" -Type string -Pattern '^[^\s]{1,128}$'
+        RepositoryId    = Get-AgentReplayManifestField -Object $binding -Name "repositoryId" -Type string -Pattern '^[^\s]{1,128}$'
+        PullRequestId   = Get-AgentReplayManifestField -Object $binding -Name "pullRequestId" -Type int -Min 1 -Max 2147483647
+        SourceCommit    = Get-AgentReplayManifestField -Object $binding -Name "sourceCommit" -Type string -Pattern '^[0-9a-f]{40}$'
+        TargetCommit    = Get-AgentReplayManifestField -Object $binding -Name "targetCommit" -Type string -Pattern '^[0-9a-f]{40}$'
+        ChangeSetSha256 = Get-AgentReplayManifestField -Object $binding -Name "changeSetSha256" -Type sha256
+    }
+
+    $bindings = Get-AgentReplayManifestField -Object $manifest -Name "bindings" -Type object
+    Assert-AgentReplayExactKeys -Object $bindings -Where "Replay manifest bindings" -Expected @(
+        "configSha256", "scriptSha256", "promptSha256", "models"
+    )
+    $models = @(Get-AgentReplayManifestField -Object $bindings -Name "models" -Type array)
+    if ($models.Count -gt 8) { throw "Replay manifest binds more than 8 models." }
+    foreach ($model in $models) {
+        if ($model -isnot [string] -or [string]$model -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') {
+            throw "Replay manifest model binding is not a plain model name."
+        }
+    }
+    $bindingsRecord = [ordered]@{
+        ConfigSha256 = Get-AgentReplayManifestField -Object $bindings -Name "configSha256" -Type sha256
+        ScriptSha256 = Get-AgentReplayManifestField -Object $bindings -Name "scriptSha256" -Type sha256
+        PromptSha256 = Get-AgentReplayManifestField -Object $bindings -Name "promptSha256" -Type sha256
+        Models       = @($models | ForEach-Object { [string]$_ })
+    }
+
+    $resources = @(Get-AgentReplayManifestField -Object $manifest -Name "resources" -Type array)
+    if ($resources.Count -lt 1 -or $resources.Count -gt $script:AgentReplayMaxResources) {
+        throw "Replay manifest declares $($resources.Count) resource(s); expected 1..$script:AgentReplayMaxResources."
+    }
+    $recordedDigest = Get-AgentReplayManifestField -Object $manifest -Name "manifestDigest" -Type sha256
+
+    $served = @{}
+    $totalBytes = [long]0
+    $resourceSummaries = [System.Collections.Generic.List[object]]::new()
+    foreach ($resource in $resources) {
+        if ($resource -isnot [System.Management.Automation.PSCustomObject]) { throw "Replay manifest resource must be an object." }
+        Assert-AgentReplayExactKeys -Object $resource -Where "Replay manifest resource" -Expected @(
+            "tool", "arguments", "requestSha256", "payloadFile", "payloadSha256", "payloadByteLength"
+        )
+        $tool = Get-AgentReplayManifestField -Object $resource -Name "tool" -Type string -Pattern '^[a-z][a-z0-9_]{0,63}$'
+        $arguments = Get-AgentReplayManifestField -Object $resource -Name "arguments" -Type object
+        $permitted = Test-AgentReplayToolPermitted -Name $tool -Arguments $arguments
+        if (-not $permitted.Permitted) {
+            throw "Replay snapshot '$SnapshotName' records $($permitted.Reason); a replay snapshot may only carry reads."
+        }
+        $requestKey = Get-AgentReplayRequestKey -Name $tool -Arguments $arguments
+        $recordedRequestSha = Get-AgentReplayManifestField -Object $resource -Name "requestSha256" -Type sha256
+        if ($requestKey.Key -cne $recordedRequestSha) {
+            throw "Replay resource for '$tool' records a requestSha256 that does not match its own arguments."
+        }
+        if ($served.ContainsKey($requestKey.Key)) {
+            throw "Replay snapshot '$SnapshotName' records the same '$tool' request twice; a snapshot must answer each request one way."
+        }
+
+        $payloadRelative = Get-AgentReplayManifestField -Object $resource -Name "payloadFile" -Type string
+        if ($payloadRelative.Length -lt 1 -or $payloadRelative.Length -gt 512) {
+            throw "Replay resource payloadFile must be 1..512 characters."
+        }
+        $segments = @($payloadRelative -split '/')
+        foreach ($segment in $segments) {
+            if ($segment -cnotmatch $script:AgentReplayPayloadSegmentPattern) {
+                throw "Replay resource payloadFile '$payloadRelative' is not a plain relative path inside the snapshot."
+            }
+        }
+        $payloadPath = $snapshotFull
+        for ($segmentIndex = 0; $segmentIndex -lt $segments.Count; $segmentIndex++) {
+            $payloadPath = Join-Path $payloadPath $segments[$segmentIndex]
+            # By index, not by value: a payload at "a/b/a" would otherwise have
+            # its first directory checked as a file because it happens to share
+            # the leaf's name.
+            $segmentKind = if ($segmentIndex -eq ($segments.Count - 1)) { "File" } else { "Directory" }
+            [void](Assert-AgentReplayPathSafe -Path $payloadPath -Within $snapshotFull -Kind $segmentKind)
+        }
+
+        $expectedBytes = Get-AgentReplayManifestField -Object $resource -Name "payloadByteLength" -Type int -Min 2 -Max $script:AgentReplayMaxPayloadBytes
+        $expectedSha = Get-AgentReplayManifestField -Object $resource -Name "payloadSha256" -Type sha256
+        # The safety check above and this read are two operations on one name,
+        # so the name can in principle be swapped between them. That window is
+        # harmless rather than unclosed: whatever the read returns is hashed
+        # against the manifest immediately below, so a swapped file fails the
+        # load. The worst a race can do here is refuse a snapshot.
+        $payloadBytes = [System.IO.File]::ReadAllBytes($payloadPath)
+        if ($payloadBytes.Length -ne $expectedBytes) {
+            throw "Replay payload '$payloadRelative' is $($payloadBytes.Length) bytes; the manifest records $expectedBytes."
+        }
+        $actualSha = Get-AgentReplayBytesSha256 -Bytes $payloadBytes
+        if ($actualSha -cne $expectedSha) { throw "Replay payload '$payloadRelative' does not match its recorded SHA-256." }
+        $totalBytes += $payloadBytes.Length
+        if ($totalBytes -gt $script:AgentReplayMaxTotalPayloadBytes) {
+            throw "Replay snapshot '$SnapshotName' carries more than $script:AgentReplayMaxTotalPayloadBytes payload bytes."
+        }
+
+        # Reject a recorded failure at load, not at serve: a snapshot that
+        # cannot answer is a broken snapshot, and finding that out halfway
+        # through a replay would leave a half-run to interpret.
+        $payloadText = ([System.Text.UTF8Encoding]::new($false, $true)).GetString($payloadBytes)
+        try { $envelope = $payloadText | ConvertFrom-Json -ErrorAction Stop }
+        catch { throw "Replay payload '$payloadRelative' is not valid JSON." }
+        if ($envelope -isnot [System.Management.Automation.PSCustomObject] -or
+            -not $envelope.PSObject.Properties["jsonrpc"] -or [string]$envelope.jsonrpc -cne "2.0" -or
+            -not $envelope.PSObject.Properties["result"] -or $envelope.PSObject.Properties["error"]) {
+            throw "Replay payload '$payloadRelative' is not a successful JSON-RPC response envelope."
+        }
+
+        $served[$requestKey.Key] = @{
+            Tool          = $tool
+            PayloadFile   = $payloadRelative
+            PayloadBytes  = $payloadBytes
+            PayloadSha256 = $expectedSha
+        }
+        [void]$resourceSummaries.Add([ordered]@{
+                tool              = $tool
+                requestSha256     = $requestKey.Key
+                payloadFile       = $payloadRelative
+                payloadSha256     = $expectedSha
+                payloadByteLength = [long]$payloadBytes.Length
+                arguments         = $arguments
+            })
+    }
+
+    # The digest covers everything the manifest asserts EXCEPT the digest field
+    # itself, so editing any binding, argument, payload hash or ordering changes
+    # it. Payload bytes are covered transitively through payloadSha256, each of
+    # which was verified against the bytes just read. It is built from the
+    # manifest's OWN field names so that a writer can compute the same value
+    # without reproducing this function's internal record shapes.
+    $digestInput = [ordered]@{
+        schemaVersion = $schemaVersion
+        kind          = $kind
+        snapshotId    = $snapshotId
+        capturedUtc   = $capturedUtc
+        provider      = $provider
+        binding       = [ordered]@{
+            organization    = $bindingRecord.Organization
+            project         = $bindingRecord.Project
+            repositoryId    = $bindingRecord.RepositoryId
+            pullRequestId   = $bindingRecord.PullRequestId
+            sourceCommit    = $bindingRecord.SourceCommit
+            targetCommit    = $bindingRecord.TargetCommit
+            changeSetSha256 = $bindingRecord.ChangeSetSha256
+        }
+        bindings      = [ordered]@{
+            configSha256 = $bindingsRecord.ConfigSha256
+            scriptSha256 = $bindingsRecord.ScriptSha256
+            promptSha256 = $bindingsRecord.PromptSha256
+            models       = @($bindingsRecord.Models)
+        }
+        resources     = @($resourceSummaries.ToArray())
+    }
+    $computedDigest = Get-AgentReplayTextSha256 -Text (ConvertTo-AgentReplayCanonicalJson -Value $digestInput)
+    if ($computedDigest -cne $recordedDigest) {
+        # Deliberately not worded as tamper detection. This digest is unkeyed:
+        # anyone who edits a snapshot can recompute it. What it does catch is a
+        # manifest that no longer describes its own payloads - corruption, a
+        # partial edit, or a recorder that disagrees with this reader. Binding a
+        # replay to a snapshot an operator actually vouched for is the job of
+        # -ExpectedManifestDigest, which is why the reviewer requires one.
+        throw "Replay manifest digest does not match its own contents; the manifest and its payloads disagree."
+    }
+    if ($ExpectedManifestDigest -and $computedDigest -cne $ExpectedManifestDigest.ToLowerInvariant()) {
+        throw "Replay manifest digest $computedDigest does not match the operator-supplied $ExpectedManifestDigest."
+    }
+
+    return @{
+        SchemaVersion  = $schemaVersion
+        SnapshotId     = $snapshotId
+        SnapshotPath   = $snapshotFull
+        ReplayRoot     = $rootFull
+        CapturedUtc    = $capturedUtc
+        Provider       = $provider
+        Binding        = $bindingRecord
+        Bindings       = $bindingsRecord
+        ManifestDigest = $computedDigest
+        ResourceCount  = $served.Count
+        PayloadBytes   = $totalBytes
+        ReplayNonce    = (New-AgentNonce)
+        Seal           = $script:AgentReplaySnapshotSeal
+        Served         = $served
+        ServedKeys     = @($served.Keys)
+    }
+}
+
+function Get-AgentReplayResponse {
+    <#
+        Answers one recorded read. Re-hashes the held bytes before parsing, so a
+        snapshot object that was tampered with in memory is caught here too, and
+        parses fresh on every call so no caller can mutate a shared object out
+        from under a later one.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Snapshot,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)]$Arguments
+    )
+    $permitted = Test-AgentReplayToolPermitted -Name $Name -Arguments $Arguments
+    if (-not $permitted.Permitted) {
+        throw "Replay refused $($permitted.Reason): a replay never writes and never authorizes a write."
+    }
+    $requestKey = Get-AgentReplayRequestKey -Name $Name -Arguments $Arguments
+    if (-not $Snapshot.Served.ContainsKey($requestKey.Key)) {
+        # Naming the exact request is the difference between "this snapshot is
+        # incomplete" and a day of guessing which argument differed. Bounded,
+        # because the arguments are operator input like everything else here.
+        $described = $requestKey.Canonical
+        if ($described.Length -gt 512) { $described = $described.Substring(0, 512) + "..." }
+        throw ("Replay snapshot '$($Snapshot.SnapshotId)' has no recorded response for '$Name' with these exact arguments; " +
+            "a replay never falls through to a live read. Requested: $described")
+    }
+    $entry = $Snapshot.Served[$requestKey.Key]
+    $actualSha = Get-AgentReplayBytesSha256 -Bytes $entry.PayloadBytes
+    if ($actualSha -cne $entry.PayloadSha256) {
+        throw "Replay payload '$($entry.PayloadFile)' changed after it was sealed."
+    }
+    $payloadText = ([System.Text.UTF8Encoding]::new($false, $true)).GetString($entry.PayloadBytes)
+    $envelope = $payloadText | ConvertFrom-Json -ErrorAction Stop
+    return $envelope.result
+}
+
+# ---------------------------------------------------------------------------
 # Generic Agency MCP JSON-RPC stdio client (portable; used only in live mode)
 # ---------------------------------------------------------------------------
 
@@ -1180,6 +1767,20 @@ function Send-AgentMcpRequest {
         [hashtable]$Params = @{},
         [Nullable[DateTime]]$DeadlineUtc
     )
+    if ($Session.ContainsKey("Replay") -and $null -ne $Session.Replay) {
+        # A replay session has no process and no socket. Every branch below this
+        # one is unreachable from here, which is the point: there is no code path
+        # from a replay session to the network. -DeadlineUtc is deliberately not
+        # consulted - a serve is a bounded in-memory hash and parse with nothing
+        # to wait for, so honouring a deadline here would only ever be theatre.
+        if ($Method -cne "tools/call") {
+            throw "Replay session refuses JSON-RPC method '$Method'; a replay answers recorded tool reads only."
+        }
+        if (-not $Params.ContainsKey("name") -or -not $Params.ContainsKey("arguments")) {
+            throw "Replay session received a tools/call without a name and arguments."
+        }
+        return (Get-AgentReplayResponse -Snapshot $Session.Replay -Name ([string]$Params["name"]) -Arguments $Params["arguments"])
+    }
     if (-not $Session.Process) { throw "Agent MCP session is closed." }
     $Session.NextId = [long]$Session.NextId + 1
     $requestId = [long]$Session.NextId
@@ -1235,6 +1836,9 @@ function Send-AgentMcpRequest {
 
 function Send-AgentMcpNotification {
     param([Parameter(Mandatory)][hashtable]$Session, [Parameter(Mandatory)][string]$Method, [hashtable]$Params = @{})
+    if ($Session.ContainsKey("Replay") -and $null -ne $Session.Replay) {
+        throw "Replay session refuses JSON-RPC notification '$Method'; a replay answers recorded tool reads only."
+    }
     $notification = [ordered]@{ jsonrpc = "2.0"; method = $Method; params = $Params } | ConvertTo-Json -Compress -Depth 10
     try {
         $Session.Process.StandardInput.WriteLine($notification)
@@ -1248,7 +1852,15 @@ function Send-AgentMcpNotification {
 
 function Close-AgentMcpSession {
     param([hashtable]$Session, [switch]$Abort)
-    if (-not $Session -or -not $Session.Process) { return }
+    if (-not $Session) { return }
+    if ($Session.ContainsKey("Replay") -and $null -ne $Session.Replay) {
+        # Dropping the snapshot reference ends the session; there was never a
+        # process to stop. Serving after this point fails on the null check
+        # in Send-AgentMcpRequest, exactly as a closed live session does.
+        $Session.Replay = $null
+        return
+    }
+    if (-not $Session.Process) { return }
     $process = [System.Diagnostics.Process]$Session.Process
     try { $process.StandardInput.Close() } catch {}
     if ($Abort -or -not $process.WaitForExit(2000)) {
@@ -1274,8 +1886,34 @@ function Open-AgentMcpSession {
         [ValidateRange(5, 120)][int]$TimeoutSeconds = 30,
         [string]$ProtocolVersion = "2024-11-05",
         [string]$ClientName = "copilot-agent-harness",
-        [string[]]$EnvironmentVariablesToRemove = @("AZURE_DEVOPS_EXT_PAT", "SYSTEM_ACCESSTOKEN")
+        [string[]]$EnvironmentVariablesToRemove = @("AZURE_DEVOPS_EXT_PAT", "SYSTEM_ACCESSTOKEN"),
+        [hashtable]$ReplaySnapshot
     )
+    if ($ReplaySnapshot) {
+        # Offline replay: no process is started, so -AgencyPath is never
+        # executed and the child-environment scrubbing below has nothing to
+        # scrub. The returned session carries the same Server/Organization the
+        # caller asked for, because callers assert on those before using it.
+        if (-not [object]::ReferenceEquals($ReplaySnapshot.Seal, $script:AgentReplaySnapshotSeal)) {
+            throw "Replay session requires a snapshot produced by New-AgentReplaySnapshot."
+        }
+        # A snapshot captured against a different organization would answer
+        # every question consistently and wrongly. Bind it here, at the one
+        # place a session is created, rather than trusting each caller.
+        if ($Organization -and [string]$ReplaySnapshot.Binding.Organization -cne $Organization) {
+            throw "Replay snapshot '$($ReplaySnapshot.SnapshotId)' was captured against organization '$($ReplaySnapshot.Binding.Organization)', not '$Organization'."
+        }
+        return @{
+            Process        = $null
+            NextId         = [long]0
+            ReadTask       = $null
+            ErrorDrainTask = $null
+            TimeoutSeconds = $TimeoutSeconds
+            Server         = $Server
+            Organization   = $Organization
+            Replay         = $ReplaySnapshot
+        }
+    }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $AgencyPath
     $args = @("mcp", $Server)
@@ -2930,6 +3568,11 @@ Export-ModuleMember -Function @(
     "Send-AgentMcpNotification",
     "Invoke-AgentMcpTool",
     "ConvertFrom-AgentMcpResourceContent",
+    "ConvertTo-AgentReplayCanonicalJson",
+    "Get-AgentReplayRequestKey",
+    "Test-AgentReplayToolPermitted",
+    "New-AgentReplaySnapshot",
+    "Get-AgentReplayResponse",
     "Get-AgentSupportedProvider",
     "Test-AgentProviderSupported",
     "New-AgentProviderContext",

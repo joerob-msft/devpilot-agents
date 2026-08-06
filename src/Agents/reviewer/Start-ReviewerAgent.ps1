@@ -313,7 +313,25 @@ param(
     [int]$ConventionSpecialistTimeoutSeconds = 900,
 
     [ValidateRange(30, 3600)]
-    [int]$VerificationTimeoutSeconds = 900
+    [int]$VerificationTimeoutSeconds = 900,
+
+    # --- Offline snapshot replay. Re-runs the WHOLE stack against reads that
+    # were recorded earlier, so a fix can be demonstrated against the exact
+    # evidence that produced a miss after the pull request has moved on.
+    # Permanently preview-only: see the replay block below the parameter
+    # validation, which refuses every write switch and every promotion, seals
+    # replay artifacts under a separate key domain so they can never be
+    # promoted, and isolates replay state from live state.
+    [string]$ReplayRoot,
+
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')]
+    [string]$ReplaySnapshotName,
+
+    # Required with -ReplaySnapshotName. The manifest's own digest is unkeyed,
+    # so it only proves internal consistency; naming the digest an operator
+    # actually vouched for is what binds this run to that snapshot.
+    [ValidatePattern('^[0-9a-fA-F]{64}$')]
+    [string]$ReplayManifestDigest
 )
 
 $ErrorActionPreference = "Stop"
@@ -587,6 +605,32 @@ $script:ReviewerConventionSpecialistAllowToolCeiling = @(
     "ado(repo_file)"
 )
 
+# Replay is offline, so the model must not keep repository tools: those reach
+# the host through the CLI's own credentials, not through the wrapper's
+# replayed session, and a run that mixed snapshot facts with live facts would
+# be worse than either alone. The list is NARROWED, never emptied - an empty
+# grant makes Get-AgentCopilotArgs omit --available-tools/--allow-tool
+# entirely, which restores Copilot CLI default tool discovery and would hand
+# the model back more than a live run ever grants it.
+#
+# This is a real difference from a live run and is disclosed as one: in replay
+# the model cannot look anything up for itself, so a replay is a LOWER bound on
+# live behaviour, not a reproduction of it.
+$script:ReviewerReplayAllowToolCeiling = @("read")
+$script:ReviewerReplayActive = $false
+$script:ReviewerReplaySnapshot = $null
+# Told to every model pass in replay, generalist and specialist alike. Each of
+# their prompts instructs the pass to re-read the pull request and stop without
+# a marker if it cannot; in replay it cannot, because it holds no repository
+# tool. Left unsaid, a correct pass fails closed for a reason that has nothing
+# to do with the change under review - which is exactly what a live gpt-5.6-sol
+# pass did the first time this ran.
+$script:ReviewerReplayModelNotice = @"
+This cycle is an OFFLINE REPLAY of a sealed snapshot. You have NO repository read tools - not the pull-request tool, not the file tool. That is deliberate and is not a failure.
+The wrapper already read the pull request, its change set and its threads from the snapshot, verified the binding in the runtime data against the snapshot's own recorded identity, and hashed every byte it delivered to you. Treat that binding as established fact.
+Work from what the wrapper delivered. Do NOT stop without a marker merely because you cannot re-read the pull request; emit your marker as usual. If a question cannot be answered from what you were given, say so or leave it alone - do not guess.
+"@
+
 $script:ReviewerVerificationAllowToolCeiling = @(
     "ado(repo_pull_request)",
     "ado(repo_file)"
@@ -690,8 +734,11 @@ $script:ReviewerVerifiedMultiPassMaxGrantAgeSeconds = 120
 function Get-ReviewerHashValue {
     param($Container, [string]$Key, $Default = $null)
     if ($null -eq $Container) { return $Default }
-    if ($Container -is [hashtable]) {
-        if ($Container.ContainsKey($Key)) { return $Container[$Key] }
+    # IDictionary, not just [hashtable]: an [ordered] literal is an
+    # OrderedDictionary, which is not a Hashtable, and falling through to the
+    # $Default for one silently returns nothing for every key it holds.
+    if ($Container -is [System.Collections.IDictionary]) {
+        if ($Container.Contains($Key)) { return $Container[$Key] }
         return $Default
     }
     if ($Container -is [System.Management.Automation.PSCustomObject]) {
@@ -721,9 +768,15 @@ function Get-ReviewerCanonicalJson {
         [void]$script:ReviewerUtf8.GetByteCount($Value)
         return (ConvertTo-Json -InputObject $Value -Compress)
     }
-    if ($Value -is [hashtable] -or $Value -is [System.Management.Automation.PSCustomObject]) {
+    if ($Value -is [System.Collections.IDictionary] -or $Value -is [System.Management.Automation.PSCustomObject]) {
+        # IDictionary, not just [hashtable]. An [ordered] literal is an
+        # OrderedDictionary; it reached the IEnumerable branch below, where
+        # @($Value) wraps rather than enumerates it, so the same object
+        # recursed into itself until this function's own depth bound stopped
+        # it - turning an ordinary record into a fatal "maximum object depth"
+        # in the middle of a run.
         $keys = @()
-        if ($Value -is [hashtable]) { $keys = @($Value.Keys | ForEach-Object { [string]$_ }) }
+        if ($Value -is [System.Collections.IDictionary]) { $keys = @($Value.Keys | ForEach-Object { [string]$_ }) }
         else { $keys = @($Value.PSObject.Properties | ForEach-Object { $_.Name }) }
         $orderedKeys = [System.Collections.Generic.List[string]]::new()
         foreach ($key in $keys) { [void]$orderedKeys.Add($key) }
@@ -804,6 +857,26 @@ function Get-ReviewerArtifactSigningKey {
     }
     Set-Content -LiteralPath $KeyPath -Value ("${storedFormat}:" + [System.Convert]::ToBase64String($toStore)) -Encoding ascii
     return $key
+}
+
+function Get-ReviewerRunArtifactKey {
+    <#
+        The key every artifact this RUN writes is sealed with.
+
+        Outside replay it is the raw per-user master key, unchanged. Inside
+        replay it is a key derived from that master under a dedicated label, so
+        a replay artifact cannot verify against the raw key that -PromotePreview
+        and -PromoteVerifiedPreview read with. That is the enforcement behind
+        "a replay artifact is never promotable": not a boolean an editor can
+        strip, but a signature that cannot be produced. Same H-7 pattern the
+        gate and verification artifacts already use.
+    #>
+    param([Parameter(Mandatory)][string]$KeyPath)
+    $master = Get-ReviewerArtifactSigningKey -KeyPath $KeyPath
+    if (-not $script:ReviewerReplayActive) { return , $master }
+    $hmac = [System.Security.Cryptography.HMACSHA256]::new($master)
+    try { return , $hmac.ComputeHash($script:ReviewerUtf8.GetBytes("devpilot.reviewer.replay.artifact.v1")) }
+    finally { $hmac.Dispose() }
 }
 
 function Get-ReviewerNormalizedDocumentText {
@@ -1507,8 +1580,24 @@ function New-ReviewerDeliveryAuthorization {
         only until a later verification layer explicitly mints VerifiedMultiPass.
         There is deliberately no config, parameter or environment override.
     #>
-    param([Parameter(Mandatory)][ValidateRange(1, 100)][int]$PassCount)
+    param(
+        [Parameter(Mandatory)][ValidateRange(1, 100)][int]$PassCount,
+        # Replay is preview-only by construction, at every pass count. Forcing
+        # it here rather than relying on the startup switch refusal means even a
+        # future call site that forgets the refusal cannot obtain a grant that
+        # would let a replayed run write anything.
+        [switch]$ReplayPreviewOnly
+    )
 
+    if ($ReplayPreviewOnly) {
+        return [ReviewerDeliveryAuthorization]::new(
+            $script:ReviewerDeliveryAuthorizationSeal,
+            $null,
+            [ReviewerDeliveryAuthorizationKind]::PreviewOnly,
+            $PassCount,
+            "offline snapshot replay is permanently preview-only"
+        )
+    }
     if ($PassCount -eq 1) {
         return [ReviewerDeliveryAuthorization]::new(
             $script:ReviewerDeliveryAuthorizationSeal,
@@ -1862,7 +1951,42 @@ function Get-ReviewerEffectiveAllowTools {
 
 function Get-ReviewerEffectiveDenyTools {
     param([string[]]$ConfigDeny)
-    return , @(@(@($ConfigDeny) + $script:ReviewerMandatoryDenyTools) | Select-Object -Unique)
+    $deny = @(@($ConfigDeny) + $script:ReviewerMandatoryDenyTools)
+    if ($script:ReviewerReplayActive) {
+        # Belt and braces with Get-ReviewerLaunchAllowTools. That function keeps
+        # the grant NON-EMPTY, because an empty allow-list makes
+        # Get-AgentCopilotArgs omit the tool flags entirely and hands the model
+        # Copilot CLI's default discovery. Denying the same family here is what
+        # actually leaves the model with nothing: the deny list always wins, so
+        # the launch names a grant and then withdraws it.
+        $deny += @($script:ReviewerReplayAllowToolCeiling)
+    }
+    return , @($deny | Select-Object -Unique)
+}
+
+function Get-ReviewerLaunchAllowTools {
+    <#
+        The permission list a model pass is actually launched with. Outside
+        replay it is exactly what the caller computed, so a preview stays a
+        faithful rehearsal of a posting run.
+
+        Inside replay it is the code-defined offline set. The wrapper's own
+        reads are served from the snapshot, but a model tool would reach the
+        host through the CLI's credentials and mix live facts into a replayed
+        review - and the local file tools would read the working tree, which is
+        neither the snapshot nor the reviewed commit.
+
+        NARROWED, never emptied, and never WIDENED either: the specialist and
+        verifier ceilings do not contain this entry, so replacing rather than
+        intersecting would have granted those passes a tool their own ceiling
+        withholds. Get-ReviewerEffectiveDenyTools denies the same family, so
+        what the launch actually grants is nothing at all - the entry exists
+        only to keep the tool flags present, because an empty grant restores
+        Copilot CLI's default discovery, which is wider than anything here.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Intended)
+    if (-not $script:ReviewerReplayActive) { return , @($Intended) }
+    return , @($script:ReviewerReplayAllowToolCeiling)
 }
 
 $script:ReviewerAuthoritativeTransportVersion = 1
@@ -2287,11 +2411,77 @@ if ($SecondPassModel) {
     }
 }
 $EffectiveSecondPassModel = $ResolvedSecondPassModel
+# ---------------------------------------------------------------------------
+# Offline snapshot replay. Resolved BEFORE the delivery authorization is minted
+# and before the state directory is chosen, because it changes both.
+# ---------------------------------------------------------------------------
+if ($ReplaySnapshotName -or $ReplayRoot -or $ReplayManifestDigest) {
+    if (-not $ReplayRoot -or -not $ReplaySnapshotName -or -not $ReplayManifestDigest) {
+        throw "Offline replay requires all of -ReplayRoot, -ReplaySnapshotName and -ReplayManifestDigest."
+    }
+    if ($DryRun) {
+        throw "-DryRun runs this agent's self-checks against its own fixtures and never opens a session; it cannot be combined with offline replay."
+    }
+    # Refused here, individually and by name, so an operator learns which switch
+    # is the problem. The authorization forced below is what makes it true even
+    # if this list is ever missed.
+    $replayRefusedSwitches = @(
+        @{ Name = "-EnableFindingComments"; Set = [bool]$EnableFindingComments },
+        @{ Name = "-EnableSummaryComment"; Set = [bool]$EnableSummaryComment },
+        @{ Name = "-EnableApprovalVote"; Set = [bool]$EnableApprovalVote },
+        @{ Name = "-EnableVerifiedCommentGate"; Set = [bool]$EnableVerifiedCommentGate },
+        @{ Name = "-EnableVerifiedSuggestionGate"; Set = [bool]$EnableVerifiedSuggestionGate },
+        @{ Name = "-EnableVerifiedApprovalGate"; Set = [bool]$EnableVerifiedApprovalGate },
+        @{ Name = "-PromotePreview"; Set = [bool]$PromotePreview },
+        @{ Name = "-PromoteVerifiedPreview"; Set = [bool]$PromoteVerifiedPreview }
+    )
+    $replayRefused = @($replayRefusedSwitches | Where-Object { $_.Set } | ForEach-Object { [string]$_.Name })
+    if ($replayRefused.Count -gt 0) {
+        throw ("Offline snapshot replay is permanently preview-only and cannot deliver, promote or vote. " +
+            "Remove: $($replayRefused -join ', ').")
+    }
+    $script:ReviewerReplaySnapshot = New-AgentReplaySnapshot -ReplayRoot $ReplayRoot `
+        -SnapshotName $ReplaySnapshotName -ExpectedManifestDigest $ReplayManifestDigest
+    $script:ReviewerReplayActive = $true
+
+    # A snapshot answers every question consistently, including the wrong ones.
+    # Bind it to the configuration this process is actually running under, or a
+    # snapshot of one repository replayed while configured for another produces
+    # a fully self-consistent artifact stamped with the wrong identity.
+    $replayBinding = $script:ReviewerReplaySnapshot.Binding
+    if ([string]$replayBinding.Organization -cne $Organization -or
+        [string]$replayBinding.Project -cne $ExpectedProject -or
+        [string]$replayBinding.RepositoryId -cne $cfgRepoId) {
+        throw ("Replay snapshot '$ReplaySnapshotName' was captured for " +
+            "$($replayBinding.Organization)/$($replayBinding.Project)/$($replayBinding.RepositoryId) " +
+            "and cannot be replayed under this configuration ($Organization/$ExpectedProject/$cfgRepoId).")
+    }
+    if ($PullRequestId -gt 0 -and $PullRequestId -ne [int]$replayBinding.PullRequestId) {
+        throw "Replay snapshot '$ReplaySnapshotName' records pull request $($replayBinding.PullRequestId), not $PullRequestId."
+    }
+    if ($PullRequestId -le 0) {
+        # Never let a replay drive candidate SELECTION: the recorded list is a
+        # moment in that repository's history, and reviewing "whatever it held"
+        # would silently make the run about a different pull request than the
+        # operator pinned.
+        throw "Offline replay requires -PullRequestId naming the pull request the snapshot was captured for ($($replayBinding.PullRequestId))."
+    }
+    if ($script:ReviewerReplaySnapshot.Bindings.ConfigSha256 -cne (Get-FileHash -LiteralPath $ConfigFile -Algorithm SHA256).Hash.ToLowerInvariant()) {
+        Write-Warning ("Replay snapshot '$ReplaySnapshotName' was captured under a different reviewer config; " +
+            "the reads it needs may differ from the reads recorded.")
+    }
+    if ($script:ReviewerReplaySnapshot.Bindings.ScriptSha256 -cne (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()) {
+        Write-Warning ("Replay snapshot '$ReplaySnapshotName' was captured under a different build of this agent; " +
+            "a transport change since then can ask for reads the snapshot does not carry, which fails closed.")
+    }
+}
+
 # The ordered pass list is the single source of truth for how many model runs a
 # PR costs, so every consumer (launch loop, preview, manifest, log) agrees.
 $ReviewPassModels = if ($EffectiveSecondPassModel) { @($EffectiveModel, $EffectiveSecondPassModel) } else { @($EffectiveModel) }
 $IsTwoPass = (@($ReviewPassModels).Count -gt 1)
-$DeliveryAuthorization = New-ReviewerDeliveryAuthorization -PassCount @($ReviewPassModels).Count
+$DeliveryAuthorization = New-ReviewerDeliveryAuthorization -PassCount @($ReviewPassModels).Count `
+    -ReplayPreviewOnly:$script:ReviewerReplayActive
 $StartupWritesRequested = Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) `
     -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)
 # Promotion is write intent even before its individual capabilities are checked.
@@ -2425,6 +2615,13 @@ if (-not $StateDir) {
     $base = $env:LOCALAPPDATA
     if (-not $base) { $base = Join-Path $HOME ".local-state" }
     $StateDir = Join-Path (Join-Path (Join-Path $base $stateNamespace) "Reviewer") $AgentName
+}
+if ($script:ReviewerReplayActive) {
+    # Replay state is separate state. Sharing the live directory would let a
+    # replay burn a real pull request's attempt budget, supersede its recorded
+    # gate decisions, and drop preview artifacts a later live run reads back -
+    # external mutation by another name, and reached without any write switch.
+    $StateDir = Join-Path (Join-Path $StateDir "replay") $script:ReviewerReplaySnapshot.SnapshotId
 }
 New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
 $StateDir = (Resolve-Path -LiteralPath $StateDir).Path
@@ -2681,6 +2878,11 @@ function Get-ReviewerGateQualification {
         return @{ Qualification = $null; Sha256 = ("0" * 64) }
     }
     $resolvedQualificationPath = (Resolve-Path -LiteralPath $GateQualificationFile).Path
+    # The RAW master key, deliberately: a qualification artifact is minted out
+    # of band by tools/New-ReviewerGateQualification.ps1, so this reads someone
+    # else's artifact, like the two promotion readers - not something this run
+    # sealed. Under the per-run key it would fail verification in every replay,
+    # with a message that reads like tampering.
     $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
     $read = Read-ReviewerGateQualification -Path $resolvedQualificationPath -MasterKey $masterKey
     if (-not $read.Ok) {
@@ -2832,7 +3034,8 @@ function Invoke-ReviewerConventionSession {
             param([string]$Path)
             Open-AgentMcpSession -AgencyPath $Path -Server "ado" `
                 -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
-                -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+                -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables `
+                -ReplaySnapshot $script:ReviewerReplaySnapshot
         }
     }
     if (-not $CloseSession) {
@@ -2877,7 +3080,8 @@ function Get-ReviewerAuthoritativeSourceSnapshots {
             try {
                 $sourceSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
                     -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
-                    -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+                    -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables `
+                    -ReplaySnapshot $script:ReviewerReplaySnapshot
             }
             catch {
                 if ($ConventionPackMode) {
@@ -3090,14 +3294,14 @@ function Save-ReviewerConventionPlan {
     )
     $planHash = Get-ReviewerConventionSpecialistObjectSha256 -Value $Plan
     $baseName = "pr$PrId-$SourceCommit-$($planHash.Substring(0, 16))"
-    $key = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $key = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
     return Save-ReviewerConventionPlanFile -Plan $Plan -Directory $conventionPlanDir `
         -BaseName $baseName -MasterKey $key
 }
 
 function Read-ReviewerConventionPlan {
     param([Parameter(Mandatory)][string]$Path)
-    $key = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $key = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
     return Read-ReviewerConventionPlanFile -Path $Path -MasterKey $key
 }
 
@@ -3360,13 +3564,13 @@ function Save-ReviewerFactPlan {
     $planHash = [string](Get-ReviewerFactValue $Plan "planSha256" "")
     if ($planHash -notmatch '^[0-9a-f]{64}$') { throw "A persisted fact plan requires a valid planSha256." }
     $baseName = "pr$PrId-$SourceCommit-$($planHash.Substring(0, 16))"
-    $key = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $key = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
     return Save-ReviewerFactPlanFile -Plan $Plan -Directory $factPlanDir -BaseName $baseName -Key $key
 }
 
 function Read-ReviewerFactPlan {
     param([Parameter(Mandatory)][string]$Path)
-    $key = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $key = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
     return Read-ReviewerFactPlanFile -Path $Path -SchemaPath $ReviewFactSchemaPath -Key $key
 }
 
@@ -3455,6 +3659,18 @@ function Get-ReviewerRuntimeContext {
     $lines.Add("")
     $lines.Add("You have NO write tools this cycle, and never will: you do not post comments and you do not vote. Report findings in the marker; the wrapper performs any write. Do not attempt a write and do not treat its absence as an error.")
     $lines.Add("")
+    if ($script:ReviewerReplayActive) {
+        # Without this the run fails closed for the wrong reason: the prompt
+        # tells the model to re-read the pull request and stop without a marker
+        # if it cannot, and in replay it cannot, because it has no repository
+        # tool. The binding above was verified by the wrapper against a sealed
+        # snapshot before this text was written, so re-reading would add nothing
+        # even if it were possible.
+        $lines.Add("## Offline replay (wrapper-verified binding)")
+        $lines.Add("")
+        $lines.Add($script:ReviewerReplayModelNotice.TrimEnd())
+        $lines.Add("")
+    }
     if ($RepoConventionsText) {
         $lines.Add("## Repository conventions (supplied by this repository's config, not by the prompt)")
         $lines.Add("")
@@ -3673,6 +3889,80 @@ function Format-ReviewerCoveragePathCell {
     return "(unsafe path, not shown)"
 }
 
+function Get-ReviewerReplayDeterminismDigests {
+    <#
+        Two digests, deliberately separate, because they make two different
+        claims.
+
+        replayInputDigest covers only what the WRAPPER computed from the
+        snapshot: the change-set digest, the whole source-coverage record, and
+        the tool grant. Nothing a model wrote enters it, so two replays of one
+        snapshot MUST produce the same value. A difference here is a
+        determinism defect in this toolkit.
+
+        replayOutcomeDigest covers the wrapper's normalized DECISIONS: the
+        anchor and severity of every candidate it would post, in sorted order,
+        plus the counts and the recommended vote. Comment prose is excluded, so
+        two models that say the same thing differently agree here - but the set
+        of anchors is still downstream of a live model, so a difference is a
+        real semantic difference and is reported as one rather than smoothed
+        over.
+    #>
+    param(
+        $SourceCoverage,
+        [object[]]$Postable = @(),
+        [object[]]$AllFindings = @(),
+        [Parameter(Mandatory)][AllowEmptyString()][string]$RecommendedVote,
+        [string[]]$AllowTools = @()
+    )
+    $counts = Get-ReviewerSeverityCounts -Findings $AllFindings
+    # Named fields, not a blanket canonicalization of the whole coverage record:
+    # that record nests deeply enough to blow the canonical-JSON depth bound,
+    # and a digest that can throw is a digest that takes the run with it. These
+    # are the wrapper-computed facts a replay must reproduce exactly.
+    $coverageRecord = [ordered]@{}
+    if ($null -ne $SourceCoverage) {
+        foreach ($field in @(
+                "coveredFiles", "sourceBearingFileCount", "coveragePercent",
+                "totalSliceBytes", "totalSiblingBytes", "deliveredSpanCount",
+                "requestedSpanCount", "spanPercent", "changeSetExcusedFileCount",
+                "readerExcusedFileCount")) {
+            $coverageRecord[$field] = [int](Get-ReviewerHashValue -Container $SourceCoverage -Key $field -Default 0)
+        }
+        $coverageRecord["files"] = @(@(Get-ReviewerHashValue -Container $SourceCoverage -Key 'files' -Default @()) |
+            ForEach-Object {
+                "{0}|{1}|{2}|{3}" -f `
+                (Get-ReviewerNormalizedPath -Path ([string](Get-ReviewerHashValue -Container $_ -Key 'path' -Default ''))),
+                ([string](Get-ReviewerHashValue -Container $_ -Key 'status' -Default '')),
+                ([string](Get-ReviewerHashValue -Container $_ -Key 'reason' -Default '')),
+                ([int](Get-ReviewerHashValue -Container $_ -Key 'deliveredSpanCount' -Default 0))
+            } | Sort-Object)
+    }
+    $inputRecord = [ordered]@{
+        coverage   = $coverageRecord
+        allowTools = @(@($AllowTools) | Sort-Object)
+    }
+    $anchors = @(@($Postable) | ForEach-Object {
+            "{0}|{1}|{2}" -f `
+            ([string](Get-ReviewerHashValue -Container $_ -Key 'severity' -Default '')).ToLowerInvariant(),
+            (Get-ReviewerNormalizedPath -Path ([string](Get-ReviewerHashValue -Container $_ -Key 'filePath' -Default ''))),
+            ([int](Get-ReviewerHashValue -Container $_ -Key 'line' -Default 0))
+        } | Sort-Object)
+    $outcomeRecord = [ordered]@{
+        anchors = @($anchors)
+        counts  = [ordered]@{
+            critical   = [int]$counts['critical']
+            important  = [int]$counts['important']
+            suggestion = [int]$counts['suggestion']
+        }
+        vote    = $RecommendedVote
+    }
+    return @{
+        InputDigest   = Get-ReviewerTextSha256 -Text (Get-ReviewerCanonicalJson -Value $inputRecord)
+        OutcomeDigest = Get-ReviewerTextSha256 -Text (Get-ReviewerCanonicalJson -Value $outcomeRecord)
+    }
+}
+
 function Write-ReviewerPreview {
     <#
         Writes the candidate comments to a file and to the console. This is what
@@ -3766,6 +4056,16 @@ function Write-ReviewerPreview {
         [void]$lines.Add("- Convention authority consulted: $ConventionSourceSummary")
     }
     [void]$lines.Add($(if ($Quiet) { "- Posting was enabled for this run; see the agent log for what was actually posted." } else { "- Nothing was posted: this is a preview." }))
+    if ($script:ReviewerReplayActive) {
+        $replayDigests = Get-ReviewerReplayDeterminismDigests -SourceCoverage $SourceCoverage `
+            -Postable $Postable -AllFindings $AllFindings -RecommendedVote $RecommendedVote `
+            -AllowTools (Get-ReviewerLaunchAllowTools -Intended (Get-ReviewerEffectiveAllowTools -BaseAllow $ConfigAllowTools))
+        [void]$lines.Add("- OFFLINE REPLAY of snapshot ``$($script:ReviewerReplaySnapshot.SnapshotId)`` (manifest digest ``$($script:ReviewerReplaySnapshot.ManifestDigest)``, replay nonce ``$($script:ReviewerReplaySnapshot.ReplayNonce)``). Every repository read came from that snapshot; no repository was contacted.")
+        [void]$lines.Add("- Replay input digest (wrapper-computed, must be identical on every replay of this snapshot): ``$($replayDigests.InputDigest)``")
+        [void]$lines.Add("- Replay outcome digest (wrapper-normalized decisions, excludes comment prose): ``$($replayDigests.OutcomeDigest)``")
+        [void]$lines.Add("- This is NOT a reproduction of a live run: the model was launched with the offline grant (``$($script:ReviewerReplayAllowToolCeiling -join ', ')``) and that same family denied, so it had no usable tool and could not look anything up for itself. A replay is therefore a LOWER bound on what a live run would find, and its marker-emission behaviour is not comparable to live: each pass is told not to stop merely because it cannot re-read the pull request.")
+        [void]$lines.Add("- This artifact is evidence, not an approved review: it is sealed under the replay key domain and can never be promoted.")
+    }
     [void]$lines.Add("")
     if ($passCount -gt 1) {
         # Which model said what is the first thing a reader of a two-pass review
@@ -3896,7 +4196,21 @@ function Write-ReviewerPreview {
             $artifact = @{
                 manifestJson = $manifestJson
                 signatureAlg = "HMACSHA256"
-                signature    = (Get-ReviewerArtifactSignature -ManifestJson $manifestJson -Key (Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath))
+                signature    = (Get-ReviewerArtifactSignature -ManifestJson $manifestJson -Key (Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath))
+            }
+            if ($script:ReviewerReplayActive) {
+                # Labelling, not enforcement. The enforcement is that the
+                # signature above was produced under the replay key domain and
+                # therefore cannot verify against the raw key -PromotePreview
+                # reads with; stripping this block does not make the artifact
+                # promotable. It is here so a human reading the file knows what
+                # it is without having to reason about key derivation.
+                $artifact["replay"] = @{
+                    snapshotId     = $script:ReviewerReplaySnapshot.SnapshotId
+                    manifestDigest = $script:ReviewerReplaySnapshot.ManifestDigest
+                    replayNonce    = $script:ReviewerReplaySnapshot.ReplayNonce
+                    promotable     = $false
+                }
             }
             Set-Content -LiteralPath $artifactPath -Value (ConvertTo-Json -InputObject $artifact -Depth 4) -Encoding UTF8
         }
@@ -3915,7 +4229,12 @@ function Write-ReviewerPreview {
         Write-Host $text
         Write-Host "===== end preview; saved to $path =====" -ForegroundColor Magenta
         if ($artifactPath) {
-            Write-Host "Publish exactly this review with: -PromotePreview `"$artifactPath`" -EnableFindingComments" -ForegroundColor Cyan
+            if ($script:ReviewerReplayActive) {
+                Write-Host "This is a REPLAY artifact and is not promotable: it is sealed under the replay key domain, so -PromotePreview cannot verify it." -ForegroundColor DarkYellow
+            }
+            else {
+                Write-Host "Publish exactly this review with: -PromotePreview `"$artifactPath`" -EnableFindingComments" -ForegroundColor Cyan
+            }
         }
     }
     Write-Host ""
@@ -7890,7 +8209,9 @@ function Write-ReviewerConventionSpecialistPreview {
         [hashtable]$ToolAudit = @{},
         [object[]]$Candidates = @(),
         [object[]]$Withheld = @(),
-        [object[]]$ResidualRisks = @()
+        [object[]]$ResidualRisks = @(),
+        [hashtable]$RuleCoverage = $null,
+        [object[]]$ChangedFileIndex = @()
     )
     $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ")
     $baseName = "pr$PrId-$($SourceCommit.Substring(0, 12))-$stamp-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
@@ -7905,6 +8226,9 @@ function Write-ReviewerConventionSpecialistPreview {
     [void]$lines.Add("- Context bytes: $ContextBytes")
     [void]$lines.Add("- Candidates: $(@($Candidates).Count)")
     [void]$lines.Add("- Nothing in this preview was merged, posted, or voted.")
+    if ($script:ReviewerReplayActive) {
+        [void]$lines.Add("- OFFLINE REPLAY of snapshot ``$($script:ReviewerReplaySnapshot.SnapshotId)`` (manifest digest ``$($script:ReviewerReplaySnapshot.ManifestDigest)``, replay nonce ``$($script:ReviewerReplaySnapshot.ReplayNonce)``); sealed under the replay key domain and never promotable.")
+    }
     if ($Diagnostic) { [void]$lines.Add("- Diagnostic: $Diagnostic") }
     [void]$lines.Add("")
     [void]$lines.Add("## Candidates")
@@ -7941,6 +8265,55 @@ function Write-ReviewerConventionSpecialistPreview {
         foreach ($risk in @($ResidualRisks)) {
             [void]$lines.Add("- $([string](Get-ReviewerConventionSpecialistValue $risk 'text' ''))")
         }
+        [void]$lines.Add("")
+    }
+    if ($null -ne $RuleCoverage) {
+        # The point of this section is the rules that produced NOTHING. A
+        # reviewer that reports two findings has said nothing about the other
+        # six rules it was given, and "nothing" is exactly what a miss looks
+        # like. Printing every row makes the difference between "checked and
+        # clean" and "never looked" visible without reading the JSON.
+        [void]$lines.Add("## Rule accounting")
+        [void]$lines.Add("")
+        [void]$lines.Add("- Transported rule sources: $([int]$RuleCoverage.ExpectedSourceCount); requested: $([int]$RuleCoverage.RequestedSourceCount); accounted for: $([int]$RuleCoverage.AccountedSourceCount)")
+        [void]$lines.Add("- Complete: $([bool]$RuleCoverage.Complete)")
+        if ([int]$RuleCoverage.DegradedRowCount -gt 0) {
+            [void]$lines.Add("- Rows the wrapper degraded to unknown: $([int]$RuleCoverage.DegradedRowCount)")
+        }
+        if (@($RuleCoverage.Missing).Count -gt 0) {
+            [void]$lines.Add("- NOT accounted for: $(@($RuleCoverage.Missing) -join ', ')")
+        }
+        if (@($RuleCoverage.Duplicates).Count -gt 0) {
+            [void]$lines.Add("- Accounted for more than once: $(@($RuleCoverage.Duplicates) -join ', ')")
+        }
+        if (@($RuleCoverage.Unknown).Count -gt 0) {
+            [void]$lines.Add("- Rows naming a source that was never transported: $(@($RuleCoverage.Unknown) -join ', ')")
+        }
+        if (@($RuleCoverage.UnaccountedCandidates).Count -gt 0) {
+            [void]$lines.Add("- Candidates with no accounting row: $(@($RuleCoverage.UnaccountedCandidates) -join ', ')")
+        }
+        [void]$lines.Add("")
+        if (@($ChangedFileIndex).Count -gt 0) {
+            [void]$lines.Add("Anchor ids: " + (@(@($ChangedFileIndex) | ForEach-Object {
+                        "$([string](Get-ReviewerConventionSpecialistValue $_ 'anchorId' ''))=$([string](Get-ReviewerConventionSpecialistValue $_ 'path' ''))"
+                    }) -join ', '))
+            [void]$lines.Add("")
+        }
+        foreach ($row in @($RuleCoverage.Rows)) {
+            [void]$lines.Add("### $([string](Get-ReviewerConventionSpecialistValue $row 'ruleSourceId' '')) - $([string](Get-ReviewerConventionSpecialistValue $row 'status' 'unknown'))")
+            [void]$lines.Add("")
+            [void]$lines.Add("- Pack: $([string](Get-ReviewerConventionSpecialistValue $row 'packName' ''))")
+            [void]$lines.Add("- Rule quote: $([string](Get-ReviewerConventionSpecialistValue $row 'ruleQuote' '(none)'))")
+            [void]$lines.Add("- Changed anchors: $([string](Get-ReviewerConventionSpecialistValue $row 'changedAnchors' '(none)'))")
+            [void]$lines.Add("- Code evidence: $([string](Get-ReviewerConventionSpecialistValue $row 'codeEvidence' ''))")
+            [void]$lines.Add("- Sibling: $([string](Get-ReviewerConventionSpecialistValue $row 'siblingStatus' '')) - $([string](Get-ReviewerConventionSpecialistValue $row 'siblingEvidence' ''))")
+            $linked = [string](Get-ReviewerConventionSpecialistValue $row 'candidateId' '')
+            [void]$lines.Add("- Candidate: $(if ($linked) { $linked } else { 'none' })")
+            [void]$lines.Add("- Notes: $([string](Get-ReviewerConventionSpecialistValue $row 'notes' ''))")
+            $degraded = [string](Get-ReviewerConventionSpecialistValue $row 'degradedReason' '')
+            if ($degraded) { [void]$lines.Add("- Wrapper degraded this row to unknown because $degraded.") }
+            [void]$lines.Add("")
+        }
     }
     $markdown = $lines.ToArray() -join "`n"
     [IO.File]::WriteAllText($markdownPath, $markdown, $script:ReviewerConventionSpecialistUtf8)
@@ -7965,13 +8338,40 @@ function Write-ReviewerConventionSpecialistPreview {
         contextBytes = $ContextBytes
         toolAudit = $ToolAudit
         candidates = @($Candidates)
+        ruleCoverage = $(if ($null -eq $RuleCoverage) {
+                $null
+            }
+            else {
+                [pscustomobject][ordered]@{
+                    complete = [bool]$RuleCoverage.Complete
+                    expectedSourceCount = [int]$RuleCoverage.ExpectedSourceCount
+                    requestedSourceCount = [int]$RuleCoverage.RequestedSourceCount
+                    accountedSourceCount = [int]$RuleCoverage.AccountedSourceCount
+                    degradedRowCount = [int]$RuleCoverage.DegradedRowCount
+                    missing = @($RuleCoverage.Missing)
+                    duplicates = @($RuleCoverage.Duplicates)
+                    unknown = @($RuleCoverage.Unknown)
+                    unaccountedCandidates = @($RuleCoverage.UnaccountedCandidates)
+                    rows = @($RuleCoverage.Rows)
+                    changedFileAnchors = @($ChangedFileIndex)
+                }
+            })
         withheld = @($Withheld)
         residualRisks = @($ResidualRisks)
         markdownPath = $markdownPath
         markdownSha256 = Get-ReviewerConventionSpecialistSha256 -Text $markdown
+        replay = $(if ($script:ReviewerReplayActive) {
+                [pscustomobject][ordered]@{
+                    snapshotId = [string]$script:ReviewerReplaySnapshot.SnapshotId
+                    manifestDigest = [string]$script:ReviewerReplaySnapshot.ManifestDigest
+                    replayNonce = [string]$script:ReviewerReplaySnapshot.ReplayNonce
+                    promotable = $false
+                }
+            }
+            else { $null })
         createdAt = [DateTime]::UtcNow.ToString("o")
     }
-    $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $masterKey = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
     $artifactPath = Save-ReviewerConventionSpecialistPreview -Directory $conventionSpecialistPreviewDir `
         -BaseName $baseName -Manifest $manifest -MasterKey $masterKey
     Write-Host "Convention specialist preview for PR $PrId saved to $markdownPath" -ForegroundColor DarkCyan
@@ -8016,6 +8416,8 @@ function Invoke-ReviewerConventionSpecialistPass {
     $candidates = @()
     $withheld = @()
     $residualRisks = @()
+    $ruleCoverage = $null
+    $changedFileIndex = @()
     $run = $null
     $preview = $null
     $markerSource = ""
@@ -8074,14 +8476,15 @@ function Invoke-ReviewerConventionSpecialistPass {
                 -ScriptSha256 $ScriptSelfSha256 -PromptSha256 $ConventionSpecialistPromptSha256 `
                 -ConventionPlan $conventionPlan -FactPlan $factPlan `
                 -ResolvedSources @($sessionData.Sources) -ChangeEntries @($sessionData.Changes) `
-                -ThreadDigestText $ThreadDigestText -PinnedSourceText $PinnedSourceText
+                -ThreadDigestText $ThreadDigestText -PinnedSourceText $PinnedSourceText `
+                -ReplayNotice $(if ($script:ReviewerReplayActive) { $script:ReviewerReplayModelNotice } else { "" })
             $contextBytes = [int]$specialistInput.Bytes
             if ([bool]$specialistInput.PinnedSourceDropped) {
                 Write-Warning ("PR $PrId's pinned source did not fit the convention specialist's input bound; " +
                     "the specialist was told to treat every changed file as unread.")
                 $toolAudit.pinnedSourceDropped = $true
             }
-            $allowTools = @($script:ReviewerConventionSpecialistAllowToolCeiling)
+            $allowTools = Get-ReviewerLaunchAllowTools -Intended $script:ReviewerConventionSpecialistAllowToolCeiling
             $availableTools = ConvertTo-ReviewerAvailableToolNames -PermissionTools $allowTools
             $denyTools = Get-ReviewerEffectiveDenyTools -ConfigDeny $ConfigDenyTools
             $toolAudit.availableTools = @($availableTools)
@@ -8156,6 +8559,8 @@ function Invoke-ReviewerConventionSpecialistPass {
             $candidates = @($validated.Candidates)
             $withheld = @($validated.Withheld)
             $residualRisks = @($validated.ResidualRisks)
+            $ruleCoverage = $validated.RuleCoverage
+            $changedFileIndex = @($validated.ChangedFileIndex)
             foreach ($unknownTool in @($toolAudit.unrecognizedTools)) {
                 if (@($residualRisks).Count -ge 12) { break }
                 $residualRisks += [pscustomobject][ordered]@{
@@ -8204,11 +8609,15 @@ function Invoke-ReviewerConventionSpecialistPass {
             -Status $status -Diagnostic $diagnostic -Model $EffectiveConventionSpecialistModel `
             -ConventionPlanSha256 $conventionPlanSha256 -FactPlanSha256 $factPlanSha256 `
             -PackNames $packNames -ContextBytes $contextBytes -ToolAudit $toolAudit `
-            -Candidates $candidates -Withheld $withheld -ResidualRisks $residualRisks
+            -Candidates $candidates -Withheld $withheld -ResidualRisks $residualRisks `
+            -RuleCoverage $ruleCoverage -ChangedFileIndex $changedFileIndex
         Write-ReviewerCycleMetadata -Fields @{
             cycle = $CycleNumber; mode = "convention-specialist"; result = $status; prId = $PrId
             sourceCommit = $SourceCommit; model = $EffectiveConventionSpecialistModel
             candidateCount = @($candidates).Count; withheldCount = @($withheld).Count
+            ruleCoverageComplete = $(if ($null -eq $ruleCoverage) { $false } else { [bool]$ruleCoverage.Complete })
+            ruleCoverageAccounted = $(if ($null -eq $ruleCoverage) { 0 } else { [int]$ruleCoverage.AccountedSourceCount })
+            ruleCoverageExpected = $(if ($null -eq $ruleCoverage) { 0 } else { [int]$ruleCoverage.ExpectedSourceCount })
             previewPath = $preview.MarkdownPath; artifactPath = $preview.ArtifactPath
             diagnostic = $diagnostic
         }
@@ -8223,6 +8632,7 @@ function Invoke-ReviewerConventionSpecialistPass {
         Diagnostic = $diagnostic
         ArtifactPath = $(if ($preview) { [string]$preview.ArtifactPath } else { "" })
         Manifest = $(if ($preview) { $preview.Manifest } else { $null })
+        RuleCoverage = $ruleCoverage
     }
 }
 
@@ -8420,7 +8830,7 @@ function Write-ReviewerVerificationDecisionPreview {
         markdownSha256 = Get-ReviewerVerificationSha256 -Text $markdown
         createdAt = [DateTime]::UtcNow.ToString("o", [Globalization.CultureInfo]::InvariantCulture)
     }
-    $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $masterKey = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
     $artifactPath = Save-ReviewerVerificationPreview -Manifest $manifest `
         -Directory $verificationPreviewDir -BaseName $baseName -MasterKey $masterKey `
         -MaxArtifactBytes ([int]$EffectiveCrossVerificationPolicy.maxArtifactBytes)
@@ -8453,7 +8863,24 @@ function Invoke-ReviewerVerificationModelRun {
         -DeterministicFacts $DeterministicFacts -SanitizedThreads $ThreadFacts `
         -MinimalDiffHunk (ConvertTo-ReviewerVerificationCanonicalArray -Items @($EvidenceHunks)) `
         -MaxInputBytes ([int]$EffectiveCrossVerificationPolicy.maxInputBytes)
-    $allowTools = @($script:ReviewerVerificationAllowToolCeiling)
+    if ($script:ReviewerReplayActive) {
+        # Same reason as the other two passes: the verifier is told it may read
+        # the pull request, and in replay it holds no tool that can. Appended
+        # after the sealed input so it cannot displace any of it, and still
+        # inside the same bound the builder enforced.
+        $replayText = ([string]$modelInput.text) + "`n---`n## Offline replay (wrapper-verified binding)`n`n" +
+        $script:ReviewerReplayModelNotice.TrimEnd() + "`n"
+        $replayBytes = $script:ReviewerUtf8.GetByteCount($replayText)
+        # The same effective ceiling the builder applied: policy may narrow the
+        # code-defined bound but never widen it, and the replay path must not
+        # be the one place that admits input the ordinary path would refuse.
+        $replayCeiling = [Math]::Min([int]$EffectiveCrossVerificationPolicy.maxInputBytes, $script:ReviewerVerificationMaxInputBytes)
+        if ($replayBytes -gt $replayCeiling) {
+            throw "Verification model input with the replay notice is $replayBytes bytes, above the effective $replayCeiling-byte bound."
+        }
+        $modelInput = [pscustomobject][ordered]@{ text = $replayText; bytes = $replayBytes }
+    }
+    $allowTools = Get-ReviewerLaunchAllowTools -Intended $script:ReviewerVerificationAllowToolCeiling
     $availableTools = ConvertTo-ReviewerAvailableToolNames -PermissionTools $allowTools
     $denyTools = Get-ReviewerEffectiveDenyTools -ConfigDeny $ConfigDenyTools
     $agencyArgs = Get-AgentCopilotArgs -AgentName "" -Source "" `
@@ -8884,7 +9311,7 @@ function Invoke-ReviewerCrossVerificationPass {
         allInputArtifactHashes = $inputBody.allInputArtifactHashes
     }
     $baseName = "pr$prId-$($sourceCommit.Substring(0, 12))-$($inputManifestSha.Substring(0, 16))"
-    $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $masterKey = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
     $inputArtifactPath = Save-ReviewerVerificationInput -Manifest $inputManifest `
         -Directory $verificationInputDir -BaseName $baseName -MasterKey $masterKey `
         -MaxArtifactBytes ([int]$EffectiveCrossVerificationPolicy.maxArtifactBytes)
@@ -9400,7 +9827,7 @@ function Invoke-ReviewerModelPass {
     # passed, nor on which pass this is: the model's privileges are identical on
     # every run, which is what makes a preview a faithful rehearsal of a posting
     # run.
-    $allowTools = Get-ReviewerEffectiveAllowTools -BaseAllow $ConfigAllowTools
+    $allowTools = Get-ReviewerLaunchAllowTools -Intended (Get-ReviewerEffectiveAllowTools -BaseAllow $ConfigAllowTools)
     $availableTools = ConvertTo-ReviewerAvailableToolNames -PermissionTools $allowTools
     $denyTools = Get-ReviewerEffectiveDenyTools -ConfigDeny $ConfigDenyTools
     $modelArg = if ($PassModel -eq (Get-AgentDefaultModelSentinel)) { $null } else { $PassModel }
@@ -9591,7 +10018,7 @@ function Write-ReviewerGatePreview {
     )
     $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ", [Globalization.CultureInfo]::InvariantCulture)
     $baseName = "pr$PrId-$($Decision.sourceCommit.Substring(0, 12))-$stamp-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
-    $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $masterKey = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
     $artifactPath = Save-ReviewerGateDecision -Manifest $Decision -Directory $gateDecisionDir -BaseName $baseName -MasterKey $masterKey
     $markdownPath = ""
     if ($RenderMarkdown) {
@@ -9754,7 +10181,7 @@ function New-ReviewerVerifiedMultiPassAuthorization {
             "VerifiedMultiPass mint for '$Purpose' on PR ${PrId}: refused (decisionArtifactMissing)."
         )
     }
-    $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+    $masterKey = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
     try {
         $decision = Read-ReviewerGateDecision -Path $DecisionArtifactPath -MasterKey $masterKey
     }
@@ -10000,7 +10427,8 @@ function Invoke-ReviewerGateDelivery {
     try {
         $sessionForWrite = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
             -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
-            -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+            -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables `
+            -ReplaySnapshot $script:ReviewerReplaySnapshot
         $existingFingerprints = $FirstRevalidation.ExistingFingerprints
         foreach ($entry in $stillEligible) {
             $finding = @{ severity = [string]$entry.severity; filePath = [string]$entry.filePath; line = [int]$entry.line; comment = [string]$entry.comment }
@@ -10197,7 +10625,7 @@ function Invoke-ReviewerGateForPullRequest {
         $eligible = @(Get-ReviewerHashValue -Container $VerificationResult -Key 'Eligible' -Default @())
         $withheld = @(Get-ReviewerHashValue -Container $VerificationResult -Key 'Withheld' -Default @())
 
-        $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+        $masterKey = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
         $inputManifest = $null
         $verificationInputSha256 = "0" * 64
         $verificationDecisionSha256 = "0" * 64
@@ -10638,7 +11066,7 @@ function Invoke-ReviewerGateReplay {
             Write-Warning "PR $PrId has an unfinished gate delivery whose sealed decision is no longer on disk; it will be re-sealed on the next full review instead of replayed."
             return
         }
-        $masterKey = Get-ReviewerArtifactSigningKey -KeyPath $artifactKeyPath
+        $masterKey = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
         $decision = Read-ReviewerGateDecision -Path $artifactPath -MasterKey $masterKey
 
         # Fatal, before any revalidation session or write: a decision whose
@@ -11440,6 +11868,14 @@ function Invoke-ReviewerPromotion {
 
     $manifestJson = [string](Get-ReviewerHashValue -Container $raw -Key 'manifestJson' -Default '')
     $signature = [string](Get-ReviewerHashValue -Container $raw -Key 'signature' -Default '')
+    if ($raw.PSObject.Properties['replay']) {
+        # Defence in depth with a readable message. The real barrier is the key
+        # domain - a replay artifact's signature cannot verify below - but an
+        # operator who tries this deserves to be told why rather than shown a
+        # generic tampering error.
+        throw ("Artifact '$ArtifactPath' was produced by an offline snapshot replay. Replay output is evidence about " +
+            "a recorded pull request state, never an approved review, and is permanently non-promotable.")
+    }
     if (-not $manifestJson) {
         throw ("This preview artifact predates artifact sealing (no signed manifest) and cannot be promoted. " +
             "Re-run the reviewer to produce a sealed artifact: $ArtifactPath")
@@ -11607,7 +12043,8 @@ function Invoke-ReviewerPromotion {
         if ($ownsSession) {
             $session = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
                 -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
-                -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+                -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables `
+                -ReplaySnapshot $script:ReviewerReplaySnapshot
         }
 
         $allFindings = @($marker['findings'])
@@ -11913,7 +12350,8 @@ function Invoke-ReviewerPromoteVerifiedPreview {
         if ($ownsSession) {
             $session = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
                 -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
-                -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+                -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables `
+                -ReplaySnapshot $script:ReviewerReplaySnapshot
         }
         $existingFingerprints = $dedicatedRevalidation.ExistingFingerprints
         $failures = 0
@@ -11985,7 +12423,8 @@ function Invoke-ReviewerCycle {
     try {
         $session = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "ado" `
             -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
-            -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+            -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables `
+            -ReplaySnapshot $script:ReviewerReplaySnapshot
 
         # -- Step 1: candidate list (wrapper-owned, deterministic) ------------
         $rawPrs = Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
@@ -12534,7 +12973,10 @@ $lock = Enter-AgentLock -Path $lockPath -AgentName $AgentName
 try {
     # Fail closed on a missing MCP server rather than running a cycle in which
     # the model silently has no tools, produces no marker, and starves the PR.
-    $missingMcpServers = @(Get-AgentMissingMcpServers -AllowToolEntries @($ConfigAllowTools) -RepositoryPath $RepoPath)
+    # Asked about the grant the model will ACTUALLY receive: in offline replay
+    # that grant carries no repository tools, so demanding a repository MCP
+    # server would refuse to start a run that never needed one.
+    $missingMcpServers = @(Get-AgentMissingMcpServers -AllowToolEntries (Get-ReviewerLaunchAllowTools -Intended $ConfigAllowTools) -RepositoryPath $RepoPath)
     if ($missingMcpServers.Count -gt 0) {
         throw ("This repository does not declare MCP server(s) required by the allow-list: $($missingMcpServers -join ', '). " +
             "Copilot would start normally but the model would have none of those tools - it could not read the pull request, " +

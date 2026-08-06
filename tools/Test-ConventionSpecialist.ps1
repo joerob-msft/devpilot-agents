@@ -229,6 +229,18 @@ $candidate = [pscustomobject][ordered]@{
     confidence = "high"
     residualRiskSummary = "Line coverage is file-granular because the transport exposes no verified right-side spans."
 }
+$coverageRow = [pscustomobject][ordered]@{
+    ruleRef = "rs0"
+    ruleSourceSha256 = "d" * 64
+    ruleQuote = "validation manifests are required"
+    status = "violation"
+    changedAnchors = "cf0:12"
+    codeEvidence = "The changed build registration omits the required manifest."
+    siblingStatus = "checked"
+    siblingEvidence = "Unchanged sibling registrations include the manifest entry."
+    candidateId = "manifest-validation"
+    notes = ""
+}
 $markerObject = [pscustomobject][ordered]@{
     schemaVersion = 1
     prId = 42
@@ -243,6 +255,7 @@ $markerObject = [pscustomobject][ordered]@{
     scriptSha256 = $scriptSha
     promptSha256 = $promptSha
     candidates = @($candidate)
+    ruleCoverage = @($coverageRow)
     withheld = @()
     residualRisks = @([pscustomobject][ordered]@{ text = "Changed-line spans are unavailable from this transport." })
     nonce = "nonce-1"
@@ -610,7 +623,7 @@ $expectedInputParameters = @(
     "SourceCommit", "TargetCommit", "ChangeSetDigest", "ConventionPlanSha256",
     "FactPlanSha256", "ConfigSha256", "ScriptSha256", "PromptSha256",
     "ConventionPlan", "FactPlan", "ResolvedSources", "ChangeEntries",
-    "ThreadDigestText", "PinnedSourceText", "MaxInputBytes"
+    "ThreadDigestText", "PinnedSourceText", "ReplayNotice", "MaxInputBytes"
 )
 Assert-Specialist (($actualInputParameters -join "|") -ceq ($expectedInputParameters -join "|")) `
     "Specialist input builder parameter allow-list changed."

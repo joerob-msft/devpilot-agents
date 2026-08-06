@@ -62,6 +62,10 @@
       {
         "sha256": "e9b8d101c6e5d37f2b39bf4240866353b92ae758f950fcbd02a1d05b5dd4facc",
         "reason": "Break out how many of those uncorroborated excusals are paths the host alone called non-text. That subset is the one where the pull request's own path says 'ordinary source' and only the untrusted party disagrees, and it now has its own reason code in the accounting table."
+      },
+      {
+        "sha256": "2b6279d7db1b94d44f38f0fb78429f2c28e07068fd4028163e357d7e267a13c9",
+        "reason": "State in the preview when the run was an offline snapshot replay: which snapshot, its manifest digest, the replay nonce, the wrapper-computed input digest and the normalized outcome digest, that the model was launched with the narrowed offline tool grant, and that the artifact is sealed under the replay key domain and can never be promoted."
       }
     ],
     "Invoke-ReviewerDelivery": [
@@ -78,6 +82,10 @@
       {
         "sha256": "24bfc80213e33e9ee61ce2eaeef1699faca371e5b0aa4de6b9dda4aeb4fef247",
         "reason": "State it in as many words when NO sealed block was produced. The block was simply omitted when empty, so a one-line regression that blanked it left the model with no source and no notice of that, while the prompt still told it the accounting table was binding."
+      },
+      {
+        "sha256": "f3bf51bbef917da38c52c84ea490277ddf0e69f1f6903cbe10aec05a61313b02",
+        "reason": "In offline replay, say that this pass holds no repository read tool and that the wrapper already verified the binding against the sealed snapshot. Without it a correct pass fails closed for the wrong reason: the prompt tells it to re-read the pull request and stop without a marker if it cannot, and in replay it cannot."
       }
     ],
     "Invoke-ReviewerModelPass": [
@@ -96,6 +104,10 @@
       {
         "sha256": "8c5e2be6e4b8827de4afdcf8892ea5b76821ae3c24b8cd9ad8ec68c88684f036",
         "reason": "Mark that oversized-input refusal a pull-request failure rather than an environment fault. Exempting it re-attempted every cycle forever, burning a full transport, the specialist and the gate each time, while never appearing in attempts state where an operator could see it."
+      },
+      {
+        "sha256": "6e451d1c86898c0c08fa0c59cb3dc795dcba2c2803bb8cf871ee2fe51d42f491",
+        "reason": "Route the generalist tool grant through Get-ReviewerLaunchAllowTools so an offline snapshot replay narrows it to the code-defined offline set instead of leaving the model its own live repository tools, which would mix live facts into a replayed review."
       }
     ],
     "Invoke-ReviewerPullRequest": [

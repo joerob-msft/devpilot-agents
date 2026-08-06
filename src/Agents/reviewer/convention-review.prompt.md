@@ -75,6 +75,39 @@ not a candidate. Do not invent a resolution.
    naming convention in the same file unless you cite the code that fails to
    enforce it. If the enforcing code is not in what the wrapper gave you, the
    question is unresolved: emit a `residualRisks` entry, not a candidate.
+10. Account for EVERY requested rule source before you finish. Free-form
+    sampling is how a review reads four rules, checks two, and reports nothing
+    about the other two. `ruleCoverageRequest.requiredRows` in wrapper runtime
+    data names the exact rows you must return - one per entry, no more, no
+    fewer - and the wrapper reconciles what you send against that list. Address
+    each row by its `ruleRef` (`rs0`, `rs1`, ...); do not repeat the pack or the
+    source id. For each row, work through every changed anchor the rule could
+    apply to and decide:
+    - `violation` - the changed code breaks the rule, and you have emitted a
+      candidate for it. Put that candidate's id in the row's `candidateId`.
+      If you decided NOT to emit a candidate, still say `violation` and explain
+      why in `notes`; the wrapper records that as withheld rather than posting
+      it.
+    - `compliant` - the rule applies to changed code here and the change follows
+      it. Name the anchors you checked.
+    - `notApplicable` - nothing in the change set is in this rule's scope. Say
+      in `notes` what makes it out of scope.
+    - `unknown` - you could not decide. This is the honest answer when the
+      source you would need was not delivered, when sibling practice could not
+      be established, or when the rule text is ambiguous. Say which in `notes`.
+    A row's `ruleSourceSha256` must be copied from its request entry and its
+    `ruleQuote` must be an exact substring of that source. Its `changedAnchors`
+    may only use `cf<n>` ids from `ruleCoverageRequest.changedFileAnchors`. A
+    row that gets any of these wrong is recorded as `unknown` by the wrapper, so
+    guessing costs you the row. Accounting never creates a finding: only
+    `candidates[]` does, and every candidate still has to satisfy every rule
+    above on its own.
+11. Unchanged sibling text is EVIDENCE ONLY. It tells you what the surrounding
+    code already does; it is not part of this pull request and must never be the
+    subject of a candidate or of a coverage row's anchor. If the change set
+    contradicts a same-file precedent - the changed code does one thing and its
+    unchanged neighbours do another - say so in `siblingEvidence` and let the
+    severity reflect that the practice is not settled.
 
 ## Result marker
 
@@ -104,10 +137,18 @@ must be exactly one of `sourceConflict`, `outsideChangedFile`, `invalidAnchor`,
 `unverifiedSource`, `unknownFact`, `unsupportedSeverity`,
 `missingSiblingEvidence`, `duplicateCandidate`, or
 `duplicateExistingThread`. Each residual-risk item has exactly `text`.
+(`accountedNotEmitted` is written by the wrapper, never by you.)
+
+Each `ruleCoverage` row has exactly `ruleRef`, `ruleSourceSha256`, `ruleQuote`
+(or empty), `status` (`violation|compliant|notApplicable|unknown`),
+`changedAnchors` (comma-separated `cf<n>:<line>`, at most 8, or empty),
+`codeEvidence`, `siblingStatus` (`checked|notRequired|unavailable`),
+`siblingEvidence`, `candidateId` (or empty), and `notes`. Send one row per entry
+in `ruleCoverageRequest.requiredRows`, in that order.
 
 The top-level object has exactly:
 
 `schemaVersion`, `prId`, `repositoryId`, `project`, `reviewedSourceCommit`,
 `targetCommit`, `changeSetDigest`, `conventionPlanSha256`, `factPlanSha256`,
-`configSha256`, `scriptSha256`, `promptSha256`, `candidates`, `withheld`,
-`residualRisks`, and `nonce`.
+`configSha256`, `scriptSha256`, `promptSha256`, `candidates`, `ruleCoverage`,
+`withheld`, `residualRisks`, and `nonce`.
