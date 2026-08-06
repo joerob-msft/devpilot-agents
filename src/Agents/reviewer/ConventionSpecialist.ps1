@@ -379,7 +379,17 @@ function Get-ReviewerConventionSpecialistFailureReason {
     )
     if ($TimedOut) { return "Convention specialist timed out after ${TimeoutSeconds}s." }
     if ($ExitCode -ne 0) { return "Convention specialist exited $ExitCode." }
-    if (-not $MarkerValid) { return "Convention specialist produced a missing or invalid result marker." }
+    if (-not $MarkerValid) {
+        # Name the length case explicitly. The marker is recovered from the
+        # transcript by a brace scan with a hard character ceiling, so a marker
+        # that is merely too long is indistinguishable from an absent one - and
+        # the accounting rows are the part most likely to push it over. An
+        # operator reading only "missing or invalid" would look for the wrong
+        # thing.
+        return ("Convention specialist produced a missing or invalid result marker. " +
+            "A marker that is well formed but too long reaches this the same way, " +
+            "so check the transcript for an over-length ruleCoverage or candidates array.")
+    }
     return ""
 }
 

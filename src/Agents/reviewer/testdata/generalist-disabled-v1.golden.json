@@ -64,7 +64,7 @@
         "reason": "Break out how many of those uncorroborated excusals are paths the host alone called non-text. That subset is the one where the pull request's own path says 'ordinary source' and only the untrusted party disagrees, and it now has its own reason code in the accounting table."
       },
       {
-        "sha256": "2b6279d7db1b94d44f38f0fb78429f2c28e07068fd4028163e357d7e267a13c9",
+        "sha256": "f55fe5c67f929648108348abe3af8610a6d8d5fbd7cc15f8a5ee8e5e838f903b",
         "reason": "State in the preview when the run was an offline snapshot replay: which snapshot, its manifest digest, the replay nonce, the wrapper-computed input digest and the normalized outcome digest, that the model was launched with the narrowed offline tool grant, and that the artifact is sealed under the replay key domain and can never be promoted."
       }
     ],
