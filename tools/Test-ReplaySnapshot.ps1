@@ -25,6 +25,14 @@ $script:Checks = 0
 $script:Failures = New-Object System.Collections.Generic.List[string]
 $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
 
+# The marker field validator is module-internal; exercise it in module scope
+# rather than exporting it just for a test.
+function Test-MarkerField {
+    param([Parameter(Mandatory)][hashtable]$Spec, [Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+    $module = Get-Module DevPilot.AgentHarness
+    return (& $module { param($s, $v) ConvertTo-AgentMarkerFieldValue -Spec $s -Value $v } $Spec $Value)
+}
+
 function Assert-Replay {
     param([bool]$Condition, [Parameter(Mandatory)][string]$Message)
     $script:Checks++
@@ -377,7 +385,7 @@ try {
     $schema = Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject "Widgets" -ExpectedNonce "n"
     Assert-Replay ($schema.Keys -ccontains "ruleCoverage") "The marker schema must declare ruleCoverage."
     $coverageSpec = $schema.Fields["ruleCoverage"]
-    Assert-Replay ([int]$coverageSpec.MaxItems -eq 17) "The rule-coverage array must be bounded at 17 rows."
+    Assert-Replay ([int]$coverageSpec.MaxItems -eq 12) "The rule-coverage array must be bounded at 12 rows."
     $rowFields = $coverageSpec.Item.Fields
     # Every field of a row must be individually bounded, and the whole section
     # must stay well inside the marker scan window - an unbounded accounting
@@ -417,6 +425,31 @@ try {
         "The withheld reason set must include the wrapper's unemitted-violation reason."
     Assert-Replay ($coverageSpec.Item.Fields["status"].Values.Count -eq 4) `
         "A coverage row's status must be one of exactly four values."
+
+    # A reporting section must not be able to destroy the findings it reports
+    # on. Twice a complete accounting was discarded whole - once for evidence a
+    # few characters over a cap, once for a single curly quote - taking the
+    # candidates with it. Prose fields therefore carry no ASCII pattern; the
+    # marker validator still refuses control characters in every string, and
+    # these fields never reach a pull-request comment.
+    $candidateSpec = $schema.Fields["candidates"]
+    foreach ($prose in @("codeEvidence", "siblingEvidence", "notes")) {
+        $spec = $coverageSpec.Item.Fields[$prose]
+        Assert-Replay (-not ($spec.ContainsKey("Pattern") -and $spec.Pattern)) `
+            "Rule-coverage field '$prose' must not carry a character pattern that a sentence about code can fail."
+        $accepted = Test-MarkerField -Spec $spec -Value ([string][char]0x2019 + "a curly quote and an en dash " + [char]0x2013)
+        Assert-Replay ([bool]$accepted.Ok) "Rule-coverage field '$prose' must accept ordinary typographic characters."
+        $control = Test-MarkerField -Spec $spec -Value "line one`nline two"
+        Assert-Replay (-not [bool]$control.Ok) "Rule-coverage field '$prose' must still refuse control characters."
+    }
+    # The candidate fields, which DO become comment text, stay strict.
+    $commentSpec = $candidateSpec.Item.Fields["diffEvidence"]
+    $rejected = Test-MarkerField -Spec $commentSpec -Value ([string][char]0x2019 + "curly")
+    Assert-Replay (-not [bool]$rejected.Ok) "Candidate comment text must remain printable ASCII only."
+    $quoteSpec = $coverageSpec.Item.Fields["ruleQuote"]
+    $quoteRejected = Test-MarkerField -Spec $quoteSpec -Value ([string][char]0x2019 + "curly")
+    Assert-Replay (-not [bool]$quoteRejected.Ok) `
+        "A coverage row's rule quote must stay ASCII, because it has to match the transported source exactly."
 
     # -- 10. The replay tool grant --------------------------------------------
     # Extracted from the reviewer's own source and evaluated here, because the
