@@ -234,7 +234,9 @@ $coverageRow = [pscustomobject][ordered]@{
     ruleSourceSha256 = "d" * 64
     ruleQuote = "validation manifests are required"
     status = "violation"
-    changedAnchors = "cf0:12"
+    scope = "invocations"
+    checkedConstructs = "mi0"
+    violatingConstructs = "mi0"
     codeEvidence = "The changed build registration omits the required manifest."
     siblingStatus = "checked"
     siblingEvidence = "Unchanged sibling registrations include the manifest entry."
@@ -623,6 +625,7 @@ $expectedInputParameters = @(
     "SourceCommit", "TargetCommit", "ChangeSetDigest", "ConventionPlanSha256",
     "FactPlanSha256", "ConfigSha256", "ScriptSha256", "PromptSha256",
     "ConventionPlan", "FactPlan", "ResolvedSources", "ChangeEntries",
+    "Constructs", "ConstructFiles",
     "ThreadDigestText", "PinnedSourceText", "ReplayNotice", "MaxInputBytes"
 )
 Assert-Specialist (($actualInputParameters -join "|") -ceq ($expectedInputParameters -join "|")) `
