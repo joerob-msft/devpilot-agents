@@ -2393,7 +2393,7 @@ function New-ReviewerSourceTransportReport {
             -RequestedSpanCount ([int]$cut.RequestedSpanCount) `
             -RawRequestedSpanCount $rawRequested `
             -DeliveredRawSpanCount ([int]$cut.DeliveredRawSpanCount) `
-            -Slices @($cut.Slices) -SiblingSlices @($cut.SiblingSlices) -SpanBasis $spanBasis
+            -Slices @($cut.Slices) -SiblingSlices @($cut.SiblingSlices) -SpanBasis $spanBasis -RawSpans @($spans)
         [void]$files.Add($entry)
         # Only CHANGED bytes draw down the changed-source budget. Sibling
         # context has its own pool, so unchanged evidence attached to an early
@@ -2557,6 +2557,12 @@ function New-ReviewerSourceFileEntry {
         # host whose misbehaviour this layer exists to survive.
         [ValidateSet("", "changeSet", "reader")][string]$NoSourceBasis = "",
         [ValidateSet("changeSet", "recovered")][string]$SpanBasis = "changeSet",
+        # The pull request's OWN hunks for this path, before any context radius
+        # was added. A delivered slice is a hunk plus up to thirty untouched
+        # lines on each side, so anything that needs to know what this change
+        # actually touched - as opposed to what was delivered around it - has to
+        # be told separately or it will call sixty untouched lines "changed".
+        [object[]]$RawSpans = @(),
         [object[]]$Slices = @(),
         [object[]]$SiblingSlices = @()
     )
@@ -2593,6 +2599,7 @@ function New-ReviewerSourceFileEntry {
         SpanBasis             = $SpanBasis
         DeliveredSpanCount    = @($Slices).Count
         DeliveredBytes        = $deliveredBytes
+        RawSpans              = @($RawSpans)
         Slices                = @($Slices)
         SiblingSlices         = @($SiblingSlices)
     }

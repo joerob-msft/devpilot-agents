@@ -26,13 +26,16 @@
 Set-StrictMode -Version Latest
 
 $script:ReviewerConstructVersion = 1
-$script:ReviewerConstructMaxPerFile = 64
-$script:ReviewerConstructMaxTotal = 200
+$script:ReviewerConstructMaxPerFile = 30
+$script:ReviewerConstructMaxTotal = 120
 $script:ReviewerConstructMaxArguments = 24
 $script:ReviewerConstructMaxLineLength = 4096
 $script:ReviewerConstructMaxSpanLines = 80
 $script:ReviewerConstructMaxAttributes = 12
 $script:ReviewerConstructMaxAttributeNames = 40
+# Small next to the specialist's whole input bound on purpose: the construct
+# block is an index into source the model already has, not a second copy of it.
+$script:ReviewerConstructMaxPayloadBytes = 32768
 $script:ReviewerConstructUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
 
 function Get-ReviewerConstructMaskedLines {
@@ -52,12 +55,16 @@ function Get-ReviewerConstructMaskedLines {
     param([Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines)
 
     $masked = [System.Collections.Generic.List[string]]::new()
+    $commentLines = [System.Collections.Generic.HashSet[int]]::new()
     $inBlockComment = $false
     $inVerbatim = $false
     $truncated = $false
+    $lineNumber = 0
 
     foreach ($rawLine in @($Lines)) {
         $line = [string]$rawLine
+        $lineNumber++
+        $hasComment = $inBlockComment
         if ($line.Length -gt $script:ReviewerConstructMaxLineLength) {
             # A line longer than any real source line is not worth scanning and
             # is not worth guessing about either.
@@ -85,12 +92,24 @@ function Get-ReviewerConstructMaskedLines {
                 continue
             }
             if ($ch -eq '/' -and $next -eq '/') {
+                $hasComment = $true
                 [void]$out.Append(' ' * ($line.Length - $i))
                 $i = $line.Length
                 continue
             }
-            if ($ch -eq '/' -and $next -eq '*') { $inBlockComment = $true; [void]$out.Append('  '); $i += 2; continue }
+            if ($ch -eq '/' -and $next -eq '*') { $inBlockComment = $true; $hasComment = $true; [void]$out.Append('  '); $i += 2; continue }
             if ($ch -eq '@' -and $next -eq '"') { $inVerbatim = $true; [void]$out.Append('  '); $i += 2; continue }
+            if ($ch -eq '"' -and $next -eq '"' -and ($i + 2 -lt $line.Length) -and $line[$i + 2] -eq '"') {
+                # A raw string literal. Masking it as an ordinary string would
+                # end the literal at the first line break and scan its body as
+                # code, which manufactures constructs out of documentation. The
+                # multi-line form is not tracked across lines here, so the file
+                # is reported as only partly understood instead.
+                $truncated = $true
+                [void]$out.Append(' ' * ($line.Length - $i))
+                $i = $line.Length
+                continue
+            }
             if ($ch -eq '"') {
                 # Ordinary string, possibly interpolated. Interpolation holes can
                 # contain arbitrary code; masking the whole literal is the
@@ -125,9 +144,11 @@ function Get-ReviewerConstructMaskedLines {
             $i++
         }
         [void]$masked.Add($out.ToString())
+        if ($hasComment) { [void]$commentLines.Add($lineNumber) }
     }
     return @{
         Lines = $masked.ToArray()
+        CommentLines = $commentLines
         Truncated = ($truncated -or $inBlockComment -or $inVerbatim)
     }
 }
@@ -209,19 +230,31 @@ function Get-ReviewerChangedInvocations {
         is the line the pull request is responsible for; a call whose opening
         line is untouched is not this change's construct even if an argument
         below it moved.
+
+        The walk stops at the first line that was never delivered. Source
+        arrives as slices with gaps between them, and a walk that treated a gap
+        as blank source would happily adopt a closing bracket from unrelated
+        code thirty lines away and report a confident, fabricated argument
+        shape - which is exactly the kind of wrong answer this whole layer
+        exists to prevent.
     #>
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines,
         [Parameter(Mandatory)][AllowEmptyCollection()][int[]]$ChangedLines,
-        [Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$MaskedLines
+        [Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$MaskedLines,
+        [AllowEmptyCollection()][int[]]$DeliveredLines = @()
     )
     $changed = [System.Collections.Generic.HashSet[int]]::new()
     foreach ($line in @($ChangedLines)) { [void]$changed.Add([int]$line) }
+    $delivered = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($line in @($DeliveredLines)) { [void]$delivered.Add([int]$line) }
+    $deliveryKnown = ($delivered.Count -gt 0)
     $found = [System.Collections.Generic.List[object]]::new()
+    $truncated = $false
 
     for ($index = 0; $index -lt $MaskedLines.Count; $index++) {
-        if ($found.Count -ge $script:ReviewerConstructMaxPerFile) { break }
+        if ($found.Count -ge $script:ReviewerConstructMaxPerFile) { $truncated = $true; break }
         $lineNumber = $index + 1
         if (-not $changed.Contains($lineNumber)) { continue }
         $masked = [string]$MaskedLines[$index]
@@ -247,9 +280,16 @@ function Get-ReviewerChangedInvocations {
         if ($calleeText -match '([A-Za-z_][A-Za-z0-9_]*)\s*(<[^<>]*>)?$') { $callee = $Matches[1] }
         if (-not $callee) { continue }
 
-        # Walk forward to the matching close paren, bounded.
+        # Walk forward to the matching close paren, bounded. A RAW copy of the
+        # same span is kept alongside the masked one: masking blanks string and
+        # char literals, so `Log(` + `"text");` masks to an argument list that
+        # looks empty. Deciding "no arguments" off the masked text would erase
+        # every call whose only argument is a literal.
         $body = [System.Text.StringBuilder]::new()
+        $rawBody = [System.Text.StringBuilder]::new()
         [void]$body.Append($masked.Substring($openIndex + 1))
+        $rawLine = [string]$Lines[$index]
+        if ($openIndex + 1 -le $rawLine.Length) { [void]$rawBody.Append($rawLine.Substring($openIndex + 1)) }
         $depth = 1
         $endLine = $lineNumber
         $closed = $false
@@ -261,7 +301,9 @@ function Get-ReviewerChangedInvocations {
         if ($closed) { continue }  # single-line call: not a multi-line construct
 
         $spanLines = 1
+        $crossedGap = $false
         for ($scan = $index + 1; $scan -lt $MaskedLines.Count; $scan++) {
+            if ($deliveryKnown -and -not $delivered.Contains($scan + 1)) { $crossedGap = $true; break }
             $spanLines++
             if ($spanLines -gt $script:ReviewerConstructMaxSpanLines) { break }
             $scanLine = [string]$MaskedLines[$scan]
@@ -276,6 +318,10 @@ function Get-ReviewerChangedInvocations {
                 }
             }
             [void]$body.Append($scanLine.Substring(0, $consumed))
+            $scanRaw = [string]$Lines[$scan]
+            [void]$rawBody.Append("`n")
+            if ($consumed -le $scanRaw.Length) { [void]$rawBody.Append($scanRaw.Substring(0, $consumed)) }
+            else { [void]$rawBody.Append($scanRaw) }
             $endLine = $scan + 1
             if ($closed) { break }
         }
@@ -286,11 +332,14 @@ function Get-ReviewerChangedInvocations {
         $argumentCount = 0
         $status = "known"
         if (-not $closed) { $status = "unknown" }
+        elseif ($crossedGap) { $status = "unknown" }
         elseif (-not $split.Ok) { $status = "unknown" }
         else {
             $arguments = @($split.Arguments)
-            # A lone empty argument is a no-argument call.
-            if ($arguments.Count -eq 1 -and -not ([string]$arguments[0].Text).Trim()) { $arguments = @() }
+            # A lone empty argument is a no-argument call - but only when the
+            # RAW span is empty too. Masked-empty with raw content is a single
+            # literal argument, which is a real argument.
+            if ($arguments.Count -eq 1 -and -not ([string]$arguments[0].Text).Trim() -and -not $rawBody.ToString().Trim()) { $arguments = @() }
             $argumentCount = $arguments.Count
             if ($argumentCount -gt $script:ReviewerConstructMaxArguments) { $status = "unknown" }
             else {
@@ -315,7 +364,7 @@ function Get-ReviewerChangedInvocations {
                 status = $status
             })
     }
-    return , $found.ToArray()
+    return @{ Constructs = @($found.ToArray()); Truncated = $truncated }
 }
 
 function Get-ReviewerConstructDeclarationAt {
@@ -332,12 +381,30 @@ function Get-ReviewerConstructDeclarationAt {
     if ($Index -lt 0 -or $Index -ge $MaskedLines.Count) { return $null }
     $masked = ([string]$MaskedLines[$Index]).Trim()
     if (-not $masked) { return $null }
-    if ($masked.StartsWith('[')) { return $null }
+    # An attribute group on the same line as the declaration is still a
+    # declaration. Skipping those lines undercounts exactly the attribute a
+    # rule is asking about.
+    $inlineAttributes = [System.Collections.Generic.List[string]]::new()
+    while ($masked.StartsWith('[')) {
+        $close = $masked.IndexOf(']')
+        if ($close -lt 0) { return $null }
+        foreach ($match in [regex]::Matches($masked.Substring(0, $close + 1), '\[\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)*)')) {
+            [void]$inlineAttributes.Add(($match.Groups[1].Value -replace '\s+', ''))
+        }
+        $masked = $masked.Substring($close + 1).Trim()
+        if (-not $masked) { return $null }
+    }
     if ($masked -notmatch '^[A-Za-z_][A-Za-z0-9_<>,\[\]\.\s]*\s([A-Za-z_][A-Za-z0-9_]*)\s*(\(|\{|=>|$)') { return $null }
     $name = $Matches[1]
-    if ($masked.StartsWith('return ') -or $masked.StartsWith('throw ') -or $masked.StartsWith('new ')) { return $null }
+    # Statement keywords that happen to be followed by a call look like
+    # declarations to a shape test. Counting them inflates the declaration set
+    # and dilutes the per-file attribute ratio a rule turns on.
+    foreach ($keyword in @('return ', 'throw ', 'new ', 'await ', 'yield ', 'else ', 'case ', 'using ', 'lock ', 'default ', 'if ', 'while ', 'for ', 'foreach ', 'switch ')) {
+        if ($masked.StartsWith($keyword)) { return $null }
+    }
 
     $attributes = [System.Collections.Generic.List[string]]::new()
+    foreach ($attribute in $inlineAttributes) { [void]$attributes.Add($attribute) }
     $truncated = $false
     for ($above = $Index - 1; $above -ge 0; $above--) {
         $line = ([string]$MaskedLines[$above]).Trim()
@@ -379,9 +446,10 @@ function Get-ReviewerChangedDeclarations {
     $changed = [System.Collections.Generic.HashSet[int]]::new()
     foreach ($line in @($ChangedLines)) { [void]$changed.Add([int]$line) }
     $found = [System.Collections.Generic.List[object]]::new()
+    $truncated = $false
 
     for ($index = 0; $index -lt $MaskedLines.Count; $index++) {
-        if ($found.Count -ge $script:ReviewerConstructMaxPerFile) { break }
+        if ($found.Count -ge $script:ReviewerConstructMaxPerFile) { $truncated = $true; break }
         $lineNumber = $index + 1
         if (-not $changed.Contains($lineNumber)) { continue }
         $declaration = Get-ReviewerConstructDeclarationAt -MaskedLines $MaskedLines -Index $index
@@ -422,7 +490,7 @@ function Get-ReviewerChangedDeclarations {
                 status = $(if ([bool]$declaration.Truncated) { "unknown" } else { "known" })
             })
     }
-    return , $found.ToArray()
+    return @{ Constructs = @($found.ToArray()); Truncated = $truncated }
 }
 
 function Get-ReviewerConstructAttributeFrequency {
@@ -459,6 +527,248 @@ function Get-ReviewerConstructAttributeFrequency {
     return @{ DeclarationCount = $declarationCount; Attributes = @($rows.ToArray()) }
 }
 
+function Get-ReviewerConstructMember {
+    <#
+        Reads an optional member off either a hashtable or an object without
+        tripping StrictMode. `DeliveredLines` is genuinely optional - a caller
+        that does not know which lines were delivered gets the whole file
+        treated as reachable - and an absent optional must not be an error.
+    #>
+    param([Parameter(Mandatory)]$Container, [Parameter(Mandatory)][string]$Name)
+    if ($null -eq $Container) { return $null }
+    if ($Container -is [System.Collections.IDictionary]) {
+        if ($Container.Contains($Name)) { return $Container[$Name] }
+        return $null
+    }
+    $property = $Container.PSObject.Properties[$Name]
+    if ($property) { return $property.Value }
+    return $null
+}
+
+function Get-ReviewerChangedComments {
+    <#
+        Contiguous runs of changed comment lines, one construct per run.
+
+        A rule about documentation - what a doc block has to say, how it spells
+        something, whether it exists at all - has nowhere to anchor if the only
+        constructs are calls and declarations. The nearest declaration can be
+        a hundred lines away, and a comment anchored on it is a comment about
+        the wrong thing.
+
+        Nothing here reads the comment's text or knows what a doc comment is.
+        It knows only that these lines carry comment content and that they
+        changed.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][AllowEmptyCollection()][int[]]$ChangedLines,
+        [Parameter(Mandatory)]$CommentLines,
+        [Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$MaskedLines
+    )
+    $changed = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($line in @($ChangedLines)) { [void]$changed.Add([int]$line) }
+    $found = [System.Collections.Generic.List[object]]::new()
+    $truncated = $false
+
+    $lineNumber = 1
+    while ($lineNumber -le $MaskedLines.Count) {
+        if (-not ($changed.Contains($lineNumber) -and $CommentLines.Contains($lineNumber))) {
+            $lineNumber++
+            continue
+        }
+        if ($found.Count -ge $script:ReviewerConstructMaxPerFile) { $truncated = $true; break }
+        $start = $lineNumber
+        $end = $lineNumber
+        while (($end + 1) -le $MaskedLines.Count -and
+            $changed.Contains($end + 1) -and $CommentLines.Contains($end + 1) -and
+            ($end + 1 - $start) -lt $script:ReviewerConstructMaxSpanLines) {
+            $end++
+        }
+        [void]$found.Add([pscustomobject][ordered]@{
+                kind = "comment"
+                path = $Path
+                line = $start
+                endLine = $end
+                status = "known"
+            })
+        $lineNumber = $end + 1
+    }
+    return @{ Constructs = @($found.ToArray()); Truncated = $truncated }
+}
+
+function Get-ReviewerChangedAssignments {
+    <#
+        Changed lines that assign to something that already exists.
+
+        Deliberately narrow: a target, a single `=` that is not part of a
+        comparison or a compound operator, and a target that is a plain name or
+        member/index path rather than a declaration with a type in front of it.
+        A declaration with an initializer is a declaration, not a reassignment,
+        and calling it one would invent violations of an immutability rule that
+        the code does not commit.
+
+        Whether reassigning is wrong here is the transported rule's business.
+        This only says: this changed line writes to this name.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][AllowEmptyCollection()][int[]]$ChangedLines,
+        [Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$MaskedLines
+    )
+    $changed = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($line in @($ChangedLines)) { [void]$changed.Add([int]$line) }
+    $found = [System.Collections.Generic.List[object]]::new()
+    $truncated = $false
+
+    for ($index = 0; $index -lt $MaskedLines.Count; $index++) {
+        if ($found.Count -ge $script:ReviewerConstructMaxPerFile) { $truncated = $true; break }
+        $lineNumber = $index + 1
+        if (-not $changed.Contains($lineNumber)) { continue }
+        $masked = ([string]$MaskedLines[$index]).Trim()
+        if (-not $masked) { continue }
+
+        # An assignment STATEMENT ends in a semicolon. Object and collection
+        # initializer entries do not, and neither does the last one before the
+        # closing brace - which is how initialization gets mistaken for
+        # reassignment. A write whose right-hand side spans lines is missed by
+        # this, which is the conservative direction.
+        if (-not $masked.EndsWith(";")) { continue }
+        if ($masked -notmatch '^([A-Za-z_][A-Za-z0-9_]*(?:\s*(?:\.|\?\.)\s*[A-Za-z_][A-Za-z0-9_]*|\s*\[[^\[\]]*\])*)\s*=([^=].*|)$') { continue }
+        $target = ($Matches[1] -replace '\s+', '')
+        $rest = [string]$Matches[2]
+        # `=>` is a lambda or an expression-bodied member, not an assignment.
+        if ($rest.StartsWith(">")) { continue }
+        # A leading type token means this line DECLARES the name.
+        $before = $masked.Substring(0, $masked.IndexOf('='))
+        if ($before.Trim() -cne $Matches[1].Trim()) { continue }
+        foreach ($keyword in @("var", "const", "readonly", "static", "public", "private", "protected", "internal")) {
+            if ($target -ceq $keyword) { $target = "" ; break }
+        }
+        if (-not $target) { continue }
+
+        [void]$found.Add([pscustomobject][ordered]@{
+                kind = "assignment"
+                path = $Path
+                line = $lineNumber
+                endLine = $lineNumber
+                target = $target
+                status = "known"
+            })
+    }
+    return @{ Constructs = @($found.ToArray()); Truncated = $truncated }
+}
+
+function Get-ReviewerConstructBudget {
+    <#
+        Splits a total construct budget across kinds so no kind is starved by a
+        kind that happens to be enumerated first. Kinds that need less than an
+        even share release the remainder to the others, which is the only split
+        that never leaves budget unused while a kind goes without.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Counts, [Parameter(Mandatory)][int]$Total)
+    $names = [string[]]@($Counts.Keys)
+    [Array]::Sort($names, [StringComparer]::Ordinal)
+    $order = @($names | Sort-Object -Property @{ Expression = { [int]$Counts[$_] } }, @{ Expression = { $_ } })
+    $allocation = @{}
+    $remaining = $Total
+    $left = @($order).Count
+    foreach ($name in $order) {
+        $share = if ($left -gt 0) { [int][Math]::Floor($remaining / $left) } else { 0 }
+        $take = [Math]::Min([int]$Counts[$name], $share)
+        $allocation[$name] = $take
+        $remaining -= $take
+        $left--
+    }
+    return $allocation
+}
+
+function Get-ReviewerConstructIdRanges {
+    <#
+        Compresses a run of construct ids of one kind into inclusive ranges.
+
+        The accounting section has to be able to say "all of them" in a field
+        short enough to survive the marker's length bound. Without this, a
+        complete answer over a large change set is literally unwritable, and an
+        unwritable answer is the same as no checklist at all.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Ids)
+    $items = @($Ids)
+    if ($items.Count -eq 0) { return "" }
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $runStart = $items[0]
+    $previous = $items[0]
+    for ($i = 1; $i -le $items.Count; $i++) {
+        $current = if ($i -lt $items.Count) { [string]$items[$i] } else { "" }
+        $contiguous = $false
+        if ($current) {
+            $previousMatch = [regex]::Match($previous, '^([a-z]{2})([0-9]+)$')
+            $currentMatch = [regex]::Match($current, '^([a-z]{2})([0-9]+)$')
+            if ($previousMatch.Success -and $currentMatch.Success -and
+                $previousMatch.Groups[1].Value -ceq $currentMatch.Groups[1].Value -and
+                ([int]$currentMatch.Groups[2].Value - [int]$previousMatch.Groups[2].Value) -eq 1) {
+                $contiguous = $true
+            }
+        }
+        if (-not $contiguous) {
+            if ($runStart -ceq $previous) { [void]$parts.Add($runStart) }
+            else { [void]$parts.Add("$runStart-$previous") }
+            $runStart = $current
+        }
+        $previous = $current
+    }
+    return ($parts -join ",")
+}
+
+function Select-ReviewerConstructsAcrossFiles {
+    <#
+        Takes up to -Limit constructs of one kind, round-robin across the files
+        they came from, then restores path-and-line order for numbering.
+
+        Straight truncation would give the whole budget to whichever files sort
+        first and nothing at all to the rest. On a change set where the tests
+        sort last, that means an ownership or assertion rule is judged against
+        no test anchor whatsoever while the row still reads as an answer - the
+        exact silent miss this enumeration exists to prevent.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Constructs,
+        [Parameter(Mandatory)][int]$Limit
+    )
+    $items = @($Constructs)
+    if ($Limit -le 0) { return @{ Constructs = @(); Truncated = ($items.Count -gt 0) } }
+    if ($items.Count -le $Limit) { return @{ Constructs = $items; Truncated = $false } }
+
+    $byPath = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
+    foreach ($item in $items) {
+        $path = [string]$item.path
+        if (-not $byPath.Contains($path)) { $byPath[$path] = [System.Collections.Generic.List[object]]::new() }
+        [void]$byPath[$path].Add($item)
+    }
+    $taken = [System.Collections.Generic.List[object]]::new()
+    $round = 0
+    while ($taken.Count -lt $Limit) {
+        $addedThisRound = $false
+        foreach ($path in @($byPath.Keys)) {
+            if ($taken.Count -ge $Limit) { break }
+            $list = $byPath[$path]
+            if ($round -ge $list.Count) { continue }
+            [void]$taken.Add($list[$round])
+            $addedThisRound = $true
+        }
+        if (-not $addedThisRound) { break }
+        $round++
+    }
+    # Back into path-then-line order so ids read down the change set.
+    $ordered = [System.Collections.Generic.List[object]]::new()
+    foreach ($path in @($byPath.Keys)) {
+        $forPath = @(@($taken) | Where-Object { [string]$_.path -ceq $path })
+        foreach ($item in @($forPath | Sort-Object -Property @{ Expression = { [int]$_.line } }, @{ Expression = { [int]$_.endLine } })) {
+            [void]$ordered.Add($item)
+        }
+    }
+    return @{ Constructs = @($ordered.ToArray()); Truncated = $true }
+}
+
 function Get-ReviewerChangedConstructs {
     <#
         The deterministic construct set for one change set. Files are processed
@@ -472,11 +782,24 @@ function Get-ReviewerChangedConstructs {
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Files,
         [int]$MaxTotal = $script:ReviewerConstructMaxTotal
     )
-    $ordered = @(@($Files) | Sort-Object -Property @{ Expression = { [string]$_.Path } })
+    # Ordinal, not Sort-Object: culture-aware ordering would give the same change
+    # set different construct ids on different hosts, and an id that means one
+    # thing here and another there is worse than no id.
+    $paths = [string[]]@(@($Files) | ForEach-Object { [string]$_.Path })
+    [Array]::Sort($paths, [StringComparer]::Ordinal)
+    $ordered = [System.Collections.Generic.List[object]]::new()
+    foreach ($path in $paths) {
+        foreach ($file in @($Files)) {
+            if ([string]$file.Path -ceq $path -and -not $ordered.Contains($file)) { [void]$ordered.Add($file); break }
+        }
+    }
     $invocations = [System.Collections.Generic.List[object]]::new()
     $declarations = [System.Collections.Generic.List[object]]::new()
+    $comments = [System.Collections.Generic.List[object]]::new()
+    $assignments = [System.Collections.Generic.List[object]]::new()
     $partialFiles = [System.Collections.Generic.List[string]]::new()
     $fileSummaries = [System.Collections.Generic.List[object]]::new()
+    $perFileTruncated = $false
 
     foreach ($file in $ordered) {
         $path = [string]$file.Path
@@ -485,13 +808,22 @@ function Get-ReviewerChangedConstructs {
         if ($lines.Count -eq 0 -or $changedLines.Count -eq 0) { continue }
         $maskResult = Get-ReviewerConstructMaskedLines -Lines $lines
         if ([bool]$maskResult.Truncated) { [void]$partialFiles.Add($path) }
-        # Assign first, then wrap. These helpers return `, @(...)` so a
-        # single-element result stays a list, and @(f x) in expression position
-        # would keep that outer wrapper instead of unrolling it.
-        $fileInvocations = Get-ReviewerChangedInvocations -Path $path -Lines $lines -ChangedLines $changedLines -MaskedLines $maskResult.Lines
-        foreach ($construct in @($fileInvocations)) { [void]$invocations.Add($construct) }
+        # Assign first, then read. These helpers return a hashtable so the
+        # truncation flag travels with the constructs; @(f x) in expression
+        # position would keep an outer wrapper instead of unrolling it.
+        $deliveredLines = @(@(Get-ReviewerConstructMember -Container $file -Name 'DeliveredLines') | Where-Object { $null -ne $_ })
+        $fileInvocations = Get-ReviewerChangedInvocations -Path $path -Lines $lines -ChangedLines $changedLines -MaskedLines $maskResult.Lines -DeliveredLines $deliveredLines
+        foreach ($construct in @($fileInvocations.Constructs)) { [void]$invocations.Add($construct) }
         $fileDeclarations = Get-ReviewerChangedDeclarations -Path $path -ChangedLines $changedLines -MaskedLines $maskResult.Lines
-        foreach ($construct in @($fileDeclarations)) { [void]$declarations.Add($construct) }
+        foreach ($construct in @($fileDeclarations.Constructs)) { [void]$declarations.Add($construct) }
+        $fileComments = Get-ReviewerChangedComments -Path $path -ChangedLines $changedLines -CommentLines $maskResult.CommentLines -MaskedLines $maskResult.Lines
+        foreach ($construct in @($fileComments.Constructs)) { [void]$comments.Add($construct) }
+        $fileAssignments = Get-ReviewerChangedAssignments -Path $path -ChangedLines $changedLines -MaskedLines $maskResult.Lines
+        foreach ($construct in @($fileAssignments.Constructs)) { [void]$assignments.Add($construct) }
+        if ([bool]$fileInvocations.Truncated -or [bool]$fileDeclarations.Truncated -or
+            [bool]$fileComments.Truncated -or [bool]$fileAssignments.Truncated) {
+            $perFileTruncated = $true
+        }
         $frequency = Get-ReviewerConstructAttributeFrequency -MaskedLines $maskResult.Lines
         [void]$fileSummaries.Add([pscustomobject][ordered]@{
                 path = $path
@@ -500,52 +832,94 @@ function Get-ReviewerChangedConstructs {
             })
     }
 
-    $result = [System.Collections.Generic.List[object]]::new()
-    $truncated = $false
-    $invocationIndex = 0
-    foreach ($construct in $invocations) {
-        if ($result.Count -ge $MaxTotal) { $truncated = $true; break }
-        [void]$result.Add([pscustomobject][ordered]@{
-                constructId = "mi$invocationIndex"
-                kind = "invocation"
-                path = $construct.path
-                line = [int]$construct.line
-                endLine = [int]$construct.endLine
-                callee = [string]$construct.callee
-                argumentCount = [int]$construct.argumentCount
-                argumentNaming = [string]$construct.argumentNaming
-                attributes = @()
-                siblingAttributes = @()
-                status = [string]$construct.status
-            })
-        $invocationIndex++
+    # Fair split, not first-come. Filling the budget with whichever kind happens
+    # to be emitted first would starve a whole kind on a change set that leans
+    # one way - which is exactly the change set where the starved kind's rule
+    # most needs its anchors.
+    $sets = [ordered]@{
+        invocation = $invocations
+        declaration = $declarations
+        comment = $comments
+        assignment = $assignments
     }
-    $declarationIndex = 0
-    foreach ($construct in $declarations) {
-        if ($result.Count -ge $MaxTotal) { $truncated = $true; break }
-        [void]$result.Add([pscustomobject][ordered]@{
-                constructId = "dc$declarationIndex"
-                kind = "declaration"
-                path = $construct.path
-                line = [int]$construct.line
-                endLine = [int]$construct.endLine
-                callee = [string]$construct.name
-                argumentCount = 0
-                argumentNaming = ""
-                attributes = @($construct.attributes)
-                siblingAttributes = @($construct.siblingAttributes)
-                status = [string]$construct.status
-            })
-        $declarationIndex++
+    $prefixes = @{ invocation = "mi"; declaration = "dc"; comment = "cm"; assignment = "as" }
+    $counts = @{}
+    foreach ($kind in $sets.Keys) { $counts[$kind] = @($sets[$kind]).Count }
+
+    # Allocate, emit, and if the payload is too large, shrink the WHOLE budget
+    # and allocate again. Trimming the tail of a single flat list instead would
+    # delete whichever kind happens to be emitted last, which is the same
+    # starvation the fair split exists to prevent - and it would delete it
+    # silently, leaving a scope that looks complete and is not.
+    $effectiveTotal = $MaxTotal
+    $truncated = $false
+    $constructs = @()
+    while ($true) {
+        $budget = Get-ReviewerConstructBudget -Counts $counts -Total $effectiveTotal
+        $result = [System.Collections.Generic.List[object]]::new()
+        $capped = $false
+        foreach ($kind in @($sets.Keys)) {
+            $selection = Select-ReviewerConstructsAcrossFiles -Constructs @($sets[$kind]) -Limit ([int]$budget[$kind])
+            if ([bool]$selection.Truncated) { $capped = $true }
+            $index = 0
+            foreach ($construct in @($selection.Constructs)) {
+                $memberName = switch ($kind) {
+                    "invocation" { "callee" }
+                    "declaration" { "name" }
+                    "assignment" { "target" }
+                    default { "name" }
+                }
+                # Only the keys that mean something for this kind. Carrying an
+                # empty `argumentNaming` on a comment costs bytes that come
+                # straight out of the budget the pinned source needs, and it
+                # invites a reader to think the field was measured and found
+                # empty rather than never applicable.
+                $record = [ordered]@{
+                    constructId = ("{0}{1}" -f $prefixes[$kind], $index)
+                    kind = $kind
+                    path = [string]$construct.path
+                    line = [int]$construct.line
+                    endLine = [int]$construct.endLine
+                }
+                if ($kind -cne "comment") {
+                    $record["name"] = [string](Get-ReviewerConstructMember -Container $construct -Name $memberName)
+                }
+                if ($kind -ceq "invocation") {
+                    $record["argumentCount"] = [int](Get-ReviewerConstructMember -Container $construct -Name "argumentCount")
+                    $record["argumentNaming"] = [string](Get-ReviewerConstructMember -Container $construct -Name "argumentNaming")
+                }
+                if ($kind -ceq "declaration") {
+                    $record["attributes"] = @(Get-ReviewerConstructMember -Container $construct -Name "attributes")
+                    $record["siblingAttributes"] = @(Get-ReviewerConstructMember -Container $construct -Name "siblingAttributes")
+                }
+                $record["status"] = [string]$construct.status
+                [void]$result.Add([pscustomobject]$record)
+                $index++
+            }
+        }
+        $constructs = @($result.ToArray())
+        if ($capped) { $truncated = $true }
+        if ($constructs.Count -eq 0) { break }
+        $payload = ($constructs | ConvertTo-Json -Depth 8 -Compress)
+        if ([System.Text.Encoding]::UTF8.GetByteCount($payload) -le $script:ReviewerConstructMaxPayloadBytes) { break }
+        $next = [int][Math]::Floor($effectiveTotal * 3 / 4)
+        if ($next -ge $effectiveTotal) { $next = $effectiveTotal - 1 }
+        if ($next -lt 1) { $constructs = @(); $truncated = $true; break }
+        $effectiveTotal = $next
+        $truncated = $true
     }
 
+    $idsByKind = [ordered]@{}
+    foreach ($kind in @($sets.Keys)) {
+        $kindIds = [string[]]@(@($constructs | Where-Object { [string]$_.kind -ceq $kind } | ForEach-Object { [string]$_.constructId }))
+        $idsByKind[$kind] = Get-ReviewerConstructIdRanges -Ids $kindIds
+    }
     return @{
         Version = $script:ReviewerConstructVersion
-        Constructs = $result.ToArray()
+        Constructs = $constructs
         Files = @($fileSummaries.ToArray())
-        InvocationIds = @(@($result | Where-Object { [string]$_.kind -ceq "invocation" } | ForEach-Object { [string]$_.constructId }))
-        DeclarationIds = @(@($result | Where-Object { [string]$_.kind -ceq "declaration" } | ForEach-Object { [string]$_.constructId }))
-        Truncated = $truncated
+        IdRangesByKind = $idsByKind
+        Truncated = ($truncated -or $perFileTruncated)
         PartiallyUnderstoodFiles = @($partialFiles.ToArray())
     }
 }

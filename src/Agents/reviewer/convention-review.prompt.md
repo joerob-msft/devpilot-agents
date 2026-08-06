@@ -81,18 +81,32 @@ not a candidate. Do not invent a resolution.
     `ruleCoverageRequest.requiredRows` names the exact rows you must return -
     one per entry, no more, no fewer, addressed by `ruleRef` (`rs0`, `rs1`, ...).
     `ruleCoverageRequest.changedConstructs` is the wrapper's own enumeration of
-    what this change set touched: every multi-line call, with `argumentNaming`
-    giving one character per argument (`n` syntactically named, `p` positional),
-    and every changed declaration, with the attributes on it and on its nearest
-    unchanged neighbours. `constructFileSummaries` counts how often each
-    attribute appears across each whole file, so "the surrounding code already
-    does this" is a number rather than an impression.
+    what this change set touched, in four kinds:
+    - `invocation` (id `mi*`) - a call that spans more than one line, with
+      `argumentNaming` giving one character per argument (`n` syntactically
+      named, `p` positional) and `name` giving the callee.
+    - `declaration` (id `dc*`) - a changed declaration, with the attributes on
+      it and the attributes on its nearest unchanged neighbours.
+    - `comment` (id `cm*`) - a run of changed comment lines, so a rule about
+      what documentation says has somewhere of its own to anchor.
+    - `assignment` (id `as*`) - a changed line that writes to a name that
+      already exists, with `name` giving the target.
+    `constructFileSummaries` counts how often each attribute appears across each
+    whole file, so "the surrounding code already does this" is a number rather
+    than an impression.
 
-    For each row set `scope` to the construct kind the rule governs -
-    `invocations`, `declarations`, `both`, or `none` - and then:
-    - `checkedConstructs` must list EVERY construct id in that scope. Not a
-      sample. The wrapper compares your list against its own enumeration and
-      degrades the row to `unknown` if anything in scope is missing.
+    For each row set `scope` to a comma-separated list of the construct KINDS
+    the rule governs - for example `invocation`, or `declaration,comment`, or
+    `none` - and then:
+    - `checkedConstructs` must account for EVERY construct id of those kinds.
+      Not a sample, and not only the ones the rule turns out to reach: a
+      construct you looked at and judged out of the rule's reach is still
+      checked, and `notes` is where you say so. `ruleCoverageRequest.
+      constructIdsByKind` gives you the exact string per kind, already
+      range-compressed - copy it. Ranges are inclusive and stay within one
+      kind: `mi0-mi37,dc0-dc18`. The wrapper compares your list against its own
+      enumeration and degrades the row to `unknown` if anything is missing,
+      naming exactly what you left out.
     - `violatingConstructs` lists exactly those you judged to break the rule.
       Every id must also appear in `checkedConstructs`.
     - `status` is `violation` when `violatingConstructs` is non-empty and never
@@ -100,9 +114,17 @@ not a candidate. Do not invent a resolution.
       it; `notApplicable` when nothing in scope is in the rule's reach; and
       `unknown` when you could not decide - undelivered source, sibling practice
       you could not establish, or ambiguous rule text. Say which in `notes`.
+    - `scope: none` and an empty `checkedConstructs` mean the rule reaches
+      nothing in this change set at all. That is only ever `notApplicable` or
+      `unknown`. A `compliant` or `violation` row that checked no construct is
+      an answer about nothing, and the wrapper degrades it.
     - a candidate you link must be anchored on one of the constructs this row
-      calls violating. A row about one place cannot account for a finding about
-      another, and the wrapper checks it.
+      calls violating - anywhere within that construct's `line`..`endLine`
+      span, which for a multi-line call is normally the offending argument
+      rather than the line the call opens on. A row about one place cannot
+      account for a finding about another, and the wrapper checks it. If the
+      thing you want to comment on has no construct covering it, widen the
+      scope to the kind that does rather than anchoring on a neighbour.
     Whether a construct is in a rule's reach is your judgement from the rule
     text. The wrapper knows only shapes: it does not know what a test is, what
     any attribute means, or which arguments matter.
@@ -145,9 +167,10 @@ must be exactly one of `sourceConflict`, `outsideChangedFile`, `invalidAnchor`,
 
 Each `ruleCoverage` row has exactly `ruleRef`, `ruleSourceSha256`, `ruleQuote`
 (or empty), `status` (`violation|compliant|notApplicable|unknown`), `scope`
-(`invocations|declarations|both|none`), `checkedConstructs` (comma-separated
-construct ids, or empty), `violatingConstructs` (comma-separated construct ids,
-or empty), `codeEvidence`, `siblingStatus`
+(comma-separated construct kinds from `invocation|declaration|comment|
+assignment`, or `none`), `checkedConstructs` (comma-separated construct ids and
+inclusive same-kind ranges, or empty), `violatingConstructs` (comma-separated
+construct ids, or empty), `codeEvidence`, `siblingStatus`
 (`checked|notRequired|unavailable`), `siblingEvidence`, `candidateId` (or
 empty), and `notes`. Send one row per entry in
 `ruleCoverageRequest.requiredRows`, in that order.
