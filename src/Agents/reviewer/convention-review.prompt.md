@@ -137,14 +137,19 @@ not a candidate. Do not invent a resolution.
 
 ## Result marker
 
-Emit exactly one final `CONVENTION_REVIEW_RESULT_V1:` marker. It must be a
-**single line**: the literal prefix, one space, then the whole JSON object
-compacted onto that one line. Do not pretty-print it, do not wrap it in a code
-fence, and do not restate it in different formatting - if you emit it more than
-once, every copy must say exactly the same thing. Copy every binding, hash, and
-nonce from wrapper runtime data exactly. Use only the exact keys and types
-below. All authored strings must be printable ASCII with no controls or
-newlines. Candidate IDs must be unique lowercase slugs.
+Emit the `CONVENTION_REVIEW_RESULT_V1:` marker **exactly once**, as the very
+last thing you write, and never again. Do not preview it, do not summarise it
+afterwards, and do not repeat it in a closing recap. If a second copy appears
+and so much as one word of prose differs between them, the wrapper cannot tell
+which one is your answer and throws BOTH away - along with every finding in
+them. This has happened; it costs the whole pass.
+
+It must be a **single line**: the literal prefix, one space, then the whole JSON
+object compacted onto that one line. Do not pretty-print it and do not wrap it
+in a code fence. Copy every binding, hash, and nonce from wrapper runtime data
+exactly. Use only the exact keys and types below. All authored strings must be
+printable ASCII with no controls or newlines. Candidate IDs must be unique
+lowercase slugs.
 
 Each candidate has exactly:
 
