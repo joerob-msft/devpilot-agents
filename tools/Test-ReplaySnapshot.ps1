@@ -937,9 +937,16 @@ try {
     Assert-Replay ($reviewerText -match '\$script:ReviewerConventionSpecialistMaxOutputBytes = \d+') `
         "The specialist output cap must be a named bound rather than a literal buried in a comparison."
     $overflowThrow = [regex]::Match($retryBlock.Value,
-        '(?s)if \(\$specialistAttempt -ge \$script:ReviewerMarkerRetryAttempts\) \{\r?\n\s*throw "Convention specialist output exceeded')
+        '(?s)if \(\$specialistAttempt -ge \$script:ReviewerConventionSpecialistMarkerRetryAttempts\) \{\r?\n\s*throw "Convention specialist output exceeded')
     Assert-Replay ($overflowThrow.Success) `
-        "A second over-cap answer must still fail the pass rather than loop."
+        "A final over-cap answer must still fail the pass rather than loop."
+
+    Assert-Replay ($retryBlock.Value -match '\$script:ReviewerConventionSpecialistMarkerRetryAttempts') `
+        "The specialist must use its own retry budget, not the generalist's."
+    Assert-Replay ($reviewerText -match '\$script:ReviewerConventionSpecialistMarkerRetryAttempts = 3') `
+        "The specialist retry budget must be a named bound."
+    Assert-Replay ($retryBlock.Value -notmatch '\$script:ReviewerMarkerRetryAttempts') `
+        "No path in the specialist loop may fall back to the generalist retry budget."
 
     # -- 11. The replay tool grant -------------------------------------------    # Extracted from the reviewer's own source and evaluated here, because the
     # claim "the model has no usable tool in replay" is otherwise a comment.

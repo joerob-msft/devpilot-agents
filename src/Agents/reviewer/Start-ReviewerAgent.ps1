@@ -549,6 +549,14 @@ $script:ReviewerMarkerRetryAttempts = 2
 # marker itself stays bounded by its schema, and overflow is retried once
 # rather than costing the pass.
 $script:ReviewerConventionSpecialistMaxOutputBytes = 262144
+# The specialist gets a larger retry budget than a generalist pass because it
+# emits a much larger hand-built marker: a row per transported rule, each naming
+# the constructs it checked, plus the candidate array. Observed failures are all
+# formatting - the marker restated with re-worded prose, a missing final key, an
+# answer over the output cap - on top of work that was done correctly. Each
+# attempt is an independent request, so a third one is worth more than it costs.
+# None of the real failures became retryable.
+$script:ReviewerConventionSpecialistMarkerRetryAttempts = 3
 
 # ---------------------------------------------------------------------------
 # CODE-DEFINED security policy (never config-supplied; a forked config file
@@ -8628,7 +8636,7 @@ function Invoke-ReviewerConventionSpecialistPass {
             # formatting slip on top of work that was done, and it is worth
             # exactly one more attempt - the same allowance the generalist
             # passes already get, for the same reason.
-            for ($specialistAttempt = 1; $specialistAttempt -le $script:ReviewerMarkerRetryAttempts; $specialistAttempt++) {
+            for ($specialistAttempt = 1; $specialistAttempt -le $script:ReviewerConventionSpecialistMarkerRetryAttempts; $specialistAttempt++) {
                 # A fresh nonce and a rebuilt input per attempt, so the second
                 # attempt is a new request rather than a second chance to answer
                 # the first one.
@@ -8692,7 +8700,7 @@ function Invoke-ReviewerConventionSpecialistPass {
                     # the model talked too much on the way. That is the same
                     # class of slip as an unusable marker, so it gets the same
                     # one retry rather than costing the pass outright.
-                    if ($specialistAttempt -ge $script:ReviewerMarkerRetryAttempts) {
+                    if ($specialistAttempt -ge $script:ReviewerConventionSpecialistMarkerRetryAttempts) {
                         throw "Convention specialist output exceeded the $($script:ReviewerConventionSpecialistMaxOutputBytes)-byte cap."
                     }
                     Write-Warning ("PR {0}'s convention specialist wrote more than the {1}-byte output cap; retrying once in a fresh session." -f `
@@ -8734,8 +8742,9 @@ function Invoke-ReviewerConventionSpecialistPass {
                     -Schema (Get-ReviewerConventionSpecialistMarkerSchema `
                         -ExpectedProject $ExpectedProject -ExpectedNonce $nonce)
                 if ($null -ne $marker) { break }
-                if ($specialistAttempt -ge $script:ReviewerMarkerRetryAttempts) { break }
-                Write-Warning ("PR {0}'s convention specialist produced an unusable result marker; retrying once in a fresh session." -f $PrId)
+                if ($specialistAttempt -ge $script:ReviewerConventionSpecialistMarkerRetryAttempts) { break }
+                Write-Warning ("PR {0}'s convention specialist produced an unusable result marker (attempt {1} of {2}); retrying in a fresh session." -f `
+                        $PrId, $specialistAttempt, $script:ReviewerConventionSpecialistMarkerRetryAttempts)
                 Write-ReviewerCycleMetadata -Fields @{
                     cycle = $CycleNumber; mode = "convention-specialist-marker-retry"; prId = $PrId
                     sourceCommit = $SourceCommit; model = [string]$EffectiveConventionSpecialistModel
