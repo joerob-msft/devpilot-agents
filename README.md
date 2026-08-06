@@ -453,6 +453,27 @@ arrived. See [docs/source-transport.md](docs/source-transport.md).
 Posted findings appear under **your** identity, since that is who the session is
 authenticated as. That is why every write is opt-in.
 
+#### Offline snapshot replay (layer 9)
+
+A pull request moves on. Once it has, the evidence that produced a particular
+review is gone, and "we fixed the miss" is an assertion nobody can check.
+
+Replay records the reads one cycle made and re-runs the **whole** stack against
+those exact bytes - transport, packs, facts, both generalist passes, the
+specialist, cross-verification, the gate and every preview - with no repository
+contacted. It is served at the one seam every read goes through, so the layers
+above it are unchanged and still apply their full hostile-input validation to
+replayed payloads.
+
+It is permanently preview-only: every write and gate switch and both promotion
+paths are refused at startup, the authorization is forced to `PreviewOnly`, the
+artifacts are sealed under a separate key domain so promotion cannot verify
+them, and replay state lives apart from live state. The model's grant is
+narrowed to `read`, because a model tool would reach the host through the CLI's
+own credentials rather than the replayed session - so a replay is a stated
+*lower bound* on a live run, not a reproduction of one. See
+[docs/replay-snapshots.md](docs/replay-snapshots.md).
+
 ### Two passes, two models
 
 A single model's coverage of real defects is both incomplete and *idiosyncratic*

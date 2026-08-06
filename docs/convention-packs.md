@@ -176,3 +176,54 @@ separate Markdown preview and domain-separated HMAC artifact under
 config/plan/fact hashes, pack names, context bytes, granted and observed tools,
 withheld reasons, and residual risks. Degradation is diagnostic in this layer;
 it does not change generalist publication or voting.
+
+## Rule-coverage accounting
+
+Transporting a rule is not the same as checking it. A specialist that reads
+eight rules, checks two, and reports one finding has said nothing at all about
+the other six - and "nothing" is exactly what a miss looks like from the
+outside.
+
+So the marker carries a bounded `ruleCoverage` array alongside `candidates`, and
+the wrapper tells the model exactly which rows it expects. `ruleCoverageRequest`
+in the runtime data names one required row per transported source, plus the
+`cf<n>` anchor ids for the changed files the wrapper delivered. Each row states:
+
+- the pack, source id and source hash it is about, and an exact quote from it;
+- a `status` of `violation`, `compliant`, `notApplicable` or `unknown`;
+- the changed anchors it checked, as `cf<n>:<line>`;
+- the code evidence, and the sibling evidence or why none was needed;
+- the id of the candidate it produced, or a note saying why none was emitted.
+
+`unknown` is a first-class answer. Source that was not delivered, sibling
+practice that could not be established and ambiguous rule text are all honest
+`unknown`s, and each says which in its note.
+
+The wrapper then reconciles the rows against the set it transported, which it
+computed itself:
+
+- a source with no row is reported **missing**; a source with two rows is
+  reported **duplicated**; a row naming a source that was never transported is
+  reported **unknown** and is not counted toward coverage;
+- a row whose source hash, quote or anchor does not match what was actually
+  transported is degraded to `unknown` with the reason recorded;
+- a candidate whose rule has no row is reported as unaccounted.
+
+Any of those makes the accounting incomplete, and the preview says so. It never
+silently annotates and continues.
+
+The accounting is deliberately powerless. It cannot create a finding, widen one,
+or bypass cross-verification: only `candidates[]` produces comment text, and
+every candidate still has to satisfy every rule it already did. A row that
+claims a `violation` with no emitted candidate is recorded through the existing
+`withheld` list under `accountedNotEmitted` - one channel, not two, because two
+lists that both mean "nearly a finding" is where a later edit promotes one.
+Sibling evidence describes unchanged code and can never be the subject of a
+candidate or the anchor of a row.
+
+The anchor ids are the only deterministic anchors the wrapper supplies: the
+changed files, ordinally sorted, from the change set it delivered. Pattern
+hints for particular rule shapes are deliberately **not** generated. They would
+steer the model toward exactly the categories the hint generator enumerates, so
+measured recall would become a property of that generator rather than of the
+specialist - which is the opposite of calibration.

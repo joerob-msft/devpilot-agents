@@ -6,6 +6,13 @@ $script:ReviewerConventionSpecialistMarkerPrefix = "CONVENTION_REVIEW_RESULT_V1:
 $script:ReviewerConventionSpecialistArtifactKind = "convention-specialist-preview"
 $script:ReviewerConventionSpecialistArtifactVersion = 1
 $script:ReviewerConventionSpecialistMaxCandidates = 8
+# The accounting shares the result marker's brace-scan window with the
+# candidate array, so it is bounded on BOTH axes: at most this many rows, each
+# with tightly bounded fields. A transported set larger than this is not
+# silently sampled - the request states the cap and the reconciliation reports
+# the remainder as unaccounted by construction.
+$script:ReviewerConventionSpecialistMaxRuleCoverage = 24
+$script:ReviewerConventionSpecialistMaxCoverageAnchors = 200
 $script:ReviewerConventionSpecialistMaxInputBytes = 327680
 $script:ReviewerConventionSpecialistUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
 $script:ReviewerConventionSpecialistImpactCategories = @(
@@ -14,7 +21,10 @@ $script:ReviewerConventionSpecialistImpactCategories = @(
 $script:ReviewerConventionSpecialistWithheldReasons = @(
     "sourceConflict", "outsideChangedFile", "invalidAnchor", "unverifiedSource",
     "unknownFact", "unsupportedSeverity", "missingSiblingEvidence", "duplicateCandidate",
-    "duplicateExistingThread"
+    "duplicateExistingThread", "accountedNotEmitted"
+)
+$script:ReviewerConventionSpecialistCoverageStatuses = @(
+    "violation", "compliant", "notApplicable", "unknown"
 )
 
 function Get-ReviewerConventionSpecialistValue {
@@ -213,7 +223,7 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
             "schemaVersion", "prId", "repositoryId", "project", "reviewedSourceCommit",
             "targetCommit", "changeSetDigest", "conventionPlanSha256", "factPlanSha256",
             "configSha256", "scriptSha256", "promptSha256",
-            "candidates", "withheld", "residualRisks", "nonce"
+            "candidates", "ruleCoverage", "withheld", "residualRisks", "nonce"
         )
         Fields = @{
             schemaVersion = @{ Type = "int"; Min = 1; Max = 1 }
@@ -271,6 +281,47 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                         candidateId = @{ Type = "string"; MaxLength = 64; AllowEmpty = $true; Pattern = '^(|[a-z][a-z0-9-]{0,63})$' }
                         reason = @{ Type = "enum"; Values = $script:ReviewerConventionSpecialistWithheldReasons }
                         detail = @{ Type = "string"; MaxLength = 800; Pattern = $ascii }
+                    }
+                }
+            }
+            # One row per REQUESTED convention source. The wrapper knows that
+            # set exactly, so this is checkable rather than decorative: a source
+            # the model never mentions, mentions twice, or invents is a gap in
+            # the accounting, reported as one.
+            #
+            # A row names its rule by INDEX into the request the wrapper sent
+            # (`rs<n>`), not by repeating pack and source id. Source ids run to
+            # a full repository path, and repeating one per row would blow the
+            # marker's brace-scan window - at which point there is no report at
+            # all, because the whole marker falls outside the scan.
+            #
+            # changedAnchors is a flat string, not an array of objects, because
+            # the marker validator does not admit an object array nested inside
+            # an object array; a nested shape would fail the marker every time.
+            # Each entry is cf<n>:<line>, where <n> indexes the changed-file
+            # list the wrapper handed the model.
+            ruleCoverage = @{
+                Type = "objectArray"; MaxItems = $script:ReviewerConventionSpecialistMaxRuleCoverage
+                Item = @{
+                    Keys = @(
+                        "ruleRef", "ruleSourceSha256", "ruleQuote",
+                        "status", "changedAnchors", "codeEvidence",
+                        "siblingStatus", "siblingEvidence", "candidateId", "notes"
+                    )
+                    Fields = @{
+                        ruleRef = @{ Type = "string"; MaxLength = 6; Pattern = '^rs[0-9]{1,3}$' }
+                        ruleSourceSha256 = @{ Type = "hex"; Length = 64 }
+                        ruleQuote = @{ Type = "string"; MaxLength = 200; AllowEmpty = $true; Pattern = '^(|[\x20-\x7E]+)$' }
+                        status = @{ Type = "enum"; Values = $script:ReviewerConventionSpecialistCoverageStatuses }
+                        changedAnchors = @{
+                            Type = "string"; MaxLength = 120; AllowEmpty = $true
+                            Pattern = '^(|cf[0-9]{1,4}:[0-9]{1,7}(,cf[0-9]{1,4}:[0-9]{1,7}){0,7})$'
+                        }
+                        codeEvidence = @{ Type = "string"; MaxLength = 240; AllowEmpty = $true; Pattern = $ascii }
+                        siblingStatus = @{ Type = "enum"; Values = @("checked", "notRequired", "unavailable") }
+                        siblingEvidence = @{ Type = "string"; MaxLength = 200; AllowEmpty = $true; Pattern = $ascii }
+                        candidateId = @{ Type = "string"; MaxLength = 64; AllowEmpty = $true; Pattern = '^(|[a-z][a-z0-9-]{0,63})$' }
+                        notes = @{ Type = "string"; MaxLength = 200; AllowEmpty = $true; Pattern = $ascii }
                     }
                 }
             }
@@ -436,6 +487,233 @@ function Test-ReviewerConventionSpecialistPlanBinding {
     return $true
 }
 
+function Get-ReviewerConventionSpecialistChangedFileIndex {
+    <#
+        The changed-file list the model is given, in one fixed order, so that a
+        coverage row can name an anchor as cf<n>:<line> instead of repeating a
+        path. Sorted ordinally by path: the order has to be a function of the
+        change set alone, or two runs over the same pull request would number
+        the same file differently and no anchor would be comparable.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ChangeEntries)
+    $paths = @(@($ChangeEntries) |
+        Where-Object { [string](Get-ReviewerConventionSpecialistValue $_ "Role" "") -ceq "current" } |
+        ForEach-Object { [string](Get-ReviewerConventionSpecialistValue $_ "Path" "") } |
+        Where-Object { $_ } |
+        Select-Object -Unique)
+    $sorted = [string[]]@($paths)
+    [Array]::Sort($sorted, [StringComparer]::Ordinal)
+    $index = [System.Collections.Generic.List[object]]::new()
+    for ($i = 0; $i -lt $sorted.Count; $i++) {
+        [void]$index.Add([pscustomobject][ordered]@{ anchorId = "cf$i"; path = $sorted[$i] })
+    }
+    return , $index.ToArray()
+}
+
+function Get-ReviewerConventionSpecialistRuleRequest {
+    <#
+        The exact accounting the wrapper will reconcile against: one requested
+        row per transported source, in a fixed ordinal order, each addressed by
+        a short `rs<n>` reference.
+
+        Capped. The marker's brace-scan window is shared with the candidate
+        array, so asking for more rows than the schema admits would not produce
+        a longer report - it would produce none, because the whole marker would
+        fail validation. When the transported set is larger than the cap the
+        remainder is reported as unaccounted BY CONSTRUCTION rather than
+        quietly sampled.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ResolvedSources,
+        [int]$MaxRows = $script:ReviewerConventionSpecialistMaxRuleCoverage
+    )
+    $ordered = @(@($ResolvedSources) | Sort-Object -Property `
+        @{ Expression = { [string](Get-ReviewerConventionSpecialistValue $_ "PackName" "") } },
+        @{ Expression = { [string](Get-ReviewerConventionSpecialistValue $_ "SourceId" "") } })
+    $requested = [System.Collections.Generic.List[object]]::new()
+    $unrequested = [System.Collections.Generic.List[string]]::new()
+    for ($i = 0; $i -lt $ordered.Count; $i++) {
+        $key = "{0}/{1}" -f `
+            [string](Get-ReviewerConventionSpecialistValue $ordered[$i] "PackName" ""),
+        [string](Get-ReviewerConventionSpecialistValue $ordered[$i] "SourceId" "")
+        if ($i -ge $MaxRows) { [void]$unrequested.Add($key); continue }
+        [void]$requested.Add([pscustomobject][ordered]@{
+                ruleRef = "rs$i"
+                packName = [string](Get-ReviewerConventionSpecialistValue $ordered[$i] "PackName" "")
+                ruleSourceId = [string](Get-ReviewerConventionSpecialistValue $ordered[$i] "SourceId" "")
+                ruleSourceSha256 = [string](Get-ReviewerConventionSpecialistValue $ordered[$i] "Sha256" "")
+                source = $ordered[$i]
+            })
+    }
+    return @{ Requested = $requested.ToArray(); Unrequested = @($unrequested.ToArray()) }
+}
+
+function Resolve-ReviewerConventionSpecialistRuleCoverage {
+    <#
+        Reconciles the model's rule accounting against the request the WRAPPER
+        sent. Pure, and deliberately powerless: it can mark the accounting
+        incomplete, and it can record that a claimed violation was never emitted
+        as a candidate, but it can neither create a candidate nor widen one.
+        Everything a reader would act on still has to come from candidates[],
+        through cross-verification, through the gate.
+
+        Degrades rather than throws. A specialist run that found something real
+        and then miscounted its own checklist is still worth reading; losing it
+        entirely would trade a recall improvement for a recall regression.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Rows,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ResolvedSources,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ChangedFileIndex,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$AcceptedCandidates,
+        # Candidate ids the wrapper already rejected. A row that links to one of
+        # these is not an unreported violation - it is a reported one that did
+        # not survive validation, and the withheld list already says so. Adding
+        # a second entry for it would double-count the same event.
+        [AllowEmptyCollection()][string[]]$WithheldCandidateIds = @()
+    )
+    $request = Get-ReviewerConventionSpecialistRuleRequest -ResolvedSources $ResolvedSources
+    $expected = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($entry in @($request.Requested)) { $expected.Add([string]$entry.ruleRef, $entry) }
+
+    $anchorIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($entry in @($ChangedFileIndex)) {
+        [void]$anchorIds.Add([string](Get-ReviewerConventionSpecialistValue $entry "anchorId" ""))
+    }
+    $candidateIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $candidateRuleKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($candidate in @($AcceptedCandidates)) {
+        [void]$candidateIds.Add([string](Get-ReviewerConventionSpecialistValue $candidate "candidateId" ""))
+        [void]$candidateRuleKeys.Add(("{0}/{1}" -f `
+                [string](Get-ReviewerConventionSpecialistValue $candidate "packName" ""),
+                [string](Get-ReviewerConventionSpecialistValue $candidate "ruleSourceId" "")))
+    }
+
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $duplicates = [System.Collections.Generic.List[string]]::new()
+    $unknown = [System.Collections.Generic.List[string]]::new()
+    $normalized = [System.Collections.Generic.List[object]]::new()
+    $unemitted = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($row in @($Rows)) {
+        $ruleRef = [string](Get-ReviewerConventionSpecialistValue $row "ruleRef" "")
+        if (-not $expected.ContainsKey($ruleRef)) { [void]$unknown.Add($ruleRef); continue }
+        if (-not $seen.Add($ruleRef)) { [void]$duplicates.Add($ruleRef); continue }
+
+        $entry = $expected[$ruleRef]
+        $source = $entry.source
+        $ruleKey = "{0}/{1}" -f [string]$entry.packName, [string]$entry.ruleSourceId
+        $status = [string](Get-ReviewerConventionSpecialistValue $row "status" "unknown")
+        $degradedReason = ""
+        # Provenance first, and first-writer-wins: a row that is wrong in more
+        # than one way is explained by the WORST thing wrong with it, not by
+        # whichever check happened to run last.
+        if (-not [string]::Equals(
+                [string](Get-ReviewerConventionSpecialistValue $row "ruleSourceSha256" ""),
+                [string](Get-ReviewerConventionSpecialistValue $source "Sha256" ""),
+                [StringComparison]::OrdinalIgnoreCase)) {
+            $status = "unknown"
+            $degradedReason = "the row cited a rule-source hash that is not the transported one"
+        }
+        $rawAnchors = [string](Get-ReviewerConventionSpecialistValue $row "changedAnchors" "")
+        if ($rawAnchors) {
+            foreach ($anchor in @($rawAnchors -split ',')) {
+                if (-not $anchorIds.Contains(($anchor -split ':')[0])) {
+                    $status = "unknown"
+                    if (-not $degradedReason) { $degradedReason = "the row named a changed-file anchor outside the change set the wrapper delivered" }
+                    break
+                }
+            }
+        }
+        $quote = [string](Get-ReviewerConventionSpecialistValue $row "ruleQuote" "")
+        if ($quote) {
+            $sourceText = ([string](Get-ReviewerConventionSpecialistValue $source "Text" "")).Replace("`r`n", "`n").Replace("`r", "`n")
+            if ($sourceText.IndexOf($quote.Replace("`r`n", "`n").Replace("`r", "`n"), [StringComparison]::Ordinal) -lt 0) {
+                $status = "unknown"
+                if (-not $degradedReason) { $degradedReason = "the row quoted text that is not in the transported source" }
+            }
+        }
+        $linkedCandidate = [string](Get-ReviewerConventionSpecialistValue $row "candidateId" "")
+        $alreadyWithheld = $false
+        if ($linkedCandidate -and -not $candidateIds.Contains($linkedCandidate)) {
+            $alreadyWithheld = (@($WithheldCandidateIds) -ccontains $linkedCandidate)
+            # Not an error about the finding - the candidate list is what it is -
+            # but the link is not real, so it is not recorded as one.
+            $linkedCandidate = ""
+            if (-not $degradedReason) {
+                $degradedReason = $(if ($alreadyWithheld) {
+                        "the candidate it linked was withheld by the wrapper"
+                    }
+                    else { "the row linked a candidate that this pass did not emit" })
+            }
+        }
+        # A row whose rule DID produce an accepted candidate is emitted even if
+        # the model forgot to write the link down. Recording it as unemitted
+        # would report a finding as missing while it sits in the candidate list.
+        $ruleProducedCandidate = $candidateRuleKeys.Contains($ruleKey)
+        if ($status -ceq "violation" -and -not $linkedCandidate -and -not $alreadyWithheld -and -not $ruleProducedCandidate) {
+            [void]$unemitted.Add([pscustomobject][ordered]@{
+                    packName = [string]$entry.packName
+                    ruleSourceId = [string]$entry.ruleSourceId
+                    notes = [string](Get-ReviewerConventionSpecialistValue $row "notes" "")
+                })
+        }
+        [void]$normalized.Add([pscustomobject][ordered]@{
+                ruleRef = $ruleRef
+                packName = [string]$entry.packName
+                ruleSourceId = [string]$entry.ruleSourceId
+                ruleSourceSha256 = [string](Get-ReviewerConventionSpecialistValue $source "Sha256" "")
+                ruleQuote = $quote
+                status = $status
+                changedAnchors = $rawAnchors
+                codeEvidence = [string](Get-ReviewerConventionSpecialistValue $row "codeEvidence" "")
+                siblingStatus = [string](Get-ReviewerConventionSpecialistValue $row "siblingStatus" "unavailable")
+                siblingEvidence = [string](Get-ReviewerConventionSpecialistValue $row "siblingEvidence" "")
+                candidateId = $linkedCandidate
+                notes = [string](Get-ReviewerConventionSpecialistValue $row "notes" "")
+                degradedReason = $degradedReason
+            })
+    }
+
+    $missing = [System.Collections.Generic.List[string]]::new()
+    foreach ($entry in @($request.Requested)) {
+        if (-not $seen.Contains([string]$entry.ruleRef)) {
+            [void]$missing.Add(("{0}/{1}" -f [string]$entry.packName, [string]$entry.ruleSourceId))
+        }
+    }
+    foreach ($key in @($request.Unrequested)) { [void]$missing.Add($key) }
+    $accountedKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($row in @($normalized)) {
+        [void]$accountedKeys.Add(("{0}/{1}" -f [string]$row.packName, [string]$row.ruleSourceId))
+    }
+    $unaccountedCandidates = @(@($AcceptedCandidates) | Where-Object {
+            -not $accountedKeys.Contains(("{0}/{1}" -f `
+                    [string](Get-ReviewerConventionSpecialistValue $_ "packName" ""),
+                    [string](Get-ReviewerConventionSpecialistValue $_ "ruleSourceId" "")))
+        } | ForEach-Object { [string](Get-ReviewerConventionSpecialistValue $_ "candidateId" "") })
+    $degradedCount = @(@($normalized) | Where-Object { [string]$_.degradedReason }).Count
+
+    return @{
+        Rows = $normalized.ToArray()
+        ExpectedSourceCount = @($ResolvedSources).Count
+        RequestedSourceCount = @($request.Requested).Count
+        AccountedSourceCount = $seen.Count
+        DegradedRowCount = $degradedCount
+        Missing = @($missing.ToArray())
+        Duplicates = @($duplicates.ToArray())
+        Unknown = @($unknown.ToArray())
+        UnaccountedCandidates = @($unaccountedCandidates)
+        UnemittedViolations = @($unemitted.ToArray())
+        # A row that the wrapper had to degrade is not a check that happened.
+        # Leaving it out of this would let a marker whose every row cited a
+        # fabricated hash still print "Complete: True", which is the one line a
+        # reader will trust.
+        Complete = ($seen.Count -eq @($request.Requested).Count -and @($request.Unrequested).Count -eq 0 -and
+            $duplicates.Count -eq 0 -and $unknown.Count -eq 0 -and
+            $degradedCount -eq 0 -and @($unaccountedCandidates).Count -eq 0)
+    }
+}
+
 function Resolve-ReviewerConventionSpecialistCandidates {
     param(
         [Parameter(Mandatory)][hashtable]$Marker,
@@ -593,10 +871,37 @@ function Resolve-ReviewerConventionSpecialistCandidates {
         [void]$accepted.Add($candidate)
     }
     foreach ($item in @($Marker.withheld)) { [void]$withheld.Add($item) }
+    # The accounting runs LAST and over the ACCEPTED candidates, so it describes
+    # the pass that actually happened rather than the one the model proposed.
+    $changedFileIndex = Get-ReviewerConventionSpecialistChangedFileIndex -ChangeEntries $ChangeEntries
+    $coverageRows = @()
+    if ($Marker.ContainsKey("ruleCoverage")) { $coverageRows = @($Marker.ruleCoverage) }
+    $coverage = Resolve-ReviewerConventionSpecialistRuleCoverage -Rows $coverageRows `
+        -ResolvedSources $ResolvedSources -ChangedFileIndex $changedFileIndex `
+        -AcceptedCandidates $accepted.ToArray() `
+        -WithheldCandidateIds @(@($withheld) | ForEach-Object {
+                [string](Get-ReviewerConventionSpecialistValue $_ "candidateId" "")
+            } | Where-Object { $_ })
+    # A rule the model called violated but never emitted is recorded through the
+    # EXISTING withheld channel, not a second one. Two lists that both mean
+    # "nearly a finding" is exactly where a later edit promotes one.
+    foreach ($unemitted in @($coverage.UnemittedViolations)) {
+        $detail = "Rule accounting reported a violation of '$([string]$unemitted.ruleSourceId)' in pack '$([string]$unemitted.packName)' but the pass emitted no candidate for it."
+        $note = [string]$unemitted.notes
+        if ($note) { $detail = "$detail Stated reason: $note" }
+        if ($detail.Length -gt 800) { $detail = $detail.Substring(0, 800) }
+        [void]$withheld.Add([pscustomobject][ordered]@{
+                candidateId = ""
+                reason = "accountedNotEmitted"
+                detail = $detail
+            })
+    }
     return @{
         Candidates = $accepted.ToArray()
         Withheld = $withheld.ToArray()
         ResidualRisks = @($Marker.residualRisks)
+        RuleCoverage = $coverage
+        ChangedFileIndex = $changedFileIndex
     }
 }
 
@@ -622,6 +927,12 @@ function New-ReviewerConventionSpecialistInput {
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ChangeEntries,
         [Parameter(Mandatory)][AllowEmptyString()][string]$ThreadDigestText,
         [AllowEmptyString()][string]$PinnedSourceText = "",
+        # Non-empty only in offline replay. The prompt tells this pass to
+        # re-read the pull request and stop without a marker if it cannot; in
+        # replay it cannot, because it has no repository tool at all. Without
+        # saying so here the pass fails closed for a reason that is not a
+        # finding about the change.
+        [AllowEmptyString()][string]$ReplayNotice = "",
         [int]$MaxInputBytes = $script:ReviewerConventionSpecialistMaxInputBytes
     )
     if (@($ResolvedSources).Count -eq 0) {
@@ -647,6 +958,15 @@ function New-ReviewerConventionSpecialistInput {
                 text = [string](Get-ReviewerConventionSpecialistValue $_ "Text" "")
             }
         })
+    $ruleRequest = Get-ReviewerConventionSpecialistRuleRequest -ResolvedSources $ResolvedSources
+    # The anchor list is bounded too. It is only a naming convenience for the
+    # rows - every path in it is already in `changedFiles` - and letting it grow
+    # with a thousand-file change set would push the envelope past its bound and
+    # turn today's graceful "pinned source dropped" degrade into a hard failure
+    # of the whole pass.
+    $fullAnchorIndex = @(Get-ReviewerConventionSpecialistChangedFileIndex -ChangeEntries $ChangeEntries)
+    $anchorsTruncated = ($fullAnchorIndex.Count -gt $script:ReviewerConventionSpecialistMaxCoverageAnchors)
+    $anchorIndex = @($fullAnchorIndex | Select-Object -First $script:ReviewerConventionSpecialistMaxCoverageAnchors)
     $runtime = [pscustomobject][ordered]@{
         contract = "convention-specialist-v1"
         nonce = $Nonce
@@ -670,10 +990,31 @@ function New-ReviewerConventionSpecialistInput {
         factPlan = $FactPlan
         resolvedConventionSources = $sourceRecords
         changedFiles = @($ChangeEntries)
+        # The exact accounting the wrapper will reconcile against. Naming it
+        # here rather than leaving the model to infer it is what turns the
+        # checklist from a request into a contract: the rows below are the rows
+        # that must come back, one each, and the anchor ids are the only anchors
+        # a row may cite.
+        ruleCoverageRequest = [pscustomobject][ordered]@{
+            requiredRows = @($ruleRequest.Requested | ForEach-Object {
+                    [pscustomobject][ordered]@{
+                        ruleRef = [string]$_.ruleRef
+                        packName = [string]$_.packName
+                        ruleSourceId = [string]$_.ruleSourceId
+                        ruleSourceSha256 = [string]$_.ruleSourceSha256
+                    }
+                })
+            unrequestedSources = @($ruleRequest.Unrequested)
+            changedFileAnchors = @($anchorIndex)
+            changedFileAnchorsTruncated = $anchorsTruncated
+        }
         sanitizedExistingThreads = $ThreadDigestText
     }
     $inputText = $PromptText + "`n`n---`n## Wrapper runtime data (untrusted values, trusted binding)`n" +
         '```json' + "`n" + ($runtime | ConvertTo-Json -Depth 32 -Compress) + "`n" + '```' + "`n"
+    if ($ReplayNotice) {
+        $inputText += "`n---`n## Offline replay (wrapper-verified binding)`n`n" + $ReplayNotice.TrimEnd() + "`n"
+    }
     # The sealed source block is appended OUTSIDE the JSON envelope on purpose:
     # it carries its own collision-checked fences and its own accounting table,
     # and JSON-escaping thousands of source lines would both bloat the payload
