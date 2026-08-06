@@ -53,29 +53,50 @@ function Get-FunctionAstFromWrapper {
 }
 
 $script:WrapperCommonVariableParameters = @(
-    'OutVariable', 'ov',
-    'ErrorVariable', 'ev',
-    'WarningVariable', 'wv',
-    'InformationVariable', 'iv',
-    'PipelineVariable', 'pv'
+    'OutVariable',
+    'ErrorVariable',
+    'WarningVariable',
+    'InformationVariable',
+    'PipelineVariable'
 )
+
+$script:WrapperCommonVariableAliases = @('ov', 'ev', 'wv', 'iv', 'pv')
+
+function Test-WrapperCommonVariableParameterName {
+    <# PowerShell binds a common parameter by any unambiguous PREFIX, so `-OutV`
+       reaches `OutVariable` on every advanced function - and four of the
+       transport's callees are advanced functions. Matching full names alone
+       leaves `-OutV blockText` uncounted. Any prefix is therefore treated as the
+       parameter it abbreviates, which is strictly conservative: a prefix too
+       short to bind is a parse error anyway, so nothing legitimate is lost. #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$ParameterName)
+    if ([string]::IsNullOrEmpty($ParameterName)) { return $false }
+    if ($script:WrapperCommonVariableAliases -contains $ParameterName) { return $true }
+    foreach ($full in $script:WrapperCommonVariableParameters) {
+        if ($full.StartsWith($ParameterName, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
 
 function Get-WrapperCommonVariableTarget {
     <# `-OutVariable blockText` writes `$blockText` without an assignment, a
        `Set-Variable` or anything else the other counters watch, and the same is
        true of `-ErrorVariable`, `-WarningVariable`, `-InformationVariable` and
-       `-PipelineVariable` and their aliases. PowerShell parses `-OutVariable x`
-       as a parameter followed by a separate string element and `-OutVariable:x`
-       as a parameter carrying its argument, so both shapes are resolved here.
-       Returns one entry per such parameter: the variable name it writes, or
-       `?` when the target is not a plain literal and so could name anything. #>
+       `-PipelineVariable`, their aliases and any binding prefix of them.
+       PowerShell parses `-OutVariable x` as a parameter followed by a separate
+       string element and `-OutVariable:x` as a parameter carrying its argument,
+       so both shapes are resolved here. A leading `+` means append rather than
+       replace - still a write to that variable - so it is stripped before the
+       name is read. Returns one entry per such parameter: the variable name it
+       writes, or `?` when the target is not a plain literal and so could name
+       anything. #>
     param([Parameter(Mandatory)]$FunctionAst)
     $targets = @()
     foreach ($parameter in $FunctionAst.FindAll({
                 param($candidate)
                 $candidate -is [Management.Automation.Language.CommandParameterAst]
             }, $true)) {
-        if ($script:WrapperCommonVariableParameters -notcontains $parameter.ParameterName) { continue }
+        if (-not (Test-WrapperCommonVariableParameterName -ParameterName $parameter.ParameterName)) { continue }
         $argument = $parameter.Argument
         if ($null -eq $argument -and $parameter.Parent -is [Management.Automation.Language.CommandAst]) {
             $elements = @($parameter.Parent.CommandElements)
@@ -86,7 +107,9 @@ function Get-WrapperCommonVariableTarget {
             }
         }
         if ($argument -is [Management.Automation.Language.StringConstantExpressionAst]) {
-            $targets += (Split-WrapperVariableName -Path $argument.Value)
+            $literal = [string]$argument.Value
+            if ($literal.StartsWith('+')) { $literal = $literal.Substring(1) }
+            $targets += (Split-WrapperVariableName -Path $literal)
         }
         else { $targets += '?' }
     }
