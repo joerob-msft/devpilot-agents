@@ -207,6 +207,14 @@ Where a value is empty, send the empty string `""` - never omit the key. "Or
 empty" means an empty value, not an absent one: one missing key rejects the
 whole marker, taking the candidates alongside it.
 
+The top-level object is given to you already built. Take
+`markerScaffold` from the wrapper runtime data exactly as it is - every
+binding, every hash and the nonce are already correct in it - fill in its
+`candidates`, `ruleCoverage`, `withheld` and `residualRisks` arrays, change
+nothing else, and print that one object on the marker line. Do not retype the
+scalar values and do not drop `nonce`: it is the last key and the one most
+often lost, and losing it costs the whole pass.
+
 The top-level object has exactly:
 
 `schemaVersion`, `prId`, `repositoryId`, `project`, `reviewedSourceCommit`,

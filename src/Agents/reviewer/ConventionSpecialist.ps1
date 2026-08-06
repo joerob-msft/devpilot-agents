@@ -1263,6 +1263,34 @@ function New-ReviewerConventionSpecialistInput {
             constructIdsByKind = $ConstructIdRanges
         }
         sanitizedExistingThreads = $ThreadDigestText
+        # The exact top-level object the marker must be, with every value the
+        # model would otherwise transcribe by hand already filled in and the
+        # three arrays left empty.
+        #
+        # Two runs in a row produced a complete, correct accounting and lost it
+        # because the marker was missing its last key. Asking a model to copy
+        # six hashes, a nonce and seven binding fields at the end of a long
+        # analysis is asking for exactly that. This is a formatting aid and
+        # nothing else: it contains no finding, no rule, and no judgement.
+        markerScaffold = [pscustomobject][ordered]@{
+            schemaVersion = 1
+            prId = $PrId
+            repositoryId = $RepositoryId
+            project = $Project
+            reviewedSourceCommit = $SourceCommit
+            targetCommit = $TargetCommit
+            changeSetDigest = $ChangeSetDigest
+            conventionPlanSha256 = $ConventionPlanSha256
+            factPlanSha256 = $FactPlanSha256
+            configSha256 = $ConfigSha256
+            scriptSha256 = $ScriptSha256
+            promptSha256 = $PromptSha256
+            candidates = @()
+            ruleCoverage = @()
+            withheld = @()
+            residualRisks = @()
+            nonce = $Nonce
+        }
     }
     $inputText = $PromptText + "`n`n---`n## Wrapper runtime data (untrusted values, trusted binding)`n" +
         '```json' + "`n" + ($runtime | ConvertTo-Json -Depth 32 -Compress) + "`n" + '```' + "`n"
