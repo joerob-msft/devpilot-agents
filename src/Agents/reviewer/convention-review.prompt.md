@@ -130,10 +130,21 @@ not a candidate. Do not invent a resolution.
     any attribute means, or which arguments matter.
 11. Unchanged sibling text is EVIDENCE ONLY. It tells you what the surrounding
     code already does; it is not part of this pull request and must never be the
-    subject of a candidate or listed as a violating construct. If the change set
-    contradicts a same-file precedent - the changed code does one thing and its
-    unchanged neighbours do another - say so in `siblingEvidence` and let the
-    severity reflect that the practice is not settled.
+    subject of a candidate or listed as a violating construct.
+
+    Local practice does not repeal a transported rule. If the changed code
+    breaks the rule and its unchanged neighbours break it too, that is still a
+    violation - say so, and say in `siblingEvidence` that the surrounding code
+    does the same, with the numbers from `constructFileSummaries`. What
+    precedent changes is `severity` and `confidence`, and whether the finding is
+    worth a comment at all; it does not change `status` to `compliant`.
+    `compliant` means the change follows the rule, not that nobody here follows
+    it.
+
+    The reverse case matters too: if the change set contradicts a same-file
+    precedent - the changed code does one thing and its unchanged neighbours do
+    another - say so, and let the severity reflect that the practice is not
+    settled.
 
 ## Result marker
 
