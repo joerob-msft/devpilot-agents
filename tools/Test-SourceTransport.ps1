@@ -1353,6 +1353,49 @@ Assert-Source ([int]$rejectPaddedReport.ReaderExcusedAllowance -eq 3) `
 Assert-Source (-not (Test-ReviewerSourceCoverageGate -Report $rejectPaddedReport -Policy $policy).Ok) `
     "and cannot be used to pad past the ceiling"
 
+# Case-variant spellings of one path are one contested path. On a
+# case-insensitive host the reader serves the same bytes for each, so an ordinal
+# comparer let eight spellings raise the ceiling by eight.
+$caseVariantReport = New-ReviewerSourceTransportReport -CommitSha $commit `
+    -ChangedPaths (@('/src/Keep.cs') + @(1..5 | ForEach-Object { "/src/lie$_.cs" }) + @('/src/keep.cs', '/SRC/KEEP.CS', '/src/KEEP.cs', '/Src/Keep.Cs')) `
+    -SpansByPath ([ordered]@{ '/src/Keep.cs' = @(@{ Start = 20; End = 21 }) }) -Policy $policy `
+    -Reader { param([string]$Path)
+        if ($Path -clike '*lie*') { return [pscustomobject]@{ Rejected = 'notTextual'; MimeType = 'application/octet-stream'; ByteLength = 3000; Sha256 = ('9' * 64) } }
+        $bodyText = New-TestFileText -LineCount 60
+        [pscustomobject]@{ Text = $bodyText; MimeType = 'text/plain'
+            ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($bodyText)
+            Sha256 = Get-ReviewerSourceSha256 -Text $bodyText }
+    } -ChangeKindsByPath ([ordered]@{ '/src/Keep.cs' = 'Edit'; '/src/lie1.cs' = 'Edit'; '/src/lie2.cs' = 'Edit'; '/src/lie3.cs' = 'Edit'; '/src/lie4.cs' = 'Edit'; '/src/lie5.cs' = 'Edit' })
+Assert-Source ([int]$caseVariantReport.ReaderExcusedAllowance -eq 3) `
+    "case-variant spellings of one path count as one contested path, not several"
+Assert-Source (-not (Test-ReviewerSourceCoverageGate -Report $caseVariantReport -Policy $policy).Ok) `
+    "so re-spelling a delivered path buys no room to mislabel source files"
+
+# A path dropped by the file cap was never read, so its text status is not
+# contested and it must not buy allowance - though it does stay in the coverage
+# denominator, which is a different question.
+$cappedPolicy = New-TestPolicy -Overrides @{ maxFiles = 6 }
+$cappedPaths = @('/src/ok1.cs') + @(1..5 | ForEach-Object { "/src/lie$_.cs" }) + @(1..6 | ForEach-Object { "/src/extra$_.cs" })
+$cappedKinds = [ordered]@{}
+foreach ($p in $cappedPaths) { $cappedKinds[$p] = 'Edit' }
+$cappedReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $cappedPaths `
+    -SpansByPath ([ordered]@{ '/src/ok1.cs' = @(@{ Start = 20; End = 21 }) }) -Policy $cappedPolicy `
+    -Reader { param([string]$Path)
+        if ($Path -clike '*lie*') { return [pscustomobject]@{ Rejected = 'notTextual'; MimeType = 'application/octet-stream'; ByteLength = 3000; Sha256 = ('9' * 64) } }
+        $bodyText = New-TestFileText -LineCount 60
+        [pscustomobject]@{ Text = $bodyText; MimeType = 'text/plain'
+            ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($bodyText)
+            Sha256 = Get-ReviewerSourceSha256 -Text $bodyText }
+    } -ChangeKindsByPath $cappedKinds
+Assert-Source ((@(@($cappedReport.Files) | Where-Object { [string]$_.Reason -ceq 'fileCountCapExceeded' }).Count -eq 6)) `
+    "the file-cap fixture really does drop paths past the cap"
+Assert-Source ([int]$cappedReport.ReaderExcusedAllowance -eq 3) `
+    "paths dropped by the file cap were never read, so they buy no allowance"
+Assert-Source (-not (Test-ReviewerSourceCoverageGate -Report $cappedReport -Policy $cappedPolicy).Ok) `
+    "so overflowing the file cap cannot raise the ceiling past what arrived"
+Assert-Source ([int]$cappedReport.SourceBearingFileCount -eq 7) `
+    "while those paths still count against coverage, which is a different question"
+
 # The exact boundary, both sides, at a change set where the share rounds cleanly.
 $atLimitReport = New-MislabelReport -Excused 5 -Delivered 5
 Assert-Source ([int]$atLimitReport.ReaderExcusedAllowance -eq 5) "the allowance for a ten-path change set is five"

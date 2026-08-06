@@ -143,13 +143,15 @@ Two details of that arithmetic are load-bearing:
 
 - The share is measured against the **distinct** paths whose text status is
   actually contested — every path that carries source, plus every reader excusal
-  the path name does not corroborate, counted once each and with malformed paths
-  excluded. Every looser denominator has been a padding vector: all changed paths
-  let a bulk move buy allowance; all source-capable paths let *icons* buy it, two
-  assets per free mislabelled source file; and counting change-set *entries* let
-  a repeated `item.path`, or a path that can never be a reviewable location at
-  all, buy it. The charge is still counted per entry, so a duplicated mislabelled
-  path over-charges — the safe direction.
+  the path name does not corroborate, counted once each and case-insensitively,
+  with malformed paths and paths dropped by the file cap excluded (neither was
+  ever read, so neither is contested). Every looser denominator has been a
+  padding vector: all changed paths let a bulk move buy allowance; all
+  source-capable paths let *icons* buy it, two assets per free mislabelled source
+  file; counting change-set *entries* let a repeated `item.path` buy it; and an
+  ordinal comparer let eight case-variant spellings of one path buy it on a
+  case-insensitive host. The charge is still counted per entry, so a duplicated
+  mislabelled path over-charges — the safe direction.
 - Unknown and extensionless paths count as **uncorroborated**, because the
   conservative direction is the one that keeps a path counted.
 

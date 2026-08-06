@@ -1226,9 +1226,20 @@ function New-ReviewerSourceTransportReport {
     #
     # The charge is still counted per entry, so a duplicated mislabelled path
     # over-charges. That is the safe direction.
-    $contestedPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    # OrdinalIgnoreCase deliberately, unlike the span map. There the concern is
+    # exact keying - two files that differ only in case are two files, and must
+    # not share a span list. Here the concern is de-duplication, and a comparer
+    # that collapses more can only ever shrink the denominator, which is the
+    # fail-closed direction. Ordinal let eight case-variant spellings of one
+    # delivered path raise the ceiling by eight on a case-insensitive host.
+    $contestedPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($contestedFile in @($files)) {
-        if ([string]$contestedFile.Reason -ceq 'pathRejected') { continue }
+        # A malformed path is never a reviewable location, and a path dropped by
+        # the file cap was never read - neither one's text status is contested,
+        # so neither may buy allowance. They stay in the coverage denominator,
+        # which is a different question and already answered correctly.
+        if ([string]$contestedFile.Reason -ceq 'pathRejected' -or
+            [string]$contestedFile.Reason -ceq 'fileCountCapExceeded') { continue }
         if ([bool]$contestedFile.CarriesSource -or
             ([string]$contestedFile.NoSourceBasis -ceq 'reader' -and
                 -not (Test-ReviewerSourcePathLooksNonText -Path ([string]$contestedFile.Path)))) {
