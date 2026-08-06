@@ -152,11 +152,13 @@ reason — `noChangedSpans` — is presented that way, and every other omission
 reason is described as a path whose source content could not be established,
 which the model must treat as unread.
 
-Emptying the denominator is the extreme case; shrinking it is the same attack at
-lower volume. Nine paths a host mislabels as non-text, beside one file that
-really is delivered, leave one source-bearing file of which one is covered — a
-clean **100%** over a change set the model has seen a tenth of, with every
-percentage floor satisfied.
+Emptying the denominator was the extreme case; shrinking it was the same attack
+at lower volume. Nine paths a host mislabelled as non-text, beside one file that
+really was delivered, *used to* leave one source-bearing file of which one was
+covered — a clean **100%** over a change set the model had seen a tenth of, with
+every percentage floor satisfied. That is the shape the cap below was added for.
+The denominator rule above now refuses it independently: the same change set
+reports **10%** and fails the coverage floor as well as the cap.
 
 So reader-derived excusal is capped — but only the part of it nobody else
 corroborates. When the reader says a path's bytes are not text **and the change
@@ -197,9 +199,9 @@ lowers it:
 | 1 edited file + 40 `.png` | 40 | 0 | 2 | 2 | refused |
 | 7 edited files + 3 `.png` | 3 | 0 | 3 | 70 | reviewed |
 | 6 edited files + 4 `.png` | 4 | 0 | 3 | 60 | reviewed — exactly on the floor |
-| 1 delivered + 9 mislabelled `.cs` | 9 | 9 | 5 | 10 | refused, both floors and `readerExcusedShareExceeded` |
+| 1 delivered + 9 mislabelled `.cs` | 9 | 9 | 5 | 10 | refused, `sourceCoverageBelowPercentFloor` and `readerExcusedShareExceeded` |
 | the same padded with 8 deletes + 8 renames | 9 | 9 | 5 | 10 | refused — padding buys nothing |
-| the same padded with 8 `.png` | 17 | 9 | 5 | 6 | refused — nor does asset padding |
+| the same padded with 8 `.png` | 17 | 9 | 5 | 5 | refused — nor does asset padding |
 | 5 delivered + 5 mislabelled `.cs` | 5 | 5 | 5 | 50 | refused — at the allowance, under the floor |
 | 4 delivered + 6 mislabelled `.cs` | 6 | 6 | 5 | 40 | refused |
 | 9 change-set deletes + 1 delivered | 0 | 0 | 2 | 100 | reviewed — the change set's own statement |

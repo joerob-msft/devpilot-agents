@@ -56,13 +56,19 @@ $script:ReviewerSourceOmissionReasons = @(
 # New-ReviewerSourceFileEntry refuses to mark a path source-free under any other
 # reason, so the flag the gate divides by and the sentence the model obeys cannot
 # drift apart.
+# Every reason that may mark a path as carrying no source at all. This is the
+# GATE-side set: `New-ReviewerSourceFileEntry` refuses `CarriesSource = $false`
+# under any other reason. It is deliberately LARGER than the model-facing set
+# below - a binary really does hold no source, but only the pull request's own
+# word may be presented to a model as "nothing to check".
 $script:ReviewerSourceNoSourceReasons = @("noChangedSpans", "binaryNoText", "emptyFile")
 # The strictly smaller set a MODEL may be told means "there is nothing in this
 # path for anyone to read". Only the pull request's own statement qualifies. A
 # path the reader could not establish content for is an UNREAD path: telling the
 # model it has nothing to check is a lie the host can author at will, and it was
 # how nine mislabelled source files were presented as nine files with nothing in
-# them.
+# them. The sealed block's binding sentence is GENERATED from this array, so the
+# prose and the rule cannot drift.
 $script:ReviewerSourceNothingToReadReasons = @("noChangedSpans")
 $script:ReviewerSourceStatuses = @("delivered", "partial", "omitted")
 $script:ReviewerSourceMaxSpansPerPath = 2000
@@ -75,20 +81,21 @@ $script:ReviewerSourceMaxSpanlessProbes = 16
 # can refuse a budget pair that could not possibly fit inside it.
 $script:ReviewerSourceMaxRenderedBytes = 4194304
 
-# How far the READER alone may shrink the coverage denominator.
+# How far the READER alone may push the covered/uncovered split.
 #
 # A path excused because the change set called it a delete is the pull request's
-# own statement. A path excused because the reader said its bytes are not text is
-# a statement by the same host whose misbehaviour this layer exists to survive,
-# and each one removes a file from the denominator the coverage floor divides by.
-# Nine mislabelled paths beside one delivered file scored 1/1 - a clean 100% over
-# a change set the model saw a tenth of.
+# own statement, and only that removes a path from the coverage denominator. A
+# path excused because the reader said its bytes are not text stays counted -
+# but it is counted as UNCOVERED, so a host that mislabels enough of a change
+# set still controls how much of it the model is deemed to have seen.
 #
-# So reader-derived excusal is capped: a share of the change set, with a small
-# absolute floor so a two-file pull request is not over-constrained. Beyond the
-# cap the gate refuses outright rather than quietly dividing by a smaller number.
-# These are code constants, deliberately NOT policy keys, because a consumer
-# config that could widen them could re-open the hole it exists to close.
+# So reader-derived excusal is capped as well: a share of the distinct contested
+# paths, with a small absolute floor so a two-file pull request is not
+# over-constrained. Past the cap the gate refuses under its own reason, so a
+# mislabelling host is refused on two independent counts - this ceiling and the
+# coverage floor - rather than one. These are code constants, deliberately NOT
+# policy keys, because a consumer config that could widen them could re-open the
+# hole they exist to close.
 $script:ReviewerSourceMaxReaderExcusedPercent = 50
 $script:ReviewerSourceReaderExcusedFloor = 2
 
@@ -1357,11 +1364,12 @@ function New-ReviewerSourceFileEntry {
         [int]$RequestedSpanCount = 0,
         [int]$RawRequestedSpanCount = 0,
         [int]$DeliveredRawSpanCount = 0,
-        # False only for a path that has no added or edited lines for this layer
-        # to deliver at all - a delete, a rename, a binary, an empty added file.
-        # Such a path cannot be "uncovered", so it is counted apart from the
-        # coverage denominator rather than sinking a percentage it has no source
-        # to contribute to.
+        # False only for a path with no added or edited lines for this layer to
+        # deliver. It does NOT by itself remove the path from the coverage
+        # denominator: only `NoSourceBasis = 'changeSet'` does that. A
+        # reader-derived excusal stays counted and does sink the percentage,
+        # because the host saying "these bytes are not text" is not evidence that
+        # there was nothing to read.
         [bool]$CarriesSource = $true,
         # Who said this path has no source: "changeSet" (the pull request's own
         # change type) or "reader" (what came back when it was read). Only the
@@ -1375,10 +1383,10 @@ function New-ReviewerSourceFileEntry {
     if ($Reason -and $script:ReviewerSourceOmissionReasons -cnotcontains $Reason) {
         throw "Unknown source-transport omission reason '$Reason'."
     }
-    # The flag the gate divides by and the reason the prompts publish must agree.
-    # If they can drift, a path can leave the coverage denominator under a reason
-    # the model has not been told means "nothing to read" - or worse, be told to
-    # ignore a file that really was unread.
+    # The gate-side set. A path may only be marked source-free under a reason
+    # that genuinely means it holds none - not the same thing as the strictly
+    # smaller model-facing set, which is narrower still because only the pull
+    # request's own word may be presented to a model as "nothing to check".
     if (-not $CarriesSource -and $script:ReviewerSourceNoSourceReasons -cnotcontains $Reason) {
         throw "Source-transport reason '$Reason' cannot mark a path as carrying no source."
     }
@@ -1452,12 +1460,12 @@ function Test-ReviewerSourceCoverageGate {
         }
     }
     # Applies to every non-empty change set, whatever the branch above decided.
-    # Each reader-derived excusal removes a file from the denominator the two
-    # percentage floors divide by, so enough of them make any percentage
-    # meaningless: nine mislabelled paths beside one delivered file scored 1/1,
-    # a clean 100% over a change set the model had seen a tenth of. Past the
-    # allowance the gate refuses outright instead of dividing by a number the
-    # host chose. The paths stay visible in the accounting table either way.
+    # A reader-derived excusal no longer shrinks the denominator, so it already
+    # shows up as uncovered - but a host that mislabels enough of a change set
+    # still decides how much of it the model is deemed to have seen. This
+    # ceiling bounds that independently of the percentage floors, so such a host
+    # is refused on two counts rather than one. The paths stay visible in the
+    # accounting table either way.
     # The charge falls back to the RAW reader-excusal count, never to zero. A
     # report missing the field is malformed, and a malformed report must
     # over-charge rather than silently switch the ceiling off. A report missing

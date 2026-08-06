@@ -54,6 +54,10 @@
       {
         "sha256": "64f2aa99bb0217548df38f7791b00933aacdf31581c9bac7f1673168e6bd59e3",
         "reason": "Tell the human what the model is now told: a path the host could not read is counted IN the coverage percentage and belongs in the list of files nobody read. The preview said those paths were excluded from the calculation and then omitted them from that list entirely, so four unread source files were described to a human as removed from the sum and named nowhere."
+      },
+      {
+        "sha256": "77bed5a456b3d9c811220c909001eed1c2e3ac02560804f18807efba59940a5c",
+        "reason": "Restore the uncorroborated count and the ceiling alongside it. Rewriting that line dropped both, so on a passing pull request a human could no longer see how close the host's unsupported non-text claims came to the refusal threshold."
       }
     ],
     "Invoke-ReviewerDelivery": [
