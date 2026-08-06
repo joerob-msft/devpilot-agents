@@ -1149,6 +1149,57 @@ try {
     Assert-Replay ($hunkFunction.Value -match '\$line - 3' -and $hunkFunction.Value -match '\$line \+ 3') `
         "Raising the read bound must not widen what a model is shown: the hunk stays seven lines."
 
+    # Enumeration runs on the mandatory path of every review, before any model.
+    # It once rebuilt a delivered-line set on every line of every file, three
+    # times over, and took twenty-seven seconds on one ordinary file - a stall
+    # with no error and no truncation flag to show for it.
+    $constructSource = [IO.File]::ReadAllText((Join-Path $RepoRoot "src\Agents\reviewer\ChangedConstructs.ps1"))
+    Assert-Replay ($constructSource -match '\$index\[\$position\] = Get-ReviewerConstructDeclarationAt') `
+        "The declaration index must be built by one pass over the file."
+    Assert-Replay ($constructSource -notmatch 'Get-ReviewerConstructDeclarationAt -MaskedLines \$MaskedLines -Index \$scan') `
+        "Nothing may recognise a line again once the index exists."
+    $bigLines = [System.Collections.Generic.List[string]]::new()
+    [void]$bigLines.Add('public class C')
+    [void]$bigLines.Add('{')
+    foreach ($n in 1..800) {
+        [void]$bigLines.Add('    [TestMethod]')
+        [void]$bigLines.Add("    public void M$n() { }")
+        [void]$bigLines.Add('')
+    }
+    [void]$bigLines.Add('}')
+    $bigCode = @($bigLines.ToArray())
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $bigResult = Get-ReviewerChangedConstructs -Files @(@{
+            Path = "src/Big.cs"; Lines = $bigCode; ChangedLines = @(4, 7, 10)
+            DeliveredLines = @(1..$bigCode.Count)
+        })
+    $watch.Stop()
+    Assert-Replay (@($bigResult.Constructs).Count -gt 0) "A large delivered file must still yield constructs."
+    Assert-Replay ($watch.ElapsedMilliseconds -lt 20000) `
+        "Enumerating a $($bigCode.Count)-line fully delivered file took $($watch.ElapsedMilliseconds) ms; it runs before every review and must not become a stall."
+
+    # Truncation must never be a way past a pattern. A field carrying both would
+    # otherwise accept a string whose only violation sat past the cut.
+    $patterned = @{ Type = "string"; MaxLength = 20; Truncate = $true; Pattern = '^[\x20-\x7E]+$' }
+    $hiddenViolation = Test-MarkerField -Spec $patterned -Value ("ascii ascii ascii ok" + [string][char]0x0416)
+    Assert-Replay (-not [bool]$hiddenViolation.Ok) `
+        "A pattern must be checked against the text as it arrived, not against the shortened copy."
+    $shortenable = Test-MarkerField -Spec $patterned -Value ("abcdefghijklmnopqrstuvwxyz")
+    Assert-Replay ([bool]$shortenable.Ok -and ([string]$shortenable.Value).Length -le 20) `
+        "A long but otherwise valid string must still be shortened rather than rejected."
+
+    # The wrapper cuts one string itself, when it records a violation the pass
+    # never emitted. That cut needs the same surrogate guard.
+    $specialistText = [IO.File]::ReadAllText((Join-Path $RepoRoot "src\Agents\reviewer\ConventionSpecialist.ps1"))
+    Assert-Replay ($specialistText -notmatch '\$detail\.Substring\(0, 800\)') `
+        "The unemitted-violation detail must not be cut with a bare Substring."
+    $shortened = Get-ReviewerConventionSpecialistShortened -Text (("a" * 799) + [string][char]0xD83D + [string][char]0xDE00) -MaxLength 800
+    $strict = [System.Text.UTF8Encoding]::new($false, $true)
+    $encodedDetail = $null
+    try { $encodedDetail = $strict.GetBytes($shortened) } catch { $encodedDetail = $null }
+    Assert-Replay ($null -ne $encodedDetail) `
+        "Shortening the unemitted-violation detail must never leave half a surrogate pair behind."
+
     # -- 11. The replay tool grant -------------------------------------------    # Extracted from the reviewer's own source and evaluated here, because the
     # claim "the model has no usable tool in replay" is otherwise a comment.
     Write-Host "11/11 replay tool grant" -ForegroundColor Cyan

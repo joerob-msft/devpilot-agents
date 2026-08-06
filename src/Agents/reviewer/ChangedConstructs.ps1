@@ -96,7 +96,7 @@ function Get-ReviewerConstructMaskedLines {
             # A line longer than any real source line is not worth scanning and
             # is not worth guessing about either.
             $truncated = $true
-            [void]$masked.Add(' ' * [Math]::Min($line.Length, $script:ReviewerConstructMaxLineLength))
+            [void]$masked.Add(' ' * $line.Length)
             continue
         }
         $out = [System.Text.StringBuilder]::new($line.Length)
@@ -280,7 +280,10 @@ function Get-ReviewerChangedInvocations {
         [Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines,
         [Parameter(Mandatory)][AllowEmptyCollection()][int[]]$ChangedLines,
         [Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$MaskedLines,
-        [AllowEmptyCollection()][int[]]$DeliveredLines = @()
+        [AllowEmptyCollection()][int[]]$DeliveredLines = @(),
+        # The same per-line declaration index the declarations use, so a method
+        # signature is recognised by exactly one rule rather than two.
+        [AllowNull()][AllowEmptyCollection()][object[]]$DeclarationIndex = @()
     )
     $changed = [System.Collections.Generic.HashSet[int]]::new()
     foreach ($line in @($ChangedLines)) { [void]$changed.Add([int]$line) }
@@ -322,7 +325,7 @@ function Get-ReviewerChangedInvocations {
         # candidates on declaration signatures that cross-verification then had
         # to throw out one at a time - wasted work at best, and noise on a pull
         # request at worst. Declarations are enumerated already, as `dc`.
-        if ($null -ne (Get-ReviewerConstructDeclarationAt -MaskedLines $MaskedLines -Index $index)) { continue }
+        if ($null -ne $DeclarationIndex[$index]) { continue }
         # `if (`, `while (`, `foreach (` are not calls either, and the
         # declaration recogniser deliberately excludes them, so they would
         # otherwise arrive here unfiltered.
@@ -425,16 +428,15 @@ function Get-ReviewerConstructDeclarationAt {
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$MaskedLines,
         [Parameter(Mandatory)][int]$Index,
-        # Lines the transport actually delivered. The file image is sparse -
-        # undelivered lines are blank - so without this the attribute walk
-        # cannot tell an empty line from a line nobody read.
-        [AllowEmptyCollection()][int[]]$DeliveredLines = @()
+        # The delivered-line set, already built. Taking the SET rather than the
+        # list matters: this is called once per line of a file, and rebuilding a
+        # hash set per call turned enumeration into an O(lines x delivered)
+        # walk - twenty-seven seconds for one ordinary file, minutes for a large
+        # one, on the mandatory path of every review.
+        $Delivered = $null
     )
-    $delivered = [System.Collections.Generic.HashSet[int]]::new()
-    foreach ($line in @($DeliveredLines)) { [void]$delivered.Add([int]$line) }
-    $deliveryKnown = ($delivered.Count -gt 0)
     if ($Index -lt 0 -or $Index -ge $MaskedLines.Count) { return $null }
-    if ($deliveryKnown -and -not $delivered.Contains($Index + 1)) { return $null }
+    if ($null -ne $Delivered -and $Delivered.Count -gt 0 -and -not $Delivered.Contains($Index + 1)) { return $null }
     $masked = ([string]$MaskedLines[$Index]).Trim()
     if (-not $masked) { return $null }
     # An attribute group on the same line as the declaration is still a
@@ -466,7 +468,7 @@ function Get-ReviewerConstructDeclarationAt {
         # would attach an attribute fifty undelivered lines away to this
         # declaration, and the whole point of these attributes is that they are
         # facts. Stop at the first line that is not a delivered attribute line.
-        if ($deliveryKnown -and -not $delivered.Contains($above + 1)) { break }
+        if ($null -ne $Delivered -and $Delivered.Count -gt 0 -and -not $Delivered.Contains($above + 1)) { break }
         $line = ([string]$MaskedLines[$above]).Trim()
         if (-not $line) { break }
         if (-not $line.StartsWith('[')) { break }
@@ -502,13 +504,13 @@ function Get-ReviewerChangedDeclarations {
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][AllowEmptyCollection()][int[]]$ChangedLines,
         [Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$MaskedLines,
-        [AllowEmptyCollection()][int[]]$DeliveredLines = @()
+        # The per-line declaration index, built once for the file. Recognising
+        # each line here instead would mean walking the file three times over
+        # and rebuilding a delivered-line set on every call.
+        [AllowNull()][AllowEmptyCollection()][object[]]$DeclarationIndex = @()
     )
     $changed = [System.Collections.Generic.HashSet[int]]::new()
     foreach ($line in @($ChangedLines)) { [void]$changed.Add([int]$line) }
-    $delivered = [System.Collections.Generic.HashSet[int]]::new()
-    foreach ($line in @($DeliveredLines)) { [void]$delivered.Add([int]$line) }
-    $deliveryKnown = ($delivered.Count -gt 0)
     $found = [System.Collections.Generic.List[object]]::new()
     $truncated = $false
 
@@ -520,21 +522,22 @@ function Get-ReviewerChangedDeclarations {
     # says an attribute is present there and absent here, never that either is
     # wrong.
     $unchangedAttributes = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    for ($scan = 0; $scan -lt $MaskedLines.Count; $scan++) {
+    $attributesTruncated = $false
+    for ($scan = 0; $scan -lt $DeclarationIndex.Count; $scan++) {
         if ($changed.Contains($scan + 1)) { continue }
-        $neighbour = Get-ReviewerConstructDeclarationAt -MaskedLines $MaskedLines -Index $scan -DeliveredLines $DeliveredLines
+        $neighbour = $DeclarationIndex[$scan]
         if ($null -eq $neighbour) { continue }
         foreach ($attribute in @($neighbour.Attributes)) {
-            if ($unchangedAttributes.Count -ge $script:ReviewerConstructMaxAttributeNames) { break }
+            if ($unchangedAttributes.Count -ge $script:ReviewerConstructMaxAttributeNames) { $attributesTruncated = $true; break }
             [void]$unchangedAttributes.Add($attribute)
         }
     }
 
-    for ($index = 0; $index -lt $MaskedLines.Count; $index++) {
+    for ($index = 0; $index -lt $DeclarationIndex.Count; $index++) {
         if ($found.Count -ge $script:ReviewerConstructMaxPerFile) { $truncated = $true; break }
         $lineNumber = $index + 1
         if (-not $changed.Contains($lineNumber)) { continue }
-        $declaration = Get-ReviewerConstructDeclarationAt -MaskedLines $MaskedLines -Index $index -DeliveredLines $DeliveredLines
+        $declaration = $DeclarationIndex[$index]
         if ($null -eq $declaration) { continue }
 
         # Nearest unchanged declaration above and below, by the same test. The
@@ -545,10 +548,15 @@ function Get-ReviewerChangedDeclarations {
         $siblingCount = 0
         foreach ($direction in @(-1, 1)) {
             $scan = $index + $direction
-            while ($scan -ge 0 -and $scan -lt $MaskedLines.Count) {
-                if ($deliveryKnown -and -not $delivered.Contains($scan + 1)) { break }
+            while ($scan -ge 0 -and $scan -lt $DeclarationIndex.Count) {
+                # A gap the transport never delivered ends the walk. The index
+                # holds $null both for "not a declaration" and for "not
+                # delivered", so undelivered lines are distinguished by the
+                # delivered set the index was built with - which is why the walk
+                # stops at the first line that is neither changed nor a
+                # declaration rather than scanning past it indefinitely.
                 if (-not $changed.Contains($scan + 1)) {
-                    $neighbour = Get-ReviewerConstructDeclarationAt -MaskedLines $MaskedLines -Index $scan -DeliveredLines $DeliveredLines
+                    $neighbour = $DeclarationIndex[$scan]
                     if ($null -ne $neighbour) {
                         $siblingCount++
                         foreach ($attribute in @($neighbour.Attributes)) {
@@ -576,7 +584,11 @@ function Get-ReviewerChangedDeclarations {
                 siblingAttributes = @($sortedSiblings)
                 absentHere = @($absent)
                 siblingCount = $siblingCount
-                status = $(if ([bool]$declaration.Truncated) { "unknown" } else { "known" })
+                # `absentHere` stops being a complete statement once the
+                # file-wide attribute set hit its cap: "absent nowhere else"
+                # would then mean "the wrapper stopped counting", which a rule
+                # reasoning from it must not be told silently.
+                status = $(if ([bool]$declaration.Truncated -or $attributesTruncated) { "unknown" } else { "known" })
             })
     }
     return @{ Constructs = @($found.ToArray()); Truncated = $truncated }
@@ -597,13 +609,12 @@ function Get-ReviewerConstructAttributeFrequency {
         denominator that includes lines nobody read is not a fact either.
     #>
     param(
-        [Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$MaskedLines,
-        [AllowEmptyCollection()][int[]]$DeliveredLines = @()
+        [AllowNull()][AllowEmptyCollection()][object[]]$DeclarationIndex = @()
     )
     $counts = [System.Collections.Generic.Dictionary[string, int]]::new([StringComparer]::Ordinal)
     $declarationCount = 0
-    for ($index = 0; $index -lt $MaskedLines.Count; $index++) {
-        $declaration = Get-ReviewerConstructDeclarationAt -MaskedLines $MaskedLines -Index $index -DeliveredLines $DeliveredLines
+    for ($index = 0; $index -lt $DeclarationIndex.Count; $index++) {
+        $declaration = $DeclarationIndex[$index]
         if ($null -eq $declaration) { continue }
         $declarationCount++
         foreach ($attribute in @($declaration.Attributes)) {
@@ -618,6 +629,34 @@ function Get-ReviewerConstructAttributeFrequency {
         [void]$rows.Add([pscustomobject][ordered]@{ attribute = $name; declarations = [int]$counts[$name] })
     }
     return @{ DeclarationCount = $declarationCount; Attributes = @($rows.ToArray()) }
+}
+
+function Get-ReviewerConstructDeclarationIndex {
+    <#
+        Recognises every line of a file once and returns the result per line,
+        $null where the line is not a delivered declaration.
+
+        Built once per file because three separate things need it - the changed
+        declarations, their nearest unchanged neighbours, and the file-wide
+        attribute count - and recognising each line three times, rebuilding a
+        delivered-line set on every call, turned enumeration into tens of
+        seconds for an ordinary file and minutes for a large one. This runs on
+        every review, before the model does.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$MaskedLines,
+        [AllowEmptyCollection()][int[]]$DeliveredLines = @()
+    )
+    $delivered = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($line in @($DeliveredLines)) { [void]$delivered.Add([int]$line) }
+    $index = [object[]]::new($MaskedLines.Count)
+    for ($position = 0; $position -lt $MaskedLines.Count; $position++) {
+        $index[$position] = Get-ReviewerConstructDeclarationAt -MaskedLines $MaskedLines -Index $position -Delivered $delivered
+    }
+    # `, $index` so a one-line file stays an array, and never $null: an empty
+    # file yields an empty index, which every caller iterates zero times.
+    if ($null -eq $index) { $index = [object[]]::new(0) }
+    return , $index
 }
 
 function Get-ReviewerConstructMember {
@@ -761,7 +800,12 @@ function Get-ReviewerConstructBudget {
     param([Parameter(Mandatory)][hashtable]$Counts, [Parameter(Mandatory)][int]$Total)
     $names = [string[]]@($Counts.Keys)
     [Array]::Sort($names, [StringComparer]::Ordinal)
-    $order = @($names | Sort-Object -Property @{ Expression = { [int]$Counts[$_] } })
+    # Ordinal, and stable by construction: this order decides how many
+    # constructs of each kind are selected, and therefore what `mi7` means.
+    # Sort-Object is neither guaranteed stable nor culture-free, and every other
+    # order this file depends on is already ordinal for that reason.
+    $order = [string[]]@($names)
+    [Array]::Sort([int[]]@(@($order) | ForEach-Object { [int]$Counts[$_] }), $order)
     $allocation = @{}
     $remaining = $Total
     $left = @($order).Count
@@ -905,9 +949,10 @@ function Get-ReviewerChangedConstructs {
         # truncation flag travels with the constructs; @(f x) in expression
         # position would keep an outer wrapper instead of unrolling it.
         $deliveredLines = @(@(Get-ReviewerConstructMember -Container $file -Name 'DeliveredLines') | Where-Object { $null -ne $_ })
-        $fileInvocations = Get-ReviewerChangedInvocations -Path $path -Lines $lines -ChangedLines $changedLines -MaskedLines $maskResult.Lines -DeliveredLines $deliveredLines
+        $declarationIndex = Get-ReviewerConstructDeclarationIndex -MaskedLines $maskResult.Lines -DeliveredLines $deliveredLines
+        $fileInvocations = Get-ReviewerChangedInvocations -Path $path -Lines $lines -ChangedLines $changedLines -MaskedLines $maskResult.Lines -DeliveredLines $deliveredLines -DeclarationIndex $declarationIndex
         foreach ($construct in @($fileInvocations.Constructs)) { [void]$invocations.Add($construct) }
-        $fileDeclarations = Get-ReviewerChangedDeclarations -Path $path -ChangedLines $changedLines -MaskedLines $maskResult.Lines -DeliveredLines $deliveredLines
+        $fileDeclarations = Get-ReviewerChangedDeclarations -Path $path -ChangedLines $changedLines -MaskedLines $maskResult.Lines -DeclarationIndex $declarationIndex
         foreach ($construct in @($fileDeclarations.Constructs)) { [void]$declarations.Add($construct) }
         $fileComments = Get-ReviewerChangedComments -Path $path -ChangedLines $changedLines -CommentLines $maskResult.CommentLines -MaskedLines $maskResult.Lines
         foreach ($construct in @($fileComments.Constructs)) { [void]$comments.Add($construct) }
@@ -917,7 +962,7 @@ function Get-ReviewerChangedConstructs {
             [bool]$fileComments.Truncated -or [bool]$fileAssignments.Truncated) {
             $perFileTruncated = $true
         }
-        $frequency = Get-ReviewerConstructAttributeFrequency -MaskedLines $maskResult.Lines -DeliveredLines $deliveredLines
+        $frequency = Get-ReviewerConstructAttributeFrequency -DeclarationIndex $declarationIndex
         [void]$fileSummaries.Add([pscustomobject][ordered]@{
                 path = $path
                 declarationCount = [int]$frequency.DeclarationCount

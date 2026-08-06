@@ -682,6 +682,9 @@ function ConvertTo-AgentMarkerFieldValue {
                 Replace([string][char]0x00AB, '"').Replace([string][char]0x00BB, '"')
             }
             $max = if ($Spec.ContainsKey('MaxLength')) { [int]$Spec.MaxLength } else { 1000 }
+            # Keep the text as it arrived: the control-character scan and the
+            # pattern are checked against this, not against a shortened copy.
+            $original = $text
             if ($text.Length -gt $max) {
                 # A field may opt into being SHORTENED rather than rejected. Only
                 # fields that never become external text may do so: a comment
@@ -703,14 +706,18 @@ function ConvertTo-AgentMarkerFieldValue {
             }
             if (-not ($Spec.ContainsKey('AllowEmpty') -and [bool]$Spec.AllowEmpty) -and $text.Trim() -eq "") { return $bad }
             $allowNewlines = ($Spec.ContainsKey('AllowNewlines') -and [bool]$Spec.AllowNewlines)
-            foreach ($ch in $text.ToCharArray()) {
+            foreach ($ch in $original.ToCharArray()) {
                 if ([char]::IsControl($ch)) {
                     if ($allowNewlines -and ($ch -eq "`n" -or $ch -eq "`r" -or $ch -eq "`t")) { continue }
                     return $bad
                 }
             }
             if ($Spec.ContainsKey('Pattern') -and $Spec.Pattern) {
-                if ($text -notmatch [string]$Spec.Pattern) { return $bad }
+                # Against the ORIGINAL, not the shortened text. Checking the cut
+                # version would accept a string whose only violation happened to
+                # sit past the cut, which is a pattern that does not mean what
+                # it says.
+                if ($original -notmatch [string]$Spec.Pattern) { return $bad }
             }
             return @{ Ok = $true; Value = $text }
         }
