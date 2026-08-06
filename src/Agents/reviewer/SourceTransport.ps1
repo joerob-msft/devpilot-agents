@@ -1008,6 +1008,22 @@ function New-ReviewerSourceTransportReport {
             continue
         }
         if ($index -gt [int]$Policy.maxFiles) {
+            # The cap bounds READS, and a path the change set says has no
+            # right-hand content is never read. Charging it against the cap made
+            # one deletion past sixty flip a pull request from reviewed to never
+            # reviewed, on every cycle - bulk moves and dead-code removals being
+            # the most ordinary shapes there are, which is the failure the whole
+            # spanless branch below exists to prevent.
+            $cappedDeclared = $null
+            if ($null -ne $ChangeKindsByPath) {
+                $cappedDeclared = Get-ReviewerSourceValue -Object $ChangeKindsByPath -Name $path -Default $null
+            }
+            if (-not (Test-ReviewerSourceChangeCarriesRightHand -ChangeTypeValue $cappedDeclared)) {
+                $index--
+                [void]$files.Add((New-ReviewerSourceFileEntry -Path $path -CommitSha $CommitSha `
+                            -Status "omitted" -Reason "noChangedSpans" -CarriesSource $false -NoSourceBasis "changeSet"))
+                continue
+            }
             [void]$files.Add((New-ReviewerSourceFileEntry -Path $path -CommitSha $CommitSha `
                         -Status "omitted" -Reason "fileCountCapExceeded" -RawRequestedSpanCount $requestedForPath))
             continue
@@ -1029,6 +1045,10 @@ function New-ReviewerSourceTransportReport {
             }
             $carriesRightHand = Test-ReviewerSourceChangeCarriesRightHand -ChangeTypeValue $declared
             if (-not $carriesRightHand) {
+                # No read happened, so no read budget was spent. Without this a
+                # pull request that deletes sixty files and edits five never
+                # reaches the fifth edit.
+                $index--
                 [void]$files.Add((New-ReviewerSourceFileEntry -Path $path -CommitSha $CommitSha `
                             -Status "omitted" -Reason "noChangedSpans" -CarriesSource $false -NoSourceBasis "changeSet"))
                 continue

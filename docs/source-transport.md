@@ -296,6 +296,19 @@ A PR that trips any of these is **not reviewed**. No preview, no comments, no
 vote — the cycle records the reason and moves on. An unperformed review that
 says so is strictly better than a clean-looking one that is silent about it.
 
+**What the floors compose to is weaker than any of them alone**, and it is worth
+stating plainly rather than leaving a reader to infer it. The reader-excusal
+allowance says at most half the contested paths may be excused on the host's
+unsupported word; the file floor says at least 60% of source-bearing files must
+arrive whole. Both can be satisfied at once by a change set that is half
+mislabelled and 40% simply undelivered: 18 delivered files, 12 that carry source
+and did not arrive, and 30 mislabelled ones passes every rule with the model
+holding **18 of 60 changed paths**. Nothing there is a defect — each path is
+accounted honestly and the block names every one the model did not get — but the
+guarantee is "no single failure mode may exceed its own floor", not "the model
+saw 60% of the change". Raise `minDeliveredFilePercent` if a repository needs a
+tighter composed bound.
+
 The preview a human reads carries the same numbers, and names the changed files
 whose source never arrived, so "no findings" can never be read as "every file
 was checked".
@@ -367,7 +380,7 @@ against 1.6 MB for the raw diff channel and 0 bytes for the file-read tool — a
 | `siblingContextSlices` | 2 | slices of UNCHANGED text delivered next to the change, per file |
 | `siblingContextLines` | 80 | lines in each sibling slice |
 | `maxTotalSiblingBytes` | 49152 | delivered SIBLING bytes for the whole PR, kept apart so evidence cannot starve the change |
-| `maxFiles` | 60 | changed files considered before the cap is accounted |
+| `maxFiles` | 60 | changed files **read** before the cap is accounted; a delete or rename is never read and never charged against it |
 
 A slice that does not fit is **dropped whole**, never truncated, so a recorded
 SHA-256 always covers exactly the lines it names. Slice hashes are computed over

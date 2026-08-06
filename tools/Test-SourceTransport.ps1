@@ -1396,6 +1396,56 @@ Assert-Source (-not (Test-ReviewerSourceCoverageGate -Report $cappedReport -Poli
 Assert-Source ([int]$cappedReport.SourceBearingFileCount -eq 7) `
     "while those paths still count against coverage, which is a different question"
 
+# The file cap bounds READS. A path the change set says has no right-hand
+# content is never read, so charging it against the cap made one deletion past
+# the cap flip a pull request from reviewed to never reviewed, forever.
+function New-CapFixture {
+    param([int]$Deletes, [int]$Edits, [switch]$DeletesFirst)
+    $editPaths = @(1..[Math]::Max($Edits, 0) | Where-Object { $Edits -gt 0 } | ForEach-Object { "/src/edit$_.cs" })
+    $deletePaths = @(1..[Math]::Max($Deletes, 0) | Where-Object { $Deletes -gt 0 } | ForEach-Object { "/old/gone$_.cs" })
+    $paths = if ($DeletesFirst) { @($deletePaths) + @($editPaths) } else { @($editPaths) + @($deletePaths) }
+    $spans = [ordered]@{}
+    $kinds = [ordered]@{}
+    foreach ($p in $editPaths) { $spans[$p] = @(@{ Start = 20; End = 21 }); $kinds[$p] = 'Edit' }
+    foreach ($p in $deletePaths) { $kinds[$p] = 'Delete' }
+    return New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $paths -SpansByPath $spans `
+        -Policy (New-TestPolicy -Overrides @{ maxFiles = 6 }) -Reader { param([string]$Path)
+        $bodyText = New-TestFileText -LineCount 60
+        [pscustomobject]@{ Text = $bodyText; MimeType = 'text/plain'
+            ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($bodyText)
+            Sha256 = Get-ReviewerSourceSha256 -Text $bodyText }
+    } -ChangeKindsByPath $kinds
+}
+$capPolicy = New-TestPolicy -Overrides @{ maxFiles = 6 }
+$bulkDeleteReport = New-CapFixture -Deletes 20 -Edits 0
+Assert-Source ((@(@($bulkDeleteReport.Files) | Where-Object { [string]$_.Reason -ceq 'fileCountCapExceeded' }).Count -eq 0)) `
+    "a deletion is never read, so it never exhausts the file cap"
+Assert-Source ((Test-ReviewerSourceCoverageGate -Report $bulkDeleteReport -Policy $capPolicy).Ok) `
+    "so a pull request that deletes far more files than the cap is still reviewable"
+foreach ($deletesFirst in @($true, $false)) {
+    $mixedCapReport = New-CapFixture -Deletes 20 -Edits 3 -DeletesFirst:$deletesFirst
+    Assert-Source ([int]$mixedCapReport.DeliveredFiles -eq 3 -and (Test-ReviewerSourceCoverageGate -Report $mixedCapReport -Policy $capPolicy).Ok) `
+        "and its edits are still delivered whether the deletions come $(if ($deletesFirst) { 'first' } else { 'last' })"
+}
+# An ADDED file past the cap genuinely has right-hand content nobody read, so it
+# must still be counted and must still refuse.
+$cappedAddPaths = @(1..16 | ForEach-Object { "/src/add$_.cs" })
+$cappedAddKinds = [ordered]@{}
+foreach ($p in $cappedAddPaths) { $cappedAddKinds[$p] = 'Add' }
+$cappedAddSpans = [ordered]@{}
+foreach ($p in $cappedAddPaths) { $cappedAddSpans[$p] = @(@{ Start = 20; End = 21 }) }
+$cappedAddReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $cappedAddPaths `
+    -SpansByPath $cappedAddSpans -Policy $capPolicy -Reader { param([string]$Path)
+        $bodyText = New-TestFileText -LineCount 60
+        [pscustomobject]@{ Text = $bodyText; MimeType = 'text/plain'
+            ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($bodyText)
+            Sha256 = Get-ReviewerSourceSha256 -Text $bodyText }
+    } -ChangeKindsByPath $cappedAddKinds
+Assert-Source ((@(@($cappedAddReport.Files) | Where-Object { [string]$_.Reason -ceq 'fileCountCapExceeded' }).Count -eq 10) -and
+    [int]$cappedAddReport.SourceBearingFileCount -eq 16 -and
+    -not (Test-ReviewerSourceCoverageGate -Report $cappedAddReport -Policy $capPolicy).Ok) `
+    "an added file past the cap still has content nobody read, so it is still counted and still refuses"
+
 # The exact boundary, both sides, at a change set where the share rounds cleanly.
 $atLimitReport = New-MislabelReport -Excused 5 -Delivered 5
 Assert-Source ([int]$atLimitReport.ReaderExcusedAllowance -eq 5) "the allowance for a ten-path change set is five"
