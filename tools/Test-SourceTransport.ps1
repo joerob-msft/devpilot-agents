@@ -1640,6 +1640,53 @@ Assert-Source ((@(@($rejectedRecord.files) | Where-Object { [string]$_.path -ceq
     ($rejectedHashes[0] -cne $rejectedHashes[1]) -and (@($rejectedHashes | Where-Object { $_.Length -eq 64 }).Count -eq 2)) `
     "two distinct rejected paths stay distinguishable in the record without either being echoed"
 
+# A path that cannot be strictly UTF-8 encoded must be rejected like any other
+# malformed one - not throw out of the report and leave the pull request
+# permanently unreviewable behind an encoder message.
+$loneSurrogatePath = "/src/" + [string][char]0xD800 + "bad.cs"
+Assert-Source ((ConvertTo-ReviewerSourcePath -Path $loneSurrogatePath) -ceq '') `
+    "a path carrying a lone surrogate is refused by normalization"
+$surrogateReport = $null
+try {
+    $surrogateReport = New-ReviewerSourceTransportReport -CommitSha $commit `
+        -ChangedPaths @('/src/ok.cs', $loneSurrogatePath) `
+        -SpansByPath ([ordered]@{ '/src/ok.cs' = @(@{ Start = 5; End = 6 }) }) -Policy $policy `
+        -Reader { param([string]$Path)
+            $bodyText = New-TestFileText -LineCount 40
+            [pscustomobject]@{ Text = $bodyText; MimeType = 'text/plain'
+                ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($bodyText)
+                Sha256 = Get-ReviewerSourceSha256 -Text $bodyText }
+        } -ChangeKindsByPath ([ordered]@{ '/src/ok.cs' = 'Edit' })
+}
+catch { $surrogateReport = $null }
+Assert-Source ($null -ne $surrogateReport -and
+    (@(@($surrogateReport.Files) | Where-Object { [string]$_.Reason -ceq 'pathRejected' }).Count -eq 1)) `
+    "and it is accounted pathRejected rather than throwing the whole change set away"
+Assert-Source ($null -ne (ConvertTo-ReviewerSourceCoverageRecord -Report $surrogateReport)) `
+    "the coverage record over such a path is still constructible"
+Assert-Source ((Get-ReviewerSourceSha256 -Text $loneSurrogatePath -Substituting).Length -eq 64) `
+    "the audit hash over a raw path substitutes rather than throwing"
+Assert-Source (Test-Throws { Get-ReviewerSourceSha256 -Text $loneSurrogatePath }) `
+    "while slice text is still hashed strictly, so a hash always describes exactly what was delivered"
+
+# The render bound is the backstop the policy check cannot be. When it fires it
+# must say what it measured and which lever moves it.
+$overflowError = ''
+try {
+    $bigText = New-TestFileText -LineCount 400
+    $overflowReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @('/src/big.cs') `
+        -SpansByPath ([ordered]@{ '/src/big.cs' = @(@{ Start = 10; End = 300 }) }) `
+        -Policy (New-TestPolicy -Overrides @{ contextRadiusLines = 0; maxSliceBytesPerFile = 8192; maxTotalSliceBytes = 8192 }) `
+        -Reader { param([string]$Path) [pscustomobject]@{ Text = $bigText; MimeType = 'text/plain'
+            ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($bigText); Sha256 = Get-ReviewerSourceSha256 -Text $bigText } } `
+        -ChangeKindsByPath ([ordered]@{ '/src/big.cs' = 'Edit' })
+    Format-ReviewerSealedSourceBlock -Report $overflowReport -NonceFactory { 'n' * 32 } -MaxRenderedBytes 1 | Out-Null
+}
+catch { $overflowError = [string]$_.Exception.Message }
+Assert-Source ($overflowError -match 'rendered \d+ byte\(s\), over its 1-byte bound' -and
+    $overflowError -match 'Lower maxSlicesPerFile, maxTotalSliceBytes or maxTotalSiblingBytes') `
+    "an over-bound render names the measured size and the lever that moves it"
+
 # The shipped policy must keep sibling evidence switched on: turning it off
 # re-starves every adoption-dependent convention the specialist can report.
 $shippedRaw = Get-Content -LiteralPath (Join-Path $repoRoot 'src/Agents/reviewer/source/v1/policy.json') -Raw | ConvertFrom-Json

@@ -83,11 +83,20 @@ function Get-ReviewerSourceValue {
 }
 
 function Get-ReviewerSourceSha256 {
-    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        # Slice text is hashed strictly, because a slice that cannot be encoded
+        # exactly is a slice whose hash would not describe what was delivered.
+        # An audit field over an attacker-supplied path is the opposite case:
+        # there, throwing would strand the pull request, so substitution is the
+        # safe direction.
+        [switch]$Substituting
+    )
+    $encoding = if ($Substituting) { [System.Text.Encoding]::UTF8 } else { $script:ReviewerSourceUtf8 }
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
         return ([BitConverter]::ToString(
-                $sha.ComputeHash($script:ReviewerSourceUtf8.GetBytes($Text)))).Replace("-", "").ToLowerInvariant()
+                $sha.ComputeHash($encoding.GetBytes($Text)))).Replace("-", "").ToLowerInvariant()
     }
     finally { $sha.Dispose() }
 }
@@ -133,6 +142,11 @@ function ConvertTo-ReviewerSourcePath {
     if ([string]::IsNullOrWhiteSpace($Path) -or $Path.Length -gt $script:ReviewerSourceMaxPathLength) { return "" }
     if ($Path -match '[\x00-\x1f\x7f]' -or $Path -match '^[A-Za-z]:') { return "" }
     if ($Path -match '[|`<>]') { return "" }
+    # A path that cannot be strictly UTF-8 encoded - a lone surrogate, say - is
+    # not text. Letting it through means the first component that hashes or
+    # transports it throws, and a throw there leaves the whole pull request
+    # unreviewable rather than this one path rejected.
+    try { [void]$script:ReviewerSourceUtf8.GetByteCount($Path) } catch { return "" }
     $normalized = $Path.Replace('\', '/')
     if ($normalized.StartsWith("//", [StringComparison]::Ordinal)) { return "" }
     if (-not $normalized.StartsWith("/", [StringComparison]::Ordinal)) { $normalized = "/" + $normalized }
@@ -195,14 +209,18 @@ function New-ReviewerSourceTransportPolicy {
         throw "The source-transport policy cannot allow more bytes per file than in total."
     }
     # Both pools land in one rendered block, so their sum is what has to fit -
-    # plus the per-slice table row and provenance line, measured at ~642 bytes
-    # and budgeted at 700. Checking the payload alone let a legal policy render
-    # about a megabyte over the bound, which surfaces as an unexplained throw
-    # and a skipped pull request.
+    # plus the per-slice table row, provenance line and two fence lines. This is
+    # a NECESSARY condition, not a sufficient one: every path is rendered three
+    # times per slice and paths may be up to
+    # $script:ReviewerSourceMaxPathLength bytes, so a policy that passes here
+    # can still overflow on a change set with unusually long paths. A constant
+    # large enough to be sufficient (3 x 1024 per slice) would refuse every
+    # useful policy, so the render bound stays as the backstop and reports the
+    # measured size and the lever that moves it.
     $worstSliceCount = $result.maxFiles * ($result.maxSlicesPerFile + $result.siblingContextSlices)
     $worstRendered = $result.maxTotalSliceBytes + $result.maxTotalSiblingBytes + ($worstSliceCount * 700)
     if ($worstRendered -gt $script:ReviewerSourceMaxRenderedBytes) {
-        throw ("The source-transport policy could render up to $worstRendered byte(s) - its changed and " +
+        throw ("The source-transport policy could render at least $worstRendered byte(s) - its changed and " +
             "sibling budgets plus per-slice overhead - which exceeds the " +
             "$($script:ReviewerSourceMaxRenderedBytes)-byte sealed-block render bound.")
     }
@@ -1407,8 +1425,19 @@ function Format-ReviewerSealedSourceBlock {
         }
     }
     $rendered = (($lines.ToArray() -join "`n") + "`n")
-    if ($script:ReviewerSourceUtf8.GetByteCount($rendered) -gt $MaxRenderedBytes) {
-        throw "The sealed source block exceeded its rendered-byte bound."
+    $renderedBytes = $script:ReviewerSourceUtf8.GetByteCount($rendered)
+    if ($renderedBytes -gt $MaxRenderedBytes) {
+        # Named precisely, because the policy check that runs at load time is a
+        # necessary condition and not a sufficient one: it cannot know how long
+        # this change set's paths are, and every path is rendered three times
+        # per slice. An operator who lands here needs to know it is a size
+        # problem and which lever moves it, not just that something threw.
+        $sliceCount = 0
+        foreach ($file in @($Report.Files)) { $sliceCount += @($file.Slices).Count + @($file.SiblingSlices).Count }
+        $payloadBytes = [int]$Report.TotalDeliveredBytes
+        throw ("The sealed source block rendered $renderedBytes byte(s), over its $MaxRenderedBytes-byte bound: " +
+            "$sliceCount slice(s) carrying $payloadBytes payload byte(s) plus per-slice provenance and fence lines. " +
+            "Lower maxSlicesPerFile, maxTotalSliceBytes or maxTotalSiblingBytes for this repository.")
     }
     return $rendered
 }
@@ -1522,12 +1551,14 @@ function ConvertTo-ReviewerSourceCoverageRecord {
         files            = @(@($Report.Files) | ForEach-Object {
                 [pscustomobject][ordered]@{
                     path               = (ConvertTo-ReviewerSourcePath -Path ([string]$_.Path))
-                    # A path that failed normalization renders as an empty string,
-                    # which makes several rejected paths indistinguishable in the
-                    # record. The hash is correlatable for an operator debugging
-                    # why a pull request is unreviewable, and is neither echoed
-                    # nor injectable.
-                    pathSha256         = (Get-ReviewerSourceSha256 -Text ([string]$_.Path))
+                    # Hashed with the substituting encoder, not the strict one.
+                    # This is the first place a raw un-normalized path is
+                    # encoded, and a lone surrogate in one would throw out of
+                    # record construction, out of the transport, and leave the
+                    # pull request permanently unreviewable behind a cryptic
+                    # encoder message - the exact failure class this layer was
+                    # fixed for, re-entered through the audit field.
+                    pathSha256         = (Get-ReviewerSourceSha256 -Text ([string]$_.Path) -Substituting)
                     status             = [string]$_.Status
                     reason             = [string]$_.Reason
                     carriesSource      = [bool]$_.CarriesSource
