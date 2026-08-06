@@ -3695,7 +3695,18 @@ function Write-ReviewerPreview {
     [void]$lines.Add("- Findings: $($counts['critical']) critical, $($counts['important']) important, $($counts['suggestion']) suggestion")
     [void]$lines.Add("- Recommended vote: $RecommendedVote")
     if ($null -ne $SourceCoverage) {
-        [void]$lines.Add("- Pinned source coverage: $([int]$SourceCoverage.coveredFiles)/$([int]$SourceCoverage.sourceBearingFileCount) changed file(s) with added or edited lines ($([int]$SourceCoverage.coveragePercent)%), $([int]$SourceCoverage.totalSliceBytes) changed-source byte(s) plus $([int]$SourceCoverage.totalSiblingBytes) byte(s) of unchanged sibling evidence; $([int]$SourceCoverage.noSourceFileCount) further path(s) have no added or edited text to read")
+        [void]$lines.Add("- Pinned source coverage: $([int]$SourceCoverage.coveredFiles)/$([int]$SourceCoverage.sourceBearingFileCount) changed file(s) with added or edited lines ($([int]$SourceCoverage.coveragePercent)%), $([int]$SourceCoverage.totalSliceBytes) changed-source byte(s) plus $([int]$SourceCoverage.totalSiblingBytes) byte(s) of unchanged sibling evidence")
+        # The two kinds of "no source here" are stated separately on purpose. The
+        # first is the pull request's own statement about its own change; the
+        # second is the host's claim about bytes nobody else has seen, and a
+        # human deciding whether to trust this review needs to know which is
+        # which rather than reading one merged figure.
+        if ([int]$SourceCoverage.changeSetExcusedFileCount -gt 0) {
+            [void]$lines.Add("- $([int]$SourceCoverage.changeSetExcusedFileCount) further changed path(s) have no added or edited text because the pull request itself says so - a delete, a rename, or an empty file")
+        }
+        if ([int]$SourceCoverage.readerExcusedFileCount -gt 0) {
+            [void]$lines.Add("- $([int]$SourceCoverage.readerExcusedFileCount) further changed path(s) were excluded because the repository host reported their bytes as non-text, not because the pull request said so (allowance for this change set: $([int]$SourceCoverage.readerExcusedAllowance))")
+        }
         # `carriesSource` is the record's own statement that a path had nothing
         # to deliver. Filtering on reason strings instead would silently start
         # listing ordinary deletes and binaries as unread the moment a new
@@ -11936,6 +11947,8 @@ function Invoke-ReviewerCycle {
                     sourceBearingFileCount = [int]$sourceTransport.Report.SourceBearingFileCount
                     noSourceFileCount = [int]$sourceTransport.Report.NoSourceFileCount
                     readerExcusedFileCount = [int]$sourceTransport.Report.ReaderExcusedFileCount
+                    changeSetExcusedFileCount = [int]$sourceTransport.Report.ChangeSetExcusedFileCount
+                    readerExcusedAllowance = [int]$sourceTransport.Report.ReaderExcusedAllowance
                     coveredFiles = [int]$sourceTransport.Report.CoveredFiles
                     coveragePercent = [int]$sourceTransport.Report.CoveragePercent
                     spanPercent = [int]$sourceTransport.Report.SpanPercent

@@ -849,8 +849,16 @@ function ConvertFrom-AgentResultMarker {
             $scanned++
             if ($scanned -gt 512) { break }
             $hit = $anchor.Index
-            $jsonStart = $StdOutText.IndexOf($openBrace, $hit + $anchor.Length)
-            if ($jsonStart -lt 0) { continue }
+            # The opening brace must be on the anchor's OWN line. Searching the
+            # whole remaining transcript let a planted prefix line carrying no
+            # brace reach forward and adopt the JSON of a genuine marker further
+            # down: sixteen such lines filled the retained-candidate cap with
+            # duplicates of the real marker, and the duplicate-marker rule then
+            # discarded a complete, correct review.
+            $lineEnd = $StdOutText.IndexOf("`n", $hit, [StringComparison]::Ordinal)
+            if ($lineEnd -lt 0) { $lineEnd = $StdOutText.Length }
+            $jsonStart = $StdOutText.IndexOf($openBrace, $hit + $anchor.Length, [StringComparison]::Ordinal)
+            if ($jsonStart -lt 0 -or $jsonStart -ge $lineEnd) { continue }
             # Bounded brace-depth scan. String contents are respected so a brace
             # inside a JSON string value cannot terminate the object early.
             # The bound is generous rather than tight because a marker carrying

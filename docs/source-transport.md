@@ -96,6 +96,7 @@ kind carries content is read anyway, and what comes back decides:
 |---|---|---|
 | zero bytes | `emptyFile` | no — there is nothing to deliver |
 | not a text MIME type | `binaryNoText` | no — a file with no line diff and no text has no lines to read |
+| a length that is not decodable | `decodeRejected` | **yes** — a malformed payload, not an oversized one |
 | real text content | `spansUnavailable` | **yes** — its diff was lost |
 | unreadable | `transportFailed` | **yes** |
 
@@ -120,6 +121,40 @@ that is the same host whose misbehaviour lost the line-diff blocks in the first
 place, so if anything left the denominator on the reader's say-so and nothing was
 delivered, the gate refuses with `sourceReadableNothing` instead of passing at a
 vacuous 100%.
+
+### The reader may only shrink the denominator so far
+
+Emptying the denominator is the extreme case; shrinking it is the same attack at
+lower volume. Nine paths a host mislabels as non-text, beside one file that
+really is delivered, leave one source-bearing file of which one is covered — a
+clean **100%** over a change set the model has seen a tenth of, with every
+percentage floor satisfied.
+
+So reader-derived excusal is capped. A change set may have at most
+`max(2, 50% of changed paths)` paths excused on the reader's say-so; past that
+the gate refuses with `readerExcusedShareExceeded` rather than dividing by a
+number the host chose. Both bounds are **code constants, not policy keys** —
+a consumer config able to widen them could re-open the hole they close, and a
+policy naming them is rejected as unknown.
+
+Worked examples, all with the shipped policy:
+
+| change set | reader-excused | allowance | outcome |
+|---|---|---|---|
+| 1 edited file + 1 icon | 1 | 2 | reviewed |
+| 7 edited files + 3 icons | 3 | 5 | reviewed |
+| 5 edited files + 5 icons | 5 | 5 | reviewed — exactly at the allowance |
+| 4 edited files + 6 icons | 6 | 5 | refused, `readerExcusedShareExceeded` |
+| 1 delivered + 9 mislabelled | 9 | 5 | refused — the 100% case above |
+| 0 delivered + 4 excused | 4 | 2 | refused, `sourceReadableNothing` |
+
+An asset-heavy pull request therefore behaves the same way a pure-asset one
+does: refused, deliberately, because it is indistinguishable from a host lying
+about the same paths — and one or two assets beside real code changes nothing.
+Paths excused either way stay listed in the accounting table and are counted
+separately in the coverage record (`changeSetExcusedFileCount`,
+`readerExcusedFileCount`, `readerExcusedAllowance`), and the human preview states
+the two on separate lines so a reader can see which claim came from where.
 
 The kinds treated as carrying no content are `delete`, `rename`, `sourcerename`,
 `targetrename`, `encoding`, `lock` and `property`. A path is excused only when
@@ -203,6 +238,7 @@ report into a pass/fail with explicit reason codes:
 | `sourceCoverageBelowSpanFloor` | delivered share of changed hunks below the policy percentage |
 | `sourceCoverageUnknown` | the change set could not be established at all |
 | `sourceReadableNothing` | nothing was delivered, and the only reason the denominator is empty is that the reader called every path's bytes unreadable |
+| `readerExcusedShareExceeded` | more paths left the denominator on the reader's say-so than the code ceiling allows |
 
 Every percentage is measured against the changed files that actually carry added
 or edited lines. A change set with no source-bearing files at all passes with no

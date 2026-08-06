@@ -68,6 +68,23 @@ $script:ReviewerSourceMaxSpanlessProbes = 16
 # can refuse a budget pair that could not possibly fit inside it.
 $script:ReviewerSourceMaxRenderedBytes = 4194304
 
+# How far the READER alone may shrink the coverage denominator.
+#
+# A path excused because the change set called it a delete is the pull request's
+# own statement. A path excused because the reader said its bytes are not text is
+# a statement by the same host whose misbehaviour this layer exists to survive,
+# and each one removes a file from the denominator the coverage floor divides by.
+# Nine mislabelled paths beside one delivered file scored 1/1 - a clean 100% over
+# a change set the model saw a tenth of.
+#
+# So reader-derived excusal is capped: a share of the change set, with a small
+# absolute floor so a two-file pull request is not over-constrained. Beyond the
+# cap the gate refuses outright rather than quietly dividing by a smaller number.
+# These are code constants, deliberately NOT policy keys, because a consumer
+# config that could widen them could re-open the hole it exists to close.
+$script:ReviewerSourceMaxReaderExcusedPercent = 50
+$script:ReviewerSourceReaderExcusedFloor = 2
+
 function Get-ReviewerSourceValue {
     param($Object, [Parameter(Mandatory)][string]$Name, $Default = $null)
     if ($null -eq $Object) { return $Default }
@@ -881,7 +898,14 @@ function Get-ReviewerSourceReaderResult {
         # lever while making an added .gitkeep sink a pull request's coverage.
         return [pscustomobject]@{ Rejected = "emptyFile"; MimeType = [string]$peek.MimeType; ByteLength = 0 }
     }
-    if ([int]$peek.ByteLength -lt 1 -or [int]$peek.ByteLength -gt [int]$Policy.maxFetchBytesPerFile) {
+    if ([int]$peek.ByteLength -lt 0) {
+        # The base64 length is not a multiple of four, or is otherwise not a
+        # decodable size. That is a malformed payload, not an oversized one -
+        # calling it fileTooLarge sent an operator to raise a cap that was never
+        # the problem. It stays in the coverage denominator either way.
+        return [pscustomobject]@{ Rejected = "decodeRejected"; MimeType = [string]$peek.MimeType; ByteLength = 0 }
+    }
+    if ([int]$peek.ByteLength -gt [int]$Policy.maxFetchBytesPerFile) {
         return [pscustomobject]@{ Rejected = "fileTooLarge"; MimeType = [string]$peek.MimeType; ByteLength = [int]$peek.ByteLength }
     }
     try { $decoded = & $Decoder $ToolResult $Path }
@@ -1148,6 +1172,12 @@ function New-ReviewerSourceTransportReport {
     # the reader said their bytes are not text is not, because that is the same
     # host whose misbehaviour emptied the line-diff blocks in the first place.
     $readerExcusedFileCount = @(@($files) | Where-Object { -not [bool]$_.CarriesSource -and [string]$_.NoSourceBasis -ceq 'reader' }).Count
+    $changeSetExcusedFileCount = $noSourceFileCount - $readerExcusedFileCount
+    # The most reader-derived excusals this change set may have before the
+    # denominator stops meaning anything. Computed here so the report carries the
+    # number an operator would otherwise have to reconstruct.
+    $readerExcusedAllowance = [Math]::Max($script:ReviewerSourceReaderExcusedFloor,
+        [int][Math]::Floor(($changedFileCount * $script:ReviewerSourceMaxReaderExcusedPercent) / 100.0))
     $sourceBearingFileCount = $changedFileCount - $noSourceFileCount
     $percent = if ($sourceBearingFileCount -lt 1) { 100 }
     else { [int][Math]::Floor(($coveredFileCount * 100.0) / $sourceBearingFileCount) }
@@ -1174,6 +1204,8 @@ function New-ReviewerSourceTransportReport {
         SourceBearingFileCount = $sourceBearingFileCount
         NoSourceFileCount      = $noSourceFileCount
         ReaderExcusedFileCount = $readerExcusedFileCount
+        ChangeSetExcusedFileCount = $changeSetExcusedFileCount
+        ReaderExcusedAllowance = $readerExcusedAllowance
         DeliveredFiles         = $deliveredFileCount
         PartialFiles           = $partialFileCount
         CoveredFiles           = $coveredFileCount
@@ -1304,16 +1336,29 @@ function Test-ReviewerSourceCoverageGate {
             [void]$reasons.Add("sourceCoverageEmpty")
         }
     }
+    # Applies to every non-empty change set, whatever the branch above decided.
+    # Each reader-derived excusal removes a file from the denominator the two
+    # percentage floors divide by, so enough of them make any percentage
+    # meaningless: nine mislabelled paths beside one delivered file scored 1/1,
+    # a clean 100% over a change set the model had seen a tenth of. Past the
+    # allowance the gate refuses outright instead of dividing by a number the
+    # host chose. The paths stay visible in the accounting table either way.
+    if ([int]$Report.ChangedFileCount -ge 1 -and
+        [int]$Report.ReaderExcusedFileCount -gt [int]$Report.ReaderExcusedAllowance) {
+        if ($reasons -cnotcontains "readerExcusedShareExceeded") { [void]$reasons.Add("readerExcusedShareExceeded") }
+    }
     return @{
-        Ok                 = ($reasons.Count -eq 0)
-        ReasonCodes        = @($reasons)
-        CoveredFiles       = [int]$Report.CoveredFiles
-        DeliveredFiles     = [int]$Report.DeliveredFiles
-        ChangedFiles       = [int]$Report.ChangedFileCount
-        SourceBearingFiles = [int]$Report.SourceBearingFileCount
-        ReaderExcusedFiles = [int]$Report.ReaderExcusedFileCount
-        CoveragePercent    = [int]$Report.CoveragePercent
-        SpanPercent        = [int]$Report.SpanPercent
+        Ok                  = ($reasons.Count -eq 0)
+        ReasonCodes         = @($reasons)
+        CoveredFiles        = [int]$Report.CoveredFiles
+        DeliveredFiles      = [int]$Report.DeliveredFiles
+        ChangedFiles        = [int]$Report.ChangedFileCount
+        SourceBearingFiles  = [int]$Report.SourceBearingFileCount
+        ReaderExcusedFiles  = [int]$Report.ReaderExcusedFileCount
+        ReaderExcusedAllowed = [int]$Report.ReaderExcusedAllowance
+        ChangeSetExcusedFiles = [int]$Report.ChangeSetExcusedFileCount
+        CoveragePercent     = [int]$Report.CoveragePercent
+        SpanPercent         = [int]$Report.SpanPercent
     }
 }
 
@@ -1536,6 +1581,8 @@ function ConvertTo-ReviewerSourceCoverageRecord {
         sourceBearingFileCount = [int]$Report.SourceBearingFileCount
         noSourceFileCount      = [int]$Report.NoSourceFileCount
         readerExcusedFileCount = [int]$Report.ReaderExcusedFileCount
+        changeSetExcusedFileCount = [int]$Report.ChangeSetExcusedFileCount
+        readerExcusedAllowance = [int]$Report.ReaderExcusedAllowance
         deliveredFiles   = [int]$Report.DeliveredFiles
         partialFiles     = [int]$Report.PartialFiles
         coveredFiles     = [int]$Report.CoveredFiles

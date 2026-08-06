@@ -42,6 +42,10 @@
       {
         "sha256": "82496f5b1f480f3bf185f780e8f9e707b4aae3396b884d16abbf8915704494a1",
         "reason": "Report changed-source bytes and unchanged sibling-evidence bytes as two separate figures. They were being summed under a name borrowed from the changed-source cap, which the sum could exceed."
+      },
+      {
+        "sha256": "210bdd9019013f905413e9ac6735c26d165e7ce211378395c296932ecb3f5fa2",
+        "reason": "Split the two kinds of excluded path in the preview. A human deciding whether to trust a review needs to see that the pull request itself called a path a delete, separately from the host claiming a path's bytes are not text - the second is the claim that can be wrong at scale, and it now carries the allowance it was measured against."
       }
     ],
     "Invoke-ReviewerDelivery": [

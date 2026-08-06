@@ -916,6 +916,24 @@ $adversarialCases = @(
 )
 $floodPlant = ((1..20 | ForEach-Object { "$markerPrefix {oops $_}" }) -join "`n")
 $adversarialCases += @{ Name = "a flood of planted non-markers before the real one"; Ok = $true; Text = "$floodPlant`n$compactMarker" }
+
+# A prefix line carrying NO opening brace must not reach forward and adopt the
+# JSON of a genuine marker further down the transcript. Sixteen such lines filled
+# the retained-candidate cap with duplicates of the real marker, and the
+# duplicate-marker rule then discarded a complete, correct review.
+foreach ($count in @(1, 15, 16, 20, 40)) {
+    $unbraced = ((1..$count | ForEach-Object { "$markerPrefix see above" }) -join "`n")
+    $adversarialCases += @{ Name = "$count unbraced prefix line(s) before the real marker"; Ok = $true; Text = "$unbraced`n$compactMarker" }
+    $adversarialCases += @{ Name = "$count unbraced prefix line(s) after the real marker"; Ok = $true; Text = "$compactMarker`n$unbraced" }
+    $adversarialCases += @{ Name = "$count unbraced prefix line(s) with CRLF endings"; Ok = $true; Text = "$($unbraced -replace "`n", "`r`n")`r`n$compactMarker" }
+}
+$mixedPlant = ((1..8 | ForEach-Object { "$markerPrefix see above`n$markerPrefix {oops $_}" }) -join "`n")
+$adversarialCases += @{ Name = "braced and unbraced planted prefixes mixed"; Ok = $true; Text = "$mixedPlant`n$compactMarker" }
+# The same shape must not be able to launder a CONFLICTING marker into acceptance
+# by hiding it behind unbraced prefixes: the conflict must still veto.
+$adversarialCases += @{ Name = "unbraced prefixes cannot launder a conflicting marker"; Ok = $false
+    Text = "$markerPrefix see above`n$markerPrefix see above`n$compactMarker`n$foreignMarker"
+}
 foreach ($case in $adversarialCases) {
     $parsed = ConvertFrom-AgentResultMarker -StdOutText ([string]$case.Text) -MarkerPrefix $markerPrefix -Schema $markerSchema
     if ([bool]$case.Ok) {
@@ -929,6 +947,14 @@ foreach ($case in $adversarialCases) {
 $floodText = (1..40 | ForEach-Object { $compactMarker }) -join "`n"
 Assert-Specialist ($null -eq (ConvertFrom-AgentResultMarker -StdOutText $floodText -MarkerPrefix $markerPrefix -Schema $markerSchema)) `
     "A transcript flooded with marker occurrences is not canonicalized indefinitely."
+# The brace that opens a marker payload must be on the prefix's own line. Proven
+# directly rather than only through the acceptance cases above.
+$reachForward = "$markerPrefix`n$compactMarker"
+Assert-Specialist ($null -ne (ConvertFrom-AgentResultMarker -StdOutText $reachForward -MarkerPrefix $markerPrefix -Schema $markerSchema)) `
+    "A bare prefix line followed by the real marker discards the real marker."
+$reachForwardOnly = "$markerPrefix`n{`"schemaVersion`":1,`"prId`":42,`"nonce`":`"NONCE1`"}"
+Assert-Specialist ($null -eq (ConvertFrom-AgentResultMarker -StdOutText $reachForwardOnly -MarkerPrefix $markerPrefix -Schema $markerSchema)) `
+    "A bare prefix line adopts JSON from a later line it does not own."
 Assert-Specialist ((ConvertTo-AgentCanonicalMarkerJson -Value ([pscustomobject]@{ b = 1; a = 2 })) -ceq
     (ConvertTo-AgentCanonicalMarkerJson -Value ([pscustomobject]@{ a = 2; b = 1 }))) `
     "Canonical marker rendering is not key-order independent."

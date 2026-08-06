@@ -1200,6 +1200,86 @@ $declaredDeleteOnlyReport = New-ReviewerSourceTransportReport -CommitSha $commit
 Assert-Source ((Test-ReviewerSourceCoverageGate -Report $declaredDeleteOnlyReport -Policy $policy).Ok) `
     "a denominator emptied by the CHANGE SET is still vacuously covered"
 
+# ---------------------------------------------------------------------------
+# Partial reader-excusal must not shrink the denominator to something flattering.
+#
+# The hole: nine paths the host mislabels as non-text plus one delivered file
+# leaves SourceBearingFileCount = 1 and CoveredFiles = 1 - a clean 100% over a
+# change set the model has seen a tenth of.
+# ---------------------------------------------------------------------------
+function New-MislabelReport {
+    param([int]$Excused, [int]$Delivered, [hashtable]$GatePolicy = $policy)
+    $paths = @()
+    $spans = [ordered]@{}
+    $kinds = [ordered]@{}
+    for ($i = 1; $i -le $Delivered; $i++) {
+        $paths += "/src/ok$i.cs"; $spans["/src/ok$i.cs"] = @(@{ Start = 20; End = 21 }); $kinds["/src/ok$i.cs"] = 'Edit'
+    }
+    for ($i = 1; $i -le $Excused; $i++) {
+        $paths += "/src/lie$i.cs"; $kinds["/src/lie$i.cs"] = 'Edit'
+    }
+    return New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $paths -SpansByPath $spans `
+        -Policy $GatePolicy -Reader { param([string]$Path)
+        if ($Path -clike '*/lie*') { return [pscustomobject]@{ Rejected = 'notTextual'; MimeType = 'application/octet-stream'; ByteLength = 3000; Sha256 = ('9' * 64) } }
+        $bodyText = New-TestFileText -LineCount 60
+        [pscustomobject]@{ Text = $bodyText; MimeType = 'text/plain'
+            ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($bodyText)
+            Sha256 = Get-ReviewerSourceSha256 -Text $bodyText }
+    } -ChangeKindsByPath $kinds
+}
+
+$mislabelReport = New-MislabelReport -Excused 9 -Delivered 1
+$mislabelGate = Test-ReviewerSourceCoverageGate -Report $mislabelReport -Policy $policy
+Assert-Source ([int]$mislabelReport.CoveragePercent -eq 100 -and [int]$mislabelReport.SourceBearingFileCount -eq 1) `
+    "the mislabel fixture really does produce the flattering 1-of-1 shape"
+Assert-Source (-not $mislabelGate.Ok -and ($mislabelGate.ReasonCodes -ccontains 'readerExcusedShareExceeded')) `
+    "nine reader-excused paths beside one delivered file are refused, not reported as 100%"
+Assert-Source ([int]$mislabelReport.ReaderExcusedFileCount -eq 9 -and [int]$mislabelReport.ChangeSetExcusedFileCount -eq 0) `
+    "and the two kinds of excusal are counted apart"
+
+# A benign asset mix must still be reviewable: this rule exists to catch a lying
+# host, not to refuse a pull request that adds a few icons.
+$benignReport = New-MislabelReport -Excused 3 -Delivered 7
+Assert-Source ([int]$benignReport.ReaderExcusedFileCount -eq 3 -and [int]$benignReport.ReaderExcusedAllowance -ge 3) `
+    "a few assets beside real code sit inside the allowance"
+Assert-Source ((Test-ReviewerSourceCoverageGate -Report $benignReport -Policy $policy).Ok) `
+    "so seven edited files plus three icons is still reviewed"
+
+# The exact boundary, both sides, at a change set where the share rounds cleanly.
+$atLimitReport = New-MislabelReport -Excused 5 -Delivered 5
+Assert-Source ([int]$atLimitReport.ReaderExcusedAllowance -eq 5) "the allowance for a ten-path change set is five"
+Assert-Source ((Test-ReviewerSourceCoverageGate -Report $atLimitReport -Policy $policy).Ok) `
+    "exactly at the allowance is accepted"
+$overLimitReport = New-MislabelReport -Excused 6 -Delivered 4
+Assert-Source (-not (Test-ReviewerSourceCoverageGate -Report $overLimitReport -Policy $policy).Ok) `
+    "one past the allowance is refused"
+
+# The small-change-set floor: two paths must not be governed by a 50% share
+# alone, or a single icon beside a single edited file would be refused.
+$tinyReport = New-MislabelReport -Excused 1 -Delivered 1
+Assert-Source ([int]$tinyReport.ReaderExcusedAllowance -eq 2 -and (Test-ReviewerSourceCoverageGate -Report $tinyReport -Policy $policy).Ok) `
+    "one icon beside one edited file is still reviewed, because the allowance has an absolute floor"
+
+# Everything excused is still the older, more specific refusal.
+$allExcusedReport = New-MislabelReport -Excused 4 -Delivered 0
+$allExcusedGate = Test-ReviewerSourceCoverageGate -Report $allExcusedReport -Policy $policy
+Assert-Source (-not $allExcusedGate.Ok -and ($allExcusedGate.ReasonCodes -ccontains 'sourceReadableNothing')) `
+    "a change set the reader excused entirely is still refused as sourceReadableNothing"
+
+# A host that lost every line-diff block AND mislabels the MIME type is the
+# original attack; it must be refused on both counts.
+$lostAndLyingReport = New-MislabelReport -Excused 8 -Delivered 2
+$lostAndLyingGate = Test-ReviewerSourceCoverageGate -Report $lostAndLyingReport -Policy $policy
+Assert-Source (-not $lostAndLyingGate.Ok -and ($lostAndLyingGate.ReasonCodes -ccontains 'readerExcusedShareExceeded')) `
+    "a host that mislabels most of the change set is refused however much of the rest arrived"
+
+# The ceiling is code-defined. A consumer policy must not be able to widen it.
+Assert-Source (Test-Throws { New-TestPolicy -Overrides @{ maxReaderExcusedPercent = 100 } }) `
+    "a policy key that would widen the reader-excusal ceiling is refused as unknown"
+$widePolicy = New-TestPolicy -Overrides @{ minDeliveredFiles = 0; minDeliveredFilePercent = 0; minDeliveredSpanPercent = 0 }
+Assert-Source (-not (Test-ReviewerSourceCoverageGate -Report (New-MislabelReport -Excused 9 -Delivered 1 -GatePolicy $widePolicy) -Policy $widePolicy).Ok) `
+    "and zeroing every policy floor does not buy past it either"
+
 # A hashtable-shaped change type must not be flattened: foreach over a
 # dictionary yields the dictionary itself, and an unbounded self-recursion or a
 # stack overflow takes the whole reviewer process down uncatchably.
@@ -1417,6 +1497,31 @@ $emptyResult = Get-ReviewerSourceReaderResult -ToolResult (New-ResourceToolResul
     -Path '/src/empty.cs' -Policy $readerPolicy -Decoder $strictDecoder
 Assert-Source (([string]$emptyResult.Rejected) -ceq 'emptyFile' -and [int]$emptyResult.ByteLength -eq 0) `
     "a zero-byte file is classified emptyFile through the real reader seam, not fileTooLarge"
+
+# A base64 payload whose length is not a decodable size is malformed, not
+# oversized. Calling it fileTooLarge sent an operator to raise a cap that was
+# never the problem, and hid a genuinely corrupt response.
+foreach ($malformed in @(
+        @{ Name = 'three characters'; Blob = 'abc' },
+        @{ Name = 'not a multiple of four'; Blob = 'abcde' },
+        @{ Name = 'invalid alphabet'; Blob = 'ab$d' },
+        @{ Name = 'non-canonical padding'; Blob = 'ab==cd==' }
+    )) {
+    $malformedResult = Get-ReviewerSourceReaderResult -ToolResult (New-ResourceToolResult -Base64 ([string]$malformed.Blob)) `
+        -Path '/src/a.cs' -Policy $readerPolicy -Decoder $strictDecoder
+    Assert-Source ($null -ne $malformedResult -and ([string]$malformedResult.Rejected) -ceq 'decodeRejected') `
+        "base64 that is $($malformed.Name) is classified decodeRejected, never fileTooLarge"
+}
+# And such a path stays in the coverage denominator, so the gate still refuses.
+$malformedReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @('/src/bad.cs') `
+    -SpansByPath ([ordered]@{ '/src/bad.cs' = @(@{ Start = 2; End = 3 }) }) -Policy $policy `
+    -Reader { param([string]$Path)
+        Get-ReviewerSourceReaderResult -ToolResult (New-ResourceToolResult -Base64 'abc') -Path $Path -Policy $readerPolicy -Decoder $strictDecoder
+    } -ChangeKindsByPath ([ordered]@{ '/src/bad.cs' = 'Edit' })
+$malformedGate = Test-ReviewerSourceCoverageGate -Report $malformedReport -Policy $policy
+Assert-Source ([int]$malformedReport.SourceBearingFileCount -eq 1 -and [int]$malformedReport.ReaderExcusedFileCount -eq 0 -and
+    -not $malformedGate.Ok -and ($malformedGate.ReasonCodes -ccontains 'sourceCoverageEmpty')) `
+    "a malformed payload keeps its path in the denominator and fails the gate closed"
 $emptySeamReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @('/src/ok.cs', '/src/empty.cs') `
     -SpansByPath ([ordered]@{ '/src/ok.cs' = @(@{ Start = 5; End = 6 }) }) -Policy $policy `
     -Reader { param([string]$Path)
