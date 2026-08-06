@@ -2027,6 +2027,14 @@ function Get-ReviewerLaunchAllowTools {
 $script:ReviewerAuthoritativeTransportVersion = 1
 $script:ReviewerAuthoritativeMaxSources = 8
 $script:ReviewerAuthoritativeMaxFileBytes = 131072
+# How large a changed file the verifier will open to cut seven lines out of it.
+# It was 128 KB, which is a sensible bound on a document but not on a source
+# file: a 292 KB test file yielded no hunk at all, so the verifier was asked to
+# confirm a finding and correctly refused, having been shown nothing. The
+# transport already reads the same file at the same commit under a far larger
+# bound; this only decides what the verifier may open, never what a model sees,
+# which stays seven lines either way.
+$script:ReviewerVerificationMaxSourceFileBytes = 1048576
 $script:ReviewerAuthoritativeMaxTotalBytes = 262144
 # A section-scoped source fetches the WHOLE document and then cuts the named
 # heading out of it, so the fetch bound has to admit a real engineering-guidance
@@ -9262,7 +9270,8 @@ function Get-ReviewerVerificationSourceHunks {
             try {
                 if (-not $fileCache.ContainsKey($normalizedPath)) {
                     $fileCache[$normalizedPath] = Get-ReviewerFactSourceFile -Session $verificationSession `
-                        -Path $path -SourceCommit $SourceCommit -MaxBytes 131072
+                        -Path $path -SourceCommit $SourceCommit `
+                        -MaxBytes $script:ReviewerVerificationMaxSourceFileBytes
                 }
                 $content = [string]$fileCache[$normalizedPath].Content
                 $lines = @($content.Replace("`r`n", "`n").Replace("`r", "`n") -split "`n")
