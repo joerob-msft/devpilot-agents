@@ -359,7 +359,8 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                 Item = @{
                     Keys = @(
                         "ruleRef", "ruleSourceSha256", "ruleQuote", "status",
-                        "scope", "checkedConstructs", "violatingConstructs",
+                        "scope", "checkedConstructs", "notInReachConstructs",
+                        "violatingConstructs",
                         "codeEvidence", "siblingStatus", "siblingEvidence",
                         "candidateId", "notes"
                     )
@@ -380,8 +381,23 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                             Type = "string"; MaxLength = 64
                             Pattern = $script:ReviewerConventionSpecialistCoverageScopePattern
                         }
+                        # 200 rather than 400: ranges make a complete list four
+                        # short spans, so the extra room bought nothing, and the
+                        # whole section has to stay well inside the marker's
+                        # scan window - which it shares with the candidates.
                         checkedConstructs = @{
-                            Type = "string"; MaxLength = 400; AllowEmpty = $true
+                            Type = "string"; MaxLength = 200; AllowEmpty = $true
+                            Pattern = '^(|(mi|dc|cm|as)[0-9]{1,3}(-(mi|dc|cm|as)[0-9]{1,3})?(,(mi|dc|cm|as)[0-9]{1,3}(-(mi|dc|cm|as)[0-9]{1,3})?)*)$'
+                        }
+                        # Constructs the row looked at and judged outside the
+                        # rule's reach. Without this the model's only honest
+                        # options are to list a production method as "checked"
+                        # against a rule about tests, or to leave it out and be
+                        # degraded - and it kept choosing the second. Narrowing
+                        # is a real judgement and deserves somewhere to be
+                        # written down; what is NOT allowed is silence.
+                        notInReachConstructs = @{
+                            Type = "string"; MaxLength = 200; AllowEmpty = $true
                             Pattern = '^(|(mi|dc|cm|as)[0-9]{1,3}(-(mi|dc|cm|as)[0-9]{1,3})?(,(mi|dc|cm|as)[0-9]{1,3}(-(mi|dc|cm|as)[0-9]{1,3})?)*)$'
                         }
                         violatingConstructs = @{
@@ -773,12 +789,34 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         $checkedResult = Expand-ReviewerConventionSpecialistConstructIds `
             -Text ([string](Get-ReviewerConventionSpecialistValue $row "checkedConstructs" ""))
         $checked = @($checkedResult.Ids)
+        $notInReachResult = Expand-ReviewerConventionSpecialistConstructIds `
+            -Text ([string](Get-ReviewerConventionSpecialistValue $row "notInReachConstructs" ""))
+        $notInReach = @($notInReachResult.Ids)
         $violatingResult = Expand-ReviewerConventionSpecialistConstructIds `
             -Text ([string](Get-ReviewerConventionSpecialistValue $row "violatingConstructs" ""))
         $violating = @($violatingResult.Ids)
-        if ((-not $checkedResult.Ok) -or (-not $violatingResult.Ok)) {
+        if ((-not $checkedResult.Ok) -or (-not $notInReachResult.Ok) -or (-not $violatingResult.Ok)) {
             $status = "unknown"
             if (-not $degradedReason) { $degradedReason = "the row wrote a construct range the wrapper could not read" }
+        }
+        # A construct is either one the rule reaches or one it does not. Claiming
+        # both about the same construct is not an accounting, it is two.
+        $bothWays = @(@($checked) | Where-Object { $notInReach -ccontains $_ })
+        if ($bothWays.Count -gt 0) {
+            $status = "unknown"
+            if (-not $degradedReason) {
+                $degradedReason = "the row called the same construct both checked and out of reach: " +
+                (@($bothWays | Select-Object -First 20) -join ",")
+            }
+        }
+        # Out of reach is a judgement about the rule, not a place to file a
+        # violation.
+        $violatingOutOfReach = @(@($violating) | Where-Object { $notInReach -ccontains $_ })
+        if ($violatingOutOfReach.Count -gt 0) {
+            $status = "unknown"
+            if (-not $degradedReason) {
+                $degradedReason = "the row called a construct out of the rule's reach and a violation of it at the same time"
+            }
         }
 
         # The scope decides which constructs this row OWES an answer for. A row
@@ -795,19 +833,29 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
             foreach ($id in $idsByKind[$kind]) { [void]$requiredList.Add($id) }
         }
         $required = @($requiredList.ToArray())
-        # `none` cannot be a free pass. A row that claims nothing was in reach
-        # while the wrapper enumerated constructs has checked nothing and said
-        # so in a way that reads like an answer - which is the exact shape of
-        # the miss this section exists to make visible.
-        if ($constructById.Count -gt 0 -and @($required).Count -eq 0 -and
-            @("notApplicable", "unknown") -cnotcontains $status) {
+        # `none` cannot be a free pass, and neither can declaring a scope and
+        # then putting every construct in it out of reach. A row that examined
+        # nothing has checked nothing, however it spells that - which is the
+        # exact shape of the miss this section exists to make visible.
+        $reachedNothing = ($constructById.Count -gt 0 -and @($checked).Count -eq 0)
+        if ($reachedNothing -and @("notApplicable", "unknown") -cnotcontains $status) {
             $status = "unknown"
             if (-not $degradedReason) {
-                $degradedReason = "the row claimed no construct was in reach while $($constructById.Count) were enumerated"
+                $degradedReason = $(if (@($required).Count -eq 0) {
+                        "the row claimed no construct was in reach while $($constructById.Count) were enumerated"
+                    }
+                    else {
+                        "the row declared scope '$scope' and then put every construct in it out of the rule's reach, which is an answer about nothing"
+                    })
             }
         }
-        $missingConstructs = @(@($required) | Where-Object { $checked -cnotcontains $_ })
-        $strayConstructs = @(@($checked) | Where-Object { $required -cnotcontains $_ })
+        # Every construct in the declared scope must be accounted for one way or
+        # the other: examined against the rule, or examined and judged outside
+        # its reach. Silence about one is the miss this whole section exists to
+        # make visible.
+        $accountedConstructs = @(@($checked) + @($notInReach))
+        $missingConstructs = @(@($required) | Where-Object { $accountedConstructs -cnotcontains $_ })
+        $strayConstructs = @(@($accountedConstructs) | Where-Object { $required -cnotcontains $_ })
         if ($missingConstructs.Count -gt 0 -or $strayConstructs.Count -gt 0) {
             $status = "unknown"
             if (-not $degradedReason) {
@@ -819,7 +867,7 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
                         $(if ($missingConstructs.Count -gt 20) { " and $($missingConstructs.Count - 20) more" } else { "" })
                     }
                     else {
-                        "the row checked constructs outside the scope it declared: " +
+                        "the row named constructs outside the scope it declared: " +
                         (@($strayConstructs | Select-Object -First 20) -join ",")
                     })
             }
@@ -911,6 +959,7 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
                 status = $status
                 scope = $scope
                 checkedConstructs = @($checked)
+                notInReachConstructs = @($notInReach)
                 violatingConstructs = @($violating)
                 codeEvidence = [string](Get-ReviewerConventionSpecialistValue $row "codeEvidence" "")
                 siblingStatus = [string](Get-ReviewerConventionSpecialistValue $row "siblingStatus" "unavailable")

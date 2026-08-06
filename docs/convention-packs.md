@@ -193,8 +193,10 @@ enumeration of every **changed construct** in the change set. Each row states:
 - the pack, source id and source hash it is about, and an exact quote from it;
 - a `status` of `violation`, `compliant`, `notApplicable` or `unknown`;
 - a `scope`: the construct kinds the rule governs, or `none`;
-- `checkedConstructs`: every construct id of those kinds, and
-  `violatingConstructs`: the ones judged to break the rule;
+- `checkedConstructs`: everything it weighed against the rule, and
+  `notInReachConstructs`: everything it examined and judged the rule does not
+  reach. Together they must cover every construct of the declared kinds;
+- `violatingConstructs`: the ones judged to break the rule;
 - the code evidence, and the sibling evidence or why none was needed;
 - the id of the candidate it produced, or a note saying why none was emitted.
 
@@ -244,11 +246,14 @@ computed itself:
   reported **unknown** and is not counted toward coverage;
 - a row whose source hash or quote does not match what was actually transported
   is degraded to `unknown` with the reason recorded;
-- a row that leaves any construct in its own declared scope unaccounted is
-  degraded, and the reason names the exact ids it left out;
-- a row that declares `scope: none` while constructs exist may only be
-  `notApplicable` or `unknown` - a `compliant` row that checked nothing is an
-  answer about nothing;
+- a row that leaves any construct in its own declared scope out of **both**
+  `checkedConstructs` and `notInReachConstructs` is degraded, and the reason
+  names the exact ids it left out; so is a row that claims the same construct
+  both ways;
+- a row that declares `scope: none` while constructs exist, or that puts every
+  construct in its scope out of reach, may only be `notApplicable` or
+  `unknown` - a `compliant` row that weighed nothing is an answer about
+  nothing;
 - a row whose linked candidate is anchored outside every construct it called
   violating is degraded: a row about one place cannot account for a finding
   about another. The anchor may fall anywhere inside the construct's
