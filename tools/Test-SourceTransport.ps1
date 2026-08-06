@@ -1213,7 +1213,7 @@ Assert-Source ((Test-ReviewerSourceCoverageGate -Report $declaredDeleteOnlyRepor
 # change set the model has seen a tenth of.
 # ---------------------------------------------------------------------------
 function New-MislabelReport {
-    param([int]$Excused, [int]$Delivered, [int]$PadDeletes = 0, [string]$ExcusedExtension = '.cs', [hashtable]$GatePolicy = $policy)
+    param([int]$Excused, [int]$Delivered, [int]$PadDeletes = 0, [int]$PadAssets = 0, [string]$ExcusedExtension = '.cs', [hashtable]$GatePolicy = $policy)
     $paths = @()
     $spans = [ordered]@{}
     $kinds = [ordered]@{}
@@ -1223,12 +1223,15 @@ function New-MislabelReport {
     for ($i = 1; $i -le $Excused; $i++) {
         $paths += "/src/lie$i$ExcusedExtension"; $kinds["/src/lie$i$ExcusedExtension"] = 'Edit'
     }
+    for ($i = 1; $i -le $PadAssets; $i++) {
+        $paths += "/assets/lie-pad$i.png"; $kinds["/assets/lie-pad$i.png"] = 'Add'
+    }
     for ($i = 1; $i -le $PadDeletes; $i++) {
         $paths += "/old/gone$i.cs"; $kinds["/old/gone$i.cs"] = 'Delete'
     }
     return New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $paths -SpansByPath $spans `
         -Policy $GatePolicy -Reader { param([string]$Path)
-        if ($Path -clike '*/lie*') { return [pscustomobject]@{ Rejected = 'notTextual'; MimeType = 'application/octet-stream'; ByteLength = 3000; Sha256 = ('9' * 64) } }
+        if ($Path -clike '*lie*') { return [pscustomobject]@{ Rejected = 'notTextual'; MimeType = 'application/octet-stream'; ByteLength = 3000; Sha256 = ('9' * 64) } }
         $bodyText = New-TestFileText -LineCount 60
         [pscustomobject]@{ Text = $bodyText; MimeType = 'text/plain'
             ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($bodyText)
@@ -1279,11 +1282,38 @@ Assert-Source (Test-ReviewerSourcePathLooksNonText -Path '/assets/logo.PNG') `
     "the extension test is case-insensitive"
 Assert-Source (-not (Test-ReviewerSourcePathLooksNonText -Path '/src/Handler.cs') -and
     -not (Test-ReviewerSourcePathLooksNonText -Path '/src/Makefile') -and
-    -not (Test-ReviewerSourcePathLooksNonText -Path '/src/.gitignore')) `
-    "source files, extensionless files and dotfiles are never treated as corroborated"
+    -not (Test-ReviewerSourcePathLooksNonText -Path '/src/.gitignore') -and
+    -not (Test-ReviewerSourcePathLooksNonText -Path '/assets/.png') -and
+    -not (Test-ReviewerSourcePathLooksNonText -Path '/src/x.') -and
+    -not (Test-ReviewerSourcePathLooksNonText -Path '/assets/logo.png.cs') -and
+    -not (Test-ReviewerSourcePathLooksNonText -Path '/certs/server.pem') -and
+    -not (Test-ReviewerSourcePathLooksNonText -Path '/data/blob.bin')) `
+    "source files, extensionless files, dotfiles, trailing dots, text-suffixed names and ambiguous formats are never corroborated"
+Assert-Source ((Test-ReviewerSourcePathLooksNonText -Path '/assets/logo.png.png') -and
+    (Test-ReviewerSourcePathLooksNonText -Path '/src/Handler.cs.png')) `
+    "corroboration reads the LAST extension, so a name ending in a binary extension counts"
 $smallAssetReport = New-MislabelReport -Excused 3 -Delivered 1 -ExcusedExtension '.png'
 Assert-Source ((Test-ReviewerSourceCoverageGate -Report $smallAssetReport -Policy $policy).Ok) `
     "and the smallest ordinary asset-adding pull request is reviewed too"
+
+# Corroborated assets must not inflate the allowance either. Removing them from
+# the charge but leaving them in the denominator just moved the padding vector:
+# every two icons bought one free mislabelled source file.
+$assetPaddedReport = New-MislabelReport -Excused 5 -Delivered 1 -PadAssets 4
+Assert-Source ([int]$assetPaddedReport.ReaderExcusedFileCount -eq 9 -and [int]$assetPaddedReport.ReaderExcusedUncorroboratedCount -eq 5) `
+    "the asset-padding fixture carries both corroborated and uncorroborated excusals"
+Assert-Source ([int]$assetPaddedReport.ReaderExcusedAllowance -eq 3) `
+    "the allowance ignores corroborated assets on both sides of the ratio, not just the charge"
+Assert-Source (-not (Test-ReviewerSourceCoverageGate -Report $assetPaddedReport -Policy $policy).Ok) `
+    "so padding a change set with icons buys no room to mislabel source files either"
+
+# A malformed report must over-charge, never silently switch the ceiling off.
+$missingChargeReport = @{}
+foreach ($key in @($assetPaddedReport.Keys)) {
+    if ($key -cne 'ReaderExcusedUncorroboratedCount') { $missingChargeReport[$key] = $assetPaddedReport[$key] }
+}
+Assert-Source (-not (Test-ReviewerSourceCoverageGate -Report $missingChargeReport -Policy $policy).Ok) `
+    "a report missing the charge field falls back to the raw count rather than passing"
 
 # The exact boundary, both sides, at a change set where the share rounds cleanly.
 $atLimitReport = New-MislabelReport -Excused 5 -Delivered 5

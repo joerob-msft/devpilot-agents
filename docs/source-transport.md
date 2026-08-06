@@ -141,11 +141,12 @@ rather than dividing by a number the host chose.
 
 Two details of that arithmetic are load-bearing:
 
-- The share is measured against the paths that **could** bear source — the change
-  set minus what the change set itself excused. Dividing by every changed path
-  let a bulk move buy allowance: eight deletes beside ten edited files raised the
-  ceiling to thirteen, and nine of those ten could then be mislabelled while the
-  gate reported a clean 100% over the one file that arrived.
+- The share is measured against the paths whose text status is actually
+  **contested** — the change set, minus what the change set itself excused, minus
+  the reader excusals the path name corroborates. Every looser denominator has
+  been a padding vector: dividing by all changed paths let a bulk move buy
+  allowance, and dividing by all source-capable paths let *icons* buy it, two
+  assets per free mislabelled source file.
 - Unknown and extensionless paths count as **uncorroborated**, because the
   conservative direction is the one that keeps a path counted.
 
@@ -155,13 +156,14 @@ as unknown.
 
 Worked examples, all with the shipped policy:
 
-| change set | reader-excused | of those uncorroborated | allowance | outcome |
+| change set | reader-excused | of those charged | allowance | outcome |
 |---|---|---|---|---|
 | 1 edited file + 3 `.png` | 3 | 0 | 2 | reviewed — the names corroborate |
-| 1 edited file + 40 `.png` | 40 | 0 | 20 | reviewed |
-| 7 edited files + 3 `.png` | 3 | 0 | 5 | reviewed |
+| 1 edited file + 40 `.png` | 40 | 0 | 2 | reviewed |
+| 7 edited files + 3 `.png` | 3 | 0 | 3 | reviewed |
 | 1 delivered + 9 mislabelled `.cs` | 9 | 9 | 5 | refused, `readerExcusedShareExceeded` |
 | the same padded with 8 deletes + 8 renames | 9 | 9 | 5 | refused — padding buys nothing |
+| the same padded with 8 `.png` | 17 | 9 | 5 | refused — nor does asset padding |
 | 5 delivered + 5 mislabelled `.cs` | 5 | 5 | 5 | reviewed — exactly at the allowance |
 | 4 delivered + 6 mislabelled `.cs` | 6 | 6 | 5 | refused |
 | 0 delivered + 4 excused | 4 | any | 2 | refused, `sourceReadableNothing` |

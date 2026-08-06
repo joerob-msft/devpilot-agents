@@ -93,13 +93,13 @@ $script:ReviewerSourceReaderExcusedFloor = 2
 # the allowance is for. Unknown and extensionless paths count as uncorroborated,
 # because the conservative direction is the one that keeps a path counted.
 $script:ReviewerSourceNonTextExtensions = @(
-    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".tif", ".tiff", ".psd",
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".icns", ".webp", ".tif", ".tiff", ".psd",
     ".pdf", ".zip", ".gz", ".tgz", ".tar", ".7z", ".rar", ".bz2", ".xz", ".cab",
-    ".dll", ".exe", ".pdb", ".so", ".dylib", ".lib", ".obj", ".bin", ".dat", ".class",
-    ".jar", ".nupkg", ".wasm", ".snk", ".pfx", ".cer", ".crt", ".p12", ".der",
+    ".dll", ".exe", ".pdb", ".so", ".dylib", ".lib", ".obj", ".class",
+    ".jar", ".nupkg", ".wasm", ".snk", ".pfx", ".p12",
     ".woff", ".woff2", ".ttf", ".otf", ".eot",
     ".mp3", ".mp4", ".wav", ".avi", ".mov", ".wmv", ".ogg", ".webm", ".flac",
-    ".xlsx", ".docx", ".pptx", ".vsdx", ".ico", ".icns", ".dmg", ".msi", ".appx"
+    ".xlsx", ".docx", ".pptx", ".vsdx", ".dmg", ".msi", ".appx"
 )
 
 function Test-ReviewerSourcePathLooksNonText {
@@ -113,7 +113,10 @@ function Test-ReviewerSourcePathLooksNonText {
     $name = if ($lastSlash -ge 0) { $Path.Substring($lastSlash + 1) } else { $Path }
     $lastDot = $name.LastIndexOf('.')
     if ($lastDot -lt 1) { return $false }
-    return ($script:ReviewerSourceNonTextExtensions -contains $name.Substring($lastDot).ToLowerInvariant())
+    # -ccontains against a lowercased extension: a case-insensitive membership
+    # test would make the lowering here dead code, and the next person to remove
+    # it would silently stop corroborating every uppercase asset name.
+    return ($script:ReviewerSourceNonTextExtensions -ccontains $name.Substring($lastDot).ToLowerInvariant())
 }
 
 function Get-ReviewerSourceValue {
@@ -1212,12 +1215,16 @@ function New-ReviewerSourceTransportReport {
             -not [bool]$_.CarriesSource -and [string]$_.NoSourceBasis -ceq 'reader' -and
             -not (Test-ReviewerSourcePathLooksNonText -Path ([string]$_.Path))
         }).Count
-    # Measured against the paths that COULD bear source, never the whole change
-    # set. Dividing by every path let a bulk move or a directory rename buy
-    # allowance: eight deletes beside ten edited files raised the ceiling to
-    # thirteen, and nine of those ten could then be mislabelled while the gate
-    # reported a clean 100% over the one file that arrived.
-    $sourceCapableFileCount = $changedFileCount - $changeSetExcusedFileCount
+    # Measured against the paths whose text status is actually contested - the
+    # change set minus what the change set itself excused, minus the reader
+    # excusals the change set's own path corroborates. Removing corroborated
+    # assets from the numerator but leaving them in the denominator just moved
+    # the padding vector: every two icons bought one free mislabelled source
+    # file, so ten edited files with nine mislabelled passed as soon as eight
+    # `.png` files sat beside them - and "some source plus some icons" needs no
+    # attacker at all.
+    $sourceCapableFileCount = $changedFileCount - $changeSetExcusedFileCount -
+        ($readerExcusedFileCount - $readerExcusedUncorroboratedCount)
     $readerExcusedAllowance = [Math]::Max($script:ReviewerSourceReaderExcusedFloor,
         [int][Math]::Floor(($sourceCapableFileCount * $script:ReviewerSourceMaxReaderExcusedPercent) / 100.0))
     $sourceBearingFileCount = $changedFileCount - $noSourceFileCount
@@ -1386,9 +1393,13 @@ function Test-ReviewerSourceCoverageGate {
     # a clean 100% over a change set the model had seen a tenth of. Past the
     # allowance the gate refuses outright instead of dividing by a number the
     # host chose. The paths stay visible in the accounting table either way.
+    # The charge falls back to the RAW reader-excusal count, never to zero. A
+    # report missing the field is malformed, and a malformed report must
+    # over-charge rather than silently switch the ceiling off.
+    $charged = Get-ReviewerSourceValue -Object $Report -Name 'ReaderExcusedUncorroboratedCount' -Default $null
+    if ($null -eq $charged) { $charged = Get-ReviewerSourceValue -Object $Report -Name 'ReaderExcusedFileCount' -Default 0 }
     if ((Get-ReviewerSourceValue -Object $Report -Name 'ChangedFileCount' -Default 0) -ge 1 -and
-        [int](Get-ReviewerSourceValue -Object $Report -Name 'ReaderExcusedUncorroboratedCount' -Default 0) -gt
-        [int](Get-ReviewerSourceValue -Object $Report -Name 'ReaderExcusedAllowance' -Default 0)) {
+        [int]$charged -gt [int](Get-ReviewerSourceValue -Object $Report -Name 'ReaderExcusedAllowance' -Default 0)) {
         if ($reasons -cnotcontains "readerExcusedShareExceeded") { [void]$reasons.Add("readerExcusedShareExceeded") }
     }
     return @{
@@ -1399,7 +1410,7 @@ function Test-ReviewerSourceCoverageGate {
         ChangedFiles        = [int]$Report.ChangedFileCount
         SourceBearingFiles  = [int]$Report.SourceBearingFileCount
         ReaderExcusedFiles  = [int](Get-ReviewerSourceValue -Object $Report -Name 'ReaderExcusedFileCount' -Default 0)
-        ReaderExcusedCharged = [int](Get-ReviewerSourceValue -Object $Report -Name 'ReaderExcusedUncorroboratedCount' -Default 0)
+        ReaderExcusedCharged = [int]$charged
         ReaderExcusedAllowed = [int](Get-ReviewerSourceValue -Object $Report -Name 'ReaderExcusedAllowance' -Default 0)
         ChangeSetExcusedFiles = [int](Get-ReviewerSourceValue -Object $Report -Name 'ChangeSetExcusedFileCount' -Default 0)
         CoveragePercent     = [int]$Report.CoveragePercent

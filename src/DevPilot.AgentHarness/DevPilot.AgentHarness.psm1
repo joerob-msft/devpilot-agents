@@ -847,7 +847,7 @@ function ConvertFrom-AgentResultMarker {
             # tight bounds are the payload-examination cap below and the
             # retained-candidate cap further down.
             $scanned++
-            if ($scanned -gt 20000) { break }
+            if ($scanned -gt 200000) { break }
             $hit = $anchor.Index
             # The opening brace must be on the anchor's OWN line. Searching the
             # whole remaining transcript let a planted prefix line carrying no
@@ -857,13 +857,18 @@ function ConvertFrom-AgentResultMarker {
             # discarded a complete, correct review.
             $lineEnd = $StdOutText.IndexOf("`n", $hit, [StringComparison]::Ordinal)
             if ($lineEnd -lt 0) { $lineEnd = $StdOutText.Length }
-            # Two-argument IndexOf deliberately. Passing a StringComparison here
-            # binds the (char, int, int) overload instead, coercing the enum to
-            # its numeric value and searching that many characters - four - so
-            # `PREFIX: result {json}` found no brace and a complete review was
-            # discarded. The line bound below is what limits the search.
-            $jsonStart = $StdOutText.IndexOf($openBrace, $hit + $anchor.Length)
-            if ($jsonStart -lt 0 -or $jsonStart -ge $lineEnd) { continue }
+            # Two-argument IndexOf would scan to the end of the transcript on
+            # every anchor that has no brace at all, which a hostile transcript
+            # can make quadratic - measured at 14 seconds on 8 MB. The (char,
+            # int, int) count overload bounds it to this anchor's own line. The
+            # anchor pattern cannot match a newline, so the count is never
+            # negative. Passing a StringComparison here instead would ALSO bind
+            # this overload and coerce the enum to 4, searching four characters
+            # and discarding every marker with a longer lead-in.
+            $searchStart = $hit + $anchor.Length
+            if ($searchStart -ge $lineEnd) { continue }
+            $jsonStart = $StdOutText.IndexOf($openBrace, $searchStart, $lineEnd - $searchStart)
+            if ($jsonStart -lt 0) { continue }
             # Only an anchor that really could carry a payload costs scan budget.
             # Counting the ones discarded here made a review killable by quoting
             # enough bare prefix lines, which is free for an attacker.
