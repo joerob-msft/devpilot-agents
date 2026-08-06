@@ -150,6 +150,34 @@ function Measure-WrapperIndirectWrite {
     return (@($commands).Count + @($refCasts).Count + @($sessionState).Count + @($builtCode).Count + @($driveWrites).Count)
 }
 
+function Measure-WrapperBareOutput {
+    <# PowerShell returns a value without a `return` statement, so counting
+       `return`s is not enough: a bare `@{ BlockText = "stub"; Gate = @{Ok=$true} }`
+       standing on its own line joins the function's output. Emitted beside the
+       real return it yields a two-element array whose `Gate.Ok` is `@($true,
+       $false)` - which `-not` reads as false, so the gate check passes. This
+       function emits nothing bare, so any such statement is the bug. Statements
+       inside `@(...)`, `$(...)` and `(...)` are excluded because there the value
+       is consumed, not returned. #>
+    param([Parameter(Mandatory)]$FunctionAst)
+    return @($FunctionAst.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.PipelineAst] -and
+                $candidate.PipelineElements.Count -eq 1 -and
+                $candidate.PipelineElements[0] -is [Management.Automation.Language.CommandExpressionAst]
+            }, $true) | Where-Object {
+            $parent = $_.Parent
+            # Top-level statements hang off a NamedBlockAst (the function's end
+            # block); nested ones off a StatementBlockAst. Both are statement
+            # positions and both join the function's output.
+            (($parent -is [Management.Automation.Language.StatementBlockAst]) -or
+                ($parent -is [Management.Automation.Language.NamedBlockAst])) -and
+            -not ($parent.Parent -is [Management.Automation.Language.ArrayExpressionAst] -or
+                $parent.Parent -is [Management.Automation.Language.SubExpressionAst] -or
+                $parent.Parent -is [Management.Automation.Language.ParenExpressionAst])
+        }).Count
+}
+
 function Measure-WrapperNestedFunction {
     <# A `function Format-ReviewerSealedSourceBlock { "stub" }` declared inside
        the pinned function shadows the real one for that scope. Every write count
@@ -950,6 +978,16 @@ Assert-Source (@($transportAst.FindAll({
                 $candidate -is [Management.Automation.Language.ReturnStatementAst]
             }, $true)).Count -eq 2) `
     "and the transport has exactly two returns - the reader's and its own - so no earlier one can hand back a doctored result the pinned lines below never reach"
+# ...and counting returns is not enough either, because PowerShell returns a
+# value without one. A bare hashtable on its own line joins the output: emitted
+# beside the real return it makes `Gate.Ok` the array `@($true, $false)`, which
+# `-not` reads as false, so the gate check passes on a stub.
+Assert-Source ((Measure-WrapperBareOutput -FunctionAst $transportAst) -eq 0) `
+    "and it emits nothing bare, so no doctored value can join what it returns without being one of those two returns"
+$transportStatements = @($transportAst.Body.EndBlock.Statements)
+Assert-Source ($transportStatements.Count -gt 0 -and
+    $transportStatements[-1] -is [Management.Automation.Language.ReturnStatementAst]) `
+    "and its last statement is that return, so wrapping the real one in a false condition cannot leave a stub as the function's value"
 # Guard depth is an ancestor walk, and a `trap` is a sibling of what it catches,
 # so `trap { continue }` swallows the head-move refusal at depth 1 where no
 # ancestor walk can ever see it.
