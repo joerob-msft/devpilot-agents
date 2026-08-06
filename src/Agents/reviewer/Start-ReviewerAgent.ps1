@@ -542,6 +542,13 @@ $ResultMarkerPrefix = "REVIEWER_RESULT_V1:"
 # review, and it is worth exactly one more attempt. A timeout, a nonzero exit,
 # or a marker bound to the wrong PR is NOT retried: those are real failures.
 $script:ReviewerMarkerRetryAttempts = 2
+# How much of a specialist answer the wrapper will scan for a marker. The pass
+# is asked to account for every transported rule against every changed
+# construct, and a model that shows that work as it goes writes a long answer;
+# 64 KB turned out to be a cap on thinking out loud rather than on payload. The
+# marker itself stays bounded by its schema, and overflow is retried once
+# rather than costing the pass.
+$script:ReviewerConventionSpecialistMaxOutputBytes = 262144
 
 # ---------------------------------------------------------------------------
 # CODE-DEFINED security policy (never config-supplied; a forked config file
@@ -8675,8 +8682,27 @@ function Invoke-ReviewerConventionSpecialistPass {
                         throw "Copilot reported specialist model '$($cliOutcome.Model)' instead of '$EffectiveConventionSpecialistModel'."
                     }
                 }
-                if ($script:ReviewerUtf8.GetByteCount($markerSource) -gt 65536) {
-                    throw "Convention specialist output exceeded the 65536-byte cap."
+                # The wrapper will scan this much untrusted text for a marker and
+                # no more. Generous rather than tight: this pass is asked to
+                # account for every rule against every changed construct, and a
+                # model that narrates that work as it goes legitimately writes a
+                # long answer. The marker itself is bounded by its schema.
+                if ($script:ReviewerUtf8.GetByteCount($markerSource) -gt $script:ReviewerConventionSpecialistMaxOutputBytes) {
+                    # Overflow is not proof the work was not done - it is proof
+                    # the model talked too much on the way. That is the same
+                    # class of slip as an unusable marker, so it gets the same
+                    # one retry rather than costing the pass outright.
+                    if ($specialistAttempt -ge $script:ReviewerMarkerRetryAttempts) {
+                        throw "Convention specialist output exceeded the $($script:ReviewerConventionSpecialistMaxOutputBytes)-byte cap."
+                    }
+                    Write-Warning ("PR {0}'s convention specialist wrote more than the {1}-byte output cap; retrying once in a fresh session." -f `
+                            $PrId, $script:ReviewerConventionSpecialistMaxOutputBytes)
+                    Write-ReviewerCycleMetadata -Fields @{
+                        cycle = $CycleNumber; mode = "convention-specialist-output-overflow"; prId = $PrId
+                        sourceCommit = $SourceCommit; model = [string]$EffectiveConventionSpecialistModel
+                    }
+                    $marker = $null
+                    continue
                 }
                 # A timeout or a nonzero exit is a real failure and is never
                 # retried: a second identical attempt would not fix it.

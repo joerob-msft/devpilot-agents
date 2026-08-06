@@ -857,7 +857,8 @@ Assert-Specialist ($passText -match '\[AllowEmptyString\(\)\]\[string\]\$Convent
     $passText -match '\[AllowEmptyString\(\)\]\[string\]\$FactPlanPath' -and
     $safeInvokerText -match 'Convention specialist escaped its degradation boundary') `
     "Empty plan paths or an escaped specialist failure can still abort the generalist cycle."
-Assert-Specialist ($passText -match '65536' -and $passText -match 'Write-ReviewerConventionSpecialistPreview') `
+Assert-Specialist ($passText -match '\$script:ReviewerConventionSpecialistMaxOutputBytes' -and
+    $passText -match 'Write-ReviewerConventionSpecialistPreview') `
     "Specialist pass no longer enforces its output cap or persists degraded previews."
 $zeroPassAt = $pullRequestFunction.IndexOf('if ($completedPasses.Count -eq 0)', [StringComparison]::Ordinal)
 $mergeFailureAt = $pullRequestFunction.IndexOf('if (-not $mergedRoundTrip)', [StringComparison]::Ordinal)

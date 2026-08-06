@@ -876,6 +876,14 @@ try {
         "A timeout or nonzero exit must still throw from inside the loop rather than be retried."
     Assert-Replay ($retryBlock.Value -match 'if \(\$forbiddenRequestedTools\.Count -gt 0\)') `
         "The forbidden-tool check must run on every attempt, not only the first."
+    Assert-Replay ($retryBlock.Value -match 'convention-specialist-output-overflow') `
+        "An answer over the output cap must be retried once too: it is a model talking too much, not work that was not done."
+    Assert-Replay ($reviewerText -match '\$script:ReviewerConventionSpecialistMaxOutputBytes = \d+') `
+        "The specialist output cap must be a named bound rather than a literal buried in a comparison."
+    $overflowThrow = [regex]::Match($retryBlock.Value,
+        '(?s)if \(\$specialistAttempt -ge \$script:ReviewerMarkerRetryAttempts\) \{\r?\n\s*throw "Convention specialist output exceeded')
+    Assert-Replay ($overflowThrow.Success) `
+        "A second over-cap answer must still fail the pass rather than loop."
 
     # -- 11. The replay tool grant -------------------------------------------    # Extracted from the reviewer's own source and evaluated here, because the
     # claim "the model has no usable tool in replay" is otherwise a comment.
