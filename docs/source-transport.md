@@ -72,11 +72,14 @@ now read structurally and judged against policy first; only content policy would
 accept reaches the decoder, and only the decoder's own refusals become
 `decodeRejected`. Nothing about its strictness changes.
 
-**A change set with no right-hand lines is not a failure — but only evidence may
-say so.** Delete-only, rename-only, binary and empty-file changes legitimately
+**A change set with no right-hand lines is not a failure — but only the pull
+request may say so.** Delete-only and rename-only changes legitimately
 have paths and no changed lines: those paths are counted apart and are **excluded
-from the coverage denominator**, because there is no source for the transport to
-deliver and they therefore cannot be uncovered. Leaving them in meant a pull
+from the coverage denominator**, because the change set itself says there is no
+source for the transport to deliver and they therefore cannot be uncovered. A
+binary or an empty file is *not* in that category — only the reader says those
+hold nothing, so they stay counted; see the denominator rule below. Leaving
+deletes in meant a pull
 request that edited two files and deleted four scored 33% and was never
 reviewed — on every cycle, forever — though every changed hunk in it had
 arrived. A change set that is nothing but deletes is reviewable on the diff
@@ -117,6 +120,15 @@ is emitted for a path the change set DID diff as text — it has added and edite
 lines — which the wrapper's MIME allowlist then refused to fetch. That is an
 unread file, not an unreadable one, so it stays source-bearing and fails the gate
 if it is not delivered.
+
+A reader may only author the conclusions a reader is entitled to reach:
+`notTextual`, `emptyFile`, `decodeRejected`, `fileTooLarge` and
+`transportFailed`. Everything else in the closed set is a conclusion this layer
+draws for itself, and a reader returning one is refused rather than believed.
+`noChangedSpans` is the sharp case — it is the one reason the model is told means
+"the pull request itself says there is nothing here", so a host able to return it
+could hand the model a settled "nothing to check" over any file it liked, on a
+passing review.
 
 Emptiness is decided on the reported byte length, not on whitespace: a file of
 blank lines has content a reviewer could be shown. A reader that reports no byte
@@ -227,7 +239,8 @@ the same host that supplies the MIME type, and forging it is no harder.
 Paths excused either way stay listed in the accounting table and are counted
 separately in the coverage record (`changeSetExcusedFileCount`,
 `readerExcusedFileCount`, `readerExcusedUncorroboratedCount`,
-`readerExcusedAllowance`), and the human preview states the two kinds on separate
+`readerNonTextUncorroboratedCount`, `readerExcusedAllowance`), and the human
+preview states the two kinds on separate
 lines — reader-excused ones as counted in the percentage and among the files
 nobody read — so a reader can see which claim came from where.
 
@@ -280,7 +293,8 @@ to have reviewed an `omitted` path, and must describe a `partial` path as
 partially read. **Exactly one** reason is an exception, because it is the only
 one that is not a gap in what the model was given: `noChangedSpans`, the pull
 request's own statement that it deleted or renamed the path. Every other reason —
-`binaryNoText`, `emptyFile`, `notTextual`, `fileTooLarge`, `spansUnavailable`,
+`binaryNoText`, `readerReportedNonTextUncorroborated`, `emptyFile`, `notTextual`,
+`fileTooLarge`, `spansUnavailable`,
 `decodeRejected`, `transportFailed` — means the source content could not be
 established: a file the model has not read and that nobody has confirmed is
 empty. That sentence is **generated from** the closed set in code rather than

@@ -65,6 +65,15 @@ $script:ReviewerSourceNoSourceReasons = @("noChangedSpans", "binaryNoText", "rea
 # them. The sealed block's binding sentence is GENERATED from this array, so the
 # prose and the rule cannot drift.
 $script:ReviewerSourceNothingToReadReasons = @("noChangedSpans")
+# Reasons a READER is permitted to author. Anything else in the closed set above
+# is a conclusion this layer draws for itself, and a reader that returns one is
+# putting words in the wrapper's mouth. `noChangedSpans` is the sharp case: it is
+# the one reason the model is told means "the pull request itself says there is
+# nothing here", so a host able to return it could hand the model a settled
+# "nothing to check" over any file it liked, on a passing review.
+$script:ReviewerSourceReaderAuthoredRejections = @(
+    "notTextual", "emptyFile", "decodeRejected", "fileTooLarge", "transportFailed"
+)
 $script:ReviewerSourceStatuses = @("delivered", "partial", "omitted")
 $script:ReviewerSourceMaxSpansPerPath = 2000
 # How many spanless-but-content-declaring paths may be read to find out what
@@ -1125,6 +1134,14 @@ function New-ReviewerSourceTransportReport {
             # fetch, which is an unread file, not an unreadable one.
             $spanlessCarriesSource = $true
             if ($spanlessRejected) {
+                # Same closed set as the spanned branch: a reader may only author
+                # the conclusions a reader is entitled to reach. Passing whatever
+                # it returned straight through let a host answer `noChangedSpans`
+                # and hand the model a settled "the pull request says there is
+                # nothing here" over any file it chose, on a passing review.
+                if ($script:ReviewerSourceReaderAuthoredRejections -cnotcontains $spanlessRejected) {
+                    throw "The source reader returned rejection '$spanlessRejected', which a reader may not author."
+                }
                 $spanlessReason = $spanlessRejected
                 if ($spanlessRejected -ceq "notTextual") {
                     $spanlessReason = if (Test-ReviewerSourcePathLooksNonText -Path $path) { "binaryNoText" }
@@ -1170,8 +1187,8 @@ function New-ReviewerSourceTransportReport {
         # transport bug instead of raising a cap.
         $rejection = [string](Get-ReviewerSourceValue -Object $resource -Name "Rejected" -Default "")
         if ($rejection) {
-            if ($script:ReviewerSourceOmissionReasons -cnotcontains $rejection) {
-                throw "The source reader returned unknown rejection '$rejection'."
+            if ($script:ReviewerSourceReaderAuthoredRejections -cnotcontains $rejection) {
+                throw "The source reader returned rejection '$rejection', which a reader may not author."
             }
             [void]$files.Add((New-ReviewerSourceFileEntry -Path $path -CommitSha $CommitSha `
                         -Status "omitted" -Reason $rejection -RawRequestedSpanCount $requestedForPath `
@@ -1265,7 +1282,10 @@ function New-ReviewerSourceTransportReport {
             -not [bool]$_.CarriesSource -and [string]$_.NoSourceBasis -ceq 'reader' -and
             -not (Test-ReviewerSourcePathLooksNonText -Path ([string]$_.Path))
         }).Count
-    $readerNonTextUncorroboratedCount = @(@($files) | Where-Object { [string]$_.Reason -ceq 'readerReportedNonTextUncorroborated' }).Count
+    $readerNonTextUncorroboratedCount = @(@($files) | Where-Object {
+            -not [bool]$_.CarriesSource -and [string]$_.NoSourceBasis -ceq 'reader' -and
+            [string]$_.Reason -ceq 'readerReportedNonTextUncorroborated'
+        }).Count
     # Measured against the DISTINCT paths whose text status is actually
     # contested. Three looser denominators have each been a padding vector in
     # turn: all changed paths let a bulk move buy allowance, all source-capable
@@ -1568,10 +1588,6 @@ function Format-ReviewerSealedSourceBlock {
     # Backtick-escaped so "$accounting:" is not parsed as a scope qualifier.
     [void]$lines.Add("$accounting`:")
     [void]$lines.Add("")
-    if ([int]$Report.ReaderNonTextUncorroboratedCount -gt 0) {
-        [void]$lines.Add("A path marked ``readerReportedNonTextUncorroborated`` is one the REPOSITORY HOST ALONE reported as not being text. The pull request's own path for it does not say so - it looks like an ordinary source file - and no source was delivered for it. You have not read it. Do not review it, do not clear it, do not report a finding on it, and do not count it as checked. How much of this change set may be set aside this way is bounded, and $($Report.ReaderNonTextUncorroboratedCount) path(s) here are.")
-        [void]$lines.Add("")
-    }
     [void]$lines.Add("| changed path | status | reason | lines delivered |")
     [void]$lines.Add("|---|---|---|---|")
     $rejectedIndex = 0
@@ -1604,6 +1620,10 @@ function Format-ReviewerSealedSourceBlock {
             }) | ForEach-Object { "``$_``" })
     [void]$lines.Add("You may not claim to have reviewed, verified, or cleared a path whose status is ``omitted``, and you may not treat a ``partial`` path as fully read. Say what you could not see. EXACTLY $($nothingToRead.Count) reason is different: $($nothingToRead -join ', ') means the pull request itself says that path holds no added or edited text - a delete or a rename - so there is nothing in it for anyone to read. Every OTHER reason, including $($stillUnread -join ', '), means the source content of that path could NOT be established. Those are files you have not read. Nobody has told you they are empty, and you may not treat them as checked.")
     [void]$lines.Add("")
+    if ([int]$Report.ReaderNonTextUncorroboratedCount -gt 0) {
+        [void]$lines.Add("A path marked ``readerReportedNonTextUncorroborated`` is one the REPOSITORY HOST ALONE reported as not being text. The pull request's own path for it does not say so - it looks like an ordinary source file - and no source was delivered for it. You have not read it. Do not review it, do not clear it, do not report a finding on it, and do not count it as checked. How much of this change set may be set aside this way is bounded, and $($Report.ReaderNonTextUncorroboratedCount) path(s) here are.")
+        [void]$lines.Add("")
+    }
     [void]$lines.Add("Slices marked ``kind: sibling`` are UNCHANGED lines from the same file, delivered next to the change so you can see what this file's existing members already do. They are evidence of established practice; they are not part of this pull request and you must never report a finding on them.")
     [void]$lines.Add("")
     foreach ($file in @($Report.Files)) {

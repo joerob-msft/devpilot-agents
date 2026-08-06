@@ -1157,7 +1157,12 @@ Assert-Source ($binaryAddBlock -match 'EXACTLY 1 reason is different' -and
 # without meaning to changes the model's instructions and fails here.
 Assert-Source (@($script:ReviewerSourceNothingToReadReasons) -join ',' -ceq 'noChangedSpans') `
     "the nothing-to-read set the sentence is built from holds exactly noChangedSpans"
-foreach ($readerReason in @('binaryNoText', 'emptyFile', 'notTextual', 'fileTooLarge', 'spansUnavailable', 'decodeRejected', 'transportFailed')) {
+# Derived, not hand-listed: the block's sentence is generated from the same sets,
+# so a hand-maintained copy here would be exactly the drift this file refuses.
+$structuralReasons = @('pathRejected', 'fileCountCapExceeded', 'budgetExhausted', 'sliceCountCapExceeded', 'spanOutsideFile', 'unsafeSliceText')
+foreach ($readerReason in @($script:ReviewerSourceOmissionReasons | Where-Object {
+            $script:ReviewerSourceNothingToReadReasons -cnotcontains $_ -and $structuralReasons -cnotcontains $_
+        })) {
     Assert-Source ($binaryAddBlock -match "``$readerReason``") `
         "the model is told '$readerReason' means the source content could not be established"
 }
@@ -1314,9 +1319,29 @@ Assert-Source ($uncorroboratedBlock -match 'readerReportedNonTextUncorroborated'
     $uncorroboratedBlock -match 'You have not read it' -and
     $uncorroboratedBlock -match 'How much of this change set may be set aside this way is bounded') `
     "the block tells the model plainly that only the host said so, that it was not delivered, and that the share is bounded"
-Assert-Source ($uncorroboratedBlock -notmatch 'readerReportedNonTextUncorroborated`` \(deleted or renamed\)' -and
-    ($script:ReviewerSourceNothingToReadReasons -cnotcontains 'readerReportedNonTextUncorroborated')) `
+Assert-Source ($script:ReviewerSourceNothingToReadReasons -cnotcontains 'readerReportedNonTextUncorroborated') `
     "and the new reason is never in the authoritative nothing-to-check set"
+# A reader may only author the conclusions a reader is entitled to reach. Left
+# unrestricted, a host could answer `noChangedSpans` and hand the model a settled
+# "the pull request says there is nothing here" over any file it chose.
+Assert-Source ($script:ReviewerSourceReaderAuthoredRejections -cnotcontains 'noChangedSpans' -and
+    $script:ReviewerSourceReaderAuthoredRejections -cnotcontains 'binaryNoText' -and
+    $script:ReviewerSourceReaderAuthoredRejections -cnotcontains 'readerReportedNonTextUncorroborated') `
+    "a reader may not author any reason that would speak for the pull request"
+foreach ($forged in @('noChangedSpans', 'binaryNoText', 'readerReportedNonTextUncorroborated', 'spansUnavailable')) {
+    Assert-Source (Test-Throws {
+            New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @('/src/secret.cs') `
+                -SpansByPath ([ordered]@{ '/src/secret.cs' = @(@{ Start = 2; End = 3 }) }) -Policy $policy `
+                -Reader { param([string]$Path) [pscustomobject]@{ Rejected = $forged; MimeType = 'text/plain'; ByteLength = 10 } } `
+                -ChangeKindsByPath ([ordered]@{ '/src/secret.cs' = 'Edit' })
+        }) "a reader that forges '$forged' on a spanned path is refused, not believed"
+    Assert-Source (Test-Throws {
+            New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @('/src/secret.cs') `
+                -SpansByPath ([ordered]@{}) -Policy $policy `
+                -Reader { param([string]$Path) [pscustomobject]@{ Rejected = $forged; MimeType = 'text/plain'; ByteLength = 10 } } `
+                -ChangeKindsByPath ([ordered]@{ '/src/secret.cs' = 'Edit' })
+        }) "and a reader that forges '$forged' on a spanless path is refused too"
+}
 # No reason may bypass the allowance: the new one is charged like any other
 # uncorroborated reader excusal.
 Assert-Source ([int]$uncorroboratedReport.ReaderExcusedAllowance -eq 5 -and
