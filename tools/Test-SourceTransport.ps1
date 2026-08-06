@@ -1577,12 +1577,13 @@ $deepKinds = , (, (, (, (, (@('delete', 'rename'))))))
 Assert-Source (Test-ReviewerSourceChangeCarriesRightHand -ChangeTypeValue $deepKinds) `
     "a change type nested past the depth bound is counted rather than trusted"
 
-# A path may only leave the coverage denominator under a reason the prompts
-# publish as 'nothing to read', and it must record what said so.
+# A path may only be marked source-free under a reason from the GATE-side set,
+# and it must record what said so. Note that being marked source-free is not the
+# same as leaving the coverage denominator: only a change-set basis does that.
 Assert-Source (Test-Throws { New-ReviewerSourceFileEntry -Path '/src/a.cs' -CommitSha $commit -Status 'omitted' -Reason 'spansUnavailable' -CarriesSource $false -NoSourceBasis 'reader' }) `
-    "a path cannot leave the denominator under a reason that means it was not read"
+    "a path cannot be marked source-free under a reason that means it was not read"
 Assert-Source (Test-Throws { New-ReviewerSourceFileEntry -Path '/src/a.cs' -CommitSha $commit -Status 'omitted' -Reason 'noChangedSpans' -CarriesSource $false }) `
-    "a path that leaves the denominator must record whether the change set or the reader said so"
+    "a path marked source-free must record whether the change set or the reader said so"
 
 # The excusing decision is made on bytes, and it records what it saw.
 $blankReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @('/src/blank.cs') `

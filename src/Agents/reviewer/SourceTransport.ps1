@@ -50,12 +50,6 @@ $script:ReviewerSourceOmissionReasons = @(
     "noChangedSpans", "binaryNoText", "emptyFile", "spansUnavailable", "fileCountCapExceeded",
     "pathRejected", "spanOutsideFile", "unsafeSliceText", "decodeRejected"
 )
-# The only reasons that mean "there is no added or edited text here for anyone to
-# read". Every other omission means the model did NOT get something it should
-# have. The two prompts publish exactly this set as their exception list, and
-# New-ReviewerSourceFileEntry refuses to mark a path source-free under any other
-# reason, so the flag the gate divides by and the sentence the model obeys cannot
-# drift apart.
 # Every reason that may mark a path as carrying no source at all. This is the
 # GATE-side set: `New-ReviewerSourceFileEntry` refuses `CarriesSource = $false`
 # under any other reason. It is deliberately LARGER than the model-facing set
