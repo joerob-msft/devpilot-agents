@@ -170,6 +170,17 @@ param(
     # config must name at least one enabled destination, or startup fails.
     [switch]$EnableTeamsNotifications,
 
+    # Who the direct message goes to. Authoritative over
+    # config.teamsNotifications.directAuthor.recipientUpn, for the same reason
+    # -OperatorAlias overrides its config counterpart: a checked-in file should
+    # not name an individual, and the recipient is a property of who is running
+    # the agent rather than of the repository.
+    #
+    # Microsoft Graph cannot create a one-on-one chat between the signed-in user
+    # and themselves, so this must be a different person than whoever the agent
+    # authenticates as.
+    [string]$TeamsRecipientUpn,
+
     # Operator controls for busy repositories and unattended hosts.
     # Each PR costs one full model run, so the per-cycle count is bounded and
     # low by default; a repository with 70 open PRs must not turn one cycle
@@ -1365,6 +1376,14 @@ $teamsDirectRecipientProp = $teamsDirectCfg.PSObject.Properties["recipientUpn"]
 if ($teamsDirectRecipientProp -and $teamsDirectRecipientProp.Value -is [string]) {
     $TeamsDirectRecipient = ([string]$teamsDirectRecipientProp.Value).Trim()
 }
+# The command line wins, so a repository can ship directAuthor.enabled = true
+# without naming a person in a checked-in file.
+if ($PSBoundParameters.ContainsKey('TeamsRecipientUpn')) {
+    $TeamsDirectRecipient = $TeamsRecipientUpn.Trim()
+}
+if ($TeamsDirectRecipient -and $TeamsDirectRecipient -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
+    throw "Teams direct recipient '$TeamsDirectRecipient' is not a valid UPN."
+}
 
 # An event this agent never raises would be configured, look enabled, and
 # deliver nothing - the exact failure this whole section exists to prevent.
@@ -1395,7 +1414,8 @@ if ($EnableTeamsNotifications) {
     }
     if ($TeamsDirectEnabled) {
         if ([string]::IsNullOrWhiteSpace($TeamsDirectRecipient)) {
-            throw ("config.teamsNotifications.directAuthor is enabled but recipientUpn is empty. Set it to the UPN to message. " +
+            throw ("config.teamsNotifications.directAuthor is enabled but no recipient is set. Pass -TeamsRecipientUpn <upn>, " +
+                "or populate config.teamsNotifications.directAuthor.recipientUpn. " +
                 "Note: Microsoft Graph cannot create a one-on-one chat with yourself, so this must be a different person than the signed-in user.")
         }
         if (@($TeamsDirectEvents).Count -eq 0) {
@@ -3082,7 +3102,7 @@ function Invoke-DryRunSelfChecks {
             '-EnableTeamsNotifications was passed but neither',
             'channel is enabled but teamId/channelId are empty',
             'is enabled but its events list is empty',
-            'recipientUpn is empty')) {
+            'no recipient is set')) {
         if ($selfText -cnotmatch [regex]::Escape($guard)) {
             $teamsFailures += "startup validation is missing the guard: '$guard'"
         }
