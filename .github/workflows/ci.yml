@@ -69,7 +69,7 @@ jobs:
         shell: pwsh
         run: |
           ./src/Agents/review-handler/Start-ReviewHandlerAgent.ps1 -DryRun `
-              -ConfigFile ./samples/apihub-ado.config.json
+              -ConfigFile ./samples/handler-ado.config.json
 
       - name: reviewer -DryRun
         shell: pwsh
