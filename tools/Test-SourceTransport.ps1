@@ -656,6 +656,8 @@ Assert-Source ($transportText -match 'Gate\s*=\s*\(Test-ReviewerSourceCoverageGa
     "the gate decision is computed, never assumed"
 Assert-Source ($transportText -match 'BlockText\s*=\s*\$blockText') `
     "the transport returns the block it rendered rather than a constant"
+Assert-Source ($transportText -match '\$blockText = Format-ReviewerSealedSourceBlock -Report \$report') `
+    "and the block it returns is the rendered accounting table, not an empty string"
 Assert-Source ($cycleText -match '\$pinnedSourceText\s*=\s*\[string\]\$sourceTransport\.BlockText') `
     "the sealed block the model receives is the one the transport produced"
 Assert-Source ($cycleText -match 'PinnedSourceText\s*=\s*\$pinnedSourceText') `
