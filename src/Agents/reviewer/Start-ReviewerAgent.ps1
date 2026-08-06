@@ -2029,12 +2029,13 @@ $script:ReviewerAuthoritativeMaxSources = 8
 $script:ReviewerAuthoritativeMaxFileBytes = 131072
 # How large a changed file the verifier will open to cut seven lines out of it.
 # It was 128 KB, which is a sensible bound on a document but not on a source
-# file: a 292 KB test file yielded no hunk at all, so the verifier was asked to
-# confirm a finding and correctly refused, having been shown nothing. The
-# transport already reads the same file at the same commit under a far larger
-# bound; this only decides what the verifier may open, never what a model sees,
-# which stays seven lines either way.
-$script:ReviewerVerificationMaxSourceFileBytes = 1048576
+# file: a changed test file over that size yielded no hunk at all, so the
+# verifier was asked to confirm a finding and correctly refused, having been
+# shown nothing. This is the ceiling `Get-ReviewerFactSourceFile` itself
+# accepts, and it only decides what the verifier may OPEN - what a model sees
+# stays seven lines either way. A file larger than this still yields no hunk,
+# and the verifier still refuses rather than guessing.
+$script:ReviewerVerificationMaxSourceFileBytes = 262144
 $script:ReviewerAuthoritativeMaxTotalBytes = 262144
 # A section-scoped source fetches the WHOLE document and then cuts the named
 # heading out of it, so the fetch bound has to admit a real engineering-guidance
