@@ -73,7 +73,7 @@ function Copy-Fixture {
 
 try {
     # -- 1. The shipped fixture loads, and every payload is hash-bound ---------
-    Write-Host "1/10 shipped synthetic snapshot" -ForegroundColor Cyan
+    Write-Host "1/11 shipped synthetic snapshot" -ForegroundColor Cyan
     $snapshot = New-AgentReplaySnapshot -ReplayRoot $fixtureRoot -SnapshotName "synthetic-pr"
     Assert-Replay ($snapshot.SnapshotId -ceq "synthetic-pr") "The shipped fixture did not load under its own name."
     Assert-Replay ($snapshot.ResourceCount -eq 7) "The shipped fixture should carry exactly 7 recorded reads."
@@ -89,7 +89,7 @@ try {
         "An operator-supplied digest that does not match must refuse the snapshot." -Match "does not match the operator-supplied"
 
     # -- 2. Serving preserves the live tool response shapes -------------------
-    Write-Host "2/10 served responses keep the live shapes" -ForegroundColor Cyan
+    Write-Host "2/11 served responses keep the live shapes" -ForegroundColor Cyan
     $session = Open-AgentMcpSession -AgencyPath "never-executed" -Server "ado" -Organization "contoso" -ReplaySnapshot $snapshot
     Assert-Replay ($null -eq $session.Process) "A replay session must not start a process."
     $pr = Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
@@ -118,7 +118,7 @@ try {
         "Two serves of one recorded read must be equal in value and separate objects."
 
     # -- 3. Absent, write, and closed all fail closed -------------------------
-    Write-Host "3/10 absent reads, writes, and closed sessions fail closed" -ForegroundColor Cyan
+    Write-Host "3/11 absent reads, writes, and closed sessions fail closed" -ForegroundColor Cyan
     Assert-ReplayThrows { Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
             action = "get"; project = "Widgets"; repositoryId = "11111111-2222-3333-4444-555555555555"; pullRequestId = 9999
         } } "A read the snapshot does not carry must fail, never fall through to a live read." -Match "no recorded response"
@@ -148,7 +148,7 @@ try {
         "A snapshot captured for one organization must not serve another." -Match "was captured against organization"
 
     # -- 4. Tampering, stale bindings, and missing payloads -------------------
-    Write-Host "4/10 tamper, stale binding, and missing resource" -ForegroundColor Cyan
+    Write-Host "4/11 tamper, stale binding, and missing resource" -ForegroundColor Cyan
     $tampered = Copy-Fixture -Name "tampered"
     $payload = Join-Path $tampered "synthetic-pr\payloads\pr-get.json"
     [IO.File]::WriteAllBytes($payload, $utf8.GetBytes(([IO.File]::ReadAllText($payload, $utf8)).Replace("4242", "4243")))
@@ -174,7 +174,7 @@ try {
         "A snapshot loaded under a different name than it declares must be refused." -Match "declares snapshotId"
 
     # -- 5. Path attacks ------------------------------------------------------
-    Write-Host "5/10 path attacks" -ForegroundColor Cyan
+    Write-Host "5/11 path attacks" -ForegroundColor Cyan
     foreach ($name in @("..", "..\other", "a/b", "C:\windows", "with:stream", "")) {
         Assert-ReplayThrows { New-AgentReplaySnapshot -ReplayRoot $fixtureRoot -SnapshotName $name } `
             "Snapshot name '$name' must be refused as a path-free single name."
@@ -206,7 +206,7 @@ try {
     }
 
     # -- 6. Recorded writes cannot be sealed into a snapshot at all -----------
-    Write-Host "6/10 a snapshot may only carry reads" -ForegroundColor Cyan
+    Write-Host "6/11 a snapshot may only carry reads" -ForegroundColor Cyan
     $writeAttempt = Join-Path $sandbox "write-attempt"
     New-Item -ItemType Directory -Force -Path (Join-Path $writeAttempt "payloads") | Out-Null
     [IO.File]::WriteAllBytes((Join-Path $writeAttempt "payloads\w.json"),
@@ -250,7 +250,7 @@ try {
         "The loader must recompute exactly the digest the writer recorded."
 
     # -- 7. Canonical form and lookup keys are host-independent ---------------
-    Write-Host "7/10 canonical form is ordinal and host-independent" -ForegroundColor Cyan
+    Write-Host "7/11 canonical form is ordinal and host-independent" -ForegroundColor Cyan
     $mixed = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
     foreach ($pair in @(@("ab", 1), @("Aa", 2), @("aa", 3), @("ch", 4), @("cz", 5), @("_x", 6))) {
         $mixed[[string]$pair[0]] = [int]$pair[1]
@@ -271,7 +271,7 @@ try {
     Assert-Replay ($escapes -ceq '{"t":"a\"b\\c\nd"}') "String escaping must be explicit and stable (got $escapes)."
 
     # -- 8. Rule-coverage accounting ------------------------------------------
-    Write-Host "8/10 rule-coverage accounting" -ForegroundColor Cyan
+    Write-Host "8/11 rule-coverage accounting" -ForegroundColor Cyan
     $sources = @(
         [pscustomobject][ordered]@{ PackName = "core"; SourceId = "rule-a"; Sha256 = ("a" * 64); Text = "Prefer assigning a field once." }
         [pscustomobject][ordered]@{ PackName = "core"; SourceId = "rule-b"; Sha256 = ("b" * 64); Text = "Name every argument of a multi-line call." }
@@ -280,77 +280,135 @@ try {
         [pscustomobject][ordered]@{ anchorId = "cf0"; path = "src/a.cs" }
         [pscustomobject][ordered]@{ anchorId = "cf1"; path = "src/b.cs" }
     )
-    $accepted = @([pscustomobject][ordered]@{ candidateId = "reassigns-field"; packName = "core"; ruleSourceId = "rule-a" })
+    $constructs = @(
+        [pscustomobject][ordered]@{ constructId = "mi0"; kind = "invocation"; path = "src/a.cs"; line = 12 }
+        [pscustomobject][ordered]@{ constructId = "mi1"; kind = "invocation"; path = "src/a.cs"; line = 40 }
+        [pscustomobject][ordered]@{ constructId = "dc0"; kind = "declaration"; path = "src/b.cs"; line = 7 }
+    )
+    $accepted = @([pscustomobject][ordered]@{
+            candidateId = "reassigns-field"; packName = "core"; ruleSourceId = "rule-a"
+            filePath = "/src/a.cs"; line = 12
+        })
     # rule-a sorts to rs0 and rule-b to rs1 under the request's ordinal order.
     function New-CoverageRow {
-        param([string]$Ref, [string]$Sha, [string]$Status, [string]$Anchors = "cf0:12", [string]$Candidate = "", [string]$Quote = "")
+        param(
+            [string]$Ref, [string]$Sha, [string]$Status, [string]$Scope = "invocations",
+            [string]$Checked = "mi0,mi1", [string]$Violating = "", [string]$Candidate = "", [string]$Quote = ""
+        )
         return [pscustomobject][ordered]@{
-            ruleRef = $Ref; ruleSourceSha256 = $Sha; ruleQuote = $Quote
-            status = $Status; changedAnchors = $Anchors; codeEvidence = "evidence"
-            siblingStatus = "checked"; siblingEvidence = "sibling"; candidateId = $Candidate; notes = "note"
+            ruleRef = $Ref; ruleSourceSha256 = $Sha; ruleQuote = $Quote; status = $Status
+            scope = $Scope; checkedConstructs = $Checked; violatingConstructs = $Violating
+            codeEvidence = "evidence"; siblingStatus = "checked"; siblingEvidence = "sibling"
+            candidateId = $Candidate; notes = "note"
         }
     }
+    function Invoke-Coverage {
+        param([object[]]$Rows, [object[]]$Accepted = @(), [string[]]$Withheld = @())
+        return Resolve-ReviewerConventionSpecialistRuleCoverage -Rows $Rows -ResolvedSources $sources `
+            -ChangedFileIndex $anchors -AcceptedCandidates $Accepted -Constructs $constructs -WithheldCandidateIds $Withheld
+    }
 
-    $complete = Resolve-ReviewerConventionSpecialistRuleCoverage -ResolvedSources $sources -ChangedFileIndex $anchors `
-        -AcceptedCandidates $accepted -Rows @(
-        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "violation" -Candidate "reassigns-field"),
+    $complete = Invoke-Coverage -Accepted $accepted -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "violation" -Violating "mi0" -Candidate "reassigns-field"),
         (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
     )
-    Assert-Replay ([bool]$complete.Complete) "Accounting that covers every transported source exactly once must be complete."
+    Assert-Replay ([bool]$complete.Complete) `
+        "Accounting that covers every requested source and every construct in scope must be complete."
     Assert-Replay (@($complete.UnemittedViolations).Count -eq 0) "A violation linked to an accepted candidate is not an unemitted one."
 
-    $short = Resolve-ReviewerConventionSpecialistRuleCoverage -ResolvedSources $sources -ChangedFileIndex $anchors `
-        -AcceptedCandidates @() -Rows @((New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant"))
+    $short = Invoke-Coverage -Rows @((New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant"))
     Assert-Replay (-not [bool]$short.Complete -and @($short.Missing) -ccontains "core/rule-b") `
-        "A transported source with no row must be reported missing, not silently dropped."
+        "A requested source with no row must be reported missing, not silently dropped."
 
-    $dupe = Resolve-ReviewerConventionSpecialistRuleCoverage -ResolvedSources $sources -ChangedFileIndex $anchors `
-        -AcceptedCandidates @() -Rows @(
+    $dupe = Invoke-Coverage -Rows @(
         (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant"),
-        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "notApplicable"),
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "notApplicable" -Scope "none" -Checked ""),
         (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
     )
     Assert-Replay (-not [bool]$dupe.Complete -and @($dupe.Duplicates) -ccontains "rs0") `
         "A source accounted for twice must be reported as a duplicate."
 
-    $bogus = Resolve-ReviewerConventionSpecialistRuleCoverage -ResolvedSources $sources -ChangedFileIndex $anchors `
-        -AcceptedCandidates @() -Rows @(
+    $bogus = Invoke-Coverage -Rows @(
         (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant"),
         (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant"),
-        (New-CoverageRow -Ref "rs9" -Sha ("c" * 64) -Status "violation")
+        (New-CoverageRow -Ref "rs9" -Sha ("c" * 64) -Status "violation" -Violating "mi0")
     )
     Assert-Replay (-not [bool]$bogus.Complete -and @($bogus.Unknown) -ccontains "rs9") `
-        "A row naming a source that was never transported must be reported, not counted."
+        "A row naming a source that was never requested must be reported, not counted."
     Assert-Replay (@($bogus.UnemittedViolations).Count -eq 0) `
-        "A violation on a source that was never transported must not become a withheld finding."
+        "A violation on a source that was never requested must not become a withheld finding."
 
-    $badAnchor = Resolve-ReviewerConventionSpecialistRuleCoverage -ResolvedSources $sources -ChangedFileIndex $anchors `
-        -AcceptedCandidates @() -Rows @(
-        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Anchors "cf9:4"),
+    # The heart of it: a rule cannot be called compliant while a construct in
+    # its own declared scope goes unmentioned.
+    $partialScope = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Checked "mi0"),
         (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
     )
-    Assert-Replay ([string]@($badAnchor.Rows)[0].status -ceq "unknown") `
-        "A row anchored outside the delivered change set must degrade to unknown."
+    Assert-Replay ([string]@($partialScope.Rows)[0].status -ceq "unknown" -and
+        [string]@($partialScope.Rows)[0].degradedReason -match "unaccounted") `
+        "A row that checks only some of the constructs in its scope must degrade to unknown."
+    Assert-Replay (-not [bool]$partialScope.Complete) "A partly-checked scope must not read as complete."
 
-    $badHash = Resolve-ReviewerConventionSpecialistRuleCoverage -ResolvedSources $sources -ChangedFileIndex $anchors `
-        -AcceptedCandidates @() -Rows @(
+    $strayScope = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Checked "mi0,mi1,dc0"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
+    )
+    Assert-Replay ([string]@($strayScope.Rows)[0].status -ceq "unknown") `
+        "A row that checks constructs outside its declared scope must degrade to unknown."
+
+    $declarationScope = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope "declarations" -Checked "dc0"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
+    )
+    Assert-Replay ([string]@($declarationScope.Rows)[0].status -ceq "compliant") `
+        "A declarations-scoped row that covers every declaration must stand."
+
+    $ghostConstruct = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "violation" -Violating "mi7"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
+    )
+    Assert-Replay ([string]@($ghostConstruct.Rows)[0].status -ceq "unknown") `
+        "A violating construct that does not exist must degrade the row."
+
+    $unnamedViolation = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "violation"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
+    )
+    Assert-Replay ([string]@($unnamedViolation.Rows)[0].status -ceq "unknown") `
+        "A violation that names no violating construct must degrade the row."
+
+    $violatingWithoutViolation = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Violating "mi0"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
+    )
+    Assert-Replay ([string]@($violatingWithoutViolation.Rows)[0].status -ceq "unknown") `
+        "Naming violating constructs while reporting no violation must degrade the row."
+
+    # A wrong-anchor row cannot stand in for the right one.
+    $wrongAnchor = Invoke-Coverage -Accepted $accepted -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "violation" -Violating "mi1" -Candidate "reassigns-field"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
+    )
+    Assert-Replay ([string]@($wrongAnchor.Rows)[0].status -ceq "unknown" -and
+        [string]@($wrongAnchor.Rows)[0].candidateId -ceq "") `
+        "A candidate anchored somewhere other than the constructs the row calls violating must not satisfy that row."
+
+    $badHash = Invoke-Coverage -Rows @(
         (New-CoverageRow -Ref "rs0" -Sha ("f" * 64) -Status "compliant"),
         (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
     )
     Assert-Replay ([string]@($badHash.Rows)[0].status -ceq "unknown") `
         "A row citing a rule-source hash that was not transported must degrade to unknown."
 
-    $badQuote = Resolve-ReviewerConventionSpecialistRuleCoverage -ResolvedSources $sources -ChangedFileIndex $anchors `
-        -AcceptedCandidates @() -Rows @(
-        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "violation" -Quote "text that is not in the source"),
+    $badQuote = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Quote "text that is not in the source"),
         (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
     )
     Assert-Replay ([string]@($badQuote.Rows)[0].status -ceq "unknown") `
         "A row quoting text absent from the transported source must degrade to unknown."
 
-    $ghost = Resolve-ReviewerConventionSpecialistRuleCoverage -ResolvedSources $sources -ChangedFileIndex $anchors `
-        -AcceptedCandidates @() -Rows @(
-        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "violation" -Candidate "never-emitted"),
+    $ghost = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "violation" -Violating "mi0" -Candidate "never-emitted"),
         (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
     )
     Assert-Replay (@($ghost.UnemittedViolations).Count -eq 1) `
@@ -358,17 +416,16 @@ try {
     Assert-Replay ([string]@($ghost.Rows)[0].candidateId -ceq "") `
         "A link to a candidate that does not exist must not be recorded as a link."
 
-    $alreadyWithheld = Resolve-ReviewerConventionSpecialistRuleCoverage -ResolvedSources $sources -ChangedFileIndex $anchors `
-        -AcceptedCandidates @() -WithheldCandidateIds @("reassigns-field") -Rows @(
-        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "violation" -Candidate "reassigns-field"),
+    $alreadyWithheld = Invoke-Coverage -Withheld @("reassigns-field") -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "violation" -Violating "mi0" -Candidate "reassigns-field"),
         (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
     )
     Assert-Replay (@($alreadyWithheld.UnemittedViolations).Count -eq 0) `
         "A violation whose candidate the wrapper already withheld must not be counted a second time."
 
-    $unaccounted = Resolve-ReviewerConventionSpecialistRuleCoverage -ResolvedSources $sources -ChangedFileIndex $anchors `
-        -AcceptedCandidates @([pscustomobject][ordered]@{ candidateId = "x"; packName = "core"; ruleSourceId = "rule-b" }) `
-        -Rows @((New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant"))
+    $unaccounted = Invoke-Coverage -Accepted @([pscustomobject][ordered]@{
+            candidateId = "x"; packName = "core"; ruleSourceId = "rule-b"; filePath = "/src/a.cs"; line = 12
+        }) -Rows @((New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant"))
     Assert-Replay (-not [bool]$unaccounted.Complete -and @($unaccounted.UnaccountedCandidates) -ccontains "x") `
         "A candidate whose rule has no accounting row must be reported."
 
@@ -381,11 +438,11 @@ try {
         "The changed-file anchor index must be ordinal, deduplicated, and current-role only."
 
     # -- 9. Schema bounds ------------------------------------------------------
-    Write-Host "9/10 schema bounds" -ForegroundColor Cyan
+    Write-Host "9/11 schema bounds" -ForegroundColor Cyan
     $schema = Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject "Widgets" -ExpectedNonce "n"
     Assert-Replay ($schema.Keys -ccontains "ruleCoverage") "The marker schema must declare ruleCoverage."
     $coverageSpec = $schema.Fields["ruleCoverage"]
-    Assert-Replay ([int]$coverageSpec.MaxItems -eq 12) "The rule-coverage array must be bounded at 12 rows."
+    Assert-Replay ([int]$coverageSpec.MaxItems -eq 10) "The rule-coverage array must be bounded at 10 rows."
     $rowFields = $coverageSpec.Item.Fields
     # Every field of a row must be individually bounded, and the whole section
     # must stay well inside the marker scan window - an unbounded accounting
@@ -451,10 +508,137 @@ try {
     Assert-Replay (-not [bool]$quoteRejected.Ok) `
         "A coverage row's rule quote must stay ASCII, because it has to match the transported source exactly."
 
-    # -- 10. The replay tool grant --------------------------------------------
+    # -- 10. Changed-construct enumeration -------------------------------------
+    # The generic half of the calibration: what the wrapper can establish about
+    # a change set WITHOUT knowing the language's testing framework, its
+    # attributes, or anything about the repository it came from.
+    Write-Host "10/11 changed-construct enumeration" -ForegroundColor Cyan
+    . (Join-Path $RepoRoot "src\Agents\reviewer\ChangedConstructs.ps1")
+
+    function Get-Constructs {
+        param([string[]]$Code, [int[]]$Changed, [string]$Path = "src/Sample.cs")
+        $changedLines = if ($Changed) { $Changed } else { @(1..$Code.Count) }
+        return Get-ReviewerChangedConstructs -Files @(@{ Path = $Path; Lines = $Code; ChangedLines = $changedLines })
+    }
+    function Get-Invocation {
+        param($Result, [int]$Index = 0)
+        $items = @(@($Result.Constructs) | Where-Object { [string]$_.kind -ceq "invocation" })
+        if ($items.Count -le $Index) { return $null }
+        return $items[$Index]
+    }
+
+    # A multi-line call whose FINAL argument is positional while earlier ones
+    # are named. This is the exact shape a real review missed.
+    $positional = Get-Constructs -Code @(
+        'public void T()', '{', '    Assert.AreEqual(', '        expected: 1,',
+        '        actual: 2,', '        "a positional message");', '}')
+    $positionalCall = Get-Invocation -Result $positional
+    Assert-Replay ($null -ne $positionalCall -and [string]$positionalCall.argumentNaming -ceq "nnp") `
+        "A trailing positional argument after named ones must be visible as 'nnp' (got '$(if ($positionalCall) { $positionalCall.argumentNaming } else { 'no call' })')."
+    Assert-Replay ($null -ne $positionalCall -and [int]$positionalCall.line -eq 3 -and [int]$positionalCall.endLine -eq 6) `
+        "A multi-line call must report the line it opens on and the line it closes on."
+
+    $allNamed = Get-Constructs -Code @(
+        'public void T()', '{', '    Assert.AreEqual(', '        expected: 1,', '        actual: 2);', '}')
+    Assert-Replay ([string](Get-Invocation -Result $allNamed).argumentNaming -ceq "nn") `
+        "A fully named multi-line call must read as all-named."
+
+    # One lambda argument. A rule about naming parameters between linefeeds has
+    # nothing to say here, and the enumeration must make that visible rather
+    # than reporting a violation shape.
+    $singleLambda = Get-Constructs -Code @(
+        'public void T()', '{', '    var x = items.SingleOrDefault(',
+        '        item => item.Id == wanted);', '}')
+    $lambdaCall = Get-Invocation -Result $singleLambda
+    Assert-Replay ($null -ne $lambdaCall -and [string]$lambdaCall.argumentNaming -ceq "p" -and [int]$lambdaCall.argumentCount -eq 1) `
+        "A single unnamed lambda argument must read as one positional argument, not as a naming violation."
+
+    # A nested call inside an argument must not be mistaken for the construct,
+    # and a comma inside it must not split the outer argument list.
+    $nested = Get-Constructs -Code @(
+        'public void T()', '{', '    Outer(',
+        '        first: Inner(a, b),', '        second: 2);', '}')
+    $nestedCall = Get-Invocation -Result $nested
+    Assert-Replay ($null -ne $nestedCall -and [string]$nestedCall.callee -ceq "Outer" -and [int]$nestedCall.argumentCount -eq 2) `
+        "A nested call must stay inside its argument: the outer call has two arguments, not three."
+
+    # Commas, parentheses and colons inside comments and strings are text.
+    $noise = Get-Constructs -Code @(
+        'public void T()', '{', '    Log(',
+        '        message: "a, b: c) (d",  // named: not really, this is a comment',
+        '        /* block, with: punctuation */ 42);', '}')
+    $noiseCall = Get-Invocation -Result $noise
+    Assert-Replay ($null -ne $noiseCall -and [int]$noiseCall.argumentCount -eq 2 -and [string]$noiseCall.argumentNaming -ceq "np") `
+        "Commas and colons inside comments and strings must not change the argument shape (got '$(if ($noiseCall) { "$($noiseCall.argumentCount)/$($noiseCall.argumentNaming)" } else { 'no call' })')."
+
+    # A generic argument list is not a comparison, and its comma is not an
+    # argument separator.
+    $generic = Get-Constructs -Code @(
+        'public void T()', '{', '    Build<Alpha, Beta>(',
+        '        left: 1,', '        right: 2);', '}')
+    $genericCall = Get-Invocation -Result $generic
+    Assert-Replay ($null -ne $genericCall -and [int]$genericCall.argumentCount -eq 2 -and [string]$genericCall.callee -ceq "Build") `
+        "A generic argument list must not be read as arguments."
+
+    # Ternaries and qualified names contain colons that are not argument names.
+    $colons = Get-Constructs -Code @(
+        'public void T()', '{', '    Pick(',
+        '        flag ? 1 : 2,', '        global::Ns.Value);', '}')
+    $colonCall = Get-Invocation -Result $colons
+    Assert-Replay ($null -ne $colonCall -and [string]$colonCall.argumentNaming -ceq "pp") `
+        "A conditional colon and a qualified-name colon must not read as argument names (got '$(if ($colonCall) { $colonCall.argumentNaming } else { 'no call' })')."
+
+    # Unterminated: report it, do not guess.
+    $malformed = Get-Constructs -Code @('public void T()', '{', '    Assert.AreEqual(', '        expected: 1,')
+    $malformedCall = Get-Invocation -Result $malformed
+    Assert-Replay ($null -ne $malformedCall -and [string]$malformedCall.status -ceq "unknown") `
+        "A call that never closes must be reported unknown rather than given an argument shape."
+    $unterminatedComment = Get-Constructs -Code @('public void T()', '{', '    /* never closed', '    Assert.AreEqual(', '        expected: 1);', '}')
+    Assert-Replay (@($unterminatedComment.PartiallyUnderstoodFiles).Count -eq 1) `
+        "A file with an unterminated comment must be reported as only partly understood."
+
+    # Declarations: the attributes on them, and the attributes on their nearest
+    # unchanged neighbours, are facts a rule can turn on.
+    $declarations = Get-Constructs -Code @(
+        'public class C', '{', '    [TestMethod]', '    [Owner("alice")]',
+        '    public void First() { }', '', '    [TestMethod]',
+        '    public void Second() { }', '}') -Changed @(7, 8)
+    $second = @(@($declarations.Constructs) | Where-Object { [string]$_.kind -ceq "declaration" })
+    Assert-Replay (@($second).Count -eq 1 -and [string]@($second)[0].callee -ceq "Second") `
+        "Only the CHANGED declaration is enumerated."
+    Assert-Replay (@(@($second)[0].attributes) -ccontains "TestMethod" -and @(@($second)[0].attributes) -cnotcontains "Owner") `
+        "A changed declaration must report exactly the attributes on it."
+    Assert-Replay (@(@($second)[0].siblingAttributes) -ccontains "Owner") `
+        "A changed declaration must report the attributes on its nearest unchanged neighbour, so precedent is a fact and not an impression."
+    $frequency = @(@($declarations.Files)[0].attributeFrequency | Where-Object { [string]$_.attribute -ceq "Owner" })
+    Assert-Replay (@($frequency).Count -eq 1 -and [int]@($frequency)[0].declarations -eq 1) `
+        "The per-file attribute count must say how much precedent there actually is."
+    $noPrecedent = Get-Constructs -Code @(
+        'public class C', '{', '    [TestMethod]', '    public void First() { }',
+        '', '    [TestMethod]', '    public void Second() { }', '}') -Changed @(6, 7)
+    Assert-Replay (@(@($noPrecedent.Files)[0].attributeFrequency | Where-Object { [string]$_.attribute -ceq "Owner" }).Count -eq 0) `
+        "A file where the attribute never appears must report no precedent for it at all."
+
+    # Dotted attribute names are reported whole: reporting
+    # System.Diagnostics.CodeAnalysis.SuppressMessage as "System" tells a reader
+    # nothing and collides with anything else in that namespace.
+    $dotted = Get-Constructs -Code @(
+        'public class C', '{', '    [System.Diagnostics.CodeAnalysis.SuppressMessage("a", "b")]',
+        '    public void First() { }', '}') -Changed @(4)
+    $dottedDeclaration = @(@($dotted.Constructs) | Where-Object { [string]$_.kind -ceq "declaration" })[0]
+    Assert-Replay (@($dottedDeclaration.attributes) -ccontains "System.Diagnostics.CodeAnalysis.SuppressMessage") `
+        "An attribute's full dotted name must be reported, not its first segment."
+
+    # Ids are a function of the change set alone, so an anchor means the same
+    # thing on every run.
+    $twice = Get-Constructs -Code @('public void T()', '{', '    A(', '        x: 1);', '    B(', '        y: 2);', '}')
+    $again = Get-Constructs -Code @('public void T()', '{', '    A(', '        x: 1);', '    B(', '        y: 2);', '}')
+    Assert-Replay ((@($twice.Constructs | ForEach-Object { $_.constructId }) -join ',') -ceq (@($again.Constructs | ForEach-Object { $_.constructId }) -join ',')) `
+        "Construct ids must be deterministic for the same change set."
+    # -- 11. The replay tool grant -------------------------------------------
     # Extracted from the reviewer's own source and evaluated here, because the
     # claim "the model has no usable tool in replay" is otherwise a comment.
-    Write-Host "10/10 replay tool grant" -ForegroundColor Cyan
+    Write-Host "11/11 replay tool grant" -ForegroundColor Cyan
     $reviewerSource = [IO.File]::ReadAllText((Join-Path $RepoRoot "src\Agents\reviewer\Start-ReviewerAgent.ps1"), $utf8)
     $reviewerTokens = $null
     $reviewerErrors = $null

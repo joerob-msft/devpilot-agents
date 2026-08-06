@@ -11,7 +11,7 @@ $script:ReviewerConventionSpecialistMaxCandidates = 8
 # with tightly bounded fields. A transported set larger than this is not
 # silently sampled - the request states the cap and the reconciliation reports
 # the remainder as unaccounted by construction.
-$script:ReviewerConventionSpecialistMaxRuleCoverage = 12
+$script:ReviewerConventionSpecialistMaxRuleCoverage = 10
 $script:ReviewerConventionSpecialistMaxCoverageAnchors = 200
 $script:ReviewerConventionSpecialistMaxInputBytes = 327680
 $script:ReviewerConventionSpecialistUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
@@ -25,6 +25,11 @@ $script:ReviewerConventionSpecialistWithheldReasons = @(
 )
 $script:ReviewerConventionSpecialistCoverageStatuses = @(
     "violation", "compliant", "notApplicable", "unknown"
+)
+# What a rule was judged against. The scope decides which constructs the row
+# must account for, so it cannot be left to prose.
+$script:ReviewerConventionSpecialistCoverageScopes = @(
+    "invocations", "declarations", "both", "none"
 )
 
 function Get-ReviewerConventionSpecialistValue {
@@ -295,27 +300,36 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
             # marker's brace-scan window - at which point there is no report at
             # all, because the whole marker falls outside the scan.
             #
-            # changedAnchors is a flat string, not an array of objects, because
-            # the marker validator does not admit an object array nested inside
-            # an object array; a nested shape would fail the marker every time.
-            # Each entry is cf<n>:<line>, where <n> indexes the changed-file
-            # list the wrapper handed the model.
+            # A row anchors on CONSTRUCT IDS, not on file and line. The wrapper
+            # enumerated every changed construct itself, so an id resolves to an
+            # exact path and line that the wrapper can check - and, more to the
+            # point, `checkedConstructs` has to name every construct in the
+            # declared scope. That is what stops "named parameters: compliant"
+            # from meaning "I looked at one call". Judging which constructs a
+            # rule applies to is still the model's job against the rule text;
+            # covering all of them is not optional.
             ruleCoverage = @{
                 Type = "objectArray"; MaxItems = $script:ReviewerConventionSpecialistMaxRuleCoverage
                 Item = @{
                     Keys = @(
-                        "ruleRef", "ruleSourceSha256", "ruleQuote",
-                        "status", "changedAnchors", "codeEvidence",
-                        "siblingStatus", "siblingEvidence", "candidateId", "notes"
+                        "ruleRef", "ruleSourceSha256", "ruleQuote", "status",
+                        "scope", "checkedConstructs", "violatingConstructs",
+                        "codeEvidence", "siblingStatus", "siblingEvidence",
+                        "candidateId", "notes"
                     )
                     Fields = @{
                         ruleRef = @{ Type = "string"; MaxLength = 6; Pattern = '^rs[0-9]{1,3}$' }
                         ruleSourceSha256 = @{ Type = "hex"; Length = 64 }
                         ruleQuote = @{ Type = "string"; MaxLength = 200; AllowEmpty = $true; Pattern = '^(|[\x20-\x7E]+)$' }
                         status = @{ Type = "enum"; Values = $script:ReviewerConventionSpecialistCoverageStatuses }
-                        changedAnchors = @{
-                            Type = "string"; MaxLength = 200; AllowEmpty = $true
-                            Pattern = '^(|cf[0-9]{1,4}:[0-9]{1,7}(,cf[0-9]{1,4}:[0-9]{1,7}){0,15})$'
+                        scope = @{ Type = "enum"; Values = $script:ReviewerConventionSpecialistCoverageScopes }
+                        checkedConstructs = @{
+                            Type = "string"; MaxLength = 400; AllowEmpty = $true
+                            Pattern = '^(|(mi|dc)[0-9]{1,3}(,(mi|dc)[0-9]{1,3})*)$'
+                        }
+                        violatingConstructs = @{
+                            Type = "string"; MaxLength = 120; AllowEmpty = $true
+                            Pattern = '^(|(mi|dc)[0-9]{1,3}(,(mi|dc)[0-9]{1,3})*)$'
                         }
                         # No ASCII pattern on the three prose fields, and lengths
                         # with real headroom rather than a cap that tracks the
@@ -597,6 +611,9 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ResolvedSources,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ChangedFileIndex,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$AcceptedCandidates,
+        # The constructs the wrapper enumerated from the change set. A row has
+        # to account for every one of them within the scope it declares.
+        [AllowEmptyCollection()][object[]]$Constructs = @(),
         # Candidate ids the wrapper already rejected. A row that links to one of
         # these is not an unreported violation - it is a reported one that did
         # not survive validation, and the withheld list already says so. Adding
@@ -607,14 +624,26 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
     $expected = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
     foreach ($entry in @($request.Requested)) { $expected.Add([string]$entry.ruleRef, $entry) }
 
-    $anchorIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    foreach ($entry in @($ChangedFileIndex)) {
-        [void]$anchorIds.Add([string](Get-ReviewerConventionSpecialistValue $entry "anchorId" ""))
+    $constructById = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $invocationIds = [System.Collections.Generic.List[string]]::new()
+    $declarationIds = [System.Collections.Generic.List[string]]::new()
+    foreach ($construct in @($Constructs)) {
+        $id = [string](Get-ReviewerConventionSpecialistValue $construct "constructId" "")
+        if (-not $id -or $constructById.ContainsKey($id)) { continue }
+        $constructById.Add($id, $construct)
+        if ([string](Get-ReviewerConventionSpecialistValue $construct "kind" "") -ceq "invocation") { [void]$invocationIds.Add($id) }
+        else { [void]$declarationIds.Add($id) }
     }
+
     $candidateIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $candidateAnchors = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
     $candidateRuleKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($candidate in @($AcceptedCandidates)) {
-        [void]$candidateIds.Add([string](Get-ReviewerConventionSpecialistValue $candidate "candidateId" ""))
+        $candidateId = [string](Get-ReviewerConventionSpecialistValue $candidate "candidateId" "")
+        [void]$candidateIds.Add($candidateId)
+        $candidateAnchors[$candidateId] = "{0}|{1}" -f `
+            (([string](Get-ReviewerConventionSpecialistValue $candidate "filePath" "")).TrimStart("/")),
+        ([int](Get-ReviewerConventionSpecialistValue $candidate "line" 0))
         [void]$candidateRuleKeys.Add(("{0}/{1}" -f `
                 [string](Get-ReviewerConventionSpecialistValue $candidate "packName" ""),
                 [string](Get-ReviewerConventionSpecialistValue $candidate "ruleSourceId" "")))
@@ -646,15 +675,45 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
             $status = "unknown"
             $degradedReason = "the row cited a rule-source hash that is not the transported one"
         }
-        $rawAnchors = [string](Get-ReviewerConventionSpecialistValue $row "changedAnchors" "")
-        if ($rawAnchors) {
-            foreach ($anchor in @($rawAnchors -split ',')) {
-                if (-not $anchorIds.Contains(($anchor -split ':')[0])) {
-                    $status = "unknown"
-                    if (-not $degradedReason) { $degradedReason = "the row named a changed-file anchor outside the change set the wrapper delivered" }
-                    break
-                }
+        $scope = [string](Get-ReviewerConventionSpecialistValue $row "scope" "none")
+        $checked = @(@(([string](Get-ReviewerConventionSpecialistValue $row "checkedConstructs" "")) -split ',') | Where-Object { $_ })
+        $violating = @(@(([string](Get-ReviewerConventionSpecialistValue $row "violatingConstructs" "")) -split ',') | Where-Object { $_ })
+
+        # The scope decides which constructs this row OWES an answer for. A row
+        # that says a rule is compliant while leaving constructs in its own
+        # declared scope unmentioned has not checked them, and saying so is the
+        # whole point of this section.
+        $required = switch ($scope) {
+            "invocations" { @($invocationIds) }
+            "declarations" { @($declarationIds) }
+            "both" { @($invocationIds) + @($declarationIds) }
+            default { @() }
+        }
+        $missingConstructs = @(@($required) | Where-Object { $checked -cnotcontains $_ })
+        $strayConstructs = @(@($checked) | Where-Object { $required -cnotcontains $_ })
+        if ($missingConstructs.Count -gt 0 -or $strayConstructs.Count -gt 0) {
+            $status = "unknown"
+            if (-not $degradedReason) {
+                $degradedReason = $(if ($missingConstructs.Count -gt 0) {
+                        "the row declared scope '$scope' but left $($missingConstructs.Count) construct(s) in that scope unaccounted"
+                    }
+                    else {
+                        "the row checked $($strayConstructs.Count) construct(s) outside the scope it declared"
+                    })
             }
+        }
+        $unknownViolating = @(@($violating) | Where-Object { -not $constructById.ContainsKey($_) -or $checked -cnotcontains $_ })
+        if ($unknownViolating.Count -gt 0) {
+            $status = "unknown"
+            if (-not $degradedReason) { $degradedReason = "the row named a violating construct it did not check, or one that does not exist" }
+        }
+        elseif ($status -ceq "violation" -and $violating.Count -eq 0) {
+            $status = "unknown"
+            if (-not $degradedReason) { $degradedReason = "the row reported a violation without naming the construct that violates" }
+        }
+        elseif ($status -cne "violation" -and $violating.Count -gt 0) {
+            $status = "unknown"
+            if (-not $degradedReason) { $degradedReason = "the row named violating constructs without reporting a violation" }
         }
         $quote = [string](Get-ReviewerConventionSpecialistValue $row "ruleQuote" "")
         if ($quote) {
@@ -678,6 +737,28 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
                     else { "the row linked a candidate that this pass did not emit" })
             }
         }
+        elseif ($linkedCandidate -and $violating.Count -gt 0) {
+            # A wrong-anchor row cannot stand in for the right one. If the
+            # linked candidate does not sit on one of the constructs this row
+            # says are violating, the row is about one place and the finding is
+            # about another, and neither has actually been accounted for.
+            $candidateAnchor = [string]$candidateAnchors[$linkedCandidate]
+            $anchorMatches = $false
+            foreach ($id in $violating) {
+                $construct = $constructById[$id]
+                $constructAnchor = "{0}|{1}" -f `
+                    (([string](Get-ReviewerConventionSpecialistValue $construct "path" "")).TrimStart("/")),
+                ([int](Get-ReviewerConventionSpecialistValue $construct "line" 0))
+                if ($constructAnchor -ceq $candidateAnchor) { $anchorMatches = $true; break }
+            }
+            if (-not $anchorMatches) {
+                $status = "unknown"
+                $linkedCandidate = ""
+                if (-not $degradedReason) {
+                    $degradedReason = "the candidate it linked is anchored somewhere other than the constructs this row calls violating"
+                }
+            }
+        }
         # A row whose rule DID produce an accepted candidate is emitted even if
         # the model forgot to write the link down. Recording it as unemitted
         # would report a finding as missing while it sits in the candidate list.
@@ -696,7 +777,9 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
                 ruleSourceSha256 = [string](Get-ReviewerConventionSpecialistValue $source "Sha256" "")
                 ruleQuote = $quote
                 status = $status
-                changedAnchors = $rawAnchors
+                scope = $scope
+                checkedConstructs = @($checked)
+                violatingConstructs = @($violating)
                 codeEvidence = [string](Get-ReviewerConventionSpecialistValue $row "codeEvidence" "")
                 siblingStatus = [string](Get-ReviewerConventionSpecialistValue $row "siblingStatus" "unavailable")
                 siblingEvidence = [string](Get-ReviewerConventionSpecialistValue $row "siblingEvidence" "")
@@ -751,7 +834,8 @@ function Resolve-ReviewerConventionSpecialistCandidates {
         [Parameter(Mandatory)]$ConventionPlan,
         [Parameter(Mandatory)]$FactPlan,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ResolvedSources,
-        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ChangeEntries
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ChangeEntries,
+        [AllowEmptyCollection()][object[]]$Constructs = @()
     )
     if (@($ResolvedSources).Count -eq 0) {
         throw "Convention specialist candidate validation requires at least one resolved convention source."
@@ -909,7 +993,7 @@ function Resolve-ReviewerConventionSpecialistCandidates {
     if ($Marker.ContainsKey("ruleCoverage")) { $coverageRows = @($Marker.ruleCoverage) }
     $coverage = Resolve-ReviewerConventionSpecialistRuleCoverage -Rows $coverageRows `
         -ResolvedSources $ResolvedSources -ChangedFileIndex $changedFileIndex `
-        -AcceptedCandidates $accepted.ToArray() `
+        -AcceptedCandidates $accepted.ToArray() -Constructs $Constructs `
         -WithheldCandidateIds @(@($withheld) | ForEach-Object {
                 [string](Get-ReviewerConventionSpecialistValue $_ "candidateId" "")
             } | Where-Object { $_ })
@@ -956,6 +1040,11 @@ function New-ReviewerConventionSpecialistInput {
         [Parameter(Mandatory)]$FactPlan,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ResolvedSources,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ChangeEntries,
+        # The constructs the wrapper enumerated from the change set. Named here
+        # rather than left to the model to find, because the accounting is
+        # reconciled against exactly this set.
+        [AllowEmptyCollection()][object[]]$Constructs = @(),
+        [AllowEmptyCollection()][object[]]$ConstructFiles = @(),
         [Parameter(Mandatory)][AllowEmptyString()][string]$ThreadDigestText,
         [AllowEmptyString()][string]$PinnedSourceText = "",
         # Non-empty only in offline replay. The prompt tells this pass to
@@ -1038,6 +1127,13 @@ function New-ReviewerConventionSpecialistInput {
             unrequestedSources = @($ruleRequest.Unrequested)
             changedFileAnchors = @($anchorIndex)
             changedFileAnchorsTruncated = $anchorsTruncated
+            # Every construct this change set touched, with the shape facts a
+            # rule might turn on: for a call, whether each argument is
+            # syntactically named; for a declaration, which attributes sit on
+            # it and which sit on its unchanged neighbours. What any of that
+            # MEANS is the transported rule's business, not the wrapper's.
+            changedConstructs = @($Constructs)
+            constructFileSummaries = @($ConstructFiles)
         }
         sanitizedExistingThreads = $ThreadDigestText
     }

@@ -474,6 +474,11 @@ if (-not (Test-Path -LiteralPath $ConventionSpecialistLibrary)) {
     throw "Convention-specialist library '$ConventionSpecialistLibrary' does not exist."
 }
 . $ConventionSpecialistLibrary
+$ChangedConstructLibrary = Join-Path $PSScriptRoot "ChangedConstructs.ps1"
+if (-not (Test-Path -LiteralPath $ChangedConstructLibrary)) {
+    throw "Changed-construct library '$ChangedConstructLibrary' does not exist."
+}
+. $ChangedConstructLibrary
 $ConventionSpecialistPromptPath = Join-Path $PSScriptRoot "convention-review.prompt.md"
 if (-not (Test-Path -LiteralPath $ConventionSpecialistPromptPath)) {
     throw "Convention-specialist prompt '$ConventionSpecialistPromptPath' does not exist."
@@ -7906,6 +7911,77 @@ function Get-ReviewerPinnedConventionChangeSet {
     }
 }
 
+function Get-ReviewerConstructFilesFromReport {
+    <#
+        Turns the source-transport report into the shape the construct
+        enumerator reads.
+
+        Only DELIVERED lines are offered. A construct enumerated over source
+        nobody read would be worse than none: the accounting would demand an
+        answer about a call the model was never shown. Sibling slices are
+        included as context but never as changed lines, so a rule can see what
+        the surrounding code already does without the change set appearing to
+        contain it.
+    #>
+    param([Parameter(Mandatory)]$Report)
+    $files = [System.Collections.Generic.List[object]]::new()
+    foreach ($file in @($Report.Files)) {
+        $slices = @($file.Slices)
+        $siblings = @($file.SiblingSlices)
+        if ($slices.Count -eq 0) { continue }
+        $maxLine = 0
+        foreach ($slice in ($slices + $siblings)) {
+            if ([int]$slice.EndLine -gt $maxLine) { $maxLine = [int]$slice.EndLine }
+        }
+        if ($maxLine -lt 1) { continue }
+        # A sparse image of the file: delivered lines in place, gaps blank. The
+        # enumerator works on line positions, so keeping the real numbering is
+        # what makes a construct's anchor mean the same thing to a human
+        # reading the pull request.
+        $lines = New-Object string[] $maxLine
+        for ($index = 0; $index -lt $maxLine; $index++) { $lines[$index] = "" }
+        $changedLines = [System.Collections.Generic.List[int]]::new()
+        foreach ($slice in ($slices + $siblings)) {
+            $sliceLines = ([string]$slice.Text) -split "`n"
+            $start = [int]$slice.StartLine
+            for ($offset = 0; $offset -lt $sliceLines.Count; $offset++) {
+                $lineNumber = $start + $offset
+                if ($lineNumber -lt 1 -or $lineNumber -gt $maxLine) { continue }
+                $lines[$lineNumber - 1] = ([string]$sliceLines[$offset]).TrimEnd("`r")
+            }
+        }
+        foreach ($slice in $slices) {
+            for ($lineNumber = [int]$slice.StartLine; $lineNumber -le [int]$slice.EndLine; $lineNumber++) {
+                [void]$changedLines.Add($lineNumber)
+            }
+        }
+        [void]$files.Add(@{
+                Path = ([string]$file.Path).TrimStart("/")
+                Lines = $lines
+                ChangedLines = $changedLines.ToArray()
+            })
+    }
+    return , $files.ToArray()
+}
+
+function Get-ReviewerConstructFilesFromReportSafely {
+    <#
+        Construct enumeration is an aid to accounting, not a gate. If it cannot
+        run, the specialist still runs with an empty construct set and the
+        accounting degrades visibly, which is a far better outcome than losing
+        the pass.
+    #>
+    param([Parameter(Mandatory)]$Report)
+    try {
+        $files = Get-ReviewerConstructFilesFromReport -Report $Report
+        return Get-ReviewerChangedConstructs -Files @($files)
+    }
+    catch {
+        Write-Warning "Changed-construct enumeration failed; the specialist will account without construct anchors: $($_.Exception.Message)"
+        return @{ Constructs = @(); Files = @(); InvocationIds = @(); DeclarationIds = @(); Truncated = $false; PartiallyUnderstoodFiles = @() }
+    }
+}
+
 function Get-ReviewerConventionSpecialistResolvedSources {
     param(
         [Parameter(Mandatory)][hashtable]$Session,
@@ -7995,7 +8071,8 @@ function Write-ReviewerConventionSpecialistPreview {
         [object[]]$Withheld = @(),
         [object[]]$ResidualRisks = @(),
         [hashtable]$RuleCoverage = $null,
-        [object[]]$ChangedFileIndex = @()
+        [object[]]$ChangedFileIndex = @(),
+        [object[]]$ChangedConstructs = @()
     )
     $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ")
     $baseName = "pr$PrId-$($SourceCommit.Substring(0, 12))-$stamp-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
@@ -8088,7 +8165,17 @@ function Write-ReviewerConventionSpecialistPreview {
             [void]$lines.Add("")
             [void]$lines.Add("- Pack: $([string](Get-ReviewerConventionSpecialistValue $row 'packName' ''))")
             [void]$lines.Add("- Rule quote: $([string](Get-ReviewerConventionSpecialistValue $row 'ruleQuote' '(none)'))")
-            [void]$lines.Add("- Changed anchors: $([string](Get-ReviewerConventionSpecialistValue $row 'changedAnchors' '(none)'))")
+            [void]$lines.Add("- Scope: $([string](Get-ReviewerConventionSpecialistValue $row 'scope' '(none)'))")
+            $checkedIds = @(Get-ReviewerConventionSpecialistValue $row 'checkedConstructs' @())
+            [void]$lines.Add("- Constructs checked ($($checkedIds.Count)): $(if ($checkedIds.Count) { $checkedIds -join ', ' } else { '(none)' })")
+            $violatingIds = @(Get-ReviewerConventionSpecialistValue $row 'violatingConstructs' @())
+            if ($violatingIds.Count -gt 0) {
+                [void]$lines.Add("- Constructs violating: $(@($violatingIds | ForEach-Object {
+                    $id = [string]$_
+                    $construct = @(@($ChangedConstructs) | Where-Object { [string]$_.constructId -ceq $id })
+                    if ($construct.Count -gt 0) { "$id ($([string]$construct[0].path):$([int]$construct[0].line))" } else { $id }
+                }) -join ', ')")
+            }
             [void]$lines.Add("- Code evidence: $([string](Get-ReviewerConventionSpecialistValue $row 'codeEvidence' ''))")
             [void]$lines.Add("- Sibling: $([string](Get-ReviewerConventionSpecialistValue $row 'siblingStatus' '')) - $([string](Get-ReviewerConventionSpecialistValue $row 'siblingEvidence' ''))")
             $linked = [string](Get-ReviewerConventionSpecialistValue $row 'candidateId' '')
@@ -8260,6 +8347,8 @@ function Invoke-ReviewerConventionSpecialistPass {
                 -ScriptSha256 $ScriptSelfSha256 -PromptSha256 $ConventionSpecialistPromptSha256 `
                 -ConventionPlan $conventionPlan -FactPlan $factPlan `
                 -ResolvedSources @($sessionData.Sources) -ChangeEntries @($sessionData.Changes) `
+                -Constructs @(Get-ReviewerHashValue -Container $Bound -Key 'ChangedConstructs' -Default @()) `
+                -ConstructFiles @(Get-ReviewerHashValue -Container $Bound -Key 'ConstructFiles' -Default @()) `
                 -ThreadDigestText $ThreadDigestText -PinnedSourceText $PinnedSourceText `
                 -ReplayNotice $(if ($script:ReviewerReplayActive) { $script:ReviewerReplayModelNotice } else { "" })
             $contextBytes = [int]$specialistInput.Bytes
@@ -8339,7 +8428,8 @@ function Invoke-ReviewerConventionSpecialistPass {
             }
             $validated = Resolve-ReviewerConventionSpecialistCandidates -Marker $marker `
                 -ConventionPlan $conventionPlan -FactPlan $factPlan `
-                -ResolvedSources @($sessionData.Sources) -ChangeEntries @($sessionData.Changes)
+                -ResolvedSources @($sessionData.Sources) -ChangeEntries @($sessionData.Changes) `
+                -Constructs @(Get-ReviewerHashValue -Container $Bound -Key 'ChangedConstructs' -Default @())
             $candidates = @($validated.Candidates)
             $withheld = @($validated.Withheld)
             $residualRisks = @($validated.ResidualRisks)
@@ -8394,7 +8484,8 @@ function Invoke-ReviewerConventionSpecialistPass {
             -ConventionPlanSha256 $conventionPlanSha256 -FactPlanSha256 $factPlanSha256 `
             -PackNames $packNames -ContextBytes $contextBytes -ToolAudit $toolAudit `
             -Candidates $candidates -Withheld $withheld -ResidualRisks $residualRisks `
-            -RuleCoverage $ruleCoverage -ChangedFileIndex $changedFileIndex
+            -RuleCoverage $ruleCoverage -ChangedFileIndex $changedFileIndex `
+            -ChangedConstructs @(Get-ReviewerHashValue -Container $Bound -Key 'ChangedConstructs' -Default @())
         Write-ReviewerCycleMetadata -Fields @{
             cycle = $CycleNumber; mode = "convention-specialist"; result = $status; prId = $PrId
             sourceCommit = $SourceCommit; model = $EffectiveConventionSpecialistModel
@@ -12398,10 +12489,15 @@ function Invoke-ReviewerCycle {
             # than no review, because it publishes an "approve" nobody earned.
             $pinnedSourceText = ""
             $sourceCoverageRecord = $null
+            $changedConstructs = @()
+            $constructFileSummaries = @()
             try {
                 $sourceTransport = Get-ReviewerSourceTransport -Session $session -PrId $prId -SourceCommit $sourceCommit
                 $pinnedSourceText = [string]$sourceTransport.BlockText
                 $sourceCoverageRecord = $sourceTransport.Record
+                $constructResult = Get-ReviewerConstructFilesFromReportSafely -Report $sourceTransport.Report
+                $changedConstructs = @($constructResult.Constructs)
+                $constructFileSummaries = @($constructResult.Files)
                 Write-Host ("  PR {0} pinned source: {1}/{2} changed file(s) that could carry source text covered ({3}%), {4} path(s) the pull request itself calls source-free, {5} changed-source byte(s) + {6} sibling byte(s)." -f `
                         $prId, $sourceTransport.Report.CoveredFiles, $sourceTransport.Report.SourceBearingFileCount,
                         $sourceTransport.Report.CoveragePercent, $sourceTransport.Report.NoSourceFileCount,
@@ -12628,6 +12724,13 @@ function Invoke-ReviewerCycle {
                     ChangedPaths         = $changedPaths
                     PinnedSourceText     = $pinnedSourceText
                     SourceCoverage       = $sourceCoverageRecord
+                    # The constructs the change set touched, enumerated from the
+                    # slices that were actually delivered. Carried on the bound
+                    # record so the specialist reconciles its accounting against
+                    # exactly the source the wrapper read, never against a file
+                    # nobody opened.
+                    ChangedConstructs    = $changedConstructs
+                    ConstructFiles       = $constructFileSummaries
                     ConventionPlanPath   = $conventionPlanPath
                     FactPlanPath         = $factPlanPath
                     ExistingFingerprints = (Get-ReviewerExistingFingerprints -Threads $threads)
