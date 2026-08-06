@@ -8491,6 +8491,8 @@ function Write-ReviewerConventionSpecialistPreview {
                     unaccountedCandidates = @($RuleCoverage.UnaccountedCandidates)
                     rows = @($RuleCoverage.Rows)
                     changedFileAnchors = @($ChangedFileIndex)
+                    constructsIncomplete = [bool]$RuleCoverage.ConstructsIncomplete
+                    changedConstructs = @($RuleCoverage.Constructs)
                 }
             })
         withheld = @($Withheld)

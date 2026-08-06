@@ -488,8 +488,11 @@ try {
         (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "violation" -Violating "mi0" -Candidate "reassigns-field"),
         (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
     ) -Accepted $accepted
-    Assert-Replay (-not [bool]$partial.Complete -and [bool]$partial.ConstructsIncomplete) `
+    Assert-Replay ([bool]$partial.Complete -eq $false -and [bool]$partial.ConstructsIncomplete) `
         "An accounting over a construct set the wrapper could not finish enumerating is not complete."
+    Assert-Replay (@($partial.Constructs).Count -eq @($constructs).Count -and
+        [string]@($partial.Constructs)[0].constructId -ceq "mi0") `
+        "The accounting must carry the construct table it was reconciled against, so a reader can check a row without re-running the enumeration."
 
     $index = Get-ReviewerConventionSpecialistChangedFileIndex -ChangeEntries @(        [pscustomobject][ordered]@{ Path = "src/z.cs"; Role = "current" },
         [pscustomobject][ordered]@{ Path = "src/a.cs"; Role = "current" },

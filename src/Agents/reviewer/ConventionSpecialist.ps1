@@ -920,6 +920,21 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         UnaccountedCandidates = @($unaccountedCandidates)
         UnemittedViolations = @($unemitted.ToArray())
         ConstructsIncomplete = $ConstructsIncomplete
+        # The construct table the rows were reconciled against, compactly. A
+        # reader who wants to check a row - "which call is mi25?" - otherwise
+        # has to re-run the enumeration and hope it matches. An accounting
+        # nobody can audit is a claim, not evidence.
+        Constructs = @(@($Constructs) | ForEach-Object {
+                [pscustomobject][ordered]@{
+                    constructId = [string](Get-ReviewerConventionSpecialistValue $_ "constructId" "")
+                    kind = [string](Get-ReviewerConventionSpecialistValue $_ "kind" "")
+                    path = [string](Get-ReviewerConventionSpecialistValue $_ "path" "")
+                    line = [int](Get-ReviewerConventionSpecialistValue $_ "line" 0)
+                    endLine = [int](Get-ReviewerConventionSpecialistValue $_ "endLine" 0)
+                    name = [string](Get-ReviewerConventionSpecialistValue $_ "name" "")
+                    argumentNaming = [string](Get-ReviewerConventionSpecialistValue $_ "argumentNaming" "")
+                }
+            })
         # A row that the wrapper had to degrade is not a check that happened.
         # Leaving it out of this would let a marker whose every row cited a
         # fabricated hash still print "Complete: True", which is the one line a
