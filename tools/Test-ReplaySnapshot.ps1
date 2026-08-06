@@ -293,11 +293,13 @@ try {
     function New-CoverageRow {
         param(
             [string]$Ref, [string]$Sha, [string]$Status, [string]$Scope = "invocation",
-            [string]$Checked = "mi0,mi1", [string]$Violating = "", [string]$Candidate = "", [string]$Quote = ""
+            [string]$Checked = "mi0,mi1", [string]$Violating = "", [string]$Candidate = "", [string]$Quote = "",
+            [string]$NotInReach = ""
         )
         return [pscustomobject][ordered]@{
             ruleRef = $Ref; ruleSourceSha256 = $Sha; ruleQuote = $Quote; status = $Status
-            scope = $Scope; checkedConstructs = $Checked; violatingConstructs = $Violating
+            scope = $Scope; checkedConstructs = $Checked; notInReachConstructs = $NotInReach
+            violatingConstructs = $Violating
             codeEvidence = "evidence"; siblingStatus = "checked"; siblingEvidence = "sibling"
             candidateId = $Candidate; notes = "note"
         }
@@ -436,6 +438,58 @@ try {
 
     # `none` is the shape a row takes when the model wants out of the checklist
     # without saying so. It has to cost something.
+    # Narrowing is a real judgement - a production method is not a test method -
+    # and it needs somewhere to be written down. What is not allowed is silence.
+    $narrowed = Invoke-Coverage -WithConstructs @(
+        [pscustomobject][ordered]@{ constructId = "dc0"; kind = "declaration"; path = "src/a.cs"; line = 5; endLine = 5 }
+        [pscustomobject][ordered]@{ constructId = "dc1"; kind = "declaration"; path = "src/a.cs"; line = 20; endLine = 20 }
+        [pscustomobject][ordered]@{ constructId = "dc2"; kind = "declaration"; path = "src/a.cs"; line = 40; endLine = 40 }
+    ) -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope "declaration" -Checked "dc1,dc2" -NotInReach "dc0"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope "declaration" -Checked "dc0-dc2")
+    )
+    Assert-Replay ([string]@($narrowed.Rows)[0].status -ceq "compliant" -and [bool]$narrowed.Complete) `
+        "A row may put a construct out of the rule's reach and still be complete, as long as it says which."
+    Assert-Replay ((@(@($narrowed.Rows)[0].notInReachConstructs) -join ",") -ceq "dc0") `
+        "The out-of-reach set must be recorded, so a reader can see what the row decided not to weigh."
+
+    $silent = Invoke-Coverage -WithConstructs @(
+        [pscustomobject][ordered]@{ constructId = "dc0"; kind = "declaration"; path = "src/a.cs"; line = 5; endLine = 5 }
+        [pscustomobject][ordered]@{ constructId = "dc1"; kind = "declaration"; path = "src/a.cs"; line = 20; endLine = 20 }
+    ) -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope "declaration" -Checked "dc1"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope "declaration" -Checked "dc0,dc1")
+    )
+    Assert-Replay ([string]@($silent.Rows)[0].status -ceq "unknown" -and
+        ([string]@($silent.Rows)[0].degradedReason).Contains("dc0")) `
+        "Leaving a construct out of BOTH lists must still degrade, and the reason must name it."
+
+    $bothWays = Invoke-Coverage -WithConstructs @(
+        [pscustomobject][ordered]@{ constructId = "dc0"; kind = "declaration"; path = "src/a.cs"; line = 5; endLine = 5 }
+    ) -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope "declaration" -Checked "dc0" -NotInReach "dc0"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope "declaration" -Checked "dc0")
+    )
+    Assert-Replay ([string]@($bothWays.Rows)[0].status -ceq "unknown") `
+        "A construct cannot be both weighed against the rule and outside its reach."
+
+    $allOutOfReach = Invoke-Coverage -WithConstructs @(
+        [pscustomobject][ordered]@{ constructId = "dc0"; kind = "declaration"; path = "src/a.cs"; line = 5; endLine = 5 }
+    ) -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope "declaration" -Checked "" -NotInReach "dc0"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope "declaration" -Checked "dc0")
+    )
+    Assert-Replay ([string]@($allOutOfReach.Rows)[0].status -ceq "unknown") `
+        "Putting every construct out of reach and calling the rule compliant is an answer about nothing."
+    $allOutOfReachOk = Invoke-Coverage -WithConstructs @(
+        [pscustomobject][ordered]@{ constructId = "dc0"; kind = "declaration"; path = "src/a.cs"; line = 5; endLine = 5 }
+    ) -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "notApplicable" -Scope "declaration" -Checked "" -NotInReach "dc0"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope "declaration" -Checked "dc0")
+    )
+    Assert-Replay ([string]@($allOutOfReachOk.Rows)[0].status -ceq "notApplicable" -and [bool]$allOutOfReachOk.Complete) `
+        "A rule that reaches nothing in a scope it declared may say exactly that."
+
     $vacuous = Invoke-Coverage -Rows @(
         (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope "none" -Checked ""),
         (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
@@ -536,7 +590,7 @@ try {
         -AcceptedCandidates @() -Rows @(@($wideRequest.Requested) | ForEach-Object {
             [pscustomobject][ordered]@{
                 ruleRef = [string]$_.ruleRef; ruleSourceSha256 = ("c" * 64); ruleQuote = ""
-                status = "notApplicable"; scope = "none"; checkedConstructs = ""; violatingConstructs = ""
+                status = "notApplicable"; scope = "none"; checkedConstructs = ""; notInReachConstructs = ""; violatingConstructs = ""
                 codeEvidence = ""; siblingStatus = "notRequired"; siblingEvidence = ""
                 candidateId = ""; notes = ""
             }

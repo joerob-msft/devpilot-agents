@@ -98,15 +98,19 @@ not a candidate. Do not invent a resolution.
     For each row set `scope` to a comma-separated list of the construct KINDS
     the rule governs - for example `invocation`, or `declaration,comment`, or
     `none` - and then:
-    - `checkedConstructs` must account for EVERY construct id of those kinds.
-      Not a sample, and not only the ones the rule turns out to reach: a
-      construct you looked at and judged out of the rule's reach is still
-      checked, and `notes` is where you say so. `ruleCoverageRequest.
-      constructIdsByKind` gives you the exact string per kind, already
-      range-compressed - copy it. Ranges are inclusive and stay within one
-      kind: `mi0-mi37,dc0-dc18`. The wrapper compares your list against its own
+    - `checkedConstructs` and `notInReachConstructs` together must account for
+      EVERY construct id of those kinds - not a sample. A construct you
+      examined and judged the rule does not reach goes in
+      `notInReachConstructs`; everything you actually weighed against the rule
+      goes in `checkedConstructs`. No construct may appear in both, and
+      silence about one is what this section exists to catch.
+      `ruleCoverageRequest.constructIdsByKind` gives you the exact string per
+      kind, already range-compressed. Ranges are inclusive and stay within one
+      kind: `mi0-mi37,dc0-dc18`. The wrapper compares the union against its own
       enumeration and degrades the row to `unknown` if anything is missing,
       naming exactly what you left out.
+    - Putting every construct out of reach is the same as checking none of
+      them: that row can only be `notApplicable` or `unknown`.
     - `violatingConstructs` lists exactly those you judged to break the rule.
       Every id must also appear in `checkedConstructs`.
     - `status` is `violation` when `violatingConstructs` is non-empty and never
@@ -189,12 +193,12 @@ must be exactly one of `sourceConflict`, `outsideChangedFile`, `invalidAnchor`,
 Each `ruleCoverage` row has exactly `ruleRef`, `ruleSourceSha256`, `ruleQuote`
 (or empty), `status` (`violation|compliant|notApplicable|unknown`), `scope`
 (comma-separated construct kinds from `invocation|declaration|comment|
-assignment`, or `none`), `checkedConstructs` (comma-separated construct ids and
-inclusive same-kind ranges, or empty), `violatingConstructs` (comma-separated
-construct ids, or empty), `codeEvidence`, `siblingStatus`
-(`checked|notRequired|unavailable`), `siblingEvidence`, `candidateId` (or
-empty), and `notes`. Send one row per entry in
-`ruleCoverageRequest.requiredRows`, in that order.
+assignment`, or `none`), `checkedConstructs` and `notInReachConstructs`
+(comma-separated construct ids and inclusive same-kind ranges, or empty),
+`violatingConstructs` (comma-separated construct ids, or empty),
+`codeEvidence`, `siblingStatus` (`checked|notRequired|unavailable`),
+`siblingEvidence`, `candidateId` (or empty), and `notes`. Send one row per
+entry in `ruleCoverageRequest.requiredRows`, in that order.
 
 **These rows are a checklist, not an essay, and the whole marker is rejected if
 any field runs over.** Keep `ruleQuote` under 200 characters, and keep it plain

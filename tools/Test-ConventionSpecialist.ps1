@@ -236,6 +236,7 @@ $coverageRow = [pscustomobject][ordered]@{
     status = "violation"
     scope = "invocation"
     checkedConstructs = "mi0"
+    notInReachConstructs = ""
     violatingConstructs = "mi0"
     codeEvidence = "The changed build registration omits the required manifest."
     siblingStatus = "checked"
