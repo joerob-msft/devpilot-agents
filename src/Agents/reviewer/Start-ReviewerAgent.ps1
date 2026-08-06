@@ -8225,15 +8225,27 @@ function Write-ReviewerConventionSpecialistPreview {
             [void]$lines.Add("- Pack: $([string](Get-ReviewerConventionSpecialistValue $row 'packName' ''))")
             [void]$lines.Add("- Rule quote: $([string](Get-ReviewerConventionSpecialistValue $row 'ruleQuote' '(none)'))")
             [void]$lines.Add("- Scope: $([string](Get-ReviewerConventionSpecialistValue $row 'scope' '(none)'))")
-            $checkedIds = @(Get-ReviewerConventionSpecialistValue $row 'checkedConstructs' @())
-            [void]$lines.Add("- Constructs checked ($($checkedIds.Count)): $(if ($checkedIds.Count) { $checkedIds -join ', ' } else { '(none)' })")
+            # The whole partition, not a collapsed "checked" count. What a
+            # reader needs from a row is which anchors it convicted, which it
+            # cleared, which it ruled out of reach and which it could not
+            # decide - "checked 3" hides all four of those.
             $violatingIds = @(Get-ReviewerConventionSpecialistValue $row 'violatingConstructs' @())
-            if ($violatingIds.Count -gt 0) {
-                [void]$lines.Add("- Constructs violating: $(@($violatingIds | ForEach-Object {
-                    $id = [string]$_
-                    $construct = @(@($ChangedConstructs) | Where-Object { [string]$_.constructId -ceq $id })
-                    if ($construct.Count -gt 0) { "$id ($([string]$construct[0].path):$([int]$construct[0].line))" } else { $id }
-                }) -join ', ')")
+            foreach ($verdict in @(
+                    @{ Label = "violating"; Ids = $violatingIds; Locate = $true },
+                    @{ Label = "compliant"; Ids = @(Get-ReviewerConventionSpecialistValue $row 'compliantConstructs' @()); Locate = $false },
+                    @{ Label = "out of the rule's reach"; Ids = @(Get-ReviewerConventionSpecialistValue $row 'notInReachConstructs' @()); Locate = $false },
+                    @{ Label = "undecided"; Ids = @(Get-ReviewerConventionSpecialistValue $row 'unknownConstructs' @()); Locate = $true })) {
+                $ids = @($verdict.Ids)
+                if ($ids.Count -eq 0) { continue }
+                $rendered = $(if ([bool]$verdict.Locate) {
+                        @($ids | ForEach-Object {
+                                $id = [string]$_
+                                $construct = @(@($ChangedConstructs) | Where-Object { [string]$_.constructId -ceq $id })
+                                if ($construct.Count -gt 0) { "$id ($([string]$construct[0].path):$([int]$construct[0].line))" } else { $id }
+                            }) -join ', '
+                    }
+                    else { $ids -join ', ' })
+                [void]$lines.Add("- Anchors $($verdict.Label) ($($ids.Count)): $rendered")
             }
             [void]$lines.Add("- Code evidence: $([string](Get-ReviewerConventionSpecialistValue $row 'codeEvidence' ''))")
             [void]$lines.Add("- Sibling: $([string](Get-ReviewerConventionSpecialistValue $row 'siblingStatus' '')) - $([string](Get-ReviewerConventionSpecialistValue $row 'siblingEvidence' ''))")
@@ -8241,7 +8253,7 @@ function Write-ReviewerConventionSpecialistPreview {
             [void]$lines.Add("- Candidate: $(if ($linked) { $linked } else { 'none' })")
             [void]$lines.Add("- Notes: $([string](Get-ReviewerConventionSpecialistValue $row 'notes' ''))")
             $degraded = [string](Get-ReviewerConventionSpecialistValue $row 'degradedReason' '')
-            if ($degraded) { [void]$lines.Add("- Wrapper degraded this row to unknown because $degraded.") }
+            if ($degraded) { [void]$lines.Add("- Wrapper note: $degraded.") }
             [void]$lines.Add("")
         }
     }

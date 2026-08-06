@@ -294,12 +294,22 @@ try {
         param(
             [string]$Ref, [string]$Sha, [string]$Status, [string]$Scope = "invocation",
             [string]$Checked = "mi0,mi1", [string]$Violating = "", [string]$Candidate = "", [string]$Quote = "",
-            [string]$NotInReach = ""
+            [string]$NotInReach = "", [string]$Unknown = ""
         )
+        # `Checked` here means "weighed against the rule", which the partition
+        # splits into violating and compliant. Whatever the test names as
+        # violating is removed from the compliant list so the four stay
+        # disjoint, exactly as a real row must.
+        $violatingIds = @(@($Violating -split ',') | Where-Object { $_ })
+        $unknownIds = @(@($Unknown -split ',') | Where-Object { $_ })
+        $compliantIds = @(@($Checked -split ',') | Where-Object {
+                $_ -and $violatingIds -cnotcontains $_ -and $unknownIds -cnotcontains $_
+            })
         return [pscustomobject][ordered]@{
             ruleRef = $Ref; ruleSourceSha256 = $Sha; ruleQuote = $Quote; status = $Status
-            scope = $Scope; checkedConstructs = $Checked; notInReachConstructs = $NotInReach
-            violatingConstructs = $Violating
+            scope = $Scope; violatingConstructs = $Violating
+            compliantConstructs = ($compliantIds -join ',')
+            notInReachConstructs = $NotInReach; unknownConstructs = $Unknown
             codeEvidence = "evidence"; siblingStatus = "checked"; siblingEvidence = "sibling"
             candidateId = $Candidate; notes = "note"
         }
@@ -352,8 +362,8 @@ try {
         (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
     )
     Assert-Replay ([string]@($partialScope.Rows)[0].status -ceq "unknown" -and
-        [string]@($partialScope.Rows)[0].degradedReason -match "unaccounted") `
-        "A row that checks only some of the constructs in its scope must degrade to unknown."
+        [string]@($partialScope.Rows)[0].degradedReason -match "no verdict") `
+        "A row that gives a verdict for only some of the anchors in its scope must degrade to unknown."
     Assert-Replay (-not [bool]$partialScope.Complete) "A partly-checked scope must not read as complete."
 
     $strayScope = Invoke-Coverage -Rows @(
@@ -377,19 +387,25 @@ try {
     Assert-Replay ([string]@($ghostConstruct.Rows)[0].status -ceq "unknown") `
         "A violating construct that does not exist must degrade the row."
 
+    # The asserted status no longer decides anything: the anchors do. A row that
+    # says "violation" over a partition with nothing violating is reporting a
+    # finding it did not anchor, and the wrapper reads the anchors instead - and
+    # says that it had to.
     $unnamedViolation = Invoke-Coverage -Rows @(
         (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "violation"),
         (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
     )
-    Assert-Replay ([string]@($unnamedViolation.Rows)[0].status -ceq "unknown") `
-        "A violation that names no violating construct must degrade the row."
+    Assert-Replay ([string]@($unnamedViolation.Rows)[0].status -ceq "compliant" -and
+        [string]@($unnamedViolation.Rows)[0].degradedReason -match "anchors decide") `
+        "A row claiming a violation it anchored nowhere must take the status its own anchors give, and the disagreement must be recorded."
 
     $violatingWithoutViolation = Invoke-Coverage -Rows @(
         (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Violating "mi0"),
         (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
     )
-    Assert-Replay ([string]@($violatingWithoutViolation.Rows)[0].status -ceq "unknown") `
-        "Naming violating constructs while reporting no violation must degrade the row."
+    Assert-Replay ([string]@($violatingWithoutViolation.Rows)[0].status -ceq "violation" -and
+        [string]@($violatingWithoutViolation.Rows)[0].degradedReason -match "anchors decide") `
+        "A row calling an anchor violating while reporting itself compliant must become a violation: the anchors decide."
 
     # A wrong-anchor row cannot stand in for the right one.
     $wrongAnchor = Invoke-Coverage -Accepted $accepted -Rows @(
@@ -578,6 +594,70 @@ try {
         [string]@($partial.Constructs)[0].constructId -ceq "mi0") `
         "The accounting must carry the construct table it was reconciled against, so a reader can check a row without re-running the enumeration."
 
+    # The partition is the mechanism. These are its edges.
+    $threeAnchors = @(
+        [pscustomobject][ordered]@{ constructId = "mi0"; kind = "invocation"; path = "src/a.cs"; line = 5; endLine = 8 }
+        [pscustomobject][ordered]@{ constructId = "mi1"; kind = "invocation"; path = "src/a.cs"; line = 20; endLine = 24 }
+        [pscustomobject][ordered]@{ constructId = "mi2"; kind = "invocation"; path = "src/a.cs"; line = 40; endLine = 44 }
+    )
+    function New-PartitionRow {
+        param([string]$Ref, [string]$Sha, [string]$Status, [string]$Scope = "invocation",
+            [string]$Violating = "", [string]$Compliant = "", [string]$NotInReach = "", [string]$Unknown = "",
+            [string]$Candidate = "")
+        return [pscustomobject][ordered]@{
+            ruleRef = $Ref; ruleSourceSha256 = $Sha; ruleQuote = ""; status = $Status
+            scope = $Scope; violatingConstructs = $Violating; compliantConstructs = $Compliant
+            notInReachConstructs = $NotInReach; unknownConstructs = $Unknown
+            codeEvidence = "evidence"; siblingStatus = "checked"; siblingEvidence = "sibling"
+            candidateId = $Candidate; notes = "note"
+        }
+    }
+    $filler = (New-PartitionRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Compliant "mi0-mi2")
+
+    # One anchor left out of all four lists.
+    $silentAnchor = Invoke-Coverage -WithConstructs $threeAnchors -Rows @(
+        (New-PartitionRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Compliant "mi0,mi1"), $filler)
+    Assert-Replay ([string]@($silentAnchor.Rows)[0].status -ceq "unknown" -and
+        [string]@($silentAnchor.Rows)[0].degradedReason -match "mi2") `
+        "An anchor with no verdict at all must degrade the row and be named."
+
+    # One anchor in two lists.
+    $twoVerdicts = Invoke-Coverage -WithConstructs $threeAnchors -Rows @(
+        (New-PartitionRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Compliant "mi0-mi2" -NotInReach "mi1"), $filler)
+    Assert-Replay ([string]@($twoVerdicts.Rows)[0].status -ceq "unknown" -and
+        [string]@($twoVerdicts.Rows)[0].degradedReason -match "more than one verdict") `
+        "An anchor given two verdicts must degrade the row."
+
+    # A verdict on something that is not an anchor.
+    $ghostVerdict = Invoke-Coverage -WithConstructs $threeAnchors -Rows @(
+        (New-PartitionRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Compliant "mi0-mi2" -Unknown "mi9"), $filler)
+    Assert-Replay ([string]@($ghostVerdict.Rows)[0].status -ceq "unknown") `
+        "A verdict on an anchor the wrapper never enumerated must degrade the row."
+
+    # The derived status, in each direction.
+    $derivedViolation = Invoke-Coverage -WithConstructs $threeAnchors -Rows @(
+        (New-PartitionRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Violating "mi1" -Compliant "mi0,mi2"), $filler)
+    Assert-Replay ([string]@($derivedViolation.Rows)[0].status -ceq "violation") `
+        "One violating anchor makes the row a violation whatever the row called itself."
+    $derivedUnknown = Invoke-Coverage -WithConstructs $threeAnchors -Rows @(
+        (New-PartitionRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Violating "mi1" -Compliant "mi0" -Unknown "mi2"), $filler)
+    Assert-Replay ([string]@($derivedUnknown.Rows)[0].status -ceq "unknown") `
+        "An anchor the row could not decide about outranks a violation: the row does not yet know its own answer."
+    $derivedNotApplicable = Invoke-Coverage -WithConstructs $threeAnchors -Rows @(
+        (New-PartitionRow -Ref "rs0" -Sha ("a" * 64) -Status "notApplicable" -NotInReach "mi0-mi2"), $filler)
+    Assert-Replay ([string]@($derivedNotApplicable.Rows)[0].status -ceq "notApplicable" -and [bool]$derivedNotApplicable.Complete) `
+        "A rule that reaches none of its anchors may say so and still be complete."
+    $derivedCompliant = Invoke-Coverage -WithConstructs $threeAnchors -Rows @(
+        (New-PartitionRow -Ref "rs0" -Sha ("a" * 64) -Status "unknown" -Compliant "mi0-mi2"), $filler)
+    Assert-Replay ([string]@($derivedCompliant.Rows)[0].status -ceq "compliant") `
+        "A row that weighed every anchor and found none violating is compliant, whatever it called itself."
+
+    # Narrowing is allowed; narrowing to nothing is not.
+    $narrowedPartition = Invoke-Coverage -WithConstructs $threeAnchors -Rows @(
+        (New-PartitionRow -Ref "rs0" -Sha ("a" * 64) -Status "violation" -Violating "mi2" -NotInReach "mi0,mi1" -Candidate "x"), $filler)
+    Assert-Replay ([string]@($narrowedPartition.Rows)[0].status -ceq "violation") `
+        "A row may rule most anchors out of reach and still convict the one the rule does reach."
+
     $index = Get-ReviewerConventionSpecialistChangedFileIndex -ChangeEntries @(        [pscustomobject][ordered]@{ Path = "src/z.cs"; Role = "current" },
         [pscustomobject][ordered]@{ Path = "src/a.cs"; Role = "current" },
         [pscustomobject][ordered]@{ Path = "src/gone.cs"; Role = "original" }
@@ -620,7 +700,7 @@ try {
         -AcceptedCandidates @() -Rows @(@($wideRequest.Requested) | ForEach-Object {
             [pscustomobject][ordered]@{
                 ruleRef = [string]$_.ruleRef; ruleSourceSha256 = ("c" * 64); ruleQuote = ""
-                status = "notApplicable"; scope = "none"; checkedConstructs = ""; notInReachConstructs = ""; violatingConstructs = ""
+                status = "notApplicable"; scope = "none"; violatingConstructs = ""; compliantConstructs = ""; notInReachConstructs = ""; unknownConstructs = ""
                 codeEvidence = ""; siblingStatus = "notRequired"; siblingEvidence = ""
                 candidateId = ""; notes = ""
             }
@@ -641,10 +721,13 @@ try {
         $kindIds = [string[]]@(0..($script:ReviewerConstructMaxTotal - 1) | ForEach-Object { "$prefix$_" })
         $widestIdList += (Get-ReviewerConstructIdRanges -Ids $kindIds).Length + 1
     }
-    Assert-Replay ($widestIdList -le [int]$coverageSpec.Item.Fields["checkedConstructs"].MaxLength) `
-        "The checked-construct field ($([int]$coverageSpec.Item.Fields['checkedConstructs'].MaxLength) chars) must hold every id the enumerator can produce ($widestIdList chars)."
-    Assert-Replay ($widestIdList -le [int]$coverageSpec.Item.Fields["violatingConstructs"].MaxLength) `
-        "The violating-construct field must hold every id the enumerator can produce."
+    # Every one of the four verdict lists has to be able to hold the whole
+    # enumerated set: a rule may legitimately find every anchor compliant, or
+    # every anchor out of its reach.
+    foreach ($verdict in @("violatingConstructs", "compliantConstructs", "notInReachConstructs", "unknownConstructs")) {
+        Assert-Replay ($widestIdList -le [int]$coverageSpec.Item.Fields[$verdict].MaxLength) `
+            "The '$verdict' field ($([int]$coverageSpec.Item.Fields[$verdict].MaxLength) chars) must hold every id the enumerator can produce ($widestIdList chars)."
+    }
     $roundTrip = Expand-ReviewerConventionSpecialistConstructIds -Text (Get-ReviewerConstructIdRanges -Ids ([string[]]@("mi0", "mi1", "mi2", "mi7")))
     Assert-Replay ([bool]$roundTrip.Ok -and (@($roundTrip.Ids) -join ",") -ceq "mi0,mi1,mi2,mi7") `
         "A range-compressed id list must expand back to exactly the ids it came from."
@@ -698,7 +781,7 @@ try {
             "Shortening must never cut a surrogate pair in half: the result has to survive being written as strict UTF-8."
     }
     # Truncation is opt-in, and comment text never opts in.
-    foreach ($strict in @("ruleQuote", "checkedConstructs", "violatingConstructs")) {
+    foreach ($strict in @("ruleQuote", "violatingConstructs", "compliantConstructs", "notInReachConstructs", "unknownConstructs")) {
         $spec = $coverageSpec.Item.Fields[$strict]
         Assert-Replay (-not ($spec.ContainsKey("Truncate") -and [bool]$spec.Truncate)) `
             "Rule-coverage field '$strict' must never be silently shortened: the wrapper checks it against something exact."
@@ -974,6 +1057,56 @@ try {
     $gapSummary = @($gapped.Files)[0]
     Assert-Replay (@($gapSummary.attributeFrequency | Where-Object { [string]$_.attribute -ceq "Owner" }).Count -eq 0) `
         "The per-file attribute count must count only what the transport delivered."
+
+    # The lexical cases a rule about argument naming turns on, each with the
+    # answer stated rather than implied. Synthetic code only.
+    $lexCases = @(
+        @{ Name = "named then positional message"; Naming = "nnp"; Args = 3; Code = @(
+                'public void T()', '{', '    Assert.AreEqual(', '        expected: a,', '        actual: b,',
+                '        "a message");', '}') }
+        @{ Name = "every argument named"; Naming = "nnn"; Args = 3; Code = @(
+                'public void T()', '{', '    Assert.AreEqual(', '        expected: a,', '        actual: b,',
+                '        message: "a message");', '}') }
+        @{ Name = "single positional lambda"; Naming = "p"; Args = 1; Code = @(
+                'public void T()', '{', '    Assert.ThrowsException<Exception>(', '        () => Run(x));', '}') }
+        @{ Name = "a named lambda whose body contains a comma"; Naming = "nn"; Args = 2; Code = @(
+                'public void T()', '{', '    Register(', '        name: "x",', '        factory: () => { Build(a, b); });', '}') }
+        @{ Name = "a positional lambda beside a named argument"; Naming = "np"; Args = 2; Code = @(
+                'public void T()', '{', '    Register(', '        name: "x",', '        () => { Build(a, b); });', '}') }
+        @{ Name = "nested call as one argument"; Naming = "pp"; Args = 2; Code = @(
+                'public void T()', '{', '    Outer(', '        Inner(a, b),', '        c);', '}') }
+        @{ Name = "generic argument list is not arguments"; Naming = "nn"; Args = 2; Code = @(
+                'public void T()', '{', '    Build<Alpha, Beta>(', '        left: 1,', '        right: 2);', '}') }
+        @{ Name = "a conditional and a string full of commas and colons"; Naming = "nn"; Args = 2; Code = @(
+                'public void T()', '{', '    Log(', '        level: 1,', '        text: 2 == 2 ? "a, b: c" : "d");', '}') }
+        @{ Name = "a bare conditional argument"; Naming = "np"; Args = 2; Code = @(
+                'public void T()', '{', '    Log(', '        level: 1,', '        flag ? "a, b: c" : "d");', '}') }
+        @{ Name = "comma inside a trailing comment"; Naming = "nn"; Args = 2; Code = @(
+                'public void T()', '{', '    Log(', '        level: 1, // one, two', '        text: "x");', '}') }
+        @{ Name = "single string literal argument"; Naming = "p"; Args = 1; Code = @(
+                'public void T()', '{', '    Log(', '        "a message");', '}') }
+    )
+    foreach ($case in $lexCases) {
+        $result = Get-Constructs -Code $case.Code
+        $call = Get-Invocation -Result $result
+        Assert-Replay ($null -ne $call -and [string]$call.status -ceq "known" -and
+            [int]$call.argumentCount -eq [int]$case.Args -and [string]$call.argumentNaming -ceq [string]$case.Naming) `
+            ("A multi-line call with {0} must read as {1} argument(s) naming '{2}' (got {3}/'{4}' status '{5}')." -f `
+                $case.Name, $case.Args, $case.Naming,
+            $(if ($call) { $call.argumentCount } else { "no call" }),
+            $(if ($call) { $call.argumentNaming } else { "" }),
+            $(if ($call) { $call.status } else { "" }))
+    }
+    # And the ones where the honest answer is "I do not know".
+    foreach ($unclear in @(
+            @{ Name = "a call that never closes"; Code = @('public void T()', '{', '    Assert.AreEqual(', '        expected: 1,') },
+            @{ Name = "an argument list whose angle brackets never balance"; Code = @(
+                    'public void T()', '{', '    Weird(', '        left: a<b,', '        right: c);', '}') })) {
+        $result = Get-Constructs -Code $unclear.Code
+        $call = Get-Invocation -Result $result
+        Assert-Replay ($null -eq $call -or [string]$call.status -ceq "unknown") `
+            "$($unclear.Name) must be reported unknown rather than given an argument shape."
+    }
 
     # A statement that happens to open a call has the shape of a declaration.    # Counting those inflates the declaration set, which is the denominator of
     # the precedent fact a rule reads.

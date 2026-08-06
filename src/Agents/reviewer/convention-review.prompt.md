@@ -103,40 +103,44 @@ not a candidate. Do not invent a resolution.
 
     For each row set `scope` to a comma-separated list of the construct KINDS
     the rule governs - for example `invocation`, or `declaration,comment`, or
-    `none` - and then:
-    - `checkedConstructs` and `notInReachConstructs` together must account for
-      EVERY construct id of those kinds - not a sample. A construct you
-      examined and judged the rule does not reach goes in
-      `notInReachConstructs`; everything you actually weighed against the rule
-      goes in `checkedConstructs`. No construct may appear in both, and
-      silence about one is what this section exists to catch.
-      `ruleCoverageRequest.constructIdsByKind` gives you the exact string per
-      kind, already range-compressed. Ranges are inclusive and stay within one
-      kind: `mi0-mi37,dc0-dc18`. The wrapper compares the union against its own
-      enumeration and degrades the row to `unknown` if anything is missing,
-      naming exactly what you left out.
-    - Putting every construct out of reach is the same as checking none of
-      them: that row can only be `notApplicable` or `unknown`.
-    - `violatingConstructs` lists exactly those you judged to break the rule.
-      Every id must also appear in `checkedConstructs`.
-    - `status` is `violation` when `violatingConstructs` is non-empty and never
-      otherwise; `compliant` when the rule applies here and **the changed code
-      itself follows it**; `notApplicable` when nothing in scope is in the
-      rule's reach; and `unknown` when you could not decide - undelivered
-      source, sibling practice you could not establish, or ambiguous rule text.
-      Say which in `notes`.
+    `none`. Then give a VERDICT FOR EVERY ANCHOR of those kinds, by putting each
+    id in exactly one of four lists:
 
-      `compliant` is a statement about the change, not about the file. "The
-      surrounding code does not follow this rule either" is never a reason for
-      `compliant`: if the changed construct does not do what the rule says,
-      that is a `violation`, and the precedent belongs in `siblingEvidence`
-      where it lowers severity and confidence. See rule 11. This is the single
-      most common way a real finding disappears - the rule an operator most
-      wanted transported is usually the one the repository follows least.
-    - `scope: none` and an empty `checkedConstructs` mean the rule reaches
-      nothing in this change set at all. That is only ever `notApplicable` or
-      `unknown`. A `compliant` or `violation` row that checked no construct is
-      an answer about nothing, and the wrapper degrades it.
+    - `violatingConstructs` - this anchor breaks the rule.
+    - `compliantConstructs` - the rule reaches this anchor and it follows it.
+    - `notInReachConstructs` - you examined this anchor and the rule does not
+      reach it. A production method is not a test method; say so here rather
+      than leaving it out.
+    - `unknownConstructs` - you could not decide: source you were not given,
+      practice you could not establish, rule text that does not settle it.
+
+    The four lists must be disjoint and together must equal every id of the
+    declared kinds - exactly, no more and no less.
+    `ruleCoverageRequest.constructIdsByKind` gives you the exact string per
+    kind, already range-compressed. Ranges are inclusive and stay within one
+    kind: `mi0-mi37,dc0-dc18`. Silence about an anchor is what this section
+    exists to catch, and the wrapper names the exact ids you left out.
+
+    You still send `status`, but **the wrapper derives the row's real status
+    from your verdicts**: `unknown` if any anchor is unknown, else `violation`
+    if any anchor violates, else `notApplicable` if you weighed none, else
+    `compliant`. Make them agree; where they do not, the anchors decide. This is
+    deliberate - it is what stops one chosen method standing in for a whole
+    rule, and what stops a rule being called compliant while an anchor went
+    unmentioned.
+
+    `compliant` is a statement about the change, not about the file. "The
+    surrounding code does not follow this rule either" is never a reason for
+    `compliant`: if the changed construct does not do what the rule says, that
+    is a `violation`, and the precedent belongs in `siblingEvidence` where it
+    lowers severity and confidence. See rule 11. This is the single most common
+    way a real finding disappears - the rule an operator most wanted transported
+    is usually the one the repository follows least.
+
+    `scope: none` means the rule reaches nothing in this change set at all, and
+    so does a scope whose every anchor you put out of reach. Either way that row
+    can only be `notApplicable` or `unknown`; a row that weighed nothing is an
+    answer about nothing.
     - a candidate you link must be anchored on one of the constructs this row
       calls violating - anywhere within that construct's `line`..`endLine`
       span, which for a multi-line call is normally the offending argument
@@ -208,9 +212,9 @@ must be exactly one of `sourceConflict`, `outsideChangedFile`, `invalidAnchor`,
 Each `ruleCoverage` row has exactly `ruleRef`, `ruleSourceSha256`, `ruleQuote`
 (or empty), `status` (`violation|compliant|notApplicable|unknown`), `scope`
 (comma-separated construct kinds from `invocation|declaration|comment|
-assignment`, or `none`), `checkedConstructs` and `notInReachConstructs`
-(comma-separated construct ids and inclusive same-kind ranges, or empty),
-`violatingConstructs` (comma-separated construct ids, or empty),
+assignment`, or `none`), the four verdict lists `violatingConstructs`,
+`compliantConstructs`, `notInReachConstructs` and `unknownConstructs` (each
+comma-separated construct ids and inclusive same-kind ranges, or empty),
 `codeEvidence`, `siblingStatus` (`checked|notRequired|unavailable`),
 `siblingEvidence`, `candidateId` (or empty), and `notes`. Send one row per
 entry in `ruleCoverageRequest.requiredRows`, in that order.
@@ -218,7 +222,7 @@ entry in `ruleCoverageRequest.requiredRows`, in that order.
 **These rows are a checklist, not an essay, and the whole marker is rejected if
 any field runs over.** Keep `ruleQuote` under 200 characters, and keep it plain
 ASCII, since it has to match the transported source exactly. Keep
-`codeEvidence`, `siblingEvidence` and `notes` under 600 each. Say the thing and
+`codeEvidence`, `siblingEvidence` and `notes` under 400 each. Say the thing and
 stop; the candidate is where a full argument belongs.
 
 **Every key listed above must be present on every object in every array.**
