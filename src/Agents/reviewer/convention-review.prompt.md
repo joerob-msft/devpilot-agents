@@ -137,10 +137,13 @@ not a candidate. Do not invent a resolution.
     way a real finding disappears - the rule an operator most wanted transported
     is usually the one the repository follows least.
 
-    `scope: none` means the rule reaches nothing in this change set at all, and
-    so does a scope whose every anchor you put out of reach. Either way that row
-    can only be `notApplicable` or `unknown`; a row that weighed nothing is an
-    answer about nothing.
+    `scope: none` says the rule reaches nothing in this change set - but you
+    must still say which anchors you mean, by naming the kinds it would govern
+    and putting them in `notInReachConstructs`. A row that names no anchor at
+    all is not falsifiable and the wrapper degrades it, whatever status it
+    claims. A scope whose every anchor you put out of reach is a real answer,
+    and it can only be `notApplicable` or `unknown`; a row that weighed nothing
+    is not compliant with anything.
     - a candidate you link must be anchored on one of the constructs this row
       calls violating - anywhere within that construct's `line`..`endLine`
       span, which for a multi-line call is normally the offending argument

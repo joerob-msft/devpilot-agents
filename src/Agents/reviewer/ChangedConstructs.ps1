@@ -43,6 +43,36 @@ $script:ReviewerConstructStatementKeywords = @(
 # block is an index into source the model already has, not a second copy of it.
 $script:ReviewerConstructMaxPayloadBytes = 32768
 $script:ReviewerConstructUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+# The lexis this enumerator actually models: `//` and `/* */` comments, "..."
+# and @"..." strings, '...' characters, and `name:` argument labels.
+#
+# Nothing here is a language parser, but it does assume a language. Handed a
+# PowerShell or Python file it read `# a comment mentioning Log(` as a
+# multi-line call, and reported every argument of every call as positional -
+# because those languages spell a named argument `-Name`, not `name:`. Both are
+# wrong in the fail-OPEN direction: prose enumerated as code, and exactly the
+# shape fact a naming rule consumes, manufactured at scale and labelled known.
+#
+# A file whose extension is not on this list is still reported, as partly
+# understood, so the accounting says it did not cover the whole change set
+# rather than covering it wrongly.
+$script:ReviewerConstructModelledExtensions = @(
+    ".c", ".cc", ".cpp", ".cs", ".cxx", ".d", ".go", ".groovy", ".h", ".hh",
+    ".hpp", ".hxx", ".java", ".js", ".json", ".jsonc", ".jsx", ".kt", ".kts",
+    ".m", ".mjs", ".mm", ".php", ".proto", ".rs", ".scala", ".swift", ".ts",
+    ".tsx"
+)
+
+function Test-ReviewerConstructModelledFile {
+    <#
+        True when this enumerator's lexis matches the file's language closely
+        enough for its answers to be facts rather than guesses.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Path)
+    $extension = [IO.Path]::GetExtension(($Path -replace '\\', '/'))
+    if (-not $extension) { return $false }
+    return ($script:ReviewerConstructModelledExtensions -ccontains $extension.ToLowerInvariant())
+}
 
 function Test-ReviewerConstructStatementKeyword {
     <#
@@ -513,10 +543,14 @@ function Get-ReviewerChangedDeclarations {
         # The per-line declaration index, built once for the file. Recognising
         # each line here instead would mean walking the file three times over
         # and rebuilding a delivered-line set on every call.
-        [AllowNull()][AllowEmptyCollection()][object[]]$DeclarationIndex = @()
+        [AllowNull()][AllowEmptyCollection()][object[]]$DeclarationIndex = @(),
+        [AllowEmptyCollection()][int[]]$DeliveredLines = @()
     )
     $changed = [System.Collections.Generic.HashSet[int]]::new()
     foreach ($line in @($ChangedLines)) { [void]$changed.Add([int]$line) }
+    $delivered = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($line in @($DeliveredLines)) { [void]$delivered.Add([int]$line) }
+    $deliveryKnown = ($delivered.Count -gt 0)
     $found = [System.Collections.Generic.List[object]]::new()
     $truncated = $false
 
@@ -555,12 +589,12 @@ function Get-ReviewerChangedDeclarations {
         foreach ($direction in @(-1, 1)) {
             $scan = $index + $direction
             while ($scan -ge 0 -and $scan -lt $DeclarationIndex.Count) {
-                # A gap the transport never delivered ends the walk. The index
-                # holds $null both for "not a declaration" and for "not
-                # delivered", so undelivered lines are distinguished by the
-                # delivered set the index was built with - which is why the walk
-                # stops at the first line that is neither changed nor a
-                # declaration rather than scanning past it indefinitely.
+                # Stop at the first line the transport never delivered. The
+                # index cannot tell "not a declaration" from "not delivered" -
+                # both are $null - so the delivered set has to be consulted
+                # directly, or the walk crosses an unread gap and calls
+                # something forty lines away this declaration's neighbour.
+                if ($deliveryKnown -and -not $delivered.Contains($scan + 1)) { break }
                 if (-not $changed.Contains($scan + 1)) {
                     $neighbour = $DeclarationIndex[$scan]
                     if ($null -ne $neighbour) {
@@ -806,12 +840,13 @@ function Get-ReviewerConstructBudget {
     param([Parameter(Mandatory)][hashtable]$Counts, [Parameter(Mandatory)][int]$Total)
     $names = [string[]]@($Counts.Keys)
     [Array]::Sort($names, [StringComparer]::Ordinal)
-    # Ordinal, and stable by construction: this order decides how many
-    # constructs of each kind are selected, and therefore what `mi7` means.
-    # Sort-Object is neither guaranteed stable nor culture-free, and every other
-    # order this file depends on is already ordinal for that reason.
+    # Ordinal on a composite key, so ties are broken by name rather than by
+    # whatever order the sort happened to leave them in. The tie matters: with
+    # three kinds at a hundred each and a budget of a hundred and twenty, one of
+    # the three gets an extra slot, and which one decides what `mi7` means.
     $order = [string[]]@($names)
-    [Array]::Sort([int[]]@(@($order) | ForEach-Object { [int]$Counts[$_] }), $order)
+    $keys = [string[]]@(@($order) | ForEach-Object { "{0:d9}|{1}" -f [int]$Counts[$_], $_ })
+    [Array]::Sort($keys, $order, [StringComparer]::Ordinal)
     $allocation = @{}
     $remaining = $Total
     $left = @($order).Count
@@ -901,13 +936,17 @@ function Select-ReviewerConstructsAcrossFiles {
         if (-not $addedThisRound) { break }
         $round++
     }
-    # Back into path-then-line order so ids read down the change set.
+    # Back into path-then-line order so ids read down the change set. Ordinal on
+    # a composite key rather than Sort-Object: this order IS the id assignment,
+    # and a numeric sort that is merely tie-free by accident is a worse promise
+    # than one that cannot tie at all.
     $ordered = [System.Collections.Generic.List[object]]::new()
     foreach ($path in @($byPath.Keys)) {
         $forPath = @(@($taken) | Where-Object { [string]$_.path -ceq $path })
-        foreach ($item in @($forPath | Sort-Object -Property @{ Expression = { [int]$_.line } }, @{ Expression = { [int]$_.endLine } })) {
-            [void]$ordered.Add($item)
-        }
+        $sortKeys = [string[]]@(@($forPath) | ForEach-Object { "{0:d9}|{1:d9}" -f [int]$_.line, [int]$_.endLine })
+        $sortValues = [object[]]@($forPath)
+        [Array]::Sort($sortKeys, $sortValues, [StringComparer]::Ordinal)
+        foreach ($item in $sortValues) { [void]$ordered.Add($item) }
     }
     return @{ Constructs = @($ordered.ToArray()); Truncated = $true }
 }
@@ -949,6 +988,14 @@ function Get-ReviewerChangedConstructs {
         $lines = @($file.Lines)
         $changedLines = @($file.ChangedLines)
         if ($lines.Count -eq 0 -or $changedLines.Count -eq 0) { continue }
+        if (-not (Test-ReviewerConstructModelledFile -Path $path)) {
+            # Not a language this enumerator's lexis models. Saying nothing
+            # about it is the honest answer; saying something wrong about it
+            # would be worse than saying nothing, because the accounting
+            # presents these as facts.
+            [void]$partialFiles.Add($path)
+            continue
+        }
         $maskResult = Get-ReviewerConstructMaskedLines -Lines $lines
         if ([bool]$maskResult.Truncated) { [void]$partialFiles.Add($path) }
         # Assign first, then read. These helpers return a hashtable so the
@@ -958,7 +1005,7 @@ function Get-ReviewerChangedConstructs {
         $declarationIndex = Get-ReviewerConstructDeclarationIndex -MaskedLines $maskResult.Lines -DeliveredLines $deliveredLines
         $fileInvocations = Get-ReviewerChangedInvocations -Path $path -Lines $lines -ChangedLines $changedLines -MaskedLines $maskResult.Lines -DeliveredLines $deliveredLines -DeclarationIndex $declarationIndex
         foreach ($construct in @($fileInvocations.Constructs)) { [void]$invocations.Add($construct) }
-        $fileDeclarations = Get-ReviewerChangedDeclarations -Path $path -ChangedLines $changedLines -MaskedLines $maskResult.Lines -DeclarationIndex $declarationIndex
+        $fileDeclarations = Get-ReviewerChangedDeclarations -Path $path -ChangedLines $changedLines -MaskedLines $maskResult.Lines -DeclarationIndex $declarationIndex -DeliveredLines $deliveredLines
         foreach ($construct in @($fileDeclarations.Constructs)) { [void]$declarations.Add($construct) }
         $fileComments = Get-ReviewerChangedComments -Path $path -ChangedLines $changedLines -CommentLines $maskResult.CommentLines -MaskedLines $maskResult.Lines
         foreach ($construct in @($fileComments.Constructs)) { [void]$comments.Add($construct) }
