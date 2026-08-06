@@ -19,12 +19,18 @@ and it is not a reproduction of a live run.
   both promotion paths are refused at startup, the delivery authorization is
   forced to `PreviewOnly` whatever the pass count, and the artifacts it writes
   are sealed under a separate key domain so promotion cannot verify them.
-- The model's tool grant is narrowed. The wrapper's own reads come from the
+- The model's tool grant is denied. The wrapper's own reads come from the
   snapshot, but a model tool would reach the host through the CLI's
-  credentials, not through the replayed session - so in replay the model is
-  launched with `read` only. It cannot look anything up for itself, which makes
-  a replay a **lower bound** on what a live run would find. The preview says so
-  in as many words.
+  credentials, not through the replayed session, and the local file tools would
+  read the working tree, which is neither the snapshot nor the reviewed commit.
+  So in replay the entire code-defined tool ceiling goes on the deny list.
+  Each pass keeps its own allow list - substituting one would offer a pass a
+  tool its own ceiling withholds - and the deny always wins, so nothing in it
+  survives. It is denied rather than emptied because an empty allow list makes
+  the launcher omit the tool flags entirely, which restores Copilot CLI's
+  default discovery. The model therefore cannot look anything up for itself,
+  which makes a replay a **lower bound** on what a live run would find. The
+  preview says so in as many words.
 - Replay state is separate state. A replay writes under
   `<StateDir>/replay/<snapshotId>/`, so it cannot burn a real pull request's
   attempt budget, supersede its gate decisions, or leave preview artifacts a

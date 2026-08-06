@@ -65,7 +65,7 @@ function Copy-Fixture {
 
 try {
     # -- 1. The shipped fixture loads, and every payload is hash-bound ---------
-    Write-Host "1/9 shipped synthetic snapshot" -ForegroundColor Cyan
+    Write-Host "1/10 shipped synthetic snapshot" -ForegroundColor Cyan
     $snapshot = New-AgentReplaySnapshot -ReplayRoot $fixtureRoot -SnapshotName "synthetic-pr"
     Assert-Replay ($snapshot.SnapshotId -ceq "synthetic-pr") "The shipped fixture did not load under its own name."
     Assert-Replay ($snapshot.ResourceCount -eq 7) "The shipped fixture should carry exactly 7 recorded reads."
@@ -81,7 +81,7 @@ try {
         "An operator-supplied digest that does not match must refuse the snapshot." -Match "does not match the operator-supplied"
 
     # -- 2. Serving preserves the live tool response shapes -------------------
-    Write-Host "2/9 served responses keep the live shapes" -ForegroundColor Cyan
+    Write-Host "2/10 served responses keep the live shapes" -ForegroundColor Cyan
     $session = Open-AgentMcpSession -AgencyPath "never-executed" -Server "ado" -Organization "contoso" -ReplaySnapshot $snapshot
     Assert-Replay ($null -eq $session.Process) "A replay session must not start a process."
     $pr = Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
@@ -110,7 +110,7 @@ try {
         "Two serves of one recorded read must be equal in value and separate objects."
 
     # -- 3. Absent, write, and closed all fail closed -------------------------
-    Write-Host "3/9 absent reads, writes, and closed sessions fail closed" -ForegroundColor Cyan
+    Write-Host "3/10 absent reads, writes, and closed sessions fail closed" -ForegroundColor Cyan
     Assert-ReplayThrows { Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
             action = "get"; project = "Widgets"; repositoryId = "11111111-2222-3333-4444-555555555555"; pullRequestId = 9999
         } } "A read the snapshot does not carry must fail, never fall through to a live read." -Match "no recorded response"
@@ -140,7 +140,7 @@ try {
         "A snapshot captured for one organization must not serve another." -Match "was captured against organization"
 
     # -- 4. Tampering, stale bindings, and missing payloads -------------------
-    Write-Host "4/9 tamper, stale binding, and missing resource" -ForegroundColor Cyan
+    Write-Host "4/10 tamper, stale binding, and missing resource" -ForegroundColor Cyan
     $tampered = Copy-Fixture -Name "tampered"
     $payload = Join-Path $tampered "synthetic-pr\payloads\pr-get.json"
     [IO.File]::WriteAllBytes($payload, $utf8.GetBytes(([IO.File]::ReadAllText($payload, $utf8)).Replace("4242", "4243")))
@@ -166,7 +166,7 @@ try {
         "A snapshot loaded under a different name than it declares must be refused." -Match "declares snapshotId"
 
     # -- 5. Path attacks ------------------------------------------------------
-    Write-Host "5/9 path attacks" -ForegroundColor Cyan
+    Write-Host "5/10 path attacks" -ForegroundColor Cyan
     foreach ($name in @("..", "..\other", "a/b", "C:\windows", "with:stream", "")) {
         Assert-ReplayThrows { New-AgentReplaySnapshot -ReplayRoot $fixtureRoot -SnapshotName $name } `
             "Snapshot name '$name' must be refused as a path-free single name."
@@ -198,7 +198,7 @@ try {
     }
 
     # -- 6. Recorded writes cannot be sealed into a snapshot at all -----------
-    Write-Host "6/9 a snapshot may only carry reads" -ForegroundColor Cyan
+    Write-Host "6/10 a snapshot may only carry reads" -ForegroundColor Cyan
     $writeAttempt = Join-Path $sandbox "write-attempt"
     New-Item -ItemType Directory -Force -Path (Join-Path $writeAttempt "payloads") | Out-Null
     [IO.File]::WriteAllBytes((Join-Path $writeAttempt "payloads\w.json"),
@@ -242,7 +242,7 @@ try {
         "The loader must recompute exactly the digest the writer recorded."
 
     # -- 7. Canonical form and lookup keys are host-independent ---------------
-    Write-Host "7/9 canonical form is ordinal and host-independent" -ForegroundColor Cyan
+    Write-Host "7/10 canonical form is ordinal and host-independent" -ForegroundColor Cyan
     $mixed = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
     foreach ($pair in @(@("ab", 1), @("Aa", 2), @("aa", 3), @("ch", 4), @("cz", 5), @("_x", 6))) {
         $mixed[[string]$pair[0]] = [int]$pair[1]
@@ -263,7 +263,7 @@ try {
     Assert-Replay ($escapes -ceq '{"t":"a\"b\\c\nd"}') "String escaping must be explicit and stable (got $escapes)."
 
     # -- 8. Rule-coverage accounting ------------------------------------------
-    Write-Host "8/9 rule-coverage accounting" -ForegroundColor Cyan
+    Write-Host "8/10 rule-coverage accounting" -ForegroundColor Cyan
     $sources = @(
         [pscustomobject][ordered]@{ PackName = "core"; SourceId = "rule-a"; Sha256 = ("a" * 64); Text = "Prefer assigning a field once." }
         [pscustomobject][ordered]@{ PackName = "core"; SourceId = "rule-b"; Sha256 = ("b" * 64); Text = "Name every argument of a multi-line call." }
@@ -373,7 +373,7 @@ try {
         "The changed-file anchor index must be ordinal, deduplicated, and current-role only."
 
     # -- 9. Schema bounds ------------------------------------------------------
-    Write-Host "9/9 schema bounds" -ForegroundColor Cyan
+    Write-Host "9/10 schema bounds" -ForegroundColor Cyan
     $schema = Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject "Widgets" -ExpectedNonce "n"
     Assert-Replay ($schema.Keys -ccontains "ruleCoverage") "The marker schema must declare ruleCoverage."
     $coverageSpec = $schema.Fields["ruleCoverage"]
@@ -417,6 +417,53 @@ try {
         "The withheld reason set must include the wrapper's unemitted-violation reason."
     Assert-Replay ($coverageSpec.Item.Fields["status"].Values.Count -eq 4) `
         "A coverage row's status must be one of exactly four values."
+
+    # -- 10. The replay tool grant --------------------------------------------
+    # Extracted from the reviewer's own source and evaluated here, because the
+    # claim "the model has no usable tool in replay" is otherwise a comment.
+    Write-Host "10/10 replay tool grant" -ForegroundColor Cyan
+    $reviewerSource = [IO.File]::ReadAllText((Join-Path $RepoRoot "src\Agents\reviewer\Start-ReviewerAgent.ps1"), $utf8)
+    $reviewerTokens = $null
+    $reviewerErrors = $null
+    $reviewerAst = [Management.Automation.Language.Parser]::ParseInput($reviewerSource, [ref]$reviewerTokens, [ref]$reviewerErrors)
+    foreach ($fn in @("Get-ReviewerLaunchAllowTools", "Get-ReviewerEffectiveDenyTools")) {
+        $node = $reviewerAst.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -ceq $fn
+            }, $true) | Select-Object -First 1
+        Assert-Replay ($null -ne $node) "The reviewer must define $fn."
+        if ($node) { . ([scriptblock]::Create($node.Extent.Text)) }
+    }
+    $script:ReviewerAllowToolCeiling = @("read", "ado(repo_pull_request)", "ado(repo_file)", "bluebird")
+    $script:ReviewerMandatoryDenyTools = @("edit", "create")
+    $passCeilings = @(
+        @{ Name = "generalist"; Tools = @("read", "ado(repo_pull_request)", "ado(repo_file)") },
+        @{ Name = "specialist"; Tools = @("ado(repo_pull_request)", "ado(repo_file)") },
+        @{ Name = "verifier"; Tools = @("ado(repo_pull_request)", "ado(repo_file)") }
+    )
+    foreach ($mode in @($false, $true)) {
+        $script:ReviewerReplayActive = $mode
+        # Assign first, then wrap: these functions return `, @(...)` so that a
+        # single-element list stays a list, and @(f x) in expression position
+        # would keep that outer wrapper instead of unrolling it.
+        $denyResult = Get-ReviewerEffectiveDenyTools -ConfigDeny @()
+        $deny = @($denyResult)
+        foreach ($pass in $passCeilings) {
+            $allowResult = Get-ReviewerLaunchAllowTools -Intended ([string[]]$pass.Tools)
+            $allow = @($allowResult)
+            Assert-Replay (@($allow).Count -gt 0) `
+                "The $($pass.Name) grant must never be empty (an empty grant restores CLI default discovery)."
+            $widened = @($allow | Where-Object { $pass.Tools -cnotcontains $_ })
+            Assert-Replay ($widened.Count -eq 0) `
+                "The $($pass.Name) grant must never exceed its own ceiling, in replay or not (got: $($widened -join ', '))."
+            if ($mode) {
+                $survivors = @($allow | Where-Object { $deny -cnotcontains $_ })
+                Assert-Replay ($survivors.Count -eq 0) `
+                    "In replay every tool the $($pass.Name) is granted must also be denied (survived: $($survivors -join ', '))."
+            }
+        }
+    }
+    $script:ReviewerReplayActive = $false
 }
 finally {
     Remove-Item -Recurse -Force $sandbox -ErrorAction SilentlyContinue

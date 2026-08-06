@@ -605,18 +605,21 @@ $script:ReviewerConventionSpecialistAllowToolCeiling = @(
     "ado(repo_file)"
 )
 
-# Replay is offline, so the model must not keep repository tools: those reach
-# the host through the CLI's own credentials, not through the wrapper's
+# Replay is offline, so the model must not keep working repository tools: those
+# reach the host through the CLI's own credentials, not through the wrapper's
 # replayed session, and a run that mixed snapshot facts with live facts would
-# be worse than either alone. The list is NARROWED, never emptied - an empty
-# grant makes Get-AgentCopilotArgs omit --available-tools/--allow-tool
-# entirely, which restores Copilot CLI default tool discovery and would hand
-# the model back more than a live run ever grants it.
+# be worse than either alone. Local file tools are no better - they would read
+# the working tree, which is neither the snapshot nor the reviewed commit.
+#
+# The whole code-defined ceiling is DENIED in replay (see
+# Get-ReviewerEffectiveDenyTools) rather than the allow list being emptied: an
+# empty allow list makes Get-AgentCopilotArgs omit the tool flags entirely,
+# which restores Copilot CLI default tool discovery and would hand the model
+# back more than a live run ever grants it.
 #
 # This is a real difference from a live run and is disclosed as one: in replay
 # the model cannot look anything up for itself, so a replay is a LOWER bound on
 # live behaviour, not a reproduction of it.
-$script:ReviewerReplayAllowToolCeiling = @("read")
 $script:ReviewerReplayActive = $false
 $script:ReviewerReplaySnapshot = $null
 # Told to every model pass in replay, generalist and specialist alike. Each of
@@ -1953,40 +1956,52 @@ function Get-ReviewerEffectiveDenyTools {
     param([string[]]$ConfigDeny)
     $deny = @(@($ConfigDeny) + $script:ReviewerMandatoryDenyTools)
     if ($script:ReviewerReplayActive) {
-        # Belt and braces with Get-ReviewerLaunchAllowTools. That function keeps
-        # the grant NON-EMPTY, because an empty allow-list makes
-        # Get-AgentCopilotArgs omit the tool flags entirely and hands the model
-        # Copilot CLI's default discovery. Denying the same family here is what
-        # actually leaves the model with nothing: the deny list always wins, so
-        # the launch names a grant and then withdraws it.
-        $deny += @($script:ReviewerReplayAllowToolCeiling)
+        # In replay the model gets no usable tool at all. The whole code-defined
+        # ceiling is denied - not just one pass's slice - so this holds however
+        # a pass's own allow list is computed, and the deny list always wins.
+        #
+        # It has to be done by denying rather than by emptying the allow list:
+        # an empty allow list makes Get-AgentCopilotArgs omit the tool flags
+        # entirely, which restores Copilot CLI's default tool discovery and
+        # hands the model more than any grant here ever would.
+        $deny += @($script:ReviewerAllowToolCeiling)
     }
     return , @($deny | Select-Object -Unique)
 }
 
+function Get-ReviewerUsableLaunchTools {
+    <#
+        The permissions a launch actually leaves the model holding: what it was
+        granted, minus what the same launch denied. The deny list always wins,
+        so a denied entry is not a capability - and asking about anything else
+        makes the MCP pre-flight demand a server for a tool nobody can call,
+        which is how a fully offline replay came to be refused for want of a
+        repository connection it never used.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Allow,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Deny
+    )
+    return , @(@($Allow) | Where-Object { @($Deny) -cnotcontains $_ })
+}
+
 function Get-ReviewerLaunchAllowTools {
     <#
-        The permission list a model pass is actually launched with. Outside
-        replay it is exactly what the caller computed, so a preview stays a
-        faithful rehearsal of a posting run.
+        The permission list a model pass is actually launched with.
 
-        Inside replay it is the code-defined offline set. The wrapper's own
-        reads are served from the snapshot, but a model tool would reach the
-        host through the CLI's credentials and mix live facts into a replayed
-        review - and the local file tools would read the working tree, which is
-        neither the snapshot nor the reviewed commit.
+        It is the caller's own list in every mode, including replay. Replacing
+        it in replay looked tidier and was wrong: the specialist and verifier
+        ceilings are repository-tool-only and contain no local-read entry, so
+        substituting one would have OFFERED those passes a tool their own
+        code-defined ceiling withholds - visible to a model that never sees it
+        in a live run, and outside the ceiling the startup guards check.
 
-        NARROWED, never emptied, and never WIDENED either: the specialist and
-        verifier ceilings do not contain this entry, so replacing rather than
-        intersecting would have granted those passes a tool their own ceiling
-        withholds. Get-ReviewerEffectiveDenyTools denies the same family, so
-        what the launch actually grants is nothing at all - the entry exists
-        only to keep the tool flags present, because an empty grant restores
-        Copilot CLI's default discovery, which is wider than anything here.
+        What makes replay offline is Get-ReviewerEffectiveDenyTools, which
+        denies the entire code-defined ceiling. The grant stays non-empty and
+        within its own bound; nothing in it survives the deny.
     #>
     param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Intended)
-    if (-not $script:ReviewerReplayActive) { return , @($Intended) }
-    return , @($script:ReviewerReplayAllowToolCeiling)
+    return , @($Intended)
 }
 
 $script:ReviewerAuthoritativeTransportVersion = 1
@@ -3936,20 +3951,31 @@ function Get-ReviewerReplayDeterminismDigests {
                 ([string](Get-ReviewerHashValue -Container $_ -Key 'status' -Default '')),
                 ([string](Get-ReviewerHashValue -Container $_ -Key 'reason' -Default '')),
                 ([int](Get-ReviewerHashValue -Container $_ -Key 'deliveredSpanCount' -Default 0))
-            } | Sort-Object)
+            })
+        # Ordinal, not Sort-Object: the canonical renderer preserves array order,
+        # so a culture comparison here would make the digest a function of the
+        # operator's locale - and this digest's whole claim is that a difference
+        # in it means a defect in this toolkit.
+        $coverageFiles = [string[]]@($coverageRecord["files"])
+        [Array]::Sort($coverageFiles, [StringComparer]::Ordinal)
+        $coverageRecord["files"] = @($coverageFiles)
     }
+    $allowToolsSorted = [string[]]@($AllowTools)
+    [Array]::Sort($allowToolsSorted, [StringComparer]::Ordinal)
     $inputRecord = [ordered]@{
         coverage   = $coverageRecord
-        allowTools = @(@($AllowTools) | Sort-Object)
+        allowTools = @($allowToolsSorted)
     }
     $anchors = @(@($Postable) | ForEach-Object {
             "{0}|{1}|{2}" -f `
             ([string](Get-ReviewerHashValue -Container $_ -Key 'severity' -Default '')).ToLowerInvariant(),
             (Get-ReviewerNormalizedPath -Path ([string](Get-ReviewerHashValue -Container $_ -Key 'filePath' -Default ''))),
             ([int](Get-ReviewerHashValue -Container $_ -Key 'line' -Default 0))
-        } | Sort-Object)
+        })
+    $anchorsSorted = [string[]]@($anchors)
+    [Array]::Sort($anchorsSorted, [StringComparer]::Ordinal)
     $outcomeRecord = [ordered]@{
-        anchors = @($anchors)
+        anchors = @($anchorsSorted)
         counts  = [ordered]@{
             critical   = [int]$counts['critical']
             important  = [int]$counts['important']
@@ -4063,7 +4089,7 @@ function Write-ReviewerPreview {
         [void]$lines.Add("- OFFLINE REPLAY of snapshot ``$($script:ReviewerReplaySnapshot.SnapshotId)`` (manifest digest ``$($script:ReviewerReplaySnapshot.ManifestDigest)``, replay nonce ``$($script:ReviewerReplaySnapshot.ReplayNonce)``). Every repository read came from that snapshot; no repository was contacted.")
         [void]$lines.Add("- Replay input digest (wrapper-computed, must be identical on every replay of this snapshot): ``$($replayDigests.InputDigest)``")
         [void]$lines.Add("- Replay outcome digest (wrapper-normalized decisions, excludes comment prose): ``$($replayDigests.OutcomeDigest)``")
-        [void]$lines.Add("- This is NOT a reproduction of a live run: the model was launched with the offline grant (``$($script:ReviewerReplayAllowToolCeiling -join ', ')``) and that same family denied, so it had no usable tool and could not look anything up for itself. A replay is therefore a LOWER bound on what a live run would find, and its marker-emission behaviour is not comparable to live: each pass is told not to stop merely because it cannot re-read the pull request.")
+        [void]$lines.Add("- This is NOT a reproduction of a live run: every tool this agent can grant was denied at launch, so the model had no usable tool and could not look anything up for itself. A replay is therefore a LOWER bound on what a live run would find, and its marker-emission behaviour is not comparable to live: each pass is told not to stop merely because it cannot re-read the pull request.")
         [void]$lines.Add("- This artifact is evidence, not an approved review: it is sealed under the replay key domain and can never be promoted.")
     }
     [void]$lines.Add("")
@@ -12977,10 +13003,13 @@ $lock = Enter-AgentLock -Path $lockPath -AgentName $AgentName
 try {
     # Fail closed on a missing MCP server rather than running a cycle in which
     # the model silently has no tools, produces no marker, and starves the PR.
-    # Asked about the grant the model will ACTUALLY receive: in offline replay
-    # that grant carries no repository tools, so demanding a repository MCP
-    # server would refuse to start a run that never needed one.
-    $missingMcpServers = @(Get-AgentMissingMcpServers -AllowToolEntries (Get-ReviewerLaunchAllowTools -Intended $ConfigAllowTools) -RepositoryPath $RepoPath)
+    # Asked about the tools the launch actually leaves usable: an offline replay
+    # denies the whole ceiling, so demanding a repository server for it would
+    # refuse a run that never needed one.
+    $launchAllow = Get-ReviewerLaunchAllowTools -Intended (Get-ReviewerEffectiveAllowTools -BaseAllow $ConfigAllowTools)
+    $launchDeny = Get-ReviewerEffectiveDenyTools -ConfigDeny $ConfigDenyTools
+    $usableLaunchTools = Get-ReviewerUsableLaunchTools -Allow $launchAllow -Deny $launchDeny
+    $missingMcpServers = @(Get-AgentMissingMcpServers -AllowToolEntries $usableLaunchTools -RepositoryPath $RepoPath)
     if ($missingMcpServers.Count -gt 0) {
         throw ("This repository does not declare MCP server(s) required by the allow-list: $($missingMcpServers -join ', '). " +
             "Copilot would start normally but the model would have none of those tools - it could not read the pull request, " +

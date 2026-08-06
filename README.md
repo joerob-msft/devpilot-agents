@@ -475,10 +475,10 @@ replayed payloads.
 It is permanently preview-only: every write and gate switch and both promotion
 paths are refused at startup, the authorization is forced to `PreviewOnly`, the
 artifacts are sealed under a separate key domain so promotion cannot verify
-them, and replay state lives apart from live state. The model's grant is
-narrowed to `read`, because a model tool would reach the host through the CLI's
-own credentials rather than the replayed session - so a replay is a stated
-*lower bound* on a live run, not a reproduction of one. See
+them, and replay state lives apart from live state. The model's entire tool
+ceiling is denied at launch, because a model tool would reach the host through
+the CLI's own credentials rather than the replayed session - so a replay is a
+stated *lower bound* on a live run, not a reproduction of one. See
 [docs/replay-snapshots.md](docs/replay-snapshots.md).
 
 ### Two passes, two models
