@@ -306,21 +306,21 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                         ruleSourcePath = @{ Type = "string"; MaxLength = 1024; Pattern = '^/[A-Za-z0-9._ /-]+$' }
                         ruleSourceCommit = @{ Type = "hex"; Length = 40 }
                         ruleSourceSha256 = @{ Type = "hex"; Length = 64 }
-                        ruleSection = @{ Type = "string"; MaxLength = 240; Pattern = $ascii }
+                        ruleSection = @{ Type = "string"; MaxLength = 240; Pattern = $ascii; NormalizeTypography = $true }
                         ruleQuote = @{ Type = "string"; MaxLength = 600; Pattern = '^(?=.{8,}$)(?=.*\S)[\x20-\x7E]+$' }
-                        diffEvidence = @{ Type = "string"; MaxLength = 1200; Pattern = $ascii }
+                        diffEvidence = @{ Type = "string"; MaxLength = 1200; Pattern = $ascii; NormalizeTypography = $true }
                         impactCategory = @{ Type = "enum"; Values = $script:ReviewerConventionSpecialistImpactCategories }
-                        impact = @{ Type = "string"; MaxLength = 800; Pattern = $ascii }
-                        expectedFixOrValidation = @{ Type = "string"; MaxLength = 1000; Pattern = $ascii }
+                        impact = @{ Type = "string"; MaxLength = 800; Pattern = $ascii; NormalizeTypography = $true }
+                        expectedFixOrValidation = @{ Type = "string"; MaxLength = 1000; Pattern = $ascii; NormalizeTypography = $true }
                         siblingStatus = @{ Type = "enum"; Values = @("checked", "notRequired") }
-                        siblingEvidence = @{ Type = "string"; MaxLength = 800; AllowEmpty = $true; Pattern = $ascii }
-                        siblingNotRequiredReason = @{ Type = "string"; MaxLength = 400; AllowEmpty = $true; Pattern = $ascii }
+                        siblingEvidence = @{ Type = "string"; MaxLength = 800; AllowEmpty = $true; Pattern = $ascii; NormalizeTypography = $true }
+                        siblingNotRequiredReason = @{ Type = "string"; MaxLength = 400; AllowEmpty = $true; Pattern = $ascii; NormalizeTypography = $true }
                         factIds = @{
                             Type = "string"; MaxLength = 600; AllowEmpty = $true
                             Pattern = '^(|rf1:[0-9a-f]{64}(,rf1:[0-9a-f]{64}){0,7})$'
                         }
                         confidence = @{ Type = "enum"; Values = @("low", "medium", "high") }
-                        residualRiskSummary = @{ Type = "string"; MaxLength = 800; AllowEmpty = $true; Pattern = $ascii }
+                        residualRiskSummary = @{ Type = "string"; MaxLength = 800; AllowEmpty = $true; Pattern = $ascii; NormalizeTypography = $true }
                     }
                 }
             }
@@ -419,7 +419,7 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                 Type = "objectArray"; MaxItems = 12
                 Item = @{
                     Keys = @("text")
-                    Fields = @{ text = @{ Type = "string"; MaxLength = 800; Pattern = $ascii } }
+                    Fields = @{ text = @{ Type = "string"; MaxLength = 800; Pattern = $ascii; NormalizeTypography = $true } }
                 }
             }
             nonce = @{ Type = "exact"; Expected = $ExpectedNonce }

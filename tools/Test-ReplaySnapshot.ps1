@@ -605,14 +605,41 @@ try {
         Assert-Replay (-not ($spec.ContainsKey("Truncate") -and [bool]$spec.Truncate)) `
             "Candidate field '$commentField' must never be silently shortened: it becomes pull-request comment text."
     }
-    # The candidate fields, which DO become comment text, stay strict.
+    # The candidate fields, which DO become comment text, stay strict: a
+    # character outside the enumerated transliteration is still refused.
     $commentSpec = $candidateSpec.Item.Fields["diffEvidence"]
-    $rejected = Test-MarkerField -Spec $commentSpec -Value ([string][char]0x2019 + "curly")
+    $rejected = Test-MarkerField -Spec $commentSpec -Value ("curly " + [string][char]0x2192)
     Assert-Replay (-not [bool]$rejected.Ok) "Candidate comment text must remain printable ASCII only."
     $quoteSpec = $coverageSpec.Item.Fields["ruleQuote"]
     $quoteRejected = Test-MarkerField -Spec $quoteSpec -Value ([string][char]0x2019 + "curly")
     Assert-Replay (-not [bool]$quoteRejected.Ok) `
         "A coverage row's rule quote must stay ASCII, because it has to match the transported source exactly."
+
+    # A model reaches for an em dash or a curly quote without thinking, and the
+    # ASCII rule that protects comment text from carrying structure then costs
+    # the whole pass. The enumerated transliteration is meaning-preserving; what
+    # is not in the table still fails closed.
+    $dashField = $candidateSpec.Item.Fields["diffEvidence"]
+    $dashed = Test-MarkerField -Spec $dashField -Value ("mi20 lines 744-750: called positionally " + [string][char]0x2014 + " both args positional.")
+    Assert-Replay ([bool]$dashed.Ok) "An em dash in candidate evidence must not cost the pass."
+    Assert-Replay (([string]$dashed.Value).IndexOf([char]0x2014) -lt 0 -and ([string]$dashed.Value) -match ' - both args') `
+        "The em dash must be replaced by the character a reader would have read anyway."
+    $quoted = Test-MarkerField -Spec $dashField -Value ([string][char]0x201C + "value" + [string][char]0x201D + " and " + [string][char]0x2026)
+    Assert-Replay ([bool]$quoted.Ok -and ([string]$quoted.Value) -ceq '"value" and ...') `
+        "Curly quotes and an ellipsis must transliterate to their ASCII equivalents."
+    $stillRejected = Test-MarkerField -Spec $dashField -Value ("evidence with an arrow " + [string][char]0x2192)
+    Assert-Replay (-not [bool]$stillRejected.Ok) `
+        "A character outside the transliteration table must still be refused: this is not a licence for arbitrary Unicode."
+    $stillControl = Test-MarkerField -Spec $dashField -Value "line one`nline two"
+    Assert-Replay (-not [bool]$stillControl.Ok) "Control characters must still be refused in candidate text."
+    foreach ($exact in @("candidateId", "packName", "filePath", "ruleSourcePath", "factIds")) {
+        $spec = $candidateSpec.Item.Fields[$exact]
+        Assert-Replay (-not ($spec.ContainsKey("NormalizeTypography") -and [bool]$spec.NormalizeTypography)) `
+            "Candidate field '$exact' is an identifier or a path and must never be rewritten."
+    }
+    $quoteSpecStrict = $candidateSpec.Item.Fields["ruleQuote"]
+    Assert-Replay (-not ($quoteSpecStrict.ContainsKey("NormalizeTypography") -and [bool]$quoteSpecStrict.NormalizeTypography)) `
+        "A candidate's rule quote must never be rewritten: it is checked against the transported source verbatim."
 
     # The scaffold: the top-level object handed to the model already built, so a
     # long analysis cannot end with a marker missing its last key.
