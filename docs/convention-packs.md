@@ -268,6 +268,13 @@ lists that both mean "nearly a finding" is where a later edit promotes one.
 Sibling evidence describes unchanged code and can never be the subject of a
 candidate or the anchor of a row.
 
+Local practice does not repeal a transported rule. Code that breaks a rule its
+unchanged neighbours also break is still a violation; what the precedent changes
+is severity, confidence, and whether the finding is worth a comment - not the
+row's status. Otherwise the most-broken rule in a repository is the one that
+reports cleanest, which is the opposite of what an operator asked for when they
+transported it.
+
 The anchor ids are deterministic and are the wrapper's own: the changed files,
 ordinally sorted, from the change set it delivered, and the changed constructs
 enumerated from them. Pattern hints for particular rule shapes are deliberately
