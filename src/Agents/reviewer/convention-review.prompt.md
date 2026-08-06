@@ -86,7 +86,13 @@ not a candidate. Do not invent a resolution.
       `argumentNaming` giving one character per argument (`n` syntactically
       named, `p` positional) and `name` giving the callee.
     - `declaration` (id `dc*`) - a changed declaration, with the attributes on
-      it and the attributes on its nearest unchanged neighbours.
+      it, the attributes on its nearest unchanged neighbours, and `absentHere`:
+      attribute names that appear on unchanged declarations elsewhere in the
+      same file but not on this one. `absentHere` is a shape fact and nothing
+      more - it says an attribute is present there and absent here. Whether
+      that matters is the rule's business, and an empty `absentHere` means the
+      file has no local precedent for anything this declaration lacks, not that
+      the declaration is fine.
     - `comment` (id `cm*`) - a run of changed comment lines, so a rule about
       what documentation says has somewhere of its own to anchor.
     - `assignment` (id `as*`) - a changed line that writes to a name that
@@ -114,10 +120,19 @@ not a candidate. Do not invent a resolution.
     - `violatingConstructs` lists exactly those you judged to break the rule.
       Every id must also appear in `checkedConstructs`.
     - `status` is `violation` when `violatingConstructs` is non-empty and never
-      otherwise; `compliant` when the rule applies here and the change follows
-      it; `notApplicable` when nothing in scope is in the rule's reach; and
-      `unknown` when you could not decide - undelivered source, sibling practice
-      you could not establish, or ambiguous rule text. Say which in `notes`.
+      otherwise; `compliant` when the rule applies here and **the changed code
+      itself follows it**; `notApplicable` when nothing in scope is in the
+      rule's reach; and `unknown` when you could not decide - undelivered
+      source, sibling practice you could not establish, or ambiguous rule text.
+      Say which in `notes`.
+
+      `compliant` is a statement about the change, not about the file. "The
+      surrounding code does not follow this rule either" is never a reason for
+      `compliant`: if the changed construct does not do what the rule says,
+      that is a `violation`, and the precedent belongs in `siblingEvidence`
+      where it lowers severity and confidence. See rule 11. This is the single
+      most common way a real finding disappears - the rule an operator most
+      wanted transported is usually the one the repository follows least.
     - `scope: none` and an empty `checkedConstructs` mean the rule reaches
       nothing in this change set at all. That is only ever `notApplicable` or
       `unknown`. A `compliant` or `violation` row that checked no construct is

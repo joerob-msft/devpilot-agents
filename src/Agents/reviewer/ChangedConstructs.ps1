@@ -512,6 +512,24 @@ function Get-ReviewerChangedDeclarations {
     $found = [System.Collections.Generic.List[object]]::new()
     $truncated = $false
 
+    # Attribute names that appear on UNCHANGED declarations in this file. A rule
+    # about an attribute needs to know whether the file already uses it: a
+    # changed declaration missing something several unchanged neighbours carry
+    # is a different situation from one missing something nobody here has ever
+    # used, and those two deserve opposite answers. Purely a shape fact - it
+    # says an attribute is present there and absent here, never that either is
+    # wrong.
+    $unchangedAttributes = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    for ($scan = 0; $scan -lt $MaskedLines.Count; $scan++) {
+        if ($changed.Contains($scan + 1)) { continue }
+        $neighbour = Get-ReviewerConstructDeclarationAt -MaskedLines $MaskedLines -Index $scan -DeliveredLines $DeliveredLines
+        if ($null -eq $neighbour) { continue }
+        foreach ($attribute in @($neighbour.Attributes)) {
+            if ($unchangedAttributes.Count -ge $script:ReviewerConstructMaxAttributeNames) { break }
+            [void]$unchangedAttributes.Add($attribute)
+        }
+    }
+
     for ($index = 0; $index -lt $MaskedLines.Count; $index++) {
         if ($found.Count -ge $script:ReviewerConstructMaxPerFile) { $truncated = $true; break }
         $lineNumber = $index + 1
@@ -545,6 +563,8 @@ function Get-ReviewerChangedDeclarations {
         }
         $sortedSiblings = [string[]]@($siblingAttributes.ToArray())
         [Array]::Sort($sortedSiblings, [StringComparer]::Ordinal)
+        $absent = [string[]]@(@($unchangedAttributes) | Where-Object { @($declaration.Attributes) -cnotcontains $_ })
+        [Array]::Sort($absent, [StringComparer]::Ordinal)
 
         [void]$found.Add([pscustomobject][ordered]@{
                 kind = "declaration"
@@ -554,6 +574,7 @@ function Get-ReviewerChangedDeclarations {
                 name = $declaration.Name
                 attributes = @($declaration.Attributes)
                 siblingAttributes = @($sortedSiblings)
+                absentHere = @($absent)
                 siblingCount = $siblingCount
                 status = $(if ([bool]$declaration.Truncated) { "unknown" } else { "known" })
             })
@@ -963,6 +984,10 @@ function Get-ReviewerChangedConstructs {
                 if ($kind -ceq "declaration") {
                     $record["attributes"] = @(Get-ReviewerConstructMember -Container $construct -Name "attributes")
                     $record["siblingAttributes"] = @(Get-ReviewerConstructMember -Container $construct -Name "siblingAttributes")
+                    # Attribute names on unchanged declarations elsewhere in
+                    # this file that this one does not carry. A fact, not a
+                    # verdict: whether that matters is the rule's business.
+                    $record["absentHere"] = @(Get-ReviewerConstructMember -Container $construct -Name "absentHere")
                 }
                 $record["status"] = [string]$construct.status
                 [void]$result.Add([pscustomobject]$record)
