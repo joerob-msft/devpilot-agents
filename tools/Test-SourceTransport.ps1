@@ -52,6 +52,56 @@ function Get-FunctionAstFromWrapper {
             }, $true) | Select-Object -First 1)
 }
 
+$script:WrapperCommonVariableParameters = @(
+    'OutVariable', 'ov',
+    'ErrorVariable', 'ev',
+    'WarningVariable', 'wv',
+    'InformationVariable', 'iv',
+    'PipelineVariable', 'pv'
+)
+
+function Get-WrapperCommonVariableTarget {
+    <# `-OutVariable blockText` writes `$blockText` without an assignment, a
+       `Set-Variable` or anything else the other counters watch, and the same is
+       true of `-ErrorVariable`, `-WarningVariable`, `-InformationVariable` and
+       `-PipelineVariable` and their aliases. PowerShell parses `-OutVariable x`
+       as a parameter followed by a separate string element and `-OutVariable:x`
+       as a parameter carrying its argument, so both shapes are resolved here.
+       Returns one entry per such parameter: the variable name it writes, or
+       `?` when the target is not a plain literal and so could name anything. #>
+    param([Parameter(Mandatory)]$FunctionAst)
+    $targets = @()
+    foreach ($parameter in $FunctionAst.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.CommandParameterAst]
+            }, $true)) {
+        if ($script:WrapperCommonVariableParameters -notcontains $parameter.ParameterName) { continue }
+        $argument = $parameter.Argument
+        if ($null -eq $argument -and $parameter.Parent -is [Management.Automation.Language.CommandAst]) {
+            $elements = @($parameter.Parent.CommandElements)
+            for ($index = 0; $index -lt $elements.Count; $index++) {
+                if ([object]::ReferenceEquals($elements[$index], $parameter) -and ($index + 1) -lt $elements.Count) {
+                    $argument = $elements[$index + 1]
+                }
+            }
+        }
+        if ($argument -is [Management.Automation.Language.StringConstantExpressionAst]) {
+            $targets += (Split-WrapperVariableName -Path $argument.Value)
+        }
+        else { $targets += '?' }
+    }
+    return , ([string[]]@($targets))
+}
+
+function Measure-WrapperCommonVariableWrite {
+    <# How many common-parameter writes name this variable. Only statically
+       readable targets are attributed; an unreadable one is charged to the
+       indirect-write count instead, because it could name anything. #>
+    param([Parameter(Mandatory)]$FunctionAst, [Parameter(Mandatory)][string]$Name)
+    $targets = Get-WrapperCommonVariableTarget -FunctionAst $FunctionAst
+    return @($targets | Where-Object { $_ -ne '?' -and $_ -eq $Name }).Count
+}
+
 function Split-WrapperVariableName {
     <# `$local:x`, `$private:x` and `$x` are the same variable to the engine but
        different UserPaths to the parser, so a scoped write walks past a pin that
@@ -85,7 +135,17 @@ function Measure-WrapperVariableWrite {
                 @('Set-Variable', 'New-Variable', 'Remove-Variable', 'Set-Item', 'Invoke-Expression') -contains $candidate.GetCommandName() -and
                 $candidate.Extent.Text -match [regex]::Escape($Name)
             }, $true))
-    return (@($direct).Count + @($indirect).Count)
+    # `foreach ($blockText in @('STUB')) { }` binds the loop variable in the
+    # enclosing scope and leaves it set after the loop, without ever being an
+    # assignment statement.
+    $loopBindings = @($FunctionAst.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.ForEachStatementAst]
+            }, $true) | Where-Object {
+            (Split-WrapperVariableName -Path $_.Variable.VariablePath.UserPath) -eq $Name
+        })
+    $commonParameters = Measure-WrapperCommonVariableWrite -FunctionAst $FunctionAst -Name $Name
+    return (@($direct).Count + @($indirect).Count + @($loopBindings).Count + $commonParameters)
 }
 
 function Measure-WrapperIndirectWrite {
@@ -93,10 +153,14 @@ function Measure-WrapperIndirectWrite {
        is decided at runtime: `Set-Variable -Name $n`, a splatted `@sv`,
        `New-Item Variable:`, `(Get-Variable x).Value = ...`, a `[ref]` handle,
        `$ExecutionContext.SessionState.PSVariable.Set(...)`, `Add-Member -Force`,
-       or a dot-sourced `[scriptblock]::Create('...')`. None of these belongs in
-       either function, so the shape is banned outright rather than pinned per
-       name. Aliases are listed beside their cmdlets because `GetCommandName()`
-       returns what was written, not what it resolves to. #>
+       or a dot-sourced `[scriptblock]::Create('...')`. Splatting is refused
+       outright because a hashtable can carry `OutVariable` as easily as any
+       other parameter, and a common variable parameter whose target is not a
+       plain literal - `-OutVariable $computed` - is charged here for the same
+       reason: it could name anything. None of these belongs in either function,
+       so the shape is banned rather than pinned per name. Aliases are listed
+       beside their cmdlets because `GetCommandName()` returns what was written,
+       not what it resolves to. #>
     param([Parameter(Mandatory)]$FunctionAst)
     $banned = @(
         'Set-Variable', 'sv', 'set',
@@ -147,7 +211,12 @@ function Measure-WrapperIndirectWrite {
                     $_.VariablePath.UserPath -match '^(function|alias|env|variable):'
                 }).Count -gt 0
         })
-    return (@($commands).Count + @($refCasts).Count + @($sessionState).Count + @($builtCode).Count + @($driveWrites).Count)
+    return (@($commands).Count + @($refCasts).Count + @($sessionState).Count + @($builtCode).Count + @($driveWrites).Count +
+        @($FunctionAst.FindAll({
+                    param($candidate)
+                    $candidate -is [Management.Automation.Language.VariableExpressionAst] -and $candidate.Splatted
+                }, $true)).Count +
+        @((Get-WrapperCommonVariableTarget -FunctionAst $FunctionAst) | Where-Object { $_ -eq '?' }).Count)
 }
 
 function Measure-WrapperBareOutput {
@@ -962,7 +1031,7 @@ Assert-Source (@($cycleMemberTargets | Where-Object { $expectedCycleMemberTarget
     "and the cycle mutates only its own bookkeeping objects - a new one has to be declared here, so an alias of the transport result cannot appear silently"
 Assert-Source ((Measure-WrapperIndirectWrite -FunctionAst $transportAst) -eq 0 -and
     (Measure-WrapperIndirectWrite -FunctionAst $cycleAst) -eq 0) `
-    "and neither function writes a variable, an alias or a function indirectly, nor calls a command that could - so the counts above cannot be evaded by choosing the target at runtime"
+    "and neither function writes a variable, an alias or a function indirectly, nor splats a parameter set, nor names a common output variable it cannot read here, nor calls a command that could - so the counts above cannot be evaded by choosing the target at runtime"
 # The counts bound what these functions WRITE. They say nothing about which
 # functions they CALL, so a nested declaration shadowing the renderer or the
 # gate leaves every count correct and returns whatever the stub says.
