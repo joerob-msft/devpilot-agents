@@ -35,13 +35,13 @@ artifact says so.
 
 For each bound PR the wrapper:
 
-1. reads the change set **with** line diff blocks and derives, per changed path,
-   the right-hand (post-change) line spans of every add and edit;
-2. leaves a pure edit whose aggregate blocks contain only context/deletes
-   uncovered because the current MCP contract does not expose the authoritative
-   `commonRefCommit`; once an authoritative, recheckable iteration seam exists,
-   the retained bounded primitive can read exact common-base/source versions and
-   recover only proven right-hand spans;
+1. reads authoritative paginated iteration identity, then reads the matching
+   aggregate diff and derives, per changed path, the right-hand (post-change)
+   line spans of every add and edit;
+2. recovers a pure same-path edit whose aggregate blocks contain only
+   context/deletes — the case ADO drops from the right-hand view — by reading the
+   authoritative common-base and source versions the flat contract now pins and
+   keeping only the spans that content difference proves;
 3. expands each span by a policy context radius, clamps it to the file, and
    merges overlaps so no line travels twice;
 4. reads each changed file's bytes itself at the exact 40-hex source commit,
@@ -124,22 +124,87 @@ had before recovery.
 
 Recovery additionally requires an authoritative binding to the configured
 organization, project, repository ID, PR ID, exact iteration ID, source, target,
-and `commonRefCommit`. The current `repo_pull_request` MCP contract exposes
-`get_changes` and its `iterationId` input, but it does not expose iteration
-metadata or a `get_iterations` action. Consequently the live wrapper does not
-attempt recovery: degenerate files retain `spansUnavailable`, remain in the
-denominator, and keep the unchanged gate closed. The deterministic recovery
-primitive and its adversarial tests are retained, but wiring it into live reads
-must wait for an authoritative, recheckable common-base seam; target-tip content
-is not an acceptable substitute.
+and common-base commit. When the MCP server exposes the authoritative flat
+paginated `get_changes` contract (microsoft/azure-devops-mcp PR #1499, head
+`276d802a53`), the wrapper detects it via `tools/list` input-schema inspection.
+Detection is structured, not a boolean: the `repo_pull_request` input schema must
+expose `get_changes` in the `action` enum together with `iterationId`, pagination
+controls `top` and `skip`, and Agency's existing aggregate-span inputs
+`includeDiffs` and `includeLineContent`. A successful probe yields a
+structured capability (bounded `PageSize` and `ChangeLimit`) rather than a flag.
+The detection is strict: any missing property, malformed schema, null response,
+or `tools/list` error causes the wrapper to fall back to legacy `get_changes`
+behavior with recovery dormant and its body semantically unchanged. The probe
+never touches the shared ordinary-transport session: it runs on a dedicated,
+short-lived repos-only MCP session that is always closed, and its result
+(including a null) is cached on the shared session so it is computed at most once.
+The public local PR #1499 server intentionally exposes identity-only changes and
+does not advertise aggregate line diffs, so that schema alone remains dormant:
+hosted Agency must deploy the identity fields additively on its existing diff
+response before recovery activates.
+
+When the flat contract is detected the wrapper drives a single bounded paginator.
+Each page is a flat record that carries its own full identity, and the wrapper
+binds every field strictly before trusting the page:
+
+1. **Per-page identity** — `iterationId` (positive), `iterationReason`
+   (`{ value, names, unrecognizedBits }`, where a null value forces empty names
+   and zero unrecognized bits), the exact lowercase 40-hex `commonRefCommit`,
+   `sourceRefCommit`, and `targetRefCommit`, and a retarget pair
+   (`oldTargetRefName`/`newTargetRefName`) that is either both-null or both
+   well-formed `refs/heads/*`. `commitsTruncated` is retained as identity metadata
+   (the exact common/source/target commits remain available), and the
+   continuation fields `hasMoreChanges`/`nextSkip`/`nextTop` must be internally
+   consistent (a terminal page pins both continuation cursors to zero; a
+   continuing page advances `nextSkip` by exactly the delivered count and keeps
+   `nextTop` within the server's 1000-entry bound).
+2. **Bounded pagination** — the first page is fetched with `top` clamped to 200,
+   `skip = 0`, and no explicit iteration (any iteration is accepted to *discover*
+   the identity). Every subsequent page pins the discovered `iterationId`
+   explicitly and must match the first page's identity exactly; a page whose
+   identity differs fails closed as mixed-identity. Advertised page sizes are
+   capped to the 1000 hard ceiling on the wire, a page returning more than the
+   requested `top` is refused, and a change set that would exceed the bounded
+   total of 1000 fails closed rather than reading forever. The source commit
+   discovered on the first page must equal the pinned source commit.
+3. **Bracketed aggregate read and final latest re-read** — only after the first
+   complete identity read does the orchestrator request aggregate spans. After
+   all content and report reads it re-reads the latest iteration whole with the
+   same bounded page/limit and fails closed on any movement: a force push (new
+   iteration), a rebase (common commit moved), a retarget (target commit or refs
+   changed), a reason change, or any change to the aggregated change list. The
+   pre-read and post-read pagination digests must be equal.
+
+The identity paginator supplements rather than replaces the existing aggregate
+diff read: its complete path/original-path/change-type digest must exactly match
+the aggregate response. The aggregate response remains the authoritative source
+of ordinary Add/Edit right-hand blocks, which are delivered with
+`spanBasis = "changeSet"` and take no recovery reads. Every raw aggregate path,
+including a path rejected by the safe-path grammar, remains in the coverage
+denominator (`pathRejected` rather than silently disappearing). Recovery runs
+only for the degenerate context/delete-only case on a pure same-path edit carrying
+at least one delete block: the wrapper reads the authoritative `commonRefCommit`
+base version and the `sourceRefCommit` version (which must equal the pinned source
+commit) and keeps only the right-hand spans that common→source content difference
+proves, presented as `spanBasis = "recovered"`. Add/delete/rename/mixed changes,
+an edit whose `originalPath` differs, and identical common/source content are
+never recovered. Incomplete pagination is rejected before any content read begins.
+The coverage gate, caps, and denominator rules are unchanged.
 
 Every file carries a versioned `spanBasis`: `changeSet` for ADO-declared
 right-hand blocks and `recovered` for deterministic common-base/source evidence.
 The basis is present in the model-facing accounting row, every slice's provenance,
 the persisted coverage record, preview/cycle metadata, and therefore artifact
-digests. Recovery attempted/recovered/evidence counts, exact common-base commit,
-and iteration ID are bounded accounting fields rather than hidden implementation
-details when an authoritative recovery binding becomes available.
+digests. Recovery attempted/recovered/evidence counts, the exact common-base
+commit, and the iteration ID are bounded accounting fields rather than hidden
+implementation details.
+
+Span recovery is available only where hosted Agency exposes PR #1499's flat
+paginated identity fields additively with its aggregate line-diff inputs.
+Against the public identity-only server, any older server, or a partial
+deployment, the structured probe fails, recovery stays dormant, and the wrapper
+reviews exactly as it did before — the degenerate pure-edit case is simply left
+uncovered rather than recovered.
 
 `binaryNoText` and `readerReportedNonTextUncorroborated` are the same reader
 answer split by whether anyone else corroborates it. When the change set's own

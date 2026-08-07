@@ -45,6 +45,11 @@ $script:ReviewerSourceSpanBases = @("changeSet", "recovered")
 $script:ReviewerSourceMaxPathLength = 1024
 $script:ReviewerSourceUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
 
+$script:ReviewerSourceCommitIdPattern = '^[0-9a-f]{40}$'
+$script:ReviewerSourceRefHeadPattern = '^refs/heads/[^\x00-\x1f\x7f\\]+$'
+$script:ReviewerSourceChangePageSize = 200
+$script:ReviewerSourceChangeLimit = 1000
+
 # Every reason a changed path can fail to arrive whole. The set is closed so a
 # renderer, a gate, or a test can enumerate it instead of pattern-matching prose.
 $script:ReviewerSourceOmissionReasons = @(
@@ -154,6 +159,287 @@ function Get-ReviewerSourceValue {
         if ($property) { return $property.Value }
     }
     return $Default
+}
+
+function ConvertTo-ReviewerSourceNormalizedCommitId {
+    <# Normalizes a commit ID to strict lowercase 40-hex. Returns $null if malformed. #>
+    param([AllowNull()][AllowEmptyString()][string]$CommitId)
+    if ([string]::IsNullOrEmpty($CommitId)) { return $null }
+    $lower = $CommitId.Trim().ToLowerInvariant()
+    if ($lower -notmatch $script:ReviewerSourceCommitIdPattern) { return $null }
+    return $lower
+}
+
+function Add-ReviewerSourceResourceBinding {
+    <# Stamps the authoritative recovery binding (Organization/Project/RepositoryId/
+       PullRequestId/IterationId/SourceCommit/TargetCommit/BaseCommit) onto a reader
+       resource so Get-ReviewerSourceRecoveredSpans can re-check the injected reader
+       contract case-sensitively. A rejected or null resource is returned untouched. #>
+    param([AllowNull()]$Resource, [Parameter(Mandatory)]$Binding)
+    if ($null -eq $Resource) { return $null }
+    foreach ($name in @("Organization", "Project", "RepositoryId", "PullRequestId",
+            "IterationId", "SourceCommit", "TargetCommit", "BaseCommit")) {
+        $value = Get-ReviewerSourceValue -Object $Binding -Name $name
+        $existing = Get-ReviewerSourceValue -Object $Resource -Name $name -Default $null
+        if ($null -ne $existing -and [string]$existing -cne [string]$value) { return $null }
+        if ($Resource -is [System.Collections.IDictionary]) {
+            $Resource[$name] = $value
+        }
+        else {
+            $Resource | Add-Member -NotePropertyName $name -NotePropertyValue $value -Force
+        }
+    }
+    return $Resource
+}
+
+function Test-ReviewerSourceGetChangesCapability {
+    <# Recovery requires the final PR #1499 identity inputs AND the hosted
+       Agency aggregate-diff inputs. The public local server intentionally has
+       no line-diff seam; activating there would erase ordinary source spans.
+       Anything short of the additive combination leaves legacy transport live. #>
+    param([Parameter(Mandatory)][AllowNull()]$ToolsListResult)
+    $tools = Get-ReviewerSourceValue -Object $ToolsListResult -Name "tools"
+    foreach ($tool in @($tools)) {
+        if ([string](Get-ReviewerSourceValue -Object $tool -Name "name" -Default "") -cne "repo_pull_request") { continue }
+        $properties = Get-ReviewerSourceValue -Object (
+            Get-ReviewerSourceValue -Object $tool -Name "inputSchema") -Name "properties"
+        $actions = @(Get-ReviewerSourceValue -Object (
+            Get-ReviewerSourceValue -Object $properties -Name "action") -Name "enum" -Default @())
+        if ($actions -cnotcontains "get_changes") { return $null }
+        foreach ($name in @("iterationId", "top", "skip", "includeDiffs", "includeLineContent")) {
+            if ($null -eq (Get-ReviewerSourceValue -Object $properties -Name $name)) { return $null }
+        }
+        return [pscustomobject]@{
+            Capable = $true
+            PageSize = $script:ReviewerSourceChangePageSize
+            ChangeLimit = $script:ReviewerSourceChangeLimit
+        }
+    }
+    return $null
+}
+
+function Get-ReviewerSourceIterationPageBinding {
+    param(
+        [Parameter(Mandatory)]$Response,
+        [ValidateRange(0, 1000)][int]$ExpectedSkip,
+        [ValidateRange(1, 1000)][int]$ExpectedTop,
+        [ValidateRange(1, [int]::MaxValue)][int]$ExpectedIterationId = 1,
+        [switch]$AllowAnyIteration
+    )
+    $iterationId = Get-ReviewerSourceValue -Object $Response -Name "iterationId"
+    if (($iterationId -isnot [int] -and $iterationId -isnot [long]) -or [int]$iterationId -lt 1 -or
+        (-not $AllowAnyIteration -and [int]$iterationId -ne $ExpectedIterationId)) { return $null }
+    $commits = @{}
+    foreach ($field in @("commonRefCommit", "sourceRefCommit", "targetRefCommit")) {
+        $node = Get-ReviewerSourceValue -Object $Response -Name $field
+        $commit = ConvertTo-ReviewerSourceNormalizedCommitId -CommitId (
+            [string](Get-ReviewerSourceValue -Object $node -Name "commitId" -Default ""))
+        if (-not $commit) { return $null }
+        $commits[$field] = $commit
+    }
+    $reason = Get-ReviewerSourceValue -Object $Response -Name "iterationReason"
+    if ($null -eq $reason) { return $null }
+    $reasonValue = Get-ReviewerSourceValue -Object $reason -Name "value"
+    $reasonNames = @(Get-ReviewerSourceValue -Object $reason -Name "names" -Default @())
+    $unrecognizedBits = Get-ReviewerSourceValue -Object $reason -Name "unrecognizedBits"
+    if ($null -ne $reasonValue -and
+        (($reasonValue -isnot [int] -and $reasonValue -isnot [long]) -or [long]$reasonValue -lt 0)) { return $null }
+    if (($unrecognizedBits -isnot [int] -and $unrecognizedBits -isnot [long]) -or [long]$unrecognizedBits -lt 0) { return $null }
+    foreach ($name in $reasonNames) {
+        if ($name -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$name)) { return $null }
+    }
+    if ($null -eq $reasonValue -and ($reasonNames.Count -ne 0 -or [long]$unrecognizedBits -ne 0)) { return $null }
+    $oldTarget = Get-ReviewerSourceValue -Object $Response -Name "oldTargetRefName"
+    $newTarget = Get-ReviewerSourceValue -Object $Response -Name "newTargetRefName"
+    if (($null -eq $oldTarget) -ne ($null -eq $newTarget)) { return $null }
+    if ($null -ne $oldTarget -and
+        ([string]$oldTarget -notmatch $script:ReviewerSourceRefHeadPattern -or
+         [string]$newTarget -notmatch $script:ReviewerSourceRefHeadPattern)) { return $null }
+    $commitsTruncated = Get-ReviewerSourceValue -Object $Response -Name "commitsTruncated"
+    $hasMore = Get-ReviewerSourceValue -Object $Response -Name "hasMoreChanges"
+    if ($commitsTruncated -isnot [bool] -or $hasMore -isnot [bool]) { return $null }
+    $nextSkip = Get-ReviewerSourceValue -Object $Response -Name "nextSkip"
+    $nextTop = Get-ReviewerSourceValue -Object $Response -Name "nextTop"
+    if (($nextSkip -isnot [int] -and $nextSkip -isnot [long]) -or
+        ($nextTop -isnot [int] -and $nextTop -isnot [long])) { return $null }
+    $changes = Get-ReviewerSourceValue -Object $Response -Name "changes"
+    if ($null -eq $changes) { return $null }
+    $changeCount = @($changes).Count
+    if ($changeCount -gt $ExpectedTop) { return $null }
+    if ($hasMore) {
+        if ($changeCount -lt 1 -or [int]$nextSkip -ne ($ExpectedSkip + $changeCount) -or
+            [int]$nextTop -lt 1 -or [int]$nextTop -gt 1000) { return $null }
+    }
+    elseif ([int]$nextSkip -ne 0 -or [int]$nextTop -ne 0) { return $null }
+    return [pscustomobject]@{
+        IterationId = [int]$iterationId
+        CommonRefCommit = $commits.commonRefCommit
+        SourceRefCommit = $commits.sourceRefCommit
+        TargetRefCommit = $commits.targetRefCommit
+        ReasonValue = if ($null -eq $reasonValue) { "" } else { [string][long]$reasonValue }
+        ReasonNames = [string[]]$reasonNames
+        UnrecognizedBits = [long]$unrecognizedBits
+        OldTargetRefName = if ($null -eq $oldTarget) { "" } else { [string]$oldTarget }
+        NewTargetRefName = if ($null -eq $newTarget) { "" } else { [string]$newTarget }
+        CommitsTruncated = [bool]$commitsTruncated
+        HasMoreChanges = [bool]$hasMore
+        NextSkip = [int]$nextSkip
+        NextTop = [int]$nextTop
+        Changes = @($changes)
+    }
+}
+
+function Test-ReviewerSourceIterationBindingStable {
+    param([AllowNull()]$Before, [AllowNull()]$After)
+    if ($null -eq $Before -or $null -eq $After) { return $false }
+    foreach ($name in @("IterationId", "CommonRefCommit", "SourceRefCommit", "TargetRefCommit",
+            "ReasonValue", "UnrecognizedBits", "OldTargetRefName", "NewTargetRefName", "CommitsTruncated")) {
+        if ([string](Get-ReviewerSourceValue -Object $Before -Name $name -Default "") -cne
+            [string](Get-ReviewerSourceValue -Object $After -Name $name -Default "")) { return $false }
+    }
+    return ((@($Before.ReasonNames) -join "`0") -ceq (@($After.ReasonNames) -join "`0"))
+}
+
+function Get-ReviewerSourcePinnedChangePages {
+    param(
+        [Parameter(Mandatory)][scriptblock]$ToolInvoker,
+        [Parameter(Mandatory)][string]$Project,
+        [Parameter(Mandatory)][string]$RepositoryId,
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)]$Capability
+    )
+    $pageSize = [Math]::Min([int](Get-ReviewerSourceValue -Object $Capability -Name "PageSize" -Default 1), 1000)
+    $limit = [Math]::Min([int](Get-ReviewerSourceValue -Object $Capability -Name "ChangeLimit" -Default 1), 1000)
+    if ($pageSize -lt 1 -or $limit -lt 1) { throw "The get_changes capability bounds are invalid." }
+    $all = [System.Collections.Generic.List[object]]::new()
+    $skip = 0
+    $iterationId = 0
+    $identity = $null
+    while ($true) {
+        $remaining = $limit - $all.Count
+        if ($remaining -lt 1) { throw "PR $PrId exceeds the bounded $limit-change source transport limit." }
+        $top = [Math]::Min($pageSize, $remaining)
+        $arguments = @{
+            action = "get_changes"; project = $Project; repositoryId = $RepositoryId
+            pullRequestId = $PrId; top = $top; skip = $skip
+        }
+        if ($iterationId -gt 0) { $arguments.iterationId = $iterationId }
+        $page = & $ToolInvoker $arguments
+        $binding = Get-ReviewerSourceIterationPageBinding -Response $page -ExpectedSkip $skip -ExpectedTop $top `
+            -ExpectedIterationId $(if ($iterationId -gt 0) { $iterationId } else { 1 }) -AllowAnyIteration:($iterationId -eq 0)
+        if ($null -eq $binding) { throw "PR $PrId returned malformed or incomplete iteration identity on a change page." }
+        if ($null -eq $identity) {
+            $identity = $binding
+            $iterationId = [int]$binding.IterationId
+        }
+        elseif (-not (Test-ReviewerSourceIterationBindingStable -Before $identity -After $binding)) {
+            throw "PR $PrId returned mixed iteration identity across change pages."
+        }
+        foreach ($change in @($binding.Changes)) { [void]$all.Add($change) }
+        if (-not $binding.HasMoreChanges) { break }
+        if ($all.Count -ge $limit) { throw "PR $PrId exceeds the bounded $limit-change source transport limit." }
+        $skip = [int]$binding.NextSkip
+    }
+    $response = [pscustomobject]@{ changes = $all.ToArray() }
+    $json = $response | ConvertTo-Json -Depth 30 -Compress
+    return [pscustomobject]@{
+        Binding = $identity
+        Response = $response
+        ChangeSetSha256 = Get-ReviewerSourceSha256 -Text $json -Substituting
+    }
+}
+
+function Invoke-ReviewerSourceNewContractTransport {
+    param(
+        [Parameter(Mandatory)][scriptblock]$ToolInvoker,
+        [Parameter(Mandatory)][scriptblock]$Reader,
+        [Parameter(Mandatory)][scriptblock]$BaseReader,
+        [Parameter(Mandatory)][scriptblock]$AggregateReader,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Organization,
+        [Parameter(Mandatory)][string]$Project,
+        [Parameter(Mandatory)][string]$RepositoryId,
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit,
+        [Parameter(Mandatory)]$Capability,
+        [Parameter(Mandatory)][hashtable]$Policy,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$PolicySha256,
+        [Parameter(Mandatory)][scriptblock]$NonceFactory
+    )
+    $first = Get-ReviewerSourcePinnedChangePages -ToolInvoker $ToolInvoker -Project $Project `
+        -RepositoryId $RepositoryId -PrId $PrId -Capability $Capability
+    $binding = $first.Binding
+    if ([string]$binding.SourceRefCommit -cne $SourceCommit) {
+        throw "PR $PrId iteration source '$($binding.SourceRefCommit)' does not match pinned source $SourceCommit."
+    }
+    $aggregateResponse = & $AggregateReader
+    if ($null -eq $aggregateResponse) {
+        throw "PR $PrId aggregate diff response was unavailable."
+    }
+    $changes = $first.Response
+    if ((Get-ReviewerSourceChangeIdentityDigest -Response $changes) -cne
+        (Get-ReviewerSourceChangeIdentityDigest -Response $aggregateResponse)) {
+        throw "PR $PrId aggregate diff and iteration-bound change pages disagree."
+    }
+    # Identity pages prove the comparison commits and complete change list. The
+    # pre-existing aggregate response remains the authoritative span source:
+    # replacing it with identity-only pages would erase ordinary host spans.
+    $spans = Get-ReviewerSourceChangedSpans -Response $aggregateResponse
+    $kindsByPath = Get-ReviewerSourceChangeKindsByPath -Response $aggregateResponse
+    $paths = [string[]]@(Get-ReviewerSourceRawChangedPaths -Response $aggregateResponse)
+    $observedRightHandBlocks = Measure-ReviewerSourceRightHandBlocks -Response $aggregateResponse
+    if (@($paths | Where-Object { -not (ConvertTo-ReviewerSourcePath -Path $_) }).Count -gt 0) {
+        # Blocks belonging to rejected paths cannot appear in the normalized span
+        # map. Keep those paths for `pathRejected` accounting without mistaking
+        # their deliberate exclusion for a parser disagreement.
+        $observedRightHandBlocks = 0
+        foreach ($spanPath in @($spans.Keys)) { $observedRightHandBlocks += @($spans[$spanPath]).Count }
+    }
+    Assert-ReviewerSourceChangeSetAgreement -ChangedPaths $paths -SpansByPath $spans `
+        -ObservedRightHandBlockCount $observedRightHandBlocks
+    $recoveryBinding = [pscustomobject]@{
+        Organization = $Organization; Project = $Project; RepositoryId = $RepositoryId.ToLowerInvariant()
+        PullRequestId = $PrId; IterationId = [int]$binding.IterationId
+        SourceCommit = $SourceCommit; TargetCommit = [string]$binding.TargetRefCommit
+        BaseCommit = [string]$binding.CommonRefCommit
+    }
+    $cache = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
+    $sourceReader = {
+        param([string]$Path, [string[]]$Kinds)
+        if ($cache.Contains($Path)) { return $cache[$Path] }
+        $actualKinds = if ($kindsByPath.Contains($Path)) { @($kindsByPath[$Path]) } else { @($Kinds) }
+        $resource = Add-ReviewerSourceResourceBinding -Resource (& $Reader $Path $actualKinds) -Binding $recoveryBinding
+        $cache[$Path] = $resource
+        return $resource
+    }.GetNewClosure()
+    $baseReader = {
+        param([string]$Path, [string[]]$Kinds)
+        return Add-ReviewerSourceResourceBinding -Resource (
+            & $BaseReader $Path $Kinds ([string]$recoveryBinding.BaseCommit)) -Binding $recoveryBinding
+    }.GetNewClosure()
+    $recovery = Get-ReviewerSourceRecoveredSpans -Response $aggregateResponse -SpansByPath $spans `
+        -Binding $recoveryBinding -SourceReader $sourceReader -BaseReader $baseReader
+    $report = New-ReviewerSourceTransportReport -CommitSha $SourceCommit -ChangedPaths $paths `
+        -SpansByPath $recovery.SpansByPath -Policy $Policy -Reader $sourceReader `
+        -ChangeKindsByPath $kindsByPath -SpanBasisByPath $recovery.SpanBasisByPath `
+        -ExpectedSpanCountByPath $recovery.ExpectedSpanCountByPath `
+        -RecoveryAttemptedFileCount ([int]$recovery.AttemptedFileCount) `
+        -RecoveryRecoveredFileCount (@($recovery.RecoveredPaths).Count) `
+        -RecoveryEvidenceBlockCount ([int]$recovery.EvidenceBlockCount) `
+        -RecoveryBaseCommit ([string]$recoveryBinding.BaseCommit) -RecoveryIterationId ([int]$recoveryBinding.IterationId)
+    $confirm = Get-ReviewerSourcePinnedChangePages -ToolInvoker $ToolInvoker -Project $Project `
+        -RepositoryId $RepositoryId -PrId $PrId -Capability $Capability
+    if (-not (Test-ReviewerSourceIterationBindingStable -Before $binding -After $confirm.Binding) -or
+        [string]$first.ChangeSetSha256 -cne [string]$confirm.ChangeSetSha256) {
+        throw "PR $PrId iteration identity or change list moved during pinned content reads."
+    }
+    $blockText = if (@($report.Files).Count -gt 0) {
+        Format-ReviewerSealedSourceBlock -Report $report -NonceFactory $NonceFactory
+    } else { "" }
+    return @{
+        Report = $report; BlockText = $blockText
+        Gate = Test-ReviewerSourceCoverageGate -Report $report -Policy $Policy
+        Record = ConvertTo-ReviewerSourceCoverageRecord -Report $report -PolicySha256 $PolicySha256
+    }
 }
 
 function Get-ReviewerSourceSha256 {
@@ -483,6 +769,51 @@ function Get-ReviewerSourceChangeKindsByPath {
     return $kindsByPath
 }
 
+function Get-ReviewerSourceRawChangedPaths {
+    <# Preserves every non-folder path exactly as the change set named it. Invalid
+       repository paths must reach the report so they are counted `pathRejected`;
+       normalizing first would silently remove them from the denominator. #>
+    param([Parameter(Mandatory)]$Response)
+    $paths = [System.Collections.Generic.List[string]]::new()
+    $changes = Resolve-ReviewerSourceChangeEntries -Response $Response
+    foreach ($change in @($changes)) {
+        if ($null -eq $change) { continue }
+        $item = Get-ReviewerSourceValue -Object $change -Name "item"
+        if ([bool](Get-ReviewerSourceValue -Object $item -Name "isFolder" -Default $false)) { continue }
+        $path = [string](Get-ReviewerSourceValue -Object $item -Name "path" -Default "")
+        if (-not $path) { $path = [string](Get-ReviewerSourceValue -Object $change -Name "path" -Default "") }
+        if ($path) { [void]$paths.Add($path) }
+    }
+    return $paths.ToArray()
+}
+
+function Get-ReviewerSourceChangeIdentityDigest {
+    <# Canonical path/originalPath/change-type identity shared by the aggregate
+       diff and the complete identity-page list. Diff blocks are intentionally
+       excluded: this comparison binds which files changed, not their two
+       independently transported span representations. #>
+    param([Parameter(Mandatory)]$Response)
+    $rows = [System.Collections.Generic.List[object]]::new()
+    $changes = Resolve-ReviewerSourceChangeEntries -Response $Response
+    foreach ($change in @($changes)) {
+        if ($null -eq $change) { throw "The change set contains a null entry." }
+        $item = Get-ReviewerSourceValue -Object $change -Name "item"
+        if ([bool](Get-ReviewerSourceValue -Object $item -Name "isFolder" -Default $false)) { continue }
+        $path = [string](Get-ReviewerSourceValue -Object $item -Name "path" -Default "")
+        if (-not $path) { $path = [string](Get-ReviewerSourceValue -Object $change -Name "path" -Default "") }
+        $originalPath = [string](Get-ReviewerSourceValue -Object $change -Name "originalPath" -Default "")
+        $kinds = Get-ReviewerSourceChangeKinds -Value (
+            Get-ReviewerSourceValue -Object $change -Name "changeType" -Default $null)
+        [void]$rows.Add([ordered]@{
+            path = $path
+            originalPath = $originalPath
+            changeKinds = [string[]]@($kinds | Sort-Object -CaseSensitive -Unique)
+        })
+    }
+    $ordered = @($rows | Sort-Object { [string]$_.path }, { [string]$_.originalPath })
+    return Get-ReviewerSourceSha256 -Text ($ordered | ConvertTo-Json -Depth 8 -Compress) -Substituting
+}
+
 function Get-ReviewerSourceChangedSpans {
     <# Extracts the right-hand-side (post-change) line spans from a change-set
        response that carries line diff blocks.
@@ -551,10 +882,16 @@ function Get-ReviewerSourceDegenerateChanges {
                         SawBlock = $false
                         SawRightHand = $false
                         Malformed = $false
+                        SamePath = $true
                         EvidenceBlockCount = 0
                     }
                 }
                 $state = $states[$path]
+                $rawOriginalPath = [string](Get-ReviewerSourceValue -Object $change -Name "originalPath" -Default "")
+                if ($rawOriginalPath) {
+                    $originalPath = ConvertTo-ReviewerSourcePath -Path $rawOriginalPath
+                    if (-not $originalPath -or $originalPath -cne $path) { $state.SamePath = $false }
+                }
                 foreach ($kind in @(Get-ReviewerSourceChangeKinds -Value (
                             Get-ReviewerSourceValue -Object $change -Name "changeType" -Default $null))) {
                     if (-not $state.ChangeKinds.Contains([string]$kind)) { [void]$state.ChangeKinds.Add([string]$kind) }
@@ -593,7 +930,7 @@ function Get-ReviewerSourceDegenerateChanges {
                 $state = $states[$path]
                 $kinds = $state.ChangeKinds.ToArray()
                 $normalizedKinds = @($kinds | Sort-Object -CaseSensitive -Unique)
-                if ($state.SawBlock -and -not $state.SawRightHand -and -not $state.Malformed -and
+                if ($state.SawBlock -and $state.SamePath -and -not $state.SawRightHand -and -not $state.Malformed -and
                     $state.EvidenceBlockCount -gt 0 -and $normalizedKinds.Count -eq 1 -and
                     [string]$normalizedKinds[0] -ceq "edit") {
                     $result[$path] = [pscustomobject]@{

@@ -1074,11 +1074,14 @@ Assert-Source ((Measure-WrapperVariableWrite -FunctionAst $transportAst -Name 'c
     "and the change set, its spans, its change kinds and the re-read head are each established once"
 # Counting writes says nothing about REACHABILITY: an inserted early return of a
 # doctored result leaves every pinned line intact and simply never runs it.
+# Three returns: (1) the capability-gated new-contract dispatch, (2) the reader
+# closure's own return inside .GetNewClosure(), and (3) the legacy path's final
+# return. The new-contract dispatch delegates to a separately validated function.
 Assert-Source (@($transportAst.FindAll({
                 param($candidate)
                 $candidate -is [Management.Automation.Language.ReturnStatementAst]
-            }, $true)).Count -eq 2) `
-    "and the transport has exactly two returns - the reader's and its own - so no earlier one can hand back a doctored result the pinned lines below never reach"
+            }, $true)).Count -eq 3) `
+    "and the transport has exactly three returns - the capability-gated dispatch, the reader's and its own - so no earlier one can hand back a doctored result the pinned lines below never reach"
 # ...and counting returns is not enough either, because PowerShell returns a
 # value without one. A bare hashtable on its own line joins the output: emitted
 # beside the real return it makes `Gate.Ok` the array `@($true, $false)`, which
@@ -1087,7 +1090,7 @@ Assert-Source ((Measure-WrapperBareOutput -FunctionAst $transportAst -AllowedCom
             'Assert-ReviewerSourceChangeSetAgreement',
             'ConvertFrom-AgentMcpResourceContent',
             'New-AgentNonce')) -eq 0) `
-    "and it emits nothing bare and calls nothing in statement position but the three commands listed here, so no doctored value can join what it returns without being one of those two returns"
+    "and it emits nothing bare and calls nothing in statement position but the three commands listed here, so no doctored value can join what it returns without being one of those three returns"
 $transportStatements = @($transportAst.Body.EndBlock.Statements)
 Assert-Source ($transportStatements.Count -gt 0 -and
     $transportStatements[-1] -is [Management.Automation.Language.ReturnStatementAst]) `
@@ -3006,8 +3009,482 @@ Assert-Source ($cycleText.IndexOf('if (-not $sourceTransport.Gate.Ok)', [StringC
     "recovery cannot move model execution ahead of the coverage decision"
 Assert-Source ($transportText.IndexOf('get_iterations', [StringComparison]::Ordinal) -lt 0 -and
     $transportText.IndexOf('New-ReviewerSourceRecoveryContext', [StringComparison]::Ordinal) -lt 0) `
-    "the live transport does not invoke an unsupported iteration action or recover without an authoritative common-base seam"
+    "the legacy transport path does not invoke an unsupported iteration action or recover without an authoritative common-base seam"
 
+# ---------------------------------------------------------------------------
+# Final flat PR #1499 get_changes contract. The whole orchestration lives in the
+# LIBRARY (SourceTransport.ps1) so it can be replayed offline, arguments and all.
+# Every fixture below is synthetic and derived only from the SHAPE of the
+# contract: a bounded, iteration-pinned, flat-paginated change set whose identity
+# is re-checked on every page and re-read whole after the content reads.
+# ---------------------------------------------------------------------------
+Write-Host "`nFlat get_changes contract tests:" -ForegroundColor Cyan
+
+# -- Capability detection -----------------------------------------------------
+# The final contract is additive: iterationId is the only new input, paging still
+# uses the existing top and skip. Activation also requires Agency's advertised
+# aggregate diff inputs; the public local server intentionally has no span seam.
+$fcValidToolsList = [pscustomobject]@{
+    tools = @([pscustomobject]@{
+            name        = "repo_pull_request"
+            inputSchema = [pscustomobject]@{
+                properties = [pscustomobject]@{
+                    action      = [pscustomobject]@{ enum = @("get", "list", "get_changes") }
+                    iterationId = [pscustomobject]@{ type = "number" }
+                    top         = [pscustomobject]@{ type = "number" }
+                    skip        = [pscustomobject]@{ type = "number" }
+                    includeDiffs = [pscustomobject]@{ type = "boolean" }
+                    includeLineContent = [pscustomobject]@{ type = "boolean" }
+                }
+            }
+        })
+}
+$fcCapability = Test-ReviewerSourceGetChangesCapability -ToolsListResult $fcValidToolsList
+Assert-Source ($null -ne $fcCapability -and [bool]$fcCapability.Capable -and
+    [int]$fcCapability.PageSize -eq 200 -and [int]$fcCapability.ChangeLimit -eq 1000) `
+    "the additive identity plus aggregate-diff schema yields a bounded 200-page/1000-total capability"
+
+$publicLocalSchema = [pscustomobject]@{ tools = @([pscustomobject]@{
+            name = "repo_pull_request"
+            inputSchema = [pscustomobject]@{ properties = [pscustomobject]@{
+                    action = [pscustomobject]@{ enum = @("get_changes") }
+                    iterationId = [pscustomobject]@{ type = "number" }
+                    top = [pscustomobject]@{ type = "number" }
+                    skip = [pscustomobject]@{ type = "number" }
+                } }
+        }) }
+Assert-Source ($null -eq (Test-ReviewerSourceGetChangesCapability -ToolsListResult $publicLocalSchema)) `
+    "the public identity-only schema stays dormant because it cannot preserve ordinary aggregate spans"
+
+# The obsolete FileDiff schema (includeLineDiffs/paths/changePageSize/changeLimit)
+# is NOT the flat contract: without top/skip it stays dormant on the legacy body.
+$oldToolsList = [pscustomobject]@{
+    tools = @([pscustomobject]@{
+            name        = "repo_pull_request"
+            inputSchema = [pscustomobject]@{
+                properties = [pscustomobject]@{
+                    action           = [pscustomobject]@{ enum = @("get", "list", "get_changes") }
+                    iterationId      = [pscustomobject]@{ type = "number" }
+                    includeLineDiffs = [pscustomobject]@{ type = "boolean" }
+                    paths            = [pscustomobject]@{ type = "array"; maxItems = 20 }
+                    changePageSize   = [pscustomobject]@{ type = "number"; maximum = 200 }
+                    changeLimit      = [pscustomobject]@{ type = "number"; maximum = 1000 }
+                }
+            }
+        })
+}
+Assert-Source ($null -eq (Test-ReviewerSourceGetChangesCapability -ToolsListResult $oldToolsList)) `
+    "the old FileDiff schema without top/skip stays dormant and runs the legacy body"
+foreach ($drop in @("iterationId", "top", "skip")) {
+    $props = [ordered]@{
+        action      = [pscustomobject]@{ enum = @("get_changes") }
+        iterationId = [pscustomobject]@{ type = "number" }
+        top         = [pscustomobject]@{ type = "number" }
+        skip        = [pscustomobject]@{ type = "number" }
+        includeDiffs = [pscustomobject]@{ type = "boolean" }
+        includeLineContent = [pscustomobject]@{ type = "boolean" }
+    }
+    $props.Remove($drop)
+    $partial = [pscustomobject]@{ tools = @([pscustomobject]@{ name = "repo_pull_request"
+                inputSchema = [pscustomobject]@{ properties = [pscustomobject]$props } }) }
+    Assert-Source ($null -eq (Test-ReviewerSourceGetChangesCapability -ToolsListResult $partial)) `
+        "a schema missing the '$drop' input is not the flat contract and stays dormant"
+}
+$noActionList = [pscustomobject]@{ tools = @([pscustomobject]@{ name = "repo_pull_request"
+            inputSchema = [pscustomobject]@{ properties = [pscustomobject]@{
+                    action = [pscustomobject]@{ enum = @("get", "list") }
+                    iterationId = [pscustomobject]@{ type = "number" }
+                    top = [pscustomobject]@{ type = "number" }; skip = [pscustomobject]@{ type = "number" } } } }) }
+Assert-Source ($null -eq (Test-ReviewerSourceGetChangesCapability -ToolsListResult $noActionList)) `
+    "a schema whose action enum omits get_changes stays dormant"
+Assert-Source ($null -eq (Test-ReviewerSourceGetChangesCapability -ToolsListResult $null) -and
+    $null -eq (Test-ReviewerSourceGetChangesCapability -ToolsListResult ([pscustomobject]@{ tools = @() }))) `
+    "a null or tool-less tools/list result stays dormant"
+
+# -- Page fixtures ------------------------------------------------------------
+# Constants match the recovery binding above so the reused readers stamp the same
+# authoritative identity the orchestrator derives from the pinned page.
+$fcSource = $recoveryBinding.SourceCommit
+$fcCommon = $recoveryBinding.BaseCommit
+$fcTarget = $recoveryBinding.TargetCommit
+$fcRepoId = $recoveryBinding.RepositoryId
+$fcPr = [int]$recoveryBinding.PullRequestId
+$fcIter = [int]$recoveryBinding.IterationId
+
+function New-FCPage {
+    param(
+        [object[]]$Changes = @(),
+        [bool]$HasMore = $false,
+        [int]$NextSkip = 0,
+        [int]$NextTop = 0,
+        [hashtable]$Overrides = @{}
+    )
+    $page = [pscustomobject]@{
+        iterationId      = $fcIter
+        commonRefCommit  = [pscustomobject]@{ commitId = $fcCommon }
+        sourceRefCommit  = [pscustomobject]@{ commitId = $fcSource }
+        targetRefCommit  = [pscustomobject]@{ commitId = $fcTarget }
+        iterationReason  = [pscustomobject]@{ value = 1; names = @("push"); unrecognizedBits = 0 }
+        oldTargetRefName = $null
+        newTargetRefName = $null
+        commitsTruncated = $false
+        hasMoreChanges   = $HasMore
+        nextSkip         = $NextSkip
+        nextTop          = $NextTop
+        changes          = @($Changes)
+    }
+    foreach ($k in $Overrides.Keys) {
+        $page.PSObject.Properties.Remove($k)
+        $page | Add-Member -MemberType NoteProperty -Name $k -Value $Overrides[$k]
+    }
+    return $page
+}
+function New-FCOrdinaryChange {
+    param([string]$Path = "/src/ord.cs", [int]$Start = 2, [int]$Count = 1)
+    return [pscustomobject]@{
+        item       = [pscustomobject]@{ path = $Path; isFolder = $false }
+        changeType = "Edit"
+        diff       = [pscustomobject]@{ lineDiffBlocks = @(
+                [pscustomobject]@{ changeType = 3; modifiedLineNumberStart = $Start; modifiedLinesCount = $Count }) }
+    }
+}
+
+# Every valid page carries a consistent, fully-populated identity.
+$fcBinding = Get-ReviewerSourceIterationPageBinding -Response (New-FCPage -Changes @((New-FCOrdinaryChange))) `
+    -ExpectedSkip 0 -ExpectedTop 200 -AllowAnyIteration
+Assert-Source ($null -ne $fcBinding -and [int]$fcBinding.IterationId -eq $fcIter -and
+    [string]$fcBinding.CommonRefCommit -ceq $fcCommon -and [string]$fcBinding.SourceRefCommit -ceq $fcSource -and
+    [string]$fcBinding.TargetRefCommit -ceq $fcTarget -and [string]$fcBinding.ReasonValue -ceq "1" -and
+    (@($fcBinding.ReasonNames) -join ",") -ceq "push" -and [long]$fcBinding.UnrecognizedBits -eq 0 -and
+    -not $fcBinding.HasMoreChanges -and [int]$fcBinding.NextSkip -eq 0 -and [int]$fcBinding.NextTop -eq 0) `
+    "a valid page binds a complete flat identity: iteration, common/source/target commits, reason and pagination"
+
+# A valid retarget names pair binds; a lone name, malformed ref, truncated
+# commits, mismatched iteration, or bad pagination each refuses the page.
+$fcRetargetPage = New-FCPage -Changes @((New-FCOrdinaryChange)) -Overrides @{
+    oldTargetRefName = "refs/heads/main"; newTargetRefName = "refs/heads/release" }
+Assert-Source ($null -ne (Get-ReviewerSourceIterationPageBinding -Response $fcRetargetPage -ExpectedSkip 0 -ExpectedTop 200 -AllowAnyIteration)) `
+    "a page carrying a complete old/new target ref pair binds"
+$fcBadCases = @(
+    @{ Name = "short common commit"; Overrides = @{ commonRefCommit = [pscustomobject]@{ commitId = "abc123" } } },
+    @{ Name = "missing source commit node"; Overrides = @{ sourceRefCommit = $null } },
+    @{ Name = "missing iterationReason"; Overrides = @{ iterationReason = $null } },
+    @{ Name = "reason names with a blank entry"; Overrides = @{ iterationReason = [pscustomobject]@{ value = 1; names = @("push", "  "); unrecognizedBits = 0 } } },
+    @{ Name = "reason value absent but bits set"; Overrides = @{ iterationReason = [pscustomobject]@{ value = $null; names = @(); unrecognizedBits = 4 } } },
+    @{ Name = "lone new target ref name"; Overrides = @{ newTargetRefName = "refs/heads/release" } },
+    @{ Name = "non-branch target ref"; Overrides = @{ oldTargetRefName = "refs/tags/v1"; newTargetRefName = "refs/heads/release" } },
+    @{ Name = "non-boolean hasMoreChanges"; Overrides = @{ hasMoreChanges = "yes" } }
+)
+foreach ($bad in $fcBadCases) {
+    $badPage = New-FCPage -Changes @((New-FCOrdinaryChange)) -Overrides $bad.Overrides
+    Assert-Source ($null -eq (Get-ReviewerSourceIterationPageBinding -Response $badPage -ExpectedSkip 0 -ExpectedTop 200 -AllowAnyIteration)) `
+        "a page with $($bad.Name) is refused (fails closed)"
+}
+# Pagination arithmetic: a continuation page must advance skip by its own change
+# count and keep top in range; a terminal page must zero both cursors.
+$fcBadPaging = New-FCPage -Changes @((New-FCOrdinaryChange)) -HasMore $true -NextSkip 5 -NextTop 200
+Assert-Source ($null -eq (Get-ReviewerSourceIterationPageBinding -Response $fcBadPaging -ExpectedSkip 0 -ExpectedTop 200 -AllowAnyIteration)) `
+    "a continuation page whose nextSkip does not advance by its change count is refused"
+$fcBadTerminal = New-FCPage -Changes @((New-FCOrdinaryChange)) -HasMore $false -NextSkip 1 -NextTop 0
+Assert-Source ($null -eq (Get-ReviewerSourceIterationPageBinding -Response $fcBadTerminal -ExpectedSkip 0 -ExpectedTop 200 -AllowAnyIteration)) `
+    "a terminal page that leaves a non-zero continuation cursor is refused"
+Assert-Source ($null -eq (Get-ReviewerSourceIterationPageBinding -Response (New-FCPage -Changes @((New-FCOrdinaryChange -Path "/a.cs"), (New-FCOrdinaryChange -Path "/b.cs"))) -ExpectedSkip 0 -ExpectedTop 1 -AllowAnyIteration)) `
+    "a page returning more changes than the requested top is refused"
+Assert-Source ($null -eq (Get-ReviewerSourceIterationPageBinding -Response (New-FCPage -Changes @((New-FCOrdinaryChange))) -ExpectedSkip 0 -ExpectedTop 200 -ExpectedIterationId 999)) `
+    "a page whose iteration id does not match the expected binding is refused"
+
+# -- Binding stability --------------------------------------------------------
+$fcStable = Get-ReviewerSourceIterationPageBinding -Response (New-FCPage -Changes @((New-FCOrdinaryChange))) -ExpectedSkip 0 -ExpectedTop 200 -AllowAnyIteration
+Assert-Source (Test-ReviewerSourceIterationBindingStable -Before $fcStable -After $fcStable) `
+    "an identity is stable against itself"
+foreach ($move in @(
+        @{ Name = "force push"; Overrides = @{ sourceRefCommit = [pscustomobject]@{ commitId = ("f" * 40) } } },
+        @{ Name = "rebase"; Overrides = @{ commonRefCommit = [pscustomobject]@{ commitId = ("e" * 40) } } },
+        @{ Name = "retarget"; Overrides = @{ oldTargetRefName = "refs/heads/main"; newTargetRefName = "refs/heads/release" } },
+        @{ Name = "reason change"; Overrides = @{ iterationReason = [pscustomobject]@{ value = 2; names = @("rebase"); unrecognizedBits = 0 } } }
+    )) {
+    $moved = Get-ReviewerSourceIterationPageBinding -Response (New-FCPage -Changes @((New-FCOrdinaryChange)) -Overrides $move.Overrides) -ExpectedSkip 0 -ExpectedTop 200 -AllowAnyIteration
+    Assert-Source (-not (Test-ReviewerSourceIterationBindingStable -Before $fcStable -After $moved)) `
+        "a $($move.Name) makes the identity unstable"
+}
+Assert-Source (-not (Test-ReviewerSourceIterationBindingStable -Before $null -After $fcStable) -and
+    -not (Test-ReviewerSourceIterationBindingStable -Before $fcStable -After $null)) `
+    "a null binding on either side is never stable"
+
+# -- Bounded pagination -------------------------------------------------------
+function Invoke-FCPager {
+    param([object[]]$Responses, $Calls, $Capability = $fcCapability)
+    $invoker = {
+        param([hashtable]$Arguments)
+        [void]$Calls.Add($Arguments)
+        return $Responses[$Calls.Count - 1]
+    }.GetNewClosure()
+    return Get-ReviewerSourcePinnedChangePages -ToolInvoker $invoker -Project "widgets" `
+        -RepositoryId $fcRepoId -PrId $fcPr -Capability $Capability
+}
+# Single page: one bounded call, aggregated change set, stable digest.
+$fcSingle = New-FCPage -Changes @((New-FCOrdinaryChange))
+$fcSingleCalls = [System.Collections.Generic.List[hashtable]]::new()
+$fcSingleResult = Invoke-FCPager -Responses @($fcSingle) -Calls $fcSingleCalls
+Assert-Source ($fcSingleCalls.Count -eq 1 -and [string]$fcSingleCalls[0].action -ceq "get_changes" -and
+    [int]$fcSingleCalls[0].top -eq 200 -and [int]$fcSingleCalls[0].skip -eq 0 -and
+    -not $fcSingleCalls[0].ContainsKey("iterationId") -and [int]$fcSingleCalls[0].pullRequestId -eq $fcPr) `
+    "the first page is fetched with a bounded top=200/skip=0 and no explicit iteration id"
+Assert-Source (@($fcSingleResult.Response.changes).Count -eq 1 -and [string]$fcSingleResult.ChangeSetSha256) `
+    "a single page aggregates its change set and produces a stable change-set digest"
+
+# Multi page: pages arrive in order, the second is pinned to the discovered
+# iteration, and the identity stays consistent across pages.
+$fcPage1 = New-FCPage -Changes @((New-FCOrdinaryChange -Path "/src/a.cs")) -HasMore $true -NextSkip 1 -NextTop 200
+$fcPage2 = New-FCPage -Changes @((New-FCOrdinaryChange -Path "/src/b.cs"))
+$fcMultiCalls = [System.Collections.Generic.List[hashtable]]::new()
+$fcMultiResult = Invoke-FCPager -Responses @($fcPage1, $fcPage2) -Calls $fcMultiCalls
+Assert-Source ($fcMultiCalls.Count -eq 2 -and [int]$fcMultiCalls[0].skip -eq 0 -and
+    -not $fcMultiCalls[0].ContainsKey("iterationId") -and
+    [int]$fcMultiCalls[1].skip -eq 1 -and [int]$fcMultiCalls[1].iterationId -eq $fcIter -and [int]$fcMultiCalls[1].top -eq 200) `
+    "paging advances skip by the delivered count and pins every page after the first to the discovered iteration"
+Assert-Source (@($fcMultiResult.Response.changes).Count -eq 2 -and
+    [string]@($fcMultiResult.Response.changes)[0].item.path -ceq "/src/a.cs" -and
+    [string]@($fcMultiResult.Response.changes)[1].item.path -ceq "/src/b.cs") `
+    "multi-page changes are aggregated in delivery order"
+
+# Mixed identity across pages fails closed.
+$fcMovedPage2 = New-FCPage -Changes @((New-FCOrdinaryChange -Path "/src/b.cs")) -Overrides @{
+    sourceRefCommit = [pscustomobject]@{ commitId = ("f" * 40) } }
+Assert-Source (Test-Throws {
+        $c = [System.Collections.Generic.List[hashtable]]::new()
+        Invoke-FCPager -Responses @($fcPage1, $fcMovedPage2) -Calls $c
+    }) "a page whose identity differs from the first fails closed with mixed-identity"
+
+# The page size is capped at 1000 however large the advertised capability.
+$fcHostileCap = [pscustomobject]@{ Capable = $true; PageSize = 99999; ChangeLimit = 99999 }
+$fcCapCalls = [System.Collections.Generic.List[hashtable]]::new()
+Invoke-FCPager -Responses @((New-FCPage -Changes @((New-FCOrdinaryChange)))) -Calls $fcCapCalls -Capability $fcHostileCap | Out-Null
+Assert-Source ([int]$fcCapCalls[0].top -le 1000) `
+    "an over-large advertised page size is capped to the 1000 hard ceiling on the wire"
+
+# A change set that never terminates within the bounded total fails closed.
+$fcRunawayCap = [pscustomobject]@{ Capable = $true; PageSize = 2; ChangeLimit = 3 }
+$fcRunA = New-FCPage -Changes @((New-FCOrdinaryChange -Path "/a.cs"), (New-FCOrdinaryChange -Path "/b.cs")) -HasMore $true -NextSkip 2 -NextTop 2
+$fcRunB = New-FCPage -Changes @((New-FCOrdinaryChange -Path "/c.cs")) -HasMore $true -NextSkip 3 -NextTop 1
+Assert-Source (Test-Throws {
+        $c = [System.Collections.Generic.List[hashtable]]::new()
+        Invoke-FCPager -Responses @($fcRunA, $fcRunB) -Calls $c -Capability $fcRunawayCap
+    }) "a change set that exceeds the bounded total (the ceiling is 1000) fails closed rather than reading forever"
+
+# -- Orchestration ------------------------------------------------------------
+$fcSourceReader = {
+    param([string]$Path, [string[]]$Kinds)
+    New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit -Text $sourceText -ChangeKinds @($Kinds)
+}.GetNewClosure()
+$fcBaseReader = {
+    param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+    New-RecoveryResource -Path $Path -CommitSha $BaseCommit -Text $targetText -ChangeKinds @($Kinds)
+}.GetNewClosure()
+function Invoke-FCOrchestrator {
+    param([object[]]$Responses, $Calls, [scriptblock]$SourceReader = $fcSourceReader,
+        [scriptblock]$BaseReader = $fcBaseReader, $Capability = $fcCapability, $AggregateResponse = $null,
+        $Events = $null)
+    if ($null -eq $AggregateResponse) { $AggregateResponse = [pscustomobject]@{ changes = @($Responses[0].changes) } }
+    $invoker = {
+        param([hashtable]$Arguments)
+        if ($null -ne $Events) { [void]$Events.Add("identity") }
+        [void]$Calls.Add($Arguments)
+        return $Responses[$Calls.Count - 1]
+    }.GetNewClosure()
+    $aggregateReader = {
+        if ($null -ne $Events) { [void]$Events.Add("aggregate") }
+        return $AggregateResponse
+    }.GetNewClosure()
+    return Invoke-ReviewerSourceNewContractTransport -ToolInvoker $invoker -Reader $SourceReader -BaseReader $BaseReader `
+        -Organization $recoveryBinding.Organization -Project $recoveryBinding.Project -RepositoryId $fcRepoId `
+        -PrId $fcPr -SourceCommit $fcSource -Capability $Capability -Policy $policy -PolicySha256 "" `
+        -NonceFactory { 'n' * 32 } -AggregateReader $aggregateReader
+}
+
+# A pure context/delete edit with delete evidence recovers the exact right-hand
+# spans from the common->source content read, presented as recovered evidence.
+$fcDegenerate = New-FCPage -Changes @((New-DegenerateEdit -Path "/src/a.cs"))
+$fcRecCalls = [System.Collections.Generic.List[hashtable]]::new()
+$fcRecEvents = [System.Collections.Generic.List[string]]::new()
+$fcRecResult = Invoke-FCOrchestrator -Responses @($fcDegenerate, $fcDegenerate) -Calls $fcRecCalls -Events $fcRecEvents
+Assert-Source ($fcRecCalls.Count -eq 2 -and [string]$fcRecCalls[0].action -ceq "get_changes" -and
+    [int]$fcRecCalls[0].top -eq 200 -and [int]$fcRecCalls[0].skip -eq 0 -and
+    -not $fcRecCalls[1].ContainsKey("iterationId") -and
+    (@($fcRecEvents) -join ",") -ceq "identity,aggregate,identity") `
+    "the orchestrator brackets the aggregate diff with complete latest-iteration identity reads"
+Assert-Source ([int]$fcRecResult.Report.CoveredFiles -eq 1 -and [int]$fcRecResult.Report.CoveragePercent -eq 100 -and
+    [bool]$fcRecResult.Gate.Ok -and $fcRecResult.BlockText -match '"spanBasis":"recovered"' -and $null -ne $fcRecResult.Record) `
+    "a degenerate same-path edit recovers its exact spans at spanBasis=recovered and passes the gate"
+
+$fcTruncatedCommits = New-FCPage -Changes @((New-DegenerateEdit -Path "/src/a.cs"))
+$fcTruncatedCommits.commitsTruncated = $true
+$fcTruncatedBinding = Get-ReviewerSourceIterationPageBinding -Response $fcTruncatedCommits `
+    -ExpectedSkip 0 -ExpectedTop 200 -ExpectedIterationId $fcIter
+Assert-Source ($null -ne $fcTruncatedBinding -and [bool]$fcTruncatedBinding.CommitsTruncated) `
+    "commit-list truncation remains bound metadata without losing exact common/source/target identity"
+
+# Ordinary server Add/Edit spans are authoritative and never enter recovery.
+$fcOrdinaryPage = New-FCPage -Changes @((New-FCOrdinaryChange -Path "/src/a.cs" -Start 2 -Count 1))
+$fcOrdCalls = [System.Collections.Generic.List[hashtable]]::new()
+$fcOrdResult = Invoke-FCOrchestrator -Responses @($fcOrdinaryPage, $fcOrdinaryPage) -Calls $fcOrdCalls `
+    -BaseReader { param($p, $k, $b) throw "recovery must not read on an ordinary authoritative span" }
+Assert-Source ([int]$fcOrdResult.Report.CoveragePercent -eq 100 -and [bool]$fcOrdResult.Gate.Ok -and
+    $fcOrdResult.BlockText -match '"spanBasis":"changeSet"' -and $fcOrdResult.BlockText -notmatch '"spanBasis":"recovered"') `
+    "an ordinary right-hand span is delivered unchanged at spanBasis=changeSet with no recovery reads"
+
+# The final public #1499 identity page carries raw change entries but no diff
+# blocks. It supplements the existing aggregate diff response rather than
+# replacing the ordinary authoritative span source.
+$fcRawIdentityChange = [pscustomobject]@{
+    changeTrackingId = 11
+    changeType = 2
+    item = [pscustomobject]@{ path = "/src/a.cs"; isFolder = $false }
+}
+$fcRawIdentityPage = New-FCPage -Changes @($fcRawIdentityChange)
+$fcAggregateOrdinary = [pscustomobject]@{ changes = @((New-FCOrdinaryChange -Path "/src/a.cs" -Start 2 -Count 1)) }
+$fcRawCalls = [System.Collections.Generic.List[hashtable]]::new()
+$fcRawResult = Invoke-FCOrchestrator -Responses @($fcRawIdentityPage, $fcRawIdentityPage) -Calls $fcRawCalls `
+    -AggregateResponse $fcAggregateOrdinary `
+    -BaseReader { param($p, $k, $b) throw "ordinary aggregate spans must not recover" }
+Assert-Source ([int]$fcRawResult.Report.CoveragePercent -eq 100 -and $fcRawResult.Gate.Ok -and
+    $fcRawResult.BlockText -match '"spanBasis":"changeSet"') `
+    "raw identity-only pages preserve ordinary spans from the separately bound aggregate diff"
+
+$fcAggregateDegenerate = [pscustomobject]@{ changes = @((New-DegenerateEdit -Path "/src/a.cs")) }
+$fcRawRecoveryCalls = [System.Collections.Generic.List[hashtable]]::new()
+$fcRawRecoveryResult = Invoke-FCOrchestrator -Responses @($fcRawIdentityPage, $fcRawIdentityPage) `
+    -Calls $fcRawRecoveryCalls -AggregateResponse $fcAggregateDegenerate
+Assert-Source ($fcRawRecoveryResult.Gate.Ok -and
+    $fcRawRecoveryResult.BlockText -match '"spanBasis":"recovered"') `
+    "raw identity-only pages bind common/source recovery for a degenerate aggregate edit"
+
+$fcRejectedPathChange = New-FCOrdinaryChange -Path "/src/x|hidden.cs" -Start 2 -Count 1
+$fcRejectedPage = New-FCPage -Changes @($fcRejectedPathChange)
+$fcRejectedCalls = [System.Collections.Generic.List[hashtable]]::new()
+$fcRejectedResult = Invoke-FCOrchestrator -Responses @($fcRejectedPage, $fcRejectedPage) -Calls $fcRejectedCalls
+Assert-Source ([int]$fcRejectedResult.Report.ChangedFileCount -eq 1 -and
+    [string]@($fcRejectedResult.Report.Files)[0].Reason -ceq "pathRejected" -and -not $fcRejectedResult.Gate.Ok) `
+    "a rejected Git path stays in the denominator and is accounted pathRejected"
+
+$fcDisagreeAggregate = [pscustomobject]@{ changes = @((New-FCOrdinaryChange -Path "/src/other.cs")) }
+Assert-Source (Test-Throws {
+        $c = [System.Collections.Generic.List[hashtable]]::new()
+        Invoke-FCOrchestrator -Responses @($fcOrdinaryPage, $fcOrdinaryPage) -Calls $c `
+            -AggregateResponse $fcDisagreeAggregate
+    }) "iteration pages and the aggregate diff must identify the exact same change set"
+
+# The pinned source must equal the iteration source or the whole read fails closed.
+$fcMismatchPage = New-FCPage -Changes @((New-FCOrdinaryChange)) -Overrides @{
+    sourceRefCommit = [pscustomobject]@{ commitId = ("d" * 40) } }
+Assert-Source (Test-Throws {
+        $c = [System.Collections.Generic.List[hashtable]]::new()
+        Invoke-FCOrchestrator -Responses @($fcMismatchPage, $fcMismatchPage) -Calls $c
+    }) "an iteration whose source commit does not equal the pinned source fails closed"
+
+# The post-read re-read fails closed on any movement: force push, rebase,
+# retarget, reason change, or a change-list that no longer matches.
+foreach ($race in @(
+        @{ Name = "force push"; Overrides = @{ sourceRefCommit = [pscustomobject]@{ commitId = ("f" * 40) } } },
+        @{ Name = "rebase"; Overrides = @{ commonRefCommit = [pscustomobject]@{ commitId = ("e" * 40) } } },
+        @{ Name = "retarget"; Overrides = @{ oldTargetRefName = "refs/heads/main"; newTargetRefName = "refs/heads/release" } },
+        @{ Name = "reason change"; Overrides = @{ iterationReason = [pscustomobject]@{ value = 2; names = @("rebase"); unrecognizedBits = 0 } } }
+    )) {
+    $confirmMoved = New-FCPage -Changes @((New-FCOrdinaryChange -Path "/src/a.cs" -Start 2 -Count 1)) -Overrides $race.Overrides
+    Assert-Source (Test-Throws {
+            $c = [System.Collections.Generic.List[hashtable]]::new()
+            Invoke-FCOrchestrator -Responses @($fcOrdinaryPage, $confirmMoved) -Calls $c `
+                -BaseReader { param($p, $k, $b) throw "no recovery here" }
+        }) "a $($race.Name) during content reads fails the post-read re-read closed"
+}
+$fcConfirmChanged = New-FCPage -Changes @((New-FCOrdinaryChange -Path "/src/a.cs" -Start 2 -Count 1), (New-FCOrdinaryChange -Path "/src/extra.cs"))
+Assert-Source (Test-Throws {
+        $c = [System.Collections.Generic.List[hashtable]]::new()
+        Invoke-FCOrchestrator -Responses @($fcOrdinaryPage, $fcConfirmChanged) -Calls $c `
+            -BaseReader { param($p, $k, $b) throw "no recovery here" }
+    }) "a change list that moves during content reads fails the post-read re-read closed"
+
+# A mixed set keeps the unread file in the denominator and fails the gate.
+$fcMixedPage = New-FCPage -Changes @((New-DegenerateEdit -Path "/src/a.cs"), (New-DegenerateEdit -Path "/src/unread.cs"))
+$fcMixedSourceReader = {
+    param([string]$Path, [string[]]$Kinds)
+    if ($Path -ceq "/src/unread.cs") { return $null }
+    New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit -Text $sourceText -ChangeKinds @($Kinds)
+}.GetNewClosure()
+$fcMixedCalls = [System.Collections.Generic.List[hashtable]]::new()
+$fcMixedResult = Invoke-FCOrchestrator -Responses @($fcMixedPage, $fcMixedPage) -Calls $fcMixedCalls -SourceReader $fcMixedSourceReader
+Assert-Source ([int]$fcMixedResult.Report.CoveredFiles -eq 1 -and [int]$fcMixedResult.Report.SourceBearingFileCount -eq 2 -and
+    -not $fcMixedResult.Gate.Ok) `
+    "a mixed recovered/unrecovered set keeps the unread file in the denominator and fails the gate"
+
+# Same content and a hostile reader both fail recovery closed - no invented span.
+$fcSameContentReader = {
+    param([string]$Path, [string[]]$Kinds)
+    New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit -Text $targetText -ChangeKinds @($Kinds)
+}.GetNewClosure()
+$fcSameResult = Invoke-FCOrchestrator -Responses @($fcDegenerate, $fcDegenerate) -Calls ([System.Collections.Generic.List[hashtable]]::new()) -SourceReader $fcSameContentReader
+Assert-Source (-not $fcSameResult.Gate.Ok -and $fcSameResult.BlockText -notmatch '"spanBasis":"recovered"') `
+    "identical common/source content cannot synthesize a span and the degenerate file fails the gate"
+$fcHostileReader = {
+    param([string]$Path, [string[]]$Kinds)
+    $r = New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit -Text $sourceText -ChangeKinds @($Kinds)
+    $r.CommitSha = "9" * 40
+    return $r
+}.GetNewClosure()
+$fcHostileResult = Invoke-FCOrchestrator -Responses @($fcDegenerate, $fcDegenerate) -Calls ([System.Collections.Generic.List[hashtable]]::new()) -SourceReader $fcHostileReader
+Assert-Source (-not $fcHostileResult.Gate.Ok -and $fcHostileResult.BlockText -notmatch '"spanBasis":"recovered"') `
+    "a hostile reader claiming the wrong pinned commit cannot drive recovery and fails the gate"
+
+# A same-path edit whose originalPath differs is a rename in disguise: excluded.
+$fcRenameEdit = [pscustomobject]@{
+    item         = [pscustomobject]@{ path = "/src/a.cs"; isFolder = $false }
+    changeType   = "Edit"
+    originalPath = "/src/old.cs"
+    diff         = [pscustomobject]@{ lineDiffBlocks = @(
+            [pscustomobject]@{ changeType = 0; modifiedLineNumberStart = 1; modifiedLinesCount = 4 },
+            [pscustomobject]@{ changeType = 2; modifiedLineNumberStart = 0; modifiedLinesCount = 0 }) }
+}
+Assert-Source (@((Get-ReviewerSourceDegenerateChanges -Response ([pscustomobject]@{ changes = @($fcRenameEdit) })).Keys).Count -eq 0) `
+    "a same-path edit whose originalPath differs is excluded from recovery"
+
+# -- Wiring, probe safety, and no obsolete tokens (structural) ----------------
+# The capability probe NEVER runs on the shared ordinary-transport session: a
+# tools/list failure aborts the session it runs on, and that session owns the
+# remaining reads and the pending PR writes. The transport delegates detection to
+# an isolated probe helper and runs the legacy body on the untouched session.
+$fcResolveText = Get-FunctionTextFromWrapper -Name 'Resolve-ReviewerGetChangesCapability'
+Assert-Source ($transportText.IndexOf('Send-AgentMcpRequest', [StringComparison]::Ordinal) -lt 0 -and
+    $transportText.IndexOf('Resolve-ReviewerGetChangesCapability', [StringComparison]::Ordinal) -ge 0) `
+    "the transport never probes on the shared session; it delegates capability detection to the isolated probe helper"
+Assert-Source ($fcResolveText.Length -gt 0 -and
+    $fcResolveText.IndexOf('Open-AgentMcpSession', [StringComparison]::Ordinal) -ge 0 -and
+    $fcResolveText.IndexOf('Close-AgentMcpSession', [StringComparison]::Ordinal) -ge 0 -and
+    $fcResolveText.IndexOf('finally', [StringComparison]::Ordinal) -ge 0 -and
+    $fcResolveText.IndexOf("Send-AgentMcpRequest -Session `$probeSession", [StringComparison]::Ordinal) -ge 0 -and
+    $fcResolveText.IndexOf("`$Session['GetChangesCapability'] = `$capability", [StringComparison]::Ordinal) -ge 0 -and
+    $fcResolveText.IndexOf("`$Session.ContainsKey('GetChangesCapability')", [StringComparison]::Ordinal) -ge 0) `
+    "the probe runs tools/list on a dedicated repos-only session, always closes it, and caches the result (including null) on the shared session"
+# The wrapper delegates to the library orchestrator, wiring the three live seams.
+$newContractText = Get-FunctionTextFromWrapper -Name 'Get-ReviewerSourceTransportNewContract'
+Assert-Source ($newContractText.Length -gt 0 -and
+    $newContractText.IndexOf('Invoke-ReviewerSourceNewContractTransport', [StringComparison]::Ordinal) -ge 0 -and
+    $newContractText.IndexOf('-ToolInvoker', [StringComparison]::Ordinal) -ge 0 -and
+    $newContractText.IndexOf('-BaseReader', [StringComparison]::Ordinal) -ge 0) `
+    "the wrapper is a thin adapter that hands the orchestrator its tool invoker and source/base readers"
+
+# The live flat implementation carries none of the obsolete FileDiff-contract
+# vocabulary. The check is case-sensitive so the capability's ChangeLimit/PageSize
+# fields are not mistaken for the dropped changeLimit/changePageSize arguments.
+$fcLiveText = (@(
+        'Test-ReviewerSourceGetChangesCapability', 'Get-ReviewerSourceIterationPageBinding',
+        'Test-ReviewerSourceIterationBindingStable', 'Get-ReviewerSourcePinnedChangePages',
+        'Invoke-ReviewerSourceNewContractTransport'
+    ) | ForEach-Object { (Get-Command $_).ScriptBlock.ToString() }) -join "`n"
+foreach ($token in @('targetTipAtIteration', 'compareTo', 'synthetic', 'FileDiff', 'fileDiff',
+        'includeLineDiffs', 'changePageSize', 'changeLimit', 'fileDiffBase', 'fileDiffTarget', 'get_iterations')) {
+    Assert-Source ($fcLiveText.IndexOf($token, [StringComparison]::Ordinal) -lt 0) `
+        "the live flat implementation contains no obsolete '$token' token"
+}
 # ---------------------------------------------------------------------------
 
 Write-Host ""
