@@ -38,6 +38,17 @@ function Get-ReviewerRunReconciliationTimestamp {
     param([AllowNull()]$Value)
     $invariant = [System.Globalization.CultureInfo]::InvariantCulture
     if ($Value -is [DateTime]) {
+        # `Unspecified` is the shape this actually arrives in: ConvertFrom-Json
+        # gives Kind=Utc for a `Z`, Local for an offset, and Unspecified for a
+        # timestamp carrying neither - and `ToUniversalTime()` on Unspecified
+        # ASSUMES local, silently adding the host's offset. A declaration sealed
+        # as 06:36:52 read back as 13:36:52Z here and as something else
+        # elsewhere, which is the very thing this function exists to prevent.
+        # Refuse it, exactly as the string branch below does.
+        if ($Value.Kind -eq [DateTimeKind]::Unspecified) {
+            throw ("A sealed timestamp must carry a UTC marker or an offset; " +
+                "'$($Value.ToString("o", $invariant))' carries neither.")
+        }
         return ([DateTime]$Value).ToUniversalTime().ToString("o", $invariant)
     }
     if ($Value -is [DateTimeOffset]) {
