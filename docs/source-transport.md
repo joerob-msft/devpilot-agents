@@ -66,7 +66,8 @@ The block opens with every changed path and whether its source actually arrived:
 set: `budgetExhausted`, `sliceCountCapExceeded`, `fileTooLarge`, `notTextual`,
 `decodeRejected`, `transportFailed`, `noChangedSpans`, `binaryNoText`,
 `readerReportedNonTextUncorroborated`, `emptyFile`, `spansUnavailable`,
-`fileCountCapExceeded`, `pathRejected`, `spanOutsideFile`, `unsafeSliceText`.
+`fileCountCapExceeded`, `pathRejected`, `spanOutsideFile`, `unsafeSliceText`,
+`recoveredHunkShortfall`.
 
 Those causes are told apart at the reader seam, before the strict decoder runs.
 The decoder's job is safety and it refuses everything it dislikes the same way,
@@ -113,7 +114,10 @@ for a pure `edit` on the same path when the aggregate entry supplies at least on
 well-formed delete block, optional context blocks, and no right-hand block. The
 delete-block count is retained as independent evidence: requested-span accounting
 uses at least that count, so a shorter recovered hunk list cannot award itself
-100% coverage. Adds, deletes, any rename mixture, context-only/empty/malformed
+100% coverage. When all proved recovered hunks arrive but that evidence floor is
+still higher, the file is partial with `recoveredHunkShortfall`; it is not
+misreported as a byte-budget failure. Adds, deletes, any rename mixture,
+context-only/empty/malformed
 block sets, ordinary diffs, binary/empty/oversized/decode-rejected content,
 missing versions, equal versions, stale identity, and work over the
 request/line/matrix/hunk caps remain unrecovered. The source read is cached and

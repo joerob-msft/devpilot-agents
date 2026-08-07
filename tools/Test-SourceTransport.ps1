@@ -660,7 +660,7 @@ Assert-Source ([int]$report.CoveredFiles -eq 1 -and [int]$report.ChangedFileCoun
 Assert-Source ([int]$report.CoveragePercent -eq 20) "the coverage percentage is measured against the files that carry source"
 foreach ($file in @($report.Files)) {
     if (-not [string]$file.Reason) { continue }
-    Assert-Source (@("budgetExhausted", "sliceCountCapExceeded", "fileTooLarge", "notTextual", "transportFailed", "noChangedSpans", "fileCountCapExceeded", "pathRejected", "spanOutsideFile", "unsafeSliceText") -ccontains [string]$file.Reason) `
+    Assert-Source (@("budgetExhausted", "sliceCountCapExceeded", "fileTooLarge", "notTextual", "transportFailed", "noChangedSpans", "fileCountCapExceeded", "pathRejected", "spanOutsideFile", "unsafeSliceText", "recoveredHunkShortfall") -ccontains [string]$file.Reason) `
         "reason '$($file.Reason)' is in the closed reason set"
 }
 Assert-Source (Test-Throws { New-ReviewerSourceFileEntry -Path '/a' -CommitSha $commit -Status 'omitted' -Reason 'madeUp' }) `
@@ -1637,7 +1637,7 @@ Assert-Source (@($script:ReviewerSourceNothingToReadReasons) -join ',' -ceq 'noC
     "the nothing-to-read set the sentence is built from holds exactly noChangedSpans"
 # Derived, not hand-listed: the block's sentence is generated from the same sets,
 # so a hand-maintained copy here would be exactly the drift this file refuses.
-$structuralReasons = @('pathRejected', 'fileCountCapExceeded', 'budgetExhausted', 'sliceCountCapExceeded', 'spanOutsideFile', 'unsafeSliceText')
+$structuralReasons = @('pathRejected', 'fileCountCapExceeded', 'budgetExhausted', 'sliceCountCapExceeded', 'spanOutsideFile', 'unsafeSliceText', 'recoveredHunkShortfall')
 foreach ($readerReason in @($script:ReviewerSourceOmissionReasons | Where-Object {
             $script:ReviewerSourceNothingToReadReasons -cnotcontains $_ -and $structuralReasons -cnotcontains $_
         })) {
@@ -2888,6 +2888,45 @@ $evidenceReport = New-ReviewerSourceTransportReport -CommitSha $recoveryBinding.
 Assert-Source ([int]$evidenceReport.RequestedSpanCount -eq 3 -and [int]$evidenceReport.DeliveredSpanCount -eq 2 -and
     [int]$evidenceReport.SpanPercent -eq 66 -and -not (Test-ReviewerSourceCoverageGate $evidenceReport $policy).Ok) `
     "independent aggregate evidence can keep recovered coverage below 100 instead of accepting a self-defined denominator"
+
+$singleHunkBaseText = "one`nold`nthree`n"
+$singleHunkSourceText = "one`nnew`nthree`n"
+$singleHunkRecovery = Get-ReviewerSourceRecoveredSpans -Response $threeDeleteResponse `
+    -SpansByPath (Get-ReviewerSourceChangedSpans $threeDeleteResponse) -Binding $recoveryBinding `
+    -SourceReader { param($Path, $Kinds) New-RecoveryResource $Path $recoveryBinding.SourceCommit $singleHunkSourceText $Kinds } `
+    -BaseReader { param($Path, $Kinds) New-RecoveryResource $Path $recoveryBinding.BaseCommit $singleHunkBaseText $Kinds }
+$singleHunkReport = New-ReviewerSourceTransportReport -CommitSha $recoveryBinding.SourceCommit `
+    -ChangedPaths @("/src/evidence.cs") -SpansByPath $singleHunkRecovery.SpansByPath -Policy $policy `
+    -Reader { param($Path) New-RecoveryResource $Path $recoveryBinding.SourceCommit $singleHunkSourceText } `
+    -ChangeKindsByPath (Get-ReviewerSourceChangeKindsByPath $threeDeleteResponse) `
+    -SpanBasisByPath $singleHunkRecovery.SpanBasisByPath `
+    -ExpectedSpanCountByPath $singleHunkRecovery.ExpectedSpanCountByPath `
+    -RecoveryAttemptedFileCount 1 -RecoveryRecoveredFileCount 1 `
+    -RecoveryEvidenceBlockCount $singleHunkRecovery.EvidenceBlockCount `
+    -RecoveryBaseCommit $recoveryBinding.BaseCommit -RecoveryIterationId $recoveryBinding.IterationId
+$singleHunkEntry = @($singleHunkReport.Files)[0]
+Assert-Source ([string]$singleHunkEntry.Status -ceq "partial" -and
+    [string]$singleHunkEntry.Reason -ceq "recoveredHunkShortfall" -and
+    [string]$singleHunkEntry.Reason -cne "budgetExhausted" -and
+    [int]$singleHunkEntry.DeliveredRawSpanCount -eq 1 -and
+    [int]$singleHunkEntry.RawRequestedSpanCount -eq 3 -and
+    [int]$singleHunkReport.SpanPercent -eq 33 -and
+    -not (Test-ReviewerSourceCoverageGate $singleHunkReport $policy).Ok) `
+    "three delete-evidence blocks but one proved recovered hunk reports recoveredHunkShortfall at 1/3 and keeps the gate closed"
+
+$budgetText = ("x" * 300) + "`nshort"
+$budgetReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @("/src/budget.cs") `
+    -SpansByPath ([ordered]@{ "/src/budget.cs" = @(@{ Start = 1; End = 1 }) }) `
+    -Policy (New-TestPolicy -Overrides @{ contextRadiusLines = 0; maxSliceBytesPerFile = 256 }) `
+    -Reader { param($Path) [pscustomobject]@{
+            Text = $budgetText; MimeType = "text/plain"
+            ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($budgetText)
+            Sha256 = Get-ReviewerSourceSha256 -Text $budgetText
+        } }
+$budgetEntry = @($budgetReport.Files)[0]
+Assert-Source ([string]$budgetEntry.SpanBasis -ceq "changeSet" -and
+    [string]$budgetEntry.Reason -ceq "budgetExhausted") `
+    "a genuine changeSet slice-budget drop remains budgetExhausted"
 
 $addCandidate = [pscustomobject]@{ changes = @([pscustomobject]@{
             item = [pscustomobject]@{ path = "/src/add.cs"; isFolder = $false }; changeType = "Add"

@@ -56,7 +56,7 @@ $script:ReviewerSourceOmissionReasons = @(
     "budgetExhausted", "sliceCountCapExceeded", "fileTooLarge", "notTextual", "transportFailed",
     "noChangedSpans", "binaryNoText", "readerReportedNonTextUncorroborated", "emptyFile",
     "spansUnavailable", "fileCountCapExceeded",
-    "pathRejected", "spanOutsideFile", "unsafeSliceText", "decodeRejected"
+    "pathRejected", "spanOutsideFile", "unsafeSliceText", "decodeRejected", "recoveredHunkShortfall"
 )
 # Every reason that may mark a path as carrying no source at all. This is the
 # GATE-side set: `New-ReviewerSourceFileEntry` refuses `CarriesSource = $false`
@@ -1883,6 +1883,12 @@ function New-ReviewerSourceTransportReport {
             elseif ([int]$cut.DroppedForBudget -gt 0) { "budgetExhausted" }
             elseif ([int]$cut.DroppedForSliceCap -gt 0) { "sliceCountCapExceeded" }
             elseif ([int]$cut.SpansOutsideFile -gt 0) { "spanOutsideFile" }
+            elseif ($spanBasis -ceq "recovered" -and
+                $rawRequested -gt [int]$cut.RawRequestedSpanCount -and
+                [int]$cut.DroppedForUnsafeText -eq 0 -and
+                [int]$cut.DroppedForBudget -eq 0 -and
+                [int]$cut.DroppedForSliceCap -eq 0 -and
+                [int]$cut.SpansOutsideFile -eq 0) { "recoveredHunkShortfall" }
             else { "budgetExhausted" }
         }
         $entry = New-ReviewerSourceFileEntry -Path $path -CommitSha $CommitSha -Status $status -Reason $reason `
@@ -2273,7 +2279,7 @@ function Format-ReviewerSealedSourceBlock {
     $nothingToRead = @($script:ReviewerSourceNothingToReadReasons | ForEach-Object { "``$_``" })
     $stillUnread = @(@($script:ReviewerSourceOmissionReasons | Where-Object {
                 $script:ReviewerSourceNothingToReadReasons -cnotcontains $_ -and
-                $_ -cnotin @('pathRejected', 'fileCountCapExceeded', 'budgetExhausted', 'sliceCountCapExceeded', 'spanOutsideFile', 'unsafeSliceText')
+                $_ -cnotin @('pathRejected', 'fileCountCapExceeded', 'budgetExhausted', 'sliceCountCapExceeded', 'spanOutsideFile', 'unsafeSliceText', 'recoveredHunkShortfall')
             }) | ForEach-Object { "``$_``" })
     [void]$lines.Add("You may not claim to have reviewed, verified, or cleared a path whose status is ``omitted``, and you may not treat a ``partial`` path as fully read. Say what you could not see. EXACTLY $($nothingToRead.Count) reason is different: $($nothingToRead -join ', ') means the pull request itself says that path holds no added or edited text - a delete or a rename - so there is nothing in it for anyone to read. Every OTHER reason, including $($stillUnread -join ', '), means the source content of that path could NOT be established. Those are files you have not read. Nobody has told you they are empty, and you may not treat them as checked.")
     [void]$lines.Add("")
