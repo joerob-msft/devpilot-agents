@@ -37,14 +37,18 @@ For each bound PR the wrapper:
 
 1. reads the change set **with** line diff blocks and derives, per changed path,
    the right-hand (post-change) line spans of every add and edit;
-2. expands each span by a policy context radius, clamps it to the file, and
+2. for a source-bearing edit whose aggregate blocks are well formed but contain
+   only context/deletes, reads the exact merge-target and source versions through
+   the existing bounded `repo_file/get_content` seam and deterministically
+   recovers only proven right-hand spans;
+3. expands each span by a policy context radius, clamps it to the file, and
    merges overlaps so no line travels twice;
-3. reads each changed file's bytes itself at the exact 40-hex source commit,
+4. reads each changed file's bytes itself at the exact 40-hex source commit,
    through the same validated resource contract it already uses;
-4. cuts the merged spans into whole-line slices, hashing each one;
-5. renders a **sealed block** — collision-checked fences, per-slice provenance
+5. cuts the merged spans into whole-line slices, hashing each one;
+6. renders a **sealed block** — collision-checked fences, per-slice provenance
    JSON, and a leading content-accounting table;
-6. refuses to review at all if coverage falls below the policy floor.
+7. refuses to review at all if coverage falls below the policy floor.
 
 Nothing about the model's tool grant changes. It gains content, not capability.
 
@@ -102,6 +106,22 @@ kind carries content is read anyway, and what comes back decides:
 | a length that is not decodable | `decodeRejected` | **yes** — a malformed payload, not an oversized one |
 | real text content | `spansUnavailable` | **yes** — its diff was lost |
 | unreadable | `transportFailed` | **yes** |
+
+Recovery is deliberately narrower than this spanless classification. It runs only
+when the aggregate entry declares source-bearing content and supplies at least one
+well-formed context/delete block but no right-hand block. Empty or malformed block
+sets, deletes, pure renames, ordinary diffs, binary/empty/oversized/decode-rejected
+content, missing versions, equal versions, stale identity, and work over the
+request/line/matrix/hunk caps remain unrecovered. The source read is cached and
+reused by normal slicing. Every unsuccessful attempt therefore retains the same
+closed-set omission reason and denominator treatment it had before recovery.
+
+Each attempt is bound to the configured organization, project, repository ID, PR
+ID, exact source and merge-target commits, canonical path, and declared change
+kinds. The PR identity and both commits are read before the aggregate diff and
+rechecked after all content reads; movement fails the transport closed. If ADO
+does not provide an exact merge-target commit, recovery is disabled while the
+ordinary aggregate-span transport remains available.
 
 `binaryNoText` and `readerReportedNonTextUncorroborated` are the same reader
 answer split by whether anyone else corroborates it. When the change set's own

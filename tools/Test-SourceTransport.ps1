@@ -1125,7 +1125,8 @@ Assert-Source ($transportText -match 'Record\s*=\s*\(ConvertTo-ReviewerSourceCov
 # rest of the layer is judged against. A literal list at this call site would
 # decode whatever it named while every policy assertion in this file still
 # passed.
-Assert-Source ($transportText -match '-AllowedMimeTypes @\(\$SourceTransportPolicy\.allowedMimeTypes\)') `
+$boundReaderText = Get-FunctionTextFromWrapper -Name 'Get-ReviewerBoundSourceContent'
+Assert-Source ($boundReaderText -match '-AllowedMimeTypes @\(\$SourceTransportPolicy\.allowedMimeTypes\)') `
     "the decoder's accepted content types come from the validated policy, never a literal list"
 # The one remaining way to present source as pinned when it is not: the author
 # pushes between the change-set read and the byte read, and the slices are
@@ -2660,6 +2661,232 @@ Assert-Source (Test-Throws {
         }
         New-ReviewerSourceTransportPolicy -Policy ([pscustomobject]$incomplete)
     }) "a policy that omits the sibling budget is refused rather than defaulted"
+
+# ---------------------------------------------------------------------------
+Write-Host "[19/19] Degenerate ADO edits recover only proven right-hand spans" -ForegroundColor Cyan
+# ---------------------------------------------------------------------------
+
+$recoveryBinding = [pscustomobject][ordered]@{
+    Organization = "example"; Project = "widgets"
+    RepositoryId = "11111111-1111-1111-1111-111111111111"
+    PullRequestId = 42
+    SourceCommit = "a" * 40
+    TargetCommit = "b" * 40
+}
+function New-RecoveryResource {
+    param(
+        [string]$Path,
+        [string]$CommitSha,
+        [string]$Text,
+        [string[]]$ChangeKinds = @("edit"),
+        [string]$Rejected = "",
+        $Binding = $recoveryBinding
+    )
+    return [pscustomobject][ordered]@{
+        Text = $Text; MimeType = "text/plain"
+        ByteLength = [Text.Encoding]::UTF8.GetByteCount($Text)
+        Sha256 = Get-ReviewerSourceSha256 -Text $Text
+        Rejected = $Rejected
+        Organization = $Binding.Organization; Project = $Binding.Project
+        RepositoryId = $Binding.RepositoryId; PullRequestId = $Binding.PullRequestId
+        SourceCommit = $Binding.SourceCommit; TargetCommit = $Binding.TargetCommit
+        Path = $Path; CommitSha = $CommitSha; ChangeKinds = @($ChangeKinds)
+    }
+}
+function New-DegenerateEdit {
+    param([string]$Path)
+    return [pscustomobject]@{
+        item = [pscustomobject]@{ path = $Path; isFolder = $false }
+        changeType = "Edit"
+        diff = [pscustomobject]@{
+            lineDiffBlocks = @(
+                [pscustomobject]@{ changeType = 0; modifiedLineNumberStart = 1; modifiedLinesCount = 4 },
+                [pscustomobject]@{ changeType = 2; modifiedLineNumberStart = 0; modifiedLinesCount = 0 }
+            )
+        }
+    }
+}
+
+$targetText = "one`ntwo`nthree`nfour`n"
+$sourceText = "one`nTWO`nthree`nfour`nfive`n"
+$degenerateResponse = [pscustomobject]@{ changes = @((New-DegenerateEdit -Path "/src/a.cs")) }
+$aggregateSpans = Get-ReviewerSourceChangedSpans -Response $degenerateResponse
+$recovered = Get-ReviewerSourceRecoveredSpans -Response $degenerateResponse -SpansByPath $aggregateSpans `
+    -Binding $recoveryBinding `
+    -SourceReader { param($Path, $Kinds) New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit -Text $sourceText -ChangeKinds $Kinds } `
+    -TargetReader { param($Path, $Kinds) New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.TargetCommit -Text $targetText -ChangeKinds $Kinds }
+$exactSpans = @($recovered.SpansByPath["/src/a.cs"])
+Assert-Source ($exactSpans.Count -eq 2 -and [int]$exactSpans[0].Start -eq 2 -and [int]$exactSpans[0].End -eq 2 -and
+    [int]$exactSpans[1].Start -eq 5 -and [int]$exactSpans[1].End -eq 5) `
+    "a context/delete-only edit recovers the exact replacement and appended right-hand lines"
+$recoveredReport = New-ReviewerSourceTransportReport -CommitSha $recoveryBinding.SourceCommit `
+    -ChangedPaths @("/src/a.cs") -SpansByPath $recovered.SpansByPath -Policy $policy `
+    -Reader { param($Path) New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit -Text $sourceText } `
+    -ChangeKindsByPath (Get-ReviewerSourceChangeKindsByPath -Response $degenerateResponse)
+Assert-Source ([int]$recoveredReport.CoveredFiles -eq 1 -and [int]$recoveredReport.CoveragePercent -eq 100 -and
+    (Test-ReviewerSourceCoverageGate -Report $recoveredReport -Policy $policy).Ok) `
+    "proven recovered spans flow through the ordinary slicer and unchanged coverage gate"
+
+$ordinaryResponse = [pscustomobject]@{ changes = @([pscustomobject]@{
+            item = [pscustomobject]@{ path = "/src/ordinary.cs"; isFolder = $false }; changeType = "Edit"
+            diff = [pscustomobject]@{ lineDiffBlocks = @([pscustomobject]@{
+                        changeType = 3; modifiedLineNumberStart = 3; modifiedLinesCount = 2
+                    }) }
+        }) }
+$ordinarySpans = Get-ReviewerSourceChangedSpans -Response $ordinaryResponse
+$ordinaryReads = 0
+$ordinaryRecovered = Get-ReviewerSourceRecoveredSpans -Response $ordinaryResponse -SpansByPath $ordinarySpans `
+    -Binding $recoveryBinding -SourceReader { $script:ordinaryReads++; throw "must not read" } `
+    -TargetReader { $script:ordinaryReads++; throw "must not read" }
+Assert-Source ($ordinaryReads -eq 0 -and @($ordinaryRecovered.SpansByPath["/src/ordinary.cs"]).Count -eq 1 -and
+    [int]@($ordinaryRecovered.SpansByPath["/src/ordinary.cs"])[0].Start -eq 3) `
+    "an ordinary authoritative right-hand span is unchanged and never enters recovery"
+$missingTargetBinding = [pscustomobject][ordered]@{
+    Organization = $recoveryBinding.Organization; Project = $recoveryBinding.Project
+    RepositoryId = $recoveryBinding.RepositoryId; PullRequestId = $recoveryBinding.PullRequestId
+    SourceCommit = $recoveryBinding.SourceCommit; TargetCommit = ""
+}
+$missingBindingReads = 0
+$missingBindingResult = Get-ReviewerSourceRecoveredSpans -Response $degenerateResponse -SpansByPath $aggregateSpans `
+    -Binding $missingTargetBinding -SourceReader { $script:missingBindingReads++; throw "must not read" } `
+    -TargetReader { $script:missingBindingReads++; throw "must not read" }
+Assert-Source ($missingBindingReads -eq 0 -and $missingBindingResult.AttemptedFileCount -eq 0 -and
+    @($missingBindingResult.SpansByPath["/src/a.cs"]).Count -eq 0) `
+    "a missing exact target commit disables recovery without inventing spans or making reads"
+
+$deleteResponse = [pscustomobject]@{ changes = @([pscustomobject]@{
+            item = [pscustomobject]@{ path = "/src/deleted.cs"; isFolder = $false }; changeType = "Delete"
+            diff = [pscustomobject]@{ lineDiffBlocks = @([pscustomobject]@{
+                        changeType = 2; modifiedLineNumberStart = 0; modifiedLinesCount = 0
+                    }) }
+        }) }
+$renameResponse = [pscustomobject]@{ changes = @([pscustomobject]@{
+            item = [pscustomobject]@{ path = "/src/renamed.cs"; isFolder = $false }; changeType = "Rename"
+            diff = [pscustomobject]@{ lineDiffBlocks = @([pscustomobject]@{
+                        changeType = 0; modifiedLineNumberStart = 1; modifiedLinesCount = 4
+                    }) }
+        }) }
+Assert-Source (@((Get-ReviewerSourceDegenerateChanges -Response $deleteResponse).Keys).Count -eq 0) `
+    "a genuine delete never becomes a recovery candidate"
+Assert-Source (@((Get-ReviewerSourceDegenerateChanges -Response $renameResponse).Keys).Count -eq 0) `
+    "a pure rename never becomes a recovery candidate"
+
+foreach ($negative in @(
+        @{ Name = "missing source"; Source = $null; Target = (New-RecoveryResource "/src/a.cs" $recoveryBinding.TargetCommit $targetText) },
+        @{ Name = "missing target"; Source = (New-RecoveryResource "/src/a.cs" $recoveryBinding.SourceCommit $sourceText); Target = $null },
+        @{ Name = "binary source"; Source = (New-RecoveryResource "/src/a.cs" $recoveryBinding.SourceCommit "" @("edit") "notTextual"); Target = (New-RecoveryResource "/src/a.cs" $recoveryBinding.TargetCommit $targetText) },
+        @{ Name = "oversized source"; Source = (New-RecoveryResource "/src/a.cs" $recoveryBinding.SourceCommit "" @("edit") "fileTooLarge"); Target = (New-RecoveryResource "/src/a.cs" $recoveryBinding.TargetCommit $targetText) },
+        @{ Name = "oversized target"; Source = (New-RecoveryResource "/src/a.cs" $recoveryBinding.SourceCommit $sourceText); Target = (New-RecoveryResource "/src/a.cs" $recoveryBinding.TargetCommit "" @("edit") "fileTooLarge") },
+        @{ Name = "decode-rejected source"; Source = (New-RecoveryResource "/src/a.cs" $recoveryBinding.SourceCommit "" @("edit") "decodeRejected"); Target = (New-RecoveryResource "/src/a.cs" $recoveryBinding.TargetCommit $targetText) },
+        @{ Name = "same contents"; Source = (New-RecoveryResource "/src/a.cs" $recoveryBinding.SourceCommit $targetText); Target = (New-RecoveryResource "/src/a.cs" $recoveryBinding.TargetCommit $targetText) }
+    )) {
+    $negativeResult = Get-ReviewerSourceRecoveredSpans -Response $degenerateResponse -SpansByPath $aggregateSpans `
+        -Binding $recoveryBinding -SourceReader { param($Path, $Kinds) $negative.Source } `
+        -TargetReader { param($Path, $Kinds) $negative.Target }
+    Assert-Source (@($negativeResult.SpansByPath["/src/a.cs"]).Count -eq 0) `
+        "$($negative.Name) cannot synthesize a right-hand span"
+}
+
+foreach ($claim in @(
+        @{ Name = "stale source commit"; Property = "CommitSha"; Value = "c" * 40 },
+        @{ Name = "stale target binding"; Property = "TargetCommit"; Value = "c" * 40 },
+        @{ Name = "path mismatch"; Property = "Path"; Value = "/src/other.cs" },
+        @{ Name = "organization mismatch"; Property = "Organization"; Value = "other" },
+        @{ Name = "project mismatch"; Property = "Project"; Value = "other" },
+        @{ Name = "repository mismatch"; Property = "RepositoryId"; Value = "22222222-2222-2222-2222-222222222222" },
+        @{ Name = "PR mismatch"; Property = "PullRequestId"; Value = 99 },
+        @{ Name = "change-type mismatch"; Property = "ChangeKinds"; Value = @("delete") }
+    )) {
+    $hostile = New-RecoveryResource "/src/a.cs" $recoveryBinding.SourceCommit $sourceText
+    $hostile.($claim.Property) = $claim.Value
+    $hostileResult = Get-ReviewerSourceRecoveredSpans -Response $degenerateResponse -SpansByPath $aggregateSpans `
+        -Binding $recoveryBinding -SourceReader { param($Path, $Kinds) $hostile } `
+        -TargetReader { param($Path, $Kinds) New-RecoveryResource $Path $recoveryBinding.TargetCommit $targetText $Kinds }
+    Assert-Source (@($hostileResult.SpansByPath["/src/a.cs"]).Count -eq 0) `
+        "a hostile reader's $($claim.Name) claim fails recovery closed"
+}
+
+$malformedResponses = @(
+    [pscustomobject]@{ changes = @([pscustomobject]@{
+                item = [pscustomobject]@{ path = "/src/a.cs"; isFolder = $false }; changeType = "Edit"
+                diff = [pscustomobject]@{ lineDiffBlocks = @([pscustomobject]@{
+                            changeType = 0; modifiedLineNumberStart = 1
+                        }) }
+            }) },
+    [pscustomobject]@{ changes = @([pscustomobject]@{
+                item = [pscustomobject]@{ path = "/src/a.cs"; isFolder = $false }; changeType = "Edit"
+                diff = [pscustomobject]@{ lineDiffBlocks = @() }
+            }) },
+    [pscustomobject]@{ changes = @([pscustomobject]@{
+                item = [pscustomobject]@{ path = "/src/a.cs"; isFolder = $false }; changeType = "Edit"
+                diff = [pscustomobject]@{ lineDiffBlocks = @($null) }
+            }) }
+)
+foreach ($malformedResponse in $malformedResponses) {
+    Assert-Source (@((Get-ReviewerSourceDegenerateChanges -Response $malformedResponse).Keys).Count -eq 0) `
+        "malformed, empty, or truncated aggregate blocks are not treated as proof of recoverability"
+}
+Assert-Source ($null -eq (Get-ReviewerSourceDeterministicDiffSpans -TargetText ("x`n" * 20) `
+            -SourceText ("y`n" * 20) -MaxMatrixCells 100)) `
+    "diff work over the matrix cap is refused before spans are produced"
+Assert-Source ($null -eq (Get-ReviewerSourceDeterministicDiffSpans -TargetText "a`nb`nc`nd" `
+            -SourceText "A`nb`nC`nd" -MaxSpans 1)) `
+    "a recovered diff over the hunk cap is refused rather than truncated"
+$removedFinalNewline = @(Get-ReviewerSourceDeterministicDiffSpans -TargetText "a`n" -SourceText "a")
+$addedFinalNewline = @(Get-ReviewerSourceDeterministicDiffSpans -TargetText "a" -SourceText "a`n")
+$changedLineEndings = @(Get-ReviewerSourceDeterministicDiffSpans -TargetText "a`r`nb`r`n" -SourceText "a`nb`n")
+Assert-Source ($removedFinalNewline.Count -eq 1 -and [int]$removedFinalNewline[0].Start -eq 1 -and
+    $addedFinalNewline.Count -eq 1 -and [int]$addedFinalNewline[0].Start -eq 1) `
+    "adding or removing the final newline recovers the exact final right-hand line"
+Assert-Source ($changedLineEndings.Count -eq 1 -and [int]$changedLineEndings[0].Start -eq 1 -and
+    [int]$changedLineEndings[0].End -eq 2) `
+    "line-ending-only edits retain exact right-hand coverage instead of comparing equal"
+
+$capChanges = @("/src/1.cs", "/src/2.cs", "/src/3.cs") | ForEach-Object { New-DegenerateEdit $_ }
+$capResponse = [pscustomobject]@{ changes = $capChanges }
+$capSourceReads = 0
+$capTargetReads = 0
+$capResult = Get-ReviewerSourceRecoveredSpans -Response $capResponse `
+    -SpansByPath (Get-ReviewerSourceChangedSpans $capResponse) -Binding $recoveryBinding -MaxRecoveryFiles 2 `
+    -SourceReader { param($Path, $Kinds) $script:capSourceReads++; New-RecoveryResource $Path $recoveryBinding.SourceCommit $sourceText $Kinds } `
+    -TargetReader { param($Path, $Kinds) $script:capTargetReads++; New-RecoveryResource $Path $recoveryBinding.TargetCommit $targetText $Kinds }
+Assert-Source ($capResult.AttemptedFileCount -eq 2 -and $capSourceReads -eq 2 -and $capTargetReads -eq 2 -and
+    @($capResult.RecoveredPaths).Count -eq 2 -and @($capResult.SpansByPath["/src/3.cs"]).Count -eq 0) `
+    "the recovery request cap bounds both exact-commit readers and leaves later files uncovered"
+
+$mixedResponseForRecovery = [pscustomobject]@{
+    changes = @((New-DegenerateEdit "/src/good.cs"), (New-DegenerateEdit "/src/unread.cs"))
+}
+$mixedRecovered = Get-ReviewerSourceRecoveredSpans -Response $mixedResponseForRecovery `
+    -SpansByPath (Get-ReviewerSourceChangedSpans $mixedResponseForRecovery) -Binding $recoveryBinding `
+    -SourceReader { param($Path, $Kinds)
+        if ($Path -ceq "/src/unread.cs") { return $null }
+        New-RecoveryResource $Path $recoveryBinding.SourceCommit $sourceText $Kinds
+    } -TargetReader { param($Path, $Kinds) New-RecoveryResource $Path $recoveryBinding.TargetCommit $targetText $Kinds }
+$mixedRecoveryReport = New-ReviewerSourceTransportReport -CommitSha $recoveryBinding.SourceCommit `
+    -ChangedPaths @("/src/good.cs", "/src/unread.cs") -SpansByPath $mixedRecovered.SpansByPath -Policy $policy `
+    -Reader { param($Path)
+        if ($Path -ceq "/src/unread.cs") { return $null }
+        New-RecoveryResource $Path $recoveryBinding.SourceCommit $sourceText
+    } -ChangeKindsByPath (Get-ReviewerSourceChangeKindsByPath $mixedResponseForRecovery)
+$mixedRecoveryGate = Test-ReviewerSourceCoverageGate -Report $mixedRecoveryReport -Policy $policy
+Assert-Source ([int]$mixedRecoveryReport.CoveredFiles -eq 1 -and [int]$mixedRecoveryReport.SourceBearingFileCount -eq 2 -and
+    -not $mixedRecoveryGate.Ok -and @($mixedRecoveryReport.Files | Where-Object Reason -eq "transportFailed").Count -eq 1) `
+    "a mixed recovered/unrecovered set keeps the unread file in the denominator and fails the unchanged gate"
+
+$recoveryHelperText = Get-FunctionTextFromWrapper -Name 'New-ReviewerSourceRecoveryContext'
+$transportRecoveryAt = $transportText.IndexOf('New-ReviewerSourceRecoveryContext', [StringComparison]::Ordinal)
+$reportBuildAt = $transportText.IndexOf('New-ReviewerSourceTransportReport', [StringComparison]::Ordinal)
+Assert-Source ($transportRecoveryAt -ge 0 -and $reportBuildAt -gt $transportRecoveryAt -and
+    $transportText -match '-SpansByPath \$spansByPath' -and $transportText -match 'Test-ReviewerSourceCoverageGate -Report \$report') `
+    "recovery feeds the ordinary report before the unchanged coverage gate is computed"
+Assert-Source ($recoveryHelperText -match '\$sourceCache' -and
+    $recoveryHelperText.IndexOf('Get-ReviewerSourceRecoveredSpans', [StringComparison]::Ordinal) -lt
+    $recoveryHelperText.IndexOf('$reportReader', [StringComparison]::Ordinal)) `
+    "the recovery source read is cached and reused by the report rather than bypassing source request bounds"
+Assert-Source ($cycleText.IndexOf('if (-not $sourceTransport.Gate.Ok)', [StringComparison]::Ordinal) -lt
+    $cycleText.IndexOf('Invoke-ReviewerPullRequest -Session', [StringComparison]::Ordinal)) `
+    "recovery cannot move model execution ahead of the coverage decision"
 
 # ---------------------------------------------------------------------------
 

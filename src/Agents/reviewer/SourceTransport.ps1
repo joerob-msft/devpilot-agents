@@ -76,6 +76,9 @@ $script:ReviewerSourceReaderAuthoredRejections = @(
 )
 $script:ReviewerSourceStatuses = @("delivered", "partial", "omitted")
 $script:ReviewerSourceMaxSpansPerPath = 2000
+$script:ReviewerSourceMaxRecoveryFiles = 16
+$script:ReviewerSourceMaxRecoveryMatrixCells = 2000000
+$script:ReviewerSourceMaxRecoveryLinesPerSide = 20000
 # How many spanless-but-content-declaring paths may be read to find out what
 # they really are. Each costs one whole-file fetch, and the pathological case -
 # a response that lost every line-diff block - would otherwise pay that for
@@ -195,6 +198,22 @@ function Split-ReviewerSourceLines {
         $lines = @($lines[0..($lines.Count - 2)])
     }
     return , $lines
+}
+
+function Split-ReviewerSourceDiffLines {
+    <# Keeps each line terminator attached to its line for exact-content diffing.
+       The transport slicer intentionally drops terminators when counting viewer
+       lines; recovery cannot, because adding/removing a final newline or changing
+       CRLF to LF is still a source edit that must map to a right-hand line. #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $parts = [regex]::Split($Text, "(`r?`n)")
+    $lines = [System.Collections.Generic.List[string]]::new()
+    for ($index = 0; $index -lt $parts.Count; $index += 2) {
+        $line = [string]$parts[$index]
+        if (($index + 1) -lt $parts.Count) { $line += [string]$parts[$index + 1] }
+        if ($line.Length -gt 0 -or ($Text.Length -eq 0 -and $index -eq 0)) { [void]$lines.Add($line) }
+    }
+    return , $lines.ToArray()
 }
 
 function ConvertTo-ReviewerSourcePath {
@@ -508,6 +527,225 @@ function Get-ReviewerSourceChangedSpans {
     return $result
 }
 
+function Get-ReviewerSourceDegenerateChanges {
+            <# Finds source-bearing entries whose aggregate ADO diff is well formed but
+               contains only context/delete blocks. Empty, malformed, and ordinary
+               right-hand diffs are not candidates: absence alone is not evidence. #>
+            param([Parameter(Mandatory)]$Response)
+            $states = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
+            $changes = Resolve-ReviewerSourceChangeEntries -Response $Response
+            foreach ($change in @($changes)) {
+                if ($null -eq $change) { continue }
+                $item = Get-ReviewerSourceValue -Object $change -Name "item"
+                $rawPath = [string](Get-ReviewerSourceValue -Object $item -Name "path" -Default "")
+                if (-not $rawPath) { $rawPath = [string](Get-ReviewerSourceValue -Object $change -Name "path" -Default "") }
+                $path = ConvertTo-ReviewerSourcePath -Path $rawPath
+                if (-not $path -or [bool](Get-ReviewerSourceValue -Object $item -Name "isFolder" -Default $false)) { continue }
+                if (-not $states.Contains($path)) {
+                    $states[$path] = @{
+                        ChangeKinds = [System.Collections.Generic.List[string]]::new()
+                        SawBlock = $false
+                        SawRightHand = $false
+                        Malformed = $false
+                    }
+                }
+                $state = $states[$path]
+                foreach ($kind in @(Get-ReviewerSourceChangeKinds -Value (
+                            Get-ReviewerSourceValue -Object $change -Name "changeType" -Default $null))) {
+                    if (-not $state.ChangeKinds.Contains([string]$kind)) { [void]$state.ChangeKinds.Add([string]$kind) }
+                }
+                $diff = Get-ReviewerSourceValue -Object $change -Name "diff"
+                $blocks = @(Get-ReviewerSourceValue -Object $diff -Name "lineDiffBlocks" -Default @())
+                if ($blocks.Count -eq 0) {
+                    $blocks = @(Get-ReviewerSourceValue -Object $change -Name "lineDiffBlocks" -Default @())
+                }
+                foreach ($block in $blocks) {
+                    $state.SawBlock = $true
+                    if ($null -eq $block) { $state.Malformed = $true; continue }
+                    $blockType = Get-ReviewerSourceValue -Object $block -Name "changeType" -Default $null
+                    $start = Get-ReviewerSourceValue -Object $block -Name "modifiedLineNumberStart" -Default $null
+                    $count = Get-ReviewerSourceValue -Object $block -Name "modifiedLinesCount" -Default $null
+                    if (($blockType -isnot [int] -and $blockType -isnot [long]) -or
+                        ($start -isnot [int] -and $start -isnot [long]) -or
+                        ($count -isnot [int] -and $count -isnot [long]) -or
+                        [int]$start -lt 0 -or [int]$count -lt 0) {
+                        $state.Malformed = $true
+                        continue
+                    }
+                    if ([int]$blockType -eq 1 -or [int]$blockType -eq 3) {
+                        $state.SawRightHand = $true
+                        continue
+                    }
+                    if ([int]$blockType -notin @(0, 2) -or
+                        ([int]$blockType -eq 0 -and ([int]$start -lt 1 -or [int]$count -lt 1))) {
+                        $state.Malformed = $true
+                    }
+                }
+            }
+            $result = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
+            foreach ($path in @($states.Keys)) {
+                $state = $states[$path]
+                $kinds = $state.ChangeKinds.ToArray()
+                if ($state.SawBlock -and -not $state.SawRightHand -and -not $state.Malformed -and
+                    (Test-ReviewerSourceChangeCarriesRightHand -ChangeTypeValue $kinds)) {
+                    $result[$path] = @($kinds)
+                }
+            }
+            return $result
+        }
+
+        function Get-ReviewerSourceDeterministicDiffSpans {
+            <# Returns exact right-hand line spans using a bounded LCS. The cell bound is
+               checked before allocation, making runtime and memory independent of host
+               claims beyond the configured ceiling. Equal-content files prove no span. #>
+            param(
+                [Parameter(Mandatory)][AllowEmptyString()][string]$TargetText,
+                [Parameter(Mandatory)][AllowEmptyString()][string]$SourceText,
+                [ValidateRange(1, [int]::MaxValue)][int]$MaxMatrixCells = $script:ReviewerSourceMaxRecoveryMatrixCells,
+                [ValidateRange(1, [int]::MaxValue)][int]$MaxLinesPerSide = $script:ReviewerSourceMaxRecoveryLinesPerSide,
+                [ValidateRange(1, [int]::MaxValue)][int]$MaxSpans = $script:ReviewerSourceMaxSpansPerPath
+            )
+            $targetLines = Split-ReviewerSourceDiffLines -Text $TargetText
+            $sourceLines = Split-ReviewerSourceDiffLines -Text $SourceText
+            $targetCount = @($targetLines).Count
+            $sourceCount = @($sourceLines).Count
+            if ($targetCount -gt $MaxLinesPerSide -or $sourceCount -gt $MaxLinesPerSide) { return $null }
+            $cells = ([long]$targetCount + 1L) * ([long]$sourceCount + 1L)
+            if ($cells -gt [long]$MaxMatrixCells) { return $null }
+            if ($TargetText -ceq $SourceText) { return , @() }
+
+            $matrix = [int[,]]::new(($targetCount + 1), ($sourceCount + 1))
+            for ($targetIndex = $targetCount - 1; $targetIndex -ge 0; $targetIndex--) {
+                for ($sourceIndex = $sourceCount - 1; $sourceIndex -ge 0; $sourceIndex--) {
+                    if ([string]$targetLines[$targetIndex] -ceq [string]$sourceLines[$sourceIndex]) {
+                        $matrix[$targetIndex, $sourceIndex] = 1 + $matrix[($targetIndex + 1), ($sourceIndex + 1)]
+                    }
+                    else {
+                        $matrix[$targetIndex, $sourceIndex] = [Math]::Max(
+                            $matrix[($targetIndex + 1), $sourceIndex],
+                            $matrix[$targetIndex, ($sourceIndex + 1)])
+                    }
+                }
+            }
+
+            $changedSourceLines = [System.Collections.Generic.List[int]]::new()
+            $targetIndex = 0
+            $sourceIndex = 0
+            while ($targetIndex -lt $targetCount -and $sourceIndex -lt $sourceCount) {
+                if ([string]$targetLines[$targetIndex] -ceq [string]$sourceLines[$sourceIndex]) {
+                    $targetIndex++
+                    $sourceIndex++
+                }
+                elseif ($matrix[($targetIndex + 1), $sourceIndex] -ge $matrix[$targetIndex, ($sourceIndex + 1)]) {
+                    $targetIndex++
+                }
+                else {
+                    [void]$changedSourceLines.Add($sourceIndex + 1)
+                    $sourceIndex++
+                }
+            }
+            while ($sourceIndex -lt $sourceCount) {
+                [void]$changedSourceLines.Add($sourceIndex + 1)
+                $sourceIndex++
+            }
+            if ($changedSourceLines.Count -eq 0) { return , @() }
+
+            $spans = [System.Collections.Generic.List[object]]::new()
+            $start = $changedSourceLines[0]
+            $end = $start
+            for ($index = 1; $index -lt $changedSourceLines.Count; $index++) {
+                $line = $changedSourceLines[$index]
+                if ($line -eq ($end + 1)) { $end = $line; continue }
+                [void]$spans.Add(@{ Start = $start; End = $end })
+                if ($spans.Count -ge $MaxSpans) { return $null }
+                $start = $line
+                $end = $line
+            }
+            [void]$spans.Add(@{ Start = $start; End = $end })
+            if ($spans.Count -gt $MaxSpans) { return $null }
+            return , $spans.ToArray()
+        }
+
+        function Test-ReviewerSourceRecoveryResourceBinding {
+            <# This validates the injected reader contract. In production, independent
+               evidence comes from the decoder's URI check, exact-commit request, and the
+               PR binding read before/after recovery; repo_file does not echo PR identity. #>
+            param(
+                [Parameter(Mandatory)]$Resource,
+                [Parameter(Mandatory)]$Binding,
+                [Parameter(Mandatory)][string]$Path,
+                [Parameter(Mandatory)][string]$CommitSha,
+                [Parameter(Mandatory)][string[]]$ChangeKinds
+            )
+            foreach ($name in @("Organization", "Project", "RepositoryId", "PullRequestId", "SourceCommit", "TargetCommit")) {
+                if ([string](Get-ReviewerSourceValue -Object $Resource -Name $name -Default "") -cne
+                    [string](Get-ReviewerSourceValue -Object $Binding -Name $name -Default "")) { return $false }
+            }
+            if ([string](Get-ReviewerSourceValue -Object $Resource -Name "Path" -Default "") -cne $Path -or
+                [string](Get-ReviewerSourceValue -Object $Resource -Name "CommitSha" -Default "") -cne $CommitSha) { return $false }
+            $expectedKinds = (@($ChangeKinds | Sort-Object -CaseSensitive -Unique) -join ",")
+            $actualKinds = (@(@(Get-ReviewerSourceValue -Object $Resource -Name "ChangeKinds" -Default @()) |
+                    Sort-Object -CaseSensitive -Unique) -join ",")
+            return ($actualKinds -ceq $expectedKinds)
+        }
+
+        function Get-ReviewerSourceRecoveredSpans {
+            <# Recovers only proven right-hand spans. Any absent, rejected, stale,
+               mismatched, same-content, over-cap, or otherwise unprovable read leaves
+               the original empty span set untouched, so existing coverage remains closed. #>
+            param(
+                [Parameter(Mandatory)]$Response,
+                [Parameter(Mandatory)]$SpansByPath,
+                [Parameter(Mandatory)]$Binding,
+                [Parameter(Mandatory)][scriptblock]$SourceReader,
+                [Parameter(Mandatory)][scriptblock]$TargetReader,
+                [ValidateRange(1, 256)][int]$MaxRecoveryFiles = $script:ReviewerSourceMaxRecoveryFiles
+            )
+            $result = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
+            foreach ($path in @($SpansByPath.Keys)) { $result[$path] = @($SpansByPath[$path]) }
+            $recoveredPaths = [System.Collections.Generic.List[string]]::new()
+            $attempted = 0
+            if ([string](Get-ReviewerSourceValue -Object $Binding -Name "Organization" -Default "") -eq "" -or
+                [string](Get-ReviewerSourceValue -Object $Binding -Name "Project" -Default "") -eq "" -or
+                [string](Get-ReviewerSourceValue -Object $Binding -Name "RepositoryId" -Default "") -eq "" -or
+                [int](Get-ReviewerSourceValue -Object $Binding -Name "PullRequestId" -Default 0) -lt 1 -or
+                [string](Get-ReviewerSourceValue -Object $Binding -Name "SourceCommit" -Default "") -notmatch '^[0-9a-f]{40}$' -or
+                [string](Get-ReviewerSourceValue -Object $Binding -Name "TargetCommit" -Default "") -notmatch '^[0-9a-f]{40}$') {
+                return [pscustomobject]@{
+                    SpansByPath = $result
+                    RecoveredPaths = $recoveredPaths.ToArray()
+                    AttemptedFileCount = 0
+                }
+            }
+            $candidates = Get-ReviewerSourceDegenerateChanges -Response $Response
+            foreach ($path in @($candidates.Keys)) {
+                if ($attempted -ge $MaxRecoveryFiles) { break }
+                if ($result.Contains($path) -and @($result[$path]).Count -gt 0) { continue }
+                $attempted++
+                $kinds = [string[]]@($candidates[$path])
+                $source = & $SourceReader $path $kinds
+                if ($null -eq $source -or [string](Get-ReviewerSourceValue -Object $source -Name "Rejected" -Default "")) { continue }
+                if (-not (Test-ReviewerSourceRecoveryResourceBinding -Resource $source -Binding $Binding -Path $path `
+                            -CommitSha ([string](Get-ReviewerSourceValue -Object $Binding -Name "SourceCommit" -Default "")) `
+                            -ChangeKinds $kinds)) { continue }
+                $target = & $TargetReader $path $kinds
+                if ($null -eq $target -or [string](Get-ReviewerSourceValue -Object $target -Name "Rejected" -Default "")) { continue }
+                if (-not (Test-ReviewerSourceRecoveryResourceBinding -Resource $target -Binding $Binding -Path $path `
+                            -CommitSha ([string](Get-ReviewerSourceValue -Object $Binding -Name "TargetCommit" -Default "")) `
+                            -ChangeKinds $kinds)) { continue }
+                $recovered = Get-ReviewerSourceDeterministicDiffSpans `
+                    -TargetText ([string](Get-ReviewerSourceValue -Object $target -Name "Text" -Default "")) `
+                    -SourceText ([string](Get-ReviewerSourceValue -Object $source -Name "Text" -Default ""))
+                if ($null -eq $recovered -or @($recovered).Count -eq 0) { continue }
+                $result[$path] = @($recovered)
+                [void]$recoveredPaths.Add([string]$path)
+            }
+            return [pscustomobject]@{
+                SpansByPath = $result
+                RecoveredPaths = $recoveredPaths.ToArray()
+                AttemptedFileCount = $attempted
+            }
+        }
 function Merge-ReviewerSourceSpans {
     <# Expands each span by the policy's context radius, clamps to the file, and
        merges overlapping or adjacent spans so no line is transported twice. #>

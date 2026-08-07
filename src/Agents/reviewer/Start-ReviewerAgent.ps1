@@ -7396,6 +7396,128 @@ function Get-ReviewerChangedPaths {
     }
 }
 
+function Get-ReviewerSourceRecoveryBinding {
+    param(
+        [Parameter(Mandatory)]$Pr,
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)][string]$SourceCommit
+    )
+    $repository = Get-ReviewerHashValue -Container $Pr -Key "repository"
+    $project = Get-ReviewerHashValue -Container $repository -Key "project"
+    $actualPrId = [int](Get-ReviewerHashValue -Container $Pr -Key "pullRequestId" -Default 0)
+    $actualRepositoryId = [string](Get-ReviewerHashValue -Container $repository -Key "id" -Default "")
+    $actualProject = [string](Get-ReviewerHashValue -Container $project -Key "name" -Default "")
+    $actualTargetRef = [string](Get-ReviewerHashValue -Container $Pr -Key "targetRefName" -Default "")
+    $actualSourceCommit = Get-ReviewerSourceCommit -Pr $Pr
+    $actualTargetCommit = [string](Get-ReviewerHashValue -Container (
+            Get-ReviewerHashValue -Container $Pr -Key "lastMergeTargetCommit") -Key "commitId" -Default "")
+    if ($actualPrId -ne $PrId -or $actualRepositoryId -ine $cfgRepoId -or
+        $actualProject -ine $ExpectedProject -or $actualTargetRef -ine $TargetRefName -or
+        $actualSourceCommit -ine $SourceCommit) {
+        throw "PR $PrId does not match the configured source identity and exact source commit."
+    }
+    return [pscustomobject][ordered]@{
+        Organization = $Organization
+        Project = $ExpectedProject
+        RepositoryId = $cfgRepoId.ToLowerInvariant()
+        PullRequestId = $PrId
+        SourceCommit = $SourceCommit.ToLowerInvariant()
+        TargetCommit = $(if ($actualTargetCommit -match '^[0-9a-fA-F]{40}$') {
+                $actualTargetCommit.ToLowerInvariant()
+            } else { "" })
+    }
+}
+
+function Get-ReviewerBoundSourceContent {
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$CommitSha,
+        [Parameter(Mandatory)][string[]]$ChangeKinds,
+        [Parameter(Mandatory)]$Binding
+    )
+    $toolResult = Send-AgentMcpRequest -Session $Session -Method "tools/call" -Params @{
+        name = "repo_file"
+        arguments = @{
+            action = "get_content"
+            project = $ExpectedProject
+            repositoryId = $cfgRepoId
+            path = $Path
+            versionType = "Commit"
+            version = $CommitSha
+        }
+    }
+    $classified = Get-ReviewerSourceReaderResult -ToolResult $toolResult -Path $Path -Policy $SourceTransportPolicy -Decoder {
+        param($InnerToolResult, [string]$InnerPath)
+        ConvertFrom-AgentMcpResourceContent -ToolResult $InnerToolResult -ExpectedUri $InnerPath `
+            -MaxBytes $script:ReviewerSourceDecoderCeilingBytes `
+            -AllowedMimeTypes @($SourceTransportPolicy.allowedMimeTypes)
+    }
+    if ($null -eq $classified) { return $null }
+    return [pscustomobject][ordered]@{
+        Text = Get-ReviewerHashValue -Container $classified -Key "Text" -Default ""
+        MimeType = Get-ReviewerHashValue -Container $classified -Key "MimeType" -Default ""
+        ByteLength = [int](Get-ReviewerHashValue -Container $classified -Key "ByteLength" -Default 0)
+        Sha256 = Get-ReviewerHashValue -Container $classified -Key "Sha256" -Default ""
+        Rejected = Get-ReviewerHashValue -Container $classified -Key "Rejected" -Default ""
+        Organization = $Binding.Organization
+        Project = $Binding.Project
+        RepositoryId = $Binding.RepositoryId
+        PullRequestId = $Binding.PullRequestId
+        SourceCommit = $Binding.SourceCommit
+        TargetCommit = $Binding.TargetCommit
+        Path = $Path
+        CommitSha = $CommitSha
+        ChangeKinds = @($ChangeKinds)
+    }
+}
+
+function New-ReviewerSourceRecoveryContext {
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)]$Changes,
+        [Parameter(Mandatory)]$AggregateSpansByPath,
+        [Parameter(Mandatory)]$ChangeKindsByPath,
+        [Parameter(Mandatory)]$Binding
+    )
+    $sourceCache = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
+    $sourceReader = {
+        param([string]$Path, [string[]]$ChangeKinds)
+        if (-not $sourceCache.Contains($Path)) {
+            $sourceCache[$Path] = Get-ReviewerBoundSourceContent -Session $Session -Path $Path `
+                -CommitSha $Binding.SourceCommit -ChangeKinds $ChangeKinds -Binding $Binding
+        }
+        return $sourceCache[$Path]
+    }.GetNewClosure()
+    $recoveredSpans = $AggregateSpansByPath
+    $recoveredPaths = @()
+    $attemptedFileCount = 0
+    if ($Binding.TargetCommit -match '^[0-9a-f]{40}$') {
+        $targetReader = {
+            param([string]$Path, [string[]]$ChangeKinds)
+            return Get-ReviewerBoundSourceContent -Session $Session -Path $Path `
+                -CommitSha $Binding.TargetCommit -ChangeKinds $ChangeKinds -Binding $Binding
+        }.GetNewClosure()
+        $recovery = Get-ReviewerSourceRecoveredSpans -Response $Changes -SpansByPath $AggregateSpansByPath `
+            -Binding $Binding -SourceReader $sourceReader -TargetReader $targetReader
+        $recoveredSpans = $recovery.SpansByPath
+        $recoveredPaths = @($recovery.RecoveredPaths)
+        $attemptedFileCount = [int]$recovery.AttemptedFileCount
+    }
+    $reportReader = {
+        param([string]$Path)
+        $kinds = @()
+        if ($ChangeKindsByPath.Contains($Path)) { $kinds = @($ChangeKindsByPath[$Path]) }
+        return & $sourceReader $Path $kinds
+    }.GetNewClosure()
+    return [pscustomobject]@{
+        SpansByPath = $recoveredSpans
+        Reader = $reportReader
+        RecoveredPaths = $recoveredPaths
+        AttemptedFileCount = $attemptedFileCount
+    }
+}
+
 function Get-ReviewerSourceTransport {
     <# Reads the pinned bytes of every changed file itself and returns the sealed
        block plus its coverage report.
@@ -7419,11 +7541,15 @@ function Get-ReviewerSourceTransport {
     if ($SourceCommit -notmatch '^[0-9a-f]{40}$') {
         throw "The sealed source transport requires an exact lowercase 40-hex source commit."
     }
+    $prBefore = Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments @{
+        action = "get"; project = $ExpectedProject; repositoryId = $RepositoryName; pullRequestId = $PrId
+    }
+    $recoveryBinding = Get-ReviewerSourceRecoveryBinding -Pr $prBefore -PrId $PrId -SourceCommit $SourceCommit
     $changes = Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments @{
         action = 'get_changes'; project = $ExpectedProject; repositoryId = $RepositoryName
         pullRequestId = $PrId; includeDiffs = $true; includeLineContent = $true; top = 1000
     }
-    $spansByPath = Get-ReviewerSourceChangedSpans -Response $changes
+    $aggregateSpansByPath = Get-ReviewerSourceChangedSpans -Response $changes
     $changeKindsByPath = Get-ReviewerSourceChangeKindsByPath -Response $changes
     # Assign directly: Get-ReviewerChangePathsFromResponse returns its array
     # behind a unary comma so a one-path change set does not unroll to a bare
@@ -7431,35 +7557,15 @@ function Get-ReviewerSourceTransport {
     # which collapses every path into one space-joined string - a shape that
     # still looks like a legal change set and shows up only as zero coverage.
     $paths = Get-ReviewerChangePathsFromResponse -Response $changes
-    Assert-ReviewerSourceChangeSetAgreement -ChangedPaths $paths -SpansByPath $spansByPath `
+    Assert-ReviewerSourceChangeSetAgreement -ChangedPaths $paths -SpansByPath $aggregateSpansByPath `
         -ObservedRightHandBlockCount (Measure-ReviewerSourceRightHandBlocks -Response $changes)
+    $recoveryContext = New-ReviewerSourceRecoveryContext -Session $Session -Changes $changes `
+        -AggregateSpansByPath $aggregateSpansByPath -ChangeKindsByPath $changeKindsByPath `
+        -Binding $recoveryBinding
+    $spansByPath = $recoveryContext.SpansByPath
     $reader = {
         param([string]$Path)
-        # The request and the decode are separated deliberately. EVERY failure
-        # Send-AgentMcpRequest raises has already aborted the session, and the
-        # session is shared by every PR in this cycle - so absorbing one as
-        # "this file was unreadable" would grind through the rest of the change
-        # set and then take out the whole cycle with a misleading reason.
-        $toolResult = Send-AgentMcpRequest -Session $Session -Method "tools/call" -Params @{
-            name = "repo_file"
-            arguments = @{
-                action = "get_content"
-                project = $ExpectedProject
-                repositoryId = $cfgRepoId
-                path = $Path
-                versionType = "Commit"
-                version = $SourceCommit
-            }
-        }
-        # Classification lives in the library so the seam is exercisable
-        # offline; the strict decode is injected so nothing about its
-        # safety contract is duplicated or relaxed here.
-        return Get-ReviewerSourceReaderResult -ToolResult $toolResult -Path $Path -Policy $SourceTransportPolicy -Decoder {
-            param($InnerToolResult, [string]$InnerPath)
-            ConvertFrom-AgentMcpResourceContent -ToolResult $InnerToolResult -ExpectedUri $InnerPath `
-                -MaxBytes $script:ReviewerSourceDecoderCeilingBytes `
-                -AllowedMimeTypes @($SourceTransportPolicy.allowedMimeTypes)
-        }
+        return & $recoveryContext.Reader $Path
     }
     $report = New-ReviewerSourceTransportReport -CommitSha $SourceCommit -ChangedPaths $paths `
         -SpansByPath $spansByPath -Policy $SourceTransportPolicy -Reader $reader `
@@ -7471,10 +7577,14 @@ function Get-ReviewerSourceTransport {
     $confirm = Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments @{
         action = "get"; project = $ExpectedProject; repositoryId = $RepositoryName; pullRequestId = $PrId
     }
+    $confirmedBinding = Get-ReviewerSourceRecoveryBinding -Pr $confirm -PrId $PrId -SourceCommit $SourceCommit
     $confirmCommit = [string](Get-ReviewerHashValue -Container (
             Get-ReviewerHashValue -Container $confirm -Key 'lastMergeSourceCommit') -Key 'commitId' -Default '')
     if ($confirmCommit.ToLowerInvariant() -cne $SourceCommit) {
         throw "PR $PrId moved from $SourceCommit to '$confirmCommit' while its pinned source was being read."
+    }
+    if ($recoveryBinding.TargetCommit -and $confirmedBinding.TargetCommit -cne $recoveryBinding.TargetCommit) {
+        throw "PR $PrId target moved from $($recoveryBinding.TargetCommit) while its pinned source was being read."
     }
     $blockText = ""
     if (@($report.Files).Count -gt 0) {
