@@ -30,6 +30,11 @@ param(
     [Parameter(Mandatory, ParameterSetName = "Declare")]
     [ValidatePattern('^[0-9a-fA-F]{64}\z')][string]$SnapshotManifestDigest,
     [Parameter(ParameterSetName = "Declare")][ValidateRange(2, 16)][int]$PlannedRunCount = 2,
+    # The runs themselves, by artifact digest, when they already exist. A count
+    # says "four runs"; this says WHICH four, so a set cannot be trimmed of the
+    # one that disagreed or topped up with a friendlier one after the fact.
+    [Parameter(ParameterSetName = "Declare")]
+    [ValidatePattern('^[0-9a-fA-F]{64}\z')][string[]]$ExpectedRunSha256 = @(),
     [Parameter(ParameterSetName = "Declare")][string]$Purpose = "",
     [string]$RunSetPath = "",
     # The declaration is sealed before any run exists, so it is normally sealed
@@ -133,7 +138,8 @@ if ($DeclareRunSet) {
         setId = $setId
         snapshotName = $SnapshotName
         snapshotManifestDigest = $SnapshotManifestDigest.ToLowerInvariant()
-        plannedRunCount = $PlannedRunCount
+        plannedRunCount = $(if (@($ExpectedRunSha256).Count -gt 0) { @($ExpectedRunSha256).Count } else { $PlannedRunCount })
+        expectedRunSha256 = @(@($ExpectedRunSha256) | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object)
         purpose = $Purpose
         promotable = $false
         declaredAt = [DateTime]::UtcNow.ToString("o")
@@ -169,6 +175,29 @@ if ($RunSetPath) {
             "$(@($ArtifactPath).Count) artifact(s) were supplied. A set chosen after the fact is not a qualification.")
     }
     $RequiredRunCount = [int]$runSet.plannedRunCount
+    # When the declaration named the runs themselves, the supplied set has to be
+    # exactly those - not that many, those. Compared as sorted sets so the order
+    # they are passed in cannot matter.
+    $declaredShas = @(Get-ReviewerConventionSpecialistValue $runSet "expectedRunSha256" @())
+    if (@($declaredShas).Count -gt 0) {
+        $suppliedShas = @(@($ArtifactPath) | ForEach-Object {
+                (Get-FileHash -LiteralPath (Resolve-Path -LiteralPath $_).ProviderPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            })
+        $sortedDeclared = @(@($declaredShas) | ForEach-Object { ([string]$_).ToLowerInvariant() })
+        $missingRuns = @(@($sortedDeclared) | Where-Object { $suppliedShas -cnotcontains $_ })
+        $extraRuns = @(@($suppliedShas) | Where-Object { $sortedDeclared -cnotcontains $_ })
+        if (@($missingRuns).Count -gt 0 -or @($extraRuns).Count -gt 0) {
+            throw ("The declared run set $($runSet.setId) named specific runs and the supplied artifacts are not those. " +
+                $(if (@($missingRuns).Count -gt 0) { "Declared but not supplied: " + (@(@($missingRuns) | ForEach-Object { $_.Substring(0, 12) }) -join ", ") + ". " } else { "" }) +
+                $(if (@($extraRuns).Count -gt 0) { "Supplied but not declared: " + (@(@($extraRuns) | ForEach-Object { $_.Substring(0, 12) }) -join ", ") + "." } else { "" }))
+        }
+        # The same artifact twice satisfies neither a count nor a set.
+        $duplicateShas = @(@($suppliedShas | Group-Object | Where-Object { $_.Count -gt 1 }) | ForEach-Object { [string]$_.Name })
+        if (@($duplicateShas).Count -gt 0) {
+            throw ("The same run artifact was supplied more than once: " +
+                (@(@($duplicateShas) | ForEach-Object { $_.Substring(0, 12) }) -join ", ") + ".")
+        }
+    }
 }
 
 foreach ($path in @($ArtifactPath)) {
@@ -208,6 +237,11 @@ $reconciliation = Resolve-ReviewerRunReconciliation -Manifests $manifests -Requi
 $setLines = @("", "## Declared run set", "")
 if ($null -ne $runSet) {
     $setLines += "Predeclared set $($runSet.setId), sealed $($runSet.declaredAt): snapshot '$($runSet.snapshotName)' at $($runSet.snapshotManifestDigest), $([int]$runSet.plannedRunCount) run(s)."
+    $namedRuns = @(Get-ReviewerConventionSpecialistValue $runSet "expectedRunSha256" @())
+    if (@($namedRuns).Count -gt 0) {
+        $setLines += "The declaration named these exact artifacts, and the comparison covered all of them:"
+        foreach ($named in @($namedRuns)) { $setLines += "  - $named" }
+    }
     $setLines += ""
 }
 else { $setLines += "No predeclared set; these runs were chosen by the operator at comparison time."; $setLines += "" }

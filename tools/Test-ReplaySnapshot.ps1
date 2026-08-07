@@ -1914,6 +1914,8 @@ try {
             }
             else { $Constructs })
         return [pscustomobject][ordered]@{
+            kind = $script:ReviewerConventionSpecialistArtifactKind
+            artifactVersion = $script:ReviewerConventionSpecialistArtifactVersion
             status = $(if ($Status -ceq "ok") { "complete" } else { $Status }); prId = 42; sourceCommit = $SourceCommit; organization = "o"; project = "p"
             repositoryId = "r"; model = "m"; configSha256 = ("1" * 64); scriptSha256 = ("2" * 64)
             specialistLibrarySha256 = ("3" * 64); promptSha256 = ("4" * 64)
@@ -2225,6 +2227,76 @@ try {
     Assert-Replay ($caseSplitPaths.Count -eq 2) `
         "Each must keep its own path; folding them prints one run's comment beside the other's file."
 
+    # Every identity the binding covers, one at a time. A run that differs in
+    # ANY of them is not a repetition, and the refusal must not depend on which
+    # field happened to change.
+    foreach ($identity in @(
+            @{ Name = "schema version"; Apply = { param($m) $m.artifactVersion = 99 } },
+            @{ Name = "artifact kind"; Apply = { param($m) $m.kind = "something-else" } },
+            @{ Name = "model"; Apply = { param($m) $m.model = "a-different-model" } },
+            @{ Name = "script build"; Apply = { param($m) $m.scriptSha256 = ("e" * 64) } },
+            @{ Name = "specialist library"; Apply = { param($m) $m.specialistLibrarySha256 = ("e" * 64) } },
+            @{ Name = "prompt"; Apply = { param($m) $m.promptSha256 = ("e" * 64) } },
+            @{ Name = "convention plan"; Apply = { param($m) $m.conventionPlanSha256 = ("e" * 64) } },
+            @{ Name = "fact plan"; Apply = { param($m) $m.factPlanSha256 = ("e" * 64) } },
+            @{ Name = "config"; Apply = { param($m) $m.configSha256 = ("e" * 64) } },
+            @{ Name = "repository"; Apply = { param($m) $m.repositoryId = "another-repo" } },
+            @{ Name = "pull request"; Apply = { param($m) $m.prId = 99 } })) {
+        $altered = New-ReconRun -Nonce "n2" -Rows @((New-ReconRow))
+        & $identity.Apply $altered
+        $mixed = Resolve-ReviewerRunReconciliation -Manifests @(
+            (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate))), $altered)
+        Assert-Replay (-not [bool]$mixed.reconciled) `
+            "Runs differing in $($identity.Name) are not repetitions of one question."
+        Assert-Replay (@($mixed.rows)[0].reconciledStatus -ceq "unknown" -and
+            @(@($mixed.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0) `
+            "A $($identity.Name) mismatch must leave nothing stable and nothing eligible."
+    }
+
+    # An incomplete construct set, and a rule-source identity that moved under a
+    # stable ref, are the two identity mismatches that live inside the coverage
+    # rather than beside it.
+    $ruleMoved = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow -Sha ("1" * 64)))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Sha ("2" * 64)))))
+    Assert-Replay (@($ruleMoved.rows)[0].reconciledStatus -ceq "unknown") `
+        "The same ref citing two different rule digests is two different questions."
+
+    # Delivery powerlessness. The reconciliation is evaluation output: it must
+    # carry no authorization of any kind, and its own kind must not be readable
+    # as a specialist preview - which is the only artifact promotion reads.
+    $powerless = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate))))
+    Assert-Replay (-not [bool]$powerless.promotable) "A reconciliation is never promotable."
+    $authorizationFields = @("authorization", "deliveryAuthorization", "writesRequested",
+        "eligible", "postable", "vote", "threadId", "commentId", "promote")
+    $leaked = @(@($authorizationFields) | Where-Object { $null -ne $powerless.PSObject.Properties[$_] })
+    Assert-Replay (@($leaked).Count -eq 0) `
+        "A reconciliation must carry no authorization field whatsoever (found: $($leaked -join ', '))."
+    Assert-Replay ([string]$powerless.kind -ceq $script:ReviewerRunReconciliationKind -and
+        [string]$powerless.kind -cne $script:ReviewerConventionSpecialistArtifactKind) `
+        "A reconciliation must not wear the kind that promotion reads."
+    # Even a fully agreed candidate is only ever `agreed` - never a word that
+    # any delivery path looks for.
+    $dispositions = @(@($powerless.candidates) | ForEach-Object { [string]$_.disposition })
+    Assert-Replay (@(@($dispositions) | Where-Object { $_ -cin @("eligible", "approved", "postable", "promoted") }).Count -eq 0) `
+        "An agreed candidate must not be labelled with any word a delivery path could act on."
+
+    # Digest tampering: editing the outcome must change the digest, and the
+    # digest must be a pure function of the outcome rather than of when or where
+    # it was computed.
+    $again = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate))))
+    Assert-Replay ([string]$powerless.reconciliationSha256 -ceq [string]$again.reconciliationSha256) `
+        "The same runs reconciled twice must produce the same digest."
+    $tamperedRows = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow -Violating @("mi0")))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Violating @("mi0")))))
+    Assert-Replay ([string]$tamperedRows.reconciliationSha256 -cne [string]$powerless.reconciliationSha256) `
+        "A different reconciled outcome must produce a different digest."
+
     # One run is not a reconciliation, however clean it looks.
     $single = Resolve-ReviewerRunReconciliation -Manifests @((New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate))))
     Assert-Replay (-not [bool]$single.reconciled -and @($single.rows)[0].reconciledStatus -ceq "unknown") `
@@ -2464,6 +2536,57 @@ try {
     $sealedRecon = @(Get-ChildItem -LiteralPath $reconDir -Filter "reconciliation-*.json")[0].FullName
     Assert-ReplayThrows { Read-ReviewerConventionSpecialistPreview -Path $sealedRecon -MasterKey $masterKey } `
         "The reconciliation artifact must not verify under the raw promotion key." -Match "signature verification failed"
+
+    # The predeclared run set, end to end. A declaration that names a count can
+    # still be filled with whichever runs looked best; one that names the
+    # artifacts cannot.
+    $declPath = & $toolPath -DeclareRunSet -SnapshotName "s" `
+        -SnapshotManifestDigest ("7" * 64) -PlannedRunCount 2 `
+        -KeyPath $keyFile -OutputDirectory $reconDir 2>&1 | Select-Object -Last 1
+    Assert-Replay (Test-Path -LiteralPath ([string]$declPath)) "Declaring a run set must seal a declaration."
+    $countOutput = & $toolPath -ArtifactPath $sealedPaths -KeyPath $keyFile `
+        -RunSetPath ([string]$declPath) -RunSetKeyPath $keyFile 2>&1
+    Assert-Replay ($LASTEXITCODE -eq 0 -and (($countOutput -join "`n") -clike "*Predeclared set*")) `
+        "A declaration must be consumable, and must say so in the report."
+    $shortSet = ""
+    try { & $toolPath -ArtifactPath @($sealedPaths[0]) -KeyPath $keyFile -RunSetPath ([string]$declPath) -RunSetKeyPath $keyFile | Out-Null }
+    catch { $shortSet = [string]$_.Exception.Message }
+    Assert-Replay ($shortSet -clike "*is not a qualification*") `
+        "A set trimmed below what was declared must be refused, not reconciled."
+
+    # And the stronger form: the declaration names the exact artifacts.
+    $runShas = @(@($sealedPaths) | ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant() })
+    $namedPath = & $toolPath -DeclareRunSet -SnapshotName "s" `
+        -SnapshotManifestDigest ("7" * 64) -ExpectedRunSha256 $runShas `
+        -KeyPath $keyFile -OutputDirectory $reconDir 2>&1 | Select-Object -Last 1
+    $namedOutput = & $toolPath -ArtifactPath $sealedPaths -KeyPath $keyFile `
+        -RunSetPath ([string]$namedPath) -RunSetKeyPath $keyFile 2>&1
+    Assert-Replay ($LASTEXITCODE -eq 0 -and (($namedOutput -join "`n") -clike "*named these exact artifacts*")) `
+        "A declaration naming exact artifacts must accept exactly those artifacts."
+    # A third run, never declared, cannot be added.
+    $thirdManifest = New-ReconRun -Nonce "n9" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate))
+    $thirdManifest | Add-Member -NotePropertyName kind -NotePropertyValue $script:ReviewerConventionSpecialistArtifactKind -Force
+    $thirdManifest | Add-Member -NotePropertyName artifactVersion `
+        -NotePropertyValue $script:ReviewerConventionSpecialistArtifactVersion -Force
+    $thirdPath = Save-ReviewerConventionSpecialistPreview -Directory $reconDir -BaseName "run3" `
+        -Manifest $thirdManifest -MasterKey $derivedKey
+    $topUp = ""
+    try {
+        & $toolPath -ArtifactPath @($sealedPaths[0], $thirdPath) -KeyPath $keyFile `
+            -RunSetPath ([string]$namedPath) -RunSetKeyPath $keyFile | Out-Null
+    }
+    catch { $topUp = [string]$_.Exception.Message }
+    Assert-Replay ($topUp -clike "*not those*") `
+        "Swapping in a run the declaration never named must be refused."
+    # The same artifact listed twice is not two runs.
+    $doubled = ""
+    try {
+        & $toolPath -ArtifactPath @($sealedPaths[0], $sealedPaths[0]) -KeyPath $keyFile `
+            -RunSetPath ([string]$namedPath) -RunSetKeyPath $keyFile | Out-Null
+    }
+    catch { $doubled = [string]$_.Exception.Message }
+    Assert-Replay ($doubled -clike "*not those*" -or $doubled -clike "*more than once*") `
+        "The same artifact twice must be refused against a named declaration."
 
     # A live-run artifact, sealed under the raw key, is not a replay run.
     $liveManifest = New-ReconRun -Nonce "n3" -Rows @((New-ReconRow))

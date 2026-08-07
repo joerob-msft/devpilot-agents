@@ -80,7 +80,16 @@ $script:ReviewerRunReconciliationBindingFields = @(
     "specialistLibrarySha256",
     "promptSha256",
     "conventionPlanSha256",
-    "factPlanSha256"
+    "factPlanSha256",
+    # Schema and code identity. `scriptSha256`, `specialistLibrarySha256` and
+    # `promptSha256` together ARE the head identity as far as this pass is
+    # concerned - they are what the reviewer was when it ran, which is a
+    # stronger statement than a commit id, because a commit id says nothing
+    # about a dirty worktree. `artifactVersion` and `kind` pin the shape those
+    # hashes are recorded in, so a schema change cannot make two differently
+    # shaped manifests compare equal.
+    "artifactVersion",
+    "kind"
 )
 
 # Without these a run has no identity at all, and two empty strings compare
@@ -88,7 +97,8 @@ $script:ReviewerRunReconciliationBindingFields = @(
 # anything.
 $script:ReviewerRunReconciliationRequiredFields = @(
     "prId", "sourceCommit", "model", "configSha256", "scriptSha256",
-    "specialistLibrarySha256", "promptSha256", "conventionPlanSha256", "factPlanSha256"
+    "specialistLibrarySha256", "promptSha256", "conventionPlanSha256", "factPlanSha256",
+    "artifactVersion", "kind"
 )
 
 function Get-ReviewerRunReconciliationValue {
