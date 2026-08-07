@@ -21,7 +21,7 @@ $script:ReviewerRunReconciliationKind = "reviewer.run-reconciliation"
 $script:ReviewerRunReconciliationSetKind = "reviewer.run-reconciliation-set"
 $script:ReviewerRunReconciliationVersion = 2
 $script:ReviewerRunSemanticCandidateKind = "reviewer.semantic-candidate"
-$script:ReviewerRunSemanticCandidateVersion = 1
+$script:ReviewerRunSemanticCandidateVersion = 2
 
 function Get-ReviewerRunReconciliationTimestamp {
     <#
@@ -303,6 +303,8 @@ function Get-ReviewerRunReconciliationPresentation {
         diffEvidence = [string](Get-ReviewerRunReconciliationValue $Candidate "diffEvidence" "")
         impact = [string](Get-ReviewerRunReconciliationValue $Candidate "impact" "")
         expectedFixOrValidation = [string](Get-ReviewerRunReconciliationValue $Candidate "expectedFixOrValidation" "")
+        confidence = [string](Get-ReviewerRunReconciliationValue $Candidate "confidence" "")
+        siblingStatus = [string](Get-ReviewerRunReconciliationValue $Candidate "siblingStatus" "")
         siblingEvidence = [string](Get-ReviewerRunReconciliationValue $Candidate "siblingEvidence" "")
         siblingNotRequiredReason = [string](Get-ReviewerRunReconciliationValue $Candidate "siblingNotRequiredReason" "")
         residualRiskSummary = [string](Get-ReviewerRunReconciliationValue $Candidate "residualRiskSummary" "")
@@ -345,11 +347,15 @@ function Get-ReviewerRunReconciliationSemanticCandidateIdentity {
     $issueClass = [string](Get-ReviewerRunReconciliationValue $Candidate "category" "")
     $impactCategory = [string](Get-ReviewerRunReconciliationValue $Candidate "impactCategory" "")
     $severity = [string](Get-ReviewerRunReconciliationValue $Candidate "severity" "")
+    $confidence = [string](Get-ReviewerRunReconciliationValue $Candidate "confidence" "")
+    $siblingStatus = [string](Get-ReviewerRunReconciliationValue $Candidate "siblingStatus" "")
     if ($issueClass -cne "convention" -or
         @("none", "buildOrTestExecution", "deployment", "security",
             "customerBehavior", "compatibility") -cnotcontains $impactCategory -or
-        @("suggestion", "important") -cnotcontains $severity) {
-        [void]$errors.Add("issue class, impact category, or severity is incomplete")
+        @("suggestion", "important") -cnotcontains $severity -or
+        @("low", "medium", "high") -cnotcontains $confidence -or
+        @("checked", "notRequired") -cnotcontains $siblingStatus) {
+        [void]$errors.Add("issue class, impact category, severity, or material qualifier is incomplete")
     }
     $remediationAction = [string](Get-ReviewerRunReconciliationValue $Candidate "remediationAction" "")
     $remediationScope = [string](Get-ReviewerRunReconciliationValue $Candidate "remediationScope" "")
@@ -465,6 +471,7 @@ function Get-ReviewerRunReconciliationSemanticCandidateIdentity {
         }
         issue = [ordered]@{ class = $issueClass; impactCategory = $impactCategory }
         severity = $severity
+        qualifiers = [ordered]@{ confidence = $confidence; siblingStatus = $siblingStatus }
         evidence = [ordered]@{ factIds = @($factIds); violations = @($violationSet.ToArray()) }
         remediation = [ordered]@{
             action = $remediationAction; scope = $remediationScope
@@ -476,7 +483,7 @@ function Get-ReviewerRunReconciliationSemanticCandidateIdentity {
     return [pscustomobject][ordered]@{
         valid = ($errors.Count -eq 0)
         errors = @($errors.ToArray())
-        id = "rsci1:$sha256"
+        id = "rsci2:$sha256"
         sha256 = $sha256
         canonicalPayload = $canonicalPayload
         payload = $payload

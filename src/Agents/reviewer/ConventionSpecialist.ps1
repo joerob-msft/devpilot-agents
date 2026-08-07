@@ -426,7 +426,7 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                         }
                         confidence = @{ Type = "enum"; Values = @("low", "medium", "high") }
                         residualRiskSummary = @{ Type = "string"; MaxLength = 800; AllowEmpty = $true; Pattern = $ascii; NormalizeTypography = $true }
-                        semanticCandidateVersion = @{ Type = "int"; Min = 1; Max = 1 }
+                        semanticCandidateVersion = @{ Type = "int"; Min = 2; Max = 2 }
                         remediationAction = @{ Type = "enum"; Values = @("add", "modify", "remove", "rename", "replace", "validate") }
                         remediationScope = @{ Type = "enum"; Values = @("inPullRequest", "followUp") }
                         remediationTargets = @{

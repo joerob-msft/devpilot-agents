@@ -2037,7 +2037,8 @@ try {
             [string]$RuleSha = ("9" * 64), [string]$ImpactCategory = "none",
             [string]$Category = "convention", [string]$Pack = "core",
             [string]$AnchorKind = "changedFile",
-            [string]$FactIds = "", [int]$SemanticVersion = 1,
+            [string]$FactIds = "", [int]$SemanticVersion = 2,
+            [string]$Confidence = "high", [string]$SiblingStatus = "checked",
             [string]$RemediationAction = "modify", [string]$RemediationScope = "inPullRequest",
             [string]$RemediationTargets = "mi0", [bool]$FollowUpRequired = $false
         )
@@ -2045,6 +2046,7 @@ try {
             candidateId = $Id; ruleSourceId = $Source; filePath = $Path; line = $Line
             ruleSourceSha256 = $RuleSha; packName = $Pack; anchorKind = $AnchorKind; category = $Category
             severity = $Severity; impactCategory = $ImpactCategory; factIds = $FactIds
+            confidence = $Confidence; siblingStatus = $SiblingStatus
             comment = $Comment; diffEvidence = "deterministic evidence"; impact = $Comment
             expectedFixOrValidation = "apply the structured remediation"
             ruleSection = "Rule"; ruleQuote = "Use the required construct."
@@ -2318,7 +2320,9 @@ try {
     $analogFinding = @($analog.candidates)[0]
     Assert-Replay ($analogFinding.disposition -ceq "semanticAgreementTextWithheld" -and
         [string]$analogFinding.comment -ceq "" -and
-        [string]$analogFinding.semanticCandidateId -cmatch '^rsci1:[0-9a-f]{64}$') `
+        [string]$analogFinding.semanticCandidateId -cmatch '^rsci2:[0-9a-f]{64}$' -and
+        [string]$analogFinding.semanticIdentity.qualifiers.confidence -ceq "high" -and
+        [string]$analogFinding.semanticIdentity.qualifiers.siblingStatus -ceq "checked") `
         "The exact analog must produce one stable semantic finding without choosing model prose."
     Assert-Replay (@($analogFinding.presentationVariants).Count -eq 2 -and
         @(@($analogFinding.presentationVariants).text.comment) -ccontains $analogCandidateA.comment -and
@@ -2364,6 +2368,12 @@ try {
         -LeftCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0 -Severity suggestion) `
         -RightCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0 -Severity important `
             -ImpactCategory customerBehavior)
+    Assert-SemanticCandidateSplit -Name "confidence" `
+        -LeftCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0 -Confidence low) `
+        -RightCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0 -Confidence high)
+    Assert-SemanticCandidateSplit -Name "sibling-status" `
+        -LeftCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0 -SiblingStatus checked) `
+        -RightCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0 -SiblingStatus notRequired)
     Assert-SemanticCandidateSplit -Name "impact" `
         -LeftCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0) `
         -RightCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0 `
@@ -2383,10 +2393,12 @@ try {
 
     $missingFollowUp = New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0
     $missingFollowUp.PSObject.Properties.Remove("followUpRequired")
-    $mixedSemanticSchema = New-ReconCandidate -Path "src/semantic.cs" -Line 1034 `
-        -RemediationTargets dc0 -SemanticVersion 2
+    $legacySemanticSchema = New-ReconCandidate -Path "src/semantic.cs" -Line 1034 `
+        -RemediationTargets dc0 -SemanticVersion 1
+    $futureSemanticSchema = New-ReconCandidate -Path "src/semantic.cs" -Line 1034 `
+        -RemediationTargets dc0 -SemanticVersion 3
     $stringTypedIdentity = New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0
-    $stringTypedIdentity.semanticCandidateVersion = "1"
+    $stringTypedIdentity.semanticCandidateVersion = "2"
     $stringTypedIdentity.line = "1034"
     $stringTypedIdentity.followUpRequired = "false"
     $nonNumericLine = New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0
@@ -2397,7 +2409,12 @@ try {
     $unsignedVersion.semanticCandidateVersion = [uint64]::MaxValue
     $oversizedJsonInteger = New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0
     $oversizedJsonInteger.line = [System.Numerics.BigInteger]::Parse("184467440737095516160")
-    foreach ($malformed in @($missingFollowUp, $mixedSemanticSchema, $stringTypedIdentity,
+    $missingConfidence = New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0
+    $missingConfidence.PSObject.Properties.Remove("confidence")
+    $missingSiblingStatus = New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0
+    $missingSiblingStatus.PSObject.Properties.Remove("siblingStatus")
+    foreach ($malformed in @($missingFollowUp, $legacySemanticSchema, $futureSemanticSchema,
+            $stringTypedIdentity, $missingConfidence, $missingSiblingStatus,
             $nonNumericLine, $largeLine, $unsignedVersion, $oversizedJsonInteger)) {
         $malformedResult = Resolve-ReviewerRunReconciliation -Manifests @(
             (New-ReconRun -Nonce "malformed-a" -Rows @((New-ReconRow -Violating @("dc0"))) `
@@ -2454,6 +2471,25 @@ try {
         "Normalized semantic output bytes and digest must be independent of run order."
     Assert-Replay (@(@($manyForward.candidates)[0].presentationVariants).Count -eq 12) `
         "A stable semantic finding across 12 runs must carry every raw presentation variant."
+    Assert-Replay (@(@($manyForward.candidates)[0].presentationVariants | Where-Object {
+                [string]$_.text.confidence -ceq "high" -and
+                [string]$_.text.siblingStatus -ceq "checked"
+            }).Count -eq 12) `
+        "Every raw presentation variant must retain confidence and sibling status."
+
+    $qualifierBaseline = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "qualifier-a" -Rows @((New-ReconRow)) -Candidates @(
+                (New-ReconCandidate -Confidence high -SiblingStatus checked))),
+        (New-ReconRun -Nonce "qualifier-b" -Rows @((New-ReconRow)) -Candidates @(
+                (New-ReconCandidate -Confidence high -SiblingStatus checked))))
+    $qualifierTamper = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "qualifier-a" -Rows @((New-ReconRow)) -Candidates @(
+                (New-ReconCandidate -Confidence low -SiblingStatus notRequired))),
+        (New-ReconRun -Nonce "qualifier-b" -Rows @((New-ReconRow)) -Candidates @(
+                (New-ReconCandidate -Confidence low -SiblingStatus notRequired))))
+    Assert-Replay ([string]$qualifierBaseline.reconciliationSha256 -cne
+        [string]$qualifierTamper.reconciliationSha256) `
+        "Changing sealed material qualifiers must change the normalized reconciliation digest."
 
     $collisionLeft = [pscustomobject]@{ sha256 = ("a" * 64); canonicalPayload = '{"left":1}' }
     $collisionRight = [pscustomobject]@{ sha256 = ("a" * 64); canonicalPayload = '{"right":1}' }
@@ -2991,6 +3027,42 @@ try {
     $absentFromSchema = @(@($sampleRecon.PSObject.Properties.Name) | Where-Object { $schemaKnown -cnotcontains $_ })
     Assert-Replay (@($absentFromSchema).Count -eq 0) `
         "Every field a real reconciliation emits must be described by the schema (undescribed: $($absentFromSchema -join ', '))."
+    Assert-Replay ($null -eq $schema.definitions.semanticCandidateIdentity.properties.PSObject.Properties["allOf"] -and
+        @($schema.definitions.semanticCandidateIdentity.allOf).Count -eq 2) `
+        "Semantic anchor conditionals must be schema applicators beside properties, never a payload property."
+    Assert-Replay (Test-Json -Json ($sampleRecon | ConvertTo-Json -Depth 32 -Compress) `
+            -SchemaFile $schemaPath -ErrorAction SilentlyContinue) `
+        "A valid changed-file semantic reconciliation must satisfy the committed v2 schema."
+    Assert-Replay (Test-Json -Json ($metadataAgreement | ConvertTo-Json -Depth 32 -Compress) `
+            -SchemaFile $schemaPath -ErrorAction SilentlyContinue) `
+        "A valid metadata semantic reconciliation must satisfy the committed v2 schema."
+    $missingQualifierForSchema = New-ReconCandidate
+    $missingQualifierForSchema.PSObject.Properties.Remove("confidence")
+    $malformedQualifierRecon = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "malformed-qualifier-a" -Rows @((New-ReconRow)) -Candidates @(
+                $missingQualifierForSchema)),
+        (New-ReconRun -Nonce "malformed-qualifier-b" -Rows @((New-ReconRow)) -Candidates @(
+                $missingQualifierForSchema)))
+    Assert-Replay (@($malformedQualifierRecon.candidates)[0].disposition -ceq
+        "withheldMalformedSemanticIdentity" -and
+        (Test-Json -Json ($malformedQualifierRecon | ConvertTo-Json -Depth 32 -Compress) `
+            -SchemaFile $schemaPath -ErrorAction SilentlyContinue)) `
+        "Malformed raw qualifiers must remain auditable in a schema-valid fail-closed artifact."
+    $badChangedSchema = $sampleRecon | ConvertTo-Json -Depth 32 | ConvertFrom-Json -Depth 32
+    $badChangedSchema.candidates[0].semanticIdentity.anchor.path = ""
+    Assert-Replay (-not (Test-Json -Json ($badChangedSchema | ConvertTo-Json -Depth 32 -Compress) `
+                -SchemaFile $schemaPath -ErrorAction SilentlyContinue)) `
+        "The v2 schema must reject a changed-file identity without a path."
+    $badMetadataSchema = $metadataAgreement | ConvertTo-Json -Depth 32 | ConvertFrom-Json -Depth 32
+    $badMetadataSchema.candidates[0].semanticIdentity.remediation.targets = @("dc0")
+    Assert-Replay (-not (Test-Json -Json ($badMetadataSchema | ConvertTo-Json -Depth 32 -Compress) `
+                -SchemaFile $schemaPath -ErrorAction SilentlyContinue)) `
+        "The v2 schema must reject metadata remediation aimed at a changed construct."
+    $literalAllOf = $sampleRecon | ConvertTo-Json -Depth 32 | ConvertFrom-Json -Depth 32
+    $literalAllOf.candidates[0].semanticIdentity | Add-Member -NotePropertyName allOf -NotePropertyValue @()
+    Assert-Replay (-not (Test-Json -Json ($literalAllOf | ConvertTo-Json -Depth 32 -Compress) `
+                -SchemaFile $schemaPath -ErrorAction SilentlyContinue)) `
+        "The v2 schema must reject a literal semantic identity property named allOf."
     $anchorVerdictEnum = @($schema.definitions.anchorOutcome.properties.reconciledVerdict.enum)
     foreach ($verdict in @("violation", "compliant", "notInReach", "unknown")) {
         Assert-Replay ($anchorVerdictEnum -ccontains $verdict) `
