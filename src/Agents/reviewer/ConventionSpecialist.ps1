@@ -102,7 +102,11 @@ function Get-ReviewerConventionSpecialistRemediationErrors {
         $id = [string](Get-ReviewerConventionSpecialistValue $fact "id" "")
         if ($id -and -not $factMap.ContainsKey($id)) { $factMap.Add($id, $fact) }
     }
-    foreach ($factId in @($changedFactText -split ',' | Where-Object { $_ })) {
+    $changedFactIds = @($changedFactText -split ',' | Where-Object { $_ })
+    if (@($changedFactIds | Select-Object -Unique).Count -ne $changedFactIds.Count) {
+        [void]$errors.Add("changed-code remediation duplicates a deterministic fact")
+    }
+    foreach ($factId in $changedFactIds) {
         if ($factId -cnotmatch '^rf1:[0-9a-f]{64}$' -or -not $factMap.ContainsKey($factId) -or
             [string](Get-ReviewerConventionSpecialistValue $factMap[$factId] "state" "") -notin
                 @("true", "false")) {

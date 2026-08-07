@@ -9675,13 +9675,24 @@ function Invoke-ReviewerCrossVerificationPass {
         -ConventionCandidates $specialistCandidates -ConventionModel $EffectiveConventionSpecialistModel `
         -ConventionArtifactSha256 $specialistArtifactSha `
         -MaxCandidates ([int]$EffectiveCrossVerificationPolicy.maxCandidates)
-    $candidates = @($candidatePlan.candidates)
-    $preVerificationWithheld = @($candidatePlan.withheld)
-    $clusters = @(Get-ReviewerVerificationClusters -Candidates $candidates `
-        -MaxCandidates ([int]$EffectiveCrossVerificationPolicy.maxCandidates) `
-        -MaxClusterSize ([int]$EffectiveCrossVerificationPolicy.maxClusterSize) `
-        -NearExactJaccard ([double]$EffectiveCrossVerificationPolicy.nearExactJaccard) `
-        -SemanticJaccard ([double]$EffectiveCrossVerificationPolicy.semanticJaccard))
+    $factPartition = Get-ReviewerVerificationCandidateFactPartition `
+        -Candidates @($candidatePlan.candidates) -FactPlan $factPlan
+    $candidates = @($factPartition.candidates)
+    $preVerificationWithheld = @($candidatePlan.withheld) + @($factPartition.withheld)
+    do {
+        $clusters = @(Get-ReviewerVerificationClusters -Candidates $candidates `
+            -MaxCandidates ([int]$EffectiveCrossVerificationPolicy.maxCandidates) `
+            -MaxClusterSize ([int]$EffectiveCrossVerificationPolicy.maxClusterSize) `
+            -NearExactJaccard ([double]$EffectiveCrossVerificationPolicy.nearExactJaccard) `
+            -SemanticJaccard ([double]$EffectiveCrossVerificationPolicy.semanticJaccard))
+        $clusterFactPartition = Get-ReviewerVerificationClusterFactPartition `
+            -Candidates $candidates -Clusters $clusters -FactPlan $factPlan
+        $clusterFactWithheld = @($clusterFactPartition.withheld)
+        if ($clusterFactWithheld.Count -gt 0) {
+            $candidates = @($clusterFactPartition.candidates)
+            $preVerificationWithheld += $clusterFactWithheld
+        }
+    } while ($clusterFactWithheld.Count -gt 0)
     $assignments = @(Get-ReviewerVerificationAssignments -Clusters $clusters `
         -GeneralistModels $ReviewPassModels -ConventionVerifierModel $EffectiveConventionVerifierModel `
         -ChangedPaths @($Bound.ChangedPaths))

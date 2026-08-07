@@ -1175,6 +1175,83 @@ function Get-ReviewerVerificationDeterministicFacts {
     return $facts
 }
 
+function Get-ReviewerVerificationCandidateFactPartition {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Candidates,
+        $FactPlan = $null,
+        [ValidateRange(1, 32)][int]$MaxFactIds = 16,
+        [ValidateRange(1024, 65536)][int]$MaxCanonicalBytes = 32768
+    )
+    [void](Get-ReviewerVerificationDeterministicFacts -Candidates @() -FactPlan $FactPlan `
+            -MaxFactIds $MaxFactIds -MaxCanonicalBytes $MaxCanonicalBytes)
+    $accepted = [System.Collections.Generic.List[object]]::new()
+    $withheld = [System.Collections.Generic.List[object]]::new()
+    foreach ($candidate in $Candidates) {
+        try {
+            [void](Get-ReviewerVerificationDeterministicFacts -Candidates @($candidate) `
+                    -FactPlan $FactPlan -MaxFactIds $MaxFactIds `
+                    -MaxCanonicalBytes $MaxCanonicalBytes)
+            [void]$accepted.Add($candidate)
+        }
+        catch {
+            [void]$withheld.Add([pscustomobject][ordered]@{
+                    candidateId = [string](Get-ReviewerVerificationValue $candidate "candidateId" "")
+                    clusterId = ""
+                    reason = "missingEvidence"
+                    detail = "Candidate deterministic-fact evidence was rejected: $($_.Exception.Message)"
+                })
+        }
+    }
+    return [pscustomobject][ordered]@{
+        candidates = $accepted.ToArray()
+        withheld = $withheld.ToArray()
+    }
+}
+
+function Get-ReviewerVerificationClusterFactPartition {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Candidates,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Clusters,
+        $FactPlan = $null,
+        [ValidateRange(1, 32)][int]$MaxFactIds = 16,
+        [ValidateRange(1024, 65536)][int]$MaxCanonicalBytes = 32768
+    )
+    $rejectedIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $withheld = [System.Collections.Generic.List[object]]::new()
+    foreach ($cluster in $Clusters) {
+        if ([string](Get-ReviewerVerificationValue $cluster "status" "") -cne "ready") {
+            continue
+        }
+        $acceptedMembers = [System.Collections.Generic.List[object]]::new()
+        foreach ($candidate in @(Get-ReviewerVerificationValue $cluster "members" @())) {
+            $trial = @($acceptedMembers.ToArray()) + @($candidate)
+            try {
+                [void](Get-ReviewerVerificationDeterministicFacts -Candidates $trial `
+                        -FactPlan $FactPlan -MaxFactIds $MaxFactIds `
+                        -MaxCanonicalBytes $MaxCanonicalBytes)
+                [void]$acceptedMembers.Add($candidate)
+            }
+            catch {
+                $candidateId = [string](Get-ReviewerVerificationValue $candidate "candidateId" "")
+                [void]$rejectedIds.Add($candidateId)
+                [void]$withheld.Add([pscustomobject][ordered]@{
+                        candidateId = $candidateId
+                        clusterId = [string](Get-ReviewerVerificationValue $cluster "clusterId" "")
+                        reason = "missingEvidence"
+                        detail = "Candidate deterministic facts exceed the bounded verifier input for this cluster."
+                    })
+            }
+        }
+    }
+    return [pscustomobject][ordered]@{
+        candidates = @($Candidates | Where-Object {
+                -not $rejectedIds.Contains(
+                    [string](Get-ReviewerVerificationValue $_ "candidateId" ""))
+            })
+        withheld = $withheld.ToArray()
+    }
+}
+
 function Get-ReviewerVerificationEvidenceOptions {
     param(
         [Parameter(Mandatory)]$Candidate,

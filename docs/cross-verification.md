@@ -82,6 +82,11 @@ the candidate. The wrapper supplies dedicated evidence options for both parts,
 including precomputed canonical digests and exact fact subsets; verifier models
 copy these values and never compute hashes. Deterministic model input contains
 the bounded union of candidate facts and changed-code remediation facts.
+Malformed, duplicate, invented, or individually oversized subsets withhold only
+their candidate. If otherwise-valid candidates in one semantic cluster would
+exceed the per-run fact or byte bound, deterministic cluster admission withholds
+only the candidate that crosses the bound; unrelated candidates and clusters
+continue without degrading the verification pass.
 
 ## Eligibility and artifacts
 
