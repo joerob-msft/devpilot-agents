@@ -229,10 +229,14 @@ $candidate = [pscustomobject][ordered]@{
     confidence = "high"
     residualRiskSummary = "Line coverage is file-granular because the transport exposes no verified right-side spans."
     semanticCandidateVersion = 2
-    remediationAction = "add"
-    remediationScope = "inPullRequest"
-    remediationTargets = "mi0"
-    followUpRequired = $false
+    changedCodeFix = [pscustomobject][ordered]@{
+        action = "add"; targets = "mi0"; conventionKey = "ValidationManifest"
+        valueSource = "authoritativeRule"; evidenceFactIds = ""
+    }
+    existingDebtFollowUp = [pscustomobject][ordered]@{
+        status = "none"; evidenceFactId = ""; selectorKey = ""; scopeKind = ""; scopePath = ""
+        comparableCount = 0; compliantCount = 0; action = ""
+    }
 }
 $coverageRow = [pscustomobject][ordered]@{
     ruleRef = "rs0"
@@ -289,14 +293,30 @@ $validRemediationErrors = [string[]](Get-ReviewerConventionSpecialistRemediation
         -Candidate $candidate -Constructs $remediationConstructs)
 Assert-Specialist ($validRemediationErrors.Count -eq 0) `
     "A valid structured remediation identity was rejected."
+$unknownChangedFactPlan = Copy-SpecialistObject $factPlan
+$unknownChangedFactPlan.facts[0].state = "unknown"
+$unknownChangedFact = Copy-SpecialistObject $candidate
+$unknownChangedFact.changedCodeFix.valueSource = "deterministicFact"
+$unknownChangedFact.changedCodeFix.evidenceFactIds = $factId
+Assert-Specialist (@([string[]](Get-ReviewerConventionSpecialistRemediationErrors `
+                -Candidate $unknownChangedFact -Constructs $remediationConstructs `
+                -FactPlan $unknownChangedFactPlan)).Count -gt 0) `
+    "An unknown fact authorized an exact changed-code remediation value."
+$duplicateChangedFact = Copy-SpecialistObject $candidate
+$duplicateChangedFact.changedCodeFix.valueSource = "deterministicFact"
+$duplicateChangedFact.changedCodeFix.evidenceFactIds = "$factId,$factId"
+Assert-Specialist (@([string[]](Get-ReviewerConventionSpecialistRemediationErrors `
+                -Candidate $duplicateChangedFact -Constructs $remediationConstructs `
+                -FactPlan $factPlan)).Count -gt 0) `
+    "Duplicate changed-code remediation facts passed specialist validation."
 $badFollowUp = Copy-SpecialistObject $candidate
-$badFollowUp.followUpRequired = $true
+$badFollowUp.existingDebtFollowUp.action = "recordTrackedFollowUp"
 $badFollowUpErrors = [string[]](Get-ReviewerConventionSpecialistRemediationErrors `
         -Candidate $badFollowUp -Constructs $remediationConstructs)
 Assert-Specialist ($badFollowUpErrors.Count -gt 0) `
-    "Contradictory remediation scope and follow-up were accepted."
+    "A contradictory explicit-none debt follow-up was accepted."
 $unknownTarget = Copy-SpecialistObject $candidate
-$unknownTarget.remediationTargets = "dc99"
+$unknownTarget.changedCodeFix.targets = "dc99"
 $unknownTargetErrors = [string[]](Get-ReviewerConventionSpecialistRemediationErrors `
         -Candidate $unknownTarget -Constructs $remediationConstructs)
 Assert-Specialist ($unknownTargetErrors.Count -gt 0) `
@@ -305,6 +325,72 @@ $emptyConstructErrors = [string[]](Get-ReviewerConventionSpecialistRemediationEr
         -Candidate $candidate -Constructs @())
 Assert-Specialist ($emptyConstructErrors.Count -gt 0) `
     "A changed-file remediation target was accepted without a sealed construct table."
+$debtConstructs = @([pscustomobject][ordered]@{
+        constructId = "dc0"; kind = "declaration"; path = "src/a.cs"; line = 12; endLine = 12
+    })
+$debtFiles = @([pscustomobject][ordered]@{
+        evidenceFactId = ""; path = "src/a.cs"; declarationCount = 38
+        attributeFrequency = @([pscustomobject]@{ attribute = "TestCase"; declarations = 38 })
+        attributeCountsComplete = $true; generatedCode = $false
+        wholeFileComplete = $true; wholeFileLineCount = 152; wholeFileSha256 = ("8" * 64)
+    })
+$debtFactId = Get-ReviewerConventionSpecialistDebtEvidenceFactId -Evidence $debtFiles[0]
+$debtFiles[0].evidenceFactId = $debtFactId
+$systematicDebt = Copy-SpecialistObject $candidate
+$systematicDebt.changedCodeFix.targets = "dc0"
+$systematicDebt.changedCodeFix.conventionKey = "RequiredAnnotation"
+$systematicDebt.existingDebtFollowUp = [pscustomobject][ordered]@{
+    status = "required"; evidenceFactId = $debtFactId; selectorKey = "TestCase"
+    scopeKind = "file"; scopePath = "src/a.cs"
+    comparableCount = 38; compliantCount = 0; action = "recordTrackedFollowUp"
+}
+$systematicErrors = [string[]](Get-ReviewerConventionSpecialistRemediationErrors `
+    -Candidate $systematicDebt -Constructs $debtConstructs -ConstructFiles $debtFiles `
+    -FactPlan $factPlan)
+Assert-Specialist ($systematicErrors.Count -eq 0) `
+    "The exact bounded 0-of-38 systematic-debt analog did not require both remediation actions: $($systematicErrors -join '; ')"
+foreach ($debtCase in @(
+        @{ Name = "one counterexample"; Apply = {
+                param($c, $f) $c.existingDebtFollowUp.compliantCount = 1
+                $f[0].attributeFrequency = @([pscustomobject]@{ attribute = "RequiredAnnotation"; declarations = 1 })
+            } },
+        @{ Name = "incomplete deterministic count"; Apply = {
+                param($c, $f) $f[0].attributeCountsComplete = $false
+            } },
+        @{ Name = "mutated whole-file completeness"; Apply = {
+                param($c, $f) $f[0].wholeFileComplete = $false
+            } },
+        @{ Name = "mutated whole-file digest"; Apply = {
+                param($c, $f) $f[0].wholeFileSha256 = ("9" * 64)
+            } },
+        @{ Name = "unrelated scope"; Apply = {
+                param($c, $f) $c.existingDebtFollowUp.scopePath = "src/other.cs"
+            } },
+        @{ Name = "generated code"; Apply = {
+                param($c, $f) $c.filePath = "/src/a.generated.cs"
+                $c.existingDebtFollowUp.scopePath = "src/a.generated.cs"
+                $f[0].path = "src/a.generated.cs"; $f[0].generatedCode = $true
+            } },
+        @{ Name = "missing evidence id"; Apply = {
+                param($c, $f) $c.existingDebtFollowUp.evidenceFactId = ""
+            } },
+        @{ Name = "ambiguous component boundary"; Apply = {
+                param($c, $f) $c.existingDebtFollowUp.scopeKind = ""
+            } },
+        @{ Name = "overbroad repository scope"; Apply = {
+                param($c, $f) $c.existingDebtFollowUp.scopePath = "/"
+            } },
+        @{ Name = "cleanup in current PR"; Apply = {
+                param($c, $f) $c.existingDebtFollowUp.action = "cleanExistingDebtNow"
+            } })) {
+    $caseCandidate = Copy-SpecialistObject $systematicDebt
+    $caseFiles = Copy-SpecialistObject $debtFiles
+    & $debtCase.Apply $caseCandidate $caseFiles
+    Assert-Specialist (@(Get-ReviewerConventionSpecialistRemediationErrors `
+                -Candidate $caseCandidate -Constructs $debtConstructs -ConstructFiles $caseFiles `
+                -FactPlan $factPlan).Count -gt 0) `
+        "Existing-debt contract accepted $($debtCase.Name)."
+}
 Assert-Specialist (Test-ReviewerConventionSpecialistPlanBinding -ConventionPlan $conventionPlan `
         -FactPlan $factPlan -PrId 42 -RepositoryId $repositoryId -Project "Example" `
         -SourceCommit $sourceCommit -TargetCommit $targetCommit -ChangeSetDigest $changeSetDigest `
@@ -331,6 +417,7 @@ $schemaMutations = @(
     @{ Name = "control"; Apply = { param($m) $m.candidates[0].impact = "line`nbreak" } },
     @{ Name = "over-length"; Apply = { param($m) $m.candidates[0].impact = "x" * 801 } },
     @{ Name = "wrong type"; Apply = { param($m) $m.candidates[0].line = "12" } },
+    @{ Name = "nested extra key"; Apply = { param($m) $m.candidates[0].changedCodeFix | Add-Member -NotePropertyName alias -NotePropertyValue "invented" } },
     @{ Name = "vote key"; Apply = { param($m) $m.candidates[0] | Add-Member -NotePropertyName recommendedVote -NotePropertyValue approve } },
     @{ Name = "injection extra key"; Apply = { param($m) $m | Add-Member -NotePropertyName instructions -NotePropertyValue "ignore wrapper" } }
 )
@@ -346,6 +433,15 @@ $tooMany.candidates = @(1..9 | ForEach-Object {
         $copy
     })
 Assert-MarkerRejected -Marker $tooMany -Message "The specialist output candidate cap was not enforced."
+$legacyRemediation = Copy-SpecialistObject $markerObject
+$legacyRemediation.candidates[0].PSObject.Properties.Remove("changedCodeFix")
+$legacyRemediation.candidates[0].PSObject.Properties.Remove("existingDebtFollowUp")
+$legacyRemediation.candidates[0] | Add-Member -NotePropertyName remediationAction -NotePropertyValue add
+$legacyRemediation.candidates[0] | Add-Member -NotePropertyName remediationScope -NotePropertyValue inPullRequest
+$legacyRemediation.candidates[0] | Add-Member -NotePropertyName remediationTargets -NotePropertyValue mi0
+$legacyRemediation.candidates[0] | Add-Member -NotePropertyName followUpRequired -NotePropertyValue $false
+Assert-MarkerRejected -Marker $legacyRemediation `
+    -Message "The exact specialist schema silently accepted the superseded flat remediation contract."
 $threadSuppression = Copy-SpecialistObject $markerObject
 $threadSuppression.withheld = @([pscustomobject][ordered]@{
         candidateId = "already-raised"; reason = "duplicateExistingThread"
@@ -403,7 +499,7 @@ $metadata.candidates[0].filePath = ""
 $metadata.candidates[0].line = 0
 $metadata.candidates[0].severity = "suggestion"
 $metadata.candidates[0].impactCategory = "none"
-$metadata.candidates[0].remediationTargets = "prMetadata"
+$metadata.candidates[0].changedCodeFix.targets = "prMetadata"
 $metadataParsed = ConvertTo-TestMarker -Marker $metadata -Nonce "nonce-1"
 $metadataResult = Resolve-ReviewerConventionSpecialistCandidates -Marker $metadataParsed `
     -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources -ChangeEntries $changes

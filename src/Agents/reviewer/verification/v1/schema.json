@@ -27,6 +27,9 @@
     "siblingEvidence",
     "siblingNotRequiredReason",
     "factIds",
+    "changedCodeFix",
+    "existingDebtFollowUp",
+    "existingDebtEvidence",
     "rawCandidateSha256"
   ],
   "properties": {
@@ -68,6 +71,82 @@
     "siblingEvidence": { "type": "string" },
     "siblingNotRequiredReason": { "type": "string" },
     "factIds": { "type": "string" },
+    "changedCodeFix": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["action", "targets", "conventionKey", "valueSource", "evidenceFactIds"],
+          "properties": {
+            "action": { "enum": ["add", "modify", "remove", "rename", "replace", "validate"] },
+            "targets": { "type": "string" },
+            "conventionKey": { "type": "string" },
+            "valueSource": { "enum": ["authoritativeRule", "deterministicFact"] },
+            "evidenceFactIds": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "existingDebtFollowUp": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status", "evidenceFactId", "selectorKey", "scopeKind", "scopePath",
+            "comparableCount", "compliantCount", "action"
+          ],
+          "properties": {
+            "status": { "enum": ["none", "required"] },
+            "evidenceFactId": { "type": "string" },
+            "selectorKey": { "type": "string" },
+            "scopeKind": { "enum": ["", "file"] },
+            "scopePath": { "type": "string" },
+            "comparableCount": { "type": "integer", "minimum": 0 },
+            "compliantCount": { "type": "integer", "minimum": 0 },
+            "action": { "enum": ["", "recordTrackedFollowUp", "linkTrackedFollowUp"] }
+          }
+        }
+      ]
+    },
+    "existingDebtEvidence": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "evidenceFactId", "path", "declarationCount",
+            "attributeFrequency", "attributeCountsComplete", "generatedCode",
+            "wholeFileComplete", "wholeFileLineCount", "wholeFileSha256"
+          ],
+          "properties": {
+            "evidenceFactId": { "type": "string", "pattern": "^rdf1:[0-9a-f]{64}$" },
+            "path": { "type": "string" },
+            "declarationCount": { "type": "integer", "minimum": 0 },
+            "attributeFrequency": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["attribute", "declarations"],
+                "properties": {
+                  "attribute": { "type": "string" },
+                  "declarations": { "type": "integer", "minimum": 1 }
+                }
+              }
+            },
+            "attributeCountsComplete": { "type": "boolean" },
+            "generatedCode": { "type": "boolean" },
+            "wholeFileComplete": { "type": "boolean" },
+            "wholeFileLineCount": { "type": "integer", "minimum": 0 },
+            "wholeFileSha256": { "$ref": "#/$defs/sha256" }
+          }
+        }
+      ]
+    },
     "rawCandidateSha256": { "$ref": "#/$defs/sha256" }
   },
   "$defs": {
