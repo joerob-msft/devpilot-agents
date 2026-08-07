@@ -704,7 +704,10 @@ function ConvertTo-AgentMarkerFieldValue {
                 if ($cut -gt 0 -and [char]::IsHighSurrogate($text[$cut - 1])) { $cut-- }
                 $text = $text.Substring(0, $cut) + "..."
             }
-            if (-not ($Spec.ContainsKey('AllowEmpty') -and [bool]$Spec.AllowEmpty) -and $text.Trim() -eq "") { return $bad }
+            # Against the ORIGINAL, like the control-character scan and the
+            # pattern below. Checked after truncation, a field of four hundred
+            # spaces becomes "..." and passes as non-empty.
+            if (-not ($Spec.ContainsKey('AllowEmpty') -and [bool]$Spec.AllowEmpty) -and $original.Trim() -eq "") { return $bad }
             $allowNewlines = ($Spec.ContainsKey('AllowNewlines') -and [bool]$Spec.AllowNewlines)
             foreach ($ch in $original.ToCharArray()) {
                 if ([char]::IsControl($ch)) {

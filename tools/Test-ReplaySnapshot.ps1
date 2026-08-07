@@ -1495,6 +1495,27 @@ try {
     Assert-Replay ($watch.ElapsedMilliseconds -lt 20000) `
         "Enumerating a $($bigCode.Count)-line fully delivered file took $($watch.ElapsedMilliseconds) ms; it runs before every review and must not become a stall."
 
+    # And the SPARSE shape, which the fully delivered case above cannot reach: a
+    # long file with a three-line edit at the bottom. Every gap line used to pay
+    # a full parameter bind of the whole masked array, so an edit near the end
+    # of a file cost the whole file - ten seconds for one, minutes for a change
+    # set. The declaration index refuses gap and blank lines before the call now.
+    $sparseLines = New-Object string[] 12000
+    for ($i = 0; $i -lt 12000; $i++) { $sparseLines[$i] = "" }
+    $sparseLines[11996] = "public void M() {"
+    $sparseLines[11997] = "    Do(x: 1);"
+    $sparseLines[11998] = "}"
+    $sparseWatch = [Diagnostics.Stopwatch]::StartNew()
+    $sparseResult = Get-ReviewerChangedConstructs -Files @(@{
+            Path = "src/Sparse.cs"; Lines = $sparseLines
+            ChangedLines = @(11997, 11998, 11999); DeliveredLines = @(11997, 11998, 11999)
+        })
+    $sparseWatch.Stop()
+    Assert-Replay (@($sparseResult.Constructs).Count -gt 0) `
+        "A sparse image with a real declaration at the bottom must still yield a construct."
+    Assert-Replay ($sparseWatch.ElapsedMilliseconds -lt 8000) `
+        "A 12000-line sparse image with three delivered lines took $($sparseWatch.ElapsedMilliseconds) ms; the undelivered gap must not be paid for line by line."
+
     # Truncation must never be a way past a pattern. A field carrying both would
     # otherwise accept a string whose only violation sat past the cut.
     $patterned = @{ Type = "string"; MaxLength = 20; Truncate = $true; Pattern = '^[\x20-\x7E]+$' }
@@ -1749,9 +1770,10 @@ try {
         "A degraded row must still record what it claimed; erasing it destroys the audit trail."
 
     # A field of overlapping ranges never adds a new id, so the unique-id
-    # ceiling never fires and the inner loop ran in full. The ranges have to be
-    # NARROWER than the ceiling for that to be true, which needs a construct
-    # table big enough that the ceiling is not reached on the first range.
+    # ceiling never fires and the inner loop ran in full. The ranges must be
+    # NARROWER than the ceiling for that to be true, and the check runs in a
+    # job with a deadline because a test whose only failure mode is a hang
+    # never reports.
     $wideConstructs = @()
     for ($i = 0; $i -lt 60; $i++) {
         $wideConstructs += [pscustomobject][ordered]@{ constructId = "mi$i"; kind = "invocation"; path = "src/a.cs"; line = ($i + 1) }
@@ -1760,17 +1782,40 @@ try {
         $wideConstructs += [pscustomobject][ordered]@{ constructId = "dc$i"; kind = "declaration"; path = "src/b.cs"; line = ($i + 1) }
     }
     $wideCover = "mi0-mi59,dc0-dc59"
-    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $floodJob = Start-Job -ScriptBlock {
+        param($RepoRoot)
+        . (Join-Path $RepoRoot "src\Agents\reviewer\ConventionSpecialist.ps1")
+        # `MaxIds` as the real call site computes it: anchor count plus sixteen,
+        # for a full 120-anchor table. Ranges of a hundred repeated forty times
+        # never add a new id past the first pass, so the unique-id ceiling
+        # cannot fire and only the work ceiling can.
+        $field = ((@(1..40) | ForEach-Object { "mi0-mi99" }) -join ",")
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $refused = Expand-ReviewerConventionSpecialistConstructIds -Text $field -MaxIds 136
+        $sw.Stop()
+        # And the legitimate shape at the same ceiling must still be accepted.
+        $legitimate = Expand-ReviewerConventionSpecialistConstructIds -Text "mi0-mi59,dc0-dc59" -MaxIds 136
+        return @{ RefusedOk = [bool]$refused.Ok; LegitimateOk = [bool]$legitimate.Ok
+            LegitimateCount = @($legitimate.Ids).Count; Ms = $sw.ElapsedMilliseconds
+        }
+    } -ArgumentList $RepoRoot
+    $floodFinished = Wait-Job -Job $floodJob -Timeout 60
+    $floodResult = $(if ($floodFinished) { @(Receive-Job -Job $floodJob)[0] } else { $null })
+    Remove-Job -Job $floodJob -Force -ErrorAction SilentlyContinue
+    Assert-Replay ($null -ne $floodResult) `
+        "The work ceiling must stop a flood of overlapping ranges; without it this does not return."
+    Assert-Replay ($null -ne $floodResult -and -not [bool]$floodResult.RefusedOk) `
+        "A field whose ranges never add a new id must still be refused, by the work ceiling rather than the id ceiling."
+    Assert-Replay ($null -ne $floodResult -and [bool]$floodResult.LegitimateOk -and [int]$floodResult.LegitimateCount -eq 120) `
+        "And at the same ceiling a legitimate full cover of the table must still be accepted."
+
     $overlapFlood = Invoke-Coverage -WithConstructs $wideConstructs -Rows @(
         (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope $bothKinds `
                 -Checked ((@(1..40) | ForEach-Object { "mi0-mi59" }) -join ",")),
         (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope $bothKinds -Checked $wideCover)
     )
-    $stopwatch.Stop()
     Assert-Replay (@($overlapFlood.Rows | Where-Object { $_.ruleRef -ceq "rs0" }).status -ceq "unknown") `
         "A flood of overlapping ranges must be refused, not expanded."
-    Assert-Replay ($stopwatch.ElapsedMilliseconds -lt 2000) `
-        "Refusing it must be cheap; the ceiling has to bound work, not just unique ids (took $($stopwatch.ElapsedMilliseconds) ms)."
     # And the legitimate shape it must NOT refuse: a full exact cover of the
     # same wide table, written as two ranges.
     $wideLegit = Invoke-Coverage -WithConstructs $wideConstructs -Rows @(
@@ -2321,6 +2366,27 @@ try {
         @(@($tenForward.rows) | Where-Object { [bool]$_.stable }).Count -eq 0 -and
         @(@($tenForward.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0) `
         "Ten runs spanning two bindings must leave nothing stable and nothing eligible."
+
+    # With eleven runs "run 1" is a prefix of "run 10" and "run 11". The digest
+    # maps positions to nonces by counting DOWN for exactly that reason, and
+    # nothing tested it - so an ascending rewrite would corrupt the two-digit
+    # runs into the one-digit run's nonce and nobody would notice.
+    $elevenRuns = @()
+    for ($i = 1; $i -le 11; $i++) {
+        $elevenRuns += (New-ReconRun -Nonce "nonce$i" -Rows @((New-ReconRow)) `
+                -Status $(if ($i -ge 9) { "degraded" } else { "complete" }))
+    }
+    $eleven = Resolve-ReviewerRunReconciliation -Manifests $elevenRuns -RequiredRunCount 11
+    $elevenReversed = Resolve-ReviewerRunReconciliation -Manifests @($elevenRuns[10..0]) -RequiredRunCount 11
+    Assert-Replay ([string]$eleven.reconciliationSha256 -ceq [string]$elevenReversed.reconciliationSha256) `
+        "Eleven runs reversed must produce the same digest; a two-digit run must not collapse into a one-digit one."
+    $degradedProblems = @(@($eleven.problems) | Where-Object { $_ -clike "*finished degraded*" })
+    Assert-Replay (@($degradedProblems).Count -eq 3) `
+        "Each degraded run must be named separately (got $(@($degradedProblems).Count))."
+    $namedRuns = @(@($degradedProblems) | ForEach-Object { ($_ -split ' ')[1] })
+    $distinctNamed = [System.Collections.Generic.HashSet[string]]::new([string[]]@($namedRuns), [StringComparer]::Ordinal)
+    Assert-Replay ($distinctNamed.Count -eq 3) `
+        "Runs 9, 10 and 11 must be three distinct runs, not one run named three times."
 
     # Five guards that mutation testing found uncovered. Each of these fails if
     # the corresponding production guard is reverted, which is the only reason

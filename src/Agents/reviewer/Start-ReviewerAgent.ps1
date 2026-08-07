@@ -8015,21 +8015,45 @@ function Get-ReviewerConstructFilesFromReport {
         # every delivered line as changed would hand the model sixty untouched
         # lines per hunk to rule on, and would let a comment land on code this
         # pull request never wrote.
+        #
+        # Merged into disjoint intervals FIRST. The clamp below bounds one span;
+        # it does nothing about two thousand overlapping ones, and spans
+        # accumulate per path across change entries. Two thousand whole-file
+        # spans over a four-thousand-line file walked eight million line
+        # positions - about four minutes and half a gigabyte, on the mandatory
+        # path of every review.
+        #
+        # Both the changed-line walk and the spanned-line total read the merged
+        # set. That matters: the partial-delivery test below compares them, and
+        # it is only correct because each counts every line exactly once.
+        # De-duplicating one side alone would invent a partial file.
         $rawSpans = @($file.RawSpans)
-        foreach ($span in $rawSpans) {
+        $mergedSpans = [System.Collections.Generic.List[object]]::new()
+        foreach ($span in @($rawSpans | Sort-Object -Property @{ Expression = { [long]$_.Start } }, @{ Expression = { [long]$_.End } })) {
+            $spanStart = [long][Math]::Max([long]1, [long]$span.Start)
+            $spanEnd = [long]$span.End
+            if ($spanEnd -lt $spanStart) { continue }
+            if ($mergedSpans.Count -gt 0 -and $spanStart -le ([long]$mergedSpans[$mergedSpans.Count - 1].End + 1)) {
+                if ($spanEnd -gt [long]$mergedSpans[$mergedSpans.Count - 1].End) {
+                    $mergedSpans[$mergedSpans.Count - 1].End = $spanEnd
+                }
+                continue
+            }
+            [void]$mergedSpans.Add([pscustomobject]@{ Start = $spanStart; End = $spanEnd })
+        }
+        foreach ($span in $mergedSpans) {
             # Clamp to the image we actually built. `RawSpans` carries the
             # provider's own `modifiedLineNumberStart` + `modifiedLinesCount`
             # unclamped and on purpose, and nothing upstream bounds the count -
             # so a change set that overstates it (a truncated generated file, a
             # provider counting against the pre-truncation text, a hostile
-            # snapshot) would spin here on the mandatory path of every review.
-            # A hang is not an exception, so the caller's try/catch cannot save
-            # it.
-            $spanStart = [Math]::Max(1, [int]$span.Start)
-            $spanEnd = [Math]::Min($maxLine, [int]$span.End)
+            # snapshot) would spin here. A hang is not an exception, so the
+            # caller's try/catch cannot save it.
+            $spanStart = [long]$span.Start
+            $spanEnd = [long][Math]::Min([long]$maxLine, [long]$span.End)
             if ($spanStart -gt $maxLine -or $spanEnd -lt $spanStart) { continue }
             for ($lineNumber = $spanStart; $lineNumber -le $spanEnd; $lineNumber++) {
-                if ($deliveredLines.Contains($lineNumber)) { [void]$changedLines.Add($lineNumber) }
+                if ($deliveredLines.Contains([int]$lineNumber)) { [void]$changedLines.Add([int]$lineNumber) }
             }
         }
         if ($rawSpans.Count -eq 0) {
@@ -8052,10 +8076,11 @@ function Get-ReviewerConstructFilesFromReport {
         # lines contributed nothing either, and the enumerator cannot tell the
         # difference between a line nobody wrote and a line nobody sent.
         $spannedLines = [long]0
-        foreach ($span in $rawSpans) {
-            # Long, and arithmetic only. The raw ends are unbounded, so summing
-            # them in an int is one hostile change set away from wrapping
-            # negative and reporting a short file as fully delivered.
+        foreach ($span in $mergedSpans) {
+            # The MERGED spans, so this counts each changed line once - exactly
+            # as the walk above does. Long, because the raw ends are unbounded
+            # and summing them in an int is one hostile change set away from
+            # wrapping negative and reporting a short file as fully delivered.
             $spannedLines += ([long][Math]::Max([long]0, [long]$span.End - [long]$span.Start + 1))
         }
         if ($spannedLines -gt 0 -and $changedLines.Count -lt $spannedLines) {
