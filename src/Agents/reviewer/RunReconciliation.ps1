@@ -526,7 +526,12 @@ function Resolve-ReviewerRunReconciliation {
                 (@(@($distinctRules) | ForEach-Object { ($_ -split $script:ReviewerRunReconciliationSeparator)[0] }) -join " vs "))
         }
         if (@($distinctStatuses).Count -gt 1 -or $anyAbsent) {
-            [void]$disagreements.Add("the runs read this rule as " + ((@($rawStatuses) | Sort-Object -Unique) -join " / "))
+            # Ordinal and de-duplicated by set, not `Sort-Object -Unique`,
+            # which is culture-aware and case-insensitive - and this text goes
+            # into the sealed artifact, so a host''s locale must not change it.
+            $statusWords = @($distinctStatuses.ToArray())
+            [Array]::Sort($statusWords, [StringComparer]::Ordinal)
+            [void]$disagreements.Add("the runs read this rule as " + ($statusWords -join " / "))
         }
         if ($distinctStatusSet.Contains("(none)")) {
             [void]$disagreements.Add("a run gave this rule no status at all")
@@ -685,7 +690,11 @@ function Resolve-ReviewerRunReconciliation {
             else { [void]$absent.Add($i + 1) }
         }
         $sortedCounts = @($counts.ToArray())
-        $sameCount = ((@($sortedCounts | Sort-Object -Unique)).Count -le 1)
+        # A set, not `Sort-Object -Unique`. Integers compare culture-free so
+        # this was not a defect, but it was the one Sort-Object on a path that
+        # reaches the digest, and the file''s own rule says not to.
+        $countSet = [System.Collections.Generic.HashSet[int]]::new([int[]]@($sortedCounts))
+        $sameCount = ($countSet.Count -le 1)
         $inEveryRun = ($absent.Count -eq 0 -and $sameCount -and
             @($severities).Count -le 1 -and @($texts).Count -le 1)
         if ($inEveryRun) { $agreedCandidateCount++ }

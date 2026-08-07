@@ -727,6 +727,14 @@ function Get-ReviewerConstructDeclarationIndex {
     foreach ($line in @($DeliveredLines)) { [void]$delivered.Add([int]$line) }
     $index = [object[]]::new($MaskedLines.Count)
     for ($position = 0; $position -lt $MaskedLines.Count; $position++) {
+        # The two cheap refusals, hoisted out of the call. The callee returned
+        # on exactly these conditions anyway, so for every undelivered gap line
+        # and every blank line the whole cost was PowerShell binding a
+        # thousands-of-elements [string[]] parameter - once per line, on the
+        # mandatory path. A three-line edit near the bottom of a long file paid
+        # for the entire file: ten seconds for one, minutes for a change set.
+        if ($delivered.Count -gt 0 -and -not $delivered.Contains($position + 1)) { continue }
+        if (-not ([string]$MaskedLines[$position]).Trim()) { continue }
         $index[$position] = Get-ReviewerConstructDeclarationAt -MaskedLines $MaskedLines -Index $position -Delivered $delivered
     }
     # `, $index` so a one-line file stays an array, and never $null: an empty
