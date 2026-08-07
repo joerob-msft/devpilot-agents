@@ -2297,6 +2297,31 @@ try {
     Assert-Replay ([string]$tamperedRows.reconciliationSha256 -cne [string]$powerless.reconciliationSha256) `
         "A different reconciled outcome must produce a different digest."
 
+    # Order independence at a size where positional labels can collide: with ten
+    # runs "run 1" is a prefix of "run 10", and a group written in input order
+    # says something different when the same runs are listed the other way.
+    $tenRuns = @()
+    for ($i = 1; $i -le 10; $i++) {
+        $tenRuns += (New-ReconRun -Nonce "nonce$i" -Rows @((New-ReconRow -Status $(if ($i % 3 -eq 0) { "compliant" } else { "violation" }) `
+                        -Violating $(if ($i % 3 -eq 0) { @() } else { @("mi0") }) `
+                        -Compliant $(if ($i % 3 -eq 0) { @("mi0") } else { @() }))) `
+                -Candidates @((New-ReconCandidate -Line (10 + ($i % 2)))) `
+                -SourceCommit $(if ($i -eq 7) { "d" * 40 } else { "c" * 40 }))
+    }
+    $tenForward = Resolve-ReviewerRunReconciliation -Manifests $tenRuns -RequiredRunCount 10
+    $tenReversed = Resolve-ReviewerRunReconciliation -Manifests @($tenRuns[9..0]) -RequiredRunCount 10
+    $shuffleOrder = @(4, 9, 1, 7, 2, 10, 3, 6, 8, 5)
+    $tenShuffled = Resolve-ReviewerRunReconciliation -RequiredRunCount 10 `
+        -Manifests @(@($shuffleOrder) | ForEach-Object { $tenRuns[$_ - 1] })
+    Assert-Replay ([string]$tenForward.reconciliationSha256 -ceq [string]$tenReversed.reconciliationSha256) `
+        "Ten runs reversed must produce the same reconciliation digest."
+    Assert-Replay ([string]$tenForward.reconciliationSha256 -ceq [string]$tenShuffled.reconciliationSha256) `
+        "Ten runs shuffled must produce the same reconciliation digest."
+    Assert-Replay (-not [bool]$tenForward.reconciled -and
+        @(@($tenForward.rows) | Where-Object { [bool]$_.stable }).Count -eq 0 -and
+        @(@($tenForward.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0) `
+        "Ten runs spanning two bindings must leave nothing stable and nothing eligible."
+
     # One run is not a reconciliation, however clean it looks.
     $single = Resolve-ReviewerRunReconciliation -Manifests @((New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate))))
     Assert-Replay (-not [bool]$single.reconciled -and @($single.rows)[0].reconciledStatus -ceq "unknown") `
@@ -2587,6 +2612,93 @@ try {
     catch { $doubled = [string]$_.Exception.Message }
     Assert-Replay ($doubled -clike "*not those*" -or $doubled -clike "*more than once*") `
         "The same artifact twice must be refused against a named declaration."
+
+    # The committed schema is the contract. A schema nobody checks against the
+    # code it describes is a document, not a contract.
+    $schemaPath = Join-Path $RepoRoot "src\Agents\reviewer\schemas\reviewer.run-reconciliation.v1.json"
+    Assert-Replay (Test-Path -LiteralPath $schemaPath) "The reconciliation schema must be committed."
+    $schema = [IO.File]::ReadAllText($schemaPath, $utf8) | ConvertFrom-Json -Depth 20
+    $schemaKinds = @($schema.definitions.runSetDeclaration.properties.kind.const,
+        $schema.definitions.reconciliation.properties.kind.const)
+    Assert-Replay ($schemaKinds -ccontains $script:ReviewerRunReconciliationSetKind -and
+        $schemaKinds -ccontains $script:ReviewerRunReconciliationKind) `
+        "The schema's kinds must be the ones the code actually writes."
+    $sampleRecon = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "s1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate))),
+        (New-ReconRun -Nonce "s2" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate))))
+    $schemaRequired = @($schema.definitions.reconciliation.required)
+    $absentFromCode = @(@($schemaRequired) | Where-Object { $null -eq $sampleRecon.PSObject.Properties[$_] })
+    Assert-Replay (@($absentFromCode).Count -eq 0) `
+        "Every field the schema requires must be present on a real reconciliation (missing: $($absentFromCode -join ', '))."
+    $schemaKnown = @($schema.definitions.reconciliation.properties.PSObject.Properties.Name)
+    $absentFromSchema = @(@($sampleRecon.PSObject.Properties.Name) | Where-Object { $schemaKnown -cnotcontains $_ })
+    Assert-Replay (@($absentFromSchema).Count -eq 0) `
+        "Every field a real reconciliation emits must be described by the schema (undescribed: $($absentFromSchema -join ', '))."
+    $anchorVerdictEnum = @($schema.definitions.anchorOutcome.properties.reconciledVerdict.enum)
+    foreach ($verdict in @("violation", "compliant", "notInReach", "unknown")) {
+        Assert-Replay ($anchorVerdictEnum -ccontains $verdict) `
+            "The schema's anchor verdicts must include '$verdict', which the reconciler emits."
+    }
+    $dispositionEnum = @($schema.definitions.candidateOutcome.properties.disposition.enum)
+    foreach ($disposition in @("agreed", "withheldRunDisagreement", "withheldCountDisagreement",
+            "withheldSeverityDisagreement", "withheldTextDisagreement", "withheldUnreconciled")) {
+        Assert-Replay ($dispositionEnum -ccontains $disposition) `
+            "The schema must describe the '$disposition' disposition the reconciler can emit."
+    }
+
+    # WIRING PROOF. "Evaluation only" is a claim until something feeds the
+    # reconciliation to the paths that actually deliver and watches them refuse
+    # it. Three of them: the promotion readers, the gate, and the eligible-set
+    # the preview draws from.
+    $wiringDir = Join-Path $sandbox "wiring"
+    [void](New-Item -ItemType Directory -Path $wiringDir -Force)
+    $wiringSet = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "w1" -Rows @((New-ReconRow -Violating @("mi0"))) -Candidates @((New-ReconCandidate -Line 12))),
+        (New-ReconRun -Nonce "w2" -Rows @((New-ReconRow -Violating @("mi0"))) -Candidates @(
+                (New-ReconCandidate -Line 12), (New-ReconCandidate -Line 99 -Id "c2"))))
+    # One candidate both runs proposed, one only the second did.
+    $agreedOnes = @(@($wiringSet.candidates) | Where-Object { $_.disposition -ceq "agreed" })
+    $withheldOnes = @(@($wiringSet.candidates) | Where-Object { $_.disposition -cne "agreed" })
+    Assert-Replay (@($agreedOnes).Count -eq 1 -and [string]@($agreedOnes)[0].line -ceq "12") `
+        "The candidate both runs proposed must be the agreed one."
+    Assert-Replay (@($withheldOnes).Count -eq 1 -and [string]@($withheldOnes)[0].line -ceq "99") `
+        "The candidate only one run proposed must be withheld, and must still appear so a reader can see it was dropped."
+
+    # Seal it and hand it to the promotion reader, which is the ONLY reader any
+    # delivery path uses.
+    $wiringSealed = Save-ReviewerConventionSpecialistPreview -Directory $wiringDir -BaseName "wiring" `
+        -Manifest ([pscustomobject][ordered]@{
+            kind = $script:ReviewerRunReconciliationKind
+            artifactVersion = $script:ReviewerRunReconciliationVersion
+            status = "ok"; reconciliation = $wiringSet; promotable = $false
+            createdAt = [DateTime]::UtcNow.ToString("o")
+        }) -MasterKey $derivedKey
+    Assert-ReplayThrows { Read-ReviewerConventionSpecialistPreview -Path $wiringSealed -MasterKey $masterKey } `
+        "The promotion reader must refuse a reconciliation sealed in the replay domain." -Match "signature verification failed"
+    Assert-ReplayThrows { Read-ReviewerConventionSpecialistPreview -Path $wiringSealed -MasterKey $derivedKey } `
+        "Even under the replay key it must be refused, because its kind is not a specialist preview." -Match "kind or version is invalid"
+
+    # And the shape itself carries nothing a delivery path could act on. The
+    # eligible set a preview draws from is `candidates[].candidateId`; a
+    # reconciliation has no such field, and its dispositions are not words any
+    # gate matches.
+    foreach ($candidate in @($wiringSet.candidates)) {
+        Assert-Replay ($null -eq $candidate.PSObject.Properties["candidateId"]) `
+            "A reconciled candidate must not carry the id a delivery path resolves."
+        Assert-Replay (@("agreed", "withheldRunDisagreement", "withheldCountDisagreement",
+                "withheldSeverityDisagreement", "withheldTextDisagreement", "withheldUnreconciled") -ccontains [string]$candidate.disposition) `
+            "A reconciled candidate's disposition must come from the closed evaluation set."
+    }
+    # A refused reconciliation empties everything, so a disagreement cannot even
+    # be read as a proposal.
+    $refusedWiring = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "w3" -Rows @((New-ReconRow -Violating @("mi0"))) -Candidates @((New-ReconCandidate))),
+        (New-ReconRun -Nonce "w4" -Rows @((New-ReconRow -Violating @("mi0"))) -Candidates @((New-ReconCandidate)) -Status "degraded"))
+    Assert-Replay (-not [bool]$refusedWiring.reconciled -and
+        @(@($refusedWiring.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0 -and
+        [int]$refusedWiring.agreedCandidateCount -eq 0 -and
+        @(@($refusedWiring.rows) | Where-Object { [bool]$_.stable }).Count -eq 0) `
+        "A refused reconciliation must leave no stable row, no agreed candidate, and a zero agreed count."
 
     # A live-run artifact, sealed under the raw key, is not a replay run.
     $liveManifest = New-ReconRun -Nonce "n3" -Rows @((New-ReconRow))
