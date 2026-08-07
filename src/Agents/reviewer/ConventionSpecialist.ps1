@@ -861,6 +861,23 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
             if (-not $degradedReason) { $degradedReason = "the row wrote a construct range the wrapper could not read" }
         }
 
+        # Reject a partition that is larger than the anchor set before doing
+        # anything quadratic with it. Ten rows writing four thousand ids each
+        # took twelve seconds in the scans below and wrote two megabytes of ids
+        # into the sealed artifact; the row is wrong either way, so it should be
+        # wrong cheaply.
+        $partitionCeiling = $constructById.Count + 16
+        $partitionSize = 0
+        foreach ($field in @($partition.Keys)) { $partitionSize += @($partition[$field]).Count }
+        if ($partitionSize -gt $partitionCeiling) {
+            $status = "unknown"
+            if (-not $degradedReason) {
+                $degradedReason = "the row gave $partitionSize verdicts over $($constructById.Count) anchors"
+            }
+            foreach ($field in @($partition.Keys)) { $partition[$field] = @() }
+            $violating = @(); $compliantIds = @(); $notInReach = @(); $unknownIds = @()
+        }
+
         # The set this row owes a verdict for.
         $requiredList = [System.Collections.Generic.List[string]]::new()
         foreach ($kind in $scopeKinds) {
@@ -872,6 +889,28 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
             foreach ($id in $idsByKind[$kind]) { [void]$requiredList.Add($id) }
         }
         $required = @($requiredList.ToArray())
+        # A scope has to name a kind. With `none` the required set is empty, the
+        # missing-anchor check is vacuous, and out-of-reach ids are exempt from
+        # the stray check - so one arbitrary id in `notInReachConstructs` bought
+        # a clean row that had weighed nothing. A rule that reaches nothing must
+        # say WHICH anchors it does not reach, and it cannot do that without
+        # naming the kinds those anchors belong to.
+        if ($constructById.Count -gt 0 -and @($scopeKinds).Count -eq 0) {
+            $status = "unknown"
+            if (-not $degradedReason) {
+                $degradedReason = "the row declared no construct kind while $($constructById.Count) anchors were enumerated; a rule that reaches nothing must name the kinds it would govern and put their anchors out of reach"
+            }
+        }
+        # Out of reach is a verdict about an anchor this rule was asked about,
+        # not a place to file ids from kinds the row said it does not govern.
+        $outOfScopeNotInReach = @(@($notInReach) | Where-Object { $required -cnotcontains $_ })
+        if ($outOfScopeNotInReach.Count -gt 0) {
+            $status = "unknown"
+            if (-not $degradedReason) {
+                $degradedReason = "the row ruled anchors out of reach that its own declared scope never covered: " +
+                (@($outOfScopeNotInReach | Select-Object -First 20) -join ",")
+            }
+        }
 
         # Disjoint. An anchor with two verdicts is not an accounting, it is two.
         $seenInPartition = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -943,6 +982,19 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
             }
         }
 
+        # Provenance before arithmetic: a row that fabricated its rule quote
+        # never read the rule at all, which is a worse thing to know than a
+        # headline disagreeing with its own anchors - and first-writer-wins
+        # means whichever check runs first is the one a reader is told about.
+        $quote = [string](Get-ReviewerConventionSpecialistValue $row "ruleQuote" "")
+        if ($quote) {
+            $sourceText = ([string](Get-ReviewerConventionSpecialistValue $source "Text" "")).Replace("`r`n", "`n").Replace("`r", "`n")
+            if ($sourceText.IndexOf($quote.Replace("`r`n", "`n").Replace("`r", "`n"), [StringComparison]::Ordinal) -lt 0) {
+                $status = "unknown"
+                if (-not $degradedReason) { $degradedReason = "the row quoted text that is not in the transported source" }
+            }
+        }
+
         # The DERIVED status. Skipped only when the WRAPPER already degraded the
         # row - a partition the wrapper could not trust has nothing worth
         # deriving from. A row that merely called ITSELF unknown still gets its
@@ -961,14 +1013,6 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
                     $degradedReason = "the row said '$status' while its own anchor verdicts say '$derived'; the anchors decide"
                 }
                 $status = $derived
-            }
-        }
-        $quote = [string](Get-ReviewerConventionSpecialistValue $row "ruleQuote" "")
-        if ($quote) {
-            $sourceText = ([string](Get-ReviewerConventionSpecialistValue $source "Text" "")).Replace("`r`n", "`n").Replace("`r", "`n")
-            if ($sourceText.IndexOf($quote.Replace("`r`n", "`n").Replace("`r", "`n"), [StringComparison]::Ordinal) -lt 0) {
-                $status = "unknown"
-                if (-not $degradedReason) { $degradedReason = "the row quoted text that is not in the transported source" }
             }
         }
         $linkedCandidate = [string](Get-ReviewerConventionSpecialistValue $row "candidateId" "")
