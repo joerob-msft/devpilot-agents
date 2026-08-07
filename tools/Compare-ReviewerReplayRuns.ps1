@@ -78,8 +78,11 @@ if ($OutputDirectory) {
     # runs that fed it.
     $sealed = Save-ReviewerConventionSpecialistPreview -Directory $OutputDirectory `
         -BaseName "reconciliation-$stamp" -Manifest ([pscustomobject][ordered]@{
-            kind = $script:ReviewerConventionSpecialistArtifactKind
-            artifactVersion = $script:ReviewerConventionSpecialistArtifactVersion
+            # Its own kind. Reusing the specialist preview's kind would make
+            # this artifact byte-for-byte a valid run artifact if the operator
+            # pointed -OutputDirectory at the previews directory.
+            kind = $script:ReviewerRunReconciliationKind
+            artifactVersion = $script:ReviewerRunReconciliationVersion
             status = "ok"
             reconciliation = $reconciliation
             reportPath = $reportPath
@@ -93,6 +96,12 @@ if ($OutputDirectory) {
 
 Write-Output $report
 
-if ($FailOnDisagreement -and -not [bool]$reconciliation.reconciled) { exit 2 }
-if ($FailOnDisagreement -and [int]$reconciliation.unstableRowCount -gt 0) { exit 3 }
+if ($FailOnDisagreement) {
+    if (-not [bool]$reconciliation.reconciled) { exit 2 }
+    if ([int]$reconciliation.unstableRowCount -gt 0) { exit 3 }
+    # A candidate only some runs proposed is disagreement too, and it is the
+    # kind an operator most wants a non-zero exit for: every row can be stable
+    # while the comment the reviewer would have posted appeared in one run.
+    if ([int]$reconciliation.agreedCandidateCount -ne @($reconciliation.candidates).Count) { exit 4 }
+}
 exit 0

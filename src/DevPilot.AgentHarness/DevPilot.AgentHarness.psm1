@@ -1241,9 +1241,9 @@ $script:AgentReplayMaxResources = 4096
 $script:AgentReplayMaxPayloadBytes = 25165824
 $script:AgentReplayMaxTotalPayloadBytes = 67108864
 $script:AgentReplayMaxManifestBytes = 8388608
-$script:AgentReplaySnapshotNamePattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
-$script:AgentReplayPayloadSegmentPattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
-$script:AgentReplayHexPattern = '^[0-9a-f]{64}$'
+$script:AgentReplaySnapshotNamePattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z'
+$script:AgentReplayPayloadSegmentPattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\z'
+$script:AgentReplayHexPattern = '^[0-9a-f]{64}\z'
 # Reference-identity seal, not a string: a constant that a hand-built hashtable
 # can carry would let any in-process caller present itself as a loaded snapshot
 # and skip every check in New-AgentReplaySnapshot. Same pattern as the
@@ -1575,8 +1575,8 @@ function New-AgentReplaySnapshot {
     if ($snapshotId -cne $SnapshotName) {
         throw "Replay manifest declares snapshotId '$snapshotId' but was loaded as '$SnapshotName'."
     }
-    $capturedUtc = Get-AgentReplayManifestField -Object $manifest -Name "capturedUtc" -Type string -Pattern '^\d{8}T\d{6}Z$'
-    $provider = Get-AgentReplayManifestField -Object $manifest -Name "provider" -Type string -Pattern '^[a-z][a-z0-9-]{0,31}$'
+    $capturedUtc = Get-AgentReplayManifestField -Object $manifest -Name "capturedUtc" -Type string -Pattern '^\d{8}T\d{6}Z\z'
+    $provider = Get-AgentReplayManifestField -Object $manifest -Name "provider" -Type string -Pattern '^[a-z][a-z0-9-]{0,31}\z'
 
     $binding = Get-AgentReplayManifestField -Object $manifest -Name "binding" -Type object
     Assert-AgentReplayExactKeys -Object $binding -Where "Replay manifest binding" -Expected @(
@@ -1584,12 +1584,12 @@ function New-AgentReplaySnapshot {
         "sourceCommit", "targetCommit", "changeSetSha256"
     )
     $bindingRecord = [ordered]@{
-        Organization    = Get-AgentReplayManifestField -Object $binding -Name "organization" -Type string -Pattern '^[^\s]{1,128}$'
-        Project         = Get-AgentReplayManifestField -Object $binding -Name "project" -Type string -Pattern '^[^\s]{1,128}$'
-        RepositoryId    = Get-AgentReplayManifestField -Object $binding -Name "repositoryId" -Type string -Pattern '^[^\s]{1,128}$'
+        Organization    = Get-AgentReplayManifestField -Object $binding -Name "organization" -Type string -Pattern '^[^\s]{1,128}\z'
+        Project         = Get-AgentReplayManifestField -Object $binding -Name "project" -Type string -Pattern '^[^\s]{1,128}\z'
+        RepositoryId    = Get-AgentReplayManifestField -Object $binding -Name "repositoryId" -Type string -Pattern '^[^\s]{1,128}\z'
         PullRequestId   = Get-AgentReplayManifestField -Object $binding -Name "pullRequestId" -Type int -Min 1 -Max 2147483647
-        SourceCommit    = Get-AgentReplayManifestField -Object $binding -Name "sourceCommit" -Type string -Pattern '^[0-9a-f]{40}$'
-        TargetCommit    = Get-AgentReplayManifestField -Object $binding -Name "targetCommit" -Type string -Pattern '^[0-9a-f]{40}$'
+        SourceCommit    = Get-AgentReplayManifestField -Object $binding -Name "sourceCommit" -Type string -Pattern '^[0-9a-f]{40}\z'
+        TargetCommit    = Get-AgentReplayManifestField -Object $binding -Name "targetCommit" -Type string -Pattern '^[0-9a-f]{40}\z'
         ChangeSetSha256 = Get-AgentReplayManifestField -Object $binding -Name "changeSetSha256" -Type sha256
     }
 

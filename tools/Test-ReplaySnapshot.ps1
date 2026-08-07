@@ -175,10 +175,19 @@ try {
 
     # -- 5. Path attacks ------------------------------------------------------
     Write-Host "5/13 path attacks" -ForegroundColor Cyan
-    foreach ($name in @("..", "..\other", "a/b", "C:\windows", "with:stream", "")) {
+    foreach ($name in @("..", "..\other", "a/b", "C:\windows", "with:stream")) {
         Assert-ReplayThrows { New-AgentReplaySnapshot -ReplayRoot $fixtureRoot -SnapshotName $name } `
-            "Snapshot name '$name' must be refused as a path-free single name."
+            "Snapshot name '$name' must be refused BY THE NAME PATTERN, not incidentally by failing to resolve." `
+            -Match "must be a single path-free name"
     }
+    Assert-ReplayThrows { New-AgentReplaySnapshot -ReplayRoot $fixtureRoot -SnapshotName "" } `
+        "An empty snapshot name must be refused."
+    # A trailing newline is not part of a name. .NET's `$` matches before a
+    # final linefeed, so an exact-shape pattern anchored with `$` quietly
+    # accepts one.
+    Assert-ReplayThrows { New-AgentReplaySnapshot -ReplayRoot $fixtureRoot -SnapshotName "good`n" } `
+        "A snapshot name with a trailing newline must be refused by the pattern." `
+        -Match "must be a single path-free name"
     $escaped = Copy-Fixture -Name "escaped"
     $escapedManifestPath = Join-Path $escaped "synthetic-pr\manifest.json"
     $escapedManifest = [IO.File]::ReadAllText($escapedManifestPath, $utf8) | ConvertFrom-Json
@@ -1466,30 +1475,60 @@ try {
     }
     $script:ReviewerAllowToolCeiling = @("read", "ado(repo_pull_request)", "ado(repo_file)", "bluebird")
     $script:ReviewerMandatoryDenyTools = @("edit", "create")
-    $passCeilings = @(
+    $syntheticCeilings = @(
         @{ Name = "generalist"; Tools = @("read", "ado(repo_pull_request)", "ado(repo_file)") },
         @{ Name = "specialist"; Tools = @("ado(repo_pull_request)", "ado(repo_file)") },
         @{ Name = "verifier"; Tools = @("ado(repo_pull_request)", "ado(repo_file)") }
     )
-    foreach ($mode in @($false, $true)) {
-        $script:ReviewerReplayActive = $mode
-        # Assign first, then wrap: these functions return `, @(...)` so that a
-        # single-element list stays a list, and @(f x) in expression position
-        # would keep that outer wrapper instead of unrolling it.
-        $denyResult = Get-ReviewerEffectiveDenyTools -ConfigDeny @()
-        $deny = @($denyResult)
-        foreach ($pass in $passCeilings) {
-            $allowResult = Get-ReviewerLaunchAllowTools -Intended ([string[]]$pass.Tools)
-            $allow = @($allowResult)
-            Assert-Replay (@($allow).Count -gt 0) `
-                "The $($pass.Name) grant must never be empty (an empty grant restores CLI default discovery)."
-            $widened = @($allow | Where-Object { $pass.Tools -cnotcontains $_ })
-            Assert-Replay ($widened.Count -eq 0) `
-                "The $($pass.Name) grant must never exceed its own ceiling, in replay or not (got: $($widened -join ', '))."
-            if ($mode) {
-                $survivors = @($allow | Where-Object { $deny -cnotcontains $_ })
-                Assert-Replay ($survivors.Count -eq 0) `
-                    "In replay every tool the $($pass.Name) is granted must also be denied (survived: $($survivors -join ', '))."
+    # And then the REAL ones. The synthetic pass proves the functions behave;
+    # only the shipped ceilings prove the agent does. Lifted from the reviewer's
+    # own source by AST so the test cannot drift from what it ships.
+    $realCeilings = @()
+    $realAllowCeiling = @()
+    $realMandatoryDeny = @()
+    foreach ($assignment in $reviewerAst.FindAll({
+                param($candidate)
+                if ($candidate -isnot [Management.Automation.Language.AssignmentStatementAst]) { return $false }
+                $target = [string]$candidate.Left.Extent.Text
+                return ($target -clike '$script:Reviewer*ToolCeiling' -or $target -ceq '$script:ReviewerMandatoryDenyTools')
+            }, $true)) {
+        $name = ([string]$assignment.Left.Extent.Text) -replace '^\$script:', ''
+        $value = @(& ([scriptblock]::Create($assignment.Right.Extent.Text)))
+        switch -CaseSensitive ($name) {
+            "ReviewerAllowToolCeiling" { $realAllowCeiling = @($value) }
+            "ReviewerMandatoryDenyTools" { $realMandatoryDeny = @($value) }
+            default { $realCeilings += @{ Name = $name; Tools = @($value) } }
+        }
+    }
+    Assert-Replay (@($realAllowCeiling).Count -gt 0 -and @($realCeilings).Count -ge 2) `
+        "The shipped tool ceilings must be readable from the reviewer's source (found $(@($realCeilings).Count) pass ceilings)."
+
+    foreach ($set in @(
+            @{ Label = "synthetic"; Allow = @("read", "ado(repo_pull_request)", "ado(repo_file)", "bluebird"); Deny = @("edit", "create"); Passes = $syntheticCeilings },
+            @{ Label = "shipped"; Allow = $realAllowCeiling; Deny = $realMandatoryDeny; Passes = $realCeilings })) {
+        $script:ReviewerAllowToolCeiling = @($set.Allow)
+        $script:ReviewerMandatoryDenyTools = @($set.Deny)
+        $passCeilings = @($set.Passes)
+        foreach ($mode in @($false, $true)) {
+            $script:ReviewerReplayActive = $mode
+            # Assign first, then wrap: these functions return `, @(...)` so that a
+            # single-element list stays a list, and @(f x) in expression position
+            # would keep that outer wrapper instead of unrolling it.
+            $denyResult = Get-ReviewerEffectiveDenyTools -ConfigDeny @()
+            $deny = @($denyResult)
+            foreach ($pass in $passCeilings) {
+                $allowResult = Get-ReviewerLaunchAllowTools -Intended ([string[]]@($pass.Tools))
+                $allow = @($allowResult)
+                Assert-Replay (@($allow).Count -gt 0) `
+                    "The $($set.Label) $($pass.Name) grant must never be empty (an empty grant restores CLI default discovery)."
+                $widened = @($allow | Where-Object { @($pass.Tools) -cnotcontains $_ })
+                Assert-Replay ($widened.Count -eq 0) `
+                    "The $($set.Label) $($pass.Name) grant must never exceed its own ceiling, in replay or not (got: $($widened -join ', '))."
+                if ($mode) {
+                    $survivors = @($allow | Where-Object { $deny -cnotcontains $_ })
+                    Assert-Replay ($survivors.Count -eq 0) `
+                        "In replay every tool the $($set.Label) $($pass.Name) is granted must also be denied (survived: $($survivors -join ', '))."
+                }
             }
         }
     }
@@ -1499,6 +1538,18 @@ try {
     # positive case (it is genuinely usable) and an adversarial case (it cannot
     # be used to say nothing).
     Write-Host "12/13 out-of-reach is fail-closed" -ForegroundColor Cyan
+    # The report-to-enumerator adapter, lifted from the reviewer by AST for the
+    # same reason as the tool grant: what it ships is the only thing worth
+    # asserting about.
+    . (Join-Path $RepoRoot "src\Agents\reviewer\ChangedConstructs.ps1")
+    foreach ($fn in @("Get-ReviewerConstructFilesFromReport", "Get-ReviewerConstructFilesFromReportSafely")) {
+        $node = $reviewerAst.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -ceq $fn
+            }, $true) | Select-Object -First 1
+        Assert-Replay ($null -ne $node) "The reviewer must define $fn."
+        if ($node) { . ([scriptblock]::Create($node.Extent.Text)) }
+    }
     $bothKinds = "invocation,declaration"
     $everyId = "mi0,mi1,dc0"
 
@@ -1575,13 +1626,70 @@ try {
     Assert-Replay ($wrongKindRow.status -ceq "unknown" -and $wrongKindRow.degradedReason -clike "*out of reach*") `
         "An out-of-reach id from a kind the declared scope never covered must be refused."
 
-    # Adversarial: a scope the wrapper does not enumerate.
+    # Adversarial: a scope the wrapper does not enumerate. Mixed WITH a real
+    # kind and a complete cover of it, so the row survives every other guard
+    # and only the invented-kind check can catch it.
     $inventedScope = Invoke-Coverage -Rows @(
-        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope "wombat" -Checked "" -NotInReach ""),
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope "wombat,invocation" -Checked "mi0,mi1"),
         (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope $bothKinds -Checked $everyId)
     )
-    Assert-Replay (@($inventedScope.Rows | Where-Object { $_.ruleRef -ceq "rs0" }).status -ceq "unknown") `
-        "A construct kind the wrapper does not enumerate cannot define a universe."
+    $inventedRow = @($inventedScope.Rows | Where-Object { $_.ruleRef -ceq "rs0" })
+    Assert-Replay ($inventedRow.status -ceq "unknown" -and $inventedRow.degradedReason -clike "*does not enumerate*") `
+        "A construct kind the wrapper does not enumerate cannot define a universe, even beside a real one."
+
+    # Adversarial: a kind the wrapper DOES enumerate but which has no anchors
+    # in this change set. The required set is empty, so the cover check, the
+    # out-of-scope check and the stray check are all vacuous - and
+    # `notApplicable` is exempt from the weighed-nothing guard. Only the
+    # named-nothing guard stands between this and a free pass, and it is the
+    # exact shape an evasive row would reach for.
+    $emptyKindEscape = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "notApplicable" -Scope "comment" -Checked ""),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope $bothKinds -Checked $everyId)
+    )
+    $emptyKindRow = @($emptyKindEscape.Rows | Where-Object { $_.ruleRef -ceq "rs0" })
+    Assert-Replay ($emptyKindRow.status -ceq "unknown" -and $emptyKindRow.degradedReason -clike "*named no anchor*") `
+        "A row scoping itself to an enumerable kind with zero anchors has named nothing falsifiable."
+    Assert-Replay (-not [bool]$emptyKindEscape.Complete) `
+        "That escape must also cost the accounting its completeness."
+
+    # Adversarial: a partition larger than the anchor set. The row is degraded,
+    # but what it CLAIMED has to survive into the sealed row - otherwise the
+    # audit trail of a model that named violations reads as if it named none.
+    # Each field stays under the per-field ceiling; only the sum exceeds it.
+    $overCeiling = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "violation" -Scope $bothKinds `
+                -Checked "mi0-mi15" -Violating "mi0" -NotInReach "dc0-dc3"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope $bothKinds -Checked $everyId)
+    )
+    $overRow = @($overCeiling.Rows | Where-Object { $_.ruleRef -ceq "rs0" })
+    Assert-Replay ($overRow.status -ceq "unknown" -and $overRow.degradedReason -clike "*verdicts over*") `
+        "More verdicts than anchors must degrade the row with the counts named (got: $($overRow.degradedReason))."
+    Assert-Replay (@($overRow.violatingConstructs) -ccontains "mi0") `
+        "A degraded row must still record what it claimed; erasing it destroys the audit trail."
+
+    # A field of overlapping ranges never adds a new id, so the unique-id
+    # ceiling never fires and the inner loop ran in full. Bound the WORK too.
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $overlapFlood = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope $bothKinds `
+                -Checked ((@(1..40) | ForEach-Object { "mi0-mi999" }) -join ",")),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope $bothKinds -Checked $everyId)
+    )
+    $stopwatch.Stop()
+    Assert-Replay (@($overlapFlood.Rows | Where-Object { $_.ruleRef -ceq "rs0" }).status -ceq "unknown") `
+        "A flood of overlapping ranges must be refused, not expanded."
+    Assert-Replay ($stopwatch.ElapsedMilliseconds -lt 2000) `
+        "Refusing it must be cheap; the ceiling has to bound work, not just unique ids (took $($stopwatch.ElapsedMilliseconds) ms)."
+
+    # The marker validates its patterns case-insensitively, so a capital letter
+    # reaches this function. Folding it costs nothing and saves a correct row.
+    $capitalScope = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope "Invocation,Declaration" -Checked $everyId),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope $bothKinds -Checked $everyId)
+    )
+    Assert-Replay (@($capitalScope.Rows | Where-Object { $_.ruleRef -ceq "rs0" }).status -ceq "compliant") `
+        "A capitalised scope must resolve to the same universe rather than silently degrading a correct row."
 
     # Adversarial: the whole checklist out of reach. Every row is individually
     # legal and the pass has weighed nothing, so it is not complete.
@@ -1592,6 +1700,51 @@ try {
     Assert-Replay (-not [bool]$allOutOfReach.Complete -and [int]$allOutOfReach.CheckedConstructCount -eq 0) `
         "An accounting where every rule reaches nothing has weighed nothing and is not complete."
 
+    # A file the transport never delivered contributes no anchors, so no row
+    # owes a verdict for it and every row is an exact cover of a change set
+    # with a hole in it. The shipped coverage floor is 60%, so this is the
+    # normal case, not a corner.
+    $reportShape = [pscustomobject][ordered]@{
+        Files = @(
+            [pscustomobject][ordered]@{
+                Path = "/src/a.cs"
+                Slices = @([pscustomobject][ordered]@{ StartLine = 1; EndLine = 4; Text = "class A {`nvoid M() {`nDo(`nx: 1);" })
+                SiblingSlices = @()
+                RawSpans = @([pscustomobject][ordered]@{ Start = 3; End = 4 })
+            },
+            [pscustomobject][ordered]@{
+                Path = "/src/b.cs"
+                Slices = @()
+                SiblingSlices = @()
+                RawSpans = @([pscustomobject][ordered]@{ Start = 10; End = 40 })
+            })
+    }
+    $selection = Get-ReviewerConstructFilesFromReport -Report $reportShape
+    Assert-Replay (@($selection.UndeliveredPaths) -ccontains "src/b.cs") `
+        "A changed file with no delivered slice must be reported as one the enumerator never saw."
+    $withHole = Get-ReviewerConstructFilesFromReportSafely -Report $reportShape
+    Assert-Replay (@($withHole.PartiallyUnderstoodFiles) -ccontains "src/b.cs") `
+        "That hole must reach the same signal an unlexable file uses, or the accounting will call itself complete over less code than the pull request changed."
+
+    # A hunk that runs past the delivered image is not a reason to count to two
+    # billion. This is the mandatory path of every review, and a hang is not an
+    # exception the caller's try/catch can catch.
+    $runawaySpan = [pscustomobject][ordered]@{
+        Files = @([pscustomobject][ordered]@{
+                Path = "/src/a.cs"
+                Slices = @([pscustomobject][ordered]@{ StartLine = 1; EndLine = 3; Text = "a`nb`nc" })
+                SiblingSlices = @()
+                RawSpans = @([pscustomobject][ordered]@{ Start = 1; End = 2147483647 })
+            })
+    }
+    $spanWatch = [Diagnostics.Stopwatch]::StartNew()
+    $runawayResult = Get-ReviewerConstructFilesFromReport -Report $runawaySpan
+    $spanWatch.Stop()
+    Assert-Replay ($spanWatch.ElapsedMilliseconds -lt 2000) `
+        "An unbounded hunk span must be clamped to the delivered image (took $($spanWatch.ElapsedMilliseconds) ms)."
+    Assert-Replay (@($runawayResult.UndeliveredPaths) -ccontains "src/a.cs") `
+        "A hunk reaching past what was delivered leaves the enumeration short, and that must be recorded."
+
     # -- 13. Repeated runs of one frozen input --------------------------------
     Write-Host "13/13 cross-run reconciliation" -ForegroundColor Cyan
     . (Join-Path $RepoRoot "src\Agents\reviewer\RunReconciliation.ps1")
@@ -1600,10 +1753,18 @@ try {
         param(
             [string]$Nonce, [object[]]$Rows, [object[]]$Candidates = @(),
             [string]$SourceCommit = "c" * 40, [string]$Promotable = "false",
-            [object[]]$Constructs = $null, [string]$Status = "ok"
+            [object[]]$Constructs = $null, [string]$Status = "ok",
+            [string]$SnapshotId = "s", [string]$ManifestDigest = ("7" * 64),
+            [string]$Complete = "true"
         )
+        # Built with the field names PRODUCTION writes (ConventionSpecialist.ps1
+        # `Constructs = ...`). A fixture in the reconciler's own vocabulary
+        # would validate the reconciler against itself.
         $set = $(if ($null -eq $Constructs) {
-                @([pscustomobject][ordered]@{ id = "mi0"; kind = "invocation"; path = "src/a.cs"; startLine = 12; endLine = 14; detail = "nnp" })
+                @([pscustomobject][ordered]@{
+                        constructId = "mi0"; kind = "invocation"; path = "src/a.cs"
+                        line = 12; endLine = 14; name = "AreEqual"; argumentNaming = "nnp"
+                    })
             }
             else { $Constructs })
         return [pscustomobject][ordered]@{
@@ -1612,9 +1773,11 @@ try {
             specialistLibrarySha256 = ("3" * 64); promptSha256 = ("4" * 64)
             conventionPlanSha256 = ("5" * 64); factPlanSha256 = ("6" * 64)
             candidates = @($Candidates)
-            ruleCoverage = [pscustomobject][ordered]@{ rows = @($Rows); changedConstructs = @($set) }
+            ruleCoverage = [pscustomobject][ordered]@{
+                complete = [bool]::Parse($Complete); rows = @($Rows); changedConstructs = @($set)
+            }
             replay = [pscustomobject][ordered]@{
-                snapshotId = "s"; manifestDigest = ("7" * 64); replayNonce = $Nonce
+                snapshotId = $SnapshotId; manifestDigest = $ManifestDigest; replayNonce = $Nonce
                 promotable = [bool]::Parse($Promotable)
             }
         }
@@ -1669,8 +1832,7 @@ try {
     # Same word, different anchors, is still disagreement.
     $anchorSplit = Resolve-ReviewerRunReconciliation -Manifests @(
         (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow -Violating @("mi0")))),
-        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Violating @("mi1"))) -Constructs @(
-                [pscustomobject][ordered]@{ id = "mi0"; kind = "invocation"; path = "src/a.cs"; startLine = 12; endLine = 14; detail = "nnp" }))
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Violating @("mi1"))))
     )
     Assert-Replay (@($anchorSplit.rows)[0].reconciledStatus -ceq "unknown") `
         "Agreeing on 'violation' while naming different anchors is two findings, not one."
@@ -1733,10 +1895,92 @@ try {
     $shiftedConstructs = Resolve-ReviewerRunReconciliation -Manifests @(
         (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow))),
         (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Constructs @(
-                [pscustomobject][ordered]@{ id = "mi0"; kind = "invocation"; path = "src/a.cs"; startLine = 99; endLine = 101; detail = "nnp" }))
+                [pscustomobject][ordered]@{
+                    constructId = "mi0"; kind = "invocation"; path = "src/a.cs"
+                    line = 99; endLine = 101; name = "AreEqual"; argumentNaming = "nnp"
+                }))
     )
     Assert-Replay (-not [bool]$shiftedConstructs.reconciled) `
         "The same anchor id at a different line is not the same anchor."
+
+    # The binding must read the table PRODUCTION writes. A hand-picked field
+    # list here is a second copy of a schema that lives elsewhere, and the day
+    # they drift the binding silently stops binding - everything still
+    # reconciles, and nothing fails.
+    $realConstructs = @(Get-ReviewerChangedConstructs -Files @(@{
+                Path = "src/a.cs"
+                Lines = @("class A {", "    void M() {", "        Do(", "            x: 1);", "    }", "}")
+                ChangedLines = @(3, 4)
+                DeliveredLines = @(1, 2, 3, 4, 5, 6)
+            })).Constructs
+    Assert-Replay (@($realConstructs).Count -gt 0) "The enumerator must produce a construct for this fixture."
+    $projected = @(@($realConstructs) | ForEach-Object {
+            [pscustomobject][ordered]@{
+                constructId = [string]$_.constructId; kind = [string]$_.kind; path = [string]$_.path
+                line = [int]$_.line; endLine = [int]$_.endLine; name = [string]$_.name
+                argumentNaming = [string]$_.argumentNaming
+            }
+        })
+    $realBinding = Get-ReviewerRunReconciliationBinding -Manifest (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Constructs $projected)
+    $movedProjection = @(@($projected) | ForEach-Object {
+            [pscustomobject][ordered]@{
+                constructId = [string]$_.constructId; kind = [string]$_.kind; path = [string]$_.path
+                line = ([int]$_.line + 500); endLine = ([int]$_.endLine + 500); name = [string]$_.name
+                argumentNaming = [string]$_.argumentNaming
+            }
+        })
+    $movedBinding = Get-ReviewerRunReconciliationBinding -Manifest (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Constructs $movedProjection)
+    Assert-Replay ([string]$realBinding.Sha256 -cne [string]$movedBinding.Sha256) `
+        "Moving a real enumerated construct must change the binding; if it does not, the binding is reading field names nobody writes."
+    Assert-Replay (@($realBinding.Missing).Count -eq 0) "A complete run manifest must have no missing binding fields."
+
+    # A manifest with no binding at all would otherwise compare equal to another
+    # empty one - the one way an empty artifact reconciles with anything.
+    $emptyBinding = Resolve-ReviewerRunReconciliation -Manifests @(
+        ([pscustomobject][ordered]@{ status = "ok"; replay = [pscustomobject][ordered]@{ replayNonce = "n1"; promotable = $false } }),
+        ([pscustomobject][ordered]@{ status = "ok"; replay = [pscustomobject][ordered]@{ replayNonce = "n2"; promotable = $false } })
+    )
+    Assert-Replay (-not [bool]$emptyBinding.reconciled -and @($emptyBinding.problems) -clike "*missing binding fields*") `
+        "Two manifests with no binding must not reconcile just because their nothings match."
+
+    # Two different recordings of the same commit are two different questions.
+    $differentSnapshot = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -SnapshotId "snapshot-a" -ManifestDigest ("a" * 64)),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -SnapshotId "snapshot-b" -ManifestDigest ("b" * 64))
+    )
+    Assert-Replay (-not [bool]$differentSnapshot.reconciled) `
+        "Runs of two different snapshots are not repetitions of one frozen input."
+
+    # An incomplete accounting has holes, and a hole agrees with everything.
+    $incompleteRuns = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Complete "false"),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Complete "false")
+    )
+    Assert-Replay (-not [bool]$incompleteRuns.reconciled -and @($incompleteRuns.problems) -clike "*did not complete*") `
+        "Two runs that both failed to account for their rules have not agreed about them."
+
+    # A row with no status at all: two blanks compare equal and would reconcile
+    # to a stable empty string.
+    $blankStatus = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow -Status ""))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Status "")))
+    )
+    Assert-Replay (@($blankStatus.rows)[0].reconciledStatus -ceq "unknown" -and -not [bool]@($blankStatus.rows)[0].stable) `
+        "A rule neither run gave a status is unknown, not a stable blank."
+
+    # The candidate key is joined from model-authored text. `ruleSourceId` is
+    # schema-allowed any printable ASCII, so a separator the fields can contain
+    # lets one candidate impersonate another.
+    $forgedKey = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Candidates @(
+                (New-ReconCandidate -Source "core/rule-a|changedFile|src/a.cs|12" -Path "" -Line 0)))
+    )
+    Assert-Replay (@(@($forgedKey.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0) `
+        "A rule id carrying the key separator must not let one candidate impersonate another."
+    $forgedReport = Format-ReviewerRunReconciliationReport -Reconciliation $forgedKey
+    Assert-Replay ($forgedReport -cnotlike "*] src/a.cs:12 rule core/rule-a;*rule core/rule-a;*") `
+        "The report must not name a file and line the candidate never claimed."
 
     # A promotable claim inside a replay artifact taints the whole comparison.
     $promotableRun = Resolve-ReviewerRunReconciliation -Manifests @(

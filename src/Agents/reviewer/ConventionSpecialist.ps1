@@ -62,6 +62,8 @@ function Expand-ReviewerConventionSpecialistConstructIds {
     $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $duplicated = [System.Collections.Generic.List[string]]::new()
     $duplicatedSeen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $scanned = 0
+    $scanCeiling = $MaxIds * 4
     foreach ($part in @(($Text -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
         $match = [regex]::Match($part, '^([a-z]{2})([0-9]{1,3})(?:-([a-z]{2})([0-9]{1,3}))?$')
         if (-not $match.Success) { return @{ Ok = $false; Ids = @(); Duplicated = @() } }
@@ -77,11 +79,17 @@ function Expand-ReviewerConventionSpecialistConstructIds {
             if ($last -lt $first) { return @{ Ok = $false; Ids = @(); Duplicated = @() } }
         }
         for ($index = $first; $index -le $last; $index++) {
-            # Stop AT the ceiling, not after it. A schema-legal field can name
-            # forty thousand-wide ranges; expanding them all first and
-            # diagnosing afterwards cost twenty-three seconds on the mandatory
-            # path, three times over if the specialist retries.
-            if ($ids.Count -ge $MaxIds) { return @{ Ok = $false; Ids = @(); Duplicated = @() } }
+            # Two ceilings, because they catch different shapes. `MaxIds`
+            # bounds the UNIQUE ids, which is what the partition costs
+            # downstream. `$scanned` bounds the WORK: a field of overlapping
+            # ranges (`mi0-mi134` forty times over) never adds a new id, so it
+            # never reaches the first ceiling, and it ran the inner loop in
+            # full - 1.6 seconds per call, three times over if the specialist
+            # retries.
+            if ($ids.Count -ge $MaxIds -or $scanned -ge $scanCeiling) {
+                return @{ Ok = $false; Ids = @(); Duplicated = @() }
+            }
+            $scanned++
             $id = "$prefix$index"
             # A repeated id is not a harmless spelling. Silently collapsing it
             # would let a row name the same anchor twice and still look like an
@@ -845,7 +853,15 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
             $degradedReason = "the row cited a rule-source hash that is not the transported one"
         }
         $scope = [string](Get-ReviewerConventionSpecialistValue $row "scope" "none")
-        $scopeKinds = @(@($scope -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -cne "none" })
+        # Lowercased before the lookup. The marker schema matches its patterns
+        # case-insensitively, so `Invocation` gets past validation and then
+        # misses the ordinal kind lookup - degrading a row that was actually
+        # right over one capital letter. The kinds are lowercase by definition,
+        # so folding here costs nothing and cannot admit a kind that does not
+        # exist.
+        $scopeKinds = @(@($scope -split ',') |
+            ForEach-Object { $_.Trim().ToLowerInvariant() } |
+            Where-Object { $_ -and $_ -cne "none" })
 
         # THE PARTITION. A row does not assert an outcome for a rule and then
         # name a few ids; it gives a verdict for EVERY anchor in the kinds it
@@ -899,8 +915,14 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
             if (-not $degradedReason) {
                 $degradedReason = "the row gave $partitionSize verdicts over $($constructById.Count) anchors"
             }
-            foreach ($field in @($partition.Keys)) { $partition[$field] = @() }
-            $violating = @(); $compliantIds = @(); $notInReach = @(); $unknownIds = @()
+            # The lists stay. Emptying them here erased the one record of what
+            # the row claimed - the sealed row read `violating: []` for a model
+            # that had named violations, and the `accountedNotEmitted` entry
+            # that should follow a claimed violation vanished with it. The
+            # scans below are safe to run on the raw claim because the
+            # per-field `-MaxIds` ceiling already bounds each list at the
+            # anchor count; the ceiling that was expensive was the unbounded
+            # expansion, and that is now caught inside the expander.
         }
 
         # The set this row owes a verdict for.

@@ -168,7 +168,7 @@
 param(
     [string]$RepoPath,
 
-    [ValidatePattern('^[A-Za-z0-9._-]+$')]
+    [ValidatePattern('^[A-Za-z0-9._-]+\z')]
     [string]$AgentName = "reviewer",
 
     [string]$PromptFile,
@@ -230,7 +230,7 @@ param(
     # re-verified (see docs/delivery-gates.md); supplying it closes the gate
     # on a mismatch instead. Never satisfiable by repository config - this is
     # a third out-of-band operator input, like -GatePolicyFile/-GateQualificationFile.
-    [ValidatePattern('^[0-9a-fA-F]{64}$')]
+    [ValidatePattern('^[0-9a-fA-F]{64}\z')]
     [string]$GateEvaluationToolSha256,
 
     # Publish a sealed gate DECISION - never a raw preview/verification
@@ -324,13 +324,13 @@ param(
     # promoted, and isolates replay state from live state.
     [string]$ReplayRoot,
 
-    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')]
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z')]
     [string]$ReplaySnapshotName,
 
     # Required with -ReplaySnapshotName. The manifest's own digest is unkeyed,
     # so it only proves internal consistency; naming the digest an operator
     # actually vouched for is what binds this run to that snapshot.
-    [ValidatePattern('^[0-9a-fA-F]{64}$')]
+    [ValidatePattern('^[0-9a-fA-F]{64}\z')]
     [string]$ReplayManifestDigest
 )
 
@@ -8193,15 +8193,29 @@ function Get-ReviewerConstructFilesFromReport {
     #>
     param([Parameter(Mandatory)]$Report)
     $files = [System.Collections.Generic.List[object]]::new()
+    # Paths the enumerator will never see. A file nobody read contributes no
+    # anchors, so no row owes a verdict for it, and every row is then an exact
+    # cover of a change set with a hole in it. An unmodelled language and a
+    # lexer that gave up are both recorded as partly-understood; a file that was
+    # never delivered is the same kind of gap and has to be recorded too, or
+    # "Complete: True" is a claim about less code than the pull request changed.
+    $undelivered = [System.Collections.Generic.List[string]]::new()
     foreach ($file in @($Report.Files)) {
         $slices = @($file.Slices)
         $siblings = @($file.SiblingSlices)
-        if ($slices.Count -eq 0) { continue }
+        $path = ([string]$file.Path).TrimStart("/")
+        if ($slices.Count -eq 0) {
+            if (@($file.RawSpans).Count -gt 0) { [void]$undelivered.Add($path) }
+            continue
+        }
         $maxLine = 0
         foreach ($slice in ($slices + $siblings)) {
             if ([int]$slice.EndLine -gt $maxLine) { $maxLine = [int]$slice.EndLine }
         }
-        if ($maxLine -lt 1) { continue }
+        if ($maxLine -lt 1) {
+            if (@($file.RawSpans).Count -gt 0) { [void]$undelivered.Add($path) }
+            continue
+        }
         # A sparse image of the file: delivered lines in place, gaps blank. The
         # enumerator works on line positions, so keeping the real numbering is
         # what makes a construct's anchor mean the same thing to a human
@@ -8227,8 +8241,17 @@ function Get-ReviewerConstructFilesFromReport {
         # pull request never wrote.
         $rawSpans = @($file.RawSpans)
         foreach ($span in $rawSpans) {
-            $spanStart = [int]$span.Start
-            $spanEnd = [int]$span.End
+            # Clamp to the image we actually built. `RawSpans` carries the
+            # provider's own `modifiedLineNumberStart` + `modifiedLinesCount`
+            # unclamped and on purpose, and nothing upstream bounds the count -
+            # so a change set that overstates it (a truncated generated file, a
+            # provider counting against the pre-truncation text, a hostile
+            # snapshot) would spin here on the mandatory path of every review.
+            # A hang is not an exception, so the caller's try/catch cannot save
+            # it.
+            $spanStart = [Math]::Max(1, [int]$span.Start)
+            $spanEnd = [Math]::Min($maxLine, [int]$span.End)
+            if ($spanStart -gt $maxLine -or $spanEnd -lt $spanStart) { continue }
             for ($lineNumber = $spanStart; $lineNumber -le $spanEnd; $lineNumber++) {
                 if ($deliveredLines.Contains($lineNumber)) { [void]$changedLines.Add($lineNumber) }
             }
@@ -8249,8 +8272,21 @@ function Get-ReviewerConstructFilesFromReport {
                 ChangedLines = $changedLines.ToArray()
                 DeliveredLines = @($deliveredLines)
             })
+        # Delivered, but only in part: the hunks that fell outside the delivered
+        # lines contributed nothing either, and the enumerator cannot tell the
+        # difference between a line nobody wrote and a line nobody sent.
+        $spannedLines = [long]0
+        foreach ($span in $rawSpans) {
+            # Long, and arithmetic only. The raw ends are unbounded, so summing
+            # them in an int is one hostile change set away from wrapping
+            # negative and reporting a short file as fully delivered.
+            $spannedLines += ([long][Math]::Max(0, [long]$span.End - [long]$span.Start + 1))
+        }
+        if ($spannedLines -gt 0 -and $changedLines.Count -lt $spannedLines) {
+            [void]$undelivered.Add(([string]$file.Path).TrimStart("/"))
+        }
     }
-    return , $files.ToArray()
+    return @{ Files = @($files.ToArray()); UndeliveredPaths = @($undelivered.ToArray()) }
 }
 
 function Get-ReviewerConstructFilesFromReportSafely {
@@ -8262,8 +8298,18 @@ function Get-ReviewerConstructFilesFromReportSafely {
     #>
     param([Parameter(Mandatory)]$Report)
     try {
-        $files = Get-ReviewerConstructFilesFromReport -Report $Report
-        return Get-ReviewerChangedConstructs -Files @($files)
+        $selection = Get-ReviewerConstructFilesFromReport -Report $Report
+        $result = Get-ReviewerChangedConstructs -Files @($selection.Files)
+        # Fold the paths that never reached the enumerator into the same signal
+        # a lexer failure uses. Both mean the same thing to a reader: the anchor
+        # set is short, so an accounting that covers it is not a claim about the
+        # whole change set.
+        foreach ($path in @($selection.UndeliveredPaths)) {
+            if (@($result.PartiallyUnderstoodFiles) -cnotcontains $path) {
+                $result.PartiallyUnderstoodFiles = @(@($result.PartiallyUnderstoodFiles) + $path)
+            }
+        }
+        return $result
     }
     catch {
         Write-Warning "Changed-construct enumeration failed; the specialist will account without construct anchors: $($_.Exception.Message)"
