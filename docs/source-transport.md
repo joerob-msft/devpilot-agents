@@ -37,10 +37,11 @@ For each bound PR the wrapper:
 
 1. reads the change set **with** line diff blocks and derives, per changed path,
    the right-hand (post-change) line spans of every add and edit;
-2. for a source-bearing edit whose aggregate blocks are well formed but contain
-   only context/deletes, reads the exact merge-target and source versions through
-   the existing bounded `repo_file/get_content` seam and deterministically
-   recovers only proven right-hand spans;
+2. leaves a pure edit whose aggregate blocks contain only context/deletes
+   uncovered because the current MCP contract does not expose the authoritative
+   `commonRefCommit`; once an authoritative, recheckable iteration seam exists,
+   the retained bounded primitive can read exact common-base/source versions and
+   recover only proven right-hand spans;
 3. expands each span by a policy context radius, clamps it to the file, and
    merges overlaps so no line travels twice;
 4. reads each changed file's bytes itself at the exact 40-hex source commit,
@@ -108,20 +109,37 @@ kind carries content is read anyway, and what comes back decides:
 | unreadable | `transportFailed` | **yes** |
 
 Recovery is deliberately narrower than this spanless classification. It runs only
-when the aggregate entry declares source-bearing content and supplies at least one
-well-formed context/delete block but no right-hand block. Empty or malformed block
-sets, deletes, pure renames, ordinary diffs, binary/empty/oversized/decode-rejected
-content, missing versions, equal versions, stale identity, and work over the
+for a pure `edit` on the same path when the aggregate entry supplies at least one
+well-formed delete block, optional context blocks, and no right-hand block. The
+delete-block count is retained as independent evidence: requested-span accounting
+uses at least that count, so a shorter recovered hunk list cannot award itself
+100% coverage. Adds, deletes, any rename mixture, context-only/empty/malformed
+block sets, ordinary diffs, binary/empty/oversized/decode-rejected content,
+missing versions, equal versions, stale identity, and work over the
 request/line/matrix/hunk caps remain unrecovered. The source read is cached and
-reused by normal slicing. Every unsuccessful attempt therefore retains the same
-closed-set omission reason and denominator treatment it had before recovery.
+reused by normal slicing. Ordinary missing-path/read errors disable recovery for
+that file; a session-fatal transport failure still propagates. Every unsuccessful
+attempt retains the same closed-set omission reason and denominator treatment it
+had before recovery.
 
-Each attempt is bound to the configured organization, project, repository ID, PR
-ID, exact source and merge-target commits, canonical path, and declared change
-kinds. The PR identity and both commits are read before the aggregate diff and
-rechecked after all content reads; movement fails the transport closed. If ADO
-does not provide an exact merge-target commit, recovery is disabled while the
-ordinary aggregate-span transport remains available.
+Recovery additionally requires an authoritative binding to the configured
+organization, project, repository ID, PR ID, exact iteration ID, source, target,
+and `commonRefCommit`. The current `repo_pull_request` MCP contract exposes
+`get_changes` and its `iterationId` input, but it does not expose iteration
+metadata or a `get_iterations` action. Consequently the live wrapper does not
+attempt recovery: degenerate files retain `spansUnavailable`, remain in the
+denominator, and keep the unchanged gate closed. The deterministic recovery
+primitive and its adversarial tests are retained, but wiring it into live reads
+must wait for an authoritative, recheckable common-base seam; target-tip content
+is not an acceptable substitute.
+
+Every file carries a versioned `spanBasis`: `changeSet` for ADO-declared
+right-hand blocks and `recovered` for deterministic common-base/source evidence.
+The basis is present in the model-facing accounting row, every slice's provenance,
+the persisted coverage record, preview/cycle metadata, and therefore artifact
+digests. Recovery attempted/recovered/evidence counts, exact common-base commit,
+and iteration ID are bounded accounting fields rather than hidden implementation
+details when an authoritative recovery binding becomes available.
 
 `binaryNoText` and `readerReportedNonTextUncorroborated` are the same reader
 answer split by whether anyone else corroborates it. When the change set's own
