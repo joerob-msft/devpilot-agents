@@ -32,6 +32,10 @@ param(
     [Parameter(ParameterSetName = "Declare")][ValidateRange(2, 16)][int]$PlannedRunCount = 2,
     [Parameter(ParameterSetName = "Declare")][string]$Purpose = "",
     [string]$RunSetPath = "",
+    # The declaration is sealed before any run exists, so it is normally sealed
+    # under its own key rather than under any run''s. Defaults to the first run
+    # key for the case where they share a state directory.
+    [string]$RunSetKeyPath = "",
     [string]$OutputDirectory = "",
     [ValidateRange(2, 16)][int]$RequiredRunCount = 2,
     [switch]$FailOnDisagreement
@@ -147,7 +151,19 @@ if ($DeclareRunSet) {
 # planned. Fewer is a set somebody trimmed; more is a set somebody topped up.
 $runSet = $null
 if ($RunSetPath) {
-    $runSet = Read-ReviewerRunReconciliationSet -Path (Resolve-Path -LiteralPath $RunSetPath).ProviderPath -MasterKey $replayKeys[0]
+    # The declaration is sealed BEFORE any run exists, so it is normally sealed
+    # under its own key rather than under any run's. Fall back to the first run
+    # key for the case where the declaration shares a state directory.
+    $runSetKey = $replayKeys[0]
+    if ($RunSetKeyPath) {
+        $runSetMaster = Get-ReviewerReplayRunMasterKey -Path (Resolve-Path -LiteralPath $RunSetKeyPath).ProviderPath
+        $runSetHmac = [System.Security.Cryptography.HMACSHA256]::new($runSetMaster)
+        try {
+            $runSetKey = $runSetHmac.ComputeHash([Text.UTF8Encoding]::new($false).GetBytes("devpilot.reviewer.replay.artifact.v1"))
+        }
+        finally { $runSetHmac.Dispose() }
+    }
+    $runSet = Read-ReviewerRunReconciliationSet -Path (Resolve-Path -LiteralPath $RunSetPath).ProviderPath -MasterKey $runSetKey
     if (@($ArtifactPath).Count -ne [int]$runSet.plannedRunCount) {
         throw ("The declared run set $($runSet.setId) planned $([int]$runSet.plannedRunCount) run(s) but " +
             "$(@($ArtifactPath).Count) artifact(s) were supplied. A set chosen after the fact is not a qualification.")

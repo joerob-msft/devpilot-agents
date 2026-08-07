@@ -247,3 +247,35 @@ safe here precisely because the binding already pins the config and both plans -
 and the rule id and hash are compared per row anyway, so a run whose `rs2` is
 about a different rule than the other's `rs2` disagrees rather than being
 quietly lined up.
+### Declaring the run set before you look
+
+An operator who picks which runs to compare after seeing their results has not
+reconciled anything; they have chosen an answer. So the set is declared and
+sealed first:
+
+```pwsh
+./tools/Compare-ReviewerReplayRuns.ps1 -DeclareRunSet `
+    -SnapshotName pr12345 -SnapshotManifestDigest <digest> `
+    -PlannedRunCount 4 -Purpose "calibration at head abc1234" `
+    -KeyPath <state>/artifact-signing.key -OutputDirectory <out>
+```
+
+Then run the replays, and reconcile against the declaration:
+
+```pwsh
+./tools/Compare-ReviewerReplayRuns.ps1 `
+    -ArtifactPath run1.json, run2.json, run3.json, run4.json `
+    -KeyPath k1, k2, k3, k4 `
+    -RunSetPath <out>/runset-<id>.json -RunSetKeyPath <out>/artifact-signing.key `
+    -OutputDirectory <out> -FailOnDisagreement
+```
+
+The comparison refuses an artifact that replayed a different snapshot, and
+refuses a set that is short or topped up. The declaration is sealed before any
+run exists, so it normally has its own key; pass `-RunSetKeyPath` unless it
+shares a state directory with the first run.
+
+**Do not edit the reviewer while a qualification set is in flight.** The
+binding covers the script and the specialist library, so a run that finishes
+after an edit binds differently and the set is spoiled - which the tool will
+tell you, having refused to reconcile it.
