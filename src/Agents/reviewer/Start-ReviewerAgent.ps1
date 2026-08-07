@@ -180,15 +180,9 @@ param(
     # config must name at least one enabled destination, or startup fails.
     [switch]$EnableTeamsNotifications,
 
-    # Who the direct message goes to. Authoritative over
-    # config.teamsNotifications.directAuthor.recipientUpn, for the same reason
-    # -OperatorAlias overrides its config counterpart: a checked-in file should
-    # not name an individual, and the recipient is a property of who is running
-    # the agent rather than of the repository.
-    #
-    # Microsoft Graph cannot create a one-on-one chat between the signed-in user
-    # and themselves, so this must be a different person than whoever the agent
-    # authenticates as.
+    # Fallback direct-message recipient when ADO does not expose a usable UPN
+    # for the PR author. Normal review notifications resolve the recipient from
+    # createdBy.uniqueName and do not need this parameter.
     [string]$TeamsRecipientUpn,
 
     # Operator controls for busy repositories and unattended hosts.
@@ -567,6 +561,17 @@ function Get-ReviewerAlias {
     $at = $UniqueName.IndexOf('@')
     if ($at -gt 0) { return $UniqueName.Substring(0, $at) }
     return $UniqueName
+}
+
+function Get-ReviewerAuthorUpn {
+    param([Parameter(Mandatory)]$Pr)
+    $author = Get-ReviewerHashValue -Container $Pr -Key 'createdBy'
+    foreach ($key in @('uniqueName', 'mailAddress', 'emailAddress')) {
+        $candidate = [string](Get-ReviewerHashValue -Container $author -Key $key -Default '')
+        $candidate = $candidate.Trim()
+        if ($candidate -match '^[^@\s]+@[^@\s]+\.[^@\s]+$') { return $candidate }
+    }
+    return ""
 }
 
 function Test-ReviewerTitleSkipped {
@@ -1462,18 +1467,18 @@ $TeamsChannelEvents = Get-AgentConfigStringArray -Object $teamsChannelCfg -Name 
 $teamsDirectCfg = Get-AgentConfigObject -Object $teamsCfg -Name "directAuthor" -Where "config.teamsNotifications"
 $TeamsDirectEnabled = Get-AgentConfigBool -Object $teamsDirectCfg -Name "enabled" -Where "config.teamsNotifications.directAuthor"
 $TeamsDirectEvents = Get-AgentConfigStringArray -Object $teamsDirectCfg -Name "events" -Where "config.teamsNotifications.directAuthor"
-$TeamsDirectRecipient = ""
+$TeamsDirectRecipientFallback = ""
 $teamsDirectRecipientProp = $teamsDirectCfg.PSObject.Properties["recipientUpn"]
 if ($teamsDirectRecipientProp -and $teamsDirectRecipientProp.Value -is [string]) {
-    $TeamsDirectRecipient = ([string]$teamsDirectRecipientProp.Value).Trim()
+    $TeamsDirectRecipientFallback = ([string]$teamsDirectRecipientProp.Value).Trim()
 }
-# The command line wins, so a repository can ship directAuthor.enabled = true
-# without naming a person in a checked-in file.
+# The command line wins as the fallback. The PR author's current ADO identity is
+# still preferred for every notification that is bound to a reviewed PR.
 if ($PSBoundParameters.ContainsKey('TeamsRecipientUpn')) {
-    $TeamsDirectRecipient = $TeamsRecipientUpn.Trim()
+    $TeamsDirectRecipientFallback = $TeamsRecipientUpn.Trim()
 }
-if ($TeamsDirectRecipient -and $TeamsDirectRecipient -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
-    throw "Teams direct recipient '$TeamsDirectRecipient' is not a valid UPN."
+if ($TeamsDirectRecipientFallback -and $TeamsDirectRecipientFallback -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
+    throw "Teams fallback direct recipient '$TeamsDirectRecipientFallback' is not a valid UPN."
 }
 
 # An event this agent never raises would be configured, look enabled, and
@@ -1504,11 +1509,6 @@ if ($EnableTeamsNotifications) {
         }
     }
     if ($TeamsDirectEnabled) {
-        if ([string]::IsNullOrWhiteSpace($TeamsDirectRecipient)) {
-            throw ("config.teamsNotifications.directAuthor is enabled but no recipient is set. Pass -TeamsRecipientUpn <upn>, " +
-                "or populate config.teamsNotifications.directAuthor.recipientUpn. " +
-                "Note: Microsoft Graph cannot create a one-on-one chat with yourself, so this must be a different person than the signed-in user.")
-        }
         if (@($TeamsDirectEvents).Count -eq 0) {
             throw "config.teamsNotifications.directAuthor is enabled but its events list is empty, so nothing would ever be sent there."
         }
@@ -3642,11 +3642,24 @@ function Invoke-DryRunSelfChecks {
     foreach ($guard in @(
             '-EnableTeamsNotifications was passed but neither',
             'channel is enabled but teamId/channelId are empty',
-            'is enabled but its events list is empty',
-            'no recipient is set')) {
+            'is enabled but its events list is empty')) {
         if ($selfText -cnotmatch [regex]::Escape($guard)) {
             $teamsFailures += "startup validation is missing the guard: '$guard'"
         }
+    }
+    $fixedRecipientGuard = 'directAuthor is enabled but no recipient' + ' is set'
+    if ($selfText -cmatch [regex]::Escape($fixedRecipientGuard)) {
+        $teamsFailures += "directAuthor still requires a fixed recipient instead of resolving the reviewed PR author."
+    }
+    $authorUpnProbe = Get-ReviewerAuthorUpn -Pr @{
+        createdBy = @{ uniqueName = 'pr.author@example.test'; mailAddress = 'fallback@example.test' }
+    }
+    $authorMailProbe = Get-ReviewerAuthorUpn -Pr @{
+        createdBy = @{ uniqueName = 'not-a-upn'; mailAddress = 'mail.author@example.test' }
+    }
+    $authorInvalidProbe = Get-ReviewerAuthorUpn -Pr @{ createdBy = @{ uniqueName = 'not-a-upn' } }
+    if ($authorUpnProbe -cne 'pr.author@example.test' -or $authorMailProbe -cne 'mail.author@example.test' -or $authorInvalidProbe) {
+        $teamsFailures += "the PR-author UPN resolver does not prefer ADO uniqueName, fall back to mailAddress, and reject unusable identities."
     }
 
     # 2. Destinations must be INDEPENDENT. A shared try, or a single combined
@@ -3654,7 +3667,7 @@ function Invoke-DryRunSelfChecks {
     $notifyAt = & $declOf 'Send-ReviewerTeamsNotification'
     if ($notifyAt -lt 0) { $teamsFailures += "Send-ReviewerTeamsNotification was not found." }
     else {
-        $notifySlice = $selfText.Substring($notifyAt, [Math]::Min(4500, $selfText.Length - $notifyAt))
+        $notifySlice = & $sourceOf 'Send-ReviewerTeamsNotification'
         if ($notifySlice -cnotmatch '\$wantChannel\s*=' -or $notifySlice -cnotmatch '\$wantDirect\s*=') {
             $teamsFailures += "channel and direct destinations are not evaluated independently."
         }
@@ -3667,10 +3680,22 @@ function Invoke-DryRunSelfChecks {
         if ($notifySlice -cnotmatch '\$delivered\.Count -gt 0') {
             $teamsFailures += "the dedupe record is not gated on at least one successful delivery."
         }
+        if ($notifySlice -cnotmatch '\$channelDedupeKey' -or $notifySlice -cnotmatch '\$directDedupeKey') {
+            $teamsFailures += "channel and direct delivery do not have independent dedupe identities."
+        }
+        if ($notifySlice -cnotmatch '\$legacyDestinations\s+-ccontains\s+''channel''') {
+            $teamsFailures += "legacy dedupe migration suppresses the channel without proving the old channel destination succeeded."
+        }
+        if ($notifySlice -cnotmatch 'RecipientUpn\s+\$resolvedDirectRecipient') {
+            $teamsFailures += "direct delivery does not use the per-notification PR-author recipient."
+        }
         # 4. A notification failure must never fail the review that succeeded.
         if ($notifySlice -cnotmatch 'review work is unaffected') {
             $teamsFailures += "a notification failure is not explicitly isolated from review work."
         }
+    }
+    if (([regex]::Matches($selfText, '-DirectRecipientUpn')).Count -lt 4) {
+        $teamsFailures += "not every PR-bound reviewer notification path supplies the author UPN."
     }
 
     # 5. Every event this agent can raise must be declared, and every declared
@@ -3935,7 +3960,7 @@ function Invoke-ReviewerDelivery {
         PostedCount = 0; PostFailures = 0; ThreadRepliesPosted = 0; ThreadReplyFailures = 0
         SummaryPosted = $false; CastVote = ""; CommentsDelivered = $false
         ThreadRepliesDelivered = $false; SummaryDelivered = $false; VoteResolved = $false
-        Delivered = $false; Aborted = $false; TerminalAbort = $false; Reason = ""
+        Delivered = $false; Aborted = $false; TerminalAbort = $false; AuthorUpn = ""; Reason = ""
     }
     if (-not (Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) -ThreadReplies ([bool]$EnableThreadReplies) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote))) {
         $outcome.Delivered = $false
@@ -3963,6 +3988,7 @@ function Invoke-ReviewerDelivery {
         $outcome.Reason = $freshness.Reason
         return $outcome
     }
+    $outcome.AuthorUpn = Get-ReviewerAuthorUpn -Pr $freshness.Pr
 
     # -- Findings --------------------------------------------------------------
     if ($EnableFindingComments -and @($Postable).Count -gt 0) {
@@ -4186,11 +4212,11 @@ function Send-ReviewerTeamsNotification {
         Destinations are INDEPENDENT. One failing must not suppress the other,
         so each send is wrapped separately rather than sharing a try.
 
-        Delivery is DEDUPED on (event, PR, source commit). The reviewer loops,
-        and a repeated cycle over unchanged state must not re-notify. The
-        dedupe record is written only when at least one destination actually
-        accepted the message, so a total failure is retried next cycle rather
-        than being recorded as delivered.
+        Delivery is DEDUPED per destination on (event, PR, source commit), with
+        the author UPN included for direct messages. The reviewer loops, and a
+        repeated cycle over unchanged state must not re-notify. A successful
+        channel send cannot suppress a failed author DM; each destination is
+        recorded only after it accepts the message.
 
         Failure is a WARNING, never a cycle failure. A missed notification must
         not fail a review that already succeeded, or mark a PR as needing
@@ -4203,6 +4229,7 @@ function Send-ReviewerTeamsNotification {
         [Parameter(Mandatory)][string]$Body,
         [int]$PrId = 0,
         [string]$SourceCommit = "",
+        [string]$DirectRecipientUpn = "",
         [string[]]$Links = @()
     )
     if (-not $EnableTeamsNotifications) { return }
@@ -4210,10 +4237,34 @@ function Send-ReviewerTeamsNotification {
     $wantDirect = $TeamsDirectEnabled -and ($TeamsDirectEvents -ccontains $NotificationEvent)
     if (-not $wantChannel -and -not $wantDirect) { return }
 
-    $dedupeKey = "$NotificationEvent|$PrId|$SourceCommit"
+    $resolvedDirectRecipient = $DirectRecipientUpn.Trim()
+    if ($resolvedDirectRecipient -and $resolvedDirectRecipient -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
+        Write-Warning "Teams '$NotificationEvent' PR-author identity '$resolvedDirectRecipient' is not a usable UPN; trying the configured fallback."
+        $resolvedDirectRecipient = ""
+    }
+    if (-not $resolvedDirectRecipient) { $resolvedDirectRecipient = $TeamsDirectRecipientFallback }
+    if ($wantDirect -and -not $resolvedDirectRecipient) {
+        Write-Warning "Teams '$NotificationEvent' direct-author delivery skipped because ADO exposed no usable author UPN and no fallback recipient is configured."
+    }
+
+    $dedupeBase = "$NotificationEvent|$PrId|$SourceCommit"
+    $channelDedupeKey = "$dedupeBase|channel"
+    $directDedupeKey = "$dedupeBase|direct|$($resolvedDirectRecipient.ToLowerInvariant())"
     $notifState = Get-JsonState -Path $notificationsStatePath
-    if ($notifState.ContainsKey($dedupeKey)) {
-        Write-Host "Teams '$NotificationEvent' already delivered for this PR/commit; skipping." -ForegroundColor DarkGray
+    # A pre-v0.3.4 record used one key for every destination. Preserve only the
+    # destinations it says actually succeeded. Even a legacy direct success
+    # does not suppress the author DM: that destination used a fixed operator
+    # UPN and did not notify the PR author.
+    $legacyChannelDelivered = $false
+    if ($notifState.ContainsKey($dedupeBase)) {
+        $legacyRecord = $notifState[$dedupeBase]
+        $legacyDestinations = [string[]]@(Get-ReviewerHashValue -Container $legacyRecord -Key 'destinations' -Default @())
+        $legacyChannelDelivered = ($legacyDestinations -ccontains 'channel')
+    }
+    $sendChannel = $wantChannel -and -not $legacyChannelDelivered -and -not $notifState.ContainsKey($channelDedupeKey)
+    $sendDirect = $wantDirect -and [bool]$resolvedDirectRecipient -and -not $notifState.ContainsKey($directDedupeKey)
+    if (-not $sendChannel -and -not $sendDirect) {
+        Write-Host "Teams '$NotificationEvent' already delivered to every available destination for this PR/commit; skipping." -ForegroundColor DarkGray
         return
     }
 
@@ -4221,29 +4272,32 @@ function Send-ReviewerTeamsNotification {
     $delivered = New-Object System.Collections.Generic.List[string]
     try {
         $workIqSession = Open-AgentMcpSession -AgencyPath $AgencyPath -Server "workiq" -TimeoutSeconds 60
-        if ($wantChannel) {
+        if ($sendChannel) {
             try {
                 Send-AgentTeamsChannelMessage -Session $workIqSession -TeamId $TeamsTeamId -ChannelId $TeamsChannelId `
                     -Title $Title -Body $Body -Links $Links | Out-Null
                 [void]$delivered.Add("channel")
+                $notifState[$channelDedupeKey] = @{
+                    event = $NotificationEvent; prId = $PrId; destination = "channel"
+                    at = (Get-Date).ToUniversalTime().ToString("o")
+                }
             }
             catch { Write-Warning "Teams '$NotificationEvent' channel delivery failed: $($_.Exception.Message)" }
         }
-        if ($wantDirect) {
+        if ($sendDirect) {
             try {
-                Send-AgentTeamsDirectMessage -Session $workIqSession -RecipientUpn $TeamsDirectRecipient `
+                Send-AgentTeamsDirectMessage -Session $workIqSession -RecipientUpn $resolvedDirectRecipient `
                     -Title $Title -Body $Body -Links $Links | Out-Null
                 [void]$delivered.Add("direct")
+                $notifState[$directDedupeKey] = @{
+                    event = $NotificationEvent; prId = $PrId; destination = "direct"
+                    recipientUpn = $resolvedDirectRecipient
+                    at = (Get-Date).ToUniversalTime().ToString("o")
+                }
             }
             catch { Write-Warning "Teams '$NotificationEvent' direct delivery failed: $($_.Exception.Message)" }
         }
         if ($delivered.Count -gt 0) {
-            $notifState[$dedupeKey] = @{
-                event        = $NotificationEvent
-                prId         = $PrId
-                destinations = @($delivered.ToArray())
-                at           = (Get-Date).ToUniversalTime().ToString("o")
-            }
             Set-JsonState -Path $notificationsStatePath -State $notifState
             Write-Host "Teams '$NotificationEvent' delivered to: $($delivered.ToArray() -join ', ')." -ForegroundColor Green
         }
@@ -4381,7 +4435,8 @@ function Invoke-ReviewerPullRequest {
         Send-ReviewerTeamsNotification -NotificationEvent 'reviewFailed' -AgencyPath $AgencyPath `
             -Title "Review failed on PR $prId" `
             -Body ("$reason" + $(if ($launchFailureReason) { " This is an environment fault on the agent host, not a problem with the pull request." } else { "" })) `
-            -PrId $prId -SourceCommit $sourceCommit -Links @(Get-ReviewerPullRequestLink -PrId $prId)
+            -PrId $prId -SourceCommit $sourceCommit -DirectRecipientUpn ([string]$Bound.AuthorUpn) `
+            -Links @(Get-ReviewerPullRequestLink -PrId $prId)
         return @{ ExitCode = 1; Summary = "PR $prId failed: $reason" }
     }
 
@@ -4570,7 +4625,7 @@ function Invoke-ReviewerPullRequest {
             -Body ("$($allFindings.Count) finding(s): $($counts['critical']) critical, $($counts['important']) important, $($counts['suggestion']) suggestion. " +
                 "$postedCount finding(s) posted, $threadRepliesPosted human-comment assessment(s) posted, $($withheld.Count) withheld by config. " +
                 "Vote: $(if ($castVote) { $castVote } else { 'none' }).") `
-            -PrId $prId -SourceCommit $sourceCommit -Links @($prLink)
+            -PrId $prId -SourceCommit $sourceCommit -DirectRecipientUpn ([string]$Bound.AuthorUpn) -Links @($prLink)
     }
     elseif ($allFindings.Count -gt 0 -or $threadReplies.Count -gt 0) {
         Send-ReviewerTeamsNotification -NotificationEvent 'previewReady' -AgencyPath $AgencyPath `
@@ -4578,7 +4633,7 @@ function Invoke-ReviewerPullRequest {
             -Body ("$($allFindings.Count) finding(s) and $($threadReplies.Count) human-comment assessment(s) were produced but nothing was posted: " +
                 "$($counts['critical']) critical, $($counts['important']) important, $($counts['suggestion']) suggestion. " +
                 "Read the preview, then publish it with -PromotePreview. Preview: $previewPath") `
-            -PrId $prId -SourceCommit $sourceCommit -Links @($prLink)
+            -PrId $prId -SourceCommit $sourceCommit -DirectRecipientUpn ([string]$Bound.AuthorUpn) -Links @($prLink)
     }
 
     return @{ ExitCode = $exit; Summary = "PR $prId reviewed ($($allFindings.Count) finding(s), $postedCount posted, $threadRepliesPosted thread assessment(s))" }
@@ -4901,6 +4956,13 @@ function Invoke-ReviewerPromotion {
 
         if ($delivery.Aborted) { Write-Warning "Nothing was published: $($delivery.Reason)."; return 1 }
         if (-not $delivery.Delivered) { Write-Warning "The promotion did not fully land: $($delivery.Reason)."; return 1 }
+        Send-ReviewerTeamsNotification -NotificationEvent 'reviewCompleted' -AgencyPath $AgencyPath `
+            -Title "Review posted on PR $prId" `
+            -Body ("$($allFindings.Count) finding(s): $($counts['critical']) critical, $($counts['important']) important, $($counts['suggestion']) suggestion. " +
+                "$([int]$delivery.PostedCount) finding(s) posted, $([int]$delivery.ThreadRepliesPosted) human-comment assessment(s) posted. " +
+                "Vote: $(if ($delivery.CastVote) { [string]$delivery.CastVote } else { 'none' }).") `
+            -PrId $prId -SourceCommit $sourceCommit -DirectRecipientUpn ([string]$delivery.AuthorUpn) `
+            -Links @(Get-ReviewerPullRequestLink -PrId $prId)
         Write-Host "Promoted the stored review of PR $prId." -ForegroundColor Green
         return 0
     }
@@ -4993,7 +5055,8 @@ function Invoke-ReviewerCycle {
                     -Title "PR $prId is starved and will be skipped" `
                     -Body ("$attempts consecutive failures reached the threshold of $ConsecutiveFailureThreshold, so this pull request is no longer being attempted. " +
                         "The agent keeps running and will look otherwise healthy. Investigate, then clear it with -ResetStarvedCandidates.") `
-                    -PrId $prId -Links @(Get-ReviewerPullRequestLink -PrId $prId)
+                    -PrId $prId -DirectRecipientUpn (Get-ReviewerAuthorUpn -Pr $pr) `
+                    -Links @(Get-ReviewerPullRequestLink -PrId $prId)
                 continue
             }
 
@@ -5094,6 +5157,7 @@ function Invoke-ReviewerCycle {
                     SourceCommit         = $sourceCommit
                     SourceBranch         = (([string](Get-ReviewerHashValue -Container $prRecord -Key 'sourceRefName' -Default '')) -replace '^refs/heads/', '')
                     AuthorAlias          = (Get-ReviewerAlias -UniqueName ([string](Get-ReviewerHashValue -Container (Get-ReviewerHashValue -Container $prRecord -Key 'createdBy') -Key 'uniqueName' -Default '')))
+                    AuthorUpn            = (Get-ReviewerAuthorUpn -Pr $prRecord)
                     DigestText           = $digest.Text
                     ThreadReplyTargets    = @($digest.AssessmentTargets)
                     ThreadReplyTargetSet  = (Get-ReviewerThreadAssessmentTargetSet -Targets $digest.AssessmentTargets)

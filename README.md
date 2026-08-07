@@ -161,6 +161,13 @@ Windows. It defends against an artifact edited on disk; it does **not** defend
 against an attacker who can already run code as you, who could equally well
 post comments directly.
 
+Teams notifications are also wrapper-owned. With
+`teamsNotifications.directAuthor.enabled` and `-EnableTeamsNotifications`, a
+posted review is sent directly to the reviewed PR's author using the UPN in
+ADO's `createdBy` identity. The configured `recipientUpn` and
+`-TeamsRecipientUpn` are fallback values only when ADO does not expose a usable
+author UPN. Channel and direct delivery are deduplicated independently.
+
 Running the agent twice, once to preview and once to post, does **not** give
 you any of this: the second run is an independent model run with a fresh nonce
 and may reach different conclusions.

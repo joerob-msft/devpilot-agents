@@ -90,12 +90,11 @@
       ]
     },
     "directAuthor": {
-      "note": "One-on-one Teams chat. Microsoft Graph cannot create a chat between the signed-in user and themselves, so recipientUpn must be a DIFFERENT person than whoever the agent runs as. Independent of the channel destination - either alone is valid.",
+      "note": "One-on-one Teams chat to the reviewed PR's author. The wrapper resolves the recipient from ADO createdBy.uniqueName for each PR. recipientUpn is only a fallback when ADO does not expose a usable author UPN. Independent of the channel destination - either alone is valid.",
       "enabled": false,
       "recipientUpn": "",
       "events": [
-        "previewReady",
-        "candidateStarved"
+        "reviewCompleted"
       ]
     }
   },
