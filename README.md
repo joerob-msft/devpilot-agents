@@ -82,7 +82,7 @@ must live inside that repository.
 | Agent | Watches | Does |
 |---|---|---|
 | `review-handler` | Your own open PRs | Finds reviewer feedback you have not answered, resumes the coding session where the code was written, makes the fix, replies, pushes, optionally requeues validation and sets auto-complete |
-| `reviewer` | Other people's PRs | Reviews the diff and reports findings; optionally posts them as PR comments and casts a non-blocking vote |
+| `reviewer` | Other people's PRs | Reviews the diff, reports findings, and assesses human review comments; optionally posts findings, replies in-place, and casts a non-blocking vote |
 
 ### `reviewer` — a model with no write tools
 
@@ -95,6 +95,14 @@ diffs and private review threads, and a `web_fetch` whose URL the model composes
 is an exfiltration channel that an injected diff only has to ask for. The model
 returns its findings as *structured data* in the result marker, the schema
 bounds them, and the **wrapper** performs every write.
+
+The reviewer can also assess existing human-authored ADO comments in place.
+For an active thread whose latest relevant comment is human-authored, it may
+verify, justify, clarify, support, or refute the comment against the diff and
+repository context. Agent, bot, and system responses are never targets. Replies
+are opt-in with `-EnableThreadReplies`, bound to the exact human comment ID,
+previewed and sealed with the rest of the review, and re-checked immediately
+before the wrapper posts them.
 
 What that does and does not buy you, stated precisely:
 
@@ -126,16 +134,17 @@ review you have actually read is a first-class mode rather than a re-run:
     -ConfigFile <your-repo>/.github/copilot/agents/reviewer.config.json `
     -OperatorAlias <your-alias> `
     -PromotePreview <state-dir>/previews/pr12345-<commit>-<stamp>.json `
-    -EnableFindingComments -EnableSummaryComment
+    -EnableFindingComments -EnableThreadReplies -EnableSummaryComment
 
 # Unattended alternative: review and post in one run. Faster, and nobody read it first.
 ./src/Agents/reviewer/Start-ReviewerAgent.ps1 -Once `
     -ConfigFile <your-repo>/.github/copilot/agents/reviewer.config.json `
-    -OperatorAlias <your-alias> -EnableFindingComments -EnableSummaryComment
+    -OperatorAlias <your-alias> `
+    -EnableFindingComments -EnableThreadReplies -EnableSummaryComment
 ```
 
 `-PromotePreview` publishes the artifact's **delivery manifest** — the exact
-comment list, summary and vote that appeared in the Markdown you read — and
+comment and thread-reply lists, summary and vote that appeared in the Markdown you read — and
 three things have to hold before any of it goes out. The artifact's HMAC seal
 must verify against a per-user key that is *not stored in the artifact*; the
 stored review must still parse under the same schema that bounded it and still

@@ -24,15 +24,16 @@
       - What that does and does not buy, stated precisely:
           * a successful prompt injection cannot reach the host or the
             repository: there is no tool to edit, run, post or vote with;
-          * everything the wrapper publishes is schema-bounded - enum severity,
-            length- and character-limited text, capped count, and an anchor
-            checked against the PR's real change set;
+          * everything the wrapper publishes is schema-bounded - enum severity
+            and assessment disposition, length- and character-limited text,
+            capped counts, finding anchors checked against the PR's real change
+            set, and thread replies bound to a specific human comment;
           * BUT the wrapper still publishes text the MODEL wrote. Structural
             validation cannot distinguish a genuine finding from a fabricated
             one, so an unattended posting run is NOT injection-proof. Use
             -PromotePreview to publish a review a human actually read.
       - Every preview writes a sealed DELIVERY MANIFEST beside its Markdown:
-        the exact comments, summary and vote shown to the operator, HMAC'd with
+        the exact comments, thread replies, summary and vote shown to the operator, HMAC'd with
         a per-user key that is NOT stored in the artifact. -PromotePreview
         verifies the seal and publishes only that manifest; it may drop an entry
         that has since become unpublishable, never add one. Without the seal the
@@ -58,10 +59,11 @@
         thread through a read tool; the prompt's ground rules classify anything
         a tool returns as data.
 
-    ADVISORY IS NOT ANONYMOUS: posted findings appear under the identity the
-    Agency/ADO session is authenticated as - the operator's. Enabling
-    -EnableFindingComments means other engineers see the operator's name on
-    every comment. That is why it is off by default.
+    ADVISORY IS NOT ANONYMOUS: posted findings and thread assessments appear
+    under the identity the Agency/ADO session is authenticated as - the
+    operator's. Enabling -EnableFindingComments or -EnableThreadReplies means
+    other engineers see the operator's name on every comment. That is why both
+    are off by default.
 
 .PARAMETER OperatorAlias
     Required for live cycles. The alias this agent runs AS. Its PRs are
@@ -84,6 +86,13 @@
     bounded it when it was produced, re-checked against the PR and commit it was
     bound to, and only then posted. This is the only mode in which the text that
     is posted is guaranteed to be the text a human read.
+
+.PARAMETER EnableThreadReplies
+    Reply in-place to active human-authored PR comments with a concise
+    verification, justification, clarification, support, or refutation. The
+    model remains read-only; the wrapper posts only replies bound to the exact
+    human comment the model assessed. Agent, bot, and system comments are never
+    eligible.
 
 .PARAMETER AcceptUnverifiablePreviewDocument
     Promote even though the Markdown preview the artifact was written alongside
@@ -109,11 +118,11 @@
     PREVIEW one specific PR: print the candidate comments and save an artifact. Posts nothing.
 
 .EXAMPLE
-    .\Start-ReviewerAgent.ps1 -ConfigFile <path> -OperatorAlias operator -PromotePreview <state>/previews/pr12345-....json -EnableFindingComments
+    .\Start-ReviewerAgent.ps1 -ConfigFile <path> -OperatorAlias operator -PromotePreview <state>/previews/pr12345-....json -EnableFindingComments -EnableThreadReplies
     Publish exactly the review that was previewed, with no second model run.
 
 .EXAMPLE
-    .\Start-ReviewerAgent.ps1 -Once -ConfigFile <path> -OperatorAlias operator -EnableFindingComments -EnableSummaryComment
+    .\Start-ReviewerAgent.ps1 -Once -ConfigFile <path> -OperatorAlias operator -EnableFindingComments -EnableThreadReplies -EnableSummaryComment
     Unattended: review one PR and post the findings in the same run.
 #>
 [CmdletBinding()]
@@ -162,8 +171,10 @@ param(
     # Without any of these the agent is a pure read-only reviewer that reports
     # its candidate comments to the console and a preview file.
     [switch]$EnableFindingComments,
+    [switch]$EnableThreadReplies,
     [switch]$EnableSummaryComment,
     [switch]$EnableApprovalVote,
+
 
     # Operator controls for busy repositories and unattended hosts.
     # Each PR costs one full model run, so the per-cycle count is bounded and
@@ -315,11 +326,14 @@ $script:ReviewerAllowedVotes = @("Approved", "ApprovedWithSuggestions", "Waiting
 # Severity vocabulary, most severe first. Order is meaningful: it drives both
 # the posting order and which findings survive the max-findings cap.
 $script:ReviewerSeverities = @("critical", "important", "suggestion")
+$script:ReviewerThreadDispositions = @("verify", "justify", "clarify", "support", "refute")
+$script:ReviewerMaxThreadReplies = 20
 
 # Code-defined comment furniture. Kept out of config so a consuming repo cannot
 # make the agent post comments that do not identify themselves as automated.
 $script:ReviewerSignatureFooter = "-- automated review by the devpilot reviewer agent; reply here if this is wrong."
 $script:ReviewerSummaryHeading = "## Reviewer agent summary"
+$script:ReviewerThreadReplyHeading = "Reviewer agent assessment"
 
 # ---------------------------------------------------------------------------
 # Pure helpers (unit-testable in -DryRun; no network / ADO / Copilot needed)
@@ -639,6 +653,9 @@ function Test-ReviewerAlreadyReviewed {
         # The capabilities this run would deliver. Each must already be recorded
         # as delivered for the PR to be skipped.
         [bool]$WantComments = $false,
+        [bool]$WantThreadReplies = $false,
+        [bool]$ThreadTargetsKnown = $false,
+        [object[]]$CurrentThreadReplyTargets = @(),
         [bool]$WantSummary = $false,
         [bool]$WantVote = $false
     )
@@ -648,6 +665,19 @@ function Test-ReviewerAlreadyReviewed {
     $rec = $ReviewedState[$key]
     $recCommit = [string](Get-ReviewerHashValue -Container $rec -Key 'sourceCommit' -Default '')
     if ($recCommit -ine $SourceCommit) { return $false }
+    if ($ThreadTargetsKnown) {
+        $targetKeyField = if ($WantThreadReplies) { 'resolvedThreadReplyTargetKeys' } else { 'reviewedThreadTargetKeys' }
+        $reviewedTargetSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+        foreach ($key in @((Get-ReviewerHashValue -Container $rec -Key $targetKeyField -Default @()))) {
+            if ($key) { [void]$reviewedTargetSet.Add([string]$key) }
+        }
+        foreach ($target in @($CurrentThreadReplyTargets)) {
+            $key = "{0}:{1}:{2}" -f ([int](Get-ReviewerHashValue -Container $target -Key 'threadId' -Default 0)),
+                ([int](Get-ReviewerHashValue -Container $target -Key 'commentId' -Default 0)),
+                ([string](Get-ReviewerHashValue -Container $target -Key 'contentFingerprint' -Default ''))
+            if (-not $reviewedTargetSet.Contains($key)) { return $false }
+        }
+    }
     if (-not $WritesRequested) { return $true }
     # Records written before per-capability tracking existed carry only
     # 'delivered', which was set when whichever switches that run had enabled
@@ -658,9 +688,11 @@ function Test-ReviewerAlreadyReviewed {
     # is cheap and safe: comment fingerprints and the summary marker make a
     # redundant attempt a no-op rather than a duplicate.
     $comments = [bool](Get-ReviewerHashValue -Container $rec -Key 'commentsDelivered' -Default $false)
+    $threadReplies = [bool](Get-ReviewerHashValue -Container $rec -Key 'threadRepliesDelivered' -Default $false)
     $summary = [bool](Get-ReviewerHashValue -Container $rec -Key 'summaryDelivered' -Default $false)
     $vote = [bool](Get-ReviewerHashValue -Container $rec -Key 'voteResolved' -Default $false)
     if ($WantComments -and -not $comments) { return $false }
+    if ($WantThreadReplies -and -not $threadReplies) { return $false }
     if ($WantSummary -and -not $summary) { return $false }
     if ($WantVote -and -not $vote) { return $false }
     return $true
@@ -706,9 +738,10 @@ function Merge-ReviewerCapabilityFlag {
 
 function Get-ReviewerRequestedCapabilities {
     <# The capability names a run is asking for, in a fixed order. #>
-    param([bool]$Comments, [bool]$Summary, [bool]$Vote)
+    param([bool]$Comments, [bool]$ThreadReplies, [bool]$Summary, [bool]$Vote)
     $l = New-Object System.Collections.Generic.List[string]
     if ($Comments) { [void]$l.Add('comments') }
+    if ($ThreadReplies) { [void]$l.Add('threadReplies') }
     if ($Summary) { [void]$l.Add('summary') }
     if ($Vote) { [void]$l.Add('vote') }
     return , ($l.ToArray())
@@ -724,8 +757,19 @@ function Get-ReviewerUnresolvedCapabilities {
         starts with only -EnableSummaryComment, promotes that plan, delivers the
         summary, reports success and closes the plan - and Y is gone.
     #>
-    param([string[]]$Requested, [bool]$CommentsDelivered, [bool]$SummaryDelivered, [bool]$VoteResolved)
-    $resolved = @{ comments = $CommentsDelivered; summary = $SummaryDelivered; vote = $VoteResolved }
+    param(
+        [string[]]$Requested,
+        [bool]$CommentsDelivered,
+        [bool]$ThreadRepliesDelivered,
+        [bool]$SummaryDelivered,
+        [bool]$VoteResolved
+    )
+    $resolved = @{
+        comments = $CommentsDelivered
+        threadReplies = $ThreadRepliesDelivered
+        summary = $SummaryDelivered
+        vote = $VoteResolved
+    }
     $l = New-Object System.Collections.Generic.List[string]
     foreach ($c in @($Requested)) {
         if ($resolved.ContainsKey($c) -and -not [bool]$resolved[$c]) { [void]$l.Add($c) }
@@ -776,6 +820,17 @@ function Get-ReviewerPendingDeliveryPlan {
     return $path
 }
 
+function Test-ReviewerShouldKeepPendingPlan {
+    param(
+        [bool]$WritesRequested,
+        [string[]]$UnresolvedCapabilities = @(),
+        [AllowEmptyString()][string]$ArtifactPath = "",
+        [bool]$TerminalAbort = $false
+    )
+    return ($WritesRequested -and @($UnresolvedCapabilities).Count -gt 0 -and
+        -not $TerminalAbort -and [bool]$ArtifactPath)
+}
+
 function Get-ReviewerLastReviewedSortKey {
     <# Sort key for fair scheduling: the UTC ticks of the last review of this
        PR, or 0 when it has never been reviewed. Ascending order therefore puts
@@ -801,7 +856,7 @@ function Get-ReviewerLastReviewedSortKey {
 function Get-ReviewerMarkerSchema {
     param([Parameter(Mandatory)][string]$ExpectedProject, [Parameter(Mandatory)][string]$ExpectedNonce, [int]$MaxFindingItems = 12)
     return @{
-        Keys   = @('schemaVersion', 'prId', 'repositoryId', 'project', 'reviewedSourceCommit', 'findings', 'recommendedVote', 'summary', 'nonce')
+        Keys   = @('schemaVersion', 'prId', 'repositoryId', 'project', 'reviewedSourceCommit', 'findings', 'threadReplies', 'recommendedVote', 'summary', 'nonce')
         Fields = @{
             schemaVersion        = @{ Type = 'int'; Min = 1; Max = 1 }
             prId                 = @{ Type = 'int'; Min = 1; Max = [int]::MaxValue }
@@ -822,6 +877,19 @@ function Get-ReviewerMarkerSchema {
                         filePath = @{ Type = 'string'; MaxLength = 400; AllowEmpty = $true; Pattern = '^(/[^\\:*?"<>|]*)?$' }
                         line     = @{ Type = 'int'; Min = 0; Max = 1000000 }
                         comment  = @{ Type = 'string'; MaxLength = 1200 }
+                    }
+                }
+            }
+            threadReplies        = @{
+                Type     = 'objectArray'
+                MaxItems = $script:ReviewerMaxThreadReplies
+                Item     = @{
+                    Keys   = @('threadId', 'commentId', 'disposition', 'comment')
+                    Fields = @{
+                        threadId    = @{ Type = 'int'; Min = 1; Max = [int]::MaxValue }
+                        commentId   = @{ Type = 'int'; Min = 1; Max = [int]::MaxValue }
+                        disposition = @{ Type = 'enum'; Values = $script:ReviewerThreadDispositions }
+                        comment     = @{ Type = 'string'; MaxLength = 1200 }
                     }
                 }
             }
@@ -1019,8 +1087,8 @@ function Get-ReviewerWritesRequested {
     <# "Is this a preview?" must consider EVERY write switch. Deciding it from
        -EnableFindingComments alone told an operator running with only
        -EnableSummaryComment that nothing would be posted, and then posted. #>
-    param([bool]$Comments, [bool]$Summary, [bool]$Vote)
-    return ($Comments -or $Summary -or $Vote)
+    param([bool]$Comments, [bool]$ThreadReplies, [bool]$Summary, [bool]$Vote)
+    return ($Comments -or $ThreadReplies -or $Summary -or $Vote)
 }
 
 function Format-ReviewerFindingComment {
@@ -1031,6 +1099,20 @@ function Format-ReviewerFindingComment {
     $severity = ([string](Get-ReviewerHashValue -Container $Finding -Key 'severity' -Default 'suggestion')).ToUpperInvariant()
     $comment = [string](Get-ReviewerHashValue -Container $Finding -Key 'comment' -Default '')
     return "**[$severity]** $comment`n`n$script:ReviewerSignatureFooter"
+}
+
+function Format-ReviewerThreadReply {
+    param([Parameter(Mandatory)]$Reply)
+    $disposition = [string](Get-ReviewerHashValue -Container $Reply -Key 'disposition' -Default 'clarify')
+    $label = if ($disposition) {
+        $disposition.Substring(0, 1).ToUpperInvariant() + $disposition.Substring(1).ToLowerInvariant()
+    }
+    else { "Clarify" }
+    $comment = [string](Get-ReviewerHashValue -Container $Reply -Key 'comment' -Default '')
+    $threadId = [int](Get-ReviewerHashValue -Container $Reply -Key 'threadId' -Default 0)
+    $commentId = [int](Get-ReviewerHashValue -Container $Reply -Key 'commentId' -Default 0)
+    $targetMarker = "<!-- devpilot-thread-assessment:$threadId`:$commentId -->"
+    return "**$script:ReviewerThreadReplyHeading - ${label}:** $comment`n`n$targetMarker`n`n$script:ReviewerSignatureFooter"
 }
 
 function Format-ReviewerSummaryComment {
@@ -1331,10 +1413,10 @@ if ($repoConvProp -and $repoConvProp.Value) {
     if ($convLines.Count -gt 0) { $RepoConventionsText = ($convLines.ToArray() -join "`n") }
 }
 
+
 $permissions = Get-AgentConfigObject -Object $Cfg -Name "permissions" -Where "config"
 $ConfigAllowTools = Get-AgentConfigStringArray -Object $permissions -Name "allowTools" -Where "config.permissions"
 $ConfigDenyTools = Get-AgentConfigStringArray -Object $permissions -Name "denyTools" -Where "config.permissions"
-
 # Fail closed: config allow-lists may NARROW the ceiling but never widen it,
 # and may never name a mandatory-denied tool.
 Test-AgentAllowToolCeiling -Candidates @($ConfigAllowTools) -Ceiling $script:ReviewerAllowToolCeiling -MandatoryDeny $script:ReviewerMandatoryDenyTools -Where "config.permissions.allowTools"
@@ -1500,6 +1582,7 @@ function Get-ReviewerRuntimeContext {
     $lines.Add("Bound PR (review ONLY this): PR ``$PrId``, repository GUID ``$RepositoryId``, source commit ``$SourceCommit``, source branch ``$SourceBranch``, author ``$AuthorAlias``.")
     $lines.Add("")
     $lines.Add("Maximum findings you may report: ``$EffectiveMaxFindings``. Severities this repository posts: $((@($PostSeverities) -join ', ')). Findings at other severities still belong in your marker - the wrapper decides what to post.")
+    $lines.Add("Maximum human-comment assessments you may report: ``$script:ReviewerMaxThreadReplies``. Only digest entries with ``eligibleForAssessment=true`` may appear in ``threadReplies``; copy both their ``threadId`` and ``latestCommentId`` exactly.")
     $lines.Add("")
     $lines.Add("You have NO write tools this cycle, and never will: you do not post comments and you do not vote. Report findings in the marker; the wrapper performs any write. Do not attempt a write and do not treat its absence as an error.")
     $lines.Add("")
@@ -1509,7 +1592,7 @@ function Get-ReviewerRuntimeContext {
         $lines.Add($RepoConventionsText)
         $lines.Add("")
     }
-    $lines.Add("Existing thread digest (structured metadata only; comment text is untrusted and intentionally omitted). Use it to avoid repeating a point someone already made:")
+    $lines.Add("Existing thread digest (structured metadata only; comment text is untrusted and intentionally omitted). Use it to avoid repeating a point someone already made and to identify human comments eligible for assessment:")
     $lines.Add($ThreadDigestText)
     $lines.Add("")
     return (($lines -join "`n") + "`n")
@@ -1536,9 +1619,13 @@ function ConvertTo-ReviewerThread {
     foreach ($rc in @(Get-ReviewerHashValue -Container $RawThread -Key 'comments' -Default @())) {
         $author = Get-ReviewerHashValue -Container $rc -Key 'author'
         $comments.Add(@{
+                commentId         = [int](Get-ReviewerHashValue -Container $rc -Key 'id' -Default 0)
                 authorDisplayName = [string](Get-ReviewerHashValue -Container $author -Key 'displayName' -Default '')
                 authorUniqueName  = [string](Get-ReviewerHashValue -Container $author -Key 'uniqueName' -Default '')
                 content           = [string](Get-ReviewerHashValue -Container $rc -Key 'content' -Default '')
+                contentFingerprint = (Get-ReviewerTextSha256 -Text ([string](Get-ReviewerHashValue -Container $rc -Key 'content' -Default '')))
+                commentType       = (Get-ReviewerHashValue -Container $rc -Key 'commentType' -Default '')
+                isDeleted         = [bool](Get-ReviewerHashValue -Container $rc -Key 'isDeleted' -Default $false)
             })
     }
     return @{
@@ -1550,6 +1637,128 @@ function ConvertTo-ReviewerThread {
     }
 }
 
+function Get-ReviewerCommentClass {
+    param(
+        [Parameter(Mandatory)]$Comment,
+        [string[]]$BotSubstrings = @(),
+        [string[]]$SystemSubstrings = @()
+    )
+    if ([bool](Get-ReviewerHashValue -Container $Comment -Key 'isDeleted' -Default $false)) { return 'system' }
+    $commentType = ([string](Get-ReviewerHashValue -Container $Comment -Key 'commentType' -Default '')).Trim().ToLowerInvariant()
+    if ($commentType -in @('2', '3', 'codechange', 'system')) { return 'system' }
+    $idText = "{0}`n{1}" -f ([string](Get-ReviewerHashValue -Container $Comment -Key 'authorDisplayName' -Default '')),
+                            ([string](Get-ReviewerHashValue -Container $Comment -Key 'authorUniqueName' -Default ''))
+    foreach ($n in @($SystemSubstrings)) {
+        if ($n -and $idText.IndexOf([string]$n, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return 'system' }
+    }
+    $body = [string](Get-ReviewerHashValue -Container $Comment -Key 'content' -Default '')
+    if ($body.IndexOf($script:ReviewerSignatureFooter, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return 'agent' }
+    foreach ($n in @($BotSubstrings)) {
+        if ($n -and $idText.IndexOf([string]$n, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return 'bot' }
+    }
+    return 'human'
+}
+
+function Get-ReviewerThreadClassification {
+    param(
+        [Parameter(Mandatory)]$Thread,
+        [string[]]$BotSubstrings = @(),
+        [string[]]$SystemSubstrings = @()
+    )
+    $human = 0
+    $agentOwn = 0
+    $latestClass = ''
+    $latestCommentId = 0
+    $latestContentFingerprint = ''
+    $orderedComments = @(@(Get-ReviewerHashValue -Container $Thread -Key 'comments' -Default @()) |
+        Sort-Object { [int](Get-ReviewerHashValue -Container $_ -Key 'commentId' -Default 0) })
+    foreach ($c in $orderedComments) {
+        $class = Get-ReviewerCommentClass -Comment $c -BotSubstrings $BotSubstrings -SystemSubstrings $SystemSubstrings
+        if ($class -eq 'system' -or $class -eq 'bot') { continue }
+        if ($class -eq 'agent') { $agentOwn++ } else { $human++ }
+        $latestClass = $class
+        $latestCommentId = [int](Get-ReviewerHashValue -Container $c -Key 'commentId' -Default 0)
+        $latestContentFingerprint = [string](Get-ReviewerHashValue -Container $c -Key 'contentFingerprint' -Default '')
+    }
+    $status = [string](Get-ReviewerHashValue -Container $Thread -Key 'status' -Default 'unknown')
+    $eligible = ($status -ieq 'active' -and $latestClass -eq 'human' -and $latestCommentId -gt 0)
+    return @{
+        ThreadId = [int](Get-ReviewerHashValue -Container $Thread -Key 'threadId' -Default 0)
+        Status = $status
+        HumanComments = $human
+        PriorAgentFindings = $agentOwn
+        LatestRelevantClass = $(if ($latestClass) { $latestClass } else { 'none' })
+        LatestRelevantCommentId = $latestCommentId
+        LatestRelevantContentFingerprint = $latestContentFingerprint
+        EligibleForAssessment = $eligible
+    }
+}
+
+function Get-ReviewerThreadAssessmentTargets {
+    param(
+        [object[]]$Threads,
+        [string[]]$BotSubstrings = @(),
+        [string[]]$SystemSubstrings = @(),
+        [int]$MaxTargets = 0
+    )
+    $targets = New-Object System.Collections.Generic.List[object]
+    foreach ($t in @($Threads)) {
+        $c = Get-ReviewerThreadClassification -Thread $t -BotSubstrings $BotSubstrings -SystemSubstrings $SystemSubstrings
+        if (-not $c.EligibleForAssessment) { continue }
+        [void]$targets.Add(@{
+                threadId = [int]$c.ThreadId
+                commentId = [int]$c.LatestRelevantCommentId
+                contentFingerprint = [string]$c.LatestRelevantContentFingerprint
+            })
+        if ($MaxTargets -gt 0 -and $targets.Count -ge $MaxTargets) { break }
+    }
+    return , ($targets.ToArray())
+}
+
+function Get-ReviewerThreadAssessmentTargetSet {
+    param([object[]]$Targets)
+    $set = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    foreach ($t in @($Targets)) {
+        $key = "{0}:{1}" -f ([int](Get-ReviewerHashValue -Container $t -Key 'threadId' -Default 0)),
+            ([int](Get-ReviewerHashValue -Container $t -Key 'commentId' -Default 0))
+        [void]$set.Add($key)
+    }
+    return $set
+}
+
+function Get-ReviewerThreadAssessmentTargetKeys {
+    param([object[]]$Targets)
+    return , (@($Targets | ForEach-Object {
+                "{0}:{1}:{2}" -f ([int](Get-ReviewerHashValue -Container $_ -Key 'threadId' -Default 0)),
+                    ([int](Get-ReviewerHashValue -Container $_ -Key 'commentId' -Default 0)),
+                    ([string](Get-ReviewerHashValue -Container $_ -Key 'contentFingerprint' -Default ''))
+            }))
+}
+
+function Merge-ReviewerThreadAssessmentTargetKeys {
+    param([string[]]$PriorKeys = @(), [object[]]$CurrentTargets = @())
+    $merged = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    foreach ($key in @($PriorKeys)) {
+        if ($key) { [void]$merged.Add([string]$key) }
+    }
+    $currentKeys = Get-ReviewerThreadAssessmentTargetKeys -Targets $CurrentTargets
+    foreach ($key in $currentKeys) {
+        if ($key) { [void]$merged.Add([string]$key) }
+    }
+    return , ([string[]]@($merged | Sort-Object))
+}
+
+function Test-ReviewerThreadRepliesBound {
+    param([object[]]$Replies, [Parameter(Mandatory)]$TargetSet)
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    foreach ($reply in @($Replies)) {
+        $key = "{0}:{1}" -f ([int](Get-ReviewerHashValue -Container $reply -Key 'threadId' -Default 0)),
+            ([int](Get-ReviewerHashValue -Container $reply -Key 'commentId' -Default 0))
+        if (-not $TargetSet.Contains($key) -or -not $seen.Add($key)) { return $false }
+    }
+    return $true
+}
+
 function Build-ReviewerThreadDigest {
     <# Metadata only: id, status, file:line, comment count, and whether the
        thread already carries an automated finding. No comment text.
@@ -1558,39 +1767,52 @@ function Build-ReviewerThreadDigest {
        though they have no human comment: they are exactly the threads the model
        most needs to know about, because re-reporting a finding that is already
        sitting on the PR is the most likely way for this agent to become noise. #>
-    param([object[]]$Threads, [string[]]$BotSubstrings = @(), [string[]]$SystemSubstrings = @())
+    param(
+        [object[]]$Threads,
+        [string[]]$BotSubstrings = @(),
+        [string[]]$SystemSubstrings = @(),
+        [string[]]$ReviewedTargetKeys = @()
+    )
+    $reviewedSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    foreach ($key in @($ReviewedTargetKeys)) {
+        if ($key) { [void]$reviewedSet.Add([string]$key) }
+    }
+    $allAssessmentTargets = Get-ReviewerThreadAssessmentTargets -Threads $Threads -BotSubstrings $BotSubstrings `
+        -SystemSubstrings $SystemSubstrings
+    $assessmentTargets = @($allAssessmentTargets | Where-Object {
+            [void]($candidateKeys = Get-ReviewerThreadAssessmentTargetKeys -Targets @($_))
+            [void]($key = [string]$candidateKeys[0])
+            -not $reviewedSet.Contains($key)
+        } | Select-Object -First $script:ReviewerMaxThreadReplies)
+    $assessmentTargetKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    $selectedTargetKeys = Get-ReviewerThreadAssessmentTargetKeys -Targets $assessmentTargets
+    foreach ($key in $selectedTargetKeys) {
+        [void]$assessmentTargetKeys.Add($key)
+    }
     $lines = New-Object System.Collections.Generic.List[string]
     foreach ($t in @($Threads)) {
-        $comments = @(Get-ReviewerHashValue -Container $t -Key 'comments' -Default @())
-        $human = 0
-        $agentOwn = 0
-        foreach ($c in $comments) {
-            $idText = "{0}`n{1}" -f ([string](Get-ReviewerHashValue -Container $c -Key 'authorDisplayName' -Default '')),
-                                    ([string](Get-ReviewerHashValue -Container $c -Key 'authorUniqueName' -Default ''))
-            $isSystem = $false
-            foreach ($n in @($SystemSubstrings)) { if ($n -and $idText.IndexOf([string]$n, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $isSystem = $true; break } }
-            if ($isSystem) { continue }
-            # This agent posts under the operator's own identity, so authorship
-            # cannot distinguish its comments from the operator's. The signature
-            # footer can - and it is code-defined, so a config cannot suppress it.
-            $body = [string](Get-ReviewerHashValue -Container $c -Key 'content' -Default '')
-            if ($body.IndexOf($script:ReviewerSignatureFooter, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $agentOwn++; continue }
-            $isBot = $false
-            foreach ($n in @($BotSubstrings)) { if ($n -and $idText.IndexOf([string]$n, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $isBot = $true; break } }
-            if (-not $isBot) { $human++ }
-        }
-        if ($human -eq 0 -and $agentOwn -eq 0) { continue }
+        $classification = Get-ReviewerThreadClassification -Thread $t -BotSubstrings $BotSubstrings -SystemSubstrings $SystemSubstrings
+        if ($classification.HumanComments -eq 0 -and $classification.PriorAgentFindings -eq 0) { continue }
+        $targetKey = "{0}:{1}:{2}" -f $classification.ThreadId, $classification.LatestRelevantCommentId,
+            $classification.LatestRelevantContentFingerprint
+        $eligibleForAssessment = ([bool]$classification.EligibleForAssessment -and $assessmentTargetKeys.Contains($targetKey))
         $fileLoc = if (Get-ReviewerHashValue -Container $t -Key 'filePath' -Default '') {
             "{0}:{1}" -f (Get-ReviewerHashValue -Container $t -Key 'filePath'), (Get-ReviewerHashValue -Container $t -Key 'line' -Default 0)
         }
         else { "(pr-level)" }
-        $lines.Add(("- threadId={0} status={1} loc={2} humanComments={3} priorAgentFindings={4}" -f
-                (Get-ReviewerHashValue -Container $t -Key 'threadId' -Default 0),
-                (Get-ReviewerHashValue -Container $t -Key 'status' -Default 'unknown'),
-                $fileLoc, $human, $agentOwn))
+        $lines.Add(("- threadId={0} status={1} loc={2} humanComments={3} priorAgentFindings={4} latestRelevant={5} latestCommentId={6} eligibleForAssessment={7}" -f
+                $classification.ThreadId, $classification.Status, $fileLoc,
+                $classification.HumanComments, $classification.PriorAgentFindings,
+                $classification.LatestRelevantClass, $classification.LatestRelevantCommentId,
+                $eligibleForAssessment.ToString().ToLowerInvariant()))
     }
     if ($lines.Count -eq 0) { $lines.Add("- (no existing human or prior-agent review threads)") }
-    return @{ Text = ($lines.ToArray() -join "`n"); TotalCount = @($Threads).Count }
+    return @{
+        Text = ($lines.ToArray() -join "`n")
+        TotalCount = @($Threads).Count
+        AssessmentTargets = $assessmentTargets
+        AllAssessmentTargets = $allAssessmentTargets
+    }
 }
 
 function Get-ReviewerExistingFingerprints {
@@ -1613,6 +1835,39 @@ function Get-ReviewerExistingFingerprints {
         }
     }
     return $set
+}
+
+function Get-ReviewerThreadReplyFingerprint {
+    param([int]$ThreadId, [string]$Content)
+    return (Get-ReviewerCommentFingerprint -Content $Content -FilePath "thread:$ThreadId" -Line 0)
+}
+
+function Get-ReviewerExistingThreadReplyFingerprints {
+    param([object[]]$Threads)
+    $set = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    foreach ($t in @($Threads)) {
+        $threadId = [int](Get-ReviewerHashValue -Container $t -Key 'threadId' -Default 0)
+        foreach ($c in @(Get-ReviewerHashValue -Container $t -Key 'comments' -Default @())) {
+            $body = [string](Get-ReviewerHashValue -Container $c -Key 'content' -Default '')
+            if ($body.IndexOf($script:ReviewerSignatureFooter, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+            $fp = Get-ReviewerThreadReplyFingerprint -ThreadId $threadId -Content $body
+            if ($fp) { [void]$set.Add($fp) }
+        }
+    }
+    return $set
+}
+
+function Select-ReviewerEligibleThreadReplies {
+    param([object[]]$Replies, [object[]]$Targets)
+    $allowed = Get-ReviewerThreadAssessmentTargetSet -Targets $Targets
+    $selected = New-Object System.Collections.Generic.List[object]
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    foreach ($reply in @($Replies)) {
+        $key = "{0}:{1}" -f ([int](Get-ReviewerHashValue -Container $reply -Key 'threadId' -Default 0)),
+            ([int](Get-ReviewerHashValue -Container $reply -Key 'commentId' -Default 0))
+        if ($allowed.Contains($key) -and $seen.Add($key)) { [void]$selected.Add($reply) }
+    }
+    return , ($selected.ToArray())
 }
 
 function Get-ReviewerFindingFingerprint {
@@ -1647,7 +1902,7 @@ function Write-ReviewerCycleMetadata {
 
 function Write-ReviewerPreview {
     <#
-        Writes the candidate comments to a file and to the console. This is what
+        Writes candidate findings and thread assessments to a file and console. This is what
         makes the agent useful before anyone trusts it enough to let it post:
         the operator reads exactly the text that WOULD have been posted.
     #>
@@ -1659,6 +1914,8 @@ function Write-ReviewerPreview {
         [object[]]$Postable = @(),
         [object[]]$Withheld = @(),
         [object[]]$AllFindings = @(),
+        [object[]]$ThreadReplies = @(),
+        [object[]]$ThreadTargets = @(),
         [Parameter(Mandatory)][string]$RecommendedVote,
         # The validated marker, re-serialized beside the human-readable preview
         # so -PromotePreview can publish this exact review without a second
@@ -1714,6 +1971,20 @@ function Write-ReviewerPreview {
             [void]$lines.Add("")
         }
     }
+    [void]$lines.Add("## Human comment assessments ($(@($ThreadReplies).Count))")
+    [void]$lines.Add("")
+    if (@($ThreadReplies).Count -eq 0) {
+        [void]$lines.Add("(none)")
+        [void]$lines.Add("")
+    }
+    foreach ($reply in @($ThreadReplies)) {
+        $threadId = [int](Get-ReviewerHashValue -Container $reply -Key 'threadId' -Default 0)
+        $commentId = [int](Get-ReviewerHashValue -Container $reply -Key 'commentId' -Default 0)
+        [void]$lines.Add("### Thread $threadId, human comment $commentId")
+        [void]$lines.Add("")
+        [void]$lines.Add((Format-ReviewerThreadReply -Reply $reply))
+        [void]$lines.Add("")
+    }
     $text = ($lines.ToArray() -join "`n")
 
     $stamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
@@ -1722,7 +1993,7 @@ function Write-ReviewerPreview {
     Set-Content -LiteralPath $path -Value $text -Encoding UTF8
 
     # The artifact is the DELIVERY MANIFEST, not a copy of the model's output.
-    # It records the exact comments, summary and vote the operator is being
+    # It records the exact comments, thread replies, summary and vote the operator is being
     # shown, plus the hash of the Markdown they read, and it is sealed with a
     # per-user HMAC key that is not stored inside it. Promotion verifies the
     # seal and publishes only what the manifest lists: it may drop an entry that
@@ -1734,7 +2005,7 @@ function Write-ReviewerPreview {
         try {
             $artifactPath = Join-Path $previewDir "$baseName.json"
             $manifest = @{
-                artifactVersion  = 3
+                artifactVersion  = 4
                 organization     = $Organization
                 project          = $ExpectedProject
                 repositoryName   = $RepositoryName
@@ -1754,6 +2025,21 @@ function Write-ReviewerPreview {
                             filePath = [string](Get-ReviewerHashValue -Container $_ -Key 'filePath' -Default '')
                             line     = [int](Get-ReviewerHashValue -Container $_ -Key 'line' -Default 0)
                             comment  = [string](Get-ReviewerHashValue -Container $_ -Key 'comment' -Default '')
+                        }
+                    })
+                approvedThreadReplies = @(@($ThreadReplies) | ForEach-Object {
+                        @{
+                            threadId = [int](Get-ReviewerHashValue -Container $_ -Key 'threadId' -Default 0)
+                            commentId = [int](Get-ReviewerHashValue -Container $_ -Key 'commentId' -Default 0)
+                            disposition = [string](Get-ReviewerHashValue -Container $_ -Key 'disposition' -Default '')
+                            comment = [string](Get-ReviewerHashValue -Container $_ -Key 'comment' -Default '')
+                        }
+                    })
+                reviewedThreadTargets = @(@($ThreadTargets) | ForEach-Object {
+                        @{
+                            threadId = [int](Get-ReviewerHashValue -Container $_ -Key 'threadId' -Default 0)
+                            commentId = [int](Get-ReviewerHashValue -Container $_ -Key 'commentId' -Default 0)
+                            contentFingerprint = [string](Get-ReviewerHashValue -Container $_ -Key 'contentFingerprint' -Default '')
                         }
                     })
                 approvedSummary  = [string]$Summary
@@ -1788,7 +2074,10 @@ function Write-ReviewerPreview {
         Write-Host $text
         Write-Host "===== end preview; saved to $path =====" -ForegroundColor Magenta
         if ($artifactPath) {
-            Write-Host "Publish exactly this review with: -PromotePreview `"$artifactPath`" -EnableFindingComments" -ForegroundColor Cyan
+            $publishSwitches = New-Object System.Collections.Generic.List[string]
+            [void]$publishSwitches.Add("-EnableFindingComments")
+            if (@($ThreadReplies).Count -gt 0) { [void]$publishSwitches.Add("-EnableThreadReplies") }
+            Write-Host "Publish exactly this review with: -PromotePreview `"$artifactPath`" $($publishSwitches.ToArray() -join ' ')" -ForegroundColor Cyan
         }
     }
     Write-Host ""
@@ -1845,11 +2134,33 @@ function Add-ReviewerThread {
     }
 
     try {
-        Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request_thread" -RawText -Arguments $arguments | Out-Null
+        Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request_thread_write" -RawText -Arguments $arguments | Out-Null
         return @{ Attempted = $true; Error = $null; Anchored = $anchored }
     }
     catch {
         return @{ Attempted = $true; Error = $_.Exception.Message; Anchored = $anchored }
+    }
+}
+
+function Add-ReviewerThreadReply {
+    <# Replies only to the exact existing thread selected by the model. Success
+       is independently confirmed by the delivery path against a fingerprint
+       built from the thread id and rendered response body. #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)][int]$ThreadId,
+        [Parameter(Mandatory)][string]$Content
+    )
+    try {
+        Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request_thread_write" -RawText -Arguments @{
+            action = 'reply'; project = $ExpectedProject; repositoryId = $RepositoryName
+            pullRequestId = $PrId; threadId = $ThreadId; content = $Content
+        } | Out-Null
+        return @{ Attempted = $true; Error = $null }
+    }
+    catch {
+        return @{ Attempted = $true; Error = $_.Exception.Message }
     }
 }
 
@@ -2019,7 +2330,7 @@ function Invoke-DryRunSelfChecks {
     $schema = Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $nonce -MaxFindingItems 12
     $commit = ("a" * 40)
     $finding = '{"severity":"critical","filePath":"/src/A.cs","line":12,"comment":"The cache result is dereferenced without a miss check."}'
-    $mkBody = "{`"schemaVersion`":1,`"prId`":4242,`"repositoryId`":`"$cfgRepoId`",`"project`":`"$ExpectedProject`",`"reviewedSourceCommit`":`"$commit`",`"findings`":[$finding],`"recommendedVote`":`"waitForAuthor`",`"summary`":`"Adds a cache.`",`"nonce`":`"$nonce`"}"
+    $mkBody = "{`"schemaVersion`":1,`"prId`":4242,`"repositoryId`":`"$cfgRepoId`",`"project`":`"$ExpectedProject`",`"reviewedSourceCommit`":`"$commit`",`"findings`":[$finding],`"threadReplies`":[],`"recommendedVote`":`"waitForAuthor`",`"summary`":`"Adds a cache.`",`"nonce`":`"$nonce`"}"
     $validLine = "$ResultMarkerPrefix $mkBody"
     $mValid = ConvertFrom-AgentResultMarker -StdOutText "assistant chatter`n$validLine" -MarkerPrefix $ResultMarkerPrefix -Schema $schema
     if ($null -eq $mValid) { $failures.Add("A valid marker was rejected.") }
@@ -2045,11 +2356,26 @@ function Invoke-DryRunSelfChecks {
     Write-Host "[DRY-RUN] Self-check 8/$total : the findings array is bounded and hostile-input safe" -ForegroundColor Cyan
     $mkMarker = {
         param([string]$FindingsJson, [string]$Vote = "none")
-        "$ResultMarkerPrefix {`"schemaVersion`":1,`"prId`":4242,`"repositoryId`":`"$cfgRepoId`",`"project`":`"$ExpectedProject`",`"reviewedSourceCommit`":`"$commit`",`"findings`":[$FindingsJson],`"recommendedVote`":`"$Vote`",`"summary`":`"x`",`"nonce`":`"$nonce`"}"
+        "$ResultMarkerPrefix {`"schemaVersion`":1,`"prId`":4242,`"repositoryId`":`"$cfgRepoId`",`"project`":`"$ExpectedProject`",`"reviewedSourceCommit`":`"$commit`",`"findings`":[$FindingsJson],`"threadReplies`":[],`"recommendedVote`":`"$Vote`",`"summary`":`"x`",`"nonce`":`"$nonce`"}"
     }
     $overCap = & $mkMarker ((1..13 | ForEach-Object { $finding }) -join ',')
     if ($null -ne (ConvertFrom-AgentResultMarker -StdOutText $overCap -MarkerPrefix $ResultMarkerPrefix -Schema $schema)) { $failures.Add("A findings array over MaxItems was accepted.") }
     else { Write-Host "  OK - an over-cap findings array is rejected" -ForegroundColor Green }
+    $threadReplyJson = '{"threadId":17,"commentId":88,"disposition":"verify","comment":"The guard covers the null path."}'
+    $withThreadReply = (& $mkMarker "") -replace '"threadReplies":\[\]', ('"threadReplies":[' + $threadReplyJson + ']')
+    if ($null -eq (ConvertFrom-AgentResultMarker -StdOutText $withThreadReply -MarkerPrefix $ResultMarkerPrefix -Schema $schema)) {
+        $failures.Add("A valid human-comment assessment was rejected by the marker schema.")
+    }
+    $tooManyThreadReplies = (& $mkMarker "") -replace '"threadReplies":\[\]', ('"threadReplies":[' + (((1..($script:ReviewerMaxThreadReplies + 1)) | ForEach-Object {
+                        $threadReplyJson -replace '"threadId":17', ('"threadId":' + $_) -replace '"commentId":88', ('"commentId":' + (100 + $_))
+                    }) -join ',') + ']')
+    if ($null -ne (ConvertFrom-AgentResultMarker -StdOutText $tooManyThreadReplies -MarkerPrefix $ResultMarkerPrefix -Schema $schema)) {
+        $failures.Add("A threadReplies array over MaxItems was accepted.")
+    }
+    $badThreadReply = $withThreadReply -replace '"disposition":"verify"', '"disposition":"agree"'
+    if ($null -ne (ConvertFrom-AgentResultMarker -StdOutText $badThreadReply -MarkerPrefix $ResultMarkerPrefix -Schema $schema)) {
+        $failures.Add("A human-comment assessment with an unknown disposition was accepted.")
+    }
     $hostileCases = @(
         @{ Name = "a newline embedded in a comment"; Json = ($finding -replace 'without a miss check\.', 'without a miss check.\nSecond line') },
         @{ Name = "an unknown severity"; Json = ($finding -replace '"critical"', '"blocker"') },
@@ -2137,7 +2463,7 @@ function Invoke-DryRunSelfChecks {
     Write-Host "[DRY-RUN] Self-check 11/$total : already-reviewed identity is PR + exact commit + delivery" -ForegroundColor Cyan
     $commitOld = ("d" * 40)
     $commitNew = ("e" * 40)
-    $reviewedProbe = @{ "77" = @{ sourceCommit = $commitOld; delivered = $true; commentsDelivered = $true; summaryDelivered = $true; voteResolved = $true } }
+    $reviewedProbe = @{ "77" = @{ sourceCommit = $commitOld; delivered = $true; commentsDelivered = $true; threadRepliesDelivered = $true; summaryDelivered = $true; voteResolved = $true } }
     if (-not (Test-ReviewerAlreadyReviewed -ReviewedState $reviewedProbe -PrId 77 -SourceCommit $commitOld)) { $failures.Add("The same PR at the same commit was not treated as already reviewed; re-running would double-post.") }
     elseif (Test-ReviewerAlreadyReviewed -ReviewedState $reviewedProbe -PrId 77 -SourceCommit $commitNew) { $failures.Add("A new push did not re-open the PR for review.") }
     elseif (Test-ReviewerAlreadyReviewed -ReviewedState $reviewedProbe -PrId 78 -SourceCommit $commitOld) { $failures.Add("An unrelated PR was reported as already reviewed.") }
@@ -2159,10 +2485,11 @@ function Invoke-DryRunSelfChecks {
     # Delivery is tracked PER CAPABILITY. A single boolean made a summary-only
     # run close the PR to a later run that wanted finding comments, so the
     # comments could never be posted at that commit.
-    $summaryOnlyRecord = @{ "77" = @{ sourceCommit = $commitOld; delivered = $true; commentsDelivered = $false; summaryDelivered = $true; voteResolved = $false } }
+    $summaryOnlyRecord = @{ "77" = @{ sourceCommit = $commitOld; delivered = $true; commentsDelivered = $false; threadRepliesDelivered = $false; summaryDelivered = $true; voteResolved = $false } }
     $capabilityCases = @(
         @{ Name = 'summary again after a summary-only run'; Want = @{ WantSummary = $true }; Expected = $true }
         @{ Name = 'comments after a summary-only run'; Want = @{ WantComments = $true }; Expected = $false }
+        @{ Name = 'thread replies after a summary-only run'; Want = @{ WantThreadReplies = $true }; Expected = $false }
         @{ Name = 'a vote after a summary-only run'; Want = @{ WantVote = $true }; Expected = $false }
         @{ Name = 'comments and summary after a summary-only run'; Want = @{ WantComments = $true; WantSummary = $true }; Expected = $false }
     )
@@ -2174,13 +2501,74 @@ function Invoke-DryRunSelfChecks {
             $capabilityFailures++
         }
     }
+    $threadReplyRecord = @{ "77" = @{
+            sourceCommit = $commitOld
+            delivered = $true
+            threadRepliesDelivered = $true
+            reviewedThreadTargetKeys = @('4:41:samefingerprint')
+            resolvedThreadReplyTargetKeys = @('4:41:samefingerprint')
+        } }
+    if (-not (Test-ReviewerAlreadyReviewed -ReviewedState $threadReplyRecord -PrId 77 -SourceCommit $commitOld `
+                -WritesRequested $true -WantThreadReplies $true -ThreadTargetsKnown $true `
+                -CurrentThreadReplyTargets @(@{ threadId = 4; commentId = 41; contentFingerprint = 'samefingerprint' }))) {
+        $failures.Add("An unchanged human comment was not recognized as already reviewed.")
+        $capabilityFailures++
+    }
+    elseif (Test-ReviewerAlreadyReviewed -ReviewedState $threadReplyRecord -PrId 77 -SourceCommit $commitOld `
+            -WritesRequested $true -WantThreadReplies $true -ThreadTargetsKnown $true `
+            -CurrentThreadReplyTargets @(@{ threadId = 4; commentId = 42 })) {
+        $failures.Add("A new human response at the same source commit did not reopen thread assessment.")
+        $capabilityFailures++
+    }
+    elseif (Test-ReviewerAlreadyReviewed -ReviewedState $threadReplyRecord -PrId 77 -SourceCommit $commitOld `
+            -WritesRequested $false -ThreadTargetsKnown $true `
+            -CurrentThreadReplyTargets @(@{ threadId = 4; commentId = 42 })) {
+        $failures.Add("A preview-only review ignored a new human response at the same source commit.")
+        $capabilityFailures++
+    }
+    $editedCommentRecord = @{ "77" = @{
+            sourceCommit = $commitOld
+            delivered = $true
+            threadRepliesDelivered = $true
+            reviewedThreadTargetKeys = @('4:41:oldfingerprint')
+        } }
+    if (Test-ReviewerAlreadyReviewed -ReviewedState $editedCommentRecord -PrId 77 -SourceCommit $commitOld `
+            -WritesRequested $false -ThreadTargetsKnown $true `
+            -CurrentThreadReplyTargets @(@{ threadId = 4; commentId = 41; contentFingerprint = 'newfingerprint' })) {
+        $failures.Add("An edited human comment with the same comment id did not reopen review.")
+        $capabilityFailures++
+    }
+    $batchedReplyRecord = @{ "77" = @{
+            sourceCommit = $commitOld
+            delivered = $true
+            threadRepliesDelivered = $true
+            reviewedThreadTargetKeys = @('4:41:a', '5:51:b')
+            resolvedThreadReplyTargetKeys = @('4:41:a')
+        } }
+    $batchedTargets = @(
+        @{ threadId = 4; commentId = 41; contentFingerprint = 'a' },
+        @{ threadId = 5; commentId = 51; contentFingerprint = 'b' }
+    )
+    if (Test-ReviewerAlreadyReviewed -ReviewedState $batchedReplyRecord -PrId 77 -SourceCommit $commitOld `
+            -WritesRequested $true -WantThreadReplies $true -ThreadTargetsKnown $true `
+            -CurrentThreadReplyTargets $batchedTargets) {
+        $failures.Add("A completed first reply batch suppressed a later unresolved target.")
+        $capabilityFailures++
+    }
+    $batchedReplyRecord["77"].resolvedThreadReplyTargetKeys = @('4:41:a', '5:51:b')
+    if (-not (Test-ReviewerAlreadyReviewed -ReviewedState $batchedReplyRecord -PrId 77 -SourceCommit $commitOld `
+                -WritesRequested $true -WantThreadReplies $true -ThreadTargetsKnown $true `
+                -CurrentThreadReplyTargets $batchedTargets)) {
+        $failures.Add("A fully resolved set of reply targets did not close the reply capability.")
+        $capabilityFailures++
+    }
     # A record written before per-capability tracking existed carries only
     # 'delivered', which the old code set when whichever switches THAT run had
     # enabled succeeded - not when both capabilities did. So it proves nothing
     # about any single capability and must suppress none of them; otherwise a
     # legacy summary-only run silently blocks finding comments forever.
     $legacyRecord = @{ "77" = @{ sourceCommit = $commitOld; delivered = $true } }
-    foreach ($want in @(@{ WantComments = $true }, @{ WantSummary = $true }, @{ WantVote = $true })) {
+    foreach ($want in @(@{ WantComments = $true }, @{ WantThreadReplies = $true }, @{ WantSummary = $true }, @{ WantVote = $true })) {
         $splat = @{ ReviewedState = $legacyRecord; PrId = 77; SourceCommit = $commitOld; WritesRequested = $true } + $want
         if (Test-ReviewerAlreadyReviewed @splat) {
             $failures.Add("A legacy delivered record suppressed '$($want.Keys -join ',')', which it cannot prove was ever delivered.")
@@ -2350,16 +2738,31 @@ function Invoke-DryRunSelfChecks {
                 $planFailures++
             }
         }
+        $retentionCases = @(
+            @{ Name = 'a transient pre-write read failure'; Writes = $true; Pending = @('comments'); Path = $planPath; Terminal = $false; Expect = $true }
+            @{ Name = 'a terminal PR state change'; Writes = $true; Pending = @('comments'); Path = $planPath; Terminal = $true; Expect = $false }
+            @{ Name = 'a fully delivered plan'; Writes = $true; Pending = @(); Path = $planPath; Terminal = $false; Expect = $false }
+            @{ Name = 'a preview'; Writes = $false; Pending = @('comments'); Path = $planPath; Terminal = $false; Expect = $false }
+        )
+        foreach ($case in $retentionCases) {
+            $got = Test-ReviewerShouldKeepPendingPlan -WritesRequested $case.Writes `
+                -UnresolvedCapabilities $case.Pending -ArtifactPath $case.Path -TerminalAbort $case.Terminal
+            if ([bool]$got -ne [bool]$case.Expect) {
+                $failures.Add("Pending-plan retention is wrong for '$($case.Name)': expected $($case.Expect), got $got.")
+                $planFailures++
+            }
+        }
         if ($planFailures -eq 0) { Write-Host "  OK - only an unfinished attempted delivery is retried, and only from its own artifact" -ForegroundColor Green }
         # A plan stays open until everything IT owes has landed. A run with
         # different switches must not close it by succeeding at its own subset.
         $maskCases = @(
-            @{ Name = 'a comments plan promoted by a summary-only run'; Plan = @('comments', 'summary'); C = $false; S = $true; V = $false; Expect = @('comments') }
-            @{ Name = 'everything the plan owed has landed'; Plan = @('comments', 'summary'); C = $true; S = $true; V = $false; Expect = @() }
-            @{ Name = 'a capability outside the plan does not reopen it'; Plan = @('summary'); C = $false; S = $true; V = $false; Expect = @() }
+            @{ Name = 'a comments plan promoted by a summary-only run'; Plan = @('comments', 'summary'); C = $false; T = $false; S = $true; V = $false; Expect = @('comments') }
+            @{ Name = 'thread replies remain independently pending'; Plan = @('comments', 'threadReplies'); C = $true; T = $false; S = $false; V = $false; Expect = @('threadReplies') }
+            @{ Name = 'everything the plan owed has landed'; Plan = @('comments', 'threadReplies', 'summary'); C = $true; T = $true; S = $true; V = $false; Expect = @() }
+            @{ Name = 'a capability outside the plan does not reopen it'; Plan = @('summary'); C = $false; T = $false; S = $true; V = $false; Expect = @() }
         )
         foreach ($case in $maskCases) {
-            $got = Get-ReviewerUnresolvedCapabilities -Requested ([string[]]$case.Plan) -CommentsDelivered $case.C -SummaryDelivered $case.S -VoteResolved $case.V
+            $got = Get-ReviewerUnresolvedCapabilities -Requested ([string[]]$case.Plan) -CommentsDelivered $case.C -ThreadRepliesDelivered $case.T -SummaryDelivered $case.S -VoteResolved $case.V
             if ((@($got) -join ',') -cne (@($case.Expect) -join ',')) {
                 $failures.Add("Plan capability tracking is wrong for '$($case.Name)': expected '$(@($case.Expect) -join ',')', got '$(@($got) -join ',')'.")
                 $planFailures++
@@ -2440,6 +2843,27 @@ function Invoke-DryRunSelfChecks {
         $failures.Add("A thread at one anchor matched a finding at a different anchor.")
     }
     else { Write-Host "  OK - existing threads are matched at their own anchor, not by text alone" -ForegroundColor Green }
+    $threadReply = @{ threadId = 17; commentId = 88; disposition = 'refute'; comment = 'The null branch still reaches the dereference.' }
+    $threadReplyBody = Format-ReviewerThreadReply -Reply $threadReply
+    if ($threadReplyBody -cnotmatch 'Reviewer agent assessment - Refute' -or -not $threadReplyBody.EndsWith($script:ReviewerSignatureFooter)) {
+        $failures.Add("A human-comment assessment is not visibly classified or signed as automated.")
+    }
+    $threadReplyFp = Get-ReviewerThreadReplyFingerprint -ThreadId 17 -Content $threadReplyBody
+    $threadReplyExisting = Get-ReviewerExistingThreadReplyFingerprints -Threads @(@{
+            threadId = 17
+            comments = @(@{ content = $threadReplyBody })
+        })
+    if (-not $threadReplyExisting.Contains($threadReplyFp)) {
+        $failures.Add("An existing thread assessment was not recognized in its original thread.")
+    }
+    elseif ($threadReplyExisting.Contains((Get-ReviewerThreadReplyFingerprint -ThreadId 18 -Content $threadReplyBody))) {
+        $failures.Add("A thread assessment fingerprint matched the same text in a different thread.")
+    }
+    $laterThreadReply = @{} + $threadReply
+    $laterThreadReply.commentId = 89
+    if ((Get-ReviewerThreadReplyFingerprint -ThreadId 17 -Content (Format-ReviewerThreadReply -Reply $laterThreadReply)) -ceq $threadReplyFp) {
+        $failures.Add("The same assessment text for a newer human comment in the same thread was deduplicated against the old response.")
+    }
     $summaryBody = Format-ReviewerSummaryComment -Summary "Adds a cache." -Counts $counts -Reported 4 -Publishable 2
     if ($summaryBody -cnotmatch [regex]::Escape($script:ReviewerSummaryHeading)) { $failures.Add("The summary comment lost its heading.") }
     elseif ($summaryBody -cnotmatch '2 of 4 finding') { $failures.Add("The summary does not disclose that findings were withheld.") }
@@ -2552,15 +2976,71 @@ function Invoke-DryRunSelfChecks {
     Write-Host "[DRY-RUN] Self-check 16/$total : the prompt receives metadata only, never comment text" -ForegroundColor Cyan
     $secret = "ThisExactSentenceMustNeverReachTheModel"
     $digestThreads = @(
-        @{ threadId = 1; status = 'active'; filePath = '/a.cs'; line = 4; comments = @(@{ authorDisplayName = 'A Human'; authorUniqueName = 'human@example.test'; content = $secret }) },
-        @{ threadId = 2; status = 'closed'; filePath = ''; line = 0; comments = @(@{ authorDisplayName = 'Build Bot'; authorUniqueName = 'bot@example.test'; content = 'build succeeded' }) },
-        @{ threadId = 3; status = 'active'; filePath = ''; line = 0; comments = @(@{ authorDisplayName = 'Automated Policy Service'; authorUniqueName = 'system'; content = 'policy evaluated' }) }
+        @{ threadId = 1; status = 'active'; filePath = '/a.cs'; line = 4; comments = @(@{ commentId = 11; authorDisplayName = 'A Human'; authorUniqueName = 'human@example.test'; content = $secret }) },
+        @{ threadId = 2; status = 'closed'; filePath = ''; line = 0; comments = @(@{ commentId = 21; authorDisplayName = 'Build Bot'; authorUniqueName = 'bot@example.test'; content = 'build succeeded' }) },
+        @{ threadId = 3; status = 'active'; filePath = ''; line = 0; comments = @(@{ commentId = 31; authorDisplayName = 'Automated Policy Service'; authorUniqueName = 'system'; content = 'policy evaluated' }) },
+        @{ threadId = 4; status = 'active'; filePath = '/b.cs'; line = 8; comments = @(
+                @{ commentId = 41; authorDisplayName = 'A Human'; authorUniqueName = 'human@example.test'; content = 'Please verify this.' },
+                @{ commentId = 42; authorDisplayName = 'Operator'; authorUniqueName = 'operator@example.test'; content = "**[IMPORTANT]** Already assessed.`n`n$script:ReviewerSignatureFooter" }
+            ) },
+        @{ threadId = 5; status = 'active'; filePath = '/c.cs'; line = 9; comments = @(
+                @{ commentId = 51; authorDisplayName = 'Operator'; authorUniqueName = 'operator@example.test'; content = "**[IMPORTANT]** Initial finding.`n`n$script:ReviewerSignatureFooter" },
+                @{ commentId = 52; authorDisplayName = 'A Human'; authorUniqueName = 'human@example.test'; content = 'I think the guard handles it.' }
+            ) },
+        @{ threadId = 6; status = 'active'; filePath = ''; line = 0; comments = @(
+                @{ commentId = 61; authorDisplayName = 'A Human-looking Identity'; authorUniqueName = 'service@example.test'; content = 'system transition'; commentType = 'system' }
+            ) },
+        @{ threadId = 7; status = 'active'; filePath = ''; line = 0; comments = @(
+                @{ commentId = 71; authorDisplayName = 'A Human'; authorUniqueName = 'human@example.test'; content = 'deleted text'; isDeleted = $true }
+            ) },
+        @{ threadId = 8; status = 'pending'; filePath = ''; line = 0; comments = @(
+                @{ commentId = 81; authorDisplayName = 'A Human'; authorUniqueName = 'human@example.test'; content = 'Pending is not active.' }
+            ) }
     )
     $digest = Build-ReviewerThreadDigest -Threads $digestThreads -BotSubstrings @('Build Bot') -SystemSubstrings @('Automated Policy Service')
     if ($digest.Text.Contains($secret)) { $failures.Add("The thread digest leaked raw comment text.") }
     elseif ($digest.Text -cnotmatch 'threadId=1') { $failures.Add("The digest dropped a thread with human comments.") }
     elseif ($digest.Text -cmatch 'threadId=3') { $failures.Add("The digest included a thread that only a system identity wrote in.") }
+    elseif ($digest.Text -cmatch 'threadId=6|threadId=7') { $failures.Add("The digest treated an ADO system or deleted comment as human review input.") }
+    elseif ($digest.Text -notmatch 'threadId=4.*eligibleForAssessment=false') { $failures.Add("A thread whose latest relevant comment is from the agent was marked eligible for assessment.") }
+    elseif ($digest.Text -notmatch 'threadId=8.*eligibleForAssessment=false') { $failures.Add("A non-active thread was marked eligible for assessment.") }
+    elseif ($digest.Text -notmatch 'threadId=5.*latestCommentId=52.*eligibleForAssessment=true') { $failures.Add("A human response after an agent comment was not marked eligible for assessment.") }
     else { Write-Host "  OK - the digest is metadata only; bot- and system-only threads are excluded" -ForegroundColor Green }
+    $targetSet = Get-ReviewerThreadAssessmentTargetSet -Targets $digest.AssessmentTargets
+    if (-not $targetSet.Contains('1:11') -or -not $targetSet.Contains('5:52') -or
+        $targetSet.Contains('4:42') -or $targetSet.Contains('8:81')) {
+        $failures.Add("Human-comment assessment targets did not preserve active human comments while excluding agent responses and non-active threads.")
+    }
+    $validReplies = @(@{ threadId = 1; commentId = 11; disposition = 'verify'; comment = 'The guard covers this path.' })
+    if (-not (Test-ReviewerThreadRepliesBound -Replies $validReplies -TargetSet $targetSet)) {
+        $failures.Add("A reply bound to an eligible human comment was rejected.")
+    }
+    elseif (Test-ReviewerThreadRepliesBound -Replies @(@{ threadId = 4; commentId = 42; disposition = 'support'; comment = 'No.' }) -TargetSet $targetSet) {
+        $failures.Add("A reply targeting an agent response was accepted.")
+    }
+    $manyHumanThreads = @(1..($script:ReviewerMaxThreadReplies + 1) | ForEach-Object {
+            @{ threadId = (100 + $_); status = 'active'; filePath = ''; line = 0; comments = @(
+                    @{ commentId = (1000 + $_); authorDisplayName = 'A Human'; authorUniqueName = 'human@example.test'; content = "Comment $_" }
+                ) }
+        })
+    $manyDigest = Build-ReviewerThreadDigest -Threads $manyHumanThreads
+    if (@($manyDigest.AssessmentTargets).Count -ne $script:ReviewerMaxThreadReplies -or
+        @($manyDigest.AllAssessmentTargets).Count -ne ($script:ReviewerMaxThreadReplies + 1)) {
+        $failures.Add("The assessment cap did not preserve the full target identity needed to schedule later batches.")
+    }
+    $nextDigest = Build-ReviewerThreadDigest -Threads $manyHumanThreads `
+        -ReviewedTargetKeys (Get-ReviewerThreadAssessmentTargetKeys -Targets $manyDigest.AssessmentTargets)
+    if (@($nextDigest.AssessmentTargets).Count -ne 1 -or
+        [int](Get-ReviewerHashValue -Container @($nextDigest.AssessmentTargets)[0] -Key 'threadId' -Default 0) -ne
+            (100 + $script:ReviewerMaxThreadReplies + 1)) {
+        $failures.Add("A later assessment batch did not advance past the targets already shown to the model.")
+    }
+    $mergedBatchKeys = Merge-ReviewerThreadAssessmentTargetKeys `
+        -PriorKeys (Get-ReviewerThreadAssessmentTargetKeys -Targets $manyDigest.AssessmentTargets) `
+        -CurrentTargets $nextDigest.AssessmentTargets
+    if (@($mergedBatchKeys).Count -ne ($script:ReviewerMaxThreadReplies + 1)) {
+        $failures.Add("Assessment state did not preserve earlier batches while adding the next one.")
+    }
     $context = Get-ReviewerRuntimeContext -Nonce "selfchecknonce" -PrId 4242 -RepositoryId $cfgRepoId -SourceCommit $commit `
         -SourceBranch "feature/x" -AuthorAlias "colleague" -ThreadDigestText $digest.Text
     if ($context.Contains($secret)) { $failures.Add("The runtime context leaked raw comment text into the prompt.") }
@@ -2608,11 +3088,24 @@ function Invoke-DryRunSelfChecks {
     # is found by IndexOf before the real declaration is, so a source-scanning
     # check written the obvious way silently inspects ITSELF and passes.
     $declOf = { param([string]$Name) $selfText.IndexOf(('func' + 'tion ' + $Name), [StringComparison]::Ordinal) }
-    foreach ($fn in @('Add-ReviewerThread', 'Set-ReviewerVote')) {
-        $at = & $declOf $fn
-        if ($at -lt 0) { $failures.Add("Could not locate '$fn' to check its write-confirmation strategy."); continue }
-        $slice = $selfText.Substring($at, [Math]::Min(3000, $selfText.Length - $at))
+    $sourceOf = {
+        param([string]$Name)
+        $at = & $declOf $Name
+        if ($at -lt 0) { return $null }
+        $next = $selfText.IndexOf("`nfunction ", $at + 1, [StringComparison]::Ordinal)
+        if ($next -lt 0) { $next = $selfText.Length }
+        return $selfText.Substring($at, $next - $at)
+    }
+    foreach ($fn in @('Add-ReviewerThread', 'Add-ReviewerThreadReply', 'Set-ReviewerVote')) {
+        $slice = & $sourceOf $fn
+        if ($null -eq $slice) { $failures.Add("Could not locate '$fn' to check its write-confirmation strategy."); continue }
         if ($slice -cnotmatch '-RawText') { $failures.Add("'$fn' does not read the ADO write reply as raw text.") }
+    }
+    foreach ($fn in @('Add-ReviewerThread', 'Add-ReviewerThreadReply')) {
+        $slice = & $sourceOf $fn
+        if ($null -ne $slice -and $slice -cnotmatch '-Name\s+"repo_pull_request_thread_write"') {
+            $failures.Add("'$fn' does not use the ADO thread write tool; the read-only thread tool cannot create or reply.")
+        }
     }
     $voteAt = & $declOf 'Set-ReviewerVote'
     if ($voteAt -lt 0 -or ($selfText.Substring($voteAt, [Math]::Min(3000, $selfText.Length - $voteAt)) -cnotmatch "action\s*=\s*'get'")) {
@@ -2693,14 +3186,15 @@ function Invoke-DryRunSelfChecks {
     # "Is this a preview?" must consider every write switch, or a summary-only
     # run tells the operator nothing will be posted and then posts.
     $modeCases = @(
-        @{ C = $false; S = $false; V = $false; Expect = $false },
-        @{ C = $true; S = $false; V = $false; Expect = $true },
-        @{ C = $false; S = $true; V = $false; Expect = $true },
-        @{ C = $false; S = $false; V = $true; Expect = $true }
+        @{ C = $false; T = $false; S = $false; V = $false; Expect = $false },
+        @{ C = $true; T = $false; S = $false; V = $false; Expect = $true },
+        @{ C = $false; T = $true; S = $false; V = $false; Expect = $true },
+        @{ C = $false; T = $false; S = $true; V = $false; Expect = $true },
+        @{ C = $false; T = $false; S = $false; V = $true; Expect = $true }
     )
     $modeOk = $true
     foreach ($m in $modeCases) {
-        if ((Get-ReviewerWritesRequested -Comments $m.C -Summary $m.S -Vote $m.V) -ne $m.Expect) { $modeOk = $false }
+        if ((Get-ReviewerWritesRequested -Comments $m.C -ThreadReplies $m.T -Summary $m.S -Vote $m.V) -ne $m.Expect) { $modeOk = $false }
     }
     if (-not $modeOk) { $failures.Add("Write-mode detection ignores at least one write switch, so a write-capable run can report itself as a preview.") }
     else { Write-Host "  OK - any single write switch makes the run a posting run" -ForegroundColor Green }
@@ -2766,6 +3260,22 @@ function Invoke-DryRunSelfChecks {
         $failures.Add("An exact 100-record boundary required $($boundaryOffsets.Count) request(s) and returned $(@($boundary).Count); expected an empty second page and 100 records.")
     }
     else { Write-Host "  OK - empty and exact-page-boundary ADO listings terminate correctly" -ForegroundColor Green }
+
+    $threadOffsets = New-Object System.Collections.Generic.List[int]
+    $pagedThreads = Get-ReviewerPullRequestThreads -Session @{} -PrId 77 -PageSize 2 -PageInvoker {
+        param($arguments)
+        [void]$threadOffsets.Add([int]$arguments.skip)
+        switch ([int]$arguments.skip) {
+            0 { return @(@{ id = 1; comments = @() }, @{ id = 2; comments = @() }) }
+            2 { return @(@{ id = 2; comments = @() }, @{ id = 3; comments = @() }) }
+            4 { return @(@{ id = 4; comments = @() }) }
+            default { return @() }
+        }
+    }
+    if (@($pagedThreads).Count -ne 4 -or ($threadOffsets.ToArray() -join ',') -cne '0,2,4') {
+        $failures.Add("ADO thread pagination returned $(@($pagedThreads).Count) unique thread(s) at offsets '$($threadOffsets.ToArray() -join ',')'; expected 4 at 0,2,4.")
+    }
+    else { Write-Host "  OK - ADO thread listing pages through every thread and deduplicates moving records" -ForegroundColor Green }
 
     $limitRejected = $false
     try {
@@ -2872,12 +3382,14 @@ function Invoke-DryRunSelfChecks {
         # deserialized copy canonicalized differently from the original. Signing
         # the stored TEXT removes the class of problem; this check proves it.
         $sealManifest = @{
-            artifactVersion  = 3
+            artifactVersion  = 4
             createdAt        = ([DateTime]::UtcNow.ToString("o"))
             prId             = 77
             scriptSha256     = 'deadbeefcafe'
             approvedSummary  = 'Looks fine.'
             approvedComments = @(@{ severity = 'critical'; filePath = '/a.cs'; line = 3; comment = 'Boom.' })
+            approvedThreadReplies = @()
+            reviewedThreadTargets = @()
         }
         $sealJson = Get-ReviewerCanonicalJson -Value $sealManifest
         $sealArtifactPath = Join-Path $sealDir "probe.json"
@@ -2987,16 +3499,39 @@ function Invoke-DryRunSelfChecks {
 # ---------------------------------------------------------------------------
 
 function Get-ReviewerPullRequestThreads {
-    <# Normalized threads for one PR, fetched once and reused for both the
-       prompt digest and the posting-idempotency fingerprints. #>
-    param([Parameter(Mandatory)][hashtable]$Session, [Parameter(Mandatory)][int]$PrId)
-    $raw = Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request_thread" -Arguments @{
-        action = 'list'; project = $ExpectedProject; repositoryId = $RepositoryName
-        pullRequestId = $PrId; top = 200
-    }
+    <# Normalized threads for one PR. ADO exposes top/skip pagination; returning
+       only the first page would hide human comments and duplicate fingerprints
+       from every assessment, reopening, and delivery check. #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)][int]$PrId,
+        [ValidateRange(1, 200)][int]$PageSize = 100,
+        [ValidateRange(1, 100)][int]$MaxPages = 20,
+        [scriptblock]$PageInvoker
+    )
     $normalized = New-Object System.Collections.Generic.List[object]
-    foreach ($rt in @($raw)) { if ($rt) { $normalized.Add((ConvertTo-ReviewerThread -RawThread $rt)) } }
-    return , ($normalized.ToArray())
+    $seen = New-Object 'System.Collections.Generic.HashSet[int]'
+    for ($pageNumber = 0; $pageNumber -lt $MaxPages; $pageNumber++) {
+        $arguments = @{
+            action = 'list'; project = $ExpectedProject; repositoryId = $RepositoryName
+            pullRequestId = $PrId; top = $PageSize; skip = ($pageNumber * $PageSize)
+        }
+        $raw = @(
+            if ($PageInvoker) { & $PageInvoker $arguments }
+            else { Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request_thread" -Arguments $arguments }
+        )
+        if ($raw.Count -gt $PageSize) {
+            throw "ADO returned $($raw.Count) pull-request threads for a page capped at $PageSize."
+        }
+        foreach ($rt in $raw) {
+            if ($null -eq $rt) { throw "ADO returned a null pull-request thread at offset $($pageNumber * $PageSize)." }
+            $threadId = [int](Get-ReviewerHashValue -Container $rt -Key 'id' -Default 0)
+            if ($threadId -le 0) { throw "ADO returned a pull-request thread with an invalid id at offset $($pageNumber * $PageSize)." }
+            if ($seen.Add($threadId)) { [void]$normalized.Add((ConvertTo-ReviewerThread -RawThread $rt)) }
+        }
+        if ($raw.Count -lt $PageSize) { return , ($normalized.ToArray()) }
+    }
+    throw "ADO pull-request thread listing filled all $MaxPages page(s) of $PageSize; refusing to use a silently truncated thread set."
 }
 
 function Get-ReviewerChangePathsFromResponse {
@@ -3077,7 +3612,7 @@ function Test-ReviewerDeliveryStillValid {
         are published to more people than a vote is, so they get the same check.
 
         Fails closed: an unreadable PR blocks delivery.
-        Returns @{ Ok = <bool>; Reason = <string>; Pr = <object> }.
+        Returns @{ Ok = <bool>; Terminal = <bool>; Reason = <string>; Pr = <object> }.
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Session,
@@ -3090,20 +3625,20 @@ function Test-ReviewerDeliveryStillValid {
             action = 'get'; project = $ExpectedProject; repositoryId = $RepositoryName; pullRequestId = $PrId
         }
     }
-    catch { return @{ Ok = $false; Reason = "the PR could not be re-read before publishing: $($_.Exception.Message)"; Pr = $null } }
-    if (-not $fresh) { return @{ Ok = $false; Reason = "the PR could not be re-read before publishing"; Pr = $null } }
+    catch { return @{ Ok = $false; Terminal = $false; Reason = "the PR could not be re-read before publishing: $($_.Exception.Message)"; Pr = $null } }
+    if (-not $fresh) { return @{ Ok = $false; Terminal = $false; Reason = "the PR could not be re-read before publishing"; Pr = $null } }
 
     $status = [string](Get-ReviewerHashValue -Container $fresh -Key 'status' -Default '')
-    if ($status -ine 'active') { return @{ Ok = $false; Reason = "the PR is no longer active (status='$status')"; Pr = $fresh } }
+    if ($status -ine 'active') { return @{ Ok = $false; Terminal = $true; Reason = "the PR is no longer active (status='$status')"; Pr = $fresh } }
     if ([bool](Get-ReviewerHashValue -Container $fresh -Key 'isDraft' -Default $false)) {
-        return @{ Ok = $false; Reason = "the PR became a draft while it was being reviewed"; Pr = $fresh }
+        return @{ Ok = $false; Terminal = $true; Reason = "the PR became a draft while it was being reviewed"; Pr = $fresh }
     }
     $current = Get-ReviewerSourceCommit -Pr $fresh
-    if (-not $current) { return @{ Ok = $false; Reason = "the PR no longer reports a usable source commit"; Pr = $fresh } }
+    if (-not $current) { return @{ Ok = $false; Terminal = $false; Reason = "the PR no longer reports a usable source commit"; Pr = $fresh } }
     if ($current -ine $ExpectedSourceCommit) {
-        return @{ Ok = $false; Reason = "the author pushed while the review was running ($($ExpectedSourceCommit.Substring(0,12)) -> $($current.Substring(0,12)))"; Pr = $fresh }
+        return @{ Ok = $false; Terminal = $true; Reason = "the author pushed while the review was running ($($ExpectedSourceCommit.Substring(0,12)) -> $($current.Substring(0,12)))"; Pr = $fresh }
     }
-    return @{ Ok = $true; Reason = "the PR is unchanged since the reviewed commit"; Pr = $fresh }
+    return @{ Ok = $true; Terminal = $false; Reason = "the PR is unchanged since the reviewed commit"; Pr = $fresh }
 }
 
 function Invoke-ReviewerDelivery {
@@ -3112,9 +3647,11 @@ function Invoke-ReviewerDelivery {
         path and the -PromotePreview path publish through identical code and
         identical guards.
 
-        Returns @{ PostedCount; PostFailures; SummaryPosted; CastVote;
-                   CommentsDelivered; SummaryDelivered; VoteResolved;
-                   Delivered; Aborted; Reason }.
+        Returns @{ PostedCount; PostFailures; ThreadRepliesPosted;
+                   ThreadReplyFailures; SummaryPosted; CastVote;
+                   CommentsDelivered; ThreadRepliesDelivered;
+                   SummaryDelivered; VoteResolved; Delivered; Aborted;
+                   TerminalAbort; Reason }.
 
         "Delivered" means every write this run was asked to perform was
         independently confirmed. It gates the reviewed-state record, so a
@@ -3129,6 +3666,8 @@ function Invoke-ReviewerDelivery {
         [Parameter(Mandatory)][int]$PrId,
         [Parameter(Mandatory)][string]$SourceCommit,
         [object[]]$Postable = @(),
+        [object[]]$ThreadReplies = @(),
+        [object[]]$ThreadTargets = @(),
         [Parameter(Mandatory)][AllowEmptyString()][string]$SummaryText,
         [Parameter(Mandatory)][hashtable]$Counts,
         [int]$ReportedFindingCount = 0,
@@ -3152,28 +3691,34 @@ function Invoke-ReviewerDelivery {
         [int]$SealedPublishableCount = -1
     )
     $outcome = @{
-        PostedCount = 0; PostFailures = 0; SummaryPosted = $false
-        CastVote = ""; CommentsDelivered = $false; SummaryDelivered = $false; VoteResolved = $false
-        Delivered = $false; Aborted = $false; Reason = ""
+        PostedCount = 0; PostFailures = 0; ThreadRepliesPosted = 0; ThreadReplyFailures = 0
+        SummaryPosted = $false; CastVote = ""; CommentsDelivered = $false
+        ThreadRepliesDelivered = $false; SummaryDelivered = $false; VoteResolved = $false
+        Delivered = $false; Aborted = $false; TerminalAbort = $false; Reason = ""
     }
-    if (-not (Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote))) {
+    if (-not (Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) -ThreadReplies ([bool]$EnableThreadReplies) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote))) {
         $outcome.Delivered = $false
         $outcome.Reason = "preview run; no write was requested"
         return $outcome
     }
 
     if (-not $ChangeSetKnown) {
-        $reason = "this PR's change set could not be read, so no finding's location could be verified"
-        Write-Warning "  not publishing on PR ${PrId}: $reason."
-        $outcome.Aborted = $true
-        $outcome.Reason = $reason
-        return $outcome
+        # A thread-reply-only run is bound to an existing human comment rather
+        # than a changed-file anchor, so it does not need the change set.
+        if ($EnableFindingComments -or $EnableSummaryComment -or $EnableApprovalVote) {
+            $reason = "this PR's change set could not be read, so no finding's location could be verified"
+            Write-Warning "  not publishing on PR ${PrId}: $reason."
+            $outcome.Aborted = $true
+            $outcome.Reason = $reason
+            return $outcome
+        }
     }
 
     $freshness = Test-ReviewerDeliveryStillValid -Session $Session -PrId $PrId -ExpectedSourceCommit $SourceCommit
     if (-not $freshness.Ok) {
         Write-Warning "  not publishing on PR ${PrId}: $($freshness.Reason)."
         $outcome.Aborted = $true
+        $outcome.TerminalAbort = [bool]$freshness.Terminal
         $outcome.Reason = $freshness.Reason
         return $outcome
     }
@@ -3213,6 +3758,89 @@ function Invoke-ReviewerDelivery {
         if ($confirmed -ne $outcome.PostedCount) {
             Write-Warning "Recorded $($outcome.PostedCount) posted finding(s) but only $confirmed are visible at the expected anchors on PR $PrId; treating the lower number as the truth."
             $outcome.PostedCount = $confirmed
+        }
+    }
+
+    # -- Human comment assessments -------------------------------------------
+    $eligibleThreadReplies = @()
+    $attemptedThreadReplies = New-Object System.Collections.Generic.List[object]
+    if ($EnableThreadReplies) {
+        $freshThreadsForReplies = Get-ReviewerPullRequestThreads -Session $Session -PrId $PrId
+        $freshTargets = Get-ReviewerThreadAssessmentTargets -Threads $freshThreadsForReplies `
+            -BotSubstrings $BotSubstrings -SystemSubstrings $SystemSubstrings
+        $eligibleThreadReplies = @(Select-ReviewerEligibleThreadReplies -Replies $ThreadReplies -Targets $freshTargets)
+        $droppedThreadReplies = @($ThreadReplies).Count - $eligibleThreadReplies.Count
+        if ($droppedThreadReplies -gt 0) {
+            Write-Host "  skipped $droppedThreadReplies thread assessment(s) because the target comment is no longer the latest eligible human comment." -ForegroundColor DarkGray
+        }
+        $existingThreadReplyFingerprints = Get-ReviewerExistingThreadReplyFingerprints -Threads $freshThreadsForReplies
+        foreach ($reply in $eligibleThreadReplies) {
+            $threadId = [int](Get-ReviewerHashValue -Container $reply -Key 'threadId' -Default 0)
+            $commentId = [int](Get-ReviewerHashValue -Container $reply -Key 'commentId' -Default 0)
+            $reviewedTarget = @($ThreadTargets | Where-Object {
+                    [int](Get-ReviewerHashValue -Container $_ -Key 'threadId' -Default 0) -eq $threadId -and
+                    [int](Get-ReviewerHashValue -Container $_ -Key 'commentId' -Default 0) -eq $commentId
+                } | Select-Object -First 1)
+            if ($reviewedTarget.Count -ne 1) {
+                Write-Host "  skipped thread $threadId because the reviewed human comment binding is unavailable." -ForegroundColor DarkGray
+                continue
+            }
+            $replyFreshness = Test-ReviewerDeliveryStillValid -Session $Session -PrId $PrId -ExpectedSourceCommit $SourceCommit
+            if (-not $replyFreshness.Ok) {
+                Write-Warning "  stopped thread replies on PR ${PrId}: $($replyFreshness.Reason)."
+                $outcome.Aborted = $true
+                $outcome.TerminalAbort = [bool]$replyFreshness.Terminal
+                $outcome.Reason = $replyFreshness.Reason
+                return $outcome
+            }
+            # A reply is addressed to a thread, not a comment id. Re-read the
+            # exact thread state immediately before every write so a human or
+            # agent response that arrived during this batch cannot make the
+            # approved assessment land beneath a different latest comment.
+            $justInTimeThreads = Get-ReviewerPullRequestThreads -Session $Session -PrId $PrId
+            $justInTimeTargets = Get-ReviewerThreadAssessmentTargets -Threads $justInTimeThreads `
+                -BotSubstrings $BotSubstrings -SystemSubstrings $SystemSubstrings
+            $justInTimeKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+            $currentTargetKeys = Get-ReviewerThreadAssessmentTargetKeys -Targets $justInTimeTargets
+            foreach ($key in $currentTargetKeys) { [void]$justInTimeKeys.Add($key) }
+            $reviewedTargetKeys = Get-ReviewerThreadAssessmentTargetKeys -Targets $reviewedTarget
+            $reviewedKey = [string]$reviewedTargetKeys[0]
+            if (-not $justInTimeKeys.Contains($reviewedKey)) {
+                Write-Host "  skipped thread $threadId because human comment $commentId is no longer the latest eligible comment." -ForegroundColor DarkGray
+                continue
+            }
+            [void]$attemptedThreadReplies.Add($reply)
+            $body = Format-ReviewerThreadReply -Reply $reply
+            $fingerprint = Get-ReviewerThreadReplyFingerprint -ThreadId $threadId -Content $body
+            if ($existingThreadReplyFingerprints.Contains($fingerprint)) {
+                Write-Host "  (assessment already exists in thread $threadId, not re-posted)" -ForegroundColor DarkGray
+                $outcome.ThreadRepliesPosted++
+                continue
+            }
+            $post = Add-ReviewerThreadReply -Session $Session -PrId $PrId -ThreadId $threadId -Content $body
+            if ($post.Error) {
+                $outcome.ThreadReplyFailures++
+                Write-Warning "  could not reply to thread $threadId on PR ${PrId}: $($post.Error)"
+            }
+            else {
+                $outcome.ThreadRepliesPosted++
+                [void]$existingThreadReplyFingerprints.Add($fingerprint)
+                Write-Host "  replied to human comment in thread $threadId." -ForegroundColor Green
+            }
+        }
+
+        $confirmedThreads = Get-ReviewerPullRequestThreads -Session $Session -PrId $PrId
+        $confirmedFingerprints = Get-ReviewerExistingThreadReplyFingerprints -Threads $confirmedThreads
+        $confirmedReplies = 0
+        foreach ($reply in $attemptedThreadReplies) {
+            $threadId = [int](Get-ReviewerHashValue -Container $reply -Key 'threadId' -Default 0)
+            if ($confirmedFingerprints.Contains((Get-ReviewerThreadReplyFingerprint -ThreadId $threadId -Content (Format-ReviewerThreadReply -Reply $reply)))) {
+                $confirmedReplies++
+            }
+        }
+        if ($confirmedReplies -ne $outcome.ThreadRepliesPosted) {
+            Write-Warning "Recorded $($outcome.ThreadRepliesPosted) thread assessment(s) but only $confirmedReplies are visible on PR $PrId; treating the lower number as the truth."
+            $outcome.ThreadRepliesPosted = $confirmedReplies
         }
     }
 
@@ -3283,11 +3911,13 @@ function Invoke-ReviewerDelivery {
     # capability is also recorded on its own so that enabling a further write
     # switch later re-opens the PR for exactly that write.
     $outcome.CommentsDelivered = ($EnableFindingComments -and $outcome.PostFailures -eq 0 -and $outcome.PostedCount -ge @($Postable).Count)
+    $outcome.ThreadRepliesDelivered = ($EnableThreadReplies -and $outcome.ThreadReplyFailures -eq 0 -and $outcome.ThreadRepliesPosted -ge $attemptedThreadReplies.Count)
     $outcome.SummaryDelivered = ($EnableSummaryComment -and $outcome.SummaryPosted)
     $commentsOk = (-not $EnableFindingComments) -or $outcome.CommentsDelivered
+    $threadRepliesOk = (-not $EnableThreadReplies) -or $outcome.ThreadRepliesDelivered
     $summaryOk = (-not $EnableSummaryComment) -or $outcome.SummaryDelivered
     $voteOk = (-not $EnableApprovalVote) -or $outcome.VoteResolved
-    $outcome.Delivered = ($commentsOk -and $summaryOk -and $voteOk)
+    $outcome.Delivered = ($commentsOk -and $threadRepliesOk -and $summaryOk -and $voteOk)
     if (-not $outcome.Delivered) { $outcome.Reason = "one or more enabled writes did not land; the PR stays eligible for a retry" }
     return $outcome
 }
@@ -3354,6 +3984,10 @@ function Invoke-ReviewerPullRequest {
         Write-Warning "The result marker did not match the bound PR/repository/commit; discarding it."
         $marker = $null
     }
+    if ($marker -and -not (Test-ReviewerThreadRepliesBound -Replies @($marker['threadReplies']) -TargetSet $Bound.ThreadReplyTargetSet)) {
+        Write-Warning "The result marker contained a duplicate or non-human thread assessment target; discarding it."
+        $marker = $null
+    }
 
     if (-not $marker) {
         $reason = if ($run.TimedOut) { "cycle timed out after ${CycleTimeoutSeconds}s" }
@@ -3412,6 +4046,7 @@ function Invoke-ReviewerPullRequest {
 
     # -- Wrapper-owned decisions ----------------------------------------------
     $allFindings = @($marker['findings'])
+    $threadReplies = @($marker['threadReplies'])
     $counts = Get-ReviewerSeverityCounts -Findings $allFindings
     $ranked = Get-ReviewerPostableFindings -Findings $allFindings -PostSeverities $PostSeverities -MaxFindings $EffectiveMaxFindings
     $scoped = Split-ReviewerFindingsByChangeSet -Findings $ranked -ChangedPaths $Bound.ChangedPaths
@@ -3420,8 +4055,8 @@ function Invoke-ReviewerPullRequest {
     $summaryText = [string]$marker['summary']
     $recommendedVote = [string]$marker['recommendedVote']
 
-    Write-Host ("PR {0} reviewed: {1} critical, {2} important, {3} suggestion; {4} postable; recommended vote '{5}'." -f `
-            $prId, $counts['critical'], $counts['important'], $counts['suggestion'], $postable.Count, $recommendedVote) -ForegroundColor Green
+    Write-Host ("PR {0} reviewed: {1} critical, {2} important, {3} suggestion; {4} postable; {5} human-comment assessment(s); recommended vote '{6}'." -f `
+            $prId, $counts['critical'], $counts['important'], $counts['suggestion'], $postable.Count, $threadReplies.Count, $recommendedVote) -ForegroundColor Green
     if ($withheld.Count -gt 0) {
         Write-Warning "$($withheld.Count) finding(s) name a file this PR does not change; they are in the preview but will not be posted."
     }
@@ -3431,9 +4066,10 @@ function Invoke-ReviewerPullRequest {
     # artifact beside it is what -PromotePreview publishes, so the operator can
     # approve one exact review instead of trusting a second model run to repeat
     # itself.
-    $writesRequested = Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)
+    $writesRequested = Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) -ThreadReplies ([bool]$EnableThreadReplies) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)
     $preview = Write-ReviewerPreview -PrId $prId -SourceCommit $sourceCommit -PrTitle $prTitle `
         -Summary $summaryText -Postable $postable -Withheld $withheld -AllFindings $allFindings `
+        -ThreadReplies $threadReplies -ThreadTargets $Bound.ThreadReplyTargets `
         -RecommendedVote $recommendedVote -Marker $marker -Quiet:$writesRequested
     $previewPath = [string]$preview.MarkdownPath
 
@@ -3450,6 +4086,7 @@ function Invoke-ReviewerPullRequest {
         if (([string](Get-ReviewerHashValue -Container $candidate -Key 'sourceCommit' -Default '')) -ieq $sourceCommit) { $priorRecord = $candidate }
     }
     $priorComments = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'commentsDelivered' -Default $false)
+    $priorThreadReplies = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'threadRepliesDelivered' -Default $false)
     $priorSummary = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'summaryDelivered' -Default $false)
     $priorVote = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'voteResolved' -Default $false)
     # A recorded success belongs to one specific review. This run's review is
@@ -3460,7 +4097,7 @@ function Invoke-ReviewerPullRequest {
     $artifactPath = [string]$preview.ArtifactPath
     $planCapabilities = Get-ReviewerPlanCapabilities `
         -PriorPending ([string[]]@(Get-ReviewerHashValue -Container $priorRecord -Key 'pendingCapabilities' -Default @())) `
-        -Requested (Get-ReviewerRequestedCapabilities -Comments ([bool]$EnableFindingComments) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)) `
+        -Requested (Get-ReviewerRequestedCapabilities -Comments ([bool]$EnableFindingComments) -ThreadReplies ([bool]$EnableThreadReplies) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)) `
         -PriorAppliesToThisReview $priorApplies
 
     if ($writesRequested) {
@@ -3475,13 +4112,17 @@ function Invoke-ReviewerPullRequest {
             postableCount       = $postable.Count
             withheldCount       = $withheld.Count
             postedCount         = 0
+            threadRepliesPosted = 0
             summaryPosted       = $false
             vote                = "none"
             delivered           = $false
             commentsDelivered   = (Merge-ReviewerCapabilityFlag -Attempted $false -SucceededThisRun $false -PriorValue $priorComments -PriorAppliesToThisReview $priorApplies)
+            threadRepliesDelivered = (Merge-ReviewerCapabilityFlag -Attempted $false -SucceededThisRun $false -PriorValue $priorThreadReplies -PriorAppliesToThisReview $priorApplies)
             summaryDelivered    = (Merge-ReviewerCapabilityFlag -Attempted $false -SucceededThisRun $false -PriorValue $priorSummary -PriorAppliesToThisReview $priorApplies)
             voteResolved        = (Merge-ReviewerCapabilityFlag -Attempted $false -SucceededThisRun $false -PriorValue $priorVote -PriorAppliesToThisReview $priorApplies)
             reviewDigest        = $reviewDigest
+            reviewedThreadTargetKeys = [string[]]@($Bound.ReviewedThreadTargetKeys)
+            resolvedThreadReplyTargetKeys = [string[]]@($Bound.ResolvedThreadReplyTargetKeys)
             previewPath         = $previewPath
             artifactPath        = $artifactPath
             pendingCapabilities = $planCapabilities
@@ -3494,12 +4135,15 @@ function Invoke-ReviewerPullRequest {
     # An empty change set means the read failed; it is fine for a preview (the
     # findings are shown to a human) but delivery must refuse it.
     $delivery = Invoke-ReviewerDelivery -Session $Session -PrId $prId -SourceCommit $sourceCommit `
-        -Postable $postable -SummaryText $summaryText -Counts $counts -ReportedFindingCount $allFindings.Count `
+        -Postable $postable -ThreadReplies $threadReplies -ThreadTargets $Bound.ThreadReplyTargets `
+        -SummaryText $summaryText -Counts $counts -ReportedFindingCount $allFindings.Count `
         -RecommendedVote $recommendedVote -ExistingFingerprints $Bound.ExistingFingerprints `
         -ChangeSetKnown (@($Bound.ChangedPaths).Count -gt 0) `
         -SummaryAlreadyDelivered ($priorApplies -and $priorSummary)
     $postedCount = [int]$delivery.PostedCount
     $postFailures = [int]$delivery.PostFailures
+    $threadRepliesPosted = [int]$delivery.ThreadRepliesPosted
+    $threadReplyFailures = [int]$delivery.ThreadReplyFailures
     $summaryPosted = [bool]$delivery.SummaryPosted
     $castVote = [string]$delivery.CastVote
 
@@ -3511,11 +4155,17 @@ function Invoke-ReviewerPullRequest {
     # leave the relevant flag $false, so the next run with posting on can still
     # publish this commit instead of skipping it as already reviewed.
     $commentsDelivered = Merge-ReviewerCapabilityFlag -Attempted $EnableFindingComments -SucceededThisRun ([bool]$delivery.CommentsDelivered) -PriorValue $priorComments -PriorAppliesToThisReview $priorApplies
+    $threadRepliesDelivered = Merge-ReviewerCapabilityFlag -Attempted $EnableThreadReplies -SucceededThisRun ([bool]$delivery.ThreadRepliesDelivered) -PriorValue $priorThreadReplies -PriorAppliesToThisReview $priorApplies
     $summaryDelivered = Merge-ReviewerCapabilityFlag -Attempted $EnableSummaryComment -SucceededThisRun ([bool]$delivery.SummaryDelivered) -PriorValue $priorSummary -PriorAppliesToThisReview $priorApplies
     $voteResolved = Merge-ReviewerCapabilityFlag -Attempted $EnableApprovalVote -SucceededThisRun ([bool]$delivery.VoteResolved) -PriorValue $priorVote -PriorAppliesToThisReview $priorApplies
 
     $unresolved = Get-ReviewerUnresolvedCapabilities -Requested $planCapabilities `
-        -CommentsDelivered $commentsDelivered -SummaryDelivered $summaryDelivered -VoteResolved $voteResolved
+        -CommentsDelivered $commentsDelivered -ThreadRepliesDelivered $threadRepliesDelivered -SummaryDelivered $summaryDelivered -VoteResolved $voteResolved
+    $resolvedThreadReplyTargetKeys = [string[]]@($Bound.ResolvedThreadReplyTargetKeys)
+    if ($EnableThreadReplies -and [bool]$delivery.ThreadRepliesDelivered) {
+        $resolvedThreadReplyTargetKeys = Merge-ReviewerThreadAssessmentTargetKeys `
+            -PriorKeys $resolvedThreadReplyTargetKeys -CurrentTargets $Bound.ThreadReplyTargets
+    }
 
     $ReviewedState[[string]$prId] = @{
         sourceCommit        = $sourceCommit
@@ -3524,19 +4174,25 @@ function Invoke-ReviewerPullRequest {
         postableCount       = $postable.Count
         withheldCount       = $withheld.Count
         postedCount         = $postedCount
+        threadRepliesPosted = $threadRepliesPosted
         summaryPosted       = $summaryPosted
         vote                = $(if ($castVote) { $castVote } else { "none" })
         delivered           = [bool]$delivery.Delivered
         commentsDelivered   = $commentsDelivered
+        threadRepliesDelivered = $threadRepliesDelivered
         summaryDelivered    = $summaryDelivered
         voteResolved        = $voteResolved
         reviewDigest        = $reviewDigest
+        reviewedThreadTargetKeys = [string[]]@($Bound.ReviewedThreadTargetKeys)
+        resolvedThreadReplyTargetKeys = [string[]]@($resolvedThreadReplyTargetKeys)
         previewPath         = $previewPath
         artifactPath        = $artifactPath
         # The plan stays open until everything IT owes has landed, not until
         # whichever run picked it up reports success with its own switches.
         pendingCapabilities = $unresolved
-        deliveryPending     = ($writesRequested -and @($unresolved).Count -gt 0 -and -not [bool]$delivery.Aborted -and [bool]$artifactPath)
+        deliveryPending     = (Test-ReviewerShouldKeepPendingPlan -WritesRequested $writesRequested `
+            -UnresolvedCapabilities $unresolved -ArtifactPath $artifactPath `
+            -TerminalAbort ([bool]$delivery.TerminalAbort))
     }
     Set-JsonState -Path $reviewedStatePath -State $ReviewedState
     if ($AttemptsState.ContainsKey([string]$prId)) {
@@ -3550,16 +4206,20 @@ function Invoke-ReviewerPullRequest {
         critical = $counts['critical']; important = $counts['important']; suggestion = $counts['suggestion']
         postableCount = $postable.Count; withheldCount = $withheld.Count
         postedCount = $postedCount; postFailures = $postFailures
+        threadRepliesReported = $threadReplies.Count; threadRepliesPosted = $threadRepliesPosted; threadReplyFailures = $threadReplyFailures
         summaryPosted = $summaryPosted; recommendedVote = $recommendedVote; castVote = $(if ($castVote) { $castVote } else { "none" })
-        commentsEnabled = [bool]$EnableFindingComments; summaryEnabled = [bool]$EnableSummaryComment; voteEnabled = [bool]$EnableApprovalVote
+        commentsEnabled = [bool]$EnableFindingComments; threadRepliesEnabled = [bool]$EnableThreadReplies; summaryEnabled = [bool]$EnableSummaryComment; voteEnabled = [bool]$EnableApprovalVote
         delivered = [bool]$delivery.Delivered; deliveryAborted = [bool]$delivery.Aborted; deliveryReason = [string]$delivery.Reason
         previewPath = $previewPath; artifactPath = [string]$preview.ArtifactPath
     }
 
     # A write that was requested and did not land is a cycle failure: it drives
-    # the backoff and is retried. An aborted delivery (the PR moved on) is not.
-    $exit = if ($postFailures -gt 0 -or ($writesRequested -and -not $delivery.Delivered -and -not $delivery.Aborted)) { 1 } else { 0 }
-    return @{ ExitCode = $exit; Summary = "PR $prId reviewed ($($allFindings.Count) finding(s), $postedCount posted)" }
+    # the backoff and is retried. Only a terminal abort (the PR moved on, became
+    # a draft, or closed) retires the sealed plan without a retry.
+    $exit = if ($postFailures -gt 0 -or $threadReplyFailures -gt 0 -or
+        ($writesRequested -and -not $delivery.Delivered -and -not $delivery.TerminalAbort)) { 1 } else { 0 }
+
+    return @{ ExitCode = $exit; Summary = "PR $prId reviewed ($($allFindings.Count) finding(s), $postedCount posted, $threadRepliesPosted thread assessment(s))" }
 }
 
 function Invoke-ReviewerPromotion {
@@ -3573,7 +4233,7 @@ function Invoke-ReviewerPromotion {
         nonce; nothing binds its conclusions to the ones a human approved.
 
         What is published here is the artifact's DELIVERY MANIFEST - the exact
-        comment list, summary and vote that appeared in the Markdown the
+        comment and thread-reply lists, summary and vote that appeared in the Markdown the
         operator read - and three separate things have to hold before any of it
         goes out:
 
@@ -3619,10 +4279,10 @@ function Invoke-ReviewerPromotion {
     # Only now is it safe to interpret the manifest's contents.
     $signed = $manifestJson | ConvertFrom-Json
 
-    foreach ($k in @('artifactVersion', 'organization', 'project', 'repositoryName', 'repositoryId', 'prId', 'sourceCommit', 'markerBody', 'approvedComments', 'approvedSummary', 'approvedVote')) {
+    foreach ($k in @('artifactVersion', 'organization', 'project', 'repositoryName', 'repositoryId', 'prId', 'sourceCommit', 'markerBody', 'approvedComments', 'approvedThreadReplies', 'reviewedThreadTargets', 'approvedSummary', 'approvedVote')) {
         if ($null -eq (Get-ReviewerHashValue -Container $signed -Key $k)) { throw "Preview artifact is missing required field '$k': $ArtifactPath" }
     }
-    if ([int]$signed.artifactVersion -ne 3) { throw "Unsupported preview artifact version $($signed.artifactVersion)." }
+    if ([int]$signed.artifactVersion -ne 4) { throw "Unsupported preview artifact version $($signed.artifactVersion)." }
 
     # A review is only meaningful against the repository it was produced for.
     if (([string]$signed.organization) -ine $Organization -or ([string]$signed.project) -ine $ExpectedProject -or
@@ -3701,9 +4361,9 @@ function Invoke-ReviewerPromotion {
         throw "The stored review is not bound to PR $prId at commit $sourceCommit; refusing to promote it."
     }
 
-    if (-not (Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote))) {
+    if (-not (Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) -ThreadReplies ([bool]$EnableThreadReplies) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote))) {
         throw ("-PromotePreview publishes an already-approved review, so it needs at least one of " +
-            "-EnableFindingComments, -EnableSummaryComment or -EnableApprovalVote.")
+            "-EnableFindingComments, -EnableThreadReplies, -EnableSummaryComment or -EnableApprovalVote.")
     }
 
     $session = $ExistingSession
@@ -3718,6 +4378,8 @@ function Invoke-ReviewerPromotion {
         $allFindings = @($marker['findings'])
         $counts = Get-ReviewerSeverityCounts -Findings $allFindings
         $approved = @($signed.approvedComments)
+        $approvedThreadReplies = @($signed.approvedThreadReplies)
+        $reviewedThreadTargets = @($signed.reviewedThreadTargets)
         $changedPaths = Get-ReviewerChangedPaths -Session $session -PrId $prId
         # Re-scope the APPROVED list; this can only remove entries.
         $stillPublishable = @((Split-ReviewerFindingsByChangeSet -Findings $approved -ChangedPaths $changedPaths).Postable)
@@ -3726,11 +4388,19 @@ function Invoke-ReviewerPromotion {
         $postable = Select-ReviewerManifestSubset -Approved $approved -Allowed $stillPublishable
         $dropped = @($approved).Count - @($postable).Count
         $threads = Get-ReviewerPullRequestThreads -Session $session -PrId $prId
+        $freshThreadTargets = Get-ReviewerThreadAssessmentTargets -Threads $threads `
+            -BotSubstrings $BotSubstrings -SystemSubstrings $SystemSubstrings
+        $threadReplies = @(Select-ReviewerEligibleThreadReplies -Replies $approvedThreadReplies -Targets $freshThreadTargets)
+        $droppedThreadReplies = $approvedThreadReplies.Count - $threadReplies.Count
 
-        Write-Host ("Promoting the stored review of PR {0} '{1}' at {2}: {3} approved comment(s), {4} to post." -f `
-                $prId, $prTitle, $sourceCommit.Substring(0, 12), @($approved).Count, @($postable).Count) -ForegroundColor Yellow
+        Write-Host ("Promoting the stored review of PR {0} '{1}' at {2}: {3} approved finding comment(s), {4} to post; {5} approved thread assessment(s), {6} still eligible." -f `
+                $prId, $prTitle, $sourceCommit.Substring(0, 12), @($approved).Count, @($postable).Count,
+                $approvedThreadReplies.Count, $threadReplies.Count) -ForegroundColor Yellow
         if ($dropped -gt 0) {
             Write-Warning "$dropped approved comment(s) are no longer publishable at the location they name and will be skipped."
+        }
+        if ($droppedThreadReplies -gt 0) {
+            Write-Warning "$droppedThreadReplies approved thread assessment(s) no longer target the latest eligible human comment and will be skipped."
         }
 
         # Record the plan BEFORE writing anything, for the same reason the live
@@ -3749,11 +4419,12 @@ function Invoke-ReviewerPromotion {
         $reviewDigest = Get-ReviewerTextSha256 -Text ([string]$signed.markerBody)
         $priorApplies = (([string](Get-ReviewerHashValue -Container $priorRecord -Key 'reviewDigest' -Default '')) -ceq $reviewDigest)
         $priorComments = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'commentsDelivered' -Default $false)
+        $priorThreadReplies = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'threadRepliesDelivered' -Default $false)
         $priorSummary = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'summaryDelivered' -Default $false)
         $priorVote = [bool](Get-ReviewerHashValue -Container $priorRecord -Key 'voteResolved' -Default $false)
         $planCapabilities = Get-ReviewerPlanCapabilities `
             -PriorPending ([string[]]@(Get-ReviewerHashValue -Container $priorRecord -Key 'pendingCapabilities' -Default @())) `
-            -Requested (Get-ReviewerRequestedCapabilities -Comments ([bool]$EnableFindingComments) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)) `
+            -Requested (Get-ReviewerRequestedCapabilities -Comments ([bool]$EnableFindingComments) -ThreadReplies ([bool]$EnableThreadReplies) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)) `
             -PriorAppliesToThisReview $priorApplies
         $reviewedState[[string]$prId] = @{
             sourceCommit        = $sourceCommit
@@ -3762,13 +4433,19 @@ function Invoke-ReviewerPromotion {
             postableCount       = @($postable).Count
             withheldCount       = $dropped
             postedCount         = 0
+            threadRepliesPosted = 0
             summaryPosted       = $false
             vote                = "none"
             delivered           = $false
             commentsDelivered   = (Merge-ReviewerCapabilityFlag -Attempted $false -SucceededThisRun $false -PriorValue $priorComments -PriorAppliesToThisReview $priorApplies)
+            threadRepliesDelivered = (Merge-ReviewerCapabilityFlag -Attempted $false -SucceededThisRun $false -PriorValue $priorThreadReplies -PriorAppliesToThisReview $priorApplies)
             summaryDelivered    = (Merge-ReviewerCapabilityFlag -Attempted $false -SucceededThisRun $false -PriorValue $priorSummary -PriorAppliesToThisReview $priorApplies)
             voteResolved        = (Merge-ReviewerCapabilityFlag -Attempted $false -SucceededThisRun $false -PriorValue $priorVote -PriorAppliesToThisReview $priorApplies)
             reviewDigest        = $reviewDigest
+            reviewedThreadTargetKeys = (Merge-ReviewerThreadAssessmentTargetKeys `
+                -PriorKeys ([string[]]@(Get-ReviewerHashValue -Container $priorRecord -Key 'reviewedThreadTargetKeys' -Default @())) `
+                -CurrentTargets $reviewedThreadTargets)
+            resolvedThreadReplyTargetKeys = [string[]]@(Get-ReviewerHashValue -Container $priorRecord -Key 'resolvedThreadReplyTargetKeys' -Default @())
             promotedFrom        = $ArtifactPath
             previewPath         = $previewPath
             artifactPath        = $ArtifactPath
@@ -3778,7 +4455,8 @@ function Invoke-ReviewerPromotion {
         Set-JsonState -Path $reviewedStatePath -State $reviewedState
 
         $delivery = Invoke-ReviewerDelivery -Session $session -PrId $prId -SourceCommit $sourceCommit `
-            -Postable $postable -SummaryText ([string]$signed.approvedSummary) -Counts $counts `
+            -Postable $postable -ThreadReplies $threadReplies -ThreadTargets $reviewedThreadTargets `
+            -SummaryText ([string]$signed.approvedSummary) -Counts $counts `
             -ReportedFindingCount ([int](Get-ReviewerHashValue -Container $signed -Key 'reportedFindings' -Default $allFindings.Count)) `
             -RecommendedVote ([string]$signed.approvedVote) `
             -ExistingFingerprints (Get-ReviewerExistingFingerprints -Threads $threads) `
@@ -3799,13 +4477,19 @@ function Invoke-ReviewerPromotion {
         $priorApplies = (([string](Get-ReviewerHashValue -Container $priorRecord -Key 'reviewDigest' -Default '')) -ceq $reviewDigest)
         $planCapabilities = Get-ReviewerPlanCapabilities `
             -PriorPending ([string[]]@(Get-ReviewerHashValue -Container $priorRecord -Key 'pendingCapabilities' -Default @())) `
-            -Requested (Get-ReviewerRequestedCapabilities -Comments ([bool]$EnableFindingComments) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)) `
+            -Requested (Get-ReviewerRequestedCapabilities -Comments ([bool]$EnableFindingComments) -ThreadReplies ([bool]$EnableThreadReplies) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)) `
             -PriorAppliesToThisReview $priorApplies
         $promotedComments = (Merge-ReviewerCapabilityFlag -Attempted $EnableFindingComments -SucceededThisRun ([bool]$delivery.CommentsDelivered) -PriorValue ([bool](Get-ReviewerHashValue -Container $priorRecord -Key 'commentsDelivered' -Default $false)) -PriorAppliesToThisReview $priorApplies)
+        $promotedThreadReplies = (Merge-ReviewerCapabilityFlag -Attempted $EnableThreadReplies -SucceededThisRun ([bool]$delivery.ThreadRepliesDelivered) -PriorValue ([bool](Get-ReviewerHashValue -Container $priorRecord -Key 'threadRepliesDelivered' -Default $false)) -PriorAppliesToThisReview $priorApplies)
         $promotedSummary = (Merge-ReviewerCapabilityFlag -Attempted $EnableSummaryComment -SucceededThisRun ([bool]$delivery.SummaryDelivered) -PriorValue ([bool](Get-ReviewerHashValue -Container $priorRecord -Key 'summaryDelivered' -Default $false)) -PriorAppliesToThisReview $priorApplies)
         $promotedVote = (Merge-ReviewerCapabilityFlag -Attempted $EnableApprovalVote -SucceededThisRun ([bool]$delivery.VoteResolved) -PriorValue ([bool](Get-ReviewerHashValue -Container $priorRecord -Key 'voteResolved' -Default $false)) -PriorAppliesToThisReview $priorApplies)
         $promotedUnresolved = Get-ReviewerUnresolvedCapabilities -Requested $planCapabilities `
-            -CommentsDelivered $promotedComments -SummaryDelivered $promotedSummary -VoteResolved $promotedVote
+            -CommentsDelivered $promotedComments -ThreadRepliesDelivered $promotedThreadReplies -SummaryDelivered $promotedSummary -VoteResolved $promotedVote
+        $promotedResolvedThreadReplyTargetKeys = [string[]]@(Get-ReviewerHashValue -Container $priorRecord -Key 'resolvedThreadReplyTargetKeys' -Default @())
+        if ($EnableThreadReplies -and [bool]$delivery.ThreadRepliesDelivered) {
+            $promotedResolvedThreadReplyTargetKeys = Merge-ReviewerThreadAssessmentTargetKeys `
+                -PriorKeys $promotedResolvedThreadReplyTargetKeys -CurrentTargets $reviewedThreadTargets
+        }
         if (@($promotedUnresolved).Count -gt 0) {
             Write-Warning ("This delivery plan still owes: $(@($promotedUnresolved) -join ', '). It stays retryable until " +
                 "those land; re-run with the matching switches.")
@@ -3817,20 +4501,28 @@ function Invoke-ReviewerPromotion {
             postableCount       = @($postable).Count
             withheldCount       = $dropped
             postedCount         = [int]$delivery.PostedCount
+            threadRepliesPosted = [int]$delivery.ThreadRepliesPosted
             summaryPosted       = [bool]$delivery.SummaryPosted
             vote                = $(if ($delivery.CastVote) { [string]$delivery.CastVote } else { "none" })
             delivered           = [bool]$delivery.Delivered
             commentsDelivered   = $promotedComments
+            threadRepliesDelivered = $promotedThreadReplies
             summaryDelivered    = $promotedSummary
             voteResolved        = $promotedVote
             reviewDigest        = $reviewDigest
+            reviewedThreadTargetKeys = (Merge-ReviewerThreadAssessmentTargetKeys `
+                -PriorKeys ([string[]]@(Get-ReviewerHashValue -Container $priorRecord -Key 'reviewedThreadTargetKeys' -Default @())) `
+                -CurrentTargets $reviewedThreadTargets)
+            resolvedThreadReplyTargetKeys = [string[]]@($promotedResolvedThreadReplyTargetKeys)
             promotedFrom        = $ArtifactPath
             previewPath         = $previewPath
             # The plan stays retryable until everything it owes has landed, so an
             # unattended retry republishes THIS review rather than re-reviewing.
             artifactPath        = $ArtifactPath
             pendingCapabilities = $promotedUnresolved
-            deliveryPending     = (@($promotedUnresolved).Count -gt 0 -and -not [bool]$delivery.Aborted)
+            deliveryPending     = (Test-ReviewerShouldKeepPendingPlan -WritesRequested $true `
+                -UnresolvedCapabilities $promotedUnresolved -ArtifactPath $ArtifactPath `
+                -TerminalAbort ([bool]$delivery.TerminalAbort))
         }
         Set-JsonState -Path $reviewedStatePath -State $reviewedState
 
@@ -3839,6 +4531,8 @@ function Invoke-ReviewerPromotion {
             prId = $prId; sourceCommit = $sourceCommit; artifactPath = $ArtifactPath
             approvedCount = @($approved).Count; droppedCount = $dropped
             postedCount = [int]$delivery.PostedCount; postFailures = [int]$delivery.PostFailures
+            approvedThreadReplies = $approvedThreadReplies.Count; droppedThreadReplies = $droppedThreadReplies
+            threadRepliesPosted = [int]$delivery.ThreadRepliesPosted; threadReplyFailures = [int]$delivery.ThreadReplyFailures
             summaryPosted = [bool]$delivery.SummaryPosted; castVote = $(if ($delivery.CastVote) { [string]$delivery.CastVote } else { "none" })
             deliveryAborted = [bool]$delivery.Aborted; deliveryReason = [string]$delivery.Reason
         }
@@ -3947,9 +4641,33 @@ function Invoke-ReviewerCycle {
                 continue
             }
 
+            # A new human response is new review input even when the source
+            # commit is unchanged and this run is preview-only. Fetch the
+            # metadata before the already-reviewed check so such a response
+            # reopens the PR without granting the model or wrapper any write.
+            $threads = Get-ReviewerPullRequestThreads -Session $session -PrId $prId
+            $reviewedThreadTargetKeys = @()
+            $resolvedThreadReplyTargetKeys = @()
+            if ($reviewedState.ContainsKey([string]$prId)) {
+                $priorReview = $reviewedState[[string]$prId]
+                if (([string](Get-ReviewerHashValue -Container $priorReview -Key 'sourceCommit' -Default '')) -ieq $sourceCommit) {
+                    $reviewedThreadTargetKeys = [string[]]@(Get-ReviewerHashValue -Container $priorReview -Key 'reviewedThreadTargetKeys' -Default @())
+                    $resolvedThreadReplyTargetKeys = [string[]]@(Get-ReviewerHashValue -Container $priorReview -Key 'resolvedThreadReplyTargetKeys' -Default @())
+                }
+            }
+            $selectionReviewedTargetKeys = if ($EnableThreadReplies) {
+                $resolvedThreadReplyTargetKeys
+            }
+            else {
+                $reviewedThreadTargetKeys
+            }
+            $digest = Build-ReviewerThreadDigest -Threads $threads -BotSubstrings $BotSubstrings `
+                -SystemSubstrings $SystemSubstrings -ReviewedTargetKeys $selectionReviewedTargetKeys
             if (Test-ReviewerAlreadyReviewed -ReviewedState $reviewedState -PrId $prId -SourceCommit $sourceCommit `
-                    -WritesRequested (Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)) `
-                    -WantComments ([bool]$EnableFindingComments) -WantSummary ([bool]$EnableSummaryComment) -WantVote ([bool]$EnableApprovalVote)) {
+                    -WritesRequested (Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) -ThreadReplies ([bool]$EnableThreadReplies) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)) `
+                    -WantComments ([bool]$EnableFindingComments) -WantThreadReplies ([bool]$EnableThreadReplies) `
+                    -ThreadTargetsKnown $true -CurrentThreadReplyTargets @($digest.AllAssessmentTargets) `
+                    -WantSummary ([bool]$EnableSummaryComment) -WantVote ([bool]$EnableApprovalVote)) {
                 Write-Host "  PR $prId skipped (already reviewed and delivered at this commit)." -ForegroundColor DarkGray
                 continue
             }
@@ -3997,8 +4715,6 @@ function Invoke-ReviewerCycle {
                 continue
             }
 
-            $threads = Get-ReviewerPullRequestThreads -Session $session -PrId $prId
-            $digest = Build-ReviewerThreadDigest -Threads $threads -BotSubstrings $BotSubstrings -SystemSubstrings $SystemSubstrings
             $changedPaths = Get-ReviewerChangedPaths -Session $session -PrId $prId
 
             [void]$bound.Add(@{
@@ -4008,6 +4724,11 @@ function Invoke-ReviewerCycle {
                     SourceBranch         = (([string](Get-ReviewerHashValue -Container $prRecord -Key 'sourceRefName' -Default '')) -replace '^refs/heads/', '')
                     AuthorAlias          = (Get-ReviewerAlias -UniqueName ([string](Get-ReviewerHashValue -Container (Get-ReviewerHashValue -Container $prRecord -Key 'createdBy') -Key 'uniqueName' -Default '')))
                     DigestText           = $digest.Text
+                    ThreadReplyTargets    = @($digest.AssessmentTargets)
+                    ThreadReplyTargetSet  = (Get-ReviewerThreadAssessmentTargetSet -Targets $digest.AssessmentTargets)
+                    ReviewedThreadTargetKeys = (Merge-ReviewerThreadAssessmentTargetKeys `
+                        -PriorKeys $reviewedThreadTargetKeys -CurrentTargets $digest.AssessmentTargets)
+                    ResolvedThreadReplyTargetKeys = [string[]]@($resolvedThreadReplyTargetKeys)
                     ChangedPaths         = $changedPaths
                     ExistingFingerprints = (Get-ReviewerExistingFingerprints -Threads $threads)
                 })
@@ -4091,11 +4812,11 @@ try {
     # Every write switch counts. Deciding this from -EnableFindingComments alone
     # told an operator running with only -EnableSummaryComment that this was a
     # preview, and then posted a summary comment to the PR.
-    if (Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)) {
-        Write-Host "Writes: findingComments=$([bool]$EnableFindingComments) summary=$([bool]$EnableSummaryComment) vote=$([bool]$EnableApprovalVote) - anything posted will appear under '$OperatorAlias'." -ForegroundColor Yellow
+    if (Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) -ThreadReplies ([bool]$EnableThreadReplies) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)) {
+        Write-Host "Writes: findingComments=$([bool]$EnableFindingComments) threadReplies=$([bool]$EnableThreadReplies) summary=$([bool]$EnableSummaryComment) vote=$([bool]$EnableApprovalVote) - anything posted will appear under '$OperatorAlias'." -ForegroundColor Yellow
     }
     else {
-        Write-Host "Writes: NONE. This is a preview run: candidate comments are printed and saved to $previewDir, and nothing is posted." -ForegroundColor Green
+        Write-Host "Writes: NONE. This is a preview run: candidate findings and thread assessments are printed and saved to $previewDir, and nothing is posted." -ForegroundColor Green
     }
 
     if ($PromotePreview) {
