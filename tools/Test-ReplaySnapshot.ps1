@@ -2950,6 +2950,42 @@ try {
             "A sealed timestamp with no UTC marker or offset ('$zoneless') must be refused." `
             -Match "carries neither"
     }
+    # And through the path it ACTUALLY arrives by. A string reaches the string
+    # branch; the reader hands it to ConvertFrom-Json first, which returns a
+    # [DateTime] with Kind=Unspecified - and `ToUniversalTime()` on that assumes
+    # local and silently adds the host's offset. Guarding only the string branch
+    # left the real one wide open.
+    $zonelessJson = (@{ declaredAt = "2026-08-07T06:36:52.0422358" } | ConvertTo-Json -Compress) | ConvertFrom-Json
+    Assert-Replay ($zonelessJson.declaredAt -is [DateTime] -and
+        $zonelessJson.declaredAt.Kind -eq [DateTimeKind]::Unspecified) `
+        "A zone-less timestamp must still arrive from ConvertFrom-Json as an Unspecified DateTime; if not, this guard is measuring nothing."
+    Assert-ReplayThrows { Get-ReviewerRunReconciliationTimestamp $zonelessJson.declaredAt } `
+        "A zone-less timestamp that has been through ConvertFrom-Json must be refused, not shifted by the host's offset." `
+        -Match "carries neither"
+    # A whole sealed declaration carrying one, read the way the tool reads it.
+    $zonelessDir = Join-Path $sandbox "zoneless"
+    [void](New-Item -ItemType Directory -Path $zonelessDir -Force)
+    $zonelessDecl = [pscustomobject][ordered]@{
+        kind = $script:ReviewerRunReconciliationSetKind
+        artifactVersion = $script:ReviewerRunReconciliationVersion
+        status = "ok"; setId = ("a" * 32); snapshotName = "s"
+        snapshotManifestDigest = ("7" * 64); plannedRunCount = 2
+        expectedRunSha256 = @(); purpose = ""; promotable = $false
+        declaredAt = "2026-08-07T06:36:52.0422358"
+    }
+    $zonelessPath = Save-ReviewerConventionSpecialistPreview -Directory $zonelessDir `
+        -BaseName "runset-zoneless" -Manifest $zonelessDecl -MasterKey $derivedKey
+    Assert-ReplayThrows { Read-ReviewerRunReconciliationSet -Path $zonelessPath -MasterKey $derivedKey } `
+        "A sealed declaration whose timestamp carries no zone must be refused by the reader, not normalized to the host's zone." `
+        -Match "carries neither"
+    # The two that MUST still work, through the same path.
+    foreach ($valid in @(
+            @{ Text = "2026-08-07T06:36:52.0422358Z"; Expect = "2026-08-07T06:36:52.0422358Z" },
+            @{ Text = "2026-08-07T08:36:52.0422358+02:00"; Expect = "2026-08-07T06:36:52.0422358Z" })) {
+        $validJson = (@{ declaredAt = $valid.Text } | ConvertTo-Json -Compress) | ConvertFrom-Json
+        Assert-Replay ((Get-ReviewerRunReconciliationTimestamp $validJson.declaredAt) -ceq $valid.Expect) `
+            "'$($valid.Text)' must normalize to '$($valid.Expect)' through ConvertFrom-Json, not be refused with the zone-less case."
+    }
 
     # End to end, through the tool, under two cultures: the declaration is
     # sealed once and consumed twice, and the report bytes must match.
