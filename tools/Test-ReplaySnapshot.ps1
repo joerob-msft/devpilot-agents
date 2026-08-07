@@ -2247,6 +2247,15 @@ try {
     )
     Assert-Replay (-not [bool]$differentInput.reconciled -and @($differentInput.rows)[0].reconciledStatus -ceq "unknown") `
         "Runs of different input must be refused rather than compared row by row."
+    Assert-Replay (@(@($differentInput.problems) | Where-Object { $_ -clike "*2 different inputs*" }).Count -gt 0) `
+        "The refusal must name the groups, not blame whichever run was listed first."
+    # And it must say the same thing whichever order they are listed in.
+    $differentReversed = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -SourceCommit ("d" * 40)),
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)))
+    )
+    Assert-Replay ([string]$differentInput.reconciliationSha256 -ceq [string]$differentReversed.reconciliationSha256) `
+        "A mixed-input refusal must not depend on the order the runs were listed in."
 
     # A construct table that shifted underneath the ids is a different question.
     $shiftedConstructs = Resolve-ReviewerRunReconciliation -Manifests @(

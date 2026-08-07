@@ -234,21 +234,29 @@ function Resolve-ReviewerRunReconciliation {
     # not about the same code), and the NONCE must differ (or the "two runs" are
     # one run counted twice, which would let a single favourable observation
     # launder itself into a stable result).
-    $binding = $null
+    #
+    # The bindings are grouped, not compared against run 1. Making one run the
+    # reference means a single degraded run - which carries no construct table,
+    # so binds differently - reads as "every other run disagrees with run 1",
+    # and it also makes the report depend on the order the operator listed
+    # them in.
+    $bindingGroups = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $bindingOrder = [System.Collections.Generic.List[string]]::new()
     $nonces = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $runIndex = 0
     foreach ($manifest in $runs) {
         $runIndex++
         $bindingResult = Get-ReviewerRunReconciliationBinding -Manifest $manifest
         $runBinding = [string]$bindingResult.Sha256
+        if (-not $bindingGroups.ContainsKey($runBinding)) {
+            $bindingGroups[$runBinding] = [System.Collections.Generic.List[int]]::new()
+            [void]$bindingOrder.Add($runBinding)
+        }
+        [void]$bindingGroups[$runBinding].Add($runIndex)
         # Two runs with no binding at all would compare equal, which is the one
         # way an empty manifest reconciles with anything.
         if (@($bindingResult.Missing).Count -gt 0) {
             [void]$problems.Add("run $runIndex is missing binding fields: " + (@($bindingResult.Missing) -join ", "))
-        }
-        if ($null -eq $binding) { $binding = $runBinding }
-        elseif ([string]::CompareOrdinal($binding, $runBinding) -ne 0) {
-            [void]$problems.Add("run $runIndex was produced from different inputs than run 1")
         }
         $replay = Get-ReviewerRunReconciliationValue $manifest "replay" $null
         $nonce = [string](Get-ReviewerRunReconciliationValue $replay "replayNonce" "")
@@ -302,9 +310,23 @@ function Resolve-ReviewerRunReconciliation {
                 replayNonce = $nonce
                 status = $status
                 complete = $complete
+                inputBindingSha256 = $runBinding
                 rowCount = @(Get-ReviewerRunReconciliationValue $coverage "rows" @()).Count
                 candidateCount = @(Get-ReviewerRunReconciliationValue $manifest "candidates" @()).Count
             })
+    }
+
+    # One binding, or none of this means anything. Reported as GROUPS so the
+    # message says which runs went together rather than which ones differed
+    # from whichever happened to be listed first.
+    $sortedBindings = @($bindingOrder.ToArray())
+    [Array]::Sort($sortedBindings, [StringComparer]::Ordinal)
+    $binding = $(if (@($sortedBindings).Count -gt 0) { $sortedBindings[0] } else { "" })
+    if (@($sortedBindings).Count -gt 1) {
+        $groupText = @(@($sortedBindings) | ForEach-Object {
+                "{" + ((@($bindingGroups[$_]) | ForEach-Object { "run $_" }) -join ", ") + "} at " + $_.Substring(0, 12)
+            })
+        [void]$problems.Add("the runs were produced from $(@($sortedBindings).Count) different inputs: " + ($groupText -join "; "))
     }
 
     # Index each run's rows by `ruleRef`. That is a POSITION in the request
@@ -669,7 +691,17 @@ function Resolve-ReviewerRunReconciliation {
     # know they read the same thing.
     $sortedNonces = @(@($runSummaries.ToArray()) | ForEach-Object { [string]$_.replayNonce })
     [Array]::Sort($sortedNonces, [StringComparer]::Ordinal)
-    $sortedProblems = @($problems.ToArray())
+    $sortedProblems = @(@($problems.ToArray()) | ForEach-Object {
+            # Problems name runs by POSITION, which is the one thing that
+            # changes when an operator lists the same runs the other way round.
+            # For the digest, rewrite each position as the run's own nonce.
+            $text = [string]$_
+            for ($i = @($runSummaries.ToArray()).Count; $i -ge 1; $i--) {
+                $nonce = [string]@($runSummaries.ToArray())[$i - 1].replayNonce
+                $text = $text.Replace("run $i", "run:" + $(if ($nonce) { $nonce } else { "unidentified" }))
+            }
+            $text
+        })
     [Array]::Sort($sortedProblems, [StringComparer]::Ordinal)
     $orderFree = [ordered]@{
         version = $script:ReviewerRunReconciliationVersion
