@@ -32,9 +32,9 @@ $script:ReviewerConventionSpecialistCoverageStatuses = @(
 $script:ReviewerConventionSpecialistCoverageScopePattern =
 '^(none|(invocation|declaration|comment|assignment)(,(invocation|declaration|comment|assignment))*)$'
 
-# The kinds of changed construct the wrapper enumerates. A row's scope is a set
-# of these, so "which constructs does this row owe an answer for" is a wrapper
-# fact and not a phrase the model can widen or narrow to suit its answer.
+# The kinds of changed construct the wrapper enumerates. Every row owes an
+# answer for the full sealed table; scope is only the subset of kinds the rule
+# can judge as violating, compliant, or unknown.
 $script:ReviewerConventionSpecialistConstructKinds = @(
     "invocation", "declaration", "comment", "assignment"
 )
@@ -441,7 +441,9 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                             Pattern = $script:ReviewerConventionSpecialistCoverageScopePattern
                         }
                         # Four disjoint id lists that together must equal every
-                        # construct of the declared kinds. This is the whole
+                        # construct in the sealed table. Scope identifies the
+                        # applicable subset; constructs of all other kinds must
+                        # be named only as not in reach. This is the whole
                         # mechanism: a row does not assert an outcome for a rule
                         # and then list some ids, it gives a verdict for EVERY
                         # anchor, and the wrapper derives the row's status from
@@ -786,8 +788,9 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Rows,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ResolvedSources,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$AcceptedCandidates,
-        # The constructs the wrapper enumerated from the change set. A row has
-        # to account for every one of them within the scope it declares.
+        # The constructs the wrapper enumerated from the change set. Every row
+        # has to account for every one; scope only identifies the applicable
+        # subset that may carry a verdict other than not-in-reach.
         [AllowEmptyCollection()][object[]]$Constructs = @(),
         # True when the enumeration itself was incomplete - a cap was hit, or a
         # file could not be lexed to the end. An accounting that fully covers a
@@ -873,10 +876,11 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
             Where-Object { $_ -and $_ -cne "none" })
 
         # THE PARTITION. A row does not assert an outcome for a rule and then
-        # name a few ids; it gives a verdict for EVERY anchor in the kinds it
-        # declared, and the four lists must be disjoint and cover exactly that
-        # set. The wrapper then DERIVES the row's status from the partition
-        # rather than taking the model's word for it.
+        # name a few ids; it gives a verdict for EVERY sealed anchor. The four
+        # lists must be disjoint and cover that full universe exactly. Scope is
+        # a separate applicable subset: anchors outside it belong only in
+        # notInReachConstructs. The wrapper then DERIVES the row's status from
+        # the partition rather than taking the model's word for it.
         #
         # That is the whole mechanism. One chosen method can no longer stand in
         # for a rule, silence can no longer read as compliance, and the status a
@@ -934,7 +938,7 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
             # expansion, and that is now caught inside the expander.
         }
 
-        # The set this row owes a verdict for.
+        # The applicable subset: these are the only anchors the rule may judge.
         $requiredList = [System.Collections.Generic.List[string]]::new()
         foreach ($kind in $scopeKinds) {
             if (-not $idsByKind.ContainsKey($kind)) {
@@ -945,6 +949,7 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
             foreach ($id in $idsByKind[$kind]) { [void]$requiredList.Add($id) }
         }
         $required = @($requiredList.ToArray())
+        $sealedUniverse = @($constructById.Keys)
         # A scope has to name a kind. With `none` the required set is empty, the
         # missing-anchor check is vacuous, and out-of-reach ids are exempt from
         # the stray check - so one arbitrary id in `notInReachConstructs` bought
@@ -957,14 +962,15 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
                 $degradedReason = "the row declared no construct kind while $($constructById.Count) anchors were enumerated; a rule that reaches nothing must name the kinds it would govern and put their anchors out of reach"
             }
         }
-        # Out of reach is a verdict about an anchor this rule was asked about,
-        # not a place to file ids from kinds the row said it does not govern.
-        $outOfScopeNotInReach = @(@($notInReach) | Where-Object { $required -cnotcontains $_ })
-        if ($outOfScopeNotInReach.Count -gt 0) {
+        # Scope limits applicable verdicts, not the universe. Anchors of other
+        # kinds are still part of the exact partition, but may only be ruled out.
+        $outOfScopeJudgements = @(@($violating) + @($compliantIds) + @($unknownIds) |
+            Where-Object { $required -cnotcontains $_ })
+        if ($outOfScopeJudgements.Count -gt 0) {
             $status = "unknown"
             if (-not $degradedReason) {
-                $degradedReason = "the row ruled anchors out of reach that its own declared scope never covered: " +
-                (@($outOfScopeNotInReach | Select-Object -First 20) -join ",")
+                $degradedReason = "the row judged anchors outside its applicable scope instead of ruling them out of reach: " +
+                (@($outOfScopeJudgements | Select-Object -First 20) -join ",")
             }
         }
 
@@ -994,27 +1000,30 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
                 (@($ghostAnchors | Select-Object -First 20) -join ",")
             }
         }
-        # Exact 1:1 coverage of the declared scope. Missing is silence; stray is
-        # a verdict about something the row said its rule does not govern -
-        # except for out-of-reach, which is meaningful about any anchor.
+        # Exact 1:1 coverage of the full sealed universe. Scope is checked
+        # separately above so an outside-kind anchor can appear only out of
+        # reach, never as a substantive or undecided judgement.
         $verdictBearing = @(@($violating) + @($compliantIds) + @($unknownIds))
         $weighedAnything = @($verdictBearing).Count -gt 0
-        $missingConstructs = @(@($required) | Where-Object { $allAccounted -cnotcontains $_ })
-        $strayConstructs = @(@($verdictBearing) | Where-Object { $required -cnotcontains $_ })
-        if ($missingConstructs.Count -gt 0 -or $strayConstructs.Count -gt 0) {
+        $missingConstructs = @(@($sealedUniverse) | Where-Object { -not $seenInPartition.Contains($_) })
+        if ($missingConstructs.Count -gt 0) {
             $status = "unknown"
             if (-not $degradedReason) {
-                # Name them. "22 unaccounted" tells a reader something went
-                # wrong; the ids tell them which anchors nobody looked at.
-                $degradedReason = $(if ($missingConstructs.Count -gt 0) {
-                        "the row declared scope '$scope' but gave no verdict for these anchors: " +
-                        (@($missingConstructs | Select-Object -First 20) -join ",") +
-                        $(if ($missingConstructs.Count -gt 20) { " and $($missingConstructs.Count - 20) more" } else { "" })
-                    }
-                    else {
-                        "the row judged anchors its own declared scope excludes: " +
-                        (@($strayConstructs | Select-Object -First 20) -join ",")
-                    })
+                $degradedReason = "the row gave no verdict for these sealed anchors: " +
+                (@($missingConstructs | Select-Object -First 20) -join ",") +
+                $(if ($missingConstructs.Count -gt 20) { " and $($missingConstructs.Count - 20) more" } else { "" })
+            }
+        }
+        # In-scope narrowing is a model judgement, not a consequence of kind.
+        # Require the row to carry evidence for it; outside-scope anchors need no
+        # extra prose because the declared scope itself is the allowed evidence.
+        $applicableNotInReach = @(@($notInReach) | Where-Object { $required -ccontains $_ })
+        $reachEvidence = [string](Get-ReviewerConventionSpecialistValue $row "codeEvidence" "")
+        if ($applicableNotInReach.Count -gt 0 -and [string]::IsNullOrWhiteSpace($reachEvidence)) {
+            $status = "unknown"
+            if (-not $degradedReason) {
+                $degradedReason = "the row ruled applicable anchors out of reach without code evidence: " +
+                (@($applicableNotInReach | Select-Object -First 20) -join ",")
             }
         }
         # `none` with nothing named is not an answer. A rule that genuinely
