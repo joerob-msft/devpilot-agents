@@ -660,7 +660,7 @@ Assert-Source ([int]$report.CoveredFiles -eq 1 -and [int]$report.ChangedFileCoun
 Assert-Source ([int]$report.CoveragePercent -eq 20) "the coverage percentage is measured against the files that carry source"
 foreach ($file in @($report.Files)) {
     if (-not [string]$file.Reason) { continue }
-    Assert-Source (@("budgetExhausted", "sliceCountCapExceeded", "fileTooLarge", "notTextual", "transportFailed", "noChangedSpans", "fileCountCapExceeded", "pathRejected", "spanOutsideFile", "unsafeSliceText") -ccontains [string]$file.Reason) `
+    Assert-Source (@("budgetExhausted", "sliceCountCapExceeded", "fileTooLarge", "notTextual", "transportFailed", "noChangedSpans", "fileCountCapExceeded", "pathRejected", "spanOutsideFile", "unsafeSliceText", "recoveredHunkShortfall") -ccontains [string]$file.Reason) `
         "reason '$($file.Reason)' is in the closed reason set"
 }
 Assert-Source (Test-Throws { New-ReviewerSourceFileEntry -Path '/a' -CommitSha $commit -Status 'omitted' -Reason 'madeUp' }) `
@@ -775,7 +775,7 @@ $forgedRendered = Format-ReviewerSealedSourceBlock -Report $forgedReport -NonceF
 # header's column count, so extra cells - not extra rows - are how a forged
 # path would present an unread file as delivered.
 foreach ($row in @($forgedRendered -split "`n" | Where-Object { $_.StartsWith('|', [StringComparison]::Ordinal) })) {
-    Assert-Source ((@($row -split '\|')).Count -eq 6) "accounting row '$row' has exactly four cells"
+    Assert-Source ((@($row -split '\|')).Count -eq 7) "accounting row '$row' has exactly five cells"
 }
 Assert-Source (-not $forgedRendered.Contains($forgedPath, [StringComparison]::Ordinal)) `
     "a refused path is never echoed into the model-facing block"
@@ -1074,11 +1074,14 @@ Assert-Source ((Measure-WrapperVariableWrite -FunctionAst $transportAst -Name 'c
     "and the change set, its spans, its change kinds and the re-read head are each established once"
 # Counting writes says nothing about REACHABILITY: an inserted early return of a
 # doctored result leaves every pinned line intact and simply never runs it.
+# Three returns: (1) the capability-gated new-contract dispatch, (2) the reader
+# closure's own return inside .GetNewClosure(), and (3) the legacy path's final
+# return. The new-contract dispatch delegates to a separately validated function.
 Assert-Source (@($transportAst.FindAll({
                 param($candidate)
                 $candidate -is [Management.Automation.Language.ReturnStatementAst]
-            }, $true)).Count -eq 2) `
-    "and the transport has exactly two returns - the reader's and its own - so no earlier one can hand back a doctored result the pinned lines below never reach"
+            }, $true)).Count -eq 3) `
+    "and the transport has exactly three returns - the capability-gated dispatch, the reader's and its own - so no earlier one can hand back a doctored result the pinned lines below never reach"
 # ...and counting returns is not enough either, because PowerShell returns a
 # value without one. A bare hashtable on its own line joins the output: emitted
 # beside the real return it makes `Gate.Ok` the array `@($true, $false)`, which
@@ -1087,7 +1090,7 @@ Assert-Source ((Measure-WrapperBareOutput -FunctionAst $transportAst -AllowedCom
             'Assert-ReviewerSourceChangeSetAgreement',
             'ConvertFrom-AgentMcpResourceContent',
             'New-AgentNonce')) -eq 0) `
-    "and it emits nothing bare and calls nothing in statement position but the three commands listed here, so no doctored value can join what it returns without being one of those two returns"
+    "and it emits nothing bare and calls nothing in statement position but the three commands listed here, so no doctored value can join what it returns without being one of those three returns"
 $transportStatements = @($transportAst.Body.EndBlock.Statements)
 Assert-Source ($transportStatements.Count -gt 0 -and
     $transportStatements[-1] -is [Management.Automation.Language.ReturnStatementAst]) `
@@ -1125,7 +1128,8 @@ Assert-Source ($transportText -match 'Record\s*=\s*\(ConvertTo-ReviewerSourceCov
 # rest of the layer is judged against. A literal list at this call site would
 # decode whatever it named while every policy assertion in this file still
 # passed.
-Assert-Source ($transportText -match '-AllowedMimeTypes @\(\$SourceTransportPolicy\.allowedMimeTypes\)') `
+$boundReaderText = Get-FunctionTextFromWrapper -Name 'Get-ReviewerBoundSourceContent'
+Assert-Source ($boundReaderText -match '-AllowedMimeTypes @\(\$SourceTransportPolicy\.allowedMimeTypes\)') `
     "the decoder's accepted content types come from the validated policy, never a literal list"
 # The one remaining way to present source as pinned when it is not: the author
 # pushes between the change-set read and the byte read, and the slices are
@@ -1633,7 +1637,7 @@ Assert-Source (@($script:ReviewerSourceNothingToReadReasons) -join ',' -ceq 'noC
     "the nothing-to-read set the sentence is built from holds exactly noChangedSpans"
 # Derived, not hand-listed: the block's sentence is generated from the same sets,
 # so a hand-maintained copy here would be exactly the drift this file refuses.
-$structuralReasons = @('pathRejected', 'fileCountCapExceeded', 'budgetExhausted', 'sliceCountCapExceeded', 'spanOutsideFile', 'unsafeSliceText')
+$structuralReasons = @('pathRejected', 'fileCountCapExceeded', 'budgetExhausted', 'sliceCountCapExceeded', 'spanOutsideFile', 'unsafeSliceText', 'recoveredHunkShortfall')
 foreach ($readerReason in @($script:ReviewerSourceOmissionReasons | Where-Object {
             $script:ReviewerSourceNothingToReadReasons -cnotcontains $_ -and $structuralReasons -cnotcontains $_
         })) {
@@ -2661,6 +2665,865 @@ Assert-Source (Test-Throws {
         New-ReviewerSourceTransportPolicy -Policy ([pscustomobject]$incomplete)
     }) "a policy that omits the sibling budget is refused rather than defaulted"
 
+# ---------------------------------------------------------------------------
+Write-Host "[19/19] Degenerate ADO edits recover only proven right-hand spans" -ForegroundColor Cyan
+# ---------------------------------------------------------------------------
+
+$recoveryBinding = [pscustomobject][ordered]@{
+    Organization = "example"; Project = "widgets"
+    RepositoryId = "11111111-1111-1111-1111-111111111111"
+    PullRequestId = 42
+    IterationId = 7
+    SourceCommit = "a" * 40
+    TargetCommit = "b" * 40
+    BaseCommit = "c" * 40
+}
+function New-RecoveryResource {
+    param(
+        [string]$Path,
+        [string]$CommitSha,
+        [string]$Text,
+        [string[]]$ChangeKinds = @("edit"),
+        [string]$Rejected = "",
+        $Binding = $recoveryBinding
+    )
+    return [pscustomobject][ordered]@{
+        Text = $Text; MimeType = "text/plain"
+        ByteLength = [Text.Encoding]::UTF8.GetByteCount($Text)
+        Sha256 = Get-ReviewerSourceSha256 -Text $Text
+        Rejected = $Rejected
+        Organization = $Binding.Organization; Project = $Binding.Project
+        RepositoryId = $Binding.RepositoryId; PullRequestId = $Binding.PullRequestId
+        SourceCommit = $Binding.SourceCommit; TargetCommit = $Binding.TargetCommit
+        BaseCommit = $Binding.BaseCommit; IterationId = $Binding.IterationId
+        Path = $Path; CommitSha = $CommitSha; ChangeKinds = @($ChangeKinds)
+    }
+}
+function New-DegenerateEdit {
+    param([string]$Path)
+    return [pscustomobject]@{
+        item = [pscustomobject]@{ path = $Path; isFolder = $false }
+        changeType = "Edit"
+        diff = [pscustomobject]@{
+            lineDiffBlocks = @(
+                [pscustomobject]@{ changeType = 0; modifiedLineNumberStart = 1; modifiedLinesCount = 4 },
+                [pscustomobject]@{ changeType = 2; modifiedLineNumberStart = 0; modifiedLinesCount = 0 }
+            )
+        }
+    }
+}
+
+$targetText = "one`ntwo`nthree`nfour`n"
+$sourceText = "one`nTWO`nthree`nfour`nfive`n"
+$degenerateResponse = [pscustomobject]@{ changes = @((New-DegenerateEdit -Path "/src/a.cs")) }
+$aggregateSpans = Get-ReviewerSourceChangedSpans -Response $degenerateResponse
+$recovered = Get-ReviewerSourceRecoveredSpans -Response $degenerateResponse -SpansByPath $aggregateSpans `
+    -Binding $recoveryBinding `
+    -SourceReader { param($Path, $Kinds) New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit -Text $sourceText -ChangeKinds $Kinds } `
+    -BaseReader { param($Path, $Kinds) New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.BaseCommit -Text $targetText -ChangeKinds $Kinds }
+$exactSpans = @($recovered.SpansByPath["/src/a.cs"])
+Assert-Source ($exactSpans.Count -eq 2 -and [int]$exactSpans[0].Start -eq 2 -and [int]$exactSpans[0].End -eq 2 -and
+    [int]$exactSpans[1].Start -eq 5 -and [int]$exactSpans[1].End -eq 5) `
+    "a context/delete-only edit recovers the exact replacement and appended right-hand lines"
+$recoveredReport = New-ReviewerSourceTransportReport -CommitSha $recoveryBinding.SourceCommit `
+    -ChangedPaths @("/src/a.cs") -SpansByPath $recovered.SpansByPath -Policy $policy `
+    -Reader { param($Path) New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit -Text $sourceText } `
+    -ChangeKindsByPath (Get-ReviewerSourceChangeKindsByPath -Response $degenerateResponse)
+Assert-Source ([int]$recoveredReport.CoveredFiles -eq 1 -and [int]$recoveredReport.CoveragePercent -eq 100 -and
+    (Test-ReviewerSourceCoverageGate -Report $recoveredReport -Policy $policy).Ok) `
+    "proven recovered spans flow through the ordinary slicer and unchanged coverage gate"
+
+$ordinaryResponse = [pscustomobject]@{ changes = @([pscustomobject]@{
+            item = [pscustomobject]@{ path = "/src/ordinary.cs"; isFolder = $false }; changeType = "Edit"
+            diff = [pscustomobject]@{ lineDiffBlocks = @([pscustomobject]@{
+                        changeType = 3; modifiedLineNumberStart = 3; modifiedLinesCount = 2
+                    }) }
+        }) }
+$ordinarySpans = Get-ReviewerSourceChangedSpans -Response $ordinaryResponse
+$ordinaryReads = 0
+$ordinaryRecovered = Get-ReviewerSourceRecoveredSpans -Response $ordinaryResponse -SpansByPath $ordinarySpans `
+    -Binding $recoveryBinding -SourceReader { $script:ordinaryReads++; throw "must not read" } `
+    -BaseReader { $script:ordinaryReads++; throw "must not read" }
+Assert-Source ($ordinaryReads -eq 0 -and @($ordinaryRecovered.SpansByPath["/src/ordinary.cs"]).Count -eq 1 -and
+    [int]@($ordinaryRecovered.SpansByPath["/src/ordinary.cs"])[0].Start -eq 3) `
+    "an ordinary authoritative right-hand span is unchanged and never enters recovery"
+$missingTargetBinding = [pscustomobject][ordered]@{
+    Organization = $recoveryBinding.Organization; Project = $recoveryBinding.Project
+    RepositoryId = $recoveryBinding.RepositoryId; PullRequestId = $recoveryBinding.PullRequestId
+    SourceCommit = $recoveryBinding.SourceCommit; TargetCommit = ""
+    BaseCommit = ""; IterationId = 0
+}
+$missingBindingReads = 0
+$missingBindingResult = Get-ReviewerSourceRecoveredSpans -Response $degenerateResponse -SpansByPath $aggregateSpans `
+    -Binding $missingTargetBinding -SourceReader { $script:missingBindingReads++; throw "must not read" } `
+    -BaseReader { $script:missingBindingReads++; throw "must not read" }
+Assert-Source ($missingBindingReads -eq 0 -and $missingBindingResult.AttemptedFileCount -eq 0 -and
+    @($missingBindingResult.SpansByPath["/src/a.cs"]).Count -eq 0) `
+    "a missing exact target commit disables recovery without inventing spans or making reads"
+
+$deleteResponse = [pscustomobject]@{ changes = @([pscustomobject]@{
+            item = [pscustomobject]@{ path = "/src/deleted.cs"; isFolder = $false }; changeType = "Delete"
+            diff = [pscustomobject]@{ lineDiffBlocks = @([pscustomobject]@{
+                        changeType = 2; modifiedLineNumberStart = 0; modifiedLinesCount = 0
+                    }) }
+        }) }
+$renameResponse = [pscustomobject]@{ changes = @([pscustomobject]@{
+            item = [pscustomobject]@{ path = "/src/renamed.cs"; isFolder = $false }; changeType = "Rename"
+            diff = [pscustomobject]@{ lineDiffBlocks = @([pscustomobject]@{
+                        changeType = 0; modifiedLineNumberStart = 1; modifiedLinesCount = 4
+                    }) }
+        }) }
+Assert-Source (@((Get-ReviewerSourceDegenerateChanges -Response $deleteResponse).Keys).Count -eq 0) `
+    "a genuine delete never becomes a recovery candidate"
+Assert-Source (@((Get-ReviewerSourceDegenerateChanges -Response $renameResponse).Keys).Count -eq 0) `
+    "a pure rename never becomes a recovery candidate"
+
+foreach ($negative in @(
+        @{ Name = "missing source"; Source = $null; Base = (New-RecoveryResource "/src/a.cs" $recoveryBinding.BaseCommit $targetText) },
+        @{ Name = "missing base"; Source = (New-RecoveryResource "/src/a.cs" $recoveryBinding.SourceCommit $sourceText); Base = $null },
+        @{ Name = "binary source"; Source = (New-RecoveryResource "/src/a.cs" $recoveryBinding.SourceCommit "" @("edit") "notTextual"); Base = (New-RecoveryResource "/src/a.cs" $recoveryBinding.BaseCommit $targetText) },
+        @{ Name = "oversized source"; Source = (New-RecoveryResource "/src/a.cs" $recoveryBinding.SourceCommit "" @("edit") "fileTooLarge"); Base = (New-RecoveryResource "/src/a.cs" $recoveryBinding.BaseCommit $targetText) },
+        @{ Name = "oversized base"; Source = (New-RecoveryResource "/src/a.cs" $recoveryBinding.SourceCommit $sourceText); Base = (New-RecoveryResource "/src/a.cs" $recoveryBinding.BaseCommit "" @("edit") "fileTooLarge") },
+        @{ Name = "decode-rejected source"; Source = (New-RecoveryResource "/src/a.cs" $recoveryBinding.SourceCommit "" @("edit") "decodeRejected"); Base = (New-RecoveryResource "/src/a.cs" $recoveryBinding.BaseCommit $targetText) },
+        @{ Name = "same contents"; Source = (New-RecoveryResource "/src/a.cs" $recoveryBinding.SourceCommit $targetText); Base = (New-RecoveryResource "/src/a.cs" $recoveryBinding.BaseCommit $targetText) }
+    )) {
+    $negativeResult = Get-ReviewerSourceRecoveredSpans -Response $degenerateResponse -SpansByPath $aggregateSpans `
+        -Binding $recoveryBinding -SourceReader { param($Path, $Kinds) $negative.Source } `
+        -BaseReader { param($Path, $Kinds) $negative.Base }
+    Assert-Source (@($negativeResult.SpansByPath["/src/a.cs"]).Count -eq 0) `
+        "$($negative.Name) cannot synthesize a right-hand span"
+}
+
+foreach ($claim in @(
+        @{ Name = "stale source commit"; Property = "CommitSha"; Value = "c" * 40 },
+        @{ Name = "stale target binding"; Property = "TargetCommit"; Value = "c" * 40 },
+        @{ Name = "stale base binding"; Property = "BaseCommit"; Value = "d" * 40 },
+        @{ Name = "iteration mismatch"; Property = "IterationId"; Value = 8 },
+        @{ Name = "path mismatch"; Property = "Path"; Value = "/src/other.cs" },
+        @{ Name = "organization mismatch"; Property = "Organization"; Value = "other" },
+        @{ Name = "project mismatch"; Property = "Project"; Value = "other" },
+        @{ Name = "repository mismatch"; Property = "RepositoryId"; Value = "22222222-2222-2222-2222-222222222222" },
+        @{ Name = "PR mismatch"; Property = "PullRequestId"; Value = 99 },
+        @{ Name = "change-type mismatch"; Property = "ChangeKinds"; Value = @("delete") }
+    )) {
+    $hostile = New-RecoveryResource "/src/a.cs" $recoveryBinding.SourceCommit $sourceText
+    $hostile.($claim.Property) = $claim.Value
+    $hostileResult = Get-ReviewerSourceRecoveredSpans -Response $degenerateResponse -SpansByPath $aggregateSpans `
+        -Binding $recoveryBinding -SourceReader { param($Path, $Kinds) $hostile } `
+        -BaseReader { param($Path, $Kinds) New-RecoveryResource $Path $recoveryBinding.BaseCommit $targetText $Kinds }
+    Assert-Source (@($hostileResult.SpansByPath["/src/a.cs"]).Count -eq 0) `
+        "a hostile reader's $($claim.Name) claim fails recovery closed"
+}
+
+$malformedResponses = @(
+    [pscustomobject]@{ changes = @([pscustomobject]@{
+                item = [pscustomobject]@{ path = "/src/a.cs"; isFolder = $false }; changeType = "Edit"
+                diff = [pscustomobject]@{ lineDiffBlocks = @([pscustomobject]@{
+                            changeType = 0; modifiedLineNumberStart = 1
+                        }) }
+            }) },
+    [pscustomobject]@{ changes = @([pscustomobject]@{
+                item = [pscustomobject]@{ path = "/src/a.cs"; isFolder = $false }; changeType = "Edit"
+                diff = [pscustomobject]@{ lineDiffBlocks = @() }
+            }) },
+    [pscustomobject]@{ changes = @([pscustomobject]@{
+                item = [pscustomobject]@{ path = "/src/a.cs"; isFolder = $false }; changeType = "Edit"
+                diff = [pscustomobject]@{ lineDiffBlocks = @($null) }
+            }) }
+)
+foreach ($malformedResponse in $malformedResponses) {
+    Assert-Source (@((Get-ReviewerSourceDegenerateChanges -Response $malformedResponse).Keys).Count -eq 0) `
+        "malformed, empty, or truncated aggregate blocks are not treated as proof of recoverability"
+}
+Assert-Source ($null -eq (Get-ReviewerSourceDeterministicDiffSpans -TargetText ("x`n" * 20) `
+            -SourceText ("y`n" * 20) -MaxMatrixCells 100)) `
+    "diff work over the matrix cap is refused before spans are produced"
+Assert-Source ($null -eq (Get-ReviewerSourceDeterministicDiffSpans -TargetText "a`nb`nc`nd" `
+            -SourceText "A`nb`nC`nd" -MaxSpans 1)) `
+    "a recovered diff over the hunk cap is refused rather than truncated"
+$removedFinalNewline = @(Get-ReviewerSourceDeterministicDiffSpans -TargetText "a`n" -SourceText "a")
+$addedFinalNewline = @(Get-ReviewerSourceDeterministicDiffSpans -TargetText "a" -SourceText "a`n")
+$changedLineEndings = @(Get-ReviewerSourceDeterministicDiffSpans -TargetText "a`r`nb`r`n" -SourceText "a`nb`n")
+Assert-Source ($removedFinalNewline.Count -eq 1 -and [int]$removedFinalNewline[0].Start -eq 1 -and
+    $addedFinalNewline.Count -eq 1 -and [int]$addedFinalNewline[0].Start -eq 1) `
+    "adding or removing the final newline recovers the exact final right-hand line"
+Assert-Source ($changedLineEndings.Count -eq 1 -and [int]$changedLineEndings[0].Start -eq 1 -and
+    [int]$changedLineEndings[0].End -eq 2) `
+    "line-ending-only edits retain exact right-hand coverage instead of comparing equal"
+
+$commonText = "one`nshared-old`ntarget-old`npr-old`n"
+$advancedTargetText = "one`nshared-new`ntarget-new`npr-old`n"
+$advancedSourceText = "one`nshared-new`ntarget-old`npr-new`n"
+$wrongTargetSpans = Get-ReviewerSourceDeterministicDiffSpans -TargetText $advancedTargetText -SourceText $advancedSourceText
+$commonBaseSpans = Get-ReviewerSourceDeterministicDiffSpans -TargetText $commonText -SourceText $advancedSourceText
+Assert-Source ($wrongTargetSpans.Count -eq 1 -and [int]$wrongTargetSpans[0].Start -eq 3 -and
+    [int]$wrongTargetSpans[0].End -eq 4) `
+    "the reviewer repro proves target-tip comparison omits the shared target+PR hunk and attributes a target-only hunk"
+Assert-Source ($commonBaseSpans.Count -eq 2 -and ([int]($commonBaseSpans[0].Start)) -eq 2 -and
+    ([int]($commonBaseSpans[1].Start)) -eq 4) `
+    "common-base comparison includes the shared target+PR hunk and excludes the target-only hunk"
+
+$threeDeleteResponse = [pscustomobject]@{ changes = @([pscustomobject]@{
+            item = [pscustomobject]@{ path = "/src/evidence.cs"; isFolder = $false }; changeType = "Edit"
+            diff = [pscustomobject]@{ lineDiffBlocks = @(
+                    [pscustomobject]@{ changeType = 2; modifiedLineNumberStart = 0; modifiedLinesCount = 0 },
+                    [pscustomobject]@{ changeType = 0; modifiedLineNumberStart = 1; modifiedLinesCount = 4 },
+                    [pscustomobject]@{ changeType = 2; modifiedLineNumberStart = 0; modifiedLinesCount = 0 },
+                    [pscustomobject]@{ changeType = 2; modifiedLineNumberStart = 0; modifiedLinesCount = 0 }
+                ) }
+        }) }
+$evidenceRecovery = Get-ReviewerSourceRecoveredSpans -Response $threeDeleteResponse `
+    -SpansByPath (Get-ReviewerSourceChangedSpans $threeDeleteResponse) -Binding $recoveryBinding `
+    -SourceReader { param($Path, $Kinds) New-RecoveryResource $Path $recoveryBinding.SourceCommit $advancedSourceText $Kinds } `
+    -BaseReader { param($Path, $Kinds) New-RecoveryResource $Path $recoveryBinding.BaseCommit $commonText $Kinds }
+$evidenceReport = New-ReviewerSourceTransportReport -CommitSha $recoveryBinding.SourceCommit `
+    -ChangedPaths @("/src/evidence.cs") -SpansByPath $evidenceRecovery.SpansByPath -Policy $policy `
+    -Reader { param($Path) New-RecoveryResource $Path $recoveryBinding.SourceCommit $advancedSourceText } `
+    -ChangeKindsByPath (Get-ReviewerSourceChangeKindsByPath $threeDeleteResponse) `
+    -SpanBasisByPath $evidenceRecovery.SpanBasisByPath `
+    -ExpectedSpanCountByPath $evidenceRecovery.ExpectedSpanCountByPath `
+    -RecoveryAttemptedFileCount 1 -RecoveryRecoveredFileCount 1 `
+    -RecoveryEvidenceBlockCount $evidenceRecovery.EvidenceBlockCount `
+    -RecoveryBaseCommit $recoveryBinding.BaseCommit -RecoveryIterationId $recoveryBinding.IterationId
+Assert-Source ([int]$evidenceReport.RequestedSpanCount -eq 3 -and [int]$evidenceReport.DeliveredSpanCount -eq 2 -and
+    [int]$evidenceReport.SpanPercent -eq 66 -and -not (Test-ReviewerSourceCoverageGate $evidenceReport $policy).Ok) `
+    "independent aggregate evidence can keep recovered coverage below 100 instead of accepting a self-defined denominator"
+
+$singleHunkBaseText = "one`nold`nthree`n"
+$singleHunkSourceText = "one`nnew`nthree`n"
+$singleHunkRecovery = Get-ReviewerSourceRecoveredSpans -Response $threeDeleteResponse `
+    -SpansByPath (Get-ReviewerSourceChangedSpans $threeDeleteResponse) -Binding $recoveryBinding `
+    -SourceReader { param($Path, $Kinds) New-RecoveryResource $Path $recoveryBinding.SourceCommit $singleHunkSourceText $Kinds } `
+    -BaseReader { param($Path, $Kinds) New-RecoveryResource $Path $recoveryBinding.BaseCommit $singleHunkBaseText $Kinds }
+$singleHunkReport = New-ReviewerSourceTransportReport -CommitSha $recoveryBinding.SourceCommit `
+    -ChangedPaths @("/src/evidence.cs") -SpansByPath $singleHunkRecovery.SpansByPath -Policy $policy `
+    -Reader { param($Path) New-RecoveryResource $Path $recoveryBinding.SourceCommit $singleHunkSourceText } `
+    -ChangeKindsByPath (Get-ReviewerSourceChangeKindsByPath $threeDeleteResponse) `
+    -SpanBasisByPath $singleHunkRecovery.SpanBasisByPath `
+    -ExpectedSpanCountByPath $singleHunkRecovery.ExpectedSpanCountByPath `
+    -RecoveryAttemptedFileCount 1 -RecoveryRecoveredFileCount 1 `
+    -RecoveryEvidenceBlockCount $singleHunkRecovery.EvidenceBlockCount `
+    -RecoveryBaseCommit $recoveryBinding.BaseCommit -RecoveryIterationId $recoveryBinding.IterationId
+$singleHunkEntry = @($singleHunkReport.Files)[0]
+Assert-Source ([string]$singleHunkEntry.Status -ceq "partial" -and
+    [string]$singleHunkEntry.Reason -ceq "recoveredHunkShortfall" -and
+    [string]$singleHunkEntry.Reason -cne "budgetExhausted" -and
+    [int]$singleHunkEntry.DeliveredRawSpanCount -eq 1 -and
+    [int]$singleHunkEntry.RawRequestedSpanCount -eq 3 -and
+    [int]$singleHunkReport.SpanPercent -eq 33 -and
+    -not (Test-ReviewerSourceCoverageGate $singleHunkReport $policy).Ok) `
+    "three delete-evidence blocks but one proved recovered hunk reports recoveredHunkShortfall at 1/3 and keeps the gate closed"
+
+$budgetText = ("x" * 300) + "`nshort"
+$budgetReport = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths @("/src/budget.cs") `
+    -SpansByPath ([ordered]@{ "/src/budget.cs" = @(@{ Start = 1; End = 1 }) }) `
+    -Policy (New-TestPolicy -Overrides @{ contextRadiusLines = 0; maxSliceBytesPerFile = 256 }) `
+    -Reader { param($Path) [pscustomobject]@{
+            Text = $budgetText; MimeType = "text/plain"
+            ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($budgetText)
+            Sha256 = Get-ReviewerSourceSha256 -Text $budgetText
+        } }
+$budgetEntry = @($budgetReport.Files)[0]
+Assert-Source ([string]$budgetEntry.SpanBasis -ceq "changeSet" -and
+    [string]$budgetEntry.Reason -ceq "budgetExhausted") `
+    "a genuine changeSet slice-budget drop remains budgetExhausted"
+
+$addCandidate = [pscustomobject]@{ changes = @([pscustomobject]@{
+            item = [pscustomobject]@{ path = "/src/add.cs"; isFolder = $false }; changeType = "Add"
+            diff = [pscustomobject]@{ lineDiffBlocks = @($deleteBlock) }
+        }) }
+$renameEditCandidate = [pscustomobject]@{ changes = @([pscustomobject]@{
+            item = [pscustomobject]@{ path = "/src/moved.cs"; isFolder = $false }; changeType = "Edit, Rename"
+            diff = [pscustomobject]@{ lineDiffBlocks = @($deleteBlock) }
+        }) }
+$contextOnlyCandidate = [pscustomobject]@{ changes = @([pscustomobject]@{
+            item = [pscustomobject]@{ path = "/src/context.cs"; isFolder = $false }; changeType = "Edit"
+            diff = [pscustomobject]@{ lineDiffBlocks = @($contextBlock) }
+        }) }
+Assert-Source (@((Get-ReviewerSourceDegenerateChanges $addCandidate).Keys).Count -eq 0 -and
+    @((Get-ReviewerSourceDegenerateChanges $renameEditCandidate).Keys).Count -eq 0) `
+    "add and mixed edit/rename changes cannot read a path whose base mapping is unproven"
+Assert-Source (@((Get-ReviewerSourceDegenerateChanges $contextOnlyCandidate).Keys).Count -eq 0) `
+    "context-only blocks cannot define recovery and its denominator without independent delete evidence"
+
+$exceptionResponse = [pscustomobject]@{
+    changes = @((New-DegenerateEdit "/src/missing.cs"), (New-DegenerateEdit "/src/later.cs"))
+}
+$laterBaseReads = 0
+$exceptionRecovery = Get-ReviewerSourceRecoveredSpans -Response $exceptionResponse `
+    -SpansByPath (Get-ReviewerSourceChangedSpans $exceptionResponse) -Binding $recoveryBinding `
+    -SourceReader { param($Path, $Kinds)
+        if ($Path -ceq "/src/missing.cs") { throw "JSON-RPC path not found" }
+        New-RecoveryResource $Path $recoveryBinding.SourceCommit $sourceText $Kinds
+    } -BaseReader { param($Path, $Kinds)
+        $script:laterBaseReads++
+        New-RecoveryResource $Path $recoveryBinding.BaseCommit $targetText $Kinds
+    }
+Assert-Source (@($exceptionRecovery.SpansByPath["/src/missing.cs"]).Count -eq 0 -and
+    @($exceptionRecovery.SpansByPath["/src/later.cs"]).Count -gt 0 -and $laterBaseReads -eq 1) `
+    "an ordinary missing-path reader exception disables one recovery and later files still process"
+Assert-Source (Test-Throws {
+        Get-ReviewerSourceRecoveredSpans -Response $degenerateResponse -SpansByPath $aggregateSpans `
+            -Binding $recoveryBinding -SourceReader { throw "session is closed" } -BaseReader { throw "must not read" }
+    }) "a true session-fatal reader failure still propagates consistently"
+
+$recoveredRecord = ConvertTo-ReviewerSourceCoverageRecord -Report $evidenceReport -PolicySha256 ("d" * 64)
+$ordinaryBasisReport = New-ReviewerSourceTransportReport -CommitSha $recoveryBinding.SourceCommit `
+    -ChangedPaths @("/src/a.cs") -SpansByPath ([ordered]@{ "/src/a.cs" = @(@{ Start = 2; End = 2 }) }) `
+    -Policy $policy -Reader { param($Path) New-RecoveryResource $Path $recoveryBinding.SourceCommit $sourceText } `
+    -ChangeKindsByPath ([ordered]@{ "/src/a.cs" = @("edit") })
+$ordinaryBasisRecord = ConvertTo-ReviewerSourceCoverageRecord -Report $ordinaryBasisReport -PolicySha256 ("d" * 64)
+Assert-Source ([string]$recoveredRecord.files[0].spanBasis -ceq "recovered" -and
+    [int]$recoveredRecord.spanBasisVersion -eq 1 -and
+    [string]$recoveredRecord.recoveryBaseCommit -ceq $recoveryBinding.BaseCommit -and
+    [int]$recoveredRecord.recoveryAttemptedFileCount -eq 1 -and
+    [int]$recoveredRecord.recoveryRecoveredFileCount -eq 1) `
+    "coverage artifacts carry closed recovered provenance, exact base identity, and bounded counts"
+Assert-Source ([string]$ordinaryBasisRecord.files[0].spanBasis -ceq "changeSet" -and
+    [int]$ordinaryBasisRecord.recoveryAttemptedFileCount -eq 0 -and
+    [string]$ordinaryBasisRecord.recoveryBaseCommit -ceq "") `
+    "ordinary authoritative spans retain changeSet provenance and no recovery identity"
+$recoveredCanonical = $recoveredRecord | ConvertTo-Json -Depth 20 -Compress
+$tamperedRecord = $recoveredCanonical | ConvertFrom-Json -Depth 20
+$tamperedRecord.files[0].spanBasis = "changeSet"
+$tamperedCanonical = $tamperedRecord | ConvertTo-Json -Depth 20 -Compress
+Assert-Source ((Get-ReviewerSourceSha256 $recoveredCanonical) -cne (Get-ReviewerSourceSha256 $tamperedCanonical)) `
+    "tampering with span provenance changes the canonical artifact digest"
+$previewWriterText = Get-FunctionTextFromWrapper -Name 'Write-ReviewerPreview'
+$promotionText = Get-FunctionTextFromWrapper -Name 'Invoke-ReviewerPromotion'
+Assert-Source ($previewWriterText -match 'sourceCoverageJson\s*=' -and
+    $previewWriterText -match 'Get-ReviewerCanonicalJson -Value \$SourceCoverage' -and
+    $promotionText -match '"sourceCoverageJson"' -and
+    $promotionText -match 'coverage JSON is not canonical') `
+    "the signed promotion manifest seals canonical source coverage and promotion rejects noncanonical provenance"
+Assert-Source (Test-Throws {
+        New-ReviewerSourceTransportReport -CommitSha $recoveryBinding.SourceCommit -ChangedPaths @("/src/a.cs") `
+            -SpansByPath ([ordered]@{ "/src/a.cs" = @(@{ Start = 2; End = 2 }) }) -Policy $policy `
+            -Reader { param($Path) New-RecoveryResource $Path $recoveryBinding.SourceCommit $sourceText } `
+            -SpanBasisByPath ([ordered]@{ "/src/a.cs" = "hostClaim" })
+    }) "span provenance is a closed set and hostile values are refused"
+$recoveredBlock = Format-ReviewerSealedSourceBlock -Report $evidenceReport -NonceFactory { "r" * 32 }
+Assert-Source ($recoveredBlock -match '\| recovered \|' -and $recoveredBlock -match '"spanBasis":"recovered"' -and
+    $recoveredBlock -match 'common-base commit' -and $recoveredBlock -match 'iteration 7') `
+    "model-facing accounting distinguishes recovered evidence from ADO-declared spans"
+
+$capChanges = @("/src/1.cs", "/src/2.cs", "/src/3.cs") | ForEach-Object { New-DegenerateEdit $_ }
+$capResponse = [pscustomobject]@{ changes = $capChanges }
+$capSourceReads = 0
+$capTargetReads = 0
+$capResult = Get-ReviewerSourceRecoveredSpans -Response $capResponse `
+    -SpansByPath (Get-ReviewerSourceChangedSpans $capResponse) -Binding $recoveryBinding -MaxRecoveryFiles 2 `
+    -SourceReader { param($Path, $Kinds) $script:capSourceReads++; New-RecoveryResource $Path $recoveryBinding.SourceCommit $sourceText $Kinds } `
+    -BaseReader { param($Path, $Kinds) $script:capTargetReads++; New-RecoveryResource $Path $recoveryBinding.BaseCommit $targetText $Kinds }
+Assert-Source ($capResult.AttemptedFileCount -eq 2 -and $capSourceReads -eq 2 -and $capTargetReads -eq 2 -and
+    @($capResult.RecoveredPaths).Count -eq 2 -and @($capResult.SpansByPath["/src/3.cs"]).Count -eq 0) `
+    "the recovery request cap bounds both exact-commit readers and leaves later files uncovered"
+
+$mixedResponseForRecovery = [pscustomobject]@{
+    changes = @((New-DegenerateEdit "/src/good.cs"), (New-DegenerateEdit "/src/unread.cs"))
+}
+$mixedRecovered = Get-ReviewerSourceRecoveredSpans -Response $mixedResponseForRecovery `
+    -SpansByPath (Get-ReviewerSourceChangedSpans $mixedResponseForRecovery) -Binding $recoveryBinding `
+    -SourceReader { param($Path, $Kinds)
+        if ($Path -ceq "/src/unread.cs") { return $null }
+        New-RecoveryResource $Path $recoveryBinding.SourceCommit $sourceText $Kinds
+    } -BaseReader { param($Path, $Kinds) New-RecoveryResource $Path $recoveryBinding.BaseCommit $targetText $Kinds }
+$mixedRecoveryReport = New-ReviewerSourceTransportReport -CommitSha $recoveryBinding.SourceCommit `
+    -ChangedPaths @("/src/good.cs", "/src/unread.cs") -SpansByPath $mixedRecovered.SpansByPath -Policy $policy `
+    -Reader { param($Path)
+        if ($Path -ceq "/src/unread.cs") { return $null }
+        New-RecoveryResource $Path $recoveryBinding.SourceCommit $sourceText
+    } -ChangeKindsByPath (Get-ReviewerSourceChangeKindsByPath $mixedResponseForRecovery)
+$mixedRecoveryGate = Test-ReviewerSourceCoverageGate -Report $mixedRecoveryReport -Policy $policy
+Assert-Source ([int]$mixedRecoveryReport.CoveredFiles -eq 1 -and [int]$mixedRecoveryReport.SourceBearingFileCount -eq 2 -and
+    -not $mixedRecoveryGate.Ok -and @($mixedRecoveryReport.Files | Where-Object Reason -eq "transportFailed").Count -eq 1) `
+    "a mixed recovered/unrecovered set keeps the unread file in the denominator and fails the unchanged gate"
+
+$reportBuildAt = $transportText.IndexOf('New-ReviewerSourceTransportReport', [StringComparison]::Ordinal)
+Assert-Source ($reportBuildAt -ge 0 -and $transportText -match '-SpansByPath \$spansByPath' -and
+    $transportText -match 'Test-ReviewerSourceCoverageGate -Report \$report') `
+    "all source spans feed the ordinary report before the unchanged coverage gate is computed"
+Assert-Source ($cycleText.IndexOf('if (-not $sourceTransport.Gate.Ok)', [StringComparison]::Ordinal) -lt
+    $cycleText.IndexOf('Invoke-ReviewerPullRequest -Session', [StringComparison]::Ordinal)) `
+    "recovery cannot move model execution ahead of the coverage decision"
+Assert-Source ($transportText.IndexOf('get_iterations', [StringComparison]::Ordinal) -lt 0 -and
+    $transportText.IndexOf('New-ReviewerSourceRecoveryContext', [StringComparison]::Ordinal) -lt 0) `
+    "the legacy transport path does not invoke an unsupported iteration action or recover without an authoritative common-base seam"
+
+# ---------------------------------------------------------------------------
+# Final flat PR #1499 get_changes contract. The whole orchestration lives in the
+# LIBRARY (SourceTransport.ps1) so it can be replayed offline, arguments and all.
+# Every fixture below is synthetic and derived only from the SHAPE of the
+# contract: a bounded, iteration-pinned, flat-paginated change set whose identity
+# is re-checked on every page and re-read whole after the content reads.
+# ---------------------------------------------------------------------------
+Write-Host "`nFlat get_changes contract tests:" -ForegroundColor Cyan
+
+# -- Capability detection -----------------------------------------------------
+# The final contract is additive: iterationId is the only new input, paging still
+# uses the existing top and skip. Activation also requires Agency's advertised
+# aggregate diff inputs; the public local server intentionally has no span seam.
+$fcValidToolsList = [pscustomobject]@{
+    tools = @([pscustomobject]@{
+            name        = "repo_pull_request"
+            inputSchema = [pscustomobject]@{
+                properties = [pscustomobject]@{
+                    action      = [pscustomobject]@{ enum = @("get", "list", "get_changes") }
+                    iterationId = [pscustomobject]@{ type = "number" }
+                    top         = [pscustomobject]@{ type = "number" }
+                    skip        = [pscustomobject]@{ type = "number" }
+                    includeDiffs = [pscustomobject]@{ type = "boolean" }
+                    includeLineContent = [pscustomobject]@{ type = "boolean" }
+                }
+            }
+        })
+}
+$fcCapability = Test-ReviewerSourceGetChangesCapability -ToolsListResult $fcValidToolsList
+Assert-Source ($null -ne $fcCapability -and [bool]$fcCapability.Capable -and
+    [int]$fcCapability.PageSize -eq 200 -and [int]$fcCapability.ChangeLimit -eq 1000) `
+    "the additive identity plus aggregate-diff schema yields a bounded 200-page/1000-total capability"
+
+$publicLocalSchema = [pscustomobject]@{ tools = @([pscustomobject]@{
+            name = "repo_pull_request"
+            inputSchema = [pscustomobject]@{ properties = [pscustomobject]@{
+                    action = [pscustomobject]@{ enum = @("get_changes") }
+                    iterationId = [pscustomobject]@{ type = "number" }
+                    top = [pscustomobject]@{ type = "number" }
+                    skip = [pscustomobject]@{ type = "number" }
+                } }
+        }) }
+Assert-Source ($null -eq (Test-ReviewerSourceGetChangesCapability -ToolsListResult $publicLocalSchema)) `
+    "the public identity-only schema stays dormant because it cannot preserve ordinary aggregate spans"
+
+# The obsolete FileDiff schema (includeLineDiffs/paths/changePageSize/changeLimit)
+# is NOT the flat contract: without top/skip it stays dormant on the legacy body.
+$oldToolsList = [pscustomobject]@{
+    tools = @([pscustomobject]@{
+            name        = "repo_pull_request"
+            inputSchema = [pscustomobject]@{
+                properties = [pscustomobject]@{
+                    action           = [pscustomobject]@{ enum = @("get", "list", "get_changes") }
+                    iterationId      = [pscustomobject]@{ type = "number" }
+                    includeLineDiffs = [pscustomobject]@{ type = "boolean" }
+                    paths            = [pscustomobject]@{ type = "array"; maxItems = 20 }
+                    changePageSize   = [pscustomobject]@{ type = "number"; maximum = 200 }
+                    changeLimit      = [pscustomobject]@{ type = "number"; maximum = 1000 }
+                }
+            }
+        })
+}
+Assert-Source ($null -eq (Test-ReviewerSourceGetChangesCapability -ToolsListResult $oldToolsList)) `
+    "the old FileDiff schema without top/skip stays dormant and runs the legacy body"
+foreach ($drop in @("iterationId", "top", "skip")) {
+    $props = [ordered]@{
+        action      = [pscustomobject]@{ enum = @("get_changes") }
+        iterationId = [pscustomobject]@{ type = "number" }
+        top         = [pscustomobject]@{ type = "number" }
+        skip        = [pscustomobject]@{ type = "number" }
+        includeDiffs = [pscustomobject]@{ type = "boolean" }
+        includeLineContent = [pscustomobject]@{ type = "boolean" }
+    }
+    $props.Remove($drop)
+    $partial = [pscustomobject]@{ tools = @([pscustomobject]@{ name = "repo_pull_request"
+                inputSchema = [pscustomobject]@{ properties = [pscustomobject]$props } }) }
+    Assert-Source ($null -eq (Test-ReviewerSourceGetChangesCapability -ToolsListResult $partial)) `
+        "a schema missing the '$drop' input is not the flat contract and stays dormant"
+}
+$noActionList = [pscustomobject]@{ tools = @([pscustomobject]@{ name = "repo_pull_request"
+            inputSchema = [pscustomobject]@{ properties = [pscustomobject]@{
+                    action = [pscustomobject]@{ enum = @("get", "list") }
+                    iterationId = [pscustomobject]@{ type = "number" }
+                    top = [pscustomobject]@{ type = "number" }; skip = [pscustomobject]@{ type = "number" } } } }) }
+Assert-Source ($null -eq (Test-ReviewerSourceGetChangesCapability -ToolsListResult $noActionList)) `
+    "a schema whose action enum omits get_changes stays dormant"
+Assert-Source ($null -eq (Test-ReviewerSourceGetChangesCapability -ToolsListResult $null) -and
+    $null -eq (Test-ReviewerSourceGetChangesCapability -ToolsListResult ([pscustomobject]@{ tools = @() }))) `
+    "a null or tool-less tools/list result stays dormant"
+
+# -- Page fixtures ------------------------------------------------------------
+# Constants match the recovery binding above so the reused readers stamp the same
+# authoritative identity the orchestrator derives from the pinned page.
+$fcSource = $recoveryBinding.SourceCommit
+$fcCommon = $recoveryBinding.BaseCommit
+$fcTarget = $recoveryBinding.TargetCommit
+$fcRepoId = $recoveryBinding.RepositoryId
+$fcPr = [int]$recoveryBinding.PullRequestId
+$fcIter = [int]$recoveryBinding.IterationId
+
+function New-FCPage {
+    param(
+        [object[]]$Changes = @(),
+        [bool]$HasMore = $false,
+        [int]$NextSkip = 0,
+        [int]$NextTop = 0,
+        [hashtable]$Overrides = @{}
+    )
+    $page = [pscustomobject]@{
+        iterationId      = $fcIter
+        commonRefCommit  = [pscustomobject]@{ commitId = $fcCommon }
+        sourceRefCommit  = [pscustomobject]@{ commitId = $fcSource }
+        targetRefCommit  = [pscustomobject]@{ commitId = $fcTarget }
+        iterationReason  = [pscustomobject]@{ value = 1; names = @("push"); unrecognizedBits = 0 }
+        oldTargetRefName = $null
+        newTargetRefName = $null
+        commitsTruncated = $false
+        hasMoreChanges   = $HasMore
+        nextSkip         = $NextSkip
+        nextTop          = $NextTop
+        changes          = @($Changes)
+    }
+    foreach ($k in $Overrides.Keys) {
+        $page.PSObject.Properties.Remove($k)
+        $page | Add-Member -MemberType NoteProperty -Name $k -Value $Overrides[$k]
+    }
+    return $page
+}
+function New-FCOrdinaryChange {
+    param([string]$Path = "/src/ord.cs", [int]$Start = 2, [int]$Count = 1)
+    return [pscustomobject]@{
+        item       = [pscustomobject]@{ path = $Path; isFolder = $false }
+        changeType = "Edit"
+        diff       = [pscustomobject]@{ lineDiffBlocks = @(
+                [pscustomobject]@{ changeType = 3; modifiedLineNumberStart = $Start; modifiedLinesCount = $Count }) }
+    }
+}
+
+# Every valid page carries a consistent, fully-populated identity.
+$fcBinding = Get-ReviewerSourceIterationPageBinding -Response (New-FCPage -Changes @((New-FCOrdinaryChange))) `
+    -ExpectedSkip 0 -ExpectedTop 200 -AllowAnyIteration
+Assert-Source ($null -ne $fcBinding -and [int]$fcBinding.IterationId -eq $fcIter -and
+    [string]$fcBinding.CommonRefCommit -ceq $fcCommon -and [string]$fcBinding.SourceRefCommit -ceq $fcSource -and
+    [string]$fcBinding.TargetRefCommit -ceq $fcTarget -and [string]$fcBinding.ReasonValue -ceq "1" -and
+    (@($fcBinding.ReasonNames) -join ",") -ceq "push" -and [long]$fcBinding.UnrecognizedBits -eq 0 -and
+    -not $fcBinding.HasMoreChanges -and [int]$fcBinding.NextSkip -eq 0 -and [int]$fcBinding.NextTop -eq 0) `
+    "a valid page binds a complete flat identity: iteration, common/source/target commits, reason and pagination"
+
+# A valid retarget names pair binds; a lone name, malformed ref, truncated
+# commits, mismatched iteration, or bad pagination each refuses the page.
+$fcRetargetPage = New-FCPage -Changes @((New-FCOrdinaryChange)) -Overrides @{
+    oldTargetRefName = "refs/heads/main"; newTargetRefName = "refs/heads/release" }
+Assert-Source ($null -ne (Get-ReviewerSourceIterationPageBinding -Response $fcRetargetPage -ExpectedSkip 0 -ExpectedTop 200 -AllowAnyIteration)) `
+    "a page carrying a complete old/new target ref pair binds"
+$fcBadCases = @(
+    @{ Name = "short common commit"; Overrides = @{ commonRefCommit = [pscustomobject]@{ commitId = "abc123" } } },
+    @{ Name = "missing source commit node"; Overrides = @{ sourceRefCommit = $null } },
+    @{ Name = "missing iterationReason"; Overrides = @{ iterationReason = $null } },
+    @{ Name = "reason names with a blank entry"; Overrides = @{ iterationReason = [pscustomobject]@{ value = 1; names = @("push", "  "); unrecognizedBits = 0 } } },
+    @{ Name = "reason value absent but bits set"; Overrides = @{ iterationReason = [pscustomobject]@{ value = $null; names = @(); unrecognizedBits = 4 } } },
+    @{ Name = "lone new target ref name"; Overrides = @{ newTargetRefName = "refs/heads/release" } },
+    @{ Name = "non-branch target ref"; Overrides = @{ oldTargetRefName = "refs/tags/v1"; newTargetRefName = "refs/heads/release" } },
+    @{ Name = "non-boolean hasMoreChanges"; Overrides = @{ hasMoreChanges = "yes" } }
+)
+foreach ($bad in $fcBadCases) {
+    $badPage = New-FCPage -Changes @((New-FCOrdinaryChange)) -Overrides $bad.Overrides
+    Assert-Source ($null -eq (Get-ReviewerSourceIterationPageBinding -Response $badPage -ExpectedSkip 0 -ExpectedTop 200 -AllowAnyIteration)) `
+        "a page with $($bad.Name) is refused (fails closed)"
+}
+# Pagination arithmetic: a continuation page must advance skip by its own change
+# count and keep top in range; a terminal page must zero both cursors.
+$fcBadPaging = New-FCPage -Changes @((New-FCOrdinaryChange)) -HasMore $true -NextSkip 5 -NextTop 200
+Assert-Source ($null -eq (Get-ReviewerSourceIterationPageBinding -Response $fcBadPaging -ExpectedSkip 0 -ExpectedTop 200 -AllowAnyIteration)) `
+    "a continuation page whose nextSkip does not advance by its change count is refused"
+$fcBadTerminal = New-FCPage -Changes @((New-FCOrdinaryChange)) -HasMore $false -NextSkip 1 -NextTop 0
+Assert-Source ($null -eq (Get-ReviewerSourceIterationPageBinding -Response $fcBadTerminal -ExpectedSkip 0 -ExpectedTop 200 -AllowAnyIteration)) `
+    "a terminal page that leaves a non-zero continuation cursor is refused"
+Assert-Source ($null -eq (Get-ReviewerSourceIterationPageBinding -Response (New-FCPage -Changes @((New-FCOrdinaryChange -Path "/a.cs"), (New-FCOrdinaryChange -Path "/b.cs"))) -ExpectedSkip 0 -ExpectedTop 1 -AllowAnyIteration)) `
+    "a page returning more changes than the requested top is refused"
+Assert-Source ($null -eq (Get-ReviewerSourceIterationPageBinding -Response (New-FCPage -Changes @((New-FCOrdinaryChange))) -ExpectedSkip 0 -ExpectedTop 200 -ExpectedIterationId 999)) `
+    "a page whose iteration id does not match the expected binding is refused"
+
+# -- Binding stability --------------------------------------------------------
+$fcStable = Get-ReviewerSourceIterationPageBinding -Response (New-FCPage -Changes @((New-FCOrdinaryChange))) -ExpectedSkip 0 -ExpectedTop 200 -AllowAnyIteration
+Assert-Source (Test-ReviewerSourceIterationBindingStable -Before $fcStable -After $fcStable) `
+    "an identity is stable against itself"
+foreach ($move in @(
+        @{ Name = "force push"; Overrides = @{ sourceRefCommit = [pscustomobject]@{ commitId = ("f" * 40) } } },
+        @{ Name = "rebase"; Overrides = @{ commonRefCommit = [pscustomobject]@{ commitId = ("e" * 40) } } },
+        @{ Name = "retarget"; Overrides = @{ oldTargetRefName = "refs/heads/main"; newTargetRefName = "refs/heads/release" } },
+        @{ Name = "reason change"; Overrides = @{ iterationReason = [pscustomobject]@{ value = 2; names = @("rebase"); unrecognizedBits = 0 } } }
+    )) {
+    $moved = Get-ReviewerSourceIterationPageBinding -Response (New-FCPage -Changes @((New-FCOrdinaryChange)) -Overrides $move.Overrides) -ExpectedSkip 0 -ExpectedTop 200 -AllowAnyIteration
+    Assert-Source (-not (Test-ReviewerSourceIterationBindingStable -Before $fcStable -After $moved)) `
+        "a $($move.Name) makes the identity unstable"
+}
+Assert-Source (-not (Test-ReviewerSourceIterationBindingStable -Before $null -After $fcStable) -and
+    -not (Test-ReviewerSourceIterationBindingStable -Before $fcStable -After $null)) `
+    "a null binding on either side is never stable"
+
+# -- Bounded pagination -------------------------------------------------------
+function Invoke-FCPager {
+    param([object[]]$Responses, $Calls, $Capability = $fcCapability)
+    $invoker = {
+        param([hashtable]$Arguments)
+        [void]$Calls.Add($Arguments)
+        return $Responses[$Calls.Count - 1]
+    }.GetNewClosure()
+    return Get-ReviewerSourcePinnedChangePages -ToolInvoker $invoker -Project "widgets" `
+        -RepositoryId $fcRepoId -PrId $fcPr -Capability $Capability
+}
+# Single page: one bounded call, aggregated change set, stable digest.
+$fcSingle = New-FCPage -Changes @((New-FCOrdinaryChange))
+$fcSingleCalls = [System.Collections.Generic.List[hashtable]]::new()
+$fcSingleResult = Invoke-FCPager -Responses @($fcSingle) -Calls $fcSingleCalls
+Assert-Source ($fcSingleCalls.Count -eq 1 -and [string]$fcSingleCalls[0].action -ceq "get_changes" -and
+    [int]$fcSingleCalls[0].top -eq 200 -and [int]$fcSingleCalls[0].skip -eq 0 -and
+    -not $fcSingleCalls[0].ContainsKey("iterationId") -and [int]$fcSingleCalls[0].pullRequestId -eq $fcPr) `
+    "the first page is fetched with a bounded top=200/skip=0 and no explicit iteration id"
+Assert-Source (@($fcSingleResult.Response.changes).Count -eq 1 -and [string]$fcSingleResult.ChangeSetSha256) `
+    "a single page aggregates its change set and produces a stable change-set digest"
+
+# Multi page: pages arrive in order, the second is pinned to the discovered
+# iteration, and the identity stays consistent across pages.
+$fcPage1 = New-FCPage -Changes @((New-FCOrdinaryChange -Path "/src/a.cs")) -HasMore $true -NextSkip 1 -NextTop 200
+$fcPage2 = New-FCPage -Changes @((New-FCOrdinaryChange -Path "/src/b.cs"))
+$fcMultiCalls = [System.Collections.Generic.List[hashtable]]::new()
+$fcMultiResult = Invoke-FCPager -Responses @($fcPage1, $fcPage2) -Calls $fcMultiCalls
+Assert-Source ($fcMultiCalls.Count -eq 2 -and [int]$fcMultiCalls[0].skip -eq 0 -and
+    -not $fcMultiCalls[0].ContainsKey("iterationId") -and
+    [int]$fcMultiCalls[1].skip -eq 1 -and [int]$fcMultiCalls[1].iterationId -eq $fcIter -and [int]$fcMultiCalls[1].top -eq 200) `
+    "paging advances skip by the delivered count and pins every page after the first to the discovered iteration"
+Assert-Source (@($fcMultiResult.Response.changes).Count -eq 2 -and
+    [string]@($fcMultiResult.Response.changes)[0].item.path -ceq "/src/a.cs" -and
+    [string]@($fcMultiResult.Response.changes)[1].item.path -ceq "/src/b.cs") `
+    "multi-page changes are aggregated in delivery order"
+
+# Mixed identity across pages fails closed.
+$fcMovedPage2 = New-FCPage -Changes @((New-FCOrdinaryChange -Path "/src/b.cs")) -Overrides @{
+    sourceRefCommit = [pscustomobject]@{ commitId = ("f" * 40) } }
+Assert-Source (Test-Throws {
+        $c = [System.Collections.Generic.List[hashtable]]::new()
+        Invoke-FCPager -Responses @($fcPage1, $fcMovedPage2) -Calls $c
+    }) "a page whose identity differs from the first fails closed with mixed-identity"
+
+# The page size is capped at 1000 however large the advertised capability.
+$fcHostileCap = [pscustomobject]@{ Capable = $true; PageSize = 99999; ChangeLimit = 99999 }
+$fcCapCalls = [System.Collections.Generic.List[hashtable]]::new()
+Invoke-FCPager -Responses @((New-FCPage -Changes @((New-FCOrdinaryChange)))) -Calls $fcCapCalls -Capability $fcHostileCap | Out-Null
+Assert-Source ([int]$fcCapCalls[0].top -le 1000) `
+    "an over-large advertised page size is capped to the 1000 hard ceiling on the wire"
+
+# A change set that never terminates within the bounded total fails closed.
+$fcRunawayCap = [pscustomobject]@{ Capable = $true; PageSize = 2; ChangeLimit = 3 }
+$fcRunA = New-FCPage -Changes @((New-FCOrdinaryChange -Path "/a.cs"), (New-FCOrdinaryChange -Path "/b.cs")) -HasMore $true -NextSkip 2 -NextTop 2
+$fcRunB = New-FCPage -Changes @((New-FCOrdinaryChange -Path "/c.cs")) -HasMore $true -NextSkip 3 -NextTop 1
+Assert-Source (Test-Throws {
+        $c = [System.Collections.Generic.List[hashtable]]::new()
+        Invoke-FCPager -Responses @($fcRunA, $fcRunB) -Calls $c -Capability $fcRunawayCap
+    }) "a change set that exceeds the bounded total (the ceiling is 1000) fails closed rather than reading forever"
+
+# -- Orchestration ------------------------------------------------------------
+$fcSourceReader = {
+    param([string]$Path, [string[]]$Kinds)
+    New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit -Text $sourceText -ChangeKinds @($Kinds)
+}.GetNewClosure()
+$fcBaseReader = {
+    param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+    New-RecoveryResource -Path $Path -CommitSha $BaseCommit -Text $targetText -ChangeKinds @($Kinds)
+}.GetNewClosure()
+function Invoke-FCOrchestrator {
+    param([object[]]$Responses, $Calls, [scriptblock]$SourceReader = $fcSourceReader,
+        [scriptblock]$BaseReader = $fcBaseReader, $Capability = $fcCapability, $AggregateResponse = $null,
+        $Events = $null)
+    if ($null -eq $AggregateResponse) { $AggregateResponse = [pscustomobject]@{ changes = @($Responses[0].changes) } }
+    $invoker = {
+        param([hashtable]$Arguments)
+        if ($null -ne $Events) { [void]$Events.Add("identity") }
+        [void]$Calls.Add($Arguments)
+        return $Responses[$Calls.Count - 1]
+    }.GetNewClosure()
+    $aggregateReader = {
+        if ($null -ne $Events) { [void]$Events.Add("aggregate") }
+        return $AggregateResponse
+    }.GetNewClosure()
+    return Invoke-ReviewerSourceNewContractTransport -ToolInvoker $invoker -Reader $SourceReader -BaseReader $BaseReader `
+        -Organization $recoveryBinding.Organization -Project $recoveryBinding.Project -RepositoryId $fcRepoId `
+        -PrId $fcPr -SourceCommit $fcSource -Capability $Capability -Policy $policy -PolicySha256 "" `
+        -NonceFactory { 'n' * 32 } -AggregateReader $aggregateReader
+}
+
+# A pure context/delete edit with delete evidence recovers the exact right-hand
+# spans from the common->source content read, presented as recovered evidence.
+$fcDegenerate = New-FCPage -Changes @((New-DegenerateEdit -Path "/src/a.cs"))
+$fcRecCalls = [System.Collections.Generic.List[hashtable]]::new()
+$fcRecEvents = [System.Collections.Generic.List[string]]::new()
+$fcRecResult = Invoke-FCOrchestrator -Responses @($fcDegenerate, $fcDegenerate) -Calls $fcRecCalls -Events $fcRecEvents
+Assert-Source ($fcRecCalls.Count -eq 2 -and [string]$fcRecCalls[0].action -ceq "get_changes" -and
+    [int]$fcRecCalls[0].top -eq 200 -and [int]$fcRecCalls[0].skip -eq 0 -and
+    -not $fcRecCalls[1].ContainsKey("iterationId") -and
+    (@($fcRecEvents) -join ",") -ceq "identity,aggregate,identity") `
+    "the orchestrator brackets the aggregate diff with complete latest-iteration identity reads"
+Assert-Source ([int]$fcRecResult.Report.CoveredFiles -eq 1 -and [int]$fcRecResult.Report.CoveragePercent -eq 100 -and
+    [bool]$fcRecResult.Gate.Ok -and $fcRecResult.BlockText -match '"spanBasis":"recovered"' -and $null -ne $fcRecResult.Record) `
+    "a degenerate same-path edit recovers its exact spans at spanBasis=recovered and passes the gate"
+
+$fcTruncatedCommits = New-FCPage -Changes @((New-DegenerateEdit -Path "/src/a.cs"))
+$fcTruncatedCommits.commitsTruncated = $true
+$fcTruncatedBinding = Get-ReviewerSourceIterationPageBinding -Response $fcTruncatedCommits `
+    -ExpectedSkip 0 -ExpectedTop 200 -ExpectedIterationId $fcIter
+Assert-Source ($null -ne $fcTruncatedBinding -and [bool]$fcTruncatedBinding.CommitsTruncated) `
+    "commit-list truncation remains bound metadata without losing exact common/source/target identity"
+
+# Ordinary server Add/Edit spans are authoritative and never enter recovery.
+$fcOrdinaryPage = New-FCPage -Changes @((New-FCOrdinaryChange -Path "/src/a.cs" -Start 2 -Count 1))
+$fcOrdCalls = [System.Collections.Generic.List[hashtable]]::new()
+$fcOrdResult = Invoke-FCOrchestrator -Responses @($fcOrdinaryPage, $fcOrdinaryPage) -Calls $fcOrdCalls `
+    -BaseReader { param($p, $k, $b) throw "recovery must not read on an ordinary authoritative span" }
+Assert-Source ([int]$fcOrdResult.Report.CoveragePercent -eq 100 -and [bool]$fcOrdResult.Gate.Ok -and
+    $fcOrdResult.BlockText -match '"spanBasis":"changeSet"' -and $fcOrdResult.BlockText -notmatch '"spanBasis":"recovered"') `
+    "an ordinary right-hand span is delivered unchanged at spanBasis=changeSet with no recovery reads"
+
+# The final public #1499 identity page carries raw change entries but no diff
+# blocks. It supplements the existing aggregate diff response rather than
+# replacing the ordinary authoritative span source.
+$fcRawIdentityChange = [pscustomobject]@{
+    changeTrackingId = 11
+    changeType = 2
+    item = [pscustomobject]@{ path = "/src/a.cs"; isFolder = $false }
+}
+$fcRawIdentityPage = New-FCPage -Changes @($fcRawIdentityChange)
+$fcAggregateOrdinary = [pscustomobject]@{ changes = @((New-FCOrdinaryChange -Path "/src/a.cs" -Start 2 -Count 1)) }
+$fcRawCalls = [System.Collections.Generic.List[hashtable]]::new()
+$fcRawResult = Invoke-FCOrchestrator -Responses @($fcRawIdentityPage, $fcRawIdentityPage) -Calls $fcRawCalls `
+    -AggregateResponse $fcAggregateOrdinary `
+    -BaseReader { param($p, $k, $b) throw "ordinary aggregate spans must not recover" }
+Assert-Source ([int]$fcRawResult.Report.CoveragePercent -eq 100 -and $fcRawResult.Gate.Ok -and
+    $fcRawResult.BlockText -match '"spanBasis":"changeSet"') `
+    "raw identity-only pages preserve ordinary spans from the separately bound aggregate diff"
+
+$fcAggregateDegenerate = [pscustomobject]@{ changes = @((New-DegenerateEdit -Path "/src/a.cs")) }
+$fcRawRecoveryCalls = [System.Collections.Generic.List[hashtable]]::new()
+$fcRawRecoveryResult = Invoke-FCOrchestrator -Responses @($fcRawIdentityPage, $fcRawIdentityPage) `
+    -Calls $fcRawRecoveryCalls -AggregateResponse $fcAggregateDegenerate
+Assert-Source ($fcRawRecoveryResult.Gate.Ok -and
+    $fcRawRecoveryResult.BlockText -match '"spanBasis":"recovered"') `
+    "raw identity-only pages bind common/source recovery for a degenerate aggregate edit"
+
+$fcRejectedPathChange = New-FCOrdinaryChange -Path "/src/x|hidden.cs" -Start 2 -Count 1
+$fcRejectedPage = New-FCPage -Changes @($fcRejectedPathChange)
+$fcRejectedCalls = [System.Collections.Generic.List[hashtable]]::new()
+$fcRejectedResult = Invoke-FCOrchestrator -Responses @($fcRejectedPage, $fcRejectedPage) -Calls $fcRejectedCalls
+Assert-Source ([int]$fcRejectedResult.Report.ChangedFileCount -eq 1 -and
+    [string]@($fcRejectedResult.Report.Files)[0].Reason -ceq "pathRejected" -and -not $fcRejectedResult.Gate.Ok) `
+    "a rejected Git path stays in the denominator and is accounted pathRejected"
+
+$fcDisagreeAggregate = [pscustomobject]@{ changes = @((New-FCOrdinaryChange -Path "/src/other.cs")) }
+Assert-Source (Test-Throws {
+        $c = [System.Collections.Generic.List[hashtable]]::new()
+        Invoke-FCOrchestrator -Responses @($fcOrdinaryPage, $fcOrdinaryPage) -Calls $c `
+            -AggregateResponse $fcDisagreeAggregate
+    }) "iteration pages and the aggregate diff must identify the exact same change set"
+
+# The pinned source must equal the iteration source or the whole read fails closed.
+$fcMismatchPage = New-FCPage -Changes @((New-FCOrdinaryChange)) -Overrides @{
+    sourceRefCommit = [pscustomobject]@{ commitId = ("d" * 40) } }
+Assert-Source (Test-Throws {
+        $c = [System.Collections.Generic.List[hashtable]]::new()
+        Invoke-FCOrchestrator -Responses @($fcMismatchPage, $fcMismatchPage) -Calls $c
+    }) "an iteration whose source commit does not equal the pinned source fails closed"
+
+# The post-read re-read fails closed on any movement: force push, rebase,
+# retarget, reason change, or a change-list that no longer matches.
+foreach ($race in @(
+        @{ Name = "force push"; Overrides = @{ sourceRefCommit = [pscustomobject]@{ commitId = ("f" * 40) } } },
+        @{ Name = "rebase"; Overrides = @{ commonRefCommit = [pscustomobject]@{ commitId = ("e" * 40) } } },
+        @{ Name = "retarget"; Overrides = @{ oldTargetRefName = "refs/heads/main"; newTargetRefName = "refs/heads/release" } },
+        @{ Name = "reason change"; Overrides = @{ iterationReason = [pscustomobject]@{ value = 2; names = @("rebase"); unrecognizedBits = 0 } } }
+    )) {
+    $confirmMoved = New-FCPage -Changes @((New-FCOrdinaryChange -Path "/src/a.cs" -Start 2 -Count 1)) -Overrides $race.Overrides
+    Assert-Source (Test-Throws {
+            $c = [System.Collections.Generic.List[hashtable]]::new()
+            Invoke-FCOrchestrator -Responses @($fcOrdinaryPage, $confirmMoved) -Calls $c `
+                -BaseReader { param($p, $k, $b) throw "no recovery here" }
+        }) "a $($race.Name) during content reads fails the post-read re-read closed"
+}
+$fcConfirmChanged = New-FCPage -Changes @((New-FCOrdinaryChange -Path "/src/a.cs" -Start 2 -Count 1), (New-FCOrdinaryChange -Path "/src/extra.cs"))
+Assert-Source (Test-Throws {
+        $c = [System.Collections.Generic.List[hashtable]]::new()
+        Invoke-FCOrchestrator -Responses @($fcOrdinaryPage, $fcConfirmChanged) -Calls $c `
+            -BaseReader { param($p, $k, $b) throw "no recovery here" }
+    }) "a change list that moves during content reads fails the post-read re-read closed"
+
+# A mixed set keeps the unread file in the denominator and fails the gate.
+$fcMixedPage = New-FCPage -Changes @((New-DegenerateEdit -Path "/src/a.cs"), (New-DegenerateEdit -Path "/src/unread.cs"))
+$fcMixedSourceReader = {
+    param([string]$Path, [string[]]$Kinds)
+    if ($Path -ceq "/src/unread.cs") { return $null }
+    New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit -Text $sourceText -ChangeKinds @($Kinds)
+}.GetNewClosure()
+$fcMixedCalls = [System.Collections.Generic.List[hashtable]]::new()
+$fcMixedResult = Invoke-FCOrchestrator -Responses @($fcMixedPage, $fcMixedPage) -Calls $fcMixedCalls -SourceReader $fcMixedSourceReader
+Assert-Source ([int]$fcMixedResult.Report.CoveredFiles -eq 1 -and [int]$fcMixedResult.Report.SourceBearingFileCount -eq 2 -and
+    -not $fcMixedResult.Gate.Ok) `
+    "a mixed recovered/unrecovered set keeps the unread file in the denominator and fails the gate"
+
+# Same content and a hostile reader both fail recovery closed - no invented span.
+$fcSameContentReader = {
+    param([string]$Path, [string[]]$Kinds)
+    New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit -Text $targetText -ChangeKinds @($Kinds)
+}.GetNewClosure()
+$fcSameResult = Invoke-FCOrchestrator -Responses @($fcDegenerate, $fcDegenerate) -Calls ([System.Collections.Generic.List[hashtable]]::new()) -SourceReader $fcSameContentReader
+Assert-Source (-not $fcSameResult.Gate.Ok -and $fcSameResult.BlockText -notmatch '"spanBasis":"recovered"') `
+    "identical common/source content cannot synthesize a span and the degenerate file fails the gate"
+$fcHostileReader = {
+    param([string]$Path, [string[]]$Kinds)
+    $r = New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit -Text $sourceText -ChangeKinds @($Kinds)
+    $r.CommitSha = "9" * 40
+    return $r
+}.GetNewClosure()
+$fcHostileResult = Invoke-FCOrchestrator -Responses @($fcDegenerate, $fcDegenerate) -Calls ([System.Collections.Generic.List[hashtable]]::new()) -SourceReader $fcHostileReader
+Assert-Source (-not $fcHostileResult.Gate.Ok -and $fcHostileResult.BlockText -notmatch '"spanBasis":"recovered"') `
+    "a hostile reader claiming the wrong pinned commit cannot drive recovery and fails the gate"
+
+# A same-path edit whose originalPath differs is a rename in disguise: excluded.
+$fcRenameEdit = [pscustomobject]@{
+    item         = [pscustomobject]@{ path = "/src/a.cs"; isFolder = $false }
+    changeType   = "Edit"
+    originalPath = "/src/old.cs"
+    diff         = [pscustomobject]@{ lineDiffBlocks = @(
+            [pscustomobject]@{ changeType = 0; modifiedLineNumberStart = 1; modifiedLinesCount = 4 },
+            [pscustomobject]@{ changeType = 2; modifiedLineNumberStart = 0; modifiedLinesCount = 0 }) }
+}
+Assert-Source (@((Get-ReviewerSourceDegenerateChanges -Response ([pscustomobject]@{ changes = @($fcRenameEdit) })).Keys).Count -eq 0) `
+    "a same-path edit whose originalPath differs is excluded from recovery"
+
+# -- Wiring, probe safety, and no obsolete tokens (structural) ----------------
+# The capability probe NEVER runs on the shared ordinary-transport session: a
+# tools/list failure aborts the session it runs on, and that session owns the
+# remaining reads and the pending PR writes. The transport delegates detection to
+# an isolated probe helper and runs the legacy body on the untouched session.
+$fcResolveText = Get-FunctionTextFromWrapper -Name 'Resolve-ReviewerGetChangesCapability'
+Assert-Source ($transportText.IndexOf('Send-AgentMcpRequest', [StringComparison]::Ordinal) -lt 0 -and
+    $transportText.IndexOf('Resolve-ReviewerGetChangesCapability', [StringComparison]::Ordinal) -ge 0) `
+    "the transport never probes on the shared session; it delegates capability detection to the isolated probe helper"
+Assert-Source ($fcResolveText.Length -gt 0 -and
+    $fcResolveText.IndexOf('Open-AgentMcpSession', [StringComparison]::Ordinal) -ge 0 -and
+    $fcResolveText.IndexOf('Close-AgentMcpSession', [StringComparison]::Ordinal) -ge 0 -and
+    $fcResolveText.IndexOf('finally', [StringComparison]::Ordinal) -ge 0 -and
+    $fcResolveText.IndexOf("Send-AgentMcpRequest -Session `$probeSession", [StringComparison]::Ordinal) -ge 0 -and
+    $fcResolveText.IndexOf("`$Session['GetChangesCapability'] = `$capability", [StringComparison]::Ordinal) -ge 0 -and
+    $fcResolveText.IndexOf("`$Session.ContainsKey('GetChangesCapability')", [StringComparison]::Ordinal) -ge 0) `
+    "the probe runs tools/list on a dedicated repos-only session, always closes it, and caches the result (including null) on the shared session"
+# The wrapper delegates to the library orchestrator, wiring the three live seams.
+$newContractText = Get-FunctionTextFromWrapper -Name 'Get-ReviewerSourceTransportNewContract'
+Assert-Source ($newContractText.Length -gt 0 -and
+    $newContractText.IndexOf('Invoke-ReviewerSourceNewContractTransport', [StringComparison]::Ordinal) -ge 0 -and
+    $newContractText.IndexOf('-ToolInvoker', [StringComparison]::Ordinal) -ge 0 -and
+    $newContractText.IndexOf('-BaseReader', [StringComparison]::Ordinal) -ge 0) `
+    "the wrapper is a thin adapter that hands the orchestrator its tool invoker and source/base readers"
+
+# The live flat implementation carries none of the obsolete FileDiff-contract
+# vocabulary. The check is case-sensitive so the capability's ChangeLimit/PageSize
+# fields are not mistaken for the dropped changeLimit/changePageSize arguments.
+$fcLiveText = (@(
+        'Test-ReviewerSourceGetChangesCapability', 'Get-ReviewerSourceIterationPageBinding',
+        'Test-ReviewerSourceIterationBindingStable', 'Get-ReviewerSourcePinnedChangePages',
+        'Invoke-ReviewerSourceNewContractTransport'
+    ) | ForEach-Object { (Get-Command $_).ScriptBlock.ToString() }) -join "`n"
+foreach ($token in @('targetTipAtIteration', 'compareTo', 'synthetic', 'FileDiff', 'fileDiff',
+        'includeLineDiffs', 'changePageSize', 'changeLimit', 'fileDiffBase', 'fileDiffTarget', 'get_iterations')) {
+    Assert-Source ($fcLiveText.IndexOf($token, [StringComparison]::Ordinal) -lt 0) `
+        "the live flat implementation contains no obsolete '$token' token"
+}
 # ---------------------------------------------------------------------------
 
 Write-Host ""

@@ -3837,6 +3837,11 @@ function Write-ReviewerPreview {
                 scriptSha256     = $ScriptSelfSha256
                 previewPath      = $path
                 previewSha256    = (Get-ReviewerTextSha256 -Text (Get-ReviewerNormalizedDocumentText -Text $text))
+                sourceCoverageJson = $(if ($null -eq $SourceCoverage) {
+                        ""
+                    } else {
+                        Get-ReviewerCanonicalJson -Value $SourceCoverage
+                    })
                 approvedComments = @(@($Postable) | ForEach-Object {
                         @{
                             severity = [string](Get-ReviewerHashValue -Container $_ -Key 'severity' -Default '')
@@ -7396,6 +7401,110 @@ function Get-ReviewerChangedPaths {
     }
 }
 
+function Get-ReviewerBoundSourceContent {
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$CommitSha,
+        [Parameter(Mandatory)][string[]]$ChangeKinds,
+        $Binding = $null
+    )
+    $toolResult = Send-AgentMcpRequest -Session $Session -Method "tools/call" -Params @{
+        name = "repo_file"
+        arguments = @{
+            action = "get_content"
+            project = $ExpectedProject
+            repositoryId = $cfgRepoId
+            path = $Path
+            versionType = "Commit"
+            version = $CommitSha
+        }
+    }
+    $classified = Get-ReviewerSourceReaderResult -ToolResult $toolResult -Path $Path -Policy $SourceTransportPolicy -Decoder {
+        param($InnerToolResult, [string]$InnerPath)
+        ConvertFrom-AgentMcpResourceContent -ToolResult $InnerToolResult -ExpectedUri $InnerPath `
+            -MaxBytes $script:ReviewerSourceDecoderCeilingBytes `
+            -AllowedMimeTypes @($SourceTransportPolicy.allowedMimeTypes)
+    }
+    if ($null -eq $classified) { return $null }
+    $result = [ordered]@{
+        Text = Get-ReviewerHashValue -Container $classified -Key "Text" -Default ""
+        MimeType = Get-ReviewerHashValue -Container $classified -Key "MimeType" -Default ""
+        ByteLength = [int](Get-ReviewerHashValue -Container $classified -Key "ByteLength" -Default 0)
+        Sha256 = Get-ReviewerHashValue -Container $classified -Key "Sha256" -Default ""
+        Rejected = Get-ReviewerHashValue -Container $classified -Key "Rejected" -Default ""
+        Path = $Path
+        CommitSha = $CommitSha
+        ChangeKinds = @($ChangeKinds)
+    }
+    if ($null -ne $Binding) {
+        foreach ($name in @("Organization", "Project", "RepositoryId", "PullRequestId",
+                "IterationId", "SourceCommit", "TargetCommit", "BaseCommit")) {
+            $result[$name] = $Binding.$name
+        }
+    }
+    return [pscustomobject]$result
+}
+
+function Resolve-ReviewerGetChangesCapability {
+    <# Detects the authoritative flat get_changes contract WITHOUT touching the
+       shared ordinary-transport session.
+
+       tools/list is a probe, and any failure Send-AgentMcpRequest raises has
+       already aborted the session it ran on. The shared session owns every
+       remaining PR read this cycle plus the pending PR writes, so probing on it
+       and then falling through to the legacy body would run that body on a closed
+       session and take out the whole cycle. Instead the probe runs on a dedicated,
+       short-lived, repos-only MCP session that is ALWAYS closed, whatever happens.
+
+       The structured capability - or $null on the old schema, a probe open
+       failure, or a tools/list failure - is cached on the shared session hashtable
+       (including the null), so the probe runs at most once per cycle and never
+       re-opens a second child. The seams are injected so the whole decision can be
+       replayed offline. #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)][string]$AgencyPath,
+        [scriptblock]$OpenProbeSession,
+        [scriptblock]$CloseProbeSession
+    )
+    if ($Session.ContainsKey('GetChangesCapability')) { return $Session['GetChangesCapability'] }
+    if (-not $OpenProbeSession) {
+        $OpenProbeSession = {
+            param([string]$Path)
+            Open-AgentMcpSession -AgencyPath $Path -Server "ado" `
+                -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
+                -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables
+        }
+    }
+    if (-not $CloseProbeSession) {
+        $CloseProbeSession = { param([hashtable]$ProbeSession) Close-AgentMcpSession -Session $ProbeSession -Abort }
+    }
+    $capability = $null
+    $probeSession = $null
+    try {
+        $probeSession = & $OpenProbeSession $AgencyPath
+        if ($probeSession -is [hashtable] -and [string]$probeSession.Server -ceq "ado" -and
+            [string]$probeSession.Organization -ceq $Organization) {
+            $toolsListResult = Send-AgentMcpRequest -Session $probeSession -Method "tools/list" -Params @{}
+            $capability = Test-ReviewerSourceGetChangesCapability -ToolsListResult $toolsListResult
+        }
+    }
+    catch {
+        # A probe open or tools/list failure leaves the shared session untouched and
+        # the legacy body runs against it. Never rethrow: the probe is best-effort.
+        $capability = $null
+    }
+    finally {
+        if ($probeSession) {
+            try { & $CloseProbeSession $probeSession }
+            catch { Write-Warning "Could not close the get_changes capability probe session: $($_.Exception.Message)" }
+        }
+    }
+    $Session['GetChangesCapability'] = $capability
+    return $capability
+}
+
 function Get-ReviewerSourceTransport {
     <# Reads the pinned bytes of every changed file itself and returns the sealed
        block plus its coverage report.
@@ -7410,20 +7519,44 @@ function Get-ReviewerSourceTransport {
 
        Failure is never silent: a file that cannot be read, is too large, is not
        text, or does not fit the budget is recorded with a reason code and shown
-       to the model in the accounting table. #>
+       to the model in the accounting table.
+
+       When the MCP server exposes the authoritative get_changes contract
+       (detected via tools/list: the flat additive input schema carries
+       iterationId/top/skip alongside the get_changes action), the wrapper reads
+       the change set as bounded, iteration-pinned pages that each carry a
+       consistent identity - commonRefCommit/sourceRefCommit/targetRefCommit,
+       iterationReason and retarget names - and re-reads the whole set after the
+       content reads, failing closed on any identity or change-list movement. The
+       common->source content fallback then feeds the dormant deterministic
+       recovery of pure same-path degenerate edits. #>
     param(
         [Parameter(Mandatory)][hashtable]$Session,
         [Parameter(Mandatory)][int]$PrId,
-        [Parameter(Mandatory)][string]$SourceCommit
+        [Parameter(Mandatory)][string]$SourceCommit,
+        [Parameter(Mandatory)][string]$AgencyPath
     )
     if ($SourceCommit -notmatch '^[0-9a-f]{40}$') {
         throw "The sealed source transport requires an exact lowercase 40-hex source commit."
     }
+    # -- Capability gate: detect authoritative get_changes contract via tools/list.
+    #    The probe NEVER runs on the shared ordinary-transport session: a tools/list
+    #    failure aborts the session it runs on, and this session owns every remaining
+    #    PR read plus the pending PR writes, so a probe failure on it would take out
+    #    the whole cycle. Resolve-ReviewerGetChangesCapability runs the probe on a
+    #    dedicated short-lived repos-only session, always closes it, and caches the
+    #    structured capability (or $null) on the shared session so the legacy body
+    #    below runs on an untouched session on the old schema or on any probe failure. --
+    $capability = Resolve-ReviewerGetChangesCapability -Session $Session -AgencyPath $AgencyPath
+    if ($null -ne $capability) {
+        return Get-ReviewerSourceTransportNewContract -Session $Session -PrId $PrId -SourceCommit $SourceCommit -Capability $capability
+    }
+    # -- Legacy get_changes path (unchanged) --
     $changes = Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments @{
         action = 'get_changes'; project = $ExpectedProject; repositoryId = $RepositoryName
         pullRequestId = $PrId; includeDiffs = $true; includeLineContent = $true; top = 1000
     }
-    $spansByPath = Get-ReviewerSourceChangedSpans -Response $changes
+    $aggregateSpansByPath = Get-ReviewerSourceChangedSpans -Response $changes
     $changeKindsByPath = Get-ReviewerSourceChangeKindsByPath -Response $changes
     # Assign directly: Get-ReviewerChangePathsFromResponse returns its array
     # behind a unary comma so a one-path change set does not unroll to a bare
@@ -7431,40 +7564,38 @@ function Get-ReviewerSourceTransport {
     # which collapses every path into one space-joined string - a shape that
     # still looks like a legal change set and shows up only as zero coverage.
     $paths = Get-ReviewerChangePathsFromResponse -Response $changes
-    Assert-ReviewerSourceChangeSetAgreement -ChangedPaths $paths -SpansByPath $spansByPath `
+    Assert-ReviewerSourceChangeSetAgreement -ChangedPaths $paths -SpansByPath $aggregateSpansByPath `
         -ObservedRightHandBlockCount (Measure-ReviewerSourceRightHandBlocks -Response $changes)
-    $reader = {
+    $defaultReader = {
         param([string]$Path)
-        # The request and the decode are separated deliberately. EVERY failure
-        # Send-AgentMcpRequest raises has already aborted the session, and the
-        # session is shared by every PR in this cycle - so absorbing one as
-        # "this file was unreadable" would grind through the rest of the change
-        # set and then take out the whole cycle with a misleading reason.
-        $toolResult = Send-AgentMcpRequest -Session $Session -Method "tools/call" -Params @{
-            name = "repo_file"
-            arguments = @{
-                action = "get_content"
-                project = $ExpectedProject
-                repositoryId = $cfgRepoId
-                path = $Path
-                versionType = "Commit"
-                version = $SourceCommit
-            }
-        }
-        # Classification lives in the library so the seam is exercisable
-        # offline; the strict decode is injected so nothing about its
-        # safety contract is duplicated or relaxed here.
-        return Get-ReviewerSourceReaderResult -ToolResult $toolResult -Path $Path -Policy $SourceTransportPolicy -Decoder {
-            param($InnerToolResult, [string]$InnerPath)
-            ConvertFrom-AgentMcpResourceContent -ToolResult $InnerToolResult -ExpectedUri $InnerPath `
-                -MaxBytes $script:ReviewerSourceDecoderCeilingBytes `
-                -AllowedMimeTypes @($SourceTransportPolicy.allowedMimeTypes)
-        }
+        $kinds = @()
+        if ($changeKindsByPath.Contains($Path)) { $kinds = @($changeKindsByPath[$Path]) }
+        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path -CommitSha $SourceCommit -ChangeKinds $kinds
+    }.GetNewClosure()
+    $recoveryContext = [pscustomobject]@{
+        SpansByPath = $aggregateSpansByPath; SpanBasisByPath = $null
+        ExpectedSpanCountByPath = $null; AttemptedFileCount = 0
+        RecoveredPaths = @(); EvidenceBlockCount = 0; Reader = $defaultReader
+        BaseCommit = ""; IterationId = 0
     }
+    $spansByPath = $recoveryContext.SpansByPath
+    $spanBasisByPath = $recoveryContext.SpanBasisByPath
+    $expectedSpanCountByPath = $recoveryContext.ExpectedSpanCountByPath
+    $recoveryAttemptedFileCount = [int]$recoveryContext.AttemptedFileCount
+    $recoveryRecoveredFileCount = @($recoveryContext.RecoveredPaths).Count
+    $recoveryEvidenceBlockCount = [int]$recoveryContext.EvidenceBlockCount
+    $recoveryBaseCommit = [string]$recoveryContext.BaseCommit
+    $recoveryIterationId = [int]$recoveryContext.IterationId
+    $reader = $recoveryContext.Reader
     $report = New-ReviewerSourceTransportReport -CommitSha $SourceCommit -ChangedPaths $paths `
         -SpansByPath $spansByPath -Policy $SourceTransportPolicy -Reader $reader `
-        -ChangeKindsByPath $changeKindsByPath
-    # The spans come from the PR's CURRENT iteration while the bytes come from
+        -ChangeKindsByPath $changeKindsByPath -SpanBasisByPath $spanBasisByPath `
+        -ExpectedSpanCountByPath $expectedSpanCountByPath `
+        -RecoveryAttemptedFileCount $recoveryAttemptedFileCount `
+        -RecoveryRecoveredFileCount $recoveryRecoveredFileCount `
+        -RecoveryEvidenceBlockCount $recoveryEvidenceBlockCount `
+        -RecoveryBaseCommit $recoveryBaseCommit -RecoveryIterationId $recoveryIterationId
+    # The spans come from the PR's aggregate change set while the bytes come from
     # the pinned commit. If the author pushed in between, the slices would be
     # correct bytes at the wrong lines, hashed cleanly, with nothing to notice
     # it. Re-read the head and refuse if it moved.
@@ -7478,11 +7609,6 @@ function Get-ReviewerSourceTransport {
     }
     $blockText = ""
     if (@($report.Files).Count -gt 0) {
-        # Rendered whenever there is anything to account for, not only when
-        # something was delivered. The accounting table IS the property this
-        # layer sells; suppressing it exactly when the model has no source
-        # would leave the model with no source and no statement that any is
-        # missing - and both prompts promise the block is there.
         $blockText = Format-ReviewerSealedSourceBlock -Report $report -NonceFactory { New-AgentNonce }
     }
     return @{
@@ -7491,6 +7617,46 @@ function Get-ReviewerSourceTransport {
         Gate      = (Test-ReviewerSourceCoverageGate -Report $report -Policy $SourceTransportPolicy)
         Record    = (ConvertTo-ReviewerSourceCoverageRecord -Report $report -PolicySha256 $SourceTransportPolicySha256)
     }
+}
+
+function Get-ReviewerSourceTransportNewContract {
+    <# Authoritative get_changes path: a thin adapter over the library orchestrator
+       Invoke-ReviewerSourceNewContractTransport. It supplies the three live seams -
+       the repo_pull_request tool invoker and the pinned source/base content readers -
+       plus the validated capability, policy, and nonce factory, and returns whatever
+       bundle the orchestrator produces. All validation, path selection, fileDiff
+       handling, recovery, reporting, and the post-read iteration re-read live in the
+       library so they can be replayed offline; nothing about the decision is made
+       here. #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)][string]$SourceCommit,
+        [Parameter(Mandatory)]$Capability
+    )
+    $toolInvoker = {
+        param([hashtable]$Arguments)
+        return Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments $Arguments
+    }.GetNewClosure()
+    $aggregateReader = {
+        return Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments @{
+            action = 'get_changes'; project = $ExpectedProject; repositoryId = $RepositoryName
+            pullRequestId = $PrId; includeDiffs = $true; includeLineContent = $true; top = 1000
+        }
+    }.GetNewClosure()
+    $sourceReader = {
+        param([string]$Path, [string[]]$Kinds)
+        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path -CommitSha $SourceCommit -ChangeKinds @($Kinds)
+    }.GetNewClosure()
+    $baseReader = {
+        param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path -CommitSha $BaseCommit -ChangeKinds @($Kinds)
+    }.GetNewClosure()
+    return Invoke-ReviewerSourceNewContractTransport -ToolInvoker $toolInvoker -Reader $sourceReader `
+        -BaseReader $baseReader -Organization $Organization -Project $ExpectedProject -RepositoryId $cfgRepoId `
+        -PrId $PrId -SourceCommit $SourceCommit -Capability $Capability -Policy $SourceTransportPolicy `
+        -PolicySha256 $SourceTransportPolicySha256 -NonceFactory { New-AgentNonce } `
+        -AggregateReader $aggregateReader
 }
 
 function Get-ReviewerPinnedConventionChangeSet {
@@ -11225,11 +11391,23 @@ function Invoke-ReviewerPromotion {
         "prId", "prTitle", "sourceCommit", "markerPrefix", "maxFindingItems",
         "reviewModels", "passesRequested", "passesCompleted", "createdAt", "scriptSha256",
         "previewPath", "previewSha256", "approvedComments", "approvedSummary",
-        "approvedVote", "reportedFindings", "markerBody"
+        "approvedVote", "reportedFindings", "markerBody", "sourceCoverageJson"
     )
+    $requiredDeliveryManifestKeys = @($deliveryManifestKeys | Where-Object { $_ -cne "sourceCoverageJson" })
     Assert-ReviewerExactObjectKeys -Object $signed -Allowed $deliveryManifestKeys `
-        -Required $deliveryManifestKeys -Where "delivery preview artifact"
+        -Required $requiredDeliveryManifestKeys -Where "delivery preview artifact"
     if ([int]$signed.artifactVersion -ne 3) { throw "Unsupported preview artifact version $($signed.artifactVersion)." }
+    if ($signed.PSObject.Properties["sourceCoverageJson"] -and [string]$signed.sourceCoverageJson) {
+        try {
+            $sourceCoverage = ([string]$signed.sourceCoverageJson) | ConvertFrom-Json -Depth 64
+            if ((Get-ReviewerCanonicalJson -Value $sourceCoverage) -cne [string]$signed.sourceCoverageJson) {
+                throw "coverage JSON is not canonical"
+            }
+        }
+        catch {
+            throw "Preview artifact carries invalid sealed source coverage: $($_.Exception.Message)"
+        }
+    }
 
     # A review is only meaningful against the repository it was produced for.
     if (([string]$signed.organization) -ine $Organization -or ([string]$signed.project) -ine $ExpectedProject -or
@@ -11934,7 +12112,7 @@ function Invoke-ReviewerCycle {
             $pinnedSourceText = ""
             $sourceCoverageRecord = $null
             try {
-                $sourceTransport = Get-ReviewerSourceTransport -Session $session -PrId $prId -SourceCommit $sourceCommit
+                $sourceTransport = Get-ReviewerSourceTransport -Session $session -PrId $prId -SourceCommit $sourceCommit -AgencyPath $AgencyPath
                 $pinnedSourceText = [string]$sourceTransport.BlockText
                 $sourceCoverageRecord = $sourceTransport.Record
                 Write-Host ("  PR {0} pinned source: {1}/{2} changed file(s) that could carry source text covered ({3}%), {4} path(s) the pull request itself calls source-free, {5} changed-source byte(s) + {6} sibling byte(s)." -f `
@@ -11958,6 +12136,12 @@ function Invoke-ReviewerCycle {
                     totalSliceBytes = [int]$sourceTransport.Report.TotalSliceBytes
                     totalSiblingBytes = [int]$sourceTransport.Report.TotalSiblingBytes
                     spansUnavailableFileCount = [int]$sourceTransport.Report.SpansUnavailableFileCount
+                    spanBasisVersion = [int]$sourceTransport.Report.SpanBasisVersion
+                    recoveryAttemptedFileCount = [int]$sourceTransport.Report.RecoveryAttemptedFileCount
+                    recoveryRecoveredFileCount = [int]$sourceTransport.Report.RecoveryRecoveredFileCount
+                    recoveryEvidenceBlockCount = [int]$sourceTransport.Report.RecoveryEvidenceBlockCount
+                    recoveryBaseCommit = [string]$sourceTransport.Report.RecoveryBaseCommit
+                    recoveryIterationId = [int]$sourceTransport.Report.RecoveryIterationId
                     reasonCodes = @($sourceTransport.Gate.ReasonCodes)
                 }
                 if (-not $sourceTransport.Gate.Ok) {
