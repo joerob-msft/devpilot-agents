@@ -55,6 +55,10 @@ function Get-ReviewerReplayRunMasterKey {
         the wrong state directory".
     #>
     param([Parameter(Mandatory)][string]$Path)
+    # A signing key is 32 bytes plus a short format prefix. Reading an operator
+    # typo that happens to be a gigabyte is nobody''s idea of a good time.
+    $info = Get-Item -LiteralPath $Path
+    if ($info.Length -gt 8192) { throw "The signing key at $Path is $($info.Length) bytes; a key file is a single short line." }
     $line = ([IO.File]::ReadAllText($Path)).Trim()
     $format = $(if ($IsWindows) { "dpapi" } else { "raw" })
     $separator = $line.IndexOf(":")
@@ -115,7 +119,7 @@ $declaredRuns = [System.Collections.Generic.List[object]]::new()
 if ($DeclareRunSet) {
     if (-not $OutputDirectory) { throw "-DeclareRunSet requires -OutputDirectory to write the sealed declaration into." }
     if (-not (Test-Path -LiteralPath $OutputDirectory -PathType Container)) {
-        [void](New-Item -ItemType Directory -Path $OutputDirectory -Force)
+        [void](New-Item -ItemType Directory -LiteralPath $OutputDirectory -Force)
     }
     $setId = [Guid]::NewGuid().ToString("N")
     $declaration = [pscustomobject][ordered]@{
@@ -201,9 +205,11 @@ else { $report = $report + "`n" + ($setLines -join "`n") }
 
 if ($OutputDirectory) {
     if (-not (Test-Path -LiteralPath $OutputDirectory -PathType Container)) {
-        [void](New-Item -ItemType Directory -Path $OutputDirectory -Force)
+        [void](New-Item -ItemType Directory -LiteralPath $OutputDirectory -Force)
     }
-    $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ")
+    # Seconds alone collide when two comparisons run back to back, and the
+    # second silently overwrites the first''s report.
+    $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ") + "-" + [Guid]::NewGuid().ToString("N").Substring(0, 8)
     $reportPath = Join-Path $OutputDirectory "reconciliation-$stamp.md"
     [IO.File]::WriteAllText($reportPath, $report, [Text.UTF8Encoding]::new($false))
     # Sealed under the replay key, so this artifact is as unpromotable as the

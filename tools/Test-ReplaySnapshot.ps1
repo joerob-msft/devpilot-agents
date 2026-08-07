@@ -1591,6 +1591,27 @@ try {
             }
         }
     }
+    # Replay interception is per-SESSION: `Open-AgentMcpSession` decides
+    # live-versus-replay from its own `-ReplaySnapshot` argument, and the
+    # process launch is guarded only by that parameter being absent. A seventh
+    # call site added later, without the argument, would reach the network from
+    # inside a replay and nothing would notice. Pin every call site.
+    $sessionCalls = @($reviewerAst.FindAll({
+                param($candidate)
+                if ($candidate -isnot [Management.Automation.Language.CommandAst]) { return $false }
+                $name = $candidate.GetCommandName()
+                return ($null -ne $name -and $name -ceq "Open-AgentMcpSession")
+            }, $true))
+    Assert-Replay (@($sessionCalls).Count -ge 5) `
+        "The reviewer must still open MCP sessions (found $(@($sessionCalls).Count)); a zero here means this check stopped looking."
+    $unguarded = @(@($sessionCalls) | Where-Object {
+            $text = [string]$_.Extent.Text
+            $text -cnotmatch '-ReplaySnapshot\s'
+        })
+    Assert-Replay (@($unguarded).Count -eq 0) `
+        ("Every Open-AgentMcpSession call must pass -ReplaySnapshot, or a replay reaches the network: " +
+        (@(@($unguarded) | ForEach-Object { "line $($_.Extent.StartLineNumber)" }) -join ", "))
+
     # -- 12. `notInReach` is fail-closed ---------------------------------------
     # Out-of-reach is the one verdict that costs nothing to give, so it is the
     # one an evasive row reaches for. Every property that makes it safe gets a
@@ -1880,7 +1901,7 @@ try {
             [object[]]$Constructs = $null, [string]$Status = "ok",
             [string]$SnapshotId = "s", [string]$ManifestDigest = ("7" * 64),
             [string]$Complete = "true", [string[]]$Missing = @(),
-            [string]$ConstructsIncomplete = "false"
+            [string]$ConstructsIncomplete = "false", [int]$Checked = 1
         )
         # Built with the field names PRODUCTION writes (ConventionSpecialist.ps1
         # `Constructs = ...`). A fixture in the reconciler's own vocabulary
@@ -1902,6 +1923,7 @@ try {
                 complete = [bool]::Parse($Complete); rows = @($Rows); changedConstructs = @($set)
                 missing = @($Missing); duplicates = @(); unknown = @(); unaccountedCandidates = @()
                 constructsIncomplete = [bool]::Parse($ConstructsIncomplete)
+                enumeratedConstructCount = @($set).Count; checkedConstructCount = $Checked
             }
             replay = [pscustomobject][ordered]@{
                 snapshotId = $SnapshotId; manifestDigest = $ManifestDigest; replayNonce = $Nonce
@@ -1923,10 +1945,13 @@ try {
         }
     }
     function New-ReconCandidate {
-        param([string]$Source = "core/rule-a", [string]$Path = "/src/a.cs", [int]$Line = 12, [string]$Id = "c1")
+        param(
+            [string]$Source = "core/rule-a", [string]$Path = "/src/a.cs", [int]$Line = 12,
+            [string]$Id = "c1", [string]$Severity = "suggestion", [string]$Comment = "text"
+        )
         return [pscustomobject][ordered]@{
             candidateId = $Id; ruleSourceId = $Source; filePath = $Path; line = $Line
-            anchorKind = "changedFile"; severity = "suggestion"; comment = "text"
+            anchorKind = "changedFile"; severity = $Severity; comment = $Comment
         }
     }
 
@@ -2136,6 +2161,70 @@ try {
     Assert-Replay (-not [bool]$mixedSchema.reconciled) `
         "A construct table describing the same call differently is a different question."
 
+    # Two candidates in ONE run sharing an anchor key. `prMetadata` candidates
+    # are all forced to file "" line 0, so any two under one rule collide
+    # exactly - and a set would drop the second, leaving it neither agreed nor
+    # withheld while the runs read as fully agreeing.
+    $extraCandidate = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @(
+                (New-ReconCandidate -Id "c1"), (New-ReconCandidate -Id "c2" -Comment "a second, more serious claim"))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Id "c1")))
+    )
+    Assert-Replay (@(@($extraCandidate.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0) `
+        "A run that proposed an extra comment at the same anchor has not agreed with one that did not."
+    Assert-Replay (@(@($extraCandidate.candidates)[0].perRunCounts) -ccontains 2) `
+        "The per-run counts must show that one run proposed two comments there."
+
+    # The claim itself, not just its location. Two runs pointing at one line and
+    # saying different things about it have not agreed on a comment.
+    $textSplit = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Comment "Rename the argument"))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Comment "This will fail at run time")))
+    )
+    Assert-Replay (@($textSplit.candidates)[0].disposition -ceq "withheldTextDisagreement") `
+        "Two runs proposing different text at one anchor have not agreed on a comment."
+    $severitySplit = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Severity "suggestion"))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Severity "important")))
+    )
+    Assert-Replay (@($severitySplit.candidates)[0].disposition -ceq "withheldSeverityDisagreement") `
+        "Severity is a materially different claim; disagreeing about it is disagreement."
+
+    # A pass where every rule ruled every anchor out of reach is clean row by
+    # row and has looked at nothing. Two of those agree perfectly about nothing.
+    $weighedNothing = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow -Status "notApplicable" -Violating @() -NotInReach @("mi0"))) -Checked 0),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Status "notApplicable" -Violating @() -NotInReach @("mi0"))) -Checked 0)
+    )
+    Assert-Replay (-not [bool]$weighedNothing.reconciled -and @($weighedNothing.problems) -clike "*weighed none of its*") `
+        "Two passes that weighed no anchor at all have agreed about nothing, and the report must say so."
+
+    # The status comparison earns its keep only when the partition is IDENTICAL
+    # and the statuses differ - which is exactly what a wrapper-degraded row
+    # looks like beside a clean one.
+    $degradedVsClean = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow -Status "unknown" -Violating @("mi0")))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Status "violation" -Violating @("mi0"))))
+    )
+    Assert-Replay (@($degradedVsClean.rows)[0].reconciledStatus -ceq "unknown" -and
+        -not [bool]@($degradedVsClean.rows)[0].stable) `
+        "One run degrading a row the other trusted is disagreement, even though both name the same anchor."
+
+    # A file path differing only in case is not the same file to this
+    # comparison, and must not be treated as one just because a dictionary
+    # happened to fold it.
+    $caseSplit = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Path "/src/Widget.cs"))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Path "/src/widget.cs")))
+    )
+    Assert-Replay (@($caseSplit.candidates).Count -eq 2 -and
+        @(@($caseSplit.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0) `
+        "Two candidates whose paths differ only in case are two candidates, and neither is agreed."
+    $caseSplitPaths = [System.Collections.Generic.HashSet[string]]::new(
+        [string[]]@(@($caseSplit.candidates) | ForEach-Object { [string]$_.filePath }), [StringComparer]::Ordinal)
+    Assert-Replay ($caseSplitPaths.Count -eq 2) `
+        "Each must keep its own path; folding them prints one run's comment beside the other's file."
+
     # One run is not a reconciliation, however clean it looks.
     $single = Resolve-ReviewerRunReconciliation -Manifests @((New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate))))
     Assert-Replay (-not [bool]$single.reconciled -and @($single.rows)[0].reconciledStatus -ceq "unknown") `
@@ -2252,8 +2341,17 @@ try {
         "A rule neither run gave a status is unknown, not a stable blank."
 
     # The candidate key is joined from model-authored text. `ruleSourceId` is
-    # schema-allowed any printable ASCII, so a separator the fields can contain
-    # lets one candidate impersonate another.
+    # schema-allowed any printable ASCII, so a separator the fields CAN contain
+    # lets one candidate impersonate another. Asserted on the key itself,
+    # because a fixture that merely produces two different keys would pass
+    # under a broken separator too.
+    $honestKey = Get-ReviewerRunReconciliationCandidateKey -Candidate (New-ReconCandidate -Source "core/rule-a" -Path "/src/a.cs" -Line 12)
+    $forgedIdentity = Get-ReviewerRunReconciliationCandidateKey -Candidate (New-ReconCandidate `
+            -Source "core/rule-a|changedFile|src/a.cs|12" -Path "" -Line 0)
+    Assert-Replay ([string]$honestKey.Key -cne [string]$forgedIdentity.Key) `
+        "A rule id built to look like a whole key must not collide with the real one."
+    Assert-Replay ([string]$honestKey.RuleSourceId -ceq "core/rule-a" -and [string]$honestKey.FilePath -ceq "src/a.cs") `
+        "The key's parts must be carried, not recovered by splitting the key back apart."
     $forgedKey = Resolve-ReviewerRunReconciliation -Manifests @(
         (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate))),
         (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Candidates @(
