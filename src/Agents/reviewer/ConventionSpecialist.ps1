@@ -962,6 +962,12 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
                 $degradedReason = "the row declared no construct kind while $($constructById.Count) anchors were enumerated; a rule that reaches nothing must name the kinds it would govern and put their anchors out of reach"
             }
         }
+        elseif ($constructById.Count -gt 0 -and $required.Count -eq 0) {
+            $status = "unknown"
+            if (-not $degradedReason) {
+                $degradedReason = "the row declared scope '$scope', but that scope contains no anchors in the sealed construct universe"
+            }
+        }
         # Scope limits applicable verdicts, not the universe. Anchors of other
         # kinds are still part of the exact partition, but may only be ruled out.
         $outOfScopeJudgements = @(@($violating) + @($compliantIds) + @($unknownIds) |

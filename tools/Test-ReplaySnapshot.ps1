@@ -2096,15 +2096,16 @@ try {
     # in this change set. The required set is empty, so the cover check, the
     # out-of-scope check and the stray check are all vacuous - and
     # `notApplicable` is exempt from the weighed-nothing guard. Only the
-    # named-nothing guard stands between this and a free pass, and it is the
-    # exact shape an evasive row would reach for.
+    # zero-applicable-anchor guard stands between this and a free pass, even
+    # when the row files the entire outside-kind universe under not-in-reach.
     $emptyKindEscape = Invoke-Coverage -Rows @(
-        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "notApplicable" -Scope "comment" -Checked ""),
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "notApplicable" -Scope "comment" -Checked "" -NotInReach $everyId),
         (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope $bothKinds -Checked $everyId)
     )
     $emptyKindRow = @($emptyKindEscape.Rows | Where-Object { $_.ruleRef -ceq "rs0" })
-    Assert-Replay ($emptyKindRow.status -ceq "unknown" -and $emptyKindRow.degradedReason -clike "*no verdict*") `
-        "A row scoping itself to an enumerable kind with zero anchors must still account for the sealed universe."
+    Assert-Replay ($emptyKindRow.status -ceq "unknown" -and
+        $emptyKindRow.degradedReason -ceq "the row declared scope 'comment', but that scope contains no anchors in the sealed construct universe") `
+        "A zero-anchor applicable scope must fail closed even after partitioning every outside-kind anchor as not in reach."
     Assert-Replay (-not [bool]$emptyKindEscape.Complete) `
         "That escape must also cost the accounting its completeness."
 
