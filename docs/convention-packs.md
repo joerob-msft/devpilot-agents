@@ -165,7 +165,7 @@ The specialist receives only the dedicated prompt, the sealed fact and
 convention plans, exact convention text re-resolved at each recorded commit and
 SHA-256, the pinned changed-file records, sanitized thread metadata, and two
 read-only tools: pull-request and repository-file reads. Its nonce-bound
-`CONVENTION_REVIEW_RESULT_V1` marker permits `suggestion` and `important`
+`CONVENTION_REVIEW_RESULT_V2` marker permits `suggestion` and `important`
 convention candidates only. Wrapper validation rechecks source quotes, pack
 membership, fact IDs, severity rules, sibling evidence, and current changed-file
 anchors. Invalid anchors are withheld rather than relocated.

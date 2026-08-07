@@ -250,7 +250,7 @@ discovery-only pass:
 The model must be named explicitly on the CLI or in
 `review.conventionSpecialistModel`; there is no default. This specialist receives
 sealed deterministic facts and commit/hash-verified matched convention sources,
-not either generalist's output. Its strict `CONVENTION_REVIEW_RESULT_V1`
+not either generalist's output. Its strict `CONVENTION_REVIEW_RESULT_V2`
 candidates are stored in separate sealed previews and are not merged, posted, or
 used for voting. Failures are recorded as degraded specialist diagnostics without
 changing the generalist review.

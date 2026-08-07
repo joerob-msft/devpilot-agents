@@ -2337,10 +2337,11 @@ try {
         param(
             [string]$Source = "core/rule-a", [string]$Status = "violation",
             [string[]]$Violating = @("mi0"), [string[]]$Compliant = @(), [string]$Sha = ("9" * 64),
-            [string[]]$NotInReach = @(), [string[]]$Unknown = @(), [string]$Ref = "rs0"
+            [string[]]$NotInReach = @(), [string[]]$Unknown = @(), [string]$Ref = "rs0",
+            [string]$Pack = "core"
         )
         return [pscustomobject][ordered]@{
-            ruleRef = $Ref; ruleSourceId = $Source; ruleSourceSha256 = $Sha; status = $Status
+            ruleRef = $Ref; packName = $Pack; ruleSourceId = $Source; ruleSourceSha256 = $Sha; status = $Status
             violatingConstructs = @($Violating); compliantConstructs = @($Compliant)
             notInReachConstructs = @($NotInReach); unknownConstructs = @($Unknown)
             candidateId = ""; degradedReason = ""
@@ -2349,11 +2350,25 @@ try {
     function New-ReconCandidate {
         param(
             [string]$Source = "core/rule-a", [string]$Path = "/src/a.cs", [int]$Line = 12,
-            [string]$Id = "c1", [string]$Severity = "suggestion", [string]$Comment = "text"
+            [string]$Id = "c1", [string]$Severity = "suggestion", [string]$Comment = "text",
+            [string]$RuleSha = ("9" * 64), [string]$ImpactCategory = "none",
+            [string]$Category = "convention", [string]$Pack = "core",
+            [string]$AnchorKind = "changedFile",
+            [string]$FactIds = "", [int]$SemanticVersion = 1,
+            [string]$RemediationAction = "modify", [string]$RemediationScope = "inPullRequest",
+            [string]$RemediationTargets = "mi0", [bool]$FollowUpRequired = $false
         )
         return [pscustomobject][ordered]@{
             candidateId = $Id; ruleSourceId = $Source; filePath = $Path; line = $Line
-            anchorKind = "changedFile"; severity = $Severity; comment = $Comment
+            ruleSourceSha256 = $RuleSha; packName = $Pack; anchorKind = $AnchorKind; category = $Category
+            severity = $Severity; impactCategory = $ImpactCategory; factIds = $FactIds
+            comment = $Comment; diffEvidence = "deterministic evidence"; impact = $Comment
+            expectedFixOrValidation = "apply the structured remediation"
+            ruleSection = "Rule"; ruleQuote = "Use the required construct."
+            siblingEvidence = ""; siblingNotRequiredReason = "local construct is sufficient"
+            residualRiskSummary = ""; semanticCandidateVersion = $SemanticVersion
+            remediationAction = $RemediationAction; remediationScope = $RemediationScope
+            remediationTargets = $RemediationTargets; followUpRequired = $FollowUpRequired
         }
     }
 
@@ -2366,7 +2381,7 @@ try {
         "Two runs that read a rule the same way must reconcile to that reading."
     Assert-Replay (@($agree.rows)[0].reconciledStatus -ceq "violation" -and @(@($agree.rows)[0].violatingConstructs) -ccontains "mi0") `
         "A stable row keeps its status and its anchors."
-    Assert-Replay (@($agree.candidates)[0].disposition -ceq "agreed") `
+    Assert-Replay (@($agree.candidates)[0].disposition -ceq "semanticAgreementTextWithheld") `
         "A candidate at the same rule, file and line in both runs is agreed even though its id differs."
     Assert-Replay (-not [bool]$agree.promotable) "A reconciliation is never promotable."
 
@@ -2419,7 +2434,7 @@ try {
         (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Line 12))),
         (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Line 13)))
     )
-    Assert-Replay (@(@($lineSplit.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0) `
+    Assert-Replay (@(@($lineSplit.candidates) | Where-Object { $_.disposition -ceq "semanticAgreementTextWithheld" }).Count -eq 0) `
         "Two runs pointing at neighbouring lines have not agreed on a comment."
 
     # Every pairing of disagreeing readings must collapse, and none of them may
@@ -2449,7 +2464,7 @@ try {
                 "$label must collapse to unknown."
             Assert-Replay (@(@($result.rows)[0].violatingConstructs).Count -eq 0) `
                 "$label must not carry forward the anchors of whichever run found something."
-            Assert-Replay (@(@($result.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0) `
+            Assert-Replay (@(@($result.candidates) | Where-Object { $_.disposition -ceq "semanticAgreementTextWithheld" }).Count -eq 0) `
                 "$label must leave no candidate eligible."
             Assert-Replay (@(@($result.rows)[0].rawStatuses) -ccontains $first.S -and
                 @(@($result.rows)[0].rawStatuses) -ccontains $second.S) `
@@ -2473,7 +2488,7 @@ try {
         (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow -Status "violation")) -Candidates @((New-ReconCandidate))),
         (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Status "violation")) -Candidates @((New-ReconCandidate)) -Status "degraded"))
     Assert-Replay (-not [bool]$degradedPair.reconciled -and
-        @(@($degradedPair.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0) `
+        @(@($degradedPair.candidates) | Where-Object { $_.disposition -ceq "semanticAgreementTextWithheld" }).Count -eq 0) `
         "A degraded run beside a clean one leaves nothing eligible, however well the two appear to agree."
 
     # Three runs, dissenter first and dissenter last. Nothing may promote the
@@ -2542,14 +2557,14 @@ try {
         (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Line 478))),
         (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Line 479))))
     Assert-Replay (@($anchorVariation.candidates).Count -eq 2 -and
-        @(@($anchorVariation.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0) `
+        @(@($anchorVariation.candidates) | Where-Object { $_.disposition -ceq "semanticAgreementTextWithheld" }).Count -eq 0) `
         "Candidates at different lines of the same rule are two proposals, neither agreed."
 
     # The very same run object submitted twice is one observation in two hats.
     $duplicateRun = New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate))
     $duplicated = Resolve-ReviewerRunReconciliation -Manifests @($duplicateRun, $duplicateRun)
     Assert-Replay (-not [bool]$duplicated.reconciled -and
-        @(@($duplicated.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0) `
+        @(@($duplicated.candidates) | Where-Object { $_.disposition -ceq "semanticAgreementTextWithheld" }).Count -eq 0) `
         "The same run twice must not reconcile, and must leave nothing eligible."
 
     # Mixed schema: a construct table describing the same call differently.
@@ -2572,25 +2587,196 @@ try {
                 (New-ReconCandidate -Id "c1"), (New-ReconCandidate -Id "c2" -Comment "a second, more serious claim"))),
         (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Id "c1")))
     )
-    Assert-Replay (@(@($extraCandidate.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0) `
+    Assert-Replay (@(@($extraCandidate.candidates) | Where-Object { $_.disposition -ceq "semanticAgreementTextWithheld" }).Count -eq 0) `
         "A run that proposed an extra comment at the same anchor has not agreed with one that did not."
-    Assert-Replay (@(@($extraCandidate.candidates)[0].perRunCounts) -ccontains 2) `
+    Assert-Replay (@(@($extraCandidate.candidates)[0].perRunCounts | ForEach-Object { [int]$_.count }) -ccontains 2) `
         "The per-run counts must show that one run proposed two comments there."
 
-    # The claim itself, not just its location. Two runs pointing at one line and
-    # saying different things about it have not agreed on a comment.
+    # Presentation is not semantic identity. Distinct prose stays in the audit
+    # artifact, while no run's wording is selected as the comment.
     $textSplit = Resolve-ReviewerRunReconciliation -Manifests @(
         (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Comment "Rename the argument"))),
         (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Comment "This will fail at run time")))
     )
-    Assert-Replay (@($textSplit.candidates)[0].disposition -ceq "withheldTextDisagreement") `
-        "Two runs proposing different text at one anchor have not agreed on a comment."
+    Assert-Replay (@($textSplit.candidates)[0].disposition -ceq "semanticAgreementTextWithheld" -and
+        [string]@($textSplit.candidates)[0].comment -ceq "" -and
+        @(@($textSplit.candidates)[0].presentationVariants).Count -eq 2) `
+        "Different prose for one semantic finding must reconcile without selecting either comment."
     $severitySplit = Resolve-ReviewerRunReconciliation -Manifests @(
         (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Severity "suggestion"))),
         (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Severity "important")))
     )
-    Assert-Replay (@($severitySplit.candidates)[0].disposition -ceq "withheldSeverityDisagreement") `
+    Assert-Replay (@(@($severitySplit.candidates) | Where-Object {
+                $_.disposition -ceq "semanticAgreementTextWithheld"
+            }).Count -eq 0) `
         "Severity is a materially different claim; disagreeing about it is disagreement."
+
+    # Exact synthetic analog of the motivating failure: same authoritative rule,
+    # path, line, declaration construct, suggestion severity, evidence, verdict,
+    # and in-PR action; only the model prose differs.
+    $dcConstructs = @(
+        [pscustomobject][ordered]@{
+            constructId = "dc0"; kind = "declaration"; path = "src/semantic.cs"
+            line = 1034; endLine = 1034; name = "Example"; argumentNaming = ""
+        },
+        [pscustomobject][ordered]@{
+            constructId = "dc1"; kind = "declaration"; path = "src/semantic.cs"
+            line = 1035; endLine = 1035; name = "Adjacent"; argumentNaming = ""
+        })
+    $analogCandidateA = New-ReconCandidate -Path "/src/semantic.cs" -Line 1034 `
+        -Comment "Use the established declaration form here." -RemediationTargets "dc0"
+    $analogCandidateB = New-ReconCandidate -Path "SRC\SEMANTIC.cs" -Line 1034 `
+        -Comment "This declaration should follow the repository form." -RemediationTargets "dc0"
+    $analog = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "analog-a" -Rows @((New-ReconRow -Violating @("dc0"))) `
+                -Candidates @($analogCandidateA) -Constructs $dcConstructs),
+        (New-ReconRun -Nonce "analog-b" -Rows @((New-ReconRow -Violating @("dc0"))) `
+                -Candidates @($analogCandidateB) -Constructs $dcConstructs))
+    $analogFinding = @($analog.candidates)[0]
+    Assert-Replay ($analogFinding.disposition -ceq "semanticAgreementTextWithheld" -and
+        [string]$analogFinding.comment -ceq "" -and
+        [string]$analogFinding.semanticCandidateId -cmatch '^rsci1:[0-9a-f]{64}$') `
+        "The exact analog must produce one stable semantic finding without choosing model prose."
+    Assert-Replay (@($analogFinding.presentationVariants).Count -eq 2 -and
+        @(@($analogFinding.presentationVariants).text.comment) -ccontains $analogCandidateA.comment -and
+        @(@($analogFinding.presentationVariants).text.comment) -ccontains $analogCandidateB.comment) `
+        "Both raw presentation variants must remain in the evaluation artifact."
+
+    function Assert-SemanticCandidateSplit {
+        param([string]$Name, $LeftCandidate, $RightCandidate, [string[]]$LeftViolations = @("dc0"),
+            [string[]]$RightViolations = @("dc0"))
+        $result = Resolve-ReviewerRunReconciliation -Manifests @(
+            (New-ReconRun -Nonce "$Name-a" -Rows @((New-ReconRow -Sha $LeftCandidate.ruleSourceSha256 `
+                            -Pack $LeftCandidate.packName -Violating $LeftViolations)) `
+                -Candidates @($LeftCandidate) -Constructs $dcConstructs),
+            (New-ReconRun -Nonce "$Name-b" -Rows @((New-ReconRow -Sha $RightCandidate.ruleSourceSha256 `
+                            -Pack $RightCandidate.packName -Violating $RightViolations)) `
+                -Candidates @($RightCandidate) -Constructs $dcConstructs))
+        Assert-Replay (@(@($result.candidates) | Where-Object {
+                    $_.disposition -ceq "semanticAgreementTextWithheld"
+                }).Count -eq 0) "$Name must remain semantically disagreed and withheld."
+    }
+
+    Assert-SemanticCandidateSplit -Name "fix-action" `
+        -LeftCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0 -RemediationAction modify) `
+        -RightCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0 -RemediationAction replace)
+    Assert-SemanticCandidateSplit -Name "follow-up" `
+        -LeftCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0) `
+        -RightCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0 `
+            -RemediationScope followUp -FollowUpRequired $true)
+    Assert-SemanticCandidateSplit -Name "construct" `
+        -LeftCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0) `
+        -RightCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1035 -RemediationTargets dc1) `
+        -LeftViolations @("dc0") -RightViolations @("dc1")
+    Assert-SemanticCandidateSplit -Name "adjacent-line" `
+        -LeftCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0) `
+        -RightCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1035 -RemediationTargets dc0)
+    Assert-SemanticCandidateSplit -Name "rule-digest" `
+        -LeftCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0 -RuleSha ("8" * 64)) `
+        -RightCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0 -RuleSha ("9" * 64))
+    Assert-SemanticCandidateSplit -Name "convention-pack" `
+        -LeftCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0 -Pack core) `
+        -RightCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0 -Pack alternate)
+    Assert-SemanticCandidateSplit -Name "severity" `
+        -LeftCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0 -Severity suggestion) `
+        -RightCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0 -Severity important `
+            -ImpactCategory customerBehavior)
+    Assert-SemanticCandidateSplit -Name "impact" `
+        -LeftCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0) `
+        -RightCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0 `
+            -ImpactCategory compatibility)
+    Assert-SemanticCandidateSplit -Name "issue-class" `
+        -LeftCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0) `
+        -RightCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0 -Category behavior)
+    Assert-SemanticCandidateSplit -Name "evidence" `
+        -LeftCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0 `
+            -FactIds ("rf1:" + ("1" * 64))) `
+        -RightCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0 `
+            -FactIds ("rf1:" + ("2" * 64)))
+    Assert-SemanticCandidateSplit -Name "violation-set" `
+        -LeftCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0) `
+        -RightCandidate (New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0) `
+        -LeftViolations @("dc0") -RightViolations @("dc0", "dc1")
+
+    $missingFollowUp = New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0
+    $missingFollowUp.PSObject.Properties.Remove("followUpRequired")
+    $mixedSemanticSchema = New-ReconCandidate -Path "src/semantic.cs" -Line 1034 `
+        -RemediationTargets dc0 -SemanticVersion 2
+    $stringTypedIdentity = New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0
+    $stringTypedIdentity.semanticCandidateVersion = "1"
+    $stringTypedIdentity.line = "1034"
+    $stringTypedIdentity.followUpRequired = "false"
+    $nonNumericLine = New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0
+    $nonNumericLine.line = "not-a-line"
+    $largeLine = New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0
+    $largeLine.line = [int64]::MaxValue
+    $unsignedVersion = New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0
+    $unsignedVersion.semanticCandidateVersion = [uint64]::MaxValue
+    $oversizedJsonInteger = New-ReconCandidate -Path "src/semantic.cs" -Line 1034 -RemediationTargets dc0
+    $oversizedJsonInteger.line = [System.Numerics.BigInteger]::Parse("184467440737095516160")
+    foreach ($malformed in @($missingFollowUp, $mixedSemanticSchema, $stringTypedIdentity,
+            $nonNumericLine, $largeLine, $unsignedVersion, $oversizedJsonInteger)) {
+        $malformedResult = Resolve-ReviewerRunReconciliation -Manifests @(
+            (New-ReconRun -Nonce "malformed-a" -Rows @((New-ReconRow -Violating @("dc0"))) `
+                    -Candidates @($malformed) -Constructs $dcConstructs),
+            (New-ReconRun -Nonce "malformed-b" -Rows @((New-ReconRow -Violating @("dc0"))) `
+                    -Candidates @($malformed) -Constructs $dcConstructs))
+        $malformedFinding = @($malformedResult.candidates)[0]
+        Assert-Replay ($malformedFinding.disposition -ceq "withheldMalformedSemanticIdentity" -and
+            [string]$malformedFinding.semanticCandidateId -ceq "" -and
+            [string]$malformedFinding.semanticIdentitySha256 -ceq "" -and
+            $null -eq $malformedFinding.semanticIdentity) `
+            "Missing fields and incompatible semantic schemas must fail closed."
+    }
+
+    $metadataFact = "rf1:" + ("3" * 64)
+    $metadataAgreement = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "metadata-a" -Rows @((New-ReconRow)) -Candidates @(
+                (New-ReconCandidate -Path "" -Line 0 -AnchorKind prMetadata `
+                    -RemediationTargets prMetadata -FactIds $metadataFact -Comment "First metadata wording"))),
+        (New-ReconRun -Nonce "metadata-b" -Rows @((New-ReconRow)) -Candidates @(
+                (New-ReconCandidate -Path "" -Line 0 -AnchorKind prMetadata `
+                    -RemediationTargets prMetadata -FactIds $metadataFact -Comment "Second metadata wording"))))
+    Assert-Replay (@($metadataAgreement.candidates).Count -eq 1 -and
+        @($metadataAgreement.candidates)[0].disposition -ceq "semanticAgreementTextWithheld" -and
+        @(@($metadataAgreement.candidates)[0].semanticIdentity.evidence.violations).Count -eq 0) `
+        "Metadata candidates must reconcile from deterministic facts without inventing changed-construct violations."
+
+    $injectedText = "line one`n$([char]0x202e)<candidate>$([char]1)"
+    $injected = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "inject-a" -Rows @((New-ReconRow -Violating @("dc0"))) `
+                -Candidates @((New-ReconCandidate -Path "src/semantic.cs" -Line 1034 `
+                        -RemediationTargets dc0 -Comment $injectedText)) -Constructs $dcConstructs),
+        (New-ReconRun -Nonce "inject-b" -Rows @((New-ReconRow -Violating @("dc0"))) `
+                -Candidates @((New-ReconCandidate -Path "src/semantic.cs" -Line 1034 `
+                        -RemediationTargets dc0 -Comment "plain wording")) -Constructs $dcConstructs))
+    $injectedFinding = @($injected.candidates)[0]
+    Assert-Replay ($injectedFinding.disposition -ceq "semanticAgreementTextWithheld" -and
+        @(@($injectedFinding.presentationVariants).text.comment) -ccontains $injectedText) `
+        "Control and Unicode presentation text must be escaped and retained, never interpreted as identity."
+
+    $manyAnalogRuns = @()
+    for ($i = 1; $i -le 12; $i++) {
+        $manyAnalogRuns += New-ReconRun -Nonce "semantic-$i" `
+            -Rows @((New-ReconRow -Violating @("dc0"))) -Constructs $dcConstructs `
+            -Candidates @((New-ReconCandidate -Path "src/semantic.cs" -Line 1034 `
+                    -RemediationTargets dc0 -Id "candidate-$i" -Comment "presentation variant $i"))
+    }
+    $manyForward = Resolve-ReviewerRunReconciliation -Manifests $manyAnalogRuns -RequiredRunCount 12
+    $manyReverse = Resolve-ReviewerRunReconciliation -Manifests @($manyAnalogRuns[11..0]) -RequiredRunCount 12
+    $forwardCandidateBytes = ConvertTo-ReviewerConventionSpecialistCanonicalJson -Value $manyForward.candidates
+    $reverseCandidateBytes = ConvertTo-ReviewerConventionSpecialistCanonicalJson -Value $manyReverse.candidates
+    Assert-Replay ($forwardCandidateBytes -ceq $reverseCandidateBytes -and
+        [string]$manyForward.reconciliationSha256 -ceq [string]$manyReverse.reconciliationSha256) `
+        "Normalized semantic output bytes and digest must be independent of run order."
+    Assert-Replay (@(@($manyForward.candidates)[0].presentationVariants).Count -eq 12) `
+        "A stable semantic finding across 12 runs must carry every raw presentation variant."
+
+    $collisionLeft = [pscustomobject]@{ sha256 = ("a" * 64); canonicalPayload = '{"left":1}' }
+    $collisionRight = [pscustomobject]@{ sha256 = ("a" * 64); canonicalPayload = '{"right":1}' }
+    Assert-Replay ((Get-ReviewerRunReconciliationSemanticCandidateBucketKey -Identity $collisionLeft) -cne
+        (Get-ReviewerRunReconciliationSemanticCandidateBucketKey -Identity $collisionRight)) `
+        "Equal hashes represented by different canonical payloads must occupy different reconciliation buckets."
 
     # A pass where every rule ruled every anchor out of reach is clean row by
     # row and has looked at nothing. Two of those agree perfectly about nothing.
@@ -2612,20 +2798,16 @@ try {
         -not [bool]@($degradedVsClean.rows)[0].stable) `
         "One run degrading a row the other trusted is disagreement, even though both name the same anchor."
 
-    # A file path differing only in case is not the same file to this
-    # comparison, and must not be treated as one just because a dictionary
-    # happened to fold it.
+    # Canonical path semantics are shared with verification: slash form, leading
+    # dot, Unicode compatibility form, and case are representation differences.
     $caseSplit = Resolve-ReviewerRunReconciliation -Manifests @(
-        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Path "/src/Widget.cs"))),
-        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Path "/src/widget.cs")))
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Path "/SRC/A.cs"))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Path "src\a.cs")))
     )
-    Assert-Replay (@($caseSplit.candidates).Count -eq 2 -and
-        @(@($caseSplit.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0) `
-        "Two candidates whose paths differ only in case are two candidates, and neither is agreed."
-    $caseSplitPaths = [System.Collections.Generic.HashSet[string]]::new(
-        [string[]]@(@($caseSplit.candidates) | ForEach-Object { [string]$_.filePath }), [StringComparer]::Ordinal)
-    Assert-Replay ($caseSplitPaths.Count -eq 2) `
-        "Each must keep its own path; folding them prints one run's comment beside the other's file."
+    Assert-Replay (@($caseSplit.candidates).Count -eq 1 -and
+        @($caseSplit.candidates)[0].disposition -ceq "semanticAgreementTextWithheld" -and
+        [string]@($caseSplit.candidates)[0].filePath -ceq "/src/a.cs") `
+        "Path case and slash representation must normalize to one semantic anchor."
 
     # Every identity the binding covers, one at a time. A run that differs in
     # ANY of them is not a repetition, and the refusal must not depend on which
@@ -2649,7 +2831,7 @@ try {
         Assert-Replay (-not [bool]$mixed.reconciled) `
             "Runs differing in $($identity.Name) are not repetitions of one question."
         Assert-Replay (@($mixed.rows)[0].reconciledStatus -ceq "unknown" -and
-            @(@($mixed.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0) `
+            @(@($mixed.candidates) | Where-Object { $_.disposition -ceq "semanticAgreementTextWithheld" }).Count -eq 0) `
             "A $($identity.Name) mismatch must leave nothing stable and nothing eligible."
     }
 
@@ -2719,7 +2901,7 @@ try {
         "Ten runs shuffled must produce the same reconciliation digest."
     Assert-Replay (-not [bool]$tenForward.reconciled -and
         @(@($tenForward.rows) | Where-Object { [bool]$_.stable }).Count -eq 0 -and
-        @(@($tenForward.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0) `
+        @(@($tenForward.candidates) | Where-Object { $_.disposition -ceq "semanticAgreementTextWithheld" }).Count -eq 0) `
         "Ten runs spanning two bindings must leave nothing stable and nothing eligible."
 
     # With eleven runs "run 1" is a prefix of "run 10" and "run 11". The digest
@@ -2803,8 +2985,8 @@ try {
         (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Id "c1"))))
     Assert-Replay (@($countOnly.candidates)[0].disposition -ceq "withheldCountDisagreement") `
         "Identical text and severity proposed twice against once is still a disagreement about how many comments to make."
-    Assert-Replay (@(@($countOnly.candidates)[0].perRunCounts) -ccontains 2 -and
-        @(@($countOnly.candidates)[0].perRunCounts) -ccontains 1) `
+    $countOnlyValues = @(@($countOnly.candidates)[0].perRunCounts | ForEach-Object { [int]$_.count })
+    Assert-Replay ($countOnlyValues -ccontains 2 -and $countOnlyValues -ccontains 1) `
         "The per-run counts must show the two and the one."
 
     # One run is not a reconciliation, however clean it looks.
@@ -2931,24 +3113,26 @@ try {
     Assert-Replay (@($blankStatus.rows)[0].reconciledStatus -ceq "unknown" -and -not [bool]@($blankStatus.rows)[0].stable) `
         "A rule neither run gave a status is unknown, not a stable blank."
 
-    # The candidate key is joined from model-authored text. `ruleSourceId` is
-    # schema-allowed any printable ASCII, so a separator the fields CAN contain
-    # lets one candidate impersonate another. Asserted on the key itself,
-    # because a fixture that merely produces two different keys would pass
-    # under a broken separator too.
-    $honestKey = Get-ReviewerRunReconciliationCandidateKey -Candidate (New-ReconCandidate -Source "core/rule-a" -Path "/src/a.cs" -Line 12)
-    $forgedIdentity = Get-ReviewerRunReconciliationCandidateKey -Candidate (New-ReconCandidate `
-            -Source "core/rule-a|changedFile|src/a.cs|12" -Path "" -Line 0)
-    Assert-Replay ([string]$honestKey.Key -cne [string]$forgedIdentity.Key) `
-        "A rule id built to look like a whole key must not collide with the real one."
-    Assert-Replay ([string]$honestKey.RuleSourceId -ceq "core/rule-a" -and [string]$honestKey.FilePath -ceq "src/a.cs") `
-        "The key's parts must be carried, not recovered by splitting the key back apart."
+    # Canonical payloads, not separator-joined model text, are identity. A rule
+    # id crafted to resemble coordinates cannot impersonate those coordinates.
+    $honestManifest = New-ReconRun -Nonce "n1" -Rows @((New-ReconRow))
+    $honestIdentity = Get-ReviewerRunReconciliationSemanticCandidateIdentity `
+        -Candidate (New-ReconCandidate) -Manifest $honestManifest
+    $forgedManifest = New-ReconRun -Nonce "n2" -Rows @(
+        (New-ReconRow -Source "core/rule-a|changedFile|src/a.cs|12"))
+    $forgedIdentity = Get-ReviewerRunReconciliationSemanticCandidateIdentity `
+        -Candidate (New-ReconCandidate -Source "core/rule-a|changedFile|src/a.cs|12") `
+        -Manifest $forgedManifest
+    Assert-Replay ([string]$honestIdentity.canonicalPayload -cne [string]$forgedIdentity.canonicalPayload) `
+        "A rule id built to look like coordinates must not collide with the canonical semantic payload."
     $forgedKey = Resolve-ReviewerRunReconciliation -Manifests @(
         (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate))),
         (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Candidates @(
                 (New-ReconCandidate -Source "core/rule-a|changedFile|src/a.cs|12" -Path "" -Line 0)))
     )
-    Assert-Replay (@(@($forgedKey.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0) `
+    Assert-Replay (@(@($forgedKey.candidates) | Where-Object {
+                $_.disposition -ceq "semanticAgreementTextWithheld"
+            }).Count -eq 0) `
         "A rule id carrying the key separator must not let one candidate impersonate another."
     $forgedReport = Format-ReviewerRunReconciliationReport -Reconciliation $forgedKey
     Assert-Replay ($forgedReport -cnotlike "*] src/a.cs:12 rule core/rule-a;*rule core/rule-a;*") `
@@ -3100,9 +3284,14 @@ try {
 
     # The committed schema is the contract. A schema nobody checks against the
     # code it describes is a document, not a contract.
-    $schemaPath = Join-Path $RepoRoot "src\Agents\reviewer\schemas\reviewer.run-reconciliation.v1.json"
+    $schemaPath = Join-Path $RepoRoot "src\Agents\reviewer\schemas\reviewer.run-reconciliation.v2.json"
     Assert-Replay (Test-Path -LiteralPath $schemaPath) "The reconciliation schema must be committed."
     $schema = [IO.File]::ReadAllText($schemaPath, $utf8) | ConvertFrom-Json -Depth 20
+    $v1SchemaPath = Join-Path $RepoRoot "src\Agents\reviewer\schemas\reviewer.run-reconciliation.v1.json"
+    $v1Schema = [IO.File]::ReadAllText($v1SchemaPath, $utf8) | ConvertFrom-Json -Depth 20
+    Assert-Replay ([int]$v1Schema.definitions.reconciliation.properties.version.const -eq 1 -and
+        [int]$schema.definitions.reconciliation.properties.version.const -eq 2) `
+        "The breaking semantic reconciliation shape must preserve v1 and publish a distinct v2 contract."
     $schemaKinds = @($schema.definitions.runSetDeclaration.properties.kind.const,
         $schema.definitions.reconciliation.properties.kind.const)
     Assert-Replay ($schemaKinds -ccontains $script:ReviewerRunReconciliationSetKind -and
@@ -3125,11 +3314,15 @@ try {
             "The schema's anchor verdicts must include '$verdict', which the reconciler emits."
     }
     $dispositionEnum = @($schema.definitions.candidateOutcome.properties.disposition.enum)
-    foreach ($disposition in @("agreed", "withheldRunDisagreement", "withheldCountDisagreement",
-            "withheldSeverityDisagreement", "withheldTextDisagreement", "withheldUnreconciled")) {
+    foreach ($disposition in @("semanticAgreementTextWithheld", "withheldRunDisagreement",
+            "withheldCountDisagreement", "withheldSemanticDisagreement",
+            "withheldMalformedSemanticIdentity", "withheldUnreconciled")) {
         Assert-Replay ($dispositionEnum -ccontains $disposition) `
             "The schema must describe the '$disposition' disposition the reconciler can emit."
     }
+    Assert-Replay ([string]$schema.definitions.candidateOutcome.properties.comment.const -ceq "" -and
+        @($schema.definitions.candidateOutcome.allOf).Count -ge 2) `
+        "The v2 schema must forbid selected prose and condition semantic agreement/malformed identity fields."
 
     # WIRING PROOF. "Evaluation only" is a claim until something feeds the
     # reconciliation to the paths that actually deliver and watches them refuse
@@ -3142,8 +3335,12 @@ try {
         (New-ReconRun -Nonce "w2" -Rows @((New-ReconRow -Violating @("mi0"))) -Candidates @(
                 (New-ReconCandidate -Line 12), (New-ReconCandidate -Line 99 -Id "c2"))))
     # One candidate both runs proposed, one only the second did.
-    $agreedOnes = @(@($wiringSet.candidates) | Where-Object { $_.disposition -ceq "agreed" })
-    $withheldOnes = @(@($wiringSet.candidates) | Where-Object { $_.disposition -cne "agreed" })
+    $agreedOnes = @(@($wiringSet.candidates) | Where-Object {
+            $_.disposition -ceq "semanticAgreementTextWithheld"
+        })
+    $withheldOnes = @(@($wiringSet.candidates) | Where-Object {
+            $_.disposition -cne "semanticAgreementTextWithheld"
+        })
     Assert-Replay (@($agreedOnes).Count -eq 1 -and [string]@($agreedOnes)[0].line -ceq "12") `
         "The candidate both runs proposed must be the agreed one."
     Assert-Replay (@($withheldOnes).Count -eq 1 -and [string]@($withheldOnes)[0].line -ceq "99") `
@@ -3170,8 +3367,9 @@ try {
     foreach ($candidate in @($wiringSet.candidates)) {
         Assert-Replay ($null -eq $candidate.PSObject.Properties["candidateId"]) `
             "A reconciled candidate must not carry the id a delivery path resolves."
-        Assert-Replay (@("agreed", "withheldRunDisagreement", "withheldCountDisagreement",
-                "withheldSeverityDisagreement", "withheldTextDisagreement", "withheldUnreconciled") -ccontains [string]$candidate.disposition) `
+        Assert-Replay (@("semanticAgreementTextWithheld", "withheldRunDisagreement",
+                "withheldCountDisagreement", "withheldSemanticDisagreement",
+                "withheldMalformedSemanticIdentity", "withheldUnreconciled") -ccontains [string]$candidate.disposition) `
             "A reconciled candidate's disposition must come from the closed evaluation set."
     }
     # A refused reconciliation empties everything, so a disagreement cannot even
@@ -3180,7 +3378,9 @@ try {
         (New-ReconRun -Nonce "w3" -Rows @((New-ReconRow -Violating @("mi0"))) -Candidates @((New-ReconCandidate))),
         (New-ReconRun -Nonce "w4" -Rows @((New-ReconRow -Violating @("mi0"))) -Candidates @((New-ReconCandidate)) -Status "degraded"))
     Assert-Replay (-not [bool]$refusedWiring.reconciled -and
-        @(@($refusedWiring.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0 -and
+        @(@($refusedWiring.candidates) | Where-Object {
+                $_.disposition -ceq "semanticAgreementTextWithheld"
+            }).Count -eq 0 -and
         [int]$refusedWiring.agreedCandidateCount -eq 0 -and
         @(@($refusedWiring.rows) | Where-Object { [bool]$_.stable }).Count -eq 0) `
         "A refused reconciliation must leave no stable row, no agreed candidate, and a zero agreed count."

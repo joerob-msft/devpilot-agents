@@ -1,0 +1,438 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:devpilot:reviewer:run-reconciliation:v2",
+  "title": "Reviewer cross-run reconciliation",
+  "description": "Two documents. A qualification run-set DECLARATION, sealed before the runs are compared, which fixes what the universe is. And the RECONCILIATION it produces, which is evaluation output and can never authorize anything.",
+  "definitions": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "runSetDeclaration": {
+      "description": "Sealed under the replay key domain BEFORE the comparison. Naming the runs is what stops a set being trimmed of the one that disagreed.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "artifactVersion",
+        "status",
+        "setId",
+        "snapshotName",
+        "snapshotManifestDigest",
+        "plannedRunCount",
+        "expectedRunSha256",
+        "purpose",
+        "promotable",
+        "declaredAt"
+      ],
+      "properties": {
+        "kind": { "const": "reviewer.run-reconciliation-set" },
+        "artifactVersion": { "const": 2 },
+        "status": { "const": "ok" },
+        "setId": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+        "snapshotName": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" },
+        "snapshotManifestDigest": { "$ref": "#/definitions/sha256" },
+        "plannedRunCount": { "type": "integer", "minimum": 2, "maximum": 16 },
+        "expectedRunSha256": {
+          "description": "The exact run artifacts, by file digest. Empty means the declaration fixes only how many runs will count, which is the weaker form.",
+          "type": "array",
+          "maxItems": 16,
+          "items": { "$ref": "#/definitions/sha256" }
+        },
+        "purpose": { "type": "string", "maxLength": 512 },
+        "promotable": { "const": false },
+        "declaredAt": { "type": "string" }
+      }
+    },
+    "anchorOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["constructId", "reconciledVerdict", "stable", "perRunVerdicts"],
+      "properties": {
+        "constructId": { "type": "string", "pattern": "^[a-z]{2}[0-9]{1,3}$" },
+        "reconciledVerdict": {
+          "description": "The single verdict every run gave this anchor, or unknown. Never a majority.",
+          "enum": ["violation", "compliant", "notInReach", "unknown"]
+        },
+        "stable": { "type": "boolean" },
+        "perRunVerdicts": {
+          "description": "One entry per run, in run order. `unaccounted` means that run never mentioned the anchor, which is an omission rather than silence to be filled in.",
+          "type": "array",
+          "items": { "enum": ["violation", "compliant", "notInReach", "unknown", "unaccounted", "conflicted"] }
+        }
+      }
+    },
+    "ruleOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ruleSourceId", "ruleRef", "reconciledStatus", "stable",
+        "rawStatuses", "disagreements", "readings", "anchors",
+        "violatingConstructs", "notInReachConstructs"
+      ],
+      "properties": {
+        "ruleSourceId": { "type": "string" },
+        "ruleRef": { "type": "string" },
+        "reconciledStatus": { "enum": ["violation", "compliant", "notApplicable", "unknown"] },
+        "stable": { "type": "boolean" },
+        "rawStatuses": {
+          "description": "Every run's own reading, preserved verbatim and in run order, including `absent` and `(none)`.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "disagreements": { "type": "array", "items": { "type": "string" } },
+        "readings": { "type": "array" },
+        "anchors": { "type": "array", "items": { "$ref": "#/definitions/anchorOutcome" } },
+        "violatingConstructs": {
+          "description": "Empty unless the row is stable. An unstable row never carries forward the anchors of whichever run found something.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "notInReachConstructs": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "candidateOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "semanticCandidateId", "semanticCandidateVersion",
+        "semanticIdentitySha256", "semanticIdentity", "identityErrors",
+        "ruleSourceId", "anchorKind", "filePath", "line",
+        "presentInRuns", "absentInRuns", "perRunCounts",
+        "presentationStatus", "presentationVariants", "inEveryRun",
+        "disposition", "severity", "comment"
+      ],
+      "properties": {
+        "semanticCandidateId": {
+          "oneOf": [
+            { "type": "string", "pattern": "^rsci1:[0-9a-f]{64}$" },
+            { "const": "" }
+          ]
+        },
+        "semanticCandidateVersion": { "const": 1 },
+        "semanticIdentitySha256": {
+          "oneOf": [
+            { "$ref": "#/definitions/sha256" },
+            { "const": "" }
+          ]
+        },
+        "semanticIdentity": {
+          "oneOf": [
+            { "$ref": "#/definitions/semanticCandidateIdentity" },
+            { "type": "null" }
+          ]
+        },
+        "identityErrors": { "type": "array", "items": { "type": "string" } },
+        "ruleSourceId": { "type": "string" },
+        "anchorKind": { "type": "string" },
+        "filePath": { "type": "string" },
+        "line": { "type": "integer" },
+        "presentInRuns": { "type": "array", "items": { "type": "string" } },
+        "absentInRuns": { "type": "array", "items": { "type": "string" } },
+        "perRunCounts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["replayNonce", "count"],
+            "properties": {
+              "replayNonce": { "type": "string" },
+              "count": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        "presentationStatus": { "const": "withheldPendingCanonicalRenderer" },
+        "presentationVariants": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["sha256", "replayNonce", "candidateId", "text"],
+            "properties": {
+              "sha256": { "$ref": "#/definitions/sha256" },
+              "replayNonce": { "type": "string" },
+              "candidateId": { "type": "string" },
+              "text": { "$ref": "#/definitions/presentationText" }
+            }
+          }
+        },
+        "inEveryRun": { "type": "boolean" },
+        "disposition": {
+          "description": "Semantic agreement retains no model wording. Nothing here can authorize a comment or vote.",
+          "enum": [
+            "semanticAgreementTextWithheld",
+            "withheldRunDisagreement",
+            "withheldCountDisagreement",
+            "withheldSemanticDisagreement",
+            "withheldMalformedSemanticIdentity",
+            "withheldUnreconciled"
+          ]
+        },
+        "severity": { "type": "string" },
+        "comment": { "const": "" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "disposition": { "const": "semanticAgreementTextWithheld" } },
+            "required": ["disposition"]
+          },
+          "then": {
+            "properties": {
+              "semanticCandidateId": { "type": "string", "pattern": "^rsci1:[0-9a-f]{64}$" },
+              "semanticIdentitySha256": { "$ref": "#/definitions/sha256" },
+              "semanticIdentity": { "$ref": "#/definitions/semanticCandidateIdentity" },
+              "identityErrors": { "maxItems": 0 },
+              "inEveryRun": { "const": true }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "disposition": { "const": "withheldMalformedSemanticIdentity" } },
+            "required": ["disposition"]
+          },
+          "then": {
+            "properties": {
+              "semanticCandidateId": { "const": "" },
+              "semanticIdentitySha256": { "const": "" },
+              "semanticIdentity": { "type": "null" },
+              "identityErrors": { "minItems": 1 },
+              "inEveryRun": { "const": false }
+            }
+          }
+        }
+      ]
+    },
+    "presentationText": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "comment", "ruleSection", "ruleQuote", "diffEvidence", "impact",
+        "expectedFixOrValidation", "siblingEvidence",
+        "siblingNotRequiredReason", "residualRiskSummary"
+      ],
+      "properties": {
+        "comment": { "type": "string" },
+        "ruleSection": { "type": "string" },
+        "ruleQuote": { "type": "string" },
+        "diffEvidence": { "type": "string" },
+        "impact": { "type": "string" },
+        "expectedFixOrValidation": { "type": "string" },
+        "siblingEvidence": { "type": "string" },
+        "siblingNotRequiredReason": { "type": "string" },
+        "residualRiskSummary": { "type": "string" }
+      }
+    },
+    "constructIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "path", "line", "endLine"],
+      "properties": {
+        "id": { "type": "string" },
+        "kind": { "type": "string" },
+        "path": { "type": "string" },
+        "line": { "type": "integer" },
+        "endLine": { "type": "integer" }
+      }
+    },
+    "semanticCandidateIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "version", "rule", "anchor", "issue", "severity", "evidence", "remediation"],
+      "properties": {
+        "kind": { "const": "reviewer.semantic-candidate" },
+        "version": { "const": 1 },
+        "rule": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["packName", "sourceId", "sha256"],
+          "properties": {
+            "packName": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+            "sourceId": { "type": "string", "minLength": 1 },
+            "sha256": { "$ref": "#/definitions/sha256" }
+          }
+        },
+        "anchor": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "path", "line", "constructs"],
+          "properties": {
+            "kind": { "enum": ["changedFile", "prMetadata"] },
+            "path": { "type": "string" },
+            "line": { "type": "integer", "minimum": 0 },
+            "constructs": { "type": "array", "items": { "$ref": "#/definitions/constructIdentity" } }
+          }
+        },
+        "issue": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["class", "impactCategory"],
+          "properties": {
+            "class": { "type": "string", "minLength": 1 },
+            "impactCategory": { "type": "string", "minLength": 1 }
+          }
+        },
+        "severity": { "enum": ["suggestion", "important"] },
+        "evidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["factIds", "violations"],
+          "properties": {
+            "factIds": { "type": "array", "items": { "type": "string" } },
+            "violations": { "type": "array", "items": { "$ref": "#/definitions/constructIdentity" } }
+          }
+        },
+        "remediation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["action", "scope", "targets", "followUpRequired"],
+          "properties": {
+            "action": { "enum": ["add", "modify", "remove", "rename", "replace", "validate"] },
+            "scope": { "enum": ["inPullRequest", "followUp"] },
+            "targets": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+            "followUpRequired": { "type": "boolean" }
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "anchor": {
+                  "properties": { "kind": { "const": "changedFile" } },
+                  "required": ["kind"]
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "anchor": {
+                  "properties": {
+                    "path": { "type": "string", "minLength": 1 },
+                    "line": { "type": "integer", "minimum": 1 },
+                    "constructs": { "type": "array", "minItems": 1 }
+                  }
+                },
+                "evidence": {
+                  "properties": {
+                    "violations": { "type": "array", "minItems": 1 }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "anchor": {
+                  "properties": { "kind": { "const": "prMetadata" } },
+                  "required": ["kind"]
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "anchor": {
+                  "properties": {
+                    "path": { "const": "" },
+                    "line": { "const": 0 },
+                    "constructs": { "type": "array", "maxItems": 0 }
+                  }
+                },
+                "evidence": {
+                  "properties": {
+                    "factIds": { "type": "array", "minItems": 1 },
+                    "violations": { "type": "array", "maxItems": 0 }
+                  }
+                },
+                "remediation": {
+                  "properties": {
+                    "targets": {
+                      "type": "array",
+                      "prefixItems": [{ "const": "prMetadata" }],
+                      "minItems": 1,
+                      "maxItems": 1
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "reconciliation": {
+      "description": "Evaluation output. It carries no authorization field, is sealed under the replay key domain, and wears a kind the promotion readers refuse.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "version", "reconciled", "promotable", "runCount",
+        "requiredRunCount", "inputBindingSha256", "problems", "runs",
+        "stableRowCount", "unstableRowCount", "rows",
+        "agreedCandidateCount", "candidates", "reconciliationSha256"
+      ],
+      "properties": {
+        "kind": { "const": "reviewer.run-reconciliation" },
+        "version": { "const": 2 },
+        "reconciled": {
+          "description": "False forces every row to unknown and every candidate to withheld.",
+          "type": "boolean"
+        },
+        "promotable": { "const": false },
+        "runCount": { "type": "integer", "minimum": 1, "maximum": 16 },
+        "requiredRunCount": { "type": "integer", "minimum": 2, "maximum": 16 },
+        "inputBindingSha256": { "$ref": "#/definitions/sha256" },
+        "problems": { "type": "array", "items": { "type": "string" } },
+        "runs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["run", "replayNonce", "status", "complete", "inputBindingSha256", "rowCount", "candidateCount"],
+            "properties": {
+              "run": { "type": "integer", "minimum": 1 },
+              "replayNonce": { "type": "string" },
+              "status": { "type": "string" },
+              "complete": { "type": "boolean" },
+              "inputBindingSha256": { "$ref": "#/definitions/sha256" },
+              "rowCount": { "type": "integer" },
+              "candidateCount": { "type": "integer" }
+            }
+          }
+        },
+        "stableRowCount": { "type": "integer" },
+        "unstableRowCount": { "type": "integer" },
+        "rows": { "type": "array", "items": { "$ref": "#/definitions/ruleOutcome" } },
+        "agreedCandidateCount": { "type": "integer" },
+        "candidates": { "type": "array", "items": { "$ref": "#/definitions/candidateOutcome" } },
+        "reconciliationSha256": {
+          "description": "Over the normalized outcome only, with run positions rewritten as nonces, so listing the same runs in another order gives the same digest.",
+          "$ref": "#/definitions/sha256"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "reconciled": { "const": false } },
+            "required": ["reconciled"]
+          },
+          "then": {
+            "properties": {
+              "candidates": {
+                "items": {
+                  "properties": {
+                    "disposition": {
+                      "not": { "const": "semanticAgreementTextWithheld" }
+                    },
+                    "inEveryRun": { "const": false }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/definitions/runSetDeclaration" },
+    { "$ref": "#/definitions/reconciliation" }
+  ]
+}

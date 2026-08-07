@@ -177,7 +177,7 @@ not a candidate. Do not invent a resolution.
 
 ## Result marker
 
-Emit the `CONVENTION_REVIEW_RESULT_V1:` marker **exactly once**, as the very
+Emit the `CONVENTION_REVIEW_RESULT_V2:` marker **exactly once**, as the very
 last thing you write, and never again. Do not preview it, do not summarise it
 afterwards, and do not repeat it in a closing recap. If a second copy appears
 and so much as one word of prose differs between them, the wrapper cannot tell
@@ -206,7 +206,16 @@ Each candidate has exactly:
 (`none|buildOrTestExecution|deployment|security|customerBehavior|compatibility`),
 `impact`, `expectedFixOrValidation`, `siblingStatus` (`checked|notRequired`),
 `siblingEvidence`, `siblingNotRequiredReason`, `factIds` (comma-separated,
-or empty), `confidence` (`low|medium|high`), and `residualRiskSummary`.
+or empty), `confidence` (`low|medium|high`), `residualRiskSummary`,
+`semanticCandidateVersion` (exactly `1`), `remediationAction`
+(`add|modify|remove|rename|replace|validate`), `remediationScope`
+(`inPullRequest|followUp`), `remediationTargets` (comma-separated sealed
+construct ids), and `followUpRequired` (boolean). These remediation fields are
+semantic coordinates, not prose: identify what the pull request must do and
+which sealed constructs it applies to. Do not put explanatory wording in them.
+For `prMetadata`, use exactly `prMetadata` as the remediation target. An
+`inPullRequest` scope requires `followUpRequired: false`; a `followUp` scope
+requires `followUpRequired: true`.
 
 Each withheld item has exactly `candidateId`, `reason`, and `detail`. `reason`
 must be exactly one of `sourceConflict`, `outsideChangedFile`, `invalidAnchor`,
