@@ -843,6 +843,58 @@ try {
 catch { $byteOverflowRejected = $true }
 Assert-Verification $byteOverflowRejected `
     "A verifier deterministic-fact payload above its byte cap was accepted."
+$goodPartitionCandidate = Copy-VerificationObject $disjointFixCandidates[0]
+$goodPartitionCandidate.candidateId = "good-fact-candidate"
+$duplicatePartitionCandidate = Copy-VerificationObject $disjointFixCandidates[0]
+$duplicatePartitionCandidate.candidateId = "duplicate-fact-candidate"
+$duplicatePartitionCandidate.changedCodeFix.evidenceFactIds = "$metadataFactId,$metadataFactId"
+$duplicatePartition = Get-ReviewerVerificationCandidateFactPartition `
+    -Candidates @($duplicatePartitionCandidate, $goodPartitionCandidate) -FactPlan $factPlan
+Assert-Verification (@($duplicatePartition.candidates).Count -eq 1 -and
+    [string]$duplicatePartition.candidates[0].candidateId -ceq "good-fact-candidate" -and
+    @($duplicatePartition.withheld).Count -eq 1 -and
+    [string]$duplicatePartition.withheld[0].candidateId -ceq "duplicate-fact-candidate") `
+    "A duplicate fact subset discarded an unrelated valid candidate at production admission."
+$overflowFactPlan = [pscustomobject]@{
+    facts = @($factPlan.facts) + @($metadataOverflowFacts)
+}
+$overflowPartitionCandidate = Copy-VerificationObject $metadataOverflowCandidate
+$overflowPartitionCandidate.candidateId = "overflow-fact-candidate"
+$overflowPartition = Get-ReviewerVerificationCandidateFactPartition `
+    -Candidates @($overflowPartitionCandidate, $goodPartitionCandidate) -FactPlan $overflowFactPlan
+Assert-Verification (@($overflowPartition.candidates).Count -eq 1 -and
+    [string]$overflowPartition.candidates[0].candidateId -ceq "good-fact-candidate" -and
+    @($overflowPartition.withheld).Count -eq 1 -and
+    [string]$overflowPartition.withheld[0].candidateId -ceq "overflow-fact-candidate") `
+    "An over-cap candidate discarded an unrelated valid candidate at production admission."
+$batchFacts = @(1..17 | ForEach-Object {
+        [pscustomobject]@{
+            id = "rf1:" + ([string](100 + $_)).PadLeft(64, "0"); domain = "source"
+            kind = "present"; subject = "b$_"; state = "true"; unknownReason = ""; value = $true
+        }
+    })
+$batchCandidates = @(1..3 | ForEach-Object {
+        $batchCandidate = Copy-VerificationObject $goodPartitionCandidate
+        $batchCandidate.candidateId = "batch-candidate-$_"
+        $start = if ($_ -eq 1) { 0 } elseif ($_ -eq 2) { 8 } else { 16 }
+        $count = if ($_ -eq 3) { 1 } else { 8 }
+        $batchCandidate.factIds = @($batchFacts[$start..($start + $count - 1)].id) -join ","
+        $batchCandidate.changedCodeFix.valueSource = "authoritativeRule"
+        $batchCandidate.changedCodeFix.evidenceFactIds = ""
+        $batchCandidate
+    })
+$batchCluster = [pscustomobject]@{
+    clusterId = "vc1:" + ("9" * 64)
+    status = "ready"
+    members = $batchCandidates
+}
+$clusterFactPartition = Get-ReviewerVerificationClusterFactPartition `
+    -Candidates $batchCandidates -Clusters @($batchCluster) `
+    -FactPlan ([pscustomobject]@{ facts = $batchFacts })
+Assert-Verification (@($clusterFactPartition.candidates).Count -eq 2 -and
+    @($clusterFactPartition.withheld).Count -eq 1 -and
+    [string]$clusterFactPartition.withheld[0].candidateId -ceq "batch-candidate-3") `
+    "Production cluster fact admission omitted bounded candidates or retained the candidate that exceeded the run cap."
 $disjointClusters = @(Get-ReviewerVerificationClusters -Candidates $disjointFixCandidates)
 $disjointAssignments = @(Get-ReviewerVerificationAssignments -Clusters $disjointClusters `
     -GeneralistModels @($opus, $sol) -ConventionVerifierModel $sol)
@@ -1390,7 +1442,9 @@ $crossPassText = Get-VerificationFunctionText -Text $wrapperText `
 foreach ($policyUse in @(
         "Get-ReviewerVerificationCandidatePlan", "nearExactJaccard", "semanticJaccard",
         "existingThreadJaccard", "maxInputBytes", "maxArtifactBytes",
-        "Get-ReviewerVerificationRunBudget", "preVerificationWithheld"
+        "Get-ReviewerVerificationRunBudget", "preVerificationWithheld",
+        "Get-ReviewerVerificationCandidateFactPartition",
+        "Get-ReviewerVerificationClusterFactPartition"
     )) {
     Assert-Verification ($crossPassText.IndexOf(
             $policyUse, [StringComparison]::Ordinal) -ge 0) `
@@ -1457,6 +1511,212 @@ $missingEvidence = Resolve-ReviewerVerificationDecisions -Clusters $singleCluste
 Assert-Verification (@($missingEvidence.eligible).Count -eq 0 -and
     @($missingEvidence.withheld | Where-Object reason -ceq "missingEvidence").Count -eq 1) `
     "A verifier verdict without wrapper-bound evidence became eligible."
+
+# Execute the production pass and safe wrapper with external I/O replaced by bounded
+# deterministic fixtures. This catches candidate-local admission failures escaping
+# into the pass-wide degradation boundary.
+. ([scriptblock]::Create($crossPassText))
+. ([scriptblock]::Create($safeVerificationText))
+$script:passCandidates = @()
+$script:passFactPlan = $factPlan
+$script:capturedVerificationInput = $null
+$script:clusterSequenceMode = ""
+$script:clusterSequenceCall = 0
+$script:ReviewerVerificationInputKind = "reviewer.verification-input.v1"
+$script:ReviewerVerificationArtifactVersion = 1
+$EffectiveConventionSpecialistModel = "claude-sonnet-5"
+$EffectiveConventionVerifierModel = $sol
+$ReviewPassModels = @($opus, $sol)
+$EffectiveEnableVerificationPreview = $true
+$EffectiveVerificationTimeoutSeconds = 30
+$EffectiveCrossVerificationPolicy = [pscustomobject]@{
+    maxCandidates = 16; maxClusterSize = 8; maxVerifierRuns = 16
+    maxVerificationSeconds = 300; maxInputBytes = 65536; maxArtifactBytes = 262144
+    nearExactJaccard = 0.92; semanticJaccard = 0.70; existingThreadJaccard = 0.80
+}
+$ConfigSha256 = "1" * 64
+$ScriptSelfSha256 = "2" * 64
+$CrossVerificationLibrarySha256 = "3" * 64
+$CrossVerificationPromptSha256 = "4" * 64
+$CrossVerificationPolicySha256 = "5" * 64
+$CrossVerificationSchemaSha256 = "6" * 64
+$Organization = "example"
+$ExpectedProject = "Example"
+$cfgRepoId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+$artifactKeyPath = "unused-key"
+$verificationInputDir = [IO.Path]::GetTempPath()
+function Read-ReviewerConventionPlan {
+    param([string]$Path)
+    return [pscustomobject]@{
+        targetCommit = "2" * 40
+        changeSetDigest = "3" * 64
+    }
+}
+function Read-ReviewerFactPlan {
+    param([string]$Path)
+    return $script:passFactPlan
+}
+function Invoke-ReviewerConventionSession {
+    param([string]$AgencyPath, [scriptblock]$Action)
+    return & $Action @{}
+}
+function Get-ReviewerPinnedConventionChangeSet {
+    param($Session, [int]$PrId, [string]$ExpectedSourceCommit)
+    return [pscustomobject]@{
+        TargetCommit = "2" * 40
+        Digest = "3" * 64
+        Entries = @()
+    }
+}
+function Get-ReviewerVerificationCandidatePlan {
+    param($GeneralistPasses, $ConventionCandidates, [string]$ConventionModel,
+        [string]$ConventionArtifactSha256, [int]$MaxCandidates)
+    return [pscustomobject]@{
+        candidates = @($script:passCandidates)
+        withheld = @()
+        totalCandidateCount = @($script:passCandidates).Count
+    }
+}
+function Get-ReviewerVerificationClusters {
+    param($Candidates, [int]$MaxCandidates, [int]$MaxClusterSize,
+        [double]$NearExactJaccard, [double]$SemanticJaccard)
+    if (@($Candidates).Count -eq 0) { return @() }
+    if ($script:clusterSequenceMode -ceq "removalMerge") {
+        $script:clusterSequenceCall++
+        if ($script:clusterSequenceCall -eq 1) {
+            return @(
+                [pscustomobject]@{
+                    clusterId = "vc1:" + ("a" * 64); status = "ready"
+                    members = @($Candidates[0], $Candidates[1])
+                    memberHashes = @($Candidates[0].candidateHash, $Candidates[1].candidateHash)
+                },
+                [pscustomobject]@{
+                    clusterId = "vc1:" + ("b" * 64); status = "ready"
+                    members = @($Candidates[2])
+                    memberHashes = @($Candidates[2].candidateHash)
+                }
+            )
+        }
+        return @([pscustomobject]@{
+                clusterId = "vc1:" + ("c" * 64)
+                status = "ready"
+                members = @($Candidates)
+                memberHashes = @($Candidates.candidateHash)
+            })
+    }
+    return @([pscustomobject]@{
+            clusterId = "vc1:" + ("7" * 64)
+            status = "ready"
+            members = @($Candidates)
+            memberHashes = @($Candidates.candidateHash)
+        })
+}
+function Get-ReviewerVerificationAssignments {
+    param($Clusters, $GeneralistModels, [string]$ConventionVerifierModel, $ChangedPaths)
+    return @()
+}
+function Get-ReviewerVerificationSourceHunks {
+    param([string]$AgencyPath, [string]$SourceCommit, $Candidates, $ChangedPaths)
+    return @()
+}
+function Get-ReviewerVerificationThreadFacts {
+    param($FactPlan)
+    return @()
+}
+function Get-ReviewerRunArtifactKey {
+    param([string]$KeyPath)
+    return [byte[]](1..32)
+}
+function Save-ReviewerVerificationInput {
+    param($Manifest, [string]$Directory, [string]$BaseName, [byte[]]$MasterKey,
+        [int]$MaxArtifactBytes)
+    $script:capturedVerificationInput = $Manifest
+    return Join-Path ([IO.Path]::GetTempPath()) "$BaseName.json"
+}
+function Invoke-ReviewerVerificationReplay {
+    param($InputManifest, $VerifierRuns)
+    return [pscustomobject]@{
+        eligible = @($InputManifest.candidates)
+        withheld = @($InputManifest.preVerificationWithheld)
+        decisions = @()
+        replaySha256 = "8" * 64
+    }
+}
+function Write-ReviewerVerificationDecisionPreview {
+    param([int]$PrId, [string]$SourceCommit, [string]$Status, [string]$Diagnostic,
+        [string]$InputArtifactPath, [string]$InputManifestSha256, $Clusters,
+        $Assignments, $VerifierRuns, $Decisions, $Withheld, $Eligible,
+        $AllCandidates, $InputArtifactHashes, [int]$TotalCandidateCount,
+        [string]$ReplaySha256)
+    return [pscustomobject]@{
+        MarkdownPath = Join-Path ([IO.Path]::GetTempPath()) "preview.md"
+        ArtifactPath = Join-Path ([IO.Path]::GetTempPath()) "preview.json"
+    }
+}
+function Write-ReviewerCycleMetadata { param([hashtable]$Fields) }
+$passBound = @{
+    PrId = 42; SourceCommit = "1" * 40; ConventionPlanPath = "plan.json"
+    FactPlanPath = "facts.json"; ChangedPaths = @("src/a.cs")
+}
+$emptySpecialistResult = [pscustomobject]@{
+    Status = "complete"; Candidates = @(); Manifest = $null; ArtifactPath = ""
+}
+$script:passFactPlan = $factPlan
+$script:passCandidates = @($duplicatePartitionCandidate, $goodPartitionCandidate)
+$duplicatePass = Invoke-ReviewerCrossVerificationPass -AgencyPath "unused" -CycleNumber 1 `
+    -Bound $passBound -PassResults @() -SpecialistResult $emptySpecialistResult
+Assert-Verification ($duplicatePass.Status -ceq "complete" -and
+    @($duplicatePass.Eligible).Count -eq 1 -and
+    [string]$duplicatePass.Eligible[0].candidateId -ceq "good-fact-candidate" -and
+    @($duplicatePass.Withheld).Count -eq 1 -and
+    [string]$duplicatePass.Withheld[0].candidateId -ceq "duplicate-fact-candidate") `
+    "Production cross-verification pass degraded or discarded a good candidate beside a duplicate subset."
+$script:passFactPlan = $overflowFactPlan
+$script:passCandidates = @($overflowPartitionCandidate, $goodPartitionCandidate)
+$overflowSafe = Invoke-ReviewerCrossVerificationSafely -AgencyPath "unused" -CycleNumber 2 `
+    -Bound $passBound -PassResults @() -SpecialistResult $emptySpecialistResult
+Assert-Verification ($overflowSafe.Status -ceq "complete" -and
+    @($overflowSafe.Eligible).Count -eq 1 -and
+    [string]$overflowSafe.Eligible[0].candidateId -ceq "good-fact-candidate" -and
+    @($overflowSafe.Withheld).Count -eq 1 -and
+    [string]$overflowSafe.Withheld[0].candidateId -ceq "overflow-fact-candidate") `
+    "Safe production cross-verification degraded or discarded a good candidate beside an over-cap subset."
+$mergeFacts = @(1..25 | ForEach-Object {
+        [pscustomobject]@{
+            id = "rf1:" + ([string](200 + $_)).PadLeft(64, "0"); domain = "source"
+            kind = "present"; subject = "m$_"; state = "true"; unknownReason = ""; value = $true
+        }
+    })
+$mergeCandidates = @(1..3 | ForEach-Object {
+        $mergeCandidate = Copy-VerificationObject $goodPartitionCandidate
+        $mergeCandidate.candidateId = "merge-candidate-$_"
+        $start = ($_ - 1) * 8
+        $mergeCandidate.factIds = @($mergeFacts[$start..($start + 7)].id) -join ","
+        if ($_ -eq 1) {
+            $mergeCandidate.changedCodeFix.valueSource = "authoritativeRule"
+            $mergeCandidate.changedCodeFix.evidenceFactIds = ""
+        }
+        else {
+            $mergeCandidate.changedCodeFix.valueSource = "deterministicFact"
+            $mergeCandidate.changedCodeFix.evidenceFactIds = [string]$mergeFacts[24].id
+        }
+        $mergeCandidate
+    })
+$script:clusterSequenceMode = "removalMerge"
+$script:clusterSequenceCall = 0
+$script:passFactPlan = [pscustomobject]@{ facts = $mergeFacts }
+$script:passCandidates = $mergeCandidates
+$removalMergePass = Invoke-ReviewerCrossVerificationPass -AgencyPath "unused" -CycleNumber 3 `
+    -Bound $passBound -PassResults @() -SpecialistResult $emptySpecialistResult
+Assert-Verification ($removalMergePass.Status -ceq "complete" -and
+    @($removalMergePass.Eligible).Count -eq 1 -and
+    [string]$removalMergePass.Eligible[0].candidateId -ceq "merge-candidate-1" -and
+    @($removalMergePass.Withheld).Count -eq 2 -and
+    @($removalMergePass.Withheld.candidateId) -ccontains "merge-candidate-2" -and
+    @($removalMergePass.Withheld.candidateId) -ccontains "merge-candidate-3" -and
+    $script:clusterSequenceCall -eq 3) `
+    "Removal-induced cluster merging recreated an over-cap run or degraded the production pass."
+$script:clusterSequenceMode = ""
 
 if ($failures.Count -gt 0) {
     Write-Host "Cross verification contract: $($failures.Count) failure(s) across $checks checks." -ForegroundColor Red

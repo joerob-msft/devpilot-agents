@@ -302,6 +302,13 @@ Assert-Specialist (@([string[]](Get-ReviewerConventionSpecialistRemediationError
                 -Candidate $unknownChangedFact -Constructs $remediationConstructs `
                 -FactPlan $unknownChangedFactPlan)).Count -gt 0) `
     "An unknown fact authorized an exact changed-code remediation value."
+$duplicateChangedFact = Copy-SpecialistObject $candidate
+$duplicateChangedFact.changedCodeFix.valueSource = "deterministicFact"
+$duplicateChangedFact.changedCodeFix.evidenceFactIds = "$factId,$factId"
+Assert-Specialist (@([string[]](Get-ReviewerConventionSpecialistRemediationErrors `
+                -Candidate $duplicateChangedFact -Constructs $remediationConstructs `
+                -FactPlan $factPlan)).Count -gt 0) `
+    "Duplicate changed-code remediation facts passed specialist validation."
 $badFollowUp = Copy-SpecialistObject $candidate
 $badFollowUp.existingDebtFollowUp.action = "recordTrackedFollowUp"
 $badFollowUpErrors = [string[]](Get-ReviewerConventionSpecialistRemediationErrors `
