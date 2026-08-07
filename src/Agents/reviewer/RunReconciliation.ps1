@@ -87,14 +87,22 @@ $script:ReviewerRunReconciliationBindingFields = @(
 # equal - which is exactly how a manifest with no binding would reconcile with
 # anything.
 $script:ReviewerRunReconciliationRequiredFields = @(
-    "prId", "sourceCommit", "configSha256", "scriptSha256",
-    "specialistLibrarySha256", "promptSha256"
+    "prId", "sourceCommit", "model", "configSha256", "scriptSha256",
+    "specialistLibrarySha256", "promptSha256", "conventionPlanSha256", "factPlanSha256"
 )
 
 function Get-ReviewerRunReconciliationValue {
     param([AllowNull()]$Object, [Parameter(Mandatory)][string]$Name, [AllowNull()]$Default = $null)
     if ($null -eq $Object) { return $Default }
     if ($Object -is [System.Collections.IDictionary]) {
+        # ContainsKey first: a generic Dictionary[string,object] binds
+        # `.Contains` to the KeyValuePair overload, which is never true for a
+        # bare key. Same probe order as the specialist's own helper - two
+        # readers of the same manifests must not disagree about what it holds.
+        if ($Object.PSObject.Methods["ContainsKey"]) {
+            if ($Object.ContainsKey($Name)) { return $Object[$Name] }
+            return $Default
+        }
         if ($Object.Contains($Name)) { return $Object[$Name] }
         return $Default
     }
@@ -281,6 +289,14 @@ function Resolve-ReviewerRunReconciliation {
             # agreement about a subset nobody chose.
             [void]$problems.Add("run $runIndex enumerated an incomplete construct table")
         }
+        # And the last term of the wrapper's own `Complete`: a pass where every
+        # rule ruled every anchor out of reach is clean row by row and has
+        # looked at nothing. Two of those agree perfectly about nothing.
+        $enumerated = [int](Get-ReviewerRunReconciliationValue $coverage "enumeratedConstructCount" 0)
+        $checked = [int](Get-ReviewerRunReconciliationValue $coverage "checkedConstructCount" 0)
+        if ($null -ne $coverage -and $enumerated -gt 0 -and $checked -eq 0) {
+            [void]$problems.Add("run $runIndex weighed none of its $enumerated anchors")
+        }
         [void]$runSummaries.Add([pscustomobject][ordered]@{
                 run = $runIndex
                 replayNonce = $nonce
@@ -305,14 +321,17 @@ function Resolve-ReviewerRunReconciliation {
     $seenRuleKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($manifest in $runs) {
         $coverage = Get-ReviewerRunReconciliationValue $manifest "ruleCoverage" $null
-        $index = [ordered]@{}
+        # Ordinal, NOT [ordered]. An OrderedDictionary compares keys
+        # case-insensitively, so `rs0` and `RS0` would be one slot. Insertion
+        # order is not relied on; the key list is re-sorted ordinally below.
+        $index = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
         foreach ($row in @(Get-ReviewerRunReconciliationValue $coverage "rows" @())) {
             $key = [string](Get-ReviewerRunReconciliationValue $row "ruleRef" "")
             if (-not $key) { $key = "source:" + [string](Get-ReviewerRunReconciliationValue $row "ruleSourceId" "") }
             # A run that lists the same ref twice has already failed its own
             # duplicate check upstream; here it just means we cannot line the
             # rows up, so treat the second as a disagreement with the first.
-            if ($index.Contains($key)) {
+            if ($index.ContainsKey($key)) {
                 [void]$problems.Add("a run accounted for rule '$key' more than once")
                 continue
             }
@@ -360,7 +379,7 @@ function Resolve-ReviewerRunReconciliation {
 
         for ($i = 0; $i -lt $byRun.Count; $i++) {
             $run = $i + 1
-            $row = $(if ($byRun[$i].Contains($key)) { $byRun[$i][$key] } else { $null })
+            $row = $(if ($byRun[$i].ContainsKey($key)) { $byRun[$i][$key] } else { $null })
             if ($null -eq $row) {
                 $anyAbsent = $true
                 [void]$rawStatuses.Add("absent")
@@ -507,16 +526,30 @@ function Resolve-ReviewerRunReconciliation {
 
     # Candidates. A proposed comment is only worth showing if every run of the
     # same input proposed it. One run out of two is a coin toss with a citation.
+    #
+    # A MULTISET per run, not a set. Two candidates can legitimately share the
+    # anchor key - `prMetadata` candidates are all forced to file "" line 0, so
+    # any two under one rule collide exactly - and a set silently dropped the
+    # second. The dropped one was then neither agreed nor withheld: it did not
+    # appear at all, and a run that proposed an extra important finding read as
+    # fully agreeing with a run that did not.
     $candidateKeys = [System.Collections.Generic.List[string]]::new()
-    $candidateFields = [ordered]@{}
+    # Ordinal, NOT [ordered]. An OrderedDictionary compares keys
+    # case-insensitively, and `filePath` is model-authored and stored verbatim -
+    # so `/src/Widget.cs` and `/src/widget.cs` collided, two disagreeing runs
+    # read as agreed, and the surviving row printed one run's path beside the
+    # other run's comment. Insertion order is not relied on; both key lists are
+    # re-sorted ordinally below.
+    $candidateFields = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
     $seenCandidateKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $candidatesByRun = [System.Collections.Generic.List[object]]::new()
     foreach ($manifest in $runs) {
-        $index = [ordered]@{}
+        $index = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
         foreach ($candidate in @(Get-ReviewerRunReconciliationValue $manifest "candidates" @())) {
             $identity = Get-ReviewerRunReconciliationCandidateKey -Candidate $candidate
             $key = [string]$identity.Key
-            if (-not $index.Contains($key)) { $index[$key] = $candidate }
+            if (-not $index.ContainsKey($key)) { $index[$key] = [System.Collections.Generic.List[object]]::new() }
+            [void]$index[$key].Add($candidate)
             if ($seenCandidateKeys.Add($key)) {
                 [void]$candidateKeys.Add($key)
                 # Keep the parts. Rebuilding them by splitting the key back
@@ -535,16 +568,41 @@ function Resolve-ReviewerRunReconciliation {
     foreach ($key in $sortedCandidateKeys) {
         $present = [System.Collections.Generic.List[int]]::new()
         $absent = [System.Collections.Generic.List[int]]::new()
+        $counts = [System.Collections.Generic.List[int]]::new()
+        $texts = [System.Collections.Generic.List[string]]::new()
+        $severities = [System.Collections.Generic.List[string]]::new()
         $example = $null
         for ($i = 0; $i -lt $candidatesByRun.Count; $i++) {
-            if ($candidatesByRun[$i].Contains($key)) {
+            $bucket = $(if ($candidatesByRun[$i].ContainsKey($key)) { $candidatesByRun[$i][$key] } else { $null })
+            $count = $(if ($null -eq $bucket) { 0 } else { $bucket.Count })
+            [void]$counts.Add($count)
+            if ($count -gt 0) {
                 [void]$present.Add($i + 1)
-                if ($null -eq $example) { $example = $candidatesByRun[$i][$key] }
+                if ($null -eq $example) { $example = $bucket[0] }
+                # The COMMENT and the SEVERITY are the claim. Two runs that
+                # point at one line and say different things about it have not
+                # agreed on a comment; showing one run's wording under the
+                # `agreed` label is choosing whose review this is.
+                foreach ($item in @($bucket)) {
+                    $severity = [string](Get-ReviewerRunReconciliationValue $item "severity" "")
+                    if ($severities -cnotcontains $severity) { [void]$severities.Add($severity) }
+                    $text = Get-ReviewerConventionSpecialistSha256 `
+                        -Text (([string](Get-ReviewerRunReconciliationValue $item "comment" "")).Trim())
+                    if ($texts -cnotcontains $text) { [void]$texts.Add($text) }
+                }
             }
             else { [void]$absent.Add($i + 1) }
         }
-        $inEveryRun = ($absent.Count -eq 0)
+        $sortedCounts = @($counts.ToArray())
+        $sameCount = ((@($sortedCounts | Sort-Object -Unique)).Count -le 1)
+        $inEveryRun = ($absent.Count -eq 0 -and $sameCount -and
+            @($severities).Count -le 1 -and @($texts).Count -le 1)
         if ($inEveryRun) { $agreedCandidateCount++ }
+        $disposition = $(if ($inEveryRun) { "agreed" }
+            elseif ($absent.Count -gt 0) { "withheldRunDisagreement" }
+            elseif (-not $sameCount) { "withheldCountDisagreement" }
+            elseif (@($severities).Count -gt 1) { "withheldSeverityDisagreement" }
+            else { "withheldTextDisagreement" })
         $identity = $candidateFields[$key]
         [void]$candidates.Add([pscustomobject][ordered]@{
                 key = $key
@@ -554,8 +612,11 @@ function Resolve-ReviewerRunReconciliation {
                 line = [string]$identity.Line
                 presentInRuns = @($present.ToArray())
                 absentInRuns = @($absent.ToArray())
+                perRunCounts = @($counts.ToArray())
+                distinctSeverities = @($severities.ToArray())
+                distinctCommentCount = @($texts).Count
                 inEveryRun = $inEveryRun
-                disposition = $(if ($inEveryRun) { "agreed" } else { "withheldRunDisagreement" })
+                disposition = $disposition
                 severity = [string](Get-ReviewerRunReconciliationValue $example "severity" "")
                 comment = [string](Get-ReviewerRunReconciliationValue $example "comment" "")
             })
