@@ -174,6 +174,28 @@ not a candidate. Do not invent a resolution.
     precedent - the changed code does one thing and its unchanged neighbours do
     another - say so, and let the severity reflect that the practice is not
     settled.
+12. Every candidate must stop the bleed in changed code. Put that required
+    in-PR action in `changedCodeFix`; never move it into a future cleanup.
+    `conventionKey` names the generic required construct from the authoritative
+    rule. `valueSource` is `deterministicFact` only when sealed facts establish
+    the exact value; otherwise use `authoritativeRule` and request the correct
+    value without guessing it. Never infer an identity, alias, owner, or assignee
+    from a nearby NOTE or comment.
+
+    `existingDebtFollowUp` is separate and non-atomic. Use explicit `status:
+    none` unless one complete `constructFileSummaries` record deterministically
+    proves a bounded file-local systematic pattern: `selectorKey` names an
+    attribute from the authoritative rule that defines the comparable cohort,
+    at least four declarations carry it, zero declarations in the file carry
+    `conventionKey`, counts are complete, the file is the same as the changed
+    construct, and `generatedCode` is false. When proved, use
+    `status: required`, copy its exact `rdf1:` evidence fact id, counts and path,
+    and request `recordTrackedFollowUp` (or `linkTrackedFollowUp` when evidence
+    establishes one already exists). This asks the author to record or link a
+    scoped follow-up issue/PR; it never asks for unrelated cleanup in this PR.
+    A counterexample, partial count, missing id, unrelated file/project,
+    generated code, ambiguous component boundary, or repo-wide claim means
+    `status: none`.
 
 ## Result marker
 
@@ -207,15 +229,17 @@ Each candidate has exactly:
 `impact`, `expectedFixOrValidation`, `siblingStatus` (`checked|notRequired`),
 `siblingEvidence`, `siblingNotRequiredReason`, `factIds` (comma-separated,
 or empty), `confidence` (`low|medium|high`), `residualRiskSummary`,
-`semanticCandidateVersion` (exactly `2`), `remediationAction`
-(`add|modify|remove|rename|replace|validate`), `remediationScope`
-(`inPullRequest|followUp`), `remediationTargets` (comma-separated sealed
-construct ids), and `followUpRequired` (boolean). These remediation fields are
-semantic coordinates, not prose: identify what the pull request must do and
-which sealed constructs it applies to. Do not put explanatory wording in them.
-For `prMetadata`, use exactly `prMetadata` as the remediation target. An
-`inPullRequest` scope requires `followUpRequired: false`; a `followUp` scope
-requires `followUpRequired: true`.
+`semanticCandidateVersion` (exactly `2`), `changedCodeFix` (an exact object with
+`action` (`add|modify|remove|rename|replace|validate`), `targets`
+(comma-separated sealed construct ids), `conventionKey`, `valueSource`
+(`authoritativeRule|deterministicFact`), and `evidenceFactIds`), and
+`existingDebtFollowUp` (an exact object with `status` (`none|required`),
+`evidenceFactId`, `selectorKey`, `scopeKind` (`""|file`), `scopePath`, `comparableCount`,
+`compliantCount`, and `action`
+(`""|recordTrackedFollowUp|linkTrackedFollowUp`)). These are semantic
+coordinates, not prose. For `prMetadata`, use exactly `prMetadata` as the
+changed-code target. Explicit `none` uses empty strings and zero counts in every
+other debt field.
 
 Each withheld item has exactly `candidateId`, `reason`, and `detail`. `reason`
 must be exactly one of `sourceConflict`, `outsideChangedFile`, `invalidAnchor`,

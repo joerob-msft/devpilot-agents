@@ -8509,6 +8509,7 @@ function Write-ReviewerConventionSpecialistPreview {
         [Parameter(Mandatory)][string]$Model,
         [Parameter(Mandatory)][string]$ConventionPlanSha256,
         [Parameter(Mandatory)][string]$FactPlanSha256,
+        $FactPlan = $null,
         [string[]]$PackNames = @(),
         [int]$ContextBytes = 0,
         [hashtable]$ToolAudit = @{},
@@ -8517,7 +8518,8 @@ function Write-ReviewerConventionSpecialistPreview {
         [object[]]$ResidualRisks = @(),
         [hashtable]$RuleCoverage = $null,
         [object[]]$ChangedFileIndex = @(),
-        [object[]]$ChangedConstructs = @()
+        [object[]]$ChangedConstructs = @(),
+        [object[]]$ConstructFiles = @()
     )
     $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ")
     $baseName = "pr$PrId-$($SourceCommit.Substring(0, 12))-$stamp-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
@@ -8708,6 +8710,15 @@ function Write-ReviewerConventionSpecialistPreview {
                     changedFileAnchors = @($ChangedFileIndex)
                     constructsIncomplete = [bool]$RuleCoverage.ConstructsIncomplete
                     changedConstructs = @($RuleCoverage.Constructs)
+                    constructFiles = @($ConstructFiles)
+                    remediationFacts = @((Get-ReviewerConventionSpecialistValue $FactPlan "facts" @()) |
+                        Where-Object {
+                            $factId = [string](Get-ReviewerConventionSpecialistValue $_ "id" "")
+                            @($Candidates | Where-Object {
+                                    $fix = Get-ReviewerConventionSpecialistValue $_ "changedCodeFix" $null
+                                    @(([string](Get-ReviewerConventionSpecialistValue $fix "evidenceFactIds" "")) -split ',') -ccontains $factId
+                                }).Count -gt 0
+                        })
                 }
             })
         withheld = @($Withheld)
@@ -8986,6 +8997,7 @@ function Invoke-ReviewerConventionSpecialistPass {
                 -ConventionPlan $conventionPlan -FactPlan $factPlan `
                 -ResolvedSources @($sessionData.Sources) -ChangeEntries @($sessionData.Changes) `
                 -Constructs @(Get-ReviewerHashValue -Container $Bound -Key 'ChangedConstructs' -Default @()) `
+                -ConstructFiles @(Get-ReviewerHashValue -Container $Bound -Key 'ConstructFiles' -Default @()) `
                 -ConstructsIncomplete ([bool](Get-ReviewerHashValue -Container $Bound -Key 'ConstructsIncomplete' -Default $false))
             $candidates = @($validated.Candidates)
             $withheld = @($validated.Withheld)
@@ -9052,10 +9064,12 @@ function Invoke-ReviewerConventionSpecialistPass {
         $preview = Write-ReviewerConventionSpecialistPreview -PrId $PrId -SourceCommit $SourceCommit `
             -Status $status -Diagnostic $diagnostic -Model $EffectiveConventionSpecialistModel `
             -ConventionPlanSha256 $conventionPlanSha256 -FactPlanSha256 $factPlanSha256 `
+            -FactPlan $factPlan `
             -PackNames $packNames -ContextBytes $contextBytes -ToolAudit $toolAudit `
             -Candidates $candidates -Withheld $withheld -ResidualRisks $residualRisks `
             -RuleCoverage $ruleCoverage -ChangedFileIndex $changedFileIndex `
-            -ChangedConstructs @(Get-ReviewerHashValue -Container $Bound -Key 'ChangedConstructs' -Default @())
+            -ChangedConstructs @(Get-ReviewerHashValue -Container $Bound -Key 'ChangedConstructs' -Default @()) `
+            -ConstructFiles @(Get-ReviewerHashValue -Container $Bound -Key 'ConstructFiles' -Default @())
         Write-ReviewerCycleMetadata -Fields @{
             cycle = $CycleNumber; mode = "convention-specialist"; result = $status; prId = $PrId
             sourceCommit = $SourceCommit; model = $EffectiveConventionSpecialistModel

@@ -25,23 +25,36 @@ function ConvertTo-ReviewerConventionSpecialistCanonicalPath {
     return $value.TrimEnd('/').ToLowerInvariant()
 }
 
+function Test-ReviewerConventionSpecialistInteger {
+    param([AllowNull()]$Value)
+    return ($Value -is [byte] -or $Value -is [sbyte] -or
+        $Value -is [int16] -or $Value -is [uint16] -or
+        $Value -is [int32] -or $Value -is [uint32] -or
+        $Value -is [int64] -or ($Value -is [uint64] -and
+            $Value -le [uint64][int64]::MaxValue))
+}
+
 function Get-ReviewerConventionSpecialistRemediationErrors {
     param(
         [Parameter(Mandatory)]$Candidate,
-        [AllowEmptyCollection()][object[]]$Constructs = @()
+        [AllowEmptyCollection()][object[]]$Constructs = @(),
+        [AllowEmptyCollection()][object[]]$ConstructFiles = @(),
+        $FactPlan = $null
     )
     $errors = [System.Collections.Generic.List[string]]::new()
-    $action = [string](Get-ReviewerConventionSpecialistValue $Candidate "remediationAction" "")
-    $scope = [string](Get-ReviewerConventionSpecialistValue $Candidate "remediationScope" "")
-    $followUp = Get-ReviewerConventionSpecialistValue $Candidate "followUpRequired" $null
+    $changedFix = Get-ReviewerConventionSpecialistValue $Candidate "changedCodeFix" $null
+    $action = [string](Get-ReviewerConventionSpecialistValue $changedFix "action" "")
+    $conventionKey = [string](Get-ReviewerConventionSpecialistValue $changedFix "conventionKey" "")
+    $valueSource = [string](Get-ReviewerConventionSpecialistValue $changedFix "valueSource" "")
+    $changedFactText = [string](Get-ReviewerConventionSpecialistValue $changedFix "evidenceFactIds" "")
     if (@("add", "modify", "remove", "rename", "replace", "validate") -cnotcontains $action -or
-        @("inPullRequest", "followUp") -cnotcontains $scope -or $followUp -isnot [bool] -or
-        ($scope -ceq "inPullRequest" -and [bool]$followUp) -or
-        ($scope -ceq "followUp" -and -not [bool]$followUp)) {
-        [void]$errors.Add("structured remediation scope and follow-up are incomplete or contradictory")
+        $conventionKey -cnotmatch '^[A-Za-z_][A-Za-z0-9_.:-]{0,127}$' -or
+        @("authoritativeRule", "deterministicFact") -cnotcontains $valueSource -or
+        ($valueSource -ceq "authoritativeRule" -and $changedFactText) -or
+        ($valueSource -ceq "deterministicFact" -and -not $changedFactText)) {
+        [void]$errors.Add("changed-code remediation is incomplete or contradictory")
     }
-    $targets = @(([string](Get-ReviewerConventionSpecialistValue `
-                $Candidate "remediationTargets" "") -split ',') |
+    $targets = @(([string](Get-ReviewerConventionSpecialistValue $changedFix "targets" "") -split ',') |
         ForEach-Object { $_.Trim() } | Where-Object { $_ })
     $anchorKind = [string](Get-ReviewerConventionSpecialistValue $Candidate "anchorKind" "")
     if ($anchorKind -ceq "prMetadata") {
@@ -61,6 +74,84 @@ function Get-ReviewerConventionSpecialistRemediationErrors {
                 }).Count -gt 0) {
             [void]$errors.Add("changed-file remediation must target known sealed constructs")
         }
+    }
+    $factMap = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($fact in @(Get-ReviewerConventionSpecialistValue $FactPlan "facts" @())) {
+        $id = [string](Get-ReviewerConventionSpecialistValue $fact "id" "")
+        if ($id -and -not $factMap.ContainsKey($id)) { $factMap.Add($id, $fact) }
+    }
+    foreach ($factId in @($changedFactText -split ',' | Where-Object { $_ })) {
+        if ($factId -cnotmatch '^rf1:[0-9a-f]{64}$' -or -not $factMap.ContainsKey($factId) -or
+            [string](Get-ReviewerConventionSpecialistValue $factMap[$factId] "state" "") -notin
+                @("true", "false")) {
+            [void]$errors.Add("changed-code remediation cites an unknown deterministic fact")
+        }
+    }
+
+    $debt = Get-ReviewerConventionSpecialistValue $Candidate "existingDebtFollowUp" $null
+    $debtStatus = [string](Get-ReviewerConventionSpecialistValue $debt "status" "")
+    $debtFactId = [string](Get-ReviewerConventionSpecialistValue $debt "evidenceFactId" "")
+    $selectorKey = [string](Get-ReviewerConventionSpecialistValue $debt "selectorKey" "")
+    $scopeKind = [string](Get-ReviewerConventionSpecialistValue $debt "scopeKind" "")
+    $scopePath = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+        [string](Get-ReviewerConventionSpecialistValue $debt "scopePath" ""))
+    $comparableValue = Get-ReviewerConventionSpecialistValue $debt "comparableCount" $null
+    $compliantValue = Get-ReviewerConventionSpecialistValue $debt "compliantCount" $null
+    $debtAction = [string](Get-ReviewerConventionSpecialistValue $debt "action" "")
+    if ($debtStatus -ceq "none") {
+        if ($debtFactId -or $selectorKey -or $scopeKind -or $scopePath -or $debtAction -or
+            -not (Test-ReviewerConventionSpecialistInteger $comparableValue) -or
+            -not (Test-ReviewerConventionSpecialistInteger $compliantValue) -or
+            [int]$comparableValue -ne 0 -or [int]$compliantValue -ne 0) {
+            [void]$errors.Add("empty existing-debt follow-up must be explicit and contain no claim")
+        }
+    }
+    elseif ($debtStatus -ceq "required") {
+        $candidatePath = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+            [string](Get-ReviewerConventionSpecialistValue $Candidate "filePath" ""))
+        if ($debtFactId -cnotmatch '^rdf1:[0-9a-f]{64}$' -or
+            $selectorKey -cnotmatch '^[A-Za-z_][A-Za-z0-9_.:-]{0,127}$' -or
+            $selectorKey -ceq $conventionKey -or
+            $scopeKind -cne "file" -or -not $scopePath -or $scopePath -cne $candidatePath -or
+            -not (Test-ReviewerConventionSpecialistInteger $comparableValue) -or
+            -not (Test-ReviewerConventionSpecialistInteger $compliantValue) -or
+            [int]$comparableValue -lt 4 -or [int]$compliantValue -ne 0 -or
+            @("recordTrackedFollowUp", "linkTrackedFollowUp") -cnotcontains $debtAction) {
+            [void]$errors.Add("existing-debt follow-up is unsupported, unbounded, or non-systematic")
+        }
+        $matchingFiles = @($ConstructFiles | Where-Object {
+                [string](Get-ReviewerConventionSpecialistValue $_ "evidenceFactId" "") -ceq $debtFactId -and
+                (ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+                    [string](Get-ReviewerConventionSpecialistValue $_ "path" ""))) -ceq $scopePath
+            })
+        if ($matchingFiles.Count -ne 1 -or
+            -not [bool](Get-ReviewerConventionSpecialistValue $matchingFiles[0] "attributeCountsComplete" $false) -or
+            [bool](Get-ReviewerConventionSpecialistValue $matchingFiles[0] "generatedCode" $true)) {
+            [void]$errors.Add("existing-debt evidence does not bind the claimed bounded scope and count")
+        }
+        else {
+            $selectorFrequency = @((Get-ReviewerConventionSpecialistValue `
+                        $matchingFiles[0] "attributeFrequency" @()) | Where-Object {
+                    [string](Get-ReviewerConventionSpecialistValue $_ "attribute" "") -ceq $selectorKey
+                })
+            $matchingFrequency = @((Get-ReviewerConventionSpecialistValue `
+                        $matchingFiles[0] "attributeFrequency" @()) | Where-Object {
+                    [string](Get-ReviewerConventionSpecialistValue $_ "attribute" "") -ceq $conventionKey
+                })
+            $actualCompliant = $(if ($matchingFrequency.Count -eq 1) {
+                    [int](Get-ReviewerConventionSpecialistValue $matchingFrequency[0] "declarations" 0)
+                } else { 0 })
+            $actualComparable = $(if ($selectorFrequency.Count -eq 1) {
+                    [int](Get-ReviewerConventionSpecialistValue $selectorFrequency[0] "declarations" 0)
+                } else { -1 })
+            if ($selectorFrequency.Count -ne 1 -or $actualComparable -ne [int]$comparableValue -or
+                $matchingFrequency.Count -gt 1 -or $actualCompliant -ne [int]$compliantValue) {
+                [void]$errors.Add("existing-debt compliant count disagrees with sealed evidence")
+            }
+        }
+    }
+    else {
+        [void]$errors.Add("existing-debt follow-up status is missing")
     }
     return , [string[]]$errors.ToArray()
 }
@@ -372,7 +463,7 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
         "diffEvidence", "impactCategory", "impact", "expectedFixOrValidation",
         "siblingStatus", "siblingEvidence", "siblingNotRequiredReason",
         "factIds", "confidence", "residualRiskSummary", "semanticCandidateVersion",
-        "remediationAction", "remediationScope", "remediationTargets", "followUpRequired"
+        "changedCodeFix", "existingDebtFollowUp"
     )
     return @{
         Keys = @(
@@ -427,13 +518,44 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                         confidence = @{ Type = "enum"; Values = @("low", "medium", "high") }
                         residualRiskSummary = @{ Type = "string"; MaxLength = 800; AllowEmpty = $true; Pattern = $ascii; NormalizeTypography = $true }
                         semanticCandidateVersion = @{ Type = "int"; Min = 2; Max = 2 }
-                        remediationAction = @{ Type = "enum"; Values = @("add", "modify", "remove", "rename", "replace", "validate") }
-                        remediationScope = @{ Type = "enum"; Values = @("inPullRequest", "followUp") }
-                        remediationTargets = @{
-                            Type = "string"; MaxLength = 600
-                            Pattern = '^(prMetadata|[a-z]{2}[0-9]+(,[a-z]{2}[0-9]+){0,31})$'
+                        changedCodeFix = @{
+                            Type = "object"
+                            Schema = @{
+                                Keys = @("action", "targets", "conventionKey", "valueSource", "evidenceFactIds")
+                                Fields = @{
+                                    action = @{ Type = "enum"; Values = @("add", "modify", "remove", "rename", "replace", "validate") }
+                                    targets = @{
+                                        Type = "string"; MaxLength = 600
+                                        Pattern = '^(prMetadata|[a-z]{2}[0-9]+(,[a-z]{2}[0-9]+){0,31})$'
+                                    }
+                                    conventionKey = @{ Type = "string"; MaxLength = 128; Pattern = '^[A-Za-z_][A-Za-z0-9_.:-]{0,127}$' }
+                                    valueSource = @{ Type = "enum"; Values = @("authoritativeRule", "deterministicFact") }
+                                    evidenceFactIds = @{
+                                        Type = "string"; MaxLength = 600; AllowEmpty = $true
+                                        Pattern = '^(|rf1:[0-9a-f]{64}(,rf1:[0-9a-f]{64}){0,7})$'
+                                    }
+                                }
+                            }
                         }
-                        followUpRequired = @{ Type = "bool" }
+                        existingDebtFollowUp = @{
+                            Type = "object"
+                            Schema = @{
+                                Keys = @(
+                                    "status", "evidenceFactId", "selectorKey", "scopeKind", "scopePath",
+                                    "comparableCount", "compliantCount", "action"
+                                )
+                                Fields = @{
+                                    status = @{ Type = "enum"; Values = @("none", "required") }
+                                    evidenceFactId = @{ Type = "string"; MaxLength = 69; AllowEmpty = $true; Pattern = '^(|rdf1:[0-9a-f]{64})$' }
+                                    selectorKey = @{ Type = "string"; MaxLength = 128; AllowEmpty = $true; Pattern = '^(|[A-Za-z_][A-Za-z0-9_.:-]{0,127})$' }
+                                    scopeKind = @{ Type = "enum"; Values = @("", "file") }
+                                    scopePath = @{ Type = "string"; MaxLength = 400; AllowEmpty = $true; Pattern = '^/?[\x20-\x21\x23-\x29\x2B-\x39\x3B\x3D\x40-\x5B\x5D-\x7B\x7D-\x7E]*$' }
+                                    comparableCount = @{ Type = "int"; Min = 0; Max = 1000000 }
+                                    compliantCount = @{ Type = "int"; Min = 0; Max = 1000000 }
+                                    action = @{ Type = "enum"; Values = @("", "recordTrackedFollowUp", "linkTrackedFollowUp") }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1336,6 +1458,7 @@ function Resolve-ReviewerConventionSpecialistCandidates {
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ResolvedSources,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ChangeEntries,
         [AllowEmptyCollection()][object[]]$Constructs = @(),
+        [AllowEmptyCollection()][object[]]$ConstructFiles = @(),
         [bool]$ConstructsIncomplete = $false
     )
     if (@($ResolvedSources).Count -eq 0) {
@@ -1385,9 +1508,21 @@ function Resolve-ReviewerConventionSpecialistCandidates {
         $candidateId = [string]$candidate.candidateId
         if (-not $seenIds.Add($candidateId)) { throw "Specialist output duplicated candidate id '$candidateId'." }
         $remediationErrors = [string[]](Get-ReviewerConventionSpecialistRemediationErrors `
-                -Candidate $candidate -Constructs $Constructs)
+                -Candidate $candidate -Constructs $Constructs -ConstructFiles $ConstructFiles `
+                -FactPlan $FactPlan)
         if ($remediationErrors.Count -gt 0) {
             throw "Specialist candidate '$candidateId' has invalid structured remediation: $($remediationErrors -join '; ')."
+        }
+        $debt = Get-ReviewerConventionSpecialistValue $candidate "existingDebtFollowUp" $null
+        if ([string](Get-ReviewerConventionSpecialistValue $debt "status" "") -ceq "required") {
+            $debtFactId = [string](Get-ReviewerConventionSpecialistValue $debt "evidenceFactId" "")
+            $debtEvidence = @($ConstructFiles | Where-Object {
+                    [string](Get-ReviewerConventionSpecialistValue $_ "evidenceFactId" "") -ceq $debtFactId
+                })
+            if ($debtEvidence.Count -ne 1) {
+                throw "Specialist candidate '$candidateId' lost its validated existing-debt evidence."
+            }
+            $candidate["existingDebtEvidence"] = $debtEvidence[0]
         }
         if ($selectedPacks -cnotcontains [string]$candidate.packName) {
             throw "Specialist candidate '$candidateId' cited an unrelated convention pack."
