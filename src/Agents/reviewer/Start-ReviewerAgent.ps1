@@ -1840,7 +1840,9 @@ function Get-ReviewerThreadAssessmentTargetSet {
             ([int](Get-ReviewerHashValue -Container $t -Key 'commentId' -Default 0))
         [void]$set.Add($key)
     }
-    return $set
+    # HashSet implements IEnumerable. Preserve the empty set as an object instead
+    # of letting PowerShell enumerate it into no output (which becomes $null).
+    return , $set
 }
 
 function Get-ReviewerThreadAssessmentTargetKeys {
@@ -3124,6 +3126,10 @@ function Invoke-DryRunSelfChecks {
     elseif ($digest.Text -notmatch 'threadId=5.*latestCommentId=52.*eligibleForAssessment=true') { $failures.Add("A human response after an agent comment was not marked eligible for assessment.") }
     else { Write-Host "  OK - the digest is metadata only; bot- and system-only threads are excluded" -ForegroundColor Green }
     $targetSet = Get-ReviewerThreadAssessmentTargetSet -Targets $digest.AssessmentTargets
+    $emptyTargetSet = Get-ReviewerThreadAssessmentTargetSet -Targets @()
+    if ($null -eq $emptyTargetSet -or $emptyTargetSet.Count -ne 0) {
+        $failures.Add("An empty human-comment assessment target set was not preserved as an empty HashSet.")
+    }
     if (-not $targetSet.Contains('1:11') -or -not $targetSet.Contains('5:52') -or
         $targetSet.Contains('4:42') -or $targetSet.Contains('8:81')) {
         $failures.Add("Human-comment assessment targets did not preserve active human comments while excluding agent responses and non-active threads.")
