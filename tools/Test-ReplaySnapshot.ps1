@@ -2248,6 +2248,49 @@ try {
     Assert-Replay (@($withHole.PartiallyUnderstoodFiles) -ccontains "src/b.cs") `
         "That hole must reach the same signal an unlexable file uses, or the accounting will call itself complete over less code than the pull request changed."
 
+    $sevenTests = @(
+        "class C {",
+        "[TestCase]", "void T1() {}",
+        "[TestCase]", "void T2() {}",
+        "[TestCase]", "void T3() {}",
+        "[TestCase]", "void T4() {}",
+        "[Owner(""a"")]", "[TestCase]", "void T5() {}",
+        "[Owner(""b"")]", "[TestCase]", "void T6() {}",
+        "[TestCase]", "void T7() {}",
+        "}")
+    $wholeFileSha = "8" * 64
+    $sparseCensusReport = [pscustomobject]@{ Files = @([pscustomobject]@{
+                Path = "/src/debt.cs"; Status = "delivered"; Reason = ""
+                FileSha256 = $wholeFileSha; LineCount = $sevenTests.Count
+                Slices = @([pscustomobject]@{
+                        StartLine = 1; EndLine = 9; Text = ($sevenTests[0..8] -join "`n")
+                    })
+                SiblingSlices = @(); RawSpans = @([pscustomobject]@{ Start = 8; End = 9 })
+            }) }
+    $sparseCensus = Get-ReviewerConstructFilesFromReportSafely -Report $sparseCensusReport
+    $sparseSummary = @($sparseCensus.Files)[0]
+    Assert-Replay (-not [bool]$sparseSummary.attributeCountsComplete -and
+        -not [bool]$sparseSummary.wholeFileComplete -and
+        @($sparseSummary.attributeFrequency | Where-Object attribute -ceq "Owner").Count -eq 0) `
+        "A sparse delivery of four of seven tests must not claim a complete zero-Owner file census."
+    $wholeCensusReport = [pscustomobject]@{ Files = @([pscustomobject]@{
+                Path = "/src/debt.cs"; Status = "delivered"; Reason = ""
+                FileSha256 = $wholeFileSha; LineCount = $sevenTests.Count
+                Slices = @([pscustomobject]@{
+                        StartLine = 1; EndLine = $sevenTests.Count; Text = ($sevenTests -join "`n")
+                    })
+                SiblingSlices = @(); RawSpans = @([pscustomobject]@{ Start = 8; End = 9 })
+            }) }
+    $wholeCensus = Get-ReviewerConstructFilesFromReportSafely -Report $wholeCensusReport
+    $wholeSummary = @($wholeCensus.Files)[0]
+    $wholeOwnerFrequency = @($wholeSummary.attributeFrequency | Where-Object attribute -ceq "Owner")
+    Assert-Replay ([bool]$wholeSummary.attributeCountsComplete -and
+        [bool]$wholeSummary.wholeFileComplete -and
+        [string]$wholeSummary.wholeFileSha256 -ceq $wholeFileSha -and
+        [int]$wholeSummary.declarationCount -eq 8 -and
+        $wholeOwnerFrequency.Count -eq 1 -and [int]$wholeOwnerFrequency[0].declarations -eq 2) `
+        "An exact gap-free whole-file delivery must seal the complete seven-test, two-Owner census (complete=$($wholeSummary.attributeCountsComplete), whole=$($wholeSummary.wholeFileComplete), declarations=$($wholeSummary.declarationCount), OwnerRows=$($wholeOwnerFrequency.Count), OwnerCount=$(if ($wholeOwnerFrequency.Count) { $wholeOwnerFrequency[0].declarations } else { -1 }))."
+
     # A hunk that runs past the delivered image is not a reason to count to two
     # billion. This is the mandatory path of every review, and a hang is not an
     # exception the caller's try/catch can catch - so the check runs in a job
@@ -2690,12 +2733,14 @@ try {
         @(@($analogFinding.presentationVariants).text.comment) -ccontains $analogCandidateA.comment -and
         @(@($analogFinding.presentationVariants).text.comment) -ccontains $analogCandidateB.comment) `
         "Both raw presentation variants must remain in the evaluation artifact."
-    $debtEvidenceId = "rdf1:" + ("d" * 64)
     $debtFiles = @([pscustomobject][ordered]@{
-            evidenceFactId = $debtEvidenceId; path = "src/semantic.cs"; declarationCount = 38
+            evidenceFactId = ""; path = "src/semantic.cs"; declarationCount = 38
             attributeFrequency = @([pscustomobject]@{ attribute = "TestCase"; declarations = 38 })
             attributeCountsComplete = $true; generatedCode = $false
+            wholeFileComplete = $true; wholeFileLineCount = 152; wholeFileSha256 = ("8" * 64)
         })
+    $debtEvidenceId = Get-ReviewerConventionSpecialistDebtEvidenceFactId -Evidence $debtFiles[0]
+    $debtFiles[0].evidenceFactId = $debtEvidenceId
     $debtCandidateA = New-ReconCandidate -Path "/src/semantic.cs" -Line 1034 `
         -Comment "Record the bounded cleanup separately." -RemediationTargets dc0 `
         -ConventionKey RequiredAnnotation -DebtStatus required -DebtFactId $debtEvidenceId `
@@ -2728,10 +2773,11 @@ try {
     $debtActionManifest = New-ReconRun -Nonce "identity-action" `
         -Rows @((New-ReconRow -Violating @("dc0"))) -Candidates @($debtActionVariant) `
         -Constructs $dcConstructs -ConstructFiles $debtFiles
-    $debtEvidenceVariantId = "rdf1:" + ("e" * 64)
     $debtEvidenceVariant = $debtCandidateA | ConvertTo-Json -Depth 32 | ConvertFrom-Json -Depth 32
-    $debtEvidenceVariant.existingDebtFollowUp.evidenceFactId = $debtEvidenceVariantId
     $debtEvidenceFiles = $debtFiles | ConvertTo-Json -Depth 32 | ConvertFrom-Json -Depth 32
+    $debtEvidenceFiles[0].wholeFileSha256 = ("e" * 64)
+    $debtEvidenceVariantId = Get-ReviewerConventionSpecialistDebtEvidenceFactId -Evidence $debtEvidenceFiles[0]
+    $debtEvidenceVariant.existingDebtFollowUp.evidenceFactId = $debtEvidenceVariantId
     $debtEvidenceFiles[0].evidenceFactId = $debtEvidenceVariantId
     $debtEvidenceManifest = New-ReconRun -Nonce "identity-evidence" `
         -Rows @((New-ReconRow -Violating @("dc0"))) -Candidates @($debtEvidenceVariant) `

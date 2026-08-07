@@ -47,9 +47,15 @@ Copy the exact SHA-256 supplied with the source hunk, rule quote, deterministic
 fact set, sibling evidence, or sanitized thread you actually relied on. If no
 wrapper-supplied evidence directly establishes the candidate, use `needsHuman`
 or `unsupported`; do not hash a claim or invent an evidence binding.
-The `candidateEvidenceOptions` records are authoritative for the exact
-`evidenceKind`, `evidenceSha256`, `factIds`, and `duplicateTargetId` combinations
-the wrapper can validate. Copy one complete option without altering its fields.
+The `candidateEvidenceOptions` records are authoritative. Options with
+`purpose: candidate` supply the exact `kind`, `sha256`, `factIds`, and
+`duplicateTargetId` combination for the main verdict. Copy one complete option
+without altering its fields. For `changedCodeFix`, copy the `sha256` and
+`factIds` from the single `purpose: changedCodeFix` option; the wrapper has
+already selected and hashed the authoritative rule quote or exact ordered
+deterministic-fact subset. For existing debt, copy `sha256` and
+`evidenceFactId` from the single `purpose: existingDebtFollowUp` option. Never
+compute a hash, combine options, or substitute an ID.
 For `changedCodeFix`, use the authoritative rule quote when `valueSource` is
 `authoritativeRule`, or the exact listed deterministic facts otherwise. Never
 invent a value, identity, assignee, or alias. For an existing-debt request, bind

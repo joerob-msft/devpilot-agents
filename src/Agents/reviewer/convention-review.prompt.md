@@ -188,7 +188,9 @@ not a candidate. Do not invent a resolution.
     attribute from the authoritative rule that defines the comparable cohort,
     at least four declarations carry it, zero declarations in the file carry
     `conventionKey`, counts are complete, the file is the same as the changed
-    construct, and `generatedCode` is false. When proved, use
+    construct, `generatedCode` is false, and the sealed file evidence says
+    `wholeFileComplete` with an exact whole-file line count and digest. Sparse
+    hunk/sibling delivery is never a complete census. When proved, use
     `status: required`, copy its exact `rdf1:` evidence fact id, counts and path,
     and request `recordTrackedFollowUp` (or `linkTrackedFollowUp` when evidence
     establishes one already exists). This asks the author to record or link a

@@ -34,6 +34,28 @@ function Test-ReviewerConventionSpecialistInteger {
             $Value -le [uint64][int64]::MaxValue))
 }
 
+function Get-ReviewerConventionSpecialistDebtEvidenceFactId {
+    param([Parameter(Mandatory)]$Evidence)
+    $rows = @((Get-ReviewerConventionSpecialistValue $Evidence "attributeFrequency" @()) |
+        ForEach-Object {
+            [pscustomobject]@{
+                attribute = [string](Get-ReviewerConventionSpecialistValue $_ "attribute" "")
+                declarations = [int](Get-ReviewerConventionSpecialistValue $_ "declarations" 0)
+            }
+        })
+    $text = @(
+        [string](Get-ReviewerConventionSpecialistValue $Evidence "path" ""),
+        [string][int](Get-ReviewerConventionSpecialistValue $Evidence "declarationCount" 0),
+        [string][bool](Get-ReviewerConventionSpecialistValue $Evidence "attributeCountsComplete" $false),
+        [string][bool](Get-ReviewerConventionSpecialistValue $Evidence "generatedCode" $true),
+        [string][bool](Get-ReviewerConventionSpecialistValue $Evidence "wholeFileComplete" $false),
+        [string][int](Get-ReviewerConventionSpecialistValue $Evidence "wholeFileLineCount" 0),
+        [string](Get-ReviewerConventionSpecialistValue $Evidence "wholeFileSha256" ""),
+        @($rows | ForEach-Object { "$($_.attribute)=$($_.declarations)" }) -join ","
+    ) -join "`n"
+    return "rdf1:$(Get-ReviewerConventionSpecialistSha256 -Text $text)"
+}
+
 function Get-ReviewerConventionSpecialistRemediationErrors {
     param(
         [Parameter(Mandatory)]$Candidate,
@@ -126,7 +148,13 @@ function Get-ReviewerConventionSpecialistRemediationErrors {
             })
         if ($matchingFiles.Count -ne 1 -or
             -not [bool](Get-ReviewerConventionSpecialistValue $matchingFiles[0] "attributeCountsComplete" $false) -or
-            [bool](Get-ReviewerConventionSpecialistValue $matchingFiles[0] "generatedCode" $true)) {
+            [bool](Get-ReviewerConventionSpecialistValue $matchingFiles[0] "generatedCode" $true) -or
+            -not [bool](Get-ReviewerConventionSpecialistValue $matchingFiles[0] "wholeFileComplete" $false) -or
+            [int](Get-ReviewerConventionSpecialistValue $matchingFiles[0] "wholeFileLineCount" 0) -lt
+                [int](Get-ReviewerConventionSpecialistValue $matchingFiles[0] "declarationCount" 0) -or
+            [string](Get-ReviewerConventionSpecialistValue $matchingFiles[0] "wholeFileSha256" "") -cnotmatch
+                '^[0-9a-f]{64}$' -or
+            (Get-ReviewerConventionSpecialistDebtEvidenceFactId -Evidence $matchingFiles[0]) -cne $debtFactId) {
             [void]$errors.Add("existing-debt evidence does not bind the claimed bounded scope and count")
         }
         else {

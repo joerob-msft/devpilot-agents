@@ -1088,11 +1088,22 @@ function Get-ReviewerChangedConstructs {
         if ([bool]$frequency.Truncated) { [void]$partialFiles.Add($path) }
         $attributeRows = @($frequency.Attributes)
         $generatedCode = Test-ReviewerConstructGeneratedCode -Path $path -Lines $lines
+        $wholeFileLineCount = [int](Get-ReviewerConstructMember -Container $file -Name 'WholeFileLineCount')
+        $wholeFileSha256 = [string](Get-ReviewerConstructMember -Container $file -Name 'WholeFileSha256')
+        $wholeFileComplete = (
+            [bool](Get-ReviewerConstructMember -Container $file -Name 'WholeFileComplete') -and
+            $wholeFileLineCount -eq $lines.Count -and
+            $wholeFileLineCount -gt 0 -and
+            $wholeFileSha256 -cmatch '^[0-9a-f]{64}$')
+        $attributeCountsComplete = (-not [bool]$frequency.Truncated -and $wholeFileComplete)
         $evidenceText = @(
             $path,
             [string][int]$frequency.DeclarationCount,
-            [string](-not [bool]$frequency.Truncated),
+            [string]$attributeCountsComplete,
             [string]$generatedCode,
+            [string]$wholeFileComplete,
+            [string]$wholeFileLineCount,
+            $wholeFileSha256,
             @($attributeRows | ForEach-Object {
                     "$([string]$_.attribute)=$([int]$_.declarations)"
                 }) -join ","
@@ -1103,10 +1114,13 @@ function Get-ReviewerChangedConstructs {
                 declarationCount = [int]$frequency.DeclarationCount
                 attributeFrequency = $attributeRows
                 generatedCode = $generatedCode
+                wholeFileComplete = $wholeFileComplete
+                wholeFileLineCount = $wholeFileLineCount
+                wholeFileSha256 = $wholeFileSha256
                 # False when a count above is lower than the truth because the
                 # wrapper stopped reading, not because the attribute is rarer.
                 # A precedent argument built on it would be inverted.
-                attributeCountsComplete = (-not [bool]$frequency.Truncated)
+                attributeCountsComplete = $attributeCountsComplete
             })
     }
 

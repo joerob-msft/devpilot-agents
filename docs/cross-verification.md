@@ -78,7 +78,10 @@ the verifier binds the exact sealed `rdf1:` evidence, bounded file scope, and
 counts. Unsupported or ambiguous follow-up is replaced with explicit `none`
 while a separately supported stop-the-bleed finding survives. Malformed
 changed-code remediation, invented values, or overbroad cleanup claims withhold
-the candidate.
+the candidate. The wrapper supplies dedicated evidence options for both parts,
+including precomputed canonical digests and exact fact subsets; verifier models
+copy these values and never compute hashes. Deterministic model input contains
+the bounded union of candidate facts and changed-code remediation facts.
 
 ## Eligibility and artifacts
 

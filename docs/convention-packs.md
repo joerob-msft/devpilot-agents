@@ -179,7 +179,10 @@ complete wrapper-generated `rdf1:` file summary proves a bounded systematic
 pattern. An authoritative-rule `selectorKey` must identify at least four
 declarations in the sealed frequency table, the required convention key must
 appear on zero declarations, counts must be complete, and the sealed
-generated-code classifier must be false.
+generated-code classifier must be false. Complete means the source transport
+delivered every textual line of the exact pinned file without gaps or
+truncation; the census fact binds that proof to the pinned whole-file digest.
+Hunk and sibling slices alone can never establish a complete census.
 When supported it requests recording or linking a scoped follow-up issue/PR,
 never unrelated cleanup in the current pull request. Partial counts,
 counterexamples, generated code, unrelated paths, ambiguous boundaries, and

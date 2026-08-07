@@ -148,6 +148,7 @@ function New-ConventionCandidate {
                 evidenceFactId = $debtFactId; path = "src/a.cs"; declarationCount = 38
                 attributeFrequency = @([pscustomobject]@{ attribute = "TestCase"; declarations = 38 })
                 attributeCountsComplete = $true; generatedCode = $false
+                wholeFileComplete = $true; wholeFileLineCount = 152; wholeFileSha256 = ("8" * 64)
             })
     }
     return $candidate
@@ -654,8 +655,25 @@ $debtCandidates = @(ConvertTo-ReviewerVerificationCandidates `
 $debtClusters = @(Get-ReviewerVerificationClusters -Candidates $debtCandidates)
 $debtAssignments = @(Get-ReviewerVerificationAssignments -Clusters $debtClusters `
     -GeneralistModels @($opus, $sol) -ConventionVerifierModel $sol)
-$debtEvidenceSha = Get-ReviewerVerificationObjectSha256 -Value $debtCandidates[0].existingDebtEvidence
-$debtFactId = [string]$debtCandidates[0].existingDebtFollowUp.evidenceFactId
+$debtEvidenceOptions = @(Get-ReviewerVerificationEvidenceOptions -Candidate $debtCandidates[0] `
+    -FactPlan $factPlan)
+$debtEvidenceOption = @($debtEvidenceOptions | Where-Object purpose -ceq "existingDebtFollowUp")
+$debtOptionInput = New-ReviewerVerificationModelInput -PromptText "prompt" -Nonce "debt-option" `
+    -Binding ([pscustomobject]@{}) -VerificationInputSha256 ("7" * 64) `
+    -ClusterId ([string]$debtClusters[0].clusterId) -VerifierModel $sol `
+    -Candidates $debtCandidates -CandidateEvidence @([pscustomobject]@{
+            candidateId = $debtCandidates[0].candidateId; options = $debtEvidenceOptions
+        })
+$debtRuntime = [regex]::Match([string]$debtOptionInput.text,
+    '(?s)## Wrapper runtime data.*?```json\r?\n(\{.*?\})\r?\n```').Groups[1].Value |
+    ConvertFrom-Json -Depth 32
+$roundTrippedDebtOption = @($debtRuntime.candidateEvidenceOptions[0].options |
+    Where-Object purpose -ceq "existingDebtFollowUp")
+Assert-Verification ($debtEvidenceOption.Count -eq 1 -and $roundTrippedDebtOption.Count -eq 1 -and
+    [string]$roundTrippedDebtOption[0].sha256 -ceq [string]$debtEvidenceOption[0].sha256) `
+    "The production verifier input did not expose the wrapper-computed debt evidence option."
+$debtEvidenceSha = [string]$roundTrippedDebtOption[0].sha256
+$debtFactId = [string]$roundTrippedDebtOption[0].evidenceFactId
 $supportedDebtRuns = @($debtAssignments | ForEach-Object {
         New-VerifierRun -Assignment $_ -ExistingDebtFollowUpOutcome supported `
             -ExistingDebtEvidenceSha256 $debtEvidenceSha -ExistingDebtEvidenceFactId $debtFactId
@@ -755,6 +773,101 @@ $unknownFix = Resolve-ReviewerVerificationDecisions -Clusters $unknownFixCluster
 Assert-Verification (@($unknownFix.eligible).Count -eq 0 -and
     @($unknownFix.withheld | Where-Object reason -ceq "unsupported").Count -eq 1) `
     "An unknown fact authorized a deterministic changed-code remediation value."
+$disjointFixRaw = New-ConventionCandidate
+$disjointFixRaw.changedCodeFix.valueSource = "deterministicFact"
+$disjointFixRaw.changedCodeFix.evidenceFactIds = $metadataFactId
+$disjointFixCandidates = @(ConvertTo-ReviewerVerificationCandidates `
+    -ConventionCandidates @($disjointFixRaw) -ConventionModel "claude-sonnet-5" `
+    -ConventionArtifactSha256 ("c" * 64))
+$disjointFacts = @(Get-ReviewerVerificationDeterministicFacts `
+    -Candidates $disjointFixCandidates -FactPlan $factPlan)
+$disjointOptions = @(Get-ReviewerVerificationEvidenceOptions `
+    -Candidate $disjointFixCandidates[0] -FactPlan $factPlan)
+$disjointChangedOption = @($disjointOptions | Where-Object purpose -ceq "changedCodeFix")
+$disjointInput = New-ReviewerVerificationModelInput -PromptText "prompt" -Nonce "disjoint-facts" `
+    -Binding ([pscustomobject]@{}) -VerificationInputSha256 ("7" * 64) `
+    -ClusterId ("vc1:" + ("a" * 64)) -VerifierModel $sol `
+    -Candidates $disjointFixCandidates -CandidateEvidence @([pscustomobject]@{
+            candidateId = $disjointFixCandidates[0].candidateId; options = $disjointOptions
+        }) -DeterministicFacts $disjointFacts
+$disjointRuntime = [regex]::Match([string]$disjointInput.text,
+    '(?s)## Wrapper runtime data.*?```json\r?\n(\{.*?\})\r?\n```').Groups[1].Value |
+    ConvertFrom-Json -Depth 32
+Assert-Verification (@($disjointRuntime.deterministicFacts).Count -eq 2 -and
+    @($disjointRuntime.deterministicFacts.id) -ccontains $factId -and
+    @($disjointRuntime.deterministicFacts.id) -ccontains $metadataFactId -and
+    $disjointChangedOption.Count -eq 1 -and
+    [string]$disjointChangedOption[0].factIds -ceq $metadataFactId) `
+    "Production verifier input did not carry the union and dedicated disjoint changed-fix subset option."
+$inventedFix = Copy-VerificationObject $disjointFixCandidates[0]
+$inventedFix.changedCodeFix.evidenceFactIds = "rf1:" + ("f" * 64)
+Assert-Verification (@(Get-ReviewerVerificationEvidenceOptions -Candidate $inventedFix `
+            -FactPlan $factPlan | Where-Object purpose -ceq "changedCodeFix").Count -eq 0) `
+    "An invented changed-fix fact ID produced a verifier evidence option."
+$duplicateFix = Copy-VerificationObject $disjointFixCandidates[0]
+$duplicateFix.changedCodeFix.evidenceFactIds = "$metadataFactId,$metadataFactId"
+Assert-Verification (@(Get-ReviewerVerificationEvidenceOptions -Candidate $duplicateFix `
+            -FactPlan $factPlan | Where-Object purpose -ceq "changedCodeFix").Count -eq 0) `
+    "A duplicate changed-fix fact subset produced a verifier evidence option."
+$missingUnionRejected = $false
+try { [void](Get-ReviewerVerificationDeterministicFacts -Candidates @($inventedFix) -FactPlan $factPlan) }
+catch { $missingUnionRejected = $true }
+Assert-Verification $missingUnionRejected `
+    "An invented changed-fix fact ID entered production deterministicFacts."
+$metadataOverflowFacts = @(1..17 | ForEach-Object {
+        [pscustomobject]@{
+            id = "rf1:" + ([string]$_).PadLeft(64, "0"); domain = "metadata"
+            kind = "present"; subject = "s$_"; state = "true"; unknownReason = ""; value = $true
+        }
+    })
+$metadataOverflowCandidate = Copy-VerificationObject $disjointFixCandidates[0]
+$metadataOverflowCandidate.anchorKind = "prMetadata"
+$metadataOverflowCandidate.factIds = ""
+$metadataOverflowCandidate.changedCodeFix.evidenceFactIds = ""
+$metadataOverflowCandidate.changedCodeFix.valueSource = "authoritativeRule"
+$countOverflowRejected = $false
+try {
+    [void](Get-ReviewerVerificationDeterministicFacts -Candidates @($metadataOverflowCandidate) `
+            -FactPlan ([pscustomobject]@{ facts = $metadataOverflowFacts }))
+}
+catch { $countOverflowRejected = $true }
+Assert-Verification $countOverflowRejected `
+    "A verifier deterministic-fact union above the production count cap was accepted."
+$oversizedFactPlan = Copy-VerificationObject $factPlan
+$oversizedFactPlan.facts[0].value = "x" * 2048
+$byteOverflowRejected = $false
+try {
+    [void](Get-ReviewerVerificationDeterministicFacts -Candidates $disjointFixCandidates `
+            -FactPlan $oversizedFactPlan -MaxCanonicalBytes 1024)
+}
+catch { $byteOverflowRejected = $true }
+Assert-Verification $byteOverflowRejected `
+    "A verifier deterministic-fact payload above its byte cap was accepted."
+$disjointClusters = @(Get-ReviewerVerificationClusters -Candidates $disjointFixCandidates)
+$disjointAssignments = @(Get-ReviewerVerificationAssignments -Clusters $disjointClusters `
+    -GeneralistModels @($opus, $sol) -ConventionVerifierModel $sol)
+$supportedDisjointRuns = @($disjointAssignments | ForEach-Object {
+        New-VerifierRun -Assignment $_ -ChangedCodeFixOutcome supported `
+            -ChangedCodeFixEvidenceSha256 ([string]$disjointChangedOption[0].sha256) `
+            -ChangedCodeFixFactIds $metadataFactId
+    })
+$supportedDisjoint = Resolve-ReviewerVerificationDecisions -Clusters $disjointClusters `
+    -Assignments $disjointAssignments -VerifierRuns $supportedDisjointRuns `
+    -ChangedPaths @("src/a.cs") -FactPlan $factPlan -ResolvedSources $resolvedSources `
+    -EvidenceHunks (Get-TestEvidenceHunks -Clusters $disjointClusters)
+Assert-Verification (@($supportedDisjoint.eligible).Count -eq 1) `
+    "A valid disjoint changed-fix fact subset copied from the production option was withheld."
+$mismatchedFixRuns = @($disjointAssignments | ForEach-Object {
+        New-VerifierRun -Assignment $_ -ChangedCodeFixOutcome supported `
+            -ChangedCodeFixEvidenceSha256 ("f" * 64) -ChangedCodeFixFactIds $metadataFactId
+    })
+$mismatchedFix = Resolve-ReviewerVerificationDecisions -Clusters $disjointClusters `
+    -Assignments $disjointAssignments -VerifierRuns $mismatchedFixRuns `
+    -ChangedPaths @("src/a.cs") -FactPlan $factPlan -ResolvedSources $resolvedSources `
+    -EvidenceHunks (Get-TestEvidenceHunks -Clusters $disjointClusters)
+Assert-Verification (@($mismatchedFix.eligible).Count -eq 0 -and
+    @($mismatchedFix.withheld | Where-Object reason -ceq "unsupported").Count -eq 1) `
+    "A changed-fix digest mismatch remained eligible."
 $contradictorySiblingRuns = @($conventionAssignments | ForEach-Object {
         New-VerifierRun -Assignment $_ -Outcome needsHuman `
             -Rationale "The cited sibling evidence contradicts the candidate and needs human adjudication."
