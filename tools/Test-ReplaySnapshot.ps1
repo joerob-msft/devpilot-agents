@@ -292,7 +292,6 @@ try {
     $constructs = @(
         [pscustomobject][ordered]@{ constructId = "mi0"; kind = "invocation"; path = "src/a.cs"; line = 12 }
         [pscustomobject][ordered]@{ constructId = "mi1"; kind = "invocation"; path = "src/a.cs"; line = 40 }
-        [pscustomobject][ordered]@{ constructId = "dc0"; kind = "declaration"; path = "src/b.cs"; line = 7 }
     )
     $accepted = @([pscustomobject][ordered]@{
             candidateId = "reassigns-field"; packName = "core"; ruleSourceId = "rule-a"
@@ -375,16 +374,21 @@ try {
         "A row that gives a verdict for only some of the anchors in its scope must degrade to unknown."
     Assert-Replay (-not [bool]$partialScope.Complete) "A partly-checked scope must not read as complete."
 
-    $strayScope = Invoke-Coverage -Rows @(
+    $strayScope = Invoke-Coverage -WithConstructs @(
+        $constructs
+        [pscustomobject][ordered]@{ constructId = "dc0"; kind = "declaration"; path = "src/b.cs"; line = 7 }
+    ) -Rows @(
         (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Checked "mi0,mi1,dc0"),
         (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
     )
     Assert-Replay ([string]@($strayScope.Rows)[0].status -ceq "unknown") `
         "A row that checks constructs outside its declared scope must degrade to unknown."
 
-    $declarationScope = Invoke-Coverage -Rows @(
+    $declarationScope = Invoke-Coverage -WithConstructs @(
+        [pscustomobject][ordered]@{ constructId = "dc0"; kind = "declaration"; path = "src/b.cs"; line = 7 }
+    ) -Rows @(
         (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope "declaration" -Checked "dc0"),
-        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant")
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope "declaration" -Checked "dc0")
     )
     Assert-Replay ([string]@($declarationScope.Rows)[0].status -ceq "compliant") `
         "A declarations-scoped row that covers every declaration must stand."
@@ -532,19 +536,20 @@ try {
         [pscustomobject][ordered]@{ constructId = "dc0"; kind = "declaration"; path = "src/a.cs"; line = 9; endLine = 9 }
     ) -Rows @(
         (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "notApplicable" -Scope "invocation,declaration" -Checked "" -NotInReach "mi0,dc0"),
-        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope "invocation" -Checked "mi0")
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope "invocation" -Checked "mi0" -NotInReach "dc0")
     )
     Assert-Replay ([string]@($namedKinds.Rows)[0].status -ceq "notApplicable" -and [bool]$namedKinds.Complete) `
         "Naming the kinds and ruling their anchors out of reach is the falsifiable way to say a rule reaches nothing."
-    $strayOutOfReach = Invoke-Coverage -WithConstructs @(
+    $outsideKindsPartition = Invoke-Coverage -WithConstructs @(
         [pscustomobject][ordered]@{ constructId = "mi0"; kind = "invocation"; path = "src/a.cs"; line = 5; endLine = 5 }
         [pscustomobject][ordered]@{ constructId = "dc0"; kind = "declaration"; path = "src/a.cs"; line = 9; endLine = 9 }
     ) -Rows @(
         (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope "invocation" -Checked "mi0" -NotInReach "dc0"),
-        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope "invocation" -Checked "mi0")
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope "invocation" -Checked "mi0" -NotInReach "dc0")
     )
-    Assert-Replay ([string]@($strayOutOfReach.Rows)[0].status -ceq "unknown") `
-        "Out of reach is a verdict about an anchor the row was asked about, not a bin for kinds it said it does not govern."
+    Assert-Replay ([string]@($outsideKindsPartition.Rows)[0].status -ceq "compliant" -and
+        [bool]$outsideKindsPartition.Complete) `
+        "Kinds outside the applicable scope belong in not-in-reach and must not degrade a correct row."
     $wrongKindChecked = Invoke-Coverage -WithConstructs @(
         [pscustomobject][ordered]@{ constructId = "mi0"; kind = "invocation"; path = "src/a.cs"; line = 5; endLine = 5 }
         [pscustomobject][ordered]@{ constructId = "dc0"; kind = "declaration"; path = "src/a.cs"; line = 9; endLine = 9 }
@@ -1651,6 +1656,11 @@ try {
         Assert-Replay ($null -ne $node) "The reviewer must define $fn."
         if ($node) { . ([scriptblock]::Create($node.Extent.Text)) }
     }
+    $constructs = @(
+        [pscustomobject][ordered]@{ constructId = "mi0"; kind = "invocation"; path = "src/a.cs"; line = 12 }
+        [pscustomobject][ordered]@{ constructId = "mi1"; kind = "invocation"; path = "src/a.cs"; line = 40 }
+        [pscustomobject][ordered]@{ constructId = "dc0"; kind = "declaration"; path = "src/b.cs"; line = 7 }
+    )
     $bothKinds = "invocation,declaration"
     $everyId = "mi0,mi1,dc0"
 
@@ -1717,15 +1727,42 @@ try {
     Assert-Replay (@($ghostReach.Rows | Where-Object { $_.ruleRef -ceq "rs0" }).status -ceq "unknown") `
         "Every out-of-reach id must resolve to a sealed enumerated construct."
 
-    # Adversarial: an id of a kind the row's own scope excludes. Out-of-reach
-    # is a verdict about an anchor the rule was asked about; it is not a bin.
-    $wrongKind = Invoke-Coverage -Rows @(
-        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope "declaration" -Checked "dc0" -NotInReach "mi0"),
+    # Positive regression: declaration is the applicable subset, while
+    # transported comment anchors still belong to the sealed partition.
+    $transportedComments = @(
+        [pscustomobject][ordered]@{ constructId = "dc0"; kind = "declaration"; path = "src/a.cs"; line = 5; endLine = 5 }
+        [pscustomobject][ordered]@{ constructId = "cm0"; kind = "comment"; path = "src/a.cs"; line = 8; endLine = 8 }
+        [pscustomobject][ordered]@{ constructId = "cm1"; kind = "comment"; path = "src/a.cs"; line = 12; endLine = 12 }
+    )
+    $declarationWithComments = Invoke-Coverage -WithConstructs $transportedComments -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "violation" -Scope "declaration" -Checked "dc0" -Violating "dc0" -NotInReach "cm0,cm1"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope "declaration" -Checked "dc0" -NotInReach "cm0,cm1")
+    )
+    $declarationCommentRow = @($declarationWithComments.Rows | Where-Object { $_.ruleRef -ceq "rs0" })
+    Assert-Replay ($declarationCommentRow.status -ceq "violation" -and
+        -not [string]$declarationCommentRow.degradedReason -and [bool]$declarationWithComments.Complete) `
+        "scope declaration with dc0 violating and cm0/cm1 not in reach must preserve the real violation."
+
+    # Adversarial: an outside-scope anchor may not carry a substantive verdict.
+    $wrongKind = Invoke-Coverage -WithConstructs $transportedComments -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "violation" -Scope "declaration" -Checked "dc0,cm0" -Violating "dc0" -NotInReach "cm1"),
         (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope $bothKinds -Checked $everyId)
     )
     $wrongKindRow = @($wrongKind.Rows | Where-Object { $_.ruleRef -ceq "rs0" })
-    Assert-Replay ($wrongKindRow.status -ceq "unknown" -and $wrongKindRow.degradedReason -clike "*out of reach*") `
-        "An out-of-reach id from a kind the declared scope never covered must be refused."
+    Assert-Replay ($wrongKindRow.status -ceq "unknown" -and $wrongKindRow.degradedReason -clike "*outside its applicable scope*") `
+        "An anchor outside applicable scope must be refused from compliant, violating, and unknown verdicts."
+
+    # Adversarial: in-scope narrowing requires explicit code evidence.
+    $noReachEvidence = New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" `
+        -Scope "invocation" -Checked "mi0" -NotInReach "mi1,dc0"
+    $noReachEvidence.codeEvidence = ""
+    $unsupportedNarrowing = Invoke-Coverage -Rows @(
+        $noReachEvidence,
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -NotInReach "dc0")
+    )
+    $unsupportedRow = @($unsupportedNarrowing.Rows | Where-Object { $_.ruleRef -ceq "rs0" })
+    Assert-Replay ($unsupportedRow.status -ceq "unknown" -and $unsupportedRow.degradedReason -clike "*without code evidence*") `
+        "An applicable anchor may not be labeled out of reach without explicit code evidence."
 
     # Adversarial: a scope the wrapper does not enumerate. Mixed WITH a real
     # kind and a complete cover of it, so the row survives every other guard
@@ -1742,15 +1779,16 @@ try {
     # in this change set. The required set is empty, so the cover check, the
     # out-of-scope check and the stray check are all vacuous - and
     # `notApplicable` is exempt from the weighed-nothing guard. Only the
-    # named-nothing guard stands between this and a free pass, and it is the
-    # exact shape an evasive row would reach for.
+    # zero-applicable-anchor guard stands between this and a free pass, even
+    # when the row files the entire outside-kind universe under not-in-reach.
     $emptyKindEscape = Invoke-Coverage -Rows @(
-        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "notApplicable" -Scope "comment" -Checked ""),
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "notApplicable" -Scope "comment" -Checked "" -NotInReach $everyId),
         (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope $bothKinds -Checked $everyId)
     )
     $emptyKindRow = @($emptyKindEscape.Rows | Where-Object { $_.ruleRef -ceq "rs0" })
-    Assert-Replay ($emptyKindRow.status -ceq "unknown" -and $emptyKindRow.degradedReason -clike "*named no anchor*") `
-        "A row scoping itself to an enumerable kind with zero anchors has named nothing falsifiable."
+    Assert-Replay ($emptyKindRow.status -ceq "unknown" -and
+        $emptyKindRow.degradedReason -ceq "the row declared scope 'comment', but that scope contains no anchors in the sealed construct universe") `
+        "A zero-anchor applicable scope must fail closed even after partitioning every outside-kind anchor as not in reach."
     Assert-Replay (-not [bool]$emptyKindEscape.Complete) `
         "That escape must also cost the accounting its completeness."
 

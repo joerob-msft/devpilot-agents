@@ -999,6 +999,40 @@ Assert-SpecialistThrows {
     ConvertTo-AgentCanonicalMarkerJson -Value $deep
 } "A hostile deeply nested marker payload is not depth-bounded."
 
+$mixedKindConstructs = @(
+    [pscustomobject][ordered]@{ constructId = "dc0"; kind = "declaration"; path = "src/a.cs"; line = 12; endLine = 12 }
+    [pscustomobject][ordered]@{ constructId = "cm0"; kind = "comment"; path = "src/a.cs"; line = 14; endLine = 14 }
+    [pscustomobject][ordered]@{ constructId = "cm1"; kind = "comment"; path = "src/a.cs"; line = 18; endLine = 18 }
+)
+$declarationViolation = [pscustomobject][ordered]@{
+    ruleRef = "rs0"; ruleSourceSha256 = ("d" * 64); ruleQuote = ""; status = "violation"
+    scope = "declaration"; violatingConstructs = "dc0"; compliantConstructs = ""
+    notInReachConstructs = "cm0,cm1"; unknownConstructs = ""
+    codeEvidence = "The declaration is governed; transported comments are not."
+    siblingStatus = "notRequired"; siblingEvidence = ""; candidateId = ""; notes = ""
+}
+$mixedKindCoverage = Resolve-ReviewerConventionSpecialistRuleCoverage -Rows @($declarationViolation) `
+    -ResolvedSources $resolvedSources -AcceptedCandidates @() -Constructs $mixedKindConstructs
+$mixedKindRow = @($mixedKindCoverage.Rows)[0]
+Assert-Specialist ($mixedKindRow.status -ceq "violation" -and
+    -not [string]$mixedKindRow.degradedReason -and [bool]$mixedKindCoverage.Complete) `
+    "A declaration violation degraded solely because transported comment anchors were truthfully not in reach."
+
+$outsideScopeJudgement = Copy-SpecialistObject -Value $declarationViolation
+$outsideScopeJudgement.compliantConstructs = "cm0"
+$outsideScopeJudgement.notInReachConstructs = "cm1"
+$outsideScopeCoverage = Resolve-ReviewerConventionSpecialistRuleCoverage -Rows @($outsideScopeJudgement) `
+    -ResolvedSources $resolvedSources -AcceptedCandidates @() -Constructs $mixedKindConstructs
+Assert-Specialist ([string]@($outsideScopeCoverage.Rows)[0].status -ceq "unknown") `
+    "A comment outside declaration scope was allowed to carry a compliant verdict."
+
+$omittedOutsideScope = Copy-SpecialistObject -Value $declarationViolation
+$omittedOutsideScope.notInReachConstructs = "cm0"
+$omittedCoverage = Resolve-ReviewerConventionSpecialistRuleCoverage -Rows @($omittedOutsideScope) `
+    -ResolvedSources $resolvedSources -AcceptedCandidates @() -Constructs $mixedKindConstructs
+Assert-Specialist ([string]@($omittedCoverage.Rows)[0].status -ceq "unknown") `
+    "A sealed comment anchor omitted from every verdict did not fail closed."
+
 if ($failures.Count -gt 0) {
     Write-Host "Convention specialist contract: $($failures.Count) failure(s) across $checks checks." -ForegroundColor Red
     foreach ($failure in $failures) { Write-Host "  FAIL - $failure" -ForegroundColor Red }

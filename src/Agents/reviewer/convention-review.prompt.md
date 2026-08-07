@@ -103,19 +103,21 @@ not a candidate. Do not invent a resolution.
 
     For each row set `scope` to a comma-separated list of the construct KINDS
     the rule governs - for example `invocation`, or `declaration,comment`, or
-    `none`. Then give a VERDICT FOR EVERY ANCHOR of those kinds, by putting each
-    id in exactly one of four lists:
+    `none`. This is the applicable subset, not the accounting universe. Give a
+    VERDICT FOR EVERY ANCHOR in the sealed construct table by putting each id in
+    exactly one of four lists:
 
     - `violatingConstructs` - this anchor breaks the rule.
     - `compliantConstructs` - the rule reaches this anchor and it follows it.
-    - `notInReachConstructs` - you examined this anchor and the rule does not
-      reach it. A production method is not a test method; say so here rather
-      than leaving it out.
+    - `notInReachConstructs` - the anchor's kind is outside `scope`, or you
+      examined an applicable anchor and the rule does not reach it. Explain
+      applicable anchors ruled out this way in `codeEvidence`.
     - `unknownConstructs` - you could not decide: source you were not given,
       practice you could not establish, rule text that does not settle it.
 
-    The four lists must be disjoint and together must equal every id of the
-    declared kinds - exactly, no more and no less.
+    The four lists must be disjoint and together must equal every sealed
+    construct id - exactly, no more and no less. Anchors whose kinds are outside
+    `scope` may appear only in `notInReachConstructs`.
     `ruleCoverageRequest.constructIdsByKind` gives you the exact string per
     kind, already range-compressed. Ranges are inclusive and stay within one
     kind: `mi0-mi37,dc0-dc18`. Silence about an anchor is what this section
@@ -137,13 +139,14 @@ not a candidate. Do not invent a resolution.
     way a real finding disappears - the rule an operator most wanted transported
     is usually the one the repository follows least.
 
-    `scope: none` says the rule reaches nothing in this change set - but you
-    must still say which anchors you mean, by naming the kinds it would govern
-    and putting them in `notInReachConstructs`. A row that names no anchor at
-    all is not falsifiable and the wrapper degrades it, whatever status it
-    claims. A scope whose every anchor you put out of reach is a real answer,
-    and it can only be `notApplicable` or `unknown`; a row that weighed nothing
-    is not compliant with anything.
+    `scope: none` is not a valid escape when constructs exist. Name the kinds
+    the rule would govern and put every other kind, plus any applicable anchor
+    the rule does not reach, in `notInReachConstructs`. A row that names no
+    anchor at all is not falsifiable and the wrapper degrades it, whatever
+    status it claims. A scope whose every applicable anchor you put out of reach
+    is a real answer only with code evidence, and it can only be
+    `notApplicable` or `unknown`; a row that weighed nothing is not compliant
+    with anything.
     - a candidate you link must be anchored on one of the constructs this row
       calls violating - anywhere within that construct's `line`..`endLine`
       span, which for a multi-line call is normally the offending argument
