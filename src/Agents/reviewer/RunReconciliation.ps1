@@ -20,6 +20,16 @@ Set-StrictMode -Version Latest
 $script:ReviewerRunReconciliationKind = "reviewer.run-reconciliation"
 $script:ReviewerRunReconciliationVersion = 1
 
+# A key separator that cannot appear in the fields it joins. `|` looked fine
+# until you notice `ruleSourceId` is schema-allowed any printable ASCII, so one
+# pipe in a rule id would let a model choose where the report says its comment
+# landed.
+$script:ReviewerRunReconciliationSeparator = [string][char]0x1f
+
+if (-not (Get-Command Get-ReviewerConventionSpecialistSha256 -ErrorAction SilentlyContinue)) {
+    throw "RunReconciliation.ps1 requires ConventionSpecialist.ps1 to be dot-sourced first."
+}
+
 # The fields that have to be identical before two runs are even comparable.
 # These are the inputs: the same PR at the same commit, judged by the same
 # script, the same specialist library, the same prompt, the same plans, the same
@@ -37,6 +47,14 @@ $script:ReviewerRunReconciliationBindingFields = @(
     "promptSha256",
     "conventionPlanSha256",
     "factPlanSha256"
+)
+
+# Without these a run has no identity at all, and two empty strings compare
+# equal - which is exactly how a manifest with no binding would reconcile with
+# anything.
+$script:ReviewerRunReconciliationRequiredFields = @(
+    "prId", "sourceCommit", "configSha256", "scriptSha256",
+    "specialistLibrarySha256", "promptSha256"
 )
 
 function Get-ReviewerRunReconciliationValue {
@@ -68,26 +86,33 @@ function Get-ReviewerRunReconciliationIdList {
 
 function Get-ReviewerRunReconciliationBinding {
     param([Parameter(Mandatory)]$Manifest)
-    $parts = [System.Collections.Generic.List[string]]::new()
+    $binding = [ordered]@{}
     foreach ($field in $script:ReviewerRunReconciliationBindingFields) {
-        [void]$parts.Add("$field=" + [string](Get-ReviewerRunReconciliationValue $Manifest $field ""))
+        $binding[$field] = [string](Get-ReviewerRunReconciliationValue $Manifest $field "")
     }
-    # The enumerated construct table is part of the question too. Two runs that
-    # were shown different anchors cannot be reconciled anchor by anchor, and
-    # the ids (`mi14`) are positional - the same name would silently mean two
-    # different lines.
+    # WHICH frozen recording was replayed is part of the question. Two runs of
+    # two different snapshots of the same commit are not repetitions.
+    $replay = Get-ReviewerRunReconciliationValue $Manifest "replay" $null
+    $binding["snapshotId"] = [string](Get-ReviewerRunReconciliationValue $replay "snapshotId" "")
+    $binding["manifestDigest"] = [string](Get-ReviewerRunReconciliationValue $replay "manifestDigest" "")
+    # The enumerated construct table too, because the ids are positional: `mi14`
+    # names the fourteenth invocation, so the same name would silently mean two
+    # different lines if the tables differed.
+    #
+    # Hash the WHOLE table as its producer wrote it. A hand-picked field list
+    # here is a second copy of a schema that lives somewhere else, and when the
+    # two drift the binding quietly stops binding - which is not a failure
+    # anybody would notice, because everything still reconciles.
     $coverage = Get-ReviewerRunReconciliationValue $Manifest "ruleCoverage" $null
-    $constructParts = [System.Collections.Generic.List[string]]::new()
-    foreach ($construct in @(Get-ReviewerRunReconciliationValue $coverage "changedConstructs" @())) {
-        [void]$constructParts.Add(([string](Get-ReviewerRunReconciliationValue $construct "id" "")) + "|" +
-            ([string](Get-ReviewerRunReconciliationValue $construct "kind" "")) + "|" +
-            ([string](Get-ReviewerRunReconciliationValue $construct "path" "")) + "|" +
-            ([string](Get-ReviewerRunReconciliationValue $construct "startLine" "")) + "|" +
-            ([string](Get-ReviewerRunReconciliationValue $construct "endLine" "")) + "|" +
-            ([string](Get-ReviewerRunReconciliationValue $construct "detail" "")))
+    $binding["constructs"] = ConvertTo-ReviewerConventionSpecialistCanonicalJson `
+        -Value @(Get-ReviewerRunReconciliationValue $coverage "changedConstructs" @())
+    $missing = @(@($script:ReviewerRunReconciliationRequiredFields) | Where-Object { -not $binding[$_] })
+    if (-not $binding["snapshotId"] -or -not $binding["manifestDigest"]) { $missing += "replay identity" }
+    return @{
+        Sha256 = Get-ReviewerConventionSpecialistSha256 `
+            -Text (ConvertTo-ReviewerConventionSpecialistCanonicalJson -Value $binding)
+        Missing = @($missing)
     }
-    [void]$parts.Add("constructs=" + ($constructParts.ToArray() -join "`n"))
-    return Get-ReviewerConventionSpecialistSha256 -Text ($parts.ToArray() -join "`u{001f}")
 }
 
 function Get-ReviewerRunReconciliationCandidateKey {
@@ -99,28 +124,36 @@ function Get-ReviewerRunReconciliationCandidateKey {
     $path = ([string](Get-ReviewerRunReconciliationValue $Candidate "filePath" "")).TrimStart("/")
     $line = [string](Get-ReviewerRunReconciliationValue $Candidate "line" "0")
     $anchorKind = [string](Get-ReviewerRunReconciliationValue $Candidate "anchorKind" "")
-    return ($rulePart + "|" + $anchorKind + "|" + $path + "|" + $line)
+    return @{
+        Key = (@($rulePart, $anchorKind, $path, $line) -join $script:ReviewerRunReconciliationSeparator)
+        RuleSourceId = $rulePart
+        AnchorKind = $anchorKind
+        FilePath = $path
+        Line = $line
+    }
 }
 
 function Test-ReviewerRunReconciliationSetsEqual {
     param([AllowNull()]$Left, [AllowNull()]$Right)
-    $a = @(Get-ReviewerRunReconciliationIdList $Left)
-    $b = @(Get-ReviewerRunReconciliationIdList $Right)
+    # Both sides arrive already ordinal-sorted from the reading. Re-sorting here
+    # would be six extra sorts per disagreeing part per run pair, for nothing.
+    $a = @($Left)
+    $b = @($Right)
     if ($a.Count -ne $b.Count) { return $false }
     for ($i = 0; $i -lt $a.Count; $i++) {
-        if ([string]::CompareOrdinal($a[$i], $b[$i]) -ne 0) { return $false }
+        if ([string]::CompareOrdinal([string]$a[$i], [string]$b[$i]) -ne 0) { return $false }
     }
     return $true
 }
 
 function Get-ReviewerRunReconciliationDifference {
     param([AllowNull()]$Left, [AllowNull()]$Right)
-    $a = [System.Collections.Generic.HashSet[string]]::new([string[]]@(Get-ReviewerRunReconciliationIdList $Left), [StringComparer]::Ordinal)
-    $b = [System.Collections.Generic.HashSet[string]]::new([string[]]@(Get-ReviewerRunReconciliationIdList $Right), [StringComparer]::Ordinal)
+    $a = [System.Collections.Generic.HashSet[string]]::new([string[]]@($Left), [StringComparer]::Ordinal)
+    $b = [System.Collections.Generic.HashSet[string]]::new([string[]]@($Right), [StringComparer]::Ordinal)
     $onlyLeft = [System.Collections.Generic.List[string]]::new()
-    foreach ($id in @(Get-ReviewerRunReconciliationIdList $Left)) { if (-not $b.Contains($id)) { [void]$onlyLeft.Add($id) } }
+    foreach ($id in @($Left)) { if (-not $b.Contains([string]$id)) { [void]$onlyLeft.Add([string]$id) } }
     $onlyRight = [System.Collections.Generic.List[string]]::new()
-    foreach ($id in @(Get-ReviewerRunReconciliationIdList $Right)) { if (-not $a.Contains($id)) { [void]$onlyRight.Add($id) } }
+    foreach ($id in @($Right)) { if (-not $a.Contains([string]$id)) { [void]$onlyRight.Add([string]$id) } }
     return @{ OnlyLeft = @($onlyLeft.ToArray()); OnlyRight = @($onlyRight.ToArray()) }
 }
 
@@ -158,7 +191,13 @@ function Resolve-ReviewerRunReconciliation {
     $runIndex = 0
     foreach ($manifest in $runs) {
         $runIndex++
-        $runBinding = Get-ReviewerRunReconciliationBinding -Manifest $manifest
+        $bindingResult = Get-ReviewerRunReconciliationBinding -Manifest $manifest
+        $runBinding = [string]$bindingResult.Sha256
+        # Two runs with no binding at all would compare equal, which is the one
+        # way an empty manifest reconciles with anything.
+        if (@($bindingResult.Missing).Count -gt 0) {
+            [void]$problems.Add("run $runIndex is missing binding fields: " + (@($bindingResult.Missing) -join ", "))
+        }
         if ($null -eq $binding) { $binding = $runBinding }
         elseif ([string]::CompareOrdinal($binding, $runBinding) -ne 0) {
             [void]$problems.Add("run $runIndex was produced from different inputs than run 1")
@@ -174,11 +213,18 @@ function Resolve-ReviewerRunReconciliation {
         if ($status -cne "ok") { [void]$problems.Add("run $runIndex finished $status rather than ok") }
         $coverage = Get-ReviewerRunReconciliationValue $manifest "ruleCoverage" $null
         if ($null -eq $coverage) { [void]$problems.Add("run $runIndex has no rule accounting to reconcile") }
+        $complete = [bool](Get-ReviewerRunReconciliationValue $coverage "complete" $false)
+        # An incomplete accounting has holes in it, and a hole agrees with
+        # everything. Two runs that both failed to account for a rule are not
+        # two runs that agree about it.
+        if ($null -ne $coverage -and -not $complete) {
+            [void]$problems.Add("run $runIndex did not complete its own rule accounting")
+        }
         [void]$runSummaries.Add([pscustomobject][ordered]@{
                 run = $runIndex
                 replayNonce = $nonce
                 status = $status
-                complete = [bool](Get-ReviewerRunReconciliationValue $coverage "complete" $false)
+                complete = $complete
                 rowCount = @(Get-ReviewerRunReconciliationValue $coverage "rows" @()).Count
                 candidateCount = @(Get-ReviewerRunReconciliationValue $manifest "candidates" @()).Count
             })
@@ -240,8 +286,16 @@ function Resolve-ReviewerRunReconciliation {
                 unknown = @(Get-ReviewerRunReconciliationIdList (Get-ReviewerRunReconciliationValue $row "unknownConstructs" @()))
                 candidateId = [string](Get-ReviewerRunReconciliationValue $row "candidateId" "")
                 degradedReason = [string](Get-ReviewerRunReconciliationValue $row "degradedReason" "")
+                ruleRef = [string](Get-ReviewerRunReconciliationValue $row "ruleRef" "")
             }
-            [void]$rawStatuses.Add($reading.status)
+            # A row with no status at all is not a reading two runs can share.
+            # Left alone, two blank statuses compare equal and reconcile to a
+            # stable empty string, which prints as a row that agreed on nothing.
+            if (-not $reading.status) {
+                $agreed = $false
+                [void]$disagreements.Add("run $($reading.run) gave this rule no status")
+            }
+            [void]$rawStatuses.Add($(if ($reading.status) { $reading.status } else { "(none)" }))
             [void]$readings.Add($reading)
             if ($null -eq $reference) { $reference = $reading; continue }
             if ([string]::CompareOrdinal($reference.status, $reading.status) -ne 0) {
@@ -273,7 +327,7 @@ function Resolve-ReviewerRunReconciliation {
         if ($stable) { $stableCount++ } else { $unstableCount++ }
         [void]$rows.Add([pscustomobject][ordered]@{
                 ruleSourceId = $key
-                ruleRef = $(if ($null -ne $reference) { [string](Get-ReviewerRunReconciliationValue $byRun[0][$key] "ruleRef" "") } else { "" })
+                ruleRef = $(if ($null -ne $reference) { [string]$reference.ruleRef } else { "" })
                 reconciledStatus = $reconciled
                 stable = $stable
                 rawStatuses = @($rawStatuses.ToArray())
@@ -287,14 +341,22 @@ function Resolve-ReviewerRunReconciliation {
     # Candidates. A proposed comment is only worth showing if every run of the
     # same input proposed it. One run out of two is a coin toss with a citation.
     $candidateKeys = [System.Collections.Generic.List[string]]::new()
+    $candidateFields = [ordered]@{}
     $seenCandidateKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $candidatesByRun = [System.Collections.Generic.List[object]]::new()
     foreach ($manifest in $runs) {
         $index = [ordered]@{}
         foreach ($candidate in @(Get-ReviewerRunReconciliationValue $manifest "candidates" @())) {
-            $key = Get-ReviewerRunReconciliationCandidateKey -Candidate $candidate
+            $identity = Get-ReviewerRunReconciliationCandidateKey -Candidate $candidate
+            $key = [string]$identity.Key
             if (-not $index.Contains($key)) { $index[$key] = $candidate }
-            if ($seenCandidateKeys.Add($key)) { [void]$candidateKeys.Add($key) }
+            if ($seenCandidateKeys.Add($key)) {
+                [void]$candidateKeys.Add($key)
+                # Keep the parts. Rebuilding them by splitting the key back
+                # apart puts an attacker-chosen file and line in the report the
+                # moment a rule id contains the separator.
+                $candidateFields[$key] = $identity
+            }
         }
         [void]$candidatesByRun.Add($index)
     }
@@ -316,13 +378,13 @@ function Resolve-ReviewerRunReconciliation {
         }
         $inEveryRun = ($absent.Count -eq 0)
         if ($inEveryRun) { $agreedCandidateCount++ }
-        $parts = $key -split '\|'
+        $identity = $candidateFields[$key]
         [void]$candidates.Add([pscustomobject][ordered]@{
                 key = $key
-                ruleSourceId = $parts[0]
-                anchorKind = $(if ($parts.Count -gt 1) { $parts[1] } else { "" })
-                filePath = $(if ($parts.Count -gt 2) { $parts[2] } else { "" })
-                line = $(if ($parts.Count -gt 3) { $parts[3] } else { "0" })
+                ruleSourceId = [string]$identity.RuleSourceId
+                anchorKind = [string]$identity.AnchorKind
+                filePath = [string]$identity.FilePath
+                line = [string]$identity.Line
                 presentInRuns = @($present.ToArray())
                 absentInRuns = @($absent.ToArray())
                 inEveryRun = $inEveryRun
