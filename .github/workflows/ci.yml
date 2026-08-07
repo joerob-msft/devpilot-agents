@@ -174,6 +174,68 @@ jobs:
         shell: pwsh
         run: ./tools/Test-ConventionSpecialist.ps1
 
+      # Layer 9: offline snapshot replay of the whole read seam, and the
+      # specialist's rule-coverage accounting. Offline by construction: the
+      # checks drive a committed synthetic snapshot with no host, no network
+      # and no model.
+      - name: replay-snapshot integrity and rule-coverage accounting
+        shell: pwsh
+        run: ./tools/Test-ReplaySnapshot.ps1
+
+      - name: reviewer - offline replay is fail-closed and preview-only
+        shell: pwsh
+        run: |
+          $scriptPath = './src/Agents/reviewer/Start-ReviewerAgent.ps1'
+          $replayRoot = './src/Agents/reviewer/testdata/replay-v1'
+          $digest = (Get-Content './src/Agents/reviewer/testdata/replay-v1/synthetic-pr/manifest.json' -Raw |
+              ConvertFrom-Json).manifestDigest
+          $common = @(
+              '-NoProfile', '-File', $scriptPath,
+              '-ConfigFile', './samples/reviewer-ado.config.json',
+              '-Model', 'claude-opus-5', '-OperatorAlias', 'example-operator',
+              '-ReplayRoot', $replayRoot, '-ReplaySnapshotName', 'synthetic-pr',
+              '-ReplayManifestDigest', $digest
+          )
+          # Every one of these must be refused at startup, before any session
+          # exists. A replay that could post is not a replay.
+          $blocked = @(
+              @{ Name = 'finding comments'; Args = @('-EnableFindingComments'); Expect = 'preview-only' },
+              @{ Name = 'summary comment'; Args = @('-EnableSummaryComment'); Expect = 'preview-only' },
+              @{ Name = 'approval vote'; Args = @('-EnableApprovalVote'); Expect = 'preview-only' },
+              @{ Name = 'raw promotion'; Args = @('-PromotePreview', 'not-needed.json'); Expect = 'preview-only' },
+              @{ Name = 'verified promotion'; Args = @('-PromoteVerifiedPreview', 'not-needed.json'); Expect = 'preview-only' },
+              @{ Name = 'comment gate'; Args = @('-EnableVerifiedCommentGate'); Expect = 'preview-only' },
+              @{ Name = 'approval gate'; Args = @('-EnableVerifiedApprovalGate'); Expect = 'preview-only' },
+              @{ Name = 'self-checks'; Args = @('-DryRun'); Expect = 'cannot be combined with offline replay' }
+          )
+          $nativePreference = $PSNativeCommandUseErrorActionPreference
+          try {
+              $PSNativeCommandUseErrorActionPreference = $false
+              foreach ($case in $blocked) {
+                  $caseArgs = [string[]]$case.Args
+                  $output = & pwsh @common @caseArgs 2>&1 | Out-String
+                  if ($LASTEXITCODE -eq 0 -or $output -notmatch [regex]::Escape($case.Expect)) {
+                      throw "Replay with $($case.Name) did not fail closed at startup: $output"
+                  }
+              }
+              # An incomplete replay invocation is refused rather than guessed at.
+              $partial = & pwsh -NoProfile -File $scriptPath -ConfigFile './samples/reviewer-ado.config.json' `
+                  -Model 'claude-opus-5' -OperatorAlias 'example-operator' -ReplayRoot $replayRoot 2>&1 | Out-String
+              if ($LASTEXITCODE -eq 0 -or $partial -notmatch 'requires all of') {
+                  throw "A partial replay invocation was not refused: $partial"
+              }
+              # The snapshot itself is not for this repository's configuration,
+              # so a replay of it must refuse rather than review the wrong PR.
+              $mismatch = & pwsh @common -PullRequestId 4242 2>&1 | Out-String
+              if ($LASTEXITCODE -eq 0 -or $mismatch -notmatch 'cannot be replayed under this configuration') {
+                  throw "A snapshot captured for another repository was not refused: $mismatch"
+              }
+          }
+          finally {
+              $PSNativeCommandUseErrorActionPreference = $nativePreference
+          }
+          exit 0
+
       - name: cross-verification isolation, replay, and schema checks
         shell: pwsh
         run: ./tools/Test-CrossVerification.ps1
