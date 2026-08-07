@@ -19,7 +19,9 @@ Set-StrictMode -Version Latest
 
 $script:ReviewerRunReconciliationKind = "reviewer.run-reconciliation"
 $script:ReviewerRunReconciliationSetKind = "reviewer.run-reconciliation-set"
-$script:ReviewerRunReconciliationVersion = 1
+$script:ReviewerRunReconciliationVersion = 2
+$script:ReviewerRunSemanticCandidateKind = "reviewer.semantic-candidate"
+$script:ReviewerRunSemanticCandidateVersion = 1
 
 function Get-ReviewerRunReconciliationTimestamp {
     <#
@@ -49,6 +51,7 @@ function Get-ReviewerRunReconciliationTimestamp {
             throw ("A sealed timestamp must carry a UTC marker or an offset; " +
                 "'$($Value.ToString("o", $invariant))' carries neither.")
         }
+
         return ([DateTime]$Value).ToUniversalTime().ToString("o", $invariant)
     }
     if ($Value -is [DateTimeOffset]) {
@@ -101,6 +104,12 @@ function Read-ReviewerRunReconciliationSet {
     $set = $manifestJson | ConvertFrom-Json -Depth 8
     if ([string](Get-ReviewerConventionSpecialistValue $set "kind" "") -cne $script:ReviewerRunReconciliationSetKind) {
         throw "That artifact is not a qualification run-set declaration."
+    }
+    if (-not (Test-ReviewerRunReconciliationInteger `
+            (Get-ReviewerConventionSpecialistValue $set "artifactVersion" $null)) -or
+        [int64](Get-ReviewerConventionSpecialistValue $set "artifactVersion" 0) -ne
+        $script:ReviewerRunReconciliationVersion) {
+        throw "Qualification run-set artifact version is missing or unsupported."
     }
     foreach ($field in @("setId", "snapshotName", "snapshotManifestDigest", "plannedRunCount")) {
         if (-not (Get-ReviewerConventionSpecialistValue $set $field "")) {
@@ -263,22 +272,225 @@ function Get-ReviewerRunReconciliationBinding {
     }
 }
 
-function Get-ReviewerRunReconciliationCandidateKey {
-    param([Parameter(Mandatory)]$Candidate)
-    # A candidate's own id (`c1`, `c2`) is whatever order the model wrote them
-    # in and means nothing across runs. What identifies a candidate is what it
-    # points at: which rule, which file, which line, which anchor.
-    $rulePart = [string](Get-ReviewerRunReconciliationValue $Candidate "ruleSourceId" "")
-    $path = ([string](Get-ReviewerRunReconciliationValue $Candidate "filePath" "")).TrimStart("/")
-    $line = [string](Get-ReviewerRunReconciliationValue $Candidate "line" "0")
-    $anchorKind = [string](Get-ReviewerRunReconciliationValue $Candidate "anchorKind" "")
-    return @{
-        Key = (@($rulePart, $anchorKind, $path, $line) -join $script:ReviewerRunReconciliationSeparator)
-        RuleSourceId = $rulePart
-        AnchorKind = $anchorKind
-        FilePath = $path
-        Line = $line
+function Get-ReviewerRunReconciliationSortedUniqueStrings {
+    param([AllowNull()]$Value)
+    $set = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($item in @($Value)) {
+        $text = [string]$item
+        if ($text) { [void]$set.Add($text) }
     }
+
+    $result = [string[]]@($set)
+    [Array]::Sort($result, [StringComparer]::Ordinal)
+    return , $result
+}
+
+function Test-ReviewerRunReconciliationInteger {
+    param([AllowNull()]$Value)
+    if ($Value -is [uint64]) { return ($Value -le [uint64][int64]::MaxValue) }
+    return ($Value -is [byte] -or $Value -is [sbyte] -or
+        $Value -is [int16] -or $Value -is [uint16] -or
+        $Value -is [int32] -or $Value -is [uint32] -or
+        $Value -is [int64])
+}
+
+function Get-ReviewerRunReconciliationPresentation {
+    param([Parameter(Mandatory)]$Candidate)
+    return [ordered]@{
+        comment = [string](Get-ReviewerRunReconciliationValue $Candidate "comment" "")
+        ruleSection = [string](Get-ReviewerRunReconciliationValue $Candidate "ruleSection" "")
+        ruleQuote = [string](Get-ReviewerRunReconciliationValue $Candidate "ruleQuote" "")
+        diffEvidence = [string](Get-ReviewerRunReconciliationValue $Candidate "diffEvidence" "")
+        impact = [string](Get-ReviewerRunReconciliationValue $Candidate "impact" "")
+        expectedFixOrValidation = [string](Get-ReviewerRunReconciliationValue $Candidate "expectedFixOrValidation" "")
+        siblingEvidence = [string](Get-ReviewerRunReconciliationValue $Candidate "siblingEvidence" "")
+        siblingNotRequiredReason = [string](Get-ReviewerRunReconciliationValue $Candidate "siblingNotRequiredReason" "")
+        residualRiskSummary = [string](Get-ReviewerRunReconciliationValue $Candidate "residualRiskSummary" "")
+    }
+}
+
+function Get-ReviewerRunReconciliationSemanticCandidateIdentity {
+    param(
+        [Parameter(Mandatory)]$Candidate,
+        [Parameter(Mandatory)]$Manifest
+    )
+    $errors = [System.Collections.Generic.List[string]]::new()
+    $candidateId = [string](Get-ReviewerRunReconciliationValue $Candidate "candidateId" "")
+    $declaredVersion = Get-ReviewerRunReconciliationValue $Candidate "semanticCandidateVersion" $null
+    if (-not (Test-ReviewerRunReconciliationInteger $declaredVersion) -or
+        [int64]$declaredVersion -ne $script:ReviewerRunSemanticCandidateVersion) {
+        [void]$errors.Add("semantic candidate schema version is missing or incompatible")
+    }
+    $ruleSourceId = [string](Get-ReviewerRunReconciliationValue $Candidate "ruleSourceId" "")
+    $packName = [string](Get-ReviewerRunReconciliationValue $Candidate "packName" "")
+    $ruleSourceSha256 = ([string](Get-ReviewerRunReconciliationValue $Candidate "ruleSourceSha256" "")).ToLowerInvariant()
+    if (-not $packName -or $packName -cnotmatch '^[a-z][a-z0-9-]{0,63}$' -or
+        -not $ruleSourceId -or $ruleSourceId -match '[\x00-\x1f\x7f]' -or
+        $ruleSourceSha256 -cnotmatch '^[0-9a-f]{64}$') {
+        [void]$errors.Add("authoritative rule provenance is incomplete")
+    }
+    $anchorKind = [string](Get-ReviewerRunReconciliationValue $Candidate "anchorKind" "")
+    $path = ConvertTo-ReviewerConventionSpecialistCanonicalPath `
+        -Path ([string](Get-ReviewerRunReconciliationValue $Candidate "filePath" ""))
+    $lineValue = Get-ReviewerRunReconciliationValue $Candidate "line" $null
+    $line = $(if (Test-ReviewerRunReconciliationInteger $lineValue) { [int64]$lineValue } else { -1 })
+    if (-not (Test-ReviewerRunReconciliationInteger $lineValue)) {
+        [void]$errors.Add("candidate line is not an integer")
+    }
+    if (($anchorKind -ceq "changedFile" -and (-not $path -or $line -lt 1)) -or
+        ($anchorKind -ceq "prMetadata" -and ($path -or $line -ne 0)) -or
+        @("changedFile", "prMetadata") -cnotcontains $anchorKind) {
+        [void]$errors.Add("semantic candidate anchor is malformed")
+    }
+    $issueClass = [string](Get-ReviewerRunReconciliationValue $Candidate "category" "")
+    $impactCategory = [string](Get-ReviewerRunReconciliationValue $Candidate "impactCategory" "")
+    $severity = [string](Get-ReviewerRunReconciliationValue $Candidate "severity" "")
+    if ($issueClass -cne "convention" -or
+        @("none", "buildOrTestExecution", "deployment", "security",
+            "customerBehavior", "compatibility") -cnotcontains $impactCategory -or
+        @("suggestion", "important") -cnotcontains $severity) {
+        [void]$errors.Add("issue class, impact category, or severity is incomplete")
+    }
+    $remediationAction = [string](Get-ReviewerRunReconciliationValue $Candidate "remediationAction" "")
+    $remediationScope = [string](Get-ReviewerRunReconciliationValue $Candidate "remediationScope" "")
+    $followUpValue = Get-ReviewerRunReconciliationValue $Candidate "followUpRequired" $null
+    $followUpRequired = $(if ($followUpValue -is [bool]) { [bool]$followUpValue } else { $false })
+    if (@("add", "modify", "remove", "rename", "replace", "validate") -cnotcontains $remediationAction -or
+        @("inPullRequest", "followUp") -cnotcontains $remediationScope -or $followUpValue -isnot [bool] -or
+        ($remediationScope -ceq "inPullRequest" -and $followUpRequired) -or
+        ($remediationScope -ceq "followUp" -and -not $followUpRequired)) {
+        [void]$errors.Add("structured remediation identity is incomplete or contradictory")
+    }
+    $targetText = [string](Get-ReviewerRunReconciliationValue $Candidate "remediationTargets" "")
+    $remediationTargets = [string[]](Get-ReviewerRunReconciliationSortedUniqueStrings `
+            -Value @($targetText -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }))
+    $factText = [string](Get-ReviewerRunReconciliationValue $Candidate "factIds" "")
+    $factIds = [string[]](Get-ReviewerRunReconciliationSortedUniqueStrings `
+            -Value @($factText -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }))
+    if (@($factIds | Where-Object { $_ -cnotmatch '^rf1:[0-9a-f]{64}$' }).Count -gt 0) {
+        [void]$errors.Add("deterministic evidence contains a malformed fact id")
+    }
+
+    $coverage = Get-ReviewerRunReconciliationValue $Manifest "ruleCoverage" $null
+    $linkedRows = @(@(Get-ReviewerRunReconciliationValue $coverage "rows" @()) | Where-Object {
+            [string](Get-ReviewerRunReconciliationValue $_ "candidateId" "") -ceq $candidateId
+        })
+    if ($anchorKind -ceq "prMetadata") { $linkedRows = @() }
+    if ($anchorKind -ceq "changedFile" -and $linkedRows.Count -eq 0) {
+        $linkedRows = @(@(Get-ReviewerRunReconciliationValue $coverage "rows" @()) | Where-Object {
+                [string](Get-ReviewerRunReconciliationValue $_ "packName" "") -ceq $packName -and
+                [string](Get-ReviewerRunReconciliationValue $_ "ruleSourceId" "") -ceq $ruleSourceId -and
+                ([string](Get-ReviewerRunReconciliationValue $_ "ruleSourceSha256" "")).ToLowerInvariant() -ceq $ruleSourceSha256 -and
+                [string](Get-ReviewerRunReconciliationValue $_ "status" "") -ceq "violation"
+            })
+    }
+    if (-not $candidateId -or ($anchorKind -ceq "changedFile" -and $linkedRows.Count -ne 1)) {
+        [void]$errors.Add("candidate is not linked to exactly one authoritative rule row")
+    }
+    $row = $(if ($linkedRows.Count -eq 1) { $linkedRows[0] } else { $null })
+    if ($anchorKind -ceq "changedFile" -and $null -ne $row -and (
+            [string](Get-ReviewerRunReconciliationValue $row "packName" "") -cne $packName -or
+            [string](Get-ReviewerRunReconciliationValue $row "ruleSourceId" "") -cne $ruleSourceId -or
+            ([string](Get-ReviewerRunReconciliationValue $row "ruleSourceSha256" "")).ToLowerInvariant() -cne $ruleSourceSha256 -or
+            [string](Get-ReviewerRunReconciliationValue $row "status" "") -cne "violation")) {
+        [void]$errors.Add("candidate provenance or verdict disagrees with its authoritative rule row")
+    }
+    $violatingIds = [string[]](Get-ReviewerRunReconciliationSortedUniqueStrings `
+            -Value $(if ($null -eq $row) { @() } else {
+                @(Get-ReviewerRunReconciliationValue $row "violatingConstructs" @())
+            }))
+    if ($anchorKind -ceq "changedFile" -and $violatingIds.Count -eq 0) {
+        [void]$errors.Add("candidate has no deterministic violation set")
+    }
+    if ($anchorKind -ceq "prMetadata" -and $factIds.Count -eq 0) {
+        [void]$errors.Add("metadata candidate has no deterministic fact evidence")
+    }
+
+    $constructMap = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($construct in @(Get-ReviewerRunReconciliationValue $coverage "changedConstructs" @())) {
+        $id = [string](Get-ReviewerRunReconciliationValue $construct "constructId" "")
+        if (-not $id -or $constructMap.ContainsKey($id)) {
+            [void]$errors.Add("construct table contains a missing or duplicate id")
+            continue
+        }
+        $constructMap.Add($id, $construct)
+    }
+    $violationSet = [System.Collections.Generic.List[object]]::new()
+    $anchorConstructs = [System.Collections.Generic.List[object]]::new()
+    foreach ($id in $violatingIds) {
+        if (-not $constructMap.ContainsKey($id)) {
+            [void]$errors.Add("violation set cites an unknown construct")
+            continue
+        }
+        $construct = $constructMap[$id]
+        $constructLineValue = Get-ReviewerRunReconciliationValue $construct "line" $null
+        $constructEndValue = Get-ReviewerRunReconciliationValue $construct "endLine" $null
+        $descriptor = [ordered]@{
+            id = $id
+            kind = [string](Get-ReviewerRunReconciliationValue $construct "kind" "")
+            path = ConvertTo-ReviewerConventionSpecialistCanonicalPath `
+                -Path ([string](Get-ReviewerRunReconciliationValue $construct "path" ""))
+            line = $(if (Test-ReviewerRunReconciliationInteger $constructLineValue) {
+                    [int64]$constructLineValue
+                } else { -1 })
+            endLine = $(if (Test-ReviewerRunReconciliationInteger $constructEndValue) {
+                    [int64]$constructEndValue
+                } else { -1 })
+        }
+        if (-not $descriptor.kind -or -not $descriptor.path -or $descriptor.line -lt 1 -or
+            $descriptor.endLine -lt $descriptor.line) {
+            [void]$errors.Add("violation set contains a malformed construct descriptor")
+        }
+        [void]$violationSet.Add($descriptor)
+        if ($descriptor.path -ceq $path -and $line -ge $descriptor.line -and $line -le $descriptor.endLine) {
+            [void]$anchorConstructs.Add($descriptor)
+        }
+    }
+    if ($anchorKind -ceq "changedFile" -and $anchorConstructs.Count -eq 0) {
+        [void]$errors.Add("candidate anchor does not identify a construct in the violation set")
+    }
+    $remediationErrors = [string[]](Get-ReviewerConventionSpecialistRemediationErrors `
+            -Candidate $Candidate -Constructs @(Get-ReviewerRunReconciliationValue $coverage "changedConstructs" @()))
+    foreach ($remediationError in $remediationErrors) {
+        [void]$errors.Add($remediationError)
+    }
+
+    $payload = [ordered]@{
+        kind = $script:ReviewerRunSemanticCandidateKind
+        version = $script:ReviewerRunSemanticCandidateVersion
+        rule = [ordered]@{ packName = $packName; sourceId = $ruleSourceId; sha256 = $ruleSourceSha256 }
+        anchor = [ordered]@{
+            kind = $anchorKind; path = $path; line = $line
+            constructs = @($anchorConstructs.ToArray())
+        }
+        issue = [ordered]@{ class = $issueClass; impactCategory = $impactCategory }
+        severity = $severity
+        evidence = [ordered]@{ factIds = @($factIds); violations = @($violationSet.ToArray()) }
+        remediation = [ordered]@{
+            action = $remediationAction; scope = $remediationScope
+            targets = @($remediationTargets); followUpRequired = $followUpRequired
+        }
+    }
+    $canonicalPayload = ConvertTo-ReviewerConventionSpecialistCanonicalJson -Value $payload
+    $sha256 = Get-ReviewerConventionSpecialistSha256 -Text $canonicalPayload
+    return [pscustomobject][ordered]@{
+        valid = ($errors.Count -eq 0)
+        errors = @($errors.ToArray())
+        id = "rsci1:$sha256"
+        sha256 = $sha256
+        canonicalPayload = $canonicalPayload
+        payload = $payload
+        key = $canonicalPayload
+        ruleSourceId = $ruleSourceId
+        anchorKind = $anchorKind
+        filePath = $path
+        line = $line
+    }
+}
+
+function Get-ReviewerRunReconciliationSemanticCandidateBucketKey {
+    param([Parameter(Mandatory)]$Identity)
+    return [string]$Identity.canonicalPayload
 }
 
 function Test-ReviewerRunReconciliationSetsEqual {
@@ -672,37 +884,42 @@ function Resolve-ReviewerRunReconciliation {
             })
     }
 
-    # Candidates. A proposed comment is only worth showing if every run of the
-    # same input proposed it. One run out of two is a coin toss with a citation.
-    #
-    # A MULTISET per run, not a set. Two candidates can legitimately share the
-    # anchor key - `prMetadata` candidates are all forced to file "" line 0, so
-    # any two under one rule collide exactly - and a set silently dropped the
-    # second. The dropped one was then neither agreed nor withheld: it did not
-    # appear at all, and a run that proposed an extra important finding read as
-    # fully agreeing with a run that did not.
+    # Candidates reconcile on sealed semantic payloads, not model ids or prose.
+    # The payload binds provenance, normalized anchor/constructs, issue and
+    # severity, deterministic evidence/violations, and structured remediation.
+    # Every presentation remains in the artifact, but no presentation becomes
+    # the comment merely because it appeared first, last, or most often.
     $candidateKeys = [System.Collections.Generic.List[string]]::new()
-    # Ordinal, NOT [ordered]. An OrderedDictionary compares keys
-    # case-insensitively, and `filePath` is model-authored and stored verbatim -
-    # so `/src/Widget.cs` and `/src/widget.cs` collided, two disagreeing runs
-    # read as agreed, and the surviving row printed one run's path beside the
-    # other run's comment. Insertion order is not relied on; both key lists are
-    # re-sorted ordinally below.
     $candidateFields = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
     $seenCandidateKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $candidatesByRun = [System.Collections.Generic.List[object]]::new()
-    foreach ($manifest in $runs) {
+    for ($runIndex = 0; $runIndex -lt $runs.Count; $runIndex++) {
+        $manifest = $runs[$runIndex]
         $index = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
         foreach ($candidate in @(Get-ReviewerRunReconciliationValue $manifest "candidates" @())) {
-            $identity = Get-ReviewerRunReconciliationCandidateKey -Candidate $candidate
-            $key = [string]$identity.Key
+            $identity = Get-ReviewerRunReconciliationSemanticCandidateIdentity `
+                -Candidate $candidate -Manifest $manifest
+            $key = $(if ([bool]$identity.valid) {
+                    Get-ReviewerRunReconciliationSemanticCandidateBucketKey -Identity $identity
+                }
+                else {
+                    "invalid" + $script:ReviewerRunReconciliationSeparator +
+                    [string]$identity.canonicalPayload + $script:ReviewerRunReconciliationSeparator +
+                    (ConvertTo-ReviewerConventionSpecialistCanonicalJson -Value $identity.errors) +
+                    $script:ReviewerRunReconciliationSeparator +
+                    (ConvertTo-ReviewerConventionSpecialistCanonicalJson -Value $candidate)
+                })
             if (-not $index.ContainsKey($key)) { $index[$key] = [System.Collections.Generic.List[object]]::new() }
-            [void]$index[$key].Add($candidate)
+            [void]$index[$key].Add([pscustomobject][ordered]@{
+                    candidate = $candidate
+                    identity = $identity
+                    presentation = Get-ReviewerRunReconciliationPresentation -Candidate $candidate
+                    run = $runIndex + 1
+                    replayNonce = [string](Get-ReviewerRunReconciliationValue `
+                            (Get-ReviewerRunReconciliationValue $manifest "replay" $null) "replayNonce" "")
+                })
             if ($seenCandidateKeys.Add($key)) {
                 [void]$candidateKeys.Add($key)
-                # Keep the parts. Rebuilding them by splitting the key back
-                # apart puts an attacker-chosen file and line in the report the
-                # moment a rule id contains the separator.
                 $candidateFields[$key] = $identity
             }
         }
@@ -714,65 +931,91 @@ function Resolve-ReviewerRunReconciliation {
     $candidates = [System.Collections.Generic.List[object]]::new()
     $agreedCandidateCount = 0
     foreach ($key in $sortedCandidateKeys) {
-        $present = [System.Collections.Generic.List[int]]::new()
-        $absent = [System.Collections.Generic.List[int]]::new()
-        $counts = [System.Collections.Generic.List[int]]::new()
-        $texts = [System.Collections.Generic.List[string]]::new()
-        $textSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-        $severities = [System.Collections.Generic.List[string]]::new()
-        $severitySet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-        $example = $null
+        $present = [System.Collections.Generic.List[string]]::new()
+        $absent = [System.Collections.Generic.List[string]]::new()
+        $counts = [System.Collections.Generic.List[object]]::new()
+        $countValues = [System.Collections.Generic.List[int]]::new()
+        $presentations = [System.Collections.Generic.List[object]]::new()
         for ($i = 0; $i -lt $candidatesByRun.Count; $i++) {
             $bucket = $(if ($candidatesByRun[$i].ContainsKey($key)) { $candidatesByRun[$i][$key] } else { $null })
             $count = $(if ($null -eq $bucket) { 0 } else { $bucket.Count })
-            [void]$counts.Add($count)
+            $nonce = [string]@($runSummaries.ToArray())[$i].replayNonce
+            [void]$countValues.Add($count)
+            [void]$counts.Add([pscustomobject][ordered]@{ replayNonce = $nonce; count = $count })
             if ($count -gt 0) {
-                [void]$present.Add($i + 1)
-                if ($null -eq $example) { $example = $bucket[0] }
-                # The COMMENT and the SEVERITY are the claim. Two runs that
-                # point at one line and say different things about it have not
-                # agreed on a comment; showing one run's wording under the
-                # `agreed` label is choosing whose review this is.
+                [void]$present.Add($nonce)
                 foreach ($item in @($bucket)) {
-                    $severity = [string](Get-ReviewerRunReconciliationValue $item "severity" "")
-                    if ($severitySet.Add($severity)) { [void]$severities.Add($severity) }
-                    $text = Get-ReviewerConventionSpecialistSha256 `
-                        -Text (([string](Get-ReviewerRunReconciliationValue $item "comment" "")).Trim())
-                    if ($textSet.Add($text)) { [void]$texts.Add($text) }
+                    $presentationJson = ConvertTo-ReviewerConventionSpecialistCanonicalJson -Value $item.presentation
+                    [void]$presentations.Add([pscustomobject][ordered]@{
+                            sha256 = Get-ReviewerConventionSpecialistSha256 -Text $presentationJson
+                            replayNonce = [string]$item.replayNonce
+                            candidateId = [string](Get-ReviewerRunReconciliationValue $item.candidate "candidateId" "")
+                            text = $item.presentation
+                        })
                 }
             }
-            else { [void]$absent.Add($i + 1) }
+            else { [void]$absent.Add($nonce) }
         }
-        $sortedCounts = @($counts.ToArray())
+        $sortedCounts = @($countValues.ToArray())
         # A set, not `Sort-Object -Unique`. Integers compare culture-free so
         # this was not a defect, but it was the one Sort-Object on a path that
         # reaches the digest, and the file''s own rule says not to.
         $countSet = [System.Collections.Generic.HashSet[int]]::new([int[]]@($sortedCounts))
         $sameCount = ($countSet.Count -le 1)
-        $inEveryRun = ($absent.Count -eq 0 -and $sameCount -and
-            @($severities).Count -le 1 -and @($texts).Count -le 1)
+        $sortedPresent = @($present.ToArray())
+        $sortedAbsent = @($absent.ToArray())
+        $sortedCountRows = @($counts.ToArray())
+        [Array]::Sort($sortedPresent, [StringComparer]::Ordinal)
+        [Array]::Sort($sortedAbsent, [StringComparer]::Ordinal)
+        [Array]::Sort($sortedCountRows, [System.Comparison[object]]{
+                param($left, $right)
+                [StringComparer]::Ordinal.Compare([string]$left.replayNonce, [string]$right.replayNonce)
+            })
+        $identity = $candidateFields[$key]
+        $inEveryRun = ([bool]$identity.valid -and $absent.Count -eq 0 -and $sameCount)
         if ($inEveryRun) { $agreedCandidateCount++ }
-        $disposition = $(if ($inEveryRun) { "agreed" }
+        $disposition = $(if (-not [bool]$identity.valid) { "withheldMalformedSemanticIdentity" }
+            elseif ($inEveryRun) { "semanticAgreementTextWithheld" }
             elseif ($absent.Count -gt 0) { "withheldRunDisagreement" }
             elseif (-not $sameCount) { "withheldCountDisagreement" }
-            elseif (@($severities).Count -gt 1) { "withheldSeverityDisagreement" }
-            else { "withheldTextDisagreement" })
-        $identity = $candidateFields[$key]
+            else { "withheldSemanticDisagreement" })
+        $sortedPresentations = @($presentations.ToArray())
+        [Array]::Sort($sortedPresentations, [System.Comparison[object]]{
+                param($left, $right)
+                $comparison = [StringComparer]::Ordinal.Compare([string]$left.sha256, [string]$right.sha256)
+                if ($comparison -ne 0) { return $comparison }
+                $comparison = [StringComparer]::Ordinal.Compare([string]$left.replayNonce, [string]$right.replayNonce)
+                if ($comparison -ne 0) { return $comparison }
+                return [StringComparer]::Ordinal.Compare([string]$left.candidateId, [string]$right.candidateId)
+            })
+        $payload = $(if ([bool]$identity.valid) {
+                Get-ReviewerRunReconciliationValue $identity "payload" $null
+            } else { $null })
         [void]$candidates.Add([pscustomobject][ordered]@{
-                key = $key
-                ruleSourceId = [string]$identity.RuleSourceId
-                anchorKind = [string]$identity.AnchorKind
-                filePath = [string]$identity.FilePath
-                line = [string]$identity.Line
-                presentInRuns = @($present.ToArray())
-                absentInRuns = @($absent.ToArray())
-                perRunCounts = @($counts.ToArray())
-                distinctSeverities = @($severities.ToArray())
-                distinctCommentCount = @($texts).Count
+                semanticCandidateId = $(if ([bool]$identity.valid) {
+                        [string](Get-ReviewerRunReconciliationValue $identity "id" "")
+                    } else { "" })
+                semanticCandidateVersion = $script:ReviewerRunSemanticCandidateVersion
+                semanticIdentitySha256 = $(if ([bool]$identity.valid) {
+                        [string](Get-ReviewerRunReconciliationValue $identity "sha256" "")
+                    } else { "" })
+                semanticIdentity = $payload
+                identityErrors = @((Get-ReviewerRunReconciliationValue $identity "errors" @()))
+                ruleSourceId = [string](Get-ReviewerRunReconciliationValue $identity "ruleSourceId" "")
+                anchorKind = [string](Get-ReviewerRunReconciliationValue $identity "anchorKind" "")
+                filePath = [string](Get-ReviewerRunReconciliationValue $identity "filePath" "")
+                line = [int64](Get-ReviewerRunReconciliationValue $identity "line" -1)
+                presentInRuns = @($sortedPresent)
+                absentInRuns = @($sortedAbsent)
+                perRunCounts = @($sortedCountRows)
+                presentationStatus = "withheldPendingCanonicalRenderer"
+                presentationVariants = @($sortedPresentations)
                 inEveryRun = $inEveryRun
                 disposition = $disposition
-                severity = [string](Get-ReviewerRunReconciliationValue $example "severity" "")
-                comment = [string](Get-ReviewerRunReconciliationValue $example "comment" "")
+                severity = $(if ($null -eq $payload) { "" } else {
+                        [string](Get-ReviewerRunReconciliationValue $payload "severity" "")
+                    })
+                comment = ""
             })
     }
 
@@ -801,7 +1044,9 @@ function Resolve-ReviewerRunReconciliation {
             }
         }
         foreach ($candidate in $candidates) {
-            if ($candidate.disposition -ceq "agreed") { $candidate.disposition = "withheldUnreconciled" }
+            if ($candidate.disposition -ceq "semanticAgreementTextWithheld") {
+                $candidate.disposition = "withheldUnreconciled"
+            }
             $candidate.inEveryRun = $false
         }
         $stableCount = 0
@@ -843,6 +1088,23 @@ function Resolve-ReviewerRunReconciliation {
             $text
         })
     [Array]::Sort($sortedProblems, [StringComparer]::Ordinal)
+    $orderFreeCandidates = @(@($candidates.ToArray()) | ForEach-Object {
+            ConvertTo-ReviewerConventionSpecialistCanonicalJson -Value ([ordered]@{
+                    semanticCandidateId = [string]$_.semanticCandidateId
+                    semanticIdentitySha256 = [string]$_.semanticIdentitySha256
+                    semanticIdentity = $_.semanticIdentity
+                    disposition = [string]$_.disposition
+                    presentations = @($_.presentationVariants | ForEach-Object {
+                            [ordered]@{
+                                sha256 = [string]$_.sha256
+                                replayNonce = [string]$_.replayNonce
+                                candidateId = [string]$_.candidateId
+                                text = $_.text
+                            }
+                        })
+                })
+        })
+    [Array]::Sort($orderFreeCandidates, [StringComparer]::Ordinal)
     $orderFree = [ordered]@{
         version = $script:ReviewerRunReconciliationVersion
         reconciled = $reconciled
@@ -860,12 +1122,7 @@ function Resolve-ReviewerRunReconciliation {
                         })
                 }
             })
-        candidates = @(@($candidates.ToArray()) | ForEach-Object {
-                [ordered]@{
-                    rule = [string]$_.ruleSourceId; path = [string]$_.filePath
-                    line = [string]$_.line; disposition = [string]$_.disposition
-                }
-            })
+        candidates = @($orderFreeCandidates)
     }
     $result | Add-Member -NotePropertyName reconciliationSha256 `
         -NotePropertyValue (Get-ReviewerConventionSpecialistSha256 `
@@ -922,6 +1179,10 @@ function Format-ReviewerRunReconciliationReport {
         [void]$lines.Add("- [$([string]$candidate.disposition)] $([string]$candidate.filePath):$([string]$candidate.line) " +
             "rule $([string]$candidate.ruleSourceId); runs $((@($candidate.presentInRuns)) -join ',')" +
             $(if (@($candidate.absentInRuns).Count -gt 0) { "; absent in $((@($candidate.absentInRuns)) -join ',')" } else { "" }))
+        if ([string]$candidate.disposition -ceq "semanticAgreementTextWithheld") {
+            [void]$lines.Add("  - Semantic identity: $([string]$candidate.semanticCandidateId)")
+            [void]$lines.Add("  - Presentation withheld; $(@($candidate.presentationVariants).Count) raw variant(s) remain in the sealed JSON artifact.")
+        }
     }
     [void]$lines.Add("")
     [void]$lines.Add("This reconciliation is an evaluation artifact. It cannot authorize delivery,")
