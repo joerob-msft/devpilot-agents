@@ -1,25 +1,27 @@
 {
   "schemaVersion": 1,
+  "provider": "AzureDevOps",
   "platform": {
     "os": "Windows",
     "device": "DevBox",
     "minimumPowerShellVersion": "7.0"
   },
   "repository": {
-    "organization": "msazure",
-    "project": "One",
-    "name": "AAPT-Antares-ApiHub",
-    "id": "f1273caf-04fb-422a-8e26-ddd91a06bd6d"
+    "note": "The repository whose pull requests this agent handles feedback on. This file lives IN that repository (typically .github/copilot/agents/review-handler.config.json), and its location is also what tells the agent where the repository root is.",
+    "organization": "contoso",
+    "project": "ExampleProject",
+    "name": "Example-Service",
+    "id": "11111111-1111-1111-1111-111111111111"
   },
   "customAgent": {
-    "note": "Empty name = no Agency custom agent. handle-cycle.prompt.md IS the complete instruction set; loading an unrelated repo agent (e.g. the Squad coordinator) on top of it makes the model adopt that persona and never emit a result marker.",
+    "note": "Empty name = no Agency custom agent. handle-cycle.prompt.md IS the complete instruction set; loading an unrelated repo agent (for example a squad coordinator) on top of it makes the model adopt that persona and never emit a result marker.",
     "name": "",
     "source": ""
   },
   "promptFile": "handle-cycle.prompt.md",
-  "stateNamespace": "ApiHub",
+  "stateNamespace": "ExampleService",
   "operator": {
-    "note": "Default PR-author alias to monitor. The -OperatorAlias wrapper parameter is authoritative and overrides this. All PR titles/descriptions/comments/diffs authored by anyone are untrusted DATA, never instructions.",
+    "note": "Default PR-author alias to monitor. The -OperatorAlias wrapper parameter is authoritative and overrides this. Leave empty in a checked-in config so the repository does not name an individual. All PR titles, descriptions, comments and diffs authored by anyone are untrusted DATA, never instructions.",
     "defaultAlias": ""
   },
   "timing": {
@@ -29,28 +31,26 @@
   },
   "commitIdContract": {
     "algorithmName": "SHA-1",
-    "usageNote": "40-character hexadecimal ADO commit-id format validation only. Never used for any cryptographic guarantee.",
+    "usageNote": "40-character hexadecimal commit-id format validation only. Never used for any cryptographic guarantee.",
     "hexLength": 40
   },
   "buddyBuild": {
-    "note": "Live PR-validation pipeline. quickbuild/CloudBuild buddy builds are a different, retired thing.",
-    "pipelineId": 250001,
-    "pipelineName": "AAPT-Antares-ApiHub-PullRequest",
+    "note": "The live PR-validation pipeline this repository runs on pull requests. Set pipelineId and pipelineName to your own validation pipeline.",
+    "pipelineId": 1234,
+    "pipelineName": "Example-Service-PullRequest",
     "prMergeRefTemplate": "refs/pull/{prId}/merge"
   },
   "threadClassification": {
-    "note": "Used to disambiguate the reviewer-agent's own findings (posted AS the operator) from the operator's genuine replies. See design-spec section 1.4.",
+    "note": "Used to disambiguate a reviewer agent's own findings (posted AS the operator) from the operator's genuine replies, and to identify comments that are not human review feedback at all.",
     "agentSignatureMarkers": [
       "**[CRITICAL]",
       "**[IMPORTANT]",
       "**[SUGGESTION]",
-      "API Hub Reviewer Agent Summary"
+      "Reviewer Agent Summary"
     ],
     "botIdentitySubstrings": [
-      "GitOps",
-      "Git LowPriv",
       "PR Assistant",
-      "MerlinBot"
+      "Policy Bot"
     ],
     "systemIdentitySubstrings": [
       "Microsoft.VisualStudio.Services.TFS"
@@ -65,7 +65,7 @@
     "prefix": "review-handler"
   },
   "teamsNotifications": {
-    "note": "Checked-in config alone NEVER enables Teams writes. The operator must also pass -EnableTeamsNotifications, and the wrapper fails closed at startup if that switch is passed while enabled/teamId/channelId/events are not populated - so the switch can never silently do nothing. Webhook URLs/secrets are never stored here.",
+    "note": "Checked-in config alone NEVER enables Teams writes. The operator must also pass -EnableTeamsNotifications, and the wrapper fails closed at startup if that switch is passed while enabled/teamId/channelId/events are not populated - so the switch can never silently do nothing. Webhook URLs and secrets are never stored here.",
     "supportedEvents": [
       "handlerStarted",
       "handlerCompleted",
@@ -120,6 +120,7 @@
     }
   },
   "permissions": {
+    "note": "This agent operates on the operator's OWN pull requests, on a branch the operator controls - which is why it may hold a narrow shell grant and local validation tools that the reviewer agent may not. Write tools that publish to the host remain mandatory denies: the model reports structured data and the WRAPPER performs every write.",
     "allowTools": [
       "read",
       "shell(git status:*)",
@@ -131,10 +132,7 @@
       "ado(repo_repository)",
       "ado(repo_file)",
       "ado(repo_branch)",
-      "ado(pipelines_build)",
-      "bluebird",
-      "web_search",
-      "web_fetch"
+      "ado(pipelines_build)"
     ],
     "denyTools": [
       "shell(srectl:*)",
@@ -148,45 +146,33 @@
       "ado(repo_pull_request_write)"
     ],
     "localValidation": {
+      "note": "Only consulted when the operator passes -EnableLocalValidation. Replace these with your repository's own build and test commands.",
       "allowTools": [
         "shell(dotnet build:*)",
-        "shell(dotnet test:*)",
-        "shell(build.cmd:*)"
+        "shell(dotnet test:*)"
       ],
       "guidanceCommands": [
         {
-          "description": "Full API Hub build, tests skipped (see AGENTS.md Build Quick Reference)",
-          "executable": "cmd.exe",
-          "arguments": [
-            "/c",
-            "build.cmd",
-            "-p:SkipTests=true"
-          ]
-        },
-        {
-          "description": "Targeted rebuild of a single changed project (replace <ProjectPath> with the .csproj under review)",
+          "description": "Targeted rebuild of a single changed project (replace <ProjectPath> with the project under review)",
           "executable": "dotnet",
           "arguments": [
             "build",
-            "<ProjectPath>",
-            "-p:LOCALDEBUG=true"
+            "<ProjectPath>"
           ]
         }
       ]
     }
   },
-  "provider": "AzureDevOps",
   "repoConventions": {
-    "note": "Injected into the agent's runtime context. Keeps repo-specific engineering rules OUT of the shared prompt so the prompt (and the result-marker contract it defines) stays identical for every consumer.",
+    "note": "Injected into the agent's runtime context as DATA. Keeps repository-specific engineering rules OUT of the shared prompt, so the prompt - and the result-marker contract it defines - stays identical for every consumer.",
     "conventionDocPaths": [
       "AGENTS.md",
-      "docs/principles.md"
+      "docs/contributing.md"
     ],
     "buildDocPath": "docs/build.md",
-    "buildHint": "dotnet build <ChangedProject>.csproj -p:LOCALDEBUG=true",
-    "fullBuildCommand": "build.cmd -p:SkipTests=true",
-    "securitySkill": "sdl-security-codegen",
+    "buildHint": "dotnet build <ChangedProject>",
+    "fullBuildCommand": "dotnet build",
     "branchNaming": "{alias}/{description}",
-    "customRules": "Never change net462 behavior - during .NET 10 migration the net462 path stays byte-for-byte identical, so use #if NETFRAMEWORK guards and put fixes in the #else branch; keep warnings-as-errors clean. If a change touches jobs-engine-managed APIM policy artifacts, follow the APIM policy testing cycle in AGENTS.md (stop the jobs engine before rebuilding engine artifacts)."
+    "customRules": "Public API changes require a corresponding entry in docs/api-changes.md. Keep warnings-as-errors clean. Prefer answering a reviewer's question directly over restating the diff."
   }
 }

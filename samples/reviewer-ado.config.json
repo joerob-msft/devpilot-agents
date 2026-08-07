@@ -53,6 +53,52 @@
       "Microsoft.VisualStudio.Services.TFS"
     ]
   },
+  "teamsNotifications": {
+    "note": "Checked-in config alone NEVER delivers anything: the operator must also pass -EnableTeamsNotifications, and startup fails if that switch is passed while nothing here is enabled - so the switch can never silently do nothing. Webhook URLs and secrets are never stored here.",
+    "supportedEvents": [
+      "reviewCompleted",
+      "reviewFailed",
+      "previewReady",
+      "candidateStarved"
+    ],
+    "workIq": {
+      "note": "Verified WorkIQ contract: 'fetch' takes an entityUrls ARRAY, 'create_entity' takes parentUrl + jsonBody, and the payload returns in structuredContent (NOT content[]). A non-2xx statusCode is a failure even when the MCP call itself succeeds.",
+      "command": "agency",
+      "subcommand": [
+        "mcp",
+        "workiq"
+      ],
+      "toolAllowlist": [
+        "fetch",
+        "create_entity"
+      ],
+      "pathPrefixAllowlist": [
+        "/me",
+        "/users/",
+        "/chats",
+        "/teams/"
+      ],
+      "timeoutSeconds": 30
+    },
+    "channel": {
+      "enabled": false,
+      "teamId": "",
+      "channelId": "",
+      "events": [
+        "candidateStarved",
+        "reviewFailed"
+      ]
+    },
+    "directAuthor": {
+      "note": "One-on-one Teams chat. Microsoft Graph cannot create a chat between the signed-in user and themselves, so recipientUpn must be a DIFFERENT person than whoever the agent runs as. Independent of the channel destination - either alone is valid.",
+      "enabled": false,
+      "recipientUpn": "",
+      "events": [
+        "previewReady",
+        "candidateStarved"
+      ]
+    }
+  },
   "repoConventions": {
     "note": "Injected into the agent's runtime context as DATA. Keeps repository-specific engineering rules OUT of the shared prompt, so the prompt - and the result-marker contract it defines - stays identical for every consumer.",
     "conventionDocPaths": [

@@ -94,6 +94,16 @@ param(
     [switch]$EnableThreadReplies,
     [switch]$EnableBuddyRequeue,
     [switch]$EnableTeamsNotifications,
+
+    # Authoritative over config.teamsNotifications.directAuthor.recipientUpn,
+    # for the same reason -OperatorAlias overrides its config counterpart: a
+    # checked-in file should not name an individual, and the recipient is a
+    # property of who is running the agent rather than of the repository.
+    #
+    # Microsoft Graph cannot create a one-on-one chat between the signed-in
+    # user and themselves, so this must be a different person than whoever the
+    # agent authenticates as.
+    [string]$TeamsRecipientUpn,
     [switch]$EnableAutoComplete,
     [switch]$LocalValidation,
     [switch]$ResumeCodingSession,
@@ -652,6 +662,12 @@ $TeamsDirectEvents = Get-AgentConfigStringArray -Object $teamsDirectCfg -Name "e
 $TeamsDirectRecipient = ""
 $directRecipientProp = $teamsDirectCfg.PSObject.Properties["recipientUpn"]
 if ($directRecipientProp -and $directRecipientProp.Value -is [string]) { $TeamsDirectRecipient = ([string]$directRecipientProp.Value).Trim() }
+# The command line wins, so a repository can ship directAuthor.enabled = true
+# without naming a person in a checked-in file.
+if ($PSBoundParameters.ContainsKey('TeamsRecipientUpn')) { $TeamsDirectRecipient = $TeamsRecipientUpn.Trim() }
+if ($TeamsDirectRecipient -and $TeamsDirectRecipient -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
+    throw "Teams direct recipient '$TeamsDirectRecipient' is not a valid UPN."
+}
 
 foreach ($evt in (@($TeamsChannelEvents) + @($TeamsDirectEvents))) {
     if ($TeamsSupportedEvents -cnotcontains $evt) {
@@ -674,7 +690,7 @@ if ($EnableTeamsNotifications) {
     }
     if ($TeamsDirectEnabled) {
         if ([string]::IsNullOrWhiteSpace($TeamsDirectRecipient)) {
-            throw ("config.teamsNotifications.directAuthor is enabled but recipientUpn is empty. Set it to the UPN to message. " +
+            throw ("config.teamsNotifications.directAuthor is enabled but no recipient is set. Pass -TeamsRecipientUpn <upn>, or populate config.teamsNotifications.directAuthor.recipientUpn. " +
                 "Note: Microsoft Graph cannot create a one-on-one chat with yourself, so this must be a different person than the signed-in user.")
         }
         if (@($TeamsDirectEvents).Count -eq 0) {
@@ -1064,7 +1080,10 @@ function Invoke-DryRunSelfChecks {
     $humanLastThread = @{ threadId = 4; status = 'active'; comments = @(@{ authorDisplayName = 'Alex Reviewer'; authorUniqueName = 'alex.reviewer@example.com'; content = 'Open question about the retry.' }) }
     $fixedThread = @{ threadId = 5; status = 'fixed'; comments = @(@{ authorDisplayName = 'Sam Reviewer'; authorUniqueName = 'sam.reviewer@example.com'; content = 'Old finding.' }) }
     $systemThread = @{ threadId = 6; status = 'active'; comments = @(@{ authorDisplayName = 'Microsoft.VisualStudio.Services.TFS'; authorUniqueName = 'tfs'; content = 'system note' }) }
-    $botThread = @{ threadId = 7; status = 'active'; comments = @(@{ authorDisplayName = 'GitOps (Git LowPriv)'; authorUniqueName = 'gitops@example.com'; content = 'PR Assistant suggestion.' }) }
+    # Derived from the configured substrings so this asserts the config-to-classifier
+    # wiring for ANY consumer, instead of only one organization's bot display names.
+    $botDisplayName = if ($BotSubstrings.Count -gt 0) { "$($BotSubstrings[0]) (automation)" } else { 'Example Bot (automation)' }
+    $botThread = @{ threadId = 7; status = 'active'; comments = @(@{ authorDisplayName = $botDisplayName; authorUniqueName = 'bot@example.com'; content = 'Automated suggestion.' }) }
     $cls = Get-HandlerClassifiedThreads -Threads @($agentFindingThread, $operatorReplyThread, $agentThenReply, $humanLastThread, $fixedThread, $systemThread, $botThread) -OperatorAlias 'operator' -AgentSignatureMarkers $AgentSignatureMarkers -BotSubstrings $BotSubstrings -SystemSubstrings $SystemSubstrings
     $byId = @{}; foreach ($c in $cls) { $byId[[int]$c.ThreadId] = $c }
     if (-not $byId[1].Actionable) { $failures.Add("Agent finding posted as operator was not actionable.") } else { Write-Host "  OK - agent finding (as operator) is actionable" -ForegroundColor Green }
