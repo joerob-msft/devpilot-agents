@@ -115,6 +115,7 @@ function Get-ReviewerConstructMaskedLines {
     $commentLines = [System.Collections.Generic.HashSet[int]]::new()
     $inBlockComment = $false
     $inVerbatim = $false
+    $inBacktick = $false
     $truncated = $false
     $lineNumber = 0
 
@@ -148,6 +149,16 @@ function Get-ReviewerConstructMaskedLines {
                 [void]$out.Append(' '); $i++
                 continue
             }
+            if ($inBacktick) {
+                # `\` escapes the next character, including a closing backtick.
+                if ($ch -eq '\') {
+                    $span = [Math]::Min(2, $line.Length - $i)
+                    [void]$out.Append(' ' * $span); $i += $span; continue
+                }
+                if ($ch -eq '`') { $inBacktick = $false; [void]$out.Append(' '); $i++; continue }
+                [void]$out.Append(' '); $i++
+                continue
+            }
             if ($ch -eq '/' -and $next -eq '/') {
                 $hasComment = $true
                 [void]$out.Append(' ' * ($line.Length - $i))
@@ -156,6 +167,17 @@ function Get-ReviewerConstructMaskedLines {
             }
             if ($ch -eq '/' -and $next -eq '*') { $inBlockComment = $true; $hasComment = $true; [void]$out.Append('  '); $i += 2; continue }
             if ($ch -eq '@' -and $next -eq '"') { $inVerbatim = $true; [void]$out.Append('  '); $i += 2; continue }
+            if ($ch -eq '`') {
+                # A template literal. Ten of the extensions this enumerator
+                # accepts use them, and they span lines - so without state here
+                # a SQL string in a .ts file became two declarations and a Go
+                # template became a call, all reported `known` and all of them
+                # usable as candidate anchors inside string content.
+                $inBacktick = $true
+                [void]$out.Append(' ')
+                $i++
+                continue
+            }
             if ($ch -eq '"' -and $next -eq '"' -and ($i + 2 -lt $line.Length) -and $line[$i + 2] -eq '"') {
                 # A raw string literal. Masking it as an ordinary string would
                 # end the literal at the first line break and scan its body as
@@ -216,7 +238,7 @@ function Get-ReviewerConstructMaskedLines {
     return @{
         Lines = $masked.ToArray()
         CommentLines = $commentLines
-        Truncated = ($truncated -or $inBlockComment -or $inVerbatim)
+        Truncated = ($truncated -or $inBlockComment -or $inVerbatim -or $inBacktick)
     }
 }
 
@@ -567,6 +589,10 @@ function Get-ReviewerChangedDeclarations {
         if ($changed.Contains($scan + 1)) { continue }
         $neighbour = $DeclarationIndex[$scan]
         if ($null -eq $neighbour) { continue }
+        # A neighbour whose own attribute list was cut short makes the file-wide
+        # set incomplete too. "Absent nowhere else" must not quietly mean "the
+        # wrapper stopped reading that declaration at twelve".
+        if ([bool]$neighbour.Truncated) { $attributesTruncated = $true }
         foreach ($attribute in @($neighbour.Attributes)) {
             if ($unchangedAttributes.Count -ge $script:ReviewerConstructMaxAttributeNames) { $attributesTruncated = $true; break }
             [void]$unchangedAttributes.Add($attribute)
@@ -586,6 +612,7 @@ function Get-ReviewerChangedDeclarations {
         # it one would make the precedent a guess dressed as a fact.
         $siblingAttributes = [System.Collections.Generic.List[string]]::new()
         $siblingCount = 0
+        $siblingTruncated = $false
         foreach ($direction in @(-1, 1)) {
             $scan = $index + $direction
             while ($scan -ge 0 -and $scan -lt $DeclarationIndex.Count) {
@@ -599,8 +626,9 @@ function Get-ReviewerChangedDeclarations {
                     $neighbour = $DeclarationIndex[$scan]
                     if ($null -ne $neighbour) {
                         $siblingCount++
+                        if ([bool]$neighbour.Truncated) { $siblingTruncated = $true }
                         foreach ($attribute in @($neighbour.Attributes)) {
-                            if ($siblingAttributes.Count -ge $script:ReviewerConstructMaxAttributes) { break }
+                            if ($siblingAttributes.Count -ge $script:ReviewerConstructMaxAttributes) { $siblingTruncated = $true; break }
                             if ($siblingAttributes -cnotcontains $attribute) { [void]$siblingAttributes.Add($attribute) }
                         }
                         break
@@ -628,7 +656,7 @@ function Get-ReviewerChangedDeclarations {
                 # file-wide attribute set hit its cap: "absent nowhere else"
                 # would then mean "the wrapper stopped counting", which a rule
                 # reasoning from it must not be told silently.
-                status = $(if ([bool]$declaration.Truncated -or $attributesTruncated) { "unknown" } else { "known" })
+                status = $(if ([bool]$declaration.Truncated -or $attributesTruncated -or $siblingTruncated) { "unknown" } else { "known" })
             })
     }
     return @{ Constructs = @($found.ToArray()); Truncated = $truncated }

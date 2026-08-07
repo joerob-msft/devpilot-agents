@@ -506,18 +506,36 @@ try {
     Assert-Replay ([string]@($allOutOfReachOk.Rows)[0].status -ceq "notApplicable" -and [bool]$allOutOfReachOk.Complete) `
         "A rule that reaches nothing in a scope it declared may say exactly that."
 
-    # Saying "this rule does not reach that construct" is informative about any
-    # construct, including one outside the scope. Weighing one against a rule
-    # whose scope excludes it is the actual error.
+    # A rule that governs no construct kind must still say WHICH anchors it does
+    # not reach - which means naming the kinds those anchors belong to. `none`
+    # plus one id was a clean row that had weighed nothing.
     $outsideScope = Invoke-Coverage -WithConstructs @(
         [pscustomobject][ordered]@{ constructId = "mi0"; kind = "invocation"; path = "src/a.cs"; line = 5; endLine = 5 }
         [pscustomobject][ordered]@{ constructId = "dc0"; kind = "declaration"; path = "src/a.cs"; line = 9; endLine = 9 }
     ) -Rows @(
         (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "notApplicable" -Scope "none" -Checked "" -NotInReach "mi0,dc0"),
-        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope "invocation" -Checked "mi0" -NotInReach "dc0")
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope "invocation" -Checked "mi0")
     )
-    Assert-Replay ([string]@($outsideScope.Rows)[0].status -ceq "notApplicable" -and [bool]$outsideScope.Complete) `
-        "A rule that governs no kind may still name the constructs it confirmed it does not reach."
+    Assert-Replay ([string]@($outsideScope.Rows)[0].status -ceq "unknown") `
+        "A row that declares no construct kind must degrade, however many ids it puts out of reach."
+    $namedKinds = Invoke-Coverage -WithConstructs @(
+        [pscustomobject][ordered]@{ constructId = "mi0"; kind = "invocation"; path = "src/a.cs"; line = 5; endLine = 5 }
+        [pscustomobject][ordered]@{ constructId = "dc0"; kind = "declaration"; path = "src/a.cs"; line = 9; endLine = 9 }
+    ) -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "notApplicable" -Scope "invocation,declaration" -Checked "" -NotInReach "mi0,dc0"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope "invocation" -Checked "mi0")
+    )
+    Assert-Replay ([string]@($namedKinds.Rows)[0].status -ceq "notApplicable" -and [bool]$namedKinds.Complete) `
+        "Naming the kinds and ruling their anchors out of reach is the falsifiable way to say a rule reaches nothing."
+    $strayOutOfReach = Invoke-Coverage -WithConstructs @(
+        [pscustomobject][ordered]@{ constructId = "mi0"; kind = "invocation"; path = "src/a.cs"; line = 5; endLine = 5 }
+        [pscustomobject][ordered]@{ constructId = "dc0"; kind = "declaration"; path = "src/a.cs"; line = 9; endLine = 9 }
+    ) -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope "invocation" -Checked "mi0" -NotInReach "dc0"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope "invocation" -Checked "mi0")
+    )
+    Assert-Replay ([string]@($strayOutOfReach.Rows)[0].status -ceq "unknown") `
+        "Out of reach is a verdict about an anchor the row was asked about, not a bin for kinds it said it does not govern."
     $wrongKindChecked = Invoke-Coverage -WithConstructs @(
         [pscustomobject][ordered]@{ constructId = "mi0"; kind = "invocation"; path = "src/a.cs"; line = 5; endLine = 5 }
         [pscustomobject][ordered]@{ constructId = "dc0"; kind = "declaration"; path = "src/a.cs"; line = 9; endLine = 9 }
