@@ -235,3 +235,15 @@ The reconciliation is sealed under the same derived replay key as the runs that
 fed it, so it verifies only there and never against the promotion path. A
 live-run artifact cannot be fed to it at all: live artifacts are sealed under
 the raw key, and the reconciler reads only the replay domain.
+The tool takes the sealed artifact and the signing key from each run. Repeats
+belong in separate state directories - that is what keeps them independent -
+and each of those mints its own key, so pass one `-KeyPath` per run in the same
+order, or a single one if the runs shared a state directory.
+
+Runs are lined up by `ruleRef` rather than by rule id, because one source can
+legitimately be transported under two refs and keying on the id would turn that
+into a phantom duplicate. The ref is a position in the request list, which is
+safe here precisely because the binding already pins the config and both plans -
+and the rule id and hash are compared per row anyway, so a run whose `rs2` is
+about a different rule than the other's `rs2` disagrees rather than being
+quietly lined up.

@@ -26,6 +26,10 @@ $script:ReviewerRunReconciliationVersion = 1
 # landed.
 $script:ReviewerRunReconciliationSeparator = [string][char]0x1f
 
+# The status a finished specialist pass writes. Not "ok" - a pass that ran to
+# completion is `complete`, and a pass that fell over is `degraded`.
+$script:ReviewerRunReconciliationOkStatus = "complete"
+
 if (-not (Get-Command Get-ReviewerConventionSpecialistSha256 -ErrorAction SilentlyContinue)) {
     throw "RunReconciliation.ps1 requires ConventionSpecialist.ps1 to be dot-sourced first."
 }
@@ -210,15 +214,36 @@ function Resolve-ReviewerRunReconciliation {
             [void]$problems.Add("run $runIndex claims to be promotable")
         }
         $status = [string](Get-ReviewerRunReconciliationValue $manifest "status" "")
-        if ($status -cne "ok") { [void]$problems.Add("run $runIndex finished $status rather than ok") }
+        if ($status -cne $script:ReviewerRunReconciliationOkStatus) {
+            [void]$problems.Add("run $runIndex finished $status rather than $($script:ReviewerRunReconciliationOkStatus)")
+        }
         $coverage = Get-ReviewerRunReconciliationValue $manifest "ruleCoverage" $null
         if ($null -eq $coverage) { [void]$problems.Add("run $runIndex has no rule accounting to reconcile") }
         $complete = [bool](Get-ReviewerRunReconciliationValue $coverage "complete" $false)
-        # An incomplete accounting has holes in it, and a hole agrees with
-        # everything. Two runs that both failed to account for a rule are not
-        # two runs that agree about it.
-        if ($null -ne $coverage -and -not $complete) {
-            [void]$problems.Add("run $runIndex did not complete its own rule accounting")
+        # A hole agrees with everything. A rule NO row covered never enters the
+        # comparison at all - it is not a disagreement, it is an absence, and
+        # two absences look exactly like two runs concurring. So the holes are
+        # named as problems, one kind at a time.
+        #
+        # A row the wrapper DEGRADED is not a hole: it arrives with status
+        # `unknown` and reconciles like any other reading. Refusing the whole
+        # comparison because some row honestly degraded would throw away the
+        # rows that did not.
+        foreach ($hole in @(
+                @{ Field = "missing"; Text = "accounted for no row at all for" },
+                @{ Field = "duplicates"; Text = "accounted twice for" },
+                @{ Field = "unknown"; Text = "wrote a row for a rule never transported to it:" },
+                @{ Field = "unaccountedCandidates"; Text = "proposed candidates with no accounting row:" })) {
+            $ids = @(Get-ReviewerRunReconciliationValue $coverage $hole.Field @())
+            if ($ids.Count -gt 0) {
+                [void]$problems.Add("run $runIndex $($hole.Text) " + ((@($ids) | Select-Object -First 8) -join ", "))
+            }
+        }
+        if ($null -ne $coverage -and [bool](Get-ReviewerRunReconciliationValue $coverage "constructsIncomplete" $false)) {
+            # A short anchor table means both runs were asked about less code
+            # than the change set contains, so agreement between them is
+            # agreement about a subset nobody chose.
+            [void]$problems.Add("run $runIndex enumerated an incomplete construct table")
         }
         [void]$runSummaries.Add([pscustomobject][ordered]@{
                 run = $runIndex
@@ -230,8 +255,15 @@ function Resolve-ReviewerRunReconciliation {
             })
     }
 
-    # Index each run's rows by the rule SOURCE, not by `rs0`. The `rsN` label is
-    # a position in a request list; the source id is the rule.
+    # Index each run's rows by `ruleRef`. That is a POSITION in the request
+    # list, which sounds fragile until you notice the binding already pins the
+    # config and both plan hashes - so the request list is identical across the
+    # runs being compared, and the position is exactly as stable as the rule.
+    # `ruleSourceId` alone is not a key: one source can legitimately be
+    # transported under two refs, and keying on it turns that into a phantom
+    # duplicate. The source id and hash are compared per row instead, so a run
+    # whose rs2 is about a different rule than the other's rs2 disagrees rather
+    # than being silently lined up.
     $byRun = [System.Collections.Generic.List[object]]::new()
     $ruleKeys = [System.Collections.Generic.List[string]]::new()
     $seenRuleKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -239,13 +271,13 @@ function Resolve-ReviewerRunReconciliation {
         $coverage = Get-ReviewerRunReconciliationValue $manifest "ruleCoverage" $null
         $index = [ordered]@{}
         foreach ($row in @(Get-ReviewerRunReconciliationValue $coverage "rows" @())) {
-            $key = [string](Get-ReviewerRunReconciliationValue $row "ruleSourceId" "")
-            if (-not $key) { $key = "rule:" + [string](Get-ReviewerRunReconciliationValue $row "ruleRef" "") }
-            # A run that lists the same rule twice has already failed its own
+            $key = [string](Get-ReviewerRunReconciliationValue $row "ruleRef" "")
+            if (-not $key) { $key = "source:" + [string](Get-ReviewerRunReconciliationValue $row "ruleSourceId" "") }
+            # A run that lists the same ref twice has already failed its own
             # duplicate check upstream; here it just means we cannot line the
             # rows up, so treat the second as a disagreement with the first.
             if ($index.Contains($key)) {
-                [void]$problems.Add("a run accounted for rule source '$key' more than once")
+                [void]$problems.Add("a run accounted for rule '$key' more than once")
                 continue
             }
             $index[$key] = $row
@@ -287,6 +319,8 @@ function Resolve-ReviewerRunReconciliation {
                 candidateId = [string](Get-ReviewerRunReconciliationValue $row "candidateId" "")
                 degradedReason = [string](Get-ReviewerRunReconciliationValue $row "degradedReason" "")
                 ruleRef = [string](Get-ReviewerRunReconciliationValue $row "ruleRef" "")
+                ruleSourceId = [string](Get-ReviewerRunReconciliationValue $row "ruleSourceId" "")
+                ruleSourceSha256 = [string](Get-ReviewerRunReconciliationValue $row "ruleSourceSha256" "")
             }
             # A row with no status at all is not a reading two runs can share.
             # Left alone, two blank statuses compare equal and reconcile to a
@@ -298,6 +332,14 @@ function Resolve-ReviewerRunReconciliation {
             [void]$rawStatuses.Add($(if ($reading.status) { $reading.status } else { "(none)" }))
             [void]$readings.Add($reading)
             if ($null -eq $reference) { $reference = $reading; continue }
+            # Same slot, different rule. The refs line up positionally, so this
+            # is the check that the position still means what it meant.
+            if ([string]::CompareOrdinal($reference.ruleSourceId, $reading.ruleSourceId) -ne 0 -or
+                [string]::CompareOrdinal($reference.ruleSourceSha256, $reading.ruleSourceSha256) -ne 0) {
+                $agreed = $false
+                [void]$disagreements.Add("run $($reading.run) accounted for a different rule in this slot " +
+                    "($($reference.ruleSourceId) vs $($reading.ruleSourceId))")
+            }
             if ([string]::CompareOrdinal($reference.status, $reading.status) -ne 0) {
                 $agreed = $false
                 [void]$disagreements.Add("run 1 read $($reference.status) and run $($reading.run) read $($reading.status)")
@@ -326,8 +368,8 @@ function Resolve-ReviewerRunReconciliation {
         $stable = [bool]($agreed -and $null -ne $reference)
         if ($stable) { $stableCount++ } else { $unstableCount++ }
         [void]$rows.Add([pscustomobject][ordered]@{
-                ruleSourceId = $key
-                ruleRef = $(if ($null -ne $reference) { [string]$reference.ruleRef } else { "" })
+                ruleSourceId = $(if ($null -ne $reference) { [string]$reference.ruleSourceId } else { "" })
+                ruleRef = $key
                 reconciledStatus = $reconciled
                 stable = $stable
                 rawStatuses = @($rawStatuses.ToArray())
