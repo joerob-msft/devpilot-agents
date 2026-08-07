@@ -251,6 +251,17 @@ computed itself:
   verdict lists is degraded, and the reason names the exact ids it left out; so
   is a row that gives the same anchor two verdicts, or a verdict to an anchor
   that does not exist;
+- `notInReachConstructs` is the cheapest verdict to give, so it is fail-closed
+  in every direction. The universe it has to cover is the wrapper's own
+  enumeration, not the model's: the row declares which construct **kinds** its
+  rule governs, and the wrapper expands those to the sealed anchor ids itself.
+  Checked and out-of-reach must then cover that universe exactly and share
+  nothing. A kind the wrapper does not enumerate cannot define a universe; an
+  out-of-reach id belonging to a kind the row's own scope excludes is refused
+  rather than binned; an id repeated inside one list is refused rather than
+  quietly deduplicated - including when the repeat is hidden inside overlapping
+  ranges - because collapsing it would let a short list impersonate an exact
+  cover;
 - the row's `status` is **derived from the verdicts**: `unknown` if any anchor
   is undecided, else `violation` if any anchor violates, else `notApplicable`
   if none was weighed, else `compliant`. Where the model's own `status`
@@ -293,3 +304,11 @@ hint generator enumerates, so measured recall would become a property of that
 generator rather than of the specialist - which is the opposite of calibration.
 Construct enumeration is the boundary: it says a call spans four lines and its
 last argument is positional; it never says that is wrong.
+
+### One reading is not a verdict
+
+A row's status is one model's reading of the frozen input. Replayed again, the
+same rule can read differently. `tools/Compare-ReviewerReplayRuns.ps1` compares
+sealed runs of an identical binding and collapses anything they disagree about
+to `unknown`, withholding any candidate that not every run proposed. There is no
+majority vote: see `docs/replay-snapshots.md`.

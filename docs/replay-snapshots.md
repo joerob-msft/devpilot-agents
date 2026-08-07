@@ -182,3 +182,56 @@ fixtures and never open a session.
 A snapshot captured under a different config, script or prompt build still
 loads, with a warning - a transport change since capture can ask for reads the
 snapshot does not carry, and that fails closed with the exact request named.
+
+## One run is not a result
+
+A replay is deterministic in its inputs and not in its model. The same snapshot,
+replayed twice, can produce two different readings of the same rule - different
+wording always, and sometimes a different verdict. Either run, read on its own,
+looks exactly like a result.
+
+So a single replay artifact says so about itself. It carries a residual risk
+naming the run as unreconciled, the preview says the same in its header, and the
+sealed manifest sets `replay.reconciled = false` with `runsReconciled = 1`.
+Nothing about that is advisory: a consumer that wants a stable status has to go
+and get one.
+
+`tools/Compare-ReviewerReplayRuns.ps1` is how. Give it the sealed specialist
+artifacts from two or more runs of the same snapshot:
+
+```pwsh
+./tools/Compare-ReviewerReplayRuns.ps1 `
+    -ArtifactPath run1.json, run2.json `
+    -KeyPath <state>/artifact-signing.key `
+    -OutputDirectory <out> -FailOnDisagreement
+```
+
+It refuses to compare runs that are not repetitions of one question. The binding
+- pull request, source commit, config, script, specialist library, prompt, both
+plans, model, and the enumerated construct table - must be identical, or the
+runs are about different code. The replay nonces must all be *different*, or the
+"two runs" are one run submitted twice, which is how a single favourable
+observation would otherwise launder itself into a stable result.
+
+Then it collapses them:
+
+- A rule every run read the same way keeps that reading, along with the anchors
+  they agreed on.
+- A rule the runs read differently becomes `unknown`, and both readings are
+  printed. Agreeing on the word while naming different anchors counts as
+  disagreement - `violation at mi14` and `violation at mi15` are two findings
+  wearing one status.
+- A rule some run never accounted for at all is `unknown`.
+- A candidate comment is agreed only if every run proposed it at the same rule,
+  file and line. The model's own `c1`/`c2` ids are ignored, because they are
+  just the order it happened to write them in.
+- Anything else is withheld with the runs that disagreed named.
+
+There is no majority vote and no tie-break. Two runs out of three is not a
+result. The reconciliation never picks the interesting reading, the common one,
+or the first one - disagreement resolves to `unknown` and stays visible.
+
+The reconciliation is sealed under the same derived replay key as the runs that
+fed it, so it verifies only there and never against the promotion path. A
+live-run artifact cannot be fed to it at all: live artifacts are sealed under
+the raw key, and the reconciler reads only the replay domain.
