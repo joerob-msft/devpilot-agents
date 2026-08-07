@@ -95,9 +95,11 @@ function New-ConventionCandidate {
     param(
         [string]$CandidateId = "manifest-validation",
         [string]$SourceSha = ("a" * 64),
-        [string]$Quote = "validation manifests are required"
+        [string]$Quote = "validation manifests are required",
+        [switch]$DebtRequired
     )
-    return [pscustomobject][ordered]@{
+    $debtFactId = "rdf1:" + ("d" * 64)
+    $candidate = [pscustomobject][ordered]@{
         candidateId = $CandidateId
         category = "convention"
         severity = "important"
@@ -122,7 +124,33 @@ function New-ConventionCandidate {
         factIds = "rf1:" + ("b" * 64)
         confidence = "high"
         residualRiskSummary = ""
+        changedCodeFix = [pscustomobject][ordered]@{
+            action = "add"; targets = "dc0"; conventionKey = "ValidationManifest"
+            valueSource = "authoritativeRule"; evidenceFactIds = ""
+        }
+        existingDebtFollowUp = $(if ($DebtRequired) {
+                [pscustomobject][ordered]@{
+                    status = "required"; evidenceFactId = $debtFactId; selectorKey = "TestCase"
+                    scopeKind = "file"
+                    scopePath = "src/a.cs"; comparableCount = 38; compliantCount = 0
+                    action = "recordTrackedFollowUp"
+                }
+            } else {
+                [pscustomobject][ordered]@{
+                    status = "none"; evidenceFactId = ""; selectorKey = ""; scopeKind = ""; scopePath = ""
+                    comparableCount = 0; compliantCount = 0; action = ""
+                }
+            })
     }
+    if ($DebtRequired) {
+        $candidate | Add-Member -NotePropertyName existingDebtEvidence -NotePropertyValue (
+            [pscustomobject][ordered]@{
+                evidenceFactId = $debtFactId; path = "src/a.cs"; declarationCount = 38
+                attributeFrequency = @([pscustomobject]@{ attribute = "TestCase"; declarations = 38 })
+                attributeCountsComplete = $true; generatedCode = $false
+            })
+    }
+    return $candidate
 }
 
 function New-VerifierRun {
@@ -136,8 +164,25 @@ function New-VerifierRun {
         [string]$Rationale = "The cited evidence directly supports the bounded candidate.",
         [string]$EvidenceKind = "diffHunk",
         [string]$EvidenceSha256 = ("e" * 64),
-        [string]$FactIds = ""
+        [string]$FactIds = "",
+        [string]$ChangedCodeFixOutcome = "",
+        [string]$ChangedCodeFixEvidenceSha256 = "",
+        [string]$ChangedCodeFixFactIds = "",
+        [string]$ExistingDebtFollowUpOutcome = "",
+        [string]$ExistingDebtEvidenceSha256 = "",
+        [string]$ExistingDebtEvidenceFactId = ""
     )
+    if (-not $ChangedCodeFixOutcome) {
+        $ChangedCodeFixOutcome = $(if ([string]$Assignment.originKind -ceq "convention") {
+                "supported"
+            } else { "notApplicable" })
+    }
+    if (-not $ChangedCodeFixEvidenceSha256 -and
+        [string]$Assignment.originKind -ceq "convention") {
+        $ChangedCodeFixEvidenceSha256 = Get-ReviewerVerificationSha256 -Text (
+            [string]$Assignment.ruleQuote)
+    }
+    if (-not $ExistingDebtFollowUpOutcome) { $ExistingDebtFollowUpOutcome = "notRequested" }
     $verdict = [pscustomobject][ordered]@{
         candidateId = [string]$Assignment.candidateId
         candidateHash = [string]$Assignment.candidateHash
@@ -149,6 +194,12 @@ function New-VerifierRun {
         correctedSeverity = $CorrectedSeverity
         rationale = $Rationale
         confidence = "high"
+        changedCodeFixOutcome = $ChangedCodeFixOutcome
+        changedCodeFixEvidenceSha256 = $ChangedCodeFixEvidenceSha256
+        changedCodeFixFactIds = $ChangedCodeFixFactIds
+        existingDebtFollowUpOutcome = $ExistingDebtFollowUpOutcome
+        existingDebtEvidenceSha256 = $ExistingDebtEvidenceSha256
+        existingDebtEvidenceFactId = $ExistingDebtEvidenceFactId
     }
     return [pscustomobject][ordered]@{
         assignmentId = [string]$Assignment.assignmentId
@@ -446,6 +497,12 @@ $markerObject = [pscustomobject][ordered]@{
             correctedSeverity = "none"
             rationale = "The minimal diff hunk directly supports the bounded candidate."
             confidence = "high"
+            changedCodeFixOutcome = "notApplicable"
+            changedCodeFixEvidenceSha256 = ""
+            changedCodeFixFactIds = ""
+            existingDebtFollowUpOutcome = "notRequested"
+            existingDebtEvidenceSha256 = ""
+            existingDebtEvidenceFactId = ""
         }
     )
     diagnostics = @()
@@ -587,6 +644,66 @@ $conventionEligible = Resolve-ReviewerVerificationDecisions -Clusters $conventio
     -EvidenceHunks (Get-TestEvidenceHunks -Clusters $conventionClusters)
 Assert-Verification (@($conventionEligible.eligible).Count -eq 1) `
     "A fully evidence-bound convention candidate was not eligible."
+Assert-Verification (
+    [string]$conventionEligible.eligible[0].comment -clike "add 'ValidationManifest'*" -and
+    [string]$conventionEligible.eligible[0].existingDebtFollowUp.status -ceq "none") `
+    "Convention remediation was not rendered deterministically from structured actions."
+$debtCandidates = @(ConvertTo-ReviewerVerificationCandidates `
+    -ConventionCandidates @((New-ConventionCandidate -DebtRequired)) `
+    -ConventionModel "claude-sonnet-5" -ConventionArtifactSha256 ("c" * 64))
+$debtClusters = @(Get-ReviewerVerificationClusters -Candidates $debtCandidates)
+$debtAssignments = @(Get-ReviewerVerificationAssignments -Clusters $debtClusters `
+    -GeneralistModels @($opus, $sol) -ConventionVerifierModel $sol)
+$debtEvidenceSha = Get-ReviewerVerificationObjectSha256 -Value $debtCandidates[0].existingDebtEvidence
+$debtFactId = [string]$debtCandidates[0].existingDebtFollowUp.evidenceFactId
+$supportedDebtRuns = @($debtAssignments | ForEach-Object {
+        New-VerifierRun -Assignment $_ -ExistingDebtFollowUpOutcome supported `
+            -ExistingDebtEvidenceSha256 $debtEvidenceSha -ExistingDebtEvidenceFactId $debtFactId
+    })
+$supportedDebt = Resolve-ReviewerVerificationDecisions -Clusters $debtClusters `
+    -Assignments $debtAssignments -VerifierRuns $supportedDebtRuns `
+    -ChangedPaths @("src/a.cs") -FactPlan $factPlan -ResolvedSources $resolvedSources `
+    -EvidenceHunks (Get-TestEvidenceHunks -Clusters $debtClusters)
+Assert-Verification (@($supportedDebt.eligible).Count -eq 1 -and
+    [string]$supportedDebt.eligible[0].existingDebtFollowUp.status -ceq "required" -and
+    [string]$supportedDebt.eligible[0].comment -clike "*tracked follow-up*0 of 38*") `
+    "Supported changed-code and bounded existing-debt actions were not both retained."
+$unsupportedDebtRuns = @($debtAssignments | ForEach-Object {
+        New-VerifierRun -Assignment $_ -ExistingDebtFollowUpOutcome unsupported
+    })
+$unsupportedDebt = Resolve-ReviewerVerificationDecisions -Clusters $debtClusters `
+    -Assignments $debtAssignments -VerifierRuns $unsupportedDebtRuns `
+    -ChangedPaths @("src/a.cs") -FactPlan $factPlan -ResolvedSources $resolvedSources `
+    -EvidenceHunks (Get-TestEvidenceHunks -Clusters $debtClusters)
+Assert-Verification (@($unsupportedDebt.eligible).Count -eq 1 -and
+    [string]$unsupportedDebt.eligible[0].existingDebtFollowUp.status -ceq "none" -and
+    [string]$unsupportedDebt.eligible[0].comment -cnotlike "*tracked follow-up*") `
+    "Unsupported debt follow-up did not strip non-atomically while retaining the supported stop-the-bleed finding."
+$mismatchedDebtRuns = @($debtAssignments | ForEach-Object {
+        New-VerifierRun -Assignment $_ -ExistingDebtFollowUpOutcome supported `
+            -ExistingDebtEvidenceSha256 ("f" * 64) -ExistingDebtEvidenceFactId $debtFactId
+    })
+$mismatchedDebt = Resolve-ReviewerVerificationDecisions -Clusters $debtClusters `
+    -Assignments $debtAssignments -VerifierRuns $mismatchedDebtRuns `
+    -ChangedPaths @("src/a.cs") -FactPlan $factPlan -ResolvedSources $resolvedSources `
+    -EvidenceHunks (Get-TestEvidenceHunks -Clusters $debtClusters)
+Assert-Verification (@($mismatchedDebt.eligible).Count -eq 1 -and
+    [string]$mismatchedDebt.eligible[0].existingDebtFollowUp.status -ceq "none" -and
+    [string]$mismatchedDebt.decisions[0].existingDebtFollowUpOutcome -ceq "unsupported" -and
+    -not [bool]$mismatchedDebt.decisions[0].existingDebtFollowUpRetained) `
+    "A supported debt verdict with mismatched sealed evidence left contradictory audit state."
+$unsupportedFixRuns = @($debtAssignments | ForEach-Object {
+        New-VerifierRun -Assignment $_ -ChangedCodeFixOutcome unsupported `
+            -ExistingDebtFollowUpOutcome supported -ExistingDebtEvidenceSha256 $debtEvidenceSha `
+            -ExistingDebtEvidenceFactId $debtFactId
+    })
+$unsupportedFix = Resolve-ReviewerVerificationDecisions -Clusters $debtClusters `
+    -Assignments $debtAssignments -VerifierRuns $unsupportedFixRuns `
+    -ChangedPaths @("src/a.cs") -FactPlan $factPlan -ResolvedSources $resolvedSources `
+    -EvidenceHunks (Get-TestEvidenceHunks -Clusters $debtClusters)
+Assert-Verification (@($unsupportedFix.eligible).Count -eq 0 -and
+    @($unsupportedFix.withheld | Where-Object reason -ceq "unsupported").Count -eq 1) `
+    "Unsupported required changed-code remediation remained eligible."
 $staleSources = Copy-VerificationObject $resolvedSources
 $staleSources[0].Sha256 = "f" * 64
 $staleRule = Resolve-ReviewerVerificationDecisions -Clusters $conventionClusters `
@@ -615,6 +732,29 @@ $partialEvidence = Resolve-ReviewerVerificationDecisions -Clusters $conventionCl
     -EvidenceHunks (Get-TestEvidenceHunks -Clusters $conventionClusters)
 Assert-Verification (@($partialEvidence.withheld | Where-Object reason -ceq "factInvalid").Count -eq 1) `
     "A convention candidate with partial deterministic evidence was accepted."
+$unknownFixCandidate = New-ConventionCandidate
+$unknownFixCandidate.changedCodeFix.valueSource = "deterministicFact"
+$unknownFixCandidate.changedCodeFix.evidenceFactIds = $metadataFactId
+$unknownFixCandidates = @(ConvertTo-ReviewerVerificationCandidates `
+    -ConventionCandidates @($unknownFixCandidate) -ConventionModel "claude-sonnet-5" `
+    -ConventionArtifactSha256 ("c" * 64))
+$unknownFixClusters = @(Get-ReviewerVerificationClusters -Candidates $unknownFixCandidates)
+$unknownFixAssignments = @(Get-ReviewerVerificationAssignments -Clusters $unknownFixClusters `
+    -GeneralistModels @($opus, $sol) -ConventionVerifierModel $sol)
+$unknownFixFactPlan = Copy-VerificationObject $factPlan
+$unknownFixFactPlan.facts[1].state = "unknown"
+$unknownFixFactPlan.facts[1].unknownReason = "The deterministic source did not resolve the value."
+$unknownFixRuns = @($unknownFixAssignments | ForEach-Object {
+        New-VerifierRun -Assignment $_ -ChangedCodeFixOutcome supported `
+            -ChangedCodeFixEvidenceSha256 ("f" * 64) -ChangedCodeFixFactIds $metadataFactId
+    })
+$unknownFix = Resolve-ReviewerVerificationDecisions -Clusters $unknownFixClusters `
+    -Assignments $unknownFixAssignments -VerifierRuns $unknownFixRuns `
+    -ChangedPaths @("src/a.cs") -FactPlan $unknownFixFactPlan -ResolvedSources $resolvedSources `
+    -EvidenceHunks (Get-TestEvidenceHunks -Clusters $unknownFixClusters)
+Assert-Verification (@($unknownFix.eligible).Count -eq 0 -and
+    @($unknownFix.withheld | Where-Object reason -ceq "unsupported").Count -eq 1) `
+    "An unknown fact authorized a deterministic changed-code remediation value."
 $contradictorySiblingRuns = @($conventionAssignments | ForEach-Object {
         New-VerifierRun -Assignment $_ -Outcome needsHuman `
             -Rationale "The cited sibling evidence contradicts the candidate and needs human adjudication."

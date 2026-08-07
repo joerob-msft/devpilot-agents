@@ -170,6 +170,21 @@ convention candidates only. Wrapper validation rechecks source quotes, pack
 membership, fact IDs, severity rules, sibling evidence, and current changed-file
 anchors. Invalid anchors are withheld rather than relocated.
 
+Each candidate carries two exact remediation parts. `changedCodeFix` is the
+required stop-the-bleed action on sealed changed constructs. It identifies the
+generic convention key and whether an exact value comes from deterministic facts
+or must be obtained from the authoritative rule; the wrapper never guesses an
+identity or assignee. `existingDebtFollowUp` is explicitly `none` unless a
+complete wrapper-generated `rdf1:` file summary proves a bounded systematic
+pattern. An authoritative-rule `selectorKey` must identify at least four
+declarations in the sealed frequency table, the required convention key must
+appear on zero declarations, counts must be complete, and the sealed
+generated-code classifier must be false.
+When supported it requests recording or linking a scoped follow-up issue/PR,
+never unrelated cleanup in the current pull request. Partial counts,
+counterexamples, generated code, unrelated paths, ambiguous boundaries, and
+repo-wide claims fail closed to `none`.
+
 Every run, including timeout, process failure, or invalid output, writes a
 separate Markdown preview and domain-separated HMAC artifact under
 `convention-specialist-previews`. The artifact records model, prompt/script/

@@ -71,6 +71,15 @@ majority vote. Verification cannot add or expand a finding or raise severity.
 An absolute phase deadline and run-count cap bound aggregate verifier work; each
 process receives no more than the remaining phase budget.
 
+Convention remediation is assessed in two parts. A candidate is eligible only
+when its required `changedCodeFix` is independently supported. The
+`existingDebtFollowUp` part is deliberately non-atomic: it is retained only when
+the verifier binds the exact sealed `rdf1:` evidence, bounded file scope, and
+counts. Unsupported or ambiguous follow-up is replaced with explicit `none`
+while a separately supported stop-the-bleed finding survives. Malformed
+changed-code remediation, invented values, or overbroad cleanup claims withhold
+the candidate.
+
 ## Eligibility and artifacts
 
 Generalist eligibility requires an independent supported outcome and a valid

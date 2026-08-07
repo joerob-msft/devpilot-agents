@@ -357,19 +357,26 @@ function Get-ReviewerRunReconciliationSemanticCandidateIdentity {
         @("checked", "notRequired") -cnotcontains $siblingStatus) {
         [void]$errors.Add("issue class, impact category, severity, or material qualifier is incomplete")
     }
-    $remediationAction = [string](Get-ReviewerRunReconciliationValue $Candidate "remediationAction" "")
-    $remediationScope = [string](Get-ReviewerRunReconciliationValue $Candidate "remediationScope" "")
-    $followUpValue = Get-ReviewerRunReconciliationValue $Candidate "followUpRequired" $null
-    $followUpRequired = $(if ($followUpValue -is [bool]) { [bool]$followUpValue } else { $false })
+    $changedFix = Get-ReviewerRunReconciliationValue $Candidate "changedCodeFix" $null
+    $remediationAction = [string](Get-ReviewerRunReconciliationValue $changedFix "action" "")
+    $conventionKey = [string](Get-ReviewerRunReconciliationValue $changedFix "conventionKey" "")
+    $valueSource = [string](Get-ReviewerRunReconciliationValue $changedFix "valueSource" "")
+    $changedEvidenceText = [string](Get-ReviewerRunReconciliationValue $changedFix "evidenceFactIds" "")
     if (@("add", "modify", "remove", "rename", "replace", "validate") -cnotcontains $remediationAction -or
-        @("inPullRequest", "followUp") -cnotcontains $remediationScope -or $followUpValue -isnot [bool] -or
-        ($remediationScope -ceq "inPullRequest" -and $followUpRequired) -or
-        ($remediationScope -ceq "followUp" -and -not $followUpRequired)) {
-        [void]$errors.Add("structured remediation identity is incomplete or contradictory")
+        $conventionKey -cnotmatch '^[A-Za-z_][A-Za-z0-9_.:-]{0,127}$' -or
+        @("authoritativeRule", "deterministicFact") -cnotcontains $valueSource -or
+        ($valueSource -ceq "authoritativeRule" -and $changedEvidenceText) -or
+        ($valueSource -ceq "deterministicFact" -and -not $changedEvidenceText)) {
+        [void]$errors.Add("changed-code remediation identity is incomplete or contradictory")
     }
-    $targetText = [string](Get-ReviewerRunReconciliationValue $Candidate "remediationTargets" "")
+    $targetText = [string](Get-ReviewerRunReconciliationValue $changedFix "targets" "")
     $remediationTargets = [string[]](Get-ReviewerRunReconciliationSortedUniqueStrings `
             -Value @($targetText -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }))
+    $changedEvidenceFactIds = [string[]](Get-ReviewerRunReconciliationSortedUniqueStrings `
+            -Value @($changedEvidenceText -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }))
+    if (@($changedEvidenceFactIds | Where-Object { $_ -cnotmatch '^rf1:[0-9a-f]{64}$' }).Count -gt 0) {
+        [void]$errors.Add("changed-code remediation evidence contains a malformed fact id")
+    }
     $factText = [string](Get-ReviewerRunReconciliationValue $Candidate "factIds" "")
     $factIds = [string[]](Get-ReviewerRunReconciliationSortedUniqueStrings `
             -Value @($factText -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }))
@@ -456,7 +463,11 @@ function Get-ReviewerRunReconciliationSemanticCandidateIdentity {
         [void]$errors.Add("candidate anchor does not identify a construct in the violation set")
     }
     $remediationErrors = [string[]](Get-ReviewerConventionSpecialistRemediationErrors `
-            -Candidate $Candidate -Constructs @(Get-ReviewerRunReconciliationValue $coverage "changedConstructs" @()))
+            -Candidate $Candidate -Constructs @(Get-ReviewerRunReconciliationValue $coverage "changedConstructs" @()) `
+            -ConstructFiles @(Get-ReviewerRunReconciliationValue $coverage "constructFiles" @()) `
+            -FactPlan ([pscustomobject]@{
+                facts = @(Get-ReviewerRunReconciliationValue $coverage "remediationFacts" @())
+            }))
     foreach ($remediationError in $remediationErrors) {
         [void]$errors.Add($remediationError)
     }
@@ -474,8 +485,32 @@ function Get-ReviewerRunReconciliationSemanticCandidateIdentity {
         qualifiers = [ordered]@{ confidence = $confidence; siblingStatus = $siblingStatus }
         evidence = [ordered]@{ factIds = @($factIds); violations = @($violationSet.ToArray()) }
         remediation = [ordered]@{
-            action = $remediationAction; scope = $remediationScope
-            targets = @($remediationTargets); followUpRequired = $followUpRequired
+            changedCodeFix = [ordered]@{
+                action = $remediationAction
+                targets = @($remediationTargets)
+                conventionKey = $conventionKey
+                valueSource = $valueSource
+                evidenceFactIds = @($changedEvidenceFactIds)
+            }
+            existingDebtFollowUp = [ordered]@{
+                status = [string](Get-ReviewerRunReconciliationValue (
+                        Get-ReviewerRunReconciliationValue $Candidate "existingDebtFollowUp" $null) "status" "")
+                evidenceFactId = [string](Get-ReviewerRunReconciliationValue (
+                        Get-ReviewerRunReconciliationValue $Candidate "existingDebtFollowUp" $null) "evidenceFactId" "")
+                selectorKey = [string](Get-ReviewerRunReconciliationValue (
+                        Get-ReviewerRunReconciliationValue $Candidate "existingDebtFollowUp" $null) "selectorKey" "")
+                scopeKind = [string](Get-ReviewerRunReconciliationValue (
+                        Get-ReviewerRunReconciliationValue $Candidate "existingDebtFollowUp" $null) "scopeKind" "")
+                scopePath = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+                    [string](Get-ReviewerRunReconciliationValue (
+                            Get-ReviewerRunReconciliationValue $Candidate "existingDebtFollowUp" $null) "scopePath" ""))
+                comparableCount = Get-ReviewerRunReconciliationValue (
+                    Get-ReviewerRunReconciliationValue $Candidate "existingDebtFollowUp" $null) "comparableCount" -1
+                compliantCount = Get-ReviewerRunReconciliationValue (
+                    Get-ReviewerRunReconciliationValue $Candidate "existingDebtFollowUp" $null) "compliantCount" -1
+                action = [string](Get-ReviewerRunReconciliationValue (
+                        Get-ReviewerRunReconciliationValue $Candidate "existingDebtFollowUp" $null) "action" "")
+            }
         }
     }
     $canonicalPayload = ConvertTo-ReviewerConventionSpecialistCanonicalJson -Value $payload
