@@ -58,6 +58,12 @@ function Expand-ReviewerConventionSpecialistConstructIds {
         else is reported unreadable rather than guessed at.
     #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Text, [int]$MaxIds = 4096)
+    # Lowercased first, for the same reason `scope` is. The marker validator
+    # checks its `Pattern` case-insensitively, so `MI0,DC3` gets past validation
+    # and then fails the case-sensitive parse below - degrading a row that was
+    # right over a capital letter. Ids are lowercase by construction, so folding
+    # cannot admit an id that does not exist.
+    $Text = $Text.ToLowerInvariant()
     $ids = [System.Collections.Generic.List[string]]::new()
     $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $duplicated = [System.Collections.Generic.List[string]]::new()
@@ -833,7 +839,10 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
     $unemitted = [System.Collections.Generic.List[object]]::new()
 
     foreach ($row in @($Rows)) {
-        $ruleRef = [string](Get-ReviewerConventionSpecialistValue $row "ruleRef" "")
+        # Lowercased for the same reason the scope and the id lists are: the
+        # marker's pattern check is case-insensitive, so `RS0` validates and
+        # then misses the ordinal lookup, costing a whole rule its accounting.
+        $ruleRef = ([string](Get-ReviewerConventionSpecialistValue $row "ruleRef" "")).ToLowerInvariant()
         if (-not $expected.ContainsKey($ruleRef)) { [void]$unknown.Add($ruleRef); continue }
         if (-not $seen.Add($ruleRef)) { [void]$duplicates.Add($ruleRef); continue }
 
@@ -1155,9 +1164,22 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
     # however correctly each row is spelled. Every row may legitimately rule its
     # anchors out of reach - but then the whole checklist has looked at nothing,
     # and `Complete` is the one word a reader trusts.
-    $checkedConstructCount = [int](@(@($normalized) | ForEach-Object {
-                @($_.violatingConstructs).Count + @($_.compliantConstructs).Count + @($_.unknownConstructs).Count
-            } | Measure-Object -Sum).Sum)
+    # Distinct anchors, not the sum of the rows' claims. Ten rows may each weigh
+    # the same twenty anchors, and "checked 200 of 20" is arithmetic nobody can
+    # read - the more so now that an over-claiming row keeps its verdicts on the
+    # record instead of having them erased.
+    $checkedSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $notInReachSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($row in @($normalized)) {
+        foreach ($id in @(@($row.violatingConstructs) + @($row.compliantConstructs) + @($row.unknownConstructs))) {
+            if ($constructById.ContainsKey([string]$id)) { [void]$checkedSet.Add([string]$id) }
+        }
+        foreach ($id in @($row.notInReachConstructs)) {
+            if ($constructById.ContainsKey([string]$id)) { [void]$notInReachSet.Add([string]$id) }
+        }
+    }
+    $checkedConstructCount = $checkedSet.Count
+    $notInReachConstructCount = $notInReachSet.Count
     $missing = [System.Collections.Generic.List[string]]::new()
     foreach ($entry in @($request.Requested)) {
         if (-not $seen.Contains([string]$entry.ruleRef)) {
@@ -1192,7 +1214,7 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         # which one they are looking at.
         EnumeratedConstructCount = $constructById.Count
         CheckedConstructCount = $checkedConstructCount
-        NotInReachConstructCount = [int](@(@($normalized) | ForEach-Object { @($_.notInReachConstructs).Count } | Measure-Object -Sum).Sum)
+        NotInReachConstructCount = $notInReachConstructCount
         UnemittedViolations = @($unemitted.ToArray())
         ConstructsIncomplete = $ConstructsIncomplete
         # The construct table the rows were reconciled against, compactly. A

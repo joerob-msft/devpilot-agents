@@ -934,7 +934,66 @@ try {
             "The scaffold's '$arrayKey' must be empty: it is a format aid and must never suggest a finding."
     }
 
-    # -- 10. Changed-construct enumeration -------------------------------------
+    # The verifier's source-read ceiling. A number in a comment is not a bound;
+    # what makes it one is that the reader's own parameter refuses anything
+    # larger, and that the constant sits exactly at that refusal point.
+    $verifierCeiling = 262144
+    $reviewerSourceText = [IO.File]::ReadAllText((Join-Path $RepoRoot "src\Agents\reviewer\Start-ReviewerAgent.ps1"), $utf8)
+    $vt = $null; $ve = $null
+    $reviewerConstAst = [Management.Automation.Language.Parser]::ParseInput($reviewerSourceText, [ref]$vt, [ref]$ve)
+    $constants = @{}
+    foreach ($assignment in $reviewerConstAst.FindAll({
+                param($c)
+                if ($c -isnot [Management.Automation.Language.AssignmentStatementAst]) { return $false }
+                return (([string]$c.Left.Extent.Text) -cin @('$script:ReviewerVerificationMaxSourceFileBytes', '$script:ReviewerAuthoritativeMaxTotalBytes'))
+            }, $true)) {
+        $constants[([string]$assignment.Left.Extent.Text)] = [int](& ([scriptblock]::Create($assignment.Right.Extent.Text)))
+    }
+    Assert-Replay ($constants['$script:ReviewerVerificationMaxSourceFileBytes'] -eq $verifierCeiling) `
+        "The verifier source-read ceiling must be the declared $verifierCeiling bytes."
+    $readerNode = $reviewerConstAst.FindAll({
+            param($c)
+            $c -is [Management.Automation.Language.FunctionDefinitionAst] -and $c.Name -ceq "Get-ReviewerFactSourceFile"
+        }, $true) | Select-Object -First 1
+    $maxBytesParam = @($readerNode.Body.ParamBlock.Parameters | Where-Object { [string]$_.Name.Extent.Text -ceq '$MaxBytes' })
+    $range = @($maxBytesParam[0].Attributes | Where-Object { $_.TypeName.Name -ceq "ValidateRange" })
+    $rangeMax = [int](& ([scriptblock]::Create([string]$range[0].PositionalArguments[1].Extent.Text)))
+    Assert-Replay ($rangeMax -eq $verifierCeiling) `
+        "The reader's own ValidateRange must clamp at the same $verifierCeiling bytes, so the constant cannot be raised alone."
+    # And the authoritative-rule reads must not have been widened along with it.
+    Assert-Replay ($constants['$script:ReviewerAuthoritativeMaxTotalBytes'] -le $verifierCeiling) `
+        "Raising the verifier's per-file read must not widen the authoritative-rule total."
+
+    # The decoder is where the bound is actually enforced: exactly at it, one
+    # byte over it, and nothing at all.
+    function New-ResourceResult {
+        param([string]$Text, [string]$Uri = "/src/a.cs")
+        # The wire shape is a base64 blob, exactly as the provider sends it.
+        return [pscustomobject][ordered]@{
+            content = @([pscustomobject][ordered]@{
+                    type = "resource"
+                    resource = [pscustomobject][ordered]@{
+                        uri = $Uri; mimeType = "text/plain"
+                        blob = [Convert]::ToBase64String([Text.UTF8Encoding]::new($false).GetBytes($Text))
+                    }
+                })
+        }
+    }
+    $atBound = New-ResourceResult -Text ("a" * $verifierCeiling)
+    $decoded = ConvertFrom-AgentMcpResourceContent -ToolResult $atBound -ExpectedUri "/src/a.cs" `
+        -MaxBytes $verifierCeiling -AllowedMimeTypes @("text/plain")
+    Assert-Replay ([int]$decoded.ByteLength -eq $verifierCeiling) `
+        "A file of exactly the ceiling must be readable; an off-by-one here silently drops real source."
+    Assert-ReplayThrows {
+        ConvertFrom-AgentMcpResourceContent -ToolResult (New-ResourceResult -Text ("a" * ($verifierCeiling + 1))) `
+            -ExpectedUri "/src/a.cs" -MaxBytes $verifierCeiling -AllowedMimeTypes @("text/plain")
+    } "One byte over the ceiling must be refused, not truncated." -Match "decoded to 262145 bytes"
+    Assert-ReplayThrows {
+        ConvertFrom-AgentMcpResourceContent -ToolResult ([pscustomobject][ordered]@{ content = @() }) `
+            -ExpectedUri "/src/a.cs" -MaxBytes $verifierCeiling -AllowedMimeTypes @("text/plain")
+    } "A response with no content must be refused rather than read as an empty file."
+
+    # -- 10. changed-construct enumeration ------------------------------------
     # The generic half of the calibration: what the wrapper can establish about
     # a change set WITHOUT knowing the language's testing framework, its
     # attributes, or anything about the repository it came from.
@@ -1542,7 +1601,7 @@ try {
     # same reason as the tool grant: what it ships is the only thing worth
     # asserting about.
     . (Join-Path $RepoRoot "src\Agents\reviewer\ChangedConstructs.ps1")
-    foreach ($fn in @("Get-ReviewerConstructFilesFromReport", "Get-ReviewerConstructFilesFromReportSafely")) {
+    foreach ($fn in @("Get-ReviewerHashValue", "Test-ReviewerConstructFileHadChangedLines", "Get-ReviewerConstructFilesFromReport", "Get-ReviewerConstructFilesFromReportSafely")) {
         $node = $reviewerAst.FindAll({
                 param($candidate)
                 $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -ceq $fn
@@ -1669,18 +1728,46 @@ try {
         "A degraded row must still record what it claimed; erasing it destroys the audit trail."
 
     # A field of overlapping ranges never adds a new id, so the unique-id
-    # ceiling never fires and the inner loop ran in full. Bound the WORK too.
+    # ceiling never fires and the inner loop ran in full. The ranges have to be
+    # NARROWER than the ceiling for that to be true, which needs a construct
+    # table big enough that the ceiling is not reached on the first range.
+    $wideConstructs = @()
+    for ($i = 0; $i -lt 60; $i++) {
+        $wideConstructs += [pscustomobject][ordered]@{ constructId = "mi$i"; kind = "invocation"; path = "src/a.cs"; line = ($i + 1) }
+    }
+    for ($i = 0; $i -lt 60; $i++) {
+        $wideConstructs += [pscustomobject][ordered]@{ constructId = "dc$i"; kind = "declaration"; path = "src/b.cs"; line = ($i + 1) }
+    }
+    $wideCover = "mi0-mi59,dc0-dc59"
     $stopwatch = [Diagnostics.Stopwatch]::StartNew()
-    $overlapFlood = Invoke-Coverage -Rows @(
+    $overlapFlood = Invoke-Coverage -WithConstructs $wideConstructs -Rows @(
         (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope $bothKinds `
-                -Checked ((@(1..40) | ForEach-Object { "mi0-mi999" }) -join ",")),
-        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope $bothKinds -Checked $everyId)
+                -Checked ((@(1..40) | ForEach-Object { "mi0-mi59" }) -join ",")),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope $bothKinds -Checked $wideCover)
     )
     $stopwatch.Stop()
     Assert-Replay (@($overlapFlood.Rows | Where-Object { $_.ruleRef -ceq "rs0" }).status -ceq "unknown") `
         "A flood of overlapping ranges must be refused, not expanded."
     Assert-Replay ($stopwatch.ElapsedMilliseconds -lt 2000) `
         "Refusing it must be cheap; the ceiling has to bound work, not just unique ids (took $($stopwatch.ElapsedMilliseconds) ms)."
+    # And the legitimate shape it must NOT refuse: a full exact cover of the
+    # same wide table, written as two ranges.
+    $wideLegit = Invoke-Coverage -WithConstructs $wideConstructs -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope $bothKinds -Checked $wideCover),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope $bothKinds -Checked $wideCover)
+    )
+    Assert-Replay (@($wideLegit.Rows | Where-Object { $_.ruleRef -ceq "rs0" }).status -ceq "compliant" -and [bool]$wideLegit.Complete) `
+        "The work ceiling must not refuse a legitimate exact cover of a full construct table."
+
+    # Capitalised ids and refs reach this code because the marker validates its
+    # patterns case-insensitively. Folding them costs nothing and saves a row.
+    $capitalIds = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "RS0" -Sha ("a" * 64) -Status "compliant" -Scope "Invocation,Declaration" -Checked "MI0,MI1,DC0"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope $bothKinds -Checked $everyId)
+    )
+    Assert-Replay (@($capitalIds.Rows | Where-Object { $_.ruleRef -ceq "rs0" }).status -ceq "compliant" -and
+        @($capitalIds.Unknown).Count -eq 0) `
+        "A capitalised ruleRef and capitalised construct ids must resolve, not silently degrade a correct row."
 
     # The marker validates its patterns case-insensitively, so a capital letter
     # reaches this function. Folding it costs nothing and saves a correct row.
@@ -1728,22 +1815,59 @@ try {
 
     # A hunk that runs past the delivered image is not a reason to count to two
     # billion. This is the mandatory path of every review, and a hang is not an
-    # exception the caller's try/catch can catch.
-    $runawaySpan = [pscustomobject][ordered]@{
-        Files = @([pscustomobject][ordered]@{
+    # exception the caller's try/catch can catch - so the check runs in a job
+    # with a deadline, because a test that can only fail by hanging never
+    # reports.
+    $runawayScript = {
+        param($RepoRoot)
+        $source = [IO.File]::ReadAllText((Join-Path $RepoRoot "src\Agents\reviewer\Start-ReviewerAgent.ps1"))
+        $t = $null; $e = $null
+        $ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$t, [ref]$e)
+        foreach ($fn in @("Get-ReviewerHashValue", "Test-ReviewerConstructFileHadChangedLines", "Get-ReviewerConstructFilesFromReport")) {
+            $node = $ast.FindAll({ param($c) $c -is [Management.Automation.Language.FunctionDefinitionAst] -and $c.Name -ceq $fn }, $true) | Select-Object -First 1
+            . ([scriptblock]::Create($node.Extent.Text))
+        }
+        $report = [pscustomobject][ordered]@{
+            Files = @([pscustomobject][ordered]@{
+                    Path = "/src/a.cs"
+                    Slices = @([pscustomobject][ordered]@{ StartLine = 1; EndLine = 3; Text = "a`nb`nc" })
+                    SiblingSlices = @()
+                    RawSpans = @([pscustomobject][ordered]@{ Start = 1; End = 2147483647 })
+                    RawRequestedSpanCount = 1
+                })
+        }
+        $result = Get-ReviewerConstructFilesFromReport -Report $report
+        return @($result.UndeliveredPaths)
+    }
+    $runawayJob = Start-Job -ScriptBlock $runawayScript -ArgumentList $RepoRoot
+    $finished = Wait-Job -Job $runawayJob -Timeout 60
+    $runawayPaths = $(if ($finished) { @(Receive-Job -Job $runawayJob) } else { @() })
+    Remove-Job -Job $runawayJob -Force -ErrorAction SilentlyContinue
+    Assert-Replay ($null -ne $finished) `
+        "An unbounded hunk span must be clamped to the delivered image; without the clamp this never returns."
+    Assert-Replay ($runawayPaths -ccontains "src/a.cs") `
+        "A hunk reaching past what was delivered leaves the enumeration short, and that must be recorded."
+
+    # A file the transport dropped BEFORE slicing carries no spans at all - too
+    # large, unreadable, past the file cap - so gating on `RawSpans` missed
+    # exactly the files nobody read.
+    $preSliceOmission = [pscustomobject][ordered]@{
+        Files = @(
+            [pscustomobject][ordered]@{
                 Path = "/src/a.cs"
-                Slices = @([pscustomobject][ordered]@{ StartLine = 1; EndLine = 3; Text = "a`nb`nc" })
+                Slices = @([pscustomobject][ordered]@{ StartLine = 1; EndLine = 4; Text = "class A {`nvoid M() {`nDo(`nx: 1);" })
                 SiblingSlices = @()
-                RawSpans = @([pscustomobject][ordered]@{ Start = 1; End = 2147483647 })
+                RawSpans = @([pscustomobject][ordered]@{ Start = 3; End = 4 })
+                RawRequestedSpanCount = 1
+            },
+            [pscustomobject][ordered]@{
+                Path = "/src/toobig.cs"
+                Slices = @(); SiblingSlices = @(); RawSpans = @(); RawRequestedSpanCount = 1
             })
     }
-    $spanWatch = [Diagnostics.Stopwatch]::StartNew()
-    $runawayResult = Get-ReviewerConstructFilesFromReport -Report $runawaySpan
-    $spanWatch.Stop()
-    Assert-Replay ($spanWatch.ElapsedMilliseconds -lt 2000) `
-        "An unbounded hunk span must be clamped to the delivered image (took $($spanWatch.ElapsedMilliseconds) ms)."
-    Assert-Replay (@($runawayResult.UndeliveredPaths) -ccontains "src/a.cs") `
-        "A hunk reaching past what was delivered leaves the enumeration short, and that must be recorded."
+    $preSliceResult = Get-ReviewerConstructFilesFromReport -Report $preSliceOmission
+    Assert-Replay (@($preSliceResult.UndeliveredPaths) -ccontains "src/toobig.cs") `
+        "A file omitted before slicing has no RawSpans, and must still be reported as one the enumerator never saw."
 
     # -- 13. Repeated runs of one frozen input --------------------------------
     Write-Host "13/13 cross-run reconciliation" -ForegroundColor Cyan
@@ -1870,6 +1994,147 @@ try {
     )
     Assert-Replay (@(@($lineSplit.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0) `
         "Two runs pointing at neighbouring lines have not agreed on a comment."
+
+    # Every pairing of disagreeing readings must collapse, and none of them may
+    # leave a candidate eligible. Written out one by one rather than trusting a
+    # single representative case, because each takes a different route through
+    # the comparison: two named statuses, a named status against a degraded
+    # one, a row that is simply absent.
+    foreach ($pair in @(
+            @{ Name = "violation and compliant"; A = @{ S = "violation"; V = @("mi0"); C = @() }; B = @{ S = "compliant"; V = @(); C = @("mi0") } },
+            @{ Name = "violation and unknown"; A = @{ S = "violation"; V = @("mi0"); C = @() }; B = @{ S = "unknown"; V = @(); C = @() } },
+            @{ Name = "compliant and unknown"; A = @{ S = "compliant"; V = @(); C = @("mi0") }; B = @{ S = "unknown"; V = @(); C = @() } },
+            @{ Name = "violation and notApplicable"; A = @{ S = "violation"; V = @("mi0"); C = @() }; B = @{ S = "notApplicable"; V = @(); C = @() } })) {
+        # Both orders. A comparison that resolves differently depending on which
+        # run the operator happened to list first is not a reconciliation, it is
+        # a coin toss with extra steps.
+        foreach ($order in @(@("A", "B"), @("B", "A"))) {
+            $first = $pair[$order[0]]
+            $second = $pair[$order[1]]
+            $result = Resolve-ReviewerRunReconciliation -Manifests @(
+                (New-ReconRun -Nonce "n1" -Candidates @((New-ReconCandidate)) `
+                        -Rows @((New-ReconRow -Status $first.S -Violating $first.V -Compliant $first.C))),
+                (New-ReconRun -Nonce "n2" `
+                        -Rows @((New-ReconRow -Status $second.S -Violating $second.V -Compliant $second.C)))
+            )
+            $label = "$($pair.Name) [$($order -join '/')]"
+            Assert-Replay (@($result.rows)[0].reconciledStatus -ceq "unknown" -and -not [bool]@($result.rows)[0].stable) `
+                "$label must collapse to unknown."
+            Assert-Replay (@(@($result.rows)[0].violatingConstructs).Count -eq 0) `
+                "$label must not carry forward the anchors of whichever run found something."
+            Assert-Replay (@(@($result.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0) `
+                "$label must leave no candidate eligible."
+            Assert-Replay (@(@($result.rows)[0].rawStatuses) -ccontains $first.S -and
+                @(@($result.rows)[0].rawStatuses) -ccontains $second.S) `
+                "$label must disclose both raw readings."
+        }
+    }
+
+    # The two shapes that are not a disagreement between named statuses at all:
+    # a row one run never wrote, and a run that fell over.
+    $absentAndNamed = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow -Status "violation"), (New-ReconRow -Ref "rs1" -Source "core/rule-b"))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Status "violation"))))
+    Assert-Replay (@(@($absentAndNamed.rows) | Where-Object { $_.ruleRef -ceq "rs1" }).reconciledStatus -ceq "unknown") `
+        "A rule one run never wrote a row for cannot take the other run's answer."
+    $reversedAbsent = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow -Status "violation"))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Status "violation"), (New-ReconRow -Ref "rs1" -Source "core/rule-b"))))
+    Assert-Replay (@(@($reversedAbsent.rows) | Where-Object { $_.ruleRef -ceq "rs1" }).reconciledStatus -ceq "unknown") `
+        "Nor when it is the FIRST run missing the row - the reference must not become whichever run happened to have it."
+    $degradedPair = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow -Status "violation")) -Candidates @((New-ReconCandidate))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Status "violation")) -Candidates @((New-ReconCandidate)) -Status "degraded"))
+    Assert-Replay (-not [bool]$degradedPair.reconciled -and
+        @(@($degradedPair.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0) `
+        "A degraded run beside a clean one leaves nothing eligible, however well the two appear to agree."
+
+    # Three runs, dissenter first and dissenter last. Nothing may promote the
+    # two that matched, in either direction.
+    foreach ($order in @(@("violation", "violation", "compliant"), @("compliant", "violation", "violation"))) {
+        $manifests = @()
+        $nonce = 0
+        foreach ($status in $order) {
+            $nonce++
+            $manifests += (New-ReconRun -Nonce "n$nonce" -Rows @((New-ReconRow -Status $status `
+                            -Violating $(if ($status -ceq "violation") { @("mi0") } else { @() }) `
+                            -Compliant $(if ($status -ceq "violation") { @() } else { @("mi0") }))))
+        }
+        $threeWay = Resolve-ReviewerRunReconciliation -Manifests $manifests
+        Assert-Replay (@($threeWay.rows)[0].reconciledStatus -ceq "unknown") `
+            "Two of three agreeing is not a result, whichever position the dissenter is in ($($order -join ','))."
+    }
+
+    # Order independence, proved by hash rather than by inspection. The same
+    # sealed runs listed the other way round must produce the same outcome
+    # byte for byte, or "which run you list first" is a lever.
+    $forward = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow -Violating @("mi0"))) -Candidates @((New-ReconCandidate))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Violating @("mi1")))))
+    $backward = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Violating @("mi1")))),
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow -Violating @("mi0"))) -Candidates @((New-ReconCandidate))))
+    Assert-Replay ([string]$forward.reconciliationSha256 -ceq [string]$backward.reconciliationSha256) `
+        "Reversing the run order must not change the reconciliation digest."
+    Assert-Replay ([string]$forward.reconciliationSha256 -cmatch '^[0-9a-f]{64}$') `
+        "The reconciliation must carry a reproducible digest of its own outcome."
+    $settledPair = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow -Violating @("mi0")))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Violating @("mi0")))))
+    Assert-Replay ([string]$forward.reconciliationSha256 -cne [string]$settledPair.reconciliationSha256) `
+        "A different outcome must produce a different digest."
+
+    # The mechanism has to be able to say yes: an anchor every run calls
+    # violating, in a rule they all call violating, survives.
+    Assert-Replay (@($settledPair.rows)[0].reconciledStatus -ceq "violation" -and
+        [bool]@($settledPair.rows)[0].stable -and
+        @(@($settledPair.rows)[0].violatingConstructs) -ccontains "mi0") `
+        "An anchor every run calls violating must normalize to violation."
+
+    # Per-ANCHOR verdicts, which is the level a reader can act on. "The
+    # violating anchors differ" says two runs disagreed; it does not say which
+    # call they disagreed about.
+    $perAnchor = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow -Violating @("mi0") -Compliant @("mi1")))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Violating @("mi0") -Compliant @()))))
+    $anchorRows = @(@($perAnchor.rows)[0].anchors)
+    $anchorMi0 = @($anchorRows | Where-Object { $_.constructId -ceq "mi0" })
+    $anchorMi1 = @($anchorRows | Where-Object { $_.constructId -ceq "mi1" })
+    Assert-Replay ($anchorMi0.reconciledVerdict -ceq "violation" -and [bool]$anchorMi0.stable) `
+        "An anchor every run read the same way keeps that verdict."
+    Assert-Replay ($anchorMi1.reconciledVerdict -ceq "unknown" -and -not [bool]$anchorMi1.stable) `
+        "An anchor one run never accounted for is unknown, not the other run's answer."
+    Assert-Replay (@($anchorMi1.perRunVerdicts) -ccontains "unaccounted") `
+        "The per-run verdicts must show which run left the anchor unaccounted."
+    Assert-Replay (@($perAnchor.rows)[0].reconciledStatus -ceq "unknown") `
+        "One unsettled anchor makes the whole rule unknown, however the runs worded it."
+
+    # Candidate-anchor variation: same rule, same file, a different line. Two
+    # proposals, neither agreed.
+    $anchorVariation = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Line 478))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Line 479))))
+    Assert-Replay (@($anchorVariation.candidates).Count -eq 2 -and
+        @(@($anchorVariation.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0) `
+        "Candidates at different lines of the same rule are two proposals, neither agreed."
+
+    # The very same run object submitted twice is one observation in two hats.
+    $duplicateRun = New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate))
+    $duplicated = Resolve-ReviewerRunReconciliation -Manifests @($duplicateRun, $duplicateRun)
+    Assert-Replay (-not [bool]$duplicated.reconciled -and
+        @(@($duplicated.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0) `
+        "The same run twice must not reconcile, and must leave nothing eligible."
+
+    # Mixed schema: a construct table describing the same call differently.
+    $mixedSchema = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Constructs @(
+                [pscustomobject][ordered]@{
+                    constructId = "mi0"; kind = "invocation"; path = "src/a.cs"
+                    line = 12; endLine = 14; name = "AreEqual"; argumentNaming = "nnn"
+                })))
+    Assert-Replay (-not [bool]$mixedSchema.reconciled) `
+        "A construct table describing the same call differently is a different question."
 
     # One run is not a reconciliation, however clean it looks.
     $single = Resolve-ReviewerRunReconciliation -Manifests @((New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate))))
@@ -2015,7 +2280,7 @@ try {
         (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Source "core/rule-z")))
     )
     Assert-Replay (@($slotDrift.rows)[0].reconciledStatus -ceq "unknown" -and
-        @(@($slotDrift.rows)[0].disagreements) -clike "*different rule in this slot*") `
+        @(@($slotDrift.rows)[0].disagreements) -clike "*different rules in this slot*") `
         "Two runs whose rs0 is about different rules have not agreed about either."
 
     # One source legitimately transported under two refs is not a duplicate.

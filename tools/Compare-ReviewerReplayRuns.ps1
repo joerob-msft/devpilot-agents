@@ -21,10 +21,17 @@
     ./tools/Compare-ReviewerReplayRuns.ps1 -ArtifactPath run1.json, run2.json `
         -KeyPath ~/.devpilot/state/artifact-signing.key -OutputDirectory ./out
 #>
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = "Compare")]
 param(
-    [Parameter(Mandatory)][string[]]$ArtifactPath,
+    [Parameter(Mandatory, ParameterSetName = "Compare")][string[]]$ArtifactPath,
     [Parameter(Mandatory)][string[]]$KeyPath,
+    [Parameter(Mandatory, ParameterSetName = "Declare")][switch]$DeclareRunSet,
+    [Parameter(Mandatory, ParameterSetName = "Declare")][string]$SnapshotName,
+    [Parameter(Mandatory, ParameterSetName = "Declare")]
+    [ValidatePattern('^[0-9a-fA-F]{64}\z')][string]$SnapshotManifestDigest,
+    [Parameter(ParameterSetName = "Declare")][ValidateRange(2, 16)][int]$PlannedRunCount = 2,
+    [Parameter(ParameterSetName = "Declare")][string]$Purpose = "",
+    [string]$RunSetPath = "",
     [string]$OutputDirectory = "",
     [ValidateRange(2, 16)][int]$RequiredRunCount = 2,
     [switch]$FailOnDisagreement
@@ -98,6 +105,52 @@ foreach ($path in $keyPaths) {
 
 $manifests = @()
 $index = 0
+$declaredRuns = [System.Collections.Generic.List[object]]::new()
+
+# The qualification set is declared BEFORE the runs exist, and sealed. That is
+# the whole point: an operator who picks which runs to compare after seeing
+# their results has not reconciled anything, they have chosen an answer. The
+# declaration fixes the snapshot, the digest and how many runs will count, and
+# the comparison below refuses anything that does not match it.
+if ($DeclareRunSet) {
+    if (-not $OutputDirectory) { throw "-DeclareRunSet requires -OutputDirectory to write the sealed declaration into." }
+    if (-not (Test-Path -LiteralPath $OutputDirectory -PathType Container)) {
+        [void](New-Item -ItemType Directory -Path $OutputDirectory -Force)
+    }
+    $setId = [Guid]::NewGuid().ToString("N")
+    $declaration = [pscustomobject][ordered]@{
+        kind = $script:ReviewerRunReconciliationSetKind
+        artifactVersion = $script:ReviewerRunReconciliationVersion
+        status = "ok"
+        setId = $setId
+        snapshotName = $SnapshotName
+        snapshotManifestDigest = $SnapshotManifestDigest.ToLowerInvariant()
+        plannedRunCount = $PlannedRunCount
+        purpose = $Purpose
+        promotable = $false
+        declaredAt = [DateTime]::UtcNow.ToString("o")
+    }
+    $path = Save-ReviewerConventionSpecialistPreview -Directory $OutputDirectory `
+        -BaseName "runset-$setId" -Manifest $declaration -MasterKey $replayKeys[0]
+    Write-Host "Declared qualification run set $setId for snapshot '$SnapshotName' ($PlannedRunCount runs)." -ForegroundColor DarkCyan
+    Write-Host "Sealed declaration: $path" -ForegroundColor DarkCyan
+    Write-Output $path
+    exit 0
+}
+
+# Consuming a declaration: the snapshot and digest each run replayed must be
+# the ones that were named in advance, and there must be as many runs as were
+# planned. Fewer is a set somebody trimmed; more is a set somebody topped up.
+$runSet = $null
+if ($RunSetPath) {
+    $runSet = Read-ReviewerRunReconciliationSet -Path (Resolve-Path -LiteralPath $RunSetPath).ProviderPath -MasterKey $replayKeys[0]
+    if (@($ArtifactPath).Count -ne [int]$runSet.plannedRunCount) {
+        throw ("The declared run set $($runSet.setId) planned $([int]$runSet.plannedRunCount) run(s) but " +
+            "$(@($ArtifactPath).Count) artifact(s) were supplied. A set chosen after the fact is not a qualification.")
+    }
+    $RequiredRunCount = [int]$runSet.plannedRunCount
+}
+
 foreach ($path in @($ArtifactPath)) {
     $resolved = (Resolve-Path -LiteralPath $path).ProviderPath
     $key = $(if ($replayKeys.Count -eq 1) { $replayKeys[0] } else { $replayKeys[$index] })
@@ -106,12 +159,45 @@ foreach ($path in @($ArtifactPath)) {
     if ($null -eq $replay -or $null -eq $replay.Value) {
         throw "Artifact '$resolved' is not a replay artifact; live-run artifacts are not reconciled here."
     }
+    if ($null -ne $runSet) {
+        if ([string]$replay.Value.snapshotId -cne [string]$runSet.snapshotName -or
+            [string]$replay.Value.manifestDigest -cne [string]$runSet.snapshotManifestDigest) {
+            throw ("Artifact '$([IO.Path]::GetFileName($resolved))' replayed snapshot " +
+                "'$($replay.Value.snapshotId)' at digest $($replay.Value.manifestDigest), which is not the " +
+                "'$($runSet.snapshotName)' at $($runSet.snapshotManifestDigest) this run set declared.")
+        }
+    }
+    # The run set is declared, not discovered. Every artifact that went in is
+    # recorded by name, nonce and file hash, so a reader can tell whether the
+    # comparison covered the runs it should have - rather than trusting that
+    # nobody quietly left out the one that disagreed.
+    [void]$declaredRuns.Add([pscustomobject][ordered]@{
+            run = $declaredRuns.Count + 1
+            artifactName = [IO.Path]::GetFileName($resolved)
+            artifactSha256 = (Get-FileHash -LiteralPath $resolved -Algorithm SHA256).Hash.ToLowerInvariant()
+            replayNonce = [string]$replay.Value.replayNonce
+        })
     $manifests += $manifest
     $index++
 }
 
 $reconciliation = Resolve-ReviewerRunReconciliation -Manifests $manifests -RequiredRunCount $RequiredRunCount
-$report = Format-ReviewerRunReconciliationReport -Reconciliation $reconciliation
+# The declared run set goes in the report, so a reader can see which runs the
+# comparison actually covered rather than trusting that nobody quietly dropped
+# the one that disagreed.
+$setLines = @("", "## Declared run set", "")
+if ($null -ne $runSet) {
+    $setLines += "Predeclared set $($runSet.setId), sealed $($runSet.declaredAt): snapshot '$($runSet.snapshotName)' at $($runSet.snapshotManifestDigest), $([int]$runSet.plannedRunCount) run(s)."
+    $setLines += ""
+}
+else { $setLines += "No predeclared set; these runs were chosen by the operator at comparison time."; $setLines += "" }
+foreach ($declared in @($declaredRuns.ToArray())) {
+    $setLines += "- run $($declared.run): $($declared.artifactName) nonce $($declared.replayNonce) sha256 $($declared.artifactSha256)"
+}
+$report = (Format-ReviewerRunReconciliationReport -Reconciliation $reconciliation) -replace "`r`n", "`n"
+$insertAt = $report.IndexOf("`n## Rules", [StringComparison]::Ordinal)
+if ($insertAt -ge 0) { $report = $report.Substring(0, $insertAt) + "`n" + ($setLines -join "`n") + $report.Substring($insertAt) }
+else { $report = $report + "`n" + ($setLines -join "`n") }
 
 if ($OutputDirectory) {
     if (-not (Test-Path -LiteralPath $OutputDirectory -PathType Container)) {
@@ -131,6 +217,7 @@ if ($OutputDirectory) {
             artifactVersion = $script:ReviewerRunReconciliationVersion
             status = "ok"
             reconciliation = $reconciliation
+            declaredRunSet = @($declaredRuns.ToArray())
             reportPath = $reportPath
             reportSha256 = Get-ReviewerConventionSpecialistSha256 -Text $report
             promotable = $false
