@@ -119,7 +119,8 @@
           "additionalProperties": false,
           "required": [
             "evidenceFactId", "path", "declarationCount",
-            "attributeFrequency", "attributeCountsComplete", "generatedCode"
+            "attributeFrequency", "attributeCountsComplete", "generatedCode",
+            "wholeFileComplete", "wholeFileLineCount", "wholeFileSha256"
           ],
           "properties": {
             "evidenceFactId": { "type": "string", "pattern": "^rdf1:[0-9a-f]{64}$" },
@@ -138,7 +139,10 @@
               }
             },
             "attributeCountsComplete": { "type": "boolean" },
-            "generatedCode": { "type": "boolean" }
+            "generatedCode": { "type": "boolean" },
+            "wholeFileComplete": { "type": "boolean" },
+            "wholeFileLineCount": { "type": "integer", "minimum": 0 },
+            "wholeFileSha256": { "$ref": "#/$defs/sha256" }
           }
         }
       ]

@@ -1120,6 +1120,61 @@ function Test-ReviewerVerificationForbiddenText {
     return $Text -match '(?i)(recommendedVote|approveWithSuggestions|waitForAuthor|approvedVote|"vote"\s*:|"comment"\s*:|"write"\s*:)'
 }
 
+function Get-ReviewerVerificationDeterministicFacts {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Candidates,
+        $FactPlan = $null,
+        [ValidateRange(1, 32)][int]$MaxFactIds = 16,
+        [ValidateRange(1024, 65536)][int]$MaxCanonicalBytes = 32768
+    )
+    $requested = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $includeMetadata = $false
+    foreach ($candidate in $Candidates) {
+        if ([string](Get-ReviewerVerificationValue $candidate "anchorKind" "") -ceq "prMetadata") {
+            $includeMetadata = $true
+        }
+        foreach ($text in @(
+                [string](Get-ReviewerVerificationValue $candidate "factIds" ""),
+                [string](Get-ReviewerVerificationValue (
+                        Get-ReviewerVerificationValue $candidate "changedCodeFix" $null) "evidenceFactIds" ""))) {
+            $ids = @($text -split ',' | Where-Object { $_ })
+            $seenSubset = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            if ($ids.Count -gt 8) { throw "A verifier fact subset exceeded the 8-ID bound." }
+            foreach ($id in $ids) {
+                if ($id -cnotmatch '^rf1:[0-9a-f]{64}$' -or -not $seenSubset.Add($id)) {
+                    throw "A verifier fact subset contains a malformed or duplicate ID."
+                }
+                [void]$requested.Add($id)
+            }
+        }
+    }
+    $factMap = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($fact in @(Get-ReviewerVerificationValue $FactPlan "facts" @())) {
+        $id = [string](Get-ReviewerVerificationValue $fact "id" "")
+        if (-not $id -or $factMap.ContainsKey($id)) {
+            throw "The verifier fact plan contains a missing or duplicate ID."
+        }
+        $factMap.Add($id, $fact)
+        if ($includeMetadata -and [string](Get-ReviewerVerificationValue $fact "domain" "") -ceq "metadata") {
+            [void]$requested.Add($id)
+        }
+    }
+    if ($requested.Count -gt $MaxFactIds) {
+        throw "Verification deterministic-fact union exceeded the $MaxFactIds-ID bound."
+    }
+    foreach ($id in $requested) {
+        if (-not $factMap.ContainsKey($id)) { throw "A verifier fact subset cites an invented or missing ID." }
+    }
+    $facts = @((Get-ReviewerVerificationValue $FactPlan "facts" @()) | Where-Object {
+            $requested.Contains([string](Get-ReviewerVerificationValue $_ "id" ""))
+        })
+    $canonical = ConvertTo-ReviewerVerificationCanonicalArray -Items $facts
+    if ($script:ReviewerVerificationUtf8.GetByteCount($canonical) -gt $MaxCanonicalBytes) {
+        throw "Verification deterministic facts exceeded the $MaxCanonicalBytes-byte bound."
+    }
+    return $facts
+}
+
 function Get-ReviewerVerificationEvidenceOptions {
     param(
         [Parameter(Mandatory)]$Candidate,
@@ -1137,18 +1192,22 @@ function Get-ReviewerVerificationEvidenceOptions {
     if ($hunk.Count -eq 1 -and
         [string](Get-ReviewerVerificationValue $hunk[0] "sha256" "") -match '^[0-9a-f]{64}$') {
         [void]$options.Add([pscustomobject][ordered]@{
+                purpose = "candidate"
                 kind = "diffHunk"
                 sha256 = [string](Get-ReviewerVerificationValue $hunk[0] "sha256" "")
                 factIds = ""
+                evidenceFactId = ""
                 duplicateTargetId = ""
             })
     }
     $quote = [string](Get-ReviewerVerificationValue $Candidate "ruleQuote" "")
     if ($quote) {
         [void]$options.Add([pscustomobject][ordered]@{
+                purpose = "candidate"
                 kind = "sourceQuote"
                 sha256 = Get-ReviewerVerificationSha256 -Text $quote
                 factIds = ""
+                evidenceFactId = ""
                 duplicateTargetId = ""
             })
     }
@@ -1160,9 +1219,11 @@ function Get-ReviewerVerificationEvidenceOptions {
     }
     if ($siblingText) {
         [void]$options.Add([pscustomobject][ordered]@{
+                purpose = "candidate"
                 kind = "sibling"
                 sha256 = Get-ReviewerVerificationSha256 -Text $siblingText
                 factIds = ""
+                evidenceFactId = ""
                 duplicateTargetId = ""
             })
     }
@@ -1180,10 +1241,12 @@ function Get-ReviewerVerificationEvidenceOptions {
         }
         if ($facts.Count -eq $candidateFactIds.Count) {
             [void]$options.Add([pscustomobject][ordered]@{
+                    purpose = "candidate"
                     kind = "deterministicFact"
                     sha256 = Get-ReviewerVerificationSha256 -Text (
                         ConvertTo-ReviewerVerificationCanonicalArray -Items $facts.ToArray())
                     factIds = ($candidateFactIds -join ",")
+                    evidenceFactId = ""
                     duplicateTargetId = ""
                 })
         }
@@ -1196,12 +1259,63 @@ function Get-ReviewerVerificationEvidenceOptions {
             }
             $factId = [string](Get-ReviewerVerificationValue $fact "id" "")
             [void]$options.Add([pscustomobject][ordered]@{
+                    purpose = "candidate"
                     kind = "deterministicFact"
                     sha256 = Get-ReviewerVerificationSha256 -Text (
                         ConvertTo-ReviewerVerificationCanonicalArray -Items @($fact))
                     factIds = $factId
+                    evidenceFactId = ""
                     duplicateTargetId = ""
                 })
+        }
+    }
+    if ([string](Get-ReviewerVerificationValue $Candidate "originKind" "") -ceq "convention") {
+        $changedFix = Get-ReviewerVerificationValue $Candidate "changedCodeFix" $null
+        $changedValueSource = [string](Get-ReviewerVerificationValue $changedFix "valueSource" "")
+        $changedFactText = [string](Get-ReviewerVerificationValue $changedFix "evidenceFactIds" "")
+        if ($changedValueSource -ceq "authoritativeRule" -and $quote) {
+            [void]$options.Add([pscustomobject][ordered]@{
+                    purpose = "changedCodeFix"; kind = "sourceQuote"
+                    sha256 = Get-ReviewerVerificationSha256 -Text $quote
+                    factIds = ""; evidenceFactId = ""; duplicateTargetId = ""
+                })
+        }
+        elseif ($changedValueSource -ceq "deterministicFact") {
+            $changedFactIds = @($changedFactText -split ',' | Where-Object { $_ })
+            $uniqueChangedFactIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            $changedFacts = [System.Collections.Generic.List[object]]::new()
+            $validChangedSubset = ($changedFactIds.Count -gt 0 -and $changedFactIds.Count -le 8)
+            foreach ($factId in $changedFactIds) {
+                if (-not $uniqueChangedFactIds.Add($factId) -or -not $factMap.ContainsKey($factId) -or
+                    [string](Get-ReviewerVerificationValue $factMap[$factId] "state" "") -notin @("true", "false")) {
+                    $validChangedSubset = $false
+                    continue
+                }
+                [void]$changedFacts.Add($factMap[$factId])
+            }
+            if ($validChangedSubset -and $changedFacts.Count -eq $changedFactIds.Count) {
+                [void]$options.Add([pscustomobject][ordered]@{
+                        purpose = "changedCodeFix"; kind = "deterministicFact"
+                        sha256 = Get-ReviewerVerificationSha256 -Text (
+                            ConvertTo-ReviewerVerificationCanonicalArray -Items $changedFacts.ToArray())
+                        factIds = ($changedFactIds -join ",")
+                        evidenceFactId = ""; duplicateTargetId = ""
+                    })
+            }
+        }
+        $debtFollowUp = Get-ReviewerVerificationValue $Candidate "existingDebtFollowUp" $null
+        $debtEvidence = Get-ReviewerVerificationValue $Candidate "existingDebtEvidence" $null
+        if ([string](Get-ReviewerVerificationValue $debtFollowUp "status" "") -ceq "required" -and
+            $null -ne $debtEvidence) {
+            $debtFactId = [string](Get-ReviewerVerificationValue $debtFollowUp "evidenceFactId" "")
+            if ($debtFactId -cmatch '^rdf1:[0-9a-f]{64}$' -and
+                [string](Get-ReviewerVerificationValue $debtEvidence "evidenceFactId" "") -ceq $debtFactId) {
+                [void]$options.Add([pscustomobject][ordered]@{
+                        purpose = "existingDebtFollowUp"; kind = "debtCensus"
+                        sha256 = Get-ReviewerVerificationObjectSha256 -Value $debtEvidence
+                        factIds = ""; evidenceFactId = $debtFactId; duplicateTargetId = ""
+                    })
+            }
         }
     }
     foreach ($thread in @($ThreadFacts)) {
@@ -1213,9 +1327,11 @@ function Get-ReviewerVerificationEvidenceOptions {
         $contentSha = [string](Get-ReviewerVerificationValue $thread "contentSha256" "")
         if ($threadId -and $contentSha -match '^[0-9a-f]{64}$') {
             [void]$options.Add([pscustomobject][ordered]@{
+                    purpose = "candidate"
                     kind = "existingThread"
                     sha256 = $contentSha
                     factIds = ""
+                    evidenceFactId = ""
                     duplicateTargetId = "thread:$threadId"
                 })
         }
@@ -1227,9 +1343,11 @@ function Get-ReviewerVerificationEvidenceOptions {
                 [string](Get-ReviewerVerificationValue $Candidate "candidateId" "") -and
                 $siblingHash -match '^[0-9a-f]{64}$') {
                 [void]$options.Add([pscustomobject][ordered]@{
+                        purpose = "candidate"
                         kind = "siblingCandidate"
                         sha256 = $siblingHash
                         factIds = ""
+                        evidenceFactId = ""
                         duplicateTargetId = $siblingId
                     })
         }
@@ -1418,6 +1536,7 @@ function Resolve-ReviewerVerificationDecisions {
                     -SiblingCandidates @(Get-ReviewerVerificationValue $cluster "members" @()) `
                     -ExistingThreadJaccard $ExistingThreadJaccard)
                 $matchingEvidence = @($evidenceOptions | Where-Object {
+                        [string](Get-ReviewerVerificationValue $_ "purpose" "") -ceq "candidate" -and
                         [string](Get-ReviewerVerificationValue $_ "kind" "") -ceq $evidenceKind -and
                         [string]::Equals(
                             [string](Get-ReviewerVerificationValue $_ "sha256" ""),
@@ -1527,30 +1646,21 @@ function Resolve-ReviewerVerificationDecisions {
             $debtOutcome = [string](Get-ReviewerVerificationValue $verdict "existingDebtFollowUpOutcome" "")
             $retainDebtFollowUp = $false
             if ($originKind -ceq "convention") {
+                $partEvidenceOptions = @(Get-ReviewerVerificationEvidenceOptions -Candidate $candidate `
+                    -FactPlan $FactPlan -ThreadFacts $ThreadFacts -EvidenceHunks $EvidenceHunks `
+                    -SiblingCandidates @(Get-ReviewerVerificationValue $cluster "members" @()) `
+                    -ExistingThreadJaccard $ExistingThreadJaccard)
                 $changedValueSource = [string](Get-ReviewerVerificationValue $changedFix "valueSource" "")
                 $expectedChangedFactIds = [string](Get-ReviewerVerificationValue $changedFix "evidenceFactIds" "")
-                $expectedChangedSha = if ($changedValueSource -ceq "authoritativeRule") {
-                    Get-ReviewerVerificationSha256 -Text ([string]$candidate.ruleQuote)
-                }
-                else {
-                    $changedFacts = [System.Collections.Generic.List[object]]::new()
-                    $changedFactsDeterministic = $true
-                    foreach ($factId in @($expectedChangedFactIds -split ',' | Where-Object { $_ })) {
-                        if ($factMap.ContainsKey($factId) -and
-                            [string](Get-ReviewerVerificationValue $factMap[$factId] "state" "") -in
-                                @("true", "false")) {
-                            [void]$changedFacts.Add($factMap[$factId])
-                        }
-                        else { $changedFactsDeterministic = $false }
-                    }
-                    if ($changedFactsDeterministic -and
-                        $changedFacts.Count -eq @($expectedChangedFactIds -split ',' | Where-Object { $_ }).Count) {
-                        Get-ReviewerVerificationSha256 -Text (
-                            ConvertTo-ReviewerVerificationCanonicalArray -Items $changedFacts.ToArray())
-                    }
-                    else { "" }
-                }
+                $changedOptions = @($partEvidenceOptions | Where-Object {
+                        [string](Get-ReviewerVerificationValue $_ "purpose" "") -ceq "changedCodeFix" -and
+                        [string](Get-ReviewerVerificationValue $_ "factIds" "") -ceq $expectedChangedFactIds
+                    })
+                $expectedChangedSha = if ($changedOptions.Count -eq 1) {
+                    [string](Get-ReviewerVerificationValue $changedOptions[0] "sha256" "")
+                } else { "" }
                 if ($changedFixOutcome -cne "supported" -or
+                    $changedOptions.Count -ne 1 -or
                     [string](Get-ReviewerVerificationValue $verdict "changedCodeFixEvidenceSha256" "") -cne
                         $expectedChangedSha -or
                     [string](Get-ReviewerVerificationValue $verdict "changedCodeFixFactIds" "") -cne
@@ -1578,10 +1688,15 @@ function Resolve-ReviewerVerificationDecisions {
                 elseif ($debtStatus -ceq "required") {
                     $debtEvidence = Get-ReviewerVerificationValue $candidate "existingDebtEvidence" $null
                     $expectedDebtFactId = [string](Get-ReviewerVerificationValue $debtFollowUp "evidenceFactId" "")
-                    $expectedDebtSha = $(if ($null -eq $debtEvidence) { "" } else {
-                            Get-ReviewerVerificationObjectSha256 -Value $debtEvidence
+                    $debtOptions = @($partEvidenceOptions | Where-Object {
+                            [string](Get-ReviewerVerificationValue $_ "purpose" "") -ceq "existingDebtFollowUp" -and
+                            [string](Get-ReviewerVerificationValue $_ "evidenceFactId" "") -ceq $expectedDebtFactId
                         })
+                    $expectedDebtSha = if ($debtOptions.Count -eq 1) {
+                        [string](Get-ReviewerVerificationValue $debtOptions[0] "sha256" "")
+                    } else { "" }
                     $retainDebtFollowUp = ($debtOutcome -ceq "supported" -and
+                        $debtOptions.Count -eq 1 -and
                         [string](Get-ReviewerVerificationValue $verdict "existingDebtEvidenceSha256" "") -ceq
                             $expectedDebtSha -and
                         [string](Get-ReviewerVerificationValue $verdict "existingDebtEvidenceFactId" "") -ceq

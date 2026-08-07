@@ -8010,6 +8010,21 @@ function Get-ReviewerConstructFilesFromReport {
                 [void]$deliveredLines.Add($lineNumber)
             }
         }
+        $wholeFileLineCount = [int](Get-ReviewerHashValue -Container $file -Key "LineCount" -Default 0)
+        $wholeFileSha256 = [string](Get-ReviewerHashValue -Container $file -Key "FileSha256" -Default "")
+        $wholeFileComplete = (
+            [string](Get-ReviewerHashValue -Container $file -Key "Status" -Default "") -ceq "delivered" -and
+            -not [string](Get-ReviewerHashValue -Container $file -Key "Reason" -Default "") -and
+            $wholeFileLineCount -gt 0 -and $wholeFileSha256 -cmatch '^[0-9a-f]{64}$' -and
+            $deliveredLines.Count -eq $wholeFileLineCount)
+        if ($wholeFileComplete) {
+            for ($lineNumber = 1; $lineNumber -le $wholeFileLineCount; $lineNumber++) {
+                if (-not $deliveredLines.Contains($lineNumber)) {
+                    $wholeFileComplete = $false
+                    break
+                }
+            }
+        }
         # The pull request's OWN hunks, intersected with what was delivered - not
         # the whole slice. A slice is a hunk plus a context radius, so treating
         # every delivered line as changed would hand the model sixty untouched
@@ -8071,6 +8086,9 @@ function Get-ReviewerConstructFilesFromReport {
                 Lines = $lines
                 ChangedLines = $changedLines.ToArray()
                 DeliveredLines = @($deliveredLines)
+                WholeFileLineCount = $wholeFileLineCount
+                WholeFileSha256 = $wholeFileSha256
+                WholeFileComplete = $wholeFileComplete
             })
         # Delivered, but only in part: the hunks that fell outside the delivered
         # lines contributed nothing either, and the enumerator cannot tell the
@@ -9534,20 +9552,8 @@ function Invoke-ReviewerCrossVerificationPass {
                             -ExistingThreadJaccard ([double]$EffectiveCrossVerificationPolicy.existingThreadJaccard)
                     }).Count -gt 0
             })
-        $relevantFactIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-        foreach ($assignedCandidate in $assignedCandidates) {
-            foreach ($factId in @(([string]$assignedCandidate.factIds) -split ',' | Where-Object { $_ })) {
-                [void]$relevantFactIds.Add($factId)
-            }
-        }
-        $relevantFacts = @($factPlan.facts | Where-Object {
-                $fact = $_
-                $factId = [string]$fact.id
-                $relevantFactIds.Contains($factId) -or
-                (@($assignedCandidates | Where-Object {
-                            [string]$_.anchorKind -ceq "prMetadata"
-                        }).Count -gt 0 -and [string]$fact.domain -ceq "metadata")
-            })
+        $relevantFacts = @(Get-ReviewerVerificationDeterministicFacts `
+            -Candidates $assignedCandidates -FactPlan $factPlan)
         $eligibleSiblingCandidates = @($cluster.members | Where-Object {
                 [string]$_.originModel -cne $verifierModel
             })

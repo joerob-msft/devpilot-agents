@@ -318,15 +318,17 @@ $emptyConstructErrors = [string[]](Get-ReviewerConventionSpecialistRemediationEr
         -Candidate $candidate -Constructs @())
 Assert-Specialist ($emptyConstructErrors.Count -gt 0) `
     "A changed-file remediation target was accepted without a sealed construct table."
-$debtFactId = "rdf1:" + ("7" * 64)
 $debtConstructs = @([pscustomobject][ordered]@{
         constructId = "dc0"; kind = "declaration"; path = "src/a.cs"; line = 12; endLine = 12
     })
 $debtFiles = @([pscustomobject][ordered]@{
-        evidenceFactId = $debtFactId; path = "src/a.cs"; declarationCount = 38
+        evidenceFactId = ""; path = "src/a.cs"; declarationCount = 38
         attributeFrequency = @([pscustomobject]@{ attribute = "TestCase"; declarations = 38 })
         attributeCountsComplete = $true; generatedCode = $false
+        wholeFileComplete = $true; wholeFileLineCount = 152; wholeFileSha256 = ("8" * 64)
     })
+$debtFactId = Get-ReviewerConventionSpecialistDebtEvidenceFactId -Evidence $debtFiles[0]
+$debtFiles[0].evidenceFactId = $debtFactId
 $systematicDebt = Copy-SpecialistObject $candidate
 $systematicDebt.changedCodeFix.targets = "dc0"
 $systematicDebt.changedCodeFix.conventionKey = "RequiredAnnotation"
@@ -347,6 +349,12 @@ foreach ($debtCase in @(
             } },
         @{ Name = "incomplete deterministic count"; Apply = {
                 param($c, $f) $f[0].attributeCountsComplete = $false
+            } },
+        @{ Name = "mutated whole-file completeness"; Apply = {
+                param($c, $f) $f[0].wholeFileComplete = $false
+            } },
+        @{ Name = "mutated whole-file digest"; Apply = {
+                param($c, $f) $f[0].wholeFileSha256 = ("9" * 64)
             } },
         @{ Name = "unrelated scope"; Apply = {
                 param($c, $f) $c.existingDebtFollowUp.scopePath = "src/other.cs"
