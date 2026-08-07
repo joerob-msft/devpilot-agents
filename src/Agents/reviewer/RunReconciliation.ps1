@@ -101,6 +101,31 @@ $script:ReviewerRunReconciliationRequiredFields = @(
     "artifactVersion", "kind"
 )
 
+function Add-ReviewerRunReconciliationProblem {
+    <#
+        Records a problem as a structure, not a sentence.
+
+        The digest has to be the same whichever order the runs were listed in,
+        and a sentence carrying "run 3" is not - so the digest used to rewrite
+        positions into nonces by substring surgery. That is wrong twice: a
+        group written in input order still differs, and any "run 1" the text
+        did not put there gets rewritten too. The `Code` and the run NONCES are
+        what the digest reads; the sentence is only ever shown to a person.
+    #>
+    param(
+        [Parameter(Mandatory)]$Problems,
+        [Parameter(Mandatory)][string]$Code,
+        [AllowEmptyCollection()][int[]]$Runs = @(),
+        [Parameter(Mandatory)][string]$Text
+    )
+    [void]$Problems.Add([pscustomobject][ordered]@{ code = $Code; runs = @($Runs); text = $Text })
+}
+
+function Get-ReviewerRunReconciliationProblemText {
+    param([AllowNull()]$Problems)
+    return , [string[]]@(@($Problems) | ForEach-Object { [string]$_.text })
+}
+
 function Get-ReviewerRunReconciliationValue {
     param([AllowNull()]$Object, [Parameter(Mandatory)][string]$Name, [AllowNull()]$Default = $null)
     if ($null -eq $Object) { return $Default }
@@ -236,7 +261,7 @@ function Resolve-ReviewerRunReconciliation {
     if ($runs.Count -lt 1) { throw "Reconciliation needs at least one run manifest." }
     if ($runs.Count -gt 16) { throw "Reconciliation accepts at most 16 run manifests." }
 
-    $problems = [System.Collections.Generic.List[string]]::new()
+    $problems = [System.Collections.Generic.List[object]]::new()
     $runSummaries = [System.Collections.Generic.List[object]]::new()
 
     # Same question, asked more than once. Two conditions, and they pull in
@@ -266,21 +291,21 @@ function Resolve-ReviewerRunReconciliation {
         # Two runs with no binding at all would compare equal, which is the one
         # way an empty manifest reconciles with anything.
         if (@($bindingResult.Missing).Count -gt 0) {
-            [void]$problems.Add("run $runIndex is missing binding fields: " + (@($bindingResult.Missing) -join ", "))
+            Add-ReviewerRunReconciliationProblem -Problems $problems -Code "missingBindingFields" -Runs @($runIndex) -Text ("run $runIndex is missing binding fields: " + (@($bindingResult.Missing) -join ", "))
         }
         $replay = Get-ReviewerRunReconciliationValue $manifest "replay" $null
         $nonce = [string](Get-ReviewerRunReconciliationValue $replay "replayNonce" "")
-        if (-not $nonce) { [void]$problems.Add("run $runIndex is not a replay artifact and carries no nonce") }
-        elseif (-not $nonces.Add($nonce)) { [void]$problems.Add("run $runIndex reuses the nonce of an earlier run") }
+        if (-not $nonce) { Add-ReviewerRunReconciliationProblem -Problems $problems -Code "noNonce" -Runs @($runIndex) -Text "run $runIndex is not a replay artifact and carries no nonce" }
+        elseif (-not $nonces.Add($nonce)) { Add-ReviewerRunReconciliationProblem -Problems $problems -Code "nonceReused" -Runs @($runIndex) -Text "run $runIndex reuses the nonce of an earlier run" }
         if ($null -ne $replay -and [bool](Get-ReviewerRunReconciliationValue $replay "promotable" $false)) {
-            [void]$problems.Add("run $runIndex claims to be promotable")
+            Add-ReviewerRunReconciliationProblem -Problems $problems -Code "claimsPromotable" -Runs @($runIndex) -Text "run $runIndex claims to be promotable"
         }
         $status = [string](Get-ReviewerRunReconciliationValue $manifest "status" "")
-        if ($status -cne $script:ReviewerRunReconciliationOkStatus) {
-            [void]$problems.Add("run $runIndex finished $status rather than $($script:ReviewerRunReconciliationOkStatus)")
+        if ([string]::CompareOrdinal($status, $script:ReviewerRunReconciliationOkStatus) -ne 0) {
+            Add-ReviewerRunReconciliationProblem -Problems $problems -Code "notComplete:$status" -Runs @($runIndex) -Text "run $runIndex finished $status rather than $($script:ReviewerRunReconciliationOkStatus)"
         }
         $coverage = Get-ReviewerRunReconciliationValue $manifest "ruleCoverage" $null
-        if ($null -eq $coverage) { [void]$problems.Add("run $runIndex has no rule accounting to reconcile") }
+        if ($null -eq $coverage) { Add-ReviewerRunReconciliationProblem -Problems $problems -Code "noAccounting" -Runs @($runIndex) -Text "run $runIndex has no rule accounting to reconcile" }
         $complete = [bool](Get-ReviewerRunReconciliationValue $coverage "complete" $false)
         # A hole agrees with everything. A rule NO row covered never enters the
         # comparison at all - it is not a disagreement, it is an absence, and
@@ -298,14 +323,14 @@ function Resolve-ReviewerRunReconciliation {
                 @{ Field = "unaccountedCandidates"; Text = "proposed candidates with no accounting row:" })) {
             $ids = @(Get-ReviewerRunReconciliationValue $coverage $hole.Field @())
             if ($ids.Count -gt 0) {
-                [void]$problems.Add("run $runIndex $($hole.Text) " + ((@($ids) | Select-Object -First 8) -join ", "))
+                Add-ReviewerRunReconciliationProblem -Problems $problems -Code "hole:$($hole.Field)" -Runs @($runIndex) -Text ("run $runIndex $($hole.Text) " + ((@($ids) | Select-Object -First 8) -join ", "))
             }
         }
         if ($null -ne $coverage -and [bool](Get-ReviewerRunReconciliationValue $coverage "constructsIncomplete" $false)) {
             # A short anchor table means both runs were asked about less code
             # than the change set contains, so agreement between them is
             # agreement about a subset nobody chose.
-            [void]$problems.Add("run $runIndex enumerated an incomplete construct table")
+            Add-ReviewerRunReconciliationProblem -Problems $problems -Code "constructsIncomplete" -Runs @($runIndex) -Text "run $runIndex enumerated an incomplete construct table"
         }
         # And the last term of the wrapper's own `Complete`: a pass where every
         # rule ruled every anchor out of reach is clean row by row and has
@@ -313,7 +338,7 @@ function Resolve-ReviewerRunReconciliation {
         $enumerated = [int](Get-ReviewerRunReconciliationValue $coverage "enumeratedConstructCount" 0)
         $checked = [int](Get-ReviewerRunReconciliationValue $coverage "checkedConstructCount" 0)
         if ($null -ne $coverage -and $enumerated -gt 0 -and $checked -eq 0) {
-            [void]$problems.Add("run $runIndex weighed none of its $enumerated anchors")
+            Add-ReviewerRunReconciliationProblem -Problems $problems -Code "weighedNothing" -Runs @($runIndex) -Text "run $runIndex weighed none of its $enumerated anchors"
         }
         [void]$runSummaries.Add([pscustomobject][ordered]@{
                 run = $runIndex
@@ -336,15 +361,19 @@ function Resolve-ReviewerRunReconciliation {
         # Members named by NONCE and sorted, not by position. A group written as
         # "{run 3, run 4}" says something different when the operator lists the
         # same runs the other way round, and that difference reached the digest.
+        $groupRuns = [System.Collections.Generic.List[int]]::new()
         $groupText = @(@($sortedBindings) | ForEach-Object {
                 $members = @(@($bindingGroups[$_]) | ForEach-Object {
+                        [void]$groupRuns.Add($_)
                         $nonce = [string]@($runSummaries.ToArray())[$_ - 1].replayNonce
                         $(if ($nonce) { $nonce } else { "unidentified" })
                     })
                 [Array]::Sort($members, [StringComparer]::Ordinal)
                 "{" + ((@($members) | ForEach-Object { "run:" + $_ }) -join ", ") + "} at " + $_.Substring(0, 12)
             })
-        [void]$problems.Add("the runs were produced from $(@($sortedBindings).Count) different inputs: " + ($groupText -join "; "))
+        Add-ReviewerRunReconciliationProblem -Problems $problems -Code "mixedInputs:$(@($sortedBindings).Count)" `
+            -Runs @($groupRuns.ToArray()) `
+            -Text ("the runs were produced from $(@($sortedBindings).Count) different inputs: " + ($groupText -join "; "))
     }
 
     # Index each run's rows by `ruleRef`. That is a POSITION in the request
@@ -372,7 +401,7 @@ function Resolve-ReviewerRunReconciliation {
             # duplicate check upstream; here it just means we cannot line the
             # rows up, so treat the second as a disagreement with the first.
             if ($index.ContainsKey($key)) {
-                [void]$problems.Add("a run accounted for rule '$key' more than once")
+                Add-ReviewerRunReconciliationProblem -Problems $problems -Code "duplicateRuleRow" -Runs @() -Text "a run accounted for rule '$key' more than once"
                 continue
             }
             $index[$key] = $row
@@ -411,10 +440,12 @@ function Resolve-ReviewerRunReconciliation {
         $rawStatuses = [System.Collections.Generic.List[string]]::new()
         $readings = [System.Collections.Generic.List[object]]::new()
         $disagreements = [System.Collections.Generic.List[string]]::new()
-        $anchorVerdicts = @{}
+        $anchorVerdicts = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
         $anchorIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         $distinctStatuses = [System.Collections.Generic.List[string]]::new()
+        $distinctStatusSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         $distinctRules = [System.Collections.Generic.List[string]]::new()
+        $distinctRuleSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         $anyAbsent = $false
 
         for ($i = 0; $i -lt $byRun.Count; $i++) {
@@ -451,14 +482,21 @@ function Resolve-ReviewerRunReconciliation {
             # empty string, which prints as a row that agreed about nothing.
             $statusWord = $(if ($reading.status) { $reading.status } else { "(none)" })
             [void]$rawStatuses.Add($statusWord)
-            if ($distinctStatuses -cnotcontains $statusWord) { [void]$distinctStatuses.Add($statusWord) }
+            # Ordinal sets, not `-cnotcontains`. PowerShell's case-sensitive
+            # operators are still CULTURE-sensitive, so a zero-weight character
+            # - a soft hyphen, a zero-width space, the separator itself -
+            # compares equal to nothing, and two different identities collapse
+            # into one, silencing the disagreement they should have raised.
+            if ($distinctStatusSet.Add($statusWord)) { [void]$distinctStatuses.Add($statusWord) }
             $ruleIdentity = $reading.ruleSourceId + $script:ReviewerRunReconciliationSeparator + $reading.ruleSourceSha256
-            if ($distinctRules -cnotcontains $ruleIdentity) { [void]$distinctRules.Add($ruleIdentity) }
+            if ($distinctRuleSet.Add($ruleIdentity)) { [void]$distinctRules.Add($ruleIdentity) }
 
             foreach ($verdict in @($verdictFields.Keys)) {
                 foreach ($id in @($reading.($verdictFields[$verdict]))) {
                     [void]$anchorIds.Add($id)
-                    if (-not $anchorVerdicts.ContainsKey($id)) { $anchorVerdicts[$id] = @{} }
+                    if (-not $anchorVerdicts.ContainsKey($id)) {
+                        $anchorVerdicts[$id] = [System.Collections.Generic.Dictionary[int, string]]::new()
+                    }
                     # A run that files one id under two verdicts already failed
                     # the wrapper's disjointness check; here it simply cannot be
                     # a single reading, so record the conflict.
@@ -472,7 +510,6 @@ function Resolve-ReviewerRunReconciliation {
             }
         }
 
-        if ($anyAbsent) { }
         if (@($distinctRules).Count -gt 1) {
             [void]$disagreements.Add("the runs accounted for different rules in this slot: " +
                 (@(@($distinctRules) | ForEach-Object { ($_ -split $script:ReviewerRunReconciliationSeparator)[0] }) -join " vs "))
@@ -480,7 +517,7 @@ function Resolve-ReviewerRunReconciliation {
         if (@($distinctStatuses).Count -gt 1 -or $anyAbsent) {
             [void]$disagreements.Add("the runs read this rule as " + ((@($rawStatuses) | Sort-Object -Unique) -join " / "))
         }
-        if (@($distinctStatuses) -ccontains "(none)") {
+        if ($distinctStatusSet.Contains("(none)")) {
             [void]$disagreements.Add("a run gave this rule no status at all")
         }
 
@@ -498,6 +535,7 @@ function Resolve-ReviewerRunReconciliation {
         foreach ($id in $sortedAnchorIds) {
             $perRun = [System.Collections.Generic.List[string]]::new()
             $distinct = [System.Collections.Generic.List[string]]::new()
+            $distinctSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
             for ($i = 0; $i -lt $byRun.Count; $i++) {
                 $run = $i + 1
                 # A run that never mentioned this anchor gave it no verdict.
@@ -505,7 +543,7 @@ function Resolve-ReviewerRunReconciliation {
                 # exactly the omission the whole partition exists to catch.
                 $verdict = $(if ($anchorVerdicts[$id].ContainsKey($run)) { [string]$anchorVerdicts[$id][$run] } else { "unaccounted" })
                 [void]$perRun.Add($verdict)
-                if ($distinct -cnotcontains $verdict) { [void]$distinct.Add($verdict) }
+                if ($distinctSet.Add($verdict)) { [void]$distinct.Add($verdict) }
             }
             $settled = (@($distinct).Count -eq 1 -and @($distinct)[0] -cne "conflicted" -and @($distinct)[0] -cne "unaccounted")
             $verdictFor = $(if ($settled) { @($distinct)[0] } else { "unknown" })
@@ -534,7 +572,7 @@ function Resolve-ReviewerRunReconciliation {
         # the runs could not even agree what word to use, what rule this slot
         # was about, or whether the rule was accounted for at all.
         $statusAgreed = (@($distinctStatuses).Count -le 1 -and -not $anyAbsent -and
-            @($distinctRules).Count -le 1 -and @($distinctStatuses) -cnotcontains "(none)")
+            @($distinctRules).Count -le 1 -and -not $distinctStatusSet.Contains("(none)"))
         $stable = [bool]($statusAgreed -and $anchorStable -and @($readings).Count -gt 0)
         $derived = $(if ($anyAnchorUnknown) { "unknown" }
             elseif ($normalizedViolating.Count -gt 0) { "violation" }
@@ -610,7 +648,9 @@ function Resolve-ReviewerRunReconciliation {
         $absent = [System.Collections.Generic.List[int]]::new()
         $counts = [System.Collections.Generic.List[int]]::new()
         $texts = [System.Collections.Generic.List[string]]::new()
+        $textSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         $severities = [System.Collections.Generic.List[string]]::new()
+        $severitySet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         $example = $null
         for ($i = 0; $i -lt $candidatesByRun.Count; $i++) {
             $bucket = $(if ($candidatesByRun[$i].ContainsKey($key)) { $candidatesByRun[$i][$key] } else { $null })
@@ -625,10 +665,10 @@ function Resolve-ReviewerRunReconciliation {
                 # `agreed` label is choosing whose review this is.
                 foreach ($item in @($bucket)) {
                     $severity = [string](Get-ReviewerRunReconciliationValue $item "severity" "")
-                    if ($severities -cnotcontains $severity) { [void]$severities.Add($severity) }
+                    if ($severitySet.Add($severity)) { [void]$severities.Add($severity) }
                     $text = Get-ReviewerConventionSpecialistSha256 `
                         -Text (([string](Get-ReviewerRunReconciliationValue $item "comment" "")).Trim())
-                    if ($texts -cnotcontains $text) { [void]$texts.Add($text) }
+                    if ($textSet.Add($text)) { [void]$texts.Add($text) }
                 }
             }
             else { [void]$absent.Add($i + 1) }
@@ -666,7 +706,7 @@ function Resolve-ReviewerRunReconciliation {
     # It is an unreconciled observation, and it says so.
     $enoughRuns = ($runs.Count -ge $RequiredRunCount)
     if (-not $enoughRuns) {
-        [void]$problems.Add("only $($runs.Count) run(s) supplied; $RequiredRunCount are required before any status may be called stable")
+        Add-ReviewerRunReconciliationProblem -Problems $problems -Code "tooFewRuns" -Runs @() -Text "only $($runs.Count) run(s) supplied; $RequiredRunCount are required before any status may be called stable"
     }
     $reconciled = [bool]($enoughRuns -and $problems.Count -eq 0)
     if (-not $reconciled) {
@@ -677,6 +717,14 @@ function Resolve-ReviewerRunReconciliation {
             $row.stable = $false
             $row.violatingConstructs = @()
             $row.notInReachConstructs = @()
+            # The ANCHORS too. Leaving them settled meant a refused comparison
+            # printed "1 settled, 0 unsettled" directly under "Reconciled:
+            # False", and a machine consumer reading rows[].anchors saw a
+            # settled violation nobody was entitled to.
+            foreach ($anchor in @($row.anchors)) {
+                $anchor.reconciledVerdict = "unknown"
+                $anchor.stable = $false
+            }
         }
         foreach ($candidate in $candidates) {
             if ($candidate.disposition -ceq "agreed") { $candidate.disposition = "withheldUnreconciled" }
@@ -695,7 +743,7 @@ function Resolve-ReviewerRunReconciliation {
         runCount = $runs.Count
         requiredRunCount = $RequiredRunCount
         inputBindingSha256 = [string]$binding
-        problems = @($problems.ToArray())
+        problems = [string[]](Get-ReviewerRunReconciliationProblemText -Problems $problems)
         runs = @($runSummaries.ToArray())
         stableRowCount = $stableCount
         unstableRowCount = $unstableCount
@@ -778,7 +826,15 @@ function Format-ReviewerRunReconciliationReport {
         }
         $unsettled = @(@($row.anchors) | Where-Object { -not [bool]$_.stable })
         if (@($row.anchors).Count -gt 0) {
-            [void]$lines.Add("- Anchors: $(@($row.anchors).Count) enumerated by the runs, $(@($row.anchors).Count - $unsettled.Count) settled, $($unsettled.Count) unsettled")
+            [void]$lines.Add($(if ([bool]$Reconciliation.reconciled) {
+                        "- Anchors: $(@($row.anchors).Count) enumerated by the runs, $(@($row.anchors).Count - $unsettled.Count) settled, $($unsettled.Count) unsettled"
+                    }
+                    else {
+                        # Not "0 settled" as an arithmetic fact - "none settled",
+                        # because the comparison was refused and settling was
+                        # never on the table.
+                        "- Anchors: $(@($row.anchors).Count) enumerated by the runs; none settled, because this is not a reconciliation"
+                    }))
         }
         foreach ($anchor in @($unsettled | Select-Object -First 24)) {
             [void]$lines.Add("  - $([string]$anchor.constructId): $((@($anchor.perRunVerdicts)) -join ' / ') -> $([string]$anchor.reconciledVerdict)")

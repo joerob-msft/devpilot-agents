@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/joerob-msft/devpilot-agents/schemas/reviewer.run-reconciliation.v1.json",
+  "$id": "urn:devpilot:reviewer:run-reconciliation:v1",
   "title": "Reviewer cross-run reconciliation",
   "description": "Two documents. A qualification run-set DECLARATION, sealed before the runs are compared, which fixes what the universe is. And the RECONCILIATION it produces, which is evaluation output and can never authorize anything.",
   "definitions": {

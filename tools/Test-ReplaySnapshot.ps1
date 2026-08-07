@@ -2322,6 +2322,70 @@ try {
         @(@($tenForward.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0) `
         "Ten runs spanning two bindings must leave nothing stable and nothing eligible."
 
+    # Five guards that mutation testing found uncovered. Each of these fails if
+    # the corresponding production guard is reverted, which is the only reason
+    # a test earns its place.
+
+    # 1. A run filing one anchor under two verdicts is not a reading.
+    $conflictedRow = New-ReconRow -Violating @("mi0") -Compliant @("mi0")
+    $conflicted = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @($conflictedRow)),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Violating @("mi0")))))
+    $conflictedAnchor = @(@(@($conflicted.rows)[0].anchors) | Where-Object { $_.constructId -ceq "mi0" })
+    Assert-Replay (@($conflictedAnchor[0].perRunVerdicts) -ccontains "conflicted" -and
+        [string]$conflictedAnchor[0].reconciledVerdict -ceq "unknown") `
+        "A run that files one anchor under two verdicts must be recorded as conflicted, not silently reduced to the first."
+
+    # 2. A run with a full binding but no replay identity is not a replay run.
+    $noReplayIdentity1 = New-ReconRun -Nonce "n1" -Rows @((New-ReconRow))
+    $noReplayIdentity1.replay.snapshotId = ""
+    $noReplayIdentity1.replay.manifestDigest = ""
+    $noReplayIdentity2 = New-ReconRun -Nonce "n2" -Rows @((New-ReconRow))
+    $noReplayIdentity2.replay.snapshotId = ""
+    $noReplayIdentity2.replay.manifestDigest = ""
+    $noIdentity = Resolve-ReviewerRunReconciliation -Manifests @($noReplayIdentity1, $noReplayIdentity2)
+    Assert-Replay (-not [bool]$noIdentity.reconciled -and
+        @(@($noIdentity.problems) | Where-Object { $_ -clike "*replay identity*" }).Count -gt 0) `
+        "Two runs with no snapshot identity must not bind equal just because their nothings match."
+
+    # 3. Every run saying `compliant` while every run lists an anchor violating
+    #    is a contradiction the anchors must win, and the row must degrade.
+    $wordVersusAnchors = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow -Status "compliant" -Violating @("mi0")))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Status "compliant" -Violating @("mi0")))))
+    Assert-Replay (@($wordVersusAnchors.rows)[0].reconciledStatus -ceq "unknown" -and
+        -not [bool]@($wordVersusAnchors.rows)[0].stable) `
+        "A word every run agreed on that contradicts the anchors they also agreed on must degrade, not be taken at face value."
+    Assert-Replay (@(@($wordVersusAnchors.rows)[0].disagreements | Where-Object { $_ -clike "*but the reconciled anchors say*" }).Count -gt 0) `
+        "And the contradiction must be stated."
+
+    # 4. A refused comparison must clear the anchors it had agreed on, not just
+    #    the row's headline.
+    $refusedButAgreeing = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow -Violating @("mi0")))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Violating @("mi0"))) -SourceCommit ("d" * 40)))
+    Assert-Replay (@(@($refusedButAgreeing.rows)[0].violatingConstructs).Count -eq 0 -and
+        @(@($refusedButAgreeing.rows)[0].notInReachConstructs).Count -eq 0) `
+        "A refused comparison must carry no violating or out-of-reach anchors forward."
+    Assert-Replay (@(@(@($refusedButAgreeing.rows)[0].anchors) | Where-Object { [bool]$_.stable }).Count -eq 0 -and
+        @(@(@($refusedButAgreeing.rows)[0].anchors) | Where-Object { [string]$_.reconciledVerdict -cne "unknown" }).Count -eq 0) `
+        "And every per-anchor verdict must be unknown; a refusal that leaves settled anchors reads as settled."
+    $refusedReport = Format-ReviewerRunReconciliationReport -Reconciliation $refusedButAgreeing
+    Assert-Replay ($refusedReport -clike "*none settled, because this is not a reconciliation*") `
+        "The report must not print a settled count under a refusal."
+
+    # 5. The same comment proposed twice by one run and once by another is a
+    #    count disagreement, with nothing else differing.
+    $countOnly = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @(
+                (New-ReconCandidate -Id "c1"), (New-ReconCandidate -Id "c2"))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Id "c1"))))
+    Assert-Replay (@($countOnly.candidates)[0].disposition -ceq "withheldCountDisagreement") `
+        "Identical text and severity proposed twice against once is still a disagreement about how many comments to make."
+    Assert-Replay (@(@($countOnly.candidates)[0].perRunCounts) -ccontains 2 -and
+        @(@($countOnly.candidates)[0].perRunCounts) -ccontains 1) `
+        "The per-run counts must show the two and the one."
+
     # One run is not a reconciliation, however clean it looks.
     $single = Resolve-ReviewerRunReconciliation -Manifests @((New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate))))
     Assert-Replay (-not [bool]$single.reconciled -and @($single.rows)[0].reconciledStatus -ceq "unknown") `

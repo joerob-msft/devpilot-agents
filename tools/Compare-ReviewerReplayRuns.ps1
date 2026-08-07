@@ -130,6 +130,14 @@ if ($DeclareRunSet) {
     if (-not (Test-Path -LiteralPath $OutputDirectory -PathType Container)) {
         [void](New-Item -ItemType Directory -LiteralPath $OutputDirectory -Force)
     }
+    if (@($ExpectedRunSha256).Count -eq 1) {
+        throw "A qualification set of one run is not a reconciliation; name at least two."
+    }
+    $duplicateDeclared = @(@($ExpectedRunSha256 | Group-Object | Where-Object { $_.Count -gt 1 }) | ForEach-Object { [string]$_.Name })
+    if (@($duplicateDeclared).Count -gt 0) {
+        throw ("The declaration names the same artifact more than once: " +
+            (@(@($duplicateDeclared) | ForEach-Object { $_.Substring(0, 12) }) -join ", ") + ".")
+    }
     $setId = [Guid]::NewGuid().ToString("N")
     $declaration = [pscustomobject][ordered]@{
         kind = $script:ReviewerRunReconciliationSetKind
@@ -274,6 +282,21 @@ if ($OutputDirectory) {
             status = "ok"
             reconciliation = $reconciliation
             declaredRunSet = @($declaredRuns.ToArray())
+            # The declaration, inside the sealed output. Without it a reader of
+            # the JSON cannot tell a qualification from runs an operator picked
+            # by hand - only the Markdown said so, and Markdown is not evidence.
+            qualification = $(if ($null -ne $runSet) {
+                    [pscustomobject][ordered]@{
+                        setId = [string]$runSet.setId
+                        snapshotName = [string]$runSet.snapshotName
+                        snapshotManifestDigest = [string]$runSet.snapshotManifestDigest
+                        plannedRunCount = [int]$runSet.plannedRunCount
+                        expectedRunSha256 = @(Get-ReviewerConventionSpecialistValue $runSet "expectedRunSha256" @())
+                        declaredAt = [string]$runSet.declaredAt
+                        purpose = [string](Get-ReviewerConventionSpecialistValue $runSet "purpose" "")
+                    }
+                }
+                else { $null })
             reportPath = $reportPath
             reportSha256 = Get-ReviewerConventionSpecialistSha256 -Text $report
             promotable = $false
