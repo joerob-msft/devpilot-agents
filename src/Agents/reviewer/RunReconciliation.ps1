@@ -21,6 +21,44 @@ $script:ReviewerRunReconciliationKind = "reviewer.run-reconciliation"
 $script:ReviewerRunReconciliationSetKind = "reviewer.run-reconciliation-set"
 $script:ReviewerRunReconciliationVersion = 1
 
+function Get-ReviewerRunReconciliationTimestamp {
+    <#
+        Normalizes a timestamp that has been through `ConvertFrom-Json`.
+
+        `ConvertFrom-Json` turns an extended ISO-8601 string into a [DateTime],
+        and casting that back to a string drops the `Z` and the subseconds and
+        formats to whatever the host's culture is. The declaration is SEALED, so
+        that difference reaches the artifact and the report: two machines
+        reconciling the same runs would produce different bytes.
+
+        The ticks survive the round trip, so the original is recoverable exactly.
+        An offset other than UTC normalizes to UTC; anything that is not a
+        round-trip timestamp at all is refused rather than guessed at.
+    #>
+    param([AllowNull()]$Value)
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+    if ($Value -is [DateTime]) {
+        return ([DateTime]$Value).ToUniversalTime().ToString("o", $invariant)
+    }
+    if ($Value -is [DateTimeOffset]) {
+        return ([DateTimeOffset]$Value).UtcDateTime.ToString("o", $invariant)
+    }
+    $text = [string]$Value
+    if (-not $text) { return "" }
+    $parsed = [DateTime]::MinValue
+    # RoundtripKind alone: it honours the `Z` or the offset already in the text
+    # and sets Kind accordingly, and `.ToUniversalTime()` below does the rest.
+    # It cannot be combined with AdjustToUniversal.
+    if ([DateTime]::TryParse($text, $invariant,
+            [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) {
+        if ($parsed.Kind -eq [DateTimeKind]::Unspecified) {
+            throw "A sealed timestamp must carry a UTC marker or an offset; '$text' carries neither."
+        }
+        return $parsed.ToUniversalTime().ToString("o", $invariant)
+    }
+    throw "A sealed timestamp must be a round-trip ISO-8601 value; '$text' is not one."
+}
+
 function Read-ReviewerRunReconciliationSet {
     <#
         Reads a sealed qualification-set declaration.
@@ -58,6 +96,11 @@ function Read-ReviewerRunReconciliationSet {
             throw "The qualification run set is missing '$field'."
         }
     }
+    # Put the timestamp back the way it was sealed, before any caller stringifies
+    # it. Every read of `declaredAt` downstream then gets the canonical form
+    # rather than whatever this host's culture would have rendered.
+    $set | Add-Member -NotePropertyName declaredAt -Force `
+        -NotePropertyValue (Get-ReviewerRunReconciliationTimestamp (Get-ReviewerConventionSpecialistValue $set "declaredAt" ""))
     return $set
 }
 
