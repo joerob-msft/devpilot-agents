@@ -8139,6 +8139,7 @@ function Write-ReviewerConventionSpecialistPreview {
     [void]$lines.Add("- Nothing in this preview was merged, posted, or voted.")
     if ($script:ReviewerReplayActive) {
         [void]$lines.Add("- OFFLINE REPLAY of snapshot ``$($script:ReviewerReplaySnapshot.SnapshotId)`` (manifest digest ``$($script:ReviewerReplaySnapshot.ManifestDigest)``, replay nonce ``$($script:ReviewerReplaySnapshot.ReplayNonce)``); sealed under the replay key domain and never promotable.")
+        [void]$lines.Add("- UNRECONCILED: this is ONE run. The model is not deterministic, so a status here is one reading, not a calibrated result. Compare two or more runs with distinct nonces (``tools/Compare-ReviewerReplayRuns.ps1``); anything they disagree about resolves to unknown and the candidate is withheld.")
     }
     if ($Diagnostic) { [void]$lines.Add("- Diagnostic: $Diagnostic") }
     [void]$lines.Add("")
@@ -8324,6 +8325,11 @@ function Write-ReviewerConventionSpecialistPreview {
                     manifestDigest = [string]$script:ReviewerReplaySnapshot.ManifestDigest
                     replayNonce = [string]$script:ReviewerReplaySnapshot.ReplayNonce
                     promotable = $false
+                    # Machine-readable counterpart to the residual risk above, so
+                    # a consumer cannot mistake one run for a reconciled result.
+                    runsReconciled = 1
+                    reconciled = $false
+                    reconciliationNote = "One replay run. Statuses are unreconciled until compared against another run with a distinct nonce."
                 }
             }
             else { $null })
@@ -8592,6 +8598,19 @@ function Invoke-ReviewerConventionSpecialistPass {
             if ($toolAudit.toolRequestAuditTruncated -and @($residualRisks).Count -lt 12) {
                 $residualRisks += [pscustomobject][ordered]@{
                     text = "CLI tool-request audit exceeded 64 entries and was truncated; the enforced availability ceiling remained unchanged."
+                }
+            }
+            # A replay is deterministic in its inputs and not in its model. One
+            # run is one reading, and a reader looking at a single sealed
+            # artifact has no way to tell a stable verdict from a coin toss that
+            # landed well. Say it inside the artifact rather than hoping the
+            # operator remembers.
+            if ($script:ReviewerReplayActive -and @($residualRisks).Count -lt 12) {
+                $residualRisks += [pscustomobject][ordered]@{
+                    text = ("Single unreconciled replay run: the statuses in this artifact are one model reading of the " +
+                        "frozen input, not a calibrated result. Reconcile two or more runs with distinct nonces " +
+                        "(tools/Compare-ReviewerReplayRuns.ps1) before treating any status as stable; disagreement " +
+                        "between runs resolves to unknown and withholds the candidate.")
                 }
             }
             $status = "complete"

@@ -73,7 +73,7 @@ function Copy-Fixture {
 
 try {
     # -- 1. The shipped fixture loads, and every payload is hash-bound ---------
-    Write-Host "1/11 shipped synthetic snapshot" -ForegroundColor Cyan
+    Write-Host "1/13 shipped synthetic snapshot" -ForegroundColor Cyan
     $snapshot = New-AgentReplaySnapshot -ReplayRoot $fixtureRoot -SnapshotName "synthetic-pr"
     Assert-Replay ($snapshot.SnapshotId -ceq "synthetic-pr") "The shipped fixture did not load under its own name."
     Assert-Replay ($snapshot.ResourceCount -eq 7) "The shipped fixture should carry exactly 7 recorded reads."
@@ -89,7 +89,7 @@ try {
         "An operator-supplied digest that does not match must refuse the snapshot." -Match "does not match the operator-supplied"
 
     # -- 2. Serving preserves the live tool response shapes -------------------
-    Write-Host "2/11 served responses keep the live shapes" -ForegroundColor Cyan
+    Write-Host "2/13 served responses keep the live shapes" -ForegroundColor Cyan
     $session = Open-AgentMcpSession -AgencyPath "never-executed" -Server "ado" -Organization "contoso" -ReplaySnapshot $snapshot
     Assert-Replay ($null -eq $session.Process) "A replay session must not start a process."
     $pr = Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
@@ -118,7 +118,7 @@ try {
         "Two serves of one recorded read must be equal in value and separate objects."
 
     # -- 3. Absent, write, and closed all fail closed -------------------------
-    Write-Host "3/11 absent reads, writes, and closed sessions fail closed" -ForegroundColor Cyan
+    Write-Host "3/13 absent reads, writes, and closed sessions fail closed" -ForegroundColor Cyan
     Assert-ReplayThrows { Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
             action = "get"; project = "Widgets"; repositoryId = "11111111-2222-3333-4444-555555555555"; pullRequestId = 9999
         } } "A read the snapshot does not carry must fail, never fall through to a live read." -Match "no recorded response"
@@ -148,7 +148,7 @@ try {
         "A snapshot captured for one organization must not serve another." -Match "was captured against organization"
 
     # -- 4. Tampering, stale bindings, and missing payloads -------------------
-    Write-Host "4/11 tamper, stale binding, and missing resource" -ForegroundColor Cyan
+    Write-Host "4/13 tamper, stale binding, and missing resource" -ForegroundColor Cyan
     $tampered = Copy-Fixture -Name "tampered"
     $payload = Join-Path $tampered "synthetic-pr\payloads\pr-get.json"
     [IO.File]::WriteAllBytes($payload, $utf8.GetBytes(([IO.File]::ReadAllText($payload, $utf8)).Replace("4242", "4243")))
@@ -174,7 +174,7 @@ try {
         "A snapshot loaded under a different name than it declares must be refused." -Match "declares snapshotId"
 
     # -- 5. Path attacks ------------------------------------------------------
-    Write-Host "5/11 path attacks" -ForegroundColor Cyan
+    Write-Host "5/13 path attacks" -ForegroundColor Cyan
     foreach ($name in @("..", "..\other", "a/b", "C:\windows", "with:stream", "")) {
         Assert-ReplayThrows { New-AgentReplaySnapshot -ReplayRoot $fixtureRoot -SnapshotName $name } `
             "Snapshot name '$name' must be refused as a path-free single name."
@@ -206,7 +206,7 @@ try {
     }
 
     # -- 6. Recorded writes cannot be sealed into a snapshot at all -----------
-    Write-Host "6/11 a snapshot may only carry reads" -ForegroundColor Cyan
+    Write-Host "6/13 a snapshot may only carry reads" -ForegroundColor Cyan
     $writeAttempt = Join-Path $sandbox "write-attempt"
     New-Item -ItemType Directory -Force -Path (Join-Path $writeAttempt "payloads") | Out-Null
     [IO.File]::WriteAllBytes((Join-Path $writeAttempt "payloads\w.json"),
@@ -250,7 +250,7 @@ try {
         "The loader must recompute exactly the digest the writer recorded."
 
     # -- 7. Canonical form and lookup keys are host-independent ---------------
-    Write-Host "7/11 canonical form is ordinal and host-independent" -ForegroundColor Cyan
+    Write-Host "7/13 canonical form is ordinal and host-independent" -ForegroundColor Cyan
     $mixed = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
     foreach ($pair in @(@("ab", 1), @("Aa", 2), @("aa", 3), @("ch", 4), @("cz", 5), @("_x", 6))) {
         $mixed[[string]$pair[0]] = [int]$pair[1]
@@ -271,7 +271,7 @@ try {
     Assert-Replay ($escapes -ceq '{"t":"a\"b\\c\nd"}') "String escaping must be explicit and stable (got $escapes)."
 
     # -- 8. Rule-coverage accounting ------------------------------------------
-    Write-Host "8/11 rule-coverage accounting" -ForegroundColor Cyan
+    Write-Host "8/13 rule-coverage accounting" -ForegroundColor Cyan
     $sources = @(
         [pscustomobject][ordered]@{ PackName = "core"; SourceId = "rule-a"; Sha256 = ("a" * 64); Text = "Prefer assigning a field once." }
         [pscustomobject][ordered]@{ PackName = "core"; SourceId = "rule-b"; Sha256 = ("b" * 64); Text = "Name every argument of a multi-line call." }
@@ -725,7 +725,7 @@ try {
         "The changed-file anchor index must be ordinal, deduplicated, and current-role only."
 
     # -- 9. Schema bounds ------------------------------------------------------
-    Write-Host "9/11 schema bounds" -ForegroundColor Cyan
+    Write-Host "9/13 schema bounds" -ForegroundColor Cyan
     $schema = Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject "Widgets" -ExpectedNonce "n"
     Assert-Replay ($schema.Keys -ccontains "ruleCoverage") "The marker schema must declare ruleCoverage."
     $coverageSpec = $schema.Fields["ruleCoverage"]
@@ -929,7 +929,7 @@ try {
     # The generic half of the calibration: what the wrapper can establish about
     # a change set WITHOUT knowing the language's testing framework, its
     # attributes, or anything about the repository it came from.
-    Write-Host "10/11 changed-construct enumeration" -ForegroundColor Cyan
+    Write-Host "10/13 changed-construct enumeration" -ForegroundColor Cyan
     . (Join-Path $RepoRoot "src\Agents\reviewer\ChangedConstructs.ps1")
 
     function Get-Constructs {
@@ -1451,7 +1451,7 @@ try {
 
     # -- 11. The replay tool grant -------------------------------------------    # Extracted from the reviewer's own source and evaluated here, because the
     # claim "the model has no usable tool in replay" is otherwise a comment.
-    Write-Host "11/11 replay tool grant" -ForegroundColor Cyan
+    Write-Host "11/13 replay tool grant" -ForegroundColor Cyan
     $reviewerSource = [IO.File]::ReadAllText((Join-Path $RepoRoot "src\Agents\reviewer\Start-ReviewerAgent.ps1"), $utf8)
     $reviewerTokens = $null
     $reviewerErrors = $null
@@ -1493,6 +1493,337 @@ try {
             }
         }
     }
+    # -- 12. `notInReach` is fail-closed ---------------------------------------
+    # Out-of-reach is the one verdict that costs nothing to give, so it is the
+    # one an evasive row reaches for. Every property that makes it safe gets a
+    # positive case (it is genuinely usable) and an adversarial case (it cannot
+    # be used to say nothing).
+    Write-Host "12/13 out-of-reach is fail-closed" -ForegroundColor Cyan
+    $bothKinds = "invocation,declaration"
+    $everyId = "mi0,mi1,dc0"
+
+    # Positive: a rule that really does not reach this change set says so
+    # against every anchor, and that survives as an answer.
+    $reachesNothing = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "notApplicable" -Scope $bothKinds -Checked "" -NotInReach $everyId),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope $bothKinds -Checked $everyId)
+    )
+    Assert-Replay (@($reachesNothing.Rows | Where-Object { $_.ruleRef -ceq "rs0" }).status -ceq "notApplicable") `
+        "A rule that puts every anchor out of reach, naming all of them, keeps its answer."
+    Assert-Replay ([bool]$reachesNothing.Complete) `
+        "An exact cover made of out-of-reach plus checked is still an exact cover."
+
+    # Positive: the mixed case - some anchors weighed, the rest out of reach.
+    $mixedReach = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "violation" -Scope $bothKinds -Checked "mi0" -Violating "mi0" -NotInReach "mi1,dc0"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope $bothKinds -Checked $everyId)
+    )
+    $mixedRow = @($mixedReach.Rows | Where-Object { $_.ruleRef -ceq "rs0" })
+    Assert-Replay ($mixedRow.status -ceq "violation" -and @($mixedRow.notInReachConstructs).Count -eq 2) `
+        "Weighing one anchor and putting the other two out of reach is a legitimate exact cover."
+
+    # Adversarial: omission. One anchor named nowhere at all.
+    $omitted = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope $bothKinds -Checked "mi0" -NotInReach "mi1"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope $bothKinds -Checked $everyId)
+    )
+    $omittedRow = @($omitted.Rows | Where-Object { $_.ruleRef -ceq "rs0" })
+    Assert-Replay ($omittedRow.status -ceq "unknown" -and $omittedRow.degradedReason -clike "*dc0*") `
+        "Checked plus out-of-reach must cover the declared universe exactly; the omitted anchor must be named."
+
+    # Adversarial: the same anchor in two lists.
+    $twoLists = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope $bothKinds -Checked "mi0,mi1,dc0" -NotInReach "dc0"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope $bothKinds -Checked $everyId)
+    )
+    Assert-Replay (@($twoLists.Rows | Where-Object { $_.ruleRef -ceq "rs0" }).status -ceq "unknown") `
+        "An anchor that is both checked and out of reach has two verdicts, not one."
+
+    # Adversarial: the same anchor twice inside ONE list. Collapsing this
+    # quietly would let a short list impersonate an exact cover.
+    $repeatedInList = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope $bothKinds -Checked "mi0,mi1" -NotInReach "dc0,dc0"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope $bothKinds -Checked $everyId)
+    )
+    $repeatedRow = @($repeatedInList.Rows | Where-Object { $_.ruleRef -ceq "rs0" })
+    Assert-Replay ($repeatedRow.status -ceq "unknown" -and $repeatedRow.degradedReason -clike "*twice*") `
+        "An anchor repeated inside one verdict list must be refused, not silently deduplicated."
+
+    # Adversarial: the same repeat hidden in overlapping ranges.
+    $overlapRange = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope $bothKinds -Checked "mi0-mi1,mi1" -NotInReach "dc0"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope $bothKinds -Checked $everyId)
+    )
+    Assert-Replay (@($overlapRange.Rows | Where-Object { $_.ruleRef -ceq "rs0" }).status -ceq "unknown") `
+        "Overlapping ranges are the same repeat written differently and must be refused too."
+
+    # Adversarial: an id that resolves to no enumerated construct.
+    $ghostReach = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope $bothKinds -Checked $everyId -NotInReach "mi99"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope $bothKinds -Checked $everyId)
+    )
+    Assert-Replay (@($ghostReach.Rows | Where-Object { $_.ruleRef -ceq "rs0" }).status -ceq "unknown") `
+        "Every out-of-reach id must resolve to a sealed enumerated construct."
+
+    # Adversarial: an id of a kind the row's own scope excludes. Out-of-reach
+    # is a verdict about an anchor the rule was asked about; it is not a bin.
+    $wrongKind = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope "declaration" -Checked "dc0" -NotInReach "mi0"),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope $bothKinds -Checked $everyId)
+    )
+    $wrongKindRow = @($wrongKind.Rows | Where-Object { $_.ruleRef -ceq "rs0" })
+    Assert-Replay ($wrongKindRow.status -ceq "unknown" -and $wrongKindRow.degradedReason -clike "*out of reach*") `
+        "An out-of-reach id from a kind the declared scope never covered must be refused."
+
+    # Adversarial: a scope the wrapper does not enumerate.
+    $inventedScope = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "compliant" -Scope "wombat" -Checked "" -NotInReach ""),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "compliant" -Scope $bothKinds -Checked $everyId)
+    )
+    Assert-Replay (@($inventedScope.Rows | Where-Object { $_.ruleRef -ceq "rs0" }).status -ceq "unknown") `
+        "A construct kind the wrapper does not enumerate cannot define a universe."
+
+    # Adversarial: the whole checklist out of reach. Every row is individually
+    # legal and the pass has weighed nothing, so it is not complete.
+    $allOutOfReach = Invoke-Coverage -Rows @(
+        (New-CoverageRow -Ref "rs0" -Sha ("a" * 64) -Status "notApplicable" -Scope $bothKinds -Checked "" -NotInReach $everyId),
+        (New-CoverageRow -Ref "rs1" -Sha ("b" * 64) -Status "notApplicable" -Scope $bothKinds -Checked "" -NotInReach $everyId)
+    )
+    Assert-Replay (-not [bool]$allOutOfReach.Complete -and [int]$allOutOfReach.CheckedConstructCount -eq 0) `
+        "An accounting where every rule reaches nothing has weighed nothing and is not complete."
+
+    # -- 13. Repeated runs of one frozen input --------------------------------
+    Write-Host "13/13 cross-run reconciliation" -ForegroundColor Cyan
+    . (Join-Path $RepoRoot "src\Agents\reviewer\RunReconciliation.ps1")
+
+    function New-ReconRun {
+        param(
+            [string]$Nonce, [object[]]$Rows, [object[]]$Candidates = @(),
+            [string]$SourceCommit = "c" * 40, [string]$Promotable = "false",
+            [object[]]$Constructs = $null, [string]$Status = "ok"
+        )
+        $set = $(if ($null -eq $Constructs) {
+                @([pscustomobject][ordered]@{ id = "mi0"; kind = "invocation"; path = "src/a.cs"; startLine = 12; endLine = 14; detail = "nnp" })
+            }
+            else { $Constructs })
+        return [pscustomobject][ordered]@{
+            status = $Status; prId = 42; sourceCommit = $SourceCommit; organization = "o"; project = "p"
+            repositoryId = "r"; model = "m"; configSha256 = ("1" * 64); scriptSha256 = ("2" * 64)
+            specialistLibrarySha256 = ("3" * 64); promptSha256 = ("4" * 64)
+            conventionPlanSha256 = ("5" * 64); factPlanSha256 = ("6" * 64)
+            candidates = @($Candidates)
+            ruleCoverage = [pscustomobject][ordered]@{ rows = @($Rows); changedConstructs = @($set) }
+            replay = [pscustomobject][ordered]@{
+                snapshotId = "s"; manifestDigest = ("7" * 64); replayNonce = $Nonce
+                promotable = [bool]::Parse($Promotable)
+            }
+        }
+    }
+    function New-ReconRow {
+        param(
+            [string]$Source = "core/rule-a", [string]$Status = "violation",
+            [string[]]$Violating = @("mi0"), [string[]]$Compliant = @(),
+            [string[]]$NotInReach = @(), [string[]]$Unknown = @(), [string]$Ref = "rs0"
+        )
+        return [pscustomobject][ordered]@{
+            ruleRef = $Ref; ruleSourceId = $Source; status = $Status
+            violatingConstructs = @($Violating); compliantConstructs = @($Compliant)
+            notInReachConstructs = @($NotInReach); unknownConstructs = @($Unknown)
+            candidateId = ""; degradedReason = ""
+        }
+    }
+    function New-ReconCandidate {
+        param([string]$Source = "core/rule-a", [string]$Path = "/src/a.cs", [int]$Line = 12, [string]$Id = "c1")
+        return [pscustomobject][ordered]@{
+            candidateId = $Id; ruleSourceId = $Source; filePath = $Path; line = $Line
+            anchorKind = "changedFile"; severity = "suggestion"; comment = "text"
+        }
+    }
+
+    # Agreement survives, and the anchors it agreed on come through.
+    $agree = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Id "c9")))
+    )
+    Assert-Replay ([bool]$agree.reconciled -and [int]$agree.stableRowCount -eq 1) `
+        "Two runs that read a rule the same way must reconcile to that reading."
+    Assert-Replay (@($agree.rows)[0].reconciledStatus -ceq "violation" -and @(@($agree.rows)[0].violatingConstructs) -ccontains "mi0") `
+        "A stable row keeps its status and its anchors."
+    Assert-Replay (@($agree.candidates)[0].disposition -ceq "agreed") `
+        "A candidate at the same rule, file and line in both runs is agreed even though its id differs."
+    Assert-Replay (-not [bool]$agree.promotable) "A reconciliation is never promotable."
+
+    # Disagreement on the word collapses to unknown - never to the interesting
+    # reading, and never to the first run.
+    $statusSplit = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow -Status "violation"))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Status "compliant" -Violating @() -Compliant @("mi0"))))
+    )
+    Assert-Replay (@($statusSplit.rows)[0].reconciledStatus -ceq "unknown" -and -not [bool]@($statusSplit.rows)[0].stable) `
+        "Two runs reading one rule differently must collapse to unknown."
+    Assert-Replay (@(@($statusSplit.rows)[0].rawStatuses) -ccontains "violation" -and @(@($statusSplit.rows)[0].rawStatuses) -ccontains "compliant") `
+        "Both raw readings must stay visible in the reconciliation."
+    Assert-Replay (@(@($statusSplit.rows)[0].violatingConstructs).Count -eq 0) `
+        "An unstable row must not carry forward the anchors of the run that happened to find something."
+
+    # Same word, different anchors, is still disagreement.
+    $anchorSplit = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow -Violating @("mi0")))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Violating @("mi1"))) -Constructs @(
+                [pscustomobject][ordered]@{ id = "mi0"; kind = "invocation"; path = "src/a.cs"; startLine = 12; endLine = 14; detail = "nnp" }))
+    )
+    Assert-Replay (@($anchorSplit.rows)[0].reconciledStatus -ceq "unknown") `
+        "Agreeing on 'violation' while naming different anchors is two findings, not one."
+
+    # Ordering is not disagreement.
+    $reordered = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow -Violating @("mi0", "mi1")))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Violating @("mi1", "mi0"))))
+    )
+    Assert-Replay ([bool]@($reordered.rows)[0].stable) "The order a model lists anchors in is not a difference."
+
+    # A rule one run never accounted for.
+    $absentRule = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow), (New-ReconRow -Source "core/rule-b" -Ref "rs1"))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)))
+    )
+    Assert-Replay (@(@($absentRule.rows) | Where-Object { $_.ruleSourceId -ceq "core/rule-b" }).reconciledStatus -ceq "unknown") `
+        "A rule only one run accounted for is unknown, not that run's answer."
+
+    # A candidate only one run proposed is withheld.
+    $candidateSplit = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)))
+    )
+    Assert-Replay (@($candidateSplit.candidates)[0].disposition -ceq "withheldRunDisagreement") `
+        "A comment only one run proposed must be withheld, not promoted by the run that found it."
+
+    # A different line is a different candidate, so both are withheld.
+    $lineSplit = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Line 12))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Line 13)))
+    )
+    Assert-Replay (@(@($lineSplit.candidates) | Where-Object { $_.disposition -ceq "agreed" }).Count -eq 0) `
+        "Two runs pointing at neighbouring lines have not agreed on a comment."
+
+    # One run is not a reconciliation, however clean it looks.
+    $single = Resolve-ReviewerRunReconciliation -Manifests @((New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate))))
+    Assert-Replay (-not [bool]$single.reconciled -and @($single.rows)[0].reconciledStatus -ceq "unknown") `
+        "A single run cannot present any status as stable."
+    Assert-Replay (@($single.candidates)[0].disposition -ceq "withheldUnreconciled") `
+        "A single run's candidate is unreconciled, not agreed."
+
+    # The same run submitted twice is one observation wearing two hats.
+    $sameNonce = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow))),
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)))
+    )
+    Assert-Replay (-not [bool]$sameNonce.reconciled -and @($sameNonce.problems) -clike "*reuses the nonce*") `
+        "A repeated nonce means one run counted twice and must not reconcile."
+
+    # Different inputs are not repeated runs.
+    $differentInput = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -SourceCommit ("d" * 40))
+    )
+    Assert-Replay (-not [bool]$differentInput.reconciled -and @($differentInput.rows)[0].reconciledStatus -ceq "unknown") `
+        "Runs of different input must be refused rather than compared row by row."
+
+    # A construct table that shifted underneath the ids is a different question.
+    $shiftedConstructs = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Constructs @(
+                [pscustomobject][ordered]@{ id = "mi0"; kind = "invocation"; path = "src/a.cs"; startLine = 99; endLine = 101; detail = "nnp" }))
+    )
+    Assert-Replay (-not [bool]$shiftedConstructs.reconciled) `
+        "The same anchor id at a different line is not the same anchor."
+
+    # A promotable claim inside a replay artifact taints the whole comparison.
+    $promotableRun = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Promotable "true")
+    )
+    Assert-Replay (-not [bool]$promotableRun.reconciled -and @($promotableRun.problems) -clike "*promotable*") `
+        "A replay artifact claiming to be promotable must not be reconciled."
+
+    # A degraded run cannot lend its silence to a clean one.
+    $degradedRun = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Status "degraded")
+    )
+    Assert-Replay (-not [bool]$degradedRun.reconciled) "A run that did not finish cleanly cannot be half of a reconciliation."
+
+    # Three runs, one dissenter: still unknown. No majority vote.
+    $majority = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow -Status "violation"))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Status "violation"))),
+        (New-ReconRun -Nonce "n3" -Rows @((New-ReconRow -Status "compliant" -Violating @() -Compliant @("mi0"))))
+    ) -RequiredRunCount 2
+    Assert-Replay (@($majority.rows)[0].reconciledStatus -ceq "unknown") `
+        "Two runs out of three is not a result; there is no majority vote."
+
+    # An operator asking for more runs than were supplied gets nothing stable.
+    $tooFew = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)))
+    ) -RequiredRunCount 3
+    Assert-Replay (-not [bool]$tooFew.reconciled -and @($tooFew.rows)[0].reconciledStatus -ceq "unknown") `
+        "Fewer runs than the operator required cannot produce a stable status."
+
+    # The disagreement has to be legible, not just counted.
+    $report = Format-ReviewerRunReconciliationReport -Reconciliation $statusSplit
+    Assert-Replay ($report -clike "*violation*" -and $report -clike "*compliant*" -and $report -clike "*never promotable*") `
+        "The report must show both readings and label itself unpromotable."
+
+    # End to end through the operator tool, including the key domain. A replay
+    # artifact is sealed under a derived key exactly so it cannot verify against
+    # the promotion path; the reconciler must read that domain and no other, or
+    # a live-run artifact could be laundered through it.
+    $reconDir = Join-Path $sandbox "recon"
+    [void](New-Item -ItemType Directory -Path $reconDir -Force)
+    $keyFile = Join-Path $reconDir "artifact-signing.key"
+    $masterKey = [byte[]]::new(32)
+    for ($i = 0; $i -lt 32; $i++) { $masterKey[$i] = [byte]($i + 1) }
+    [IO.File]::WriteAllBytes($keyFile, $masterKey)
+    $replayHmac = [System.Security.Cryptography.HMACSHA256]::new($masterKey)
+    try { $derivedKey = $replayHmac.ComputeHash([Text.UTF8Encoding]::new($false).GetBytes("devpilot.reviewer.replay.artifact.v1")) }
+    finally { $replayHmac.Dispose() }
+
+    $sealedPaths = @()
+    foreach ($pair in @(@("run1", "n1"), @("run2", "n2"))) {
+        $manifest = New-ReconRun -Nonce $pair[1] -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate))
+        $manifest | Add-Member -NotePropertyName kind -NotePropertyValue $script:ReviewerConventionSpecialistArtifactKind -Force
+        $manifest | Add-Member -NotePropertyName artifactVersion `
+            -NotePropertyValue $script:ReviewerConventionSpecialistArtifactVersion -Force
+        $sealedPaths += Save-ReviewerConventionSpecialistPreview -Directory $reconDir -BaseName $pair[0] `
+            -Manifest $manifest -MasterKey $derivedKey
+    }
+    $toolPath = Join-Path $RepoRoot "tools\Compare-ReviewerReplayRuns.ps1"
+    $toolOutput = & $toolPath -ArtifactPath $sealedPaths -KeyPath $keyFile -OutputDirectory $reconDir 2>&1
+    Assert-Replay ($LASTEXITCODE -eq 0 -and (($toolOutput -join "`n") -clike "*Reconciled: True*")) `
+        "The reconciler must read two sealed replay artifacts and reconcile them."
+    Assert-Replay (@(Get-ChildItem -LiteralPath $reconDir -Filter "reconciliation-*.json").Count -eq 1) `
+        "The reconciler must seal its own artifact beside the report."
+    $sealedRecon = @(Get-ChildItem -LiteralPath $reconDir -Filter "reconciliation-*.json")[0].FullName
+    Assert-ReplayThrows { Read-ReviewerConventionSpecialistPreview -Path $sealedRecon -MasterKey $masterKey } `
+        "The reconciliation artifact must not verify under the raw promotion key." -Match "signature verification failed"
+
+    # A live-run artifact, sealed under the raw key, is not a replay run.
+    $liveManifest = New-ReconRun -Nonce "n3" -Rows @((New-ReconRow))
+    $liveManifest.PSObject.Properties.Remove("replay")
+    $liveManifest | Add-Member -NotePropertyName kind -NotePropertyValue $script:ReviewerConventionSpecialistArtifactKind -Force
+    $liveManifest | Add-Member -NotePropertyName artifactVersion `
+        -NotePropertyValue $script:ReviewerConventionSpecialistArtifactVersion -Force
+    $livePath = Save-ReviewerConventionSpecialistPreview -Directory $reconDir -BaseName "live" `
+        -Manifest $liveManifest -MasterKey $masterKey
+    $liveRefusal = ""
+    try {
+        & $toolPath -ArtifactPath @($sealedPaths[0], $livePath) -KeyPath $keyFile | Out-Null
+    }
+    catch { $liveRefusal = [string]$_.Exception.Message }
+    Assert-Replay ($liveRefusal -clike "*signature verification failed*") `
+        "A live-run artifact sealed under the promotion key must be refused by the seal, not by an editable field."
+
     $script:ReviewerReplayActive = $false
 }
 finally {

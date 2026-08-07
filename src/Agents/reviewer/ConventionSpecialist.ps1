@@ -60,31 +60,38 @@ function Expand-ReviewerConventionSpecialistConstructIds {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Text, [int]$MaxIds = 4096)
     $ids = [System.Collections.Generic.List[string]]::new()
     $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $duplicated = [System.Collections.Generic.List[string]]::new()
+    $duplicatedSeen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($part in @(($Text -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
         $match = [regex]::Match($part, '^([a-z]{2})([0-9]{1,3})(?:-([a-z]{2})([0-9]{1,3}))?$')
-        if (-not $match.Success) { return @{ Ok = $false; Ids = @() } }
+        if (-not $match.Success) { return @{ Ok = $false; Ids = @(); Duplicated = @() } }
         $prefix = $match.Groups[1].Value
         if (@($script:ReviewerConventionSpecialistConstructPrefixes.Values) -cnotcontains $prefix) {
-            return @{ Ok = $false; Ids = @() }
+            return @{ Ok = $false; Ids = @(); Duplicated = @() }
         }
         $first = [int]$match.Groups[2].Value
         $last = $first
         if ($match.Groups[3].Success) {
-            if ($match.Groups[3].Value -cne $prefix) { return @{ Ok = $false; Ids = @() } }
+            if ($match.Groups[3].Value -cne $prefix) { return @{ Ok = $false; Ids = @(); Duplicated = @() } }
             $last = [int]$match.Groups[4].Value
-            if ($last -lt $first) { return @{ Ok = $false; Ids = @() } }
+            if ($last -lt $first) { return @{ Ok = $false; Ids = @(); Duplicated = @() } }
         }
         for ($index = $first; $index -le $last; $index++) {
             # Stop AT the ceiling, not after it. A schema-legal field can name
             # forty thousand-wide ranges; expanding them all first and
             # diagnosing afterwards cost twenty-three seconds on the mandatory
             # path, three times over if the specialist retries.
-            if ($ids.Count -ge $MaxIds) { return @{ Ok = $false; Ids = @() } }
+            if ($ids.Count -ge $MaxIds) { return @{ Ok = $false; Ids = @(); Duplicated = @() } }
             $id = "$prefix$index"
+            # A repeated id is not a harmless spelling. Silently collapsing it
+            # would let a row name the same anchor twice and still look like an
+            # exact cover, which is the one property this whole partition rests
+            # on.
             if ($seen.Add($id)) { [void]$ids.Add($id) }
+            elseif ($duplicatedSeen.Add($id)) { [void]$duplicated.Add($id) }
         }
     }
-    return @{ Ok = $true; Ids = @($ids.ToArray()) }
+    return @{ Ok = $true; Ids = @($ids.ToArray()); Duplicated = @($duplicated.ToArray()) }
 }
 
 function Get-ReviewerConventionSpecialistShortened {
@@ -851,11 +858,15 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         # reader sees is a function of the anchors rather than of a sentence.
         $partition = [ordered]@{}
         $partitionOk = $true
+        $partitionDuplicated = @()
         foreach ($field in @("violatingConstructs", "compliantConstructs", "notInReachConstructs", "unknownConstructs")) {
             $expanded = Expand-ReviewerConventionSpecialistConstructIds `
                 -Text ([string](Get-ReviewerConventionSpecialistValue $row $field "")) `
                 -MaxIds ($constructById.Count + 16)
             if (-not $expanded.Ok) { $partitionOk = $false }
+            foreach ($dup in @($expanded.Duplicated)) {
+                if ($partitionDuplicated -cnotcontains $dup) { $partitionDuplicated += $dup }
+            }
             $partition[$field] = @($expanded.Ids)
         }
         $violating = @($partition["violatingConstructs"])
@@ -865,6 +876,14 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         if (-not $partitionOk) {
             $status = "unknown"
             if (-not $degradedReason) { $degradedReason = "the row wrote a construct range the wrapper could not read" }
+        }
+        # A repeat inside one list is as much a broken cover as a repeat across
+        # two. The expander refuses to collapse it quietly, so say so here.
+        if ($partitionDuplicated.Count -gt 0) {
+            $status = "unknown"
+            if (-not $degradedReason) {
+                $degradedReason = "the row named $(($partitionDuplicated | Select-Object -First 4) -join ', ') twice in one verdict list"
+            }
         }
 
         # Reject a partition that is larger than the anchor set before doing
