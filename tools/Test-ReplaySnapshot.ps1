@@ -697,6 +697,26 @@ try {
         @($violationUnderUnknown.UnemittedViolations).Count -eq 1) `
         "A violation the row named must be recorded even when an undecided anchor makes the row unknown."
 
+    # An accounting where every row ruled every anchor out of reach is spelled
+    # correctly and has looked at nothing. "Complete: True" is the one line a
+    # reader trusts, so it must not sit on top of that.
+    $everythingOutOfReach = Invoke-Coverage -WithConstructs $threeAnchors -Rows @(
+        (New-PartitionRow -Ref "rs0" -Sha ("a" * 64) -Status "notApplicable" -NotInReach "mi0-mi2"),
+        (New-PartitionRow -Ref "rs1" -Sha ("b" * 64) -Status "notApplicable" -NotInReach "mi0-mi2"))
+    Assert-Replay ([string]@($everythingOutOfReach.Rows)[0].status -ceq "notApplicable" -and
+        -not [bool]$everythingOutOfReach.Complete -and
+        [int]$everythingOutOfReach.CheckedConstructCount -eq 0) `
+        "A checklist whose every row weighed nothing must not report itself complete, however correct each row is."
+    # A row over an empty change set is a different thing and stays complete.
+    # Called directly: an empty array passed through the helper's optional
+    # parameter binds as $null and falls back to the default construct set.
+    $noConstructsAtAll = Resolve-ReviewerConventionSpecialistRuleCoverage -ResolvedSources $sources `
+        -AcceptedCandidates @() -Constructs @() -Rows @(
+        (New-PartitionRow -Ref "rs0" -Sha ("a" * 64) -Status "notApplicable" -Scope "none"),
+        (New-PartitionRow -Ref "rs1" -Sha ("b" * 64) -Status "notApplicable" -Scope "none"))
+    Assert-Replay ([bool]$noConstructsAtAll.Complete) `
+        "With no anchors enumerated at all there is nothing to weigh, and the accounting is complete over it."
+
     $index = Get-ReviewerConventionSpecialistChangedFileIndex -ChangeEntries @(        [pscustomobject][ordered]@{ Path = "src/z.cs"; Role = "current" },
         [pscustomobject][ordered]@{ Path = "src/a.cs"; Role = "current" },
         [pscustomobject][ordered]@{ Path = "src/gone.cs"; Role = "original" }
@@ -1168,6 +1188,22 @@ try {
         })
     Assert-Replay (@($unmodelled.Constructs).Count -eq 0) `
         "A file in a language this enumerator does not model must yield no constructs (got $(@($unmodelled.Constructs).Count))."
+    # The backtick is why the modelled list is short: it quotes a template
+    # literal in one language, a raw string in another, and an identifier in a
+    # third. A Kotlin test named in backticks was being read as a call.
+    foreach ($backticked in @("src/WidgetTest.kt", "src/thing.go", "src/q.ts")) {
+        Assert-Replay (-not (Test-ReviewerConstructModelledFile -Path $backticked)) `
+            "'$backticked' uses the backtick for something this lexer does not model and must not be enumerated."
+    }
+    Assert-Replay ((Test-ReviewerConstructModelledFile -Path "src/Widget.cs") -and
+        (Test-ReviewerConstructModelledFile -Path "src/Widget.java")) `
+        "A language whose lexis this enumerator does model must still be enumerated."
+    $strayBacktick = Get-ReviewerChangedConstructs -Files @(@{
+            Path = "src/Odd.cs"; Lines = @('public void T()', '{', '    var s = `weird`;', '    Log(', '        text: 1);', '}')
+            ChangedLines = @(1, 2, 3, 4, 5, 6)
+        })
+    Assert-Replay (@($strayBacktick.PartiallyUnderstoodFiles) -ccontains "src/Odd.cs") `
+        "A backtick in a language that has no use for one means the file is not what it claims, and must be reported as not understood."
     Assert-Replay (@($unmodelled.PartiallyUnderstoodFiles) -ccontains "tools/Thing.ps1") `
         "An unmodelled file must be reported as only partly understood, which is what makes the accounting say it did not cover the change set."
     $reviewerConstructWiring = [IO.File]::ReadAllText((Join-Path $RepoRoot "src\Agents\reviewer\Start-ReviewerAgent.ps1"))

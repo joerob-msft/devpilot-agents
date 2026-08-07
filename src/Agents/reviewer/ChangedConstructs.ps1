@@ -53,14 +53,20 @@ $script:ReviewerConstructUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
 # wrong in the fail-OPEN direction: prose enumerated as code, and exactly the
 # shape fact a naming rule consumes, manufactured at scale and labelled known.
 #
+# The backtick is why this list is shorter than it could be. It quotes a
+# template literal in JavaScript and TypeScript, a raw string in Go where `\`
+# does NOT escape, and an IDENTIFIER in Kotlin, Scala and Groovy - where a test
+# named `` `renders when enabled` `` was being read as a call with two named
+# arguments. One character, four incompatible meanings, and no way to tell them
+# apart without knowing the language. Those extensions are off the list rather
+# than guessed at.
+#
 # A file whose extension is not on this list is still reported, as partly
 # understood, so the accounting says it did not cover the whole change set
 # rather than covering it wrongly.
 $script:ReviewerConstructModelledExtensions = @(
-    ".c", ".cc", ".cpp", ".cs", ".cxx", ".d", ".go", ".groovy", ".h", ".hh",
-    ".hpp", ".hxx", ".java", ".js", ".json", ".jsonc", ".jsx", ".kt", ".kts",
-    ".m", ".mjs", ".mm", ".php", ".proto", ".rs", ".scala", ".swift", ".ts",
-    ".tsx"
+    ".c", ".cc", ".cpp", ".cs", ".cxx", ".d", ".h", ".hh", ".hpp", ".hxx",
+    ".java", ".json", ".jsonc", ".m", ".mm", ".php", ".proto", ".rs", ".swift"
 )
 
 function Test-ReviewerConstructModelledFile {
@@ -150,12 +156,8 @@ function Get-ReviewerConstructMaskedLines {
                 continue
             }
             if ($inBacktick) {
-                # `\` escapes the next character, including a closing backtick.
-                if ($ch -eq '\') {
-                    $span = [Math]::Min(2, $line.Length - $i)
-                    [void]$out.Append(' ' * $span); $i += $span; continue
-                }
-                if ($ch -eq '`') { $inBacktick = $false; [void]$out.Append(' '); $i++; continue }
+                # Retained only so a stale flag cannot silently change meaning;
+                # nothing sets it now that the backtick masks to end of line.
                 [void]$out.Append(' '); $i++
                 continue
             }
@@ -168,14 +170,13 @@ function Get-ReviewerConstructMaskedLines {
             if ($ch -eq '/' -and $next -eq '*') { $inBlockComment = $true; $hasComment = $true; [void]$out.Append('  '); $i += 2; continue }
             if ($ch -eq '@' -and $next -eq '"') { $inVerbatim = $true; [void]$out.Append('  '); $i += 2; continue }
             if ($ch -eq '`') {
-                # A template literal. Ten of the extensions this enumerator
-                # accepts use them, and they span lines - so without state here
-                # a SQL string in a .ts file became two declarations and a Go
-                # template became a call, all reported `known` and all of them
-                # usable as candidate anchors inside string content.
-                $inBacktick = $true
-                [void]$out.Append(' ')
-                $i++
+                # No language on the modelled list gives the backtick a meaning,
+                # so one here means the file is not what its extension says or
+                # the lexis has moved on. Either way the rest of the line is not
+                # something to guess about.
+                $truncated = $true
+                [void]$out.Append(' ' * ($line.Length - $i))
+                $i = $line.Length
                 continue
             }
             if ($ch -eq '"' -and $next -eq '"' -and ($i + 2 -lt $line.Length) -and $line[$i + 2] -eq '"') {
@@ -681,13 +682,20 @@ function Get-ReviewerConstructAttributeFrequency {
     )
     $counts = [System.Collections.Generic.Dictionary[string, int]]::new([StringComparer]::Ordinal)
     $declarationCount = 0
+    $frequencyTruncated = $false
     for ($index = 0; $index -lt $DeclarationIndex.Count; $index++) {
         $declaration = $DeclarationIndex[$index]
         if ($null -eq $declaration) { continue }
+        # A declaration whose own attribute list was cut short makes this count
+        # wrong in the direction that matters: it reports an attribute as
+        # appearing on fewer declarations than it does, which reads as "this
+        # file has never used it" - a precedent fact, inverted.
+        if ([bool]$declaration.Truncated) { $frequencyTruncated = $true }
         $declarationCount++
         foreach ($attribute in @($declaration.Attributes)) {
             if ($counts.ContainsKey($attribute)) { $counts[$attribute] = $counts[$attribute] + 1 }
             elseif ($counts.Count -lt $script:ReviewerConstructMaxAttributeNames) { $counts[$attribute] = 1 }
+            else { $frequencyTruncated = $true }
         }
     }
     $names = [string[]]@($counts.Keys)
@@ -696,7 +704,7 @@ function Get-ReviewerConstructAttributeFrequency {
     foreach ($name in $names) {
         [void]$rows.Add([pscustomobject][ordered]@{ attribute = $name; declarations = [int]$counts[$name] })
     }
-    return @{ DeclarationCount = $declarationCount; Attributes = @($rows.ToArray()) }
+    return @{ DeclarationCount = $declarationCount; Attributes = @($rows.ToArray()); Truncated = $frequencyTruncated }
 }
 
 function Get-ReviewerConstructDeclarationIndex {
@@ -1044,10 +1052,15 @@ function Get-ReviewerChangedConstructs {
             $perFileTruncated = $true
         }
         $frequency = Get-ReviewerConstructAttributeFrequency -DeclarationIndex $declarationIndex
+        if ([bool]$frequency.Truncated) { [void]$partialFiles.Add($path) }
         [void]$fileSummaries.Add([pscustomobject][ordered]@{
                 path = $path
                 declarationCount = [int]$frequency.DeclarationCount
                 attributeFrequency = @($frequency.Attributes)
+                # False when a count above is lower than the truth because the
+                # wrapper stopped reading, not because the attribute is rarer.
+                # A precedent argument built on it would be inverted.
+                attributeCountsComplete = (-not [bool]$frequency.Truncated)
             })
     }
 

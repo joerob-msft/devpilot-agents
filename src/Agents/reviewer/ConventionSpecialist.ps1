@@ -57,7 +57,7 @@ function Expand-ReviewerConventionSpecialistConstructIds {
         range must stay within one kind and must not run backwards; anything
         else is reported unreadable rather than guessed at.
     #>
-    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text, [int]$MaxIds = 4096)
     $ids = [System.Collections.Generic.List[string]]::new()
     $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($part in @(($Text -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
@@ -75,6 +75,11 @@ function Expand-ReviewerConventionSpecialistConstructIds {
             if ($last -lt $first) { return @{ Ok = $false; Ids = @() } }
         }
         for ($index = $first; $index -le $last; $index++) {
+            # Stop AT the ceiling, not after it. A schema-legal field can name
+            # forty thousand-wide ranges; expanding them all first and
+            # diagnosing afterwards cost twenty-three seconds on the mandatory
+            # path, three times over if the specialist retries.
+            if ($ids.Count -ge $MaxIds) { return @{ Ok = $false; Ids = @() } }
             $id = "$prefix$index"
             if ($seen.Add($id)) { [void]$ids.Add($id) }
         }
@@ -848,7 +853,8 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         $partitionOk = $true
         foreach ($field in @("violatingConstructs", "compliantConstructs", "notInReachConstructs", "unknownConstructs")) {
             $expanded = Expand-ReviewerConventionSpecialistConstructIds `
-                -Text ([string](Get-ReviewerConventionSpecialistValue $row $field ""))
+                -Text ([string](Get-ReviewerConventionSpecialistValue $row $field "")) `
+                -MaxIds ($constructById.Count + 16)
             if (-not $expanded.Ok) { $partitionOk = $false }
             $partition[$field] = @($expanded.Ids)
         }
@@ -1104,6 +1110,13 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
             })
     }
 
+    # An accounting that weighed no anchor at all is not complete over anything,
+    # however correctly each row is spelled. Every row may legitimately rule its
+    # anchors out of reach - but then the whole checklist has looked at nothing,
+    # and `Complete` is the one word a reader trusts.
+    $checkedConstructCount = [int](@(@($normalized) | ForEach-Object {
+                @($_.violatingConstructs).Count + @($_.compliantConstructs).Count + @($_.unknownConstructs).Count
+            } | Measure-Object -Sum).Sum)
     $missing = [System.Collections.Generic.List[string]]::new()
     foreach ($entry in @($request.Requested)) {
         if (-not $seen.Contains([string]$entry.ruleRef)) {
@@ -1137,9 +1150,7 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         # different claim from "checked 120", and a reader must be able to see
         # which one they are looking at.
         EnumeratedConstructCount = $constructById.Count
-        CheckedConstructCount = [int](@(@($normalized) | ForEach-Object {
-                    @($_.violatingConstructs).Count + @($_.compliantConstructs).Count + @($_.unknownConstructs).Count
-                } | Measure-Object -Sum).Sum)
+        CheckedConstructCount = $checkedConstructCount
         NotInReachConstructCount = [int](@(@($normalized) | ForEach-Object { @($_.notInReachConstructs).Count } | Measure-Object -Sum).Sum)
         UnemittedViolations = @($unemitted.ToArray())
         ConstructsIncomplete = $ConstructsIncomplete
@@ -1166,7 +1177,13 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         Complete = ($seen.Count -eq @($request.Requested).Count -and @($request.Unrequested).Count -eq 0 -and
             $duplicates.Count -eq 0 -and $unknown.Count -eq 0 -and
             $degradedCount -eq 0 -and @($unaccountedCandidates).Count -eq 0 -and
-            -not $ConstructsIncomplete)
+            -not $ConstructsIncomplete -and
+            # An accounting that weighed no anchor at all is not complete over
+            # anything, however correctly each row is spelled. Every row may
+            # legitimately rule its anchors out of reach - but then the whole
+            # checklist has looked at nothing, and "Complete" would be the one
+            # word a reader trusts.
+            (@($Constructs).Count -eq 0 -or $checkedConstructCount -gt 0))
     }
 }
 
