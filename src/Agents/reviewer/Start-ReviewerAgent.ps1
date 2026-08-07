@@ -1953,7 +1953,7 @@ function Get-ReviewerExistingFingerprints {
             if ($fp) { [void]$set.Add($fp) }
         }
     }
-    return $set
+    return , $set
 }
 
 function Get-ReviewerThreadReplyFingerprint {
@@ -1973,7 +1973,7 @@ function Get-ReviewerExistingThreadReplyFingerprints {
             if ($fp) { [void]$set.Add($fp) }
         }
     }
-    return $set
+    return , $set
 }
 
 function Select-ReviewerEligibleThreadReplies {
@@ -2943,6 +2943,15 @@ function Invoke-DryRunSelfChecks {
     $existing = Get-ReviewerExistingFingerprints -Threads @(@{ comments = @(@{ content = $body }) })
     if (-not $existing.Contains($fpA)) { $failures.Add("An already-posted comment was not recognized from the PR, so it would be posted twice.") }
     else { Write-Host "  OK - an already-posted comment is recognized from the PR itself, not from local state" -ForegroundColor Green }
+    $emptyExisting = Get-ReviewerExistingFingerprints -Threads @()
+    $emptyThreadReplies = Get-ReviewerExistingThreadReplyFingerprints -Threads @()
+    try {
+        [void]$emptyExisting.Add('finding-probe')
+        [void]$emptyThreadReplies.Add('thread-reply-probe')
+    }
+    catch {
+        $failures.Add("Empty existing-comment fingerprint sets were not preserved as mutable HashSets.")
+    }
     # The same sentence at two call sites is two findings. A body-only
     # fingerprint would treat the second as already posted, drop it, and still
     # count it - which then satisfies the "everything is visible" precondition
