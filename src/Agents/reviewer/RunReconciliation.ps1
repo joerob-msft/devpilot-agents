@@ -18,7 +18,37 @@
 Set-StrictMode -Version Latest
 
 $script:ReviewerRunReconciliationKind = "reviewer.run-reconciliation"
+$script:ReviewerRunReconciliationSetKind = "reviewer.run-reconciliation-set"
 $script:ReviewerRunReconciliationVersion = 1
+
+function Read-ReviewerRunReconciliationSet {
+    <#
+        Reads a sealed qualification-set declaration.
+
+        Separate from the specialist preview reader because the kind is
+        different, and because a declaration that verified as a run artifact
+        would be a declaration somebody could have written afterwards.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][byte[]]$MasterKey)
+    $envelope = [IO.File]::ReadAllText($Path, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+    $manifestJson = [string](Get-ReviewerConventionSpecialistValue $envelope "manifestJson" "")
+    $signature = [string](Get-ReviewerConventionSpecialistValue $envelope "signature" "")
+    $key = Get-ReviewerConventionSpecialistDomainKey -MasterKey $MasterKey -Domain preview
+    if (-not $manifestJson -or
+        -not (Test-ReviewerConventionSpecialistSignature -Json $manifestJson -Key $key -Signature $signature)) {
+        throw "Qualification run-set signature verification failed."
+    }
+    $set = $manifestJson | ConvertFrom-Json -Depth 8
+    if ([string](Get-ReviewerConventionSpecialistValue $set "kind" "") -cne $script:ReviewerRunReconciliationSetKind) {
+        throw "That artifact is not a qualification run-set declaration."
+    }
+    foreach ($field in @("setId", "snapshotName", "snapshotManifestDigest", "plannedRunCount")) {
+        if (-not (Get-ReviewerConventionSpecialistValue $set $field "")) {
+            throw "The qualification run set is missing '$field'."
+        }
+    }
+    return $set
+}
 
 # A key separator that cannot appear in the fields it joins. `|` looked fine
 # until you notice `ruleSourceId` is schema-allowed any printable ASCII, so one
@@ -78,6 +108,12 @@ function Get-ReviewerRunReconciliationIdList {
     param([AllowNull()]$Value)
     # Ordinal sort, because the comparison below is a set comparison and the
     # order a model happened to write ids in is not a difference.
+    #
+    # Callers must cast to `[string[]]`, NOT wrap in `@()`. The `return , @()`
+    # idiom keeps a single-element list a list, and `@()` around such a call
+    # wraps the whole array as ONE element - which made every anchor id an
+    # array rather than a string, so hashtable lookups compared by reference
+    # and set comparisons compared the stringification of the whole set.
     $ids = [System.Collections.Generic.List[string]]::new()
     foreach ($id in @($Value)) {
         $text = [string]$id
@@ -85,7 +121,7 @@ function Get-ReviewerRunReconciliationIdList {
     }
     $array = $ids.ToArray()
     [Array]::Sort($array, [StringComparer]::Ordinal)
-    return , @($array)
+    return , [string[]]$array
 }
 
 function Get-ReviewerRunReconciliationBinding {
@@ -288,95 +324,184 @@ function Resolve-ReviewerRunReconciliation {
     $sortedRuleKeys = @($ruleKeys.ToArray())
     [Array]::Sort($sortedRuleKeys, [StringComparer]::Ordinal)
 
+
+    # Per rule, and then per ANCHOR inside it.
+    #
+    # Comparing four id lists tells you THAT two runs disagreed. It does not
+    # tell you which anchor they disagreed about, and "the violating anchors
+    # differ" is not something a reader can act on. So each construct gets its
+    # own reconciled verdict: every run's verdict for that id is collected, and
+    # if they are not all the same the anchor is `unknown` with both readings
+    # named. The rule's status is then derived from the anchors, exactly as the
+    # wrapper derives a row's status from its partition.
+    #
+    # Nothing here reads run 1 as a reference. Every comparison is over the SET
+    # of readings, so listing the runs in a different order cannot change the
+    # outcome - which matters, because "whichever run you happened to put first"
+    # is precisely the kind of favourable selection this exists to prevent.
     $rows = [System.Collections.Generic.List[object]]::new()
     $stableCount = 0
     $unstableCount = 0
+    $verdictFields = [ordered]@{
+        violation = "violating"
+        compliant = "compliant"
+        notInReach = "notInReach"
+        unknown = "unknown"
+    }
     foreach ($key in $sortedRuleKeys) {
         $rawStatuses = [System.Collections.Generic.List[string]]::new()
         $readings = [System.Collections.Generic.List[object]]::new()
-        $reference = $null
-        $agreed = $true
         $disagreements = [System.Collections.Generic.List[string]]::new()
+        $anchorVerdicts = @{}
+        $anchorIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $distinctStatuses = [System.Collections.Generic.List[string]]::new()
+        $distinctRules = [System.Collections.Generic.List[string]]::new()
+        $anyAbsent = $false
+
         for ($i = 0; $i -lt $byRun.Count; $i++) {
+            $run = $i + 1
             $row = $(if ($byRun[$i].Contains($key)) { $byRun[$i][$key] } else { $null })
             if ($null -eq $row) {
+                $anyAbsent = $true
                 [void]$rawStatuses.Add("absent")
                 [void]$readings.Add([pscustomobject][ordered]@{
-                        run = $i + 1; status = "absent"; violating = @(); compliant = @()
-                        notInReach = @(); unknown = @(); candidateId = ""; degradedReason = "the run did not account for this rule at all"
+                        run = $run; status = "absent"; violating = @(); compliant = @()
+                        notInReach = @(); unknown = @(); candidateId = ""
+                        degradedReason = "the run did not account for this rule at all"
+                        ruleRef = $key; ruleSourceId = ""; ruleSourceSha256 = ""
                     })
-                $agreed = $false
-                [void]$disagreements.Add("run $($i + 1) did not account for this rule")
+                [void]$disagreements.Add("run $run did not account for this rule")
                 continue
             }
             $reading = [pscustomobject][ordered]@{
-                run = $i + 1
+                run = $run
                 status = [string](Get-ReviewerRunReconciliationValue $row "status" "")
-                violating = @(Get-ReviewerRunReconciliationIdList (Get-ReviewerRunReconciliationValue $row "violatingConstructs" @()))
-                compliant = @(Get-ReviewerRunReconciliationIdList (Get-ReviewerRunReconciliationValue $row "compliantConstructs" @()))
-                notInReach = @(Get-ReviewerRunReconciliationIdList (Get-ReviewerRunReconciliationValue $row "notInReachConstructs" @()))
-                unknown = @(Get-ReviewerRunReconciliationIdList (Get-ReviewerRunReconciliationValue $row "unknownConstructs" @()))
+                violating = [string[]](Get-ReviewerRunReconciliationIdList (Get-ReviewerRunReconciliationValue $row "violatingConstructs" @()))
+                compliant = [string[]](Get-ReviewerRunReconciliationIdList (Get-ReviewerRunReconciliationValue $row "compliantConstructs" @()))
+                notInReach = [string[]](Get-ReviewerRunReconciliationIdList (Get-ReviewerRunReconciliationValue $row "notInReachConstructs" @()))
+                unknown = [string[]](Get-ReviewerRunReconciliationIdList (Get-ReviewerRunReconciliationValue $row "unknownConstructs" @()))
                 candidateId = [string](Get-ReviewerRunReconciliationValue $row "candidateId" "")
                 degradedReason = [string](Get-ReviewerRunReconciliationValue $row "degradedReason" "")
                 ruleRef = [string](Get-ReviewerRunReconciliationValue $row "ruleRef" "")
                 ruleSourceId = [string](Get-ReviewerRunReconciliationValue $row "ruleSourceId" "")
                 ruleSourceSha256 = [string](Get-ReviewerRunReconciliationValue $row "ruleSourceSha256" "")
             }
-            # A row with no status at all is not a reading two runs can share.
-            # Left alone, two blank statuses compare equal and reconcile to a
-            # stable empty string, which prints as a row that agreed on nothing.
-            if (-not $reading.status) {
-                $agreed = $false
-                [void]$disagreements.Add("run $($reading.run) gave this rule no status")
-            }
-            [void]$rawStatuses.Add($(if ($reading.status) { $reading.status } else { "(none)" }))
             [void]$readings.Add($reading)
-            if ($null -eq $reference) { $reference = $reading; continue }
-            # Same slot, different rule. The refs line up positionally, so this
-            # is the check that the position still means what it meant.
-            if ([string]::CompareOrdinal($reference.ruleSourceId, $reading.ruleSourceId) -ne 0 -or
-                [string]::CompareOrdinal($reference.ruleSourceSha256, $reading.ruleSourceSha256) -ne 0) {
-                $agreed = $false
-                [void]$disagreements.Add("run $($reading.run) accounted for a different rule in this slot " +
-                    "($($reference.ruleSourceId) vs $($reading.ruleSourceId))")
-            }
-            if ([string]::CompareOrdinal($reference.status, $reading.status) -ne 0) {
-                $agreed = $false
-                [void]$disagreements.Add("run 1 read $($reference.status) and run $($reading.run) read $($reading.status)")
-            }
-            # Agreeing on the word while disagreeing about which anchors carry
-            # it is still disagreement. `violation as2` and `violation as7` are
-            # two different findings wearing one status.
-            foreach ($part in @(
-                    @{ Name = "violating"; Left = $reference.violating; Right = $reading.violating },
-                    @{ Name = "compliant"; Left = $reference.compliant; Right = $reading.compliant },
-                    @{ Name = "out of reach"; Left = $reference.notInReach; Right = $reading.notInReach },
-                    @{ Name = "unknown"; Left = $reference.unknown; Right = $reading.unknown })) {
-                if (-not (Test-ReviewerRunReconciliationSetsEqual $part.Left $part.Right)) {
-                    $agreed = $false
-                    $diff = Get-ReviewerRunReconciliationDifference $part.Left $part.Right
-                    $detail = @()
-                    if (@($diff.OnlyLeft).Count -gt 0) { $detail += "only run 1: " + ((@($diff.OnlyLeft) | Select-Object -First 12) -join ",") }
-                    if (@($diff.OnlyRight).Count -gt 0) { $detail += "only run $($reading.run): " + ((@($diff.OnlyRight) | Select-Object -First 12) -join ",") }
-                    [void]$disagreements.Add("the $($part.Name) anchors differ (" + ($detail -join "; ") + ")")
+            # A row with no status at all is not a reading anyone can share.
+            # Left alone, two blanks compare equal and reconcile to a stable
+            # empty string, which prints as a row that agreed about nothing.
+            $statusWord = $(if ($reading.status) { $reading.status } else { "(none)" })
+            [void]$rawStatuses.Add($statusWord)
+            if ($distinctStatuses -cnotcontains $statusWord) { [void]$distinctStatuses.Add($statusWord) }
+            $ruleIdentity = $reading.ruleSourceId + $script:ReviewerRunReconciliationSeparator + $reading.ruleSourceSha256
+            if ($distinctRules -cnotcontains $ruleIdentity) { [void]$distinctRules.Add($ruleIdentity) }
+
+            foreach ($verdict in @($verdictFields.Keys)) {
+                foreach ($id in @($reading.($verdictFields[$verdict]))) {
+                    [void]$anchorIds.Add($id)
+                    if (-not $anchorVerdicts.ContainsKey($id)) { $anchorVerdicts[$id] = @{} }
+                    # A run that files one id under two verdicts already failed
+                    # the wrapper's disjointness check; here it simply cannot be
+                    # a single reading, so record the conflict.
+                    if ($anchorVerdicts[$id].ContainsKey($run) -and $anchorVerdicts[$id][$run] -cne $verdict) {
+                        $anchorVerdicts[$id][$run] = "conflicted"
+                    }
+                    elseif (-not $anchorVerdicts[$id].ContainsKey($run)) {
+                        $anchorVerdicts[$id][$run] = $verdict
+                    }
                 }
             }
         }
-        # The whole point. Disagreement does not resolve to the interesting
-        # reading, or the common one, or the first one. It resolves to `unknown`.
-        $reconciled = $(if ($agreed -and $null -ne $reference) { $reference.status } else { "unknown" })
-        $stable = [bool]($agreed -and $null -ne $reference)
+
+        if ($anyAbsent) { }
+        if (@($distinctRules).Count -gt 1) {
+            [void]$disagreements.Add("the runs accounted for different rules in this slot: " +
+                (@(@($distinctRules) | ForEach-Object { ($_ -split $script:ReviewerRunReconciliationSeparator)[0] }) -join " vs "))
+        }
+        if (@($distinctStatuses).Count -gt 1 -or $anyAbsent) {
+            [void]$disagreements.Add("the runs read this rule as " + ((@($rawStatuses) | Sort-Object -Unique) -join " / "))
+        }
+        if (@($distinctStatuses) -ccontains "(none)") {
+            [void]$disagreements.Add("a run gave this rule no status at all")
+        }
+
+        # Now the anchors. Order-independent by construction: the id set is a
+        # set, and each id's verdict is the single value every run gave it, or
+        # `unknown`.
+        $sortedAnchorIds = @($anchorIds)
+        [Array]::Sort($sortedAnchorIds, [StringComparer]::Ordinal)
+        $anchorRows = [System.Collections.Generic.List[object]]::new()
+        $anchorStable = $true
+        $normalizedViolating = [System.Collections.Generic.List[string]]::new()
+        $normalizedNotInReach = [System.Collections.Generic.List[string]]::new()
+        $normalizedWeighed = 0
+        $anyAnchorUnknown = $false
+        foreach ($id in $sortedAnchorIds) {
+            $perRun = [System.Collections.Generic.List[string]]::new()
+            $distinct = [System.Collections.Generic.List[string]]::new()
+            for ($i = 0; $i -lt $byRun.Count; $i++) {
+                $run = $i + 1
+                # A run that never mentioned this anchor gave it no verdict.
+                # That is not silence to be filled in from another run; it is
+                # exactly the omission the whole partition exists to catch.
+                $verdict = $(if ($anchorVerdicts[$id].ContainsKey($run)) { [string]$anchorVerdicts[$id][$run] } else { "unaccounted" })
+                [void]$perRun.Add($verdict)
+                if ($distinct -cnotcontains $verdict) { [void]$distinct.Add($verdict) }
+            }
+            $settled = (@($distinct).Count -eq 1 -and @($distinct)[0] -cne "conflicted" -and @($distinct)[0] -cne "unaccounted")
+            $verdictFor = $(if ($settled) { @($distinct)[0] } else { "unknown" })
+            if (-not $settled) {
+                $anchorStable = $false
+                $sortedDistinct = @($distinct)
+                [Array]::Sort($sortedDistinct, [StringComparer]::Ordinal)
+                [void]$disagreements.Add("anchor $id read as " + ($sortedDistinct -join " / "))
+            }
+            switch -CaseSensitive ($verdictFor) {
+                "violation" { [void]$normalizedViolating.Add($id); $normalizedWeighed++ }
+                "compliant" { $normalizedWeighed++ }
+                "notInReach" { [void]$normalizedNotInReach.Add($id) }
+                default { $anyAnchorUnknown = $true; $normalizedWeighed++ }
+            }
+            [void]$anchorRows.Add([pscustomobject][ordered]@{
+                    constructId = $id
+                    reconciledVerdict = $verdictFor
+                    stable = $settled
+                    perRunVerdicts = @($perRun.ToArray())
+                })
+        }
+
+        # The rule's status comes from its anchors, the same way the wrapper
+        # derives a row's status from its partition - and collapses outright if
+        # the runs could not even agree what word to use, what rule this slot
+        # was about, or whether the rule was accounted for at all.
+        $statusAgreed = (@($distinctStatuses).Count -le 1 -and -not $anyAbsent -and
+            @($distinctRules).Count -le 1 -and @($distinctStatuses) -cnotcontains "(none)")
+        $stable = [bool]($statusAgreed -and $anchorStable -and @($readings).Count -gt 0)
+        $derived = $(if ($anyAnchorUnknown) { "unknown" }
+            elseif ($normalizedViolating.Count -gt 0) { "violation" }
+            elseif ($normalizedWeighed -eq 0) { "notApplicable" }
+            else { "compliant" })
+        $reconciledStatus = $(if (-not $stable) { "unknown" }
+            elseif (@($distinctStatuses).Count -eq 1 -and @($distinctStatuses)[0] -cne $derived) {
+                # Every run said the same word and the anchors say another. The
+                # anchors decide, as they do inside a single run.
+                [void]$disagreements.Add("every run said $(@($distinctStatuses)[0]) but the reconciled anchors say $derived")
+                "unknown"
+            }
+            else { $derived })
+        if ($reconciledStatus -cne $derived -or -not $stable) { $stable = $false }
         if ($stable) { $stableCount++ } else { $unstableCount++ }
         [void]$rows.Add([pscustomobject][ordered]@{
-                ruleSourceId = $(if ($null -ne $reference) { [string]$reference.ruleSourceId } else { "" })
+                ruleSourceId = $(if (@($distinctRules).Count -eq 1) { (@($distinctRules)[0] -split $script:ReviewerRunReconciliationSeparator)[0] } else { "" })
                 ruleRef = $key
-                reconciledStatus = $reconciled
+                reconciledStatus = $reconciledStatus
                 stable = $stable
                 rawStatuses = @($rawStatuses.ToArray())
                 disagreements = @($disagreements.ToArray())
                 readings = @($readings.ToArray())
-                violatingConstructs = @($(if ($stable) { $reference.violating } else { @() }))
-                notInReachConstructs = @($(if ($stable) { $reference.notInReach } else { @() }))
+                anchors = @($anchorRows.ToArray())
+                violatingConstructs = @($(if ($stable) { $normalizedViolating.ToArray() } else { @() }))
+                notInReachConstructs = @($(if ($stable) { $normalizedNotInReach.ToArray() } else { @() }))
             })
     }
 
@@ -461,7 +586,7 @@ function Resolve-ReviewerRunReconciliation {
         $agreedCandidateCount = 0
     }
 
-    return [pscustomobject][ordered]@{
+    $result = [pscustomobject][ordered]@{
         kind = $script:ReviewerRunReconciliationKind
         version = $script:ReviewerRunReconciliationVersion
         reconciled = $reconciled
@@ -477,6 +602,42 @@ function Resolve-ReviewerRunReconciliation {
         agreedCandidateCount = $agreedCandidateCount
         candidates = @($candidates.ToArray())
     }
+    # A digest over the OUTCOME, not the inputs, and specifically not over
+    # anything that carries the order the runs were listed in. Two operators who
+    # reconcile the same sealed runs must be able to compare one hex string and
+    # know they read the same thing.
+    $sortedNonces = @(@($runSummaries.ToArray()) | ForEach-Object { [string]$_.replayNonce })
+    [Array]::Sort($sortedNonces, [StringComparer]::Ordinal)
+    $sortedProblems = @($problems.ToArray())
+    [Array]::Sort($sortedProblems, [StringComparer]::Ordinal)
+    $orderFree = [ordered]@{
+        version = $script:ReviewerRunReconciliationVersion
+        reconciled = $reconciled
+        binding = [string]$binding
+        runNonces = @($sortedNonces)
+        problems = @($sortedProblems)
+        rules = @(@($rows.ToArray()) | ForEach-Object {
+                [ordered]@{
+                    ruleRef = [string]$_.ruleRef
+                    ruleSourceId = [string]$_.ruleSourceId
+                    status = [string]$_.reconciledStatus
+                    stable = [bool]$_.stable
+                    anchors = @(@($_.anchors) | ForEach-Object {
+                            [ordered]@{ id = [string]$_.constructId; verdict = [string]$_.reconciledVerdict; stable = [bool]$_.stable }
+                        })
+                }
+            })
+        candidates = @(@($candidates.ToArray()) | ForEach-Object {
+                [ordered]@{
+                    rule = [string]$_.ruleSourceId; path = [string]$_.filePath
+                    line = [string]$_.line; disposition = [string]$_.disposition
+                }
+            })
+    }
+    $result | Add-Member -NotePropertyName reconciliationSha256 `
+        -NotePropertyValue (Get-ReviewerConventionSpecialistSha256 `
+            -Text (ConvertTo-ReviewerConventionSpecialistCanonicalJson -Value $orderFree)) -Force
+    return $result
 }
 
 function Format-ReviewerRunReconciliationReport {
@@ -486,6 +647,7 @@ function Format-ReviewerRunReconciliationReport {
     [void]$lines.Add("")
     [void]$lines.Add("Runs compared: $([int]$Reconciliation.runCount) (required: $([int]$Reconciliation.requiredRunCount))")
     [void]$lines.Add("Input binding: $([string]$Reconciliation.inputBindingSha256)")
+    [void]$lines.Add("Reconciliation digest: $([string]$Reconciliation.reconciliationSha256)")
     [void]$lines.Add("Reconciled: $([bool]$Reconciliation.reconciled)")
     if (@($Reconciliation.problems).Count -gt 0) {
         [void]$lines.Add("")
@@ -502,6 +664,13 @@ function Format-ReviewerRunReconciliationReport {
         [void]$lines.Add("- Raw per-run statuses: $((@($row.rawStatuses)) -join ', ')")
         if (@($row.violatingConstructs).Count -gt 0) {
             [void]$lines.Add("- Violating anchors: $((@($row.violatingConstructs)) -join ', ')")
+        }
+        $unsettled = @(@($row.anchors) | Where-Object { -not [bool]$_.stable })
+        if (@($row.anchors).Count -gt 0) {
+            [void]$lines.Add("- Anchors: $(@($row.anchors).Count) enumerated by the runs, $(@($row.anchors).Count - $unsettled.Count) settled, $($unsettled.Count) unsettled")
+        }
+        foreach ($anchor in @($unsettled | Select-Object -First 24)) {
+            [void]$lines.Add("  - $([string]$anchor.constructId): $((@($anchor.perRunVerdicts)) -join ' / ') -> $([string]$anchor.reconciledVerdict)")
         }
         foreach ($disagreement in @($row.disagreements)) { [void]$lines.Add("- Disagreement: $disagreement") }
     }

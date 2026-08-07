@@ -7937,6 +7937,18 @@ function Get-ReviewerPinnedConventionChangeSet {
     }
 }
 
+function Test-ReviewerConstructFileHadChangedLines {
+    <#
+        Did this changed file have source lines the enumerator should have
+        seen? `RawSpans` only exists on the entry the slicer builds, so a file
+        omitted earlier - too large, unreadable, past the file cap, a rejected
+        path - has none. `RawRequestedSpanCount` survives every omission path.
+    #>
+    param([Parameter(Mandatory)]$File)
+    if (@($File.RawSpans).Count -gt 0) { return $true }
+    return ([int](Get-ReviewerHashValue -Container $File -Key "RawRequestedSpanCount" -Default 0) -gt 0)
+}
+
 function Get-ReviewerConstructFilesFromReport {
     <#
         Turns the source-transport report into the shape the construct
@@ -7963,7 +7975,13 @@ function Get-ReviewerConstructFilesFromReport {
         $siblings = @($file.SiblingSlices)
         $path = ([string]$file.Path).TrimStart("/")
         if ($slices.Count -eq 0) {
-            if (@($file.RawSpans).Count -gt 0) { [void]$undelivered.Add($path) }
+            # `RawSpans` is only populated by the entry the SLICER builds. A
+            # file omitted before that - too large, unreadable, past the file
+            # cap, a rejected path - carries no spans at all, so gating on them
+            # missed precisely the files nobody read.
+            # `RawRequestedSpanCount` survives every omission path and is what
+            # "this file had changed lines" actually means.
+            if (Test-ReviewerConstructFileHadChangedLines -File $file) { [void]$undelivered.Add($path) }
             continue
         }
         $maxLine = 0
@@ -7971,7 +7989,7 @@ function Get-ReviewerConstructFilesFromReport {
             if ([int]$slice.EndLine -gt $maxLine) { $maxLine = [int]$slice.EndLine }
         }
         if ($maxLine -lt 1) {
-            if (@($file.RawSpans).Count -gt 0) { [void]$undelivered.Add($path) }
+            if (Test-ReviewerConstructFileHadChangedLines -File $file) { [void]$undelivered.Add($path) }
             continue
         }
         # A sparse image of the file: delivered lines in place, gaps blank. The
@@ -8038,7 +8056,7 @@ function Get-ReviewerConstructFilesFromReport {
             # Long, and arithmetic only. The raw ends are unbounded, so summing
             # them in an int is one hostile change set away from wrapping
             # negative and reporting a short file as fully delivered.
-            $spannedLines += ([long][Math]::Max(0, [long]$span.End - [long]$span.Start + 1))
+            $spannedLines += ([long][Math]::Max([long]0, [long]$span.End - [long]$span.Start + 1))
         }
         if ($spannedLines -gt 0 -and $changedLines.Count -lt $spannedLines) {
             [void]$undelivered.Add(([string]$file.Path).TrimStart("/"))

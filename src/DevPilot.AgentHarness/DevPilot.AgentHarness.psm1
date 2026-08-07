@@ -449,7 +449,7 @@ function Get-AgentCopilotArgs {
         $engineArgs += @("--model", $validated)
     }
     if ($ResumeSessionId) {
-        if ($ResumeSessionId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+        if ($ResumeSessionId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z') {
             throw "Get-AgentCopilotArgs: -ResumeSessionId '$ResumeSessionId' is not a valid session GUID."
         }
         $engineArgs += @("--resume", $ResumeSessionId)
@@ -626,7 +626,7 @@ function ConvertTo-AgentMarkerFieldValue {
             return @{ Ok = $true; Value = [int]$Value }
         }
         "guid" {
-            if ($Value -isnot [string] -or $Value -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') { return $bad }
+            if ($Value -isnot [string] -or $Value -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z') { return $bad }
             return @{ Ok = $true; Value = [string]$Value }
         }
         "exact" {
@@ -634,12 +634,12 @@ function ConvertTo-AgentMarkerFieldValue {
             return @{ Ok = $true; Value = [string]$Value }
         }
         "hex" {
-            if ($Value -isnot [string] -or $Value -notmatch "^[0-9a-fA-F]{$([int]$Spec.Length)}$") { return $bad }
+            if ($Value -isnot [string] -or $Value -notmatch "^[0-9a-fA-F]{$([int]$Spec.Length)}\z") { return $bad }
             return @{ Ok = $true; Value = [string]$Value }
         }
         "hexOrNull" {
             if ($null -eq $Value) { return @{ Ok = $true; Value = $null } }
-            if ($Value -is [string] -and $Value -match "^[0-9a-fA-F]{$([int]$Spec.Length)}$") { return @{ Ok = $true; Value = [string]$Value } }
+            if ($Value -is [string] -and $Value -match "^[0-9a-fA-F]{$([int]$Spec.Length)}\z") { return @{ Ok = $true; Value = [string]$Value } }
             return $bad
         }
         "enum" {
