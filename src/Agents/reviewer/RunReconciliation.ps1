@@ -333,8 +333,16 @@ function Resolve-ReviewerRunReconciliation {
     [Array]::Sort($sortedBindings, [StringComparer]::Ordinal)
     $binding = $(if (@($sortedBindings).Count -gt 0) { $sortedBindings[0] } else { "" })
     if (@($sortedBindings).Count -gt 1) {
+        # Members named by NONCE and sorted, not by position. A group written as
+        # "{run 3, run 4}" says something different when the operator lists the
+        # same runs the other way round, and that difference reached the digest.
         $groupText = @(@($sortedBindings) | ForEach-Object {
-                "{" + ((@($bindingGroups[$_]) | ForEach-Object { "run $_" }) -join ", ") + "} at " + $_.Substring(0, 12)
+                $members = @(@($bindingGroups[$_]) | ForEach-Object {
+                        $nonce = [string]@($runSummaries.ToArray())[$_ - 1].replayNonce
+                        $(if ($nonce) { $nonce } else { "unidentified" })
+                    })
+                [Array]::Sort($members, [StringComparer]::Ordinal)
+                "{" + ((@($members) | ForEach-Object { "run:" + $_ }) -join ", ") + "} at " + $_.Substring(0, 12)
             })
         [void]$problems.Add("the runs were produced from $(@($sortedBindings).Count) different inputs: " + ($groupText -join "; "))
     }
