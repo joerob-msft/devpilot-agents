@@ -261,19 +261,20 @@ Then version 2 collapses runs:
   disagreement - `violation at mi14` and `violation at mi15` are two findings
   wearing one status.
 - A rule some run never accounted for at all is `unknown`.
-- Candidate agreement uses `reviewer.semantic-candidate` version 1, not comment
+- Candidate agreement uses `reviewer.semantic-candidate` version 2, not comment
   text. Its sealed canonical payload binds the authoritative rule id and digest,
   normalized file path, anchor kind/line and exact construct spans, issue and
-  impact class, severity, deterministic fact and violation sets, and structured
-  remediation action/scope/targets/follow-up requirement. Candidate/model ids
-  and free-form prose are excluded.
+  impact class, severity, confidence, sibling status, deterministic fact and
+  violation sets, and structured remediation action/scope/targets/follow-up
+  requirement. Candidate/model ids and free-form prose are excluded.
 - When those semantics agree, the result is
   `semanticAgreementTextWithheld`: it is one stable evaluation finding, but its
   `comment` is empty and no model wording is selected. Every raw presentation
-  variant remains in deterministic nonce/digest order under
+  variant, including its confidence and sibling status, remains in deterministic nonce/digest order under
   `presentationVariants` until an independently verified renderer can produce
   canonical text.
 - A different rule digest, construct/span, issue or impact class, severity,
+  confidence, sibling status,
   deterministic evidence/violation set, or remediation identity is a different
   candidate and remains withheld. Missing fields, incompatible semantic schema
   versions, contradictory follow-up fields, unknown remediation targets, and

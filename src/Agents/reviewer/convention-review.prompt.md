@@ -207,7 +207,7 @@ Each candidate has exactly:
 `impact`, `expectedFixOrValidation`, `siblingStatus` (`checked|notRequired`),
 `siblingEvidence`, `siblingNotRequiredReason`, `factIds` (comma-separated,
 or empty), `confidence` (`low|medium|high`), `residualRiskSummary`,
-`semanticCandidateVersion` (exactly `1`), `remediationAction`
+`semanticCandidateVersion` (exactly `2`), `remediationAction`
 (`add|modify|remove|rename|replace|validate`), `remediationScope`
 (`inPullRequest|followUp`), `remediationTargets` (comma-separated sealed
 construct ids), and `followUpRequired` (boolean). These remediation fields are
