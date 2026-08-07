@@ -2764,6 +2764,82 @@ try {
         @(@($refusedWiring.rows) | Where-Object { [bool]$_.stable }).Count -eq 0) `
         "A refused reconciliation must leave no stable row, no agreed candidate, and a zero agreed count."
 
+    # Four guards that mutation testing found load-bearing and untested. Each
+    # is the enforcement behind a claim this whole layer makes.
+
+    # (a) The key domain IS the non-promotion enforcement. If it stops
+    #     diverging, every replay artifact becomes promotable.
+    $keyFn = $reviewerAst.FindAll({
+            param($c)
+            $c -is [Management.Automation.Language.FunctionDefinitionAst] -and $c.Name -ceq "Get-ReviewerRunArtifactKey"
+        }, $true) | Select-Object -First 1
+    Assert-Replay ($null -ne $keyFn) "The reviewer must define Get-ReviewerRunArtifactKey."
+    . ([scriptblock]::Create($keyFn.Extent.Text))
+    $domainKeyPath = Join-Path $reconDir "domain-signing.key"
+    [IO.File]::WriteAllText($domainKeyPath, "raw:" + [Convert]::ToBase64String($masterKey))
+    function Get-ReviewerArtifactSigningKey { param([string]$KeyPath) return , $masterKey }
+    $script:ReviewerUtf8 = [Text.UTF8Encoding]::new($false)
+    $script:ReviewerReplayActive = $false
+    $liveKeyBytes = Get-ReviewerRunArtifactKey -KeyPath $domainKeyPath
+    $script:ReviewerReplayActive = $true
+    $replayKeyBytes = Get-ReviewerRunArtifactKey -KeyPath $domainKeyPath
+    $script:ReviewerReplayActive = $false
+    Assert-Replay ([Convert]::ToBase64String($liveKeyBytes) -cne [Convert]::ToBase64String($replayKeyBytes)) `
+        "In replay the artifact key must be a DERIVED key; if it stops diverging every replay artifact becomes promotable."
+    Assert-Replay ([Convert]::ToBase64String($liveKeyBytes) -ceq [Convert]::ToBase64String($masterKey)) `
+        "Outside replay it must remain the raw master key, or nothing a live run seals can ever be promoted."
+    $expectedDerived = $null
+    $domainHmac = [System.Security.Cryptography.HMACSHA256]::new($masterKey)
+    try { $expectedDerived = $domainHmac.ComputeHash([Text.UTF8Encoding]::new($false).GetBytes("devpilot.reviewer.replay.artifact.v1")) }
+    finally { $domainHmac.Dispose() }
+    Assert-Replay ([Convert]::ToBase64String($replayKeyBytes) -ceq [Convert]::ToBase64String($expectedDerived)) `
+        "The derived key must be HMAC-SHA256 of the master over the documented replay label."
+
+    # (b) The promotion path's own refusal of anything carrying a `replay`
+    #     property - defence in depth behind the seal.
+    $promoteSource = [string]$reviewerSource
+    $replayLabelGuard = @($reviewerAst.FindAll({
+                param($c)
+                $c -is [Management.Automation.Language.FunctionDefinitionAst] -and $c.Name -ceq "Invoke-ReviewerPromotion"
+            }, $true))
+    Assert-Replay (@($replayLabelGuard).Count -eq 1) "The reviewer must define exactly one promotion entry point."
+    Assert-Replay ([string]$replayLabelGuard[0].Extent.Text -clike "*'replay'*" -or
+        [string]$replayLabelGuard[0].Extent.Text -clike '*"replay"*') `
+        "The promotion path must refuse an artifact carrying a replay label, not rely on the seal alone."
+
+    # (c) The state directory is redirected BEFORE anything is created, which is
+    #     what keeps a replay out of the files a live run reads.
+    Assert-Replay ($promoteSource -clike '*Join-Path (Join-Path $StateDir "replay") $script:ReviewerReplaySnapshot.SnapshotId*') `
+        "In replay the state directory must be re-rooted under replay/<snapshotId>."
+    $redirectLine = ($promoteSource -split "`n" | Select-String -Pattern 'Join-Path \(Join-Path \$StateDir "replay"\)' | Select-Object -First 1).LineNumber
+    $createLine = ($promoteSource -split "`n" | Select-String -Pattern 'New-Item -ItemType Directory -Force -Path \$StateDir' | Select-Object -First 1).LineNumber
+    Assert-Replay ($redirectLine -lt $createLine) `
+        "The redirect must happen before the state directory is created, or a replay leaves a directory in the live tree."
+
+    # (d) A replay delivery authorization is PreviewOnly at every pass count.
+    #     Asserted structurally rather than by execution, because the function
+    #     returns a class this harness does not load - and the property that
+    #     matters is that the replay branch returns FIRST, before any pass-count
+    #     logic can reach a different kind.
+    $authFn = $reviewerAst.FindAll({
+            param($c)
+            $c -is [Management.Automation.Language.FunctionDefinitionAst] -and $c.Name -ceq "New-ReviewerDeliveryAuthorization"
+        }, $true) | Select-Object -First 1
+    Assert-Replay ($null -ne $authFn) "The reviewer must define New-ReviewerDeliveryAuthorization."
+    $authText = [string]$authFn.Extent.Text
+    $replayBranch = $authText.IndexOf('if ($ReplayPreviewOnly)', [StringComparison]::Ordinal)
+    Assert-Replay ($replayBranch -ge 0) "The authorization producer must have an explicit replay branch."
+    $afterBranch = $authText.Substring($replayBranch)
+    $firstReturn = $afterBranch.IndexOf("return", [StringComparison]::Ordinal)
+    $firstKind = $afterBranch.IndexOf("ReviewerDeliveryAuthorizationKind]::", [StringComparison]::Ordinal)
+    Assert-Replay ($firstReturn -ge 0 -and $firstKind -gt $firstReturn -and
+        $afterBranch.Substring($firstKind, 60) -clike "*PreviewOnly*") `
+        "The replay branch must return PreviewOnly, and must do so before any other kind is reachable."
+    $otherKinds = @([regex]::Matches($authText.Substring(0, $replayBranch), 'ReviewerDeliveryAuthorizationKind\]::(\w+)') |
+        ForEach-Object { $_.Groups[1].Value })
+    Assert-Replay (@($otherKinds).Count -eq 0) `
+        "Nothing may mint an authorization kind before the replay branch is considered (found: $($otherKinds -join ', '))."
+
     # A live-run artifact, sealed under the raw key, is not a replay run.
     $liveManifest = New-ReconRun -Nonce "n3" -Rows @((New-ReconRow))
     $liveManifest.PSObject.Properties.Remove("replay")
