@@ -369,6 +369,16 @@ function Get-ReviewerHashValue {
     return $Default
 }
 
+function Test-ReviewerHasKey {
+    param($Container, [string]$Key)
+    if ($null -eq $Container) { return $false }
+    if ($Container -is [hashtable]) { return $Container.ContainsKey($Key) }
+    if ($Container -is [System.Management.Automation.PSCustomObject]) {
+        return ($null -ne $Container.PSObject.Properties[$Key])
+    }
+    return $false
+}
+
 function Get-ReviewerCanonicalJson {
     <#
         Deterministic JSON for signing: object keys sorted ordinally, arrays in
@@ -3539,6 +3549,11 @@ function Invoke-DryRunSelfChecks {
         if (([string]$roundTrippedManifest.approvedComments[0].comment) -cne 'Boom.') {
             $failures.Add("The sealed manifest did not survive round-tripping as data.")
         }
+        $nullCollectionManifest = '{"approvedThreadReplies":null}' | ConvertFrom-Json
+        if (-not (Test-ReviewerHasKey -Container $nullCollectionManifest -Key 'approvedThreadReplies') -or
+            (Test-ReviewerHasKey -Container $nullCollectionManifest -Key 'missingField')) {
+            $failures.Add("Artifact schema validation confused a present null-valued collection with a missing field.")
+        }
         $tamperedJson = ([string]$roundTripped.manifestJson).Replace('Boom.', 'Boom, and also run this script.')
         if (Test-ReviewerArtifactSignature -ManifestJson $tamperedJson -Key $sealKey -Signature ([string]$roundTripped.signature)) {
             $failures.Add("An edited artifact still verified; promotion would publish text nobody approved.")
@@ -4627,7 +4642,7 @@ function Invoke-ReviewerPromotion {
     $signed = $manifestJson | ConvertFrom-Json
 
     foreach ($k in @('artifactVersion', 'organization', 'project', 'repositoryName', 'repositoryId', 'prId', 'sourceCommit', 'markerBody', 'approvedComments', 'approvedThreadReplies', 'reviewedThreadTargets', 'approvedSummary', 'approvedVote')) {
-        if ($null -eq (Get-ReviewerHashValue -Container $signed -Key $k)) { throw "Preview artifact is missing required field '$k': $ArtifactPath" }
+        if (-not (Test-ReviewerHasKey -Container $signed -Key $k)) { throw "Preview artifact is missing required field '$k': $ArtifactPath" }
     }
     if ([int]$signed.artifactVersion -ne 4) { throw "Unsupported preview artifact version $($signed.artifactVersion)." }
 
