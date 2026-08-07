@@ -10,8 +10,9 @@
 
     This reads the sealed specialist artifacts from two or more such runs and
     collapses them. Anything the runs disagree about becomes `unknown`, and any
-    candidate comment that not every run proposed is withheld. There is no
-    majority vote and no tie-break: disagreement is the answer.
+    candidate whose sealed semantic identity is not present in every run is
+    withheld. Presentation text is audited separately and never selected from a
+    run. There is no majority vote and no tie-break: disagreement is the answer.
 
     The output is an evaluation artifact. It is sealed under the replay key, so
     it can never verify against the promotion path, and it says so in its own

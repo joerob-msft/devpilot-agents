@@ -213,7 +213,9 @@ runs are about different code. The replay nonces must all be *different*, or the
 "two runs" are one run submitted twice, which is how a single favourable
 observation would otherwise launder itself into a stable result.
 
-Then it collapses them:
+The semantic form is reconciliation artifact version 2; version 1 remains a
+separate legacy schema and is never interpreted as carrying semantic identity.
+Then version 2 collapses runs:
 
 - A rule every run read the same way keeps that reading, along with the anchors
   they agreed on.
@@ -222,14 +224,32 @@ Then it collapses them:
   disagreement - `violation at mi14` and `violation at mi15` are two findings
   wearing one status.
 - A rule some run never accounted for at all is `unknown`.
-- A candidate comment is agreed only if every run proposed it at the same rule,
-  file and line. The model's own `c1`/`c2` ids are ignored, because they are
-  just the order it happened to write them in.
+- Candidate agreement uses `reviewer.semantic-candidate` version 2, not comment
+  text. Its sealed canonical payload binds the authoritative rule id and digest,
+  normalized file path, anchor kind/line and exact construct spans, issue and
+  impact class, severity, confidence, sibling status, deterministic fact and
+  violation sets, and structured remediation action/scope/targets/follow-up
+  requirement. Candidate/model ids and free-form prose are excluded.
+- When those semantics agree, the result is
+  `semanticAgreementTextWithheld`: it is one stable evaluation finding, but its
+  `comment` is empty and no model wording is selected. Every raw presentation
+  variant, including its confidence and sibling status, remains in deterministic nonce/digest order under
+  `presentationVariants` until an independently verified renderer can produce
+  canonical text.
+- A different rule digest, construct/span, issue or impact class, severity,
+  confidence, sibling status,
+  deterministic evidence/violation set, or remediation identity is a different
+  candidate and remains withheld. Missing fields, incompatible semantic schema
+  versions, contradictory follow-up fields, unknown remediation targets, and
+  malformed identities are withheld rather than inferred.
 - Anything else is withheld with the runs that disagreed named.
 
 There is no majority vote and no tie-break. Two runs out of three is not a
 result. The reconciliation never picks the interesting reading, the common one,
 or the first one - disagreement resolves to `unknown` and stays visible.
+Semantic agreement does not add delivery authority: the reconciliation remains
+non-promotable, replay-only evaluation output, and canonical presentation text
+is deliberately absent.
 
 The reconciliation is sealed under the same derived replay key as the runs that
 fed it, so it verifies only there and never against the promotion path. A
