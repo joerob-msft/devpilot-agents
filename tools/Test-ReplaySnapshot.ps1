@@ -2906,6 +2906,75 @@ try {
     Assert-Replay (@($otherKinds).Count -eq 0) `
         "Nothing may mint an authorization kind before the replay branch is considered (found: $($otherKinds -join ', '))."
 
+    # A sealed timestamp must survive `ConvertFrom-Json`, which turns an
+    # extended ISO-8601 string into a [DateTime]. The ticks survive; the
+    # `[string]` cast does not - it drops the `Z` and the subseconds and renders
+    # to the host's culture, so two machines reconciling the same runs would
+    # seal different bytes.
+    $stampOriginal = "2026-08-07T06:36:52.0422358Z"
+    $stampJson = (@{ declaredAt = $stampOriginal } | ConvertTo-Json -Compress) | ConvertFrom-Json
+    Assert-Replay ($stampJson.declaredAt -is [DateTime]) `
+        "ConvertFrom-Json must still be coercing the timestamp; if it stopped, this guard is measuring nothing."
+    Assert-Replay ([string]$stampJson.declaredAt -cne $stampOriginal) `
+        "And the naive cast must still be lossy, or the same."
+    Assert-Replay ((Get-ReviewerRunReconciliationTimestamp $stampJson.declaredAt) -ceq $stampOriginal) `
+        "The normalizer must recover the exact sealed timestamp, subseconds and Z included."
+
+    # Across cultures. `o` is culture-invariant by definition, but only if
+    # somebody actually asks for it.
+    foreach ($cultureName in @("de-DE", "ar-SA", "ja-JP", "tr-TR")) {
+        $previousCulture = [Threading.Thread]::CurrentThread.CurrentCulture
+        try {
+            [Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::new($cultureName)
+            Assert-Replay ((Get-ReviewerRunReconciliationTimestamp $stampJson.declaredAt) -ceq $stampOriginal) `
+                "The normalized timestamp must be identical under $cultureName."
+        }
+        finally { [Threading.Thread]::CurrentThread.CurrentCulture = $previousCulture }
+    }
+
+    # An offset that is not UTC normalizes to UTC rather than being refused or
+    # silently kept; a value that is not a timestamp at all is refused.
+    Assert-Replay ((Get-ReviewerRunReconciliationTimestamp "2026-08-07T08:36:52.0422358+02:00") -ceq $stampOriginal) `
+        "A non-UTC offset must normalize to the same instant in UTC."
+    Assert-Replay ((Get-ReviewerRunReconciliationTimestamp "") -ceq "") `
+        "An absent timestamp stays absent rather than becoming an invented one."
+    foreach ($malformed in @("not-a-timestamp", "2026-13-45T99:99:99Z")) {
+        Assert-ReplayThrows { Get-ReviewerRunReconciliationTimestamp $malformed } `
+            "A malformed sealed timestamp ('$malformed') must be refused, not guessed at." `
+            -Match "round-trip ISO-8601"
+    }
+    # A timestamp with no zone marker is ambiguous, and guessing a zone is how
+    # two hosts seal two different instants for one declaration.
+    foreach ($zoneless in @("2026-08-07T06:36:52", "07/08/2026")) {
+        Assert-ReplayThrows { Get-ReviewerRunReconciliationTimestamp $zoneless } `
+            "A sealed timestamp with no UTC marker or offset ('$zoneless') must be refused." `
+            -Match "carries neither"
+    }
+
+    # End to end, through the tool, under two cultures: the declaration is
+    # sealed once and consumed twice, and the report bytes must match.
+    $cultureDir = Join-Path $sandbox "culture"
+    [void](New-Item -ItemType Directory -Path $cultureDir -Force)
+    $cultureDecl = & $toolPath -DeclareRunSet -SnapshotName "s" `
+        -SnapshotManifestDigest ("7" * 64) -PlannedRunCount 2 `
+        -KeyPath $keyFile -OutputDirectory $cultureDir 2>&1 | Select-Object -Last 1
+    $cultureReports = @()
+    foreach ($cultureName in @("en-US", "de-DE")) {
+        $runDir = Join-Path $cultureDir $cultureName.Replace("-", "")
+        [void](New-Item -ItemType Directory -Path $runDir -Force)
+        $previousCulture = [Threading.Thread]::CurrentThread.CurrentCulture
+        try {
+            [Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::new($cultureName)
+            [void](& $toolPath -ArtifactPath $sealedPaths -KeyPath $keyFile `
+                    -RunSetPath ([string]$cultureDecl) -RunSetKeyPath $keyFile -OutputDirectory $runDir 2>&1)
+        }
+        finally { [Threading.Thread]::CurrentThread.CurrentCulture = $previousCulture }
+        $reportFile = @(Get-ChildItem -LiteralPath $runDir -Filter "reconciliation-*.md")[0]
+        $cultureReports += (Get-FileHash -LiteralPath $reportFile.FullName -Algorithm SHA256).Hash
+    }
+    Assert-Replay (@($cultureReports).Count -eq 2 -and $cultureReports[0] -ceq $cultureReports[1]) `
+        "The reconciliation report must be byte-identical whichever culture the host is set to."
+
     # A live-run artifact, sealed under the raw key, is not a replay run.
     $liveManifest = New-ReconRun -Nonce "n3" -Rows @((New-ReconRow))
     $liveManifest.PSObject.Properties.Remove("replay")
