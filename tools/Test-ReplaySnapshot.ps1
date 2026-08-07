@@ -1755,7 +1755,8 @@ try {
             [string]$SourceCommit = "c" * 40, [string]$Promotable = "false",
             [object[]]$Constructs = $null, [string]$Status = "ok",
             [string]$SnapshotId = "s", [string]$ManifestDigest = ("7" * 64),
-            [string]$Complete = "true"
+            [string]$Complete = "true", [string[]]$Missing = @(),
+            [string]$ConstructsIncomplete = "false"
         )
         # Built with the field names PRODUCTION writes (ConventionSpecialist.ps1
         # `Constructs = ...`). A fixture in the reconciler's own vocabulary
@@ -1768,13 +1769,15 @@ try {
             }
             else { $Constructs })
         return [pscustomobject][ordered]@{
-            status = $Status; prId = 42; sourceCommit = $SourceCommit; organization = "o"; project = "p"
+            status = $(if ($Status -ceq "ok") { "complete" } else { $Status }); prId = 42; sourceCommit = $SourceCommit; organization = "o"; project = "p"
             repositoryId = "r"; model = "m"; configSha256 = ("1" * 64); scriptSha256 = ("2" * 64)
             specialistLibrarySha256 = ("3" * 64); promptSha256 = ("4" * 64)
             conventionPlanSha256 = ("5" * 64); factPlanSha256 = ("6" * 64)
             candidates = @($Candidates)
             ruleCoverage = [pscustomobject][ordered]@{
                 complete = [bool]::Parse($Complete); rows = @($Rows); changedConstructs = @($set)
+                missing = @($Missing); duplicates = @(); unknown = @(); unaccountedCandidates = @()
+                constructsIncomplete = [bool]::Parse($ConstructsIncomplete)
             }
             replay = [pscustomobject][ordered]@{
                 snapshotId = $SnapshotId; manifestDigest = $ManifestDigest; replayNonce = $Nonce
@@ -1785,11 +1788,11 @@ try {
     function New-ReconRow {
         param(
             [string]$Source = "core/rule-a", [string]$Status = "violation",
-            [string[]]$Violating = @("mi0"), [string[]]$Compliant = @(),
+            [string[]]$Violating = @("mi0"), [string[]]$Compliant = @(), [string]$Sha = ("9" * 64),
             [string[]]$NotInReach = @(), [string[]]$Unknown = @(), [string]$Ref = "rs0"
         )
         return [pscustomobject][ordered]@{
-            ruleRef = $Ref; ruleSourceId = $Source; status = $Status
+            ruleRef = $Ref; ruleSourceId = $Source; ruleSourceSha256 = $Sha; status = $Status
             violatingConstructs = @($Violating); compliantConstructs = @($Compliant)
             notInReachConstructs = @($NotInReach); unknownConstructs = @($Unknown)
             candidateId = ""; degradedReason = ""
@@ -1849,7 +1852,7 @@ try {
         (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow), (New-ReconRow -Source "core/rule-b" -Ref "rs1"))),
         (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)))
     )
-    Assert-Replay (@(@($absentRule.rows) | Where-Object { $_.ruleSourceId -ceq "core/rule-b" }).reconciledStatus -ceq "unknown") `
+    Assert-Replay (@(@($absentRule.rows) | Where-Object { $_.ruleRef -ceq "rs1" }).reconciledStatus -ceq "unknown") `
         "A rule only one run accounted for is unknown, not that run's answer."
 
     # A candidate only one run proposed is withheld.
@@ -1951,13 +1954,28 @@ try {
     Assert-Replay (-not [bool]$differentSnapshot.reconciled) `
         "Runs of two different snapshots are not repetitions of one frozen input."
 
-    # An incomplete accounting has holes, and a hole agrees with everything.
-    $incompleteRuns = Resolve-ReviewerRunReconciliation -Manifests @(
+    # An accounting with a HOLE in it - a rule no row covered - is not two runs
+    # agreeing, because an absence in both looks exactly like concurrence.
+    # A row the wrapper degraded is different: it arrives as `unknown` and
+    # reconciles normally, so honest degradation must NOT collapse the rest.
+    $holedRuns = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Missing @("core/rule-b")),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Missing @("core/rule-b"))
+    )
+    Assert-Replay (-not [bool]$holedRuns.reconciled -and @($holedRuns.problems) -clike "*core/rule-b*") `
+        "A rule neither run wrote a row for is a hole, and the hole must be named."
+    $degradedRows = Resolve-ReviewerRunReconciliation -Manifests @(
         (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Complete "false"),
         (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Complete "false")
     )
-    Assert-Replay (-not [bool]$incompleteRuns.reconciled -and @($incompleteRuns.problems) -clike "*did not complete*") `
-        "Two runs that both failed to account for their rules have not agreed about them."
+    Assert-Replay ([bool]$degradedRows.reconciled -and [bool]@($degradedRows.rows)[0].stable) `
+        "A run whose accounting was incomplete only because a row degraded must still reconcile the rows that did not."
+    $shortTable = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -ConstructsIncomplete "true"),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -ConstructsIncomplete "true")
+    )
+    Assert-Replay (-not [bool]$shortTable.reconciled -and @($shortTable.problems) -clike "*incomplete construct table*") `
+        "Agreement over a short anchor table is agreement about a subset nobody chose."
 
     # A row with no status at all: two blanks compare equal and would reconcile
     # to a stable empty string.
@@ -1990,12 +2008,32 @@ try {
     Assert-Replay (-not [bool]$promotableRun.reconciled -and @($promotableRun.problems) -clike "*promotable*") `
         "A replay artifact claiming to be promotable must not be reconciled."
 
-    # A degraded run cannot lend its silence to a clean one.
+    # Same slot, different rule. Refs line up positionally, and the binding
+    # makes that safe - but only if the position still means the same rule.
+    $slotDrift = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow -Source "core/rule-a"))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Source "core/rule-z")))
+    )
+    Assert-Replay (@($slotDrift.rows)[0].reconciledStatus -ceq "unknown" -and
+        @(@($slotDrift.rows)[0].disagreements) -clike "*different rule in this slot*") `
+        "Two runs whose rs0 is about different rules have not agreed about either."
+
+    # One source legitimately transported under two refs is not a duplicate.
+    $twoRefsOneSource = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow -Ref "rs0"), (New-ReconRow -Ref "rs1"))),
+        (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow -Ref "rs0"), (New-ReconRow -Ref "rs1")))
+    )
+    Assert-Replay ([bool]$twoRefsOneSource.reconciled -and [int]$twoRefsOneSource.stableRowCount -eq 2) `
+        "The same rule transported under two refs is two rows, not a phantom duplicate."
+
+    # A degraded pass is not half a reconciliation, and the success status the
+    # reviewer actually writes is `complete` - not `ok`.
     $degradedRun = Resolve-ReviewerRunReconciliation -Manifests @(
         (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow))),
         (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Status "degraded")
     )
-    Assert-Replay (-not [bool]$degradedRun.reconciled) "A run that did not finish cleanly cannot be half of a reconciliation."
+    Assert-Replay (-not [bool]$degradedRun.reconciled -and @($degradedRun.problems) -clike "*degraded*") `
+        "A run that did not finish cleanly cannot be half of a reconciliation."
 
     # Three runs, one dissenter: still unknown. No majority vote.
     $majority = Resolve-ReviewerRunReconciliation -Manifests @(
@@ -2028,7 +2066,10 @@ try {
     $keyFile = Join-Path $reconDir "artifact-signing.key"
     $masterKey = [byte[]]::new(32)
     for ($i = 0; $i -lt 32; $i++) { $masterKey[$i] = [byte]($i + 1) }
-    [IO.File]::WriteAllBytes($keyFile, $masterKey)
+    # The reviewer's own key file is a "<format>:<base64>" line, not raw bytes.
+    # Writing raw bytes here would have hidden a reader that could not read the
+    # only files it will ever be pointed at.
+    [IO.File]::WriteAllText($keyFile, "raw:" + [Convert]::ToBase64String($masterKey))
     $replayHmac = [System.Security.Cryptography.HMACSHA256]::new($masterKey)
     try { $derivedKey = $replayHmac.ComputeHash([Text.UTF8Encoding]::new($false).GetBytes("devpilot.reviewer.replay.artifact.v1")) }
     finally { $replayHmac.Dispose() }
