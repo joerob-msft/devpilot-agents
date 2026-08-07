@@ -29,7 +29,18 @@ function Read-ReviewerRunReconciliationSet {
         different, and because a declaration that verified as a run artifact
         would be a declaration somebody could have written afterwards.
     #>
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][byte[]]$MasterKey)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][byte[]]$MasterKey,
+        [ValidateRange(1024, 16777216)][int]$MaxBytes = 1048576
+    )
+    # Bounded. The path is operator-supplied, and a declaration is a few hundred
+    # bytes; reading a gigabyte because somebody named the wrong file is a
+    # self-inflicted wound with no upside.
+    $info = Get-Item -LiteralPath $Path
+    if ($info.Length -gt $MaxBytes) {
+        throw "The qualification run set at $Path is $($info.Length) bytes; the cap is $MaxBytes."
+    }
     $envelope = [IO.File]::ReadAllText($Path, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
     $manifestJson = [string](Get-ReviewerConventionSpecialistValue $envelope "manifestJson" "")
     $signature = [string](Get-ReviewerConventionSpecialistValue $envelope "signature" "")

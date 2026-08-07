@@ -1242,7 +1242,7 @@ $script:AgentReplayMaxPayloadBytes = 25165824
 $script:AgentReplayMaxTotalPayloadBytes = 67108864
 $script:AgentReplayMaxManifestBytes = 8388608
 $script:AgentReplaySnapshotNamePattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z'
-$script:AgentReplayPayloadSegmentPattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\z'
+$script:AgentReplayPayloadSegmentPattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,126}[A-Za-z0-9_-]\z|^[A-Za-z0-9]\z'
 $script:AgentReplayHexPattern = '^[0-9a-f]{64}\z'
 # Reference-identity seal, not a string: a constant that a hand-built hashtable
 # can carry would let any in-process caller present itself as a loaded snapshot
