@@ -1629,6 +1629,32 @@ try {
             $text = [string]$_.Extent.Text
             $text -cnotmatch '-ReplaySnapshot\s'
         })
+    # One exemption, and it is a narrow one: the get_changes capability probe
+    # opens its own short-lived session and is short-circuited in replay before
+    # it can, so it never reaches this call. The exemption is spelled as a
+    # REQUIREMENT - the short-circuit must exist - so removing the guard breaks
+    # this test rather than silently widening the exemption.
+    $probeNode = $reviewerAst.FindAll({
+            param($candidate)
+            $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $candidate.Name -ceq "Resolve-ReviewerGetChangesCapability"
+        }, $true) | Select-Object -First 1
+    $probeGuarded = $false
+    $probeStart = -1
+    $probeEnd = -1
+    if ($null -ne $probeNode) {
+        $probeStart = $probeNode.Extent.StartLineNumber
+        $probeEnd = $probeNode.Extent.EndLineNumber
+        $probeGuarded = ([string]$probeNode.Extent.Text) -match
+        '(?s)if \(\$script:ReviewerReplayActive\) \{\s*\$Session\[''GetChangesCapability''\] = \$null'
+    }
+    Assert-Replay ($null -eq $probeNode -or $probeGuarded) `
+        "The get_changes capability probe must short-circuit in replay, because it opens its own session without the snapshot."
+    if ($probeGuarded) {
+        $unguarded = @(@($unguarded) | Where-Object {
+                $_.Extent.StartLineNumber -lt $probeStart -or $_.Extent.StartLineNumber -gt $probeEnd
+            })
+    }
     Assert-Replay (@($unguarded).Count -eq 0) `
         ("Every Open-AgentMcpSession call must pass -ReplaySnapshot, or a replay reaches the network: " +
         (@(@($unguarded) | ForEach-Object { "line $($_.Extent.StartLineNumber)" }) -join ", "))

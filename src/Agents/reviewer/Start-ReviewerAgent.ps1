@@ -7878,6 +7878,19 @@ function Resolve-ReviewerGetChangesCapability {
         [scriptblock]$CloseProbeSession
     )
     if ($Session.ContainsKey('GetChangesCapability')) { return $Session['GetChangesCapability'] }
+    # Replay owns this decision before the probe does. The probe opens its own
+    # short-lived MCP session, and in replay that session would be a LIVE one -
+    # the snapshot is never handed to it - so the one thing offline replay
+    # promises would be broken by a capability check.
+    #
+    # Returning $null is not a workaround: it is the documented outcome for the
+    # old schema or a probe failure, and the caller already handles it by
+    # running the legacy body on an untouched session. Cached like any other
+    # answer so the decision is made once.
+    if ($script:ReviewerReplayActive) {
+        $Session['GetChangesCapability'] = $null
+        return $null
+    }
     if (-not $OpenProbeSession) {
         $OpenProbeSession = {
             param([string]$Path)
