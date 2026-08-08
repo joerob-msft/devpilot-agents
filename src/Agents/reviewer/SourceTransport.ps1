@@ -49,6 +49,11 @@ $script:ReviewerSourceCommitIdPattern = '^[0-9a-f]{40}$'
 $script:ReviewerSourceRefHeadPattern = '^refs/heads/[^\x00-\x1f\x7f\\]+$'
 $script:ReviewerSourceChangePageSize = 200
 $script:ReviewerSourceChangeLimit = 1000
+$script:ReviewerSourceAzMaxResponseBytes = 1048576
+$script:ReviewerSourceAzMaxErrorBytes = 16384
+$script:ReviewerSourceAzTimeoutSeconds = 30
+$script:ReviewerSourceAzMaxRequests = 25
+$script:ReviewerSourceAzApiVersion = "7.1"
 
 # Every reason a changed path can fail to arrive whole. The set is closed so a
 # renderer, a gate, or a test can enumerate it instead of pattern-matching prose.
@@ -300,6 +305,480 @@ function Test-ReviewerSourceIterationBindingStable {
     return ((@($Before.ReasonNames) -join "`0") -ceq (@($After.ReasonNames) -join "`0"))
 }
 
+function Test-ReviewerSourceAzProject {
+    param([AllowNull()][AllowEmptyString()][string]$Project)
+    if ([string]::IsNullOrWhiteSpace($Project) -or $Project.Length -gt 128 -or
+        $Project -match '[\x00-\x1f\x7f/\\:><*?|"`,=+\[\];]' -or
+        $Project.StartsWith("_", [StringComparison]::Ordinal) -or
+        $Project.StartsWith(".", [StringComparison]::Ordinal) -or
+        $Project.EndsWith(".", [StringComparison]::Ordinal) -or
+        $Project.Trim() -cne $Project) {
+        return $false
+    }
+    return $true
+}
+
+function Get-ReviewerSourceAzIterationBinding {
+    param(
+        [Parameter(Mandatory)]$Response,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit
+    )
+    $iterations = $null
+    if ($Response -is [System.Management.Automation.PSCustomObject] -and
+        $Response.PSObject.Properties["value"]) {
+        $count = Get-ReviewerSourceValue -Object $Response -Name "count"
+        $iterations = @(Get-ReviewerSourceValue -Object $Response -Name "value")
+        if (($count -isnot [int] -and $count -isnot [long]) -or [int]$count -ne $iterations.Count) {
+            return $null
+        }
+    }
+    elseif ($Response -isnot [string] -and
+        $Response -is [System.Collections.IEnumerable] -and
+        $Response -isnot [System.Collections.IDictionary]) {
+        $iterations = @($Response)
+    }
+    else {
+        return $null
+    }
+    if ($iterations.Count -lt 1 -or $iterations.Count -gt 1000) { return $null }
+
+    $ids = [System.Collections.Generic.HashSet[int]]::new()
+    $latest = $null
+    foreach ($iteration in $iterations) {
+        if ($iteration -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+        $id = Get-ReviewerSourceValue -Object $iteration -Name "id"
+        if (($id -isnot [int] -and $id -isnot [long]) -or [long]$id -lt 1 -or
+            [long]$id -gt [int]::MaxValue -or -not $ids.Add([int]$id)) {
+            return $null
+        }
+        if ($null -eq $latest -or [int]$id -gt [int]$latest.id) { $latest = $iteration }
+    }
+
+    $commits = @{}
+    foreach ($field in @("commonRefCommit", "sourceRefCommit", "targetRefCommit")) {
+        $node = Get-ReviewerSourceValue -Object $latest -Name $field
+        $commit = ConvertTo-ReviewerSourceNormalizedCommitId -CommitId (
+            [string](Get-ReviewerSourceValue -Object $node -Name "commitId" -Default ""))
+        if (-not $commit) { return $null }
+        $commits[$field] = $commit
+    }
+    if ([string]$commits.sourceRefCommit -cne $SourceCommit) { return $null }
+
+    $reason = Get-ReviewerSourceValue -Object $latest -Name "reason"
+    if ($reason -isnot [string]) { return $null }
+    $reasonName = $reason.Trim().ToLowerInvariant()
+    if (@("unknown", "create", "push", "forcepush", "rebase", "retarget", "resolveconflicts") -cnotcontains $reasonName) {
+        return $null
+    }
+    $hasMoreCommits = Get-ReviewerSourceValue -Object $latest -Name "hasMoreCommits"
+    if ($hasMoreCommits -isnot [bool]) { return $null }
+    $oldTarget = Get-ReviewerSourceValue -Object $latest -Name "oldTargetRefName"
+    $newTarget = Get-ReviewerSourceValue -Object $latest -Name "newTargetRefName"
+    if (($null -eq $oldTarget) -ne ($null -eq $newTarget)) { return $null }
+    if ($null -ne $oldTarget -and
+        ([string]$oldTarget -notmatch $script:ReviewerSourceRefHeadPattern -or
+         [string]$newTarget -notmatch $script:ReviewerSourceRefHeadPattern)) {
+        return $null
+    }
+    return [pscustomobject]@{
+        IterationId = [int]$latest.id
+        CommonRefCommit = $commits.commonRefCommit
+        SourceRefCommit = $commits.sourceRefCommit
+        TargetRefCommit = $commits.targetRefCommit
+        ReasonValue = $reasonName
+        ReasonNames = [string[]]@($reasonName)
+        UnrecognizedBits = 0L
+        OldTargetRefName = if ($null -eq $oldTarget) { "" } else { [string]$oldTarget }
+        NewTargetRefName = if ($null -eq $newTarget) { "" } else { [string]$newTarget }
+        CommitsTruncated = [bool]$hasMoreCommits
+    }
+}
+
+function Get-ReviewerSourceAzChangePage {
+    param(
+        [Parameter(Mandatory)]$Response,
+        [ValidateRange(0, 1000)][int]$ExpectedSkip,
+        [ValidateRange(1, 200)][int]$ExpectedTop
+    )
+    if ($Response -isnot [System.Management.Automation.PSCustomObject] -or
+        -not $Response.PSObject.Properties["changeEntries"]) {
+        return $null
+    }
+    $changes = @(Get-ReviewerSourceValue -Object $Response -Name "changeEntries")
+    if ($changes.Count -gt $ExpectedTop) { return $null }
+    $hasNextSkip = $null -ne $Response.PSObject.Properties["nextSkip"]
+    $hasNextTop = $null -ne $Response.PSObject.Properties["nextTop"]
+    if ($hasNextSkip -ne $hasNextTop) { return $null }
+    if (-not $hasNextSkip) {
+        # The REST sample omits both cursors on its terminal response. A full
+        # page without cursors is ambiguous, so only a short page proves EOF.
+        if ($changes.Count -ge $ExpectedTop) { return $null }
+        return [pscustomobject]@{
+            Changes = @($changes)
+            HasMoreChanges = $false
+            NextSkip = 0
+            NextTop = 0
+        }
+    }
+    $nextSkip = Get-ReviewerSourceValue -Object $Response -Name "nextSkip"
+    $nextTop = Get-ReviewerSourceValue -Object $Response -Name "nextTop"
+    if (($nextSkip -isnot [int] -and $nextSkip -isnot [long]) -or
+        ($nextTop -isnot [int] -and $nextTop -isnot [long])) {
+        return $null
+    }
+    $hasMore = ([int]$nextSkip -ne 0 -or [int]$nextTop -ne 0)
+    if ($hasMore) {
+        if ($changes.Count -lt 1 -or [int]$nextSkip -ne ($ExpectedSkip + $changes.Count) -or
+            [int]$nextTop -lt 1 -or [int]$nextTop -gt 200) {
+            return $null
+        }
+    }
+    elseif ([int]$nextSkip -ne 0 -or [int]$nextTop -ne 0) {
+        return $null
+    }
+    return [pscustomobject]@{
+        Changes = @($changes)
+        HasMoreChanges = $hasMore
+        NextSkip = [int]$nextSkip
+        NextTop = [int]$nextTop
+    }
+}
+
+function Get-ReviewerSourceAzIdentityCapture {
+    param(
+        [Parameter(Mandatory)][scriptblock]$AzInvoker,
+        [Parameter(Mandatory)][string]$Project,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')][string]$RepositoryId,
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$PrId,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit
+    )
+    if (-not (Test-ReviewerSourceAzProject -Project $Project)) {
+        throw "The Azure DevOps CLI fallback project is malformed."
+    }
+    $baseRoute = [ordered]@{
+        project = $Project
+        repositoryId = $RepositoryId
+        pullRequestId = [string]$PrId
+    }
+    $iterations = & $AzInvoker "pullRequestIterations" $baseRoute ([ordered]@{})
+    $binding = Get-ReviewerSourceAzIterationBinding -Response $iterations -SourceCommit $SourceCommit
+    if ($null -eq $binding) {
+        throw "The Azure DevOps CLI fallback returned malformed, duplicate, missing, or mismatched iteration identity."
+    }
+
+    $all = [System.Collections.Generic.List[object]]::new()
+    $trackingIds = [System.Collections.Generic.HashSet[int]]::new()
+    $skip = 0
+    while ($true) {
+        $remaining = $script:ReviewerSourceChangeLimit - $all.Count
+        if ($remaining -lt 1) {
+            throw "The Azure DevOps CLI fallback exceeded the bounded change limit."
+        }
+        $top = [Math]::Min($script:ReviewerSourceChangePageSize, $remaining)
+        $route = [ordered]@{}
+        foreach ($key in $baseRoute.Keys) { $route[$key] = $baseRoute[$key] }
+        $route["iterationId"] = [string]$binding.IterationId
+        $query = [ordered]@{ '$top' = [string]$top; '$skip' = [string]$skip }
+        $rawPage = & $AzInvoker "pullRequestIterationChanges" $route $query
+        $page = Get-ReviewerSourceAzChangePage -Response $rawPage -ExpectedSkip $skip -ExpectedTop $top
+        if ($null -eq $page) {
+            throw "The Azure DevOps CLI fallback returned a malformed or ambiguous iteration-change page."
+        }
+        foreach ($change in @($page.Changes)) {
+            if ($change -isnot [System.Management.Automation.PSCustomObject]) {
+                throw "The Azure DevOps CLI fallback returned a malformed iteration change."
+            }
+            $trackingId = Get-ReviewerSourceValue -Object $change -Name "changeTrackingId"
+            if (($trackingId -isnot [int] -and $trackingId -isnot [long]) -or
+                [long]$trackingId -lt 1 -or [long]$trackingId -gt [int]::MaxValue -or
+                -not $trackingIds.Add([int]$trackingId)) {
+                throw "The Azure DevOps CLI fallback returned a duplicate or malformed change identity."
+            }
+            $item = Get-ReviewerSourceValue -Object $change -Name "item"
+            $path = [string](Get-ReviewerSourceValue -Object $item -Name "path" -Default "")
+            $changeType = [string](Get-ReviewerSourceValue -Object $change -Name "changeType" -Default "")
+            if ([string]::IsNullOrEmpty($path) -or $path.Length -gt $script:ReviewerSourceMaxPathLength -or
+                $path -match '[\x00-\x1f\x7f]' -or
+                @("none", "add", "edit", "encoding", "rename", "delete", "undelete", "branch",
+                    "merge", "lock", "rollback", "sourcerename", "targetrename", "property", "all") -cnotcontains
+                    $changeType.Trim().ToLowerInvariant()) {
+                throw "The Azure DevOps CLI fallback returned a malformed iteration change."
+            }
+            [void]$all.Add($change)
+        }
+        if (-not $page.HasMoreChanges) { break }
+        if ($all.Count -ge $script:ReviewerSourceChangeLimit) {
+            throw "The Azure DevOps CLI fallback exceeded the bounded change limit."
+        }
+        $skip = [int]$page.NextSkip
+    }
+    $response = [pscustomobject]@{ changes = $all.ToArray() }
+    return [pscustomobject]@{
+        Binding = $binding
+        Response = $response
+        ChangeSetSha256 = Get-ReviewerSourceSha256 -Text (
+            $response | ConvertTo-Json -Depth 30 -Compress) -Substituting
+    }
+}
+
+function Invoke-ReviewerSourceAzProcess {
+    param(
+        [Parameter(Mandatory)][string]$ExecutablePath,
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [ValidateRange(1, 300)][int]$TimeoutSeconds = $script:ReviewerSourceAzTimeoutSeconds,
+        [ValidateRange(1024, 4194304)][int]$MaxStdoutBytes = $script:ReviewerSourceAzMaxResponseBytes,
+        [ValidateRange(1024, 65536)][int]$MaxStderrBytes = $script:ReviewerSourceAzMaxErrorBytes
+    )
+    $start = [System.Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = $ExecutablePath
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    foreach ($argument in $Arguments) { [void]$start.ArgumentList.Add($argument) }
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $start
+    $stdout = [System.IO.MemoryStream]::new()
+    $stderr = [System.IO.MemoryStream]::new()
+    $started = $false
+    try {
+        try { $started = $process.Start() }
+        catch { throw "The Azure CLI process could not be started." }
+        if (-not $started) { throw "The Azure CLI process could not be started." }
+        $outBuffer = [byte[]]::new(8192)
+        $errBuffer = [byte[]]::new(4096)
+        $outTask = $process.StandardOutput.BaseStream.ReadAsync($outBuffer, 0, $outBuffer.Length)
+        $errTask = $process.StandardError.BaseStream.ReadAsync($errBuffer, 0, $errBuffer.Length)
+        $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+        while ($null -ne $outTask -or $null -ne $errTask) {
+            $remaining = [int][Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+            if ($remaining -le 0) {
+                if (-not $process.HasExited) { $process.Kill($true) }
+                throw "The Azure CLI read timed out."
+            }
+            $pending = [System.Collections.Generic.List[System.Threading.Tasks.Task]]::new()
+            if ($null -ne $outTask) { [void]$pending.Add($outTask) }
+            if ($null -ne $errTask) { [void]$pending.Add($errTask) }
+            $completed = [System.Threading.Tasks.Task]::WaitAny($pending.ToArray(), $remaining)
+            if ($completed -lt 0) {
+                if (-not $process.HasExited) { $process.Kill($true) }
+                throw "The Azure CLI read timed out."
+            }
+            $task = $pending[$completed]
+            if ($null -ne $outTask -and [object]::ReferenceEquals($task, $outTask)) {
+                $count = $outTask.GetAwaiter().GetResult()
+                if ($count -eq 0) { $outTask = $null }
+                else {
+                    if (($stdout.Length + $count) -gt $MaxStdoutBytes) {
+                        if (-not $process.HasExited) { $process.Kill($true) }
+                        throw "The Azure CLI response exceeded the byte limit."
+                    }
+                    $stdout.Write($outBuffer, 0, $count)
+                    $outTask = $process.StandardOutput.BaseStream.ReadAsync($outBuffer, 0, $outBuffer.Length)
+                }
+            }
+            elseif ($null -ne $errTask -and [object]::ReferenceEquals($task, $errTask)) {
+                $count = $errTask.GetAwaiter().GetResult()
+                if ($count -eq 0) { $errTask = $null }
+                else {
+                    if (($stderr.Length + $count) -gt $MaxStderrBytes) {
+                        if (-not $process.HasExited) { $process.Kill($true) }
+                        throw "The Azure CLI error response exceeded the byte limit."
+                    }
+                    $stderr.Write($errBuffer, 0, $count)
+                    $errTask = $process.StandardError.BaseStream.ReadAsync($errBuffer, 0, $errBuffer.Length)
+                }
+            }
+        }
+        $remaining = [int][Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+        if ($remaining -le 0 -or -not $process.WaitForExit($remaining)) {
+            if (-not $process.HasExited) { $process.Kill($true) }
+            throw "The Azure CLI read timed out."
+        }
+        return [pscustomobject]@{
+            ExitCode = [int]$process.ExitCode
+            Stdout = $script:ReviewerSourceUtf8.GetString($stdout.ToArray())
+            Stderr = $script:ReviewerSourceUtf8.GetString($stderr.ToArray())
+        }
+    }
+    finally {
+        if ($started -and -not $process.HasExited) {
+            try { $process.Kill($true) } catch {}
+        }
+        $process.Dispose()
+        $stdout.Dispose()
+        $stderr.Dispose()
+    }
+}
+
+function Invoke-ReviewerSourceAzJson {
+    param(
+        [Parameter(Mandatory)][string]$ExecutablePath,
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [Parameter(Mandatory)][ValidateSet("extension", "account", "token", "rest")][string]$Operation,
+        [scriptblock]$ProcessInvoker
+    )
+    if (-not $ProcessInvoker) {
+        $ProcessInvoker = {
+            param($Path, $Args, $Timeout, $MaxOut, $MaxErr)
+            Invoke-ReviewerSourceAzProcess -ExecutablePath $Path -Arguments $Args `
+                -TimeoutSeconds $Timeout -MaxStdoutBytes $MaxOut -MaxStderrBytes $MaxErr
+        }
+    }
+    $result = & $ProcessInvoker $ExecutablePath $Arguments $script:ReviewerSourceAzTimeoutSeconds `
+        $script:ReviewerSourceAzMaxResponseBytes $script:ReviewerSourceAzMaxErrorBytes
+    $exitCode = Get-ReviewerSourceValue -Object $result -Name "ExitCode" -Default -1
+    $stdout = [string](Get-ReviewerSourceValue -Object $result -Name "Stdout" -Default "")
+    $stderr = [string](Get-ReviewerSourceValue -Object $result -Name "Stderr" -Default "")
+    if (($exitCode -isnot [int] -and $exitCode -isnot [long]) -or [int]$exitCode -ne 0) {
+        if ($Operation -ceq "extension") {
+            throw "The Azure DevOps CLI extension is unavailable."
+        }
+        if ($Operation -in @("account", "token")) {
+            throw "Azure CLI authentication is unavailable."
+        }
+        if ($stderr -match '(?i)\bAADSTS53003\b') {
+            throw "The Azure DevOps CLI read was blocked by Conditional Access (AADSTS53003)."
+        }
+        if ($stderr -match '(?i)(az login|not logged|authentication|unauthorized|forbidden)') {
+            throw "Azure DevOps CLI authentication is unavailable."
+        }
+        throw "The Azure DevOps CLI read failed."
+    }
+    if ([Text.Encoding]::UTF8.GetByteCount($stdout) -gt $script:ReviewerSourceAzMaxResponseBytes) {
+        throw "The Azure CLI response exceeded the byte limit."
+    }
+    try {
+        $parsed = $stdout | ConvertFrom-Json -Depth 64 -NoEnumerate -ErrorAction Stop
+        if ($parsed -is [System.Array]) { return , $parsed }
+        return $parsed
+    }
+    catch {
+        throw "The Azure CLI returned malformed JSON."
+    }
+}
+
+function New-ReviewerSourceAzCliInvoker {
+    param(
+        [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')][string]$Organization,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')][string]$ExpectedTenantId,
+        [scriptblock]$ExecutableResolver,
+        [scriptblock]$ProcessInvoker
+    )
+    if (-not $ExecutableResolver) {
+        $ExecutableResolver = {
+            $command = Get-Command az -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($command) { return [string]$command.Path }
+            return ""
+        }
+    }
+    $executablePath = [string](& $ExecutableResolver)
+    if ([string]::IsNullOrWhiteSpace($executablePath) -or
+        -not [System.IO.Path]::IsPathFullyQualified($executablePath)) {
+        throw "Azure CLI is unavailable."
+    }
+
+    $extension = Invoke-ReviewerSourceAzJson -ExecutablePath $executablePath -Operation "extension" `
+        -Arguments @("extension", "show", "--name", "azure-devops", "--output", "json", "--only-show-errors") `
+        -ProcessInvoker $ProcessInvoker
+    if ([string](Get-ReviewerSourceValue -Object $extension -Name "name" -Default "") -cne "azure-devops") {
+        throw "The Azure DevOps CLI extension is unavailable."
+    }
+    $account = Invoke-ReviewerSourceAzJson -ExecutablePath $executablePath -Operation "account" `
+        -Arguments @("account", "show", "--output", "json", "--only-show-errors") `
+        -ProcessInvoker $ProcessInvoker
+    $tenantId = [string](Get-ReviewerSourceValue -Object $account -Name "tenantId" -Default "")
+    if ($tenantId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+        throw "Azure CLI authentication did not return a tenant identity."
+    }
+    if ($tenantId.ToLowerInvariant() -cne $ExpectedTenantId) {
+        throw "Azure CLI is signed into a tenant other than the configured reviewer tenant."
+    }
+    $tokenMetadata = Invoke-ReviewerSourceAzJson -ExecutablePath $executablePath -Operation "token" `
+        -Arguments @("account", "get-access-token", "--resource", "499b84ac-1321-427f-aa17-267ca6975798",
+            "--tenant", $ExpectedTenantId, "--query", "{tenant:tenant,expires_on:expires_on}",
+            "--output", "json", "--only-show-errors") -ProcessInvoker $ProcessInvoker
+    $tokenTenant = [string](Get-ReviewerSourceValue -Object $tokenMetadata -Name "tenant" -Default "")
+    $expiresOn = Get-ReviewerSourceValue -Object $tokenMetadata -Name "expires_on"
+    if ($tokenTenant -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' -or
+        $tokenTenant.ToLowerInvariant() -cne $ExpectedTenantId -or
+        ($expiresOn -isnot [int] -and $expiresOn -isnot [long]) -or [long]$expiresOn -le 0) {
+        throw "Azure CLI authentication did not return tenant-bound Azure DevOps token metadata."
+    }
+
+    $organizationUrl = "https://dev.azure.com/$Organization"
+    $requestCounter = [pscustomobject]@{ Value = 3 }
+    $maxRequests = $script:ReviewerSourceAzMaxRequests
+    $apiVersion = $script:ReviewerSourceAzApiVersion
+    $projectValidator = ${function:Test-ReviewerSourceAzProject}
+    $jsonInvoker = ${function:Invoke-ReviewerSourceAzJson}
+    return {
+        param(
+            [ValidateSet("pullRequestIterations", "pullRequestIterationChanges")][string]$Resource,
+            [System.Collections.IDictionary]$RouteParameters,
+            [System.Collections.IDictionary]$QueryParameters
+        )
+        $requestCounter.Value = [int]$requestCounter.Value + 1
+        if ([int]$requestCounter.Value -gt $maxRequests) {
+            throw "The Azure DevOps CLI fallback exceeded its request limit."
+        }
+        $expectedRouteKeys = if ($Resource -ceq "pullRequestIterations") {
+            @("project", "repositoryId", "pullRequestId")
+        } else {
+            @("project", "repositoryId", "pullRequestId", "iterationId")
+        }
+        if ($null -eq $RouteParameters -or
+            (@($RouteParameters.Keys | Sort-Object) -join "`0") -cne (@($expectedRouteKeys | Sort-Object) -join "`0")) {
+            throw "The Azure DevOps CLI fallback route is malformed."
+        }
+        $project = [string]$RouteParameters["project"]
+        $repositoryId = [string]$RouteParameters["repositoryId"]
+        $pullRequestId = [string]$RouteParameters["pullRequestId"]
+        if (-not (& $projectValidator -Project $project) -or
+            $repositoryId -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -or
+            $pullRequestId -notmatch '^[1-9][0-9]{0,9}$' -or [long]$pullRequestId -gt [int]::MaxValue) {
+            throw "The Azure DevOps CLI fallback route is malformed."
+        }
+        if ($Resource -ceq "pullRequestIterationChanges") {
+            $iterationId = [string]$RouteParameters["iterationId"]
+            if ($iterationId -notmatch '^[1-9][0-9]{0,9}$' -or [long]$iterationId -gt [int]::MaxValue) {
+                throw "The Azure DevOps CLI fallback route is malformed."
+            }
+        }
+        $expectedQueryKeys = if ($Resource -ceq "pullRequestIterations") { @() } else { @('$skip', '$top') }
+        if ($null -eq $QueryParameters -or
+            (@($QueryParameters.Keys | Sort-Object) -join "`0") -cne (@($expectedQueryKeys | Sort-Object) -join "`0")) {
+            throw "The Azure DevOps CLI fallback query is malformed."
+        }
+
+        $escapedProject = [Uri]::EscapeDataString($project)
+        $url = "$organizationUrl/$escapedProject/_apis/git/repositories/$repositoryId/pullRequests/$pullRequestId/iterations"
+        if ($Resource -ceq "pullRequestIterationChanges") {
+            $skip = [string]$QueryParameters['$skip']
+            $top = [string]$QueryParameters['$top']
+            if ($skip -notmatch '^(0|[1-9][0-9]{0,3})$' -or [int]$skip -gt 1000 -or
+                $top -notmatch '^[1-9][0-9]{0,2}$' -or [int]$top -gt 200) {
+                throw "The Azure DevOps CLI fallback query is malformed."
+            }
+            $url += "/$iterationId/changes"
+        }
+        $arguments = [System.Collections.Generic.List[string]]::new()
+        foreach ($value in @("rest", "--method", "get", "--url", $url, "--resource",
+                "499b84ac-1321-427f-aa17-267ca6975798", "--url-parameters",
+                "api-version=$apiVersion")) {
+            [void]$arguments.Add($value)
+        }
+        if ($Resource -ceq "pullRequestIterationChanges") {
+            [void]$arguments.Add("`$top=$top")
+            [void]$arguments.Add("`$skip=$skip")
+        }
+        foreach ($value in @("--output", "json", "--only-show-errors")) { [void]$arguments.Add($value) }
+        return & $jsonInvoker -ExecutablePath $executablePath -Arguments $arguments.ToArray() `
+            -Operation "rest" -ProcessInvoker $ProcessInvoker
+    }.GetNewClosure()
+}
+
 function Get-ReviewerSourcePinnedChangePages {
     param(
         [Parameter(Mandatory)][scriptblock]$ToolInvoker,
@@ -351,7 +830,8 @@ function Get-ReviewerSourcePinnedChangePages {
 
 function Invoke-ReviewerSourceNewContractTransport {
     param(
-        [Parameter(Mandatory)][scriptblock]$ToolInvoker,
+        [scriptblock]$ToolInvoker,
+        [scriptblock]$IdentityReader,
         [Parameter(Mandatory)][scriptblock]$Reader,
         [Parameter(Mandatory)][scriptblock]$BaseReader,
         [Parameter(Mandatory)][scriptblock]$AggregateReader,
@@ -360,13 +840,21 @@ function Invoke-ReviewerSourceNewContractTransport {
         [Parameter(Mandatory)][string]$RepositoryId,
         [Parameter(Mandatory)][int]$PrId,
         [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit,
-        [Parameter(Mandatory)]$Capability,
+        $Capability,
         [Parameter(Mandatory)][hashtable]$Policy,
         [Parameter(Mandatory)][AllowEmptyString()][string]$PolicySha256,
         [Parameter(Mandatory)][scriptblock]$NonceFactory
     )
-    $first = Get-ReviewerSourcePinnedChangePages -ToolInvoker $ToolInvoker -Project $Project `
-        -RepositoryId $RepositoryId -PrId $PrId -Capability $Capability
+    if ($IdentityReader) {
+        $first = & $IdentityReader
+    }
+    elseif ($ToolInvoker -and $Capability) {
+        $first = Get-ReviewerSourcePinnedChangePages -ToolInvoker $ToolInvoker -Project $Project `
+            -RepositoryId $RepositoryId -PrId $PrId -Capability $Capability
+    }
+    else {
+        throw "The authoritative source transport requires an identity reader or hosted MCP capability."
+    }
     $binding = $first.Binding
     if ([string]$binding.SourceRefCommit -cne $SourceCommit) {
         throw "PR $PrId iteration source '$($binding.SourceRefCommit)' does not match pinned source $SourceCommit."
@@ -426,8 +914,13 @@ function Invoke-ReviewerSourceNewContractTransport {
         -RecoveryRecoveredFileCount (@($recovery.RecoveredPaths).Count) `
         -RecoveryEvidenceBlockCount ([int]$recovery.EvidenceBlockCount) `
         -RecoveryBaseCommit ([string]$recoveryBinding.BaseCommit) -RecoveryIterationId ([int]$recoveryBinding.IterationId)
-    $confirm = Get-ReviewerSourcePinnedChangePages -ToolInvoker $ToolInvoker -Project $Project `
-        -RepositoryId $RepositoryId -PrId $PrId -Capability $Capability
+    if ($IdentityReader) {
+        $confirm = & $IdentityReader
+    }
+    else {
+        $confirm = Get-ReviewerSourcePinnedChangePages -ToolInvoker $ToolInvoker -Project $Project `
+            -RepositoryId $RepositoryId -PrId $PrId -Capability $Capability
+    }
     if (-not (Test-ReviewerSourceIterationBindingStable -Before $binding -After $confirm.Binding) -or
         [string]$first.ChangeSetSha256 -cne [string]$confirm.ChangeSetSha256) {
         throw "PR $PrId iteration identity or change list moved during pinned content reads."
@@ -802,6 +1295,9 @@ function Get-ReviewerSourceChangeIdentityDigest {
         $path = [string](Get-ReviewerSourceValue -Object $item -Name "path" -Default "")
         if (-not $path) { $path = [string](Get-ReviewerSourceValue -Object $change -Name "path" -Default "") }
         $originalPath = [string](Get-ReviewerSourceValue -Object $change -Name "originalPath" -Default "")
+        if (-not $originalPath) {
+            $originalPath = [string](Get-ReviewerSourceValue -Object $change -Name "sourceServerItem" -Default "")
+        }
         $kinds = Get-ReviewerSourceChangeKinds -Value (
             Get-ReviewerSourceValue -Object $change -Name "changeType" -Default $null)
         [void]$rows.Add([ordered]@{

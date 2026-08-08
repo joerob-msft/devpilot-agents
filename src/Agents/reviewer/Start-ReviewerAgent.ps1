@@ -451,6 +451,10 @@ foreach ($sourcePolicyProperty in $SourceTransportPolicyRaw.PSObject.Properties)
     $SourceTransportPolicyProperties[$sourcePolicyProperty.Name] = $sourcePolicyProperty.Value
 }
 $SourceTransportPolicy = New-ReviewerSourceTransportPolicy -Policy ([pscustomobject]$SourceTransportPolicyProperties)
+$SourceTransportAzFallbackSchemaPath = Join-Path $PSScriptRoot "source/v1/azure-devops-cli-fallback.schema.json"
+if (-not (Test-Path -LiteralPath $SourceTransportAzFallbackSchemaPath)) {
+    throw "Source-transport Azure CLI fallback schema '$SourceTransportAzFallbackSchemaPath' does not exist."
+}
 $ConventionSpecialistLibrary = Join-Path $PSScriptRoot "ConventionSpecialist.ps1"
 if (-not (Test-Path -LiteralPath $ConventionSpecialistLibrary)) {
     throw "Convention-specialist library '$ConventionSpecialistLibrary' does not exist."
@@ -2116,6 +2120,35 @@ if ($deliveryGatesCfgProperty) {
     if ($deliveryGatesCfg.PSObject.Properties["disabled"]) {
         $CfgDeliveryGatesDisabled = Get-AgentConfigBool -Object $deliveryGatesCfg -Name "disabled" `
             -Where "config.review.deliveryGates"
+    }
+}
+$CfgAzCliFallbackEnabled = $false
+$CfgAzCliFallbackTenantId = ""
+$sourceTransportCfgProperty = $reviewCfg.PSObject.Properties["sourceTransport"]
+if ($sourceTransportCfgProperty) {
+    $sourceTransportCfg = $sourceTransportCfgProperty.Value
+    Assert-ReviewerExactObjectKeys -Object $sourceTransportCfg `
+        -Allowed @("note", "azureDevOpsCliFallback") -Required @("azureDevOpsCliFallback") `
+        -Where "config.review.sourceTransport"
+    $azFallbackCfg = Get-AgentConfigObject -Object $sourceTransportCfg `
+        -Name "azureDevOpsCliFallback" -Where "config.review.sourceTransport"
+    $azFallbackJson = $azFallbackCfg | ConvertTo-Json -Depth 8
+    if (-not ($azFallbackJson | Test-Json -SchemaFile $SourceTransportAzFallbackSchemaPath -ErrorAction Stop)) {
+        throw "config.review.sourceTransport.azureDevOpsCliFallback does not satisfy its schema."
+    }
+    Assert-ReviewerExactObjectKeys -Object $azFallbackCfg `
+        -Allowed @("note", "enabled", "tenantId") -Required @("enabled", "tenantId") `
+        -Where "config.review.sourceTransport.azureDevOpsCliFallback"
+    $CfgAzCliFallbackEnabled = Get-AgentConfigBool -Object $azFallbackCfg -Name "enabled" `
+        -Where "config.review.sourceTransport.azureDevOpsCliFallback"
+    $CfgAzCliFallbackTenantId = Get-AgentConfigString -Object $azFallbackCfg -Name "tenantId" `
+        -Where "config.review.sourceTransport.azureDevOpsCliFallback" -MaxLength 36 -AllowEmpty `
+        -Pattern '^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})?$'
+    if ($CfgAzCliFallbackEnabled -and -not $CfgAzCliFallbackTenantId) {
+        throw "config.review.sourceTransport.azureDevOpsCliFallback.tenantId is required when the fallback is enabled."
+    }
+    if ($CfgAzCliFallbackTenantId) {
+        $CfgAzCliFallbackTenantId = $CfgAzCliFallbackTenantId.ToLowerInvariant()
     }
 }
 foreach ($sev in @($PostSeverities)) {
@@ -7551,6 +7584,9 @@ function Get-ReviewerSourceTransport {
     if ($null -ne $capability) {
         return Get-ReviewerSourceTransportNewContract -Session $Session -PrId $PrId -SourceCommit $SourceCommit -Capability $capability
     }
+    if ($CfgAzCliFallbackEnabled) {
+        return Get-ReviewerSourceTransportAzCliFallback -Session $Session -PrId $PrId -SourceCommit $SourceCommit
+    }
     # -- Legacy get_changes path (unchanged) --
     $changes = Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments @{
         action = 'get_changes'; project = $ExpectedProject; repositoryId = $RepositoryName
@@ -7657,6 +7693,46 @@ function Get-ReviewerSourceTransportNewContract {
         -PrId $PrId -SourceCommit $SourceCommit -Capability $Capability -Policy $SourceTransportPolicy `
         -PolicySha256 $SourceTransportPolicySha256 -NonceFactory { New-AgentNonce } `
         -AggregateReader $aggregateReader
+}
+
+function Get-ReviewerSourceTransportAzCliFallback {
+    <# Explicitly enabled fallback for hosts that still expose aggregate line-diff
+       blocks but not authoritative iteration identity. Azure CLI supplies only
+       the latest iteration and its common-to-source change pages; the existing
+       MCP aggregate response and pinned file readers remain the content seams. #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)][int]$PrId,
+        [Parameter(Mandatory)][string]$SourceCommit
+    )
+    $azInvoker = New-ReviewerSourceAzCliInvoker -Organization $Organization `
+        -ExpectedTenantId $CfgAzCliFallbackTenantId
+    $azCaptureFunction = ${function:Get-ReviewerSourceAzIdentityCapture}
+    $identityReader = {
+        return & $azCaptureFunction -AzInvoker $azInvoker -Project $ExpectedProject `
+            -RepositoryId $cfgRepoId.ToLowerInvariant() -PrId $PrId -SourceCommit $SourceCommit
+    }.GetNewClosure()
+    $aggregateReader = {
+        return Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments @{
+            action = 'get_changes'; project = $ExpectedProject; repositoryId = $RepositoryName
+            pullRequestId = $PrId; includeDiffs = $true; includeLineContent = $true; top = 1000
+        }
+    }.GetNewClosure()
+    $sourceReader = {
+        param([string]$Path, [string[]]$Kinds)
+        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path `
+            -CommitSha $SourceCommit -ChangeKinds @($Kinds)
+    }.GetNewClosure()
+    $baseReader = {
+        param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path `
+            -CommitSha $BaseCommit -ChangeKinds @($Kinds)
+    }.GetNewClosure()
+    return Invoke-ReviewerSourceNewContractTransport -IdentityReader $identityReader `
+        -Reader $sourceReader -BaseReader $baseReader -AggregateReader $aggregateReader `
+        -Organization $Organization -Project $ExpectedProject -RepositoryId $cfgRepoId `
+        -PrId $PrId -SourceCommit $SourceCommit -Policy $SourceTransportPolicy `
+        -PolicySha256 $SourceTransportPolicySha256 -NonceFactory { New-AgentNonce }
 }
 
 function Get-ReviewerPinnedConventionChangeSet {

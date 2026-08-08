@@ -1074,14 +1074,15 @@ Assert-Source ((Measure-WrapperVariableWrite -FunctionAst $transportAst -Name 'c
     "and the change set, its spans, its change kinds and the re-read head are each established once"
 # Counting writes says nothing about REACHABILITY: an inserted early return of a
 # doctored result leaves every pinned line intact and simply never runs it.
-# Three returns: (1) the capability-gated new-contract dispatch, (2) the reader
-# closure's own return inside .GetNewClosure(), and (3) the legacy path's final
-# return. The new-contract dispatch delegates to a separately validated function.
+# Four returns: (1) the capability-gated new-contract dispatch, (2) the explicit
+# CLI-fallback dispatch, (3) the reader closure's own return inside
+# .GetNewClosure(), and (4) the legacy path's final return. Both dispatches
+# delegate to separately validated functions.
 Assert-Source (@($transportAst.FindAll({
                 param($candidate)
                 $candidate -is [Management.Automation.Language.ReturnStatementAst]
-            }, $true)).Count -eq 3) `
-    "and the transport has exactly three returns - the capability-gated dispatch, the reader's and its own - so no earlier one can hand back a doctored result the pinned lines below never reach"
+            }, $true)).Count -eq 4) `
+    "and the transport has exactly four returns - the two gated dispatches, the reader's and its own - so no earlier one can hand back a doctored result the pinned lines below never reach"
 # ...and counting returns is not enough either, because PowerShell returns a
 # value without one. A bare hashtable on its own line joins the output: emitted
 # beside the real return it makes `Gate.Ok` the array `@($true, $false)`, which
@@ -3352,9 +3353,10 @@ Assert-Source ($fcRecCalls.Count -eq 2 -and [string]$fcRecCalls[0].action -ceq "
     -not $fcRecCalls[1].ContainsKey("iterationId") -and
     (@($fcRecEvents) -join ",") -ceq "identity,aggregate,identity") `
     "the orchestrator brackets the aggregate diff with complete latest-iteration identity reads"
-Assert-Source ([int]$fcRecResult.Report.CoveredFiles -eq 1 -and [int]$fcRecResult.Report.CoveragePercent -eq 100 -and
-    [bool]$fcRecResult.Gate.Ok -and $fcRecResult.BlockText -match '"spanBasis":"recovered"' -and $null -ne $fcRecResult.Record) `
-    "a degenerate same-path edit recovers its exact spans at spanBasis=recovered and passes the gate"
+$fcRecCondition = [bool]([int]$fcRecResult.Report.CoveredFiles -eq 1 -and
+    [int]$fcRecResult.Report.CoveragePercent -eq 100 -and [bool]$fcRecResult.Gate.Ok -and
+    $fcRecResult.BlockText -match '"spanBasis":"recovered"' -and $null -ne $fcRecResult.Record)
+Assert-Source $fcRecCondition "a degenerate same-path edit recovers its exact spans at spanBasis=recovered and passes the gate"
 
 $fcTruncatedCommits = New-FCPage -Changes @((New-DegenerateEdit -Path "/src/a.cs"))
 $fcTruncatedCommits.commitsTruncated = $true
@@ -3368,9 +3370,10 @@ $fcOrdinaryPage = New-FCPage -Changes @((New-FCOrdinaryChange -Path "/src/a.cs" 
 $fcOrdCalls = [System.Collections.Generic.List[hashtable]]::new()
 $fcOrdResult = Invoke-FCOrchestrator -Responses @($fcOrdinaryPage, $fcOrdinaryPage) -Calls $fcOrdCalls `
     -BaseReader { param($p, $k, $b) throw "recovery must not read on an ordinary authoritative span" }
-Assert-Source ([int]$fcOrdResult.Report.CoveragePercent -eq 100 -and [bool]$fcOrdResult.Gate.Ok -and
-    $fcOrdResult.BlockText -match '"spanBasis":"changeSet"' -and $fcOrdResult.BlockText -notmatch '"spanBasis":"recovered"') `
-    "an ordinary right-hand span is delivered unchanged at spanBasis=changeSet with no recovery reads"
+$fcOrdCondition = [bool]([int]$fcOrdResult.Report.CoveragePercent -eq 100 -and
+    [bool]$fcOrdResult.Gate.Ok -and $fcOrdResult.BlockText -match '"spanBasis":"changeSet"' -and
+    $fcOrdResult.BlockText -notmatch '"spanBasis":"recovered"')
+Assert-Source $fcOrdCondition "an ordinary right-hand span is delivered unchanged at spanBasis=changeSet with no recovery reads"
 
 # The final public #1499 identity page carries raw change entries but no diff
 # blocks. It supplements the existing aggregate diff response rather than
@@ -3386,17 +3389,17 @@ $fcRawCalls = [System.Collections.Generic.List[hashtable]]::new()
 $fcRawResult = Invoke-FCOrchestrator -Responses @($fcRawIdentityPage, $fcRawIdentityPage) -Calls $fcRawCalls `
     -AggregateResponse $fcAggregateOrdinary `
     -BaseReader { param($p, $k, $b) throw "ordinary aggregate spans must not recover" }
-Assert-Source ([int]$fcRawResult.Report.CoveragePercent -eq 100 -and $fcRawResult.Gate.Ok -and
-    $fcRawResult.BlockText -match '"spanBasis":"changeSet"') `
-    "raw identity-only pages preserve ordinary spans from the separately bound aggregate diff"
+$fcRawCondition = [bool]([int]$fcRawResult.Report.CoveragePercent -eq 100 -and
+    $fcRawResult.Gate.Ok -and $fcRawResult.BlockText -match '"spanBasis":"changeSet"')
+Assert-Source $fcRawCondition "raw identity-only pages preserve ordinary spans from the separately bound aggregate diff"
 
 $fcAggregateDegenerate = [pscustomobject]@{ changes = @((New-DegenerateEdit -Path "/src/a.cs")) }
 $fcRawRecoveryCalls = [System.Collections.Generic.List[hashtable]]::new()
 $fcRawRecoveryResult = Invoke-FCOrchestrator -Responses @($fcRawIdentityPage, $fcRawIdentityPage) `
     -Calls $fcRawRecoveryCalls -AggregateResponse $fcAggregateDegenerate
-Assert-Source ($fcRawRecoveryResult.Gate.Ok -and
-    $fcRawRecoveryResult.BlockText -match '"spanBasis":"recovered"') `
-    "raw identity-only pages bind common/source recovery for a degenerate aggregate edit"
+$fcRawRecoveryCondition = [bool]($fcRawRecoveryResult.Gate.Ok -and
+    $fcRawRecoveryResult.BlockText -match '"spanBasis":"recovered"')
+Assert-Source $fcRawRecoveryCondition "raw identity-only pages bind common/source recovery for a degenerate aggregate edit"
 
 $fcRejectedPathChange = New-FCOrdinaryChange -Path "/src/x|hidden.cs" -Start 2 -Count 1
 $fcRejectedPage = New-FCPage -Changes @($fcRejectedPathChange)
@@ -3452,9 +3455,9 @@ $fcMixedSourceReader = {
 }.GetNewClosure()
 $fcMixedCalls = [System.Collections.Generic.List[hashtable]]::new()
 $fcMixedResult = Invoke-FCOrchestrator -Responses @($fcMixedPage, $fcMixedPage) -Calls $fcMixedCalls -SourceReader $fcMixedSourceReader
-Assert-Source ([int]$fcMixedResult.Report.CoveredFiles -eq 1 -and [int]$fcMixedResult.Report.SourceBearingFileCount -eq 2 -and
-    -not $fcMixedResult.Gate.Ok) `
-    "a mixed recovered/unrecovered set keeps the unread file in the denominator and fails the gate"
+$fcMixedCondition = [bool]([int]$fcMixedResult.Report.CoveredFiles -eq 1 -and
+    [int]$fcMixedResult.Report.SourceBearingFileCount -eq 2 -and -not $fcMixedResult.Gate.Ok)
+Assert-Source $fcMixedCondition "a mixed recovered/unrecovered set keeps the unread file in the denominator and fails the gate"
 
 # Same content and a hostile reader both fail recovery closed - no invented span.
 $fcSameContentReader = {
@@ -3486,6 +3489,374 @@ $fcRenameEdit = [pscustomobject]@{
 Assert-Source (@((Get-ReviewerSourceDegenerateChanges -Response ([pscustomobject]@{ changes = @($fcRenameEdit) })).Keys).Count -eq 0) `
     "a same-path edit whose originalPath differs is excluded from recovery"
 
+# -- Explicit Azure CLI identity fallback -------------------------------------
+Write-Host "`nAzure CLI identity fallback tests:" -ForegroundColor Cyan
+$azTenant = "12121212-3434-5656-7878-909090909090"
+$azOtherTenant = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+function New-AzIteration {
+    param(
+        [int]$Id = $fcIter,
+        [string]$Source = $fcSource,
+        [string]$Common = $fcCommon,
+        [string]$Target = $fcTarget,
+        [string]$Reason = "push"
+    )
+    return [pscustomobject]@{
+        id = $Id
+        commonRefCommit = [pscustomobject]@{ commitId = $Common }
+        sourceRefCommit = [pscustomobject]@{ commitId = $Source }
+        targetRefCommit = [pscustomobject]@{ commitId = $Target }
+        reason = $Reason
+        hasMoreCommits = $false
+        oldTargetRefName = $null
+        newTargetRefName = $null
+    }
+}
+function New-AzChange {
+    param([string]$Path = "/src/a.cs", [int]$TrackingId = 1)
+    return [pscustomobject]@{
+        changeTrackingId = $TrackingId
+        changeId = $TrackingId
+        item = [pscustomobject]@{ path = $Path }
+        changeType = "edit"
+    }
+}
+function New-AzChangePage {
+    param([object[]]$Changes = @(), [int]$NextSkip = 0, [int]$NextTop = 0)
+    return [pscustomobject]@{
+        changeEntries = @($Changes)
+        nextSkip = $NextSkip
+        nextTop = $NextTop
+    }
+}
+function New-AzProcessResult {
+    param([int]$ExitCode = 0, [string]$Stdout = "{}", [string]$Stderr = "")
+    return [pscustomobject]@{ ExitCode = $ExitCode; Stdout = $Stdout; Stderr = $Stderr }
+}
+
+$azIterationJson = ConvertTo-Json -InputObject @((New-AzIteration)) -Depth 12 -Compress
+$azChangeJson = ConvertTo-Json -InputObject (New-AzChangePage -Changes @((New-AzChange))) -Depth 12 -Compress
+$azCalls = [System.Collections.Generic.List[object]]::new()
+$azProcess = {
+    param($Path, [string[]]$Arguments, $Timeout, $MaxOut, $MaxErr)
+    [void]$azCalls.Add([pscustomobject]@{
+            Path = $Path; Arguments = @($Arguments); Timeout = $Timeout
+            MaxOut = $MaxOut; MaxErr = $MaxErr
+        })
+    if ($Arguments[0] -ceq "extension") {
+        return [pscustomobject]@{ ExitCode = 0; Stdout = '{"name":"azure-devops","version":"1.0.0"}'; Stderr = "" }
+    }
+    if ($Arguments[0] -ceq "account") {
+        if ($Arguments[1] -ceq "get-access-token") {
+            return [pscustomobject]@{
+                ExitCode = 0
+                Stdout = "{`"tenant`":`"$azTenant`",`"expires_on`":4102444800}"
+                Stderr = ""
+            }
+        }
+        return [pscustomobject]@{ ExitCode = 0; Stdout = "{`"tenantId`":`"$azTenant`"}"; Stderr = "" }
+    }
+    $urlIndex = [Array]::IndexOf($Arguments, "--url")
+    if ($urlIndex -lt 0) {
+        return [pscustomobject]@{ ExitCode = 1; Stdout = ""; Stderr = "bad request" }
+    }
+    if ($Arguments[$urlIndex + 1].EndsWith("/iterations", [StringComparison]::Ordinal)) {
+        return [pscustomobject]@{
+            ExitCode = 0
+            Stdout = $azIterationJson
+            Stderr = ""
+        }
+    }
+    return [pscustomobject]@{ ExitCode = 0; Stdout = $azChangeJson; Stderr = "" }
+}.GetNewClosure()
+$azInvoker = New-ReviewerSourceAzCliInvoker -Organization "contoso" -ExpectedTenantId $azTenant `
+    -ExecutableResolver { "C:\Program Files\Azure CLI\az.cmd" } -ProcessInvoker $azProcess
+$azCapture = Get-ReviewerSourceAzIdentityCapture -AzInvoker $azInvoker -Project "widgets" `
+    -RepositoryId $fcRepoId -PrId $fcPr -SourceCommit $fcSource
+Assert-Source ([int]$azCapture.Binding.IterationId -eq $fcIter -and
+    [string]$azCapture.Binding.CommonRefCommit -ceq $fcCommon -and
+    [string]$azCapture.Binding.SourceRefCommit -ceq $fcSource -and
+    [string]$azCapture.Binding.TargetRefCommit -ceq $fcTarget -and
+    @($azCapture.Response.changes).Count -eq 1) `
+    "the CLI fallback binds the latest exact common/source/target identity and its common-to-source changes"
+$azTerminalWithoutCursors = [pscustomobject]@{ changeEntries = @((New-AzChange)) }
+Assert-Source ($null -ne (Get-ReviewerSourceAzChangePage -Response $azTerminalWithoutCursors `
+            -ExpectedSkip 0 -ExpectedTop 200)) `
+    "a short REST terminal page may omit both continuation cursors"
+$azAmbiguousFullPage = [pscustomobject]@{
+    changeEntries = @(1..200 | ForEach-Object { New-AzChange -Path "/src/$_.cs" -TrackingId $_ })
+}
+Assert-Source ($null -eq (Get-ReviewerSourceAzChangePage -Response $azAmbiguousFullPage `
+            -ExpectedSkip 0 -ExpectedTop 200)) `
+    "a full REST page without continuation cursors is treated as ambiguous truncation and refused"
+
+$invokeCall = @($azCalls | Where-Object { $_.Arguments[0] -ceq "rest" })[0]
+$invokeArgs = @($invokeCall.Arguments)
+Assert-Source ($invokeCall.Path -ceq "C:\Program Files\Azure CLI\az.cmd" -and
+    [int]$invokeCall.Timeout -eq 30 -and [int]$invokeCall.MaxOut -eq 1048576 -and
+    $invokeArgs -ccontains "--method" -and $invokeArgs -ccontains "get" -and
+    $invokeArgs -ccontains "--only-show-errors" -and $invokeArgs -ccontains "--output" -and
+    $invokeArgs -ccontains "json" -and $invokeArgs -ccontains "--resource" -and
+    @($invokeArgs | Where-Object { $_ -match '^https://dev\.azure\.com/contoso/' }).Count -eq 1 -and
+    @($invokeArgs | Where-Object { $_ -match '(?i)(token|password|secret)' }).Count -eq 0) `
+    "the production CLI seam uses a fixed structured read-only REST command, bounded output, no token argument, and no shell text"
+$changeInvokeArgs = @(@($azCalls | Where-Object {
+                $_.Arguments[0] -ceq "rest" -and $_.Arguments -match "/$fcIter/changes" })[0].Arguments)
+Assert-Source (@($changeInvokeArgs | Where-Object { $_ -match "/$fcIter/changes$" }).Count -eq 1 -and
+    $changeInvokeArgs -ccontains '$top=200' -and $changeInvokeArgs -ccontains '$skip=0' -and
+    @($changeInvokeArgs | Where-Object { $_ -match '(?i)compareTo' }).Count -eq 0) `
+    "iteration changes are pinned to the exact iteration with bounded top/skip and never use compareTo"
+
+Assert-Source (Test-Throws {
+        New-ReviewerSourceAzCliInvoker -Organization "contoso" -ExpectedTenantId $azTenant `
+            -ExecutableResolver { "" } -ProcessInvoker $azProcess
+    }) "an enabled fallback fails closed when Azure CLI is missing"
+$extensionMissing = {
+    param($Path, $Arguments)
+    return [pscustomobject]@{ ExitCode = 2; Stdout = ""; Stderr = "extension unavailable" }
+}
+Assert-Source (Test-Throws {
+        New-ReviewerSourceAzCliInvoker -Organization "contoso" -ExpectedTenantId $azTenant `
+            -ExecutableResolver { "C:\az.cmd" } -ProcessInvoker $extensionMissing
+    }) "an enabled fallback fails closed when the azure-devops extension is missing"
+$signedOut = {
+    param($Path, $Arguments)
+    if ($Arguments[0] -ceq "extension") {
+        return [pscustomobject]@{ ExitCode = 0; Stdout = '{"name":"azure-devops"}'; Stderr = "" }
+    }
+    return [pscustomobject]@{ ExitCode = 1; Stdout = ""; Stderr = "Please run az login" }
+}
+Assert-Source (Test-Throws {
+        New-ReviewerSourceAzCliInvoker -Organization "contoso" -ExpectedTenantId $azTenant `
+            -ExecutableResolver { "C:\az.cmd" } -ProcessInvoker $signedOut
+    }) "an enabled fallback fails closed when Azure CLI is signed out"
+$wrongTenant = {
+    param($Path, $Arguments)
+    if ($Arguments[0] -ceq "extension") {
+        return [pscustomobject]@{ ExitCode = 0; Stdout = '{"name":"azure-devops"}'; Stderr = "" }
+    }
+    return [pscustomobject]@{ ExitCode = 0; Stdout = "{`"tenantId`":`"$azOtherTenant`"}"; Stderr = "" }
+}.GetNewClosure()
+Assert-Source (Test-Throws {
+        New-ReviewerSourceAzCliInvoker -Organization "contoso" -ExpectedTenantId $azTenant `
+            -ExecutableResolver { "C:\az.cmd" } -ProcessInvoker $wrongTenant
+    }) "an enabled fallback fails closed when Azure CLI is signed into the wrong tenant"
+$malformedJson = {
+    param($Path, $Arguments)
+    return [pscustomobject]@{ ExitCode = 0; Stdout = "{not-json"; Stderr = "" }
+}
+Assert-Source (Test-Throws {
+        New-ReviewerSourceAzCliInvoker -Organization "contoso" -ExpectedTenantId $azTenant `
+            -ExecutableResolver { "C:\az.cmd" } -ProcessInvoker $malformedJson
+    }) "malformed Azure CLI JSON fails closed before any DevOps read"
+$conditionalAccess = {
+    param($Path, $Arguments)
+    if ($Arguments[0] -ceq "extension") {
+        return [pscustomobject]@{ ExitCode = 0; Stdout = '{"name":"azure-devops"}'; Stderr = "" }
+    }
+    if ($Arguments[0] -ceq "account") {
+        if ($Arguments[1] -ceq "get-access-token") {
+            return [pscustomobject]@{
+                ExitCode = 0
+                Stdout = "{`"tenant`":`"$azTenant`",`"expires_on`":4102444800}"
+                Stderr = ""
+            }
+        }
+        return [pscustomobject]@{ ExitCode = 0; Stdout = "{`"tenantId`":`"$azTenant`"}"; Stderr = "" }
+    }
+    return [pscustomobject]@{ ExitCode = 1; Stdout = ""; Stderr = "AADSTS53003: blocked; private-response-body" }
+}.GetNewClosure()
+$caError = ""
+try {
+    $caInvoker = New-ReviewerSourceAzCliInvoker -Organization "contoso" -ExpectedTenantId $azTenant `
+        -ExecutableResolver { "C:\az.cmd" } -ProcessInvoker $conditionalAccess
+    & $caInvoker "pullRequestIterations" ([ordered]@{
+            project = "widgets"; repositoryId = $fcRepoId; pullRequestId = [string]$fcPr
+        }) ([ordered]@{}) | Out-Null
+}
+catch { $caError = [string]$_.Exception.Message }
+Assert-Source ($caError -match 'AADSTS53003' -and $caError -notmatch 'private-response-body') `
+    "Conditional Access failure is categorized without disclosing the CLI response body"
+foreach ($boundedFailure in @(
+        @{ Name = "timeout"; Message = "The Azure CLI read timed out." },
+        @{ Name = "oversize response"; Message = "The Azure CLI response exceeded the byte limit." }
+    )) {
+    $failure = $boundedFailure
+    $failingProcess = { param($p, $a) throw $failure.Message }.GetNewClosure()
+    Assert-Source (Test-Throws {
+            New-ReviewerSourceAzCliInvoker -Organization "contoso" -ExpectedTenantId $azTenant `
+                -ExecutableResolver { "C:\az.cmd" } -ProcessInvoker $failingProcess
+        }) "an Azure CLI $($boundedFailure.Name) fails closed"
+}
+
+$validIteration = New-AzIteration
+Assert-Source ($null -eq (Get-ReviewerSourceAzIterationBinding -Response @() -SourceCommit $fcSource)) `
+    "a missing iteration fails closed"
+Assert-Source ($null -eq (Get-ReviewerSourceAzIterationBinding -Response @($validIteration, $validIteration) -SourceCommit $fcSource)) `
+    "duplicate iteration identity fails closed"
+$missingCommitIteration = New-AzIteration
+$missingCommitIteration.commonRefCommit = $null
+Assert-Source ($null -eq (Get-ReviewerSourceAzIterationBinding -Response @($missingCommitIteration) -SourceCommit $fcSource)) `
+    "missing or malformed common/source/target commits fail closed"
+Assert-Source ($null -eq (Get-ReviewerSourceAzIterationBinding -Response @(
+            (New-AzIteration -Source ("f" * 40))) -SourceCommit $fcSource)) `
+    "CLI iteration source mismatch with the pinned MCP source fails closed"
+$conflictResolution = Get-ReviewerSourceAzIterationBinding -Response @(
+    (New-AzIteration -Reason "resolveConflicts")) -SourceCommit $fcSource
+Assert-Source ($null -ne $conflictResolution -and
+    [string]$conflictResolution.ReasonValue -ceq "resolveconflicts") `
+    "a valid conflict-resolution iteration reason remains authoritative"
+$renameFromCli = [pscustomobject]@{
+    changeTrackingId = 1
+    item = [pscustomobject]@{ path = "/src/new.cs" }
+    sourceServerItem = "/src/old.cs"
+    changeType = "rename"
+}
+$renameFromMcp = [pscustomobject]@{
+    item = [pscustomobject]@{ path = "/src/new.cs" }
+    originalPath = "/src/old.cs"
+    changeType = "rename"
+}
+Assert-Source ((Get-ReviewerSourceChangeIdentityDigest -Response ([pscustomobject]@{
+                changes = @($renameFromCli)
+            })) -ceq
+    (Get-ReviewerSourceChangeIdentityDigest -Response ([pscustomobject]@{
+                changes = @($renameFromMcp)
+            }))) "CLI sourceServerItem and MCP originalPath normalize to the same rename identity"
+
+$realPwsh = (Get-Command pwsh -CommandType Application).Path
+$realProcess = Invoke-ReviewerSourceAzProcess -ExecutablePath $realPwsh `
+    -Arguments @("-NoProfile", "-Command", "[Console]::Out.Write('ok')") `
+    -TimeoutSeconds 5 -MaxStdoutBytes 1024 -MaxStderrBytes 1024
+Assert-Source ([int]$realProcess.ExitCode -eq 0 -and [string]$realProcess.Stdout -ceq "ok") `
+    "the real structured process seam captures a bounded successful child"
+Assert-Source (Test-Throws {
+        Invoke-ReviewerSourceAzProcess -ExecutablePath $realPwsh `
+            -Arguments @("-NoProfile", "-Command", "Start-Sleep -Seconds 2") `
+            -TimeoutSeconds 1 -MaxStdoutBytes 1024 -MaxStderrBytes 1024
+    }) "the real structured process seam terminates a timed-out child"
+Assert-Source (Test-Throws {
+        Invoke-ReviewerSourceAzProcess -ExecutablePath $realPwsh `
+            -Arguments @("-NoProfile", "-Command", "[Console]::Out.Write('x' * 2048)") `
+            -TimeoutSeconds 5 -MaxStdoutBytes 1024 -MaxStderrBytes 1024
+    }) "the real structured process seam terminates an oversized child"
+
+$multiPageResponses = [System.Collections.Generic.Queue[object]]::new()
+$multiPageResponses.Enqueue(@((New-AzIteration)))
+$multiPageResponses.Enqueue((New-AzChangePage -Changes @(
+            (New-AzChange -Path "/src/a.cs" -TrackingId 1)) -NextSkip 1 -NextTop 200))
+$multiPageResponses.Enqueue((New-AzChangePage -Changes @(
+            (New-AzChange -Path "/src/b.cs" -TrackingId 2))))
+$multiPageCalls = [System.Collections.Generic.List[object]]::new()
+$multiPageInvoker = {
+    param($resource, $route, $query)
+    [void]$multiPageCalls.Add([pscustomobject]@{
+            Resource = $resource; Route = $route; Query = $query
+        })
+    $response = $multiPageResponses.Dequeue()
+    if ($response -is [System.Array]) { return , $response }
+    return $response
+}.GetNewClosure()
+$multiPageCapture = Get-ReviewerSourceAzIdentityCapture -AzInvoker $multiPageInvoker `
+    -Project "widgets" -RepositoryId $fcRepoId -PrId $fcPr -SourceCommit $fcSource
+Assert-Source (@($multiPageCapture.Response.changes).Count -eq 2 -and
+    [string]$multiPageCalls[1].Query['$skip'] -ceq "0" -and
+    [string]$multiPageCalls[2].Query['$skip'] -ceq "1" -and
+    [string]$multiPageCalls[2].Route.iterationId -ceq [string]$fcIter) `
+    "multi-page CLI capture advances skip and pins every change page to the exact iteration"
+
+$identityResponses = [System.Collections.Generic.Queue[object]]::new()
+$identityResponses.Enqueue(@((New-AzIteration)))
+$identityResponses.Enqueue((New-AzChangePage -Changes @((New-AzChange))))
+$identityResponses.Enqueue(@((New-AzIteration)))
+$identityResponses.Enqueue((New-AzChangePage -Changes @((New-AzChange))))
+$identityInvoker = {
+    param($resource, $route, $query)
+    $response = $identityResponses.Dequeue()
+    if ($response -is [System.Array]) { return , $response }
+    return $response
+}.GetNewClosure()
+$azCaptureFunction = ${function:Get-ReviewerSourceAzIdentityCapture}
+$identityReader = {
+    & $azCaptureFunction -AzInvoker $identityInvoker -Project "widgets" `
+        -RepositoryId $fcRepoId -PrId $fcPr -SourceCommit $fcSource
+}.GetNewClosure()
+$azAggregateDegenerate = [pscustomobject]@{ changes = @((New-DegenerateEdit -Path "/src/a.cs")) }
+$azRecoveryResult = Invoke-ReviewerSourceNewContractTransport -IdentityReader $identityReader `
+    -Reader $fcSourceReader -BaseReader $fcBaseReader -AggregateReader { $azAggregateDegenerate } `
+    -Organization "contoso" -Project "widgets" -RepositoryId $fcRepoId -PrId $fcPr `
+    -SourceCommit $fcSource -Policy $policy -PolicySha256 "" -NonceFactory { 'n' * 32 }
+Assert-Source ($azRecoveryResult.Gate.Ok -and $azRecoveryResult.BlockText -match '"spanBasis":"recovered"' -and
+    [string]$azRecoveryResult.Report.RecoveryBaseCommit -ceq $fcCommon -and
+    [int]$azRecoveryResult.Report.RecoveryIterationId -eq $fcIter) `
+    "successful CLI identity binding drives exact common-to-source recovery through the production orchestrator"
+
+$cliMcpMismatchQueue = [System.Collections.Generic.Queue[object]]::new()
+$cliMcpMismatchQueue.Enqueue(@((New-AzIteration)))
+$cliMcpMismatchQueue.Enqueue((New-AzChangePage -Changes @((New-AzChange))))
+$cliMcpMismatchInvoker = {
+    param($r, $route, $q)
+    $response = $cliMcpMismatchQueue.Dequeue()
+    if ($response -is [System.Array]) { return , $response }
+    return $response
+}.GetNewClosure()
+$cliMcpMismatchReader = {
+    & $azCaptureFunction -AzInvoker $cliMcpMismatchInvoker -Project "widgets" `
+        -RepositoryId $fcRepoId -PrId $fcPr -SourceCommit $fcSource
+}.GetNewClosure()
+Assert-Source (Test-Throws {
+        Invoke-ReviewerSourceNewContractTransport -IdentityReader $cliMcpMismatchReader `
+            -Reader $fcSourceReader -BaseReader $fcBaseReader `
+            -AggregateReader { [pscustomobject]@{ changes = @((New-DegenerateEdit -Path "/src/other.cs")) } } `
+            -Organization "contoso" -Project "widgets" -RepositoryId $fcRepoId -PrId $fcPr `
+            -SourceCommit $fcSource -Policy $policy -PolicySha256 "" -NonceFactory { 'n' * 32 }
+    }) "CLI iteration changes and MCP aggregate source mismatch fails closed"
+
+$movingQueue = [System.Collections.Generic.Queue[object]]::new()
+$movingQueue.Enqueue(@((New-AzIteration)))
+$movingQueue.Enqueue((New-AzChangePage -Changes @((New-AzChange))))
+$movingQueue.Enqueue(@((New-AzIteration -Common ("e" * 40))))
+$movingQueue.Enqueue((New-AzChangePage -Changes @((New-AzChange))))
+$movingInvoker = {
+    param($r, $route, $q)
+    $response = $movingQueue.Dequeue()
+    if ($response -is [System.Array]) { return , $response }
+    return $response
+}.GetNewClosure()
+$movingReader = {
+    & $azCaptureFunction -AzInvoker $movingInvoker -Project "widgets" `
+        -RepositoryId $fcRepoId -PrId $fcPr -SourceCommit $fcSource
+}.GetNewClosure()
+Assert-Source (Test-Throws {
+        Invoke-ReviewerSourceNewContractTransport -IdentityReader $movingReader `
+            -Reader $fcSourceReader -BaseReader $fcBaseReader -AggregateReader { $azAggregateDegenerate } `
+            -Organization "contoso" -Project "widgets" -RepositoryId $fcRepoId -PrId $fcPr `
+            -SourceCommit $fcSource -Policy $policy -PolicySha256 "" -NonceFactory { 'n' * 32 }
+    }) "CLI iteration movement during pinned content reads fails closed"
+
+$changeMovingQueue = [System.Collections.Generic.Queue[object]]::new()
+$changeMovingQueue.Enqueue(@((New-AzIteration)))
+$changeMovingQueue.Enqueue((New-AzChangePage -Changes @((New-AzChange))))
+$changeMovingQueue.Enqueue(@((New-AzIteration)))
+$changeMovingQueue.Enqueue((New-AzChangePage -Changes @(
+            (New-AzChange), (New-AzChange -Path "/src/extra.cs" -TrackingId 2))))
+$changeMovingInvoker = {
+    param($r, $route, $q)
+    $response = $changeMovingQueue.Dequeue()
+    if ($response -is [System.Array]) { return , $response }
+    return $response
+}.GetNewClosure()
+$changeMovingReader = {
+    & $azCaptureFunction -AzInvoker $changeMovingInvoker -Project "widgets" `
+        -RepositoryId $fcRepoId -PrId $fcPr -SourceCommit $fcSource
+}.GetNewClosure()
+Assert-Source (Test-Throws {
+        Invoke-ReviewerSourceNewContractTransport -IdentityReader $changeMovingReader `
+            -Reader $fcSourceReader -BaseReader $fcBaseReader -AggregateReader { $azAggregateDegenerate } `
+            -Organization "contoso" -Project "widgets" -RepositoryId $fcRepoId -PrId $fcPr `
+            -SourceCommit $fcSource -Policy $policy -PolicySha256 "" -NonceFactory { 'n' * 32 }
+    }) "CLI iteration change-set movement during pinned content reads fails closed"
+
 # -- Wiring, probe safety, and no obsolete tokens (structural) ----------------
 # The capability probe NEVER runs on the shared ordinary-transport session: a
 # tools/list failure aborts the session it runs on, and that session owns the
@@ -3510,6 +3881,18 @@ Assert-Source ($newContractText.Length -gt 0 -and
     $newContractText.IndexOf('-ToolInvoker', [StringComparison]::Ordinal) -ge 0 -and
     $newContractText.IndexOf('-BaseReader', [StringComparison]::Ordinal) -ge 0) `
     "the wrapper is a thin adapter that hands the orchestrator its tool invoker and source/base readers"
+$azFallbackText = Get-FunctionTextFromWrapper -Name 'Get-ReviewerSourceTransportAzCliFallback'
+$capabilityIndex = $transportText.IndexOf('if ($null -ne $capability)', [StringComparison]::Ordinal)
+$fallbackIndex = $transportText.IndexOf('if ($CfgAzCliFallbackEnabled)', [StringComparison]::Ordinal)
+$legacyIndex = $transportText.IndexOf('# -- Legacy get_changes path (unchanged) --', [StringComparison]::Ordinal)
+Assert-Source ($capabilityIndex -ge 0 -and $fallbackIndex -gt $capabilityIndex -and $legacyIndex -gt $fallbackIndex) `
+    "production orchestration is MCP-first, invokes CLI only when explicitly enabled, and otherwise reaches the unchanged legacy body"
+Assert-Source ($azFallbackText.Length -gt 0 -and
+    $azFallbackText.IndexOf('New-ReviewerSourceAzCliInvoker', [StringComparison]::Ordinal) -ge 0 -and
+    $azFallbackText.IndexOf('Get-ReviewerSourceAzIdentityCapture', [StringComparison]::Ordinal) -ge 0 -and
+    $azFallbackText.IndexOf('-IdentityReader', [StringComparison]::Ordinal) -ge 0 -and
+    $azFallbackText.IndexOf('Invoke-AgentMcpTool', [StringComparison]::Ordinal) -ge 0) `
+    "the production fallback binds CLI identity to the existing MCP aggregate/content seams without exposing CLI to a model"
 
 # The live flat implementation carries none of the obsolete FileDiff-contract
 # vocabulary. The check is case-sensitive so the capability's ChangeLimit/PageSize
