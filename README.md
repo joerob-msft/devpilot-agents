@@ -111,6 +111,13 @@ What that does and does not buy you, stated precisely:
 That last point is why the reviewer is preview-first, and why publishing a
 review you have actually read is a first-class mode rather than a re-run:
 
+The reviewer requires PowerShell 7, GitHub Copilot CLI, and access to the
+configured Azure DevOps MCP server. Its optional, explicitly enabled
+Azure DevOps CLI identity fallback additionally requires Azure CLI, the
+`azure-devops` extension, and tenant-bound browser authentication. Installation,
+Conditional Access troubleshooting, trust boundaries, and disable/uninstall
+steps are documented in [Sealed source transport](docs/source-transport.md#optional-azure-devops-cli-identity-fallback).
+
 ```powershell
 # Offline validation
 ./src/Agents/reviewer/Start-ReviewerAgent.ps1 -DryRun `

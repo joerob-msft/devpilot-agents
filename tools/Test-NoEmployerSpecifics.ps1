@@ -44,6 +44,10 @@ $rules = @(
 
 # The module manifest's GUID is the module's own identity, not a resource id.
 $guidExemptLeaf = 'DevPilot.AgentHarness.psd1'
+# Public Microsoft first-party application ID for Azure DevOps. This is a
+# protocol resource identifier, not a tenant, subscription, employer, or private
+# resource, and the setup docs need it to verify auth without printing a token.
+$publicAzureDevOpsResourceId = '499b84ac-1321-427f-aa17-267ca6975798'
 # Likewise, the manifest's Project/License/Help/Icon URIs are this repository's
 # own address. They necessarily contain the owning account name.
 $manifestUriLine = "^\s*(ProjectUri|LicenseUri|HelpInfoURI|IconUri)\s*="
@@ -95,6 +99,7 @@ foreach ($file in (Get-ChildItem -LiteralPath $RepoRoot -Recurse -File)) {
             if ($rule.Name -eq 'Resource GUIDs') {
                 if ($file.Name -eq $guidExemptLeaf) { continue }
                 if (Test-SyntheticGuid -Guid $hit) { continue }
+                if ($hit -ceq $publicAzureDevOpsResourceId) { continue }
             }
             if ($file.Name -eq $guidExemptLeaf -and $line -match $manifestUriLine) { continue }
             # A citation of a sample file path is documentation, not a leak.

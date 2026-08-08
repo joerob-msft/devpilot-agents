@@ -203,12 +203,130 @@ digests. Recovery attempted/recovered/evidence counts, the exact common-base
 commit, and the iteration ID are bounded accounting fields rather than hidden
 implementation details.
 
-Span recovery is available only where hosted Agency exposes PR #1499's flat
-paginated identity fields additively with its aggregate line-diff inputs.
-Against the public identity-only server, any older server, or a partial
-deployment, the structured probe fails, recovery stays dormant, and the wrapper
-reviews exactly as it did before — the degenerate pure-edit case is simply left
-uncovered rather than recovered.
+The MCP contract remains the first preference. An explicitly enabled Azure
+DevOps CLI fallback can supply the same authoritative identity when hosted MCP
+still exposes aggregate line-diff blocks but not the flat iteration fields.
+Without that opt-in, against an older or partial deployment, the structured
+probe fails, recovery stays dormant, and the wrapper reviews exactly as it did
+before — the degenerate pure-edit case is simply left uncovered rather than
+recovered.
+
+### Optional Azure DevOps CLI identity fallback
+
+The fallback removes the need to wait for a hosted MCP identity-contract
+deployment. It does **not** replace MCP source transport: the wrapper still reads
+the aggregate `lineDiffBlocks` and exact pinned file contents through the hosted
+MCP session. Azure CLI supplies only the latest pull-request iteration and that
+iteration's common-to-source change pages. Their canonical path/original-path/
+change-type digest must equal the MCP aggregate response before any span is
+trusted.
+
+The fallback is off when `review.sourceTransport` is absent and in the shipped
+sample:
+
+```json
+{
+  "review": {
+    "sourceTransport": {
+      "azureDevOpsCliFallback": {
+        "enabled": false,
+        "tenantId": "00000000-0000-0000-0000-000000000000"
+      }
+    }
+  }
+}
+```
+
+To enable it, set `enabled` to `true` and replace `tenantId` with the exact
+Microsoft Entra tenant expected for the Azure DevOps organization. The wrapper
+refuses an empty or different tenant. The object is closed by
+`source/v1/azure-devops-cli-fallback.schema.json`; unknown keys fail startup.
+
+#### Installation and authentication
+
+Install Azure CLI by your platform's supported method, then install its
+`azure-devops` extension:
+
+```powershell
+az extension add --name azure-devops
+az extension show --name azure-devops --query "{name:name,version:version}" --output json
+```
+
+Authenticate in the tenant named by config. On Conditional Access-managed
+corporate hosts where device code or Windows Account Manager can be restricted,
+the validated browser flow is to disable the Windows broker **for this process**
+and allow tenant-only accounts:
+
+```powershell
+$env:AZURE_CORE_ENABLE_BROKER_ON_WINDOWS = 'false'
+az login --tenant <tenant-id> --allow-no-subscriptions
+```
+
+Use your organization's tenant ID in place of `<tenant-id>`. On hosts that allow
+the default broker, a normal `az login --tenant <tenant-id>
+--allow-no-subscriptions` is also supported. Do not put credentials, refresh
+tokens, or access tokens in reviewer config.
+
+Verify the selected tenant and Azure DevOps resource access without displaying
+an access token:
+
+```powershell
+az account show --query tenantId --output tsv
+az account get-access-token `
+    --resource 499b84ac-1321-427f-aa17-267ca6975798 `
+    --query "{expiresOn:expiresOn,tenant:tenant}" --output json
+```
+
+The first value must equal `tenantId` in config. The second command prints only
+expiry and tenant metadata; never remove its `--query` in logs or automation.
+
+`AADSTS53003` means Conditional Access blocked token acquisition. Device-code
+login and brokered WAM login can each be disallowed independently; retry with
+the broker-disabled browser flow above in the correct tenant. If that remains
+blocked, an administrator must satisfy the applicable Conditional Access policy.
+The reviewer fails closed and sanitizes the CLI error rather than printing the
+private response body.
+
+#### Trust boundary and limits
+
+- The model receives no shell tool, Azure CLI command, environment token, or
+  access token. Only deterministic wrapper code starts `az.cmd`/`az`.
+- The command is fixed to `az rest --method get` against one of two
+  wrapper-constructed Azure DevOps Git paths: pull-request iterations or exact
+  iteration changes. It pins the Azure DevOps resource application ID, API
+  `7.1`, JSON output, and validated organization/project/repository/PR/iteration
+  route values. No arbitrary URL, command text, `compareTo`, or model value is
+  accepted. `az rest` deliberately bypasses `az devops login` PAT credentials;
+  the read uses the tenant-bound Azure CLI account token.
+- Startup verifies the `azure-devops` extension and exact signed-in tenant.
+  It also acquires only token metadata for the configured tenant and Azure
+  DevOps resource before any REST read. Reads are capped at 30 seconds, 1 MiB
+  stdout, 16 KiB stderr, 200 changes per page, 1,000 changes total, and 25 Azure
+  CLI process requests for the bracketed
+  capture. Malformed, duplicate, truncated, moving, unauthorized, or mismatched
+  data fails the PR closed.
+- The least Azure DevOps permission required for these endpoints is Code (Read)
+  (`vso.code`) where the authentication mechanism exposes scoped permissions.
+  The Entra bearer token for the Azure DevOps resource is the signed-in user's
+  resource token; the wrapper does not down-scope it to `vso.code`, and it may
+  authorize other actions granted to that identity. Runtime read-only
+  enforcement comes from the wrapper's fixed `az rest --method get` calls to
+  the two allowlisted endpoint families above, with no arbitrary URL or write
+  method. The fallback itself never writes a comment, vote, reviewer, pull
+  request, repository object, or work item.
+- After pinned content reads, the wrapper re-reads both latest iteration identity
+  and all pinned iteration changes. Identity or digest movement fails closed.
+
+To disable the fallback, set `enabled` back to `false` or remove the entire
+`sourceTransport` object; default behavior is restored immediately. To remove
+the optional dependency:
+
+```powershell
+az extension remove --name azure-devops
+```
+
+`az logout` additionally removes Azure CLI sign-in state, but affects every
+Azure CLI workload for that user, not only this reviewer.
 
 `binaryNoText` and `readerReportedNonTextUncorroborated` are the same reader
 answer split by whether anyone else corroborates it. When the change set's own
