@@ -659,22 +659,42 @@ function Invoke-ReviewerSourceAzJson {
     }
 }
 
-function Test-ReviewerSourceReplayActive {
-    # True if anything visible from here says this process is replaying a sealed
-    # snapshot. Three signals, deliberately redundant, because the cost of a
-    # false negative is a live network call inside a run that claims to have
-    # made none, and the cost of a false positive is only a refused fallback.
-    #
-    # The environment variable is the one that survives scope: a script-scope
-    # variable set by the reviewer is invisible once this library is loaded into
-    # a module, a thread job, or a child pwsh, and in exactly those contexts the
-    # old read returned $false, which is to say "go ahead".
-    if ($env:DEVPILOT_REVIEWER_REPLAY_ACTIVE) { return $true }
+function Get-ReviewerSourceReplaySignal {
+    <#
+        The name of the signal saying this process is replaying a sealed
+        snapshot, or "" if none says so. Deliberately redundant: the cost of a
+        false negative is a live network call inside a run that claims to have
+        made none, and the cost of a false positive is a refused fallback.
+
+        The environment variable is the one that survives scope. A script-scope
+        variable set by the reviewer is invisible once this library is loaded
+        into a module, a thread job, or a child pwsh, and in exactly those
+        contexts reading its absence as $false means "go ahead". ANY non-empty
+        value means replay - including "0" and "false", because a guard is the
+        wrong place to parse intent. Unset the variable to clear it; assigning
+        "" removes it in PowerShell, so there is no "off" value to get wrong.
+
+        "stale-environment" is its own answer because it is a different fault
+        with a different fix: the environment says replay while this process's
+        own script scope says it is not replaying, which means a leftover
+        variable from an earlier replay is about to disable a live fallback.
+        Refusing is still right, but saying "you are in a replay" would be a
+        lie, and would send someone looking in the wrong place.
+    #>
     foreach ($name in @("ReviewerReplayActive", "ReviewerReplaySnapshot")) {
         $found = Get-Variable -Name $name -Scope Script -ErrorAction SilentlyContinue
-        if ($found -and $found.Value) { return $true }
+        if ($found -and $found.Value) { return "script:$name" }
     }
-    return $false
+    if ($env:DEVPILOT_REVIEWER_REPLAY_ACTIVE) {
+        $active = Get-Variable -Name "ReviewerReplayActive" -Scope Script -ErrorAction SilentlyContinue
+        if ($active -and -not $active.Value) { return "stale-environment" }
+        return "environment"
+    }
+    return ""
+}
+
+function Test-ReviewerSourceReplayActive {
+    return ("" -cne (Get-ReviewerSourceReplaySignal))
 }
 
 function New-ReviewerSourceAzCliInvoker {
@@ -695,14 +715,20 @@ function New-ReviewerSourceAzCliInvoker {
     # decision to go live has already been made, and a silent skip here would
     # hand back a transport that reads nothing.
     #
-    # Ask three independent questions, because a guard that cannot see the
-    # answer must not read that as permission. A script-scope variable is
-    # invisible from a module, a thread job, or a child process, and this
-    # library is dot-sourced on its own by tests where it does not exist at
-    # all - so the reviewer also publishes replay in the process environment,
-    # which every one of those contexts can still see, and any one signal is
-    # enough to refuse.
-    if (Test-ReviewerSourceReplayActive) {
+    # Ask every question that can be asked from here, because a guard that
+    # cannot see the answer must not read that as permission. A script-scope
+    # variable is invisible from a module, a thread job, or a child process,
+    # and this library is dot-sourced on its own by tests where it does not
+    # exist at all - so the reviewer also publishes replay in the process
+    # environment, which every one of those contexts can still see, and any
+    # one signal is enough to refuse.
+    $replaySignal = Get-ReviewerSourceReplaySignal
+    if ($replaySignal -ceq "stale-environment") {
+        throw ("Refusing to build the Azure CLI source fallback: DEVPILOT_REVIEWER_REPLAY_ACTIVE is set in this " +
+            "process environment, but this run is NOT a replay. That is a leftover from an earlier offline replay " +
+            "in the same shell. Unset it (Remove-Item Env:\DEVPILOT_REVIEWER_REPLAY_ACTIVE) and run again.")
+    }
+    if ($replaySignal) {
         throw ("The Azure CLI source fallback cannot run inside an offline replay: it resolves and executes " +
             "the az CLI and then contacts the REST API, and a replayed run reads only its sealed snapshot.")
     }

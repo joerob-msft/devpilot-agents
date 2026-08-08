@@ -77,7 +77,11 @@
       },
       {
         "sha256": "13a5ad8233f9a38c2f628f9656bb3706f617ec581fa8f9efa5a8d7f84c9ac324",
-        "reason": "CURRENT and authoritative. Adds the suppressed-live-fallback disclosure to both the preview text and the sealed replay artifact block: when a replay ran with review.sourceTransport.azureDevOpsCliFallback.enabled set, it read through the snapshot-backed path rather than the live az CLI transport, so its source coverage and span basis may differ from a live run under the same config, and the warning that said so at startup does not survive to the file."
+        "reason": "History only, superseded below. First version of the suppressed-live-fallback disclosure, before the capability-probe substitution was disclosed alongside it."
+      },
+      {
+        "sha256": "b6a5a00d94d81a598c2215d672638ab0e8bb295646d938ec3717d816be882a28",
+        "reason": "CURRENT and authoritative. Discloses what actually served source in a replay, not merely the part that was configured: sourceTransportMode snapshotLegacy and capabilityProbeSuppressed always, because replay declines the MCP capability probe so the newer get_changes contract is never used even when the recorded run used it, plus azCliFallbackSuppressed when config had enabled the live Azure CLI fallback. Recording only the configured half would let a reader take a faithful-looking artifact for a faithful transport. Both replay blocks are ordered so key order in an evidence file does not reshuffle when a key is added."
       }
     ],
     "Invoke-ReviewerDelivery": [

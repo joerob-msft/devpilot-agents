@@ -1718,10 +1718,15 @@ try {
     # Scope must not become permission. A script-scope flag is invisible from a
     # module, a thread job or a child process; if the guard read that absence as
     # "not replaying" it would go live in exactly the contexts hardest to audit.
+    # Remove the variable to reproduce those contexts faithfully: present-and-
+    # false is a different situation, tested separately below.
     $liveAttempts.Clear()
     $envRefusal = ""
     try {
+        Remove-Variable -Name ReviewerReplayActive -Scope Script -ErrorAction SilentlyContinue
         $env:DEVPILOT_REVIEWER_REPLAY_ACTIVE = "1"
+        Assert-Replay ((Get-ReviewerSourceReplaySignal) -ceq "environment") `
+            "With no script-scope flag at all, the environment alone must report a replay."
         try {
             [void](New-ReviewerSourceAzCliInvoker -Organization "contoso" `
                     -ExpectedTenantId "11111111-2222-3333-4444-555555555555" `
@@ -1729,12 +1734,41 @@ try {
         }
         catch { $envRefusal = [string]$_.Exception.Message }
     }
-    finally { Remove-Item Env:\DEVPILOT_REVIEWER_REPLAY_ACTIVE -ErrorAction SilentlyContinue }
+    finally {
+        Remove-Item Env:\DEVPILOT_REVIEWER_REPLAY_ACTIVE -ErrorAction SilentlyContinue
+        $script:ReviewerReplayActive = $false
+    }
     Assert-Replay ($envRefusal -clike "*cannot run inside an offline replay*") `
         "Replay published in the environment must refuse the invoker even with no script-scope flag (got: '$envRefusal')."
     Assert-Replay (@($liveAttempts).Count -eq 0) `
         ("The environment signal must refuse before any executable resolution or process start (attempted: " +
         (@($liveAttempts) -join "; ") + ").")
+
+    # A leftover variable from an earlier replay in the same shell must refuse
+    # too - but must not claim a replay is happening. The reviewer knows it is
+    # not; saying otherwise sends the operator looking in the wrong place while
+    # every pull request is skipped.
+    $liveAttempts.Clear()
+    $staleRefusal = ""
+    try {
+        $env:DEVPILOT_REVIEWER_REPLAY_ACTIVE = "1"
+        $script:ReviewerReplayActive = $false
+        try {
+            [void](New-ReviewerSourceAzCliInvoker -Organization "contoso" `
+                    -ExpectedTenantId "11111111-2222-3333-4444-555555555555" `
+                    -ExecutableResolver $recordingResolver -ProcessInvoker $recordingInvoker)
+        }
+        catch { $staleRefusal = [string]$_.Exception.Message }
+    }
+    finally { Remove-Item Env:\DEVPILOT_REVIEWER_REPLAY_ACTIVE -ErrorAction SilentlyContinue }
+    Assert-Replay ($staleRefusal -clike "*is set in this process environment, but this run is NOT a replay*") `
+        "A stale environment variable must be diagnosed as stale, not reported as a replay (got: '$staleRefusal')."
+    Assert-Replay ($staleRefusal -clike "*Remove-Item Env:\DEVPILOT_REVIEWER_REPLAY_ACTIVE*") `
+        "The stale-variable refusal must name the exact way to clear it."
+    Assert-Replay (@($liveAttempts).Count -eq 0) `
+        "A stale environment variable must still refuse before anything is resolved or run."
+    Assert-Replay ((Get-ReviewerSourceReplaySignal) -ceq "") `
+        "With no signal at all the probe must report no replay, or the live fallback is dead everywhere."
 
     # And the live path must be entirely unaffected: same call, replay off,
     # reaches its seams AND returns a usable invoker.
@@ -1756,15 +1790,84 @@ try {
 
     # Source pins. Deleting EITHER guard has to fail this suite: the branch
     # guard that declines the fallback, and the invoker guard that refuses it.
-    # Pin the REFUSAL, not merely a mention of the flag - a pin that matches the
-    # token alone stays green when the throw is deleted around it.
+    # These are AST assertions, not text matches, for two reasons a text match
+    # cannot handle: a comment carrying the right token satisfies a regex while
+    # the code is gone, and a regex cannot tell whether the refusal still comes
+    # BEFORE the thing it is meant to prevent.
     $transportText = [IO.File]::ReadAllText((Join-Path $RepoRoot "src\Agents\reviewer\SourceTransport.ps1"), $utf8)
-    Assert-Replay ($transportText -cmatch '(?s)function New-ReviewerSourceAzCliInvoker.{0,3000}?if \(Test-ReviewerSourceReplayActive\) \{\s*throw') `
-        "New-ReviewerSourceAzCliInvoker must throw, not merely mention replay, before it resolves anything."
-    Assert-Replay ($transportText -cmatch '(?s)function Test-ReviewerSourceReplayActive.{0,1200}?DEVPILOT_REVIEWER_REPLAY_ACTIVE') `
+    $transportAst = [Management.Automation.Language.Parser]::ParseInput($transportText, [ref]$null, [ref]$null)
+    $invokerFn = @($transportAst.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $candidate.Name -ceq "New-ReviewerSourceAzCliInvoker"
+            }, $true)) | Select-Object -First 1
+    Assert-Replay ($null -ne $invokerFn) "New-ReviewerSourceAzCliInvoker must exist to be pinned."
+    $firstThrowLine = @($invokerFn.FindAll({
+                param($candidate) $candidate -is [Management.Automation.Language.ThrowStatementAst]
+            }, $true) | ForEach-Object { $_.Extent.StartLineNumber } | Sort-Object) | Select-Object -First 1
+    # The first thing the body does with the outside world: run the resolver.
+    $firstResolverLine = @($invokerFn.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.InvokeMemberExpressionAst] -or
+                ($candidate -is [Management.Automation.Language.CommandAst] -and
+                $candidate.InvocationOperator -eq [Management.Automation.Language.TokenKind]::Ampersand -and
+                $candidate.Extent.Text -cmatch '\$ExecutableResolver')
+            }, $true) | Where-Object { $_.Extent.Text -cmatch '\$ExecutableResolver' } |
+            ForEach-Object { $_.Extent.StartLineNumber } | Sort-Object) | Select-Object -First 1
+    Assert-Replay ($null -ne $firstResolverLine) `
+        "The invoker must still resolve an executable, or this pin is measuring nothing."
+    Assert-Replay ($null -ne $firstThrowLine -and $firstThrowLine -lt $firstResolverLine) `
+        ("The replay refusal must throw BEFORE the invoker resolves anything " +
+        "(first throw line $firstThrowLine, first resolver use line $firstResolverLine).")
+    $signalCalls = @($invokerFn.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.CommandAst] -and
+                $candidate.GetCommandName() -ceq "Get-ReviewerSourceReplaySignal"
+            }, $true))
+    Assert-Replay (@($signalCalls).Count -ge 1 -and
+        @($signalCalls)[0].Extent.StartLineNumber -lt $firstResolverLine) `
+        "The invoker must consult the replay signal before it resolves anything."
+    Assert-Replay ($transportText -cmatch '(?s)function Get-ReviewerSourceReplaySignal.{0,2400}?\$env:DEVPILOT_REVIEWER_REPLAY_ACTIVE') `
         "The replay probe must consult the environment, or scope alone decides whether the guard can see replay."
-    Assert-Replay ($reviewerSource -cmatch 'DEVPILOT_REVIEWER_REPLAY_ACTIVE\s*=\s*"1"') `
-        "Replay activation must publish itself in the environment for guards outside script scope."
+
+    # The env publication is the one load-bearing piece of the scope proof, and
+    # a text match on it is satisfied by a comment. Assert on the AST, and on
+    # POSITION: the assignment must live inside the replay startup block, so
+    # commenting it out or moving it somewhere that never runs fails here.
+    $replayStartupBlock = @($reviewerAst.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.IfStatementAst] -and
+                $candidate.Clauses[0].Item1.Extent.Text -cmatch '\$ReplaySnapshotName -or \$ReplayRoot'
+            }, $true)) | Select-Object -First 1
+    Assert-Replay ($null -ne $replayStartupBlock) "The replay startup block must be findable to pin what it publishes."
+    $envPublications = @($reviewerAst.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $candidate.Left.Extent.Text -ceq '$env:DEVPILOT_REVIEWER_REPLAY_ACTIVE'
+            }, $true))
+    Assert-Replay (@($envPublications).Count -eq 1) `
+        "Replay must publish itself in the environment in exactly one place (found $(@($envPublications).Count))."
+    $publication = @($envPublications)[0]
+    Assert-Replay ($publication.Extent.StartLineNumber -gt $replayStartupBlock.Extent.StartLineNumber -and
+        $publication.Extent.EndLineNumber -lt $replayStartupBlock.Extent.EndLineNumber) `
+        ("The environment publication must be INSIDE the replay startup block (publication at line " +
+        "$($publication.Extent.StartLineNumber), block spans $($replayStartupBlock.Extent.StartLineNumber)" +
+        "-$($replayStartupBlock.Extent.EndLineNumber)).")
+    Assert-Replay ($publication.Right.Extent.Text -cmatch '^"1"$') `
+        "Replay must publish a non-empty value; an empty assignment deletes the variable in PowerShell."
+    # And it must be cleared on the way in, or an operator's leftover variable
+    # from an earlier replay refuses the live fallback in a run that is not
+    # replaying, skipping every pull request for a reason that is not true.
+    $envClears = @($reviewerAst.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.CommandAst] -and
+                $candidate.GetCommandName() -ceq "Remove-Item" -and
+                $candidate.Extent.Text -cmatch 'DEVPILOT_REVIEWER_REPLAY_ACTIVE'
+            }, $true))
+    Assert-Replay (@($envClears).Count -ge 1 -and
+        @($envClears)[0].Extent.StartLineNumber -lt $replayStartupBlock.Extent.StartLineNumber) `
+        "An inherited replay variable must be cleared at startup, before the replay block can legitimately set it."
+
     Assert-Replay ($reviewerSource -cmatch '(?s)if \(\$CfgAzCliFallbackEnabled\) \{.{0,1400}?if \(-not \$script:ReviewerReplayActive\) \{\s*return Get-ReviewerSourceTransportAzCliFallback') `
         "The CLI fallback must be declined in replay before it is taken, inside the enabled branch."
     $fallbackCalls = @($reviewerAst.FindAll({

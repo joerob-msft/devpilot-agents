@@ -641,6 +641,11 @@ $script:ReviewerConventionSpecialistAllowToolCeiling = @(
 # the model cannot look anything up for itself, so a replay is a LOWER bound on
 # live behaviour, not a reproduction of it.
 $script:ReviewerReplayActive = $false
+# Clear before anything can read it. This is set later, and only, by the replay
+# startup path; inherited from an operator's shell it would refuse the live
+# Azure CLI fallback in a run that is not replaying at all, skipping every pull
+# request with a message asserting a replay that is not happening.
+Remove-Item Env:\DEVPILOT_REVIEWER_REPLAY_ACTIVE -ErrorAction SilentlyContinue
 # True when a replay ran with the live az CLI fallback enabled in config and
 # suppressed it. Recorded in the sealed artifact, because such a replay read
 # through a different transport than the live run it is evidence of, and a
@@ -4143,8 +4148,9 @@ function Write-ReviewerPreview {
         [void]$lines.Add("- Replay outcome digest (wrapper-normalized decisions, excludes comment prose): ``$($replayDigests.OutcomeDigest)``")
         [void]$lines.Add("- This is NOT a reproduction of a live run: every tool this agent can grant was denied at launch, so the model had no usable tool and could not look anything up for itself. A replay is therefore a LOWER bound on what a live run would find, and its marker-emission behaviour is not comparable to live: each pass is told not to stop merely because it cannot re-read the pull request.")
         [void]$lines.Add("- This artifact is evidence, not an approved review: it is sealed under the replay key domain and can never be promoted.")
+        [void]$lines.Add("- Source was served by the snapshot-backed legacy path (``sourceTransportMode: snapshotLegacy``): replay declines the MCP capability probe, so the newer get_changes contract is never used here even if the recorded run used it. Source coverage and span basis can therefore differ from the live run this snapshot records.")
         if ($script:ReviewerReplayAzFallbackSuppressed) {
-            [void]$lines.Add("- The live Azure CLI source fallback was enabled in config and was SUPPRESSED for this replay: it resolves and runs the az CLI and then contacts the REST API. Source was read through the snapshot-backed path instead, so source coverage and span basis here may differ from a live run under the same config.")
+            [void]$lines.Add("- The live Azure CLI source fallback was enabled in config and was SUPPRESSED for this replay: it resolves and runs the az CLI and then contacts the REST API. Source was read from the snapshot instead.")
         }
     }
     [void]$lines.Add("")
@@ -4286,17 +4292,21 @@ function Write-ReviewerPreview {
                 # reads with; stripping this block does not make the artifact
                 # promotable. It is here so a human reading the file knows what
                 # it is without having to reason about key derivation.
-                $artifact["replay"] = @{
+                $artifact["replay"] = [ordered]@{
                     snapshotId     = $script:ReviewerReplaySnapshot.SnapshotId
                     manifestDigest = $script:ReviewerReplaySnapshot.ManifestDigest
                     replayNonce    = $script:ReviewerReplaySnapshot.ReplayNonce
                     promotable     = $false
-                    # True when config asked for the live az CLI fallback and this
-                    # replay suppressed it. Worth recording: such a replay read
-                    # through the legacy snapshot-backed path, not the transport
-                    # the live run it is evidence of would have used, so coverage
-                    # and span basis may differ. The warning that said so went to
-                    # the console and is gone; this stays with the file.
+                    # What actually served source here, and why that may not be
+                    # what a live run would have used. Replay declines the MCP
+                    # capability probe outright and declines the live az CLI
+                    # fallback if config asked for it, so source always comes
+                    # from the snapshot-backed legacy path. If the recorded run
+                    # used the newer contract or the CLI, coverage and span
+                    # basis can differ from this. Recorded rather than warned,
+                    # because the warning is gone by the time anyone reads this.
+                    sourceTransportMode     = "snapshotLegacy"
+                    capabilityProbeSuppressed = $true
                     azCliFallbackSuppressed = [bool]$script:ReviewerReplayAzFallbackSuppressed
                 }
             }
@@ -8710,10 +8720,13 @@ function Write-ReviewerConventionSpecialistPreview {
                     manifestDigest = [string]$script:ReviewerReplaySnapshot.ManifestDigest
                     replayNonce = [string]$script:ReviewerReplaySnapshot.ReplayNonce
                     promotable = $false
-                    # True when config asked for the live az CLI fallback and this
-                    # replay suppressed it, so the run read through the legacy
-                    # snapshot-backed path rather than the transport a live run
-                    # would have used.
+                    # What actually served source here. Replay declines the MCP
+                    # capability probe, and declines the live az CLI fallback if
+                    # config asked for it, so source always comes from the
+                    # snapshot-backed legacy path - which may not be the
+                    # transport the recorded run used.
+                    sourceTransportMode = "snapshotLegacy"
+                    capabilityProbeSuppressed = $true
                     azCliFallbackSuppressed = [bool]$script:ReviewerReplayAzFallbackSuppressed
                     # Machine-readable counterpart to the residual risk above, so
                     # a consumer cannot mistake one run for a reconciled result.

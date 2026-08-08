@@ -246,7 +246,10 @@ The flag is ignored in an offline snapshot replay, and deliberately so: this
 fallback is a live transport that runs `az` and then calls the REST API, which
 would contradict a replay's only claim about itself. Replay suppresses it,
 warns once at startup, and records `azCliFallbackSuppressed` in the sealed
-artifact. See [replay-snapshots.md](replay-snapshots.md).
+artifact. If you see the reviewer refuse this fallback in a run that is not a
+replay, `DEVPILOT_REVIEWER_REPLAY_ACTIVE` is left over in your shell from an
+earlier replay; the refusal names it. See
+[replay-snapshots.md](replay-snapshots.md).
 
 #### Installation and authentication
 

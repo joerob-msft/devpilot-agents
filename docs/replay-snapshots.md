@@ -64,7 +64,11 @@ the assumption that once let a configured replay contact the live service, so
 replay refuses that transport in three places:
 
 - the MCP capability probe is short-circuited in replay, so it neither contacts
-  anything nor reports a capability the snapshot cannot serve;
+  anything nor reports a capability the snapshot cannot serve. A consequence
+  worth knowing: source is therefore always served by the snapshot-backed legacy
+  path, even when the recorded run used the newer `get_changes` contract, so
+  source coverage and span basis in a replay can differ from the live run the
+  snapshot records;
 - `Get-ReviewerSourceTransport` declines the fallback branch in replay and falls
   through to the snapshot-backed path, so the run stays consistent rather than
   half live, and a read the snapshot lacks still fails closed there;
@@ -73,10 +77,20 @@ replay refuses that transport in three places:
   as script scope, so the refusal survives being loaded into a module, a thread
   job or a child process, where a script-scope flag would be invisible.
 
-A replay that suppressed a configured fallback records
-`azCliFallbackSuppressed` in its sealed artifact and says so in the preview,
-because it read through a different transport than the live run it is evidence
-of, and coverage and span basis can differ as a result.
+`DEVPILOT_REVIEWER_REPLAY_ACTIVE` is set by the reviewer, for the reviewer. Any
+non-empty value means replay, including `0` and `false`, because a safety guard
+is the wrong place to parse intent; assigning `""` deletes the variable in
+PowerShell, so removal is the only way to express "off". The reviewer clears it
+at startup before anything can read it and sets it only on the replay path, so a
+leftover from an earlier replay in the same shell cannot silently disable the
+live fallback in a later live run — and if one is somehow present anyway, the
+refusal says the variable is stale rather than claiming a replay is happening.
+
+Every replay artifact records what actually served source:
+`sourceTransportMode: snapshotLegacy`, `capabilityProbeSuppressed`, and
+`azCliFallbackSuppressed` when config had enabled the live fallback. The preview
+says the same in prose, because a console warning is gone by the time anyone
+reads the file.
 
 ## The snapshot
 
