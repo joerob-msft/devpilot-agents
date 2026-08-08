@@ -2487,6 +2487,15 @@ if ($ReplaySnapshotName -or $ReplayRoot -or $ReplayManifestDigest) {
     $script:ReviewerReplaySnapshot = New-AgentReplaySnapshot -ReplayRoot $ReplayRoot `
         -SnapshotName $ReplaySnapshotName -ExpectedManifestDigest $ReplayManifestDigest
     $script:ReviewerReplayActive = $true
+    # Say once, here, that a configured live fallback will be ignored. The
+    # transport itself must stay free of statement-position calls, and an
+    # operator who set the flag deserves to know it did nothing rather than to
+    # wonder later why the CLI never ran.
+    if ($CfgAzCliFallbackEnabled) {
+        Write-Warning ("Offline replay ignores review.sourceTransport.azureDevOpsCliFallback.enabled: " +
+            "that fallback resolves and runs the az CLI and then contacts the REST API, and every read in a " +
+            "replayed run comes from the sealed snapshot instead.")
+    }
 
     # A snapshot answers every question consistently, including the wrong ones.
     # Bind it to the configuration this process is actually running under, or a
@@ -7974,7 +7983,17 @@ function Get-ReviewerSourceTransport {
         return Get-ReviewerSourceTransportNewContract -Session $Session -PrId $PrId -SourceCommit $SourceCommit -Capability $capability
     }
     if ($CfgAzCliFallbackEnabled) {
-        return Get-ReviewerSourceTransportAzCliFallback -Session $Session -PrId $PrId -SourceCommit $SourceCommit
+        # In replay the fallback is not merely unnecessary, it is wrong. Replay's
+        # whole contract is that every byte came from the sealed snapshot; the
+        # CLI fallback is a second, LIVE transport that shells out to `az` and
+        # then talks to the REST API. Taking it here would mix live data into a
+        # sealed run, which is worse than failing - so replay falls through to
+        # the legacy body below and reads the snapshot like everything else. A
+        # read the snapshot does not carry still fails closed there, with the
+        # exact request named. The operator is told once, at startup.
+        if (-not $script:ReviewerReplayActive) {
+            return Get-ReviewerSourceTransportAzCliFallback -Session $Session -PrId $PrId -SourceCommit $SourceCommit
+        }
     }
     # -- Legacy get_changes path (unchanged) --
     $changes = Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments @{

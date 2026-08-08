@@ -666,6 +666,26 @@ function New-ReviewerSourceAzCliInvoker {
         [scriptblock]$ExecutableResolver,
         [scriptblock]$ProcessInvoker
     )
+    # Defence in depth, and the last line of it. Everything below this shells
+    # out: it resolves `az` on PATH, runs `az extension`, `az account`, and
+    # `az account get-access-token`, and the transport it returns then talks to
+    # the REST API. None of that may happen inside an offline replay, whatever
+    # a config says and whichever call site got here.
+    #
+    # The caller already declines the fallback in replay. This refuses rather
+    # than declines, because by the time anything asks to BUILD the invoker the
+    # decision to go live has already been made, and a silent skip here would
+    # hand back a transport that reads nothing.
+    #
+    # Read defensively: this library is dot-sourced on its own by tests, where
+    # the reviewer's script-scope variable does not exist.
+    $replayActive = $false
+    $replayVar = Get-Variable -Name "ReviewerReplayActive" -Scope Script -ErrorAction SilentlyContinue
+    if ($replayVar) { $replayActive = [bool]$replayVar.Value }
+    if ($replayActive) {
+        throw ("The Azure CLI source fallback cannot run inside an offline replay: it resolves and executes " +
+            "the az CLI and then contacts the REST API, and a replayed run reads only its sealed snapshot.")
+    }
     if (-not $ExecutableResolver) {
         $ExecutableResolver = {
             $command = Get-Command az -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1

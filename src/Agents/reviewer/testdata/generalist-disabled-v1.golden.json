@@ -66,6 +66,14 @@
       {
         "sha256": "f55fe5c67f929648108348abe3af8610a6d8d5fbd7cc15f8a5ee8e5e838f903b",
         "reason": "State in the preview when the run was an offline snapshot replay: which snapshot, its manifest digest, the replay nonce, the wrapper-computed input digest and the normalized outcome digest, that the model was launched with the narrowed offline tool grant, and that the artifact is sealed under the replay key domain and can never be promoted."
+      },
+      {
+        "sha256": "63b7fe6b70bf104473b81f0bd4ef1664596e63bc54e8f4716fb7fc61f4fcf592",
+        "reason": "STACK CONTEXT, not a change made by this layer. The parent PR31 (daviburg-recover-ado-source-spans, head 11335a7) edited this function to report recovered source spans, and did not append its own authorized delta - so the golden fails at the parent head 357d08e with this layer absent, which was verified directly. Recorded here because this layer was restacked onto that parent and inherits its text; the entry belongs to PR31 and should move there if that PR ever records it itself."
+      },
+      {
+        "sha256": "4bc2794694805ea039fa686a4d328a3e6dce337017f51232835acd0f306e44de",
+        "reason": "This layer's own replay reporting, re-expressed on top of the parent's recovered-span text after the restack. Same behaviour as the f55fe5c6 entry above - which snapshot, manifest digest, replay nonce, input and outcome digests, narrowed tool grant, sealed under the replay key and never promotable - and that entry is kept above purely as audit history of the pre-restack shape."
       }
     ],
     "Invoke-ReviewerDelivery": [

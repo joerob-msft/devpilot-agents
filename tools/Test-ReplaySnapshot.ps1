@@ -1659,6 +1659,65 @@ try {
         ("Every Open-AgentMcpSession call must pass -ReplaySnapshot, or a replay reaches the network: " +
         (@(@($unguarded) | ForEach-Object { "line $($_.Extent.StartLineNumber)" }) -join ", "))
 
+    . (Join-Path $RepoRoot "src\Agents\reviewer\SourceTransport.ps1")
+    # The CLI fallback is a second, LIVE transport. In replay it must never be
+    # taken, whatever the config says - taking it would resolve `az` on PATH,
+    # run `az account get-access-token`, and then talk to the REST API, from
+    # inside a run whose whole promise is that every byte came from a snapshot.
+    #
+    # Executable, not just a source scan: the invoker is built with seams that
+    # RECORD any attempt to resolve an executable or start a process, and the
+    # assertion is that neither fires.
+    $liveAttempts = [System.Collections.Generic.List[string]]::new()
+    $recordingResolver = { [void]$liveAttempts.Add("resolve-executable"); return "C:\nowhere\az.exe" }
+    $recordingInvoker = { param($ExecutablePath, $Arguments) [void]$liveAttempts.Add("start-process: $($Arguments -join ' ')"); return @{ ExitCode = 0; StdOut = "{}"; StdErr = "" } }
+
+    $script:ReviewerReplayActive = $true
+    $replayRefusal = ""
+    try {
+        [void](New-ReviewerSourceAzCliInvoker -Organization "contoso" `
+                -ExpectedTenantId "11111111-2222-3333-4444-555555555555" `
+                -ExecutableResolver $recordingResolver -ProcessInvoker $recordingInvoker)
+    }
+    catch { $replayRefusal = [string]$_.Exception.Message }
+    $script:ReviewerReplayActive = $false
+    Assert-Replay ($replayRefusal -clike "*cannot run inside an offline replay*") `
+        "Building the az CLI invoker during replay must be refused outright (got: '$replayRefusal')."
+    Assert-Replay (@($liveAttempts).Count -eq 0) `
+        ("No executable resolution and no process start may happen during replay (attempted: " +
+        (@($liveAttempts) -join "; ") + ").")
+
+    # And the live path must be entirely unaffected: same call, replay off,
+    # reaches its seams normally.
+    $liveAttempts.Clear()
+    $liveOutcome = ""
+    try {
+        [void](New-ReviewerSourceAzCliInvoker -Organization "contoso" `
+                -ExpectedTenantId "11111111-2222-3333-4444-555555555555" `
+                -ExecutableResolver $recordingResolver -ProcessInvoker $recordingInvoker)
+    }
+    catch { $liveOutcome = [string]$_.Exception.Message }
+    Assert-Replay (@($liveAttempts).Count -gt 0) `
+        "Outside replay the invoker must still reach its seams; the guard must not disable the live fallback."
+    Assert-Replay ($liveOutcome -cnotlike "*offline replay*") `
+        "A live run must never be refused by the replay guard (got: '$liveOutcome')."
+
+    # Source pins. Deleting EITHER guard has to fail this suite: the branch
+    # guard that declines the fallback, and the invoker guard that refuses it.
+    $transportText = [IO.File]::ReadAllText((Join-Path $RepoRoot "src\Agents\reviewer\SourceTransport.ps1"), $utf8)
+    Assert-Replay ($transportText -cmatch '(?s)function New-ReviewerSourceAzCliInvoker.{0,3000}?ReviewerReplayActive') `
+        "New-ReviewerSourceAzCliInvoker must refuse to build during replay."
+    Assert-Replay ($reviewerSource -cmatch '(?s)if \(\$CfgAzCliFallbackEnabled\) \{.{0,1400}?if \(-not \$script:ReviewerReplayActive\) \{\s*return Get-ReviewerSourceTransportAzCliFallback') `
+        "The CLI fallback must be declined in replay before it is taken, inside the enabled branch."
+    $fallbackCalls = @($reviewerAst.FindAll({
+                param($candidate)
+                if ($candidate -isnot [Management.Automation.Language.CommandAst]) { return $false }
+                $name = $candidate.GetCommandName()
+                return ($null -ne $name -and $name -ceq "Get-ReviewerSourceTransportAzCliFallback")
+            }, $true))
+    Assert-Replay (@($fallbackCalls).Count -eq 1) `
+        "There must be exactly one call site for the CLI fallback (found $(@($fallbackCalls).Count)); a second would need its own replay guard."
+
     # -- 12. `notInReach` is fail-closed ---------------------------------------
     # Out-of-reach is the one verdict that costs nothing to give, so it is the
     # one an evasive row reaches for. Every property that makes it safe gets a
