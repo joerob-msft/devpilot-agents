@@ -693,8 +693,22 @@ function Get-ReviewerSourceReplaySignal {
     return ""
 }
 
-function Test-ReviewerSourceReplayActive {
-    return ("" -cne (Get-ReviewerSourceReplaySignal))
+function Clear-ReviewerSourceReplayEnvironment {
+    # Called once at reviewer startup, before anything can read it. Inherited
+    # from an operator's shell - a replay followed by an ordinary review in the
+    # same window - this variable would refuse the live Azure CLI fallback in a
+    # run that is not replaying, skipping every pull request for a reason that
+    # is not true. The replay path sets it later, deliberately, and that is the
+    # only way it should ever be set in this process.
+    Remove-Item Env:\DEVPILOT_REVIEWER_REPLAY_ACTIVE -ErrorAction SilentlyContinue
+}
+
+function Publish-ReviewerSourceReplayEnvironment {
+    # Called once when replay activates. The environment is the only channel a
+    # guard can read from a module, a thread job or a child process, where a
+    # script-scope variable is invisible and its absence would be taken for
+    # permission to go live.
+    $env:DEVPILOT_REVIEWER_REPLAY_ACTIVE = "1"
 }
 
 function New-ReviewerSourceAzCliInvoker {

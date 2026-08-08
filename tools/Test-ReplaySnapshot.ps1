@@ -1788,6 +1788,55 @@ try {
     Assert-Replay (@($liveAttempts).Count -gt 0) `
         "Outside replay the invoker must still reach its seams; the guard must not disable the live fallback."
 
+    # The env publication and its startup clear are the load-bearing pieces of
+    # the scope proof, and both are now real functions with real coverage. A
+    # source pin can only ever assert shape; these assert EFFECT, so renaming
+    # the variable, gutting the body, or hiding either behind a dead branch is
+    # caught by observation rather than by a regex that a comment satisfies.
+    try {
+        $env:DEVPILOT_REVIEWER_REPLAY_ACTIVE = "leftover-from-an-earlier-replay"
+        Clear-ReviewerSourceReplayEnvironment
+        Assert-Replay (-not (Test-Path Env:\DEVPILOT_REVIEWER_REPLAY_ACTIVE)) `
+            "Startup must clear an inherited replay variable, or a live run refuses its own fallback."
+        Publish-ReviewerSourceReplayEnvironment
+        Assert-Replay ((Test-Path Env:\DEVPILOT_REVIEWER_REPLAY_ACTIVE) -and
+            $env:DEVPILOT_REVIEWER_REPLAY_ACTIVE -ceq "1") `
+            "Replay activation must publish a non-empty environment signal (got: '$($env:DEVPILOT_REVIEWER_REPLAY_ACTIVE)')."
+        Remove-Variable -Name ReviewerReplayActive -Scope Script -ErrorAction SilentlyContinue
+        Assert-Replay ((Get-ReviewerSourceReplaySignal) -ceq "environment") `
+            "What Publish-ReviewerSourceReplayEnvironment writes must be exactly what the guard reads."
+        Clear-ReviewerSourceReplayEnvironment
+        Assert-Replay ((Get-ReviewerSourceReplaySignal) -ceq "") `
+            "Clearing must actually clear the signal the guard reads, not merely a similarly named variable."
+    }
+    finally {
+        Remove-Item Env:\DEVPILOT_REVIEWER_REPLAY_ACTIVE -ErrorAction SilentlyContinue
+        $script:ReviewerReplayActive = $false
+    }
+
+    # The redundant half of the signal set. A snapshot is assigned before the
+    # active flag is set, so there is a real window where only this one is true;
+    # untested redundancy is redundancy that quietly stops being there.
+    try {
+        Remove-Variable -Name ReviewerReplayActive -Scope Script -ErrorAction SilentlyContinue
+        $script:ReviewerReplaySnapshot = [pscustomobject]@{ SnapshotId = "probe" }
+        Assert-Replay ((Get-ReviewerSourceReplaySignal) -ceq "script:ReviewerReplaySnapshot") `
+            "A bound snapshot alone must report a replay, even before the active flag is set."
+        $snapshotRefusal = ""
+        try {
+            [void](New-ReviewerSourceAzCliInvoker -Organization "contoso" `
+                    -ExpectedTenantId "11111111-2222-3333-4444-555555555555" `
+                    -ExecutableResolver $recordingResolver -ProcessInvoker $recordingInvoker)
+        }
+        catch { $snapshotRefusal = [string]$_.Exception.Message }
+        Assert-Replay ($snapshotRefusal -clike "*cannot run inside an offline replay*") `
+            "A bound snapshot alone must refuse the invoker (got: '$snapshotRefusal')."
+    }
+    finally {
+        $script:ReviewerReplaySnapshot = $null
+        $script:ReviewerReplayActive = $false
+    }
+
     # Source pins. Deleting EITHER guard has to fail this suite: the branch
     # guard that declines the fallback, and the invoker guard that refuses it.
     # These are AST assertions, not text matches, for two reasons a text match
@@ -1830,43 +1879,65 @@ try {
     Assert-Replay ($transportText -cmatch '(?s)function Get-ReviewerSourceReplaySignal.{0,2400}?\$env:DEVPILOT_REVIEWER_REPLAY_ACTIVE') `
         "The replay probe must consult the environment, or scope alone decides whether the guard can see replay."
 
-    # The env publication is the one load-bearing piece of the scope proof, and
-    # a text match on it is satisfied by a comment. Assert on the AST, and on
-    # POSITION: the assignment must live inside the replay startup block, so
-    # commenting it out or moving it somewhere that never runs fails here.
+    # The two calls must actually be reached. Shape and line position are not
+    # enough: wrapping either in `if ($false) { … }` leaves the AST node at the
+    # same line, inside the same span, and a position-only pin stays green while
+    # the behaviour is gone. Walk the ancestor chain and refuse any conditional
+    # between the call and the statement that is supposed to contain it.
     $replayStartupBlock = @($reviewerAst.FindAll({
                 param($candidate)
                 $candidate -is [Management.Automation.Language.IfStatementAst] -and
                 $candidate.Clauses[0].Item1.Extent.Text -cmatch '\$ReplaySnapshotName -or \$ReplayRoot'
             }, $true)) | Select-Object -First 1
     Assert-Replay ($null -ne $replayStartupBlock) "The replay startup block must be findable to pin what it publishes."
-    $envPublications = @($reviewerAst.FindAll({
+    $conditionalAncestors = {
+        param($Node, $StopAt)
+        $names = [System.Collections.Generic.List[string]]::new()
+        $walk = $Node.Parent
+        while ($null -ne $walk -and -not [object]::ReferenceEquals($walk, $StopAt)) {
+            if ($walk -is [Management.Automation.Language.IfStatementAst] -or
+                $walk -is [Management.Automation.Language.SwitchStatementAst] -or
+                $walk -is [Management.Automation.Language.TrapStatementAst] -or
+                $walk -is [Management.Automation.Language.FunctionDefinitionAst]) {
+                [void]$names.Add($walk.GetType().Name + "@" + $walk.Extent.StartLineNumber)
+            }
+            $walk = $walk.Parent
+        }
+        return [string[]]$names.ToArray()
+    }
+    $publishCalls = @($reviewerAst.FindAll({
                 param($candidate)
-                $candidate -is [Management.Automation.Language.AssignmentStatementAst] -and
-                $candidate.Left.Extent.Text -ceq '$env:DEVPILOT_REVIEWER_REPLAY_ACTIVE'
+                $candidate -is [Management.Automation.Language.CommandAst] -and
+                $candidate.GetCommandName() -ceq "Publish-ReviewerSourceReplayEnvironment"
             }, $true))
-    Assert-Replay (@($envPublications).Count -eq 1) `
-        "Replay must publish itself in the environment in exactly one place (found $(@($envPublications).Count))."
-    $publication = @($envPublications)[0]
+    Assert-Replay (@($publishCalls).Count -eq 1) `
+        "Replay must publish itself in the environment in exactly one place (found $(@($publishCalls).Count))."
+    $publication = @($publishCalls)[0]
     Assert-Replay ($publication.Extent.StartLineNumber -gt $replayStartupBlock.Extent.StartLineNumber -and
         $publication.Extent.EndLineNumber -lt $replayStartupBlock.Extent.EndLineNumber) `
         ("The environment publication must be INSIDE the replay startup block (publication at line " +
         "$($publication.Extent.StartLineNumber), block spans $($replayStartupBlock.Extent.StartLineNumber)" +
         "-$($replayStartupBlock.Extent.EndLineNumber)).")
-    Assert-Replay ($publication.Right.Extent.Text -cmatch '^"1"$') `
-        "Replay must publish a non-empty value; an empty assignment deletes the variable in PowerShell."
-    # And it must be cleared on the way in, or an operator's leftover variable
-    # from an earlier replay refuses the live fallback in a run that is not
-    # replaying, skipping every pull request for a reason that is not true.
-    $envClears = @($reviewerAst.FindAll({
+    $publishGuards = @(& $conditionalAncestors $publication $replayStartupBlock)
+    Assert-Replay (@($publishGuards).Count -eq 0) `
+        ("The environment publication must be unconditional within the replay startup block; it is nested under: " +
+        (@($publishGuards) -join ", ") + ".")
+    # And it must be cleared on the way in, unconditionally, or an operator's
+    # leftover variable from an earlier replay refuses the live fallback in a
+    # run that is not replaying, skipping every pull request for a false reason.
+    $clearCalls = @($reviewerAst.FindAll({
                 param($candidate)
                 $candidate -is [Management.Automation.Language.CommandAst] -and
-                $candidate.GetCommandName() -ceq "Remove-Item" -and
-                $candidate.Extent.Text -cmatch 'DEVPILOT_REVIEWER_REPLAY_ACTIVE'
+                $candidate.GetCommandName() -ceq "Clear-ReviewerSourceReplayEnvironment"
             }, $true))
-    Assert-Replay (@($envClears).Count -ge 1 -and
-        @($envClears)[0].Extent.StartLineNumber -lt $replayStartupBlock.Extent.StartLineNumber) `
+    Assert-Replay (@($clearCalls).Count -eq 1) `
+        "An inherited replay variable must be cleared in exactly one place (found $(@($clearCalls).Count))."
+    $clear = @($clearCalls)[0]
+    Assert-Replay ($clear.Extent.StartLineNumber -lt $replayStartupBlock.Extent.StartLineNumber) `
         "An inherited replay variable must be cleared at startup, before the replay block can legitimately set it."
+    $clearGuards = @(& $conditionalAncestors $clear $reviewerAst)
+    Assert-Replay (@($clearGuards).Count -eq 0) `
+        ("The startup clear must be unconditional; it is nested under: " + (@($clearGuards) -join ", ") + ".")
 
     Assert-Replay ($reviewerSource -cmatch '(?s)if \(\$CfgAzCliFallbackEnabled\) \{.{0,1400}?if \(-not \$script:ReviewerReplayActive\) \{\s*return Get-ReviewerSourceTransportAzCliFallback') `
         "The CLI fallback must be declined in replay before it is taken, inside the enabled branch."

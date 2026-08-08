@@ -645,7 +645,7 @@ $script:ReviewerReplayActive = $false
 # startup path; inherited from an operator's shell it would refuse the live
 # Azure CLI fallback in a run that is not replaying at all, skipping every pull
 # request with a message asserting a replay that is not happening.
-Remove-Item Env:\DEVPILOT_REVIEWER_REPLAY_ACTIVE -ErrorAction SilentlyContinue
+Clear-ReviewerSourceReplayEnvironment
 # True when a replay ran with the live az CLI fallback enabled in config and
 # suppressed it. Recorded in the sealed artifact, because such a replay read
 # through a different transport than the live run it is evidence of, and a
@@ -2502,7 +2502,7 @@ if ($ReplaySnapshotName -or $ReplayRoot -or $ReplayManifestDigest) {
     # flag would read that as permission to go live. The environment is visible
     # from all of them, so the refusal in New-ReviewerSourceAzCliInvoker holds
     # wherever that function ends up being loaded.
-    $env:DEVPILOT_REVIEWER_REPLAY_ACTIVE = "1"
+    Publish-ReviewerSourceReplayEnvironment
     # Say once, here, that a configured live fallback will be ignored, and
     # remember it for the artifact. The transport itself must stay free of
     # statement-position calls, and an operator who set the flag deserves to

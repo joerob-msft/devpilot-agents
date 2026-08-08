@@ -11,7 +11,8 @@
     "Get-ReviewerPostableFindings": "df41352b7f8e49ef33b57a50ec76facf2d8cda0e3d80d6bc2bfe5f4f67ac39a7",
     "Split-ReviewerFindingsByChangeSet": "662dc52aefdaf9c5de7b9e8d7bf614a42a2030227495606ffb3e6fd9b941d6e0",
     "Invoke-ReviewerPullRequest": "62432a88a734669cfe06220131db07429ea8940eb8eb35078ad925748efce719",
-    "Invoke-ReviewerDelivery": "05a9813a6ed6c6e7e8992c3bb4587629da520ec1dc1ec81235d80f84623247eb"
+    "Invoke-ReviewerDelivery": "05a9813a6ed6c6e7e8992c3bb4587629da520ec1dc1ec81235d80f84623247eb",
+    "Write-ReviewerConventionSpecialistPreview": "606bee25c5dcebd1471dccd81576b46d44d6cf5dc6c71a96a95becba4518c8b5"
   },
   "authorizedFunctionDeltas": {
     "Write-ReviewerPreview": [
