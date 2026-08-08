@@ -291,7 +291,7 @@ private response body.
 
 - The model receives no shell tool, Azure CLI command, environment token, or
   access token. Only deterministic wrapper code starts `az.cmd`/`az`.
-- - The command is fixed to `az rest --method get` against one of two
+- The command is fixed to `az rest --method get` against one of two
   wrapper-constructed Azure DevOps Git paths: pull-request iterations or exact
   iteration changes. It pins the Azure DevOps resource application ID, API
   `7.1`, JSON output, and validated organization/project/repository/PR/iteration
@@ -305,8 +305,15 @@ private response body.
   CLI process requests for the bracketed
   capture. Malformed, duplicate, truncated, moving, unauthorized, or mismatched
   data fails the PR closed.
-- The API permission is read-only `vso.code`. The fallback never writes a
-  comment, vote, reviewer, pull request, repository object, or work item.
+- The least Azure DevOps permission required for these endpoints is Code (Read)
+  (`vso.code`) where the authentication mechanism exposes scoped permissions.
+  The Entra bearer token for the Azure DevOps resource is the signed-in user's
+  resource token; the wrapper does not down-scope it to `vso.code`, and it may
+  authorize other actions granted to that identity. Runtime read-only
+  enforcement comes from the wrapper's fixed `az rest --method get` calls to
+  the two allowlisted endpoint families above, with no arbitrary URL or write
+  method. The fallback itself never writes a comment, vote, reviewer, pull
+  request, repository object, or work item.
 - After pinned content reads, the wrapper re-reads both latest iteration identity
   and all pinned iteration changes. Identity or digest movement fails closed.
 
