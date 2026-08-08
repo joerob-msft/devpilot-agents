@@ -38,8 +38,8 @@ and it is not a reproduction of a live run.
 
 ## The seam
 
-Every repository read in this toolkit goes through `Send-AgentMcpRequest`. A
-replay session is served there, which is why the layers above it need no
+Almost every repository read in this toolkit goes through `Send-AgentMcpRequest`.
+A replay session is served there, which is why the layers above it need no
 changes and see no difference: `Invoke-AgentMcpTool` still validates the
 envelope, `ConvertFrom-AgentMcpResourceContent` still enforces the exact URI,
 the MIME allow-list, canonical base64, the size bound and UTF-8 strictness. A
@@ -54,6 +54,29 @@ to the network:
   can ask for one;
 - a read the snapshot does not carry throws, naming the exact request. It never
   falls through to a live read.
+
+**"Almost" matters.** The MCP seam is one of two source transports. The Azure
+CLI source fallback (`review.sourceTransport.azureDevOpsCliFallback.enabled`,
+see [source-transport.md](source-transport.md)) does not go through
+`Send-AgentMcpRequest` at all: it resolves `az` on `PATH`, runs it, and then
+calls the REST API directly. Treating the MCP seam as the only egress is exactly
+the assumption that once let a configured replay contact the live service, so
+replay refuses that transport in three places:
+
+- the MCP capability probe is short-circuited in replay, so it neither contacts
+  anything nor reports a capability the snapshot cannot serve;
+- `Get-ReviewerSourceTransport` declines the fallback branch in replay and falls
+  through to the snapshot-backed path, so the run stays consistent rather than
+  half live, and a read the snapshot lacks still fails closed there;
+- `New-ReviewerSourceAzCliInvoker` refuses outright, whichever call site got
+  there — it checks `DEVPILOT_REVIEWER_REPLAY_ACTIVE` in the environment as well
+  as script scope, so the refusal survives being loaded into a module, a thread
+  job or a child process, where a script-scope flag would be invisible.
+
+A replay that suppressed a configured fallback records
+`azCliFallbackSuppressed` in its sealed artifact and says so in the preview,
+because it read through a different transport than the live run it is evidence
+of, and coverage and span basis can differ as a result.
 
 ## The snapshot
 

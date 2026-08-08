@@ -1669,44 +1669,102 @@ try {
     # RECORD any attempt to resolve an executable or start a process, and the
     # assertion is that neither fires.
     $liveAttempts = [System.Collections.Generic.List[string]]::new()
-    $recordingResolver = { [void]$liveAttempts.Add("resolve-executable"); return "C:\nowhere\az.exe" }
-    $recordingInvoker = { param($ExecutablePath, $Arguments) [void]$liveAttempts.Add("start-process: $($Arguments -join ' ')"); return @{ ExitCode = 0; StdOut = "{}"; StdErr = "" } }
+    $recordingResolver = { [void]$liveAttempts.Add("resolve-executable"); return "C:\Program Files\Azure CLI\az.cmd" }
+    # Faithful to what production returns: [pscustomobject] with Stdout/Stderr in
+    # that exact casing (SourceTransport.ps1 Invoke-ReviewerSourceAzProcess), and
+    # answers real enough that the live path SUCCEEDS. A stub that fails at the
+    # first check would satisfy "the guard did not refuse it" while proving
+    # nothing about whether the live fallback still works.
+    $recordingInvoker = {
+        param($Path, [string[]]$Arguments, $Timeout, $MaxOut, $MaxErr)
+        [void]$liveAttempts.Add("start-process: $($Arguments -join ' ')")
+        if ($Arguments[0] -ceq "extension") {
+            return [pscustomobject]@{ ExitCode = 0; Stdout = '{"name":"azure-devops","version":"1.0.0"}'; Stderr = "" }
+        }
+        if ($Arguments[0] -ceq "account") {
+            if ($Arguments[1] -ceq "get-access-token") {
+                return [pscustomobject]@{
+                    ExitCode = 0
+                    Stdout = '{"tenant":"11111111-2222-3333-4444-555555555555","expires_on":4102444800}'
+                    Stderr = ""
+                }
+            }
+            return [pscustomobject]@{ ExitCode = 0; Stdout = '{"tenantId":"11111111-2222-3333-4444-555555555555"}'; Stderr = "" }
+        }
+        return [pscustomobject]@{ ExitCode = 0; Stdout = "{}"; Stderr = "" }
+    }
 
-    $script:ReviewerReplayActive = $true
     $replayRefusal = ""
     try {
-        [void](New-ReviewerSourceAzCliInvoker -Organization "contoso" `
-                -ExpectedTenantId "11111111-2222-3333-4444-555555555555" `
-                -ExecutableResolver $recordingResolver -ProcessInvoker $recordingInvoker)
+        $script:ReviewerReplayActive = $true
+        try {
+            [void](New-ReviewerSourceAzCliInvoker -Organization "contoso" `
+                    -ExpectedTenantId "11111111-2222-3333-4444-555555555555" `
+                    -ExecutableResolver $recordingResolver -ProcessInvoker $recordingInvoker)
+        }
+        catch { $replayRefusal = [string]$_.Exception.Message }
     }
-    catch { $replayRefusal = [string]$_.Exception.Message }
-    $script:ReviewerReplayActive = $false
+    finally {
+        # Restore in finally: an error anywhere above must not leave the rest of
+        # this suite running as though it were replaying.
+        $script:ReviewerReplayActive = $false
+    }
     Assert-Replay ($replayRefusal -clike "*cannot run inside an offline replay*") `
         "Building the az CLI invoker during replay must be refused outright (got: '$replayRefusal')."
     Assert-Replay (@($liveAttempts).Count -eq 0) `
         ("No executable resolution and no process start may happen during replay (attempted: " +
         (@($liveAttempts) -join "; ") + ").")
 
+    # Scope must not become permission. A script-scope flag is invisible from a
+    # module, a thread job or a child process; if the guard read that absence as
+    # "not replaying" it would go live in exactly the contexts hardest to audit.
+    $liveAttempts.Clear()
+    $envRefusal = ""
+    try {
+        $env:DEVPILOT_REVIEWER_REPLAY_ACTIVE = "1"
+        try {
+            [void](New-ReviewerSourceAzCliInvoker -Organization "contoso" `
+                    -ExpectedTenantId "11111111-2222-3333-4444-555555555555" `
+                    -ExecutableResolver $recordingResolver -ProcessInvoker $recordingInvoker)
+        }
+        catch { $envRefusal = [string]$_.Exception.Message }
+    }
+    finally { Remove-Item Env:\DEVPILOT_REVIEWER_REPLAY_ACTIVE -ErrorAction SilentlyContinue }
+    Assert-Replay ($envRefusal -clike "*cannot run inside an offline replay*") `
+        "Replay published in the environment must refuse the invoker even with no script-scope flag (got: '$envRefusal')."
+    Assert-Replay (@($liveAttempts).Count -eq 0) `
+        ("The environment signal must refuse before any executable resolution or process start (attempted: " +
+        (@($liveAttempts) -join "; ") + ").")
+
     # And the live path must be entirely unaffected: same call, replay off,
-    # reaches its seams normally.
+    # reaches its seams AND returns a usable invoker.
     $liveAttempts.Clear()
     $liveOutcome = ""
+    $liveInvoker = $null
     try {
-        [void](New-ReviewerSourceAzCliInvoker -Organization "contoso" `
-                -ExpectedTenantId "11111111-2222-3333-4444-555555555555" `
-                -ExecutableResolver $recordingResolver -ProcessInvoker $recordingInvoker)
+        $liveInvoker = New-ReviewerSourceAzCliInvoker -Organization "contoso" `
+            -ExpectedTenantId "11111111-2222-3333-4444-555555555555" `
+            -ExecutableResolver $recordingResolver -ProcessInvoker $recordingInvoker
     }
     catch { $liveOutcome = [string]$_.Exception.Message }
+    Assert-Replay ($liveOutcome -ceq "") `
+        "Outside replay the invoker must still be built successfully (got: '$liveOutcome')."
+    Assert-Replay ($liveInvoker -is [scriptblock]) `
+        "Outside replay the guard must still hand back a usable invoker scriptblock."
     Assert-Replay (@($liveAttempts).Count -gt 0) `
         "Outside replay the invoker must still reach its seams; the guard must not disable the live fallback."
-    Assert-Replay ($liveOutcome -cnotlike "*offline replay*") `
-        "A live run must never be refused by the replay guard (got: '$liveOutcome')."
 
     # Source pins. Deleting EITHER guard has to fail this suite: the branch
     # guard that declines the fallback, and the invoker guard that refuses it.
+    # Pin the REFUSAL, not merely a mention of the flag - a pin that matches the
+    # token alone stays green when the throw is deleted around it.
     $transportText = [IO.File]::ReadAllText((Join-Path $RepoRoot "src\Agents\reviewer\SourceTransport.ps1"), $utf8)
-    Assert-Replay ($transportText -cmatch '(?s)function New-ReviewerSourceAzCliInvoker.{0,3000}?ReviewerReplayActive') `
-        "New-ReviewerSourceAzCliInvoker must refuse to build during replay."
+    Assert-Replay ($transportText -cmatch '(?s)function New-ReviewerSourceAzCliInvoker.{0,3000}?if \(Test-ReviewerSourceReplayActive\) \{\s*throw') `
+        "New-ReviewerSourceAzCliInvoker must throw, not merely mention replay, before it resolves anything."
+    Assert-Replay ($transportText -cmatch '(?s)function Test-ReviewerSourceReplayActive.{0,1200}?DEVPILOT_REVIEWER_REPLAY_ACTIVE') `
+        "The replay probe must consult the environment, or scope alone decides whether the guard can see replay."
+    Assert-Replay ($reviewerSource -cmatch 'DEVPILOT_REVIEWER_REPLAY_ACTIVE\s*=\s*"1"') `
+        "Replay activation must publish itself in the environment for guards outside script scope."
     Assert-Replay ($reviewerSource -cmatch '(?s)if \(\$CfgAzCliFallbackEnabled\) \{.{0,1400}?if \(-not \$script:ReviewerReplayActive\) \{\s*return Get-ReviewerSourceTransportAzCliFallback') `
         "The CLI fallback must be declined in replay before it is taken, inside the enabled branch."
     $fallbackCalls = @($reviewerAst.FindAll({

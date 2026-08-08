@@ -825,15 +825,20 @@ Assert-Specialist ($allowedPromptHashes -ccontains (Get-ReviewerConventionSpecia
 foreach ($property in $golden.authorizedFunctionDeltas.PSObject.Properties) {
     $deltaHistory = @($property.Value)
     if ($deltaHistory.Count -lt 2) { continue }
-    $supersededHash = [string]$deltaHistory[0].sha256
     $currentHash = [string]$deltaHistory[$deltaHistory.Count - 1].sha256
     $accepted = Get-ReviewerAuthorizedHashes -Golden $golden -Name $property.Name
-    Assert-Specialist ($supersededHash -cne $currentHash) `
-        "A superseded authorized hash for '$($property.Name)' must differ from the current one."
     Assert-Specialist ($accepted -ccontains $currentHash) `
         "The current authorized hash for '$($property.Name)' is accepted."
-    Assert-Specialist (-not ($accepted -ccontains $supersededHash)) `
-        "A superseded authorized hash for '$($property.Name)' is REFUSED, so a revert cannot pass the drift pin."
+    # EVERY superseded entry, not just the oldest. A history of fifteen with one
+    # checked leaves thirteen shapes that could be reverted to without the pin
+    # noticing, which is the whole thing this assertion exists to prevent.
+    foreach ($index in 0..($deltaHistory.Count - 2)) {
+        $supersededHash = [string]$deltaHistory[$index].sha256
+        Assert-Specialist ($supersededHash -cne $currentHash) `
+            "Superseded authorized hash $index for '$($property.Name)' must differ from the current one."
+        Assert-Specialist (-not ($accepted -ccontains $supersededHash)) `
+            "Superseded authorized hash $index for '$($property.Name)' is REFUSED, so a revert cannot pass the drift pin."
+    }
     Assert-Specialist (-not ($accepted -ccontains [string]$golden.functions.PSObject.Properties[$property.Name].Value)) `
         "The pre-delta baseline hash for '$($property.Name)' is refused once a delta supersedes it."
 }

@@ -641,6 +641,11 @@ $script:ReviewerConventionSpecialistAllowToolCeiling = @(
 # the model cannot look anything up for itself, so a replay is a LOWER bound on
 # live behaviour, not a reproduction of it.
 $script:ReviewerReplayActive = $false
+# True when a replay ran with the live az CLI fallback enabled in config and
+# suppressed it. Recorded in the sealed artifact, because such a replay read
+# through a different transport than the live run it is evidence of, and a
+# warning on the console is gone by the time anyone reads the file.
+$script:ReviewerReplayAzFallbackSuppressed = $false
 $script:ReviewerReplaySnapshot = $null
 # Told to every model pass in replay, generalist and specialist alike. Each of
 # their prompts instructs the pass to re-read the pull request and stop without
@@ -2487,11 +2492,18 @@ if ($ReplaySnapshotName -or $ReplayRoot -or $ReplayManifestDigest) {
     $script:ReviewerReplaySnapshot = New-AgentReplaySnapshot -ReplayRoot $ReplayRoot `
         -SnapshotName $ReplaySnapshotName -ExpectedManifestDigest $ReplayManifestDigest
     $script:ReviewerReplayActive = $true
-    # Say once, here, that a configured live fallback will be ignored. The
-    # transport itself must stay free of statement-position calls, and an
-    # operator who set the flag deserves to know it did nothing rather than to
-    # wonder later why the CLI never ran.
+    # Publish replay where scope cannot hide it. $script: is invisible from a
+    # module, a thread job, or a child pwsh, and a guard that cannot see the
+    # flag would read that as permission to go live. The environment is visible
+    # from all of them, so the refusal in New-ReviewerSourceAzCliInvoker holds
+    # wherever that function ends up being loaded.
+    $env:DEVPILOT_REVIEWER_REPLAY_ACTIVE = "1"
+    # Say once, here, that a configured live fallback will be ignored, and
+    # remember it for the artifact. The transport itself must stay free of
+    # statement-position calls, and an operator who set the flag deserves to
+    # know it did nothing rather than wonder later why the CLI never ran.
     if ($CfgAzCliFallbackEnabled) {
+        $script:ReviewerReplayAzFallbackSuppressed = $true
         Write-Warning ("Offline replay ignores review.sourceTransport.azureDevOpsCliFallback.enabled: " +
             "that fallback resolves and runs the az CLI and then contacts the REST API, and every read in a " +
             "replayed run comes from the sealed snapshot instead.")
@@ -4131,6 +4143,9 @@ function Write-ReviewerPreview {
         [void]$lines.Add("- Replay outcome digest (wrapper-normalized decisions, excludes comment prose): ``$($replayDigests.OutcomeDigest)``")
         [void]$lines.Add("- This is NOT a reproduction of a live run: every tool this agent can grant was denied at launch, so the model had no usable tool and could not look anything up for itself. A replay is therefore a LOWER bound on what a live run would find, and its marker-emission behaviour is not comparable to live: each pass is told not to stop merely because it cannot re-read the pull request.")
         [void]$lines.Add("- This artifact is evidence, not an approved review: it is sealed under the replay key domain and can never be promoted.")
+        if ($script:ReviewerReplayAzFallbackSuppressed) {
+            [void]$lines.Add("- The live Azure CLI source fallback was enabled in config and was SUPPRESSED for this replay: it resolves and runs the az CLI and then contacts the REST API. Source was read through the snapshot-backed path instead, so source coverage and span basis here may differ from a live run under the same config.")
+        }
     }
     [void]$lines.Add("")
     if ($passCount -gt 1) {
@@ -4276,6 +4291,13 @@ function Write-ReviewerPreview {
                     manifestDigest = $script:ReviewerReplaySnapshot.ManifestDigest
                     replayNonce    = $script:ReviewerReplaySnapshot.ReplayNonce
                     promotable     = $false
+                    # True when config asked for the live az CLI fallback and this
+                    # replay suppressed it. Worth recording: such a replay read
+                    # through the legacy snapshot-backed path, not the transport
+                    # the live run it is evidence of would have used, so coverage
+                    # and span basis may differ. The warning that said so went to
+                    # the console and is gone; this stays with the file.
+                    azCliFallbackSuppressed = [bool]$script:ReviewerReplayAzFallbackSuppressed
                 }
             }
             Set-Content -LiteralPath $artifactPath -Value (ConvertTo-Json -InputObject $artifact -Depth 4) -Encoding UTF8
@@ -8688,6 +8710,11 @@ function Write-ReviewerConventionSpecialistPreview {
                     manifestDigest = [string]$script:ReviewerReplaySnapshot.ManifestDigest
                     replayNonce = [string]$script:ReviewerReplaySnapshot.ReplayNonce
                     promotable = $false
+                    # True when config asked for the live az CLI fallback and this
+                    # replay suppressed it, so the run read through the legacy
+                    # snapshot-backed path rather than the transport a live run
+                    # would have used.
+                    azCliFallbackSuppressed = [bool]$script:ReviewerReplayAzFallbackSuppressed
                     # Machine-readable counterpart to the residual risk above, so
                     # a consumer cannot mistake one run for a reconciled result.
                     runsReconciled = 1

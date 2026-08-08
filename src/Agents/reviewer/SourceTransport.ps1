@@ -659,6 +659,24 @@ function Invoke-ReviewerSourceAzJson {
     }
 }
 
+function Test-ReviewerSourceReplayActive {
+    # True if anything visible from here says this process is replaying a sealed
+    # snapshot. Three signals, deliberately redundant, because the cost of a
+    # false negative is a live network call inside a run that claims to have
+    # made none, and the cost of a false positive is only a refused fallback.
+    #
+    # The environment variable is the one that survives scope: a script-scope
+    # variable set by the reviewer is invisible once this library is loaded into
+    # a module, a thread job, or a child pwsh, and in exactly those contexts the
+    # old read returned $false, which is to say "go ahead".
+    if ($env:DEVPILOT_REVIEWER_REPLAY_ACTIVE) { return $true }
+    foreach ($name in @("ReviewerReplayActive", "ReviewerReplaySnapshot")) {
+        $found = Get-Variable -Name $name -Scope Script -ErrorAction SilentlyContinue
+        if ($found -and $found.Value) { return $true }
+    }
+    return $false
+}
+
 function New-ReviewerSourceAzCliInvoker {
     param(
         [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')][string]$Organization,
@@ -677,12 +695,14 @@ function New-ReviewerSourceAzCliInvoker {
     # decision to go live has already been made, and a silent skip here would
     # hand back a transport that reads nothing.
     #
-    # Read defensively: this library is dot-sourced on its own by tests, where
-    # the reviewer's script-scope variable does not exist.
-    $replayActive = $false
-    $replayVar = Get-Variable -Name "ReviewerReplayActive" -Scope Script -ErrorAction SilentlyContinue
-    if ($replayVar) { $replayActive = [bool]$replayVar.Value }
-    if ($replayActive) {
+    # Ask three independent questions, because a guard that cannot see the
+    # answer must not read that as permission. A script-scope variable is
+    # invisible from a module, a thread job, or a child process, and this
+    # library is dot-sourced on its own by tests where it does not exist at
+    # all - so the reviewer also publishes replay in the process environment,
+    # which every one of those contexts can still see, and any one signal is
+    # enough to refuse.
+    if (Test-ReviewerSourceReplayActive) {
         throw ("The Azure CLI source fallback cannot run inside an offline replay: it resolves and executes " +
             "the az CLI and then contacts the REST API, and a replayed run reads only its sealed snapshot.")
     }

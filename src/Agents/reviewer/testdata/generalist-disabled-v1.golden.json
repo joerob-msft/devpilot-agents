@@ -69,11 +69,15 @@
       },
       {
         "sha256": "63b7fe6b70bf104473b81f0bd4ef1664596e63bc54e8f4716fb7fc61f4fcf592",
-        "reason": "STACK CONTEXT, not a change made by this layer. The parent PR31 (daviburg-recover-ado-source-spans, head 11335a7) edited this function to report recovered source spans, and did not append its own authorized delta - so the golden fails at the parent head 357d08e with this layer absent, which was verified directly. Recorded here because this layer was restacked onto that parent and inherits its text; the entry belongs to PR31 and should move there if that PR ever records it itself."
+        "reason": "STACK CONTEXT, kept as history only - the acceptance rule reads the LAST entry, so this one is inert as a control and is here to explain the chain, not to authorize anything. The parent PR31 (daviburg-recover-ado-source-spans, head 11335a7) edited this function to report recovered source spans and did not append its own authorized delta, so the golden fails at the parent head 357d08e with this layer absent, which was verified directly. Recorded because this layer was restacked onto that parent and inherits its text; the entry belongs to PR31 and should move there if that PR ever records it itself."
       },
       {
         "sha256": "4bc2794694805ea039fa686a4d328a3e6dce337017f51232835acd0f306e44de",
-        "reason": "This layer's own replay reporting, re-expressed on top of the parent's recovered-span text after the restack. Same behaviour as the f55fe5c6 entry above - which snapshot, manifest digest, replay nonce, input and outcome digests, narrowed tool grant, sealed under the replay key and never promotable - and that entry is kept above purely as audit history of the pre-restack shape."
+        "reason": "History only, superseded below. This layer's replay reporting re-expressed on top of the parent's recovered-span text after the restack: which snapshot, manifest digest, replay nonce, input and outcome digests, narrowed tool grant, sealed under the replay key and never promotable."
+      },
+      {
+        "sha256": "13a5ad8233f9a38c2f628f9656bb3706f617ec581fa8f9efa5a8d7f84c9ac324",
+        "reason": "CURRENT and authoritative. Adds the suppressed-live-fallback disclosure to both the preview text and the sealed replay artifact block: when a replay ran with review.sourceTransport.azureDevOpsCliFallback.enabled set, it read through the snapshot-backed path rather than the live az CLI transport, so its source coverage and span basis may differ from a live run under the same config, and the warning that said so at startup does not survive to the file."
       }
     ],
     "Invoke-ReviewerDelivery": [
