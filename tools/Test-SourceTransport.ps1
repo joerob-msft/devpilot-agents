@@ -26,8 +26,9 @@ Set-StrictMode -Version Latest
 $repoRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repoRoot 'src/Agents/reviewer/SourceTransport.ps1')
 
-# The wrapper is parsed, never executed: these checks assert how the library is
-# WIRED IN, which no amount of library-level testing can establish.
+# The wrapper is parsed for structural checks. Its two authoritative transport
+# adapters are also executed below with synthetic in-process dependencies so
+# closure capture and production wiring are covered without network activity.
 $wrapperPath = Join-Path $repoRoot 'src/Agents/reviewer/Start-ReviewerAgent.ps1'
 $wrapperText = [IO.File]::ReadAllText($wrapperPath)
 $wrapperTokens = $null
@@ -4556,6 +4557,190 @@ Assert-Source (Test-Throws {
             -SourceCommit $fcSource -Policy $policy -PolicySha256 "" -NonceFactory { 'n' * 32 }
     }) "CLI iteration change-set movement during pinned content reads fails closed"
 
+# -- Executable production-wrapper recovery readers --------------------------
+# Load only the two thin adapters from the production wrapper. Their dependencies
+# below are deterministic in-process recorders; no MCP, CLI process, or model runs.
+$ExpectedProject = $recoveryBinding.Project
+$RepositoryName = "synthetic-repository"
+$cfgRepoId = $recoveryBinding.RepositoryId
+$Organization = $recoveryBinding.Organization
+$SourceTransportPolicy = $largePolicy
+$SourceTransportPolicySha256 = ""
+$CfgAzCliFallbackTenantId = "00000000-0000-0000-0000-000000000000"
+$global:ProductionWrapperFixture = $null
+
+function global:Get-ReviewerBoundSourceContent {
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$CommitSha,
+        [Parameter(Mandatory)][string[]]$ChangeKinds,
+        [ValidateRange(0, [int]::MaxValue)][int]$MaxBytesPerFile = 0
+    )
+    $fixture = $global:ProductionWrapperFixture
+    $effectiveMaxBytes = if ($MaxBytesPerFile -gt 0) {
+        $MaxBytesPerFile
+    } else {
+        [int]$fixture.OrdinaryMaxBytes
+    }
+    [void]$fixture.Reads.Add([pscustomobject]@{
+            Path = $Path
+            CommitSha = $CommitSha
+            MaxBytesPerFile = $MaxBytesPerFile
+            EffectiveMaxBytes = $effectiveMaxBytes
+            ChangeKinds = @($ChangeKinds)
+        })
+    $text = if ($CommitSha -ceq $fixture.CommonCommit) { $fixture.CommonText } else { $fixture.SourceText }
+    $byteLength = [Text.Encoding]::UTF8.GetByteCount($text)
+    if ($byteLength -gt $effectiveMaxBytes) {
+        return [pscustomobject]@{
+            Rejected = "fileTooLarge"; MimeType = "text/plain"; ByteLength = $byteLength
+            Path = $Path; CommitSha = $CommitSha; ChangeKinds = @($ChangeKinds)
+        }
+    }
+    return [pscustomobject]@{
+        Text = $text; MimeType = "text/plain"; ByteLength = $byteLength
+        Sha256 = "0" * 64; Rejected = ""
+        Organization = $fixture.Binding.Organization; Project = $fixture.Binding.Project
+        RepositoryId = $fixture.Binding.RepositoryId; PullRequestId = $fixture.Binding.PullRequestId
+        SourceCommit = $fixture.Binding.SourceCommit; TargetCommit = $fixture.Binding.TargetCommit
+        BaseCommit = $fixture.Binding.BaseCommit; IterationId = $fixture.Binding.IterationId
+        Path = $Path; CommitSha = $CommitSha; ChangeKinds = @($ChangeKinds)
+    }
+}
+
+function global:Invoke-AgentMcpTool {
+    param([hashtable]$Session, [string]$Name, [hashtable]$Arguments)
+    return $global:ProductionWrapperFixture.Page
+}
+
+function New-ReviewerSourceAzCliInvoker {
+    param([string]$Organization, [string]$ExpectedTenantId)
+    return { throw "the synthetic identity capture must not invoke a CLI process" }
+}
+
+function Get-ReviewerSourceAzIdentityCapture {
+    param(
+        [scriptblock]$AzInvoker,
+        [string]$Project,
+        [string]$RepositoryId,
+        [int]$PrId,
+        [string]$SourceCommit
+    )
+    return $global:ProductionWrapperFixture.Identity
+}
+
+function global:New-AgentNonce { return "n" * 32 }
+
+. ([scriptblock]::Create((Get-FunctionTextFromWrapper -Name 'Get-ReviewerSourceTransportNewContract')))
+. ([scriptblock]::Create((Get-FunctionTextFromWrapper -Name 'Get-ReviewerSourceTransportAzCliFallback')))
+
+function Invoke-ProductionWrapperFixture {
+    param(
+        [ValidateSet("mcp", "cli")][string]$Wrapper,
+        [ValidateSet("ordinary", "deletion", "edit", "overCap")][string]$Shape
+    )
+    $path = "/src/wrapper-$Wrapper-$Shape.cs"
+    $change = if ($Shape -ceq "ordinary") {
+        New-FCOrdinaryChange -Path $path -Start 1008 -Count 1
+    } else {
+        New-DegenerateEdit -Path $path
+    }
+    $page = New-FCPage -Changes @($change)
+    $sourceForShape = switch ($Shape) {
+        "ordinary" { $largeEditText }
+        "deletion" { $largeDeletionText }
+        "edit" { $largeEditText }
+        "overCap" { "z" * ($script:ReviewerSourceMaxRecoveryBytesPerSide + 1) }
+    }
+    $commonForShape = switch ($Shape) {
+        "deletion" { $largeCommonText }
+        default { $largeDeletionText }
+    }
+    $identityBinding = Get-ReviewerSourceIterationPageBinding -Response $page `
+        -ExpectedSkip 0 -ExpectedTop 200 -AllowAnyIteration
+    $reads = [System.Collections.Generic.List[object]]::new()
+    $global:ProductionWrapperFixture = @{
+        Page = $page
+        SourceText = $sourceForShape
+        CommonText = $commonForShape
+        CommonCommit = $fcCommon
+        OrdinaryMaxBytes = [int]$largePolicy.maxFetchBytesPerFile
+        Binding = $recoveryBinding
+        Reads = $reads
+        Identity = [pscustomobject]@{
+            Binding = $identityBinding
+            Response = $page
+            ChangeSetSha256 = "synthetic-stable-change-set"
+        }
+    }
+    $result = if ($Wrapper -ceq "mcp") {
+        Get-ReviewerSourceTransportNewContract -Session @{} -PrId $fcPr `
+            -SourceCommit $fcSource -Capability $fcCapability
+    } else {
+        Get-ReviewerSourceTransportAzCliFallback -Session @{} -PrId $fcPr -SourceCommit $fcSource
+    }
+    return [pscustomobject]@{ Result = $result; Reads = @($reads); Path = $path }
+}
+
+$productionWrapperResults = @{}
+foreach ($wrapper in @("mcp", "cli")) {
+    foreach ($shape in @("ordinary", "deletion", "edit", "overCap")) {
+        $productionWrapperResults["$wrapper/$shape"] = Invoke-ProductionWrapperFixture `
+            -Wrapper $wrapper -Shape $shape
+    }
+
+    $ordinaryProbe = $productionWrapperResults["$wrapper/ordinary"]
+    $ordinaryFile = @($ordinaryProbe.Result.Report.Files)[0]
+    Assert-Source ($ordinaryProbe.Reads.Count -eq 1 -and
+        [int]$ordinaryProbe.Reads[0].MaxBytesPerFile -eq 0 -and
+        [int]$ordinaryProbe.Reads[0].EffectiveMaxBytes -eq 1048576 -and
+        [string]$ordinaryProbe.Reads[0].CommitSha -ceq $fcSource -and
+        [string]$ordinaryProbe.Reads[0].Path -ceq $ordinaryProbe.Path -and
+        [string]$ordinaryFile.Reason -ceq "fileTooLarge" -and
+        @($ordinaryFile.Slices).Count -eq 0) `
+        "$wrapper production wrapper keeps an ordinary >1 MiB source read at the 1 MiB delivery ceiling"
+
+    $deletionProbe = $productionWrapperResults["$wrapper/deletion"]
+    $deletionFile = @($deletionProbe.Result.Report.Files)[0]
+    $deletionSourceRead = @($deletionProbe.Reads | Where-Object CommitSha -CEQ $fcSource)
+    $deletionBaseRead = @($deletionProbe.Reads | Where-Object CommitSha -CEQ $fcCommon)
+    Assert-Source ($deletionProbe.Reads.Count -eq 2 -and
+        @($deletionProbe.Reads | Where-Object {
+                [int]$_.MaxBytesPerFile -ne $script:ReviewerSourceMaxRecoveryBytesPerSide -or
+                [int]$_.EffectiveMaxBytes -ne $script:ReviewerSourceMaxRecoveryBytesPerSide
+            }).Count -eq 0 -and
+        $deletionSourceRead.Count -eq 1 -and $deletionBaseRead.Count -eq 1 -and
+        [string]$deletionSourceRead[0].Path -ceq $deletionProbe.Path -and
+        [string]$deletionBaseRead[0].Path -ceq $deletionProbe.Path -and
+        $deletionProbe.Result.Gate.Ok -and
+        [int]$deletionProbe.Result.Report.SourceBearingFileCount -eq 0 -and
+        [string]$deletionFile.Reason -ceq "authoritativeDeletionOnly") `
+        "$wrapper production recovery source/base closures both capture exactly 2 MiB and prove a large deletion-only path"
+
+    $editProbe = $productionWrapperResults["$wrapper/edit"]
+    $editFile = @($editProbe.Result.Report.Files)[0]
+    Assert-Source ($editProbe.Reads.Count -eq 2 -and
+        @($editProbe.Reads | Where-Object {
+                [int]$_.MaxBytesPerFile -ne $script:ReviewerSourceMaxRecoveryBytesPerSide
+            }).Count -eq 0 -and
+        [string]$editFile.SpanBasis -ceq "recovered" -and
+        [string]$editFile.Reason -ceq "fileTooLarge" -and
+        [int]$editFile.RawRequestedSpanCount -eq 1 -and
+        @($editFile.Slices).Count -eq 0 -and
+        $editProbe.Result.BlockText -notmatch [regex]::Escape($largePrivateMarker)) `
+        "$wrapper production path privately recovers a bounded large edit without exposing whole-file content"
+
+    $overCapProbe = $productionWrapperResults["$wrapper/overCap"]
+    $overCapFile = @($overCapProbe.Result.Report.Files)[0]
+    Assert-Source ($overCapProbe.Reads.Count -eq 1 -and
+        [int]$overCapProbe.Reads[0].MaxBytesPerFile -eq $script:ReviewerSourceMaxRecoveryBytesPerSide -and
+        [string]$overCapFile.Reason -ceq "recoveryByteCapExceeded" -and
+        [int]$overCapProbe.Result.Report.SourceBearingFileCount -eq 1 -and
+        -not $overCapProbe.Result.Gate.Ok) `
+        "$wrapper production recovery reader keeps a >2 MiB source capped and in the denominator"
+}
+
 # -- Wiring, probe safety, and no obsolete tokens (structural) ----------------
 # The capability probe NEVER runs on the shared ordinary-transport session: a
 # tools/list failure aborts the session it runs on, and that session owns the
@@ -4581,8 +4766,13 @@ Assert-Source ($newContractText.Length -gt 0 -and
     $newContractText.IndexOf('-BaseReader', [StringComparison]::Ordinal) -ge 0 -and
     $newContractText.IndexOf('-RecoveryReader', [StringComparison]::Ordinal) -ge 0 -and
     $newContractText.IndexOf('-RecoveryBaseReader', [StringComparison]::Ordinal) -ge 0 -and
+    $newContractText.IndexOf(
+        '[int]$recoveryBytesPerSide = [int]$script:ReviewerSourceMaxRecoveryBytesPerSide',
+        [StringComparison]::Ordinal) -ge 0 -and
+    $newContractText.IndexOf('-MaxBytesPerFile $recoveryBytesPerSide',
+        [StringComparison]::Ordinal) -ge 0 -and
     $newContractText.IndexOf('-MaxBytesPerFile $script:ReviewerSourceMaxRecoveryBytesPerSide',
-        [StringComparison]::Ordinal) -ge 0) `
+        [StringComparison]::Ordinal) -lt 0) `
     "the wrapper hands the orchestrator ordinary readers plus private recovery readers at the exact hard byte cap"
 $azFallbackText = Get-FunctionTextFromWrapper -Name 'Get-ReviewerSourceTransportAzCliFallback'
 $capabilityIndex = $transportText.IndexOf('if ($null -ne $capability)', [StringComparison]::Ordinal)

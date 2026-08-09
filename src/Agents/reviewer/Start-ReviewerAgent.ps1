@@ -8138,15 +8138,16 @@ function Get-ReviewerSourceTransportNewContract {
         param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
         return Get-ReviewerBoundSourceContent -Session $Session -Path $Path -CommitSha $BaseCommit -ChangeKinds @($Kinds)
     }.GetNewClosure()
+    [int]$recoveryBytesPerSide = [int]$script:ReviewerSourceMaxRecoveryBytesPerSide
     $recoverySourceReader = {
         param([string]$Path, [string[]]$Kinds)
         return Get-ReviewerBoundSourceContent -Session $Session -Path $Path -CommitSha $SourceCommit `
-            -ChangeKinds @($Kinds) -MaxBytesPerFile $script:ReviewerSourceMaxRecoveryBytesPerSide
+            -ChangeKinds @($Kinds) -MaxBytesPerFile $recoveryBytesPerSide
     }.GetNewClosure()
     $recoveryBaseReader = {
         param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
         return Get-ReviewerBoundSourceContent -Session $Session -Path $Path -CommitSha $BaseCommit `
-            -ChangeKinds @($Kinds) -MaxBytesPerFile $script:ReviewerSourceMaxRecoveryBytesPerSide
+            -ChangeKinds @($Kinds) -MaxBytesPerFile $recoveryBytesPerSide
     }.GetNewClosure()
     return Invoke-ReviewerSourceNewContractTransport -ToolInvoker $toolInvoker -Reader $sourceReader `
         -BaseReader $baseReader -RecoveryReader $recoverySourceReader -RecoveryBaseReader $recoveryBaseReader `
@@ -8189,17 +8190,18 @@ function Get-ReviewerSourceTransportAzCliFallback {
         return Get-ReviewerBoundSourceContent -Session $Session -Path $Path `
             -CommitSha $BaseCommit -ChangeKinds @($Kinds)
     }.GetNewClosure()
+    [int]$recoveryBytesPerSide = [int]$script:ReviewerSourceMaxRecoveryBytesPerSide
     $recoverySourceReader = {
         param([string]$Path, [string[]]$Kinds)
         return Get-ReviewerBoundSourceContent -Session $Session -Path $Path `
             -CommitSha $SourceCommit -ChangeKinds @($Kinds) `
-            -MaxBytesPerFile $script:ReviewerSourceMaxRecoveryBytesPerSide
+            -MaxBytesPerFile $recoveryBytesPerSide
     }.GetNewClosure()
     $recoveryBaseReader = {
         param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
         return Get-ReviewerBoundSourceContent -Session $Session -Path $Path `
             -CommitSha $BaseCommit -ChangeKinds @($Kinds) `
-            -MaxBytesPerFile $script:ReviewerSourceMaxRecoveryBytesPerSide
+            -MaxBytesPerFile $recoveryBytesPerSide
     }.GetNewClosure()
     return Invoke-ReviewerSourceNewContractTransport -IdentityReader $identityReader `
         -Reader $sourceReader -BaseReader $baseReader -RecoveryReader $recoverySourceReader `
