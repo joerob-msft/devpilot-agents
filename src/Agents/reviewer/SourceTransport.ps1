@@ -659,6 +659,58 @@ function Invoke-ReviewerSourceAzJson {
     }
 }
 
+function Get-ReviewerSourceReplaySignal {
+    <#
+        The name of the signal saying this process is replaying a sealed
+        snapshot, or "" if none says so. Deliberately redundant: the cost of a
+        false negative is a live network call inside a run that claims to have
+        made none, and the cost of a false positive is a refused fallback.
+
+        The environment variable is the one that survives scope. A script-scope
+        variable set by the reviewer is invisible once this library is loaded
+        into a module, a thread job, or a child pwsh, and in exactly those
+        contexts reading its absence as $false means "go ahead". ANY non-empty
+        value means replay - including "0" and "false", because a guard is the
+        wrong place to parse intent. Unset the variable to clear it; assigning
+        "" removes it in PowerShell, so there is no "off" value to get wrong.
+
+        "stale-environment" is its own answer because it is a different fault
+        with a different fix: the environment says replay while this process's
+        own script scope says it is not replaying, which means a leftover
+        variable from an earlier replay is about to disable a live fallback.
+        Refusing is still right, but saying "you are in a replay" would be a
+        lie, and would send someone looking in the wrong place.
+    #>
+    foreach ($name in @("ReviewerReplayActive", "ReviewerReplaySnapshot")) {
+        $found = Get-Variable -Name $name -Scope Script -ErrorAction SilentlyContinue
+        if ($found -and $found.Value) { return "script:$name" }
+    }
+    if ($env:DEVPILOT_REVIEWER_REPLAY_ACTIVE) {
+        $active = Get-Variable -Name "ReviewerReplayActive" -Scope Script -ErrorAction SilentlyContinue
+        if ($active -and -not $active.Value) { return "stale-environment" }
+        return "environment"
+    }
+    return ""
+}
+
+function Clear-ReviewerSourceReplayEnvironment {
+    # Called once at reviewer startup, before anything can read it. Inherited
+    # from an operator's shell - a replay followed by an ordinary review in the
+    # same window - this variable would refuse the live Azure CLI fallback in a
+    # run that is not replaying, skipping every pull request for a reason that
+    # is not true. The replay path sets it later, deliberately, and that is the
+    # only way it should ever be set in this process.
+    Remove-Item Env:\DEVPILOT_REVIEWER_REPLAY_ACTIVE -ErrorAction SilentlyContinue
+}
+
+function Publish-ReviewerSourceReplayEnvironment {
+    # Called once when replay activates. The environment is the only channel a
+    # guard can read from a module, a thread job or a child process, where a
+    # script-scope variable is invisible and its absence would be taken for
+    # permission to go live.
+    $env:DEVPILOT_REVIEWER_REPLAY_ACTIVE = "1"
+}
+
 function New-ReviewerSourceAzCliInvoker {
     param(
         [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')][string]$Organization,
@@ -666,6 +718,34 @@ function New-ReviewerSourceAzCliInvoker {
         [scriptblock]$ExecutableResolver,
         [scriptblock]$ProcessInvoker
     )
+    # Defence in depth, and the last line of it. Everything below this shells
+    # out: it resolves `az` on PATH, runs `az extension`, `az account`, and
+    # `az account get-access-token`, and the transport it returns then talks to
+    # the REST API. None of that may happen inside an offline replay, whatever
+    # a config says and whichever call site got here.
+    #
+    # The caller already declines the fallback in replay. This refuses rather
+    # than declines, because by the time anything asks to BUILD the invoker the
+    # decision to go live has already been made, and a silent skip here would
+    # hand back a transport that reads nothing.
+    #
+    # Ask every question that can be asked from here, because a guard that
+    # cannot see the answer must not read that as permission. A script-scope
+    # variable is invisible from a module, a thread job, or a child process,
+    # and this library is dot-sourced on its own by tests where it does not
+    # exist at all - so the reviewer also publishes replay in the process
+    # environment, which every one of those contexts can still see, and any
+    # one signal is enough to refuse.
+    $replaySignal = Get-ReviewerSourceReplaySignal
+    if ($replaySignal -ceq "stale-environment") {
+        throw ("Refusing to build the Azure CLI source fallback: DEVPILOT_REVIEWER_REPLAY_ACTIVE is set in this " +
+            "process environment, but this run is NOT a replay. That is a leftover from an earlier offline replay " +
+            "in the same shell. Unset it (Remove-Item Env:\DEVPILOT_REVIEWER_REPLAY_ACTIVE) and run again.")
+    }
+    if ($replaySignal) {
+        throw ("The Azure CLI source fallback cannot run inside an offline replay: it resolves and executes " +
+            "the az CLI and then contacts the REST API, and a replayed run reads only its sealed snapshot.")
+    }
     if (-not $ExecutableResolver) {
         $ExecutableResolver = {
             $command = Get-Command az -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -2393,7 +2473,7 @@ function New-ReviewerSourceTransportReport {
             -RequestedSpanCount ([int]$cut.RequestedSpanCount) `
             -RawRequestedSpanCount $rawRequested `
             -DeliveredRawSpanCount ([int]$cut.DeliveredRawSpanCount) `
-            -Slices @($cut.Slices) -SiblingSlices @($cut.SiblingSlices) -SpanBasis $spanBasis
+            -Slices @($cut.Slices) -SiblingSlices @($cut.SiblingSlices) -SpanBasis $spanBasis -RawSpans @($spans)
         [void]$files.Add($entry)
         # Only CHANGED bytes draw down the changed-source budget. Sibling
         # context has its own pool, so unchanged evidence attached to an early
@@ -2557,6 +2637,12 @@ function New-ReviewerSourceFileEntry {
         # host whose misbehaviour this layer exists to survive.
         [ValidateSet("", "changeSet", "reader")][string]$NoSourceBasis = "",
         [ValidateSet("changeSet", "recovered")][string]$SpanBasis = "changeSet",
+        # The pull request's OWN hunks for this path, before any context radius
+        # was added. A delivered slice is a hunk plus up to thirty untouched
+        # lines on each side, so anything that needs to know what this change
+        # actually touched - as opposed to what was delivered around it - has to
+        # be told separately or it will call sixty untouched lines "changed".
+        [object[]]$RawSpans = @(),
         [object[]]$Slices = @(),
         [object[]]$SiblingSlices = @()
     )
@@ -2593,6 +2679,7 @@ function New-ReviewerSourceFileEntry {
         SpanBasis             = $SpanBasis
         DeliveredSpanCount    = @($Slices).Count
         DeliveredBytes        = $deliveredBytes
+        RawSpans              = @($RawSpans)
         Slices                = @($Slices)
         SiblingSlices         = @($SiblingSlices)
     }

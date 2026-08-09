@@ -242,6 +242,15 @@ Microsoft Entra tenant expected for the Azure DevOps organization. The wrapper
 refuses an empty or different tenant. The object is closed by
 `source/v1/azure-devops-cli-fallback.schema.json`; unknown keys fail startup.
 
+The flag is ignored in an offline snapshot replay, and deliberately so: this
+fallback is a live transport that runs `az` and then calls the REST API, which
+would contradict a replay's only claim about itself. Replay suppresses it,
+warns once at startup, and records `azCliFallbackSuppressed` in the sealed
+artifact. If you see the reviewer refuse this fallback in a run that is not a
+replay, `DEVPILOT_REVIEWER_REPLAY_ACTIVE` is left over in your shell from an
+earlier replay; the refusal names it. See
+[replay-snapshots.md](replay-snapshots.md).
+
 #### Installation and authentication
 
 Install Azure CLI by your platform's supported method, then install its

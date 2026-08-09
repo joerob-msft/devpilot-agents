@@ -11,7 +11,8 @@
     "Get-ReviewerPostableFindings": "df41352b7f8e49ef33b57a50ec76facf2d8cda0e3d80d6bc2bfe5f4f67ac39a7",
     "Split-ReviewerFindingsByChangeSet": "662dc52aefdaf9c5de7b9e8d7bf614a42a2030227495606ffb3e6fd9b941d6e0",
     "Invoke-ReviewerPullRequest": "62432a88a734669cfe06220131db07429ea8940eb8eb35078ad925748efce719",
-    "Invoke-ReviewerDelivery": "05a9813a6ed6c6e7e8992c3bb4587629da520ec1dc1ec81235d80f84623247eb"
+    "Invoke-ReviewerDelivery": "05a9813a6ed6c6e7e8992c3bb4587629da520ec1dc1ec81235d80f84623247eb",
+    "Write-ReviewerConventionSpecialistPreview": "606bee25c5dcebd1471dccd81576b46d44d6cf5dc6c71a96a95becba4518c8b5"
   },
   "authorizedFunctionDeltas": {
     "Write-ReviewerPreview": [
@@ -62,6 +63,26 @@
       {
         "sha256": "e9b8d101c6e5d37f2b39bf4240866353b92ae758f950fcbd02a1d05b5dd4facc",
         "reason": "Break out how many of those uncorroborated excusals are paths the host alone called non-text. That subset is the one where the pull request's own path says 'ordinary source' and only the untrusted party disagrees, and it now has its own reason code in the accounting table."
+      },
+      {
+        "sha256": "f55fe5c67f929648108348abe3af8610a6d8d5fbd7cc15f8a5ee8e5e838f903b",
+        "reason": "State in the preview when the run was an offline snapshot replay: which snapshot, its manifest digest, the replay nonce, the wrapper-computed input digest and the normalized outcome digest, that the model was launched with the narrowed offline tool grant, and that the artifact is sealed under the replay key domain and can never be promoted."
+      },
+      {
+        "sha256": "63b7fe6b70bf104473b81f0bd4ef1664596e63bc54e8f4716fb7fc61f4fcf592",
+        "reason": "STACK CONTEXT, kept as history only - the acceptance rule reads the LAST entry, so this one is inert as a control and is here to explain the chain, not to authorize anything. The parent PR31 (daviburg-recover-ado-source-spans, head 11335a7) edited this function to report recovered source spans and did not append its own authorized delta, so the golden fails at the parent head 357d08e with this layer absent, which was verified directly. Recorded because this layer was restacked onto that parent and inherits its text; the entry belongs to PR31 and should move there if that PR ever records it itself."
+      },
+      {
+        "sha256": "4bc2794694805ea039fa686a4d328a3e6dce337017f51232835acd0f306e44de",
+        "reason": "History only, superseded below. This layer's replay reporting re-expressed on top of the parent's recovered-span text after the restack: which snapshot, manifest digest, replay nonce, input and outcome digests, narrowed tool grant, sealed under the replay key and never promotable."
+      },
+      {
+        "sha256": "13a5ad8233f9a38c2f628f9656bb3706f617ec581fa8f9efa5a8d7f84c9ac324",
+        "reason": "History only, superseded below. First version of the suppressed-live-fallback disclosure, before the capability-probe substitution was disclosed alongside it."
+      },
+      {
+        "sha256": "b6a5a00d94d81a598c2215d672638ab0e8bb295646d938ec3717d816be882a28",
+        "reason": "CURRENT and authoritative. Discloses what actually served source in a replay, not merely the part that was configured: sourceTransportMode snapshotLegacy and capabilityProbeSuppressed always, because replay declines the MCP capability probe so the newer get_changes contract is never used even when the recorded run used it, plus azCliFallbackSuppressed when config had enabled the live Azure CLI fallback. Recording only the configured half would let a reader take a faithful-looking artifact for a faithful transport. Both replay blocks are ordered so key order in an evidence file does not reshuffle when a key is added."
       }
     ],
     "Invoke-ReviewerDelivery": [
@@ -78,6 +99,10 @@
       {
         "sha256": "24bfc80213e33e9ee61ce2eaeef1699faca371e5b0aa4de6b9dda4aeb4fef247",
         "reason": "State it in as many words when NO sealed block was produced. The block was simply omitted when empty, so a one-line regression that blanked it left the model with no source and no notice of that, while the prompt still told it the accounting table was binding."
+      },
+      {
+        "sha256": "f3bf51bbef917da38c52c84ea490277ddf0e69f1f6903cbe10aec05a61313b02",
+        "reason": "In offline replay, say that this pass holds no repository read tool and that the wrapper already verified the binding against the sealed snapshot. Without it a correct pass fails closed for the wrong reason: the prompt tells it to re-read the pull request and stop without a marker if it cannot, and in replay it cannot."
       }
     ],
     "Invoke-ReviewerModelPass": [
@@ -96,6 +121,10 @@
       {
         "sha256": "8c5e2be6e4b8827de4afdcf8892ea5b76821ae3c24b8cd9ad8ec68c88684f036",
         "reason": "Mark that oversized-input refusal a pull-request failure rather than an environment fault. Exempting it re-attempted every cycle forever, burning a full transport, the specialist and the gate each time, while never appearing in attempts state where an operator could see it."
+      },
+      {
+        "sha256": "6e451d1c86898c0c08fa0c59cb3dc795dcba2c2803bb8cf871ee2fe51d42f491",
+        "reason": "Route the generalist tool grant through Get-ReviewerLaunchAllowTools so an offline snapshot replay narrows it to the code-defined offline set instead of leaving the model its own live repository tools, which would mix live facts into a replayed review."
       }
     ],
     "Invoke-ReviewerPullRequest": [
