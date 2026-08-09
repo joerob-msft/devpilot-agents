@@ -2331,6 +2331,37 @@ $bigResult = Get-ReviewerSourceReaderResult -ToolResult (New-ResourceToolResult 
 Assert-Source (([string]$bigResult.Rejected) -ceq 'fileTooLarge') "an oversized file is classified fileTooLarge, not transportFailed"
 Assert-Source ([int]$bigResult.ByteLength -eq 4096) "the oversize classification reports the real decoded size"
 
+$recoveryBoundaryBytes = [byte[]]::new($script:ReviewerSourceMaxRecoveryBytesPerSide)
+[Array]::Fill($recoveryBoundaryBytes, [byte][char]'a')
+$recoveryBoundaryBase64 = [Convert]::ToBase64String($recoveryBoundaryBytes)
+$ordinaryBoundaryResult = Get-ReviewerSourceReaderResult `
+    -ToolResult (New-ResourceToolResult -Base64 $recoveryBoundaryBase64) `
+    -Path '/src/recovery-boundary.cs' -Policy (New-TestPolicy -Overrides @{ maxFetchBytesPerFile = 1048576 }) `
+    -Decoder $strictDecoder
+$privateBoundaryResult = Get-ReviewerSourceReaderResult `
+    -ToolResult (New-ResourceToolResult -Base64 $recoveryBoundaryBase64) `
+    -Path '/src/recovery-boundary.cs' -Policy $readerPolicy `
+    -MaxBytesPerFile $script:ReviewerSourceMaxRecoveryBytesPerSide -Decoder $strictDecoder
+$overRecoveryBoundaryBytes = [byte[]]::new($script:ReviewerSourceMaxRecoveryBytesPerSide + 1)
+[Array]::Fill($overRecoveryBoundaryBytes, [byte][char]'a')
+$overPrivateBoundaryResult = Get-ReviewerSourceReaderResult `
+    -ToolResult (New-ResourceToolResult -Base64 ([Convert]::ToBase64String($overRecoveryBoundaryBytes))) `
+    -Path '/src/over-recovery-boundary.cs' -Policy $readerPolicy `
+    -MaxBytesPerFile $script:ReviewerSourceMaxRecoveryBytesPerSide -Decoder $strictDecoder
+Assert-Source ([string]$ordinaryBoundaryResult.Rejected -ceq 'fileTooLarge' -and
+    [int]$ordinaryBoundaryResult.ByteLength -eq $script:ReviewerSourceMaxRecoveryBytesPerSide) `
+    "ordinary source delivery still rejects a 2 MiB file under its independent 1 MiB policy ceiling"
+Assert-Source ([string]$privateBoundaryResult.Text -and
+    [int]$privateBoundaryResult.ByteLength -eq $script:ReviewerSourceMaxRecoveryBytesPerSide -and
+    -not $privateBoundaryResult.PSObject.Properties['Rejected']) `
+    "the private recovery reader accepts exactly the existing 2 MiB Myers byte ceiling"
+Assert-Source ([string]$overPrivateBoundaryResult.Rejected -ceq 'fileTooLarge' -and
+    [int]$overPrivateBoundaryResult.ByteLength -eq ($script:ReviewerSourceMaxRecoveryBytesPerSide + 1)) `
+    "the private recovery reader rejects one byte beyond the hard 2 MiB ceiling before decode"
+$recoveryBoundaryBytes = $null
+$recoveryBoundaryBase64 = $null
+$overRecoveryBoundaryBytes = $null
+
 # An empty added file is an ordinary thing. Calling it "too large" sent an
 # operator to the wrong lever and, worse, kept it in the coverage denominator so
 # that adding a .gitkeep sank a pull request's coverage forever.
@@ -3080,6 +3111,18 @@ $closedCaps = @(
 )
 Assert-Source (@($closedCaps | Where-Object { $_.Success -or @($_.Spans).Count -gt 0 }).Count -eq 0) `
     "byte, line, frontier, operation, and trace cap exhaustion all fail closed without fabricated spans"
+$exactByteBoundaryText = "a" * $script:ReviewerSourceMaxRecoveryBytesPerSide
+$exactByteBoundaryResult = Get-ReviewerSourceDeterministicDiffResult `
+    -TargetText $exactByteBoundaryText -SourceText $exactByteBoundaryText
+$overByteBoundaryResult = Get-ReviewerSourceDeterministicDiffResult `
+    -TargetText $exactByteBoundaryText -SourceText ($exactByteBoundaryText + "a")
+Assert-Source ($exactByteBoundaryResult.Success -and @($exactByteBoundaryResult.Spans).Count -eq 0) `
+    "the exact diff accepts both sides at the hard byte boundary"
+Assert-Source (-not $overByteBoundaryResult.Success -and
+    [string]$overByteBoundaryResult.FailureReason -ceq "recoveryByteCapExceeded" -and
+    @($overByteBoundaryResult.Spans).Count -eq 0) `
+    "the exact diff rejects either side one byte over the hard boundary without partial spans"
+$exactByteBoundaryText = $null
 $newlineDenseResult = Get-ReviewerSourceDeterministicDiffResult -TargetText ("`n" * 100001) `
     -SourceText "x" -MaxBytesPerSide 200000
 Assert-Source (-not $newlineDenseResult.Success -and
@@ -3546,8 +3589,11 @@ $fcBaseReader = {
 function Invoke-FCOrchestrator {
     param([object[]]$Responses, $Calls, [scriptblock]$SourceReader = $fcSourceReader,
         [scriptblock]$BaseReader = $fcBaseReader, $Capability = $fcCapability, $AggregateResponse = $null,
+        [scriptblock]$RecoverySourceReader, [scriptblock]$RecoveryBaseReader,
         $Events = $null, [hashtable]$TransportPolicy = $policy)
     if ($null -eq $AggregateResponse) { $AggregateResponse = [pscustomobject]@{ changes = @($Responses[0].changes) } }
+    if ($null -eq $RecoverySourceReader) { $RecoverySourceReader = $SourceReader }
+    if ($null -eq $RecoveryBaseReader) { $RecoveryBaseReader = $BaseReader }
     $invoker = {
         param([hashtable]$Arguments)
         if ($null -ne $Events) { [void]$Events.Add("identity") }
@@ -3559,6 +3605,7 @@ function Invoke-FCOrchestrator {
         return $AggregateResponse
     }.GetNewClosure()
     return Invoke-ReviewerSourceNewContractTransport -ToolInvoker $invoker -Reader $SourceReader -BaseReader $BaseReader `
+        -RecoveryReader $RecoverySourceReader -RecoveryBaseReader $RecoveryBaseReader `
         -Organization $recoveryBinding.Organization -Project $recoveryBinding.Project -RepositoryId $fcRepoId `
         -PrId $fcPr -SourceCommit $fcSource -Capability $Capability -Policy $TransportPolicy -PolicySha256 "" `
         -NonceFactory { 'n' * 32 } -AggregateReader $aggregateReader
@@ -3670,16 +3717,31 @@ Assert-Source (Test-Throws {
 
 # A mixed set keeps the unread file in the denominator and fails the gate.
 $fcMixedPage = New-FCPage -Changes @((New-DegenerateEdit -Path "/src/a.cs"), (New-DegenerateEdit -Path "/src/unread.cs"))
+$fcMixedReads = @{ Good = 0; Unread = 0 }
 $fcMixedSourceReader = {
     param([string]$Path, [string[]]$Kinds)
-    if ($Path -ceq "/src/unread.cs") { return $null }
+    if ($Path -ceq "/src/unread.cs") { $fcMixedReads.Unread++; return $null }
+    $fcMixedReads.Good++
     New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit -Text $sourceText -ChangeKinds @($Kinds)
 }.GetNewClosure()
 $fcMixedCalls = [System.Collections.Generic.List[hashtable]]::new()
 $fcMixedResult = Invoke-FCOrchestrator -Responses @($fcMixedPage, $fcMixedPage) -Calls $fcMixedCalls -SourceReader $fcMixedSourceReader
 $fcMixedCondition = [bool]([int]$fcMixedResult.Report.CoveredFiles -eq 1 -and
-    [int]$fcMixedResult.Report.SourceBearingFileCount -eq 2 -and -not $fcMixedResult.Gate.Ok)
+    [int]$fcMixedResult.Report.SourceBearingFileCount -eq 2 -and -not $fcMixedResult.Gate.Ok -and
+    $fcMixedReads.Good -eq 1 -and $fcMixedReads.Unread -eq 1)
 Assert-Source $fcMixedCondition "a mixed recovered/unrecovered set keeps the unread file in the denominator and fails the gate"
+
+$fcThrowReads = @{ Count = 0 }
+$fcThrowResult = Invoke-FCOrchestrator -Responses @($fcDegenerate, $fcDegenerate) `
+    -Calls ([System.Collections.Generic.List[hashtable]]::new()) `
+    -SourceReader {
+        $fcThrowReads.Count++
+        throw "ordinary missing path"
+    }.GetNewClosure()
+Assert-Source (-not $fcThrowResult.Gate.Ok -and
+    [string]@($fcThrowResult.Report.Files)[0].Reason -ceq "transportFailed" -and
+    $fcThrowReads.Count -eq 1) `
+    "a nonfatal failed recovery source read is cached as failure and never fetched again for reporting"
 
 # Same content and a hostile reader both fail recovery closed - no invented span.
 $fcSameContentReader = {
@@ -3758,6 +3820,260 @@ Assert-Source ($fcCappedDeletionResult.Gate.Ok -and
     [string]@($fcCappedDeletionResult.Report.Files | Where-Object {
             $_.Path -ceq "/src/deletion.cs" })[0].Reason -ceq "authoritativeDeletionOnly") `
     "authoritative deletion-only proof is denominator-neutral even after the read-file cap is reached"
+
+function New-LargeRecoveryText {
+    param(
+        [ValidateRange(1, 100000)][int]$LineCount,
+        [ValidateRange(0, 100000)][int]$ReplacementLine = 0,
+        [AllowEmptyString()][string]$ReplacementText = ""
+    )
+    $ordinaryLine = "x" * 999
+    $replacement = if ($ReplacementLine -gt 0) {
+        if ($ReplacementText.Length -gt 999) { throw "The synthetic replacement line is too long." }
+        $ReplacementText + ("y" * (999 - $ReplacementText.Length))
+    } else {
+        ""
+    }
+    $builder = [System.Text.StringBuilder]::new($LineCount * 1000)
+    for ($line = 1; $line -le $LineCount; $line++) {
+        [void]$builder.Append($(if ($line -eq $ReplacementLine) { $replacement } else { $ordinaryLine }))
+        [void]$builder.Append("`n")
+    }
+    return $builder.ToString()
+}
+
+$largePolicy = New-TestPolicy -Overrides @{ maxFetchBytesPerFile = 1048576 }
+$largeCommonText = New-LargeRecoveryText -LineCount 2017
+$largeDeletionText = New-LargeRecoveryText -LineCount 2016
+$largePrivateMarker = "SYNTHETIC_PRIVATE_RECOVERY_CONTENT"
+$largeEditText = New-LargeRecoveryText -LineCount 2016 -ReplacementLine 1008 -ReplacementText $largePrivateMarker
+Assert-Source ([System.Text.Encoding]::UTF8.GetByteCount($largeDeletionText) -gt [int]$largePolicy.maxFetchBytesPerFile -and
+    [System.Text.Encoding]::UTF8.GetByteCount($largeCommonText) -le $script:ReviewerSourceMaxRecoveryBytesPerSide) `
+    "the large recovery fixture is above ordinary delivery but within the exact recovery byte ceiling"
+
+$largeOrdinaryPage = New-FCPage -Changes @((New-FCOrdinaryChange -Path "/src/large.cs" -Start 1008 -Count 1))
+$largeOrdinaryReads = 0
+$largeOrdinaryResult = Invoke-FCOrchestrator -Responses @($largeOrdinaryPage, $largeOrdinaryPage) `
+    -Calls ([System.Collections.Generic.List[hashtable]]::new()) -TransportPolicy $largePolicy `
+    -SourceReader {
+        param([string]$Path, [string[]]$Kinds)
+        $script:largeOrdinaryReads++
+        [pscustomobject]@{
+            Rejected = "fileTooLarge"; MimeType = "text/plain"
+            ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($largeEditText)
+            Path = $Path; CommitSha = $recoveryBinding.SourceCommit; ChangeKinds = @($Kinds)
+        }
+    } -BaseReader { throw "ordinary authoritative spans must not enter recovery" }
+$largeOrdinaryFile = @($largeOrdinaryResult.Report.Files)[0]
+Assert-Source ($largeOrdinaryReads -eq 1 -and -not $largeOrdinaryResult.Gate.Ok -and
+    [string]$largeOrdinaryFile.Reason -ceq "fileTooLarge" -and @($largeOrdinaryFile.Slices).Count -eq 0 -and
+    $largeOrdinaryResult.BlockText -notmatch [regex]::Escape($largePrivateMarker)) `
+    "a 1.5-2 MiB ordinary changed file remains fileTooLarge and sends no content to the model"
+
+$largeDegenerate = New-FCPage -Changes @((New-DegenerateEdit -Path "/src/large-delete.cs"))
+$largeDeletionOrdinaryReads = 0
+$largeDeletionRecoveryReads = 0
+$largeDeletionBaseReads = 0
+$largeDeletionResult = Invoke-FCOrchestrator -Responses @($largeDegenerate, $largeDegenerate) `
+    -Calls ([System.Collections.Generic.List[hashtable]]::new()) -TransportPolicy $largePolicy `
+    -SourceReader {
+        param([string]$Path, [string[]]$Kinds)
+        $script:largeDeletionOrdinaryReads++
+        throw "a privately proven deletion-only source must not be read again for delivery"
+    } -BaseReader { throw "the ordinary base seam must not be used for recovery" } `
+    -RecoverySourceReader {
+        param([string]$Path, [string[]]$Kinds)
+        $script:largeDeletionRecoveryReads++
+        New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit `
+            -Text $largeDeletionText -ChangeKinds @($Kinds)
+    } -RecoveryBaseReader {
+        param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+        $script:largeDeletionBaseReads++
+        New-RecoveryResource -Path $Path -CommitSha $BaseCommit -Text $largeCommonText -ChangeKinds @($Kinds)
+    }
+$largeDeletionFile = @($largeDeletionResult.Report.Files)[0]
+Assert-Source ($largeDeletionResult.Gate.Ok -and
+    [string]$largeDeletionFile.Reason -ceq "authoritativeDeletionOnly" -and
+    [int]$largeDeletionResult.Report.SourceBearingFileCount -eq 0 -and
+    $largeDeletionOrdinaryReads -eq 0 -and $largeDeletionRecoveryReads -eq 1 -and $largeDeletionBaseReads -eq 1) `
+    "a large exact deletion-only edit is privately compared once per side and removed truthfully from the denominator"
+
+$largeEditPage = New-FCPage -Changes @((New-DegenerateEdit -Path "/src/large-edit.cs"))
+$largeEditOrdinaryReads = 0
+$largeEditRecoveryReads = 0
+$largeEditResult = Invoke-FCOrchestrator -Responses @($largeEditPage, $largeEditPage) `
+    -Calls ([System.Collections.Generic.List[hashtable]]::new()) -TransportPolicy $largePolicy `
+    -SourceReader {
+        param([string]$Path, [string[]]$Kinds)
+        $script:largeEditOrdinaryReads++
+        throw "the recovery cache must classify this ordinary read without fetching again"
+    } -BaseReader { throw "the ordinary base seam must not be used for recovery" } `
+    -RecoverySourceReader {
+        param([string]$Path, [string[]]$Kinds)
+        $script:largeEditRecoveryReads++
+        New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit `
+            -Text $largeEditText -ChangeKinds @($Kinds)
+    } -RecoveryBaseReader {
+        param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+        New-RecoveryResource -Path $Path -CommitSha $BaseCommit -Text $largeDeletionText -ChangeKinds @($Kinds)
+    }
+$largeEditFile = @($largeEditResult.Report.Files)[0]
+Assert-Source (-not $largeEditResult.Gate.Ok -and [string]$largeEditFile.SpanBasis -ceq "recovered" -and
+    [string]$largeEditFile.Reason -ceq "fileTooLarge" -and @($largeEditFile.RawSpans).Count -eq 0 -and
+    [int]$largeEditFile.RawRequestedSpanCount -eq 1 -and @($largeEditFile.Slices).Count -eq 0 -and
+    [int]$largeEditResult.Report.RecoveryRecoveredFileCount -eq 1 -and
+    $largeEditOrdinaryReads -eq 0 -and
+    $largeEditRecoveryReads -eq 1 -and $largeEditResult.BlockText -notmatch [regex]::Escape($largePrivateMarker)) `
+    "a large real edit is exactly recovered but ordinary delivery stays capped, refetch-free, and private"
+
+$largeDecodeOrdinaryReads = 0
+$largeDecodeResult = Invoke-FCOrchestrator -Responses @($largeEditPage, $largeEditPage) `
+    -Calls ([System.Collections.Generic.List[hashtable]]::new()) -TransportPolicy $largePolicy `
+    -SourceReader {
+        $script:largeDecodeOrdinaryReads++
+        throw "the private rejection must be sanitized without an ordinary refetch"
+    } -BaseReader { throw "the ordinary base seam must not be used for recovery" } `
+    -RecoverySourceReader {
+        param([string]$Path, [string[]]$Kinds)
+        [pscustomobject]@{
+            Rejected = "decodeRejected"; MimeType = "text/plain"
+            ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($largeEditText)
+            Text = $largePrivateMarker
+            Path = $Path; CommitSha = $recoveryBinding.SourceCommit; ChangeKinds = @($Kinds)
+        }
+    } -RecoveryBaseReader { throw "a rejected source must stop before the base read" }
+$largeDecodeFile = @($largeDecodeResult.Report.Files)[0]
+Assert-Source (-not $largeDecodeResult.Gate.Ok -and
+    [string]$largeDecodeFile.Reason -ceq "fileTooLarge" -and
+    [int]$largeDecodeFile.FileByteLength -gt [int]$largePolicy.maxFetchBytesPerFile -and
+    $largeDecodeOrdinaryReads -eq 0 -and
+    $largeDecodeResult.BlockText -notmatch [regex]::Escape($largePrivateMarker)) `
+    "a private oversized decode rejection is sanitized to ordinary fileTooLarge without text leakage or refetch"
+
+$overRecoveryPage = New-FCPage -Changes @((New-DegenerateEdit -Path "/src/over-recovery.cs"))
+$overRecoverySourceReads = 0
+$overRecoveryBaseReads = 0
+$overRecoveryResult = Invoke-FCOrchestrator -Responses @($overRecoveryPage, $overRecoveryPage) `
+    -Calls ([System.Collections.Generic.List[hashtable]]::new()) -TransportPolicy $largePolicy `
+    -SourceReader { throw "a hard recovery-cap failure must not retry through ordinary delivery" } `
+    -BaseReader { throw "the ordinary base seam must not be used for recovery" } `
+    -RecoverySourceReader {
+        param([string]$Path, [string[]]$Kinds)
+        $script:overRecoverySourceReads++
+        [pscustomobject]@{
+            Rejected = "fileTooLarge"; MimeType = "text/plain"
+            ByteLength = ($script:ReviewerSourceMaxRecoveryBytesPerSide + 1)
+            Path = $Path; CommitSha = $recoveryBinding.SourceCommit; ChangeKinds = @($Kinds)
+        }
+    } -RecoveryBaseReader {
+        $script:overRecoveryBaseReads++
+        throw "the source-side byte cap must fire before a base read"
+    }
+$overRecoveryFile = @($overRecoveryResult.Report.Files)[0]
+Assert-Source (-not $overRecoveryResult.Gate.Ok -and
+    [string]$overRecoveryFile.Reason -ceq "recoveryByteCapExceeded" -and
+    [int]$overRecoveryResult.Report.SourceBearingFileCount -eq 1 -and
+    [int]$overRecoveryFile.RawRequestedSpanCount -eq 1 -and @($overRecoveryFile.Slices).Count -eq 0 -and
+    $overRecoverySourceReads -eq 1 -and $overRecoveryBaseReads -eq 0) `
+    "a source above 2 MiB fails closed before base/Myers work and remains in both coverage floors"
+
+$largeMovedConfirm = New-FCPage -Changes @((New-DegenerateEdit -Path "/src/large-delete.cs")) -Overrides @{
+    commonRefCommit = [pscustomobject]@{ commitId = ("e" * 40) } }
+$largeMoveRecoveryReads = 0
+Assert-Source (Test-Throws {
+        Invoke-FCOrchestrator -Responses @($largeDegenerate, $largeMovedConfirm) `
+            -Calls ([System.Collections.Generic.List[hashtable]]::new()) -TransportPolicy $largePolicy `
+            -SourceReader { throw "deletion-only does not enter ordinary delivery" } `
+            -BaseReader { throw "ordinary base seam must not be used" } `
+            -RecoverySourceReader {
+                param([string]$Path, [string[]]$Kinds)
+                $script:largeMoveRecoveryReads++
+                New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit `
+                    -Text $largeDeletionText -ChangeKinds @($Kinds)
+            } -RecoveryBaseReader {
+                param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+                New-RecoveryResource -Path $Path -CommitSha $BaseCommit -Text $largeCommonText -ChangeKinds @($Kinds)
+            }
+    }) "identity movement after large private content reads fails closed"
+Assert-Source ($largeMoveRecoveryReads -eq 1) `
+    "the large movement fixture performed exactly one bounded source read before the final identity refusal"
+
+$largeChangedConfirm = New-FCPage -Changes @(
+    (New-DegenerateEdit -Path "/src/large-delete.cs"),
+    (New-FCOrdinaryChange -Path "/src/extra.cs" -Start 1 -Count 1)
+)
+Assert-Source (Test-Throws {
+        Invoke-FCOrchestrator -Responses @($largeDegenerate, $largeChangedConfirm) `
+            -Calls ([System.Collections.Generic.List[hashtable]]::new()) -TransportPolicy $largePolicy `
+            -SourceReader { throw "deletion-only does not enter ordinary delivery" } `
+            -BaseReader { throw "ordinary base seam must not be used" } `
+            -RecoverySourceReader {
+                param([string]$Path, [string[]]$Kinds)
+                New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit `
+                    -Text $largeDeletionText -ChangeKinds @($Kinds)
+            } -RecoveryBaseReader {
+                param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+                New-RecoveryResource -Path $Path -CommitSha $BaseCommit -Text $largeCommonText -ChangeKinds @($Kinds)
+            }
+    }) "change-list movement after large private content reads fails closed"
+
+$accountingChanges = @((New-FCOrdinaryChange -Path "/src/review.cs" -Start 2 -Count 1))
+foreach ($number in 1..7) { $accountingChanges += New-DegenerateEdit -Path "/src/delete$number.cs" }
+$accountingPage = New-FCPage -Changes $accountingChanges
+$accountingReads = @{ Ordinary = 0; Recovery = 0; Base = 0 }
+$accountingSourceReader = {
+    param([string]$Path, [string[]]$Kinds)
+    $accountingReads.Ordinary++
+    if ($Path -cne "/src/review.cs") { throw "proved deletion-only paths must not be reread for delivery" }
+    New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit -Text $sourceText -ChangeKinds @($Kinds)
+}.GetNewClosure()
+$accountingRecoveryReader = {
+    param([string]$Path, [string[]]$Kinds)
+    $accountingReads.Recovery++
+    $textForPath = if ($Path -ceq "/src/delete7.cs") { $largeDeletionText } else { $deletionSourceText }
+    New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit -Text $textForPath -ChangeKinds @($Kinds)
+}.GetNewClosure()
+$accountingBaseReader = {
+    param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+    $accountingReads.Base++
+    $textForPath = if ($Path -ceq "/src/delete7.cs") { $largeCommonText } else { $deletionBaseText }
+    New-RecoveryResource -Path $Path -CommitSha $BaseCommit -Text $textForPath -ChangeKinds @($Kinds)
+}.GetNewClosure()
+$accountingResult = Invoke-FCOrchestrator -Responses @($accountingPage, $accountingPage) `
+    -Calls ([System.Collections.Generic.List[hashtable]]::new()) -TransportPolicy $largePolicy `
+    -SourceReader $accountingSourceReader -BaseReader { throw "ordinary base seam must not be used" } `
+    -RecoverySourceReader $accountingRecoveryReader -RecoveryBaseReader $accountingBaseReader
+Assert-Source ($accountingResult.Gate.Ok -and [int]$accountingResult.Report.ChangedFileCount -eq 8 -and
+    [int]$accountingResult.Report.AuthoritativeDeletionOnlyFileCount -eq 7 -and
+    [int]$accountingResult.Report.SourceBearingFileCount -eq 1 -and
+    [int]$accountingResult.Report.DeliveredFiles -eq 1 -and
+    [int]$accountingResult.Report.CoveragePercent -eq 100 -and
+    $accountingReads.Ordinary -eq 1 -and $accountingReads.Recovery -eq 7 -and $accountingReads.Base -eq 7) `
+    "seven exact deletions, including one above 1 MiB, plus one delivered file yield denominator 1 and 100% coverage (gate=$($accountingResult.Gate.Ok), changed=$($accountingResult.Report.ChangedFileCount), deletions=$($accountingResult.Report.AuthoritativeDeletionOnlyFileCount), denominator=$($accountingResult.Report.SourceBearingFileCount), delivered=$($accountingResult.Report.DeliveredFiles), coverage=$($accountingResult.Report.CoveragePercent), ordinaryReads=$($accountingReads.Ordinary), recoveryReads=$($accountingReads.Recovery), baseReads=$($accountingReads.Base))"
+
+$unprovenAccountingRecoveryReader = {
+    param([string]$Path, [string[]]$Kinds)
+    if ($Path -ceq "/src/delete7.cs") {
+        return [pscustomobject]@{
+            Rejected = "fileTooLarge"; MimeType = "text/plain"
+            ByteLength = ($script:ReviewerSourceMaxRecoveryBytesPerSide + 1)
+            Path = $Path; CommitSha = $recoveryBinding.SourceCommit; ChangeKinds = @($Kinds)
+        }
+    }
+    New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit `
+        -Text $deletionSourceText -ChangeKinds @($Kinds)
+}.GetNewClosure()
+$unprovenAccountingResult = Invoke-FCOrchestrator -Responses @($accountingPage, $accountingPage) `
+    -Calls ([System.Collections.Generic.List[hashtable]]::new()) -TransportPolicy $largePolicy `
+    -SourceReader $accountingSourceReader -BaseReader { throw "ordinary base seam must not be used" } `
+    -RecoverySourceReader $unprovenAccountingRecoveryReader -RecoveryBaseReader $accountingBaseReader
+Assert-Source (-not $unprovenAccountingResult.Gate.Ok -and
+    [int]$unprovenAccountingResult.Report.AuthoritativeDeletionOnlyFileCount -eq 6 -and
+    [int]$unprovenAccountingResult.Report.SourceBearingFileCount -eq 2 -and
+    [int]$unprovenAccountingResult.Report.CoveragePercent -eq 50 -and
+    [string]@($unprovenAccountingResult.Report.Files | Where-Object {
+            $_.Path -ceq "/src/delete7.cs" })[0].Reason -ceq "recoveryByteCapExceeded") `
+    "one unproven over-cap file returns to the denominator and closes the eight-file gate"
 
 $fcCapSourceLines = [string[]](1..20 | ForEach-Object { "source-$($_)" })
 $fcCapBaseLines = [string[]](1..20 | ForEach-Object { "base-$($_)" })
@@ -4262,8 +4578,12 @@ $newContractText = Get-FunctionTextFromWrapper -Name 'Get-ReviewerSourceTranspor
 Assert-Source ($newContractText.Length -gt 0 -and
     $newContractText.IndexOf('Invoke-ReviewerSourceNewContractTransport', [StringComparison]::Ordinal) -ge 0 -and
     $newContractText.IndexOf('-ToolInvoker', [StringComparison]::Ordinal) -ge 0 -and
-    $newContractText.IndexOf('-BaseReader', [StringComparison]::Ordinal) -ge 0) `
-    "the wrapper is a thin adapter that hands the orchestrator its tool invoker and source/base readers"
+    $newContractText.IndexOf('-BaseReader', [StringComparison]::Ordinal) -ge 0 -and
+    $newContractText.IndexOf('-RecoveryReader', [StringComparison]::Ordinal) -ge 0 -and
+    $newContractText.IndexOf('-RecoveryBaseReader', [StringComparison]::Ordinal) -ge 0 -and
+    $newContractText.IndexOf('-MaxBytesPerFile $script:ReviewerSourceMaxRecoveryBytesPerSide',
+        [StringComparison]::Ordinal) -ge 0) `
+    "the wrapper hands the orchestrator ordinary readers plus private recovery readers at the exact hard byte cap"
 $azFallbackText = Get-FunctionTextFromWrapper -Name 'Get-ReviewerSourceTransportAzCliFallback'
 $capabilityIndex = $transportText.IndexOf('if ($null -ne $capability)', [StringComparison]::Ordinal)
 $fallbackIndex = $transportText.IndexOf('if ($CfgAzCliFallbackEnabled)', [StringComparison]::Ordinal)
@@ -4274,8 +4594,10 @@ Assert-Source ($azFallbackText.Length -gt 0 -and
     $azFallbackText.IndexOf('New-ReviewerSourceAzCliInvoker', [StringComparison]::Ordinal) -ge 0 -and
     $azFallbackText.IndexOf('Get-ReviewerSourceAzIdentityCapture', [StringComparison]::Ordinal) -ge 0 -and
     $azFallbackText.IndexOf('-IdentityReader', [StringComparison]::Ordinal) -ge 0 -and
+    $azFallbackText.IndexOf('-RecoveryReader', [StringComparison]::Ordinal) -ge 0 -and
+    $azFallbackText.IndexOf('-RecoveryBaseReader', [StringComparison]::Ordinal) -ge 0 -and
     $azFallbackText.IndexOf('Invoke-AgentMcpTool', [StringComparison]::Ordinal) -ge 0) `
-    "the production fallback binds CLI identity to the existing MCP aggregate/content seams without exposing CLI to a model"
+    "the production fallback binds CLI identity to ordinary/private MCP content seams without exposing CLI to a model"
 
 # The live flat implementation carries none of the obsolete FileDiff-contract
 # vocabulary. The check is case-sensitive so the capability's ChangeLimit/PageSize

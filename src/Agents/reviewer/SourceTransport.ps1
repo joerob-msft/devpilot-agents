@@ -932,6 +932,8 @@ function Invoke-ReviewerSourceNewContractTransport {
         [scriptblock]$IdentityReader,
         [Parameter(Mandatory)][scriptblock]$Reader,
         [Parameter(Mandatory)][scriptblock]$BaseReader,
+        [scriptblock]$RecoveryReader,
+        [scriptblock]$RecoveryBaseReader,
         [Parameter(Mandatory)][scriptblock]$AggregateReader,
         [Parameter(Mandatory)][AllowEmptyString()][string]$Organization,
         [Parameter(Mandatory)][string]$Project,
@@ -988,22 +990,77 @@ function Invoke-ReviewerSourceNewContractTransport {
         SourceCommit = $SourceCommit; TargetCommit = [string]$binding.TargetRefCommit
         BaseCommit = [string]$binding.CommonRefCommit
     }
+    if ($null -eq $RecoveryReader) { $RecoveryReader = $Reader }
+    if ($null -eq $RecoveryBaseReader) { $RecoveryBaseReader = $BaseReader }
     $cache = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
+    $recoverySourceCache = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
+    $recoverySourceAttempted = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $recoverySourceReader = {
+        param([string]$Path, [string[]]$Kinds)
+        if ($recoverySourceAttempted.Contains($Path)) { return $recoverySourceCache[$Path] }
+        [void]$recoverySourceAttempted.Add($Path)
+        $actualKinds = if ($kindsByPath.Contains($Path)) { @($kindsByPath[$Path]) } else { @($Kinds) }
+        $resource = $null
+        try {
+            $resource = Add-ReviewerSourceResourceBinding -Resource (
+                & $RecoveryReader $Path $actualKinds) -Binding $recoveryBinding
+        }
+        catch {
+            if ($_.Exception.Message -match 'session is closed|closed stdout|exited before returning|timed out') { throw }
+            $resource = $null
+        }
+        $recoverySourceCache[$Path] = $resource
+        return $resource
+    }.GetNewClosure()
     $sourceReader = {
         param([string]$Path, [string[]]$Kinds)
         if ($cache.Contains($Path)) { return $cache[$Path] }
         $actualKinds = if ($kindsByPath.Contains($Path)) { @($kindsByPath[$Path]) } else { @($Kinds) }
-        $resource = Add-ReviewerSourceResourceBinding -Resource (& $Reader $Path $actualKinds) -Binding $recoveryBinding
+        $resource = $null
+        if ($recoverySourceAttempted.Contains($Path)) {
+            $recoveryResource = $recoverySourceCache[$Path]
+            if ($null -eq $recoveryResource) {
+                $cache[$Path] = $null
+                return $null
+            }
+            $rejected = [string](Get-ReviewerSourceValue -Object $recoveryResource -Name "Rejected" -Default "")
+            $byteLength = [int](Get-ReviewerSourceValue -Object $recoveryResource -Name "ByteLength" -Default -1)
+            if ($byteLength -gt [int]$Policy.maxFetchBytesPerFile) {
+                # Recovery may privately inspect more bytes than ordinary
+                # delivery. Do not let that wider object or its private decode
+                # classification reach slicing or the sealed block; retain only
+                # the ordinary oversize census.
+                $resource = Add-ReviewerSourceResourceBinding -Resource ([pscustomobject]@{
+                        Rejected = "fileTooLarge"
+                        MimeType = [string](Get-ReviewerSourceValue -Object $recoveryResource -Name "MimeType" -Default "")
+                        ByteLength = $byteLength
+                        Path = $Path
+                        CommitSha = $SourceCommit
+                        ChangeKinds = [string[]]@($actualKinds)
+                    }) -Binding $recoveryBinding
+            }
+            elseif ($rejected -and $rejected -cne "fileTooLarge") {
+                $resource = $recoveryResource
+            }
+            elseif (-not $rejected -and $byteLength -ge 0) {
+                $resource = $recoveryResource
+            }
+        }
+        if ($null -eq $resource) {
+            $resource = Add-ReviewerSourceResourceBinding -Resource (
+                & $Reader $Path $actualKinds) -Binding $recoveryBinding
+        }
         $cache[$Path] = $resource
         return $resource
     }.GetNewClosure()
     $baseReader = {
         param([string]$Path, [string[]]$Kinds)
         return Add-ReviewerSourceResourceBinding -Resource (
-            & $BaseReader $Path $Kinds ([string]$recoveryBinding.BaseCommit)) -Binding $recoveryBinding
+            & $RecoveryBaseReader $Path $Kinds ([string]$recoveryBinding.BaseCommit)) -Binding $recoveryBinding
     }.GetNewClosure()
     $recovery = Get-ReviewerSourceRecoveredSpans -Response $aggregateResponse -SpansByPath $spans `
-        -Binding $recoveryBinding -SourceReader $sourceReader -BaseReader $baseReader
+        -Binding $recoveryBinding -SourceReader $recoverySourceReader -BaseReader $baseReader `
+        -MaxCensusBytes ([int]$Policy.maxFetchBytesPerFile)
     $report = New-ReviewerSourceTransportReport -CommitSha $SourceCommit -ChangedPaths $paths `
         -SpansByPath $recovery.SpansByPath -Policy $Policy -Reader $sourceReader `
         -ChangeKindsByPath $kindsByPath -SpanBasisByPath $recovery.SpanBasisByPath `
@@ -1831,7 +1888,8 @@ function Get-ReviewerSourceDegenerateChanges {
                 [Parameter(Mandatory)]$Binding,
                 [Parameter(Mandatory)][scriptblock]$SourceReader,
                 [Parameter(Mandatory)][scriptblock]$BaseReader,
-                [ValidateRange(1, 256)][int]$MaxRecoveryFiles = $script:ReviewerSourceMaxRecoveryFiles
+                [ValidateRange(1, 256)][int]$MaxRecoveryFiles = $script:ReviewerSourceMaxRecoveryFiles,
+                [ValidateRange(1, [int]::MaxValue)][int]$MaxCensusBytes = [int]::MaxValue
             )
             $result = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
             foreach ($path in @($SpansByPath.Keys)) { $result[$path] = @($SpansByPath[$path]) }
@@ -1871,6 +1929,7 @@ function Get-ReviewerSourceDegenerateChanges {
                 if ($result.Contains($path) -and @($result[$path]).Count -gt 0) { continue }
                 $attempted++
                 $kinds = [string[]]@($candidates[$path].ChangeKinds)
+                $expectedSpanCountByPath[$path] = [int]$candidates[$path].EvidenceBlockCount
                 $source = $null
                 try { $source = & $SourceReader $path $kinds }
                 catch {
@@ -1879,7 +1938,20 @@ function Get-ReviewerSourceDegenerateChanges {
                 }
                 if ($null -eq $source) { continue }
                 $sourceRejected = [string](Get-ReviewerSourceValue -Object $source -Name "Rejected" -Default "")
-                if ($sourceRejected -and $sourceRejected -cne "emptyFile") { continue }
+                if ($sourceRejected -and $sourceRejected -cne "emptyFile") {
+                    $sourceBytes = [int](Get-ReviewerSourceValue -Object $source -Name "ByteLength" -Default 0)
+                    if ($sourceRejected -ceq "fileTooLarge" -and
+                        $sourceBytes -gt $script:ReviewerSourceMaxRecoveryBytesPerSide) {
+                        $recoveryFailureByPath[$path] = [pscustomobject]@{
+                            Reason = "recoveryByteCapExceeded"
+                            FileByteLength = $sourceBytes
+                            FileSha256 = ""
+                            MimeType = [string](Get-ReviewerSourceValue -Object $source -Name "MimeType" -Default "")
+                            LineCount = 0
+                        }
+                    }
+                    continue
+                }
                 if ($sourceRejected -ceq "emptyFile" -and
                     ([int](Get-ReviewerSourceValue -Object $source -Name "ByteLength" -Default -1) -ne 0 -or
                         [string](Get-ReviewerSourceValue -Object $source -Name "Text" -Default "") -cne "")) { continue }
@@ -1892,22 +1964,49 @@ function Get-ReviewerSourceDegenerateChanges {
                     if ($_.Exception.Message -match 'session is closed|closed stdout|exited before returning|timed out') { throw }
                     continue
                 }
-                if ($null -eq $base -or [string](Get-ReviewerSourceValue -Object $base -Name "Rejected" -Default "")) { continue }
+                if ($null -eq $base) { continue }
+                $baseRejected = [string](Get-ReviewerSourceValue -Object $base -Name "Rejected" -Default "")
+                if ($baseRejected) {
+                    $baseBytes = [int](Get-ReviewerSourceValue -Object $base -Name "ByteLength" -Default 0)
+                    if ($baseRejected -ceq "fileTooLarge" -and
+                        $baseBytes -gt $script:ReviewerSourceMaxRecoveryBytesPerSide) {
+                        $sourceText = [string](Get-ReviewerSourceValue -Object $source -Name "Text" -Default "")
+                        $sourceBytes = [int](Get-ReviewerSourceValue -Object $source -Name "ByteLength" -Default 0)
+                        $includeWholeFileCensus = ($sourceBytes -le $MaxCensusBytes)
+                        $recoveryFailureByPath[$path] = [pscustomobject]@{
+                            Reason = "recoveryByteCapExceeded"
+                            FileByteLength = $sourceBytes
+                            FileSha256 = $(if ($includeWholeFileCensus) {
+                                    [string](Get-ReviewerSourceValue -Object $source -Name "Sha256" -Default "")
+                                } else { "" })
+                            MimeType = [string](Get-ReviewerSourceValue -Object $source -Name "MimeType" -Default "")
+                            LineCount = $(if ($includeWholeFileCensus) {
+                                    Measure-ReviewerSourceLineCount -Text $sourceText
+                                } else { 0 })
+                        }
+                    }
+                    continue
+                }
                 if (-not (Test-ReviewerSourceRecoveryResourceBinding -Resource $base -Binding $Binding -Path $path `
                             -CommitSha ([string](Get-ReviewerSourceValue -Object $Binding -Name "BaseCommit" -Default "")) `
                             -ChangeKinds $kinds)) { continue }
-                $expectedSpanCountByPath[$path] = [int]$candidates[$path].EvidenceBlockCount
                 $diffResult = Get-ReviewerSourceDeterministicDiffResult `
                     -TargetText ([string](Get-ReviewerSourceValue -Object $base -Name "Text" -Default "")) `
                     -SourceText ([string](Get-ReviewerSourceValue -Object $source -Name "Text" -Default ""))
                 if (-not [bool]$diffResult.Success) {
                     $sourceText = [string](Get-ReviewerSourceValue -Object $source -Name "Text" -Default "")
+                    $sourceBytes = [int](Get-ReviewerSourceValue -Object $source -Name "ByteLength" -Default 0)
+                    $includeWholeFileCensus = ($sourceBytes -le $MaxCensusBytes)
                     $recoveryFailureByPath[$path] = [pscustomobject]@{
                         Reason = [string]$diffResult.FailureReason
-                        FileByteLength = [int](Get-ReviewerSourceValue -Object $source -Name "ByteLength" -Default 0)
-                        FileSha256 = [string](Get-ReviewerSourceValue -Object $source -Name "Sha256" -Default "")
+                        FileByteLength = $sourceBytes
+                        FileSha256 = $(if ($includeWholeFileCensus) {
+                                [string](Get-ReviewerSourceValue -Object $source -Name "Sha256" -Default "")
+                            } else { "" })
                         MimeType = [string](Get-ReviewerSourceValue -Object $source -Name "MimeType" -Default "")
-                        LineCount = Measure-ReviewerSourceLineCount -Text $sourceText
+                        LineCount = $(if ($includeWholeFileCensus) {
+                                Measure-ReviewerSourceLineCount -Text $sourceText
+                            } else { 0 })
                     }
                     continue
                 }
@@ -2327,8 +2426,14 @@ function Get-ReviewerSourceReaderResult {
         [Parameter(Mandatory)]$ToolResult,
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][hashtable]$Policy,
+        [ValidateRange(0, [int]::MaxValue)][int]$MaxBytesPerFile = 0,
         [Parameter(Mandatory)][scriptblock]$Decoder
     )
+    $effectiveMaxBytes = if ($MaxBytesPerFile -gt 0) {
+        $MaxBytesPerFile
+    } else {
+        [int]$Policy.maxFetchBytesPerFile
+    }
     $peek = $null
     try {
         if ($ToolResult -is [System.Management.Automation.PSCustomObject] -or $ToolResult -is [System.Collections.IDictionary]) {
@@ -2390,7 +2495,7 @@ function Get-ReviewerSourceReaderResult {
         # the problem. It stays in the coverage denominator either way.
         return [pscustomobject]@{ Rejected = "decodeRejected"; MimeType = [string]$peek.MimeType; ByteLength = 0 }
     }
-    if ([int]$peek.ByteLength -gt [int]$Policy.maxFetchBytesPerFile) {
+    if ([int]$peek.ByteLength -gt $effectiveMaxBytes) {
         return [pscustomobject]@{ Rejected = "fileTooLarge"; MimeType = [string]$peek.MimeType; ByteLength = [int]$peek.ByteLength }
     }
     try { $decoded = & $Decoder $ToolResult $Path }

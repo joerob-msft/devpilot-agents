@@ -2053,10 +2053,10 @@ $script:ReviewerAuthoritativeMaxTotalBytes = 262144
 # to a few. Without this split, naming a section in a large document still
 # failed the read, which is exactly how large rule documents ended up never
 # reaching the reviewer at all.
-# The decoder's own hard ceiling. The source transport reads up to this and
-# then applies its policy's per-file bound itself, so an oversized file is
-# accounted `fileTooLarge` - which is what the docs promise and what tells an
-# operator to raise the cap - instead of surfacing as an opaque decode failure.
+# The decoder's absolute hard ceiling. Each source read supplies a tighter
+# purpose-specific limit: ordinary delivery uses policy, while exact recovery
+# may use only its 2 MiB per-side algorithm cap. Structural sizing classifies an
+# oversized response before this decoder allocates it.
 $script:ReviewerSourceDecoderCeilingBytes = 5242880
 $script:ReviewerAuthoritativeMaxDocumentBytes = 524288
 $script:ReviewerMaxModelInputBytes = 393216
@@ -7857,8 +7857,17 @@ function Get-ReviewerBoundSourceContent {
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][string]$CommitSha,
         [Parameter(Mandatory)][string[]]$ChangeKinds,
+        [ValidateRange(0, [int]::MaxValue)][int]$MaxBytesPerFile = 0,
         $Binding = $null
     )
+    $effectiveMaxBytes = if ($MaxBytesPerFile -gt 0) {
+        $MaxBytesPerFile
+    } else {
+        [int]$SourceTransportPolicy.maxFetchBytesPerFile
+    }
+    if ($effectiveMaxBytes -gt $script:ReviewerSourceDecoderCeilingBytes) {
+        throw "The source-content read ceiling exceeds the decoder's hard byte ceiling."
+    }
     $toolResult = Send-AgentMcpRequest -Session $Session -Method "tools/call" -Params @{
         name = "repo_file"
         arguments = @{
@@ -7870,10 +7879,11 @@ function Get-ReviewerBoundSourceContent {
             version = $CommitSha
         }
     }
-    $classified = Get-ReviewerSourceReaderResult -ToolResult $toolResult -Path $Path -Policy $SourceTransportPolicy -Decoder {
+    $classified = Get-ReviewerSourceReaderResult -ToolResult $toolResult -Path $Path `
+        -Policy $SourceTransportPolicy -MaxBytesPerFile $effectiveMaxBytes -Decoder {
         param($InnerToolResult, [string]$InnerPath)
         ConvertFrom-AgentMcpResourceContent -ToolResult $InnerToolResult -ExpectedUri $InnerPath `
-            -MaxBytes $script:ReviewerSourceDecoderCeilingBytes `
+            -MaxBytes $effectiveMaxBytes `
             -AllowedMimeTypes @($SourceTransportPolicy.allowedMimeTypes)
     }
     if ($null -eq $classified) { return $null }
@@ -8128,8 +8138,19 @@ function Get-ReviewerSourceTransportNewContract {
         param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
         return Get-ReviewerBoundSourceContent -Session $Session -Path $Path -CommitSha $BaseCommit -ChangeKinds @($Kinds)
     }.GetNewClosure()
+    $recoverySourceReader = {
+        param([string]$Path, [string[]]$Kinds)
+        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path -CommitSha $SourceCommit `
+            -ChangeKinds @($Kinds) -MaxBytesPerFile $script:ReviewerSourceMaxRecoveryBytesPerSide
+    }.GetNewClosure()
+    $recoveryBaseReader = {
+        param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path -CommitSha $BaseCommit `
+            -ChangeKinds @($Kinds) -MaxBytesPerFile $script:ReviewerSourceMaxRecoveryBytesPerSide
+    }.GetNewClosure()
     return Invoke-ReviewerSourceNewContractTransport -ToolInvoker $toolInvoker -Reader $sourceReader `
-        -BaseReader $baseReader -Organization $Organization -Project $ExpectedProject -RepositoryId $cfgRepoId `
+        -BaseReader $baseReader -RecoveryReader $recoverySourceReader -RecoveryBaseReader $recoveryBaseReader `
+        -Organization $Organization -Project $ExpectedProject -RepositoryId $cfgRepoId `
         -PrId $PrId -SourceCommit $SourceCommit -Capability $Capability -Policy $SourceTransportPolicy `
         -PolicySha256 $SourceTransportPolicySha256 -NonceFactory { New-AgentNonce } `
         -AggregateReader $aggregateReader
@@ -8168,8 +8189,21 @@ function Get-ReviewerSourceTransportAzCliFallback {
         return Get-ReviewerBoundSourceContent -Session $Session -Path $Path `
             -CommitSha $BaseCommit -ChangeKinds @($Kinds)
     }.GetNewClosure()
+    $recoverySourceReader = {
+        param([string]$Path, [string[]]$Kinds)
+        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path `
+            -CommitSha $SourceCommit -ChangeKinds @($Kinds) `
+            -MaxBytesPerFile $script:ReviewerSourceMaxRecoveryBytesPerSide
+    }.GetNewClosure()
+    $recoveryBaseReader = {
+        param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path `
+            -CommitSha $BaseCommit -ChangeKinds @($Kinds) `
+            -MaxBytesPerFile $script:ReviewerSourceMaxRecoveryBytesPerSide
+    }.GetNewClosure()
     return Invoke-ReviewerSourceNewContractTransport -IdentityReader $identityReader `
-        -Reader $sourceReader -BaseReader $baseReader -AggregateReader $aggregateReader `
+        -Reader $sourceReader -BaseReader $baseReader -RecoveryReader $recoverySourceReader `
+        -RecoveryBaseReader $recoveryBaseReader -AggregateReader $aggregateReader `
         -Organization $Organization -Project $ExpectedProject -RepositoryId $cfgRepoId `
         -PrId $PrId -SourceCommit $SourceCommit -Policy $SourceTransportPolicy `
         -PolicySha256 $SourceTransportPolicySha256 -NonceFactory { New-AgentNonce }
