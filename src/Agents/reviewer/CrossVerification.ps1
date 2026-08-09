@@ -343,11 +343,12 @@ function ConvertTo-ReviewerVerificationNormalizedText {
 
 function ConvertTo-ReviewerVerificationPath {
     param([AllowEmptyString()][string]$Path = "")
-    $value = $Path.Trim().Replace('\', '/')
-    if (-not $value) { return "" }
-    if ($value.StartsWith("./", [StringComparison]::Ordinal)) {
-        $value = $value.Substring(2)
+    if (Get-Command ConvertTo-ReviewerConventionSpecialistCanonicalPath -ErrorAction SilentlyContinue) {
+        return ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path $Path
     }
+    $value = $Path.Trim().Replace('\', '/').Normalize([Text.NormalizationForm]::FormKC)
+    if (-not $value) { return "" }
+    if ($value.StartsWith("./", [StringComparison]::Ordinal)) { $value = $value.Substring(2) }
     if (-not $value.StartsWith("/", [StringComparison]::Ordinal)) { $value = "/$value" }
     return $value.TrimEnd('/').ToLowerInvariant()
 }

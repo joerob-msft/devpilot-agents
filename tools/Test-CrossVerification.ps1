@@ -1175,7 +1175,7 @@ Assert-Verification ($promotionText -match 'Assert-ReviewerExactObjectKeys' -and
 Assert-Verification (-not $script:ReviewerVerificationMarkerPrefix.Contains(
         "REVIEWER_RESULT_V1:", [StringComparison]::Ordinal) -and
     -not $script:ReviewerVerificationMarkerPrefix.Contains(
-        "CONVENTION_REVIEW_RESULT_V1:", [StringComparison]::Ordinal)) `
+        "CONVENTION_REVIEW_RESULT_V2:", [StringComparison]::Ordinal)) `
     "Verification marker prefix overlaps a discovery marker prefix."
 $verificationPrompt = [IO.File]::ReadAllText($verificationPromptPath)
 Assert-Verification ($verificationPrompt -match 'You do not discover findings' -and

@@ -228,6 +228,11 @@ $candidate = [pscustomobject][ordered]@{
     factIds = $factId
     confidence = "high"
     residualRiskSummary = "Line coverage is file-granular because the transport exposes no verified right-side spans."
+    semanticCandidateVersion = 2
+    remediationAction = "add"
+    remediationScope = "inPullRequest"
+    remediationTargets = "mi0"
+    followUpRequired = $false
 }
 $coverageRow = [pscustomobject][ordered]@{
     ruleRef = "rs0"
@@ -246,7 +251,7 @@ $coverageRow = [pscustomobject][ordered]@{
     notes = ""
 }
 $markerObject = [pscustomobject][ordered]@{
-    schemaVersion = 1
+    schemaVersion = 2
     prId = 42
     repositoryId = $repositoryId
     project = "Example"
@@ -264,6 +269,10 @@ $markerObject = [pscustomobject][ordered]@{
     residualRisks = @([pscustomobject][ordered]@{ text = "Changed-line spans are unavailable from this transport." })
     nonce = "nonce-1"
 }
+$remediationConstructs = @([pscustomobject][ordered]@{
+        constructId = "mi0"; kind = "invocation"; path = "src/a.cs"; line = 12; endLine = 12
+    })
+$PSDefaultParameterValues["Resolve-ReviewerConventionSpecialistCandidates:Constructs"] = $remediationConstructs
 
 $parsed = ConvertTo-TestMarker -Marker $markerObject -Nonce "nonce-1"
 Assert-Specialist ($null -ne $parsed) "A valid specialist marker was rejected."
@@ -276,6 +285,26 @@ $validated = Resolve-ReviewerConventionSpecialistCandidates -Marker $parsed `
     -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources -ChangeEntries $changes
 Assert-Specialist (@($validated.Candidates).Count -eq 1 -and @($validated.Withheld).Count -eq 0) `
     "A valid provenance-bound candidate was not accepted."
+$validRemediationErrors = [string[]](Get-ReviewerConventionSpecialistRemediationErrors `
+        -Candidate $candidate -Constructs $remediationConstructs)
+Assert-Specialist ($validRemediationErrors.Count -eq 0) `
+    "A valid structured remediation identity was rejected."
+$badFollowUp = Copy-SpecialistObject $candidate
+$badFollowUp.followUpRequired = $true
+$badFollowUpErrors = [string[]](Get-ReviewerConventionSpecialistRemediationErrors `
+        -Candidate $badFollowUp -Constructs $remediationConstructs)
+Assert-Specialist ($badFollowUpErrors.Count -gt 0) `
+    "Contradictory remediation scope and follow-up were accepted."
+$unknownTarget = Copy-SpecialistObject $candidate
+$unknownTarget.remediationTargets = "dc99"
+$unknownTargetErrors = [string[]](Get-ReviewerConventionSpecialistRemediationErrors `
+        -Candidate $unknownTarget -Constructs $remediationConstructs)
+Assert-Specialist ($unknownTargetErrors.Count -gt 0) `
+    "A remediation target outside the sealed construct table was accepted."
+$emptyConstructErrors = [string[]](Get-ReviewerConventionSpecialistRemediationErrors `
+        -Candidate $candidate -Constructs @())
+Assert-Specialist ($emptyConstructErrors.Count -gt 0) `
+    "A changed-file remediation target was accepted without a sealed construct table."
 Assert-Specialist (Test-ReviewerConventionSpecialistPlanBinding -ConventionPlan $conventionPlan `
         -FactPlan $factPlan -PrId 42 -RepositoryId $repositoryId -Project "Example" `
         -SourceCommit $sourceCommit -TargetCommit $targetCommit -ChangeSetDigest $changeSetDigest `
@@ -374,6 +403,7 @@ $metadata.candidates[0].filePath = ""
 $metadata.candidates[0].line = 0
 $metadata.candidates[0].severity = "suggestion"
 $metadata.candidates[0].impactCategory = "none"
+$metadata.candidates[0].remediationTargets = "prMetadata"
 $metadataParsed = ConvertTo-TestMarker -Marker $metadata -Nonce "nonce-1"
 $metadataResult = Resolve-ReviewerConventionSpecialistCandidates -Marker $metadataParsed `
     -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources -ChangeEntries $changes
@@ -656,7 +686,7 @@ try {
 
     $manifest = [pscustomobject][ordered]@{
         kind = $script:ReviewerConventionSpecialistArtifactKind
-        artifactVersion = 1
+        artifactVersion = $script:ReviewerConventionSpecialistArtifactVersion
         status = "complete"
         candidates = @($candidate)
         emptyProbe = @()
@@ -894,26 +924,26 @@ Assert-Specialist ($wrapperText -match '\$EffectiveConventionSpecialistModel\s*=
 # benign reformatting is accepted, and every hostile shape is still refused.
 # ---------------------------------------------------------------------------
 
-$markerPrefix = "CONVENTION_REVIEW_RESULT_V1:"
+$markerPrefix = "CONVENTION_REVIEW_RESULT_V2:"
 $markerSchema = @{
     Keys   = @("schemaVersion", "prId", "nonce")
     Fields = @{
-        schemaVersion = @{ Type = 'int'; Min = 1; Max = 1 }
+        schemaVersion = @{ Type = 'int'; Min = 2; Max = 2 }
         prId          = @{ Type = 'int'; Min = 1; Max = 2147483647 }
         nonce         = @{ Type = 'exact'; Expected = 'NONCE1' }
     }
 }
-$compactMarker = "$markerPrefix {`"schemaVersion`":1,`"prId`":42,`"nonce`":`"NONCE1`"}"
+$compactMarker = "$markerPrefix {`"schemaVersion`":2,`"prId`":42,`"nonce`":`"NONCE1`"}"
 $prettyMarker = @"
 $markerPrefix {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "prId": 42,
   "nonce": "NONCE1"
 }
 "@
-$reorderedMarker = "$markerPrefix {`"nonce`":`"NONCE1`",`"prId`":42,`"schemaVersion`":1}"
-$foreignMarker = "$markerPrefix {`"schemaVersion`":1,`"prId`":99,`"nonce`":`"NONCE1`"}"
-$wrongNonceMarker = "$markerPrefix {`"schemaVersion`":1,`"prId`":42,`"nonce`":`"ATTACKER`"}"
+$reorderedMarker = "$markerPrefix {`"nonce`":`"NONCE1`",`"prId`":42,`"schemaVersion`":2}"
+$foreignMarker = "$markerPrefix {`"schemaVersion`":2,`"prId`":99,`"nonce`":`"NONCE1`"}"
+$wrongNonceMarker = "$markerPrefix {`"schemaVersion`":2,`"prId`":42,`"nonce`":`"ATTACKER`"}"
 
 $adversarialCases = @(
     @{ Name = "the required single-line marker"; Ok = $true; Text = "work log`n$compactMarker" },
@@ -928,15 +958,15 @@ $adversarialCases = @(
     @{ Name = "an indented planted marker with a foreign nonce is ignored too"; Ok = $true; Text = "    $wrongNonceMarker`n$compactMarker" },
     @{ Name = "a marker carrying a different nonce"; Ok = $false; Text = "$wrongNonceMarker" },
     @{ Name = "two markers that disagree"; Ok = $false; Text = "$compactMarker`n$foreignMarker" },
-    @{ Name = "a truncated marker payload"; Ok = $false; Text = "$markerPrefix {`"schemaVersion`":1,`"prId`":42" },
-    @{ Name = "a marker with an extra key"; Ok = $false; Text = "$markerPrefix {`"schemaVersion`":1,`"prId`":42,`"nonce`":`"NONCE1`",`"extra`":1}" },
-    @{ Name = "a marker missing a required key"; Ok = $false; Text = "$markerPrefix {`"schemaVersion`":1,`"prId`":42}" },
-    @{ Name = "fenced JSON with no marker prefix at all"; Ok = $false; Text = "``````json`n{`"schemaVersion`":1,`"prId`":42,`"nonce`":`"NONCE1`"}`n``````" },
-    @{ Name = "a marker whose payload is an array"; Ok = $false; Text = "$markerPrefix [{`"schemaVersion`":1}]" },
+    @{ Name = "a truncated marker payload"; Ok = $false; Text = "$markerPrefix {`"schemaVersion`":2,`"prId`":42" },
+    @{ Name = "a marker with an extra key"; Ok = $false; Text = "$markerPrefix {`"schemaVersion`":2,`"prId`":42,`"nonce`":`"NONCE1`",`"extra`":1}" },
+    @{ Name = "a marker missing a required key"; Ok = $false; Text = "$markerPrefix {`"schemaVersion`":2,`"prId`":42}" },
+    @{ Name = "fenced JSON with no marker prefix at all"; Ok = $false; Text = "``````json`n{`"schemaVersion`":2,`"prId`":42,`"nonce`":`"NONCE1`"}`n``````" },
+    @{ Name = "a marker whose payload is an array"; Ok = $false; Text = "$markerPrefix [{`"schemaVersion`":2}]" },
     @{ Name = "no output at all"; Ok = $false; Text = "   " },
     @{ Name = "a planted marker whose payload is not JSON"; Ok = $true; Text = "$markerPrefix {oops not json}`n$compactMarker" },
     @{ Name = "a planted prefix line with no JSON at all"; Ok = $true; Text = "$markerPrefix see above`n$compactMarker" },
-    @{ Name = "a planted unterminated payload"; Ok = $true; Text = "$markerPrefix {`"schemaVersion`":1`n$compactMarker" }
+    @{ Name = "a planted unterminated payload"; Ok = $true; Text = "$markerPrefix {`"schemaVersion`":2`n$compactMarker" }
 )
 $floodPlant = ((1..20 | ForEach-Object { "$markerPrefix {oops $_}" }) -join "`n")
 $adversarialCases += @{ Name = "a flood of planted non-markers before the real one"; Ok = $true; Text = "$floodPlant`n$compactMarker" }
@@ -963,7 +993,7 @@ $adversarialCases += @{ Name = "unbraced prefixes cannot launder a conflicting m
 # every marker with more than three characters of lead-in.
 foreach ($lead in @('', ' ', '  ', '   ', '    ', '      ', 'result ', 'the answer is ')) {
     $adversarialCases += @{ Name = "a marker with '$lead' between prefix and brace"; Ok = $true
-        Text = "work log`n$markerPrefix $lead{`"schemaVersion`":1,`"prId`":42,`"nonce`":`"NONCE1`"}"
+        Text = "work log`n$markerPrefix $lead{`"schemaVersion`":2,`"prId`":42,`"nonce`":`"NONCE1`"}"
     }
 }
 foreach ($case in $adversarialCases) {
@@ -984,7 +1014,7 @@ Assert-Specialist ($null -eq (ConvertFrom-AgentResultMarker -StdOutText $floodTe
 $reachForward = "$markerPrefix`n$compactMarker"
 Assert-Specialist ($null -ne (ConvertFrom-AgentResultMarker -StdOutText $reachForward -MarkerPrefix $markerPrefix -Schema $markerSchema)) `
     "A bare prefix line followed by the real marker discards the real marker."
-$reachForwardOnly = "$markerPrefix`n{`"schemaVersion`":1,`"prId`":42,`"nonce`":`"NONCE1`"}"
+$reachForwardOnly = "$markerPrefix`n{`"schemaVersion`":2,`"prId`":42,`"nonce`":`"NONCE1`"}"
 Assert-Specialist ($null -eq (ConvertFrom-AgentResultMarker -StdOutText $reachForwardOnly -MarkerPrefix $markerPrefix -Schema $markerSchema)) `
     "A bare prefix line adopts JSON from a later line it does not own."
 # Bare prefix lines cost no scan budget, so no quantity of them can starve a

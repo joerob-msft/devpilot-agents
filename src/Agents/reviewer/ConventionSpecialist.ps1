@@ -2,9 +2,9 @@
 
 Set-StrictMode -Version Latest
 
-$script:ReviewerConventionSpecialistMarkerPrefix = "CONVENTION_REVIEW_RESULT_V1:"
+$script:ReviewerConventionSpecialistMarkerPrefix = "CONVENTION_REVIEW_RESULT_V2:"
 $script:ReviewerConventionSpecialistArtifactKind = "convention-specialist-preview"
-$script:ReviewerConventionSpecialistArtifactVersion = 1
+$script:ReviewerConventionSpecialistArtifactVersion = 2
 $script:ReviewerConventionSpecialistMaxCandidates = 8
 # The accounting shares the result marker's brace-scan window with the
 # candidate array, so it is bounded on BOTH axes: at most this many rows, each
@@ -15,6 +15,55 @@ $script:ReviewerConventionSpecialistMaxRuleCoverage = 10
 $script:ReviewerConventionSpecialistMaxCoverageAnchors = 200
 $script:ReviewerConventionSpecialistMaxInputBytes = 327680
 $script:ReviewerConventionSpecialistUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+
+function ConvertTo-ReviewerConventionSpecialistCanonicalPath {
+    param([AllowEmptyString()][string]$Path = "")
+    $value = $Path.Trim().Replace('\', '/').Normalize([Text.NormalizationForm]::FormKC)
+    if (-not $value) { return "" }
+    if ($value.StartsWith("./", [StringComparison]::Ordinal)) { $value = $value.Substring(2) }
+    if (-not $value.StartsWith("/", [StringComparison]::Ordinal)) { $value = "/$value" }
+    return $value.TrimEnd('/').ToLowerInvariant()
+}
+
+function Get-ReviewerConventionSpecialistRemediationErrors {
+    param(
+        [Parameter(Mandatory)]$Candidate,
+        [AllowEmptyCollection()][object[]]$Constructs = @()
+    )
+    $errors = [System.Collections.Generic.List[string]]::new()
+    $action = [string](Get-ReviewerConventionSpecialistValue $Candidate "remediationAction" "")
+    $scope = [string](Get-ReviewerConventionSpecialistValue $Candidate "remediationScope" "")
+    $followUp = Get-ReviewerConventionSpecialistValue $Candidate "followUpRequired" $null
+    if (@("add", "modify", "remove", "rename", "replace", "validate") -cnotcontains $action -or
+        @("inPullRequest", "followUp") -cnotcontains $scope -or $followUp -isnot [bool] -or
+        ($scope -ceq "inPullRequest" -and [bool]$followUp) -or
+        ($scope -ceq "followUp" -and -not [bool]$followUp)) {
+        [void]$errors.Add("structured remediation scope and follow-up are incomplete or contradictory")
+    }
+    $targets = @(([string](Get-ReviewerConventionSpecialistValue `
+                $Candidate "remediationTargets" "") -split ',') |
+        ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $anchorKind = [string](Get-ReviewerConventionSpecialistValue $Candidate "anchorKind" "")
+    if ($anchorKind -ceq "prMetadata") {
+        if ($targets.Count -ne 1 -or $targets[0] -cne "prMetadata") {
+            [void]$errors.Add("metadata remediation must target prMetadata")
+        }
+    }
+    else {
+        $known = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($construct in @($Constructs)) {
+            $id = [string](Get-ReviewerConventionSpecialistValue $construct "constructId" "")
+            if ($id) { [void]$known.Add($id) }
+        }
+        if ($targets.Count -eq 0 -or @($targets | Where-Object {
+                    $_ -cnotmatch '^[a-z]{2}[0-9]+$' -or
+                    -not $known.Contains($_)
+                }).Count -gt 0) {
+            [void]$errors.Add("changed-file remediation must target known sealed constructs")
+        }
+    }
+    return , [string[]]$errors.ToArray()
+}
 $script:ReviewerConventionSpecialistImpactCategories = @(
     "none", "buildOrTestExecution", "deployment", "security", "customerBehavior", "compatibility"
 )
@@ -168,7 +217,8 @@ function ConvertTo-ReviewerConventionSpecialistCanonicalJson {
     if ($Value -is [byte] -or $Value -is [sbyte] -or $Value -is [int16] -or
         $Value -is [uint16] -or $Value -is [int32] -or $Value -is [uint32] -or
         $Value -is [int64] -or $Value -is [uint64] -or $Value -is [single] -or
-        $Value -is [double] -or $Value -is [decimal]) {
+        $Value -is [double] -or $Value -is [decimal] -or
+        $Value -is [System.Numerics.BigInteger]) {
         return [Convert]::ToString($Value, [System.Globalization.CultureInfo]::InvariantCulture)
     }
     if ($Value -is [string]) {
@@ -321,7 +371,8 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
         "ruleSourceCommit", "ruleSourceSha256", "ruleSection", "ruleQuote",
         "diffEvidence", "impactCategory", "impact", "expectedFixOrValidation",
         "siblingStatus", "siblingEvidence", "siblingNotRequiredReason",
-        "factIds", "confidence", "residualRiskSummary"
+        "factIds", "confidence", "residualRiskSummary", "semanticCandidateVersion",
+        "remediationAction", "remediationScope", "remediationTargets", "followUpRequired"
     )
     return @{
         Keys = @(
@@ -331,7 +382,7 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
             "candidates", "ruleCoverage", "withheld", "residualRisks", "nonce"
         )
         Fields = @{
-            schemaVersion = @{ Type = "int"; Min = 1; Max = 1 }
+            schemaVersion = @{ Type = "int"; Min = 2; Max = 2 }
             prId = @{ Type = "int"; Min = 1; Max = [int]::MaxValue }
             repositoryId = @{ Type = "guid" }
             project = @{ Type = "exact"; Expected = $ExpectedProject }
@@ -375,6 +426,14 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                         }
                         confidence = @{ Type = "enum"; Values = @("low", "medium", "high") }
                         residualRiskSummary = @{ Type = "string"; MaxLength = 800; AllowEmpty = $true; Pattern = $ascii; NormalizeTypography = $true }
+                        semanticCandidateVersion = @{ Type = "int"; Min = 2; Max = 2 }
+                        remediationAction = @{ Type = "enum"; Values = @("add", "modify", "remove", "rename", "replace", "validate") }
+                        remediationScope = @{ Type = "enum"; Values = @("inPullRequest", "followUp") }
+                        remediationTargets = @{
+                            Type = "string"; MaxLength = 600
+                            Pattern = '^(prMetadata|[a-z]{2}[0-9]+(,[a-z]{2}[0-9]+){0,31})$'
+                        }
+                        followUpRequired = @{ Type = "bool" }
                     }
                 }
             }
@@ -823,10 +882,13 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
 
     $candidateIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $candidateAnchors = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+    $candidateAnchorKinds = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
     $candidateRuleKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($candidate in @($AcceptedCandidates)) {
         $candidateId = [string](Get-ReviewerConventionSpecialistValue $candidate "candidateId" "")
         [void]$candidateIds.Add($candidateId)
+        $candidateAnchorKinds[$candidateId] = [string](Get-ReviewerConventionSpecialistValue `
+                $candidate "anchorKind" "")
         $candidateAnchors[$candidateId] = "{0}|{1}" -f `
             (([string](Get-ReviewerConventionSpecialistValue $candidate "filePath" "")).TrimStart("/")),
         ([int](Get-ReviewerConventionSpecialistValue $candidate "line" 0))
@@ -1100,7 +1162,8 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
                     else { "the row linked a candidate that this pass did not emit" })
             }
         }
-        elseif ($linkedCandidate -and $violating.Count -gt 0) {
+        elseif ($linkedCandidate -and $violating.Count -gt 0 -and
+            [string]$candidateAnchorKinds[$linkedCandidate] -cne "prMetadata") {
             # A wrong-anchor row cannot stand in for the right one. If the
             # linked candidate does not sit on one of the constructs this row
             # says are violating, the row is about one place and the finding is
@@ -1321,6 +1384,11 @@ function Resolve-ReviewerConventionSpecialistCandidates {
     foreach ($candidate in @($Marker.candidates)) {
         $candidateId = [string]$candidate.candidateId
         if (-not $seenIds.Add($candidateId)) { throw "Specialist output duplicated candidate id '$candidateId'." }
+        $remediationErrors = [string[]](Get-ReviewerConventionSpecialistRemediationErrors `
+                -Candidate $candidate -Constructs $Constructs)
+        if ($remediationErrors.Count -gt 0) {
+            throw "Specialist candidate '$candidateId' has invalid structured remediation: $($remediationErrors -join '; ')."
+        }
         if ($selectedPacks -cnotcontains [string]$candidate.packName) {
             throw "Specialist candidate '$candidateId' cited an unrelated convention pack."
         }
@@ -1591,7 +1659,7 @@ function New-ReviewerConventionSpecialistInput {
         # analysis is asking for exactly that. This is a formatting aid and
         # nothing else: it contains no finding, no rule, and no judgement.
         markerScaffold = [pscustomobject][ordered]@{
-            schemaVersion = 1
+            schemaVersion = 2
             prId = $PrId
             repositoryId = $RepositoryId
             project = $Project
