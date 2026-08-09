@@ -194,8 +194,9 @@ enumeration of every **changed construct** in the change set. Each row states:
 - a `status` of `violation`, `compliant`, `notApplicable` or `unknown` - which
   the wrapper **derives** from the verdicts below rather than taking on trust;
 - a `scope`: the construct kinds the rule governs, or `none`;
-- a verdict for **every** anchor of those kinds, split across four disjoint
-  lists that together equal that set exactly: `violatingConstructs`,
+- a verdict for **every** anchor in the sealed construct table, split across
+  four disjoint lists that together equal that full universe exactly:
+  `violatingConstructs`,
   `compliantConstructs`, `notInReachConstructs` (examined, and the rule does
   not reach it) and `unknownConstructs` (could not decide);
 - the code evidence, and the sibling evidence or why none was needed;
@@ -247,18 +248,17 @@ computed itself:
   reported **unknown** and is not counted toward coverage;
 - a row whose source hash or quote does not match what was actually transported
   is degraded to `unknown` with the reason recorded;
-- a row that leaves any anchor in its own declared scope out of **all four**
+- a row that leaves any sealed anchor out of **all four**
   verdict lists is degraded, and the reason names the exact ids it left out; so
   is a row that gives the same anchor two verdicts, or a verdict to an anchor
   that does not exist;
 - `notInReachConstructs` is the cheapest verdict to give, so it is fail-closed
-  in every direction. The universe it has to cover is the wrapper's own
-  enumeration, not the model's: the row declares which construct **kinds** its
-  rule governs, and the wrapper expands those to the sealed anchor ids itself.
-  Checked and out-of-reach must then cover that universe exactly and share
-  nothing. A kind the wrapper does not enumerate cannot define a universe; an
-  out-of-reach id belonging to a kind the row's own scope excludes is refused
-  rather than binned; an id repeated inside one list is refused rather than
+  in every direction. The universe is the wrapper's full sealed enumeration,
+  not the model's; `scope` names only the applicable kinds. Anchors of every
+  other kind must still be accounted for, and may appear only in
+  `notInReachConstructs`. An applicable anchor may be ruled out only with code
+  evidence. A kind the wrapper does not enumerate cannot define a scope; an id
+  repeated inside one list is refused rather than
   quietly deduplicated - including when the repeat is hidden inside overlapping
   ranges - because collapsing it would let a short list impersonate an exact
   cover;
