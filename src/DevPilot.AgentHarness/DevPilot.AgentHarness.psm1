@@ -615,10 +615,9 @@ function ConvertTo-AgentMarkerFieldValue {
         [int]$Depth = 0
     )
     $bad = @{ Ok = $false; Value = $null }
-    # objectArray may not contain objectArray. Bounding the nesting keeps the
-    # validator's cost linear in the payload and stops a crafted marker from
-    # driving deep recursion.
-    if ($Depth -gt 1) { return $bad }
+    # A top-level array may contain exact objects with scalar fields. Bounding
+    # the nesting still rejects recursive object/array structures.
+    if ($Depth -gt 2) { return $bad }
 
     switch ([string]$Spec.Type) {
         "int" {
@@ -764,6 +763,30 @@ function ConvertTo-AgentMarkerFieldValue {
             }
             return @{ Ok = $true; Value = $out.ToArray() }
         }
+        "object" {
+            if ($Value -isnot [System.Management.Automation.PSCustomObject]) { return $bad }
+            if (-not $Spec.ContainsKey('Schema')) { return $bad }
+            $objectSchema = $Spec.Schema
+            if ($objectSchema -isnot [hashtable] -or
+                -not $objectSchema.ContainsKey('Keys') -or
+                -not $objectSchema.ContainsKey('Fields')) {
+                return $bad
+            }
+            $objectKeys = @($objectSchema.Keys)
+            $valueKeys = @($Value.PSObject.Properties | ForEach-Object { $_.Name })
+            foreach ($name in $valueKeys) { if ($objectKeys -notcontains $name) { return $bad } }
+            foreach ($name in $objectKeys) { if (-not $Value.PSObject.Properties[$name]) { return $bad } }
+            $record = @{}
+            foreach ($name in $objectKeys) {
+                $fieldSpec = $objectSchema.Fields[$name]
+                if ($null -eq $fieldSpec) { return $bad }
+                $converted = ConvertTo-AgentMarkerFieldValue -Spec $fieldSpec `
+                    -Value $Value.PSObject.Properties[$name].Value -Depth ($Depth + 1)
+                if (-not $converted.Ok) { return $bad }
+                $record[$name] = $converted.Value
+            }
+            return @{ Ok = $true; Value = $record }
+        }
         default { return $bad }
     }
 }
@@ -822,14 +845,15 @@ function ConvertFrom-AgentResultMarker {
           - each field validates against its typed schema entry (strict int
             typing, exact-format GUID, case-sensitive string/enum/nonce
             equality, fixed-length hex, nullable hex, bounded control-character
-            -free text, and bounded arrays of flat objects).
+            -free text, exact nested objects, and bounded arrays of flat objects).
 
         $Schema = @{
             Keys   = @(<ordered allowed/required key names>)
-            Fields = @{ <name> = @{ Type = 'int'|'guid'|'exact'|'hex'|'hexOrNull'|'enum'|'bool'|'string'|'objectArray'; ... } }
+            Fields = @{ <name> = @{ Type = 'int'|'guid'|'exact'|'hex'|'hexOrNull'|'enum'|'bool'|'string'|'object'|'objectArray'; ... } }
         }
 
         'string'      = @{ MaxLength = <int>; AllowEmpty = <bool>; AllowNewlines = <bool>; Pattern = <regex> }
+        'object'      = @{ Schema = @{ Keys = @(...); Fields = @{...} } }
         'objectArray' = @{ MaxItems = <int>; Item = @{ Keys = @(...); Fields = @{...} } }
 
         'objectArray' exists so an agent can return STRUCTURED results that the

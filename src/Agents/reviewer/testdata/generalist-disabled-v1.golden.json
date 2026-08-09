@@ -132,6 +132,12 @@
         "sha256": "62432a88a734669cfe06220131db07429ea8940eb8eb35078ad925748efce719",
         "reason": "Pinned so the source-coverage wiring cannot be dropped silently: this function carries the marker retry loop and the preview call that publishes pinned source coverage and the convention authority summary."
       }
+    ],
+    "Write-ReviewerConventionSpecialistPreview": [
+      {
+        "sha256": "871ae332707c8f0f59d01ec50fc730e6bd011ead39262ca6941facaf99cb73f9",
+        "reason": "Authorize the structured-remediation preview fields on top of the parent replay-isolation disclosure: preserve sourceTransportMode, capabilityProbeSuppressed, and azCliFallbackSuppressed while sealing construct-file census evidence and the exact remediation facts cited by changedCodeFix."
+      }
     ]
   },
   "promptSha256": "f9357af7ea2dc1f3f5929b2541bd9875c3e63fd8bee50894a88a4688fc05ebd1",

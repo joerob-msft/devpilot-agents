@@ -8316,6 +8316,21 @@ function Get-ReviewerConstructFilesFromReport {
                 [void]$deliveredLines.Add($lineNumber)
             }
         }
+        $wholeFileLineCount = [int](Get-ReviewerHashValue -Container $file -Key "LineCount" -Default 0)
+        $wholeFileSha256 = [string](Get-ReviewerHashValue -Container $file -Key "FileSha256" -Default "")
+        $wholeFileComplete = (
+            [string](Get-ReviewerHashValue -Container $file -Key "Status" -Default "") -ceq "delivered" -and
+            -not [string](Get-ReviewerHashValue -Container $file -Key "Reason" -Default "") -and
+            $wholeFileLineCount -gt 0 -and $wholeFileSha256 -cmatch '^[0-9a-f]{64}$' -and
+            $deliveredLines.Count -eq $wholeFileLineCount)
+        if ($wholeFileComplete) {
+            for ($lineNumber = 1; $lineNumber -le $wholeFileLineCount; $lineNumber++) {
+                if (-not $deliveredLines.Contains($lineNumber)) {
+                    $wholeFileComplete = $false
+                    break
+                }
+            }
+        }
         # The pull request's OWN hunks, intersected with what was delivered - not
         # the whole slice. A slice is a hunk plus a context radius, so treating
         # every delivered line as changed would hand the model sixty untouched
@@ -8377,6 +8392,9 @@ function Get-ReviewerConstructFilesFromReport {
                 Lines = $lines
                 ChangedLines = $changedLines.ToArray()
                 DeliveredLines = @($deliveredLines)
+                WholeFileLineCount = $wholeFileLineCount
+                WholeFileSha256 = $wholeFileSha256
+                WholeFileComplete = $wholeFileComplete
             })
         # Delivered, but only in part: the hunks that fell outside the delivered
         # lines contributed nothing either, and the enumerator cannot tell the
@@ -8509,6 +8527,7 @@ function Write-ReviewerConventionSpecialistPreview {
         [Parameter(Mandatory)][string]$Model,
         [Parameter(Mandatory)][string]$ConventionPlanSha256,
         [Parameter(Mandatory)][string]$FactPlanSha256,
+        $FactPlan = $null,
         [string[]]$PackNames = @(),
         [int]$ContextBytes = 0,
         [hashtable]$ToolAudit = @{},
@@ -8517,7 +8536,8 @@ function Write-ReviewerConventionSpecialistPreview {
         [object[]]$ResidualRisks = @(),
         [hashtable]$RuleCoverage = $null,
         [object[]]$ChangedFileIndex = @(),
-        [object[]]$ChangedConstructs = @()
+        [object[]]$ChangedConstructs = @(),
+        [object[]]$ConstructFiles = @()
     )
     $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ")
     $baseName = "pr$PrId-$($SourceCommit.Substring(0, 12))-$stamp-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
@@ -8708,6 +8728,15 @@ function Write-ReviewerConventionSpecialistPreview {
                     changedFileAnchors = @($ChangedFileIndex)
                     constructsIncomplete = [bool]$RuleCoverage.ConstructsIncomplete
                     changedConstructs = @($RuleCoverage.Constructs)
+                    constructFiles = @($ConstructFiles)
+                    remediationFacts = @((Get-ReviewerConventionSpecialistValue $FactPlan "facts" @()) |
+                        Where-Object {
+                            $factId = [string](Get-ReviewerConventionSpecialistValue $_ "id" "")
+                            @($Candidates | Where-Object {
+                                    $fix = Get-ReviewerConventionSpecialistValue $_ "changedCodeFix" $null
+                                    @(([string](Get-ReviewerConventionSpecialistValue $fix "evidenceFactIds" "")) -split ',') -ccontains $factId
+                                }).Count -gt 0
+                        })
                 }
             })
         withheld = @($Withheld)
@@ -8986,6 +9015,7 @@ function Invoke-ReviewerConventionSpecialistPass {
                 -ConventionPlan $conventionPlan -FactPlan $factPlan `
                 -ResolvedSources @($sessionData.Sources) -ChangeEntries @($sessionData.Changes) `
                 -Constructs @(Get-ReviewerHashValue -Container $Bound -Key 'ChangedConstructs' -Default @()) `
+                -ConstructFiles @(Get-ReviewerHashValue -Container $Bound -Key 'ConstructFiles' -Default @()) `
                 -ConstructsIncomplete ([bool](Get-ReviewerHashValue -Container $Bound -Key 'ConstructsIncomplete' -Default $false))
             $candidates = @($validated.Candidates)
             $withheld = @($validated.Withheld)
@@ -9052,10 +9082,12 @@ function Invoke-ReviewerConventionSpecialistPass {
         $preview = Write-ReviewerConventionSpecialistPreview -PrId $PrId -SourceCommit $SourceCommit `
             -Status $status -Diagnostic $diagnostic -Model $EffectiveConventionSpecialistModel `
             -ConventionPlanSha256 $conventionPlanSha256 -FactPlanSha256 $factPlanSha256 `
+            -FactPlan $factPlan `
             -PackNames $packNames -ContextBytes $contextBytes -ToolAudit $toolAudit `
             -Candidates $candidates -Withheld $withheld -ResidualRisks $residualRisks `
             -RuleCoverage $ruleCoverage -ChangedFileIndex $changedFileIndex `
-            -ChangedConstructs @(Get-ReviewerHashValue -Container $Bound -Key 'ChangedConstructs' -Default @())
+            -ChangedConstructs @(Get-ReviewerHashValue -Container $Bound -Key 'ChangedConstructs' -Default @()) `
+            -ConstructFiles @(Get-ReviewerHashValue -Container $Bound -Key 'ConstructFiles' -Default @())
         Write-ReviewerCycleMetadata -Fields @{
             cycle = $CycleNumber; mode = "convention-specialist"; result = $status; prId = $PrId
             sourceCommit = $SourceCommit; model = $EffectiveConventionSpecialistModel
@@ -9643,13 +9675,24 @@ function Invoke-ReviewerCrossVerificationPass {
         -ConventionCandidates $specialistCandidates -ConventionModel $EffectiveConventionSpecialistModel `
         -ConventionArtifactSha256 $specialistArtifactSha `
         -MaxCandidates ([int]$EffectiveCrossVerificationPolicy.maxCandidates)
-    $candidates = @($candidatePlan.candidates)
-    $preVerificationWithheld = @($candidatePlan.withheld)
-    $clusters = @(Get-ReviewerVerificationClusters -Candidates $candidates `
-        -MaxCandidates ([int]$EffectiveCrossVerificationPolicy.maxCandidates) `
-        -MaxClusterSize ([int]$EffectiveCrossVerificationPolicy.maxClusterSize) `
-        -NearExactJaccard ([double]$EffectiveCrossVerificationPolicy.nearExactJaccard) `
-        -SemanticJaccard ([double]$EffectiveCrossVerificationPolicy.semanticJaccard))
+    $factPartition = Get-ReviewerVerificationCandidateFactPartition `
+        -Candidates @($candidatePlan.candidates) -FactPlan $factPlan
+    $candidates = @($factPartition.candidates)
+    $preVerificationWithheld = @($candidatePlan.withheld) + @($factPartition.withheld)
+    do {
+        $clusters = @(Get-ReviewerVerificationClusters -Candidates $candidates `
+            -MaxCandidates ([int]$EffectiveCrossVerificationPolicy.maxCandidates) `
+            -MaxClusterSize ([int]$EffectiveCrossVerificationPolicy.maxClusterSize) `
+            -NearExactJaccard ([double]$EffectiveCrossVerificationPolicy.nearExactJaccard) `
+            -SemanticJaccard ([double]$EffectiveCrossVerificationPolicy.semanticJaccard))
+        $clusterFactPartition = Get-ReviewerVerificationClusterFactPartition `
+            -Candidates $candidates -Clusters $clusters -FactPlan $factPlan
+        $clusterFactWithheld = @($clusterFactPartition.withheld)
+        if ($clusterFactWithheld.Count -gt 0) {
+            $candidates = @($clusterFactPartition.candidates)
+            $preVerificationWithheld += $clusterFactWithheld
+        }
+    } while ($clusterFactWithheld.Count -gt 0)
     $assignments = @(Get-ReviewerVerificationAssignments -Clusters $clusters `
         -GeneralistModels $ReviewPassModels -ConventionVerifierModel $EffectiveConventionVerifierModel `
         -ChangedPaths @($Bound.ChangedPaths))
@@ -9834,20 +9877,8 @@ function Invoke-ReviewerCrossVerificationPass {
                             -ExistingThreadJaccard ([double]$EffectiveCrossVerificationPolicy.existingThreadJaccard)
                     }).Count -gt 0
             })
-        $relevantFactIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-        foreach ($assignedCandidate in $assignedCandidates) {
-            foreach ($factId in @(([string]$assignedCandidate.factIds) -split ',' | Where-Object { $_ })) {
-                [void]$relevantFactIds.Add($factId)
-            }
-        }
-        $relevantFacts = @($factPlan.facts | Where-Object {
-                $fact = $_
-                $factId = [string]$fact.id
-                $relevantFactIds.Contains($factId) -or
-                (@($assignedCandidates | Where-Object {
-                            [string]$_.anchorKind -ceq "prMetadata"
-                        }).Count -gt 0 -and [string]$fact.domain -ceq "metadata")
-            })
+        $relevantFacts = @(Get-ReviewerVerificationDeterministicFacts `
+            -Candidates $assignedCandidates -FactPlan $factPlan)
         $eligibleSiblingCandidates = @($cluster.members | Where-Object {
                 [string]$_.originModel -cne $verifierModel
             })
