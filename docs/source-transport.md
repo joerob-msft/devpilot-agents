@@ -67,7 +67,11 @@ set: `budgetExhausted`, `sliceCountCapExceeded`, `fileTooLarge`, `notTextual`,
 `decodeRejected`, `transportFailed`, `noChangedSpans`, `binaryNoText`,
 `readerReportedNonTextUncorroborated`, `emptyFile`, `spansUnavailable`,
 `fileCountCapExceeded`, `pathRejected`, `spanOutsideFile`, `unsafeSliceText`,
-`recoveredHunkShortfall`.
+`recoveredHunkShortfall`, `authoritativeDeletionOnly`, and the closed recovery
+cap reasons `recoveryByteCapExceeded`, `recoveryLineCapExceeded`,
+`recoveryEditDistanceCapExceeded`, `recoveryOperationCapExceeded`,
+`recoveryFrontierCapExceeded`, `recoveryTraceCapExceeded`, and
+`recoveryHunkCapExceeded`.
 
 Those causes are told apart at the reader seam, before the strict decoder runs.
 The decoder's job is safety and it refuses everything it dislikes the same way,
@@ -78,11 +82,12 @@ now read structurally and judged against policy first; only content policy would
 accept reaches the decoder, and only the decoder's own refusals become
 `decodeRejected`. Nothing about its strictness changes.
 
-**A change set with no right-hand lines is not a failure — but only the pull
-request may say so.** Delete-only and rename-only changes legitimately
+**A change set with no right-hand lines is not a failure — but that state must
+be proven authoritatively.** Delete-only and rename-only changes legitimately
 have paths and no changed lines: those paths are counted apart and are **excluded
-from the coverage denominator**, because the change set itself says there is no
-source for the transport to deliver and they therefore cannot be uncovered. A
+from the coverage denominator** when either the change set itself says there is
+no source to deliver or exact common-to-source comparison proves only deletions.
+A
 binary or an empty file is *not* in that category — only the reader says those
 hold nothing, so they stay counted; see the denominator rule below. Leaving
 deletes in meant a pull request that edited two files and deleted four scored
@@ -120,11 +125,22 @@ misreported as a byte-budget failure. Adds, deletes, any rename mixture,
 context-only/empty/malformed
 block sets, ordinary diffs, binary/empty/oversized/decode-rejected content,
 missing versions, equal versions, stale identity, and work over the
-request/line/matrix/hunk caps remain unrecovered. The source read is cached and
+request/byte/line/edit-distance/operation/frontier-trace/hunk caps remain
+unrecovered. The source read is cached and
 reused by normal slicing. Ordinary missing-path/read errors disable recovery for
 that file; a session-fatal transport failure still propagates. Every unsuccessful
-attempt retains the same closed-set omission reason and denominator treatment it
-had before recovery.
+attempt retains a closed omission reason and stays in both coverage floors. Cap
+exhaustion records its exact reason and whole-file census but never emits partial
+or fabricated spans.
+
+The exact comparison uses deterministic bounded Myers shortest-edit recovery,
+`O((N+M)D)` work for edit distance `D`, with deletion-preferred ties. Independent
+hard ceilings bound each side to 100,000 lines and 2 MiB, edit distance to 4,096,
+the frontier to 8,195 entries, operations to 20,000,000, retained trace entries
+to 4,000,000, and recovered hunks to 2,000. Exceeding any ceiling fails closed.
+The reverse frontier reconstructs the former matrix oracle's deletion-first
+canonical minimal script, including repeated-line ambiguities. The algorithm
+does not call Git, a shell, another diff implementation, or a model.
 
 Recovery additionally requires an authoritative binding to the configured
 organization, project, repository ID, PR ID, exact iteration ID, source, target,
@@ -193,7 +209,14 @@ commit) and keeps only the right-hand spans that common→source content differe
 proves, presented as `spanBasis = "recovered"`. Add/delete/rename/mixed changes,
 an edit whose `originalPath` differs, and identical common/source content are
 never recovered. Incomplete pagination is rejected before any content read begins.
-The coverage gate, caps, and denominator rules are unchanged.
+When that exact comparison proves a non-empty pure edit contains deletions and no
+right-hand insertions, the path is recorded as `authoritativeDeletionOnly` with
+`noSourceBasis = "authoritativeComparison"` and recovered provenance. It leaves
+the denominator because there is no reviewable right-hand source. Missing reads,
+rejected content, equal versions, malformed aggregate evidence, and cap exhaustion
+cannot enter that state and remain uncovered. The final iteration identity and
+change-list digest are rechecked after all reads before this signed record is
+returned.
 
 Every file carries a versioned `spanBasis`: `changeSet` for ADO-declared
 right-hand blocks and `recovered` for deterministic common-base/source evidence.

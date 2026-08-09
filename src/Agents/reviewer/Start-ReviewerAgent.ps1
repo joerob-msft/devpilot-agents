@@ -13116,9 +13116,10 @@ function Invoke-ReviewerCycle {
                 $constructFileSummaries = @($constructResult.Files)
                 $constructIdRanges = $constructResult.IdRangesByKind
                 $constructsIncomplete = ([bool]$constructResult.Truncated -or @($constructResult.PartiallyUnderstoodFiles).Count -gt 0)
-                Write-Host ("  PR {0} pinned source: {1}/{2} changed file(s) that could carry source text covered ({3}%), {4} path(s) the pull request itself calls source-free, {5} changed-source byte(s) + {6} sibling byte(s)." -f `
+                Write-Host ("  PR {0} pinned source: {1}/{2} changed file(s) that could carry source text covered ({3}%), {4} path(s) the pull request itself calls source-free, {5} path(s) exact comparison proves deletion-only, {6} changed-source byte(s) + {7} sibling byte(s)." -f `
                         $prId, $sourceTransport.Report.CoveredFiles, $sourceTransport.Report.SourceBearingFileCount,
-                        $sourceTransport.Report.CoveragePercent, $sourceTransport.Report.NoSourceFileCount,
+                        $sourceTransport.Report.CoveragePercent, $sourceTransport.Report.ChangeSetExcusedFileCount,
+                        $sourceTransport.Report.AuthoritativeDeletionOnlyFileCount,
                         $sourceTransport.Report.TotalSliceBytes, $sourceTransport.Report.TotalSiblingBytes) -ForegroundColor Cyan
                 Write-ReviewerCycleMetadata -Fields @{
                     cycle = $CycleNumber; mode = "source-transport"; prId = $prId; sourceCommit = $sourceCommit
@@ -13126,10 +13127,11 @@ function Invoke-ReviewerCycle {
                     changedFileCount = [int]$sourceTransport.Report.ChangedFileCount
                     sourceBearingFileCount = [int]$sourceTransport.Report.SourceBearingFileCount
                     noSourceFileCount = [int]$sourceTransport.Report.NoSourceFileCount
+                    changeSetExcusedFileCount = [int]$sourceTransport.Report.ChangeSetExcusedFileCount
+                    authoritativeDeletionOnlyFileCount = [int]$sourceTransport.Report.AuthoritativeDeletionOnlyFileCount
                     readerExcusedFileCount = [int]$sourceTransport.Report.ReaderExcusedFileCount
                     readerExcusedUncorroboratedCount = [int]$sourceTransport.Report.ReaderExcusedUncorroboratedCount
                     readerNonTextUncorroboratedCount = [int]$sourceTransport.Report.ReaderNonTextUncorroboratedCount
-                    changeSetExcusedFileCount = [int]$sourceTransport.Report.ChangeSetExcusedFileCount
                     readerExcusedAllowance = [int]$sourceTransport.Report.ReaderExcusedAllowance
                     coveredFiles = [int]$sourceTransport.Report.CoveredFiles
                     coveragePercent = [int]$sourceTransport.Report.CoveragePercent
