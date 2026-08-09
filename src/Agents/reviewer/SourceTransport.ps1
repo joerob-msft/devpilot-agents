@@ -2967,16 +2967,13 @@ function Test-ReviewerSourceCoverageGate {
         [void]$reasons.Add("sourceCoverageUnknown")
     }
     elseif ([int]$Report.SourceBearingFileCount -lt 1) {
-        # Every path is one the pull request ITSELF declared source-free - a
-        # delete or a rename. There is nothing to deliver, so coverage is
-        # vacuously complete, which is a different thing from having failed to
-        # deliver source that existed.
-        #
-        # Only the change set can put a change set in this state: a
-        # reader-derived excusal no longer leaves the denominator, so
-        # SourceBearingFileCount cannot reach zero while any path was excused on
-        # the host's word. A hostile host that mislabels everything now lands on
-        # sourceCoverageEmpty at 0%, not here.
+        # Every changed path was authoritatively classified as having no
+        # reviewable right-hand source: either the change set declared a
+        # deletion/no-source change, or exact pinned common-to-source comparison
+        # proved deletion-only content. Coverage is therefore vacuously complete,
+        # which is different from having failed to deliver source that existed.
+        # Read, decode, cap, and other unproven failures remain source-bearing in
+        # the denominator, so none can create this state.
         $reasons.Clear()
     }
     else {
