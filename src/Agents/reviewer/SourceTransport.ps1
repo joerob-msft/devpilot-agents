@@ -61,22 +61,29 @@ $script:ReviewerSourceOmissionReasons = @(
     "budgetExhausted", "sliceCountCapExceeded", "fileTooLarge", "notTextual", "transportFailed",
     "noChangedSpans", "binaryNoText", "readerReportedNonTextUncorroborated", "emptyFile",
     "spansUnavailable", "fileCountCapExceeded",
-    "pathRejected", "spanOutsideFile", "unsafeSliceText", "decodeRejected", "recoveredHunkShortfall"
+    "pathRejected", "spanOutsideFile", "unsafeSliceText", "decodeRejected", "recoveredHunkShortfall",
+    "authoritativeDeletionOnly", "recoveryByteCapExceeded", "recoveryLineCapExceeded",
+    "recoveryEditDistanceCapExceeded", "recoveryFrontierCapExceeded", "recoveryOperationCapExceeded",
+    "recoveryTraceCapExceeded", "recoveryHunkCapExceeded"
 )
 # Every reason that may mark a path as carrying no source at all. This is the
 # GATE-side set: `New-ReviewerSourceFileEntry` refuses `CarriesSource = $false`
 # under any other reason. It is deliberately LARGER than the model-facing set
 # below - a binary really does hold no source, but only the pull request's own
-# word may be presented to a model as "nothing to check".
-$script:ReviewerSourceNoSourceReasons = @("noChangedSpans", "binaryNoText", "readerReportedNonTextUncorroborated", "emptyFile")
+# word or an exact pinned common-to-source comparison may be presented to a
+# model as "nothing to check".
+$script:ReviewerSourceNoSourceReasons = @(
+    "noChangedSpans", "binaryNoText", "readerReportedNonTextUncorroborated", "emptyFile",
+    "authoritativeDeletionOnly"
+)
 # The strictly smaller set a MODEL may be told means "there is nothing in this
-# path for anyone to read". Only the pull request's own statement qualifies. A
-# path the reader could not establish content for is an UNREAD path: telling the
-# model it has nothing to check is a lie the host can author at will, and it was
-# how nine mislabelled source files were presented as nine files with nothing in
-# them. The sealed block's binding sentence is GENERATED from this array, so the
-# prose and the rule cannot drift.
-$script:ReviewerSourceNothingToReadReasons = @("noChangedSpans")
+# path for anyone to read". Only the pull request's own statement or the wrapper's
+# exact common-to-source deletion proof qualifies. A path the reader could not
+# establish content for is an UNREAD path: telling the model it has nothing to
+# check is a lie the host can author at will, and it was how nine mislabelled
+# source files were presented as nine files with nothing in them. The sealed
+# block's binding sentence is GENERATED from this array, so prose and rule cannot drift.
+$script:ReviewerSourceNothingToReadReasons = @("noChangedSpans", "authoritativeDeletionOnly")
 # Reasons a READER is permitted to author. Anything else in the closed set above
 # is a conclusion this layer draws for itself, and a reader that returns one is
 # putting words in the wrapper's mouth. `noChangedSpans` is the sharp case: it is
@@ -89,8 +96,12 @@ $script:ReviewerSourceReaderAuthoredRejections = @(
 $script:ReviewerSourceStatuses = @("delivered", "partial", "omitted")
 $script:ReviewerSourceMaxSpansPerPath = 2000
 $script:ReviewerSourceMaxRecoveryFiles = 16
-$script:ReviewerSourceMaxRecoveryMatrixCells = 2000000
-$script:ReviewerSourceMaxRecoveryLinesPerSide = 20000
+$script:ReviewerSourceMaxRecoveryLinesPerSide = 100000
+$script:ReviewerSourceMaxRecoveryBytesPerSide = 2097152
+$script:ReviewerSourceMaxRecoveryEditDistance = 4096
+$script:ReviewerSourceMaxRecoveryFrontierEntries = 8195
+$script:ReviewerSourceMaxRecoveryOperations = 20000000
+$script:ReviewerSourceMaxRecoveryTraceEntries = 4000000
 # How many spanless-but-content-declaring paths may be read to find out what
 # they really are. Each costs one whole-file fetch, and the pathological case -
 # a response that lost every line-diff block - would otherwise pay that for
@@ -621,9 +632,16 @@ function Invoke-ReviewerSourceAzJson {
     )
     if (-not $ProcessInvoker) {
         $ProcessInvoker = {
-            param($Path, $Args, $Timeout, $MaxOut, $MaxErr)
-            Invoke-ReviewerSourceAzProcess -ExecutablePath $Path -Arguments $Args `
-                -TimeoutSeconds $Timeout -MaxStdoutBytes $MaxOut -MaxStderrBytes $MaxErr
+            param(
+                [Parameter(Mandatory)][string]$DelegateExecutablePath,
+                [Parameter(Mandatory)][string[]]$DelegateArguments,
+                [Parameter(Mandatory)][int]$DelegateTimeoutSeconds,
+                [Parameter(Mandatory)][int]$DelegateMaxStdoutBytes,
+                [Parameter(Mandatory)][int]$DelegateMaxStderrBytes
+            )
+            Invoke-ReviewerSourceAzProcess -ExecutablePath $DelegateExecutablePath -Arguments $DelegateArguments `
+                -TimeoutSeconds $DelegateTimeoutSeconds -MaxStdoutBytes $DelegateMaxStdoutBytes `
+                -MaxStderrBytes $DelegateMaxStderrBytes
         }
     }
     $result = & $ProcessInvoker $ExecutablePath $Arguments $script:ReviewerSourceAzTimeoutSeconds `
@@ -914,6 +932,8 @@ function Invoke-ReviewerSourceNewContractTransport {
         [scriptblock]$IdentityReader,
         [Parameter(Mandatory)][scriptblock]$Reader,
         [Parameter(Mandatory)][scriptblock]$BaseReader,
+        [scriptblock]$RecoveryReader,
+        [scriptblock]$RecoveryBaseReader,
         [Parameter(Mandatory)][scriptblock]$AggregateReader,
         [Parameter(Mandatory)][AllowEmptyString()][string]$Organization,
         [Parameter(Mandatory)][string]$Project,
@@ -970,26 +990,83 @@ function Invoke-ReviewerSourceNewContractTransport {
         SourceCommit = $SourceCommit; TargetCommit = [string]$binding.TargetRefCommit
         BaseCommit = [string]$binding.CommonRefCommit
     }
+    if ($null -eq $RecoveryReader) { $RecoveryReader = $Reader }
+    if ($null -eq $RecoveryBaseReader) { $RecoveryBaseReader = $BaseReader }
     $cache = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
+    $recoverySourceCache = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
+    $recoverySourceAttempted = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $recoverySourceReader = {
+        param([string]$Path, [string[]]$Kinds)
+        if ($recoverySourceAttempted.Contains($Path)) { return $recoverySourceCache[$Path] }
+        [void]$recoverySourceAttempted.Add($Path)
+        $actualKinds = if ($kindsByPath.Contains($Path)) { @($kindsByPath[$Path]) } else { @($Kinds) }
+        $resource = $null
+        try {
+            $resource = Add-ReviewerSourceResourceBinding -Resource (
+                & $RecoveryReader $Path $actualKinds) -Binding $recoveryBinding
+        }
+        catch {
+            if ($_.Exception.Message -match 'session is closed|closed stdout|exited before returning|timed out') { throw }
+            $resource = $null
+        }
+        $recoverySourceCache[$Path] = $resource
+        return $resource
+    }.GetNewClosure()
     $sourceReader = {
         param([string]$Path, [string[]]$Kinds)
         if ($cache.Contains($Path)) { return $cache[$Path] }
         $actualKinds = if ($kindsByPath.Contains($Path)) { @($kindsByPath[$Path]) } else { @($Kinds) }
-        $resource = Add-ReviewerSourceResourceBinding -Resource (& $Reader $Path $actualKinds) -Binding $recoveryBinding
+        $resource = $null
+        if ($recoverySourceAttempted.Contains($Path)) {
+            $recoveryResource = $recoverySourceCache[$Path]
+            if ($null -eq $recoveryResource) {
+                $cache[$Path] = $null
+                return $null
+            }
+            $rejected = [string](Get-ReviewerSourceValue -Object $recoveryResource -Name "Rejected" -Default "")
+            $byteLength = [int](Get-ReviewerSourceValue -Object $recoveryResource -Name "ByteLength" -Default -1)
+            if ($byteLength -gt [int]$Policy.maxFetchBytesPerFile) {
+                # Recovery may privately inspect more bytes than ordinary
+                # delivery. Do not let that wider object or its private decode
+                # classification reach slicing or the sealed block; retain only
+                # the ordinary oversize census.
+                $resource = Add-ReviewerSourceResourceBinding -Resource ([pscustomobject]@{
+                        Rejected = "fileTooLarge"
+                        MimeType = [string](Get-ReviewerSourceValue -Object $recoveryResource -Name "MimeType" -Default "")
+                        ByteLength = $byteLength
+                        Path = $Path
+                        CommitSha = $SourceCommit
+                        ChangeKinds = [string[]]@($actualKinds)
+                    }) -Binding $recoveryBinding
+            }
+            elseif ($rejected -and $rejected -cne "fileTooLarge") {
+                $resource = $recoveryResource
+            }
+            elseif (-not $rejected -and $byteLength -ge 0) {
+                $resource = $recoveryResource
+            }
+        }
+        if ($null -eq $resource) {
+            $resource = Add-ReviewerSourceResourceBinding -Resource (
+                & $Reader $Path $actualKinds) -Binding $recoveryBinding
+        }
         $cache[$Path] = $resource
         return $resource
     }.GetNewClosure()
     $baseReader = {
         param([string]$Path, [string[]]$Kinds)
         return Add-ReviewerSourceResourceBinding -Resource (
-            & $BaseReader $Path $Kinds ([string]$recoveryBinding.BaseCommit)) -Binding $recoveryBinding
+            & $RecoveryBaseReader $Path $Kinds ([string]$recoveryBinding.BaseCommit)) -Binding $recoveryBinding
     }.GetNewClosure()
     $recovery = Get-ReviewerSourceRecoveredSpans -Response $aggregateResponse -SpansByPath $spans `
-        -Binding $recoveryBinding -SourceReader $sourceReader -BaseReader $baseReader
+        -Binding $recoveryBinding -SourceReader $recoverySourceReader -BaseReader $baseReader `
+        -MaxCensusBytes ([int]$Policy.maxFetchBytesPerFile)
     $report = New-ReviewerSourceTransportReport -CommitSha $SourceCommit -ChangedPaths $paths `
         -SpansByPath $recovery.SpansByPath -Policy $Policy -Reader $sourceReader `
         -ChangeKindsByPath $kindsByPath -SpanBasisByPath $recovery.SpanBasisByPath `
         -ExpectedSpanCountByPath $recovery.ExpectedSpanCountByPath `
+        -AuthoritativeNoSourceByPath $recovery.AuthoritativeNoSourceByPath `
+        -RecoveryFailureByPath $recovery.RecoveryFailureByPath `
         -RecoveryAttemptedFileCount ([int]$recovery.AttemptedFileCount) `
         -RecoveryRecoveredFileCount (@($recovery.RecoveredPaths).Count) `
         -RecoveryEvidenceBlockCount ([int]$recovery.EvidenceBlockCount) `
@@ -1067,14 +1144,28 @@ function Split-ReviewerSourceDiffLines {
        lines; recovery cannot, because adding/removing a final newline or changing
        CRLF to LF is still a source edit that must map to a right-hand line. #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    if ($Text.Length -eq 0) { return , [string[]]@() }
     $parts = [regex]::Split($Text, "(`r?`n)")
     $lines = [System.Collections.Generic.List[string]]::new()
     for ($index = 0; $index -lt $parts.Count; $index += 2) {
         $line = [string]$parts[$index]
         if (($index + 1) -lt $parts.Count) { $line += [string]$parts[$index + 1] }
-        if ($line.Length -gt 0 -or ($Text.Length -eq 0 -and $index -eq 0)) { [void]$lines.Add($line) }
+        if ($line.Length -gt 0) { [void]$lines.Add($line) }
     }
     return , $lines.ToArray()
+}
+
+function Measure-ReviewerSourceLineCount {
+    <# Counts viewer lines without allocating a line array. A trailing newline
+       terminates the preceding line; it does not create a phantom final line. #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    if ($Text.Length -eq 0) { return 0 }
+    $count = 0
+    for ($index = 0; $index -lt $Text.Length; $index++) {
+        if ($Text[$index] -eq "`n") { $count++ }
+    }
+    if ($Text[$Text.Length - 1] -ne "`n") { $count++ }
+    return $count
 }
 
 function ConvertTo-ReviewerSourcePath {
@@ -1464,6 +1555,9 @@ function Get-ReviewerSourceDegenerateChanges {
                 }
                 $state = $states[$path]
                 $rawOriginalPath = [string](Get-ReviewerSourceValue -Object $change -Name "originalPath" -Default "")
+                if (-not $rawOriginalPath) {
+                    $rawOriginalPath = [string](Get-ReviewerSourceValue -Object $change -Name "sourceServerItem" -Default "")
+                }
                 if ($rawOriginalPath) {
                     $originalPath = ConvertTo-ReviewerSourcePath -Path $rawOriginalPath
                     if (-not $originalPath -or $originalPath -cne $path) { $state.SamePath = $false }
@@ -1518,76 +1612,242 @@ function Get-ReviewerSourceDegenerateChanges {
             return $result
         }
 
-        function Get-ReviewerSourceDeterministicDiffSpans {
-            <# Returns exact right-hand line spans using a bounded LCS. The cell bound is
-               checked before allocation, making runtime and memory independent of host
-               claims beyond the configured ceiling. Equal-content files prove no span. #>
+        function Get-ReviewerSourceDeterministicDiffResult {
+            <# Bounded Myers shortest-edit-script recovery. The frontier is linear in
+               edit distance and the retained trace is independently capped. Ties prefer
+               deletion, matching the former exact LCS oracle's deterministic walk. #>
             param(
                 [Parameter(Mandatory)][AllowEmptyString()][string]$TargetText,
                 [Parameter(Mandatory)][AllowEmptyString()][string]$SourceText,
-                [ValidateRange(1, [int]::MaxValue)][int]$MaxMatrixCells = $script:ReviewerSourceMaxRecoveryMatrixCells,
                 [ValidateRange(1, [int]::MaxValue)][int]$MaxLinesPerSide = $script:ReviewerSourceMaxRecoveryLinesPerSide,
+                [ValidateRange(1, [int]::MaxValue)][int]$MaxBytesPerSide = $script:ReviewerSourceMaxRecoveryBytesPerSide,
+                [ValidateRange(1, [int]::MaxValue)][int]$MaxEditDistance = $script:ReviewerSourceMaxRecoveryEditDistance,
+                [ValidateRange(3, [int]::MaxValue)][int]$MaxFrontierEntries = $script:ReviewerSourceMaxRecoveryFrontierEntries,
+                [ValidateRange(1, [long]::MaxValue)][long]$MaxOperations = $script:ReviewerSourceMaxRecoveryOperations,
+                [ValidateRange(1, [long]::MaxValue)][long]$MaxTraceEntries = $script:ReviewerSourceMaxRecoveryTraceEntries,
                 [ValidateRange(1, [int]::MaxValue)][int]$MaxSpans = $script:ReviewerSourceMaxSpansPerPath
             )
+            function New-ClosedDiffResult {
+                param([string]$Reason, [long]$Operations = 0, [long]$TraceEntries = 0)
+                return [pscustomobject]@{
+                    Success = $false; FailureReason = $Reason; Spans = @()
+                    InsertionCount = 0; DeletionCount = 0; EditDistance = 0
+                    OperationCount = $Operations; TraceEntryCount = $TraceEntries
+                }
+            }
+            if ($script:ReviewerSourceUtf8.GetByteCount($TargetText) -gt $MaxBytesPerSide -or
+                $script:ReviewerSourceUtf8.GetByteCount($SourceText) -gt $MaxBytesPerSide) {
+                return New-ClosedDiffResult -Reason "recoveryByteCapExceeded"
+            }
+            $targetCount = Measure-ReviewerSourceLineCount -Text $TargetText
+            $sourceCount = Measure-ReviewerSourceLineCount -Text $SourceText
+            if ($targetCount -gt $MaxLinesPerSide -or $sourceCount -gt $MaxLinesPerSide) {
+                return New-ClosedDiffResult -Reason "recoveryLineCapExceeded"
+            }
             $targetLines = Split-ReviewerSourceDiffLines -Text $TargetText
             $sourceLines = Split-ReviewerSourceDiffLines -Text $SourceText
-            $targetCount = @($targetLines).Count
-            $sourceCount = @($sourceLines).Count
-            if ($targetCount -gt $MaxLinesPerSide -or $sourceCount -gt $MaxLinesPerSide) { return $null }
-            $cells = ([long]$targetCount + 1L) * ([long]$sourceCount + 1L)
-            if ($cells -gt [long]$MaxMatrixCells) { return $null }
-            if ($TargetText -ceq $SourceText) { return , @() }
-
-            $matrix = [int[,]]::new(($targetCount + 1), ($sourceCount + 1))
-            for ($targetIndex = $targetCount - 1; $targetIndex -ge 0; $targetIndex--) {
-                for ($sourceIndex = $sourceCount - 1; $sourceIndex -ge 0; $sourceIndex--) {
-                    if ([string]$targetLines[$targetIndex] -ceq [string]$sourceLines[$sourceIndex]) {
-                        $matrix[$targetIndex, $sourceIndex] = 1 + $matrix[($targetIndex + 1), ($sourceIndex + 1)]
+            if ($TargetText -ceq $SourceText) {
+                return [pscustomobject]@{
+                    Success = $true; FailureReason = ""; Spans = @()
+                    InsertionCount = 0; DeletionCount = 0; EditDistance = 0
+                    OperationCount = 0; TraceEntryCount = 1
+                }
+            }
+            $distanceCeiling = [Math]::Min($MaxEditDistance, ($targetCount + $sourceCount))
+            $frontierEntryCount = (2 * $distanceCeiling) + 3
+            if ($frontierEntryCount -gt $MaxFrontierEntries) {
+                return New-ClosedDiffResult -Reason "recoveryFrontierCapExceeded"
+            }
+            $frontierOffset = $distanceCeiling + 1
+            $frontier = [int[]]::new($frontierEntryCount)
+            $frontier[$frontierOffset + 1] = 0
+            [long]$operations = 0
+            [long]$traceEntries = 0
+            $foundDistance = -1
+            :distanceLoop for ($distance = 0; $distance -le $distanceCeiling; $distance++) {
+                for ($diagonal = -$distance; $diagonal -le $distance; $diagonal += 2) {
+                    $operations++
+                    if ($operations -gt $MaxOperations) {
+                        return New-ClosedDiffResult -Reason "recoveryOperationCapExceeded" `
+                            -Operations $operations -TraceEntries $traceEntries
+                    }
+                    $frontierIndex = $frontierOffset + $diagonal
+                    if ($diagonal -eq -$distance -or
+                        ($diagonal -ne $distance -and
+                            $frontier[$frontierIndex - 1] -lt $frontier[$frontierIndex + 1])) {
+                        $x = $frontier[$frontierIndex + 1]
                     }
                     else {
-                        $matrix[$targetIndex, $sourceIndex] = [Math]::Max(
-                            $matrix[($targetIndex + 1), $sourceIndex],
-                            $matrix[$targetIndex, ($sourceIndex + 1)])
+                        $x = $frontier[$frontierIndex - 1] + 1
+                    }
+                    $y = $x - $diagonal
+                    while ($x -lt $targetCount -and $y -lt $sourceCount -and
+                        [string]$targetLines[$x] -ceq [string]$sourceLines[$y]) {
+                        $x++
+                        $y++
+                        $operations++
+                        if ($operations -gt $MaxOperations) {
+                            return New-ClosedDiffResult -Reason "recoveryOperationCapExceeded" `
+                                -Operations $operations -TraceEntries $traceEntries
+                        }
+                    }
+                    $frontier[$frontierIndex] = $x
+                    if ($x -ge $targetCount -and $y -ge $sourceCount) {
+                        $foundDistance = $distance
+                        break
                     }
                 }
+                if ($foundDistance -ge 0) { break distanceLoop }
             }
-
-            $changedSourceLines = [System.Collections.Generic.List[int]]::new()
-            $targetIndex = 0
-            $sourceIndex = 0
-            while ($targetIndex -lt $targetCount -and $sourceIndex -lt $sourceCount) {
-                if ([string]$targetLines[$targetIndex] -ceq [string]$sourceLines[$sourceIndex]) {
-                    $targetIndex++
-                    $sourceIndex++
+            if ($foundDistance -lt 0) {
+                return New-ClosedDiffResult -Reason "recoveryEditDistanceCapExceeded" `
+                    -Operations $operations -TraceEntries $traceEntries
+            }
+            $reverseTargetLines = [string[]]$targetLines.Clone()
+            $reverseSourceLines = [string[]]$sourceLines.Clone()
+            [Array]::Reverse($reverseTargetLines)
+            [Array]::Reverse($reverseSourceLines)
+            $reverseFrontier = [int[]]::new($frontierEntryCount)
+            $reverseFrontier[$frontierOffset + 1] = 0
+            $reverseTrace = [System.Collections.Generic.List[int[]]]::new()
+            for ($distance = 0; $distance -le $foundDistance; $distance++) {
+                $nextTraceEntries = $traceEntries + ((2L * $distance) + 1L)
+                if ($nextTraceEntries -gt $MaxTraceEntries) {
+                    return New-ClosedDiffResult -Reason "recoveryTraceCapExceeded" `
+                        -Operations $operations -TraceEntries $traceEntries
                 }
-                elseif ($matrix[($targetIndex + 1), $sourceIndex] -ge $matrix[$targetIndex, ($sourceIndex + 1)]) {
-                    $targetIndex++
+                for ($diagonal = -$distance; $diagonal -le $distance; $diagonal += 2) {
+                    $operations++
+                    if ($operations -gt $MaxOperations) {
+                        return New-ClosedDiffResult -Reason "recoveryOperationCapExceeded" `
+                            -Operations $operations -TraceEntries $traceEntries
+                    }
+                    $frontierIndex = $frontierOffset + $diagonal
+                    if ($diagonal -eq -$distance -or
+                        ($diagonal -ne $distance -and
+                            $reverseFrontier[$frontierIndex - 1] -lt $reverseFrontier[$frontierIndex + 1])) {
+                        $reverseX = $reverseFrontier[$frontierIndex + 1]
+                    }
+                    else {
+                        $reverseX = $reverseFrontier[$frontierIndex - 1] + 1
+                    }
+                    $reverseY = $reverseX - $diagonal
+                    while ($reverseX -lt $targetCount -and $reverseY -lt $sourceCount -and
+                        [string]$reverseTargetLines[$reverseX] -ceq [string]$reverseSourceLines[$reverseY]) {
+                        $reverseX++
+                        $reverseY++
+                        $operations++
+                        if ($operations -gt $MaxOperations) {
+                            return New-ClosedDiffResult -Reason "recoveryOperationCapExceeded" `
+                                -Operations $operations -TraceEntries $traceEntries
+                        }
+                    }
+                    $reverseFrontier[$frontierIndex] = $reverseX
+                }
+                $snapshot = [int[]]::new((2 * $distance) + 1)
+                for ($diagonal = -$distance; $diagonal -le $distance; $diagonal++) {
+                    $snapshot[$diagonal + $distance] = $reverseFrontier[$frontierOffset + $diagonal]
+                }
+                [void]$reverseTrace.Add($snapshot)
+                $traceEntries = $nextTraceEntries
+            }
+            $changedSourceLines = [System.Collections.Generic.List[int]]::new()
+            $insertionCount = 0
+            $deletionCount = 0
+            $x = 0
+            $y = 0
+            $remainingDistance = $foundDistance
+            while ($x -lt $targetCount -or $y -lt $sourceCount) {
+                while ($x -lt $targetCount -and $y -lt $sourceCount -and
+                    [string]$targetLines[$x] -ceq [string]$sourceLines[$y]) {
+                    $x++
+                    $y++
+                }
+                if ($x -ge $targetCount) {
+                    while ($y -lt $sourceCount) {
+                        [void]$changedSourceLines.Add($y + 1)
+                        $insertionCount++
+                        $remainingDistance--
+                        $y++
+                    }
+                    break
+                }
+                if ($y -ge $sourceCount) {
+                    $deletionCount += ($targetCount - $x)
+                    $remainingDistance -= ($targetCount - $x)
+                    $x = $targetCount
+                    break
+                }
+                $nextRemaining = $remainingDistance - 1
+                $suffixTargetCount = $targetCount - ($x + 1)
+                $suffixSourceCount = $sourceCount - $y
+                $reverseDiagonal = $suffixTargetCount - $suffixSourceCount
+                $deletionCanFinish = $false
+                if ($nextRemaining -ge 0 -and [Math]::Abs($reverseDiagonal) -le $nextRemaining) {
+                    $reverseSnapshot = $reverseTrace[$nextRemaining]
+                    $reverseIndex = $reverseDiagonal + $nextRemaining
+                    $deletionCanFinish = ($reverseIndex -ge 0 -and $reverseIndex -lt $reverseSnapshot.Length -and
+                        $reverseSnapshot[$reverseIndex] -ge $suffixTargetCount)
+                }
+                if ($deletionCanFinish) {
+                    $x++
+                    $deletionCount++
                 }
                 else {
-                    [void]$changedSourceLines.Add($sourceIndex + 1)
-                    $sourceIndex++
+                    [void]$changedSourceLines.Add($y + 1)
+                    $y++
+                    $insertionCount++
+                }
+                $remainingDistance = $nextRemaining
+            }
+            if ($remainingDistance -ne 0) {
+                throw "The bounded exact diff reconstruction violated its edit-distance invariant."
+            }
+            $orderedChangedLines = @($changedSourceLines)
+            $spans = [System.Collections.Generic.List[object]]::new()
+            if ($orderedChangedLines.Count -gt 0) {
+                $start = [int]$orderedChangedLines[0]
+                $end = $start
+                for ($index = 1; $index -lt $orderedChangedLines.Count; $index++) {
+                    $line = [int]$orderedChangedLines[$index]
+                    if ($line -eq ($end + 1)) { $end = $line; continue }
+                    [void]$spans.Add(@{ Start = $start; End = $end })
+                    if ($spans.Count -ge $MaxSpans) {
+                        return New-ClosedDiffResult -Reason "recoveryHunkCapExceeded" `
+                            -Operations $operations -TraceEntries $traceEntries
+                    }
+                    $start = $line
+                    $end = $line
+                }
+                [void]$spans.Add(@{ Start = $start; End = $end })
+                if ($spans.Count -gt $MaxSpans) {
+                    return New-ClosedDiffResult -Reason "recoveryHunkCapExceeded" `
+                        -Operations $operations -TraceEntries $traceEntries
                 }
             }
-            while ($sourceIndex -lt $sourceCount) {
-                [void]$changedSourceLines.Add($sourceIndex + 1)
-                $sourceIndex++
+            return [pscustomobject]@{
+                Success = $true; FailureReason = ""; Spans = @($spans.ToArray())
+                InsertionCount = $insertionCount; DeletionCount = $deletionCount
+                EditDistance = $foundDistance; OperationCount = $operations
+                TraceEntryCount = $traceEntries
             }
-            if ($changedSourceLines.Count -eq 0) { return , @() }
+        }
 
-            $spans = [System.Collections.Generic.List[object]]::new()
-            $start = $changedSourceLines[0]
-            $end = $start
-            for ($index = 1; $index -lt $changedSourceLines.Count; $index++) {
-                $line = $changedSourceLines[$index]
-                if ($line -eq ($end + 1)) { $end = $line; continue }
-                [void]$spans.Add(@{ Start = $start; End = $end })
-                if ($spans.Count -ge $MaxSpans) { return $null }
-                $start = $line
-                $end = $line
-            }
-            [void]$spans.Add(@{ Start = $start; End = $end })
-            if ($spans.Count -gt $MaxSpans) { return $null }
-            return , $spans.ToArray()
+        function Get-ReviewerSourceDeterministicDiffSpans {
+            param(
+                [Parameter(Mandatory)][AllowEmptyString()][string]$TargetText,
+                [Parameter(Mandatory)][AllowEmptyString()][string]$SourceText,
+                [ValidateRange(1, [int]::MaxValue)][int]$MaxLinesPerSide = $script:ReviewerSourceMaxRecoveryLinesPerSide,
+                [ValidateRange(1, [int]::MaxValue)][int]$MaxBytesPerSide = $script:ReviewerSourceMaxRecoveryBytesPerSide,
+                [ValidateRange(1, [int]::MaxValue)][int]$MaxEditDistance = $script:ReviewerSourceMaxRecoveryEditDistance,
+                [ValidateRange(3, [int]::MaxValue)][int]$MaxFrontierEntries = $script:ReviewerSourceMaxRecoveryFrontierEntries,
+                [ValidateRange(1, [long]::MaxValue)][long]$MaxOperations = $script:ReviewerSourceMaxRecoveryOperations,
+                [ValidateRange(1, [long]::MaxValue)][long]$MaxTraceEntries = $script:ReviewerSourceMaxRecoveryTraceEntries,
+                [ValidateRange(1, [int]::MaxValue)][int]$MaxSpans = $script:ReviewerSourceMaxSpansPerPath
+            )
+            $result = Get-ReviewerSourceDeterministicDiffResult @PSBoundParameters
+            if (-not [bool]$result.Success) { return $null }
+            return , @($result.Spans)
         }
 
         function Test-ReviewerSourceRecoveryResourceBinding {
@@ -1628,13 +1888,16 @@ function Get-ReviewerSourceDegenerateChanges {
                 [Parameter(Mandatory)]$Binding,
                 [Parameter(Mandatory)][scriptblock]$SourceReader,
                 [Parameter(Mandatory)][scriptblock]$BaseReader,
-                [ValidateRange(1, 256)][int]$MaxRecoveryFiles = $script:ReviewerSourceMaxRecoveryFiles
+                [ValidateRange(1, 256)][int]$MaxRecoveryFiles = $script:ReviewerSourceMaxRecoveryFiles,
+                [ValidateRange(1, [int]::MaxValue)][int]$MaxCensusBytes = [int]::MaxValue
             )
             $result = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
             foreach ($path in @($SpansByPath.Keys)) { $result[$path] = @($SpansByPath[$path]) }
             $recoveredPaths = [System.Collections.Generic.List[string]]::new()
             $spanBasisByPath = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
             $expectedSpanCountByPath = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
+            $authoritativeNoSourceByPath = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
+            $recoveryFailureByPath = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
             foreach ($path in @($result.Keys)) { $spanBasisByPath[$path] = "changeSet" }
             $attempted = 0
             if ([string](Get-ReviewerSourceValue -Object $Binding -Name "Organization" -Default "") -eq "" -or
@@ -1651,6 +1914,8 @@ function Get-ReviewerSourceDegenerateChanges {
                     AttemptedFileCount = 0
                     SpanBasisByPath = $spanBasisByPath
                     ExpectedSpanCountByPath = $expectedSpanCountByPath
+                    AuthoritativeNoSourceByPath = $authoritativeNoSourceByPath
+                    RecoveryFailureByPath = $recoveryFailureByPath
                     EvidenceBlockCount = 0
                 }
             }
@@ -1664,13 +1929,32 @@ function Get-ReviewerSourceDegenerateChanges {
                 if ($result.Contains($path) -and @($result[$path]).Count -gt 0) { continue }
                 $attempted++
                 $kinds = [string[]]@($candidates[$path].ChangeKinds)
+                $expectedSpanCountByPath[$path] = [int]$candidates[$path].EvidenceBlockCount
                 $source = $null
                 try { $source = & $SourceReader $path $kinds }
                 catch {
                     if ($_.Exception.Message -match 'session is closed|closed stdout|exited before returning|timed out') { throw }
                     continue
                 }
-                if ($null -eq $source -or [string](Get-ReviewerSourceValue -Object $source -Name "Rejected" -Default "")) { continue }
+                if ($null -eq $source) { continue }
+                $sourceRejected = [string](Get-ReviewerSourceValue -Object $source -Name "Rejected" -Default "")
+                if ($sourceRejected -and $sourceRejected -cne "emptyFile") {
+                    $sourceBytes = [int](Get-ReviewerSourceValue -Object $source -Name "ByteLength" -Default 0)
+                    if ($sourceRejected -ceq "fileTooLarge" -and
+                        $sourceBytes -gt $script:ReviewerSourceMaxRecoveryBytesPerSide) {
+                        $recoveryFailureByPath[$path] = [pscustomobject]@{
+                            Reason = "recoveryByteCapExceeded"
+                            FileByteLength = $sourceBytes
+                            FileSha256 = ""
+                            MimeType = [string](Get-ReviewerSourceValue -Object $source -Name "MimeType" -Default "")
+                            LineCount = 0
+                        }
+                    }
+                    continue
+                }
+                if ($sourceRejected -ceq "emptyFile" -and
+                    ([int](Get-ReviewerSourceValue -Object $source -Name "ByteLength" -Default -1) -ne 0 -or
+                        [string](Get-ReviewerSourceValue -Object $source -Name "Text" -Default "") -cne "")) { continue }
                 if (-not (Test-ReviewerSourceRecoveryResourceBinding -Resource $source -Binding $Binding -Path $path `
                             -CommitSha ([string](Get-ReviewerSourceValue -Object $Binding -Name "SourceCommit" -Default "")) `
                             -ChangeKinds $kinds)) { continue }
@@ -1680,18 +1964,64 @@ function Get-ReviewerSourceDegenerateChanges {
                     if ($_.Exception.Message -match 'session is closed|closed stdout|exited before returning|timed out') { throw }
                     continue
                 }
-                if ($null -eq $base -or [string](Get-ReviewerSourceValue -Object $base -Name "Rejected" -Default "")) { continue }
+                if ($null -eq $base) { continue }
+                $baseRejected = [string](Get-ReviewerSourceValue -Object $base -Name "Rejected" -Default "")
+                if ($baseRejected) {
+                    $baseBytes = [int](Get-ReviewerSourceValue -Object $base -Name "ByteLength" -Default 0)
+                    if ($baseRejected -ceq "fileTooLarge" -and
+                        $baseBytes -gt $script:ReviewerSourceMaxRecoveryBytesPerSide) {
+                        $sourceText = [string](Get-ReviewerSourceValue -Object $source -Name "Text" -Default "")
+                        $sourceBytes = [int](Get-ReviewerSourceValue -Object $source -Name "ByteLength" -Default 0)
+                        $includeWholeFileCensus = ($sourceBytes -le $MaxCensusBytes)
+                        $recoveryFailureByPath[$path] = [pscustomobject]@{
+                            Reason = "recoveryByteCapExceeded"
+                            FileByteLength = $sourceBytes
+                            FileSha256 = $(if ($includeWholeFileCensus) {
+                                    [string](Get-ReviewerSourceValue -Object $source -Name "Sha256" -Default "")
+                                } else { "" })
+                            MimeType = [string](Get-ReviewerSourceValue -Object $source -Name "MimeType" -Default "")
+                            LineCount = $(if ($includeWholeFileCensus) {
+                                    Measure-ReviewerSourceLineCount -Text $sourceText
+                                } else { 0 })
+                        }
+                    }
+                    continue
+                }
                 if (-not (Test-ReviewerSourceRecoveryResourceBinding -Resource $base -Binding $Binding -Path $path `
                             -CommitSha ([string](Get-ReviewerSourceValue -Object $Binding -Name "BaseCommit" -Default "")) `
                             -ChangeKinds $kinds)) { continue }
-                $recovered = Get-ReviewerSourceDeterministicDiffSpans `
+                $diffResult = Get-ReviewerSourceDeterministicDiffResult `
                     -TargetText ([string](Get-ReviewerSourceValue -Object $base -Name "Text" -Default "")) `
                     -SourceText ([string](Get-ReviewerSourceValue -Object $source -Name "Text" -Default ""))
-                if ($null -eq $recovered -or @($recovered).Count -eq 0) { continue }
-                $result[$path] = @($recovered)
+                if (-not [bool]$diffResult.Success) {
+                    $sourceText = [string](Get-ReviewerSourceValue -Object $source -Name "Text" -Default "")
+                    $sourceBytes = [int](Get-ReviewerSourceValue -Object $source -Name "ByteLength" -Default 0)
+                    $includeWholeFileCensus = ($sourceBytes -le $MaxCensusBytes)
+                    $recoveryFailureByPath[$path] = [pscustomobject]@{
+                        Reason = [string]$diffResult.FailureReason
+                        FileByteLength = $sourceBytes
+                        FileSha256 = $(if ($includeWholeFileCensus) {
+                                [string](Get-ReviewerSourceValue -Object $source -Name "Sha256" -Default "")
+                            } else { "" })
+                        MimeType = [string](Get-ReviewerSourceValue -Object $source -Name "MimeType" -Default "")
+                        LineCount = $(if ($includeWholeFileCensus) {
+                                Measure-ReviewerSourceLineCount -Text $sourceText
+                            } else { 0 })
+                    }
+                    continue
+                }
+                if (@($diffResult.Spans).Count -eq 0) {
+                    if ([int]$diffResult.DeletionCount -gt 0 -and [int]$diffResult.InsertionCount -eq 0) {
+                        $spanBasisByPath[$path] = "recovered"
+                        $authoritativeNoSourceByPath[$path] = "authoritativeDeletionOnly"
+                        $expectedSpanCountByPath.Remove($path)
+                    }
+                    continue
+                }
+                $result[$path] = @($diffResult.Spans)
                 $spanBasisByPath[$path] = "recovered"
                 $expectedSpanCountByPath[$path] = [Math]::Max(
-                    @($recovered).Count, [int]$candidates[$path].EvidenceBlockCount)
+                    @($diffResult.Spans).Count, [int]$candidates[$path].EvidenceBlockCount)
                 [void]$recoveredPaths.Add([string]$path)
             }
             return [pscustomobject]@{
@@ -1700,6 +2030,8 @@ function Get-ReviewerSourceDegenerateChanges {
                 AttemptedFileCount = $attempted
                 SpanBasisByPath = $spanBasisByPath
                 ExpectedSpanCountByPath = $expectedSpanCountByPath
+                AuthoritativeNoSourceByPath = $authoritativeNoSourceByPath
+                RecoveryFailureByPath = $recoveryFailureByPath
                 EvidenceBlockCount = $evidenceBlockCount
             }
         }
@@ -2094,8 +2426,14 @@ function Get-ReviewerSourceReaderResult {
         [Parameter(Mandatory)]$ToolResult,
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][hashtable]$Policy,
+        [ValidateRange(0, [int]::MaxValue)][int]$MaxBytesPerFile = 0,
         [Parameter(Mandatory)][scriptblock]$Decoder
     )
+    $effectiveMaxBytes = if ($MaxBytesPerFile -gt 0) {
+        $MaxBytesPerFile
+    } else {
+        [int]$Policy.maxFetchBytesPerFile
+    }
     $peek = $null
     try {
         if ($ToolResult -is [System.Management.Automation.PSCustomObject] -or $ToolResult -is [System.Collections.IDictionary]) {
@@ -2157,7 +2495,7 @@ function Get-ReviewerSourceReaderResult {
         # the problem. It stays in the coverage denominator either way.
         return [pscustomobject]@{ Rejected = "decodeRejected"; MimeType = [string]$peek.MimeType; ByteLength = 0 }
     }
-    if ([int]$peek.ByteLength -gt [int]$Policy.maxFetchBytesPerFile) {
+    if ([int]$peek.ByteLength -gt $effectiveMaxBytes) {
         return [pscustomobject]@{ Rejected = "fileTooLarge"; MimeType = [string]$peek.MimeType; ByteLength = [int]$peek.ByteLength }
     }
     try { $decoded = & $Decoder $ToolResult $Path }
@@ -2201,6 +2539,8 @@ function New-ReviewerSourceTransportReport {
         $ChangeKindsByPath = $null,
         $SpanBasisByPath = $null,
         $ExpectedSpanCountByPath = $null,
+        $AuthoritativeNoSourceByPath = $null,
+        $RecoveryFailureByPath = $null,
         [ValidateRange(0, [int]::MaxValue)][int]$RecoveryAttemptedFileCount = 0,
         [ValidateRange(0, [int]::MaxValue)][int]$RecoveryRecoveredFileCount = 0,
         [ValidateRange(0, [int]::MaxValue)][int]$RecoveryEvidenceBlockCount = 0,
@@ -2245,6 +2585,37 @@ function New-ReviewerSourceTransportReport {
             $index--
             [void]$files.Add((New-ReviewerSourceFileEntry -Path ([string]$rawPath) -CommitSha $CommitSha `
                         -Status "omitted" -Reason "pathRejected" -SpanBasis $spanBasis))
+            continue
+        }
+        $authoritativeNoSourceReason = if ($null -ne $AuthoritativeNoSourceByPath) {
+            [string](Get-ReviewerSourceValue -Object $AuthoritativeNoSourceByPath -Name $path -Default "")
+        } else { "" }
+        if ($authoritativeNoSourceReason) {
+            $index--
+            [void]$files.Add((New-ReviewerSourceFileEntry -Path $path -CommitSha $CommitSha `
+                        -Status "omitted" -Reason $authoritativeNoSourceReason -CarriesSource $false `
+                        -NoSourceBasis "authoritativeComparison" -SpanBasis $spanBasis))
+            continue
+        }
+        $recoveryFailure = if ($null -ne $RecoveryFailureByPath) {
+            Get-ReviewerSourceValue -Object $RecoveryFailureByPath -Name $path -Default $null
+        } else { $null }
+        if ($null -ne $recoveryFailure) {
+            $recoveryFailureReason = if ($recoveryFailure -is [string]) {
+                [string]$recoveryFailure
+            } else {
+                [string](Get-ReviewerSourceValue -Object $recoveryFailure -Name "Reason" -Default "")
+            }
+            if (-not $recoveryFailureReason) {
+                throw "A recovery failure must carry a closed reason."
+            }
+            [void]$files.Add((New-ReviewerSourceFileEntry -Path $path -CommitSha $CommitSha `
+                        -Status "omitted" -Reason $recoveryFailureReason -SpanBasis $spanBasis `
+                        -RawRequestedSpanCount $requestedForPath `
+                        -FileByteLength ([int](Get-ReviewerSourceValue -Object $recoveryFailure -Name "FileByteLength" -Default 0)) `
+                        -FileSha256 ([string](Get-ReviewerSourceValue -Object $recoveryFailure -Name "FileSha256" -Default "")) `
+                        -MimeType ([string](Get-ReviewerSourceValue -Object $recoveryFailure -Name "MimeType" -Default "")) `
+                        -LineCount ([int](Get-ReviewerSourceValue -Object $recoveryFailure -Name "LineCount" -Default 0))))
             continue
         }
         if ($index -gt [int]$Policy.maxFiles) {
@@ -2501,6 +2872,9 @@ function New-ReviewerSourceTransportReport {
     # host whose misbehaviour emptied the line-diff blocks in the first place.
     $readerExcusedFileCount = @(@($files) | Where-Object { -not [bool]$_.CarriesSource -and [string]$_.NoSourceBasis -ceq 'reader' }).Count
     $changeSetExcusedFileCount = @(@($files) | Where-Object { -not [bool]$_.CarriesSource -and [string]$_.NoSourceBasis -ceq 'changeSet' }).Count
+    $authoritativeDeletionOnlyFileCount = @(@($files) | Where-Object {
+            -not [bool]$_.CarriesSource -and [string]$_.NoSourceBasis -ceq 'authoritativeComparison'
+        }).Count
     # Only the reader-excused paths the change set's OWN path does not corroborate
     # are charged against the allowance. An icon the pull request calls `.png` and
     # the reader calls non-text is two parties agreeing; `/src/Handler.cs` called
@@ -2558,7 +2932,7 @@ function New-ReviewerSourceTransportReport {
     # The cost is deliberate and is the point: a pull request that adds assets
     # the host reports as non-text scores against them, because from this side
     # "an icon" and "a source file the host is lying about" are the same answer.
-    $sourceBearingFileCount = $changedFileCount - $changeSetExcusedFileCount
+    $sourceBearingFileCount = $changedFileCount - $changeSetExcusedFileCount - $authoritativeDeletionOnlyFileCount
     $percent = if ($sourceBearingFileCount -lt 1) { 100 }
     else { [int][Math]::Floor(($coveredFileCount * 100.0) / $sourceBearingFileCount) }
     # A file-level percentage alone lets a change set where every file
@@ -2582,11 +2956,12 @@ function New-ReviewerSourceTransportReport {
         CommitSha              = $CommitSha.ToLowerInvariant()
         ChangedFileCount       = $changedFileCount
         SourceBearingFileCount = $sourceBearingFileCount
-        NoSourceFileCount      = $changeSetExcusedFileCount
+        NoSourceFileCount      = ($changeSetExcusedFileCount + $authoritativeDeletionOnlyFileCount)
         ReaderExcusedFileCount = $readerExcusedFileCount
         ReaderExcusedUncorroboratedCount = $readerExcusedUncorroboratedCount
         ReaderNonTextUncorroboratedCount = $readerNonTextUncorroboratedCount
         ChangeSetExcusedFileCount = $changeSetExcusedFileCount
+        AuthoritativeDeletionOnlyFileCount = $authoritativeDeletionOnlyFileCount
         ReaderExcusedAllowance = $readerExcusedAllowance
         DeliveredFiles         = $deliveredFileCount
         PartialFiles           = $partialFileCount
@@ -2635,7 +3010,7 @@ function New-ReviewerSourceFileEntry {
         # first may make a change set vacuously covered - a change type is the
         # pull request's assertion, while a MIME type is an assertion by the same
         # host whose misbehaviour this layer exists to survive.
-        [ValidateSet("", "changeSet", "reader")][string]$NoSourceBasis = "",
+        [ValidateSet("", "changeSet", "reader", "authoritativeComparison")][string]$NoSourceBasis = "",
         [ValidateSet("changeSet", "recovered")][string]$SpanBasis = "changeSet",
         # The pull request's OWN hunks for this path, before any context radius
         # was added. A delivered slice is a hunk plus up to thirty untouched
@@ -2697,16 +3072,13 @@ function Test-ReviewerSourceCoverageGate {
         [void]$reasons.Add("sourceCoverageUnknown")
     }
     elseif ([int]$Report.SourceBearingFileCount -lt 1) {
-        # Every path is one the pull request ITSELF declared source-free - a
-        # delete or a rename. There is nothing to deliver, so coverage is
-        # vacuously complete, which is a different thing from having failed to
-        # deliver source that existed.
-        #
-        # Only the change set can put a change set in this state: a
-        # reader-derived excusal no longer leaves the denominator, so
-        # SourceBearingFileCount cannot reach zero while any path was excused on
-        # the host's word. A hostile host that mislabels everything now lands on
-        # sourceCoverageEmpty at 0%, not here.
+        # Every changed path was authoritatively classified as having no
+        # reviewable right-hand source: either the change set declared a
+        # deletion/no-source change, or exact pinned common-to-source comparison
+        # proved deletion-only content. Coverage is therefore vacuously complete,
+        # which is different from having failed to deliver source that existed.
+        # Read, decode, cap, and other unproven failures remain source-bearing in
+        # the denominator, so none can create this state.
         $reasons.Clear()
     }
     else {
@@ -2828,8 +3200,11 @@ function Format-ReviewerSealedSourceBlock {
     if ([int]$Report.ReaderExcusedFileCount -gt 0) {
         $accounting += ". $($Report.ReaderExcusedFileCount) changed path(s) counted above are ones the repository host answered for but whose source content could NOT be established - you have not read them, and nobody has told you they are empty"
     }
-    if ([int]$Report.NoSourceFileCount -gt 0) {
-        $accounting += ". $($Report.NoSourceFileCount) further changed path(s) are ones THE PULL REQUEST ITSELF says hold no added or edited text - a delete or a rename - so there is nothing in them for anyone to read"
+    if ([int]$Report.ChangeSetExcusedFileCount -gt 0) {
+        $accounting += ". $($Report.ChangeSetExcusedFileCount) further changed path(s) are ones THE PULL REQUEST ITSELF says hold no added or edited text - a delete or a rename - so there is nothing in them for anyone to read"
+    }
+    if ([int]$Report.AuthoritativeDeletionOnlyFileCount -gt 0) {
+        $accounting += ". $($Report.AuthoritativeDeletionOnlyFileCount) further changed path(s) were proven by an exact pinned common-to-source comparison to contain only deletions and no right-hand source"
     }
     # Backtick-escaped so "$accounting:" is not parsed as a scope qualifier.
     [void]$lines.Add("$accounting`:")
@@ -2864,7 +3239,7 @@ function Format-ReviewerSealedSourceBlock {
                 $script:ReviewerSourceNothingToReadReasons -cnotcontains $_ -and
                 $_ -cnotin @('pathRejected', 'fileCountCapExceeded', 'budgetExhausted', 'sliceCountCapExceeded', 'spanOutsideFile', 'unsafeSliceText', 'recoveredHunkShortfall')
             }) | ForEach-Object { "``$_``" })
-    [void]$lines.Add("You may not claim to have reviewed, verified, or cleared a path whose status is ``omitted``, and you may not treat a ``partial`` path as fully read. Say what you could not see. EXACTLY $($nothingToRead.Count) reason is different: $($nothingToRead -join ', ') means the pull request itself says that path holds no added or edited text - a delete or a rename - so there is nothing in it for anyone to read. Every OTHER reason, including $($stillUnread -join ', '), means the source content of that path could NOT be established. Those are files you have not read. Nobody has told you they are empty, and you may not treat them as checked.")
+    [void]$lines.Add("You may not claim to have reviewed, verified, or cleared a path whose status is ``omitted``, and you may not treat a ``partial`` path as fully read. Say what you could not see. EXACTLY $($nothingToRead.Count) reasons are different: ``noChangedSpans`` means the pull request declares no added or edited text, and ``authoritativeDeletionOnly`` means an exact pinned common-to-source comparison proved only deletions. In either state there is no right-hand source for anyone to read. Every OTHER reason, including $($stillUnread -join ', '), means the source content or its changed right-hand spans could NOT be established. Those are files you have not read. Nobody has told you they are empty, and you may not treat them as checked.")
     [void]$lines.Add("")
     if ([int]$Report.ReaderNonTextUncorroboratedCount -gt 0) {
         [void]$lines.Add("A path marked ``readerReportedNonTextUncorroborated`` is one the REPOSITORY HOST ALONE reported as not being text. The pull request's own path for it does not say so - it looks like an ordinary source file - and no source was delivered for it. You have not read it. Do not review it, do not clear it, do not report a finding on it, and do not count it as checked. How much of this change set may be set aside this way is bounded, and $($Report.ReaderNonTextUncorroboratedCount) path(s) here are.")
@@ -3017,6 +3392,7 @@ function ConvertTo-ReviewerSourceCoverageRecord {
         readerExcusedUncorroboratedCount = [int]$Report.ReaderExcusedUncorroboratedCount
         readerNonTextUncorroboratedCount = [int]$Report.ReaderNonTextUncorroboratedCount
         changeSetExcusedFileCount = [int]$Report.ChangeSetExcusedFileCount
+        authoritativeDeletionOnlyFileCount = [int]$Report.AuthoritativeDeletionOnlyFileCount
         readerExcusedAllowance = [int]$Report.ReaderExcusedAllowance
         deliveredFiles   = [int]$Report.DeliveredFiles
         partialFiles     = [int]$Report.PartialFiles

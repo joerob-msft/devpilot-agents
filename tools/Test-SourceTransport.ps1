@@ -26,8 +26,9 @@ Set-StrictMode -Version Latest
 $repoRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repoRoot 'src/Agents/reviewer/SourceTransport.ps1')
 
-# The wrapper is parsed, never executed: these checks assert how the library is
-# WIRED IN, which no amount of library-level testing can establish.
+# The wrapper is parsed for structural checks. Its two authoritative transport
+# adapters are also executed below with synthetic in-process dependencies so
+# closure capture and production wiring are covered without network activity.
 $wrapperPath = Join-Path $repoRoot 'src/Agents/reviewer/Start-ReviewerAgent.ps1'
 $wrapperText = [IO.File]::ReadAllText($wrapperPath)
 $wrapperTokens = $null
@@ -1629,13 +1630,15 @@ Assert-Source ([int]$binaryAddReport.RequestedSpanCount -eq 1) `
 $binaryAddBlock = Format-ReviewerSealedSourceBlock -Report $binaryAddReport -NonceFactory { 'n' * 32 }
 Assert-Source ($binaryAddBlock -match '/assets/logo\.png' -and $binaryAddBlock -match 'binaryNoText') `
     "the binary is still named in the accounting table with its own reason"
-Assert-Source ($binaryAddBlock -match 'EXACTLY 1 reason is different' -and
-    $binaryAddBlock -match '`noChangedSpans` means the pull request itself says') `
-    "only the pull request's own statement is presented to the model as nothing-to-read"
+Assert-Source ($binaryAddBlock -match 'EXACTLY 2 reasons are different' -and
+    $binaryAddBlock -match '`noChangedSpans` means the pull request' -and
+    $binaryAddBlock -match '`authoritativeDeletionOnly` means an exact pinned') `
+    "only change-set or exact authoritative comparison proof is presented to the model as nothing-to-read"
 # The sentence is generated from the closed set, so adding a reason to the set
 # without meaning to changes the model's instructions and fails here.
-Assert-Source (@($script:ReviewerSourceNothingToReadReasons) -join ',' -ceq 'noChangedSpans') `
-    "the nothing-to-read set the sentence is built from holds exactly noChangedSpans"
+Assert-Source ((@($script:ReviewerSourceNothingToReadReasons) -join ',') -ceq
+    'noChangedSpans,authoritativeDeletionOnly') `
+    "the nothing-to-read set holds exactly change-set and authoritative comparison proof states"
 # Derived, not hand-listed: the block's sentence is generated from the same sets,
 # so a hand-maintained copy here would be exactly the drift this file refuses.
 $structuralReasons = @('pathRejected', 'fileCountCapExceeded', 'budgetExhausted', 'sliceCountCapExceeded', 'spanOutsideFile', 'unsafeSliceText', 'recoveredHunkShortfall')
@@ -1645,7 +1648,7 @@ foreach ($readerReason in @($script:ReviewerSourceOmissionReasons | Where-Object
     Assert-Source ($binaryAddBlock -match "``$readerReason``") `
         "the model is told '$readerReason' means the source content could not be established"
 }
-Assert-Source ($binaryAddBlock -match 'means the source content of that path could NOT be established' -and
+Assert-Source ($binaryAddBlock -match 'means the source content or its changed right-hand spans could NOT be established' -and
     $binaryAddBlock -match 'Nobody has told you they are empty') `
     "and every reader-derived reason is described to the model as a file it has not read"
 
@@ -2329,6 +2332,37 @@ $bigResult = Get-ReviewerSourceReaderResult -ToolResult (New-ResourceToolResult 
 Assert-Source (([string]$bigResult.Rejected) -ceq 'fileTooLarge') "an oversized file is classified fileTooLarge, not transportFailed"
 Assert-Source ([int]$bigResult.ByteLength -eq 4096) "the oversize classification reports the real decoded size"
 
+$recoveryBoundaryBytes = [byte[]]::new($script:ReviewerSourceMaxRecoveryBytesPerSide)
+[Array]::Fill($recoveryBoundaryBytes, [byte][char]'a')
+$recoveryBoundaryBase64 = [Convert]::ToBase64String($recoveryBoundaryBytes)
+$ordinaryBoundaryResult = Get-ReviewerSourceReaderResult `
+    -ToolResult (New-ResourceToolResult -Base64 $recoveryBoundaryBase64) `
+    -Path '/src/recovery-boundary.cs' -Policy (New-TestPolicy -Overrides @{ maxFetchBytesPerFile = 1048576 }) `
+    -Decoder $strictDecoder
+$privateBoundaryResult = Get-ReviewerSourceReaderResult `
+    -ToolResult (New-ResourceToolResult -Base64 $recoveryBoundaryBase64) `
+    -Path '/src/recovery-boundary.cs' -Policy $readerPolicy `
+    -MaxBytesPerFile $script:ReviewerSourceMaxRecoveryBytesPerSide -Decoder $strictDecoder
+$overRecoveryBoundaryBytes = [byte[]]::new($script:ReviewerSourceMaxRecoveryBytesPerSide + 1)
+[Array]::Fill($overRecoveryBoundaryBytes, [byte][char]'a')
+$overPrivateBoundaryResult = Get-ReviewerSourceReaderResult `
+    -ToolResult (New-ResourceToolResult -Base64 ([Convert]::ToBase64String($overRecoveryBoundaryBytes))) `
+    -Path '/src/over-recovery-boundary.cs' -Policy $readerPolicy `
+    -MaxBytesPerFile $script:ReviewerSourceMaxRecoveryBytesPerSide -Decoder $strictDecoder
+Assert-Source ([string]$ordinaryBoundaryResult.Rejected -ceq 'fileTooLarge' -and
+    [int]$ordinaryBoundaryResult.ByteLength -eq $script:ReviewerSourceMaxRecoveryBytesPerSide) `
+    "ordinary source delivery still rejects a 2 MiB file under its independent 1 MiB policy ceiling"
+Assert-Source ([string]$privateBoundaryResult.Text -and
+    [int]$privateBoundaryResult.ByteLength -eq $script:ReviewerSourceMaxRecoveryBytesPerSide -and
+    -not $privateBoundaryResult.PSObject.Properties['Rejected']) `
+    "the private recovery reader accepts exactly the existing 2 MiB Myers byte ceiling"
+Assert-Source ([string]$overPrivateBoundaryResult.Rejected -ceq 'fileTooLarge' -and
+    [int]$overPrivateBoundaryResult.ByteLength -eq ($script:ReviewerSourceMaxRecoveryBytesPerSide + 1)) `
+    "the private recovery reader rejects one byte beyond the hard 2 MiB ceiling before decode"
+$recoveryBoundaryBytes = $null
+$recoveryBoundaryBase64 = $null
+$overRecoveryBoundaryBytes = $null
+
 # An empty added file is an ordinary thing. Calling it "too large" sent an
 # operator to the wrong lever and, worse, kept it in the coverage denominator so
 # that adding a .gitkeep sank a pull request's coverage forever.
@@ -2836,9 +2870,95 @@ foreach ($malformedResponse in $malformedResponses) {
     Assert-Source (@((Get-ReviewerSourceDegenerateChanges -Response $malformedResponse).Keys).Count -eq 0) `
         "malformed, empty, or truncated aggregate blocks are not treated as proof of recoverability"
 }
-Assert-Source ($null -eq (Get-ReviewerSourceDeterministicDiffSpans -TargetText ("x`n" * 20) `
-            -SourceText ("y`n" * 20) -MaxMatrixCells 100)) `
-    "diff work over the matrix cap is refused before spans are produced"
+function Get-MatrixOracleSpans {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$TargetText,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$SourceText
+    )
+    $targetLines = Split-ReviewerSourceDiffLines -Text $TargetText
+    $sourceLines = Split-ReviewerSourceDiffLines -Text $SourceText
+    $targetCount = @($targetLines).Count
+    $sourceCount = @($sourceLines).Count
+    $matrix = [int[,]]::new(($targetCount + 1), ($sourceCount + 1))
+    for ($targetIndex = $targetCount - 1; $targetIndex -ge 0; $targetIndex--) {
+        for ($sourceIndex = $sourceCount - 1; $sourceIndex -ge 0; $sourceIndex--) {
+            if ([string]$targetLines[$targetIndex] -ceq [string]$sourceLines[$sourceIndex]) {
+                $matrix[$targetIndex, $sourceIndex] = 1 + $matrix[($targetIndex + 1), ($sourceIndex + 1)]
+            }
+            else {
+                $matrix[$targetIndex, $sourceIndex] = [Math]::Max(
+                    $matrix[($targetIndex + 1), $sourceIndex],
+                    $matrix[$targetIndex, ($sourceIndex + 1)])
+            }
+        }
+    }
+    $changed = [System.Collections.Generic.List[int]]::new()
+    $targetIndex = 0
+    $sourceIndex = 0
+    while ($targetIndex -lt $targetCount -and $sourceIndex -lt $sourceCount) {
+        if ([string]$targetLines[$targetIndex] -ceq [string]$sourceLines[$sourceIndex]) {
+            $targetIndex++
+            $sourceIndex++
+        }
+        elseif ($matrix[($targetIndex + 1), $sourceIndex] -ge $matrix[$targetIndex, ($sourceIndex + 1)]) {
+            $targetIndex++
+        }
+        else {
+            [void]$changed.Add($sourceIndex + 1)
+            $sourceIndex++
+        }
+    }
+    while ($sourceIndex -lt $sourceCount) {
+        [void]$changed.Add($sourceIndex + 1)
+        $sourceIndex++
+    }
+    $spans = [System.Collections.Generic.List[object]]::new()
+    if ($changed.Count -gt 0) {
+        $start = $changed[0]
+        $end = $start
+        for ($index = 1; $index -lt $changed.Count; $index++) {
+            if ($changed[$index] -eq ($end + 1)) { $end = $changed[$index]; continue }
+            [void]$spans.Add([pscustomobject]@{ Start = $start; End = $end })
+            $start = $changed[$index]
+            $end = $start
+        }
+        [void]$spans.Add([pscustomobject]@{ Start = $start; End = $end })
+    }
+    return , $spans.ToArray()
+}
+function Convert-SpansToKey {
+    param([object[]]$Spans)
+    return (@($Spans | ForEach-Object { "$([int]$_.Start)-$([int]$_.End)" }) -join ",")
+}
+function Get-MatrixOracleEditDistance {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$TargetText,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$SourceText
+    )
+    $targetLines = Split-ReviewerSourceDiffLines -Text $TargetText
+    $sourceLines = Split-ReviewerSourceDiffLines -Text $SourceText
+    $previous = [int[]]::new(($sourceLines.Count + 1))
+    for ($targetIndex = $targetLines.Count - 1; $targetIndex -ge 0; $targetIndex--) {
+        $current = [int[]]::new(($sourceLines.Count + 1))
+        for ($sourceIndex = $sourceLines.Count - 1; $sourceIndex -ge 0; $sourceIndex--) {
+            $current[$sourceIndex] = if ([string]$targetLines[$targetIndex] -ceq [string]$sourceLines[$sourceIndex]) {
+                1 + $previous[$sourceIndex + 1]
+            } else {
+                [Math]::Max($previous[$sourceIndex], $current[$sourceIndex + 1])
+            }
+        }
+        $previous = $current
+    }
+    return ($targetLines.Count + $sourceLines.Count - (2 * $previous[0]))
+}
+
+$editCapResult = Get-ReviewerSourceDeterministicDiffResult -TargetText ("x`n" * 20) `
+    -SourceText ("y`n" * 20) -MaxEditDistance 10
+Assert-Source (-not $editCapResult.Success -and
+    [string]$editCapResult.FailureReason -ceq "recoveryEditDistanceCapExceeded" -and
+    $null -eq (Get-ReviewerSourceDeterministicDiffSpans -TargetText ("x`n" * 20) `
+            -SourceText ("y`n" * 20) -MaxEditDistance 10)) `
+    "diff work over the edit-distance cap fails closed before spans are produced"
 Assert-Source ($null -eq (Get-ReviewerSourceDeterministicDiffSpans -TargetText "a`nb`nc`nd" `
             -SourceText "A`nb`nC`nd" -MaxSpans 1)) `
     "a recovered diff over the hunk cap is refused rather than truncated"
@@ -2863,6 +2983,152 @@ Assert-Source ($wrongTargetSpans.Count -eq 1 -and [int]$wrongTargetSpans[0].Star
 Assert-Source ($commonBaseSpans.Count -eq 2 -and ([int]($commonBaseSpans[0].Start)) -eq 2 -and
     ([int]($commonBaseSpans[1].Start)) -eq 4) `
     "common-base comparison includes the shared target+PR hunk and excludes the target-only hunk"
+
+$adversarialDiffCases = @(
+    @{ Name = "empty"; Target = ""; Source = "" },
+    @{ Name = "insert"; Target = "a`nb`n"; Source = "a`nx`nb`n" },
+    @{ Name = "delete"; Target = "a`nx`nb`n"; Source = "a`nb`n" },
+    @{ Name = "replace"; Target = "a`nold`nb`n"; Source = "a`nnew`nb`n" },
+    @{ Name = "shifted repeated block"; Target = "a`nb`na`nb`nc`n"; Source = "a`na`nb`nb`nc`n" },
+    @{ Name = "multiple hunks"; Target = "a`nb`nc`nd`ne`n"; Source = "a`nB`nc`nD`ne`n" },
+    @{ Name = "ambiguous equals"; Target = "a`nb`na`n"; Source = "a`na`nb`n" },
+    @{ Name = "line endings"; Target = "a`r`nb`r`n"; Source = "a`nb`n" },
+    @{ Name = "empty target"; Target = ""; Source = "a`nb`n" },
+    @{ Name = "empty source"; Target = "a`nb`n"; Source = "" }
+)
+foreach ($case in $adversarialDiffCases) {
+    $oracleKey = Convert-SpansToKey (Get-MatrixOracleSpans -TargetText $case.Target -SourceText $case.Source)
+    $myersKey = Convert-SpansToKey (Get-ReviewerSourceDeterministicDiffSpans -TargetText $case.Target -SourceText $case.Source)
+    Assert-Source ($myersKey -ceq $oracleKey) "bounded Myers matches the exact matrix oracle for $($case.Name)"
+}
+
+$random = [System.Random]::new(20260808)
+$alphabet = @("a`n", "b`n", "a`n", "c`n", "`n")
+$generatedAgree = $true
+$generatedMismatch = ""
+for ($caseIndex = 0; $caseIndex -lt 400; $caseIndex++) {
+    $targetParts = [System.Collections.Generic.List[string]]::new()
+    $sourceParts = [System.Collections.Generic.List[string]]::new()
+    foreach ($ignored in 1..($random.Next(1, 13))) { [void]$targetParts.Add($alphabet[$random.Next($alphabet.Count)]) }
+    foreach ($ignored in 1..($random.Next(1, 13))) { [void]$sourceParts.Add($alphabet[$random.Next($alphabet.Count)]) }
+    $generatedTarget = $targetParts -join ""
+    $generatedSource = $sourceParts -join ""
+    $oracleKey = Convert-SpansToKey (Get-MatrixOracleSpans -TargetText $generatedTarget -SourceText $generatedSource)
+    $oracleDistance = Get-MatrixOracleEditDistance -TargetText $generatedTarget -SourceText $generatedSource
+    $myersResult = Get-ReviewerSourceDeterministicDiffResult -TargetText $generatedTarget -SourceText $generatedSource
+    $myersKey = Convert-SpansToKey $myersResult.Spans
+    $spannedInsertionCount = 0
+    foreach ($span in @($myersResult.Spans)) {
+        $spannedInsertionCount += ([int]$span.End - [int]$span.Start + 1)
+    }
+    if (-not $myersResult.Success -or [int]$myersResult.EditDistance -ne $oracleDistance -or
+        $myersKey -cne $oracleKey -or
+        $spannedInsertionCount -ne [int]$myersResult.InsertionCount) {
+        $generatedAgree = $false
+        $generatedMismatch = "case=$caseIndex oracle=$oracleKey myers=$myersKey oracleDistance=$oracleDistance myersDistance=$($myersResult.EditDistance)"
+        break
+    }
+}
+Assert-Source $generatedAgree "400 bounded repeated-line cases reproduce the exact matrix oracle's canonical right-hand spans ($generatedMismatch)"
+
+$reportedTieTarget = "a`nb`nb`n"
+$reportedTieSource = "b`na`nb`n"
+Assert-Source ((Convert-SpansToKey (Get-ReviewerSourceDeterministicDiffSpans $reportedTieTarget $reportedTieSource)) -ceq "2-2") `
+    "repeated-line tie reconstruction preserves the matrix oracle's deletion-first right-hand span"
+
+$generatedUniqueAgree = $true
+for ($caseIndex = 0; $caseIndex -lt 200; $caseIndex++) {
+    $lineCount = $random.Next(2, 20)
+    $targetUnique = [System.Collections.Generic.List[string]]::new()
+    $sourceUnique = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in 1..$lineCount) {
+        $value = "case-$caseIndex-line-$line`n"
+        [void]$targetUnique.Add($value)
+        if ($random.Next(0, 5) -eq 0) { continue }
+        if ($random.Next(0, 5) -eq 0) { [void]$sourceUnique.Add("case-$caseIndex-replaced-$line`n") }
+        else { [void]$sourceUnique.Add($value) }
+        if ($random.Next(0, 7) -eq 0) { [void]$sourceUnique.Add("case-$caseIndex-inserted-$line`n") }
+    }
+    $targetUniqueText = $targetUnique -join ""
+    $sourceUniqueText = $sourceUnique -join ""
+    if ((Convert-SpansToKey (Get-MatrixOracleSpans $targetUniqueText $sourceUniqueText)) -cne
+        (Convert-SpansToKey (Get-ReviewerSourceDeterministicDiffSpans $targetUniqueText $sourceUniqueText))) {
+        $generatedUniqueAgree = $false
+        break
+    }
+}
+Assert-Source $generatedUniqueAgree "200 generated unique-line edit scripts reproduce the matrix oracle's exact right-hand spans"
+
+$repeatTarget = "a`nb`na`nc`na`nd`n"
+$repeatSource = "a`na`nb`nc`nA`nd`n"
+$repeatKeys = @(1..20 | ForEach-Object {
+        Convert-SpansToKey (Get-ReviewerSourceDeterministicDiffSpans -TargetText $repeatTarget -SourceText $repeatSource)
+    } | Sort-Object -Unique)
+Assert-Source ($repeatKeys.Count -eq 1) "ambiguous minimal scripts reconstruct deterministically across repeated runs"
+
+$largeTargetLines = [string[]](1..5000 | ForEach-Object { "line-$($_)" })
+$largeSourceLines = [string[]]$largeTargetLines.Clone()
+$largeSourceLines[99] = "changed-100"
+$largeSourceLines[2499] = "changed-2500"
+$largeSourceLines[4899] = "changed-4900"
+$largeResult = Get-ReviewerSourceDeterministicDiffResult -TargetText ($largeTargetLines -join "`n") `
+    -SourceText ($largeSourceLines -join "`n")
+Assert-Source ($largeResult.Success -and (Convert-SpansToKey $largeResult.Spans) -ceq "100-100,2500-2500,4900-4900" -and
+    [long]$largeResult.TraceEntryCount -lt 1000) `
+    "a realistic 25M-cell shape above the old product cap recovers exactly with a bounded trace"
+
+$hugeTargetLines = [string[]](1..37000 | ForEach-Object { "stable-$($_)" })
+$hugeSourceLines = [string[]]$hugeTargetLines.Clone()
+$hugeSourceLines[18499] = "changed-18500"
+$hugeResult = Get-ReviewerSourceDeterministicDiffResult -TargetText ($hugeTargetLines -join "`n") `
+    -SourceText ($hugeSourceLines -join "`n")
+Assert-Source ($hugeResult.Success -and (Convert-SpansToKey $hugeResult.Spans) -ceq "18500-18500" -and
+    [long]$hugeResult.TraceEntryCount -lt 100) `
+    "a 37k-line file recovers exactly without matrix-scale memory"
+
+$syntheticQualificationPassed = $true
+foreach ($qualificationSize in @(1600, 3200, 6400, 12800, 25600, 37000)) {
+    $qualificationBase = [string[]](1..$qualificationSize | ForEach-Object { "qualified-$($_)" })
+    $qualificationSource = [string[]]$qualificationBase.Clone()
+    $qualificationLine = [Math]::Floor($qualificationSize / 2)
+    $qualificationSource[$qualificationLine - 1] = "qualified-change-$qualificationLine"
+    $qualification = Get-ReviewerSourceDeterministicDiffResult `
+        -TargetText ($qualificationBase -join "`n") -SourceText ($qualificationSource -join "`n")
+    if (-not $qualification.Success -or
+        (Convert-SpansToKey $qualification.Spans) -cne "$qualificationLine-$qualificationLine") {
+        $syntheticQualificationPassed = $false
+        break
+    }
+}
+Assert-Source $syntheticQualificationPassed `
+    "the no-model synthetic production qualification recovers every formerly matrix-capped scale tier"
+
+$closedCaps = @(
+    Get-ReviewerSourceDeterministicDiffResult -TargetText "a`nb" -SourceText "a`nb" -MaxBytesPerSide 1
+    Get-ReviewerSourceDeterministicDiffResult -TargetText "a`nb" -SourceText "a`nb" -MaxLinesPerSide 1
+    Get-ReviewerSourceDeterministicDiffResult -TargetText "a`nb" -SourceText "A`nB" -MaxFrontierEntries 3
+    Get-ReviewerSourceDeterministicDiffResult -TargetText "a`nb`nc" -SourceText "A`nB`nC" -MaxOperations 1
+    Get-ReviewerSourceDeterministicDiffResult -TargetText "a`nb`nc" -SourceText "A`nB`nC" -MaxTraceEntries 1
+)
+Assert-Source (@($closedCaps | Where-Object { $_.Success -or @($_.Spans).Count -gt 0 }).Count -eq 0) `
+    "byte, line, frontier, operation, and trace cap exhaustion all fail closed without fabricated spans"
+$exactByteBoundaryText = "a" * $script:ReviewerSourceMaxRecoveryBytesPerSide
+$exactByteBoundaryResult = Get-ReviewerSourceDeterministicDiffResult `
+    -TargetText $exactByteBoundaryText -SourceText $exactByteBoundaryText
+$overByteBoundaryResult = Get-ReviewerSourceDeterministicDiffResult `
+    -TargetText $exactByteBoundaryText -SourceText ($exactByteBoundaryText + "a")
+Assert-Source ($exactByteBoundaryResult.Success -and @($exactByteBoundaryResult.Spans).Count -eq 0) `
+    "the exact diff accepts both sides at the hard byte boundary"
+Assert-Source (-not $overByteBoundaryResult.Success -and
+    [string]$overByteBoundaryResult.FailureReason -ceq "recoveryByteCapExceeded" -and
+    @($overByteBoundaryResult.Spans).Count -eq 0) `
+    "the exact diff rejects either side one byte over the hard boundary without partial spans"
+$exactByteBoundaryText = $null
+$newlineDenseResult = Get-ReviewerSourceDeterministicDiffResult -TargetText ("`n" * 100001) `
+    -SourceText "x" -MaxBytesPerSide 200000
+Assert-Source (-not $newlineDenseResult.Success -and
+    [string]$newlineDenseResult.FailureReason -ceq "recoveryLineCapExceeded") `
+    "newline-dense input is rejected by a scalar line census before line-array allocation"
 
 $threeDeleteResponse = [pscustomobject]@{ changes = @([pscustomobject]@{
             item = [pscustomobject]@{ path = "/src/evidence.cs"; isFolder = $false }; changeType = "Edit"
@@ -3324,8 +3590,11 @@ $fcBaseReader = {
 function Invoke-FCOrchestrator {
     param([object[]]$Responses, $Calls, [scriptblock]$SourceReader = $fcSourceReader,
         [scriptblock]$BaseReader = $fcBaseReader, $Capability = $fcCapability, $AggregateResponse = $null,
-        $Events = $null)
+        [scriptblock]$RecoverySourceReader, [scriptblock]$RecoveryBaseReader,
+        $Events = $null, [hashtable]$TransportPolicy = $policy)
     if ($null -eq $AggregateResponse) { $AggregateResponse = [pscustomobject]@{ changes = @($Responses[0].changes) } }
+    if ($null -eq $RecoverySourceReader) { $RecoverySourceReader = $SourceReader }
+    if ($null -eq $RecoveryBaseReader) { $RecoveryBaseReader = $BaseReader }
     $invoker = {
         param([hashtable]$Arguments)
         if ($null -ne $Events) { [void]$Events.Add("identity") }
@@ -3337,8 +3606,9 @@ function Invoke-FCOrchestrator {
         return $AggregateResponse
     }.GetNewClosure()
     return Invoke-ReviewerSourceNewContractTransport -ToolInvoker $invoker -Reader $SourceReader -BaseReader $BaseReader `
+        -RecoveryReader $RecoverySourceReader -RecoveryBaseReader $RecoveryBaseReader `
         -Organization $recoveryBinding.Organization -Project $recoveryBinding.Project -RepositoryId $fcRepoId `
-        -PrId $fcPr -SourceCommit $fcSource -Capability $Capability -Policy $policy -PolicySha256 "" `
+        -PrId $fcPr -SourceCommit $fcSource -Capability $Capability -Policy $TransportPolicy -PolicySha256 "" `
         -NonceFactory { 'n' * 32 } -AggregateReader $aggregateReader
 }
 
@@ -3448,16 +3718,31 @@ Assert-Source (Test-Throws {
 
 # A mixed set keeps the unread file in the denominator and fails the gate.
 $fcMixedPage = New-FCPage -Changes @((New-DegenerateEdit -Path "/src/a.cs"), (New-DegenerateEdit -Path "/src/unread.cs"))
+$fcMixedReads = @{ Good = 0; Unread = 0 }
 $fcMixedSourceReader = {
     param([string]$Path, [string[]]$Kinds)
-    if ($Path -ceq "/src/unread.cs") { return $null }
+    if ($Path -ceq "/src/unread.cs") { $fcMixedReads.Unread++; return $null }
+    $fcMixedReads.Good++
     New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit -Text $sourceText -ChangeKinds @($Kinds)
 }.GetNewClosure()
 $fcMixedCalls = [System.Collections.Generic.List[hashtable]]::new()
 $fcMixedResult = Invoke-FCOrchestrator -Responses @($fcMixedPage, $fcMixedPage) -Calls $fcMixedCalls -SourceReader $fcMixedSourceReader
 $fcMixedCondition = [bool]([int]$fcMixedResult.Report.CoveredFiles -eq 1 -and
-    [int]$fcMixedResult.Report.SourceBearingFileCount -eq 2 -and -not $fcMixedResult.Gate.Ok)
+    [int]$fcMixedResult.Report.SourceBearingFileCount -eq 2 -and -not $fcMixedResult.Gate.Ok -and
+    $fcMixedReads.Good -eq 1 -and $fcMixedReads.Unread -eq 1)
 Assert-Source $fcMixedCondition "a mixed recovered/unrecovered set keeps the unread file in the denominator and fails the gate"
+
+$fcThrowReads = @{ Count = 0 }
+$fcThrowResult = Invoke-FCOrchestrator -Responses @($fcDegenerate, $fcDegenerate) `
+    -Calls ([System.Collections.Generic.List[hashtable]]::new()) `
+    -SourceReader {
+        $fcThrowReads.Count++
+        throw "ordinary missing path"
+    }.GetNewClosure()
+Assert-Source (-not $fcThrowResult.Gate.Ok -and
+    [string]@($fcThrowResult.Report.Files)[0].Reason -ceq "transportFailed" -and
+    $fcThrowReads.Count -eq 1) `
+    "a nonfatal failed recovery source read is cached as failure and never fetched again for reporting"
 
 # Same content and a hostile reader both fail recovery closed - no invented span.
 $fcSameContentReader = {
@@ -3467,6 +3752,398 @@ $fcSameContentReader = {
 $fcSameResult = Invoke-FCOrchestrator -Responses @($fcDegenerate, $fcDegenerate) -Calls ([System.Collections.Generic.List[hashtable]]::new()) -SourceReader $fcSameContentReader
 Assert-Source (-not $fcSameResult.Gate.Ok -and $fcSameResult.BlockText -notmatch '"spanBasis":"recovered"') `
     "identical common/source content cannot synthesize a span and the degenerate file fails the gate"
+
+$deletionBaseText = "keep`nremove-one`nremove-two`ntail`n"
+$deletionSourceText = "keep`ntail`n"
+$fcDeletionSourceReader = {
+    param([string]$Path, [string[]]$Kinds)
+    New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit -Text $deletionSourceText -ChangeKinds @($Kinds)
+}.GetNewClosure()
+$fcDeletionBaseReader = {
+    param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+    New-RecoveryResource -Path $Path -CommitSha $BaseCommit -Text $deletionBaseText -ChangeKinds @($Kinds)
+}.GetNewClosure()
+$fcDeletionResult = Invoke-FCOrchestrator -Responses @($fcDegenerate, $fcDegenerate) `
+    -Calls ([System.Collections.Generic.List[hashtable]]::new()) -SourceReader $fcDeletionSourceReader `
+    -BaseReader $fcDeletionBaseReader
+$fcDeletionFile = @($fcDeletionResult.Report.Files)[0]
+Assert-Source ($fcDeletionResult.Gate.Ok -and [int]$fcDeletionResult.Report.SourceBearingFileCount -eq 0 -and
+    [int]$fcDeletionResult.Report.AuthoritativeDeletionOnlyFileCount -eq 1 -and
+    [string]$fcDeletionFile.Reason -ceq "authoritativeDeletionOnly" -and
+    [string]$fcDeletionFile.NoSourceBasis -ceq "authoritativeComparison" -and
+    [string]$fcDeletionFile.SpanBasis -ceq "recovered" -and
+    [int]$fcDeletionResult.Record.authoritativeDeletionOnlyFileCount -eq 1) `
+    "an exact common-to-source deletion-only edit is signed as non-reviewable right-hand source and does not lower coverage"
+Assert-Source ($fcDeletionResult.BlockText -match 'exact pinned common-to-source comparison' -and
+    $fcDeletionResult.BlockText -notmatch '1 further changed path\\(s\\) are ones THE PULL REQUEST ITSELF') `
+    "model-facing accounting attributes deletion-only proof to exact comparison rather than the pull request"
+
+$fcEmptyDeletionSourceReader = {
+    param([string]$Path, [string[]]$Kinds)
+    New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit -Text "" `
+        -ChangeKinds @($Kinds) -Rejected "emptyFile"
+}.GetNewClosure()
+$fcEmptyDeletionBaseReader = {
+    param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+    New-RecoveryResource -Path $Path -CommitSha $BaseCommit -Text "removed-one`nremoved-two`n" -ChangeKinds @($Kinds)
+}.GetNewClosure()
+$fcEmptyDeletionResult = Invoke-FCOrchestrator -Responses @($fcDegenerate, $fcDegenerate) `
+    -Calls ([System.Collections.Generic.List[hashtable]]::new()) -SourceReader $fcEmptyDeletionSourceReader `
+    -BaseReader $fcEmptyDeletionBaseReader
+Assert-Source ($fcEmptyDeletionResult.Gate.Ok -and
+    [int]$fcEmptyDeletionResult.Report.AuthoritativeDeletionOnlyFileCount -eq 1 -and
+    [string]@($fcEmptyDeletionResult.Report.Files)[0].Reason -ceq "authoritativeDeletionOnly") `
+    "deleting all file content is represented as zero right-hand lines and qualifies as authoritative deletion-only"
+
+$fcCappedDeletionChanges = @(
+    (New-FCOrdinaryChange -Path "/src/ordinary.cs" -Start 2 -Count 1),
+    (New-DegenerateEdit -Path "/src/deletion.cs")
+)
+$fcCappedDeletionPage = New-FCPage -Changes $fcCappedDeletionChanges
+$fcCappedDeletionSourceReader = {
+    param([string]$Path, [string[]]$Kinds)
+    if ($Path -ceq "/src/deletion.cs") {
+        return New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit `
+            -Text $deletionSourceText -ChangeKinds @($Kinds)
+    }
+    return New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit `
+        -Text $sourceText -ChangeKinds @($Kinds)
+}.GetNewClosure()
+$fcCappedDeletionResult = Invoke-FCOrchestrator `
+    -Responses @($fcCappedDeletionPage, $fcCappedDeletionPage) `
+    -Calls ([System.Collections.Generic.List[hashtable]]::new()) `
+    -SourceReader $fcCappedDeletionSourceReader -BaseReader $fcDeletionBaseReader `
+    -TransportPolicy (New-TestPolicy -Overrides @{ maxFiles = 1 })
+Assert-Source ($fcCappedDeletionResult.Gate.Ok -and
+    [int]$fcCappedDeletionResult.Report.SourceBearingFileCount -eq 1 -and
+    [int]$fcCappedDeletionResult.Report.DeliveredFiles -eq 1 -and
+    [int]$fcCappedDeletionResult.Report.AuthoritativeDeletionOnlyFileCount -eq 1 -and
+    [string]@($fcCappedDeletionResult.Report.Files | Where-Object {
+            $_.Path -ceq "/src/deletion.cs" })[0].Reason -ceq "authoritativeDeletionOnly") `
+    "authoritative deletion-only proof is denominator-neutral even after the read-file cap is reached"
+
+function New-LargeRecoveryText {
+    param(
+        [ValidateRange(1, 100000)][int]$LineCount,
+        [ValidateRange(0, 100000)][int]$ReplacementLine = 0,
+        [AllowEmptyString()][string]$ReplacementText = ""
+    )
+    $ordinaryLine = "x" * 999
+    $replacement = if ($ReplacementLine -gt 0) {
+        if ($ReplacementText.Length -gt 999) { throw "The synthetic replacement line is too long." }
+        $ReplacementText + ("y" * (999 - $ReplacementText.Length))
+    } else {
+        ""
+    }
+    $builder = [System.Text.StringBuilder]::new($LineCount * 1000)
+    for ($line = 1; $line -le $LineCount; $line++) {
+        [void]$builder.Append($(if ($line -eq $ReplacementLine) { $replacement } else { $ordinaryLine }))
+        [void]$builder.Append("`n")
+    }
+    return $builder.ToString()
+}
+
+$largePolicy = New-TestPolicy -Overrides @{ maxFetchBytesPerFile = 1048576 }
+$largeCommonText = New-LargeRecoveryText -LineCount 2017
+$largeDeletionText = New-LargeRecoveryText -LineCount 2016
+$largePrivateMarker = "SYNTHETIC_PRIVATE_RECOVERY_CONTENT"
+$largeEditText = New-LargeRecoveryText -LineCount 2016 -ReplacementLine 1008 -ReplacementText $largePrivateMarker
+Assert-Source ([System.Text.Encoding]::UTF8.GetByteCount($largeDeletionText) -gt [int]$largePolicy.maxFetchBytesPerFile -and
+    [System.Text.Encoding]::UTF8.GetByteCount($largeCommonText) -le $script:ReviewerSourceMaxRecoveryBytesPerSide) `
+    "the large recovery fixture is above ordinary delivery but within the exact recovery byte ceiling"
+
+$largeOrdinaryPage = New-FCPage -Changes @((New-FCOrdinaryChange -Path "/src/large.cs" -Start 1008 -Count 1))
+$largeOrdinaryReads = 0
+$largeOrdinaryResult = Invoke-FCOrchestrator -Responses @($largeOrdinaryPage, $largeOrdinaryPage) `
+    -Calls ([System.Collections.Generic.List[hashtable]]::new()) -TransportPolicy $largePolicy `
+    -SourceReader {
+        param([string]$Path, [string[]]$Kinds)
+        $script:largeOrdinaryReads++
+        [pscustomobject]@{
+            Rejected = "fileTooLarge"; MimeType = "text/plain"
+            ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($largeEditText)
+            Path = $Path; CommitSha = $recoveryBinding.SourceCommit; ChangeKinds = @($Kinds)
+        }
+    } -BaseReader { throw "ordinary authoritative spans must not enter recovery" }
+$largeOrdinaryFile = @($largeOrdinaryResult.Report.Files)[0]
+Assert-Source ($largeOrdinaryReads -eq 1 -and -not $largeOrdinaryResult.Gate.Ok -and
+    [string]$largeOrdinaryFile.Reason -ceq "fileTooLarge" -and @($largeOrdinaryFile.Slices).Count -eq 0 -and
+    $largeOrdinaryResult.BlockText -notmatch [regex]::Escape($largePrivateMarker)) `
+    "a 1.5-2 MiB ordinary changed file remains fileTooLarge and sends no content to the model"
+
+$largeDegenerate = New-FCPage -Changes @((New-DegenerateEdit -Path "/src/large-delete.cs"))
+$largeDeletionOrdinaryReads = 0
+$largeDeletionRecoveryReads = 0
+$largeDeletionBaseReads = 0
+$largeDeletionResult = Invoke-FCOrchestrator -Responses @($largeDegenerate, $largeDegenerate) `
+    -Calls ([System.Collections.Generic.List[hashtable]]::new()) -TransportPolicy $largePolicy `
+    -SourceReader {
+        param([string]$Path, [string[]]$Kinds)
+        $script:largeDeletionOrdinaryReads++
+        throw "a privately proven deletion-only source must not be read again for delivery"
+    } -BaseReader { throw "the ordinary base seam must not be used for recovery" } `
+    -RecoverySourceReader {
+        param([string]$Path, [string[]]$Kinds)
+        $script:largeDeletionRecoveryReads++
+        New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit `
+            -Text $largeDeletionText -ChangeKinds @($Kinds)
+    } -RecoveryBaseReader {
+        param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+        $script:largeDeletionBaseReads++
+        New-RecoveryResource -Path $Path -CommitSha $BaseCommit -Text $largeCommonText -ChangeKinds @($Kinds)
+    }
+$largeDeletionFile = @($largeDeletionResult.Report.Files)[0]
+Assert-Source ($largeDeletionResult.Gate.Ok -and
+    [string]$largeDeletionFile.Reason -ceq "authoritativeDeletionOnly" -and
+    [int]$largeDeletionResult.Report.SourceBearingFileCount -eq 0 -and
+    $largeDeletionOrdinaryReads -eq 0 -and $largeDeletionRecoveryReads -eq 1 -and $largeDeletionBaseReads -eq 1) `
+    "a large exact deletion-only edit is privately compared once per side and removed truthfully from the denominator"
+
+$largeEditPage = New-FCPage -Changes @((New-DegenerateEdit -Path "/src/large-edit.cs"))
+$largeEditOrdinaryReads = 0
+$largeEditRecoveryReads = 0
+$largeEditResult = Invoke-FCOrchestrator -Responses @($largeEditPage, $largeEditPage) `
+    -Calls ([System.Collections.Generic.List[hashtable]]::new()) -TransportPolicy $largePolicy `
+    -SourceReader {
+        param([string]$Path, [string[]]$Kinds)
+        $script:largeEditOrdinaryReads++
+        throw "the recovery cache must classify this ordinary read without fetching again"
+    } -BaseReader { throw "the ordinary base seam must not be used for recovery" } `
+    -RecoverySourceReader {
+        param([string]$Path, [string[]]$Kinds)
+        $script:largeEditRecoveryReads++
+        New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit `
+            -Text $largeEditText -ChangeKinds @($Kinds)
+    } -RecoveryBaseReader {
+        param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+        New-RecoveryResource -Path $Path -CommitSha $BaseCommit -Text $largeDeletionText -ChangeKinds @($Kinds)
+    }
+$largeEditFile = @($largeEditResult.Report.Files)[0]
+Assert-Source (-not $largeEditResult.Gate.Ok -and [string]$largeEditFile.SpanBasis -ceq "recovered" -and
+    [string]$largeEditFile.Reason -ceq "fileTooLarge" -and @($largeEditFile.RawSpans).Count -eq 0 -and
+    [int]$largeEditFile.RawRequestedSpanCount -eq 1 -and @($largeEditFile.Slices).Count -eq 0 -and
+    [int]$largeEditResult.Report.RecoveryRecoveredFileCount -eq 1 -and
+    $largeEditOrdinaryReads -eq 0 -and
+    $largeEditRecoveryReads -eq 1 -and $largeEditResult.BlockText -notmatch [regex]::Escape($largePrivateMarker)) `
+    "a large real edit is exactly recovered but ordinary delivery stays capped, refetch-free, and private"
+
+$largeDecodeOrdinaryReads = 0
+$largeDecodeResult = Invoke-FCOrchestrator -Responses @($largeEditPage, $largeEditPage) `
+    -Calls ([System.Collections.Generic.List[hashtable]]::new()) -TransportPolicy $largePolicy `
+    -SourceReader {
+        $script:largeDecodeOrdinaryReads++
+        throw "the private rejection must be sanitized without an ordinary refetch"
+    } -BaseReader { throw "the ordinary base seam must not be used for recovery" } `
+    -RecoverySourceReader {
+        param([string]$Path, [string[]]$Kinds)
+        [pscustomobject]@{
+            Rejected = "decodeRejected"; MimeType = "text/plain"
+            ByteLength = [System.Text.Encoding]::UTF8.GetByteCount($largeEditText)
+            Text = $largePrivateMarker
+            Path = $Path; CommitSha = $recoveryBinding.SourceCommit; ChangeKinds = @($Kinds)
+        }
+    } -RecoveryBaseReader { throw "a rejected source must stop before the base read" }
+$largeDecodeFile = @($largeDecodeResult.Report.Files)[0]
+Assert-Source (-not $largeDecodeResult.Gate.Ok -and
+    [string]$largeDecodeFile.Reason -ceq "fileTooLarge" -and
+    [int]$largeDecodeFile.FileByteLength -gt [int]$largePolicy.maxFetchBytesPerFile -and
+    $largeDecodeOrdinaryReads -eq 0 -and
+    $largeDecodeResult.BlockText -notmatch [regex]::Escape($largePrivateMarker)) `
+    "a private oversized decode rejection is sanitized to ordinary fileTooLarge without text leakage or refetch"
+
+$overRecoveryPage = New-FCPage -Changes @((New-DegenerateEdit -Path "/src/over-recovery.cs"))
+$overRecoverySourceReads = 0
+$overRecoveryBaseReads = 0
+$overRecoveryResult = Invoke-FCOrchestrator -Responses @($overRecoveryPage, $overRecoveryPage) `
+    -Calls ([System.Collections.Generic.List[hashtable]]::new()) -TransportPolicy $largePolicy `
+    -SourceReader { throw "a hard recovery-cap failure must not retry through ordinary delivery" } `
+    -BaseReader { throw "the ordinary base seam must not be used for recovery" } `
+    -RecoverySourceReader {
+        param([string]$Path, [string[]]$Kinds)
+        $script:overRecoverySourceReads++
+        [pscustomobject]@{
+            Rejected = "fileTooLarge"; MimeType = "text/plain"
+            ByteLength = ($script:ReviewerSourceMaxRecoveryBytesPerSide + 1)
+            Path = $Path; CommitSha = $recoveryBinding.SourceCommit; ChangeKinds = @($Kinds)
+        }
+    } -RecoveryBaseReader {
+        $script:overRecoveryBaseReads++
+        throw "the source-side byte cap must fire before a base read"
+    }
+$overRecoveryFile = @($overRecoveryResult.Report.Files)[0]
+Assert-Source (-not $overRecoveryResult.Gate.Ok -and
+    [string]$overRecoveryFile.Reason -ceq "recoveryByteCapExceeded" -and
+    [int]$overRecoveryResult.Report.SourceBearingFileCount -eq 1 -and
+    [int]$overRecoveryFile.RawRequestedSpanCount -eq 1 -and @($overRecoveryFile.Slices).Count -eq 0 -and
+    $overRecoverySourceReads -eq 1 -and $overRecoveryBaseReads -eq 0) `
+    "a source above 2 MiB fails closed before base/Myers work and remains in both coverage floors"
+
+$largeMovedConfirm = New-FCPage -Changes @((New-DegenerateEdit -Path "/src/large-delete.cs")) -Overrides @{
+    commonRefCommit = [pscustomobject]@{ commitId = ("e" * 40) } }
+$largeMoveRecoveryReads = 0
+Assert-Source (Test-Throws {
+        Invoke-FCOrchestrator -Responses @($largeDegenerate, $largeMovedConfirm) `
+            -Calls ([System.Collections.Generic.List[hashtable]]::new()) -TransportPolicy $largePolicy `
+            -SourceReader { throw "deletion-only does not enter ordinary delivery" } `
+            -BaseReader { throw "ordinary base seam must not be used" } `
+            -RecoverySourceReader {
+                param([string]$Path, [string[]]$Kinds)
+                $script:largeMoveRecoveryReads++
+                New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit `
+                    -Text $largeDeletionText -ChangeKinds @($Kinds)
+            } -RecoveryBaseReader {
+                param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+                New-RecoveryResource -Path $Path -CommitSha $BaseCommit -Text $largeCommonText -ChangeKinds @($Kinds)
+            }
+    }) "identity movement after large private content reads fails closed"
+Assert-Source ($largeMoveRecoveryReads -eq 1) `
+    "the large movement fixture performed exactly one bounded source read before the final identity refusal"
+
+$largeChangedConfirm = New-FCPage -Changes @(
+    (New-DegenerateEdit -Path "/src/large-delete.cs"),
+    (New-FCOrdinaryChange -Path "/src/extra.cs" -Start 1 -Count 1)
+)
+Assert-Source (Test-Throws {
+        Invoke-FCOrchestrator -Responses @($largeDegenerate, $largeChangedConfirm) `
+            -Calls ([System.Collections.Generic.List[hashtable]]::new()) -TransportPolicy $largePolicy `
+            -SourceReader { throw "deletion-only does not enter ordinary delivery" } `
+            -BaseReader { throw "ordinary base seam must not be used" } `
+            -RecoverySourceReader {
+                param([string]$Path, [string[]]$Kinds)
+                New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit `
+                    -Text $largeDeletionText -ChangeKinds @($Kinds)
+            } -RecoveryBaseReader {
+                param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+                New-RecoveryResource -Path $Path -CommitSha $BaseCommit -Text $largeCommonText -ChangeKinds @($Kinds)
+            }
+    }) "change-list movement after large private content reads fails closed"
+
+$accountingChanges = @((New-FCOrdinaryChange -Path "/src/review.cs" -Start 2 -Count 1))
+foreach ($number in 1..7) { $accountingChanges += New-DegenerateEdit -Path "/src/delete$number.cs" }
+$accountingPage = New-FCPage -Changes $accountingChanges
+$accountingReads = @{ Ordinary = 0; Recovery = 0; Base = 0 }
+$accountingSourceReader = {
+    param([string]$Path, [string[]]$Kinds)
+    $accountingReads.Ordinary++
+    if ($Path -cne "/src/review.cs") { throw "proved deletion-only paths must not be reread for delivery" }
+    New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit -Text $sourceText -ChangeKinds @($Kinds)
+}.GetNewClosure()
+$accountingRecoveryReader = {
+    param([string]$Path, [string[]]$Kinds)
+    $accountingReads.Recovery++
+    $textForPath = if ($Path -ceq "/src/delete7.cs") { $largeDeletionText } else { $deletionSourceText }
+    New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit -Text $textForPath -ChangeKinds @($Kinds)
+}.GetNewClosure()
+$accountingBaseReader = {
+    param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+    $accountingReads.Base++
+    $textForPath = if ($Path -ceq "/src/delete7.cs") { $largeCommonText } else { $deletionBaseText }
+    New-RecoveryResource -Path $Path -CommitSha $BaseCommit -Text $textForPath -ChangeKinds @($Kinds)
+}.GetNewClosure()
+$accountingResult = Invoke-FCOrchestrator -Responses @($accountingPage, $accountingPage) `
+    -Calls ([System.Collections.Generic.List[hashtable]]::new()) -TransportPolicy $largePolicy `
+    -SourceReader $accountingSourceReader -BaseReader { throw "ordinary base seam must not be used" } `
+    -RecoverySourceReader $accountingRecoveryReader -RecoveryBaseReader $accountingBaseReader
+Assert-Source ($accountingResult.Gate.Ok -and [int]$accountingResult.Report.ChangedFileCount -eq 8 -and
+    [int]$accountingResult.Report.AuthoritativeDeletionOnlyFileCount -eq 7 -and
+    [int]$accountingResult.Report.SourceBearingFileCount -eq 1 -and
+    [int]$accountingResult.Report.DeliveredFiles -eq 1 -and
+    [int]$accountingResult.Report.CoveragePercent -eq 100 -and
+    $accountingReads.Ordinary -eq 1 -and $accountingReads.Recovery -eq 7 -and $accountingReads.Base -eq 7) `
+    "seven exact deletions, including one above 1 MiB, plus one delivered file yield denominator 1 and 100% coverage (gate=$($accountingResult.Gate.Ok), changed=$($accountingResult.Report.ChangedFileCount), deletions=$($accountingResult.Report.AuthoritativeDeletionOnlyFileCount), denominator=$($accountingResult.Report.SourceBearingFileCount), delivered=$($accountingResult.Report.DeliveredFiles), coverage=$($accountingResult.Report.CoveragePercent), ordinaryReads=$($accountingReads.Ordinary), recoveryReads=$($accountingReads.Recovery), baseReads=$($accountingReads.Base))"
+
+$unprovenAccountingRecoveryReader = {
+    param([string]$Path, [string[]]$Kinds)
+    if ($Path -ceq "/src/delete7.cs") {
+        return [pscustomobject]@{
+            Rejected = "fileTooLarge"; MimeType = "text/plain"
+            ByteLength = ($script:ReviewerSourceMaxRecoveryBytesPerSide + 1)
+            Path = $Path; CommitSha = $recoveryBinding.SourceCommit; ChangeKinds = @($Kinds)
+        }
+    }
+    New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit `
+        -Text $deletionSourceText -ChangeKinds @($Kinds)
+}.GetNewClosure()
+$unprovenAccountingResult = Invoke-FCOrchestrator -Responses @($accountingPage, $accountingPage) `
+    -Calls ([System.Collections.Generic.List[hashtable]]::new()) -TransportPolicy $largePolicy `
+    -SourceReader $accountingSourceReader -BaseReader { throw "ordinary base seam must not be used" } `
+    -RecoverySourceReader $unprovenAccountingRecoveryReader -RecoveryBaseReader $accountingBaseReader
+Assert-Source (-not $unprovenAccountingResult.Gate.Ok -and
+    [int]$unprovenAccountingResult.Report.AuthoritativeDeletionOnlyFileCount -eq 6 -and
+    [int]$unprovenAccountingResult.Report.SourceBearingFileCount -eq 2 -and
+    [int]$unprovenAccountingResult.Report.CoveragePercent -eq 50 -and
+    [string]@($unprovenAccountingResult.Report.Files | Where-Object {
+            $_.Path -ceq "/src/delete7.cs" })[0].Reason -ceq "recoveryByteCapExceeded") `
+    "one unproven over-cap file returns to the denominator and closes the eight-file gate"
+
+$fcCapSourceLines = [string[]](1..20 | ForEach-Object { "source-$($_)" })
+$fcCapBaseLines = [string[]](1..20 | ForEach-Object { "base-$($_)" })
+$fcCapSourceReader = {
+    param([string]$Path, [string[]]$Kinds)
+    New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit -Text ($fcCapSourceLines -join "`n") -ChangeKinds @($Kinds)
+}.GetNewClosure()
+$fcCapBaseReader = {
+    param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+    New-RecoveryResource -Path $Path -CommitSha $BaseCommit -Text ($fcCapBaseLines -join "`n") -ChangeKinds @($Kinds)
+}.GetNewClosure()
+$savedEditDistanceCap = $script:ReviewerSourceMaxRecoveryEditDistance
+try {
+    $script:ReviewerSourceMaxRecoveryEditDistance = 2
+    $fcCapResult = Invoke-FCOrchestrator -Responses @($fcDegenerate, $fcDegenerate) `
+        -Calls ([System.Collections.Generic.List[hashtable]]::new()) -SourceReader $fcCapSourceReader `
+        -BaseReader $fcCapBaseReader
+}
+finally {
+    $script:ReviewerSourceMaxRecoveryEditDistance = $savedEditDistanceCap
+}
+Assert-Source (-not $fcCapResult.Gate.Ok -and [int]$fcCapResult.Report.SourceBearingFileCount -eq 1 -and
+    [string]@($fcCapResult.Report.Files)[0].Reason -ceq "recoveryEditDistanceCapExceeded" -and
+    [int]@($fcCapResult.Report.Files)[0].RawRequestedSpanCount -eq 1 -and
+    [string]@($fcCapResult.Report.Files)[0].FileSha256 -and
+    [int]$fcCapResult.Report.AuthoritativeDeletionOnlyFileCount -eq 0) `
+    "recovery cap exhaustion stays in both evidence floors with whole-file census, a truthful reason, and no false-authoritative span"
+
+$fcCappedFailureChanges = @(
+    (New-FCOrdinaryChange -Path "/src/ordinary.cs" -Start 2 -Count 1),
+    (New-DegenerateEdit -Path "/src/cap.cs")
+)
+$fcCappedFailurePage = New-FCPage -Changes $fcCappedFailureChanges
+$fcCappedFailureSourceReader = {
+    param([string]$Path, [string[]]$Kinds)
+    $textForPath = if ($Path -ceq "/src/cap.cs") { $fcCapSourceLines -join "`n" } else { $sourceText }
+    New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit -Text $textForPath -ChangeKinds @($Kinds)
+}.GetNewClosure()
+$fcCappedFailureBaseReader = {
+    param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+    New-RecoveryResource -Path $Path -CommitSha $BaseCommit -Text ($fcCapBaseLines -join "`n") -ChangeKinds @($Kinds)
+}.GetNewClosure()
+$savedEditDistanceCap = $script:ReviewerSourceMaxRecoveryEditDistance
+try {
+    $script:ReviewerSourceMaxRecoveryEditDistance = 2
+    $fcCappedFailureResult = Invoke-FCOrchestrator `
+        -Responses @($fcCappedFailurePage, $fcCappedFailurePage) `
+        -Calls ([System.Collections.Generic.List[hashtable]]::new()) `
+        -SourceReader $fcCappedFailureSourceReader -BaseReader $fcCappedFailureBaseReader `
+        -TransportPolicy (New-TestPolicy -Overrides @{ maxFiles = 1 })
+}
+finally {
+    $script:ReviewerSourceMaxRecoveryEditDistance = $savedEditDistanceCap
+}
+$fcCappedFailureFile = @($fcCappedFailureResult.Report.Files | Where-Object { $_.Path -ceq "/src/cap.cs" })[0]
+Assert-Source ([string]$fcCappedFailureFile.Reason -ceq "recoveryEditDistanceCapExceeded" -and
+    [string]$fcCappedFailureFile.FileSha256 -and [int]$fcCappedFailureFile.FileByteLength -gt 0 -and
+    [int]$fcCappedFailureFile.LineCount -eq 20) `
+    "a recovery cap beyond maxFiles retains its exact reason and pre-read whole-file census (reason=$($fcCappedFailureFile.Reason), bytes=$($fcCappedFailureFile.FileByteLength), lines=$($fcCappedFailureFile.LineCount), sha=$([bool][string]$fcCappedFailureFile.FileSha256))"
+
+$nonFatalFailureReport = New-ReviewerSourceTransportReport -CommitSha $fcSource `
+    -ChangedPaths @("/src/cap.cs") -SpansByPath ([ordered]@{ "/src/cap.cs" = @() }) `
+    -Policy $policy -Reader { throw "ordinary missing path" } `
+    -ChangeKindsByPath ([ordered]@{ "/src/cap.cs" = "Edit" }) `
+    -RecoveryFailureByPath ([ordered]@{ "/src/cap.cs" = "recoveryOperationCapExceeded" }) `
+    -ExpectedSpanCountByPath ([ordered]@{ "/src/cap.cs" = 1 })
+Assert-Source ([string]@($nonFatalFailureReport.Files)[0].Reason -ceq "recoveryOperationCapExceeded" -and
+    [int]$nonFatalFailureReport.SourceBearingFileCount -eq 1) `
+    "a nonfatal census exception preserves the truthful recovery-cap reason without aborting the pull request"
 $fcHostileReader = {
     param([string]$Path, [string[]]$Kinds)
     $r = New-RecoveryResource -Path $Path -CommitSha $recoveryBinding.SourceCommit -Text $sourceText -ChangeKinds @($Kinds)
@@ -3488,6 +4165,13 @@ $fcRenameEdit = [pscustomobject]@{
 }
 Assert-Source (@((Get-ReviewerSourceDegenerateChanges -Response ([pscustomobject]@{ changes = @($fcRenameEdit) })).Keys).Count -eq 0) `
     "a same-path edit whose originalPath differs is excluded from recovery"
+$fcSourceServerRenameEdit = $fcRenameEdit.PSObject.Copy()
+$fcSourceServerRenameEdit.PSObject.Properties.Remove("originalPath")
+$fcSourceServerRenameEdit | Add-Member -NotePropertyName sourceServerItem -NotePropertyValue "/src/old.cs"
+Assert-Source (@((Get-ReviewerSourceDegenerateChanges -Response ([pscustomobject]@{
+                    changes = @($fcSourceServerRenameEdit)
+                })).Keys).Count -eq 0) `
+    "a rename expressed through sourceServerItem is excluded from recovery"
 
 # -- Explicit Azure CLI identity fallback -------------------------------------
 Write-Host "`nAzure CLI identity fallback tests:" -ForegroundColor Cyan
@@ -3536,6 +4220,22 @@ function New-AzProcessResult {
 
 $azIterationJson = ConvertTo-Json -InputObject @((New-AzIteration)) -Depth 12 -Compress
 $azChangeJson = ConvertTo-Json -InputObject (New-AzChangePage -Changes @((New-AzChange))) -Depth 12 -Compress
+$defaultDelegateScript = Join-Path ([System.IO.Path]::GetTempPath()) ("reviewer-az-args-{0}.ps1" -f ([guid]::NewGuid().ToString("N")))
+try {
+    [System.IO.File]::WriteAllText($defaultDelegateScript, @'
+param([Parameter(ValueFromRemainingArguments = $true)][string[]]$ForwardedArguments)
+[Console]::Out.Write(($ForwardedArguments | ConvertTo-Json -Compress))
+'@, [System.Text.UTF8Encoding]::new($false))
+    $defaultForwarded = @("first", "two words", '$top=200', "--only-show-errors", "last")
+    $defaultResult = Invoke-ReviewerSourceAzJson -ExecutablePath (Get-Command pwsh).Source `
+        -Arguments (@("-NoProfile", "-NonInteractive", "-File", $defaultDelegateScript) + $defaultForwarded) `
+        -Operation "rest"
+    Assert-Source ((@($defaultResult) -join "`u{001f}") -ceq ($defaultForwarded -join "`u{001f}")) `
+        "the default non-injected CLI delegate forwards every argument in exact order and returns faithful stdout JSON"
+}
+finally {
+    Remove-Item -LiteralPath $defaultDelegateScript -Force -ErrorAction SilentlyContinue
+}
 $azCalls = [System.Collections.Generic.List[object]]::new()
 $azProcess = {
     param($Path, [string[]]$Arguments, $Timeout, $MaxOut, $MaxErr)
@@ -3857,6 +4557,190 @@ Assert-Source (Test-Throws {
             -SourceCommit $fcSource -Policy $policy -PolicySha256 "" -NonceFactory { 'n' * 32 }
     }) "CLI iteration change-set movement during pinned content reads fails closed"
 
+# -- Executable production-wrapper recovery readers --------------------------
+# Load only the two thin adapters from the production wrapper. Their dependencies
+# below are deterministic in-process recorders; no MCP, CLI process, or model runs.
+$ExpectedProject = $recoveryBinding.Project
+$RepositoryName = "synthetic-repository"
+$cfgRepoId = $recoveryBinding.RepositoryId
+$Organization = $recoveryBinding.Organization
+$SourceTransportPolicy = $largePolicy
+$SourceTransportPolicySha256 = ""
+$CfgAzCliFallbackTenantId = "00000000-0000-0000-0000-000000000000"
+$global:ProductionWrapperFixture = $null
+
+function global:Get-ReviewerBoundSourceContent {
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$CommitSha,
+        [Parameter(Mandatory)][string[]]$ChangeKinds,
+        [ValidateRange(0, [int]::MaxValue)][int]$MaxBytesPerFile = 0
+    )
+    $fixture = $global:ProductionWrapperFixture
+    $effectiveMaxBytes = if ($MaxBytesPerFile -gt 0) {
+        $MaxBytesPerFile
+    } else {
+        [int]$fixture.OrdinaryMaxBytes
+    }
+    [void]$fixture.Reads.Add([pscustomobject]@{
+            Path = $Path
+            CommitSha = $CommitSha
+            MaxBytesPerFile = $MaxBytesPerFile
+            EffectiveMaxBytes = $effectiveMaxBytes
+            ChangeKinds = @($ChangeKinds)
+        })
+    $text = if ($CommitSha -ceq $fixture.CommonCommit) { $fixture.CommonText } else { $fixture.SourceText }
+    $byteLength = [Text.Encoding]::UTF8.GetByteCount($text)
+    if ($byteLength -gt $effectiveMaxBytes) {
+        return [pscustomobject]@{
+            Rejected = "fileTooLarge"; MimeType = "text/plain"; ByteLength = $byteLength
+            Path = $Path; CommitSha = $CommitSha; ChangeKinds = @($ChangeKinds)
+        }
+    }
+    return [pscustomobject]@{
+        Text = $text; MimeType = "text/plain"; ByteLength = $byteLength
+        Sha256 = "0" * 64; Rejected = ""
+        Organization = $fixture.Binding.Organization; Project = $fixture.Binding.Project
+        RepositoryId = $fixture.Binding.RepositoryId; PullRequestId = $fixture.Binding.PullRequestId
+        SourceCommit = $fixture.Binding.SourceCommit; TargetCommit = $fixture.Binding.TargetCommit
+        BaseCommit = $fixture.Binding.BaseCommit; IterationId = $fixture.Binding.IterationId
+        Path = $Path; CommitSha = $CommitSha; ChangeKinds = @($ChangeKinds)
+    }
+}
+
+function global:Invoke-AgentMcpTool {
+    param([hashtable]$Session, [string]$Name, [hashtable]$Arguments)
+    return $global:ProductionWrapperFixture.Page
+}
+
+function New-ReviewerSourceAzCliInvoker {
+    param([string]$Organization, [string]$ExpectedTenantId)
+    return { throw "the synthetic identity capture must not invoke a CLI process" }
+}
+
+function Get-ReviewerSourceAzIdentityCapture {
+    param(
+        [scriptblock]$AzInvoker,
+        [string]$Project,
+        [string]$RepositoryId,
+        [int]$PrId,
+        [string]$SourceCommit
+    )
+    return $global:ProductionWrapperFixture.Identity
+}
+
+function global:New-AgentNonce { return "n" * 32 }
+
+. ([scriptblock]::Create((Get-FunctionTextFromWrapper -Name 'Get-ReviewerSourceTransportNewContract')))
+. ([scriptblock]::Create((Get-FunctionTextFromWrapper -Name 'Get-ReviewerSourceTransportAzCliFallback')))
+
+function Invoke-ProductionWrapperFixture {
+    param(
+        [ValidateSet("mcp", "cli")][string]$Wrapper,
+        [ValidateSet("ordinary", "deletion", "edit", "overCap")][string]$Shape
+    )
+    $path = "/src/wrapper-$Wrapper-$Shape.cs"
+    $change = if ($Shape -ceq "ordinary") {
+        New-FCOrdinaryChange -Path $path -Start 1008 -Count 1
+    } else {
+        New-DegenerateEdit -Path $path
+    }
+    $page = New-FCPage -Changes @($change)
+    $sourceForShape = switch ($Shape) {
+        "ordinary" { $largeEditText }
+        "deletion" { $largeDeletionText }
+        "edit" { $largeEditText }
+        "overCap" { "z" * ($script:ReviewerSourceMaxRecoveryBytesPerSide + 1) }
+    }
+    $commonForShape = switch ($Shape) {
+        "deletion" { $largeCommonText }
+        default { $largeDeletionText }
+    }
+    $identityBinding = Get-ReviewerSourceIterationPageBinding -Response $page `
+        -ExpectedSkip 0 -ExpectedTop 200 -AllowAnyIteration
+    $reads = [System.Collections.Generic.List[object]]::new()
+    $global:ProductionWrapperFixture = @{
+        Page = $page
+        SourceText = $sourceForShape
+        CommonText = $commonForShape
+        CommonCommit = $fcCommon
+        OrdinaryMaxBytes = [int]$largePolicy.maxFetchBytesPerFile
+        Binding = $recoveryBinding
+        Reads = $reads
+        Identity = [pscustomobject]@{
+            Binding = $identityBinding
+            Response = $page
+            ChangeSetSha256 = "synthetic-stable-change-set"
+        }
+    }
+    $result = if ($Wrapper -ceq "mcp") {
+        Get-ReviewerSourceTransportNewContract -Session @{} -PrId $fcPr `
+            -SourceCommit $fcSource -Capability $fcCapability
+    } else {
+        Get-ReviewerSourceTransportAzCliFallback -Session @{} -PrId $fcPr -SourceCommit $fcSource
+    }
+    return [pscustomobject]@{ Result = $result; Reads = @($reads); Path = $path }
+}
+
+$productionWrapperResults = @{}
+foreach ($wrapper in @("mcp", "cli")) {
+    foreach ($shape in @("ordinary", "deletion", "edit", "overCap")) {
+        $productionWrapperResults["$wrapper/$shape"] = Invoke-ProductionWrapperFixture `
+            -Wrapper $wrapper -Shape $shape
+    }
+
+    $ordinaryProbe = $productionWrapperResults["$wrapper/ordinary"]
+    $ordinaryFile = @($ordinaryProbe.Result.Report.Files)[0]
+    Assert-Source ($ordinaryProbe.Reads.Count -eq 1 -and
+        [int]$ordinaryProbe.Reads[0].MaxBytesPerFile -eq 0 -and
+        [int]$ordinaryProbe.Reads[0].EffectiveMaxBytes -eq 1048576 -and
+        [string]$ordinaryProbe.Reads[0].CommitSha -ceq $fcSource -and
+        [string]$ordinaryProbe.Reads[0].Path -ceq $ordinaryProbe.Path -and
+        [string]$ordinaryFile.Reason -ceq "fileTooLarge" -and
+        @($ordinaryFile.Slices).Count -eq 0) `
+        "$wrapper production wrapper keeps an ordinary >1 MiB source read at the 1 MiB delivery ceiling"
+
+    $deletionProbe = $productionWrapperResults["$wrapper/deletion"]
+    $deletionFile = @($deletionProbe.Result.Report.Files)[0]
+    $deletionSourceRead = @($deletionProbe.Reads | Where-Object CommitSha -CEQ $fcSource)
+    $deletionBaseRead = @($deletionProbe.Reads | Where-Object CommitSha -CEQ $fcCommon)
+    Assert-Source ($deletionProbe.Reads.Count -eq 2 -and
+        @($deletionProbe.Reads | Where-Object {
+                [int]$_.MaxBytesPerFile -ne $script:ReviewerSourceMaxRecoveryBytesPerSide -or
+                [int]$_.EffectiveMaxBytes -ne $script:ReviewerSourceMaxRecoveryBytesPerSide
+            }).Count -eq 0 -and
+        $deletionSourceRead.Count -eq 1 -and $deletionBaseRead.Count -eq 1 -and
+        [string]$deletionSourceRead[0].Path -ceq $deletionProbe.Path -and
+        [string]$deletionBaseRead[0].Path -ceq $deletionProbe.Path -and
+        $deletionProbe.Result.Gate.Ok -and
+        [int]$deletionProbe.Result.Report.SourceBearingFileCount -eq 0 -and
+        [string]$deletionFile.Reason -ceq "authoritativeDeletionOnly") `
+        "$wrapper production recovery source/base closures both capture exactly 2 MiB and prove a large deletion-only path"
+
+    $editProbe = $productionWrapperResults["$wrapper/edit"]
+    $editFile = @($editProbe.Result.Report.Files)[0]
+    Assert-Source ($editProbe.Reads.Count -eq 2 -and
+        @($editProbe.Reads | Where-Object {
+                [int]$_.MaxBytesPerFile -ne $script:ReviewerSourceMaxRecoveryBytesPerSide
+            }).Count -eq 0 -and
+        [string]$editFile.SpanBasis -ceq "recovered" -and
+        [string]$editFile.Reason -ceq "fileTooLarge" -and
+        [int]$editFile.RawRequestedSpanCount -eq 1 -and
+        @($editFile.Slices).Count -eq 0 -and
+        $editProbe.Result.BlockText -notmatch [regex]::Escape($largePrivateMarker)) `
+        "$wrapper production path privately recovers a bounded large edit without exposing whole-file content"
+
+    $overCapProbe = $productionWrapperResults["$wrapper/overCap"]
+    $overCapFile = @($overCapProbe.Result.Report.Files)[0]
+    Assert-Source ($overCapProbe.Reads.Count -eq 1 -and
+        [int]$overCapProbe.Reads[0].MaxBytesPerFile -eq $script:ReviewerSourceMaxRecoveryBytesPerSide -and
+        [string]$overCapFile.Reason -ceq "recoveryByteCapExceeded" -and
+        [int]$overCapProbe.Result.Report.SourceBearingFileCount -eq 1 -and
+        -not $overCapProbe.Result.Gate.Ok) `
+        "$wrapper production recovery reader keeps a >2 MiB source capped and in the denominator"
+}
+
 # -- Wiring, probe safety, and no obsolete tokens (structural) ----------------
 # The capability probe NEVER runs on the shared ordinary-transport session: a
 # tools/list failure aborts the session it runs on, and that session owns the
@@ -3879,8 +4763,17 @@ $newContractText = Get-FunctionTextFromWrapper -Name 'Get-ReviewerSourceTranspor
 Assert-Source ($newContractText.Length -gt 0 -and
     $newContractText.IndexOf('Invoke-ReviewerSourceNewContractTransport', [StringComparison]::Ordinal) -ge 0 -and
     $newContractText.IndexOf('-ToolInvoker', [StringComparison]::Ordinal) -ge 0 -and
-    $newContractText.IndexOf('-BaseReader', [StringComparison]::Ordinal) -ge 0) `
-    "the wrapper is a thin adapter that hands the orchestrator its tool invoker and source/base readers"
+    $newContractText.IndexOf('-BaseReader', [StringComparison]::Ordinal) -ge 0 -and
+    $newContractText.IndexOf('-RecoveryReader', [StringComparison]::Ordinal) -ge 0 -and
+    $newContractText.IndexOf('-RecoveryBaseReader', [StringComparison]::Ordinal) -ge 0 -and
+    $newContractText.IndexOf(
+        '[int]$recoveryBytesPerSide = [int]$script:ReviewerSourceMaxRecoveryBytesPerSide',
+        [StringComparison]::Ordinal) -ge 0 -and
+    $newContractText.IndexOf('-MaxBytesPerFile $recoveryBytesPerSide',
+        [StringComparison]::Ordinal) -ge 0 -and
+    $newContractText.IndexOf('-MaxBytesPerFile $script:ReviewerSourceMaxRecoveryBytesPerSide',
+        [StringComparison]::Ordinal) -lt 0) `
+    "the wrapper hands the orchestrator ordinary readers plus private recovery readers at the exact hard byte cap"
 $azFallbackText = Get-FunctionTextFromWrapper -Name 'Get-ReviewerSourceTransportAzCliFallback'
 $capabilityIndex = $transportText.IndexOf('if ($null -ne $capability)', [StringComparison]::Ordinal)
 $fallbackIndex = $transportText.IndexOf('if ($CfgAzCliFallbackEnabled)', [StringComparison]::Ordinal)
@@ -3891,8 +4784,10 @@ Assert-Source ($azFallbackText.Length -gt 0 -and
     $azFallbackText.IndexOf('New-ReviewerSourceAzCliInvoker', [StringComparison]::Ordinal) -ge 0 -and
     $azFallbackText.IndexOf('Get-ReviewerSourceAzIdentityCapture', [StringComparison]::Ordinal) -ge 0 -and
     $azFallbackText.IndexOf('-IdentityReader', [StringComparison]::Ordinal) -ge 0 -and
+    $azFallbackText.IndexOf('-RecoveryReader', [StringComparison]::Ordinal) -ge 0 -and
+    $azFallbackText.IndexOf('-RecoveryBaseReader', [StringComparison]::Ordinal) -ge 0 -and
     $azFallbackText.IndexOf('Invoke-AgentMcpTool', [StringComparison]::Ordinal) -ge 0) `
-    "the production fallback binds CLI identity to the existing MCP aggregate/content seams without exposing CLI to a model"
+    "the production fallback binds CLI identity to ordinary/private MCP content seams without exposing CLI to a model"
 
 # The live flat implementation carries none of the obsolete FileDiff-contract
 # vocabulary. The check is case-sensitive so the capability's ChangeLimit/PageSize

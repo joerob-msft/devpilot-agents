@@ -67,7 +67,11 @@ set: `budgetExhausted`, `sliceCountCapExceeded`, `fileTooLarge`, `notTextual`,
 `decodeRejected`, `transportFailed`, `noChangedSpans`, `binaryNoText`,
 `readerReportedNonTextUncorroborated`, `emptyFile`, `spansUnavailable`,
 `fileCountCapExceeded`, `pathRejected`, `spanOutsideFile`, `unsafeSliceText`,
-`recoveredHunkShortfall`.
+`recoveredHunkShortfall`, `authoritativeDeletionOnly`, and the closed recovery
+cap reasons `recoveryByteCapExceeded`, `recoveryLineCapExceeded`,
+`recoveryEditDistanceCapExceeded`, `recoveryOperationCapExceeded`,
+`recoveryFrontierCapExceeded`, `recoveryTraceCapExceeded`, and
+`recoveryHunkCapExceeded`.
 
 Those causes are told apart at the reader seam, before the strict decoder runs.
 The decoder's job is safety and it refuses everything it dislikes the same way,
@@ -78,11 +82,12 @@ now read structurally and judged against policy first; only content policy would
 accept reaches the decoder, and only the decoder's own refusals become
 `decodeRejected`. Nothing about its strictness changes.
 
-**A change set with no right-hand lines is not a failure — but only the pull
-request may say so.** Delete-only and rename-only changes legitimately
+**A change set with no right-hand lines is not a failure — but that state must
+be proven authoritatively.** Delete-only and rename-only changes legitimately
 have paths and no changed lines: those paths are counted apart and are **excluded
-from the coverage denominator**, because the change set itself says there is no
-source for the transport to deliver and they therefore cannot be uncovered. A
+from the coverage denominator** when either the change set itself says there is
+no source to deliver or exact common-to-source comparison proves only deletions.
+A
 binary or an empty file is *not* in that category — only the reader says those
 hold nothing, so they stay counted; see the denominator rule below. Leaving
 deletes in meant a pull request that edited two files and deleted four scored
@@ -118,13 +123,30 @@ uses at least that count, so a shorter recovered hunk list cannot award itself
 still higher, the file is partial with `recoveredHunkShortfall`; it is not
 misreported as a byte-budget failure. Adds, deletes, any rename mixture,
 context-only/empty/malformed
-block sets, ordinary diffs, binary/empty/oversized/decode-rejected content,
+block sets, ordinary diffs, binary/empty/recovery-oversized/decode-rejected content,
 missing versions, equal versions, stale identity, and work over the
-request/line/matrix/hunk caps remain unrecovered. The source read is cached and
-reused by normal slicing. Ordinary missing-path/read errors disable recovery for
-that file; a session-fatal transport failure still propagates. Every unsuccessful
-attempt retains the same closed-set omission reason and denominator treatment it
-had before recovery.
+request/byte/line/edit-distance/operation/frontier-trace/hunk caps remain
+unrecovered. Recovery has separate source/base reader delegates that may privately
+decode at most the exact algorithm's 2 MiB per-side ceiling. The source read is
+cached: when it also fits `maxFetchBytesPerFile`, normal slicing reuses it; when it
+does not, reporting receives only an ordinary `fileTooLarge` classification, never
+the wider text, hash, line census, slices, or model content. Ordinary
+missing-path/read errors disable recovery for that file; a session-fatal transport
+failure still propagates. Every unsuccessful attempt retains a closed omission
+reason and stays in both coverage floors. Cap exhaustion never emits partial or
+fabricated spans.
+
+The exact comparison uses deterministic bounded Myers shortest-edit recovery,
+`O((N+M)D)` work for edit distance `D`, with deletion-preferred ties. Independent
+hard ceilings bound each side to 100,000 lines and 2 MiB, edit distance to 4,096,
+the frontier to 8,195 entries, operations to 20,000,000, retained trace entries
+to 4,000,000, and recovered hunks to 2,000. Exceeding any ceiling fails closed.
+The reverse frontier reconstructs the former matrix oracle's deletion-first
+canonical minimal script, including repeated-line ambiguities. The algorithm
+does not call Git, a shell, another diff implementation, or a model.
+The 2 MiB content ceiling is code-defined and reused by the private reader; it is
+not a consumer-configurable delivery allowance. Ordinary files remain subject to
+the separate `maxFetchBytesPerFile` policy before any slice can be delivered.
 
 Recovery additionally requires an authoritative binding to the configured
 organization, project, repository ID, PR ID, exact iteration ID, source, target,
@@ -193,7 +215,14 @@ commit) and keeps only the right-hand spans that common→source content differe
 proves, presented as `spanBasis = "recovered"`. Add/delete/rename/mixed changes,
 an edit whose `originalPath` differs, and identical common/source content are
 never recovered. Incomplete pagination is rejected before any content read begins.
-The coverage gate, caps, and denominator rules are unchanged.
+When that exact comparison proves a non-empty pure edit contains deletions and no
+right-hand insertions, the path is recorded as `authoritativeDeletionOnly` with
+`noSourceBasis = "authoritativeComparison"` and recovered provenance. It leaves
+the denominator because there is no reviewable right-hand source. Missing reads,
+rejected content, equal versions, malformed aggregate evidence, and cap exhaustion
+cannot enter that state and remain uncovered. The final iteration identity and
+change-list digest are rechecked after all reads before this signed record is
+returned.
 
 Every file carries a versioned `spanBasis`: `changeSet` for ADO-declared
 right-hand blocks and `recovered` for deterministic common-base/source evidence.
@@ -496,7 +525,9 @@ every line-diff block, where every probe returns real text and the coverage floo
 is going to refuse the pull request anyway; a pull request that adds forty icons
 returns forty non-text answers and spends no budget. Past the cap a path is
 counted uncovered without being read, which is the fail-closed direction. All
-reads remain bounded by `maxFiles` and `maxFetchBytesPerFile`.
+ordinary delivery reads remain bounded by `maxFiles` and
+`maxFetchBytesPerFile`. Exact recovery additionally permits only its candidate
+paths to use the private, code-defined 2 MiB per-side reader ceiling.
 
 One consequence is worth stating plainly. A pull request consisting of **nothing
 but** assets — an icon set, a fixture directory, a localization bundle — leaves
@@ -671,7 +702,7 @@ against 1.6 MB for the raw diff channel and 0 bytes for the file-read tool — a
 | key | default | what it bounds |
 |---|---|---|
 | `contextRadiusLines` | 30 | unchanged lines kept on each side of a changed span |
-| `maxFetchBytesPerFile` | 1048576 | largest file the wrapper will read; larger is `fileTooLarge` |
+| `maxFetchBytesPerFile` | 1048576 | largest file eligible for ordinary census, slices, or model delivery; larger is `fileTooLarge` even if privately compared for recovery |
 | `maxSliceBytesPerFile` | 32768 | delivered slice bytes for one file |
 | `maxTotalSliceBytes` | 196608 | delivered CHANGED slice bytes for the whole PR |
 | `maxSlicesPerFile` | 24 | slices for one file |
@@ -773,5 +804,9 @@ schema:
 - **Coverage is measured in files, not in judgement.** A `delivered` file whose
   changed span is a one-line edit inside a 3,000-line class still gives the model
   only a local view.
-- **A file larger than `maxFetchBytesPerFile` is reported, not read.** That is a
-  deliberate refusal, and the accounting says so.
+- **A file larger than `maxFetchBytesPerFile` is never delivered.** It may be
+  privately read only when it is a qualified degenerate recovery candidate and
+  still fits the code-defined 2 MiB exact-comparison ceiling. That private object
+  can prove deletion-only or bounded right-hand spans, but it never becomes
+  ordinary whole-file census, slices, or model input; accounting still reports
+  `fileTooLarge` when reviewable right-hand source exists.
