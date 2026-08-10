@@ -1996,7 +1996,10 @@ function Select-ReviewerEligibleThreadReplies {
             ([int](Get-ReviewerHashValue -Container $reply -Key 'commentId' -Default 0))
         if ($allowed.Contains($key) -and $seen.Add($key)) { [void]$selected.Add($reply) }
     }
-    return , ($selected.ToArray())
+    # Callers use @() to normalize zero, one, or many pipeline results. Returning
+    # the array as one object would nest multiple replies, making Count equal 1
+    # and causing delivery to read the nested array as a reply with threadId 0.
+    return $selected.ToArray()
 }
 
 function Get-ReviewerFindingFingerprint {
@@ -3159,6 +3162,16 @@ function Invoke-DryRunSelfChecks {
     }
     elseif (Test-ReviewerThreadRepliesBound -Replies @(@{ threadId = 4; commentId = 42; disposition = 'support'; comment = 'No.' }) -TargetSet $targetSet) {
         $failures.Add("A reply targeting an agent response was accepted.")
+    }
+    $twoEligibleReplies = @(
+        @{ threadId = 1; commentId = 11; disposition = 'verify'; comment = 'First.' },
+        @{ threadId = 5; commentId = 52; disposition = 'support'; comment = 'Second.' }
+    )
+    $selectedEligibleReplies = @(Select-ReviewerEligibleThreadReplies -Replies $twoEligibleReplies -Targets $digest.AssessmentTargets)
+    if ($selectedEligibleReplies.Count -ne 2 -or
+        [int](Get-ReviewerHashValue -Container $selectedEligibleReplies[0] -Key 'threadId' -Default 0) -ne 1 -or
+        [int](Get-ReviewerHashValue -Container $selectedEligibleReplies[1] -Key 'threadId' -Default 0) -ne 5) {
+        $failures.Add("Multiple eligible thread replies were nested into one array instead of remaining separate reply objects.")
     }
     $manyHumanThreads = @(1..($script:ReviewerMaxThreadReplies + 1) | ForEach-Object {
             @{ threadId = (100 + $_); status = 'active'; filePath = ''; line = 0; comments = @(
