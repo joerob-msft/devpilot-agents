@@ -647,6 +647,11 @@ $reportKinds = [ordered]@{
 }
 $report = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $paths `
     -SpansByPath $spansByPath -Policy $policy -Reader $reader -ChangeKindsByPath $reportKinds
+$rightHandRanges = Get-ReviewerSourceRightHandRangesByPath -Report $report
+Assert-Source ($rightHandRanges.ContainsKey("src/ok.cs") -and
+    [int]$rightHandRanges["src/ok.cs"][0].startLine -eq 5 -and
+    [int]$rightHandRanges["src/ok.cs"][0].endLine -eq 6) `
+    "changed-file anchors use normalized paths and exact right-hand changed spans"
 
 Assert-Source (@($report.Files).Count -eq $paths.Count) "every changed path appears in the report exactly once"
 $byPath = @{}
@@ -1075,15 +1080,15 @@ Assert-Source ((Measure-WrapperVariableWrite -FunctionAst $transportAst -Name 'c
     "and the change set, its spans, its change kinds and the re-read head are each established once"
 # Counting writes says nothing about REACHABILITY: an inserted early return of a
 # doctored result leaves every pinned line intact and simply never runs it.
-# Four returns: (1) the capability-gated new-contract dispatch, (2) the explicit
-# CLI-fallback dispatch, (3) the reader closure's own return inside
-# .GetNewClosure(), and (4) the legacy path's final return. Both dispatches
-# delegate to separately validated functions.
+# Five returns: (1) sealed schema-v2 replay, (2) the capability-gated
+# new-contract dispatch, (3) the explicit CLI-fallback dispatch, (4) the reader
+# closure's own return inside .GetNewClosure(), and (5) the legacy path's final
+# return. Every live dispatch delegates to separately validated functions.
 Assert-Source (@($transportAst.FindAll({
                 param($candidate)
                 $candidate -is [Management.Automation.Language.ReturnStatementAst]
-            }, $true)).Count -eq 4) `
-    "and the transport has exactly four returns - the two gated dispatches, the reader's and its own - so no earlier one can hand back a doctored result the pinned lines below never reach"
+            }, $true)).Count -eq 5) `
+    "and the transport has exactly five returns - sealed replay, two live dispatches, the reader's and its own - so no undeclared one can hand back a doctored result"
 # ...and counting returns is not enough either, because PowerShell returns a
 # value without one. A bare hashtable on its own line joins the output: emitted
 # beside the real return it makes `Gate.Ok` the array `@($true, $false)`, which

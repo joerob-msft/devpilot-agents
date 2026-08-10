@@ -1262,12 +1262,13 @@ function Invoke-TimedProcess {
 # ---------------------------------------------------------------------------
 
 # Code-defined, not manifest-defined: a bound a snapshot can raise is not a bound.
-$script:AgentReplaySchemaVersion = 1
+$script:AgentReplaySchemaVersions = @(1, 2)
 $script:AgentReplayKind = "agent-replay-snapshot"
 $script:AgentReplayMaxResources = 4096
 $script:AgentReplayMaxPayloadBytes = 25165824
 $script:AgentReplayMaxTotalPayloadBytes = 67108864
 $script:AgentReplayMaxManifestBytes = 8388608
+$script:AgentReplayMaxSourceTransportBytes = 16777216
 $script:AgentReplaySnapshotNamePattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z'
 $script:AgentReplayPayloadSegmentPattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,126}[A-Za-z0-9_-]\z|^[A-Za-z0-9]\z'
 $script:AgentReplayHexPattern = '^[0-9a-f]{64}\z'
@@ -1588,13 +1589,15 @@ function New-AgentReplaySnapshot {
     catch { throw "Replay manifest is not valid JSON." }
     if ($manifest -isnot [System.Management.Automation.PSCustomObject]) { throw "Replay manifest must be a JSON object." }
 
-    Assert-AgentReplayExactKeys -Object $manifest -Where "Replay manifest" -Expected @(
+    $schemaVersion = Get-AgentReplayManifestField -Object $manifest -Name "schemaVersion" -Type int -Min 1 -Max 2
+    $manifestKeys = @(
         "schemaVersion", "kind", "snapshotId", "capturedUtc", "provider",
         "binding", "bindings", "resources", "manifestDigest"
     )
-    $schemaVersion = Get-AgentReplayManifestField -Object $manifest -Name "schemaVersion" -Type int -Min 1 -Max 1
-    if ($schemaVersion -ne $script:AgentReplaySchemaVersion) {
-        throw "Replay manifest declares schema version $schemaVersion; this build reads version $script:AgentReplaySchemaVersion."
+    if ($schemaVersion -eq 2) { $manifestKeys += "sourceTransport" }
+    Assert-AgentReplayExactKeys -Object $manifest -Where "Replay manifest" -Expected $manifestKeys
+    if ($script:AgentReplaySchemaVersions -notcontains $schemaVersion) {
+        throw "Replay manifest declares schema version $schemaVersion; this build reads versions $($script:AgentReplaySchemaVersions -join ', ')."
     }
     $kind = Get-AgentReplayManifestField -Object $manifest -Name "kind" -Type string
     if ($kind -cne $script:AgentReplayKind) { throw "Replay manifest kind '$kind' is not '$script:AgentReplayKind'." }
@@ -1606,10 +1609,12 @@ function New-AgentReplaySnapshot {
     $provider = Get-AgentReplayManifestField -Object $manifest -Name "provider" -Type string -Pattern '^[a-z][a-z0-9-]{0,31}\z'
 
     $binding = Get-AgentReplayManifestField -Object $manifest -Name "binding" -Type object
-    Assert-AgentReplayExactKeys -Object $binding -Where "Replay manifest binding" -Expected @(
+    $bindingKeys = @(
         "organization", "project", "repositoryId", "pullRequestId",
         "sourceCommit", "targetCommit", "changeSetSha256"
     )
+    if ($schemaVersion -eq 2) { $bindingKeys += @("iterationId", "commonCommit") }
+    Assert-AgentReplayExactKeys -Object $binding -Where "Replay manifest binding" -Expected $bindingKeys
     $bindingRecord = [ordered]@{
         Organization    = Get-AgentReplayManifestField -Object $binding -Name "organization" -Type string -Pattern '^[^\s]{1,128}\z'
         Project         = Get-AgentReplayManifestField -Object $binding -Name "project" -Type string -Pattern '^[^\s]{1,128}\z'
@@ -1618,6 +1623,12 @@ function New-AgentReplaySnapshot {
         SourceCommit    = Get-AgentReplayManifestField -Object $binding -Name "sourceCommit" -Type string -Pattern '^[0-9a-f]{40}\z'
         TargetCommit    = Get-AgentReplayManifestField -Object $binding -Name "targetCommit" -Type string -Pattern '^[0-9a-f]{40}\z'
         ChangeSetSha256 = Get-AgentReplayManifestField -Object $binding -Name "changeSetSha256" -Type sha256
+    }
+    if ($schemaVersion -eq 2) {
+        $bindingRecord["IterationId"] = Get-AgentReplayManifestField -Object $binding -Name "iterationId" `
+            -Type int -Min 1 -Max 2147483647
+        $bindingRecord["CommonCommit"] = Get-AgentReplayManifestField -Object $binding -Name "commonCommit" `
+            -Type string -Pattern '^[0-9a-f]{40}\z'
     }
 
     $bindings = Get-AgentReplayManifestField -Object $manifest -Name "bindings" -Type object
@@ -1647,6 +1658,59 @@ function New-AgentReplaySnapshot {
     $served = @{}
     $totalBytes = [long]0
     $resourceSummaries = [System.Collections.Generic.List[object]]::new()
+    $sourceTransportRecord = $null
+    $sourceTransportDigestRecord = $null
+    if ($schemaVersion -eq 2) {
+        $sourceTransport = Get-AgentReplayManifestField -Object $manifest -Name "sourceTransport" -Type object
+        Assert-AgentReplayExactKeys -Object $sourceTransport -Where "Replay manifest sourceTransport" -Expected @(
+            "mode", "artifactFile", "artifactSha256", "artifactByteLength"
+        )
+        $sourceMode = Get-AgentReplayManifestField -Object $sourceTransport -Name "mode" -Type string `
+            -Pattern '^(mcpFlat|azureDevOpsCliFallback|legacyMcp)$'
+        $artifactRelative = Get-AgentReplayManifestField -Object $sourceTransport -Name "artifactFile" -Type string
+        if ($artifactRelative.Length -lt 1 -or $artifactRelative.Length -gt 512) {
+            throw "Replay source-transport artifactFile must be 1..512 characters."
+        }
+        $artifactSegments = @($artifactRelative -split '/')
+        foreach ($segment in $artifactSegments) {
+            if ($segment -cnotmatch $script:AgentReplayPayloadSegmentPattern) {
+                throw "Replay source-transport artifactFile '$artifactRelative' is not a plain relative path inside the snapshot."
+            }
+        }
+        $artifactPath = $snapshotFull
+        for ($segmentIndex = 0; $segmentIndex -lt $artifactSegments.Count; $segmentIndex++) {
+            $artifactPath = Join-Path $artifactPath $artifactSegments[$segmentIndex]
+            $segmentKind = if ($segmentIndex -eq ($artifactSegments.Count - 1)) { "File" } else { "Directory" }
+            [void](Assert-AgentReplayPathSafe -Path $artifactPath -Within $snapshotFull -Kind $segmentKind)
+        }
+        $artifactLength = Get-AgentReplayManifestField -Object $sourceTransport -Name "artifactByteLength" `
+            -Type int -Min 2 -Max $script:AgentReplayMaxSourceTransportBytes
+        $artifactSha = Get-AgentReplayManifestField -Object $sourceTransport -Name "artifactSha256" -Type sha256
+        $artifactBytes = [IO.File]::ReadAllBytes($artifactPath)
+        if ($artifactBytes.Length -ne $artifactLength) {
+            throw "Replay source-transport artifact '$artifactRelative' is $($artifactBytes.Length) bytes; the manifest records $artifactLength."
+        }
+        if ((Get-AgentReplayBytesSha256 -Bytes $artifactBytes) -cne $artifactSha) {
+            throw "Replay source-transport artifact '$artifactRelative' does not match its recorded SHA-256."
+        }
+        $totalBytes += $artifactBytes.Length
+        if ($totalBytes -gt $script:AgentReplayMaxTotalPayloadBytes) {
+            throw "Replay snapshot '$SnapshotName' carries more than $script:AgentReplayMaxTotalPayloadBytes payload bytes."
+        }
+        $sourceTransportRecord = @{
+            Mode = $sourceMode
+            ArtifactFile = $artifactRelative
+            ArtifactSha256 = $artifactSha
+            ArtifactBytes = $artifactBytes
+        }
+        $sourceTransportDigestRecord = [ordered]@{
+            mode = $sourceMode
+            artifactFile = $artifactRelative
+            artifactSha256 = $artifactSha
+            artifactByteLength = [long]$artifactBytes.Length
+        }
+    }
+
     foreach ($resource in $resources) {
         if ($resource -isnot [System.Management.Automation.PSCustomObject]) { throw "Replay manifest resource must be an object." }
         Assert-AgentReplayExactKeys -Object $resource -Where "Replay manifest resource" -Expected @(
@@ -1762,6 +1826,11 @@ function New-AgentReplaySnapshot {
         }
         resources     = @($resourceSummaries.ToArray())
     }
+    if ($schemaVersion -eq 2) {
+        $digestInput.binding["iterationId"] = $bindingRecord.IterationId
+        $digestInput.binding["commonCommit"] = $bindingRecord.CommonCommit
+    }
+    if ($schemaVersion -eq 2) { $digestInput["sourceTransport"] = $sourceTransportDigestRecord }
     $computedDigest = Get-AgentReplayTextSha256 -Text (ConvertTo-AgentReplayCanonicalJson -Value $digestInput)
     if ($computedDigest -cne $recordedDigest) {
         # Deliberately not worded as tamper detection. This digest is unkeyed:
@@ -1792,6 +1861,7 @@ function New-AgentReplaySnapshot {
         Seal           = $script:AgentReplaySnapshotSeal
         Served         = $served
         ServedKeys     = @($served.Keys)
+        SourceTransport = $sourceTransportRecord
     }
 }
 

@@ -82,7 +82,11 @@
       },
       {
         "sha256": "b6a5a00d94d81a598c2215d672638ab0e8bb295646d938ec3717d816be882a28",
-        "reason": "CURRENT and authoritative. Discloses what actually served source in a replay, not merely the part that was configured: sourceTransportMode snapshotLegacy and capabilityProbeSuppressed always, because replay declines the MCP capability probe so the newer get_changes contract is never used even when the recorded run used it, plus azCliFallbackSuppressed when config had enabled the live Azure CLI fallback. Recording only the configured half would let a reader take a faithful-looking artifact for a faithful transport. Both replay blocks are ordered so key order in an evidence file does not reshuffle when a key is added."
+        "reason": "History only, superseded below. Disclosed snapshotLegacy transport substitution and suppression of capability probing and the live Azure CLI fallback."
+      },
+      {
+        "sha256": "f94a0f0dc39789f3671194b808d3e36b88af51008a35ff75b31f6e58deb9ba72",
+        "reason": "CURRENT and authoritative. Disclose schema-v2 replay as exact reconstruction from the canonical sealed source-transport artifact, including its recorded live mode, while retaining an explicit snapshotLegacy warning only for schema-v1 compatibility snapshots."
       }
     ],
     "Invoke-ReviewerDelivery": [
@@ -136,7 +140,11 @@
     "Write-ReviewerConventionSpecialistPreview": [
       {
         "sha256": "871ae332707c8f0f59d01ec50fc730e6bd011ead39262ca6941facaf99cb73f9",
-        "reason": "Authorize the structured-remediation preview fields on top of the parent replay-isolation disclosure: preserve sourceTransportMode, capabilityProbeSuppressed, and azCliFallbackSuppressed while sealing construct-file census evidence and the exact remediation facts cited by changedCodeFix."
+        "reason": "History only, superseded below. Authorized structured-remediation preview fields on top of the snapshotLegacy replay disclosure."
+      },
+      {
+        "sha256": "38af213211e5422a81d180e9435d556d58c693348763412cb8a6f303a8c5b75e",
+        "reason": "CURRENT and authoritative. Preserve structured remediation evidence while reporting the exact sealed source-transport mode reconstructed by schema-v2 replay, with snapshotLegacy retained only for schema-v1 compatibility."
       }
     ]
   },

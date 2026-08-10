@@ -182,6 +182,10 @@ jobs:
         shell: pwsh
         run: ./tools/Test-ReplaySnapshot.ps1
 
+      - name: reviewer qualification git-identity policy
+        shell: pwsh
+        run: ./tools/Test-ReviewerQualificationPreflight.ps1
+
       - name: reviewer - offline replay is fail-closed and preview-only
         shell: pwsh
         run: |

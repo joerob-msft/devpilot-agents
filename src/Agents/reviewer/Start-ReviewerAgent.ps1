@@ -331,7 +331,11 @@ param(
     # so it only proves internal consistency; naming the digest an operator
     # actually vouched for is what binds this run to that snapshot.
     [ValidatePattern('^[0-9a-fA-F]{64}\z')]
-    [string]$ReplayManifestDigest
+    [string]$ReplayManifestDigest,
+
+    # Optional private capture seam for schema-v2 replay snapshots. The file is
+    # canonical, identity-bound source evidence, not a delivery artifact.
+    [string]$CaptureSourceTransportArtifactPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -651,6 +655,7 @@ Clear-ReviewerSourceReplayEnvironment
 # through a different transport than the live run it is evidence of, and a
 # warning on the console is gone by the time anyone reads the file.
 $script:ReviewerReplayAzFallbackSuppressed = $false
+$script:ReviewerReplaySourceTransportMode = $null
 $script:ReviewerReplaySnapshot = $null
 # Told to every model pass in replay, generalist and specialist alike. Each of
 # their prompts instructs the pass to re-read the pull request and stop without
@@ -2470,6 +2475,9 @@ $EffectiveSecondPassModel = $ResolvedSecondPassModel
 # and before the state directory is chosen, because it changes both.
 # ---------------------------------------------------------------------------
 if ($ReplaySnapshotName -or $ReplayRoot -or $ReplayManifestDigest) {
+    if ($CaptureSourceTransportArtifactPath) {
+        throw "Offline replay cannot capture a new source-transport artifact."
+    }
     if (-not $ReplayRoot -or -not $ReplaySnapshotName -or -not $ReplayManifestDigest) {
         throw "Offline replay requires all of -ReplayRoot, -ReplaySnapshotName and -ReplayManifestDigest."
     }
@@ -4148,7 +4156,12 @@ function Write-ReviewerPreview {
         [void]$lines.Add("- Replay outcome digest (wrapper-normalized decisions, excludes comment prose): ``$($replayDigests.OutcomeDigest)``")
         [void]$lines.Add("- This is NOT a reproduction of a live run: every tool this agent can grant was denied at launch, so the model had no usable tool and could not look anything up for itself. A replay is therefore a LOWER bound on what a live run would find, and its marker-emission behaviour is not comparable to live: each pass is told not to stop merely because it cannot re-read the pull request.")
         [void]$lines.Add("- This artifact is evidence, not an approved review: it is sealed under the replay key domain and can never be promoted.")
-        [void]$lines.Add("- Source was served by the snapshot-backed legacy path (``sourceTransportMode: snapshotLegacy``): replay declines the MCP capability probe, so the newer get_changes contract is never used here even if the recorded run used it. Source coverage and span basis can therefore differ from the live run this snapshot records.")
+        if ($script:ReviewerReplaySourceTransportMode) {
+            [void]$lines.Add("- Source was reproduced from the snapshot's canonical sealed source-transport artifact (``sourceTransportMode: $($script:ReviewerReplaySourceTransportMode)``). Its report, coverage, gate, and rendered source block were verified before use; replay made no live source request.")
+        }
+        else {
+            [void]$lines.Add("- Source was served by the schema-v1 snapshot-backed legacy path (``sourceTransportMode: snapshotLegacy``). This compatibility path can differ from the transport used by the recorded live run.")
+        }
         if ($script:ReviewerReplayAzFallbackSuppressed) {
             [void]$lines.Add("- The live Azure CLI source fallback was enabled in config and was SUPPRESSED for this replay: it resolves and runs the az CLI and then contacts the REST API. Source was read from the snapshot instead.")
         }
@@ -4305,7 +4318,9 @@ function Write-ReviewerPreview {
                     # used the newer contract or the CLI, coverage and span
                     # basis can differ from this. Recorded rather than warned,
                     # because the warning is gone by the time anyone reads this.
-                    sourceTransportMode     = "snapshotLegacy"
+                    sourceTransportMode     = $(if ($script:ReviewerReplaySourceTransportMode) {
+                            $script:ReviewerReplaySourceTransportMode
+                        } else { "snapshotLegacy" })
                     capabilityProbeSuppressed = $true
                     azCliFallbackSuppressed = [bool]$script:ReviewerReplayAzFallbackSuppressed
                 }
@@ -8012,6 +8027,30 @@ function Get-ReviewerSourceTransport {
     if ($SourceCommit -notmatch '^[0-9a-f]{40}$') {
         throw "The sealed source transport requires an exact lowercase 40-hex source commit."
     }
+    if ($script:ReviewerReplayActive -and $script:ReviewerReplaySnapshot -and $script:ReviewerReplaySnapshot.SourceTransport) {
+        $sourceReplay = $script:ReviewerReplaySnapshot.SourceTransport
+        $artifactText = [Text.UTF8Encoding]::new($false, $true).GetString([byte[]]$sourceReplay.ArtifactBytes)
+        $artifactEnvelope = $artifactText | ConvertFrom-Json -AsHashtable -Depth 64 -ErrorAction Stop
+        $expectedBinding = [ordered]@{
+            organization = $Organization
+            project = $ExpectedProject
+            repositoryId = $cfgRepoId.ToLowerInvariant()
+            pullRequestId = $PrId
+            iterationId = [int]$script:ReviewerReplaySnapshot.Binding.iterationId
+            commonCommit = [string]$script:ReviewerReplaySnapshot.Binding.commonCommit
+            sourceCommit = $SourceCommit
+            targetCommit = [string]$script:ReviewerReplaySnapshot.Binding.targetCommit
+            changeSetSha256 = [string]$script:ReviewerReplaySnapshot.Binding.changeSetSha256
+        }
+        $transport = Import-ReviewerSourceTransportReplayArtifact -Bytes ([byte[]]$sourceReplay.ArtifactBytes) `
+            -ExpectedBinding $expectedBinding -Policy $SourceTransportPolicy `
+            -PolicySha256 $SourceTransportPolicySha256
+        if ([string]$transport.Mode -cne [string]$sourceReplay.Mode) {
+            throw "Sealed source-transport mode does not match the replay manifest descriptor."
+        }
+        $script:ReviewerReplaySourceTransportMode = [string]$transport.Mode
+        return $transport
+    }
     # -- Capability gate: detect authoritative get_changes contract via tools/list.
     #    The probe NEVER runs on the shared ordinary-transport session: a tools/list
     #    failure aborts the session it runs on, and this session owns every remaining
@@ -8022,7 +8061,8 @@ function Get-ReviewerSourceTransport {
     #    below runs on an untouched session on the old schema or on any probe failure. --
     $capability = Resolve-ReviewerGetChangesCapability -Session $Session -AgencyPath $AgencyPath
     if ($null -ne $capability) {
-        return Get-ReviewerSourceTransportNewContract -Session $Session -PrId $PrId -SourceCommit $SourceCommit -Capability $capability
+        return Get-ReviewerSourceTransportNewContract -Session $Session -PrId $PrId `
+            -SourceCommit $SourceCommit -Capability $capability
     }
     if ($CfgAzCliFallbackEnabled) {
         # In replay the fallback is not merely unnecessary, it is wrong. Replay's
@@ -8034,7 +8074,8 @@ function Get-ReviewerSourceTransport {
         # read the snapshot does not carry still fails closed there, with the
         # exact request named. The operator is told once, at startup.
         if (-not $script:ReviewerReplayActive) {
-            return Get-ReviewerSourceTransportAzCliFallback -Session $Session -PrId $PrId -SourceCommit $SourceCommit
+            return Get-ReviewerSourceTransportAzCliFallback -Session $Session -PrId $PrId `
+                -SourceCommit $SourceCommit
         }
     }
     # -- Legacy get_changes path (unchanged) --
@@ -8102,6 +8143,7 @@ function Get-ReviewerSourceTransport {
         BlockText = $blockText
         Gate      = (Test-ReviewerSourceCoverageGate -Report $report -Policy $SourceTransportPolicy)
         Record    = (ConvertTo-ReviewerSourceCoverageRecord -Report $report -PolicySha256 $SourceTransportPolicySha256)
+        Mode      = "legacyMcp"
     }
 }
 
@@ -8149,12 +8191,16 @@ function Get-ReviewerSourceTransportNewContract {
         return Get-ReviewerBoundSourceContent -Session $Session -Path $Path -CommitSha $BaseCommit `
             -ChangeKinds @($Kinds) -MaxBytesPerFile $recoveryBytesPerSide
     }.GetNewClosure()
-    return Invoke-ReviewerSourceNewContractTransport -ToolInvoker $toolInvoker -Reader $sourceReader `
+    $result = Invoke-ReviewerSourceNewContractTransport -ToolInvoker $toolInvoker -Reader $sourceReader `
         -BaseReader $baseReader -RecoveryReader $recoverySourceReader -RecoveryBaseReader $recoveryBaseReader `
         -Organization $Organization -Project $ExpectedProject -RepositoryId $cfgRepoId `
         -PrId $PrId -SourceCommit $SourceCommit -Capability $Capability -Policy $SourceTransportPolicy `
         -PolicySha256 $SourceTransportPolicySha256 -NonceFactory { New-AgentNonce } `
         -AggregateReader $aggregateReader
+    return @{
+        Report = $result.Report; BlockText = $result.BlockText; Gate = $result.Gate
+        Record = $result.Record; Binding = $result.Binding; Mode = "mcpFlat"
+    }
 }
 
 function Get-ReviewerSourceTransportAzCliFallback {
@@ -8203,12 +8249,43 @@ function Get-ReviewerSourceTransportAzCliFallback {
             -CommitSha $BaseCommit -ChangeKinds @($Kinds) `
             -MaxBytesPerFile $recoveryBytesPerSide
     }.GetNewClosure()
-    return Invoke-ReviewerSourceNewContractTransport -IdentityReader $identityReader `
+    $result = Invoke-ReviewerSourceNewContractTransport -IdentityReader $identityReader `
         -Reader $sourceReader -BaseReader $baseReader -RecoveryReader $recoverySourceReader `
         -RecoveryBaseReader $recoveryBaseReader -AggregateReader $aggregateReader `
         -Organization $Organization -Project $ExpectedProject -RepositoryId $cfgRepoId `
         -PrId $PrId -SourceCommit $SourceCommit -Policy $SourceTransportPolicy `
         -PolicySha256 $SourceTransportPolicySha256 -NonceFactory { New-AgentNonce }
+    return @{
+        Report = $result.Report; BlockText = $result.BlockText; Gate = $result.Gate
+        Record = $result.Record; Binding = $result.Binding; Mode = "azureDevOpsCliFallback"
+    }
+}
+
+function Save-ReviewerSourceTransportReplayCapture {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][hashtable]$Transport
+    )
+    if (-not $Transport.Binding) {
+        throw "The selected source transport does not expose authoritative iteration binding and cannot be captured for exact replay."
+    }
+    $capturePath = [IO.Path]::GetFullPath($Path)
+    $repoPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\..\..")).TrimEnd('\') + '\'
+    if ($capturePath.StartsWith($repoPath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Source-transport replay artifacts are private and must be captured outside the repository."
+    }
+    if (Test-Path -LiteralPath $capturePath) {
+        throw "Source-transport replay artifact '$capturePath' already exists; immutable capture refuses overwrite."
+    }
+    $captureParent = Split-Path -Parent $capturePath
+    if (-not (Test-Path -LiteralPath $captureParent -PathType Container)) {
+        [void](New-Item -ItemType Directory -Path $captureParent -Force)
+    }
+    $captureBytes = New-ReviewerSourceTransportReplayArtifact -Binding $Transport.Binding `
+        -Mode ([string]$Transport.Mode) -PolicySha256 $SourceTransportPolicySha256 `
+        -Policy $SourceTransportPolicy -Report $Transport.Report `
+        -BlockText ([string]$Transport.BlockText)
+    [IO.File]::WriteAllBytes($capturePath, $captureBytes)
 }
 
 function Get-ReviewerPinnedConventionChangeSet {
@@ -8790,7 +8867,9 @@ function Write-ReviewerConventionSpecialistPreview {
                     # config asked for it, so source always comes from the
                     # snapshot-backed legacy path - which may not be the
                     # transport the recorded run used.
-                    sourceTransportMode = "snapshotLegacy"
+                    sourceTransportMode = $(if ($script:ReviewerReplaySourceTransportMode) {
+                            $script:ReviewerReplaySourceTransportMode
+                        } else { "snapshotLegacy" })
                     capabilityProbeSuppressed = $true
                     azCliFallbackSuppressed = [bool]$script:ReviewerReplayAzFallbackSuppressed
                     # Machine-readable counterpart to the residual risk above, so
@@ -8931,6 +9010,7 @@ function Invoke-ReviewerConventionSpecialistPass {
                     -Constructs @(Get-ReviewerHashValue -Container $Bound -Key 'ChangedConstructs' -Default @()) `
                     -ConstructFiles @(Get-ReviewerHashValue -Container $Bound -Key 'ConstructFiles' -Default @()) `
                     -ConstructIdRanges (Get-ReviewerHashValue -Container $Bound -Key 'ConstructIdRanges' -Default $null) `
+                    -RightHandRangesByPath (Get-ReviewerHashValue -Container $Bound -Key 'ChangedFileRangesByPath' -Default @{}) `
                     -ThreadDigestText $ThreadDigestText -PinnedSourceText $PinnedSourceText `
                     -ReplayNotice $(if ($script:ReviewerReplayActive) { $script:ReviewerReplayModelNotice } else { "" })
                 $contextBytes = [int]$specialistInput.Bytes
@@ -9052,7 +9132,8 @@ function Invoke-ReviewerConventionSpecialistPass {
                 -ResolvedSources @($sessionData.Sources) -ChangeEntries @($sessionData.Changes) `
                 -Constructs @(Get-ReviewerHashValue -Container $Bound -Key 'ChangedConstructs' -Default @()) `
                 -ConstructFiles @(Get-ReviewerHashValue -Container $Bound -Key 'ConstructFiles' -Default @()) `
-                -ConstructsIncomplete ([bool](Get-ReviewerHashValue -Container $Bound -Key 'ConstructsIncomplete' -Default $false))
+                -ConstructsIncomplete ([bool](Get-ReviewerHashValue -Container $Bound -Key 'ConstructsIncomplete' -Default $false)) `
+                -RightHandRangesByPath (Get-ReviewerHashValue -Container $Bound -Key 'ChangedFileRangesByPath' -Default @{})
             $candidates = @($validated.Candidates)
             $withheld = @($validated.Withheld)
             $residualRisks = @($validated.ResidualRisks)
@@ -13143,8 +13224,13 @@ function Invoke-ReviewerCycle {
             $constructFileSummaries = @()
             $constructIdRanges = $null
             $constructsIncomplete = $false
+            $changedFileRangesByPath = @{}
             try {
                 $sourceTransport = Get-ReviewerSourceTransport -Session $session -PrId $prId -SourceCommit $sourceCommit -AgencyPath $AgencyPath
+                if ($CaptureSourceTransportArtifactPath) {
+                    Save-ReviewerSourceTransportReplayCapture -Path $CaptureSourceTransportArtifactPath `
+                        -Transport $sourceTransport
+                }
                 $pinnedSourceText = [string]$sourceTransport.BlockText
                 $sourceCoverageRecord = $sourceTransport.Record
                 $constructResult = Get-ReviewerConstructFilesFromReportSafely -Report $sourceTransport.Report
@@ -13152,6 +13238,7 @@ function Invoke-ReviewerCycle {
                 $constructFileSummaries = @($constructResult.Files)
                 $constructIdRanges = $constructResult.IdRangesByKind
                 $constructsIncomplete = ([bool]$constructResult.Truncated -or @($constructResult.PartiallyUnderstoodFiles).Count -gt 0)
+                $changedFileRangesByPath = Get-ReviewerSourceRightHandRangesByPath -Report $sourceTransport.Report
                 Write-Host ("  PR {0} pinned source: {1}/{2} changed file(s) that could carry source text covered ({3}%), {4} path(s) the pull request itself calls source-free, {5} path(s) exact comparison proves deletion-only, {6} changed-source byte(s) + {7} sibling byte(s)." -f `
                         $prId, $sourceTransport.Report.CoveredFiles, $sourceTransport.Report.SourceBearingFileCount,
                         $sourceTransport.Report.CoveragePercent, $sourceTransport.Report.ChangeSetExcusedFileCount,
@@ -13394,6 +13481,7 @@ function Invoke-ReviewerCycle {
                     ChangedConstructs    = $changedConstructs
                     ConstructFiles       = $constructFileSummaries
                     ConstructIdRanges    = $constructIdRanges
+                    ChangedFileRangesByPath = $changedFileRangesByPath
                     ConstructsIncomplete = $constructsIncomplete
                     ConventionPlanPath   = $conventionPlanPath
                     FactPlanPath         = $factPlanPath

@@ -385,20 +385,47 @@ function Get-ReviewerRunReconciliationSemanticCandidateIdentity {
     }
 
     $coverage = Get-ReviewerRunReconciliationValue $Manifest "ruleCoverage" $null
+    $changedLineBound = $false
+    if ($anchorKind -ceq "changedFile") {
+        foreach ($fileAnchor in @(Get-ReviewerRunReconciliationValue $coverage "changedFileAnchors" @())) {
+            $anchorPath = ConvertTo-ReviewerConventionSpecialistCanonicalPath `
+                -Path ([string](Get-ReviewerRunReconciliationValue $fileAnchor "path" ""))
+            if ($anchorPath -cne $path) { continue }
+            foreach ($range in @(Get-ReviewerRunReconciliationValue $fileAnchor "rightHandRanges" @())) {
+                $rangeStart = Get-ReviewerRunReconciliationValue $range "startLine" $null
+                $rangeEnd = Get-ReviewerRunReconciliationValue $range "endLine" $null
+                if ((Test-ReviewerRunReconciliationInteger $rangeStart) -and
+                    (Test-ReviewerRunReconciliationInteger $rangeEnd) -and
+                    $line -ge [int64]$rangeStart -and $line -le [int64]$rangeEnd) {
+                    $changedLineBound = $true
+                    break
+                }
+            }
+            if ($changedLineBound) { break }
+        }
+    }
+    $ruleRows = @(@(Get-ReviewerRunReconciliationValue $coverage "rows" @()) | Where-Object {
+            [string](Get-ReviewerRunReconciliationValue $_ "packName" "") -ceq $packName -and
+            [string](Get-ReviewerRunReconciliationValue $_ "ruleSourceId" "") -ceq $ruleSourceId -and
+            ([string](Get-ReviewerRunReconciliationValue $_ "ruleSourceSha256" "")).ToLowerInvariant() -ceq $ruleSourceSha256
+        })
+    if ($anchorKind -ceq "changedFile" -and $ruleRows.Count -ne 1) {
+        [void]$errors.Add("candidate is not bound to exactly one authoritative rule source")
+    }
     $linkedRows = @(@(Get-ReviewerRunReconciliationValue $coverage "rows" @()) | Where-Object {
             [string](Get-ReviewerRunReconciliationValue $_ "candidateId" "") -ceq $candidateId
         })
     if ($anchorKind -ceq "prMetadata") { $linkedRows = @() }
     if ($anchorKind -ceq "changedFile" -and $linkedRows.Count -eq 0) {
-        $linkedRows = @(@(Get-ReviewerRunReconciliationValue $coverage "rows" @()) | Where-Object {
-                [string](Get-ReviewerRunReconciliationValue $_ "packName" "") -ceq $packName -and
-                [string](Get-ReviewerRunReconciliationValue $_ "ruleSourceId" "") -ceq $ruleSourceId -and
-                ([string](Get-ReviewerRunReconciliationValue $_ "ruleSourceSha256" "")).ToLowerInvariant() -ceq $ruleSourceSha256 -and
+        $linkedRows = @($ruleRows | Where-Object {
                 [string](Get-ReviewerRunReconciliationValue $_ "status" "") -ceq "violation"
             })
     }
-    if (-not $candidateId -or ($anchorKind -ceq "changedFile" -and $linkedRows.Count -ne 1)) {
-        [void]$errors.Add("candidate is not linked to exactly one authoritative rule row")
+    if ($anchorKind -ceq "changedFile" -and $linkedRows.Count -eq 0 -and -not $changedLineBound) {
+        [void]$errors.Add("non-construct candidate anchor is not within a sealed right-hand changed-file range")
+    }
+    if (-not $candidateId -or ($anchorKind -ceq "changedFile" -and $linkedRows.Count -gt 1)) {
+        [void]$errors.Add("candidate has an invalid authoritative rule-row link")
     }
     $row = $(if ($linkedRows.Count -eq 1) { $linkedRows[0] } else { $null })
     if ($anchorKind -ceq "changedFile" -and $null -ne $row -and (
@@ -412,7 +439,7 @@ function Get-ReviewerRunReconciliationSemanticCandidateIdentity {
             -Value $(if ($null -eq $row) { @() } else {
                 @(Get-ReviewerRunReconciliationValue $row "violatingConstructs" @())
             }))
-    if ($anchorKind -ceq "changedFile" -and $violatingIds.Count -eq 0) {
+    if ($anchorKind -ceq "changedFile" -and $null -ne $row -and $violatingIds.Count -eq 0) {
         [void]$errors.Add("candidate has no deterministic violation set")
     }
     if ($anchorKind -ceq "prMetadata" -and $factIds.Count -eq 0) {
@@ -459,12 +486,13 @@ function Get-ReviewerRunReconciliationSemanticCandidateIdentity {
             [void]$anchorConstructs.Add($descriptor)
         }
     }
-    if ($anchorKind -ceq "changedFile" -and $anchorConstructs.Count -eq 0) {
+    if ($anchorKind -ceq "changedFile" -and $null -ne $row -and $anchorConstructs.Count -eq 0) {
         [void]$errors.Add("candidate anchor does not identify a construct in the violation set")
     }
     $remediationErrors = [string[]](Get-ReviewerConventionSpecialistRemediationErrors `
             -Candidate $Candidate -Constructs @(Get-ReviewerRunReconciliationValue $coverage "changedConstructs" @()) `
             -ConstructFiles @(Get-ReviewerRunReconciliationValue $coverage "constructFiles" @()) `
+            -ChangedFileAnchors @(Get-ReviewerRunReconciliationValue $coverage "changedFileAnchors" @()) `
             -FactPlan ([pscustomobject]@{
                 facts = @(Get-ReviewerRunReconciliationValue $coverage "remediationFacts" @())
             }))

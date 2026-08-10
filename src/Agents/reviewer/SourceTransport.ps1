@@ -1089,6 +1089,17 @@ function Invoke-ReviewerSourceNewContractTransport {
         Report = $report; BlockText = $blockText
         Gate = Test-ReviewerSourceCoverageGate -Report $report -Policy $Policy
         Record = ConvertTo-ReviewerSourceCoverageRecord -Report $report -PolicySha256 $PolicySha256
+        Binding = [pscustomobject][ordered]@{
+            organization = $Organization
+            project = $Project
+            repositoryId = $RepositoryId.ToLowerInvariant()
+            pullRequestId = $PrId
+            iterationId = [int]$binding.IterationId
+            commonCommit = [string]$binding.CommonRefCommit
+            sourceCommit = $SourceCommit
+            targetCommit = [string]$binding.TargetRefCommit
+            changeSetSha256 = [string]$first.ChangeSetSha256
+        }
     }
 }
 
@@ -3434,5 +3445,211 @@ function ConvertTo-ReviewerSourceCoverageRecord {
                     siblingSliceSha256 = @(@($_.SiblingSlices) | ForEach-Object { [string]$_.Sha256 })
                 }
             })
+    }
+}
+
+function Get-ReviewerSourceRightHandRangesByPath {
+    param([Parameter(Mandatory)]$Report)
+    $result = @{}
+    foreach ($sourceFile in @($Report.Files)) {
+        $path = ConvertTo-ReviewerSourcePath -Path ([string]$sourceFile.Path)
+        if (-not $path) { continue }
+        $result[$path.TrimStart("/")] = @($sourceFile.RawSpans | ForEach-Object {
+                [pscustomobject][ordered]@{
+                    startLine = [int]$_.Start
+                    endLine = [int]$_.End
+                }
+            })
+    }
+    return $result
+}
+
+function Get-ReviewerSourceReplayCanonicalJson {
+    param([Parameter(Mandatory)]$Value)
+    $canonical = Get-Command ConvertTo-AgentReplayCanonicalJson -ErrorAction SilentlyContinue
+    if (-not $canonical) {
+        throw "Source-transport replay artifacts require the AgentHarness canonical JSON implementation."
+    }
+    return (ConvertTo-AgentReplayCanonicalJson -Value $Value)
+}
+
+function Assert-ReviewerSourceReplayExactKeys {
+    param(
+        [Parameter(Mandatory)]$Value,
+        [Parameter(Mandatory)][string]$Where,
+        [Parameter(Mandatory)][string[]]$Expected
+    )
+    if ($Value -isnot [System.Collections.IDictionary]) {
+        throw "$Where must be an object."
+    }
+    $actual = [string[]]@($Value.Keys | ForEach-Object { [string]$_ })
+    [Array]::Sort($actual, [StringComparer]::Ordinal)
+    $wanted = [string[]]@($Expected)
+    [Array]::Sort($wanted, [StringComparer]::Ordinal)
+    if (($actual -join "`0") -cne ($wanted -join "`0")) {
+        throw "$Where has fields [$($actual -join ', ')]; expected exactly [$($wanted -join ', ')]."
+    }
+}
+
+function Get-ReviewerSourceReplayBinding {
+    param([Parameter(Mandatory)]$Binding)
+    Assert-ReviewerSourceReplayExactKeys -Value $Binding -Where "Source-transport replay binding" -Expected @(
+        "organization", "project", "repositoryId", "pullRequestId", "iterationId",
+        "commonCommit", "sourceCommit", "targetCommit", "changeSetSha256"
+    )
+    $normalized = [ordered]@{
+        organization = [string]$Binding.organization
+        project = [string]$Binding.project
+        repositoryId = ([string]$Binding.repositoryId).ToLowerInvariant()
+        pullRequestId = [int]$Binding.pullRequestId
+        iterationId = [int]$Binding.iterationId
+        commonCommit = ([string]$Binding.commonCommit).ToLowerInvariant()
+        sourceCommit = ([string]$Binding.sourceCommit).ToLowerInvariant()
+        targetCommit = ([string]$Binding.targetCommit).ToLowerInvariant()
+        changeSetSha256 = ([string]$Binding.changeSetSha256).ToLowerInvariant()
+    }
+    if (-not $normalized.organization -or -not $normalized.project -or
+        $normalized.repositoryId -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -or
+        $normalized.pullRequestId -lt 1 -or $normalized.iterationId -lt 1 -or
+        $normalized.commonCommit -notmatch '^[0-9a-f]{40}$' -or
+        $normalized.sourceCommit -notmatch '^[0-9a-f]{40}$' -or
+        $normalized.targetCommit -notmatch '^[0-9a-f]{40}$' -or
+        $normalized.changeSetSha256 -notmatch '^[0-9a-f]{64}$') {
+        throw "Source-transport replay binding is malformed."
+    }
+    return $normalized
+}
+
+function Get-ReviewerSourceReplayBlockNonce {
+    param([Parameter(Mandatory)][string]$BlockText)
+    $matches = [regex]::Matches($BlockText, '(?m)^PINNED_SOURCE_([A-Z0-9]{8,128}) BEGIN ')
+    if ($matches.Count -lt 1) {
+        throw "Source-transport replay block has no sealed source boundary."
+    }
+    $nonce = [string]$matches[0].Groups[1].Value
+    foreach ($match in $matches) {
+        if ([string]$match.Groups[1].Value -cne $nonce) {
+            throw "Source-transport replay block uses more than one source boundary."
+        }
+    }
+    return $nonce
+}
+
+function New-ReviewerSourceTransportReplayArtifact {
+    param(
+        [Parameter(Mandatory)][hashtable]$Report,
+        [Parameter(Mandatory)][string]$BlockText,
+        [Parameter(Mandatory)][hashtable]$Policy,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-fA-F]{64}$')][string]$PolicySha256,
+        [Parameter(Mandatory)][ValidateSet("mcpFlat", "azureDevOpsCliFallback", "legacyMcp")][string]$Mode,
+        [Parameter(Mandatory)]$Binding
+    )
+    $bound = Get-ReviewerSourceReplayBinding -Binding $Binding
+    if ([string]$Report.CommitSha -cne [string]$bound.sourceCommit -or
+        [int]$Report.RecoveryIterationId -ne [int]$bound.iterationId -or
+        [string]$Report.RecoveryBaseCommit -cne [string]$bound.commonCommit) {
+        throw "Source-transport report identity does not match its replay binding."
+    }
+    $nonce = Get-ReviewerSourceReplayBlockNonce -BlockText $BlockText
+    $rendered = Format-ReviewerSealedSourceBlock -Report $Report -NonceFactory { $nonce }.GetNewClosure()
+    if ($rendered -cne $BlockText) {
+        throw "Source-transport block is not the exact canonical rendering of its report."
+    }
+    $record = ConvertTo-ReviewerSourceCoverageRecord -Report $Report -PolicySha256 $PolicySha256
+    $gateResult = Test-ReviewerSourceCoverageGate -Report $Report -Policy $Policy
+    $gate = [ordered]@{ ok = [bool]$gateResult.Ok; reasonCodes = [string[]]@($gateResult.ReasonCodes) }
+    $body = [ordered]@{
+        schemaVersion = 1
+        kind = "reviewer-source-transport-replay"
+        mode = $Mode
+        binding = $bound
+        policySha256 = $PolicySha256.ToLowerInvariant()
+        report = $Report
+        coverageRecord = $record
+        gate = $gate
+        blockText = $BlockText
+    }
+    $digest = Get-ReviewerSourceSha256 -Text (Get-ReviewerSourceReplayCanonicalJson -Value $body)
+    $artifact = [ordered]@{}
+    foreach ($key in $body.Keys) { $artifact[$key] = $body[$key] }
+    $artifact["artifactDigest"] = $digest
+    $canonical = Get-ReviewerSourceReplayCanonicalJson -Value $artifact
+    return , ([Text.UTF8Encoding]::new($false, $true)).GetBytes($canonical)
+}
+
+function Import-ReviewerSourceTransportReplayArtifact {
+    param(
+        [Parameter(Mandatory)][byte[]]$Bytes,
+        [Parameter(Mandatory)][hashtable]$Policy,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-fA-F]{64}$')][string]$PolicySha256,
+        [Parameter(Mandatory)]$ExpectedBinding
+    )
+    if ($Bytes.Length -lt 2 -or $Bytes.Length -gt 16777216) {
+        throw "Source-transport replay artifact is $($Bytes.Length) bytes; expected 2..16777216."
+    }
+    $text = ([Text.UTF8Encoding]::new($false, $true)).GetString($Bytes)
+    try { $artifact = $text | ConvertFrom-Json -AsHashtable -Depth 64 -ErrorAction Stop }
+    catch { throw "Source-transport replay artifact is not valid strict UTF-8 JSON." }
+    Assert-ReviewerSourceReplayExactKeys -Value $artifact -Where "Source-transport replay artifact" -Expected @(
+        "schemaVersion", "kind", "mode", "binding", "policySha256", "report",
+        "coverageRecord", "gate", "blockText", "artifactDigest"
+    )
+    if ((Get-ReviewerSourceReplayCanonicalJson -Value $artifact) -cne $text) {
+        throw "Source-transport replay artifact is not canonical JSON."
+    }
+    if ([int]$artifact.schemaVersion -ne 1 -or
+        [string]$artifact.kind -cne "reviewer-source-transport-replay" -or
+        @("mcpFlat", "azureDevOpsCliFallback", "legacyMcp") -cnotcontains [string]$artifact.mode) {
+        throw "Source-transport replay artifact kind, version, or mode is unsupported."
+    }
+    $body = [ordered]@{}
+    foreach ($key in @(
+            "schemaVersion", "kind", "mode", "binding", "policySha256", "report",
+            "coverageRecord", "gate", "blockText")) {
+        $body[$key] = $artifact[$key]
+    }
+    $computedDigest = Get-ReviewerSourceSha256 -Text (Get-ReviewerSourceReplayCanonicalJson -Value $body)
+    if ([string]$artifact.artifactDigest -cne $computedDigest) {
+        throw "Source-transport replay artifact digest does not match its canonical contents."
+    }
+    $bound = Get-ReviewerSourceReplayBinding -Binding $artifact.binding
+    $expected = Get-ReviewerSourceReplayBinding -Binding $ExpectedBinding
+    if ((Get-ReviewerSourceReplayCanonicalJson -Value $bound) -cne
+        (Get-ReviewerSourceReplayCanonicalJson -Value $expected)) {
+        throw "Source-transport replay artifact binding does not match the loaded snapshot."
+    }
+    if ([string]$artifact.policySha256 -cne $PolicySha256.ToLowerInvariant()) {
+        throw "Source-transport replay artifact was produced under a different source policy."
+    }
+    $report = [hashtable]$artifact.report
+    if ([string]$report.CommitSha -cne [string]$bound.sourceCommit -or
+        [int]$report.RecoveryIterationId -ne [int]$bound.iterationId -or
+        [string]$report.RecoveryBaseCommit -cne [string]$bound.commonCommit) {
+        throw "Source-transport replay report identity does not match its sealed binding."
+    }
+    $record = ConvertTo-ReviewerSourceCoverageRecord -Report $report -PolicySha256 $PolicySha256
+    if ((Get-ReviewerSourceReplayCanonicalJson -Value $record) -cne
+        (Get-ReviewerSourceReplayCanonicalJson -Value $artifact.coverageRecord)) {
+        throw "Source-transport replay coverage record cannot be reconstructed from its report."
+    }
+    $gateResult = Test-ReviewerSourceCoverageGate -Report $report -Policy $Policy
+    $gate = [ordered]@{ ok = [bool]$gateResult.Ok; reasonCodes = [string[]]@($gateResult.ReasonCodes) }
+    if ((Get-ReviewerSourceReplayCanonicalJson -Value $gate) -cne
+        (Get-ReviewerSourceReplayCanonicalJson -Value $artifact.gate)) {
+        throw "Source-transport replay gate cannot be reconstructed from its report."
+    }
+    $blockText = [string]$artifact.blockText
+    $nonce = Get-ReviewerSourceReplayBlockNonce -BlockText $blockText
+    $rendered = Format-ReviewerSealedSourceBlock -Report $report -NonceFactory { $nonce }.GetNewClosure()
+    if ($rendered -cne $blockText) {
+        throw "Source-transport replay block cannot be reconstructed from its report."
+    }
+    return @{
+        Report = $report
+        BlockText = $blockText
+        Record = $record
+        Gate = @{ Ok = [bool]$gateResult.Ok; ReasonCodes = [string[]]@($gateResult.ReasonCodes) }
+        Mode = [string]$artifact.mode
+        ArtifactDigest = $computedDigest
     }
 }
