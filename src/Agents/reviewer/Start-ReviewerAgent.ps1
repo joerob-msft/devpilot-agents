@@ -10091,7 +10091,7 @@ function Invoke-ReviewerCrossVerificationPass {
     }
     $reconciliationManifest = $null
     if ($specialistManifest) {
-        $reconciliationManifest = $specialistManifest | ConvertTo-Json -Depth 32 | ConvertFrom-Json -Depth 32
+        $reconciliationManifest = Copy-ReviewerVerificationJsonValue -Value $specialistManifest
         $reconciliationManifest.candidates = @(
             Get-ReviewerVerificationAcceptedConventionCandidates `
                 -ConventionCandidates @(Get-ReviewerVerificationValue $specialistManifest "candidates" @()) `

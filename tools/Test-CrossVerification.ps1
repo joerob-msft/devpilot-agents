@@ -276,6 +276,29 @@ $resolvedSources = @(
     }
 )
 
+$jsonCopySource = [pscustomobject][ordered]@{
+    createdAt = "2026-08-10T23:25:04.1234567Z"
+    nested = [pscustomobject][ordered]@{
+        empty = @()
+        singleton = @("only")
+        values = @("a", "b")
+        object = [pscustomobject][ordered]@{}
+        enabled = $true
+    }
+}
+$jsonCopy = Copy-ReviewerVerificationJsonValue -Value $jsonCopySource
+Assert-Verification ($jsonCopy.createdAt -is [string] -and
+    [string]$jsonCopy.createdAt -ceq [string]$jsonCopySource.createdAt -and
+    (ConvertTo-ReviewerVerificationCanonicalJson -Value $jsonCopy) -ceq
+    (ConvertTo-ReviewerVerificationCanonicalJson -Value $jsonCopySource)) `
+    "The verification JSON clone retyped an ISO string or lost nested JSON values."
+$jsonCopy.nested.values[0] = "changed"
+Assert-Verification ([string]$jsonCopySource.nested.values[0] -ceq "a") `
+    "The verification JSON clone retained mutable nested array references."
+Assert-VerificationThrows {
+    Copy-ReviewerVerificationJsonValue -Value ([DateTime]::UtcNow)
+} "The verification JSON clone accepted a runtime DateTime instead of preserving the JSON-only boundary."
+
 # Exact duplicates retain both originals but share one deterministic cluster.
 $exactFinding = New-GeneralistFinding -Comment "The retry path persists a null result and loses the prior state."
 $exactCandidates = @(ConvertTo-ReviewerVerificationCandidates -GeneralistPasses @(

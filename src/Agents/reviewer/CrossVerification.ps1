@@ -190,6 +190,61 @@ function Get-ReviewerVerificationObjectSha256 {
         ConvertTo-ReviewerVerificationCanonicalJson -Value $Value)
 }
 
+function Copy-ReviewerVerificationJsonValue {
+    param(
+        [AllowNull()][AllowEmptyCollection()][object]$Value,
+        [int]$Depth = 0
+    )
+    if ($Depth -gt 32) { throw "Verification JSON copy exceeded the maximum object depth of 32." }
+    if ($null -eq $Value -or $Value -is [string] -or $Value -is [bool] -or
+        $Value -is [byte] -or $Value -is [sbyte] -or $Value -is [int16] -or
+        $Value -is [uint16] -or $Value -is [int32] -or $Value -is [uint32] -or
+        $Value -is [int64] -or $Value -is [uint64] -or $Value -is [single] -or
+        $Value -is [double] -or $Value -is [decimal]) {
+        return $Value
+    }
+    if ($Value -is [System.Collections.IDictionary] -or
+        $Value -is [System.Management.Automation.PSCustomObject]) {
+        $copy = [ordered]@{}
+        $names = [System.Collections.Generic.List[string]]::new()
+        if ($Value -is [System.Collections.IDictionary]) {
+            foreach ($key in $Value.Keys) {
+                if ($key -isnot [string]) {
+                    throw "Verification JSON copy requires unique string object keys."
+                }
+                [void]$names.Add([string]$key)
+            }
+        }
+        else {
+            foreach ($property in $Value.PSObject.Properties) {
+                [void]$names.Add([string]$property.Name)
+            }
+        }
+        foreach ($nameValue in $names) {
+            if ($copy.Contains([string]$nameValue)) {
+                throw "Verification JSON copy requires unique string object keys."
+            }
+            $name = [string]$nameValue
+            if ($Value -is [System.Collections.IDictionary]) {
+                $raw = $Value[$name]
+            }
+            else {
+                $raw = $Value.PSObject.Properties[$name].Value
+            }
+            $copy[$name] = Copy-ReviewerVerificationJsonValue -Value $raw -Depth ($Depth + 1)
+        }
+        return [pscustomobject]$copy
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $items = [System.Collections.Generic.List[object]]::new()
+        foreach ($item in $Value) {
+            [void]$items.Add((Copy-ReviewerVerificationJsonValue -Value $item -Depth ($Depth + 1)))
+        }
+        return , $items.ToArray()
+    }
+    throw "Verification JSON copy encountered unsupported type '$($Value.GetType().FullName)'."
+}
+
 function Get-ReviewerVerificationDomainKey {
     param(
         [Parameter(Mandatory)][byte[]]$MasterKey,
@@ -845,8 +900,7 @@ function Get-ReviewerVerificationAcceptedConventionCandidates {
         if (-not $candidateMap.ContainsKey($originCandidateId)) {
             throw "Accepted convention decision references unknown origin candidate '$originCandidateId'."
         }
-        $candidate = $candidateMap[$originCandidateId] |
-            ConvertTo-Json -Depth 32 | ConvertFrom-Json -Depth 32
+        $candidate = Copy-ReviewerVerificationJsonValue -Value $candidateMap[$originCandidateId]
         if ([string]$accepted.correctedSeverity -cne "none") {
             $candidate.severity = [string]$accepted.correctedSeverity
         }
