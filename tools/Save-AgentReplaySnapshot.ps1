@@ -52,7 +52,10 @@ param(
     [string]$ScriptSha256 = ("0" * 64),
     [string]$PromptSha256 = ("0" * 64),
     [string[]]$Models = @(),
-    [string]$ChangeSetPayloadFile
+    [string]$ChangeSetPayloadFile,
+    [string]$SourceTransportArtifactFile,
+    [ValidateRange(0, [int]::MaxValue)][int]$IterationId = 0,
+    [ValidatePattern('^$|^[0-9a-fA-F]{40}$')][string]$CommonCommit = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -136,8 +139,56 @@ $bindings = [ordered]@{
     promptSha256 = $PromptSha256.ToLowerInvariant()
     models       = @($Models)
 }
+$schemaVersion = 1
+$sourceTransport = $null
+if ($SourceTransportArtifactFile) {
+    if ($IterationId -lt 1 -or -not $CommonCommit) {
+        throw "Schema-v2 source replay requires authoritative -IterationId and -CommonCommit."
+    }
+    $CommonCommit = $CommonCommit.ToLowerInvariant()
+    $sourcePath = Join-Path $snapshotFull ($SourceTransportArtifactFile -replace '/', [IO.Path]::DirectorySeparatorChar)
+    if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+        throw "Source-transport artifact '$SourceTransportArtifactFile' does not exist under '$snapshotFull'."
+    }
+    $sourceBytes = [IO.File]::ReadAllBytes($sourcePath)
+    if ($sourceBytes.Length -lt 2 -or $sourceBytes.Length -gt 16777216) {
+        throw "Source-transport artifact is $($sourceBytes.Length) bytes; expected 2..16777216."
+    }
+    $sourceText = $utf8.GetString($sourceBytes)
+    try { $sourceArtifact = $sourceText | ConvertFrom-Json -AsHashtable -Depth 64 -ErrorAction Stop }
+    catch { throw "Source-transport artifact is not valid strict UTF-8 JSON." }
+    if ((ConvertTo-AgentReplayCanonicalJson -Value $sourceArtifact) -cne $sourceText) {
+        throw "Source-transport artifact is not canonical JSON."
+    }
+    if ([int]$sourceArtifact.schemaVersion -ne 1 -or
+        [string]$sourceArtifact.kind -cne "reviewer-source-transport-replay" -or
+        @("mcpFlat", "azureDevOpsCliFallback", "legacyMcp") -cnotcontains [string]$sourceArtifact.mode) {
+        throw "Source-transport artifact kind, version, or mode is unsupported."
+    }
+    $sourceBinding = $sourceArtifact.binding
+    if ([string]$sourceBinding.organization -cne $Organization -or
+        [string]$sourceBinding.project -cne $Project -or
+        [string]$sourceBinding.repositoryId -cne $RepositoryId.ToLowerInvariant() -or
+        [int]$sourceBinding.pullRequestId -ne $PullRequestId -or
+        [int]$sourceBinding.iterationId -ne $IterationId -or
+        [string]$sourceBinding.commonCommit -cne $CommonCommit -or
+        [string]$sourceBinding.sourceCommit -cne $SourceCommit -or
+        [string]$sourceBinding.targetCommit -cne $TargetCommit -or
+        [string]$sourceBinding.changeSetSha256 -cne $changeSetSha) {
+        throw "Source-transport artifact binding does not match the snapshot being sealed."
+    }
+    $schemaVersion = 2
+    $binding["iterationId"] = $IterationId
+    $binding["commonCommit"] = $CommonCommit
+    $sourceTransport = [ordered]@{
+        mode = [string]$sourceArtifact.mode
+        artifactFile = $SourceTransportArtifactFile
+        artifactSha256 = Get-Sha256Hex -Bytes $sourceBytes
+        artifactByteLength = [long]$sourceBytes.Length
+    }
+}
 $digestInput = [ordered]@{
-    schemaVersion = 1
+    schemaVersion = $schemaVersion
     kind          = "agent-replay-snapshot"
     snapshotId    = $snapshotName
     capturedUtc   = $captured
@@ -146,10 +197,11 @@ $digestInput = [ordered]@{
     bindings      = $bindings
     resources     = @($digestResources.ToArray())
 }
+if ($schemaVersion -eq 2) { $digestInput["sourceTransport"] = $sourceTransport }
 $digest = Get-Sha256Hex -Bytes ($utf8.GetBytes((ConvertTo-AgentReplayCanonicalJson -Value $digestInput)))
 
 $manifest = [ordered]@{
-    schemaVersion  = 1
+    schemaVersion  = $schemaVersion
     kind           = "agent-replay-snapshot"
     snapshotId     = $snapshotName
     capturedUtc    = $captured
@@ -158,6 +210,11 @@ $manifest = [ordered]@{
     bindings       = $bindings
     resources      = @($resources.ToArray())
     manifestDigest = $digest
+}
+if ($schemaVersion -eq 2) {
+    $manifest.Remove("manifestDigest")
+    $manifest["sourceTransport"] = $sourceTransport
+    $manifest["manifestDigest"] = $digest
 }
 $manifestPath = Join-Path $snapshotFull "manifest.json"
 [System.IO.File]::WriteAllBytes($manifestPath, $utf8.GetBytes(($manifest | ConvertTo-Json -Depth 20)))

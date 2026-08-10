@@ -61,6 +61,7 @@ function Get-ReviewerConventionSpecialistRemediationErrors {
         [Parameter(Mandatory)]$Candidate,
         [AllowEmptyCollection()][object[]]$Constructs = @(),
         [AllowEmptyCollection()][object[]]$ConstructFiles = @(),
+        [AllowEmptyCollection()][object[]]$ChangedFileAnchors = @(),
         $FactPlan = $null
     )
     $errors = [System.Collections.Generic.List[string]]::new()
@@ -90,11 +91,32 @@ function Get-ReviewerConventionSpecialistRemediationErrors {
             $id = [string](Get-ReviewerConventionSpecialistValue $construct "constructId" "")
             if ($id) { [void]$known.Add($id) }
         }
+        $candidatePath = ConvertTo-ReviewerConventionSpecialistCanonicalPath `
+            -Path ([string](Get-ReviewerConventionSpecialistValue $Candidate "filePath" ""))
+        $candidateLineValue = Get-ReviewerConventionSpecialistValue $Candidate "line" 0
+        $candidateLine = if ($candidateLineValue -is [int] -or $candidateLineValue -is [long] -or
+            $candidateLineValue -is [short] -or $candidateLineValue -is [byte]) {
+            [int64]$candidateLineValue
+        } else { 0 }
+        foreach ($fileAnchor in @($ChangedFileAnchors)) {
+            $anchorPath = ConvertTo-ReviewerConventionSpecialistCanonicalPath `
+                -Path ([string](Get-ReviewerConventionSpecialistValue $fileAnchor "path" ""))
+            if ($anchorPath -cne $candidatePath) { continue }
+            foreach ($range in @(Get-ReviewerConventionSpecialistValue $fileAnchor "rightHandRanges" @())) {
+                $startLine = [int](Get-ReviewerConventionSpecialistValue $range "startLine" 0)
+                $endLine = [int](Get-ReviewerConventionSpecialistValue $range "endLine" 0)
+                if ($candidateLine -ge $startLine -and $candidateLine -le $endLine) {
+                    $anchorId = [string](Get-ReviewerConventionSpecialistValue $fileAnchor "anchorId" "")
+                    if ($anchorId) { [void]$known.Add($anchorId) }
+                    break
+                }
+            }
+        }
         if ($targets.Count -eq 0 -or @($targets | Where-Object {
                     $_ -cnotmatch '^[a-z]{2}[0-9]+$' -or
                     -not $known.Contains($_)
                 }).Count -gt 0) {
-            [void]$errors.Add("changed-file remediation must target known sealed constructs")
+            [void]$errors.Add("changed-file remediation must target a known sealed construct or right-hand changed-file anchor")
         }
     }
     $factMap = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
@@ -909,7 +931,10 @@ function Get-ReviewerConventionSpecialistChangedFileIndex {
         change set alone, or two runs over the same pull request would number
         the same file differently and no anchor would be comparable.
     #>
-    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ChangeEntries)
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ChangeEntries,
+        [hashtable]$RightHandRangesByPath = @{}
+    )
     $paths = @(@($ChangeEntries) |
         Where-Object { [string](Get-ReviewerConventionSpecialistValue $_ "Role" "") -ceq "current" } |
         ForEach-Object { [string](Get-ReviewerConventionSpecialistValue $_ "Path" "") } |
@@ -919,7 +944,20 @@ function Get-ReviewerConventionSpecialistChangedFileIndex {
     [Array]::Sort($sorted, [StringComparer]::Ordinal)
     $index = [System.Collections.Generic.List[object]]::new()
     for ($i = 0; $i -lt $sorted.Count; $i++) {
-        [void]$index.Add([pscustomobject][ordered]@{ anchorId = "cf$i"; path = $sorted[$i] })
+        $ranges = @()
+        if ($RightHandRangesByPath.ContainsKey($sorted[$i])) {
+            $ranges = @($RightHandRangesByPath[$sorted[$i]] | ForEach-Object {
+                    [pscustomobject][ordered]@{
+                        startLine = [int](Get-ReviewerConventionSpecialistValue $_ "startLine" 0)
+                        endLine = [int](Get-ReviewerConventionSpecialistValue $_ "endLine" 0)
+                    }
+                })
+        }
+        [void]$index.Add([pscustomobject][ordered]@{
+                anchorId = "cf$i"
+                path = $sorted[$i]
+                rightHandRanges = $ranges
+            })
     }
     return , $index.ToArray()
 }
@@ -1491,7 +1529,8 @@ function Resolve-ReviewerConventionSpecialistCandidates {
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ChangeEntries,
         [AllowEmptyCollection()][object[]]$Constructs = @(),
         [AllowEmptyCollection()][object[]]$ConstructFiles = @(),
-        [bool]$ConstructsIncomplete = $false
+        [bool]$ConstructsIncomplete = $false,
+        [hashtable]$RightHandRangesByPath = @{}
     )
     if (@($ResolvedSources).Count -eq 0) {
         throw "Convention specialist candidate validation requires at least one resolved convention source."
@@ -1526,6 +1565,8 @@ function Resolve-ReviewerConventionSpecialistCandidates {
     $seenIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $accepted = [System.Collections.Generic.List[object]]::new()
     $withheld = [System.Collections.Generic.List[object]]::new()
+    $changedFileIndex = Get-ReviewerConventionSpecialistChangedFileIndex -ChangeEntries $ChangeEntries `
+        -RightHandRangesByPath $RightHandRangesByPath
     foreach ($item in @($Marker.withheld)) {
         if (Test-ReviewerConventionSpecialistVoteText -Text ([string]$item.detail)) {
             throw "Specialist withheld diagnostics carried a vote recommendation."
@@ -1541,7 +1582,7 @@ function Resolve-ReviewerConventionSpecialistCandidates {
         if (-not $seenIds.Add($candidateId)) { throw "Specialist output duplicated candidate id '$candidateId'." }
         $remediationErrors = [string[]](Get-ReviewerConventionSpecialistRemediationErrors `
                 -Candidate $candidate -Constructs $Constructs -ConstructFiles $ConstructFiles `
-                -FactPlan $FactPlan)
+                    -ChangedFileAnchors $changedFileIndex -FactPlan $FactPlan)
         if ($remediationErrors.Count -gt 0) {
             throw "Specialist candidate '$candidateId' has invalid structured remediation: $($remediationErrors -join '; ')."
         }
@@ -1632,8 +1673,20 @@ function Resolve-ReviewerConventionSpecialistCandidates {
         }
         if ([string]$candidate.anchorKind -ceq "changedFile") {
             $relativePath = ([string]$candidate.filePath).TrimStart("/")
+            $lineInChangedRange = $false
+            if ($RightHandRangesByPath.ContainsKey($relativePath)) {
+                foreach ($range in @($RightHandRangesByPath[$relativePath])) {
+                    $startLine = [int](Get-ReviewerConventionSpecialistValue $range "startLine" 0)
+                    $endLine = [int](Get-ReviewerConventionSpecialistValue $range "endLine" 0)
+                    if ([int]$candidate.line -ge $startLine -and [int]$candidate.line -le $endLine) {
+                        $lineInChangedRange = $true
+                        break
+                    }
+                }
+            }
             if (-not [string]$candidate.filePath -or [int]$candidate.line -lt 1 -or
-                -not $currentPaths.Contains($relativePath)) {
+                -not $currentPaths.Contains($relativePath) -or
+                ($RightHandRangesByPath.Count -gt 0 -and -not $lineInChangedRange)) {
                 [void]$withheld.Add([pscustomobject][ordered]@{
                         candidateId = $candidateId
                         reason = "outsideChangedFile"
@@ -1661,7 +1714,6 @@ function Resolve-ReviewerConventionSpecialistCandidates {
     foreach ($item in @($Marker.withheld)) { [void]$withheld.Add($item) }
     # The accounting runs LAST and over the ACCEPTED candidates, so it describes
     # the pass that actually happened rather than the one the model proposed.
-    $changedFileIndex = Get-ReviewerConventionSpecialistChangedFileIndex -ChangeEntries $ChangeEntries
     $coverageRows = @()
     if ($Marker.ContainsKey("ruleCoverage")) { $coverageRows = @($Marker.ruleCoverage) }
     $coverage = Resolve-ReviewerConventionSpecialistRuleCoverage -Rows $coverageRows `
@@ -1720,6 +1772,7 @@ function New-ReviewerConventionSpecialistInput {
         [AllowEmptyCollection()][object[]]$Constructs = @(),
         [AllowEmptyCollection()][object[]]$ConstructFiles = @(),
         $ConstructIdRanges = $null,
+        [hashtable]$RightHandRangesByPath = @{},
         [Parameter(Mandatory)][AllowEmptyString()][string]$ThreadDigestText,
         [AllowEmptyString()][string]$PinnedSourceText = "",
         # Non-empty only in offline replay. The prompt tells this pass to
@@ -1759,7 +1812,8 @@ function New-ReviewerConventionSpecialistInput {
     # with a thousand-file change set would push the envelope past its bound and
     # turn today's graceful "pinned source dropped" degrade into a hard failure
     # of the whole pass.
-    $fullAnchorIndex = @(Get-ReviewerConventionSpecialistChangedFileIndex -ChangeEntries $ChangeEntries)
+    $fullAnchorIndex = @(Get-ReviewerConventionSpecialistChangedFileIndex -ChangeEntries $ChangeEntries `
+            -RightHandRangesByPath $RightHandRangesByPath)
     $anchorsTruncated = ($fullAnchorIndex.Count -gt $script:ReviewerConventionSpecialistMaxCoverageAnchors)
     $anchorIndex = @($fullAnchorIndex | Select-Object -First $script:ReviewerConventionSpecialistMaxCoverageAnchors)
     $runtime = [pscustomobject][ordered]@{

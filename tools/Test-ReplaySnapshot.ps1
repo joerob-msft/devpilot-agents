@@ -20,6 +20,7 @@ Set-StrictMode -Version Latest
 
 Import-Module (Join-Path $RepoRoot "src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1") -Force
 . (Join-Path $RepoRoot "src\Agents\reviewer\ConventionSpecialist.ps1")
+. (Join-Path $RepoRoot "src\Agents\reviewer\SourceTransport.ps1")
 
 $script:Checks = 0
 $script:Failures = New-Object System.Collections.Generic.List[string]
@@ -257,6 +258,143 @@ try {
     $reloaded = New-AgentReplaySnapshot -ReplayRoot $sealRoot -SnapshotName "round-trip" -ExpectedManifestDigest $sealedDigest
     Assert-Replay ($reloaded.ManifestDigest -ceq $sealedDigest -and $reloaded.ResourceCount -eq 1) `
         "The loader must recompute exactly the digest the writer recorded."
+
+    # Schema v2 seals the exact source transport selected during live capture.
+    # Three nondegenerate files make a 0/N replay regression visible immediately.
+    $v2Root = Join-Path $sandbox "sealed-v2"
+    $v2Dir = Join-Path $v2Root "source-parity"
+    New-Item -ItemType Directory -Force -Path (Join-Path $v2Dir "payloads") | Out-Null
+    [IO.File]::WriteAllBytes((Join-Path $v2Dir "payloads\pr.json"),
+        $utf8.GetBytes('{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"pullRequestId\":10}"}]}}'))
+    $v2Recipe = @(@{
+            tool = "repo_pull_request"
+            arguments = [ordered]@{ action = "get"; project = "Widgets"; repositoryId = "11111111-2222-3333-4444-555555555555"; pullRequestId = 10 }
+            payloadFile = "payloads/pr.json"
+        })
+    [IO.File]::WriteAllBytes((Join-Path $v2Dir "recipe.json"), $utf8.GetBytes(($v2Recipe | ConvertTo-Json -Depth 10)))
+    $changeSetPath = Join-Path $v2Dir "change-set.json"
+    [IO.File]::WriteAllBytes($changeSetPath, $utf8.GetBytes(
+            '{"iteration":3,"paths":["/src/a.cs","/src/b.cs","/src/c.cs"]}'))
+    $changeSetSha = (Get-FileHash -LiteralPath $changeSetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $sourceCommit = "a" * 40
+    $targetCommit = "b" * 40
+    $commonCommit = "c" * 40
+    $sourceCorpus = @{
+        "/src/a.cs" = "line1`nline2`nline3`nline4`nline5`nline6"
+        "/src/b.cs" = "one`ntwo`nthree`nfour`nfive`nsix"
+        "/src/c.cs" = "alpha`nbeta`ngamma`ndelta`nepsilon`nzeta"
+    }
+    $sourceReader = {
+        param([string]$Path)
+        $text = [string]$sourceCorpus[$Path]
+        return [pscustomobject]@{
+            Text = $text
+            MimeType = "text/plain"
+            ByteLength = $utf8.GetByteCount($text)
+            Sha256 = Get-ReviewerSourceSha256 -Text $text
+        }
+    }.GetNewClosure()
+    $sourceSpans = [ordered]@{
+        "/src/a.cs" = @(@{ Start = 2; End = 3 })
+        "/src/b.cs" = @(@{ Start = 3; End = 4 })
+        "/src/c.cs" = @(@{ Start = 4; End = 5 })
+    }
+    $sourceKinds = [ordered]@{
+        "/src/a.cs" = "Edit"; "/src/b.cs" = "Edit"; "/src/c.cs" = "Edit"
+    }
+    $sourcePolicyRaw = Get-Content -LiteralPath (Join-Path $RepoRoot "src\Agents\reviewer\source\v1\policy.json") -Raw |
+        ConvertFrom-Json
+    $sourcePolicyProperties = [ordered]@{}
+    foreach ($property in $sourcePolicyRaw.PSObject.Properties) {
+        if ($property.Name.StartsWith("_", [StringComparison]::Ordinal)) { continue }
+        $sourcePolicyProperties[$property.Name] = $property.Value
+    }
+    $sourcePolicy = New-ReviewerSourceTransportPolicy -Policy ([pscustomobject]$sourcePolicyProperties)
+    $sourcePolicySha = (Get-FileHash -LiteralPath (Join-Path $RepoRoot "src\Agents\reviewer\source\v1\policy.json") `
+            -Algorithm SHA256).Hash.ToLowerInvariant()
+    $liveReport = New-ReviewerSourceTransportReport -CommitSha $sourceCommit `
+        -ChangedPaths @($sourceSpans.Keys) -SpansByPath $sourceSpans -Policy $sourcePolicy `
+        -Reader $sourceReader -ChangeKindsByPath $sourceKinds `
+        -RecoveryBaseCommit $commonCommit -RecoveryIterationId 3
+    $liveGate = Test-ReviewerSourceCoverageGate -Report $liveReport -Policy $sourcePolicy
+    $liveRecord = ConvertTo-ReviewerSourceCoverageRecord -Report $liveReport -PolicySha256 $sourcePolicySha
+    $liveBlock = Format-ReviewerSealedSourceBlock -Report $liveReport -NonceFactory { "0123456789abcdef0123456789abcdef" }
+    $sourceBinding = [ordered]@{
+        organization = "contoso"; project = "Widgets"
+        repositoryId = "11111111-2222-3333-4444-555555555555"
+        pullRequestId = 10; iterationId = 3; commonCommit = $commonCommit
+        sourceCommit = $sourceCommit; targetCommit = $targetCommit
+        changeSetSha256 = $changeSetSha
+    }
+    $artifactBytes = New-ReviewerSourceTransportReplayArtifact -Binding $sourceBinding `
+        -Mode azureDevOpsCliFallback -PolicySha256 $sourcePolicySha -Policy $sourcePolicy `
+        -Report $liveReport -BlockText $liveBlock
+    [IO.File]::WriteAllBytes((Join-Path $v2Dir "source-transport.json"), $artifactBytes)
+    & (Join-Path $RepoRoot "tools\Save-AgentReplaySnapshot.ps1") -SnapshotPath $v2Dir `
+        -Recipe (Join-Path $v2Dir "recipe.json") -Organization "contoso" -Project "Widgets" `
+        -RepositoryId "11111111-2222-3333-4444-555555555555" -PullRequestId 10 `
+        -SourceCommit $sourceCommit -TargetCommit $targetCommit -ChangeSetPayloadFile "change-set.json" `
+        -SourceTransportArtifactFile "source-transport.json" -IterationId 3 `
+        -CommonCommit $commonCommit | Out-Null
+    $v2Manifest = [IO.File]::ReadAllText((Join-Path $v2Dir "manifest.json"), $utf8) | ConvertFrom-Json
+    $v2Snapshot = New-AgentReplaySnapshot -ReplayRoot $v2Root -SnapshotName "source-parity" `
+        -ExpectedManifestDigest ([string]$v2Manifest.manifestDigest)
+    Assert-Replay ($null -ne $v2Snapshot.SourceTransport -and
+        [string]$v2Snapshot.SourceTransport.Mode -ceq "azureDevOpsCliFallback") `
+        "Schema-v2 replay did not disclose the live source-transport mode."
+    $v2PayloadLength = (Get-Item -LiteralPath (Join-Path $v2Dir "payloads\pr.json")).Length
+    Assert-Replay ([long]$v2Snapshot.PayloadBytes -eq
+        ([long]$artifactBytes.Length + [long]$v2PayloadLength)) `
+        "Schema-v2 payload accounting must count the source artifact exactly once."
+    $replayedTransport = Import-ReviewerSourceTransportReplayArtifact `
+        -Bytes ([byte[]]$v2Snapshot.SourceTransport.ArtifactBytes) -ExpectedBinding $sourceBinding `
+        -Policy $sourcePolicy -PolicySha256 $sourcePolicySha
+    Assert-Replay ([int]$liveReport.CoveredFiles -eq 3 -and [int]$liveReport.DeliveredSpanCount -eq 3) `
+        "The synthetic live capture was not a three-file, nondegenerate source transport."
+    Assert-Replay ((ConvertTo-AgentReplayCanonicalJson -Value $liveRecord) -ceq
+        (ConvertTo-AgentReplayCanonicalJson -Value $replayedTransport.Record)) `
+        "Live and replay source-coverage records were not byte-semantically identical."
+    Assert-Replay ((ConvertTo-AgentReplayCanonicalJson -Value $liveReport) -ceq
+        (ConvertTo-AgentReplayCanonicalJson -Value $replayedTransport.Report)) `
+        "Live and replay source reports were not byte-semantically identical."
+    Assert-Replay ([string]$replayedTransport.BlockText -ceq $liveBlock -and
+        [bool]$replayedTransport.Gate.Ok -eq [bool]$liveGate.Ok) `
+        "Replay did not reproduce the exact sealed block and coverage gate."
+    $wrongIdentityDir = Join-Path $sandbox "sealed-v2-wrong-identity"
+    Copy-Item -Recurse -Force $v2Dir $wrongIdentityDir
+    Remove-Item -LiteralPath (Join-Path $wrongIdentityDir "manifest.json") -Force
+    Assert-ReplayThrows {
+        & (Join-Path $RepoRoot "tools\Save-AgentReplaySnapshot.ps1") `
+            -SnapshotPath $wrongIdentityDir -Recipe (Join-Path $wrongIdentityDir "recipe.json") `
+            -Organization "contoso" -Project "Widgets" `
+            -RepositoryId "11111111-2222-3333-4444-555555555555" -PullRequestId 10 `
+            -SourceCommit $sourceCommit -TargetCommit $targetCommit `
+            -ChangeSetPayloadFile "change-set.json" -SourceTransportArtifactFile "source-transport.json" `
+            -IterationId 4 -CommonCommit $commonCommit
+    } "The sealer must reject an independently supplied iteration that disagrees with the artifact." `
+        -Match "binding does not match"
+    foreach ($mode in @("mcpFlat", "azureDevOpsCliFallback", "legacyMcp")) {
+        $modeBytes = New-ReviewerSourceTransportReplayArtifact -Binding $sourceBinding -Mode $mode `
+            -PolicySha256 $sourcePolicySha -Policy $sourcePolicy -Report $liveReport `
+            -BlockText $liveBlock
+        $modeReplay = Import-ReviewerSourceTransportReplayArtifact -Bytes $modeBytes `
+            -ExpectedBinding $sourceBinding -Policy $sourcePolicy -PolicySha256 $sourcePolicySha
+        Assert-Replay ([string]$modeReplay.Mode -ceq $mode) "Sealed replay lost source mode '$mode'."
+    }
+    $v2Missing = Join-Path $sandbox "sealed-v2-missing"
+    Copy-Item -Recurse -Force $v2Root $v2Missing
+    Remove-Item -LiteralPath (Join-Path $v2Missing "source-parity\source-transport.json") -Force
+    Assert-ReplayThrows {
+        New-AgentReplaySnapshot -ReplayRoot $v2Missing -SnapshotName "source-parity"
+    } "A missing sealed source-transport artifact must fail closed." -Match "does not exist|Cannot find|could not be found"
+    $v2Tampered = Join-Path $sandbox "sealed-v2-tampered"
+    Copy-Item -Recurse -Force $v2Root $v2Tampered
+    $v2ArtifactPath = Join-Path $v2Tampered "source-parity\source-transport.json"
+    $v2ArtifactText = [IO.File]::ReadAllText($v2ArtifactPath, $utf8).Replace('"coveredFiles":3', '"coveredFiles":2')
+    [IO.File]::WriteAllBytes($v2ArtifactPath, $utf8.GetBytes($v2ArtifactText))
+    Assert-ReplayThrows {
+        New-AgentReplaySnapshot -ReplayRoot $v2Tampered -SnapshotName "source-parity"
+    } "A tampered sealed source-transport artifact must fail its manifest hash." -Match "does not match its recorded SHA-256|is \d+ bytes"
 
     # -- 7. Canonical form and lookup keys are host-independent ---------------
     Write-Host "7/13 canonical form is ordinal and host-independent" -ForegroundColor Cyan
@@ -1958,7 +2096,7 @@ try {
     Assert-Replay (@($clearGuards).Count -eq 0) `
         ("The startup clear must be unconditional; it is nested under: " + (@($clearGuards) -join ", ") + ".")
 
-    Assert-Replay ($reviewerSource -cmatch '(?s)if \(\$CfgAzCliFallbackEnabled\) \{.{0,1400}?if \(-not \$script:ReviewerReplayActive\) \{\s*return Get-ReviewerSourceTransportAzCliFallback') `
+    Assert-Replay ($reviewerSource -cmatch '(?s)if \(\$CfgAzCliFallbackEnabled\) \{.{0,5000}?if \(-not \$script:ReviewerReplayActive\) \{\s*return Get-ReviewerSourceTransportAzCliFallback') `
         "The CLI fallback must be declined in replay before it is taken, inside the enabled branch."
     $fallbackCalls = @($reviewerAst.FindAll({
                 param($candidate)
@@ -1968,6 +2106,35 @@ try {
             }, $true))
     Assert-Replay (@($fallbackCalls).Count -eq 1) `
         "There must be exactly one call site for the CLI fallback (found $(@($fallbackCalls).Count)); a second would need its own replay guard."
+    $sourceTransportFn = @($reviewerAst.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $candidate.Name -ceq "Get-ReviewerSourceTransport"
+            }, $true)) | Select-Object -First 1
+    $sealedImport = @($sourceTransportFn.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.CommandAst] -and
+                $candidate.GetCommandName() -ceq "Import-ReviewerSourceTransportReplayArtifact"
+            }, $true))
+    $liveSourceCalls = @($sourceTransportFn.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.CommandAst] -and
+                @("Resolve-ReviewerGetChangesCapability", "Invoke-AgentMcpTool",
+                    "Get-ReviewerSourceTransportAzCliFallback") -ccontains $candidate.GetCommandName()
+            }, $true))
+    Assert-Replay ($sealedImport.Count -eq 1 -and $liveSourceCalls.Count -ge 3 -and
+        $sealedImport[0].Extent.StartOffset -lt
+        (@($liveSourceCalls | ForEach-Object { $_.Extent.StartOffset } | Measure-Object -Minimum).Minimum)) `
+        "Schema-v2 replay must import and return sealed source before any capability probe, MCP source read, or Azure CLI fallback call."
+    $sealedReturn = @($sourceTransportFn.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.ReturnStatementAst] -and
+                $candidate.Extent.StartOffset -gt $sealedImport[0].Extent.StartOffset
+            }, $true) | Sort-Object { $_.Extent.StartOffset }) | Select-Object -First 1
+    Assert-Replay ($null -ne $sealedReturn -and
+        $sealedReturn.Extent.StartOffset -lt
+        (@($liveSourceCalls | ForEach-Object { $_.Extent.StartOffset } | Measure-Object -Minimum).Minimum)) `
+        "The sealed source import must return before any live source seam can execute."
 
     # -- 12. `notInReach` is fail-closed ---------------------------------------
     # Out-of-reach is the one verdict that costs nothing to give, so it is the
@@ -2359,7 +2526,8 @@ try {
             [string]$SnapshotId = "s", [string]$ManifestDigest = ("7" * 64),
             [string]$Complete = "true", [string[]]$Missing = @(),
             [string]$ConstructsIncomplete = "false", [int]$Checked = 1,
-            [object[]]$ConstructFiles = @(), [object[]]$RemediationFacts = @()
+            [object[]]$ConstructFiles = @(), [object[]]$RemediationFacts = @(),
+            [object[]]$ChangedFileAnchors = @()
         )
         # Built with the field names PRODUCTION writes (ConventionSpecialist.ps1
         # `Constructs = ...`). A fixture in the reconciler's own vocabulary
@@ -2381,6 +2549,7 @@ try {
             candidates = @($Candidates)
             ruleCoverage = [pscustomobject][ordered]@{
                 complete = [bool]::Parse($Complete); rows = @($Rows); changedConstructs = @($set)
+                changedFileAnchors = @($ChangedFileAnchors)
                 constructFiles = @($ConstructFiles)
                 remediationFacts = @($RemediationFacts)
                 missing = @($Missing); duplicates = @(); unknown = @(); unaccountedCandidates = @()
@@ -2692,6 +2861,48 @@ try {
     Assert-Replay (@($factBackedAgreement.candidates).Count -eq 1 -and
         @($factBackedAgreement.candidates)[0].disposition -ceq "semanticAgreementTextWithheld") `
         "Identical deterministic-fact changed-code remediation did not reconcile from sealed facts."
+
+    # A localization issue inside a method body may have no declaration or
+    # invocation construct. Its sealed right-hand file range is sufficient; the
+    # specialist's per-construct row stays truthfully notApplicable.
+    $bodyAnchors = @([pscustomobject][ordered]@{
+            anchorId = "cf0"; path = "src/exception.cs"
+            rightHandRanges = @([pscustomobject][ordered]@{ startLine = 1110; endLine = 1114 })
+        })
+    $bodyRow = New-ReconRow -Source "engineering/localized-exceptions" `
+        -Status "notApplicable" -Violating @() -Compliant @()
+    $bodyCandidateA = New-ReconCandidate -Source "engineering/localized-exceptions" `
+        -Path "/src/exception.cs" -Line 1112 -RemediationTargets "cf0" `
+        -ConventionKey "LocalizedExceptionMessage" -Comment "Use the repository localization mechanism."
+    $bodyCandidateB = New-ReconCandidate -Source "engineering/localized-exceptions" `
+        -Path "SRC\EXCEPTION.cs" -Line 1112 -RemediationTargets "cf0" `
+        -ConventionKey "LocalizedExceptionMessage" -Comment "Localize this exception through the established mechanism."
+    $bodyAgreement = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "body-a" -Rows @($bodyRow) -Candidates @($bodyCandidateA) `
+                -Constructs @() -ChangedFileAnchors $bodyAnchors -Checked 0),
+        (New-ReconRun -Nonce "body-b" -Rows @($bodyRow) -Candidates @($bodyCandidateB) `
+                -Constructs @() -ChangedFileAnchors $bodyAnchors -Checked 0))
+    $bodyFinding = @($bodyAgreement.candidates)[0]
+    Assert-Replay (@($bodyAgreement.candidates).Count -eq 1 -and
+        $bodyFinding.disposition -ceq "semanticAgreementTextWithheld") `
+        ("A non-lexical exception-string finding on a sealed changed-file line did not reconcile: " +
+            (ConvertTo-Json -Compress -Depth 8 -InputObject @($bodyAgreement.candidates)))
+    Assert-Replay (@($bodyFinding.semanticIdentity.anchor.constructs).Count -eq 0 -and
+        @($bodyFinding.semanticIdentity.evidence.violations).Count -eq 0 -and
+        @($bodyFinding.semanticIdentity.remediation.changedCodeFix.targets) -ccontains "cf0") `
+        "Changed-file eligibility invented a lexical construct instead of retaining the sealed file anchor."
+    $bodyOutside = New-ReconCandidate -Source "engineering/localized-exceptions" `
+        -Path "/src/exception.cs" -Line 1120 -RemediationTargets "cf0" `
+        -ConventionKey "LocalizedExceptionMessage"
+    $outsideAgreement = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "outside-a" -Rows @($bodyRow) -Candidates @($bodyOutside) `
+                -Constructs @() -ChangedFileAnchors $bodyAnchors -Checked 0),
+        (New-ReconRun -Nonce "outside-b" -Rows @($bodyRow) -Candidates @($bodyOutside) `
+                -Constructs @() -ChangedFileAnchors $bodyAnchors -Checked 0))
+    Assert-Replay (@(@($outsideAgreement.candidates) | Where-Object {
+                $_.disposition -ceq "semanticAgreementTextWithheld"
+            }).Count -eq 0) `
+        "A non-construct finding outside the sealed right-hand changed-file range became eligible."
     $severitySplit = Resolve-ReviewerRunReconciliation -Manifests @(
         (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Severity "suggestion"))),
         (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Severity "important")))

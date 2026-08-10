@@ -753,7 +753,7 @@ $expectedInputParameters = @(
     "SourceCommit", "TargetCommit", "ChangeSetDigest", "ConventionPlanSha256",
     "FactPlanSha256", "ConfigSha256", "ScriptSha256", "PromptSha256",
     "ConventionPlan", "FactPlan", "ResolvedSources", "ChangeEntries",
-    "Constructs", "ConstructFiles", "ConstructIdRanges",
+    "Constructs", "ConstructFiles", "ConstructIdRanges", "RightHandRangesByPath",
     "ThreadDigestText", "PinnedSourceText", "ReplayNotice", "MaxInputBytes"
 )
 Assert-Specialist (($actualInputParameters -join "|") -ceq ($expectedInputParameters -join "|")) `

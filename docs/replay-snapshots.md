@@ -55,23 +55,23 @@ to the network:
 - a read the snapshot does not carry throws, naming the exact request. It never
   falls through to a live read.
 
-**"Almost" matters.** The MCP seam is one of two source transports. The Azure
+**"Almost" matters.** The MCP seam is one of two live source transports. The Azure
 CLI source fallback (`review.sourceTransport.azureDevOpsCliFallback.enabled`,
 see [source-transport.md](source-transport.md)) does not go through
 `Send-AgentMcpRequest` at all: it resolves `az` on `PATH`, runs it, and then
 calls the REST API directly. Treating the MCP seam as the only egress is exactly
 the assumption that once let a configured replay contact the live service, so
-replay refuses that transport in three places:
+schema-v2 replay bypasses both live transports:
 
-- the MCP capability probe is short-circuited in replay, so it neither contacts
-  anything nor reports a capability the snapshot cannot serve. A consequence
-  worth knowing: source is therefore always served by the snapshot-backed legacy
-  path, even when the recorded run used the newer `get_changes` contract, so
-  source coverage and span basis in a replay can differ from the live run the
-  snapshot records;
-- `Get-ReviewerSourceTransport` declines the fallback branch in replay and falls
-  through to the snapshot-backed path, so the run stays consistent rather than
-  half live, and a read the snapshot lacks still fails closed there;
+- live capture writes one canonical source-transport artifact containing its
+  exact iteration/common/source/target/change-set binding, transport mode,
+  report, coverage record, gate and rendered sealed block;
+- the snapshot manifest hashes that artifact and includes its descriptor in the
+  manifest digest;
+- replay validates the binding, policy hash, canonical JSON, artifact digest,
+  reconstructed coverage record and gate, and exact rerendered source block
+  before returning it. This return occurs before capability probing, MCP source
+  reads or the Azure CLI branch;
 - `New-ReviewerSourceAzCliInvoker` refuses outright, whichever call site got
   there — it checks `DEVPILOT_REVIEWER_REPLAY_ACTIVE` in the environment as well
   as script scope, so the refusal survives being loaded into a module, a thread
@@ -86,11 +86,10 @@ leftover from an earlier replay in the same shell cannot silently disable the
 live fallback in a later live run — and if one is somehow present anyway, the
 refusal says the variable is stale rather than claiming a replay is happening.
 
-Every replay artifact records what actually served source:
-`sourceTransportMode: snapshotLegacy`, `capabilityProbeSuppressed`, and
-`azCliFallbackSuppressed` when config had enabled the live fallback. The preview
-says the same in prose, because a console warning is gone by the time anyone
-reads the file.
+Every schema-v2 replay artifact records the captured live mode:
+`mcpFlat`, `azureDevOpsCliFallback`, or `legacyMcp`. Schema-v1 snapshots remain
+loadable for compatibility and disclose `snapshotLegacy`; they do not claim
+live/replay source-coverage parity.
 
 ## The snapshot
 
@@ -100,6 +99,7 @@ A snapshot is a directory named as a single child of an explicit replay root:
 <replay root>/
   <snapshot name>/
     manifest.json
+    source-transport.json
     payloads/...
 ```
 
@@ -113,6 +113,8 @@ resources, 24 MB per payload, 64 MB in total). It records
 - `resources[]` - for each recorded read, the tool, the exact arguments, the
   SHA-256 of the canonical `{name, arguments}` that is its lookup key, and the
   payload file with its own hash and byte length;
+- `sourceTransport` (schema v2) - the recorded live mode and the canonical
+  source-transport artifact's relative path, SHA-256 and byte length;
 - `manifestDigest` - a canonical digest over everything above.
 
 Every payload is the exact JSON-RPC response line the read returned.
@@ -173,7 +175,11 @@ credentialed; sealing is pure, so it can be tested, reviewed and run anywhere.
 
 `tools/Save-AgentReplaySnapshot.ps1` does the sealing. It takes payload files an
 operator has already captured plus a recipe naming the tool and arguments each
-one answers:
+one answers. For exact source replay, live capture also uses
+`-CaptureSourceTransportArtifactPath` and the sealer receives that file through
+`-SourceTransportArtifactFile`, together with independently supplied
+`-IterationId` and `-CommonCommit`. The sealer requires those values to match
+the artifact before it writes the schema-v2 manifest:
 
 ```json
 [
@@ -195,6 +201,16 @@ made-up files - that exercises the mode end to end without any real repository
 content. `tools/Test-ReplaySnapshot.ps1` drives it.
 
 ## Running a replay
+
+An offline qualification running from an app-created worktree should preflight
+the reviewer build with `tools/Assert-ReviewerQualificationPreflight.ps1`.
+`OfflineReplay` requires a clean worktree, exact expected `HEAD`, and the
+required accepted full ref (for example, `refs/heads/reviewer-layer`) resolving
+to that same commit. It deliberately does not require the generated local
+branch name to equal the accepted ref and may run from detached `HEAD` when all
+other identity checks pass. `LiveDeployment` additionally requires an attached
+`HEAD` on the configured branch. Git stderr is retained only for sanitized
+failure diagnostics and is never interpreted as identity or dirty-status data.
 
 ```pwsh
 ./src/Agents/reviewer/Start-ReviewerAgent.ps1 `
