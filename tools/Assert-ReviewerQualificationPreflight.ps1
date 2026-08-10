@@ -23,4 +23,3 @@ $arguments = @{
 if ($ExpectedBranch) { $arguments["ExpectedBranch"] = $ExpectedBranch }
 $result = Test-ReviewerQualificationGitIdentity @arguments
 ConvertTo-Json -InputObject $result -Depth 4 -Compress
-
