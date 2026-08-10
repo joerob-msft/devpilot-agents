@@ -182,7 +182,7 @@ explicitly enabled voting. Never assume a vote happened.
 The **final non-blank output line** must be exactly one line of the form:
 
 ```text
-REVIEWER_RESULT_V2: {"schemaVersion":2,"prId":<int>,"repositoryId":"<guid>","project":"<string>","reviewedSourceCommit":"<40-hex>","findings":[{"severity":"<critical|important|suggestion>","filePath":"<path>","line":<int>,"comment":"<text>"}],"threadReplies":[{"threadId":<int>,"commentId":<int>,"disposition":"<verify|justify|clarify|support|refute>","comment":"<text>"}],"recommendedVote":"<approve|approveWithSuggestions|waitForAuthor|none>","summary":"<text>","reviewSections":[{"section":"<scope|skillsApplied|verifiedStrengths|rolloutAndRisk|validation|securityReview|recommendationRationale>","content":"<text>"}],"securityReviewApplied":<true|false>,"nonce":"<runtime nonce>"}
+REVIEWER_RESULT_V3: {"schemaVersion":3,"prId":<int>,"repositoryId":"<guid>","project":"<string>","reviewedSourceCommit":"<40-hex>","findings":[{"severity":"<critical|important|suggestion>","filePath":"<path>","line":<int>,"comment":"<text>"}],"threadReplies":[{"threadId":<int>,"commentId":<int>,"disposition":"<verify|justify|clarify|support|refute>","comment":"<text>"}],"recommendedVote":"<approve|approveWithSuggestions|waitForAuthor|none>","summary":"<text>","riskLevel":"<low|medium|high|unknown>","scopeItems":[{"surface":"<text>","assessment":"<text>"}],"skillsApplied":[{"name":"<text>","application":"<text>"}],"strengths":[{"title":"<text>","evidence":"<text>"}],"rolloutItems":[{"area":"<text>","assessment":"<text>"}],"validationItems":[{"status":"<present|gap|notApplicable>","item":"<text>"}],"securityReviewApplied":<true|false>,"securitySummary":"<text>","recommendationRationale":"<text>","findingLimitReached":<true|false>,"omittedFindingCount":<int>,"nonce":"<runtime nonce>"}
 ```
 
 Requirements:
@@ -196,26 +196,30 @@ Requirements:
   warrants an assessment.
 - `summary` is one plain-text line describing what the PR does and your overall
   assessment.
-- `reviewSections` contains the detailed review that the wrapper renders as
-  deterministic Markdown. Emit each section at most once. When a primary skill
-  is configured, always include `scope`, `skillsApplied`, and
-  `recommendationRationale`; include every other applicable section rather than
-  compressing useful analysis into the one-line summary.
-- `scope` explains the changed surfaces and review approach.
-- `skillsApplied` names the configured review guidance actually used.
-- `verifiedStrengths` records concrete behavior or safeguards verified from the
-  diff and surrounding source; omit generic praise.
-- `rolloutAndRisk` covers compatibility, deployment reach, feature flags,
+- The structured arrays are presentation data for deterministic wrapper-owned
+  Markdown. They are plain text, not Markdown. Never put tables, links, images,
+  HTML, headings, or bullet syntax in their scalar values.
+- `scopeItems` explains the changed surfaces and how each was assessed.
+- `skillsApplied` names the configured review guidance actually used and how it
+  affected the analysis. When a primary skill is configured, emit at least one
+  scope item, one skill item, and a non-empty `recommendationRationale`.
+- `strengths` records concrete behavior or safeguards verified from the diff
+  and surrounding source; omit generic praise.
+- `rolloutItems` covers compatibility, deployment reach, feature flags,
   migration parity, and operational risk when applicable.
-- `validation` states what tests or validation are present or missing without
-  claiming to have run commands you cannot run.
-- `securityReview` summarizes the security skill's result and is required when
-  `securityReviewApplied` is true.
+- `validationItems` records evidence as `present`, a meaningful `gap`, or
+  `notApplicable`. Do not claim to have run commands you cannot run.
+- `securitySummary` is required and non-empty when `securityReviewApplied` is
+  true; otherwise emit an empty string.
 - `recommendationRationale` explains why the findings support the recommended
   vote.
-- Section content may contain newlines and simple Markdown bullets, but no HTML.
-  Keep each section evidence-oriented and bounded; do not repeat full finding
-  comments.
+- The wrapper provides a hard finding cap in Runtime context. Prioritize
+  Critical, then Important, then Suggestion findings. If additional actionable
+  findings were omitted solely because the cap was reached, emit
+  `findingLimitReached:true` and their count in `omittedFindingCount`. Otherwise
+  emit `findingLimitReached:false` and `omittedFindingCount:0`.
+- Keep every item evidence-oriented and bounded; do not repeat full finding
+  comments in the presentation arrays.
 - Emit exactly **one** marker-prefixed line, and make it the final non-blank
   line. Do not add extra fields.
 
