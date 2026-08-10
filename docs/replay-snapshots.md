@@ -181,6 +181,12 @@ one answers. For exact source replay, live capture also uses
 `-IterationId` and `-CommonCommit`. The sealer requires those values to match
 the artifact before it writes the schema-v2 manifest:
 
+Use `-CaptureSourceTransportOnly` with the capture path when the evidence must
+be sealed before any model sees it. The wrapper then requires the source gate
+to pass for the explicitly named `-PullRequestId`, writes the artifact, and
+stops before authoritative-source reads or model launches. This mode also
+requires `-Once`.
+
 ```json
 [
   {

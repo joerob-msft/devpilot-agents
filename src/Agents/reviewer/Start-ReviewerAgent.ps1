@@ -335,7 +335,11 @@ param(
 
     # Optional private capture seam for schema-v2 replay snapshots. The file is
     # canonical, identity-bound source evidence, not a delivery artifact.
-    [string]$CaptureSourceTransportArtifactPath
+    [string]$CaptureSourceTransportArtifactPath,
+
+    # Capture a passing source-transport artifact and stop before authoritative
+    # source reads or model launches. Requires the capture path above.
+    [switch]$CaptureSourceTransportOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -2470,6 +2474,32 @@ if ($SecondPassModel) {
     }
 }
 $EffectiveSecondPassModel = $ResolvedSecondPassModel
+if ($CaptureSourceTransportOnly -and -not $CaptureSourceTransportArtifactPath) {
+    throw "-CaptureSourceTransportOnly requires -CaptureSourceTransportArtifactPath."
+}
+if ($CaptureSourceTransportOnly) {
+    if (-not $Once) {
+        throw "-CaptureSourceTransportOnly requires -Once."
+    }
+    if ($PullRequestId -lt 1) {
+        throw "-CaptureSourceTransportOnly requires an explicit -PullRequestId."
+    }
+    $captureRefusedSwitches = @(
+        @{ Name = "-EnableFindingComments"; Set = [bool]$EnableFindingComments },
+        @{ Name = "-EnableSummaryComment"; Set = [bool]$EnableSummaryComment },
+        @{ Name = "-EnableApprovalVote"; Set = [bool]$EnableApprovalVote },
+        @{ Name = "-EnableVerifiedCommentGate"; Set = [bool]$EnableVerifiedCommentGate },
+        @{ Name = "-EnableVerifiedSuggestionGate"; Set = [bool]$EnableVerifiedSuggestionGate },
+        @{ Name = "-EnableVerifiedApprovalGate"; Set = [bool]$EnableVerifiedApprovalGate },
+        @{ Name = "-PromotePreview"; Set = [bool]$PromotePreview },
+        @{ Name = "-PromoteVerifiedPreview"; Set = [bool]$PromoteVerifiedPreview }
+    )
+    $captureRefused = @($captureRefusedSwitches | Where-Object { $_.Set } | ForEach-Object { [string]$_.Name })
+    if ($captureRefused.Count -gt 0) {
+        throw ("Source-transport-only capture cannot deliver, promote or vote. Remove: " +
+            "$($captureRefused -join ', ').")
+    }
+}
 # ---------------------------------------------------------------------------
 # Offline snapshot replay. Resolved BEFORE the delivery authorization is minted
 # and before the state directory is chosen, because it changes both.
@@ -13083,6 +13113,8 @@ function Invoke-ReviewerCycle {
         $bound = New-Object System.Collections.Generic.List[hashtable]
         # Unfinished deliveries retried from their own sealed plan this cycle.
         $retried = New-Object System.Collections.Generic.List[string]
+        $captureCompleted = $false
+        $capturedPrId = 0
         foreach ($pr in $candidates) {
             if ($bound.Count -ge $PullRequestsPerCycle) { break }
             if ($selectionDeadline -and [DateTime]::UtcNow -gt $selectionDeadline) {
@@ -13244,10 +13276,6 @@ function Invoke-ReviewerCycle {
             $changedFileRangesByPath = @{}
             try {
                 $sourceTransport = Get-ReviewerSourceTransport -Session $session -PrId $prId -SourceCommit $sourceCommit -AgencyPath $AgencyPath
-                if ($CaptureSourceTransportArtifactPath) {
-                    Save-ReviewerSourceTransportReplayCapture -Path $CaptureSourceTransportArtifactPath `
-                        -Transport $sourceTransport
-                }
                 $pinnedSourceText = [string]$sourceTransport.BlockText
                 $sourceCoverageRecord = $sourceTransport.Record
                 $constructResult = Get-ReviewerConstructFilesFromReportSafely -Report $sourceTransport.Report
@@ -13310,6 +13338,19 @@ function Invoke-ReviewerCycle {
                     $result.ExitCode = 1
                     [void]$retried.Add("PR $prId skipped (no sealed source block)")
                     continue
+                }
+                if ($CaptureSourceTransportArtifactPath) {
+                    Save-ReviewerSourceTransportReplayCapture -Path $CaptureSourceTransportArtifactPath `
+                        -Transport $sourceTransport
+                    if ($CaptureSourceTransportOnly) {
+                        Write-ReviewerCycleMetadata -Fields @{
+                            cycle = $CycleNumber; mode = "source-transport"; prId = $prId
+                            sourceCommit = $sourceCommit; result = "captured"
+                        }
+                        $captureCompleted = $true
+                        $capturedPrId = $prId
+                        break
+                    }
                 }
             }
             catch {
@@ -13515,6 +13556,22 @@ function Invoke-ReviewerCycle {
                 })
         }
 
+        if ($CaptureSourceTransportOnly) {
+            if ($captureCompleted) {
+                $result.ExitCode = 0
+                $result.Summary = "PR $capturedPrId source transport captured"
+                Write-ReviewerCycleMetadata -Fields @{
+                    cycle = $CycleNumber; mode = "live"; result = "captured"; prId = $capturedPrId
+                }
+                return $result
+            }
+            $result.ExitCode = 1
+            $result.Summary = "source transport capture did not complete"
+            Write-ReviewerCycleMetadata -Fields @{
+                cycle = $CycleNumber; mode = "live"; result = "captureFailed"; prId = $PullRequestId
+            }
+            return $result
+        }
         if ($bound.Count -eq 0) {
             if ($retried.Count -gt 0) {
                 $result.Summary = ($retried.ToArray() -join "; ")

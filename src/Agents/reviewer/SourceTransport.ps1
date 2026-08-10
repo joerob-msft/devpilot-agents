@@ -3495,10 +3495,15 @@ function Assert-ReviewerSourceReplayExactKeys {
         [Parameter(Mandatory)][string]$Where,
         [Parameter(Mandatory)][string[]]$Expected
     )
-    if ($Value -isnot [System.Collections.IDictionary]) {
+    if ($Value -is [System.Collections.IDictionary]) {
+        $actual = [string[]]@($Value.Keys | ForEach-Object { [string]$_ })
+    }
+    elseif ($Value -is [pscustomobject]) {
+        $actual = [string[]]@($Value.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    }
+    else {
         throw "$Where must be an object."
     }
-    $actual = [string[]]@($Value.Keys | ForEach-Object { [string]$_ })
     [Array]::Sort($actual, [StringComparer]::Ordinal)
     $wanted = [string[]]@($Expected)
     [Array]::Sort($wanted, [StringComparer]::Ordinal)

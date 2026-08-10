@@ -330,6 +330,12 @@ try {
     $artifactBytes = New-ReviewerSourceTransportReplayArtifact -Binding $sourceBinding `
         -Mode azureDevOpsCliFallback -PolicySha256 $sourcePolicySha -Policy $sourcePolicy `
         -Report $liveReport -BlockText $liveBlock
+    $captureShapeBytes = New-ReviewerSourceTransportReplayArtifact `
+        -Binding ([pscustomobject]$sourceBinding) -Mode azureDevOpsCliFallback `
+        -PolicySha256 $sourcePolicySha -Policy $sourcePolicy -Report $liveReport -BlockText $liveBlock
+    Assert-Replay ([Convert]::ToBase64String($captureShapeBytes) -ceq
+        [Convert]::ToBase64String($artifactBytes)) `
+        "The live transport's PSCustomObject binding shape cannot be sealed for replay."
     [IO.File]::WriteAllBytes((Join-Path $v2Dir "source-transport.json"), $artifactBytes)
     & (Join-Path $RepoRoot "tools\Save-AgentReplaySnapshot.ps1") -SnapshotPath $v2Dir `
         -Recipe (Join-Path $v2Dir "recipe.json") -Organization "contoso" -Project "Widgets" `
