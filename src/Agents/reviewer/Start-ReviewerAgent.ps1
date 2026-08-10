@@ -257,8 +257,9 @@ if (-not $importedHarness) {
 }
 $HarnessPath = $importedHarness.Path
 
-$ResultMarkerPrefix = "REVIEWER_RESULT_V2:"
+$ResultMarkerPrefix = "REVIEWER_RESULT_V3:"
 $script:ReviewerLegacyResultMarkerPrefix = "REVIEWER_RESULT_V1:"
+$script:ReviewerV2ResultMarkerPrefix = "REVIEWER_RESULT_V2:"
 
 # ---------------------------------------------------------------------------
 # CODE-DEFINED security policy (never config-supplied; a forked config file
@@ -351,7 +352,7 @@ $script:ReviewerSummarySections = @(
 # Code-defined comment furniture. Kept out of config so a consuming repo cannot
 # make the agent post comments that do not identify themselves as automated.
 $script:ReviewerSignatureFooter = "-- automated review by the devpilot reviewer agent; reply here if this is wrong."
-$script:ReviewerSummaryHeading = "## Reviewer agent summary"
+$script:ReviewerSummaryHeading = "## Code Review Summary"
 $script:ReviewerThreadReplyHeading = "Reviewer agent assessment"
 
 # ---------------------------------------------------------------------------
@@ -898,7 +899,7 @@ function Get-ReviewerMarkerSchema {
         [Parameter(Mandatory)][string]$ExpectedProject,
         [Parameter(Mandatory)][string]$ExpectedNonce,
         [int]$MaxFindingItems = 12,
-        [ValidateSet(1, 2)][int]$SchemaVersion = 2
+        [ValidateSet(1, 2, 3)][int]$SchemaVersion = 3
     )
     $fields = @{
             schemaVersion        = @{ Type = 'int'; Min = $SchemaVersion; Max = $SchemaVersion }
@@ -956,8 +957,159 @@ function Get-ReviewerMarkerSchema {
         }
         $fields.securityReviewApplied = @{ Type = 'bool' }
     }
+    if ($SchemaVersion -eq 3) {
+        $keys += @(
+            'riskLevel', 'scopeItems', 'skillsApplied', 'strengths',
+            'rolloutItems', 'validationItems', 'securityReviewApplied',
+            'securitySummary', 'recommendationRationale',
+            'findingLimitReached', 'omittedFindingCount'
+        )
+        $fields.riskLevel = @{ Type = 'enum'; Values = @('low', 'medium', 'high', 'unknown') }
+        $fields.scopeItems = @{
+            Type = 'objectArray'; MaxItems = 10
+            Item = @{
+                Keys = @('surface', 'assessment')
+                Fields = @{
+                    surface = @{ Type = 'string'; MaxLength = 120 }
+                    assessment = @{ Type = 'string'; MaxLength = 600 }
+                }
+            }
+        }
+        $fields.skillsApplied = @{
+            Type = 'objectArray'; MaxItems = 6
+            Item = @{
+                Keys = @('name', 'application')
+                Fields = @{
+                    name = @{ Type = 'string'; MaxLength = 160 }
+                    application = @{ Type = 'string'; MaxLength = 500 }
+                }
+            }
+        }
+        $fields.strengths = @{
+            Type = 'objectArray'; MaxItems = 10
+            Item = @{
+                Keys = @('title', 'evidence')
+                Fields = @{
+                    title = @{ Type = 'string'; MaxLength = 160 }
+                    evidence = @{ Type = 'string'; MaxLength = 700 }
+                }
+            }
+        }
+        $fields.rolloutItems = @{
+            Type = 'objectArray'; MaxItems = 10
+            Item = @{
+                Keys = @('area', 'assessment')
+                Fields = @{
+                    area = @{ Type = 'string'; MaxLength = 160 }
+                    assessment = @{ Type = 'string'; MaxLength = 700 }
+                }
+            }
+        }
+        $fields.validationItems = @{
+            Type = 'objectArray'; MaxItems = 12
+            Item = @{
+                Keys = @('status', 'item')
+                Fields = @{
+                    status = @{ Type = 'enum'; Values = @('present', 'gap', 'notApplicable') }
+                    item = @{ Type = 'string'; MaxLength = 700 }
+                }
+            }
+        }
+        $fields.securityReviewApplied = @{ Type = 'bool' }
+        $fields.securitySummary = @{ Type = 'string'; MaxLength = 1200; AllowEmpty = $true }
+        $fields.recommendationRationale = @{ Type = 'string'; MaxLength = 1200 }
+        $fields.findingLimitReached = @{ Type = 'bool' }
+        $fields.omittedFindingCount = @{ Type = 'int'; Min = 0; Max = 100 }
+    }
     $keys += 'nonce'
     return @{ Keys = $keys; Fields = $fields }
+}
+
+function Get-ReviewerPresentationFromMarker {
+    param([Parameter(Mandatory)][hashtable]$Marker)
+    $version = [int](Get-ReviewerHashValue -Container $Marker -Key 'schemaVersion' -Default 1)
+    $presentation = @{
+        SchemaVersion = $version
+        RiskLevel = 'unknown'
+        ScopeItems = @()
+        SkillsApplied = @()
+        Strengths = @()
+        RolloutItems = @()
+        ValidationItems = @()
+        SecurityReviewApplied = $false
+        SecuritySummary = ''
+        RecommendationRationale = ''
+        FindingLimitReached = $false
+        OmittedFindingCount = 0
+    }
+    if ($version -eq 3) {
+        $presentation.RiskLevel = [string]$Marker['riskLevel']
+        $presentation.ScopeItems = @($Marker['scopeItems'])
+        $presentation.SkillsApplied = @($Marker['skillsApplied'])
+        $presentation.Strengths = @($Marker['strengths'])
+        $presentation.RolloutItems = @($Marker['rolloutItems'])
+        $presentation.ValidationItems = @($Marker['validationItems'])
+        $presentation.SecurityReviewApplied = [bool]$Marker['securityReviewApplied']
+        $presentation.SecuritySummary = [string]$Marker['securitySummary']
+        $presentation.RecommendationRationale = [string]$Marker['recommendationRationale']
+        $presentation.FindingLimitReached = [bool]$Marker['findingLimitReached']
+        $presentation.OmittedFindingCount = [int]$Marker['omittedFindingCount']
+        return $presentation
+    }
+    if ($version -eq 2) {
+        foreach ($section in @($Marker['reviewSections'])) {
+            $name = [string](Get-ReviewerHashValue -Container $section -Key 'section' -Default '')
+            $content = [string](Get-ReviewerHashValue -Container $section -Key 'content' -Default '')
+            switch ($name) {
+                'scope' { $presentation.ScopeItems = @(@{ surface = 'Review scope'; assessment = $content }) }
+                'skillsApplied' { $presentation.SkillsApplied = @(@{ name = 'Configured review guidance'; application = $content }) }
+                'verifiedStrengths' { $presentation.Strengths = @(@{ title = 'Verified behavior'; evidence = $content }) }
+                'rolloutAndRisk' { $presentation.RolloutItems = @(@{ area = 'Rollout and risk'; assessment = $content }) }
+                'validation' { $presentation.ValidationItems = @(@{ status = 'legacy'; item = $content }) }
+                'securityReview' { $presentation.SecuritySummary = $content }
+                'recommendationRationale' { $presentation.RecommendationRationale = $content }
+            }
+        }
+        $presentation.SecurityReviewApplied = [bool]$Marker['securityReviewApplied']
+    }
+    return $presentation
+}
+
+function ConvertTo-ReviewerHashtable {
+    param([Parameter(Mandatory)]$Value)
+    return (ConvertTo-Json -InputObject $Value -Depth 12 -Compress | ConvertFrom-Json -AsHashtable)
+}
+
+function Test-ReviewerPresentation {
+    param(
+        [Parameter(Mandatory)][hashtable]$Presentation,
+        [bool]$PrimarySkillConfigured = $false,
+        [string]$SecurityMode = 'off',
+        [int]$FindingCount = 0,
+        [int]$MaxFindings = 0
+    )
+    if ($PrimarySkillConfigured -and
+        (@($Presentation.ScopeItems).Count -eq 0 -or
+            @($Presentation.SkillsApplied).Count -eq 0 -or
+            [string]::IsNullOrWhiteSpace([string]$Presentation.RecommendationRationale))) {
+        return $false
+    }
+    if ($SecurityMode -ceq 'always' -and -not [bool]$Presentation.SecurityReviewApplied) { return $false }
+    if ($SecurityMode -ceq 'off' -and [bool]$Presentation.SecurityReviewApplied) { return $false }
+    if ([bool]$Presentation.SecurityReviewApplied -and [string]::IsNullOrWhiteSpace([string]$Presentation.SecuritySummary)) {
+        return $false
+    }
+    if (-not [bool]$Presentation.SecurityReviewApplied -and -not [string]::IsNullOrWhiteSpace([string]$Presentation.SecuritySummary)) {
+        return $false
+    }
+    if (([bool]$Presentation.FindingLimitReached -and [int]$Presentation.OmittedFindingCount -lt 1) -or
+        (-not [bool]$Presentation.FindingLimitReached -and [int]$Presentation.OmittedFindingCount -ne 0)) {
+        return $false
+    }
+    if ([bool]$Presentation.FindingLimitReached -and ($MaxFindings -lt 1 -or $FindingCount -ne $MaxFindings)) {
+        return $false
+    }
+    return $true
 }
 
 function Test-ReviewerSummarySections {
@@ -978,7 +1130,9 @@ function Test-ReviewerSummarySections {
         }
     }
     if ($SecurityMode -ceq 'always' -and -not $SecurityReviewApplied) { return $false }
+    if ($SecurityMode -ceq 'off' -and $SecurityReviewApplied) { return $false }
     if ($SecurityReviewApplied -and -not $seen.Contains('securityReview')) { return $false }
+    if (-not $SecurityReviewApplied -and $seen.Contains('securityReview')) { return $false }
     return $true
 }
 
@@ -1195,6 +1349,24 @@ function ConvertTo-ReviewerSafeMarkdownText {
     return $safe
 }
 
+function ConvertTo-ReviewerTableCell {
+    param([AllowEmptyString()][string]$Text)
+    return ((ConvertTo-ReviewerSafeMarkdownText -Text $Text) -replace '\|', '\|' -replace '\s+', ' ').Trim()
+}
+
+function Get-ReviewerFindingSummaryText {
+    param([Parameter(Mandatory)]$Finding)
+    $text = [string](Get-ReviewerHashValue -Container $Finding -Key 'comment' -Default '')
+    $first = ($text -split '(?<=[.!?])\s+', 2)[0].Trim()
+    if ($first.Length -gt 180) {
+        $short = $first.Substring(0, 177)
+        $wordBoundary = $short.LastIndexOf(' ')
+        if ($wordBoundary -gt 120) { $short = $short.Substring(0, $wordBoundary) }
+        return ($short.TrimEnd() + '...')
+    }
+    return $first
+}
+
 function Format-ReviewerFindingComment {
     <# The severity prefix is not decoration: the sibling handler agent
        recognizes an automated finding by exactly this marker, so changing the
@@ -1228,49 +1400,141 @@ function Format-ReviewerSummaryComment {
        exactly the value that moves. #>
     param(
         [string]$Summary,
+        [hashtable]$Presentation = $null,
         [object[]]$ReviewSections = @(),
         [bool]$SecurityReviewApplied = $false,
+        [object[]]$Findings = @(),
+        [string]$RecommendedVote = 'none',
         [hashtable]$Counts,
         [int]$Reported,
         [int]$Publishable
     )
+    if (-not $Presentation) {
+        $Presentation = Get-ReviewerPresentationFromMarker -Marker @{
+            schemaVersion = 2
+            reviewSections = @($ReviewSections)
+            securityReviewApplied = [bool]$SecurityReviewApplied
+        }
+    }
     $parts = New-Object System.Collections.Generic.List[string]
     [void]$parts.Add($script:ReviewerSummaryHeading)
+    [void]$parts.Add("")
+    $recommendation = switch ($RecommendedVote) {
+        'approve' { 'APPROVE' }
+        'approveWithSuggestions' { 'APPROVE WITH SUGGESTIONS' }
+        'waitForAuthor' { 'WAITING FOR AUTHOR' }
+        default { 'NO VOTE RECOMMENDED' }
+    }
+    [void]$parts.Add("> **Recommendation: $recommendation**")
+    if ([string]$Presentation.RecommendationRationale) {
+        [void]$parts.Add("> $(ConvertTo-ReviewerSafeMarkdownText -Text ([string]$Presentation.RecommendationRationale))")
+    }
     [void]$parts.Add("")
     if ($Summary -and $Summary.Trim() -ne "") {
         [void]$parts.Add((ConvertTo-ReviewerSafeMarkdownText -Text $Summary.Trim()))
         [void]$parts.Add("")
     }
-    $sectionLabels = @{
-        scope = "Scope and approach"
-        skillsApplied = "Review guidance applied"
-        verifiedStrengths = "Verified strengths"
-        rolloutAndRisk = "Rollout and risk analysis"
-        validation = "Validation assessment"
-        securityReview = "SDL security review"
-        recommendationRationale = "Recommendation"
-    }
-    foreach ($sectionName in $script:ReviewerSummarySections) {
-        $matching = @($ReviewSections | Where-Object {
-                [string](Get-ReviewerHashValue -Container $_ -Key 'section' -Default '') -ceq $sectionName
-            })
-        if ($matching.Count -eq 0) { continue }
-        $content = [string](Get-ReviewerHashValue -Container $matching[0] -Key 'content' -Default '')
-        if (-not $content.Trim()) { continue }
-        [void]$parts.Add("### $($sectionLabels[$sectionName])")
+
+    [void]$parts.Add("| Priority | Count |")
+    [void]$parts.Add("|---|---:|")
+    [void]$parts.Add("| Critical | $($Counts['critical']) |")
+    [void]$parts.Add("| Important | $($Counts['important']) |")
+    [void]$parts.Add("| Suggestion | $($Counts['suggestion']) |")
+    [void]$parts.Add("")
+
+    if (@($Presentation.ScopeItems).Count -gt 0) {
+        [void]$parts.Add("### Scope")
         [void]$parts.Add("")
-        [void]$parts.Add((ConvertTo-ReviewerSafeMarkdownText -Text $content.Trim()))
-        [void]$parts.Add("")
-    }
-    if ($SecurityReviewApplied -and @($ReviewSections | Where-Object {
-                [string](Get-ReviewerHashValue -Container $_ -Key 'section' -Default '') -ceq 'securityReview'
-            }).Count -eq 0) {
-        [void]$parts.Add("### SDL security review")
-        [void]$parts.Add("")
-        [void]$parts.Add("The security review skill was applied, but the model did not provide a publishable security-review section.")
+        [void]$parts.Add("| Surface | Assessment |")
+        [void]$parts.Add("|---|---|")
+        foreach ($item in @($Presentation.ScopeItems)) {
+            $surface = ConvertTo-ReviewerTableCell -Text ([string](Get-ReviewerHashValue -Container $item -Key 'surface' -Default ''))
+            $assessment = ConvertTo-ReviewerTableCell -Text ([string](Get-ReviewerHashValue -Container $item -Key 'assessment' -Default ''))
+            [void]$parts.Add("| $surface | $assessment |")
+        }
         [void]$parts.Add("")
     }
-    [void]$parts.Add(("Findings: {0} critical, {1} important, {2} suggestion." -f $Counts['critical'], $Counts['important'], $Counts['suggestion']))
+
+    if (@($Findings).Count -gt 0) {
+        [void]$parts.Add("### Key Findings")
+        [void]$parts.Add("")
+        [void]$parts.Add("| Priority | Location | Finding |")
+        [void]$parts.Add("|---|---|---|")
+        foreach ($finding in @($Findings)) {
+            $severity = ([string](Get-ReviewerHashValue -Container $finding -Key 'severity' -Default 'suggestion'))
+            $severity = $severity.Substring(0, 1).ToUpperInvariant() + $severity.Substring(1)
+            $path = [string](Get-ReviewerHashValue -Container $finding -Key 'filePath' -Default '')
+            $line = [int](Get-ReviewerHashValue -Container $finding -Key 'line' -Default 0)
+            $location = if ($path) { "$path`:$line" } else { "PR-level" }
+            $findingText = Get-ReviewerFindingSummaryText -Finding $finding
+            [void]$parts.Add("| $severity | ``$(ConvertTo-ReviewerTableCell -Text $location)`` | $(ConvertTo-ReviewerTableCell -Text $findingText) |")
+        }
+        [void]$parts.Add("")
+    }
+
+    if (@($Presentation.Strengths).Count -gt 0) {
+        [void]$parts.Add("### Verified Strengths")
+        [void]$parts.Add("")
+        foreach ($item in @($Presentation.Strengths)) {
+            $title = ConvertTo-ReviewerSafeMarkdownText -Text ([string](Get-ReviewerHashValue -Container $item -Key 'title' -Default ''))
+            $evidence = ConvertTo-ReviewerSafeMarkdownText -Text ([string](Get-ReviewerHashValue -Container $item -Key 'evidence' -Default ''))
+            [void]$parts.Add("- **PASS - ${title}:** $evidence")
+        }
+        [void]$parts.Add("")
+    }
+
+    if (@($Presentation.RolloutItems).Count -gt 0) {
+        [void]$parts.Add("### Rollout and Risk")
+        [void]$parts.Add("")
+        [void]$parts.Add("| Area | Assessment |")
+        [void]$parts.Add("|---|---|")
+        foreach ($item in @($Presentation.RolloutItems)) {
+            $area = ConvertTo-ReviewerTableCell -Text ([string](Get-ReviewerHashValue -Container $item -Key 'area' -Default ''))
+            $assessment = ConvertTo-ReviewerTableCell -Text ([string](Get-ReviewerHashValue -Container $item -Key 'assessment' -Default ''))
+            [void]$parts.Add("| $area | $assessment |")
+        }
+        [void]$parts.Add("")
+    }
+
+    if (@($Presentation.ValidationItems).Count -gt 0) {
+        [void]$parts.Add("### Validation")
+        [void]$parts.Add("")
+        foreach ($item in @($Presentation.ValidationItems)) {
+            $status = [string](Get-ReviewerHashValue -Container $item -Key 'status' -Default 'notApplicable')
+            $label = switch ($status) { 'present' { 'PASS' } 'gap' { 'GAP' } 'legacy' { 'INFO' } default { 'N/A' } }
+            $text = ConvertTo-ReviewerSafeMarkdownText -Text ([string](Get-ReviewerHashValue -Container $item -Key 'item' -Default ''))
+            [void]$parts.Add("- **${label}:** $text")
+        }
+        [void]$parts.Add("")
+    }
+
+    if (@($Presentation.SkillsApplied).Count -gt 0) {
+        [void]$parts.Add("### Review Guidance")
+        [void]$parts.Add("")
+        foreach ($item in @($Presentation.SkillsApplied)) {
+            $name = ConvertTo-ReviewerSafeMarkdownText -Text ([string](Get-ReviewerHashValue -Container $item -Key 'name' -Default ''))
+            $application = ConvertTo-ReviewerSafeMarkdownText -Text ([string](Get-ReviewerHashValue -Container $item -Key 'application' -Default ''))
+            [void]$parts.Add("- **${name}:** $application")
+        }
+        [void]$parts.Add("")
+    }
+
+    if ([bool]$Presentation.SecurityReviewApplied -or [string]$Presentation.SecuritySummary) {
+        [void]$parts.Add("### SDL Security Review")
+        [void]$parts.Add("")
+        [void]$parts.Add("**Status:** $(if ([bool]$Presentation.SecurityReviewApplied) { 'Applied' } else { 'Not applied' })")
+        if ([string]$Presentation.SecuritySummary) {
+            [void]$parts.Add("")
+            [void]$parts.Add((ConvertTo-ReviewerSafeMarkdownText -Text ([string]$Presentation.SecuritySummary)))
+        }
+        [void]$parts.Add("")
+    }
+
+    [void]$parts.Add("**Assessed risk:** $(([string]$Presentation.RiskLevel).ToUpperInvariant())")
+    if ([bool]$Presentation.FindingLimitReached) {
+        [void]$parts.Add("")
+        [void]$parts.Add("**Finding cap reached:** $([int]$Presentation.OmittedFindingCount) additional actionable finding(s) were omitted after prioritization.")
+    }
     if ($Publishable -lt $Reported) {
         # Says ELIGIBLE, not published. What actually landed depends on which
         # write switches this run carried and on whether each thread write
@@ -2217,6 +2481,14 @@ function Get-ReviewerFindingFingerprint {
             -Line ([int](Get-ReviewerHashValue -Container $Finding -Key 'line' -Default 0)))
 }
 
+function Get-ReviewerFindingThreadStatus {
+    param([Parameter(Mandatory)]$Finding)
+    if ([string](Get-ReviewerHashValue -Container $Finding -Key 'severity' -Default '') -ceq 'suggestion') {
+        return 'Closed'
+    }
+    return 'Active'
+}
+
 # ---------------------------------------------------------------------------
 # Cycle metadata helper
 # ---------------------------------------------------------------------------
@@ -2248,6 +2520,7 @@ function Write-ReviewerPreview {
         [Parameter(Mandatory)][string]$SourceCommit,
         [Parameter(Mandatory)][string]$PrTitle,
         [Parameter(Mandatory)][AllowEmptyString()][string]$Summary,
+        [hashtable]$Presentation = $null,
         [object[]]$ReviewSections = @(),
         [bool]$SecurityReviewApplied = $false,
         [object[]]$Postable = @(),
@@ -2277,9 +2550,16 @@ function Write-ReviewerPreview {
     [void]$lines.Add("")
     [void]$lines.Add("## Summary the agent would post")
     [void]$lines.Add("")
-    [void]$lines.Add((Format-ReviewerSummaryComment -Summary $Summary -ReviewSections $ReviewSections `
-            -SecurityReviewApplied $SecurityReviewApplied -Counts $counts -Reported @($AllFindings).Count `
-            -Publishable @($Postable).Count))
+    if (-not $Presentation) {
+        $Presentation = Get-ReviewerPresentationFromMarker -Marker @{
+            schemaVersion = 2
+            reviewSections = @($ReviewSections)
+            securityReviewApplied = [bool]$SecurityReviewApplied
+        }
+    }
+    [void]$lines.Add((Format-ReviewerSummaryComment -Summary $Summary -Presentation $Presentation `
+            -Findings $AllFindings -RecommendedVote $RecommendedVote -Counts $counts `
+            -Reported @($AllFindings).Count -Publishable @($Postable).Count))
     [void]$lines.Add("")
     [void]$lines.Add("## Candidate comments ($(@($Postable).Count))")
     [void]$lines.Add("")
@@ -2346,7 +2626,7 @@ function Write-ReviewerPreview {
         try {
             $artifactPath = Join-Path $previewDir "$baseName.json"
             $manifest = @{
-                artifactVersion  = 5
+                artifactVersion  = 6
                 organization     = $Organization
                 project          = $ExpectedProject
                 repositoryName   = $RepositoryName
@@ -2384,13 +2664,7 @@ function Write-ReviewerPreview {
                         }
                     })
                 approvedSummary  = [string]$Summary
-                approvedReviewSections = @(@($ReviewSections) | ForEach-Object {
-                        @{
-                            section = [string](Get-ReviewerHashValue -Container $_ -Key 'section' -Default '')
-                            content = [string](Get-ReviewerHashValue -Container $_ -Key 'content' -Default '')
-                        }
-                    })
-                securityReviewApplied = [bool]$SecurityReviewApplied
+                approvedPresentation = $Presentation
                 approvedVote     = [string]$RecommendedVote
                 reportedFindings = @($AllFindings).Count
                 markerBody       = (ConvertTo-Json -InputObject $Marker -Depth 8 -Compress)
@@ -2459,7 +2733,8 @@ function Add-ReviewerThread {
         [Parameter(Mandatory)][int]$PrId,
         [Parameter(Mandatory)][string]$Content,
         [string]$FilePath = "",
-        [int]$Line = 0
+        [int]$Line = 0,
+        [ValidateSet('Active', 'Closed')][string]$Status = 'Active'
     )
     # The pair invariant is enforced at parse time, but it is cheap to refuse a
     # malformed anchor here too rather than guess which half to believe.
@@ -2469,7 +2744,7 @@ function Add-ReviewerThread {
 
     $arguments = @{
         action = 'create'; project = $ExpectedProject; repositoryId = $RepositoryName
-        pullRequestId = $PrId; content = $Content; status = 'Active'
+        pullRequestId = $PrId; content = $Content; status = $Status
     }
     $anchored = $false
     if ($FilePath -and $Line -gt 0) {
@@ -2675,11 +2950,11 @@ function Invoke-DryRunSelfChecks {
 
     Write-Host "[DRY-RUN] Self-check 7/$total : result-marker parsing and binding" -ForegroundColor Cyan
     $nonce = "selfchecknonce"
-    $schema = Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $nonce -MaxFindingItems 12 -SchemaVersion 2
+    $schema = Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $nonce -MaxFindingItems 12 -SchemaVersion 3
     $commit = ("a" * 40)
     $finding = '{"severity":"critical","filePath":"/src/A.cs","line":12,"comment":"The cache result is dereferenced without a miss check."}'
-    $sectionsJson = '[{"section":"scope","content":"Cache behavior and tests."},{"section":"skillsApplied","content":"Repository code review guidance."},{"section":"recommendationRationale","content":"The critical finding blocks approval."}]'
-    $mkBody = "{`"schemaVersion`":2,`"prId`":4242,`"repositoryId`":`"$cfgRepoId`",`"project`":`"$ExpectedProject`",`"reviewedSourceCommit`":`"$commit`",`"findings`":[$finding],`"threadReplies`":[],`"recommendedVote`":`"waitForAuthor`",`"summary`":`"Adds a cache.`",`"reviewSections`":$sectionsJson,`"securityReviewApplied`":false,`"nonce`":`"$nonce`"}"
+    $presentationJson = '"riskLevel":"medium","scopeItems":[{"surface":"Cache behavior","assessment":"Reviewed the miss path and callers."}],"skillsApplied":[{"name":"Repository code review guidance","application":"Applied the repository correctness and validation rules."}],"strengths":[{"title":"Tenant scoping","evidence":"Cache keys retain the tenant identifier."}],"rolloutItems":[{"area":"Compatibility","assessment":"The change is isolated to the new cache path."}],"validationItems":[{"status":"gap","item":"No cache-miss regression test is present."}],"securityReviewApplied":false,"securitySummary":"","recommendationRationale":"The critical finding blocks approval.","findingLimitReached":false,"omittedFindingCount":0'
+    $mkBody = "{`"schemaVersion`":3,`"prId`":4242,`"repositoryId`":`"$cfgRepoId`",`"project`":`"$ExpectedProject`",`"reviewedSourceCommit`":`"$commit`",`"findings`":[$finding],`"threadReplies`":[],`"recommendedVote`":`"waitForAuthor`",`"summary`":`"Adds a cache.`",$presentationJson,`"nonce`":`"$nonce`"}"
     $validLine = "$ResultMarkerPrefix $mkBody"
     $mValid = ConvertFrom-AgentResultMarker -StdOutText "assistant chatter`n$validLine" -MarkerPrefix $ResultMarkerPrefix -Schema $schema
     if ($null -eq $mValid) { $failures.Add("A valid marker was rejected.") }
@@ -2709,11 +2984,18 @@ function Invoke-DryRunSelfChecks {
         $failures.Add("A valid legacy V1 marker was rejected, so existing preview artifacts cannot be promoted.")
     }
     else { Write-Host "  OK - legacy V1 markers remain valid for sealed-artifact promotion" -ForegroundColor Green }
+    $v2Schema = Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $nonce -MaxFindingItems 12 -SchemaVersion 2
+    $v2Body = "{`"schemaVersion`":2,`"prId`":4242,`"repositoryId`":`"$cfgRepoId`",`"project`":`"$ExpectedProject`",`"reviewedSourceCommit`":`"$commit`",`"findings`":[],`"threadReplies`":[],`"recommendedVote`":`"approve`",`"summary`":`"V2 review.`",`"reviewSections`":[{`"section`":`"scope`",`"content`":`"Reviewed scope.`"},{`"section`":`"skillsApplied`",`"content`":`"Applied guidance.`"},{`"section`":`"recommendationRationale`",`"content`":`"No findings.`"}],`"securityReviewApplied`":false,`"nonce`":`"$nonce`"}"
+    if ($null -eq (ConvertFrom-AgentResultMarker -StdOutText "$script:ReviewerV2ResultMarkerPrefix $v2Body" `
+            -MarkerPrefix $script:ReviewerV2ResultMarkerPrefix -Schema $v2Schema)) {
+        $failures.Add("A valid legacy V2 marker was rejected, so existing preview artifacts cannot be promoted.")
+    }
+    else { Write-Host "  OK - legacy V2 markers remain valid for sealed-artifact promotion" -ForegroundColor Green }
 
     Write-Host "[DRY-RUN] Self-check 8/$total : the findings array is bounded and hostile-input safe" -ForegroundColor Cyan
     $mkMarker = {
         param([string]$FindingsJson, [string]$Vote = "none")
-        "$ResultMarkerPrefix {`"schemaVersion`":2,`"prId`":4242,`"repositoryId`":`"$cfgRepoId`",`"project`":`"$ExpectedProject`",`"reviewedSourceCommit`":`"$commit`",`"findings`":[$FindingsJson],`"threadReplies`":[],`"recommendedVote`":`"$Vote`",`"summary`":`"x`",`"reviewSections`":$sectionsJson,`"securityReviewApplied`":false,`"nonce`":`"$nonce`"}"
+        "$ResultMarkerPrefix {`"schemaVersion`":3,`"prId`":4242,`"repositoryId`":`"$cfgRepoId`",`"project`":`"$ExpectedProject`",`"reviewedSourceCommit`":`"$commit`",`"findings`":[$FindingsJson],`"threadReplies`":[],`"recommendedVote`":`"$Vote`",`"summary`":`"x`",$presentationJson,`"nonce`":`"$nonce`"}"
     }
     $overCap = & $mkMarker ((1..13 | ForEach-Object { $finding }) -join ',')
     if ($null -ne (ConvertFrom-AgentResultMarker -StdOutText $overCap -MarkerPrefix $ResultMarkerPrefix -Schema $schema)) { $failures.Add("A findings array over MaxItems was accepted.") }
@@ -2733,25 +3015,52 @@ function Invoke-DryRunSelfChecks {
     if ($null -ne (ConvertFrom-AgentResultMarker -StdOutText $badThreadReply -MarkerPrefix $ResultMarkerPrefix -Schema $schema)) {
         $failures.Add("A human-comment assessment with an unknown disposition was accepted.")
     }
-    $duplicateSection = (& $mkMarker "") -replace '"reviewSections":\[[^\]]+\]', ('"reviewSections":[' +
-        '{"section":"scope","content":"One."},{"section":"scope","content":"Two."}]')
-    $duplicateSectionMarker = ConvertFrom-AgentResultMarker -StdOutText $duplicateSection -MarkerPrefix $ResultMarkerPrefix -Schema $schema
-    if ($null -eq $duplicateSectionMarker -or
-        (Test-ReviewerSummarySections -Sections @($duplicateSectionMarker['reviewSections']) -PrimarySkillConfigured $true)) {
-        $failures.Add("Duplicate detailed-review sections were not rejected by semantic validation.")
+    $validPresentation = Get-ReviewerPresentationFromMarker -Marker (ConvertFrom-AgentResultMarker -StdOutText (& $mkMarker "") -MarkerPrefix $ResultMarkerPrefix -Schema $schema)
+    if (-not (Test-ReviewerPresentation -Presentation $validPresentation -PrimarySkillConfigured $true -SecurityMode 'auto')) {
+        $failures.Add("A complete V3 presentation was rejected by semantic validation.")
     }
-    $securityWithoutSection = (& $mkMarker "") -replace '"securityReviewApplied":false', '"securityReviewApplied":true'
-    $securityWithoutSectionMarker = ConvertFrom-AgentResultMarker -StdOutText $securityWithoutSection -MarkerPrefix $ResultMarkerPrefix -Schema $schema
-    if ($null -eq $securityWithoutSectionMarker -or
-        (Test-ReviewerSummarySections -Sections @($securityWithoutSectionMarker['reviewSections']) `
-            -SecurityReviewApplied $true -PrimarySkillConfigured $true)) {
-        $failures.Add("securityReviewApplied=true was accepted without a securityReview section.")
+    $securityWithoutSummary = (& $mkMarker "") -replace '"securityReviewApplied":false', '"securityReviewApplied":true'
+    $securityWithoutSummaryMarker = ConvertFrom-AgentResultMarker -StdOutText $securityWithoutSummary -MarkerPrefix $ResultMarkerPrefix -Schema $schema
+    if ($null -eq $securityWithoutSummaryMarker -or
+        (Test-ReviewerPresentation -Presentation (Get-ReviewerPresentationFromMarker -Marker $securityWithoutSummaryMarker) `
+            -PrimarySkillConfigured $true -SecurityMode 'auto')) {
+        $failures.Add("securityReviewApplied=true was accepted without a security summary.")
     }
-    if (-not (Test-ReviewerSummarySections -Sections @($securityWithoutSectionMarker['reviewSections']) `
-            -SecurityReviewApplied $false -PrimarySkillConfigured $true -SecurityMode 'auto') -or
-        (Test-ReviewerSummarySections -Sections @($securityWithoutSectionMarker['reviewSections']) `
-            -SecurityReviewApplied $false -PrimarySkillConfigured $true -SecurityMode 'always')) {
-        $failures.Add("securityMode=always did not require the security review while auto incorrectly did.")
+    $securityWithSummary = $securityWithoutSummary -replace '"securitySummary":""', '"securitySummary":"Applied SDL review."'
+    $securityWithSummaryMarker = ConvertFrom-AgentResultMarker -StdOutText $securityWithSummary -MarkerPrefix $ResultMarkerPrefix -Schema $schema
+    $securityPresentation = Get-ReviewerPresentationFromMarker -Marker $securityWithSummaryMarker
+    if ($null -eq $securityWithSummaryMarker -or
+        (Test-ReviewerPresentation -Presentation $securityPresentation -PrimarySkillConfigured $true -SecurityMode 'off') -or
+        -not (Test-ReviewerPresentation -Presentation $securityPresentation -PrimarySkillConfigured $true -SecurityMode 'auto')) {
+        $failures.Add("Security-review provenance did not respect off/auto mode.")
+    }
+    $summaryWithoutSecurity = (& $mkMarker "") -replace '"securitySummary":""', '"securitySummary":"Unclaimed SDL review."'
+    $summaryWithoutSecurityMarker = ConvertFrom-AgentResultMarker -StdOutText $summaryWithoutSecurity -MarkerPrefix $ResultMarkerPrefix -Schema $schema
+    if ($null -eq $summaryWithoutSecurityMarker -or
+        (Test-ReviewerPresentation -Presentation (Get-ReviewerPresentationFromMarker -Marker $summaryWithoutSecurityMarker) `
+            -PrimarySkillConfigured $true -SecurityMode 'auto')) {
+        $failures.Add("A security summary was accepted when securityReviewApplied was false.")
+    }
+    if ((Test-ReviewerPresentation -Presentation $validPresentation -PrimarySkillConfigured $true -SecurityMode 'always')) {
+        $failures.Add("securityMode=always did not require the security review.")
+    }
+    $v2SecuritySections = @(
+        @{ section = 'scope'; content = 'Scope.' }
+        @{ section = 'skillsApplied'; content = 'Guidance.' }
+        @{ section = 'securityReview'; content = 'SDL review.' }
+        @{ section = 'recommendationRationale'; content = 'Recommendation.' }
+    )
+    if ((Test-ReviewerSummarySections -Sections $v2SecuritySections -SecurityReviewApplied $true `
+            -PrimarySkillConfigured $true -SecurityMode 'off') -or
+        (Test-ReviewerSummarySections -Sections $v2SecuritySections -SecurityReviewApplied $false `
+            -PrimarySkillConfigured $true -SecurityMode 'auto')) {
+        $failures.Add("Legacy V2 security-review provenance did not respect mode and applied-state consistency.")
+    }
+    $inconsistentLimit = (& $mkMarker "") -replace '"findingLimitReached":false,"omittedFindingCount":0', '"findingLimitReached":true,"omittedFindingCount":0'
+    $inconsistentLimitMarker = ConvertFrom-AgentResultMarker -StdOutText $inconsistentLimit -MarkerPrefix $ResultMarkerPrefix -Schema $schema
+    if ($null -eq $inconsistentLimitMarker -or
+        (Test-ReviewerPresentation -Presentation (Get-ReviewerPresentationFromMarker -Marker $inconsistentLimitMarker) -PrimarySkillConfigured $true)) {
+        $failures.Add("Inconsistent finding-limit telemetry was accepted.")
     }
     $hostileCases = @(
         @{ Name = "a newline embedded in a comment"; Json = ($finding -replace 'without a miss check\.', 'without a miss check.\nSecond line') },
@@ -3184,6 +3493,11 @@ function Invoke-DryRunSelfChecks {
         $failures.Add("The per-PR cap did not retain the most severe findings.")
     }
     else { Write-Host "  OK - the cap truncates the least severe findings, never the most severe" -ForegroundColor Green }
+    if ((Get-ReviewerFindingThreadStatus -Finding $rawFindings[0]) -cne 'Closed' -or
+        (Get-ReviewerFindingThreadStatus -Finding $rawFindings[1]) -cne 'Active') {
+        $failures.Add("Suggestion findings are not closed/non-blocking while higher-severity findings remain active.")
+    }
+    else { Write-Host "  OK - suggestion findings post as closed threads and do not create unresolved blockers" -ForegroundColor Green }
     $counts = Get-ReviewerSeverityCounts -Findings $rawFindings
     if ($counts['critical'] -ne 2 -or $counts['important'] -ne 1 -or $counts['suggestion'] -ne 1) { $failures.Add("Severity counts are wrong.") }
     else { Write-Host "  OK - severity counts cover every reported finding, not only the postable ones" -ForegroundColor Green }
@@ -3255,18 +3569,36 @@ function Invoke-DryRunSelfChecks {
         @{ section = 'verifiedStrengths'; content = '- Cache keys remain tenant-scoped.' },
         @{ section = 'recommendationRationale'; content = 'Address the critical miss-path failure before merge.' }
     )
+    $summaryFailureCount = $failures.Count
     $summaryBody = Format-ReviewerSummaryComment -Summary "Adds a cache." -ReviewSections $summarySections `
         -Counts $counts -Reported 4 -Publishable 2
     if ($summaryBody -cnotmatch [regex]::Escape($script:ReviewerSummaryHeading)) { $failures.Add("The summary comment lost its heading.") }
     elseif ($summaryBody -cnotmatch '2 of 4 finding') { $failures.Add("The summary does not disclose that findings were withheld.") }
-    elseif ($summaryBody -cnotmatch '### Verified strengths' -or $summaryBody -cnotmatch 'tenant-scoped') {
+    elseif ($summaryBody -cnotmatch '### Verified Strengths' -or $summaryBody -cnotmatch 'tenant-scoped') {
         $failures.Add("The summary formatter dropped structured review detail.")
     }
     elseif ((Format-ReviewerSummaryComment -Summary 'Review ![private](https://example.test/x)' `
                 -Counts $counts -Reported 4 -Publishable 2) -match '!\[private\]\(https://') {
         $failures.Add("Model-authored summary text can still render an external Markdown image.")
     }
-    else { Write-Host "  OK - the summary renders bounded review detail and discloses withheld findings" -ForegroundColor Green }
+    else {
+        $hostilePresentation = @{
+            SchemaVersion = 3; RiskLevel = 'medium'
+            ScopeItems = @(@{ surface = 'Cache | path'; assessment = "Line one`n| forged | row | https://example.test/x" })
+            SkillsApplied = @(); Strengths = @(); RolloutItems = @(); ValidationItems = @()
+            SecurityReviewApplied = $false; SecuritySummary = ''; RecommendationRationale = 'Review result.'
+            FindingLimitReached = $false; OmittedFindingCount = 0
+        }
+        $hostileSummary = Format-ReviewerSummaryComment -Summary 'Review.' -Presentation $hostilePresentation `
+            -Findings @() -RecommendedVote 'none' -Counts $counts -Reported 0 -Publishable 0
+        if ($hostileSummary -match 'https://' -or $hostileSummary -match '(?m)^\| forged \|') {
+            $failures.Add("Model-authored V3 table data can still create a live URL or inject a Markdown table row.")
+        }
+        else { Write-Host "  OK - V3 table cells neutralize links, pipes and embedded rows" -ForegroundColor Green }
+    }
+    if ($failures.Count -eq $summaryFailureCount) {
+        Write-Host "  OK - the summary renders bounded review detail and discloses withheld findings" -ForegroundColor Green
+    }
 
     Write-Host "[DRY-RUN] Self-check 14/$total : vote gating fails closed" -ForegroundColor Cyan
     $reviewedCommit = ("f" * 40)
@@ -4207,6 +4539,8 @@ function Invoke-ReviewerDelivery {
         [object[]]$ThreadReplies = @(),
         [object[]]$ThreadTargets = @(),
         [Parameter(Mandatory)][AllowEmptyString()][string]$SummaryText,
+        [hashtable]$Presentation = $null,
+        [object[]]$SummaryFindings = @(),
         [object[]]$ReviewSections = @(),
         [bool]$SecurityReviewApplied = $false,
         [Parameter(Mandatory)][hashtable]$Counts,
@@ -4275,7 +4609,8 @@ function Invoke-ReviewerDelivery {
             }
             $post = Add-ReviewerThread -Session $Session -PrId $PrId -Content (Format-ReviewerFindingComment -Finding $f) `
                 -FilePath ([string](Get-ReviewerHashValue -Container $f -Key 'filePath' -Default '')) `
-                -Line ([int](Get-ReviewerHashValue -Container $f -Key 'line' -Default 0))
+                -Line ([int](Get-ReviewerHashValue -Container $f -Key 'line' -Default 0)) `
+                -Status (Get-ReviewerFindingThreadStatus -Finding $f)
             if ($post.Error) {
                 $outcome.PostFailures++
                 Write-Warning "  could not post a finding on PR ${PrId}: $($post.Error)"
@@ -4393,8 +4728,16 @@ function Invoke-ReviewerDelivery {
         $outcome.SummaryPosted = $true
     }
     elseif ($summaryGate.Post) {
-        $summaryBody = Format-ReviewerSummaryComment -Summary $SummaryText -ReviewSections $ReviewSections `
-            -SecurityReviewApplied $SecurityReviewApplied -Counts $Counts -Reported $ReportedFindingCount `
+        if (-not $Presentation) {
+            $Presentation = Get-ReviewerPresentationFromMarker -Marker @{
+                schemaVersion = 2
+                reviewSections = @($ReviewSections)
+                securityReviewApplied = [bool]$SecurityReviewApplied
+            }
+        }
+        if (@($SummaryFindings).Count -eq 0) { $SummaryFindings = @($Postable) }
+        $summaryBody = Format-ReviewerSummaryComment -Summary $SummaryText -Presentation $Presentation `
+            -Findings $SummaryFindings -RecommendedVote $RecommendedVote -Counts $Counts -Reported $ReportedFindingCount `
             -Publishable (Get-ReviewerPublishableCount -SealedCount $SealedPublishableCount -PostableCount (@($Postable).Count))
         $summaryFingerprint = Get-ReviewerCommentFingerprint -Content $summaryBody
         if ($ExistingFingerprints.Contains($summaryFingerprint)) {
@@ -4642,7 +4985,7 @@ function Invoke-ReviewerPullRequest {
     if ($run.ExitCode -eq 0 -and -not $run.TimedOut) {
         $marker = ConvertFrom-AgentResultMarker -StdOutText $markerSource -MarkerPrefix $ResultMarkerPrefix `
             -Schema (Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $nonce `
-                -MaxFindingItems $EffectiveMaxFindings -SchemaVersion 2)
+                -MaxFindingItems $EffectiveMaxFindings -SchemaVersion 3)
     }
     if ($marker -and -not (Test-ReviewerMarkerBinding -Marker $marker -PrId $prId -RepositoryId $cfgRepoId -SourceCommit $sourceCommit)) {
         Write-Warning "The result marker did not match the bound PR/repository/commit; discarding it."
@@ -4652,11 +4995,13 @@ function Invoke-ReviewerPullRequest {
         Write-Warning "The result marker contained a duplicate or non-human thread assessment target; discarding it."
         $marker = $null
     }
-    if ($marker -and -not (Test-ReviewerSummarySections -Sections @($marker['reviewSections']) `
-            -SecurityReviewApplied ([bool]$marker['securityReviewApplied']) `
-            -PrimarySkillConfigured ([bool]$PrimaryReviewSkillPath) -SecurityMode $SecurityReviewMode)) {
-        Write-Warning "The result marker omitted a required review section or repeated a section; discarding it."
+    $presentation = if ($marker) { Get-ReviewerPresentationFromMarker -Marker $marker } else { $null }
+    if ($marker -and -not (Test-ReviewerPresentation -Presentation $presentation `
+            -PrimarySkillConfigured ([bool]$PrimaryReviewSkillPath) -SecurityMode $SecurityReviewMode `
+            -FindingCount @($marker['findings']).Count -MaxFindings $EffectiveMaxFindings)) {
+        Write-Warning "The result marker omitted required structured review content or reported inconsistent limit/security metadata; discarding it."
         $marker = $null
+        $presentation = $null
     }
 
     if (-not $marker) {
@@ -4731,12 +5076,11 @@ function Invoke-ReviewerPullRequest {
     $postable = @($scoped.Postable)
     $withheld = @($scoped.Withheld)
     $summaryText = [string]$marker['summary']
-    $reviewSections = @($marker['reviewSections'])
-    $securityReviewApplied = [bool]$marker['securityReviewApplied']
     $recommendedVote = [string]$marker['recommendedVote']
 
-    Write-Host ("PR {0} reviewed: {1} critical, {2} important, {3} suggestion; {4} postable; {5} human-comment assessment(s); recommended vote '{6}'." -f `
-            $prId, $counts['critical'], $counts['important'], $counts['suggestion'], $postable.Count, $threadReplies.Count, $recommendedVote) -ForegroundColor Green
+    Write-Host ("PR {0} reviewed: {1} critical, {2} important, {3} suggestion; {4} postable; {5} human-comment assessment(s); recommended vote '{6}'; finding cap reached={7}, omitted={8}." -f `
+            $prId, $counts['critical'], $counts['important'], $counts['suggestion'], $postable.Count, $threadReplies.Count, $recommendedVote,
+            ([bool]$presentation.FindingLimitReached), ([int]$presentation.OmittedFindingCount)) -ForegroundColor Green
     if ($withheld.Count -gt 0) {
         Write-Warning "$($withheld.Count) finding(s) name a file this PR does not change; they are in the preview but will not be posted."
     }
@@ -4748,7 +5092,7 @@ function Invoke-ReviewerPullRequest {
     # itself.
     $writesRequested = Get-ReviewerWritesRequested -Comments ([bool]$EnableFindingComments) -ThreadReplies ([bool]$EnableThreadReplies) -Summary ([bool]$EnableSummaryComment) -Vote ([bool]$EnableApprovalVote)
     $preview = Write-ReviewerPreview -PrId $prId -SourceCommit $sourceCommit -PrTitle $prTitle `
-        -Summary $summaryText -ReviewSections $reviewSections -SecurityReviewApplied $securityReviewApplied `
+        -Summary $summaryText -Presentation $presentation `
         -Postable $postable -Withheld $withheld -AllFindings $allFindings `
         -ThreadReplies $threadReplies -ThreadTargets $Bound.ThreadReplyTargets `
         -RecommendedVote $recommendedVote -Marker $marker -Quiet:$writesRequested
@@ -4817,7 +5161,7 @@ function Invoke-ReviewerPullRequest {
     # findings are shown to a human) but delivery must refuse it.
     $delivery = Invoke-ReviewerDelivery -Session $Session -PrId $prId -SourceCommit $sourceCommit `
         -Postable $postable -ThreadReplies $threadReplies -ThreadTargets $Bound.ThreadReplyTargets `
-        -SummaryText $summaryText -ReviewSections $reviewSections -SecurityReviewApplied $securityReviewApplied `
+        -SummaryText $summaryText -Presentation $presentation -SummaryFindings $allFindings `
         -Counts $counts -ReportedFindingCount $allFindings.Count `
         -RecommendedVote $recommendedVote -ExistingFingerprints $Bound.ExistingFingerprints `
         -ChangeSetKnown (@($Bound.ChangedPaths).Count -gt 0) `
@@ -4887,6 +5231,7 @@ function Invoke-ReviewerPullRequest {
         sourceCommit = $sourceCommit; findingCount = $allFindings.Count
         critical = $counts['critical']; important = $counts['important']; suggestion = $counts['suggestion']
         postableCount = $postable.Count; withheldCount = $withheld.Count
+        findingLimitReached = [bool]$presentation.FindingLimitReached; omittedFindingCount = [int]$presentation.OmittedFindingCount
         postedCount = $postedCount; postFailures = $postFailures
         threadRepliesReported = $threadReplies.Count; threadRepliesPosted = $threadRepliesPosted; threadReplyFailures = $threadReplyFailures
         summaryPosted = $summaryPosted; recommendedVote = $recommendedVote; castVote = $(if ($castVote) { $castVote } else { "none" })
@@ -4986,10 +5331,13 @@ function Invoke-ReviewerPromotion {
         if (-not (Test-ReviewerHasKey -Container $signed -Key $k)) { throw "Preview artifact is missing required field '$k': $ArtifactPath" }
     }
     $artifactVersion = [int]$signed.artifactVersion
-    if (@(4, 5) -cnotcontains $artifactVersion) { throw "Unsupported preview artifact version $artifactVersion." }
+    if (@(4, 5, 6) -cnotcontains $artifactVersion) { throw "Unsupported preview artifact version $artifactVersion." }
     if ($artifactVersion -eq 5) {
         foreach ($k in @('approvedReviewSections', 'securityReviewApplied')) {
             if (-not (Test-ReviewerHasKey -Container $signed -Key $k)) { throw "Preview artifact is missing required field '$k': $ArtifactPath" }
+        }
+        if ($artifactVersion -eq 6 -and -not (Test-ReviewerHasKey -Container $signed -Key 'approvedPresentation')) {
+            throw "Preview artifact is missing required field 'approvedPresentation': $ArtifactPath"
         }
     }
 
@@ -5042,12 +5390,16 @@ function Invoke-ReviewerPromotion {
     $storedNonce = [string](Get-ReviewerHashValue -Container $storedMarkerObject -Key 'nonce' -Default '')
     if (-not $storedNonce) { throw "Preview artifact carries no nonce; refusing to promote it." }
     $storedSchemaVersion = [int](Get-ReviewerHashValue -Container $storedMarkerObject -Key 'schemaVersion' -Default 0)
-    if (@(1, 2) -cnotcontains $storedSchemaVersion) {
+    if (@(1, 2, 3) -cnotcontains $storedSchemaVersion) {
         throw "Preview artifact carries unsupported reviewer result schema version '$storedSchemaVersion'."
     }
     $storedMarkerPrefix = [string](Get-ReviewerHashValue -Container $signed -Key 'markerPrefix' -Default '')
     if (-not $storedMarkerPrefix) {
-        $storedMarkerPrefix = if ($storedSchemaVersion -eq 1) { $script:ReviewerLegacyResultMarkerPrefix } else { $ResultMarkerPrefix }
+        $storedMarkerPrefix = switch ($storedSchemaVersion) {
+            1 { $script:ReviewerLegacyResultMarkerPrefix }
+            2 { $script:ReviewerV2ResultMarkerPrefix }
+            default { $ResultMarkerPrefix }
+        }
     }
     # Every comment this run writes - the summary and each finding - is rendered
     # by THIS script's formatter, heading and footer. If the agent was upgraded
@@ -5083,6 +5435,12 @@ function Invoke-ReviewerPromotion {
             -PrimarySkillConfigured ([bool]$PrimaryReviewSkillPath) -SecurityMode $SecurityReviewMode)) {
         throw "The stored review omitted a required review section or repeated a section; refusing to promote it."
     }
+    $storedPresentation = Get-ReviewerPresentationFromMarker -Marker $marker
+    if ($storedSchemaVersion -eq 3 -and -not (Test-ReviewerPresentation -Presentation $storedPresentation `
+            -PrimarySkillConfigured ([bool]$PrimaryReviewSkillPath) -SecurityMode $SecurityReviewMode `
+            -FindingCount @($marker['findings']).Count -MaxFindings $maxItems)) {
+        throw "The stored review omitted required structured review content or reported inconsistent limit/security metadata; refusing to promote it."
+    }
     if ([string]$signed.approvedSummary -cne [string]$marker['summary'] -or
         [string]$signed.approvedVote -cne [string]$marker['recommendedVote']) {
         throw "The sealed delivery manifest does not match the stored marker's summary or vote."
@@ -5093,6 +5451,13 @@ function Invoke-ReviewerPromotion {
         if ($manifestSectionsJson -cne $markerSectionsJson -or
             [bool]$signed.securityReviewApplied -ne [bool]$marker['securityReviewApplied']) {
             throw "The sealed delivery manifest does not match the stored marker's detailed review sections."
+        }
+    }
+    if ($artifactVersion -eq 6) {
+        $manifestPresentationJson = Get-ReviewerCanonicalJson -Value $signed.approvedPresentation
+        $markerPresentationJson = Get-ReviewerCanonicalJson -Value $storedPresentation
+        if ($manifestPresentationJson -cne $markerPresentationJson) {
+            throw "The sealed delivery manifest does not match the stored marker's structured review presentation."
         }
     }
 
@@ -5113,8 +5478,14 @@ function Invoke-ReviewerPromotion {
         $allFindings = @($marker['findings'])
         $counts = Get-ReviewerSeverityCounts -Findings $allFindings
         $approved = @($signed.approvedComments)
-        $approvedReviewSections = if ($artifactVersion -ge 5) { @($signed.approvedReviewSections) } else { @() }
-        $securityReviewApplied = if ($artifactVersion -ge 5) { [bool]$signed.securityReviewApplied } else { $false }
+        $approvedReviewSections = if ($artifactVersion -eq 5) { @($signed.approvedReviewSections) } else { @() }
+        $securityReviewApplied = if ($artifactVersion -eq 5) { [bool]$signed.securityReviewApplied } else { $false }
+        $approvedPresentation = if ($artifactVersion -eq 6) {
+            ConvertTo-ReviewerHashtable -Value $signed.approvedPresentation
+        }
+        else {
+            Get-ReviewerPresentationFromMarker -Marker $marker
+        }
         $approvedThreadReplies = @($signed.approvedThreadReplies)
         $reviewedThreadTargets = @($signed.reviewedThreadTargets)
         $changedPaths = Get-ReviewerChangedPaths -Session $session -PrId $prId
@@ -5169,6 +5540,8 @@ function Invoke-ReviewerPromotion {
             findingCount        = $allFindings.Count
             postableCount       = @($postable).Count
             withheldCount       = $dropped
+            findingLimitReached = [bool]$approvedPresentation.FindingLimitReached
+            omittedFindingCount = [int]$approvedPresentation.OmittedFindingCount
             postedCount         = 0
             threadRepliesPosted = 0
             summaryPosted       = $false
@@ -5193,7 +5566,8 @@ function Invoke-ReviewerPromotion {
 
         $delivery = Invoke-ReviewerDelivery -Session $session -PrId $prId -SourceCommit $sourceCommit `
             -Postable $postable -ThreadReplies $threadReplies -ThreadTargets $reviewedThreadTargets `
-            -SummaryText ([string]$signed.approvedSummary) -ReviewSections $approvedReviewSections `
+            -SummaryText ([string]$signed.approvedSummary) -Presentation $approvedPresentation -SummaryFindings $allFindings `
+            -ReviewSections $approvedReviewSections `
             -SecurityReviewApplied $securityReviewApplied -Counts $counts `
             -ReportedFindingCount ([int](Get-ReviewerHashValue -Container $signed -Key 'reportedFindings' -Default $allFindings.Count)) `
             -RecommendedVote ([string]$signed.approvedVote) `
@@ -5272,6 +5646,8 @@ function Invoke-ReviewerPromotion {
             approvedThreadReplies = $approvedThreadReplies.Count; droppedThreadReplies = $droppedThreadReplies
             threadRepliesPosted = [int]$delivery.ThreadRepliesPosted; threadReplyFailures = [int]$delivery.ThreadReplyFailures
             summaryPosted = [bool]$delivery.SummaryPosted; castVote = $(if ($delivery.CastVote) { [string]$delivery.CastVote } else { "none" })
+            findingLimitReached = [bool]$approvedPresentation.FindingLimitReached
+            omittedFindingCount = [int]$approvedPresentation.OmittedFindingCount
             deliveryAborted = [bool]$delivery.Aborted; deliveryReason = [string]$delivery.Reason
         }
 

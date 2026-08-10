@@ -124,10 +124,14 @@ security skill only to security-sensitive changes.
 
 Skill guidance is subordinate to the reviewer's fixed cycle contract. The model
 may read and apply analysis guidance, but it still cannot ask an interactive
-question, run shell commands, edit files, post comments, or vote. The V2 result
-marker carries bounded detailed sections such as scope, verified strengths,
-rollout risk, validation, SDL results, and recommendation rationale. The trusted
-wrapper renders those sections as deterministic Markdown and owns every write.
+question, run shell commands, edit files, post comments, or vote. The V3 result
+marker carries bounded flat objects for scope, applied guidance, verified
+strengths, rollout risk, validation, SDL results, and recommendation rationale.
+The trusted wrapper—not the model—renders the recommendation banner, count and
+findings tables, status rows, headings, and footer as deterministic Markdown.
+It also records whether the configured finding cap was reached and how many
+additional actionable findings the model omitted, so operators can tune the cap
+without removing the runaway safeguard. The wrapper owns every write.
 
 What that does and does not buy you, stated precisely:
 
