@@ -45,14 +45,21 @@ Policy may narrow code-defined candidate, cluster, input, artifact, verifier-run
 and phase-time ceilings but cannot widen them; the sealed effective policy records
 the clamped values actually enforced.
 
-Generalist candidates discovered by Claude Opus 5 are assigned to GPT-5.6 Sol;
-Sol candidates are assigned to Opus 5. Convention candidates use the explicitly
-configured generalist verifier. A sole-origin candidate cannot verify itself.
-Mixed-origin clusters are still evidence-checked; corroboration is not truth.
+Blind discovery is three-way and isolated: GPT generalist, Opus generalist, and
+the convention specialist do not receive one another's findings. After all
+three blind passes finish, the wrapper forms the exact candidate union without
+requiring discovery overlap. Every GPT-only, Opus-only, and specialist-only
+candidate then receives two fresh cross-checks: one from GPT and one from Opus.
+The specialist never cross-checks. A candidate is semantically accepted only
+when both cross-checks bind supplied evidence and concur on the exact outcome;
+blind overlap, first/latest wording, majority, and specialist concurrence are
+not substitutes. The specialist discovery model must differ from both
+generalist cross-check models. Mixed-origin clusters remain advisory for
+deduplication.
 
 ## Verifier boundary
 
-Each verifier receives one cluster only: assigned candidates, bounded sibling
+Each fresh cross-check invocation receives one cluster only: assigned candidates, bounded sibling
 evidence, exact source-commit hunks, cited convention quote/provenance,
 deterministic facts, and sanitized existing-thread evidence. It does not receive
 discovery summaries, unrelated candidates, delivery state, or write tools.
@@ -62,8 +69,9 @@ discovery summaries, unrelated candidates, delivery state, or write tools.
 candidate, cluster, source snapshot, verifier model, prompt, and evidence hash.
 The schema has no comment, publication, write, summary, or vote fields.
 The wrapper requires the CLI to report the exact non-empty configured model for
-every verifier run. Convention candidates cannot be assigned back to their
-specialist discovery model even if startup validation is bypassed.
+every cross-check run. The sealed assignment set must contain exactly one GPT
+and one Opus cross-check per candidate. Convention candidates cannot be assigned
+to their specialist discovery model even if startup validation is bypassed.
 
 Timeout, invalid marker, stale binding, model mismatch, tool violation, missing
 evidence, incomplete output, disagreement, or `needsHuman` withholds. There is no
@@ -103,6 +111,13 @@ severity, source/fact/thread bindings, all input hashes, and final eligible
 preview candidates. Input and decision artifacts derive different HMAC keys from
 the reviewer master key. Delivery promotion accepts only the exact delivery
 manifest key set and cannot authenticate either verification domain.
+
+For repeated sealed executions, each decision artifact also embeds a
+reconciliation manifest whose candidate list is the subset of specialist
+semantic candidates accepted by both GPT and Opus. Corrected severity and the
+removal of unsupported existing-debt follow-up are applied before sealing this
+subset. Reconciliation never reads rejected or superseded raw specialist
+semantics from that artifact.
 
 ## Layer 6: delivery gates
 

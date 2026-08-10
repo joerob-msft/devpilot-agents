@@ -439,8 +439,9 @@ function Get-ReviewerRunReconciliationSemanticCandidateIdentity {
             -Value $(if ($null -eq $row) { @() } else {
                 @(Get-ReviewerRunReconciliationValue $row "violatingConstructs" @())
             }))
-    if ($anchorKind -ceq "changedFile" -and $null -ne $row -and $violatingIds.Count -eq 0) {
-        [void]$errors.Add("candidate has no deterministic violation set")
+    if ($anchorKind -ceq "changedFile" -and $null -ne $row -and
+        $violatingIds.Count -eq 0 -and -not $changedLineBound) {
+        [void]$errors.Add("candidate has neither a deterministic violation set nor a sealed changed-file anchor")
     }
     if ($anchorKind -ceq "prMetadata" -and $factIds.Count -eq 0) {
         [void]$errors.Add("metadata candidate has no deterministic fact evidence")
@@ -486,8 +487,9 @@ function Get-ReviewerRunReconciliationSemanticCandidateIdentity {
             [void]$anchorConstructs.Add($descriptor)
         }
     }
-    if ($anchorKind -ceq "changedFile" -and $null -ne $row -and $anchorConstructs.Count -eq 0) {
-        [void]$errors.Add("candidate anchor does not identify a construct in the violation set")
+    if ($anchorKind -ceq "changedFile" -and $null -ne $row -and
+        $anchorConstructs.Count -eq 0 -and -not $changedLineBound) {
+        [void]$errors.Add("candidate anchor identifies neither a violation construct nor a sealed changed-file range")
     }
     $remediationErrors = [string[]](Get-ReviewerConventionSpecialistRemediationErrors `
             -Candidate $Candidate -Constructs @(Get-ReviewerRunReconciliationValue $coverage "changedConstructs" @()) `

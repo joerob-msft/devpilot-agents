@@ -18,11 +18,26 @@ $script:ReviewerConventionSpecialistUtf8 = [System.Text.UTF8Encoding]::new($fals
 
 function ConvertTo-ReviewerConventionSpecialistCanonicalPath {
     param([AllowEmptyString()][string]$Path = "")
-    $value = $Path.Trim().Replace('\', '/').Normalize([Text.NormalizationForm]::FormKC)
-    if (-not $value) { return "" }
-    if ($value.StartsWith("./", [StringComparison]::Ordinal)) { $value = $value.Substring(2) }
-    if (-not $value.StartsWith("/", [StringComparison]::Ordinal)) { $value = "/$value" }
-    return $value.TrimEnd('/').ToLowerInvariant()
+    if (-not (Get-Command ConvertTo-ReviewerSourceIdentityPath -ErrorAction SilentlyContinue)) {
+        throw "Convention specialist path validation requires SourceTransport.ps1."
+    }
+    return ConvertTo-ReviewerSourceIdentityPath -Path $Path
+}
+
+function ConvertTo-ReviewerConventionSpecialistRangesByPath {
+    param([hashtable]$RightHandRangesByPath = @{})
+    $result = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($rawPath in $RightHandRangesByPath.Keys) {
+        $path = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path ([string]$rawPath)
+        if (-not $path) {
+            throw "Changed-file right-hand ranges contain an invalid repository path."
+        }
+        if ($result.ContainsKey($path)) {
+            throw "Changed-file right-hand ranges contain ambiguous path identity '$path'."
+        }
+        $result.Add($path, @($RightHandRangesByPath[$rawPath]))
+    }
+    return $result
 }
 
 function Test-ReviewerConventionSpecialistInteger {
@@ -935,18 +950,25 @@ function Get-ReviewerConventionSpecialistChangedFileIndex {
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ChangeEntries,
         [hashtable]$RightHandRangesByPath = @{}
     )
-    $paths = @(@($ChangeEntries) |
-        Where-Object { [string](Get-ReviewerConventionSpecialistValue $_ "Role" "") -ceq "current" } |
-        ForEach-Object { [string](Get-ReviewerConventionSpecialistValue $_ "Path" "") } |
-        Where-Object { $_ } |
-        Select-Object -Unique)
-    $sorted = [string[]]@($paths)
+    $pathSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($entry in @($ChangeEntries)) {
+        if ([string](Get-ReviewerConventionSpecialistValue $entry "Role" "") -cne "current") { continue }
+        $path = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+            [string](Get-ReviewerConventionSpecialistValue $entry "Path" ""))
+        if (-not $path) { throw "Changed-file index contains an invalid current repository path." }
+        if (-not $pathSet.Add($path)) {
+            throw "Changed-file index contains ambiguous duplicate path identity '$path'."
+        }
+    }
+    $sorted = [string[]]@($pathSet)
     [Array]::Sort($sorted, [StringComparer]::Ordinal)
+    $canonicalRanges = ConvertTo-ReviewerConventionSpecialistRangesByPath `
+        -RightHandRangesByPath $RightHandRangesByPath
     $index = [System.Collections.Generic.List[object]]::new()
     for ($i = 0; $i -lt $sorted.Count; $i++) {
         $ranges = @()
-        if ($RightHandRangesByPath.ContainsKey($sorted[$i])) {
-            $ranges = @($RightHandRangesByPath[$sorted[$i]] | ForEach-Object {
+        if ($canonicalRanges.ContainsKey($sorted[$i])) {
+            $ranges = @($canonicalRanges[$sorted[$i]] | ForEach-Object {
                     [pscustomobject][ordered]@{
                         startLine = [int](Get-ReviewerConventionSpecialistValue $_ "startLine" 0)
                         endLine = [int](Get-ReviewerConventionSpecialistValue $_ "endLine" 0)
@@ -1082,7 +1104,8 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         $candidateAnchorKinds[$candidateId] = [string](Get-ReviewerConventionSpecialistValue `
                 $candidate "anchorKind" "")
         $candidateAnchors[$candidateId] = "{0}|{1}" -f `
-            (([string](Get-ReviewerConventionSpecialistValue $candidate "filePath" "")).TrimStart("/")),
+            (ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+                [string](Get-ReviewerConventionSpecialistValue $candidate "filePath" ""))),
         ([int](Get-ReviewerConventionSpecialistValue $candidate "line" 0))
         [void]$candidateRuleKeys.Add(("{0}/{1}" -f `
                 [string](Get-ReviewerConventionSpecialistValue $candidate "packName" ""),
@@ -1371,10 +1394,11 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
                 # license a comment almost anywhere. An anchor has to be an
                 # anchor.
                 if ([string](Get-ReviewerConventionSpecialistValue $construct "status" "known") -cne "known") { continue }
-                $constructPath = ([string](Get-ReviewerConventionSpecialistValue $construct "path" "")).TrimStart("/")
+                $constructPath = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+                    [string](Get-ReviewerConventionSpecialistValue $construct "path" ""))
                 $candidateParts = $candidateAnchor -split '\|'
                 if ($candidateParts.Count -ne 2) { continue }
-                if (-not [string]::Equals($constructPath, [string]$candidateParts[0], [StringComparison]::OrdinalIgnoreCase)) { continue }
+                if (-not [string]::Equals($constructPath, [string]$candidateParts[0], [StringComparison]::Ordinal)) { continue }
                 # ANYWHERE inside the construct, not just its opening line. The
                 # rule that started this is about the last argument of a
                 # multi-line call, and a reviewer anchors that comment on the
@@ -1556,12 +1580,21 @@ function Resolve-ReviewerConventionSpecialistCandidates {
         $id = [string](Get-ReviewerConventionSpecialistValue $fact "id" "")
         if ($id -and -not $factMap.ContainsKey($id)) { $factMap.Add($id, $fact) }
     }
-    $currentPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $currentPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($entry in @($ChangeEntries)) {
         if ([string](Get-ReviewerConventionSpecialistValue $entry "Role" "") -ceq "current") {
-            [void]$currentPaths.Add([string](Get-ReviewerConventionSpecialistValue $entry "Path" ""))
+            $currentPath = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+                [string](Get-ReviewerConventionSpecialistValue $entry "Path" ""))
+            if (-not $currentPath) {
+                throw "Convention specialist change entries contain an invalid current repository path."
+            }
+            if (-not $currentPaths.Add($currentPath)) {
+                throw "Convention specialist change entries contain ambiguous duplicate path identity '$currentPath'."
+            }
         }
     }
+    $canonicalRanges = ConvertTo-ReviewerConventionSpecialistRangesByPath `
+        -RightHandRangesByPath $RightHandRangesByPath
     $seenIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $accepted = [System.Collections.Generic.List[object]]::new()
     $withheld = [System.Collections.Generic.List[object]]::new()
@@ -1672,10 +1705,11 @@ function Resolve-ReviewerConventionSpecialistCandidates {
             }
         }
         if ([string]$candidate.anchorKind -ceq "changedFile") {
-            $relativePath = ([string]$candidate.filePath).TrimStart("/")
+            $relativePath = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+                [string]$candidate.filePath)
             $lineInChangedRange = $false
-            if ($RightHandRangesByPath.ContainsKey($relativePath)) {
-                foreach ($range in @($RightHandRangesByPath[$relativePath])) {
+            if ($canonicalRanges.ContainsKey($relativePath)) {
+                foreach ($range in @($canonicalRanges[$relativePath])) {
                     $startLine = [int](Get-ReviewerConventionSpecialistValue $range "startLine" 0)
                     $endLine = [int](Get-ReviewerConventionSpecialistValue $range "endLine" 0)
                     if ([int]$candidate.line -ge $startLine -and [int]$candidate.line -le $endLine) {
@@ -1686,7 +1720,7 @@ function Resolve-ReviewerConventionSpecialistCandidates {
             }
             if (-not [string]$candidate.filePath -or [int]$candidate.line -lt 1 -or
                 -not $currentPaths.Contains($relativePath) -or
-                ($RightHandRangesByPath.Count -gt 0 -and -not $lineInChangedRange)) {
+                ($canonicalRanges.Count -gt 0 -and -not $lineInChangedRange)) {
                 [void]$withheld.Add([pscustomobject][ordered]@{
                         candidateId = $candidateId
                         reason = "outsideChangedFile"
@@ -1694,6 +1728,7 @@ function Resolve-ReviewerConventionSpecialistCandidates {
                     })
                 continue
             }
+            $candidate.filePath = $relativePath
         }
         else {
             if ([string]$candidate.filePath -or [int]$candidate.line -ne 0 -or $facts.Count -eq 0 -or

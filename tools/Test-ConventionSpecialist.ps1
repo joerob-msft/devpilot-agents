@@ -11,6 +11,7 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 Import-Module (Join-Path $repoRoot "src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1") -Force
 . (Join-Path $repoRoot "src\Agents\reviewer\ConventionPacks.ps1")
 . (Join-Path $repoRoot "src\Agents\reviewer\ReviewFacts.ps1")
+. (Join-Path $repoRoot "src\Agents\reviewer\SourceTransport.ps1")
 . (Join-Path $repoRoot "src\Agents\reviewer\ConventionSpecialist.ps1")
 
 $wrapperPath = Join-Path $repoRoot "src\Agents\reviewer\Start-ReviewerAgent.ps1"
@@ -492,6 +493,56 @@ Assert-Specialist (@((Resolve-ReviewerConventionSpecialistCandidates -Marker $re
             -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
             -ChangeEntries $changes).Candidates).Count -eq 1) `
     "A repository-relative changed-file anchor without a leading slash was rejected."
+
+$fileAnchorRanges = @{ "/src/a.cs" = @([pscustomobject]@{ startLine = 12; endLine = 12 }) }
+$fileAnchorOnly = Copy-SpecialistObject $markerObject
+$fileAnchorOnly.candidates[0].changedCodeFix.targets = "cf0"
+$fileAnchorOnlyParsed = ConvertTo-TestMarker -Marker $fileAnchorOnly -Nonce "nonce-1"
+$fileAnchorOnlyResult = Resolve-ReviewerConventionSpecialistCandidates -Marker $fileAnchorOnlyParsed `
+    -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
+    -ChangeEntries $changes -Constructs @() -RightHandRangesByPath $fileAnchorRanges
+Assert-Specialist (@($fileAnchorOnlyResult.Candidates).Count -eq 1 -and
+    [string]$fileAnchorOnlyResult.Candidates[0].filePath -ceq "/src/a.cs" -and
+    [string]$fileAnchorOnlyResult.Candidates[0].changedCodeFix.targets -ceq "cf0" -and
+    @($fileAnchorOnlyResult.ChangedFileIndex).Count -eq 1) `
+    "A valid sealed changed-file anchor without a lexical construct was not retained truthfully."
+$outOfSpanFileAnchor = Copy-SpecialistObject $fileAnchorOnly
+$outOfSpanFileAnchor.candidates[0].line = 13
+$outOfSpanFileAnchorParsed = ConvertTo-TestMarker -Marker $outOfSpanFileAnchor -Nonce "nonce-1"
+Assert-SpecialistThrows {
+    Resolve-ReviewerConventionSpecialistCandidates -Marker $outOfSpanFileAnchorParsed `
+        -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
+        -ChangeEntries $changes -Constructs @() -RightHandRangesByPath $fileAnchorRanges
+} "An out-of-span changed-file remediation anchor was accepted."
+$mismatchedFileAnchor = Copy-SpecialistObject $fileAnchorOnly
+$mismatchedFileAnchor.candidates[0].filePath = "/src/other.cs"
+$mismatchedFileAnchorParsed = ConvertTo-TestMarker -Marker $mismatchedFileAnchor -Nonce "nonce-1"
+Assert-SpecialistThrows {
+    Resolve-ReviewerConventionSpecialistCandidates -Marker $mismatchedFileAnchorParsed `
+        -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
+        -ChangeEntries $changes -Constructs @() -RightHandRangesByPath $fileAnchorRanges
+} "A path-mismatched changed-file remediation anchor was accepted."
+
+$line1112Changes = @([pscustomobject][ordered]@{
+        Path = "/src/flow/Roles/Flow.Worker.Cloud.New/Jobs/AutomationProject/AutomationProjectApplicationProvisioningJob.cs"
+        Role = "current"; ChangeTypes = @("edit")
+    })
+$line1112Ranges = @{
+    "/src/flow/Roles/Flow.Worker.Cloud.New/Jobs/AutomationProject/AutomationProjectApplicationProvisioningJob.cs" =
+        @([pscustomobject]@{ startLine = 1112; endLine = 1112 })
+}
+$line1112Candidate = Copy-SpecialistObject $fileAnchorOnly
+$line1112Candidate.candidates[0].filePath =
+    "/src/flow/Roles/Flow.Worker.Cloud.New/Jobs/AutomationProject/AutomationProjectApplicationProvisioningJob.cs"
+$line1112Candidate.candidates[0].line = 1112
+$line1112Parsed = ConvertTo-TestMarker -Marker $line1112Candidate -Nonce "nonce-1"
+$line1112Result = Resolve-ReviewerConventionSpecialistCandidates -Marker $line1112Parsed `
+    -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
+    -ChangeEntries $line1112Changes -Constructs @() -RightHandRangesByPath $line1112Ranges
+Assert-Specialist (@($line1112Result.Candidates).Count -eq 1 -and
+    [int]$line1112Result.Candidates[0].line -eq 1112 -and
+    [string]$line1112Result.Candidates[0].changedCodeFix.targets -ceq "cf0") `
+    "The localization stress fixture could not represent exact line 1112 as cf0 without inventing a construct."
 
 $metadata = Copy-SpecialistObject $markerObject
 $metadata.candidates[0].anchorKind = "prMetadata"

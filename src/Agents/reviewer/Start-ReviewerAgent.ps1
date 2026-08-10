@@ -2655,8 +2655,10 @@ if ($EffectiveEnableVerificationPreview) {
     }
     $EffectiveConventionVerifierModel = Assert-AgentSupportedModel `
         -ModelId $selectedConventionVerifierModel -Where "convention verifier model"
-    if ($EffectiveConventionVerifierModel -ceq $EffectiveConventionSpecialistModel) {
-        throw "The convention verifier model must differ from the convention-specialist discovery model."
+    if (@($ReviewPassModels | Where-Object {
+                $_ -ceq $EffectiveConventionSpecialistModel
+            }).Count -gt 0) {
+        throw "The convention-specialist discovery model must differ from both generalist cross-check models."
     }
     Test-AgentAllowToolCeiling -Candidates $script:ReviewerVerificationAllowToolCeiling `
         -Ceiling $script:ReviewerAllowToolCeiling -MandatoryDeny $script:ReviewerMandatoryDenyTools `
@@ -9324,6 +9326,7 @@ function Write-ReviewerVerificationDecisionPreview {
         # is not eligible, and a decision record carries no comment, anchor or
         # evidence to render.
         [object[]]$AllCandidates = @(),
+        $ReconciliationManifest = $null,
         [object[]]$InputArtifactHashes = @(),
         [ValidateRange(0, [int]::MaxValue)][int]$TotalCandidateCount = 0,
         [AllowEmptyString()][string]$ReplaySha256 = ""
@@ -9419,6 +9422,7 @@ function Write-ReviewerVerificationDecisionPreview {
         decisions = @($Decisions)
         withheld = @($Withheld)
         eligiblePreviewCandidates = @($Eligible)
+        reconciliationManifest = $ReconciliationManifest
         replaySha256 = $ReplaySha256
         markdownPath = $markdownPath
         markdownSha256 = Get-ReviewerVerificationSha256 -Text $markdown
@@ -9611,10 +9615,15 @@ function Get-ReviewerVerificationSourceHunks {
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Candidates,
         [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$ChangedPaths
     )
-    $changed = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $changed = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
     foreach ($changedPath in @($ChangedPaths)) {
-        $normalized = (ConvertTo-ReviewerVerificationPath -Path ([string]$changedPath)).TrimStart("/")
-        if ($normalized) { [void]$changed.Add($normalized) }
+        $normalized = ConvertTo-ReviewerVerificationPath -Path ([string]$changedPath)
+        $readPath = ConvertTo-ReviewerVerificationReadPath -Path ([string]$changedPath)
+        if (-not $normalized -or -not $readPath) { continue }
+        if ($changed.ContainsKey($normalized) -and $changed[$normalized] -cne $readPath) {
+            throw "Pinned change set contains ambiguous path identity '$normalized'."
+        }
+        $changed[$normalized] = $readPath
     }
     return Invoke-ReviewerConventionSession -AgencyPath $AgencyPath -Action {
         param([hashtable]$verificationSession)
@@ -9625,15 +9634,11 @@ function Get-ReviewerVerificationSourceHunks {
                 -not [string]$candidate.filePath -or [int]$candidate.line -lt 1) {
                 continue
             }
-            $normalizedPath = (ConvertTo-ReviewerVerificationPath -Path (
-                    [string]$candidate.filePath)).TrimStart("/")
-            $path = ConvertTo-ReviewerVerificationReadPath -Path ([string]$candidate.filePath)
-            $segments = @($normalizedPath -split '/')
-            if (-not $changed.Contains($normalizedPath) -or
-                $normalizedPath -notmatch '^[a-z0-9._ /-]+$' -or
-                @($segments | Where-Object { $_ -eq "" -or $_ -eq "." -or $_ -eq ".." }).Count -gt 0) {
+            $normalizedPath = ConvertTo-ReviewerVerificationPath -Path ([string]$candidate.filePath)
+            if (-not $normalizedPath -or -not $changed.ContainsKey($normalizedPath)) {
                 continue
             }
+            $path = $changed[$normalizedPath]
             try {
                 if (-not $fileCache.ContainsKey($normalizedPath)) {
                     $fileCache[$normalizedPath] = Get-ReviewerFactSourceFile -Session $verificationSession `
@@ -9880,6 +9885,7 @@ function Invoke-ReviewerCrossVerificationPass {
         evidenceHunks = @($evidenceHunks)
         changedEntries = @($changeEntries)
         changedPaths = @($Bound.ChangedPaths)
+        crossCheckModels = @($ReviewPassModels | Sort-Object)
         threadFacts = @($threadFacts)
         candidateEvidenceOptions = $candidateEvidenceOptions.ToArray()
         candidates = @($candidates)
@@ -9907,6 +9913,7 @@ function Invoke-ReviewerCrossVerificationPass {
         evidenceHunks = $inputBody.evidenceHunks
         changedEntries = $inputBody.changedEntries
         changedPaths = $inputBody.changedPaths
+        crossCheckModels = $inputBody.crossCheckModels
         threadFacts = $inputBody.threadFacts
         candidateEvidenceOptions = $inputBody.candidateEvidenceOptions
         candidates = $inputBody.candidates
@@ -10052,12 +10059,22 @@ function Invoke-ReviewerCrossVerificationPass {
     else {
         "degraded"
     }
+    $reconciliationManifest = $null
+    if ($specialistManifest) {
+        $reconciliationManifest = $specialistManifest | ConvertTo-Json -Depth 32 | ConvertFrom-Json -Depth 32
+        $reconciliationManifest.candidates = @(
+            Get-ReviewerVerificationAcceptedConventionCandidates `
+                -ConventionCandidates @(Get-ReviewerVerificationValue $specialistManifest "candidates" @()) `
+                -Decisions @($replay.decisions) -Clusters $clusters)
+        if ($status -cne "complete") { $reconciliationManifest.status = "degraded" }
+    }
     $preview = Write-ReviewerVerificationDecisionPreview -PrId $prId -SourceCommit $sourceCommit `
         -Status $status -Diagnostic "" -InputArtifactPath $inputArtifactPath `
         -InputManifestSha256 $inputManifestSha -Clusters $clusters -Assignments $assignments `
         -VerifierRuns $runRecords.ToArray() -Decisions @($replay.decisions) `
         -Withheld @($replay.withheld) -Eligible @($replay.eligible) `
         -AllCandidates @($candidatePlan.candidates) `
+        -ReconciliationManifest $reconciliationManifest `
         -InputArtifactHashes $inputHashes.ToArray() `
         -TotalCandidateCount ([int]$candidatePlan.totalCandidateCount) `
         -ReplaySha256 ([string]$replay.replaySha256)

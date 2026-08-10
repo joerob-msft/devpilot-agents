@@ -354,12 +354,18 @@
                   "properties": {
                     "path": { "type": "string", "minLength": 1 },
                     "line": { "type": "integer", "minimum": 1 },
-                    "constructs": { "type": "array", "minItems": 1 }
+                    "constructs": {
+                      "description": "Lexical constructs covering the anchor. Empty only when the exact line is bound by a sealed changed-file RawSpan.",
+                      "type": "array"
+                    }
                   }
                 },
                 "evidence": {
                   "properties": {
-                    "violations": { "type": "array", "minItems": 1 }
+                    "violations": {
+                      "description": "Lexical violation constructs. Empty only for a convention-backed changed-file anchor inside a sealed RawSpan.",
+                      "type": "array"
+                    }
                   }
                 }
               }

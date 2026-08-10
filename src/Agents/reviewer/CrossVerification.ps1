@@ -343,23 +343,18 @@ function ConvertTo-ReviewerVerificationNormalizedText {
 
 function ConvertTo-ReviewerVerificationPath {
     param([AllowEmptyString()][string]$Path = "")
-    if (Get-Command ConvertTo-ReviewerConventionSpecialistCanonicalPath -ErrorAction SilentlyContinue) {
-        return ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path $Path
+    if (-not (Get-Command ConvertTo-ReviewerSourceIdentityPath -ErrorAction SilentlyContinue)) {
+        throw "Cross-verification path validation requires SourceTransport.ps1."
     }
-    $value = $Path.Trim().Replace('\', '/').Normalize([Text.NormalizationForm]::FormKC)
-    if (-not $value) { return "" }
-    if ($value.StartsWith("./", [StringComparison]::Ordinal)) { $value = $value.Substring(2) }
-    if (-not $value.StartsWith("/", [StringComparison]::Ordinal)) { $value = "/$value" }
-    return $value.TrimEnd('/').ToLowerInvariant()
+    return ConvertTo-ReviewerSourceIdentityPath -Path $Path
 }
 
 function ConvertTo-ReviewerVerificationReadPath {
     param([AllowEmptyString()][string]$Path = "")
-    $value = $Path.Trim().Replace('\', '/')
-    if ($value.StartsWith("./", [StringComparison]::Ordinal)) {
-        $value = $value.Substring(2)
+    if (-not (Get-Command ConvertTo-ReviewerSourcePath -ErrorAction SilentlyContinue)) {
+        throw "Cross-verification source reads require SourceTransport.ps1."
     }
-    return $value.TrimStart("/")
+    return ConvertTo-ReviewerSourcePath -Path $Path
 }
 
 function Get-ReviewerVerificationTokens {
@@ -442,7 +437,8 @@ function New-ReviewerVerificationCandidate {
         [string]$OriginCandidateId = ""
     )
     $severity = [string](Get-ReviewerVerificationValue $RawCandidate "severity" "suggestion")
-    $filePath = [string](Get-ReviewerVerificationValue $RawCandidate "filePath" "")
+    $filePath = ConvertTo-ReviewerVerificationPath -Path (
+        [string](Get-ReviewerVerificationValue $RawCandidate "filePath" ""))
     $line = [int](Get-ReviewerVerificationValue $RawCandidate "line" 0)
     $anchorKind = [string](Get-ReviewerVerificationValue $RawCandidate "anchorKind" "")
     if (-not $anchorKind) { $anchorKind = $(if ($filePath) { "changedFile" } else { "prMetadata" }) }
@@ -785,6 +781,101 @@ function Get-ReviewerVerificationClusters {
     return $clusters.ToArray()
 }
 
+function Get-ReviewerVerificationAcceptedConventionCandidateDecisions {
+    param(
+        [AllowEmptyCollection()][object[]]$Decisions = @(),
+        [AllowEmptyCollection()][object[]]$Clusters = @()
+    )
+    $acceptedCandidates = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($decision in @($Decisions)) {
+        $candidateId = [string](Get-ReviewerVerificationValue $decision "candidateId" "")
+        if (-not $candidateId) { continue }
+        if ($acceptedCandidates.ContainsKey($candidateId)) {
+            throw "Verification decisions contain duplicate candidate id '$candidateId'."
+        }
+        $acceptedCandidates.Add($candidateId, $decision)
+    }
+    $result = [System.Collections.Generic.List[object]]::new()
+    $seenOriginIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($cluster in @($Clusters)) {
+        foreach ($member in @(Get-ReviewerVerificationValue $cluster "members" @())) {
+            $candidateId = [string](Get-ReviewerVerificationValue $member "candidateId" "")
+            if (-not $acceptedCandidates.ContainsKey($candidateId)) { continue }
+            if ([string](Get-ReviewerVerificationValue $member "originKind" "") -cne "convention") {
+                continue
+            }
+            $originCandidateId = [string](Get-ReviewerVerificationValue $member "originCandidateId" "")
+            if (-not $originCandidateId -or -not $seenOriginIds.Add($originCandidateId)) { continue }
+            $decision = $acceptedCandidates[$candidateId]
+            [void]$result.Add([pscustomobject][ordered]@{
+                    originCandidateId = $originCandidateId
+                    candidateId = $candidateId
+                    correctedSeverity = [string](Get-ReviewerVerificationValue $decision "correctedSeverity" "")
+                    existingDebtFollowUpRetained = [bool](Get-ReviewerVerificationValue `
+                        $decision "existingDebtFollowUpRetained" $false)
+                })
+        }
+    }
+    $result.Sort([System.Comparison[object]] {
+            param($left, $right)
+            return [StringComparer]::Ordinal.Compare(
+                [string]$left.originCandidateId, [string]$right.originCandidateId)
+        })
+    return $result.ToArray()
+}
+
+function Get-ReviewerVerificationAcceptedConventionCandidates {
+    param(
+        [AllowEmptyCollection()][object[]]$ConventionCandidates = @(),
+        [AllowEmptyCollection()][object[]]$Decisions = @(),
+        [AllowEmptyCollection()][object[]]$Clusters = @()
+    )
+    $candidateMap = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($candidate in @($ConventionCandidates)) {
+        $candidateId = [string](Get-ReviewerVerificationValue $candidate "candidateId" "")
+        if (-not $candidateId -or $candidateMap.ContainsKey($candidateId)) {
+            throw "Convention candidate set contains a missing or duplicate candidate id."
+        }
+        $candidateMap.Add($candidateId, $candidate)
+    }
+    $result = [System.Collections.Generic.List[object]]::new()
+    foreach ($accepted in @(Get-ReviewerVerificationAcceptedConventionCandidateDecisions `
+            -Decisions $Decisions -Clusters $Clusters)) {
+        $originCandidateId = [string]$accepted.originCandidateId
+        if (-not $candidateMap.ContainsKey($originCandidateId)) {
+            throw "Accepted convention decision references unknown origin candidate '$originCandidateId'."
+        }
+        $candidate = $candidateMap[$originCandidateId] |
+            ConvertTo-Json -Depth 32 | ConvertFrom-Json -Depth 32
+        if ([string]$accepted.correctedSeverity -cne "none") {
+            $candidate.severity = [string]$accepted.correctedSeverity
+        }
+        $debt = Get-ReviewerVerificationValue $candidate "existingDebtFollowUp" $null
+        if ([string](Get-ReviewerVerificationValue $debt "status" "") -ceq "required" -and
+            -not [bool]$accepted.existingDebtFollowUpRetained) {
+            $candidate.existingDebtFollowUp = [pscustomobject][ordered]@{
+                status = "none"; evidenceFactId = ""; selectorKey = ""; scopeKind = ""; scopePath = ""
+                comparableCount = 0; compliantCount = 0; action = ""
+            }
+        }
+        [void]$result.Add($candidate)
+    }
+    return $result.ToArray()
+}
+
+function Get-ReviewerVerificationAcceptedConventionCandidateIds {
+    param(
+        [AllowEmptyCollection()][object[]]$Decisions = @(),
+        [AllowEmptyCollection()][object[]]$Clusters = @()
+    )
+    $candidateIds = [System.Collections.Generic.List[string]]::new()
+    foreach ($accepted in @(Get-ReviewerVerificationAcceptedConventionCandidateDecisions `
+            -Decisions $Decisions -Clusters $Clusters)) {
+        [void]$candidateIds.Add([string]$accepted.originCandidateId)
+    }
+    return $candidateIds.ToArray()
+}
+
 function Get-ReviewerVerificationThreadFacts {
     param($FactPlan)
     $records = [System.Collections.Generic.List[object]]::new()
@@ -882,7 +973,19 @@ function Get-ReviewerVerificationAssignments {
         [AllowEmptyString()][string]$ConventionVerifierModel = "",
         [string[]]$ChangedPaths = @()
     )
-    $models = @($GeneralistModels)
+    $modelSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $models = [System.Collections.Generic.List[string]]::new()
+    foreach ($model in @($GeneralistModels)) {
+        if ([string]::IsNullOrWhiteSpace([string]$model)) { continue }
+        if ($modelSet.Add([string]$model)) { [void]$models.Add([string]$model) }
+    }
+    if ($models.Count -ne 2) {
+        throw "Cross-verification requires exactly two distinct configured generalist models."
+    }
+    $models.Sort([StringComparer]::Ordinal)
+    if ($ConventionVerifierModel -and -not $modelSet.Contains($ConventionVerifierModel)) {
+        throw "The compatibility convention verifier model must name one of the two generalist cross-check models."
+    }
     $changed = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($path in @($ChangedPaths)) {
         $normalized = ConvertTo-ReviewerVerificationPath -Path ([string]$path)
@@ -896,6 +999,9 @@ function Get-ReviewerVerificationAssignments {
         foreach ($candidate in @(Get-ReviewerVerificationValue $cluster "members" @())) {
             $originKind = [string](Get-ReviewerVerificationValue $candidate "originKind" "")
             $originModel = [string](Get-ReviewerVerificationValue $candidate "originModel" "")
+            if ($originKind -ceq "convention" -and $modelSet.Contains($originModel)) {
+                throw "The convention-specialist discovery model cannot be a generalist cross-check model."
+            }
             if ($changed.Count -gt 0 -and [string]$candidate.anchorKind -ceq "changedFile") {
                 $candidatePath = ConvertTo-ReviewerVerificationPath -Path ([string]$candidate.filePath)
                 if (-not $candidatePath -or [int]$candidate.line -lt 1 -or
@@ -903,25 +1009,7 @@ function Get-ReviewerVerificationAssignments {
                     continue
                 }
             }
-            $targets = [System.Collections.Generic.List[string]]::new()
-            if ($originKind -ceq "convention") {
-                if ($ConventionVerifierModel -and -not [string]::Equals(
-                        $ConventionVerifierModel, $originModel, [StringComparison]::Ordinal)) {
-                    [void]$targets.Add($ConventionVerifierModel)
-                }
-            }
-            else {
-                foreach ($model in $models) {
-                    if (-not [string]::Equals($model, $originModel, [StringComparison]::Ordinal)) {
-                        [void]$targets.Add($model)
-                    }
-                }
-            }
-            foreach ($target in $targets) {
-                if ($originKind -ceq "generalist" -and $models.Count -eq 1 -and
-                    [string]::Equals($target, $originModel, [StringComparison]::Ordinal)) {
-                    throw "A sole-origin generalist candidate cannot be assigned to its own model."
-                }
+            foreach ($target in $models) {
                 [void]$assignments.Add([pscustomobject][ordered]@{
                         assignmentId = "va1:" + (Get-ReviewerVerificationObjectSha256 -Value @(
                                 [string](Get-ReviewerVerificationValue $cluster "clusterId" ""),
@@ -1444,7 +1532,8 @@ function Resolve-ReviewerVerificationDecisions {
         [object[]]$EvidenceHunks = @(),
         [object[]]$PreVerificationWithheld = @(),
         [ValidateRange(0.0, 1.0)][double]$ExistingThreadJaccard = $script:ReviewerVerificationExistingThreadJaccard,
-        [bool]$SpecialistDegraded = $false
+        [bool]$SpecialistDegraded = $false,
+        [string[]]$RequiredVerifierModels = @()
     )
     $eligible = [System.Collections.Generic.List[object]]::new()
     $withheld = [System.Collections.Generic.List[object]]::new()
@@ -1543,6 +1632,22 @@ function Resolve-ReviewerVerificationDecisions {
             else {
                 @()
             })
+            if (@($RequiredVerifierModels).Count -gt 0) {
+                $expectedModels = @(@($RequiredVerifierModels) | Sort-Object -Unique)
+                $actualModels = @($candidateAssignments | ForEach-Object {
+                        [string](Get-ReviewerVerificationValue $_ "verifierModel" "")
+                    } | Sort-Object -Unique)
+                if ($expectedModels.Count -ne 2 -or $actualModels.Count -ne 2 -or
+                    ($expectedModels -join "`n") -cne ($actualModels -join "`n") -or
+                    $candidateAssignments.Count -ne 2) {
+                    [void]$withheld.Add([pscustomobject][ordered]@{
+                            candidateId = $candidateId; clusterId = $clusterId
+                            reason = "incompleteVerifier"
+                            detail = "The candidate did not receive exactly one fresh cross-check from each required generalist model."
+                        })
+                    continue
+                }
+            }
             if ($candidateAssignments.Count -eq 0) {
                 [void]$withheld.Add([pscustomobject][ordered]@{
                         candidateId = $candidateId; clusterId = $clusterId
@@ -1927,6 +2032,7 @@ function Resolve-ReviewerVerificationDecisions {
                 candidateId = [string]$winner.candidate.candidateId
                 candidateHash = [string]$winner.candidate.candidateHash
                 originKind = [string]$winner.candidate.originKind
+                originCandidateId = [string]$winner.candidate.originCandidateId
                 origins = @((Get-ReviewerVerificationValue $cluster "origins" @()))
                 severity = $finalSeverity
                 filePath = [string]$winner.candidate.filePath
@@ -2039,6 +2145,7 @@ function Invoke-ReviewerVerificationReplay {
         -MaxCandidates $maxCandidates -MaxClusterSize $maxClusterSize `
         -NearExactJaccard $nearExactJaccard -SemanticJaccard $semanticJaccard)
     $assignments = @((Get-ReviewerVerificationValue $InputManifest "assignments" @()))
+    $crossCheckModels = @((Get-ReviewerVerificationValue $InputManifest "crossCheckModels" @()))
     $threads = @((Get-ReviewerVerificationValue $InputManifest "threadFacts" @()))
     $changedPaths = @((Get-ReviewerVerificationValue $InputManifest "changedPaths" @()))
     $factPlan = Get-ReviewerVerificationValue $InputManifest "factPlan"
@@ -2058,7 +2165,8 @@ function Invoke-ReviewerVerificationReplay {
         -FactPlan $factPlan -ResolvedSources $resolvedSources `
         -EvidenceHunks $evidenceHunks -PreVerificationWithheld $preVerificationWithheld `
         -ExistingThreadJaccard $existingThreadJaccard `
-        -SpecialistDegraded ($specialistStatus -cne "complete")
+        -SpecialistDegraded ($specialistStatus -cne "complete") `
+        -RequiredVerifierModels $crossCheckModels
     return [pscustomobject][ordered]@{
         clusters = $clusters
         assignments = $assignments
