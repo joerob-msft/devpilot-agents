@@ -104,6 +104,31 @@ are opt-in with `-EnableThreadReplies`, bound to the exact human comment ID,
 previewed and sealed with the rest of the review, and re-checked immediately
 before the wrapper posts them.
 
+### Repository review skills
+
+A consumer can delegate review analysis to repository-owned skills without
+granting the model any additional tools:
+
+```json
+"reviewSkills": {
+  "primary": ".github/skills/code-reviewer/SKILL.md",
+  "security": ".github/skills/sdl-security-review/SKILL.md",
+  "securityMode": "auto"
+}
+```
+
+Both paths must be repository-relative Markdown files under `.github/skills`.
+The primary skill supplies the repository's review process and linked reference
+material. Security mode is `off`, `auto`, or `always`; `auto` applies the
+security skill only to security-sensitive changes.
+
+Skill guidance is subordinate to the reviewer's fixed cycle contract. The model
+may read and apply analysis guidance, but it still cannot ask an interactive
+question, run shell commands, edit files, post comments, or vote. The V2 result
+marker carries bounded detailed sections such as scope, verified strengths,
+rollout risk, validation, SDL results, and recommendation rationale. The trusted
+wrapper renders those sections as deterministic Markdown and owns every write.
+
 What that does and does not buy you, stated precisely:
 
 - a successful prompt injection **cannot reach the host or the repository**:
@@ -197,9 +222,11 @@ Other properties worth knowing:
   finding that failed the first time would never be mentioned again. The plan is
   written to state *before* the first ADO call, so a crash mid-delivery leaves a
   retryable plan rather than an invisible partial review.
-- **The summary describes the review, not the delivery.** Its body quotes what
-  was found and how much of it is *eligible* to post - never how much actually
-  posted, and never a claim that anything was published. That is both honest
+- **The summary describes the review, not the delivery.** Its bounded,
+  structured sections record the applied review guidance, verified behavior,
+  rollout and validation analysis, security assessment, and recommendation.
+  The body also quotes how much of the review is *eligible* to post - never how
+  much actually posted, and never a claim that anything was published. That is both honest
   (what lands depends on which write switches the run carried and on whether
   each thread write confirmed) and retry-stable, so fingerprint dedupe against
   the PR's own threads collapses a re-post instead of adding a second,
