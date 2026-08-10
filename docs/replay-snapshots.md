@@ -205,9 +205,12 @@ content. `tools/Test-ReplaySnapshot.ps1` drives it.
 An offline qualification running from an app-created worktree should preflight
 the reviewer build with `tools/Assert-ReviewerQualificationPreflight.ps1`.
 `OfflineReplay` requires a clean worktree, exact expected `HEAD`, and the
-required accepted ref resolving to that same commit; it deliberately does not
-require the generated local branch name to equal the accepted ref.
-`LiveDeployment` additionally requires the configured branch name.
+required accepted full ref (for example, `refs/heads/reviewer-layer`) resolving
+to that same commit. It deliberately does not require the generated local
+branch name to equal the accepted ref and may run from detached `HEAD` when all
+other identity checks pass. `LiveDeployment` additionally requires an attached
+`HEAD` on the configured branch. Git stderr is retained only for sanitized
+failure diagnostics and is never interpreted as identity or dirty-status data.
 
 ```pwsh
 ./src/Agents/reviewer/Start-ReviewerAgent.ps1 `

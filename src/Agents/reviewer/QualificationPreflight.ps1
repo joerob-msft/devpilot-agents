@@ -2,16 +2,117 @@
 
 Set-StrictMode -Version Latest
 
+function ConvertTo-ReviewerQualificationDiagnostic {
+    param([AllowEmptyString()][string]$Value)
+
+    $sanitized = [regex]::Replace($Value, '[\x00-\x1f\x7f]+', ' ')
+    $sanitized = [regex]::Replace($sanitized, '\s+', ' ').Trim()
+    if ($sanitized.Length -gt 2048) {
+        $sanitized = $sanitized.Substring(0, 2048) + "..."
+    }
+    if (-not $sanitized) { return "<no stderr>" }
+    return $sanitized
+}
+
 function Invoke-ReviewerQualificationGit {
     param(
         [Parameter(Mandatory)][string]$RepositoryPath,
         [Parameter(Mandatory)][string[]]$Arguments
     )
-    $output = @(& git -C $RepositoryPath @Arguments 2>&1)
-    if ($LASTEXITCODE -ne 0) {
-        throw "git $($Arguments -join ' ') failed: $($output -join [Environment]::NewLine)"
+
+    $gitCommand = Get-Command -Name git -CommandType Application -ErrorAction Stop |
+        Select-Object -First 1
+    $stdoutFile = [IO.Path]::GetTempFileName()
+    $stderrFile = [IO.Path]::GetTempFileName()
+    try {
+        & $gitCommand.Source -C $RepositoryPath @Arguments 1> $stdoutFile 2> $stderrFile
+        $exitCode = $LASTEXITCODE
+        $stdout = [IO.File]::ReadAllText($stdoutFile)
+        $stderr = [IO.File]::ReadAllText($stderrFile)
     }
-    return , [string[]]$output
+    finally {
+        Remove-Item -LiteralPath $stdoutFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $stderrFile -Force -ErrorAction SilentlyContinue
+    }
+    if ($exitCode -ne 0) {
+        $diagnostic = ConvertTo-ReviewerQualificationDiagnostic -Value $stderr
+        $command = ConvertTo-ReviewerQualificationDiagnostic -Value ($Arguments -join " ")
+        throw "git $command failed with exit code ${exitCode}: $diagnostic"
+    }
+    return [string[]]@($stdout -split '\r?\n' |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+}
+
+function Read-ReviewerQualificationSingleOutput {
+    param(
+        [AllowNull()][AllowEmptyCollection()][string[]]$Output,
+        [Parameter(Mandatory)][string]$Operation
+    )
+
+    $lines = @($Output | Where-Object { $null -ne $_ })
+    if ($lines.Count -ne 1) {
+        throw "Qualification $Operation expected exactly one nonempty stdout line; received $($lines.Count)."
+    }
+    return $lines[0]
+}
+
+function Read-ReviewerQualificationBranchOutput {
+    param([AllowNull()][AllowEmptyCollection()][string[]]$Output)
+
+    $lines = @($Output | Where-Object { $null -ne $_ })
+    if ($lines.Count -gt 1) {
+        throw "Qualification branch read expected at most one nonempty stdout line; received $($lines.Count)."
+    }
+    if ($lines.Count -eq 0) { return $null }
+    return $lines[0]
+}
+
+function Assert-ReviewerQualificationNoOutput {
+    param(
+        [AllowNull()][AllowEmptyCollection()][string[]]$Output,
+        [Parameter(Mandatory)][string]$Operation
+    )
+
+    $lines = @($Output | Where-Object { $null -ne $_ })
+    if ($lines.Count -ne 0) {
+        throw "Qualification $Operation expected no stdout; received $($lines.Count) nonempty line(s)."
+    }
+}
+
+function Get-ReviewerQualificationGitState {
+    param(
+        [Parameter(Mandatory)][string]$RepositoryPath,
+        [Parameter(Mandatory)][string]$RequiredRef
+    )
+
+    $headOutput = @(Invoke-ReviewerQualificationGit -RepositoryPath $RepositoryPath `
+            -Arguments @("rev-parse", "--verify", "HEAD"))
+    $head = Read-ReviewerQualificationSingleOutput -Output $headOutput -Operation "HEAD read"
+    if ($head -notmatch '^[0-9a-fA-F]{40}$') {
+        throw "Qualification HEAD read returned an invalid object ID."
+    }
+
+    $refOutput = @(Invoke-ReviewerQualificationGit -RepositoryPath $RepositoryPath `
+            -Arguments @("rev-parse", "--verify", "--end-of-options", "$RequiredRef^{commit}"))
+    $resolvedRef = Read-ReviewerQualificationSingleOutput -Output $refOutput `
+        -Operation "required-ref read"
+    if ($resolvedRef -notmatch '^[0-9a-fA-F]{40}$') {
+        throw "Qualification required-ref read returned an invalid object ID."
+    }
+
+    $dirty = @(Invoke-ReviewerQualificationGit -RepositoryPath $RepositoryPath `
+            -Arguments @("status", "--porcelain=v1", "--untracked-files=normal"))
+    $branchOutput = @(Invoke-ReviewerQualificationGit -RepositoryPath $RepositoryPath `
+            -Arguments @("branch", "--show-current"))
+    $branch = Read-ReviewerQualificationBranchOutput -Output $branchOutput
+
+    return [pscustomobject][ordered]@{
+        head = $head.ToLowerInvariant()
+        requiredRefCommit = $resolvedRef.ToLowerInvariant()
+        dirty = [string[]]$dirty
+        branch = $branch
+    }
 }
 
 function Test-ReviewerQualificationGitIdentity {
@@ -31,41 +132,60 @@ function Test-ReviewerQualificationGitIdentity {
     if (-not (Test-Path -LiteralPath $RepositoryPath -PathType Container)) {
         throw "Qualification repository '$RepositoryPath' does not exist."
     }
-    $headOutput = Invoke-ReviewerQualificationGit -RepositoryPath $RepositoryPath `
-        -Arguments @("rev-parse", "--verify", "HEAD")
-    $head = ([string]$headOutput[0]).Trim().ToLowerInvariant()
-    if ($head -cne $ExpectedCommit) {
-        throw "Qualification HEAD '$head' does not match expected commit '$ExpectedCommit'."
+    if (-not $RequiredRef.StartsWith("refs/", [StringComparison]::Ordinal)) {
+        throw "Qualification required ref '$RequiredRef' must be an unambiguous full ref name under refs/."
     }
-    $refOutput = Invoke-ReviewerQualificationGit -RepositoryPath $RepositoryPath `
-        -Arguments @("rev-parse", "--verify", "$RequiredRef^{commit}")
-    $resolvedRef = ([string]$refOutput[0]).Trim().ToLowerInvariant()
-    if ($resolvedRef -cne $ExpectedCommit) {
-        throw "Qualification ref '$RequiredRef' resolves to '$resolvedRef', not expected commit '$ExpectedCommit'."
+    try {
+        $refFormatOutput = @(Invoke-ReviewerQualificationGit -RepositoryPath $RepositoryPath `
+                -Arguments @("check-ref-format", $RequiredRef))
+        Assert-ReviewerQualificationNoOutput -Output $refFormatOutput `
+            -Operation "required-ref syntax check"
     }
-    $dirty = @((Invoke-ReviewerQualificationGit -RepositoryPath $RepositoryPath `
-                -Arguments @("status", "--porcelain=v1", "--untracked-files=normal")) |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    if ($dirty.Count -ne 0) {
+    catch {
+        $diagnostic = ConvertTo-ReviewerQualificationDiagnostic -Value $_.Exception.Message
+        throw "Qualification required ref '$RequiredRef' is invalid: $diagnostic"
+    }
+
+    $initial = Get-ReviewerQualificationGitState -RepositoryPath $RepositoryPath `
+        -RequiredRef $RequiredRef
+    if ($initial.head -cne $ExpectedCommit) {
+        throw "Qualification HEAD '$($initial.head)' does not match expected commit '$ExpectedCommit'."
+    }
+    if ($initial.requiredRefCommit -cne $ExpectedCommit) {
+        throw "Qualification ref '$RequiredRef' resolves to '$($initial.requiredRefCommit)', not expected commit '$ExpectedCommit'."
+    }
+    if ($initial.dirty.Count -ne 0) {
         throw "Qualification worktree is dirty."
     }
-    $branchOutput = Invoke-ReviewerQualificationGit -RepositoryPath $RepositoryPath `
-        -Arguments @("branch", "--show-current")
-    $branch = ([string]$branchOutput[0]).Trim()
+    $detached = [string]::IsNullOrEmpty($initial.branch)
     if ($Mode -eq "LiveDeployment") {
+        if ($detached) {
+            throw "Live deployment qualification refuses detached HEAD."
+        }
         if (-not $ExpectedBranch) {
             throw "Live deployment qualification requires -ExpectedBranch."
         }
-        if ($branch -cne $ExpectedBranch) {
-            throw "Live deployment branch '$branch' does not match expected branch '$ExpectedBranch'."
+        if ($initial.branch -cne $ExpectedBranch) {
+            throw "Live deployment branch '$($initial.branch)' does not match expected branch '$ExpectedBranch'."
         }
     }
+
+    $final = Get-ReviewerQualificationGitState -RepositoryPath $RepositoryPath `
+        -RequiredRef $RequiredRef
+    if ($final.head -cne $initial.head -or
+        $final.requiredRefCommit -cne $initial.requiredRefCommit -or
+        ($final.dirty -join "`0") -cne ($initial.dirty -join "`0") -or
+        $final.branch -cne $initial.branch) {
+        throw "Qualification Git identity changed during preflight."
+    }
+
     return [pscustomobject][ordered]@{
         mode = $Mode
-        head = $head
+        head = $initial.head
         requiredRef = $RequiredRef
-        requiredRefCommit = $resolvedRef
-        currentBranch = $branch
+        requiredRefCommit = $initial.requiredRefCommit
+        branchState = if ($detached) { "detached" } else { "attached" }
+        currentBranch = if ($detached) { $null } else { $initial.branch }
         clean = $true
     }
 }
