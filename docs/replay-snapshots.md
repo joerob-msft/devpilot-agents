@@ -235,6 +235,12 @@ pinned. The snapshot's organization, project and repository must match the
 running configuration, or the run refuses rather than producing a
 self-consistent artifact stamped with the wrong identity.
 
+Long-running qualification slots must be launched through an attached sync/async
+shell whose completion notification is owned by the active session, or through an
+explicit scheduled/manual wake-up. A detached child process does not wake the
+session when it exits and must never be treated as an automatic resume mechanism.
+Status checks do not restart, resume, or replace an immutable attempted slot.
+
 `-DryRun` cannot be combined with replay: the self-checks run against their own
 fixtures and never open a session.
 

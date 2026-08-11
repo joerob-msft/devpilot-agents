@@ -8762,6 +8762,7 @@ function Write-ReviewerConventionSpecialistPreview {
         [void]$lines.Add(("- Changed constructs enumerated: {0}; row-construct pairs weighed against a rule: {1}; ruled out of the rule's reach: {2}" -f `
                 [int]$RuleCoverage.EnumeratedConstructCount, [int]$RuleCoverage.CheckedConstructCount,
             [int]$RuleCoverage.NotInReachConstructCount))
+        [void]$lines.Add("- Exact changed-file line targets weighed as violations: $([int]$RuleCoverage.CheckedChangedFileTargetCount)")
         if ([bool]$RuleCoverage.ConstructsIncomplete) {
             [void]$lines.Add("- The construct enumeration itself was incomplete, so this accounting does not cover the whole change set.")
         }
@@ -8819,6 +8820,11 @@ function Write-ReviewerConventionSpecialistPreview {
                 if ($ids.Count -gt 60) { $rendered += ", and $($ids.Count - 60) more" }
                 [void]$lines.Add("- Anchors $($verdict.Label) ($($ids.Count)): $rendered")
             }
+            $lineTargets = @(Get-ReviewerConventionSpecialistValue `
+                $row 'violatingChangedFileTargets' @())
+            if ($lineTargets.Count -gt 0) {
+                [void]$lines.Add("- Changed-file line targets violating ($($lineTargets.Count)): $($lineTargets -join ', ')")
+            }
             [void]$lines.Add("- Code evidence: $([string](Get-ReviewerConventionSpecialistValue $row 'codeEvidence' ''))")
             [void]$lines.Add("- Sibling: $([string](Get-ReviewerConventionSpecialistValue $row 'siblingStatus' '')) - $([string](Get-ReviewerConventionSpecialistValue $row 'siblingEvidence' ''))")
             $linked = [string](Get-ReviewerConventionSpecialistValue $row 'candidateId' '')
@@ -8864,6 +8870,7 @@ function Write-ReviewerConventionSpecialistPreview {
                     degradedRowCount = [int]$RuleCoverage.DegradedRowCount
                     enumeratedConstructCount = [int]$RuleCoverage.EnumeratedConstructCount
                     checkedConstructCount = [int]$RuleCoverage.CheckedConstructCount
+                    checkedChangedFileTargetCount = [int]$RuleCoverage.CheckedChangedFileTargetCount
                     notInReachConstructCount = [int]$RuleCoverage.NotInReachConstructCount
                     missing = @($RuleCoverage.Missing)
                     duplicates = @($RuleCoverage.Duplicates)
@@ -9643,7 +9650,8 @@ function Get-ReviewerVerificationSourceHunks {
         [Parameter(Mandatory)][string]$AgencyPath,
         [Parameter(Mandatory)][string]$SourceCommit,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Candidates,
-        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$ChangedPaths
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$ChangedPaths,
+        $SourceReport = $null
     )
     $changed = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
     foreach ($changedPath in @($ChangedPaths)) {
@@ -9654,6 +9662,16 @@ function Get-ReviewerVerificationSourceHunks {
             throw "Pinned change set contains ambiguous path identity '$normalized'."
         }
         $changed[$normalized] = $readPath
+    }
+    $sealedFiles = @{}
+    foreach ($file in @(Get-ReviewerVerificationValue $SourceReport "Files" @())) {
+        $normalized = ConvertTo-ReviewerVerificationPath -Path (
+            [string](Get-ReviewerVerificationValue $file "Path" ""))
+        if (-not $normalized -or $sealedFiles.ContainsKey($normalized)) {
+            if ($normalized) { throw "Sealed source report contains ambiguous path '$normalized'." }
+            continue
+        }
+        $sealedFiles[$normalized] = $file
     }
     return Invoke-ReviewerConventionSession -AgencyPath $AgencyPath -Action {
         param([hashtable]$verificationSession)
@@ -9669,6 +9687,49 @@ function Get-ReviewerVerificationSourceHunks {
                 continue
             }
             $path = $changed[$normalizedPath]
+            if ($sealedFiles.ContainsKey($normalizedPath)) {
+                $line = [int]$candidate.line
+                $matchingSlices = @((Get-ReviewerVerificationValue `
+                            $sealedFiles[$normalizedPath] "Slices" @()) | Where-Object {
+                        $line -ge [int](Get-ReviewerVerificationValue $_ "StartLine" 0) -and
+                        $line -le [int](Get-ReviewerVerificationValue $_ "EndLine" 0)
+                    })
+                if ($matchingSlices.Count -gt 1) {
+                    throw "Sealed source report contains overlapping slices for '$path' line $line."
+                }
+                if ($matchingSlices.Count -eq 1) {
+                    $slice = $matchingSlices[0]
+                    $sliceStart = [int](Get-ReviewerVerificationValue $slice "StartLine" 0)
+                    $sliceEnd = [int](Get-ReviewerVerificationValue $slice "EndLine" 0)
+                    $sliceLines = @(([string](Get-ReviewerVerificationValue `
+                                $slice "Text" "")).Replace("`r`n", "`n").Replace("`r", "`n") -split "`n")
+                    if ($sliceStart -lt 1 -or $sliceEnd -lt $sliceStart -or
+                        $sliceLines.Count -ne ($sliceEnd - $sliceStart + 1)) {
+                        throw "Sealed source report contains malformed slice line accounting for '$path'."
+                    }
+                    $start = [Math]::Max($sliceStart, $line - 3)
+                    $end = [Math]::Min($sliceEnd, $line + 3)
+                    $rendered = [System.Collections.Generic.List[string]]::new()
+                    for ($index = $start; $index -le $end; $index++) {
+                        [void]$rendered.Add((
+                                [Convert]::ToString($index, [Globalization.CultureInfo]::InvariantCulture) +
+                                ": " + [string]$sliceLines[$index - $sliceStart]))
+                    }
+                    $text = $rendered.ToArray() -join "`n"
+                    [void]$hunks.Add([pscustomobject][ordered]@{
+                            candidateId = [string]$candidate.candidateId
+                            filePath = [string]$candidate.filePath
+                            line = $line
+                            startLine = $start
+                            endLine = $end
+                            sourceCommit = $SourceCommit
+                            sourceKind = "sealedSourceSlice"
+                            text = $text
+                            sha256 = Get-ReviewerVerificationSha256 -Text $text
+                        })
+                    continue
+                }
+            }
             try {
                 if (-not $fileCache.ContainsKey($normalizedPath)) {
                     $fileCache[$normalizedPath] = Get-ReviewerFactSourceFile -Session $verificationSession `
@@ -9695,6 +9756,7 @@ function Get-ReviewerVerificationSourceHunks {
                         startLine = $start
                         endLine = $end
                         sourceCommit = $SourceCommit
+                        sourceKind = "commitPinnedFile"
                         text = $text
                         sha256 = Get-ReviewerVerificationSha256 -Text $text
                     })
@@ -9744,7 +9806,7 @@ function Invoke-ReviewerCrossVerificationPass {
             throw "Cross-verification source/change-set binding moved before verification."
         }
         $sources = @()
-        if ($SpecialistResult -and @($SpecialistResult.Candidates).Count -gt 0) {
+        if (@(Get-ReviewerVerificationValue $conventionPlan "selectedPacks" @()).Count -gt 0) {
             $sources = @(Get-ReviewerConventionSpecialistResolvedSources `
                     -Session $verificationSession -ConventionPlan $conventionPlan)
         }
@@ -9776,10 +9838,23 @@ function Invoke-ReviewerCrossVerificationPass {
                 sha256 = $markerSha
             })
     }
+    if ($rawPasses.Count -ne @($ReviewPassModels).Count -or
+        @($ReviewPassModels | Where-Object {
+                $expectedModel = [string]$_
+                @($rawPasses | Where-Object {
+                        [string]$_.model -ceq $expectedModel -and
+                        [string]$_.status -ceq "complete"
+                    }).Count -ne 1
+            }).Count -gt 0) {
+        throw "Cross-verification requires one completed blind generalist pass from every configured generalist model."
+    }
     $specialistStatus = [string](Get-ReviewerVerificationValue $SpecialistResult "Status" "degraded")
     $specialistCandidates = @((Get-ReviewerVerificationValue $SpecialistResult "Candidates" @()))
     $specialistManifest = Get-ReviewerVerificationValue $SpecialistResult "Manifest"
     $specialistArtifactPath = [string](Get-ReviewerVerificationValue $SpecialistResult "ArtifactPath" "")
+    if ($specialistStatus -cne "complete" -or $null -eq $specialistManifest) {
+        throw "Cross-verification requires a completed specialist blind pass with a sealed manifest."
+    }
     $specialistArtifactSha = if ($specialistArtifactPath -and
         (Test-Path -LiteralPath $specialistArtifactPath -PathType Leaf)) {
         (Get-FileHash -LiteralPath $specialistArtifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -9823,9 +9898,16 @@ function Invoke-ReviewerCrossVerificationPass {
                 marker = $(if ($_.markerJson) { [string]$_.markerJson | ConvertFrom-Json -Depth 32 } else { $null })
             }
         })
+    $changedFileAnchors = @(Get-ReviewerConventionSpecialistChangedFileIndex `
+        -ChangeEntries $changeEntries `
+        -RightHandRangesByPath $(if ($Bound.ContainsKey('ChangedFileRangesByPath')) {
+                $Bound['ChangedFileRangesByPath']
+            } else { @{} }))
     $candidatePlan = Get-ReviewerVerificationCandidatePlan -GeneralistPasses $normalizedPasses `
         -ConventionCandidates $specialistCandidates -ConventionModel $EffectiveConventionSpecialistModel `
         -ConventionArtifactSha256 $specialistArtifactSha `
+        -ConventionPlan $conventionPlan -ResolvedSources $resolvedSources `
+        -ChangedFileAnchors $changedFileAnchors `
         -MaxCandidates ([int]$EffectiveCrossVerificationPolicy.maxCandidates)
     $factPartition = Get-ReviewerVerificationCandidateFactPartition `
         -Candidates @($candidatePlan.candidates) -FactPlan $factPlan
@@ -9848,6 +9930,9 @@ function Invoke-ReviewerCrossVerificationPass {
     $assignments = @(Get-ReviewerVerificationAssignments -Clusters $clusters `
         -GeneralistModels $ReviewPassModels -ConventionVerifierModel $EffectiveConventionVerifierModel `
         -ChangedPaths @($Bound.ChangedPaths))
+    $assignmentCoverage = Assert-ReviewerVerificationAssignmentCoverage -Clusters $clusters `
+        -Assignments $assignments -RequiredVerifierModels $ReviewPassModels `
+        -MaxVerifierRuns ([int]$EffectiveCrossVerificationPolicy.maxVerifierRuns)
     $readyCandidateIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($cluster in @($clusters | Where-Object { [string]$_.status -ceq "ready" })) {
         foreach ($member in @($cluster.members)) { [void]$readyCandidateIds.Add([string]$member.candidateId) }
@@ -9856,7 +9941,11 @@ function Invoke-ReviewerCrossVerificationPass {
             $readyCandidateIds.Contains([string]$_.candidateId)
         })
     $evidenceHunks = @(Get-ReviewerVerificationSourceHunks -AgencyPath $AgencyPath `
-        -SourceCommit $sourceCommit -Candidates $verifiableCandidates -ChangedPaths @($Bound.ChangedPaths))
+        -SourceCommit $sourceCommit -Candidates $verifiableCandidates `
+        -ChangedPaths @($Bound.ChangedPaths) `
+        -SourceReport $(if ($Bound.ContainsKey('SourceTransportReport')) {
+                $Bound['SourceTransportReport']
+            } else { $null }))
     $threadFacts = @(Get-ReviewerVerificationThreadFacts -FactPlan $factPlan)
     $candidateEvidenceOptions = [System.Collections.Generic.List[object]]::new()
     foreach ($candidate in $verifiableCandidates) {
@@ -9918,6 +10007,7 @@ function Invoke-ReviewerCrossVerificationPass {
         crossCheckModels = @($ReviewPassModels | Sort-Object)
         threadFacts = @($threadFacts)
         candidateEvidenceOptions = $candidateEvidenceOptions.ToArray()
+        assignmentCoverage = $assignmentCoverage
         candidates = @($candidates)
         totalCandidateCount = [int]$candidatePlan.totalCandidateCount
         preVerificationWithheld = @($preVerificationWithheld)
@@ -9946,6 +10036,7 @@ function Invoke-ReviewerCrossVerificationPass {
         crossCheckModels = $inputBody.crossCheckModels
         threadFacts = $inputBody.threadFacts
         candidateEvidenceOptions = $inputBody.candidateEvidenceOptions
+        assignmentCoverage = $inputBody.assignmentCoverage
         candidates = $inputBody.candidates
         totalCandidateCount = $inputBody.totalCandidateCount
         preVerificationWithheld = $inputBody.preVerificationWithheld
@@ -10093,9 +10184,8 @@ function Invoke-ReviewerCrossVerificationPass {
     if ($specialistManifest) {
         $reconciliationManifest = Copy-ReviewerVerificationJsonValue -Value $specialistManifest
         $reconciliationManifest.candidates = @(
-            Get-ReviewerVerificationAcceptedConventionCandidates `
-                -ConventionCandidates @(Get-ReviewerVerificationValue $specialistManifest "candidates" @()) `
-                -Decisions @($replay.decisions) -Clusters $clusters)
+            Get-ReviewerVerificationAcceptedReconciliationCandidates `
+                -Eligible @($replay.eligible) -Decisions @($replay.decisions) -Clusters $clusters)
         if ($status -cne "complete") { $reconciliationManifest.status = "degraded" }
     }
     $preview = Write-ReviewerVerificationDecisionPreview -PrId $prId -SourceCommit $sourceCommit `
@@ -13530,6 +13620,7 @@ function Invoke-ReviewerCycle {
                     DigestText           = $digest.Text
                     ChangedPaths         = $changedPaths
                     PinnedSourceText     = $pinnedSourceText
+                    SourceTransportReport = $sourceTransport.Report
                     SourceCoverage       = $sourceCoverageRecord
                     # The constructs the change set touched, enumerated from the
                     # slices that were actually delivered. Carried on the bound

@@ -10,7 +10,7 @@ $script:ReviewerVerificationMaxCandidates = 64
 $script:ReviewerVerificationMaxClusterSize = 8
 $script:ReviewerVerificationMaxInputBytes = 524288
 $script:ReviewerVerificationMaxArtifactBytes = 2097152
-$script:ReviewerVerificationMaxVerifierRuns = 12
+$script:ReviewerVerificationMaxVerifierRuns = 128
 $script:ReviewerVerificationMaxPhaseSeconds = 3600
 $script:ReviewerVerificationNearExactJaccard = 0.70
 $script:ReviewerVerificationSemanticJaccard = 0.55
@@ -483,13 +483,204 @@ function Get-ReviewerVerificationSimilarity {
     return ([double]$intersection / [double]$union)
 }
 
+function Get-ReviewerVerificationChangedFileAnchor {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$FilePath,
+        [Parameter(Mandatory)][int]$Line,
+        [AllowEmptyCollection()][object[]]$ChangedFileAnchors = @()
+    )
+    $path = ConvertTo-ReviewerVerificationPath -Path $FilePath
+    if (-not $path -or $Line -lt 1) { return $null }
+    $anchorMatches = [System.Collections.Generic.List[object]]::new()
+    foreach ($anchor in @($ChangedFileAnchors)) {
+        $anchorPath = ConvertTo-ReviewerVerificationPath -Path (
+            [string](Get-ReviewerVerificationValue $anchor "path" ""))
+        if ($anchorPath -cne $path) { continue }
+        foreach ($range in @(Get-ReviewerVerificationValue $anchor "rightHandRanges" @())) {
+            $startLine = [int](Get-ReviewerVerificationValue $range "startLine" 0)
+            $endLine = [int](Get-ReviewerVerificationValue $range "endLine" 0)
+            if ($Line -ge $startLine -and $Line -le $endLine) {
+                [void]$anchorMatches.Add($anchor)
+                break
+            }
+        }
+    }
+    if ($anchorMatches.Count -gt 1) {
+        throw "Changed-file anchor identity is ambiguous for '$path' line $Line."
+    }
+    if ($anchorMatches.Count -eq 0) { return $null }
+    $anchorId = [string](Get-ReviewerVerificationValue $anchorMatches[0] "anchorId" "")
+    if ($anchorId -cnotmatch '^cf[0-9]+$') {
+        throw "Changed-file anchor identity is malformed for '$path' line $Line."
+    }
+    return $anchorMatches[0]
+}
+
+function Get-ReviewerVerificationAuthoritativeRuleQuote {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Section,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$SourceText
+    )
+    $normalized = $SourceText.Replace("`r`n", "`n").Replace("`r", "`n")
+    if (-not $Section -or
+        $normalized.IndexOf($Section, [StringComparison]::Ordinal) -lt 0) {
+        return ""
+    }
+    $sectionSeen = $false
+    $sectionLevel = 0
+    foreach ($sourceLine in @($normalized -split "`n")) {
+        $line = $sourceLine.Trim()
+        if (-not $sectionSeen) {
+            if ($line -ceq $Section.Trim()) {
+                $sectionSeen = $true
+                if ($line -match '^(#{1,6})\s+') { $sectionLevel = $Matches[1].Length }
+            }
+            continue
+        }
+        if ($line -match '^(#{1,6})\s+') {
+            if ($sectionLevel -eq 0 -or $Matches[1].Length -le $sectionLevel) { break }
+            continue
+        }
+        if (-not $line) { continue }
+        if ($line.Length -gt 600) { $line = $line.Substring(0, 600).TrimEnd() }
+        if ($line.Length -ge 8 -and $line -notmatch '[^\x20-\x7E]') { return $line }
+    }
+    return ""
+}
+
+function Test-ReviewerVerificationConventionBindingApplicable {
+    param(
+        [Parameter(Mandatory)]$RawCandidate,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Section,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Quote
+    )
+    $candidateText = @(
+        [string](Get-ReviewerVerificationValue $RawCandidate "comment" ""),
+        [string](Get-ReviewerVerificationValue $RawCandidate "evidence" ""),
+        [string](Get-ReviewerVerificationValue $RawCandidate "diffEvidence" ""),
+        [string](Get-ReviewerVerificationValue $RawCandidate "impact" ""),
+        [string](Get-ReviewerVerificationValue $RawCandidate "expectedFixOrValidation" "")
+    ) -join " "
+    $candidateTokens = [System.Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal)
+    foreach ($token in @(Get-ReviewerVerificationTokens -Text $candidateText)) {
+        [void]$candidateTokens.Add($token)
+    }
+    $sectionMatches = 0
+    foreach ($token in @(Get-ReviewerVerificationTokens -Text $Section)) {
+        if ($candidateTokens.Contains($token)) { $sectionMatches++ }
+    }
+    $ruleMatches = [System.Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal)
+    foreach ($token in @(Get-ReviewerVerificationTokens -Text "$Section $Quote")) {
+        if ($candidateTokens.Contains($token)) { [void]$ruleMatches.Add($token) }
+    }
+    return ($sectionMatches -ge 1 -and $ruleMatches.Count -ge 2)
+}
+
+function Get-ReviewerVerificationConventionBindings {
+    param(
+        [Parameter(Mandatory)]$RawCandidate,
+        $ConventionPlan = $null,
+        [AllowEmptyCollection()][object[]]$ResolvedSources = @(),
+        [AllowEmptyCollection()][object[]]$ChangedFileAnchors = @()
+    )
+    $filePath = ConvertTo-ReviewerVerificationPath -Path (
+        [string](Get-ReviewerVerificationValue $RawCandidate "filePath" ""))
+    $line = [int](Get-ReviewerVerificationValue $RawCandidate "line" 0)
+    $anchor = Get-ReviewerVerificationChangedFileAnchor -FilePath $filePath -Line $line `
+        -ChangedFileAnchors $ChangedFileAnchors
+    if ($null -eq $anchor) { return @() }
+
+    $sourceMap = [System.Collections.Generic.Dictionary[string, object]]::new(
+        [StringComparer]::Ordinal)
+    foreach ($source in @($ResolvedSources)) {
+        $packName = [string](Get-ReviewerVerificationValue $source "PackName" (
+                Get-ReviewerVerificationValue $source "packName" ""))
+        $sourceId = [string](Get-ReviewerVerificationValue $source "SourceId" (
+                Get-ReviewerVerificationValue $source "sourceId" ""))
+        $key = "$packName`n$sourceId"
+        if (-not $packName -or -not $sourceId -or $sourceMap.ContainsKey($key)) {
+            throw "Resolved convention sources have a missing or ambiguous pack/source identity."
+        }
+        $sourceMap.Add($key, $source)
+    }
+
+    $bindings = [System.Collections.Generic.List[object]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($pack in @(Get-ReviewerVerificationValue $ConventionPlan "selectedPacks" @())) {
+        $packName = [string](Get-ReviewerVerificationValue $pack "name" "")
+        $pathMatched = @((Get-ReviewerVerificationValue $pack "matchedPaths" @()) | Where-Object {
+                [string](Get-ReviewerVerificationValue $_ "role" "") -ceq "current" -and
+                (ConvertTo-ReviewerVerificationPath -Path (
+                        [string](Get-ReviewerVerificationValue $_ "path" ""))) -ceq $filePath
+            }).Count -gt 0
+        if (-not $pathMatched) { continue }
+        foreach ($sourceRef in @(Get-ReviewerVerificationValue $pack "sources" @())) {
+            $sourceId = [string](Get-ReviewerVerificationValue $sourceRef "sourceId" "")
+            $key = "$packName`n$sourceId"
+            if (-not $sourceMap.ContainsKey($key) -or -not $seen.Add($key)) { continue }
+            $source = $sourceMap[$key]
+            $section = [string](Get-ReviewerVerificationValue $source "Section" (
+                    Get-ReviewerVerificationValue $source "section" ""))
+            $sourceText = [string](Get-ReviewerVerificationValue $source "Text" (
+                    Get-ReviewerVerificationValue $source "text" ""))
+            $quote = Get-ReviewerVerificationAuthoritativeRuleQuote `
+                -Section $section -SourceText $sourceText
+            if ($quote.Length -lt 8 -or $quote.Length -gt 600 -or
+                $quote -match '[^\x20-\x7E]' -or
+                $sourceText.IndexOf($quote, [StringComparison]::Ordinal) -lt 0) {
+                continue
+            }
+            if (-not (Test-ReviewerVerificationConventionBindingApplicable `
+                    -RawCandidate $RawCandidate -Section $section -Quote $quote)) {
+                continue
+            }
+            $conventionKey = $sourceId
+            if ($conventionKey -cnotmatch '^[A-Za-z_][A-Za-z0-9_.:\-]{0,127}$') {
+                $conventionKey = $packName
+            }
+            if ($conventionKey -cnotmatch '^[A-Za-z_][A-Za-z0-9_.:\-]{0,127}$') { continue }
+            [void]$bindings.Add([pscustomobject][ordered]@{
+                    packName = $packName
+                    ruleSourceId = $sourceId
+                    ruleSourceRepositoryId = [string](Get-ReviewerVerificationValue $source "RepositoryId" (
+                            Get-ReviewerVerificationValue $source "repositoryId" ""))
+                    ruleSourcePath = [string](Get-ReviewerVerificationValue $source "Path" (
+                            Get-ReviewerVerificationValue $source "path" ""))
+                    ruleSourceCommit = [string](Get-ReviewerVerificationValue $source "CommitSha" (
+                            Get-ReviewerVerificationValue $source "commitSha" ""))
+                    ruleSourceSha256 = [string](Get-ReviewerVerificationValue $source "Sha256" (
+                            Get-ReviewerVerificationValue $source "sha256" ""))
+                    ruleSection = $section
+                    ruleQuote = $quote
+                    changedCodeFix = [pscustomobject][ordered]@{
+                        action = "replace"
+                        targets = [string](Get-ReviewerVerificationValue $anchor "anchorId" "")
+                        conventionKey = $conventionKey
+                        valueSource = "authoritativeRule"
+                        evidenceFactIds = ""
+                    }
+                })
+        }
+    }
+    $bindings.Sort([System.Comparison[object]] {
+            param($left, $right)
+            return [StringComparer]::Ordinal.Compare(
+                "$([string]$left.packName)`n$([string]$left.ruleSourceId)",
+                "$([string]$right.packName)`n$([string]$right.ruleSourceId)")
+        })
+    return $bindings.ToArray()
+}
+
 function New-ReviewerVerificationCandidate {
     param(
         [Parameter(Mandatory)][ValidateSet("generalist", "convention")][string]$OriginKind,
         [Parameter(Mandatory)][string]$OriginModel,
         [Parameter(Mandatory)][string]$OriginArtifactSha256,
         [Parameter(Mandatory)]$RawCandidate,
-        [string]$OriginCandidateId = ""
+        [string]$OriginCandidateId = "",
+        $ConventionBinding = $null
     )
     $severity = [string](Get-ReviewerVerificationValue $RawCandidate "severity" "suggestion")
     $filePath = ConvertTo-ReviewerVerificationPath -Path (
@@ -512,6 +703,36 @@ function New-ReviewerVerificationCandidate {
     $behaviorText = "$comment $evidence $([string](Get-ReviewerVerificationValue $RawCandidate 'expectedFixOrValidation' ''))"
     $tokens = @(Get-ReviewerVerificationTokens -Text $behaviorText)
     $rawJson = ConvertTo-ReviewerVerificationCanonicalJson -Value $RawCandidate
+    $ruleSourceId = [string](Get-ReviewerVerificationValue $RawCandidate "ruleSourceId" "")
+    $ruleBindingOrigin = $(if ($ruleSourceId) { "blindSpecialist" }
+        elseif ($null -ne $ConventionBinding) { "wrapper" } else { "" })
+    $bindingValue = {
+        param([string]$Name, [string]$Default = "")
+        $rawValue = [string](Get-ReviewerVerificationValue $RawCandidate $Name "")
+        if ($rawValue) { return $rawValue }
+        return [string](Get-ReviewerVerificationValue $ConventionBinding $Name $Default)
+    }
+    $changedCodeFix = Get-ReviewerVerificationValue $RawCandidate "changedCodeFix" $null
+    if ($null -eq $changedCodeFix) {
+        $changedCodeFix = Get-ReviewerVerificationValue $ConventionBinding "changedCodeFix" $null
+    }
+    $conventionBound = (-not [string]::IsNullOrWhiteSpace((& $bindingValue "ruleSourceId")) -and
+        $null -ne $changedCodeFix)
+    $siblingStatus = [string](Get-ReviewerVerificationValue $RawCandidate "siblingStatus" "")
+    $siblingNotRequiredReason = [string](Get-ReviewerVerificationValue `
+            $RawCandidate "siblingNotRequiredReason" "")
+    if ($conventionBound -and $OriginKind -ceq "generalist" -and -not $siblingStatus) {
+        $siblingStatus = "notRequired"
+        $siblingNotRequiredReason =
+            "The wrapper bound the exact changed line and authoritative rule for independent cross-check."
+    }
+    $existingDebt = Get-ReviewerVerificationValue $RawCandidate "existingDebtFollowUp" $null
+    if ($conventionBound -and $null -eq $existingDebt) {
+        $existingDebt = [pscustomobject][ordered]@{
+            status = "none"; evidenceFactId = ""; selectorKey = ""; scopeKind = ""; scopePath = ""
+            comparableCount = 0; compliantCount = 0; action = ""
+        }
+    }
     $record = [pscustomobject][ordered]@{
         schemaVersion = 1
         originKind = $OriginKind
@@ -526,15 +747,38 @@ function New-ReviewerVerificationCandidate {
         severity = $severity
         comment = $comment
         evidence = $evidence
-        ruleSourceId = [string](Get-ReviewerVerificationValue $RawCandidate "ruleSourceId" "")
-        ruleSourceSha256 = [string](Get-ReviewerVerificationValue $RawCandidate "ruleSourceSha256" "")
-        ruleQuote = [string](Get-ReviewerVerificationValue $RawCandidate "ruleQuote" "")
-        siblingStatus = [string](Get-ReviewerVerificationValue $RawCandidate "siblingStatus" "")
+        conventionBound = $conventionBound
+        ruleBindingOrigin = $ruleBindingOrigin
+        category = $(if ($conventionBound) { "convention" } else { "" })
+        packName = & $bindingValue "packName"
+        ruleSourceId = & $bindingValue "ruleSourceId"
+        ruleSourceRepositoryId = & $bindingValue "ruleSourceRepositoryId"
+        ruleSourcePath = & $bindingValue "ruleSourcePath"
+        ruleSourceCommit = & $bindingValue "ruleSourceCommit"
+        ruleSourceSha256 = & $bindingValue "ruleSourceSha256"
+        ruleSection = & $bindingValue "ruleSection"
+        ruleQuote = & $bindingValue "ruleQuote"
+        diffEvidence = $(if ($OriginKind -ceq "convention") {
+                [string](Get-ReviewerVerificationValue $RawCandidate "diffEvidence" "")
+            } else { $evidence })
+        impactCategory = [string](Get-ReviewerVerificationValue $RawCandidate "impactCategory" "none")
+        impact = $(if ($OriginKind -ceq "convention") {
+                [string](Get-ReviewerVerificationValue $RawCandidate "impact" "")
+            } else { $comment })
+        expectedFixOrValidation = $(if ($OriginKind -ceq "convention") {
+                [string](Get-ReviewerVerificationValue $RawCandidate "expectedFixOrValidation" "")
+            } elseif ($conventionBound) {
+                "Apply the wrapper-bound authoritative rule using the structured changed-code remediation."
+            } else { "" })
+        siblingStatus = $siblingStatus
         siblingEvidence = [string](Get-ReviewerVerificationValue $RawCandidate "siblingEvidence" "")
-        siblingNotRequiredReason = [string](Get-ReviewerVerificationValue $RawCandidate "siblingNotRequiredReason" "")
+        siblingNotRequiredReason = $siblingNotRequiredReason
         factIds = [string](Get-ReviewerVerificationValue $RawCandidate "factIds" "")
-        changedCodeFix = Get-ReviewerVerificationValue $RawCandidate "changedCodeFix" $null
-        existingDebtFollowUp = Get-ReviewerVerificationValue $RawCandidate "existingDebtFollowUp" $null
+        confidence = [string](Get-ReviewerVerificationValue $RawCandidate "confidence" "")
+        residualRiskSummary = [string](Get-ReviewerVerificationValue $RawCandidate "residualRiskSummary" "")
+        semanticCandidateVersion = $(if ($conventionBound) { 2 } else { 0 })
+        changedCodeFix = $changedCodeFix
+        existingDebtFollowUp = $existingDebt
         existingDebtEvidence = Get-ReviewerVerificationValue $RawCandidate "existingDebtEvidence" $null
         rawCandidateSha256 = Get-ReviewerVerificationSha256 -Text $rawJson
     }
@@ -555,13 +799,28 @@ function New-ReviewerVerificationCandidate {
         severity = $record.severity
         comment = $record.comment
         evidence = $record.evidence
+        conventionBound = $record.conventionBound
+        ruleBindingOrigin = $record.ruleBindingOrigin
+        category = $record.category
+        packName = $record.packName
         ruleSourceId = $record.ruleSourceId
+        ruleSourceRepositoryId = $record.ruleSourceRepositoryId
+        ruleSourcePath = $record.ruleSourcePath
+        ruleSourceCommit = $record.ruleSourceCommit
         ruleSourceSha256 = $record.ruleSourceSha256
+        ruleSection = $record.ruleSection
         ruleQuote = $record.ruleQuote
+        diffEvidence = $record.diffEvidence
+        impactCategory = $record.impactCategory
+        impact = $record.impact
+        expectedFixOrValidation = $record.expectedFixOrValidation
         siblingStatus = $record.siblingStatus
         siblingEvidence = $record.siblingEvidence
         siblingNotRequiredReason = $record.siblingNotRequiredReason
         factIds = $record.factIds
+        confidence = $record.confidence
+        residualRiskSummary = $record.residualRiskSummary
+        semanticCandidateVersion = $record.semanticCandidateVersion
         changedCodeFix = $record.changedCodeFix
         existingDebtFollowUp = $record.existingDebtFollowUp
         existingDebtEvidence = $record.existingDebtEvidence
@@ -575,6 +834,9 @@ function ConvertTo-ReviewerVerificationCandidates {
         [object[]]$ConventionCandidates = @(),
         [string]$ConventionModel = "",
         [string]$ConventionArtifactSha256 = ("0" * 64),
+        $ConventionPlan = $null,
+        [object[]]$ResolvedSources = @(),
+        [object[]]$ChangedFileAnchors = @(),
         [int]$MaxCandidates = $script:ReviewerVerificationMaxCandidates
     )
     $result = [System.Collections.Generic.List[object]]::new()
@@ -592,6 +854,15 @@ function ConvertTo-ReviewerVerificationCandidates {
             [void]$result.Add((New-ReviewerVerificationCandidate -OriginKind generalist `
                     -OriginModel $model -OriginArtifactSha256 $artifactSha `
                     -RawCandidate $finding -OriginCandidateId "finding-$index"))
+            $bindings = @(Get-ReviewerVerificationConventionBindings -RawCandidate $finding `
+                -ConventionPlan $ConventionPlan -ResolvedSources $ResolvedSources `
+                -ChangedFileAnchors $ChangedFileAnchors)
+            foreach ($binding in $bindings) {
+                [void]$result.Add((New-ReviewerVerificationCandidate -OriginKind generalist `
+                        -OriginModel $model -OriginArtifactSha256 $artifactSha `
+                        -RawCandidate $finding -OriginCandidateId "finding-$index" `
+                        -ConventionBinding $binding))
+            }
         }
     }
     foreach ($candidate in @($ConventionCandidates)) {
@@ -620,17 +891,30 @@ function Get-ReviewerVerificationCandidatePlan {
         [object[]]$ConventionCandidates = @(),
         [string]$ConventionModel = "",
         [string]$ConventionArtifactSha256 = ("0" * 64),
+        $ConventionPlan = $null,
+        [object[]]$ResolvedSources = @(),
+        [object[]]$ChangedFileAnchors = @(),
         [int]$MaxCandidates = $script:ReviewerVerificationMaxCandidates
     )
     $MaxCandidates = [Math]::Min($MaxCandidates, $script:ReviewerVerificationMaxCandidates)
     $allCandidates = @(ConvertTo-ReviewerVerificationCandidates `
         -GeneralistPasses $GeneralistPasses -ConventionCandidates $ConventionCandidates `
         -ConventionModel $ConventionModel -ConventionArtifactSha256 $ConventionArtifactSha256 `
+        -ConventionPlan $ConventionPlan -ResolvedSources $ResolvedSources `
+        -ChangedFileAnchors $ChangedFileAnchors `
         -MaxCandidates ([int]::MaxValue))
+    $selectionOrder = @(
+        @($allCandidates | Where-Object {
+                [string](Get-ReviewerVerificationValue $_ "ruleBindingOrigin" "") -cne "wrapper"
+            })
+        @($allCandidates | Where-Object {
+                [string](Get-ReviewerVerificationValue $_ "ruleBindingOrigin" "") -ceq "wrapper"
+            })
+    )
     $bounded = [System.Collections.Generic.List[object]]::new()
     $withheld = [System.Collections.Generic.List[object]]::new()
-    for ($index = 0; $index -lt $allCandidates.Count; $index++) {
-        $candidate = $allCandidates[$index]
+    for ($index = 0; $index -lt $selectionOrder.Count; $index++) {
+        $candidate = $selectionOrder[$index]
         if ($index -lt $MaxCandidates) {
             [void]$bounded.Add($candidate)
             continue
@@ -930,6 +1214,98 @@ function Get-ReviewerVerificationAcceptedConventionCandidateIds {
     return $candidateIds.ToArray()
 }
 
+function Get-ReviewerVerificationAcceptedReconciliationCandidates {
+    param(
+        [AllowEmptyCollection()][object[]]$Eligible = @(),
+        [AllowEmptyCollection()][object[]]$Decisions = @(),
+        [AllowEmptyCollection()][object[]]$Clusters = @()
+    )
+    $candidateMap = [System.Collections.Generic.Dictionary[string, object]]::new(
+        [StringComparer]::Ordinal)
+    foreach ($cluster in @($Clusters)) {
+        foreach ($candidate in @(Get-ReviewerVerificationValue $cluster "members" @())) {
+            $candidateId = [string](Get-ReviewerVerificationValue $candidate "candidateId" "")
+            if (-not $candidateId -or $candidateMap.ContainsKey($candidateId)) {
+                throw "Reconciliation candidates contain a missing or duplicate verification candidate id."
+            }
+            $candidateMap.Add($candidateId, $candidate)
+        }
+    }
+    $orderedDecisions = [System.Collections.Generic.List[object]]::new()
+    foreach ($entry in @($Decisions)) { [void]$orderedDecisions.Add($entry) }
+    $orderedDecisions.Sort([System.Comparison[object]] {
+            param($left, $right)
+            return [StringComparer]::Ordinal.Compare(
+                [string](Get-ReviewerVerificationValue $left "candidateId" ""),
+                [string](Get-ReviewerVerificationValue $right "candidateId" ""))
+        })
+    $result = [System.Collections.Generic.List[object]]::new()
+    foreach ($decision in $orderedDecisions) {
+        $candidateId = [string](Get-ReviewerVerificationValue $decision "candidateId" "")
+        if (-not $candidateMap.ContainsKey($candidateId)) {
+            throw "An accepted verification decision is missing its candidate record."
+        }
+        $candidate = $candidateMap[$candidateId]
+        if (-not [bool](Get-ReviewerVerificationValue $candidate "conventionBound" $false)) {
+            continue
+        }
+        $severity = [string](Get-ReviewerVerificationValue $decision "correctedSeverity" "none")
+        if ($severity -ceq "none") {
+            $severity = [string](Get-ReviewerVerificationValue $candidate "severity" "")
+        }
+        $debt = Copy-ReviewerVerificationJsonValue -Value (
+            Get-ReviewerVerificationValue $candidate "existingDebtFollowUp" $null)
+        if ([string](Get-ReviewerVerificationValue $debt "status" "") -ceq "required" -and
+            -not [bool](Get-ReviewerVerificationValue $decision "existingDebtFollowUpRetained" $false)) {
+            $debt = [pscustomobject][ordered]@{
+                status = "none"; evidenceFactId = ""; selectorKey = ""; scopeKind = ""; scopePath = ""
+                comparableCount = 0; compliantCount = 0; action = ""
+            }
+        }
+        $hash = [string](Get-ReviewerVerificationValue $candidate "candidateHash" "")
+        [void]$result.Add([pscustomobject][ordered]@{
+                candidateId = "verified-" + $hash.Substring(0, 55)
+                category = "convention"
+                severity = $severity
+                anchorKind = [string](Get-ReviewerVerificationValue $candidate "anchorKind" "")
+                filePath = [string](Get-ReviewerVerificationValue $candidate "filePath" "")
+                line = [int](Get-ReviewerVerificationValue $candidate "line" 0)
+                packName = [string](Get-ReviewerVerificationValue $candidate "packName" "")
+                ruleSourceId = [string](Get-ReviewerVerificationValue $candidate "ruleSourceId" "")
+                ruleSourceRepositoryId = [string](Get-ReviewerVerificationValue `
+                    $candidate "ruleSourceRepositoryId" "")
+                ruleSourcePath = [string](Get-ReviewerVerificationValue $candidate "ruleSourcePath" "")
+                ruleSourceCommit = [string](Get-ReviewerVerificationValue `
+                    $candidate "ruleSourceCommit" "")
+                ruleSourceSha256 = [string](Get-ReviewerVerificationValue `
+                    $candidate "ruleSourceSha256" "")
+                ruleSection = [string](Get-ReviewerVerificationValue $candidate "ruleSection" "")
+                ruleQuote = [string](Get-ReviewerVerificationValue $candidate "ruleQuote" "")
+                diffEvidence = [string](Get-ReviewerVerificationValue $candidate "diffEvidence" "")
+                impactCategory = [string](Get-ReviewerVerificationValue `
+                    $candidate "impactCategory" "none")
+                impact = [string](Get-ReviewerVerificationValue $candidate "impact" "")
+                expectedFixOrValidation = [string](Get-ReviewerVerificationValue `
+                    $candidate "expectedFixOrValidation" "")
+                siblingStatus = [string](Get-ReviewerVerificationValue `
+                    $candidate "siblingStatus" "notRequired")
+                siblingEvidence = [string](Get-ReviewerVerificationValue `
+                    $candidate "siblingEvidence" "")
+                siblingNotRequiredReason = [string](Get-ReviewerVerificationValue `
+                    $candidate "siblingNotRequiredReason" "")
+                factIds = [string](Get-ReviewerVerificationValue $candidate "factIds" "")
+                confidence = [string](Get-ReviewerVerificationValue $decision "confidence" "low")
+                residualRiskSummary = [string](Get-ReviewerVerificationValue `
+                    $candidate "residualRiskSummary" "")
+                semanticCandidateVersion = 2
+                changedCodeFix = Copy-ReviewerVerificationJsonValue -Value (
+                    Get-ReviewerVerificationValue $candidate "changedCodeFix" $null)
+                existingDebtFollowUp = $debt
+            })
+    }
+    return $result.ToArray()
+}
+
 function Get-ReviewerVerificationThreadFacts {
     param($FactPlan)
     $records = [System.Collections.Generic.List[object]]::new()
@@ -1075,6 +1451,10 @@ function Get-ReviewerVerificationAssignments {
                         candidateHash = [string](Get-ReviewerVerificationValue $candidate "candidateHash" "")
                         originKind = $originKind
                         originModel = $originModel
+                        conventionBound = [bool](Get-ReviewerVerificationValue `
+                            $candidate "conventionBound" $false)
+                        ruleBindingOrigin = [string](Get-ReviewerVerificationValue `
+                            $candidate "ruleBindingOrigin" "")
                         ruleQuote = [string](Get-ReviewerVerificationValue $candidate "ruleQuote" "")
                         verifierModel = $target
                     })
@@ -1088,6 +1468,56 @@ function Get-ReviewerVerificationAssignments {
                 [string](Get-ReviewerVerificationValue $right "assignmentId" ""))
         })
     return $assignments.ToArray()
+}
+
+function Assert-ReviewerVerificationAssignmentCoverage {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Clusters,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Assignments,
+        [Parameter(Mandatory)][string[]]$RequiredVerifierModels,
+        [ValidateRange(1, [int]::MaxValue)][int]$MaxVerifierRuns
+    )
+    $models = @($RequiredVerifierModels | Where-Object { $_ } | Sort-Object -Unique)
+    if ($models.Count -ne 2) {
+        throw "Assignment coverage validation requires exactly two verifier models."
+    }
+    $ready = [System.Collections.Generic.List[object]]::new()
+    foreach ($cluster in @($Clusters)) {
+        if ([string](Get-ReviewerVerificationValue $cluster "status" "ready") -cne "ready") {
+            continue
+        }
+        foreach ($candidate in @(Get-ReviewerVerificationValue $cluster "members" @())) {
+            [void]$ready.Add($candidate)
+        }
+    }
+    $requiredAssignments = 2 * $ready.Count
+    if ($requiredAssignments -gt $script:ReviewerVerificationMaxVerifierRuns) {
+        throw "The bounded candidate union requires $requiredAssignments verifier assignments, above the code-defined $($script:ReviewerVerificationMaxVerifierRuns)-assignment hard cap."
+    }
+    if ($MaxVerifierRuns -lt $requiredAssignments) {
+        throw "The declared verifier budget $MaxVerifierRuns cannot cover all $requiredAssignments required assignments."
+    }
+    if (@($Assignments).Count -ne $requiredAssignments) {
+        throw "The assignment plan contains $(@($Assignments).Count) assignments; exactly $requiredAssignments are required."
+    }
+    foreach ($candidate in $ready) {
+        $candidateId = [string](Get-ReviewerVerificationValue $candidate "candidateId" "")
+        $assignedModels = @($Assignments | Where-Object {
+                [string](Get-ReviewerVerificationValue $_ "candidateId" "") -ceq $candidateId
+            } | ForEach-Object {
+                [string](Get-ReviewerVerificationValue $_ "verifierModel" "")
+            } | Sort-Object -Unique)
+        if ($assignedModels.Count -ne 2 -or
+            [string]::Join("`n", $assignedModels) -cne [string]::Join("`n", $models)) {
+            throw "Candidate '$candidateId' does not have exactly one assignment for each required verifier model."
+        }
+    }
+    return [pscustomobject][ordered]@{
+        readyCandidateCount = $ready.Count
+        requiredAssignmentCount = $requiredAssignments
+        declaredMaxVerifierRuns = $MaxVerifierRuns
+        complete = $true
+    }
 }
 
 function Test-ReviewerVerificationReportedModel {
@@ -1488,8 +1918,9 @@ function Get-ReviewerVerificationEvidenceOptions {
                 })
         }
     }
-    if ([string](Get-ReviewerVerificationValue $Candidate "originKind" "") -ceq "convention") {
-        $changedFix = Get-ReviewerVerificationValue $Candidate "changedCodeFix" $null
+    $changedFix = Get-ReviewerVerificationValue $Candidate "changedCodeFix" $null
+    if ([bool](Get-ReviewerVerificationValue $Candidate "conventionBound" $false) -and
+        $null -ne $changedFix) {
         $changedValueSource = [string](Get-ReviewerVerificationValue $changedFix "valueSource" "")
         $changedFactText = [string](Get-ReviewerVerificationValue $changedFix "evidenceFactIds" "")
         if ($changedValueSource -ceq "authoritativeRule" -and $quote) {
@@ -1618,9 +2049,16 @@ function Resolve-ReviewerVerificationDecisions {
     }
     $sourceMap = @{}
     foreach ($source in @($ResolvedSources)) {
+        $packName = [string](Get-ReviewerVerificationValue $source "PackName" (
+                Get-ReviewerVerificationValue $source "packName" ""))
         $sourceId = [string](Get-ReviewerVerificationValue $source "SourceId" (
                 Get-ReviewerVerificationValue $source "sourceId" ""))
-        if ($sourceId -and -not $sourceMap.ContainsKey($sourceId)) { $sourceMap[$sourceId] = $source }
+        if (-not $sourceId) { continue }
+        $sourceKey = "$packName`n$sourceId"
+        if ($sourceMap.ContainsKey($sourceKey)) {
+            throw "Resolved convention sources contain ambiguous pack/source identity '$sourceKey'."
+        }
+        $sourceMap[$sourceKey] = $source
     }
     foreach ($cluster in @($Clusters)) {
         $clusterId = [string](Get-ReviewerVerificationValue $cluster "clusterId" "")
@@ -1650,6 +2088,8 @@ function Resolve-ReviewerVerificationDecisions {
             $candidateId = [string](Get-ReviewerVerificationValue $candidate "candidateId" "")
             $candidateHash = [string](Get-ReviewerVerificationValue $candidate "candidateHash" "")
             $originKind = [string](Get-ReviewerVerificationValue $candidate "originKind" "")
+            $isConventionBound = [bool](Get-ReviewerVerificationValue `
+                    $candidate "conventionBound" $false)
             if ($originKind -ceq "convention" -and $SpecialistDegraded) {
                 [void]$withheld.Add([pscustomobject][ordered]@{
                         candidateId = $candidateId; clusterId = $clusterId
@@ -1881,7 +2321,7 @@ function Resolve-ReviewerVerificationDecisions {
             $changedFixOutcome = [string](Get-ReviewerVerificationValue $verdict "changedCodeFixOutcome" "")
             $debtOutcome = [string](Get-ReviewerVerificationValue $verdict "existingDebtFollowUpOutcome" "")
             $retainDebtFollowUp = $false
-            if ($originKind -ceq "convention") {
+            if ($isConventionBound) {
                 $partEvidenceOptions = @(Get-ReviewerVerificationEvidenceOptions -Candidate $candidate `
                     -FactPlan $FactPlan -ThreadFacts $ThreadFacts -EvidenceHunks $EvidenceHunks `
                     -SiblingCandidates @(Get-ReviewerVerificationValue $cluster "members" @()) `
@@ -1956,11 +2396,17 @@ function Resolve-ReviewerVerificationDecisions {
                     })
                 continue
             }
-            if ($originKind -ceq "convention") {
+            if ($isConventionBound) {
+                $packName = [string]$candidate.packName
                 $sourceId = [string]$candidate.ruleSourceId
-                $sourceValid = $sourceMap.ContainsKey($sourceId)
+                $sourceKey = "$packName`n$sourceId"
+                $legacySourceKey = "`n$sourceId"
+                $sourceValid = $sourceMap.ContainsKey($sourceKey) -or
+                    $sourceMap.ContainsKey($legacySourceKey)
                 if ($sourceValid) {
-                    $source = $sourceMap[$sourceId]
+                    $source = if ($sourceMap.ContainsKey($sourceKey)) {
+                        $sourceMap[$sourceKey]
+                    } else { $sourceMap[$legacySourceKey] }
                     $expectedHash = [string](Get-ReviewerVerificationValue $source "Sha256" (
                             Get-ReviewerVerificationValue $source "sha256" ""))
                     $sourceText = [string](Get-ReviewerVerificationValue $source "Text" (
@@ -1968,7 +2414,22 @@ function Resolve-ReviewerVerificationDecisions {
                     $sourceValid = [string]::Equals(
                         $expectedHash, [string]$candidate.ruleSourceSha256,
                         [StringComparison]::OrdinalIgnoreCase) -and
-                        $sourceText.IndexOf([string]$candidate.ruleQuote, [StringComparison]::Ordinal) -ge 0
+                        $sourceText.IndexOf([string]$candidate.ruleQuote, [StringComparison]::Ordinal) -ge 0 -and
+                        [string]::Equals(
+                            [string](Get-ReviewerVerificationValue $source "RepositoryId" (
+                                    Get-ReviewerVerificationValue $source "repositoryId" "")),
+                            [string]$candidate.ruleSourceRepositoryId,
+                            [StringComparison]::OrdinalIgnoreCase) -and
+                        [string]::Equals(
+                            [string](Get-ReviewerVerificationValue $source "Path" (
+                                    Get-ReviewerVerificationValue $source "path" "")),
+                            [string]$candidate.ruleSourcePath,
+                            [StringComparison]::Ordinal) -and
+                        [string]::Equals(
+                            [string](Get-ReviewerVerificationValue $source "CommitSha" (
+                                    Get-ReviewerVerificationValue $source "commitSha" "")),
+                            [string]$candidate.ruleSourceCommit,
+                            [StringComparison]::OrdinalIgnoreCase)
                 }
                 if (-not $sourceValid -or
                     [string]$candidate.ruleSourceSha256 -notmatch '^[0-9a-f]{64}$' -or
@@ -2026,6 +2487,7 @@ function Resolve-ReviewerVerificationDecisions {
                     changedCodeFixOutcome = $changedFixOutcome
                     existingDebtFollowUpOutcome = $debtOutcome
                     existingDebtFollowUpRetained = $retainDebtFollowUp
+                    confidence = [string](Get-ReviewerVerificationValue $verdict "confidence" "")
                     verifierModels = @($candidateAssignments | ForEach-Object {
                             [string](Get-ReviewerVerificationValue $_ "verifierModel" "")
                         })
@@ -2070,13 +2532,18 @@ function Resolve-ReviewerVerificationDecisions {
             }
         }
         $structuredComment = [string]$winner.candidate.comment
-        if ([string]$winner.candidate.originKind -ceq "convention") {
+        if ([bool](Get-ReviewerVerificationValue $winner.candidate "conventionBound" $false)) {
             $fix = $winner.candidate.changedCodeFix
             $targetText = [string](Get-ReviewerVerificationValue $fix "targets" "")
             $keyText = [string](Get-ReviewerVerificationValue $fix "conventionKey" "")
             $sourceText = $(if ([string](Get-ReviewerVerificationValue $fix "valueSource" "") -ceq
                     "deterministicFact") { "the sealed deterministic evidence" } else { "the authoritative rule" })
-            $structuredComment = "$([string](Get-ReviewerVerificationValue $fix 'action' 'modify')) '$keyText' on changed construct(s) $targetText using the correct value from $sourceText."
+            $targetKind = if (@($targetText -split ',' | Where-Object {
+                        $_ -and $_ -cnotmatch '^cf[0-9]+$'
+                    }).Count -eq 0) {
+                "changed-file anchor(s)"
+            } else { "lexical construct(s)" }
+            $structuredComment = "$([string](Get-ReviewerVerificationValue $fix 'action' 'modify')) '$keyText' on $targetKind $targetText using the correct value from $sourceText."
             if ([string](Get-ReviewerVerificationValue $effectiveDebt "status" "") -ceq "required") {
                 $structuredComment += " Record and link a tracked follow-up for the bounded existing debt in $([string](Get-ReviewerVerificationValue $effectiveDebt 'scopePath' '')) ($([int](Get-ReviewerVerificationValue $effectiveDebt 'compliantCount' 0)) of $([int](Get-ReviewerVerificationValue $effectiveDebt 'comparableCount' 0)) comparable declarations comply); do not clean unrelated debt in this pull request."
             }
@@ -2094,6 +2561,15 @@ function Resolve-ReviewerVerificationDecisions {
                 comment = $structuredComment
                 evidence = [string]$winner.candidate.evidence
                 confidence = [string]$winner.confidence
+                conventionBound = [bool](Get-ReviewerVerificationValue `
+                    $winner.candidate "conventionBound" $false)
+                ruleBindingOrigin = [string](Get-ReviewerVerificationValue `
+                    $winner.candidate "ruleBindingOrigin" "")
+                packName = [string](Get-ReviewerVerificationValue $winner.candidate "packName" "")
+                ruleSourceId = [string](Get-ReviewerVerificationValue `
+                    $winner.candidate "ruleSourceId" "")
+                ruleSourceSha256 = [string](Get-ReviewerVerificationValue `
+                    $winner.candidate "ruleSourceSha256" "")
                 changedCodeFix = $winner.candidate.changedCodeFix
                 existingDebtFollowUp = $effectiveDebt
             })

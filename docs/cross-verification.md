@@ -38,18 +38,26 @@ of its ordered member hashes.
 Candidate and cluster caps isolate rather than erase work. Candidates beyond the
 normalization cap and every member of an oversized semantic cluster are listed
 individually as `candidateLimit` or `clusterLimit`; unrelated ready clusters still
-receive verifier assignments. The sealed effective policy drives candidate,
+receive verifier assignments. Original blind findings and specialist findings are
+admitted before optional wrapper-enriched variants, so bounding can never retain an
+enrichment after withholding its origin. The sealed effective policy drives candidate,
 cluster, input, artifact, run-count, deadline, near-exact, semantic, and existing-
 thread thresholds, and replay applies those same saved values.
 Policy may narrow code-defined candidate, cluster, input, artifact, verifier-run,
 and phase-time ceilings but cannot widen them; the sealed effective policy records
-the clamped values actually enforced.
+the clamped values actually enforced. Before any verifier process launches, the
+wrapper derives the required assignment budget as twice the bounded union size and
+requires exactly one assignment from each generalist for every candidate. A policy
+budget below `2N` fails the phase before launch rather than partially verifying the
+union. The code-defined hard cap remains an absolute ceiling.
 
 Blind discovery is three-way and isolated: GPT generalist, Opus generalist, and
 the convention specialist do not receive one another's findings. After all
 three blind passes finish, the wrapper forms the exact candidate union without
 requiring discovery overlap. Every GPT-only, Opus-only, and specialist-only
 candidate then receives two fresh cross-checks: one from GPT and one from Opus.
+If any configured blind pass is missing or degraded, cross-verification fails before
+launch and exposes no eligible candidate.
 The specialist never cross-checks. A candidate is semantically accepted only
 when both cross-checks bind supplied evidence and concur on the exact outcome;
 blind overlap, first/latest wording, majority, and specialist concurrence are
@@ -57,10 +65,23 @@ not substitutes. The specialist discovery model must differ from both
 generalist cross-check models. Mixed-origin clusters remain advisory for
 deduplication.
 
+Before cross-checking, the wrapper may add an enriched variant of a blind generalist finding with
+convention evidence, but only when the normalized path matches a selected pack,
+the exact line is inside one sealed right-hand `RawSpan`, and the referenced
+authoritative section is present in the sealed source bytes. The enrichment records
+wrapper provenance, binds the exact rule source/hash/section, and supplies a
+structured `changedCodeFix` against the truthful `cf<n>` anchor. Its convention key
+is an existing sealed source identity; it never invents a localization resource key.
+The original blind finding always remains in the union, so speculative convention
+routing cannot replace or suppress it. If the bindings are unavailable, ambiguous,
+or not deterministically relevant to the finding text, no enriched variant is added
+and the original proceeds under the normal evidence requirements.
+
 ## Verifier boundary
 
 Each fresh cross-check invocation receives one cluster only: assigned candidates, bounded sibling
-evidence, exact source-commit hunks, cited convention quote/provenance,
+evidence, exact source-commit hunks (preferentially reconstructed from already
+sealed source slices), cited convention quote/provenance,
 deterministic facts, and sanitized existing-thread evidence. It does not receive
 discovery summaries, unrelated candidates, delivery state, or write tools.
 
@@ -79,7 +100,8 @@ majority vote. Verification cannot add or expand a finding or raise severity.
 An absolute phase deadline and run-count cap bound aggregate verifier work; each
 process receives no more than the remaining phase budget.
 
-Convention remediation is assessed in two parts. A candidate is eligible only
+Convention-bound remediation is assessed in two parts regardless of whether the
+blind origin was GPT, Opus, or the specialist. A candidate is eligible only
 when its required `changedCodeFix` is independently supported. The
 `existingDebtFollowUp` part is deliberately non-atomic: it is retained only when
 the verifier binds the exact sealed `rdf1:` evidence, bounded file scope, and
@@ -101,8 +123,7 @@ continue without degrading the verification pass.
 Generalist eligibility requires an independent supported outcome and a valid
 changed-file or PR-metadata anchor. Convention eligibility additionally rechecks
 the exact source hash and quote, sibling requirement, deterministic fact states,
-and existing-thread duplicates. A degraded specialist is recorded but cannot
-remove independently verified generalist candidates.
+and existing-thread duplicates.
 
 Decision artifacts are `verification-decision-preview` manifests under
 `verification-previews`. They include clusters/origins, assignments, verifier
@@ -113,11 +134,14 @@ the reviewer master key. Delivery promotion accepts only the exact delivery
 manifest key set and cannot authenticate either verification domain.
 
 For repeated sealed executions, each decision artifact also embeds a
-reconciliation manifest whose candidate list is the subset of specialist
-semantic candidates accepted by both GPT and Opus. Corrected severity and the
-removal of unsupported existing-debt follow-up are applied before sealing this
-subset. Reconciliation never reads rejected or superseded raw specialist
-semantics from that artifact.
+reconciliation manifest whose candidate list is every convention-bound candidate
+accepted by both GPT and Opus, including wrapper-enriched
+generalist origins. Corrected severity and the removal of unsupported existing-debt
+follow-up are applied before sealing this subset. Reconciliation never reads
+rejected or superseded raw semantics from that artifact.
+Exact `cf<n>:line` violations are reconciled as first-class anchors alongside the
+separate lexical construct partition; stable line targets never become invented
+constructs and count as weighed evidence for the rule.
 
 ## Layer 6: delivery gates
 

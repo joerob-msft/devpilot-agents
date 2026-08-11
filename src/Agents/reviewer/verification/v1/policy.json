@@ -4,7 +4,7 @@
   "maxClusterSize": 8,
   "maxInputBytes": 524288,
   "maxArtifactBytes": 2097152,
-  "maxVerifierRuns": 12,
+  "maxVerifierRuns": 128,
   "maxVerificationSeconds": 3600,
   "nearExactJaccard": 0.7,
   "semanticJaccard": 0.55,

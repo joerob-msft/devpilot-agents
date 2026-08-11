@@ -66,9 +66,12 @@ not a candidate. Do not invent a resolution.
    a sibling check is not required.
 7. Use `changedFile` only for a current changed file and a positive right-side
    line. Copy its repository-relative path from `changedFiles`; either `src/a.cs`
-   or `/src/a.cs` is accepted. Never relocate an invalid anchor. Use `prMetadata`
-   only for deterministic metadata/template facts, with empty file path and line
-   zero.
+   or `/src/a.cs` is accepted. The exact normalized path and line must appear in
+   one `ruleCoverageRequest.changedFileAnchors[].rightHandRanges` entry. Its
+   `cf<n>` id is a truthful changed-file anchor, distinct from every lexical
+   construct id. Never relocate an invalid anchor or invent a construct. Use
+   `prMetadata` only for deterministic metadata/template facts, with empty file
+   path and line zero.
 8. Never emit `critical`, a vote, a vote recommendation, or generalist findings.
 9. A comment that states an invariant is evidence of intent, never evidence of
    enforcement. Do not author a candidate that contradicts a remark, summary, or
@@ -100,6 +103,14 @@ not a candidate. Do not invent a resolution.
     `constructFileSummaries` counts how often each attribute appears across each
     whole file, so "the surrounding code already does this" is a number rather
     than an impression.
+
+    `ruleCoverageRequest.changedFileAnchors` is a separate table of delivered
+    right-hand changed regions. When a rule violation is on an exact changed line
+    that no lexical construct covers, put `cf<n>:<line>` in
+    `violatingChangedFileTargets`. This does not add to, remove from, or excuse
+    the complete lexical construct partition below. It records a line-level
+    convention target without pretending the line is an invocation, declaration,
+    comment, or assignment.
 
     For each row set `scope` to a comma-separated list of the construct KINDS
     the rule governs - for example `invocation`, or `declaration,comment`, or
@@ -139,21 +150,23 @@ not a candidate. Do not invent a resolution.
     way a real finding disappears - the rule an operator most wanted transported
     is usually the one the repository follows least.
 
-    `scope: none` is not a valid escape when constructs exist. Name the kinds
-    the rule would govern and put every other kind, plus any applicable anchor
-    the rule does not reach, in `notInReachConstructs`. A row that names no
-    anchor at all is not falsifiable and the wrapper degrades it, whatever
-    status it claims. A scope whose every applicable anchor you put out of reach
-    is a real answer only with code evidence, and it can only be
+    `scope: none` is valid only when the rule's violation is represented by an
+    exact entry in `violatingChangedFileTargets` and every lexical construct is
+    truthfully partitioned into `notInReachConstructs`. Otherwise it is not an
+    escape when constructs exist: name the kinds the rule would govern and put
+    every other kind, plus any applicable anchor the rule does not reach, in
+    `notInReachConstructs`. A row that names no anchor at all is not falsifiable
+    and the wrapper degrades it, whatever status it claims. A scope whose every
+    applicable lexical anchor you put out of reach is a real answer only with
+    code evidence, and absent a changed-file violation it can only be
     `notApplicable` or `unknown`; a row that weighed nothing is not compliant
     with anything.
-    - a candidate you link must be anchored on one of the constructs this row
-      calls violating - anywhere within that construct's `line`..`endLine`
-      span, which for a multi-line call is normally the offending argument
-      rather than the line the call opens on. A row about one place cannot
-      account for a finding about another, and the wrapper checks it. If the
-      thing you want to comment on has no construct covering it, widen the
-      scope to the kind that does rather than anchoring on a neighbour.
+    - a candidate you link must be anchored either on one of the constructs this
+      row calls violating (anywhere within its exact `line`..`endLine` span), or
+      on one exact `cf<n>:<line>` entry in `violatingChangedFileTargets`. A row
+      about one place cannot account for a finding about another, and the wrapper
+      checks it. If no construct covers the expression, use its delivered
+      changed-file line target; never widen to a neighbouring construct.
     Whether a construct is in a rule's reach is your judgement from the rule
     text. The wrapper knows only shapes: it does not know what a test is, what
     any attribute means, or which arguments matter.
@@ -256,6 +269,8 @@ Each `ruleCoverage` row has exactly `ruleRef`, `ruleSourceSha256`, `ruleQuote`
 assignment`, or `none`), the four verdict lists `violatingConstructs`,
 `compliantConstructs`, `notInReachConstructs` and `unknownConstructs` (each
 comma-separated construct ids and inclusive same-kind ranges, or empty),
+`violatingChangedFileTargets` (comma-separated exact `cf<n>:<line>` targets, or
+empty),
 `codeEvidence`, `siblingStatus` (`checked|notRequired|unavailable`),
 `siblingEvidence`, `candidateId` (or empty), and `notes`. Send one row per
 entry in `ruleCoverageRequest.requiredRows`, in that order.
