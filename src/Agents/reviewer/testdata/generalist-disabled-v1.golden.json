@@ -144,7 +144,11 @@
       },
       {
         "sha256": "38af213211e5422a81d180e9435d556d58c693348763412cb8a6f303a8c5b75e",
-        "reason": "CURRENT and authoritative. Preserve structured remediation evidence while reporting the exact sealed source-transport mode reconstructed by schema-v2 replay, with snapshotLegacy retained only for schema-v1 compatibility."
+        "reason": "History only, superseded below. Preserve structured remediation evidence while reporting the exact sealed source-transport mode reconstructed by schema-v2 replay, with snapshotLegacy retained only for schema-v1 compatibility."
+      },
+      {
+        "sha256": "e172b0267cd87a521b71120bfca1350293c492c5b10926ff659edec7f091a279",
+        "reason": "CURRENT and authoritative. Count explicit changed-file line targets alongside lexical construct coverage without changing the disabled generalist discovery or delivery path."
       }
     ]
   },

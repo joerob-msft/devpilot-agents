@@ -9,6 +9,8 @@ Set-StrictMode -Version Latest
 
 $repoRoot = Split-Path $PSScriptRoot -Parent
 Import-Module (Join-Path $repoRoot "src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1") -Force
+. (Join-Path $repoRoot "src\Agents\reviewer\SourceTransport.ps1")
+. (Join-Path $repoRoot "src\Agents\reviewer\ConventionSpecialist.ps1")
 . (Join-Path $repoRoot "src\Agents\reviewer\CrossVerification.ps1")
 
 $schemaPath = Join-Path $repoRoot "src\Agents\reviewer\verification\v1\schema.json"
@@ -174,12 +176,13 @@ function New-VerifierRun {
         [string]$ExistingDebtEvidenceFactId = ""
     )
     if (-not $ChangedCodeFixOutcome) {
-        $ChangedCodeFixOutcome = $(if ([string]$Assignment.originKind -ceq "convention") {
+        $ChangedCodeFixOutcome = $(if ([bool](Get-ReviewerVerificationValue `
+                    $Assignment "conventionBound" $false)) {
                 "supported"
             } else { "notApplicable" })
     }
     if (-not $ChangedCodeFixEvidenceSha256 -and
-        [string]$Assignment.originKind -ceq "convention") {
+        [bool](Get-ReviewerVerificationValue $Assignment "conventionBound" $false)) {
         $ChangedCodeFixEvidenceSha256 = Get-ReviewerVerificationSha256 -Text (
             [string]$Assignment.ruleQuote)
     }
@@ -270,10 +273,36 @@ $factPlan = [pscustomobject][ordered]@{
 $resolvedSources = @(
     [pscustomobject][ordered]@{
         SourceId = "shared-rules"
+        RepositoryId = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+        Path = "/docs/rules.md"
+        CommitSha = "2" * 40
         Sha256 = "a" * 64
         Text = "Build convention: validation manifests are required for changed test registrations."
     }
 )
+
+$jsonCopySource = [pscustomobject][ordered]@{
+    createdAt = "2026-08-10T23:25:04.1234567Z"
+    nested = [pscustomobject][ordered]@{
+        empty = @()
+        singleton = @("only")
+        values = @("a", "b")
+        object = [pscustomobject][ordered]@{}
+        enabled = $true
+    }
+}
+$jsonCopy = Copy-ReviewerVerificationJsonValue -Value $jsonCopySource
+Assert-Verification ($jsonCopy.createdAt -is [string] -and
+    [string]$jsonCopy.createdAt -ceq [string]$jsonCopySource.createdAt -and
+    (ConvertTo-ReviewerVerificationCanonicalJson -Value $jsonCopy) -ceq
+    (ConvertTo-ReviewerVerificationCanonicalJson -Value $jsonCopySource)) `
+    "The verification JSON clone retyped an ISO string or lost nested JSON values."
+$jsonCopy.nested.values[0] = "changed"
+Assert-Verification ([string]$jsonCopySource.nested.values[0] -ceq "a") `
+    "The verification JSON clone retained mutable nested array references."
+Assert-VerificationThrows {
+    Copy-ReviewerVerificationJsonValue -Value ([DateTime]::UtcNow)
+} "The verification JSON clone accepted a runtime DateTime instead of preserving the JSON-only boundary."
 
 # Exact duplicates retain both originals but share one deterministic cluster.
 $exactFinding = New-GeneralistFinding -Comment "The retry path persists a null result and loses the prior state."
@@ -284,20 +313,22 @@ $exactCandidates = @(ConvertTo-ReviewerVerificationCandidates -GeneralistPasses 
 $exactClusters = @(Get-ReviewerVerificationClusters -Candidates $exactCandidates)
 Assert-Verification ($exactCandidates.Count -eq 2 -and $exactClusters.Count -eq 1 -and
     @($exactClusters[0].members).Count -eq 2) "Exact duplicates were dropped or not clustered."
-foreach ($pathVariant in @("src/a.cs", "./src/a.cs", "\src\a.cs", " /src/a.cs ")) {
+foreach ($pathVariant in @("src/a.cs", "\src\a.cs", "/src/a.cs")) {
     Assert-Verification ((ConvertTo-ReviewerVerificationPath -Path $pathVariant) -ceq "/src/a.cs") `
         "Verification path normalization diverged for '$pathVariant'."
 }
-Assert-Verification ((ConvertTo-ReviewerVerificationPath -Path "././src/a.cs") -ceq "/./src/a.cs") `
-    "Verification comparison path diverged from baseline repeated-dot semantics."
+foreach ($ambiguousPath in @("./src/a.cs", "././src/a.cs", " /src/a.cs ", "/src/../a.cs")) {
+    Assert-Verification ((ConvertTo-ReviewerVerificationPath -Path $ambiguousPath) -ceq "") `
+        "Verification path validation repaired ambiguous path '$ambiguousPath'."
+}
 Assert-Verification ((ConvertTo-ReviewerVerificationReadPath `
-        -Path " ./Tools/Scripts/Test-ConfigSpecSettingsOrder.ps1 ") -ceq
-    "Tools/Scripts/Test-ConfigSpecSettingsOrder.ps1") `
-    "Verification source reads no longer preserve original path casing."
+        -Path "Tools/Scripts/Test-ConfigSpecSettingsOrder.ps1") -ceq
+    "/Tools/Scripts/Test-ConfigSpecSettingsOrder.ps1") `
+    "Verification source reads no longer preserve original path casing and canonical leading slash."
 $relativePathCandidate = Copy-VerificationObject $exactCandidates[0]
 $relativePathCandidate.filePath = "src/a.cs"
 $dotPathCandidate = Copy-VerificationObject $exactCandidates[1]
-$dotPathCandidate.filePath = "./src/a.cs"
+$dotPathCandidate.filePath = "\src\a.cs"
 Assert-Verification (@(Get-ReviewerVerificationClusters -Candidates @(
             $relativePathCandidate, $dotPathCandidate
         )).Count -eq 1) `
@@ -399,7 +430,7 @@ $widenedPolicy.maxCandidates = 640
 $widenedPolicy.maxClusterSize = 80
 $widenedPolicy.maxInputBytes = 900000
 $widenedPolicy.maxArtifactBytes = 3000000
-$widenedPolicy.maxVerifierRuns = 120
+$widenedPolicy.maxVerifierRuns = 640
 $widenedPolicy.maxVerificationSeconds = 36000
 $clampedPolicy = ConvertTo-ReviewerVerificationEffectivePolicy -Policy $widenedPolicy
 Assert-Verification (
@@ -411,18 +442,43 @@ Assert-Verification (
     [int]$clampedPolicy.maxVerificationSeconds -eq $script:ReviewerVerificationMaxPhaseSeconds
 ) "Policy values widened a code-defined verification ceiling."
 
-# Assignment is cross-model for generalists and explicitly named for convention.
+# Every exact blind-origin candidate receives fresh cross-checks from both
+# generalists, including the model that performed its separate blind pass.
 $assignments = @(Get-ReviewerVerificationAssignments -Clusters $exactClusters `
     -GeneralistModels @($opus, $sol) -ConventionVerifierModel $sol)
-Assert-Verification ($assignments.Count -eq 2 -and
+Assert-Verification ($assignments.Count -eq 4 -and
+    @($assignments | Where-Object { $_.originModel -ceq $opus -and $_.verifierModel -ceq $opus }).Count -eq 1 -and
     @($assignments | Where-Object { $_.originModel -ceq $opus -and $_.verifierModel -ceq $sol }).Count -eq 1 -and
-    @($assignments | Where-Object { $_.originModel -ceq $sol -and $_.verifierModel -ceq $opus }).Count -eq 1) `
-    "Generalist origin/model assignment did not cross-verify Opus and Sol."
+    @($assignments | Where-Object { $_.originModel -ceq $sol -and $_.verifierModel -ceq $opus }).Count -eq 1 -and
+    @($assignments | Where-Object { $_.originModel -ceq $sol -and $_.verifierModel -ceq $sol }).Count -eq 1) `
+    "Blind findings were not assigned to both fresh generalist cross-checkers."
+$sevenCandidatePass = New-GeneralistPass -Model $sol -Findings @(
+    1..7 | ForEach-Object {
+        New-GeneralistFinding -FilePath "/src/coverage-$_.cs" -Line (100 + $_) `
+            -Comment "Bounded candidate $_ reports a distinct changed behavior failure."
+    }
+)
+$sevenCandidates = @(ConvertTo-ReviewerVerificationCandidates -GeneralistPasses @($sevenCandidatePass))
+$sevenClusters = @(Get-ReviewerVerificationClusters -Candidates $sevenCandidates)
+$fourteenAssignments = @(Get-ReviewerVerificationAssignments -Clusters $sevenClusters `
+        -GeneralistModels @($opus, $sol))
+$fourteenCoverage = Assert-ReviewerVerificationAssignmentCoverage -Clusters $sevenClusters `
+    -Assignments $fourteenAssignments -RequiredVerifierModels @($opus, $sol) -MaxVerifierRuns 14
+Assert-Verification ($sevenCandidates.Count -eq 7 -and $fourteenAssignments.Count -eq 14 -and
+    [int]$fourteenCoverage.requiredAssignmentCount -eq 14 -and
+    [int]$fourteenCoverage.declaredMaxVerifierRuns -eq 14) `
+    "A seven-candidate union did not receive all fourteen GPT/Opus assignments."
+Assert-VerificationThrows {
+    Assert-ReviewerVerificationAssignmentCoverage -Clusters $sevenClusters `
+        -Assignments $fourteenAssignments -RequiredVerifierModels @($opus, $sol) `
+        -MaxVerifierRuns 13
+} "An insufficient declared budget was accepted before verifier launch."
 $opusCandidate = @($exactCandidates | Where-Object originModel -ceq $opus)[0]
-$singleAssignments = @(Get-ReviewerVerificationAssignments -Clusters @(
+Assert-VerificationThrows {
+    Get-ReviewerVerificationAssignments -Clusters @(
         (Get-ReviewerVerificationClusters -Candidates @($opusCandidate))[0]
-    ) -GeneralistModels @($opus))
-Assert-Verification ($singleAssignments.Count -eq 0) "A sole-origin candidate was self-assigned."
+    ) -GeneralistModels @($opus)
+} "Cross-verification accepted fewer than two distinct generalist models."
 
 $conventionCandidates = @(ConvertTo-ReviewerVerificationCandidates `
     -ConventionCandidates @((New-ConventionCandidate)) -ConventionModel "claude-sonnet-5" `
@@ -430,13 +486,279 @@ $conventionCandidates = @(ConvertTo-ReviewerVerificationCandidates `
 $conventionClusters = @(Get-ReviewerVerificationClusters -Candidates $conventionCandidates)
 $conventionAssignments = @(Get-ReviewerVerificationAssignments -Clusters $conventionClusters `
     -GeneralistModels @($opus, $sol) -ConventionVerifierModel $sol)
-Assert-Verification ($conventionAssignments.Count -eq 1 -and
-    $conventionAssignments[0].verifierModel -ceq $sol) `
-    "Convention candidate did not use its explicitly named generalist verifier."
-$selfConventionAssignments = @(Get-ReviewerVerificationAssignments -Clusters $conventionClusters `
-    -GeneralistModels @($opus, $sol) -ConventionVerifierModel "claude-sonnet-5")
-Assert-Verification ($selfConventionAssignments.Count -eq 0) `
-    "Library assignment allowed a convention candidate to verify itself."
+Assert-Verification ($conventionAssignments.Count -eq 2 -and
+    @($conventionAssignments.verifierModel | Sort-Object) -join "|" -ceq
+        "$opus|$sol") `
+    "Convention candidate did not receive both generalist cross-checks."
+Assert-VerificationThrows {
+    Get-ReviewerVerificationAssignments -Clusters $conventionClusters `
+        -GeneralistModels @($opus, $sol) -ConventionVerifierModel "claude-sonnet-5"
+} "The specialist model was accepted as a convention cross-checker."
+$sameModelConvention = @(ConvertTo-ReviewerVerificationCandidates `
+    -ConventionCandidates @((New-ConventionCandidate -CandidateId "same-model-specialist")) `
+    -ConventionModel $opus -ConventionArtifactSha256 ("d" * 64))
+$sameModelClusters = @(Get-ReviewerVerificationClusters -Candidates $sameModelConvention)
+Assert-VerificationThrows {
+    Get-ReviewerVerificationAssignments -Clusters $sameModelClusters `
+        -GeneralistModels @($opus, $sol) -ConventionVerifierModel $sol `
+        -ChangedPaths @("/src/a.cs")
+} "The specialist discovery model was assigned to cross-check its own candidate."
+
+$originUnionPasses = @(
+    (New-GeneralistPass -Model $sol -Findings @(
+            (New-GeneralistFinding -FilePath "/src/gpt-only.cs" -Line 10 `
+                -Comment "The GPT-only blind finding identifies a bounded retry defect.")
+        )),
+    (New-GeneralistPass -Model $opus -Findings @(
+            (New-GeneralistFinding -FilePath "/src/opus-only.cs" -Line 20 `
+                -Comment "The Opus-only blind finding identifies a bounded validation defect.")
+        ))
+)
+$originUnion = @(ConvertTo-ReviewerVerificationCandidates -GeneralistPasses $originUnionPasses `
+    -ConventionCandidates @((New-ConventionCandidate -CandidateId "specialist-only")) `
+    -ConventionModel "claude-sonnet-5" -ConventionArtifactSha256 ("c" * 64))
+$originUnionClusters = @(Get-ReviewerVerificationClusters -Candidates $originUnion)
+$originUnionAssignments = @(Get-ReviewerVerificationAssignments -Clusters $originUnionClusters `
+    -GeneralistModels @($opus, $sol) -ConventionVerifierModel $sol `
+    -ChangedPaths @("/src/gpt-only.cs", "/src/opus-only.cs", "/src/a.cs"))
+Assert-Verification ($originUnion.Count -eq 3 -and $originUnionAssignments.Count -eq 6 -and
+    @($originUnion | Where-Object originModel -ceq $sol).Count -eq 1 -and
+    @($originUnion | Where-Object originModel -ceq $opus).Count -eq 1 -and
+    @($originUnion | Where-Object originKind -ceq "convention").Count -eq 1 -and
+    @($originUnionAssignments | Where-Object verifierModel -ceq "claude-sonnet-5").Count -eq 0) `
+    "The exact blind candidate union omitted a sole-origin finding or assigned the specialist as cross-checker."
+
+# Generalist-origin convention findings are deterministically bound to the exact
+# sealed rule and changed-file range before either verifier sees them.
+$localizationSection = "### Use localized strings in exceptions and web action methods"
+$localizationSourceId = "localized-exception-guidance"
+$localizationRuleQuote = "Exception messages must use localized resource strings."
+$bindingPlan = [pscustomobject]@{
+    selectedPacks = @([pscustomobject]@{
+            name = "csharp-localization"
+            matchedPaths = @(
+                [pscustomobject]@{ role = "current"; path = "/src/gpt-only.cs" },
+                [pscustomobject]@{ role = "current"; path = "src/opus-only.cs" }
+            )
+            sources = @([pscustomobject]@{ sourceId = $localizationSourceId })
+        })
+}
+$bindingSource = [pscustomobject]@{
+    PackName = "csharp-localization"; SourceId = $localizationSourceId
+    RepositoryId = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+    Path = "/engineeringprocesses/conventions/codingpatterns.md"; CommitSha = "2" * 40
+    Sha256 = "d" * 64; Section = $localizationSection
+    Text = "$localizationSection`n$localizationRuleQuote"
+}
+$bindingAnchors = @(
+    [pscustomobject]@{
+        anchorId = "cf0"; path = "/src/gpt-only.cs"
+        rightHandRanges = @([pscustomobject]@{ startLine = 1112; endLine = 1112 })
+    },
+    [pscustomobject]@{
+        anchorId = "cf1"; path = "/src/opus-only.cs"
+        rightHandRanges = @([pscustomobject]@{ startLine = 23; endLine = 25 })
+    }
+)
+$gptOnlyPass = New-GeneralistPass -Model $sol -Findings @(
+    (New-GeneralistFinding -FilePath "src/gpt-only.cs" -Line 1112 `
+        -Comment "The InvalidOperationException message is not localized.")
+)
+$opusOnlyPass = New-GeneralistPass -Model $opus -Findings @(
+    (New-GeneralistFinding -FilePath "\src\opus-only.cs" -Line 24 `
+        -Comment "This exception message bypasses the localization resource mechanism.")
+)
+$enrichedGeneralists = @(ConvertTo-ReviewerVerificationCandidates `
+        -GeneralistPasses @($gptOnlyPass, $opusOnlyPass) -ConventionPlan $bindingPlan `
+        -ResolvedSources @($bindingSource) -ChangedFileAnchors $bindingAnchors)
+Assert-Verification ($enrichedGeneralists.Count -eq 4 -and
+    @($enrichedGeneralists | Where-Object {
+            [bool]$_.conventionBound -and [string]$_.ruleBindingOrigin -ceq "wrapper" -and
+            [string]$_.ruleSourceId -ceq $localizationSourceId -and
+            [string]$_.ruleQuote -ceq $localizationRuleQuote -and
+            [string]$_.changedCodeFix.valueSource -ceq "authoritativeRule" -and
+            [string]$_.changedCodeFix.conventionKey -ceq $localizationSourceId -and
+            [string]$_.changedCodeFix.targets -cmatch '^cf[01]$'
+        }).Count -eq 2 -and
+    @($enrichedGeneralists | Where-Object {
+            -not [bool]$_.conventionBound -and [string]$_.ruleSourceId -ceq ""
+        }).Count -eq 2) `
+    "GPT-only or Opus-only blind findings were not enriched with exact sealed rule/remediation evidence."
+foreach ($candidate in $enrichedGeneralists) {
+    Assert-Verification (Test-Json -Json ($candidate | ConvertTo-Json -Depth 32 -Compress) `
+            -SchemaFile $schemaPath) `
+        "A wrapper-enriched generalist candidate failed the versioned schema."
+}
+Assert-Verification (@($enrichedGeneralists | Where-Object {
+            [string](Get-ReviewerVerificationValue (
+                    Get-ReviewerVerificationValue $_ "changedCodeFix" $null) "conventionKey" "") `
+                -cmatch '(?i)resource(key)?$'
+        }).Count -eq 0) `
+    "Wrapper enrichment invented a localization resource key."
+Assert-Verification ([bool]$conventionCandidates[0].conventionBound -and
+    [string]$conventionCandidates[0].ruleBindingOrigin -ceq "blindSpecialist") `
+    "A specialist-only structured candidate lost its sealed convention binding."
+$line1112SpecialistRaw = New-ConventionCandidate -CandidateId "line-1112-specialist"
+$line1112SpecialistRaw.filePath =
+    "/src/flow/Roles/Flow.Worker.Cloud.New/Jobs/AutomationProject/AutomationProjectApplicationProvisioningJob.cs"
+$line1112SpecialistRaw.line = 1112
+$line1112SpecialistRaw.changedCodeFix.targets = "cf1"
+$line1112SpecialistUnion = @(ConvertTo-ReviewerVerificationCandidates `
+        -ConventionCandidates @($line1112SpecialistRaw) -ConventionModel "claude-sonnet-5" `
+        -ConventionArtifactSha256 ("c" * 64))
+$line1112SpecialistAssignments = @(Get-ReviewerVerificationAssignments `
+        -Clusters (Get-ReviewerVerificationClusters -Candidates $line1112SpecialistUnion) `
+        -GeneralistModels @($opus, $sol) `
+        -ChangedPaths @($line1112SpecialistRaw.filePath))
+Assert-Verification ($line1112SpecialistUnion.Count -eq 1 -and
+    [int]$line1112SpecialistUnion[0].line -eq 1112 -and
+    [string]$line1112SpecialistUnion[0].changedCodeFix.targets -ceq "cf1" -and
+    $line1112SpecialistAssignments.Count -eq 2) `
+    "The exact cf1 line-1112 specialist finding did not enter the blind union with both cross-checks."
+$noBinding = @(ConvertTo-ReviewerVerificationCandidates `
+        -GeneralistPasses @($gptOnlyPass) -ConventionPlan $bindingPlan `
+        -ResolvedSources @($bindingSource) -ChangedFileAnchors @(
+            [pscustomobject]@{
+                anchorId = "cf0"; path = "/src/gpt-only.cs"
+                rightHandRanges = @([pscustomobject]@{ startLine = 1113; endLine = 1114 })
+            }))
+Assert-Verification ($noBinding.Count -eq 1 -and -not [bool]$noBinding[0].conventionBound -and
+    [string]$noBinding[0].ruleSourceId -ceq "") `
+    "An out-of-span finding received invented convention evidence."
+$unrelatedPass = New-GeneralistPass -Model $sol -Findings @(
+    (New-GeneralistFinding -FilePath "src/gpt-only.cs" -Line 1112 `
+        -Comment "This dereference can produce a null reference failure.")
+)
+$unrelatedBinding = @(ConvertTo-ReviewerVerificationCandidates `
+        -GeneralistPasses @($unrelatedPass) -ConventionPlan $bindingPlan `
+        -ResolvedSources @($bindingSource) -ChangedFileAnchors $bindingAnchors)
+Assert-Verification ($unrelatedBinding.Count -eq 1 -and
+    -not [bool]$unrelatedBinding[0].conventionBound -and
+    [string]$unrelatedBinding[0].ruleSourceId -ceq "") `
+    "An unrelated generalist finding was speculatively replaced by a convention-bound candidate."
+$crossSectionSource = $bindingSource.PSObject.Copy()
+$crossSectionSource.Text = "$localizationSection`n## Unrelated rule`n$localizationRuleQuote"
+$crossSectionBinding = @(ConvertTo-ReviewerVerificationCandidates `
+        -GeneralistPasses @($gptOnlyPass) -ConventionPlan $bindingPlan `
+        -ResolvedSources @($crossSectionSource) -ChangedFileAnchors $bindingAnchors)
+Assert-Verification ($crossSectionBinding.Count -eq 1 -and
+    -not [bool]$crossSectionBinding[0].conventionBound) `
+    "Rule enrichment escaped the selected Markdown section into an unrelated peer section."
+Assert-VerificationThrows {
+    ConvertTo-ReviewerVerificationCandidates -GeneralistPasses @($gptOnlyPass) `
+        -ConventionPlan $bindingPlan -ResolvedSources @($bindingSource, $bindingSource) `
+        -ChangedFileAnchors $bindingAnchors
+} "Ambiguous sealed convention source identity was accepted for wrapper enrichment."
+$enrichedGptCandidate = @($enrichedGeneralists | Where-Object {
+        [string]$_.originModel -ceq $sol -and [bool]$_.conventionBound
+    })[0]
+$enrichedCluster = @(Get-ReviewerVerificationClusters -Candidates @($enrichedGptCandidate))
+$enrichedAssignments = @(Get-ReviewerVerificationAssignments -Clusters $enrichedCluster `
+        -GeneralistModels @($opus, $sol) -ChangedPaths @($enrichedGptCandidate.filePath))
+$enrichedEvidence = Get-TestEvidenceHunks -Clusters $enrichedCluster
+$enrichedAccepted = Resolve-ReviewerVerificationDecisions -Clusters $enrichedCluster `
+    -Assignments $enrichedAssignments -VerifierRuns (New-CompleteRuns -Assignments $enrichedAssignments) `
+    -ChangedPaths @($enrichedGptCandidate.filePath) -FactPlan $factPlan `
+    -ResolvedSources @($bindingSource) -EvidenceHunks $enrichedEvidence `
+    -RequiredVerifierModels @($opus, $sol)
+Assert-Verification (@($enrichedAccepted.eligible).Count -eq 1 -and
+    [string]$enrichedAccepted.eligible[0].changedCodeFix.targets -ceq "cf0" -and
+    [string]$enrichedAccepted.eligible[0].comment -clike "*changed-file anchor(s) cf0*") `
+    "Fresh GPT and Opus concurrence did not accept the wrapper-enriched localization candidate."
+$enrichedReconciliationCandidates = @(Get-ReviewerVerificationAcceptedReconciliationCandidates `
+        -Eligible @($enrichedAccepted.eligible) -Decisions @($enrichedAccepted.decisions) `
+        -Clusters $enrichedCluster)
+Assert-Verification ($enrichedReconciliationCandidates.Count -eq 1 -and
+    [string]$enrichedReconciliationCandidates[0].ruleSourceId -ceq $localizationSourceId -and
+    [string]$enrichedReconciliationCandidates[0].changedCodeFix.targets -ceq "cf0") `
+    "An accepted enriched generalist finding did not enter run reconciliation."
+$peerCandidate = Copy-ReviewerVerificationJsonValue -Value $enrichedGptCandidate
+$peerCandidate.candidateId = "cand1:" + ("e" * 64)
+$peerCandidate.candidateHash = "e" * 64
+$peerCandidate.ruleSourceId = "second-localization-rule"
+$peerCandidate.ruleSourceSha256 = "e" * 64
+$peerCluster = Copy-ReviewerVerificationJsonValue -Value $enrichedCluster[0]
+$peerCluster.members = @($enrichedGptCandidate, $peerCandidate)
+$peerDecisions = @(
+    $enrichedAccepted.decisions[0],
+    [pscustomobject]@{
+        candidateId = $peerCandidate.candidateId; correctedSeverity = "none"
+        existingDebtFollowUpRetained = $false; confidence = "high"
+    }
+)
+$peerReconciliationCandidates = @(Get-ReviewerVerificationAcceptedReconciliationCandidates `
+        -Eligible @($enrichedAccepted.eligible) -Decisions $peerDecisions -Clusters @($peerCluster))
+Assert-Verification ($peerReconciliationCandidates.Count -eq 2 -and
+    @($peerReconciliationCandidates.ruleSourceId) -ccontains "second-localization-rule") `
+    "Reconciliation omitted an accepted convention peer that was not the rendered cluster winner."
+$enrichedDisagreementRuns = @(
+    (New-VerifierRun -Assignment $enrichedAssignments[0]),
+    (New-VerifierRun -Assignment $enrichedAssignments[1] -Outcome unsupported)
+)
+$enrichedDisagreement = Resolve-ReviewerVerificationDecisions -Clusters $enrichedCluster `
+    -Assignments $enrichedAssignments -VerifierRuns $enrichedDisagreementRuns `
+    -ChangedPaths @($enrichedGptCandidate.filePath) -FactPlan $factPlan `
+    -ResolvedSources @($bindingSource) -EvidenceHunks $enrichedEvidence `
+    -RequiredVerifierModels @($opus, $sol)
+Assert-Verification (@($enrichedDisagreement.eligible).Count -eq 0 -and
+    @($enrichedDisagreement.withheld | Where-Object reason -ceq "verifierDisagreement").Count -eq 1) `
+    "Verifier disagreement did not withhold the wrapper-enriched localization candidate."
+
+$requiredSingleCandidate = @((Get-ReviewerVerificationClusters -Candidates @($opusCandidate))[0])
+$requiredAssignments = @(Get-ReviewerVerificationAssignments -Clusters $requiredSingleCandidate `
+    -GeneralistModels @($opus, $sol))
+$requiredEvidence = Get-TestEvidenceHunks -Clusters $requiredSingleCandidate
+$oneCrossCheck = Resolve-ReviewerVerificationDecisions -Clusters $requiredSingleCandidate `
+    -Assignments @($requiredAssignments[0]) `
+    -VerifierRuns @((New-VerifierRun -Assignment $requiredAssignments[0])) `
+    -ChangedPaths @("src/a.cs") -FactPlan $factPlan -EvidenceHunks $requiredEvidence `
+    -RequiredVerifierModels @($opus, $sol)
+Assert-Verification (@($oneCrossCheck.eligible).Count -eq 0 -and
+    @($oneCrossCheck.withheld | Where-Object reason -ceq "incompleteVerifier").Count -eq 1) `
+    "A candidate became eligible without both required GPT and Opus cross-checks."
+$bothCrossChecks = Resolve-ReviewerVerificationDecisions -Clusters $requiredSingleCandidate `
+    -Assignments $requiredAssignments -VerifierRuns (New-CompleteRuns -Assignments $requiredAssignments) `
+    -ChangedPaths @("src/a.cs") -FactPlan $factPlan -EvidenceHunks $requiredEvidence `
+    -RequiredVerifierModels @($opus, $sol)
+Assert-Verification (@($bothCrossChecks.eligible).Count -eq 1 -and
+    @($bothCrossChecks.decisions[0].verifierModels | Sort-Object) -join "|" -ceq
+        "$opus|$sol") `
+    "Dual GPT and Opus concurrence did not make the exact candidate eligible."
+$acceptedCluster = @($originUnionClusters | Where-Object {
+        @($_.members | Where-Object originKind -ceq "convention").Count -eq 1
+    })[0]
+$specialistMember = @($acceptedCluster.members | Where-Object originKind -ceq "convention")[0]
+$generalistMember = @($originUnion | Where-Object originKind -ceq "generalist")[0]
+$mixedCluster = [pscustomobject][ordered]@{
+    clusterId = $acceptedCluster.clusterId
+    members = @($generalistMember, $specialistMember)
+}
+$acceptedConventionIds = @(Get-ReviewerVerificationAcceptedConventionCandidateIds -Decisions @(
+        [pscustomobject]@{
+            candidateId = $specialistMember.candidateId
+        }
+    ) -Clusters @($mixedCluster))
+Assert-Verification ($acceptedConventionIds.Count -eq 1 -and
+    $acceptedConventionIds[0] -ceq "specialist-only") `
+    "An accepted cluster lost its specialist semantic candidate when the rendered winner was generalist-originated."
+$rejectedConventionIds = @(Get-ReviewerVerificationAcceptedConventionCandidateIds -Decisions @(
+        [pscustomobject]@{
+            candidateId = $generalistMember.candidateId
+        }
+    ) -Clusters @($mixedCluster))
+Assert-Verification ($rejectedConventionIds.Count -eq 0) `
+    "A specialist candidate rejected by its own cross-checks entered reconciliation through an eligible cluster peer."
+$effectiveConventionCandidates = @(Get-ReviewerVerificationAcceptedConventionCandidates `
+    -ConventionCandidates @((New-ConventionCandidate -CandidateId "specialist-only" -DebtRequired)) `
+    -Decisions @([pscustomobject]@{
+            candidateId = $specialistMember.candidateId
+            correctedSeverity = "suggestion"
+            existingDebtFollowUpRetained = $false
+        }) -Clusters @($mixedCluster))
+Assert-Verification ($effectiveConventionCandidates.Count -eq 1 -and
+    [string]$effectiveConventionCandidates[0].severity -ceq "suggestion" -and
+    [string]$effectiveConventionCandidates[0].existingDebtFollowUp.status -ceq "none") `
+    "Reconciliation retained specialist severity or debt semantics rejected by both cross-checkers."
 Assert-Verification (
     (Test-ReviewerVerificationReportedModel -ExpectedModel $sol -ReportedModel $sol) -and
     -not (Test-ReviewerVerificationReportedModel -ExpectedModel $sol -ReportedModel "") -and
@@ -449,9 +771,9 @@ $runCapBudget = Get-ReviewerVerificationRunBudget -RunsLaunched 2 -MaxRuns 2 `
 $deadlineBudget = Get-ReviewerVerificationRunBudget -RunsLaunched 1 -MaxRuns 2 `
     -ElapsedSeconds 100 -MaxPhaseSeconds 120 -ConfiguredRunTimeoutSeconds 90
 $widenedRunBudget = Get-ReviewerVerificationRunBudget `
-    -RunsLaunched $script:ReviewerVerificationMaxVerifierRuns -MaxRuns 120 `
+    -RunsLaunched $script:ReviewerVerificationMaxVerifierRuns -MaxRuns 640 `
     -ElapsedSeconds 0 -MaxPhaseSeconds 36000 -ConfiguredRunTimeoutSeconds 90
-$widenedTimeBudget = Get-ReviewerVerificationRunBudget -RunsLaunched 0 -MaxRuns 120 `
+$widenedTimeBudget = Get-ReviewerVerificationRunBudget -RunsLaunched 0 -MaxRuns 640 `
     -ElapsedSeconds $script:ReviewerVerificationMaxPhaseSeconds `
     -MaxPhaseSeconds 36000 -ConfiguredRunTimeoutSeconds 90
 Assert-Verification ([bool]$withinBudget.canRun -and $withinBudget.timeoutSeconds -eq 90 -and
@@ -999,7 +1321,7 @@ $sourceQuoteOption = @(Get-ReviewerVerificationEvidenceOptions -Candidate $conve
 $sourceQuoteRun = New-VerifierRun -Assignment $conventionAssignments[0] `
     -EvidenceKind sourceQuote -EvidenceSha256 ([string]$sourceQuoteOption.sha256)
 $sourceQuoteResolved = Resolve-ReviewerVerificationDecisions -Clusters $conventionClusters `
-    -Assignments $conventionAssignments -VerifierRuns @($sourceQuoteRun) `
+    -Assignments @($conventionAssignments[0]) -VerifierRuns @($sourceQuoteRun) `
     -ChangedPaths @("src/a.cs") -FactPlan $factPlan -ResolvedSources $resolvedSources
 Assert-Verification (@($sourceQuoteResolved.eligible).Count -eq 1) `
     "A wrapper-advertised source-quote evidence option was rejected."
@@ -1009,7 +1331,7 @@ $siblingOption = @(Get-ReviewerVerificationEvidenceOptions -Candidate $conventio
 $siblingRun = New-VerifierRun -Assignment $conventionAssignments[0] `
     -EvidenceKind sibling -EvidenceSha256 ([string]$siblingOption.sha256)
 $siblingResolved = Resolve-ReviewerVerificationDecisions -Clusters $conventionClusters `
-    -Assignments $conventionAssignments -VerifierRuns @($siblingRun) `
+    -Assignments @($conventionAssignments[0]) -VerifierRuns @($siblingRun) `
     -ChangedPaths @("src/a.cs") -FactPlan $factPlan -ResolvedSources $resolvedSources
 Assert-Verification (@($siblingResolved.eligible).Count -eq 1) `
     "A wrapper-advertised sibling evidence option was rejected."
@@ -1020,7 +1342,7 @@ $factRun = New-VerifierRun -Assignment $conventionAssignments[0] `
     -EvidenceKind deterministicFact -EvidenceSha256 ([string]$factOption.sha256) `
     -FactIds ([string]$factOption.factIds)
 $factResolved = Resolve-ReviewerVerificationDecisions -Clusters $conventionClusters `
-    -Assignments $conventionAssignments -VerifierRuns @($factRun) `
+    -Assignments @($conventionAssignments[0]) -VerifierRuns @($factRun) `
     -ChangedPaths @("src/a.cs") -FactPlan $factPlan -ResolvedSources $resolvedSources
 Assert-Verification (@($factResolved.eligible).Count -eq 1) `
     "A wrapper-advertised deterministic-fact evidence option was rejected."
@@ -1098,7 +1420,7 @@ $metadataRun = New-VerifierRun -Assignment $metadataAssignments[0] `
     -EvidenceKind deterministicFact -EvidenceSha256 ([string]$metadataOption.sha256) `
     -FactIds $metadataFactId
 $metadataResolved = Resolve-ReviewerVerificationDecisions -Clusters $metadataClusters `
-    -Assignments $metadataAssignments -VerifierRuns @($metadataRun) -ChangedPaths @("src/a.cs") `
+    -Assignments @($metadataAssignments[0]) -VerifierRuns @($metadataRun) -ChangedPaths @("src/a.cs") `
     -FactPlan $factPlan
 Assert-Verification (@($metadataResolved.eligible).Count -eq 1) `
     "A PR-metadata candidate with exact deterministic evidence was unreachable."
@@ -1138,6 +1460,29 @@ Assert-Verification (@($widenedCandidatePlan.candidates).Count -eq
     $script:ReviewerVerificationMaxCandidates -and
     @($widenedCandidatePlan.withheld).Count -eq 1) `
     "A policy value widened the code-defined candidate ceiling."
+$pairedBoundPlan = Get-ReviewerVerificationCandidatePlan -GeneralistPasses @(
+    (New-GeneralistPass -Model $sol -Findings @(
+            (New-GeneralistFinding -FilePath "src/gpt-only.cs" -Line 1112 `
+                -Comment "The InvalidOperationException message is not localized."),
+            (New-GeneralistFinding -FilePath "src/gpt-only.cs" -Line 1112 `
+                -Comment "This exception message does not use a localized resource.")
+        ))
+) -ConventionPlan $bindingPlan -ResolvedSources @($bindingSource) `
+    -ChangedFileAnchors $bindingAnchors -MaxCandidates 3
+$pairedOrigins = @($pairedBoundPlan.candidates | Where-Object {
+        [string]$_.ruleBindingOrigin -cne "wrapper"
+    })
+$orphanedEnrichment = @($pairedBoundPlan.candidates | Where-Object {
+        [string]$_.ruleBindingOrigin -ceq "wrapper"
+    } | Where-Object {
+        $variant = $_
+        @($pairedOrigins | Where-Object {
+                [string]$_.originArtifactSha256 -ceq [string]$variant.originArtifactSha256 -and
+                [string]$_.originCandidateId -ceq [string]$variant.originCandidateId
+            }).Count -ne 1
+    })
+Assert-Verification ($pairedOrigins.Count -eq 2 -and $orphanedEnrichment.Count -eq 0) `
+    "Candidate bounding retained a wrapper enrichment after withholding its original blind finding."
 $oversizedFindings = @(1..9 | ForEach-Object {
         New-GeneralistFinding -Comment "The exact retry state failure loses data."
     })
@@ -1322,6 +1667,7 @@ $replayInput = [pscustomobject][ordered]@{
     resolvedSources = @()
     evidenceHunks = @(Get-TestEvidenceHunks -Clusters $exactClusters)
     specialistStatus = "complete"
+    crossCheckModels = @($opus, $sol)
 }
 $replayRuns = New-CompleteRuns -Assignments $assignments
 $replayOne = Invoke-ReviewerVerificationReplay -InputManifest $replayInput -VerifierRuns $replayRuns
@@ -1437,6 +1783,32 @@ Assert-Verification ($sourceHunkText -match 'ConvertTo-ReviewerVerificationReadP
     $sourceHunkText -match '\$fileCache\[\$normalizedPath\]' -and
     $sourceHunkText -match '-Path\s+\$path') `
     "Source-hunk reads do not separate normalized cache identity from case-preserving request paths."
+. ([scriptblock]::Create($sourceHunkText))
+$script:pinnedSourceReadCount = 0
+function Invoke-ReviewerConventionSession {
+    param([string]$AgencyPath, [scriptblock]$Action)
+    return & $Action @{}
+}
+function Get-ReviewerPinnedSourceFiles {
+    param($Session, [string]$CommitSha, [string[]]$Paths)
+    $script:pinnedSourceReadCount++
+    throw "The sealed source slice should have avoided a whole-file source read."
+}
+$sealedSliceHunks = @(Get-ReviewerVerificationSourceHunks -AgencyPath "unused" `
+        -SourceCommit ("2" * 40) -Candidates @($enrichedGptCandidate) `
+        -ChangedPaths @("\src\gpt-only.cs") -SourceReport ([pscustomobject]@{
+            Files = @([pscustomobject]@{
+                    Path = "src/gpt-only.cs"
+                    Slices = @([pscustomobject]@{
+                            StartLine = 1110; EndLine = 1114
+                            Text = "context 1110`ncontext 1111`nthrow new InvalidOperationException(message);`ncontext 1113`ncontext 1114"
+                        })
+                })
+        }))
+Assert-Verification ($sealedSliceHunks.Count -eq 1 -and
+    [string]$sealedSliceHunks[0].sourceKind -ceq "sealedSourceSlice" -and
+    [int]$sealedSliceHunks[0].line -eq 1112 -and $script:pinnedSourceReadCount -eq 0) `
+    "Verifier evidence did not reuse the normalized sealed source slice."
 $crossPassText = Get-VerificationFunctionText -Text $wrapperText `
     -Name "Invoke-ReviewerCrossVerificationPass"
 foreach ($policyUse in @(
@@ -1570,7 +1942,8 @@ function Get-ReviewerPinnedConventionChangeSet {
 }
 function Get-ReviewerVerificationCandidatePlan {
     param($GeneralistPasses, $ConventionCandidates, [string]$ConventionModel,
-        [string]$ConventionArtifactSha256, [int]$MaxCandidates)
+        [string]$ConventionArtifactSha256, $ConventionPlan, $ResolvedSources,
+        $ChangedFileAnchors, [int]$MaxCandidates)
     return [pscustomobject]@{
         candidates = @($script:passCandidates)
         withheld = @()
@@ -1613,10 +1986,32 @@ function Get-ReviewerVerificationClusters {
 }
 function Get-ReviewerVerificationAssignments {
     param($Clusters, $GeneralistModels, [string]$ConventionVerifierModel, $ChangedPaths)
-    return @()
+    $result = [System.Collections.Generic.List[object]]::new()
+    foreach ($cluster in @($Clusters)) {
+        foreach ($candidate in @($cluster.members)) {
+            foreach ($model in @($GeneralistModels)) {
+                [void]$result.Add([pscustomobject]@{
+                        assignmentId = "test-$($candidate.candidateId)-$model"
+                        clusterId = [string]$cluster.clusterId
+                        candidateId = [string]$candidate.candidateId
+                        candidateHash = [string]$candidate.candidateHash
+                        originKind = [string]$candidate.originKind
+                        originModel = [string]$candidate.originModel
+                        conventionBound = [bool](Get-ReviewerVerificationValue `
+                            $candidate "conventionBound" $false)
+                        ruleBindingOrigin = [string](Get-ReviewerVerificationValue `
+                            $candidate "ruleBindingOrigin" "")
+                        ruleQuote = [string](Get-ReviewerVerificationValue `
+                            $candidate "ruleQuote" "")
+                        verifierModel = [string]$model
+                    })
+            }
+        }
+    }
+    return $result.ToArray()
 }
 function Get-ReviewerVerificationSourceHunks {
-    param([string]$AgencyPath, [string]$SourceCommit, $Candidates, $ChangedPaths)
+    param([string]$AgencyPath, [string]$SourceCommit, $Candidates, $ChangedPaths, $SourceReport)
     return @()
 }
 function Get-ReviewerVerificationThreadFacts {
@@ -1633,6 +2028,21 @@ function Save-ReviewerVerificationInput {
     $script:capturedVerificationInput = $Manifest
     return Join-Path ([IO.Path]::GetTempPath()) "$BaseName.json"
 }
+function Invoke-ReviewerVerificationModelRun {
+    param($AgencyPath, $Binding, $InputManifestSha256, $Cluster, $VerifierModel,
+        $AssignedCandidates, $SiblingEvidence, $EvidenceHunks, $CandidateEvidence,
+        $DeterministicFacts, $ThreadFacts, [int]$TimeoutSeconds)
+    return [pscustomobject]@{
+        status = "complete"; reason = ""; detail = ""; model = $VerifierModel
+        clusterId = [string]$Cluster.clusterId; nonceSha256 = "9" * 64
+        promptSha256 = "4" * 64; inputBytes = 128
+        toolAudit = [pscustomobject]@{
+            grantedPermissions = @(); availableTools = @(); deniedPermissions = @()
+            requestedTools = @(); requestAuditTruncated = $false; modifiedFiles = @()
+        }
+        marker = $null
+    }
+}
 function Invoke-ReviewerVerificationReplay {
     param($InputManifest, $VerifierRuns)
     return [pscustomobject]@{
@@ -1646,7 +2056,7 @@ function Write-ReviewerVerificationDecisionPreview {
     param([int]$PrId, [string]$SourceCommit, [string]$Status, [string]$Diagnostic,
         [string]$InputArtifactPath, [string]$InputManifestSha256, $Clusters,
         $Assignments, $VerifierRuns, $Decisions, $Withheld, $Eligible,
-        $AllCandidates, $InputArtifactHashes, [int]$TotalCandidateCount,
+        $AllCandidates, $ReconciliationManifest, $InputArtifactHashes, [int]$TotalCandidateCount,
         [string]$ReplaySha256)
     return [pscustomobject]@{
         MarkdownPath = Join-Path ([IO.Path]::GetTempPath()) "preview.md"
@@ -1659,12 +2069,18 @@ $passBound = @{
     FactPlanPath = "facts.json"; ChangedPaths = @("src/a.cs")
 }
 $emptySpecialistResult = [pscustomobject]@{
-    Status = "complete"; Candidates = @(); Manifest = $null; ArtifactPath = ""
+    Status = "complete"; Candidates = @()
+    Manifest = [pscustomobject]@{ status = "complete"; candidates = @() }
+    ArtifactPath = ""
 }
+$completePassResults = @(
+    [pscustomobject]@{ Model = $opus; Marker = [pscustomobject]@{ findings = @() }; Reason = "" },
+    [pscustomobject]@{ Model = $sol; Marker = [pscustomobject]@{ findings = @() }; Reason = "" }
+)
 $script:passFactPlan = $factPlan
 $script:passCandidates = @($duplicatePartitionCandidate, $goodPartitionCandidate)
 $duplicatePass = Invoke-ReviewerCrossVerificationPass -AgencyPath "unused" -CycleNumber 1 `
-    -Bound $passBound -PassResults @() -SpecialistResult $emptySpecialistResult
+    -Bound $passBound -PassResults $completePassResults -SpecialistResult $emptySpecialistResult
 Assert-Verification ($duplicatePass.Status -ceq "complete" -and
     @($duplicatePass.Eligible).Count -eq 1 -and
     [string]$duplicatePass.Eligible[0].candidateId -ceq "good-fact-candidate" -and
@@ -1674,7 +2090,7 @@ Assert-Verification ($duplicatePass.Status -ceq "complete" -and
 $script:passFactPlan = $overflowFactPlan
 $script:passCandidates = @($overflowPartitionCandidate, $goodPartitionCandidate)
 $overflowSafe = Invoke-ReviewerCrossVerificationSafely -AgencyPath "unused" -CycleNumber 2 `
-    -Bound $passBound -PassResults @() -SpecialistResult $emptySpecialistResult
+    -Bound $passBound -PassResults $completePassResults -SpecialistResult $emptySpecialistResult
 Assert-Verification ($overflowSafe.Status -ceq "complete" -and
     @($overflowSafe.Eligible).Count -eq 1 -and
     [string]$overflowSafe.Eligible[0].candidateId -ceq "good-fact-candidate" -and
@@ -1707,7 +2123,7 @@ $script:clusterSequenceCall = 0
 $script:passFactPlan = [pscustomobject]@{ facts = $mergeFacts }
 $script:passCandidates = $mergeCandidates
 $removalMergePass = Invoke-ReviewerCrossVerificationPass -AgencyPath "unused" -CycleNumber 3 `
-    -Bound $passBound -PassResults @() -SpecialistResult $emptySpecialistResult
+    -Bound $passBound -PassResults $completePassResults -SpecialistResult $emptySpecialistResult
 Assert-Verification ($removalMergePass.Status -ceq "complete" -and
     @($removalMergePass.Eligible).Count -eq 1 -and
     [string]$removalMergePass.Eligible[0].candidateId -ceq "merge-candidate-1" -and
@@ -1716,6 +2132,15 @@ Assert-Verification ($removalMergePass.Status -ceq "complete" -and
     @($removalMergePass.Withheld.candidateId) -ccontains "merge-candidate-3" -and
     $script:clusterSequenceCall -eq 3) `
     "Removal-induced cluster merging recreated an over-cap run or degraded the production pass."
+$script:passCandidates = @($goodPartitionCandidate)
+$missingSpecialistPass = Invoke-ReviewerCrossVerificationSafely -AgencyPath "unused" -CycleNumber 4 `
+    -Bound $passBound -PassResults $completePassResults -SpecialistResult ([pscustomobject]@{
+        Status = "degraded"; Candidates = @(); Manifest = $null; ArtifactPath = ""
+    })
+Assert-Verification ($missingSpecialistPass.Status -ceq "degraded" -and
+    @($missingSpecialistPass.Eligible).Count -eq 0 -and
+    [string]$missingSpecialistPass.Diagnostic -clike "*completed specialist blind pass*") `
+    "Cross-verification launched or exposed eligible findings without all three blind passes."
 $script:clusterSequenceMode = ""
 
 if ($failures.Count -gt 0) {

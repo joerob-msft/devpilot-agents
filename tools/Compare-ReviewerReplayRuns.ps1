@@ -8,11 +8,11 @@
     snapshot twice and the specialist may word a rule differently, or read an
     anchor differently, and either run on its own looks like a result.
 
-    This reads the sealed specialist artifacts from two or more such runs and
-    collapses them. Anything the runs disagree about becomes `unknown`, and any
-    candidate whose sealed semantic identity is not present in every run is
-    withheld. Presentation text is audited separately and never selected from a
-    run. There is no majority vote and no tie-break: disagreement is the answer.
+    This reads sealed verification-decision artifacts, using their embedded
+    reconciliation manifests so only candidates accepted by both generalist
+    cross-checkers enter reconciliation. Legacy specialist artifacts remain
+    readable for compatibility. Anything the runs disagree about becomes
+    `unknown`; there is no majority vote or tie-break.
 
     The output is an evaluation artifact. It is sealed under the replay key, so
     it can never verify against the promotion path, and it says so in its own
@@ -51,7 +51,9 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $reviewerRoot = Join-Path (Split-Path -Parent $PSScriptRoot) "src\Agents\reviewer"
+. (Join-Path $reviewerRoot "SourceTransport.ps1")
 . (Join-Path $reviewerRoot "ConventionSpecialist.ps1")
+. (Join-Path $reviewerRoot "CrossVerification.ps1")
 . (Join-Path $reviewerRoot "RunReconciliation.ps1")
 
 function Get-ReviewerReplayRunMasterKey {
@@ -212,7 +214,23 @@ if ($RunSetPath) {
 foreach ($path in @($ArtifactPath)) {
     $resolved = (Resolve-Path -LiteralPath $path).ProviderPath
     $key = $(if ($replayKeys.Count -eq 1) { $replayKeys[0] } else { $replayKeys[$index] })
-    $manifest = Read-ReviewerConventionSpecialistPreview -Path $resolved -MasterKey $key
+    $manifest = $null
+    try {
+        $verificationManifest = Read-ReviewerVerificationPreview -Path $resolved -MasterKey $key
+        $manifest = Get-ReviewerConventionSpecialistValue `
+            -Object $verificationManifest -Name "reconciliationManifest" -Default $null
+        if ($null -eq $manifest) {
+            throw "Verification decision artifact has no reconciliation manifest."
+        }
+    }
+    catch {
+        try {
+            $manifest = Read-ReviewerConventionSpecialistPreview -Path $resolved -MasterKey $key
+        }
+        catch {
+            throw
+        }
+    }
     $replay = $manifest.PSObject.Properties["replay"]
     if ($null -eq $replay -or $null -eq $replay.Value) {
         throw "Artifact '$resolved' is not a replay artifact; live-run artifacts are not reconciled here."

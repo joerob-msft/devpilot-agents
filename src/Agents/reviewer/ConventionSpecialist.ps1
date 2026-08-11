@@ -18,11 +18,26 @@ $script:ReviewerConventionSpecialistUtf8 = [System.Text.UTF8Encoding]::new($fals
 
 function ConvertTo-ReviewerConventionSpecialistCanonicalPath {
     param([AllowEmptyString()][string]$Path = "")
-    $value = $Path.Trim().Replace('\', '/').Normalize([Text.NormalizationForm]::FormKC)
-    if (-not $value) { return "" }
-    if ($value.StartsWith("./", [StringComparison]::Ordinal)) { $value = $value.Substring(2) }
-    if (-not $value.StartsWith("/", [StringComparison]::Ordinal)) { $value = "/$value" }
-    return $value.TrimEnd('/').ToLowerInvariant()
+    if (-not (Get-Command ConvertTo-ReviewerSourceIdentityPath -ErrorAction SilentlyContinue)) {
+        throw "Convention specialist path validation requires SourceTransport.ps1."
+    }
+    return ConvertTo-ReviewerSourceIdentityPath -Path $Path
+}
+
+function ConvertTo-ReviewerConventionSpecialistRangesByPath {
+    param([hashtable]$RightHandRangesByPath = @{})
+    $result = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($rawPath in $RightHandRangesByPath.Keys) {
+        $path = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path ([string]$rawPath)
+        if (-not $path) {
+            throw "Changed-file right-hand ranges contain an invalid repository path."
+        }
+        if ($result.ContainsKey($path)) {
+            throw "Changed-file right-hand ranges contain ambiguous path identity '$path'."
+        }
+        $result.Add($path, @($RightHandRangesByPath[$rawPath]))
+    }
+    return $result
 }
 
 function Test-ReviewerConventionSpecialistInteger {
@@ -71,7 +86,7 @@ function Get-ReviewerConventionSpecialistRemediationErrors {
     $valueSource = [string](Get-ReviewerConventionSpecialistValue $changedFix "valueSource" "")
     $changedFactText = [string](Get-ReviewerConventionSpecialistValue $changedFix "evidenceFactIds" "")
     if (@("add", "modify", "remove", "rename", "replace", "validate") -cnotcontains $action -or
-        $conventionKey -cnotmatch '^[A-Za-z_][A-Za-z0-9_.:-]{0,127}$' -or
+        $conventionKey -cnotmatch '^[A-Za-z_][A-Za-z0-9_.:\-]{0,127}$' -or
         @("authoritativeRule", "deterministicFact") -cnotcontains $valueSource -or
         ($valueSource -ceq "authoritativeRule" -and $changedFactText) -or
         ($valueSource -ceq "deterministicFact" -and -not $changedFactText)) {
@@ -236,6 +251,8 @@ $script:ReviewerConventionSpecialistConstructKinds = @(
 # fields share it, and four copies of a regex is four chances to edit three.
 $script:ReviewerConventionSpecialistConstructListPattern =
 '^(|(mi|dc|cm|as)[0-9]{1,3}(-(mi|dc|cm|as)[0-9]{1,3})?(,(mi|dc|cm|as)[0-9]{1,3}(-(mi|dc|cm|as)[0-9]{1,3})?)*)$'
+$script:ReviewerConventionSpecialistChangedLineListPattern =
+'^(|cf[0-9]{1,3}:[1-9][0-9]{0,6}(,cf[0-9]{1,3}:[1-9][0-9]{0,6})*)$'
 $script:ReviewerConventionSpecialistConstructPrefixes = @{
     invocation = "mi"; declaration = "dc"; comment = "cm"; assignment = "as"
 }
@@ -582,7 +599,7 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                                         Type = "string"; MaxLength = 600
                                         Pattern = '^(prMetadata|[a-z]{2}[0-9]+(,[a-z]{2}[0-9]+){0,31})$'
                                     }
-                                    conventionKey = @{ Type = "string"; MaxLength = 128; Pattern = '^[A-Za-z_][A-Za-z0-9_.:-]{0,127}$' }
+                                    conventionKey = @{ Type = "string"; MaxLength = 128; Pattern = '^[A-Za-z_][A-Za-z0-9_.:\-]{0,127}$' }
                                     valueSource = @{ Type = "enum"; Values = @("authoritativeRule", "deterministicFact") }
                                     evidenceFactIds = @{
                                         Type = "string"; MaxLength = 600; AllowEmpty = $true
@@ -635,12 +652,9 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
             # marker's brace-scan window - at which point there is no report at
             # all, because the whole marker falls outside the scan.
             #
-            # A row anchors on CONSTRUCT IDS, not on file and line. The wrapper
-            # enumerated every changed construct itself, so an id resolves to an
-            # exact path and line that the wrapper can check - and, more to the
-            # A row anchors on CONSTRUCT IDS, not on file and line. The wrapper
-            # enumerated every changed construct itself, so an id resolves to an
-            # exact path and line that the wrapper can check - and, more to the
+            # Lexical accounting remains on construct ids. A separate exact
+            # cf<n>:<line> channel covers rule violations on delivered right-hand
+            # lines that do not belong to any lexical construct.
             # point, the row must give a VERDICT for every anchor in the kinds
             # it declares: violating, compliant, out of the rule's reach, or
             # unknown, disjoint and covering the set exactly. That is what stops
@@ -655,6 +669,7 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                         "ruleRef", "ruleSourceSha256", "ruleQuote", "status",
                         "scope", "violatingConstructs", "compliantConstructs",
                         "notInReachConstructs", "unknownConstructs",
+                        "violatingChangedFileTargets",
                         "codeEvidence", "siblingStatus", "siblingEvidence",
                         "candidateId", "notes"
                     )
@@ -690,11 +705,11 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                         # short spans, and the section has to stay well inside
                         # the marker scan window it shares with the candidates.
                         violatingConstructs = @{
-                            Type = "string"; MaxLength = 400; AllowEmpty = $true
+                            Type = "string"; MaxLength = 370; AllowEmpty = $true
                             Pattern = $script:ReviewerConventionSpecialistConstructListPattern
                         }
                         compliantConstructs = @{
-                            Type = "string"; MaxLength = 400; AllowEmpty = $true
+                            Type = "string"; MaxLength = 370; AllowEmpty = $true
                             Pattern = $script:ReviewerConventionSpecialistConstructListPattern
                         }
                         # Anchors the row examined and judged outside the rule's
@@ -705,15 +720,21 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                         # judgement and deserves somewhere to be written down;
                         # what is NOT allowed is silence.
                         notInReachConstructs = @{
-                            Type = "string"; MaxLength = 400; AllowEmpty = $true
+                            Type = "string"; MaxLength = 370; AllowEmpty = $true
                             Pattern = $script:ReviewerConventionSpecialistConstructListPattern
                         }
                         # Anchors the row could not decide about. A first-class
                         # answer, and the only honest one when the source was
                         # not delivered or the rule text does not settle it.
                         unknownConstructs = @{
-                            Type = "string"; MaxLength = 400; AllowEmpty = $true
+                            Type = "string"; MaxLength = 370; AllowEmpty = $true
                             Pattern = $script:ReviewerConventionSpecialistConstructListPattern
+                        }
+                        violatingChangedFileTargets = @{
+                            # There can be at most eight candidates in the marker;
+                            # eight cf<n>:<line> targets fit within this bound.
+                            Type = "string"; MaxLength = 128; AllowEmpty = $true
+                            Pattern = $script:ReviewerConventionSpecialistChangedLineListPattern
                         }
                         # No ASCII pattern on the three prose fields, lengths
                         # with real headroom rather than a cap that tracks the
@@ -935,18 +956,25 @@ function Get-ReviewerConventionSpecialistChangedFileIndex {
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$ChangeEntries,
         [hashtable]$RightHandRangesByPath = @{}
     )
-    $paths = @(@($ChangeEntries) |
-        Where-Object { [string](Get-ReviewerConventionSpecialistValue $_ "Role" "") -ceq "current" } |
-        ForEach-Object { [string](Get-ReviewerConventionSpecialistValue $_ "Path" "") } |
-        Where-Object { $_ } |
-        Select-Object -Unique)
-    $sorted = [string[]]@($paths)
+    $pathSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($entry in @($ChangeEntries)) {
+        if ([string](Get-ReviewerConventionSpecialistValue $entry "Role" "") -cne "current") { continue }
+        $path = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+            [string](Get-ReviewerConventionSpecialistValue $entry "Path" ""))
+        if (-not $path) { throw "Changed-file index contains an invalid current repository path." }
+        if (-not $pathSet.Add($path)) {
+            throw "Changed-file index contains ambiguous duplicate path identity '$path'."
+        }
+    }
+    $sorted = [string[]]@($pathSet)
     [Array]::Sort($sorted, [StringComparer]::Ordinal)
+    $canonicalRanges = ConvertTo-ReviewerConventionSpecialistRangesByPath `
+        -RightHandRangesByPath $RightHandRangesByPath
     $index = [System.Collections.Generic.List[object]]::new()
     for ($i = 0; $i -lt $sorted.Count; $i++) {
         $ranges = @()
-        if ($RightHandRangesByPath.ContainsKey($sorted[$i])) {
-            $ranges = @($RightHandRangesByPath[$sorted[$i]] | ForEach-Object {
+        if ($canonicalRanges.ContainsKey($sorted[$i])) {
+            $ranges = @($canonicalRanges[$sorted[$i]] | ForEach-Object {
                     [pscustomobject][ordered]@{
                         startLine = [int](Get-ReviewerConventionSpecialistValue $_ "startLine" 0)
                         endLine = [int](Get-ReviewerConventionSpecialistValue $_ "endLine" 0)
@@ -1043,6 +1071,7 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         # has to account for every one; scope only identifies the applicable
         # subset that may carry a verdict other than not-in-reach.
         [AllowEmptyCollection()][object[]]$Constructs = @(),
+        [AllowEmptyCollection()][object[]]$ChangedFileAnchors = @(),
         # True when the enumeration itself was incomplete - a cap was hit, or a
         # file could not be lexed to the end. An accounting that fully covers a
         # construct set that is missing entries is not complete, and saying so
@@ -1071,6 +1100,31 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         $constructById.Add($id, $construct)
         [void]$idsByKind[$kind].Add($id)
     }
+    $changedLineAnchors = [System.Collections.Generic.Dictionary[string, object]]::new(
+        [StringComparer]::Ordinal)
+    foreach ($anchor in @($ChangedFileAnchors)) {
+        $anchorId = [string](Get-ReviewerConventionSpecialistValue $anchor "anchorId" "")
+        $anchorPath = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+            [string](Get-ReviewerConventionSpecialistValue $anchor "path" ""))
+        if ($anchorId -cnotmatch '^cf[0-9]+$' -or -not $anchorPath) {
+            throw "Changed-file line-target table contains a malformed anchor."
+        }
+        if ($changedLineAnchors.ContainsKey($anchorId)) {
+            throw "Changed-file line-target table contains duplicate anchor '$anchorId'."
+        }
+        $ranges = [System.Collections.Generic.List[object]]::new()
+        foreach ($range in @(Get-ReviewerConventionSpecialistValue $anchor "rightHandRanges" @())) {
+            $startLine = [int](Get-ReviewerConventionSpecialistValue $range "startLine" 0)
+            $endLine = [int](Get-ReviewerConventionSpecialistValue $range "endLine" 0)
+            if ($startLine -lt 1 -or $endLine -lt $startLine) {
+                throw "Changed-file line-target table contains a malformed right-hand range."
+            }
+            [void]$ranges.Add([pscustomobject]@{ startLine = $startLine; endLine = $endLine })
+        }
+        $changedLineAnchors.Add($anchorId, [pscustomobject]@{
+                path = $anchorPath; ranges = $ranges.ToArray()
+            })
+    }
 
     $candidateIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $candidateAnchors = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
@@ -1082,7 +1136,8 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         $candidateAnchorKinds[$candidateId] = [string](Get-ReviewerConventionSpecialistValue `
                 $candidate "anchorKind" "")
         $candidateAnchors[$candidateId] = "{0}|{1}" -f `
-            (([string](Get-ReviewerConventionSpecialistValue $candidate "filePath" "")).TrimStart("/")),
+            (ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+                [string](Get-ReviewerConventionSpecialistValue $candidate "filePath" ""))),
         ([int](Get-ReviewerConventionSpecialistValue $candidate "line" 0))
         [void]$candidateRuleKeys.Add(("{0}/{1}" -f `
                 [string](Get-ReviewerConventionSpecialistValue $candidate "packName" ""),
@@ -1156,6 +1211,36 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         $compliantIds = @($partition["compliantConstructs"])
         $notInReach = @($partition["notInReachConstructs"])
         $unknownIds = @($partition["unknownConstructs"])
+        $violatingChangedLines = @(([string](Get-ReviewerConventionSpecialistValue `
+                    $row "violatingChangedFileTargets" "")) -split ',' | Where-Object { $_ })
+        $lineTargetSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $resolvedLineTargets = [System.Collections.Generic.Dictionary[string, string]]::new(
+            [StringComparer]::Ordinal)
+        $invalidLineTargets = [System.Collections.Generic.List[string]]::new()
+        foreach ($target in $violatingChangedLines) {
+            $parts = @(([string]$target) -split ':')
+            $valid = ($lineTargetSet.Add([string]$target) -and $parts.Count -eq 2 -and
+                $parts[0] -cmatch '^cf[0-9]+$' -and $parts[1] -cmatch '^[1-9][0-9]*$' -and
+                $changedLineAnchors.ContainsKey([string]$parts[0]))
+            $line = $(if ($valid) { [int]$parts[1] } else { 0 })
+            if ($valid) {
+                $anchor = $changedLineAnchors[[string]$parts[0]]
+                $valid = @($anchor.ranges | Where-Object {
+                        $line -ge [int]$_.startLine -and $line -le [int]$_.endLine
+                    }).Count -gt 0
+                if ($valid) {
+                    $resolvedLineTargets.Add([string]$target, "$([string]$anchor.path)|$line")
+                }
+            }
+            if (-not $valid) { [void]$invalidLineTargets.Add([string]$target) }
+        }
+        if ($invalidLineTargets.Count -gt 0) {
+            $status = "unknown"
+            if (-not $degradedReason) {
+                $degradedReason = "the row named duplicate or unavailable changed-file line targets: " +
+                    (@($invalidLineTargets | Select-Object -First 20) -join ",")
+            }
+        }
         if (-not $partitionOk) {
             $status = "unknown"
             if (-not $degradedReason) { $degradedReason = "the row wrote a construct range the wrapper could not read" }
@@ -1210,13 +1295,15 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         # a clean row that had weighed nothing. A rule that reaches nothing must
         # say WHICH anchors it does not reach, and it cannot do that without
         # naming the kinds those anchors belong to.
-        if ($constructById.Count -gt 0 -and @($scopeKinds).Count -eq 0) {
+        if ($constructById.Count -gt 0 -and @($scopeKinds).Count -eq 0 -and
+            @($violatingChangedLines).Count -eq 0) {
             $status = "unknown"
             if (-not $degradedReason) {
                 $degradedReason = "the row declared no construct kind while $($constructById.Count) anchors were enumerated; a rule that reaches nothing must name the kinds it would govern and put their anchors out of reach"
             }
         }
-        elseif ($constructById.Count -gt 0 -and $required.Count -eq 0) {
+        elseif (@($scopeKinds).Count -gt 0 -and $constructById.Count -gt 0 -and
+            $required.Count -eq 0) {
             $status = "unknown"
             if (-not $degradedReason) {
                 $degradedReason = "the row declared scope '$scope', but that scope contains no anchors in the sealed construct universe"
@@ -1263,7 +1350,8 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         # Exact 1:1 coverage of the full sealed universe. Scope is checked
         # separately above so an outside-kind anchor can appear only out of
         # reach, never as a substantive or undecided judgement.
-        $verdictBearing = @(@($violating) + @($compliantIds) + @($unknownIds))
+        $verdictBearing = @(@($violating) + @($compliantIds) + @($unknownIds) +
+            @($violatingChangedLines))
         $weighedAnything = @($verdictBearing).Count -gt 0
         $missingConstructs = @(@($sealedUniverse) | Where-Object { -not $seenInPartition.Contains($_) })
         if ($missingConstructs.Count -gt 0) {
@@ -1326,7 +1414,7 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         # anchors read, which is the whole point.
         if (-not $degradedReason) {
             $derived = $(if (@($unknownIds).Count -gt 0) { "unknown" }
-                elseif (@($violating).Count -gt 0) { "violation" }
+                elseif (@($violating).Count -gt 0 -or @($violatingChangedLines).Count -gt 0) { "violation" }
                 elseif (-not $weighedAnything) { "notApplicable" }
                 else { "compliant" })
             if ($derived -cne $status) {
@@ -1354,7 +1442,7 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
                     else { "the row linked a candidate that this pass did not emit" })
             }
         }
-        elseif ($linkedCandidate -and $violating.Count -gt 0 -and
+        elseif ($linkedCandidate -and
             [string]$candidateAnchorKinds[$linkedCandidate] -cne "prMetadata") {
             # A wrong-anchor row cannot stand in for the right one. If the
             # linked candidate does not sit on one of the constructs this row
@@ -1362,7 +1450,15 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
             # about another, and neither has actually been accounted for.
             $candidateAnchor = [string]$candidateAnchors[$linkedCandidate]
             $anchorMatches = $false
+            foreach ($target in $violatingChangedLines) {
+                if ($resolvedLineTargets.ContainsKey([string]$target) -and
+                    [string]$resolvedLineTargets[[string]$target] -ceq $candidateAnchor) {
+                    $anchorMatches = $true
+                    break
+                }
+            }
             foreach ($id in $violating) {
+                if ($anchorMatches) { break }
                 $construct = $constructById[$id]
                 # A construct the enumerator could not finish reading has an
                 # endLine that is where the walk gave up, not where the call
@@ -1371,10 +1467,11 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
                 # license a comment almost anywhere. An anchor has to be an
                 # anchor.
                 if ([string](Get-ReviewerConventionSpecialistValue $construct "status" "known") -cne "known") { continue }
-                $constructPath = ([string](Get-ReviewerConventionSpecialistValue $construct "path" "")).TrimStart("/")
+                $constructPath = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+                    [string](Get-ReviewerConventionSpecialistValue $construct "path" ""))
                 $candidateParts = $candidateAnchor -split '\|'
                 if ($candidateParts.Count -ne 2) { continue }
-                if (-not [string]::Equals($constructPath, [string]$candidateParts[0], [StringComparison]::OrdinalIgnoreCase)) { continue }
+                if (-not [string]::Equals($constructPath, [string]$candidateParts[0], [StringComparison]::Ordinal)) { continue }
                 # ANYWHERE inside the construct, not just its opening line. The
                 # rule that started this is about the last argument of a
                 # multi-line call, and a reviewer anchors that comment on the
@@ -1390,7 +1487,7 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
                 $status = "unknown"
                 $linkedCandidate = ""
                 if (-not $degradedReason) {
-                    $degradedReason = "the candidate it linked is anchored somewhere other than the constructs this row calls violating"
+                    $degradedReason = "the candidate it linked is anchored somewhere other than the constructs or changed-file targets this row calls violating"
                 }
             }
         }
@@ -1402,7 +1499,8 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         # row unknown, and a pre- or post-derive degrade rewrites the status
         # too - either way a violation the row explicitly named would vanish
         # from the record entirely, which is the opposite of the point.
-        if (@($violating).Count -gt 0 -and -not $linkedCandidate -and -not $alreadyWithheld -and -not $ruleProducedCandidate) {
+        if ((@($violating).Count -gt 0 -or @($violatingChangedLines).Count -gt 0) -and
+            -not $linkedCandidate -and -not $alreadyWithheld -and -not $ruleProducedCandidate) {
             [void]$unemitted.Add([pscustomobject][ordered]@{
                     packName = [string]$entry.packName
                     ruleSourceId = [string]$entry.ruleSourceId
@@ -1418,6 +1516,7 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
                 status = $status
                 scope = $scope
                 violatingConstructs = @($violating)
+                violatingChangedFileTargets = @($violatingChangedLines)
                 compliantConstructs = @($compliantIds)
                 notInReachConstructs = @($notInReach)
                 unknownConstructs = @($unknownIds)
@@ -1449,6 +1548,14 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         }
     }
     $checkedConstructCount = $checkedSet.Count
+    $checkedChangedFileTargetSet = [System.Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal)
+    foreach ($row in @($normalized)) {
+        foreach ($target in @($row.violatingChangedFileTargets)) {
+            [void]$checkedChangedFileTargetSet.Add([string]$target)
+        }
+    }
+    $checkedChangedFileTargetCount = $checkedChangedFileTargetSet.Count
     $notInReachConstructCount = $notInReachSet.Count
     $missing = [System.Collections.Generic.List[string]]::new()
     foreach ($entry in @($request.Requested)) {
@@ -1484,6 +1591,7 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
         # which one they are looking at.
         EnumeratedConstructCount = $constructById.Count
         CheckedConstructCount = $checkedConstructCount
+        CheckedChangedFileTargetCount = $checkedChangedFileTargetCount
         NotInReachConstructCount = $notInReachConstructCount
         UnemittedViolations = @($unemitted.ToArray())
         ConstructsIncomplete = $ConstructsIncomplete
@@ -1516,7 +1624,8 @@ function Resolve-ReviewerConventionSpecialistRuleCoverage {
             # legitimately rule its anchors out of reach - but then the whole
             # checklist has looked at nothing, and "Complete" would be the one
             # word a reader trusts.
-            (@($Constructs).Count -eq 0 -or $checkedConstructCount -gt 0))
+            (@($Constructs).Count -eq 0 -or $checkedConstructCount -gt 0 -or
+                $checkedChangedFileTargetCount -gt 0))
     }
 }
 
@@ -1556,12 +1665,21 @@ function Resolve-ReviewerConventionSpecialistCandidates {
         $id = [string](Get-ReviewerConventionSpecialistValue $fact "id" "")
         if ($id -and -not $factMap.ContainsKey($id)) { $factMap.Add($id, $fact) }
     }
-    $currentPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $currentPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($entry in @($ChangeEntries)) {
         if ([string](Get-ReviewerConventionSpecialistValue $entry "Role" "") -ceq "current") {
-            [void]$currentPaths.Add([string](Get-ReviewerConventionSpecialistValue $entry "Path" ""))
+            $currentPath = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+                [string](Get-ReviewerConventionSpecialistValue $entry "Path" ""))
+            if (-not $currentPath) {
+                throw "Convention specialist change entries contain an invalid current repository path."
+            }
+            if (-not $currentPaths.Add($currentPath)) {
+                throw "Convention specialist change entries contain ambiguous duplicate path identity '$currentPath'."
+            }
         }
     }
+    $canonicalRanges = ConvertTo-ReviewerConventionSpecialistRangesByPath `
+        -RightHandRangesByPath $RightHandRangesByPath
     $seenIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $accepted = [System.Collections.Generic.List[object]]::new()
     $withheld = [System.Collections.Generic.List[object]]::new()
@@ -1672,10 +1790,11 @@ function Resolve-ReviewerConventionSpecialistCandidates {
             }
         }
         if ([string]$candidate.anchorKind -ceq "changedFile") {
-            $relativePath = ([string]$candidate.filePath).TrimStart("/")
+            $relativePath = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+                [string]$candidate.filePath)
             $lineInChangedRange = $false
-            if ($RightHandRangesByPath.ContainsKey($relativePath)) {
-                foreach ($range in @($RightHandRangesByPath[$relativePath])) {
+            if ($canonicalRanges.ContainsKey($relativePath)) {
+                foreach ($range in @($canonicalRanges[$relativePath])) {
                     $startLine = [int](Get-ReviewerConventionSpecialistValue $range "startLine" 0)
                     $endLine = [int](Get-ReviewerConventionSpecialistValue $range "endLine" 0)
                     if ([int]$candidate.line -ge $startLine -and [int]$candidate.line -le $endLine) {
@@ -1686,7 +1805,7 @@ function Resolve-ReviewerConventionSpecialistCandidates {
             }
             if (-not [string]$candidate.filePath -or [int]$candidate.line -lt 1 -or
                 -not $currentPaths.Contains($relativePath) -or
-                ($RightHandRangesByPath.Count -gt 0 -and -not $lineInChangedRange)) {
+                ($canonicalRanges.Count -gt 0 -and -not $lineInChangedRange)) {
                 [void]$withheld.Add([pscustomobject][ordered]@{
                         candidateId = $candidateId
                         reason = "outsideChangedFile"
@@ -1694,6 +1813,7 @@ function Resolve-ReviewerConventionSpecialistCandidates {
                     })
                 continue
             }
+            $candidate.filePath = $relativePath
         }
         else {
             if ([string]$candidate.filePath -or [int]$candidate.line -ne 0 -or $facts.Count -eq 0 -or
@@ -1719,6 +1839,7 @@ function Resolve-ReviewerConventionSpecialistCandidates {
     $coverage = Resolve-ReviewerConventionSpecialistRuleCoverage -Rows $coverageRows `
         -ResolvedSources $ResolvedSources `
         -AcceptedCandidates $accepted.ToArray() -Constructs $Constructs `
+        -ChangedFileAnchors $changedFileIndex `
         -ConstructsIncomplete $ConstructsIncomplete `
         -WithheldCandidateIds @(@($withheld) | ForEach-Object {
                 [string](Get-ReviewerConventionSpecialistValue $_ "candidateId" "")

@@ -181,6 +181,12 @@ one answers. For exact source replay, live capture also uses
 `-IterationId` and `-CommonCommit`. The sealer requires those values to match
 the artifact before it writes the schema-v2 manifest:
 
+Use `-CaptureSourceTransportOnly` with the capture path when the evidence must
+be sealed before any model sees it. The wrapper then requires the source gate
+to pass for the explicitly named `-PullRequestId`, writes the artifact, and
+stops before authoritative-source reads or model launches. This mode also
+requires `-Once`.
+
 ```json
 [
   {
@@ -228,6 +234,12 @@ would quietly make the run about a different pull request than the operator
 pinned. The snapshot's organization, project and repository must match the
 running configuration, or the run refuses rather than producing a
 self-consistent artifact stamped with the wrong identity.
+
+Long-running qualification slots must be launched through an attached sync/async
+shell whose completion notification is owned by the active session, or through an
+explicit scheduled/manual wake-up. A detached child process does not wake the
+session when it exits and must never be treated as an automatic resume mechanism.
+Status checks do not restart, resume, or replace an immutable attempted slot.
 
 `-DryRun` cannot be combined with replay: the self-checks run against their own
 fixtures and never open a session.

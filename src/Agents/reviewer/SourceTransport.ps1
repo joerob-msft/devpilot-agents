@@ -1191,6 +1191,7 @@ function ConvertTo-ReviewerSourcePath {
        permits those characters; this reviewer does not need them. #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path) -or $Path.Length -gt $script:ReviewerSourceMaxPathLength) { return "" }
+    if (-not [string]::Equals($Path, $Path.Trim(), [StringComparison]::Ordinal)) { return "" }
     if ($Path -match '[\x00-\x1f\x7f]' -or $Path -match '^[A-Za-z]:') { return "" }
     if ($Path -match '[|`<>]') { return "" }
     # A path that cannot be strictly UTF-8 encoded - a lone surrogate, say - is
@@ -1198,6 +1199,9 @@ function ConvertTo-ReviewerSourcePath {
     # transports it throws, and a throw there leaves the whole pull request
     # unreviewable rather than this one path rejected.
     try { [void]$script:ReviewerSourceUtf8.GetByteCount($Path) } catch { return "" }
+    # Preserve every non-separator code point exactly as Git reported it.
+    # Compatibility normalization can turn fullwidth punctuation into path
+    # separators or model-facing Markdown metacharacters.
     $normalized = $Path.Replace('\', '/')
     if ($normalized.StartsWith("//", [StringComparison]::Ordinal)) { return "" }
     if (-not $normalized.StartsWith("/", [StringComparison]::Ordinal)) { $normalized = "/" + $normalized }
@@ -1207,6 +1211,15 @@ function ConvertTo-ReviewerSourcePath {
         if ($segment -eq "" -or $segment -eq "." -or $segment -eq "..") { return "" }
     }
     return $normalized
+}
+
+function ConvertTo-ReviewerSourceIdentityPath {
+    <# Produces the one case-insensitive repository-path identity used by
+       specialist, verification, replay lookup, reconciliation, and previews. #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Path)
+    $normalized = ConvertTo-ReviewerSourcePath -Path $Path
+    if (-not $normalized) { return "" }
+    return $normalized.ToLowerInvariant()
 }
 
 function New-ReviewerSourceTransportPolicy {
@@ -3452,9 +3465,12 @@ function Get-ReviewerSourceRightHandRangesByPath {
     param([Parameter(Mandatory)]$Report)
     $result = @{}
     foreach ($sourceFile in @($Report.Files)) {
-        $path = ConvertTo-ReviewerSourcePath -Path ([string]$sourceFile.Path)
+        $path = ConvertTo-ReviewerSourceIdentityPath -Path ([string]$sourceFile.Path)
         if (-not $path) { continue }
-        $result[$path.TrimStart("/")] = @($sourceFile.RawSpans | ForEach-Object {
+        if ($result.ContainsKey($path)) {
+            throw "Source report contains ambiguous duplicate path identity '$path'."
+        }
+        $result[$path] = @($sourceFile.RawSpans | ForEach-Object {
                 [pscustomobject][ordered]@{
                     startLine = [int]$_.Start
                     endLine = [int]$_.End
@@ -3479,10 +3495,15 @@ function Assert-ReviewerSourceReplayExactKeys {
         [Parameter(Mandatory)][string]$Where,
         [Parameter(Mandatory)][string[]]$Expected
     )
-    if ($Value -isnot [System.Collections.IDictionary]) {
+    if ($Value -is [System.Collections.IDictionary]) {
+        $actual = [string[]]@($Value.Keys | ForEach-Object { [string]$_ })
+    }
+    elseif ($Value -is [pscustomobject]) {
+        $actual = [string[]]@($Value.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    }
+    else {
         throw "$Where must be an object."
     }
-    $actual = [string[]]@($Value.Keys | ForEach-Object { [string]$_ })
     [Array]::Sort($actual, [StringComparer]::Ordinal)
     $wanted = [string[]]@($Expected)
     [Array]::Sort($wanted, [StringComparer]::Ordinal)

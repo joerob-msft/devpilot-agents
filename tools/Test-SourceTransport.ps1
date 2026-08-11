@@ -486,6 +486,14 @@ Write-Host "[2/9] Repository paths are normalized, never repaired" -ForegroundCo
 Assert-Source ((ConvertTo-ReviewerSourcePath -Path 'src/a.cs') -ceq '/src/a.cs') "a relative path gains a leading slash"
 Assert-Source ((ConvertTo-ReviewerSourcePath -Path '\src\a.cs') -ceq '/src/a.cs') "a backslash path is normalized"
 Assert-Source ((ConvertTo-ReviewerSourcePath -Path '/src/a.cs') -ceq '/src/a.cs') "an already-canonical path is unchanged"
+$fullwidthPipePath = "src$([char]0xFF5C)name.cs"
+$fullwidthSlashPath = "src$([char]0xFF0F)name.cs"
+Assert-Source ((ConvertTo-ReviewerSourcePath -Path $fullwidthPipePath) -ceq "/$fullwidthPipePath") `
+    "compatibility punctuation is preserved rather than normalized into a forbidden Markdown metacharacter"
+Assert-Source ((ConvertTo-ReviewerSourcePath -Path $fullwidthSlashPath) -ceq "/$fullwidthSlashPath") `
+    "compatibility punctuation is preserved rather than normalized into a repository separator"
+Assert-Source ((ConvertTo-ReviewerSourceIdentityPath -Path $fullwidthSlashPath) -cne "/src/name.cs") `
+    "a fullwidth slash cannot alias a distinct Git path identity"
 foreach ($bad in @('', '   ', '/src/../etc/passwd', '//server/share/a.cs', 'C:/temp/a.cs', "/src/a`u{0001}.cs", '/src//a.cs')) {
     Assert-Source ((ConvertTo-ReviewerSourcePath -Path $bad) -ceq '') "unsafe path '$bad' is rejected outright"
 }
@@ -648,9 +656,9 @@ $reportKinds = [ordered]@{
 $report = New-ReviewerSourceTransportReport -CommitSha $commit -ChangedPaths $paths `
     -SpansByPath $spansByPath -Policy $policy -Reader $reader -ChangeKindsByPath $reportKinds
 $rightHandRanges = Get-ReviewerSourceRightHandRangesByPath -Report $report
-Assert-Source ($rightHandRanges.ContainsKey("src/ok.cs") -and
-    [int]$rightHandRanges["src/ok.cs"][0].startLine -eq 5 -and
-    [int]$rightHandRanges["src/ok.cs"][0].endLine -eq 6) `
+Assert-Source ($rightHandRanges.ContainsKey("/src/ok.cs") -and
+    [int]$rightHandRanges["/src/ok.cs"][0].startLine -eq 5 -and
+    [int]$rightHandRanges["/src/ok.cs"][0].endLine -eq 6) `
     "changed-file anchors use normalized paths and exact right-hand changed spans"
 
 Assert-Source (@($report.Files).Count -eq $paths.Count) "every changed path appears in the report exactly once"

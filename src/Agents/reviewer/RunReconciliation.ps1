@@ -363,7 +363,7 @@ function Get-ReviewerRunReconciliationSemanticCandidateIdentity {
     $valueSource = [string](Get-ReviewerRunReconciliationValue $changedFix "valueSource" "")
     $changedEvidenceText = [string](Get-ReviewerRunReconciliationValue $changedFix "evidenceFactIds" "")
     if (@("add", "modify", "remove", "rename", "replace", "validate") -cnotcontains $remediationAction -or
-        $conventionKey -cnotmatch '^[A-Za-z_][A-Za-z0-9_.:-]{0,127}$' -or
+        $conventionKey -cnotmatch '^[A-Za-z_][A-Za-z0-9_.:\-]{0,127}$' -or
         @("authoritativeRule", "deterministicFact") -cnotcontains $valueSource -or
         ($valueSource -ceq "authoritativeRule" -and $changedEvidenceText) -or
         ($valueSource -ceq "deterministicFact" -and -not $changedEvidenceText)) {
@@ -439,8 +439,9 @@ function Get-ReviewerRunReconciliationSemanticCandidateIdentity {
             -Value $(if ($null -eq $row) { @() } else {
                 @(Get-ReviewerRunReconciliationValue $row "violatingConstructs" @())
             }))
-    if ($anchorKind -ceq "changedFile" -and $null -ne $row -and $violatingIds.Count -eq 0) {
-        [void]$errors.Add("candidate has no deterministic violation set")
+    if ($anchorKind -ceq "changedFile" -and $null -ne $row -and
+        $violatingIds.Count -eq 0 -and -not $changedLineBound) {
+        [void]$errors.Add("candidate has neither a deterministic violation set nor a sealed changed-file anchor")
     }
     if ($anchorKind -ceq "prMetadata" -and $factIds.Count -eq 0) {
         [void]$errors.Add("metadata candidate has no deterministic fact evidence")
@@ -486,8 +487,9 @@ function Get-ReviewerRunReconciliationSemanticCandidateIdentity {
             [void]$anchorConstructs.Add($descriptor)
         }
     }
-    if ($anchorKind -ceq "changedFile" -and $null -ne $row -and $anchorConstructs.Count -eq 0) {
-        [void]$errors.Add("candidate anchor does not identify a construct in the violation set")
+    if ($anchorKind -ceq "changedFile" -and $null -ne $row -and
+        $anchorConstructs.Count -eq 0 -and -not $changedLineBound) {
+        [void]$errors.Add("candidate anchor identifies neither a violation construct nor a sealed changed-file range")
     }
     $remediationErrors = [string[]](Get-ReviewerConventionSpecialistRemediationErrors `
             -Candidate $Candidate -Constructs @(Get-ReviewerRunReconciliationValue $coverage "changedConstructs" @()) `
@@ -684,7 +686,10 @@ function Resolve-ReviewerRunReconciliation {
         # looked at nothing. Two of those agree perfectly about nothing.
         $enumerated = [int](Get-ReviewerRunReconciliationValue $coverage "enumeratedConstructCount" 0)
         $checked = [int](Get-ReviewerRunReconciliationValue $coverage "checkedConstructCount" 0)
-        if ($null -ne $coverage -and $enumerated -gt 0 -and $checked -eq 0) {
+        $checkedChangedFileTargets = [int](Get-ReviewerRunReconciliationValue `
+                $coverage "checkedChangedFileTargetCount" 0)
+        if ($null -ne $coverage -and $enumerated -gt 0 -and
+            ($checked + $checkedChangedFileTargets) -eq 0) {
             Add-ReviewerRunReconciliationProblem -Problems $problems -Code "weighedNothing" -Runs @($runIndex) -Text "run $runIndex weighed none of its $enumerated anchors"
         }
         [void]$runSummaries.Add([pscustomobject][ordered]@{
@@ -814,6 +819,8 @@ function Resolve-ReviewerRunReconciliation {
                 run = $run
                 status = [string](Get-ReviewerRunReconciliationValue $row "status" "")
                 violating = [string[]](Get-ReviewerRunReconciliationIdList (Get-ReviewerRunReconciliationValue $row "violatingConstructs" @()))
+                violatingChangedFileTargets = [string[]](Get-ReviewerRunReconciliationIdList (
+                        Get-ReviewerRunReconciliationValue $row "violatingChangedFileTargets" @()))
                 compliant = [string[]](Get-ReviewerRunReconciliationIdList (Get-ReviewerRunReconciliationValue $row "compliantConstructs" @()))
                 notInReach = [string[]](Get-ReviewerRunReconciliationIdList (Get-ReviewerRunReconciliationValue $row "notInReachConstructs" @()))
                 unknown = [string[]](Get-ReviewerRunReconciliationIdList (Get-ReviewerRunReconciliationValue $row "unknownConstructs" @()))
@@ -854,6 +861,19 @@ function Resolve-ReviewerRunReconciliation {
                         $anchorVerdicts[$id][$run] = $verdict
                     }
                 }
+                foreach ($id in @($reading.violatingChangedFileTargets)) {
+                    [void]$anchorIds.Add($id)
+                    if (-not $anchorVerdicts.ContainsKey($id)) {
+                        $anchorVerdicts[$id] = [System.Collections.Generic.Dictionary[int, string]]::new()
+                    }
+                    if ($anchorVerdicts[$id].ContainsKey($run) -and
+                        $anchorVerdicts[$id][$run] -cne "violation") {
+                        $anchorVerdicts[$id][$run] = "conflicted"
+                    }
+                    elseif (-not $anchorVerdicts[$id].ContainsKey($run)) {
+                        $anchorVerdicts[$id][$run] = "violation"
+                    }
+                }
             }
         }
 
@@ -881,6 +901,7 @@ function Resolve-ReviewerRunReconciliation {
         $anchorRows = [System.Collections.Generic.List[object]]::new()
         $anchorStable = $true
         $normalizedViolating = [System.Collections.Generic.List[string]]::new()
+        $normalizedViolatingChangedFileTargets = [System.Collections.Generic.List[string]]::new()
         $normalizedNotInReach = [System.Collections.Generic.List[string]]::new()
         $normalizedWeighed = 0
         $anyAnchorUnknown = $false
@@ -906,7 +927,15 @@ function Resolve-ReviewerRunReconciliation {
                 [void]$disagreements.Add("anchor $id read as " + ($sortedDistinct -join " / "))
             }
             switch -CaseSensitive ($verdictFor) {
-                "violation" { [void]$normalizedViolating.Add($id); $normalizedWeighed++ }
+                "violation" {
+                    if ($id -cmatch '^cf[0-9]{1,3}:[1-9][0-9]{0,8}$') {
+                        [void]$normalizedViolatingChangedFileTargets.Add($id)
+                    }
+                    else {
+                        [void]$normalizedViolating.Add($id)
+                    }
+                    $normalizedWeighed++
+                }
                 "compliant" { $normalizedWeighed++ }
                 "notInReach" { [void]$normalizedNotInReach.Add($id) }
                 default { $anyAnchorUnknown = $true; $normalizedWeighed++ }
@@ -927,7 +956,8 @@ function Resolve-ReviewerRunReconciliation {
             @($distinctRules).Count -le 1 -and -not $distinctStatusSet.Contains("(none)"))
         $stable = [bool]($statusAgreed -and $anchorStable -and @($readings).Count -gt 0)
         $derived = $(if ($anyAnchorUnknown) { "unknown" }
-            elseif ($normalizedViolating.Count -gt 0) { "violation" }
+            elseif ($normalizedViolating.Count -gt 0 -or
+                $normalizedViolatingChangedFileTargets.Count -gt 0) { "violation" }
             elseif ($normalizedWeighed -eq 0) { "notApplicable" }
             else { "compliant" })
         $reconciledStatus = $(if (-not $stable) { "unknown" }
@@ -950,6 +980,9 @@ function Resolve-ReviewerRunReconciliation {
                 readings = @($readings.ToArray())
                 anchors = @($anchorRows.ToArray())
                 violatingConstructs = @($(if ($stable) { $normalizedViolating.ToArray() } else { @() }))
+                violatingChangedFileTargets = @($(if ($stable) {
+                            $normalizedViolatingChangedFileTargets.ToArray()
+                        } else { @() }))
                 notInReachConstructs = @($(if ($stable) { $normalizedNotInReach.ToArray() } else { @() }))
             })
     }
@@ -1103,6 +1136,7 @@ function Resolve-ReviewerRunReconciliation {
             $row.reconciledStatus = "unknown"
             $row.stable = $false
             $row.violatingConstructs = @()
+            $row.violatingChangedFileTargets = @()
             $row.notInReachConstructs = @()
             # The ANCHORS too. Leaving them settled meant a refused comparison
             # printed "1 settled, 0 unsettled" directly under "Reconciled:

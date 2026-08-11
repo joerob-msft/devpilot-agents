@@ -21,6 +21,7 @@ Set-StrictMode -Version Latest
 Import-Module (Join-Path $RepoRoot "src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1") -Force
 . (Join-Path $RepoRoot "src\Agents\reviewer\ConventionSpecialist.ps1")
 . (Join-Path $RepoRoot "src\Agents\reviewer\SourceTransport.ps1")
+. (Join-Path $RepoRoot "src\Agents\reviewer\CrossVerification.ps1")
 
 $script:Checks = 0
 $script:Failures = New-Object System.Collections.Generic.List[string]
@@ -329,6 +330,12 @@ try {
     $artifactBytes = New-ReviewerSourceTransportReplayArtifact -Binding $sourceBinding `
         -Mode azureDevOpsCliFallback -PolicySha256 $sourcePolicySha -Policy $sourcePolicy `
         -Report $liveReport -BlockText $liveBlock
+    $captureShapeBytes = New-ReviewerSourceTransportReplayArtifact `
+        -Binding ([pscustomobject]$sourceBinding) -Mode azureDevOpsCliFallback `
+        -PolicySha256 $sourcePolicySha -Policy $sourcePolicy -Report $liveReport -BlockText $liveBlock
+    Assert-Replay ([Convert]::ToBase64String($captureShapeBytes) -ceq
+        [Convert]::ToBase64String($artifactBytes)) `
+        "The live transport's PSCustomObject binding shape cannot be sealed for replay."
     [IO.File]::WriteAllBytes((Join-Path $v2Dir "source-transport.json"), $artifactBytes)
     & (Join-Path $RepoRoot "tools\Save-AgentReplaySnapshot.ps1") -SnapshotPath $v2Dir `
         -Recipe (Join-Path $v2Dir "recipe.json") -Organization "contoso" -Project "Widgets" `
@@ -873,7 +880,7 @@ try {
         [pscustomobject][ordered]@{ Path = "src/a.cs"; Role = "current" },
         [pscustomobject][ordered]@{ Path = "src/gone.cs"; Role = "original" }
     )
-    Assert-Replay (@($index).Count -eq 2 -and [string]@($index)[0].path -ceq "src/a.cs" -and [string]@($index)[0].anchorId -ceq "cf0") `
+    Assert-Replay (@($index).Count -eq 2 -and [string]@($index)[0].path -ceq "/src/a.cs" -and [string]@($index)[0].anchorId -ceq "cf0") `
         "The changed-file anchor index must be ordinal, deduplicated, and current-role only."
 
     # -- 9. Schema bounds ------------------------------------------------------
@@ -2526,6 +2533,7 @@ try {
             [string]$SnapshotId = "s", [string]$ManifestDigest = ("7" * 64),
             [string]$Complete = "true", [string[]]$Missing = @(),
             [string]$ConstructsIncomplete = "false", [int]$Checked = 1,
+            [int]$CheckedChangedFileTargets = 0,
             [object[]]$ConstructFiles = @(), [object[]]$RemediationFacts = @(),
             [object[]]$ChangedFileAnchors = @()
         )
@@ -2555,6 +2563,7 @@ try {
                 missing = @($Missing); duplicates = @(); unknown = @(); unaccountedCandidates = @()
                 constructsIncomplete = [bool]::Parse($ConstructsIncomplete)
                 enumeratedConstructCount = @($set).Count; checkedConstructCount = $Checked
+                checkedChangedFileTargetCount = $CheckedChangedFileTargets
             }
             replay = [pscustomobject][ordered]@{
                 snapshotId = $SnapshotId; manifestDigest = $ManifestDigest; replayNonce = $Nonce
@@ -2567,13 +2576,15 @@ try {
             [string]$Source = "core/rule-a", [string]$Status = "violation",
             [string[]]$Violating = @("mi0"), [string[]]$Compliant = @(), [string]$Sha = ("9" * 64),
             [string[]]$NotInReach = @(), [string[]]$Unknown = @(), [string]$Ref = "rs0",
-            [string]$Pack = "core"
+            [string]$Pack = "core", [string]$CandidateId = "",
+            [string[]]$ViolatingChangedFileTargets = @()
         )
         return [pscustomobject][ordered]@{
             ruleRef = $Ref; packName = $Pack; ruleSourceId = $Source; ruleSourceSha256 = $Sha; status = $Status
             violatingConstructs = @($Violating); compliantConstructs = @($Compliant)
+            violatingChangedFileTargets = @($ViolatingChangedFileTargets)
             notInReachConstructs = @($NotInReach); unknownConstructs = @($Unknown)
-            candidateId = ""; degradedReason = ""
+            candidateId = $CandidateId; degradedReason = ""
         }
     }
     function New-ReconCandidate {
@@ -2631,6 +2642,36 @@ try {
     Assert-Replay (@($agree.candidates)[0].disposition -ceq "semanticAgreementTextWithheld") `
         "A candidate at the same rule, file and line in both runs is agreed even though its id differs."
     Assert-Replay (-not [bool]$agree.promotable) "A reconciliation is never promotable."
+
+    $line1112Path = "/src/flow/Roles/Flow.Worker.Cloud.New/Jobs/AutomationProject/AutomationProjectApplicationProvisioningJob.cs"
+    $line1112Anchor = [pscustomobject][ordered]@{
+        anchorId = "cf1"; path = $line1112Path
+        rightHandRanges = @([pscustomobject][ordered]@{ startLine = 1110; endLine = 1114 })
+    }
+    $line1112PrecedingAnchor = [pscustomobject][ordered]@{
+        anchorId = "cf0"; path = "/src/a.cs"
+        rightHandRanges = @([pscustomobject][ordered]@{ startLine = 1; endLine = 1 })
+    }
+    $line1112 = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "cf-run-1" -Rows @(
+                (New-ReconRow -CandidateId "line-1112-a" -Violating @())
+            ) -Candidates @(
+                (New-ReconCandidate -Id "line-1112-a" -Path $line1112Path -Line 1112 `
+                    -RemediationTargets "cf1")
+            ) -Constructs @() -Checked 0 `
+            -ChangedFileAnchors @($line1112PrecedingAnchor, $line1112Anchor)),
+        (New-ReconRun -Nonce "cf-run-2" -Rows @(
+                (New-ReconRow -CandidateId "line-1112-b" -Violating @())
+            ) -Candidates @(
+                (New-ReconCandidate -Id "line-1112-b" -Path $line1112Path.TrimStart("/") `
+                    -Line 1112 -RemediationTargets "cf1")
+            ) -Constructs @() -Checked 0 `
+            -ChangedFileAnchors @($line1112PrecedingAnchor, $line1112Anchor))
+    )
+    Assert-Replay ([bool]$line1112.reconciled -and $line1112.agreedCandidateCount -eq 1 -and
+        @($line1112.candidates)[0].disposition -ceq "semanticAgreementTextWithheld" -and
+        @(@($line1112.candidates)[0].semanticIdentity.anchor.constructs).Count -eq 0) `
+        "Two accepted line-1112 cf1 candidates did not reconcile without inventing a lexical construct."
 
     # Disagreement on the word collapses to unknown - never to the interesting
     # reading, and never to the first run.
@@ -2864,13 +2905,15 @@ try {
 
     # A localization issue inside a method body may have no declaration or
     # invocation construct. Its sealed right-hand file range is sufficient; the
-    # specialist's per-construct row stays truthfully notApplicable.
+    # specialist's lexical construct partition stays empty while the explicit
+    # changed-file target carries the violation.
     $bodyAnchors = @([pscustomobject][ordered]@{
             anchorId = "cf0"; path = "src/exception.cs"
             rightHandRanges = @([pscustomobject][ordered]@{ startLine = 1110; endLine = 1114 })
         })
     $bodyRow = New-ReconRow -Source "engineering/localized-exceptions" `
-        -Status "notApplicable" -Violating @() -Compliant @()
+        -Status "violation" -Violating @() -Compliant @() `
+        -ViolatingChangedFileTargets @("cf0:1112")
     $bodyCandidateA = New-ReconCandidate -Source "engineering/localized-exceptions" `
         -Path "/src/exception.cs" -Line 1112 -RemediationTargets "cf0" `
         -ConventionKey "LocalizedExceptionMessage" -Comment "Use the repository localization mechanism."
@@ -2879,9 +2922,11 @@ try {
         -ConventionKey "LocalizedExceptionMessage" -Comment "Localize this exception through the established mechanism."
     $bodyAgreement = Resolve-ReviewerRunReconciliation -Manifests @(
         (New-ReconRun -Nonce "body-a" -Rows @($bodyRow) -Candidates @($bodyCandidateA) `
-                -Constructs @() -ChangedFileAnchors $bodyAnchors -Checked 0),
+                -Constructs @() -ChangedFileAnchors $bodyAnchors -Checked 0 `
+                -CheckedChangedFileTargets 1),
         (New-ReconRun -Nonce "body-b" -Rows @($bodyRow) -Candidates @($bodyCandidateB) `
-                -Constructs @() -ChangedFileAnchors $bodyAnchors -Checked 0))
+                -Constructs @() -ChangedFileAnchors $bodyAnchors -Checked 0 `
+                -CheckedChangedFileTargets 1))
     $bodyFinding = @($bodyAgreement.candidates)[0]
     Assert-Replay (@($bodyAgreement.candidates).Count -eq 1 -and
         $bodyFinding.disposition -ceq "semanticAgreementTextWithheld") `
@@ -2891,6 +2936,13 @@ try {
         @($bodyFinding.semanticIdentity.evidence.violations).Count -eq 0 -and
         @($bodyFinding.semanticIdentity.remediation.changedCodeFix.targets) -ccontains "cf0") `
         "Changed-file eligibility invented a lexical construct instead of retaining the sealed file anchor."
+    $bodyRule = @($bodyAgreement.rows)[0]
+    Assert-Replay ([string]$bodyRule.reconciledStatus -ceq "violation" -and
+        @($bodyRule.violatingChangedFileTargets).Count -eq 1 -and
+        [string]@($bodyRule.violatingChangedFileTargets)[0] -ceq "cf0:1112" -and
+        @($bodyRule.violatingConstructs).Count -eq 0 -and
+        [bool]$bodyAgreement.reconciled) `
+        "Exact changed-file line violations were not compared as first-class reconciliation anchors."
     $bodyOutside = New-ReconCandidate -Source "engineering/localized-exceptions" `
         -Path "/src/exception.cs" -Line 1120 -RemediationTargets "cf0" `
         -ConventionKey "LocalizedExceptionMessage"
@@ -3631,6 +3683,26 @@ try {
     $sealedRecon = @(Get-ChildItem -LiteralPath $reconDir -Filter "reconciliation-*.json")[0].FullName
     Assert-ReplayThrows { Read-ReviewerConventionSpecialistPreview -Path $sealedRecon -MasterKey $masterKey } `
         "The reconciliation artifact must not verify under the raw promotion key." -Match "signature verification failed"
+
+    $verificationPaths = @()
+    foreach ($pair in @(@("verified-run1", "v1"), @("verified-run2", "v2"))) {
+        $acceptedManifest = New-ReconRun -Nonce $pair[1] -Rows @((New-ReconRow)) `
+            -Candidates @((New-ReconCandidate))
+        $acceptedManifest | Add-Member -NotePropertyName kind `
+            -NotePropertyValue $script:ReviewerConventionSpecialistArtifactKind -Force
+        $acceptedManifest | Add-Member -NotePropertyName artifactVersion `
+            -NotePropertyValue $script:ReviewerConventionSpecialistArtifactVersion -Force
+        $verificationPaths += Save-ReviewerVerificationPreview -Directory $reconDir -BaseName $pair[0] `
+            -MasterKey $derivedKey -Manifest ([pscustomobject][ordered]@{
+                kind = $script:ReviewerVerificationPreviewKind
+                artifactVersion = $script:ReviewerVerificationArtifactVersion
+                reconciliationManifest = $acceptedManifest
+            })
+    }
+    $verificationOutput = & $toolPath -ArtifactPath $verificationPaths -KeyPath $keyFile 2>&1
+    Assert-Replay ($LASTEXITCODE -eq 0 -and
+        (($verificationOutput -join "`n") -clike "*Reconciled: True*")) `
+        "The reconciler did not consume cross-verified semantic candidates from verification decisions."
 
     # The predeclared run set, end to end. A declaration that names a count can
     # still be filled with whichever runs looked best; one that names the

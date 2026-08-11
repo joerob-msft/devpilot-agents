@@ -11,6 +11,7 @@ $repoRoot = Split-Path $PSScriptRoot -Parent
 Import-Module (Join-Path $repoRoot "src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1") -Force
 . (Join-Path $repoRoot "src\Agents\reviewer\ConventionPacks.ps1")
 . (Join-Path $repoRoot "src\Agents\reviewer\ReviewFacts.ps1")
+. (Join-Path $repoRoot "src\Agents\reviewer\SourceTransport.ps1")
 . (Join-Path $repoRoot "src\Agents\reviewer\ConventionSpecialist.ps1")
 
 $wrapperPath = Join-Path $repoRoot "src\Agents\reviewer\Start-ReviewerAgent.ps1"
@@ -248,6 +249,7 @@ $coverageRow = [pscustomobject][ordered]@{
     compliantConstructs = ""
     notInReachConstructs = ""
     unknownConstructs = ""
+    violatingChangedFileTargets = ""
     codeEvidence = "The changed build registration omits the required manifest."
     siblingStatus = "checked"
     siblingEvidence = "Unchanged sibling registrations include the manifest entry."
@@ -492,6 +494,85 @@ Assert-Specialist (@((Resolve-ReviewerConventionSpecialistCandidates -Marker $re
             -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
             -ChangeEntries $changes).Candidates).Count -eq 1) `
     "A repository-relative changed-file anchor without a leading slash was rejected."
+
+$fileAnchorRanges = @{ "/src/a.cs" = @([pscustomobject]@{ startLine = 12; endLine = 12 }) }
+$fileAnchorOnly = Copy-SpecialistObject $markerObject
+$fileAnchorOnly.candidates[0].changedCodeFix.targets = "cf0"
+$fileAnchorOnlyParsed = ConvertTo-TestMarker -Marker $fileAnchorOnly -Nonce "nonce-1"
+$fileAnchorOnlyResult = Resolve-ReviewerConventionSpecialistCandidates -Marker $fileAnchorOnlyParsed `
+    -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
+    -ChangeEntries $changes -Constructs @() -RightHandRangesByPath $fileAnchorRanges
+Assert-Specialist (@($fileAnchorOnlyResult.Candidates).Count -eq 1 -and
+    [string]$fileAnchorOnlyResult.Candidates[0].filePath -ceq "/src/a.cs" -and
+    [string]$fileAnchorOnlyResult.Candidates[0].changedCodeFix.targets -ceq "cf0" -and
+    @($fileAnchorOnlyResult.ChangedFileIndex).Count -eq 1) `
+    "A valid sealed changed-file anchor without a lexical construct was not retained truthfully."
+$outOfSpanFileAnchor = Copy-SpecialistObject $fileAnchorOnly
+$outOfSpanFileAnchor.candidates[0].line = 13
+$outOfSpanFileAnchorParsed = ConvertTo-TestMarker -Marker $outOfSpanFileAnchor -Nonce "nonce-1"
+Assert-SpecialistThrows {
+    Resolve-ReviewerConventionSpecialistCandidates -Marker $outOfSpanFileAnchorParsed `
+        -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
+        -ChangeEntries $changes -Constructs @() -RightHandRangesByPath $fileAnchorRanges
+} "An out-of-span changed-file remediation anchor was accepted."
+$mismatchedFileAnchor = Copy-SpecialistObject $fileAnchorOnly
+$mismatchedFileAnchor.candidates[0].filePath = "/src/other.cs"
+$mismatchedFileAnchorParsed = ConvertTo-TestMarker -Marker $mismatchedFileAnchor -Nonce "nonce-1"
+Assert-SpecialistThrows {
+    Resolve-ReviewerConventionSpecialistCandidates -Marker $mismatchedFileAnchorParsed `
+        -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
+        -ChangeEntries $changes -Constructs @() -RightHandRangesByPath $fileAnchorRanges
+} "A path-mismatched changed-file remediation anchor was accepted."
+
+$line1112Changes = @(
+    [pscustomobject][ordered]@{
+        Path = "/src/a.cs"; Role = "current"; ChangeTypes = @("edit")
+    },
+    [pscustomobject][ordered]@{
+        Path = "/src/flow/Roles/Flow.Worker.Cloud.New/Jobs/AutomationProject/AutomationProjectApplicationProvisioningJob.cs"
+        Role = "current"; ChangeTypes = @("edit")
+    }
+)
+$line1112Ranges = @{
+    "/src/a.cs" = @([pscustomobject]@{ startLine = 1; endLine = 1 })
+    "/src/flow/Roles/Flow.Worker.Cloud.New/Jobs/AutomationProject/AutomationProjectApplicationProvisioningJob.cs" =
+        @([pscustomobject]@{ startLine = 1112; endLine = 1112 })
+}
+$line1112UnrelatedConstruct = [pscustomobject][ordered]@{
+    constructId = "mi0"; kind = "invocation"; path = "/src/a.cs"
+    line = 1; endLine = 1; status = "known"
+}
+$line1112Candidate = Copy-SpecialistObject $fileAnchorOnly
+$line1112Candidate.candidates[0].filePath =
+    "/src/flow/Roles/Flow.Worker.Cloud.New/Jobs/AutomationProject/AutomationProjectApplicationProvisioningJob.cs"
+$line1112Candidate.candidates[0].line = 1112
+$line1112Candidate.ruleCoverage[0].scope = "none"
+$line1112Candidate.ruleCoverage[0].violatingConstructs = ""
+$line1112Candidate.ruleCoverage[0].notInReachConstructs = "mi0"
+$line1112Candidate.ruleCoverage[0].violatingChangedFileTargets = "cf1:1112"
+$line1112Candidate.candidates[0].changedCodeFix.targets = "cf1"
+$line1112Parsed = ConvertTo-TestMarker -Marker $line1112Candidate -Nonce "nonce-1"
+$line1112Result = Resolve-ReviewerConventionSpecialistCandidates -Marker $line1112Parsed `
+    -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
+    -ChangeEntries $line1112Changes -Constructs @($line1112UnrelatedConstruct) `
+    -RightHandRangesByPath $line1112Ranges
+Assert-Specialist (@($line1112Result.Candidates).Count -eq 1 -and
+    [int]$line1112Result.Candidates[0].line -eq 1112 -and
+    [string]$line1112Result.Candidates[0].changedCodeFix.targets -ceq "cf1" -and
+    [string]$line1112Result.RuleCoverage.Rows[0].violatingChangedFileTargets[0] -ceq
+        "cf1:1112" -and
+    [string]$line1112Result.RuleCoverage.Rows[0].notInReachConstructs[0] -ceq "mi0" -and
+    [bool]$line1112Result.RuleCoverage.Complete) `
+    "The localization stress fixture could not represent exact line 1112 as cf1 without inventing a construct."
+$line1112WithoutCandidate = Copy-SpecialistObject $line1112Candidate
+$line1112WithoutCandidate.candidates = @()
+$line1112WithoutCandidateParsed = ConvertTo-TestMarker -Marker $line1112WithoutCandidate -Nonce "nonce-1"
+$line1112WithoutCandidateResult = Resolve-ReviewerConventionSpecialistCandidates `
+    -Marker $line1112WithoutCandidateParsed -ConventionPlan $conventionPlan `
+    -FactPlan $factPlan -ResolvedSources $resolvedSources -ChangeEntries $line1112Changes `
+    -Constructs @($line1112UnrelatedConstruct) -RightHandRangesByPath $line1112Ranges
+Assert-Specialist (@($line1112WithoutCandidateResult.RuleCoverage.UnemittedViolations).Count -eq 1) `
+    "A claimed changed-file line violation without a candidate disappeared from specialist accounting."
 
 $metadata = Copy-SpecialistObject $markerObject
 $metadata.candidates[0].anchorKind = "prMetadata"
@@ -1139,6 +1220,7 @@ $declarationViolation = [pscustomobject][ordered]@{
     ruleRef = "rs0"; ruleSourceSha256 = ("d" * 64); ruleQuote = ""; status = "violation"
     scope = "declaration"; violatingConstructs = "dc0"; compliantConstructs = ""
     notInReachConstructs = "cm0,cm1"; unknownConstructs = ""
+    violatingChangedFileTargets = ""
     codeEvidence = "The declaration is governed; transported comments are not."
     siblingStatus = "notRequired"; siblingEvidence = ""; candidateId = ""; notes = ""
 }
