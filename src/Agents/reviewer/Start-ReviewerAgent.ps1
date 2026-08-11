@@ -3908,6 +3908,12 @@ function Invoke-DryRunSelfChecks {
         $failures.Add("Change-entry extraction did not return exactly the changed FILE paths: got '$(@($shapeProbe) -join ', ')'.")
     }
     else { Write-Host "  OK - changed-file paths are extracted from the enveloped response and folders are ignored" -ForegroundColor Green }
+    $changeRequest = Get-ReviewerChangeRequestArguments -PrId 77
+    if ([bool]$changeRequest.includeDiffs -or [bool]$changeRequest.includeLineContent -or
+        [string]$changeRequest.repositoryId -cne $cfgRepoId) {
+        $failures.Add("Change-set lookup requests full diff content or is not bound to the configured repository GUID.")
+    }
+    else { Write-Host "  OK - change-set lookup requests metadata only, avoiding oversized MCP responses" -ForegroundColor Green }
     # ADO's own collections are { count, value }, so the MCP server may nest the
     # array a level deeper. Failing to descend yields no paths, which reads as
     # "change set unknown" and blocks publication entirely.
@@ -4448,6 +4454,17 @@ function Get-ReviewerChangePathsFromResponse {
     return , ($paths.ToArray())
 }
 
+function Get-ReviewerChangeRequestArguments {
+    param([Parameter(Mandatory)][int]$PrId)
+    return @{
+        action = 'get_changes'; project = $ExpectedProject; repositoryId = $cfgRepoId
+        pullRequestId = $PrId; top = 1000
+        # Anchor scoping needs paths only. Full line content can turn a small
+        # file list into a multi-megabyte MCP response and exceed the transport.
+        includeDiffs = $false; includeLineContent = $false
+    }
+}
+
 function Get-ReviewerChangedPaths {
     <# The set of files this PR actually touches, used to refuse anchoring a
        comment onto a file the author never edited. A failure here returns an
@@ -4456,10 +4473,8 @@ function Get-ReviewerChangedPaths {
        first time ADO returns an unexpected shape. #>
     param([Parameter(Mandatory)][hashtable]$Session, [Parameter(Mandatory)][int]$PrId)
     try {
-        $changes = Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments @{
-            action = 'get_changes'; project = $ExpectedProject; repositoryId = $RepositoryName
-            pullRequestId = $PrId; top = 1000
-        }
+        $changes = Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" `
+            -Arguments (Get-ReviewerChangeRequestArguments -PrId $PrId)
         $paths = Get-ReviewerChangePathsFromResponse -Response $changes
         if (@($paths).Count -eq 0) { Write-Warning "PR $PrId reported no changed files; anchor scoping is disabled for this PR." }
         return , (@($paths))
