@@ -100,6 +100,32 @@ function Assert-MarkerRejected {
     Assert-Specialist ($null -eq (ConvertTo-TestMarker -Marker $Marker -Nonce "nonce-1")) $Message
 }
 
+function Assert-SpecialistCandidateWithheld {
+    param(
+        [Parameter(Mandatory)]$Marker,
+        [Parameter(Mandatory)][string]$Reason,
+        [Parameter(Mandatory)][string]$Message,
+        [object[]]$ChangeEntries = $changes,
+        [hashtable]$RightHandRangesByPath = $PSDefaultParameterValues[
+            "Resolve-ReviewerConventionSpecialistCandidates:RightHandRangesByPath"]
+    )
+    $result = Resolve-ReviewerConventionSpecialistCandidates -Marker $Marker `
+        -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
+        -ChangeEntries $ChangeEntries -RightHandRangesByPath $RightHandRangesByPath
+    Assert-Specialist (@($result.Candidates).Count -eq 0 -and
+        @($result.Withheld | Where-Object { [string]$_.reason -ceq $Reason }).Count -gt 0) $Message
+}
+
+function Assert-SpecialistCandidateRejected {
+    param([Parameter(Mandatory)][scriptblock]$Action, [Parameter(Mandatory)][string]$Message)
+    $script:checks++
+    try {
+        $result = & $Action
+        if (@($result.Candidates).Count -ne 0) { [void]$script:failures.Add($Message) }
+    }
+    catch {}
+}
+
 $repositoryId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 $sourceRepositoryId = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
 $sourceCommit = "1" * 40
@@ -204,6 +230,7 @@ $resolvedSources = @(
     }
 )
 $changes = @([pscustomobject][ordered]@{ Path = "src/a.cs"; Role = "current"; ChangeTypes = @("edit") })
+$factId = "rf1:" + ("7" * 64)
 $candidate = [pscustomobject][ordered]@{
     candidateId = "manifest-validation"
     category = "convention"
@@ -211,6 +238,8 @@ $candidate = [pscustomobject][ordered]@{
     anchorKind = "changedFile"
     filePath = "/src/a.cs"
     line = 12
+    primaryTarget = "cf0:12"
+    manifestations = ""
     packName = "csharp-core"
     ruleSourceId = "shared-rules"
     ruleSourceRepositoryId = $sourceRepositoryId
@@ -279,6 +308,9 @@ $remediationConstructs = @([pscustomobject][ordered]@{
         constructId = "mi0"; kind = "invocation"; path = "src/a.cs"; line = 12; endLine = 12
     })
 $PSDefaultParameterValues["Resolve-ReviewerConventionSpecialistCandidates:Constructs"] = $remediationConstructs
+$PSDefaultParameterValues["Resolve-ReviewerConventionSpecialistCandidates:RightHandRangesByPath"] = @{
+    "/src/a.cs" = @([pscustomobject]@{ startLine = 12; endLine = 12 })
+}
 
 $parsed = ConvertTo-TestMarker -Marker $markerObject -Nonce "nonce-1"
 Assert-Specialist ($null -ne $parsed) "A valid specialist marker was rejected."
@@ -467,8 +499,7 @@ Assert-SpecialistThrows {
 foreach ($case in @(
         @{ Name = "stale source hash"; Field = "ruleSourceSha256"; Value = "e" * 64 },
         @{ Name = "unrelated source"; Field = "ruleSourceId"; Value = "other-source" },
-        @{ Name = "fabricated quote"; Field = "ruleQuote"; Value = "text absent from source" },
-        @{ Name = "unknown fact"; Field = "factIds"; Value = "rf1:" + ("f" * 64) }
+        @{ Name = "fabricated quote"; Field = "ruleQuote"; Value = "text absent from source" }
     )) {
     $invalid = Copy-SpecialistObject $markerObject
     $invalid.candidates[0].($case.Field) = $case.Value
@@ -478,6 +509,11 @@ foreach ($case in @(
             -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources -ChangeEntries $changes
     } "$($case.Name) was accepted."
 }
+$unknownFactCandidate = Copy-SpecialistObject $markerObject
+$unknownFactCandidate.candidates[0].factIds = "rf1:" + ("f" * 64)
+$unknownFactParsed = ConvertTo-TestMarker -Marker $unknownFactCandidate -Nonce "nonce-1"
+Assert-SpecialistCandidateWithheld -Marker $unknownFactParsed -Reason "invalidEvidence" `
+    -Message "An unknown fact was not withheld at candidate scope."
 
 $outside = Copy-SpecialistObject $markerObject
 $outside.candidates[0].filePath = "/src/unchanged.cs"
@@ -485,7 +521,7 @@ $outsideParsed = ConvertTo-TestMarker -Marker $outside -Nonce "nonce-1"
 $outsideResult = Resolve-ReviewerConventionSpecialistCandidates -Marker $outsideParsed `
     -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources -ChangeEntries $changes
 Assert-Specialist (@($outsideResult.Candidates).Count -eq 0 -and
-    [string]$outsideResult.Withheld[0].reason -ceq "outsideChangedFile") `
+    [string]$outsideResult.Withheld[0].reason -ceq "invalidTarget") `
     "An unchanged-file anchor was not withheld without relocation."
 $relativeAnchor = Copy-SpecialistObject $markerObject
 $relativeAnchor.candidates[0].filePath = "src/a.cs"
@@ -497,32 +533,75 @@ Assert-Specialist (@((Resolve-ReviewerConventionSpecialistCandidates -Marker $re
 
 $fileAnchorRanges = @{ "/src/a.cs" = @([pscustomobject]@{ startLine = 12; endLine = 12 }) }
 $fileAnchorOnly = Copy-SpecialistObject $markerObject
-$fileAnchorOnly.candidates[0].changedCodeFix.targets = "cf0"
+$fileAnchorOnly.candidates[0].changedCodeFix.targets = "cf0:12"
+$fileAnchorOnly.ruleCoverage[0].violatingConstructs = ""
+$fileAnchorOnly.ruleCoverage[0].violatingChangedFileTargets = "cf0:12"
 $fileAnchorOnlyParsed = ConvertTo-TestMarker -Marker $fileAnchorOnly -Nonce "nonce-1"
 $fileAnchorOnlyResult = Resolve-ReviewerConventionSpecialistCandidates -Marker $fileAnchorOnlyParsed `
     -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
     -ChangeEntries $changes -Constructs @() -RightHandRangesByPath $fileAnchorRanges
 Assert-Specialist (@($fileAnchorOnlyResult.Candidates).Count -eq 1 -and
     [string]$fileAnchorOnlyResult.Candidates[0].filePath -ceq "/src/a.cs" -and
-    [string]$fileAnchorOnlyResult.Candidates[0].changedCodeFix.targets -ceq "cf0" -and
+    [string]$fileAnchorOnlyResult.Candidates[0].changedCodeFix.targets -ceq "cf0:12" -and
     @($fileAnchorOnlyResult.ChangedFileIndex).Count -eq 1) `
     "A valid sealed changed-file anchor without a lexical construct was not retained truthfully."
+$incompleteUnreferencedConstruct = [pscustomobject]@{
+    constructId = "mi9"
+    kind = "method"
+    name = ""
+    path = "/src/a.cs"
+    line = 12
+    endLine = 12
+}
+$fileAnchorWithIncompleteConstruct = Resolve-ReviewerConventionSpecialistCandidates `
+    -Marker $fileAnchorOnlyParsed -ConventionPlan $conventionPlan -FactPlan $factPlan `
+    -ResolvedSources $resolvedSources -ChangeEntries $changes `
+    -Constructs @($incompleteUnreferencedConstruct) -RightHandRangesByPath $fileAnchorRanges
+Assert-Specialist (@($fileAnchorWithIncompleteConstruct.Candidates).Count -eq 1) `
+    "An unreferenced incomplete lexical construct poisoned a changed-line-only candidate."
+$oversizedAnchorTable = @(
+    [pscustomobject]@{
+        anchorId = "cf0"; path = "/src/a.cs"
+        rightHandRanges = @([pscustomobject]@{ startLine = 12; endLine = 12 })
+    },
+    [pscustomobject]@{
+        anchorId = "cf1000"; path = "/src/z.cs"
+        rightHandRanges = @([pscustomobject]@{ startLine = 1; endLine = 1 })
+    }
+)
+$boundedAnchorResolution = Resolve-ReviewerConventionSpecialistTargets -Text "cf0:12" `
+    -ChangedFileAnchors $oversizedAnchorTable -ChangedLinesOnly
+Assert-Specialist ([bool]$boundedAnchorResolution.Ok) `
+    "An unrelated changed-file anchor outside the canonical grammar poisoned a valid target."
+$structuredFacts = Copy-SpecialistObject $facts
+$structuredFacts[0].value = [pscustomobject][ordered]@{ heading = "Validation" }
+$structuredFactPlan = New-TestFactPlan -Binding $binding -Hashes $hashes -Facts $structuredFacts
+$structuredCandidateEvidence = Copy-SpecialistObject $fileAnchorOnly
+$structuredCandidateEvidence.candidates[0].factIds = "rf1:" + ("7" * 64)
+$structuredCandidateEvidence.factPlanSha256 = $structuredFactPlan.planSha256
+$structuredCandidateEvidenceParsed = ConvertTo-TestMarker -Marker $structuredCandidateEvidence -Nonce "nonce-1"
+$structuredCandidateEvidenceResult = Resolve-ReviewerConventionSpecialistCandidates `
+    -Marker $structuredCandidateEvidenceParsed -ConventionPlan $conventionPlan -FactPlan $structuredFactPlan `
+    -ResolvedSources $resolvedSources -ChangeEntries $changes -Constructs @() `
+    -RightHandRangesByPath $fileAnchorRanges
+Assert-Specialist (@($structuredCandidateEvidenceResult.Candidates).Count -eq 1) `
+    "A wrapper-known structured fact was incorrectly rejected as candidate-level evidence."
+Assert-Specialist (Test-ReviewerConventionSpecialistDeterministicFact ([pscustomobject]@{
+            state = "true"; value = $false
+        })) "A known false boolean payload was conflated with its fact knowledge state."
 $outOfSpanFileAnchor = Copy-SpecialistObject $fileAnchorOnly
 $outOfSpanFileAnchor.candidates[0].line = 13
+$outOfSpanFileAnchor.candidates[0].primaryTarget = "cf0:13"
 $outOfSpanFileAnchorParsed = ConvertTo-TestMarker -Marker $outOfSpanFileAnchor -Nonce "nonce-1"
-Assert-SpecialistThrows {
-    Resolve-ReviewerConventionSpecialistCandidates -Marker $outOfSpanFileAnchorParsed `
-        -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
-        -ChangeEntries $changes -Constructs @() -RightHandRangesByPath $fileAnchorRanges
-} "An out-of-span changed-file remediation anchor was accepted."
+Assert-SpecialistCandidateWithheld -Marker $outOfSpanFileAnchorParsed -Reason "invalidTarget" `
+    -Message "An out-of-span changed-file remediation anchor was accepted." `
+    -RightHandRangesByPath $fileAnchorRanges
 $mismatchedFileAnchor = Copy-SpecialistObject $fileAnchorOnly
 $mismatchedFileAnchor.candidates[0].filePath = "/src/other.cs"
 $mismatchedFileAnchorParsed = ConvertTo-TestMarker -Marker $mismatchedFileAnchor -Nonce "nonce-1"
-Assert-SpecialistThrows {
-    Resolve-ReviewerConventionSpecialistCandidates -Marker $mismatchedFileAnchorParsed `
-        -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
-        -ChangeEntries $changes -Constructs @() -RightHandRangesByPath $fileAnchorRanges
-} "A path-mismatched changed-file remediation anchor was accepted."
+Assert-SpecialistCandidateWithheld -Marker $mismatchedFileAnchorParsed -Reason "invalidTarget" `
+    -Message "A path-mismatched changed-file remediation anchor was accepted." `
+    -RightHandRangesByPath $fileAnchorRanges
 
 $line1112Changes = @(
     [pscustomobject][ordered]@{
@@ -546,11 +625,12 @@ $line1112Candidate = Copy-SpecialistObject $fileAnchorOnly
 $line1112Candidate.candidates[0].filePath =
     "/src/flow/Roles/Flow.Worker.Cloud.New/Jobs/AutomationProject/AutomationProjectApplicationProvisioningJob.cs"
 $line1112Candidate.candidates[0].line = 1112
+$line1112Candidate.candidates[0].primaryTarget = "cf1:1112"
 $line1112Candidate.ruleCoverage[0].scope = "none"
 $line1112Candidate.ruleCoverage[0].violatingConstructs = ""
 $line1112Candidate.ruleCoverage[0].notInReachConstructs = "mi0"
 $line1112Candidate.ruleCoverage[0].violatingChangedFileTargets = "cf1:1112"
-$line1112Candidate.candidates[0].changedCodeFix.targets = "cf1"
+$line1112Candidate.candidates[0].changedCodeFix.targets = "cf1:1112"
 $line1112Parsed = ConvertTo-TestMarker -Marker $line1112Candidate -Nonce "nonce-1"
 $line1112Result = Resolve-ReviewerConventionSpecialistCandidates -Marker $line1112Parsed `
     -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
@@ -558,7 +638,7 @@ $line1112Result = Resolve-ReviewerConventionSpecialistCandidates -Marker $line11
     -RightHandRangesByPath $line1112Ranges
 Assert-Specialist (@($line1112Result.Candidates).Count -eq 1 -and
     [int]$line1112Result.Candidates[0].line -eq 1112 -and
-    [string]$line1112Result.Candidates[0].changedCodeFix.targets -ceq "cf1" -and
+    [string]$line1112Result.Candidates[0].changedCodeFix.targets -ceq "cf1:1112" -and
     [string]$line1112Result.RuleCoverage.Rows[0].violatingChangedFileTargets[0] -ceq
         "cf1:1112" -and
     [string]$line1112Result.RuleCoverage.Rows[0].notInReachConstructs[0] -ceq "mi0" -and
@@ -574,13 +654,85 @@ $line1112WithoutCandidateResult = Resolve-ReviewerConventionSpecialistCandidates
 Assert-Specialist (@($line1112WithoutCandidateResult.RuleCoverage.UnemittedViolations).Count -eq 1) `
     "A claimed changed-file line violation without a candidate disappeared from specialist accounting."
 
+$multiFileChanges = @(
+    [pscustomobject]@{ Path = "/src/a.cs"; Role = "current"; ChangeTypes = @("edit") },
+    [pscustomobject]@{ Path = "/src/b.cs"; Role = "current"; ChangeTypes = @("edit") }
+)
+$multiFileRanges = @{
+    "/src/a.cs" = @([pscustomobject]@{ startLine = 12; endLine = 12 })
+    "/src/b.cs" = @([pscustomobject]@{ startLine = 22; endLine = 22 })
+}
+$multiFile = Copy-SpecialistObject $markerObject
+$multiFile.candidates[0].manifestations = "cf1:22"
+$multiFile.candidates[0].changedCodeFix.targets = "cf0:12,cf1:22"
+$multiFile.ruleCoverage[0].violatingChangedFileTargets = "cf0:12,cf1:22"
+$multiFileParsed = ConvertTo-TestMarker -Marker $multiFile -Nonce "nonce-1"
+$multiFileResult = Resolve-ReviewerConventionSpecialistCandidates -Marker $multiFileParsed `
+    -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
+    -ChangeEntries $multiFileChanges -RightHandRangesByPath $multiFileRanges
+Assert-Specialist (@($multiFileResult.Candidates).Count -eq 1 -and
+    [string]$multiFileResult.Candidates[0].primaryTarget -ceq "cf0:12" -and
+    [string]$multiFileResult.Candidates[0].manifestations -ceq "cf1:22" -and
+    [string]$multiFileResult.Candidates[0].changedCodeFix.targets -ceq "cf0:12,cf1:22" -and
+    [string]$multiFileResult.Candidates[0].filePath -ceq "/src/a.cs" -and
+    [int]$multiFileResult.Candidates[0].line -eq 12) `
+    "A bounded multi-file issue did not preserve its primary comment anchor, manifestations, and remediation scope."
+$nonDeterministicPrimary = Copy-SpecialistObject $multiFile
+$nonDeterministicPrimary.candidates[0].filePath = "/src/b.cs"
+$nonDeterministicPrimary.candidates[0].line = 22
+$nonDeterministicPrimary.candidates[0].primaryTarget = "cf1:22"
+$nonDeterministicPrimary.candidates[0].manifestations = "cf0:12"
+$nonDeterministicPrimaryParsed = ConvertTo-TestMarker -Marker $nonDeterministicPrimary -Nonce "nonce-1"
+Assert-SpecialistCandidateWithheld -Marker $nonDeterministicPrimaryParsed -Reason "invalidTarget" `
+    -Message "A model-selected later manifestation replaced the deterministic primary anchor." `
+    -ChangeEntries $multiFileChanges -RightHandRangesByPath $multiFileRanges
+$outOfSpanManifestation = Copy-SpecialistObject $multiFile
+$outOfSpanManifestation.candidates[0].manifestations = "cf1:23"
+$outOfSpanManifestationParsed = ConvertTo-TestMarker -Marker $outOfSpanManifestation -Nonce "nonce-1"
+Assert-SpecialistCandidateWithheld -Marker $outOfSpanManifestationParsed -Reason "invalidTarget" `
+    -Message "An out-of-RawSpan cross-file manifestation was accepted." `
+    -ChangeEntries $multiFileChanges -RightHandRangesByPath $multiFileRanges
+$unsubstantiatedManifestation = Copy-SpecialistObject $multiFile
+$unsubstantiatedManifestation.ruleCoverage[0].violatingChangedFileTargets = "cf0:12"
+$unsubstantiatedManifestationParsed = ConvertTo-TestMarker -Marker $unsubstantiatedManifestation -Nonce "nonce-1"
+Assert-SpecialistCandidateWithheld -Marker $unsubstantiatedManifestationParsed -Reason "invalidTarget" `
+    -Message "A changed line absent from the linked rule violation set was accepted as a manifestation." `
+    -ChangeEntries $multiFileChanges -RightHandRangesByPath $multiFileRanges
+$uncertainSiblingAnchor = Copy-SpecialistObject $fileAnchorOnly
+$uncertainSiblingAnchor.ruleCoverage[0].unknownConstructs = "mi1"
+$uncertainSiblingAnchorParsed = ConvertTo-TestMarker -Marker $uncertainSiblingAnchor -Nonce "nonce-1"
+$uncertainSiblingAnchorResult = Resolve-ReviewerConventionSpecialistCandidates `
+    -Marker $uncertainSiblingAnchorParsed -ConventionPlan $conventionPlan -FactPlan $factPlan `
+    -ResolvedSources $resolvedSources -ChangeEntries $changes -RightHandRangesByPath $fileAnchorRanges `
+    -Constructs @(
+        [pscustomobject]@{
+            constructId = "mi0"; kind = "invocation"; path = "/src/a.cs"
+            line = 12; endLine = 12; status = "known"
+        },
+        [pscustomobject]@{
+            constructId = "mi1"; kind = "invocation"; path = "/src/a.cs"
+            line = 12; endLine = 12; status = "known"
+        })
+Assert-Specialist (@($uncertainSiblingAnchorResult.Candidates).Count -eq 1 -and
+    [string]$uncertainSiblingAnchorResult.RuleCoverage.Rows[0].status -ceq "unknown") `
+    "An honestly unknown sibling anchor erased an explicitly substantiated manifestation."
+$inventedRemediationTarget = Copy-SpecialistObject $multiFile
+$inventedRemediationTarget.candidates[0].changedCodeFix.targets = "NewResourceKey"
+Assert-MarkerRejected -Marker $inventedRemediationTarget `
+    -Message "An invented identifier bypassed the canonical sealed-target grammar."
+
 $metadata = Copy-SpecialistObject $markerObject
 $metadata.candidates[0].anchorKind = "prMetadata"
 $metadata.candidates[0].filePath = ""
 $metadata.candidates[0].line = 0
+$metadata.candidates[0].primaryTarget = "prMetadata"
+$metadata.candidates[0].manifestations = ""
 $metadata.candidates[0].severity = "suggestion"
 $metadata.candidates[0].impactCategory = "none"
 $metadata.candidates[0].changedCodeFix.targets = "prMetadata"
+$metadata.candidates[0].changedCodeFix.valueSource = "deterministicFact"
+$metadata.candidates[0].changedCodeFix.evidenceFactIds = $factId
+$metadata.candidates[0].factIds = $factId
 $metadataParsed = ConvertTo-TestMarker -Marker $metadata -Nonce "nonce-1"
 $metadataResult = Resolve-ReviewerConventionSpecialistCandidates -Marker $metadataParsed `
     -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources -ChangeEntries $changes
@@ -596,8 +748,9 @@ foreach ($metadataCase in @(
     $badMetadataResult = Resolve-ReviewerConventionSpecialistCandidates -Marker $badMetadataParsed `
         -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources -ChangeEntries $changes
     Assert-Specialist (@($badMetadataResult.Candidates).Count -eq 0 -and
-        @($badMetadataResult.Withheld).Count -eq 1 -and
-        [string]$badMetadataResult.Withheld[0].reason -ceq "invalidAnchor") `
+        @($badMetadataResult.Withheld | Where-Object {
+                @("invalidAnchor", "invalidEvidence") -ccontains [string]$_.reason
+            }).Count -gt 0) `
         "A $($metadataCase.Name) fact did not reach and fail PR-metadata anchor enforcement."
 }
 
@@ -611,10 +764,11 @@ foreach ($case in @(
     $invalid.candidates[0].impactCategory = $case.Impact
     $invalid.candidates[0].factIds = $case.FactIds
     $invalidParsed = ConvertTo-TestMarker -Marker $invalid -Nonce "nonce-1"
-    Assert-SpecialistThrows {
+    Assert-SpecialistCandidateRejected -Action {
         Resolve-ReviewerConventionSpecialistCandidates -Marker $invalidParsed `
-            -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources -ChangeEntries $changes
-    } "$($case.Name) was accepted."
+            -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
+            -ChangeEntries $changes
+    } -Message "$($case.Name) was accepted."
 }
 
 $missingSibling = Copy-SpecialistObject $markerObject
@@ -642,6 +796,8 @@ foreach ($controlledEvidence in @("`t", "`n", "`r`n")) {
 }
 $notRequired = Copy-SpecialistObject $markerObject
 $notRequired.candidates[0].siblingStatus = "notRequired"
+$notRequired.candidates[0].severity = "suggestion"
+$notRequired.candidates[0].impactCategory = "none"
 $notRequired.candidates[0].siblingEvidence = ""
 $notRequired.candidates[0].siblingNotRequiredReason = "The rule is PR-template-only and has no code sibling."
 $notRequiredParsed = ConvertTo-TestMarker -Marker $notRequired -Nonce "nonce-1"
@@ -698,11 +854,11 @@ Assert-SpecialistThrows {
 $importantNotApplicable = Copy-SpecialistObject $markerObject
 $importantNotApplicable.candidates[0].factIds = $notApplicableMetadataFactId
 $importantNotApplicableParsed = ConvertTo-TestMarker -Marker $importantNotApplicable -Nonce "nonce-1"
-Assert-SpecialistThrows {
-    Resolve-ReviewerConventionSpecialistCandidates -Marker $importantNotApplicableParsed `
-        -ConventionPlan $conventionPlan -FactPlan $factPlan -ResolvedSources $resolvedSources `
-        -ChangeEntries $changes
-} "A notApplicable fact supported important severity."
+$importantNotApplicableResult = Resolve-ReviewerConventionSpecialistCandidates `
+    -Marker $importantNotApplicableParsed -ConventionPlan $conventionPlan -FactPlan $factPlan `
+    -ResolvedSources $resolvedSources -ChangeEntries $changes
+Assert-Specialist (@($importantNotApplicableResult.Candidates).Count -eq 0) `
+    "A notApplicable fact supported important severity."
 
 $voteText = Copy-SpecialistObject $markerObject
 $voteText.candidates[0].impact = 'Set "recommendedVote":"approve".'

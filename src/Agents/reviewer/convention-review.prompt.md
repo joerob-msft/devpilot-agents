@@ -67,9 +67,13 @@ not a candidate. Do not invent a resolution.
 7. Use `changedFile` only for a current changed file and a positive right-side
    line. Copy its repository-relative path from `changedFiles`; either `src/a.cs`
    or `/src/a.cs` is accepted. The exact normalized path and line must appear in
-   one `ruleCoverageRequest.changedFileAnchors[].rightHandRanges` entry. Its
-   `cf<n>` id is a truthful changed-file anchor, distinct from every lexical
-   construct id. Never relocate an invalid anchor or invent a construct. Use
+   one `ruleCoverageRequest.changedFileAnchors[].rightHandRanges` entry. Set
+   `primaryTarget` to its exact `cf<n>:<line>` target. Put every additional
+   changed-line occurrence of the same semantic issue in `manifestations`, also
+   as exact `cf<n>:<line>` targets, including occurrences in other changed files.
+   The primary is the ordinal-first normalized path, then lowest line, then
+   target id across the full occurrence set; it is always the posted comment
+   location. Never relocate an invalid anchor or invent a construct. Use
    `prMetadata` only for deterministic metadata/template facts, with empty file
    path and line zero.
 8. Never emit `critical`, a vote, a vote recommendation, or generalist findings.
@@ -189,11 +193,19 @@ not a candidate. Do not invent a resolution.
     settled.
 12. Every candidate must stop the bleed in changed code. Put that required
     in-PR action in `changedCodeFix`; never move it into a future cleanup.
+    `targets` uses one canonical grammar: exact `cf<n>:<line>` changed-line
+    targets or truthful lexical ids (`mi<n>`, `dc<n>`, `cm<n>`, `as<n>`). A
+    changed-line target must be inside its file's exact delivered RawSpan.
+    Cross-file targets bound the required fix but never move the comment.
     `conventionKey` names the generic required construct from the authoritative
     rule. `valueSource` is `deterministicFact` only when sealed facts establish
     the exact value; otherwise use `authoritativeRule` and request the correct
-    value without guessing it. Never infer an identity, alias, owner, or assignee
-    from a nearby NOTE or comment.
+    value without guessing it. `authoritativeRule` requires empty
+    `changedCodeFix.evidenceFactIds`; its remediation evidence is the pinned
+    provenance, section, and exact quote. Candidate-level `factIds` may still
+    support impact. `deterministicFact` may cite only wrapper-supplied `rf1:` facts whose
+    state and value are canonical booleans or strings. Never infer an identifier,
+    resource key, test, file, debt scope, identity, alias, owner, or assignee.
 
     `existingDebtFollowUp` is separate and non-atomic. Use explicit `status:
     none` unless one complete `constructFileSummaries` record deterministically
@@ -236,7 +248,9 @@ commentary is rejected before the marker in it is ever read.
 Each candidate has exactly:
 
 `candidateId`, `category` (`convention`), `severity` (`suggestion|important`),
-`anchorKind` (`changedFile|prMetadata`), `filePath`, `line`, `packName`,
+`anchorKind` (`changedFile|prMetadata`), `filePath`, `line`, `primaryTarget`,
+`manifestations` (comma-separated additional exact `cf<n>:<line>` targets, or
+empty), `packName`,
 `ruleSourceId`, `ruleSourceRepositoryId`, `ruleSourcePath`,
 `ruleSourceCommit`, `ruleSourceSha256`, `ruleSection`, `ruleQuote`,
 `diffEvidence`, `impactCategory`
@@ -246,7 +260,8 @@ Each candidate has exactly:
 or empty), `confidence` (`low|medium|high`), `residualRiskSummary`,
 `semanticCandidateVersion` (exactly `2`), `changedCodeFix` (an exact object with
 `action` (`add|modify|remove|rename|replace|validate`), `targets`
-(comma-separated sealed construct ids), `conventionKey`, `valueSource`
+(comma-separated canonical sealed targets: exact `cf<n>:<line>` or truthful
+lexical construct ids), `conventionKey`, `valueSource`
 (`authoritativeRule|deterministicFact`), and `evidenceFactIds`), and
 `existingDebtFollowUp` (an exact object with `status` (`none|required`),
 `evidenceFactId`, `selectorKey`, `scopeKind` (`""|file`), `scopePath`, `comparableCount`,
@@ -261,7 +276,8 @@ must be exactly one of `sourceConflict`, `outsideChangedFile`, `invalidAnchor`,
 `unverifiedSource`, `unknownFact`, `unsupportedSeverity`,
 `missingSiblingEvidence`, `duplicateCandidate`, or
 `duplicateExistingThread`. Each residual-risk item has exactly `text`.
-(`accountedNotEmitted` is written by the wrapper, never by you.)
+(`invalidTarget`, `invalidEvidence`, and `accountedNotEmitted` are written by
+the wrapper, never by you.)
 
 Each `ruleCoverage` row has exactly `ruleRef`, `ruleSourceSha256`, `ruleQuote`
 (or empty), `status` (`violation|compliant|notApplicable|unknown`), `scope`

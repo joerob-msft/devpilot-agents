@@ -2549,6 +2549,23 @@ try {
                     })
             }
             else { $Constructs })
+        if (@($ChangedFileAnchors).Count -eq 0 -and @($Candidates).Count -gt 0) {
+            $anchorRows = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+            foreach ($candidate in @($Candidates)) {
+                $target = [string](Get-ReviewerConventionSpecialistValue $candidate "primaryTarget" "")
+                $match = [regex]::Match($target, '^(cf[0-9]+):([1-9][0-9]*)$')
+                if (-not $match.Success -or $anchorRows.ContainsKey($match.Groups[1].Value)) { continue }
+                $anchorRows.Add($match.Groups[1].Value, [pscustomobject][ordered]@{
+                        anchorId = $match.Groups[1].Value
+                        path = [string](Get-ReviewerConventionSpecialistValue $candidate "filePath" "")
+                        rightHandRanges = @([pscustomobject][ordered]@{
+                                startLine = [int]$match.Groups[2].Value
+                                endLine = [int]$match.Groups[2].Value
+                            })
+                    })
+            }
+            $ChangedFileAnchors = @($anchorRows.Values)
+        }
         return [pscustomobject][ordered]@{
             kind = $script:ReviewerConventionSpecialistArtifactKind
             artifactVersion = $script:ReviewerConventionSpecialistArtifactVersion
@@ -2602,13 +2619,18 @@ try {
             [string]$ConventionKey = "RequiredConstruct",
             [string]$ChangedValueSource = "authoritativeRule",
             [string]$ChangedEvidenceFactIds = "",
+            [string]$PrimaryTarget = "", [string]$Manifestations = "",
             [string]$DebtStatus = "none", [string]$DebtFactId = "",
             [string]$DebtSelectorKey = "",
             [string]$DebtScopePath = "", [int]$ComparableCount = 0,
             [int]$CompliantCount = 0, [string]$DebtAction = ""
         )
+        if (-not $PrimaryTarget) {
+            $PrimaryTarget = $(if ($AnchorKind -ceq "prMetadata") { "prMetadata" } else { "cf0:$Line" })
+        }
         return [pscustomobject][ordered]@{
             candidateId = $Id; ruleSourceId = $Source; filePath = $Path; line = $Line
+            primaryTarget = $PrimaryTarget; manifestations = $Manifestations
             ruleSourceSha256 = $RuleSha; packName = $Pack; anchorKind = $AnchorKind; category = $Category
             severity = $Severity; impactCategory = $ImpactCategory; factIds = $FactIds
             confidence = $Confidence; siblingStatus = $SiblingStatus
@@ -2659,14 +2681,14 @@ try {
                 (New-ReconRow -CandidateId "line-1112-a" -Violating @())
             ) -Candidates @(
                 (New-ReconCandidate -Id "line-1112-a" -Path $line1112Path -Line 1112 `
-                    -RemediationTargets "cf1")
+                    -RemediationTargets "cf1:1112" -PrimaryTarget "cf1:1112")
             ) -Constructs @() -Checked 0 `
             -ChangedFileAnchors @($line1112PrecedingAnchor, $line1112Anchor)),
         (New-ReconRun -Nonce "cf-run-2" -Rows @(
                 (New-ReconRow -CandidateId "line-1112-b" -Violating @())
             ) -Candidates @(
                 (New-ReconCandidate -Id "line-1112-b" -Path $line1112Path.TrimStart("/") `
-                    -Line 1112 -RemediationTargets "cf1")
+                    -Line 1112 -RemediationTargets "cf1:1112" -PrimaryTarget "cf1:1112")
             ) -Constructs @() -Checked 0 `
             -ChangedFileAnchors @($line1112PrecedingAnchor, $line1112Anchor))
     )
@@ -2892,6 +2914,16 @@ try {
         [string]@($textSplit.candidates)[0].comment -ceq "" -and
         @(@($textSplit.candidates)[0].presentationVariants).Count -eq 2) `
         "Different prose for one semantic finding must reconcile without selecting either comment."
+    $sectionVariant = New-ReconCandidate -Comment "Rename the argument"
+    $sectionVariant.ruleSection = "A differently worded section label"
+    $sectionSplit = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "section-1" -Rows @((New-ReconRow)) `
+                -Candidates @((New-ReconCandidate -Comment "Rename the argument"))),
+        (New-ReconRun -Nonce "section-2" -Rows @((New-ReconRow)) -Candidates @($sectionVariant))
+    )
+    Assert-Replay (@($sectionSplit.candidates).Count -eq 1 -and
+        @($sectionSplit.candidates)[0].disposition -ceq "semanticAgreementTextWithheld") `
+        "Model-authored rule-section prose split an otherwise identical semantic finding."
     $changedFixFactId = "rf1:" + ("f" * 64)
     $changedFixFact = [pscustomobject]@{ id = $changedFixFactId; state = "true"; value = "verified" }
     $factBackedCandidate = New-ReconCandidate -ChangedValueSource deterministicFact `
@@ -2904,6 +2936,20 @@ try {
     Assert-Replay (@($factBackedAgreement.candidates).Count -eq 1 -and
         @($factBackedAgreement.candidates)[0].disposition -ceq "semanticAgreementTextWithheld") `
         "Identical deterministic-fact changed-code remediation did not reconcile from sealed facts."
+    $upperKeyCandidate = New-ReconCandidate -ConventionKey "RequiredConstruct"
+    $lowerKeyCandidate = New-ReconCandidate -ConventionKey "requiredConstruct"
+    $upperKeyManifest = New-ReconRun -Nonce "key-upper" -Rows @((New-ReconRow)) `
+        -Candidates @($upperKeyCandidate)
+    $lowerKeyManifest = New-ReconRun -Nonce "key-lower" -Rows @((New-ReconRow)) `
+        -Candidates @($lowerKeyCandidate)
+    $upperKeyIdentity = Get-ReviewerRunReconciliationSemanticCandidateIdentity `
+        -Candidate $upperKeyCandidate -Manifest $upperKeyManifest
+    $lowerKeyIdentity = Get-ReviewerRunReconciliationSemanticCandidateIdentity `
+        -Candidate $lowerKeyCandidate -Manifest $lowerKeyManifest
+    Assert-Replay ([bool]$upperKeyIdentity.valid -and [bool]$lowerKeyIdentity.valid -and
+        (Get-ReviewerRunReconciliationSemanticCandidateBucketKey -Identity $upperKeyIdentity) -cne
+        (Get-ReviewerRunReconciliationSemanticCandidateBucketKey -Identity $lowerKeyIdentity)) `
+        "Case-distinct remediation keys collapsed into one semantic identity."
 
     # A localization issue inside a method body may have no declaration or
     # invocation construct. Its sealed right-hand file range is sufficient; the
@@ -2917,10 +2963,10 @@ try {
         -Status "violation" -Violating @() -Compliant @() `
         -ViolatingChangedFileTargets @("cf0:1112")
     $bodyCandidateA = New-ReconCandidate -Source "engineering/localized-exceptions" `
-        -Path "/src/exception.cs" -Line 1112 -RemediationTargets "cf0" `
+        -Path "/src/exception.cs" -Line 1112 -RemediationTargets "cf0:1112" `
         -ConventionKey "LocalizedExceptionMessage" -Comment "Use the repository localization mechanism."
     $bodyCandidateB = New-ReconCandidate -Source "engineering/localized-exceptions" `
-        -Path "SRC\EXCEPTION.cs" -Line 1112 -RemediationTargets "cf0" `
+        -Path "SRC\EXCEPTION.cs" -Line 1112 -RemediationTargets "cf0:1112" `
         -ConventionKey "LocalizedExceptionMessage" -Comment "Localize this exception through the established mechanism."
     $bodyAgreement = Resolve-ReviewerRunReconciliation -Manifests @(
         (New-ReconRun -Nonce "body-a" -Rows @($bodyRow) -Candidates @($bodyCandidateA) `
@@ -2936,7 +2982,8 @@ try {
             (ConvertTo-Json -Compress -Depth 8 -InputObject @($bodyAgreement.candidates)))
     Assert-Replay (@($bodyFinding.semanticIdentity.anchor.constructs).Count -eq 0 -and
         @($bodyFinding.semanticIdentity.evidence.violations).Count -eq 0 -and
-        @($bodyFinding.semanticIdentity.remediation.changedCodeFix.targets) -ccontains "cf0") `
+        @($bodyFinding.semanticIdentity.remediation.changedCodeFix.targets |
+            ForEach-Object { [string]$_.target }) -ccontains "cf0:1112") `
         "Changed-file eligibility invented a lexical construct instead of retaining the sealed file anchor."
     $bodyRule = @($bodyAgreement.rows)[0]
     Assert-Replay ([string]$bodyRule.reconciledStatus -ceq "violation" -and
@@ -2946,7 +2993,7 @@ try {
         [bool]$bodyAgreement.reconciled) `
         "Exact changed-file line violations were not compared as first-class reconciliation anchors."
     $bodyOutside = New-ReconCandidate -Source "engineering/localized-exceptions" `
-        -Path "/src/exception.cs" -Line 1120 -RemediationTargets "cf0" `
+        -Path "/src/exception.cs" -Line 1120 -RemediationTargets "cf0:1120" `
         -ConventionKey "LocalizedExceptionMessage"
     $outsideAgreement = Resolve-ReviewerRunReconciliation -Manifests @(
         (New-ReconRun -Nonce "outside-a" -Rows @($bodyRow) -Candidates @($bodyOutside) `
@@ -2957,6 +3004,57 @@ try {
                 $_.disposition -ceq "semanticAgreementTextWithheld"
             }).Count -eq 0) `
         "A non-construct finding outside the sealed right-hand changed-file range became eligible."
+    $multiFileAnchors = @(
+        [pscustomobject][ordered]@{
+            anchorId = "cf0"; path = "src/a.cs"
+            rightHandRanges = @([pscustomobject]@{ startLine = 12; endLine = 12 })
+        },
+        [pscustomobject][ordered]@{
+            anchorId = "cf1"; path = "src/b.cs"
+            rightHandRanges = @([pscustomobject]@{ startLine = 22; endLine = 22 })
+        }
+    )
+    $multiFileRow = New-ReconRow -Violating @() `
+        -ViolatingChangedFileTargets @("cf0:12", "cf1:22")
+    $multiFileCandidateA = New-ReconCandidate -Path "/src/a.cs" -Line 12 `
+        -PrimaryTarget "cf0:12" -Manifestations "cf1:22" `
+        -RemediationTargets "cf0:12,cf1:22" -Comment "First wording"
+    $multiFileCandidateB = New-ReconCandidate -Path "SRC\A.cs" -Line 12 `
+        -PrimaryTarget "cf0:12" -Manifestations "cf1:22" `
+        -RemediationTargets "cf1:22,cf0:12" -Comment "Second wording"
+    $multiFileAgreement = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "multi-a" -Rows @($multiFileRow) -Candidates @($multiFileCandidateA) `
+                -Constructs @() -ChangedFileAnchors $multiFileAnchors -Checked 0 `
+                -CheckedChangedFileTargets 2),
+        (New-ReconRun -Nonce "multi-b" -Rows @($multiFileRow) -Candidates @($multiFileCandidateB) `
+                -Constructs @() -ChangedFileAnchors $multiFileAnchors -Checked 0 `
+                -CheckedChangedFileTargets 2)
+    )
+    $multiFileFinding = @($multiFileAgreement.candidates)[0]
+    Assert-Replay (@($multiFileAgreement.candidates).Count -eq 1 -and
+        $multiFileFinding.disposition -ceq "semanticAgreementTextWithheld" -and
+        @($multiFileFinding.semanticIdentity.manifestations).Count -eq 2 -and
+        [string]$multiFileFinding.semanticIdentity.anchor.target -ceq "cf0:12" -and
+        @($multiFileFinding.presentationVariants).Count -eq 2) `
+        "One issue with exact multi-file manifestations did not reconcile independently of target order and prose."
+    $unrelatedMultiFileCandidate = New-ReconCandidate -Path "/src/a.cs" -Line 12 `
+        -PrimaryTarget "cf0:12" -Manifestations "cf1:22" `
+        -RemediationTargets "cf0:12,cf1:22" -ConventionKey "DifferentSubject"
+    $unrelatedMultiFile = Resolve-ReviewerRunReconciliation -Manifests @(
+        (New-ReconRun -Nonce "unrelated-a" -Rows @($multiFileRow) `
+                -Candidates @($multiFileCandidateA, $unrelatedMultiFileCandidate) `
+                -Constructs @() -ChangedFileAnchors $multiFileAnchors -Checked 0 `
+                -CheckedChangedFileTargets 2),
+        (New-ReconRun -Nonce "unrelated-b" -Rows @($multiFileRow) `
+                -Candidates @($multiFileCandidateA, $unrelatedMultiFileCandidate) `
+                -Constructs @() -ChangedFileAnchors $multiFileAnchors -Checked 0 `
+                -CheckedChangedFileTargets 2)
+    )
+    Assert-Replay (@($unrelatedMultiFile.candidates).Count -eq 2 -and
+        @($unrelatedMultiFile.candidates | Where-Object {
+                $_.disposition -ceq "semanticAgreementTextWithheld"
+            }).Count -eq 2) `
+        "Different normalized convention subjects collapsed despite sharing manifestations and remediation scope."
     $severitySplit = Resolve-ReviewerRunReconciliation -Manifests @(
         (New-ReconRun -Nonce "n1" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Severity "suggestion"))),
         (New-ReconRun -Nonce "n2" -Rows @((New-ReconRow)) -Candidates @((New-ReconCandidate -Severity "important")))
@@ -3789,9 +3887,12 @@ try {
     Assert-Replay (Test-Json -Json ($sampleRecon | ConvertTo-Json -Depth 32 -Compress) `
             -SchemaFile $schemaPath -ErrorAction SilentlyContinue) `
         "A valid changed-file semantic reconciliation must satisfy the committed v2 schema."
-    Assert-Replay (Test-Json -Json ($metadataAgreement | ConvertTo-Json -Depth 32 -Compress) `
-            -SchemaFile $schemaPath -ErrorAction SilentlyContinue) `
-        "A valid metadata semantic reconciliation must satisfy the committed v2 schema."
+    $metadataSchemaErrors = @()
+    $metadataSchemaValid = Test-Json -Json ($metadataAgreement | ConvertTo-Json -Depth 32 -Compress) `
+        -SchemaFile $schemaPath -ErrorAction SilentlyContinue -ErrorVariable metadataSchemaErrors
+    Assert-Replay $metadataSchemaValid `
+        ("A valid metadata semantic reconciliation must satisfy the committed v2 schema: " +
+            (@($metadataSchemaErrors) -join " | "))
     $missingQualifierForSchema = New-ReconCandidate
     $missingQualifierForSchema.PSObject.Properties.Remove("confidence")
     $malformedQualifierRecon = Resolve-ReviewerRunReconciliation -Manifests @(
