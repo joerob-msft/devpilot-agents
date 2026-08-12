@@ -25,7 +25,13 @@ $script:ReviewerVerificationWithheldReasons = @(
     "incompleteVerifier", "invalidMarker", "modelMismatch", "selfVerification",
     "staleBinding", "timeout", "toolViolation", "unsupported", "needsHuman",
     "missingEvidence", "wrongSeverity", "severityEscalation", "verifierDisagreement",
-    "sourceInvalid", "factInvalid", "siblingInvalid", "specialistDegraded"
+    "sourceInvalid", "factInvalid", "siblingInvalid", "specialistDegraded",
+    # Typed cross-verifier extraction classes. A verifier run record now reports
+    # the precise typed marker-extraction failure (never a generic invalidMarker)
+    # so a withheld candidate carries WHY the verifier's marker failed. All are
+    # terminal - there is no verifier retry loop.
+    "overflow", "missingMarker", "malformedMarker", "nonObject", "truncated",
+    "schemaInvalid", "ambiguousMarker", "wrongBinding", "verdictSetMismatch"
 )
 
 function ConvertTo-ReviewerVerificationEffectivePolicy {
@@ -1558,6 +1564,68 @@ function Get-ReviewerVerificationRunBudget {
         timeoutSeconds = [Math]::Min($ConfiguredRunTimeoutSeconds, $remaining)
         remainingSeconds = $remaining
     }
+}
+
+function Assert-ReviewerVerificationBudgetPreflight {
+    <#
+        Deterministic, launch-free budget check run ONCE before any verifier
+        model starts. Given the full required run count for the sealed
+        assignment plan, it proves the declared run AND time budget can cover
+        EVERY run - or refuses the whole set. This closes the partial-launch
+        window the per-run budget alone left open, where early clusters would
+        launch and later ones silently degrade when the phase clock expired
+        mid-loop: either every required run can launch, or none does.
+
+        The time reservation is conservative and authoritative: a launched run
+        may consume the WHOLE configured per-run timeout, so the only reservation
+        that guarantees every planned run can finish is RequiredRunCount *
+        ConfiguredRunTimeoutSeconds. (The earlier design reserved only 30s per
+        run - the per-run floor - which admitted plans whose later runs could
+        still be starved when a run took closer to its full timeout. That is the
+        exact partial-launch window this preflight now closes.) Because the
+        preflight reserves the full configured timeout for every planned run, the
+        caller must treat admission as final and hand each admitted group the
+        configured timeout WITHOUT re-checking the phase clock mid-loop, so every
+        admitted group launches. The product can be large (up to the 128-run and
+        3600s hard caps), so it is computed in [long] to stay overflow-safe.
+
+        Returns @{ canLaunch; reason; requiredRunCount; effectiveMaxRuns;
+                   effectiveMaxSeconds; requiredSeconds; remainingSeconds }.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateRange(0, [int]::MaxValue)][int]$RequiredRunCount,
+        [ValidateRange(1, [int]::MaxValue)][int]$MaxVerifierRuns,
+        [ValidateRange(30, [int]::MaxValue)][int]$MaxPhaseSeconds,
+        [Parameter(Mandatory)][ValidateRange(30, 3600)][int]$ConfiguredRunTimeoutSeconds,
+        [ValidateRange(0.0, [double]::MaxValue)][double]$ElapsedSeconds = 0.0
+    )
+    $effectiveMaxRuns = [Math]::Min($MaxVerifierRuns, $script:ReviewerVerificationMaxVerifierRuns)
+    $effectiveMaxSeconds = [Math]::Min($MaxPhaseSeconds, $script:ReviewerVerificationMaxPhaseSeconds)
+    $remaining = [long][Math]::Floor($effectiveMaxSeconds - $ElapsedSeconds)
+    # Overflow-safe: worst case is 128 runs * 3600s, far inside [long] but the
+    # multiplication is done in [long] regardless so no widening ever overflows.
+    [long]$requiredSeconds = [long]$RequiredRunCount * [long]$ConfiguredRunTimeoutSeconds
+    $result = [ordered]@{
+        canLaunch           = $true
+        reason              = ""
+        requiredRunCount    = $RequiredRunCount
+        effectiveMaxRuns    = $effectiveMaxRuns
+        effectiveMaxSeconds = $effectiveMaxSeconds
+        requiredSeconds     = $requiredSeconds
+        remainingSeconds    = [long][Math]::Max([long]0, $remaining)
+    }
+    if ($RequiredRunCount -eq 0) { return [pscustomobject]$result }
+    if ($RequiredRunCount -gt $effectiveMaxRuns) {
+        $result.canLaunch = $false
+        $result.reason = "candidateLimit"
+        return [pscustomobject]$result
+    }
+    if ($remaining -lt $requiredSeconds) {
+        $result.canLaunch = $false
+        $result.reason = "timeout"
+        return [pscustomobject]$result
+    }
+    return [pscustomobject]$result
 }
 
 function Get-ReviewerVerificationMarkerSchema {

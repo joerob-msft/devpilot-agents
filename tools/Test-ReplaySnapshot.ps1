@@ -1562,10 +1562,12 @@ try {
     Assert-Replay ($retryBlock.Success) "The specialist launch must sit inside the retry loop."
     Assert-Replay ($retryBlock.Value -match '\$nonce = New-AgentNonce') `
         "Each specialist attempt must mint a fresh nonce, so the retry is a new request rather than a second answer to the first."
-    Assert-Replay ($retryBlock.Value -match 'if \(\$processFailure\) \{ throw \$processFailure \}') `
-        "A timeout or nonzero exit must still throw from inside the loop rather than be retried."
-    Assert-Replay ($retryBlock.Value -match 'if \(\$forbiddenRequestedTools\.Count -gt 0\)') `
+    Assert-Replay ($retryBlock.Value -match '\$specialistTerminalThrow = \$processFailure') `
+        "A timeout or nonzero exit must still terminate the loop with a throw rather than be retried."
+    Assert-Replay ($retryBlock.Value -match '\$forbiddenRequestedTools\.Count -gt 0') `
         "The forbidden-tool check must run on every attempt, not only the first."
+    Assert-Replay ($retryBlock.Value -match '(?s)& \$emitSpecialistAcct \$specialistAttempt \$nonce \$specialistTerminalClass[^\r\n]*\r?\n\s*throw \$specialistTerminalThrow') `
+        "Every launched attempt must emit exactly one accounting record before the terminal throw."
     Assert-Replay ($retryBlock.Value -match 'convention-specialist-output-overflow') `
         "An answer over the output cap must be retried once too: it is a model talking too much, not work that was not done."
     Assert-Replay ($reviewerText -match '\$script:ReviewerConventionSpecialistMaxOutputBytes = \d+') `

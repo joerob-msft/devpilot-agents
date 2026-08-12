@@ -832,81 +832,148 @@ function ConvertTo-AgentCanonicalMarkerJson {
     throw "Marker payload contained an unsupported JSON type."
 }
 
-function ConvertFrom-AgentResultMarker {
+# ---------------------------------------------------------------------------
+# Result-marker extraction budget (shared by extraction AND schema sizing).
+#
+# The scan window is expressed in CHARACTERS because the brace-matching scan
+# below indexes $StdOutText by UTF-16 code unit. Sharing ONE budget between the
+# extraction scan and the worst-case schema sizing (Measure-AgentMarkerSchema
+# WorstCaseChars) is what lets a caller PROVE, before it ever launches a model,
+# that the largest object its declared schema can legally produce still fits the
+# window the extractor will scan - or fail closed at startup if it cannot.
+# ---------------------------------------------------------------------------
+$script:AgentMarkerScanWindowChars = 65536   # per-anchor brace-scan window
+$script:AgentMarkerMaxPrefixScans = 20000    # bare-prefix occurrences examined
+$script:AgentMarkerMaxExaminedPayloads = 512 # payload-bearing anchors examined
+$script:AgentMarkerMaxRetainedCandidates = 16
+
+# Typed extraction outcome status values. A caller uses these to decide, with no
+# prose matching, whether a failed extraction is a retryable result-EMISSION
+# slip (retry with a fresh nonce) or a terminal rejection (never retried).
+$script:AgentMarkerStatus = @{
+    Success         = 'success'         # a single schema-valid, bound marker
+    MissingMarker   = 'missingMarker'   # no prefixed line carried a payload
+    MalformedMarker = 'malformedMarker' # a payload was present but not JSON
+    NonObject       = 'nonObject'       # the JSON payload was an array/scalar
+    Truncated       = 'truncated'       # the object never closed within window
+    Overflow        = 'overflow'        # too many carrying-the-nonce occurrences
+    SchemaInvalid   = 'schemaInvalid'   # parsed object failed the typed schema
+    WrongBinding    = 'wrongBinding'    # an exact field carried the wrong value
+    AmbiguousMarker = 'ambiguousMarker' # two occurrences meant different things
+}
+
+function Test-AgentMarkerStatusRetryable {
     <#
-        Parses a single strict `<PREFIX>: <json>` result line as HOSTILE input.
-        All body logic is wrapped in one try/catch; any invalid condition
-        returns $null (fail closed). Enforces, in order:
-          - exactly one non-blank line starts with $MarkerPrefix, and it is the
-            FINAL non-blank line, byte-identical to that single prefixed line;
-          - the JSON payload is exactly one object (never array/scalar);
-          - top-level keys are EXACTLY the schema's key set (no extra, none
-            missing);
-          - each field validates against its typed schema entry (strict int
-            typing, exact-format GUID, case-sensitive string/enum/nonce
-            equality, fixed-length hex, nullable hex, bounded control-character
-            -free text, exact nested objects, and bounded arrays of flat objects).
+        A result-EMISSION failure - the model did the work but did not frame the
+        answer the wrapper can read - is worth exactly one fresh-nonce retry. A
+        marker that carries the WRONG binding (an exact field echoed with the
+        wrong value, e.g. a replayed nonce) is not: a second attempt would not
+        change what the model chose to bind to, and retrying it is how a replay
+        would be handed extra tries. Process/timeout/environment failures are
+        classified by the caller, not here.
+    #>
+    param([Parameter(Mandatory)][string]$Status)
+    switch ($Status) {
+        'success' { return $false }
+        'wrongBinding' { return $false }
+        'missingMarker' { return $true }
+        'malformedMarker' { return $true }
+        'nonObject' { return $true }
+        'truncated' { return $true }
+        'overflow' { return $true }
+        'schemaInvalid' { return $true }
+        'ambiguousMarker' { return $true }
+        default { return $false }
+    }
+}
+
+function Get-AgentResultMarkerOutcome {
+    <#
+        Typed core of result-marker extraction. Parses a single strict
+        `<PREFIX>: <json>` result line as HOSTILE input and returns a typed
+        outcome instead of a bare object/$null, so a caller can tell a missing
+        marker from a malformed one from a schema-invalid one from a
+        wrong-binding one and act (retry/accounting) deterministically.
+
+        Returns a hashtable:
+          @{
+            Status    = one of $script:AgentMarkerStatus values
+            Value     = parsed marker hashtable (only when Status -eq 'success')
+            Field     = offending field name for schemaInvalid/wrongBinding, or $null
+            Retryable = [bool] (see Test-AgentMarkerStatusRetryable)
+            Reason    = short human string
+          }
+
+        Behaviour is byte-for-byte identical to the historical
+        ConvertFrom-AgentResultMarker for the accept/reject decision: the same
+        anchors are scanned, the same candidates are collected, the same
+        canonical-agreement and schema checks run in the same order. The ONLY
+        addition is that each fail-closed exit now records WHY. A schema-invalid
+        or wrong-binding occurrence is still DROPPED as a candidate (never a
+        veto), so a later valid marker still wins - the typed reason is reported
+        only when no valid marker exists.
 
         $Schema = @{
             Keys   = @(<ordered allowed/required key names>)
             Fields = @{ <name> = @{ Type = 'int'|'guid'|'exact'|'hex'|'hexOrNull'|'enum'|'bool'|'string'|'object'|'objectArray'; ... } }
         }
-
-        'string'      = @{ MaxLength = <int>; AllowEmpty = <bool>; AllowNewlines = <bool>; Pattern = <regex> }
-        'object'      = @{ Schema = @{ Keys = @(...); Fields = @{...} } }
-        'objectArray' = @{ MaxItems = <int>; Item = @{ Keys = @(...); Fields = @{...} } }
-
-        'objectArray' exists so an agent can return STRUCTURED results that the
-        wrapper acts on itself. That is what lets a wrapper own every write
-        instead of handing the model a write tool: the model reports findings,
-        the schema bounds them, and the wrapper decides what to do with them.
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$StdOutText,
         [Parameter(Mandatory)][string]$MarkerPrefix,
-        [Parameter(Mandatory)][hashtable]$Schema
+        [Parameter(Mandatory)][hashtable]$Schema,
+        [int]$ScanWindowChars = $script:AgentMarkerScanWindowChars
     )
+    $mk = {
+        param([string]$Status, $Value, $Field, [string]$Reason)
+        return @{
+            Status    = $Status
+            Value     = $Value
+            Field     = $Field
+            Retryable = (Test-AgentMarkerStatusRetryable -Status $Status)
+            Reason    = $Reason
+        }
+    }
     try {
-        if ([string]::IsNullOrWhiteSpace($StdOutText)) { return $null }
+        if ($ScanWindowChars -lt 2) { $ScanWindowChars = $script:AgentMarkerScanWindowChars }
+        if ([string]::IsNullOrWhiteSpace($StdOutText)) {
+            return (& $mk $script:AgentMarkerStatus.MissingMarker $null $null "No output was produced.")
+        }
 
-        # Copilot's stdout framing does NOT guarantee the marker sits alone on
-        # the final line: a following message can be concatenated onto the same
-        # line without a newline, and the model may restate the marker in a
-        # closing summary turn. Both happen in practice, and the earlier
-        # "exactly one prefixed line, and it must be last" rule rejected those
-        # cycles even though the work had completed correctly.
-        #
-        # Extract EVERY marker occurrence by brace-matching the JSON that
-        # follows it, then require every occurrence to MEAN the same thing.
-        # Comparison is canonical rather than byte-for-byte, because a model
-        # that prints a pretty, fenced copy in its closing summary and a
-        # compact copy on the final line has emitted one result, not two. The
-        # anti-injection property survives:
-        #   - two markers that genuinely differ still fail closed;
-        #   - a marker the model never produced cannot match the expected
-        #     nonce, which is generated per cycle AFTER the PR content was
-        #     authored.
+        # The strongest diagnostic seen while collecting candidates, reported
+        # only if no valid candidate survives. Higher rank = more informative /
+        # more terminal, so a definite wrong-binding signal is surfaced ahead of
+        # a mere "the payload did not parse". Held in FUNCTION-LOCAL state (a
+        # hashtable the $note closure mutates by member, never reassigns) so the
+        # parse is reentrant and leaves no module-global residue.
+        $rankOf = {
+            param([string]$s)
+            switch ($s) {
+                'wrongBinding' { return 6 }
+                'schemaInvalid' { return 5 }
+                'nonObject' { return 4 }
+                'truncated' { return 3 }
+                'malformedMarker' { return 2 }
+                'missingMarker' { return 1 }
+                default { return 0 }
+            }
+        }
+        $best = @{ Rank = -1; Status = $null; Field = $null }
+        $note = {
+            param([string]$Status, $Field)
+            $r = (& $rankOf $Status)
+            if ($r -gt $best.Rank) {
+                $best.Rank = $r
+                $best.Status = $Status
+                $best.Field = $Field
+            }
+        }
+
         $parsedCandidates = New-Object System.Collections.Generic.List[object]
         $quoteChar = [char]'"'
         $escapeChar = [char]'\'
         $openBrace = [char]'{'
         $closeBrace = [char]'}'
-        # Anchored to a line start. Matching the prefix ANYWHERE would let a
-        # finding that quotes attacker-planted source such as
-        # "// REVIEWER_RESULT_V1: {...}" manufacture a second, different
-        # candidate and fail the whole review closed - an author-controlled
-        # kill switch on being reviewed. Leading whitespace and trailing text
-        # on the same line stay tolerated, which is what the relaxation was
-        # for in the first place.
-        #
-        # Filtering happens DURING collection, not after it. An occurrence that
-        # does not parse, has no JSON after the prefix, or does not carry the
-        # schema's exact-valued fields is simply not a candidate - it is text
-        # that happens to look like one. Treating any of those as a global veto
-        # reopened the same kill switch by a different door: the wrapper now
-        # injects raw pull-request lines into the model's context and asks it to
-        # quote evidence, so a planted "<PREFIX>: not json" echoed at a line
-        # start would discard a complete, valid review.
         $exactFields = @($Schema.Keys | Where-Object {
                 $spec = $Schema.Fields[$_]
                 $null -ne $spec -and [string]$spec.Type -ceq 'exact'
@@ -915,55 +982,25 @@ function ConvertFrom-AgentResultMarker {
         $scanned = 0
         $examined = 0
         foreach ($anchor in [regex]::Matches($StdOutText, $anchorPattern)) {
-            # Bounded scan: a transcript carrying an implausible number of
-            # prefix occurrences is an attack surface, not a formatting quirk.
-            # The outer bound is deliberately far above any plausible transcript
-            # because a bare prefix line costs one IndexOf and nothing else; the
-            # tight bounds are the payload-examination cap below and the
-            # retained-candidate cap further down.
             $scanned++
-            if ($scanned -gt 200000) {
-                Write-Verbose "Result-marker scan stopped after $scanned prefix occurrence(s); a marker beyond that point is not seen."
+            if ($scanned -gt $script:AgentMarkerMaxPrefixScans) {
+                Write-Verbose "Result-marker scan stopped after $scanned prefix occurrence(s)."
                 break
             }
             $hit = $anchor.Index
-            # The opening brace must be on the anchor's OWN line. Searching the
-            # whole remaining transcript let a planted prefix line carrying no
-            # brace reach forward and adopt the JSON of a genuine marker further
-            # down: sixteen such lines filled the retained-candidate cap with
-            # duplicates of the real marker, and the duplicate-marker rule then
-            # discarded a complete, correct review.
             $lineEnd = $StdOutText.IndexOf("`n", $hit, [StringComparison]::Ordinal)
             if ($lineEnd -lt 0) { $lineEnd = $StdOutText.Length }
-            # Two-argument IndexOf would scan to the end of the transcript on
-            # every anchor that has no brace at all, which a hostile transcript
-            # can make quadratic - measured at 14 seconds on 8 MB. The (char,
-            # int, int) count overload bounds it to this anchor's own line. The
-            # anchor pattern cannot match a newline, so the count is never
-            # negative. Passing a StringComparison here instead would ALSO bind
-            # this overload and coerce the enum to 4, searching four characters
-            # and discarding every marker with a longer lead-in.
             $searchStart = $hit + $anchor.Length
             if ($searchStart -ge $lineEnd) { continue }
             $jsonStart = $StdOutText.IndexOf($openBrace, $searchStart, $lineEnd - $searchStart)
             if ($jsonStart -lt 0) { continue }
-            # Only an anchor that really could carry a payload costs scan budget.
-            # Counting the ones discarded here made a review killable by quoting
-            # enough bare prefix lines, which is free for an attacker.
             $examined++
-            if ($examined -gt 512) { break }
-            # Bounded brace-depth scan. String contents are respected so a brace
-            # inside a JSON string value cannot terminate the object early.
-            # The bound is generous rather than tight because a marker carrying
-            # an objectArray of findings is legitimately tens of KB; the schema
-            # (MaxItems / MaxLength) is what actually constrains the payload,
-            # while this bound only stops an unterminated brace from scanning an
-            # entire multi-megabyte transcript.
+            if ($examined -gt $script:AgentMarkerMaxExaminedPayloads) { break }
             $depth = 0
             $inString = $false
             $escaped = $false
             $jsonEnd = -1
-            $limit = [Math]::Min($StdOutText.Length, $jsonStart + 65536)
+            $limit = [Math]::Min($StdOutText.Length, $jsonStart + $ScanWindowChars)
             for ($i = $jsonStart; $i -lt $limit; $i++) {
                 $ch = $StdOutText[$i]
                 if ($inString) {
@@ -979,17 +1016,41 @@ function ConvertFrom-AgentResultMarker {
                     if ($depth -eq 0) { $jsonEnd = $i; break }
                 }
             }
-            if ($jsonEnd -lt 0) { continue }
+            if ($jsonEnd -lt 0) {
+                # The object never closed inside the window: either it was cut
+                # off (truncated) or an over-long/over-nested payload overflowed
+                # the bounded scan. Both are the same fail-closed exit.
+                & $note $script:AgentMarkerStatus.Truncated $null
+                continue
+            }
             $parsed = $null
             try { $parsed = $StdOutText.Substring($jsonStart, $jsonEnd - $jsonStart + 1) | ConvertFrom-Json -ErrorAction Stop }
-            catch { continue }
-            if ($parsed -isnot [System.Management.Automation.PSCustomObject]) { continue }
+            catch {
+                & $note $script:AgentMarkerStatus.MalformedMarker $null
+                continue
+            }
+            if ($parsed -isnot [System.Management.Automation.PSCustomObject]) {
+                & $note $script:AgentMarkerStatus.NonObject $null
+                continue
+            }
             if ($exactFields.Count -gt 0) {
                 $bound = $true
                 foreach ($name in $exactFields) {
                     $property = $parsed.PSObject.Properties[$name]
-                    if ($null -eq $property -or $property.Value -isnot [string] -or
-                        [string]$property.Value -cne [string]$Schema.Fields[$name].Expected) {
+                    if ($null -eq $property -or $property.Value -isnot [string]) {
+                        # The binding field is absent or not even a string: the
+                        # model failed to EMIT it. That is a schema-shape slip,
+                        # not evidence of a marker bound to the wrong work, so it
+                        # is retryable with a fresh nonce.
+                        & $note $script:AgentMarkerStatus.SchemaInvalid $name
+                        $bound = $false
+                        break
+                    }
+                    if ([string]$property.Value -cne [string]$Schema.Fields[$name].Expected) {
+                        # The field is present but carries the WRONG value (a
+                        # replayed or invented nonce, a foreign project). Never
+                        # retried.
+                        & $note $script:AgentMarkerStatus.WrongBinding $name
                         $bound = $false
                         break
                     }
@@ -997,16 +1058,26 @@ function ConvertFrom-AgentResultMarker {
                 if (-not $bound) { continue }
             }
             [void]$parsedCandidates.Add($parsed)
-            # More than a handful of occurrences that all carry this cycle's
-            # nonce is not a formatting quirk either.
-            if ($parsedCandidates.Count -gt 16) { return $null }
+            if ($parsedCandidates.Count -gt $script:AgentMarkerMaxRetainedCandidates) {
+                return (& $mk $script:AgentMarkerStatus.Overflow $null $null `
+                        "More than $script:AgentMarkerMaxRetainedCandidates marker occurrences carried this cycle's nonce.")
+            }
         }
-        if ($parsedCandidates.Count -eq 0) { return $null }
-        # Every surviving occurrence must MEAN the same thing. Whitespace and
-        # key order may differ - a fenced, pretty-printed restatement of the
-        # same result is the same result - but any semantic difference between
-        # two markers that both carry this cycle's nonce fails closed.
+        if ($parsedCandidates.Count -eq 0) {
+            $status = if ($best.Status) { $best.Status } else { $script:AgentMarkerStatus.MissingMarker }
+            $field = $best.Field
+            $reason = switch ($status) {
+                'wrongBinding' { "A marker echoed the wrong '$field' value." }
+                'schemaInvalid' { "A marker omitted or malformed the required '$field' field." }
+                'nonObject' { "The marker payload was not a JSON object." }
+                'truncated' { "The marker payload did not close inside the $ScanWindowChars-character scan window." }
+                'malformedMarker' { "A marker prefix was present but its payload was not valid JSON." }
+                default { "No valid result marker was found." }
+            }
+            return (& $mk $status $null $field $reason)
+        }
 
+        # Every surviving occurrence must MEAN the same thing.
         $obj = $null
         $canonical = $null
         foreach ($parsed in $parsedCandidates) {
@@ -1016,31 +1087,288 @@ function ConvertFrom-AgentResultMarker {
                 $obj = $parsed
                 continue
             }
-            if ($parsedCanonical -cne $canonical) { return $null }
+            if ($parsedCanonical -cne $canonical) {
+                return (& $mk $script:AgentMarkerStatus.AmbiguousMarker $null $null `
+                        "Two marker occurrences carried this cycle's nonce but disagreed.")
+            }
         }
-        if ($obj -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+        if ($obj -isnot [System.Management.Automation.PSCustomObject]) {
+            return (& $mk $script:AgentMarkerStatus.NonObject $null $null "The marker payload was not a JSON object.")
+        }
 
         $allowedKeys = @($Schema.Keys)
         $actualKeys = @($obj.PSObject.Properties | ForEach-Object { $_.Name })
         foreach ($name in $actualKeys) {
-            if ($allowedKeys -notcontains $name) { return $null }
+            if ($allowedKeys -notcontains $name) {
+                return (& $mk $script:AgentMarkerStatus.SchemaInvalid $null $name "The marker carried an unexpected key '$name'.")
+            }
         }
         foreach ($name in $allowedKeys) {
-            if (-not $obj.PSObject.Properties[$name]) { return $null }
+            if (-not $obj.PSObject.Properties[$name]) {
+                return (& $mk $script:AgentMarkerStatus.SchemaInvalid $null $name "The marker omitted the required key '$name'.")
+            }
         }
 
         $out = @{}
         foreach ($name in $allowedKeys) {
             $spec = $Schema.Fields[$name]
-            if ($null -eq $spec) { return $null }
+            if ($null -eq $spec) {
+                return (& $mk $script:AgentMarkerStatus.SchemaInvalid $null $name "The schema declared no rule for key '$name'.")
+            }
             $converted = ConvertTo-AgentMarkerFieldValue -Spec $spec -Value $obj.PSObject.Properties[$name].Value
-            if (-not $converted.Ok) { return $null }
+            if (-not $converted.Ok) {
+                # A present-but-wrong exact field is a wrong binding; every other
+                # field failure is a schema-shape failure.
+                $status = if ([string]$spec.Type -ceq 'exact') { $script:AgentMarkerStatus.WrongBinding } else { $script:AgentMarkerStatus.SchemaInvalid }
+                return (& $mk $status $null $name "The marker field '$name' failed its typed schema rule.")
+            }
             $out[$name] = $converted.Value
         }
-        return $out
+        return (& $mk $script:AgentMarkerStatus.Success $out $null "")
     }
     catch {
-        return $null
+        return (& $mk $script:AgentMarkerStatus.MalformedMarker $null $null "The marker could not be parsed: $($_.Exception.Message)")
+    }
+}
+
+function ConvertFrom-AgentResultMarker {
+    <#
+        Compatibility wrapper preserved for every existing caller: returns the
+        parsed marker hashtable on success and $null on any fail-closed
+        condition, exactly as before. New callers that need to distinguish
+        WHY extraction failed (for retry/accounting) use
+        ConvertFrom-AgentResultMarkerOutcome instead. Both share one
+        implementation (Get-AgentResultMarkerOutcome) so the accept/reject
+        decision can never drift between them.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$StdOutText,
+        [Parameter(Mandatory)][string]$MarkerPrefix,
+        [Parameter(Mandatory)][hashtable]$Schema,
+        [int]$ScanWindowChars = $script:AgentMarkerScanWindowChars
+    )
+    $outcome = Get-AgentResultMarkerOutcome -StdOutText $StdOutText -MarkerPrefix $MarkerPrefix `
+        -Schema $Schema -ScanWindowChars $ScanWindowChars
+    if ($outcome.Status -ceq $script:AgentMarkerStatus.Success) { return $outcome.Value }
+    return $null
+}
+
+function ConvertFrom-AgentResultMarkerOutcome {
+    <#
+        Public typed extraction entry point. Identical parse to
+        ConvertFrom-AgentResultMarker but returns the full typed outcome
+        (Status/Value/Field/Retryable/Reason). See Get-AgentResultMarkerOutcome.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$StdOutText,
+        [Parameter(Mandatory)][string]$MarkerPrefix,
+        [Parameter(Mandatory)][hashtable]$Schema,
+        [int]$ScanWindowChars = $script:AgentMarkerScanWindowChars
+    )
+    return Get-AgentResultMarkerOutcome -StdOutText $StdOutText -MarkerPrefix $MarkerPrefix `
+        -Schema $Schema -ScanWindowChars $ScanWindowChars
+}
+
+function Measure-AgentMarkerSchemaWorstCaseChars {
+    <#
+        Upper bound, in CHARACTERS, on the compact JSON serialization of the
+        largest object a marker schema can legally produce. Character-based to
+        match the extractor's character-indexed scan window, so the two share
+        one budget: a schema whose worst case exceeds the window has a legal
+        object the extractor could never capture, and the caller can refuse to
+        launch rather than discover it on a real review.
+
+        String fields forbid control characters, so the only in-string
+        expansion is the escaping of `"` and `\` (one char -> two), bounded by
+        MaxLength; hence MaxLength*2 + 2 quotes is a true upper bound per string.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Schema,
+        [int]$Depth = 0
+    )
+    if ($Depth -gt 24) { throw "Marker schema exceeded the maximum measurable depth." }
+    $fieldChars = {
+        param([hashtable]$Spec)
+        switch ([string]$Spec.Type) {
+            'int' {
+                $max = if ($Spec.ContainsKey('Max')) { [long]$Spec.Max } else { [long][int]::MaxValue }
+                $min = if ($Spec.ContainsKey('Min')) { [long]$Spec.Min } else { [long][int]::MinValue }
+                $digits = [Math]::Max(([string][Math]::Abs($max)).Length, ([string][Math]::Abs($min)).Length)
+                $sign = if ($min -lt 0) { 1 } else { 0 }
+                return $digits + $sign
+            }
+            'guid' { return 38 }                                  # 36 + 2 quotes
+            'bool' { return 5 }                                   # "false"
+            'hex' { return ([int]$Spec.Length) + 2 }
+            'hexOrNull' { return [Math]::Max((([int]$Spec.Length) + 2), 4) }
+            'exact' { return (ConvertTo-Json -InputObject ([string]$Spec.Expected) -Compress).Length }
+            'enum' {
+                $m = 0
+                foreach ($v in @($Spec.Values)) {
+                    $len = (ConvertTo-Json -InputObject ([string]$v) -Compress).Length
+                    if ($len -gt $m) { $m = $len }
+                }
+                return $m
+            }
+            'string' {
+                $maxLen = if ($Spec.ContainsKey('MaxLength')) { [int]$Spec.MaxLength } else { 0 }
+                return ($maxLen * 2) + 2
+            }
+            'object' {
+                return (Measure-AgentMarkerSchemaWorstCaseChars -Schema ([hashtable]$Spec.Schema) -Depth ($Depth + 1))
+            }
+            'objectArray' {
+                $maxItems = if ($Spec.ContainsKey('MaxItems')) { [int]$Spec.MaxItems } else { 25 }
+                $itemSchema = @{ Keys = @($Spec.Item.Keys); Fields = $Spec.Item.Fields }
+                $itemChars = Measure-AgentMarkerSchemaWorstCaseChars -Schema $itemSchema -Depth ($Depth + 1)
+                # [ ] plus each item and a separating comma.
+                return 2 + ($maxItems * ($itemChars + 1))
+            }
+            default { throw "Cannot size unknown marker field type '$($Spec.Type)'." }
+        }
+    }
+    $total = 2   # the object's own braces
+    $keys = @($Schema.Keys)
+    for ($i = 0; $i -lt $keys.Count; $i++) {
+        $name = [string]$keys[$i]
+        $spec = $Schema.Fields[$name]
+        if ($null -eq $spec) { throw "Schema key '$name' has no field rule." }
+        $keyChars = (ConvertTo-Json -InputObject $name -Compress).Length   # "name"
+        $total += $keyChars + 1 + (& $fieldChars ([hashtable]$spec))       # "name":value
+        if ($i -lt $keys.Count - 1) { $total += 1 }                        # comma
+    }
+    return $total
+}
+
+function Test-AgentMarkerSchemaFitsScanWindow {
+    <#
+        Returns whether the largest legal object a schema can produce still fits
+        the extractor's scan window. A caller asserts Fits before launching a
+        model so a schema/window mismatch fails at startup (deterministically),
+        not on a real review whose complete, valid marker the window would
+        silently truncate.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Schema,
+        [int]$ScanWindowChars = $script:AgentMarkerScanWindowChars,
+        [string]$MarkerPrefix = ""
+    )
+    $worst = Measure-AgentMarkerSchemaWorstCaseChars -Schema $Schema
+    # The extractor scans from the opening brace; the prefix and the single
+    # space before the brace sit OUTSIDE the window, so they do not count here.
+    return [pscustomobject][ordered]@{
+        Fits           = ($worst -le $ScanWindowChars)
+        WorstCaseChars = $worst
+        WindowChars    = $ScanWindowChars
+    }
+}
+
+function Measure-AgentMarkerSchemaWorstCaseBytes {
+    <#
+        Upper bound, in UTF-8 BYTES, on the compact JSON serialization of the
+        largest object a marker schema can legally produce. The char-based
+        Measure-AgentMarkerSchemaWorstCaseChars sizes the extractor's scan
+        window; this sizes the surface's hard output byte cap, which is what a
+        model process is actually bounded by. They differ whenever a string
+        field permits non-ASCII: a JSON string escapes only `"` and `\` (one
+        char -> two ASCII bytes), but an unescaped non-ASCII BMP code unit costs
+        up to THREE UTF-8 bytes. Three bytes per character dominates the doubled
+        escape, so a string field's worst case is MaxLength*3 + 2 quote bytes -
+        conservative regardless of whether a field's pattern happens to forbid
+        non-ASCII. Numeric, guid, hex and boolean literals are ASCII, so their
+        byte cost equals their char cost; exact/enum values are measured as the
+        actual UTF-8 byte length of their JSON.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Schema,
+        [int]$Depth = 0
+    )
+    if ($Depth -gt 24) { throw "Marker schema exceeded the maximum measurable depth." }
+    $fieldBytes = {
+        param([hashtable]$Spec)
+        switch ([string]$Spec.Type) {
+            'int' {
+                $max = if ($Spec.ContainsKey('Max')) { [long]$Spec.Max } else { [long][int]::MaxValue }
+                $min = if ($Spec.ContainsKey('Min')) { [long]$Spec.Min } else { [long][int]::MinValue }
+                $digits = [Math]::Max(([string][Math]::Abs($max)).Length, ([string][Math]::Abs($min)).Length)
+                $sign = if ($min -lt 0) { 1 } else { 0 }
+                return $digits + $sign
+            }
+            'guid' { return 38 }
+            'bool' { return 5 }
+            'hex' { return ([int]$Spec.Length) + 2 }
+            'hexOrNull' { return [Math]::Max((([int]$Spec.Length) + 2), 4) }
+            'exact' { return [System.Text.Encoding]::UTF8.GetByteCount((ConvertTo-Json -InputObject ([string]$Spec.Expected) -Compress)) }
+            'enum' {
+                $m = 0
+                foreach ($v in @($Spec.Values)) {
+                    $len = [System.Text.Encoding]::UTF8.GetByteCount((ConvertTo-Json -InputObject ([string]$v) -Compress))
+                    if ($len -gt $m) { $m = $len }
+                }
+                return $m
+            }
+            'string' {
+                $maxLen = if ($Spec.ContainsKey('MaxLength')) { [int]$Spec.MaxLength } else { 0 }
+                return ($maxLen * 3) + 2
+            }
+            'object' {
+                return (Measure-AgentMarkerSchemaWorstCaseBytes -Schema ([hashtable]$Spec.Schema) -Depth ($Depth + 1))
+            }
+            'objectArray' {
+                $maxItems = if ($Spec.ContainsKey('MaxItems')) { [int]$Spec.MaxItems } else { 25 }
+                $itemSchema = @{ Keys = @($Spec.Item.Keys); Fields = $Spec.Item.Fields }
+                $itemBytes = Measure-AgentMarkerSchemaWorstCaseBytes -Schema $itemSchema -Depth ($Depth + 1)
+                return 2 + ($maxItems * ($itemBytes + 1))
+            }
+            default { throw "Cannot size unknown marker field type '$($Spec.Type)'." }
+        }
+    }
+    $total = 2   # the object's own braces
+    $keys = @($Schema.Keys)
+    for ($i = 0; $i -lt $keys.Count; $i++) {
+        $name = [string]$keys[$i]
+        $spec = $Schema.Fields[$name]
+        if ($null -eq $spec) { throw "Schema key '$name' has no field rule." }
+        $keyBytes = [System.Text.Encoding]::UTF8.GetByteCount((ConvertTo-Json -InputObject $name -Compress))   # "name"
+        $total += $keyBytes + 1 + (& $fieldBytes ([hashtable]$spec))                                            # "name":value
+        if ($i -lt $keys.Count - 1) { $total += 1 }                                                            # comma
+    }
+    return $total
+}
+
+function Test-AgentMarkerSchemaFitsLaunchContract {
+    <#
+        A surface's complete result-contract fit check: the largest legal marker
+        the schema can produce must fit BOTH the character scan window the
+        extractor will use AND the surface's hard UTF-8 output byte cap. Callers
+        assert Fits before launching a model, so a schema/window/cap mismatch
+        fails deterministically at startup rather than silently dropping a
+        complete, valid marker on a real review. Returns the measured worst
+        cases so a refusal can name exactly which bound was exceeded.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Schema,
+        [Parameter(Mandatory)][int]$ScanWindowChars,
+        [Parameter(Mandatory)][int]$MaxOutputBytes
+    )
+    $worstChars = Measure-AgentMarkerSchemaWorstCaseChars -Schema $Schema
+    $worstBytes = Measure-AgentMarkerSchemaWorstCaseBytes -Schema $Schema
+    $fitsWindow = ($worstChars -le $ScanWindowChars)
+    $fitsCap = ($worstBytes -le $MaxOutputBytes)
+    $reason = $null
+    if (-not $fitsWindow) {
+        $reason = "largest legal marker is $worstChars chars, above the ${ScanWindowChars}-char scan window"
+    }
+    elseif (-not $fitsCap) {
+        $reason = "largest legal marker is $worstBytes bytes, above the ${MaxOutputBytes}-byte output cap"
+    }
+    return [pscustomobject][ordered]@{
+        Fits           = ($fitsWindow -and $fitsCap)
+        WorstCaseChars = $worstChars
+        WorstCaseBytes = $worstBytes
+        ScanWindowChars = $ScanWindowChars
+        MaxOutputBytes = $MaxOutputBytes
+        Reason         = $reason
     }
 }
 
@@ -2262,9 +2590,19 @@ function Get-AgentCliJsonOutcome {
         events are streaming fragments of the SAME message, so including them
         would duplicate the answer (and any result marker inside it).
 
-        Returns @{ Answer; Model; ModifiedFiles; ToolRequests; ExitCode } or $null when the
-        output is not JSONL - an older CLI, or a run without --output-format -
-        so the caller falls back to raw stdout instead of failing the cycle.
+        Usage accounting is read from two events, when present, so a caller can
+        record exact per-attempt cost even for a run that produced no marker:
+          {"type":"result","usage":{"premiumRequests":N,"totalApiDurationMs":N,"sessionDurationMs":N}}
+          {"type":"session.usage_checkpoint","data":{"totalNanoAiu":N,"totalPremiumRequests":N}}
+        The checkpoint is cumulative, so the LAST one seen wins. Every usage
+        figure is null when its event/field is absent - never zero, so a caller
+        can tell "the CLI did not report this" from "the CLI reported zero".
+
+        Returns @{ Answer; Model; ModifiedFiles; ToolRequests; ExitCode; ModelActuallyRan; Usage }
+        or $null when the output is not JSONL - an older CLI, or a run without
+        --output-format - so the caller falls back to raw stdout instead of
+        failing the cycle. Usage is a hashtable whose values are null when the
+        CLI did not report them.
     #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$StdOutText)
     if ([string]::IsNullOrWhiteSpace($StdOutText)) { return $null }
@@ -2275,8 +2613,27 @@ function Get-AgentCliJsonOutcome {
     $toolRequests = New-Object System.Collections.Generic.List[string]
     $model = ""
     $exitCode = $null
+    $usagePremiumRequests = $null
+    $usageTotalApiDurationMs = $null
+    $usageSessionDurationMs = $null
+    $usageTotalNanoAiu = $null
+    $usageTotalPremiumRequests = $null
     $sawJson = $false
     $sawAssistantMessage = $false
+    # A CLI usage figure may exceed [int]::MaxValue (nano-AIU totals are large),
+    # so these are read as [long] with a strict non-negative integral check that
+    # rejects strings, fractions, and negatives - never coercing junk to a number.
+    $readLong = {
+        param($Value)
+        if ($null -eq $Value) { return $null }
+        if ($Value -is [double] -or $Value -is [single]) {
+            if ([double]$Value -ne [Math]::Floor([double]$Value)) { return $null }
+        }
+        [long]$parsed = 0
+        if (-not [long]::TryParse(([string]$Value), [ref]$parsed)) { return $null }
+        if ($parsed -lt 0) { return $null }
+        return $parsed
+    }
     foreach ($line in ($StdOutText -split "`r?`n")) {
         $trimmed = "$line".Trim()
         if ($trimmed.Length -lt 2 -or -not $trimmed.StartsWith("{")) { continue }
@@ -2340,7 +2697,20 @@ function Get-AgentCliJsonOutcome {
                         foreach ($v in @($fmProp.Value)) { if ($v -is [string] -and $v.Trim() -ne "") { [void]$modified.Add([string]$v) } }
                     }
                 }
+                $prProp = $usageProp.Value.PSObject.Properties["premiumRequests"]
+                if ($prProp) { $usagePremiumRequests = (& $readLong $prProp.Value) }
+                $adProp = $usageProp.Value.PSObject.Properties["totalApiDurationMs"]
+                if ($adProp) { $usageTotalApiDurationMs = (& $readLong $adProp.Value) }
+                $sdProp = $usageProp.Value.PSObject.Properties["sessionDurationMs"]
+                if ($sdProp) { $usageSessionDurationMs = (& $readLong $sdProp.Value) }
             }
+        }
+        elseif ($eventType -eq "session.usage_checkpoint" -and $data) {
+            # Cumulative: the last checkpoint carries the run's running totals.
+            $naProp = $data.PSObject.Properties["totalNanoAiu"]
+            if ($naProp) { $v = (& $readLong $naProp.Value); if ($null -ne $v) { $usageTotalNanoAiu = $v } }
+            $tprProp = $data.PSObject.Properties["totalPremiumRequests"]
+            if ($tprProp) { $v = (& $readLong $tprProp.Value); if ($null -ne $v) { $usageTotalPremiumRequests = $v } }
         }
     }
     if (-not $sawJson) { return $null }
@@ -2358,6 +2728,13 @@ function Get-AgentCliJsonOutcome {
         ToolRequests   = @($toolRequests.ToArray())
         ExitCode       = $exitCode
         ModelActuallyRan = $sawAssistantMessage
+        Usage          = @{
+            PremiumRequests      = $usagePremiumRequests
+            TotalApiDurationMs   = $usageTotalApiDurationMs
+            SessionDurationMs    = $usageSessionDurationMs
+            TotalNanoAiu         = $usageTotalNanoAiu
+            TotalPremiumRequests = $usageTotalPremiumRequests
+        }
     }
 }
 
@@ -3701,6 +4078,13 @@ Export-ModuleMember -Function @(
     "Set-JsonState",
     "Write-AgentMetadata",
     "ConvertFrom-AgentResultMarker",
+    "ConvertFrom-AgentResultMarkerOutcome",
+    "Get-AgentResultMarkerOutcome",
+    "Test-AgentMarkerStatusRetryable",
+    "Measure-AgentMarkerSchemaWorstCaseChars",
+    "Measure-AgentMarkerSchemaWorstCaseBytes",
+    "Test-AgentMarkerSchemaFitsScanWindow",
+    "Test-AgentMarkerSchemaFitsLaunchContract",
     "ConvertTo-AgentCanonicalMarkerJson",
     "Find-CopilotSessionForBranch",
     "Set-TimedProcessArguments",

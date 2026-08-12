@@ -1199,6 +1199,672 @@ Assert-Specialist ($null -eq (ConvertFrom-AgentResultMarker -StdOutText $reachFo
 $hugePlant = ((1..2000 | ForEach-Object { "$markerPrefix see above" }) -join "`n")
 Assert-Specialist ($null -ne (ConvertFrom-AgentResultMarker -StdOutText "$hugePlant`n$compactMarker" -MarkerPrefix $markerPrefix -Schema $markerSchema)) `
     "Two thousand bare prefix lines discard a valid review."
+
+# ---------------------------------------------------------------------------
+# Layer A: typed, bounded model-result extraction outcome.
+#
+# The compatibility wrapper above answers only "was there a valid marker?".
+# ConvertFrom-AgentResultMarkerOutcome answers WHY a marker failed, so the
+# reviewer can tell a retryable emission slip (retry with a fresh nonce) apart
+# from a terminal rejection (never retried) with no prose matching. Every mode
+# is pinned here against the exact same schema the wrapper cases used.
+# ---------------------------------------------------------------------------
+$typedSchema = $markerSchema
+$typedCases = @(
+    @{ Name = "success"; Status = "success"; Retryable = $false; Text = "work log`n$compactMarker" }
+    @{ Name = "missing marker"; Status = "missingMarker"; Retryable = $true; Text = "no marker here at all" }
+    @{ Name = "empty transcript"; Status = "missingMarker"; Retryable = $true; Text = "   " }
+    @{ Name = "malformed JSON payload"; Status = "malformedMarker"; Retryable = $true; Text = "$markerPrefix {oops not json}" }
+    @{ Name = "truncated payload never closes"; Status = "truncated"; Retryable = $true; Text = "$markerPrefix {`"schemaVersion`":2,`"prId`":42" }
+    @{ Name = "missing required exact binding (nonce)"; Status = "schemaInvalid"; Field = "nonce"; Retryable = $true
+        Text = "$markerPrefix {`"schemaVersion`":2,`"prId`":42}" }
+    @{ Name = "wrong exact binding (replayed nonce)"; Status = "wrongBinding"; Field = "nonce"; Retryable = $false
+        Text = "$wrongNonceMarker" }
+    @{ Name = "two bound markers disagree"; Status = "ambiguousMarker"; Retryable = $true
+        Text = "$compactMarker`n$foreignMarker" }
+)
+foreach ($tc in $typedCases) {
+    $outcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText ([string]$tc.Text) -MarkerPrefix $markerPrefix -Schema $typedSchema
+    Assert-Specialist ([string]$outcome.Status -ceq [string]$tc.Status) `
+        "Typed extraction misclassified '$($tc.Name)': got '$($outcome.Status)', expected '$($tc.Status)'."
+    Assert-Specialist ([bool]$outcome.Retryable -eq [bool]$tc.Retryable) `
+        "Typed extraction gave the wrong retryability for '$($tc.Name)'."
+    if ($tc.ContainsKey('Field')) {
+        Assert-Specialist ([string]$outcome.Field -ceq [string]$tc.Field) `
+            "Typed extraction reported the wrong offending field for '$($tc.Name)'."
+    }
+}
+# Overflow: more than the retained-candidate cap of identical bound markers is a
+# distinct, retryable outcome rather than a silently accepted first-wins.
+$overflowOutcome = ConvertFrom-AgentResultMarkerOutcome `
+    -StdOutText ((1..40 | ForEach-Object { $compactMarker }) -join "`n") `
+    -MarkerPrefix $markerPrefix -Schema $typedSchema
+Assert-Specialist ([string]$overflowOutcome.Status -ceq "overflow" -and [bool]$overflowOutcome.Retryable) `
+    "A flood of identical bound markers is not the retryable 'overflow' outcome."
+# The success value carries the parsed, typed marker object.
+$successOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText $compactMarker -MarkerPrefix $markerPrefix -Schema $typedSchema
+Assert-Specialist ([int]$successOutcome.Value['prId'] -eq 42 -and [string]$successOutcome.Value['nonce'] -ceq 'NONCE1') `
+    "A successful typed extraction did not surface the parsed marker value."
+# Every status value's retry policy is pinned directly, including the two
+# statuses (nonObject, and any unknown/process status) the caller also routes
+# through this one helper.
+$retryablePolicy = @{
+    success = $false; wrongBinding = $false
+    missingMarker = $true; malformedMarker = $true; nonObject = $true
+    truncated = $true; overflow = $true; schemaInvalid = $true; ambiguousMarker = $true
+}
+foreach ($status in $retryablePolicy.Keys) {
+    Assert-Specialist ((Test-AgentMarkerStatusRetryable -Status $status) -eq [bool]$retryablePolicy[$status]) `
+        "Test-AgentMarkerStatusRetryable gave the wrong policy for '$status'."
+}
+Assert-Specialist (-not (Test-AgentMarkerStatusRetryable -Status "processFailure") -and
+    -not (Test-AgentMarkerStatusRetryable -Status "someUnknownStatus")) `
+    "An unknown or process-failure status defaulted to retryable, which would hand a replay extra attempts."
+
+# ---------------------------------------------------------------------------
+# Layer A: explicit scanner budget - the maximum legal serialized result must
+# fit the scan/capture window, and a caller can prove it before launch.
+# ---------------------------------------------------------------------------
+$fitSchema = @{
+    Keys   = @("nonce", "pad")
+    Fields = @{
+        nonce = @{ Type = 'exact'; Expected = 'N' }
+        pad   = @{ Type = 'string'; MaxLength = 200 }
+    }
+}
+$fitWorst = (Test-AgentMarkerSchemaFitsScanWindow -Schema $fitSchema -ScanWindowChars 65536).WorstCaseChars
+Assert-Specialist ((Test-AgentMarkerSchemaFitsScanWindow -Schema $fitSchema -ScanWindowChars $fitWorst).Fits) `
+    "A schema whose worst case exactly equals the window was reported as not fitting."
+Assert-Specialist (-not (Test-AgentMarkerSchemaFitsScanWindow -Schema $fitSchema -ScanWindowChars ($fitWorst - 1)).Fits) `
+    "A schema one character larger than the window was still reported as fitting."
+# The window is a real CAPTURE bound, not just a declared number: a legal marker
+# whose payload length exactly equals the window is captured, and one character
+# longer is refused as truncated rather than silently half-read.
+$fitPrefix = "MAXFIT_V1:"
+$window = 64
+$payloadPrefixChars = ('{"nonce":"N","pad":"').Length                                    # up to the opening pad quote
+$payloadSuffixChars = ('"}').Length
+$exactPadLen = $window - $payloadPrefixChars - $payloadSuffixChars
+$exactPayload = '{"nonce":"N","pad":"' + ('X' * $exactPadLen) + '"}'
+Assert-Specialist ($exactPayload.Length -eq $window) "Test scaffolding failed to build a window-sized payload."
+$exactText = "$fitPrefix $exactPayload"
+$overText = "$fitPrefix " + ('{"nonce":"N","pad":"' + ('X' * ($exactPadLen + 1)) + '"}')
+$exactOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText $exactText -MarkerPrefix $fitPrefix -Schema $fitSchema -ScanWindowChars $window
+Assert-Specialist ([string]$exactOutcome.Status -ceq "success") `
+    "A legal marker whose payload exactly fills the scan window was not captured."
+$overOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText $overText -MarkerPrefix $fitPrefix -Schema $fitSchema -ScanWindowChars $window
+Assert-Specialist ([string]$overOutcome.Status -ceq "truncated" -and [bool]$overOutcome.Retryable) `
+    "A marker one character past the scan window was not refused as truncated."
+
+# ---------------------------------------------------------------------------
+# Layer A: the pre-launch result-contract gate is a REAL launch gate, not a
+# helper tested in isolation. The actual gate function the wrapper runs is
+# extracted from the live source and executed here; a schema whose largest
+# legal marker cannot fit its declared window/byte cap must throw (refuse to
+# launch), and a fitting schema must return the SAME window the extractor is
+# then handed. The three model surfaces that emit a marker are each proven to
+# call this gate BEFORE any Invoke-TimedProcess, so a contract that cannot fit
+# can never reach a process launch.
+# ---------------------------------------------------------------------------
+Invoke-Expression (Get-FunctionText -Text $wrapperText -Name 'Assert-ReviewerModelResultContractFits')
+# The real production specialist schema at its declared bounds is a clean fit,
+# and the gate returns exactly the window the extractor will scan.
+$gateSchema = Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject 'One' -ExpectedNonce ('a' * 36)
+$gateWindow = [regex]::Match($wrapperText, '\$script:ReviewerConventionSpecialistScanWindowChars\s*=\s*(\d+)').Groups[1].Value -as [int]
+$gateCap = [regex]::Match($wrapperText, '\$script:ReviewerConventionSpecialistMaxOutputBytes\s*=\s*(\d+)').Groups[1].Value -as [int]
+Assert-Specialist ($gateWindow -gt 0 -and $gateCap -gt 0) "The specialist scan-window/output-cap constants were not found in the live source."
+$gateReturned = Assert-ReviewerModelResultContractFits -Surface "convention specialist" -Schema $gateSchema `
+    -ScanWindowChars $gateWindow -MaxOutputBytes $gateCap
+Assert-Specialist ([int]$gateReturned -eq [int]$gateWindow) `
+    "The contract gate did not return the declared scan window for the extractor to reuse."
+# Maximum legal marker acceptance and +1 overflow, measured against the REAL
+# specialist schema: the gate fits at exactly the worst-case window and byte
+# count, and refuses one character / one byte tighter.
+$gateWorst = Test-AgentMarkerSchemaFitsLaunchContract -Schema $gateSchema -ScanWindowChars 4000000 -MaxOutputBytes 8000000
+Assert-Specialist ([int](Assert-ReviewerModelResultContractFits -Surface "convention specialist" -Schema $gateSchema `
+            -ScanWindowChars ([int]$gateWorst.WorstCaseChars) -MaxOutputBytes ([int]$gateWorst.WorstCaseBytes)) -eq [int]$gateWorst.WorstCaseChars) `
+    "The largest legal specialist marker was refused at a window/cap sized exactly to it."
+Assert-SpecialistThrows { Assert-ReviewerModelResultContractFits -Surface "convention specialist" -Schema $gateSchema `
+        -ScanWindowChars ([int]$gateWorst.WorstCaseChars - 1) -MaxOutputBytes ([int]$gateWorst.WorstCaseBytes) } `
+    "A scan window one character below the specialist worst case did not refuse to launch."
+Assert-SpecialistThrows { Assert-ReviewerModelResultContractFits -Surface "convention specialist" -Schema $gateSchema `
+        -ScanWindowChars ([int]$gateWorst.WorstCaseChars) -MaxOutputBytes ([int]$gateWorst.WorstCaseBytes - 1) } `
+    "An output byte cap one byte below the specialist worst case did not refuse to launch."
+# The refusal is surface-named and fatal (a code/schema defect, never a model
+# slip), so the caller cannot mistake it for a retryable pass failure.
+$gateThrew = $false
+try { Assert-ReviewerModelResultContractFits -Surface "convention specialist" -Schema $gateSchema -ScanWindowChars 8 -MaxOutputBytes 16 | Out-Null }
+catch { $gateThrew = $true; $gateErr = [string]$_ }
+Assert-Specialist ($gateThrew -and $gateErr -match 'convention specialist' -and $gateErr -match 'must not launch') `
+    "An unfittable contract did not throw a surface-named refuse-to-launch error."
+# Each of the three marker-emitting surfaces calls the gate BEFORE it launches a
+# process, so no Invoke-TimedProcess can run for a contract that cannot fit.
+foreach ($surfaceFn in @('Invoke-ReviewerModelPass', 'Invoke-ReviewerConventionSpecialistPass', 'Invoke-ReviewerVerificationModelRun')) {
+    $surfaceText = Get-FunctionText -Text $wrapperText -Name $surfaceFn
+    $gateIndex = $surfaceText.IndexOf('Assert-ReviewerModelResultContractFits', [StringComparison]::Ordinal)
+    $launchIndex = $surfaceText.IndexOf('Invoke-TimedProcess', [StringComparison]::Ordinal)
+    Assert-Specialist ($gateIndex -ge 0 -and $launchIndex -ge 0 -and $gateIndex -lt $launchIndex) `
+        "$surfaceFn does not run the pre-launch contract gate before Invoke-TimedProcess."
+}
+
+# ---------------------------------------------------------------------------
+# Layer A (item 2/this turn): the generalist marker window/cap must fit the
+# LARGEST legal generalist schema, MaxFindings = 25 (the -MaxFindings CLI
+# ceiling), not just the default 12. A too-small window silently clamps a legal
+# option: a correct 25-finding review would be refused at launch. These prove the
+# live constants admit EVERY legal MaxFindings in 0..25, that the maximum legal
+# marker extracts, and that one finding past the cap / a window overflow reject.
+# ---------------------------------------------------------------------------
+Invoke-Expression (Get-FunctionText -Text $wrapperText -Name 'Get-ReviewerMarkerSchema')
+$script:ReviewerSeverities = @("critical", "important", "suggestion")
+$genWindow = [regex]::Match($wrapperText, '\$script:ReviewerMarkerScanWindowChars\s*=\s*(\d+)').Groups[1].Value -as [int]
+$genCap = [regex]::Match($wrapperText, '\$script:ReviewerMarkerMaxOutputBytes\s*=\s*(\d+)').Groups[1].Value -as [int]
+Assert-Specialist ($genWindow -gt 0 -and $genCap -gt 0) `
+    "The generalist scan-window/output-cap constants were not found in the live source."
+$genNonce = ('a' * 36)
+$genPrefix = 'REVIEWER_RESULT_V1:'
+# The full legal MaxFindings range fits the live bounds - none is silently
+# clamped. 25 is the CLI ceiling; 0 is a legal empty review.
+for ($n = 0; $n -le 25; $n++) {
+    $schemaN = Get-ReviewerMarkerSchema -ExpectedProject 'One' -ExpectedNonce $genNonce -MaxFindingItems $n
+    $fitN = Test-AgentMarkerSchemaFitsLaunchContract -Schema $schemaN -ScanWindowChars $genWindow -MaxOutputBytes $genCap
+    Assert-Specialist ([bool]$fitN.Fits) `
+        "The live generalist bounds refuse the largest legal marker for MaxFindings=$n (chars $($fitN.WorstCaseChars) / bytes $($fitN.WorstCaseBytes)), silently clamping a legal option."
+    # The gate itself (the real launch barrier) admits every legal size and hands
+    # back the same window the extractor will scan.
+    Assert-Specialist ([int](Assert-ReviewerModelResultContractFits -Surface "generalist pass (test)" `
+                -Schema $schemaN -ScanWindowChars $genWindow -MaxOutputBytes $genCap) -eq $genWindow) `
+        "The generalist launch gate refused a legal MaxFindings=$n contract at the live window."
+}
+# The maximum legal schema (25 findings) sits inside the live window and cap with
+# headroom - the worst case is a bound, not a coincidence.
+$gen25Schema = Get-ReviewerMarkerSchema -ExpectedProject 'One' -ExpectedNonce $genNonce -MaxFindingItems 25
+$gen25Worst = Test-AgentMarkerSchemaFitsLaunchContract -Schema $gen25Schema -ScanWindowChars 8000000 -MaxOutputBytes 16000000
+Assert-Specialist ([int]$gen25Worst.WorstCaseChars -le $genWindow -and [int]$gen25Worst.WorstCaseBytes -le $genCap) `
+    "The live generalist window/cap does not cover the MaxFindings=25 worst case ($($gen25Worst.WorstCaseChars) chars / $($gen25Worst.WorstCaseBytes) bytes)."
+# The maximum legal marker (25 findings, long fields) EXTRACTS successfully under
+# the live window - the whole point of raising the bound.
+$maxComment = ('c' * 1200)
+$gen25Findings = @(1..25 | ForEach-Object {
+        [ordered]@{ severity = 'critical'; filePath = ('/' + ('d' * 200) + '.cs'); line = 1000000; comment = $maxComment }
+    })
+$gen25Marker = [ordered]@{
+    schemaVersion = 1; prId = 42; repositoryId = '11111111-2222-3333-4444-555555555555'
+    project = 'One'; reviewedSourceCommit = ('a' * 40); findings = $gen25Findings
+    recommendedVote = 'waitForAuthor'; summary = ('s' * 1500); nonce = $genNonce
+}
+$gen25Outcome = ConvertFrom-AgentResultMarkerOutcome `
+    -StdOutText ($genPrefix + ' ' + ($gen25Marker | ConvertTo-Json -Depth 12 -Compress)) `
+    -MarkerPrefix $genPrefix -Schema $gen25Schema -ScanWindowChars $genWindow
+Assert-Specialist ([string]$gen25Outcome.Status -ceq 'success' -and
+    @($gen25Outcome.Value['findings']).Count -eq 25) `
+    "The maximum legal 25-finding generalist marker did not extract under the live scan window."
+# One finding past the cap is a schema violation (schemaInvalid), never silently
+# accepted or truncated.
+$gen26Findings = @(1..26 | ForEach-Object {
+        [ordered]@{ severity = 'important'; filePath = '/a.cs'; line = 1; comment = 'over the cap' }
+    })
+$gen26Marker = [ordered]@{
+    schemaVersion = 1; prId = 42; repositoryId = '11111111-2222-3333-4444-555555555555'
+    project = 'One'; reviewedSourceCommit = ('a' * 40); findings = $gen26Findings
+    recommendedVote = 'approve'; summary = ''; nonce = $genNonce
+}
+$gen26Outcome = ConvertFrom-AgentResultMarkerOutcome `
+    -StdOutText ($genPrefix + ' ' + ($gen26Marker | ConvertTo-Json -Depth 12 -Compress)) `
+    -MarkerPrefix $genPrefix -Schema $gen25Schema -ScanWindowChars $genWindow
+Assert-Specialist ([string]$gen26Outcome.Status -ceq 'schemaInvalid') `
+    "A 26-finding marker (one past the MaxFindings=25 cap) was not rejected as schemaInvalid."
+# A marker whose JSON runs past the scan window is a window overflow (truncated),
+# proving the bounded scan is still hard - a wider legal schema did not remove the
+# ceiling, it only sized it correctly.
+$gen25OverflowOutcome = ConvertFrom-AgentResultMarkerOutcome `
+    -StdOutText ($genPrefix + ' ' + ($gen25Marker | ConvertTo-Json -Depth 12 -Compress)) `
+    -MarkerPrefix $genPrefix -Schema $gen25Schema -ScanWindowChars 256
+Assert-Specialist ([string]$gen25OverflowOutcome.Status -ceq 'truncated') `
+    "A marker that overruns the scan window was not rejected as truncated."
+# The generalist launch gate refuses one character below and one byte below the
+# MaxFindings=25 worst case, so the bound is exact, not loose.
+Assert-SpecialistThrows { Assert-ReviewerModelResultContractFits -Surface "generalist pass (test)" -Schema $gen25Schema `
+        -ScanWindowChars ([int]$gen25Worst.WorstCaseChars - 1) -MaxOutputBytes ([int]$gen25Worst.WorstCaseBytes) } `
+    "A generalist scan window one character below the MaxFindings=25 worst case did not refuse to launch."
+Assert-SpecialistThrows { Assert-ReviewerModelResultContractFits -Surface "generalist pass (test)" -Schema $gen25Schema `
+        -ScanWindowChars ([int]$gen25Worst.WorstCaseChars) -MaxOutputBytes ([int]$gen25Worst.WorstCaseBytes - 1) } `
+    "A generalist output byte cap one byte below the MaxFindings=25 worst case did not refuse to launch."
+
+# ---------------------------------------------------------------------------
+# Layer A (final): the MERGED marker is the largest marker this agent re-parses -
+# one full generalist cap PER PASS, up to 25 * 2 = 50 findings (~166 KB). Both
+# re-validation sites (seal in Invoke-ReviewerPullRequest, promotion in
+# Invoke-ReviewerPromotion) must scan it under a dedicated merged window, not the
+# harness 65536 default that would silently TRUNCATE a maximal two-pass review and
+# seal an artifact that could never be promoted. These prove the live merged
+# bounds admit the 50-finding worst case, round-trip the maximum legal marker at
+# BOTH seal and promotion, reject +1 / a window overflow, keep strict binding, and
+# that both live sites size their scan window from the merged contract and assert
+# fit (plus the promotion byte cap and ceiling) before parsing.
+# ---------------------------------------------------------------------------
+$mergedWindow = [regex]::Match($wrapperText, '\$script:ReviewerMergedMarkerScanWindowChars\s*=\s*(\d+)').Groups[1].Value -as [int]
+$mergedCap = [regex]::Match($wrapperText, '\$script:ReviewerMergedMarkerMaxOutputBytes\s*=\s*(\d+)').Groups[1].Value -as [int]
+$mergedMaxItems = [regex]::Match($wrapperText, '\$script:ReviewerMergedMarkerMaxFindingItems\s*=\s*(\d+)').Groups[1].Value -as [int]
+Assert-Specialist ($mergedWindow -gt 0 -and $mergedCap -gt 0 -and $mergedMaxItems -eq 50) `
+    "The merged-marker scan-window/output-cap constants were not found, or the 25*2=50 legal ceiling changed, in the live source."
+$mergedNonce = ('b' * 40)
+$mergedPrefix = 'REVIEWER_RESULT_V1:'
+$mergedSchema = Get-ReviewerMarkerSchema -ExpectedProject 'One' -ExpectedNonce $mergedNonce -MaxFindingItems $mergedMaxItems
+# The 50-finding worst case fits the live merged window and cap...
+$mergedWorst = Test-AgentMarkerSchemaFitsLaunchContract -Schema $mergedSchema -ScanWindowChars 8000000 -MaxOutputBytes 16000000
+Assert-Specialist ([int]$mergedWorst.WorstCaseChars -le $mergedWindow -and [int]$mergedWorst.WorstCaseBytes -le $mergedCap) `
+    "The live merged window/cap does not cover the 50-finding worst case ($($mergedWorst.WorstCaseChars) chars / $($mergedWorst.WorstCaseBytes) bytes)."
+# ...and the launch gate admits it while returning the same window.
+Assert-Specialist ([int](Assert-ReviewerModelResultContractFits -Surface "merged review (test)" `
+            -Schema $mergedSchema -ScanWindowChars $mergedWindow -MaxOutputBytes $mergedCap) -eq $mergedWindow) `
+    "The merged launch gate refused the legal 50-finding contract at the live merged window."
+# The maximum legal 2-pass 50-finding compact marker round-trips at seal: build it
+# the way a live cycle builds a merged marker and re-parse under the merged window.
+$mComment = ('c' * 1200)
+$mPath = ('/' + ('d' * 396) + '.cs')
+$merged50Findings = @(1..50 | ForEach-Object {
+        [ordered]@{ severity = 'critical'; filePath = $mPath; line = 1000000; comment = $mComment }
+    })
+$merged50Marker = [ordered]@{
+    schemaVersion = 1; prId = 42; repositoryId = '11111111-2222-3333-4444-555555555555'
+    project = 'One'; reviewedSourceCommit = ('a' * 40); findings = $merged50Findings
+    recommendedVote = 'waitForAuthor'; summary = ('s' * 1500); nonce = $mergedNonce
+}
+$merged50Json = $merged50Marker | ConvertTo-Json -Depth 12 -Compress
+$merged50Seal = ConvertFrom-AgentResultMarker -StdOutText ($mergedPrefix + ' ' + $merged50Json) `
+    -MarkerPrefix $mergedPrefix -Schema $mergedSchema -ScanWindowChars $mergedWindow
+Assert-Specialist ($null -ne $merged50Seal -and @($merged50Seal['findings']).Count -eq 50) `
+    "The maximum legal 50-finding merged marker did not round-trip at seal under the live merged scan window."
+# The SAME body IS lost under the old harness 65536 fallback the bug used - proof
+# the dedicated window is load-bearing, not cosmetic.
+$merged50Fallback = ConvertFrom-AgentResultMarkerOutcome -StdOutText ($mergedPrefix + ' ' + $merged50Json) `
+    -MarkerPrefix $mergedPrefix -Schema $mergedSchema -ScanWindowChars 65536
+Assert-Specialist ([string]$merged50Fallback.Status -ceq 'truncated') `
+    "A 50-finding merged marker was NOT truncated under the old 65536 fallback, so the bug this fix closes could not have existed."
+# Promotion at the maximum legal bound extracts identically under the merged window.
+$merged50Promote = ConvertFrom-AgentResultMarkerOutcome -StdOutText ($mergedPrefix + ' ' + $merged50Json) `
+    -MarkerPrefix $mergedPrefix -Schema $mergedSchema -ScanWindowChars $mergedWindow
+Assert-Specialist ([string]$merged50Promote.Status -ceq 'success' -and @($merged50Promote.Value['findings']).Count -eq 50) `
+    "The maximum legal 50-finding merged marker did not extract at promotion under the live merged window."
+# +1 (51 findings) is a schema violation, never silently accepted or truncated.
+$merged51Findings = @(1..51 | ForEach-Object { [ordered]@{ severity = 'important'; filePath = '/a.cs'; line = 1; comment = 'over' } })
+$merged51Marker = [ordered]@{
+    schemaVersion = 1; prId = 42; repositoryId = '11111111-2222-3333-4444-555555555555'
+    project = 'One'; reviewedSourceCommit = ('a' * 40); findings = $merged51Findings
+    recommendedVote = 'approve'; summary = ''; nonce = $mergedNonce
+}
+$merged51Outcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText ($mergedPrefix + ' ' + ($merged51Marker | ConvertTo-Json -Depth 12 -Compress)) `
+    -MarkerPrefix $mergedPrefix -Schema $mergedSchema -ScanWindowChars $mergedWindow
+Assert-Specialist ([string]$merged51Outcome.Status -ceq 'schemaInvalid') `
+    "A 51-finding merged marker (one past the 50 ceiling) was not rejected as schemaInvalid."
+# A merged marker that overruns a tiny window is truncated - the merged scan is a
+# hard bound, a wider legal schema only sized it correctly.
+$merged50Truncated = ConvertFrom-AgentResultMarkerOutcome -StdOutText ($mergedPrefix + ' ' + $merged50Json) `
+    -MarkerPrefix $mergedPrefix -Schema $mergedSchema -ScanWindowChars 256
+Assert-Specialist ([string]$merged50Truncated.Status -ceq 'truncated') `
+    "A merged marker that overruns the scan window was not rejected as truncated."
+# Strict binding is UNCHANGED under the merged window: the schema's exact project
+# and nonce still reject a marker bound to a different project or nonce.
+$mergedWrongProjectSchema = Get-ReviewerMarkerSchema -ExpectedProject 'Other' -ExpectedNonce $mergedNonce -MaxFindingItems $mergedMaxItems
+$mergedWrongProject = ConvertFrom-AgentResultMarkerOutcome -StdOutText ($mergedPrefix + ' ' + $merged50Json) `
+    -MarkerPrefix $mergedPrefix -Schema $mergedWrongProjectSchema -ScanWindowChars $mergedWindow
+Assert-Specialist ([string]$mergedWrongProject.Status -cne 'success') `
+    "A merged marker bound to a different project was accepted; strict binding weakened under the merged window."
+$mergedWrongNonceSchema = Get-ReviewerMarkerSchema -ExpectedProject 'One' -ExpectedNonce ('z' * 40) -MaxFindingItems $mergedMaxItems
+$mergedWrongNonce = ConvertFrom-AgentResultMarkerOutcome -StdOutText ($mergedPrefix + ' ' + $merged50Json) `
+    -MarkerPrefix $mergedPrefix -Schema $mergedWrongNonceSchema -ScanWindowChars $mergedWindow
+Assert-Specialist ([string]$mergedWrongNonce.Status -cne 'success') `
+    "A merged marker carrying the wrong nonce was accepted; strict nonce binding weakened under the merged window."
+# The gate is exact at the merged bound too: one char / one byte below the
+# 50-finding worst case refuses to launch.
+Assert-SpecialistThrows { Assert-ReviewerModelResultContractFits -Surface "merged review (test)" -Schema $mergedSchema `
+        -ScanWindowChars ([int]$mergedWorst.WorstCaseChars - 1) -MaxOutputBytes ([int]$mergedWorst.WorstCaseBytes) } `
+    "A merged scan window one character below the 50-finding worst case did not refuse."
+Assert-SpecialistThrows { Assert-ReviewerModelResultContractFits -Surface "merged review (test)" -Schema $mergedSchema `
+        -ScanWindowChars ([int]$mergedWorst.WorstCaseChars) -MaxOutputBytes ([int]$mergedWorst.WorstCaseBytes - 1) } `
+    "A merged output byte cap one byte below the 50-finding worst case did not refuse."
+# Both live re-validation sites size their scan window from the merged contract and
+# assert fit before parsing - source assertions so a future edit cannot silently
+# drop back to the harness default that caused the bug.
+$mergeSiteText = Get-FunctionText -Text $wrapperText -Name 'Invoke-ReviewerPullRequest'
+Assert-Specialist ($mergeSiteText -match 'Assert-ReviewerModelResultContractFits -Surface "merged review"') `
+    "The live merge site no longer asserts the merged result-contract fit before sealing."
+Assert-Specialist ($mergeSiteText -match '(?s)\$mergedRoundTrip = ConvertFrom-AgentResultMarker.{0,600}-ScanWindowChars \$script:ReviewerMergedMarkerScanWindowChars') `
+    "The live merge re-validation no longer scans under the dedicated merged window."
+$promoteSiteText = Get-FunctionText -Text $wrapperText -Name 'Invoke-ReviewerPromotion'
+Assert-Specialist ($promoteSiteText -match 'Assert-ReviewerModelResultContractFits -Surface "stored review"') `
+    "The promotion re-validation no longer asserts the merged result-contract fit before parsing."
+Assert-Specialist ($promoteSiteText -match '-ScanWindowChars \$script:ReviewerMergedMarkerScanWindowChars') `
+    "The promotion re-validation no longer scans the stored marker under the merged window."
+Assert-Specialist ($promoteSiteText -match '\$script:ReviewerUtf8\.GetByteCount\(\$storedMarkerBody\) -gt \$script:ReviewerMergedMarkerMaxOutputBytes') `
+    "The promotion path no longer enforces the hard merged byte cap on the stored marker body."
+Assert-Specialist ($promoteSiteText -match '\$maxItems -gt \$script:ReviewerMergedMarkerMaxFindingItems') `
+    "The promotion path no longer refuses a stored finding bound above the legal merged ceiling."
+
+# ---------------------------------------------------------------------------
+# Layer A (item 3/7): the specialist marker loop is driven by the SAME typed
+# outcome the unit cases pin, so a PR16769813-style marker that parses cleanly
+# and only later fails a downstream SEMANTIC check is a single attempt with no
+# marker retry, and each actual attempt emits its own accounting with a hashed
+# nonce. These pin the live loop text against a silent regression to the old
+# generic-null retry.
+# ---------------------------------------------------------------------------
+$specialistPassText = Get-FunctionText -Text $wrapperText -Name 'Invoke-ReviewerConventionSpecialistPass'
+Assert-Specialist ($specialistPassText -match 'ConvertFrom-AgentResultMarkerOutcome') `
+    "The specialist loop does not classify the marker through the typed outcome."
+Assert-Specialist ($specialistPassText -notmatch '=\s*ConvertFrom-AgentResultMarker\b') `
+    "The specialist loop still assigns from the untyped compatibility parser."
+Assert-Specialist ($specialistPassText -match 'if \(\$null -ne \$marker\) \{ break \}') `
+    "The specialist loop does not treat a clean marker parse as terminal (one attempt, no marker retry)."
+Assert-Specialist ($specialistPassText -match 'if \(-not \(Test-AgentMarkerStatusRetryable -Status \$specialistMarkerStatus\)\) \{ break \}') `
+    "The specialist loop retries on something other than a typed-retryable emission slip."
+$specialistNonceInLoop = $specialistPassText.IndexOf('New-AgentNonce', [StringComparison]::Ordinal)
+$specialistLoopStart = $specialistPassText.IndexOf('$specialistAttempt = 1', [StringComparison]::Ordinal)
+Assert-Specialist ($specialistLoopStart -ge 0 -and $specialistNonceInLoop -gt $specialistLoopStart) `
+    "The specialist loop does not mint a fresh nonce inside each attempt."
+Assert-Specialist ($specialistPassText -match 'specialist-attempt-accounting' -and
+    $specialistPassText -match 'nonceSha256 = \(Get-ReviewerTextSha256') `
+    "The specialist loop does not emit per-attempt accounting keyed by a hashed nonce."
+# The accounting records the nonce only as a SHA-256, never the raw nonce value.
+Assert-Specialist ($specialistPassText -notmatch 'nonce = \$AttemptNonce' -and $specialistPassText -notmatch 'nonce = \$nonce\b') `
+    "The specialist accounting leaks a raw nonce instead of its hash."
+
+# ---------------------------------------------------------------------------
+# Layer A (item 2/this turn): every LAUNCHED specialist attempt emits exactly one
+# accounting record before any terminal throw. A process/tool failure is
+# classified (timeout / processFailure / modelMismatch / toolViolation) into a
+# deferred terminal-class variable rather than thrown on the spot, so the single
+# accounting record is guaranteed to precede the throw and no launched attempt is
+# invisible to accounting. A contract-fit refusal happens BEFORE any launch, so it
+# emits a separate launch-refusal record and NEVER an attempt record.
+# ---------------------------------------------------------------------------
+# There are exactly three attempt-accounting emit sites, one per mutually
+# exclusive terminal path of a launched attempt: the process/tool terminal class,
+# the output overflow, and the typed marker extraction. No path emits twice.
+Assert-Specialist (([regex]::Matches($specialistPassText, '&\s+\$emitSpecialistAcct')).Count -eq 3) `
+    "The specialist loop does not have exactly one accounting emit per launched-attempt terminal path."
+# The deferred terminal path emits its single record and only then throws.
+Assert-Specialist ($specialistPassText -match ('if \(\$specialistTerminalClass\) \{\s*' +
+        '& \$emitSpecialistAcct \$specialistAttempt \$nonce \$specialistTerminalClass ' +
+        '\$specialistModelRan \$specialistUsage\s*throw \$specialistTerminalThrow')) `
+    "A launched specialist attempt can throw its terminal failure without first emitting its accounting record."
+# Each launched-attempt failure carries a precise typed process/tool class.
+foreach ($terminalClass in @('modelMismatch', 'toolViolation')) {
+    Assert-Specialist ($specialistPassText -match ('\$specialistTerminalClass = ' + "'" + $terminalClass + "'")) `
+        "The specialist loop does not classify a launched-attempt failure as the precise '$terminalClass'."
+}
+# A timeout and a nonzero exit are told apart into their own precise classes.
+Assert-Specialist ($specialistPassText -match ('\$specialistTerminalClass = if \(\[bool\]\$run\.TimedOut\) ' +
+        "\{ 'timeout' \} else \{ 'processFailure' \}")) `
+    "The specialist loop does not classify a launched-attempt failure into the precise timeout vs processFailure classes."
+# The model-mismatch, modified-files, and forbidden-tool failures are DEFERRED
+# (assigned to the terminal-throw variable), never thrown inline ahead of
+# accounting.
+Assert-Specialist ($specialistPassText -notmatch 'throw "Copilot reported specialist model' -and
+    $specialistPassText -notmatch 'throw "Convention specialist reported modified files' -and
+    $specialistPassText -notmatch 'throw "Convention specialist requested forbidden') `
+    "A launched specialist attempt still throws a process/tool failure inline, bypassing its accounting record."
+# A contract-fit refusal is surfaced as launch-refusal metadata (no launch, no
+# attempt accounting), and the refusal block never emits an attempt record.
+Assert-Specialist ($specialistPassText -match 'mode = "specialist-launch-refused"' -and
+    $specialistPassText -match 'reason = "contractFit"') `
+    "A specialist contract-fit refusal does not emit its own launch-refusal metadata."
+$refuseStart = $specialistPassText.IndexOf('specialist-launch-refused', [StringComparison]::Ordinal)
+$refuseLaunch = $specialistPassText.IndexOf('Invoke-TimedProcess', [StringComparison]::Ordinal)
+$refuseBlock = if ($refuseStart -ge 0 -and $refuseLaunch -gt $refuseStart) {
+    $specialistPassText.Substring($refuseStart, $refuseLaunch - $refuseStart)
+} else { '' }
+Assert-Specialist ($refuseBlock -and $refuseBlock -notmatch 'emitSpecialistAcct' -and
+    $refuseBlock -notmatch 'specialist-attempt-accounting') `
+    "A specialist contract-fit refusal emits an attempt-accounting record even though no model launched."
+# The overflow and extraction emits stay on their own exclusive paths: overflow
+# emits then continues/throws, and a clean parse breaks the loop, so a
+# semantically-rejected-later marker (PR16769813) is one successful attempt with
+# no marker retry and no second accounting record.
+Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specialistAttempt `$nonce 'overflow' `$specialistModelRan `$specialistUsage") -and
+    $specialistPassText.Contains('& $emitSpecialistAcct $specialistAttempt $nonce $specialistMarkerStatus $specialistModelRan $specialistUsage')) `
+    "The overflow and typed-extraction accounting emits are not the exact per-attempt records expected."
+
+# ---------------------------------------------------------------------------
+# Layer A (item 1/4/5/6): drive the ACTUAL Invoke-ReviewerModelPass, not just
+# the parser. The live function is extracted from source and executed with the
+# process launch and runtime helpers mocked, so the whole marker-validation path
+# runs exactly as it does in production. This is the regression the audit named:
+# the status was compared against $script:AgentMarkerStatus, which is MODULE
+# scoped and invisible to the reviewer script, so every comparison was $null and
+# every valid marker was rejected. The block is wrapped in its own scope so its
+# mocks and $script: config never leak into later tests.
+# ---------------------------------------------------------------------------
+& {
+    foreach ($fn in 'Get-ReviewerMarkerSchema', 'Test-ReviewerMarkerBinding', 'Get-ReviewerHashValue', 'Invoke-ReviewerModelPass') {
+        Invoke-Expression (Get-FunctionText -Text $wrapperText -Name $fn)
+    }
+    # Assert-ReviewerModelResultContractFits was already defined above; the pass
+    # calls it as the real pre-launch gate.
+    $script:ReviewerUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+    $script:ReviewerSeverities = @("critical", "important", "suggestion")
+    $script:ReviewerMaxModelInputBytes = 10485760
+    $script:ReviewerMarkerScanWindowChars = 65536
+    $script:ReviewerMarkerMaxOutputBytes = 131072
+    $ExpectedProject = 'One'
+    $EffectiveMaxFindings = 12
+    $ResultMarkerPrefix = 'REVIEWER_RESULT_V1:'
+    $cfgRepoId = '11111111-2222-3333-4444-555555555555'
+    $ConfigAllowTools = @(); $ConfigDenyTools = @()
+    $CopilotAgentName = 'a'; $CopilotAgentSource = 's'
+    $CopilotSensitiveEnvironmentVariables = @()
+    $RepoPath = $repoRoot
+    $CycleTimeoutSeconds = 60
+    $logDir = Join-Path ([IO.Path]::GetTempPath()) ("reviewer-item1-{0}" -f ([guid]::NewGuid()))
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $PromptFile = Join-Path $logDir 'prompt.md'
+    Set-Content -LiteralPath $PromptFile -Value 'PROMPT' -Encoding UTF8
+    $script:knownNonce = ('abc123' * 6)
+    $script:timedProcessCalled = $false
+    $script:cannedStdOut = ''
+
+    function New-AgentNonce { $script:knownNonce }
+    function Get-ReviewerRuntimeContext { param($Nonce, $PrId, $RepositoryId, $SourceCommit, $SourceBranch, $AuthorAlias, $ThreadDigestText, $AuthoritativeSourcesText, $PinnedSourceText) '' }
+    function Write-ReviewerCycleMetadata { param($Fields) }
+    function Get-ReviewerEffectiveAllowTools { param($BaseAllow) @() }
+    function Get-ReviewerLaunchAllowTools { param($Intended) @() }
+    function ConvertTo-ReviewerAvailableToolNames { param($PermissionTools) @() }
+    function Get-ReviewerEffectiveDenyTools { param($ConfigDeny) @() }
+    function Get-AgentDefaultModelSentinel { 'DEFAULT_SENTINEL' }
+    function Get-AgentCopilotArgs { param($AgentName, $Source, $AvailableTools, $AllowTools, $DenyTools, $Model, [switch]$JsonOutput) @('--json') }
+    function Invoke-TimedProcess {
+        param($FilePath, $ArgumentList, $StandardInputContent, [switch]$CaptureStdOut, [switch]$CaptureStdErr, $WorkingDirectory, $EnvironmentVariablesToRemove, $TimeoutSeconds)
+        $script:timedProcessCalled = $true
+        @{ StdOut = $script:cannedStdOut; StdErr = ''; ExitCode = 0; TimedOut = $false }
+    }
+
+    $sourceCommit = ('a' * 40)
+    $Bound = @{ PrId = 42; SourceCommit = $sourceCommit; SourceBranch = 'b'; AuthorAlias = 'x'; DigestText = '' }
+    function New-Transcript {
+        param([hashtable]$Marker)
+        $compact = ([pscustomobject]$Marker | ConvertTo-Json -Compress -Depth 8)
+        $assistant = @{ type = 'assistant.message'; data = @{ content = "$ResultMarkerPrefix $compact"; model = 'claude-opus-5' } } | ConvertTo-Json -Compress -Depth 8
+        $result = @{ type = 'result'; exitCode = 0; usage = @{ premiumRequests = 3; totalApiDurationMs = 100; sessionDurationMs = 120; codeChanges = @{ filesModified = @() } } } | ConvertTo-Json -Compress -Depth 8
+        ($assistant, $result) -join "`n"
+    }
+    $validMarker = [ordered]@{ schemaVersion = 1; prId = 42; repositoryId = $cfgRepoId; project = 'One'
+        reviewedSourceCommit = $sourceCommit; findings = @(); recommendedVote = 'approve'; summary = ''; nonce = $script:knownNonce }
+
+    # (1) A valid, correctly bound marker succeeds - the whole point of the fix.
+    $script:cannedStdOut = New-Transcript -Marker $validMarker
+    $script:timedProcessCalled = $false
+    $okRes = Invoke-ReviewerModelPass -AgencyPath 'copilot' -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1
+    Assert-Specialist ($script:timedProcessCalled -and [string]$okRes.RejectionClass -ceq 'success' -and
+        $null -ne $okRes.Marker -and [int]$okRes.Marker['prId'] -eq 42) `
+        "The live Invoke-ReviewerModelPass rejected a valid, correctly bound marker (the module-scope status regression)."
+    Assert-Specialist ([long]$okRes.Usage.PremiumRequests -eq 3 -and [long]$okRes.Usage.TotalApiDurationMs -eq 100 -and [bool]$okRes.ModelRan) `
+        "The live pass did not surface exact per-attempt usage accounting for a successful marker."
+
+    # (5) A marker that omits its nonce is the typed schemaInvalid slip (retryable,
+    # fresh nonce) with a precise reason naming the field - never a generic invalid
+    # marker. This is the exact PR16769165 shape.
+    $noNonce = [ordered]@{ schemaVersion = 1; prId = 42; repositoryId = $cfgRepoId; project = 'One'
+        reviewedSourceCommit = $sourceCommit; findings = @(); recommendedVote = 'approve'; summary = '' }
+    $script:cannedStdOut = New-Transcript -Marker $noNonce
+    $noNonceRes = Invoke-ReviewerModelPass -AgencyPath 'copilot' -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1
+    Assert-Specialist ([string]$noNonceRes.RejectionClass -ceq 'schemaInvalid' -and $null -eq $noNonceRes.Marker -and
+        $noNonceRes.Reason -match 'nonce') `
+        "The live pass did not classify a missing-nonce marker as the typed schemaInvalid (field nonce) slip."
+    Assert-Specialist (Test-AgentMarkerStatusRetryable -Status ([string]$noNonceRes.RejectionClass)) `
+        "The live pass reported a missing-nonce marker as non-retryable, denying it a fresh-nonce retry."
+
+    # (6) A marker whose schema exact fields all pass but which points at the wrong
+    # pull request is wrongBinding - terminal, never retried - and the launch is
+    # still counted (the model did run).
+    $wrongPr = [ordered]@{ schemaVersion = 1; prId = 999; repositoryId = $cfgRepoId; project = 'One'
+        reviewedSourceCommit = $sourceCommit; findings = @(); recommendedVote = 'approve'; summary = ''; nonce = $script:knownNonce }
+    $script:cannedStdOut = New-Transcript -Marker $wrongPr
+    $wrongRes = Invoke-ReviewerModelPass -AgencyPath 'copilot' -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1
+    Assert-Specialist ([string]$wrongRes.RejectionClass -ceq 'wrongBinding' -and $null -eq $wrongRes.Marker) `
+        "The live pass did not refuse a marker bound to the wrong pull request as wrongBinding."
+    Assert-Specialist (-not (Test-AgentMarkerStatusRetryable -Status ([string]$wrongRes.RejectionClass))) `
+        "The live pass reported a wrong-binding marker as retryable, which is how a replay would be handed extra tries."
+
+    # (4) When the declared scan window cannot hold the schema's largest legal
+    # marker, the pre-launch gate must refuse to launch: Invoke-TimedProcess is
+    # never reached. Shrinking the window below the generalist worst case proves
+    # the gate is a real launch barrier, not an isolated helper.
+    $script:ReviewerMarkerScanWindowChars = 8
+    $script:timedProcessCalled = $false
+    $gateBlocked = $false
+    try { Invoke-ReviewerModelPass -AgencyPath 'copilot' -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1 | Out-Null }
+    catch { $gateBlocked = $true }
+    Assert-Specialist ($gateBlocked -and -not $script:timedProcessCalled) `
+        "An un-fittable generalist result contract still reached Invoke-TimedProcess instead of refusing to launch."
+
+    Remove-Item -LiteralPath $logDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ---------------------------------------------------------------------------
+# Layer A: retry only retryable emission failures, within existing bounds, and
+# with exact attempt accounting. The retry DECISION is the typed helper; this
+# pins the loop policy it drives for the generalist (2 attempts) and specialist
+# (3 attempts), including exhaustion and the no-retry terminal cases.
+# ---------------------------------------------------------------------------
+function Measure-MarkerRetryAttempts {
+    param([string[]]$StatusesPerAttempt, [int]$MaxAttempts)
+    $attempts = 0
+    foreach ($status in $StatusesPerAttempt) {
+        if ($attempts -ge $MaxAttempts) { break }
+        $attempts++
+        if ($status -ceq 'success') { break }
+        if (-not (Test-AgentMarkerStatusRetryable -Status $status)) { break }
+    }
+    return $attempts
+}
+Assert-Specialist ((Measure-MarkerRetryAttempts -StatusesPerAttempt @('schemaInvalid', 'schemaInvalid', 'schemaInvalid') -MaxAttempts 2) -eq 2) `
+    "A generalist did not stop retrying a retryable emission failure at its 2-attempt bound."
+Assert-Specialist ((Measure-MarkerRetryAttempts -StatusesPerAttempt @('schemaInvalid', 'schemaInvalid', 'schemaInvalid', 'schemaInvalid') -MaxAttempts 3) -eq 3) `
+    "A specialist did not stop retrying a retryable emission failure at its 3-attempt bound."
+Assert-Specialist ((Measure-MarkerRetryAttempts -StatusesPerAttempt @('schemaInvalid', 'success', 'success') -MaxAttempts 3) -eq 2) `
+    "A fresh-nonce retry that then succeeded did not stop on the successful attempt."
+Assert-Specialist ((Measure-MarkerRetryAttempts -StatusesPerAttempt @('wrongBinding', 'success') -MaxAttempts 3) -eq 1) `
+    "A wrong-binding rejection was retried instead of terminating immediately."
+Assert-Specialist ((Measure-MarkerRetryAttempts -StatusesPerAttempt @('success') -MaxAttempts 2) -eq 1) `
+    "A first-attempt success still consumed a retry."
+
+# ---------------------------------------------------------------------------
+# Layer A: exact usage accounting extracted from the CLI transcript, present
+# when emitted and null when absent.
+# ---------------------------------------------------------------------------
+$usageJson = @(
+    '{"type":"assistant.message","data":{"content":"done","model":"claude-opus-5"}}'
+    '{"type":"session.usage_checkpoint","data":{"totalNanoAiu":40546000000,"totalPremiumRequests":15}}'
+    '{"type":"result","exitCode":0,"usage":{"premiumRequests":15,"totalApiDurationMs":87848,"sessionDurationMs":98874,"codeChanges":{"filesModified":[]}}}'
+) -join "`n"
+$usage = (Get-AgentCliJsonOutcome -StdOutText $usageJson).Usage
+Assert-Specialist ([long]$usage.PremiumRequests -eq 15 -and [long]$usage.TotalApiDurationMs -eq 87848 -and
+    [long]$usage.SessionDurationMs -eq 98874 -and [long]$usage.TotalNanoAiu -eq 40546000000 -and
+    [long]$usage.TotalPremiumRequests -eq 15) `
+    "Exact usage accounting was not extracted from an emitting transcript."
+$noUsageJson = @(
+    '{"type":"assistant.message","data":{"content":"done","model":"m"}}'
+    '{"type":"result","exitCode":0,"usage":{"codeChanges":{"filesModified":[]}}}'
+) -join "`n"
+$noUsage = (Get-AgentCliJsonOutcome -StdOutText $noUsageJson).Usage
+Assert-Specialist ($null -eq $noUsage.PremiumRequests -and $null -eq $noUsage.TotalApiDurationMs -and
+    $null -eq $noUsage.SessionDurationMs -and $null -eq $noUsage.TotalNanoAiu -and $null -eq $noUsage.TotalPremiumRequests) `
+    "Absent usage fields were not reported as null."
+# A negative or non-integral usage value is rejected, not silently coerced.
+$badUsageJson = @(
+    '{"type":"session.usage_checkpoint","data":{"totalNanoAiu":-5,"totalPremiumRequests":"lots"}}'
+    '{"type":"result","exitCode":0,"usage":{"premiumRequests":-1,"codeChanges":{"filesModified":[]}}}'
+) -join "`n"
+$badUsage = (Get-AgentCliJsonOutcome -StdOutText $badUsageJson).Usage
+Assert-Specialist ($null -eq $badUsage.TotalNanoAiu -and $null -eq $badUsage.TotalPremiumRequests -and $null -eq $badUsage.PremiumRequests) `
+    "A negative or non-integral usage figure was accepted instead of dropped."
+
+# ---------------------------------------------------------------------------
+# Layer A: deterministic offline replay of the exact captured production
+# failures. The private corpus is never copied into the repo; its root is
+# supplied through REVIEWER_LAYERA_CORPUS_ROOT. When it is absent (CI without
+# the corpus) the replay assertions are recorded as skipped so the suite stays
+# green everywhere, but when present they must reproduce the precise typed
+# classification and usage figures - never a generic invalid marker.
+# ---------------------------------------------------------------------------
+$corpusRoot = [string]$env:REVIEWER_LAYERA_CORPUS_ROOT
+if ([string]::IsNullOrWhiteSpace($corpusRoot) -or -not (Test-Path -LiteralPath $corpusRoot)) {
+    Assert-Specialist $true "Corpus replay skipped: set REVIEWER_LAYERA_CORPUS_ROOT to the private corpus root to run it."
+}
+else {
+    $nonceOnlySchema = @{ Keys = @("nonce"); Fields = @{ nonce = @{ Type = 'exact'; Expected = 'unused' } } }
+    # PR16769165 generalist: five Opus outputs parsed a marker OBJECT but omitted
+    # the nonce; each must classify as schemaInvalid/nonce (retryable), never a
+    # generic missing/invalid marker, and its usage must be read exactly.
+    $genExpect = @{
+        'pr16769165' = @{ PremiumRequests = 15; TotalApiDurationMs = 87848; SessionDurationMs = 98874; TotalNanoAiu = 40546000000 }
+        'pr16769813' = @{ PremiumRequests = 15; TotalApiDurationMs = 78155; SessionDurationMs = 85284; TotalNanoAiu = 35772875000 }
+    }
+    foreach ($pr in @('pr16769165', 'pr16769813')) {
+        $genFile = Get-ChildItem -Recurse -File -LiteralPath $corpusRoot -Filter *.txt |
+            Where-Object { $_.FullName -match "$pr.*failed-cycles" } | Select-Object -First 1
+        Assert-Specialist ($null -ne $genFile) "Corpus generalist transcript for $pr was not found under the corpus root."
+        if ($genFile) {
+            $genText = [IO.File]::ReadAllText($genFile.FullName)
+            $genOutcome = Get-AgentCliJsonOutcome -StdOutText $genText
+            $genMarker = ConvertFrom-AgentResultMarkerOutcome -StdOutText $genOutcome.Answer `
+                -MarkerPrefix "REVIEWER_RESULT_V1:" -Schema $nonceOnlySchema
+            Assert-Specialist ([string]$genMarker.Status -ceq "schemaInvalid" -and [string]$genMarker.Field -ceq "nonce" -and
+                [bool]$genMarker.Retryable) `
+                "Replayed $pr generalist output was not classified as schemaInvalid/nonce (retryable)."
+            $exp = $genExpect[$pr]
+            Assert-Specialist ([long]$genOutcome.Usage.PremiumRequests -eq $exp.PremiumRequests -and
+                [long]$genOutcome.Usage.TotalApiDurationMs -eq $exp.TotalApiDurationMs -and
+                [long]$genOutcome.Usage.SessionDurationMs -eq $exp.SessionDurationMs -and
+                [long]$genOutcome.Usage.TotalNanoAiu -eq $exp.TotalNanoAiu) `
+                "Replayed $pr generalist usage accounting did not match the captured figures."
+        }
+    }
+    # PR16769813 specialist: the marker is COMPLETE and correctly bound - the
+    # cycle failed on a downstream semantic remediation rejection (Layer B), not
+    # a marker-emission slip. Extraction must therefore be success (never a
+    # generic invalid marker), and a replayed/wrong nonce must be wrongBinding,
+    # both of which are terminal (non-retryable).
+    $specFile = Get-ChildItem -Recurse -File -LiteralPath $corpusRoot -Filter *.txt |
+        Where-Object { $_.FullName -match 'pr16769813.*convention-specialist-failures' } | Select-Object -First 1
+    Assert-Specialist ($null -ne $specFile) "Corpus specialist transcript for pr16769813 was not found under the corpus root."
+    if ($specFile) {
+        $specText = [IO.File]::ReadAllText($specFile.FullName)
+        $specNonce = '88ec21531dce5d416a6b2109a59c88feee12'
+        $specSchema = Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject "One" -ExpectedNonce $specNonce
+        $specOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText $specText `
+            -MarkerPrefix $script:ReviewerConventionSpecialistMarkerPrefix -Schema $specSchema
+        Assert-Specialist ([string]$specOutcome.Status -ceq "success" -and -not [bool]$specOutcome.Retryable) `
+            "Replayed pr16769813 specialist marker was not a clean success, so its semantic failure would be misread as a marker slip."
+        $specWrong = ConvertFrom-AgentResultMarkerOutcome -StdOutText $specText `
+            -MarkerPrefix $script:ReviewerConventionSpecialistMarkerPrefix `
+            -Schema (Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject "One" -ExpectedNonce 'replayed-nonce')
+        Assert-Specialist ([string]$specWrong.Status -ceq "wrongBinding" -and -not [bool]$specWrong.Retryable) `
+            "A replayed specialist nonce was not the terminal, non-retryable wrongBinding outcome."
+    }
+}
+
 Assert-Specialist ((ConvertTo-AgentCanonicalMarkerJson -Value ([pscustomobject]@{ b = 1; a = 2 })) -ceq
     (ConvertTo-AgentCanonicalMarkerJson -Value ([pscustomobject]@{ a = 2; b = 1 }))) `
     "Canonical marker rendering is not key-order independent."
