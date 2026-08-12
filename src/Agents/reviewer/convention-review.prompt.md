@@ -61,6 +61,14 @@ not a candidate. Do not invent a resolution.
    deployment, security, customer behavior, or compatibility, and the candidate
    cites at least one supporting deterministic fact or checked unchanged-sibling
    precedent. A self-declared impact category is not sufficient evidence.
+   `severity` and `impactCategory` are a single coupled decision and must agree:
+   set `severity: important` if and only if `impactCategory` is not `none`. If the
+   violation genuinely protects one of those categories, use `severity: important`,
+   name that `impactCategory`, and supply the required fact or checked-sibling
+   evidence; otherwise use `severity: suggestion` with `impactCategory: none`. Never
+   pair a protected `impactCategory` with `suggestion`, and never pair `important`
+   with `impactCategory: none` - a deployment/security/etc. impact described in
+   `impact` is by definition not a `suggestion`.
 6. Every candidate must state concrete diff evidence, impact, and the expected
    fix or validation. It must record sibling evidence or an explicit reason that
    a sibling check is not required.
