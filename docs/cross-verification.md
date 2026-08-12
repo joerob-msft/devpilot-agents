@@ -245,6 +245,14 @@ Exact `cf<n>:line` violations are reconciled as first-class anchors alongside th
 separate lexical construct partition; stable line targets never become invented
 constructs and count as weighed evidence for the rule.
 
+When the convention specialist degraded there is no manifest to embed - its
+discovery is not trusted - so `reconciliationManifest` is `null`. In offline
+replay the decision artifact also carries the same `replay` identity block the
+specialist preview carries (snapshot, manifest digest, nonce, never promotable),
+so such a run can still be bound to the recording it replayed and reconciled as
+an empty run. See "A run that produced nothing" in `docs/replay-snapshots.md`
+for the exact conditions under which that is accepted.
+
 ## Layer 6: delivery gates
 
 An optional, separate, fail-closed layer reads this preview's sealed eligible

@@ -728,9 +728,11 @@ function New-ReviewerCorpusSealEnvelope {
         kind and is byte-deterministic, so two seals of one recipe over one
         corpus produce identical payloads:
 
-          jsonRpcResult      - the corpus payload IS the tool result; it is
-                               embedded verbatim, so the sealed bytes contain the
-                               captured bytes unchanged.
+          jsonRpcResult      - the corpus payload IS the tool result, MCP content
+                               shape and all; it is embedded verbatim, so the
+                               sealed bytes contain the captured bytes
+                               unchanged. A captured REST body is NOT a tool
+                               result and is refused here.
           mcpTextContent     - the corpus payload is the text a text-content tool
                                returned.
           mcpResourceContent - the corpus payload is file content an embedded
@@ -747,8 +749,19 @@ function New-ReviewerCorpusSealEnvelope {
     $text = $script:ReviewerCorpusSealUtf8.GetString($Payload.Bytes)
     switch ($Envelope) {
         "jsonRpcResult" {
-            try { $null = $text | ConvertFrom-Json -Depth 64 -ErrorAction Stop }
+            $parsed = $null
+            try { $parsed = $text | ConvertFrom-Json -Depth 64 -ErrorAction Stop }
             catch { throw "Corpus payload '$($Payload.Path)' is not valid JSON and cannot be a JSON-RPC result." }
+            # Embedding verbatim is only honest when what was captured IS a tool
+            # result. A captured REST body seals, loads and binds cleanly and
+            # then cannot be read by anything, because every reader goes through
+            # Invoke-AgentMcpTool. Such a payload belongs in an mcpTextContent
+            # envelope - that is the exact shape the MCP server returns for it.
+            if (-not (Test-AgentMcpToolResultShape -Result $parsed)) {
+                throw ("Corpus payload '$($Payload.Path)' is not an MCP tool result, so a jsonRpcResult " +
+                    "envelope would seal a response no reader can consume. Declare it as mcpTextContent, " +
+                    "which wraps the captured text the way the MCP server does.")
+            }
             return $script:ReviewerCorpusSealUtf8.GetBytes('{"jsonrpc":"2.0","result":' + $text + '}')
         }
         "mcpTextContent" {

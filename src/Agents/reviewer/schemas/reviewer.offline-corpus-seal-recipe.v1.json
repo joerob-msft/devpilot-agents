@@ -253,7 +253,7 @@
           "envelope": {
             "type": "string",
             "enum": ["jsonRpcResult", "mcpTextContent", "mcpResourceContent"],
-            "description": "How the captured payload is wrapped into the response the loader serves. 'jsonRpcResult' embeds the captured JSON verbatim, so the sealed bytes contain the captured bytes unchanged."
+            "description": "How the captured payload is wrapped into the response the loader serves. 'jsonRpcResult' embeds the captured JSON verbatim, so the sealed bytes contain the captured bytes unchanged; it requires the captured payload to already be an MCP tool result (a content array with text or an embedded resource). A captured REST body must use 'mcpTextContent', which wraps it the way the MCP server does."
           },
           "payloadFile": { "$ref": "#/definitions/relativePath" },
           "corpusPayload": { "$ref": "#/definitions/corpusPayloadRef" },

@@ -352,7 +352,7 @@ function New-SealRecipe {
             [ordered]@{
                 tool = "repo_pull_request"
                 arguments = [ordered]@{ action = "get"; organization = $org; project = $project; repositoryId = $repositoryId; pullRequestId = $pullRequestId }
-                envelope = "jsonRpcResult"
+                envelope = "mcpTextContent"
                 payloadFile = "payloads/pr-get.json"
                 corpusPayload = (New-BoundDeclaration -Relative "live/pr-get.json" -Text $prGetText)
                 resourceUri = ""
@@ -362,7 +362,7 @@ function New-SealRecipe {
             [ordered]@{
                 tool = "repo_pull_request"
                 arguments = [ordered]@{ action = "get_changes"; organization = $org; project = $project; repositoryId = $repositoryId; pullRequestId = $pullRequestId; iterationId = $iterationId }
-                envelope = "jsonRpcResult"
+                envelope = "mcpTextContent"
                 payloadFile = "payloads/changes.json"
                 corpusPayload = (New-BoundDeclaration -Relative "live/changes.json" -Text $changeSetText)
                 resourceUri = ""
@@ -372,7 +372,7 @@ function New-SealRecipe {
             [ordered]@{
                 tool = "repo_pull_request_thread"
                 arguments = [ordered]@{ action = "list"; organization = $org; project = $project; repositoryId = $repositoryId; pullRequestId = $pullRequestId }
-                envelope = "jsonRpcResult"
+                envelope = "mcpTextContent"
                 payloadFile = "payloads/threads.json"
                 corpusPayload = (New-BoundDeclaration -Relative "live/threads.json" -Text $threadsText)
                 resourceUri = ""
@@ -652,6 +652,18 @@ try {
         -ExpectedUri "ado://$org/$project/$repositoryId$alphaPath"
     Assert-Seal -Name "replayed right-hand content is byte-exact" -Condition ([string]$decoded.Text -ceq $alphaText)
 
+    # A sealed read is only evidence if a reader can consume it. This is the
+    # exact failure that killed a run set after its snapshot had loaded, bound
+    # and hashed perfectly: the recorded responses were REST bodies, which no
+    # reader can parse.
+    $consumable = $true
+    foreach ($resource in $recipe.resources) {
+        $response = Get-AgentReplayResponse -Snapshot $loaded -Name ([string]$resource.tool) `
+            -Arguments (ConvertTo-RecipeObject -Recipe $resource).arguments
+        if (-not (Test-AgentMcpToolResultShape -Result $response)) { $consumable = $false }
+    }
+    Assert-Seal -Name "every sealed response is an MCP tool result a reader can consume" -Condition $consumable
+
     # -- rejection classes ----------------------------------------------------
     Write-Host "Rejection classes" -ForegroundColor Cyan
 
@@ -681,6 +693,24 @@ try {
     Assert-SealThrows -Name "extra unindexed payload" -Match "is not a member of the canonical corpus index" -Script {
         Get-ReviewerCorpusSealPayload -Index $index -Path "unindexed-extra.json"
     }
+
+    # A captured REST body is not a tool result. Sealing it verbatim produces a
+    # snapshot that loads and then cannot answer the run's first read, so the
+    # envelope kind that embeds verbatim must refuse it and name the fix.
+    Assert-SealThrows -Name "a REST body may not be sealed as a verbatim tool result" `
+        -Match "is not an MCP tool result" -Script {
+        New-ReviewerCorpusSealEnvelope -Envelope "jsonRpcResult" `
+            -Payload (Get-ReviewerCorpusSealPayload -Index $index -Path "live/pr-get.json")
+    }
+
+    $capturedToolResultText = '{"content":[{"type":"text","text":"{\"pullRequestId\":1}"}]}'
+    $capturedToolResult = New-ReviewerCorpusSealEnvelope -Envelope "jsonRpcResult" -Payload @{
+        Path       = "live/captured-tool-result.json"
+        Bytes      = $utf8.GetBytes($capturedToolResultText)
+        ByteLength = $utf8.GetByteCount($capturedToolResultText)
+    }
+    Assert-Seal -Name "a captured MCP tool result still seals verbatim" `
+        -Condition ($utf8.GetString($capturedToolResult) -ceq ('{"jsonrpc":"2.0","result":' + $capturedToolResultText + '}'))
 
     foreach ($alias in @("files\alpha.txt", "./files/alpha.txt", "files//alpha.txt", "src/../files/alpha.txt", "/files/alpha.txt", "C:/files/alpha.txt")) {
         $captured = $alias

@@ -93,10 +93,12 @@ if ($snapshotName -match 'offlinecorpusseal') {
 }
 $records = @(Get-Content -LiteralPath $Recipe -Raw | ConvertFrom-Json)
 if ($records.Count -lt 1) { throw "Recipe '$Recipe' declares no resources." }
+if ($records.Count -gt 4096) { throw "Recipe '$Recipe' declares more than 4096 resources." }
 
 $resources = [System.Collections.Generic.List[object]]::new()
 $digestResources = [System.Collections.Generic.List[object]]::new()
 $seen = @{}
+$totalPayloadBytes = [long]0
 foreach ($record in $records) {
     $tool = [string]$record.tool
     $arguments = $record.arguments
@@ -110,6 +112,25 @@ foreach ($record in $records) {
         throw "Recipe references payload '$relative', which does not exist under '$snapshotFull'."
     }
     $bytes = [System.IO.File]::ReadAllBytes($payloadPath)
+    $totalPayloadBytes += [long]$bytes.Length
+    if ($totalPayloadBytes -gt 67108864) {
+        throw "Recipe payloads exceed the 67108864-byte replay-snapshot limit."
+    }
+    $payloadText = $null
+    $payloadResult = $null
+    try {
+        $payloadText = $utf8.GetString($bytes)
+        $payloadResult = $payloadText | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        throw "Recipe payload '$relative' is not a strict UTF-8 JSON MCP tool result."
+    }
+    if ($payloadResult -isnot [System.Management.Automation.PSCustomObject] -or
+        -not $payloadResult.PSObject.Properties["jsonrpc"] -or [string]$payloadResult.jsonrpc -cne "2.0" -or
+        -not $payloadResult.PSObject.Properties["result"] -or $payloadResult.PSObject.Properties["error"] -or
+        -not (Test-AgentMcpToolResultShape -Result $payloadResult.result)) {
+        throw "Recipe payload '$relative' is not an MCP tool result consumable by the replay reader."
+    }
     $key = Get-AgentReplayRequestKey -Name $tool -Arguments $arguments
     if ($seen.ContainsKey($key.Key)) { throw "Recipe records the same '$tool' request twice." }
     $seen[$key.Key] = $true
@@ -235,10 +256,27 @@ if ($schemaVersion -eq 2) {
     $manifest["manifestDigest"] = $digest
 }
 $manifestPath = Join-Path $snapshotFull "manifest.json"
-[System.IO.File]::WriteAllBytes($manifestPath, $utf8.GetBytes(($manifest | ConvertTo-Json -Depth 20)))
+$previousManifest = if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+    [System.IO.File]::ReadAllBytes($manifestPath)
+}
+else { $null }
+try {
+    [System.IO.File]::WriteAllBytes($manifestPath, $utf8.GetBytes(($manifest | ConvertTo-Json -Depth 20)))
 
-# Prove the manifest we just wrote is one the loader accepts, rather than
-# claiming it. A writer that emits an unloadable snapshot is worse than none.
-$verified = New-AgentReplaySnapshot -ReplayRoot (Split-Path $snapshotFull -Parent) -SnapshotName $snapshotName -ExpectedManifestDigest $digest
+    # Prove the manifest we just wrote is one the loader accepts, rather than
+    # claiming it. Restore the previous manifest (or remove the rejected new
+    # one) if any loader invariant refuses it.
+    $verified = New-AgentReplaySnapshot -ReplayRoot (Split-Path $snapshotFull -Parent) `
+        -SnapshotName $snapshotName -ExpectedManifestDigest $digest
+}
+catch {
+    if ($null -ne $previousManifest) {
+        [System.IO.File]::WriteAllBytes($manifestPath, $previousManifest)
+    }
+    elseif (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+        Remove-Item -LiteralPath $manifestPath -Force
+    }
+    throw
+}
 Write-Host ("Sealed replay snapshot '{0}': {1} resource(s), {2} payload byte(s), digest {3}" -f `
         $verified.SnapshotId, $verified.ResourceCount, $verified.PayloadBytes, $verified.ManifestDigest) -ForegroundColor Green

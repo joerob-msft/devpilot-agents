@@ -112,7 +112,7 @@ try {
     $reviewerScript = Join-Path $RepoRoot "src\Agents\reviewer\Start-ReviewerAgent.ps1"
     $tokens = $null
     $parseErrors = $null
-    [void][System.Management.Automation.Language.Parser]::ParseFile($reviewerScript, [ref]$tokens, [ref]$parseErrors)
+    $reviewerAst = [System.Management.Automation.Language.Parser]::ParseFile($reviewerScript, [ref]$tokens, [ref]$parseErrors)
     Assert-Qualification (@($parseErrors).Count -eq 0) "The reviewer script does not parse."
     $modelLiterals = @(@($tokens) |
             Where-Object { $_.Kind -eq "StringLiteral" -or $_.Kind -eq "StringExpandable" } |
@@ -120,6 +120,23 @@ try {
     Assert-Qualification ($modelLiterals.Count -eq 0) `
         ("The reviewer script hardcodes model id(s) instead of deriving them: " +
             (@(@($modelLiterals) | ForEach-Object { [string]$_.Value }) -join ', ') + ".")
+
+    # The candidate-discovery read has one composer, and the prelaunch probe and
+    # the cycle both call it. A probe that composed its own copy could preflight
+    # a read the run never issues - and the run would then ask for a read no
+    # bounded snapshot carries, which is the defect that spoiled a declared set.
+    $composerDefinitions = @($reviewerAst.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq "Get-ReviewerCandidateSourceRequest"
+            }, $true))
+    $composerCalls = @($reviewerAst.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.CommandAst] -and
+                [string]$node.GetCommandName() -ceq "Get-ReviewerCandidateSourceRequest"
+            }, $true))
+    Assert-Qualification ($composerDefinitions.Count -eq 1 -and $composerCalls.Count -ge 2) `
+        "The candidate-discovery request is not composed once and shared by the prelaunch probe and the cycle."
 
     # -- 2. Sandbox: a clean reviewer build, a reviewed repo, a config --------
     Write-Host "2/11 sandbox reviewer build" -ForegroundColor Cyan
@@ -151,6 +168,15 @@ if (-not $QualificationPrelaunch) {
     Write-Error "stand-in agent fails at startup"
     exit 9
 }
+Import-Module (Join-Path $PSScriptRoot "..\..\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1") -Force
+$standInConfig = Get-Content -LiteralPath $ConfigFile -Raw | ConvertFrom-Json
+$standInProbeArguments = [ordered]@{
+    action        = 'get'
+    project       = [string]$standInConfig.repository.project
+    repositoryId  = [string]$standInConfig.repository.name
+    pullRequestId = $PullRequestId
+}
+$standInProbeKey = Get-AgentReplayRequestKey -Name "repo_pull_request" -Arguments $standInProbeArguments
 $report = [ordered]@{
     seam = "reviewer.qualification-prelaunch.v1"
     agentScriptSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -170,6 +196,11 @@ $report = [ordered]@{
     replayManifestDigest = $ReplayManifestDigest.ToLowerInvariant()
     replayNonPromotable = $false
     deliveryAuthorization = "PreviewOnly"
+    sourceProbeTool = "repo_pull_request"
+    sourceProbeAction = "get"
+    sourceProbeArguments = [pscustomobject]$standInProbeArguments
+    sourceProbeRequestSha256 = $standInProbeKey.Key
+    sourceProbePullRequestId = $PullRequestId
 }
 Write-Output ("REVIEWER_QUALIFICATION_PRELAUNCH_V1 " +
     (ConvertTo-Json -InputObject ([pscustomobject]$report) -Depth 6 -Compress))
@@ -188,11 +219,7 @@ exit 0
 
     $sandboxReviewerScript = Join-Path $toolkitCopy "src\Agents\reviewer\Start-ReviewerAgent.ps1"
     $sandboxTool = Join-Path $toolkitCopy "tools\Invoke-ReviewerReplayQualification.ps1"
-    $replayRoot = Join-Path $toolkitCopy "src\Agents\reviewer\testdata\replay-v1"
-    $snapshotManifest = Get-Content -LiteralPath (Join-Path $replayRoot "synthetic-pr\manifest.json") -Raw |
-        ConvertFrom-Json
-    $digest = [string]$snapshotManifest.manifestDigest
-    $snapshotPrId = [int]$snapshotManifest.binding.pullRequestId
+    $committedReplayRoot = Join-Path $toolkitCopy "src\Agents\reviewer\testdata\replay-v1"
 
     $reviewedRepo = Join-Path $sandbox "reviewed-repo"
     New-Item -ItemType Directory -Force -Path $reviewedRepo | Out-Null
@@ -203,14 +230,65 @@ exit 0
     # A qualification config, like the real ones, lives OUTSIDE the reviewed
     # repository - which is exactly why -RepoPath cannot be left to inference.
     $config = Get-Content -LiteralPath (Join-Path $RepoRoot "samples\reviewer-ado.config.json") -Raw | ConvertFrom-Json
-    $config.repository.organization = [string]$snapshotManifest.binding.organization
-    $config.repository.project = [string]$snapshotManifest.binding.project
-    $config.repository.id = [string]$snapshotManifest.binding.repositoryId
     $config.review.conventionSpecialistModel = "claude-sonnet-5"
     $config.review.verification.enabled = $true
     $config.review.verification.conventionVerifierModel = $pair.Second
     $configPath = Join-Path $configDir "qualification.config.json"
     Set-Content -LiteralPath $configPath -Value (ConvertTo-Json -InputObject $config -Depth 20) -Encoding utf8NoBOM
+
+    # A snapshot sealed the way a real bounded one is: it carries the DIRECT
+    # read for one named pull request and no repository-wide census, and its
+    # recorded request is keyed on the repository identity this config actually
+    # asks with (the configured repository NAME, which is what the agent passes
+    # as repositoryId). A snapshot recorded under a different identity than the
+    # config names cannot answer the run's first read - the defect this fixture
+    # exists to keep closed, exercised as a refusal further down.
+    $snapshotPrId = 4242
+    $replayRoot = Join-Path $sandbox "replay-root"
+    $snapshotName = "qualification-direct-get"
+    $snapshotDir = Join-Path $replayRoot $snapshotName
+    New-Item -ItemType Directory -Force -Path (Join-Path $snapshotDir "payloads") | Out-Null
+    $recordedPullRequest = [ordered]@{
+        pullRequestId = $snapshotPrId
+        title         = "Synthetic pull request"
+        status        = "active"
+        sourceRefName = "refs/heads/feature"
+        targetRefName = "refs/heads/main"
+    }
+    $recordedResponse = [ordered]@{
+        jsonrpc = "2.0"
+        id      = 1
+        result  = [ordered]@{
+            content = @([ordered]@{
+                    type = "text"
+                    text = (ConvertTo-Json -InputObject $recordedPullRequest -Depth 6 -Compress)
+                })
+        }
+    }
+    Set-Content -LiteralPath (Join-Path $snapshotDir "payloads\pr-get.json") -Encoding utf8NoBOM `
+        -Value (ConvertTo-Json -InputObject $recordedResponse -Depth 10 -Compress)
+    $recipePath = Join-Path $snapshotDir "recipe.json"
+    Set-Content -LiteralPath $recipePath -Encoding utf8NoBOM -Value (ConvertTo-Json -Depth 10 -InputObject @(
+            [ordered]@{
+                tool        = "repo_pull_request"
+                arguments   = [ordered]@{
+                    action        = "get"
+                    project       = [string]$config.repository.project
+                    repositoryId  = [string]$config.repository.name
+                    pullRequestId = $snapshotPrId
+                }
+                payloadFile = "payloads/pr-get.json"
+            }))
+    & (Join-Path $RepoRoot "tools\Save-AgentReplaySnapshot.ps1") -SnapshotPath $snapshotDir -Recipe $recipePath `
+        -Organization ([string]$config.repository.organization) -Project ([string]$config.repository.project) `
+        -RepositoryId ([string]$config.repository.id) -PullRequestId $snapshotPrId `
+        -SourceCommit ("a" * 40) -TargetCommit ("b" * 40) -Models @($pair.First, $pair.Second) | Out-Null
+    $snapshotManifest = Get-Content -LiteralPath (Join-Path $snapshotDir "manifest.json") -Raw | ConvertFrom-Json
+    $digest = [string]$snapshotManifest.manifestDigest
+    $recordedGetRequestSha256 = [string](@($snapshotManifest.resources |
+                Where-Object { [string]$_.tool -ceq "repo_pull_request" -and [string]$_.arguments.action -ceq "get" })[0].requestSha256)
+    Assert-Qualification (@($snapshotManifest.resources).Count -eq 1 -and $recordedGetRequestSha256) `
+        "The synthetic bounded snapshot does not carry exactly the one direct-get response it is built from."
 
     $planArguments = @{
         RepoPath             = $reviewedRepo
@@ -218,7 +296,7 @@ exit 0
         OperatorAlias        = "example-operator"
         PullRequestId        = $snapshotPrId
         ReplayRoot           = $replayRoot
-        ReplaySnapshotName   = "synthetic-pr"
+        ReplaySnapshotName   = $snapshotName
         ReplayManifestDigest = $digest
         QualificationRoot    = $qualificationRoot
         ReviewerScriptPath   = $sandboxReviewerScript
@@ -257,10 +335,22 @@ exit 0
             "$($item.Slot) did not resolve the normalized -RepoPath."
         Assert-Qualification ($item.Model -ceq $pair.First -and $item.SecondPassModel -ceq $pair.Second) `
             "$($item.Slot) did not resolve the supported current generalist pairing."
-        Assert-Qualification ($item.SnapshotId -ceq "synthetic-pr" -and
+        Assert-Qualification ($item.SnapshotId -ceq $snapshotName -and
             $item.SnapshotManifestDigest -ceq $digest.ToLowerInvariant() -and
             $item.PullRequestId -eq $snapshotPrId) `
             "$($item.Slot) did not load and bind the snapshot inside the agent."
+        # The run's FIRST source read, proven end to end: the agent issued a
+        # bounded direct get keyed on the configured repository name, the
+        # snapshot answered it with the pull request under qualification, and
+        # the request it asked with is the one this snapshot actually records.
+        Assert-Qualification ($item.SourceProbeTool -ceq "repo_pull_request" -and $item.SourceProbeAction -ceq "get") `
+            "$($item.Slot) opened with '$($item.SourceProbeTool)/$($item.SourceProbeAction)' rather than a bounded direct get."
+        Assert-Qualification ($item.SourceProbeRepositoryId -ceq [string]$config.repository.name) `
+            "$($item.Slot) asked for its pull request under a repository identity the config does not name."
+        Assert-Qualification ($item.SourceProbeRequestSha256 -ceq $recordedGetRequestSha256) `
+            "$($item.Slot) opened with a read the sealed snapshot does not record."
+        Assert-Qualification ($item.SourceProbePullRequestId -eq $snapshotPrId) `
+            "$($item.Slot) did not resolve the pull request under qualification from the snapshot's recorded read."
         Assert-Qualification ($item.DeliveryAuthorization -ceq "PreviewOnly") `
             "$($item.Slot) resolved a delivery authorization other than preview-only."
         Assert-Qualification (-not $item.StateDirExists -and -not (Test-Path -LiteralPath $item.StateDir)) `
@@ -415,6 +505,37 @@ exit 0
         New-ReviewerReplayQualificationPlan @bad
     } "A missing config was accepted." "does not exist"
 
+    # A snapshot that binds perfectly and still cannot answer the read the run
+    # opens with. The committed synthetic fixture records its reads under the
+    # repository GUID, while the agent asks with the configured repository NAME,
+    # so a config that names the repository any other way is refused BEFORE the
+    # run set is declared instead of dying in every slot afterwards.
+    $committedManifest = Get-Content -LiteralPath (Join-Path $committedReplayRoot "synthetic-pr\manifest.json") -Raw |
+        ConvertFrom-Json
+    $identityConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+    $identityConfig.repository.organization = [string]$committedManifest.binding.organization
+    $identityConfig.repository.project = [string]$committedManifest.binding.project
+    $identityConfig.repository.id = [string]$committedManifest.binding.repositoryId
+    $identityConfigPath = Join-Path $configDir "identity-mismatch.config.json"
+    Set-Content -LiteralPath $identityConfigPath `
+        -Value (ConvertTo-Json -InputObject $identityConfig -Depth 20) -Encoding utf8NoBOM
+    $identityArguments = $planArguments.Clone()
+    $identityArguments["ConfigFile"] = $identityConfigPath
+    $identityArguments["ReplayRoot"] = $committedReplayRoot
+    $identityArguments["ReplaySnapshotName"] = "synthetic-pr"
+    $identityArguments["ReplayManifestDigest"] = [string]$committedManifest.manifestDigest
+    $identityArguments["PullRequestId"] = [int]$committedManifest.binding.pullRequestId
+    # It plans: every binding the plan checks agrees. Only running the agent's
+    # own first read finds the mismatch, which is why the preflight does that.
+    $identityPlan = New-ReviewerReplayQualificationPlan @identityArguments
+    Assert-Qualification ($identityPlan.Snapshot.ManifestDigest -ceq ([string]$committedManifest.manifestDigest).ToLowerInvariant()) `
+        "A snapshot whose recorded reads use another repository identity failed to plan for an unrelated reason."
+    Assert-QualificationThrows {
+        Assert-ReviewerReplayQualificationPlan -Plan $identityPlan
+    } "A snapshot that cannot answer the run's first read was accepted." "no recorded response|records no response"
+    Assert-Qualification (-not (Test-Path -LiteralPath (Join-Path $qualificationRoot "runset"))) `
+        "A snapshot/config request-contract mismatch still reached a declaration."
+
     # -- 7. Preflight writes only the report an operator asks for -------------
     Write-Host "7/11 preflight mode" -ForegroundColor Cyan
     $reportPath = Join-Path $sandbox "preflight-report.json"
@@ -475,7 +596,7 @@ exit 0
         "A passing preflight did not produce a sealed run-set declaration."
     $declarationEnvelope = Get-Content -LiteralPath $declaredPath -Raw | ConvertFrom-Json
     $declaration = [string]$declarationEnvelope.manifestJson | ConvertFrom-Json
-    Assert-Qualification ([string]$declaration.snapshotName -ceq "synthetic-pr" -and
+    Assert-Qualification ([string]$declaration.snapshotName -ceq $snapshotName -and
         [string]$declaration.snapshotManifestDigest -ceq $digest.ToLowerInvariant() -and
         [int]$declaration.plannedRunCount -eq 2 -and -not [bool]$declaration.promotable) `
         "The declaration does not pin the preflighted snapshot, digest and run count as non-promotable."
@@ -490,7 +611,7 @@ exit 0
         -RunSetPath $declaredPath -KeyPath $keyPath
     $verified = [string](@($verifiedJson | Where-Object { $_ -is [string] } | Select-Object -Last 1)) | ConvertFrom-Json
     Assert-Qualification ([string]$verified.planDigest -ceq $planDigest -and
-        [string]$verified.snapshotName -ceq "synthetic-pr") `
+        [string]$verified.snapshotName -ceq $snapshotName) `
         "Verifying the sealed declaration did not return the plan it was sealed for."
     $otherKeyPath = Join-Path $sandbox "other-signing.key"
     $otherKeyBytes = [byte[]]::new(32)

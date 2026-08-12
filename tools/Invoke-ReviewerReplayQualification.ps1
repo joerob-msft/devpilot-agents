@@ -7,24 +7,29 @@
 
 .DESCRIPTION
     A qualification run set is sealed BEFORE its runs exist, so a declaration
-    made against an invocation that cannot start spoils the set. Both times
-    that has happened the cause was the invocation, not the review: one slot
-    named a model the agent's startup validation no longer accepted, and its
-    replacement omitted -RepoPath so the agent could not resolve the reviewed
-    repository from a config that lives outside one. Both died before a model
-    was ever launched - after the set had been declared.
+    made against an invocation that cannot start spoils the set. Every time that
+    has happened the cause was the invocation, not the review: one slot named a
+    model the agent's startup validation no longer accepted, its replacement
+    omitted -RepoPath so the agent could not resolve the reviewed repository
+    from a config that lives outside one, and a later set opened its cycle with
+    a repository-wide pull-request list the bounded sealed snapshot does not
+    carry, and one sealed snapshot recorded captured REST bodies instead of tool
+    results, so it loaded and bound perfectly and no reader could consume it.
+    All died before a model was ever launched - after the set had been
+    declared.
 
     So this tool constructs the COMPLETE argument vector for every slot,
     validates everything the agent validates at startup, and then runs that
     exact vector through the AGENT ITSELF, which stops at its own model-launch
-    boundary: after its config load, model resolution, replay snapshot load and
-    -RepoPath resolution, and before it creates any state, opens any session or
-    launches any model. Only then may a run set be declared, and the
-    declaration is sealed under a digest of the whole plan - every slot's argv
-    included - so a slot can never run against a declaration made for a
-    different set of commands. There is exactly one constructed argv per slot:
-    the preflight and the child process consume the same array, so a passing
-    preflight cannot be describing a different command than the one that runs.
+    boundary: after its config load, model resolution, replay snapshot load,
+    -RepoPath resolution and the run's first source read against the snapshot,
+    and before it creates any state, opens any session or launches any model.
+    Only then may a run set be declared, and the declaration is sealed under a
+    digest of the whole plan - every slot's argv included - so a slot can never
+    run against a declaration made for a different set of commands. There is
+    exactly one constructed argv per slot: the preflight and the child process
+    consume the same array, so a passing preflight cannot be describing a
+    different command than the one that runs.
 
     This tool never writes to a repository host, never contacts Azure DevOps,
     and never launches a model itself. Preflight creates no agent state; the
@@ -168,6 +173,10 @@ Write-Host "  reviewer build : $($plan.GitIdentity.head) ($($plan.GitIdentity.re
 Write-Host "  generalists    : $($plan.Models.First) + $($plan.Models.Second)" -ForegroundColor DarkGray
 Write-Host "  specialist     : $($plan.Models.ConventionSpecialist)" -ForegroundColor DarkGray
 Write-Host "  snapshot       : $($plan.Snapshot.Name) ($($plan.Snapshot.ManifestDigest.Substring(0, 12)), PR $($plan.Snapshot.PullRequestId), nonPromotable=$($plan.Snapshot.NonPromotable))" -ForegroundColor DarkGray
+$firstEvidence = @($evidence)[0]
+Write-Host ("  first read     : $($firstEvidence.SourceProbeTool)/$($firstEvidence.SourceProbeAction) " +
+    "repositoryId=$($firstEvidence.SourceProbeRepositoryId) PR $($firstEvidence.SourceProbePullRequestId) " +
+    "(recorded as $($firstEvidence.SourceProbeRequestSha256.Substring(0, 12)))") -ForegroundColor DarkGray
 foreach ($plannedSlot in @($plan.Slots)) {
     Write-Host "  $($plannedSlot.Name): $($plannedSlot.CommandText)" -ForegroundColor DarkCyan
 }

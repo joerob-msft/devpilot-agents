@@ -260,6 +260,57 @@ try {
     Assert-Replay ($reloaded.ManifestDigest -ceq $sealedDigest -and $reloaded.ResourceCount -eq 1) `
         "The loader must recompute exactly the digest the writer recorded."
 
+    # A recorded response that is a raw REST body wrapped in a JSON-RPC envelope
+    # loads, hashes and binds perfectly, and then no reader can parse it: the
+    # run dies at its first read, after the run set has been declared. The
+    # loader must refuse the whole snapshot instead, for every recorded read.
+    $restShaped = Join-Path $sandbox "rest-shaped"
+    New-Item -ItemType Directory -Force -Path (Join-Path $restShaped "payloads") | Out-Null
+    [IO.File]::WriteAllBytes((Join-Path $restShaped "payloads\pr.json"),
+        $utf8.GetBytes('{"jsonrpc":"2.0","id":1,"result":{"pullRequestId":11,"status":"active"}}'))
+    $restRecipe = @(@{
+            tool = "repo_pull_request"
+            arguments = [ordered]@{ action = "get"; project = "Widgets"; repositoryId = "11111111-2222-3333-4444-555555555555"; pullRequestId = 11 }
+            payloadFile = "payloads/pr.json"
+        })
+    [IO.File]::WriteAllBytes((Join-Path $restShaped "recipe.json"), $utf8.GetBytes(($restRecipe | ConvertTo-Json -Depth 10)))
+    Assert-ReplayThrows {
+        & (Join-Path $RepoRoot "tools\Save-AgentReplaySnapshot.ps1") -SnapshotPath $restShaped `
+            -Recipe (Join-Path $restShaped "recipe.json") -Organization "contoso" -Project "Widgets" `
+            -RepositoryId "11111111-2222-3333-4444-555555555555" -PullRequestId 11 `
+            -SourceCommit ("a" * 40) -TargetCommit ("b" * 40)
+    } "A recorded REST body is not a tool result and must be refused." -Match "is not an MCP tool result"
+    Assert-Replay (-not (Test-Path -LiteralPath (Join-Path $restShaped "manifest.json") -PathType Leaf)) `
+        "A rejected REST-shaped payload must not publish a manifest."
+    Assert-Replay (-not (Test-AgentMcpToolResultShape -Result ([pscustomobject]@{ pullRequestId = 11 }))) `
+        "A REST body must not pass the tool-result shape check."
+    Assert-Replay (Test-AgentMcpToolResultShape -Result (
+            '{"content":[{"type":"text","text":"{}"}]}' | ConvertFrom-Json)) `
+        "A text tool result must pass the tool-result shape check."
+    Assert-Replay (Test-AgentMcpToolResultShape -Result (
+            '{"content":[{"type":"resource","resource":{"uri":"/a","mimeType":"text/plain","blob":"eA=="}}]}' |
+            ConvertFrom-Json)) `
+        "An embedded-resource tool result must pass the tool-result shape check."
+    Assert-Replay (-not (Test-AgentMcpToolResultShape -Result (
+                '{"isError":true,"content":[{"type":"text","text":"failure"}]}' | ConvertFrom-Json))) `
+        "An MCP tool error must not pass the tool-result shape check."
+    Assert-Replay (-not (Test-AgentMcpToolResultShape -Result (
+                '{"content":[{"type":"resource","resource":{}}]}' | ConvertFrom-Json))) `
+        "An incomplete embedded resource must not pass the tool-result shape check."
+    Assert-Replay (-not (Test-AgentMcpToolResultShape -Result (
+                '{"content":[{"type":"resource","extra":true,"resource":{"uri":"/a","mimeType":"text/plain","blob":"eA=="}}]}' |
+                ConvertFrom-Json))) `
+        "An embedded resource with unexpected content fields must not pass the tool-result shape check."
+    Assert-Replay (-not (Test-AgentMcpToolResultShape -Result (
+                '{"content":[{"type":"resource","resource":{"uri":"/a","mimeType":"text/plain","blob":"/w=="}}]}' |
+                ConvertFrom-Json))) `
+        "An embedded resource containing invalid UTF-8 must not pass the tool-result shape check."
+    $oversizedToolText = [pscustomobject]@{
+        content = @([pscustomobject]@{ type = "text"; text = ("x" * (20MB + 1)) })
+    }
+    Assert-Replay (-not (Test-AgentMcpToolResultShape -Result $oversizedToolText)) `
+        "Text larger than the read-time 20 MB bound must not pass the tool-result shape check."
+
     # Schema v2 seals the exact source transport selected during live capture.
     # Three nondegenerate files make a 0/N replay regression visible immediately.
     $v2Root = Join-Path $sandbox "sealed-v2"
@@ -3803,6 +3854,155 @@ try {
     Assert-Replay ($LASTEXITCODE -eq 0 -and
         (($verificationOutput -join "`n") -clike "*Reconciled: True*")) `
         "The reconciler did not consume cross-verified semantic candidates from verification decisions."
+
+    # An EMPTY run. A degraded convention specialist contributes no manifest by
+    # design, so the decision artifact carries `reconciliationManifest = null`
+    # while still being a signed, complete statement: every candidate accounted
+    # for, nothing eligible, nothing decided. That artifact used to be re-read
+    # under the specialist reader after its own signature had already verified,
+    # and the operator was shown a signature failure for a file whose signature
+    # was fine.
+    function New-EmptyDecision {
+        param(
+            [string]$Nonce,
+            [int]$Total = 1,
+            $Withheld = $null,
+            [object[]]$Decisions = @(),
+            [object[]]$Eligible = @(),
+            [string]$Status = "degraded",
+            [switch]$NoReplay,
+            [string]$SnapshotId = "s",
+            [string]$ManifestDigest = ("7" * 64)
+        )
+        if ($null -eq $Withheld) {
+            $Withheld = @([pscustomobject][ordered]@{
+                    candidateId = "c1"; clusterId = "cl1"; reason = "unsupported"
+                    detail = "No supported verifier model was available for this candidate."
+                })
+        }
+        return [pscustomobject][ordered]@{
+            kind = $script:ReviewerVerificationPreviewKind
+            artifactVersion = $script:ReviewerVerificationArtifactVersion
+            status = $Status
+            organization = "o"; project = "p"; repositoryId = "r"
+            prId = 42; sourceCommit = ("c" * 40)
+            configSha256 = ("1" * 64); scriptSha256 = ("2" * 64)
+            verificationLibrarySha256 = ("a" * 64); promptSha256 = ("4" * 64)
+            policySha256 = ("b" * 64); schemaSha256 = ("c" * 64)
+            inputManifestSha256 = ("d" * 64)
+            inputArtifactHashes = @([pscustomobject][ordered]@{
+                    id = "convention-plan"; kind = "convention-plan"; sha256 = ("5" * 64)
+                })
+            totalCandidateCount = $Total
+            decisions = @($Decisions)
+            withheld = @($Withheld)
+            eligiblePreviewCandidates = @($Eligible)
+            reconciliationManifest = $null
+            replaySha256 = ("e" * 64)
+            replay = $(if ($NoReplay) { $null }
+                else {
+                    [pscustomobject][ordered]@{
+                        snapshotId = $SnapshotId; manifestDigest = $ManifestDigest
+                        replayNonce = $Nonce; promotable = $false
+                    }
+                })
+        }
+    }
+    $emptyPaths = @()
+    $emptyIndex = 0
+    foreach ($nonce in @("e1", "e2")) {
+        $emptyIndex++
+        $emptyPaths += Save-ReviewerVerificationPreview -Directory $reconDir `
+            -BaseName "empty-run$emptyIndex" -MasterKey $derivedKey `
+            -Manifest (New-EmptyDecision -Nonce $nonce)
+    }
+    $emptyOutput = (& $toolPath -ArtifactPath $emptyPaths -KeyPath $keyFile 2>&1) -join "`n"
+    Assert-Replay ($LASTEXITCODE -eq 0 -and $emptyOutput -cnotlike "*signature verification failed*") `
+        "An all-withheld empty run must reconcile as an empty run, not fail as a signature error."
+    Assert-Replay ($emptyOutput -clike "*nonce e1*" -and $emptyOutput -clike "*nonce e2*") `
+        "Both empty runs must be recorded in the declared run set by their own nonces."
+    Assert-Replay ($emptyOutput -clike "*Reconciled: False*" -and $emptyOutput -clike "*degraded*") `
+        "An empty run that finished degraded must be reported degraded, not laundered into a clean result."
+    Assert-Replay ($emptyOutput -cnotlike "*missing binding fields*") `
+        "An empty run binds to what its own artifact proves; it must not report missing binding fields."
+    # And the binding is exact: same plan binds equal, different accounting does not.
+    $emptyBindingA = Get-ReviewerRunReconciliationBinding -Manifest (
+        New-ReviewerRunReconciliationEmptyRunInput -VerificationManifest (New-EmptyDecision -Nonce "e1") `
+            -Source "a.json" -NoManifestError "x.")
+    $emptyBindingB = Get-ReviewerRunReconciliationBinding -Manifest (
+        New-ReviewerRunReconciliationEmptyRunInput -VerificationManifest (New-EmptyDecision -Nonce "e2") `
+            -Source "b.json" -NoManifestError "x.")
+    Assert-Replay ([string]$emptyBindingA.Sha256 -ceq [string]$emptyBindingB.Sha256 -and
+        @($emptyBindingA.Missing).Count -eq 0) `
+        "Two empty runs of the same plan must bind identically and completely."
+    $otherAccounting = Get-ReviewerRunReconciliationBinding -Manifest (
+        New-ReviewerRunReconciliationEmptyRunInput -VerificationManifest (
+            New-EmptyDecision -Nonce "e3" -Withheld @([pscustomobject][ordered]@{
+                    candidateId = "c1"; reason = "specialistDegraded"; detail = "d"
+                })) -Source "c.json" -NoManifestError "x.")
+    Assert-Replay ([string]$otherAccounting.Sha256 -cne [string]$emptyBindingA.Sha256) `
+        "An empty run that withheld for a different reason must not bind equal to one that did not."
+    $specialistBinding = Get-ReviewerRunReconciliationBinding -Manifest (New-ReconRun -Nonce "e1" -Rows @())
+    Assert-Replay ([string]$specialistBinding.Sha256 -cne [string]$emptyBindingA.Sha256) `
+        "An empty run must never bind equal to a specialist run artifact."
+    # A declaration still pins the snapshot an empty run replayed.
+    $emptyDecl = & $toolPath -DeclareRunSet -SnapshotName "other-snapshot" `
+        -SnapshotManifestDigest ("7" * 64) -PlannedRunCount 2 `
+        -KeyPath $keyFile -OutputDirectory $reconDir 2>&1 | Select-Object -Last 1
+    $emptyWrongSnapshot = ""
+    try {
+        & $toolPath -ArtifactPath $emptyPaths -KeyPath $keyFile `
+            -RunSetPath ([string]$emptyDecl) -RunSetKeyPath $keyFile | Out-Null
+    }
+    catch { $emptyWrongSnapshot = [string]$_.Exception.Message }
+    Assert-Replay ($emptyWrongSnapshot -clike "*is not the*other-snapshot*") `
+        "An empty run replaying another snapshot must be refused against the declaration."
+
+    # The malformed shapes. Each one keeps the original precise error, and none
+    # of them may reach the specialist reader.
+    foreach ($case in @(
+            @{ Name = "nonempty-decisions"
+                Manifest = (New-EmptyDecision -Nonce "m1" -Decisions @([pscustomobject]@{ candidateId = "c1"; verdict = "confirmed" }))
+                Match = "*not an empty run*" },
+            @{ Name = "nonempty-eligible"
+                Manifest = (New-EmptyDecision -Nonce "m2" -Eligible @([pscustomobject]@{ candidateId = "c1" }))
+                Match = "*not an empty run*" },
+            @{ Name = "unaccounted"
+                Manifest = (New-EmptyDecision -Nonce "m3" -Total 2)
+                Match = "*unaccounted for*" },
+            @{ Name = "reasonless"
+                Manifest = (New-EmptyDecision -Nonce "m4" -Withheld @([pscustomobject]@{ candidateId = "c1"; reason = "" }))
+                Match = "*no explicit*" },
+            @{ Name = "complete-without-manifest"
+                Manifest = (New-EmptyDecision -Nonce "m5" -Status "complete")
+                Match = "*malformed*" },
+            @{ Name = "no-replay-identity"
+                Manifest = (New-EmptyDecision -Nonce "m6" -NoReplay)
+                Match = "*no replay identity*" })) {
+        $malformedPath = Save-ReviewerVerificationPreview -Directory $reconDir `
+            -BaseName ("malformed-" + $case.Name) -MasterKey $derivedKey -Manifest $case.Manifest
+        $malformedError = ""
+        try { & $toolPath -ArtifactPath @($malformedPath, $emptyPaths[0]) -KeyPath $keyFile | Out-Null }
+        catch { $malformedError = [string]$_.Exception.Message }
+        Assert-Replay ($malformedError -clike "*has no reconciliation manifest*" -and
+            $malformedError -clike $case.Match) `
+            "A $($case.Name) decision must keep the original precise error (got: $malformedError)."
+        Assert-Replay ($malformedError -cnotlike "*signature verification failed*" -and
+            $malformedError -cnotlike "*not a convention specialist*") `
+            "A $($case.Name) decision must never be re-read under the specialist reader."
+    }
+    # A file that is neither artifact names both readers rather than only the
+    # last one tried.
+    $neitherPath = Save-ReviewerConventionSpecialistPreview -Directory $reconDir -BaseName "neither" `
+        -MasterKey $derivedKey -Manifest ([pscustomobject][ordered]@{
+            kind = "reviewer.not-an-artifact"; artifactVersion = 1
+        })
+    $neitherError = ""
+    try { & $toolPath -ArtifactPath @($neitherPath, $emptyPaths[0]) -KeyPath $keyFile | Out-Null }
+    catch { $neitherError = [string]$_.Exception.Message }
+    Assert-Replay ($neitherError -clike "*neither a cross-verification decision*" -and
+        $neitherError -clike "*nor a convention specialist preview*") `
+        "An artifact that is neither shape must name both readers (got: $neitherError)."
 
     # The predeclared run set, end to end. A declaration that names a count can
     # still be filled with whichever runs looked best; one that names the

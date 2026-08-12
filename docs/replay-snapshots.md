@@ -117,7 +117,14 @@ resources, 24 MB per payload, 64 MB in total). It records
   source-transport artifact's relative path, SHA-256 and byte length;
 - `manifestDigest` - a canonical digest over everything above.
 
-Every payload is the exact JSON-RPC response line the read returned.
+Every payload is the exact JSON-RPC response line the read returned, and every
+one of them must be a response a reader could actually consume: an MCP tool
+result, that is, a `content` array whose first item carries `text` or an
+embedded `resource`. The loader checks that at load, for every recorded read,
+because a raw REST body wrapped in a JSON-RPC envelope loads, hashes and binds
+perfectly and then fails at the read that needs it - halfway through a run that
+has already been declared. Record what the MCP server returns, not the REST body
+it wraps.
 
 ### What the digest does and does not prove
 
@@ -297,6 +304,15 @@ must be the canonical repository path *itself*. Aliases are refused, not
 normalized, so `//src/a.cs`, `/src/./a.cs` and `\src\a.cs` do not bind to
 `/src/a.cs`. Two recorded source reads of one path are refused as well.
 
+Each recorded read declares how its captured bytes become the response the loader
+serves. `mcpTextContent` and `mcpResourceContent` wrap captured text or file
+content the way the MCP server does. `jsonRpcResult` embeds the captured JSON
+verbatim, which is only honest when what was captured *is* a tool result, so the
+seal refuses it for anything else - a captured REST body sealed verbatim would
+produce a snapshot that loads perfectly and that no reader can consume, which is
+a failure a corpus seal must not be able to hide. Seal such a payload as
+`mcpTextContent`.
+
 Nothing is written into the published location until every check has passed. The
 seal is built into a staging replay root beside the target, loaded back through
 the production loader from staging, and only then moved into place; an existing
@@ -454,12 +470,30 @@ the reviewed repository by walking up from the config's own location for a
 so the run throws before a model is ever launched.
 
 All three replay parameters are required together. `-PullRequestId` is required
-and must match the snapshot's binding: the recorded pull-request list is a
-moment in that repository's history, and letting it drive candidate selection
-would quietly make the run about a different pull request than the operator
-pinned. The snapshot's organization, project and repository must match the
-running configuration, or the run refuses rather than producing a
-self-consistent artifact stamped with the wrong identity.
+and must match the snapshot's binding: a recorded candidate set is a moment in
+that repository's history, and letting it drive candidate selection would
+quietly make the run about a different pull request than the operator pinned.
+The snapshot's organization, project and repository must match the running
+configuration, or the run refuses rather than producing a self-consistent
+artifact stamped with the wrong identity.
+
+A run that names its pull request resolves **that** pull request directly
+(`repo_pull_request` / `get`); only an untargeted run asks the repository for an
+active-pull-request list. Both requests are composed in one place
+(`Get-ReviewerCandidateSourceRequest`), which the live cycle and the
+qualification prelaunch probe share. This matters for replay: a bounded
+snapshot - an offline corpus seal in particular - is sealed around the reads one
+pull request needs and deliberately carries no repository-wide census, so a
+cycle that always listed demanded a response no such snapshot holds and died
+before any model launched.
+
+The read is keyed on the repository identity the agent asks with, which is
+`config.repository.name` (the ADO MCP `repositoryId` argument accepts either a
+name or a GUID). A snapshot recorded against a repository **GUID** therefore
+needs a config whose `repository.name` is that GUID; `repository.id` still
+carries the GUID and is what the snapshot binding is checked against. Getting
+this wrong used to surface as both slots failing after the set was declared; it
+is now a preflight refusal.
 
 ### Preflight the exact commands before declaring anything
 
@@ -481,7 +515,18 @@ the pull request, the planned state directory, the delivery authorization - and
 the preflight compares that report against the plan. It refuses to combine with
 `-DryRun`, `-ShowState`, `-ResetStarvedCandidates`, any capture switch, any
 promotion and any delivery or gate switch: it is an earlier stop, never a new
-capability.
+capability. It is restricted to offline replay and to an explicitly named pull
+request, so it can never become a live probe.
+
+At that boundary the agent also issues the run's **first source read** against
+the sealed snapshot - the bounded direct get for the named pull request, through
+the same composer the cycle uses. A replay session starts no child process, so
+this probe cannot reach a host even in principle. It reports the tool, action,
+exact arguments, request digest and the pull request the snapshot answered with;
+the wrapper recomputes that digest from the reported arguments and looks it up
+in the snapshot it planned against. A snapshot that binds correctly but cannot
+answer the read the run opens with - the request-contract mismatch above - is
+refused here, before a run set is declared.
 
 ```pwsh
 # 1. Look. Creates no state and launches no model; the only file written is the
@@ -531,12 +576,18 @@ declaration. The qualification root must be outside the toolkit worktree, the
 reviewed repository and the replay root - writing there would dirty the tree
 whose cleanliness the run's identity depends on.
 
-`tools/Test-ReviewerReplayQualification.ps1` proves all of this offline against
-the committed synthetic snapshot: that a slot which names a superseded Opus
-build or omits `-RepoPath` is refused before any declaration is written, that
-the prelaunch mode creates no state and refuses every forbidden combination,
-that a declaration sealed for another plan cannot be run against, and that a
-child which fails at startup consumes its slot's only attempt.
+`tools/Test-ReviewerReplayQualification.ps1` proves all of this offline, against
+the committed synthetic snapshot and a bounded one it seals in its own sandbox:
+that a slot which names a superseded Opus build or omits `-RepoPath` is refused
+before any declaration is written, that a targeted run's first read is the
+bounded direct get the snapshot actually records, that a snapshot recorded under
+a different repository identity than the config names is refused at preflight,
+that the prelaunch mode creates no state and refuses every forbidden
+combination, that a declaration sealed for another plan cannot be run against,
+and that a child which fails at startup consumes its slot's only attempt. The
+agent's own `-DryRun` self-checks cover the composer directly: a named pull
+request produces a direct get, an untargeted run produces the list, and a
+request bounded by neither is refused.
 
 Long-running qualification slots must be launched through an attached sync/async
 shell whose completion notification is owned by the active session, or through an
@@ -635,6 +686,46 @@ safe here precisely because the binding already pins the config and both plans -
 and the rule id and hash are compared per row anyway, so a run whose `rs2` is
 about a different rule than the other's `rs2` disagrees rather than being
 quietly lined up.
+
+### A run that produced nothing
+
+The tool also accepts a sealed cross-verification decision and reconciles the
+specialist manifest embedded in it. When the convention specialist degraded that
+manifest is deliberately absent - its discovery is not trusted - so the decision
+carries `reconciliationManifest = null` while remaining a signed, complete
+statement about a run.
+
+That artifact is reconciled as an **empty run**, and only when it proves it is
+one:
+
+- `decisions` and `eligiblePreviewCandidates` are both exactly empty;
+- the run did not finish `complete` (a complete pass always embeds the
+  manifest, so a complete one without it is malformed, not empty);
+- every one of `totalCandidateCount` candidates is named exactly once in
+  `withheld` with an explicit reason - unsupported, specialist-degraded or any
+  other stated accounting;
+- and the decision carries its own replay identity: snapshot, manifest digest
+  and nonce.
+
+It then binds under its own kind, `reviewer.run-reconciliation.empty-run`, to
+what that artifact proves about itself: the pull request and commit, the config
+and agent-script hashes, the verification library, prompt, policy and schema
+digests, the input manifest digest, a canonical digest of the whole
+`inputArtifactHashes` table (which pins the generalist passes, the specialist
+artifact, and both plans), and a canonical digest of the withheld accounting.
+Nothing is borrowed from the declaration, the file name, or an operator
+argument, and an empty run never binds equal to a specialist run artifact.
+
+If any of those conditions fails the tool throws the precise reason and stops.
+It never re-reads the file as a convention specialist preview afterwards: an
+artifact whose verification signature has already verified *is* a verification
+decision, and reporting a signature failure against a second contract for it
+would name the wrong defect - which is exactly what a completed qualification
+set was told about an honest empty run.
+
+An empty run is not a clean one. Its status is `degraded`, so the comparison
+reports itself unreconciled, with the degradation named.
+
 ### Declaring the run set before you look
 
 An operator who picks which runs to compare after seeing their results has not

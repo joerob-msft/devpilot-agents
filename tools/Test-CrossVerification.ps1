@@ -2436,6 +2436,27 @@ foreach ($forbiddenName in @(
             $forbiddenName, [StringComparison]::OrdinalIgnoreCase) -lt 0) `
         "Cross-verification library references delivery surface '$forbiddenName'."
 }
+# A decision artifact has to be bindable to the recording it replayed. When the
+# convention specialist degrades there is no reconciliation manifest inside it
+# to borrow that identity from, so the decision must carry its own - and it must
+# be the SAME identity the specialist preview carries, from one definition,
+# because two artifacts of one run disagreeing about their snapshot would be
+# worse than either being absent.
+$decisionPreviewText = Get-VerificationFunctionText -Text $wrapperText `
+    -Name "Write-ReviewerVerificationDecisionPreview"
+Assert-Verification ($decisionPreviewText -match 'replay\s*=\s*New-ReviewerReplayArtifactIdentity') `
+    "The verification decision preview does not carry the run's replay identity."
+$specialistPreviewText = Get-VerificationFunctionText -Text $wrapperText `
+    -Name "Write-ReviewerConventionSpecialistPreview"
+Assert-Verification ($specialistPreviewText -match 'replay\s*=\s*New-ReviewerReplayArtifactIdentity') `
+    "The specialist preview no longer shares one replay identity definition with the decision preview."
+$replayIdentityText = Get-VerificationFunctionText -Text $wrapperText `
+    -Name "New-ReviewerReplayArtifactIdentity"
+Assert-Verification ($replayIdentityText -match 'ReviewerReplayActive' -and
+    $replayIdentityText -match 'promotable\s*=\s*\$false' -and
+    ([regex]::Matches($wrapperText,
+        'replayNonce\s*=\s*\[string\]\$script:ReviewerReplaySnapshot\.ReplayNonce')).Count -eq 1) `
+    "The replay identity block must be defined exactly once, only in replay, and never promotable."
 foreach ($functionName in @(
         "Write-ReviewerVerificationDecisionPreview", "Invoke-ReviewerVerificationModelRun",
         "Get-ReviewerVerificationSourceHunks", "Invoke-ReviewerCrossVerificationPass",

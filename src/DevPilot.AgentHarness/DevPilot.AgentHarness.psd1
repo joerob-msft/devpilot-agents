@@ -96,7 +96,7 @@ FunctionsToExport = 'Get-DevPilotAgentPath', 'Resolve-AgentRepositoryRoot', 'Get
                'Get-TaskTextBeforeDeadline', 'Invoke-TimedProcess', 
                'Open-AgentMcpSession', 'Close-AgentMcpSession', 
                'Send-AgentMcpRequest', 'Send-AgentMcpNotification', 
-               'Invoke-AgentMcpTool', 'ConvertFrom-AgentMcpResourceContent',
+               'Invoke-AgentMcpTool', 'Test-AgentMcpToolResultShape', 'ConvertFrom-AgentMcpResourceContent',
                'ConvertTo-AgentReplayCanonicalJson', 'Get-AgentReplayRequestKey',
                'Test-AgentReplayToolPermitted', 'New-AgentReplaySnapshot',
                'Assert-AgentReplaySnapshotPromotable',

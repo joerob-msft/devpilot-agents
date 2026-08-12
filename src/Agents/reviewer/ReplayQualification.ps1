@@ -7,22 +7,29 @@
     purpose: an operator who picks which runs to compare after seeing them has
     chosen an answer rather than reconciled anything. The cost of that ordering
     is that a declaration made against an invocation that cannot start is a
-    spoiled set - and the two ways it has actually been spoiled were both
-    invocation defects, not review defects:
+    spoiled set - and the four ways it has actually been spoiled were all
+    invocation or evidence defects, not review defects:
 
       * a slot naming a model the agent's startup validation no longer accepts
-        (a wrapper that had written a model version down for itself), and
+        (a wrapper that had written a model version down for itself),
       * a slot that omitted -RepoPath, so the agent tried to resolve the
-        reviewed repository from a config that lives outside one and threw.
+        reviewed repository from a config that lives outside one and threw,
+      * a run whose first source read was a repository-wide pull-request list
+        that the bounded, sealed snapshot deliberately does not carry, and
+      * a sealed snapshot whose recorded responses were captured REST bodies
+        rather than tool results, which loads and binds perfectly and which no
+        reader can consume (now refused when the snapshot is loaded, here and
+        in the agent, rather than at the read that needs it).
 
-    Both died before a model was ever launched, after the set had been
+    All four died before a model was ever launched, after the set had been
     declared. So this library builds the COMPLETE argument vector for every
     slot, validates every input the agent will validate at startup, and then
     runs that exact vector through the AGENT ITSELF up to the agent's own
-    model-launch boundary - all before the caller is allowed to declare
-    anything. There is exactly one constructed argv per slot; the preflight and
-    the real invocation consume the same array, so a preflight that passes
-    cannot be describing a different command than the one that runs.
+    model-launch boundary - where the agent also issues the run's first source
+    read against the sealed snapshot - all before the caller is allowed to
+    declare anything. There is exactly one constructed argv per slot; the
+    preflight and the real invocation consume the same array, so a preflight
+    that passes cannot be describing a different command than the one that runs.
 
     Nothing here writes a file, launches a model, or opens a network
     connection. The one child process it starts is the agent in its own
@@ -474,9 +481,9 @@ function Assert-ReviewerReplayQualificationPlan {
         the plan against the agent's answer rather than against a copy of the
         agent's parameter block. A model the registry no longer supports, a
         -RepoPath the agent cannot resolve, a snapshot that does not bind to
-        this config or this pull request: each of them fails here, and each of
-        them is a failure that previously surfaced only after the run set had
-        been sealed.
+        this config or this pull request, or a snapshot that cannot answer the
+        read the run opens with: each of them fails here, and each of them is a
+        failure that previously surfaced only after the run set had been sealed.
 
         Returns per-slot evidence.
     #>
@@ -485,6 +492,14 @@ function Assert-ReviewerReplayQualificationPlan {
     if (@($Plan.Slots).Count -lt 2) {
         throw "A qualification of fewer than two slots is not a reconciliation."
     }
+    # Loaded once, here, so the probe the agent reports can be looked up in the
+    # snapshot THIS process planned against rather than taken on the child's
+    # word. A snapshot keyed on a repository identity the config does not name -
+    # the exact shape of the defect that killed a declared set before any model
+    # ran - has no such recorded read, and fails here.
+    $snapshot = New-AgentReplaySnapshot -ReplayRoot ([string]$Plan.Snapshot.ReplayRoot) `
+        -SnapshotName ([string]$Plan.Snapshot.Name) -ExpectedManifestDigest ([string]$Plan.Snapshot.ManifestDigest)
+    $servedKeys = @($snapshot.ServedKeys)
     $evidence = @(foreach ($plannedSlot in @($Plan.Slots)) {
             $arguments = [string[]]@($plannedSlot.Arguments)
             $refused = @($arguments | Where-Object { @($script:ReviewerQualificationRefusedSwitches) -ccontains $_ })
@@ -502,7 +517,9 @@ function Assert-ReviewerReplayQualificationPlan {
             foreach ($required in @("seam", "repoPath", "plannedStateDir", "stateDirExists", "configFile",
                     "configSha256", "model", "secondPassModel", "isTwoPass", "conventionSpecialist",
                     "conventionSpecialistModel", "pullRequestId", "replayActive", "replaySnapshotId",
-                    "replayManifestDigest", "deliveryAuthorization", "agentScriptSha256")) {
+                    "replayManifestDigest", "deliveryAuthorization", "agentScriptSha256",
+                    "sourceProbeTool", "sourceProbeAction", "sourceProbeArguments",
+                    "sourceProbeRequestSha256", "sourceProbePullRequestId")) {
                 if (-not $resolved.PSObject.Properties[$required]) {
                     throw "The agent's prelaunch report for $($plannedSlot.Name) is missing '$required'."
                 }
@@ -567,6 +584,51 @@ function Assert-ReviewerReplayQualificationPlan {
                 throw ("$($plannedSlot.Name) resolved delivery authorization " +
                     "'$($resolved.deliveryAuthorization)'; an offline replay is preview-only by construction.")
             }
+            # -- the run's FIRST source read, proven against this snapshot ------
+            # A slot that binds perfectly still dies before any model if the
+            # snapshot cannot answer the read the cycle opens with. The agent
+            # issues that exact read at its prelaunch boundary and reports it;
+            # this recomputes the request key from the reported arguments and
+            # looks it up in the snapshot, so neither side is trusted alone.
+            if ([string]$resolved.sourceProbeTool -cne "repo_pull_request" -or
+                [string]$resolved.sourceProbeAction -cne "get") {
+                throw ("$($plannedSlot.Name) probed its source with " +
+                    "'$($resolved.sourceProbeTool)/$($resolved.sourceProbeAction)'. A qualification names its pull " +
+                    "request, so the run's first read must be the bounded direct get - never a repository-wide list.")
+            }
+            $probeArguments = $resolved.sourceProbeArguments
+            $probeKeys = @(@($probeArguments.PSObject.Properties.Name) | Sort-Object)
+            if (($probeKeys -join ",") -cne "action,project,pullRequestId,repositoryId") {
+                throw ("$($plannedSlot.Name) probed its source with argument(s) " +
+                    "'$($probeKeys -join ", ")' rather than the bounded direct-get argument set.")
+            }
+            if ([string]$probeArguments.project -cne [string]$Plan.Project -or
+                [int]$probeArguments.pullRequestId -ne [int]$Plan.PullRequestId) {
+                throw ("$($plannedSlot.Name) probed for " +
+                    "$($probeArguments.project)/PR $($probeArguments.pullRequestId) rather than the planned " +
+                    "$($Plan.Project)/PR $($Plan.PullRequestId).")
+            }
+            $recomputedKey = Get-AgentReplayRequestKey -Name ([string]$resolved.sourceProbeTool) -Arguments ([ordered]@{
+                    action        = [string]$probeArguments.action
+                    project       = [string]$probeArguments.project
+                    repositoryId  = [string]$probeArguments.repositoryId
+                    pullRequestId = [int]$probeArguments.pullRequestId
+                })
+            if ([string]$recomputedKey.Key -cne [string]$resolved.sourceProbeRequestSha256) {
+                throw ("$($plannedSlot.Name) reported a source-probe request key that does not hash its own " +
+                    "reported arguments.")
+            }
+            if (@($servedKeys) -cnotcontains [string]$resolved.sourceProbeRequestSha256) {
+                throw ("Snapshot '$($Plan.Snapshot.Name)' records no response for the read " +
+                    "$($plannedSlot.Name) opens with (repositoryId '$($probeArguments.repositoryId)', " +
+                    "pull request $($probeArguments.pullRequestId)). A snapshot sealed around a different " +
+                    "repository identity than this config names cannot answer it, and the run would fail before " +
+                    "a model launched.")
+            }
+            if ([int]$resolved.sourceProbePullRequestId -ne [int]$Plan.PullRequestId) {
+                throw ("$($plannedSlot.Name) resolved pull request $($resolved.sourceProbePullRequestId) from the " +
+                    "snapshot's recorded read, not the planned $($Plan.PullRequestId).")
+            }
             [pscustomobject][ordered]@{
                 Slot                 = $plannedSlot.Name
                 Seam                 = [string]$resolved.seam
@@ -582,6 +644,11 @@ function Assert-ReviewerReplayQualificationPlan {
                 SnapshotManifestDigest = [string]$resolved.replayManifestDigest
                 NonPromotable        = [bool]$resolved.replayNonPromotable
                 DeliveryAuthorization = [string]$resolved.deliveryAuthorization
+                SourceProbeTool      = [string]$resolved.sourceProbeTool
+                SourceProbeAction    = [string]$resolved.sourceProbeAction
+                SourceProbeRepositoryId = [string]$probeArguments.repositoryId
+                SourceProbeRequestSha256 = [string]$resolved.sourceProbeRequestSha256
+                SourceProbePullRequestId = [int]$resolved.sourceProbePullRequestId
             }
         })
     $stateDirs = @(@($evidence) | ForEach-Object { $_.StateDir.ToLowerInvariant() })

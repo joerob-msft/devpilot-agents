@@ -2312,6 +2312,19 @@ function New-AgentReplaySnapshot {
             -not $envelope.PSObject.Properties["result"] -or $envelope.PSObject.Properties["error"]) {
             throw "Replay payload '$payloadRelative' is not a successful JSON-RPC response envelope."
         }
+        # A well-formed envelope is not the same as a readable one. Every reader
+        # in this toolkit consumes a tool result through Invoke-AgentMcpTool,
+        # which requires the MCP content shape; a raw REST body wrapped in a
+        # JSON-RPC envelope loads, hashes and binds perfectly and then fails at
+        # the read that needs it - after a run has already started. Checking it
+        # here means a snapshot that cannot answer is refused whole, at load,
+        # for EVERY recorded read rather than only the first one a run happens
+        # to reach.
+        if (-not (Test-AgentMcpToolResultShape -Result $envelope.result)) {
+            throw ("Replay payload '$payloadRelative' is not an MCP tool result: it carries no content array " +
+                "with text or an embedded resource, so no reader could consume it. Record the response the MCP " +
+                "server returns, not the REST body it wraps.")
+        }
 
         $served[$requestKey.Key] = @{
             Tool          = $tool
@@ -2671,6 +2684,75 @@ function Open-AgentMcpSession {
         Close-AgentMcpSession -Session $session -Abort
         throw
     }
+}
+
+function Test-AgentMcpToolResultShape {
+    <#
+        True when a JSON-RPC `result` is something a reader could actually
+        consume: the MCP tool-result shape, a content array whose first item
+        carries text or an embedded resource. This is the load-time and
+        seal-time mirror of what Invoke-AgentMcpTool requires at read time, so
+        a recorded response that no reader could parse is refused while it is
+        still being written down rather than in the middle of a run.
+    #>
+    param([Parameter(Mandatory)][AllowNull()]$Result)
+    if ($Result -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+    if ($Result.PSObject.Properties["isError"] -and $Result.isError -eq $true) { return $false }
+    $contentProperty = $Result.PSObject.Properties["content"]
+    if ($null -eq $contentProperty) { return $false }
+    $content = @($contentProperty.Value)
+    if ($content.Count -lt 1 -or $content[0] -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+    $first = $content[0]
+    $textTypeValid = (-not $first.PSObject.Properties["type"] -or [string]$first.type -ceq "text")
+    if ($textTypeValid -and $first.PSObject.Properties["text"] -and
+        $first.text -is [string] -and $first.text.Length -le 20MB) {
+        return $true
+    }
+    if ($first.PSObject.Properties["resource"] -and
+        $first.PSObject.Properties["type"] -and [string]$first.type -ceq "resource" -and
+        $first.resource -is [System.Management.Automation.PSCustomObject]) {
+        if ($content.Count -ne 1) { return $false }
+        if (@($first.PSObject.Properties.Name | Where-Object { @("resource", "type") -cnotcontains $_ }).Count -gt 0) {
+            return $false
+        }
+        $resource = $first.resource
+        if (@("blob", "mimeType", "uri") | Where-Object { -not $resource.PSObject.Properties[$_] }) {
+            return $false
+        }
+        if (@($resource.PSObject.Properties.Name | Where-Object {
+                    @("blob", "mimeType", "uri") -cnotcontains $_
+                }).Count -gt 0) {
+            return $false
+        }
+        if ($resource.uri -isnot [string] -or [string]::IsNullOrWhiteSpace($resource.uri) -or
+            $resource.uri.Length -gt 2048 -or
+            $resource.mimeType -isnot [string] -or [string]::IsNullOrWhiteSpace($resource.mimeType) -or
+            $resource.mimeType.Length -gt 128 -or
+            $resource.blob -isnot [string] -or [string]::IsNullOrWhiteSpace($resource.blob)) {
+            return $false
+        }
+        $blob = [string]$resource.blob
+        if (($blob.Length % 4) -ne 0 -or $blob -notmatch '^[A-Za-z0-9+/]*={0,2}$') { return $false }
+        try { $bytes = [Convert]::FromBase64String($blob) }
+        catch { return $false }
+        if ($bytes.Length -lt 1 -or $bytes.Length -gt 5MB -or
+            [Convert]::ToBase64String($bytes) -cne $blob -or
+            ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)) {
+            return $false
+        }
+        try {
+            $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+        }
+        catch { return $false }
+        foreach ($character in $text.ToCharArray()) {
+            $code = [int]$character
+            if (($code -lt 32 -and $code -notin @(9, 10, 13)) -or $code -eq 127) {
+                return $false
+            }
+        }
+        return $true
+    }
+    return $false
 }
 
 function Invoke-AgentMcpTool {
@@ -4338,6 +4420,7 @@ Export-ModuleMember -Function @(
     "Send-AgentMcpRequest",
     "Send-AgentMcpNotification",
     "Invoke-AgentMcpTool",
+    "Test-AgentMcpToolResultShape",
     "ConvertFrom-AgentMcpResourceContent",
     "ConvertTo-AgentReplayCanonicalJson",
     "Get-AgentReplayRequestKey",

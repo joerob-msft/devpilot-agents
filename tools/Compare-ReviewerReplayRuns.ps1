@@ -249,20 +249,42 @@ foreach ($path in @($ArtifactPath)) {
     $resolved = (Resolve-Path -LiteralPath $path).ProviderPath
     $key = $(if ($replayKeys.Count -eq 1) { $replayKeys[0] } else { $replayKeys[$index] })
     $manifest = $null
+    # A file either verifies as a cross-verification decision or it does not.
+    # If it does, it IS that artifact, and every remaining question about it is
+    # a question about its contents - so the specialist reader is never tried
+    # afterwards. It used to be: the "no reconciliation manifest" throw landed
+    # in the same catch as a signature failure, the same bytes were then
+    # re-read under the specialist's domain key, and an honest empty run was
+    # reported to the operator as a signature failure on an artifact whose
+    # signature had in fact just verified.
+    $verificationManifest = $null
+    $verificationError = $null
     try {
         $verificationManifest = Read-ReviewerVerificationPreview -Path $resolved -MasterKey $key
+    }
+    catch {
+        $verificationError = $_
+    }
+    if ($null -ne $verificationManifest) {
         $manifest = Get-ReviewerConventionSpecialistValue `
             -Object $verificationManifest -Name "reconciliationManifest" -Default $null
         if ($null -eq $manifest) {
-            throw "Verification decision artifact has no reconciliation manifest."
+            # Throws unless the artifact proves it is an empty run, and carries
+            # the original sentence when it does throw.
+            $manifest = New-ReviewerRunReconciliationEmptyRunInput `
+                -VerificationManifest $verificationManifest `
+                -Source ([IO.Path]::GetFileName($resolved)) `
+                -NoManifestError "Verification decision artifact has no reconciliation manifest."
         }
     }
-    catch {
+    else {
         try {
             $manifest = Read-ReviewerConventionSpecialistPreview -Path $resolved -MasterKey $key
         }
         catch {
-            throw
+            throw ("Artifact '$resolved' is neither a cross-verification decision (" +
+                $verificationError.Exception.Message + ") nor a convention specialist preview (" +
+                $_.Exception.Message + ").")
         }
     }
     $replay = $manifest.PSObject.Properties["replay"]

@@ -864,6 +864,57 @@ function Get-ReviewerHashValue {
     return $Default
 }
 
+function Get-ReviewerCandidateSourceRequest {
+    <#
+        THE one place the candidate-discovery read is composed.
+
+        A run that names its pull request resolves THAT pull request directly; a
+        repository-wide census is only asked for when the run has to choose its
+        own candidate. This is a correctness property rather than an
+        optimization: an offline replay snapshot is sealed around the bounded
+        set of reads a run actually needs, and a cycle that always asked for the
+        census demanded a recorded list no bounded snapshot carries - which
+        killed both slots of a qualification set before a model ever launched.
+
+        The prelaunch probe and the live cycle both call this, so a snapshot
+        that answers the preflight is a snapshot that answers the run.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Project,
+        [Parameter(Mandatory)][string]$RepositoryName,
+        [ValidateRange(0, 2147483647)][int]$TargetPullRequestId = 0,
+        [string]$TargetRefName = "",
+        [ValidateRange(1, 1000)][int]$Top = 100
+    )
+    if ($TargetPullRequestId -gt 0) {
+        return [pscustomobject][ordered]@{
+            Name      = "repo_pull_request"
+            Action    = "get"
+            Arguments = [ordered]@{
+                action        = 'get'
+                project       = $Project
+                repositoryId  = $RepositoryName
+                pullRequestId = $TargetPullRequestId
+            }
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($TargetRefName)) {
+        throw "An untargeted candidate list requires a target ref name; a census with no target ref is not a bounded read."
+    }
+    return [pscustomobject][ordered]@{
+        Name      = "repo_pull_request"
+        Action    = "list"
+        Arguments = [ordered]@{
+            action        = 'list'
+            project       = $Project
+            repositoryId  = $RepositoryName
+            status        = 'Active'
+            targetRefName = $TargetRefName
+            top           = $Top
+        }
+    }
+}
+
 function Get-ReviewerCanonicalJson {
     <#
         Deterministic JSON for signing: object keys sorted ordinally, arrays in
@@ -2632,6 +2683,33 @@ if ($CaptureSourceTransportOnly) {
             "$($captureRefused -join ', ').")
     }
 }
+
+# Two children, two different scrubs, and the asymmetry is deliberate rather
+# than an oversight - it is worth stating because the "obviously stricter"
+# version of this is broken.
+#
+# The Copilot child AUTHENTICATES to GitHub with COPILOT_GITHUB_TOKEN, GH_TOKEN
+# or GITHUB_TOKEN. Stripping those does not harden it, it stops it starting: on
+# a host where GITHUB_TOKEN is the only one set, a stricter scrub is
+# indistinguishable from a broken agent, and the failure surfaces as an
+# authentication error nobody will connect to a credential-hygiene change. It
+# gets the ADO-PAT-shaped names, which it has no use for and must not carry.
+#
+# The `agency mcp ado` child is the reverse. It authenticates through agency's
+# own credential flow, so it needs neither family, and a GitHub token in its
+# environment is pure blast radius. It gets both.
+#
+# Neither list is a substitute for the tool grant: the model has no shell and no
+# outbound-network tool, so it cannot read an environment variable at all. This
+# bounds what a COMPROMISED CHILD PROCESS holds, not what the model can ask for.
+#
+# Defined here, above the qualification prelaunch boundary, so the prelaunch
+# source probe opens its session with the SAME scrub the cycle uses rather than
+# a second copy of the list that could drift from it.
+$CopilotSensitiveEnvironmentVariables = @("AZURE_DEVOPS_EXT_PAT", "SYSTEM_ACCESSTOKEN")
+$McpSensitiveEnvironmentVariables = $CopilotSensitiveEnvironmentVariables +
+@("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
+
 # ---------------------------------------------------------------------------
 # Offline snapshot replay. Resolved BEFORE the delivery authorization is minted
 # and before the state directory is chosen, because it changes both.
@@ -2884,6 +2962,48 @@ if ($script:ReviewerReplayActive) {
 # means a preflight that passes has proven the invocation starts, without a
 # state directory, a signing key, a session, a host call or a model.
 if ($QualificationPrelaunch) {
+    if (-not $script:ReviewerReplayActive) {
+        throw "-QualificationPrelaunch is restricted to offline replay; a live prelaunch probe is not permitted."
+    }
+    if ($PullRequestId -le 0) {
+        throw "-QualificationPrelaunch requires an explicit -PullRequestId so its source probe is bounded."
+    }
+
+    # Exercise the exact first wrapper-owned source request while the replay
+    # seam still guarantees zero host access - no process is started for a
+    # replay session, so this probe cannot reach the network even in principle.
+    # It catches a snapshot/config request-contract mismatch (a snapshot keyed
+    # on a repository identity the config does not name, a snapshot that carries
+    # no bounded direct read for this pull request) before a run set is
+    # declared, which is the only place that mismatch can still be fixed.
+    $probeRequest = Get-ReviewerCandidateSourceRequest -Project $ExpectedProject `
+        -RepositoryName $RepositoryName -TargetPullRequestId $PullRequestId -TargetRefName $TargetRefName
+    if ([string]$probeRequest.Action -cne "get") {
+        throw "-QualificationPrelaunch must probe a bounded direct read, not a '$($probeRequest.Action)'."
+    }
+    $probeKey = Get-AgentReplayRequestKey -Name $probeRequest.Name -Arguments $probeRequest.Arguments
+    $prelaunchSession = $null
+    $probeResolvedPullRequestId = 0
+    try {
+        $prelaunchSession = Open-AgentMcpSession -AgencyPath "offline-replay-not-executed" -Server "ado" `
+            -Organization $Organization -Toolsets @("repos") -TimeoutSeconds 30 `
+            -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables `
+            -ReplaySnapshot $script:ReviewerReplaySnapshot
+        $prelaunchPr = Invoke-AgentMcpTool -Session $prelaunchSession -Name $probeRequest.Name `
+            -Arguments $probeRequest.Arguments
+        if (-not $prelaunchPr) {
+            throw "Qualification prelaunch did not resolve the explicitly requested pull request."
+        }
+        $probeResolvedPullRequestId = [int](Get-ReviewerHashValue -Container $prelaunchPr -Key 'pullRequestId' -Default 0)
+        if ($probeResolvedPullRequestId -ne $PullRequestId) {
+            throw ("Qualification prelaunch resolved pull request $probeResolvedPullRequestId from the snapshot's " +
+                "recorded direct read, not the requested $PullRequestId.")
+        }
+    }
+    finally {
+        if ($prelaunchSession) { Close-AgentMcpSession -Session $prelaunchSession }
+    }
+
     $prelaunch = [ordered]@{
         seam                 = "reviewer.qualification-prelaunch.v1"
         agentScriptSha256    = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -2913,6 +3033,17 @@ if ($QualificationPrelaunch) {
         replaySnapshotId     = $(if ($script:ReviewerReplayActive) { [string]$script:ReviewerReplaySnapshot.SnapshotId } else { "" })
         replayManifestDigest = $(if ($script:ReviewerReplayActive) { [string]$script:ReviewerReplaySnapshot.ManifestDigest } else { "" })
         replayNonPromotable  = $(if ($script:ReviewerReplayActive) { [bool]$script:ReviewerReplayClassification.NonPromotable } else { $false })
+        # Evidence of the probe, not a claim that one happened: the exact tool,
+        # action, arguments and request key the cycle will ask with, plus the
+        # pull request the snapshot answered with. A caller can recompute the
+        # key from the arguments and look it up in the snapshot it planned
+        # against, so "the run's first read is recorded" is checkable outside
+        # this process.
+        sourceProbeTool          = [string]$probeRequest.Name
+        sourceProbeAction        = [string]$probeRequest.Action
+        sourceProbeArguments     = [pscustomobject]$probeRequest.Arguments
+        sourceProbeRequestSha256 = [string]$probeKey.Key
+        sourceProbePullRequestId = [int]$probeResolvedPullRequestId
     }
     Write-Output ("REVIEWER_QUALIFICATION_PRELAUNCH_V1 " +
         (ConvertTo-Json -InputObject ([pscustomobject]$prelaunch) -Depth 6 -Compress))
@@ -2964,27 +3095,6 @@ $ReviewFactScriptClosure = @(
         sha256 = (Get-FileHash -LiteralPath $ReviewFactLibrary -Algorithm SHA256).Hash.ToLowerInvariant()
     }
 )
-# Two children, two different scrubs, and the asymmetry is deliberate rather
-# than an oversight - it is worth stating because the "obviously stricter"
-# version of this is broken.
-#
-# The Copilot child AUTHENTICATES to GitHub with COPILOT_GITHUB_TOKEN, GH_TOKEN
-# or GITHUB_TOKEN. Stripping those does not harden it, it stops it starting: on
-# a host where GITHUB_TOKEN is the only one set, a stricter scrub is
-# indistinguishable from a broken agent, and the failure surfaces as an
-# authentication error nobody will connect to a credential-hygiene change. It
-# gets the ADO-PAT-shaped names, which it has no use for and must not carry.
-#
-# The `agency mcp ado` child is the reverse. It authenticates through agency's
-# own credential flow, so it needs neither family, and a GitHub token in its
-# environment is pure blast radius. It gets both.
-#
-# Neither list is a substitute for the tool grant: the model has no shell and no
-# outbound-network tool, so it cannot read an environment variable at all. This
-# bounds what a COMPROMISED CHILD PROCESS holds, not what the model can ask for.
-$CopilotSensitiveEnvironmentVariables = @("AZURE_DEVOPS_EXT_PAT", "SYSTEM_ACCESSTOKEN")
-$McpSensitiveEnvironmentVariables = $CopilotSensitiveEnvironmentVariables +
-@("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
 
 # Operator state inspection / recovery. These run before any cycle so a starved
 # or confusing state can be examined and cleared without hand-editing JSON.
@@ -4689,7 +4799,7 @@ function Set-ReviewerVote {
 
 function Invoke-DryRunSelfChecks {
     $failures = New-Object System.Collections.Generic.List[string]
-    $total = 47
+    $total = 48
 
     Write-Host "[DRY-RUN] Self-check 1/$total : parser validity + prompt presence" -ForegroundColor Cyan
     foreach ($p in @($PSCommandPath, $HarnessPath)) {
@@ -8001,6 +8111,44 @@ function Invoke-DryRunSelfChecks {
         Remove-Item -LiteralPath $gateSelfCheckSandboxDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 
+    Write-Host "[DRY-RUN] Self-check 48/$total : candidate discovery is a direct get when a pull request is named, and a list only when it is not" -ForegroundColor Cyan
+    # The third pre-model defect: the cycle always asked for a repository-wide
+    # census, and a bounded offline snapshot carries no such list, so both slots
+    # of a declared qualification set died before a model launched. The shape of
+    # each request is asserted here rather than left to a live read.
+    $sc48Targeted = Get-ReviewerCandidateSourceRequest -Project "ExampleProject" -RepositoryName "Example-Service" `
+        -TargetPullRequestId 4242 -TargetRefName "refs/heads/main"
+    $sc48TargetedKeys = @($sc48Targeted.Arguments.Keys | ForEach-Object { [string]$_ } | Sort-Object)
+    if ([string]$sc48Targeted.Name -cne "repo_pull_request" -or [string]$sc48Targeted.Action -cne "get" -or
+        ($sc48TargetedKeys -join ',') -cne "action,project,pullRequestId,repositoryId" -or
+        [string]$sc48Targeted.Arguments['action'] -cne "get" -or
+        [int]$sc48Targeted.Arguments['pullRequestId'] -ne 4242 -or
+        [string]$sc48Targeted.Arguments['repositoryId'] -cne "Example-Service") {
+        $failures.Add("A targeted run's candidate request is not the bounded direct get for exactly that pull request.")
+    }
+    else { Write-Host "  OK - a named pull request is resolved by a bounded direct get" -ForegroundColor Green }
+
+    $sc48Untargeted = Get-ReviewerCandidateSourceRequest -Project "ExampleProject" -RepositoryName "Example-Service" `
+        -TargetRefName "refs/heads/main"
+    $sc48UntargetedKeys = @($sc48Untargeted.Arguments.Keys | ForEach-Object { [string]$_ } | Sort-Object)
+    if ([string]$sc48Untargeted.Action -cne "list" -or
+        ($sc48UntargetedKeys -join ',') -cne "action,project,repositoryId,status,targetRefName,top" -or
+        [string]$sc48Untargeted.Arguments['status'] -cne "Active" -or
+        [string]$sc48Untargeted.Arguments['targetRefName'] -cne "refs/heads/main") {
+        $failures.Add("An untargeted run's candidate request is not the active-pull-request list for the target ref.")
+    }
+    else { Write-Host "  OK - only an untargeted run asks the repository for a census" -ForegroundColor Green }
+
+    $sc48RefusedUnbounded = $false
+    try {
+        Get-ReviewerCandidateSourceRequest -Project "ExampleProject" -RepositoryName "Example-Service" | Out-Null
+    }
+    catch { $sc48RefusedUnbounded = $true }
+    if (-not $sc48RefusedUnbounded) {
+        $failures.Add("A census with neither a pull request nor a target ref was composed instead of refused.")
+    }
+    else { Write-Host "  OK - a request bounded by neither a pull request nor a target ref is refused" -ForegroundColor Green }
+
     Write-Host ""
     if ($failures.Count -eq 0) {
         Write-Host "[DRY-RUN] All $total self-checks passed." -ForegroundColor Green
@@ -8859,6 +9007,41 @@ function Get-ReviewerConventionSpecialistResolvedSources {
     return $resolved.ToArray()
 }
 
+function New-ReviewerReplayArtifactIdentity {
+    <#
+        The replay identity block every run artifact carries.
+
+        One definition, because two artifacts of the same run that disagreed
+        about which snapshot produced them would be worse than either being
+        absent - and because an artifact WITHOUT this block cannot be bound to
+        the recording it replayed, which is what reconciliation compares.
+
+        Returns $null outside replay: a live run is not a replay of anything.
+    #>
+    if (-not $script:ReviewerReplayActive) { return $null }
+    return [pscustomobject][ordered]@{
+        snapshotId = [string]$script:ReviewerReplaySnapshot.SnapshotId
+        manifestDigest = [string]$script:ReviewerReplaySnapshot.ManifestDigest
+        replayNonce = [string]$script:ReviewerReplaySnapshot.ReplayNonce
+        promotable = $false
+        # What actually served source here. Replay declines the MCP
+        # capability probe, and declines the live az CLI fallback if
+        # config asked for it, so source always comes from the
+        # snapshot-backed legacy path - which may not be the
+        # transport the recorded run used.
+        sourceTransportMode = $(if ($script:ReviewerReplaySourceTransportMode) {
+                $script:ReviewerReplaySourceTransportMode
+            } else { "snapshotLegacy" })
+        capabilityProbeSuppressed = $true
+        azCliFallbackSuppressed = [bool]$script:ReviewerReplayAzFallbackSuppressed
+        # Machine-readable counterpart to the residual risk above, so
+        # a consumer cannot mistake one run for a reconciled result.
+        runsReconciled = 1
+        reconciled = $false
+        reconciliationNote = "One replay run. Statuses are unreconciled until compared against another run with a distinct nonce."
+    }
+}
+
 function Write-ReviewerConventionSpecialistPreview {
     param(
         [Parameter(Mandatory)][int]$PrId,
@@ -9091,30 +9274,7 @@ function Write-ReviewerConventionSpecialistPreview {
         residualRisks = @($ResidualRisks)
         markdownPath = $markdownPath
         markdownSha256 = Get-ReviewerConventionSpecialistSha256 -Text $markdown
-        replay = $(if ($script:ReviewerReplayActive) {
-                [pscustomobject][ordered]@{
-                    snapshotId = [string]$script:ReviewerReplaySnapshot.SnapshotId
-                    manifestDigest = [string]$script:ReviewerReplaySnapshot.ManifestDigest
-                    replayNonce = [string]$script:ReviewerReplaySnapshot.ReplayNonce
-                    promotable = $false
-                    # What actually served source here. Replay declines the MCP
-                    # capability probe, and declines the live az CLI fallback if
-                    # config asked for it, so source always comes from the
-                    # snapshot-backed legacy path - which may not be the
-                    # transport the recorded run used.
-                    sourceTransportMode = $(if ($script:ReviewerReplaySourceTransportMode) {
-                            $script:ReviewerReplaySourceTransportMode
-                        } else { "snapshotLegacy" })
-                    capabilityProbeSuppressed = $true
-                    azCliFallbackSuppressed = [bool]$script:ReviewerReplayAzFallbackSuppressed
-                    # Machine-readable counterpart to the residual risk above, so
-                    # a consumer cannot mistake one run for a reconciled result.
-                    runsReconciled = 1
-                    reconciled = $false
-                    reconciliationNote = "One replay run. Statuses are unreconciled until compared against another run with a distinct nonce."
-                }
-            }
-            else { $null })
+        replay = New-ReviewerReplayArtifactIdentity
         createdAt = [DateTime]::UtcNow.ToString("o")
     }
     $masterKey = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
@@ -9746,6 +9906,11 @@ function Write-ReviewerVerificationDecisionPreview {
         eligiblePreviewCandidates = @($Eligible)
         reconciliationManifest = $ReconciliationManifest
         replaySha256 = $ReplaySha256
+        # The same replay identity the specialist preview carries. Without it a
+        # decision that embeds no reconciliation manifest - the shape a degraded
+        # specialist produces - could not be bound to the recording it replayed,
+        # and an honest empty run would be unreconcilable.
+        replay = New-ReviewerReplayArtifactIdentity
         markdownPath = $markdownPath
         markdownSha256 = Get-ReviewerVerificationSha256 -Text $markdown
         createdAt = [DateTime]::UtcNow.ToString("o", [Globalization.CultureInfo]::InvariantCulture)
@@ -13842,22 +14007,20 @@ function Invoke-ReviewerCycle {
             -ReplaySnapshot $script:ReviewerReplaySnapshot
 
         # -- Step 1: candidate list (wrapper-owned, deterministic) ------------
-        $rawPrs = Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
-            action = 'list'; project = $ExpectedProject; repositoryId = $RepositoryName
-            status = 'Active'; targetRefName = $TargetRefName; top = 100
-        }
+        # Composed in ONE place, shared with the qualification prelaunch probe:
+        # a targeted run resolves its pull request directly and never asks for a
+        # repository-wide census it does not need (and that a bounded offline
+        # snapshot does not carry).
+        $candidateRequest = Get-ReviewerCandidateSourceRequest -Project $ExpectedProject `
+            -RepositoryName $RepositoryName -TargetPullRequestId $PullRequestId -TargetRefName $TargetRefName
+        $rawCandidateResponse = Invoke-AgentMcpTool -Session $session -Name $candidateRequest.Name `
+            -Arguments $candidateRequest.Arguments
+        $rawPrs = @(@($rawCandidateResponse) | Where-Object { $_ })
         $reviewedState = Get-JsonState -Path $reviewedStatePath
         $attemptsState = Get-JsonState -Path $attemptsStatePath
 
         if ($PullRequestId -gt 0) {
             $candidates = @(@($rawPrs) | Where-Object { $_ -and [int](Get-ReviewerHashValue -Container $_ -Key 'pullRequestId' -Default 0) -eq $PullRequestId })
-            if ($candidates.Count -eq 0) {
-                # It may exist but not be in the listed slice; ask for it directly.
-                $direct = Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
-                    action = 'get'; project = $ExpectedProject; repositoryId = $RepositoryName; pullRequestId = $PullRequestId
-                }
-                if ($direct) { $candidates = @($direct) }
-            }
             Write-Host "Candidates: restricted to PR $PullRequestId ($($candidates.Count) found)." -ForegroundColor Cyan
         }
         else {
