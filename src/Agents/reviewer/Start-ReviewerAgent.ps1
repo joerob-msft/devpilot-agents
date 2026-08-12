@@ -10517,11 +10517,20 @@ function Invoke-ReviewerCrossVerificationPass {
                 marker = $(if ($_.markerJson) { [string]$_.markerJson | ConvertFrom-Json -Depth 32 } else { $null })
             }
         })
-    $changedFileAnchors = @(Get-ReviewerConventionSpecialistChangedFileIndex `
+    # Get-ReviewerConventionSpecialistChangedFileIndex returns a `,`-protected
+    # array so a zero- or one-file change set still round-trips as an array.
+    # Wrapping that call in @() does NOT flatten it - it nests the whole index
+    # as a single Object[] element, so the resolver below would see one bogus
+    # anchor with no anchorId/path and EVERY cross-file manifestation would fail
+    # to resolve, stripping the verifier of the cross-file evidence it must rule
+    # on (the anchor hunk still emits because it needs no resolver). Assign the
+    # protected array directly so the cf<n> references resolve against the real
+    # per-file anchors, exactly as the specialist index they were bound to.
+    $changedFileAnchors = Get-ReviewerConventionSpecialistChangedFileIndex `
         -ChangeEntries $changeEntries `
         -RightHandRangesByPath $(if ($Bound.ContainsKey('ChangedFileRangesByPath')) {
                 $Bound['ChangedFileRangesByPath']
-            } else { @{} }))
+            } else { @{} })
     $candidatePlan = Get-ReviewerVerificationCandidatePlan -GeneralistPasses $normalizedPasses `
         -ConventionCandidates $specialistCandidates -ConventionModel $EffectiveConventionSpecialistModel `
         -ConventionArtifactSha256 $specialistArtifactSha `

@@ -2225,8 +2225,14 @@ function New-ReviewerConventionSpecialistInput {
     # with a thousand-file change set would push the envelope past its bound and
     # turn today's graceful "pinned source dropped" degrade into a hard failure
     # of the whole pass.
-    $fullAnchorIndex = @(Get-ReviewerConventionSpecialistChangedFileIndex -ChangeEntries $ChangeEntries `
-            -RightHandRangesByPath $RightHandRangesByPath)
+    # Assign the `,`-protected index directly: wrapping the call in @() nests
+    # the whole index as a single Object[] element instead of flattening it, so
+    # the anchor list handed to the model (and its .Count truncation check)
+    # would collapse to one bogus entry. Direct assignment keeps the real
+    # per-file anchors, and still round-trips a zero- or one-file change set as
+    # an array because the function returns a protected array.
+    $fullAnchorIndex = Get-ReviewerConventionSpecialistChangedFileIndex -ChangeEntries $ChangeEntries `
+        -RightHandRangesByPath $RightHandRangesByPath
     $anchorsTruncated = ($fullAnchorIndex.Count -gt $script:ReviewerConventionSpecialistMaxCoverageAnchors)
     $anchorIndex = @($fullAnchorIndex | Select-Object -First $script:ReviewerConventionSpecialistMaxCoverageAnchors)
     $runtime = [pscustomobject][ordered]@{

@@ -2501,6 +2501,59 @@ $crossFileDiffHunkOptions = @($crossFileOptions | Where-Object {
 Assert-Verification ($crossFileDiffHunkOptions.Count -eq 5 -and
     @($crossFileDiffHunkOptions | ForEach-Object { [string]$_.sha256 } | Sort-Object -Unique).Count -eq 5) `
     "Every sealed cross-file manifestation hunk must be an independently bindable diffHunk evidence option."
+# Regression: the changed-file anchor index is a unary-comma-protected array so
+# a one-file change set survives as an array. Wrapping the CALL in @() does not
+# flatten that - it NESTS the whole index as one bogus element with no anchorId
+# or path, which silently broke the verifier's cross-file resolution: every cf
+# ref failed to resolve, so a convention candidate reached its two verifiers
+# with only its anchor hunk and they split (verifierDisagreement). The hand-
+# built anchors above cannot catch that; these are built the way production
+# builds them and must stay resolvable. Guard the shape and the anti-pattern.
+$indexEntries = @(
+    [pscustomobject][ordered]@{ Path = "src/model.json"; Role = "current" },
+    [pscustomobject][ordered]@{ Path = "src/rolloutspec.json"; Role = "current" }
+)
+$indexRanges = @{
+    "src/model.json"       = @([pscustomobject]@{ startLine = 180; endLine = 220 })
+    "src/rolloutspec.json" = @([pscustomobject]@{ startLine = 50; endLine = 60 })
+}
+$directIndex = Get-ReviewerConventionSpecialistChangedFileIndex `
+    -ChangeEntries $indexEntries -RightHandRangesByPath $indexRanges
+Assert-Verification (@($directIndex).Count -eq 2 -and
+    @($directIndex | Where-Object {
+            [string]$_.anchorId -match '^cf\d+$' -and [string]$_.path
+        }).Count -eq 2) `
+    "A directly assigned changed-file anchor index must be one resolvable anchor per changed file, never a nested array."
+$nestedIndex = @(Get-ReviewerConventionSpecialistChangedFileIndex `
+        -ChangeEntries $indexEntries -RightHandRangesByPath $indexRanges)
+Assert-Verification ($nestedIndex.Count -eq 1 -and $nestedIndex[0] -is [object[]]) `
+    "Wrapping the changed-file index call in @() nests it into one bogus element; production must assign the call directly, never @(call)."
+# model.json sorts before rolloutspec.json, so the production index numbers them
+# cf0/cf1 in that order. A convention candidate anchored in one file and
+# manifested in the other must, using ONLY these production anchors, still be
+# shown a sealed manifestation slice for the cross-file line.
+$prodCandidate = [pscustomobject][ordered]@{
+    candidateId  = "cand-prod-index-1"
+    candidateHash = "e" * 64
+    anchorKind   = "changedFile"
+    filePath     = "src/model.json"
+    line         = 210
+    primaryTarget = "cf0:210"
+    manifestations = "cf0:210,cf1:52"
+    conventionBound = $true
+    originKind   = "convention"
+}
+$prodHunks = @(Get-ReviewerVerificationSourceHunks -AgencyPath "unused" `
+        -SourceCommit ("2" * 40) -Candidates @($prodCandidate) `
+        -ChangedPaths @("src/model.json", "src/rolloutspec.json") `
+        -ChangedFileAnchors $directIndex -SourceReport $crossFileReport)
+$prodManifest = @($prodHunks | Where-Object {
+        [string]$_.role -ceq "manifestation" -and
+        [string]$_.filePath -ceq "/src/rolloutspec.json"
+    })
+Assert-Verification ($prodManifest.Count -eq 1 -and [int]$prodManifest[0].line -eq 52 -and
+    [string]$prodManifest[0].sourceKind -ceq "sealedSourceSlice") `
+    "Anchors built by the production changed-file index must resolve a cross-file manifestation hunk; the nested @() form would leave only the anchor hunk and split the verifiers."
 $crossPassText = Get-VerificationFunctionText -Text $wrapperText `
     -Name "Invoke-ReviewerCrossVerificationPass"
 foreach ($policyUse in @(
