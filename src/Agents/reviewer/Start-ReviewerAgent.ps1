@@ -10207,7 +10207,13 @@ function Get-ReviewerVerificationSourceHunks {
                 $reqEnd = $SpanEnd
                 if (($reqEnd - $reqStart + 1) -gt $maxContextSpan) {
                     $half = [int]($maxContextSpan / 2)
-                    $reqStart = [Math]::Max($SpanStart, $AnchorLine - $half)
+                    # Center the bounded window on the anchor, but keep the full
+                    # $maxContextSpan span even when the anchor sits near a range
+                    # edge: clamp the start into [SpanStart, SpanEnd-span+1] first,
+                    # then derive the end from it. Both bounds stay inside the
+                    # sealed changed-right-hand range, so no unsealed line is added.
+                    $maxStart = $SpanEnd - $maxContextSpan + 1
+                    $reqStart = [Math]::Max($SpanStart, [Math]::Min($maxStart, $AnchorLine - $half))
                     $reqEnd = [Math]::Min($SpanEnd, $reqStart + $maxContextSpan - 1)
                 }
             }
@@ -10312,6 +10318,14 @@ function Get-ReviewerVerificationSourceHunks {
                 Add-ReviewerVerificationSourceHunk -CandidateId $candidateId `
                     -RawPath ([string]$candidate.filePath) -AnchorLine ([int]$candidate.line) -Role "anchor"
             }
+            # A convention candidate frequently spans files: the anchor sits in one
+            # changed file while the governing line (for example the subscriptionKey
+            # that mandates a "Global." prefix) is a changed line in a *different*
+            # file that the candidate names as a manifestation target. Collect the
+            # anchor plus every sealed changed-line manifestation target as context
+            # points so the enclosing sealed range of each (below) is delivered.
+            $contextPoints = [System.Collections.Generic.List[object]]::new()
+            $contextPoints.Add([pscustomobject]@{ path = [string]$candidate.filePath; line = [int]$candidate.line })
             $manifestationText = [string](Get-ReviewerVerificationValue $candidate "manifestations" "")
             if ($manifestationText -and
                 (Get-Command Resolve-ReviewerConventionSpecialistTargets -ErrorAction SilentlyContinue)) {
@@ -10322,25 +10336,29 @@ function Get-ReviewerVerificationSourceHunks {
                         if ([string]$target.kind -cne "changedLine") { continue }
                         Add-ReviewerVerificationSourceHunk -CandidateId $candidateId `
                             -RawPath ([string]$target.path) -AnchorLine ([int]$target.line) -Role "manifestation"
+                        $contextPoints.Add([pscustomobject]@{ path = [string]$target.path; line = [int]$target.line })
                     }
                 }
             }
             $isConvention = (([string](Get-ReviewerVerificationValue $candidate "originKind" "") -ceq "convention") -or
                 [bool](Get-ReviewerVerificationValue $candidate "conventionBound" $false))
             if ($isConvention -and @($ChangedFileAnchors).Count -gt 0) {
-                $candidateNormalizedPath = ConvertTo-ReviewerVerificationPath -Path ([string]$candidate.filePath)
-                foreach ($anchor in @($ChangedFileAnchors)) {
-                    $anchorNormalizedPath = ConvertTo-ReviewerVerificationPath -Path (
-                        [string](Get-ReviewerVerificationValue $anchor "path" ""))
-                    if (-not $anchorNormalizedPath -or $anchorNormalizedPath -cne $candidateNormalizedPath) { continue }
-                    foreach ($range in @(Get-ReviewerVerificationValue $anchor "rightHandRanges" @())) {
-                        $rangeStart = [int](Get-ReviewerVerificationValue $range "startLine" 0)
-                        $rangeEnd = [int](Get-ReviewerVerificationValue $range "endLine" 0)
-                        if ($rangeStart -lt 1 -or $rangeEnd -lt $rangeStart) { continue }
-                        if ([int]$candidate.line -lt $rangeStart -or [int]$candidate.line -gt $rangeEnd) { continue }
-                        Add-ReviewerVerificationSourceHunk -CandidateId $candidateId `
-                            -RawPath ([string]$candidate.filePath) -AnchorLine ([int]$candidate.line) `
-                            -Role "context" -SpanStart $rangeStart -SpanEnd $rangeEnd
+                foreach ($point in $contextPoints) {
+                    $pointNormalizedPath = ConvertTo-ReviewerVerificationPath -Path ([string]$point.path)
+                    if (-not $pointNormalizedPath) { continue }
+                    foreach ($anchor in @($ChangedFileAnchors)) {
+                        $anchorNormalizedPath = ConvertTo-ReviewerVerificationPath -Path (
+                            [string](Get-ReviewerVerificationValue $anchor "path" ""))
+                        if (-not $anchorNormalizedPath -or $anchorNormalizedPath -cne $pointNormalizedPath) { continue }
+                        foreach ($range in @(Get-ReviewerVerificationValue $anchor "rightHandRanges" @())) {
+                            $rangeStart = [int](Get-ReviewerVerificationValue $range "startLine" 0)
+                            $rangeEnd = [int](Get-ReviewerVerificationValue $range "endLine" 0)
+                            if ($rangeStart -lt 1 -or $rangeEnd -lt $rangeStart) { continue }
+                            if ([int]$point.line -lt $rangeStart -or [int]$point.line -gt $rangeEnd) { continue }
+                            Add-ReviewerVerificationSourceHunk -CandidateId $candidateId `
+                                -RawPath ([string]$point.path) -AnchorLine ([int]$point.line) `
+                                -Role "context" -SpanStart $rangeStart -SpanEnd $rangeEnd
+                        }
                     }
                 }
             }
