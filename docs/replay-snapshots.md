@@ -432,13 +432,26 @@ other identity checks pass. `LiveDeployment` additionally requires an attached
 failure diagnostics and is never interpreted as identity or dirty-status data.
 
 ```pwsh
+$pair = Get-AgentGeneralistModelPair
 ./src/Agents/reviewer/Start-ReviewerAgent.ps1 `
+    -RepoPath <the repository being reviewed> `
     -ConfigFile <config> -OperatorAlias <alias> -Once `
     -PullRequestId <the pull request the snapshot was captured for> `
-    -Model claude-opus-5 -SecondPassModel gpt-5.6-sol `
+    -Model $pair.First -SecondPassModel $pair.Second `
     -ReplayRoot <replay root> -ReplaySnapshotName <snapshot> `
     -ReplayManifestDigest <digest>
 ```
+
+The generalist pairing is **derived**, never typed out: `Get-AgentGeneralistModelPair`
+reads the harness's supported-model registry, which is the same derivation the
+agent's own startup validation uses. A wrapper that writes a model version down
+for itself goes stale the day the registry moves, and the failure lands at slot
+startup - after the run set has been declared.
+
+`-RepoPath` is likewise not optional in practice. Omitted, the agent resolves
+the reviewed repository by walking up from the config's own location for a
+`.git` directory; a qualification config normally lives outside any repository,
+so the run throws before a model is ever launched.
 
 All three replay parameters are required together. `-PullRequestId` is required
 and must match the snapshot's binding: the recorded pull-request list is a
@@ -447,6 +460,83 @@ would quietly make the run about a different pull request than the operator
 pinned. The snapshot's organization, project and repository must match the
 running configuration, or the run refuses rather than producing a
 self-consistent artifact stamped with the wrong identity.
+
+### Preflight the exact commands before declaring anything
+
+Both of the failures above are invocation defects, and both are only expensive
+because the run set is sealed *before* its runs exist. `tools/Invoke-ReviewerReplayQualification.ps1`
+closes that window: it builds the complete argument vector for every slot,
+validates everything the agent validates at startup - build identity, config
+(through the agent's own loader, prompt file included), models, snapshot load,
+digest, pull-request binding, promotability, output paths - and then runs that
+exact vector through the agent itself.
+
+The boundary is the agent's own. `Start-ReviewerAgent.ps1 -QualificationPrelaunch`
+is a strictly earlier exit on the normal startup path: every check the agent
+performs still runs, and the process stops immediately before it creates its
+state directory, which is the first thing it writes and is earlier than any
+session, any host call and any model launch. It reports what it resolved -
+`-RepoPath`, both generalist models, the specialist, the snapshot id and digest,
+the pull request, the planned state directory, the delivery authorization - and
+the preflight compares that report against the plan. It refuses to combine with
+`-DryRun`, `-ShowState`, `-ResetStarvedCandidates`, any capture switch, any
+promotion and any delivery or gate switch: it is an earlier stop, never a new
+capability.
+
+```pwsh
+# 1. Look. Creates no state and launches no model; the only file written is the
+#    report you ask for. Prints the exact command each slot will run.
+./tools/Invoke-ReviewerReplayQualification.ps1 -Mode Preflight `
+    -RepoPath <reviewed repo> -ConfigFile <config outside that repo> `
+    -OperatorAlias <alias> -PullRequestId <id> `
+    -ReplayRoot <replay root> -ReplaySnapshotName <snapshot> `
+    -ReplayManifestDigest <digest> -QualificationRoot <out> `
+    -ExpectedCommit <40-hex> -RequiredRef refs/heads/<accepted layer> `
+    -PreflightReportPath <out-of-repo>/preflight.json
+
+# 2. Declare, after the same preflight passes again.
+./tools/Invoke-ReviewerReplayQualification.ps1 -Mode Declare ... `
+    -RunSetKeyPath <state>/artifact-signing.key -Purpose "closure at <head>"
+
+# 3. Run one slot at a time, each in its own state directory. The key is
+#    required: the declaration is verified under it, and its plan digest must
+#    be this plan's, before the slot is allowed to run.
+./tools/Invoke-ReviewerReplayQualification.ps1 -Mode RunSlot -Slot slot1 ... `
+    -RunSetKeyPath <state>/artifact-signing.key
+./tools/Invoke-ReviewerReplayQualification.ps1 -Mode RunSlot -Slot slot2 ... `
+    -RunSetKeyPath <state>/artifact-signing.key
+```
+
+There is exactly one constructed argument vector per slot. The preflight and
+the child process consume the same array, so a passing preflight cannot be
+describing a different command than the one that runs. Every delivery,
+promotion, gate and capture switch is refused by construction and re-checked on
+the constructed command.
+
+The declaration is sealed under a canonical digest of the whole plan - every
+slot's exact argv, the normalized `-RepoPath`, the config and agent-script
+hashes, the toolkit build identity, the models and timeouts, and the snapshot.
+`-Mode RunSlot` therefore requires `-RunSetKeyPath`, verifies the declaration
+cryptographically through `tools/Compare-ReviewerReplayRuns.ps1 -VerifyRunSet`,
+and only then compares that plan digest. The same snapshot and the same run
+count but a different command is a different qualification, and is refused.
+
+A slot is attempted once. `-Mode RunSlot` refuses a slot whose state directory
+exists at all, and records the attempt as a read-only marker in run accounting -
+`runs/<slot>-attempt.json`, created exclusively - *before* the child process is
+started. A slot whose child fails to start has still spent its attempt and
+leaves no agent state, so a failed launch cannot be quietly retried until one of
+them happens to start. `-Mode Declare` refuses a root that already holds a
+declaration. The qualification root must be outside the toolkit worktree, the
+reviewed repository and the replay root - writing there would dirty the tree
+whose cleanliness the run's identity depends on.
+
+`tools/Test-ReviewerReplayQualification.ps1` proves all of this offline against
+the committed synthetic snapshot: that a slot which names a superseded Opus
+build or omits `-RepoPath` is refused before any declaration is written, that
+the prelaunch mode creates no state and refuses every forbidden combination,
+that a declaration sealed for another plan cannot be run against, and that a
+child which fails at startup consumes its slot's only attempt.
 
 Long-running qualification slots must be launched through an attached sync/async
 shell whose completion notification is owned by the active session, or through an
@@ -555,8 +645,23 @@ sealed first:
 ./tools/Compare-ReviewerReplayRuns.ps1 -DeclareRunSet `
     -SnapshotName pr12345 -SnapshotManifestDigest <digest> `
     -PlannedRunCount 4 -Purpose "calibration at head abc1234" `
+    -PlanDigest <64-hex digest of the exact plan> `
     -KeyPath <state>/artifact-signing.key -OutputDirectory <out>
 ```
+
+A sealed declaration can be read back, signature first, with
+`-VerifyRunSet -RunSetPath <declaration> -KeyPath <key>`; it prints the manifest
+only if the bytes verify under that key.
+
+Declaring by hand is only safe once the slot commands are known to start, and a
+declaration with no `-PlanDigest` cannot say which commands it authorized - the
+runner refuses it. `tools/Invoke-ReviewerReplayQualification.ps1 -Mode Declare`
+is the supported path: it re-runs the full preflight above, reaches this
+declaration only after every slot has reached the agent's model-launch boundary,
+and seals the digest of that exact plan. A set declared against an invocation
+that cannot start is spoiled, and the two times that has happened the cause was
+the invocation - a stale model version, and a missing `-RepoPath` - not the
+review.
 
 Then run the replays, and reconcile against the declaration:
 

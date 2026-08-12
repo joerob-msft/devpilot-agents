@@ -481,6 +481,15 @@ the CLI's own credentials rather than the replayed session - so a replay is a
 stated *lower bound* on a live run, not a reproduction of one. See
 [docs/replay-snapshots.md](docs/replay-snapshots.md).
 
+A qualification set is sealed before its runs exist, so an invocation that
+cannot start spoils the set. `tools/Invoke-ReviewerReplayQualification.ps1`
+builds the one argument vector each slot will run, validates every input the
+agent validates at startup, and runs that exact vector through the agent itself,
+which stops at its own model-launch boundary - all before anything is declared.
+The declaration is then sealed under a digest of the whole plan, argv included.
+Preflight creates no state and launches no model; the only file it writes is the
+report you ask for, so looking first costs nothing.
+
 ### Two passes, two models
 
 A single model's coverage of real defects is both incomplete and *idiosyncratic*
@@ -550,6 +559,18 @@ How it works, and why it is arranged this way:
 Both models must be named explicitly: pairing a chosen model against "whatever
 the CLI defaults to today" is not reproducible, and naming the same model twice
 is refused outright — it doubles the cost to miss the same things twice.
+
+The pairing the agent currently accepts is *derived*, not written down: it comes
+from `Get-AgentGeneralistModelPair`, which reads the harness's supported-model
+registry, and the same derivation drives startup validation, CI and the
+qualification wrapper. The model ids in the examples above are illustrative —
+ask the module which pair is current rather than copying a version out of a
+document:
+
+```powershell
+Import-Module ./src/DevPilot.AgentHarness/DevPilot.AgentHarness.psd1
+(Get-AgentGeneralistModelPair).Models
+```
 
 ---
 

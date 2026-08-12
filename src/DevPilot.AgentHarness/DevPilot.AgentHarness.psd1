@@ -76,7 +76,8 @@ FunctionsToExport = 'Get-DevPilotAgentPath', 'Resolve-AgentRepositoryRoot', 'Get
                'Send-AgentTeamsChannelMessage', 'Send-AgentTeamsDirectMessage', 
                'Resolve-AgentTeamsUserChatId', 'New-AgentTeamsMessageHtml', 
                'Get-AgentRequiredProperty', 'Get-AgentDefaultModelSentinel', 
-               'Assert-AgentSupportedModel', 'Test-ParserValidity', 
+               'Assert-AgentSupportedModel', 'Get-AgentGeneralistModelPair',
+               'Test-AgentGeneralistModelPair', 'Test-ParserValidity',
                'Get-OnceFinalExitCode', 'Test-StrictJsonInt', 'New-AgentNonce', 
                'Test-AgentValidatedParamRebind', 
                'Test-AgentProtectedBranch', 'Get-AgentConfigProperty', 
@@ -167,4 +168,3 @@ PrivateData = @{
 # DefaultCommandPrefix = ''
 
 }
-

@@ -339,7 +339,21 @@ param(
 
     # Capture a passing source-transport artifact and stop before authoritative
     # source reads or model launches. Requires the capture path above.
-    [switch]$CaptureSourceTransportOnly
+    [switch]$CaptureSourceTransportOnly,
+
+    # --- Qualification prelaunch. Runs THIS script's own startup validation -
+    # config, prompt closure, models, permissions, replay snapshot load and
+    # binding, repository and state-directory resolution - against the exact
+    # argument vector a qualification slot will run, then stops at the last
+    # instruction before any state directory is created, and prints what it
+    # resolved. It grants nothing: it is a strictly earlier exit on the normal
+    # path, so a command that survives it is the command that would have run.
+    #
+    # It exists because a qualification run set is sealed BEFORE its runs, and
+    # a set declared against an invocation that cannot start is spoiled. A
+    # wrapper that only re-checked its own copy of this script's parameter
+    # metadata would still miss everything decided by the body below.
+    [switch]$QualificationPrelaunch
 )
 
 $ErrorActionPreference = "Stop"
@@ -446,6 +460,13 @@ if (-not $importedHarness) {
         "or run this script from a checkout of the devpilot-agents repository.")
 }
 $HarnessPath = $importedHarness.Path
+# The independent generalist pairing is DERIVED from the harness's
+# supported-model registry, never spelled out here. Startup validation, the
+# sealed-decision re-verification below, and every out-of-repo qualification
+# wrapper read the SAME derivation, so retiring a model moves all of them at
+# once instead of leaving one of them asking for a version this script has
+# already stopped accepting.
+$script:ReviewerGeneralistModelPair = Get-AgentGeneralistModelPair
 $ConventionPackLibrary = Join-Path $PSScriptRoot "ConventionPacks.ps1"
 if (-not (Test-Path -LiteralPath $ConventionPackLibrary)) {
     throw "Convention-pack library '$ConventionPackLibrary' does not exist."
@@ -2525,6 +2546,36 @@ foreach ($a in @($AuthorAliases)) {
     if ($a -notmatch '^[A-Za-z0-9._-]+$') { throw "-AuthorAliases entry '$a' is not a safe alias." }
 }
 
+# ---------------------------------------------------------------------------
+# Qualification prelaunch. A strictly earlier exit on the normal path: every
+# validation below still runs, and the process stops immediately before the
+# first state directory is created. It is refused in combination with anything
+# that delivers, promotes, captures, mutates state, or diverts into the
+# self-check fixtures, because a prelaunch that could do any of those would be
+# a new capability rather than an earlier stop.
+# ---------------------------------------------------------------------------
+if ($QualificationPrelaunch) {
+    $prelaunchRefusedSwitches = @(
+        @{ Name = "-DryRun"; Set = [bool]$DryRun },
+        @{ Name = "-ShowState"; Set = [bool]$ShowState },
+        @{ Name = "-ResetStarvedCandidates"; Set = [bool]$ResetStarvedCandidates },
+        @{ Name = "-CaptureSourceTransportOnly"; Set = [bool]$CaptureSourceTransportOnly },
+        @{ Name = "-CaptureSourceTransportArtifactPath"; Set = [bool]$CaptureSourceTransportArtifactPath },
+        @{ Name = "-EnableFindingComments"; Set = [bool]$EnableFindingComments },
+        @{ Name = "-EnableSummaryComment"; Set = [bool]$EnableSummaryComment },
+        @{ Name = "-EnableApprovalVote"; Set = [bool]$EnableApprovalVote },
+        @{ Name = "-EnableVerifiedCommentGate"; Set = [bool]$EnableVerifiedCommentGate },
+        @{ Name = "-EnableVerifiedSuggestionGate"; Set = [bool]$EnableVerifiedSuggestionGate },
+        @{ Name = "-EnableVerifiedApprovalGate"; Set = [bool]$EnableVerifiedApprovalGate },
+        @{ Name = "-PromotePreview"; Set = [bool]$PromotePreview },
+        @{ Name = "-PromoteVerifiedPreview"; Set = [bool]$PromoteVerifiedPreview }
+    )
+    $prelaunchRefused = @($prelaunchRefusedSwitches | Where-Object { $_.Set } | ForEach-Object { [string]$_.Name })
+    if ($prelaunchRefused.Count -gt 0) {
+        throw ("-QualificationPrelaunch validates an invocation and exits before any state exists; it cannot be " +
+            "combined with $($prelaunchRefused -join ', ').")
+    }
+}
 # A vote with no visible reasoning is an unexplained verdict on someone else's
 # work. Refuse the combination at startup rather than discovering it per-PR.
 if ($EnableApprovalVote -and -not $EnableFindingComments) {
@@ -2765,10 +2816,10 @@ if ($EffectiveEnableVerificationPreview) {
     if (-not $IsTwoPass) {
         throw "Verification preview requires two explicitly named independent generalist passes."
     }
-    if (@($ReviewPassModels | Where-Object {
-                $_ -ceq "claude-opus-5" -or $_ -ceq "gpt-5.6-sol"
-            }).Count -ne 2) {
-        throw "Verification preview requires the explicit claude-opus-5 and gpt-5.6-sol generalist pairing."
+    if (-not (Test-AgentGeneralistModelPair -Models @($ReviewPassModels))) {
+        throw ("Verification preview requires the explicit " +
+            "$($script:ReviewerGeneralistModelPair.First) and " +
+            "$($script:ReviewerGeneralistModelPair.Second) generalist pairing.")
     }
     if (-not $EnableConventionSpecialist) {
         throw "Verification preview requires -EnableConventionSpecialist so all layer-5 inputs are present."
@@ -2826,6 +2877,46 @@ if ($script:ReviewerReplayActive) {
     # gate decisions, and drop preview artifacts a later live run reads back -
     # external mutation by another name, and reached without any write switch.
     $StateDir = Join-Path (Join-Path $StateDir "replay") $script:ReviewerReplaySnapshot.SnapshotId
+}
+# THE model-launch boundary for qualification. Everything above is this agent's
+# real startup validation, run against the exact argument vector the slot will
+# run; the next statement is the first one that creates anything. Stopping here
+# means a preflight that passes has proven the invocation starts, without a
+# state directory, a signing key, a session, a host call or a model.
+if ($QualificationPrelaunch) {
+    $prelaunch = [ordered]@{
+        seam                 = "reviewer.qualification-prelaunch.v1"
+        agentScriptSha256    = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        configFile           = $ConfigFile
+        configSha256         = (Get-FileHash -LiteralPath $ConfigFile -Algorithm SHA256).Hash.ToLowerInvariant()
+        promptFile           = $PromptFile
+        repoPath             = $RepoPath
+        # Resolved, deliberately NOT created: the caller is told exactly where
+        # this run would have written, and nothing is written.
+        plannedStateDir      = $StateDir
+        stateDirExists       = [bool](Test-Path -LiteralPath $StateDir)
+        operatorAlias        = $OperatorAlias
+        pullRequestId        = $PullRequestId
+        organization         = $Organization
+        project              = $ExpectedProject
+        repositoryId         = $cfgRepoId
+        model                = $EffectiveModel
+        secondPassModel      = $EffectiveSecondPassModel
+        isTwoPass            = [bool]$IsTwoPass
+        conventionSpecialist = [bool]$EnableConventionSpecialist
+        conventionSpecialistModel = $EffectiveConventionSpecialistModel
+        verificationPreview  = [bool]$EffectiveEnableVerificationPreview
+        conventionVerifierModel = $EffectiveConventionVerifierModel
+        deliveryAuthorization = [string]$DeliveryAuthorization.Kind
+        deliveryAuthorizationReason = [string]$DeliveryAuthorization.Reason
+        replayActive         = [bool]$script:ReviewerReplayActive
+        replaySnapshotId     = $(if ($script:ReviewerReplayActive) { [string]$script:ReviewerReplaySnapshot.SnapshotId } else { "" })
+        replayManifestDigest = $(if ($script:ReviewerReplayActive) { [string]$script:ReviewerReplaySnapshot.ManifestDigest } else { "" })
+        replayNonPromotable  = $(if ($script:ReviewerReplayActive) { [bool]$script:ReviewerReplayClassification.NonPromotable } else { $false })
+    }
+    Write-Output ("REVIEWER_QUALIFICATION_PRELAUNCH_V1 " +
+        (ConvertTo-Json -InputObject ([pscustomobject]$prelaunch) -Depth 6 -Compress))
+    exit 0
 }
 New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
 $StateDir = (Resolve-Path -LiteralPath $StateDir).Path
@@ -7245,7 +7336,7 @@ function Invoke-DryRunSelfChecks {
             runOk = $true; runReasonCodes = @(); allWithheldReasonsSafe = $true
             verificationInputSha256 = ("1" * 64); verificationDecisionSha256 = ("2" * 64)
             passesRequested = 2; generalistPairComplete = $true
-            generalistPassModels = ((@("claude-opus-5", "gpt-5.6-sol") | Sort-Object) -join '|')
+            generalistPassModels = $script:ReviewerGeneralistModelPair.SortedKey
             decisionExpiresAtUtc = ([DateTime]::UtcNow.AddHours(1).ToString("o"))
             candidates = @($candidate); unattendedComments = @($candidate); unattendedSuggestions = @()
             humanPromotableComments = @($candidate)
@@ -7329,7 +7420,7 @@ function Invoke-DryRunSelfChecks {
         @{ Name = "verification decision sha missing"; Args = @{ DecisionOverrides = @{ verificationDecisionSha256 = ("0" * 64) } }; Reason = "verificationDecisionShaMissing" }
         @{ Name = "sealed pass count below two"; Args = @{ DecisionOverrides = @{ passesRequested = 1 } }; Reason = "sealedPassCountBelowTwo" }
         @{ Name = "generalist pair incomplete"; Args = @{ DecisionOverrides = @{ generalistPairComplete = $false } }; Reason = "generalistPassIncomplete" }
-        @{ Name = "generalist model pair mismatch"; Args = @{ DecisionOverrides = @{ generalistPassModels = "claude-opus-5" } }; Reason = "generalistPairMismatch" }
+        @{ Name = "generalist model pair mismatch"; Args = @{ DecisionOverrides = @{ generalistPassModels = $script:ReviewerGeneralistModelPair.First } }; Reason = "generalistPairMismatch" }
         @{ Name = "revalidation failed"; Args = @{ RevalidationOk = $false }; Reason = "revalidationFailed" }
         @{ Name = "PR not active"; Args = @{ PrIsActive = $false }; Reason = "prNotActive" }
         @{ Name = "PR is draft"; Args = @{ PrIsDraft = $true }; Reason = "prIsDraft" }
@@ -7860,8 +7951,8 @@ function Invoke-DryRunSelfChecks {
     $sc47NullPassAccounting = Get-ReviewerGateGeneralistPassAccounting -InputManifest $sc47NullPassManifest
     $sc47DegradedManifest = [pscustomobject]@{
         rawGeneralistPasses = @(
-            [pscustomobject]@{ status = "degraded"; model = "claude-opus-5"; markerJson = "" },
-            [pscustomobject]@{ status = "degraded"; model = "gpt-5.6-sol"; markerJson = "" }
+            [pscustomobject]@{ status = "degraded"; model = $script:ReviewerGeneralistModelPair.First; markerJson = "" },
+            [pscustomobject]@{ status = "degraded"; model = $script:ReviewerGeneralistModelPair.Second; markerJson = "" }
         )
     }
     $sc47DegradedAccounting = Get-ReviewerGateGeneralistPassAccounting -InputManifest $sc47DegradedManifest
@@ -11322,7 +11413,7 @@ function Get-ReviewerGateGeneralistPassAccounting {
     $completedModels = @($completed | ForEach-Object {
             [string](Get-ReviewerHashValue -Container $_ -Key 'model' -Default '')
         } | Where-Object { $_ } | Sort-Object)
-    $expectedModels = @("claude-opus-5", "gpt-5.6-sol") | Sort-Object
+    $expectedModels = @($script:ReviewerGeneralistModelPair.Models) | Sort-Object
     return @{
         Passes          = $passes
         Completed       = $completed
@@ -11423,7 +11514,7 @@ function New-ReviewerVerifiedMultiPassAuthorization {
     # gateComments/gateApproval (including replay, which uses gateComments)
     # keep the EXISTING live-process requirement unchanged: those purposes
     # only ever run within the SAME cycle that just produced the passes.
-    $expectedGeneralistPair = (@("claude-opus-5", "gpt-5.6-sol") | Sort-Object) -join '|'
+    $expectedGeneralistPair = $script:ReviewerGeneralistModelPair.SortedKey
     $structurallyPossible = if ($Purpose -ceq "gatePromotion") {
         ([int](Get-ReviewerHashValue -Container $decision -Key 'passesRequested' -Default 0) -eq 2) -and
         ([bool](Get-ReviewerHashValue -Container $decision -Key 'generalistPairComplete' -Default $false)) -and
@@ -11432,7 +11523,7 @@ function New-ReviewerVerifiedMultiPassAuthorization {
     }
     else {
         [bool]$IsTwoPass -and [bool]$EffectiveEnableVerificationPreview -and [bool]$EnableConventionSpecialist -and
-        (@($ReviewPassModels | Where-Object { $_ -ceq "claude-opus-5" -or $_ -ceq "gpt-5.6-sol" }).Count -eq 2)
+        (Test-AgentGeneralistModelPair -Models @($ReviewPassModels))
     }
 
     $targetBranchName = $TargetRefName -replace '^refs/heads/', ''
@@ -11492,7 +11583,8 @@ function New-ReviewerVerifiedMultiPassAuthorization {
         $script:ReviewerVerifiedMultiPassSeal,
         [ReviewerDeliveryAuthorizationKind]::VerifiedMultiPass,
         2,
-        "independent claude-opus-5/gpt-5.6-sol two-pass union, cross-verified and gate-sealed for '$Purpose'",
+        ("independent $($script:ReviewerGeneralistModelPair.First)/$($script:ReviewerGeneralistModelPair.Second) " +
+            "two-pass union, cross-verified and gate-sealed for '$Purpose'"),
         $PrId,
         $ExpectedSourceCommit,
         $coverageDigest

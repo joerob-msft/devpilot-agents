@@ -32,6 +32,15 @@ $ErrorActionPreference = "Stop"
 # takes exactly one separate following argv entry. "auto" is intentionally
 # excluded: agents want reproducible behavior, and "auto" is non-deterministic.
 # Update ONLY this array when Copilot CLI adds/retires a model.
+#
+# ORDERING IS PART OF THE CONTRACT: within each family the entries are listed
+# NEWEST FIRST. Get-AgentGeneralistModelPair derives the current independent
+# generalist pairing from that order, so retiring a model or adding its
+# successor here is the ONE edit that moves every consumer - the reviewer's
+# startup validation, its sealed-decision re-verification, and the offline
+# qualification wrapper - at the same time. Nothing downstream may name a
+# version of its own; that is precisely how a wrapper ends up asking for a
+# model the agent no longer accepts.
 # ---------------------------------------------------------------------------
 $script:AgentHarnessSupportedModels = @(
     "claude-sonnet-5",
@@ -57,12 +66,88 @@ $script:AgentHarnessSupportedModels = @(
 )
 $script:AgentHarnessDefaultModelSentinel = "copilot-cli-default"
 
+# The two families an independent generalist cross-check is drawn from, and
+# what disqualifies a member of each. Small/specialized variants are excluded
+# by name-shape rather than by listing survivors, so a new "-mini" or "-codex"
+# entry cannot quietly become a generalist by being added to the registry.
+$script:AgentHarnessGeneralistFamilies = @(
+    [ordered]@{ Family = "claude-opus"; Include = '^claude-opus-'; Exclude = '(?:-mini|-codex|-flash|-haiku)' },
+    [ordered]@{ Family = "gpt"; Include = '^gpt-'; Exclude = '(?:-mini|-codex|-flash)' }
+)
+
 function Get-AgentSupportedModels {
     return , @($script:AgentHarnessSupportedModels)
 }
 
 function Get-AgentDefaultModelSentinel {
     return $script:AgentHarnessDefaultModelSentinel
+}
+
+function Get-AgentGeneralistModelPair {
+    <#
+        THE single source of truth for "which two models is an independent
+        two-pass generalist review made of".
+
+        Derived from the supported-model registry above rather than declared
+        separately, because a second declaration is a second thing to forget:
+        the defect this closes is a qualification wrapper that named
+        claude-opus-4.8 while the agent's startup validation required
+        claude-opus-5, so every slot died before a model was ever launched.
+        With the pair derived, a registry edit moves the agent and every
+        wrapper together and a stale version cannot be written down anywhere.
+
+        Returns the ordered pair (first pass, second pass) plus the sorted
+        '|'-joined key the reviewer seals into a decision as
+        `generalistPassModels`, so callers never re-derive that string either.
+    #>
+    param([string[]]$SupportedModels)
+
+    $allowed = if ($SupportedModels -and @($SupportedModels).Count -gt 0) {
+        @($SupportedModels)
+    }
+    else { @($script:AgentHarnessSupportedModels) }
+
+    $selected = @(foreach ($family in $script:AgentHarnessGeneralistFamilies) {
+            $candidate = @($allowed | Where-Object {
+                    $_ -cmatch $family.Include -and $_ -cnotmatch $family.Exclude
+                }) | Select-Object -First 1
+            if (-not $candidate) {
+                throw ("The supported-model registry carries no '$($family.Family)' generalist. An independent " +
+                    "two-pass review needs one model from each family; add the current one to " +
+                    "`$script:AgentHarnessSupportedModels, newest first.")
+            }
+            [string]$candidate
+        })
+    if ($selected.Count -ne 2 -or $selected[0] -ceq $selected[1]) {
+        throw "The derived generalist pairing is not two distinct models: $($selected -join ', ')."
+    }
+    foreach ($model in $selected) {
+        [void](Assert-AgentSupportedModel -ModelId $model -SupportedModels $allowed -Where "derived generalist pairing")
+    }
+    return [ordered]@{
+        First  = $selected[0]
+        Second = $selected[1]
+        Models = [string[]]@($selected)
+        # Sorted, '|'-joined - the exact shape sealed into a gate decision's
+        # generalistPassModels and re-verified on promotion.
+        SortedKey = (@($selected) | Sort-Object) -join '|'
+    }
+}
+
+function Test-AgentGeneralistModelPair {
+    <#
+        True only when the supplied models are exactly the derived pairing -
+        both members, no third model, no repeat. Case-sensitive, because a
+        model id is an exact argv token.
+    #>
+    param(
+        [AllowNull()][AllowEmptyCollection()][string[]]$Models,
+        [string[]]$SupportedModels
+    )
+    $pair = Get-AgentGeneralistModelPair -SupportedModels $SupportedModels
+    $supplied = @(@($Models) | Where-Object { $_ })
+    if ($supplied.Count -ne 2) { return $false }
+    return ((@($supplied) | Sort-Object) -join '|') -ceq $pair.SortedKey
 }
 
 function Assert-AgentSupportedModel {
@@ -4212,6 +4297,8 @@ Export-ModuleMember -Function @(
     "Get-AgentRequiredProperty",
     "Get-AgentDefaultModelSentinel",
     "Assert-AgentSupportedModel",
+    "Get-AgentGeneralistModelPair",
+    "Test-AgentGeneralistModelPair",
     "Test-ParserValidity",
     "Get-OnceFinalExitCode",
     "Test-StrictJsonInt",

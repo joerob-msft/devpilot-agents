@@ -239,8 +239,12 @@ function Get-TestEvidenceHunks {
         })
 }
 
-$opus = "claude-opus-5"
-$sol = "gpt-5.6-sol"
+# The pairing under test is the derived one, never a version written down here:
+# a fixture that names its own Opus build is how a suite keeps passing against a
+# pairing the agent has already stopped accepting.
+$generalistPair = Get-AgentGeneralistModelPair
+$opus = $generalistPair.First
+$sol = $generalistPair.Second
 $sourceCommit = "1" * 40
 $targetCommit = "2" * 40
 $changeSetDigest = "3" * 64
@@ -2464,8 +2468,9 @@ Assert-Verification ($verificationPrompt -match 'You do not discover findings' -
     "Verifier prompt no longer forbids discovery, majority voting, or finding expansion."
 Assert-Verification ($wrapperText -match 'verification-inputs' -and
     $wrapperText -match 'verification-previews' -and
-    $wrapperText -match 'claude-opus-5 and gpt-5\.6-sol generalist pairing') `
-    "Wrapper startup no longer requires explicit preview directories and verifier pairing."
+    $wrapperText -match 'Test-AgentGeneralistModelPair -Models @\(\$ReviewPassModels\)' -and
+    $wrapperText -match 'ReviewerGeneralistModelPair') `
+    "Wrapper startup no longer requires explicit preview directories and the derived generalist pairing."
 Assert-Verification ($wrapperText -match 'maxVerifierRuns' -and
     $wrapperText -match 'maxVerificationSeconds' -and
     $wrapperText -match '\$_.originModel\s+-cne\s+\$verifierModel') `
