@@ -556,7 +556,15 @@ $script:ReviewerMarkerRetryAttempts = 2
 # 64 KB turned out to be a cap on thinking out loud rather than on payload. The
 # marker itself stays bounded by its schema, and overflow is retried once
 # rather than costing the pass.
-$script:ReviewerConventionSpecialistMaxOutputBytes = 262144
+#
+# Sized so the LEGAL MAXIMUM marker this schema can produce still fits: eight
+# candidates, every string field at its MaxLength, worst-case UTF-8 (a non-ASCII
+# string field can reach three bytes per character) comes to ~453 KB. A cap
+# below that would let a wholly legitimate, maximal review overflow and retry
+# forever instead of ever being accepted, so the cap sits above the schema's
+# own ceiling rather than below it. The pre-launch contract gate
+# (Assert-ReviewerModelResultContractFits) proves this relationship at startup.
+$script:ReviewerConventionSpecialistMaxOutputBytes = 524288
 # The specialist gets a larger retry budget than a generalist pass because it
 # emits a much larger hand-built marker: a row per transported rule, each naming
 # the constructs it checked, plus the candidate array. Observed failures are all
@@ -565,6 +573,50 @@ $script:ReviewerConventionSpecialistMaxOutputBytes = 262144
 # attempt is an independent request, so a third one is worth more than it costs.
 # None of the real failures became retryable.
 $script:ReviewerConventionSpecialistMarkerRetryAttempts = 3
+
+# ---------------------------------------------------------------------------
+# Per-surface result-contract scan/capture bounds. Each model surface that
+# emits a result marker (the generalist pass, the convention specialist, and
+# the cross-verifier) declares ONE explicit scan window (characters the
+# extractor will scan for the closing brace) and ONE hard output byte cap. A
+# marker whose largest legal serialization does not fit BOTH bounds could never
+# be captured on a real review, so Assert-ReviewerModelResultContractFits proves
+# the fit before any Invoke-TimedProcess launch and the same window is handed to
+# the typed extractor. The windows are sized above each surface schema's
+# measured worst case (see Measure-AgentMarkerSchemaWorstCaseChars /
+# ...WorstCaseBytes) with headroom, so a production surface never refuses to
+# launch; the gate only fires if a schema is widened past its declared window.
+#
+# The generalist marker window/cap must cover the LARGEST legal generalist
+# schema, which is MaxFindings = 25 (the -MaxFindings CLI ceiling), not the
+# default 12. At 25 findings the schema's measured worst case is 84990 chars /
+# 126490 UTF-8 bytes (the byte figure already assumes the worst-case multi-byte
+# encoding of every free-text field), so a 65536-char window would have refused
+# every legal MaxFindings >= 20 - silently clamping a legal option. These bounds
+# sit above that worst case with headroom and remain hard, finite caps.
+$script:ReviewerMarkerScanWindowChars = 131072
+$script:ReviewerMarkerMaxOutputBytes = 196608
+$script:ReviewerConventionSpecialistScanWindowChars = 327680
+$script:ReviewerVerificationScanWindowChars = 65536
+$script:ReviewerVerificationMaxOutputBytes = 131072
+
+# The MERGED marker is the largest marker this agent ever re-parses. It is not a
+# model's answer but the wrapper's own re-serialization of a completed multi-pass
+# review, and it can legally carry one full generalist cap PER PASS: up to the
+# -MaxFindings CLI ceiling of 25 times the two-pass maximum, i.e. 50 findings.
+# Its measured worst case is 166724 chars / 248224 UTF-8 bytes (the byte figure
+# already assumes the worst-case multi-byte encoding of every free-text field),
+# far past the single-pass generalist window. Seal-time re-validation and
+# promotion-time re-validation both size their scan window from THIS contract and
+# assert the actual merged schema fits it before parsing, so a legal maximal
+# two-pass review is never silently truncated below its own bound and then sealed
+# into an artifact that could never be promoted. Hard, finite caps above that
+# worst case with headroom; the fit gate fires only if the schema is widened past
+# this window. $script:ReviewerMergedMarkerMaxFindingItems is the ABSOLUTE legal
+# ceiling (25 * 2); a live cycle's runtime $MergedMarkerMaxFindingItems is <= it.
+$script:ReviewerMergedMarkerMaxFindingItems = 50
+$script:ReviewerMergedMarkerScanWindowChars = 262144
+$script:ReviewerMergedMarkerMaxOutputBytes = 393216
 
 # ---------------------------------------------------------------------------
 # CODE-DEFINED security policy (never config-supplied; a forked config file
@@ -1344,6 +1396,35 @@ function Get-ReviewerMarkerSchema {
             nonce                = @{ Type = 'exact'; Expected = $ExpectedNonce }
         }
     }
+}
+
+function Assert-ReviewerModelResultContractFits {
+    <#
+        A hard pre-launch gate. Before any model that emits a result marker is
+        launched, the largest legal marker its schema can produce must fit BOTH
+        the character scan window the extractor will use AND the surface's hard
+        UTF-8 output byte cap. A schema that cannot fit has a legal, correct
+        answer the wrapper could never capture, so this refuses to launch rather
+        than discover the loss on a real review. The declared window is returned
+        so the caller hands the SAME window to the typed extractor - one
+        contract, measured once, enforced at both ends.
+
+        Throws a precise, non-retryable contract error naming the surface and
+        the bound exceeded. This is a code/schema defect, never a model slip, so
+        it is deliberately fatal rather than a retryable pass failure.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Surface,
+        [Parameter(Mandatory)][hashtable]$Schema,
+        [Parameter(Mandatory)][int]$ScanWindowChars,
+        [Parameter(Mandatory)][int]$MaxOutputBytes
+    )
+    $fit = Test-AgentMarkerSchemaFitsLaunchContract -Schema $Schema `
+        -ScanWindowChars $ScanWindowChars -MaxOutputBytes $MaxOutputBytes
+    if (-not $fit.Fits) {
+        throw "The $Surface result-marker contract cannot fit its declared bounds and must not launch: $($fit.Reason)."
+    }
+    return $ScanWindowChars
 }
 
 function Test-ReviewerMarkerBinding {
@@ -5667,7 +5748,8 @@ function Invoke-DryRunSelfChecks {
     }
     $rtParsed = ConvertFrom-AgentResultMarker -StdOutText ("$ResultMarkerPrefix " + (ConvertTo-Json -InputObject $rtMerged -Depth 8 -Compress)) `
         -MarkerPrefix $ResultMarkerPrefix `
-        -Schema (Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $rtNonce -MaxFindingItems $MergedMarkerMaxFindingItems)
+        -Schema (Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $rtNonce -MaxFindingItems $MergedMarkerMaxFindingItems) `
+        -ScanWindowChars $script:ReviewerMergedMarkerScanWindowChars
     if (-not $rtParsed) {
         $failures.Add("A merged marker built the way a live cycle builds it does not survive the marker schema, so every merged review would seal an artifact that can never be promoted.")
     }
@@ -9023,15 +9105,33 @@ function Invoke-ReviewerConventionSpecialistPass {
             $cliOutcome = $null
             $markerSource = ""
             $boundedRawRequestedTools = @()
-            # The specialist emits by hand the largest marker this agent
-            # produces: a candidate array and a row for every transported rule,
-            # each naming the constructs it checked. A model that restates that
-            # marker in its closing summary and paraphrases one sentence while
-            # doing so has emitted two markers that disagree, and the harness
-            # correctly refuses to guess which one is the answer. That is a
-            # formatting slip on top of work that was done, and it is worth
-            # exactly one more attempt - the same allowance the generalist
-            # passes already get, for the same reason.
+            # Typed marker status for the most recent attempt and the retry gate.
+            # A parse that yields a schema/shape slip is retryable with a fresh
+            # nonce; a wrong binding (the schema's own project/nonce exact fields
+            # mismatched) is terminal and never retried.
+            $specialistMarkerStatus = $null
+            # One accounting record per ACTUAL specialist attempt: its number, the
+            # SHA-256 of the nonce it was launched with (never the raw nonce), the
+            # typed rejection, whether the model ran, and the exact usage this
+            # attempt reported (null when the CLI did not). Cumulative session
+            # totals (totalNanoAiu/totalPremiumRequests) are recorded per attempt,
+            # never summed across the separate sessions a retry creates.
+            $emitSpecialistAcct = {
+                param([int]$Attempt, [string]$AttemptNonce, [string]$RejectionClass, [bool]$ModelRan, $Usage)
+                Write-ReviewerCycleMetadata -Fields @{
+                    cycle = $CycleNumber; mode = "specialist-attempt-accounting"; prId = $PrId
+                    sourceCommit = $SourceCommit; model = [string]$EffectiveConventionSpecialistModel
+                    attempt = $Attempt
+                    nonceSha256 = (Get-ReviewerTextSha256 -Text $AttemptNonce)
+                    rejectionClass = $RejectionClass
+                    modelRan = $ModelRan
+                    premiumRequests = $(if ($Usage) { $Usage.PremiumRequests } else { $null })
+                    totalNanoAiu = $(if ($Usage) { $Usage.TotalNanoAiu } else { $null })
+                    totalApiDurationMs = $(if ($Usage) { $Usage.TotalApiDurationMs } else { $null })
+                    sessionDurationMs = $(if ($Usage) { $Usage.SessionDurationMs } else { $null })
+                    totalPremiumRequests = $(if ($Usage) { $Usage.TotalPremiumRequests } else { $null })
+                }
+            }
             for ($specialistAttempt = 1; $specialistAttempt -le $script:ReviewerConventionSpecialistMarkerRetryAttempts; $specialistAttempt++) {
                 # A fresh nonce and a rebuilt input per attempt, so the second
                 # attempt is a new request rather than a second chance to answer
@@ -9067,12 +9167,47 @@ function Invoke-ReviewerConventionSpecialistPass {
                     -AvailableTools $availableTools -AllowTools $allowTools -DenyTools $denyTools `
                     -Model $EffectiveConventionSpecialistModel -JsonOutput
                 Write-Host "Launching convention specialist ($EffectiveConventionSpecialistModel, discovery only, timeout=${ConventionSpecialistTimeoutSeconds}s)..." -ForegroundColor Cyan
+                # Pre-launch result-contract gate. The specialist emits the
+                # largest marker this agent produces; its largest legal
+                # serialization must fit BOTH the declared scan window and the
+                # hard output byte cap before the process is launched, so a
+                # complete, correct discovery pass can never be silently lost to
+                # a too-small window or cap. The same window is handed to the
+                # typed extractor below.
+                $specialistSchema = Get-ReviewerConventionSpecialistMarkerSchema `
+                    -ExpectedProject $ExpectedProject -ExpectedNonce $nonce
+                try {
+                    $specialistScanWindow = Assert-ReviewerModelResultContractFits -Surface "convention specialist" `
+                        -Schema $specialistSchema -ScanWindowChars $script:ReviewerConventionSpecialistScanWindowChars `
+                        -MaxOutputBytes $script:ReviewerConventionSpecialistMaxOutputBytes
+                }
+                catch {
+                    # A contract-fit refusal happens BEFORE any launch, so it is
+                    # deliberately NOT an attempt-accounting record (no model ran).
+                    # It is surfaced under its own launch-refusal metadata so the
+                    # refusal stays visible and is never mistaken for a failed run.
+                    Write-ReviewerCycleMetadata -Fields @{
+                        cycle = $CycleNumber; mode = "specialist-launch-refused"; prId = $PrId
+                        sourceCommit = $SourceCommit; model = [string]$EffectiveConventionSpecialistModel
+                        attempt = $specialistAttempt; reason = "contractFit"; detail = [string]$_.Exception.Message
+                    }
+                    throw
+                }
                 $run = Invoke-TimedProcess -FilePath $AgencyPath -ArgumentList $agencyArgs `
                     -StandardInputContent $specialistInput.Text -CaptureStdOut -CaptureStdErr -WorkingDirectory $RepoPath `
                     -EnvironmentVariablesToRemove $CopilotSensitiveEnvironmentVariables `
                     -TimeoutSeconds $ConventionSpecialistTimeoutSeconds
                 $cliOutcome = Get-AgentCliJsonOutcome -StdOutText ([string]$run.StdOut)
+                $specialistUsage = if ($cliOutcome -and $cliOutcome.Usage) { $cliOutcome.Usage } else { $null }
+                $specialistModelRan = [bool]($cliOutcome -and $cliOutcome.ModelActuallyRan)
                 $markerSource = [string]$run.StdOut
+                # Deferred terminal classification. A LAUNCHED attempt that fails
+                # on the process (timeout/exit/model identity) or the tool grant
+                # is classified here rather than thrown immediately, so its single
+                # accounting record is emitted BEFORE the terminal throw below and
+                # no launched attempt is ever invisible to accounting.
+                $specialistTerminalClass = $null
+                $specialistTerminalThrow = $null
                 $boundedRawRequestedTools = @()
                 # Reset the audit at the top of every attempt. Carrying a failed
                 # attempt's requested tools into a clean one would either report
@@ -9093,17 +9228,25 @@ function Invoke-ReviewerConventionSpecialistPass {
                         })
                     $toolAudit.modifiedFiles = @($cliOutcome.ModifiedFiles)
                     if ($cliOutcome.Model -and [string]$cliOutcome.Model -cne $EffectiveConventionSpecialistModel) {
-                        throw "Copilot reported specialist model '$($cliOutcome.Model)' instead of '$EffectiveConventionSpecialistModel'."
+                        $specialistTerminalClass = 'modelMismatch'
+                        $specialistTerminalThrow = "Copilot reported specialist model '$($cliOutcome.Model)' instead of '$EffectiveConventionSpecialistModel'."
                     }
                 }
                 # A timeout or a nonzero exit is a real failure and is never
-                # retried: a second identical attempt would not fix it.
-                $processFailure = Get-ReviewerConventionSpecialistFailureReason -TimedOut ([bool]$run.TimedOut) `
-                    -ExitCode ([int]$run.ExitCode) -MarkerValid $true `
-                    -TimeoutSeconds $ConventionSpecialistTimeoutSeconds
-                if ($processFailure) { throw $processFailure }
-                if (@($toolAudit.modifiedFiles).Count -gt 0) {
-                    throw "Convention specialist reported modified files despite its read-only grant."
+                # retried: a second identical attempt would not fix it. Classified
+                # (timeout vs processFailure) rather than thrown immediately.
+                if (-not $specialistTerminalClass) {
+                    $processFailure = Get-ReviewerConventionSpecialistFailureReason -TimedOut ([bool]$run.TimedOut) `
+                        -ExitCode ([int]$run.ExitCode) -MarkerValid $true `
+                        -TimeoutSeconds $ConventionSpecialistTimeoutSeconds
+                    if ($processFailure) {
+                        $specialistTerminalClass = if ([bool]$run.TimedOut) { 'timeout' } else { 'processFailure' }
+                        $specialistTerminalThrow = $processFailure
+                    }
+                }
+                if (-not $specialistTerminalClass -and @($toolAudit.modifiedFiles).Count -gt 0) {
+                    $specialistTerminalClass = 'toolViolation'
+                    $specialistTerminalThrow = "Convention specialist reported modified files despite its read-only grant."
                 }
                 $forbiddenRequestedTools = @($boundedRawRequestedTools | Where-Object {
                         $rawName = [string]$_
@@ -9113,8 +9256,16 @@ function Invoke-ReviewerConventionSpecialistPass {
                             }).Count -gt 0 -or
                         $rawName -match '(?i)(^|[_(-])(write|edit|create|task|shell|web)([_)-]|$)'
                     })
-                if ($forbiddenRequestedTools.Count -gt 0) {
-                    throw "Convention specialist requested forbidden tool(s): $($forbiddenRequestedTools -join ', ')."
+                if (-not $specialistTerminalClass -and $forbiddenRequestedTools.Count -gt 0) {
+                    $specialistTerminalClass = 'toolViolation'
+                    $specialistTerminalThrow = "Convention specialist requested forbidden tool(s): $($forbiddenRequestedTools -join ', ')."
+                }
+                # Exactly one accounting record for this launched attempt, emitted
+                # BEFORE the terminal throw, with the precise typed process/tool
+                # class and this attempt's usage (null when the CLI reported none).
+                if ($specialistTerminalClass) {
+                    & $emitSpecialistAcct $specialistAttempt $nonce $specialistTerminalClass $specialistModelRan $specialistUsage
+                    throw $specialistTerminalThrow
                 }
                 $toolAudit.unrecognizedTools = @($boundedRawRequestedTools | Where-Object {
                         -not (ConvertTo-ReviewerConventionSpecialistToolIdentity -Name ([string]$_))
@@ -9131,6 +9282,8 @@ function Invoke-ReviewerConventionSpecialistPass {
                     # the model talked too much on the way. That is the same
                     # class of slip as an unusable marker, so it gets the same
                     # one retry rather than costing the pass outright.
+                    $specialistMarkerStatus = 'overflow'
+                    & $emitSpecialistAcct $specialistAttempt $nonce 'overflow' $specialistModelRan $specialistUsage
                     if ($specialistAttempt -ge $script:ReviewerConventionSpecialistMarkerRetryAttempts) {
                         throw "Convention specialist output exceeded the $($script:ReviewerConventionSpecialistMaxOutputBytes)-byte cap."
                     }
@@ -9143,17 +9296,35 @@ function Invoke-ReviewerConventionSpecialistPass {
                     $marker = $null
                     continue
                 }
-                $marker = ConvertFrom-AgentResultMarker -StdOutText $markerSource `
+                # Typed extraction so a schema/shape slip (retryable, fresh nonce)
+                # is told apart from a wrong binding (the schema's own exact
+                # project/nonce fields mismatched - terminal, never retried) and
+                # from a clean success. The same window the pre-launch gate
+                # validated is used, so launch bound and capture bound are one.
+                $markerOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText $markerSource `
                     -MarkerPrefix $script:ReviewerConventionSpecialistMarkerPrefix `
-                    -Schema (Get-ReviewerConventionSpecialistMarkerSchema `
-                        -ExpectedProject $ExpectedProject -ExpectedNonce $nonce)
+                    -Schema $specialistSchema -ScanWindowChars $specialistScanWindow
+                $specialistMarkerStatus = [string]$markerOutcome.Status
+                $marker = if ($specialistMarkerStatus -ceq 'success') { $markerOutcome.Value } else { $null }
+                & $emitSpecialistAcct $specialistAttempt $nonce $specialistMarkerStatus $specialistModelRan $specialistUsage
+                # A successful parse is terminal for the marker loop: a PR16769813
+                # specialist marker that parses cleanly and only later fails a
+                # SEMANTIC remediation check must NOT be re-launched - that is not
+                # a marker-emission slip, and retrying it would burn a full,
+                # independent specialist run for nothing.
                 if ($null -ne $marker) { break }
                 if ($specialistAttempt -ge $script:ReviewerConventionSpecialistMarkerRetryAttempts) { break }
-                Write-Warning ("PR {0}'s convention specialist produced an unusable result marker (attempt {1} of {2}); retrying in a fresh session." -f `
-                        $PrId, $specialistAttempt, $script:ReviewerConventionSpecialistMarkerRetryAttempts)
+                # Retry ONLY a typed-retryable emission slip. A wrong binding is
+                # terminal (a fresh attempt cannot un-mismatch the schema's exact
+                # fields, and retrying one is exactly how a replay would be handed
+                # extra tries).
+                if (-not (Test-AgentMarkerStatusRetryable -Status $specialistMarkerStatus)) { break }
+                Write-Warning ("PR {0}'s convention specialist produced an unusable result marker (attempt {1} of {2}, {3}); retrying in a fresh session." -f `
+                        $PrId, $specialistAttempt, $script:ReviewerConventionSpecialistMarkerRetryAttempts, $specialistMarkerStatus)
                 Write-ReviewerCycleMetadata -Fields @{
                     cycle = $CycleNumber; mode = "convention-specialist-marker-retry"; prId = $PrId
                     sourceCommit = $SourceCommit; model = [string]$EffectiveConventionSpecialistModel
+                    rejectionClass = $specialistMarkerStatus
                 }
             }
             $markerFailure = Get-ReviewerConventionSpecialistFailureReason -TimedOut $false -ExitCode 0 `
@@ -9524,6 +9695,17 @@ function Invoke-ReviewerVerificationModelRun {
     Write-Host ("Launching cross-verifier {0} for {1} ({2} candidate(s), timeout={3}s)..." -f `
             $VerifierModel, [string]$Cluster.clusterId, @($AssignedCandidates).Count,
             $TimeoutSeconds) -ForegroundColor Cyan
+    # Pre-launch result-contract gate. The verifier's verdict array is sized to
+    # exactly the candidates assigned to this cluster, so its largest legal
+    # marker must fit both the declared scan window and the hard output byte cap
+    # for THIS assignment before the process is launched. The same schema and
+    # window are reused by the extractor below.
+    $verificationSchema = Get-ReviewerVerificationMarkerSchema -ExpectedProject $ExpectedProject `
+        -ExpectedNonce $nonce -ExpectedVerifierModel $VerifierModel `
+        -MaxVerdicts @($AssignedCandidates).Count
+    $verificationScanWindow = Assert-ReviewerModelResultContractFits -Surface "cross-verifier ($VerifierModel)" `
+        -Schema $verificationSchema -ScanWindowChars $script:ReviewerVerificationScanWindowChars `
+        -MaxOutputBytes $script:ReviewerVerificationMaxOutputBytes
     $run = Invoke-TimedProcess -FilePath $AgencyPath -ArgumentList $agencyArgs `
         -StandardInputContent $modelInput.text -CaptureStdOut -CaptureStdErr -WorkingDirectory $RepoPath `
         -EnvironmentVariablesToRemove $CopilotSensitiveEnvironmentVariables `
@@ -9594,20 +9776,44 @@ function Invoke-ReviewerVerificationModelRun {
         }
     }
     $marker = $null
+    $markerStatus = $null
+    $markerField = $null
     if (-not $failureReason) {
-        if ($script:ReviewerUtf8.GetByteCount($markerSource) -gt 65536) {
-            $failureReason = "invalidMarker"
-            $failureDetail = "Verifier output exceeded the 65536-byte cap."
+        if ($script:ReviewerUtf8.GetByteCount($markerSource) -gt $script:ReviewerVerificationMaxOutputBytes) {
+            # Output-cap overflow is the typed 'overflow' class, not a generic
+            # invalid marker: the verdict work may be sound and only the model's
+            # surrounding prose too long. There is no verifier retry loop, so this
+            # is terminal, but it is recorded under its precise class.
+            $failureReason = "overflow"
+            $failureDetail = "Verifier output exceeded the $($script:ReviewerVerificationMaxOutputBytes)-byte cap."
         }
         else {
-            $marker = ConvertFrom-AgentResultMarker -StdOutText $markerSource `
+            # Typed extraction so an extraction failure is recorded under its
+            # precise class (missingMarker / malformedMarker / truncated /
+            # nonObject / schemaInvalid / wrongBinding / ambiguousMarker) rather
+            # than a generic invalidMarker. The SAME prevalidated window and
+            # schema the pre-launch gate proved are reused here, so the launch
+            # bound and the capture bound are one.
+            $markerOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText $markerSource `
                 -MarkerPrefix $script:ReviewerVerificationMarkerPrefix `
-                -Schema (Get-ReviewerVerificationMarkerSchema -ExpectedProject $ExpectedProject `
-                    -ExpectedNonce $nonce -ExpectedVerifierModel $VerifierModel `
-                    -MaxVerdicts @($AssignedCandidates).Count)
-            if (-not $marker) {
-                $failureReason = "invalidMarker"
-                $failureDetail = "Verifier produced a missing or invalid result marker."
+                -Schema $verificationSchema -ScanWindowChars $verificationScanWindow
+            $markerStatus = [string]$markerOutcome.Status
+            $markerField = [string]$markerOutcome.Field
+            if ($markerStatus -ceq 'success') {
+                $marker = $markerOutcome.Value
+            }
+            else {
+                # A schema exact-field mismatch (project/nonce/verifierModel) is
+                # the typed wrongBinding; every other non-success status is its
+                # own typed emission class. None is retried - there is no verifier
+                # retry loop - but the run record carries the precise reason.
+                $failureReason = $markerStatus
+                $failureDetail = if ($markerField) {
+                    "Verifier result marker rejected: $markerStatus (field '$markerField')."
+                }
+                else {
+                    "Verifier result marker rejected: $markerStatus."
+                }
             }
         }
     }
@@ -9618,6 +9824,10 @@ function Invoke-ReviewerVerificationModelRun {
             -VerificationInputSha256 $InputManifestSha256 -ClusterId ([string]$Cluster.clusterId) `
             -ConfigSha256 ([string]$Binding.configSha256) -ScriptSha256 ([string]$Binding.scriptSha256) `
             -PromptSha256 ([string]$Binding.promptSha256) -VerifierModel $VerifierModel)) {
+        # The caller binding covers the sealed fields the schema does not exact-
+        # match (candidate/source/input/cluster/commit binding); a marker that
+        # parsed cleanly but points at the wrong sealed work is a stale binding -
+        # terminal, never retried.
         $marker = $null
         $failureReason = "staleBinding"
         $failureDetail = "Verifier result marker binding is stale."
@@ -9626,8 +9836,13 @@ function Invoke-ReviewerVerificationModelRun {
         $expectedIds = @($AssignedCandidates | ForEach-Object { [string]$_.candidateId } | Sort-Object)
         $actualIds = @($marker.verdicts | ForEach-Object { [string]$_.candidateId } | Sort-Object)
         if (($expectedIds -join "|") -cne ($actualIds -join "|")) {
+            # A clean, correctly bound marker whose verdict SET does not match the
+            # assigned candidates is a semantic rejection after successful
+            # extraction, not a marker-emission slip. It is terminal (non-
+            # retryable) and recorded under its own precise class rather than a
+            # generic invalidMarker.
             $marker = $null
-            $failureReason = "invalidMarker"
+            $failureReason = "verdictSetMismatch"
             $failureDetail = "Verifier verdict set did not exactly match its assigned candidates."
         }
     }
@@ -9852,8 +10067,29 @@ function Invoke-ReviewerCrossVerificationPass {
     $specialistCandidates = @((Get-ReviewerVerificationValue $SpecialistResult "Candidates" @()))
     $specialistManifest = Get-ReviewerVerificationValue $SpecialistResult "Manifest"
     $specialistArtifactPath = [string](Get-ReviewerVerificationValue $SpecialistResult "ArtifactPath" "")
-    if ($specialistStatus -cne "complete" -or $null -eq $specialistManifest) {
-        throw "Cross-verification requires a completed specialist blind pass with a sealed manifest."
+    # A degraded specialist no longer aborts the whole cross-verification. The
+    # blind generalist candidate union is constructed and sealed on its own, so
+    # a generalist finding that needs no specialist-only convention evidence
+    # still gets its full fresh GPT + fresh Opus cross-check. Only convention-
+    # ORIGIN candidates - the ones a degraded specialist can no longer stand
+    # behind - are withheld, candidate by candidate, by the replay's
+    # SpecialistDegraded handling downstream (reason "specialistDegraded"). The
+    # complete-blind-generalist requirement above still holds; only the
+    # specialist's completeness is now allowed to be partial.
+    $specialistDegraded = ($specialistStatus -cne "complete" -or $null -eq $specialistManifest)
+    if ($specialistDegraded) {
+        Write-Warning ("PR $prId convention specialist degraded; cross-verifying the blind generalist union alone. " +
+            "Convention-only candidates are withheld candidate-by-candidate.")
+        Write-ReviewerCycleMetadata -Fields @{
+            cycle = $CycleNumber; mode = "verification-specialist-degraded"; prId = $prId
+            sourceCommit = $sourceCommit; specialistStatus = $specialistStatus
+        }
+        # A degraded specialist's own discovery is untrusted: the union carries
+        # only the blind generalist findings, and the sealed manifest records
+        # the specialist as degraded so replay withholds convention candidates.
+        $specialistCandidates = @()
+        $specialistManifest = $null
+        $specialistStatus = "degraded"
     }
     $specialistArtifactSha = if ($specialistArtifactPath -and
         (Test-Path -LiteralPath $specialistArtifactPath -PathType Leaf)) {
@@ -9913,6 +10149,33 @@ function Invoke-ReviewerCrossVerificationPass {
         -Candidates @($candidatePlan.candidates) -FactPlan $factPlan
     $candidates = @($factPartition.candidates)
     $preVerificationWithheld = @($candidatePlan.withheld) + @($factPartition.withheld)
+    if ($specialistDegraded -and @($candidates).Count -gt 0) {
+        # A degraded specialist can no longer supply convention evidence, so
+        # every candidate that DEPENDS on that evidence - a convention-origin
+        # finding, or a generalist finding bound to a convention rule - is
+        # withheld candidate by candidate, before clustering and before any
+        # launch. Functional generalist findings that need no convention-only
+        # evidence are kept untouched and receive their full fresh GPT + fresh
+        # Opus cross-check. The total candidate count is preserved (kept +
+        # withheld), so the sealed artifact still reconciles on replay.
+        $degradedKept = [System.Collections.Generic.List[object]]::new()
+        foreach ($candidate in @($candidates)) {
+            $isConventionOrigin = ([string](Get-ReviewerVerificationValue $candidate "originKind" "") -ceq "convention")
+            $isConventionBound = [bool](Get-ReviewerVerificationValue $candidate "conventionBound" $false)
+            if ($isConventionOrigin -or $isConventionBound) {
+                $preVerificationWithheld += [pscustomobject][ordered]@{
+                    candidateId = [string](Get-ReviewerVerificationValue $candidate "candidateId" "")
+                    clusterId   = ""
+                    reason      = "specialistDegraded"
+                    detail      = "The convention specialist was degraded, so this candidate's required convention evidence is unavailable."
+                }
+            }
+            else {
+                [void]$degradedKept.Add($candidate)
+            }
+        }
+        $candidates = @($degradedKept.ToArray())
+    }
     do {
         $clusters = @(Get-ReviewerVerificationClusters -Candidates $candidates `
             -MaxCandidates ([int]$EffectiveCrossVerificationPolicy.maxCandidates) `
@@ -10061,25 +10324,36 @@ function Invoke-ReviewerCrossVerificationPass {
     $orderedGroupKeys = [System.Collections.Generic.List[string]]::new()
     foreach ($groupKey in $groups.Keys) { [void]$orderedGroupKeys.Add([string]$groupKey) }
     $orderedGroupKeys.Sort([StringComparer]::Ordinal)
-    $verifierRunsLaunched = 0
-    foreach ($key in $orderedGroupKeys) {
-        $groupAssignments = @($groups[$key])
-        $clusterId = [string]$groupAssignments[0].clusterId
-        $verifierModel = [string]$groupAssignments[0].verifierModel
-        $budget = Get-ReviewerVerificationRunBudget -RunsLaunched $verifierRunsLaunched `
-            -MaxRuns ([int]$EffectiveCrossVerificationPolicy.maxVerifierRuns) `
-            -ElapsedSeconds $verificationPhaseStopwatch.Elapsed.TotalSeconds `
-            -MaxPhaseSeconds ([int]$EffectiveCrossVerificationPolicy.maxVerificationSeconds) `
-            -ConfiguredRunTimeoutSeconds $EffectiveVerificationTimeoutSeconds
-        if (-not [bool]$budget.canRun) {
-            foreach ($assignment in $groupAssignments) {
+    # Deterministic 2N preflight: prove the WHOLE required verifier run set fits
+    # the declared run and time budget BEFORE launching a single model. Either
+    # every required run can launch or none does - no partial launch that would
+    # cross-check some candidates and silently degrade the rest when the phase
+    # clock expires mid-loop.
+    $budgetPreflight = Assert-ReviewerVerificationBudgetPreflight `
+        -RequiredRunCount $orderedGroupKeys.Count `
+        -MaxVerifierRuns ([int]$EffectiveCrossVerificationPolicy.maxVerifierRuns) `
+        -MaxPhaseSeconds ([int]$EffectiveCrossVerificationPolicy.maxVerificationSeconds) `
+        -ConfiguredRunTimeoutSeconds $EffectiveVerificationTimeoutSeconds `
+        -ElapsedSeconds $verificationPhaseStopwatch.Elapsed.TotalSeconds
+    if (-not [bool]$budgetPreflight.canLaunch) {
+        Write-ReviewerCycleMetadata -Fields @{
+            cycle = $CycleNumber; mode = "verification-budget-preflight"; prId = $prId
+            sourceCommit = $sourceCommit; result = "degraded"; reason = [string]$budgetPreflight.reason
+            requiredRunCount = [int]$budgetPreflight.requiredRunCount
+            effectiveMaxRuns = [int]$budgetPreflight.effectiveMaxRuns
+            requiredSeconds = [int]$budgetPreflight.requiredSeconds
+            remainingSeconds = [int]$budgetPreflight.remainingSeconds
+        }
+        # No launch: mark every planned assignment degraded up front.
+        foreach ($key in $orderedGroupKeys) {
+            foreach ($assignment in @($groups[$key])) {
                 [void]$runRecords.Add([pscustomobject][ordered]@{
                         assignmentId = [string]$assignment.assignmentId
                         status = "degraded"
-                        reason = [string]$budget.reason
-                        detail = "Verification aggregate run/time budget was exhausted before this assignment."
-                        model = $verifierModel
-                        clusterId = $clusterId
+                        reason = [string]$budgetPreflight.reason
+                        detail = "Verification budget preflight refused to launch: the full required run set does not fit the declared run/time budget."
+                        model = [string]$assignment.verifierModel
+                        clusterId = [string]$assignment.clusterId
                         nonceSha256 = "0" * 64
                         promptSha256 = $CrossVerificationPromptSha256
                         inputBytes = 0
@@ -10090,8 +10364,20 @@ function Invoke-ReviewerCrossVerificationPass {
                         marker = $null
                     })
             }
-            continue
         }
+        $orderedGroupKeys = [System.Collections.Generic.List[string]]::new()
+    }
+    foreach ($key in $orderedGroupKeys) {
+        $groupAssignments = @($groups[$key])
+        $clusterId = [string]$groupAssignments[0].clusterId
+        $verifierModel = [string]$groupAssignments[0].verifierModel
+        # No mid-loop budget re-check. The deterministic preflight above already
+        # proved the WHOLE admitted set fits the run and time budget by reserving
+        # the full configured per-run timeout for every planned run, so every
+        # admitted group launches with that configured timeout. Re-checking the
+        # phase clock here is exactly what re-opened the partial-launch window:
+        # a run that consumed most of its timeout could starve a later planned
+        # group even though the preflight had already reserved room for it.
         $cluster = @($clusters | Where-Object { [string]$_.clusterId -ceq $clusterId })[0]
         $candidateIds = @($groupAssignments | ForEach-Object { [string]$_.candidateId })
         $assignedCandidates = @($cluster.members | Where-Object {
@@ -10141,8 +10427,7 @@ function Invoke-ReviewerCrossVerificationPass {
             -AssignedCandidates $assignedCandidates -SiblingEvidence $siblingEvidence `
             -EvidenceHunks $assignedHunks -CandidateEvidence $assignedEvidence `
             -DeterministicFacts $relevantFacts -ThreadFacts $relevantThreads `
-            -TimeoutSeconds ([int]$budget.timeoutSeconds)
-        $verifierRunsLaunched++
+            -TimeoutSeconds $EffectiveVerificationTimeoutSeconds
         foreach ($assignment in $groupAssignments) {
             [void]$runRecords.Add([pscustomobject][ordered]@{
                     assignmentId = [string]$assignment.assignmentId
@@ -10180,6 +10465,10 @@ function Invoke-ReviewerCrossVerificationPass {
     else {
         "degraded"
     }
+    # A degraded specialist means convention coverage was incomplete even when
+    # every generalist verifier run completed, so the pass is reported degraded
+    # (its eligible generalist findings are still exposed - see the union above).
+    if ($specialistDegraded) { $status = "degraded" }
     $reconciliationManifest = $null
     if ($specialistManifest) {
         $reconciliationManifest = Copy-ReviewerVerificationJsonValue -Value $specialistManifest
@@ -10505,8 +10794,12 @@ function Invoke-ReviewerModelPass {
         follows would quietly erase exactly the disagreement the second pass was
         added to surface.
 
-        Returns @{ Model; Marker; Reason; EnvironmentFault } - Marker is $null
-        when this pass produced nothing usable.
+        Returns @{ Model; Marker; Reason; EnvironmentFault; RejectionClass; Nonce;
+        ModelRan; Usage } - Marker is $null when this pass produced nothing
+        usable. RejectionClass is the typed terminal reason ('success', a marker
+        status like 'schemaInvalid'/'wrongBinding', or 'timeout'/'processFailure'/
+        'environment'/'oversize'); Usage is the CLI's exact accounting (null
+        fields when unavailable).
     #>
     param(
         [Parameter(Mandatory)][string]$AgencyPath,
@@ -10550,7 +10843,8 @@ function Invoke-ReviewerModelPass {
         # it. Counting it retires the pull request after the configured
         # threshold, visibly, which is the honest outcome for a condition that
         # cannot improve on its own.
-        return @{ Model = $PassModel; Marker = $null; Reason = $oversizeReason; EnvironmentFault = $false }
+        return @{ Model = $PassModel; Marker = $null; Reason = $oversizeReason; EnvironmentFault = $false
+            RejectionClass = 'oversize'; Nonce = $nonce; ModelRan = $false; Usage = $null }
     }
 
     # -- Launch the model -----------------------------------------------------
@@ -10567,6 +10861,17 @@ function Invoke-ReviewerModelPass {
     $label = if ($PassCount -gt 1) { "pass $PassNumber of $PassCount, $PassModel, read-only" } else { "read-only" }
     Write-Host "Launching Copilot ($label, timeout=${CycleTimeoutSeconds}s)..." -ForegroundColor Cyan
 
+    # Pre-launch result-contract gate. The generalist marker schema, at this
+    # pass's own MaxFindingItems, must have a largest legal serialization that
+    # fits both the declared scan window and the hard output byte cap BEFORE the
+    # process is launched - otherwise a complete, correct review could be emitted
+    # and silently lost. The same window this gate validated is handed to the
+    # typed extractor below, so the launch bound and the capture bound are one.
+    $markerSchema = Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $nonce -MaxFindingItems $EffectiveMaxFindings
+    $scanWindow = Assert-ReviewerModelResultContractFits -Surface "generalist pass ($PassModel)" `
+        -Schema $markerSchema -ScanWindowChars $script:ReviewerMarkerScanWindowChars `
+        -MaxOutputBytes $script:ReviewerMarkerMaxOutputBytes
+
     $run = Invoke-TimedProcess -FilePath $AgencyPath -ArgumentList $agencyArgs -StandardInputContent $stdin `
         -CaptureStdOut -CaptureStdErr -WorkingDirectory $RepoPath `
         -EnvironmentVariablesToRemove $CopilotSensitiveEnvironmentVariables -TimeoutSeconds $CycleTimeoutSeconds
@@ -10574,6 +10879,7 @@ function Invoke-ReviewerModelPass {
     # -- Marker validation (hostile input) ------------------------------------
     $markerSource = [string]$run.StdOut
     $cliOutcome = Get-AgentCliJsonOutcome -StdOutText ([string]$run.StdOut)
+    $usage = $null
     if ($cliOutcome -and $cliOutcome.Answer) {
         $markerSource = [string]$cliOutcome.Answer
         if ($cliOutcome.Model) { Write-Host "Model reported by CLI: $($cliOutcome.Model)" -ForegroundColor DarkGray }
@@ -10583,25 +10889,69 @@ function Invoke-ReviewerModelPass {
             Write-Warning "The CLI reported $(@($cliOutcome.ModifiedFiles).Count) modified file(s) in a review that was granted no write tool: $((@($cliOutcome.ModifiedFiles) | Select-Object -First 5) -join ', ')"
         }
     }
+    # Exact per-attempt accounting, read from the CLI's own usage events. Every
+    # figure is null when the CLI did not report it, so a caller can tell an
+    # unavailable figure from a real zero.
+    if ($cliOutcome -and $cliOutcome.Usage) { $usage = $cliOutcome.Usage }
     $marker = $null
+    # Typed extraction so a caller can distinguish a missing marker from a
+    # schema-shape slip (retryable, fresh nonce) from a wrong-binding replay
+    # signal (never retried) - instead of collapsing every one to a generic
+    # "invalid marker". The status values are the parser's public literal
+    # strings: $script:AgentMarkerStatus lives in the harness MODULE scope and
+    # is not visible to this script, so comparing against it here would always
+    # be $null and reject every marker. Compare against the literals the typed
+    # API documents and returns.
+    $markerStatus = $null
+    $markerField = $null
     if ($run.ExitCode -eq 0 -and -not $run.TimedOut) {
-        $marker = ConvertFrom-AgentResultMarker -StdOutText $markerSource -MarkerPrefix $ResultMarkerPrefix `
-            -Schema (Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $nonce -MaxFindingItems $EffectiveMaxFindings)
+        $markerOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText $markerSource -MarkerPrefix $ResultMarkerPrefix `
+            -Schema $markerSchema `
+            -ScanWindowChars $scanWindow
+        $markerStatus = [string]$markerOutcome.Status
+        $markerField = [string]$markerOutcome.Field
+        if ($markerStatus -ceq 'success') { $marker = $markerOutcome.Value }
     }
     if ($marker -and -not (Test-ReviewerMarkerBinding -Marker $marker -PrId $prId -RepositoryId $cfgRepoId -SourceCommit $sourceCommit)) {
         Write-Warning "The result marker did not match the bound PR/repository/commit; discarding it."
         $marker = $null
         # A distinct reason so the pass-level retry can tell a formatting slip
-        # from a marker bound to the wrong work. The latter is never retried.
+        # from a marker bound to the wrong work. The extractor only enforces the
+        # schema's `exact` fields (project/nonce); this caller check is what
+        # binds the marker to THIS pull request/repository/source commit, and a
+        # marker that parsed cleanly but points at the wrong work is a wrong
+        # binding - terminal, never retried.
         $bindingRejected = $true
+        $markerStatus = 'wrongBinding'
+        $markerField = 'binding'
     }
     else { $bindingRejected = $false }
-    if ($marker) { return @{ Model = $PassModel; Marker = $marker; Reason = ""; EnvironmentFault = $false } }
+    if ($marker) {
+        return @{ Model = $PassModel; Marker = $marker; Reason = ""; EnvironmentFault = $false
+            RejectionClass = 'success'; Nonce = $nonce; ModelRan = [bool]($cliOutcome -and $cliOutcome.ModelActuallyRan); Usage = $usage }
+    }
 
+    # A precise, typed reason - never a generic "invalid marker". A schema-shape
+    # slip names the offending field (e.g. "schemaInvalid (field 'nonce')"),
+    # which is exactly the PR16769165 case where the marker omitted its nonce.
     $reason = if ($run.TimedOut) { "cycle timed out after ${CycleTimeoutSeconds}s" }
     elseif ($run.ExitCode -ne 0) { "copilot exited $($run.ExitCode)" }
     elseif ($bindingRejected) { "result marker bound to the wrong pull request" }
-    else { "missing or invalid result marker" }
+    elseif ($markerStatus) {
+        if ($markerField) { "result marker rejected: $markerStatus (field '$markerField')" }
+        else { "result marker rejected: $markerStatus" }
+    }
+    else { "missingMarker" }
+
+    # The typed rejection class the pass-level retry gates on. Marker-emission
+    # slips (missing/malformed/truncated/overflow/nonObject/schemaInvalid/
+    # ambiguous) are retryable with a fresh nonce; a wrong binding, a timeout, a
+    # nonzero exit and an environment fault are not.
+    $rejectionClass = if ($run.TimedOut) { 'timeout' }
+    elseif ($run.ExitCode -ne 0) { 'processFailure' }
+    elseif ($bindingRejected) { 'wrongBinding' }
+    elseif ($markerStatus) { $markerStatus }
+    else { 'missingMarker' }
 
     # A PR is not "unreviewable" because the host lost its credentials.
     # Launch signatures are read from STDERR ONLY, and only when the model
@@ -10611,7 +10961,7 @@ function Invoke-ReviewerModelPass {
     $modelActuallyRan = [bool]($cliOutcome -and $cliOutcome.ModelActuallyRan)
     $launchFailureReason = $null
     if (-not $modelActuallyRan) { $launchFailureReason = Get-AgentLaunchFailureReason -StdErrText ([string]$run.StdErr) }
-    if ($launchFailureReason) { $reason = "environment: $launchFailureReason" }
+    if ($launchFailureReason) { $reason = "environment: $launchFailureReason"; $rejectionClass = 'environment' }
     if ($PassCount -gt 1) { $reason = "pass $PassNumber ($PassModel): $reason" }
 
     # The transcript is the only way to diagnose a silent refusal, and it
@@ -10638,7 +10988,8 @@ function Invoke-ReviewerModelPass {
     }
     catch { Write-Warning "Could not write the failure transcript: $($_.Exception.Message)" }
 
-    return @{ Model = $PassModel; Marker = $null; Reason = $reason; EnvironmentFault = [bool]$launchFailureReason }
+    return @{ Model = $PassModel; Marker = $null; Reason = $reason; EnvironmentFault = [bool]$launchFailureReason
+        RejectionClass = $rejectionClass; Nonce = $nonce; ModelRan = $modelActuallyRan; Usage = $usage }
 }
 
 # ---------------------------------------------------------------------------
@@ -12187,24 +12538,96 @@ function Invoke-ReviewerPullRequest {
     foreach ($passModel in @($ReviewPassModels)) {
         $passNumber++
         $passResult = $null
+        # Exact per-attempt accounting. Two classes of usage figure need
+        # different treatment across a retry: a per-RUN figure (this session's
+        # own premium requests / API / session duration) is additive across
+        # attempts, but a CUMULATIVE checkpoint figure (totalNanoAiu,
+        # totalPremiumRequests) is a running session total, and each retry is a
+        # SEPARATE session, so summing them would double-count. The per-run
+        # figures are summed; the cumulative figures are recorded per attempt and
+        # only the terminal attempt's snapshot is carried to the aggregate. Every
+        # figure stays $null until the CLI reports one, so a genuinely
+        # unavailable figure is never reported as a real zero.
+        $acctAttempts = 0
+        $acctPremiumRequests = $null
+        $acctTotalApiDurationMs = $null
+        $acctSessionDurationMs = $null
+        $acctTermTotalNanoAiu = $null
+        $acctTermTotalPremiumRequests = $null
+        $addAcct = {
+            param($Current, $Value)
+            if ($null -eq $Value) { return $Current }
+            if ($null -eq $Current) { return [long]$Value }
+            return ([long]$Current + [long]$Value)
+        }
         for ($attempt = 1; $attempt -le $script:ReviewerMarkerRetryAttempts; $attempt++) {
             $passResult = Invoke-ReviewerModelPass -AgencyPath $AgencyPath -CycleNumber $CycleNumber `
                 -Bound $Bound -PassModel ([string]$passModel) -PassNumber $passNumber -PassCount $passCount
+            $acctAttempts++
+            $u = $passResult.Usage
+            if ($u) {
+                $acctPremiumRequests = (& $addAcct $acctPremiumRequests $u.PremiumRequests)
+                $acctTotalApiDurationMs = (& $addAcct $acctTotalApiDurationMs $u.TotalApiDurationMs)
+                $acctSessionDurationMs = (& $addAcct $acctSessionDurationMs $u.SessionDurationMs)
+                if ($null -ne $u.TotalNanoAiu) { $acctTermTotalNanoAiu = [long]$u.TotalNanoAiu }
+                if ($null -ne $u.TotalPremiumRequests) { $acctTermTotalPremiumRequests = [long]$u.TotalPremiumRequests }
+            }
+            # One accounting record per ACTUAL attempt: its number, the SHA-256 of
+            # the nonce it was launched with (never the raw nonce), the typed
+            # rejection, whether the model ran, and the exact usage this attempt
+            # reported (null when the CLI did not). This preserves each attempt's
+            # figures instead of collapsing them into a single aggregate that
+            # loses every nonce, rejection and per-run usage.
+            Write-ReviewerCycleMetadata -Fields @{
+                cycle = $CycleNumber; mode = "model-attempt-accounting"; prId = $prId; sourceCommit = $sourceCommit
+                pass = $passNumber; model = [string]$passModel
+                attempt = $attempt
+                nonceSha256 = (Get-ReviewerTextSha256 -Text ([string]$passResult.Nonce))
+                rejectionClass = [string]$passResult.RejectionClass
+                modelRan = [bool]$passResult.ModelRan
+                premiumRequests = $(if ($u) { $u.PremiumRequests } else { $null })
+                totalNanoAiu = $(if ($u) { $u.TotalNanoAiu } else { $null })
+                totalApiDurationMs = $(if ($u) { $u.TotalApiDurationMs } else { $null })
+                sessionDurationMs = $(if ($u) { $u.SessionDurationMs } else { $null })
+                totalPremiumRequests = $(if ($u) { $u.TotalPremiumRequests } else { $null })
+            }
             if ($null -ne $passResult.Marker) { break }
-            # Retry only an unusable marker from an otherwise clean run, and
-            # only once. Anything else - a timeout, a nonzero exit, an
-            # environment fault, a marker bound to the wrong PR - is a real
-            # failure that a second identical attempt would not fix.
+            # Retry only a RETRYABLE result-emission slip from an otherwise
+            # clean run, and only within the configured attempt bound. A
+            # timeout, a nonzero exit, an environment fault, and - crucially -
+            # a marker echoing the WRONG binding (a replay signal) are never
+            # retried: a second identical attempt cannot fix them, and retrying
+            # a wrong binding is exactly how a replay would be handed extra
+            # tries. The typed RejectionClass alone decides retryability - a
+            # missing/malformed/truncated/overflow/schemaInvalid/nonObject/
+            # ambiguous emission slip is retryable; everything else is terminal.
             if ($attempt -ge $script:ReviewerMarkerRetryAttempts) { break }
-            if ([bool]$passResult.EnvironmentFault -or
-                ([string]$passResult.Reason) -notmatch 'missing or invalid result marker') {
+            $retryable = (Test-AgentMarkerStatusRetryable -Status ([string]$passResult.RejectionClass))
+            if ([bool]$passResult.EnvironmentFault -or -not $retryable) {
                 break
             }
             Write-Warning ("PR {0} pass {1} produced an unusable result marker; retrying once in a fresh session." -f $prId, $passNumber)
             Write-ReviewerCycleMetadata -Fields @{
                 cycle = $CycleNumber; mode = "marker-retry"; prId = $prId
                 sourceCommit = $sourceCommit; pass = $passNumber; model = [string]$passModel
+                rejectionClass = [string]$passResult.RejectionClass
             }
+        }
+        # A terminal aggregate over the pass: attempts made, the terminal typed
+        # reason, the summed per-run usage, and the terminal cumulative snapshot
+        # (labelled as such, since cumulative session totals are non-additive
+        # across the separate sessions a retry creates).
+        Write-ReviewerCycleMetadata -Fields @{
+            cycle = $CycleNumber; mode = "pass-accounting"; prId = $prId; sourceCommit = $sourceCommit
+            pass = $passNumber; model = [string]$passModel
+            attempts = $acctAttempts
+            succeeded = ($null -ne $passResult.Marker)
+            terminalRejectionClass = [string]$passResult.RejectionClass
+            premiumRequests = $acctPremiumRequests
+            totalApiDurationMs = $acctTotalApiDurationMs
+            sessionDurationMs = $acctSessionDurationMs
+            terminalTotalNanoAiu = $acctTermTotalNanoAiu
+            terminalTotalPremiumRequests = $acctTermTotalPremiumRequests
         }
         [void]$passResults.Add($passResult)
     }
@@ -12301,11 +12724,25 @@ function Invoke-ReviewerPullRequest {
     # unpromotable into a cycle that fails immediately, next to the code that
     # caused it. It re-parses through the real validator, not a re-implementation
     # of it, because only the real one can prove promotion will accept this.
+    #
+    # The merged schema carries up to one full generalist cap per pass, so its
+    # largest legal serialization is far bigger than a single pass's and MUST be
+    # scanned under the dedicated merged-marker window, not the harness default:
+    # a 50-finding merged marker is ~166 KB and would be silently truncated by
+    # the 65536-char fallback, sealing an artifact that could never be promoted.
+    # The pre-parse contract gate proves the actual merged schema fits that
+    # window (and the hard output byte cap) before parsing, and the SAME window
+    # is handed to the extractor - one contract, measured once, enforced at both
+    # ends. A schema too big to fit is a code defect, so it is fatal here.
+    $mergedSchema = Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject `
+        -ExpectedNonce ([string]$marker['nonce']) -MaxFindingItems $MergedMarkerMaxFindingItems
+    Assert-ReviewerModelResultContractFits -Surface "merged review" -Schema $mergedSchema `
+        -ScanWindowChars $script:ReviewerMergedMarkerScanWindowChars `
+        -MaxOutputBytes $script:ReviewerMergedMarkerMaxOutputBytes | Out-Null
     $mergedRoundTrip = ConvertFrom-AgentResultMarker `
         -StdOutText ("$ResultMarkerPrefix " + (ConvertTo-Json -InputObject $marker -Depth 8 -Compress)) `
-        -MarkerPrefix $ResultMarkerPrefix `
-        -Schema (Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject `
-            -ExpectedNonce ([string]$marker['nonce']) -MaxFindingItems $MergedMarkerMaxFindingItems)
+        -MarkerPrefix $ResultMarkerPrefix -Schema $mergedSchema `
+        -ScanWindowChars $script:ReviewerMergedMarkerScanWindowChars
     if (-not $mergedRoundTrip) {
         # Deterministic, so it will fail identically next cycle: count it as a
         # real (non-environment) failure. That bounds the retry loop, and
@@ -12743,6 +13180,15 @@ function Invoke-ReviewerPromotion {
     }
     $maxItems = [int](Get-ReviewerHashValue -Container $signed -Key 'maxFindingItems' -Default $EffectiveMaxFindings)
     if ($maxItems -lt 1) { $maxItems = $EffectiveMaxFindings }
+    # Defence in depth on top of the signature: the stored bound decides how large
+    # a marker the re-parse will admit, so it is held to the same absolute ceiling
+    # a live merge is - the -MaxFindings cap of 25 times the two-pass maximum. A
+    # value past that is impossible for an honest artifact and must never be
+    # allowed to widen the scan window, so it is refused rather than trusted.
+    if ($maxItems -gt $script:ReviewerMergedMarkerMaxFindingItems) {
+        throw ("The stored review declares a finding bound ($maxItems) above the legal maximum " +
+            "($($script:ReviewerMergedMarkerMaxFindingItems)); refusing to promote it.")
+    }
     # A review that was short a pass when it was sealed is still short a pass
     # now. The operator promoting it has read and approved the FINDINGS; that is
     # not the same as approving a verdict reached by fewer models than they
@@ -12755,9 +13201,26 @@ function Invoke-ReviewerPromotion {
         Write-Warning ("This review was produced by $sealedCompleted of $sealedRequested configured pass(es); " +
             "its findings will publish but no vote will be cast.")
     }
-    $marker = ConvertFrom-AgentResultMarker -StdOutText ("$ResultMarkerPrefix " + [string]$signed.markerBody) `
-        -MarkerPrefix $ResultMarkerPrefix `
-        -Schema (Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject -ExpectedNonce $storedNonce -MaxFindingItems $maxItems)
+    # The stored marker is re-parsed under the SAME merged contract the seal
+    # proved it against. Its largest legal serialization can be ~166 KB, so it is
+    # scanned under the dedicated merged-marker window, not the harness default
+    # that would silently truncate a maximal two-pass review and reject a review
+    # the operator legitimately approved. The hard byte cap bounds the input text
+    # independently of the schema, and the contract gate proves the schema (with
+    # the sealed bound) fits the window before parsing; the SAME window is handed
+    # to the extractor - one contract, enforced at both ends.
+    $storedMarkerBody = [string]$signed.markerBody
+    if ($script:ReviewerUtf8.GetByteCount($storedMarkerBody) -gt $script:ReviewerMergedMarkerMaxOutputBytes) {
+        throw ("The stored review marker exceeds the $($script:ReviewerMergedMarkerMaxOutputBytes)-byte cap; refusing to promote it.")
+    }
+    $promotionSchema = Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject `
+        -ExpectedNonce $storedNonce -MaxFindingItems $maxItems
+    Assert-ReviewerModelResultContractFits -Surface "stored review" -Schema $promotionSchema `
+        -ScanWindowChars $script:ReviewerMergedMarkerScanWindowChars `
+        -MaxOutputBytes $script:ReviewerMergedMarkerMaxOutputBytes | Out-Null
+    $marker = ConvertFrom-AgentResultMarker -StdOutText ("$ResultMarkerPrefix " + $storedMarkerBody) `
+        -MarkerPrefix $ResultMarkerPrefix -Schema $promotionSchema `
+        -ScanWindowChars $script:ReviewerMergedMarkerScanWindowChars
     if (-not $marker) { throw "The stored review did not survive re-validation; refusing to promote it." }
     if (-not (Test-ReviewerMarkerBinding -Marker $marker -PrId $prId -RepositoryId $cfgRepoId -SourceCommit $sourceCommit)) {
         throw "The stored review is not bound to PR $prId at commit $sourceCommit; refusing to promote it."

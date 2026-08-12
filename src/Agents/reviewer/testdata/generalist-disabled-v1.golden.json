@@ -129,12 +129,32 @@
       {
         "sha256": "6e451d1c86898c0c08fa0c59cb3dc795dcba2c2803bb8cf871ee2fe51d42f491",
         "reason": "Route the generalist tool grant through Get-ReviewerLaunchAllowTools so an offline snapshot replay narrows it to the code-defined offline set instead of leaving the model its own live repository tools, which would mix live facts into a replayed review."
+      },
+      {
+        "sha256": "47a9eb2a83bf2c6cbabe7c309508da917d238cede2b3d69f198b20ce0c1936b5",
+        "reason": "Layer A typed model-result extraction: classify the marker outcome through ConvertFrom-AgentResultMarkerOutcome and surface RejectionClass, Nonce, ModelRan and typed Usage accounting so a missing-nonce marker is schemaInvalid (retryable, fresh nonce) rather than a generic invalid marker, and a wrong-binding echo is refused without retry."
+      },
+      {
+        "sha256": "a0d7cd76a8204e036ace2898a3bbfa71787e05205c5ed8f0e953e950da80fe1b",
+        "reason": "Layer A audit fixes: compare the typed status against public literal strings instead of the module-scoped $script:AgentMarkerStatus (invisible here, so every marker was rejected as null), and add a real pre-launch result-contract gate (Assert-ReviewerModelResultContractFits) that proves the generalist schema's largest legal marker fits the declared scan window and output byte cap before Invoke-TimedProcess, handing the same window to the typed extractor."
       }
     ],
     "Invoke-ReviewerPullRequest": [
       {
         "sha256": "62432a88a734669cfe06220131db07429ea8940eb8eb35078ad925748efce719",
         "reason": "Pinned so the source-coverage wiring cannot be dropped silently: this function carries the marker retry loop and the preview call that publishes pinned source coverage and the convention authority summary."
+      },
+      {
+        "sha256": "622990544b78fdcae4206846f29458c2ca01673746adbc9eb737e3d8ece17faf",
+        "reason": "Layer A typed retry accounting: the generalist retry loop now gates on Test-AgentMarkerStatusRetryable against the typed RejectionClass, accumulates exact per-pass attempt/premiumRequest/nanoAiu/duration accounting, and emits pass-accounting cycle metadata while preserving the pinned missing-or-invalid-result-marker refusal substring."
+      },
+      {
+        "sha256": "280f6b3559714bad8757a3b41079f9c5a4bc37897d8163b9813093e3a90dc686",
+        "reason": "Layer A audit fixes: the generalist retry now gates solely on the typed Test-AgentMarkerStatusRetryable classification (the prose 'missing or invalid result marker' dependency is removed), and accounting is emitted once per ACTUAL attempt as model-attempt-accounting (attempt number, nonce SHA-256 not the raw nonce, typed rejection, modelRan, per-attempt usage/nulls); cumulative session totals are recorded per attempt and never summed across the separate sessions a retry creates."
+      },
+      {
+        "sha256": "3c83cac8c722e0f80db4c8a6261842989177afd2216f03985fe4aa22ba0aba90",
+        "reason": "Layer A merged-marker contract: the seal-time re-validation now sizes its scan window from the dedicated merged-marker contract (25 findings times the two-pass maximum = 50), asserts Assert-ReviewerModelResultContractFits for the merged review before serializing, and hands that same window to ConvertFrom-AgentResultMarker so a maximal two-pass review is never truncated by the harness 65536 default and sealed into an unpromotable artifact. No change to the disabled generalist discovery or delivery path."
       }
     ],
     "Write-ReviewerConventionSpecialistPreview": [

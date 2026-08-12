@@ -785,6 +785,136 @@ Assert-Verification ([bool]$withinBudget.canRun -and $withinBudget.timeoutSecond
     [string]$widenedTimeBudget.reason -ceq "timeout") `
     "Aggregate verifier run/deadline budget did not bound the phase."
 
+# ---------------------------------------------------------------------------
+# Layer A: deterministic 2N preflight. The whole required run set is validated
+# ONCE before any launch, so a set that cannot finish is refused wholesale
+# rather than launching some clusters and degrading the rest mid-loop.
+# ---------------------------------------------------------------------------
+# 2N: every eligible candidate needs exactly two verifier runs (one fresh GPT,
+# one fresh Opus), so N candidates require 2N runs, and the preflight sizes the
+# whole phase against that. The reservation is conservative - the FULL configured
+# per-run timeout for every planned run - so an admitted set can never starve a
+# later run mid-loop.
+$twoNCandidates = 5
+$twoNRuns = 2 * $twoNCandidates
+$twoNAdmit = Assert-ReviewerVerificationBudgetPreflight -RequiredRunCount $twoNRuns `
+    -MaxVerifierRuns 16 -MaxPhaseSeconds 3600 -ConfiguredRunTimeoutSeconds 90 -ElapsedSeconds 0
+Assert-Verification ([bool]$twoNAdmit.canLaunch -and [int]$twoNAdmit.requiredRunCount -eq 10 -and
+    [long]$twoNAdmit.requiredSeconds -eq 900) `
+    "The 2N preflight did not admit a run set that fits the run and full-timeout time budget."
+# Refused for run count: 2N exceeds the effective max verifier runs.
+$runLimited = Assert-ReviewerVerificationBudgetPreflight -RequiredRunCount 18 `
+    -MaxVerifierRuns 16 -MaxPhaseSeconds 3600 -ConfiguredRunTimeoutSeconds 90 -ElapsedSeconds 0
+Assert-Verification (-not [bool]$runLimited.canLaunch -and [string]$runLimited.reason -ceq "candidateLimit") `
+    "The 2N preflight admitted a run set larger than the verifier-run budget."
+# Refused for time: the remaining phase seconds cannot cover the full configured
+# per-run timeout for every required run.
+$timeLimited = Assert-ReviewerVerificationBudgetPreflight -RequiredRunCount 10 `
+    -MaxVerifierRuns 16 -MaxPhaseSeconds 3600 -ConfiguredRunTimeoutSeconds 90 -ElapsedSeconds 3550
+Assert-Verification (-not [bool]$timeLimited.canLaunch -and [string]$timeLimited.reason -ceq "timeout" -and
+    [long]$timeLimited.requiredSeconds -eq 900) `
+    "The 2N preflight admitted a run set the phase clock cannot finish at the full per-run timeout."
+# The boundary: exactly enough remaining seconds for the whole set at the FULL
+# configured timeout is admitted; one second less is refused. Proves no off-by-one
+# launch on insufficient time.
+$exactTime = Assert-ReviewerVerificationBudgetPreflight -RequiredRunCount 10 `
+    -MaxVerifierRuns 16 -MaxPhaseSeconds 900 -ConfiguredRunTimeoutSeconds 90 -ElapsedSeconds 0
+$oneShort = Assert-ReviewerVerificationBudgetPreflight -RequiredRunCount 10 `
+    -MaxVerifierRuns 16 -MaxPhaseSeconds 900 -ConfiguredRunTimeoutSeconds 90 -ElapsedSeconds 1
+Assert-Verification ([bool]$exactTime.canLaunch -and -not [bool]$oneShort.canLaunch -and
+    [string]$oneShort.reason -ceq "timeout") `
+    "The 2N preflight did not treat the full-timeout time budget as an exact, launch-free boundary."
+# An empty plan launches nothing and is trivially admitted.
+$zeroPlan = Assert-ReviewerVerificationBudgetPreflight -RequiredRunCount 0 `
+    -MaxVerifierRuns 16 -MaxPhaseSeconds 3600 -ConfiguredRunTimeoutSeconds 90 -ElapsedSeconds 0
+Assert-Verification ([bool]$zeroPlan.canLaunch -and [int]$zeroPlan.requiredRunCount -eq 0) `
+    "An empty preflight plan was not admitted as a no-op."
+# Overflow-safe reservation: the hard-cap worst case (128 runs at the 3600s
+# per-run ceiling) is computed without wrapping and refuses cleanly when the
+# phase clock cannot cover it.
+$overflowSafe = Assert-ReviewerVerificationBudgetPreflight -RequiredRunCount 128 `
+    -MaxVerifierRuns 128 -MaxPhaseSeconds 3600 -ConfiguredRunTimeoutSeconds 3600 -ElapsedSeconds 0
+Assert-Verification (-not [bool]$overflowSafe.canLaunch -and [string]$overflowSafe.reason -ceq "timeout" -and
+    [long]$overflowSafe.requiredSeconds -eq ([long]128 * 3600)) `
+    "The 2N preflight did not reserve the full per-run timeout overflow-safely at the hard caps."
+
+# ---------------------------------------------------------------------------
+# Layer A (item 1/this turn): the admitted set is launched WHOLE. The caller
+# hands every admitted group the configured per-run timeout and does NOT re-check
+# the phase clock mid-loop, so a run that consumes most of its timeout can never
+# starve a later planned group. This simulation reproduces the exact scenario the
+# earlier per-run recheck mishandled - N runs each taking close to the full
+# timeout - and proves all N launch after admission and zero launch after refusal.
+# ---------------------------------------------------------------------------
+function Measure-VerifierLaunches {
+    param(
+        [int]$RequiredRunCount, [int]$MaxVerifierRuns, [int]$MaxPhaseSeconds,
+        [int]$ConfiguredRunTimeoutSeconds, [double]$PerRunDurationSeconds, [double]$StartElapsedSeconds
+    )
+    # Preflight ONCE, exactly as production does.
+    $preflight = Assert-ReviewerVerificationBudgetPreflight -RequiredRunCount $RequiredRunCount `
+        -MaxVerifierRuns $MaxVerifierRuns -MaxPhaseSeconds $MaxPhaseSeconds `
+        -ConfiguredRunTimeoutSeconds $ConfiguredRunTimeoutSeconds -ElapsedSeconds $StartElapsedSeconds
+    if (-not [bool]$preflight.canLaunch) { return [pscustomobject]@{ launched = 0; refused = $true } }
+    # Admitted: launch every planned group with the configured timeout, advancing
+    # the wall clock by each run's real duration, and NEVER re-checking budget.
+    $launched = 0
+    $elapsed = $StartElapsedSeconds
+    for ($i = 0; $i -lt $RequiredRunCount; $i++) {
+        $launched++
+        $elapsed += $PerRunDurationSeconds
+    }
+    return [pscustomobject]@{ launched = $launched; refused = $false; finalElapsed = $elapsed }
+}
+# Admitted set with runs each taking ~the full timeout: all 10 launch even though
+# cumulative elapsed climbs well past the old 30s-remaining floor for later runs.
+$admitAll = Measure-VerifierLaunches -RequiredRunCount 10 -MaxVerifierRuns 16 -MaxPhaseSeconds 900 `
+    -ConfiguredRunTimeoutSeconds 90 -PerRunDurationSeconds 89 -StartElapsedSeconds 0
+Assert-Verification (-not [bool]$admitAll.refused -and [int]$admitAll.launched -eq 10) `
+    "An admitted 2N set did not launch every planned group when each run consumed nearly its full timeout."
+# The exact partial-launch regression this closes: the OLD per-run gate, re-checked
+# with elapsed advancing by each run's real duration, would have refused later runs
+# even though a floor-based preflight (30s/run) had admitted the set. Here the
+# phase has room for the old 30s-per-run floor (10*30=300 <= 500) but NOT for the
+# full configured timeout of every run, so the mid-loop recheck strands later runs
+# - the exact window the conservative preflight now refuses wholesale.
+$oldElapsed = 0.0
+$oldLaunched = 0
+for ($i = 0; $i -lt 10; $i++) {
+    $perRun = Get-ReviewerVerificationRunBudget -RunsLaunched $oldLaunched -MaxRuns 16 `
+        -ElapsedSeconds $oldElapsed -MaxPhaseSeconds 500 -ConfiguredRunTimeoutSeconds 90
+    if (-not [bool]$perRun.canRun) { break }
+    $oldLaunched++
+    $oldElapsed += 89
+}
+Assert-Verification ($oldLaunched -gt 0 -and $oldLaunched -lt 10) `
+    "The simulated old per-run gate did not expose the partial-launch window the preflight now closes."
+# And the NEW preflight refuses that same set wholesale (full timeout reservation
+# 10*90=900 > 500 remaining), so zero launch instead of a partial subset.
+$refusePartial = Measure-VerifierLaunches -RequiredRunCount 10 -MaxVerifierRuns 16 -MaxPhaseSeconds 500 `
+    -ConfiguredRunTimeoutSeconds 90 -PerRunDurationSeconds 89 -StartElapsedSeconds 0
+Assert-Verification ([bool]$refusePartial.refused -and [int]$refusePartial.launched -eq 0) `
+    "The conservative preflight admitted a set the old per-run gate could only partially launch."
+# Refusal is authoritative and total: a set that does not fit launches nothing.
+$refuseAll = Measure-VerifierLaunches -RequiredRunCount 10 -MaxVerifierRuns 16 -MaxPhaseSeconds 300 `
+    -ConfiguredRunTimeoutSeconds 90 -PerRunDurationSeconds 89 -StartElapsedSeconds 0
+Assert-Verification ([bool]$refuseAll.refused -and [int]$refuseAll.launched -eq 0) `
+    "A refused 2N set launched a partial subset instead of nothing."
+# The caller wires the preflight decision as authoritative: after admission the
+# group loop hands each run the configured timeout and never re-checks the per-run
+# budget mid-loop (the old partial-launch source).
+$crossPassSource = Get-VerificationFunctionText -Text $wrapperText -Name "Invoke-ReviewerCrossVerificationPass"
+$preflightIndex = $crossPassSource.IndexOf('Assert-ReviewerVerificationBudgetPreflight', [StringComparison]::Ordinal)
+$loopStartIndex = $crossPassSource.IndexOf('foreach ($key in $orderedGroupKeys)', [StringComparison]::Ordinal)
+$loopBody = if ($loopStartIndex -gt $preflightIndex -and $preflightIndex -ge 0) {
+    $crossPassSource.Substring($loopStartIndex)
+} else { '' }
+Assert-Verification ($loopBody -and $loopBody -notmatch 'Get-ReviewerVerificationRunBudget') `
+    "The verifier group loop still re-checks the per-run budget after admission, re-opening partial launch."
+Assert-Verification ($loopBody -match '-TimeoutSeconds \$EffectiveVerificationTimeoutSeconds') `
+    "An admitted verifier group is not handed the configured per-run timeout the preflight reserved."
+
+
 # Both-generalist clusters are independently assessed, not auto-accepted.
 $exactResolved = Resolve-ReviewerVerificationDecisions -Clusters $exactClusters -Assignments $assignments `
     -VerifierRuns (New-CompleteRuns -Assignments $assignments) -ChangedPaths @("src/a.cs") -FactPlan $factPlan `
@@ -897,7 +1027,14 @@ Assert-Verification (@($escalated.eligible).Count -eq 0 -and
     "Verifier severity escalation was accepted."
 
 # Timeout, invalid marker, model mismatch, tool violation, and incomplete runs withhold.
-foreach ($failureReason in @("timeout", "invalidMarker", "modelMismatch", "toolViolation", "incompleteVerifier")) {
+# The typed cross-verifier extraction classes (overflow / the typed marker-status
+# strings / verdictSetMismatch / staleBinding) are ALSO first-class run reasons:
+# each must fail closed and be preserved verbatim on the withheld candidate rather
+# than collapsed to a generic incompleteVerifier - that is what lets a run record
+# report WHY the verifier marker failed instead of a generic invalidMarker.
+foreach ($failureReason in @("timeout", "invalidMarker", "modelMismatch", "toolViolation", "incompleteVerifier",
+        "overflow", "missingMarker", "malformedMarker", "nonObject", "truncated",
+        "schemaInvalid", "ambiguousMarker", "wrongBinding", "verdictSetMismatch", "staleBinding")) {
     $failedRun = New-VerifierRun -Assignment $singleAssignment -Status "degraded" -Reason $failureReason
     $failed = Resolve-ReviewerVerificationDecisions -Clusters $singleCluster `
         -Assignments @($singleAssignment) -VerifierRuns @($failedRun) `
@@ -905,7 +1042,14 @@ foreach ($failureReason in @("timeout", "invalidMarker", "modelMismatch", "toolV
         -EvidenceHunks (Get-TestEvidenceHunks -Clusters $singleCluster)
     Assert-Verification (@($failed.eligible).Count -eq 0 -and
         @($failed.withheld | Where-Object reason -ceq $failureReason).Count -eq 1) `
-        "Verifier failure '$failureReason' did not fail closed."
+        "Verifier failure '$failureReason' did not fail closed with its precise reason preserved."
+}
+# Every typed cross-verifier extraction class is a recognized withheld reason, so
+# Resolve-ReviewerVerificationDecisions never rewrites it to incompleteVerifier.
+foreach ($typedReason in @("overflow", "missingMarker", "malformedMarker", "nonObject", "truncated",
+        "schemaInvalid", "ambiguousMarker", "wrongBinding", "verdictSetMismatch")) {
+    Assert-Verification ($script:ReviewerVerificationWithheldReasons -ccontains $typedReason) `
+        "The typed cross-verifier extraction class '$typedReason' is not in the recognized withheld-reason vocabulary."
 }
 
 # Multiple verifier decisions for one candidate must agree; no majority is used.
@@ -1777,6 +1921,72 @@ foreach ($emptyArrayParameter in @(
 Assert-Verification ($modelRunText -match 'Test-ReviewerVerificationReportedModel' -and
     $modelRunText -match 'did not report an exact verifier model identity') `
     "Production verifier runs accept an empty or unbound reported model identity."
+# The verifier now extracts its result marker through the typed outcome API and
+# records the precise typed status as the run reason, never the compat wrapper or
+# a generic invalidMarker for an extraction failure.
+Assert-Verification ($modelRunText -match 'ConvertFrom-AgentResultMarkerOutcome') `
+    "The verifier model run no longer uses the typed marker-extraction outcome."
+Assert-Verification ($modelRunText -notmatch 'ConvertFrom-AgentResultMarker\b(?!Outcome)') `
+    "The verifier model run still relies on the compatibility marker parser."
+Assert-Verification ($modelRunText -notmatch '"invalidMarker"' -and
+    $modelRunText -notmatch "'invalidMarker'") `
+    "The verifier model run still emits a generic invalidMarker extraction reason."
+Assert-Verification ($modelRunText -match '\$failureReason\s*=\s*\$markerStatus') `
+    "The verifier does not map the typed marker status directly onto the run reason."
+Assert-Verification ($modelRunText -match '\$failureReason\s*=\s*"overflow"' -and
+    $modelRunText -match 'ReviewerVerificationMaxOutputBytes') `
+    "The verifier does not map output-cap overflow onto the typed overflow class."
+Assert-Verification ($modelRunText -match '\$failureReason\s*=\s*"staleBinding"') `
+    "The verifier does not preserve a stale caller binding as staleBinding."
+Assert-Verification ($modelRunText -match '\$failureReason\s*=\s*"verdictSetMismatch"') `
+    "The verifier does not classify a post-extraction verdict-set mismatch precisely."
+Assert-Verification ($modelRunText -match '-Schema\s+\$verificationSchema' -and
+    $modelRunText -match '-ScanWindowChars\s+\$verificationScanWindow') `
+    "The verifier does not reuse the prevalidated scan window and schema for extraction."
+# Typed extraction against the REAL verification marker schema produces the precise
+# per-failure status the verifier maps onto its run reason - proving those reasons
+# are real typed classes, not synthetic strings. The schema exact-fields
+# (project/verifierModel/nonce) back the wrongBinding class. The fully-valid
+# $markerObject built above is reused so only the field under test varies.
+$verifierPrefix = $script:ReviewerVerificationMarkerPrefix
+$verifierWindow = 65536
+$verifierSchema = Get-ReviewerVerificationMarkerSchema -ExpectedProject "Example" `
+    -ExpectedNonce "verify-nonce" -ExpectedVerifierModel $sol
+function Get-VerifierMarkerOutcome {
+    param([Parameter(Mandatory)]$Payload)
+    return ConvertFrom-AgentResultMarkerOutcome `
+        -StdOutText ($verifierPrefix + " " + ($Payload | ConvertTo-Json -Depth 32 -Compress)) `
+        -MarkerPrefix $verifierPrefix -Schema $verifierSchema -ScanWindowChars $verifierWindow
+}
+$validVerifierOutcome = Get-VerifierMarkerOutcome -Payload $markerObject
+Assert-Verification ([string]$validVerifierOutcome.Status -ceq "success" -and
+    $null -ne $validVerifierOutcome.Value) `
+    "A valid verifier marker did not extract as success through the typed outcome."
+$missingVerifierOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText "no marker at all here" `
+    -MarkerPrefix $verifierPrefix -Schema $verifierSchema -ScanWindowChars $verifierWindow
+Assert-Verification ([string]$missingVerifierOutcome.Status -ceq "missingMarker") `
+    "A verifier stdout with no marker did not extract as missingMarker."
+$malformedVerifierOutcome = ConvertFrom-AgentResultMarkerOutcome `
+    -StdOutText ($verifierPrefix + " {not json") `
+    -MarkerPrefix $verifierPrefix -Schema $verifierSchema -ScanWindowChars $verifierWindow
+Assert-Verification (@("malformedMarker", "truncated") -ccontains [string]$malformedVerifierOutcome.Status) `
+    "A malformed verifier marker did not extract as a precise malformed/truncated class."
+$noNonceVerifierPayload = Copy-VerificationObject $markerObject
+$noNonceVerifierPayload.PSObject.Properties.Remove("nonce")
+$schemaInvalidVerifierOutcome = Get-VerifierMarkerOutcome -Payload $noNonceVerifierPayload
+Assert-Verification ([string]$schemaInvalidVerifierOutcome.Status -ceq "schemaInvalid") `
+    "A verifier marker missing its nonce did not extract as schemaInvalid."
+$wrongNonceVerifierPayload = Copy-VerificationObject $markerObject
+$wrongNonceVerifierPayload.nonce = "wrong-verify-nonce"
+$wrongBindingVerifierOutcome = Get-VerifierMarkerOutcome -Payload $wrongNonceVerifierPayload
+Assert-Verification ([string]$wrongBindingVerifierOutcome.Status -ceq "wrongBinding") `
+    "A verifier marker with a wrong nonce did not extract as wrongBinding."
+foreach ($typedVerifierStatus in @($missingVerifierOutcome.Status, $malformedVerifierOutcome.Status,
+        $schemaInvalidVerifierOutcome.Status, $wrongBindingVerifierOutcome.Status)) {
+    Assert-Verification ([string]$typedVerifierStatus -cne "invalidMarker" -and
+        [string]$typedVerifierStatus -cne "success") `
+        "A verifier extraction failure collapsed onto a generic non-typed status."
+}
 $sourceHunkText = Get-VerificationFunctionText -Text $wrapperText `
     -Name "Get-ReviewerVerificationSourceHunks"
 Assert-Verification ($sourceHunkText -match 'ConvertTo-ReviewerVerificationReadPath' -and
@@ -1814,7 +2024,7 @@ $crossPassText = Get-VerificationFunctionText -Text $wrapperText `
 foreach ($policyUse in @(
         "Get-ReviewerVerificationCandidatePlan", "nearExactJaccard", "semanticJaccard",
         "existingThreadJaccard", "maxInputBytes", "maxArtifactBytes",
-        "Get-ReviewerVerificationRunBudget", "preVerificationWithheld",
+        "Assert-ReviewerVerificationBudgetPreflight", "preVerificationWithheld",
         "Get-ReviewerVerificationCandidateFactPartition",
         "Get-ReviewerVerificationClusterFactPartition"
     )) {
@@ -2032,6 +2242,7 @@ function Invoke-ReviewerVerificationModelRun {
     param($AgencyPath, $Binding, $InputManifestSha256, $Cluster, $VerifierModel,
         $AssignedCandidates, $SiblingEvidence, $EvidenceHunks, $CandidateEvidence,
         $DeterministicFacts, $ThreadFacts, [int]$TimeoutSeconds)
+    $script:modelRunCalls++
     return [pscustomobject]@{
         status = "complete"; reason = ""; detail = ""; model = $VerifierModel
         clusterId = [string]$Cluster.clusterId; nonceSha256 = "9" * 64
@@ -2063,7 +2274,9 @@ function Write-ReviewerVerificationDecisionPreview {
         ArtifactPath = Join-Path ([IO.Path]::GetTempPath()) "preview.json"
     }
 }
-function Write-ReviewerCycleMetadata { param([hashtable]$Fields) }
+function Write-ReviewerCycleMetadata { param([hashtable]$Fields) [void]$script:cycleMetadata.Add($Fields) }
+$script:modelRunCalls = 0
+$script:cycleMetadata = [System.Collections.Generic.List[object]]::new()
 $passBound = @{
     PrId = 42; SourceCommit = "1" * 40; ConventionPlanPath = "plan.json"
     FactPlanPath = "facts.json"; ChangedPaths = @("src/a.cs")
@@ -2132,16 +2345,72 @@ Assert-Verification ($removalMergePass.Status -ceq "complete" -and
     @($removalMergePass.Withheld.candidateId) -ccontains "merge-candidate-3" -and
     $script:clusterSequenceCall -eq 3) `
     "Removal-induced cluster merging recreated an over-cap run or degraded the production pass."
+$script:clusterSequenceMode = ""
+$script:passFactPlan = $factPlan
 $script:passCandidates = @($goodPartitionCandidate)
 $missingSpecialistPass = Invoke-ReviewerCrossVerificationSafely -AgencyPath "unused" -CycleNumber 4 `
     -Bound $passBound -PassResults $completePassResults -SpecialistResult ([pscustomobject]@{
         Status = "degraded"; Candidates = @(); Manifest = $null; ArtifactPath = ""
     })
+# A degraded specialist no longer aborts the whole pass: the blind generalist
+# union is still built and sealed, and only convention-dependent candidates are
+# withheld candidate by candidate (good-fact-candidate is convention-origin).
 Assert-Verification ($missingSpecialistPass.Status -ceq "degraded" -and
     @($missingSpecialistPass.Eligible).Count -eq 0 -and
-    [string]$missingSpecialistPass.Diagnostic -clike "*completed specialist blind pass*") `
-    "Cross-verification launched or exposed eligible findings without all three blind passes."
+    @($missingSpecialistPass.Withheld | Where-Object {
+            [string]$_.candidateId -ceq "good-fact-candidate" -and
+            [string]$_.reason -ceq "specialistDegraded"
+        }).Count -eq 1) `
+    "A degraded specialist did not withhold its convention-dependent candidate candidate-by-candidate."
+# The same degraded specialist must NOT suppress a functional generalist finding
+# that needs no convention evidence: it stays in the sealed union and receives a
+# full fresh GPT + fresh Opus cross-check assignment pair.
+$functionalGeneralistPass = New-GeneralistPass -Model $opus -Findings @(
+    (New-GeneralistFinding -Comment (
+            "The retry loop reuses the same cancellation token after the first timeout, so every later attempt is cancelled before it starts."))
+)
+$functionalGeneralistCandidates = @(ConvertTo-ReviewerVerificationCandidates `
+    -GeneralistPasses @($functionalGeneralistPass))
+$script:passCandidates = @($functionalGeneralistCandidates)
+$script:capturedVerificationInput = $null
+$functionalGeneralistResult = Invoke-ReviewerCrossVerificationSafely -AgencyPath "unused" -CycleNumber 5 `
+    -Bound $passBound -PassResults $completePassResults -SpecialistResult ([pscustomobject]@{
+        Status = "degraded"; Candidates = @(); Manifest = $null; ArtifactPath = ""
+    })
+$functionalId = [string]$functionalGeneralistCandidates[0].candidateId
+Assert-Verification ($functionalGeneralistResult.Status -ceq "degraded" -and
+    @($functionalGeneralistResult.Eligible | Where-Object {
+            [string]$_.candidateId -ceq $functionalId
+        }).Count -eq 1 -and
+    @($script:capturedVerificationInput.assignments | Where-Object {
+            [string]$_.candidateId -ceq $functionalId
+        } | ForEach-Object { [string]$_.verifierModel } | Sort-Object -Unique).Count -eq 2) `
+    "A degraded specialist suppressed a functional generalist candidate or denied it a full GPT+Opus cross-check."
 $script:clusterSequenceMode = ""
+
+# ---------------------------------------------------------------------------
+# Layer A: deterministic preflight in the live pass - NO partial launch when
+# the declared budget cannot cover the whole required run set. With one
+# functional candidate cross-checked by two models the pass needs 2 runs; a
+# phase budget too small for 2 runs must refuse to launch a SINGLE model, mark
+# every planned assignment degraded, and record the preflight refusal.
+# ---------------------------------------------------------------------------
+$script:passFactPlan = $factPlan
+$script:passCandidates = @($functionalGeneralistCandidates)
+$script:modelRunCalls = 0
+$script:cycleMetadata = [System.Collections.Generic.List[object]]::new()
+$savedMaxSeconds = [int]$EffectiveCrossVerificationPolicy.maxVerificationSeconds
+$EffectiveCrossVerificationPolicy.maxVerificationSeconds = 30   # too little for 2 * 30s runs
+$noLaunchPass = Invoke-ReviewerCrossVerificationPass -AgencyPath "unused" -CycleNumber 6 `
+    -Bound $passBound -PassResults $completePassResults -SpecialistResult $emptySpecialistResult
+$EffectiveCrossVerificationPolicy.maxVerificationSeconds = $savedMaxSeconds
+$preflightMeta = @($script:cycleMetadata | Where-Object { [string]$_.mode -ceq "verification-budget-preflight" })
+Assert-Verification ($script:modelRunCalls -eq 0 -and
+    $noLaunchPass.Status -cne "complete" -and
+    @($preflightMeta).Count -eq 1 -and
+    [string]@($preflightMeta)[0].reason -ceq "timeout" -and
+    [int]@($preflightMeta)[0].requiredRunCount -eq 2) `
+    "The pass launched a verifier model or failed to record a preflight refusal when the budget could not cover every required run."
 
 if ($failures.Count -gt 0) {
     Write-Host "Cross verification contract: $($failures.Count) failure(s) across $checks checks." -ForegroundColor Red

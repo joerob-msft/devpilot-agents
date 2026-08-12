@@ -1177,8 +1177,12 @@ Assert-Source ($readerSeamText -match "reported failure\|omitted content\|unexpe
 Assert-Source ($readerSeamText -match 'path\s+= \(ConvertTo-ReviewerSourcePath -Path') `
     "the persisted record never carries a raw unnormalized path"
 $harnessText = (Get-Content -LiteralPath (Join-Path $repoRoot 'src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1') -Raw)
-Assert-Source ($harnessText -match '\$examined -gt 512' -and $harnessText -match '\$scanned -gt 20000') `
+Assert-Source ($harnessText -match '\$examined -gt \$script:AgentMarkerMaxExaminedPayloads' -and
+    $harnessText -match '\$scanned -gt \$script:AgentMarkerMaxPrefixScans') `
     "only anchors that could carry a payload cost scan budget, so bare decoy prefixes cannot discard a valid review"
+Assert-Source ($harnessText -match '\$script:AgentMarkerMaxPrefixScans = 20000' -and
+    $harnessText -match '\$script:AgentMarkerMaxExaminedPayloads = 512') `
+    "the bounded-scan budgets are declared as named constants, so the scan loop and any launch-contract math read the same numbers"
 $runtimeText = Get-FunctionTextFromWrapper -Name 'Get-ReviewerRuntimeContext'
 Assert-Source ($runtimeText -match 'NONE PRODUCED' -and $runtimeText -match 'Treat every changed file as unread') `
     "an absent sealed block is stated to the model instead of silently omitted"
@@ -1209,8 +1213,10 @@ $passText = Get-FunctionTextFromWrapper -Name 'Invoke-ReviewerModelPass'
 Assert-Source ($passText -match 'PinnedSourceText') "the generalist runtime context carries the sealed block"
 $prText = Get-FunctionTextFromWrapper -Name 'Invoke-ReviewerPullRequest'
 Assert-Source ($prText -match 'ReviewerMarkerRetryAttempts') "the marker retry is wired into the pass loop"
-Assert-Source ($prText -match "notmatch 'missing or invalid result marker'") `
-    "only a genuine marker parse failure is retried"
+Assert-Source ($prText -match 'Test-AgentMarkerStatusRetryable') `
+    "only a typed-retryable marker-emission slip is retried"
+Assert-Source ($prText -notmatch "notmatch 'missing or invalid result marker'") `
+    "the retry no longer depends on matching a prose reason string"
 
 # ---------------------------------------------------------------------------
 Write-Host "[13/13] Unchanged sibling context travels with the change" -ForegroundColor Cyan
