@@ -10145,7 +10145,8 @@ function Get-ReviewerVerificationSourceHunks {
         [Parameter(Mandatory)][string]$SourceCommit,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Candidates,
         [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$ChangedPaths,
-        $SourceReport = $null
+        $SourceReport = $null,
+        [AllowEmptyCollection()][object[]]$ChangedFileAnchors = @()
     )
     $changed = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
     foreach ($changedPath in @($ChangedPaths)) {
@@ -10171,18 +10172,29 @@ function Get-ReviewerVerificationSourceHunks {
         param([hashtable]$verificationSession)
         $fileCache = @{}
         $hunks = [System.Collections.Generic.List[object]]::new()
-        foreach ($candidate in @($Candidates)) {
-            if ([string]$candidate.anchorKind -cne "changedFile" -or
-                -not [string]$candidate.filePath -or [int]$candidate.line -lt 1) {
-                continue
-            }
-            $normalizedPath = ConvertTo-ReviewerVerificationPath -Path ([string]$candidate.filePath)
-            if (-not $normalizedPath -or -not $changed.ContainsKey($normalizedPath)) {
-                continue
-            }
+        # A candidate's semantic identity is its primary anchor plus its ordered-
+        # independent cross-file manifestation set. The verifier must rule on the
+        # WHOLE sealed evidence set, so one hunk is rendered for the anchor line
+        # and one for every manifestation line the candidate binds; each is a
+        # sealed changed-right-hand slice. Dedupe keeps a manifestation that
+        # coincides with the anchor from being rendered twice.
+        $emittedHunkKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        function Add-ReviewerVerificationSourceHunk {
+            param(
+                [string]$CandidateId,
+                [AllowEmptyString()][string]$RawPath,
+                [int]$AnchorLine,
+                [string]$Role
+            )
+            if (-not $CandidateId -or -not $RawPath -or $AnchorLine -lt 1) { return }
+            $normalizedPath = ConvertTo-ReviewerVerificationPath -Path $RawPath
+            if (-not $normalizedPath -or -not $changed.ContainsKey($normalizedPath)) { return }
             $path = $changed[$normalizedPath]
+            $dedupeKey = $CandidateId + "|" + $normalizedPath + "|" +
+                [Convert]::ToString($AnchorLine, [Globalization.CultureInfo]::InvariantCulture)
+            if (-not $emittedHunkKeys.Add($dedupeKey)) { return }
             if ($sealedFiles.ContainsKey($normalizedPath)) {
-                $line = [int]$candidate.line
+                $line = [int]$AnchorLine
                 $matchingSlices = @((Get-ReviewerVerificationValue `
                             $sealedFiles[$normalizedPath] "Slices" @()) | Where-Object {
                         $line -ge [int](Get-ReviewerVerificationValue $_ "StartLine" 0) -and
@@ -10211,17 +10223,18 @@ function Get-ReviewerVerificationSourceHunks {
                     }
                     $text = $rendered.ToArray() -join "`n"
                     [void]$hunks.Add([pscustomobject][ordered]@{
-                            candidateId = [string]$candidate.candidateId
-                            filePath = [string]$candidate.filePath
+                            candidateId = [string]$CandidateId
+                            filePath = $normalizedPath
                             line = $line
                             startLine = $start
                             endLine = $end
                             sourceCommit = $SourceCommit
                             sourceKind = "sealedSourceSlice"
+                            role = [string]$Role
                             text = $text
                             sha256 = Get-ReviewerVerificationSha256 -Text $text
                         })
-                    continue
+                    return
                 }
             }
             try {
@@ -10232,8 +10245,8 @@ function Get-ReviewerVerificationSourceHunks {
                 }
                 $content = [string]$fileCache[$normalizedPath].Content
                 $lines = @($content.Replace("`r`n", "`n").Replace("`r", "`n") -split "`n")
-                $line = [int]$candidate.line
-                if ($line -gt $lines.Count) { continue }
+                $line = [int]$AnchorLine
+                if ($line -gt $lines.Count) { return }
                 $start = [Math]::Max(1, $line - 3)
                 $end = [Math]::Min($lines.Count, $line + 3)
                 $rendered = [System.Collections.Generic.List[string]]::new()
@@ -10244,19 +10257,45 @@ function Get-ReviewerVerificationSourceHunks {
                 }
                 $text = $rendered.ToArray() -join "`n"
                 [void]$hunks.Add([pscustomobject][ordered]@{
-                        candidateId = [string]$candidate.candidateId
-                        filePath = [string]$candidate.filePath
+                        candidateId = [string]$CandidateId
+                        filePath = $normalizedPath
                         line = $line
                         startLine = $start
                         endLine = $end
                         sourceCommit = $SourceCommit
                         sourceKind = "commitPinnedFile"
+                        role = [string]$Role
                         text = $text
                         sha256 = Get-ReviewerVerificationSha256 -Text $text
                     })
             }
             catch {
                 Write-Warning "Could not build verifier source hunk for '$path': $($_.Exception.Message)"
+            }
+        }
+        foreach ($candidate in @($Candidates)) {
+            if ([string]$candidate.anchorKind -cne "changedFile" -or
+                -not [string]$candidate.filePath -or [int]$candidate.line -lt 1) {
+                continue
+            }
+            $candidateId = [string]$candidate.candidateId
+            $readPath = ConvertTo-ReviewerVerificationReadPath -Path ([string]$candidate.filePath)
+            if ($readPath) {
+                Add-ReviewerVerificationSourceHunk -CandidateId $candidateId `
+                    -RawPath ([string]$candidate.filePath) -AnchorLine ([int]$candidate.line) -Role "anchor"
+            }
+            $manifestationText = [string](Get-ReviewerVerificationValue $candidate "manifestations" "")
+            if ($manifestationText -and
+                (Get-Command Resolve-ReviewerConventionSpecialistTargets -ErrorAction SilentlyContinue)) {
+                $resolvedTargets = Resolve-ReviewerConventionSpecialistTargets -Text $manifestationText `
+                    -ChangedFileAnchors @($ChangedFileAnchors) -ChangedLinesOnly
+                if ($resolvedTargets.Ok) {
+                    foreach ($target in @($resolvedTargets.Targets)) {
+                        if ([string]$target.kind -cne "changedLine") { continue }
+                        Add-ReviewerVerificationSourceHunk -CandidateId $candidateId `
+                            -RawPath ([string]$target.path) -AnchorLine ([int]$target.line) -Role "manifestation"
+                    }
+                }
             }
         }
         return $hunks.ToArray()
@@ -10485,6 +10524,7 @@ function Invoke-ReviewerCrossVerificationPass {
     $evidenceHunks = @(Get-ReviewerVerificationSourceHunks -AgencyPath $AgencyPath `
         -SourceCommit $sourceCommit -Candidates $verifiableCandidates `
         -ChangedPaths @($Bound.ChangedPaths) `
+        -ChangedFileAnchors $changedFileAnchors `
         -SourceReport $(if ($Bound.ContainsKey('SourceTransportReport')) {
                 $Bound['SourceTransportReport']
             } else { $null }))

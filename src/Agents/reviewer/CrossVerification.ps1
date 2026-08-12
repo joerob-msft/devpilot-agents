@@ -2235,15 +2235,18 @@ function Get-ReviewerVerificationEvidenceOptions {
     )
     $candidateId = [string](Get-ReviewerVerificationValue $Candidate "candidateId" "")
     $options = [System.Collections.Generic.List[object]]::new()
-    $hunk = @($EvidenceHunks | Where-Object {
-            [string](Get-ReviewerVerificationValue $_ "candidateId" "") -ceq $candidateId
-        } | Select-Object -First 1)
-    if ($hunk.Count -eq 1 -and
-        [string](Get-ReviewerVerificationValue $hunk[0] "sha256" "") -match '^[0-9a-f]{64}$') {
+    $hunkOptions = @($EvidenceHunks | Where-Object {
+            [string](Get-ReviewerVerificationValue $_ "candidateId" "") -ceq $candidateId -and
+            [string](Get-ReviewerVerificationValue $_ "sha256" "") -match '^[0-9a-f]{64}$'
+        })
+    $seenHunkSha = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($hunk in $hunkOptions) {
+        $hunkSha = [string](Get-ReviewerVerificationValue $hunk "sha256" "")
+        if (-not $seenHunkSha.Add($hunkSha)) { continue }
         [void]$options.Add([pscustomobject][ordered]@{
                 purpose = "candidate"
                 kind = "diffHunk"
-                sha256 = [string](Get-ReviewerVerificationValue $hunk[0] "sha256" "")
+                sha256 = $hunkSha
                 factIds = ""
                 evidenceFactId = ""
                 duplicateTargetId = ""

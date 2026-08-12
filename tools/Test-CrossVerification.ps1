@@ -2414,6 +2414,73 @@ Assert-Verification ($sealedSliceHunks.Count -eq 1 -and
     [string]$sealedSliceHunks[0].sourceKind -ceq "sealedSourceSlice" -and
     [int]$sealedSliceHunks[0].line -eq 1112 -and $script:pinnedSourceReadCount -eq 0) `
     "Verifier evidence did not reuse the normalized sealed source slice."
+# A cross-file convention candidate's semantic identity is its primary anchor
+# plus its ordered-independent manifestation set. The verifier must be shown a
+# sealed changed-right-hand slice for EVERY manifestation line, not only the
+# anchor, or it fails closed for lack of the cross-file evidence it needs.
+$crossFileAnchors = @(
+    [pscustomobject][ordered]@{
+        anchorId = "cf1"; path = "src/model.json"
+        rightHandRanges = @([pscustomobject]@{ startLine = 180; endLine = 220 })
+    },
+    [pscustomobject][ordered]@{
+        anchorId = "cf0"; path = "src/rolloutspec.json"
+        rightHandRanges = @([pscustomobject]@{ startLine = 50; endLine = 60 })
+    }
+)
+$crossFileCandidate = [pscustomobject][ordered]@{
+    candidateId = "cand-crossfile-1"
+    candidateHash = "d" * 64
+    anchorKind = "changedFile"
+    filePath = "src/model.json"
+    line = 210
+    primaryTarget = "cf1:210"
+    manifestations = "cf1:187,cf1:210,cf0:52"
+    conventionBound = $true
+    originKind = "convention"
+}
+$crossFileReport = [pscustomobject]@{
+    Files = @(
+        [pscustomobject]@{
+            Path = "src/model.json"
+            Slices = @([pscustomobject]@{
+                    StartLine = 180; EndLine = 220
+                    Text = ((180..220 | ForEach-Object { "model line $_" }) -join "`n")
+                })
+        },
+        [pscustomobject]@{
+            Path = "src/rolloutspec.json"
+            Slices = @([pscustomobject]@{
+                    StartLine = 50; EndLine = 60
+                    Text = ((50..60 | ForEach-Object { "rollout line $_" }) -join "`n")
+                })
+        }
+    )
+}
+$crossFileHunks = @(Get-ReviewerVerificationSourceHunks -AgencyPath "unused" `
+        -SourceCommit ("2" * 40) -Candidates @($crossFileCandidate) `
+        -ChangedPaths @("src/model.json", "src/rolloutspec.json") `
+        -ChangedFileAnchors $crossFileAnchors -SourceReport $crossFileReport)
+$crossFileKeys = @($crossFileHunks | ForEach-Object {
+        [string]$_.filePath + ":" + [string]$_.line + ":" + [string]$_.role
+    } | Sort-Object)
+Assert-Verification ($crossFileHunks.Count -eq 3 -and
+    @($crossFileHunks | Where-Object { [string]$_.sourceKind -cne "sealedSourceSlice" }).Count -eq 0) `
+    "A cross-file convention candidate did not render one sealed slice per anchor and manifestation line."
+Assert-Verification (($crossFileKeys -join "|") -ceq
+    "/src/model.json:187:manifestation|/src/model.json:210:anchor|/src/rolloutspec.json:52:manifestation") `
+    "Cross-file manifestation hunks did not cover the exact anchor plus manifestation lines with the anchor deduplicated."
+$crossFileHunkShas = @($crossFileHunks | ForEach-Object { [string]$_.sha256 } | Sort-Object -Unique)
+Assert-Verification ($crossFileHunkShas.Count -eq 3) `
+    "Cross-file manifestation hunks must each carry a distinct sealed evidence hash."
+$crossFileOptions = @(Get-ReviewerVerificationEvidenceOptions -Candidate $crossFileCandidate `
+        -FactPlan $null -ThreadFacts @() -EvidenceHunks $crossFileHunks)
+$crossFileDiffHunkOptions = @($crossFileOptions | Where-Object {
+        [string]$_.purpose -ceq "candidate" -and [string]$_.kind -ceq "diffHunk"
+    })
+Assert-Verification ($crossFileDiffHunkOptions.Count -eq 3 -and
+    @($crossFileDiffHunkOptions | ForEach-Object { [string]$_.sha256 } | Sort-Object -Unique).Count -eq 3) `
+    "Every sealed cross-file manifestation hunk must be an independently bindable diffHunk evidence option."
 $crossPassText = Get-VerificationFunctionText -Text $wrapperText `
     -Name "Invoke-ReviewerCrossVerificationPass"
 foreach ($policyUse in @(
