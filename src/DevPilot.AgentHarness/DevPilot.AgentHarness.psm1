@@ -32,6 +32,15 @@ $ErrorActionPreference = "Stop"
 # takes exactly one separate following argv entry. "auto" is intentionally
 # excluded: agents want reproducible behavior, and "auto" is non-deterministic.
 # Update ONLY this array when Copilot CLI adds/retires a model.
+#
+# ORDERING IS PART OF THE CONTRACT: within each family the entries are listed
+# NEWEST FIRST. Get-AgentGeneralistModelPair derives the current independent
+# generalist pairing from that order, so retiring a model or adding its
+# successor here is the ONE edit that moves every consumer - the reviewer's
+# startup validation, its sealed-decision re-verification, and the offline
+# qualification wrapper - at the same time. Nothing downstream may name a
+# version of its own; that is precisely how a wrapper ends up asking for a
+# model the agent no longer accepts.
 # ---------------------------------------------------------------------------
 $script:AgentHarnessSupportedModels = @(
     "claude-sonnet-5",
@@ -57,12 +66,88 @@ $script:AgentHarnessSupportedModels = @(
 )
 $script:AgentHarnessDefaultModelSentinel = "copilot-cli-default"
 
+# The two families an independent generalist cross-check is drawn from, and
+# what disqualifies a member of each. Small/specialized variants are excluded
+# by name-shape rather than by listing survivors, so a new "-mini" or "-codex"
+# entry cannot quietly become a generalist by being added to the registry.
+$script:AgentHarnessGeneralistFamilies = @(
+    [ordered]@{ Family = "claude-opus"; Include = '^claude-opus-'; Exclude = '(?:-mini|-codex|-flash|-haiku)' },
+    [ordered]@{ Family = "gpt"; Include = '^gpt-'; Exclude = '(?:-mini|-codex|-flash)' }
+)
+
 function Get-AgentSupportedModels {
     return , @($script:AgentHarnessSupportedModels)
 }
 
 function Get-AgentDefaultModelSentinel {
     return $script:AgentHarnessDefaultModelSentinel
+}
+
+function Get-AgentGeneralistModelPair {
+    <#
+        THE single source of truth for "which two models is an independent
+        two-pass generalist review made of".
+
+        Derived from the supported-model registry above rather than declared
+        separately, because a second declaration is a second thing to forget:
+        the defect this closes is a qualification wrapper that named
+        claude-opus-4.8 while the agent's startup validation required
+        claude-opus-5, so every slot died before a model was ever launched.
+        With the pair derived, a registry edit moves the agent and every
+        wrapper together and a stale version cannot be written down anywhere.
+
+        Returns the ordered pair (first pass, second pass) plus the sorted
+        '|'-joined key the reviewer seals into a decision as
+        `generalistPassModels`, so callers never re-derive that string either.
+    #>
+    param([string[]]$SupportedModels)
+
+    $allowed = if ($SupportedModels -and @($SupportedModels).Count -gt 0) {
+        @($SupportedModels)
+    }
+    else { @($script:AgentHarnessSupportedModels) }
+
+    $selected = @(foreach ($family in $script:AgentHarnessGeneralistFamilies) {
+            $candidate = @($allowed | Where-Object {
+                    $_ -cmatch $family.Include -and $_ -cnotmatch $family.Exclude
+                }) | Select-Object -First 1
+            if (-not $candidate) {
+                throw ("The supported-model registry carries no '$($family.Family)' generalist. An independent " +
+                    "two-pass review needs one model from each family; add the current one to " +
+                    "`$script:AgentHarnessSupportedModels, newest first.")
+            }
+            [string]$candidate
+        })
+    if ($selected.Count -ne 2 -or $selected[0] -ceq $selected[1]) {
+        throw "The derived generalist pairing is not two distinct models: $($selected -join ', ')."
+    }
+    foreach ($model in $selected) {
+        [void](Assert-AgentSupportedModel -ModelId $model -SupportedModels $allowed -Where "derived generalist pairing")
+    }
+    return [ordered]@{
+        First  = $selected[0]
+        Second = $selected[1]
+        Models = [string[]]@($selected)
+        # Sorted, '|'-joined - the exact shape sealed into a gate decision's
+        # generalistPassModels and re-verified on promotion.
+        SortedKey = (@($selected) | Sort-Object) -join '|'
+    }
+}
+
+function Test-AgentGeneralistModelPair {
+    <#
+        True only when the supplied models are exactly the derived pairing -
+        both members, no third model, no repeat. Case-sensitive, because a
+        model id is an exact argv token.
+    #>
+    param(
+        [AllowNull()][AllowEmptyCollection()][string[]]$Models,
+        [string[]]$SupportedModels
+    )
+    $pair = Get-AgentGeneralistModelPair -SupportedModels $SupportedModels
+    $supplied = @(@($Models) | Where-Object { $_ })
+    if ($supplied.Count -ne 2) { return $false }
+    return ((@($supplied) | Sort-Object) -join '|') -ceq $pair.SortedKey
 }
 
 function Assert-AgentSupportedModel {
@@ -1460,6 +1545,34 @@ function Set-TimedProcessArguments {
 
 function Stop-ProcessTree {
     param([Parameter(Mandatory)][System.Diagnostics.Process]$Process)
+    # A direct child can exit while one of its descendants still owns a copied
+    # stdout/stderr handle. Process.Kill(true) can no longer discover that tree
+    # once the root has exited, but Win32_Process retains each descendant's
+    # ParentProcessId. Snapshot and stop deepest-first before the normal kill
+    # fallbacks so output-drain timeouts do not leave detached pipe holders.
+    if ($IsWindows) {
+        try {
+            $rootStartedAt = $Process.StartTime.ToUniversalTime()
+            $allProcesses = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+            $frontier = @([int]$Process.Id)
+            $descendants = [System.Collections.Generic.List[int]]::new()
+            while ($frontier.Count -gt 0) {
+                $next = [System.Collections.Generic.List[int]]::new()
+                foreach ($candidate in $allProcesses) {
+                    if ($frontier -contains [int]$candidate.ParentProcessId -and
+                        [DateTime]$candidate.CreationDate -ge $rootStartedAt.AddSeconds(-1)) {
+                        [void]$descendants.Add([int]$candidate.ProcessId)
+                        [void]$next.Add([int]$candidate.ProcessId)
+                    }
+                }
+                $frontier = @($next)
+            }
+            for ($index = $descendants.Count - 1; $index -ge 0; $index--) {
+                Stop-Process -Id $descendants[$index] -Force -ErrorAction SilentlyContinue
+            }
+        }
+        catch {}
+    }
     try { $Process.Kill($true); return } catch {}
     try { & taskkill.exe /PID $Process.Id /T /F 2>$null 1>$null } catch {}
     try { $Process.Kill() } catch {}
@@ -1498,6 +1611,8 @@ function Invoke-TimedProcess {
         [switch]$CaptureStdErr,
         [string]$WorkingDirectory,
         [string[]]$EnvironmentVariablesToRemove = @(),
+        [string]$ProgressPath = "",
+        [ValidateRange(0, 86400)][int]$ProgressTimeoutSeconds = 0,
         [Parameter(Mandatory)][int]$TimeoutSeconds
     )
     $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -1515,7 +1630,10 @@ function Invoke-TimedProcess {
     foreach ($variableName in @($EnvironmentVariablesToRemove)) { [void]$psi.EnvironmentVariables.Remove($variableName) }
     foreach ($variableName in (Get-AgentSessionIsolationEnvVars)) { [void]$psi.EnvironmentVariables.Remove($variableName) }
 
-    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $startedAtUtc = [DateTime]::UtcNow
+    $deadline = $startedAtUtc.AddSeconds($TimeoutSeconds)
+    $lastProgressUtc = $startedAtUtc
+    $progressObserved = $false
     $proc = $null
     try {
         $proc = [System.Diagnostics.Process]::Start($psi)
@@ -1539,20 +1657,64 @@ function Invoke-TimedProcess {
         }
 
         $exited = $false
+        $timeoutReason = ""
         if (-not $timedOut) {
-            $remainingMs = [Math]::Max(0, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-            $exited = $proc.WaitForExit($remainingMs)
-            $timedOut = -not $exited
+            if (-not $ProgressPath -or $ProgressTimeoutSeconds -le 0) {
+                $remainingMs = [Math]::Max(0, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+                $exited = $proc.WaitForExit($remainingMs)
+                $timedOut = -not $exited
+                if ($timedOut) { $timeoutReason = "hardDeadline" }
+            }
+            else {
+                while (-not $exited) {
+                    $nowUtc = [DateTime]::UtcNow
+                    if ($nowUtc -ge $deadline) {
+                        $timedOut = $true
+                        $timeoutReason = "hardDeadline"
+                        break
+                    }
+                    if (Test-Path -LiteralPath $ProgressPath) {
+                        $progressItems = [System.Collections.Generic.List[object]]::new()
+                        $rootProgress = Get-Item -LiteralPath $ProgressPath -ErrorAction SilentlyContinue
+                        if ($rootProgress) { [void]$progressItems.Add($rootProgress) }
+                        foreach ($progressItem in @(Get-ChildItem -LiteralPath $ProgressPath -File -Recurse `
+                                    -ErrorAction SilentlyContinue)) {
+                            [void]$progressItems.Add($progressItem)
+                        }
+                        $latestProgress = @($progressItems |
+                                Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1)
+                        if ($latestProgress.Count -eq 1) {
+                            if (-not $progressObserved -or $latestProgress[0].LastWriteTimeUtc -gt $lastProgressUtc) {
+                                $lastProgressUtc = $latestProgress[0].LastWriteTimeUtc
+                            }
+                            $progressObserved = $true
+                        }
+                    }
+                    if ($progressObserved -and
+                        ($nowUtc - $lastProgressUtc).TotalSeconds -ge $ProgressTimeoutSeconds) {
+                        $timedOut = $true
+                        $timeoutReason = "progressDeadline"
+                        break
+                    }
+                    $remainingMs = [Math]::Max(1, [int]($deadline - $nowUtc).TotalMilliseconds)
+                    $exited = $proc.WaitForExit([Math]::Min(250, $remainingMs))
+                }
+            }
         }
 
         if ($timedOut) {
+            if (-not $timeoutReason) { $timeoutReason = "standardInputDeadline" }
             Stop-ProcessTree -Process $proc
             $proc.WaitForExit(5000) | Out-Null
         }
 
         $stdoutResult = Get-TaskTextBeforeDeadline -Task $stdoutTask -DeadlineUtc $deadline
         $stderrResult = Get-TaskTextBeforeDeadline -Task $stderrTask -DeadlineUtc $deadline
-        if (-not $stdoutResult.Completed -or -not $stderrResult.Completed) { $timedOut = $true }
+        if (-not $stdoutResult.Completed -or -not $stderrResult.Completed) {
+            $timedOut = $true
+            if (-not $timeoutReason) { $timeoutReason = "outputDrainDeadline" }
+            Stop-ProcessTree -Process $proc
+        }
 
         $exitCode = -1
         if ($exited -and -not $timedOut) {
@@ -1565,6 +1727,10 @@ function Invoke-TimedProcess {
             StdOut    = $stdoutResult.Text
             StdErr    = $stderrResult.Text
             ProcessId = $proc.Id
+            TimeoutReason = $timeoutReason
+            StartedAtUtc = $startedAtUtc.ToString("o")
+            EndedAtUtc = [DateTime]::UtcNow.ToString("o")
+            LastProgressUtc = $lastProgressUtc.ToString("o")
         }
     }
     finally {
@@ -1600,6 +1766,10 @@ $script:AgentReplayMaxSourceTransportBytes = 16777216
 $script:AgentReplaySnapshotNamePattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z'
 $script:AgentReplayPayloadSegmentPattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,126}[A-Za-z0-9_-]\z|^[A-Za-z0-9]\z'
 $script:AgentReplayHexPattern = '^[0-9a-f]{64}\z'
+# Seal kinds a manifest classification may declare. A classification only ever
+# WITHDRAWS promotability, so every kind here is non-promotable by definition;
+# the list exists so an unknown label is refused rather than honoured blindly.
+$script:AgentReplayNonPromotableSealKinds = @("offlineCorpusSeal")
 # Reference-identity seal, not a string: a constant that a hand-built hashtable
 # can carry would let any in-process caller present itself as a loaded snapshot
 # and skip every check in New-AgentReplaySnapshot. Same pattern as the
@@ -1923,6 +2093,19 @@ function New-AgentReplaySnapshot {
         "binding", "bindings", "resources", "manifestDigest"
     )
     if ($schemaVersion -eq 2) { $manifestKeys += "sourceTransport" }
+    # `classification` is the ONE optional manifest key. It is optional because
+    # every snapshot sealed before it existed has to keep loading and keep its
+    # digest; it is a manifest key rather than a free-standing sidecar because a
+    # label that is not covered by the digest is a label anyone can delete. A
+    # snapshot that omits it is an ordinary promotable snapshot, which is what
+    # schema v1 and pre-existing v2 snapshots are.
+    $hasClassification = [bool]$manifest.PSObject.Properties["classification"]
+    if ($hasClassification) {
+        if ($schemaVersion -ne 2) {
+            throw "Replay manifest carries a classification but declares schema version $schemaVersion; classification is a schema-v2 field."
+        }
+        $manifestKeys += "classification"
+    }
     Assert-AgentReplayExactKeys -Object $manifest -Where "Replay manifest" -Expected $manifestKeys
     if ($script:AgentReplaySchemaVersions -notcontains $schemaVersion) {
         throw "Replay manifest declares schema version $schemaVersion; this build reads versions $($script:AgentReplaySchemaVersions -join ', ')."
@@ -2039,6 +2222,108 @@ function New-AgentReplaySnapshot {
         }
     }
 
+    # -- classification, and the sidecar it binds ---------------------------
+    # Default: an ordinary, promotable snapshot. Stated explicitly rather than
+    # left null, because a consumer that has to test for absence before it can
+    # tell whether something is promotable will eventually forget to.
+    $classificationRecord = @{
+        SealKind      = "standard"
+        NonPromotable = $false
+        SidecarFile   = ""
+        SidecarSha256 = ""
+        Sidecar       = $null
+    }
+    $classificationDigestRecord = $null
+    if ($hasClassification) {
+        $classification = Get-AgentReplayManifestField -Object $manifest -Name "classification" -Type object
+        Assert-AgentReplayExactKeys -Object $classification -Where "Replay manifest classification" -Expected @(
+            "sealKind", "nonPromotable", "sidecarFile", "sidecarSha256"
+        )
+        $sealKind = Get-AgentReplayManifestField -Object $classification -Name "sealKind" -Type string `
+            -Pattern '^[a-z][A-Za-z0-9]{0,31}\z'
+        if ($script:AgentReplayNonPromotableSealKinds -cnotcontains $sealKind) {
+            throw "Replay manifest classification declares sealKind '$sealKind', which this build does not recognize."
+        }
+        $nonPromotable = Get-AgentReplayManifestField -Object $classification -Name "nonPromotable" -Type bool
+        if (-not $nonPromotable) {
+            # A classification block exists ONLY to withdraw promotability. If it
+            # could also assert promotability it would be a way to launder a
+            # sealed snapshot into a promotable one by editing four fields, and
+            # the whole point is that this label can never be talked out of.
+            throw "Replay manifest classification declares nonPromotable = false; a classification may only withdraw promotability, never grant it."
+        }
+        $sidecarRelative = Get-AgentReplayManifestField -Object $classification -Name "sidecarFile" -Type string
+        if ($sidecarRelative.Length -lt 1 -or $sidecarRelative.Length -gt 512) {
+            throw "Replay classification sidecarFile must be 1..512 characters."
+        }
+        $sidecarSegments = @($sidecarRelative -split '/')
+        foreach ($segment in $sidecarSegments) {
+            if ($segment -cnotmatch $script:AgentReplayPayloadSegmentPattern) {
+                throw "Replay classification sidecarFile '$sidecarRelative' is not a plain relative path inside the snapshot."
+            }
+        }
+        $sidecarSha = Get-AgentReplayManifestField -Object $classification -Name "sidecarSha256" -Type sha256
+        $sidecarPath = $snapshotFull
+        for ($segmentIndex = 0; $segmentIndex -lt $sidecarSegments.Count; $segmentIndex++) {
+            $sidecarPath = Join-Path $sidecarPath $sidecarSegments[$segmentIndex]
+            $segmentKind = if ($segmentIndex -eq ($sidecarSegments.Count - 1)) { "File" } else { "Directory" }
+            if (-not (Test-Path -LiteralPath $sidecarPath)) {
+                # Deleting the sidecar is the obvious way to try to shed the
+                # label, so it fails the LOAD rather than merely being noticed.
+                throw "Replay snapshot '$SnapshotName' is classified '$sealKind' but its sidecar '$sidecarRelative' is missing."
+            }
+            [void](Assert-AgentReplayPathSafe -Path $sidecarPath -Within $snapshotFull -Kind $segmentKind)
+        }
+        $sidecarBytes = [System.IO.File]::ReadAllBytes($sidecarPath)
+        if ($sidecarBytes.Length -lt 2 -or $sidecarBytes.Length -gt $script:AgentReplayMaxManifestBytes) {
+            throw "Replay classification sidecar '$sidecarRelative' is $($sidecarBytes.Length) bytes; expected 2..$script:AgentReplayMaxManifestBytes."
+        }
+        if ((Get-AgentReplayBytesSha256 -Bytes $sidecarBytes) -cne $sidecarSha) {
+            throw "Replay classification sidecar '$sidecarRelative' does not match its recorded SHA-256."
+        }
+        $sidecarText = ([System.Text.UTF8Encoding]::new($false, $true)).GetString($sidecarBytes)
+        try { $sidecar = $sidecarText | ConvertFrom-Json -ErrorAction Stop }
+        catch { throw "Replay classification sidecar '$sidecarRelative' is not valid JSON." }
+        if ($sidecar -isnot [System.Management.Automation.PSCustomObject]) {
+            throw "Replay classification sidecar '$sidecarRelative' must be a JSON object."
+        }
+        # The sidecar has to agree with the manifest about what it is about. The
+        # binding runs manifest -> sidecar only: the manifest pins the sidecar's
+        # hash and the digest pins the manifest, so a sidecar that also carried
+        # the manifest digest would close a cycle neither side could compute.
+        foreach ($pair in @(
+                @("snapshotId", $snapshotId),
+                @("sealKind", $sealKind))) {
+            $name = [string]$pair[0]
+            if (-not $sidecar.PSObject.Properties[$name]) {
+                throw "Replay classification sidecar '$sidecarRelative' omits '$name'."
+            }
+            if ([string]$sidecar.PSObject.Properties[$name].Value -cne [string]$pair[1]) {
+                throw "Replay classification sidecar '$sidecarRelative' disagrees with the manifest about '$name'."
+            }
+        }
+        if (-not $sidecar.PSObject.Properties["nonPromotable"] -or -not [bool]$sidecar.nonPromotable) {
+            throw "Replay classification sidecar '$sidecarRelative' does not record nonPromotable = true."
+        }
+        $totalBytes += $sidecarBytes.Length
+        if ($totalBytes -gt $script:AgentReplayMaxTotalPayloadBytes) {
+            throw "Replay snapshot '$SnapshotName' carries more than $script:AgentReplayMaxTotalPayloadBytes payload bytes."
+        }
+        $classificationRecord = @{
+            SealKind      = $sealKind
+            NonPromotable = $true
+            SidecarFile   = $sidecarRelative
+            SidecarSha256 = $sidecarSha
+            Sidecar       = $sidecar
+        }
+        $classificationDigestRecord = [ordered]@{
+            sealKind      = $sealKind
+            nonPromotable = $true
+            sidecarFile   = $sidecarRelative
+            sidecarSha256 = $sidecarSha
+        }
+    }
+
     foreach ($resource in $resources) {
         if ($resource -isnot [System.Management.Automation.PSCustomObject]) { throw "Replay manifest resource must be an object." }
         Assert-AgentReplayExactKeys -Object $resource -Where "Replay manifest resource" -Expected @(
@@ -2108,6 +2393,19 @@ function New-AgentReplaySnapshot {
             -not $envelope.PSObject.Properties["result"] -or $envelope.PSObject.Properties["error"]) {
             throw "Replay payload '$payloadRelative' is not a successful JSON-RPC response envelope."
         }
+        # A well-formed envelope is not the same as a readable one. Every reader
+        # in this toolkit consumes a tool result through Invoke-AgentMcpTool,
+        # which requires the MCP content shape; a raw REST body wrapped in a
+        # JSON-RPC envelope loads, hashes and binds perfectly and then fails at
+        # the read that needs it - after a run has already started. Checking it
+        # here means a snapshot that cannot answer is refused whole, at load,
+        # for EVERY recorded read rather than only the first one a run happens
+        # to reach.
+        if (-not (Test-AgentMcpToolResultShape -Result $envelope.result)) {
+            throw ("Replay payload '$payloadRelative' is not an MCP tool result: it carries no content array " +
+                "with text or an embedded resource, so no reader could consume it. Record the response the MCP " +
+                "server returns, not the REST body it wraps.")
+        }
 
         $served[$requestKey.Key] = @{
             Tool          = $tool
@@ -2159,6 +2457,13 @@ function New-AgentReplaySnapshot {
         $digestInput.binding["commonCommit"] = $bindingRecord.CommonCommit
     }
     if ($schemaVersion -eq 2) { $digestInput["sourceTransport"] = $sourceTransportDigestRecord }
+    # The classification is part of what the manifest ASSERTS, so it is part of
+    # what the digest covers. Editing the sealKind, flipping nonPromotable,
+    # repointing the sidecar or swapping the sidecar's bytes all change this
+    # value, which is what makes the label survive an edit rather than merely
+    # describe one. Absent classification contributes nothing, so every snapshot
+    # sealed before this field existed keeps exactly the digest it had.
+    if ($null -ne $classificationDigestRecord) { $digestInput["classification"] = $classificationDigestRecord }
     $computedDigest = Get-AgentReplayTextSha256 -Text (ConvertTo-AgentReplayCanonicalJson -Value $digestInput)
     if ($computedDigest -cne $recordedDigest) {
         # Deliberately not worded as tamper detection. This digest is unkeyed:
@@ -2190,7 +2495,36 @@ function New-AgentReplaySnapshot {
         Served         = $served
         ServedKeys     = @($served.Keys)
         SourceTransport = $sourceTransportRecord
+        Classification = $classificationRecord
     }
+}
+
+function Assert-AgentReplaySnapshotPromotable {
+    <#
+        The one gate every promotable flow calls before it treats a replayed
+        result as something that can be published, promoted or counted as a
+        qualification. A snapshot that carries a classification has withdrawn
+        its own promotability permanently, and the withdrawal is covered by the
+        manifest digest, so it cannot be shed by deleting a file.
+
+        Deliberately a THROW rather than a boolean. A caller that has to
+        remember to test the answer is a caller that can forget to.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Snapshot,
+        [string]$Operation = "Promotion"
+    )
+    if ($Snapshot["Seal"] -isnot [object] -or -not [object]::ReferenceEquals($Snapshot["Seal"], $script:AgentReplaySnapshotSeal)) {
+        throw "$Operation requires a snapshot produced by New-AgentReplaySnapshot."
+    }
+    $classification = $Snapshot["Classification"]
+    if ($null -eq $classification) { return $true }
+    if ([bool]$classification.NonPromotable) {
+        throw ("$Operation refused: replay snapshot '$($Snapshot.SnapshotId)' is classified " +
+            "'$($classification.SealKind)' and is permanently non-promotable. It was sealed offline from captured " +
+            "material, contacted no live host, and cannot stand behind a published or promoted result.")
+    }
+    return $true
 }
 
 function Get-AgentReplayResponse {
@@ -2431,6 +2765,75 @@ function Open-AgentMcpSession {
         Close-AgentMcpSession -Session $session -Abort
         throw
     }
+}
+
+function Test-AgentMcpToolResultShape {
+    <#
+        True when a JSON-RPC `result` is something a reader could actually
+        consume: the MCP tool-result shape, a content array whose first item
+        carries text or an embedded resource. This is the load-time and
+        seal-time mirror of what Invoke-AgentMcpTool requires at read time, so
+        a recorded response that no reader could parse is refused while it is
+        still being written down rather than in the middle of a run.
+    #>
+    param([Parameter(Mandatory)][AllowNull()]$Result)
+    if ($Result -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+    if ($Result.PSObject.Properties["isError"] -and $Result.isError -eq $true) { return $false }
+    $contentProperty = $Result.PSObject.Properties["content"]
+    if ($null -eq $contentProperty) { return $false }
+    $content = @($contentProperty.Value)
+    if ($content.Count -lt 1 -or $content[0] -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+    $first = $content[0]
+    $textTypeValid = (-not $first.PSObject.Properties["type"] -or [string]$first.type -ceq "text")
+    if ($textTypeValid -and $first.PSObject.Properties["text"] -and
+        $first.text -is [string] -and $first.text.Length -le 20MB) {
+        return $true
+    }
+    if ($first.PSObject.Properties["resource"] -and
+        $first.PSObject.Properties["type"] -and [string]$first.type -ceq "resource" -and
+        $first.resource -is [System.Management.Automation.PSCustomObject]) {
+        if ($content.Count -ne 1) { return $false }
+        if (@($first.PSObject.Properties.Name | Where-Object { @("resource", "type") -cnotcontains $_ }).Count -gt 0) {
+            return $false
+        }
+        $resource = $first.resource
+        if (@("blob", "mimeType", "uri") | Where-Object { -not $resource.PSObject.Properties[$_] }) {
+            return $false
+        }
+        if (@($resource.PSObject.Properties.Name | Where-Object {
+                    @("blob", "mimeType", "uri") -cnotcontains $_
+                }).Count -gt 0) {
+            return $false
+        }
+        if ($resource.uri -isnot [string] -or [string]::IsNullOrWhiteSpace($resource.uri) -or
+            $resource.uri.Length -gt 2048 -or
+            $resource.mimeType -isnot [string] -or [string]::IsNullOrWhiteSpace($resource.mimeType) -or
+            $resource.mimeType.Length -gt 128 -or
+            $resource.blob -isnot [string] -or [string]::IsNullOrWhiteSpace($resource.blob)) {
+            return $false
+        }
+        $blob = [string]$resource.blob
+        if (($blob.Length % 4) -ne 0 -or $blob -notmatch '^[A-Za-z0-9+/]*={0,2}$') { return $false }
+        try { $bytes = [Convert]::FromBase64String($blob) }
+        catch { return $false }
+        if ($bytes.Length -lt 1 -or $bytes.Length -gt 5MB -or
+            [Convert]::ToBase64String($bytes) -cne $blob -or
+            ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)) {
+            return $false
+        }
+        try {
+            $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+        }
+        catch { return $false }
+        foreach ($character in $text.ToCharArray()) {
+            $code = [int]$character
+            if (($code -lt 32 -and $code -notin @(9, 10, 13)) -or $code -eq 127) {
+                return $false
+            }
+        }
+        return $true
+    }
+    return $false
 }
 
 function Invoke-AgentMcpTool {
@@ -4057,6 +4460,8 @@ Export-ModuleMember -Function @(
     "Get-AgentRequiredProperty",
     "Get-AgentDefaultModelSentinel",
     "Assert-AgentSupportedModel",
+    "Get-AgentGeneralistModelPair",
+    "Test-AgentGeneralistModelPair",
     "Test-ParserValidity",
     "Get-OnceFinalExitCode",
     "Test-StrictJsonInt",
@@ -4096,11 +4501,13 @@ Export-ModuleMember -Function @(
     "Send-AgentMcpRequest",
     "Send-AgentMcpNotification",
     "Invoke-AgentMcpTool",
+    "Test-AgentMcpToolResultShape",
     "ConvertFrom-AgentMcpResourceContent",
     "ConvertTo-AgentReplayCanonicalJson",
     "Get-AgentReplayRequestKey",
     "Test-AgentReplayToolPermitted",
     "New-AgentReplaySnapshot",
+    "Assert-AgentReplaySnapshotPromotable",
     "Get-AgentReplayResponse",
     "Get-AgentSupportedProvider",
     "Test-AgentProviderSupported",

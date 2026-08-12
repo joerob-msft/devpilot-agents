@@ -80,11 +80,16 @@ jobs:
       - name: reviewer - two-pass preview is fail-closed
         shell: pwsh
         run: |
+          # The pairing is derived from the supported-model registry, never
+          # written down here: a workflow that names its own model version is
+          # the same defect that spoiled a qualification set.
+          Import-Module ./src/DevPilot.AgentHarness/DevPilot.AgentHarness.psd1 -Force
+          $pair = Get-AgentGeneralistModelPair
           $scriptPath = './src/Agents/reviewer/Start-ReviewerAgent.ps1'
           $common = @(
               '-NoProfile', '-File', $scriptPath, '-DryRun',
               '-ConfigFile', './samples/reviewer-ado.config.json',
-              '-Model', 'claude-opus-5', '-SecondPassModel', 'gpt-5.6-sol'
+              '-Model', $pair.First, '-SecondPassModel', $pair.Second
           )
 
           & pwsh @common
@@ -133,9 +138,11 @@ jobs:
           # -DryRun exits 0 (reaching self-checks) rather than throwing at
           # parameter-resolution time, regardless of -SecondPassModel.
           $scriptPath = './src/Agents/reviewer/Start-ReviewerAgent.ps1'
+          Import-Module ./src/DevPilot.AgentHarness/DevPilot.AgentHarness.psd1 -Force
+          $pair = Get-AgentGeneralistModelPair
           $configs = @(
-              @{ Name = 'single-pass'; Args = @('-Model', 'claude-opus-5') },
-              @{ Name = 'two-pass'; Args = @('-Model', 'claude-opus-5', '-SecondPassModel', 'gpt-5.6-sol') }
+              @{ Name = 'single-pass'; Args = @('-Model', $pair.First) },
+              @{ Name = 'two-pass'; Args = @('-Model', $pair.First, '-SecondPassModel', $pair.Second) }
           )
           foreach ($config in $configs) {
               $configArgs = [string[]]$config.Args
@@ -186,6 +193,16 @@ jobs:
         shell: pwsh
         run: ./tools/Test-ReviewerQualificationPreflight.ps1
 
+      # The qualification INVOCATION itself: the derived generalist pairing, the
+      # single constructed argv per slot, and the binding of that argv through
+      # the agent itself, in its -QualificationPrelaunch mode, which stops at the
+      # agent's own model-launch boundary before creating any state.
+      # Offline: the checks build a sandbox reviewer build and drive the
+      # committed synthetic snapshot, with no host, no network and no model.
+      - name: reviewer replay-qualification invocation checks
+        shell: pwsh
+        run: ./tools/Test-ReviewerReplayQualification.ps1
+
       - name: reviewer - offline replay is fail-closed and preview-only
         shell: pwsh
         run: |
@@ -193,10 +210,12 @@ jobs:
           $replayRoot = './src/Agents/reviewer/testdata/replay-v1'
           $digest = (Get-Content './src/Agents/reviewer/testdata/replay-v1/synthetic-pr/manifest.json' -Raw |
               ConvertFrom-Json).manifestDigest
+          Import-Module ./src/DevPilot.AgentHarness/DevPilot.AgentHarness.psd1 -Force
+          $pair = Get-AgentGeneralistModelPair
           $common = @(
               '-NoProfile', '-File', $scriptPath,
               '-ConfigFile', './samples/reviewer-ado.config.json',
-              '-Model', 'claude-opus-5', '-OperatorAlias', 'example-operator',
+              '-Model', $pair.First, '-OperatorAlias', 'example-operator',
               '-ReplayRoot', $replayRoot, '-ReplaySnapshotName', 'synthetic-pr',
               '-ReplayManifestDigest', $digest
           )
@@ -224,7 +243,7 @@ jobs:
               }
               # An incomplete replay invocation is refused rather than guessed at.
               $partial = & pwsh -NoProfile -File $scriptPath -ConfigFile './samples/reviewer-ado.config.json' `
-                  -Model 'claude-opus-5' -OperatorAlias 'example-operator' -ReplayRoot $replayRoot 2>&1 | Out-String
+                  -Model $pair.First -OperatorAlias 'example-operator' -ReplayRoot $replayRoot 2>&1 | Out-String
               if ($LASTEXITCODE -eq 0 -or $partial -notmatch 'requires all of') {
                   throw "A partial replay invocation was not refused: $partial"
               }

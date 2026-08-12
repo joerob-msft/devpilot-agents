@@ -19,6 +19,10 @@
     text.
 
 .EXAMPLE
+    ./tools/Compare-ReviewerReplayRuns.ps1 -VerifyRunSet -RunSetPath runset-*.json `
+        -KeyPath ~/.devpilot/state/artifact-signing.key
+
+.EXAMPLE
     ./tools/Compare-ReviewerReplayRuns.ps1 -ArtifactPath run1.json, run2.json `
         -KeyPath ~/.devpilot/state/artifact-signing.key -OutputDirectory ./out
 #>
@@ -37,7 +41,21 @@ param(
     [Parameter(ParameterSetName = "Declare")]
     [ValidatePattern('^[0-9a-fA-F]{64}\z')][string[]]$ExpectedRunSha256 = @(),
     [Parameter(ParameterSetName = "Declare")][string]$Purpose = "",
-    [string]$RunSetPath = "",
+    # The plan the set is declared FOR, as a digest. A declaration that fixes
+    # only the snapshot and the run count still permits a slot to run a
+    # different command against it - a different model pairing, a different
+    # reviewed repository, a different agent build. Sealing the plan digest
+    # makes the declaration a statement about the exact runs, and the runner
+    # refuses anything whose plan does not hash to this.
+    [Parameter(ParameterSetName = "Declare")]
+    [ValidatePattern('^[0-9a-fA-F]{64}\z')][string]$PlanDigest = "",
+    # Read a sealed declaration back, verifying its signature, and emit its
+    # manifest. Generic on purpose: anything that must act on a declaration can
+    # then verify it cryptographically rather than parsing the envelope and
+    # trusting the text inside it.
+    [Parameter(Mandatory, ParameterSetName = "Verify")][switch]$VerifyRunSet,
+    [Parameter(Mandatory, ParameterSetName = "Verify")]
+    [Parameter(ParameterSetName = "Compare")][string]$RunSetPath = "",
     # The declaration is sealed before any run exists, so it is normally sealed
     # under its own key rather than under any run''s. Defaults to the first run
     # key for the case where they share a state directory.
@@ -92,12 +110,31 @@ function Get-ReviewerReplayRunMasterKey {
     }
 }
 
+function Get-ReviewerReplayDerivedKey {
+    <#
+        The replay-domain key for one key file. Replay artifacts are sealed
+        under a derived key precisely so they cannot verify against the
+        promotion path; deriving it in one place keeps every reader of a replay
+        artifact - reconciliation, declaration, verification - on the same
+        label.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $master = Get-ReviewerReplayRunMasterKey -Path (Resolve-Path -LiteralPath $Path).ProviderPath
+    if ($master.Length -lt 32) { throw "Artifact signing key '$Path' is too short." }
+    $hmac = [System.Security.Cryptography.HMACSHA256]::new($master)
+    try {
+        return , $hmac.ComputeHash([Text.UTF8Encoding]::new($false).GetBytes("devpilot.reviewer.replay.artifact.v1"))
+    }
+    finally { $hmac.Dispose() }
+}
+
 # One key for all runs, or one per run in the same order. Repeats are naturally
 # run in isolated state directories - that is what keeps them independent - and
 # each of those mints its own signing key, so insisting on a single key would
 # mean either sharing state between runs or not comparing them at all.
 $keyPaths = @($KeyPath)
-if ($keyPaths.Count -ne 1 -and $keyPaths.Count -ne @($ArtifactPath).Count) {
+if (-not $DeclareRunSet -and -not $VerifyRunSet -and
+    $keyPaths.Count -ne 1 -and $keyPaths.Count -ne @($ArtifactPath).Count) {
     throw "Supply one -KeyPath for all runs, or exactly one per -ArtifactPath (got $($keyPaths.Count) keys for $(@($ArtifactPath).Count) artifacts)."
 }
 
@@ -106,17 +143,20 @@ foreach ($path in $keyPaths) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "Artifact signing key '$path' does not exist."
     }
-    $master = Get-ReviewerReplayRunMasterKey -Path (Resolve-Path -LiteralPath $path).ProviderPath
-    if ($master.Length -lt 32) { throw "Artifact signing key '$path' is too short." }
-    # Replay artifacts are sealed under a derived key precisely so they cannot
-    # verify against the promotion path. Derive the same label here; a manifest
-    # that only verifies under the RAW key is a live-run artifact and has no
-    # business in a replay reconciliation.
-    $hmac = [System.Security.Cryptography.HMACSHA256]::new($master)
-    try {
-        $replayKeys += , $hmac.ComputeHash([Text.UTF8Encoding]::new($false).GetBytes("devpilot.reviewer.replay.artifact.v1"))
-    }
-    finally { $hmac.Dispose() }
+    $replayKeys += , (Get-ReviewerReplayDerivedKey -Path $path)
+}
+
+# Verifying a declaration is a read: it proves the sealed bytes were sealed
+# under this key and returns what they say. Nothing else here may act on a
+# declaration it has not verified.
+if ($VerifyRunSet) {
+    $verifyKey = $replayKeys[0]
+    if ($RunSetKeyPath) { $verifyKey = Get-ReviewerReplayDerivedKey -Path $RunSetKeyPath }
+    $verified = Read-ReviewerRunReconciliationSet -Path (Resolve-Path -LiteralPath $RunSetPath).ProviderPath `
+        -MasterKey $verifyKey
+    Write-Host "Verified qualification run set $($verified.setId) for snapshot '$($verified.snapshotName)'." -ForegroundColor DarkCyan
+    Write-Output (ConvertTo-Json -InputObject $verified -Depth 8 -Compress)
+    exit 0
 }
 
 $manifests = @()
@@ -151,6 +191,7 @@ if ($DeclareRunSet) {
         snapshotManifestDigest = $SnapshotManifestDigest.ToLowerInvariant()
         plannedRunCount = $(if (@($ExpectedRunSha256).Count -gt 0) { @($ExpectedRunSha256).Count } else { $PlannedRunCount })
         expectedRunSha256 = @(@($ExpectedRunSha256) | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object)
+        planDigest = $PlanDigest.ToLowerInvariant()
         purpose = $Purpose
         promotable = $false
         declaredAt = [DateTime]::UtcNow.ToString("o")
@@ -172,14 +213,7 @@ if ($RunSetPath) {
     # under its own key rather than under any run's. Fall back to the first run
     # key for the case where the declaration shares a state directory.
     $runSetKey = $replayKeys[0]
-    if ($RunSetKeyPath) {
-        $runSetMaster = Get-ReviewerReplayRunMasterKey -Path (Resolve-Path -LiteralPath $RunSetKeyPath).ProviderPath
-        $runSetHmac = [System.Security.Cryptography.HMACSHA256]::new($runSetMaster)
-        try {
-            $runSetKey = $runSetHmac.ComputeHash([Text.UTF8Encoding]::new($false).GetBytes("devpilot.reviewer.replay.artifact.v1"))
-        }
-        finally { $runSetHmac.Dispose() }
-    }
+    if ($RunSetKeyPath) { $runSetKey = Get-ReviewerReplayDerivedKey -Path $RunSetKeyPath }
     $runSet = Read-ReviewerRunReconciliationSet -Path (Resolve-Path -LiteralPath $RunSetPath).ProviderPath -MasterKey $runSetKey
     if (@($ArtifactPath).Count -ne [int]$runSet.plannedRunCount) {
         throw ("The declared run set $($runSet.setId) planned $([int]$runSet.plannedRunCount) run(s) but " +
@@ -215,20 +249,42 @@ foreach ($path in @($ArtifactPath)) {
     $resolved = (Resolve-Path -LiteralPath $path).ProviderPath
     $key = $(if ($replayKeys.Count -eq 1) { $replayKeys[0] } else { $replayKeys[$index] })
     $manifest = $null
+    # A file either verifies as a cross-verification decision or it does not.
+    # If it does, it IS that artifact, and every remaining question about it is
+    # a question about its contents - so the specialist reader is never tried
+    # afterwards. It used to be: the "no reconciliation manifest" throw landed
+    # in the same catch as a signature failure, the same bytes were then
+    # re-read under the specialist's domain key, and an honest empty run was
+    # reported to the operator as a signature failure on an artifact whose
+    # signature had in fact just verified.
+    $verificationManifest = $null
+    $verificationError = $null
     try {
         $verificationManifest = Read-ReviewerVerificationPreview -Path $resolved -MasterKey $key
+    }
+    catch {
+        $verificationError = $_
+    }
+    if ($null -ne $verificationManifest) {
         $manifest = Get-ReviewerConventionSpecialistValue `
             -Object $verificationManifest -Name "reconciliationManifest" -Default $null
         if ($null -eq $manifest) {
-            throw "Verification decision artifact has no reconciliation manifest."
+            # Throws unless the artifact proves it is an empty run, and carries
+            # the original sentence when it does throw.
+            $manifest = New-ReviewerRunReconciliationEmptyRunInput `
+                -VerificationManifest $verificationManifest `
+                -Source ([IO.Path]::GetFileName($resolved)) `
+                -NoManifestError "Verification decision artifact has no reconciliation manifest."
         }
     }
-    catch {
+    else {
         try {
             $manifest = Read-ReviewerConventionSpecialistPreview -Path $resolved -MasterKey $key
         }
         catch {
-            throw
+            throw ("Artifact '$resolved' is neither a cross-verification decision (" +
+                $verificationError.Exception.Message + ") nor a convention specialist preview (" +
+                $_.Exception.Message + ").")
         }
     }
     $replay = $manifest.PSObject.Properties["replay"]

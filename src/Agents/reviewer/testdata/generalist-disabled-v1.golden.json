@@ -168,7 +168,11 @@
       },
       {
         "sha256": "e172b0267cd87a521b71120bfca1350293c492c5b10926ff659edec7f091a279",
-        "reason": "CURRENT and authoritative. Count explicit changed-file line targets alongside lexical construct coverage without changing the disabled generalist discovery or delivery path."
+        "reason": "History only, superseded below. Count explicit changed-file line targets alongside lexical construct coverage without changing the disabled generalist discovery or delivery path."
+      },
+      {
+        "sha256": "d9c05cece0a6464f793221223da98853c7cca47d554e515b59b38b7543c1e79e",
+        "reason": "CURRENT and authoritative. Emit the replay identity block from one shared definition instead of an inline copy, byte-for-byte identical, so the cross-verification decision carries the same snapshot, digest and nonce and an empty run can be bound to the recording it replayed."
       }
     ]
   },

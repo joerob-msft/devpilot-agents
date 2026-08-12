@@ -339,7 +339,21 @@ param(
 
     # Capture a passing source-transport artifact and stop before authoritative
     # source reads or model launches. Requires the capture path above.
-    [switch]$CaptureSourceTransportOnly
+    [switch]$CaptureSourceTransportOnly,
+
+    # --- Qualification prelaunch. Runs THIS script's own startup validation -
+    # config, prompt closure, models, permissions, replay snapshot load and
+    # binding, repository and state-directory resolution - against the exact
+    # argument vector a qualification slot will run, then stops at the last
+    # instruction before any state directory is created, and prints what it
+    # resolved. It grants nothing: it is a strictly earlier exit on the normal
+    # path, so a command that survives it is the command that would have run.
+    #
+    # It exists because a qualification run set is sealed BEFORE its runs, and
+    # a set declared against an invocation that cannot start is spoiled. A
+    # wrapper that only re-checked its own copy of this script's parameter
+    # metadata would still miss everything decided by the body below.
+    [switch]$QualificationPrelaunch
 )
 
 $ErrorActionPreference = "Stop"
@@ -446,6 +460,13 @@ if (-not $importedHarness) {
         "or run this script from a checkout of the devpilot-agents repository.")
 }
 $HarnessPath = $importedHarness.Path
+# The independent generalist pairing is DERIVED from the harness's
+# supported-model registry, never spelled out here. Startup validation, the
+# sealed-decision re-verification below, and every out-of-repo qualification
+# wrapper read the SAME derivation, so retiring a model moves all of them at
+# once instead of leaving one of them asking for a version this script has
+# already stopped accepting.
+$script:ReviewerGeneralistModelPair = Get-AgentGeneralistModelPair
 $ConventionPackLibrary = Join-Path $PSScriptRoot "ConventionPacks.ps1"
 if (-not (Test-Path -LiteralPath $ConventionPackLibrary)) {
     throw "Convention-pack library '$ConventionPackLibrary' does not exist."
@@ -841,6 +862,57 @@ function Get-ReviewerHashValue {
         return $Default
     }
     return $Default
+}
+
+function Get-ReviewerCandidateSourceRequest {
+    <#
+        THE one place the candidate-discovery read is composed.
+
+        A run that names its pull request resolves THAT pull request directly; a
+        repository-wide census is only asked for when the run has to choose its
+        own candidate. This is a correctness property rather than an
+        optimization: an offline replay snapshot is sealed around the bounded
+        set of reads a run actually needs, and a cycle that always asked for the
+        census demanded a recorded list no bounded snapshot carries - which
+        killed both slots of a qualification set before a model ever launched.
+
+        The prelaunch probe and the live cycle both call this, so a snapshot
+        that answers the preflight is a snapshot that answers the run.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Project,
+        [Parameter(Mandatory)][string]$RepositoryName,
+        [ValidateRange(0, 2147483647)][int]$TargetPullRequestId = 0,
+        [string]$TargetRefName = "",
+        [ValidateRange(1, 1000)][int]$Top = 100
+    )
+    if ($TargetPullRequestId -gt 0) {
+        return [pscustomobject][ordered]@{
+            Name      = "repo_pull_request"
+            Action    = "get"
+            Arguments = [ordered]@{
+                action        = 'get'
+                project       = $Project
+                repositoryId  = $RepositoryName
+                pullRequestId = $TargetPullRequestId
+            }
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($TargetRefName)) {
+        throw "An untargeted candidate list requires a target ref name; a census with no target ref is not a bounded read."
+    }
+    return [pscustomobject][ordered]@{
+        Name      = "repo_pull_request"
+        Action    = "list"
+        Arguments = [ordered]@{
+            action        = 'list'
+            project       = $Project
+            repositoryId  = $RepositoryName
+            status        = 'Active'
+            targetRefName = $TargetRefName
+            top           = $Top
+        }
+    }
 }
 
 function Get-ReviewerCanonicalJson {
@@ -2525,6 +2597,36 @@ foreach ($a in @($AuthorAliases)) {
     if ($a -notmatch '^[A-Za-z0-9._-]+$') { throw "-AuthorAliases entry '$a' is not a safe alias." }
 }
 
+# ---------------------------------------------------------------------------
+# Qualification prelaunch. A strictly earlier exit on the normal path: every
+# validation below still runs, and the process stops immediately before the
+# first state directory is created. It is refused in combination with anything
+# that delivers, promotes, captures, mutates state, or diverts into the
+# self-check fixtures, because a prelaunch that could do any of those would be
+# a new capability rather than an earlier stop.
+# ---------------------------------------------------------------------------
+if ($QualificationPrelaunch) {
+    $prelaunchRefusedSwitches = @(
+        @{ Name = "-DryRun"; Set = [bool]$DryRun },
+        @{ Name = "-ShowState"; Set = [bool]$ShowState },
+        @{ Name = "-ResetStarvedCandidates"; Set = [bool]$ResetStarvedCandidates },
+        @{ Name = "-CaptureSourceTransportOnly"; Set = [bool]$CaptureSourceTransportOnly },
+        @{ Name = "-CaptureSourceTransportArtifactPath"; Set = [bool]$CaptureSourceTransportArtifactPath },
+        @{ Name = "-EnableFindingComments"; Set = [bool]$EnableFindingComments },
+        @{ Name = "-EnableSummaryComment"; Set = [bool]$EnableSummaryComment },
+        @{ Name = "-EnableApprovalVote"; Set = [bool]$EnableApprovalVote },
+        @{ Name = "-EnableVerifiedCommentGate"; Set = [bool]$EnableVerifiedCommentGate },
+        @{ Name = "-EnableVerifiedSuggestionGate"; Set = [bool]$EnableVerifiedSuggestionGate },
+        @{ Name = "-EnableVerifiedApprovalGate"; Set = [bool]$EnableVerifiedApprovalGate },
+        @{ Name = "-PromotePreview"; Set = [bool]$PromotePreview },
+        @{ Name = "-PromoteVerifiedPreview"; Set = [bool]$PromoteVerifiedPreview }
+    )
+    $prelaunchRefused = @($prelaunchRefusedSwitches | Where-Object { $_.Set } | ForEach-Object { [string]$_.Name })
+    if ($prelaunchRefused.Count -gt 0) {
+        throw ("-QualificationPrelaunch validates an invocation and exits before any state exists; it cannot be " +
+            "combined with $($prelaunchRefused -join ', ').")
+    }
+}
 # A vote with no visible reasoning is an unexplained verdict on someone else's
 # work. Refuse the combination at startup rather than discovering it per-PR.
 if ($EnableApprovalVote -and -not $EnableFindingComments) {
@@ -2581,6 +2683,33 @@ if ($CaptureSourceTransportOnly) {
             "$($captureRefused -join ', ').")
     }
 }
+
+# Two children, two different scrubs, and the asymmetry is deliberate rather
+# than an oversight - it is worth stating because the "obviously stricter"
+# version of this is broken.
+#
+# The Copilot child AUTHENTICATES to GitHub with COPILOT_GITHUB_TOKEN, GH_TOKEN
+# or GITHUB_TOKEN. Stripping those does not harden it, it stops it starting: on
+# a host where GITHUB_TOKEN is the only one set, a stricter scrub is
+# indistinguishable from a broken agent, and the failure surfaces as an
+# authentication error nobody will connect to a credential-hygiene change. It
+# gets the ADO-PAT-shaped names, which it has no use for and must not carry.
+#
+# The `agency mcp ado` child is the reverse. It authenticates through agency's
+# own credential flow, so it needs neither family, and a GitHub token in its
+# environment is pure blast radius. It gets both.
+#
+# Neither list is a substitute for the tool grant: the model has no shell and no
+# outbound-network tool, so it cannot read an environment variable at all. This
+# bounds what a COMPROMISED CHILD PROCESS holds, not what the model can ask for.
+#
+# Defined here, above the qualification prelaunch boundary, so the prelaunch
+# source probe opens its session with the SAME scrub the cycle uses rather than
+# a second copy of the list that could drift from it.
+$CopilotSensitiveEnvironmentVariables = @("AZURE_DEVOPS_EXT_PAT", "SYSTEM_ACCESSTOKEN")
+$McpSensitiveEnvironmentVariables = $CopilotSensitiveEnvironmentVariables +
+@("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
+
 # ---------------------------------------------------------------------------
 # Offline snapshot replay. Resolved BEFORE the delivery authorization is minted
 # and before the state directory is chosen, because it changes both.
@@ -2616,6 +2745,19 @@ if ($ReplaySnapshotName -or $ReplayRoot -or $ReplayManifestDigest) {
     $script:ReviewerReplaySnapshot = New-AgentReplaySnapshot -ReplayRoot $ReplayRoot `
         -SnapshotName $ReplaySnapshotName -ExpectedManifestDigest $ReplayManifestDigest
     $script:ReviewerReplayActive = $true
+    # A classified snapshot has permanently withdrawn its own promotability, and
+    # the withdrawal rides in the manifest digest rather than in a file someone
+    # can delete. Replay already refuses every promote and write switch above, so
+    # this is belt-and-braces - but it is the check that stays correct if that
+    # list is ever missed, and it says out loud in the log what the run is built
+    # on, so nobody reads a corpus-sealed result as a live one later.
+    $script:ReviewerReplayClassification = $script:ReviewerReplaySnapshot.Classification
+    if ([bool]$script:ReviewerReplayClassification.NonPromotable) {
+        Write-Warning ("Replay snapshot '$ReplaySnapshotName' is classified " +
+            "'$($script:ReviewerReplayClassification.SealKind)' and is permanently non-promotable: it was sealed " +
+            "offline from captured material and contacted no live host. This run is research evidence and can " +
+            "never be promoted or published.")
+    }
     # Publish replay where scope cannot hide it. $script: is invisible from a
     # module, a thread job, or a child pwsh, and a guard that cannot see the
     # flag would read that as permission to go live. The environment is visible
@@ -2752,10 +2894,10 @@ if ($EffectiveEnableVerificationPreview) {
     if (-not $IsTwoPass) {
         throw "Verification preview requires two explicitly named independent generalist passes."
     }
-    if (@($ReviewPassModels | Where-Object {
-                $_ -ceq "claude-opus-5" -or $_ -ceq "gpt-5.6-sol"
-            }).Count -ne 2) {
-        throw "Verification preview requires the explicit claude-opus-5 and gpt-5.6-sol generalist pairing."
+    if (-not (Test-AgentGeneralistModelPair -Models @($ReviewPassModels))) {
+        throw ("Verification preview requires the explicit " +
+            "$($script:ReviewerGeneralistModelPair.First) and " +
+            "$($script:ReviewerGeneralistModelPair.Second) generalist pairing.")
     }
     if (-not $EnableConventionSpecialist) {
         throw "Verification preview requires -EnableConventionSpecialist so all layer-5 inputs are present."
@@ -2814,6 +2956,99 @@ if ($script:ReviewerReplayActive) {
     # external mutation by another name, and reached without any write switch.
     $StateDir = Join-Path (Join-Path $StateDir "replay") $script:ReviewerReplaySnapshot.SnapshotId
 }
+# THE model-launch boundary for qualification. Everything above is this agent's
+# real startup validation, run against the exact argument vector the slot will
+# run; the next statement is the first one that creates anything. Stopping here
+# means a preflight that passes has proven the invocation starts, without a
+# state directory, a signing key, a session, a host call or a model.
+if ($QualificationPrelaunch) {
+    if (-not $script:ReviewerReplayActive) {
+        throw "-QualificationPrelaunch is restricted to offline replay; a live prelaunch probe is not permitted."
+    }
+    if ($PullRequestId -le 0) {
+        throw "-QualificationPrelaunch requires an explicit -PullRequestId so its source probe is bounded."
+    }
+
+    # Exercise the exact first wrapper-owned source request while the replay
+    # seam still guarantees zero host access - no process is started for a
+    # replay session, so this probe cannot reach the network even in principle.
+    # It catches a snapshot/config request-contract mismatch (a snapshot keyed
+    # on a repository identity the config does not name, a snapshot that carries
+    # no bounded direct read for this pull request) before a run set is
+    # declared, which is the only place that mismatch can still be fixed.
+    $probeRequest = Get-ReviewerCandidateSourceRequest -Project $ExpectedProject `
+        -RepositoryName $RepositoryName -TargetPullRequestId $PullRequestId -TargetRefName $TargetRefName
+    if ([string]$probeRequest.Action -cne "get") {
+        throw "-QualificationPrelaunch must probe a bounded direct read, not a '$($probeRequest.Action)'."
+    }
+    $probeKey = Get-AgentReplayRequestKey -Name $probeRequest.Name -Arguments $probeRequest.Arguments
+    $prelaunchSession = $null
+    $probeResolvedPullRequestId = 0
+    try {
+        $prelaunchSession = Open-AgentMcpSession -AgencyPath "offline-replay-not-executed" -Server "ado" `
+            -Organization $Organization -Toolsets @("repos") -TimeoutSeconds 30 `
+            -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables `
+            -ReplaySnapshot $script:ReviewerReplaySnapshot
+        $prelaunchPr = Invoke-AgentMcpTool -Session $prelaunchSession -Name $probeRequest.Name `
+            -Arguments $probeRequest.Arguments
+        if (-not $prelaunchPr) {
+            throw "Qualification prelaunch did not resolve the explicitly requested pull request."
+        }
+        $probeResolvedPullRequestId = [int](Get-ReviewerHashValue -Container $prelaunchPr -Key 'pullRequestId' -Default 0)
+        if ($probeResolvedPullRequestId -ne $PullRequestId) {
+            throw ("Qualification prelaunch resolved pull request $probeResolvedPullRequestId from the snapshot's " +
+                "recorded direct read, not the requested $PullRequestId.")
+        }
+    }
+    finally {
+        if ($prelaunchSession) { Close-AgentMcpSession -Session $prelaunchSession }
+    }
+
+    $prelaunch = [ordered]@{
+        seam                 = "reviewer.qualification-prelaunch.v1"
+        agentScriptSha256    = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        configFile           = $ConfigFile
+        configSha256         = (Get-FileHash -LiteralPath $ConfigFile -Algorithm SHA256).Hash.ToLowerInvariant()
+        promptFile           = $PromptFile
+        repoPath             = $RepoPath
+        # Resolved, deliberately NOT created: the caller is told exactly where
+        # this run would have written, and nothing is written.
+        plannedStateDir      = $StateDir
+        stateDirExists       = [bool](Test-Path -LiteralPath $StateDir)
+        operatorAlias        = $OperatorAlias
+        pullRequestId        = $PullRequestId
+        organization         = $Organization
+        project              = $ExpectedProject
+        repositoryId         = $cfgRepoId
+        model                = $EffectiveModel
+        secondPassModel      = $EffectiveSecondPassModel
+        isTwoPass            = [bool]$IsTwoPass
+        conventionSpecialist = [bool]$EnableConventionSpecialist
+        conventionSpecialistModel = $EffectiveConventionSpecialistModel
+        verificationPreview  = [bool]$EffectiveEnableVerificationPreview
+        conventionVerifierModel = $EffectiveConventionVerifierModel
+        deliveryAuthorization = [string]$DeliveryAuthorization.Kind
+        deliveryAuthorizationReason = [string]$DeliveryAuthorization.Reason
+        replayActive         = [bool]$script:ReviewerReplayActive
+        replaySnapshotId     = $(if ($script:ReviewerReplayActive) { [string]$script:ReviewerReplaySnapshot.SnapshotId } else { "" })
+        replayManifestDigest = $(if ($script:ReviewerReplayActive) { [string]$script:ReviewerReplaySnapshot.ManifestDigest } else { "" })
+        replayNonPromotable  = $(if ($script:ReviewerReplayActive) { [bool]$script:ReviewerReplayClassification.NonPromotable } else { $false })
+        # Evidence of the probe, not a claim that one happened: the exact tool,
+        # action, arguments and request key the cycle will ask with, plus the
+        # pull request the snapshot answered with. A caller can recompute the
+        # key from the arguments and look it up in the snapshot it planned
+        # against, so "the run's first read is recorded" is checkable outside
+        # this process.
+        sourceProbeTool          = [string]$probeRequest.Name
+        sourceProbeAction        = [string]$probeRequest.Action
+        sourceProbeArguments     = [pscustomobject]$probeRequest.Arguments
+        sourceProbeRequestSha256 = [string]$probeKey.Key
+        sourceProbePullRequestId = [int]$probeResolvedPullRequestId
+    }
+    Write-Output ("REVIEWER_QUALIFICATION_PRELAUNCH_V1 " +
+        (ConvertTo-Json -InputObject ([pscustomobject]$prelaunch) -Depth 6 -Compress))
+    exit 0
+}
 New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
 $StateDir = (Resolve-Path -LiteralPath $StateDir).Path
 
@@ -2860,27 +3095,6 @@ $ReviewFactScriptClosure = @(
         sha256 = (Get-FileHash -LiteralPath $ReviewFactLibrary -Algorithm SHA256).Hash.ToLowerInvariant()
     }
 )
-# Two children, two different scrubs, and the asymmetry is deliberate rather
-# than an oversight - it is worth stating because the "obviously stricter"
-# version of this is broken.
-#
-# The Copilot child AUTHENTICATES to GitHub with COPILOT_GITHUB_TOKEN, GH_TOKEN
-# or GITHUB_TOKEN. Stripping those does not harden it, it stops it starting: on
-# a host where GITHUB_TOKEN is the only one set, a stricter scrub is
-# indistinguishable from a broken agent, and the failure surfaces as an
-# authentication error nobody will connect to a credential-hygiene change. It
-# gets the ADO-PAT-shaped names, which it has no use for and must not carry.
-#
-# The `agency mcp ado` child is the reverse. It authenticates through agency's
-# own credential flow, so it needs neither family, and a GitHub token in its
-# environment is pure blast radius. It gets both.
-#
-# Neither list is a substitute for the tool grant: the model has no shell and no
-# outbound-network tool, so it cannot read an environment variable at all. This
-# bounds what a COMPROMISED CHILD PROCESS holds, not what the model can ask for.
-$CopilotSensitiveEnvironmentVariables = @("AZURE_DEVOPS_EXT_PAT", "SYSTEM_ACCESSTOKEN")
-$McpSensitiveEnvironmentVariables = $CopilotSensitiveEnvironmentVariables +
-@("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
 
 # Operator state inspection / recovery. These run before any cycle so a starved
 # or confusing state can be examined and cleared without hand-editing JSON.
@@ -3220,13 +3434,23 @@ function Invoke-ReviewerConventionSession {
         [Parameter(Mandatory)][string]$AgencyPath,
         [Parameter(Mandatory)][scriptblock]$Action,
         [scriptblock]$OpenSession,
-        [scriptblock]$CloseSession
+        [scriptblock]$CloseSession,
+        # A caller working against a hard wall-clock deadline may lower the
+        # transport's per-request timeout so the session it opens cannot outlive
+        # the bound it was started under. Zero keeps the configured timeout.
+        [ValidateRange(0, [int]::MaxValue)][int]$RequestTimeoutSeconds = 0
     )
+    $effectiveTimeoutSeconds = if ($RequestTimeoutSeconds -gt 0) {
+        [Math]::Min([int]$RequestTimeoutSeconds, [int]$McpTimeoutSeconds)
+    }
+    else {
+        [int]$McpTimeoutSeconds
+    }
     if (-not $OpenSession) {
         $OpenSession = {
             param([string]$Path)
             Open-AgentMcpSession -AgencyPath $Path -Server "ado" `
-                -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
+                -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $effectiveTimeoutSeconds `
                 -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables `
                 -ReplaySnapshot $script:ReviewerReplaySnapshot
         }
@@ -4575,7 +4799,7 @@ function Set-ReviewerVote {
 
 function Invoke-DryRunSelfChecks {
     $failures = New-Object System.Collections.Generic.List[string]
-    $total = 47
+    $total = 48
 
     Write-Host "[DRY-RUN] Self-check 1/$total : parser validity + prompt presence" -ForegroundColor Cyan
     foreach ($p in @($PSCommandPath, $HarnessPath)) {
@@ -7222,7 +7446,7 @@ function Invoke-DryRunSelfChecks {
             runOk = $true; runReasonCodes = @(); allWithheldReasonsSafe = $true
             verificationInputSha256 = ("1" * 64); verificationDecisionSha256 = ("2" * 64)
             passesRequested = 2; generalistPairComplete = $true
-            generalistPassModels = ((@("claude-opus-5", "gpt-5.6-sol") | Sort-Object) -join '|')
+            generalistPassModels = $script:ReviewerGeneralistModelPair.SortedKey
             decisionExpiresAtUtc = ([DateTime]::UtcNow.AddHours(1).ToString("o"))
             candidates = @($candidate); unattendedComments = @($candidate); unattendedSuggestions = @()
             humanPromotableComments = @($candidate)
@@ -7306,7 +7530,7 @@ function Invoke-DryRunSelfChecks {
         @{ Name = "verification decision sha missing"; Args = @{ DecisionOverrides = @{ verificationDecisionSha256 = ("0" * 64) } }; Reason = "verificationDecisionShaMissing" }
         @{ Name = "sealed pass count below two"; Args = @{ DecisionOverrides = @{ passesRequested = 1 } }; Reason = "sealedPassCountBelowTwo" }
         @{ Name = "generalist pair incomplete"; Args = @{ DecisionOverrides = @{ generalistPairComplete = $false } }; Reason = "generalistPassIncomplete" }
-        @{ Name = "generalist model pair mismatch"; Args = @{ DecisionOverrides = @{ generalistPassModels = "claude-opus-5" } }; Reason = "generalistPairMismatch" }
+        @{ Name = "generalist model pair mismatch"; Args = @{ DecisionOverrides = @{ generalistPassModels = $script:ReviewerGeneralistModelPair.First } }; Reason = "generalistPairMismatch" }
         @{ Name = "revalidation failed"; Args = @{ RevalidationOk = $false }; Reason = "revalidationFailed" }
         @{ Name = "PR not active"; Args = @{ PrIsActive = $false }; Reason = "prNotActive" }
         @{ Name = "PR is draft"; Args = @{ PrIsDraft = $true }; Reason = "prIsDraft" }
@@ -7837,8 +8061,8 @@ function Invoke-DryRunSelfChecks {
     $sc47NullPassAccounting = Get-ReviewerGateGeneralistPassAccounting -InputManifest $sc47NullPassManifest
     $sc47DegradedManifest = [pscustomobject]@{
         rawGeneralistPasses = @(
-            [pscustomobject]@{ status = "degraded"; model = "claude-opus-5"; markerJson = "" },
-            [pscustomobject]@{ status = "degraded"; model = "gpt-5.6-sol"; markerJson = "" }
+            [pscustomobject]@{ status = "degraded"; model = $script:ReviewerGeneralistModelPair.First; markerJson = "" },
+            [pscustomobject]@{ status = "degraded"; model = $script:ReviewerGeneralistModelPair.Second; markerJson = "" }
         )
     }
     $sc47DegradedAccounting = Get-ReviewerGateGeneralistPassAccounting -InputManifest $sc47DegradedManifest
@@ -7886,6 +8110,44 @@ function Invoke-DryRunSelfChecks {
         # never a broad delete of anything under the real -StateDir.
         Remove-Item -LiteralPath $gateSelfCheckSandboxDir -Recurse -Force -ErrorAction SilentlyContinue
     }
+
+    Write-Host "[DRY-RUN] Self-check 48/$total : candidate discovery is a direct get when a pull request is named, and a list only when it is not" -ForegroundColor Cyan
+    # The third pre-model defect: the cycle always asked for a repository-wide
+    # census, and a bounded offline snapshot carries no such list, so both slots
+    # of a declared qualification set died before a model launched. The shape of
+    # each request is asserted here rather than left to a live read.
+    $sc48Targeted = Get-ReviewerCandidateSourceRequest -Project "ExampleProject" -RepositoryName "Example-Service" `
+        -TargetPullRequestId 4242 -TargetRefName "refs/heads/main"
+    $sc48TargetedKeys = @($sc48Targeted.Arguments.Keys | ForEach-Object { [string]$_ } | Sort-Object)
+    if ([string]$sc48Targeted.Name -cne "repo_pull_request" -or [string]$sc48Targeted.Action -cne "get" -or
+        ($sc48TargetedKeys -join ',') -cne "action,project,pullRequestId,repositoryId" -or
+        [string]$sc48Targeted.Arguments['action'] -cne "get" -or
+        [int]$sc48Targeted.Arguments['pullRequestId'] -ne 4242 -or
+        [string]$sc48Targeted.Arguments['repositoryId'] -cne "Example-Service") {
+        $failures.Add("A targeted run's candidate request is not the bounded direct get for exactly that pull request.")
+    }
+    else { Write-Host "  OK - a named pull request is resolved by a bounded direct get" -ForegroundColor Green }
+
+    $sc48Untargeted = Get-ReviewerCandidateSourceRequest -Project "ExampleProject" -RepositoryName "Example-Service" `
+        -TargetRefName "refs/heads/main"
+    $sc48UntargetedKeys = @($sc48Untargeted.Arguments.Keys | ForEach-Object { [string]$_ } | Sort-Object)
+    if ([string]$sc48Untargeted.Action -cne "list" -or
+        ($sc48UntargetedKeys -join ',') -cne "action,project,repositoryId,status,targetRefName,top" -or
+        [string]$sc48Untargeted.Arguments['status'] -cne "Active" -or
+        [string]$sc48Untargeted.Arguments['targetRefName'] -cne "refs/heads/main") {
+        $failures.Add("An untargeted run's candidate request is not the active-pull-request list for the target ref.")
+    }
+    else { Write-Host "  OK - only an untargeted run asks the repository for a census" -ForegroundColor Green }
+
+    $sc48RefusedUnbounded = $false
+    try {
+        Get-ReviewerCandidateSourceRequest -Project "ExampleProject" -RepositoryName "Example-Service" | Out-Null
+    }
+    catch { $sc48RefusedUnbounded = $true }
+    if (-not $sc48RefusedUnbounded) {
+        $failures.Add("A census with neither a pull request nor a target ref was composed instead of refused.")
+    }
+    else { Write-Host "  OK - a request bounded by neither a pull request nor a target ref is refused" -ForegroundColor Green }
 
     Write-Host ""
     if ($failures.Count -eq 0) {
@@ -8745,6 +9007,41 @@ function Get-ReviewerConventionSpecialistResolvedSources {
     return $resolved.ToArray()
 }
 
+function New-ReviewerReplayArtifactIdentity {
+    <#
+        The replay identity block every run artifact carries.
+
+        One definition, because two artifacts of the same run that disagreed
+        about which snapshot produced them would be worse than either being
+        absent - and because an artifact WITHOUT this block cannot be bound to
+        the recording it replayed, which is what reconciliation compares.
+
+        Returns $null outside replay: a live run is not a replay of anything.
+    #>
+    if (-not $script:ReviewerReplayActive) { return $null }
+    return [pscustomobject][ordered]@{
+        snapshotId = [string]$script:ReviewerReplaySnapshot.SnapshotId
+        manifestDigest = [string]$script:ReviewerReplaySnapshot.ManifestDigest
+        replayNonce = [string]$script:ReviewerReplaySnapshot.ReplayNonce
+        promotable = $false
+        # What actually served source here. Replay declines the MCP
+        # capability probe, and declines the live az CLI fallback if
+        # config asked for it, so source always comes from the
+        # snapshot-backed legacy path - which may not be the
+        # transport the recorded run used.
+        sourceTransportMode = $(if ($script:ReviewerReplaySourceTransportMode) {
+                $script:ReviewerReplaySourceTransportMode
+            } else { "snapshotLegacy" })
+        capabilityProbeSuppressed = $true
+        azCliFallbackSuppressed = [bool]$script:ReviewerReplayAzFallbackSuppressed
+        # Machine-readable counterpart to the residual risk above, so
+        # a consumer cannot mistake one run for a reconciled result.
+        runsReconciled = 1
+        reconciled = $false
+        reconciliationNote = "One replay run. Statuses are unreconciled until compared against another run with a distinct nonce."
+    }
+}
+
 function Write-ReviewerConventionSpecialistPreview {
     param(
         [Parameter(Mandatory)][int]$PrId,
@@ -8977,30 +9274,7 @@ function Write-ReviewerConventionSpecialistPreview {
         residualRisks = @($ResidualRisks)
         markdownPath = $markdownPath
         markdownSha256 = Get-ReviewerConventionSpecialistSha256 -Text $markdown
-        replay = $(if ($script:ReviewerReplayActive) {
-                [pscustomobject][ordered]@{
-                    snapshotId = [string]$script:ReviewerReplaySnapshot.SnapshotId
-                    manifestDigest = [string]$script:ReviewerReplaySnapshot.ManifestDigest
-                    replayNonce = [string]$script:ReviewerReplaySnapshot.ReplayNonce
-                    promotable = $false
-                    # What actually served source here. Replay declines the MCP
-                    # capability probe, and declines the live az CLI fallback if
-                    # config asked for it, so source always comes from the
-                    # snapshot-backed legacy path - which may not be the
-                    # transport the recorded run used.
-                    sourceTransportMode = $(if ($script:ReviewerReplaySourceTransportMode) {
-                            $script:ReviewerReplaySourceTransportMode
-                        } else { "snapshotLegacy" })
-                    capabilityProbeSuppressed = $true
-                    azCliFallbackSuppressed = [bool]$script:ReviewerReplayAzFallbackSuppressed
-                    # Machine-readable counterpart to the residual risk above, so
-                    # a consumer cannot mistake one run for a reconciled result.
-                    runsReconciled = 1
-                    reconciled = $false
-                    reconciliationNote = "One replay run. Statuses are unreconciled until compared against another run with a distinct nonce."
-                }
-            }
-            else { $null })
+        replay = New-ReviewerReplayArtifactIdentity
         createdAt = [DateTime]::UtcNow.ToString("o")
     }
     $masterKey = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
@@ -9632,6 +9906,11 @@ function Write-ReviewerVerificationDecisionPreview {
         eligiblePreviewCandidates = @($Eligible)
         reconciliationManifest = $ReconciliationManifest
         replaySha256 = $ReplaySha256
+        # The same replay identity the specialist preview carries. Without it a
+        # decision that embeds no reconciliation manifest - the shape a degraded
+        # specialist produces - could not be bound to the recording it replayed,
+        # and an honest empty run would be unreconcilable.
+        replay = New-ReviewerReplayArtifactIdentity
         markdownPath = $markdownPath
         markdownSha256 = Get-ReviewerVerificationSha256 -Text $markdown
         createdAt = [DateTime]::UtcNow.ToString("o", [Globalization.CultureInfo]::InvariantCulture)
@@ -10324,25 +10603,45 @@ function Invoke-ReviewerCrossVerificationPass {
     $orderedGroupKeys = [System.Collections.Generic.List[string]]::new()
     foreach ($groupKey in $groups.Keys) { [void]$orderedGroupKeys.Add([string]$groupKey) }
     $orderedGroupKeys.Sort([StringComparer]::Ordinal)
-    # Deterministic 2N preflight: prove the WHOLE required verifier run set fits
-    # the declared run and time budget BEFORE launching a single model. Either
-    # every required run can launch or none does - no partial launch that would
-    # cross-check some candidates and silently degrade the rest when the phase
-    # clock expires mid-loop.
+    # Deterministic 2N preflight: prove the WHOLE required verifier ASSIGNMENT set
+    # fits the declared run and time budget BEFORE launching a single model. The
+    # unit is assignments - every candidate once by GPT and once by Opus - not the
+    # grouped invocations they happen to be batched into, because grouping is an
+    # implementation detail and budgeting it would make the reservation a promise
+    # about batching rather than about the work. Either every required assignment
+    # can launch or none does: no partial launch that would cross-check some
+    # candidates and silently degrade the rest when the phase clock expires
+    # mid-loop.
+    #
+    # The plan is also the ONLY source of the per-invocation timeout and of the
+    # absolute phase deadline: the phase (less a reserved overhead slice for
+    # setup, fresh binding, reconciliation and artifact writes) is divided among
+    # the required assignments, and each admitted group is handed exactly the
+    # share the preflight reserved, so admission and invocation cannot disagree
+    # about how long a run may take.
     $budgetPreflight = Assert-ReviewerVerificationBudgetPreflight `
-        -RequiredRunCount $orderedGroupKeys.Count `
+        -RequiredAssignmentCount ([int]$assignmentCoverage.requiredAssignmentCount) `
+        -InvocationCount $orderedGroupKeys.Count `
         -MaxVerifierRuns ([int]$EffectiveCrossVerificationPolicy.maxVerifierRuns) `
         -MaxPhaseSeconds ([int]$EffectiveCrossVerificationPolicy.maxVerificationSeconds) `
         -ConfiguredRunTimeoutSeconds $EffectiveVerificationTimeoutSeconds `
         -ElapsedSeconds $verificationPhaseStopwatch.Elapsed.TotalSeconds
+    $admittedRunTimeoutSeconds = [int]$budgetPreflight.perInvocationTimeoutSeconds
+    $verificationPhaseDeadlineSeconds = [int]$budgetPreflight.phaseDeadlineSeconds
     if (-not [bool]$budgetPreflight.canLaunch) {
         Write-ReviewerCycleMetadata -Fields @{
             cycle = $CycleNumber; mode = "verification-budget-preflight"; prId = $prId
             sourceCommit = $sourceCommit; result = "degraded"; reason = [string]$budgetPreflight.reason
-            requiredRunCount = [int]$budgetPreflight.requiredRunCount
-            effectiveMaxRuns = [int]$budgetPreflight.effectiveMaxRuns
+            requiredAssignmentCount = [int]$budgetPreflight.requiredAssignmentCount
+            invocationCount = [int]$budgetPreflight.invocationCount
+            effectiveMaxAssignments = [int]$budgetPreflight.effectiveMaxAssignments
             requiredSeconds = [int]$budgetPreflight.requiredSeconds
             remainingSeconds = [int]$budgetPreflight.remainingSeconds
+            reservedOverheadSeconds = [int]$budgetPreflight.reservedOverheadSeconds
+            perAssignmentTimeoutSeconds = [int]$budgetPreflight.perAssignmentTimeoutSeconds
+            perInvocationTimeoutSeconds = [int]$budgetPreflight.perInvocationTimeoutSeconds
+            minAssignmentSeconds = [int]$budgetPreflight.minAssignmentSeconds
+            maxSupportedAssignmentCount = [int]$budgetPreflight.maxSupportedAssignmentCount
         }
         # No launch: mark every planned assignment degraded up front.
         foreach ($key in $orderedGroupKeys) {
@@ -10351,7 +10650,7 @@ function Invoke-ReviewerCrossVerificationPass {
                         assignmentId = [string]$assignment.assignmentId
                         status = "degraded"
                         reason = [string]$budgetPreflight.reason
-                        detail = "Verification budget preflight refused to launch: the full required run set does not fit the declared run/time budget."
+                        detail = "Verification budget preflight refused to launch: the full required assignment set does not fit the declared run/time budget."
                         model = [string]$assignment.verifierModel
                         clusterId = [string]$assignment.clusterId
                         nonceSha256 = "0" * 64
@@ -10372,12 +10671,12 @@ function Invoke-ReviewerCrossVerificationPass {
         $clusterId = [string]$groupAssignments[0].clusterId
         $verifierModel = [string]$groupAssignments[0].verifierModel
         # No mid-loop budget re-check. The deterministic preflight above already
-        # proved the WHOLE admitted set fits the run and time budget by reserving
-        # the full configured per-run timeout for every planned run, so every
-        # admitted group launches with that configured timeout. Re-checking the
-        # phase clock here is exactly what re-opened the partial-launch window:
-        # a run that consumed most of its timeout could starve a later planned
-        # group even though the preflight had already reserved room for it.
+        # proved the WHOLE admitted set fits the run and time budget by dividing
+        # the remaining phase among the required runs, so every admitted group
+        # launches with the exact share the preflight reserved for it. Re-checking
+        # the phase clock here is what re-opened the partial-launch window: a run
+        # that consumed most of its bound could strand a later planned group even
+        # though room had already been reserved for it.
         $cluster = @($clusters | Where-Object { [string]$_.clusterId -ceq $clusterId })[0]
         $candidateIds = @($groupAssignments | ForEach-Object { [string]$_.candidateId })
         $assignedCandidates = @($cluster.members | Where-Object {
@@ -10427,7 +10726,7 @@ function Invoke-ReviewerCrossVerificationPass {
             -AssignedCandidates $assignedCandidates -SiblingEvidence $siblingEvidence `
             -EvidenceHunks $assignedHunks -CandidateEvidence $assignedEvidence `
             -DeterministicFacts $relevantFacts -ThreadFacts $relevantThreads `
-            -TimeoutSeconds $EffectiveVerificationTimeoutSeconds
+            -TimeoutSeconds $admittedRunTimeoutSeconds
         foreach ($assignment in $groupAssignments) {
             [void]$runRecords.Add([pscustomobject][ordered]@{
                     assignmentId = [string]$assignment.assignmentId
@@ -10444,21 +10743,107 @@ function Invoke-ReviewerCrossVerificationPass {
                 })
         }
     }
-    $freshBinding = Invoke-ReviewerConventionSession -AgencyPath $AgencyPath -Action {
-        param([hashtable]$verificationSession)
-        return Get-ReviewerPinnedConventionChangeSet -Session $verificationSession -PrId $prId `
-            -ExpectedSourceCommit $sourceCommit
+    # The cap is a bound on the PHASE, not on the launches inside it. The reserved
+    # overhead slice above is what setup, this fresh binding, reconciliation and
+    # the artifact write are supposed to fit into. If the phase has nonetheless
+    # crossed its absolute deadline, the phase STOPS here: it does not spend more
+    # wall clock on a live fresh binding it cannot afford, and it does not publish
+    # findings that were produced outside the bound the operator declared.
+    # Recording the overrun and continuing was the earlier behaviour, and a bound
+    # that is only ever logged is not a bound.
+    $phaseDeadlineState = Get-ReviewerVerificationPhaseDeadlineState `
+        -PhaseDeadlineSeconds $verificationPhaseDeadlineSeconds `
+        -ElapsedSeconds $verificationPhaseStopwatch.Elapsed.TotalSeconds
+    $phaseDeadlineOverrun = [bool]$phaseDeadlineState.exceeded
+    if ($phaseDeadlineOverrun) {
+        Write-ReviewerCycleMetadata -Fields @{
+            cycle = $CycleNumber; mode = "verification-phase-deadline"; prId = $prId
+            sourceCommit = $sourceCommit
+            result = [string]$phaseDeadlineState.result
+            phaseDeadlineSeconds = [int]$phaseDeadlineState.phaseDeadlineSeconds
+            phaseElapsedSeconds = [int]$phaseDeadlineState.elapsedSeconds
+            phaseRemainingSeconds = [int]$phaseDeadlineState.remainingSeconds
+            minPostprocessingSeconds = [int]$phaseDeadlineState.minPostprocessingSeconds
+            reservedOverheadSeconds = [int]$budgetPreflight.reservedOverheadSeconds
+            requiredAssignmentCount = [int]$budgetPreflight.requiredAssignmentCount
+            invocationCount = [int]$budgetPreflight.invocationCount
+        }
+        foreach ($runRecord in $runRecords) {
+            $runRecord.status = "degraded"
+            $runRecord.reason = "phaseDeadline"
+            $runRecord.detail = [string]$phaseDeadlineState.detail
+            $runRecord.marker = $null
+        }
     }
-    if ($freshBinding.TargetCommit -cne $targetCommit -or $freshBinding.Digest -cne $changeSetDigest) {
+    # The fresh binding is a LIVE read, so it is only attempted while the phase
+    # still has deadline left, AND only under a transport timeout whose worst
+    # case fits in what is left. Checking the deadline and then starting an
+    # unbounded live call would let the call itself breach the bound. Skipping it
+    # is not a weakening: the results it would have re-bound are already withheld.
+    $freshBindingBudget = Get-ReviewerVerificationFreshBindingBudget `
+        -DeadlineState $phaseDeadlineState -RequestTimeoutSeconds ([int]$McpTimeoutSeconds)
+    if (-not [bool]$freshBindingBudget.allowed -and -not $phaseDeadlineOverrun) {
+        # The deadline has not passed, but the binding cannot be bounded inside
+        # it. Fail closed exactly as an overrun would: unre-bound results are not
+        # published as if they had been re-bound.
+        Write-ReviewerCycleMetadata -Fields @{
+            cycle = $CycleNumber; mode = "verification-fresh-binding-skipped"; prId = $prId
+            sourceCommit = $sourceCommit
+            reason = [string]$freshBindingBudget.reason
+            availableSeconds = [int]$freshBindingBudget.availableSeconds
+            phaseRemainingSeconds = [int]$phaseDeadlineState.remainingSeconds
+        }
         foreach ($runRecord in $runRecords) {
             $runRecord.status = "degraded"
             $runRecord.reason = "staleBinding"
-            $runRecord.detail = "The source/change-set binding moved during verification."
+            $runRecord.detail = [string]$freshBindingBudget.detail
             $runRecord.marker = $null
+        }
+    }
+    if ([bool]$freshBindingBudget.allowed) {
+        $freshBinding = Invoke-ReviewerConventionSession -AgencyPath $AgencyPath `
+            -RequestTimeoutSeconds ([int]$freshBindingBudget.requestTimeoutSeconds) -Action {
+            param([hashtable]$verificationSession)
+            return Get-ReviewerPinnedConventionChangeSet -Session $verificationSession -PrId $prId `
+                -ExpectedSourceCommit $sourceCommit
+        }
+        if ($freshBinding.TargetCommit -cne $targetCommit -or $freshBinding.Digest -cne $changeSetDigest) {
+            foreach ($runRecord in $runRecords) {
+                $runRecord.status = "degraded"
+                $runRecord.reason = "staleBinding"
+                $runRecord.detail = "The source/change-set binding moved during verification."
+                $runRecord.marker = $null
+            }
+        }
+        # The binding is bounded, not instantaneous: the deadline is re-evaluated
+        # immediately after it and BEFORE anything is published, so a phase that
+        # crossed the line while re-binding still withholds everything.
+        $phaseDeadlineState = Get-ReviewerVerificationPhaseDeadlineState `
+            -PhaseDeadlineSeconds $verificationPhaseDeadlineSeconds `
+            -ElapsedSeconds $verificationPhaseStopwatch.Elapsed.TotalSeconds
+        if ([bool]$phaseDeadlineState.exceeded -and -not $phaseDeadlineOverrun) {
+            $phaseDeadlineOverrun = $true
+            Write-ReviewerCycleMetadata -Fields @{
+                cycle = $CycleNumber; mode = "verification-phase-deadline"; prId = $prId
+                sourceCommit = $sourceCommit
+                result = [string]$phaseDeadlineState.result
+                phaseDeadlineSeconds = [int]$phaseDeadlineState.phaseDeadlineSeconds
+                phaseElapsedSeconds = [int]$phaseDeadlineState.elapsedSeconds
+                phaseRemainingSeconds = [int]$phaseDeadlineState.remainingSeconds
+                minPostprocessingSeconds = [int]$phaseDeadlineState.minPostprocessingSeconds
+                stage = "afterFreshBinding"
+            }
+            foreach ($runRecord in $runRecords) {
+                $runRecord.status = "degraded"
+                $runRecord.reason = "phaseDeadline"
+                $runRecord.detail = [string]$phaseDeadlineState.detail
+                $runRecord.marker = $null
+            }
         }
     }
     $replay = Invoke-ReviewerVerificationReplay -InputManifest $inputManifest `
         -VerifierRuns $runRecords.ToArray()
+    $replay = Limit-ReviewerVerificationToPhaseDeadline -Replay $replay -DeadlineState $phaseDeadlineState
     $status = if (@($runRecords | Where-Object { $_.status -cne "complete" }).Count -eq 0) {
         "complete"
     }
@@ -11193,7 +11578,7 @@ function Get-ReviewerGateGeneralistPassAccounting {
     $completedModels = @($completed | ForEach-Object {
             [string](Get-ReviewerHashValue -Container $_ -Key 'model' -Default '')
         } | Where-Object { $_ } | Sort-Object)
-    $expectedModels = @("claude-opus-5", "gpt-5.6-sol") | Sort-Object
+    $expectedModels = @($script:ReviewerGeneralistModelPair.Models) | Sort-Object
     return @{
         Passes          = $passes
         Completed       = $completed
@@ -11294,7 +11679,7 @@ function New-ReviewerVerifiedMultiPassAuthorization {
     # gateComments/gateApproval (including replay, which uses gateComments)
     # keep the EXISTING live-process requirement unchanged: those purposes
     # only ever run within the SAME cycle that just produced the passes.
-    $expectedGeneralistPair = (@("claude-opus-5", "gpt-5.6-sol") | Sort-Object) -join '|'
+    $expectedGeneralistPair = $script:ReviewerGeneralistModelPair.SortedKey
     $structurallyPossible = if ($Purpose -ceq "gatePromotion") {
         ([int](Get-ReviewerHashValue -Container $decision -Key 'passesRequested' -Default 0) -eq 2) -and
         ([bool](Get-ReviewerHashValue -Container $decision -Key 'generalistPairComplete' -Default $false)) -and
@@ -11303,7 +11688,7 @@ function New-ReviewerVerifiedMultiPassAuthorization {
     }
     else {
         [bool]$IsTwoPass -and [bool]$EffectiveEnableVerificationPreview -and [bool]$EnableConventionSpecialist -and
-        (@($ReviewPassModels | Where-Object { $_ -ceq "claude-opus-5" -or $_ -ceq "gpt-5.6-sol" }).Count -eq 2)
+        (Test-AgentGeneralistModelPair -Models @($ReviewPassModels))
     }
 
     $targetBranchName = $TargetRefName -replace '^refs/heads/', ''
@@ -11363,7 +11748,8 @@ function New-ReviewerVerifiedMultiPassAuthorization {
         $script:ReviewerVerifiedMultiPassSeal,
         [ReviewerDeliveryAuthorizationKind]::VerifiedMultiPass,
         2,
-        "independent claude-opus-5/gpt-5.6-sol two-pass union, cross-verified and gate-sealed for '$Purpose'",
+        ("independent $($script:ReviewerGeneralistModelPair.First)/$($script:ReviewerGeneralistModelPair.Second) " +
+            "two-pass union, cross-verified and gate-sealed for '$Purpose'"),
         $PrId,
         $ExpectedSourceCommit,
         $coverageDigest
@@ -13621,22 +14007,20 @@ function Invoke-ReviewerCycle {
             -ReplaySnapshot $script:ReviewerReplaySnapshot
 
         # -- Step 1: candidate list (wrapper-owned, deterministic) ------------
-        $rawPrs = Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
-            action = 'list'; project = $ExpectedProject; repositoryId = $RepositoryName
-            status = 'Active'; targetRefName = $TargetRefName; top = 100
-        }
+        # Composed in ONE place, shared with the qualification prelaunch probe:
+        # a targeted run resolves its pull request directly and never asks for a
+        # repository-wide census it does not need (and that a bounded offline
+        # snapshot does not carry).
+        $candidateRequest = Get-ReviewerCandidateSourceRequest -Project $ExpectedProject `
+            -RepositoryName $RepositoryName -TargetPullRequestId $PullRequestId -TargetRefName $TargetRefName
+        $rawCandidateResponse = Invoke-AgentMcpTool -Session $session -Name $candidateRequest.Name `
+            -Arguments $candidateRequest.Arguments
+        $rawPrs = @(@($rawCandidateResponse) | Where-Object { $_ })
         $reviewedState = Get-JsonState -Path $reviewedStatePath
         $attemptsState = Get-JsonState -Path $attemptsStatePath
 
         if ($PullRequestId -gt 0) {
             $candidates = @(@($rawPrs) | Where-Object { $_ -and [int](Get-ReviewerHashValue -Container $_ -Key 'pullRequestId' -Default 0) -eq $PullRequestId })
-            if ($candidates.Count -eq 0) {
-                # It may exist but not be in the listed slice; ask for it directly.
-                $direct = Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
-                    action = 'get'; project = $ExpectedProject; repositoryId = $RepositoryName; pullRequestId = $PullRequestId
-                }
-                if ($direct) { $candidates = @($direct) }
-            }
             Write-Host "Candidates: restricted to PR $PullRequestId ($($candidates.Count) found)." -ForegroundColor Cyan
         }
         else {

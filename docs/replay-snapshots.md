@@ -117,7 +117,14 @@ resources, 24 MB per payload, 64 MB in total). It records
   source-transport artifact's relative path, SHA-256 and byte length;
 - `manifestDigest` - a canonical digest over everything above.
 
-Every payload is the exact JSON-RPC response line the read returned.
+Every payload is the exact JSON-RPC response line the read returned, and every
+one of them must be a response a reader could actually consume: an MCP tool
+result, that is, a `content` array whose first item carries `text` or an
+embedded `resource`. The loader checks that at load, for every recorded read,
+because a raw REST body wrapped in a JSON-RPC envelope loads, hashes and binds
+perfectly and then fails at the read that needs it - halfway through a run that
+has already been declared. Record what the MCP server returns, not the REST body
+it wraps.
 
 ### What the digest does and does not prove
 
@@ -206,6 +213,228 @@ snapshot - invented organization, invented repository, a synthetic GUID and two
 made-up files - that exercises the mode end to end without any real repository
 content. `tools/Test-ReplaySnapshot.ps1` drives it.
 
+## Sealing offline from a captured corpus
+
+Sometimes the capture already happened and what survives is not payload files
+laid out for the sealer but a research **corpus**: a directory of captured bytes
+plus a `corpus-index.json` binding every one of them to a path, a SHA-256 and a
+byte length. `tools/Save-CorpusReplaySeal.ps1` turns that into a schema-v2
+snapshot without contacting anything.
+
+```pwsh
+./tools/Save-CorpusReplaySeal.ps1 `
+    -CorpusRoot <corpus> -CorpusIndexSha256 <64 hex> `
+    -Recipe <private recipe>.json -ReplayRoot <private replay root>
+```
+
+It has no live seam and no fallback: no MCP session, no repository host, no `az`,
+no child process, no network. The only bytes it can read are the ones the index
+names plus, when the recipe asks for it, one hash-pinned versioned policy file
+(see below). The only way it can fail to find something is by refusing.
+`-CorpusIndexSha256` is mandatory, because an index that is merely
+self-consistent proves nothing - whoever edited it could recompute whatever it
+contains. The tool also refuses a corpus or an output root inside this
+repository, since a seal is private evidence about a real pull request and is
+never committed. Containment is checked against *real* paths: every component of
+an operator-supplied corpus root or replay root is walked, and a reparse point
+anywhere along either one is refused rather than followed, because a junction is
+otherwise a one-line way to make "outside the repository" resolve back inside it.
+
+That guard lives in `Save-ReviewerCorpusSeal` itself, not only in the CLI, so a
+caller reaching the library directly gets the same protection - and it runs
+twice, once before staging and once immediately before publication, refusing if
+the root moved in between. PowerShell cannot hold a directory handle across a
+rename, so the window cannot be closed entirely; two checks and a root-identity
+comparison are the strongest defence available here, and the alternative of
+checking once was strictly worse.
+
+### The recipe states everything twice
+
+`src/Agents/reviewer/schemas/reviewer.offline-corpus-seal-recipe.v1.json`
+describes the private recipe. It is deliberately redundant with the corpus: it
+must independently bind the organization, project, repository, pull request and
+iteration; the source, common and target commits; the authoritative change-set
+digest *and* its exact path order; every changed file's right-hand payload, hash,
+length and spans; the siblings, rules, threads and facts the prompts consume; the
+policy, config, script, schema and prompt hashes; the source transport's mode,
+coverage record, gate and rendered block; the capture provenance and
+status-at-capture; and its own non-promotability.
+
+Redundancy is the point. Anywhere the recipe and the corpus disagree, one of them
+is wrong and neither is authoritative enough to overrule the other, so the seal
+refuses instead of adopting whatever the corpus happens to say. The refusals are
+specific: a tampered or missing payload, a wrong index digest, a stale commit or
+iteration, another pull request's identity substituted in, an aliased path
+(`..`, a backslash, a doubled slash, a drive letter, a case-fold twin), an extra
+payload the index never listed, two resources answering one request, a declared
+hash or length the corpus does not have, or a source census that leaves an
+authoritative changed path neither delivered nor explicitly accounted for as
+having no right-hand content.
+
+Completeness is measured against the **change set**, not against the recipe. The
+authoritative changed paths and their change kinds are derived from the captured
+change metadata, and a path there that does not survive normalization is a
+refusal rather than something to filter away quietly - a recipe cannot shrink the
+denominator by declaring fewer files or by naming a path the change set spells
+differently. Every authoritative path is passed through the transport report, so
+its coverage fraction is the real one. A path may be declared as carrying no
+right-hand content only when its authoritative change kind proves it (a deletion
+or an otherwise source-free change); anything else must arrive with sealed bytes.
+Declared change kinds are compared to the authoritative ones in both directions.
+
+Identity is bound in three independent parts, not one. The corpus index names the
+repository it was captured from as `organization/project/repositoryName`, and the
+recipe must agree with all three; the repository GUID is bound separately, from
+the captured identity payload. A recipe that binds only the GUID could present
+one repository's evidence under another organization and project, so binding it
+alone is not accepted. The captured identity must also carry the pull request,
+iteration, source, common and target commits, status, draft flag and repository
+id, and the **end-of-capture** identity - the only evidence that the pull request
+did not move *while* it was being read - is checked against every one of those it
+carries (accepting `lastMergeSourceCommit`/`lastMergeTargetCommit` as the names
+some captures use). An end identity that declares `matchesInitialCapture: false`,
+or that carries nothing checkable at all, is refused.
+
+Sealed right-hand bytes are bound to a **recorded read** of that exact path. A
+resource that names this repository and the source commit is held to the whole
+contract rather than the part of it that happened to be present: `action` must be
+`get_content`, `versionType` must be `Commit`, `project` must be the bound
+project, `organization` must match when the recorded tool carries it, and `path`
+must be the canonical repository path *itself*. Aliases are refused, not
+normalized, so `//src/a.cs`, `/src/./a.cs` and `\src\a.cs` do not bind to
+`/src/a.cs`. Two recorded source reads of one path are refused as well.
+
+Each recorded read declares how its captured bytes become the response the loader
+serves. `mcpTextContent` and `mcpResourceContent` wrap captured text or file
+content the way the MCP server does. `jsonRpcResult` embeds the captured JSON
+verbatim, which is only honest when what was captured *is* a tool result, so the
+seal refuses it for anything else - a captured REST body sealed verbatim would
+produce a snapshot that loads perfectly and that no reader can consume, which is
+a failure a corpus seal must not be able to hide. Seal such a payload as
+`mcpTextContent`.
+
+Nothing is written into the published location until every check has passed. The
+seal is built into a staging replay root beside the target, loaded back through
+the production loader from staging, and only then moved into place; an existing
+snapshot being replaced with `-Force` is set aside first and restored if any step
+fails. Output paths are prevalidated as a set before any of them is created, so
+an artifact file cannot collide with the manifest, the sidecar, a payload, or an
+ancestor directory of one. A refusal is always a refusal to create rather than a
+half-written snapshot.
+
+The replay root is validated **in the library**, not only in the CLI, because a
+safety property one entry point enforces is a property the other entry point does
+not have. A root that is a reparse point, that resolves somewhere other than
+where it is named, or that lies lexically or really inside the toolkit working
+tree is refused outright. PowerShell cannot hold a directory handle across a
+rename, so the defence is to check at every moment that matters rather than once:
+the root, the staging root, every payload parent, the artifact parent, the
+sidecar and manifest parents, and the publication source and target are each
+re-checked for reparse points and boundary containment immediately before they
+are written through or moved. Cleanup - the one path that runs even when
+everything else failed - never recurses through a reparse point; a link is
+unlinked and only real directories are descended into.
+
+### Source transport, offline
+
+The sealed source-transport artifact is either **adopted** from one the capture
+recorded - held to exactly the standard `Import-ReviewerSourceTransportReplayArtifact`
+applies, which re-derives the coverage record, gate and block from the report and
+refuses any divergence - or **derived** from the corpus by running the reviewer's
+own report, gate and block renderer over the captured right-hand bytes with a
+reader that can only return indexed corpus payloads.
+
+Derivation is not invention, but it is not capture either. The block nonce is
+declared in the recipe rather than generated, because a seal must be reproducible
+byte for byte; it is a boundary marker, not a secret, and the live path still
+generates a fresh one per run.
+
+The policy the report derives under has exactly two admissible origins, and the
+recipe must name exactly one of them:
+
+- `corpusPath` - the policy the capture itself recorded, as an indexed corpus
+  payload. Preferred, because then the seal is a function of indexed bytes alone.
+- `toolkitPath` - a versioned policy file in the toolkit, for the ordinary case
+  of a capture that recorded no policy document. It is not a live seam: no MCP
+  session, repository host, `az` invocation or child process is involved, just a
+  hash-pinned read of a file already under version control. It is nonetheless
+  fenced hard, because a mutable file is the weakest input a seal has. The path
+  must lie under `src/Agents/reviewer/source/`, must resolve to a real path still
+  inside that tree with a reparse point anywhere along it refused, and the recipe
+  must pin both its SHA-256 and its byte length - which are verified against the
+  bytes actually read and against `hashes.policySha256`. Any divergence refuses
+  the seal.
+
+Which route was taken is recorded, not inferred: the classification sidecar
+carries `sourceTransport.policyProvenance` of `corpus` or `toolkitSealTime` and
+the reference it resolved. `toolkitSealTime` says exactly what it means - this
+byte-for-byte reproducibility holds against *that* policy revision, and a reader
+who wants to know which one can compare `policySha256`.
+
+### Right-hand content and spans are derived, not declared
+
+Two independent bindings decide what a sealed file shows and where it points, and
+neither of them trusts the recipe.
+
+The **bytes**: for every sealed path there must be exactly one recorded read in
+the recipe's own resource list whose arguments name this repository, this path
+and the bound source commit - and that read's corpus payload must be byte
+identical to the sealed right-hand payload. A recipe cannot present one file's
+content under another file's name, or last week's content under this iteration's
+commit, because the correspondence is recomputed from the read arguments rather
+than taken from a declaration. Two reads of the same path at the source commit
+are refused: a snapshot must answer that read one way.
+
+The **spans**: `changeSet.spanEvidence` names an indexed hunk census, and the
+right-hand span of a hunk is exactly `(newStart, newCount)`. A hunk with
+`newCount = 0` removed lines and contributes no span, which is how a pure
+deletion legitimately ends up with none. The recipe restates its spans and they
+are compared index by index against the derived ones; any divergence refuses.
+Evidence describing a path the change set does not carry is refused, as is a
+content-bearing path the evidence describes no hunks for - so a span census from
+one pull request cannot be spliced onto another's file list, and a recipe cannot
+widen or shift a span to pull unchanged code into the reviewer's window.
+
+### What a seal is not
+
+Every seal is permanently non-promotable, and the loader is what enforces it. The
+manifest of a schema-v2 seal carries a `classification` block naming the seal
+kind, `nonPromotable: true`, and the sidecar's path and SHA-256; the manifest
+digest covers that block, so the classification cannot be edited away, and the
+sidecar cannot be deleted or altered without failing the load outright. The
+binding runs manifest -> sidecar only, since a sidecar that also pinned the
+manifest digest would be a hash cycle nobody could compute. A classification may
+only ever *withdraw* promotability: `nonPromotable: false` is refused, so the
+block is not a channel for granting anything. `New-AgentReplaySnapshot` returns
+the classification, and `Assert-AgentReplaySnapshotPromotable` is the one gate
+every promotable flow calls - it throws rather than returning a boolean, because
+a caller that has to remember to check an answer is a caller that can forget to.
+Schema-v1 snapshots are unaffected; a v1 manifest carrying a classification is
+refused, an unclassified snapshot classifies as `standard` and stays promotable,
+and an absent block contributes nothing to the digest, so existing digests do not
+move.
+
+The snapshot id must also contain `offlinecorpusseal`, because the name is the
+one label that travels with the snapshot everywhere it is copied, quoted or
+logged, and `tools/Save-AgentReplaySnapshot.ps1` refuses both that name and any
+directory whose manifest is already classified. Alongside the manifest the tool
+writes `offline-corpus-seal.json`, recording `sealKind: offlineCorpusSeal`,
+`nonPromotable: true`, a null promotion key domain, `liveSeamCount: 0`,
+`liveHostContacted: false`, the corpus binding, the capture provenance, the full
+source census, the transport digests and gate, and the evidence actually cited.
+
+It also records `livePostReadRaceCheck: "notPerformed"`, and the tool refuses a
+recipe that claims anything else. A seal built from a corpus performed no live
+read, so it cannot have re-checked the pull request after one; recording a race
+check would be the artifact asserting a guarantee it never obtained. Practically:
+a corpus seal is evidence about how the reviewer behaves on captured material. It
+can never be the basis for publishing to a live pull request.
+
+`tools/Test-CorpusReplaySeal.ps1` builds a synthetic corpus in a sandbox and
+proves both halves - that two seals of one recipe are byte-identical and replay
+through the production loader unchanged, and that every rejection class above
+fails closed.
+
 ## Running a replay
 
 An offline qualification running from an app-created worktree should preflight
@@ -219,21 +448,146 @@ other identity checks pass. `LiveDeployment` additionally requires an attached
 failure diagnostics and is never interpreted as identity or dirty-status data.
 
 ```pwsh
+$pair = Get-AgentGeneralistModelPair
 ./src/Agents/reviewer/Start-ReviewerAgent.ps1 `
+    -RepoPath <the repository being reviewed> `
     -ConfigFile <config> -OperatorAlias <alias> -Once `
     -PullRequestId <the pull request the snapshot was captured for> `
-    -Model claude-opus-5 -SecondPassModel gpt-5.6-sol `
+    -Model $pair.First -SecondPassModel $pair.Second `
     -ReplayRoot <replay root> -ReplaySnapshotName <snapshot> `
     -ReplayManifestDigest <digest>
 ```
 
+The generalist pairing is **derived**, never typed out: `Get-AgentGeneralistModelPair`
+reads the harness's supported-model registry, which is the same derivation the
+agent's own startup validation uses. A wrapper that writes a model version down
+for itself goes stale the day the registry moves, and the failure lands at slot
+startup - after the run set has been declared.
+
+`-RepoPath` is likewise not optional in practice. Omitted, the agent resolves
+the reviewed repository by walking up from the config's own location for a
+`.git` directory; a qualification config normally lives outside any repository,
+so the run throws before a model is ever launched.
+
 All three replay parameters are required together. `-PullRequestId` is required
-and must match the snapshot's binding: the recorded pull-request list is a
-moment in that repository's history, and letting it drive candidate selection
-would quietly make the run about a different pull request than the operator
-pinned. The snapshot's organization, project and repository must match the
-running configuration, or the run refuses rather than producing a
-self-consistent artifact stamped with the wrong identity.
+and must match the snapshot's binding: a recorded candidate set is a moment in
+that repository's history, and letting it drive candidate selection would
+quietly make the run about a different pull request than the operator pinned.
+The snapshot's organization, project and repository must match the running
+configuration, or the run refuses rather than producing a self-consistent
+artifact stamped with the wrong identity.
+
+A run that names its pull request resolves **that** pull request directly
+(`repo_pull_request` / `get`); only an untargeted run asks the repository for an
+active-pull-request list. Both requests are composed in one place
+(`Get-ReviewerCandidateSourceRequest`), which the live cycle and the
+qualification prelaunch probe share. This matters for replay: a bounded
+snapshot - an offline corpus seal in particular - is sealed around the reads one
+pull request needs and deliberately carries no repository-wide census, so a
+cycle that always listed demanded a response no such snapshot holds and died
+before any model launched.
+
+The read is keyed on the repository identity the agent asks with, which is
+`config.repository.name` (the ADO MCP `repositoryId` argument accepts either a
+name or a GUID). A snapshot recorded against a repository **GUID** therefore
+needs a config whose `repository.name` is that GUID; `repository.id` still
+carries the GUID and is what the snapshot binding is checked against. Getting
+this wrong used to surface as both slots failing after the set was declared; it
+is now a preflight refusal.
+
+### Preflight the exact commands before declaring anything
+
+Both of the failures above are invocation defects, and both are only expensive
+because the run set is sealed *before* its runs exist. `tools/Invoke-ReviewerReplayQualification.ps1`
+closes that window: it builds the complete argument vector for every slot,
+validates everything the agent validates at startup - build identity, config
+(through the agent's own loader, prompt file included), models, snapshot load,
+digest, pull-request binding, promotability, output paths - and then runs that
+exact vector through the agent itself.
+
+The boundary is the agent's own. `Start-ReviewerAgent.ps1 -QualificationPrelaunch`
+is a strictly earlier exit on the normal startup path: every check the agent
+performs still runs, and the process stops immediately before it creates its
+state directory, which is the first thing it writes and is earlier than any
+session, any host call and any model launch. It reports what it resolved -
+`-RepoPath`, both generalist models, the specialist, the snapshot id and digest,
+the pull request, the planned state directory, the delivery authorization - and
+the preflight compares that report against the plan. It refuses to combine with
+`-DryRun`, `-ShowState`, `-ResetStarvedCandidates`, any capture switch, any
+promotion and any delivery or gate switch: it is an earlier stop, never a new
+capability. It is restricted to offline replay and to an explicitly named pull
+request, so it can never become a live probe.
+
+At that boundary the agent also issues the run's **first source read** against
+the sealed snapshot - the bounded direct get for the named pull request, through
+the same composer the cycle uses. A replay session starts no child process, so
+this probe cannot reach a host even in principle. It reports the tool, action,
+exact arguments, request digest and the pull request the snapshot answered with;
+the wrapper recomputes that digest from the reported arguments and looks it up
+in the snapshot it planned against. A snapshot that binds correctly but cannot
+answer the read the run opens with - the request-contract mismatch above - is
+refused here, before a run set is declared.
+
+```pwsh
+# 1. Look. Creates no state and launches no model; the only file written is the
+#    report you ask for. Prints the exact command each slot will run.
+./tools/Invoke-ReviewerReplayQualification.ps1 -Mode Preflight `
+    -RepoPath <reviewed repo> -ConfigFile <config outside that repo> `
+    -OperatorAlias <alias> -PullRequestId <id> `
+    -ReplayRoot <replay root> -ReplaySnapshotName <snapshot> `
+    -ReplayManifestDigest <digest> -QualificationRoot <out> `
+    -ExpectedCommit <40-hex> -RequiredRef refs/heads/<accepted layer> `
+    -PreflightReportPath <out-of-repo>/preflight.json
+
+# 2. Declare, after the same preflight passes again.
+./tools/Invoke-ReviewerReplayQualification.ps1 -Mode Declare ... `
+    -RunSetKeyPath <state>/artifact-signing.key -Purpose "closure at <head>"
+
+# 3. Run one slot at a time, each in its own state directory. The key is
+#    required: the declaration is verified under it, and its plan digest must
+#    be this plan's, before the slot is allowed to run.
+./tools/Invoke-ReviewerReplayQualification.ps1 -Mode RunSlot -Slot slot1 ... `
+    -RunSetKeyPath <state>/artifact-signing.key
+./tools/Invoke-ReviewerReplayQualification.ps1 -Mode RunSlot -Slot slot2 ... `
+    -RunSetKeyPath <state>/artifact-signing.key
+```
+
+There is exactly one constructed argument vector per slot. The preflight and
+the child process consume the same array, so a passing preflight cannot be
+describing a different command than the one that runs. Every delivery,
+promotion, gate and capture switch is refused by construction and re-checked on
+the constructed command.
+
+The declaration is sealed under a canonical digest of the whole plan - every
+slot's exact argv, the normalized `-RepoPath`, the config and agent-script
+hashes, the toolkit build identity, the models and timeouts, and the snapshot.
+`-Mode RunSlot` therefore requires `-RunSetKeyPath`, verifies the declaration
+cryptographically through `tools/Compare-ReviewerReplayRuns.ps1 -VerifyRunSet`,
+and only then compares that plan digest. The same snapshot and the same run
+count but a different command is a different qualification, and is refused.
+
+A slot is attempted once. `-Mode RunSlot` refuses a slot whose state directory
+exists at all, and records the attempt as a read-only marker in run accounting -
+`runs/<slot>-attempt.json`, created exclusively - *before* the child process is
+started. A slot whose child fails to start has still spent its attempt and
+leaves no agent state, so a failed launch cannot be quietly retried until one of
+them happens to start. `-Mode Declare` refuses a root that already holds a
+declaration. The qualification root must be outside the toolkit worktree, the
+reviewed repository and the replay root - writing there would dirty the tree
+whose cleanliness the run's identity depends on.
+
+`tools/Test-ReviewerReplayQualification.ps1` proves all of this offline, against
+the committed synthetic snapshot and a bounded one it seals in its own sandbox:
+that a slot which names a superseded Opus build or omits `-RepoPath` is refused
+before any declaration is written, that a targeted run's first read is the
+bounded direct get the snapshot actually records, that a snapshot recorded under
+a different repository identity than the config names is refused at preflight,
+that the prelaunch mode creates no state and refuses every forbidden
+combination, that a declaration sealed for another plan cannot be run against,
+and that a child which fails at startup consumes its slot's only attempt. The
+agent's own `-DryRun` self-checks cover the composer directly: a named pull
+request produces a direct get, an untargeted run produces the list, and a
+request bounded by neither is refused.
 
 Long-running qualification slots must be launched through an attached sync/async
 shell whose completion notification is owned by the active session, or through an
@@ -332,6 +686,46 @@ safe here precisely because the binding already pins the config and both plans -
 and the rule id and hash are compared per row anyway, so a run whose `rs2` is
 about a different rule than the other's `rs2` disagrees rather than being
 quietly lined up.
+
+### A run that produced nothing
+
+The tool also accepts a sealed cross-verification decision and reconciles the
+specialist manifest embedded in it. When the convention specialist degraded that
+manifest is deliberately absent - its discovery is not trusted - so the decision
+carries `reconciliationManifest = null` while remaining a signed, complete
+statement about a run.
+
+That artifact is reconciled as an **empty run**, and only when it proves it is
+one:
+
+- `decisions` and `eligiblePreviewCandidates` are both exactly empty;
+- the run did not finish `complete` (a complete pass always embeds the
+  manifest, so a complete one without it is malformed, not empty);
+- every one of `totalCandidateCount` candidates is named exactly once in
+  `withheld` with an explicit reason - unsupported, specialist-degraded or any
+  other stated accounting;
+- and the decision carries its own replay identity: snapshot, manifest digest
+  and nonce.
+
+It then binds under its own kind, `reviewer.run-reconciliation.empty-run`, to
+what that artifact proves about itself: the pull request and commit, the config
+and agent-script hashes, the verification library, prompt, policy and schema
+digests, the input manifest digest, a canonical digest of the whole
+`inputArtifactHashes` table (which pins the generalist passes, the specialist
+artifact, and both plans), and a canonical digest of the withheld accounting.
+Nothing is borrowed from the declaration, the file name, or an operator
+argument, and an empty run never binds equal to a specialist run artifact.
+
+If any of those conditions fails the tool throws the precise reason and stops.
+It never re-reads the file as a convention specialist preview afterwards: an
+artifact whose verification signature has already verified *is* a verification
+decision, and reporting a signature failure against a second contract for it
+would name the wrong defect - which is exactly what a completed qualification
+set was told about an honest empty run.
+
+An empty run is not a clean one. Its status is `degraded`, so the comparison
+reports itself unreconciled, with the degradation named.
+
 ### Declaring the run set before you look
 
 An operator who picks which runs to compare after seeing their results has not
@@ -342,8 +736,23 @@ sealed first:
 ./tools/Compare-ReviewerReplayRuns.ps1 -DeclareRunSet `
     -SnapshotName pr12345 -SnapshotManifestDigest <digest> `
     -PlannedRunCount 4 -Purpose "calibration at head abc1234" `
+    -PlanDigest <64-hex digest of the exact plan> `
     -KeyPath <state>/artifact-signing.key -OutputDirectory <out>
 ```
+
+A sealed declaration can be read back, signature first, with
+`-VerifyRunSet -RunSetPath <declaration> -KeyPath <key>`; it prints the manifest
+only if the bytes verify under that key.
+
+Declaring by hand is only safe once the slot commands are known to start, and a
+declaration with no `-PlanDigest` cannot say which commands it authorized - the
+runner refuses it. `tools/Invoke-ReviewerReplayQualification.ps1 -Mode Declare`
+is the supported path: it re-runs the full preflight above, reaches this
+declaration only after every slot has reached the agent's model-launch boundary,
+and seals the digest of that exact plan. A set declared against an invocation
+that cannot start is spoiled, and the two times that has happened the cause was
+the invocation - a stale model version, and a missing `-RepoPath` - not the
+review.
 
 Then run the replays, and reconcile against the declaration:
 

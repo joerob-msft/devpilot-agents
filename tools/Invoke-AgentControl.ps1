@@ -51,6 +51,9 @@
 
 .EXAMPLE
     # Start a two-pass reviewer that posts nothing, and watch it.
+    # The pairing comes from the supported-model registry rather than being
+    # typed out, so a retired model version cannot be started by copy-paste.
+    $pair = Get-AgentGeneralistModelPair
     $state = "$env:LOCALAPPDATA\DevPilot\Reviewer\bpm"
     ./tools/Invoke-AgentControl.ps1 -Action start -Name bpm-reviewer -StateDir $state `
         -AgentScript ./src/Agents/reviewer/Start-ReviewerAgent.ps1 `
@@ -58,7 +61,7 @@
             '-ConfigFile', 'C:\repos\my-repo\.github\copilot\agents\reviewer.config.json',
             '-OperatorAlias', 'myalias',
             '-StateDir', $state,
-            '-Model', 'claude-opus-5', '-SecondPassModel', 'gpt-5.6-sol')
+            '-Model', $pair.First, '-SecondPassModel', $pair.Second)
 
     ./tools/Invoke-AgentControl.ps1 -Action status -Name bpm-reviewer -StateDir $state
     ./tools/Invoke-AgentControl.ps1 -Action tail   -Name bpm-reviewer -StateDir $state

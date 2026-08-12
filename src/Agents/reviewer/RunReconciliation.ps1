@@ -175,6 +175,75 @@ $script:ReviewerRunReconciliationRequiredFields = @(
     "artifactVersion", "kind"
 )
 
+# A run that produced no candidate at all still has to be reconciled, and it has
+# no specialist manifest to be reconciled FROM: a degraded convention specialist
+# is deliberately not trusted to contribute one, so the cross-verification
+# decision carries `reconciliationManifest = null`. That artifact is not
+# nothing - it is a signed statement that every candidate was accounted for and
+# none survived - so it reconciles under its OWN binding rather than being
+# forced into the specialist's field names with blanks where the specialist's
+# hashes would have been. Blanks would be the one shape that compares equal to
+# anything.
+$script:ReviewerRunReconciliationEmptyRunKind = "reviewer.run-reconciliation.empty-run"
+
+# Everything below is carried BY the verification decision itself. Nothing is
+# borrowed from a declaration, a file name or an operator argument: an empty run
+# binds to exactly what it can prove about itself.
+$script:ReviewerRunReconciliationEmptyRunBindingFields = @(
+    "prId",
+    "sourceCommit",
+    "organization",
+    "project",
+    "repositoryId",
+    "configSha256",
+    "scriptSha256",
+    "verificationLibrarySha256",
+    "promptSha256",
+    "policySha256",
+    "schemaSha256",
+    "inputManifestSha256",
+    # The whole input hash table, canonically. That single digest pins the
+    # generalist passes, the specialist artifact, the convention plan and the
+    # fact plan - the same inputs `conventionPlanSha256` and friends pin for a
+    # specialist manifest - without this file keeping a second copy of a list
+    # whose shape lives in the agent.
+    "inputArtifactHashesSha256",
+    # And the accounting that made this an empty run in the first place, so a
+    # run that withheld different candidates for different reasons cannot bind
+    # equal to one that withheld nothing.
+    "emptyRunAccountingSha256",
+    "artifactVersion",
+    "kind"
+)
+
+$script:ReviewerRunReconciliationEmptyRunRequiredFields = @(
+    "prId", "sourceCommit", "configSha256", "scriptSha256",
+    "verificationLibrarySha256", "promptSha256", "inputArtifactHashesSha256",
+    "emptyRunAccountingSha256", "artifactVersion", "kind"
+)
+
+function Get-ReviewerRunReconciliationBindingProfile {
+    <#
+        The binding field list for a manifest, chosen by its kind.
+
+        Field NAMES reach the binding digest, so two profiles cannot collide:
+        an empty run and a specialist run never compare equal even if every
+        value they share happened to match.
+    #>
+    param([AllowNull()]$Manifest)
+    $kind = [string](Get-ReviewerRunReconciliationValue $Manifest "kind" "")
+    if ([string]::CompareOrdinal($kind, $script:ReviewerRunReconciliationEmptyRunKind) -eq 0) {
+        return @{
+            Binding = $script:ReviewerRunReconciliationEmptyRunBindingFields
+            Required = $script:ReviewerRunReconciliationEmptyRunRequiredFields
+        }
+    }
+    return @{
+        Binding = $script:ReviewerRunReconciliationBindingFields
+        Required = $script:ReviewerRunReconciliationRequiredFields
+    }
+}
+
 function Add-ReviewerRunReconciliationProblem {
     <#
         Records a problem as a structure, not a sentence.
@@ -243,8 +312,9 @@ function Get-ReviewerRunReconciliationIdList {
 
 function Get-ReviewerRunReconciliationBinding {
     param([Parameter(Mandatory)]$Manifest)
+    $bindingProfile = Get-ReviewerRunReconciliationBindingProfile -Manifest $Manifest
     $binding = [ordered]@{}
-    foreach ($field in $script:ReviewerRunReconciliationBindingFields) {
+    foreach ($field in $bindingProfile.Binding) {
         $binding[$field] = [string](Get-ReviewerRunReconciliationValue $Manifest $field "")
     }
     # WHICH frozen recording was replayed is part of the question. Two runs of
@@ -283,12 +353,162 @@ function Get-ReviewerRunReconciliationBinding {
             [StringComparer]::Ordinal.Compare([string]$left.anchorId, [string]$right.anchorId)
         })
     $binding["changedFileAnchors"] = ConvertTo-ReviewerConventionSpecialistCanonicalJson -Value $anchorBindings
-    $missing = @(@($script:ReviewerRunReconciliationRequiredFields) | Where-Object { -not $binding[$_] })
+    $missing = @(@($bindingProfile.Required) | Where-Object { -not $binding[$_] })
     if (-not $binding["snapshotId"] -or -not $binding["manifestDigest"]) { $missing += "replay identity" }
     return @{
         Sha256 = Get-ReviewerConventionSpecialistSha256 `
             -Text (ConvertTo-ReviewerConventionSpecialistCanonicalJson -Value $binding)
         Missing = @($missing)
+    }
+}
+
+function New-ReviewerRunReconciliationEmptyRunInput {
+    <#
+    .SYNOPSIS
+        Normalizes a candidate-free cross-verification decision into a
+        reconciliation input, or refuses it.
+    .DESCRIPTION
+        A cross-verification decision carries `reconciliationManifest = null`
+        when the convention specialist degraded: its own discovery is not
+        trusted, so no specialist manifest is embedded. That artifact is still a
+        signed, complete statement about a run - every candidate accounted for,
+        nothing eligible, nothing decided - and refusing to reconcile it would
+        mean a qualification set could never contain an honest empty run.
+
+        Accepted ONLY when the artifact says so exactly:
+
+          - `decisions` and `eligiblePreviewCandidates` are both empty. One
+            decision means the run reached a verdict this input cannot carry.
+          - the run did not finish `complete`. A complete pass always embeds a
+            reconciliation manifest, so a complete one without it is malformed,
+            not empty.
+          - every one of `totalCandidateCount` candidates is named in `withheld`
+            with an explicit reason - withheld/unsupported/specialist-degraded
+            accounting. A candidate that is simply absent from the accounting is
+            a candidate nobody can say what happened to.
+          - the artifact carries replay identity. Binding an empty run to a
+            snapshot named anywhere else - a declaration, a file name, an
+            operator argument - would be asserting the identity rather than
+            reading it.
+
+        Anything else throws, carrying `NoManifestError` verbatim so the caller's
+        original precise error survives.
+
+        Pure: no file, no network, no model.
+    #>
+    param(
+        [Parameter(Mandatory)]$VerificationManifest,
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$NoManifestError
+    )
+    $decisionCount = @(Get-ReviewerRunReconciliationValue $VerificationManifest "decisions" @()).Count
+    $eligibleCount = @(Get-ReviewerRunReconciliationValue $VerificationManifest "eligiblePreviewCandidates" @()).Count
+    if ($decisionCount -ne 0 -or $eligibleCount -ne 0) {
+        throw ("$NoManifestError It records $decisionCount decision(s) and $eligibleCount eligible " +
+            "preview candidate(s), so '$Source' is not an empty run and cannot be reconciled as one.")
+    }
+    $status = [string](Get-ReviewerRunReconciliationValue $VerificationManifest "status" "")
+    if ([string]::CompareOrdinal($status, $script:ReviewerRunReconciliationOkStatus) -eq 0) {
+        throw ("$NoManifestError It reports status '$status', and a pass that finished " +
+            "$($script:ReviewerRunReconciliationOkStatus) always carries one, so '$Source' is malformed.")
+    }
+    if (-not $status) {
+        throw "$NoManifestError It reports no status at all, so '$Source' is malformed."
+    }
+    $total = [int](Get-ReviewerRunReconciliationValue $VerificationManifest "totalCandidateCount" 0)
+    $withheldRows = @(Get-ReviewerRunReconciliationValue $VerificationManifest "withheld" @())
+    $accountedRows = [System.Collections.Generic.List[object]]::new()
+    $accountedIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($row in $withheldRows) {
+        $candidateId = [string](Get-ReviewerRunReconciliationValue $row "candidateId" "")
+        $reason = [string](Get-ReviewerRunReconciliationValue $row "reason" "")
+        if (-not $candidateId -or -not $reason -or [string]::CompareOrdinal($reason, "unknown") -eq 0) {
+            throw ("$NoManifestError Its withheld accounting has a row with no candidate id or no explicit " +
+                "reason, so '$Source' does not account for every candidate.")
+        }
+        if (-not $accountedIds.Add($candidateId)) {
+            throw ("$NoManifestError Its withheld accounting names candidate '$candidateId' more than once, " +
+                "so '$Source' does not account for every candidate exactly once.")
+        }
+        [void]$accountedRows.Add([pscustomobject][ordered]@{ candidateId = $candidateId; reason = $reason })
+    }
+    if ($accountedIds.Count -ne $total) {
+        throw ("$NoManifestError It normalized $total candidate(s) and accounts explicitly for " +
+            "$($accountedIds.Count), so '$Source' leaves candidates unaccounted for.")
+    }
+    $replay = Get-ReviewerRunReconciliationValue $VerificationManifest "replay" $null
+    $snapshotId = [string](Get-ReviewerRunReconciliationValue $replay "snapshotId" "")
+    $manifestDigest = [string](Get-ReviewerRunReconciliationValue $replay "manifestDigest" "")
+    $replayNonce = [string](Get-ReviewerRunReconciliationValue $replay "replayNonce" "")
+    if (-not $snapshotId -or -not $manifestDigest -or -not $replayNonce) {
+        throw ("$NoManifestError It carries no replay identity - snapshot, digest and nonce - so '$Source' " +
+            "cannot be bound to the recording it replayed. Reconcile that run set from its convention " +
+            "specialist previews, which carry their own binding.")
+    }
+    $rows = @($accountedRows.ToArray())
+    [Array]::Sort($rows, [System.Comparison[object]] {
+            param($left, $right)
+            [StringComparer]::Ordinal.Compare([string]$left.candidateId, [string]$right.candidateId)
+        })
+    $accounting = [pscustomobject][ordered]@{
+        status = $status
+        totalCandidateCount = $total
+        decisionCount = $decisionCount
+        eligibleCount = $eligibleCount
+        withheld = @($rows)
+        replaySha256 = [string](Get-ReviewerRunReconciliationValue $VerificationManifest "replaySha256" "")
+    }
+    $inputHashes = @(Get-ReviewerRunReconciliationValue $VerificationManifest "inputArtifactHashes" @())
+    return [pscustomobject][ordered]@{
+        kind = $script:ReviewerRunReconciliationEmptyRunKind
+        artifactVersion = $script:ReviewerRunReconciliationVersion
+        status = $status
+        prId = [string](Get-ReviewerRunReconciliationValue $VerificationManifest "prId" "")
+        sourceCommit = [string](Get-ReviewerRunReconciliationValue $VerificationManifest "sourceCommit" "")
+        organization = [string](Get-ReviewerRunReconciliationValue $VerificationManifest "organization" "")
+        project = [string](Get-ReviewerRunReconciliationValue $VerificationManifest "project" "")
+        repositoryId = [string](Get-ReviewerRunReconciliationValue $VerificationManifest "repositoryId" "")
+        configSha256 = [string](Get-ReviewerRunReconciliationValue $VerificationManifest "configSha256" "")
+        scriptSha256 = [string](Get-ReviewerRunReconciliationValue $VerificationManifest "scriptSha256" "")
+        verificationLibrarySha256 = [string](Get-ReviewerRunReconciliationValue $VerificationManifest "verificationLibrarySha256" "")
+        promptSha256 = [string](Get-ReviewerRunReconciliationValue $VerificationManifest "promptSha256" "")
+        policySha256 = [string](Get-ReviewerRunReconciliationValue $VerificationManifest "policySha256" "")
+        schemaSha256 = [string](Get-ReviewerRunReconciliationValue $VerificationManifest "schemaSha256" "")
+        inputManifestSha256 = [string](Get-ReviewerRunReconciliationValue $VerificationManifest "inputManifestSha256" "")
+        inputArtifactHashesSha256 = Get-ReviewerConventionSpecialistSha256 `
+            -Text (ConvertTo-ReviewerConventionSpecialistCanonicalJson -Value $inputHashes)
+        emptyRunAccountingSha256 = Get-ReviewerConventionSpecialistSha256 `
+            -Text (ConvertTo-ReviewerConventionSpecialistCanonicalJson -Value $accounting)
+        emptyRunAccounting = $accounting
+        sourceArtifact = $Source
+        candidates = @()
+        # Explicitly empty, not absent. An absent rule table is a hole the
+        # reconciler is right to complain about; this run enumerated nothing
+        # because there was nothing to enumerate, and says so.
+        ruleCoverage = [pscustomobject][ordered]@{
+            complete = $false
+            rows = @()
+            changedConstructs = @()
+            changedFileAnchors = @()
+            constructFiles = @()
+            remediationFacts = @()
+            missing = @()
+            duplicates = @()
+            unknown = @()
+            unaccountedCandidates = @()
+            constructsIncomplete = $false
+            enumeratedConstructCount = 0
+            checkedConstructCount = 0
+            checkedChangedFileTargetCount = 0
+        }
+        # Copied, not sanitized: a run claiming to be promotable must still be
+        # caught by the reconciler rather than quietly cleaned up here.
+        replay = [pscustomobject][ordered]@{
+            snapshotId = $snapshotId
+            manifestDigest = $manifestDigest
+            replayNonce = $replayNonce
+            promotable = [bool](Get-ReviewerRunReconciliationValue $replay "promotable" $false)
+        }
     }
 }
 

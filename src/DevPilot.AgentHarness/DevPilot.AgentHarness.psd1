@@ -76,7 +76,8 @@ FunctionsToExport = 'Get-DevPilotAgentPath', 'Resolve-AgentRepositoryRoot', 'Get
                'Send-AgentTeamsChannelMessage', 'Send-AgentTeamsDirectMessage', 
                'Resolve-AgentTeamsUserChatId', 'New-AgentTeamsMessageHtml', 
                'Get-AgentRequiredProperty', 'Get-AgentDefaultModelSentinel', 
-               'Assert-AgentSupportedModel', 'Test-ParserValidity', 
+               'Assert-AgentSupportedModel', 'Get-AgentGeneralistModelPair',
+               'Test-AgentGeneralistModelPair', 'Test-ParserValidity',
                'Get-OnceFinalExitCode', 'Test-StrictJsonInt', 'New-AgentNonce', 
                'Test-AgentValidatedParamRebind', 
                'Test-AgentProtectedBranch', 'Get-AgentConfigProperty', 
@@ -90,14 +91,15 @@ FunctionsToExport = 'Get-DevPilotAgentPath', 'Resolve-AgentRepositoryRoot', 'Get
                'Measure-AgentMarkerSchemaWorstCaseChars', 'Measure-AgentMarkerSchemaWorstCaseBytes',
                'Test-AgentMarkerSchemaFitsScanWindow', 'Test-AgentMarkerSchemaFitsLaunchContract',
                'ConvertTo-AgentCanonicalMarkerJson',
-               'Find-CopilotSessionForBranch', 
+               'Find-CopilotSessionForBranch',
                'Set-TimedProcessArguments', 'Stop-ProcessTree', 
                'Get-TaskTextBeforeDeadline', 'Invoke-TimedProcess', 
                'Open-AgentMcpSession', 'Close-AgentMcpSession', 
                'Send-AgentMcpRequest', 'Send-AgentMcpNotification', 
-               'Invoke-AgentMcpTool', 'ConvertFrom-AgentMcpResourceContent',
+               'Invoke-AgentMcpTool', 'Test-AgentMcpToolResultShape', 'ConvertFrom-AgentMcpResourceContent',
                'ConvertTo-AgentReplayCanonicalJson', 'Get-AgentReplayRequestKey',
                'Test-AgentReplayToolPermitted', 'New-AgentReplaySnapshot',
+               'Assert-AgentReplaySnapshotPromotable',
                'Get-AgentReplayResponse',
     'Get-AgentSupportedProvider', 'Test-AgentProviderSupported', 'New-AgentProviderContext', 'Assert-AgentProviderContext',
     'Invoke-AgentGitHubApi', 'Invoke-AgentGitHubGraphQl', 'ConvertTo-AgentProviderPullRequestStatus', 'ConvertTo-AgentProviderVote',
@@ -166,5 +168,3 @@ PrivateData = @{
 # DefaultCommandPrefix = ''
 
 }
-
-

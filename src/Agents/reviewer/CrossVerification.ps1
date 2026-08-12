@@ -12,6 +12,46 @@ $script:ReviewerVerificationMaxInputBytes = 524288
 $script:ReviewerVerificationMaxArtifactBytes = 2097152
 $script:ReviewerVerificationMaxVerifierRuns = 128
 $script:ReviewerVerificationMaxPhaseSeconds = 3600
+# Evidence-based floor for ONE verifier assignment, in seconds.
+#
+# Measured, not guessed. Across the sealed replay runs kept as qualification
+# evidence, a bounded single-model cross-verifier CLI phase completed in 136 to
+# 295 wall-clock seconds; 295 is the slowest interval observed. The floor is set
+# at 300 - just above the worst measurement - because that is the smallest slice
+# for which a run is expected to finish rather than be killed on its own timeout.
+#
+# It is a FLOOR on what may be handed to a run, not a reservation of what a run
+# will take. Below it a launch is not a shorter review, it is a review that ends
+# in `timeout` and produces nothing, so admitting one would spend the whole phase
+# to learn nothing.
+$script:ReviewerVerificationMinAssignmentSeconds = 300
+# Wall-clock the phase keeps back for work that is not a verifier invocation:
+# sealing the assignment plan, minting fresh nonces, reconciling verdicts,
+# writing the artifact. Reserving it is what makes the phase cap a bound on the
+# PHASE rather than on the launches inside it - without it the launches may
+# legitimately consume the entire cap and every second of setup and
+# postprocessing is overrun that nobody budgeted. 120s is deliberately generous
+# against the observed few seconds of non-launch work, because the cost of
+# over-reserving is a slightly smaller share and the cost of under-reserving is
+# breaching the hard cap.
+$script:ReviewerVerificationReservedOverheadSeconds = 120
+# The least remaining wall clock in which the post-launch tail - the fresh
+# binding, reconciliation and the artifact write - may still be STARTED. Below
+# it the phase stops instead, because beginning work the deadline cannot cover
+# is how a hard bound turns into an advisory one.
+$script:ReviewerVerificationMinPostprocessingSeconds = 15
+# The live fresh binding re-reads the change set twice around an exact source/
+# target re-read, so a bounded worst case is the per-request transport timeout
+# times the requests it can make, plus a slice for opening and closing its
+# isolated session. Six is that count: target-before, first change set, PR
+# re-read, second change set, target-after, and one for session setup.
+$script:ReviewerVerificationFreshBindingMaxRequests = 6
+# The MCP session disposer may wait up to seven seconds for graceful shutdown
+# before terminating the child. Keep that teardown bound outside request time.
+$script:ReviewerVerificationFreshBindingCleanupSeconds = 7
+# Below this per-request timeout a live ADO read is not worth starting: it would
+# almost certainly time out and consume the remaining window for nothing.
+$script:ReviewerVerificationMinFreshBindingRequestSeconds = 5
 $script:ReviewerVerificationNearExactJaccard = 0.70
 $script:ReviewerVerificationSemanticJaccard = 0.55
 $script:ReviewerVerificationExistingThreadJaccard = 0.68
@@ -26,6 +66,10 @@ $script:ReviewerVerificationWithheldReasons = @(
     "staleBinding", "timeout", "toolViolation", "unsupported", "needsHuman",
     "missingEvidence", "wrongSeverity", "severityEscalation", "verifierDisagreement",
     "sourceInvalid", "factInvalid", "siblingInvalid", "specialistDegraded",
+    # The absolute phase deadline expired before the finding could be published.
+    # Withholding under its own reason keeps the preview honest about WHY it is
+    # empty, rather than silently showing less than the phase discovered.
+    "phaseDeadline",
     # Typed cross-verifier extraction classes. A verifier run record now reports
     # the precise typed marker-extraction failure (never a generic invalidMarker)
     # so a withheld candidate carries WHY the verifier's marker failed. All are
@@ -1585,67 +1629,336 @@ function Get-ReviewerVerificationRunBudget {
     }
 }
 
-function Assert-ReviewerVerificationBudgetPreflight {
+function Get-ReviewerVerificationPhaseBudgetPlan {
     <#
-        Deterministic, launch-free budget check run ONCE before any verifier
-        model starts. Given the full required run count for the sealed
-        assignment plan, it proves the declared run AND time budget can cover
-        EVERY run - or refuses the whole set. This closes the partial-launch
-        window the per-run budget alone left open, where early clusters would
-        launch and later ones silently degrade when the phase clock expired
-        mid-loop: either every required run can launch, or none does.
+        THE source of truth for cross-verifier phase time. Preflight admission and
+        per-invocation launch both read this one function, so the number a run is
+        launched with is by construction the number the preflight reserved.
 
-        The time reservation is conservative and authoritative: a launched run
-        may consume the WHOLE configured per-run timeout, so the only reservation
-        that guarantees every planned run can finish is RequiredRunCount *
-        ConfiguredRunTimeoutSeconds. (The earlier design reserved only 30s per
-        run - the per-run floor - which admitted plans whose later runs could
-        still be starved when a run took closer to its full timeout. That is the
-        exact partial-launch window this preflight now closes.) Because the
-        preflight reserves the full configured timeout for every planned run, the
-        caller must treat admission as final and hand each admitted group the
-        configured timeout WITHOUT re-checking the phase clock mid-loop, so every
-        admitted group launches. The product can be large (up to the 128-run and
-        3600s hard caps), so it is computed in [long] to stay overflow-safe.
+        WHAT IS BUDGETED IS ASSIGNMENTS, NOT INVOCATIONS. The requirement is that
+        every candidate is cross-checked once by GPT and once by Opus, so the unit
+        the phase must be able to afford is the 2N assignment set - the same unit
+        the acceptance boundaries are stated in. Budgeting the GROUPED invocation
+        count instead was the earlier defect: grouping is an optimisation, and an
+        optimisation that shrinks the reservation makes the reservation a promise
+        about the implementation rather than about the work.
 
-        Returns @{ canLaunch; reason; requiredRunCount; effectiveMaxRuns;
-                   effectiveMaxSeconds; requiredSeconds; remainingSeconds }.
+        The bug this replaces: preflight reserved the CONFIGURED per-run timeout
+        for every planned run and compared the product against the phase. With the
+        shipped defaults that is 10 x 900s = 9000s against a 3600s phase, so a
+        perfectly ordinary 5-candidate pull request was refused wholesale and zero
+        verifiers ran - while the runs it refused would each have finished in
+        roughly 150 to 300 seconds. The reservation was treating a per-run CEILING
+        as if it were a per-run COST.
+
+        The fix is to stop reserving the ceiling and start dividing the phase:
+
+            remaining     = maxPhase - elapsed - reservedOverhead
+            share         = floor(remaining / assignments)
+            perInvocation = min(configured, floor(remaining / invocations))
+
+        Admission is decided on `share`, the conservative per-ASSIGNMENT slice.
+        Time is handed out per INVOCATION, which is never more numerous than the
+        assignments it covers, so the worst case
+
+            invocations x perInvocation <= invocations x (remaining / invocations)
+                                        <= remaining
+
+        holds no matter how the assignments are grouped. That is what makes the
+        accounting safe under batching without having to launch one process per
+        assignment. The all-or-none property is preserved exactly: admission is
+        computed once for the whole 2N set, and the set is either fully launched
+        or fully refused.
+
+        Admission needs one more thing, or dividing would just relabel starvation
+        as success: a run given too little time does not review faster, it dies on
+        its own timeout and returns nothing. So a share below the evidence floor
+        ($script:ReviewerVerificationMinAssignmentSeconds, measured at 300s against
+        a 136-295s observed range) is refused rather than launched.
+
+        The floor is capped by what the operator configured -
+        min(configured, floor) - because a deployment that deliberately configures
+        short runs is describing its own runs, and this function has no standing to
+        insist they need longer than they were declared to need.
+
+        Hard bounds are unchanged and still absolute: at most
+        $script:ReviewerVerificationMaxVerifierRuns assignments, at most
+        $script:ReviewerVerificationMaxPhaseSeconds of phase wall clock, and never
+        more than the caller's own declared maxima. `phaseDeadlineSeconds` is
+        returned so the caller can enforce the cap as an ABSOLUTE deadline on the
+        whole phase - setup, launches and postprocessing alike - rather than only
+        on the part of it that happens to be a launch.
+
+        Returns @{ canLaunch; reason; requiredAssignmentCount; invocationCount;
+                   effectiveMaxAssignments; effectiveMaxSeconds;
+                   perAssignmentTimeoutSeconds; perInvocationTimeoutSeconds;
+                   minAssignmentSeconds; maxSupportedAssignmentCount;
+                   requiredSeconds; remainingSeconds; reservedOverheadSeconds;
+                   phaseDeadlineSeconds }.
     #>
     param(
-        [Parameter(Mandatory)][ValidateRange(0, [int]::MaxValue)][int]$RequiredRunCount,
-        [ValidateRange(1, [int]::MaxValue)][int]$MaxVerifierRuns,
-        [ValidateRange(30, [int]::MaxValue)][int]$MaxPhaseSeconds,
+        [Parameter(Mandatory)][ValidateRange(0, [int]::MaxValue)][int]$RequiredAssignmentCount,
+        [ValidateRange(0, [int]::MaxValue)][int]$InvocationCount = 0,
+        [ValidateRange(1, [int]::MaxValue)][int]$MaxVerifierRuns = $script:ReviewerVerificationMaxVerifierRuns,
+        [ValidateRange(30, [int]::MaxValue)][int]$MaxPhaseSeconds = $script:ReviewerVerificationMaxPhaseSeconds,
         [Parameter(Mandatory)][ValidateRange(30, 3600)][int]$ConfiguredRunTimeoutSeconds,
-        [ValidateRange(0.0, [double]::MaxValue)][double]$ElapsedSeconds = 0.0
+        [ValidateRange(0.0, [double]::MaxValue)][double]$ElapsedSeconds = 0.0,
+        [ValidateRange(0, 3600)][int]$ReservedOverheadSeconds = $script:ReviewerVerificationReservedOverheadSeconds
     )
-    $effectiveMaxRuns = [Math]::Min($MaxVerifierRuns, $script:ReviewerVerificationMaxVerifierRuns)
-    $effectiveMaxSeconds = [Math]::Min($MaxPhaseSeconds, $script:ReviewerVerificationMaxPhaseSeconds)
-    $remaining = [long][Math]::Floor($effectiveMaxSeconds - $ElapsedSeconds)
-    # Overflow-safe: worst case is 128 runs * 3600s, far inside [long] but the
-    # multiplication is done in [long] regardless so no widening ever overflows.
-    [long]$requiredSeconds = [long]$RequiredRunCount * [long]$ConfiguredRunTimeoutSeconds
-    $result = [ordered]@{
-        canLaunch           = $true
-        reason              = ""
-        requiredRunCount    = $RequiredRunCount
-        effectiveMaxRuns    = $effectiveMaxRuns
-        effectiveMaxSeconds = $effectiveMaxSeconds
-        requiredSeconds     = $requiredSeconds
-        remainingSeconds    = [long][Math]::Max([long]0, $remaining)
+    # Grouping may only ever reduce the number of processes, never increase it.
+    # If it did, the assignment count would no longer bound the invocation count
+    # and the worst-case product above would stop holding.
+    if ($InvocationCount -eq 0) { $InvocationCount = $RequiredAssignmentCount }
+    if ($InvocationCount -gt $RequiredAssignmentCount) {
+        throw ("Cross-verification budget was asked to cover $InvocationCount invocation(s) for " +
+            "$RequiredAssignmentCount assignment(s); invocations may group assignments but never exceed them.")
     }
-    if ($RequiredRunCount -eq 0) { return [pscustomobject]$result }
-    if ($RequiredRunCount -gt $effectiveMaxRuns) {
-        $result.canLaunch = $false
+    if ($RequiredAssignmentCount -gt 0 -and $InvocationCount -lt 1) {
+        throw "Cross-verification budget was asked to cover $RequiredAssignmentCount assignment(s) with no invocation."
+    }
+    $effectiveMaxAssignments = [int][Math]::Min($MaxVerifierRuns, $script:ReviewerVerificationMaxVerifierRuns)
+    $effectiveMaxSeconds = [int][Math]::Min($MaxPhaseSeconds, $script:ReviewerVerificationMaxPhaseSeconds)
+    # The overhead reservation and the elapsed clock come off the same cap, so
+    # what is divided below is only the time genuinely available for launches.
+    $remaining = [long][Math]::Max(
+        [long]0, [long][Math]::Floor($effectiveMaxSeconds - $ElapsedSeconds - $ReservedOverheadSeconds))
+    # Never above what the operator configured: a deployment that declares short
+    # runs is describing its own runs, and this policy does not overrule it.
+    $minAssignment = [long][Math]::Min(
+        [long]$ConfiguredRunTimeoutSeconds, [long]$script:ReviewerVerificationMinAssignmentSeconds)
+    $maxSupported = [long][Math]::Min([long]$effectiveMaxAssignments, [long][Math]::Floor($remaining / $minAssignment))
+    $result = [ordered]@{
+        canLaunch                   = $true
+        reason                      = ""
+        requiredAssignmentCount     = $RequiredAssignmentCount
+        invocationCount             = $InvocationCount
+        effectiveMaxAssignments     = $effectiveMaxAssignments
+        effectiveMaxSeconds         = $effectiveMaxSeconds
+        perAssignmentTimeoutSeconds = 0
+        perInvocationTimeoutSeconds = 0
+        minAssignmentSeconds        = [int]$minAssignment
+        maxSupportedAssignmentCount = [int]$maxSupported
+        requiredSeconds             = [long]0
+        remainingSeconds            = $remaining
+        reservedOverheadSeconds     = [int]$ReservedOverheadSeconds
+        phaseDeadlineSeconds        = [int]$effectiveMaxSeconds
+    }
+    if ($RequiredAssignmentCount -eq 0) { return [pscustomobject]$result }
+    if ($RequiredAssignmentCount -gt $effectiveMaxAssignments) {
         $result.reason = "candidateLimit"
+        $result.canLaunch = $false
+        # Still report what the set would have cost at the floor, so the refusal
+        # record says how far outside the budget the plan was.
+        $result.requiredSeconds = [long]$RequiredAssignmentCount * $minAssignment
         return [pscustomobject]$result
     }
-    if ($remaining -lt $requiredSeconds) {
+    # Overflow-safe by construction: the shares are divisions of a bounded
+    # remaining budget, and the product below is taken in [long] regardless.
+    $share = [long][Math]::Floor($remaining / [long]$RequiredAssignmentCount)
+    $perAssignment = [long][Math]::Min([long]$ConfiguredRunTimeoutSeconds, $share)
+    if ($perAssignment -lt $minAssignment) {
         $result.canLaunch = $false
         $result.reason = "timeout"
+        $result.requiredSeconds = [long]$RequiredAssignmentCount * $minAssignment
         return [pscustomobject]$result
+    }
+    $perInvocation = [long][Math]::Min(
+        [long]$ConfiguredRunTimeoutSeconds, [long][Math]::Floor($remaining / [long]$InvocationCount))
+    $result.perAssignmentTimeoutSeconds = [int]$perAssignment
+    $result.perInvocationTimeoutSeconds = [int]$perInvocation
+    $result.requiredSeconds = [long]$InvocationCount * $perInvocation
+    if ($result.requiredSeconds -gt $remaining) {
+        # Unreachable by the arithmetic above; asserted anyway, because the one
+        # thing this function must never do is admit a set it cannot afford.
+        throw ("Cross-verification budget computed a reservation of $($result.requiredSeconds)s against " +
+            "$remaining s of remaining phase; refusing to admit an unaffordable set.")
     }
     return [pscustomobject]$result
 }
+
+function Assert-ReviewerVerificationBudgetPreflight {
+    <#
+        Deterministic, launch-free budget check run ONCE before any verifier model
+        starts. Given the full required ASSIGNMENT count for the sealed plan - the
+        2N of "every candidate, once by GPT and once by Opus" - it proves the
+        declared run AND time budget can cover EVERY assignment, or refuses the
+        whole set. This closes the partial-launch window the per-run budget alone
+        left open, where early clusters would launch and later ones silently
+        degrade when the phase clock expired mid-loop: either every required
+        assignment is launched, or none is.
+
+        The arithmetic lives in Get-ReviewerVerificationPhaseBudgetPlan, and the
+        caller MUST hand every admitted invocation that plan's
+        `perInvocationTimeoutSeconds` and stop the phase at its
+        `phaseDeadlineSeconds`. That is the whole point of one source of truth:
+        the preflight reserved exactly the bound each invocation is given, so the
+        admitted set fits by construction and the group loop never re-checks the
+        phase clock mid-loop.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateRange(0, [int]::MaxValue)][int]$RequiredAssignmentCount,
+        [ValidateRange(0, [int]::MaxValue)][int]$InvocationCount = 0,
+        [ValidateRange(1, [int]::MaxValue)][int]$MaxVerifierRuns,
+        [ValidateRange(30, [int]::MaxValue)][int]$MaxPhaseSeconds,
+        [Parameter(Mandatory)][ValidateRange(30, 3600)][int]$ConfiguredRunTimeoutSeconds,
+        [ValidateRange(0.0, [double]::MaxValue)][double]$ElapsedSeconds = 0.0,
+        [ValidateRange(0, 3600)][int]$ReservedOverheadSeconds = $script:ReviewerVerificationReservedOverheadSeconds
+    )
+    return (Get-ReviewerVerificationPhaseBudgetPlan -RequiredAssignmentCount $RequiredAssignmentCount `
+            -InvocationCount $InvocationCount -MaxVerifierRuns $MaxVerifierRuns -MaxPhaseSeconds $MaxPhaseSeconds `
+            -ConfiguredRunTimeoutSeconds $ConfiguredRunTimeoutSeconds -ElapsedSeconds $ElapsedSeconds `
+            -ReservedOverheadSeconds $ReservedOverheadSeconds)
+}
+
+function Get-ReviewerVerificationPhaseDeadlineState {
+    <#
+        The absolute phase deadline, evaluated after the verifier invocations and
+        before any of the post-launch tail. The reserved overhead slice is what
+        the tail - fresh binding, reconciliation, artifact publication - is
+        supposed to fit into; this states, deterministically, whether it still
+        does. A bound that is only ever logged is not a bound, so callers MUST
+        act on `exceeded` rather than merely record it.
+
+        The tail is not started with less than the minimum postprocessing window
+        left, because beginning work the deadline cannot cover is precisely how a
+        hard bound decays into an advisory one. `overrun` means the deadline has
+        already passed; `exhausted` means it has not, but too little remains to
+        honestly start the tail. Both stop the phase identically.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$PhaseDeadlineSeconds,
+        [Parameter(Mandatory)][ValidateRange(0.0, [double]::MaxValue)][double]$ElapsedSeconds,
+        [ValidateRange(0, 3600)][int]$MinPostprocessingSeconds =
+        $script:ReviewerVerificationMinPostprocessingSeconds
+    )
+    $elapsed = [int][Math]::Floor($ElapsedSeconds)
+    $remaining = [int]($PhaseDeadlineSeconds - $elapsed)
+    $exceeded = $remaining -lt $MinPostprocessingSeconds
+    $result = if (-not $exceeded) { "within" } elseif ($remaining -lt 0) { "overrun" } else { "exhausted" }
+    $detail = ""
+    if ($exceeded) {
+        $detail = ("The verification phase had $remaining second(s) left against its absolute " +
+            "$PhaseDeadlineSeconds-second deadline, below the $MinPostprocessingSeconds-second tail it needs; " +
+            "no result from this phase may be presented as eligible.")
+    }
+    return [pscustomobject][ordered]@{
+        phaseDeadlineSeconds = [int]$PhaseDeadlineSeconds
+        elapsedSeconds = $elapsed
+        remainingSeconds = $remaining
+        minPostprocessingSeconds = [int]$MinPostprocessingSeconds
+        exceeded = [bool]$exceeded
+        result = [string]$result
+        detail = [string]$detail
+    }
+}
+
+function Limit-ReviewerVerificationToPhaseDeadline {
+    <#
+        Withholds EVERYTHING once the phase deadline state says the phase must
+        stop. Degrading every verifier run should already leave nothing eligible,
+        but "should" is not a guarantee, and the one thing an expired bound must
+        never do is let a finding through. Any candidate still standing is moved
+        into `withheld` under the explicit `phaseDeadline` reason, so the preview
+        can say plainly why it is empty rather than silently showing less.
+
+        Returns the replay unchanged when the deadline has not been reached.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Replay,
+        [Parameter(Mandatory)][object]$DeadlineState
+    )
+    if (-not [bool]$DeadlineState.exceeded) { return $Replay }
+    $withheld = [System.Collections.Generic.List[object]]::new()
+    foreach ($item in @($Replay.withheld)) { [void]$withheld.Add($item) }
+    foreach ($item in @($Replay.eligible)) {
+        [void]$withheld.Add([pscustomobject][ordered]@{
+                candidateId = [string]$item.candidateId
+                candidateHash = [string]$item.candidateHash
+                originKind = [string](Get-ReviewerVerificationValue $item "originKind" "")
+                originModel = [string](Get-ReviewerVerificationValue $item "originModel" "")
+                clusterId = [string](Get-ReviewerVerificationValue $item "clusterId" "")
+                reason = "phaseDeadline"
+                detail = ("Withheld: the verification phase ran out of its absolute " +
+                    "$([int]$DeadlineState.phaseDeadlineSeconds)-second bound before this finding could be published.")
+            })
+    }
+    return @{
+        eligible = @()
+        withheld = @($withheld.ToArray())
+        decisions = @($Replay.decisions)
+        replaySha256 = [string]$Replay.replaySha256
+    }
+}
+
+
+function Get-ReviewerVerificationFreshBindingBudget {
+    <#
+        Decides whether the LIVE fresh binding may be started at all, and under
+        what per-request transport timeout.
+
+        Checking the deadline before the fresh binding and then starting an
+        unbounded live call is a bound in name only: the call itself can run past
+        the deadline by an arbitrary amount and the phase would still publish. So
+        the call is only started when its own WORST CASE fits in what is left.
+
+        Worst case is the per-request transport timeout multiplied by the number
+        of requests the pinned-change-set read can make (target commit, first
+        change set, PR re-read, second change set, target commit again) plus a
+        slice for opening and closing the isolated session. The transport timeout
+        is the only hard bound available in this runtime, so it is lowered to fit
+        rather than trusted to be short enough, and the phase's minimum
+        postprocessing window is kept out of the arithmetic entirely: it belongs
+        to publication, not to this call.
+
+        `allowed = $false` means fail closed - skip the fresh binding and degrade,
+        which is what the caller already does when the deadline is gone.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$DeadlineState,
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$RequestTimeoutSeconds,
+        [ValidateRange(1, 64)][int]$MaxRequests = $script:ReviewerVerificationFreshBindingMaxRequests,
+        [ValidateRange(0, 60)][int]$CleanupSeconds =
+        $script:ReviewerVerificationFreshBindingCleanupSeconds,
+        [ValidateRange(1, 3600)][int]$MinRequestTimeoutSeconds =
+        $script:ReviewerVerificationMinFreshBindingRequestSeconds
+    )
+    if ([bool]$DeadlineState.exceeded) {
+        return [pscustomobject][ordered]@{
+            allowed = $false
+            requestTimeoutSeconds = 0
+            worstCaseSeconds = 0
+            availableSeconds = 0
+            reason = "phaseDeadline"
+            detail = "The phase deadline was already reached, so no live fresh binding was started."
+        }
+    }
+    # Only the slice above the postprocessing floor may be spent here; the floor
+    # itself is what publishes the result the binding is meant to protect.
+    $available = [int]$DeadlineState.remainingSeconds -
+        [int]$DeadlineState.minPostprocessingSeconds - $CleanupSeconds
+    if ($available -lt ($MinRequestTimeoutSeconds * $MaxRequests)) {
+        return [pscustomobject][ordered]@{
+            allowed = $false
+            requestTimeoutSeconds = 0
+            worstCaseSeconds = 0
+            availableSeconds = [int]$available
+            reason = "freshBindingBudget"
+            detail = ("The phase had $available second(s) above its postprocessing floor, less than the " +
+                "$($MinRequestTimeoutSeconds * $MaxRequests) second(s) a bounded fresh binding needs; it was not started.")
+        }
+    }
+    $perRequest = [Math]::Min([int]$RequestTimeoutSeconds, [int][Math]::Floor($available / $MaxRequests))
+    return [pscustomobject][ordered]@{
+        allowed = $true
+        requestTimeoutSeconds = [int]$perRequest
+        worstCaseSeconds = [int](($perRequest * $MaxRequests) + $CleanupSeconds)
+        availableSeconds = [int]$available
+        cleanupSeconds = $CleanupSeconds
+        reason = ""
+        detail = ""
+    }
+}
+
 
 function Get-ReviewerVerificationMarkerSchema {
     param(
