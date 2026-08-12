@@ -263,6 +263,26 @@ function Get-ReviewerRunReconciliationBinding {
     $coverage = Get-ReviewerRunReconciliationValue $Manifest "ruleCoverage" $null
     $binding["constructs"] = ConvertTo-ReviewerConventionSpecialistCanonicalJson `
         -Value @(Get-ReviewerRunReconciliationValue $coverage "changedConstructs" @())
+    $anchorBindings = @(@(Get-ReviewerRunReconciliationValue $coverage "changedFileAnchors" @()) |
+        ForEach-Object {
+            [pscustomobject][ordered]@{
+                anchorId = ([string](Get-ReviewerRunReconciliationValue $_ "anchorId" "")).ToLowerInvariant()
+                path = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+                    [string](Get-ReviewerRunReconciliationValue $_ "path" ""))
+                rightHandRanges = @((Get-ReviewerRunReconciliationValue $_ "rightHandRanges" @()) |
+                    ForEach-Object {
+                        [pscustomobject][ordered]@{
+                            startLine = [int64](Get-ReviewerRunReconciliationValue $_ "startLine" 0)
+                            endLine = [int64](Get-ReviewerRunReconciliationValue $_ "endLine" 0)
+                        }
+                    })
+            }
+        })
+    [Array]::Sort($anchorBindings, [System.Comparison[object]]{
+            param($left, $right)
+            [StringComparer]::Ordinal.Compare([string]$left.anchorId, [string]$right.anchorId)
+        })
+    $binding["changedFileAnchors"] = ConvertTo-ReviewerConventionSpecialistCanonicalJson -Value $anchorBindings
     $missing = @(@($script:ReviewerRunReconciliationRequiredFields) | Where-Object { -not $binding[$_] })
     if (-not $binding["snapshotId"] -or -not $binding["manifestDigest"]) { $missing += "replay identity" }
     return @{
@@ -370,8 +390,6 @@ function Get-ReviewerRunReconciliationSemanticCandidateIdentity {
         [void]$errors.Add("changed-code remediation identity is incomplete or contradictory")
     }
     $targetText = [string](Get-ReviewerRunReconciliationValue $changedFix "targets" "")
-    $remediationTargets = [string[]](Get-ReviewerRunReconciliationSortedUniqueStrings `
-            -Value @($targetText -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }))
     $changedEvidenceFactIds = [string[]](Get-ReviewerRunReconciliationSortedUniqueStrings `
             -Value @($changedEvidenceText -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }))
     if (@($changedEvidenceFactIds | Where-Object { $_ -cnotmatch '^rf1:[0-9a-f]{64}$' }).Count -gt 0) {
@@ -385,6 +403,35 @@ function Get-ReviewerRunReconciliationSemanticCandidateIdentity {
     }
 
     $coverage = Get-ReviewerRunReconciliationValue $Manifest "ruleCoverage" $null
+    $constructs = @(Get-ReviewerRunReconciliationValue $coverage "changedConstructs" @())
+    $changedFileAnchors = @(Get-ReviewerRunReconciliationValue $coverage "changedFileAnchors" @())
+    $primaryTargetText = [string](Get-ReviewerRunReconciliationValue $Candidate "primaryTarget" "")
+    $manifestationText = [string](Get-ReviewerRunReconciliationValue $Candidate "manifestations" "")
+    $primaryTarget = Resolve-ReviewerConventionSpecialistTargets -Text $primaryTargetText `
+        -Constructs $constructs -ChangedFileAnchors $changedFileAnchors `
+        -ChangedLinesOnly:($anchorKind -ceq "changedFile") -AllowPrMetadata:($anchorKind -ceq "prMetadata")
+    $manifestations = Resolve-ReviewerConventionSpecialistTargets -Text (
+        @($primaryTargetText, $manifestationText | Where-Object { $_ }) -join ",") `
+        -Constructs $constructs -ChangedFileAnchors $changedFileAnchors `
+        -ChangedLinesOnly:($anchorKind -ceq "changedFile") -AllowPrMetadata:($anchorKind -ceq "prMetadata")
+    $remediation = Resolve-ReviewerConventionSpecialistTargets -Text $targetText `
+        -Constructs $constructs -ChangedFileAnchors $changedFileAnchors `
+        -AllowPrMetadata:($anchorKind -ceq "prMetadata")
+    foreach ($targetError in @($primaryTarget.Errors) + @($manifestations.Errors) + @($remediation.Errors)) {
+        [void]$errors.Add($targetError)
+    }
+    if (@($primaryTarget.Targets).Count -ne 1 -or @($manifestations.Targets).Count -lt 1) {
+        [void]$errors.Add("candidate has no exact primary manifestation")
+    }
+    elseif ([string](@($manifestations.Targets)[0].target) -cne
+        [string](@($primaryTarget.Targets)[0].target)) {
+        [void]$errors.Add("primary manifestation is not the deterministic ordinal path/line selection")
+    }
+    elseif ($anchorKind -ceq "changedFile" -and (
+            [string](@($primaryTarget.Targets)[0].path) -cne $path -or
+            [int64](@($primaryTarget.Targets)[0].line) -ne $line)) {
+        [void]$errors.Add("primary manifestation does not match the comment anchor")
+    }
     $changedLineBound = $false
     if ($anchorKind -ceq "changedFile") {
         foreach ($fileAnchor in @(Get-ReviewerRunReconciliationValue $coverage "changedFileAnchors" @())) {
@@ -448,7 +495,7 @@ function Get-ReviewerRunReconciliationSemanticCandidateIdentity {
     }
 
     $constructMap = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
-    foreach ($construct in @(Get-ReviewerRunReconciliationValue $coverage "changedConstructs" @())) {
+    foreach ($construct in $constructs) {
         $id = [string](Get-ReviewerRunReconciliationValue $construct "constructId" "")
         if (-not $id -or $constructMap.ContainsKey($id)) {
             [void]$errors.Add("construct table contains a missing or duplicate id")
@@ -492,7 +539,7 @@ function Get-ReviewerRunReconciliationSemanticCandidateIdentity {
         [void]$errors.Add("candidate anchor identifies neither a violation construct nor a sealed changed-file range")
     }
     $remediationErrors = [string[]](Get-ReviewerConventionSpecialistRemediationErrors `
-            -Candidate $Candidate -Constructs @(Get-ReviewerRunReconciliationValue $coverage "changedConstructs" @()) `
+            -Candidate $Candidate -Constructs $constructs `
             -ConstructFiles @(Get-ReviewerRunReconciliationValue $coverage "constructFiles" @()) `
             -ChangedFileAnchors @(Get-ReviewerRunReconciliationValue $coverage "changedFileAnchors" @()) `
             -FactPlan ([pscustomobject]@{
@@ -505,11 +552,16 @@ function Get-ReviewerRunReconciliationSemanticCandidateIdentity {
     $payload = [ordered]@{
         kind = $script:ReviewerRunSemanticCandidateKind
         version = $script:ReviewerRunSemanticCandidateVersion
-        rule = [ordered]@{ packName = $packName; sourceId = $ruleSourceId; sha256 = $ruleSourceSha256 }
+        rule = [ordered]@{
+            packName = $packName.ToLowerInvariant()
+            sourceId = $ruleSourceId
+            sha256 = $ruleSourceSha256
+        }
         anchor = [ordered]@{
-            kind = $anchorKind; path = $path; line = $line
+            kind = $anchorKind; target = [string]$primaryTarget.Canonical; path = $path; line = $line
             constructs = @($anchorConstructs.ToArray())
         }
+        manifestations = @($manifestations.Targets)
         issue = [ordered]@{ class = $issueClass; impactCategory = $impactCategory }
         severity = $severity
         qualifiers = [ordered]@{ confidence = $confidence; siblingStatus = $siblingStatus }
@@ -517,7 +569,7 @@ function Get-ReviewerRunReconciliationSemanticCandidateIdentity {
         remediation = [ordered]@{
             changedCodeFix = [ordered]@{
                 action = $remediationAction
-                targets = @($remediationTargets)
+                targets = @($remediation.Targets)
                 conventionKey = $conventionKey
                 valueSource = $valueSource
                 evidenceFactIds = @($changedEvidenceFactIds)

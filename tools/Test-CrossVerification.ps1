@@ -108,6 +108,8 @@ function New-ConventionCandidate {
         anchorKind = "changedFile"
         filePath = "/src/a.cs"
         line = 12
+        primaryTarget = "cf0:12"
+        manifestations = ""
         packName = "csharp-core"
         ruleSourceId = "shared-rules"
         ruleSourceRepositoryId = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
@@ -578,7 +580,7 @@ Assert-Verification ($enrichedGeneralists.Count -eq 4 -and
             [string]$_.ruleQuote -ceq $localizationRuleQuote -and
             [string]$_.changedCodeFix.valueSource -ceq "authoritativeRule" -and
             [string]$_.changedCodeFix.conventionKey -ceq $localizationSourceId -and
-            [string]$_.changedCodeFix.targets -cmatch '^cf[01]$'
+            [string]$_.changedCodeFix.targets -cmatch '^(cf0:1112|cf1:24)$'
         }).Count -eq 2 -and
     @($enrichedGeneralists | Where-Object {
             -not [bool]$_.conventionBound -and [string]$_.ruleSourceId -ceq ""
@@ -602,7 +604,8 @@ $line1112SpecialistRaw = New-ConventionCandidate -CandidateId "line-1112-special
 $line1112SpecialistRaw.filePath =
     "/src/flow/Roles/Flow.Worker.Cloud.New/Jobs/AutomationProject/AutomationProjectApplicationProvisioningJob.cs"
 $line1112SpecialistRaw.line = 1112
-$line1112SpecialistRaw.changedCodeFix.targets = "cf1"
+$line1112SpecialistRaw.primaryTarget = "cf1:1112"
+$line1112SpecialistRaw.changedCodeFix.targets = "cf1:1112"
 $line1112SpecialistUnion = @(ConvertTo-ReviewerVerificationCandidates `
         -ConventionCandidates @($line1112SpecialistRaw) -ConventionModel "claude-sonnet-5" `
         -ConventionArtifactSha256 ("c" * 64))
@@ -612,7 +615,7 @@ $line1112SpecialistAssignments = @(Get-ReviewerVerificationAssignments `
         -ChangedPaths @($line1112SpecialistRaw.filePath))
 Assert-Verification ($line1112SpecialistUnion.Count -eq 1 -and
     [int]$line1112SpecialistUnion[0].line -eq 1112 -and
-    [string]$line1112SpecialistUnion[0].changedCodeFix.targets -ceq "cf1" -and
+    [string]$line1112SpecialistUnion[0].changedCodeFix.targets -ceq "cf1:1112" -and
     $line1112SpecialistAssignments.Count -eq 2) `
     "The exact cf1 line-1112 specialist finding did not enter the blind union with both cross-checks."
 $noBinding = @(ConvertTo-ReviewerVerificationCandidates `
@@ -662,15 +665,15 @@ $enrichedAccepted = Resolve-ReviewerVerificationDecisions -Clusters $enrichedClu
     -ResolvedSources @($bindingSource) -EvidenceHunks $enrichedEvidence `
     -RequiredVerifierModels @($opus, $sol)
 Assert-Verification (@($enrichedAccepted.eligible).Count -eq 1 -and
-    [string]$enrichedAccepted.eligible[0].changedCodeFix.targets -ceq "cf0" -and
-    [string]$enrichedAccepted.eligible[0].comment -clike "*changed-file anchor(s) cf0*") `
+    [string]$enrichedAccepted.eligible[0].changedCodeFix.targets -ceq "cf0:1112" -and
+    [string]$enrichedAccepted.eligible[0].comment -clike "*changed-file anchor(s) cf0:1112*") `
     "Fresh GPT and Opus concurrence did not accept the wrapper-enriched localization candidate."
 $enrichedReconciliationCandidates = @(Get-ReviewerVerificationAcceptedReconciliationCandidates `
         -Eligible @($enrichedAccepted.eligible) -Decisions @($enrichedAccepted.decisions) `
         -Clusters $enrichedCluster)
 Assert-Verification ($enrichedReconciliationCandidates.Count -eq 1 -and
     [string]$enrichedReconciliationCandidates[0].ruleSourceId -ceq $localizationSourceId -and
-    [string]$enrichedReconciliationCandidates[0].changedCodeFix.targets -ceq "cf0") `
+    [string]$enrichedReconciliationCandidates[0].changedCodeFix.targets -ceq "cf0:1112") `
     "An accepted enriched generalist finding did not enter run reconciliation."
 $peerCandidate = Copy-ReviewerVerificationJsonValue -Value $enrichedGptCandidate
 $peerCandidate.candidateId = "cand1:" + ("e" * 64)

@@ -49,6 +49,165 @@ function Test-ReviewerConventionSpecialistInteger {
             $Value -le [uint64][int64]::MaxValue))
 }
 
+function Test-ReviewerConventionSpecialistDeterministicFact {
+    param([AllowNull()]$Fact)
+    if ($null -eq $Fact -or
+        @("true", "false") -cnotcontains
+            [string](Get-ReviewerConventionSpecialistValue $Fact "state" "")) {
+        return $false
+    }
+    $value = Get-ReviewerConventionSpecialistValue $Fact "value" $null
+    if ($value -is [bool]) { return $true }
+    return ($value -is [string] -and
+        -not ([string]$value -match '[\x00-\x1f\x7f]'))
+}
+
+function Resolve-ReviewerConventionSpecialistTargets {
+    <#
+        Resolves the one target grammar used by candidates, remediation,
+        reconciliation, and previews. A cf target names one exact delivered
+        right-hand line. A lexical target names one wrapper-enumerated construct.
+        Nothing is inferred from nearby syntax or from a path supplied by a model.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [AllowEmptyCollection()][object[]]$Constructs = @(),
+        [AllowEmptyCollection()][object[]]$ChangedFileAnchors = @(),
+        [switch]$ChangedLinesOnly,
+        [switch]$AllowPrMetadata,
+        [int]$MaxTargets = 32
+    )
+    $errors = [System.Collections.Generic.List[string]]::new()
+    $constructMap = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $invalidConstructIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($construct in $(if ($ChangedLinesOnly) { @() } else { @($Constructs) })) {
+        $id = [string](Get-ReviewerConventionSpecialistValue $construct "constructId" "")
+        $path = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+            [string](Get-ReviewerConventionSpecialistValue $construct "path" ""))
+        $line = Get-ReviewerConventionSpecialistValue $construct "line" $null
+        $endLine = Get-ReviewerConventionSpecialistValue $construct "endLine" $null
+        if ($id -cnotmatch '^(mi|dc|cm|as)[0-9]{1,3}$' -or
+            $constructMap.ContainsKey($id) -or $invalidConstructIds.Contains($id) -or -not $path -or
+            -not (Test-ReviewerConventionSpecialistInteger $line) -or
+            -not (Test-ReviewerConventionSpecialistInteger $endLine) -or
+            [int64]$line -lt 1 -or [int64]$endLine -lt [int64]$line -or
+            [string](Get-ReviewerConventionSpecialistValue $construct "status" "known") -cne "known") {
+            if ($id) {
+                [void]$invalidConstructIds.Add($id)
+                [void]$constructMap.Remove($id)
+            }
+            continue
+        }
+        $constructMap.Add($id, [pscustomobject][ordered]@{
+                target = $id
+                kind = "construct"
+                constructKind = [string](Get-ReviewerConventionSpecialistValue $construct "kind" "")
+                path = $path
+                line = [int64]$line
+                endLine = [int64]$endLine
+            })
+    }
+    $fileMap = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $invalidFileIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($anchor in @($ChangedFileAnchors)) {
+        $id = [string](Get-ReviewerConventionSpecialistValue $anchor "anchorId" "")
+        $path = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+            [string](Get-ReviewerConventionSpecialistValue $anchor "path" ""))
+        if ($id -cnotmatch '^cf[0-9]{1,3}$') { continue }
+        if (-not $path -or $fileMap.ContainsKey($id) -or $invalidFileIds.Contains($id)) {
+            [void]$invalidFileIds.Add($id)
+            [void]$fileMap.Remove($id)
+            continue
+        }
+        $ranges = [System.Collections.Generic.List[object]]::new()
+        $malformedRange = $false
+        foreach ($range in @(Get-ReviewerConventionSpecialistValue $anchor "rightHandRanges" @())) {
+            $start = Get-ReviewerConventionSpecialistValue $range "startLine" $null
+            $end = Get-ReviewerConventionSpecialistValue $range "endLine" $null
+            if (-not (Test-ReviewerConventionSpecialistInteger $start) -or
+                -not (Test-ReviewerConventionSpecialistInteger $end) -or
+                [int64]$start -lt 1 -or [int64]$end -lt [int64]$start) {
+                $malformedRange = $true
+                break
+            }
+            [void]$ranges.Add([pscustomobject]@{ startLine = [int64]$start; endLine = [int64]$end })
+        }
+        if ($malformedRange) {
+            [void]$invalidFileIds.Add($id)
+            continue
+        }
+        $fileMap.Add($id, [pscustomobject]@{ path = $path; ranges = $ranges.ToArray() })
+    }
+
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $resolved = [System.Collections.Generic.List[object]]::new()
+    $tokens = @($Text -split ',' | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ })
+    if ($tokens.Count -gt $MaxTargets) {
+        [void]$errors.Add("target list exceeds the bounded $MaxTargets-target limit")
+    }
+    foreach ($token in @($tokens | Select-Object -First $MaxTargets)) {
+        if (-not $seen.Add($token)) {
+            [void]$errors.Add("target '$token' is duplicated")
+            continue
+        }
+        if ($token -ceq "prmetadata") {
+            if (-not $AllowPrMetadata -or $tokens.Count -ne 1) {
+                [void]$errors.Add("prMetadata cannot be combined with changed-code targets")
+            }
+            else {
+                [void]$resolved.Add([pscustomobject][ordered]@{
+                        target = "prMetadata"; kind = "prMetadata"; path = ""; line = 0; endLine = 0
+                    })
+            }
+            continue
+        }
+        $lineMatch = [regex]::Match($token, '^(cf[0-9]{1,3}):([1-9][0-9]{0,6})$')
+        if ($lineMatch.Success) {
+            $fileId = $lineMatch.Groups[1].Value
+            $line = [int64]$lineMatch.Groups[2].Value
+            if ($invalidFileIds.Contains($fileId) -or -not $fileMap.ContainsKey($fileId)) {
+                [void]$errors.Add("changed-file target '$token' is missing or belongs to another sealed change set")
+                continue
+            }
+            $anchor = $fileMap[$fileId]
+            if (@($anchor.ranges | Where-Object {
+                        $line -ge [int64]$_.startLine -and $line -le [int64]$_.endLine
+                    }).Count -ne 1) {
+                [void]$errors.Add("changed-file target '$token' is deleted, context, ambiguous, or outside its exact RawSpan")
+                continue
+            }
+            [void]$resolved.Add([pscustomobject][ordered]@{
+                    target = $token; kind = "changedLine"; path = [string]$anchor.path
+                    line = $line; endLine = $line
+                })
+            continue
+        }
+        if (-not $ChangedLinesOnly -and $token -cmatch '^(mi|dc|cm|as)[0-9]{1,3}$') {
+            if ($invalidConstructIds.Contains($token) -or -not $constructMap.ContainsKey($token)) {
+                [void]$errors.Add("lexical target '$token' is missing or belongs to another sealed construct table")
+            }
+            else { [void]$resolved.Add($constructMap[$token]) }
+            continue
+        }
+        [void]$errors.Add("target '$token' does not match the canonical target grammar")
+    }
+    $ordered = @($resolved.ToArray())
+    [Array]::Sort($ordered, [System.Comparison[object]]{
+            param($left, $right)
+            $comparison = [StringComparer]::Ordinal.Compare([string]$left.path, [string]$right.path)
+            if ($comparison -ne 0) { return $comparison }
+            $comparison = [int64]$left.line - [int64]$right.line
+            if ($comparison -ne 0) { return [Math]::Sign($comparison) }
+            return [StringComparer]::Ordinal.Compare([string]$left.target, [string]$right.target)
+        })
+    return @{
+        Ok = ($errors.Count -eq 0)
+        Errors = [string[]]$errors.ToArray()
+        Targets = @($ordered)
+        Canonical = (@($ordered | ForEach-Object { [string]$_.target }) -join ",")
+    }
+}
+
 function Get-ReviewerConventionSpecialistDebtEvidenceFactId {
     param([Parameter(Mandatory)]$Evidence)
     $rows = @((Get-ReviewerConventionSpecialistValue $Evidence "attributeFrequency" @()) |
@@ -92,46 +251,20 @@ function Get-ReviewerConventionSpecialistRemediationErrors {
         ($valueSource -ceq "deterministicFact" -and -not $changedFactText)) {
         [void]$errors.Add("changed-code remediation is incomplete or contradictory")
     }
-    $targets = @(([string](Get-ReviewerConventionSpecialistValue $changedFix "targets" "") -split ',') |
-        ForEach-Object { $_.Trim() } | Where-Object { $_ })
     $anchorKind = [string](Get-ReviewerConventionSpecialistValue $Candidate "anchorKind" "")
+    $resolvedTargets = Resolve-ReviewerConventionSpecialistTargets `
+        -Text ([string](Get-ReviewerConventionSpecialistValue $changedFix "targets" "")) `
+        -Constructs $Constructs -ChangedFileAnchors $ChangedFileAnchors `
+        -AllowPrMetadata:($anchorKind -ceq "prMetadata")
+    foreach ($targetError in @($resolvedTargets.Errors)) { [void]$errors.Add($targetError) }
     if ($anchorKind -ceq "prMetadata") {
-        if ($targets.Count -ne 1 -or $targets[0] -cne "prMetadata") {
+        if ([string]$resolvedTargets.Canonical -cne "prMetadata") {
             [void]$errors.Add("metadata remediation must target prMetadata")
         }
     }
     else {
-        $known = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-        foreach ($construct in @($Constructs)) {
-            $id = [string](Get-ReviewerConventionSpecialistValue $construct "constructId" "")
-            if ($id) { [void]$known.Add($id) }
-        }
-        $candidatePath = ConvertTo-ReviewerConventionSpecialistCanonicalPath `
-            -Path ([string](Get-ReviewerConventionSpecialistValue $Candidate "filePath" ""))
-        $candidateLineValue = Get-ReviewerConventionSpecialistValue $Candidate "line" 0
-        $candidateLine = if ($candidateLineValue -is [int] -or $candidateLineValue -is [long] -or
-            $candidateLineValue -is [short] -or $candidateLineValue -is [byte]) {
-            [int64]$candidateLineValue
-        } else { 0 }
-        foreach ($fileAnchor in @($ChangedFileAnchors)) {
-            $anchorPath = ConvertTo-ReviewerConventionSpecialistCanonicalPath `
-                -Path ([string](Get-ReviewerConventionSpecialistValue $fileAnchor "path" ""))
-            if ($anchorPath -cne $candidatePath) { continue }
-            foreach ($range in @(Get-ReviewerConventionSpecialistValue $fileAnchor "rightHandRanges" @())) {
-                $startLine = [int](Get-ReviewerConventionSpecialistValue $range "startLine" 0)
-                $endLine = [int](Get-ReviewerConventionSpecialistValue $range "endLine" 0)
-                if ($candidateLine -ge $startLine -and $candidateLine -le $endLine) {
-                    $anchorId = [string](Get-ReviewerConventionSpecialistValue $fileAnchor "anchorId" "")
-                    if ($anchorId) { [void]$known.Add($anchorId) }
-                    break
-                }
-            }
-        }
-        if ($targets.Count -eq 0 -or @($targets | Where-Object {
-                    $_ -cnotmatch '^[a-z]{2}[0-9]+$' -or
-                    -not $known.Contains($_)
-                }).Count -gt 0) {
-            [void]$errors.Add("changed-file remediation must target a known sealed construct or right-hand changed-file anchor")
+        if (@($resolvedTargets.Targets).Count -eq 0) {
+            [void]$errors.Add("changed-file remediation must target a sealed changed line or truthful lexical construct")
         }
     }
     $factMap = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
@@ -145,9 +278,8 @@ function Get-ReviewerConventionSpecialistRemediationErrors {
     }
     foreach ($factId in $changedFactIds) {
         if ($factId -cnotmatch '^rf1:[0-9a-f]{64}$' -or -not $factMap.ContainsKey($factId) -or
-            [string](Get-ReviewerConventionSpecialistValue $factMap[$factId] "state" "") -notin
-                @("true", "false")) {
-            [void]$errors.Add("changed-code remediation cites an unknown deterministic fact")
+            -not (Test-ReviewerConventionSpecialistDeterministicFact $factMap[$factId])) {
+            [void]$errors.Add("changed-code remediation cites a fact that is unknown or not a canonical boolean/string value")
         }
     }
 
@@ -230,7 +362,7 @@ $script:ReviewerConventionSpecialistImpactCategories = @(
 $script:ReviewerConventionSpecialistWithheldReasons = @(
     "sourceConflict", "outsideChangedFile", "invalidAnchor", "unverifiedSource",
     "unknownFact", "unsupportedSeverity", "missingSiblingEvidence", "duplicateCandidate",
-    "duplicateExistingThread", "accountedNotEmitted"
+    "duplicateExistingThread", "accountedNotEmitted", "invalidTarget", "invalidEvidence"
 )
 $script:ReviewerConventionSpecialistCoverageStatuses = @(
     "violation", "compliant", "notApplicable", "unknown"
@@ -253,6 +385,8 @@ $script:ReviewerConventionSpecialistConstructListPattern =
 '^(|(mi|dc|cm|as)[0-9]{1,3}(-(mi|dc|cm|as)[0-9]{1,3})?(,(mi|dc|cm|as)[0-9]{1,3}(-(mi|dc|cm|as)[0-9]{1,3})?)*)$'
 $script:ReviewerConventionSpecialistChangedLineListPattern =
 '^(|cf[0-9]{1,3}:[1-9][0-9]{0,6}(,cf[0-9]{1,3}:[1-9][0-9]{0,6})*)$'
+$script:ReviewerConventionSpecialistTargetListPattern =
+'^(prMetadata|(?:cf[0-9]{1,3}:[1-9][0-9]{0,6}|(?:mi|dc|cm|as)[0-9]{1,3})(?:,(?:cf[0-9]{1,3}:[1-9][0-9]{0,6}|(?:mi|dc|cm|as)[0-9]{1,3})){0,31})$'
 $script:ReviewerConventionSpecialistConstructPrefixes = @{
     invocation = "mi"; declaration = "dc"; comment = "cm"; assignment = "as"
 }
@@ -529,6 +663,7 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
     $ascii = '^[\x20-\x7E]*$'
     $candidateKeys = @(
         "candidateId", "category", "severity", "anchorKind", "filePath", "line",
+        "primaryTarget", "manifestations",
         "packName", "ruleSourceId", "ruleSourceRepositoryId", "ruleSourcePath",
         "ruleSourceCommit", "ruleSourceSha256", "ruleSection", "ruleQuote",
         "diffEvidence", "impactCategory", "impact", "expectedFixOrValidation",
@@ -567,6 +702,14 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                         anchorKind = @{ Type = "enum"; Values = @("changedFile", "prMetadata") }
                         filePath = @{ Type = "string"; MaxLength = 400; AllowEmpty = $true; Pattern = '^/?[\x20-\x21\x23-\x29\x2B-\x39\x3B\x3D\x40-\x5B\x5D-\x7B\x7D-\x7E]*$' }
                         line = @{ Type = "int"; Min = 0; Max = 1000000 }
+                        primaryTarget = @{
+                            Type = "string"; MaxLength = 24
+                            Pattern = '^(prMetadata|cf[0-9]{1,3}:[1-9][0-9]{0,6})$'
+                        }
+                        manifestations = @{
+                            Type = "string"; MaxLength = 400; AllowEmpty = $true
+                            Pattern = $script:ReviewerConventionSpecialistChangedLineListPattern
+                        }
                         packName = @{ Type = "string"; MaxLength = 64; Pattern = '^[a-z][a-z0-9-]{0,63}$' }
                         ruleSourceId = @{ Type = "string"; MaxLength = 1100; Pattern = $ascii }
                         ruleSourceRepositoryId = @{ Type = "guid" }
@@ -597,7 +740,7 @@ function Get-ReviewerConventionSpecialistMarkerSchema {
                                     action = @{ Type = "enum"; Values = @("add", "modify", "remove", "rename", "replace", "validate") }
                                     targets = @{
                                         Type = "string"; MaxLength = 600
-                                        Pattern = '^(prMetadata|[a-z]{2}[0-9]+(,[a-z]{2}[0-9]+){0,31})$'
+                                        Pattern = $script:ReviewerConventionSpecialistTargetListPattern
                                     }
                                     conventionKey = @{ Type = "string"; MaxLength = 128; Pattern = '^[A-Za-z_][A-Za-z0-9_.:\-]{0,127}$' }
                                     valueSource = @{ Type = "enum"; Values = @("authoritativeRule", "deterministicFact") }
@@ -1698,12 +1841,69 @@ function Resolve-ReviewerConventionSpecialistCandidates {
     foreach ($candidate in @($Marker.candidates)) {
         $candidateId = [string]$candidate.candidateId
         if (-not $seenIds.Add($candidateId)) { throw "Specialist output duplicated candidate id '$candidateId'." }
+        $anchorKind = [string](Get-ReviewerConventionSpecialistValue $candidate "anchorKind" "")
+        $primaryTarget = [string](Get-ReviewerConventionSpecialistValue $candidate "primaryTarget" "")
+        $manifestationText = [string](Get-ReviewerConventionSpecialistValue $candidate "manifestations" "")
+        if ($anchorKind -ceq "prMetadata") {
+            if ($primaryTarget -cne "prMetadata" -or $manifestationText) {
+                [void]$withheld.Add([pscustomobject][ordered]@{
+                        candidateId = $candidateId; reason = "invalidTarget"
+                        detail = "Metadata candidates require primaryTarget prMetadata and no changed-line manifestations."
+                    })
+                continue
+            }
+        }
+        else {
+            $primary = Resolve-ReviewerConventionSpecialistTargets -Text $primaryTarget `
+                -Constructs $Constructs -ChangedFileAnchors $changedFileIndex -ChangedLinesOnly
+            $additional = Resolve-ReviewerConventionSpecialistTargets -Text $manifestationText `
+                -Constructs $Constructs -ChangedFileAnchors $changedFileIndex -ChangedLinesOnly
+            $full = Resolve-ReviewerConventionSpecialistTargets `
+                -Text (@($primaryTarget, $manifestationText | Where-Object { $_ }) -join ",") `
+                -Constructs $Constructs -ChangedFileAnchors $changedFileIndex -ChangedLinesOnly
+            $targetErrors = @($primary.Errors) + @($additional.Errors) + @($full.Errors)
+            $candidatePath = ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+                [string](Get-ReviewerConventionSpecialistValue $candidate "filePath" ""))
+            $candidateLine = Get-ReviewerConventionSpecialistValue $candidate "line" $null
+            if (@($primary.Targets).Count -ne 1 -or
+                [string]((@($primary.Targets)[0]).path) -cne $candidatePath -or
+                -not (Test-ReviewerConventionSpecialistInteger $candidateLine) -or
+                [int64]((@($primary.Targets)[0]).line) -ne [int64]$candidateLine) {
+                $targetErrors += "primaryTarget does not exactly match the posted filePath and line"
+            }
+            if (@($full.Targets).Count -gt 0) {
+                $deterministicPrimary = @($full.Targets)[0]
+                if ([string]$deterministicPrimary.target -cne $primaryTarget.ToLowerInvariant()) {
+                    $targetErrors += "primaryTarget is not the deterministic ordinal path/line selection"
+                }
+            }
+            if ($targetErrors.Count -gt 0) {
+                [void]$withheld.Add([pscustomobject][ordered]@{
+                        candidateId = $candidateId; reason = "invalidTarget"
+                        detail = Get-ReviewerConventionSpecialistShortened `
+                            -Text ("Candidate target validation failed: " + ($targetErrors -join "; ") + ".") `
+                            -MaxLength 800
+                    })
+                continue
+            }
+            $candidate.primaryTarget = [string]$primary.Canonical
+            $candidate.manifestations = [string]$additional.Canonical
+        }
         $remediationErrors = [string[]](Get-ReviewerConventionSpecialistRemediationErrors `
                 -Candidate $candidate -Constructs $Constructs -ConstructFiles $ConstructFiles `
                     -ChangedFileAnchors $changedFileIndex -FactPlan $FactPlan)
         if ($remediationErrors.Count -gt 0) {
-            throw "Specialist candidate '$candidateId' has invalid structured remediation: $($remediationErrors -join '; ')."
+            [void]$withheld.Add([pscustomobject][ordered]@{
+                    candidateId = $candidateId; reason = "invalidTarget"
+                    detail = Get-ReviewerConventionSpecialistShortened `
+                        -Text ("Structured remediation validation failed: " +
+                            ($remediationErrors -join "; ") + ".") -MaxLength 800
+                })
+            continue
         }
+        $candidate.changedCodeFix.targets = [string](Resolve-ReviewerConventionSpecialistTargets `
+            -Text ([string]$candidate.changedCodeFix.targets) -Constructs $Constructs `
+            -ChangedFileAnchors $changedFileIndex -AllowPrMetadata:($anchorKind -ceq "prMetadata")).Canonical
         $debt = Get-ReviewerConventionSpecialistValue $candidate "existingDebtFollowUp" $null
         if ([string](Get-ReviewerConventionSpecialistValue $debt "status" "") -ceq "required") {
             $debtFactId = [string](Get-ReviewerConventionSpecialistValue $debt "evidenceFactId" "")
@@ -1745,18 +1945,36 @@ function Resolve-ReviewerConventionSpecialistCandidates {
             throw "Specialist candidate '$candidateId' duplicated a deterministic fact id."
         }
         $facts = [System.Collections.Generic.List[object]]::new()
+        $invalidEvidence = [System.Collections.Generic.List[string]]::new()
         foreach ($factId in $factIds) {
             if (-not $factMap.ContainsKey($factId)) {
-                throw "Specialist candidate '$candidateId' cited unknown deterministic fact '$factId'."
+                [void]$invalidEvidence.Add("unknown deterministic fact '$factId'")
+                continue
+            }
+            if (@("true", "false") -cnotcontains [string](
+                    Get-ReviewerConventionSpecialistValue $factMap[$factId] "state" "")) {
+                [void]$invalidEvidence.Add("fact '$factId' does not have a deterministic state")
+                continue
             }
             [void]$facts.Add($factMap[$factId])
         }
+        if ($invalidEvidence.Count -gt 0) {
+            [void]$withheld.Add([pscustomobject][ordered]@{
+                    candidateId = $candidateId; reason = "invalidEvidence"
+                    detail = Get-ReviewerConventionSpecialistShortened `
+                        -Text ("Candidate evidence validation failed: " +
+                            (@($invalidEvidence) -join "; ") + ".") -MaxLength 800
+                })
+            continue
+        }
         if ([string]$candidate.severity -ceq "important") {
+            $candidateSiblingStatus = [string](Get-ReviewerConventionSpecialistValue `
+                $candidate "siblingStatus" "")
             if ([string]$candidate.impactCategory -ceq "none") {
                 throw "Specialist candidate '$candidateId' escalated severity without a protected impact category."
             }
-            if ($facts.Count -eq 0 -and [string]$candidate.siblingStatus -cne "checked") {
-                throw "Specialist candidate '$candidateId' used important severity without a deterministic fact or checked sibling evidence."
+            if ($facts.Count -eq 0 -and $candidateSiblingStatus -cne "checked") {
+                throw "Specialist candidate '$candidateId' used important severity without a deterministic fact or checked sibling evidence (status '$candidateSiblingStatus')."
             }
             if ($facts.Count -eq 0 -and ([string]$candidate.siblingEvidence).Trim().Length -lt 16) {
                 throw "Specialist candidate '$candidateId' used important severity without meaningful checked sibling evidence."
@@ -1765,7 +1983,11 @@ function Resolve-ReviewerConventionSpecialistCandidates {
                         @("true", "false") -cnotcontains
                         [string](Get-ReviewerConventionSpecialistValue $_ "state" "")
                     }).Count -gt 0) {
-                throw "Specialist candidate '$candidateId' used a non-deterministic fact to support important severity."
+                $invalidStates = @($facts | ForEach-Object {
+                        "$([string](Get-ReviewerConventionSpecialistValue $_ 'id' ''))=" +
+                        [string](Get-ReviewerConventionSpecialistValue $_ "state" "")
+                    }) -join ","
+                throw "Specialist candidate '$candidateId' used a non-deterministic fact to support important severity ($invalidStates)."
             }
         }
         elseif ([string]$candidate.impactCategory -cne "none") {
@@ -1844,6 +2066,76 @@ function Resolve-ReviewerConventionSpecialistCandidates {
         -WithheldCandidateIds @(@($withheld) | ForEach-Object {
                 [string](Get-ReviewerConventionSpecialistValue $_ "candidateId" "")
             } | Where-Object { $_ })
+    # A manifestation is not merely any changed line. It must be one of the
+    # exact changed-line violations in the linked rule row, or lie inside one of
+    # that row's truthful lexical violation constructs. This keeps unrelated
+    # changed lines from changing semantic identity or widening fix scope.
+    $retained = [System.Collections.Generic.List[object]]::new()
+    $constructById = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($construct in @($Constructs)) {
+        $id = [string](Get-ReviewerConventionSpecialistValue $construct "constructId" "")
+        if ($id -and
+            [string](Get-ReviewerConventionSpecialistValue $construct "status" "known") -ceq "known" -and
+            -not $constructById.ContainsKey($id)) {
+            $constructById.Add($id, $construct)
+        }
+    }
+    foreach ($candidate in @($accepted)) {
+        if ([string](Get-ReviewerConventionSpecialistValue $candidate "anchorKind" "") -cne "changedFile") {
+            [void]$retained.Add($candidate)
+            continue
+        }
+        $rows = @($coverage.Rows | Where-Object {
+               [string]$_.packName -ceq [string]$candidate.packName -and
+               [string]$_.ruleSourceId -ceq [string]$candidate.ruleSourceId
+            })
+        $manifestations = Resolve-ReviewerConventionSpecialistTargets -Text (
+            @([string]$candidate.primaryTarget, [string]$candidate.manifestations |
+               Where-Object { $_ }) -join ",") -ChangedFileAnchors $changedFileIndex -ChangedLinesOnly
+        $unsupported = [System.Collections.Generic.List[string]]::new()
+        if ($rows.Count -ne 1 -or -not $manifestations.Ok) {
+            [void]$unsupported.Add([string]$candidate.primaryTarget)
+        }
+        else {
+            $row = $rows[0]
+            $allowedLines = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            foreach ($target in @($row.violatingChangedFileTargets)) { [void]$allowedLines.Add([string]$target) }
+            $violationConstructs = @($row.violatingConstructs | Where-Object {
+                   $constructById.ContainsKey([string]$_)
+               } | ForEach-Object { $constructById[[string]$_] })
+            foreach ($manifestation in @($manifestations.Targets)) {
+               if ($allowedLines.Contains([string]$manifestation.target)) { continue }
+               $insideViolation = @($violationConstructs | Where-Object {
+                       (ConvertTo-ReviewerConventionSpecialistCanonicalPath -Path (
+                           [string](Get-ReviewerConventionSpecialistValue $_ "path" ""))) -ceq
+                           [string]$manifestation.path -and
+                       [int64]$manifestation.line -ge
+                           [int64](Get-ReviewerConventionSpecialistValue $_ "line" 0) -and
+                       [int64]$manifestation.line -le
+                           [int64](Get-ReviewerConventionSpecialistValue $_ "endLine" 0)
+                   }).Count -gt 0
+               if (-not $insideViolation) { [void]$unsupported.Add([string]$manifestation.target) }
+            }
+        }
+        if ($unsupported.Count -gt 0) {
+            [void]$withheld.Add([pscustomobject][ordered]@{
+                   candidateId = [string]$candidate.candidateId
+                   reason = "invalidTarget"
+                   detail = "Manifestations are not exact violations in the candidate's authoritative rule row: " +
+                       (@($unsupported) -join ",") + "."
+               })
+        }
+        else { [void]$retained.Add($candidate) }
+    }
+    if ($retained.Count -ne $accepted.Count) {
+        $coverage = Resolve-ReviewerConventionSpecialistRuleCoverage -Rows $coverageRows `
+            -ResolvedSources $ResolvedSources -AcceptedCandidates $retained.ToArray() `
+            -Constructs $Constructs -ChangedFileAnchors $changedFileIndex `
+            -ConstructsIncomplete $ConstructsIncomplete `
+            -WithheldCandidateIds @(@($withheld) | ForEach-Object {
+                   [string](Get-ReviewerConventionSpecialistValue $_ "candidateId" "")
+               } | Where-Object { $_ })
+    }
     # A rule the model called violated but never emitted is recorded through the
     # EXISTING withheld channel, not a second one. Two lists that both mean
     # "nearly a finding" is exactly where a later edit promotes one.
@@ -1859,7 +2151,7 @@ function Resolve-ReviewerConventionSpecialistCandidates {
             })
     }
     return @{
-        Candidates = $accepted.ToArray()
+        Candidates = $retained.ToArray()
         Withheld = $withheld.ToArray()
         ResidualRisks = @($Marker.residualRisks)
         RuleCoverage = $coverage

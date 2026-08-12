@@ -96,6 +96,17 @@ function Get-ReviewerVerificationValue {
     return $Default
 }
 
+function Test-ReviewerVerificationDeterministicFact {
+    param([AllowNull()]$Fact)
+    if ($null -eq $Fact -or
+        @("true", "false") -cnotcontains [string](Get-ReviewerVerificationValue $Fact "state" "")) {
+        return $false
+    }
+    $value = Get-ReviewerVerificationValue $Fact "value" $null
+    if ($value -is [bool]) { return $true }
+    return ($value -is [string] -and -not ([string]$value -match '[\x00-\x1f\x7f]'))
+}
+
 function Get-ReviewerVerificationSha256 {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
     $sha = [Security.Cryptography.SHA256]::Create()
@@ -660,9 +671,11 @@ function Get-ReviewerVerificationConventionBindings {
                             Get-ReviewerVerificationValue $source "sha256" ""))
                     ruleSection = $section
                     ruleQuote = $quote
+                    primaryTarget = "$([string](Get-ReviewerVerificationValue $anchor 'anchorId' '')):$line"
+                    manifestations = ""
                     changedCodeFix = [pscustomobject][ordered]@{
                         action = "replace"
-                        targets = [string](Get-ReviewerVerificationValue $anchor "anchorId" "")
+                        targets = "$([string](Get-ReviewerVerificationValue $anchor 'anchorId' '')):$line"
                         conventionKey = $conventionKey
                         valueSource = "authoritativeRule"
                         evidenceFactIds = ""
@@ -750,6 +763,8 @@ function New-ReviewerVerificationCandidate {
         anchorKind = $anchorKind
         filePath = $filePath
         line = $line
+        primaryTarget = & $bindingValue "primaryTarget"
+        manifestations = & $bindingValue "manifestations"
         severity = $severity
         comment = $comment
         evidence = $evidence
@@ -802,6 +817,8 @@ function New-ReviewerVerificationCandidate {
         anchorKind = $record.anchorKind
         filePath = $record.filePath
         line = $record.line
+        primaryTarget = $record.primaryTarget
+        manifestations = $record.manifestations
         severity = $record.severity
         comment = $record.comment
         evidence = $record.evidence
@@ -1276,6 +1293,8 @@ function Get-ReviewerVerificationAcceptedReconciliationCandidates {
                 anchorKind = [string](Get-ReviewerVerificationValue $candidate "anchorKind" "")
                 filePath = [string](Get-ReviewerVerificationValue $candidate "filePath" "")
                 line = [int](Get-ReviewerVerificationValue $candidate "line" 0)
+                primaryTarget = [string](Get-ReviewerVerificationValue $candidate "primaryTarget" "")
+                manifestations = [string](Get-ReviewerVerificationValue $candidate "manifestations" "")
                 packName = [string](Get-ReviewerVerificationValue $candidate "packName" "")
                 ruleSourceId = [string](Get-ReviewerVerificationValue $candidate "ruleSourceId" "")
                 ruleSourceRepositoryId = [string](Get-ReviewerVerificationValue `
@@ -1954,7 +1973,11 @@ function Get-ReviewerVerificationEvidenceOptions {
     if ($candidateFactIds.Count -gt 0) {
         $facts = [System.Collections.Generic.List[object]]::new()
         foreach ($factId in $candidateFactIds) {
-            if ($factMap.ContainsKey($factId)) { [void]$facts.Add($factMap[$factId]) }
+            if ($factMap.ContainsKey($factId) -and
+                @("true", "false") -ccontains
+                    [string](Get-ReviewerVerificationValue $factMap[$factId] "state" "")) {
+                [void]$facts.Add($factMap[$factId])
+            }
         }
         if ($facts.Count -eq $candidateFactIds.Count) {
             [void]$options.Add([pscustomobject][ordered]@{
@@ -2005,7 +2028,7 @@ function Get-ReviewerVerificationEvidenceOptions {
             $validChangedSubset = ($changedFactIds.Count -gt 0 -and $changedFactIds.Count -le 8)
             foreach ($factId in $changedFactIds) {
                 if (-not $uniqueChangedFactIds.Add($factId) -or -not $factMap.ContainsKey($factId) -or
-                    [string](Get-ReviewerVerificationValue $factMap[$factId] "state" "") -notin @("true", "false")) {
+                    -not (Test-ReviewerVerificationDeterministicFact $factMap[$factId])) {
                     $validChangedSubset = $false
                     continue
                 }
@@ -2607,7 +2630,7 @@ function Resolve-ReviewerVerificationDecisions {
             $sourceText = $(if ([string](Get-ReviewerVerificationValue $fix "valueSource" "") -ceq
                     "deterministicFact") { "the sealed deterministic evidence" } else { "the authoritative rule" })
             $targetKind = if (@($targetText -split ',' | Where-Object {
-                        $_ -and $_ -cnotmatch '^cf[0-9]+$'
+                        $_ -and $_ -cnotmatch '^cf[0-9]+:[1-9][0-9]*$'
                     }).Count -eq 0) {
                 "changed-file anchor(s)"
             } else { "lexical construct(s)" }
@@ -2626,6 +2649,8 @@ function Resolve-ReviewerVerificationDecisions {
                 severity = $finalSeverity
                 filePath = [string]$winner.candidate.filePath
                 line = [int]$winner.candidate.line
+                primaryTarget = [string](Get-ReviewerVerificationValue $winner.candidate "primaryTarget" "")
+                manifestations = [string](Get-ReviewerVerificationValue $winner.candidate "manifestations" "")
                 comment = $structuredComment
                 evidence = [string]$winner.candidate.evidence
                 confidence = [string]$winner.confidence
