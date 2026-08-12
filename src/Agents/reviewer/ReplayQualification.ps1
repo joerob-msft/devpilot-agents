@@ -258,6 +258,8 @@ function New-ReviewerReplayQualificationPlan {
         [ValidateRange(30, 7200)][int]$CycleTimeoutSeconds = 1800,
         [ValidateRange(30, 3600)][int]$ConventionSpecialistTimeoutSeconds = 900,
         [ValidateRange(30, 3600)][int]$VerificationTimeoutSeconds = 900,
+        [ValidateRange(1, 14400)][int]$SlotTimeoutSeconds = 3600,
+        [ValidateRange(0, 14400)][int]$ProgressTimeoutSeconds = 0,
         [string]$ConventionSpecialistModel = "",
         [string]$ConventionVerifierModel = ""
     )
@@ -386,6 +388,18 @@ function New-ReviewerReplayQualificationPlan {
             "config that lives outside a repository - after the run set has been declared.")
     }
     $qualificationRootFull = Get-ReviewerQualificationFullPath -Path $QualificationRoot -Purpose "qualification root"
+    $effectiveProgressTimeoutSeconds = if ($ProgressTimeoutSeconds -gt 0) {
+        $ProgressTimeoutSeconds
+    }
+    else {
+        [Math]::Min($SlotTimeoutSeconds,
+            ([Math]::Max($CycleTimeoutSeconds,
+                    [Math]::Max($ConventionSpecialistTimeoutSeconds, $VerificationTimeoutSeconds)) + 120))
+    }
+    if ($effectiveProgressTimeoutSeconds -gt $SlotTimeoutSeconds) {
+        throw ("Qualification progress timeout ($effectiveProgressTimeoutSeconds seconds) exceeds the slot hard " +
+            "deadline ($SlotTimeoutSeconds seconds).")
+    }
     foreach ($forbidden in @(
             @{ Path = $toolkitRoot; Name = "the toolkit repository under qualification" },
             @{ Path = $repoPathFull; Name = "the reviewed repository" },
@@ -418,6 +432,7 @@ function New-ReviewerReplayQualificationPlan {
                 ConsolePath = Join-Path (Join-Path $qualificationRootFull "runs") "$slotName-console.txt"
                 ErrorPath   = Join-Path (Join-Path $qualificationRootFull "runs") "$slotName-stderr.txt"
                 ExitPath    = Join-Path (Join-Path $qualificationRootFull "runs") "$slotName-exit.txt"
+                TerminalPath = Join-Path (Join-Path $qualificationRootFull "runs") "$slotName-terminal.json"
                 Arguments   = [string[]]$arguments
                 CommandText = ConvertTo-ReviewerQualificationCommandText -ReviewerScriptPath $scriptPath `
                     -Arguments $arguments
@@ -466,6 +481,8 @@ function New-ReviewerReplayQualificationPlan {
         DeliveryMode        = "previewOnly"
         Promotable          = $false
         SlotCount           = $SlotCount
+        SlotTimeoutSeconds  = $SlotTimeoutSeconds
+        ProgressTimeoutSeconds = $effectiveProgressTimeoutSeconds
         Slots               = @($slots)
     }
 }
@@ -710,6 +727,8 @@ function Get-ReviewerQualificationPlanDigest {
         deliveryMode = [string]$Plan.DeliveryMode
         promotable = [bool]$Plan.Promotable
         slotCount = [int]$Plan.SlotCount
+        slotTimeoutSeconds = [int]$Plan.SlotTimeoutSeconds
+        progressTimeoutSeconds = [int]$Plan.ProgressTimeoutSeconds
         slots = @(@($Plan.Slots) | ForEach-Object {
                 [ordered]@{
                     name = [string]$_.Name

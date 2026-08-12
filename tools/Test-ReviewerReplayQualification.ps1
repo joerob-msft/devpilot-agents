@@ -164,6 +164,27 @@ param(
 )
 Set-StrictMode -Version Latest
 if (-not $QualificationPrelaunch) {
+    if ($OperatorAlias -ceq "hang-test") {
+        New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
+        $nested = Start-Process -FilePath (Get-Process -Id $PID).Path `
+            -ArgumentList @("-NoProfile", "-Command", "Start-Sleep -Seconds 60") -PassThru
+        Set-Content -LiteralPath (Join-Path $StateDir "nested.pid") -Value $nested.Id -Encoding ascii
+        Set-Content -LiteralPath (Join-Path $StateDir "progress.json") -Value '{}' -Encoding ascii
+        Start-Sleep -Seconds 60
+        exit 0
+    }
+    if ($OperatorAlias -ceq "drain-test") {
+        New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
+        $nestedPsi = [Diagnostics.ProcessStartInfo]::new()
+        $nestedPsi.FileName = (Get-Process -Id $PID).Path
+        foreach ($argument in @("-NoProfile", "-Command", "Start-Sleep -Seconds 60")) {
+            [void]$nestedPsi.ArgumentList.Add($argument)
+        }
+        $nestedPsi.UseShellExecute = $false
+        $nested = [Diagnostics.Process]::Start($nestedPsi)
+        Set-Content -LiteralPath (Join-Path $StateDir "nested.pid") -Value $nested.Id -Encoding ascii
+        exit 0
+    }
     # A startup failure strictly before any state exists.
     Write-Error "stand-in agent fails at startup"
     exit 9
@@ -316,6 +337,8 @@ exit 0
         $plan.Snapshot.PullRequestId -eq $snapshotPrId) `
         "The plan did not load and bind the snapshot it was given."
     Assert-Qualification ($plan.Snapshot.ResourceCount -gt 0) "The plan reported a snapshot with no recorded reads."
+    Assert-Qualification ($plan.SlotTimeoutSeconds -eq 3600 -and $plan.ProgressTimeoutSeconds -eq 1920) `
+        "The plan did not derive its bounded-progress deadline from the largest configured model-call timeout."
     Assert-Qualification (-not $plan.Promotable -and $plan.DeliveryMode -ceq "previewOnly") `
         "The plan did not record the replay as non-promotable, preview-only work."
     Assert-Qualification ($plan.GitIdentity.head -ceq $head -and [bool]$plan.GitIdentity.clean -and
@@ -694,6 +717,68 @@ exit 0
     Assert-QualificationThrows {
         & $sandboxTool -Mode RunSlot @attemptArguments -Slot "slot1" -RunSetKeyPath $keyPath
     } "A slot whose child failed to start was allowed a second attempt." "already been attempted"
+
+    # The wrapper, not only each model call, owns a hard deadline and a
+    # no-progress watchdog. The hanging stand-in creates a grandchild so this
+    # also proves cancellation reaches the whole owned process tree.
+    $hangRoot = Join-Path $sandbox "hang-root"
+    $hangArguments = $planArguments.Clone()
+    $hangArguments["QualificationRoot"] = $hangRoot
+    $hangArguments["ReviewerScriptPath"] = $failingAgent
+    $hangArguments["OperatorAlias"] = "hang-test"
+    $hangArguments["SlotTimeoutSeconds"] = 10
+    $hangArguments["ProgressTimeoutSeconds"] = 2
+    & $sandboxTool -Mode Declare @hangArguments -RunSetKeyPath $keyPath -Purpose "deterministic hanging child" | Out-Null
+    & $sandboxTool -Mode RunSlot @hangArguments -Slot "slot1" -RunSetKeyPath $keyPath 2>&1 | Out-Null
+    $hangExit = $LASTEXITCODE
+    $hangTerminalPath = Join-Path $hangRoot "runs\slot1-terminal.json"
+    $hangTerminal = Get-Content -LiteralPath $hangTerminalPath -Raw | ConvertFrom-Json
+    $nestedPid = [int](Get-Content -LiteralPath (Join-Path $hangRoot "runs\slot1-state\nested.pid") -Raw)
+    $treeStopDeadline = [DateTime]::UtcNow.AddSeconds(3)
+    while ((Get-Process -Id $nestedPid -ErrorAction SilentlyContinue) -and
+        [DateTime]::UtcNow -lt $treeStopDeadline) {
+        Start-Sleep -Milliseconds 100
+    }
+    Assert-Qualification ($hangExit -eq 124 -and [bool]$hangTerminal.timedOut -and
+        [string]$hangTerminal.timeoutReason -ceq "progressDeadline") `
+        "A hanging slot did not terminate at its declared progress deadline with exit 124."
+    Assert-Qualification ([int]$hangTerminal.slotTimeoutSeconds -eq 10 -and
+        [int]$hangTerminal.progressTimeoutSeconds -eq 2 -and
+        [string]$hangTerminal.status -ceq "timedOut") `
+        "The hanging slot's terminal evidence did not preserve its exact deadline policy."
+    Assert-Qualification ((Get-Item -LiteralPath $hangTerminalPath).IsReadOnly) `
+        "A timed-out slot's terminal evidence remains writable."
+    Assert-Qualification (-not (Get-Process -Id $nestedPid -ErrorAction SilentlyContinue)) `
+        "The hanging slot's grandchild survived owned process-tree cancellation."
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode RunSlot @hangArguments -Slot "slot1" -RunSetKeyPath $keyPath
+    } "A timed-out slot was allowed to resume." "already (has state|been attempted)"
+
+    # A child may exit while a descendant still holds its inherited output
+    # handles. The wrapper must hit the output-drain deadline and find that
+    # descendant by the exited root's PID; Kill(true) alone cannot.
+    $drainRoot = Join-Path $sandbox "drain-root"
+    $drainArguments = $planArguments.Clone()
+    $drainArguments["QualificationRoot"] = $drainRoot
+    $drainArguments["ReviewerScriptPath"] = $failingAgent
+    $drainArguments["OperatorAlias"] = "drain-test"
+    $drainArguments["SlotTimeoutSeconds"] = 4
+    $drainArguments["ProgressTimeoutSeconds"] = 4
+    & $sandboxTool -Mode Declare @drainArguments -RunSetKeyPath $keyPath -Purpose "deterministic pipe holder" | Out-Null
+    & $sandboxTool -Mode RunSlot @drainArguments -Slot "slot1" -RunSetKeyPath $keyPath 2>&1 | Out-Null
+    $drainTerminal = Get-Content -LiteralPath (Join-Path $drainRoot "runs\slot1-terminal.json") -Raw |
+        ConvertFrom-Json
+    $drainNestedPid = [int](Get-Content -LiteralPath (Join-Path $drainRoot "runs\slot1-state\nested.pid") -Raw)
+    $drainStopDeadline = [DateTime]::UtcNow.AddSeconds(3)
+    while ((Get-Process -Id $drainNestedPid -ErrorAction SilentlyContinue) -and
+        [DateTime]::UtcNow -lt $drainStopDeadline) {
+        Start-Sleep -Milliseconds 100
+    }
+    Assert-Qualification ([bool]$drainTerminal.timedOut -and
+        [string]$drainTerminal.timeoutReason -ceq "outputDrainDeadline") `
+        "A detached output-pipe holder was not classified as an output-drain timeout."
+    Assert-Qualification (-not (Get-Process -Id $drainNestedPid -ErrorAction SilentlyContinue)) `
+        "A detached output-pipe holder survived output-drain cancellation."
 
     # -- 11. Nothing here ever reached a model or a network call -------------
     Write-Host "11/11 offline discipline" -ForegroundColor Cyan

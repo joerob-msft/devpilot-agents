@@ -1545,6 +1545,34 @@ function Set-TimedProcessArguments {
 
 function Stop-ProcessTree {
     param([Parameter(Mandatory)][System.Diagnostics.Process]$Process)
+    # A direct child can exit while one of its descendants still owns a copied
+    # stdout/stderr handle. Process.Kill(true) can no longer discover that tree
+    # once the root has exited, but Win32_Process retains each descendant's
+    # ParentProcessId. Snapshot and stop deepest-first before the normal kill
+    # fallbacks so output-drain timeouts do not leave detached pipe holders.
+    if ($IsWindows) {
+        try {
+            $rootStartedAt = $Process.StartTime.ToUniversalTime()
+            $allProcesses = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+            $frontier = @([int]$Process.Id)
+            $descendants = [System.Collections.Generic.List[int]]::new()
+            while ($frontier.Count -gt 0) {
+                $next = [System.Collections.Generic.List[int]]::new()
+                foreach ($candidate in $allProcesses) {
+                    if ($frontier -contains [int]$candidate.ParentProcessId -and
+                        [DateTime]$candidate.CreationDate -ge $rootStartedAt.AddSeconds(-1)) {
+                        [void]$descendants.Add([int]$candidate.ProcessId)
+                        [void]$next.Add([int]$candidate.ProcessId)
+                    }
+                }
+                $frontier = @($next)
+            }
+            for ($index = $descendants.Count - 1; $index -ge 0; $index--) {
+                Stop-Process -Id $descendants[$index] -Force -ErrorAction SilentlyContinue
+            }
+        }
+        catch {}
+    }
     try { $Process.Kill($true); return } catch {}
     try { & taskkill.exe /PID $Process.Id /T /F 2>$null 1>$null } catch {}
     try { $Process.Kill() } catch {}
@@ -1583,6 +1611,8 @@ function Invoke-TimedProcess {
         [switch]$CaptureStdErr,
         [string]$WorkingDirectory,
         [string[]]$EnvironmentVariablesToRemove = @(),
+        [string]$ProgressPath = "",
+        [ValidateRange(0, 86400)][int]$ProgressTimeoutSeconds = 0,
         [Parameter(Mandatory)][int]$TimeoutSeconds
     )
     $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -1600,7 +1630,10 @@ function Invoke-TimedProcess {
     foreach ($variableName in @($EnvironmentVariablesToRemove)) { [void]$psi.EnvironmentVariables.Remove($variableName) }
     foreach ($variableName in (Get-AgentSessionIsolationEnvVars)) { [void]$psi.EnvironmentVariables.Remove($variableName) }
 
-    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $startedAtUtc = [DateTime]::UtcNow
+    $deadline = $startedAtUtc.AddSeconds($TimeoutSeconds)
+    $lastProgressUtc = $startedAtUtc
+    $progressObserved = $false
     $proc = $null
     try {
         $proc = [System.Diagnostics.Process]::Start($psi)
@@ -1624,20 +1657,64 @@ function Invoke-TimedProcess {
         }
 
         $exited = $false
+        $timeoutReason = ""
         if (-not $timedOut) {
-            $remainingMs = [Math]::Max(0, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-            $exited = $proc.WaitForExit($remainingMs)
-            $timedOut = -not $exited
+            if (-not $ProgressPath -or $ProgressTimeoutSeconds -le 0) {
+                $remainingMs = [Math]::Max(0, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+                $exited = $proc.WaitForExit($remainingMs)
+                $timedOut = -not $exited
+                if ($timedOut) { $timeoutReason = "hardDeadline" }
+            }
+            else {
+                while (-not $exited) {
+                    $nowUtc = [DateTime]::UtcNow
+                    if ($nowUtc -ge $deadline) {
+                        $timedOut = $true
+                        $timeoutReason = "hardDeadline"
+                        break
+                    }
+                    if (Test-Path -LiteralPath $ProgressPath) {
+                        $progressItems = [System.Collections.Generic.List[object]]::new()
+                        $rootProgress = Get-Item -LiteralPath $ProgressPath -ErrorAction SilentlyContinue
+                        if ($rootProgress) { [void]$progressItems.Add($rootProgress) }
+                        foreach ($progressItem in @(Get-ChildItem -LiteralPath $ProgressPath -File -Recurse `
+                                    -ErrorAction SilentlyContinue)) {
+                            [void]$progressItems.Add($progressItem)
+                        }
+                        $latestProgress = @($progressItems |
+                                Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1)
+                        if ($latestProgress.Count -eq 1) {
+                            if (-not $progressObserved -or $latestProgress[0].LastWriteTimeUtc -gt $lastProgressUtc) {
+                                $lastProgressUtc = $latestProgress[0].LastWriteTimeUtc
+                            }
+                            $progressObserved = $true
+                        }
+                    }
+                    if ($progressObserved -and
+                        ($nowUtc - $lastProgressUtc).TotalSeconds -ge $ProgressTimeoutSeconds) {
+                        $timedOut = $true
+                        $timeoutReason = "progressDeadline"
+                        break
+                    }
+                    $remainingMs = [Math]::Max(1, [int]($deadline - $nowUtc).TotalMilliseconds)
+                    $exited = $proc.WaitForExit([Math]::Min(250, $remainingMs))
+                }
+            }
         }
 
         if ($timedOut) {
+            if (-not $timeoutReason) { $timeoutReason = "standardInputDeadline" }
             Stop-ProcessTree -Process $proc
             $proc.WaitForExit(5000) | Out-Null
         }
 
         $stdoutResult = Get-TaskTextBeforeDeadline -Task $stdoutTask -DeadlineUtc $deadline
         $stderrResult = Get-TaskTextBeforeDeadline -Task $stderrTask -DeadlineUtc $deadline
-        if (-not $stdoutResult.Completed -or -not $stderrResult.Completed) { $timedOut = $true }
+        if (-not $stdoutResult.Completed -or -not $stderrResult.Completed) {
+            $timedOut = $true
+            if (-not $timeoutReason) { $timeoutReason = "outputDrainDeadline" }
+            Stop-ProcessTree -Process $proc
+        }
 
         $exitCode = -1
         if ($exited -and -not $timedOut) {
@@ -1650,6 +1727,10 @@ function Invoke-TimedProcess {
             StdOut    = $stdoutResult.Text
             StdErr    = $stderrResult.Text
             ProcessId = $proc.Id
+            TimeoutReason = $timeoutReason
+            StartedAtUtc = $startedAtUtc.ToString("o")
+            EndedAtUtc = [DateTime]::UtcNow.ToString("o")
+            LastProgressUtc = $lastProgressUtc.ToString("o")
         }
     }
     finally {

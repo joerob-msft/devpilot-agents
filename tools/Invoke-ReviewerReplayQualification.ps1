@@ -62,6 +62,16 @@
     worktree, this exact HEAD, and this full ref resolving to the same commit;
     an app-created worktree's generated branch name is not required to match.
 
+.PARAMETER SlotTimeoutSeconds
+    Signed hard wall-clock deadline for one complete slot. The default is 3600
+    seconds; it bounds every generalist, specialist, verification and drain
+    stage together even if an inner timeout or child pipe handling fails.
+
+.PARAMETER ProgressTimeoutSeconds
+    Signed maximum interval without state-file activity after the child creates
+    its state directory. Zero derives the interval from the largest configured
+    model-call timeout plus 120 seconds, capped by SlotTimeoutSeconds.
+
 .EXAMPLE
     ./tools/Invoke-ReviewerReplayQualification.ps1 -Mode Preflight `
         -RepoPath <reviewed repo> -ConfigFile <config outside the repo> `
@@ -99,6 +109,8 @@ param(
     [ValidateRange(30, 7200)][int]$CycleTimeoutSeconds = 1800,
     [ValidateRange(30, 3600)][int]$ConventionSpecialistTimeoutSeconds = 900,
     [ValidateRange(30, 3600)][int]$VerificationTimeoutSeconds = 900,
+    [ValidateRange(1, 14400)][int]$SlotTimeoutSeconds = 3600,
+    [ValidateRange(0, 14400)][int]$ProgressTimeoutSeconds = 0,
     [ValidatePattern('^slot([1-9]|1[0-6])\z')][string]$Slot = "",
     [string]$RunSetKeyPath = "",
     [string]$Purpose = "",
@@ -131,7 +143,8 @@ $plan = New-ReviewerReplayQualificationPlan -RepoPath $RepoPath -ConfigFile $Con
     -ConventionVerifierModel $ConventionVerifierModel `
     -CycleTimeoutSeconds $CycleTimeoutSeconds `
     -ConventionSpecialistTimeoutSeconds $ConventionSpecialistTimeoutSeconds `
-    -VerificationTimeoutSeconds $VerificationTimeoutSeconds
+    -VerificationTimeoutSeconds $VerificationTimeoutSeconds `
+    -SlotTimeoutSeconds $SlotTimeoutSeconds -ProgressTimeoutSeconds $ProgressTimeoutSeconds
 $evidence = Assert-ReviewerReplayQualificationPlan -Plan $plan
 $planDigest = Get-ReviewerQualificationPlanDigest -Plan $plan
 
@@ -299,9 +312,20 @@ if ($declaredPlanDigest -cne $planDigest) {
 
 # An attempted slot is immutable. Any state at all - even an empty directory
 # somebody created by hand - means this slot's identity is already spoken for.
+$attemptPath = Join-Path $plan.RunDirectory "$($target.Name)-attempt.json"
+if (Test-Path -LiteralPath $attemptPath) {
+    throw ("Slot '$($target.Name)' has already been attempted: '$attemptPath' exists. An attempt is consumed when " +
+        "it is made, whether or not the run started; qualify into a fresh root.")
+}
 if (Test-Path -LiteralPath $target.StateDir) {
     throw ("Slot state directory '$($target.StateDir)' already exists. A slot is attempted once; " +
         "use a fresh qualification root rather than re-running it.")
+}
+foreach ($outputPath in @($target.ConsolePath, $target.ErrorPath, $target.ExitPath, $target.TerminalPath)) {
+    if (Test-Path -LiteralPath $outputPath) {
+        throw ("Slot output '$outputPath' already exists. A slot is attempted once; use a fresh qualification " +
+            "root rather than overwriting terminal evidence.")
+    }
 }
 [void](New-Item -ItemType Directory -Force -Path $plan.RunDirectory)
 # The attempt is consumed HERE, before the child exists, and in run accounting
@@ -310,7 +334,6 @@ if (Test-Path -LiteralPath $target.StateDir) {
 # state would be an attempt nobody could see, free to be quietly retried until
 # one of them started. Created exclusively, so two runners racing for the same
 # slot cannot both win, and read-only afterwards.
-$attemptPath = Join-Path $plan.RunDirectory "$($target.Name)-attempt.json"
 $attempt = [pscustomobject][ordered]@{
     kind          = "reviewer.replay-qualification.attempt.v1"
     slot          = $target.Name
@@ -322,6 +345,8 @@ $attempt = [pscustomobject][ordered]@{
     stateDir      = $target.StateDir
     commandText   = $target.CommandText
     arguments     = [string[]]@($target.Arguments)
+    slotTimeoutSeconds = [int]$plan.SlotTimeoutSeconds
+    progressTimeoutSeconds = [int]$plan.ProgressTimeoutSeconds
     attemptedAtUtc = [DateTime]::UtcNow.ToString("o")
 }
 $attemptJson = ConvertTo-Json -InputObject $attempt -Depth 8
@@ -345,33 +370,48 @@ Write-Host "Attempt recorded (immutable): $attemptPath" -ForegroundColor DarkGra
 # the next reader cannot tell that from a run that began and died.
 
 $pwshPath = Get-ReviewerQualificationPwshPath
-$startInfo = [Diagnostics.ProcessStartInfo]::new()
-$startInfo.FileName = $pwshPath
-foreach ($argument in @("-NoLogo", "-NoProfile", "-NonInteractive", "-File", $plan.ReviewerScriptPath)) {
-    [void]$startInfo.ArgumentList.Add($argument)
-}
-# THE preflighted array, unchanged. Nothing rebuilds a similar command here.
-foreach ($argument in [string[]]@($target.Arguments)) { [void]$startInfo.ArgumentList.Add($argument) }
-$startInfo.RedirectStandardOutput = $true
-$startInfo.RedirectStandardError = $true
-$startInfo.UseShellExecute = $false
-$startInfo.WorkingDirectory = $plan.QualificationRoot
-
 Write-Host "Running $($target.Name): $($target.CommandText)" -ForegroundColor Cyan
-$process = [Diagnostics.Process]::Start($startInfo)
-# Read both pipes concurrently; a child that fills one while we drain the other
-# would deadlock, and a replay slot is a long, chatty run.
-$stdoutTask = $process.StandardOutput.ReadToEndAsync()
-$stderrTask = $process.StandardError.ReadToEndAsync()
-$process.WaitForExit()
-$stdout = $stdoutTask.GetAwaiter().GetResult()
-$stderr = $stderrTask.GetAwaiter().GetResult()
-$exitCode = $process.ExitCode
+# THE preflighted array, unchanged. Nothing rebuilds a similar command here.
+$processArguments = @("-NoLogo", "-NoProfile", "-NonInteractive", "-File", $plan.ReviewerScriptPath) +
+    [string[]]@($target.Arguments)
+$run = Invoke-TimedProcess -FilePath $pwshPath -ArgumentList $processArguments `
+    -CaptureStdOut -CaptureStdErr -WorkingDirectory $plan.QualificationRoot `
+    -TimeoutSeconds ([int]$plan.SlotTimeoutSeconds) -ProgressPath $target.StateDir `
+    -ProgressTimeoutSeconds ([int]$plan.ProgressTimeoutSeconds)
+$stdout = [string]$run.StdOut
+$stderr = [string]$run.StdErr
+$exitCode = if ([bool]$run.TimedOut) { 124 } else { [int]$run.ExitCode }
 $utf8 = [Text.UTF8Encoding]::new($false)
 [IO.File]::WriteAllText($target.ConsolePath, $stdout, $utf8)
 [IO.File]::WriteAllText($target.ErrorPath, $stderr, $utf8)
 [IO.File]::WriteAllText($target.ExitPath, "$exitCode", $utf8)
+$terminal = [pscustomobject][ordered]@{
+    kind                   = "reviewer.replay-qualification.terminal.v1"
+    slot                   = $target.Name
+    setId                  = [string]$declaration.setId
+    planDigest             = $planDigest
+    status                 = $(if ([bool]$run.TimedOut) { "timedOut" } elseif ($exitCode -eq 0) { "complete" } else { "failed" })
+    exitCode               = $exitCode
+    timedOut               = [bool]$run.TimedOut
+    timeoutReason          = [string]$run.TimeoutReason
+    childProcessId         = [int]$run.ProcessId
+    startedAtUtc           = [string]$run.StartedAtUtc
+    endedAtUtc             = [string]$run.EndedAtUtc
+    lastProgressUtc        = [string]$run.LastProgressUtc
+    slotTimeoutSeconds     = [int]$plan.SlotTimeoutSeconds
+    progressTimeoutSeconds = [int]$plan.ProgressTimeoutSeconds
+}
+$terminalBytes = $utf8.GetBytes((ConvertTo-Json -InputObject $terminal -Depth 5))
+$terminalStream = [IO.File]::Open($target.TerminalPath, [IO.FileMode]::CreateNew,
+    [IO.FileAccess]::Write, [IO.FileShare]::None)
+try { $terminalStream.Write($terminalBytes, 0, $terminalBytes.Length) }
+finally { $terminalStream.Dispose() }
+Set-ItemProperty -LiteralPath $target.TerminalPath -Name IsReadOnly -Value $true
 Write-Host $stdout
 if ($stderr) { Write-Host $stderr -ForegroundColor DarkYellow }
+if ([bool]$run.TimedOut) {
+    Write-Warning ("$($target.Name) terminated at its $($run.TimeoutReason) boundary; immutable evidence is at " +
+        "'$($target.TerminalPath)'.")
+}
 Write-Host "$($target.Name) exited $exitCode; console at $($target.ConsolePath)." -ForegroundColor DarkGray
 exit $exitCode
