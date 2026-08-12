@@ -1,0 +1,319 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:devpilot:reviewer:offline-corpus-seal-recipe:v1",
+  "title": "Offline corpus seal recipe",
+  "description": "A PRIVATE recipe that turns an already-captured, integrity-indexed research corpus into a schema-v2 replay snapshot with no live seam. The recipe is deliberately redundant with the corpus: it must state the identity, hashes, lengths, order and coverage it expects INDEPENDENTLY, so any disagreement is a refusal rather than a silent adoption of whatever the corpus happens to say. A recipe is private evidence about a real pull request and is never committed; only this schema is.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion", "kind", "snapshotId", "provider", "capturedUtc", "corpus", "binding",
+    "capture", "bindings", "hashes", "changeSet", "changedFiles", "evidence",
+    "sourceTransport", "resources", "sourceCensus", "nonPromotable", "sealKind"
+  ],
+  "properties": {
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "kind": { "type": "string", "const": "reviewer-offline-corpus-seal-recipe" },
+    "snapshotId": {
+      "type": "string",
+      "description": "The sealed snapshot's directory name. It must contain 'offlinecorpusseal', because the name is the one label that travels with the snapshot everywhere it is copied, quoted or logged - a sidecar alone would not.",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+    },
+    "provider": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,31}$" },
+    "capturedUtc": {
+      "type": "string",
+      "description": "Basic-form UTC timestamp. Extended ISO-8601 is refused because the canonical JSON renderer rejects the DateTime values a JSON reader produces from it.",
+      "pattern": "^[0-9]{8}T[0-9]{6}Z$"
+    },
+    "nonPromotable": {
+      "type": "boolean",
+      "const": true,
+      "description": "An offline corpus seal is permanently non-promotable. There is no true/false choice here; the field exists so the recipe has to say so out loud."
+    },
+    "sealKind": { "type": "string", "const": "offlineCorpusSeal" },
+    "corpus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["indexSha256", "payloadCount"],
+      "properties": {
+        "indexSha256": { "$ref": "#/definitions/sha256" },
+        "payloadCount": { "type": "integer", "minimum": 1, "maximum": 4096 }
+      }
+    },
+    "binding": {
+      "type": "object",
+      "description": "The one pull request iteration this seal is about. Organization, project and repository are bound INDEPENDENTLY: organization/project/repositoryName are compared to the corpus index's own 'organization/project/repositoryName' string, and repositoryId to the captured identity payload's repositoryId. Every remaining field is re-checked against the corpus index's captured identity, so a stale commit, a different iteration, another repository or another pull request's identity is refused before a byte is written.",
+      "additionalProperties": false,
+      "required": [
+        "organization", "project", "repositoryId", "repositoryName", "pullRequestId", "iterationId",
+        "sourceCommit", "commonCommit", "targetCommit", "changeSetSha256"
+      ],
+      "properties": {
+        "organization": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^/\\s]+$" },
+        "project": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^/\\s]+$" },
+        "repositoryId": { "$ref": "#/definitions/guid" },
+        "repositoryName": {
+          "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^/\\s]+$",
+          "description": "The repository NAME, bound to the third component of the corpus index's repository string. Without it the seal binds only two thirds of the identity the requirement asks for."
+        },
+        "pullRequestId": { "type": "integer", "minimum": 1 },
+        "iterationId": { "type": "integer", "minimum": 1 },
+        "sourceCommit": { "$ref": "#/definitions/commit" },
+        "commonCommit": { "$ref": "#/definitions/commit" },
+        "targetCommit": { "$ref": "#/definitions/commit" },
+        "changeSetSha256": { "$ref": "#/definitions/sha256" }
+      }
+    },
+    "capture": {
+      "type": "object",
+      "description": "Where the sealed bytes came from, and what the pull request looked like at capture time.",
+      "additionalProperties": false,
+      "required": ["identity", "endIdentity", "statusAtCapture", "isDraft", "mode", "livePostReadRaceCheck"],
+      "properties": {
+        "identity": { "$ref": "#/definitions/corpusPayloadRef" },
+        "endIdentity": { "$ref": "#/definitions/corpusPayloadRef" },
+        "statusAtCapture": { "type": "string", "pattern": "^[a-zA-Z][a-zA-Z0-9 ._-]{0,63}$" },
+        "isDraft": { "type": "boolean" },
+        "mode": { "type": "string", "pattern": "^[a-zA-Z][a-zA-Z0-9._-]{0,63}$" },
+        "livePostReadRaceCheck": {
+          "type": "string",
+          "const": "notPerformed",
+          "description": "A seal built from a corpus performed no live read, so it cannot have re-checked the pull request after one. Any other value would be the artifact claiming a guarantee it never obtained."
+        }
+      }
+    },
+    "bindings": {
+      "type": "object",
+      "description": "The manifest-level bindings the sealed snapshot carries.",
+      "additionalProperties": false,
+      "required": ["configSha256", "scriptSha256", "promptSha256", "models"],
+      "properties": {
+        "configSha256": { "$ref": "#/definitions/sha256" },
+        "scriptSha256": { "$ref": "#/definitions/sha256" },
+        "promptSha256": { "$ref": "#/definitions/sha256" },
+        "models": {
+          "type": "array",
+          "maxItems": 8,
+          "items": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }
+        }
+      }
+    },
+    "hashes": {
+      "type": "object",
+      "description": "Policy, config, script, schema and prompt hashes. Config, script and prompt are stated twice - here and in 'bindings' - and must agree; a recipe that contradicts itself is refused rather than arbitrated.",
+      "additionalProperties": false,
+      "required": ["policySha256", "configSha256", "scriptSha256", "schemaSha256", "promptSha256"],
+      "properties": {
+        "policySha256": { "$ref": "#/definitions/sha256" },
+        "configSha256": { "$ref": "#/definitions/sha256" },
+        "scriptSha256": { "$ref": "#/definitions/sha256" },
+        "schemaSha256": { "$ref": "#/definitions/sha256" },
+        "promptSha256": { "$ref": "#/definitions/sha256" }
+      }
+    },
+    "changeSet": {
+      "type": "object",
+      "description": "The authoritative change set. Its identity digest AND its exact path order are both bound: the digest says which files changed, the order says which file a positional claim refers to, and neither implies the other. 'spanEvidence' is the captured hunk census the right-hand spans are DERIVED from.",
+      "additionalProperties": false,
+      "required": ["authoritative", "digestOrder", "spanEvidence"],
+      "properties": {
+        "authoritative": { "$ref": "#/definitions/corpusPayloadRef" },
+        "spanEvidence": {
+          "description": "Indexed per-path diff-hunk evidence. Each entry carries a normalized 'path' and 'hunks' with 'newStart'/'newCount'; the right-hand span of a hunk is exactly (newStart, newCount) and a hunk with newCount = 0 contributes none. The seal derives every span from this payload and refuses any changedFiles entry that restates them differently, so a recipe can never point the reviewer at lines the capture did not record as changed.",
+          "$ref": "#/definitions/corpusPayloadRef"
+        },
+        "digestOrder": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/repositoryPath" }
+        }
+      }
+    },
+    "changedFiles": {
+      "type": "array",
+      "description": "Every changed path whose right-hand content this seal delivers.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "changeKinds", "rightHand", "spans"],
+        "properties": {
+          "path": {
+            "allOf": [{ "$ref": "#/definitions/repositoryPath" }],
+            "description": "Already in the reviewer's normalized form. A path that normalizes to something else is refused rather than rewritten, so one file has exactly one spelling."
+          },
+          "changeKinds": {
+            "type": "array",
+            "items": { "type": "string", "pattern": "^[a-z]{1,32}$" }
+          },
+          "rightHand": {
+            "description": "The captured right-hand bytes, as an indexed corpus payload. The seal additionally requires a recorded 'repo_file' read whose own arguments name this repositoryId, this path and binding.sourceCommit, and whose corpus payload is byte-identical to this one - so sealed bytes are provably bytes this capture read for THIS file at THIS commit, not merely some indexed blob.",
+            "$ref": "#/definitions/corpusPayloadRef"
+          },
+          "spans": {
+            "type": "array",
+            "minItems": 1,
+            "description": "Right-hand line spans, in strictly ascending non-overlapping order. These are RESTATED here, not decided here: the seal derives the spans from changeSet.spanEvidence and refuses any divergence.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["start", "count"],
+              "properties": {
+                "start": { "type": "integer", "minimum": 1 },
+                "count": { "type": "integer", "minimum": 1 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "sourceCensus": {
+      "type": "object",
+      "description": "The completeness claim. Every authoritative changed path must be either sealed with right-hand content or explicitly listed as having none; an unexplained path is an incomplete census, and the seal fails closed rather than shipping a snapshot with a hole in it.",
+      "additionalProperties": false,
+      "required": ["authoritativeChangedPathCount", "rightHandCoveredPathCount", "noRightHandPaths"],
+      "properties": {
+        "authoritativeChangedPathCount": { "type": "integer", "minimum": 0 },
+        "rightHandCoveredPathCount": { "type": "integer", "minimum": 0 },
+        "noRightHandPaths": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/repositoryPath" }
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "description": "The non-source material the prompts consume. Each payload may be cited once across all four classes; citing one twice is refused because it makes the evidence count meaningless.",
+      "additionalProperties": false,
+      "required": ["siblings", "rules", "threads", "facts"],
+      "properties": {
+        "siblings": { "$ref": "#/definitions/corpusPayloadRefList" },
+        "rules": { "$ref": "#/definitions/corpusPayloadRefList" },
+        "threads": { "$ref": "#/definitions/corpusPayloadRefList" },
+        "facts": { "$ref": "#/definitions/corpusPayloadRefList" }
+      }
+    },
+    "sourceTransport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "mode", "artifactFile", "policy", "blockNonce", "capturedArtifact", "expected"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["capturedArtifact", "derivedFromCorpus"],
+          "description": "'capturedArtifact' adopts an artifact the capture recorded, held to the production importer's standard. 'derivedFromCorpus' re-runs the reviewer's own transport report, coverage record, gate and block renderer over the captured right-hand bytes, using a reader that can only return indexed corpus payloads and has no fallback branch.",
+          "default": "derivedFromCorpus"
+        },
+        "mode": { "type": "string", "enum": ["mcpFlat", "azureDevOpsCliFallback", "legacyMcp"] },
+        "artifactFile": { "$ref": "#/definitions/relativePath" },
+        "policy": {
+          "description": "The source-transport policy the artifact is produced and verified under, stated exactly one of two ways. 'corpusPath' names an indexed corpus payload and is always preferred, because it is inside the index's integrity claim and is the policy the captured behaviour actually ran under. 'toolkitPath' names a versioned policy in this toolkit for the common case where the capture recorded the transport's outputs but never the policy document; it is confined to 'src/Agents/reviewer/source/', must not pass through any reparse point or escape that tree, is verified against the declared sha256 and byteLength AND against hashes.policySha256, and is recorded in the sidecar as policyProvenance 'toolkitSealTime' so a seal-time policy is never presented as a captured one. Neither route contacts a host, a process or a network.",
+          "oneOf": [
+            { "$ref": "#/definitions/corpusPayloadRef" },
+            { "$ref": "#/definitions/toolkitPolicyRef" }
+          ]
+        },
+        "blockNonce": {
+          "type": "string",
+          "description": "The deterministic sealed-source boundary nonce. A seal has to be reproducible byte for byte, so the nonce is declared rather than generated; it is a boundary marker, not a secret, and the live path still generates a fresh one per run.",
+          "pattern": "^[A-Z0-9]{8,128}$"
+        },
+        "capturedArtifact": {
+          "description": "Required when kind is 'capturedArtifact'; null otherwise.",
+          "oneOf": [{ "$ref": "#/definitions/corpusPayloadRef" }, { "type": "null" }]
+        },
+        "expected": {
+          "type": "object",
+          "description": "What the recipe author believes the transport layer produces. All six are re-derived from the corpus and compared.",
+          "additionalProperties": false,
+          "required": [
+            "artifactSha256", "artifactByteLength", "blockSha256",
+            "coverageRecordSha256", "gateOk", "gateReasonCodes"
+          ],
+          "properties": {
+            "artifactSha256": { "$ref": "#/definitions/sha256" },
+            "artifactByteLength": { "type": "integer", "minimum": 2, "maximum": 16777216 },
+            "blockSha256": { "$ref": "#/definitions/sha256" },
+            "coverageRecordSha256": { "$ref": "#/definitions/sha256" },
+            "gateOk": { "type": "boolean" },
+            "gateReasonCodes": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      }
+    },
+    "resources": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4096,
+      "description": "Every recorded read the sealed snapshot answers. Each tool/argument pair may appear once - a snapshot that answers one request two ways is not a recording - and each must fall inside the replay read ceiling. Any repo_file read whose arguments name the bound repositoryId AND the bound sourceCommit is held to the whole source-read contract: action 'get_content', the bound project, versionType 'Commit', an organization argument (if present) equal to the bound organization, and a path that is EXACTLY the canonical repository path - an alias that merely normalizes to it is refused, not accepted.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["tool", "arguments", "envelope", "payloadFile", "corpusPayload", "resourceUri", "mimeType", "expected"],
+        "properties": {
+          "tool": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$" },
+          "arguments": { "type": "object" },
+          "envelope": {
+            "type": "string",
+            "enum": ["jsonRpcResult", "mcpTextContent", "mcpResourceContent"],
+            "description": "How the captured payload is wrapped into the response the loader serves. 'jsonRpcResult' embeds the captured JSON verbatim, so the sealed bytes contain the captured bytes unchanged."
+          },
+          "payloadFile": { "$ref": "#/definitions/relativePath" },
+          "corpusPayload": { "$ref": "#/definitions/corpusPayloadRef" },
+          "resourceUri": {
+            "type": "string",
+            "description": "The exact URI for an mcpResourceContent envelope; empty for every other envelope.",
+            "maxLength": 2048
+          },
+          "mimeType": { "type": "string", "maxLength": 128 },
+          "expected": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["payloadSha256", "payloadByteLength"],
+            "properties": {
+              "payloadSha256": { "$ref": "#/definitions/sha256" },
+              "payloadByteLength": { "type": "integer", "minimum": 2, "maximum": 25165824 }
+            }
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "guid": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+    "repositoryPath": { "type": "string", "pattern": "^/[^\\u0000-\\u001f]{1,1024}$" },
+    "relativePath": {
+      "type": "string",
+      "description": "A plain forward-slash relative path. Backslashes, drive letters, '.', '..', leading or trailing slashes and doubled slashes are all refused rather than normalized, because each is a second way of writing one name - and an alias is how an unindexed payload gets read under an indexed name.",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,126}(/[A-Za-z0-9][A-Za-z0-9._-]{0,126})*$"
+    },
+    "corpusPayloadRef": {
+      "type": "object",
+      "description": "One payload, named by its corpus path and independently bound to a hash and a length. The corpus index must agree with both.",
+      "additionalProperties": false,
+      "required": ["corpusPath", "sha256", "byteLength"],
+      "properties": {
+        "corpusPath": { "$ref": "#/definitions/relativePath" },
+        "sha256": { "$ref": "#/definitions/sha256" },
+        "byteLength": { "type": "integer", "minimum": 0, "maximum": 25165824 }
+      }
+    },
+    "toolkitPolicyRef": {
+      "type": "object",
+      "description": "A versioned source-transport policy from this toolkit, hash-pinned. Permitted ONLY for the transport policy and ONLY under 'src/Agents/reviewer/source/'. It is not a live seam - no host, process or network is involved - but it is a weaker claim than a captured policy, because the rules were chosen at seal time rather than recorded at capture time. The sidecar therefore records policyProvenance 'toolkitSealTime' rather than flattening the two cases together.",
+      "additionalProperties": false,
+      "required": ["toolkitPath", "sha256", "byteLength"],
+      "properties": {
+        "toolkitPath": {
+          "allOf": [{ "$ref": "#/definitions/relativePath" }],
+          "pattern": "^src/Agents/reviewer/source/[A-Za-z0-9][A-Za-z0-9._-]{0,126}(/[A-Za-z0-9][A-Za-z0-9._-]{0,126})*$"
+        },
+        "sha256": { "$ref": "#/definitions/sha256" },
+        "byteLength": { "type": "integer", "minimum": 2, "maximum": 25165824 }
+      }
+    },
+    "corpusPayloadRefList": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/corpusPayloadRef" }
+    }
+  }
+}

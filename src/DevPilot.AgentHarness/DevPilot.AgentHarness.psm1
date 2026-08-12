@@ -1600,6 +1600,10 @@ $script:AgentReplayMaxSourceTransportBytes = 16777216
 $script:AgentReplaySnapshotNamePattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z'
 $script:AgentReplayPayloadSegmentPattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,126}[A-Za-z0-9_-]\z|^[A-Za-z0-9]\z'
 $script:AgentReplayHexPattern = '^[0-9a-f]{64}\z'
+# Seal kinds a manifest classification may declare. A classification only ever
+# WITHDRAWS promotability, so every kind here is non-promotable by definition;
+# the list exists so an unknown label is refused rather than honoured blindly.
+$script:AgentReplayNonPromotableSealKinds = @("offlineCorpusSeal")
 # Reference-identity seal, not a string: a constant that a hand-built hashtable
 # can carry would let any in-process caller present itself as a loaded snapshot
 # and skip every check in New-AgentReplaySnapshot. Same pattern as the
@@ -1923,6 +1927,19 @@ function New-AgentReplaySnapshot {
         "binding", "bindings", "resources", "manifestDigest"
     )
     if ($schemaVersion -eq 2) { $manifestKeys += "sourceTransport" }
+    # `classification` is the ONE optional manifest key. It is optional because
+    # every snapshot sealed before it existed has to keep loading and keep its
+    # digest; it is a manifest key rather than a free-standing sidecar because a
+    # label that is not covered by the digest is a label anyone can delete. A
+    # snapshot that omits it is an ordinary promotable snapshot, which is what
+    # schema v1 and pre-existing v2 snapshots are.
+    $hasClassification = [bool]$manifest.PSObject.Properties["classification"]
+    if ($hasClassification) {
+        if ($schemaVersion -ne 2) {
+            throw "Replay manifest carries a classification but declares schema version $schemaVersion; classification is a schema-v2 field."
+        }
+        $manifestKeys += "classification"
+    }
     Assert-AgentReplayExactKeys -Object $manifest -Where "Replay manifest" -Expected $manifestKeys
     if ($script:AgentReplaySchemaVersions -notcontains $schemaVersion) {
         throw "Replay manifest declares schema version $schemaVersion; this build reads versions $($script:AgentReplaySchemaVersions -join ', ')."
@@ -2036,6 +2053,108 @@ function New-AgentReplaySnapshot {
             artifactFile = $artifactRelative
             artifactSha256 = $artifactSha
             artifactByteLength = [long]$artifactBytes.Length
+        }
+    }
+
+    # -- classification, and the sidecar it binds ---------------------------
+    # Default: an ordinary, promotable snapshot. Stated explicitly rather than
+    # left null, because a consumer that has to test for absence before it can
+    # tell whether something is promotable will eventually forget to.
+    $classificationRecord = @{
+        SealKind      = "standard"
+        NonPromotable = $false
+        SidecarFile   = ""
+        SidecarSha256 = ""
+        Sidecar       = $null
+    }
+    $classificationDigestRecord = $null
+    if ($hasClassification) {
+        $classification = Get-AgentReplayManifestField -Object $manifest -Name "classification" -Type object
+        Assert-AgentReplayExactKeys -Object $classification -Where "Replay manifest classification" -Expected @(
+            "sealKind", "nonPromotable", "sidecarFile", "sidecarSha256"
+        )
+        $sealKind = Get-AgentReplayManifestField -Object $classification -Name "sealKind" -Type string `
+            -Pattern '^[a-z][A-Za-z0-9]{0,31}\z'
+        if ($script:AgentReplayNonPromotableSealKinds -cnotcontains $sealKind) {
+            throw "Replay manifest classification declares sealKind '$sealKind', which this build does not recognize."
+        }
+        $nonPromotable = Get-AgentReplayManifestField -Object $classification -Name "nonPromotable" -Type bool
+        if (-not $nonPromotable) {
+            # A classification block exists ONLY to withdraw promotability. If it
+            # could also assert promotability it would be a way to launder a
+            # sealed snapshot into a promotable one by editing four fields, and
+            # the whole point is that this label can never be talked out of.
+            throw "Replay manifest classification declares nonPromotable = false; a classification may only withdraw promotability, never grant it."
+        }
+        $sidecarRelative = Get-AgentReplayManifestField -Object $classification -Name "sidecarFile" -Type string
+        if ($sidecarRelative.Length -lt 1 -or $sidecarRelative.Length -gt 512) {
+            throw "Replay classification sidecarFile must be 1..512 characters."
+        }
+        $sidecarSegments = @($sidecarRelative -split '/')
+        foreach ($segment in $sidecarSegments) {
+            if ($segment -cnotmatch $script:AgentReplayPayloadSegmentPattern) {
+                throw "Replay classification sidecarFile '$sidecarRelative' is not a plain relative path inside the snapshot."
+            }
+        }
+        $sidecarSha = Get-AgentReplayManifestField -Object $classification -Name "sidecarSha256" -Type sha256
+        $sidecarPath = $snapshotFull
+        for ($segmentIndex = 0; $segmentIndex -lt $sidecarSegments.Count; $segmentIndex++) {
+            $sidecarPath = Join-Path $sidecarPath $sidecarSegments[$segmentIndex]
+            $segmentKind = if ($segmentIndex -eq ($sidecarSegments.Count - 1)) { "File" } else { "Directory" }
+            if (-not (Test-Path -LiteralPath $sidecarPath)) {
+                # Deleting the sidecar is the obvious way to try to shed the
+                # label, so it fails the LOAD rather than merely being noticed.
+                throw "Replay snapshot '$SnapshotName' is classified '$sealKind' but its sidecar '$sidecarRelative' is missing."
+            }
+            [void](Assert-AgentReplayPathSafe -Path $sidecarPath -Within $snapshotFull -Kind $segmentKind)
+        }
+        $sidecarBytes = [System.IO.File]::ReadAllBytes($sidecarPath)
+        if ($sidecarBytes.Length -lt 2 -or $sidecarBytes.Length -gt $script:AgentReplayMaxManifestBytes) {
+            throw "Replay classification sidecar '$sidecarRelative' is $($sidecarBytes.Length) bytes; expected 2..$script:AgentReplayMaxManifestBytes."
+        }
+        if ((Get-AgentReplayBytesSha256 -Bytes $sidecarBytes) -cne $sidecarSha) {
+            throw "Replay classification sidecar '$sidecarRelative' does not match its recorded SHA-256."
+        }
+        $sidecarText = ([System.Text.UTF8Encoding]::new($false, $true)).GetString($sidecarBytes)
+        try { $sidecar = $sidecarText | ConvertFrom-Json -ErrorAction Stop }
+        catch { throw "Replay classification sidecar '$sidecarRelative' is not valid JSON." }
+        if ($sidecar -isnot [System.Management.Automation.PSCustomObject]) {
+            throw "Replay classification sidecar '$sidecarRelative' must be a JSON object."
+        }
+        # The sidecar has to agree with the manifest about what it is about. The
+        # binding runs manifest -> sidecar only: the manifest pins the sidecar's
+        # hash and the digest pins the manifest, so a sidecar that also carried
+        # the manifest digest would close a cycle neither side could compute.
+        foreach ($pair in @(
+                @("snapshotId", $snapshotId),
+                @("sealKind", $sealKind))) {
+            $name = [string]$pair[0]
+            if (-not $sidecar.PSObject.Properties[$name]) {
+                throw "Replay classification sidecar '$sidecarRelative' omits '$name'."
+            }
+            if ([string]$sidecar.PSObject.Properties[$name].Value -cne [string]$pair[1]) {
+                throw "Replay classification sidecar '$sidecarRelative' disagrees with the manifest about '$name'."
+            }
+        }
+        if (-not $sidecar.PSObject.Properties["nonPromotable"] -or -not [bool]$sidecar.nonPromotable) {
+            throw "Replay classification sidecar '$sidecarRelative' does not record nonPromotable = true."
+        }
+        $totalBytes += $sidecarBytes.Length
+        if ($totalBytes -gt $script:AgentReplayMaxTotalPayloadBytes) {
+            throw "Replay snapshot '$SnapshotName' carries more than $script:AgentReplayMaxTotalPayloadBytes payload bytes."
+        }
+        $classificationRecord = @{
+            SealKind      = $sealKind
+            NonPromotable = $true
+            SidecarFile   = $sidecarRelative
+            SidecarSha256 = $sidecarSha
+            Sidecar       = $sidecar
+        }
+        $classificationDigestRecord = [ordered]@{
+            sealKind      = $sealKind
+            nonPromotable = $true
+            sidecarFile   = $sidecarRelative
+            sidecarSha256 = $sidecarSha
         }
     }
 
@@ -2159,6 +2278,13 @@ function New-AgentReplaySnapshot {
         $digestInput.binding["commonCommit"] = $bindingRecord.CommonCommit
     }
     if ($schemaVersion -eq 2) { $digestInput["sourceTransport"] = $sourceTransportDigestRecord }
+    # The classification is part of what the manifest ASSERTS, so it is part of
+    # what the digest covers. Editing the sealKind, flipping nonPromotable,
+    # repointing the sidecar or swapping the sidecar's bytes all change this
+    # value, which is what makes the label survive an edit rather than merely
+    # describe one. Absent classification contributes nothing, so every snapshot
+    # sealed before this field existed keeps exactly the digest it had.
+    if ($null -ne $classificationDigestRecord) { $digestInput["classification"] = $classificationDigestRecord }
     $computedDigest = Get-AgentReplayTextSha256 -Text (ConvertTo-AgentReplayCanonicalJson -Value $digestInput)
     if ($computedDigest -cne $recordedDigest) {
         # Deliberately not worded as tamper detection. This digest is unkeyed:
@@ -2190,7 +2316,36 @@ function New-AgentReplaySnapshot {
         Served         = $served
         ServedKeys     = @($served.Keys)
         SourceTransport = $sourceTransportRecord
+        Classification = $classificationRecord
     }
+}
+
+function Assert-AgentReplaySnapshotPromotable {
+    <#
+        The one gate every promotable flow calls before it treats a replayed
+        result as something that can be published, promoted or counted as a
+        qualification. A snapshot that carries a classification has withdrawn
+        its own promotability permanently, and the withdrawal is covered by the
+        manifest digest, so it cannot be shed by deleting a file.
+
+        Deliberately a THROW rather than a boolean. A caller that has to
+        remember to test the answer is a caller that can forget to.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Snapshot,
+        [string]$Operation = "Promotion"
+    )
+    if ($Snapshot["Seal"] -isnot [object] -or -not [object]::ReferenceEquals($Snapshot["Seal"], $script:AgentReplaySnapshotSeal)) {
+        throw "$Operation requires a snapshot produced by New-AgentReplaySnapshot."
+    }
+    $classification = $Snapshot["Classification"]
+    if ($null -eq $classification) { return $true }
+    if ([bool]$classification.NonPromotable) {
+        throw ("$Operation refused: replay snapshot '$($Snapshot.SnapshotId)' is classified " +
+            "'$($classification.SealKind)' and is permanently non-promotable. It was sealed offline from captured " +
+            "material, contacted no live host, and cannot stand behind a published or promoted result.")
+    }
+    return $true
 }
 
 function Get-AgentReplayResponse {
@@ -4101,6 +4256,7 @@ Export-ModuleMember -Function @(
     "Get-AgentReplayRequestKey",
     "Test-AgentReplayToolPermitted",
     "New-AgentReplaySnapshot",
+    "Assert-AgentReplaySnapshotPromotable",
     "Get-AgentReplayResponse",
     "Get-AgentSupportedProvider",
     "Test-AgentProviderSupported",

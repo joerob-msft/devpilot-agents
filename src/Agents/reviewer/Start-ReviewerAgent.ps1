@@ -2616,6 +2616,19 @@ if ($ReplaySnapshotName -or $ReplayRoot -or $ReplayManifestDigest) {
     $script:ReviewerReplaySnapshot = New-AgentReplaySnapshot -ReplayRoot $ReplayRoot `
         -SnapshotName $ReplaySnapshotName -ExpectedManifestDigest $ReplayManifestDigest
     $script:ReviewerReplayActive = $true
+    # A classified snapshot has permanently withdrawn its own promotability, and
+    # the withdrawal rides in the manifest digest rather than in a file someone
+    # can delete. Replay already refuses every promote and write switch above, so
+    # this is belt-and-braces - but it is the check that stays correct if that
+    # list is ever missed, and it says out loud in the log what the run is built
+    # on, so nobody reads a corpus-sealed result as a live one later.
+    $script:ReviewerReplayClassification = $script:ReviewerReplaySnapshot.Classification
+    if ([bool]$script:ReviewerReplayClassification.NonPromotable) {
+        Write-Warning ("Replay snapshot '$ReplaySnapshotName' is classified " +
+            "'$($script:ReviewerReplayClassification.SealKind)' and is permanently non-promotable: it was sealed " +
+            "offline from captured material and contacted no live host. This run is research evidence and can " +
+            "never be promoted or published.")
+    }
     # Publish replay where scope cannot hide it. $script: is invisible from a
     # module, a thread job, or a child pwsh, and a guard that cannot see the
     # flag would read that as permission to go live. The environment is visible
@@ -3220,13 +3233,23 @@ function Invoke-ReviewerConventionSession {
         [Parameter(Mandatory)][string]$AgencyPath,
         [Parameter(Mandatory)][scriptblock]$Action,
         [scriptblock]$OpenSession,
-        [scriptblock]$CloseSession
+        [scriptblock]$CloseSession,
+        # A caller working against a hard wall-clock deadline may lower the
+        # transport's per-request timeout so the session it opens cannot outlive
+        # the bound it was started under. Zero keeps the configured timeout.
+        [ValidateRange(0, [int]::MaxValue)][int]$RequestTimeoutSeconds = 0
     )
+    $effectiveTimeoutSeconds = if ($RequestTimeoutSeconds -gt 0) {
+        [Math]::Min([int]$RequestTimeoutSeconds, [int]$McpTimeoutSeconds)
+    }
+    else {
+        [int]$McpTimeoutSeconds
+    }
     if (-not $OpenSession) {
         $OpenSession = {
             param([string]$Path)
             Open-AgentMcpSession -AgencyPath $Path -Server "ado" `
-                -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $McpTimeoutSeconds `
+                -Organization $Organization -Toolsets @("repos") -TimeoutSeconds $effectiveTimeoutSeconds `
                 -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables `
                 -ReplaySnapshot $script:ReviewerReplaySnapshot
         }
@@ -10324,25 +10347,45 @@ function Invoke-ReviewerCrossVerificationPass {
     $orderedGroupKeys = [System.Collections.Generic.List[string]]::new()
     foreach ($groupKey in $groups.Keys) { [void]$orderedGroupKeys.Add([string]$groupKey) }
     $orderedGroupKeys.Sort([StringComparer]::Ordinal)
-    # Deterministic 2N preflight: prove the WHOLE required verifier run set fits
-    # the declared run and time budget BEFORE launching a single model. Either
-    # every required run can launch or none does - no partial launch that would
-    # cross-check some candidates and silently degrade the rest when the phase
-    # clock expires mid-loop.
+    # Deterministic 2N preflight: prove the WHOLE required verifier ASSIGNMENT set
+    # fits the declared run and time budget BEFORE launching a single model. The
+    # unit is assignments - every candidate once by GPT and once by Opus - not the
+    # grouped invocations they happen to be batched into, because grouping is an
+    # implementation detail and budgeting it would make the reservation a promise
+    # about batching rather than about the work. Either every required assignment
+    # can launch or none does: no partial launch that would cross-check some
+    # candidates and silently degrade the rest when the phase clock expires
+    # mid-loop.
+    #
+    # The plan is also the ONLY source of the per-invocation timeout and of the
+    # absolute phase deadline: the phase (less a reserved overhead slice for
+    # setup, fresh binding, reconciliation and artifact writes) is divided among
+    # the required assignments, and each admitted group is handed exactly the
+    # share the preflight reserved, so admission and invocation cannot disagree
+    # about how long a run may take.
     $budgetPreflight = Assert-ReviewerVerificationBudgetPreflight `
-        -RequiredRunCount $orderedGroupKeys.Count `
+        -RequiredAssignmentCount ([int]$assignmentCoverage.requiredAssignmentCount) `
+        -InvocationCount $orderedGroupKeys.Count `
         -MaxVerifierRuns ([int]$EffectiveCrossVerificationPolicy.maxVerifierRuns) `
         -MaxPhaseSeconds ([int]$EffectiveCrossVerificationPolicy.maxVerificationSeconds) `
         -ConfiguredRunTimeoutSeconds $EffectiveVerificationTimeoutSeconds `
         -ElapsedSeconds $verificationPhaseStopwatch.Elapsed.TotalSeconds
+    $admittedRunTimeoutSeconds = [int]$budgetPreflight.perInvocationTimeoutSeconds
+    $verificationPhaseDeadlineSeconds = [int]$budgetPreflight.phaseDeadlineSeconds
     if (-not [bool]$budgetPreflight.canLaunch) {
         Write-ReviewerCycleMetadata -Fields @{
             cycle = $CycleNumber; mode = "verification-budget-preflight"; prId = $prId
             sourceCommit = $sourceCommit; result = "degraded"; reason = [string]$budgetPreflight.reason
-            requiredRunCount = [int]$budgetPreflight.requiredRunCount
-            effectiveMaxRuns = [int]$budgetPreflight.effectiveMaxRuns
+            requiredAssignmentCount = [int]$budgetPreflight.requiredAssignmentCount
+            invocationCount = [int]$budgetPreflight.invocationCount
+            effectiveMaxAssignments = [int]$budgetPreflight.effectiveMaxAssignments
             requiredSeconds = [int]$budgetPreflight.requiredSeconds
             remainingSeconds = [int]$budgetPreflight.remainingSeconds
+            reservedOverheadSeconds = [int]$budgetPreflight.reservedOverheadSeconds
+            perAssignmentTimeoutSeconds = [int]$budgetPreflight.perAssignmentTimeoutSeconds
+            perInvocationTimeoutSeconds = [int]$budgetPreflight.perInvocationTimeoutSeconds
+            minAssignmentSeconds = [int]$budgetPreflight.minAssignmentSeconds
+            maxSupportedAssignmentCount = [int]$budgetPreflight.maxSupportedAssignmentCount
         }
         # No launch: mark every planned assignment degraded up front.
         foreach ($key in $orderedGroupKeys) {
@@ -10351,7 +10394,7 @@ function Invoke-ReviewerCrossVerificationPass {
                         assignmentId = [string]$assignment.assignmentId
                         status = "degraded"
                         reason = [string]$budgetPreflight.reason
-                        detail = "Verification budget preflight refused to launch: the full required run set does not fit the declared run/time budget."
+                        detail = "Verification budget preflight refused to launch: the full required assignment set does not fit the declared run/time budget."
                         model = [string]$assignment.verifierModel
                         clusterId = [string]$assignment.clusterId
                         nonceSha256 = "0" * 64
@@ -10372,12 +10415,12 @@ function Invoke-ReviewerCrossVerificationPass {
         $clusterId = [string]$groupAssignments[0].clusterId
         $verifierModel = [string]$groupAssignments[0].verifierModel
         # No mid-loop budget re-check. The deterministic preflight above already
-        # proved the WHOLE admitted set fits the run and time budget by reserving
-        # the full configured per-run timeout for every planned run, so every
-        # admitted group launches with that configured timeout. Re-checking the
-        # phase clock here is exactly what re-opened the partial-launch window:
-        # a run that consumed most of its timeout could starve a later planned
-        # group even though the preflight had already reserved room for it.
+        # proved the WHOLE admitted set fits the run and time budget by dividing
+        # the remaining phase among the required runs, so every admitted group
+        # launches with the exact share the preflight reserved for it. Re-checking
+        # the phase clock here is what re-opened the partial-launch window: a run
+        # that consumed most of its bound could strand a later planned group even
+        # though room had already been reserved for it.
         $cluster = @($clusters | Where-Object { [string]$_.clusterId -ceq $clusterId })[0]
         $candidateIds = @($groupAssignments | ForEach-Object { [string]$_.candidateId })
         $assignedCandidates = @($cluster.members | Where-Object {
@@ -10427,7 +10470,7 @@ function Invoke-ReviewerCrossVerificationPass {
             -AssignedCandidates $assignedCandidates -SiblingEvidence $siblingEvidence `
             -EvidenceHunks $assignedHunks -CandidateEvidence $assignedEvidence `
             -DeterministicFacts $relevantFacts -ThreadFacts $relevantThreads `
-            -TimeoutSeconds $EffectiveVerificationTimeoutSeconds
+            -TimeoutSeconds $admittedRunTimeoutSeconds
         foreach ($assignment in $groupAssignments) {
             [void]$runRecords.Add([pscustomobject][ordered]@{
                     assignmentId = [string]$assignment.assignmentId
@@ -10444,21 +10487,107 @@ function Invoke-ReviewerCrossVerificationPass {
                 })
         }
     }
-    $freshBinding = Invoke-ReviewerConventionSession -AgencyPath $AgencyPath -Action {
-        param([hashtable]$verificationSession)
-        return Get-ReviewerPinnedConventionChangeSet -Session $verificationSession -PrId $prId `
-            -ExpectedSourceCommit $sourceCommit
+    # The cap is a bound on the PHASE, not on the launches inside it. The reserved
+    # overhead slice above is what setup, this fresh binding, reconciliation and
+    # the artifact write are supposed to fit into. If the phase has nonetheless
+    # crossed its absolute deadline, the phase STOPS here: it does not spend more
+    # wall clock on a live fresh binding it cannot afford, and it does not publish
+    # findings that were produced outside the bound the operator declared.
+    # Recording the overrun and continuing was the earlier behaviour, and a bound
+    # that is only ever logged is not a bound.
+    $phaseDeadlineState = Get-ReviewerVerificationPhaseDeadlineState `
+        -PhaseDeadlineSeconds $verificationPhaseDeadlineSeconds `
+        -ElapsedSeconds $verificationPhaseStopwatch.Elapsed.TotalSeconds
+    $phaseDeadlineOverrun = [bool]$phaseDeadlineState.exceeded
+    if ($phaseDeadlineOverrun) {
+        Write-ReviewerCycleMetadata -Fields @{
+            cycle = $CycleNumber; mode = "verification-phase-deadline"; prId = $prId
+            sourceCommit = $sourceCommit
+            result = [string]$phaseDeadlineState.result
+            phaseDeadlineSeconds = [int]$phaseDeadlineState.phaseDeadlineSeconds
+            phaseElapsedSeconds = [int]$phaseDeadlineState.elapsedSeconds
+            phaseRemainingSeconds = [int]$phaseDeadlineState.remainingSeconds
+            minPostprocessingSeconds = [int]$phaseDeadlineState.minPostprocessingSeconds
+            reservedOverheadSeconds = [int]$budgetPreflight.reservedOverheadSeconds
+            requiredAssignmentCount = [int]$budgetPreflight.requiredAssignmentCount
+            invocationCount = [int]$budgetPreflight.invocationCount
+        }
+        foreach ($runRecord in $runRecords) {
+            $runRecord.status = "degraded"
+            $runRecord.reason = "phaseDeadline"
+            $runRecord.detail = [string]$phaseDeadlineState.detail
+            $runRecord.marker = $null
+        }
     }
-    if ($freshBinding.TargetCommit -cne $targetCommit -or $freshBinding.Digest -cne $changeSetDigest) {
+    # The fresh binding is a LIVE read, so it is only attempted while the phase
+    # still has deadline left, AND only under a transport timeout whose worst
+    # case fits in what is left. Checking the deadline and then starting an
+    # unbounded live call would let the call itself breach the bound. Skipping it
+    # is not a weakening: the results it would have re-bound are already withheld.
+    $freshBindingBudget = Get-ReviewerVerificationFreshBindingBudget `
+        -DeadlineState $phaseDeadlineState -RequestTimeoutSeconds ([int]$McpTimeoutSeconds)
+    if (-not [bool]$freshBindingBudget.allowed -and -not $phaseDeadlineOverrun) {
+        # The deadline has not passed, but the binding cannot be bounded inside
+        # it. Fail closed exactly as an overrun would: unre-bound results are not
+        # published as if they had been re-bound.
+        Write-ReviewerCycleMetadata -Fields @{
+            cycle = $CycleNumber; mode = "verification-fresh-binding-skipped"; prId = $prId
+            sourceCommit = $sourceCommit
+            reason = [string]$freshBindingBudget.reason
+            availableSeconds = [int]$freshBindingBudget.availableSeconds
+            phaseRemainingSeconds = [int]$phaseDeadlineState.remainingSeconds
+        }
         foreach ($runRecord in $runRecords) {
             $runRecord.status = "degraded"
             $runRecord.reason = "staleBinding"
-            $runRecord.detail = "The source/change-set binding moved during verification."
+            $runRecord.detail = [string]$freshBindingBudget.detail
             $runRecord.marker = $null
+        }
+    }
+    if ([bool]$freshBindingBudget.allowed) {
+        $freshBinding = Invoke-ReviewerConventionSession -AgencyPath $AgencyPath `
+            -RequestTimeoutSeconds ([int]$freshBindingBudget.requestTimeoutSeconds) -Action {
+            param([hashtable]$verificationSession)
+            return Get-ReviewerPinnedConventionChangeSet -Session $verificationSession -PrId $prId `
+                -ExpectedSourceCommit $sourceCommit
+        }
+        if ($freshBinding.TargetCommit -cne $targetCommit -or $freshBinding.Digest -cne $changeSetDigest) {
+            foreach ($runRecord in $runRecords) {
+                $runRecord.status = "degraded"
+                $runRecord.reason = "staleBinding"
+                $runRecord.detail = "The source/change-set binding moved during verification."
+                $runRecord.marker = $null
+            }
+        }
+        # The binding is bounded, not instantaneous: the deadline is re-evaluated
+        # immediately after it and BEFORE anything is published, so a phase that
+        # crossed the line while re-binding still withholds everything.
+        $phaseDeadlineState = Get-ReviewerVerificationPhaseDeadlineState `
+            -PhaseDeadlineSeconds $verificationPhaseDeadlineSeconds `
+            -ElapsedSeconds $verificationPhaseStopwatch.Elapsed.TotalSeconds
+        if ([bool]$phaseDeadlineState.exceeded -and -not $phaseDeadlineOverrun) {
+            $phaseDeadlineOverrun = $true
+            Write-ReviewerCycleMetadata -Fields @{
+                cycle = $CycleNumber; mode = "verification-phase-deadline"; prId = $prId
+                sourceCommit = $sourceCommit
+                result = [string]$phaseDeadlineState.result
+                phaseDeadlineSeconds = [int]$phaseDeadlineState.phaseDeadlineSeconds
+                phaseElapsedSeconds = [int]$phaseDeadlineState.elapsedSeconds
+                phaseRemainingSeconds = [int]$phaseDeadlineState.remainingSeconds
+                minPostprocessingSeconds = [int]$phaseDeadlineState.minPostprocessingSeconds
+                stage = "afterFreshBinding"
+            }
+            foreach ($runRecord in $runRecords) {
+                $runRecord.status = "degraded"
+                $runRecord.reason = "phaseDeadline"
+                $runRecord.detail = [string]$phaseDeadlineState.detail
+                $runRecord.marker = $null
+            }
         }
     }
     $replay = Invoke-ReviewerVerificationReplay -InputManifest $inputManifest `
         -VerifierRuns $runRecords.ToArray()
+    $replay = Limit-ReviewerVerificationToPhaseDeadline -Replay $replay -DeadlineState $phaseDeadlineState
     $status = if (@($runRecords | Where-Object { $_.status -cne "complete" }).Count -eq 0) {
         "complete"
     }

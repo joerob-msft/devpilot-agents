@@ -795,83 +795,254 @@ Assert-Verification ([bool]$withinBudget.canRun -and $withinBudget.timeoutSecond
 # ---------------------------------------------------------------------------
 # 2N: every eligible candidate needs exactly two verifier runs (one fresh GPT,
 # one fresh Opus), so N candidates require 2N runs, and the preflight sizes the
-# whole phase against that. The reservation is conservative - the FULL configured
-# per-run timeout for every planned run - so an admitted set can never starve a
-# later run mid-loop.
+# whole phase against that. One source of truth: the phase is DIVIDED among the
+# required runs and each admitted run is handed exactly the share reserved for
+# it, so admission and invocation can never disagree about how long a run may
+# take, and no run can starve a later one mid-loop.
+# 2N: every eligible candidate needs exactly two verifier ASSIGNMENTS (one fresh
+# GPT, one fresh Opus), so N candidates require 2N assignments, and the preflight
+# sizes the whole phase against THAT - not against the grouped invocation count
+# the assignments happen to be batched into. Budgeting the groups was the earlier
+# defect: grouping is an optimisation, and reserving for the optimisation rather
+# than for the work makes the reservation a promise about the implementation.
+# One source of truth: the phase is DIVIDED among the required assignments and
+# each admitted invocation is handed exactly the share reserved for it, so
+# admission and invocation can never disagree about how long a run may take, and
+# no run can starve a later one mid-loop.
 $twoNCandidates = 5
-$twoNRuns = 2 * $twoNCandidates
-$twoNAdmit = Assert-ReviewerVerificationBudgetPreflight -RequiredRunCount $twoNRuns `
+$twoNAssignments = 2 * $twoNCandidates
+$twoNAdmit = Assert-ReviewerVerificationBudgetPreflight -RequiredAssignmentCount $twoNAssignments `
     -MaxVerifierRuns 16 -MaxPhaseSeconds 3600 -ConfiguredRunTimeoutSeconds 90 -ElapsedSeconds 0
-Assert-Verification ([bool]$twoNAdmit.canLaunch -and [int]$twoNAdmit.requiredRunCount -eq 10 -and
+Assert-Verification ([bool]$twoNAdmit.canLaunch -and [int]$twoNAdmit.requiredAssignmentCount -eq 10 -and
+    [int]$twoNAdmit.perAssignmentTimeoutSeconds -eq 90 -and
+    [int]$twoNAdmit.perInvocationTimeoutSeconds -eq 90 -and
     [long]$twoNAdmit.requiredSeconds -eq 900) `
-    "The 2N preflight did not admit a run set that fits the run and full-timeout time budget."
-# Refused for run count: 2N exceeds the effective max verifier runs.
-$runLimited = Assert-ReviewerVerificationBudgetPreflight -RequiredRunCount 18 `
+    "The 2N preflight did not admit an assignment set that fits the run and divided-phase time budget."
+# Refused for assignment count: 2N exceeds the effective max verifier runs.
+$runLimited = Assert-ReviewerVerificationBudgetPreflight -RequiredAssignmentCount 18 `
     -MaxVerifierRuns 16 -MaxPhaseSeconds 3600 -ConfiguredRunTimeoutSeconds 90 -ElapsedSeconds 0
-Assert-Verification (-not [bool]$runLimited.canLaunch -and [string]$runLimited.reason -ceq "candidateLimit") `
-    "The 2N preflight admitted a run set larger than the verifier-run budget."
-# Refused for time: the remaining phase seconds cannot cover the full configured
-# per-run timeout for every required run.
-$timeLimited = Assert-ReviewerVerificationBudgetPreflight -RequiredRunCount 10 `
+Assert-Verification (-not [bool]$runLimited.canLaunch -and [string]$runLimited.reason -ceq "candidateLimit" -and
+    [int]$runLimited.perAssignmentTimeoutSeconds -eq 0) `
+    "The 2N preflight admitted an assignment set larger than the verifier-run budget."
+# Refused for time: the remaining phase seconds cannot give every required
+# assignment even the evidence-based minimum, so nothing is launched at all.
+$timeLimited = Assert-ReviewerVerificationBudgetPreflight -RequiredAssignmentCount 10 `
     -MaxVerifierRuns 16 -MaxPhaseSeconds 3600 -ConfiguredRunTimeoutSeconds 90 -ElapsedSeconds 3550
 Assert-Verification (-not [bool]$timeLimited.canLaunch -and [string]$timeLimited.reason -ceq "timeout" -and
-    [long]$timeLimited.requiredSeconds -eq 900) `
-    "The 2N preflight admitted a run set the phase clock cannot finish at the full per-run timeout."
-# The boundary: exactly enough remaining seconds for the whole set at the FULL
-# configured timeout is admitted; one second less is refused. Proves no off-by-one
-# launch on insufficient time.
-$exactTime = Assert-ReviewerVerificationBudgetPreflight -RequiredRunCount 10 `
-    -MaxVerifierRuns 16 -MaxPhaseSeconds 900 -ConfiguredRunTimeoutSeconds 90 -ElapsedSeconds 0
-$oneShort = Assert-ReviewerVerificationBudgetPreflight -RequiredRunCount 10 `
-    -MaxVerifierRuns 16 -MaxPhaseSeconds 900 -ConfiguredRunTimeoutSeconds 90 -ElapsedSeconds 1
-Assert-Verification ([bool]$exactTime.canLaunch -and -not [bool]$oneShort.canLaunch -and
-    [string]$oneShort.reason -ceq "timeout") `
-    "The 2N preflight did not treat the full-timeout time budget as an exact, launch-free boundary."
+    [long]$timeLimited.requiredSeconds -eq 900 -and
+    [int]$timeLimited.perAssignmentTimeoutSeconds -eq 0) `
+    "The 2N preflight admitted an assignment set the phase clock cannot give a usable slice to."
+# The boundary: exactly enough remaining seconds for the whole set at the
+# minimum acceptable per-assignment slice is admitted; one second less is
+# refused. Proves no off-by-one launch on insufficient time. The phase is stated
+# as 900 usable seconds PLUS the reserved overhead, so the arithmetic under test
+# is the division and not the reservation.
+$exactTime = Assert-ReviewerVerificationBudgetPreflight -RequiredAssignmentCount 10 `
+    -MaxVerifierRuns 16 -MaxPhaseSeconds (900 + $script:ReviewerVerificationReservedOverheadSeconds) `
+    -ConfiguredRunTimeoutSeconds 90 -ElapsedSeconds 0
+$oneShort = Assert-ReviewerVerificationBudgetPreflight -RequiredAssignmentCount 10 `
+    -MaxVerifierRuns 16 -MaxPhaseSeconds (900 + $script:ReviewerVerificationReservedOverheadSeconds) `
+    -ConfiguredRunTimeoutSeconds 90 -ElapsedSeconds 1
+Assert-Verification ([bool]$exactTime.canLaunch -and [int]$exactTime.perAssignmentTimeoutSeconds -eq 90 -and
+    -not [bool]$oneShort.canLaunch -and [string]$oneShort.reason -ceq "timeout") `
+    "The 2N preflight did not treat the divided time budget as an exact, launch-free boundary."
 # An empty plan launches nothing and is trivially admitted.
-$zeroPlan = Assert-ReviewerVerificationBudgetPreflight -RequiredRunCount 0 `
+$zeroPlan = Assert-ReviewerVerificationBudgetPreflight -RequiredAssignmentCount 0 `
     -MaxVerifierRuns 16 -MaxPhaseSeconds 3600 -ConfiguredRunTimeoutSeconds 90 -ElapsedSeconds 0
-Assert-Verification ([bool]$zeroPlan.canLaunch -and [int]$zeroPlan.requiredRunCount -eq 0) `
+Assert-Verification ([bool]$zeroPlan.canLaunch -and [int]$zeroPlan.requiredAssignmentCount -eq 0 -and
+    [int]$zeroPlan.perAssignmentTimeoutSeconds -eq 0) `
     "An empty preflight plan was not admitted as a no-op."
-# Overflow-safe reservation: the hard-cap worst case (128 runs at the 3600s
-# per-run ceiling) is computed without wrapping and refuses cleanly when the
-# phase clock cannot cover it.
-$overflowSafe = Assert-ReviewerVerificationBudgetPreflight -RequiredRunCount 128 `
+# Overflow-safe accounting at the hard caps: 128 assignments cannot each receive
+# the evidence floor out of a 3600s phase, so the set is refused cleanly and the
+# reported shortfall is computed in [long] without wrapping.
+$overflowSafe = Assert-ReviewerVerificationBudgetPreflight -RequiredAssignmentCount 128 `
     -MaxVerifierRuns 128 -MaxPhaseSeconds 3600 -ConfiguredRunTimeoutSeconds 3600 -ElapsedSeconds 0
 Assert-Verification (-not [bool]$overflowSafe.canLaunch -and [string]$overflowSafe.reason -ceq "timeout" -and
-    [long]$overflowSafe.requiredSeconds -eq ([long]128 * 3600)) `
-    "The 2N preflight did not reserve the full per-run timeout overflow-safely at the hard caps."
+    [long]$overflowSafe.requiredSeconds -eq ([long]128 * $script:ReviewerVerificationMinAssignmentSeconds)) `
+    "The 2N preflight did not account for the hard-cap worst case overflow-safely."
+# Invocations may GROUP assignments but never exceed them; if they could, the
+# assignment count would stop bounding the worst-case wall clock.
+Assert-VerificationThrows -Action { Get-ReviewerVerificationPhaseBudgetPlan -RequiredAssignmentCount 6 `
+        -InvocationCount 7 -ConfiguredRunTimeoutSeconds 900 } `
+    -Message "The budget plan accepted more invocations than assignments, breaking the worst-case bound."
+# ---------------------------------------------------------------------------
+# Layer A: the evidence-based per-assignment policy. The bug being closed here
+# refused perfectly ordinary bounded unions: with the shipped defaults a 3- or
+# 5-candidate pull request needs 6 or 10 ASSIGNMENTS, and reserving the 900s
+# per-run CEILING for each of them demanded 5400s or 9000s against a 3600s phase
+# - so zero verifiers launched even though every one of those runs would have
+# finished in roughly 150-300 measured seconds. Dividing the phase admits them
+# while keeping the wall-clock bound absolute.
+# ---------------------------------------------------------------------------
+$usableSeconds = 3600 - $script:ReviewerVerificationReservedOverheadSeconds
+$sixUnion = Assert-ReviewerVerificationBudgetPreflight -RequiredAssignmentCount 6 `
+    -MaxVerifierRuns 128 -MaxPhaseSeconds 3600 -ConfiguredRunTimeoutSeconds 900 -ElapsedSeconds 0
+Assert-Verification ([bool]$sixUnion.canLaunch -and
+    [int]$sixUnion.perAssignmentTimeoutSeconds -eq [int][Math]::Floor($usableSeconds / 6) -and
+    [long]$sixUnion.requiredSeconds -le [long]$sixUnion.remainingSeconds) `
+    "A valid 6-assignment bounded union was not admitted inside the 3600s phase."
+$tenUnion = Assert-ReviewerVerificationBudgetPreflight -RequiredAssignmentCount 10 `
+    -MaxVerifierRuns 128 -MaxPhaseSeconds 3600 -ConfiguredRunTimeoutSeconds 900 -ElapsedSeconds 0
+Assert-Verification ([bool]$tenUnion.canLaunch -and
+    [int]$tenUnion.perAssignmentTimeoutSeconds -eq [int][Math]::Floor($usableSeconds / 10) -and
+    [long]$tenUnion.requiredSeconds -le [long]$tenUnion.remainingSeconds) `
+    "A valid 10-assignment bounded union was not admitted inside the 3600s phase."
+# Every admitted per-assignment bound is a real bound: at or above the measured
+# floor, never above what the operator configured, and never above the phase.
+Assert-Verification (
+    [int]$sixUnion.perAssignmentTimeoutSeconds -ge $script:ReviewerVerificationMinAssignmentSeconds -and
+    [int]$tenUnion.perAssignmentTimeoutSeconds -ge $script:ReviewerVerificationMinAssignmentSeconds -and
+    [int]$sixUnion.perAssignmentTimeoutSeconds -le 900 -and
+    [int]$tenUnion.perAssignmentTimeoutSeconds -le $script:ReviewerVerificationMaxPhaseSeconds) `
+    "An admitted per-assignment timeout fell below the evidence floor or above its declared ceiling."
+# Max supported count and the one-over-cap boundary, stated in ASSIGNMENTS. With
+# a 3600s phase, the reserved overhead and the 300s evidence floor the phase
+# supports exactly floor(usable/300) assignments; one more cannot give every
+# assignment a usable slice and is refused wholesale.
+$maxSupported = [int]$tenUnion.maxSupportedAssignmentCount
+Assert-Verification ($maxSupported -eq [int][Math]::Floor($usableSeconds / $script:ReviewerVerificationMinAssignmentSeconds)) `
+    "The phase budget plan did not report the exact maximum supported assignment count."
+$atCap = Assert-ReviewerVerificationBudgetPreflight -RequiredAssignmentCount $maxSupported `
+    -MaxVerifierRuns 128 -MaxPhaseSeconds 3600 -ConfiguredRunTimeoutSeconds 900 -ElapsedSeconds 0
+$overCap = Assert-ReviewerVerificationBudgetPreflight -RequiredAssignmentCount ($maxSupported + 1) `
+    -MaxVerifierRuns 128 -MaxPhaseSeconds 3600 -ConfiguredRunTimeoutSeconds 900 -ElapsedSeconds 0
+Assert-Verification ([bool]$atCap.canLaunch -and
+    [int]$atCap.perAssignmentTimeoutSeconds -ge $script:ReviewerVerificationMinAssignmentSeconds -and
+    [long]$atCap.requiredSeconds -le [long]$atCap.remainingSeconds -and
+    -not [bool]$overCap.canLaunch -and [string]$overCap.reason -ceq "timeout" -and
+    [int]$overCap.perAssignmentTimeoutSeconds -eq 0) `
+    "The maximum supported assignment count was not an exact admit/refuse boundary."
+# The global hard cap is absolute: a caller declaring a larger phase than the
+# build allows is clamped, so no configuration can buy more wall clock.
+$widened = Assert-ReviewerVerificationBudgetPreflight -RequiredAssignmentCount 10 `
+    -MaxVerifierRuns 1024 -MaxPhaseSeconds 86400 -ConfiguredRunTimeoutSeconds 3600 -ElapsedSeconds 0
+Assert-Verification ([int]$widened.effectiveMaxSeconds -eq $script:ReviewerVerificationMaxPhaseSeconds -and
+    [int]$widened.effectiveMaxAssignments -eq $script:ReviewerVerificationMaxVerifierRuns -and
+    [int]$widened.phaseDeadlineSeconds -eq $script:ReviewerVerificationMaxPhaseSeconds -and
+    [long]$widened.requiredSeconds -le [long]$script:ReviewerVerificationMaxPhaseSeconds) `
+    "A widened caller budget escaped the global hard phase and run caps."
+# A deployment that configures short runs is describing its own runs; the
+# evidence floor never overrules it upward.
+$shortConfigured = Assert-ReviewerVerificationBudgetPreflight -RequiredAssignmentCount 10 `
+    -MaxVerifierRuns 16 -MaxPhaseSeconds 3600 -ConfiguredRunTimeoutSeconds 30 -ElapsedSeconds 0
+Assert-Verification ([bool]$shortConfigured.canLaunch -and
+    [int]$shortConfigured.perAssignmentTimeoutSeconds -eq 30 -and
+    [int]$shortConfigured.minAssignmentSeconds -eq 30) `
+    "The evidence floor overruled an operator that deliberately configured short verifier runs."
 
 # ---------------------------------------------------------------------------
-# Layer A (item 1/this turn): the admitted set is launched WHOLE. The caller
-# hands every admitted group the configured per-run timeout and does NOT re-check
-# the phase clock mid-loop, so a run that consumes most of its timeout can never
-# starve a later planned group. This simulation reproduces the exact scenario the
-# earlier per-run recheck mishandled - N runs each taking close to the full
-# timeout - and proves all N launch after admission and zero launch after refusal.
+# Layer A: the hard cap covers the WHOLE phase, not only the launches. Setup,
+# fresh binding, reconciliation and the artifact write are real wall clock, so
+# the plan reserves an explicit bounded overhead slice before dividing anything.
+# Without it the launches may legitimately consume the entire cap and every
+# second of non-launch work is unbudgeted overrun.
+# ---------------------------------------------------------------------------
+$withOverhead = Get-ReviewerVerificationPhaseBudgetPlan -RequiredAssignmentCount 10 `
+    -MaxVerifierRuns 128 -MaxPhaseSeconds 3600 -ConfiguredRunTimeoutSeconds 900 -ElapsedSeconds 0
+$withoutOverhead = Get-ReviewerVerificationPhaseBudgetPlan -RequiredAssignmentCount 10 `
+    -MaxVerifierRuns 128 -MaxPhaseSeconds 3600 -ConfiguredRunTimeoutSeconds 900 -ElapsedSeconds 0 `
+    -ReservedOverheadSeconds 0
+Assert-Verification (
+    [int]$withOverhead.reservedOverheadSeconds -eq $script:ReviewerVerificationReservedOverheadSeconds -and
+    [long]$withOverhead.remainingSeconds -eq
+    ([long]$withoutOverhead.remainingSeconds - $script:ReviewerVerificationReservedOverheadSeconds) -and
+    [long]$withOverhead.requiredSeconds + $script:ReviewerVerificationReservedOverheadSeconds -le
+    [long]$withOverhead.effectiveMaxSeconds) `
+    "The phase budget did not hold back a bounded overhead slice inside the hard cap."
+# Injected overhead consumes real budget: a phase that has already spent time on
+# setup admits a smaller set, and at some point admits nothing rather than
+# launching a set whose completion would breach the cap.
+foreach ($injected in @(0.0, 600.0, 1800.0, 3000.0)) {
+    $injectedPlan = Get-ReviewerVerificationPhaseBudgetPlan -RequiredAssignmentCount 10 `
+        -MaxVerifierRuns 128 -MaxPhaseSeconds 3600 -ConfiguredRunTimeoutSeconds 900 -ElapsedSeconds $injected
+    $worstCase = $injected + [double]$injectedPlan.requiredSeconds +
+        [double]$injectedPlan.reservedOverheadSeconds
+    Assert-Verification ((-not [bool]$injectedPlan.canLaunch) -or
+        $worstCase -le [double]$injectedPlan.phaseDeadlineSeconds) `
+        "With ${injected}s of injected phase overhead the admitted set could finish past the absolute phase deadline."
+}
+$exhausted = Get-ReviewerVerificationPhaseBudgetPlan -RequiredAssignmentCount 10 `
+    -MaxVerifierRuns 128 -MaxPhaseSeconds 3600 -ConfiguredRunTimeoutSeconds 900 -ElapsedSeconds 3000
+Assert-Verification (-not [bool]$exhausted.canLaunch -and [string]$exhausted.reason -ceq "timeout") `
+    "A phase with too little time left after overhead still admitted a full assignment set."
+
+# One source of truth: the preflight is a thin call into the plan, so the two
+# can never drift apart into an admission the invocation contradicts.
+foreach ($case in @(
+        @{ n = 6; g = 2; phase = 3600; configured = 900; elapsed = 0.0 },
+        @{ n = 10; g = 4; phase = 3600; configured = 900; elapsed = 0.0 },
+        @{ n = 11; g = 11; phase = 3600; configured = 900; elapsed = 0.0 },
+        @{ n = 12; g = 6; phase = 3600; configured = 900; elapsed = 0.0 },
+        @{ n = 4; g = 2; phase = 1800; configured = 900; elapsed = 120.0 })) {
+    $viaPreflight = Assert-ReviewerVerificationBudgetPreflight -RequiredAssignmentCount ([int]$case.n) `
+        -InvocationCount ([int]$case.g) -MaxVerifierRuns 128 -MaxPhaseSeconds ([int]$case.phase) `
+        -ConfiguredRunTimeoutSeconds ([int]$case.configured) -ElapsedSeconds ([double]$case.elapsed)
+    $viaPlan = Get-ReviewerVerificationPhaseBudgetPlan -RequiredAssignmentCount ([int]$case.n) `
+        -InvocationCount ([int]$case.g) -MaxVerifierRuns 128 -MaxPhaseSeconds ([int]$case.phase) `
+        -ConfiguredRunTimeoutSeconds ([int]$case.configured) -ElapsedSeconds ([double]$case.elapsed)
+    Assert-Verification (($viaPreflight | ConvertTo-Json -Depth 6 -Compress) -ceq
+        ($viaPlan | ConvertTo-Json -Depth 6 -Compress)) `
+        "Preflight and the phase budget plan disagreed for $($case.n) assignment(s) - there is more than one source of truth."
+    # Batching must never make the worst case exceed what was reserved.
+    if ([bool]$viaPlan.canLaunch) {
+        Assert-Verification (
+            ([long]$viaPlan.invocationCount * [long]$viaPlan.perInvocationTimeoutSeconds) -le
+            [long]$viaPlan.remainingSeconds) `
+            "Grouping $($case.n) assignment(s) into $($case.g) invocation(s) reserved more time than the phase has."
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Layer A: the admitted set is launched WHOLE. The caller hands every admitted
+# group the timeout the preflight reserved and does NOT re-check the phase clock
+# mid-loop, so a run that consumes most of its timeout can never starve a later
+# planned group. This simulation reproduces the exact scenario the earlier
+# per-run recheck mishandled - N runs each taking close to the full timeout - and
+# proves all N launch after admission and zero launch after refusal.
 # ---------------------------------------------------------------------------
 function Measure-VerifierLaunches {
     param(
-        [int]$RequiredRunCount, [int]$MaxVerifierRuns, [int]$MaxPhaseSeconds,
-        [int]$ConfiguredRunTimeoutSeconds, [double]$PerRunDurationSeconds, [double]$StartElapsedSeconds
+        [int]$RequiredAssignmentCount, [int]$InvocationCount = 0, [int]$MaxVerifierRuns, [int]$MaxPhaseSeconds,
+        [int]$ConfiguredRunTimeoutSeconds, [double]$PerRunDurationSeconds, [double]$StartElapsedSeconds,
+        [double]$PostLaunchOverheadSeconds = 0.0
     )
+    if ($InvocationCount -eq 0) { $InvocationCount = $RequiredAssignmentCount }
     # Preflight ONCE, exactly as production does.
-    $preflight = Assert-ReviewerVerificationBudgetPreflight -RequiredRunCount $RequiredRunCount `
-        -MaxVerifierRuns $MaxVerifierRuns -MaxPhaseSeconds $MaxPhaseSeconds `
+    $preflight = Assert-ReviewerVerificationBudgetPreflight -RequiredAssignmentCount $RequiredAssignmentCount `
+        -InvocationCount $InvocationCount -MaxVerifierRuns $MaxVerifierRuns -MaxPhaseSeconds $MaxPhaseSeconds `
         -ConfiguredRunTimeoutSeconds $ConfiguredRunTimeoutSeconds -ElapsedSeconds $StartElapsedSeconds
-    if (-not [bool]$preflight.canLaunch) { return [pscustomobject]@{ launched = 0; refused = $true } }
-    # Admitted: launch every planned group with the configured timeout, advancing
-    # the wall clock by each run's real duration, and NEVER re-checking budget.
+    if (-not [bool]$preflight.canLaunch) {
+        return [pscustomobject]@{ launched = 0; launchedAssignments = 0; refused = $true; timeouts = @() }
+    }
+    # Admitted: launch every planned group with the timeout the preflight
+    # reserved for it, advancing the wall clock by each run's real duration, and
+    # NEVER re-checking budget.
     $launched = 0
     $elapsed = $StartElapsedSeconds
-    for ($i = 0; $i -lt $RequiredRunCount; $i++) {
+    $timeouts = [System.Collections.Generic.List[int]]::new()
+    for ($i = 0; $i -lt $InvocationCount; $i++) {
         $launched++
+        [void]$timeouts.Add([int]$preflight.perInvocationTimeoutSeconds)
         $elapsed += $PerRunDurationSeconds
     }
-    return [pscustomobject]@{ launched = $launched; refused = $false; finalElapsed = $elapsed }
+    $elapsed += $PostLaunchOverheadSeconds
+    return [pscustomobject]@{
+        launched = $launched
+        launchedAssignments = $RequiredAssignmentCount
+        refused = $false
+        finalElapsed = $elapsed
+        timeouts = @($timeouts.ToArray())
+        worstCaseElapsed = $StartElapsedSeconds +
+        ($InvocationCount * [double]$preflight.perInvocationTimeoutSeconds) +
+        [double]$preflight.reservedOverheadSeconds
+        effectiveMaxSeconds = [int]$preflight.effectiveMaxSeconds
+        phaseDeadlineSeconds = [int]$preflight.phaseDeadlineSeconds
+    }
 }
 # Admitted set with runs each taking ~the full timeout: all 10 launch even though
 # cumulative elapsed climbs well past the old 30s-remaining floor for later runs.
-$admitAll = Measure-VerifierLaunches -RequiredRunCount 10 -MaxVerifierRuns 16 -MaxPhaseSeconds 900 `
+$admitAll = Measure-VerifierLaunches -RequiredAssignmentCount 10 -MaxVerifierRuns 16 `
+    -MaxPhaseSeconds (900 + $script:ReviewerVerificationReservedOverheadSeconds) `
     -ConfiguredRunTimeoutSeconds 90 -PerRunDurationSeconds 89 -StartElapsedSeconds 0
 Assert-Verification (-not [bool]$admitAll.refused -and [int]$admitAll.launched -eq 10) `
     "An admitted 2N set did not launch every planned group when each run consumed nearly its full timeout."
@@ -892,20 +1063,51 @@ for ($i = 0; $i -lt 10; $i++) {
 }
 Assert-Verification ($oldLaunched -gt 0 -and $oldLaunched -lt 10) `
     "The simulated old per-run gate did not expose the partial-launch window the preflight now closes."
-# And the NEW preflight refuses that same set wholesale (full timeout reservation
-# 10*90=900 > 500 remaining), so zero launch instead of a partial subset.
-$refusePartial = Measure-VerifierLaunches -RequiredRunCount 10 -MaxVerifierRuns 16 -MaxPhaseSeconds 500 `
+# And the NEW preflight refuses that same set wholesale, so zero launch instead
+# of a partial subset.
+$refusePartial = Measure-VerifierLaunches -RequiredAssignmentCount 10 -MaxVerifierRuns 16 -MaxPhaseSeconds 500 `
     -ConfiguredRunTimeoutSeconds 90 -PerRunDurationSeconds 89 -StartElapsedSeconds 0
 Assert-Verification ([bool]$refusePartial.refused -and [int]$refusePartial.launched -eq 0) `
     "The conservative preflight admitted a set the old per-run gate could only partially launch."
 # Refusal is authoritative and total: a set that does not fit launches nothing.
-$refuseAll = Measure-VerifierLaunches -RequiredRunCount 10 -MaxVerifierRuns 16 -MaxPhaseSeconds 300 `
+$refuseAll = Measure-VerifierLaunches -RequiredAssignmentCount 10 -MaxVerifierRuns 16 -MaxPhaseSeconds 300 `
     -ConfiguredRunTimeoutSeconds 90 -PerRunDurationSeconds 89 -StartElapsedSeconds 0
 Assert-Verification ([bool]$refuseAll.refused -and [int]$refuseAll.launched -eq 0) `
     "A refused 2N set launched a partial subset instead of nothing."
-# The caller wires the preflight decision as authoritative: after admission the
-# group loop hands each run the configured timeout and never re-checks the per-run
-# budget mid-loop (the old partial-launch source).
+# The regression this closes, end to end: 6, 10 and the maximum supported number
+# of declared ASSIGNMENTS at the shipped 900s configured timeout against the
+# 3600s phase. All launch in FULL - never partially, never zero - and the worst
+# case in which every invocation consumes its entire reserved slice, plus the
+# reserved overhead, still lands inside the absolute phase deadline. Each count
+# is exercised both ungrouped and grouped, because the acceptance boundary is the
+# assignment count while the launches are invocations.
+foreach ($assignmentCount in @(6, 10, $maxSupported)) {
+    foreach ($grouping in @($assignmentCount, [int][Math]::Max(1, [Math]::Floor($assignmentCount / 2)))) {
+        $union = Measure-VerifierLaunches -RequiredAssignmentCount $assignmentCount -InvocationCount $grouping `
+            -MaxVerifierRuns 128 -MaxPhaseSeconds 3600 -ConfiguredRunTimeoutSeconds 900 `
+            -PerRunDurationSeconds 295 -StartElapsedSeconds 0 -PostLaunchOverheadSeconds 20
+        Assert-Verification (-not [bool]$union.refused -and [int]$union.launched -eq $grouping -and
+            [int]$union.launchedAssignments -eq $assignmentCount -and
+            @($union.timeouts | Sort-Object -Unique).Count -eq 1 -and
+            [double]$union.worstCaseElapsed -le [double]$union.phaseDeadlineSeconds -and
+            [double]$union.finalElapsed -le [double]$union.phaseDeadlineSeconds) `
+            "A valid $assignmentCount-assignment union in $grouping invocation(s) did not launch in full inside the hard phase bound."
+    }
+}
+# One over the supported cap launches NOTHING, not a partial subset - and that
+# holds however the assignments are grouped, because admission is decided on the
+# assignment count.
+foreach ($grouping in @(($maxSupported + 1), 1)) {
+    $overCapLaunch = Measure-VerifierLaunches -RequiredAssignmentCount ($maxSupported + 1) `
+        -InvocationCount $grouping -MaxVerifierRuns 128 -MaxPhaseSeconds 3600 `
+        -ConfiguredRunTimeoutSeconds 900 -PerRunDurationSeconds 295 -StartElapsedSeconds 0
+    Assert-Verification ([bool]$overCapLaunch.refused -and [int]$overCapLaunch.launched -eq 0) `
+        "A union one over the supported cap launched a partial subset instead of failing closed before any launch."
+}
+# The caller wires the preflight decision as authoritative: it budgets the exact
+# 2N assignment count, after admission the group loop hands each invocation the
+# reserved timeout, and it never re-checks the per-run budget mid-loop (the old
+# partial-launch source).
 $crossPassSource = Get-VerificationFunctionText -Text $wrapperText -Name "Invoke-ReviewerCrossVerificationPass"
 $preflightIndex = $crossPassSource.IndexOf('Assert-ReviewerVerificationBudgetPreflight', [StringComparison]::Ordinal)
 $loopStartIndex = $crossPassSource.IndexOf('foreach ($key in $orderedGroupKeys)', [StringComparison]::Ordinal)
@@ -914,8 +1116,15 @@ $loopBody = if ($loopStartIndex -gt $preflightIndex -and $preflightIndex -ge 0) 
 } else { '' }
 Assert-Verification ($loopBody -and $loopBody -notmatch 'Get-ReviewerVerificationRunBudget') `
     "The verifier group loop still re-checks the per-run budget after admission, re-opening partial launch."
-Assert-Verification ($loopBody -match '-TimeoutSeconds \$EffectiveVerificationTimeoutSeconds') `
-    "An admitted verifier group is not handed the configured per-run timeout the preflight reserved."
+Assert-Verification ($loopBody -match '-TimeoutSeconds \$admittedRunTimeoutSeconds') `
+    "An admitted verifier group is not handed the exact per-assignment timeout the preflight reserved."
+Assert-Verification ($crossPassSource -match '\$admittedRunTimeoutSeconds\s*=\s*\[int\]\$budgetPreflight\.perInvocationTimeoutSeconds') `
+    "The per-run timeout handed to verifiers is not taken from the preflight plan, so admission and invocation can drift."
+Assert-Verification ($crossPassSource -match '-RequiredAssignmentCount \(\[int\]\$assignmentCoverage\.requiredAssignmentCount\)') `
+    "The phase budget is not sized on the sealed 2N assignment count, so grouping could shrink the reservation."
+Assert-Verification ($crossPassSource -match '\$verificationPhaseDeadlineSeconds\s*=\s*\[int\]\$budgetPreflight\.phaseDeadlineSeconds' -and
+    $crossPassSource -match 'verification-phase-deadline') `
+    "The cross-verification phase does not enforce the plan's absolute deadline across the whole phase."
 
 
 # Both-generalist clusters are independently assessed, not auto-accepted.
@@ -1824,6 +2033,185 @@ $replayTwo = Invoke-ReviewerVerificationReplay -InputManifest (
 Assert-Verification ([string]$replayOne.replaySha256 -ceq [string]$replayTwo.replaySha256 -and
     @($replayOne.eligible).Count -eq @($replayTwo.eligible).Count) `
     "Saved-artifact replay did not deterministically reconstruct wrapper decisions."
+
+# ---------------------------------------------------------------------------
+# Layer A: the absolute phase deadline is ENFORCED, not merely recorded. The
+# earlier behaviour wrote a metadata line about the overrun and then carried
+# straight on into a LIVE fresh binding, reconciliation and an eligible preview -
+# so the "hard wall-clock bound" bounded only the launches, and a phase could
+# publish findings produced entirely outside the window the operator declared.
+# A bound that is only ever logged is not a bound.
+# ---------------------------------------------------------------------------
+$deadlineMin = $script:ReviewerVerificationMinPostprocessingSeconds
+$withinDeadline = Get-ReviewerVerificationPhaseDeadlineState -PhaseDeadlineSeconds 3600 -ElapsedSeconds 100.0
+Assert-Verification (-not [bool]$withinDeadline.exceeded -and [string]$withinDeadline.result -ceq "within" -and
+    [int]$withinDeadline.remainingSeconds -eq 3500 -and [string]$withinDeadline.detail -ceq "") `
+    "A phase with most of its deadline left was treated as expired."
+# The exact boundary: the tail may START with exactly the minimum window left and
+# not one second less. Proves no off-by-one either way.
+$exactTail = Get-ReviewerVerificationPhaseDeadlineState -PhaseDeadlineSeconds 3600 `
+    -ElapsedSeconds ([double](3600 - $deadlineMin))
+$oneShortTail = Get-ReviewerVerificationPhaseDeadlineState -PhaseDeadlineSeconds 3600 `
+    -ElapsedSeconds ([double](3600 - $deadlineMin + 1))
+Assert-Verification (-not [bool]$exactTail.exceeded -and [bool]$oneShortTail.exceeded -and
+    [string]$oneShortTail.result -ceq "exhausted" -and [int]$oneShortTail.remainingSeconds -eq ($deadlineMin - 1)) `
+    "The minimum postprocessing window was not an exact start/stop boundary for the phase tail."
+# Past the deadline entirely is reported distinctly but stops the phase identically.
+$overrunState = Get-ReviewerVerificationPhaseDeadlineState -PhaseDeadlineSeconds 3600 -ElapsedSeconds 3605.4
+Assert-Verification ([bool]$overrunState.exceeded -and [string]$overrunState.result -ceq "overrun" -and
+    [int]$overrunState.remainingSeconds -eq -5 -and [int]$overrunState.elapsedSeconds -eq 3605 -and
+    [string]$overrunState.detail -match "3600-second deadline") `
+    "A phase past its absolute deadline was not reported as an enforced overrun."
+# Withholding is total: nothing survives an expired bound, and what is withheld
+# says why. A within-deadline phase is passed through untouched.
+Assert-Verification (@($replayOne.eligible).Count -gt 0) `
+    "The deadline fixture needs an eligible finding to prove the deadline withholds it."
+$unlimited = Limit-ReviewerVerificationToPhaseDeadline -Replay $replayOne -DeadlineState $withinDeadline
+Assert-Verification (@($unlimited.eligible).Count -eq @($replayOne.eligible).Count -and
+    @($unlimited.withheld).Count -eq @($replayOne.withheld).Count) `
+    "A phase inside its deadline had results withheld anyway."
+$limited = Limit-ReviewerVerificationToPhaseDeadline -Replay $replayOne -DeadlineState $overrunState
+Assert-Verification (@($limited.eligible).Count -eq 0 -and
+    @($limited.withheld).Count -eq (@($replayOne.withheld).Count + @($replayOne.eligible).Count) -and
+    @($limited.withheld | Where-Object reason -ceq "phaseDeadline").Count -eq @($replayOne.eligible).Count -and
+    [string]$limited.replaySha256 -ceq [string]$replayOne.replaySha256 -and
+    @($limited.decisions).Count -eq @($replayOne.decisions).Count) `
+    "An expired phase deadline still emitted eligible findings instead of withholding every one of them."
+Assert-Verification (@($limited.withheld | Where-Object reason -ceq "phaseDeadline" |
+        Where-Object { [string]$_.candidateId -and [string]$_.detail -match "3600-second bound" }).Count -eq
+    @($replayOne.eligible).Count) `
+    "Deadline-withheld findings did not carry their candidate identity and the reason the phase stopped."
+Assert-Verification ($script:ReviewerVerificationWithheldReasons -ccontains "phaseDeadline") `
+    "phaseDeadline is not a declared withheld reason, so replay would rewrite it to a generic failure."
+# End to end with injected overhead: the launches themselves fit the budget and
+# all of them run - all-or-none is untouched - but setup and postprocessing push
+# the phase past its absolute deadline. Every run is then degraded, the live
+# fresh binding is skipped, and nothing at all is eligible.
+$overrunLaunch = Measure-VerifierLaunches -RequiredAssignmentCount 10 -MaxVerifierRuns 128 `
+    -MaxPhaseSeconds 3600 -ConfiguredRunTimeoutSeconds 900 -PerRunDurationSeconds 340 `
+    -StartElapsedSeconds 120 -PostLaunchOverheadSeconds 150
+Assert-Verification (-not [bool]$overrunLaunch.refused -and [int]$overrunLaunch.launched -eq 10) `
+    "The injected-overrun scenario did not launch its admitted set in full, so it cannot prove the tail is what stops."
+$overrunTail = Get-ReviewerVerificationPhaseDeadlineState `
+    -PhaseDeadlineSeconds ([int]$overrunLaunch.phaseDeadlineSeconds) `
+    -ElapsedSeconds ([double]$overrunLaunch.finalElapsed)
+Assert-Verification ([bool]$overrunTail.exceeded) `
+    "The injected phase overhead did not push the phase past its absolute deadline as the scenario requires."
+$overrunRuns = @(New-CompleteRuns -Assignments $assignments | ForEach-Object {
+        $degraded = Copy-VerificationObject $_
+        $degraded.status = "degraded"
+        $degraded.reason = "phaseDeadline"
+        $degraded.detail = [string]$overrunTail.detail
+        $degraded.marker = $null
+        $degraded
+    })
+$overrunReplay = Limit-ReviewerVerificationToPhaseDeadline -DeadlineState $overrunTail -Replay (
+    Invoke-ReviewerVerificationReplay -InputManifest $replayInput -VerifierRuns $overrunRuns)
+$overrunStatus = if (@($overrunRuns | Where-Object { $_.status -cne "complete" }).Count -eq 0) {
+    "complete"
+} else { "degraded" }
+Assert-Verification (@($overrunReplay.eligible).Count -eq 0 -and [string]$overrunStatus -ceq "degraded" -and
+    @($overrunReplay.withheld).Count -ge [int]$replayInput.totalCandidateCount -and
+    @($overrunReplay.withheld | Where-Object reason -ceq "phaseDeadline").Count -ge 1) `
+    "A phase that overran its deadline during setup and postprocessing still produced an eligible preview."
+# The wrapper wires exactly that: it evaluates the deadline state, degrades every
+# run, skips the LIVE fresh binding it can no longer afford, and passes the replay
+# through the withholding gate before anything is previewed.
+Assert-Verification ($crossPassSource -match '\$phaseDeadlineState\s*=\s*Get-ReviewerVerificationPhaseDeadlineState' -and
+    $crossPassSource -match '\$phaseDeadlineOverrun\s*=\s*\[bool\]\$phaseDeadlineState\.exceeded') `
+    "The verification phase does not compute an enforced deadline state after its verifier invocations."
+Assert-Verification ($crossPassSource -match '(?s)if \(\[bool\]\$freshBindingBudget\.allowed\) \{\s*\$freshBinding\s*=') `
+    "The live fresh binding is no longer gated on a bounded budget."
+Assert-Verification ($crossPassSource -match '\$freshBindingBudget\s*=\s*Get-ReviewerVerificationFreshBindingBudget' -and
+    $crossPassSource -match 'Invoke-ReviewerConventionSession -AgencyPath \$AgencyPath\s*`?\s*[\r\n]?\s*-RequestTimeoutSeconds') `
+    "The live fresh binding is not bounded by the phase's remaining deadline."
+Assert-Verification ($crossPassSource -match '(?s)\$freshBinding\.TargetCommit.*?\$phaseDeadlineState\s*=\s*Get-ReviewerVerificationPhaseDeadlineState') `
+    "The phase deadline is not re-evaluated after the live fresh binding and before publication."
+Assert-Verification ($crossPassSource -match '\$replay\s*=\s*Limit-ReviewerVerificationToPhaseDeadline') `
+    "The phase does not withhold its results once the absolute deadline has expired."
+$deadlineBlock = $crossPassSource.Substring(
+    $crossPassSource.IndexOf('$phaseDeadlineState =', [StringComparison]::Ordinal))
+Assert-Verification ($deadlineBlock -match 'reason = "phaseDeadline"') `
+    "An expired phase does not degrade its verifier runs under the phaseDeadline reason."
+
+# The live fresh binding is the one piece of the tail that can run for an
+# unbounded time, so it is only started when its own worst case fits.
+$bindingRequests = $script:ReviewerVerificationFreshBindingMaxRequests
+$bindingFloor = $script:ReviewerVerificationMinFreshBindingRequestSeconds
+$bindingCleanup = $script:ReviewerVerificationFreshBindingCleanupSeconds
+$roomyState = Get-ReviewerVerificationPhaseDeadlineState -PhaseDeadlineSeconds 3600 -ElapsedSeconds 100.0
+$roomyBudget = Get-ReviewerVerificationFreshBindingBudget -DeadlineState $roomyState -RequestTimeoutSeconds 120
+Assert-Verification ([bool]$roomyBudget.allowed -and [int]$roomyBudget.requestTimeoutSeconds -eq 120 -and
+    [int]$roomyBudget.worstCaseSeconds -le [int]$roomyBudget.availableSeconds) `
+    "A phase with most of its deadline left refused or mis-bounded its live fresh binding."
+
+# When the configured transport timeout no longer fits, it is LOWERED rather
+# than trusted: the worst case has to stay inside what the phase has left.
+$tightState = Get-ReviewerVerificationPhaseDeadlineState -PhaseDeadlineSeconds 3600 -ElapsedSeconds 3540.0
+$tightBudget = Get-ReviewerVerificationFreshBindingBudget -DeadlineState $tightState -RequestTimeoutSeconds 900
+$tightAvailable = [int]$tightState.remainingSeconds - [int]$tightState.minPostprocessingSeconds - $bindingCleanup
+Assert-Verification ([bool]$tightBudget.allowed -and
+    [int]$tightBudget.requestTimeoutSeconds -eq [int][Math]::Floor($tightAvailable / $bindingRequests) -and
+    [int]$tightBudget.worstCaseSeconds -le ($tightAvailable + $bindingCleanup)) `
+    "A tight phase did not lower the fresh binding's transport timeout to fit its remaining deadline."
+
+# Below the floor there is no honest bound left, so the binding is not started
+# at all - failing closed rather than starting work the deadline cannot cover.
+$starvedElapsed = [double](3600 - ($script:ReviewerVerificationMinPostprocessingSeconds +
+        $bindingCleanup + ($bindingFloor * $bindingRequests) - 1))
+$starvedState = Get-ReviewerVerificationPhaseDeadlineState -PhaseDeadlineSeconds 3600 -ElapsedSeconds $starvedElapsed
+$starvedBudget = Get-ReviewerVerificationFreshBindingBudget -DeadlineState $starvedState -RequestTimeoutSeconds 900
+Assert-Verification (-not [bool]$starvedState.exceeded -and -not [bool]$starvedBudget.allowed -and
+    [string]$starvedBudget.reason -ceq "freshBindingBudget" -and
+    [string]$starvedBudget.detail -match "was not started") `
+    "A phase with too little room started a live fresh binding it could not bound."
+$expiredBudget = Get-ReviewerVerificationFreshBindingBudget -DeadlineState $overrunState -RequestTimeoutSeconds 900
+Assert-Verification (-not [bool]$expiredBudget.allowed -and [string]$expiredBudget.reason -ceq "phaseDeadline") `
+    "An already-expired phase still permitted a live fresh binding."
+# The bound holds across the whole admissible range, not only at the samples above.
+$bindingSweepOk = $true
+foreach ($elapsedSample in @(0, 600, 1800, 3000, 3400, 3500, 3560, 3570, 3580, 3590)) {
+    $sampleState = Get-ReviewerVerificationPhaseDeadlineState -PhaseDeadlineSeconds 3600 `
+        -ElapsedSeconds ([double]$elapsedSample)
+    $sampleBudget = Get-ReviewerVerificationFreshBindingBudget -DeadlineState $sampleState -RequestTimeoutSeconds 900
+    if (-not [bool]$sampleBudget.allowed) { continue }
+    $sampleWorstCaseElapsed = [double]$elapsedSample + [double]$sampleBudget.worstCaseSeconds
+    if ($sampleWorstCaseElapsed -gt (3600 - $script:ReviewerVerificationMinPostprocessingSeconds)) {
+        $bindingSweepOk = $false
+    }
+}
+Assert-Verification $bindingSweepOk `
+    "A permitted fresh binding's worst case could still push the phase past its absolute deadline."
+
+# End to end: the launches fit, the binding is permitted, but the binding itself
+# burns its whole worst case. The deadline re-check AFTER it is what stops the
+# phase, and nothing is published as eligible.
+$bindingOverrunState = Get-ReviewerVerificationPhaseDeadlineState -PhaseDeadlineSeconds 3600 -ElapsedSeconds 3400.0
+$bindingOverrunBudget = Get-ReviewerVerificationFreshBindingBudget `
+    -DeadlineState $bindingOverrunState -RequestTimeoutSeconds 900
+Assert-Verification ([bool]$bindingOverrunBudget.allowed) `
+    "The fresh-binding overrun scenario needs a permitted binding to prove the re-check is what stops the phase."
+$afterBindingState = Get-ReviewerVerificationPhaseDeadlineState -PhaseDeadlineSeconds 3600 `
+    -ElapsedSeconds (3400.0 + [double]$bindingOverrunBudget.worstCaseSeconds + 60.0)
+Assert-Verification ([bool]$afterBindingState.exceeded) `
+    "The injected fresh-binding overrun did not push the phase past its deadline as the scenario requires."
+$afterBindingRuns = @(New-CompleteRuns -Assignments $assignments | ForEach-Object {
+        $degraded = Copy-VerificationObject $_
+        $degraded.status = "degraded"
+        $degraded.reason = "phaseDeadline"
+        $degraded.detail = [string]$afterBindingState.detail
+        $degraded.marker = $null
+        $degraded
+    })
+$afterBindingReplay = Limit-ReviewerVerificationToPhaseDeadline -DeadlineState $afterBindingState -Replay (
+    Invoke-ReviewerVerificationReplay -InputManifest $replayInput -VerifierRuns $afterBindingRuns)
+Assert-Verification (@($afterBindingReplay.eligible).Count -eq 0 -and
+    @($afterBindingReplay.withheld | Where-Object reason -ceq "phaseDeadline").Count -ge 1) `
+    "A phase that overran its deadline inside the live fresh binding still produced an eligible preview."
+Assert-Verification ($crossPassSource -match 'verification-fresh-binding-skipped' -and
+    $crossPassSource -match '(?s)freshBindingBudget\.allowed -and -not \$phaseDeadlineOverrun.*?reason = "staleBinding"') `
+    "A fresh binding that cannot be bounded does not fail closed by degrading its runs."
+
 $incompleteCoverageReplay = Copy-VerificationObject $replayInput
 $incompleteCoverageReplay.totalCandidateCount = 3
 Assert-VerificationThrows {
@@ -2142,7 +2530,9 @@ function Read-ReviewerFactPlan {
     return $script:passFactPlan
 }
 function Invoke-ReviewerConventionSession {
-    param([string]$AgencyPath, [scriptblock]$Action)
+    param([string]$AgencyPath, [scriptblock]$Action, [int]$RequestTimeoutSeconds = 0)
+    $script:passFreshBindingTimeoutSeconds = $RequestTimeoutSeconds
+    $script:passFreshBindingCalls++
     return & $Action @{}
 }
 function Get-ReviewerPinnedConventionChangeSet {
@@ -2280,6 +2670,11 @@ function Write-ReviewerVerificationDecisionPreview {
 function Write-ReviewerCycleMetadata { param([hashtable]$Fields) [void]$script:cycleMetadata.Add($Fields) }
 $script:modelRunCalls = 0
 $script:cycleMetadata = [System.Collections.Generic.List[object]]::new()
+# The wrapper's configured MCP request timeout, which the phase lowers when its
+# remaining deadline cannot cover the transport's own worst case.
+$McpTimeoutSeconds = 120
+$script:passFreshBindingCalls = 0
+$script:passFreshBindingTimeoutSeconds = -1
 $passBound = @{
     PrId = 42; SourceCommit = "1" * 40; ConventionPlanPath = "plan.json"
     FactPlanPath = "facts.json"; ChangedPaths = @("src/a.cs")
@@ -2303,6 +2698,12 @@ Assert-Verification ($duplicatePass.Status -ceq "complete" -and
     @($duplicatePass.Withheld).Count -eq 1 -and
     [string]$duplicatePass.Withheld[0].candidateId -ceq "duplicate-fact-candidate") `
     "Production cross-verification pass degraded or discarded a good candidate beside a duplicate subset."
+# The live fresh binding ran, and it ran under a bounded transport timeout that
+# never exceeds the wrapper's configured one.
+Assert-Verification ([int]$script:passFreshBindingCalls -ge 1 -and
+    [int]$script:passFreshBindingTimeoutSeconds -gt 0 -and
+    [int]$script:passFreshBindingTimeoutSeconds -le $McpTimeoutSeconds) `
+    "The production pass did not bound its live fresh binding's transport timeout."
 $script:passFactPlan = $overflowFactPlan
 $script:passCandidates = @($overflowPartitionCandidate, $goodPartitionCandidate)
 $overflowSafe = Invoke-ReviewerCrossVerificationSafely -AgencyPath "unused" -CycleNumber 2 `
@@ -2412,8 +2813,8 @@ Assert-Verification ($script:modelRunCalls -eq 0 -and
     $noLaunchPass.Status -cne "complete" -and
     @($preflightMeta).Count -eq 1 -and
     [string]@($preflightMeta)[0].reason -ceq "timeout" -and
-    [int]@($preflightMeta)[0].requiredRunCount -eq 2) `
-    "The pass launched a verifier model or failed to record a preflight refusal when the budget could not cover every required run."
+    [int]@($preflightMeta)[0].requiredAssignmentCount -eq 2) `
+    "The pass launched a verifier model or failed to record a preflight refusal when the budget could not cover every required assignment."
 
 if ($failures.Count -gt 0) {
     Write-Host "Cross verification contract: $($failures.Count) failure(s) across $checks checks." -ForegroundColor Red

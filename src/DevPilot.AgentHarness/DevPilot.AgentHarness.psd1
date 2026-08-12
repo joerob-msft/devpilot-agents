@@ -90,7 +90,7 @@ FunctionsToExport = 'Get-DevPilotAgentPath', 'Resolve-AgentRepositoryRoot', 'Get
                'Measure-AgentMarkerSchemaWorstCaseChars', 'Measure-AgentMarkerSchemaWorstCaseBytes',
                'Test-AgentMarkerSchemaFitsScanWindow', 'Test-AgentMarkerSchemaFitsLaunchContract',
                'ConvertTo-AgentCanonicalMarkerJson',
-               'Find-CopilotSessionForBranch', 
+               'Find-CopilotSessionForBranch',
                'Set-TimedProcessArguments', 'Stop-ProcessTree', 
                'Get-TaskTextBeforeDeadline', 'Invoke-TimedProcess', 
                'Open-AgentMcpSession', 'Close-AgentMcpSession', 
@@ -98,6 +98,7 @@ FunctionsToExport = 'Get-DevPilotAgentPath', 'Resolve-AgentRepositoryRoot', 'Get
                'Invoke-AgentMcpTool', 'ConvertFrom-AgentMcpResourceContent',
                'ConvertTo-AgentReplayCanonicalJson', 'Get-AgentReplayRequestKey',
                'Test-AgentReplayToolPermitted', 'New-AgentReplaySnapshot',
+               'Assert-AgentReplaySnapshotPromotable',
                'Get-AgentReplayResponse',
     'Get-AgentSupportedProvider', 'Test-AgentProviderSupported', 'New-AgentProviderContext', 'Assert-AgentProviderContext',
     'Invoke-AgentGitHubApi', 'Invoke-AgentGitHubGraphQl', 'ConvertTo-AgentProviderPullRequestStatus', 'ConvertTo-AgentProviderVote',
@@ -166,5 +167,4 @@ PrivateData = @{
 # DefaultCommandPrefix = ''
 
 }
-
 

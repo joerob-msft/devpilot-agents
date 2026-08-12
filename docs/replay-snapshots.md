@@ -206,6 +206,219 @@ snapshot - invented organization, invented repository, a synthetic GUID and two
 made-up files - that exercises the mode end to end without any real repository
 content. `tools/Test-ReplaySnapshot.ps1` drives it.
 
+## Sealing offline from a captured corpus
+
+Sometimes the capture already happened and what survives is not payload files
+laid out for the sealer but a research **corpus**: a directory of captured bytes
+plus a `corpus-index.json` binding every one of them to a path, a SHA-256 and a
+byte length. `tools/Save-CorpusReplaySeal.ps1` turns that into a schema-v2
+snapshot without contacting anything.
+
+```pwsh
+./tools/Save-CorpusReplaySeal.ps1 `
+    -CorpusRoot <corpus> -CorpusIndexSha256 <64 hex> `
+    -Recipe <private recipe>.json -ReplayRoot <private replay root>
+```
+
+It has no live seam and no fallback: no MCP session, no repository host, no `az`,
+no child process, no network. The only bytes it can read are the ones the index
+names plus, when the recipe asks for it, one hash-pinned versioned policy file
+(see below). The only way it can fail to find something is by refusing.
+`-CorpusIndexSha256` is mandatory, because an index that is merely
+self-consistent proves nothing - whoever edited it could recompute whatever it
+contains. The tool also refuses a corpus or an output root inside this
+repository, since a seal is private evidence about a real pull request and is
+never committed. Containment is checked against *real* paths: every component of
+an operator-supplied corpus root or replay root is walked, and a reparse point
+anywhere along either one is refused rather than followed, because a junction is
+otherwise a one-line way to make "outside the repository" resolve back inside it.
+
+That guard lives in `Save-ReviewerCorpusSeal` itself, not only in the CLI, so a
+caller reaching the library directly gets the same protection - and it runs
+twice, once before staging and once immediately before publication, refusing if
+the root moved in between. PowerShell cannot hold a directory handle across a
+rename, so the window cannot be closed entirely; two checks and a root-identity
+comparison are the strongest defence available here, and the alternative of
+checking once was strictly worse.
+
+### The recipe states everything twice
+
+`src/Agents/reviewer/schemas/reviewer.offline-corpus-seal-recipe.v1.json`
+describes the private recipe. It is deliberately redundant with the corpus: it
+must independently bind the organization, project, repository, pull request and
+iteration; the source, common and target commits; the authoritative change-set
+digest *and* its exact path order; every changed file's right-hand payload, hash,
+length and spans; the siblings, rules, threads and facts the prompts consume; the
+policy, config, script, schema and prompt hashes; the source transport's mode,
+coverage record, gate and rendered block; the capture provenance and
+status-at-capture; and its own non-promotability.
+
+Redundancy is the point. Anywhere the recipe and the corpus disagree, one of them
+is wrong and neither is authoritative enough to overrule the other, so the seal
+refuses instead of adopting whatever the corpus happens to say. The refusals are
+specific: a tampered or missing payload, a wrong index digest, a stale commit or
+iteration, another pull request's identity substituted in, an aliased path
+(`..`, a backslash, a doubled slash, a drive letter, a case-fold twin), an extra
+payload the index never listed, two resources answering one request, a declared
+hash or length the corpus does not have, or a source census that leaves an
+authoritative changed path neither delivered nor explicitly accounted for as
+having no right-hand content.
+
+Completeness is measured against the **change set**, not against the recipe. The
+authoritative changed paths and their change kinds are derived from the captured
+change metadata, and a path there that does not survive normalization is a
+refusal rather than something to filter away quietly - a recipe cannot shrink the
+denominator by declaring fewer files or by naming a path the change set spells
+differently. Every authoritative path is passed through the transport report, so
+its coverage fraction is the real one. A path may be declared as carrying no
+right-hand content only when its authoritative change kind proves it (a deletion
+or an otherwise source-free change); anything else must arrive with sealed bytes.
+Declared change kinds are compared to the authoritative ones in both directions.
+
+Identity is bound in three independent parts, not one. The corpus index names the
+repository it was captured from as `organization/project/repositoryName`, and the
+recipe must agree with all three; the repository GUID is bound separately, from
+the captured identity payload. A recipe that binds only the GUID could present
+one repository's evidence under another organization and project, so binding it
+alone is not accepted. The captured identity must also carry the pull request,
+iteration, source, common and target commits, status, draft flag and repository
+id, and the **end-of-capture** identity - the only evidence that the pull request
+did not move *while* it was being read - is checked against every one of those it
+carries (accepting `lastMergeSourceCommit`/`lastMergeTargetCommit` as the names
+some captures use). An end identity that declares `matchesInitialCapture: false`,
+or that carries nothing checkable at all, is refused.
+
+Sealed right-hand bytes are bound to a **recorded read** of that exact path. A
+resource that names this repository and the source commit is held to the whole
+contract rather than the part of it that happened to be present: `action` must be
+`get_content`, `versionType` must be `Commit`, `project` must be the bound
+project, `organization` must match when the recorded tool carries it, and `path`
+must be the canonical repository path *itself*. Aliases are refused, not
+normalized, so `//src/a.cs`, `/src/./a.cs` and `\src\a.cs` do not bind to
+`/src/a.cs`. Two recorded source reads of one path are refused as well.
+
+Nothing is written into the published location until every check has passed. The
+seal is built into a staging replay root beside the target, loaded back through
+the production loader from staging, and only then moved into place; an existing
+snapshot being replaced with `-Force` is set aside first and restored if any step
+fails. Output paths are prevalidated as a set before any of them is created, so
+an artifact file cannot collide with the manifest, the sidecar, a payload, or an
+ancestor directory of one. A refusal is always a refusal to create rather than a
+half-written snapshot.
+
+The replay root is validated **in the library**, not only in the CLI, because a
+safety property one entry point enforces is a property the other entry point does
+not have. A root that is a reparse point, that resolves somewhere other than
+where it is named, or that lies lexically or really inside the toolkit working
+tree is refused outright. PowerShell cannot hold a directory handle across a
+rename, so the defence is to check at every moment that matters rather than once:
+the root, the staging root, every payload parent, the artifact parent, the
+sidecar and manifest parents, and the publication source and target are each
+re-checked for reparse points and boundary containment immediately before they
+are written through or moved. Cleanup - the one path that runs even when
+everything else failed - never recurses through a reparse point; a link is
+unlinked and only real directories are descended into.
+
+### Source transport, offline
+
+The sealed source-transport artifact is either **adopted** from one the capture
+recorded - held to exactly the standard `Import-ReviewerSourceTransportReplayArtifact`
+applies, which re-derives the coverage record, gate and block from the report and
+refuses any divergence - or **derived** from the corpus by running the reviewer's
+own report, gate and block renderer over the captured right-hand bytes with a
+reader that can only return indexed corpus payloads.
+
+Derivation is not invention, but it is not capture either. The block nonce is
+declared in the recipe rather than generated, because a seal must be reproducible
+byte for byte; it is a boundary marker, not a secret, and the live path still
+generates a fresh one per run.
+
+The policy the report derives under has exactly two admissible origins, and the
+recipe must name exactly one of them:
+
+- `corpusPath` - the policy the capture itself recorded, as an indexed corpus
+  payload. Preferred, because then the seal is a function of indexed bytes alone.
+- `toolkitPath` - a versioned policy file in the toolkit, for the ordinary case
+  of a capture that recorded no policy document. It is not a live seam: no MCP
+  session, repository host, `az` invocation or child process is involved, just a
+  hash-pinned read of a file already under version control. It is nonetheless
+  fenced hard, because a mutable file is the weakest input a seal has. The path
+  must lie under `src/Agents/reviewer/source/`, must resolve to a real path still
+  inside that tree with a reparse point anywhere along it refused, and the recipe
+  must pin both its SHA-256 and its byte length - which are verified against the
+  bytes actually read and against `hashes.policySha256`. Any divergence refuses
+  the seal.
+
+Which route was taken is recorded, not inferred: the classification sidecar
+carries `sourceTransport.policyProvenance` of `corpus` or `toolkitSealTime` and
+the reference it resolved. `toolkitSealTime` says exactly what it means - this
+byte-for-byte reproducibility holds against *that* policy revision, and a reader
+who wants to know which one can compare `policySha256`.
+
+### Right-hand content and spans are derived, not declared
+
+Two independent bindings decide what a sealed file shows and where it points, and
+neither of them trusts the recipe.
+
+The **bytes**: for every sealed path there must be exactly one recorded read in
+the recipe's own resource list whose arguments name this repository, this path
+and the bound source commit - and that read's corpus payload must be byte
+identical to the sealed right-hand payload. A recipe cannot present one file's
+content under another file's name, or last week's content under this iteration's
+commit, because the correspondence is recomputed from the read arguments rather
+than taken from a declaration. Two reads of the same path at the source commit
+are refused: a snapshot must answer that read one way.
+
+The **spans**: `changeSet.spanEvidence` names an indexed hunk census, and the
+right-hand span of a hunk is exactly `(newStart, newCount)`. A hunk with
+`newCount = 0` removed lines and contributes no span, which is how a pure
+deletion legitimately ends up with none. The recipe restates its spans and they
+are compared index by index against the derived ones; any divergence refuses.
+Evidence describing a path the change set does not carry is refused, as is a
+content-bearing path the evidence describes no hunks for - so a span census from
+one pull request cannot be spliced onto another's file list, and a recipe cannot
+widen or shift a span to pull unchanged code into the reviewer's window.
+
+### What a seal is not
+
+Every seal is permanently non-promotable, and the loader is what enforces it. The
+manifest of a schema-v2 seal carries a `classification` block naming the seal
+kind, `nonPromotable: true`, and the sidecar's path and SHA-256; the manifest
+digest covers that block, so the classification cannot be edited away, and the
+sidecar cannot be deleted or altered without failing the load outright. The
+binding runs manifest -> sidecar only, since a sidecar that also pinned the
+manifest digest would be a hash cycle nobody could compute. A classification may
+only ever *withdraw* promotability: `nonPromotable: false` is refused, so the
+block is not a channel for granting anything. `New-AgentReplaySnapshot` returns
+the classification, and `Assert-AgentReplaySnapshotPromotable` is the one gate
+every promotable flow calls - it throws rather than returning a boolean, because
+a caller that has to remember to check an answer is a caller that can forget to.
+Schema-v1 snapshots are unaffected; a v1 manifest carrying a classification is
+refused, an unclassified snapshot classifies as `standard` and stays promotable,
+and an absent block contributes nothing to the digest, so existing digests do not
+move.
+
+The snapshot id must also contain `offlinecorpusseal`, because the name is the
+one label that travels with the snapshot everywhere it is copied, quoted or
+logged, and `tools/Save-AgentReplaySnapshot.ps1` refuses both that name and any
+directory whose manifest is already classified. Alongside the manifest the tool
+writes `offline-corpus-seal.json`, recording `sealKind: offlineCorpusSeal`,
+`nonPromotable: true`, a null promotion key domain, `liveSeamCount: 0`,
+`liveHostContacted: false`, the corpus binding, the capture provenance, the full
+source census, the transport digests and gate, and the evidence actually cited.
+
+It also records `livePostReadRaceCheck: "notPerformed"`, and the tool refuses a
+recipe that claims anything else. A seal built from a corpus performed no live
+read, so it cannot have re-checked the pull request after one; recording a race
+check would be the artifact asserting a guarantee it never obtained. Practically:
+a corpus seal is evidence about how the reviewer behaves on captured material. It
+can never be the basis for publishing to a live pull request.
+
+`tools/Test-CorpusReplaySeal.ps1` builds a synthetic corpus in a sandbox and
+proves both halves - that two seals of one recipe are byte-identical and replay
+through the production loader unchanged, and that every rejection class above
+fails closed.
+
 ## Running a replay
 
 An offline qualification running from an app-created worktree should preflight

@@ -4194,6 +4194,30 @@ try {
     Assert-Replay ($liveRefusal -clike "*signature verification failed*") `
         "A live-run artifact sealed under the promotion key must be refused by the seal, not by an editable field."
 
+    # -- 14. Classification leaves schema-v1 snapshots alone ------------------
+    Write-Host "14/14 classification is a schema-v2 addition only" -ForegroundColor Cyan
+    $plainSnapshot = New-AgentReplaySnapshot -ReplayRoot $fixtureRoot -SnapshotName "synthetic-pr"
+    Assert-Replay (([string]$plainSnapshot.Classification.SealKind -ceq "standard") -and
+        -not [bool]$plainSnapshot.Classification.NonPromotable) `
+        "An ordinary schema-v1 snapshot must classify as a standard, promotable snapshot."
+    Assert-Replay (Assert-AgentReplaySnapshotPromotable -Snapshot $plainSnapshot) `
+        "An unclassified snapshot must remain promotable."
+    Assert-ReplayThrows { Assert-AgentReplaySnapshotPromotable -Snapshot @{ SnapshotId = "forged" } } `
+        "A hand-built object must not pass the promotability gate." -Match "produced by New-AgentReplaySnapshot"
+
+    $classifiedV1 = Copy-Fixture -Name "classified-v1"
+    $v1ManifestPath = Join-Path $classifiedV1 "synthetic-pr\manifest.json"
+    $v1Manifest = Get-Content -LiteralPath $v1ManifestPath -Raw | ConvertFrom-Json
+    $v1Manifest | Add-Member -NotePropertyName "classification" -NotePropertyValue ([pscustomobject]@{
+            sealKind      = "offlineCorpusSeal"
+            nonPromotable = $true
+            sidecarFile   = "non-promotable.json"
+            sidecarSha256 = ("0" * 64)
+        }) -Force
+    Set-Content -LiteralPath $v1ManifestPath -Value ($v1Manifest | ConvertTo-Json -Depth 32) -Encoding utf8NoBOM
+    Assert-ReplayThrows { New-AgentReplaySnapshot -ReplayRoot $classifiedV1 -SnapshotName "synthetic-pr" } `
+        "A schema-v1 manifest must not be allowed to carry a classification." -Match "schema-v2 field"
+
     $script:ReviewerReplayActive = $false
 }
 finally {

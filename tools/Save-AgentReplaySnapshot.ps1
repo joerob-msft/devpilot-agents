@@ -73,6 +73,24 @@ function Get-Sha256Hex {
 
 $snapshotFull = [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $SnapshotPath).Path)
 $snapshotName = Split-Path $snapshotFull -Leaf
+# This sealer produces ORDINARY, promotable snapshots. It has no way to compute
+# a classification, so sealing over a directory that already carries one - or
+# claiming a name reserved for offline corpus seals - would strip the label off
+# a non-promotable artifact and hand it back as promotable.
+$existingManifest = Join-Path $snapshotFull "manifest.json"
+if (Test-Path -LiteralPath $existingManifest -PathType Leaf) {
+    $existing = $null
+    try { $existing = (Get-Content -LiteralPath $existingManifest -Raw) | ConvertFrom-Json -ErrorAction Stop }
+    catch { $existing = $null }
+    if ($existing -is [System.Management.Automation.PSCustomObject] -and $existing.PSObject.Properties["classification"]) {
+        throw ("Snapshot '$snapshotName' is classified non-promotable; this sealer only produces ordinary promotable " +
+            "snapshots and will not reseal one without its classification. Use tools/Save-CorpusReplaySeal.ps1.")
+    }
+}
+if ($snapshotName -match 'offlinecorpusseal') {
+    throw ("Snapshot name '$snapshotName' is reserved for offline corpus seals, which only " +
+        "tools/Save-CorpusReplaySeal.ps1 may produce.")
+}
 $records = @(Get-Content -LiteralPath $Recipe -Raw | ConvertFrom-Json)
 if ($records.Count -lt 1) { throw "Recipe '$Recipe' declares no resources." }
 
