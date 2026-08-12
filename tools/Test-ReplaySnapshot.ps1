@@ -1671,8 +1671,8 @@ try {
     Assert-Replay ($readerRange.Success) "The fact-source reader's byte range must be findable."
     Assert-Replay ([int]$verifierBound.Groups[1].Value -le [int]$readerRange.Groups[1].Value) `
         "The verifier's read bound ($($verifierBound.Groups[1].Value)) must be within what the reader accepts ($($readerRange.Groups[1].Value)), or every hunk fails instead of one."
-    Assert-Replay ($hunkFunction.Value -match '\$line - 3' -and $hunkFunction.Value -match '\$line \+ 3') `
-        "Raising the read bound must not widen what a model is shown: the hunk stays seven lines."
+    Assert-Replay ($hunkFunction.Value -match '\$AnchorLine - 3' -and $hunkFunction.Value -match '\$AnchorLine \+ 3') `
+        "Raising the read bound must not widen what a model is shown: the anchor hunk stays seven lines."
 
     # Enumeration runs on the mandatory path of every review, before any model.
     # It once rebuilt a delivered-line set on every line of every file, three

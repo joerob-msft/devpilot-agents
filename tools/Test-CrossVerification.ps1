@@ -2464,22 +2464,34 @@ $crossFileHunks = @(Get-ReviewerVerificationSourceHunks -AgencyPath "unused" `
 $crossFileKeys = @($crossFileHunks | ForEach-Object {
         [string]$_.filePath + ":" + [string]$_.line + ":" + [string]$_.role
     } | Sort-Object)
-Assert-Verification ($crossFileHunks.Count -eq 3 -and
+Assert-Verification ($crossFileHunks.Count -eq 4 -and
     @($crossFileHunks | Where-Object { [string]$_.sourceKind -cne "sealedSourceSlice" }).Count -eq 0) `
-    "A cross-file convention candidate did not render one sealed slice per anchor and manifestation line."
+    "A cross-file convention candidate did not render one sealed slice per anchor and manifestation line plus its enclosing context."
 Assert-Verification (($crossFileKeys -join "|") -ceq
-    "/src/model.json:187:manifestation|/src/model.json:210:anchor|/src/rolloutspec.json:52:manifestation") `
+    ("/src/model.json:187:manifestation|/src/model.json:210:anchor|" +
+        "/src/model.json:210:context|/src/rolloutspec.json:52:manifestation")) `
     "Cross-file manifestation hunks did not cover the exact anchor plus manifestation lines with the anchor deduplicated."
+# The convention candidate's required "Global." prefix is governed by a nearby
+# changed line (187) that is neither the anchor nor a legal manifestation. The
+# enclosing sealed changed-right-hand context hunk must deliver that governing
+# line to the verifier so it can independently confirm the mandate.
+$crossFileContextHunk = @($crossFileHunks | Where-Object { [string]$_.role -ceq "context" })
+Assert-Verification ($crossFileContextHunk.Count -eq 1 -and
+    [int]$crossFileContextHunk[0].startLine -le 187 -and
+    [int]$crossFileContextHunk[0].endLine -ge 210 -and
+    ([string]$crossFileContextHunk[0].text).Contains("model line 187") -and
+    ([string]$crossFileContextHunk[0].text).Contains("model line 210")) `
+    "The convention context hunk did not deliver the governing changed line (187) alongside the anchor (210)."
 $crossFileHunkShas = @($crossFileHunks | ForEach-Object { [string]$_.sha256 } | Sort-Object -Unique)
-Assert-Verification ($crossFileHunkShas.Count -eq 3) `
+Assert-Verification ($crossFileHunkShas.Count -eq 4) `
     "Cross-file manifestation hunks must each carry a distinct sealed evidence hash."
 $crossFileOptions = @(Get-ReviewerVerificationEvidenceOptions -Candidate $crossFileCandidate `
         -FactPlan $null -ThreadFacts @() -EvidenceHunks $crossFileHunks)
 $crossFileDiffHunkOptions = @($crossFileOptions | Where-Object {
         [string]$_.purpose -ceq "candidate" -and [string]$_.kind -ceq "diffHunk"
     })
-Assert-Verification ($crossFileDiffHunkOptions.Count -eq 3 -and
-    @($crossFileDiffHunkOptions | ForEach-Object { [string]$_.sha256 } | Sort-Object -Unique).Count -eq 3) `
+Assert-Verification ($crossFileDiffHunkOptions.Count -eq 4 -and
+    @($crossFileDiffHunkOptions | ForEach-Object { [string]$_.sha256 } | Sort-Object -Unique).Count -eq 4) `
     "Every sealed cross-file manifestation hunk must be an independently bindable diffHunk evidence option."
 $crossPassText = Get-VerificationFunctionText -Text $wrapperText `
     -Name "Invoke-ReviewerCrossVerificationPass"

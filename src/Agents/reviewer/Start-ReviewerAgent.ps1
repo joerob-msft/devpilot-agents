@@ -10179,19 +10179,45 @@ function Get-ReviewerVerificationSourceHunks {
         # sealed changed-right-hand slice. Dedupe keeps a manifestation that
         # coincides with the anchor from being rendered twice.
         $emittedHunkKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        # A convention candidate's required form is often set by a nearby changed
+        # line that is NOT itself a violation target (for example a subscriptionKey
+        # binding that mandates a "Global." prefix on a definition several lines
+        # below). Such a governing line is neither the anchor nor a legal
+        # manifestation, so the anchor/manifestation +-3 windows never surface it.
+        # For convention candidates the verifier therefore also receives one bounded
+        # "context" hunk spanning the sealed changed-right-hand range that encloses
+        # the anchor, capped to keep evidence bounded. Every rendered line stays
+        # sealed changed-right-hand evidence; nothing unsealed is ever added.
+        $maxContextSpan = 120
         function Add-ReviewerVerificationSourceHunk {
             param(
                 [string]$CandidateId,
                 [AllowEmptyString()][string]$RawPath,
                 [int]$AnchorLine,
-                [string]$Role
+                [string]$Role,
+                [int]$SpanStart = 0,
+                [int]$SpanEnd = 0
             )
             if (-not $CandidateId -or -not $RawPath -or $AnchorLine -lt 1) { return }
             $normalizedPath = ConvertTo-ReviewerVerificationPath -Path $RawPath
             if (-not $normalizedPath -or -not $changed.ContainsKey($normalizedPath)) { return }
             $path = $changed[$normalizedPath]
+            if ($SpanStart -ge 1 -and $SpanEnd -ge $SpanStart) {
+                $reqStart = $SpanStart
+                $reqEnd = $SpanEnd
+                if (($reqEnd - $reqStart + 1) -gt $maxContextSpan) {
+                    $half = [int]($maxContextSpan / 2)
+                    $reqStart = [Math]::Max($SpanStart, $AnchorLine - $half)
+                    $reqEnd = [Math]::Min($SpanEnd, $reqStart + $maxContextSpan - 1)
+                }
+            }
+            else {
+                $reqStart = $AnchorLine - 3
+                $reqEnd = $AnchorLine + 3
+            }
             $dedupeKey = $CandidateId + "|" + $normalizedPath + "|" +
-                [Convert]::ToString($AnchorLine, [Globalization.CultureInfo]::InvariantCulture)
+                [Convert]::ToString($reqStart, [Globalization.CultureInfo]::InvariantCulture) + "|" +
+                [Convert]::ToString($reqEnd, [Globalization.CultureInfo]::InvariantCulture)
             if (-not $emittedHunkKeys.Add($dedupeKey)) { return }
             if ($sealedFiles.ContainsKey($normalizedPath)) {
                 $line = [int]$AnchorLine
@@ -10213,8 +10239,9 @@ function Get-ReviewerVerificationSourceHunks {
                         $sliceLines.Count -ne ($sliceEnd - $sliceStart + 1)) {
                         throw "Sealed source report contains malformed slice line accounting for '$path'."
                     }
-                    $start = [Math]::Max($sliceStart, $line - 3)
-                    $end = [Math]::Min($sliceEnd, $line + 3)
+                    $start = [Math]::Max($sliceStart, $reqStart)
+                    $end = [Math]::Min($sliceEnd, $reqEnd)
+                    if ($end -lt $start) { return }
                     $rendered = [System.Collections.Generic.List[string]]::new()
                     for ($index = $start; $index -le $end; $index++) {
                         [void]$rendered.Add((
@@ -10247,8 +10274,9 @@ function Get-ReviewerVerificationSourceHunks {
                 $lines = @($content.Replace("`r`n", "`n").Replace("`r", "`n") -split "`n")
                 $line = [int]$AnchorLine
                 if ($line -gt $lines.Count) { return }
-                $start = [Math]::Max(1, $line - 3)
-                $end = [Math]::Min($lines.Count, $line + 3)
+                $start = [Math]::Max(1, $reqStart)
+                $end = [Math]::Min($lines.Count, $reqEnd)
+                if ($end -lt $start) { return }
                 $rendered = [System.Collections.Generic.List[string]]::new()
                 for ($index = $start; $index -le $end; $index++) {
                     [void]$rendered.Add((
@@ -10294,6 +10322,25 @@ function Get-ReviewerVerificationSourceHunks {
                         if ([string]$target.kind -cne "changedLine") { continue }
                         Add-ReviewerVerificationSourceHunk -CandidateId $candidateId `
                             -RawPath ([string]$target.path) -AnchorLine ([int]$target.line) -Role "manifestation"
+                    }
+                }
+            }
+            $isConvention = (([string](Get-ReviewerVerificationValue $candidate "originKind" "") -ceq "convention") -or
+                [bool](Get-ReviewerVerificationValue $candidate "conventionBound" $false))
+            if ($isConvention -and @($ChangedFileAnchors).Count -gt 0) {
+                $candidateNormalizedPath = ConvertTo-ReviewerVerificationPath -Path ([string]$candidate.filePath)
+                foreach ($anchor in @($ChangedFileAnchors)) {
+                    $anchorNormalizedPath = ConvertTo-ReviewerVerificationPath -Path (
+                        [string](Get-ReviewerVerificationValue $anchor "path" ""))
+                    if (-not $anchorNormalizedPath -or $anchorNormalizedPath -cne $candidateNormalizedPath) { continue }
+                    foreach ($range in @(Get-ReviewerVerificationValue $anchor "rightHandRanges" @())) {
+                        $rangeStart = [int](Get-ReviewerVerificationValue $range "startLine" 0)
+                        $rangeEnd = [int](Get-ReviewerVerificationValue $range "endLine" 0)
+                        if ($rangeStart -lt 1 -or $rangeEnd -lt $rangeStart) { continue }
+                        if ([int]$candidate.line -lt $rangeStart -or [int]$candidate.line -gt $rangeEnd) { continue }
+                        Add-ReviewerVerificationSourceHunk -CandidateId $candidateId `
+                            -RawPath ([string]$candidate.filePath) -AnchorLine ([int]$candidate.line) `
+                            -Role "context" -SpanStart $rangeStart -SpanEnd $rangeEnd
                     }
                 }
             }
