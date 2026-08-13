@@ -165,6 +165,28 @@ try {
     Assert-ReplayThrows { New-AgentReplaySnapshot -ReplayRoot $rebound -SnapshotName "synthetic-pr" } `
         "A binding edited after capture must break the manifest digest." -Match "manifest and its payloads disagree"
 
+    # A malformed sealed reviewed-target commit is startup-fatal: the loader
+    # validates binding.targetCommit against the lowercase 40-hex shape while
+    # reading the manifest, long before any planner could consume it. This is
+    # why offline convention planning can trust the sealed target verbatim - a
+    # malformed one never loads, so it can never reach candidate discovery.
+    $badTarget = Copy-Fixture -Name "bad-target"
+    $badTargetManifestPath = Join-Path $badTarget "synthetic-pr\manifest.json"
+    $badTargetManifest = [IO.File]::ReadAllText($badTargetManifestPath, $utf8) | ConvertFrom-Json
+    $badTargetManifest.binding.targetCommit = "g" * 40
+    [IO.File]::WriteAllBytes($badTargetManifestPath, $utf8.GetBytes(($badTargetManifest | ConvertTo-Json -Depth 20)))
+    Assert-ReplayThrows { New-AgentReplaySnapshot -ReplayRoot $badTarget -SnapshotName "synthetic-pr" } `
+        "A non-hex sealed target commit must be rejected at load, not passed to a planner." `
+        -Match "targetCommit' does not match its required shape"
+    $upperTarget = Copy-Fixture -Name "upper-target"
+    $upperTargetManifestPath = Join-Path $upperTarget "synthetic-pr\manifest.json"
+    $upperTargetManifest = [IO.File]::ReadAllText($upperTargetManifestPath, $utf8) | ConvertFrom-Json
+    $upperTargetManifest.binding.targetCommit = "A" * 40
+    [IO.File]::WriteAllBytes($upperTargetManifestPath, $utf8.GetBytes(($upperTargetManifest | ConvertTo-Json -Depth 20)))
+    Assert-ReplayThrows { New-AgentReplaySnapshot -ReplayRoot $upperTarget -SnapshotName "synthetic-pr" } `
+        "An uppercase (non-lowercase-hex) sealed target commit must be rejected at load." `
+        -Match "targetCommit' does not match its required shape"
+
     $missing = Copy-Fixture -Name "missing"
     Remove-Item (Join-Path $missing "synthetic-pr\payloads\branch-main.json") -Force
     Assert-ReplayThrows { New-AgentReplaySnapshot -ReplayRoot $missing -SnapshotName "synthetic-pr" } `

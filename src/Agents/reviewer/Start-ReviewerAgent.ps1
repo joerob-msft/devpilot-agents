@@ -3674,7 +3674,11 @@ function Test-ReviewerReplayConventionReadRecorded {
         [Parameter(Mandatory)][hashtable]$Arguments
     )
     if (-not $script:ReviewerReplayActive) { return $true }
-    if (-not $Session.ContainsKey("Replay") -or $null -eq $Session["Replay"]) { return $true }
+    # Replay is active but this session carries no sealed snapshot. That is an
+    # inconsistent wiring state, not a licence to issue a live read: fail closed
+    # so the source is withheld (candidate-level convention degrade) rather than
+    # risk falling through to the forbidden live transport.
+    if (-not $Session.ContainsKey("Replay") -or $null -eq $Session["Replay"]) { return $false }
     return (Test-AgentReplaySnapshotHasResponse -Snapshot $Session["Replay"] -Name $Name -Arguments $Arguments)
 }
 
@@ -11026,16 +11030,20 @@ function Invoke-ReviewerCrossVerificationPass {
     $replay = Invoke-ReviewerVerificationReplay -InputManifest $inputManifest `
         -VerifierRuns $runRecords.ToArray()
     $replay = Limit-ReviewerVerificationToPhaseDeadline -Replay $replay -DeadlineState $phaseDeadlineState
-    $status = if (@($runRecords | Where-Object { $_.status -cne "complete" }).Count -eq 0) {
-        "complete"
-    }
-    else {
-        "degraded"
-    }
-    # A degraded specialist means convention coverage was incomplete even when
-    # every generalist verifier run completed, so the pass is reported degraded
-    # (its eligible generalist findings are still exposed - see the union above).
-    if ($specialistDegraded) { $status = "degraded" }
+    $allVerifierRunsComplete = (@($runRecords | Where-Object { $_.status -cne "complete" }).Count -eq 0)
+    # Partial convention-evidence degradation - a sealed authoritative source the
+    # offline replay could not answer, withheld candidate-by-candidate while the
+    # specialist still stood behind the packs it did receive - must not be
+    # reported as a complete review, otherwise unavailable convention evidence is
+    # silently treated as success. Fold all three coverage signals (every
+    # verifier run complete, specialist not degraded, convention plan not
+    # degraded) through one pure decision. A degraded result still exposes the
+    # eligible blind-generalist findings via the sealed union above.
+    $conventionEvidenceDegraded = [bool](Get-ReviewerVerificationValue $conventionPlan "evidenceDegraded" $false)
+    $status = Get-ReviewerVerificationConventionCoverageStatus `
+        -AllVerifierRunsComplete $allVerifierRunsComplete `
+        -SpecialistDegraded $specialistDegraded `
+        -ConventionEvidenceDegraded $conventionEvidenceDegraded
     $reconciliationManifest = $null
     if ($specialistManifest) {
         $reconciliationManifest = Copy-ReviewerVerificationJsonValue -Value $specialistManifest

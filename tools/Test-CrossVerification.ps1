@@ -560,6 +560,27 @@ Assert-Verification (@($originUnionAssignments | Where-Object { [string]$_.verif
     @($originUnionAssignments | Where-Object { [string]$_.verifierModel -ceq "gpt-5.6-sol" }).Count -eq 3) `
     "The named convention verifier reduced the reciprocal pair instead of leaving both cross-checks intact."
 
+# Phase 2b (review fix): the pass status decision must fold three independent
+# coverage signals so a PARTIAL convention-evidence degradation (some packs
+# resolved, some withheld because the sealed replay could not answer them) is
+# never reported as a complete review, while a fully-covered pass still reads
+# complete. Get-ReviewerVerificationConventionCoverageStatus is the pure gate.
+Assert-Verification ((Get-ReviewerVerificationConventionCoverageStatus `
+            -AllVerifierRunsComplete $true -SpecialistDegraded $false -ConventionEvidenceDegraded $false) -ceq "complete") `
+    "A fully-covered pass (all runs complete, specialist not degraded, evidence complete) was not reported complete."
+Assert-Verification ((Get-ReviewerVerificationConventionCoverageStatus `
+            -AllVerifierRunsComplete $true -SpecialistDegraded $false -ConventionEvidenceDegraded $true) -ceq "degraded") `
+    "A partial convention-evidence degradation was silently reported complete instead of degraded."
+Assert-Verification ((Get-ReviewerVerificationConventionCoverageStatus `
+            -AllVerifierRunsComplete $true -SpecialistDegraded $true -ConventionEvidenceDegraded $false) -ceq "degraded") `
+    "A degraded specialist did not force the pass status to degraded."
+Assert-Verification ((Get-ReviewerVerificationConventionCoverageStatus `
+            -AllVerifierRunsComplete $false -SpecialistDegraded $false -ConventionEvidenceDegraded $false) -ceq "degraded") `
+    "An incomplete verifier run set did not force the pass status to degraded."
+Assert-Verification ((Get-ReviewerVerificationConventionCoverageStatus `
+            -AllVerifierRunsComplete $false -SpecialistDegraded $true -ConventionEvidenceDegraded $true) -ceq "degraded") `
+    "Combined incomplete signals did not report degraded."
+
 # Generalist-origin convention findings are deterministically bound to the exact
 # sealed rule and changed-file range before either verifier sees them.
 $localizationSection = "### Use localized strings in exceptions and web action methods"
