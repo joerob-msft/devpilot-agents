@@ -172,69 +172,10 @@ elseif ($Mode -ceq "RunSlot") {
     }
 }
 
-function Get-VerifiedRunSetDeclaration {
-    <#
-        Reads the single sealed run-set declaration under a qualification root and
-        verifies it under the run-set signing key BEFORE anything in it is
-        believed. An envelope parsed as text is a file anybody could have written;
-        a signature check is the only thing that makes it a declaration. Returns
-        the verified declaration object and its path, and refuses a declaration
-        that names a different snapshot, run count, or plan than this one.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$RunSetDirectory,
-        [Parameter(Mandatory)][string]$CompareTool,
-        [Parameter(Mandatory)][string]$RunSetKeyPath,
-        [Parameter(Mandatory)]$Plan,
-        [string]$ExpectedPlanDigest = ""
-    )
-    $declarationPaths = @()
-    if (Test-Path -LiteralPath $RunSetDirectory -PathType Container) {
-        $declarationPaths = @(Get-ChildItem -LiteralPath $RunSetDirectory -Filter "runset-*.json" -File `
-                -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike "*.sig" } |
-                ForEach-Object { $_.FullName })
-    }
-    if ($declarationPaths.Count -ne 1) {
-        throw ("Expected exactly one sealed run-set declaration under '$RunSetDirectory'; " +
-            "found $($declarationPaths.Count). Declare the set first (-Mode Declare).")
-    }
-    $verifiedOutput = & $CompareTool -VerifyRunSet -RunSetPath $declarationPaths[0] -KeyPath $RunSetKeyPath
-    $verifiedJson = @(@($verifiedOutput) |
-            Where-Object { $_ -is [string] -and $_.TrimStart().StartsWith("{") } |
-            Select-Object -Last 1)
-    if (@($verifiedJson).Count -ne 1) {
-        throw "Verification of '$($declarationPaths[0])' returned no manifest; the declaration did not verify under '$RunSetKeyPath'."
-    }
-    $declaration = [string]$verifiedJson[0] | ConvertFrom-Json
-    if ([string]$declaration.snapshotName -cne [string]$Plan.Snapshot.Name -or
-        [string]$declaration.snapshotManifestDigest -cne [string]$Plan.Snapshot.ManifestDigest) {
-        throw ("The sealed declaration names snapshot '$($declaration.snapshotName)' at digest " +
-            "$($declaration.snapshotManifestDigest); this plan replays '$($Plan.Snapshot.Name)' at " +
-            "$($Plan.Snapshot.ManifestDigest). A slot never runs against a declaration it does not match.")
-    }
-    if ([int]$declaration.plannedRunCount -ne [int]$Plan.SlotCount) {
-        throw ("The sealed declaration plans $([int]$declaration.plannedRunCount) run(s) and this plan has " +
-            "$($Plan.SlotCount) slot(s).")
-    }
-    # The declaration was sealed FOR a plan, not merely for a snapshot. Same
-    # snapshot, different models - or a different reviewed repository, or a
-    # different agent build - is a different qualification wearing this one's
-    # seal. A slot re-runs the plan, so it presents the exact digest to match
-    # (the token-sealed one); reconciliation only reads finished terminals, so it
-    # binds them to the declaration's own authentic digest instead of recomputing
-    # one it would need the launch token to reproduce.
-    $declaredPlanDigest = ""
-    if ($declaration.PSObject.Properties["planDigest"]) { $declaredPlanDigest = [string]$declaration.planDigest }
-    if (-not $declaredPlanDigest) {
-        throw ("The sealed declaration $($declaration.setId) carries no plan digest, so it cannot say which commands " +
-            "it authorized. Declare a new set with this build of the tool.")
-    }
-    if ($ExpectedPlanDigest -and $declaredPlanDigest -cne $ExpectedPlanDigest) {
-        throw ("The sealed declaration $($declaration.setId) was made for plan $declaredPlanDigest and this plan " +
-            "hashes to $ExpectedPlanDigest. Every slot of a set runs the plan that was declared.")
-    }
-    return [pscustomobject]@{ Declaration = $declaration; Path = $declarationPaths[0] }
-}
+# Get-VerifiedRunSetDeclaration is the SHARED declaration verifier defined in
+# ReplayQualification.ps1 (dot-sourced above). The coordinator and the status
+# reader both call that one copy so neither can accept a declaration the other
+# would reject.
 
 $plan = New-ReviewerReplayQualificationPlan -RepoPath $RepoPath -ConfigFile $ConfigFile `
     -OperatorAlias $OperatorAlias -PullRequestId $PullRequestId `
@@ -271,12 +212,13 @@ if ($Mode -ceq "Reconcile") {
     if (-not (Test-Path -LiteralPath $reconcileCompareTool -PathType Leaf)) {
         throw "Run-set tool '$reconcileCompareTool' does not exist."
     }
-    $reconcileVerified = Get-VerifiedRunSetDeclaration -RunSetDirectory $plan.RunSetDirectory `
-        -CompareTool $reconcileCompareTool -RunSetKeyPath $reconcileKeyPath -Plan $plan
-    $reconcileSetId = [string]$reconcileVerified.Declaration.setId
-    $reconcileDeclaredDigest = [string]$reconcileVerified.Declaration.planDigest
-    $reconciledSlots = Assert-ReviewerQualificationReconciliationReady -Plan $plan `
-        -ExpectedSetId $reconcileSetId -ExpectedPlanDigest $reconcileDeclaredDigest
+    # The single shared readiness gate. Status calls this same function over the
+    # same reconstructed plan, so the two can never positively disagree.
+    $reconciled = Assert-ReviewerQualificationSetReconcilable -Plan $plan `
+        -CompareTool $reconcileCompareTool -RunSetKeyPath $reconcileKeyPath
+    $reconcileSetId = [string]$reconciled.Declaration.setId
+    $reconcileDeclaredDigest = [string]$reconciled.Declaration.planDigest
+    $reconciledSlots = @($reconciled.Slots)
     $reconciliation = [pscustomobject][ordered]@{
         kind              = "reviewer.replay-qualification.reconciliation-ready.v1"
         generatedAtUtc    = [DateTime]::UtcNow.ToString("o")

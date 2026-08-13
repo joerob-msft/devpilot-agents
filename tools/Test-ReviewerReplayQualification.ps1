@@ -910,18 +910,34 @@ exit 0
         [bool]$statusObject[0].signatureUnverified -and
         -not [bool]$statusObject[0].reconciliationReady) `
         "The status command did not report evidence-complete-but-signature-unverified without a run-set key."
-    # With the run-set key it applies the SAME verifier the gate uses, so a
-    # positive reconciliationReady is only ever reported for a verified set - and
-    # matches what Reconcile independently accepted for the same inputs.
-    $statusVerified = @(& $statusTool -QualificationRoot $orderRoot -RunSetKeyPath $keyPath |
+    # With the run-set key AND the full plan inputs (parity mode), status
+    # reconstructs the exact same authenticated plan Reconcile builds and runs the
+    # ONE shared readiness gate, so a positive reconciliationReady is exactly the
+    # Reconcile verdict for the same inputs - the two can never positively disagree.
+    $statusVerified = @(& $statusTool @orderArguments -RunSetKeyPath $keyPath |
             Where-Object { $_ -is [pscustomobject] -and $_.kind })
     Assert-Qualification (@($statusVerified).Count -eq 1 -and
+        [bool]$statusVerified[0].parityMode -and
         [bool]$statusVerified[0].evidenceComplete -and
         -not [bool]$statusVerified[0].signatureUnverified -and
+        -not [bool]$statusVerified[0].declarationCorrupt -and
         [bool]$statusVerified[0].reconciliationReady -and
         [bool]$statusVerified[0].declaration.signatureVerified -and
         [bool]$statusVerified[0].declaration.countValid) `
-        "The status command did not confirm reconciliation ready against a verified declaration with a run-set key."
+        "The status command did not confirm reconciliation ready against a verified declaration in parity mode."
+    # Parity is exact: the SAME @orderArguments made Reconcile accept this set
+    # above (reviewer.replay-qualification.reconciliation-ready.v1), and status
+    # reports reconciliationReady for those same inputs - they cannot disagree.
+    # A wrong SlotCount is an explicit plan mismatch: status must withhold
+    # readiness with a reason, exactly as Reconcile would reject it.
+    $statusWrongCount = @(& $statusTool @orderArguments -RunSetKeyPath $keyPath -SlotCount 3 |
+            Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (@($statusWrongCount).Count -eq 1 -and [bool]$statusWrongCount[0].parityMode -and
+        -not [bool]$statusWrongCount[0].reconciliationReady -and [string]$statusWrongCount[0].reconciliationReason) `
+        "The status command claimed readiness for a plan whose SlotCount does not match the sealed declaration."
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode Reconcile @orderArguments -RunSetKeyPath $keyPath -SlotCount 3
+    } "Reconcile accepted a set whose SlotCount status also rejected." "and this plan has"
     Assert-Qualification (-not (@($statusObject[0].slots | Where-Object { [bool]$_.recordedChildAlive }).Count)) `
         "The status command reported a completed slot's child as still alive."
     Assert-Qualification ([bool]$statusObject[0].declaration.launchTokenPresent) `
@@ -1101,14 +1117,38 @@ exit 0
         (Start-Job -ScriptBlock $raceScript -ArgumentList $sandboxTool, "Declare", $raceArguments, $keyPath, "race-a"),
         (Start-Job -ScriptBlock $raceScript -ArgumentList $sandboxTool, "Declare", $raceArguments, $keyPath, "race-b")
     )
-    $raceResults = @($raceJobs | Wait-Job -Timeout 120 | Receive-Job)
+    $raceCompleted = @($raceJobs | Wait-Job -Timeout 120)
+    Assert-Qualification (@($raceCompleted).Count -eq 2 -and
+        -not @($raceJobs | Where-Object { $_.State -eq 'Running' }).Count) `
+        "A concurrent publisher job did not complete within the deadline."
+    $raceResults = @($raceJobs | Receive-Job)
     $raceJobs | Remove-Job -Force -ErrorAction SilentlyContinue
+    # Every contender is accounted for: exactly one won (ok:0), exactly one lost,
+    # and the loser failed for the expected atomic-publication reason.
+    $raceOk = @($raceResults | Where-Object { [string]$_ -like "ok:0" })
+    $raceErr = @($raceResults | Where-Object { [string]$_ -like "err:*" })
+    Assert-Qualification (@($raceResults).Count -eq 2 -and @($raceOk).Count -eq 1 -and @($raceErr).Count -eq 1) `
+        "Concurrent publishers did not resolve to exactly one winner and one failed contender."
+    Assert-Qualification ([string]@($raceErr)[0] -match 'already|concurrent') `
+        "The losing concurrent publisher did not fail for the expected atomic-publication reason."
     $racePublished = @(Get-ChildItem -LiteralPath (Join-Path $raceRoot "runset") -Filter "runset-*.json" -File `
             -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike "*.sig" })
     $raceStagingLeft = @(Get-ChildItem -LiteralPath $raceRoot -Directory -Filter ".runset-staging-*" `
             -ErrorAction SilentlyContinue)
     Assert-Qualification (@($racePublished).Count -eq 1 -and @($raceStagingLeft).Count -eq 0) `
         "Concurrent publishers did not resolve to exactly one whole set with no staging residue."
+    # The winner's published set is whole: its declaration verifies under the key
+    # and its launch-authorization token is present, well-formed, and unique (no
+    # orphan token left in staging).
+    $raceCompareTool = Join-Path $toolkitCopy "tools\Compare-ReviewerReplayRuns.ps1"
+    $raceVerified = & $raceCompareTool -VerifyRunSet -RunSetPath $racePublished[0].FullName -KeyPath $keyPath
+    $raceVerifiedObj = @(@($raceVerified) |
+            Where-Object { $_ -is [string] -and $_.TrimStart().StartsWith("{") } | Select-Object -Last 1)
+    $raceToken = Join-Path $raceRoot "runset\launch-authorization.token"
+    Assert-Qualification (@($raceVerifiedObj).Count -eq 1 -and
+        (Test-Path -LiteralPath $raceToken -PathType Leaf) -and
+        (((Get-Content -LiteralPath $raceToken -Raw).Trim()) -match '^[0-9a-f]{64}$')) `
+        "The winning concurrent publisher did not leave a verifiable declaration bound to a whole, well-formed token."
 
     # Finding 2: status refuses to derive slots or claim any readiness from a
     # declaration whose plannedRunCount is outside the supported 2..16 range. A
@@ -1134,24 +1174,105 @@ exit 0
     Assert-Qualification ([bool]$goodCountStatus[0].declaration.countValid) `
         "Status rejected an in-range plannedRunCount as invalid."
 
-    # Finding 3: slot membership is case-exact. A 'Slot1' terminal is NEVER
-    # counted where the declared set expects 'slot1'; it is surfaced as an
-    # unexpected slot, matching Reconcile's case-sensitive slot binding.
+    # Finding 3/4: slot membership is case-exact, and Status and Reconcile use the
+    # SAME shared resolver, so they reject a case alias IDENTICALLY. The fixture is
+    # bound to its OWN set (a real slot1 run into caseRoot), then renamed so casing
+    # is the only changed variable: a physical 'Slot1-terminal.json' where the
+    # declared set expects 'slot1'. Neither reader may open it as 'slot1'.
     $caseRoot = Join-Path $sandbox "case-exact-root"
     $caseArguments = $planArguments.Clone()
     $caseArguments["QualificationRoot"] = $caseRoot
     $caseArguments["ReviewerScriptPath"] = $failingAgent
+    $caseArguments["OperatorAlias"] = "complete-test"
     & $sandboxTool -Mode Declare @caseArguments -RunSetKeyPath $keyPath -Purpose "case-exact slots" | Out-Null
-    New-Item -ItemType Directory -Force -Path (Join-Path $caseRoot "runs") | Out-Null
-    $caseTerminalPath = Join-Path $caseRoot "runs\Slot1-terminal.json"
-    Copy-Item -LiteralPath $authenticSlot1Path -Destination $caseTerminalPath -Force
-    Set-ItemProperty -LiteralPath $caseTerminalPath -Name IsReadOnly -Value $true
-    $caseStatus = @(& $statusTool -QualificationRoot $caseRoot -RunSetKeyPath $keyPath |
+    $caseTokenPath = Join-Path $caseRoot "runset\launch-authorization.token"
+    & $sandboxTool -Mode RunSlot @caseArguments -Slot "slot1" -RunSetKeyPath $keyPath `
+        -LaunchAuthorizationTokenPath $caseTokenPath 2>&1 | Out-Null
+    Assert-Qualification ($LASTEXITCODE -eq 0) "The case fixture's own slot1 did not complete."
+    # Rename slot1 -> Slot1 (casing the ONLY variable); the terminal stays bound to
+    # caseRoot's own declaration, so any rejection is due purely to the case alias.
+    # A single case-only Rename-Item is a no-op on a case-insensitive volume, so it
+    # is done in two steps (through a distinct interim name) to force the NTFS
+    # directory entry to physically carry the new casing. The file content (and
+    # thus its set/plan binding) is untouched.
+    $caseLower = Join-Path $caseRoot "runs\slot1-terminal.json"
+    $caseUpper = Join-Path $caseRoot "runs\Slot1-terminal.json"
+    Set-ItemProperty -LiteralPath $caseLower -Name IsReadOnly -Value $false
+    Rename-Item -LiteralPath $caseLower -NewName "slot1-terminal.json.caserename"
+    Rename-Item -LiteralPath (Join-Path $caseRoot "runs\slot1-terminal.json.caserename") -NewName "Slot1-terminal.json"
+    Set-ItemProperty -LiteralPath $caseUpper -Name IsReadOnly -Value $true
+    # Prove the physical entry is exactly 'Slot1-terminal.json' (case-sensitive).
+    $caseEntry = @(Get-ChildItem -LiteralPath (Join-Path $caseRoot "runs") -File -Filter "*-terminal.json" |
+            Where-Object { [string]::Equals($_.Name, "Slot1-terminal.json", [StringComparison]::Ordinal) })
+    Assert-Qualification (@($caseEntry).Count -eq 1) "The case fixture did not produce a physical 'Slot1-terminal.json' entry."
+    # Status (parity mode) and Reconcile receive the exact same authenticated
+    # inputs and reject identically: no case-exact 'slot1-terminal.json' exists.
+    $caseStatus = @(& $statusTool @caseArguments -RunSetKeyPath $keyPath |
             Where-Object { $_ -is [pscustomobject] -and $_.kind })
-    Assert-Qualification (@($caseStatus[0].unexpectedSlots) -ccontains "Slot1" -and
+    Assert-Qualification (@($caseStatus).Count -eq 1 -and [bool]$caseStatus[0].parityMode -and
+        @($caseStatus[0].unexpectedSlots) -ccontains "Slot1" -and
         -not [bool]$caseStatus[0].evidenceComplete -and
-        -not [bool]$caseStatus[0].reconciliationReady) `
+        -not [bool]$caseStatus[0].reconciliationReady -and
+        [string]$caseStatus[0].reconciliationReason -match "case-exact") `
         "Status counted a case-mismatched 'Slot1' terminal toward a 'slot1' declared set."
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode Reconcile @caseArguments -RunSetKeyPath $keyPath
+    } "Reconcile opened a case-mismatched 'Slot1' terminal as 'slot1'." "case-exact"
+
+    # -- 12e. Durability boundary: a corrupt/incomplete published set is classified
+    #         explicitly, never silently treated as a valid set. Directory.Move is
+    #         process/concurrency atomic, NOT a power-loss fsync barrier, so on
+    #         every read the declaration signature and the published inventory are
+    #         verified; a truncated declaration or a missing token fails closed in
+    #         BOTH Status (parity) and Reconcile. ------------------------------
+    Write-Host "12e/13 durability: corrupt/incomplete published set fails closed" -ForegroundColor Cyan
+
+    # (a) A tampered/truncated declaration no longer verifies under the key.
+    $corruptRoot = Join-Path $sandbox "corrupt-decl-root"
+    $corruptArguments = $planArguments.Clone()
+    $corruptArguments["QualificationRoot"] = $corruptRoot
+    $corruptArguments["ReviewerScriptPath"] = $failingAgent
+    $corruptArguments["OperatorAlias"] = "complete-test"
+    & $sandboxTool -Mode Declare @corruptArguments -RunSetKeyPath $keyPath -Purpose "durability corruption" | Out-Null
+    $corruptDeclFile = @(Get-ChildItem -LiteralPath (Join-Path $corruptRoot "runset") -Filter "runset-*.json" -File |
+            Where-Object { $_.Name -notlike "*.sig" })[0].FullName
+    Set-ItemProperty -LiteralPath $corruptDeclFile -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
+    $corruptEnvelope = Get-Content -LiteralPath $corruptDeclFile -Raw | ConvertFrom-Json
+    # Tamper the signed manifest WITHOUT breaking JSON: the HMAC over it no longer matches.
+    $corruptEnvelope.manifestJson = ([string]$corruptEnvelope.manifestJson) + " "
+    [IO.File]::WriteAllText($corruptDeclFile, (ConvertTo-Json -InputObject $corruptEnvelope -Depth 12 -Compress),
+        [Text.UTF8Encoding]::new($false))
+    $corruptStatus = @(& $statusTool @corruptArguments -RunSetKeyPath $keyPath |
+            Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (@($corruptStatus).Count -eq 1 -and [bool]$corruptStatus[0].parityMode -and
+        [bool]$corruptStatus[0].declarationCorrupt -and [bool]$corruptStatus[0].signatureUnverified -and
+        -not [bool]$corruptStatus[0].reconciliationReady -and [string]$corruptStatus[0].reconciliationReason) `
+        "Status did not classify a tampered/truncated published declaration as corrupt and not-ready."
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode Reconcile @corruptArguments -RunSetKeyPath $keyPath
+    } "Reconcile accepted a tampered/truncated published declaration." "signature verification failed"
+
+    # (b) A published set missing its launch-authorization token is an incomplete
+    #     inventory (a power-loss-style partial publish): corrupt, never launchable.
+    $missTokenRoot = Join-Path $sandbox "missing-token-root"
+    $missTokenArguments = $planArguments.Clone()
+    $missTokenArguments["QualificationRoot"] = $missTokenRoot
+    $missTokenArguments["ReviewerScriptPath"] = $failingAgent
+    $missTokenArguments["OperatorAlias"] = "complete-test"
+    & $sandboxTool -Mode Declare @missTokenArguments -RunSetKeyPath $keyPath -Purpose "missing token" | Out-Null
+    $missTokenPath = Join-Path $missTokenRoot "runset\launch-authorization.token"
+    Set-ItemProperty -LiteralPath $missTokenPath -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $missTokenPath -Force
+    $missTokenStatus = @(& $statusTool @missTokenArguments -RunSetKeyPath $keyPath |
+            Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (@($missTokenStatus).Count -eq 1 -and [bool]$missTokenStatus[0].parityMode -and
+        [bool]$missTokenStatus[0].declarationCorrupt -and
+        -not [bool]$missTokenStatus[0].reconciliationReady -and
+        [string]$missTokenStatus[0].reconciliationReason -match "launch-authorization") `
+        "Status did not classify a published set missing its launch token as corrupt and not-ready."
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode Reconcile @missTokenArguments -RunSetKeyPath $keyPath
+    } "Reconcile accepted a published set missing its launch-authorization token." "launch-authorization token"
 
     # -- 13. No fragile stdout consumer anywhere in the production path -------
     Write-Host "13/13 production execution path uses no Tee-Object" -ForegroundColor Cyan
