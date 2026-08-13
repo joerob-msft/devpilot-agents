@@ -1898,6 +1898,32 @@ try {
         ("Every Open-AgentMcpSession call must pass -ReplaySnapshot, or a replay reaches the network: " +
         (@(@($unguarded) | ForEach-Object { "line $($_.Extent.StartLineNumber)" }) -join ", "))
 
+    # The authoritative-source resolver degrades an unrecorded convention read at
+    # the SOURCE level in replay for BOTH of its callers - the convention pack
+    # path (-ConventionPackMode) and the generalist-context path
+    # (repoConventions.authoritativeSources, no switch). Coupling the degrade to
+    # -ConventionPackMode (as an earlier build did) let the non-pack path issue a
+    # live-shaped repo_repository/repo_branch/repo_file read the sealed snapshot
+    # cannot answer; that threw OUTSIDE the per-PR isolation and aborted the whole
+    # cycle, taking blind functional discovery down with a convention-evidence
+    # gap. Pin the decoupling so the regression cannot return.
+    $authSourceFn = $reviewerAst.FindAll({
+            param($c)
+            $c -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $c.Name -ceq "Get-ReviewerAuthoritativeSourceSnapshots"
+        }, $true) | Select-Object -First 1
+    Assert-Replay ($null -ne $authSourceFn) `
+        "The reviewer must define Get-ReviewerAuthoritativeSourceSnapshots."
+    $authSourceText = [string]$authSourceFn.Extent.Text
+    Assert-Replay ($authSourceText -cnotmatch '\$ConventionPackMode\s+-and\s+\$script:ReviewerReplayActive') `
+        "The replay convention-source degrade must NOT be gated on -ConventionPackMode; the generalist-context path must degrade candidate-level, never abort the cycle."
+    $replayProbeGuards = @([regex]::Matches($authSourceText, 'if \(\$script:ReviewerReplayActive\) \{'))
+    Assert-Replay (@($replayProbeGuards).Count -ge 2) `
+        ("Both authoritative-source replay probes (repo_repository/repo_branch and repo_file) must be gated on " +
+        "`$script:ReviewerReplayActive alone (found $(@($replayProbeGuards).Count)).")
+    Assert-Replay ($authSourceText -clike '*withholding it (candidate-level convention degrade)*') `
+        "An unrecorded authoritative source must be withheld (candidate-level convention degrade), never issue a live-shaped read in replay."
+
     . (Join-Path $RepoRoot "src\Agents\reviewer\SourceTransport.ps1")
     # The CLI fallback is a second, LIVE transport. In replay it must never be
     # taken, whatever the config says - taking it would resolve `az` on PATH,

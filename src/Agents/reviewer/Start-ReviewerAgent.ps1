@@ -3518,9 +3518,13 @@ function Get-ReviewerAuthoritativeSourceSnapshots {
         foreach ($source in $sources) {
             # Offline replay withholds a convention authoritative source that was
             # never captured, at candidate level, rather than issuing a read the
-            # sealed snapshot cannot answer. The probe issues no request; the
-            # matching live path is unchanged (issue-and-throw on a real fault).
-            if ($ConventionPackMode -and $script:ReviewerReplayActive) {
+            # sealed snapshot cannot answer. This applies to BOTH the convention
+            # pack path and the generalist-context (repoConventions.authoritative
+            # Sources) path: an unrecorded read must degrade the affected source,
+            # never abort the whole cycle and take blind functional discovery down
+            # with it. The probe issues no request; the matching live path is
+            # unchanged (issue-and-throw on a real fault when replay is inactive).
+            if ($script:ReviewerReplayActive) {
                 $probeRepoArgs = @{ action = "get"; project = $source.Project; repositoryNameOrId = $source.RepositoryId }
                 $probeBranchArgs = @{ action = "get"; project = $source.Project; repositoryId = $source.RepositoryId; branchName = $source.Branch }
                 if (-not (Test-ReviewerReplayConventionReadRecorded -Session $sourceSession -Name "repo_repository" -Arguments $probeRepoArgs) -or
@@ -3570,7 +3574,7 @@ function Get-ReviewerAuthoritativeSourceSnapshots {
             }
             $commitSha = [string]$commitCache[$commitKey]
 
-            if ($ConventionPackMode -and $script:ReviewerReplayActive) {
+            if ($script:ReviewerReplayActive) {
                 $probeFileArgs = @{ action = "get_content"; project = $source.Project; repositoryId = $source.RepositoryId; path = $source.Path; versionType = "Commit"; version = $commitSha }
                 if (-not (Test-ReviewerReplayConventionReadRecorded -Session $sourceSession -Name "repo_file" -Arguments $probeFileArgs)) {
                     Write-Warning "Convention authoritative source content '$($source.Path)' is not present in the sealed replay snapshot; withholding it (candidate-level convention degrade)."
