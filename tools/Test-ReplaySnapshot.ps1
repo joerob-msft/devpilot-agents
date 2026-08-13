@@ -2038,12 +2038,16 @@ try {
                 param($c) $c -is [Management.Automation.Language.AssignmentStatementAst]
             }, $true))
     $memberAssign = {
-        param($MemberName)
+        param($MemberName, $ExpectedRhsVar)
         @($cycleAssignments | Where-Object {
                 $left = $_.Left
+                $rightExpr = $null
+                if ($_.Right -is [Management.Automation.Language.CommandExpressionAst]) { $rightExpr = $_.Right.Expression }
                 $left -is [Management.Automation.Language.MemberExpressionAst] -and
                 $left.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
-                [string]$left.Member.Value -ceq $MemberName
+                [string]$left.Member.Value -ceq $MemberName -and
+                $rightExpr -is [Management.Automation.Language.VariableExpressionAst] -and
+                [string]$rightExpr.VariablePath.UserPath -ceq $ExpectedRhsVar
             }).Count -gt 0
     }
     $localAssignFromVar = {
@@ -2058,10 +2062,13 @@ try {
                 [string]$rightExpr.VariablePath.UserPath -ceq $SourceVar
             }).Count -gt 0
     }
-    Assert-Replay (& $memberAssign "AuthoritativeSourceConfiguredCount") `
-        "Invoke-ReviewerCycle must assign the configured authoritative-source count onto each bound item (.AuthoritativeSourceConfiguredCount)."
-    Assert-Replay (& $memberAssign "AuthoritativeSourceResolvedCount") `
-        "Invoke-ReviewerCycle must assign the resolved authoritative-source count onto each bound item (.AuthoritativeSourceResolvedCount)."
+    # Bind the RHS variable, not just the member name: a swap
+    # (.AuthoritativeSourceConfiguredCount = $authoritativeSourceResolvedCount)
+    # would otherwise still pass and misreport withheld counts.
+    Assert-Replay (& $memberAssign "AuthoritativeSourceConfiguredCount" "authoritativeSourceConfiguredCount") `
+        "Invoke-ReviewerCycle must assign `$authoritativeSourceConfiguredCount onto each bound item's .AuthoritativeSourceConfiguredCount."
+    Assert-Replay (& $memberAssign "AuthoritativeSourceResolvedCount" "authoritativeSourceResolvedCount") `
+        "Invoke-ReviewerCycle must assign `$authoritativeSourceResolvedCount onto each bound item's .AuthoritativeSourceResolvedCount."
     Assert-Replay (& $localAssignFromVar "authoritativeSourceConfiguredCount" "configuredSourceCount") `
         "Invoke-ReviewerCycle must derive `$authoritativeSourceConfiguredCount from `$configuredSourceCount."
     Assert-Replay (& $localAssignFromVar "authoritativeSourceResolvedCount" "resolvedSourceCount") `
@@ -2077,13 +2084,45 @@ try {
             [string]$c.GetCommandName() -ceq "Get-ReviewerConventionSourceSummary"
         }, $true) | Select-Object -First 1
     Assert-Replay ($null -ne $summaryCall) "Invoke-ReviewerPullRequest must call Get-ReviewerConventionSourceSummary."
-    $summaryParams = @($summaryCall.CommandElements | Where-Object {
-            $_ -is [Management.Automation.Language.CommandParameterAst]
-        } | ForEach-Object { [string]$_.ParameterName })
-    Assert-Replay ($summaryParams -ccontains "AuthoritativeSourceConfiguredCount" -and
-        $summaryParams -ccontains "AuthoritativeSourceResolvedCount") `
-        ("Invoke-ReviewerPullRequest must forward -AuthoritativeSourceConfiguredCount and " +
-        "-AuthoritativeSourceResolvedCount into Get-ReviewerConventionSourceSummary.")
+    # For each forwarded count parameter, bind its ARGUMENT to the matching bound-
+    # item key: the argument must contain a Get-ReviewerHashValue call whose -Key
+    # literal equals the parameter name. This rejects a swapped/constant/wrong-key
+    # argument that a name-only check would accept.
+    $summaryArgBindsKey = {
+        param($ParamName)
+        $elements = $summaryCall.CommandElements
+        for ($i = 0; $i -lt $elements.Count - 1; $i++) {
+            $element = $elements[$i]
+            if ($element -is [Management.Automation.Language.CommandParameterAst] -and
+                [string]$element.ParameterName -ceq $ParamName) {
+                $argument = $elements[$i + 1]
+                $hashCalls = @($argument.FindAll({
+                            param($c)
+                            $c -is [Management.Automation.Language.CommandAst] -and
+                            [string]$c.GetCommandName() -ceq "Get-ReviewerHashValue"
+                        }, $true))
+                foreach ($hashCall in $hashCalls) {
+                    $keyElements = $hashCall.CommandElements
+                    for ($k = 0; $k -lt $keyElements.Count - 1; $k++) {
+                        $keyParam = $keyElements[$k]
+                        if ($keyParam -is [Management.Automation.Language.CommandParameterAst] -and
+                            [string]$keyParam.ParameterName -ceq "Key") {
+                            $keyValue = $keyElements[$k + 1]
+                            if ($keyValue -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                                [string]$keyValue.Value -ceq $ParamName) {
+                                return $true
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return $false
+    }
+    Assert-Replay (& $summaryArgBindsKey "AuthoritativeSourceConfiguredCount") `
+        "Invoke-ReviewerPullRequest must forward -AuthoritativeSourceConfiguredCount bound to the bound-item key 'AuthoritativeSourceConfiguredCount'."
+    Assert-Replay (& $summaryArgBindsKey "AuthoritativeSourceResolvedCount") `
+        "Invoke-ReviewerPullRequest must forward -AuthoritativeSourceResolvedCount bound to the bound-item key 'AuthoritativeSourceResolvedCount'."
 
     . (Join-Path $RepoRoot "src\Agents\reviewer\SourceTransport.ps1")
     # The CLI fallback is a second, LIVE transport. In replay it must never be
