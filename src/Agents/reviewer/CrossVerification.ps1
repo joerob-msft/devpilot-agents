@@ -1377,23 +1377,32 @@ function Get-ReviewerVerificationAcceptedReconciliationCandidates {
 
 function Get-ReviewerVerificationConventionCoverageStatus {
     <#
-        Decides a cross-verification pass status from three independent coverage
+        Decides a cross-verification pass status from four independent coverage
         signals so partial convention-evidence degradation can never be reported
         as a complete review. A pass is "complete" only when every blind verifier
         run completed, the convention specialist stood behind its own discovery,
-        AND the sealed convention plan carried complete authoritative evidence.
-        Any incomplete signal yields "degraded" - the caller still exposes the
-        eligible blind-generalist findings. Kept a pure decision so it is
-        deterministically unit-testable in isolation.
+        the sealed convention plan carried complete authoritative evidence, AND
+        every configured generalist authoritative source reached the blind
+        generalist context. Any incomplete signal yields "degraded" - the caller
+        still exposes the eligible blind-generalist findings. Kept a pure decision
+        so it is deterministically unit-testable in isolation.
+
+        AuthoritativeSourceDegraded covers the generalist-context authoritative
+        source path (repoConventions.authoritativeSources): when offline replay
+        withholds a configured source it was never sealed to answer, the blind
+        generalist never saw that convention text, so the pass must degrade rather
+        than silently report a complete review with missing authoritative evidence.
     #>
     param(
         [Parameter(Mandatory)][bool]$AllVerifierRunsComplete,
         [Parameter(Mandatory)][bool]$SpecialistDegraded,
-        [Parameter(Mandatory)][bool]$ConventionEvidenceDegraded
+        [Parameter(Mandatory)][bool]$ConventionEvidenceDegraded,
+        [bool]$AuthoritativeSourceDegraded = $false
     )
     if (-not $AllVerifierRunsComplete) { return "degraded" }
     if ($SpecialistDegraded) { return "degraded" }
     if ($ConventionEvidenceDegraded) { return "degraded" }
+    if ($AuthoritativeSourceDegraded) { return "degraded" }
     return "complete"
 }
 

@@ -1917,12 +1917,48 @@ try {
     $authSourceText = [string]$authSourceFn.Extent.Text
     Assert-Replay ($authSourceText -cnotmatch '\$ConventionPackMode\s+-and\s+\$script:ReviewerReplayActive') `
         "The replay convention-source degrade must NOT be gated on -ConventionPackMode; the generalist-context path must degrade candidate-level, never abort the cycle."
-    $replayProbeGuards = @([regex]::Matches($authSourceText, 'if \(\$script:ReviewerReplayActive\) \{'))
-    Assert-Replay (@($replayProbeGuards).Count -ge 2) `
-        ("Both authoritative-source replay probes (repo_repository/repo_branch and repo_file) must be gated on " +
-        "`$script:ReviewerReplayActive alone (found $(@($replayProbeGuards).Count)).")
-    Assert-Replay ($authSourceText -clike '*withholding it (candidate-level convention degrade)*') `
-        "An unrecorded authoritative source must be withheld (candidate-level convention degrade), never issue a live-shaped read in replay."
+    # AST-relationship check (not a text scan): every replay convention-read probe
+    # call must have an ancestor if-guard that tests $script:ReviewerReplayActive,
+    # and NO ancestor if-guard may reference $ConventionPackMode. This holds under
+    # any reordering, nesting, or reformatting - it inspects the actual guard
+    # conditions each probe is enclosed by, up to the function boundary.
+    $probeCalls = @($authSourceFn.FindAll({
+                param($c)
+                $c -is [Management.Automation.Language.CommandAst] -and
+                [string]$c.GetCommandName() -ceq "Test-ReviewerReplayConventionReadRecorded"
+            }, $true))
+    Assert-Replay (@($probeCalls).Count -ge 3) `
+        ("Get-ReviewerAuthoritativeSourceSnapshots must probe repo_repository, repo_branch, and repo_file for a " +
+        "recorded replay response before reading (found $(@($probeCalls).Count) probe call(s)).")
+    foreach ($probe in $probeCalls) {
+        $ancestorIfConds = New-Object System.Collections.Generic.List[string]
+        $node = $probe.Parent
+        while ($null -ne $node -and -not ($node -is [Management.Automation.Language.FunctionDefinitionAst])) {
+            if ($node -is [Management.Automation.Language.IfStatementAst]) {
+                [void]$ancestorIfConds.Add([string]$node.Clauses[0].Item1.Extent.Text)
+            }
+            $node = $node.Parent
+        }
+        $guardedByReplay = (@($ancestorIfConds | Where-Object { $_ -match '\$script:ReviewerReplayActive' }).Count -gt 0)
+        $coupledToPack = (@($ancestorIfConds | Where-Object { $_ -match '\$ConventionPackMode' }).Count -gt 0)
+        Assert-Replay $guardedByReplay `
+            ("A replay convention-read probe at line $($probe.Extent.StartLineNumber) must be enclosed by an " +
+            "`$script:ReviewerReplayActive if-guard.")
+        Assert-Replay (-not $coupledToPack) `
+            ("A replay convention-read probe at line $($probe.Extent.StartLineNumber) must NOT be enclosed by any " +
+            "`$ConventionPackMode if-guard; that couples the degrade to the pack path and re-aborts the non-pack cycle.")
+    }
+    # Match the candidate-level degrade warning as AST string literals, not raw
+    # source text, so a comment can never satisfy it (comments are not AST nodes).
+    $degradeLiterals = @($authSourceFn.FindAll({
+                param($c)
+                ($c -is [Management.Automation.Language.StringConstantExpressionAst] -or
+                    $c -is [Management.Automation.Language.ExpandableStringExpressionAst]) -and
+                ([string]$c.Extent.Text) -clike '*candidate-level convention degrade*'
+            }, $true))
+    Assert-Replay (@($degradeLiterals).Count -ge 2) `
+        ("Both authoritative-source replay probes must withhold an unrecorded source with a candidate-level " +
+        "convention-degrade warning literal (found $(@($degradeLiterals).Count)).")
 
     . (Join-Path $RepoRoot "src\Agents\reviewer\SourceTransport.ps1")
     # The CLI fallback is a second, LIVE transport. In replay it must never be

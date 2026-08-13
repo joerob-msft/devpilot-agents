@@ -581,6 +581,26 @@ Assert-Verification ((Get-ReviewerVerificationConventionCoverageStatus `
             -AllVerifierRunsComplete $false -SpecialistDegraded $true -ConventionEvidenceDegraded $true) -ceq "degraded") `
     "Combined incomplete signals did not report degraded."
 
+# Review fix (0a0aa61 follow-up): a configured generalist authoritative source
+# withheld by offline replay (the non-pack repoConventions.authoritativeSources
+# path) is a fourth independent coverage signal. When every other signal is
+# complete but a configured source did not reach the blind generalist context,
+# the pass must still degrade - unavailable convention evidence can never be
+# silently reported as a complete review. The signal defaults to false so a
+# fully-covered pass is unaffected and pre-existing three-argument callers keep
+# their exact behavior.
+Assert-Verification ((Get-ReviewerVerificationConventionCoverageStatus `
+            -AllVerifierRunsComplete $true -SpecialistDegraded $false -ConventionEvidenceDegraded $false `
+            -AuthoritativeSourceDegraded $false) -ceq "complete") `
+    "A fully-covered pass with no withheld authoritative source was not reported complete."
+Assert-Verification ((Get-ReviewerVerificationConventionCoverageStatus `
+            -AllVerifierRunsComplete $true -SpecialistDegraded $false -ConventionEvidenceDegraded $false `
+            -AuthoritativeSourceDegraded $true) -ceq "degraded") `
+    "A withheld generalist authoritative source did not force the pass status to degraded."
+Assert-Verification ((Get-ReviewerVerificationConventionCoverageStatus `
+            -AllVerifierRunsComplete $true -SpecialistDegraded $false -ConventionEvidenceDegraded $false) -ceq "complete") `
+    "Omitting AuthoritativeSourceDegraded must default to not-degraded and preserve legacy three-argument behavior."
+
 # Generalist-origin convention findings are deterministically bound to the exact
 # sealed rule and changed-file range before either verifier sees them.
 $localizationSection = "### Use localized strings in exceptions and web action methods"

@@ -11039,18 +11039,25 @@ function Invoke-ReviewerCrossVerificationPass {
     # offline replay could not answer, withheld candidate-by-candidate while the
     # specialist still stood behind the packs it did receive - must not be
     # reported as a complete review, otherwise unavailable convention evidence is
-    # silently treated as success. Fold all three coverage signals (every
-    # verifier run complete, specialist not degraded, convention plan not
-    # degraded) through one pure decision. A degraded result still surfaces the
-    # eligible blind-generalist findings in this pass's sealed preview/eligible
-    # set, but a degraded run's candidates are then withheld from posting by the
-    # separate, already-tested delivery gate (typed reason verificationDegraded):
-    # "preserved" here means preview/decision-visible, not auto-postable.
+    # silently treated as success. Fold all four coverage signals (every verifier
+    # run complete, specialist not degraded, convention plan not degraded, and
+    # every configured generalist authoritative source resolved) through one pure
+    # decision. A degraded result still surfaces the eligible blind-generalist
+    # findings in this pass's sealed preview/eligible set, but a degraded run's
+    # candidates are then withheld from posting by the separate, already-tested
+    # delivery gate (typed reason verificationDegraded): "preserved" here means
+    # preview/decision-visible, not auto-postable.
     $conventionEvidenceDegraded = [bool](Get-ReviewerVerificationValue $conventionPlan "evidenceDegraded" $false)
+    # A configured generalist authoritative source that offline replay withheld
+    # (threaded onto the bound item at cycle-level source resolution) means the
+    # blind generalist never saw convention text it was configured to carry, so
+    # this pass must degrade the same way a degraded convention plan does.
+    $authoritativeSourceDegraded = [bool]$Bound['AuthoritativeSourceDegraded']
     $status = Get-ReviewerVerificationConventionCoverageStatus `
         -AllVerifierRunsComplete $allVerifierRunsComplete `
         -SpecialistDegraded $specialistDegraded `
-        -ConventionEvidenceDegraded $conventionEvidenceDegraded
+        -ConventionEvidenceDegraded $conventionEvidenceDegraded `
+        -AuthoritativeSourceDegraded $authoritativeSourceDegraded
     $reconciliationManifest = $null
     if ($specialistManifest) {
         $reconciliationManifest = Copy-ReviewerVerificationJsonValue -Value $specialistManifest
@@ -14730,12 +14737,32 @@ function Invoke-ReviewerCycle {
         # a separate MCP session. A transport failure can fail this fresh review
         # closed without closing the session that owns delivery and PR state.
         $authoritativeSourcesText = ""
+        $authoritativeSourceDegraded = $false
         if (@($AuthoritativeSourcePolicy.Sources).Count -gt 0) {
+            $configuredSourceCount = @($AuthoritativeSourcePolicy.Sources).Count
             $sourceSnapshots = Get-ReviewerAuthoritativeSourceSnapshots -AgencyPath $AgencyPath -Policy $AuthoritativeSourcePolicy
+            $resolvedSourceCount = @($sourceSnapshots).Count
+            # Offline replay withholds a configured authoritative source that was
+            # never sealed (candidate-level convention degrade above). When any
+            # configured source did not resolve, the blind generalist context is
+            # missing convention text it was configured to carry, so the fresh
+            # cross-verification pass must degrade rather than report a complete
+            # review with silently-missing authoritative evidence. Live runs never
+            # reach here partial (an unresolved source throws upstream), so this
+            # only ever trips under replay withholding.
+            $authoritativeSourceDegraded = ($resolvedSourceCount -lt $configuredSourceCount)
             $authoritativeSourcesText = Format-ReviewerAuthoritativeSources `
                 -Snapshots $sourceSnapshots -MaxTotalBytes $AuthoritativeSourcePolicy.MaxTotalBytes
-            Write-Host ("Authoritative sources: {0} file(s), {1} decoded byte(s), commit-pinned with SHA-256 provenance." -f `
-                    @($sourceSnapshots).Count, (($sourceSnapshots | Measure-Object -Property ByteLength -Sum).Sum)) -ForegroundColor Cyan
+            Write-Host ("Authoritative sources: {0} of {1} configured file(s), {2} decoded byte(s), commit-pinned with SHA-256 provenance." -f `
+                    $resolvedSourceCount, $configuredSourceCount, (($sourceSnapshots | Measure-Object -Property ByteLength -Sum).Sum)) -ForegroundColor Cyan
+            if ($authoritativeSourceDegraded) {
+                Write-Warning ("Authoritative sources degraded: {0} of {1} configured source(s) withheld from the blind generalist context; cross-verification will degrade this pass." -f `
+                        ($configuredSourceCount - $resolvedSourceCount), $configuredSourceCount)
+                Write-ReviewerCycleMetadata -Fields @{
+                    cycle = $CycleNumber; mode = "source-degraded"
+                    configuredSources = $configuredSourceCount; resolvedSources = $resolvedSourceCount
+                }
+            }
             foreach ($entry in $sourceSnapshots) {
                 Write-ReviewerCycleMetadata -Fields @{
                     cycle = $CycleNumber; mode = "source"; repositoryId = $entry.RepositoryId
@@ -14744,7 +14771,10 @@ function Invoke-ReviewerCycle {
                 }
             }
         }
-        foreach ($item in $bound) { $item.AuthoritativeSourcesText = $authoritativeSourcesText }
+        foreach ($item in $bound) {
+            $item.AuthoritativeSourcesText = $authoritativeSourcesText
+            $item.AuthoritativeSourceDegraded = $authoritativeSourceDegraded
+        }
 
         # -- Step 3: review each bound PR -------------------------------------
         $summaries = New-Object System.Collections.Generic.List[string]
