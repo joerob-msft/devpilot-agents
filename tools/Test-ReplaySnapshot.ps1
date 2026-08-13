@@ -1928,14 +1928,36 @@ try {
                 $c -is [Management.Automation.Language.CommandAst] -and
                 [string]$c.GetCommandName() -ceq "Test-ReviewerReplayConventionReadRecorded"
             }, $true))
-    Assert-Replay (@($probeCalls).Count -ge 3) `
-        ("Get-ReviewerAuthoritativeSourceSnapshots must probe repo_repository, repo_branch, and repo_file for a " +
-        "recorded replay response before reading (found $(@($probeCalls).Count) probe call(s)).")
+    # EXACTLY three probe calls exist in the source text - one each for
+    # repo_repository, repo_branch, repo_file. A looser "-ge 3" would let an
+    # unguarded fourth probe (or a probe with a dynamic -Name) slip past the
+    # per-probe governance/name checks below, so pin the count.
+    Assert-Replay (@($probeCalls).Count -eq 3) `
+        ("Get-ReviewerAuthoritativeSourceSnapshots must probe exactly repo_repository, repo_branch, and repo_file " +
+        "for a recorded replay response before reading (found $(@($probeCalls).Count) probe call(s)).")
+    # An if-condition governs a probe when its bare, un-negated expression is
+    # exactly `$script:ReviewerReplayActive`. Comparing condition TEXT would let
+    # an inverted guard - `if (-not $script:ReviewerReplayActive)` - satisfy the
+    # regex while flipping the meaning, so unwrap the condition AST and require a
+    # sole VariableExpressionAst named script:ReviewerReplayActive.
+    $isBareReplayActive = {
+        param($ConditionAst)
+        $expr = $ConditionAst
+        if ($expr -is [Management.Automation.Language.PipelineAst]) {
+            if ($expr.PipelineElements.Count -ne 1) { return $false }
+            $element = $expr.PipelineElements[0]
+            if ($element -isnot [Management.Automation.Language.CommandExpressionAst]) { return $false }
+            $expr = $element.Expression
+        }
+        if ($expr -isnot [Management.Automation.Language.VariableExpressionAst]) { return $false }
+        return ([string]$expr.VariablePath.UserPath -ceq 'script:ReviewerReplayActive')
+    }
     $probeNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($probe in $probeCalls) {
-        # Collect only the clause conditions that actually GOVERN this probe: an
-        # ancestor if-clause whose body (or else block) contains the probe extent.
-        $governingConds = New-Object System.Collections.Generic.List[string]
+        # Collect only the clause CONDITIONS (as AST, not text) that actually
+        # GOVERN this probe: an ancestor if-clause whose body (or else block)
+        # contains the probe extent.
+        $governingConds = New-Object System.Collections.Generic.List[object]
         $elseGoverned = $false
         $node = $probe.Parent
         while ($null -ne $node -and -not ($node -is [Management.Automation.Language.FunctionDefinitionAst])) {
@@ -1946,7 +1968,7 @@ try {
                     if ($null -ne $body -and
                         $body.Extent.StartOffset -le $probe.Extent.StartOffset -and
                         $body.Extent.EndOffset -ge $probe.Extent.EndOffset) {
-                        [void]$governingConds.Add([string]$clause.Item1.Extent.Text)
+                        [void]$governingConds.Add($clause.Item1)
                         $matchedClause = $true
                         break
                     }
@@ -1959,24 +1981,31 @@ try {
             }
             $node = $node.Parent
         }
-        $guardedByReplay = (@($governingConds | Where-Object { $_ -match '\$script:ReviewerReplayActive' }).Count -gt 0)
-        $coupledToPack = (@($governingConds | Where-Object { $_ -match '\$ConventionPackMode' }).Count -gt 0)
+        $guardedByReplay = (@($governingConds | Where-Object { & $isBareReplayActive $_ }).Count -gt 0)
+        $coupledToPack = (@($governingConds | Where-Object { [string]$_.Extent.Text -match '\$ConventionPackMode' }).Count -gt 0)
         Assert-Replay ($guardedByReplay -and -not $elseGoverned) `
-            ("A replay convention-read probe at line $($probe.Extent.StartLineNumber) must be governed by an " +
-            "`$script:ReviewerReplayActive if-guard body (never an else branch).")
+            ("A replay convention-read probe at line $($probe.Extent.StartLineNumber) must be governed by a bare, " +
+            "un-negated `$script:ReviewerReplayActive if-guard body (never an else branch or a negated guard).")
         Assert-Replay (-not $coupledToPack) `
             ("A replay convention-read probe at line $($probe.Extent.StartLineNumber) must NOT be governed by any " +
             "`$ConventionPackMode if-guard; that couples the degrade to the pack path and re-aborts the non-pack cycle.")
+        # Every probe must carry exactly one literal -Name; a dynamic or missing
+        # name would otherwise be silently ignored by the name-set assertion.
+        $literalNames = New-Object System.Collections.Generic.List[string]
         for ($i = 0; $i -lt $probe.CommandElements.Count - 1; $i++) {
             $element = $probe.CommandElements[$i]
             if ($element -is [Management.Automation.Language.CommandParameterAst] -and
                 [string]$element.ParameterName -ceq "Name") {
                 $nameValue = $probe.CommandElements[$i + 1]
                 if ($nameValue -is [Management.Automation.Language.StringConstantExpressionAst]) {
-                    [void]$probeNames.Add([string]$nameValue.Value)
+                    [void]$literalNames.Add([string]$nameValue.Value)
                 }
             }
         }
+        Assert-Replay (@($literalNames).Count -eq 1) `
+            ("A replay convention-read probe at line $($probe.Extent.StartLineNumber) must pass exactly one literal " +
+            "-Name (found $(@($literalNames).Count)).")
+        foreach ($literalName in $literalNames) { [void]$probeNames.Add($literalName) }
     }
     Assert-Replay ($probeNames.Count -eq 3 -and $probeNames.Contains("repo_repository") -and
         $probeNames.Contains("repo_branch") -and $probeNames.Contains("repo_file")) `
@@ -1993,6 +2022,68 @@ try {
     Assert-Replay (@($degradeLiterals).Count -ge 2) `
         ("Both authoritative-source replay probes must withhold an unrecorded source with a candidate-level " +
         "convention-degrade warning literal (found $(@($degradeLiterals).Count)).")
+
+    # Wiring regression: the honest "N of M resolved; K withheld" convention-source
+    # summary depends on Invoke-ReviewerCycle threading the configured/resolved
+    # authoritative-source counts onto each bound item, and Invoke-ReviewerPull
+    # Request forwarding them into Get-ReviewerConventionSourceSummary. Testing the
+    # summary helper alone leaves this wiring unguarded - deleting the assignments
+    # would restore the misreport while the helper tests still pass. Pin every hop.
+    $cycleFn = $reviewerAst.FindAll({
+            param($c)
+            $c -is [Management.Automation.Language.FunctionDefinitionAst] -and $c.Name -ceq "Invoke-ReviewerCycle"
+        }, $true) | Select-Object -First 1
+    Assert-Replay ($null -ne $cycleFn) "The reviewer must define Invoke-ReviewerCycle."
+    $cycleAssignments = @($cycleFn.FindAll({
+                param($c) $c -is [Management.Automation.Language.AssignmentStatementAst]
+            }, $true))
+    $memberAssign = {
+        param($MemberName)
+        @($cycleAssignments | Where-Object {
+                $left = $_.Left
+                $left -is [Management.Automation.Language.MemberExpressionAst] -and
+                $left.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                [string]$left.Member.Value -ceq $MemberName
+            }).Count -gt 0
+    }
+    $localAssignFromVar = {
+        param($TargetVar, $SourceVar)
+        @($cycleAssignments | Where-Object {
+                $left = $_.Left
+                $rightExpr = $null
+                if ($_.Right -is [Management.Automation.Language.CommandExpressionAst]) { $rightExpr = $_.Right.Expression }
+                $left -is [Management.Automation.Language.VariableExpressionAst] -and
+                [string]$left.VariablePath.UserPath -ceq $TargetVar -and
+                $rightExpr -is [Management.Automation.Language.VariableExpressionAst] -and
+                [string]$rightExpr.VariablePath.UserPath -ceq $SourceVar
+            }).Count -gt 0
+    }
+    Assert-Replay (& $memberAssign "AuthoritativeSourceConfiguredCount") `
+        "Invoke-ReviewerCycle must assign the configured authoritative-source count onto each bound item (.AuthoritativeSourceConfiguredCount)."
+    Assert-Replay (& $memberAssign "AuthoritativeSourceResolvedCount") `
+        "Invoke-ReviewerCycle must assign the resolved authoritative-source count onto each bound item (.AuthoritativeSourceResolvedCount)."
+    Assert-Replay (& $localAssignFromVar "authoritativeSourceConfiguredCount" "configuredSourceCount") `
+        "Invoke-ReviewerCycle must derive `$authoritativeSourceConfiguredCount from `$configuredSourceCount."
+    Assert-Replay (& $localAssignFromVar "authoritativeSourceResolvedCount" "resolvedSourceCount") `
+        "Invoke-ReviewerCycle must derive `$authoritativeSourceResolvedCount from `$resolvedSourceCount."
+    $prFn = $reviewerAst.FindAll({
+            param($c)
+            $c -is [Management.Automation.Language.FunctionDefinitionAst] -and $c.Name -ceq "Invoke-ReviewerPullRequest"
+        }, $true) | Select-Object -First 1
+    Assert-Replay ($null -ne $prFn) "The reviewer must define Invoke-ReviewerPullRequest."
+    $summaryCall = $prFn.FindAll({
+            param($c)
+            $c -is [Management.Automation.Language.CommandAst] -and
+            [string]$c.GetCommandName() -ceq "Get-ReviewerConventionSourceSummary"
+        }, $true) | Select-Object -First 1
+    Assert-Replay ($null -ne $summaryCall) "Invoke-ReviewerPullRequest must call Get-ReviewerConventionSourceSummary."
+    $summaryParams = @($summaryCall.CommandElements | Where-Object {
+            $_ -is [Management.Automation.Language.CommandParameterAst]
+        } | ForEach-Object { [string]$_.ParameterName })
+    Assert-Replay ($summaryParams -ccontains "AuthoritativeSourceConfiguredCount" -and
+        $summaryParams -ccontains "AuthoritativeSourceResolvedCount") `
+        ("Invoke-ReviewerPullRequest must forward -AuthoritativeSourceConfiguredCount and " +
+        "-AuthoritativeSourceResolvedCount into Get-ReviewerConventionSourceSummary.")
 
     . (Join-Path $RepoRoot "src\Agents\reviewer\SourceTransport.ps1")
     # The CLI fallback is a second, LIVE transport. In replay it must never be
