@@ -795,15 +795,26 @@ function Resolve-ReviewerQualificationSlotTerminalPath {
     )
     if (-not (Test-Path -LiteralPath $RunDirectory -PathType Container)) { return $null }
     $expectedName = "$SlotName-terminal.json"
-    $exact = @(Get-ChildItem -LiteralPath $RunDirectory -File -Filter "*-terminal.json" `
-            -ErrorAction SilentlyContinue |
-            Where-Object { [string]::Equals($_.Name, $expectedName, [StringComparison]::Ordinal) })
-    if (@($exact).Count -gt 1) {
+    $all = @(Get-ChildItem -LiteralPath $RunDirectory -File -Filter "*-terminal.json" -ErrorAction SilentlyContinue)
+    # Candidates are matched case-INSENSITIVELY first: any entry that differs
+    # from the expected name only by case is an ALIAS of this slot's evidence.
+    # More than one such alias (possible only on a case-sensitive volume) is
+    # ambiguous slot evidence and is refused rather than one variant chosen.
+    $aliases = @($all |
+            Where-Object { [string]::Equals($_.Name, $expectedName, [StringComparison]::OrdinalIgnoreCase) })
+    if ($aliases.Count -gt 1) {
         throw ("Multiple case-variant terminal files resolve to '$expectedName' under '$RunDirectory'; " +
             "ambiguous slot evidence is refused rather than one variant chosen.")
     }
-    if (@($exact).Count -eq 0) { return $null }
-    return $exact[0].FullName
+    if ($aliases.Count -eq 0) { return $null }
+    # Exactly one candidate: it must match the requested name ORDINALLY. A single
+    # differently-cased alias (e.g. a physical 'Slot1-terminal.json' for the
+    # requested 'slot1') is NOT opened in the expected slot's place - to a reader
+    # the requested slot then has no case-exact terminal.
+    if (-not [string]::Equals($aliases[0].Name, $expectedName, [StringComparison]::Ordinal)) {
+        return $null
+    }
+    return $aliases[0].FullName
 }
 
 function Read-ReviewerQualificationSlotTerminal {
@@ -976,18 +987,21 @@ function Get-VerifiedRunSetDeclaration {
         believed. An envelope parsed as text is a file anybody could have written;
         a signature check is the only thing that makes it a declaration - and it
         is also what detects a truncated or corrupted published declaration, since
-        a partial or altered envelope no longer verifies. Returns the verified
-        declaration object and its path, and refuses a declaration that names a
-        different snapshot, run count, or plan than this one. This is the shared
-        verifier: the coordinator's Reconcile gate and the status reader both call
-        it, so neither can accept a declaration the other would reject.
+        a partial or altered envelope no longer verifies. This is the SIGNATURE
+        boundary only: it returns the verified declaration object and its path and
+        throws solely when there is not exactly one declaration or the signature
+        does not verify. Whether that authentic declaration MATCHES this plan
+        (snapshot, run count, full plan digest) is a separate question answered by
+        Assert-ReviewerQualificationDeclarationMatchesPlan, so a caller can tell a
+        corrupt/tampered declaration (signature failure) apart from a benign
+        plan-input mismatch (wrong count, snapshot, models, repo, timeouts). The
+        coordinator's Declare/RunSlot/Reconcile paths and the status reader all
+        call this one copy, so none can accept a declaration another would reject.
     #>
     param(
         [Parameter(Mandatory)][string]$RunSetDirectory,
         [Parameter(Mandatory)][string]$CompareTool,
-        [Parameter(Mandatory)][string]$RunSetKeyPath,
-        [Parameter(Mandatory)]$Plan,
-        [string]$ExpectedPlanDigest = ""
+        [Parameter(Mandatory)][string]$RunSetKeyPath
     )
     $declarationPaths = @()
     if (Test-Path -LiteralPath $RunSetDirectory -PathType Container) {
@@ -1008,34 +1022,48 @@ function Get-VerifiedRunSetDeclaration {
             "under '$RunSetKeyPath'. A published declaration that no longer verifies is corrupt or tampered and is never launchable.")
     }
     $declaration = [string]$verifiedJson[0] | ConvertFrom-Json
-    if ([string]$declaration.snapshotName -cne [string]$Plan.Snapshot.Name -or
-        [string]$declaration.snapshotManifestDigest -cne [string]$Plan.Snapshot.ManifestDigest) {
-        throw ("The sealed declaration names snapshot '$($declaration.snapshotName)' at digest " +
-            "$($declaration.snapshotManifestDigest); this plan replays '$($Plan.Snapshot.Name)' at " +
+    return [pscustomobject]@{ Declaration = $declaration; Path = $declarationPaths[0] }
+}
+
+function Assert-ReviewerQualificationDeclarationMatchesPlan {
+    <#
+        Given a signature-verified declaration and a plan, refuses the declaration
+        unless it was sealed FOR this plan. Same snapshot, different models - or a
+        different reviewed repository, a different agent build, different timeouts,
+        a different operator - is a different qualification wearing this one's
+        seal, and snapshot-and-count alone cannot see it. When an ExpectedPlanDigest
+        is supplied (the caller reproduces it from the token that sealed the set:
+        a slot presents its token, reconciliation reads the published one), the
+        declaration's own sealed digest must equal it exactly, binding EVERY plan
+        input. This is the plan-identity boundary, kept apart from the signature
+        boundary so a plan-input mismatch is never mislabeled a signature failure.
+    #>
+    param(
+        [Parameter(Mandatory)]$Declaration,
+        [Parameter(Mandatory)]$Plan,
+        [string]$ExpectedPlanDigest = ""
+    )
+    if ([string]$Declaration.snapshotName -cne [string]$Plan.Snapshot.Name -or
+        [string]$Declaration.snapshotManifestDigest -cne [string]$Plan.Snapshot.ManifestDigest) {
+        throw ("The sealed declaration names snapshot '$($Declaration.snapshotName)' at digest " +
+            "$($Declaration.snapshotManifestDigest); this plan replays '$($Plan.Snapshot.Name)' at " +
             "$($Plan.Snapshot.ManifestDigest). A slot never runs against a declaration it does not match.")
     }
-    if ([int]$declaration.plannedRunCount -ne [int]$Plan.SlotCount) {
-        throw ("The sealed declaration plans $([int]$declaration.plannedRunCount) run(s) and this plan has " +
+    if ([int]$Declaration.plannedRunCount -ne [int]$Plan.SlotCount) {
+        throw ("The sealed declaration plans $([int]$Declaration.plannedRunCount) run(s) and this plan has " +
             "$($Plan.SlotCount) slot(s).")
     }
-    # The declaration was sealed FOR a plan, not merely for a snapshot. Same
-    # snapshot, different models - or a different reviewed repository, or a
-    # different agent build - is a different qualification wearing this one's
-    # seal. A slot re-runs the plan, so it presents the exact digest to match
-    # (the token-sealed one); reconciliation only reads finished terminals, so it
-    # binds them to the declaration's own authentic digest instead of recomputing
-    # one it would need the launch token to reproduce.
     $declaredPlanDigest = ""
-    if ($declaration.PSObject.Properties["planDigest"]) { $declaredPlanDigest = [string]$declaration.planDigest }
+    if ($Declaration.PSObject.Properties["planDigest"]) { $declaredPlanDigest = [string]$Declaration.planDigest }
     if (-not $declaredPlanDigest) {
-        throw ("The sealed declaration $($declaration.setId) carries no plan digest, so it cannot say which commands " +
+        throw ("The sealed declaration $($Declaration.setId) carries no plan digest, so it cannot say which commands " +
             "it authorized. Declare a new set with this build of the tool.")
     }
     if ($ExpectedPlanDigest -and $declaredPlanDigest -cne $ExpectedPlanDigest) {
-        throw ("The sealed declaration $($declaration.setId) was made for plan $declaredPlanDigest and this plan " +
-            "hashes to $ExpectedPlanDigest. Every slot of a set runs the plan that was declared.")
+        throw ("The sealed declaration $($Declaration.setId) was made for plan $declaredPlanDigest and this plan " +
+            "hashes to $ExpectedPlanDigest. Every slot of a set runs the plan that was declared - the reviewed " +
+            "repository, the models, the timeouts and every other plan input, not the snapshot and slot count alone.")
     }
-    return [pscustomobject]@{ Declaration = $declaration; Path = $declarationPaths[0] }
 }
 
 function Assert-ReviewerQualificationPublishedInventory {
@@ -1051,6 +1079,8 @@ function Assert-ReviewerQualificationPublishedInventory {
         set: not reconcilable, not launchable, and never silently treated as a
         valid set. Recoverability after arbitrary host/filesystem loss is NOT
         claimed; such a set is reported corrupt and a new root is declared.
+        Returns the validated 64-hex token text so the caller can reproduce the
+        plan digest the set was sealed under without re-reading the file.
     #>
     param([Parameter(Mandatory)][string]$RunSetDirectory)
     $tokenPath = Join-Path $RunSetDirectory "launch-authorization.token"
@@ -1063,6 +1093,7 @@ function Assert-ReviewerQualificationPublishedInventory {
         throw ("The published launch-authorization token under '$RunSetDirectory' is malformed (expected 64 " +
             "lowercase hex characters); the published set is corrupt and never reconcilable or launchable.")
     }
+    return $tokenText
 }
 
 function Assert-ReviewerQualificationSetReconcilable {
@@ -1073,8 +1104,12 @@ function Assert-ReviewerQualificationSetReconcilable {
         run the SAME sequence over the SAME reconstructed plan, status can never
         report a set reconciliation-ready that Reconcile would reject, nor the
         reverse, for the same authenticated inputs. It verifies the sealed
-        declaration under the key (which also detects a corrupt/truncated one),
-        confirms the published inventory is complete, and binds every slot's
+        declaration under the key (the signature boundary, which also detects a
+        corrupt/truncated one), confirms the published inventory is complete and
+        reads the launch token it carries, reproduces THIS plan's full digest with
+        that token and requires it to equal the declaration's sealed digest - so a
+        divergence in any plan input (repository, models, timeouts, operator, ...)
+        and not just snapshot and slot count is refused - and binds every slot's
         immutable terminal to the verified set and plan with no live child.
     #>
     param(
@@ -1082,9 +1117,26 @@ function Assert-ReviewerQualificationSetReconcilable {
         [Parameter(Mandatory)][string]$CompareTool,
         [Parameter(Mandatory)][string]$RunSetKeyPath
     )
+    # Signature boundary: the declaration is authentic (or the set is corrupt).
     $verified = Get-VerifiedRunSetDeclaration -RunSetDirectory ([string]$Plan.RunSetDirectory) `
-        -CompareTool $CompareTool -RunSetKeyPath $RunSetKeyPath -Plan $Plan
-    Assert-ReviewerQualificationPublishedInventory -RunSetDirectory ([string]$Plan.RunSetDirectory)
+        -CompareTool $CompareTool -RunSetKeyPath $RunSetKeyPath
+    # Inventory boundary: a complete publish carries its launch token. Reading it
+    # here lets reconciliation - which holds no token of its own - reproduce the
+    # exact plan digest the set was sealed under.
+    $publishedToken = Assert-ReviewerQualificationPublishedInventory -RunSetDirectory ([string]$Plan.RunSetDirectory)
+    $publishedTokenHash = Get-ReviewerQualificationLaunchTokenHash -Token $publishedToken
+    $originalHash = [string]$Plan.LaunchAuthorizationHash
+    $currentDigest = ""
+    try {
+        $Plan.LaunchAuthorizationHash = $publishedTokenHash
+        $currentDigest = Get-ReviewerQualificationPlanDigest -Plan $Plan
+    }
+    finally {
+        $Plan.LaunchAuthorizationHash = $originalHash
+    }
+    # Plan-identity boundary: bind the FULL plan, not snapshot and count alone.
+    Assert-ReviewerQualificationDeclarationMatchesPlan -Declaration $verified.Declaration -Plan $Plan `
+        -ExpectedPlanDigest $currentDigest
     $slots = Assert-ReviewerQualificationReconciliationReady -Plan $Plan `
         -ExpectedSetId ([string]$verified.Declaration.setId) `
         -ExpectedPlanDigest ([string]$verified.Declaration.planDigest)

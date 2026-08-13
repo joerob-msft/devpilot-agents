@@ -929,15 +929,39 @@ exit 0
     # above (reviewer.replay-qualification.reconciliation-ready.v1), and status
     # reports reconciliationReady for those same inputs - they cannot disagree.
     # A wrong SlotCount is an explicit plan mismatch: status must withhold
-    # readiness with a reason, exactly as Reconcile would reject it.
+    # readiness with a reason, exactly as Reconcile would reject it. The
+    # declaration's HMAC signature is perfectly valid - only the caller-supplied
+    # SlotCount disagrees - so status must NOT mislabel it as an unverified
+    # signature or a corrupt set; those flags stay false while readiness is false.
     $statusWrongCount = @(& $statusTool @orderArguments -RunSetKeyPath $keyPath -SlotCount 3 |
             Where-Object { $_ -is [pscustomobject] -and $_.kind })
     Assert-Qualification (@($statusWrongCount).Count -eq 1 -and [bool]$statusWrongCount[0].parityMode -and
-        -not [bool]$statusWrongCount[0].reconciliationReady -and [string]$statusWrongCount[0].reconciliationReason) `
-        "The status command claimed readiness for a plan whose SlotCount does not match the sealed declaration."
+        -not [bool]$statusWrongCount[0].reconciliationReady -and [string]$statusWrongCount[0].reconciliationReason -and
+        -not [bool]$statusWrongCount[0].signatureUnverified -and
+        -not [bool]$statusWrongCount[0].declarationCorrupt -and
+        [bool]$statusWrongCount[0].declaration.signatureVerified) `
+        "The status command claimed readiness for a plan whose SlotCount does not match the sealed declaration, or mislabeled a validly-signed declaration as unverified/corrupt on a benign SlotCount mismatch."
     Assert-QualificationThrows {
         & $sandboxTool -Mode Reconcile @orderArguments -RunSetKeyPath $keyPath -SlotCount 3
     } "Reconcile accepted a set whose SlotCount status also rejected." "and this plan has"
+    # Full-plan binding (finding #1): a plan input that is NOT snapshot or slot
+    # count - here the cycle timeout, which rides in every slot's argument vector
+    # and therefore the sealed plan digest - is reconstructed differently by the
+    # caller. Reconciliation holds no launch token, so it reads the published one
+    # to reproduce THIS plan's digest; that digest no longer equals the sealed
+    # one, so both Status and Reconcile must reject the set for the plan-mismatch
+    # reason. The signature is still valid, so status must not call it corrupt.
+    $statusWrongPlan = @(& $statusTool @orderArguments -RunSetKeyPath $keyPath -CycleTimeoutSeconds 600 |
+            Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (@($statusWrongPlan).Count -eq 1 -and [bool]$statusWrongPlan[0].parityMode -and
+        -not [bool]$statusWrongPlan[0].reconciliationReady -and
+        -not [bool]$statusWrongPlan[0].signatureUnverified -and
+        -not [bool]$statusWrongPlan[0].declarationCorrupt -and
+        [string]$statusWrongPlan[0].reconciliationReason -match "was made for plan") `
+        "The status command accepted, mislabeled, or gave the wrong reason for a plan whose cycle timeout differs from the sealed declaration."
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode Reconcile @orderArguments -RunSetKeyPath $keyPath -CycleTimeoutSeconds 600
+    } "Reconcile accepted a set whose full plan (cycle timeout) status also rejected." "was made for plan"
     Assert-Qualification (-not (@($statusObject[0].slots | Where-Object { [bool]$_.recordedChildAlive }).Count)) `
         "The status command reported a completed slot's child as still alive."
     Assert-Qualification ([bool]$statusObject[0].declaration.launchTokenPresent) `
@@ -1218,6 +1242,27 @@ exit 0
     Assert-QualificationThrows {
         & $sandboxTool -Mode Reconcile @caseArguments -RunSetKeyPath $keyPath
     } "Reconcile opened a case-mismatched 'Slot1' terminal as 'slot1'." "case-exact"
+
+    # Duplicate case-alias (finding 2): where the filesystem preserves case, two
+    # terminals that differ ONLY by case for the same logical slot are ambiguous
+    # evidence, and the shared resolver refuses them fail-closed rather than
+    # choosing one variant. On a case-insensitive volume the two names collapse to
+    # one file so the ambiguity cannot arise; the guard then skips, as directed.
+    $aliasDir = Join-Path $sandbox "alias-ambiguity\runs"
+    New-Item -ItemType Directory -Force -Path $aliasDir | Out-Null
+    $aliasContent = Get-Content -LiteralPath $caseUpper -Raw
+    [IO.File]::WriteAllText((Join-Path $aliasDir "Slot1-terminal.json"), $aliasContent, [Text.UTF8Encoding]::new($false))
+    try { [IO.File]::WriteAllText((Join-Path $aliasDir "slot1-terminal.json"), $aliasContent, [Text.UTF8Encoding]::new($false)) } catch {}
+    $aliasEntries = @(Get-ChildItem -LiteralPath $aliasDir -File -Filter "*-terminal.json")
+    if (@($aliasEntries).Count -eq 2) {
+        Assert-QualificationThrows {
+            Resolve-ReviewerQualificationSlotTerminalPath -RunDirectory $aliasDir -SlotName "slot1"
+        } "The shared resolver chose one of two case-variant terminals instead of refusing the ambiguity." "ambiguous slot evidence"
+    }
+    else {
+        Write-Host "  (case-insensitive volume: two case-variant terminals cannot coexist; ambiguity guard skipped)" `
+            -ForegroundColor DarkGray
+    }
 
     # -- 12e. Durability boundary: a corrupt/incomplete published set is classified
     #         explicitly, never silently treated as a valid set. Directory.Move is

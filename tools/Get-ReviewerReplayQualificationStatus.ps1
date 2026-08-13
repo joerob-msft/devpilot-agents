@@ -189,8 +189,15 @@ if (Test-Path -LiteralPath $runDirectory -PathType Container) {
         @($terminalFiles | ForEach-Object { $_.Name -replace '-terminal\.json$', '' })
     ) | Sort-Object -Unique -CaseSensitive
     foreach ($slotName in $slotNames) {
-        $attemptPath = Join-Path $runDirectory "$slotName-attempt.json"
-        $attemptExists = Test-Path -LiteralPath $attemptPath -PathType Leaf
+        # Attempt evidence is resolved case-EXACTLY too, from the enumerated
+        # physical entry, so a 'Slot1-attempt.json' is never opened in place of
+        # 'slot1' by a case-insensitive constructed-path open - the same discipline
+        # the shared terminal resolver enforces.
+        $attemptEntry = $attemptFiles |
+            Where-Object { [string]::Equals($_.Name, "$slotName-attempt.json", [StringComparison]::Ordinal) } |
+            Select-Object -First 1
+        $attemptExists = [bool]$attemptEntry
+        $attemptPath = if ($attemptExists) { $attemptEntry.FullName } else { Join-Path $runDirectory "$slotName-attempt.json" }
         $attempt = $null
         if ($attemptExists) {
             try { $attempt = Get-Content -LiteralPath $attemptPath -Raw | ConvertFrom-Json } catch {}
@@ -323,12 +330,16 @@ if ($parityMode -and $declarationSummary -and -not $declarationSummary.PSObject.
         $reconciliationReason = "plan reconstruction failed: $($_.Exception.Message)"
     }
     if ($statusPlan) {
-        # Shared verifier: sets the informational signatureVerified flag. This is
-        # the SAME verifier the gate runs, so a declaration that no longer verifies
-        # (truncated/tampered) is seen identically by status and Reconcile.
+        # Signature boundary only: sets the informational signatureVerified flag
+        # from the declaration's cryptographic authenticity ALONE. A wrong
+        # SlotCount, snapshot, or any other plan-input mismatch leaves the
+        # signature perfectly valid, so it must NOT be reported as an unverified
+        # signature; that mismatch surfaces as a not-ready reason from the gate
+        # below instead. This is the SAME signature check the gate runs, so a
+        # truncated/tampered declaration is seen identically by status and Reconcile.
         try {
             [void](Get-VerifiedRunSetDeclaration -RunSetDirectory ([string]$statusPlan.RunSetDirectory) `
-                    -CompareTool $compareTool -RunSetKeyPath $RunSetKeyPath -Plan $statusPlan)
+                    -CompareTool $compareTool -RunSetKeyPath $RunSetKeyPath)
             $declarationVerified = $true
         }
         catch {

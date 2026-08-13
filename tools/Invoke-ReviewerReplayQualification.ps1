@@ -387,7 +387,9 @@ if ($Mode -ceq "Declare") {
         # authorization the plan digest sealed. Any staged file that fails a check
         # is discarded whole; nothing partial is ever published.
         $stagedVerified = Get-VerifiedRunSetDeclaration -RunSetDirectory $stagingDirectory `
-            -CompareTool $compareTool -RunSetKeyPath $keyPath -Plan $plan -ExpectedPlanDigest $planDigest
+            -CompareTool $compareTool -RunSetKeyPath $keyPath
+        Assert-ReviewerQualificationDeclarationMatchesPlan -Declaration $stagedVerified.Declaration `
+            -Plan $plan -ExpectedPlanDigest $planDigest
         $stagedTokenHash = Get-ReviewerQualificationLaunchTokenHash `
             -Token ([IO.File]::ReadAllText($stagedTokenPath)).Trim()
         if ($stagedTokenHash -cne $launchAuthorizationHash) {
@@ -464,7 +466,9 @@ if (-not (Test-Path -LiteralPath $runSetKeyPath -PathType Leaf)) {
 # in it is believed. Same routine reconciliation uses, so a slot and the
 # reconciliation that follows it bind identity the same way.
 $verifiedDeclaration = Get-VerifiedRunSetDeclaration -RunSetDirectory $runSetDirectory `
-    -CompareTool $compareTool -RunSetKeyPath $runSetKeyPath -Plan $plan -ExpectedPlanDigest $planDigest
+    -CompareTool $compareTool -RunSetKeyPath $runSetKeyPath
+Assert-ReviewerQualificationDeclarationMatchesPlan -Declaration $verifiedDeclaration.Declaration `
+    -Plan $plan -ExpectedPlanDigest $planDigest
 $declaration = $verifiedDeclaration.Declaration
 $declarations = @($verifiedDeclaration.Path)
 
