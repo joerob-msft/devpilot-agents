@@ -2037,6 +2037,31 @@ try {
     $cycleAssignments = @($cycleFn.FindAll({
                 param($c) $c -is [Management.Automation.Language.AssignmentStatementAst]
             }, $true))
+    $boundForeach = @($cycleFn.FindAll({
+                param($c)
+                $c -is [Management.Automation.Language.ForEachStatementAst] -and
+                $c.Variable -is [Management.Automation.Language.VariableExpressionAst] -and
+                [string]$c.Variable.VariablePath.UserPath -ceq "item" -and
+                $c.Condition -is [Management.Automation.Language.PipelineAst] -and
+                ([string]$c.Condition.Extent.Text) -match '(?i)\$bound'
+            }, $true))
+    Assert-Replay (@($boundForeach).Count -gt 0) `
+        "Invoke-ReviewerCycle must thread the counts inside a foreach (`$item in `$bound) loop over bound PR items."
+    # The assignment must be lexically INSIDE a foreach ($item in $bound) body -
+    # otherwise moving it after the loop would set only the final item while the
+    # independent existence checks still pass.
+    $insideBoundForeach = {
+        param($AssignmentAst)
+        foreach ($loop in $boundForeach) {
+            $body = $loop.Body
+            if ($null -ne $body -and
+                $body.Extent.StartOffset -le $AssignmentAst.Extent.StartOffset -and
+                $body.Extent.EndOffset -ge $AssignmentAst.Extent.EndOffset) {
+                return $true
+            }
+        }
+        return $false
+    }
     $memberAssign = {
         param($MemberName, $ExpectedRhsVar)
         @($cycleAssignments | Where-Object {
@@ -2049,7 +2074,8 @@ try {
                 $left.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
                 [string]$left.Member.Value -ceq $MemberName -and
                 $rightExpr -is [Management.Automation.Language.VariableExpressionAst] -and
-                [string]$rightExpr.VariablePath.UserPath -ceq $ExpectedRhsVar
+                [string]$rightExpr.VariablePath.UserPath -ceq $ExpectedRhsVar -and
+                (& $insideBoundForeach $_)
             }).Count -gt 0
     }
     $localAssignFromVar = {
@@ -2064,18 +2090,6 @@ try {
                 [string]$rightExpr.VariablePath.UserPath -ceq $SourceVar
             }).Count -gt 0
     }
-    # The member assignments must live inside `foreach ($item in $bound)`, so the
-    # `$item` receiver is genuinely each bound PR item, not an unrelated `$item`.
-    $boundForeach = @($cycleFn.FindAll({
-                param($c)
-                $c -is [Management.Automation.Language.ForEachStatementAst] -and
-                $c.Variable -is [Management.Automation.Language.VariableExpressionAst] -and
-                [string]$c.Variable.VariablePath.UserPath -ceq "item" -and
-                $c.Condition -is [Management.Automation.Language.PipelineAst] -and
-                ([string]$c.Condition.Extent.Text) -match '(?i)\$bound'
-            }, $true))
-    Assert-Replay (@($boundForeach).Count -gt 0) `
-        "Invoke-ReviewerCycle must thread the counts inside a foreach (`$item in `$bound) loop over bound PR items."
     # Bind the RHS variable, not just the member name: a swap
     # (.AuthoritativeSourceConfiguredCount = $authoritativeSourceResolvedCount)
     # would otherwise still pass and misreport withheld counts.
