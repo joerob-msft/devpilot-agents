@@ -2044,6 +2044,8 @@ try {
                 $rightExpr = $null
                 if ($_.Right -is [Management.Automation.Language.CommandExpressionAst]) { $rightExpr = $_.Right.Expression }
                 $left -is [Management.Automation.Language.MemberExpressionAst] -and
+                $left.Expression -is [Management.Automation.Language.VariableExpressionAst] -and
+                [string]$left.Expression.VariablePath.UserPath -ceq "item" -and
                 $left.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
                 [string]$left.Member.Value -ceq $MemberName -and
                 $rightExpr -is [Management.Automation.Language.VariableExpressionAst] -and
@@ -2062,6 +2064,18 @@ try {
                 [string]$rightExpr.VariablePath.UserPath -ceq $SourceVar
             }).Count -gt 0
     }
+    # The member assignments must live inside `foreach ($item in $bound)`, so the
+    # `$item` receiver is genuinely each bound PR item, not an unrelated `$item`.
+    $boundForeach = @($cycleFn.FindAll({
+                param($c)
+                $c -is [Management.Automation.Language.ForEachStatementAst] -and
+                $c.Variable -is [Management.Automation.Language.VariableExpressionAst] -and
+                [string]$c.Variable.VariablePath.UserPath -ceq "item" -and
+                $c.Condition -is [Management.Automation.Language.PipelineAst] -and
+                ([string]$c.Condition.Extent.Text) -match '(?i)\$bound'
+            }, $true))
+    Assert-Replay (@($boundForeach).Count -gt 0) `
+        "Invoke-ReviewerCycle must thread the counts inside a foreach (`$item in `$bound) loop over bound PR items."
     # Bind the RHS variable, not just the member name: a swap
     # (.AuthoritativeSourceConfiguredCount = $authoritativeSourceResolvedCount)
     # would otherwise still pass and misreport withheld counts.
@@ -2103,17 +2117,24 @@ try {
                         }, $true))
                 foreach ($hashCall in $hashCalls) {
                     $keyElements = $hashCall.CommandElements
+                    $keyMatches = $false
+                    $containerMatches = $false
                     for ($k = 0; $k -lt $keyElements.Count - 1; $k++) {
-                        $keyParam = $keyElements[$k]
-                        if ($keyParam -is [Management.Automation.Language.CommandParameterAst] -and
-                            [string]$keyParam.ParameterName -ceq "Key") {
-                            $keyValue = $keyElements[$k + 1]
-                            if ($keyValue -is [Management.Automation.Language.StringConstantExpressionAst] -and
-                                [string]$keyValue.Value -ceq $ParamName) {
-                                return $true
-                            }
+                        $callParam = $keyElements[$k]
+                        if ($callParam -isnot [Management.Automation.Language.CommandParameterAst]) { continue }
+                        $callArg = $keyElements[$k + 1]
+                        if ([string]$callParam.ParameterName -ceq "Key" -and
+                            $callArg -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                            [string]$callArg.Value -ceq $ParamName) {
+                            $keyMatches = $true
+                        }
+                        if ([string]$callParam.ParameterName -ceq "Container" -and
+                            $callArg -is [Management.Automation.Language.VariableExpressionAst] -and
+                            [string]$callArg.VariablePath.UserPath -ceq "Bound") {
+                            $containerMatches = $true
                         }
                     }
+                    if ($keyMatches -and $containerMatches) { return $true }
                 }
             }
         }
