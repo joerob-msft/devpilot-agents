@@ -307,6 +307,27 @@ if ($parityMode -and $declarationSummary -and -not $declarationSummary.PSObject.
     if (-not $ReviewerScriptPath) {
         $ReviewerScriptPath = Join-Path $toolkitRoot "src\Agents\reviewer\Start-ReviewerAgent.ps1"
     }
+    # Signature boundary FIRST and INDEPENDENT of plan reconstruction. The
+    # declaration's cryptographic authenticity is a property of the published
+    # run-set ALONE - it does not depend on the caller's plan inputs. It must be
+    # reported truthfully even when a plan-input mismatch (wrong snapshot
+    # digest/name, unresolved model, wrong commit) makes plan reconstruction
+    # throw before the gate runs; otherwise a validly-signed declaration would be
+    # mislabeled signatureUnverified merely because these inputs don't match it.
+    # Resolves off $runSetDirectory directly (not $statusPlan.RunSetDirectory),
+    # using the SAME signature check the gate runs, so a truncated/tampered
+    # declaration is seen identically by status and Reconcile. A wrong SlotCount,
+    # snapshot, or any other plan-input mismatch leaves the signature valid; that
+    # mismatch surfaces as a not-ready reason from the gate below instead.
+    try {
+        [void](Get-VerifiedRunSetDeclaration -RunSetDirectory $runSetDirectory `
+                -CompareTool $compareTool -RunSetKeyPath $RunSetKeyPath)
+        $declarationVerified = $true
+    }
+    catch {
+        $declarationVerified = $false
+        $reconciliationReason = $_.Exception.Message
+    }
     $statusPlan = $null
     try {
         $statusPlan = New-ReviewerReplayQualificationPlan -RepoPath $RepoPath -ConfigFile $ConfigFile `
@@ -327,25 +348,13 @@ if ($parityMode -and $declarationSummary -and -not $declarationSummary.PSObject.
         # A plan that cannot even be reconstructed from these inputs (wrong commit,
         # dirty worktree, unresolved model, missing snapshot) is by definition a
         # mismatch: Reconcile would fail identically. Not ready, with the reason.
-        $reconciliationReason = "plan reconstruction failed: $($_.Exception.Message)"
+        # A signature failure (above) is the more fundamental fault, so it keeps
+        # priority as the reported reason.
+        if (-not $reconciliationReason) {
+            $reconciliationReason = "plan reconstruction failed: $($_.Exception.Message)"
+        }
     }
     if ($statusPlan) {
-        # Signature boundary only: sets the informational signatureVerified flag
-        # from the declaration's cryptographic authenticity ALONE. A wrong
-        # SlotCount, snapshot, or any other plan-input mismatch leaves the
-        # signature perfectly valid, so it must NOT be reported as an unverified
-        # signature; that mismatch surfaces as a not-ready reason from the gate
-        # below instead. This is the SAME signature check the gate runs, so a
-        # truncated/tampered declaration is seen identically by status and Reconcile.
-        try {
-            [void](Get-VerifiedRunSetDeclaration -RunSetDirectory ([string]$statusPlan.RunSetDirectory) `
-                    -CompareTool $compareTool -RunSetKeyPath $RunSetKeyPath)
-            $declarationVerified = $true
-        }
-        catch {
-            $declarationVerified = $false
-            $reconciliationReason = $_.Exception.Message
-        }
         # The SAME shared readiness gate Reconcile runs. reconciliationReady is
         # exactly its verdict, so status and Reconcile cannot positively disagree
         # for the same authenticated inputs.

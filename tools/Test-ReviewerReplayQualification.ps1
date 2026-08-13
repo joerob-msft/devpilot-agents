@@ -962,6 +962,24 @@ exit 0
     Assert-QualificationThrows {
         & $sandboxTool -Mode Reconcile @orderArguments -RunSetKeyPath $keyPath -CycleTimeoutSeconds 600
     } "Reconcile accepted a set whose full plan (cycle timeout) status also rejected." "was made for plan"
+    # Signature independence (RD#4): a plan input so wrong that the plan cannot be
+    # RECONSTRUCTED at all - here a snapshot name that does not exist - must not
+    # be conflated with a signature failure. The published declaration's HMAC is
+    # perfectly valid; only the caller's inputs are wrong. Status verifies the
+    # signature off the run-set directory BEFORE (and independently of) plan
+    # reconstruction, so signatureVerified stays true and the set is not flagged
+    # corrupt; the failure surfaces as a plan-reconstruction not-ready reason.
+    $statusBadSnapshotArgs = $orderArguments.Clone()
+    $statusBadSnapshotArgs["ReplaySnapshotName"] = "nonexistent-snapshot"
+    $statusBadSnapshot = @(& $statusTool @statusBadSnapshotArgs -RunSetKeyPath $keyPath |
+            Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (@($statusBadSnapshot).Count -eq 1 -and [bool]$statusBadSnapshot[0].parityMode -and
+        -not [bool]$statusBadSnapshot[0].reconciliationReady -and
+        -not [bool]$statusBadSnapshot[0].signatureUnverified -and
+        -not [bool]$statusBadSnapshot[0].declarationCorrupt -and
+        [bool]$statusBadSnapshot[0].declaration.signatureVerified -and
+        [string]$statusBadSnapshot[0].reconciliationReason -match "plan reconstruction failed") `
+        "The status command mislabeled a validly-signed declaration as signature-unverified/corrupt when plan reconstruction failed on a wrong snapshot name."
     Assert-Qualification (-not (@($statusObject[0].slots | Where-Object { [bool]$_.recordedChildAlive }).Count)) `
         "The status command reported a completed slot's child as still alive."
     Assert-Qualification ([bool]$statusObject[0].declaration.launchTokenPresent) `
