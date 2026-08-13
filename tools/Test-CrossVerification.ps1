@@ -601,6 +601,35 @@ Assert-Verification ((Get-ReviewerVerificationConventionCoverageStatus `
             -AllVerifierRunsComplete $true -SpecialistDegraded $false -ConventionEvidenceDegraded $false) -ceq "complete") `
     "Omitting AuthoritativeSourceDegraded must default to not-degraded and preserve legacy three-argument behavior."
 
+# Review fix (0fd304d follow-up): the human-facing convention-source summary must
+# report withheld authoritative sources honestly - a replay that could not answer
+# a configured source is a capture gap, not a configuration gap. Execute the pure
+# summary function with an empty convention-plan path so only the authoritative-
+# source branch runs (no plan dependency).
+Invoke-Expression (Get-VerificationFunctionText -Text $wrapperText -Name "Get-ReviewerConventionSourceSummary")
+$summaryFull = Get-ReviewerConventionSourceSummary -ConventionPlanPath "" `
+    -AuthoritativeSourcesText "" -AuthoritativeSourceConfiguredCount 3 -AuthoritativeSourceResolvedCount 3
+Assert-Verification ($summaryFull -ceq "3 commit-pinned authoritative source(s) in the generalist context") `
+    "A fully-resolved authoritative-source summary must report the resolved count without a withheld clause."
+$summaryPartial = Get-ReviewerConventionSourceSummary -ConventionPlanPath "" `
+    -AuthoritativeSourcesText "" -AuthoritativeSourceConfiguredCount 3 -AuthoritativeSourceResolvedCount 1
+Assert-Verification ($summaryPartial -clike "*1 of 3 configured authoritative source(s) resolved*" -and
+    $summaryPartial -clike "*2 withheld*") `
+    "A partially-withheld authoritative-source summary must report resolved-of-configured and the withheld count."
+$summaryAllWithheld = Get-ReviewerConventionSourceSummary -ConventionPlanPath "" `
+    -AuthoritativeSourcesText "" -AuthoritativeSourceConfiguredCount 3 -AuthoritativeSourceResolvedCount 0
+Assert-Verification ($summaryAllWithheld -clike "*0 of 3 configured authoritative source(s) resolved*" -and
+    $summaryAllWithheld -clike "*3 withheld*" -and
+    $summaryAllWithheld -cnotlike "*declares no convention packs and no authoritative sources*") `
+    "An all-withheld authoritative-source summary must report the withheld sources, never misreport them as none declared."
+$summaryLegacy = Get-ReviewerConventionSourceSummary -ConventionPlanPath "" `
+    -AuthoritativeSourcesText "Source 1 provenance: a`nSource 2 provenance: b"
+Assert-Verification ($summaryLegacy -ceq "2 commit-pinned authoritative source(s) in the generalist context") `
+    "A legacy caller without counts must still summarize the rendered provenance source count."
+$summaryNone = Get-ReviewerConventionSourceSummary -ConventionPlanPath "" -AuthoritativeSourcesText ""
+Assert-Verification ($summaryNone -clike "*declares no convention packs and no authoritative sources*") `
+    "A config with no packs and no authoritative sources must still report the honest configuration-gap line."
+
 # Generalist-origin convention findings are deterministically bound to the exact
 # sealed rule and changed-file range before either verifier sees them.
 $localizationSection = "### Use localized strings in exceptions and web action methods"

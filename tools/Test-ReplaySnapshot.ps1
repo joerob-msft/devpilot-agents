@@ -1918,10 +1918,11 @@ try {
     Assert-Replay ($authSourceText -cnotmatch '\$ConventionPackMode\s+-and\s+\$script:ReviewerReplayActive') `
         "The replay convention-source degrade must NOT be gated on -ConventionPackMode; the generalist-context path must degrade candidate-level, never abort the cycle."
     # AST-relationship check (not a text scan): every replay convention-read probe
-    # call must have an ancestor if-guard that tests $script:ReviewerReplayActive,
-    # and NO ancestor if-guard may reference $ConventionPackMode. This holds under
-    # any reordering, nesting, or reformatting - it inspects the actual guard
-    # conditions each probe is enclosed by, up to the function boundary.
+    # call must be GOVERNED by an $script:ReviewerReplayActive if-guard - meaning
+    # the probe sits inside that clause's BODY - and by NO $ConventionPackMode
+    # guard, under any reordering, nesting, or reformatting. A probe that merely
+    # sits inside another if's CONDITION is not governed by that if, and a probe in
+    # an else branch is not replay-guarded at all; both are rejected.
     $probeCalls = @($authSourceFn.FindAll({
                 param($c)
                 $c -is [Management.Automation.Language.CommandAst] -and
@@ -1930,24 +1931,57 @@ try {
     Assert-Replay (@($probeCalls).Count -ge 3) `
         ("Get-ReviewerAuthoritativeSourceSnapshots must probe repo_repository, repo_branch, and repo_file for a " +
         "recorded replay response before reading (found $(@($probeCalls).Count) probe call(s)).")
+    $probeNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($probe in $probeCalls) {
-        $ancestorIfConds = New-Object System.Collections.Generic.List[string]
+        # Collect only the clause conditions that actually GOVERN this probe: an
+        # ancestor if-clause whose body (or else block) contains the probe extent.
+        $governingConds = New-Object System.Collections.Generic.List[string]
+        $elseGoverned = $false
         $node = $probe.Parent
         while ($null -ne $node -and -not ($node -is [Management.Automation.Language.FunctionDefinitionAst])) {
             if ($node -is [Management.Automation.Language.IfStatementAst]) {
-                [void]$ancestorIfConds.Add([string]$node.Clauses[0].Item1.Extent.Text)
+                $matchedClause = $false
+                foreach ($clause in $node.Clauses) {
+                    $body = $clause.Item2
+                    if ($null -ne $body -and
+                        $body.Extent.StartOffset -le $probe.Extent.StartOffset -and
+                        $body.Extent.EndOffset -ge $probe.Extent.EndOffset) {
+                        [void]$governingConds.Add([string]$clause.Item1.Extent.Text)
+                        $matchedClause = $true
+                        break
+                    }
+                }
+                if (-not $matchedClause -and $null -ne $node.ElseClause -and
+                    $node.ElseClause.Extent.StartOffset -le $probe.Extent.StartOffset -and
+                    $node.ElseClause.Extent.EndOffset -ge $probe.Extent.EndOffset) {
+                    $elseGoverned = $true
+                }
             }
             $node = $node.Parent
         }
-        $guardedByReplay = (@($ancestorIfConds | Where-Object { $_ -match '\$script:ReviewerReplayActive' }).Count -gt 0)
-        $coupledToPack = (@($ancestorIfConds | Where-Object { $_ -match '\$ConventionPackMode' }).Count -gt 0)
-        Assert-Replay $guardedByReplay `
-            ("A replay convention-read probe at line $($probe.Extent.StartLineNumber) must be enclosed by an " +
-            "`$script:ReviewerReplayActive if-guard.")
+        $guardedByReplay = (@($governingConds | Where-Object { $_ -match '\$script:ReviewerReplayActive' }).Count -gt 0)
+        $coupledToPack = (@($governingConds | Where-Object { $_ -match '\$ConventionPackMode' }).Count -gt 0)
+        Assert-Replay ($guardedByReplay -and -not $elseGoverned) `
+            ("A replay convention-read probe at line $($probe.Extent.StartLineNumber) must be governed by an " +
+            "`$script:ReviewerReplayActive if-guard body (never an else branch).")
         Assert-Replay (-not $coupledToPack) `
-            ("A replay convention-read probe at line $($probe.Extent.StartLineNumber) must NOT be enclosed by any " +
+            ("A replay convention-read probe at line $($probe.Extent.StartLineNumber) must NOT be governed by any " +
             "`$ConventionPackMode if-guard; that couples the degrade to the pack path and re-aborts the non-pack cycle.")
+        for ($i = 0; $i -lt $probe.CommandElements.Count - 1; $i++) {
+            $element = $probe.CommandElements[$i]
+            if ($element -is [Management.Automation.Language.CommandParameterAst] -and
+                [string]$element.ParameterName -ceq "Name") {
+                $nameValue = $probe.CommandElements[$i + 1]
+                if ($nameValue -is [Management.Automation.Language.StringConstantExpressionAst]) {
+                    [void]$probeNames.Add([string]$nameValue.Value)
+                }
+            }
+        }
     }
+    Assert-Replay ($probeNames.Count -eq 3 -and $probeNames.Contains("repo_repository") -and
+        $probeNames.Contains("repo_branch") -and $probeNames.Contains("repo_file")) `
+        ("The replay convention-read probes must target exactly repo_repository, repo_branch, and repo_file " +
+        "(found: $(@($probeNames | Sort-Object) -join ', ')).")
     # Match the candidate-level degrade warning as AST string literals, not raw
     # source text, so a comment can never satisfy it (comments are not AST nodes).
     $degradeLiterals = @($authSourceFn.FindAll({

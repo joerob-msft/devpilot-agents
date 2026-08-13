@@ -4338,13 +4338,39 @@ function Get-ReviewerConventionSourceSummary {
        is injected into the generalist's runtime context directly, while
        `repoConventions.conventionPacks` produces a sealed plan. Reporting on
        only one of them would make this line false for a config that uses the
-       other. #>
+       other.
+
+       When the caller supplies the configured/resolved authoritative-source
+       counts, a replay that withheld a configured source (one it never sealed)
+       is reported as "N of M resolved; K withheld" rather than misdiagnosed as a
+       configuration gap. #>
     param(
         [AllowEmptyString()][string]$ConventionPlanPath = "",
-        [AllowEmptyString()][string]$AuthoritativeSourcesText = ""
+        [AllowEmptyString()][string]$AuthoritativeSourcesText = "",
+        [int]$AuthoritativeSourceConfiguredCount = 0,
+        [int]$AuthoritativeSourceResolvedCount = -1
     )
     $authorityParts = [System.Collections.Generic.List[string]]::new()
-    if ($AuthoritativeSourcesText) {
+    if ($AuthoritativeSourceConfiguredCount -gt 0) {
+        # When the caller knows how many authoritative sources the config declared
+        # AND how many actually resolved, report both. Offline replay can withhold
+        # a configured source it never sealed; reporting only the resolved count
+        # (or, when all are withheld, the empty-text "declares no authoritative
+        # sources" line below) would misdiagnose a replay-capture gap as a config
+        # gap. The run is already degraded and non-postable in that case; this only
+        # keeps the human-facing artifact honest.
+        $resolved = [Math]::Max(0, $AuthoritativeSourceResolvedCount)
+        if ($resolved -ge $AuthoritativeSourceConfiguredCount) {
+            [void]$authorityParts.Add("$resolved commit-pinned authoritative source(s) in the generalist context")
+        }
+        else {
+            $withheldCount = $AuthoritativeSourceConfiguredCount - $resolved
+            [void]$authorityParts.Add(
+                "$resolved of $AuthoritativeSourceConfiguredCount configured authoritative source(s) resolved in the " +
+                "generalist context; $withheldCount withheld because the offline replay snapshot could not answer them")
+        }
+    }
+    elseif ($AuthoritativeSourcesText) {
         $sourceCount = ([regex]::Matches($AuthoritativeSourcesText, '(?m)^Source \d+ provenance:')).Count
         [void]$authorityParts.Add("$sourceCount commit-pinned authoritative source(s) in the generalist context")
     }
@@ -13402,7 +13428,9 @@ function Invoke-ReviewerPullRequest {
         -SourceCoverage (Get-ReviewerHashValue -Container $Bound -Key 'SourceCoverage' -Default $null) `
         -ConventionSourceSummary (Get-ReviewerConventionSourceSummary `
                 -ConventionPlanPath ([string](Get-ReviewerHashValue -Container $Bound -Key 'ConventionPlanPath' -Default '')) `
-                -AuthoritativeSourcesText ([string](Get-ReviewerHashValue -Container $Bound -Key 'AuthoritativeSourcesText' -Default '')))
+                -AuthoritativeSourcesText ([string](Get-ReviewerHashValue -Container $Bound -Key 'AuthoritativeSourcesText' -Default '')) `
+                -AuthoritativeSourceConfiguredCount ([int](Get-ReviewerHashValue -Container $Bound -Key 'AuthoritativeSourceConfiguredCount' -Default 0)) `
+                -AuthoritativeSourceResolvedCount ([int](Get-ReviewerHashValue -Container $Bound -Key 'AuthoritativeSourceResolvedCount' -Default -1)))
     $previewPath = [string]$preview.MarkdownPath
 
     # -- Record the delivery plan BEFORE writing anything ----------------------
@@ -14738,10 +14766,14 @@ function Invoke-ReviewerCycle {
         # closed without closing the session that owns delivery and PR state.
         $authoritativeSourcesText = ""
         $authoritativeSourceDegraded = $false
+        $authoritativeSourceConfiguredCount = 0
+        $authoritativeSourceResolvedCount = 0
         if (@($AuthoritativeSourcePolicy.Sources).Count -gt 0) {
             $configuredSourceCount = @($AuthoritativeSourcePolicy.Sources).Count
             $sourceSnapshots = Get-ReviewerAuthoritativeSourceSnapshots -AgencyPath $AgencyPath -Policy $AuthoritativeSourcePolicy
             $resolvedSourceCount = @($sourceSnapshots).Count
+            $authoritativeSourceConfiguredCount = $configuredSourceCount
+            $authoritativeSourceResolvedCount = $resolvedSourceCount
             # Offline replay withholds a configured authoritative source that was
             # never sealed (candidate-level convention degrade above). When any
             # configured source did not resolve, the blind generalist context is
@@ -14774,6 +14806,8 @@ function Invoke-ReviewerCycle {
         foreach ($item in $bound) {
             $item.AuthoritativeSourcesText = $authoritativeSourcesText
             $item.AuthoritativeSourceDegraded = $authoritativeSourceDegraded
+            $item.AuthoritativeSourceConfiguredCount = $authoritativeSourceConfiguredCount
+            $item.AuthoritativeSourceResolvedCount = $authoritativeSourceResolvedCount
         }
 
         # -- Step 3: review each bound PR -------------------------------------

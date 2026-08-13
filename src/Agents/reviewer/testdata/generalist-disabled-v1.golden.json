@@ -155,6 +155,10 @@
       {
         "sha256": "3c83cac8c722e0f80db4c8a6261842989177afd2216f03985fe4aa22ba0aba90",
         "reason": "Layer A merged-marker contract: the seal-time re-validation now sizes its scan window from the dedicated merged-marker contract (25 findings times the two-pass maximum = 50), asserts Assert-ReviewerModelResultContractFits for the merged review before serializing, and hands that same window to ConvertFrom-AgentResultMarker so a maximal two-pass review is never truncated by the harness 65536 default and sealed into an unpromotable artifact. No change to the disabled generalist discovery or delivery path."
+      },
+      {
+        "sha256": "6f6c02324459e6a98dada749a1253f65bc2fab5e437c70b06205f334e19bf224",
+        "reason": "Thread the cycle-level authoritative-source configured/resolved counts and the withheld-degrade flag onto the bound item and into the convention-source summary call, so an offline replay that could not answer a configured generalist authoritative source is reported honestly (N of M resolved; K withheld) and degrades cross-verification instead of being silently summarized as a configuration gap. No change to the disabled generalist discovery or delivery path."
       }
     ],
     "Write-ReviewerConventionSpecialistPreview": [
