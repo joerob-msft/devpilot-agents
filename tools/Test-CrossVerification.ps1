@@ -534,6 +534,32 @@ Assert-Verification ($originUnion.Count -eq 3 -and $originUnionAssignments.Count
     @($originUnionAssignments | Where-Object verifierModel -ceq "claude-sonnet-5").Count -eq 0) `
     "The exact blind candidate union omitted a sole-origin finding or assigned the specialist as cross-checker."
 
+# Phase 2b: bind the reciprocal cross-check pair to the exact production model
+# identifiers and prove the separate convention verifier never reduces it. The
+# union above (two functional generalists + one specialist convention candidate)
+# must give EVERY candidate exactly one fresh gpt-5.6-sol and one fresh
+# claude-opus-5 verifier, with the named convention verifier being one of that
+# pair, not a replacement for it.
+Assert-Verification (@(@($opus, $sol) | Sort-Object) -join "|" -ceq "claude-opus-5|gpt-5.6-sol") `
+    "The derived reciprocal cross-check pair is not exactly {claude-opus-5, gpt-5.6-sol}."
+$phase2bPairPerCandidate = @($originUnion | ForEach-Object {
+        $cid = [string]$_.candidateId
+        $pair = @($originUnionAssignments | Where-Object { [string]$_.candidateId -ceq $cid } |
+                ForEach-Object { [string]$_.verifierModel } | Sort-Object -Unique)
+        (@($pair) -join "|")
+    } | Sort-Object -Unique)
+Assert-Verification (@($phase2bPairPerCandidate).Count -eq 1 -and
+    $phase2bPairPerCandidate[0] -ceq "claude-opus-5|gpt-5.6-sol") `
+    "Not every union candidate received exactly one fresh claude-opus-5 and one fresh gpt-5.6-sol cross-check."
+$phase2bCoverage = Assert-ReviewerVerificationAssignmentCoverage -Clusters $originUnionClusters `
+    -Assignments $originUnionAssignments -RequiredVerifierModels @($opus, $sol) -MaxVerifierRuns 6
+Assert-Verification ([bool]$phase2bCoverage.complete -and [int]$phase2bCoverage.readyCandidateCount -eq 3) `
+    "Assignment coverage did not confirm the full GPT+Opus pair for every union candidate."
+# The convention verifier naming gpt-5.6-sol must not drop opus from any pair.
+Assert-Verification (@($originUnionAssignments | Where-Object { [string]$_.verifierModel -ceq "claude-opus-5" }).Count -eq 3 -and
+    @($originUnionAssignments | Where-Object { [string]$_.verifierModel -ceq "gpt-5.6-sol" }).Count -eq 3) `
+    "The named convention verifier reduced the reciprocal pair instead of leaving both cross-checks intact."
+
 # Generalist-origin convention findings are deterministically bound to the exact
 # sealed rule and changed-file range before either verifier sees them.
 $localizationSection = "### Use localized strings in exceptions and web action methods"

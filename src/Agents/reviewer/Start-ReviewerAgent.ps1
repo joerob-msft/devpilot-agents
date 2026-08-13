@@ -3516,6 +3516,19 @@ function Get-ReviewerAuthoritativeSourceSnapshots {
         $snapshots = New-Object System.Collections.Generic.List[hashtable]
         $totalBytes = 0
         foreach ($source in $sources) {
+            # Offline replay withholds a convention authoritative source that was
+            # never captured, at candidate level, rather than issuing a read the
+            # sealed snapshot cannot answer. The probe issues no request; the
+            # matching live path is unchanged (issue-and-throw on a real fault).
+            if ($ConventionPackMode -and $script:ReviewerReplayActive) {
+                $probeRepoArgs = @{ action = "get"; project = $source.Project; repositoryNameOrId = $source.RepositoryId }
+                $probeBranchArgs = @{ action = "get"; project = $source.Project; repositoryId = $source.RepositoryId; branchName = $source.Branch }
+                if (-not (Test-ReviewerReplayConventionReadRecorded -Session $sourceSession -Name "repo_repository" -Arguments $probeRepoArgs) -or
+                    -not (Test-ReviewerReplayConventionReadRecorded -Session $sourceSession -Name "repo_branch" -Arguments $probeBranchArgs)) {
+                    Write-Warning "Convention authoritative source '$(if ($source.Name) { $source.Name } else { $source.Path })' is not present in the sealed replay snapshot; withholding it (candidate-level convention degrade)."
+                    continue
+                }
+            }
             $repositoryKey = "$($source.Project)`n$($source.RepositoryId)"
             if (-not $repositoryCache.ContainsKey($repositoryKey)) {
                 try {
@@ -3556,6 +3569,14 @@ function Get-ReviewerAuthoritativeSourceSnapshots {
                     -BranchResult $branchResult -ExpectedBranch $source.Branch
             }
             $commitSha = [string]$commitCache[$commitKey]
+
+            if ($ConventionPackMode -and $script:ReviewerReplayActive) {
+                $probeFileArgs = @{ action = "get_content"; project = $source.Project; repositoryId = $source.RepositoryId; path = $source.Path; versionType = "Commit"; version = $commitSha }
+                if (-not (Test-ReviewerReplayConventionReadRecorded -Session $sourceSession -Name "repo_file" -Arguments $probeFileArgs)) {
+                    Write-Warning "Convention authoritative source content '$($source.Path)' is not present in the sealed replay snapshot; withholding it (candidate-level convention degrade)."
+                    continue
+                }
+            }
 
             # Agency ADO repo_file accepts versionType=Commit and version=<sha>.
             # Live smoke proved historical commits return distinct bytes and a
@@ -3638,9 +3659,49 @@ function Get-ReviewerAuthoritativeSourceSnapshots {
     }
 }
 
+function Test-ReviewerReplayConventionReadRecorded {
+    <#
+        Answers whether a convention-source read was captured in the sealed
+        replay snapshot, so an offline planner can withhold an unavailable
+        source at candidate level instead of issuing a request the snapshot
+        cannot answer (which would fail-closed and abort the whole cycle) or
+        falling through to a forbidden live read. Live mode always returns
+        true, so the readers keep their existing issue-and-throw behavior.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][hashtable]$Arguments
+    )
+    if (-not $script:ReviewerReplayActive) { return $true }
+    if (-not $Session.ContainsKey("Replay") -or $null -eq $Session["Replay"]) { return $true }
+    return (Test-AgentReplaySnapshotHasResponse -Snapshot $Session["Replay"] -Name $Name -Arguments $Arguments)
+}
+
 function Get-ReviewerConventionTargetCommit {
     param([Parameter(Mandatory)][hashtable]$Session)
     $targetBranch = $TargetRefName -replace '^refs/heads/', ''
+    # Offline replay resolves the reviewed target commit from the sealed
+    # snapshot binding, never from a live-shaped repo_branch read. The target
+    # commit is already an authoritatively bound corpus fact - it is checked at
+    # seal time against the corpus's own captured PR identity
+    # (lastMergeTargetCommit) and is covered by the manifest digest the operator
+    # pins - so re-deriving it by asking for the branch tip would only invite a
+    # request a replay cannot answer. A missing or malformed sealed commit is a
+    # candidate-level convention fault (it degrades the convention path), not a
+    # reason to fall through to a live read.
+    if ($script:ReviewerReplayActive) {
+        $sealedTarget = ""
+        if ($script:ReviewerReplaySnapshot -and $script:ReviewerReplaySnapshot.Binding) {
+            $sealedTarget = ([string]$script:ReviewerReplaySnapshot.Binding.targetCommit).ToLowerInvariant()
+        }
+        if ($sealedTarget -notmatch '^[0-9a-f]{40}$') {
+            throw (New-ReviewerConventionEnvironmentException -Operation "resolve reviewed target branch" `
+                    -InnerException ([InvalidOperationException]::new(
+                        "The sealed replay snapshot does not carry an exact reviewed-target commit for branch '$targetBranch'.")))
+        }
+        return $sealedTarget
+    }
     try {
         $branchResult = Invoke-AgentMcpTool -Session $Session -Name "repo_branch" -Arguments @{
             action       = "get"
@@ -3667,6 +3728,13 @@ function Get-ReviewerConventionRepositorySnapshots {
     foreach ($source in @($RepositorySources)) {
         $path = [string]$source.Path
         if (-not $seen.Add($path)) { continue }
+        if ($script:ReviewerReplayActive) {
+            $probeFileArgs = @{ action = "get_content"; project = $ExpectedProject; repositoryId = $cfgRepoId; path = $path; versionType = "Commit"; version = $TargetCommit }
+            if (-not (Test-ReviewerReplayConventionReadRecorded -Session $Session -Name "repo_file" -Arguments $probeFileArgs)) {
+                Write-Warning "Convention repository source '$path' is not present in the sealed replay snapshot; withholding it (candidate-level convention degrade)."
+                continue
+            }
+        }
         try {
             $toolResult = Send-AgentMcpRequest -Session $Session -Method "tools/call" -Params @{
                 name      = "repo_file"
@@ -14455,7 +14523,8 @@ function Invoke-ReviewerCycle {
                                 TargetCommit = $pinnedChanges.TargetCommit; ChangeSetDigest = $pinnedChanges.Digest
                             } -AuthoritativeSnapshots $packAuthoritativeSnapshots `
                             -RepositorySnapshots $packRepositorySnapshots `
-                            -ScriptSha256 $ScriptSelfSha256 -ConfigSha256 $ConfigSha256
+                            -ScriptSha256 $ScriptSelfSha256 -ConfigSha256 $ConfigSha256 `
+                            -AllowDegradedSources:$script:ReviewerReplayActive
                         $readyPlanPath = Save-ReviewerConventionPlan -Plan $conventionPlan `
                             -PrId $prId -SourceCommit $sourceCommit
                         $factBinding = [pscustomobject][ordered]@{
@@ -14526,9 +14595,15 @@ function Invoke-ReviewerCycle {
                                 $prId, @($conventionPlan.selectedPacks).Count, @($conventionPlan.withheldPacks).Count,
                                 $conventionPlan.totalContextBytes, $conventionPlan.maxTotalBytes) -ForegroundColor Cyan
                         Write-ReviewerCycleMetadata -Fields @{
-                            cycle = $CycleNumber; mode = "convention-plan"; result = "ready"; prId = $prId
+                            cycle = $CycleNumber; mode = "convention-plan"
+                            result = $(if ($conventionPlan.evidenceDegraded) { "degraded" } else { "ready" })
+                            prId = $prId
                             sourceCommit = $sourceCommit; changeSetDigest = $pinnedChanges.Digest
                             selectedPackCount = @($conventionPlan.selectedPacks).Count
+                            withheldPackCount = @($conventionPlan.withheldPacks).Count
+                            evidenceStatus = [string]$conventionPlan.evidenceStatus
+                            evidenceDegraded = [bool]$conventionPlan.evidenceDegraded
+                            degradedReason = [string]$conventionPlan.degradedReason
                             totalContextBytes = $conventionPlan.totalContextBytes; planPath = $readyPlanPath
                         }
                         return @{ PlanPath = $readyPlanPath; FactPlanPath = $factPlanPath }

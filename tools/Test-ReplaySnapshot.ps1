@@ -4418,12 +4418,51 @@ try {
     Assert-ReplayThrows { New-AgentReplaySnapshot -ReplayRoot $classifiedV1 -SnapshotName "synthetic-pr" } `
         "A schema-v1 manifest must not be allowed to carry a classification." -Match "schema-v2 field"
 
+    # -- 15. Convention-source availability probe -----------------------------
+    # Test-AgentReplaySnapshotHasResponse lets the offline convention planner
+    # tell a source that was never captured apart from one that is present,
+    # WITHOUT issuing a read the snapshot cannot answer. It must agree exactly
+    # with what Get-AgentReplayResponse would serve or throw for.
+    Write-Host "15 convention-source availability probe" -ForegroundColor Cyan
+    $probeSnapshot = New-AgentReplaySnapshot -ReplayRoot $fixtureRoot -SnapshotName "synthetic-pr"
+    $recordedPrArgs = @{ action = "get"; project = "Widgets"; repositoryId = "11111111-2222-3333-4444-555555555555"; pullRequestId = 4242 }
+    $recordedFileArgs = @{ action = "get_content"; project = "Widgets"; repositoryId = "11111111-2222-3333-4444-555555555555"; path = "/src/Widget.cs"; versionType = "Commit"; version = "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0" }
+    Assert-Replay (Test-AgentReplaySnapshotHasResponse -Snapshot $probeSnapshot -Name "repo_pull_request" -Arguments $recordedPrArgs) `
+        "The probe must report a recorded read as available."
+    Assert-Replay (Test-AgentReplaySnapshotHasResponse -Snapshot $probeSnapshot -Name "repo_file" -Arguments $recordedFileArgs) `
+        "The probe must report a recorded repo_file read as available."
+    # An unrecorded read (a source the corpus never captured) must probe false,
+    # never throw and never fall through - so the planner can withhold it.
+    Assert-Replay (-not (Test-AgentReplaySnapshotHasResponse -Snapshot $probeSnapshot -Name "repo_pull_request" `
+                -Arguments @{ action = "get"; project = "Widgets"; repositoryId = "11111111-2222-3333-4444-555555555555"; pullRequestId = 9999 })) `
+        "The probe must report an uncaptured read as unavailable."
+    Assert-Replay (-not (Test-AgentReplaySnapshotHasResponse -Snapshot $probeSnapshot -Name "repo_branch" `
+                -Arguments @{ action = "get"; project = "Widgets"; repositoryId = "11111111-2222-3333-4444-555555555555"; branchName = "master" })) `
+        "The probe must report an uncaptured convention branch read as unavailable."
+    # Argument identity matters: a single differing value is a different read.
+    Assert-Replay (-not (Test-AgentReplaySnapshotHasResponse -Snapshot $probeSnapshot -Name "repo_file" `
+                -Arguments @{ action = "get_content"; project = "Widgets"; repositoryId = "11111111-2222-3333-4444-555555555555"; path = "/src/Other.cs"; versionType = "Commit"; version = "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0" })) `
+        "The probe must not treat a different path as the same recorded read."
+    # A write tool is outside the read ceiling: the probe refuses it (false),
+    # exactly as the serve path would, so it can never be seen as available.
+    Assert-Replay (-not (Test-AgentReplaySnapshotHasResponse -Snapshot $probeSnapshot -Name "repo_pull_request_write" `
+                -Arguments @{ action = "get"; project = "Widgets"; pullRequestId = 4242 })) `
+        "The probe must refuse a write tool rather than report it available."
+    Assert-ReplayThrows { Test-AgentReplaySnapshotHasResponse -Snapshot @{ Seal = "agent-replay-v1"; Served = @{} } `
+            -Name "repo_file" -Arguments @{ action = "get_content" } } `
+        "A hand-built snapshot object must not be accepted by the probe." -Match "produced by New-AgentReplaySnapshot"
+    # The probe must not consume or alter the snapshot: a serve still succeeds
+    # after probing, proving the probe issued nothing and mutated nothing.
+    $afterProbeSession = Open-AgentMcpSession -AgencyPath "never-executed" -Server "ado" -Organization "contoso" -ReplaySnapshot $probeSnapshot
+    $afterProbePr = Invoke-AgentMcpTool -Session $afterProbeSession -Name "repo_pull_request" -Arguments $recordedPrArgs
+    Assert-Replay ([int]$afterProbePr.pullRequestId -eq 4242) "Probing must leave the recorded read servable."
+    Close-AgentMcpSession -Session $afterProbeSession
+
     $script:ReviewerReplayActive = $false
 }
 finally {
     Remove-Item -Recurse -Force $sandbox -ErrorAction SilentlyContinue
 }
-
 Write-Host ""
 if ($script:Failures.Count -eq 0) {
     Write-Host "PASS - $($script:Checks) replay-snapshot and rule-coverage check(s) passed." -ForegroundColor Green

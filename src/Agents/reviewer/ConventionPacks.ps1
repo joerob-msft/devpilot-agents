@@ -671,7 +671,15 @@ function New-ReviewerConventionContextPlan {
         [object[]]$AuthoritativeSnapshots = @(),
         [object[]]$RepositorySnapshots = @(),
         [Parameter(Mandatory)][string]$ScriptSha256,
-        [Parameter(Mandatory)][string]$ConfigSha256
+        [Parameter(Mandatory)][string]$ConfigSha256,
+        # Offline replay may legitimately lack an authoritative/repository source
+        # that was never captured in the immutable corpus. When set, a pack whose
+        # required source did not resolve is withheld at candidate level with a
+        # typed reason and the plan is flagged evidence-degraded, instead of
+        # throwing (which would abort the whole cycle, including functional
+        # generalist discovery). Live callers leave this off so a genuinely
+        # missing source still fails closed.
+        [switch]$AllowDegradedSources
     )
     $snapshots = @(@($AuthoritativeSnapshots) + @($RepositorySnapshots))
     $snapshotById = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
@@ -683,6 +691,8 @@ function New-ReviewerConventionContextPlan {
         $snapshotById.Add($sourceId, $snapshot)
     }
     $selectedPlans = New-Object System.Collections.Generic.List[object]
+    $degradedPacks = New-Object System.Collections.Generic.List[object]
+    $degradedReasons = New-Object System.Collections.Generic.List[string]
     $totalBytes = 0
     foreach ($selectionItem in @($Selection.Selected)) {
         $pack = $selectionItem.Pack
@@ -692,8 +702,10 @@ function New-ReviewerConventionContextPlan {
             [void]$sourceIds.Add("repo:" + ([string]$local.Path).ToLowerInvariant())
         }
         $resolved = New-Object System.Collections.Generic.List[object]
+        $missingSourceId = $null
         foreach ($sourceId in $sourceIds) {
             if (-not $snapshotById.ContainsKey($sourceId)) {
+                if ($AllowDegradedSources) { $missingSourceId = $sourceId; break }
                 throw "Selected pack '$($pack.Name)' did not resolve source '$sourceId'."
             }
             $snapshot = $snapshotById[$sourceId]
@@ -715,6 +727,18 @@ function New-ReviewerConventionContextPlan {
                     mimeType      = [string](Get-ReviewerConventionValue $snapshot "MimeType")
                     byteLength    = [int](Get-ReviewerConventionValue $snapshot "ByteLength")
                 })
+        }
+        if ($missingSourceId) {
+            [void]$degradedPacks.Add([pscustomobject][ordered]@{
+                    name                = $pack.Name
+                    priority            = [int]$pack.Priority
+                    status              = "withheld"
+                    reason              = "authoritative-source-unavailable"
+                    degraded            = $true
+                    unavailableSourceId = [string]$missingSourceId
+                })
+            [void]$degradedReasons.Add("pack '$($pack.Name)' withheld: convention source '$missingSourceId' unavailable in sealed replay")
+            continue
         }
         $matchedPaths = @($selectionItem.Matches | ForEach-Object {
                 [pscustomobject][ordered]@{
@@ -753,12 +777,22 @@ function New-ReviewerConventionContextPlan {
                 reason          = ""
             })
     }
+    $evidenceDegraded = ($degradedPacks.Count -gt 0)
     return [pscustomobject][ordered]@{
         planVersion       = $script:ReviewerConventionPlanVersion
         schemaVersion     = [int]$Policy.SchemaVersion
         status            = "ready"
         failureReason     = ""
         environmentFault  = $false
+        # Structural readiness (status) stays "ready" so the plan remains a
+        # usable, digest-bound object; evidenceStatus separately reports whether
+        # every selected pack's authoritative evidence was present. A degraded
+        # plan carries no degraded-source packs into selectedPacks, so the
+        # specialist sees only fully-evidenced packs (or none) and convention
+        # candidates lacking evidence are withheld downstream.
+        evidenceStatus    = $(if ($evidenceDegraded) { "degraded" } else { "complete" })
+        evidenceDegraded  = [bool]$evidenceDegraded
+        degradedReason    = $(if ($evidenceDegraded) { ($degradedReasons -join "; ") } else { "" })
         scriptSha256      = $ScriptSha256.ToLowerInvariant()
         configSha256      = $ConfigSha256.ToLowerInvariant()
         organization      = [string]$Binding.Organization
@@ -769,7 +803,7 @@ function New-ReviewerConventionContextPlan {
         targetCommit      = [string]$Binding.TargetCommit
         changeSetDigest   = [string]$Binding.ChangeSetDigest
         selectedPacks     = $selectedPlans.ToArray()
-        withheldPacks     = @($Selection.Withheld)
+        withheldPacks     = @(@($Selection.Withheld) + $degradedPacks.ToArray())
         totalContextBytes = $totalBytes
         maxTotalBytes     = [int]$Policy.MaxTotalBytes
     }
