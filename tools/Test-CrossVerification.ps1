@@ -2705,6 +2705,7 @@ Assert-Verification (@($missingEvidence.eligible).Count -eq 0 -and
 . ([scriptblock]::Create($safeVerificationText))
 $script:passCandidates = @()
 $script:passFactPlan = $factPlan
+$script:passConventionEvidenceDegraded = $false
 $script:capturedVerificationInput = $null
 $script:clusterSequenceMode = ""
 $script:clusterSequenceCall = 0
@@ -2736,6 +2737,7 @@ function Read-ReviewerConventionPlan {
     return [pscustomobject]@{
         targetCommit = "2" * 40
         changeSetDigest = "3" * 64
+        evidenceDegraded = $script:passConventionEvidenceDegraded
     }
 }
 function Read-ReviewerFactPlan {
@@ -2917,6 +2919,23 @@ Assert-Verification ([int]$script:passFreshBindingCalls -ge 1 -and
     [int]$script:passFreshBindingTimeoutSeconds -gt 0 -and
     [int]$script:passFreshBindingTimeoutSeconds -le $McpTimeoutSeconds) `
     "The production pass did not bound its live fresh binding's transport timeout."
+# Partial convention-evidence degradation flows END TO END through the production
+# pass: when the sealed convention plan reports evidenceDegraded, the pass status
+# is degraded (never silently complete) yet the cross-verified functional
+# candidate is PRESERVED in the eligible set - the coverage gate only reports
+# incomplete coverage, it does not discard findings. (Whether a degraded run's
+# eligible candidates are postable is the separate, already-tested delivery gate,
+# which withholds them with a typed verificationDegraded reason.)
+$script:passConventionEvidenceDegraded = $true
+$script:passFactPlan = $factPlan
+$script:passCandidates = @($goodPartitionCandidate)
+$degradedEvidencePass = Invoke-ReviewerCrossVerificationPass -AgencyPath "unused" -CycleNumber 1 `
+    -Bound $passBound -PassResults $completePassResults -SpecialistResult $emptySpecialistResult
+Assert-Verification ($degradedEvidencePass.Status -ceq "degraded" -and
+    @($degradedEvidencePass.Eligible).Count -eq 1 -and
+    [string]$degradedEvidencePass.Eligible[0].candidateId -ceq "good-fact-candidate") `
+    "A convention plan reporting evidenceDegraded did not force a degraded pass while preserving its eligible functional candidate."
+$script:passConventionEvidenceDegraded = $false
 $script:passFactPlan = $overflowFactPlan
 $script:passCandidates = @($overflowPartitionCandidate, $goodPartitionCandidate)
 $overflowSafe = Invoke-ReviewerCrossVerificationSafely -AgencyPath "unused" -CycleNumber 2 `

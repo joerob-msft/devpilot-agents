@@ -11037,8 +11037,11 @@ function Invoke-ReviewerCrossVerificationPass {
     # reported as a complete review, otherwise unavailable convention evidence is
     # silently treated as success. Fold all three coverage signals (every
     # verifier run complete, specialist not degraded, convention plan not
-    # degraded) through one pure decision. A degraded result still exposes the
-    # eligible blind-generalist findings via the sealed union above.
+    # degraded) through one pure decision. A degraded result still surfaces the
+    # eligible blind-generalist findings in this pass's sealed preview/eligible
+    # set, but a degraded run's candidates are then withheld from posting by the
+    # separate, already-tested delivery gate (typed reason verificationDegraded):
+    # "preserved" here means preview/decision-visible, not auto-postable.
     $conventionEvidenceDegraded = [bool](Get-ReviewerVerificationValue $conventionPlan "evidenceDegraded" $false)
     $status = Get-ReviewerVerificationConventionCoverageStatus `
         -AllVerifierRunsComplete $allVerifierRunsComplete `
