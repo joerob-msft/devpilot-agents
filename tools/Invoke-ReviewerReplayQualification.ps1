@@ -395,51 +395,104 @@ if ($Mode -ceq "Declare") {
         throw ("A run set is already declared under '$runSetDirectory': $($existing -join ', '). " +
             "Declare exactly one set per qualification root; start a new root for a new set.")
     }
-    [void](New-Item -ItemType Directory -Force -Path $runSetDirectory)
-    # The single-use launch token whose hash the plan digest was already sealed
-    # under is minted and sealed BEFORE the declaration is published, so a
-    # declaration never outlives a token that failed to write. Written
-    # exclusively (CreateNew) and read-only: a run set mints its token exactly
-    # once, and no second declaration can quietly replace it. The operator hands
-    # this path to RunSlot; a slot without it cannot reproduce the sealed digest
-    # and is refused before any model launch.
-    $launchTokenPath = Join-Path $runSetDirectory "launch-authorization.token"
-    # Token minting and declaration publication share ONE cleanup path. Any
-    # failure - the exclusive create, the write, the read-only marking, or the
-    # declaration publish itself - rolls the token back so a retry into this
-    # root starts clean rather than colliding on a half-created set or orphaning
-    # a token that never sealed a declaration.
-    $launchTokenCreated = $false
+    # The qualification root must exist to stage into; the runset directory must
+    # NOT, because it is created only by the atomic publish below - so a reader
+    # ever sees either no set or a complete one.
+    $publishParent = Split-Path -Parent $runSetDirectory
+    if (-not (Test-Path -LiteralPath $publishParent -PathType Container)) {
+        [void](New-Item -ItemType Directory -Force -Path $publishParent)
+    }
+    if (Test-Path -LiteralPath $runSetDirectory) {
+        throw ("A run set directory already exists at '$runSetDirectory' but holds no sealed declaration; " +
+            "it is a broken or partial root. Start a new qualification root for a new set.")
+    }
+    # ONE atomic publish boundary, owned by this attempt. The token and the
+    # sealed declaration are staged in a uniquely named directory on the same
+    # volume as the destination, validated end to end, and then made visible by
+    # a single directory rename. A reader sees either no runset directory or a
+    # complete, validated one - never a half-written declaration, nor a token
+    # without its declaration. If this process dies anywhere before the rename,
+    # only this attempt's staging directory is left behind: it is named so status
+    # can report it as incomplete, and it is never mistaken for a declared set.
+    # The launch token's cryptographic binding is unchanged; it is simply minted
+    # inside the transaction so it can never outlive a declaration that failed.
+    $stagingDirectory = Join-Path $publishParent (".runset-staging-" + [Guid]::NewGuid().ToString("N"))
+    [void](New-Item -ItemType Directory -Path $stagingDirectory)
+    $published = $false
     try {
-        $launchTokenStream = [IO.File]::Open($launchTokenPath, [IO.FileMode]::CreateNew,
+        # Mint the launch token into staging (exclusive create, then read-only).
+        $stagedTokenPath = Join-Path $stagingDirectory "launch-authorization.token"
+        $stagedTokenStream = [IO.File]::Open($stagedTokenPath, [IO.FileMode]::CreateNew,
             [IO.FileAccess]::Write, [IO.FileShare]::None)
-        $launchTokenCreated = $true
         try {
-            $launchTokenBytesOut = [Text.UTF8Encoding]::new($false).GetBytes($launchAuthorizationToken)
-            $launchTokenStream.Write($launchTokenBytesOut, 0, $launchTokenBytesOut.Length)
+            $stagedTokenBytes = [Text.UTF8Encoding]::new($false).GetBytes($launchAuthorizationToken)
+            $stagedTokenStream.Write($stagedTokenBytes, 0, $stagedTokenBytes.Length)
         }
-        finally { $launchTokenStream.Dispose() }
-        Set-ItemProperty -LiteralPath $launchTokenPath -Name IsReadOnly -Value $true
-        # Publish the sealed declaration only after the token is durable.
+        finally { $stagedTokenStream.Dispose() }
+        Set-ItemProperty -LiteralPath $stagedTokenPath -Name IsReadOnly -Value $true
+
+        # Seal the declaration into staging.
         $declared = & $compareTool -DeclareRunSet -SnapshotName $plan.Snapshot.Name `
             -SnapshotManifestDigest $plan.Snapshot.ManifestDigest -PlannedRunCount $plan.SlotCount `
-            -PlanDigest $planDigest -Purpose $Purpose -KeyPath $keyPath -OutputDirectory $runSetDirectory
+            -PlanDigest $planDigest -Purpose $Purpose -KeyPath $keyPath -OutputDirectory $stagingDirectory
         if ($LASTEXITCODE -ne 0) {
             throw "The run-set declaration tool exited $LASTEXITCODE; no declaration was published."
         }
-    }
-    catch {
-        # Roll back only the token this attempt created. A pre-existing token
-        # (CreateNew would have thrown) is another set's and is left untouched.
-        if ($launchTokenCreated) {
-            Set-ItemProperty -LiteralPath $launchTokenPath -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $launchTokenPath -Force -ErrorAction SilentlyContinue
+
+        # Validate the staged set END TO END before it is made visible: exactly
+        # one declaration that verifies under the key and matches this plan and
+        # its token-sealed digest, and a token that hashes to the launch
+        # authorization the plan digest sealed. Any staged file that fails a check
+        # is discarded whole; nothing partial is ever published.
+        $stagedVerified = Get-VerifiedRunSetDeclaration -RunSetDirectory $stagingDirectory `
+            -CompareTool $compareTool -RunSetKeyPath $keyPath -Plan $plan -ExpectedPlanDigest $planDigest
+        $stagedTokenHash = Get-ReviewerQualificationLaunchTokenHash `
+            -Token ([IO.File]::ReadAllText($stagedTokenPath)).Trim()
+        if ($stagedTokenHash -cne $launchAuthorizationHash) {
+            throw ("The staged launch token does not hash to the plan-sealed launch authorization; the " +
+                "declaration and its token must bind to the same plan. The staged set is discarded.")
         }
-        throw
+        # An attempt-owned publish marker records what this staging becomes, so a
+        # crash leaves a self-describing, non-launchable residue rather than a
+        # bare directory. It never matches the runset-*.json readers load.
+        $intent = [pscustomobject][ordered]@{
+            kind        = "reviewer.replay-qualification.publish-intent.v1"
+            setId       = [string]$stagedVerified.Declaration.setId
+            planDigest  = $planDigest
+            stagedAtUtc = [DateTime]::UtcNow.ToString("o")
+        }
+        [IO.File]::WriteAllText((Join-Path $stagingDirectory "publish-intent.json"),
+            (ConvertTo-Json -InputObject $intent -Depth 4), [Text.UTF8Encoding]::new($false))
+
+        # ATOMIC PUBLISH. Directory.Move is a same-volume rename: the destination
+        # appears whole or not at all. If it already exists, a concurrent
+        # publisher won the race and exactly one declaration is ever published.
+        try {
+            [IO.Directory]::Move($stagingDirectory, $runSetDirectory)
+        }
+        catch [IO.IOException] {
+            if (Test-Path -LiteralPath $runSetDirectory -PathType Container) {
+                throw ("A run set was published under '$runSetDirectory' by a concurrent declaration; " +
+                    "exactly one declaration wins a qualification root.")
+            }
+            throw
+        }
+        $published = $true
     }
-    $declaredPath = @($declared | Where-Object { $_ -is [string] } | Select-Object -Last 1)
-    Write-Host "Declared run set after a passing preflight: $declaredPath" -ForegroundColor Green
-    Write-Host "  launch authorization: $launchTokenPath (single-use; required by every RunSlot)" -ForegroundColor DarkGray
+    finally {
+        # A staging directory that never published is this attempt's alone - its
+        # name is a fresh GUID - so removing it cannot touch a published set or
+        # another contender's staging. Clear the token's read-only bit first.
+        if (-not $published -and (Test-Path -LiteralPath $stagingDirectory -PathType Container)) {
+            Get-ChildItem -LiteralPath $stagingDirectory -Recurse -File -ErrorAction SilentlyContinue |
+                ForEach-Object { try { $_.IsReadOnly = $false } catch {} }
+            Remove-Item -LiteralPath $stagingDirectory -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $declaredPath = @(Get-ExistingRunSetPath -Directory $runSetDirectory | Select-Object -Last 1)
+    $publishedTokenPath = Join-Path $runSetDirectory "launch-authorization.token"
+    Write-Host "Declared run set (atomically published): $declaredPath" -ForegroundColor Green
+    Write-Host "  launch authorization: $publishedTokenPath (single-use; required by every RunSlot)" -ForegroundColor DarkGray
     Write-Output $declaredPath
     exit 0
 }

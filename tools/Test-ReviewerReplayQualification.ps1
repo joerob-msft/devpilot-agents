@@ -899,11 +899,29 @@ exit 0
     } "Reconciliation accepted a failed slot." "completed successfully"
 
     # The status command reads immutable evidence, not the live process table.
+    # Without a run-set key it can attest the slot evidence is complete, but it
+    # must NOT claim reconciliation readiness off an unverified declaration - it
+    # reports signatureUnverified and withholds reconciliationReady so it can
+    # never positively disagree with the Reconcile gate.
     $statusObject = @(& $statusTool -QualificationRoot $orderRoot | Where-Object { $_ -is [pscustomobject] -and $_.kind })
     Assert-Qualification (@($statusObject).Count -eq 1 -and
         [int]$statusObject[0].slotsAttempted -eq 2 -and [int]$statusObject[0].slotsComplete -eq 2 -and
-        [bool]$statusObject[0].reconciliationReady) `
-        "The status command did not report both slots complete and reconciliation ready."
+        [bool]$statusObject[0].evidenceComplete -and
+        [bool]$statusObject[0].signatureUnverified -and
+        -not [bool]$statusObject[0].reconciliationReady) `
+        "The status command did not report evidence-complete-but-signature-unverified without a run-set key."
+    # With the run-set key it applies the SAME verifier the gate uses, so a
+    # positive reconciliationReady is only ever reported for a verified set - and
+    # matches what Reconcile independently accepted for the same inputs.
+    $statusVerified = @(& $statusTool -QualificationRoot $orderRoot -RunSetKeyPath $keyPath |
+            Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (@($statusVerified).Count -eq 1 -and
+        [bool]$statusVerified[0].evidenceComplete -and
+        -not [bool]$statusVerified[0].signatureUnverified -and
+        [bool]$statusVerified[0].reconciliationReady -and
+        [bool]$statusVerified[0].declaration.signatureVerified -and
+        [bool]$statusVerified[0].declaration.countValid) `
+        "The status command did not confirm reconciliation ready against a verified declaration with a run-set key."
     Assert-Qualification (-not (@($statusObject[0].slots | Where-Object { [bool]$_.recordedChildAlive }).Count)) `
         "The status command reported a completed slot's child as still alive."
     Assert-Qualification ([bool]$statusObject[0].declaration.launchTokenPresent) `
@@ -959,9 +977,9 @@ exit 0
             -LaunchAuthorizationTokenPath $bindTokenPath
     } "The predecessor gate accepted a forged slot1 terminal." "names run set"
 
-    $bindStatus = @(& $statusTool -QualificationRoot $bindRoot | Where-Object { $_ -is [pscustomobject] -and $_.kind })
-    Assert-Qualification (-not [bool]$bindStatus[0].reconciliationReady) `
-        "The status command reported readiness for a forged, unbound terminal."
+    $bindStatus = @(& $statusTool -QualificationRoot $bindRoot -RunSetKeyPath $keyPath | Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (-not [bool]$bindStatus[0].reconciliationReady -and -not [bool]$bindStatus[0].evidenceComplete) `
+        "The status command reported readiness or complete evidence for a forged, unbound terminal."
     $bindSlot1 = @($bindStatus[0].slots | Where-Object { [string]$_.slot -ceq "slot1" })
     Assert-Qualification (@($bindSlot1).Count -eq 1 -and
         [bool]$bindSlot1[0].PSObject.Properties["boundToDeclaration"] -and -not [bool]$bindSlot1[0].boundToDeclaration) `
@@ -1016,10 +1034,124 @@ exit 0
     $strayTerminalPath = Join-Path $strayRoot "runs\slot3-terminal.json"
     Copy-Item -LiteralPath $authenticSlot1Path -Destination $strayTerminalPath -Force
     Set-ItemProperty -LiteralPath $strayTerminalPath -Name IsReadOnly -Value $true
-    $strayStatus = @(& $statusTool -QualificationRoot $strayRoot | Where-Object { $_ -is [pscustomobject] -and $_.kind })
-    Assert-Qualification (-not [bool]$strayStatus[0].reconciliationReady -and
-        @($strayStatus[0].unexpectedSlots) -contains "slot3") `
+    $strayStatus = @(& $statusTool -QualificationRoot $strayRoot -RunSetKeyPath $keyPath | Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (-not [bool]$strayStatus[0].reconciliationReady -and -not [bool]$strayStatus[0].evidenceComplete -and
+        @($strayStatus[0].unexpectedSlots) -ccontains "slot3") `
         "The status command counted a slot outside the declared set toward readiness."
+
+    # -- 12d. Atomic declaration publish, staging residue, count-range guard,
+    #         and case-exact slot membership ---------------------------------
+    Write-Host "12d/13 atomic publish, staging residue, count-range and case-exact slots" -ForegroundColor Cyan
+
+    # A successful Declare publishes a WHOLE run set: the signed declaration, its
+    # launch token, and the publish-intent marker are all present, and no
+    # attempt-owned staging directory is left behind under the root.
+    $publishRoot = Join-Path $sandbox "atomic-publish-root"
+    $publishArguments = $planArguments.Clone()
+    $publishArguments["QualificationRoot"] = $publishRoot
+    $publishArguments["ReviewerScriptPath"] = $failingAgent
+    & $sandboxTool -Mode Declare @publishArguments -RunSetKeyPath $keyPath -Purpose "atomic publish" | Out-Null
+    $publishDecl = @(Get-ChildItem -LiteralPath (Join-Path $publishRoot "runset") -Filter "runset-*.json" -File |
+            Where-Object { $_.Name -notlike "*.sig" })
+    Assert-Qualification (@($publishDecl).Count -eq 1 -and
+        (Test-Path -LiteralPath (Join-Path $publishRoot "runset\launch-authorization.token") -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $publishRoot "runset\publish-intent.json") -PathType Leaf)) `
+        "A successful Declare did not publish a whole run set (declaration + token + intent marker)."
+    Assert-Qualification (-not @(Get-ChildItem -LiteralPath $publishRoot -Directory -Filter ".runset-staging-*" `
+                -ErrorAction SilentlyContinue).Count) `
+        "A successful Declare left attempt-owned staging residue under the root."
+
+    # A second Declare into a published root is refused before it can stage or
+    # mint another token: exactly one declaration owns a root.
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode Declare @publishArguments -RunSetKeyPath $keyPath -Purpose "second declare"
+    } "A second Declare was accepted into an already-declared root." "already"
+
+    # Incomplete attempt-owned staging (a crash between stage and publish) is
+    # self-describing residue: status surfaces it, but it is NEVER a declared or
+    # launchable set - readers only ever look in 'runset', which stays empty, so
+    # neither status nor the gate treats it as evidence.
+    $stagingRoot = Join-Path $sandbox "staging-residue-root"
+    $stagingDir = Join-Path $stagingRoot ".runset-staging-11112222-3333-4444-5555-666677778888"
+    New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null
+    Set-Content -LiteralPath (Join-Path $stagingDir "runset-partial.json") -Value '{"setId":"partial"}' -Encoding utf8NoBOM
+    $stagingStatus = @(& $statusTool -QualificationRoot $stagingRoot -RunSetKeyPath $keyPath |
+            Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (@($stagingStatus).Count -eq 1 -and
+        @($stagingStatus[0].incompleteStaging).Count -eq 1 -and
+        [string]@($stagingStatus[0].incompleteStaging)[0] -clike ".runset-staging-*" -and
+        $null -eq $stagingStatus[0].declaration -and
+        -not [bool]$stagingStatus[0].evidenceComplete -and
+        -not [bool]$stagingStatus[0].reconciliationReady) `
+        "Incomplete staging residue was treated as a declared or launchable set."
+
+    # Two concurrent publishers into the same fresh root: exactly one wins the
+    # atomic rename, the other fails closed, and no half-published set or orphan
+    # staging is left behind - readers see either no set or one whole set.
+    $raceRoot = Join-Path $sandbox "concurrent-publish-root"
+    $raceArguments = $planArguments.Clone()
+    $raceArguments["QualificationRoot"] = $raceRoot
+    $raceArguments["ReviewerScriptPath"] = $failingAgent
+    $raceScript = {
+        param($tool, $mode, $declArgs, $key, $purpose)
+        try { & $tool -Mode $mode @declArgs -RunSetKeyPath $key -Purpose $purpose *>$null; "ok:$LASTEXITCODE" }
+        catch { "err:$($_.Exception.Message)" }
+    }
+    $raceJobs = @(
+        (Start-Job -ScriptBlock $raceScript -ArgumentList $sandboxTool, "Declare", $raceArguments, $keyPath, "race-a"),
+        (Start-Job -ScriptBlock $raceScript -ArgumentList $sandboxTool, "Declare", $raceArguments, $keyPath, "race-b")
+    )
+    $raceResults = @($raceJobs | Wait-Job -Timeout 120 | Receive-Job)
+    $raceJobs | Remove-Job -Force -ErrorAction SilentlyContinue
+    $racePublished = @(Get-ChildItem -LiteralPath (Join-Path $raceRoot "runset") -Filter "runset-*.json" -File `
+            -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike "*.sig" })
+    $raceStagingLeft = @(Get-ChildItem -LiteralPath $raceRoot -Directory -Filter ".runset-staging-*" `
+            -ErrorAction SilentlyContinue)
+    Assert-Qualification (@($racePublished).Count -eq 1 -and @($raceStagingLeft).Count -eq 0) `
+        "Concurrent publishers did not resolve to exactly one whole set with no staging residue."
+
+    # Finding 2: status refuses to derive slots or claim any readiness from a
+    # declaration whose plannedRunCount is outside the supported 2..16 range. A
+    # zero count can never make a zero-terminal set look 'ready', and a '1..0'
+    # style count never misgenerates a descending slot pair.
+    foreach ($badCount in @(0, 1, 17, -3)) {
+        $badRoot = Join-Path $sandbox "badcount-$([Math]::Abs($badCount))-root"
+        New-Item -ItemType Directory -Force -Path (Join-Path $badRoot "runset") | Out-Null
+        Set-Content -LiteralPath (Join-Path $badRoot "runset\runset-bad.json") `
+            -Value ('{"setId":"bad","snapshotName":"s","snapshotManifestDigest":"m","plannedRunCount":' +
+                $badCount + ',"planDigest":"d","promotable":false}') `
+            -Encoding utf8NoBOM
+        $badStatus = @(& $statusTool -QualificationRoot $badRoot | Where-Object { $_ -is [pscustomobject] -and $_.kind })
+        Assert-Qualification (@($badStatus).Count -eq 1 -and
+            -not [bool]$badStatus[0].declaration.countValid -and
+            -not [bool]$badStatus[0].evidenceComplete -and
+            -not [bool]$badStatus[0].reconciliationReady) `
+            "Status derived readiness from an out-of-range plannedRunCount ($badCount)."
+    }
+    # A valid in-range count is accepted as count-valid.
+    $goodCountStatus = @(& $statusTool -QualificationRoot $orderRoot -RunSetKeyPath $keyPath |
+            Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification ([bool]$goodCountStatus[0].declaration.countValid) `
+        "Status rejected an in-range plannedRunCount as invalid."
+
+    # Finding 3: slot membership is case-exact. A 'Slot1' terminal is NEVER
+    # counted where the declared set expects 'slot1'; it is surfaced as an
+    # unexpected slot, matching Reconcile's case-sensitive slot binding.
+    $caseRoot = Join-Path $sandbox "case-exact-root"
+    $caseArguments = $planArguments.Clone()
+    $caseArguments["QualificationRoot"] = $caseRoot
+    $caseArguments["ReviewerScriptPath"] = $failingAgent
+    & $sandboxTool -Mode Declare @caseArguments -RunSetKeyPath $keyPath -Purpose "case-exact slots" | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $caseRoot "runs") | Out-Null
+    $caseTerminalPath = Join-Path $caseRoot "runs\Slot1-terminal.json"
+    Copy-Item -LiteralPath $authenticSlot1Path -Destination $caseTerminalPath -Force
+    Set-ItemProperty -LiteralPath $caseTerminalPath -Name IsReadOnly -Value $true
+    $caseStatus = @(& $statusTool -QualificationRoot $caseRoot -RunSetKeyPath $keyPath |
+            Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (@($caseStatus[0].unexpectedSlots) -ccontains "Slot1" -and
+        -not [bool]$caseStatus[0].evidenceComplete -and
+        -not [bool]$caseStatus[0].reconciliationReady) `
+        "Status counted a case-mismatched 'Slot1' terminal toward a 'slot1' declared set."
 
     # -- 13. No fragile stdout consumer anywhere in the production path -------
     Write-Host "13/13 production execution path uses no Tee-Object" -ForegroundColor Cyan
