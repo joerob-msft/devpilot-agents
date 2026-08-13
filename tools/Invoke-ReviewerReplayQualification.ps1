@@ -90,7 +90,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet("Preflight", "Declare", "RunSlot")][string]$Mode = "Preflight",
+    [ValidateSet("Preflight", "Declare", "RunSlot", "Reconcile")][string]$Mode = "Preflight",
     [Parameter(Mandatory)][string]$RepoPath,
     [Parameter(Mandatory)][string]$ConfigFile,
     [Parameter(Mandatory)][string]$OperatorAlias,
@@ -113,6 +113,7 @@ param(
     [ValidateRange(0, 14400)][int]$ProgressTimeoutSeconds = 0,
     [ValidatePattern('^slot([1-9]|1[0-6])\z')][string]$Slot = "",
     [string]$RunSetKeyPath = "",
+    [string]$LaunchAuthorizationTokenPath = "",
     [string]$Purpose = "",
     [string]$PreflightReportPath = ""
 )
@@ -129,10 +130,112 @@ if (-not $ReviewerScriptPath) {
     $ReviewerScriptPath = Join-Path $toolkitRoot "src\Agents\reviewer\Start-ReviewerAgent.ps1"
 }
 
+# -Slot names the one slot a launch targets, and only RunSlot launches. Accepting
+# it elsewhere would let it scope the no-resume preflight for a mode that must
+# hold every slot pristine (Declare) or read every slot (Reconcile).
+if ($Slot -and $Mode -cne "RunSlot") {
+    throw "-Slot is only valid with -Mode RunSlot; -Mode $Mode acts on the whole run set."
+}
+
 # ---------------------------------------------------------------------------
 # 1. Plan and preflight. Every mode runs this first, and a failure here happens
 #    before anything is declared, written or launched.
+#
+#    The launch-authorization token is a run-set-scoped single-use secret. A
+#    declaration mints one and seals its SHA-256 into the plan digest; a slot
+#    reproduces that digest only by presenting the matching token. A pure
+#    Preflight look and a Reconcile check carry no token - neither declares nor
+#    launches - so their hash stays empty.
 # ---------------------------------------------------------------------------
+$launchAuthorizationToken = ""
+$launchAuthorizationHash = ""
+if ($Mode -ceq "Declare") {
+    $launchTokenBytes = [byte[]]::new(32)
+    [System.Security.Cryptography.RandomNumberGenerator]::Fill($launchTokenBytes)
+    $launchAuthorizationToken = [Convert]::ToHexString($launchTokenBytes).ToLowerInvariant()
+    $launchAuthorizationHash = Get-ReviewerQualificationLaunchTokenHash -Token $launchAuthorizationToken
+}
+elseif ($Mode -ceq "RunSlot") {
+    # A missing token path is reported inside the RunSlot section, after the
+    # slot and key checks, so the failure a caller sees is the first thing it
+    # got wrong. Only a token that was actually supplied is read and hashed here
+    # so the plan the slot preflights carries the same sealed hash the matching
+    # declaration was sealed under.
+    if ($LaunchAuthorizationTokenPath) {
+        $launchTokenPathFull = Get-ReviewerQualificationFullPath -Path $LaunchAuthorizationTokenPath `
+            -Purpose "launch-authorization token"
+        if (-not (Test-Path -LiteralPath $launchTokenPathFull -PathType Leaf)) {
+            throw "Launch-authorization token '$launchTokenPathFull' does not exist. Declare the run set to mint one."
+        }
+        $launchAuthorizationToken = ([IO.File]::ReadAllText($launchTokenPathFull)).Trim()
+        $launchAuthorizationHash = Get-ReviewerQualificationLaunchTokenHash -Token $launchAuthorizationToken
+    }
+}
+
+function Get-VerifiedRunSetDeclaration {
+    <#
+        Reads the single sealed run-set declaration under a qualification root and
+        verifies it under the run-set signing key BEFORE anything in it is
+        believed. An envelope parsed as text is a file anybody could have written;
+        a signature check is the only thing that makes it a declaration. Returns
+        the verified declaration object and its path, and refuses a declaration
+        that names a different snapshot, run count, or plan than this one.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$RunSetDirectory,
+        [Parameter(Mandatory)][string]$CompareTool,
+        [Parameter(Mandatory)][string]$RunSetKeyPath,
+        [Parameter(Mandatory)]$Plan,
+        [string]$ExpectedPlanDigest = ""
+    )
+    $declarationPaths = @()
+    if (Test-Path -LiteralPath $RunSetDirectory -PathType Container) {
+        $declarationPaths = @(Get-ChildItem -LiteralPath $RunSetDirectory -Filter "runset-*.json" -File `
+                -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike "*.sig" } |
+                ForEach-Object { $_.FullName })
+    }
+    if ($declarationPaths.Count -ne 1) {
+        throw ("Expected exactly one sealed run-set declaration under '$RunSetDirectory'; " +
+            "found $($declarationPaths.Count). Declare the set first (-Mode Declare).")
+    }
+    $verifiedOutput = & $CompareTool -VerifyRunSet -RunSetPath $declarationPaths[0] -KeyPath $RunSetKeyPath
+    $verifiedJson = @(@($verifiedOutput) |
+            Where-Object { $_ -is [string] -and $_.TrimStart().StartsWith("{") } |
+            Select-Object -Last 1)
+    if (@($verifiedJson).Count -ne 1) {
+        throw "Verification of '$($declarationPaths[0])' returned no manifest; the declaration did not verify under '$RunSetKeyPath'."
+    }
+    $declaration = [string]$verifiedJson[0] | ConvertFrom-Json
+    if ([string]$declaration.snapshotName -cne [string]$Plan.Snapshot.Name -or
+        [string]$declaration.snapshotManifestDigest -cne [string]$Plan.Snapshot.ManifestDigest) {
+        throw ("The sealed declaration names snapshot '$($declaration.snapshotName)' at digest " +
+            "$($declaration.snapshotManifestDigest); this plan replays '$($Plan.Snapshot.Name)' at " +
+            "$($Plan.Snapshot.ManifestDigest). A slot never runs against a declaration it does not match.")
+    }
+    if ([int]$declaration.plannedRunCount -ne [int]$Plan.SlotCount) {
+        throw ("The sealed declaration plans $([int]$declaration.plannedRunCount) run(s) and this plan has " +
+            "$($Plan.SlotCount) slot(s).")
+    }
+    # The declaration was sealed FOR a plan, not merely for a snapshot. Same
+    # snapshot, different models - or a different reviewed repository, or a
+    # different agent build - is a different qualification wearing this one's
+    # seal. A slot re-runs the plan, so it presents the exact digest to match
+    # (the token-sealed one); reconciliation only reads finished terminals, so it
+    # binds them to the declaration's own authentic digest instead of recomputing
+    # one it would need the launch token to reproduce.
+    $declaredPlanDigest = ""
+    if ($declaration.PSObject.Properties["planDigest"]) { $declaredPlanDigest = [string]$declaration.planDigest }
+    if (-not $declaredPlanDigest) {
+        throw ("The sealed declaration $($declaration.setId) carries no plan digest, so it cannot say which commands " +
+            "it authorized. Declare a new set with this build of the tool.")
+    }
+    if ($ExpectedPlanDigest -and $declaredPlanDigest -cne $ExpectedPlanDigest) {
+        throw ("The sealed declaration $($declaration.setId) was made for plan $declaredPlanDigest and this plan " +
+            "hashes to $ExpectedPlanDigest. Every slot of a set runs the plan that was declared.")
+    }
+    return [pscustomobject]@{ Declaration = $declaration; Path = $declarationPaths[0] }
+}
+
 $plan = New-ReviewerReplayQualificationPlan -RepoPath $RepoPath -ConfigFile $ConfigFile `
     -OperatorAlias $OperatorAlias -PullRequestId $PullRequestId `
     -ReplayRoot $ReplayRoot -ReplaySnapshotName $ReplaySnapshotName `
@@ -144,8 +247,55 @@ $plan = New-ReviewerReplayQualificationPlan -RepoPath $RepoPath -ConfigFile $Con
     -CycleTimeoutSeconds $CycleTimeoutSeconds `
     -ConventionSpecialistTimeoutSeconds $ConventionSpecialistTimeoutSeconds `
     -VerificationTimeoutSeconds $VerificationTimeoutSeconds `
-    -SlotTimeoutSeconds $SlotTimeoutSeconds -ProgressTimeoutSeconds $ProgressTimeoutSeconds
-$evidence = Assert-ReviewerReplayQualificationPlan -Plan $plan
+    -SlotTimeoutSeconds $SlotTimeoutSeconds -ProgressTimeoutSeconds $ProgressTimeoutSeconds `
+    -LaunchAuthorizationHash $launchAuthorizationHash
+
+# ---------------------------------------------------------------------------
+# 1b. Reconciliation readiness. Reconciliation is the only step that reads
+#     across slots. It launches nothing, so it deliberately does NOT run the
+#     per-slot launch-boundary preflight (that refuses a slot whose state
+#     already exists, which is exactly the post-run condition reconciliation
+#     inspects). It verifies the sealed declaration, binds every terminal to
+#     that set and plan, and refuses a partial, failed, or still-live set.
+# ---------------------------------------------------------------------------
+if ($Mode -ceq "Reconcile") {
+    if (-not $RunSetKeyPath) {
+        throw ("-Mode Reconcile requires -RunSetKeyPath. Reconciliation binds every terminal to the sealed " +
+            "declaration, which is verified cryptographically rather than read as text.")
+    }
+    $reconcileKeyPath = Get-ReviewerQualificationFullPath -Path $RunSetKeyPath -Purpose "run-set key"
+    if (-not (Test-Path -LiteralPath $reconcileKeyPath -PathType Leaf)) {
+        throw "Run-set signing key '$reconcileKeyPath' does not exist."
+    }
+    $reconcileCompareTool = Join-Path $toolkitRoot "tools\Compare-ReviewerReplayRuns.ps1"
+    if (-not (Test-Path -LiteralPath $reconcileCompareTool -PathType Leaf)) {
+        throw "Run-set tool '$reconcileCompareTool' does not exist."
+    }
+    $reconcileVerified = Get-VerifiedRunSetDeclaration -RunSetDirectory $plan.RunSetDirectory `
+        -CompareTool $reconcileCompareTool -RunSetKeyPath $reconcileKeyPath -Plan $plan
+    $reconcileSetId = [string]$reconcileVerified.Declaration.setId
+    $reconcileDeclaredDigest = [string]$reconcileVerified.Declaration.planDigest
+    $reconciledSlots = Assert-ReviewerQualificationReconciliationReady -Plan $plan `
+        -ExpectedSetId $reconcileSetId -ExpectedPlanDigest $reconcileDeclaredDigest
+    $reconciliation = [pscustomobject][ordered]@{
+        kind              = "reviewer.replay-qualification.reconciliation-ready.v1"
+        generatedAtUtc    = [DateTime]::UtcNow.ToString("o")
+        qualificationRoot = $plan.QualificationRoot
+        snapshotName      = $plan.Snapshot.Name
+        setId             = $reconcileSetId
+        planDigest        = $reconcileDeclaredDigest
+        slotCount         = [int]$plan.SlotCount
+        deliveryMode      = $plan.DeliveryMode
+        promotable        = $plan.Promotable
+        slots             = @($reconciledSlots)
+    }
+    Write-Host ("Reconciliation ready: all $($plan.SlotCount) slot(s) completed and no recorded child is live.") `
+        -ForegroundColor Green
+    Write-Output $reconciliation
+    exit 0
+}
+
+$evidence = Assert-ReviewerReplayQualificationPlan -Plan $plan -TargetSlot $Slot
 $planDigest = Get-ReviewerQualificationPlanDigest -Plan $plan
 
 $report = [pscustomobject][ordered]@{
@@ -153,6 +303,7 @@ $report = [pscustomobject][ordered]@{
     mode                 = $Mode
     generatedAtUtc       = [DateTime]::UtcNow.ToString("o")
     planDigest           = $planDigest
+    launchAuthorizationHash = $launchAuthorizationHash
     reviewerScriptPath   = $plan.ReviewerScriptPath
     reviewerScriptSha256 = $plan.ReviewerScriptSha256
     toolkitRepository    = $plan.ToolkitRepositoryPath
@@ -245,11 +396,50 @@ if ($Mode -ceq "Declare") {
             "Declare exactly one set per qualification root; start a new root for a new set.")
     }
     [void](New-Item -ItemType Directory -Force -Path $runSetDirectory)
-    $declared = & $compareTool -DeclareRunSet -SnapshotName $plan.Snapshot.Name `
-        -SnapshotManifestDigest $plan.Snapshot.ManifestDigest -PlannedRunCount $plan.SlotCount `
-        -PlanDigest $planDigest -Purpose $Purpose -KeyPath $keyPath -OutputDirectory $runSetDirectory
+    # The single-use launch token whose hash the plan digest was already sealed
+    # under is minted and sealed BEFORE the declaration is published, so a
+    # declaration never outlives a token that failed to write. Written
+    # exclusively (CreateNew) and read-only: a run set mints its token exactly
+    # once, and no second declaration can quietly replace it. The operator hands
+    # this path to RunSlot; a slot without it cannot reproduce the sealed digest
+    # and is refused before any model launch.
+    $launchTokenPath = Join-Path $runSetDirectory "launch-authorization.token"
+    # Token minting and declaration publication share ONE cleanup path. Any
+    # failure - the exclusive create, the write, the read-only marking, or the
+    # declaration publish itself - rolls the token back so a retry into this
+    # root starts clean rather than colliding on a half-created set or orphaning
+    # a token that never sealed a declaration.
+    $launchTokenCreated = $false
+    try {
+        $launchTokenStream = [IO.File]::Open($launchTokenPath, [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $launchTokenCreated = $true
+        try {
+            $launchTokenBytesOut = [Text.UTF8Encoding]::new($false).GetBytes($launchAuthorizationToken)
+            $launchTokenStream.Write($launchTokenBytesOut, 0, $launchTokenBytesOut.Length)
+        }
+        finally { $launchTokenStream.Dispose() }
+        Set-ItemProperty -LiteralPath $launchTokenPath -Name IsReadOnly -Value $true
+        # Publish the sealed declaration only after the token is durable.
+        $declared = & $compareTool -DeclareRunSet -SnapshotName $plan.Snapshot.Name `
+            -SnapshotManifestDigest $plan.Snapshot.ManifestDigest -PlannedRunCount $plan.SlotCount `
+            -PlanDigest $planDigest -Purpose $Purpose -KeyPath $keyPath -OutputDirectory $runSetDirectory
+        if ($LASTEXITCODE -ne 0) {
+            throw "The run-set declaration tool exited $LASTEXITCODE; no declaration was published."
+        }
+    }
+    catch {
+        # Roll back only the token this attempt created. A pre-existing token
+        # (CreateNew would have thrown) is another set's and is left untouched.
+        if ($launchTokenCreated) {
+            Set-ItemProperty -LiteralPath $launchTokenPath -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $launchTokenPath -Force -ErrorAction SilentlyContinue
+        }
+        throw
+    }
     $declaredPath = @($declared | Where-Object { $_ -is [string] } | Select-Object -Last 1)
     Write-Host "Declared run set after a passing preflight: $declaredPath" -ForegroundColor Green
+    Write-Host "  launch authorization: $launchTokenPath (single-use; required by every RunSlot)" -ForegroundColor DarkGray
     Write-Output $declaredPath
     exit 0
 }
@@ -266,49 +456,28 @@ if (-not $RunSetKeyPath) {
     throw ("-Mode RunSlot requires -RunSetKeyPath. The declaration decides whether this slot may run at all, so " +
         "it is verified cryptographically rather than read as text.")
 }
+if (-not $LaunchAuthorizationTokenPath) {
+    throw ("-Mode RunSlot requires -LaunchAuthorizationTokenPath. A declaration mints a single-use launch token " +
+        "and seals its hash into the plan digest; a slot that cannot present it cannot reproduce the sealed " +
+        "declaration and is refused before any model launch.")
+}
 $runSetKeyPath = Get-ReviewerQualificationFullPath -Path $RunSetKeyPath -Purpose "run-set key"
 if (-not (Test-Path -LiteralPath $runSetKeyPath -PathType Leaf)) {
     throw "Run-set signing key '$runSetKeyPath' does not exist."
 }
-$declarations = @(Get-ExistingRunSetPath -Directory $runSetDirectory)
-if ($declarations.Count -ne 1) {
-    throw ("Expected exactly one sealed run-set declaration under '$runSetDirectory' before a slot runs; " +
-        "found $($declarations.Count). Declare the set first (-Mode Declare).")
-}
 # Verified under the key, by the tool that seals declarations, BEFORE anything
-# in it is believed. An envelope parsed as text is a file anybody could have
-# written; a signature check is the only thing that makes it a declaration.
-$verifiedOutput = & $compareTool -VerifyRunSet -RunSetPath $declarations[0] -KeyPath $runSetKeyPath
-$verifiedJson = @(@($verifiedOutput) |
-        Where-Object { $_ -is [string] -and $_.TrimStart().StartsWith("{") } |
-        Select-Object -Last 1)
-if (@($verifiedJson).Count -ne 1) {
-    throw "Verification of '$($declarations[0])' returned no manifest; the declaration did not verify under '$runSetKeyPath'."
-}
-$declaration = [string]$verifiedJson[0] | ConvertFrom-Json
-if ([string]$declaration.snapshotName -cne [string]$plan.Snapshot.Name -or
-    [string]$declaration.snapshotManifestDigest -cne [string]$plan.Snapshot.ManifestDigest) {
-    throw ("The sealed declaration names snapshot '$($declaration.snapshotName)' at digest " +
-        "$($declaration.snapshotManifestDigest); this plan replays '$($plan.Snapshot.Name)' at " +
-        "$($plan.Snapshot.ManifestDigest). A slot never runs against a declaration it does not match.")
-}
-if ([int]$declaration.plannedRunCount -ne [int]$plan.SlotCount) {
-    throw ("The sealed declaration plans $([int]$declaration.plannedRunCount) run(s) and this plan has " +
-        "$($plan.SlotCount) slot(s).")
-}
-# The declaration was sealed FOR a plan, not merely for a snapshot. Same
-# snapshot, different models - or a different reviewed repository, or a
-# different agent build - is a different qualification wearing this one's seal.
-$declaredPlanDigest = ""
-if ($declaration.PSObject.Properties["planDigest"]) { $declaredPlanDigest = [string]$declaration.planDigest }
-if (-not $declaredPlanDigest) {
-    throw ("The sealed declaration $($declaration.setId) carries no plan digest, so it cannot say which commands " +
-        "it authorized. Declare a new set with this build of the tool.")
-}
-if ($declaredPlanDigest -cne $planDigest) {
-    throw ("The sealed declaration $($declaration.setId) was made for plan $declaredPlanDigest and this plan " +
-        "hashes to $planDigest. Every slot of a set runs the plan that was declared.")
-}
+# in it is believed. Same routine reconciliation uses, so a slot and the
+# reconciliation that follows it bind identity the same way.
+$verifiedDeclaration = Get-VerifiedRunSetDeclaration -RunSetDirectory $runSetDirectory `
+    -CompareTool $compareTool -RunSetKeyPath $runSetKeyPath -Plan $plan -ExpectedPlanDigest $planDigest
+$declaration = $verifiedDeclaration.Declaration
+$declarations = @($verifiedDeclaration.Path)
+
+# One authorized, proven slot at a time. Slot N (N > 1) may not start until slot
+# N-1 has an immutable, successful terminal result; a later slot never follows a
+# failed or timed-out one, and reconciliation waits for the whole set.
+Assert-ReviewerQualificationSlotPredecessorComplete -SlotName $target.Name -RunDirectory $plan.RunDirectory `
+    -ExpectedSetId ([string]$declaration.setId) -ExpectedPlanDigest $planDigest
 
 # An attempted slot is immutable. Any state at all - even an empty directory
 # somebody created by hand - means this slot's identity is already spoken for.
@@ -340,6 +509,7 @@ $attempt = [pscustomobject][ordered]@{
     setId         = [string]$declaration.setId
     planDigest    = $planDigest
     declaration   = $declarations[0]
+    launchAuthorizationHash = $launchAuthorizationHash
     snapshotName  = $plan.Snapshot.Name
     snapshotDigest = $plan.Snapshot.ManifestDigest
     stateDir      = $target.StateDir
