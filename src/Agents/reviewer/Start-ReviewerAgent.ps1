@@ -4072,7 +4072,12 @@ function Format-ReviewerAuthoritativeSources {
         [hashtable[]]$Snapshots = @(),
         [ValidateRange(0, 262144)][int]$MaxTotalBytes = 0
     )
-    $items = @($Snapshots)
+    # Defensive against a caller that hands us $null or an array that coerces a
+    # withheld/empty snapshot set into a phantom single $null element: filter nulls
+    # so a fully-withheld authoritative context collapses to the empty early-return
+    # instead of running Measure-Object -Sum over nothing (which throws under
+    # StrictMode: "The property 'Sum' cannot be found on this object").
+    $items = @($Snapshots | Where-Object { $null -ne $_ })
     if ($items.Count -eq 0) { return "" }
     $actualBytes = [int](($items | Measure-Object -Property ByteLength -Sum).Sum)
     if ($MaxTotalBytes -lt 1 -or $actualBytes -gt $MaxTotalBytes) {
@@ -6451,6 +6456,31 @@ function Invoke-DryRunSelfChecks {
         $renderA -cnotmatch '"commitSha":"a{40}"' -or
         $renderA -cnotmatch '"sha256":"82ae4e259f55c0fb1ac8aa1239e210ad0c3b2a43ab006b394affe94a10e16f72"') {
         $failures.Add("Authoritative source rendering did not preserve provenance behind a fresh collision-resistant boundary.")
+    }
+    # Regression: the offline all-convention-sources-withheld path. When every
+    # configured authoritative source is withheld, Get-ReviewerAuthoritativeSource
+    # Snapshots returns an empty array that collapses to AutomationNull, the caller
+    # coerces it to $null through Format-ReviewerAuthoritativeSources' [hashtable[]]
+    # parameter, and @($null) becomes a phantom single-element collection. This
+    # drives the exact deterministic pre-model sequence to the model-launch boundary
+    # under StrictMode and asserts it fails closed to empty text instead of throwing
+    # "The property 'Sum' cannot be found on this object".
+    $withheldRenderFailed = $false
+    foreach ($withheldInput in @(@(), $null, @($null), @($null, $null))) {
+        try {
+            $withheldText = Format-ReviewerAuthoritativeSources -Snapshots $withheldInput -MaxTotalBytes 35
+            if ($null -ne $withheldText -and [string]$withheldText -cne "") { $withheldRenderFailed = $true }
+        }
+        catch { $withheldRenderFailed = $true }
+    }
+    # A phantom $null next to a real snapshot must render only the real source.
+    try {
+        $mixedText = Format-ReviewerAuthoritativeSources -Snapshots @($null, $renderSnapshot) -MaxTotalBytes 35
+        if ([string]$mixedText -cnotmatch '"sha256":"82ae4e259f55c0fb1ac8aa1239e210ad0c3b2a43ab006b394affe94a10e16f72"') { $withheldRenderFailed = $true }
+    }
+    catch { $withheldRenderFailed = $true }
+    if ($withheldRenderFailed) {
+        $failures.Add("The all-authoritative-sources-withheld path did not fail closed to empty rendering under StrictMode.")
     }
     $legacyContext = Get-ReviewerRuntimeContext "nonce" 4242 $cfgRepoId ("a" * 40) "feature/x" "colleague" "[]"
     if (-not $legacyContext) { $failures.Add("Adding authoritative source text changed the positional runtime-context call contract.") }

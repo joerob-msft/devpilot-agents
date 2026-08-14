@@ -2259,6 +2259,53 @@ try {
             "the resolved-count guard in Invoke-ReviewerCycle.")
     }
 
+    # Second all-withheld StrictMode defect (companion to the byte-total guard
+    # above): when every configured authoritative source is withheld, the snapshot
+    # builder returns an empty List[hashtable].ToArray() that PowerShell collapses
+    # to AutomationNull on the function-output boundary. The caller then coerces it
+    # to $null through Format-ReviewerAuthoritativeSources' [hashtable[]] parameter,
+    # @($null) becomes a phantom single-element collection that slips past the
+    # `$items.Count -eq 0` early return, and Measure-Object -Property ByteLength -Sum
+    # over that lone $null emits no object - so `.Sum` throws under StrictMode inside
+    # Format-ReviewerAuthoritativeSources itself. The builders deliberately return a
+    # flat array (a unary-comma wrap is explicitly rejected by Test-ConventionPacks
+    # so convention collectors stay flat), so the defense lives at the consumer:
+    # Format must filter $null elements before the count guard. Pin that filter.
+    $findReviewerFn = {
+        param($Name)
+        $reviewerAst.FindAll({
+                param($c)
+                $c -is [Management.Automation.Language.FunctionDefinitionAst] -and $c.Name -ceq $Name
+            }, $true) | Select-Object -First 1
+    }
+    $formatFn = & $findReviewerFn "Format-ReviewerAuthoritativeSources"
+    Assert-Replay ($null -ne $formatFn) "The reviewer must define Format-ReviewerAuthoritativeSources."
+    # The materialization `$items = @($Snapshots | Where-Object { $null -ne $_ })`
+    # must filter nulls before the `$items.Count -eq 0` early return, so a phantom
+    # @($null) collapses to empty rather than reaching the ByteLength Measure/.Sum.
+    $itemsAssign = @($formatFn.FindAll({
+                param($c)
+                $c -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $c.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+                [string]$c.Left.VariablePath.UserPath -ceq "items"
+            }, $true)) | Select-Object -First 1
+    Assert-Replay ($null -ne $itemsAssign) "Format-ReviewerAuthoritativeSources must assign `$items."
+    $itemsWhere = @($itemsAssign.Right.FindAll({
+                param($c)
+                $c -is [Management.Automation.Language.CommandAst] -and
+                ([string]$c.GetCommandName()) -ceq "Where-Object"
+            }, $true))
+    $itemsNullTest = @($itemsAssign.Right.FindAll({
+                param($c)
+                $c -is [Management.Automation.Language.BinaryExpressionAst] -and
+                $c.Operator -eq [Management.Automation.Language.TokenKind]::Ine -and
+                (([string]$c.Left.Extent.Text -ceq '$null') -or ([string]$c.Right.Extent.Text -ceq '$null'))
+            }, $true))
+    Assert-Replay (@($itemsWhere).Count -ge 1 -and @($itemsNullTest).Count -ge 1) `
+        ("Format-ReviewerAuthoritativeSources must build `$items by filtering `$null elements " +
+        "(@(`$Snapshots | Where-Object { `$null -ne `$_ })) before the count guard so a phantom @(`$null) " +
+        "cannot reach Measure-Object -Sum.")
+
     . (Join-Path $RepoRoot "src\Agents\reviewer\SourceTransport.ps1")
     # The CLI fallback is a second, LIVE transport. In replay it must never be
     # taken, whatever the config says - taking it would resolve `az` on PATH,
