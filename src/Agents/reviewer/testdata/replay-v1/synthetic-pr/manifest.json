@@ -57,6 +57,22 @@
         "project": "Widgets",
         "repositoryId": "11111111-2222-3333-4444-555555555555",
         "pullRequestId": 4242,
+        "includeDiffs": true,
+        "includeLineContent": true,
+        "top": 1000
+      },
+      "requestSha256": "d27fd1ac53f3ddd37ff9e865ec9a36ffb914c1d0b5b99ca4aa76e195d88ff357",
+      "payloadFile": "payloads/pr-changes.json",
+      "payloadSha256": "0bb7ae300b9336e3145432279dc9d54a2d7300e4ea0c6878745d25e69bd9d7c9",
+      "payloadByteLength": 693
+    },
+    {
+      "tool": "repo_pull_request",
+      "arguments": {
+        "action": "get_changes",
+        "project": "Widgets",
+        "repositoryId": "11111111-2222-3333-4444-555555555555",
+        "pullRequestId": 4242,
         "top": 1000
       },
       "requestSha256": "e2ddfc82421505fe95bf2e9f448bff464368723d222733c57b089184fb7c95dd",
@@ -70,9 +86,10 @@
         "action": "list",
         "project": "Widgets",
         "repositoryId": "11111111-2222-3333-4444-555555555555",
-        "pullRequestId": 4242
+        "pullRequestId": 4242,
+        "top": 200
       },
-      "requestSha256": "732910bbc6a71c1493288d9730e15ecb98a137a2e4deb969d2c1d557139ee313",
+      "requestSha256": "6d5187fb26a4a16d9266c8e9f8bbc4566a0b9b916b045f6dca82fc612111d1ea",
       "payloadFile": "payloads/pr-threads.json",
       "payloadSha256": "203303a16f8f8224150d0909a75187b2c832ac83ed83ba989bf5bf76720f0053",
       "payloadByteLength": 402
@@ -121,5 +138,5 @@
       "payloadByteLength": 439
     }
   ],
-  "manifestDigest": "89e8d3cb609d31f05eb43be1f45383fdd815c5783d0c5f179dc9765111d2c2cd"
+  "manifestDigest": "904bb81c21ee3ed4a18c14daff65484b5807820e63d4e1ab05b5d307a78592db"
 }

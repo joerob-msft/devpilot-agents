@@ -28,6 +28,19 @@
       "project": "Widgets",
       "repositoryId": "11111111-2222-3333-4444-555555555555",
       "pullRequestId": 4242,
+      "includeDiffs": true,
+      "includeLineContent": true,
+      "top": 1000
+    },
+    "payloadFile": "payloads/pr-changes.json"
+  },
+  {
+    "tool": "repo_pull_request",
+    "arguments": {
+      "action": "get_changes",
+      "project": "Widgets",
+      "repositoryId": "11111111-2222-3333-4444-555555555555",
+      "pullRequestId": 4242,
       "top": 1000
     },
     "payloadFile": "payloads/pr-changes.json"
@@ -38,7 +51,8 @@
       "action": "list",
       "project": "Widgets",
       "repositoryId": "11111111-2222-3333-4444-555555555555",
-      "pullRequestId": 4242
+      "pullRequestId": 4242,
+      "top": 200
     },
     "payloadFile": "payloads/pr-threads.json"
   },

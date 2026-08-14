@@ -1538,6 +1538,31 @@ function Find-CopilotSessionForBranch {
 # Timed subprocess execution (real Copilot invocation + -DryRun timeout test)
 # ---------------------------------------------------------------------------
 
+function Add-AgentOfflineTelemetryEvent {
+    param(
+        [Parameter(Mandatory)][string]$Event,
+        [hashtable]$Data = @{}
+    )
+    if ($env:DEVPILOT_OFFLINE_TELEMETRY_MODE -cne "production-test-only" -or
+        [string]::IsNullOrWhiteSpace($env:DEVPILOT_OFFLINE_TELEMETRY_PATH)) {
+        return
+    }
+    $record = [ordered]@{
+        schemaVersion = 1
+        event = $Event
+        processId = $PID
+        recordedAtUtc = [DateTime]::UtcNow.ToString("o")
+        data = [ordered]@{}
+    }
+    foreach ($key in @($Data.Keys | Sort-Object -CaseSensitive)) {
+        $record.data[[string]$key] = $Data[$key]
+    }
+    [IO.File]::AppendAllText(
+        $env:DEVPILOT_OFFLINE_TELEMETRY_PATH,
+        (ConvertTo-Json -InputObject $record -Depth 12 -Compress) + [Environment]::NewLine,
+        [Text.UTF8Encoding]::new($false))
+}
+
 function Set-TimedProcessArguments {
     param([Parameter(Mandatory)][System.Diagnostics.ProcessStartInfo]$Psi, [string[]]$ArgumentList)
     foreach ($argument in @($ArgumentList)) { $Psi.ArgumentList.Add($argument) }
@@ -1637,6 +1662,17 @@ function Invoke-TimedProcess {
     $proc = $null
     try {
         $proc = [System.Diagnostics.Process]::Start($psi)
+        $telemetryArguments = @($ArgumentList)
+        for ($argumentIndex = 0; $argumentIndex -lt $telemetryArguments.Count - 1; $argumentIndex++) {
+            if ([string]$telemetryArguments[$argumentIndex] -ceq '-BindingBase64') {
+                $telemetryArguments[$argumentIndex + 1] = '$OPERATIONAL_BINDING'
+            }
+        }
+        Add-AgentOfflineTelemetryEvent -Event "process.started" -Data @{
+            executable = [string]$psi.FileName
+            childProcessId = [int]$proc.Id
+            arguments = $telemetryArguments
+        }
 
         $stdoutTask = $null
         $stderrTask = $null
@@ -2612,6 +2648,10 @@ function Send-AgentMcpRequest {
         if (-not $Params.ContainsKey("name") -or -not $Params.ContainsKey("arguments")) {
             throw "Replay session received a tools/call without a name and arguments."
         }
+        Add-AgentOfflineTelemetryEvent -Event "provider.replayServed" -Data @{
+            method = $Method
+            tool = [string]$Params["name"]
+        }
         return (Get-AgentReplayResponse -Snapshot $Session.Replay -Name ([string]$Params["name"]) -Arguments $Params["arguments"])
     }
     if (-not $Session.Process) { throw "Agent MCP session is closed." }
@@ -2620,6 +2660,10 @@ function Send-AgentMcpRequest {
     $request = [ordered]@{ jsonrpc = "2.0"; id = $requestId; method = $Method; params = $Params }
     $line = $request | ConvertTo-Json -Compress -Depth 20
     try {
+        Add-AgentOfflineTelemetryEvent -Event "provider.liveWrite" -Data @{
+            method = $Method
+            childProcessId = [int]$Session.Process.Id
+        }
         $Session.Process.StandardInput.WriteLine($line)
         $Session.Process.StandardInput.Flush()
     }
@@ -2736,6 +2780,10 @@ function Open-AgentMcpSession {
         if ($Organization -and [string]$ReplaySnapshot.Binding.Organization -cne $Organization) {
             throw "Replay snapshot '$($ReplaySnapshot.SnapshotId)' was captured against organization '$($ReplaySnapshot.Binding.Organization)', not '$Organization'."
         }
+        Add-AgentOfflineTelemetryEvent -Event "provider.replaySessionOpened" -Data @{
+            server = $Server
+            snapshotId = [string]$ReplaySnapshot.SnapshotId
+        }
         return @{
             Process        = $null
             NextId         = [long]0
@@ -2765,6 +2813,11 @@ function Open-AgentMcpSession {
     foreach ($variableName in (Get-AgentSessionIsolationEnvVars)) { [void]$psi.EnvironmentVariables.Remove($variableName) }
 
     $process = [System.Diagnostics.Process]::Start($psi)
+    Add-AgentOfflineTelemetryEvent -Event "provider.liveProcessStarted" -Data @{
+        executable = [string]$psi.FileName
+        childProcessId = [int]$process.Id
+        server = $Server
+    }
     $session = @{
         Process        = $process
         NextId         = [long]0

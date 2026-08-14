@@ -1,0 +1,190 @@
+{
+  "schemaVersion": 1,
+  "kind": "reviewer-offline-model-adapter",
+  "fixtureId": "synthetic-exact-path",
+  "expectedBaseCommit": "ccbf14632064118f008539becec2fef77030cf54",
+  "adapterScript": "../../offline/Invoke-ReviewerModelAdapter.ps1",
+  "adapterScriptSha256": "6bff33f3839aee0d3f81741a3423096c739f77aeef4146fdc3caf8de9bda0717",
+  "classification": {
+    "offlineOnly": true,
+    "nonPromotable": true,
+    "writesPermitted": false,
+    "outputsPreAuthored": true,
+    "oracleDerivedAtRuntime": false
+  },
+  "roles": {
+    "blind-opus": {
+      "model": "claude-opus-5",
+      "behavior": "success",
+      "markerPrefix": "REVIEWER_RESULT_V1:",
+      "markerTemplate": {
+        "schemaVersion": 1,
+        "prId": "{{binding.prId}}",
+        "repositoryId": "{{binding.repositoryId}}",
+        "project": "{{binding.project}}",
+        "reviewedSourceCommit": "{{binding.reviewedSourceCommit}}",
+        "findings": [
+          {
+            "severity": "important",
+            "filePath": "/src/Widget.cs",
+            "line": 15,
+            "comment": "The new Rename method mutates an identifier documented and initialized as construction-stable. Preserve the original identifier or update the contract and add a regression test for the intended lifecycle."
+          }
+        ],
+        "recommendedVote": "waitForAuthor",
+        "summary": "One construction-lifecycle regression requires clarification.",
+        "nonce": "{{binding.nonce}}"
+      }
+    },
+    "blind-gpt": {
+      "model": "gpt-5.6-sol",
+      "behavior": "success",
+      "markerPrefix": "REVIEWER_RESULT_V1:",
+      "markerTemplate": {
+        "schemaVersion": 1,
+        "prId": "{{binding.prId}}",
+        "repositoryId": "{{binding.repositoryId}}",
+        "project": "{{binding.project}}",
+        "reviewedSourceCommit": "{{binding.reviewedSourceCommit}}",
+        "findings": [],
+        "recommendedVote": "approve",
+        "summary": "No additional finding.",
+        "nonce": "{{binding.nonce}}"
+      }
+    },
+    "specialist": {
+      "model": "claude-sonnet-5",
+      "behavior": "success",
+      "markerPrefix": "CONVENTION_REVIEW_RESULT_V2:",
+      "markerTemplate": {
+        "schemaVersion": 2,
+        "prId": "{{binding.prId}}",
+        "repositoryId": "{{binding.repositoryId}}",
+        "project": "{{binding.project}}",
+        "reviewedSourceCommit": "{{binding.reviewedSourceCommit}}",
+        "targetCommit": "{{binding.targetCommit}}",
+        "changeSetDigest": "{{binding.changeSetDigest}}",
+        "conventionPlanSha256": "{{binding.conventionPlanSha256}}",
+        "factPlanSha256": "{{binding.factPlanSha256}}",
+        "configSha256": "{{binding.configSha256}}",
+        "scriptSha256": "{{binding.scriptSha256}}",
+        "promptSha256": "{{binding.promptSha256}}",
+        "candidates": [],
+        "ruleCoverage": [
+          {
+            "ruleRef": "rs1",
+            "ruleSourceSha256": "{{runtime.ruleCoverageRequest.requiredRows.0.ruleSourceSha256}}",
+            "ruleQuote": "",
+            "status": "notApplicable",
+            "scope": "none",
+            "violatingConstructs": "",
+            "compliantConstructs": "",
+            "notInReachConstructs": "{{derived.allConstructIds}}",
+            "unknownConstructs": "",
+            "violatingChangedFileTargets": "",
+            "codeEvidence": "The transported rule does not govern this synthetic lifecycle change.",
+            "siblingStatus": "notRequired",
+            "siblingEvidence": "",
+            "candidateId": "",
+            "notes": "All sealed constructs were explicitly classified outside this rule's reach."
+          }
+        ],
+        "withheld": [],
+        "residualRisks": [],
+        "nonce": "{{binding.nonce}}"
+      }
+    },
+    "reciprocal-opus-verifier": {
+      "model": "claude-opus-5",
+      "behavior": "success",
+      "markerPrefix": "VERIFICATION_RESULT_V1:",
+      "markerTemplate": {
+        "schemaVersion": 1,
+        "prId": "{{binding.prId}}",
+        "repositoryId": "{{binding.repositoryId}}",
+        "project": "{{binding.project}}",
+        "reviewedSourceCommit": "{{binding.reviewedSourceCommit}}",
+        "targetCommit": "{{binding.targetCommit}}",
+        "changeSetDigest": "{{binding.changeSetDigest}}",
+        "verificationInputSha256": "{{binding.verificationInputSha256}}",
+        "clusterId": "{{binding.clusterId}}",
+        "configSha256": "{{binding.configSha256}}",
+        "scriptSha256": "{{binding.scriptSha256}}",
+        "promptSha256": "{{binding.promptSha256}}",
+        "verifierModel": "{{binding.verifierModel}}",
+        "verdicts": [
+          {
+            "candidateId": "{{runtime.candidates.0.candidateId}}",
+            "candidateHash": "{{runtime.candidates.0.candidateHash}}",
+            "outcome": "verified",
+            "evidenceKind": "{{runtime.candidateEvidenceOptions.0.options.0.kind}}",
+            "evidenceSha256": "{{runtime.candidateEvidenceOptions.0.options.0.sha256}}",
+            "factIds": "{{runtime.candidateEvidenceOptions.0.options.0.factIds}}",
+            "duplicateTargetId": "",
+            "correctedSeverity": "none",
+            "rationale": "The sealed changed-source evidence supports the bounded lifecycle claim.",
+            "confidence": "high",
+            "changedCodeFixOutcome": "notApplicable",
+            "changedCodeFixEvidenceSha256": "",
+            "changedCodeFixFactIds": "",
+            "existingDebtFollowUpOutcome": "notRequested",
+            "existingDebtEvidenceSha256": "",
+            "existingDebtEvidenceFactId": ""
+          }
+        ],
+        "diagnostics": [],
+        "nonce": "{{binding.nonce}}"
+      }
+    },
+    "reciprocal-gpt-verifier": {
+      "model": "gpt-5.6-sol",
+      "behavior": "success",
+      "markerPrefix": "VERIFICATION_RESULT_V1:",
+      "markerTemplate": {
+        "schemaVersion": 1,
+        "prId": "{{binding.prId}}",
+        "repositoryId": "{{binding.repositoryId}}",
+        "project": "{{binding.project}}",
+        "reviewedSourceCommit": "{{binding.reviewedSourceCommit}}",
+        "targetCommit": "{{binding.targetCommit}}",
+        "changeSetDigest": "{{binding.changeSetDigest}}",
+        "verificationInputSha256": "{{binding.verificationInputSha256}}",
+        "clusterId": "{{binding.clusterId}}",
+        "configSha256": "{{binding.configSha256}}",
+        "scriptSha256": "{{binding.scriptSha256}}",
+        "promptSha256": "{{binding.promptSha256}}",
+        "verifierModel": "{{binding.verifierModel}}",
+        "verdicts": [
+          {
+            "candidateId": "{{runtime.candidates.0.candidateId}}",
+            "candidateHash": "{{runtime.candidates.0.candidateHash}}",
+            "outcome": "verified",
+            "evidenceKind": "{{runtime.candidateEvidenceOptions.0.options.0.kind}}",
+            "evidenceSha256": "{{runtime.candidateEvidenceOptions.0.options.0.sha256}}",
+            "factIds": "{{runtime.candidateEvidenceOptions.0.options.0.factIds}}",
+            "duplicateTargetId": "",
+            "correctedSeverity": "none",
+            "rationale": "The sealed changed-source evidence supports the bounded lifecycle claim.",
+            "confidence": "high",
+            "changedCodeFixOutcome": "notApplicable",
+            "changedCodeFixEvidenceSha256": "",
+            "changedCodeFixFactIds": "",
+            "existingDebtFollowUpOutcome": "notRequested",
+            "existingDebtEvidenceSha256": "",
+            "existingDebtEvidenceFactId": ""
+          }
+        ],
+        "diagnostics": [],
+        "nonce": "{{binding.nonce}}"
+      }
+    },
+    "compatibility-generalist": {
+      "model": "gpt-5.6-sol",
+      "behavior": "missingMarker"
+    },
+    "compatibility-verifier": {
+      "model": "gpt-5.6-sol",
+      "behavior": "missingMarker"
+    }
+  }
+}

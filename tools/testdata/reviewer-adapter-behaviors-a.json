@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "kind": "reviewer-offline-model-adapter",
+  "expectedBaseCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "classification": { "offlineOnly": true, "nonPromotable": true, "writesPermitted": false, "outputsPreAuthored": true, "oracleDerivedAtRuntime": false },
+  "roles": {
+    "blind-gpt": { "model": "gpt-5.6-sol", "behavior": "success", "markerPrefix": "TEST_RESULT_V1:", "markerTemplate": { "schemaVersion": 1, "nonce": "{{binding.nonce}}", "decision": "accept" } },
+    "blind-opus": { "model": "claude-opus-5", "behavior": "missingMarker" },
+    "specialist": { "model": "claude-sonnet-5", "behavior": "truncatedMarker", "markerPrefix": "TEST_RESULT_V1:", "markerTemplate": { "schemaVersion": 1, "nonce": "{{binding.nonce}}", "decision": "accept" } },
+    "reciprocal-gpt-verifier": { "model": "gpt-5.6-sol", "behavior": "multipleMarkers", "markerPrefix": "TEST_RESULT_V1:", "markerTemplate": { "schemaVersion": 1, "nonce": "{{binding.nonce}}", "decision": "accept" } },
+    "reciprocal-opus-verifier": { "model": "claude-opus-5", "behavior": "wrongBinding", "markerPrefix": "TEST_RESULT_V1:", "markerTemplate": { "schemaVersion": 1, "nonce": "{{binding.nonce}}", "decision": "accept" } },
+    "compatibility-generalist": { "model": "gpt-5.6-sol", "behavior": "timeout", "delaySeconds": 4 },
+    "compatibility-verifier": { "model": "gpt-5.6-sol", "behavior": "crash", "exitCode": 23 }
+  }
+}

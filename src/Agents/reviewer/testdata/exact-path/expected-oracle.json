@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "kind": "reviewer-orchestration-expected-oracle",
+  "fixtureId": "synthetic-exact-path",
+  "expectedSemanticSha256": "37ddc4674e54cb1e0335a63fdf702fea7490d2f5ba797ea86e66074ecc6f7503",
+  "provenance": {
+    "author": "hand-authored synthetic fixture",
+    "modelQualityClaim": false,
+    "purpose": "orchestration correctness only"
+  },
+  "expected": {
+    "generalistPassesComplete": 2,
+    "rawFindingCount": 1,
+    "specialistStatus": "notApplicable",
+    "specialistCandidateCount": 0,
+    "reciprocalAssignmentCount": 2,
+    "verificationStatus": "degraded",
+    "eligibleCandidateCount": 1,
+    "deliveryMode": "shadow-only",
+    "externalWrites": 0,
+    "realModelLaunches": 0
+  }
+}

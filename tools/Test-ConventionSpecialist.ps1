@@ -1498,10 +1498,13 @@ Assert-Specialist ($gateThrew -and $gateErr -match 'convention specialist' -and 
 foreach ($surfaceFn in @('Invoke-ReviewerModelPass', 'Invoke-ReviewerConventionSpecialistPass', 'Invoke-ReviewerVerificationModelRun')) {
     $surfaceText = Get-FunctionText -Text $wrapperText -Name $surfaceFn
     $gateIndex = $surfaceText.IndexOf('Assert-ReviewerModelResultContractFits', [StringComparison]::Ordinal)
-    $launchIndex = $surfaceText.IndexOf('Invoke-TimedProcess', [StringComparison]::Ordinal)
+    $launchIndex = $surfaceText.IndexOf('Invoke-ReviewerModelSubprocess', [StringComparison]::Ordinal)
     Assert-Specialist ($gateIndex -ge 0 -and $launchIndex -ge 0 -and $gateIndex -lt $launchIndex) `
-        "$surfaceFn does not run the pre-launch contract gate before Invoke-TimedProcess."
+        "$surfaceFn does not run the pre-launch contract gate before the shared production subprocess boundary."
 }
+$subprocessText = Get-FunctionText -Text $wrapperText -Name 'Invoke-ReviewerModelSubprocess'
+Assert-Specialist ($subprocessText -match 'Invoke-TimedProcess') `
+    "The shared production subprocess boundary no longer reaches Invoke-TimedProcess."
 
 # ---------------------------------------------------------------------------
 # Layer A (item 2/this turn): the generalist marker window/cap must fit the
@@ -1723,7 +1726,13 @@ Assert-Specialist ($specialistPassText -match 'specialist-attempt-accounting' -a
     $specialistPassText -match 'nonceSha256 = \(Get-ReviewerTextSha256') `
     "The specialist loop does not emit per-attempt accounting keyed by a hashed nonce."
 # The accounting records the nonce only as a SHA-256, never the raw nonce value.
-Assert-Specialist ($specialistPassText -notmatch 'nonce = \$AttemptNonce' -and $specialistPassText -notmatch 'nonce = \$nonce\b') `
+$accountingStart = $specialistPassText.IndexOf('$emitSpecialistAcct = {', [StringComparison]::Ordinal)
+$accountingEnd = $specialistPassText.IndexOf('$specialistAttempt = 1', [StringComparison]::Ordinal)
+$accountingText = if ($accountingStart -ge 0 -and $accountingEnd -gt $accountingStart) {
+    $specialistPassText.Substring($accountingStart, $accountingEnd - $accountingStart)
+} else { '' }
+Assert-Specialist ($accountingText -and $accountingText -notmatch 'nonce = \$AttemptNonce' -and
+    $accountingText -notmatch 'nonce = \$nonce\b') `
     "The specialist accounting leaks a raw nonce instead of its hash."
 
 # ---------------------------------------------------------------------------
@@ -1767,7 +1776,7 @@ Assert-Specialist ($specialistPassText -match 'mode = "specialist-launch-refused
     $specialistPassText -match 'reason = "contractFit"') `
     "A specialist contract-fit refusal does not emit its own launch-refusal metadata."
 $refuseStart = $specialistPassText.IndexOf('specialist-launch-refused', [StringComparison]::Ordinal)
-$refuseLaunch = $specialistPassText.IndexOf('Invoke-TimedProcess', [StringComparison]::Ordinal)
+$refuseLaunch = $specialistPassText.IndexOf('Invoke-ReviewerModelSubprocess', [StringComparison]::Ordinal)
 $refuseBlock = if ($refuseStart -ge 0 -and $refuseLaunch -gt $refuseStart) {
     $specialistPassText.Substring($refuseStart, $refuseLaunch - $refuseStart)
 } else { '' }
@@ -1793,7 +1802,8 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
 # mocks and $script: config never leak into later tests.
 # ---------------------------------------------------------------------------
 & {
-    foreach ($fn in 'Get-ReviewerMarkerSchema', 'Test-ReviewerMarkerBinding', 'Get-ReviewerHashValue', 'Invoke-ReviewerModelPass') {
+    foreach ($fn in 'Get-ReviewerMarkerSchema', 'Test-ReviewerMarkerBinding', 'Get-ReviewerHashValue',
+        'Invoke-ReviewerModelSubprocess', 'Invoke-ReviewerModelPass') {
         Invoke-Expression (Get-FunctionText -Text $wrapperText -Name $fn)
     }
     # Assert-ReviewerModelResultContractFits was already defined above; the pass
@@ -1803,6 +1813,8 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
     $script:ReviewerMaxModelInputBytes = 10485760
     $script:ReviewerMarkerScanWindowChars = 65536
     $script:ReviewerMarkerMaxOutputBytes = 131072
+    $script:ReviewerGeneralistModelPair = Get-AgentGeneralistModelPair
+    $script:ReviewerOfflineModelAdapterActive = $false
     $ExpectedProject = 'One'
     $EffectiveMaxFindings = 12
     $ResultMarkerPrefix = 'REVIEWER_RESULT_V1:'
