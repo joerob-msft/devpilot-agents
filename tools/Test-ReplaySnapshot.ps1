@@ -2178,33 +2178,69 @@ try {
             }, $true))
     Assert-Replay (@($byteSumAccess).Count -ge 1) `
         "Invoke-ReviewerCycle must total authoritative-source bytes via a ByteLength Measure-Object -Sum."
-    $resolvedCountGuards = @($cycleFn.FindAll({
+    # Structural (not text) match of the guard condition: exactly the binary
+    # expression `$resolvedSourceCount -gt 0`. A regex would accept a weakened
+    # condition such as `-gt 0 -or $true` (which parses as an -or BinaryExpression,
+    # not -gt), so require the clause condition to BE a -gt BinaryExpression whose
+    # left is $resolvedSourceCount and whose right is the constant 0.
+    $isExactResolvedGuard = {
+        param($Clause)
+        $cond = $Clause.Item1
+        $expr = $null
+        if ($cond -is [Management.Automation.Language.PipelineAst] -and
+            @($cond.PipelineElements).Count -eq 1 -and
+            $cond.PipelineElements[0] -is [Management.Automation.Language.CommandExpressionAst]) {
+            $expr = $cond.PipelineElements[0].Expression
+        }
+        ($expr -is [Management.Automation.Language.BinaryExpressionAst] -and
+            $expr.Operator -eq [Management.Automation.Language.TokenKind]::Igt -and
+            $expr.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+            [string]$expr.Left.VariablePath.UserPath -ceq "resolvedSourceCount" -and
+            $expr.Right -is [Management.Automation.Language.ConstantExpressionAst] -and
+            [int]$expr.Right.Value -eq 0)
+    }
+    $resolvedGuardBodies = @()
+    foreach ($ifStatement in $cycleFn.FindAll({
                 param($c) $c -is [Management.Automation.Language.IfStatementAst]
-            }, $true) | Where-Object {
-            $matched = $false
-            foreach ($clause in $_.Clauses) {
-                if (([string]$clause.Item1.Extent.Text) -match '(?i)\$resolvedSourceCount\s*-gt\s*0') { $matched = $true }
-            }
-            $matched
-        })
-    Assert-Replay (@($resolvedCountGuards).Count -ge 1) `
-        "Invoke-ReviewerCycle must guard the authoritative-source byte total on `$resolvedSourceCount -gt 0."
+            }, $true)) {
+        foreach ($clause in $ifStatement.Clauses) {
+            if (& $isExactResolvedGuard $clause) { $resolvedGuardBodies += $clause.Item2 }
+        }
+    }
+    Assert-Replay (@($resolvedGuardBodies).Count -ge 1) `
+        "Invoke-ReviewerCycle must guard the authoritative-source byte total on exactly `$resolvedSourceCount -gt 0."
+    # The byte accumulator must be initialized to 0 BEFORE (dominating) the guard,
+    # so an all-withheld cycle reports 0 bytes rather than an undefined value.
+    $zeroInit = @($cycleFn.FindAll({
+                param($c)
+                $c -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $c.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+                [string]$c.Left.VariablePath.UserPath -ceq "authoritativeSourceBytes" -and
+                $c.Right -is [Management.Automation.Language.CommandExpressionAst] -and
+                $c.Right.Expression -is [Management.Automation.Language.ConstantExpressionAst] -and
+                [int]$c.Right.Expression.Value -eq 0
+            }, $true))
+    Assert-Replay (@($zeroInit).Count -ge 1) `
+        "Invoke-ReviewerCycle must initialize `$authoritativeSourceBytes = 0 before the resolved-count guard."
     foreach ($access in $byteSumAccess) {
         $guarded = $false
-        foreach ($guard in $resolvedCountGuards) {
-            foreach ($clause in $guard.Clauses) {
-                $body = $clause.Item2
-                if ($null -ne $body -and
-                    $body.Extent.StartOffset -le $access.Extent.StartOffset -and
-                    $body.Extent.EndOffset -ge $access.Extent.EndOffset) {
-                    $guarded = $true; break
+        $initDominates = $false
+        foreach ($body in $resolvedGuardBodies) {
+            if ($null -ne $body -and
+                $body.Extent.StartOffset -le $access.Extent.StartOffset -and
+                $body.Extent.EndOffset -ge $access.Extent.EndOffset) {
+                $guarded = $true
+                foreach ($init in $zeroInit) {
+                    if ($init.Extent.StartOffset -lt $body.Extent.StartOffset) { $initDominates = $true }
                 }
+                break
             }
-            if ($guarded) { break }
         }
         Assert-Replay $guarded `
             ("Every authoritative-source ByteLength Measure-Object -Sum in Invoke-ReviewerCycle must sit inside an " +
             "if (`$resolvedSourceCount -gt 0) guard so an all-withheld replay cannot read .Sum off an empty pipeline.")
+        Assert-Replay $initDominates `
+            "The `$authoritativeSourceBytes = 0 initialization must precede the guarded byte total in Invoke-ReviewerCycle."
     }
 
     . (Join-Path $RepoRoot "src\Agents\reviewer\SourceTransport.ps1")
