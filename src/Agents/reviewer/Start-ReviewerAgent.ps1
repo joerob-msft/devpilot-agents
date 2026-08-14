@@ -343,6 +343,11 @@ param(
     [ValidatePattern('^[0-9a-fA-F]{40}\z')]
     [string]$ExpectedReviewerBaseCommit,
 
+    # Direct JSONL event telemetry for the production-test-only adapter path.
+    # Requiring a new output file makes absence of events distinguishable from
+    # stale evidence left by a prior run.
+    [string]$OfflineTelemetryPath,
+
     # Optional private capture seam for schema-v2 replay snapshots. The file is
     # canonical, identity-bound source evidence, not a delivery artifact.
     [string]$CaptureSourceTransportArtifactPath,
@@ -2818,22 +2823,29 @@ if ($ReplaySnapshotName -or $ReplayRoot -or $ReplayManifestDigest) {
 }
 
 $offlineAdapterRequested = ([bool]$EnableOfflineModelAdapter -or
-    [bool]$OfflineModelAdapterManifest -or [bool]$ExpectedReviewerBaseCommit)
+    [bool]$OfflineModelAdapterManifest -or [bool]$ExpectedReviewerBaseCommit -or
+    [bool]$OfflineTelemetryPath)
 $script:ReviewerOfflineModelAdapterActive = $false
 $script:ReviewerOfflineModelAdapterManifestPath = ""
 $script:ReviewerOfflineModelAdapterScriptPath = ""
 $script:ReviewerOfflineModelAdapterExpectedBaseCommit = ""
 if ($offlineAdapterRequested) {
     if (-not $EnableOfflineModelAdapter -or -not $OfflineModelAdapterManifest -or
-        -not $ExpectedReviewerBaseCommit) {
+        -not $ExpectedReviewerBaseCommit -or -not $OfflineTelemetryPath) {
         throw ("The offline model adapter requires all of -EnableOfflineModelAdapter, " +
-            "-OfflineModelAdapterManifest, and -ExpectedReviewerBaseCommit.")
+            "-OfflineModelAdapterManifest, -ExpectedReviewerBaseCommit, and -OfflineTelemetryPath.")
     }
     if (-not $script:ReviewerReplayActive) {
         throw "The offline model adapter is test-only and may run only inside sealed offline replay."
     }
     if (-not (Test-Path -LiteralPath $OfflineModelAdapterManifest -PathType Leaf)) {
         throw "Offline model adapter manifest '$OfflineModelAdapterManifest' does not exist."
+    }
+    $telemetryPath = [IO.Path]::GetFullPath($OfflineTelemetryPath)
+    $telemetryParent = Split-Path $telemetryPath -Parent
+    if (-not (Test-Path -LiteralPath $telemetryParent -PathType Container) -or
+        (Test-Path -LiteralPath $telemetryPath)) {
+        throw "Offline telemetry requires an existing parent and a new output file."
     }
     $adapterManifestPath = (Resolve-Path -LiteralPath $OfflineModelAdapterManifest).Path
     $adapterManifest = Get-Content -LiteralPath $adapterManifestPath -Raw | ConvertFrom-Json -Depth 64
@@ -2878,6 +2890,8 @@ if ($offlineAdapterRequested) {
     $script:ReviewerOfflineModelAdapterManifestPath = $adapterManifestPath
     $script:ReviewerOfflineModelAdapterScriptPath = $adapterScriptPath
     $script:ReviewerOfflineModelAdapterExpectedBaseCommit = $expectedBase
+    $env:DEVPILOT_OFFLINE_TELEMETRY_MODE = "production-test-only"
+    $env:DEVPILOT_OFFLINE_TELEMETRY_PATH = $telemetryPath
 }
 
 # The ordered pass list is the single source of truth for how many model runs a

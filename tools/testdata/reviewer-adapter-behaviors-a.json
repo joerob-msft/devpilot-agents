@@ -13,4 +13,3 @@
     "compatibility-verifier": { "model": "gpt-5.6-sol", "behavior": "crash", "exitCode": 23 }
   }
 }
-

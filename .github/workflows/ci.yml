@@ -215,6 +215,10 @@ jobs:
         shell: pwsh
         run: ./tools/Test-ReviewerExactPath.ps1
 
+      - name: reviewer structural coverage golden
+        shell: pwsh
+        run: ./tools/Test-ReviewerStructuralCoverage.ps1
+
       - name: reviewer - offline replay is fail-closed and preview-only
         shell: pwsh
         run: |

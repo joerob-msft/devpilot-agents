@@ -32,3 +32,24 @@ same analyzed input. Its guard recognition is intentionally limited to direct
 count comparisons, `??` defaults, and direct terminating empty-count guards.
 Additional real-code sampling and labeled counterexamples should precede a
 blocking rollout.
+
+## Repository-wide reporting measurement
+
+The reporting-mode command above was also run over all of `src/`. It emitted 23
+findings: 7 `PSEN001`, 14 `PSEN002`, and 2 `PSEN003`. A deterministic sample of
+the first 12 findings in file/line/rule order was manually classified against
+the surrounding implementation:
+
+| Classification | Count | Representative evidence |
+|---|---:|---|
+| True positive | 1 | `ConventionPacks.ps1` reads `.Sum` from an empty-capable resolved-source list without a default |
+| False positive | 8 | Preserved `return ,@(...)` output, string casts that eliminate null, predicate references to `$null`, and explicit non-empty guards |
+| Unknown / intentional test construct | 3 | Adversarial fixture arrays deliberately containing `$null` and parser-shape probes |
+
+This sample is useful for direction, not a statistical precision estimate:
+only 12 of 23 reports were classified, selection was deterministic rather than
+random, and dynamic output cardinality cannot always be proven statically.
+The observed actionable precision among classified non-test reports was low
+(1/9). In-place prevention is therefore viable only in reporting mode today;
+making the rule blocking would create avoidable churn until command-return
+contracts, explicit fixture scopes, and indirect count guards are modeled.

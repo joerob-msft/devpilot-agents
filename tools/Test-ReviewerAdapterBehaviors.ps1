@@ -47,6 +47,9 @@ foreach ($case in $cases) {
     $result = Invoke-Case $case.Manifest $case.Role $case.Model $timeout
     if ($case.ContainsKey('TimedOut') -and $case.TimedOut) {
         if (-not $result.TimedOut) { throw "$($case.Name): expected timeout." }
+        if ($result.ProcessId -and (Get-Process -Id $result.ProcessId -ErrorAction SilentlyContinue)) {
+            throw "$($case.Name): timed-out child process $($result.ProcessId) was not terminated."
+        }
     } else {
         if ($result.TimedOut -or $result.ExitCode -ne [int]$case.Exit) {
             throw "$($case.Name): exit=$($result.ExitCode), timedOut=$($result.TimedOut), stderr=$($result.StdErr)"
