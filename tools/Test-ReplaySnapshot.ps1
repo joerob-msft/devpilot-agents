@@ -2283,26 +2283,61 @@ try {
     # The materialization `$items = @($Snapshots | Where-Object { $null -ne $_ })`
     # must filter nulls before the `$items.Count -eq 0` early return, so a phantom
     # @($null) collapses to empty rather than reaching the ByteLength Measure/.Sum.
-    $itemsAssign = @($formatFn.FindAll({
+    # Locate the count guard first, then pin the LAST $items assignment that
+    # dominates it: this rejects a later `$items = @($Snapshots)` reassignment that
+    # would shadow a filtered earlier one and silently restore the StrictMode crash
+    # while a naive "some Where-Object exists somewhere" check still passed.
+    $itemsAssigns = @($formatFn.FindAll({
                 param($c)
                 $c -is [Management.Automation.Language.AssignmentStatementAst] -and
                 $c.Left -is [Management.Automation.Language.VariableExpressionAst] -and
                 [string]$c.Left.VariablePath.UserPath -ceq "items"
+            }, $true))
+    Assert-Replay (@($itemsAssigns).Count -ge 1) "Format-ReviewerAuthoritativeSources must assign `$items."
+    # The early-return guard: an if whose condition is exactly `$items.Count -eq 0`.
+    $countGuardIf = @($formatFn.FindAll({
+                param($c)
+                $c -is [Management.Automation.Language.IfStatementAst] -and
+                @($c.Clauses).Count -ge 1 -and
+                (@($c.Clauses[0].Item1.FindAll({
+                                param($b)
+                                $b -is [Management.Automation.Language.BinaryExpressionAst] -and
+                                $b.Operator -eq [Management.Automation.Language.TokenKind]::Ieq -and
+                                $b.Left -is [Management.Automation.Language.MemberExpressionAst] -and
+                                $b.Left.Expression -is [Management.Automation.Language.VariableExpressionAst] -and
+                                [string]$b.Left.Expression.VariablePath.UserPath -ceq "items" -and
+                                $b.Left.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                                [string]$b.Left.Member.Value -ceq "Count" -and
+                                $b.Right -is [Management.Automation.Language.ConstantExpressionAst] -and
+                                [double]$b.Right.Value -eq 0
+                            }, $true))).Count -ge 1
             }, $true)) | Select-Object -First 1
-    Assert-Replay ($null -ne $itemsAssign) "Format-ReviewerAuthoritativeSources must assign `$items."
-    $itemsWhere = @($itemsAssign.Right.FindAll({
+    Assert-Replay ($null -ne $countGuardIf) `
+        "Format-ReviewerAuthoritativeSources must keep the `$items.Count -eq 0 early-return guard."
+    # The $items assignment that actually reaches the guard is the last one lexically
+    # preceding it; that one - not merely some assignment somewhere - must be filtered.
+    $dominatingAssign = @($itemsAssigns | Where-Object {
+                $_.Extent.StartOffset -lt $countGuardIf.Extent.StartOffset
+            } | Sort-Object { $_.Extent.StartOffset } | Select-Object -Last 1)
+    Assert-Replay ($null -ne $dominatingAssign) `
+        "Format-ReviewerAuthoritativeSources must assign `$items before the count guard."
+    $itemsWhere = @($dominatingAssign.Right.FindAll({
                 param($c)
                 $c -is [Management.Automation.Language.CommandAst] -and
                 ([string]$c.GetCommandName()) -ceq "Where-Object"
             }, $true))
-    $itemsNullTest = @($itemsAssign.Right.FindAll({
+    # Pin the comparison to exactly `$null -ne $_` (operands $null and $_ in either
+    # order), not any -ne with a $null somewhere, so a weakened predicate is rejected.
+    $itemsNullTest = @($dominatingAssign.Right.FindAll({
                 param($c)
-                $c -is [Management.Automation.Language.BinaryExpressionAst] -and
-                $c.Operator -eq [Management.Automation.Language.TokenKind]::Ine -and
-                (([string]$c.Left.Extent.Text -ceq '$null') -or ([string]$c.Right.Extent.Text -ceq '$null'))
+                if (-not ($c -is [Management.Automation.Language.BinaryExpressionAst])) { return $false }
+                if ($c.Operator -ne [Management.Automation.Language.TokenKind]::Ine) { return $false }
+                $lp = if ($c.Left -is [Management.Automation.Language.VariableExpressionAst]) { [string]$c.Left.VariablePath.UserPath } else { $null }
+                $rp = if ($c.Right -is [Management.Automation.Language.VariableExpressionAst]) { [string]$c.Right.VariablePath.UserPath } else { $null }
+                ($lp -ceq "null" -and $rp -ceq "_") -or ($lp -ceq "_" -and $rp -ceq "null")
             }, $true))
     Assert-Replay (@($itemsWhere).Count -ge 1 -and @($itemsNullTest).Count -ge 1) `
-        ("Format-ReviewerAuthoritativeSources must build `$items by filtering `$null elements " +
+        ("Format-ReviewerAuthoritativeSources must build the guard-reaching `$items by filtering `$null elements " +
         "(@(`$Snapshots | Where-Object { `$null -ne `$_ })) before the count guard so a phantom @(`$null) " +
         "cannot reach Measure-Object -Sum.")
 
