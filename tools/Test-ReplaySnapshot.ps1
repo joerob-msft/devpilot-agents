@@ -2316,23 +2316,24 @@ try {
         ($b.Right.Value -is [int] -or $b.Right.Value -is [long] -or $b.Right.Value -is [double] -or $b.Right.Value -is [decimal]) -and
         [double]$b.Right.Value -eq 0
     }
-    # The guard must actually short-circuit: its then-block must `return ""`. Pinning
-    # the body rejects a decoy `if ($items.Count -eq 0) { Write-Host ... }` that has the
-    # exact condition but no early return - selecting such a decoy (Select -First 1)
-    # would otherwise let the real guard be preceded by a shadow reassignment and false-pass.
+    # The guard must actually short-circuit: a `return ""` must be a DIRECT statement of
+    # its then-block (not a recursive descendant). Pinning the body this way rejects both
+    # a decoy `if ($items.Count -eq 0) { Write-Host ... }` with no early return AND a
+    # non-short-circuiting `if ($items.Count -eq 0) { if ($false) { return "" } }` whose
+    # return never actually fires - either of which, if selected (Select -First 1), would
+    # let the real guard be preceded by a shadow reassignment and false-pass.
     $hasEmptyStringReturn = {
         param($Block)
         if ($null -eq $Block) { return $false }
-        @($Block.FindAll({
-                    param($r)
-                    ($r -is [Management.Automation.Language.ReturnStatementAst]) -and
-                    ($null -ne $r.Pipeline) -and
-                    ($r.Pipeline -is [Management.Automation.Language.PipelineAst]) -and
-                    (@($r.Pipeline.PipelineElements).Count -eq 1) -and
-                    ($r.Pipeline.PipelineElements[0] -is [Management.Automation.Language.CommandExpressionAst]) -and
-                    ($r.Pipeline.PipelineElements[0].Expression -is [Management.Automation.Language.StringConstantExpressionAst]) -and
-                    ([string]$r.Pipeline.PipelineElements[0].Expression.Value -ceq "")
-                }, $true)).Count -ge 1
+        @($Block.Statements | Where-Object {
+                    ($_ -is [Management.Automation.Language.ReturnStatementAst]) -and
+                    ($null -ne $_.Pipeline) -and
+                    ($_.Pipeline -is [Management.Automation.Language.PipelineAst]) -and
+                    (@($_.Pipeline.PipelineElements).Count -eq 1) -and
+                    ($_.Pipeline.PipelineElements[0] -is [Management.Automation.Language.CommandExpressionAst]) -and
+                    ($_.Pipeline.PipelineElements[0].Expression -is [Management.Automation.Language.StringConstantExpressionAst]) -and
+                    ([string]$_.Pipeline.PipelineElements[0].Expression.Value -ceq "")
+                }).Count -ge 1
     }
     $countGuardIf = @($formatFn.FindAll({
                 param($c)
