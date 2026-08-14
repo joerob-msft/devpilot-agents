@@ -2209,8 +2209,12 @@ try {
     }
     Assert-Replay (@($resolvedGuardBodies).Count -ge 1) `
         "Invoke-ReviewerCycle must guard the authoritative-source byte total on exactly `$resolvedSourceCount -gt 0."
-    # The byte accumulator must be initialized to 0 BEFORE (dominating) the guard,
-    # so an all-withheld cycle reports 0 bytes rather than an undefined value.
+    # The byte accumulator must be initialized to a NUMERIC 0 BEFORE the guard and
+    # in the SAME immediate statement block, so an all-withheld cycle reports 0
+    # bytes rather than an undefined value. Same-block dominance (not mere source
+    # order) rejects an init buried in an unrelated earlier conditional that would
+    # not execute on the guard's path; a numeric-value check rejects a string "0"
+    # or boolean zero equivalent.
     $zeroInit = @($cycleFn.FindAll({
                 param($c)
                 $c -is [Management.Automation.Language.AssignmentStatementAst] -and
@@ -2218,10 +2222,12 @@ try {
                 [string]$c.Left.VariablePath.UserPath -ceq "authoritativeSourceBytes" -and
                 $c.Right -is [Management.Automation.Language.CommandExpressionAst] -and
                 $c.Right.Expression -is [Management.Automation.Language.ConstantExpressionAst] -and
-                [int]$c.Right.Expression.Value -eq 0
+                ($c.Right.Expression.Value -is [int] -or $c.Right.Expression.Value -is [long] -or
+                    $c.Right.Expression.Value -is [double] -or $c.Right.Expression.Value -is [decimal]) -and
+                [double]$c.Right.Expression.Value -eq 0
             }, $true))
     Assert-Replay (@($zeroInit).Count -ge 1) `
-        "Invoke-ReviewerCycle must initialize `$authoritativeSourceBytes = 0 before the resolved-count guard."
+        "Invoke-ReviewerCycle must initialize `$authoritativeSourceBytes = 0 (numeric) before the resolved-count guard."
     foreach ($access in $byteSumAccess) {
         $guarded = $false
         $initDominates = $false
@@ -2230,8 +2236,17 @@ try {
                 $body.Extent.StartOffset -le $access.Extent.StartOffset -and
                 $body.Extent.EndOffset -ge $access.Extent.EndOffset) {
                 $guarded = $true
+                # $body.Parent is the guard IfStatementAst; its .Parent is the
+                # statement block the guard lives in. The init must be a sibling in
+                # that same block and lexically precede the guard.
+                $guardIf = $body.Parent
+                $guardBlock = if ($null -ne $guardIf) { $guardIf.Parent } else { $null }
                 foreach ($init in $zeroInit) {
-                    if ($init.Extent.StartOffset -lt $body.Extent.StartOffset) { $initDominates = $true }
+                    if ($null -ne $guardBlock -and
+                        [object]::ReferenceEquals($init.Parent, $guardBlock) -and
+                        $init.Extent.StartOffset -lt $guardIf.Extent.StartOffset) {
+                        $initDominates = $true
+                    }
                 }
                 break
             }
@@ -2240,7 +2255,8 @@ try {
             ("Every authoritative-source ByteLength Measure-Object -Sum in Invoke-ReviewerCycle must sit inside an " +
             "if (`$resolvedSourceCount -gt 0) guard so an all-withheld replay cannot read .Sum off an empty pipeline.")
         Assert-Replay $initDominates `
-            "The `$authoritativeSourceBytes = 0 initialization must precede the guarded byte total in Invoke-ReviewerCycle."
+            ("The `$authoritativeSourceBytes = 0 initialization must be a sibling in the same block as, and precede, " +
+            "the resolved-count guard in Invoke-ReviewerCycle.")
     }
 
     . (Join-Path $RepoRoot "src\Agents\reviewer\SourceTransport.ps1")
