@@ -2316,14 +2316,33 @@ try {
         ($b.Right.Value -is [int] -or $b.Right.Value -is [long] -or $b.Right.Value -is [double] -or $b.Right.Value -is [decimal]) -and
         [double]$b.Right.Value -eq 0
     }
+    # The guard must actually short-circuit: its then-block must `return ""`. Pinning
+    # the body rejects a decoy `if ($items.Count -eq 0) { Write-Host ... }` that has the
+    # exact condition but no early return - selecting such a decoy (Select -First 1)
+    # would otherwise let the real guard be preceded by a shadow reassignment and false-pass.
+    $hasEmptyStringReturn = {
+        param($Block)
+        if ($null -eq $Block) { return $false }
+        @($Block.FindAll({
+                    param($r)
+                    ($r -is [Management.Automation.Language.ReturnStatementAst]) -and
+                    ($null -ne $r.Pipeline) -and
+                    ($r.Pipeline -is [Management.Automation.Language.PipelineAst]) -and
+                    (@($r.Pipeline.PipelineElements).Count -eq 1) -and
+                    ($r.Pipeline.PipelineElements[0] -is [Management.Automation.Language.CommandExpressionAst]) -and
+                    ($r.Pipeline.PipelineElements[0].Expression -is [Management.Automation.Language.StringConstantExpressionAst]) -and
+                    ([string]$r.Pipeline.PipelineElements[0].Expression.Value -ceq "")
+                }, $true)).Count -ge 1
+    }
     $countGuardIf = @($formatFn.FindAll({
                 param($c)
                 $c -is [Management.Automation.Language.IfStatementAst] -and
                 @($c.Clauses).Count -ge 1 -and
-                (& $isExactCountGuardCondition $c.Clauses[0].Item1)
+                (& $isExactCountGuardCondition $c.Clauses[0].Item1) -and
+                (& $hasEmptyStringReturn $c.Clauses[0].Item2)
             }, $true)) | Select-Object -First 1
     Assert-Replay ($null -ne $countGuardIf) `
-        "Format-ReviewerAuthoritativeSources must keep an early-return guard whose condition is exactly `$items.Count -eq 0."
+        "Format-ReviewerAuthoritativeSources must keep an early-return guard whose condition is exactly `$items.Count -eq 0 and whose body returns an empty string."
     # Control-flow dominance (not mere source order): the assignment that reaches the
     # guard must be a sibling in the guard's own immediate statement block and precede
     # it. $countGuardIf.Parent is that block; require reference equality, exactly as
