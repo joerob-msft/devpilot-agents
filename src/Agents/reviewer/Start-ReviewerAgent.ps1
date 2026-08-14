@@ -14785,8 +14785,17 @@ function Invoke-ReviewerCycle {
             $authoritativeSourceDegraded = ($resolvedSourceCount -lt $configuredSourceCount)
             $authoritativeSourcesText = Format-ReviewerAuthoritativeSources `
                 -Snapshots $sourceSnapshots -MaxTotalBytes $AuthoritativeSourcePolicy.MaxTotalBytes
+            # Offline replay can withhold every configured authoritative source, so
+            # $sourceSnapshots may legitimately be empty here. Measure-Object -Sum on
+            # an empty pipeline emits no object at all, and reading .Sum off nothing
+            # throws under StrictMode - so the byte total is guarded on the resolved
+            # count rather than assumed to exist.
+            $authoritativeSourceBytes = 0
+            if ($resolvedSourceCount -gt 0) {
+                $authoritativeSourceBytes = [int](($sourceSnapshots | Measure-Object -Property ByteLength -Sum).Sum)
+            }
             Write-Host ("Authoritative sources: {0} of {1} configured file(s), {2} decoded byte(s), commit-pinned with SHA-256 provenance." -f `
-                    $resolvedSourceCount, $configuredSourceCount, (($sourceSnapshots | Measure-Object -Property ByteLength -Sum).Sum)) -ForegroundColor Cyan
+                    $resolvedSourceCount, $configuredSourceCount, $authoritativeSourceBytes) -ForegroundColor Cyan
             if ($authoritativeSourceDegraded) {
                 Write-Warning ("Authoritative sources degraded: {0} of {1} configured source(s) withheld from the blind generalist context; cross-verification will degrade this pass." -f `
                         ($configuredSourceCount - $resolvedSourceCount), $configuredSourceCount)

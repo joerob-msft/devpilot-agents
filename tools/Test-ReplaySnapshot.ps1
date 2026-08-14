@@ -2159,6 +2159,54 @@ try {
     Assert-Replay (& $summaryArgBindsKey "AuthoritativeSourceResolvedCount") `
         "Invoke-ReviewerPullRequest must forward -AuthoritativeSourceResolvedCount bound to the bound-item key 'AuthoritativeSourceResolvedCount'."
 
+    # Regression (empty authoritative-source total): offline replay can withhold
+    # EVERY configured authoritative source, leaving $sourceSnapshots empty.
+    # Measure-Object -Sum emits NO object on an empty pipeline, so reading .Sum off
+    # it throws "The property 'Sum' cannot be found on this object" under
+    # StrictMode - failing the whole cycle before any functional model launch. This
+    # was observed on PR16760357, whose configured authoritative sources are all
+    # unsealed. The byte total must therefore be computed only when at least one
+    # source resolved. Pin the .Sum access to a $resolvedSourceCount -gt 0 guard so
+    # deleting the guard fails this test rather than surfacing only at model time.
+    $byteSumAccess = @($cycleFn.FindAll({
+                param($c)
+                $c -is [Management.Automation.Language.MemberExpressionAst] -and
+                $c.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                [string]$c.Member.Value -ceq "Sum" -and
+                ([string]$c.Expression.Extent.Text) -match '(?i)Measure-Object' -and
+                ([string]$c.Expression.Extent.Text) -match '(?i)ByteLength'
+            }, $true))
+    Assert-Replay (@($byteSumAccess).Count -ge 1) `
+        "Invoke-ReviewerCycle must total authoritative-source bytes via a ByteLength Measure-Object -Sum."
+    $resolvedCountGuards = @($cycleFn.FindAll({
+                param($c) $c -is [Management.Automation.Language.IfStatementAst]
+            }, $true) | Where-Object {
+            $matched = $false
+            foreach ($clause in $_.Clauses) {
+                if (([string]$clause.Item1.Extent.Text) -match '(?i)\$resolvedSourceCount\s*-gt\s*0') { $matched = $true }
+            }
+            $matched
+        })
+    Assert-Replay (@($resolvedCountGuards).Count -ge 1) `
+        "Invoke-ReviewerCycle must guard the authoritative-source byte total on `$resolvedSourceCount -gt 0."
+    foreach ($access in $byteSumAccess) {
+        $guarded = $false
+        foreach ($guard in $resolvedCountGuards) {
+            foreach ($clause in $guard.Clauses) {
+                $body = $clause.Item2
+                if ($null -ne $body -and
+                    $body.Extent.StartOffset -le $access.Extent.StartOffset -and
+                    $body.Extent.EndOffset -ge $access.Extent.EndOffset) {
+                    $guarded = $true; break
+                }
+            }
+            if ($guarded) { break }
+        }
+        Assert-Replay $guarded `
+            ("Every authoritative-source ByteLength Measure-Object -Sum in Invoke-ReviewerCycle must sit inside an " +
+            "if (`$resolvedSourceCount -gt 0) guard so an all-withheld replay cannot read .Sum off an empty pipeline.")
+    }
+
     . (Join-Path $RepoRoot "src\Agents\reviewer\SourceTransport.ps1")
     # The CLI fallback is a second, LIVE transport. In replay it must never be
     # taken, whatever the config says - taking it would resolve `az` on PATH,

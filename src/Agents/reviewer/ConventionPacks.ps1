@@ -754,7 +754,13 @@ function New-ReviewerConventionContextPlan {
         $provenanceBytes = $script:ReviewerConventionUtf8.GetByteCount($contextDescriptorJson)
         $routingEvidenceJson = ([ordered]@{ matchedPaths = $matchedPaths } | ConvertTo-Json -Depth 10 -Compress)
         $routingEvidenceBytes = $script:ReviewerConventionUtf8.GetByteCount($routingEvidenceJson)
-        $contentBytes = [int](($resolved | Measure-Object -Property byteLength -Sum).Sum)
+        # A selected pack always resolves at least one source, but Measure-Object
+        # -Sum emits nothing on an empty pipeline and reading .Sum off nothing
+        # throws under StrictMode, so the content total is guarded on the count.
+        $contentBytes = 0
+        if ($resolved.Count -gt 0) {
+            $contentBytes = [int](($resolved | Measure-Object -Property byteLength -Sum).Sum)
+        }
         $packBytes = $provenanceBytes + $contentBytes
         if ($packBytes -gt [int]$pack.MaxBytes) {
             throw "Selected pack '$($pack.Name)' requires $packBytes bytes, above its $($pack.MaxBytes)-byte cap; no source was truncated."
