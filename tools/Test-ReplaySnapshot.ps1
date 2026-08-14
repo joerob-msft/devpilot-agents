@@ -2283,10 +2283,11 @@ try {
     # The materialization `$items = @($Snapshots | Where-Object { $null -ne $_ })`
     # must filter nulls before the `$items.Count -eq 0` early return, so a phantom
     # @($null) collapses to empty rather than reaching the ByteLength Measure/.Sum.
-    # Locate the count guard first, then pin the LAST $items assignment that
-    # dominates it: this rejects a later `$items = @($Snapshots)` reassignment that
-    # would shadow a filtered earlier one and silently restore the StrictMode crash
-    # while a naive "some Where-Object exists somewhere" check still passed.
+    # Locate the count guard first, then pin the $items assignment that actually
+    # dominates it (same immediate statement block, lexically preceding, chosen last)
+    # so neither a shadow `$items = @($Snapshots)` reassignment nor a filtered
+    # assignment buried in a non-dominating inner block (e.g. if ($false) { ... }) can
+    # silently restore the StrictMode crash while the guard still reports success.
     $itemsAssigns = @($formatFn.FindAll({
                 param($c)
                 $c -is [Management.Automation.Language.AssignmentStatementAst] -and
@@ -2294,33 +2295,49 @@ try {
                 [string]$c.Left.VariablePath.UserPath -ceq "items"
             }, $true))
     Assert-Replay (@($itemsAssigns).Count -ge 1) "Format-ReviewerAuthoritativeSources must assign `$items."
-    # The early-return guard: an if whose condition is exactly `$items.Count -eq 0`.
+    # The early-return guard: an if whose COMPLETE condition is exactly
+    # `$items.Count -eq 0` - a structural match on the condition pipeline itself, not
+    # a descendant search, so a widened `... -and $false` condition is rejected.
+    $isExactCountGuardCondition = {
+        param($Condition)
+        if (-not ($Condition -is [Management.Automation.Language.PipelineAst])) { return $false }
+        if (@($Condition.PipelineElements).Count -ne 1) { return $false }
+        $el = $Condition.PipelineElements[0]
+        if (-not ($el -is [Management.Automation.Language.CommandExpressionAst])) { return $false }
+        $b = $el.Expression
+        ($b -is [Management.Automation.Language.BinaryExpressionAst]) -and
+        $b.Operator -eq [Management.Automation.Language.TokenKind]::Ieq -and
+        $b.Left -is [Management.Automation.Language.MemberExpressionAst] -and
+        $b.Left.Expression -is [Management.Automation.Language.VariableExpressionAst] -and
+        [string]$b.Left.Expression.VariablePath.UserPath -ceq "items" -and
+        $b.Left.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
+        [string]$b.Left.Member.Value -ceq "Count" -and
+        $b.Right -is [Management.Automation.Language.ConstantExpressionAst] -and
+        ($b.Right.Value -is [int] -or $b.Right.Value -is [long] -or $b.Right.Value -is [double] -or $b.Right.Value -is [decimal]) -and
+        [double]$b.Right.Value -eq 0
+    }
     $countGuardIf = @($formatFn.FindAll({
                 param($c)
                 $c -is [Management.Automation.Language.IfStatementAst] -and
                 @($c.Clauses).Count -ge 1 -and
-                (@($c.Clauses[0].Item1.FindAll({
-                                param($b)
-                                $b -is [Management.Automation.Language.BinaryExpressionAst] -and
-                                $b.Operator -eq [Management.Automation.Language.TokenKind]::Ieq -and
-                                $b.Left -is [Management.Automation.Language.MemberExpressionAst] -and
-                                $b.Left.Expression -is [Management.Automation.Language.VariableExpressionAst] -and
-                                [string]$b.Left.Expression.VariablePath.UserPath -ceq "items" -and
-                                $b.Left.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
-                                [string]$b.Left.Member.Value -ceq "Count" -and
-                                $b.Right -is [Management.Automation.Language.ConstantExpressionAst] -and
-                                [double]$b.Right.Value -eq 0
-                            }, $true))).Count -ge 1
+                (& $isExactCountGuardCondition $c.Clauses[0].Item1)
             }, $true)) | Select-Object -First 1
     Assert-Replay ($null -ne $countGuardIf) `
-        "Format-ReviewerAuthoritativeSources must keep the `$items.Count -eq 0 early-return guard."
-    # The $items assignment that actually reaches the guard is the last one lexically
-    # preceding it; that one - not merely some assignment somewhere - must be filtered.
-    $dominatingAssign = @($itemsAssigns | Where-Object {
+        "Format-ReviewerAuthoritativeSources must keep an early-return guard whose condition is exactly `$items.Count -eq 0."
+    # Control-flow dominance (not mere source order): the assignment that reaches the
+    # guard must be a sibling in the guard's own immediate statement block and precede
+    # it. $countGuardIf.Parent is that block; require reference equality, exactly as
+    # the authoritative-source byte-total guard above pins its zero-init dominance.
+    $guardBlock = $countGuardIf.Parent
+    # No @() wrapper here: Select-Object -Last 1 over no matches must collapse to $null
+    # so the null-check below is meaningful (an @() empty array is -ne $null and would
+    # let a filter-only-AFTER-the-guard variant slip past into an ungraceful .Right throw).
+    $dominatingAssign = $itemsAssigns | Where-Object {
+                [object]::ReferenceEquals($_.Parent, $guardBlock) -and
                 $_.Extent.StartOffset -lt $countGuardIf.Extent.StartOffset
-            } | Sort-Object { $_.Extent.StartOffset } | Select-Object -Last 1)
+            } | Sort-Object { $_.Extent.StartOffset } | Select-Object -Last 1
     Assert-Replay ($null -ne $dominatingAssign) `
-        "Format-ReviewerAuthoritativeSources must assign `$items before the count guard."
+        "Format-ReviewerAuthoritativeSources must assign `$items in the guard's own block before the count guard."
     $itemsWhere = @($dominatingAssign.Right.FindAll({
                 param($c)
                 $c -is [Management.Automation.Language.CommandAst] -and
