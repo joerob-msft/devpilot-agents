@@ -164,6 +164,11 @@ param(
 )
 Set-StrictMode -Version Latest
 if (-not $QualificationPrelaunch) {
+    if ($OperatorAlias -ceq "complete-test") {
+        New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
+        Set-Content -LiteralPath (Join-Path $StateDir "progress.json") -Value '{}' -Encoding ascii
+        exit 0
+    }
     if ($OperatorAlias -ceq "hang-test") {
         New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
         $nested = Start-Process -FilePath (Get-Process -Id $PID).Path `
@@ -617,6 +622,20 @@ exit 0
     $declaredPath = [string](@($declaredPath | Where-Object { $_ -is [string] } | Select-Object -Last 1))
     Assert-Qualification ($declaredPath -and (Test-Path -LiteralPath $declaredPath -PathType Leaf)) `
         "A passing preflight did not produce a sealed run-set declaration."
+    # A declaration mints a single-use launch-authorization token whose hash the
+    # plan digest is sealed under. Every RunSlot must present it.
+    $launchTokenPath = Join-Path $qualificationRoot "runset\launch-authorization.token"
+    Assert-Qualification (Test-Path -LiteralPath $launchTokenPath -PathType Leaf) `
+        "A declaration did not mint a launch-authorization token."
+    Assert-Qualification ((Get-Item -LiteralPath $launchTokenPath).IsReadOnly -and
+        ((Get-Content -LiteralPath $launchTokenPath -Raw).Trim() -match '^[0-9a-f]{64}\z')) `
+        "The minted launch token is not an immutable 64-hex single-use secret."
+    # The declaration seals the plan digest WITH the minted token's hash bound
+    # in - the digest a slot only reproduces by presenting that exact token.
+    $mainTokenHash = Get-ReviewerQualificationLaunchTokenHash -Token ((Get-Content -LiteralPath $launchTokenPath -Raw).Trim())
+    $sealedPlanDigest = Get-ReviewerQualificationPlanDigest -Plan (New-ReviewerReplayQualificationPlan @planArguments -LaunchAuthorizationHash $mainTokenHash)
+    Assert-Qualification ($sealedPlanDigest -cne $planDigest) `
+        "Binding a launch token into the plan did not change its digest, so the token is not sealed."
     $declarationEnvelope = Get-Content -LiteralPath $declaredPath -Raw | ConvertFrom-Json
     $declaration = [string]$declarationEnvelope.manifestJson | ConvertFrom-Json
     Assert-Qualification ([string]$declaration.snapshotName -ceq $snapshotName -and
@@ -627,13 +646,13 @@ exit 0
         & $sandboxTool -Mode Declare @planArguments -RunSetKeyPath $keyPath -Purpose "second set"
     } "A second run set was declared into a root that already had one." "already declared"
 
-    Assert-Qualification ([string]$declaration.planDigest -ceq $planDigest) `
+    Assert-Qualification ([string]$declaration.planDigest -ceq $sealedPlanDigest) `
         "The declaration is not sealed under the digest of the plan it was preflighted from."
     # The declaration verifies under its key, through the tool that seals it.
     $verifiedJson = & (Join-Path $toolkitCopy "tools\Compare-ReviewerReplayRuns.ps1") -VerifyRunSet `
         -RunSetPath $declaredPath -KeyPath $keyPath
     $verified = [string](@($verifiedJson | Where-Object { $_ -is [string] } | Select-Object -Last 1)) | ConvertFrom-Json
-    Assert-Qualification ([string]$verified.planDigest -ceq $planDigest -and
+    Assert-Qualification ([string]$verified.planDigest -ceq $sealedPlanDigest -and
         [string]$verified.snapshotName -ceq $snapshotName) `
         "Verifying the sealed declaration did not return the plan it was sealed for."
     $otherKeyPath = Join-Path $sandbox "other-signing.key"
@@ -654,17 +673,35 @@ exit 0
         & $sandboxTool -Mode RunSlot @planArguments -Slot "slot1"
     } "A slot ran without the key that verifies its declaration." "requires -RunSetKeyPath"
     Assert-QualificationThrows {
-        & $sandboxTool -Mode RunSlot @planArguments -Slot "slot1" -RunSetKeyPath $otherKeyPath
+        & $sandboxTool -Mode RunSlot @planArguments -Slot "slot1" -RunSetKeyPath $keyPath
+    } "A slot ran without the single-use launch token." "requires -LaunchAuthorizationTokenPath"
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode RunSlot @planArguments -Slot "slot1" -RunSetKeyPath $keyPath `
+            -LaunchAuthorizationTokenPath (Join-Path $sandbox "no-such.token")
+    } "A slot ran against a launch token path that does not exist." "token .* does not exist"
+    # A wrong (stale) token reproduces a different plan digest than the one the
+    # declaration was sealed under, and is refused before any model launch.
+    $staleTokenPath = Join-Path $sandbox "stale.token"
+    Set-Content -LiteralPath $staleTokenPath -Value ("f" * 64) -Encoding utf8NoBOM
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode RunSlot @planArguments -Slot "slot1" -RunSetKeyPath $keyPath `
+            -LaunchAuthorizationTokenPath $staleTokenPath
+    } "A stale launch token was accepted for a slot." "was made for plan"
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode RunSlot @planArguments -Slot "slot1" -RunSetKeyPath $otherKeyPath `
+            -LaunchAuthorizationTokenPath $launchTokenPath
     } "A slot ran against a declaration that did not verify under the supplied key." "signature verification failed"
     # Same snapshot, same run count, different plan: the digest is what refuses.
     Assert-QualificationThrows {
-        & $sandboxTool -Mode RunSlot @variantArguments -Slot "slot1" -RunSetKeyPath $keyPath
+        & $sandboxTool -Mode RunSlot @variantArguments -Slot "slot1" -RunSetKeyPath $keyPath `
+            -LaunchAuthorizationTokenPath $launchTokenPath
     } "A slot ran a plan the declaration was not sealed for." "was made for plan"
     # Any state at all, even an empty directory somebody created by hand.
     $occupied = Join-Path (Join-Path $qualificationRoot "runs") "slot1-state"
     New-Item -ItemType Directory -Force -Path $occupied | Out-Null
     Assert-QualificationThrows {
-        & $sandboxTool -Mode RunSlot @planArguments -Slot "slot1" -RunSetKeyPath $keyPath
+        & $sandboxTool -Mode RunSlot @planArguments -Slot "slot1" -RunSetKeyPath $keyPath `
+            -LaunchAuthorizationTokenPath $launchTokenPath
     } "An already-attempted slot was re-run into its own state directory." "already exists"
     Remove-Item -LiteralPath $occupied -Recurse -Force
     # A declaration for another snapshot, unsigned, must not be usable at all.
@@ -681,7 +718,8 @@ exit 0
     Assert-QualificationThrows {
         $bad = $planArguments.Clone()
         $bad["QualificationRoot"] = $foreignRoot
-        & $sandboxTool -Mode RunSlot @bad -Slot "slot1" -RunSetKeyPath $keyPath
+        & $sandboxTool -Mode RunSlot @bad -Slot "slot1" -RunSetKeyPath $keyPath `
+            -LaunchAuthorizationTokenPath $launchTokenPath
     } "A slot ran against an unsigned declaration." "signature verification failed"
 
     # -- 10. A slot's one attempt is consumed before its child starts --------
@@ -694,9 +732,12 @@ exit 0
         -Purpose "startup failure before any agent state"
     Assert-Qualification (@($attemptDeclared | Where-Object { $_ -is [string] }).Count -ge 1) `
         "The stand-in plan did not declare a run set."
+    $attemptTokenPath = Join-Path $attemptRoot "runset\launch-authorization.token"
+    $attemptTokenHash = Get-ReviewerQualificationLaunchTokenHash -Token ((Get-Content -LiteralPath $attemptTokenPath -Raw).Trim())
     $attemptExit = 0
     try {
-        & $sandboxTool -Mode RunSlot @attemptArguments -Slot "slot1" -RunSetKeyPath $keyPath 2>&1 | Out-Null
+        & $sandboxTool -Mode RunSlot @attemptArguments -Slot "slot1" -RunSetKeyPath $keyPath `
+            -LaunchAuthorizationTokenPath $attemptTokenPath 2>&1 | Out-Null
         $attemptExit = $LASTEXITCODE
     }
     catch { $attemptExit = 9 }
@@ -710,12 +751,15 @@ exit 0
         "The attempt marker is writable; an attempt record that can be edited records nothing."
     $attemptRecord = Get-Content -LiteralPath $attemptMarker -Raw | ConvertFrom-Json
     Assert-Qualification ([string]$attemptRecord.slot -ceq "slot1" -and
-        [string]$attemptRecord.planDigest -ceq (Get-ReviewerQualificationPlanDigest -Plan (New-ReviewerReplayQualificationPlan @attemptArguments)) -and
+        [string]$attemptRecord.planDigest -ceq (Get-ReviewerQualificationPlanDigest -Plan (New-ReviewerReplayQualificationPlan @attemptArguments -LaunchAuthorizationHash $attemptTokenHash)) -and
         @($attemptRecord.arguments) -ccontains "-RepoPath") `
         "The attempt marker does not record the exact plan and command it consumed."
+    Assert-Qualification ([string]$attemptRecord.launchAuthorizationHash -ceq $attemptTokenHash) `
+        "The attempt marker does not record the launch authorization it consumed."
     # And the spent attempt is what refuses the retry - not the missing state.
     Assert-QualificationThrows {
-        & $sandboxTool -Mode RunSlot @attemptArguments -Slot "slot1" -RunSetKeyPath $keyPath
+        & $sandboxTool -Mode RunSlot @attemptArguments -Slot "slot1" -RunSetKeyPath $keyPath `
+            -LaunchAuthorizationTokenPath $attemptTokenPath
     } "A slot whose child failed to start was allowed a second attempt." "already been attempted"
 
     # The wrapper, not only each model call, owns a hard deadline and a
@@ -729,7 +773,9 @@ exit 0
     $hangArguments["SlotTimeoutSeconds"] = 10
     $hangArguments["ProgressTimeoutSeconds"] = 2
     & $sandboxTool -Mode Declare @hangArguments -RunSetKeyPath $keyPath -Purpose "deterministic hanging child" | Out-Null
-    & $sandboxTool -Mode RunSlot @hangArguments -Slot "slot1" -RunSetKeyPath $keyPath 2>&1 | Out-Null
+    $hangTokenPath = Join-Path $hangRoot "runset\launch-authorization.token"
+    & $sandboxTool -Mode RunSlot @hangArguments -Slot "slot1" -RunSetKeyPath $keyPath `
+        -LaunchAuthorizationTokenPath $hangTokenPath 2>&1 | Out-Null
     $hangExit = $LASTEXITCODE
     $hangTerminalPath = Join-Path $hangRoot "runs\slot1-terminal.json"
     $hangTerminal = Get-Content -LiteralPath $hangTerminalPath -Raw | ConvertFrom-Json
@@ -751,7 +797,8 @@ exit 0
     Assert-Qualification (-not (Get-Process -Id $nestedPid -ErrorAction SilentlyContinue)) `
         "The hanging slot's grandchild survived owned process-tree cancellation."
     Assert-QualificationThrows {
-        & $sandboxTool -Mode RunSlot @hangArguments -Slot "slot1" -RunSetKeyPath $keyPath
+        & $sandboxTool -Mode RunSlot @hangArguments -Slot "slot1" -RunSetKeyPath $keyPath `
+            -LaunchAuthorizationTokenPath $hangTokenPath
     } "A timed-out slot was allowed to resume." "already (has state|been attempted)"
 
     # A child may exit while a descendant still holds its inherited output
@@ -765,7 +812,9 @@ exit 0
     $drainArguments["SlotTimeoutSeconds"] = 4
     $drainArguments["ProgressTimeoutSeconds"] = 4
     & $sandboxTool -Mode Declare @drainArguments -RunSetKeyPath $keyPath -Purpose "deterministic pipe holder" | Out-Null
-    & $sandboxTool -Mode RunSlot @drainArguments -Slot "slot1" -RunSetKeyPath $keyPath 2>&1 | Out-Null
+    $drainTokenPath = Join-Path $drainRoot "runset\launch-authorization.token"
+    & $sandboxTool -Mode RunSlot @drainArguments -Slot "slot1" -RunSetKeyPath $keyPath `
+        -LaunchAuthorizationTokenPath $drainTokenPath 2>&1 | Out-Null
     $drainTerminal = Get-Content -LiteralPath (Join-Path $drainRoot "runs\slot1-terminal.json") -Raw |
         ConvertFrom-Json
     $drainNestedPid = [int](Get-Content -LiteralPath (Join-Path $drainRoot "runs\slot1-state\nested.pid") -Raw)
@@ -780,8 +829,527 @@ exit 0
     Assert-Qualification (-not (Get-Process -Id $drainNestedPid -ErrorAction SilentlyContinue)) `
         "A detached output-pipe holder survived output-drain cancellation."
 
+    # -- 12. Slot ordering, reconciliation gate, and status reads ------------
+    Write-Host "12/13 slot ordering, reconciliation and status" -ForegroundColor Cyan
+    $statusTool = Join-Path $toolkitCopy "tools\Get-ReviewerReplayQualificationStatus.ps1"
+
+    # A slot that completes successfully, so slot ordering can be proven against
+    # real immutable terminal evidence rather than a failure or a timeout.
+    $orderRoot = Join-Path $sandbox "order-root"
+    $orderArguments = $planArguments.Clone()
+    $orderArguments["QualificationRoot"] = $orderRoot
+    $orderArguments["ReviewerScriptPath"] = $failingAgent
+    $orderArguments["OperatorAlias"] = "complete-test"
+    & $sandboxTool -Mode Declare @orderArguments -RunSetKeyPath $keyPath -Purpose "slot ordering" | Out-Null
+    $orderTokenPath = Join-Path $orderRoot "runset\launch-authorization.token"
+
+    # Slot 2 may not start before slot 1 has an immutable successful terminal.
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode RunSlot @orderArguments -Slot "slot2" -RunSetKeyPath $keyPath `
+            -LaunchAuthorizationTokenPath $orderTokenPath
+    } "Slot 2 started before slot 1 had a terminal result." "cannot start before 'slot1'"
+
+    # Reconciliation refuses a set with no completed slots at all.
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode Reconcile @orderArguments -RunSetKeyPath $keyPath
+    } "Reconciliation proceeded with no completed slots." "requires every slot"
+
+    # Slot 1 runs and completes.
+    & $sandboxTool -Mode RunSlot @orderArguments -Slot "slot1" -RunSetKeyPath $keyPath `
+        -LaunchAuthorizationTokenPath $orderTokenPath 2>&1 | Out-Null
+    $orderSlot1Exit = $LASTEXITCODE
+    $orderSlot1Terminal = Get-Content -LiteralPath (Join-Path $orderRoot "runs\slot1-terminal.json") -Raw | ConvertFrom-Json
+    Assert-Qualification ($orderSlot1Exit -eq 0 -and [string]$orderSlot1Terminal.status -ceq "complete") `
+        "A successful stand-in slot did not record a complete terminal result."
+
+    # Reconciliation still refuses because slot 2 has not completed.
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode Reconcile @orderArguments -RunSetKeyPath $keyPath
+    } "Reconciliation proceeded before every slot completed." "requires every slot"
+
+    # Only now may slot 2 run; it completes and reconciliation is satisfied.
+    & $sandboxTool -Mode RunSlot @orderArguments -Slot "slot2" -RunSetKeyPath $keyPath `
+        -LaunchAuthorizationTokenPath $orderTokenPath 2>&1 | Out-Null
+    Assert-Qualification ($LASTEXITCODE -eq 0) "Slot 2 did not complete after slot 1's successful terminal."
+    $reconcileOutput = & $sandboxTool -Mode Reconcile @orderArguments -RunSetKeyPath $keyPath
+    $reconcileObject = @($reconcileOutput | Where-Object { $_ -is [pscustomobject] -and $_.kind } | Select-Object -Last 1)
+    Assert-Qualification (@($reconcileObject).Count -eq 1 -and
+        [string]$reconcileObject[0].kind -ceq "reviewer.replay-qualification.reconciliation-ready.v1" -and
+        @($reconcileObject[0].slots).Count -eq 2) `
+        "Reconciliation did not confirm both completed slots after 2/2 success."
+
+    # A slot that fails blocks its successor: a later slot never follows a failed one.
+    $failOrderRoot = Join-Path $sandbox "fail-order-root"
+    $failOrderArguments = $planArguments.Clone()
+    $failOrderArguments["QualificationRoot"] = $failOrderRoot
+    $failOrderArguments["ReviewerScriptPath"] = $failingAgent
+    & $sandboxTool -Mode Declare @failOrderArguments -RunSetKeyPath $keyPath -Purpose "failed slot blocks successor" | Out-Null
+    $failOrderTokenPath = Join-Path $failOrderRoot "runset\launch-authorization.token"
+    & $sandboxTool -Mode RunSlot @failOrderArguments -Slot "slot1" -RunSetKeyPath $keyPath `
+        -LaunchAuthorizationTokenPath $failOrderTokenPath 2>&1 | Out-Null
+    $failSlot1Terminal = Get-Content -LiteralPath (Join-Path $failOrderRoot "runs\slot1-terminal.json") -Raw | ConvertFrom-Json
+    Assert-Qualification ([string]$failSlot1Terminal.status -ceq "failed") `
+        "A stand-in slot that exited non-zero was not recorded as failed."
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode RunSlot @failOrderArguments -Slot "slot2" -RunSetKeyPath $keyPath `
+            -LaunchAuthorizationTokenPath $failOrderTokenPath
+    } "Slot 2 followed a failed slot 1." "completed successfully"
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode Reconcile @failOrderArguments -RunSetKeyPath $keyPath
+    } "Reconciliation accepted a failed slot." "completed successfully"
+
+    # The status command reads immutable evidence, not the live process table.
+    # Without a run-set key it can attest the slot evidence is complete, but it
+    # must NOT claim reconciliation readiness off an unverified declaration - it
+    # reports signatureUnverified and withholds reconciliationReady so it can
+    # never positively disagree with the Reconcile gate.
+    $statusObject = @(& $statusTool -QualificationRoot $orderRoot | Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (@($statusObject).Count -eq 1 -and
+        [int]$statusObject[0].slotsAttempted -eq 2 -and [int]$statusObject[0].slotsComplete -eq 2 -and
+        [bool]$statusObject[0].evidenceComplete -and
+        [bool]$statusObject[0].signatureUnverified -and
+        -not [bool]$statusObject[0].reconciliationReady) `
+        "The status command did not report evidence-complete-but-signature-unverified without a run-set key."
+    # With the run-set key AND the full plan inputs (parity mode), status
+    # reconstructs the exact same authenticated plan Reconcile builds and runs the
+    # ONE shared readiness gate, so a positive reconciliationReady is exactly the
+    # Reconcile verdict for the same inputs - the two can never positively disagree.
+    $statusVerified = @(& $statusTool @orderArguments -RunSetKeyPath $keyPath |
+            Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (@($statusVerified).Count -eq 1 -and
+        [bool]$statusVerified[0].parityMode -and
+        [bool]$statusVerified[0].evidenceComplete -and
+        -not [bool]$statusVerified[0].signatureUnverified -and
+        -not [bool]$statusVerified[0].declarationCorrupt -and
+        [bool]$statusVerified[0].reconciliationReady -and
+        [bool]$statusVerified[0].declaration.signatureVerified -and
+        [bool]$statusVerified[0].declaration.countValid) `
+        "The status command did not confirm reconciliation ready against a verified declaration in parity mode."
+    # Parity is exact: the SAME @orderArguments made Reconcile accept this set
+    # above (reviewer.replay-qualification.reconciliation-ready.v1), and status
+    # reports reconciliationReady for those same inputs - they cannot disagree.
+    # A wrong SlotCount is an explicit plan mismatch: status must withhold
+    # readiness with a reason, exactly as Reconcile would reject it. The
+    # declaration's HMAC signature is perfectly valid - only the caller-supplied
+    # SlotCount disagrees - so status must NOT mislabel it as an unverified
+    # signature or a corrupt set; those flags stay false while readiness is false.
+    $statusWrongCount = @(& $statusTool @orderArguments -RunSetKeyPath $keyPath -SlotCount 3 |
+            Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (@($statusWrongCount).Count -eq 1 -and [bool]$statusWrongCount[0].parityMode -and
+        -not [bool]$statusWrongCount[0].reconciliationReady -and [string]$statusWrongCount[0].reconciliationReason -and
+        -not [bool]$statusWrongCount[0].signatureUnverified -and
+        -not [bool]$statusWrongCount[0].declarationCorrupt -and
+        [bool]$statusWrongCount[0].declaration.signatureVerified) `
+        "The status command claimed readiness for a plan whose SlotCount does not match the sealed declaration, or mislabeled a validly-signed declaration as unverified/corrupt on a benign SlotCount mismatch."
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode Reconcile @orderArguments -RunSetKeyPath $keyPath -SlotCount 3
+    } "Reconcile accepted a set whose SlotCount status also rejected." "and this plan has"
+    # Full-plan binding (finding #1): a plan input that is NOT snapshot or slot
+    # count - here the cycle timeout, which rides in every slot's argument vector
+    # and therefore the sealed plan digest - is reconstructed differently by the
+    # caller. Reconciliation holds no launch token, so it reads the published one
+    # to reproduce THIS plan's digest; that digest no longer equals the sealed
+    # one, so both Status and Reconcile must reject the set for the plan-mismatch
+    # reason. The signature is still valid, so status must not call it corrupt.
+    $statusWrongPlan = @(& $statusTool @orderArguments -RunSetKeyPath $keyPath -CycleTimeoutSeconds 600 |
+            Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (@($statusWrongPlan).Count -eq 1 -and [bool]$statusWrongPlan[0].parityMode -and
+        -not [bool]$statusWrongPlan[0].reconciliationReady -and
+        -not [bool]$statusWrongPlan[0].signatureUnverified -and
+        -not [bool]$statusWrongPlan[0].declarationCorrupt -and
+        [string]$statusWrongPlan[0].reconciliationReason -match "was made for plan") `
+        "The status command accepted, mislabeled, or gave the wrong reason for a plan whose cycle timeout differs from the sealed declaration."
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode Reconcile @orderArguments -RunSetKeyPath $keyPath -CycleTimeoutSeconds 600
+    } "Reconcile accepted a set whose full plan (cycle timeout) status also rejected." "was made for plan"
+    # Signature independence (RD#4): a plan input so wrong that the plan cannot be
+    # RECONSTRUCTED at all - here a snapshot name that does not exist - must not
+    # be conflated with a signature failure. The published declaration's HMAC is
+    # perfectly valid; only the caller's inputs are wrong. Status verifies the
+    # signature off the run-set directory BEFORE (and independently of) plan
+    # reconstruction, so signatureVerified stays true and the set is not flagged
+    # corrupt; the failure surfaces as a plan-reconstruction not-ready reason.
+    $statusBadSnapshotArgs = $orderArguments.Clone()
+    $statusBadSnapshotArgs["ReplaySnapshotName"] = "nonexistent-snapshot"
+    $statusBadSnapshot = @(& $statusTool @statusBadSnapshotArgs -RunSetKeyPath $keyPath |
+            Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (@($statusBadSnapshot).Count -eq 1 -and [bool]$statusBadSnapshot[0].parityMode -and
+        -not [bool]$statusBadSnapshot[0].reconciliationReady -and
+        -not [bool]$statusBadSnapshot[0].signatureUnverified -and
+        -not [bool]$statusBadSnapshot[0].declarationCorrupt -and
+        [bool]$statusBadSnapshot[0].declaration.signatureVerified -and
+        [string]$statusBadSnapshot[0].reconciliationReason -match "plan reconstruction failed") `
+        "The status command mislabeled a validly-signed declaration as signature-unverified/corrupt when plan reconstruction failed on a wrong snapshot name."
+    Assert-Qualification (-not (@($statusObject[0].slots | Where-Object { [bool]$_.recordedChildAlive }).Count)) `
+        "The status command reported a completed slot's child as still alive."
+    Assert-Qualification ([bool]$statusObject[0].declaration.launchTokenPresent) `
+        "The status command did not observe the minted launch token."
+
+    # An attempt without a terminal is reported as in-flight/aborted, and the
+    # status tool never infers liveness by matching command text.
+    $inflightRoot = Join-Path $sandbox "inflight-status-root"
+    New-Item -ItemType Directory -Force -Path (Join-Path $inflightRoot "runs") | Out-Null
+    Set-Content -LiteralPath (Join-Path $inflightRoot "runs\slot1-attempt.json") `
+        -Value '{"slot":"slot1"}' -Encoding utf8NoBOM
+    $inflightStatus = @(& $statusTool -QualificationRoot $inflightRoot | Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    $inflightSlot = @($inflightStatus[0].slots)[0]
+    Assert-Qualification ([string]$inflightSlot.state -ceq "attemptedWithoutTerminal" -and
+        [string]$inflightSlot.note -match "not inferred from command text") `
+        "The status command did not report an attempt-without-terminal as in-flight without inferring liveness from text."
+    $statusToolText = Get-Content -LiteralPath $statusTool -Raw
+    Assert-Qualification ($statusToolText -notmatch "CommandLine" -and $statusToolText -notmatch "Win32_Process" -and
+        ($statusToolText -match "Test-ReviewerQualificationRecordedProcessAlive" -or $statusToolText -match "Get-Process -Id") -and
+        $statusToolText -notmatch "Get-Process(?! -Id)") `
+        "The status command scans the process table by something other than an exact recorded PID."
+
+    # -- 12b. Identity binding: a terminal that does not name this verified set
+    #         is refused by reconciliation, the predecessor gate, and status
+    #         readiness - even when it is a well-formed, immutable, "complete"
+    #         terminal. Only slot1 is forged; a forged slot2 terminal would trip
+    #         RunSlot's own target no-resume check before the predecessor gate.
+    Write-Host "12b/13 terminals are bound to the verified declaration" -ForegroundColor Cyan
+    $bindRoot = Join-Path $sandbox "identity-bind-root"
+    $bindArguments = $planArguments.Clone()
+    $bindArguments["QualificationRoot"] = $bindRoot
+    $bindArguments["ReviewerScriptPath"] = $failingAgent
+    $bindArguments["OperatorAlias"] = "complete-test"
+    & $sandboxTool -Mode Declare @bindArguments -RunSetKeyPath $keyPath -Purpose "identity binding" | Out-Null
+    $bindTokenPath = Join-Path $bindRoot "runset\launch-authorization.token"
+    $bindRunsDir = Join-Path $bindRoot "runs"
+    New-Item -ItemType Directory -Force -Path $bindRunsDir | Out-Null
+    $forgedTerminal = [pscustomobject][ordered]@{
+        kind = "reviewer.replay-qualification.terminal.v1"; slot = "slot1"; setId = "forged-set-id"
+        planDigest = "forged-digest"; status = "complete"; exitCode = 0; timedOut = $false
+        timeoutReason = ""; childProcessId = 0; startedAtUtc = ""; endedAtUtc = ""
+    }
+    $forgedTerminalPath = Join-Path $bindRunsDir "slot1-terminal.json"
+    Set-Content -LiteralPath $forgedTerminalPath -Value (ConvertTo-Json $forgedTerminal -Depth 5) -Encoding utf8NoBOM
+    Set-ItemProperty -LiteralPath $forgedTerminalPath -Name IsReadOnly -Value $true
+
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode Reconcile @bindArguments -RunSetKeyPath $keyPath
+    } "Reconciliation accepted a terminal that does not name the verified set." "names run set"
+
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode RunSlot @bindArguments -Slot "slot2" -RunSetKeyPath $keyPath `
+            -LaunchAuthorizationTokenPath $bindTokenPath
+    } "The predecessor gate accepted a forged slot1 terminal." "names run set"
+
+    $bindStatus = @(& $statusTool -QualificationRoot $bindRoot -RunSetKeyPath $keyPath | Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (-not [bool]$bindStatus[0].reconciliationReady -and -not [bool]$bindStatus[0].evidenceComplete) `
+        "The status command reported readiness or complete evidence for a forged, unbound terminal."
+    $bindSlot1 = @($bindStatus[0].slots | Where-Object { [string]$_.slot -ceq "slot1" })
+    Assert-Qualification (@($bindSlot1).Count -eq 1 -and
+        [bool]$bindSlot1[0].PSObject.Properties["boundToDeclaration"] -and -not [bool]$bindSlot1[0].boundToDeclaration) `
+        "The status command did not flag a forged terminal as unbound to the declaration."
+
+    # Reconciliation is a whole-set read, so -Slot is refused for it just as for
+    # Declare; a mode that acts on the set never takes a single-slot target.
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode Reconcile @bindArguments -Slot "slot1" -RunSetKeyPath $keyPath
+    } "-Slot was accepted for a whole-set mode." "only valid with -Mode RunSlot"
+
+    # -- 12c. A terminal names its own slot; one slot's proof copied onto
+    #         another slot's path is refused, and status never counts a slot
+    #         outside the declared slot1..slotN toward reconciliation readiness.
+    Write-Host "12c/13 cross-slot terminal copy and expected-slot scoping" -ForegroundColor Cyan
+    # orderRoot's slot1 terminal is authentic and bound to orderRoot's set. Copy
+    # it onto a fresh set's slot2 path: its own slot field still reads 'slot1',
+    # so reconciliation refuses it as copied from another slot.
+    $authenticSlot1Path = Join-Path $orderRoot "runs\slot1-terminal.json"
+    $copyRoot = Join-Path $sandbox "cross-slot-root"
+    $copyArguments = $planArguments.Clone()
+    $copyArguments["QualificationRoot"] = $copyRoot
+    $copyArguments["ReviewerScriptPath"] = $failingAgent
+    $copyArguments["OperatorAlias"] = "complete-test"
+    & $sandboxTool -Mode Declare @copyArguments -RunSetKeyPath $keyPath -Purpose "cross-slot copy" | Out-Null
+    $copyTokenPath = Join-Path $copyRoot "runset\launch-authorization.token"
+    & $sandboxTool -Mode RunSlot @copyArguments -Slot "slot1" -RunSetKeyPath $keyPath `
+        -LaunchAuthorizationTokenPath $copyTokenPath 2>&1 | Out-Null
+    Assert-Qualification ($LASTEXITCODE -eq 0) "The cross-slot fixture's slot1 did not complete."
+    # Overwrite this set's genuine slot2 (never run) with slot1's own terminal.
+    $copySlot2Path = Join-Path $copyRoot "runs\slot2-terminal.json"
+    $copySlot1Path = Join-Path $copyRoot "runs\slot1-terminal.json"
+    Copy-Item -LiteralPath $copySlot1Path -Destination $copySlot2Path -Force
+    Set-ItemProperty -LiteralPath $copySlot2Path -Name IsReadOnly -Value $true
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode Reconcile @copyArguments -RunSetKeyPath $keyPath
+    } "Reconciliation accepted a slot1 terminal copied onto the slot2 path." "copied from another slot"
+    $copyStatus = @(& $statusTool -QualificationRoot $copyRoot | Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    $copyStatusSlot2 = @($copyStatus[0].slots | Where-Object { [string]$_.slot -ceq "slot2" })
+    Assert-Qualification (@($copyStatusSlot2).Count -eq 1 -and -not [bool]$copyStatusSlot2[0].boundToDeclaration) `
+        "The status command bound a cross-slot copied terminal to the declaration."
+
+    # A complete terminal for a slot OUTSIDE the declared set never counts toward
+    # readiness; the two declared slots are still missing, so the set is not ready
+    # and the stray slot is surfaced as unexpected.
+    $strayRoot = Join-Path $sandbox "stray-slot-root"
+    $strayArguments = $planArguments.Clone()
+    $strayArguments["QualificationRoot"] = $strayRoot
+    $strayArguments["ReviewerScriptPath"] = $failingAgent
+    & $sandboxTool -Mode Declare @strayArguments -RunSetKeyPath $keyPath -Purpose "stray slot scoping" | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $strayRoot "runs") | Out-Null
+    $strayTerminalPath = Join-Path $strayRoot "runs\slot3-terminal.json"
+    Copy-Item -LiteralPath $authenticSlot1Path -Destination $strayTerminalPath -Force
+    Set-ItemProperty -LiteralPath $strayTerminalPath -Name IsReadOnly -Value $true
+    $strayStatus = @(& $statusTool -QualificationRoot $strayRoot -RunSetKeyPath $keyPath | Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (-not [bool]$strayStatus[0].reconciliationReady -and -not [bool]$strayStatus[0].evidenceComplete -and
+        @($strayStatus[0].unexpectedSlots) -ccontains "slot3") `
+        "The status command counted a slot outside the declared set toward readiness."
+
+    # -- 12d. Atomic declaration publish, staging residue, count-range guard,
+    #         and case-exact slot membership ---------------------------------
+    Write-Host "12d/13 atomic publish, staging residue, count-range and case-exact slots" -ForegroundColor Cyan
+
+    # A successful Declare publishes a WHOLE run set: the signed declaration, its
+    # launch token, and the publish-intent marker are all present, and no
+    # attempt-owned staging directory is left behind under the root.
+    $publishRoot = Join-Path $sandbox "atomic-publish-root"
+    $publishArguments = $planArguments.Clone()
+    $publishArguments["QualificationRoot"] = $publishRoot
+    $publishArguments["ReviewerScriptPath"] = $failingAgent
+    & $sandboxTool -Mode Declare @publishArguments -RunSetKeyPath $keyPath -Purpose "atomic publish" | Out-Null
+    $publishDecl = @(Get-ChildItem -LiteralPath (Join-Path $publishRoot "runset") -Filter "runset-*.json" -File |
+            Where-Object { $_.Name -notlike "*.sig" })
+    Assert-Qualification (@($publishDecl).Count -eq 1 -and
+        (Test-Path -LiteralPath (Join-Path $publishRoot "runset\launch-authorization.token") -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $publishRoot "runset\publish-intent.json") -PathType Leaf)) `
+        "A successful Declare did not publish a whole run set (declaration + token + intent marker)."
+    Assert-Qualification (-not @(Get-ChildItem -LiteralPath $publishRoot -Directory -Filter ".runset-staging-*" `
+                -ErrorAction SilentlyContinue).Count) `
+        "A successful Declare left attempt-owned staging residue under the root."
+
+    # A second Declare into a published root is refused before it can stage or
+    # mint another token: exactly one declaration owns a root.
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode Declare @publishArguments -RunSetKeyPath $keyPath -Purpose "second declare"
+    } "A second Declare was accepted into an already-declared root." "already"
+
+    # Incomplete attempt-owned staging (a crash between stage and publish) is
+    # self-describing residue: status surfaces it, but it is NEVER a declared or
+    # launchable set - readers only ever look in 'runset', which stays empty, so
+    # neither status nor the gate treats it as evidence.
+    $stagingRoot = Join-Path $sandbox "staging-residue-root"
+    $stagingDir = Join-Path $stagingRoot ".runset-staging-11112222-3333-4444-5555-666677778888"
+    New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null
+    Set-Content -LiteralPath (Join-Path $stagingDir "runset-partial.json") -Value '{"setId":"partial"}' -Encoding utf8NoBOM
+    $stagingStatus = @(& $statusTool -QualificationRoot $stagingRoot -RunSetKeyPath $keyPath |
+            Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (@($stagingStatus).Count -eq 1 -and
+        @($stagingStatus[0].incompleteStaging).Count -eq 1 -and
+        [string]@($stagingStatus[0].incompleteStaging)[0] -clike ".runset-staging-*" -and
+        $null -eq $stagingStatus[0].declaration -and
+        -not [bool]$stagingStatus[0].evidenceComplete -and
+        -not [bool]$stagingStatus[0].reconciliationReady) `
+        "Incomplete staging residue was treated as a declared or launchable set."
+
+    # Two concurrent publishers into the same fresh root: exactly one wins the
+    # atomic rename, the other fails closed, and no half-published set or orphan
+    # staging is left behind - readers see either no set or one whole set.
+    $raceRoot = Join-Path $sandbox "concurrent-publish-root"
+    $raceArguments = $planArguments.Clone()
+    $raceArguments["QualificationRoot"] = $raceRoot
+    $raceArguments["ReviewerScriptPath"] = $failingAgent
+    $raceScript = {
+        param($tool, $mode, $declArgs, $key, $purpose)
+        try { & $tool -Mode $mode @declArgs -RunSetKeyPath $key -Purpose $purpose *>$null; "ok:$LASTEXITCODE" }
+        catch { "err:$($_.Exception.Message)" }
+    }
+    $raceJobs = @(
+        (Start-Job -ScriptBlock $raceScript -ArgumentList $sandboxTool, "Declare", $raceArguments, $keyPath, "race-a"),
+        (Start-Job -ScriptBlock $raceScript -ArgumentList $sandboxTool, "Declare", $raceArguments, $keyPath, "race-b")
+    )
+    $raceCompleted = @($raceJobs | Wait-Job -Timeout 120)
+    Assert-Qualification (@($raceCompleted).Count -eq 2 -and
+        -not @($raceJobs | Where-Object { $_.State -eq 'Running' }).Count) `
+        "A concurrent publisher job did not complete within the deadline."
+    $raceResults = @($raceJobs | Receive-Job)
+    $raceJobs | Remove-Job -Force -ErrorAction SilentlyContinue
+    # Every contender is accounted for: exactly one won (ok:0), exactly one lost,
+    # and the loser failed for the expected atomic-publication reason.
+    $raceOk = @($raceResults | Where-Object { [string]$_ -like "ok:0" })
+    $raceErr = @($raceResults | Where-Object { [string]$_ -like "err:*" })
+    Assert-Qualification (@($raceResults).Count -eq 2 -and @($raceOk).Count -eq 1 -and @($raceErr).Count -eq 1) `
+        "Concurrent publishers did not resolve to exactly one winner and one failed contender."
+    Assert-Qualification ([string]@($raceErr)[0] -match 'already|concurrent') `
+        "The losing concurrent publisher did not fail for the expected atomic-publication reason."
+    $racePublished = @(Get-ChildItem -LiteralPath (Join-Path $raceRoot "runset") -Filter "runset-*.json" -File `
+            -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike "*.sig" })
+    $raceStagingLeft = @(Get-ChildItem -LiteralPath $raceRoot -Directory -Filter ".runset-staging-*" `
+            -ErrorAction SilentlyContinue)
+    Assert-Qualification (@($racePublished).Count -eq 1 -and @($raceStagingLeft).Count -eq 0) `
+        "Concurrent publishers did not resolve to exactly one whole set with no staging residue."
+    # The winner's published set is whole: its declaration verifies under the key
+    # and its launch-authorization token is present, well-formed, and unique (no
+    # orphan token left in staging).
+    $raceCompareTool = Join-Path $toolkitCopy "tools\Compare-ReviewerReplayRuns.ps1"
+    $raceVerified = & $raceCompareTool -VerifyRunSet -RunSetPath $racePublished[0].FullName -KeyPath $keyPath
+    $raceVerifiedObj = @(@($raceVerified) |
+            Where-Object { $_ -is [string] -and $_.TrimStart().StartsWith("{") } | Select-Object -Last 1)
+    $raceToken = Join-Path $raceRoot "runset\launch-authorization.token"
+    Assert-Qualification (@($raceVerifiedObj).Count -eq 1 -and
+        (Test-Path -LiteralPath $raceToken -PathType Leaf) -and
+        (((Get-Content -LiteralPath $raceToken -Raw).Trim()) -match '^[0-9a-f]{64}$')) `
+        "The winning concurrent publisher did not leave a verifiable declaration bound to a whole, well-formed token."
+
+    # Finding 2: status refuses to derive slots or claim any readiness from a
+    # declaration whose plannedRunCount is outside the supported 2..16 range. A
+    # zero count can never make a zero-terminal set look 'ready', and a '1..0'
+    # style count never misgenerates a descending slot pair.
+    foreach ($badCount in @(0, 1, 17, -3)) {
+        $badRoot = Join-Path $sandbox "badcount-$([Math]::Abs($badCount))-root"
+        New-Item -ItemType Directory -Force -Path (Join-Path $badRoot "runset") | Out-Null
+        Set-Content -LiteralPath (Join-Path $badRoot "runset\runset-bad.json") `
+            -Value ('{"setId":"bad","snapshotName":"s","snapshotManifestDigest":"m","plannedRunCount":' +
+                $badCount + ',"planDigest":"d","promotable":false}') `
+            -Encoding utf8NoBOM
+        $badStatus = @(& $statusTool -QualificationRoot $badRoot | Where-Object { $_ -is [pscustomobject] -and $_.kind })
+        Assert-Qualification (@($badStatus).Count -eq 1 -and
+            -not [bool]$badStatus[0].declaration.countValid -and
+            -not [bool]$badStatus[0].evidenceComplete -and
+            -not [bool]$badStatus[0].reconciliationReady) `
+            "Status derived readiness from an out-of-range plannedRunCount ($badCount)."
+    }
+    # A valid in-range count is accepted as count-valid.
+    $goodCountStatus = @(& $statusTool -QualificationRoot $orderRoot -RunSetKeyPath $keyPath |
+            Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification ([bool]$goodCountStatus[0].declaration.countValid) `
+        "Status rejected an in-range plannedRunCount as invalid."
+
+    # Finding 3/4: slot membership is case-exact, and Status and Reconcile use the
+    # SAME shared resolver, so they reject a case alias IDENTICALLY. The fixture is
+    # bound to its OWN set (a real slot1 run into caseRoot), then renamed so casing
+    # is the only changed variable: a physical 'Slot1-terminal.json' where the
+    # declared set expects 'slot1'. Neither reader may open it as 'slot1'.
+    $caseRoot = Join-Path $sandbox "case-exact-root"
+    $caseArguments = $planArguments.Clone()
+    $caseArguments["QualificationRoot"] = $caseRoot
+    $caseArguments["ReviewerScriptPath"] = $failingAgent
+    $caseArguments["OperatorAlias"] = "complete-test"
+    & $sandboxTool -Mode Declare @caseArguments -RunSetKeyPath $keyPath -Purpose "case-exact slots" | Out-Null
+    $caseTokenPath = Join-Path $caseRoot "runset\launch-authorization.token"
+    & $sandboxTool -Mode RunSlot @caseArguments -Slot "slot1" -RunSetKeyPath $keyPath `
+        -LaunchAuthorizationTokenPath $caseTokenPath 2>&1 | Out-Null
+    Assert-Qualification ($LASTEXITCODE -eq 0) "The case fixture's own slot1 did not complete."
+    # Rename slot1 -> Slot1 (casing the ONLY variable); the terminal stays bound to
+    # caseRoot's own declaration, so any rejection is due purely to the case alias.
+    # A single case-only Rename-Item is a no-op on a case-insensitive volume, so it
+    # is done in two steps (through a distinct interim name) to force the NTFS
+    # directory entry to physically carry the new casing. The file content (and
+    # thus its set/plan binding) is untouched.
+    $caseLower = Join-Path $caseRoot "runs\slot1-terminal.json"
+    $caseUpper = Join-Path $caseRoot "runs\Slot1-terminal.json"
+    Set-ItemProperty -LiteralPath $caseLower -Name IsReadOnly -Value $false
+    Rename-Item -LiteralPath $caseLower -NewName "slot1-terminal.json.caserename"
+    Rename-Item -LiteralPath (Join-Path $caseRoot "runs\slot1-terminal.json.caserename") -NewName "Slot1-terminal.json"
+    Set-ItemProperty -LiteralPath $caseUpper -Name IsReadOnly -Value $true
+    # Prove the physical entry is exactly 'Slot1-terminal.json' (case-sensitive).
+    $caseEntry = @(Get-ChildItem -LiteralPath (Join-Path $caseRoot "runs") -File -Filter "*-terminal.json" |
+            Where-Object { [string]::Equals($_.Name, "Slot1-terminal.json", [StringComparison]::Ordinal) })
+    Assert-Qualification (@($caseEntry).Count -eq 1) "The case fixture did not produce a physical 'Slot1-terminal.json' entry."
+    # Status (parity mode) and Reconcile receive the exact same authenticated
+    # inputs and reject identically: no case-exact 'slot1-terminal.json' exists.
+    $caseStatus = @(& $statusTool @caseArguments -RunSetKeyPath $keyPath |
+            Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (@($caseStatus).Count -eq 1 -and [bool]$caseStatus[0].parityMode -and
+        @($caseStatus[0].unexpectedSlots) -ccontains "Slot1" -and
+        -not [bool]$caseStatus[0].evidenceComplete -and
+        -not [bool]$caseStatus[0].reconciliationReady -and
+        [string]$caseStatus[0].reconciliationReason -match "case-exact") `
+        "Status counted a case-mismatched 'Slot1' terminal toward a 'slot1' declared set."
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode Reconcile @caseArguments -RunSetKeyPath $keyPath
+    } "Reconcile opened a case-mismatched 'Slot1' terminal as 'slot1'." "case-exact"
+
+    # Duplicate case-alias (finding 2): where the filesystem preserves case, two
+    # terminals that differ ONLY by case for the same logical slot are ambiguous
+    # evidence, and the shared resolver refuses them fail-closed rather than
+    # choosing one variant. On a case-insensitive volume the two names collapse to
+    # one file so the ambiguity cannot arise; the guard then skips, as directed.
+    $aliasDir = Join-Path $sandbox "alias-ambiguity\runs"
+    New-Item -ItemType Directory -Force -Path $aliasDir | Out-Null
+    $aliasContent = Get-Content -LiteralPath $caseUpper -Raw
+    [IO.File]::WriteAllText((Join-Path $aliasDir "Slot1-terminal.json"), $aliasContent, [Text.UTF8Encoding]::new($false))
+    try { [IO.File]::WriteAllText((Join-Path $aliasDir "slot1-terminal.json"), $aliasContent, [Text.UTF8Encoding]::new($false)) } catch {}
+    $aliasEntries = @(Get-ChildItem -LiteralPath $aliasDir -File -Filter "*-terminal.json")
+    if (@($aliasEntries).Count -eq 2) {
+        Assert-QualificationThrows {
+            Resolve-ReviewerQualificationSlotTerminalPath -RunDirectory $aliasDir -SlotName "slot1"
+        } "The shared resolver chose one of two case-variant terminals instead of refusing the ambiguity." "ambiguous slot evidence"
+    }
+    else {
+        Write-Host "  (case-insensitive volume: two case-variant terminals cannot coexist; ambiguity guard skipped)" `
+            -ForegroundColor DarkGray
+    }
+
+    # -- 12e. Durability boundary: a corrupt/incomplete published set is classified
+    #         explicitly, never silently treated as a valid set. Directory.Move is
+    #         process/concurrency atomic, NOT a power-loss fsync barrier, so on
+    #         every read the declaration signature and the published inventory are
+    #         verified; a truncated declaration or a missing token fails closed in
+    #         BOTH Status (parity) and Reconcile. ------------------------------
+    Write-Host "12e/13 durability: corrupt/incomplete published set fails closed" -ForegroundColor Cyan
+
+    # (a) A tampered/truncated declaration no longer verifies under the key.
+    $corruptRoot = Join-Path $sandbox "corrupt-decl-root"
+    $corruptArguments = $planArguments.Clone()
+    $corruptArguments["QualificationRoot"] = $corruptRoot
+    $corruptArguments["ReviewerScriptPath"] = $failingAgent
+    $corruptArguments["OperatorAlias"] = "complete-test"
+    & $sandboxTool -Mode Declare @corruptArguments -RunSetKeyPath $keyPath -Purpose "durability corruption" | Out-Null
+    $corruptDeclFile = @(Get-ChildItem -LiteralPath (Join-Path $corruptRoot "runset") -Filter "runset-*.json" -File |
+            Where-Object { $_.Name -notlike "*.sig" })[0].FullName
+    Set-ItemProperty -LiteralPath $corruptDeclFile -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
+    $corruptEnvelope = Get-Content -LiteralPath $corruptDeclFile -Raw | ConvertFrom-Json
+    # Tamper the signed manifest WITHOUT breaking JSON: the HMAC over it no longer matches.
+    $corruptEnvelope.manifestJson = ([string]$corruptEnvelope.manifestJson) + " "
+    [IO.File]::WriteAllText($corruptDeclFile, (ConvertTo-Json -InputObject $corruptEnvelope -Depth 12 -Compress),
+        [Text.UTF8Encoding]::new($false))
+    $corruptStatus = @(& $statusTool @corruptArguments -RunSetKeyPath $keyPath |
+            Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (@($corruptStatus).Count -eq 1 -and [bool]$corruptStatus[0].parityMode -and
+        [bool]$corruptStatus[0].declarationCorrupt -and [bool]$corruptStatus[0].signatureUnverified -and
+        -not [bool]$corruptStatus[0].reconciliationReady -and [string]$corruptStatus[0].reconciliationReason) `
+        "Status did not classify a tampered/truncated published declaration as corrupt and not-ready."
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode Reconcile @corruptArguments -RunSetKeyPath $keyPath
+    } "Reconcile accepted a tampered/truncated published declaration." "signature verification failed"
+
+    # (b) A published set missing its launch-authorization token is an incomplete
+    #     inventory (a power-loss-style partial publish): corrupt, never launchable.
+    $missTokenRoot = Join-Path $sandbox "missing-token-root"
+    $missTokenArguments = $planArguments.Clone()
+    $missTokenArguments["QualificationRoot"] = $missTokenRoot
+    $missTokenArguments["ReviewerScriptPath"] = $failingAgent
+    $missTokenArguments["OperatorAlias"] = "complete-test"
+    & $sandboxTool -Mode Declare @missTokenArguments -RunSetKeyPath $keyPath -Purpose "missing token" | Out-Null
+    $missTokenPath = Join-Path $missTokenRoot "runset\launch-authorization.token"
+    Set-ItemProperty -LiteralPath $missTokenPath -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $missTokenPath -Force
+    $missTokenStatus = @(& $statusTool @missTokenArguments -RunSetKeyPath $keyPath |
+            Where-Object { $_ -is [pscustomobject] -and $_.kind })
+    Assert-Qualification (@($missTokenStatus).Count -eq 1 -and [bool]$missTokenStatus[0].parityMode -and
+        [bool]$missTokenStatus[0].declarationCorrupt -and
+        -not [bool]$missTokenStatus[0].reconciliationReady -and
+        [string]$missTokenStatus[0].reconciliationReason -match "launch-authorization") `
+        "Status did not classify a published set missing its launch token as corrupt and not-ready."
+    Assert-QualificationThrows {
+        & $sandboxTool -Mode Reconcile @missTokenArguments -RunSetKeyPath $keyPath
+    } "Reconcile accepted a published set missing its launch-authorization token." "launch-authorization token"
+
+    # -- 13. No fragile stdout consumer anywhere in the production path -------
+    Write-Host "13/13 production execution path uses no Tee-Object" -ForegroundColor Cyan
+    foreach ($productionPath in @(
+            (Join-Path $RepoRoot "tools\Invoke-ReviewerReplayQualification.ps1"),
+            (Join-Path $RepoRoot "tools\Get-ReviewerReplayQualificationStatus.ps1"),
+            (Join-Path $RepoRoot "src\Agents\reviewer\ReplayQualification.ps1"),
+            (Join-Path $RepoRoot "src\DevPilot.AgentHarness\DevPilot.AgentHarness.psm1"))) {
+        Assert-Qualification ((Get-Content -LiteralPath $productionPath -Raw) -notmatch "Tee-Object") `
+            "The production execution path '$productionPath' pipes output through Tee-Object."
+    }
+
     # -- 11. Nothing here ever reached a model or a network call -------------
-    Write-Host "11/11 offline discipline" -ForegroundColor Cyan
+    Write-Host "offline discipline" -ForegroundColor Cyan
     $libraryText = Get-Content -LiteralPath (Join-Path $RepoRoot "src\Agents\reviewer\ReplayQualification.ps1") -Raw
     foreach ($forbiddenCall in @("Invoke-RestMethod", "Invoke-WebRequest", "System.Net.Http")) {
         Assert-Qualification ($libraryText -notmatch [regex]::Escape($forbiddenCall)) `

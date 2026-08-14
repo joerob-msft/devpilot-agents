@@ -1375,6 +1375,37 @@ function Get-ReviewerVerificationAcceptedReconciliationCandidates {
     return $result.ToArray()
 }
 
+function Get-ReviewerVerificationConventionCoverageStatus {
+    <#
+        Decides a cross-verification pass status from four independent coverage
+        signals so partial convention-evidence degradation can never be reported
+        as a complete review. A pass is "complete" only when every blind verifier
+        run completed, the convention specialist stood behind its own discovery,
+        the sealed convention plan carried complete authoritative evidence, AND
+        every configured generalist authoritative source reached the blind
+        generalist context. Any incomplete signal yields "degraded" - the caller
+        still exposes the eligible blind-generalist findings. Kept a pure decision
+        so it is deterministically unit-testable in isolation.
+
+        AuthoritativeSourceDegraded covers the generalist-context authoritative
+        source path (repoConventions.authoritativeSources): when offline replay
+        withholds a configured source it was never sealed to answer, the blind
+        generalist never saw that convention text, so the pass must degrade rather
+        than silently report a complete review with missing authoritative evidence.
+    #>
+    param(
+        [Parameter(Mandatory)][bool]$AllVerifierRunsComplete,
+        [Parameter(Mandatory)][bool]$SpecialistDegraded,
+        [Parameter(Mandatory)][bool]$ConventionEvidenceDegraded,
+        [bool]$AuthoritativeSourceDegraded = $false
+    )
+    if (-not $AllVerifierRunsComplete) { return "degraded" }
+    if ($SpecialistDegraded) { return "degraded" }
+    if ($ConventionEvidenceDegraded) { return "degraded" }
+    if ($AuthoritativeSourceDegraded) { return "degraded" }
+    return "complete"
+}
+
 function Get-ReviewerVerificationThreadFacts {
     param($FactPlan)
     $records = [System.Collections.Generic.List[object]]::new()
@@ -2235,15 +2266,18 @@ function Get-ReviewerVerificationEvidenceOptions {
     )
     $candidateId = [string](Get-ReviewerVerificationValue $Candidate "candidateId" "")
     $options = [System.Collections.Generic.List[object]]::new()
-    $hunk = @($EvidenceHunks | Where-Object {
-            [string](Get-ReviewerVerificationValue $_ "candidateId" "") -ceq $candidateId
-        } | Select-Object -First 1)
-    if ($hunk.Count -eq 1 -and
-        [string](Get-ReviewerVerificationValue $hunk[0] "sha256" "") -match '^[0-9a-f]{64}$') {
+    $hunkOptions = @($EvidenceHunks | Where-Object {
+            [string](Get-ReviewerVerificationValue $_ "candidateId" "") -ceq $candidateId -and
+            [string](Get-ReviewerVerificationValue $_ "sha256" "") -match '^[0-9a-f]{64}$'
+        })
+    $seenHunkSha = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($hunk in $hunkOptions) {
+        $hunkSha = [string](Get-ReviewerVerificationValue $hunk "sha256" "")
+        if (-not $seenHunkSha.Add($hunkSha)) { continue }
         [void]$options.Add([pscustomobject][ordered]@{
                 purpose = "candidate"
                 kind = "diffHunk"
-                sha256 = [string](Get-ReviewerVerificationValue $hunk[0] "sha256" "")
+                sha256 = $hunkSha
                 factIds = ""
                 evidenceFactId = ""
                 duplicateTargetId = ""

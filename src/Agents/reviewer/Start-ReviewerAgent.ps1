@@ -3516,6 +3516,23 @@ function Get-ReviewerAuthoritativeSourceSnapshots {
         $snapshots = New-Object System.Collections.Generic.List[hashtable]
         $totalBytes = 0
         foreach ($source in $sources) {
+            # Offline replay withholds a convention authoritative source that was
+            # never captured, at candidate level, rather than issuing a read the
+            # sealed snapshot cannot answer. This applies to BOTH the convention
+            # pack path and the generalist-context (repoConventions.authoritative
+            # Sources) path: an unrecorded read must degrade the affected source,
+            # never abort the whole cycle and take blind functional discovery down
+            # with it. The probe issues no request; the matching live path is
+            # unchanged (issue-and-throw on a real fault when replay is inactive).
+            if ($script:ReviewerReplayActive) {
+                $probeRepoArgs = @{ action = "get"; project = $source.Project; repositoryNameOrId = $source.RepositoryId }
+                $probeBranchArgs = @{ action = "get"; project = $source.Project; repositoryId = $source.RepositoryId; branchName = $source.Branch }
+                if (-not (Test-ReviewerReplayConventionReadRecorded -Session $sourceSession -Name "repo_repository" -Arguments $probeRepoArgs) -or
+                    -not (Test-ReviewerReplayConventionReadRecorded -Session $sourceSession -Name "repo_branch" -Arguments $probeBranchArgs)) {
+                    Write-Warning "Convention authoritative source '$(if ($source.Name) { $source.Name } else { $source.Path })' is not present in the sealed replay snapshot; withholding it (candidate-level convention degrade)."
+                    continue
+                }
+            }
             $repositoryKey = "$($source.Project)`n$($source.RepositoryId)"
             if (-not $repositoryCache.ContainsKey($repositoryKey)) {
                 try {
@@ -3556,6 +3573,14 @@ function Get-ReviewerAuthoritativeSourceSnapshots {
                     -BranchResult $branchResult -ExpectedBranch $source.Branch
             }
             $commitSha = [string]$commitCache[$commitKey]
+
+            if ($script:ReviewerReplayActive) {
+                $probeFileArgs = @{ action = "get_content"; project = $source.Project; repositoryId = $source.RepositoryId; path = $source.Path; versionType = "Commit"; version = $commitSha }
+                if (-not (Test-ReviewerReplayConventionReadRecorded -Session $sourceSession -Name "repo_file" -Arguments $probeFileArgs)) {
+                    Write-Warning "Convention authoritative source content '$($source.Path)' is not present in the sealed replay snapshot; withholding it (candidate-level convention degrade)."
+                    continue
+                }
+            }
 
             # Agency ADO repo_file accepts versionType=Commit and version=<sha>.
             # Live smoke proved historical commits return distinct bytes and a
@@ -3638,9 +3663,53 @@ function Get-ReviewerAuthoritativeSourceSnapshots {
     }
 }
 
+function Test-ReviewerReplayConventionReadRecorded {
+    <#
+        Answers whether a convention-source read was captured in the sealed
+        replay snapshot, so an offline planner can withhold an unavailable
+        source at candidate level instead of issuing a request the snapshot
+        cannot answer (which would fail-closed and abort the whole cycle) or
+        falling through to a forbidden live read. Live mode always returns
+        true, so the readers keep their existing issue-and-throw behavior.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Session,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][hashtable]$Arguments
+    )
+    if (-not $script:ReviewerReplayActive) { return $true }
+    # Replay is active but this session carries no sealed snapshot. That is an
+    # inconsistent wiring state, not a licence to issue a live read: fail closed
+    # so the source is withheld (candidate-level convention degrade) rather than
+    # risk falling through to the forbidden live transport.
+    if (-not $Session.ContainsKey("Replay") -or $null -eq $Session["Replay"]) { return $false }
+    return (Test-AgentReplaySnapshotHasResponse -Snapshot $Session["Replay"] -Name $Name -Arguments $Arguments)
+}
+
 function Get-ReviewerConventionTargetCommit {
     param([Parameter(Mandatory)][hashtable]$Session)
     $targetBranch = $TargetRefName -replace '^refs/heads/', ''
+    # Offline replay resolves the reviewed target commit from the sealed
+    # snapshot binding, never from a live-shaped repo_branch read. The target
+    # commit is already an authoritatively bound corpus fact - it is checked at
+    # seal time against the corpus's own captured PR identity
+    # (lastMergeTargetCommit) and is covered by the manifest digest the operator
+    # pins - so re-deriving it by asking for the branch tip would only invite a
+    # request a replay cannot answer. A missing or malformed sealed commit is a
+    # candidate-level convention fault (it degrades the convention path), not a
+    # reason to fall through to a live read.
+    if ($script:ReviewerReplayActive) {
+        $sealedTarget = ""
+        if ($script:ReviewerReplaySnapshot -and $script:ReviewerReplaySnapshot.Binding) {
+            $sealedTarget = ([string]$script:ReviewerReplaySnapshot.Binding.targetCommit).ToLowerInvariant()
+        }
+        if ($sealedTarget -notmatch '^[0-9a-f]{40}$') {
+            throw (New-ReviewerConventionEnvironmentException -Operation "resolve reviewed target branch" `
+                    -InnerException ([InvalidOperationException]::new(
+                        "The sealed replay snapshot does not carry an exact reviewed-target commit for branch '$targetBranch'.")))
+        }
+        return $sealedTarget
+    }
     try {
         $branchResult = Invoke-AgentMcpTool -Session $Session -Name "repo_branch" -Arguments @{
             action       = "get"
@@ -3667,6 +3736,13 @@ function Get-ReviewerConventionRepositorySnapshots {
     foreach ($source in @($RepositorySources)) {
         $path = [string]$source.Path
         if (-not $seen.Add($path)) { continue }
+        if ($script:ReviewerReplayActive) {
+            $probeFileArgs = @{ action = "get_content"; project = $ExpectedProject; repositoryId = $cfgRepoId; path = $path; versionType = "Commit"; version = $TargetCommit }
+            if (-not (Test-ReviewerReplayConventionReadRecorded -Session $Session -Name "repo_file" -Arguments $probeFileArgs)) {
+                Write-Warning "Convention repository source '$path' is not present in the sealed replay snapshot; withholding it (candidate-level convention degrade)."
+                continue
+            }
+        }
         try {
             $toolResult = Send-AgentMcpRequest -Session $Session -Method "tools/call" -Params @{
                 name      = "repo_file"
@@ -3996,7 +4072,12 @@ function Format-ReviewerAuthoritativeSources {
         [hashtable[]]$Snapshots = @(),
         [ValidateRange(0, 262144)][int]$MaxTotalBytes = 0
     )
-    $items = @($Snapshots)
+    # Defensive against a caller that hands us $null or an array that coerces a
+    # withheld/empty snapshot set into a phantom single $null element: filter nulls
+    # so a fully-withheld authoritative context collapses to the empty early-return
+    # instead of running Measure-Object -Sum over nothing (which throws under
+    # StrictMode: "The property 'Sum' cannot be found on this object").
+    $items = @($Snapshots | Where-Object { $null -ne $_ })
     if ($items.Count -eq 0) { return "" }
     $actualBytes = [int](($items | Measure-Object -Property ByteLength -Sum).Sum)
     if ($MaxTotalBytes -lt 1 -or $actualBytes -gt $MaxTotalBytes) {
@@ -4262,13 +4343,39 @@ function Get-ReviewerConventionSourceSummary {
        is injected into the generalist's runtime context directly, while
        `repoConventions.conventionPacks` produces a sealed plan. Reporting on
        only one of them would make this line false for a config that uses the
-       other. #>
+       other.
+
+       When the caller supplies the configured/resolved authoritative-source
+       counts, a replay that withheld a configured source (one it never sealed)
+       is reported as "N of M resolved; K withheld" rather than misdiagnosed as a
+       configuration gap. #>
     param(
         [AllowEmptyString()][string]$ConventionPlanPath = "",
-        [AllowEmptyString()][string]$AuthoritativeSourcesText = ""
+        [AllowEmptyString()][string]$AuthoritativeSourcesText = "",
+        [int]$AuthoritativeSourceConfiguredCount = 0,
+        [int]$AuthoritativeSourceResolvedCount = -1
     )
     $authorityParts = [System.Collections.Generic.List[string]]::new()
-    if ($AuthoritativeSourcesText) {
+    if ($AuthoritativeSourceConfiguredCount -gt 0) {
+        # When the caller knows how many authoritative sources the config declared
+        # AND how many actually resolved, report both. Offline replay can withhold
+        # a configured source it never sealed; reporting only the resolved count
+        # (or, when all are withheld, the empty-text "declares no authoritative
+        # sources" line below) would misdiagnose a replay-capture gap as a config
+        # gap. The run is already degraded and non-postable in that case; this only
+        # keeps the human-facing artifact honest.
+        $resolved = [Math]::Max(0, $AuthoritativeSourceResolvedCount)
+        if ($resolved -ge $AuthoritativeSourceConfiguredCount) {
+            [void]$authorityParts.Add("$resolved commit-pinned authoritative source(s) in the generalist context")
+        }
+        else {
+            $withheldCount = $AuthoritativeSourceConfiguredCount - $resolved
+            [void]$authorityParts.Add(
+                "$resolved of $AuthoritativeSourceConfiguredCount configured authoritative source(s) resolved in the " +
+                "generalist context; $withheldCount withheld because the offline replay snapshot could not answer them")
+        }
+    }
+    elseif ($AuthoritativeSourcesText) {
         $sourceCount = ([regex]::Matches($AuthoritativeSourcesText, '(?m)^Source \d+ provenance:')).Count
         [void]$authorityParts.Add("$sourceCount commit-pinned authoritative source(s) in the generalist context")
     }
@@ -6349,6 +6456,31 @@ function Invoke-DryRunSelfChecks {
         $renderA -cnotmatch '"commitSha":"a{40}"' -or
         $renderA -cnotmatch '"sha256":"82ae4e259f55c0fb1ac8aa1239e210ad0c3b2a43ab006b394affe94a10e16f72"') {
         $failures.Add("Authoritative source rendering did not preserve provenance behind a fresh collision-resistant boundary.")
+    }
+    # Regression: the offline all-convention-sources-withheld path. When every
+    # configured authoritative source is withheld, Get-ReviewerAuthoritativeSource
+    # Snapshots returns an empty array that collapses to AutomationNull, the caller
+    # coerces it to $null through Format-ReviewerAuthoritativeSources' [hashtable[]]
+    # parameter, and @($null) becomes a phantom single-element collection. This
+    # drives the exact deterministic pre-model sequence to the model-launch boundary
+    # under StrictMode and asserts it fails closed to empty text instead of throwing
+    # "The property 'Sum' cannot be found on this object".
+    $withheldRenderFailed = $false
+    foreach ($withheldInput in @(@(), $null, @($null), @($null, $null))) {
+        try {
+            $withheldText = Format-ReviewerAuthoritativeSources -Snapshots $withheldInput -MaxTotalBytes 35
+            if ($null -ne $withheldText -and [string]$withheldText -cne "") { $withheldRenderFailed = $true }
+        }
+        catch { $withheldRenderFailed = $true }
+    }
+    # A phantom $null next to a real snapshot must render only the real source.
+    try {
+        $mixedText = Format-ReviewerAuthoritativeSources -Snapshots @($null, $renderSnapshot) -MaxTotalBytes 35
+        if ([string]$mixedText -cnotmatch '"sha256":"82ae4e259f55c0fb1ac8aa1239e210ad0c3b2a43ab006b394affe94a10e16f72"') { $withheldRenderFailed = $true }
+    }
+    catch { $withheldRenderFailed = $true }
+    if ($withheldRenderFailed) {
+        $failures.Add("The all-authoritative-sources-withheld path did not fail closed to empty rendering under StrictMode.")
     }
     $legacyContext = Get-ReviewerRuntimeContext "nonce" 4242 $cfgRepoId ("a" * 40) "feature/x" "colleague" "[]"
     if (-not $legacyContext) { $failures.Add("Adding authoritative source text changed the positional runtime-context call contract.") }
@@ -10145,7 +10277,8 @@ function Get-ReviewerVerificationSourceHunks {
         [Parameter(Mandatory)][string]$SourceCommit,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Candidates,
         [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$ChangedPaths,
-        $SourceReport = $null
+        $SourceReport = $null,
+        [AllowEmptyCollection()][object[]]$ChangedFileAnchors = @()
     )
     $changed = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
     foreach ($changedPath in @($ChangedPaths)) {
@@ -10171,18 +10304,61 @@ function Get-ReviewerVerificationSourceHunks {
         param([hashtable]$verificationSession)
         $fileCache = @{}
         $hunks = [System.Collections.Generic.List[object]]::new()
-        foreach ($candidate in @($Candidates)) {
-            if ([string]$candidate.anchorKind -cne "changedFile" -or
-                -not [string]$candidate.filePath -or [int]$candidate.line -lt 1) {
-                continue
-            }
-            $normalizedPath = ConvertTo-ReviewerVerificationPath -Path ([string]$candidate.filePath)
-            if (-not $normalizedPath -or -not $changed.ContainsKey($normalizedPath)) {
-                continue
-            }
+        # A candidate's semantic identity is its primary anchor plus its ordered-
+        # independent cross-file manifestation set. The verifier must rule on the
+        # WHOLE sealed evidence set, so one hunk is rendered for the anchor line
+        # and one for every manifestation line the candidate binds; each is a
+        # sealed changed-right-hand slice. Dedupe keeps a manifestation that
+        # coincides with the anchor from being rendered twice.
+        $emittedHunkKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        # A convention candidate's required form is often set by a nearby changed
+        # line that is NOT itself a violation target (for example a subscriptionKey
+        # binding that mandates a "Global." prefix on a definition several lines
+        # below). Such a governing line is neither the anchor nor a legal
+        # manifestation, so the anchor/manifestation +-3 windows never surface it.
+        # For convention candidates the verifier therefore also receives one bounded
+        # "context" hunk spanning the sealed changed-right-hand range that encloses
+        # the anchor, capped to keep evidence bounded. Every rendered line stays
+        # sealed changed-right-hand evidence; nothing unsealed is ever added.
+        $maxContextSpan = 120
+        function Add-ReviewerVerificationSourceHunk {
+            param(
+                [string]$CandidateId,
+                [AllowEmptyString()][string]$RawPath,
+                [int]$AnchorLine,
+                [string]$Role,
+                [int]$SpanStart = 0,
+                [int]$SpanEnd = 0
+            )
+            if (-not $CandidateId -or -not $RawPath -or $AnchorLine -lt 1) { return }
+            $normalizedPath = ConvertTo-ReviewerVerificationPath -Path $RawPath
+            if (-not $normalizedPath -or -not $changed.ContainsKey($normalizedPath)) { return }
             $path = $changed[$normalizedPath]
+            if ($SpanStart -ge 1 -and $SpanEnd -ge $SpanStart) {
+                $reqStart = $SpanStart
+                $reqEnd = $SpanEnd
+                if (($reqEnd - $reqStart + 1) -gt $maxContextSpan) {
+                    $half = [int]($maxContextSpan / 2)
+                    # Center the bounded window on the anchor, but keep the full
+                    # $maxContextSpan span even when the anchor sits near a range
+                    # edge: clamp the start into [SpanStart, SpanEnd-span+1] first,
+                    # then derive the end from it. Both bounds stay inside the
+                    # sealed changed-right-hand range, so no unsealed line is added.
+                    $maxStart = $SpanEnd - $maxContextSpan + 1
+                    $reqStart = [Math]::Max($SpanStart, [Math]::Min($maxStart, $AnchorLine - $half))
+                    $reqEnd = [Math]::Min($SpanEnd, $reqStart + $maxContextSpan - 1)
+                }
+            }
+            else {
+                $reqStart = $AnchorLine - 3
+                $reqEnd = $AnchorLine + 3
+            }
+            $dedupeKey = $CandidateId + "|" + $normalizedPath + "|" +
+                [Convert]::ToString($reqStart, [Globalization.CultureInfo]::InvariantCulture) + "|" +
+                [Convert]::ToString($reqEnd, [Globalization.CultureInfo]::InvariantCulture)
+            if (-not $emittedHunkKeys.Add($dedupeKey)) { return }
             if ($sealedFiles.ContainsKey($normalizedPath)) {
-                $line = [int]$candidate.line
+                $line = [int]$AnchorLine
                 $matchingSlices = @((Get-ReviewerVerificationValue `
                             $sealedFiles[$normalizedPath] "Slices" @()) | Where-Object {
                         $line -ge [int](Get-ReviewerVerificationValue $_ "StartLine" 0) -and
@@ -10201,8 +10377,9 @@ function Get-ReviewerVerificationSourceHunks {
                         $sliceLines.Count -ne ($sliceEnd - $sliceStart + 1)) {
                         throw "Sealed source report contains malformed slice line accounting for '$path'."
                     }
-                    $start = [Math]::Max($sliceStart, $line - 3)
-                    $end = [Math]::Min($sliceEnd, $line + 3)
+                    $start = [Math]::Max($sliceStart, $reqStart)
+                    $end = [Math]::Min($sliceEnd, $reqEnd)
+                    if ($end -lt $start) { return }
                     $rendered = [System.Collections.Generic.List[string]]::new()
                     for ($index = $start; $index -le $end; $index++) {
                         [void]$rendered.Add((
@@ -10211,17 +10388,18 @@ function Get-ReviewerVerificationSourceHunks {
                     }
                     $text = $rendered.ToArray() -join "`n"
                     [void]$hunks.Add([pscustomobject][ordered]@{
-                            candidateId = [string]$candidate.candidateId
-                            filePath = [string]$candidate.filePath
+                            candidateId = [string]$CandidateId
+                            filePath = $normalizedPath
                             line = $line
                             startLine = $start
                             endLine = $end
                             sourceCommit = $SourceCommit
                             sourceKind = "sealedSourceSlice"
+                            role = [string]$Role
                             text = $text
                             sha256 = Get-ReviewerVerificationSha256 -Text $text
                         })
-                    continue
+                    return
                 }
             }
             try {
@@ -10232,10 +10410,11 @@ function Get-ReviewerVerificationSourceHunks {
                 }
                 $content = [string]$fileCache[$normalizedPath].Content
                 $lines = @($content.Replace("`r`n", "`n").Replace("`r", "`n") -split "`n")
-                $line = [int]$candidate.line
-                if ($line -gt $lines.Count) { continue }
-                $start = [Math]::Max(1, $line - 3)
-                $end = [Math]::Min($lines.Count, $line + 3)
+                $line = [int]$AnchorLine
+                if ($line -gt $lines.Count) { return }
+                $start = [Math]::Max(1, $reqStart)
+                $end = [Math]::Min($lines.Count, $reqEnd)
+                if ($end -lt $start) { return }
                 $rendered = [System.Collections.Generic.List[string]]::new()
                 for ($index = $start; $index -le $end; $index++) {
                     [void]$rendered.Add((
@@ -10244,19 +10423,76 @@ function Get-ReviewerVerificationSourceHunks {
                 }
                 $text = $rendered.ToArray() -join "`n"
                 [void]$hunks.Add([pscustomobject][ordered]@{
-                        candidateId = [string]$candidate.candidateId
-                        filePath = [string]$candidate.filePath
+                        candidateId = [string]$CandidateId
+                        filePath = $normalizedPath
                         line = $line
                         startLine = $start
                         endLine = $end
                         sourceCommit = $SourceCommit
                         sourceKind = "commitPinnedFile"
+                        role = [string]$Role
                         text = $text
                         sha256 = Get-ReviewerVerificationSha256 -Text $text
                     })
             }
             catch {
                 Write-Warning "Could not build verifier source hunk for '$path': $($_.Exception.Message)"
+            }
+        }
+        foreach ($candidate in @($Candidates)) {
+            if ([string]$candidate.anchorKind -cne "changedFile" -or
+                -not [string]$candidate.filePath -or [int]$candidate.line -lt 1) {
+                continue
+            }
+            $candidateId = [string]$candidate.candidateId
+            $readPath = ConvertTo-ReviewerVerificationReadPath -Path ([string]$candidate.filePath)
+            if ($readPath) {
+                Add-ReviewerVerificationSourceHunk -CandidateId $candidateId `
+                    -RawPath ([string]$candidate.filePath) -AnchorLine ([int]$candidate.line) -Role "anchor"
+            }
+            # A convention candidate frequently spans files: the anchor sits in one
+            # changed file while the governing line (for example the subscriptionKey
+            # that mandates a "Global." prefix) is a changed line in a *different*
+            # file that the candidate names as a manifestation target. Collect the
+            # anchor plus every sealed changed-line manifestation target as context
+            # points so the enclosing sealed range of each (below) is delivered.
+            $contextPoints = [System.Collections.Generic.List[object]]::new()
+            $contextPoints.Add([pscustomobject]@{ path = [string]$candidate.filePath; line = [int]$candidate.line })
+            $manifestationText = [string](Get-ReviewerVerificationValue $candidate "manifestations" "")
+            if ($manifestationText -and
+                (Get-Command Resolve-ReviewerConventionSpecialistTargets -ErrorAction SilentlyContinue)) {
+                $resolvedTargets = Resolve-ReviewerConventionSpecialistTargets -Text $manifestationText `
+                    -ChangedFileAnchors @($ChangedFileAnchors) -ChangedLinesOnly
+                if ($resolvedTargets.Ok) {
+                    foreach ($target in @($resolvedTargets.Targets)) {
+                        if ([string]$target.kind -cne "changedLine") { continue }
+                        Add-ReviewerVerificationSourceHunk -CandidateId $candidateId `
+                            -RawPath ([string]$target.path) -AnchorLine ([int]$target.line) -Role "manifestation"
+                        $contextPoints.Add([pscustomobject]@{ path = [string]$target.path; line = [int]$target.line })
+                    }
+                }
+            }
+            $isConvention = (([string](Get-ReviewerVerificationValue $candidate "originKind" "") -ceq "convention") -or
+                [bool](Get-ReviewerVerificationValue $candidate "conventionBound" $false))
+            if ($isConvention -and @($ChangedFileAnchors).Count -gt 0) {
+                foreach ($point in $contextPoints) {
+                    $pointNormalizedPath = ConvertTo-ReviewerVerificationPath -Path ([string]$point.path)
+                    if (-not $pointNormalizedPath) { continue }
+                    foreach ($anchor in @($ChangedFileAnchors)) {
+                        $anchorNormalizedPath = ConvertTo-ReviewerVerificationPath -Path (
+                            [string](Get-ReviewerVerificationValue $anchor "path" ""))
+                        if (-not $anchorNormalizedPath -or $anchorNormalizedPath -cne $pointNormalizedPath) { continue }
+                        foreach ($range in @(Get-ReviewerVerificationValue $anchor "rightHandRanges" @())) {
+                            $rangeStart = [int](Get-ReviewerVerificationValue $range "startLine" 0)
+                            $rangeEnd = [int](Get-ReviewerVerificationValue $range "endLine" 0)
+                            if ($rangeStart -lt 1 -or $rangeEnd -lt $rangeStart) { continue }
+                            if ([int]$point.line -lt $rangeStart -or [int]$point.line -gt $rangeEnd) { continue }
+                            Add-ReviewerVerificationSourceHunk -CandidateId $candidateId `
+                                -RawPath ([string]$point.path) -AnchorLine ([int]$point.line) `
+                                -Role "context" -SpanStart $rangeStart -SpanEnd $rangeEnd
+                        }
+                    }
+                }
             }
         }
         return $hunks.ToArray()
@@ -10413,11 +10649,20 @@ function Invoke-ReviewerCrossVerificationPass {
                 marker = $(if ($_.markerJson) { [string]$_.markerJson | ConvertFrom-Json -Depth 32 } else { $null })
             }
         })
-    $changedFileAnchors = @(Get-ReviewerConventionSpecialistChangedFileIndex `
+    # Get-ReviewerConventionSpecialistChangedFileIndex returns a `,`-protected
+    # array so a zero- or one-file change set still round-trips as an array.
+    # Wrapping that call in @() does NOT flatten it - it nests the whole index
+    # as a single Object[] element, so the resolver below would see one bogus
+    # anchor with no anchorId/path and EVERY cross-file manifestation would fail
+    # to resolve, stripping the verifier of the cross-file evidence it must rule
+    # on (the anchor hunk still emits because it needs no resolver). Assign the
+    # protected array directly so the cf<n> references resolve against the real
+    # per-file anchors, exactly as the specialist index they were bound to.
+    $changedFileAnchors = Get-ReviewerConventionSpecialistChangedFileIndex `
         -ChangeEntries $changeEntries `
         -RightHandRangesByPath $(if ($Bound.ContainsKey('ChangedFileRangesByPath')) {
                 $Bound['ChangedFileRangesByPath']
-            } else { @{} }))
+            } else { @{} })
     $candidatePlan = Get-ReviewerVerificationCandidatePlan -GeneralistPasses $normalizedPasses `
         -ConventionCandidates $specialistCandidates -ConventionModel $EffectiveConventionSpecialistModel `
         -ConventionArtifactSha256 $specialistArtifactSha `
@@ -10485,6 +10730,7 @@ function Invoke-ReviewerCrossVerificationPass {
     $evidenceHunks = @(Get-ReviewerVerificationSourceHunks -AgencyPath $AgencyPath `
         -SourceCommit $sourceCommit -Candidates $verifiableCandidates `
         -ChangedPaths @($Bound.ChangedPaths) `
+        -ChangedFileAnchors $changedFileAnchors `
         -SourceReport $(if ($Bound.ContainsKey('SourceTransportReport')) {
                 $Bound['SourceTransportReport']
             } else { $null }))
@@ -10844,16 +11090,30 @@ function Invoke-ReviewerCrossVerificationPass {
     $replay = Invoke-ReviewerVerificationReplay -InputManifest $inputManifest `
         -VerifierRuns $runRecords.ToArray()
     $replay = Limit-ReviewerVerificationToPhaseDeadline -Replay $replay -DeadlineState $phaseDeadlineState
-    $status = if (@($runRecords | Where-Object { $_.status -cne "complete" }).Count -eq 0) {
-        "complete"
-    }
-    else {
-        "degraded"
-    }
-    # A degraded specialist means convention coverage was incomplete even when
-    # every generalist verifier run completed, so the pass is reported degraded
-    # (its eligible generalist findings are still exposed - see the union above).
-    if ($specialistDegraded) { $status = "degraded" }
+    $allVerifierRunsComplete = (@($runRecords | Where-Object { $_.status -cne "complete" }).Count -eq 0)
+    # Partial convention-evidence degradation - a sealed authoritative source the
+    # offline replay could not answer, withheld candidate-by-candidate while the
+    # specialist still stood behind the packs it did receive - must not be
+    # reported as a complete review, otherwise unavailable convention evidence is
+    # silently treated as success. Fold all four coverage signals (every verifier
+    # run complete, specialist not degraded, convention plan not degraded, and
+    # every configured generalist authoritative source resolved) through one pure
+    # decision. A degraded result still surfaces the eligible blind-generalist
+    # findings in this pass's sealed preview/eligible set, but a degraded run's
+    # candidates are then withheld from posting by the separate, already-tested
+    # delivery gate (typed reason verificationDegraded): "preserved" here means
+    # preview/decision-visible, not auto-postable.
+    $conventionEvidenceDegraded = [bool](Get-ReviewerVerificationValue $conventionPlan "evidenceDegraded" $false)
+    # A configured generalist authoritative source that offline replay withheld
+    # (threaded onto the bound item at cycle-level source resolution) means the
+    # blind generalist never saw convention text it was configured to carry, so
+    # this pass must degrade the same way a degraded convention plan does.
+    $authoritativeSourceDegraded = [bool]$Bound['AuthoritativeSourceDegraded']
+    $status = Get-ReviewerVerificationConventionCoverageStatus `
+        -AllVerifierRunsComplete $allVerifierRunsComplete `
+        -SpecialistDegraded $specialistDegraded `
+        -ConventionEvidenceDegraded $conventionEvidenceDegraded `
+        -AuthoritativeSourceDegraded $authoritativeSourceDegraded
     $reconciliationManifest = $null
     if ($specialistManifest) {
         $reconciliationManifest = Copy-ReviewerVerificationJsonValue -Value $specialistManifest
@@ -13198,7 +13458,9 @@ function Invoke-ReviewerPullRequest {
         -SourceCoverage (Get-ReviewerHashValue -Container $Bound -Key 'SourceCoverage' -Default $null) `
         -ConventionSourceSummary (Get-ReviewerConventionSourceSummary `
                 -ConventionPlanPath ([string](Get-ReviewerHashValue -Container $Bound -Key 'ConventionPlanPath' -Default '')) `
-                -AuthoritativeSourcesText ([string](Get-ReviewerHashValue -Container $Bound -Key 'AuthoritativeSourcesText' -Default '')))
+                -AuthoritativeSourcesText ([string](Get-ReviewerHashValue -Container $Bound -Key 'AuthoritativeSourcesText' -Default '')) `
+                -AuthoritativeSourceConfiguredCount ([int](Get-ReviewerHashValue -Container $Bound -Key 'AuthoritativeSourceConfiguredCount' -Default 0)) `
+                -AuthoritativeSourceResolvedCount ([int](Get-ReviewerHashValue -Container $Bound -Key 'AuthoritativeSourceResolvedCount' -Default -1)))
     $previewPath = [string]$preview.MarkdownPath
 
     # -- Record the delivery plan BEFORE writing anything ----------------------
@@ -14341,7 +14603,8 @@ function Invoke-ReviewerCycle {
                                 TargetCommit = $pinnedChanges.TargetCommit; ChangeSetDigest = $pinnedChanges.Digest
                             } -AuthoritativeSnapshots $packAuthoritativeSnapshots `
                             -RepositorySnapshots $packRepositorySnapshots `
-                            -ScriptSha256 $ScriptSelfSha256 -ConfigSha256 $ConfigSha256
+                            -ScriptSha256 $ScriptSelfSha256 -ConfigSha256 $ConfigSha256 `
+                            -AllowDegradedSources:$script:ReviewerReplayActive
                         $readyPlanPath = Save-ReviewerConventionPlan -Plan $conventionPlan `
                             -PrId $prId -SourceCommit $sourceCommit
                         $factBinding = [pscustomobject][ordered]@{
@@ -14412,9 +14675,15 @@ function Invoke-ReviewerCycle {
                                 $prId, @($conventionPlan.selectedPacks).Count, @($conventionPlan.withheldPacks).Count,
                                 $conventionPlan.totalContextBytes, $conventionPlan.maxTotalBytes) -ForegroundColor Cyan
                         Write-ReviewerCycleMetadata -Fields @{
-                            cycle = $CycleNumber; mode = "convention-plan"; result = "ready"; prId = $prId
+                            cycle = $CycleNumber; mode = "convention-plan"
+                            result = $(if ($conventionPlan.evidenceDegraded) { "degraded" } else { "ready" })
+                            prId = $prId
                             sourceCommit = $sourceCommit; changeSetDigest = $pinnedChanges.Digest
                             selectedPackCount = @($conventionPlan.selectedPacks).Count
+                            withheldPackCount = @($conventionPlan.withheldPacks).Count
+                            evidenceStatus = [string]$conventionPlan.evidenceStatus
+                            evidenceDegraded = [bool]$conventionPlan.evidenceDegraded
+                            degradedReason = [string]$conventionPlan.degradedReason
                             totalContextBytes = $conventionPlan.totalContextBytes; planPath = $readyPlanPath
                         }
                         return @{ PlanPath = $readyPlanPath; FactPlanPath = $factPlanPath }
@@ -14526,12 +14795,45 @@ function Invoke-ReviewerCycle {
         # a separate MCP session. A transport failure can fail this fresh review
         # closed without closing the session that owns delivery and PR state.
         $authoritativeSourcesText = ""
+        $authoritativeSourceDegraded = $false
+        $authoritativeSourceConfiguredCount = 0
+        $authoritativeSourceResolvedCount = 0
         if (@($AuthoritativeSourcePolicy.Sources).Count -gt 0) {
+            $configuredSourceCount = @($AuthoritativeSourcePolicy.Sources).Count
             $sourceSnapshots = Get-ReviewerAuthoritativeSourceSnapshots -AgencyPath $AgencyPath -Policy $AuthoritativeSourcePolicy
+            $resolvedSourceCount = @($sourceSnapshots).Count
+            $authoritativeSourceConfiguredCount = $configuredSourceCount
+            $authoritativeSourceResolvedCount = $resolvedSourceCount
+            # Offline replay withholds a configured authoritative source that was
+            # never sealed (candidate-level convention degrade above). When any
+            # configured source did not resolve, the blind generalist context is
+            # missing convention text it was configured to carry, so the fresh
+            # cross-verification pass must degrade rather than report a complete
+            # review with silently-missing authoritative evidence. Live runs never
+            # reach here partial (an unresolved source throws upstream), so this
+            # only ever trips under replay withholding.
+            $authoritativeSourceDegraded = ($resolvedSourceCount -lt $configuredSourceCount)
             $authoritativeSourcesText = Format-ReviewerAuthoritativeSources `
                 -Snapshots $sourceSnapshots -MaxTotalBytes $AuthoritativeSourcePolicy.MaxTotalBytes
-            Write-Host ("Authoritative sources: {0} file(s), {1} decoded byte(s), commit-pinned with SHA-256 provenance." -f `
-                    @($sourceSnapshots).Count, (($sourceSnapshots | Measure-Object -Property ByteLength -Sum).Sum)) -ForegroundColor Cyan
+            # Offline replay can withhold every configured authoritative source, so
+            # $sourceSnapshots may legitimately be empty here. Measure-Object -Sum on
+            # an empty pipeline emits no object at all, and reading .Sum off nothing
+            # throws under StrictMode - so the byte total is guarded on the resolved
+            # count rather than assumed to exist.
+            $authoritativeSourceBytes = 0
+            if ($resolvedSourceCount -gt 0) {
+                $authoritativeSourceBytes = [int](($sourceSnapshots | Measure-Object -Property ByteLength -Sum).Sum)
+            }
+            Write-Host ("Authoritative sources: {0} of {1} configured file(s), {2} decoded byte(s), commit-pinned with SHA-256 provenance." -f `
+                    $resolvedSourceCount, $configuredSourceCount, $authoritativeSourceBytes) -ForegroundColor Cyan
+            if ($authoritativeSourceDegraded) {
+                Write-Warning ("Authoritative sources degraded: {0} of {1} configured source(s) withheld from the blind generalist context; cross-verification will degrade this pass." -f `
+                        ($configuredSourceCount - $resolvedSourceCount), $configuredSourceCount)
+                Write-ReviewerCycleMetadata -Fields @{
+                    cycle = $CycleNumber; mode = "source-degraded"
+                    configuredSources = $configuredSourceCount; resolvedSources = $resolvedSourceCount
+                }
+            }
             foreach ($entry in $sourceSnapshots) {
                 Write-ReviewerCycleMetadata -Fields @{
                     cycle = $CycleNumber; mode = "source"; repositoryId = $entry.RepositoryId
@@ -14540,7 +14842,12 @@ function Invoke-ReviewerCycle {
                 }
             }
         }
-        foreach ($item in $bound) { $item.AuthoritativeSourcesText = $authoritativeSourcesText }
+        foreach ($item in $bound) {
+            $item.AuthoritativeSourcesText = $authoritativeSourcesText
+            $item.AuthoritativeSourceDegraded = $authoritativeSourceDegraded
+            $item.AuthoritativeSourceConfiguredCount = $authoritativeSourceConfiguredCount
+            $item.AuthoritativeSourceResolvedCount = $authoritativeSourceResolvedCount
+        }
 
         # -- Step 3: review each bound PR -------------------------------------
         $summaries = New-Object System.Collections.Generic.List[string]

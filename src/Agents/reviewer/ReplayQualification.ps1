@@ -261,7 +261,14 @@ function New-ReviewerReplayQualificationPlan {
         [ValidateRange(1, 14400)][int]$SlotTimeoutSeconds = 3600,
         [ValidateRange(0, 14400)][int]$ProgressTimeoutSeconds = 0,
         [string]$ConventionSpecialistModel = "",
-        [string]$ConventionVerifierModel = ""
+        [string]$ConventionVerifierModel = "",
+        # SHA-256 (lowercase hex) of the run set's single-use launch-authorization
+        # token. Empty during a pure -Mode Preflight look; a declaration mints the
+        # token and seals its hash here so the plan digest - and therefore the
+        # sealed declaration - can only be reproduced by a slot that presents the
+        # matching token. A stale, wrong or absent token yields a different digest
+        # and is refused before any model launch.
+        [ValidatePattern('^([0-9a-f]{64})?\z')][string]$LaunchAuthorizationHash = ""
     )
 
     if ($OperatorAlias -notmatch '^[A-Za-z0-9._-]+\z') {
@@ -483,6 +490,7 @@ function New-ReviewerReplayQualificationPlan {
         SlotCount           = $SlotCount
         SlotTimeoutSeconds  = $SlotTimeoutSeconds
         ProgressTimeoutSeconds = $effectiveProgressTimeoutSeconds
+        LaunchAuthorizationHash = $LaunchAuthorizationHash.ToLowerInvariant()
         Slots               = @($slots)
     }
 }
@@ -503,8 +511,16 @@ function Assert-ReviewerReplayQualificationPlan {
         failure that previously surfaced only after the run set had been sealed.
 
         Returns per-slot evidence.
+
+        When -TargetSlot is supplied the no-resume (state-already-exists) check
+        is enforced only for that slot. A sequential set runs slot1, then slot2;
+        by the time slot2 preflights, slot1 legitimately has state, and only the
+        slot being launched must be pristine. With no -TargetSlot (the Declare
+        preflight) every slot must be stateless, which is what a fresh set is.
     #>
-    param([Parameter(Mandatory)]$Plan)
+    param(
+        [Parameter(Mandatory)]$Plan,
+        [string]$TargetSlot = "")
 
     if (@($Plan.Slots).Count -lt 2) {
         throw "A qualification of fewer than two slots is not a reconciliation."
@@ -562,7 +578,8 @@ function Assert-ReviewerReplayQualificationPlan {
                 throw ("$($plannedSlot.Name) would run in '$($resolved.plannedStateDir)' rather than under the " +
                     "planned '$($plannedSlot.StateDir)'.")
             }
-            if ([bool]$resolved.stateDirExists) {
+            if ([bool]$resolved.stateDirExists -and
+                ($TargetSlot -eq "" -or [string]$plannedSlot.Name -ceq $TargetSlot)) {
                 throw ("$($plannedSlot.Name) already has state at '$($resolved.plannedStateDir)'. A slot is " +
                     "attempted once; qualify into a fresh root.")
             }
@@ -729,6 +746,7 @@ function Get-ReviewerQualificationPlanDigest {
         slotCount = [int]$Plan.SlotCount
         slotTimeoutSeconds = [int]$Plan.SlotTimeoutSeconds
         progressTimeoutSeconds = [int]$Plan.ProgressTimeoutSeconds
+        launchAuthorizationHash = [string]$Plan.LaunchAuthorizationHash
         slots = @(@($Plan.Slots) | ForEach-Object {
                 [ordered]@{
                     name = [string]$_.Name
@@ -740,4 +758,387 @@ function Get-ReviewerQualificationPlanDigest {
     $json = ConvertTo-Json -InputObject $document -Depth 8 -Compress
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json)
     return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+}
+
+function Get-ReviewerQualificationLaunchTokenHash {
+    <#
+        The launch-authorization token is a run-set-scoped secret minted at
+        declaration. Its SHA-256 is what the plan digest seals; a slot that
+        cannot present the token cannot reproduce the digest and is refused
+        before it consumes its attempt or starts a child.
+    #>
+    param([Parameter(Mandatory)][string]$Token)
+    $trimmed = $Token.Trim()
+    if ($trimmed -notmatch '^[0-9a-f]{64}\z') {
+        throw "Launch-authorization token is malformed; expected 64 lowercase hex characters."
+    }
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($trimmed)
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+}
+
+function Resolve-ReviewerQualificationSlotTerminalPath {
+    <#
+        Resolves one slot's immutable terminal-evidence file by an ORDINAL,
+        case-exact match on the physical directory entry name. A constructed-path
+        open (Join-Path + Get-Content) is case-insensitive on Windows, so a
+        physical 'Slot1-terminal.json' would be opened in place of the expected
+        'slot1-terminal.json' and silently accepted; enumerating the directory and
+        comparing the real entry name ordinally refuses that alias. Reconciliation
+        and status share this resolver so neither can resolve a slot the other
+        would not. A case-variant duplicate - possible only on a case-sensitive
+        volume - is ambiguous slot evidence and is refused fail-closed. Returns
+        $null when no exact entry exists (the slot has no terminal to a reader).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$RunDirectory,
+        [Parameter(Mandatory)][string]$SlotName
+    )
+    if (-not (Test-Path -LiteralPath $RunDirectory -PathType Container)) { return $null }
+    $expectedName = "$SlotName-terminal.json"
+    $all = @(Get-ChildItem -LiteralPath $RunDirectory -File -Filter "*-terminal.json" -ErrorAction SilentlyContinue)
+    # Candidates are matched case-INSENSITIVELY first: any entry that differs
+    # from the expected name only by case is an ALIAS of this slot's evidence.
+    # More than one such alias (possible only on a case-sensitive volume) is
+    # ambiguous slot evidence and is refused rather than one variant chosen.
+    $aliases = @($all |
+            Where-Object { [string]::Equals($_.Name, $expectedName, [StringComparison]::OrdinalIgnoreCase) })
+    if ($aliases.Count -gt 1) {
+        throw ("Multiple case-variant terminal files resolve to '$expectedName' under '$RunDirectory'; " +
+            "ambiguous slot evidence is refused rather than one variant chosen.")
+    }
+    if ($aliases.Count -eq 0) { return $null }
+    # Exactly one candidate: it must match the requested name ORDINALLY. A single
+    # differently-cased alias (e.g. a physical 'Slot1-terminal.json' for the
+    # requested 'slot1') is NOT opened in the expected slot's place - to a reader
+    # the requested slot then has no case-exact terminal.
+    if (-not [string]::Equals($aliases[0].Name, $expectedName, [StringComparison]::Ordinal)) {
+        return $null
+    }
+    return $aliases[0].FullName
+}
+
+function Read-ReviewerQualificationSlotTerminal {
+    <#
+        Reads one slot's immutable terminal evidence. A terminal record that is
+        absent, writable, or unparsable is not evidence a reader may act on.
+    #>
+    param([Parameter(Mandatory)][string]$TerminalPath)
+    if (-not (Test-Path -LiteralPath $TerminalPath -PathType Leaf)) {
+        return $null
+    }
+    if (-not (Get-Item -LiteralPath $TerminalPath).IsReadOnly) {
+        throw "Slot terminal evidence '$TerminalPath' is writable; immutable terminal evidence is required."
+    }
+    return (Get-Content -LiteralPath $TerminalPath -Raw | ConvertFrom-Json)
+}
+
+function Test-ReviewerQualificationRecordedProcessAlive {
+    <#
+        Liveness for exactly one recorded child PID, disambiguated by start time
+        so a reused PID cannot be mistaken for the qualification's own child.
+        Never scans the process table by command text - a status or gate that
+        matched command text would match its own inspecting shell.
+
+        Conservative by construction: a PID that is present but whose start time
+        cannot be read is reported ALIVE, not dead. This gate exists to refuse a
+        reconciliation while a model process might still live; an unreadable
+        identity is an unknown, and an unknown must not be resolved in the
+        direction that lets reconciliation proceed.
+    #>
+    param(
+        [Parameter(Mandatory)][int]$ProcessId,
+        [string]$StartedAtUtc = "",
+        [string]$EndedAtUtc = ""
+    )
+    if ($ProcessId -le 0) { return $false }
+    $candidate = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if (-not $candidate) { return $false }
+    try { $candidateStartUtc = $candidate.StartTime.ToUniversalTime() } catch { return $true }
+    $lowerBound = [DateTime]::MinValue
+    $upperBound = [DateTime]::MaxValue
+    if ($StartedAtUtc) { $lowerBound = ([DateTimeOffset]::Parse($StartedAtUtc)).UtcDateTime.AddSeconds(-2) }
+    if ($EndedAtUtc) { $upperBound = ([DateTimeOffset]::Parse($EndedAtUtc)).UtcDateTime.AddSeconds(2) }
+    return ($candidateStartUtc -ge $lowerBound -and $candidateStartUtc -le $upperBound)
+}
+
+function Assert-ReviewerQualificationTerminalBoundToDeclaration {
+    <#
+        A terminal record is only evidence of THIS run set's slot when it names
+        this set and the plan this set declared. A fabricated or stale terminal
+        from another set or plan - even a correctly immutable one - is refused.
+        The terminal must also name the very slot it was read as, so one slot's
+        proof cannot be copied onto another slot's path. Set/plan binding no-ops
+        when no expected identity is supplied (there is nothing to bind against
+        yet), so a caller that has not verified a declaration is explicit about
+        it rather than silently trusting the file; the slot-name check always
+        runs, because a terminal always names its own slot.
+    #>
+    param(
+        [Parameter(Mandatory)]$Terminal,
+        [Parameter(Mandatory)][string]$SlotName,
+        [string]$ExpectedSetId = "",
+        [string]$ExpectedPlanDigest = ""
+    )
+    # A terminal records the slot it belongs to. One genuine slot's terminal
+    # copied onto another slot's path would still carry its original slot name,
+    # so a terminal whose own slot field disagrees with the path it was read
+    # from is a cross-slot forgery and is refused before any identity binding.
+    if ([string]$Terminal.slot -cne $SlotName) {
+        throw ("Terminal evidence read as '$SlotName' records slot '$([string]$Terminal.slot)'. A terminal " +
+            "copied from another slot is never accepted; each slot's proof names itself.")
+    }
+    if ($ExpectedSetId -and [string]$Terminal.setId -cne $ExpectedSetId) {
+        throw ("Terminal evidence for '$SlotName' names run set '$([string]$Terminal.setId)', not the verified " +
+            "'$ExpectedSetId'. A terminal from another set is never accepted as this set's proof.")
+    }
+    if ($ExpectedPlanDigest -and [string]$Terminal.planDigest -cne $ExpectedPlanDigest) {
+        throw ("Terminal evidence for '$SlotName' was recorded for plan $([string]$Terminal.planDigest), not the " +
+            "verified $ExpectedPlanDigest. A terminal from another plan is never accepted as this set's proof.")
+    }
+}
+
+function Assert-ReviewerQualificationSlotPredecessorComplete {
+    <#
+        A slot never runs ahead of its predecessor. Slot N (N > 1) requires slot
+        N-1 to have recorded an immutable, successful terminal result, bound to
+        this verified set and plan, with its recorded child no longer alive: the
+        run set advances one authorized, proven slot at a time and never launches
+        a replacement or a later slot after a failure, a timeout, or while the
+        predecessor's process might still live.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SlotName,
+        [Parameter(Mandatory)][string]$RunDirectory,
+        [string]$ExpectedSetId = "",
+        [string]$ExpectedPlanDigest = ""
+    )
+    if ($SlotName -notmatch '^slot([0-9]+)\z') {
+        throw "Slot name '$SlotName' is not of the form slotN."
+    }
+    $ordinal = [int]$Matches[1]
+    if ($ordinal -le 1) { return }
+    $predecessor = "slot$($ordinal - 1)"
+    $predecessorTerminalPath = Resolve-ReviewerQualificationSlotTerminalPath -RunDirectory $RunDirectory -SlotName $predecessor
+    if (-not $predecessorTerminalPath) {
+        throw ("Slot '$SlotName' cannot start before '$predecessor' records an immutable successful terminal " +
+            "result: no case-exact '$predecessor-terminal.json' exists under '$RunDirectory'. One authorized slot proceeds at a time.")
+    }
+    $predecessorTerminal = Read-ReviewerQualificationSlotTerminal -TerminalPath $predecessorTerminalPath
+    Assert-ReviewerQualificationTerminalBoundToDeclaration -Terminal $predecessorTerminal -SlotName $predecessor `
+        -ExpectedSetId $ExpectedSetId -ExpectedPlanDigest $ExpectedPlanDigest
+    if ([string]$predecessorTerminal.status -cne "complete") {
+        throw ("Slot '$SlotName' requires '$predecessor' to have completed successfully; its immutable terminal " +
+            "status is '$([string]$predecessorTerminal.status)'. A later slot never follows a failed or timed-out one.")
+    }
+    if (Test-ReviewerQualificationRecordedProcessAlive -ProcessId ([int]$predecessorTerminal.childProcessId) `
+            -StartedAtUtc ([string]$predecessorTerminal.startedAtUtc) -EndedAtUtc ([string]$predecessorTerminal.endedAtUtc)) {
+        throw ("Slot '$SlotName' cannot start while '$predecessor' recorded child " +
+            "$([int]$predecessorTerminal.childProcessId) is still running. One slot's process ends before the next begins.")
+    }
+}
+
+function Assert-ReviewerQualificationReconciliationReady {
+    <#
+        Reconciliation is the only step that reads across slots, so it is the
+        step most tempted to proceed on a partial set. It requires every slot to
+        have a complete, immutable terminal result - bound to this verified set
+        and plan - and no recorded child still alive: both terminal-success slots
+        and no live model process.
+    #>
+    param(
+        [Parameter(Mandatory)]$Plan,
+        [string]$ExpectedSetId = "",
+        [string]$ExpectedPlanDigest = ""
+    )
+    $runDirectory = [string]$Plan.RunDirectory
+    $reconciled = [System.Collections.Generic.List[object]]::new()
+    foreach ($slot in @($Plan.Slots)) {
+        $terminalPath = Resolve-ReviewerQualificationSlotTerminalPath -RunDirectory $runDirectory -SlotName ([string]$slot.Name)
+        $terminal = if ($terminalPath) { Read-ReviewerQualificationSlotTerminal -TerminalPath $terminalPath } else { $null }
+        if (-not $terminal) {
+            throw ("Reconciliation requires every slot to have a terminal result; '$($slot.Name)' has no case-exact " +
+                "'$($slot.Name)-terminal.json' under '$runDirectory'. Run and complete all $($Plan.SlotCount) slots first.")
+        }
+        Assert-ReviewerQualificationTerminalBoundToDeclaration -Terminal $terminal -SlotName ([string]$slot.Name) `
+            -ExpectedSetId $ExpectedSetId -ExpectedPlanDigest $ExpectedPlanDigest
+        if ([string]$terminal.status -cne "complete") {
+            throw ("Reconciliation requires every slot to have completed successfully; '$($slot.Name)' terminated " +
+                "'$([string]$terminal.status)'. A partial or failed set is never reconciled.")
+        }
+        if (Test-ReviewerQualificationRecordedProcessAlive -ProcessId ([int]$terminal.childProcessId) `
+                -StartedAtUtc ([string]$terminal.startedAtUtc) -EndedAtUtc ([string]$terminal.endedAtUtc)) {
+            throw ("Reconciliation refuses a live model process: '$($slot.Name)' recorded child " +
+                "$([int]$terminal.childProcessId) is still running. No reconciliation while a slot's process lives.")
+        }
+        [void]$reconciled.Add([pscustomobject][ordered]@{
+                slot           = [string]$slot.Name
+                status         = [string]$terminal.status
+                exitCode       = [int]$terminal.exitCode
+                childProcessId = [int]$terminal.childProcessId
+            })
+    }
+    return @($reconciled)
+}
+
+function Get-VerifiedRunSetDeclaration {
+    <#
+        Reads the single sealed run-set declaration under a qualification root and
+        verifies it under the run-set signing key BEFORE anything in it is
+        believed. An envelope parsed as text is a file anybody could have written;
+        a signature check is the only thing that makes it a declaration - and it
+        is also what detects a truncated or corrupted published declaration, since
+        a partial or altered envelope no longer verifies. This is the SIGNATURE
+        boundary only: it returns the verified declaration object and its path and
+        throws solely when there is not exactly one declaration or the signature
+        does not verify. Whether that authentic declaration MATCHES this plan
+        (snapshot, run count, full plan digest) is a separate question answered by
+        Assert-ReviewerQualificationDeclarationMatchesPlan, so a caller can tell a
+        corrupt/tampered declaration (signature failure) apart from a benign
+        plan-input mismatch (wrong count, snapshot, models, repo, timeouts). The
+        coordinator's Declare/RunSlot/Reconcile paths and the status reader all
+        call this one copy, so none can accept a declaration another would reject.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$RunSetDirectory,
+        [Parameter(Mandatory)][string]$CompareTool,
+        [Parameter(Mandatory)][string]$RunSetKeyPath
+    )
+    $declarationPaths = @()
+    if (Test-Path -LiteralPath $RunSetDirectory -PathType Container) {
+        $declarationPaths = @(Get-ChildItem -LiteralPath $RunSetDirectory -Filter "runset-*.json" -File `
+                -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike "*.sig" } |
+                ForEach-Object { $_.FullName })
+    }
+    if ($declarationPaths.Count -ne 1) {
+        throw ("Expected exactly one sealed run-set declaration under '$RunSetDirectory'; " +
+            "found $($declarationPaths.Count). Declare the set first (-Mode Declare).")
+    }
+    $verifiedOutput = & $CompareTool -VerifyRunSet -RunSetPath $declarationPaths[0] -KeyPath $RunSetKeyPath
+    $verifiedJson = @(@($verifiedOutput) |
+            Where-Object { $_ -is [string] -and $_.TrimStart().StartsWith("{") } |
+            Select-Object -Last 1)
+    if (@($verifiedJson).Count -ne 1) {
+        throw ("Verification of '$($declarationPaths[0])' returned no manifest; the declaration did not verify " +
+            "under '$RunSetKeyPath'. A published declaration that no longer verifies is corrupt or tampered and is never launchable.")
+    }
+    $declaration = [string]$verifiedJson[0] | ConvertFrom-Json
+    return [pscustomobject]@{ Declaration = $declaration; Path = $declarationPaths[0] }
+}
+
+function Assert-ReviewerQualificationDeclarationMatchesPlan {
+    <#
+        Given a signature-verified declaration and a plan, refuses the declaration
+        unless it was sealed FOR this plan. Same snapshot, different models - or a
+        different reviewed repository, a different agent build, different timeouts,
+        a different operator - is a different qualification wearing this one's
+        seal, and snapshot-and-count alone cannot see it. When an ExpectedPlanDigest
+        is supplied (the caller reproduces it from the token that sealed the set:
+        a slot presents its token, reconciliation reads the published one), the
+        declaration's own sealed digest must equal it exactly, binding EVERY plan
+        input. This is the plan-identity boundary, kept apart from the signature
+        boundary so a plan-input mismatch is never mislabeled a signature failure.
+    #>
+    param(
+        [Parameter(Mandatory)]$Declaration,
+        [Parameter(Mandatory)]$Plan,
+        [string]$ExpectedPlanDigest = ""
+    )
+    if ([string]$Declaration.snapshotName -cne [string]$Plan.Snapshot.Name -or
+        [string]$Declaration.snapshotManifestDigest -cne [string]$Plan.Snapshot.ManifestDigest) {
+        throw ("The sealed declaration names snapshot '$($Declaration.snapshotName)' at digest " +
+            "$($Declaration.snapshotManifestDigest); this plan replays '$($Plan.Snapshot.Name)' at " +
+            "$($Plan.Snapshot.ManifestDigest). A slot never runs against a declaration it does not match.")
+    }
+    if ([int]$Declaration.plannedRunCount -ne [int]$Plan.SlotCount) {
+        throw ("The sealed declaration plans $([int]$Declaration.plannedRunCount) run(s) and this plan has " +
+            "$($Plan.SlotCount) slot(s).")
+    }
+    $declaredPlanDigest = ""
+    if ($Declaration.PSObject.Properties["planDigest"]) { $declaredPlanDigest = [string]$Declaration.planDigest }
+    if (-not $declaredPlanDigest) {
+        throw ("The sealed declaration $($Declaration.setId) carries no plan digest, so it cannot say which commands " +
+            "it authorized. Declare a new set with this build of the tool.")
+    }
+    if ($ExpectedPlanDigest -and $declaredPlanDigest -cne $ExpectedPlanDigest) {
+        throw ("The sealed declaration $($Declaration.setId) was made for plan $declaredPlanDigest and this plan " +
+            "hashes to $ExpectedPlanDigest. Every slot of a set runs the plan that was declared - the reviewed " +
+            "repository, the models, the timeouts and every other plan input, not the snapshot and slot count alone.")
+    }
+}
+
+function Assert-ReviewerQualificationPublishedInventory {
+    <#
+        A published run set is complete or it is nothing. Directory.Move makes the
+        namespace flip atomic against process death and concurrent publishers, but
+        it is NOT a power-loss fsync barrier: a host or filesystem crash mid-write
+        can leave a runset directory whose files are present in the namespace yet
+        truncated or missing. The signature check catches a corrupt declaration;
+        this check catches an incomplete INVENTORY - the launch-authorization
+        token a complete publish always carries. A runset directory missing its
+        token, or carrying a malformed one, is classified as a corrupt published
+        set: not reconcilable, not launchable, and never silently treated as a
+        valid set. Recoverability after arbitrary host/filesystem loss is NOT
+        claimed; such a set is reported corrupt and a new root is declared.
+        Returns the validated 64-hex token text so the caller can reproduce the
+        plan digest the set was sealed under without re-reading the file.
+    #>
+    param([Parameter(Mandatory)][string]$RunSetDirectory)
+    $tokenPath = Join-Path $RunSetDirectory "launch-authorization.token"
+    if (-not (Test-Path -LiteralPath $tokenPath -PathType Leaf)) {
+        throw ("The published run set under '$RunSetDirectory' is missing its launch-authorization token; " +
+            "the publish is incomplete or corrupt. A partial published set is never reconcilable or launchable.")
+    }
+    $tokenText = ([IO.File]::ReadAllText($tokenPath)).Trim()
+    if ($tokenText -notmatch '^[0-9a-f]{64}\z') {
+        throw ("The published launch-authorization token under '$RunSetDirectory' is malformed (expected 64 " +
+            "lowercase hex characters); the published set is corrupt and never reconcilable or launchable.")
+    }
+    return $tokenText
+}
+
+function Assert-ReviewerQualificationSetReconcilable {
+    <#
+        The single shared pre-model readiness gate for a declared run set. The
+        coordinator's Reconcile mode calls it and acts on the result; the status
+        reader calls it inside a try/catch and reports the outcome. Because both
+        run the SAME sequence over the SAME reconstructed plan, status can never
+        report a set reconciliation-ready that Reconcile would reject, nor the
+        reverse, for the same authenticated inputs. It verifies the sealed
+        declaration under the key (the signature boundary, which also detects a
+        corrupt/truncated one), confirms the published inventory is complete and
+        reads the launch token it carries, reproduces THIS plan's full digest with
+        that token and requires it to equal the declaration's sealed digest - so a
+        divergence in any plan input (repository, models, timeouts, operator, ...)
+        and not just snapshot and slot count is refused - and binds every slot's
+        immutable terminal to the verified set and plan with no live child.
+    #>
+    param(
+        [Parameter(Mandatory)]$Plan,
+        [Parameter(Mandatory)][string]$CompareTool,
+        [Parameter(Mandatory)][string]$RunSetKeyPath
+    )
+    # Signature boundary: the declaration is authentic (or the set is corrupt).
+    $verified = Get-VerifiedRunSetDeclaration -RunSetDirectory ([string]$Plan.RunSetDirectory) `
+        -CompareTool $CompareTool -RunSetKeyPath $RunSetKeyPath
+    # Inventory boundary: a complete publish carries its launch token. Reading it
+    # here lets reconciliation - which holds no token of its own - reproduce the
+    # exact plan digest the set was sealed under.
+    $publishedToken = Assert-ReviewerQualificationPublishedInventory -RunSetDirectory ([string]$Plan.RunSetDirectory)
+    $publishedTokenHash = Get-ReviewerQualificationLaunchTokenHash -Token $publishedToken
+    $originalHash = [string]$Plan.LaunchAuthorizationHash
+    $currentDigest = ""
+    try {
+        $Plan.LaunchAuthorizationHash = $publishedTokenHash
+        $currentDigest = Get-ReviewerQualificationPlanDigest -Plan $Plan
+    }
+    finally {
+        $Plan.LaunchAuthorizationHash = $originalHash
+    }
+    # Plan-identity boundary: bind the FULL plan, not snapshot and count alone.
+    Assert-ReviewerQualificationDeclarationMatchesPlan -Declaration $verified.Declaration -Plan $Plan `
+        -ExpectedPlanDigest $currentDigest
+    $slots = Assert-ReviewerQualificationReconciliationReady -Plan $Plan `
+        -ExpectedSetId ([string]$verified.Declaration.setId) `
+        -ExpectedPlanDigest ([string]$verified.Declaration.planDigest)
+    return [pscustomobject]@{ Declaration = $verified.Declaration; Slots = @($slots) }
 }

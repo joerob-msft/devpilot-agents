@@ -2563,6 +2563,32 @@ function Get-AgentReplayResponse {
     return $envelope.result
 }
 
+function Test-AgentReplaySnapshotHasResponse {
+    <#
+        A non-throwing availability probe over the same request key
+        Get-AgentReplayResponse serves from. It exists so an offline planner can
+        tell a source that was never captured (a reason to degrade a candidate,
+        not to fall through to a live read) apart from a source that is present.
+        It never returns payload bytes and never contacts anything: like the
+        serve path it refuses a write tool outright, and otherwise answers only
+        whether this exact tool-and-arguments read was recorded. Probing and
+        then skipping keeps a replay from even issuing a request it knows the
+        snapshot cannot answer.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Snapshot,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)]$Arguments
+    )
+    if ($Snapshot["Seal"] -isnot [object] -or -not [object]::ReferenceEquals($Snapshot["Seal"], $script:AgentReplaySnapshotSeal)) {
+        throw "Replay availability probe requires a snapshot produced by New-AgentReplaySnapshot."
+    }
+    $permitted = Test-AgentReplayToolPermitted -Name $Name -Arguments $Arguments
+    if (-not $permitted.Permitted) { return $false }
+    $requestKey = Get-AgentReplayRequestKey -Name $Name -Arguments $Arguments
+    return [bool]$Snapshot.Served.ContainsKey($requestKey.Key)
+}
+
 # ---------------------------------------------------------------------------
 # Generic Agency MCP JSON-RPC stdio client (portable; used only in live mode)
 # ---------------------------------------------------------------------------
@@ -4509,6 +4535,7 @@ Export-ModuleMember -Function @(
     "New-AgentReplaySnapshot",
     "Assert-AgentReplaySnapshotPromotable",
     "Get-AgentReplayResponse",
+    "Test-AgentReplaySnapshotHasResponse",
     "Get-AgentSupportedProvider",
     "Test-AgentProviderSupported",
     "New-AgentProviderContext",

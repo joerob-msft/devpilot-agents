@@ -165,6 +165,28 @@ try {
     Assert-ReplayThrows { New-AgentReplaySnapshot -ReplayRoot $rebound -SnapshotName "synthetic-pr" } `
         "A binding edited after capture must break the manifest digest." -Match "manifest and its payloads disagree"
 
+    # A malformed sealed reviewed-target commit is startup-fatal: the loader
+    # validates binding.targetCommit against the lowercase 40-hex shape while
+    # reading the manifest, long before any planner could consume it. This is
+    # why offline convention planning can trust the sealed target verbatim - a
+    # malformed one never loads, so it can never reach candidate discovery.
+    $badTarget = Copy-Fixture -Name "bad-target"
+    $badTargetManifestPath = Join-Path $badTarget "synthetic-pr\manifest.json"
+    $badTargetManifest = [IO.File]::ReadAllText($badTargetManifestPath, $utf8) | ConvertFrom-Json
+    $badTargetManifest.binding.targetCommit = "g" * 40
+    [IO.File]::WriteAllBytes($badTargetManifestPath, $utf8.GetBytes(($badTargetManifest | ConvertTo-Json -Depth 20)))
+    Assert-ReplayThrows { New-AgentReplaySnapshot -ReplayRoot $badTarget -SnapshotName "synthetic-pr" } `
+        "A non-hex sealed target commit must be rejected at load, not passed to a planner." `
+        -Match "targetCommit' does not match its required shape"
+    $upperTarget = Copy-Fixture -Name "upper-target"
+    $upperTargetManifestPath = Join-Path $upperTarget "synthetic-pr\manifest.json"
+    $upperTargetManifest = [IO.File]::ReadAllText($upperTargetManifestPath, $utf8) | ConvertFrom-Json
+    $upperTargetManifest.binding.targetCommit = "A" * 40
+    [IO.File]::WriteAllBytes($upperTargetManifestPath, $utf8.GetBytes(($upperTargetManifest | ConvertTo-Json -Depth 20)))
+    Assert-ReplayThrows { New-AgentReplaySnapshot -ReplayRoot $upperTarget -SnapshotName "synthetic-pr" } `
+        "An uppercase (non-lowercase-hex) sealed target commit must be rejected at load." `
+        -Match "targetCommit' does not match its required shape"
+
     $missing = Copy-Fixture -Name "missing"
     Remove-Item (Join-Path $missing "synthetic-pr\payloads\branch-main.json") -Force
     Assert-ReplayThrows { New-AgentReplaySnapshot -ReplayRoot $missing -SnapshotName "synthetic-pr" } `
@@ -1671,8 +1693,8 @@ try {
     Assert-Replay ($readerRange.Success) "The fact-source reader's byte range must be findable."
     Assert-Replay ([int]$verifierBound.Groups[1].Value -le [int]$readerRange.Groups[1].Value) `
         "The verifier's read bound ($($verifierBound.Groups[1].Value)) must be within what the reader accepts ($($readerRange.Groups[1].Value)), or every hunk fails instead of one."
-    Assert-Replay ($hunkFunction.Value -match '\$line - 3' -and $hunkFunction.Value -match '\$line \+ 3') `
-        "Raising the read bound must not widen what a model is shown: the hunk stays seven lines."
+    Assert-Replay ($hunkFunction.Value -match '\$AnchorLine - 3' -and $hunkFunction.Value -match '\$AnchorLine \+ 3') `
+        "Raising the read bound must not widen what a model is shown: the anchor hunk stays seven lines."
 
     # Enumeration runs on the mandatory path of every review, before any model.
     # It once rebuilt a delivered-line set on every line of every file, three
@@ -1875,6 +1897,486 @@ try {
     Assert-Replay (@($unguarded).Count -eq 0) `
         ("Every Open-AgentMcpSession call must pass -ReplaySnapshot, or a replay reaches the network: " +
         (@(@($unguarded) | ForEach-Object { "line $($_.Extent.StartLineNumber)" }) -join ", "))
+
+    # The authoritative-source resolver degrades an unrecorded convention read at
+    # the SOURCE level in replay for BOTH of its callers - the convention pack
+    # path (-ConventionPackMode) and the generalist-context path
+    # (repoConventions.authoritativeSources, no switch). Coupling the degrade to
+    # -ConventionPackMode (as an earlier build did) let the non-pack path issue a
+    # live-shaped repo_repository/repo_branch/repo_file read the sealed snapshot
+    # cannot answer; that threw OUTSIDE the per-PR isolation and aborted the whole
+    # cycle, taking blind functional discovery down with a convention-evidence
+    # gap. Pin the decoupling so the regression cannot return.
+    $authSourceFn = $reviewerAst.FindAll({
+            param($c)
+            $c -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $c.Name -ceq "Get-ReviewerAuthoritativeSourceSnapshots"
+        }, $true) | Select-Object -First 1
+    Assert-Replay ($null -ne $authSourceFn) `
+        "The reviewer must define Get-ReviewerAuthoritativeSourceSnapshots."
+    $authSourceText = [string]$authSourceFn.Extent.Text
+    Assert-Replay ($authSourceText -cnotmatch '\$ConventionPackMode\s+-and\s+\$script:ReviewerReplayActive') `
+        "The replay convention-source degrade must NOT be gated on -ConventionPackMode; the generalist-context path must degrade candidate-level, never abort the cycle."
+    # AST-relationship check (not a text scan): every replay convention-read probe
+    # call must be GOVERNED by an $script:ReviewerReplayActive if-guard - meaning
+    # the probe sits inside that clause's BODY - and by NO $ConventionPackMode
+    # guard, under any reordering, nesting, or reformatting. A probe that merely
+    # sits inside another if's CONDITION is not governed by that if, and a probe in
+    # an else branch is not replay-guarded at all; both are rejected.
+    $probeCalls = @($authSourceFn.FindAll({
+                param($c)
+                $c -is [Management.Automation.Language.CommandAst] -and
+                [string]$c.GetCommandName() -ceq "Test-ReviewerReplayConventionReadRecorded"
+            }, $true))
+    # EXACTLY three probe calls exist in the source text - one each for
+    # repo_repository, repo_branch, repo_file. A looser "-ge 3" would let an
+    # unguarded fourth probe (or a probe with a dynamic -Name) slip past the
+    # per-probe governance/name checks below, so pin the count.
+    Assert-Replay (@($probeCalls).Count -eq 3) `
+        ("Get-ReviewerAuthoritativeSourceSnapshots must probe exactly repo_repository, repo_branch, and repo_file " +
+        "for a recorded replay response before reading (found $(@($probeCalls).Count) probe call(s)).")
+    # An if-condition governs a probe when its bare, un-negated expression is
+    # exactly `$script:ReviewerReplayActive`. Comparing condition TEXT would let
+    # an inverted guard - `if (-not $script:ReviewerReplayActive)` - satisfy the
+    # regex while flipping the meaning, so unwrap the condition AST and require a
+    # sole VariableExpressionAst named script:ReviewerReplayActive.
+    $isBareReplayActive = {
+        param($ConditionAst)
+        $expr = $ConditionAst
+        if ($expr -is [Management.Automation.Language.PipelineAst]) {
+            if ($expr.PipelineElements.Count -ne 1) { return $false }
+            $element = $expr.PipelineElements[0]
+            if ($element -isnot [Management.Automation.Language.CommandExpressionAst]) { return $false }
+            $expr = $element.Expression
+        }
+        if ($expr -isnot [Management.Automation.Language.VariableExpressionAst]) { return $false }
+        return ([string]$expr.VariablePath.UserPath -ceq 'script:ReviewerReplayActive')
+    }
+    $probeNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($probe in $probeCalls) {
+        # Collect only the clause CONDITIONS (as AST, not text) that actually
+        # GOVERN this probe: an ancestor if-clause whose body (or else block)
+        # contains the probe extent.
+        $governingConds = New-Object System.Collections.Generic.List[object]
+        $elseGoverned = $false
+        $node = $probe.Parent
+        while ($null -ne $node -and -not ($node -is [Management.Automation.Language.FunctionDefinitionAst])) {
+            if ($node -is [Management.Automation.Language.IfStatementAst]) {
+                $matchedClause = $false
+                foreach ($clause in $node.Clauses) {
+                    $body = $clause.Item2
+                    if ($null -ne $body -and
+                        $body.Extent.StartOffset -le $probe.Extent.StartOffset -and
+                        $body.Extent.EndOffset -ge $probe.Extent.EndOffset) {
+                        [void]$governingConds.Add($clause.Item1)
+                        $matchedClause = $true
+                        break
+                    }
+                }
+                if (-not $matchedClause -and $null -ne $node.ElseClause -and
+                    $node.ElseClause.Extent.StartOffset -le $probe.Extent.StartOffset -and
+                    $node.ElseClause.Extent.EndOffset -ge $probe.Extent.EndOffset) {
+                    $elseGoverned = $true
+                }
+            }
+            $node = $node.Parent
+        }
+        $guardedByReplay = (@($governingConds | Where-Object { & $isBareReplayActive $_ }).Count -gt 0)
+        $coupledToPack = (@($governingConds | Where-Object { [string]$_.Extent.Text -match '\$ConventionPackMode' }).Count -gt 0)
+        Assert-Replay ($guardedByReplay -and -not $elseGoverned) `
+            ("A replay convention-read probe at line $($probe.Extent.StartLineNumber) must be governed by a bare, " +
+            "un-negated `$script:ReviewerReplayActive if-guard body (never an else branch or a negated guard).")
+        Assert-Replay (-not $coupledToPack) `
+            ("A replay convention-read probe at line $($probe.Extent.StartLineNumber) must NOT be governed by any " +
+            "`$ConventionPackMode if-guard; that couples the degrade to the pack path and re-aborts the non-pack cycle.")
+        # Every probe must carry exactly one literal -Name; a dynamic or missing
+        # name would otherwise be silently ignored by the name-set assertion.
+        $literalNames = New-Object System.Collections.Generic.List[string]
+        for ($i = 0; $i -lt $probe.CommandElements.Count - 1; $i++) {
+            $element = $probe.CommandElements[$i]
+            if ($element -is [Management.Automation.Language.CommandParameterAst] -and
+                [string]$element.ParameterName -ceq "Name") {
+                $nameValue = $probe.CommandElements[$i + 1]
+                if ($nameValue -is [Management.Automation.Language.StringConstantExpressionAst]) {
+                    [void]$literalNames.Add([string]$nameValue.Value)
+                }
+            }
+        }
+        Assert-Replay (@($literalNames).Count -eq 1) `
+            ("A replay convention-read probe at line $($probe.Extent.StartLineNumber) must pass exactly one literal " +
+            "-Name (found $(@($literalNames).Count)).")
+        foreach ($literalName in $literalNames) { [void]$probeNames.Add($literalName) }
+    }
+    Assert-Replay ($probeNames.Count -eq 3 -and $probeNames.Contains("repo_repository") -and
+        $probeNames.Contains("repo_branch") -and $probeNames.Contains("repo_file")) `
+        ("The replay convention-read probes must target exactly repo_repository, repo_branch, and repo_file " +
+        "(found: $(@($probeNames | Sort-Object) -join ', ')).")
+    # Match the candidate-level degrade warning as AST string literals, not raw
+    # source text, so a comment can never satisfy it (comments are not AST nodes).
+    $degradeLiterals = @($authSourceFn.FindAll({
+                param($c)
+                ($c -is [Management.Automation.Language.StringConstantExpressionAst] -or
+                    $c -is [Management.Automation.Language.ExpandableStringExpressionAst]) -and
+                ([string]$c.Extent.Text) -clike '*candidate-level convention degrade*'
+            }, $true))
+    Assert-Replay (@($degradeLiterals).Count -ge 2) `
+        ("Both authoritative-source replay probes must withhold an unrecorded source with a candidate-level " +
+        "convention-degrade warning literal (found $(@($degradeLiterals).Count)).")
+
+    # Wiring regression: the honest "N of M resolved; K withheld" convention-source
+    # summary depends on Invoke-ReviewerCycle threading the configured/resolved
+    # authoritative-source counts onto each bound item, and Invoke-ReviewerPull
+    # Request forwarding them into Get-ReviewerConventionSourceSummary. Testing the
+    # summary helper alone leaves this wiring unguarded - deleting the assignments
+    # would restore the misreport while the helper tests still pass. Pin every hop.
+    $cycleFn = $reviewerAst.FindAll({
+            param($c)
+            $c -is [Management.Automation.Language.FunctionDefinitionAst] -and $c.Name -ceq "Invoke-ReviewerCycle"
+        }, $true) | Select-Object -First 1
+    Assert-Replay ($null -ne $cycleFn) "The reviewer must define Invoke-ReviewerCycle."
+    $cycleAssignments = @($cycleFn.FindAll({
+                param($c) $c -is [Management.Automation.Language.AssignmentStatementAst]
+            }, $true))
+    $boundForeach = @($cycleFn.FindAll({
+                param($c)
+                $c -is [Management.Automation.Language.ForEachStatementAst] -and
+                $c.Variable -is [Management.Automation.Language.VariableExpressionAst] -and
+                [string]$c.Variable.VariablePath.UserPath -ceq "item" -and
+                $c.Condition -is [Management.Automation.Language.PipelineAst] -and
+                ([string]$c.Condition.Extent.Text) -match '(?i)\$bound'
+            }, $true))
+    Assert-Replay (@($boundForeach).Count -gt 0) `
+        "Invoke-ReviewerCycle must thread the counts inside a foreach (`$item in `$bound) loop over bound PR items."
+    # The assignment must be lexically INSIDE a foreach ($item in $bound) body -
+    # otherwise moving it after the loop would set only the final item while the
+    # independent existence checks still pass.
+    $insideBoundForeach = {
+        param($AssignmentAst)
+        foreach ($loop in $boundForeach) {
+            $body = $loop.Body
+            if ($null -ne $body -and
+                $body.Extent.StartOffset -le $AssignmentAst.Extent.StartOffset -and
+                $body.Extent.EndOffset -ge $AssignmentAst.Extent.EndOffset) {
+                return $true
+            }
+        }
+        return $false
+    }
+    $memberAssign = {
+        param($MemberName, $ExpectedRhsVar)
+        @($cycleAssignments | Where-Object {
+                $left = $_.Left
+                $rightExpr = $null
+                if ($_.Right -is [Management.Automation.Language.CommandExpressionAst]) { $rightExpr = $_.Right.Expression }
+                $left -is [Management.Automation.Language.MemberExpressionAst] -and
+                $left.Expression -is [Management.Automation.Language.VariableExpressionAst] -and
+                [string]$left.Expression.VariablePath.UserPath -ceq "item" -and
+                $left.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                [string]$left.Member.Value -ceq $MemberName -and
+                $rightExpr -is [Management.Automation.Language.VariableExpressionAst] -and
+                [string]$rightExpr.VariablePath.UserPath -ceq $ExpectedRhsVar -and
+                (& $insideBoundForeach $_)
+            }).Count -gt 0
+    }
+    $localAssignFromVar = {
+        param($TargetVar, $SourceVar)
+        @($cycleAssignments | Where-Object {
+                $left = $_.Left
+                $rightExpr = $null
+                if ($_.Right -is [Management.Automation.Language.CommandExpressionAst]) { $rightExpr = $_.Right.Expression }
+                $left -is [Management.Automation.Language.VariableExpressionAst] -and
+                [string]$left.VariablePath.UserPath -ceq $TargetVar -and
+                $rightExpr -is [Management.Automation.Language.VariableExpressionAst] -and
+                [string]$rightExpr.VariablePath.UserPath -ceq $SourceVar
+            }).Count -gt 0
+    }
+    # Bind the RHS variable, not just the member name: a swap
+    # (.AuthoritativeSourceConfiguredCount = $authoritativeSourceResolvedCount)
+    # would otherwise still pass and misreport withheld counts.
+    Assert-Replay (& $memberAssign "AuthoritativeSourceConfiguredCount" "authoritativeSourceConfiguredCount") `
+        "Invoke-ReviewerCycle must assign `$authoritativeSourceConfiguredCount onto each bound item's .AuthoritativeSourceConfiguredCount."
+    Assert-Replay (& $memberAssign "AuthoritativeSourceResolvedCount" "authoritativeSourceResolvedCount") `
+        "Invoke-ReviewerCycle must assign `$authoritativeSourceResolvedCount onto each bound item's .AuthoritativeSourceResolvedCount."
+    Assert-Replay (& $localAssignFromVar "authoritativeSourceConfiguredCount" "configuredSourceCount") `
+        "Invoke-ReviewerCycle must derive `$authoritativeSourceConfiguredCount from `$configuredSourceCount."
+    Assert-Replay (& $localAssignFromVar "authoritativeSourceResolvedCount" "resolvedSourceCount") `
+        "Invoke-ReviewerCycle must derive `$authoritativeSourceResolvedCount from `$resolvedSourceCount."
+    $prFn = $reviewerAst.FindAll({
+            param($c)
+            $c -is [Management.Automation.Language.FunctionDefinitionAst] -and $c.Name -ceq "Invoke-ReviewerPullRequest"
+        }, $true) | Select-Object -First 1
+    Assert-Replay ($null -ne $prFn) "The reviewer must define Invoke-ReviewerPullRequest."
+    $summaryCall = $prFn.FindAll({
+            param($c)
+            $c -is [Management.Automation.Language.CommandAst] -and
+            [string]$c.GetCommandName() -ceq "Get-ReviewerConventionSourceSummary"
+        }, $true) | Select-Object -First 1
+    Assert-Replay ($null -ne $summaryCall) "Invoke-ReviewerPullRequest must call Get-ReviewerConventionSourceSummary."
+    # For each forwarded count parameter, bind its ARGUMENT to the matching bound-
+    # item key: the argument must contain a Get-ReviewerHashValue call whose -Key
+    # literal equals the parameter name. This rejects a swapped/constant/wrong-key
+    # argument that a name-only check would accept.
+    $summaryArgBindsKey = {
+        param($ParamName)
+        $elements = $summaryCall.CommandElements
+        for ($i = 0; $i -lt $elements.Count - 1; $i++) {
+            $element = $elements[$i]
+            if ($element -is [Management.Automation.Language.CommandParameterAst] -and
+                [string]$element.ParameterName -ceq $ParamName) {
+                $argument = $elements[$i + 1]
+                $hashCalls = @($argument.FindAll({
+                            param($c)
+                            $c -is [Management.Automation.Language.CommandAst] -and
+                            [string]$c.GetCommandName() -ceq "Get-ReviewerHashValue"
+                        }, $true))
+                foreach ($hashCall in $hashCalls) {
+                    $keyElements = $hashCall.CommandElements
+                    $keyMatches = $false
+                    $containerMatches = $false
+                    for ($k = 0; $k -lt $keyElements.Count - 1; $k++) {
+                        $callParam = $keyElements[$k]
+                        if ($callParam -isnot [Management.Automation.Language.CommandParameterAst]) { continue }
+                        $callArg = $keyElements[$k + 1]
+                        if ([string]$callParam.ParameterName -ceq "Key" -and
+                            $callArg -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                            [string]$callArg.Value -ceq $ParamName) {
+                            $keyMatches = $true
+                        }
+                        if ([string]$callParam.ParameterName -ceq "Container" -and
+                            $callArg -is [Management.Automation.Language.VariableExpressionAst] -and
+                            [string]$callArg.VariablePath.UserPath -ceq "Bound") {
+                            $containerMatches = $true
+                        }
+                    }
+                    if ($keyMatches -and $containerMatches) { return $true }
+                }
+            }
+        }
+        return $false
+    }
+    Assert-Replay (& $summaryArgBindsKey "AuthoritativeSourceConfiguredCount") `
+        "Invoke-ReviewerPullRequest must forward -AuthoritativeSourceConfiguredCount bound to the bound-item key 'AuthoritativeSourceConfiguredCount'."
+    Assert-Replay (& $summaryArgBindsKey "AuthoritativeSourceResolvedCount") `
+        "Invoke-ReviewerPullRequest must forward -AuthoritativeSourceResolvedCount bound to the bound-item key 'AuthoritativeSourceResolvedCount'."
+
+    # Regression (empty authoritative-source total): offline replay can withhold
+    # EVERY configured authoritative source, leaving $sourceSnapshots empty.
+    # Measure-Object -Sum emits NO object on an empty pipeline, so reading .Sum off
+    # it throws "The property 'Sum' cannot be found on this object" under
+    # StrictMode - failing the whole cycle before any functional model launch. This
+    # was observed on PR16760357, whose configured authoritative sources are all
+    # unsealed. The byte total must therefore be computed only when at least one
+    # source resolved. Pin the .Sum access to a $resolvedSourceCount -gt 0 guard so
+    # deleting the guard fails this test rather than surfacing only at model time.
+    $byteSumAccess = @($cycleFn.FindAll({
+                param($c)
+                $c -is [Management.Automation.Language.MemberExpressionAst] -and
+                $c.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                [string]$c.Member.Value -ceq "Sum" -and
+                ([string]$c.Expression.Extent.Text) -match '(?i)Measure-Object' -and
+                ([string]$c.Expression.Extent.Text) -match '(?i)ByteLength'
+            }, $true))
+    Assert-Replay (@($byteSumAccess).Count -ge 1) `
+        "Invoke-ReviewerCycle must total authoritative-source bytes via a ByteLength Measure-Object -Sum."
+    # Structural (not text) match of the guard condition: exactly the binary
+    # expression `$resolvedSourceCount -gt 0`. A regex would accept a weakened
+    # condition such as `-gt 0 -or $true` (which parses as an -or BinaryExpression,
+    # not -gt), so require the clause condition to BE a -gt BinaryExpression whose
+    # left is $resolvedSourceCount and whose right is the constant 0.
+    $isExactResolvedGuard = {
+        param($Clause)
+        $cond = $Clause.Item1
+        $expr = $null
+        if ($cond -is [Management.Automation.Language.PipelineAst] -and
+            @($cond.PipelineElements).Count -eq 1 -and
+            $cond.PipelineElements[0] -is [Management.Automation.Language.CommandExpressionAst]) {
+            $expr = $cond.PipelineElements[0].Expression
+        }
+        ($expr -is [Management.Automation.Language.BinaryExpressionAst] -and
+            $expr.Operator -eq [Management.Automation.Language.TokenKind]::Igt -and
+            $expr.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+            [string]$expr.Left.VariablePath.UserPath -ceq "resolvedSourceCount" -and
+            $expr.Right -is [Management.Automation.Language.ConstantExpressionAst] -and
+            [int]$expr.Right.Value -eq 0)
+    }
+    $resolvedGuardBodies = @()
+    foreach ($ifStatement in $cycleFn.FindAll({
+                param($c) $c -is [Management.Automation.Language.IfStatementAst]
+            }, $true)) {
+        foreach ($clause in $ifStatement.Clauses) {
+            if (& $isExactResolvedGuard $clause) { $resolvedGuardBodies += $clause.Item2 }
+        }
+    }
+    Assert-Replay (@($resolvedGuardBodies).Count -ge 1) `
+        "Invoke-ReviewerCycle must guard the authoritative-source byte total on exactly `$resolvedSourceCount -gt 0."
+    # The byte accumulator must be initialized to a NUMERIC 0 BEFORE the guard and
+    # in the SAME immediate statement block, so an all-withheld cycle reports 0
+    # bytes rather than an undefined value. Same-block dominance (not mere source
+    # order) rejects an init buried in an unrelated earlier conditional that would
+    # not execute on the guard's path; a numeric-value check rejects a string "0"
+    # or boolean zero equivalent.
+    $zeroInit = @($cycleFn.FindAll({
+                param($c)
+                $c -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $c.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+                [string]$c.Left.VariablePath.UserPath -ceq "authoritativeSourceBytes" -and
+                $c.Right -is [Management.Automation.Language.CommandExpressionAst] -and
+                $c.Right.Expression -is [Management.Automation.Language.ConstantExpressionAst] -and
+                ($c.Right.Expression.Value -is [int] -or $c.Right.Expression.Value -is [long] -or
+                    $c.Right.Expression.Value -is [double] -or $c.Right.Expression.Value -is [decimal]) -and
+                [double]$c.Right.Expression.Value -eq 0
+            }, $true))
+    Assert-Replay (@($zeroInit).Count -ge 1) `
+        "Invoke-ReviewerCycle must initialize `$authoritativeSourceBytes = 0 (numeric) before the resolved-count guard."
+    foreach ($access in $byteSumAccess) {
+        $guarded = $false
+        $initDominates = $false
+        foreach ($body in $resolvedGuardBodies) {
+            if ($null -ne $body -and
+                $body.Extent.StartOffset -le $access.Extent.StartOffset -and
+                $body.Extent.EndOffset -ge $access.Extent.EndOffset) {
+                $guarded = $true
+                # $body.Parent is the guard IfStatementAst; its .Parent is the
+                # statement block the guard lives in. The init must be a sibling in
+                # that same block and lexically precede the guard.
+                $guardIf = $body.Parent
+                $guardBlock = if ($null -ne $guardIf) { $guardIf.Parent } else { $null }
+                foreach ($init in $zeroInit) {
+                    if ($null -ne $guardBlock -and
+                        [object]::ReferenceEquals($init.Parent, $guardBlock) -and
+                        $init.Extent.StartOffset -lt $guardIf.Extent.StartOffset) {
+                        $initDominates = $true
+                    }
+                }
+                break
+            }
+        }
+        Assert-Replay $guarded `
+            ("Every authoritative-source ByteLength Measure-Object -Sum in Invoke-ReviewerCycle must sit inside an " +
+            "if (`$resolvedSourceCount -gt 0) guard so an all-withheld replay cannot read .Sum off an empty pipeline.")
+        Assert-Replay $initDominates `
+            ("The `$authoritativeSourceBytes = 0 initialization must be a sibling in the same block as, and precede, " +
+            "the resolved-count guard in Invoke-ReviewerCycle.")
+    }
+
+    # Second all-withheld StrictMode defect (companion to the byte-total guard
+    # above): when every configured authoritative source is withheld, the snapshot
+    # builder returns an empty List[hashtable].ToArray() that PowerShell collapses
+    # to AutomationNull on the function-output boundary. The caller then coerces it
+    # to $null through Format-ReviewerAuthoritativeSources' [hashtable[]] parameter,
+    # @($null) becomes a phantom single-element collection that slips past the
+    # `$items.Count -eq 0` early return, and Measure-Object -Property ByteLength -Sum
+    # over that lone $null emits no object - so `.Sum` throws under StrictMode inside
+    # Format-ReviewerAuthoritativeSources itself. The builders deliberately return a
+    # flat array (a unary-comma wrap is explicitly rejected by Test-ConventionPacks
+    # so convention collectors stay flat), so the defense lives at the consumer:
+    # Format must filter $null elements before the count guard. Pin that filter.
+    $findReviewerFn = {
+        param($Name)
+        $reviewerAst.FindAll({
+                param($c)
+                $c -is [Management.Automation.Language.FunctionDefinitionAst] -and $c.Name -ceq $Name
+            }, $true) | Select-Object -First 1
+    }
+    $formatFn = & $findReviewerFn "Format-ReviewerAuthoritativeSources"
+    Assert-Replay ($null -ne $formatFn) "The reviewer must define Format-ReviewerAuthoritativeSources."
+    # The materialization `$items = @($Snapshots | Where-Object { $null -ne $_ })`
+    # must filter nulls before the `$items.Count -eq 0` early return, so a phantom
+    # @($null) collapses to empty rather than reaching the ByteLength Measure/.Sum.
+    # Locate the count guard first, then pin the $items assignment that actually
+    # dominates it (same immediate statement block, lexically preceding, chosen last)
+    # so neither a shadow `$items = @($Snapshots)` reassignment nor a filtered
+    # assignment buried in a non-dominating inner block (e.g. if ($false) { ... }) can
+    # silently restore the StrictMode crash while the guard still reports success.
+    $itemsAssigns = @($formatFn.FindAll({
+                param($c)
+                $c -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $c.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+                [string]$c.Left.VariablePath.UserPath -ceq "items"
+            }, $true))
+    Assert-Replay (@($itemsAssigns).Count -ge 1) "Format-ReviewerAuthoritativeSources must assign `$items."
+    # The early-return guard: an if whose COMPLETE condition is exactly
+    # `$items.Count -eq 0` - a structural match on the condition pipeline itself, not
+    # a descendant search, so a widened `... -and $false` condition is rejected.
+    $isExactCountGuardCondition = {
+        param($Condition)
+        if (-not ($Condition -is [Management.Automation.Language.PipelineAst])) { return $false }
+        if (@($Condition.PipelineElements).Count -ne 1) { return $false }
+        $el = $Condition.PipelineElements[0]
+        if (-not ($el -is [Management.Automation.Language.CommandExpressionAst])) { return $false }
+        $b = $el.Expression
+        ($b -is [Management.Automation.Language.BinaryExpressionAst]) -and
+        $b.Operator -eq [Management.Automation.Language.TokenKind]::Ieq -and
+        $b.Left -is [Management.Automation.Language.MemberExpressionAst] -and
+        $b.Left.Expression -is [Management.Automation.Language.VariableExpressionAst] -and
+        [string]$b.Left.Expression.VariablePath.UserPath -ceq "items" -and
+        $b.Left.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
+        [string]$b.Left.Member.Value -ceq "Count" -and
+        $b.Right -is [Management.Automation.Language.ConstantExpressionAst] -and
+        ($b.Right.Value -is [int] -or $b.Right.Value -is [long] -or $b.Right.Value -is [double] -or $b.Right.Value -is [decimal]) -and
+        [double]$b.Right.Value -eq 0
+    }
+    # The guard must actually short-circuit: a `return ""` must be a DIRECT statement of
+    # its then-block (not a recursive descendant). Pinning the body this way rejects both
+    # a decoy `if ($items.Count -eq 0) { Write-Host ... }` with no early return AND a
+    # non-short-circuiting `if ($items.Count -eq 0) { if ($false) { return "" } }` whose
+    # return never actually fires - either of which, if selected (Select -First 1), would
+    # let the real guard be preceded by a shadow reassignment and false-pass.
+    $hasEmptyStringReturn = {
+        param($Block)
+        if ($null -eq $Block) { return $false }
+        @($Block.Statements | Where-Object {
+                    ($_ -is [Management.Automation.Language.ReturnStatementAst]) -and
+                    ($null -ne $_.Pipeline) -and
+                    ($_.Pipeline -is [Management.Automation.Language.PipelineAst]) -and
+                    (@($_.Pipeline.PipelineElements).Count -eq 1) -and
+                    ($_.Pipeline.PipelineElements[0] -is [Management.Automation.Language.CommandExpressionAst]) -and
+                    ($_.Pipeline.PipelineElements[0].Expression -is [Management.Automation.Language.StringConstantExpressionAst]) -and
+                    ([string]$_.Pipeline.PipelineElements[0].Expression.Value -ceq "")
+                }).Count -ge 1
+    }
+    $countGuardIf = @($formatFn.FindAll({
+                param($c)
+                $c -is [Management.Automation.Language.IfStatementAst] -and
+                @($c.Clauses).Count -ge 1 -and
+                (& $isExactCountGuardCondition $c.Clauses[0].Item1) -and
+                (& $hasEmptyStringReturn $c.Clauses[0].Item2)
+            }, $true)) | Select-Object -First 1
+    Assert-Replay ($null -ne $countGuardIf) `
+        "Format-ReviewerAuthoritativeSources must keep an early-return guard whose condition is exactly `$items.Count -eq 0 and whose body returns an empty string."
+    # Control-flow dominance (not mere source order): the assignment that reaches the
+    # guard must be a sibling in the guard's own immediate statement block and precede
+    # it. $countGuardIf.Parent is that block; require reference equality, exactly as
+    # the authoritative-source byte-total guard above pins its zero-init dominance.
+    $guardBlock = $countGuardIf.Parent
+    # No @() wrapper here: Select-Object -Last 1 over no matches must collapse to $null
+    # so the null-check below is meaningful (an @() empty array is -ne $null and would
+    # let a filter-only-AFTER-the-guard variant slip past into an ungraceful .Right throw).
+    $dominatingAssign = $itemsAssigns | Where-Object {
+                [object]::ReferenceEquals($_.Parent, $guardBlock) -and
+                $_.Extent.StartOffset -lt $countGuardIf.Extent.StartOffset
+            } | Sort-Object { $_.Extent.StartOffset } | Select-Object -Last 1
+    Assert-Replay ($null -ne $dominatingAssign) `
+        "Format-ReviewerAuthoritativeSources must assign `$items in the guard's own block before the count guard."
+    $itemsWhere = @($dominatingAssign.Right.FindAll({
+                param($c)
+                $c -is [Management.Automation.Language.CommandAst] -and
+                ([string]$c.GetCommandName()) -ceq "Where-Object"
+            }, $true))
+    # Pin the comparison to exactly `$null -ne $_` (operands $null and $_ in either
+    # order), not any -ne with a $null somewhere, so a weakened predicate is rejected.
+    $itemsNullTest = @($dominatingAssign.Right.FindAll({
+                param($c)
+                if (-not ($c -is [Management.Automation.Language.BinaryExpressionAst])) { return $false }
+                if ($c.Operator -ne [Management.Automation.Language.TokenKind]::Ine) { return $false }
+                $lp = if ($c.Left -is [Management.Automation.Language.VariableExpressionAst]) { [string]$c.Left.VariablePath.UserPath } else { $null }
+                $rp = if ($c.Right -is [Management.Automation.Language.VariableExpressionAst]) { [string]$c.Right.VariablePath.UserPath } else { $null }
+                ($lp -ceq "null" -and $rp -ceq "_") -or ($lp -ceq "_" -and $rp -ceq "null")
+            }, $true))
+    Assert-Replay (@($itemsWhere).Count -ge 1 -and @($itemsNullTest).Count -ge 1) `
+        ("Format-ReviewerAuthoritativeSources must build the guard-reaching `$items by filtering `$null elements " +
+        "(@(`$Snapshots | Where-Object { `$null -ne `$_ })) before the count guard so a phantom @(`$null) " +
+        "cannot reach Measure-Object -Sum.")
 
     . (Join-Path $RepoRoot "src\Agents\reviewer\SourceTransport.ps1")
     # The CLI fallback is a second, LIVE transport. In replay it must never be
@@ -4418,12 +4920,51 @@ try {
     Assert-ReplayThrows { New-AgentReplaySnapshot -ReplayRoot $classifiedV1 -SnapshotName "synthetic-pr" } `
         "A schema-v1 manifest must not be allowed to carry a classification." -Match "schema-v2 field"
 
+    # -- 15. Convention-source availability probe -----------------------------
+    # Test-AgentReplaySnapshotHasResponse lets the offline convention planner
+    # tell a source that was never captured apart from one that is present,
+    # WITHOUT issuing a read the snapshot cannot answer. It must agree exactly
+    # with what Get-AgentReplayResponse would serve or throw for.
+    Write-Host "15 convention-source availability probe" -ForegroundColor Cyan
+    $probeSnapshot = New-AgentReplaySnapshot -ReplayRoot $fixtureRoot -SnapshotName "synthetic-pr"
+    $recordedPrArgs = @{ action = "get"; project = "Widgets"; repositoryId = "11111111-2222-3333-4444-555555555555"; pullRequestId = 4242 }
+    $recordedFileArgs = @{ action = "get_content"; project = "Widgets"; repositoryId = "11111111-2222-3333-4444-555555555555"; path = "/src/Widget.cs"; versionType = "Commit"; version = "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0" }
+    Assert-Replay (Test-AgentReplaySnapshotHasResponse -Snapshot $probeSnapshot -Name "repo_pull_request" -Arguments $recordedPrArgs) `
+        "The probe must report a recorded read as available."
+    Assert-Replay (Test-AgentReplaySnapshotHasResponse -Snapshot $probeSnapshot -Name "repo_file" -Arguments $recordedFileArgs) `
+        "The probe must report a recorded repo_file read as available."
+    # An unrecorded read (a source the corpus never captured) must probe false,
+    # never throw and never fall through - so the planner can withhold it.
+    Assert-Replay (-not (Test-AgentReplaySnapshotHasResponse -Snapshot $probeSnapshot -Name "repo_pull_request" `
+                -Arguments @{ action = "get"; project = "Widgets"; repositoryId = "11111111-2222-3333-4444-555555555555"; pullRequestId = 9999 })) `
+        "The probe must report an uncaptured read as unavailable."
+    Assert-Replay (-not (Test-AgentReplaySnapshotHasResponse -Snapshot $probeSnapshot -Name "repo_branch" `
+                -Arguments @{ action = "get"; project = "Widgets"; repositoryId = "11111111-2222-3333-4444-555555555555"; branchName = "master" })) `
+        "The probe must report an uncaptured convention branch read as unavailable."
+    # Argument identity matters: a single differing value is a different read.
+    Assert-Replay (-not (Test-AgentReplaySnapshotHasResponse -Snapshot $probeSnapshot -Name "repo_file" `
+                -Arguments @{ action = "get_content"; project = "Widgets"; repositoryId = "11111111-2222-3333-4444-555555555555"; path = "/src/Other.cs"; versionType = "Commit"; version = "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0" })) `
+        "The probe must not treat a different path as the same recorded read."
+    # A write tool is outside the read ceiling: the probe refuses it (false),
+    # exactly as the serve path would, so it can never be seen as available.
+    Assert-Replay (-not (Test-AgentReplaySnapshotHasResponse -Snapshot $probeSnapshot -Name "repo_pull_request_write" `
+                -Arguments @{ action = "get"; project = "Widgets"; pullRequestId = 4242 })) `
+        "The probe must refuse a write tool rather than report it available."
+    Assert-ReplayThrows { Test-AgentReplaySnapshotHasResponse -Snapshot @{ Seal = "agent-replay-v1"; Served = @{} } `
+            -Name "repo_file" -Arguments @{ action = "get_content" } } `
+        "A hand-built snapshot object must not be accepted by the probe." -Match "produced by New-AgentReplaySnapshot"
+    # The probe must not consume or alter the snapshot: a serve still succeeds
+    # after probing, proving the probe issued nothing and mutated nothing.
+    $afterProbeSession = Open-AgentMcpSession -AgencyPath "never-executed" -Server "ado" -Organization "contoso" -ReplaySnapshot $probeSnapshot
+    $afterProbePr = Invoke-AgentMcpTool -Session $afterProbeSession -Name "repo_pull_request" -Arguments $recordedPrArgs
+    Assert-Replay ([int]$afterProbePr.pullRequestId -eq 4242) "Probing must leave the recorded read servable."
+    Close-AgentMcpSession -Session $afterProbeSession
+
     $script:ReviewerReplayActive = $false
 }
 finally {
     Remove-Item -Recurse -Force $sandbox -ErrorAction SilentlyContinue
 }
-
 Write-Host ""
 if ($script:Failures.Count -eq 0) {
     Write-Host "PASS - $($script:Checks) replay-snapshot and rule-coverage check(s) passed." -ForegroundColor Green

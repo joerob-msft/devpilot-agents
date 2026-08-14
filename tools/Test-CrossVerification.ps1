@@ -534,6 +534,102 @@ Assert-Verification ($originUnion.Count -eq 3 -and $originUnionAssignments.Count
     @($originUnionAssignments | Where-Object verifierModel -ceq "claude-sonnet-5").Count -eq 0) `
     "The exact blind candidate union omitted a sole-origin finding or assigned the specialist as cross-checker."
 
+# Phase 2b: bind the reciprocal cross-check pair to the exact production model
+# identifiers and prove the separate convention verifier never reduces it. The
+# union above (two functional generalists + one specialist convention candidate)
+# must give EVERY candidate exactly one fresh gpt-5.6-sol and one fresh
+# claude-opus-5 verifier, with the named convention verifier being one of that
+# pair, not a replacement for it.
+Assert-Verification (@(@($opus, $sol) | Sort-Object) -join "|" -ceq "claude-opus-5|gpt-5.6-sol") `
+    "The derived reciprocal cross-check pair is not exactly {claude-opus-5, gpt-5.6-sol}."
+$phase2bPairPerCandidate = @($originUnion | ForEach-Object {
+        $cid = [string]$_.candidateId
+        $pair = @($originUnionAssignments | Where-Object { [string]$_.candidateId -ceq $cid } |
+                ForEach-Object { [string]$_.verifierModel } | Sort-Object -Unique)
+        (@($pair) -join "|")
+    } | Sort-Object -Unique)
+Assert-Verification (@($phase2bPairPerCandidate).Count -eq 1 -and
+    $phase2bPairPerCandidate[0] -ceq "claude-opus-5|gpt-5.6-sol") `
+    "Not every union candidate received exactly one fresh claude-opus-5 and one fresh gpt-5.6-sol cross-check."
+$phase2bCoverage = Assert-ReviewerVerificationAssignmentCoverage -Clusters $originUnionClusters `
+    -Assignments $originUnionAssignments -RequiredVerifierModels @($opus, $sol) -MaxVerifierRuns 6
+Assert-Verification ([bool]$phase2bCoverage.complete -and [int]$phase2bCoverage.readyCandidateCount -eq 3) `
+    "Assignment coverage did not confirm the full GPT+Opus pair for every union candidate."
+# The convention verifier naming gpt-5.6-sol must not drop opus from any pair.
+Assert-Verification (@($originUnionAssignments | Where-Object { [string]$_.verifierModel -ceq "claude-opus-5" }).Count -eq 3 -and
+    @($originUnionAssignments | Where-Object { [string]$_.verifierModel -ceq "gpt-5.6-sol" }).Count -eq 3) `
+    "The named convention verifier reduced the reciprocal pair instead of leaving both cross-checks intact."
+
+# Phase 2b (review fix): the pass status decision must fold three independent
+# coverage signals so a PARTIAL convention-evidence degradation (some packs
+# resolved, some withheld because the sealed replay could not answer them) is
+# never reported as a complete review, while a fully-covered pass still reads
+# complete. Get-ReviewerVerificationConventionCoverageStatus is the pure gate.
+Assert-Verification ((Get-ReviewerVerificationConventionCoverageStatus `
+            -AllVerifierRunsComplete $true -SpecialistDegraded $false -ConventionEvidenceDegraded $false) -ceq "complete") `
+    "A fully-covered pass (all runs complete, specialist not degraded, evidence complete) was not reported complete."
+Assert-Verification ((Get-ReviewerVerificationConventionCoverageStatus `
+            -AllVerifierRunsComplete $true -SpecialistDegraded $false -ConventionEvidenceDegraded $true) -ceq "degraded") `
+    "A partial convention-evidence degradation was silently reported complete instead of degraded."
+Assert-Verification ((Get-ReviewerVerificationConventionCoverageStatus `
+            -AllVerifierRunsComplete $true -SpecialistDegraded $true -ConventionEvidenceDegraded $false) -ceq "degraded") `
+    "A degraded specialist did not force the pass status to degraded."
+Assert-Verification ((Get-ReviewerVerificationConventionCoverageStatus `
+            -AllVerifierRunsComplete $false -SpecialistDegraded $false -ConventionEvidenceDegraded $false) -ceq "degraded") `
+    "An incomplete verifier run set did not force the pass status to degraded."
+Assert-Verification ((Get-ReviewerVerificationConventionCoverageStatus `
+            -AllVerifierRunsComplete $false -SpecialistDegraded $true -ConventionEvidenceDegraded $true) -ceq "degraded") `
+    "Combined incomplete signals did not report degraded."
+
+# Review fix (0a0aa61 follow-up): a configured generalist authoritative source
+# withheld by offline replay (the non-pack repoConventions.authoritativeSources
+# path) is a fourth independent coverage signal. When every other signal is
+# complete but a configured source did not reach the blind generalist context,
+# the pass must still degrade - unavailable convention evidence can never be
+# silently reported as a complete review. The signal defaults to false so a
+# fully-covered pass is unaffected and pre-existing three-argument callers keep
+# their exact behavior.
+Assert-Verification ((Get-ReviewerVerificationConventionCoverageStatus `
+            -AllVerifierRunsComplete $true -SpecialistDegraded $false -ConventionEvidenceDegraded $false `
+            -AuthoritativeSourceDegraded $false) -ceq "complete") `
+    "A fully-covered pass with no withheld authoritative source was not reported complete."
+Assert-Verification ((Get-ReviewerVerificationConventionCoverageStatus `
+            -AllVerifierRunsComplete $true -SpecialistDegraded $false -ConventionEvidenceDegraded $false `
+            -AuthoritativeSourceDegraded $true) -ceq "degraded") `
+    "A withheld generalist authoritative source did not force the pass status to degraded."
+Assert-Verification ((Get-ReviewerVerificationConventionCoverageStatus `
+            -AllVerifierRunsComplete $true -SpecialistDegraded $false -ConventionEvidenceDegraded $false) -ceq "complete") `
+    "Omitting AuthoritativeSourceDegraded must default to not-degraded and preserve legacy three-argument behavior."
+
+# Review fix (0fd304d follow-up): the human-facing convention-source summary must
+# report withheld authoritative sources honestly - a replay that could not answer
+# a configured source is a capture gap, not a configuration gap. Execute the pure
+# summary function with an empty convention-plan path so only the authoritative-
+# source branch runs (no plan dependency).
+Invoke-Expression (Get-VerificationFunctionText -Text $wrapperText -Name "Get-ReviewerConventionSourceSummary")
+$summaryFull = Get-ReviewerConventionSourceSummary -ConventionPlanPath "" `
+    -AuthoritativeSourcesText "" -AuthoritativeSourceConfiguredCount 3 -AuthoritativeSourceResolvedCount 3
+Assert-Verification ($summaryFull -ceq "3 commit-pinned authoritative source(s) in the generalist context") `
+    "A fully-resolved authoritative-source summary must report the resolved count without a withheld clause."
+$summaryPartial = Get-ReviewerConventionSourceSummary -ConventionPlanPath "" `
+    -AuthoritativeSourcesText "" -AuthoritativeSourceConfiguredCount 3 -AuthoritativeSourceResolvedCount 1
+Assert-Verification ($summaryPartial -clike "*1 of 3 configured authoritative source(s) resolved*" -and
+    $summaryPartial -clike "*2 withheld*") `
+    "A partially-withheld authoritative-source summary must report resolved-of-configured and the withheld count."
+$summaryAllWithheld = Get-ReviewerConventionSourceSummary -ConventionPlanPath "" `
+    -AuthoritativeSourcesText "" -AuthoritativeSourceConfiguredCount 3 -AuthoritativeSourceResolvedCount 0
+Assert-Verification ($summaryAllWithheld -clike "*0 of 3 configured authoritative source(s) resolved*" -and
+    $summaryAllWithheld -clike "*3 withheld*" -and
+    $summaryAllWithheld -cnotlike "*declares no convention packs and no authoritative sources*") `
+    "An all-withheld authoritative-source summary must report the withheld sources, never misreport them as none declared."
+$summaryLegacy = Get-ReviewerConventionSourceSummary -ConventionPlanPath "" `
+    -AuthoritativeSourcesText "Source 1 provenance: a`nSource 2 provenance: b"
+Assert-Verification ($summaryLegacy -ceq "2 commit-pinned authoritative source(s) in the generalist context") `
+    "A legacy caller without counts must still summarize the rendered provenance source count."
+$summaryNone = Get-ReviewerConventionSourceSummary -ConventionPlanPath "" -AuthoritativeSourcesText ""
+Assert-Verification ($summaryNone -clike "*declares no convention packs and no authoritative sources*") `
+    "A config with no packs and no authoritative sources must still report the honest configuration-gap line."
+
 # Generalist-origin convention findings are deterministically bound to the exact
 # sealed rule and changed-file range before either verifier sees them.
 $localizationSection = "### Use localized strings in exceptions and web action methods"
@@ -2414,6 +2510,146 @@ Assert-Verification ($sealedSliceHunks.Count -eq 1 -and
     [string]$sealedSliceHunks[0].sourceKind -ceq "sealedSourceSlice" -and
     [int]$sealedSliceHunks[0].line -eq 1112 -and $script:pinnedSourceReadCount -eq 0) `
     "Verifier evidence did not reuse the normalized sealed source slice."
+# A cross-file convention candidate's semantic identity is its primary anchor
+# plus its ordered-independent manifestation set. The verifier must be shown a
+# sealed changed-right-hand slice for EVERY manifestation line, not only the
+# anchor, or it fails closed for lack of the cross-file evidence it needs.
+$crossFileAnchors = @(
+    [pscustomobject][ordered]@{
+        anchorId = "cf1"; path = "src/model.json"
+        rightHandRanges = @([pscustomobject]@{ startLine = 180; endLine = 220 })
+    },
+    [pscustomobject][ordered]@{
+        anchorId = "cf0"; path = "src/rolloutspec.json"
+        rightHandRanges = @([pscustomobject]@{ startLine = 50; endLine = 60 })
+    }
+)
+$crossFileCandidate = [pscustomobject][ordered]@{
+    candidateId = "cand-crossfile-1"
+    candidateHash = "d" * 64
+    anchorKind = "changedFile"
+    filePath = "src/model.json"
+    line = 210
+    primaryTarget = "cf1:210"
+    manifestations = "cf1:187,cf1:210,cf0:52"
+    conventionBound = $true
+    originKind = "convention"
+}
+$crossFileReport = [pscustomobject]@{
+    Files = @(
+        [pscustomobject]@{
+            Path = "src/model.json"
+            Slices = @([pscustomobject]@{
+                    StartLine = 180; EndLine = 220
+                    Text = ((180..220 | ForEach-Object { "model line $_" }) -join "`n")
+                })
+        },
+        [pscustomobject]@{
+            Path = "src/rolloutspec.json"
+            Slices = @([pscustomobject]@{
+                    StartLine = 50; EndLine = 60
+                    Text = ((50..60 | ForEach-Object { "rollout line $_" }) -join "`n")
+                })
+        }
+    )
+}
+$crossFileHunks = @(Get-ReviewerVerificationSourceHunks -AgencyPath "unused" `
+        -SourceCommit ("2" * 40) -Candidates @($crossFileCandidate) `
+        -ChangedPaths @("src/model.json", "src/rolloutspec.json") `
+        -ChangedFileAnchors $crossFileAnchors -SourceReport $crossFileReport)
+$crossFileKeys = @($crossFileHunks | ForEach-Object {
+        [string]$_.filePath + ":" + [string]$_.line + ":" + [string]$_.role
+    } | Sort-Object)
+Assert-Verification ($crossFileHunks.Count -eq 5 -and
+    @($crossFileHunks | Where-Object { [string]$_.sourceKind -cne "sealedSourceSlice" }).Count -eq 0) `
+    "A cross-file convention candidate did not render one sealed slice per anchor and manifestation line plus the enclosing context of every changed file it spans."
+Assert-Verification (($crossFileKeys -join "|") -ceq
+    ("/src/model.json:187:manifestation|/src/model.json:210:anchor|" +
+        "/src/model.json:210:context|/src/rolloutspec.json:52:context|" +
+        "/src/rolloutspec.json:52:manifestation")) `
+    "Cross-file manifestation hunks did not cover the exact anchor plus manifestation lines with the anchor deduplicated and enclosing context per spanned file."
+# The convention candidate's required "Global." prefix is governed by a nearby
+# changed line (187) that is neither the anchor nor a legal manifestation. The
+# enclosing sealed changed-right-hand context hunk for the anchor's file must
+# deliver that governing line to the verifier so it can independently confirm
+# the mandate, and a cross-file manifestation target (rolloutspec:52) must carry
+# its own enclosing context too.
+$crossFileModelContextHunk = @($crossFileHunks | Where-Object {
+        [string]$_.role -ceq "context" -and [string]$_.filePath -ceq "/src/model.json" })
+Assert-Verification ($crossFileModelContextHunk.Count -eq 1 -and
+    [int]$crossFileModelContextHunk[0].startLine -le 187 -and
+    [int]$crossFileModelContextHunk[0].endLine -ge 210 -and
+    ([string]$crossFileModelContextHunk[0].text).Contains("model line 187") -and
+    ([string]$crossFileModelContextHunk[0].text).Contains("model line 210")) `
+    "The convention context hunk did not deliver the governing changed line (187) alongside the anchor (210)."
+$crossFileContextHunks = @($crossFileHunks | Where-Object { [string]$_.role -ceq "context" })
+Assert-Verification ($crossFileContextHunks.Count -eq 2 -and
+    @($crossFileContextHunks | ForEach-Object { [string]$_.filePath } | Sort-Object -Unique).Count -eq 2) `
+    "Every changed file a cross-file convention candidate spans must receive one enclosing sealed context hunk."
+$crossFileHunkShas = @($crossFileHunks | ForEach-Object { [string]$_.sha256 } | Sort-Object -Unique)
+Assert-Verification ($crossFileHunkShas.Count -eq 5) `
+    "Cross-file manifestation hunks must each carry a distinct sealed evidence hash."
+$crossFileOptions = @(Get-ReviewerVerificationEvidenceOptions -Candidate $crossFileCandidate `
+        -FactPlan $null -ThreadFacts @() -EvidenceHunks $crossFileHunks)
+$crossFileDiffHunkOptions = @($crossFileOptions | Where-Object {
+        [string]$_.purpose -ceq "candidate" -and [string]$_.kind -ceq "diffHunk"
+    })
+Assert-Verification ($crossFileDiffHunkOptions.Count -eq 5 -and
+    @($crossFileDiffHunkOptions | ForEach-Object { [string]$_.sha256 } | Sort-Object -Unique).Count -eq 5) `
+    "Every sealed cross-file manifestation hunk must be an independently bindable diffHunk evidence option."
+# Regression: the changed-file anchor index is a unary-comma-protected array so
+# a one-file change set survives as an array. Wrapping the CALL in @() does not
+# flatten that - it NESTS the whole index as one bogus element with no anchorId
+# or path, which silently broke the verifier's cross-file resolution: every cf
+# ref failed to resolve, so a convention candidate reached its two verifiers
+# with only its anchor hunk and they split (verifierDisagreement). The hand-
+# built anchors above cannot catch that; these are built the way production
+# builds them and must stay resolvable. Guard the shape and the anti-pattern.
+$indexEntries = @(
+    [pscustomobject][ordered]@{ Path = "src/model.json"; Role = "current" },
+    [pscustomobject][ordered]@{ Path = "src/rolloutspec.json"; Role = "current" }
+)
+$indexRanges = @{
+    "src/model.json"       = @([pscustomobject]@{ startLine = 180; endLine = 220 })
+    "src/rolloutspec.json" = @([pscustomobject]@{ startLine = 50; endLine = 60 })
+}
+$directIndex = Get-ReviewerConventionSpecialistChangedFileIndex `
+    -ChangeEntries $indexEntries -RightHandRangesByPath $indexRanges
+Assert-Verification (@($directIndex).Count -eq 2 -and
+    @($directIndex | Where-Object {
+            [string]$_.anchorId -match '^cf\d+$' -and [string]$_.path
+        }).Count -eq 2) `
+    "A directly assigned changed-file anchor index must be one resolvable anchor per changed file, never a nested array."
+$nestedIndex = @(Get-ReviewerConventionSpecialistChangedFileIndex `
+        -ChangeEntries $indexEntries -RightHandRangesByPath $indexRanges)
+Assert-Verification ($nestedIndex.Count -eq 1 -and $nestedIndex[0] -is [object[]]) `
+    "Wrapping the changed-file index call in @() nests it into one bogus element; production must assign the call directly, never @(call)."
+# model.json sorts before rolloutspec.json, so the production index numbers them
+# cf0/cf1 in that order. A convention candidate anchored in one file and
+# manifested in the other must, using ONLY these production anchors, still be
+# shown a sealed manifestation slice for the cross-file line.
+$prodCandidate = [pscustomobject][ordered]@{
+    candidateId  = "cand-prod-index-1"
+    candidateHash = "e" * 64
+    anchorKind   = "changedFile"
+    filePath     = "src/model.json"
+    line         = 210
+    primaryTarget = "cf0:210"
+    manifestations = "cf0:210,cf1:52"
+    conventionBound = $true
+    originKind   = "convention"
+}
+$prodHunks = @(Get-ReviewerVerificationSourceHunks -AgencyPath "unused" `
+        -SourceCommit ("2" * 40) -Candidates @($prodCandidate) `
+        -ChangedPaths @("src/model.json", "src/rolloutspec.json") `
+        -ChangedFileAnchors $directIndex -SourceReport $crossFileReport)
+$prodManifest = @($prodHunks | Where-Object {
+        [string]$_.role -ceq "manifestation" -and
+        [string]$_.filePath -ceq "/src/rolloutspec.json"
+    })
+Assert-Verification ($prodManifest.Count -eq 1 -and [int]$prodManifest[0].line -eq 52 -and
+    [string]$prodManifest[0].sourceKind -ceq "sealedSourceSlice") `
+    "Anchors built by the production changed-file index must resolve a cross-file manifestation hunk; the nested @() form would leave only the anchor hunk and split the verifiers."
 $crossPassText = Get-VerificationFunctionText -Text $wrapperText `
     -Name "Invoke-ReviewerCrossVerificationPass"
 foreach ($policyUse in @(
@@ -2518,6 +2754,7 @@ Assert-Verification (@($missingEvidence.eligible).Count -eq 0 -and
 . ([scriptblock]::Create($safeVerificationText))
 $script:passCandidates = @()
 $script:passFactPlan = $factPlan
+$script:passConventionEvidenceDegraded = $false
 $script:capturedVerificationInput = $null
 $script:clusterSequenceMode = ""
 $script:clusterSequenceCall = 0
@@ -2549,6 +2786,7 @@ function Read-ReviewerConventionPlan {
     return [pscustomobject]@{
         targetCommit = "2" * 40
         changeSetDigest = "3" * 64
+        evidenceDegraded = $script:passConventionEvidenceDegraded
     }
 }
 function Read-ReviewerFactPlan {
@@ -2730,6 +2968,23 @@ Assert-Verification ([int]$script:passFreshBindingCalls -ge 1 -and
     [int]$script:passFreshBindingTimeoutSeconds -gt 0 -and
     [int]$script:passFreshBindingTimeoutSeconds -le $McpTimeoutSeconds) `
     "The production pass did not bound its live fresh binding's transport timeout."
+# Partial convention-evidence degradation flows END TO END through the production
+# pass: when the sealed convention plan reports evidenceDegraded, the pass status
+# is degraded (never silently complete) yet the cross-verified functional
+# candidate is PRESERVED in the eligible set - the coverage gate only reports
+# incomplete coverage, it does not discard findings. (Whether a degraded run's
+# eligible candidates are postable is the separate, already-tested delivery gate,
+# which withholds them with a typed verificationDegraded reason.)
+$script:passConventionEvidenceDegraded = $true
+$script:passFactPlan = $factPlan
+$script:passCandidates = @($goodPartitionCandidate)
+$degradedEvidencePass = Invoke-ReviewerCrossVerificationPass -AgencyPath "unused" -CycleNumber 1 `
+    -Bound $passBound -PassResults $completePassResults -SpecialistResult $emptySpecialistResult
+Assert-Verification ($degradedEvidencePass.Status -ceq "degraded" -and
+    @($degradedEvidencePass.Eligible).Count -eq 1 -and
+    [string]$degradedEvidencePass.Eligible[0].candidateId -ceq "good-fact-candidate") `
+    "A convention plan reporting evidenceDegraded did not force a degraded pass while preserving its eligible functional candidate."
+$script:passConventionEvidenceDegraded = $false
 $script:passFactPlan = $overflowFactPlan
 $script:passCandidates = @($overflowPartitionCandidate, $goodPartitionCandidate)
 $overflowSafe = Invoke-ReviewerCrossVerificationSafely -AgencyPath "unused" -CycleNumber 2 `
