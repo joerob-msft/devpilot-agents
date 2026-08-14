@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "kind": "reviewer-gate-0-1-structural-coverage-matrix",
+  "claim": "orchestration-correctness-not-model-quality",
+  "rows": [
+    { "surface": "generalist", "success": true, "missingMarker": true, "truncatedMarker": false, "multipleMarkers": false, "wrongBinding": false, "timeout": true, "crash": false, "stdoutSaturation": true, "stderrSaturation": true },
+    { "surface": "specialist", "success": true, "missingMarker": false, "truncatedMarker": true, "multipleMarkers": false, "wrongBinding": false, "timeout": false, "crash": false, "stdoutSaturation": false, "stderrSaturation": false },
+    { "surface": "reciprocalVerifier", "success": true, "missingMarker": false, "truncatedMarker": false, "multipleMarkers": true, "wrongBinding": true, "timeout": false, "crash": true, "stdoutSaturation": false, "stderrSaturation": false }
+  ],
+  "normalizationContract": "reviewer-semantic-normalization-contract.v1.json",
+  "excludedFromSemanticComparison": ["run IDs", "timestamps", "nonces", "HMAC keys"],
+  "replayInterpretation": "lower-bound; environment and live-model residuals remain"
+}

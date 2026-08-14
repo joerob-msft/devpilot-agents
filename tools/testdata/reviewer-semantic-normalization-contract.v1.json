@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "kind": "reviewer-semantic-decision-normalization-contract",
+  "excludedKeyPatterns": [
+    "(?i)^(runId|sessionId|attemptId|nonce)$|nonce$",
+    "(?i)(timestamp|(?:created|updated|started|ended|generated|captured|frozen)At|timeUtc|atUtc|epochSeconds)$",
+    "(?i)^(hmac.*(?:key|signature)|hmac|signature|signingKey|keyMaterial)$"
+  ],
+  "setArrayPaths": [
+    "$.eligibleCandidateIds",
+    "$.blockedCandidateIds",
+    "$.residualRisks",
+    "$.verdicts"
+  ],
+  "rules": {
+    "objectKeys": "ordinal case-sensitive sort",
+    "numbers": "JSON numeric value",
+    "strings": "preserved exactly",
+    "ordinaryArrays": "preserve order",
+    "setArrays": "sort by normalized compact JSON"
+  }
+}

@@ -160,6 +160,10 @@ jobs:
         shell: pwsh
         run: ./tools/Test-Provider.ps1
 
+      - name: empty-to-null AST analyzer fixture measurement
+        shell: pwsh
+        run: ./tools/Test-PowerShellEmptyNullHazardAnalyzer.ps1
+
       - name: convention-pack schema and replay checks
         shell: pwsh
         run: ./tools/Test-ConventionPacks.ps1
@@ -202,6 +206,14 @@ jobs:
       - name: reviewer replay-qualification invocation checks
         shell: pwsh
         run: ./tools/Test-ReviewerReplayQualification.ps1
+
+      - name: reviewer deterministic adapter process and parser checks
+        shell: pwsh
+        run: ./tools/Test-ReviewerAdapterBehaviors.ps1
+
+      - name: exact-path deterministic reviewer orchestration
+        shell: pwsh
+        run: ./tools/Test-ReviewerExactPath.ps1
 
       - name: reviewer - offline replay is fail-closed and preview-only
         shell: pwsh

@@ -78,7 +78,7 @@ try {
     Write-Host "1/13 shipped synthetic snapshot" -ForegroundColor Cyan
     $snapshot = New-AgentReplaySnapshot -ReplayRoot $fixtureRoot -SnapshotName "synthetic-pr"
     Assert-Replay ($snapshot.SnapshotId -ceq "synthetic-pr") "The shipped fixture did not load under its own name."
-    Assert-Replay ($snapshot.ResourceCount -eq 7) "The shipped fixture should carry exactly 7 recorded reads."
+    Assert-Replay ($snapshot.ResourceCount -eq 8) "The shipped fixture should carry exactly 8 recorded reads."
     Assert-Replay ($snapshot.ManifestDigest -match '^[0-9a-f]{64}$') "The shipped fixture produced no manifest digest."
     Assert-Replay ($snapshot.ReplayNonce -match '^[0-9a-f]{36}$') "A loaded snapshot must mint a replay nonce."
     Assert-Replay ($snapshot.Binding.PullRequestId -eq 4242) "The shipped fixture is bound to the wrong pull request."

@@ -333,6 +333,16 @@ param(
     [ValidatePattern('^[0-9a-fA-F]{64}\z')]
     [string]$ReplayManifestDigest,
 
+    # Test-only subprocess seam. It is reachable only during an already-sealed,
+    # non-promotable offline replay and still feeds the ordinary production
+    # parser, retry, accounting, reconciliation, and delivery-decision code.
+    [switch]$EnableOfflineModelAdapter,
+
+    [string]$OfflineModelAdapterManifest,
+
+    [ValidatePattern('^[0-9a-fA-F]{40}\z')]
+    [string]$ExpectedReviewerBaseCommit,
+
     # Optional private capture seam for schema-v2 replay snapshots. The file is
     # canonical, identity-bound source evidence, not a delivery artifact.
     [string]$CaptureSourceTransportArtifactPath,
@@ -2805,6 +2815,69 @@ if ($ReplaySnapshotName -or $ReplayRoot -or $ReplayManifestDigest) {
         Write-Warning ("Replay snapshot '$ReplaySnapshotName' was captured under a different build of this agent; " +
             "a transport change since then can ask for reads the snapshot does not carry, which fails closed.")
     }
+}
+
+$offlineAdapterRequested = ([bool]$EnableOfflineModelAdapter -or
+    [bool]$OfflineModelAdapterManifest -or [bool]$ExpectedReviewerBaseCommit)
+$script:ReviewerOfflineModelAdapterActive = $false
+$script:ReviewerOfflineModelAdapterManifestPath = ""
+$script:ReviewerOfflineModelAdapterScriptPath = ""
+$script:ReviewerOfflineModelAdapterExpectedBaseCommit = ""
+if ($offlineAdapterRequested) {
+    if (-not $EnableOfflineModelAdapter -or -not $OfflineModelAdapterManifest -or
+        -not $ExpectedReviewerBaseCommit) {
+        throw ("The offline model adapter requires all of -EnableOfflineModelAdapter, " +
+            "-OfflineModelAdapterManifest, and -ExpectedReviewerBaseCommit.")
+    }
+    if (-not $script:ReviewerReplayActive) {
+        throw "The offline model adapter is test-only and may run only inside sealed offline replay."
+    }
+    if (-not (Test-Path -LiteralPath $OfflineModelAdapterManifest -PathType Leaf)) {
+        throw "Offline model adapter manifest '$OfflineModelAdapterManifest' does not exist."
+    }
+    $adapterManifestPath = (Resolve-Path -LiteralPath $OfflineModelAdapterManifest).Path
+    $adapterManifest = Get-Content -LiteralPath $adapterManifestPath -Raw | ConvertFrom-Json -Depth 64
+    $adapterKeys = @($adapterManifest.PSObject.Properties.Name | Sort-Object)
+    $expectedAdapterKeys = @(
+        "adapterScript", "adapterScriptSha256", "classification", "expectedBaseCommit",
+        "fixtureId", "kind", "roles", "schemaVersion"
+    ) | Sort-Object
+    if (($adapterKeys -join "`n") -cne ($expectedAdapterKeys -join "`n")) {
+        throw "Offline model adapter manifest has an unexpected top-level shape."
+    }
+    if ([int]$adapterManifest.schemaVersion -ne 1 -or
+        [string]$adapterManifest.kind -cne "reviewer-offline-model-adapter") {
+        throw "Offline model adapter manifest kind/version is unsupported."
+    }
+    if (-not [bool]$adapterManifest.classification.offlineOnly -or
+        -not [bool]$adapterManifest.classification.nonPromotable -or
+        [bool]$adapterManifest.classification.writesPermitted -or
+        -not [bool]$adapterManifest.classification.outputsPreAuthored -or
+        [bool]$adapterManifest.classification.oracleDerivedAtRuntime) {
+        throw "Offline model adapter classification is not sealed, pre-authored, and no-write."
+    }
+    $expectedBase = $ExpectedReviewerBaseCommit.ToLowerInvariant()
+    if ([string]$adapterManifest.expectedBaseCommit -cne $expectedBase) {
+        throw "Offline model adapter expected-base binding does not match -ExpectedReviewerBaseCommit."
+    }
+    $repoRootForCommit = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..\..")).Path
+    & git -C $repoRootForCommit merge-base --is-ancestor $expectedBase HEAD
+    if ($LASTEXITCODE -ne 0) {
+        throw "Expected reviewer base commit '$expectedBase' is not an ancestor of the running checkout."
+    }
+    $adapterScriptPath = Join-Path (Split-Path $adapterManifestPath -Parent) ([string]$adapterManifest.adapterScript)
+    if (-not (Test-Path -LiteralPath $adapterScriptPath -PathType Leaf)) {
+        throw "Offline model adapter script '$adapterScriptPath' does not exist."
+    }
+    $adapterScriptPath = (Resolve-Path -LiteralPath $adapterScriptPath).Path
+    $adapterScriptSha = (Get-FileHash -LiteralPath $adapterScriptPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($adapterScriptSha -cne [string]$adapterManifest.adapterScriptSha256) {
+        throw "Offline model adapter script SHA-256 does not match its manifest."
+    }
+    $script:ReviewerOfflineModelAdapterActive = $true
+    $script:ReviewerOfflineModelAdapterManifestPath = $adapterManifestPath
+    $script:ReviewerOfflineModelAdapterScriptPath = $adapterScriptPath
+    $script:ReviewerOfflineModelAdapterExpectedBaseCommit = $expectedBase
 }
 
 # The ordered pass list is the single source of truth for how many model runs a
@@ -9431,7 +9504,43 @@ function Get-ReviewerConventionSpecialistDiagnosticText {
         [void]$builder.Append($character)
         $bytes += $width
     }
+
     return $builder.ToString() + "`n[diagnostic text truncated]"
+}
+
+function Invoke-ReviewerModelSubprocess {
+    param(
+        [Parameter(Mandatory)][string]$AgencyPath,
+        [Parameter(Mandatory)][string[]]$AgencyArguments,
+        [Parameter(Mandatory)][string]$StandardInputContent,
+        [Parameter(Mandatory)][string]$Role,
+        [Parameter(Mandatory)][string]$Model,
+        [Parameter(Mandatory)][hashtable]$Binding,
+        [Parameter(Mandatory)][int]$TimeoutSeconds
+    )
+    if (-not $script:ReviewerOfflineModelAdapterActive) {
+        return Invoke-TimedProcess -FilePath $AgencyPath -ArgumentList $AgencyArguments `
+            -StandardInputContent $StandardInputContent -CaptureStdOut -CaptureStdErr `
+            -WorkingDirectory $RepoPath -EnvironmentVariablesToRemove $CopilotSensitiveEnvironmentVariables `
+            -TimeoutSeconds $TimeoutSeconds
+    }
+
+    $bindingJson = ConvertTo-Json -InputObject $Binding -Depth 16 -Compress
+    $bindingBase64 = [Convert]::ToBase64String($script:ReviewerUtf8.GetBytes($bindingJson))
+    $pwsh = Get-Command pwsh -ErrorAction Stop
+    $pwshPath = if ($pwsh.Path) { [string]$pwsh.Path } else { [string]$pwsh.Source }
+    $adapterArgs = @(
+        "-NoProfile", "-File", $script:ReviewerOfflineModelAdapterScriptPath,
+        "-ManifestPath", $script:ReviewerOfflineModelAdapterManifestPath,
+        "-Role", $Role,
+        "-Model", $Model,
+        "-ExpectedBaseCommit", $script:ReviewerOfflineModelAdapterExpectedBaseCommit,
+        "-BindingBase64", $bindingBase64
+    )
+    return Invoke-TimedProcess -FilePath $pwshPath -ArgumentList $adapterArgs `
+        -StandardInputContent $StandardInputContent -CaptureStdOut -CaptureStdErr `
+        -WorkingDirectory $RepoPath -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables `
+        -TimeoutSeconds $TimeoutSeconds
 }
 
 function Invoke-ReviewerConventionSpecialistPass {
@@ -9599,10 +9708,15 @@ function Invoke-ReviewerConventionSpecialistPass {
                     }
                     throw
                 }
-                $run = Invoke-TimedProcess -FilePath $AgencyPath -ArgumentList $agencyArgs `
-                    -StandardInputContent $specialistInput.Text -CaptureStdOut -CaptureStdErr -WorkingDirectory $RepoPath `
-                    -EnvironmentVariablesToRemove $CopilotSensitiveEnvironmentVariables `
-                    -TimeoutSeconds $ConventionSpecialistTimeoutSeconds
+                $run = Invoke-ReviewerModelSubprocess -AgencyPath $AgencyPath -AgencyArguments $agencyArgs `
+                    -StandardInputContent $specialistInput.Text -Role "specialist" `
+                    -Model $EffectiveConventionSpecialistModel -Binding @{
+                        nonce = $nonce; prId = $PrId; repositoryId = $cfgRepoId; project = $ExpectedProject
+                        reviewedSourceCommit = $SourceCommit; targetCommit = $targetCommit
+                        changeSetDigest = $changeSetDigest; conventionPlanSha256 = $conventionPlanSha256
+                        factPlanSha256 = $factPlanSha256; configSha256 = $ConfigSha256
+                        scriptSha256 = $ScriptSelfSha256; promptSha256 = $ConventionSpecialistPromptSha256
+                    } -TimeoutSeconds $ConventionSpecialistTimeoutSeconds
                 $cliOutcome = Get-AgentCliJsonOutcome -StdOutText ([string]$run.StdOut)
                 $specialistUsage = if ($cliOutcome -and $cliOutcome.Usage) { $cliOutcome.Usage } else { $null }
                 $specialistModelRan = [bool]($cliOutcome -and $cliOutcome.ModelActuallyRan)
@@ -10117,10 +10231,26 @@ function Invoke-ReviewerVerificationModelRun {
     $verificationScanWindow = Assert-ReviewerModelResultContractFits -Surface "cross-verifier ($VerifierModel)" `
         -Schema $verificationSchema -ScanWindowChars $script:ReviewerVerificationScanWindowChars `
         -MaxOutputBytes $script:ReviewerVerificationMaxOutputBytes
-    $run = Invoke-TimedProcess -FilePath $AgencyPath -ArgumentList $agencyArgs `
-        -StandardInputContent $modelInput.text -CaptureStdOut -CaptureStdErr -WorkingDirectory $RepoPath `
-        -EnvironmentVariablesToRemove $CopilotSensitiveEnvironmentVariables `
-        -TimeoutSeconds $TimeoutSeconds
+    $verifierRole = if ($VerifierModel -ceq $script:ReviewerGeneralistModelPair.First) {
+        "reciprocal-opus-verifier"
+    }
+    elseif ($VerifierModel -ceq $script:ReviewerGeneralistModelPair.Second) {
+        "reciprocal-gpt-verifier"
+    }
+    else {
+        "compatibility-verifier"
+    }
+    $run = Invoke-ReviewerModelSubprocess -AgencyPath $AgencyPath -AgencyArguments $agencyArgs `
+        -StandardInputContent $modelInput.text -Role $verifierRole -Model $VerifierModel `
+        -Binding @{
+            nonce = $nonce; prId = [int]$Binding.pullRequestId
+            repositoryId = [string]$Binding.repositoryId; project = $ExpectedProject
+            reviewedSourceCommit = [string]$Binding.sourceCommit
+            targetCommit = [string]$Binding.targetCommit; changeSetDigest = [string]$Binding.changeSetDigest
+            verificationInputSha256 = $InputManifestSha256; clusterId = [string]$Cluster.clusterId
+            configSha256 = [string]$Binding.configSha256; scriptSha256 = [string]$Binding.scriptSha256
+            promptSha256 = [string]$Binding.promptSha256; verifierModel = $VerifierModel
+        } -TimeoutSeconds $TimeoutSeconds
     $cliOutcome = Get-AgentCliJsonOutcome -StdOutText ([string]$run.StdOut)
     $markerSource = [string]$run.StdOut
     $requestedTools = @()
@@ -11517,9 +11647,21 @@ function Invoke-ReviewerModelPass {
         -Schema $markerSchema -ScanWindowChars $script:ReviewerMarkerScanWindowChars `
         -MaxOutputBytes $script:ReviewerMarkerMaxOutputBytes
 
-    $run = Invoke-TimedProcess -FilePath $AgencyPath -ArgumentList $agencyArgs -StandardInputContent $stdin `
-        -CaptureStdOut -CaptureStdErr -WorkingDirectory $RepoPath `
-        -EnvironmentVariablesToRemove $CopilotSensitiveEnvironmentVariables -TimeoutSeconds $CycleTimeoutSeconds
+    $generalistRole = if ($PassModel -ceq $script:ReviewerGeneralistModelPair.First) {
+        "blind-opus"
+    }
+    elseif ($PassModel -ceq $script:ReviewerGeneralistModelPair.Second) {
+        "blind-gpt"
+    }
+    else {
+        "compatibility-generalist"
+    }
+    $run = Invoke-ReviewerModelSubprocess -AgencyPath $AgencyPath -AgencyArguments $agencyArgs `
+        -StandardInputContent $stdin -Role $generalistRole -Model $PassModel `
+        -Binding @{
+            nonce = $nonce; prId = $prId; repositoryId = $cfgRepoId; project = $ExpectedProject
+            reviewedSourceCommit = $sourceCommit
+        } -TimeoutSeconds $CycleTimeoutSeconds
 
     # -- Marker validation (hostile input) ------------------------------------
     $markerSource = [string]$run.StdOut
@@ -14905,7 +15047,12 @@ if ($DryRun) {
     exit $selfCheckExit
 }
 
-$agencyCmd = Get-Command agency -ErrorAction SilentlyContinue
+$agencyCmd = if ($script:ReviewerOfflineModelAdapterActive) {
+    Get-Command pwsh -ErrorAction SilentlyContinue
+}
+else {
+    Get-Command agency -ErrorAction SilentlyContinue
+}
 if (-not $agencyCmd) {
     throw ("Agency CLI ('agency') was not found on PATH. Live cycles invoke Copilot through Agency, and the " +
         "Azure DevOps MCP server is reached the same way. Install Agency and re-run, or pass -DryRun to validate " +
