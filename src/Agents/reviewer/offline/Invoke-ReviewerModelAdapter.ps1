@@ -84,7 +84,11 @@ function Get-AllConstructIds {
     if (-not $request) { return '' }
     $changed = $request.Value.PSObject.Properties['changedConstructs']
     if (-not $changed) { return '' }
-    return (@($changed.Value | ForEach-Object { [string]$_.id } | Where-Object { $_ }) -join ',')
+    return (@($changed.Value | ForEach-Object {
+                if ($null -eq $_) { return }
+                $idProperty = $_.PSObject.Properties['id']
+                if ($idProperty) { [string]$idProperty.Value }
+            } | Where-Object { $_ }) -join ',')
 }
 
 try {
@@ -150,14 +154,31 @@ try {
             $marker.nonce = 'wrong-binding'
             $markerJson = ConvertTo-Json -InputObject $marker -Depth 64 -Compress
         }
+        if ($behavior -eq 'schemaInvalidMarker') {
+            # Inject an unexpected key so the exact production result-marker parser
+            # classifies the payload as 'schemaInvalid' (an unexpected key), distinct
+            # from 'wrongBinding' (an exact field carrying a wrong value). Role-generic:
+            # every role's marker schema forbids additional keys.
+            $marker | Add-Member -NotePropertyName 'unexpectedSchemaKey' -NotePropertyValue 'x' -Force
+            $markerJson = ConvertTo-Json -InputObject $marker -Depth 64 -Compress
+        }
         $answer = "$([string]$roleSpec.markerPrefix) $markerJson"
         if ($behavior -eq 'multipleMarkers') { $answer = "$answer`n$answer" }
     }
 
     if ($behavior -in 'stdoutSaturation', 'stderrSaturation') { exit 0 }
+    # The reported CLI-envelope model is the run model unless the role pre-authors a
+    # reportedModelOverride, which drives the verifier's exact-production modelMismatch
+    # classification (the envelope model != the authorized verifier model). This never
+    # changes which model the subprocess is; only the reported identity in the envelope.
+    $reportedModel = $Model
+    if ($roleSpec.PSObject.Properties['reportedModelOverride']) {
+        $override = [string]$roleSpec.reportedModelOverride
+        if ($override) { $reportedModel = $override }
+    }
     [pscustomobject]@{
         type = 'assistant.message'
-        data = [pscustomobject]@{ content = $answer; model = $Model }
+        data = [pscustomobject]@{ content = $answer; model = $reportedModel }
     } | ConvertTo-Json -Compress -Depth 8
     [pscustomobject]@{
         type = 'result'

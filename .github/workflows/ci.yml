@@ -219,6 +219,14 @@ jobs:
         shell: pwsh
         run: ./tools/Test-ReviewerStructuralCoverage.ps1
 
+      # Blinded transcript acquisition: the outer supervisor and the reviewer's
+      # gated acquisition mode, driven only by the sealed offline stub adapter.
+      # Offline and deterministic: no network, no ADO/GitHub, no provider process,
+      # no real model - it captures raw stimulus and seals an oracle-free package.
+      - name: blinded transcript acquisition runner
+        shell: pwsh
+        run: ./tools/Test-ReviewerBlindedAcquisition.ps1
+
       - name: reviewer - offline replay is fail-closed and preview-only
         shell: pwsh
         run: |

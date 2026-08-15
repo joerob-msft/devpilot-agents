@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "reviewer.blinded-fixture-projection.v1",
+  "title": "Reviewer blinded fixture projection",
+  "description": "A role-scoped projection of the exact model-input context a reviewer role would receive, with NO expected decision, oracle, adjudication, or delivery-eligibility field. It is stimulus only: the acquisition runner reuses the production prompt builders to turn these fields into the real model input and never compares them to an answer.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "kind", "fixtureId", "role", "binding"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "kind": { "const": "reviewer-blinded-fixture-projection" },
+    "fixtureId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+    "role": { "enum": ["generalist", "specialist", "verifier"] },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prId", "repositoryId", "project", "sourceCommit", "targetCommit", "changeSetDigest"],
+      "properties": {
+        "prId": { "type": "integer", "minimum": 1 },
+        "repositoryId": { "type": "string", "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$" },
+        "project": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-fA-F]{40}$" },
+        "targetCommit": { "type": "string", "pattern": "^[0-9a-fA-F]{40}$" },
+        "changeSetDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "generalist": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceBranch", "authorAlias", "title", "threadDigestText"],
+      "properties": {
+        "sourceBranch": { "type": "string", "minLength": 1, "maxLength": 400 },
+        "authorAlias": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "title": { "type": "string", "maxLength": 400 },
+        "threadDigestText": { "type": "string", "minLength": 1, "maxLength": 65536 },
+        "authoritativeSourcesText": { "type": "string", "maxLength": 262144 },
+        "pinnedSourceText": { "type": "string", "maxLength": 1048576 }
+      }
+    },
+    "specialist": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["conventionPlanJson"],
+      "properties": {
+        "conventionPlanJson": { "type": "string", "minLength": 1, "maxLength": 4194304 },
+        "factPlanJson": { "type": "string", "maxLength": 4194304 }
+      }
+    },
+    "verifier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["targetCommit", "changeSetDigest", "configSha256", "scriptSha256", "promptSha256"],
+      "properties": {
+        "targetCommit": { "type": "string", "pattern": "^[0-9a-fA-F]{40}$" },
+        "changeSetDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "configSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "scriptSha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+        "promptSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    }
+  }
+}

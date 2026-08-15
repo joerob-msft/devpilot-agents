@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "reviewer.acquisition-plan.v1",
+  "title": "Reviewer blinded acquisition plan",
+  "description": "The single authorization for exactly one blinded transcript acquisition: one role, one model, one blinded fixture projection (bound by SHA-256), one sealed non-promotable replay snapshot (bound by manifest digest), and a cryptographically random authorization token stored ONLY as its SHA-256. The plan carries no oracle and permits no write. A fresh role requires a fresh authorized plan.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "kind",
+    "planId",
+    "createdUtc",
+    "role",
+    "model",
+    "fixtureId",
+    "fixtureProjectionSha256",
+    "snapshotName",
+    "snapshotManifestDigest",
+    "expectedBaseCommit",
+    "expectedRef",
+    "expectedHeadCommit",
+    "repoPath",
+    "outputRoot",
+    "configSha256",
+    "authorizationTokenSha256",
+    "nonce",
+    "target",
+    "classification"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "kind": { "const": "reviewer-blinded-acquisition-plan" },
+    "planId": { "type": "string", "pattern": "^[0-9a-f]{16,64}$" },
+    "createdUtc": { "type": "string", "format": "date-time" },
+    "role": { "enum": ["generalist", "specialist", "verifier"] },
+    "model": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "fixtureId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+    "fixtureProjectionSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "snapshotName": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+    "snapshotManifestDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "expectedBaseCommit": { "type": "string", "pattern": "^[0-9a-fA-F]{40}$" },
+    "expectedRef": { "type": "string", "minLength": 1, "maxLength": 400 },
+    "expectedHeadCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "repoPath": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "outputRoot": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "configSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "authorizationTokenSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "nonce": { "type": "string", "pattern": "^[0-9a-f]{16,64}$" },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidateInputSha256", "sourceFixtureId", "sourceModel", "sourceRole", "clusterId", "clusterHash"],
+      "properties": {
+        "candidateInputSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "sourceFixtureId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+        "sourceModel": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "sourceRole": { "enum": ["generalist", "specialist"] },
+        "clusterId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "clusterHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "discovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["packageManifestSha256", "markerSha256", "sourceModel", "sourceRole", "sourceFixtureId", "candidateExtractionHash", "resultMarkerPrefix", "resultMarkerBinding"],
+      "properties": {
+        "packageManifestSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "markerSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "sourceModel": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "sourceRole": { "const": "generalist" },
+        "sourceFixtureId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+        "candidateExtractionHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "resultMarkerPrefix": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "resultMarkerBinding": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["prId", "repositoryId", "project", "sourceCommit"],
+          "properties": {
+            "prId": { "type": "integer", "minimum": 1 },
+            "repositoryId": { "type": "string", "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$" },
+            "project": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "sourceCommit": { "type": "string", "pattern": "^[0-9a-fA-F]{40}$" }
+          }
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prId", "repositoryId", "project", "sourceCommit", "targetCommit", "changeSetDigest"],
+      "properties": {
+        "prId": { "type": "integer", "minimum": 1 },
+        "repositoryId": { "type": "string", "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$" },
+        "project": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-fA-F]{40}$" },
+        "targetCommit": { "type": "string", "pattern": "^[0-9a-fA-F]{40}$" },
+        "changeSetDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "classification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["blinded", "oracleFree", "nonPromotable", "writesPermitted", "acquisitionOnly"],
+      "properties": {
+        "blinded": { "const": true },
+        "oracleFree": { "const": true },
+        "nonPromotable": { "const": true },
+        "writesPermitted": { "const": false },
+        "acquisitionOnly": { "const": true }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "role": { "const": "verifier" } } },
+      "then": { "required": ["candidate", "discovery"] }
+    }
+  ]
+}
