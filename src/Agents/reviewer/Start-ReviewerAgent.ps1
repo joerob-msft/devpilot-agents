@@ -370,6 +370,12 @@ param(
     # metadata would still miss everything decided by the body below.
     [switch]$QualificationPrelaunch,
 
+    # In-process configuration contract validation for no-process callers.
+    [switch]$ValidateConfigurationOnly,
+
+    [ValidateSet("generalist", "specialist", "verifier")]
+    [string]$ValidateConfigurationRole,
+
     # --- Blinded transcript acquisition. Captures ONE model transcript for a
     # single declared role against a sealed, non-promotable replay snapshot,
     # reusing the EXACT production prompt construction, result-marker parser,
@@ -2704,6 +2710,81 @@ foreach ($a in @($AuthorAliases)) {
     if ($a -notmatch '^[A-Za-z0-9._-]+$') { throw "-AuthorAliases entry '$a' is not a safe alias." }
 }
 
+if ($ValidateConfigurationOnly) {
+    if (-not $ValidateConfigurationRole) {
+        throw "-ValidateConfigurationOnly requires -ValidateConfigurationRole."
+    }
+    if (-not $Model) { throw "-ValidateConfigurationOnly requires the eventual primary -Model." }
+    $validatedPrimaryModel = Assert-AgentSupportedModel -ModelId $Model -Where "configuration validation primary model"
+    if ($CfgConventionSpecialistModel) {
+        [void](Assert-AgentSupportedModel -ModelId $CfgConventionSpecialistModel -Where "config convention specialist model")
+    }
+    if ($CfgVerificationEnabled) {
+        if (-not $CfgConventionVerifierModel) {
+            throw "Enabled config.review.verification requires conventionVerifierModel."
+        }
+        [void](Assert-AgentSupportedModel -ModelId $CfgConventionVerifierModel -Where "config convention verifier model")
+    }
+    if ($ValidateConfigurationRole -cin @("specialist", "verifier")) {
+        if (-not $SecondPassModel) {
+            throw "$ValidateConfigurationRole configuration validation requires the eventual -SecondPassModel."
+        }
+        $validatedSecondModel = Assert-AgentSupportedModel -ModelId $SecondPassModel `
+            -Where "configuration validation second generalist model"
+        if ($validatedSecondModel -ceq $validatedPrimaryModel) {
+            throw "Configuration validation requires distinct generalist models."
+        }
+        if (-not $ConventionSpecialistModel) {
+            throw "$ValidateConfigurationRole configuration validation requires the eventual -ConventionSpecialistModel."
+        }
+        [void](Assert-AgentSupportedModel -ModelId $ConventionSpecialistModel `
+                -Where "configuration validation convention specialist model")
+        if (-not $ConventionPackPolicy) {
+            throw "$ValidateConfigurationRole configuration validation requires config.repoConventions.conventionPacks."
+        }
+        $missingSpecialistPermissions = @($script:ReviewerConventionSpecialistAllowToolCeiling | Where-Object {
+                $ConfigAllowTools -cnotcontains $_
+            })
+        if ($missingSpecialistPermissions.Count -gt 0) {
+            throw ("$ValidateConfigurationRole configuration validation is missing required specialist permissions: " +
+                ($missingSpecialistPermissions -join ', '))
+        }
+    }
+    if ($ValidateConfigurationRole -ceq "verifier") {
+        if (-not (Test-AgentGeneralistModelPair -Models @($validatedPrimaryModel, $validatedSecondModel))) {
+            throw ("Verifier configuration validation requires the explicit " +
+                "$($script:ReviewerGeneralistModelPair.First) and " +
+                "$($script:ReviewerGeneralistModelPair.Second) generalist pairing.")
+        }
+        if ($ConventionSpecialistModel -ceq $validatedPrimaryModel -or
+            $ConventionSpecialistModel -ceq $validatedSecondModel) {
+            throw "Verifier configuration validation requires a specialist model distinct from both generalists."
+        }
+        if (-not $ConventionVerifierModel) {
+            throw "Verifier configuration validation requires the eventual -ConventionVerifierModel."
+        }
+        [void](Assert-AgentSupportedModel -ModelId $ConventionVerifierModel `
+                -Where "configuration validation convention verifier model")
+        $missingVerifierPermissions = @($script:ReviewerVerificationAllowToolCeiling | Where-Object {
+                $ConfigAllowTools -cnotcontains $_
+            })
+        if ($missingVerifierPermissions.Count -gt 0) {
+            throw ("Verifier configuration validation is missing required verifier permissions: " +
+                ($missingVerifierPermissions -join ', '))
+        }
+    }
+    [pscustomobject]@{
+        kind = "reviewer-configuration-readiness"
+        valid = $true
+        configFile = $ConfigFile
+        promptFile = [string]$ConfigLoad.PromptFilePath
+        provider = $provider
+        project = $cfgProject
+        repositoryId = $cfgRepoId.ToLowerInvariant()
+    }
+    return
+}
+
 # ---------------------------------------------------------------------------
 # Qualification prelaunch. A strictly earlier exit on the normal path: every
 # validation below still runs, and the process stops immediately before the
@@ -2927,6 +3008,8 @@ $script:ReviewerOfflineModelAdapterExpectedBaseCommit = ""
 # never persists the binding base64 or any credential.
 $script:ReviewerAcquisitionActive = $false
 $script:ReviewerAcquisitionCaptures = [System.Collections.Generic.List[object]]::new()
+$script:ReviewerAcquisitionExpectedConventionPlan = $null
+$script:ReviewerAcquisitionExpectedFactPlan = $null
 # When acquisition drives the exact production cycle for the specialist role, the
 # guard in Invoke-ReviewerPullRequest dispatches to ONLY that role and returns
 # before any discovery pass, the cross-verification run, or delivery. Empty unless
@@ -3291,6 +3374,7 @@ $artifactKeyPath = Join-Path $StateDir "artifact-signing.key"
 
 $ScriptSelfSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
 $ConfigSha256 = (Get-FileHash -LiteralPath $ConfigFile -Algorithm SHA256).Hash
+$PromptFileSha256 = (Get-FileHash -LiteralPath $PromptFile -Algorithm SHA256).Hash.ToLowerInvariant()
 $ConventionSpecialistPromptSha256 = (Get-FileHash -LiteralPath $ConventionSpecialistPromptPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $ConventionSpecialistLibrarySha256 = (Get-FileHash -LiteralPath $ConventionSpecialistLibrary -Algorithm SHA256).Hash.ToLowerInvariant()
 $CrossVerificationPromptSha256 = (Get-FileHash -LiteralPath $CrossVerificationPromptPath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -9864,6 +9948,23 @@ function Invoke-ReviewerConventionSpecialistPass {
         }
         $conventionPlan = Read-ReviewerConventionPlan -Path $ConventionPlanPath
         $factPlan = Read-ReviewerFactPlan -Path $FactPlanPath
+        if ($script:ReviewerAcquisitionActive -and
+            [string]$script:ReviewerAcquisitionTargetRole -ceq "specialist") {
+            if ($null -eq $script:ReviewerAcquisitionExpectedConventionPlan -or
+                $null -eq $script:ReviewerAcquisitionExpectedFactPlan) {
+                throw "Specialist acquisition requires exact sealed convention and fact plan provenance."
+            }
+            $actualConventionHash = Get-ReviewerVerificationObjectSha256 -Value $conventionPlan
+            $expectedConventionHash = Get-ReviewerVerificationObjectSha256 `
+                -Value $script:ReviewerAcquisitionExpectedConventionPlan
+            $actualFactHash = Get-ReviewerVerificationObjectSha256 -Value $factPlan
+            $expectedFactHash = Get-ReviewerVerificationObjectSha256 `
+                -Value $script:ReviewerAcquisitionExpectedFactPlan
+            if ($actualConventionHash -cne $expectedConventionHash -or
+                $actualFactHash -cne $expectedFactHash) {
+                throw "Production-generated specialist plans do not exactly match the sealed role projection."
+            }
+        }
         $conventionPlanSha256 = Get-ReviewerConventionSpecialistObjectSha256 -Value $conventionPlan
         $factPlanSha256 = [string](Get-ReviewerFactValue $factPlan "planSha256" "")
         $packNames = @((Get-ReviewerConventionSpecialistValue $conventionPlan "selectedPacks" @()) | ForEach-Object {
@@ -15689,6 +15790,22 @@ function Invoke-ReviewerBlindedAcquisitionRun {
     }
     $projection = $projectionText | ConvertFrom-Json -Depth 64
     Assert-ReviewerAcquisitionNoForbiddenKeys -Node $projection -Surface "The blinded fixture projection"
+    if ($projection.PSObject.Properties["specialist"] -and $projection.specialist) {
+        foreach ($name in @("conventionPlanJson", "factPlanJson")) {
+            if (-not $projection.specialist.PSObject.Properties[$name] -or
+                [string]::IsNullOrWhiteSpace([string]$projection.specialist.$name)) { continue }
+            try { $decodedRoleJson = ([string]$projection.specialist.$name) | ConvertFrom-Json -Depth 64 -ErrorAction Stop }
+            catch { throw "The blinded fixture projection specialist.$name is not valid JSON." }
+            Assert-ReviewerAcquisitionNoForbiddenKeys -Node $decodedRoleJson `
+                -Surface "The blinded fixture projection specialist.$name decoded JSON"
+            if ($name -ceq "conventionPlanJson") {
+                $script:ReviewerAcquisitionExpectedConventionPlan = $decodedRoleJson
+            }
+            else {
+                $script:ReviewerAcquisitionExpectedFactPlan = $decodedRoleJson
+            }
+        }
+    }
     $projectionSha256 = Get-ReviewerTextSha256 -Text $projectionText
     if ($projectionSha256 -cne [string]$plan.fixtureProjectionSha256) {
         throw "The blinded fixture projection SHA-256 does not match the plan's binding."
@@ -15762,6 +15879,33 @@ function Invoke-ReviewerBlindedAcquisitionRun {
     if ($plan.PSObject.Properties['configSha256'] -and [string]$plan.configSha256) {
         if (([string]$plan.configSha256).ToLowerInvariant() -cne ([string]$ConfigSha256).ToLowerInvariant()) {
             throw "The running config SHA-256 does not match the plan's bound configSha256."
+        }
+    }
+    if ([string]$script:ReviewerReplaySnapshot.Classification.SealKind -ceq "benchmarkPackMaterialization") {
+        $materialization = $script:ReviewerReplaySnapshot.Classification.Sidecar
+        if ($null -eq $materialization) {
+            throw "The benchmark-pack replay has no validated materialization sidecar."
+        }
+        foreach ($identityCheck in @(
+                @("fixtureId", [string]$projection.fixtureId),
+                @("role", $AcquireTranscriptRole),
+                @("projectionSha256", $projectionSha256))) {
+            $name = [string]$identityCheck[0]
+            if (-not $materialization.PSObject.Properties[$name] -or
+                [string]$materialization.PSObject.Properties[$name].Value -cne [string]$identityCheck[1]) {
+                throw "The benchmark-pack materialization sidecar does not bind the running $name."
+            }
+        }
+        foreach ($bindingCheck in @(
+                @("configSha256", [string]$ConfigSha256),
+                @("promptSha256", [string]$PromptFileSha256),
+                @("reviewerScriptSha256", [string]$ScriptSelfSha256))) {
+            $name = [string]$bindingCheck[0]
+            if (-not $materialization.PSObject.Properties[$name] -or
+                ([string]$materialization.PSObject.Properties[$name].Value).ToLowerInvariant() -cne
+                    ([string]$bindingCheck[1]).ToLowerInvariant()) {
+                throw "The benchmark-pack materialization sidecar does not bind the running $name."
+            }
         }
     }
 
@@ -16155,6 +16299,8 @@ function Invoke-ReviewerBlindedAcquisitionRun {
             finally {
                 $script:ReviewerAcquisitionActive = $false
                 $script:ReviewerAcquisitionTargetRole = ''
+                $script:ReviewerAcquisitionExpectedConventionPlan = $null
+                $script:ReviewerAcquisitionExpectedFactPlan = $null
             }
             # The production pass's OWN completeness classifies whether a marker landed.
             $rolePassResult = $script:ReviewerAcquisitionRolePassResult

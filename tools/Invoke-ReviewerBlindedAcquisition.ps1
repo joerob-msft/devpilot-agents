@@ -151,6 +151,13 @@ param(
     [Parameter(ParameterSetName = 'Acquire')]
     [switch]$UseOfflineStubAdapter,
 
+    # Validate the complete acquisition declaration and emit typed readiness JSON
+    # without minting a token or plan, taking a lease, creating state, or starting
+    # any process. This deliberately remains in the Acquire parameter set so the
+    # exact same required inputs and validation path are exercised.
+    [Parameter(ParameterSetName = 'Acquire')]
+    [switch]$Preflight,
+
     [Parameter(Mandatory)]
     [string]$OutputRoot,
 
@@ -297,16 +304,99 @@ function Assert-AcquisitionSchema {
     }
 }
 
+function Get-AcquisitionGitLayout {
+    param([Parameter(Mandatory)][string]$RepositoryRoot)
+    $dotGit = Join-Path $RepositoryRoot '.git'
+    if (Test-Path -LiteralPath $dotGit -PathType Container) {
+        return [pscustomobject]@{ GitDirectory = (Resolve-Path -LiteralPath $dotGit).Path; CommonDirectory = (Resolve-Path -LiteralPath $dotGit).Path }
+    }
+    if (-not (Test-Path -LiteralPath $dotGit -PathType Leaf)) {
+        throw "RepoPath '$RepositoryRoot' is not a git worktree."
+    }
+    $pointer = [IO.File]::ReadAllText($dotGit, $Utf8).Trim()
+    if ($pointer -notmatch '^gitdir:\s*(.+)$') { throw "RepoPath '$RepositoryRoot' has an invalid .git pointer." }
+    $gitDirectory = $Matches[1]
+    if (-not [IO.Path]::IsPathRooted($gitDirectory)) {
+        $gitDirectory = Join-Path $RepositoryRoot $gitDirectory
+    }
+    $gitDirectory = [IO.Path]::GetFullPath($gitDirectory)
+    if (-not (Test-Path -LiteralPath $gitDirectory -PathType Container)) {
+        throw "RepoPath '$RepositoryRoot' points to a missing git directory."
+    }
+    $commonDirectory = $gitDirectory
+    $commonPointer = Join-Path $gitDirectory 'commondir'
+    if (Test-Path -LiteralPath $commonPointer -PathType Leaf) {
+        $commonValue = [IO.File]::ReadAllText($commonPointer, $Utf8).Trim()
+        $commonDirectory = if ([IO.Path]::IsPathRooted($commonValue)) {
+            [IO.Path]::GetFullPath($commonValue)
+        }
+        else { [IO.Path]::GetFullPath((Join-Path $gitDirectory $commonValue)) }
+    }
+    if (-not (Test-Path -LiteralPath $commonDirectory -PathType Container)) {
+        throw "RepoPath '$RepositoryRoot' points to a missing common git directory."
+    }
+    return [pscustomobject]@{ GitDirectory = $gitDirectory; CommonDirectory = $commonDirectory }
+}
+
+function Resolve-AcquisitionGitRef {
+    param(
+        [Parameter(Mandatory)]$Layout,
+        [Parameter(Mandatory)][string]$Ref,
+        [int]$Depth = 0
+    )
+    if ($Depth -gt 8 -or $Ref -notmatch '^refs/[A-Za-z0-9._/-]+$' -or
+        $Ref -match '(^|/)\.\.?(/|$)|//|[\\]') {
+        throw "Git ref '$Ref' is not a safe full ref."
+    }
+    foreach ($root in @([string]$Layout.GitDirectory, [string]$Layout.CommonDirectory) | Select-Object -Unique) {
+        $candidate = Join-Path $root ($Ref -replace '/', [IO.Path]::DirectorySeparatorChar)
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $value = [IO.File]::ReadAllText($candidate, $Utf8).Trim()
+            if ($value -match '^ref:\s*(refs/.+)$') {
+                return Resolve-AcquisitionGitRef -Layout $Layout -Ref $Matches[1] -Depth ($Depth + 1)
+            }
+            if ($value -match '^[0-9a-fA-F]{40}$') { return $value.ToLowerInvariant() }
+            throw "Git ref '$Ref' does not contain a commit object id."
+        }
+    }
+    $packedRefs = Join-Path ([string]$Layout.CommonDirectory) 'packed-refs'
+    if (Test-Path -LiteralPath $packedRefs -PathType Leaf) {
+        foreach ($line in [IO.File]::ReadAllLines($packedRefs, $Utf8)) {
+            if ($line.StartsWith('#') -or $line.StartsWith('^')) { continue }
+            $parts = $line.Split(' ', 2, [StringSplitOptions]::RemoveEmptyEntries)
+            if ($parts.Count -eq 2 -and $parts[1] -ceq $Ref -and $parts[0] -match '^[0-9a-fA-F]{40}$') {
+                return $parts[0].ToLowerInvariant()
+            }
+        }
+    }
+    throw "Expected ref '$Ref' does not resolve to a commit in this worktree."
+}
+
+function Get-AcquisitionGitHead {
+    param([Parameter(Mandatory)]$Layout)
+    $headPath = Join-Path ([string]$Layout.GitDirectory) 'HEAD'
+    if (-not (Test-Path -LiteralPath $headPath -PathType Leaf)) { throw 'Git HEAD is missing.' }
+    $headValue = [IO.File]::ReadAllText($headPath, $Utf8).Trim()
+    if ($headValue -match '^ref:\s*(refs/.+)$') {
+        return Resolve-AcquisitionGitRef -Layout $Layout -Ref $Matches[1]
+    }
+    if ($headValue -match '^[0-9a-fA-F]{40}$') { return $headValue.ToLowerInvariant() }
+    throw 'Git HEAD does not contain a commit object id or symbolic ref.'
+}
+
 function Get-AcquisitionSealKeyPath {
     if ($SealKeyPath) { return $SealKeyPath }
     $dir = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.devpilot'
-    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    if (-not $Preflight) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
     return (Join-Path $dir 'reviewer-acquisition-seal.key')
 }
 
 function Get-AcquisitionSealKey {
     $path = Get-AcquisitionSealKeyPath
     if (-not (Test-Path -LiteralPath $path)) {
+        if ($Preflight) {
+            throw "Preflight will not create the acquisition seal key '$path'; supply an existing -SealKeyPath."
+        }
         $bytes = New-Object byte[] 32
         [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
         [IO.File]::WriteAllBytes($path, $bytes)
@@ -679,42 +769,46 @@ if ($PSCmdlet.ParameterSetName -eq 'Verify') {
 $outputRootFull = [IO.Path]::GetFullPath($OutputRoot)
 $outputParent = [IO.Path]::GetDirectoryName($outputRootFull)
 if (-not $outputParent -or -not (Test-Path -LiteralPath $outputParent -PathType Container)) {
-    throw "The acquisition output root's parent directory must already exist so the launch lease can be the first mutation."
+    throw "The acquisition output root's parent directory must already exist."
 }
 
-# -- Atomic CreateNew launch lease: the FIRST mutation -------------------------
-# The authoritative lease is a parent-sidecar keyed by the canonical output-root
-# path. It is created before the output root itself, so a losing concurrent
-# invocation mutates neither the root nor any artifact beneath it. Acquisition
-# never resumes, replaces, or auto-advances a consumed lease; the sidecar persists
-# for that reason. The stream is held open (FileShare.None) for the whole run.
 $outputLeaf = [IO.Path]::GetFileName($outputRootFull.TrimEnd(
         [IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar))
 $leaseKey = (Get-Sha256Hex -Text $outputRootFull).Substring(0, 16)
 $leasePath = Join-Path $outputParent (".$outputLeaf.$leaseKey.acquisition.lease")
 $leaseStream = $null
-try {
-    $leaseStream = [IO.File]::Open($leasePath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-}
-catch {
+if (Test-Path -LiteralPath $leasePath) {
     throw "A launch lease already exists at '$leasePath'; acquisition never resumes, replaces or auto-advances a consumed lease."
 }
-
 if (Test-Path -LiteralPath $outputRootFull) {
     if (@(Get-ChildItem -LiteralPath $outputRootFull -Force).Count -gt 0) {
         throw "Acquisition output root '$outputRootFull' must be empty or new."
     }
 }
-else { New-Item -ItemType Directory -Path $outputRootFull | Out-Null }
 
 $packageDir = Join-Path $outputRootFull 'package'
 $workDir = Join-Path $outputRootFull 'work'
 $stateDir = Join-Path $workDir 'reviewer-state'
-New-Item -ItemType Directory -Force -Path $packageDir, $workDir, $stateDir | Out-Null
 $telemetryPath = Join-Path $workDir 'telemetry.jsonl'
 $planPath = Join-Path $workDir 'acquisition-plan.json'
 $stdOutPath = Join-Path $workDir 'reviewer-stdout.log'
 $stdErrPath = Join-Path $workDir 'reviewer-stderr.log'
+
+# Preserve Acquire's original consumed-identity semantics: its lease remains the
+# first mutation and failed validation consumes that output identity. Preflight
+# alone stays entirely before this boundary and creates nothing.
+if (-not $Preflight) {
+    try {
+        $leaseStream = [IO.File]::Open($leasePath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    }
+    catch {
+        throw "A launch lease already exists at '$leasePath'; acquisition never resumes, replaces or auto-advances a consumed lease."
+    }
+    if (-not (Test-Path -LiteralPath $outputRootFull)) {
+        New-Item -ItemType Directory -Path $outputRootFull | Out-Null
+    }
+    New-Item -ItemType Directory -Force -Path $packageDir, $workDir, $stateDir | Out-Null
+}
 
 foreach ($needed in @($ReviewerScript, $ConfigFile, $FixtureProjectionFile, $HarnessModule)) {
     if (-not (Test-Path -LiteralPath $needed -PathType Leaf)) { throw "Required input '$needed' does not exist." }
@@ -739,6 +833,16 @@ $projectionText = [IO.File]::ReadAllText($projectionFull, $Utf8)
 Assert-AcquisitionSchema -JsonText $projectionText -SchemaName 'fixture-projection.schema.json' -Surface 'The blinded fixture projection'
 $projection = $projectionText | ConvertFrom-Json -Depth 64
 Assert-AcquisitionNoForbiddenKeys -Node $projection -Surface 'The blinded fixture projection'
+if ($projection.PSObject.Properties['specialist'] -and $projection.specialist) {
+    foreach ($name in @('conventionPlanJson', 'factPlanJson')) {
+        if (-not $projection.specialist.PSObject.Properties[$name] -or
+            [string]::IsNullOrWhiteSpace([string]$projection.specialist.$name)) { continue }
+        try { $decodedRoleJson = ([string]$projection.specialist.$name) | ConvertFrom-Json -Depth 64 -ErrorAction Stop }
+        catch { throw "The blinded fixture projection specialist.$name is not valid JSON." }
+        Assert-AcquisitionNoForbiddenKeys -Node $decodedRoleJson `
+            -Surface "The blinded fixture projection specialist.$name decoded JSON"
+    }
+}
 if ([string]$projection.role -cne $Role) { throw "The projection is role '$($projection.role)', not the requested '$Role'." }
 $projectionSha256 = Get-Sha256Hex -Text $projectionText
 
@@ -748,7 +852,23 @@ Import-Module $HarnessModule -Force -ErrorAction Stop
 if (-not (Get-Command Assert-AgentSupportedModel -ErrorAction SilentlyContinue)) {
     throw "The agent harness does not export Assert-AgentSupportedModel; the model cannot be validated through the registry."
 }
-Assert-AgentSupportedModel -Model $Model
+[void](Assert-AgentSupportedModel -Model $Model)
+
+if ($Role -eq 'specialist') {
+    if (-not $DiscoveryGeneralistModel) { throw "Specialist acquisition requires -DiscoveryGeneralistModel (the configured generalist first-pass model)." }
+    if (-not $SecondGeneralistModel) { throw "Specialist acquisition requires -SecondGeneralistModel (the configured generalist model pair)." }
+    [void](Assert-AgentSupportedModel -Model $DiscoveryGeneralistModel)
+    [void](Assert-AgentSupportedModel -Model $SecondGeneralistModel)
+}
+elseif ($Role -eq 'verifier') {
+    if (-not $SecondGeneralistModel) { throw "Verifier acquisition requires -SecondGeneralistModel (the second configured generalist model)." }
+    if (-not $ConventionSpecialistModel) { throw "Verifier acquisition requires -ConventionSpecialistModel (the configured convention specialist model)." }
+    if ($ConventionVerifierModel -and ([string]$ConventionVerifierModel -cne [string]$Model)) {
+        throw "Verifier acquisition captures exactly the authorized -Model '$Model'; a differing -ConventionVerifierModel '$ConventionVerifierModel' is refused."
+    }
+    [void](Assert-AgentSupportedModel -Model $SecondGeneralistModel)
+    [void](Assert-AgentSupportedModel -Model $ConventionSpecialistModel)
+}
 
 # -- Canonical target identity from the authoritative sealed replay Bound ------
 # The sealed replay snapshot manifest is the single source of truth for the PR /
@@ -765,6 +885,89 @@ if (-not (Test-Path -LiteralPath $replayManifestPath -PathType Leaf)) {
     throw "The sealed replay snapshot '$ReplaySnapshotName' has no manifest at '$replayManifestPath'."
 }
 $replayManifest = ([IO.File]::ReadAllText($replayManifestPath, $Utf8)) | ConvertFrom-Json -Depth 32
+# Preflight must prove the complete replay is production-loadable without
+# launching the child. Acquire deliberately leaves the pinned-digest enforcement
+# to the child so a replay-load crash is sealed as terminal evidence.
+$validatedReplay = if ($Preflight) {
+    New-AgentReplaySnapshot -ReplayRoot $replayRootFull -SnapshotName $ReplaySnapshotName `
+        -ExpectedManifestDigest $ReplayManifestDigest
+}
+else { $null }
+if ($Preflight) {
+    if (-not [bool]$validatedReplay.Classification.NonPromotable) {
+        throw "Preflight requires a classified non-promotable replay snapshot."
+    }
+    $validatedConfig = Get-AgentConfig -Path $configFull -AgentDir (Split-Path $reviewerScriptFull -Parent) `
+        -SupportedSchemaVersions @(1) -PromptFileField 'promptFile'
+    $validationPrimaryModel = if ($Role -ceq 'specialist') { $DiscoveryGeneralistModel } else { $Model }
+    $configurationValidationArgs = @{
+        ConfigFile = $configFull
+        OperatorAlias = $OperatorAlias
+        ValidateConfigurationOnly = $true
+        ValidateConfigurationRole = $Role
+        Model = $validationPrimaryModel
+    }
+    if ($Role -cin @('specialist', 'verifier')) {
+        $configurationValidationArgs['SecondPassModel'] = $SecondGeneralistModel
+        $configurationValidationArgs['ConventionSpecialistModel'] =
+            $(if ($Role -ceq 'specialist') { $Model } else { $ConventionSpecialistModel })
+    }
+    if ($Role -ceq 'verifier') {
+        $configurationValidationArgs['ConventionVerifierModel'] = $Model
+    }
+    $configReadiness = @(& $reviewerScriptFull @configurationValidationArgs)
+    $configReadyRecord = @($configReadiness | Where-Object {
+            [string]$_.kind -ceq 'reviewer-configuration-readiness' -and [bool]$_.valid
+        })
+    if ($configReadyRecord.Count -ne 1) {
+        throw 'Preflight did not receive exactly one successful production reviewer configuration validation record.'
+    }
+    if ([string]$configReadyRecord[0].project -cne [string]$validatedReplay.Binding.Project -or
+        [string]$configReadyRecord[0].repositoryId -cne [string]$validatedReplay.Binding.RepositoryId) {
+        throw 'Preflight config repository identity does not match the replay binding.'
+    }
+    $promptSha256 = Get-FileSha256Hex -Path ([string]$validatedConfig.PromptFilePath)
+    foreach ($bindingCheck in @(
+            @{ Name = 'config'; Recorded = [string]$validatedReplay.Bindings.ConfigSha256; Actual = (Get-FileSha256Hex -Path $configFull) },
+            @{ Name = 'prompt'; Recorded = [string]$validatedReplay.Bindings.PromptSha256; Actual = $promptSha256 },
+            @{ Name = 'script'; Recorded = [string]$validatedReplay.Bindings.ScriptSha256; Actual = (Get-FileSha256Hex -Path $reviewerScriptFull) })) {
+        if ($bindingCheck.Recorded -cne ('0' * 64) -and $bindingCheck.Recorded -cne $bindingCheck.Actual) {
+            throw "Preflight $($bindingCheck.Name) bytes do not match the replay manifest binding."
+        }
+    }
+    if ([string]$validatedReplay.Classification.SealKind -ceq 'benchmarkPackMaterialization') {
+        $materialization = $validatedReplay.Classification.Sidecar
+        if ($null -eq $materialization) { throw 'Preflight benchmark-pack replay has no validated materialization sidecar.' }
+        foreach ($identityCheck in @(
+                @{ Name = 'fixtureId'; Actual = [string]$projection.fixtureId },
+                @{ Name = 'role'; Actual = $Role },
+                @{ Name = 'projectionSha256'; Actual = $projectionSha256 })) {
+            if (-not $materialization.PSObject.Properties[$identityCheck.Name] -or
+                [string]$materialization.PSObject.Properties[$identityCheck.Name].Value -cne
+                    [string]$identityCheck.Actual) {
+                throw "Preflight benchmark-pack materialization does not bind the supplied $($identityCheck.Name)."
+            }
+        }
+        foreach ($sidecarCheck in @(
+                @{ Name = 'configSha256'; Actual = (Get-FileSha256Hex -Path $configFull) },
+                @{ Name = 'promptSha256'; Actual = $promptSha256 },
+                @{ Name = 'reviewerScriptSha256'; Actual = (Get-FileSha256Hex -Path $reviewerScriptFull) })) {
+            if (-not $materialization.PSObject.Properties[$sidecarCheck.Name] -or
+                ([string]$materialization.PSObject.Properties[$sidecarCheck.Name].Value).ToLowerInvariant() -cne
+                    ([string]$sidecarCheck.Actual).ToLowerInvariant()) {
+                throw "Preflight benchmark-pack materialization does not bind the supplied $($sidecarCheck.Name)."
+            }
+        }
+    }
+    $boundModels = @($validatedReplay.Bindings.Models)
+    $requestedModels = @($Model, $DiscoveryGeneralistModel, $SecondGeneralistModel,
+        $ConventionSpecialistModel, $ConventionVerifierModel) | Where-Object { $_ } | Select-Object -Unique
+    foreach ($requestedModel in $requestedModels) {
+        if ($boundModels.Count -gt 0 -and $boundModels -cnotcontains $requestedModel) {
+            throw "Preflight model '$requestedModel' is not bound by the replay manifest."
+        }
+    }
+}
 # The pinned -ReplayManifestDigest is NOT re-enforced here: the child's
 # New-AgentReplaySnapshot recomputes the sealed snapshot digest and fail-closed
 # refuses (throwing, so the outer seals tamper-evident CRASH terminal evidence)
@@ -963,38 +1166,169 @@ elseif ($DiscoveryPackageRoot) {
 }
 
 # -- Exact current build / clean / ref checks --------------------------------
-Push-Location $RepoRoot
-try {
-    $head = (& git rev-parse HEAD 2>$null).Trim()
-    if ($LASTEXITCODE -ne 0) { throw "RepoPath '$RepoRoot' is not a git worktree." }
+if ($Preflight) {
+    # Preflight cannot start even a git subprocess. Resolve HEAD and the full ref
+    # directly from worktree/common-dir metadata; Acquire repeats these checks
+    # through git and additionally proves cleanliness + base ancestry.
+    $gitLayout = Get-AcquisitionGitLayout -RepositoryRoot $RepoRoot
+    $head = Get-AcquisitionGitHead -Layout $gitLayout
     if ($head -cne $ExpectedHeadCommit.ToLowerInvariant() -and $head -cne $ExpectedHeadCommit) {
         throw "Worktree HEAD '$head' does not match the expected commit '$ExpectedHeadCommit'."
     }
-    if (-not $AllowDirtyWorktree) {
-        $porcelain = @(& git status --porcelain)
-        if ($porcelain.Count -gt 0) { throw "Worktree is not clean; acquisition requires an exact, clean build." }
-    }
-    # The expected ref must be a FULL ref (refs/...), never a bare name or a raw
-    # commit id, and it must resolve to a commit that is EXACTLY today's HEAD and
-    # EXACTLY the expected head commit. A ref that is valid but points somewhere
-    # else (a different branch, a stale tag) is refused: the sealed run is bound
-    # to one identity, so ref/HEAD/commit must be the same object.
     if ($ExpectedRef -notmatch '^refs/') {
         throw "Expected ref '$ExpectedRef' must be a full ref (refs/...); a bare name or commit id is not accepted."
     }
-    $refCommit = (& git rev-parse --verify --quiet "$ExpectedRef^{commit}" 2>$null)
-    if ($LASTEXITCODE -ne 0 -or -not $refCommit) { throw "Expected ref '$ExpectedRef' does not resolve to a commit in this worktree." }
-    $refCommit = $refCommit.Trim()
+    $refCommit = Resolve-AcquisitionGitRef -Layout $gitLayout -Ref $ExpectedRef
     if ($refCommit -cne $head) {
         throw "Expected ref '$ExpectedRef' resolves to '$refCommit', not the worktree HEAD '$head'."
     }
     if ($refCommit -cne $ExpectedHeadCommit.ToLowerInvariant() -and $refCommit -cne $ExpectedHeadCommit) {
         throw "Expected ref '$ExpectedRef' resolves to '$refCommit', not the expected head commit '$ExpectedHeadCommit'."
     }
-    & git merge-base --is-ancestor $ExpectedReviewerBaseCommit HEAD
-    if ($LASTEXITCODE -ne 0) { throw "Expected reviewer base commit '$ExpectedReviewerBaseCommit' is not an ancestor of HEAD." }
 }
-finally { Pop-Location }
+else {
+    $priorOptionalLocks = [Environment]::GetEnvironmentVariable('GIT_OPTIONAL_LOCKS')
+    [Environment]::SetEnvironmentVariable('GIT_OPTIONAL_LOCKS', '0')
+    Push-Location $RepoRoot
+    try {
+        $head = (& git rev-parse HEAD 2>$null).Trim()
+        if ($LASTEXITCODE -ne 0) { throw "RepoPath '$RepoRoot' is not a git worktree." }
+        if ($head -cne $ExpectedHeadCommit.ToLowerInvariant() -and $head -cne $ExpectedHeadCommit) {
+            throw "Worktree HEAD '$head' does not match the expected commit '$ExpectedHeadCommit'."
+        }
+        if (-not $AllowDirtyWorktree) {
+            $porcelain = @(& git status --porcelain)
+            if ($porcelain.Count -gt 0) { throw "Worktree is not clean; acquisition requires an exact, clean build." }
+        }
+        if ($ExpectedRef -notmatch '^refs/') {
+            throw "Expected ref '$ExpectedRef' must be a full ref (refs/...); a bare name or commit id is not accepted."
+        }
+        $refCommit = (& git rev-parse --verify --quiet "$ExpectedRef^{commit}" 2>$null)
+        if ($LASTEXITCODE -ne 0 -or -not $refCommit) { throw "Expected ref '$ExpectedRef' does not resolve to a commit in this worktree." }
+        $refCommit = $refCommit.Trim()
+        if ($refCommit -cne $head) {
+            throw "Expected ref '$ExpectedRef' resolves to '$refCommit', not the worktree HEAD '$head'."
+        }
+        if ($refCommit -cne $ExpectedHeadCommit.ToLowerInvariant() -and $refCommit -cne $ExpectedHeadCommit) {
+            throw "Expected ref '$ExpectedRef' resolves to '$refCommit', not the expected head commit '$ExpectedHeadCommit'."
+        }
+        & git merge-base --is-ancestor $ExpectedReviewerBaseCommit HEAD
+        if ($LASTEXITCODE -ne 0) { throw "Expected reviewer base commit '$ExpectedReviewerBaseCommit' is not an ancestor of HEAD." }
+    }
+    finally {
+        Pop-Location
+        [Environment]::SetEnvironmentVariable('GIT_OPTIONAL_LOCKS', $priorOptionalLocks)
+    }
+}
+
+# -- Read-only Preflight -------------------------------------------------------
+# Everything above is shared with Acquire. Nothing above creates a plan, token,
+# lease, state directory, process, or model invocation. Validate the eventual
+# plan shape with inert placeholders, then return one typed readiness document.
+if ($Preflight) {
+    if ($AuthorizationToken) {
+        throw "Preflight does not accept or mint an authorization token."
+    }
+    $planProbe = [ordered]@{
+        schemaVersion            = 1
+        kind                     = 'reviewer-blinded-acquisition-plan'
+        planId                   = ('0' * 32)
+        createdUtc               = '2000-01-01T00:00:00.0000000Z'
+        role                     = $Role
+        model                    = $Model
+        fixtureId                = [string]$projection.fixtureId
+        fixtureProjectionSha256  = $projectionSha256
+        snapshotName             = $ReplaySnapshotName
+        snapshotManifestDigest   = $ReplayManifestDigest.ToLowerInvariant()
+        expectedBaseCommit       = $ExpectedReviewerBaseCommit.ToLowerInvariant()
+        expectedRef              = $ExpectedRef
+        expectedHeadCommit       = $ExpectedHeadCommit.ToLowerInvariant()
+        repoPath                 = (Resolve-Path -LiteralPath $RepoRoot).Path
+        outputRoot               = $outputRootFull
+        configSha256             = (Get-FileSha256Hex -Path $configFull)
+        authorizationTokenSha256 = ('0' * 64)
+        nonce                    = ('0' * 32)
+        classification           = [ordered]@{
+            blinded = $true; oracleFree = $true; nonPromotable = $true
+            writesPermitted = $false; acquisitionOnly = $true
+        }
+    }
+    if ($Role -eq 'verifier') { $planProbe['candidate'] = $planCandidate; $planProbe['discovery'] = $planDiscovery }
+    $planProbe['target'] = $planTarget
+    Assert-AcquisitionSchema -JsonText (ConvertTo-Json -InputObject $planProbe -Depth 32) `
+        -SchemaName 'acquisition-plan.schema.json' -Surface 'The prospective acquisition plan'
+
+    $readiness = [ordered]@{
+        schemaVersion = 1
+        kind = 'reviewer-blinded-acquisition-readiness'
+        ready = $true
+        role = $Role
+        model = $Model
+        fixture = [ordered]@{
+            id = [string]$projection.fixtureId
+            projectionPath = $projectionFull
+            projectionSha256 = $projectionSha256
+        }
+        replay = [ordered]@{
+            root = $replayRootFull
+            snapshotName = $ReplaySnapshotName
+            manifestDigest = [string]$validatedReplay.ManifestDigest
+            resourceCount = [int]$validatedReplay.ResourceCount
+            payloadBytes = [long]$validatedReplay.PayloadBytes
+            nonPromotable = [bool]$validatedReplay.Classification.NonPromotable
+        }
+        config = [ordered]@{
+            path = $configFull
+            sha256 = (Get-FileSha256Hex -Path $configFull)
+        }
+        repository = [ordered]@{
+            path = (Resolve-Path -LiteralPath $RepoRoot).Path
+            head = $head
+            ref = $ExpectedRef
+            baseCommit = $ExpectedReviewerBaseCommit.ToLowerInvariant()
+        }
+        candidate = if ($Role -eq 'verifier') {
+            [ordered]@{
+                path = $candidateFull
+                sha256 = $candidateSha256
+                clusterHash = $clusterHash
+                discoveryPackageRoot = $discoveryRootFull
+            }
+        } else { $null }
+        output = [ordered]@{
+            root = $outputRootFull
+            leasePath = $leasePath
+            collisionFree = $true
+        }
+        checks = [ordered]@{
+            exactHead = $true
+            exactRef = $true
+            exactRepoPath = $true
+            bundleBound = $true
+            projectionBound = $true
+            replayLoadable = $true
+            configBound = $true
+            modelSupported = $true
+            roleFit = $true
+            candidateFit = $true
+            planFit = $true
+            noWrite = $true
+        }
+        sideEffects = [ordered]@{
+            planFilesCreated = 0
+            tokensMinted = 0
+            leasesCreated = 0
+            processesStarted = 0
+            modelsStarted = 0
+            providerWrites = 0
+        }
+    }
+    $readinessJson = ConvertTo-AcquisitionCanonicalJson -Value $readiness
+    Assert-AcquisitionSchema -JsonText $readinessJson -SchemaName 'acquisition-readiness.schema.json' `
+        -Surface 'The acquisition readiness report'
+    Write-Output $readinessJson
+    exit 0
+}
 
 # -- Mint the authorization token (CSPRNG) and author the plan ---------------
 Assert-AcquisitionSchema -JsonText $projectionText -SchemaName 'fixture-projection.schema.json' -Surface 'The blinded fixture projection'

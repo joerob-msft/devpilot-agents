@@ -40,10 +40,10 @@
     "specialist": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["conventionPlanJson"],
+      "required": ["conventionPlanJson", "factPlanJson"],
       "properties": {
         "conventionPlanJson": { "type": "string", "minLength": 1, "maxLength": 4194304 },
-        "factPlanJson": { "type": "string", "maxLength": 4194304 }
+        "factPlanJson": { "type": "string", "minLength": 1, "maxLength": 4194304 }
       }
     },
     "verifier": {
@@ -58,5 +58,19 @@
         "promptSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "role": { "const": "generalist" } }, "required": ["role"] },
+      "then": { "required": ["generalist"] }
+    },
+    {
+      "if": { "properties": { "role": { "const": "specialist" } }, "required": ["role"] },
+      "then": { "required": ["specialist"] }
+    },
+    {
+      "if": { "properties": { "role": { "const": "verifier" } }, "required": ["role"] },
+      "then": { "required": ["verifier"] }
+    }
+  ]
 }
