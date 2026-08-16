@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "reviewer.production-role-input-capture-blocked.v1",
+  "title": "Typed blocker for a no-model reviewer role input capture",
+  "description": "Published INSTEAD of a ready capture bundle when the production role path did not reach the exact model boundary. A blocker records exactly why, and asserts the same zero side effects a ready capture does: refusing to capture never authorizes a live read, a fallback or a fabricated stimulus.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion", "kind", "ready", "status", "blockedReason", "blockedDetail",
+    "fixtureId", "role", "model", "boundaryHits", "snapshot", "build", "sideEffects", "timings"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "kind": { "const": "reviewer-production-role-input-capture-blocked" },
+    "ready": { "const": false },
+    "status": { "enum": ["blocked", "degraded"] },
+    "blockedReason": { "enum": ["sealedPathFailedClosed", "noModelBoundaryReached"] },
+    "blockedDetail": { "type": "string", "maxLength": 8192 },
+    "fixtureId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+    "role": { "enum": ["generalist", "specialist", "verifier"] },
+    "model": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "boundaryHits": { "const": 0 },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "manifestDigest", "nonPromotable", "resourceCount"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "manifestDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "nonPromotable": { "const": true },
+        "resourceCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repoPath", "head", "ref"],
+      "properties": {
+        "repoPath": { "type": "string", "minLength": 1 },
+        "head": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "ref": { "type": "string", "pattern": "^refs/" }
+      }
+    },
+    "sideEffects": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["modelProcesses", "agencyProcesses", "providerProcesses", "plansCreated", "tokensMinted", "leasesCreated", "liveReads", "liveWrites", "providerWrites"],
+      "properties": {
+        "modelProcesses": { "const": 0 },
+        "agencyProcesses": { "const": 0 },
+        "providerProcesses": { "const": 0 },
+        "plansCreated": { "const": 0 },
+        "tokensMinted": { "const": 0 },
+        "leasesCreated": { "const": 0 },
+        "liveReads": { "const": 0 },
+        "liveWrites": { "const": 0 },
+        "providerWrites": { "const": 0 }
+      }
+    },
+    "timings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["startedUtc", "endedUtc", "totalDurationMs"],
+      "properties": {
+        "startedUtc": { "type": "string", "minLength": 1 },
+        "endedUtc": { "type": "string", "minLength": 1 },
+        "totalDurationMs": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

@@ -231,6 +231,14 @@ jobs:
         shell: pwsh
         run: ./tools/Test-ReviewerBenchmarkPackMaterializer.ps1
 
+      # Proves the no-model production role input capture builds the EXACT
+      # production prompt for one role, byte-identical to the blinded adapter
+      # path, while starting zero model/agency/provider processes and writing
+      # zero plans, tokens, leases or provider state.
+      - name: reviewer - no-model production role input capture
+        shell: pwsh
+        run: ./tools/Test-ReviewerRoleInputCapture.ps1
+
       - name: reviewer - offline replay is fail-closed and preview-only
         shell: pwsh
         run: |

@@ -1,0 +1,197 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "reviewer.production-role-input-capture.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion", "kind", "ready", "status", "fixtureId", "role", "model",
+    "nonce", "promptBytes", "resultMarkerPrefix", "identities", "hashes",
+    "bindingIdentity", "launch", "snapshot", "build", "classification",
+    "sideEffects", "timings", "files"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "kind": { "const": "reviewer-production-role-input-capture" },
+    "ready": { "const": true },
+    "status": { "const": "captured" },
+    "fixtureId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+    "role": { "enum": ["generalist", "specialist", "verifier"] },
+    "model": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "nonce": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "promptBytes": { "type": "integer", "minimum": 1 },
+    "resultMarkerPrefix": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "identities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "organization", "project", "repositoryId", "prId", "source", "common", "target", "changeSet"],
+      "properties": {
+        "provider": { "type": "string", "minLength": 1 },
+        "organization": { "type": "string" },
+        "project": { "type": "string", "minLength": 1 },
+        "repositoryId": { "type": "string", "minLength": 1 },
+        "prId": { "type": "integer", "minimum": 1 },
+        "source": { "$ref": "#/$defs/commit" },
+        "common": { "$ref": "#/$defs/optionalCommit" },
+        "target": { "$ref": "#/$defs/commit" },
+        "changeSet": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "hashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fixtureProjectionSha256", "requestSha256", "inputSha256", "promptSha256",
+        "schemaSha256", "configSha256", "scriptSha256", "launchArgumentsSha256",
+        "bindingSha256", "snapshotManifestDigest", "candidateInputSha256",
+        "clusterHash", "discoveryMarkerSha256", "derivedCandidateHash", "derivedClusterHash"
+      ],
+      "properties": {
+        "fixtureProjectionSha256": { "$ref": "#/$defs/hash" },
+        "requestSha256": { "$ref": "#/$defs/hash" },
+        "inputSha256": { "$ref": "#/$defs/hash" },
+        "promptSha256": { "$ref": "#/$defs/hash" },
+        "schemaSha256": { "$ref": "#/$defs/hash" },
+        "configSha256": { "$ref": "#/$defs/hash" },
+        "scriptSha256": { "$ref": "#/$defs/hash" },
+        "launchArgumentsSha256": { "$ref": "#/$defs/hash" },
+        "bindingSha256": { "$ref": "#/$defs/hash" },
+        "snapshotManifestDigest": { "$ref": "#/$defs/hash" },
+        "candidateInputSha256": { "$ref": "#/$defs/optionalHash" },
+        "clusterHash": { "$ref": "#/$defs/optionalHash" },
+        "discoveryMarkerSha256": { "$ref": "#/$defs/optionalHash" },
+        "derivedCandidateHash": { "$ref": "#/$defs/optionalHash" },
+        "derivedClusterHash": { "$ref": "#/$defs/optionalHash" }
+      }
+    },
+    "bindingIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nonce", "prId", "repositoryId", "project", "reviewedSourceCommit"],
+      "properties": {
+        "nonce": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "prId": { "type": "integer", "minimum": 1 },
+        "repositoryId": { "type": "string", "minLength": 1 },
+        "project": { "type": "string", "minLength": 1 },
+        "reviewedSourceCommit": { "$ref": "#/$defs/commit" },
+        "targetCommit": { "$ref": "#/$defs/commit" },
+        "changeSetDigest": { "$ref": "#/$defs/hash" },
+        "clusterId": { "type": "string", "pattern": "^vc1:[0-9a-f]{64}$" },
+        "verifierModel": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    },
+    "launch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["argumentsSha256", "boundaryHits", "availableTools", "allowTools", "denySet", "arguments"],
+      "properties": {
+        "argumentsSha256": { "$ref": "#/$defs/hash" },
+        "boundaryHits": { "const": 1 },
+        "availableTools": { "$ref": "#/$defs/toolList" },
+        "allowTools": { "$ref": "#/$defs/toolList" },
+        "denySet": { "$ref": "#/$defs/toolList" },
+        "arguments": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "manifestDigest", "nonPromotable", "sealKind", "resources"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "manifestDigest": { "$ref": "#/$defs/hash" },
+        "nonPromotable": { "const": true },
+        "sealKind": { "type": "string" },
+        "resources": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["tool", "requestSha256", "payloadSha256", "payloadFile"],
+            "properties": {
+              "tool": { "type": "string", "minLength": 1 },
+              "requestSha256": { "$ref": "#/$defs/hash" },
+              "payloadSha256": { "$ref": "#/$defs/hash" },
+              "payloadFile": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repoPath", "head", "ref", "reviewerScriptPath", "promptFile"],
+      "properties": {
+        "repoPath": { "type": "string", "minLength": 1 },
+        "head": { "$ref": "#/$defs/commit" },
+        "ref": { "type": "string", "pattern": "^refs/" },
+        "reviewerScriptPath": { "type": "string", "minLength": 1 },
+        "promptFile": { "type": "string", "minLength": 1 }
+      }
+    },
+    "classification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["private", "oracleFree", "nonPromotable", "writesPermitted"],
+      "properties": {
+        "private": { "const": true },
+        "oracleFree": { "const": true },
+        "nonPromotable": { "const": true },
+        "writesPermitted": { "const": false }
+      }
+    },
+    "sideEffects": { "$ref": "#/$defs/zeroSideEffects" },
+    "timings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["startedUtc", "endedUtc", "totalDurationMs"],
+      "properties": {
+        "startedUtc": { "type": "string", "minLength": 1 },
+        "endedUtc": { "type": "string", "minLength": 1 },
+        "totalDurationMs": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "files": {
+      "type": "array",
+      "minItems": 4,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "sha256", "byteLength"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "sha256": { "$ref": "#/$defs/hash" },
+          "byteLength": { "type": "integer", "minimum": 0 }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "optionalHash": { "type": "string", "pattern": "^(|[0-9a-f]{64})$" },
+    "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "optionalCommit": { "type": "string", "pattern": "^(|[0-9a-f]{40})$" },
+    "toolList": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "zeroSideEffects": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["modelProcesses", "agencyProcesses", "providerProcesses", "plansCreated", "tokensMinted", "leasesCreated", "liveReads", "liveWrites", "providerWrites"],
+      "properties": {
+        "modelProcesses": { "const": 0 },
+        "agencyProcesses": { "const": 0 },
+        "providerProcesses": { "const": 0 },
+        "plansCreated": { "const": 0 },
+        "tokensMinted": { "const": 0 },
+        "leasesCreated": { "const": 0 },
+        "liveReads": { "const": 0 },
+        "liveWrites": { "const": 0 },
+        "providerWrites": { "const": 0 }
+      }
+    }
+  }
+}

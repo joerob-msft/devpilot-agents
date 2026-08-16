@@ -412,7 +412,53 @@ param(
     # stub adapter at all; it also pins execution to the repository's own sealed
     # offline adapter script (containment). Without it, acquisition refuses the
     # offline adapter and a production run would take the real model boundary.
-    [switch]$AcquisitionTestOnlyOfflineAdapter
+    [switch]$AcquisitionTestOnlyOfflineAdapter,
+
+    # --- No-model production role input capture -----------------------------
+    # Executes the EXACT current sealed planning / context / prompt construction
+    # for ONE declared role and model against a sealed, non-promotable replay
+    # snapshot, and STOPS at the exact production model boundary
+    # (Invoke-ReviewerModelSubprocess) BEFORE any child process is created. No
+    # model, agency or provider process is ever launched, no plan / token / lease
+    # is authored or consumed, and no live read or write is issued. It emits a
+    # role-scoped, read-only capture whose prompt bytes are exactly the bytes the
+    # production pass would have written to the model's standard input.
+    #
+    # The offline stub adapter is REFUSED in this mode: capture stands at the
+    # real production boundary, and there is nothing to stub because nothing is
+    # ever launched.
+    [ValidateSet("generalist", "specialist", "verifier")]
+    [string]$CaptureRoleInputRole,
+
+    # The one role/model whose input is captured. It must equal the model the
+    # production role pass would actually request for this configuration, which
+    # is re-asserted from the effective configuration before the role is driven.
+    [string]$CaptureRoleInputModel,
+
+    # The role's blinded stimulus inputs reuse the SHARED acquisition input
+    # parameters rather than a parallel set, so both modes read exactly the same
+    # artifact types through exactly the same schema gates:
+    #   -AcquisitionFixtureProjectionFile : the blinded, oracle-free projection
+    #   -AcquisitionCandidateInputFile    : verifier only, the independently
+    #                                       captured discovery candidate
+    #   -AcquisitionDiscoveryMarkerFile   : verifier only, the sealed discovery
+    #                                       result marker the candidate projects
+    [string]$CaptureRoleInputOutputRoot,
+
+    # Optional blinded legacy benchmark projection. When supplied, the capture
+    # emits a materializer-ready bundle: every sealed resource the legacy pack
+    # declares is re-verified against its own hash/length binding and copied in,
+    # the new role-provenance resource is appended, and the rewritten projection
+    # is published alongside. This is the artifact PR50's
+    # Convert-ReviewerBlindedBenchmarkPack.ps1 and PR49 accept.
+    [string]$CaptureRoleInputLegacyProjectionFile,
+
+    # The exact full ref (refs/...) and commit this capture is bound to. Both are
+    # re-resolved from the running worktree and must agree with HEAD; a non-git
+    # RepoPath, an unreadable ref or a disagreement fails closed.
+    [string]$CaptureRoleInputExpectedRef,
+
+    [string]$CaptureRoleInputExpectedHeadCommit
 )
 
 $ErrorActionPreference = "Stop"
@@ -3026,6 +3072,30 @@ $script:ReviewerAcquisitionRolePassResult = $null
 # recorded, any further model subprocess launch is a contract violation and is
 # refused before it starts.
 $script:ReviewerAcquisitionSingleShot = $false
+# --- No-model role input capture -------------------------------------------
+# When armed, the exact production model boundary records the fully constructed
+# stimulus and REFUSES the invocation before any child process is created. The
+# sentinel is a fixed, recognizable string so the capture driver can tell the
+# boundary apart from a genuine production fault and classify a run that never
+# reached the boundary as typed blocked/degraded instead of fabricating one.
+$script:ReviewerRoleInputCaptureActive = $false
+$script:ReviewerRoleInputCapture = $null
+$script:ReviewerRoleInputCaptureBoundaryHits = 0
+$script:ReviewerRoleInputConventionPlan = $null
+$script:ReviewerRoleInputFactPlan = $null
+$script:ReviewerRoleInputCaptureSentinel =
+    'reviewer-role-input-capture: reached the exact production model boundary; no child process was launched.'
+if ($CaptureRoleInputRole -and $AcquireTranscriptRole) {
+    throw "Role input capture and blinded transcript acquisition are mutually exclusive modes; declare exactly one."
+}
+if ($CaptureRoleInputRole -and $DryRun) {
+    throw ("Role input capture and -DryRun are mutually exclusive: capture short-circuits Main ahead of the " +
+        "dry-run self-checks, so a run asking for both would silently get only one of them.")
+}
+if ($CaptureRoleInputRole -and $offlineAdapterRequested) {
+    throw ("Role input capture refuses the offline model adapter: it stops at the exact production model " +
+        "boundary and launches nothing, so there is no subprocess to stub.")
+}
 if ($offlineAdapterRequested) {
     if (-not $EnableOfflineModelAdapter -or -not $OfflineModelAdapterManifest -or
         -not $ExpectedReviewerBaseCommit -or -not $OfflineTelemetryPath) {
@@ -3244,6 +3314,19 @@ if ((Split-Path -Leaf $PromptFile) -ne $ConfigLoad.PromptFileName) {
     throw "This agent only supports the configured prompt file '$($ConfigLoad.PromptFileName)' (got '$(Split-Path -Leaf $PromptFile)')."
 }
 
+if ($CaptureRoleInputRole) {
+    if (-not $CaptureRoleInputOutputRoot) {
+        throw 'Role input capture requires -CaptureRoleInputOutputRoot.'
+    }
+    $captureOutputFull = [IO.Path]::GetFullPath($CaptureRoleInputOutputRoot)
+    $captureOutputParent = Split-Path $captureOutputFull -Parent
+    if (-not (Test-Path -LiteralPath $captureOutputParent -PathType Container)) {
+        throw "Role input capture output parent '$captureOutputParent' does not exist."
+    }
+    if (-not $StateDir) {
+        $StateDir = Join-Path $captureOutputParent ('.role-input-state-' + [Guid]::NewGuid().ToString('N'))
+    }
+}
 if (-not $StateDir) {
     $base = $env:LOCALAPPDATA
     if (-not $base) { $base = Join-Path $HOME ".local-state" }
@@ -4086,6 +4169,10 @@ function Save-ReviewerConventionPlan {
         [Parameter(Mandatory)][int]$PrId,
         [Parameter(Mandatory)][string]$SourceCommit
     )
+    if ($script:ReviewerRoleInputCaptureActive) {
+        $script:ReviewerRoleInputConventionPlan = $Plan
+        return 'memory://reviewer-role-input/convention-plan'
+    }
     $planHash = Get-ReviewerConventionSpecialistObjectSha256 -Value $Plan
     $baseName = "pr$PrId-$SourceCommit-$($planHash.Substring(0, 16))"
     $key = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
@@ -4095,6 +4182,13 @@ function Save-ReviewerConventionPlan {
 
 function Read-ReviewerConventionPlan {
     param([Parameter(Mandatory)][string]$Path)
+    if ($script:ReviewerRoleInputCaptureActive -and
+        $Path -ceq 'memory://reviewer-role-input/convention-plan') {
+        if ($null -eq $script:ReviewerRoleInputConventionPlan) {
+            throw 'The in-memory convention plan is unavailable.'
+        }
+        return $script:ReviewerRoleInputConventionPlan
+    }
     $key = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
     return Read-ReviewerConventionPlanFile -Path $Path -MasterKey $key
 }
@@ -4355,6 +4449,10 @@ function Save-ReviewerFactPlan {
         [Parameter(Mandatory)][int]$PrId,
         [Parameter(Mandatory)][string]$SourceCommit
     )
+    if ($script:ReviewerRoleInputCaptureActive) {
+        $script:ReviewerRoleInputFactPlan = $Plan
+        return 'memory://reviewer-role-input/fact-plan'
+    }
     $planHash = [string](Get-ReviewerFactValue $Plan "planSha256" "")
     if ($planHash -notmatch '^[0-9a-f]{64}$') { throw "A persisted fact plan requires a valid planSha256." }
     $baseName = "pr$PrId-$SourceCommit-$($planHash.Substring(0, 16))"
@@ -4364,6 +4462,13 @@ function Save-ReviewerFactPlan {
 
 function Read-ReviewerFactPlan {
     param([Parameter(Mandatory)][string]$Path)
+    if ($script:ReviewerRoleInputCaptureActive -and
+        $Path -ceq 'memory://reviewer-role-input/fact-plan') {
+        if ($null -eq $script:ReviewerRoleInputFactPlan) {
+            throw 'The in-memory fact plan is unavailable.'
+        }
+        return $script:ReviewerRoleInputFactPlan
+    }
     $key = Get-ReviewerRunArtifactKey -KeyPath $artifactKeyPath
     return Read-ReviewerFactPlanFile -Path $Path -SchemaPath $ReviewFactSchemaPath -Key $key
 }
@@ -9858,6 +9963,56 @@ function Get-ReviewerAcquisitionAttemptUsage {
     }
 }
 
+function Add-ReviewerRoleInputCapture {
+    <#
+        Record the ONE fully constructed production stimulus at the exact model
+        boundary, for the no-model role input capture mode. This runs INSTEAD of
+        a launch: the caller refuses the invocation immediately afterwards, so no
+        model / agency / provider child process is ever created.
+
+        The record binds the exact prompt bytes, their SHA-256, the exact launch
+        argument vector the production pass assembled (tool grant + deny set +
+        model + output mode - never a credential), the per-attempt nonce and the
+        stimulus identity fields. The binding is NOT persisted wholesale: only
+        its canonical hash plus the identity fields already bound elsewhere, so
+        no operational binding payload can leak into a capture.
+
+        Append-once: the FIRST boundary hit is the captured one. Any further hit
+        is counted (so a role that would have launched more than one subprocess
+        is visible in the seal) but never overwrites the first.
+    #>
+    param(
+        [Parameter(Mandatory)][string[]]$AgencyArguments,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$StandardInputContent,
+        [Parameter(Mandatory)][string]$Role,
+        [Parameter(Mandatory)][string]$Model,
+        [Parameter(Mandatory)][hashtable]$Binding,
+        [Parameter(Mandatory)][int]$TimeoutSeconds
+    )
+    $script:ReviewerRoleInputCaptureBoundaryHits++
+    if ($null -ne $script:ReviewerRoleInputCapture) { return }
+    $promptText = [string]$StandardInputContent
+    $identity = [ordered]@{}
+    foreach ($key in @('nonce', 'prId', 'repositoryId', 'project', 'reviewedSourceCommit',
+            'targetCommit', 'changeSetDigest', 'clusterId', 'verifierModel')) {
+        if ($Binding.ContainsKey($key)) { $identity[$key] = $Binding[$key] }
+    }
+    $script:ReviewerRoleInputCapture = [ordered]@{
+        launchRole       = $Role
+        model            = $Model
+        nonce            = [string]$(if ($Binding.ContainsKey('nonce')) { $Binding['nonce'] } else { '' })
+        promptText       = $promptText
+        promptBytes      = [int]$script:ReviewerUtf8.GetByteCount($promptText)
+        promptSha256     = (Get-ReviewerTextSha256 -Text $promptText)
+        arguments        = @($AgencyArguments | ForEach-Object { [string]$_ })
+        argumentsSha256  = (Get-ReviewerTextSha256 -Text (($AgencyArguments | ForEach-Object { [string]$_ }) -join "`n"))
+        bindingSha256    = (Get-ReviewerTextSha256 -Text (Get-ReviewerCanonicalJson -Value $Binding))
+        bindingIdentity  = $identity
+        timeoutSeconds   = [int]$TimeoutSeconds
+        capturedAtUtc    = [DateTime]::UtcNow.ToString('o')
+    }
+}
+
 function Invoke-ReviewerModelSubprocess {
     param(
         [Parameter(Mandatory)][string]$AgencyPath,
@@ -9868,6 +10023,21 @@ function Invoke-ReviewerModelSubprocess {
         [Parameter(Mandatory)][hashtable]$Binding,
         [Parameter(Mandatory)][int]$TimeoutSeconds
     )
+    # -- No-model role input capture boundary --------------------------------
+    # THIS is the exact production model boundary. When role input capture is
+    # armed the fully constructed stimulus is recorded and the invocation is
+    # refused right here - before Invoke-TimedProcess, before the offline
+    # adapter branch, before any process start - so a capture run can never
+    # create a model, agency or provider child process. The refusal is a fixed
+    # sentinel the capture driver recognizes; anything else that unwinds this
+    # run is a genuine production fault and is classified as blocked, never
+    # papered over with a fabricated stimulus.
+    if ($script:ReviewerRoleInputCaptureActive) {
+        Add-ReviewerRoleInputCapture -AgencyArguments $AgencyArguments `
+            -StandardInputContent $StandardInputContent -Role $Role -Model $Model `
+            -Binding $Binding -TimeoutSeconds $TimeoutSeconds
+        throw $script:ReviewerRoleInputCaptureSentinel
+    }
     # -- Blinded acquisition single-shot boundary ----------------------------
     # Acquisition captures EXACTLY ONE role/model invocation. The verifier capture
     # invokes the production verifier model run once, terminal and without retry,
@@ -15574,7 +15744,12 @@ function Get-ReviewerAcquisitionForbiddenKeyHits {
         $child = Get-ReviewerHashValue -Container $Node -Key $key
         foreach ($h in (Get-ReviewerAcquisitionForbiddenKeyHits -Node $child -Path "$Path.$key" -Depth ($Depth + 1))) { [void]$hits.Add($h) }
     }
-    if ($Node -isnot [string] -and $Node -is [System.Collections.IEnumerable]) {
+    # Sequence walk. A dictionary is deliberately excluded: PowerShell does not
+    # enumerate a dictionary element-wise, so `@($Node)` hands back the SAME
+    # dictionary and the walk would recurse into itself until it hit the depth
+    # ceiling. Its entries were already covered by the key walk above.
+    if ($Node -isnot [string] -and $Node -isnot [System.Collections.IDictionary] -and
+        $Node -is [System.Collections.IEnumerable]) {
         $index = 0
         foreach ($item in @($Node)) {
             foreach ($h in (Get-ReviewerAcquisitionForbiddenKeyHits -Node $item -Path "$Path[$index]" -Depth ($Depth + 1))) { [void]$hits.Add($h) }
@@ -16529,8 +16704,810 @@ function Invoke-ReviewerBlindedAcquisitionRun {
 }
 
 # ---------------------------------------------------------------------------
+# No-model production role input capture
+# ---------------------------------------------------------------------------
+
+function Get-ReviewerRoleInputForbiddenPathHits {
+    <#
+        Recursive oracle/expected-decision scan over a FILESYSTEM PATH, the twin
+        of the recursive key scan. A path is rejected when ANY of its segments
+        (or, for a directory, any file at any depth beneath it) names an oracle,
+        an expected decision, an answer key, a ground truth, an adjudication or a
+        golden label. Capture inputs are stimulus only, so a run can never be
+        pointed at truth material even by accident.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [int]$Depth = 0)
+    if ($Depth -gt 16) { throw "Role input capture path scan exceeded depth 16." }
+    $denied = @('oracle', 'expected', 'groundtruth', 'ground-truth', 'ground_truth', 'answerkey',
+        'answer-key', 'adjudication', 'golden', 'verdicttruth', 'truth-label')
+    $hits = [System.Collections.Generic.List[string]]::new()
+    $full = [IO.Path]::GetFullPath($Path)
+    foreach ($segment in @($full -split '[\\/]+') | Where-Object { $_ }) {
+        $lower = ([string]$segment).ToLowerInvariant()
+        foreach ($needle in $denied) {
+            if ($lower.Contains($needle)) { [void]$hits.Add("$full ($segment)"); break }
+        }
+    }
+    if (Test-Path -LiteralPath $full -PathType Container) {
+        foreach ($child in @(Get-ChildItem -LiteralPath $full -Force -ErrorAction SilentlyContinue)) {
+            foreach ($h in (Get-ReviewerRoleInputForbiddenPathHits -Path $child.FullName -Depth ($Depth + 1))) {
+                [void]$hits.Add($h)
+            }
+        }
+    }
+    return @($hits.ToArray() | Sort-Object -Unique)
+}
+
+function Assert-ReviewerRoleInputSafePath {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Surface)
+    $hits = @(Get-ReviewerRoleInputForbiddenPathHits -Path $Path)
+    if ($hits.Count -gt 0) {
+        throw ("$Surface resolves to an oracle/expected-decision path: $($hits -join ', '). " +
+            "Role input capture accepts stimulus only.")
+    }
+}
+
+function Get-ReviewerRoleInputSealedResourceInventory {
+    <#
+        The exact inventory of sealed replay resources this process loaded: one
+        record per served read, bound by tool, request digest and payload digest.
+        Recorded so a capture proves WHICH sealed material built its prompt, and
+        so a later reader can detect a snapshot that no longer serves the same
+        reads. No payload bytes and no arguments are copied out.
+    #>
+    $served = $script:ReviewerReplaySnapshot.Served
+    $records = [System.Collections.Generic.List[object]]::new()
+    foreach ($key in @($served.Keys | Sort-Object -CaseSensitive)) {
+        $entry = $served[$key]
+        [void]$records.Add([ordered]@{
+                tool          = [string]$entry.Tool
+                requestSha256 = [string]$key
+                payloadSha256 = ([string]$entry.PayloadSha256).ToLowerInvariant()
+                payloadFile   = [string]$entry.PayloadFile
+            })
+    }
+    return , $records.ToArray()
+}
+
+function Get-ReviewerRoleInputToolGrant {
+    <#
+        Derive the EXACT tool grant and deny set from the argument vector the
+        production pass actually assembled, rather than re-deriving it from
+        config. Whatever the launch would have carried is what the capture
+        reports, so a grant regression cannot hide behind a second computation.
+    #>
+    param([AllowNull()][AllowEmptyCollection()][string[]]$Arguments = @())
+    $read = {
+        param([string]$Prefix)
+        $hit = @($Arguments | Where-Object { ([string]$_).StartsWith($Prefix, [StringComparison]::Ordinal) })
+        if ($hit.Count -eq 0) { return , @() }
+        $value = ([string]$hit[0]).Substring($Prefix.Length)
+        return , @($value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    }
+    return [ordered]@{
+        availableTools = @(& $read '--available-tools=')
+        allowTools     = @(& $read '--allow-tool=')
+        denyTools      = @(& $read '--deny-tool=')
+        jsonOutput     = ([bool](@($Arguments) -ccontains 'json'))
+    }
+}
+
+# The zero-side-effect assertion a capture publishes. These are CONSTANTS, not
+# measurements: the mode cannot launch a model, agency or provider process (the
+# boundary refuses before any process starts), cannot author a plan or mint a
+# token or take a lease (none of those paths are reachable), and cannot read or
+# write live (the run is sealed-replay only). The outer supervisor independently
+# corroborates them from telemetry rather than trusting this record.
+$script:ReviewerRoleInputZeroSideEffects = [ordered]@{
+    modelProcesses    = 0
+    agencyProcesses   = 0
+    providerProcesses = 0
+    plansCreated      = 0
+    tokensMinted      = 0
+    leasesCreated     = 0
+    liveReads         = 0
+    liveWrites        = 0
+    providerWrites    = 0
+}
+
+function Set-ReviewerRoleInputTreeReadOnly {
+    <#
+        Mark every published file read-only, deepest-first, so the bundle a
+        capture hands back cannot be edited in place by an ordinary write.
+    #>
+    param([Parameter(Mandatory)][string]$Root)
+    foreach ($file in @(Get-ChildItem -LiteralPath $Root -File -Recurse -Force)) {
+        $file.Attributes = $file.Attributes -bor [IO.FileAttributes]::ReadOnly
+    }
+}
+
+function Remove-ReviewerRoleInputTree {
+    <#
+        Delete a tree this mode created, clearing the read-only bit first so an
+        abandoned staging directory cannot survive as an undeletable remnant.
+    #>
+    param([Parameter(Mandatory)][string]$Root)
+    Get-ChildItem -LiteralPath $Root -File -Recurse -Force -ErrorAction SilentlyContinue |
+        ForEach-Object { try { $_.Attributes = [IO.FileAttributes]::Normal } catch { } }
+    Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+function Invoke-ReviewerRoleInputCaptureRun {
+    <#
+        Executes the EXACT current sealed planning / context / prompt
+        construction for ONE declared role and model and STOPS at the exact
+        production model boundary. It reuses the production builders, parser
+        surfaces, configuration, model registry and role entry points verbatim -
+        no prompt logic is restated here - and adds nothing to the launch path
+        except the boundary refusal, which happens before any process starts.
+
+        It authors no plan, mints no token, takes no lease, opens no live
+        transport, and performs no provider read or write. It refuses oracle /
+        expected-decision inputs by strict schema, a recursive key scan AND a
+        recursive path scan. The outcome is typed: 'captured' when the boundary
+        was reached, 'degraded' when the production role path completed without
+        ever reaching a model boundary, and 'blocked' when the sealed material
+        the role needs is missing or the path failed closed. It never falls back
+        to a live read and never fabricates a stimulus.
+    #>
+    $startedUtc = [DateTime]::UtcNow
+    if (-not $script:ReviewerReplayActive) {
+        throw "Role input capture runs only inside a sealed, non-promotable offline replay."
+    }
+    if ($script:ReviewerOfflineModelAdapterActive) {
+        throw "Role input capture refuses the offline stub adapter; it stops at the exact production model boundary."
+    }
+    if (-not $CaptureRoleInputModel) { throw "Role input capture requires -CaptureRoleInputModel." }
+    if (-not $CaptureRoleInputOutputRoot) { throw "Role input capture requires -CaptureRoleInputOutputRoot." }
+    if (-not $AcquisitionFixtureProjectionFile -or
+        -not (Test-Path -LiteralPath $AcquisitionFixtureProjectionFile -PathType Leaf)) {
+        throw "Role input capture requires -AcquisitionFixtureProjectionFile naming an existing blinded projection."
+    }
+    $outputRoot = [IO.Path]::GetFullPath($CaptureRoleInputOutputRoot)
+    if (Test-Path -LiteralPath $outputRoot) {
+        throw "Role input capture output root '$outputRoot' already exists; a capture never publishes over an existing bundle."
+    }
+    $outputParent = Split-Path $outputRoot -Parent
+    if (-not (Test-Path -LiteralPath $outputParent -PathType Container)) {
+        throw "Role input capture output parent '$outputParent' does not exist."
+    }
+    # Everything is built in a sibling staging directory and published by a single
+    # rename, so an interrupted capture leaves no half-written bundle and a reader
+    # never observes a partially assembled one.
+    $staging = Join-Path $outputParent ('.' + (Split-Path $outputRoot -Leaf) + '.staging-' + [Guid]::NewGuid().ToString('N'))
+    $published = $false
+
+    # -- Oracle refusal: recursive PATH scan before a single byte is read ------
+    $projectionFull = (Resolve-Path -LiteralPath $AcquisitionFixtureProjectionFile).Path
+    Assert-ReviewerRoleInputSafePath -Path $projectionFull -Surface "The blinded fixture projection"
+    Assert-ReviewerRoleInputSafePath -Path $outputRoot -Surface "The capture output root"
+    if ($AcquisitionCandidateInputFile) {
+        Assert-ReviewerRoleInputSafePath -Path $AcquisitionCandidateInputFile -Surface "The discovery candidate input"
+    }
+    if ($AcquisitionDiscoveryMarkerFile) {
+        Assert-ReviewerRoleInputSafePath -Path $AcquisitionDiscoveryMarkerFile -Surface "The discovery result marker"
+    }
+
+    $schemaDir = Join-Path $PSScriptRoot 'acquisition\v1'
+    $projectionText = [IO.File]::ReadAllText($projectionFull, $script:ReviewerUtf8)
+    if (-not (Test-Json -Json $projectionText -SchemaFile (Join-Path $schemaDir 'fixture-projection.schema.json') -ErrorAction SilentlyContinue)) {
+        throw "The blinded fixture projection failed its versioned schema."
+    }
+    $projection = $projectionText | ConvertFrom-Json -Depth 64
+    Assert-ReviewerAcquisitionNoForbiddenKeys -Node $projection -Surface "The blinded fixture projection"
+    if ([string]$projection.role -cne $CaptureRoleInputRole) {
+        throw "The blinded projection is role '$($projection.role)', not '$CaptureRoleInputRole'."
+    }
+    $projectionSha256 = Get-ReviewerTextSha256 -Text $projectionText
+    if ($projection.PSObject.Properties["specialist"] -and $projection.specialist) {
+        foreach ($name in @("conventionPlanJson", "factPlanJson")) {
+            if (-not $projection.specialist.PSObject.Properties[$name] -or
+                [string]::IsNullOrWhiteSpace([string]$projection.specialist.$name)) { continue }
+            try { $decodedRoleJson = ([string]$projection.specialist.$name) | ConvertFrom-Json -Depth 64 -ErrorAction Stop }
+            catch { throw "The blinded fixture projection specialist.$name is not valid JSON." }
+            Assert-ReviewerAcquisitionNoForbiddenKeys -Node $decodedRoleJson `
+                -Surface "The blinded fixture projection specialist.$name decoded JSON"
+            if ($name -ceq "conventionPlanJson") { $script:ReviewerAcquisitionExpectedConventionPlan = $decodedRoleJson }
+            else { $script:ReviewerAcquisitionExpectedFactPlan = $decodedRoleJson }
+        }
+    }
+
+    # -- Model identity through the shared registry, then role coherence -------
+    [void](Assert-AgentSupportedModel -ModelId $CaptureRoleInputModel -Where "role input capture model")
+    $model = [string]$CaptureRoleInputModel
+    $configuredRoleModel = switch ($CaptureRoleInputRole) {
+        'specialist' { [string]$EffectiveConventionSpecialistModel }
+        'verifier' { [string]$EffectiveConventionVerifierModel }
+        default { [string]$EffectiveModel }
+    }
+    if ($configuredRoleModel -cne $model) {
+        throw ("The effective $CaptureRoleInputRole model '$configuredRoleModel' does not equal the requested " +
+            "-CaptureRoleInputModel '$model'; capture records exactly the model this configuration would launch.")
+    }
+
+    # -- Sealed, non-promotable snapshot identity -----------------------------
+    if (-not [bool]$script:ReviewerReplaySnapshot.Classification.NonPromotable) {
+        throw "Role input capture requires a classified non-promotable replay snapshot."
+    }
+    $replayBound = $script:ReviewerReplaySnapshot.Binding
+    $binding = $projection.binding
+    if ([int]$binding.prId -ne [int]$PullRequestId) {
+        throw "The blinded projection PR ($([int]$binding.prId)) does not match the sealed run ($PullRequestId)."
+    }
+    if (([string]$binding.repositoryId).ToLowerInvariant() -cne ([string]$cfgRepoId).ToLowerInvariant()) {
+        throw "The blinded projection repositoryId does not match this configuration."
+    }
+    if ([string]$binding.project -cne [string]$ExpectedProject) {
+        throw "The blinded projection project does not match this configuration."
+    }
+    if ([int]$binding.prId -ne [int]$replayBound.PullRequestId) {
+        throw "The blinded projection PR does not match the sealed replay Bound PR."
+    }
+    if ([string]$binding.repositoryId -cne [string]$replayBound.RepositoryId) {
+        throw "The blinded projection repositoryId does not match the sealed replay Bound repository."
+    }
+    if ([string]$binding.project -cne [string]$replayBound.Project) {
+        throw "The blinded projection project does not match the sealed replay Bound project."
+    }
+    foreach ($identityCheck in @(
+            @('sourceCommit', [string]$binding.sourceCommit, [string]$replayBound.SourceCommit),
+            @('targetCommit', [string]$binding.targetCommit, [string]$replayBound.TargetCommit),
+            @('changeSetDigest', [string]$binding.changeSetDigest, [string]$replayBound.ChangeSetSha256))) {
+        if (([string]$identityCheck[1]).ToLowerInvariant() -cne ([string]$identityCheck[2]).ToLowerInvariant()) {
+            throw "The blinded projection $($identityCheck[0]) does not match the sealed replay Bound value."
+        }
+    }
+
+    # -- Ref / HEAD identity: FAIL CLOSED on any git failure ------------------
+    if (-not $CaptureRoleInputExpectedHeadCommit -or $CaptureRoleInputExpectedHeadCommit -notmatch '^[0-9a-fA-F]{40}$') {
+        throw "Role input capture requires -CaptureRoleInputExpectedHeadCommit as a full 40-hex commit id."
+    }
+    if (-not $CaptureRoleInputExpectedRef -or $CaptureRoleInputExpectedRef -notmatch '^refs/') {
+        throw "Role input capture requires -CaptureRoleInputExpectedRef as a full ref (refs/...)."
+    }
+    $resolvedRepoPath = (Resolve-Path -LiteralPath $RepoPath).Path
+    $headNow = (& git -C $RepoPath rev-parse HEAD 2>$null)
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$headNow)) {
+        throw "The running RepoPath '$resolvedRepoPath' is not a readable git worktree; capture fails closed on HEAD resolution."
+    }
+    $headNow = ([string]$headNow).Trim().ToLowerInvariant()
+    if ($headNow -cne $CaptureRoleInputExpectedHeadCommit.ToLowerInvariant()) {
+        throw "The running checkout HEAD '$headNow' does not match -CaptureRoleInputExpectedHeadCommit."
+    }
+    $refCommit = (& git -C $RepoPath rev-parse --verify --quiet "$CaptureRoleInputExpectedRef^{commit}" 2>$null)
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$refCommit)) {
+        throw "The expected ref '$CaptureRoleInputExpectedRef' does not resolve to a commit in the running worktree."
+    }
+    if (($refCommit.Trim().ToLowerInvariant()) -cne $headNow) {
+        throw "The expected ref '$CaptureRoleInputExpectedRef' does not resolve to the running checkout HEAD."
+    }
+
+    # -- Verifier: independently captured candidate + sealed discovery ---------
+    $candidateInputSha256 = ''
+    $clusterHash = ''
+    $discoveryMarkerSha256 = ''
+    $derivedCandidateHash = ''
+    $derivedClusterHash = ''
+    $derivedCandidates = @()
+    $verifierCluster = $null
+    $discoveryMarker = $null
+    if ($CaptureRoleInputRole -ceq 'verifier') {
+        if (-not $AcquisitionCandidateInputFile -or -not (Test-Path -LiteralPath $AcquisitionCandidateInputFile -PathType Leaf)) {
+            throw "The verifier role requires -AcquisitionCandidateInputFile naming an independently captured discovery candidate; a candidate is never derived from truth."
+        }
+        if (-not $AcquisitionDiscoveryMarkerFile -or -not (Test-Path -LiteralPath $AcquisitionDiscoveryMarkerFile -PathType Leaf)) {
+            throw "The verifier role requires -AcquisitionDiscoveryMarkerFile naming the sealed discovery result marker."
+        }
+        $candidateText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $AcquisitionCandidateInputFile).Path, $script:ReviewerUtf8)
+        if (-not (Test-Json -Json $candidateText -SchemaFile (Join-Path $schemaDir 'discovery-candidate.schema.json') -ErrorAction SilentlyContinue)) {
+            throw "The discovery candidate input failed its versioned schema."
+        }
+        $candidate = $candidateText | ConvertFrom-Json -Depth 64
+        Assert-ReviewerAcquisitionNoForbiddenKeys -Node $candidate -Surface "The discovery candidate input"
+        $candidateInputSha256 = Get-ReviewerTextSha256 -Text $candidateText
+        $clusterHash = Get-ReviewerTextSha256 -Text (ConvertTo-ReviewerCanonicalJsonText -JsonText $candidateText)
+        if ([string]$candidate.sourceFixtureId -ceq [string]$projection.fixtureId -and
+            [string]$candidate.sourceRole -ceq 'verifier') {
+            throw "The discovery candidate cannot itself be a verifier capture of the same fixture."
+        }
+        if ([string]$candidate.sourceRole -cne 'generalist') {
+            throw "The discovery candidate must come from an independent generalist discovery capture."
+        }
+        if (-not (@($ReviewPassModels) | Where-Object { [string]$_ -ceq [string]$candidate.sourceModel })) {
+            throw "The discovery candidate source model '$([string]$candidate.sourceModel)' is not one of this build's configured generalist models."
+        }
+        $discoveryMarkerText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $AcquisitionDiscoveryMarkerFile).Path, $script:ReviewerUtf8)
+        $discoveryMarkerSha256 = Get-ReviewerTextSha256 -Text $discoveryMarkerText
+        $discoveryCliOutcome = Get-AgentCliJsonOutcome -StdOutText $discoveryMarkerText
+        $discoveryAnswer = if ($discoveryCliOutcome -and $discoveryCliOutcome.Answer) { [string]$discoveryCliOutcome.Answer } else { $discoveryMarkerText }
+        $discoveryAnswer = $discoveryAnswer.Trim()
+        $discoveryPrefixIndex = $discoveryAnswer.IndexOf($ResultMarkerPrefix, [System.StringComparison]::Ordinal)
+        if ($discoveryPrefixIndex -lt 0) {
+            throw "The discovery result marker does not carry this build's production result-marker prefix."
+        }
+        $discoveryAnswer = $discoveryAnswer.Substring($discoveryPrefixIndex + $ResultMarkerPrefix.Length).Trim()
+        try { $discoveryMarker = $discoveryAnswer | ConvertFrom-Json -Depth 64 }
+        catch { throw "The discovery result marker is not valid JSON; the verifier cannot rebuild its discovery pass." }
+        if ([int]$discoveryMarker.prId -ne [int]$binding.prId -or
+            [string]$discoveryMarker.repositoryId -cne [string]$binding.repositoryId -or
+            [string]$discoveryMarker.project -cne [string]$binding.project -or
+            (([string]$discoveryMarker.reviewedSourceCommit).ToLowerInvariant() -cne ([string]$binding.sourceCommit).ToLowerInvariant())) {
+            throw "The discovery result marker identity does not match the canonical target; the discovery is for a different PR/commit."
+        }
+        # The EXACT production extraction and clustering, from the discovery
+        # model's own marker - never from truth, never fabricated.
+        $discoveryOnlyPass = @{ Model = [string]$candidate.sourceModel; Marker = $discoveryMarker; Reason = '' }
+        $derivedCandidates = @(ConvertTo-ReviewerVerificationCandidates -GeneralistPasses @($discoveryOnlyPass))
+        if ($derivedCandidates.Count -eq 0) {
+            throw "The discovery result marker yielded no candidates; a verifier capture requires at least one discovery finding."
+        }
+        $derivedClusters = @(Get-ReviewerVerificationClusters -Candidates $derivedCandidates)
+        $derivedPairs = @($derivedCandidates | ForEach-Object { "$([string]$_.candidateId)`n$([string]$_.candidateHash)" } | Sort-Object)
+        $providedPairs = @(@($candidate.candidates) | ForEach-Object { "$([string]$_.candidateId)`n$([string]$_.candidateHash)" } | Sort-Object)
+        if (($derivedPairs -join '|') -cne ($providedPairs -join '|')) {
+            throw "The supplied discovery candidate set does not match the set derived from the discovery marker; the verifier candidate must be the exact projection of that discovery."
+        }
+        $derivedClusterIds = @(@($derivedClusters | ForEach-Object { [string]$_.clusterId }) | Sort-Object -Unique)
+        if ($derivedClusterIds.Count -ne 1) {
+            throw "The discovery result marker derived $($derivedClusterIds.Count) clusters; capture binds a single-cluster discovery candidate."
+        }
+        if ([string]$candidate.clusterId -cne [string]$derivedClusterIds[0]) {
+            throw "The supplied discovery candidate clusterId does not match the cluster derived from the discovery marker."
+        }
+        $verifierCluster = $derivedClusters[0]
+        if ([string]$verifierCluster.status -cne 'ready') {
+            throw "The derived verification cluster is not assignable (status '$([string]$verifierCluster.status)'); capture refuses a run production would not have assigned."
+        }
+        $derivedCandidateHash = Get-ReviewerTextSha256 -Text ($derivedPairs -join '|')
+        $derivedClusterHash = Get-ReviewerTextSha256 -Text ($derivedClusterIds -join '|')
+    }
+    elseif ($AcquisitionCandidateInputFile -or $AcquisitionDiscoveryMarkerFile) {
+        throw "A discovery candidate / marker is only valid for the verifier role."
+    }
+
+    Write-Host ("Role input capture: role=$CaptureRoleInputRole model=$model fixture=$($projection.fixtureId) " +
+        "snapshot=$ReplaySnapshotName pr=$PullRequestId (no model, no process, oracle-free)") -ForegroundColor Cyan
+
+    # -- Drive the EXACT production role path to the model boundary -----------
+    # No agency path exists in this mode: nothing is ever launched, so the
+    # boundary's -AgencyPath is a non-executable sentinel. Replay sessions start
+    # no process, so it is never used for a transport either.
+    $agencyPathSentinel = '(role-input-capture:no-agency-path)'
+    $status = 'blocked'
+    $blockedReason = ''
+    $blockedDetail = ''
+    $script:ReviewerRoleInputCapture = $null
+    $script:ReviewerRoleInputCaptureBoundaryHits = 0
+    $script:ReviewerRoleInputCaptureActive = $true
+    try {
+        switch ($CaptureRoleInputRole) {
+            'generalist' {
+                $gen = $projection.generalist
+                if ($null -eq $gen) { throw "The generalist projection is missing its role context." }
+                $Bound = @{
+                    PrId                     = [int]$binding.prId
+                    SourceCommit             = [string]$binding.sourceCommit
+                    SourceBranch             = [string]$gen.sourceBranch
+                    AuthorAlias              = [string]$gen.authorAlias
+                    DigestText               = [string]$gen.threadDigestText
+                    AuthoritativeSourcesText = [string](Get-ReviewerHashValue -Container $gen -Key 'authoritativeSourcesText' -Default '')
+                    PinnedSourceText         = [string](Get-ReviewerHashValue -Container $gen -Key 'pinnedSourceText' -Default '')
+                }
+                [void](Invoke-ReviewerModelPass -AgencyPath $agencyPathSentinel -CycleNumber 1 `
+                        -Bound $Bound -PassModel $model -PassNumber 1 -PassCount 1)
+            }
+            'specialist' {
+                if (-not $EnableConventionSpecialist) {
+                    throw "Specialist capture requires the convention specialist to be enabled in the capture config."
+                }
+                # The exact production cycle, routed to ONE role by the existing
+                # single-role guard, and returning before any discovery pass, the
+                # verifier or any delivery.
+                $script:ReviewerAcquisitionRolePassResult = $null
+                $script:ReviewerAcquisitionTargetRole = 'specialist'
+                $script:ReviewerAcquisitionActive = $true
+                try { [void](Invoke-ReviewerCycle -CycleNumber 1 -AgencyPath $agencyPathSentinel) }
+                finally {
+                    $script:ReviewerAcquisitionActive = $false
+                    $script:ReviewerAcquisitionTargetRole = ''
+                    $script:ReviewerAcquisitionExpectedConventionPlan = $null
+                    $script:ReviewerAcquisitionExpectedFactPlan = $null
+                }
+            }
+            'verifier' {
+                [void](Invoke-ReviewerAcquisitionVerifierCapture -AgencyPath $agencyPathSentinel `
+                        -PrId ([int]$binding.prId) -SourceCommit ([string]$binding.sourceCommit) `
+                        -VerifierModel $model -Candidates $derivedCandidates -Cluster $verifierCluster `
+                        -DiscoveryMarker $discoveryMarker)
+            }
+        }
+    }
+    catch {
+        $message = [string]$_.Exception.Message
+        if ($message -cne $script:ReviewerRoleInputCaptureSentinel) {
+            $blockedReason = 'sealedPathFailedClosed'
+            $blockedDetail = $message
+        }
+    }
+    finally {
+        $script:ReviewerRoleInputCaptureActive = $false
+    }
+
+    $capture = $script:ReviewerRoleInputCapture
+    if ($capture) { $status = 'captured' }
+    elseif (-not $blockedReason) {
+        # The role path completed without ever reaching a model boundary: the
+        # sealed material selected no work for this role. Typed, never a
+        # fabricated stimulus and never a live retry.
+        $status = 'degraded'
+        $blockedReason = 'noModelBoundaryReached'
+        $blockedDetail = "The production $CaptureRoleInputRole path completed without constructing a model stimulus."
+    }
+
+    # -- Role-scoped digests, reusing the production prompt/schema surfaces ----
+    # The result-contract schema is nonce-bound, so it exists only when a
+    # stimulus was actually constructed. A blocked or degraded capture reports an
+    # empty schema digest rather than a schema built around an invented nonce.
+    $captureNonce = if ($capture) { [string]$capture.nonce } else { '' }
+    $roleMarkerSchema = $null
+    switch ($CaptureRoleInputRole) {
+        'specialist' {
+            $rolePromptPath = (Resolve-Path -LiteralPath $ConventionSpecialistPromptPath).Path
+            $roleMarkerPrefix = [string]$script:ReviewerConventionSpecialistMarkerPrefix
+            if ($captureNonce) {
+                $roleMarkerSchema = Get-ReviewerConventionSpecialistMarkerSchema -ExpectedProject $ExpectedProject `
+                    -ExpectedNonce $captureNonce
+            }
+        }
+        'verifier' {
+            $rolePromptPath = (Resolve-Path -LiteralPath $CrossVerificationPromptPath).Path
+            $roleMarkerPrefix = [string]$script:ReviewerVerificationMarkerPrefix
+            if ($captureNonce) {
+                $roleMarkerSchema = Get-ReviewerVerificationMarkerSchema -ExpectedProject $ExpectedProject `
+                    -ExpectedNonce $captureNonce -ExpectedVerifierModel $model -MaxVerdicts @($derivedCandidates).Count
+            }
+        }
+        default {
+            $rolePromptPath = (Resolve-Path -LiteralPath $PromptFile).Path
+            $roleMarkerPrefix = [string]$ResultMarkerPrefix
+            if ($captureNonce) {
+                $roleMarkerSchema = Get-ReviewerMarkerSchema -ExpectedProject $ExpectedProject `
+                    -ExpectedNonce $captureNonce -MaxFindingItems $EffectiveMaxFindings
+            }
+        }
+    }
+    $rolePromptText = [IO.File]::ReadAllText($rolePromptPath, $script:ReviewerUtf8)
+    $requestRecord = [ordered]@{
+        role         = $CaptureRoleInputRole
+        model        = $model
+        prId         = [int]$binding.prId
+        repositoryId = [string]$cfgRepoId
+        project      = [string]$ExpectedProject
+        sourceCommit = [string]$binding.sourceCommit
+        markerPrefix = [string]$roleMarkerPrefix
+        maxFindings  = [int]$EffectiveMaxFindings
+    }
+    $promptText = if ($capture) { [string]$capture.promptText } else { '' }
+    $captureArguments = if ($capture) { @($capture.arguments) } else { @() }
+    $toolGrant = Get-ReviewerRoleInputToolGrant -Arguments $captureArguments
+
+    $digests = [ordered]@{
+        fixtureProjectionSha256 = $projectionSha256
+        requestSha256           = (Get-ReviewerTextSha256 -Text (Get-ReviewerCanonicalJson -Value $requestRecord))
+        inputSha256             = [string]$(if ($capture) { $capture.promptSha256 } else { '' })
+        promptSha256            = (Get-ReviewerTextSha256 -Text $rolePromptText)
+        schemaSha256            = [string]$(if ($null -ne $roleMarkerSchema) { Get-ReviewerTextSha256 -Text (Get-ReviewerCanonicalJson -Value $roleMarkerSchema) } else { '' })
+        configSha256            = ([string]$ConfigSha256).ToLowerInvariant()
+        scriptSha256            = ([string]$ScriptSelfSha256).ToLowerInvariant()
+        launchArgumentsSha256   = [string]$(if ($capture) { $capture.argumentsSha256 } else { '' })
+        bindingSha256           = [string]$(if ($capture) { $capture.bindingSha256 } else { '' })
+        snapshotManifestDigest  = ([string]$ReplayManifestDigest).ToLowerInvariant()
+        candidateInputSha256    = $candidateInputSha256
+        clusterHash             = $clusterHash
+        discoveryMarkerSha256   = $discoveryMarkerSha256
+        derivedCandidateHash    = $derivedCandidateHash
+        derivedClusterHash      = $derivedClusterHash
+    }
+
+    # -- Emission: a READY bundle, or an exact typed blocker ------------------
+    # A capture publishes exactly one of two things. When the boundary was
+    # reached it publishes an atomic, read-only, schema-validated capture bundle
+    # whose manifest asserts ready=true. When it was not, it publishes a typed
+    # blocker document instead and exits non-zero: there is no half-ready bundle,
+    # no live fallback and no fabricated stimulus.
+    $endedUtc = [DateTime]::UtcNow
+    $timings = [ordered]@{
+        startedUtc      = $startedUtc.ToString('o')
+        endedUtc        = $endedUtc.ToString('o')
+        totalDurationMs = [int](($endedUtc - $startedUtc).TotalMilliseconds)
+    }
+    try {
+        New-Item -ItemType Directory -Path $staging -Force | Out-Null
+        if ($status -cne 'captured') {
+            $blocker = [ordered]@{
+                schemaVersion = 1
+                kind          = 'reviewer-production-role-input-capture-blocked'
+                ready         = $false
+                status        = $status
+                blockedReason = [string]$blockedReason
+                blockedDetail = [string]$blockedDetail
+                fixtureId     = [string]$projection.fixtureId
+                role          = $CaptureRoleInputRole
+                model         = $model
+                boundaryHits  = [int]$script:ReviewerRoleInputCaptureBoundaryHits
+                snapshot      = [ordered]@{
+                    name           = [string]$ReplaySnapshotName
+                    manifestDigest = ([string]$ReplayManifestDigest).ToLowerInvariant()
+                    nonPromotable  = $true
+                    resourceCount  = [int]$script:ReviewerReplaySnapshot.ResourceCount
+                }
+                build         = [ordered]@{
+                    repoPath = $resolvedRepoPath
+                    head     = $headNow
+                    ref      = [string]$CaptureRoleInputExpectedRef
+                }
+                sideEffects   = $script:ReviewerRoleInputZeroSideEffects
+                timings       = $timings
+            }
+            Assert-ReviewerAcquisitionNoForbiddenKeys -Node $blocker -Surface 'Role input capture blocker'
+            $blockerText = Get-ReviewerCanonicalJson -Value $blocker
+            if (-not (Test-Json -Json $blockerText -SchemaFile (Join-Path $schemaDir 'role-input-capture-blocked.schema.json') -ErrorAction SilentlyContinue)) {
+                throw 'The role input capture blocker failed its versioned schema.'
+            }
+            [IO.File]::WriteAllText((Join-Path $staging 'capture-blocked.json'), $blockerText, $script:ReviewerUtf8)
+            Set-ReviewerRoleInputTreeReadOnly -Root $staging
+            Move-Item -LiteralPath $staging -Destination $outputRoot
+            $published = $true
+            Write-Host ("Role input capture BLOCKED: status=$status reason=$blockedReason " +
+                "role=$CaptureRoleInputRole model=$model -> $outputRoot") -ForegroundColor Yellow
+            if ($blockedDetail) { Write-Host "  $blockedDetail" -ForegroundColor Yellow }
+            return 3
+        }
+
+        # -- The exact boundary must have been reached exactly once ------------
+        if ($script:ReviewerRoleInputCaptureBoundaryHits -ne 1) {
+            throw ("Role input capture observed $script:ReviewerRoleInputCaptureBoundaryHits model-boundary hits; " +
+                "exactly one is required for a single-role capture.")
+        }
+        if ([string]$capture.model -cne $model) {
+            throw "The production role requested model '$([string]$capture.model)', not the captured '$model'."
+        }
+
+        # -- The blinded role projection, rebuilt from the VALIDATED input -----
+        # The role context sealed out is the same oracle-scanned, schema-gated
+        # context that came in; it is never re-derived from live run state.
+        $roleContext = Get-ReviewerHashValue -Container $projection -Key $CaptureRoleInputRole
+        if ($null -eq $roleContext) { throw "The blinded projection carries no '$CaptureRoleInputRole' role context." }
+        $emittedProjection = [ordered]@{
+            schemaVersion = 1
+            kind          = 'reviewer-blinded-fixture-projection'
+            fixtureId     = [string]$projection.fixtureId
+            role          = $CaptureRoleInputRole
+            binding       = [ordered]@{
+                prId            = [int]$binding.prId
+                repositoryId    = [string]$binding.repositoryId
+                project         = [string]$binding.project
+                sourceCommit    = ([string]$binding.sourceCommit).ToLowerInvariant()
+                targetCommit    = ([string]$binding.targetCommit).ToLowerInvariant()
+                changeSetDigest = ([string]$binding.changeSetDigest).ToLowerInvariant()
+            }
+        }
+        $emittedProjection[$CaptureRoleInputRole] = $roleContext
+        $emittedProjectionJson = Get-ReviewerCanonicalJson -Value $emittedProjection
+        if (-not (Test-Json -Json $emittedProjectionJson -SchemaFile (Join-Path $schemaDir 'fixture-projection.schema.json') -ErrorAction SilentlyContinue)) {
+            throw 'The emitted blinded role projection failed its versioned schema.'
+        }
+        Assert-ReviewerAcquisitionNoForbiddenKeys -Node $emittedProjection -Surface 'The emitted blinded role projection'
+
+        [IO.File]::WriteAllText((Join-Path $staging 'role-input-prompt.txt'), $promptText, $script:ReviewerUtf8)
+        [IO.File]::WriteAllText((Join-Path $staging 'projection.json'), $emittedProjectionJson, $script:ReviewerUtf8)
+        [IO.File]::WriteAllText((Join-Path $staging 'role-input-request.json'),
+            (Get-ReviewerCanonicalJson -Value $requestRecord), $script:ReviewerUtf8)
+        [IO.File]::WriteAllText((Join-Path $staging 'role-input-marker-schema.json'),
+            (Get-ReviewerCanonicalJson -Value $roleMarkerSchema), $script:ReviewerUtf8)
+
+        # -- Role provenance, sealed as a model-visible resource ---------------
+        $provenance = [ordered]@{
+            schemaVersion = 1
+            kind          = 'reviewer-model-visible-role-provenance'
+            fixtureId     = [string]$projection.fixtureId
+            role          = $CaptureRoleInputRole
+            bindingSha256 = (Get-ReviewerTextSha256 -Text (Get-ReviewerCanonicalJson -Value $emittedProjection.binding))
+            configSha256  = ([string]$ConfigSha256).ToLowerInvariant()
+            scriptSha256  = ([string]$ScriptSelfSha256).ToLowerInvariant()
+            promptSha256  = ([string]$PromptFileSha256).ToLowerInvariant()
+            context       = $roleContext
+        }
+        $provenanceJson = Get-ReviewerCanonicalJson -Value $provenance
+        if (-not (Test-Json -Json $provenanceJson -SchemaFile (Join-Path $schemaDir 'role-provenance.schema.json') -ErrorAction SilentlyContinue)) {
+            throw 'The captured role provenance failed its versioned schema.'
+        }
+        $provenanceSha = Get-ReviewerTextSha256 -Text $provenanceJson
+        $provenanceLeaf = "$provenanceSha-role-$CaptureRoleInputRole.json"
+        $sealedDir = Join-Path $staging 'sealed-resources'
+        New-Item -ItemType Directory -Path $sealedDir -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $sealedDir $provenanceLeaf), $provenanceJson, $script:ReviewerUtf8)
+
+        # -- Optional materializer-ready legacy pack ---------------------------
+        # Every sealed resource the legacy projection declares is re-verified
+        # against its own hash AND byte length before it is copied, so a pack
+        # whose media drifted from its manifest is refused rather than restated.
+        if ($CaptureRoleInputLegacyProjectionFile) {
+            $legacyPath = (Resolve-Path -LiteralPath $CaptureRoleInputLegacyProjectionFile).Path
+            Assert-ReviewerRoleInputSafePath -Path $legacyPath -Surface "The legacy benchmark projection"
+            $legacyText = [IO.File]::ReadAllText($legacyPath, $script:ReviewerUtf8)
+            if (-not (Test-Json -Json $legacyText -SchemaFile (Join-Path $schemaDir 'legacy-benchmark-projection.schema.json') -ErrorAction SilentlyContinue)) {
+                throw 'The legacy benchmark projection failed its versioned schema.'
+            }
+            $legacy = $legacyText | ConvertFrom-Json -AsHashtable -Depth 64
+            Assert-ReviewerAcquisitionNoForbiddenKeys -Node $legacy -Surface 'The legacy benchmark projection'
+            if ((Get-ReviewerTextSha256 -Text (Get-ReviewerCanonicalJson -Value $legacy.binding)) -cne [string]$legacy.bindingSha256) {
+                throw 'The legacy benchmark projection bindingSha256 does not cover its own binding.'
+            }
+            if ([int]$legacy.binding.pr -ne [int]$replayBound.PullRequestId -or
+                [string]$legacy.binding.repositoryId -cne [string]$replayBound.RepositoryId -or
+                (([string]$legacy.binding.source).ToLowerInvariant() -cne ([string]$replayBound.SourceCommit).ToLowerInvariant()) -or
+                (([string]$legacy.binding.target).ToLowerInvariant() -cne ([string]$replayBound.TargetCommit).ToLowerInvariant())) {
+                throw 'The legacy benchmark projection identity does not match the sealed replay snapshot.'
+            }
+            $legacyPackRoot = Split-Path (Split-Path $legacyPath -Parent) -Parent
+            foreach ($resource in @($legacy.resources)) {
+                $relative = ([string]$resource.sealedPath).Replace('/', [IO.Path]::DirectorySeparatorChar)
+                if ([IO.Path]::IsPathRooted($relative) -or $relative -match '(^|[\\/])\.\.([\\/]|$)') {
+                    throw "The legacy sealed resource path '$([string]$resource.sealedPath)' escapes its pack."
+                }
+                $source = Join-Path $legacyPackRoot $relative
+                if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+                    throw "The legacy sealed resource '$([string]$resource.sealedPath)' is missing from its pack."
+                }
+                if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant() -cne ([string]$resource.sha256).ToLowerInvariant() -or
+                    [long](Get-Item -LiteralPath $source).Length -ne [long]$resource.byteLength) {
+                    throw "The legacy sealed resource '$([string]$resource.sealedPath)' failed its hash/length binding."
+                }
+                $destination = Join-Path $staging $relative
+                New-Item -ItemType Directory -Force -Path (Split-Path $destination -Parent) | Out-Null
+                Copy-Item -LiteralPath $source -Destination $destination
+            }
+            $legacy.resources = @($legacy.resources) + @([ordered]@{
+                    mediaRole  = "role-provenance-$CaptureRoleInputRole"
+                    sealedPath = "sealed-resources/$provenanceLeaf"
+                    sha256     = $provenanceSha
+                    byteLength = [long]$script:ReviewerUtf8.GetByteCount($provenanceJson)
+                })
+            $legacyProjectionDir = Join-Path $staging 'projections'
+            New-Item -ItemType Directory -Force -Path $legacyProjectionDir | Out-Null
+            [IO.File]::WriteAllText((Join-Path $legacyProjectionDir "$([string]$legacy.fixtureId).blinded.json"),
+                (Get-ReviewerCanonicalJson -Value $legacy), $script:ReviewerUtf8)
+        }
+
+        # -- The capture manifest, last, so it covers every emitted file -------
+        $files = @(Get-ChildItem -LiteralPath $staging -File -Recurse -Force | Sort-Object FullName | ForEach-Object {
+                [ordered]@{
+                    path       = [IO.Path]::GetRelativePath($staging, $_.FullName).Replace('\', '/')
+                    sha256     = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                    byteLength = [long]$_.Length
+                }
+            })
+        $captureManifest = [ordered]@{
+            schemaVersion  = 1
+            kind           = 'reviewer-production-role-input-capture'
+            ready          = $true
+            status         = 'captured'
+            fixtureId      = [string]$projection.fixtureId
+            role           = $CaptureRoleInputRole
+            model          = $model
+            nonce          = $captureNonce
+            promptBytes    = [int]$capture.promptBytes
+            resultMarkerPrefix = [string]$roleMarkerPrefix
+            identities     = [ordered]@{
+                provider     = [string]$script:ReviewerReplaySnapshot.Provider
+                organization = [string](Get-ReviewerHashValue -Container $replayBound -Key 'Organization' -Default '')
+                project      = [string]$ExpectedProject
+                repositoryId = [string]$cfgRepoId
+                prId         = [int]$PullRequestId
+                source       = ([string]$replayBound.SourceCommit).ToLowerInvariant()
+                common       = ([string](Get-ReviewerHashValue -Container $replayBound -Key 'CommonCommit' -Default '')).ToLowerInvariant()
+                target       = ([string]$replayBound.TargetCommit).ToLowerInvariant()
+                changeSet    = ([string]$replayBound.ChangeSetSha256).ToLowerInvariant()
+            }
+            hashes         = $digests
+            bindingIdentity = $capture.bindingIdentity
+            launch         = [ordered]@{
+                argumentsSha256 = [string]$capture.argumentsSha256
+                boundaryHits    = [int]$script:ReviewerRoleInputCaptureBoundaryHits
+                availableTools  = @($toolGrant.availableTools)
+                allowTools      = @($toolGrant.allowTools)
+                denySet         = @($toolGrant.denyTools)
+                arguments       = @($captureArguments)
+            }
+            snapshot       = [ordered]@{
+                name           = [string]$ReplaySnapshotName
+                manifestDigest = ([string]$ReplayManifestDigest).ToLowerInvariant()
+                nonPromotable  = $true
+                sealKind       = [string]$script:ReviewerReplaySnapshot.Classification.SealKind
+                resources      = @(Get-ReviewerRoleInputSealedResourceInventory)
+            }
+            build          = [ordered]@{
+                repoPath           = $resolvedRepoPath
+                head               = $headNow
+                ref                = [string]$CaptureRoleInputExpectedRef
+                reviewerScriptPath = [string]$PSCommandPath
+                promptFile         = $rolePromptPath
+            }
+            classification = [ordered]@{
+                private         = $true
+                oracleFree      = $true
+                nonPromotable   = $true
+                writesPermitted = $false
+            }
+            sideEffects    = $script:ReviewerRoleInputZeroSideEffects
+            timings        = $timings
+            files          = $files
+        }
+        # Scan the caller-derived subtrees only. The `classification` block is
+        # this mode's OWN assertion about the bundle - `oracleFree = true` is a
+        # claim that no oracle is present, and running an oracle-key scan over it
+        # would refuse the very statement that there is no oracle. Every subtree
+        # whose content originates outside this function is scanned.
+        foreach ($scanned in @(
+                @{ Node = $captureManifest.identities; Surface = 'The capture manifest identity block' },
+                @{ Node = $captureManifest.bindingIdentity; Surface = 'The capture manifest binding identity' },
+                @{ Node = $captureManifest.launch; Surface = 'The capture manifest launch record' },
+                @{ Node = $captureManifest.snapshot; Surface = 'The capture manifest sealed inventory' },
+                @{ Node = $captureManifest.build; Surface = 'The capture manifest build record' })) {
+            Assert-ReviewerAcquisitionNoForbiddenKeys -Node $scanned.Node -Surface ([string]$scanned.Surface)
+        }
+        $manifestText = Get-ReviewerCanonicalJson -Value $captureManifest
+        $schemaErrors = $null
+        if (-not (Test-Json -Json $manifestText -SchemaFile (Join-Path $schemaDir 'role-input-capture.schema.json') `
+                    -ErrorAction SilentlyContinue -ErrorVariable schemaErrors)) {
+            throw "The role input capture manifest failed its versioned schema: $(($schemaErrors | ForEach-Object { $_.ToString() }) -join '; ')"
+        }
+        [IO.File]::WriteAllText((Join-Path $staging 'capture-manifest.json'), $manifestText, $script:ReviewerUtf8)
+
+        Set-ReviewerRoleInputTreeReadOnly -Root $staging
+        Move-Item -LiteralPath $staging -Destination $outputRoot
+        $published = $true
+        Write-Host ("Role input capture READY: role=$CaptureRoleInputRole model=$model " +
+            "promptBytes=$([int]$capture.promptBytes) boundaryHits=1 modelSubprocesses=0 -> $outputRoot") -ForegroundColor Green
+        Write-Output (Get-ReviewerCanonicalJson -Value ([ordered]@{
+                    kind           = 'reviewer-production-role-input-capture-result'
+                    ready          = $true
+                    role           = $CaptureRoleInputRole
+                    model          = $model
+                    outputRoot     = $outputRoot
+                    manifestSha256 = (Get-ReviewerTextSha256 -Text $manifestText)
+                    inputSha256    = [string]$capture.promptSha256
+                }))
+        return 0
+    }
+    finally {
+        # An unpublished staging tree is never left behind, and the throwaway
+        # state directory a capture was given is removed whole: a no-model
+        # capture leaves exactly the bundle it published and nothing else.
+        if (-not $published -and (Test-Path -LiteralPath $staging)) {
+            Remove-ReviewerRoleInputTree -Root $staging
+        }
+        if ($StateDir -and (Test-Path -LiteralPath $StateDir)) {
+            Remove-ReviewerRoleInputTree -Root $StateDir
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+# No-model role input capture short-circuits Main entirely, ahead of the dry-run
+# self-checks, the run lock and the model-runner lookup: it builds exactly one
+# role's stimulus from sealed material and stops at the exact production model
+# boundary. It launches no process, authors no plan, mints no token, takes no
+# lease, and reads and writes nothing live - so it must not resolve `agency`,
+# which would make a no-model capture depend on the very executable it exists to
+# prove it never runs.
+if ($CaptureRoleInputRole) {
+    exit (Invoke-ReviewerRoleInputCaptureRun)
+}
 
 if ($DryRun) {
     $lock = $null
