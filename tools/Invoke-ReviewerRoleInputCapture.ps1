@@ -89,6 +89,13 @@ param(
     [Parameter(Mandatory, ParameterSetName = 'Verify')]
     [string]$OutputRoot,
 
+    # HMAC key kept outside the published bundle. Capture may create the default
+    # private key; Preflight and VerifyOnly never create one.
+    [Parameter(ParameterSetName = 'Capture')]
+    [Parameter(ParameterSetName = 'Preflight')]
+    [Parameter(ParameterSetName = 'Verify')]
+    [string]$SealKeyPath,
+
     # Verifier role only: the independently captured discovery candidate the
     # cross-check is about, and the sealed discovery result marker it came from.
     [Parameter(ParameterSetName = 'Capture')]
@@ -150,6 +157,70 @@ function Get-Sha256Hex {
 function Get-FileSha256Hex {
     param([Parameter(Mandatory)][string]$Path)
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Get-CaptureSealKeyPath {
+    if ($SealKeyPath) { return [IO.Path]::GetFullPath($SealKeyPath) }
+    return (Join-Path (Join-Path ([Environment]::GetFolderPath('UserProfile')) '.devpilot') 'reviewer-role-input-capture-seal.key')
+}
+
+function Get-CaptureSealKey {
+    param([switch]$Create)
+    $path = Get-CaptureSealKeyPath
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        if (-not $Create) {
+            throw "The capture seal key '$path' does not exist; supply an existing -SealKeyPath."
+        }
+        $parent = Split-Path $path -Parent
+        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+        $bytes = [byte[]]::new(32)
+        [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+        $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+        try { & icacls $path /inheritance:r /grant:r "$($env:USERNAME):(R,W)" *> $null } catch { }
+    }
+    $key = [IO.File]::ReadAllBytes($path)
+    if ($key.Length -ne 32) { throw "The capture seal key '$path' must contain exactly 32 bytes." }
+    return , $key
+}
+
+function Get-HmacHex {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text, [Parameter(Mandatory)][byte[]]$Key)
+    $hmac = [Security.Cryptography.HMACSHA256]::new($Key)
+    try { return ([Convert]::ToHexString($hmac.ComputeHash($Utf8.GetBytes($Text)))).ToLowerInvariant() }
+    finally { $hmac.Dispose() }
+}
+
+function Test-FixedTimeHex {
+    param([string]$A, [string]$B)
+    if ($A.Length -ne $B.Length) { return $false }
+    $diff = 0
+    for ($i = 0; $i -lt $A.Length; $i++) {
+        $diff = $diff -bor ([int][char]$A[$i] -bxor [int][char]$B[$i])
+    }
+    return ($diff -eq 0)
+}
+
+function Write-CaptureSeal {
+    param(
+        [Parameter(Mandatory)][string]$BundleRoot,
+        [Parameter(Mandatory)][string]$SignedFile,
+        [Parameter(Mandatory)][byte[]]$Key
+    )
+    $signedPath = Join-Path $BundleRoot $SignedFile
+    $text = [IO.File]::ReadAllText($signedPath, $Utf8)
+    $seal = [ordered]@{
+        schemaVersion = 1
+        kind          = 'reviewer-production-role-input-capture-seal'
+        algorithm     = 'HMACSHA256'
+        signedFile    = $SignedFile
+        signedSha256  = Get-Sha256Hex -Text $text
+        manifestHmac  = Get-HmacHex -Text $text -Key $Key
+    }
+    $sealPath = Join-Path $BundleRoot 'capture-seal.json'
+    [IO.File]::WriteAllText($sealPath, ($seal | ConvertTo-Json -Compress), $Utf8)
+    $item = Get-Item -LiteralPath $sealPath -Force
+    $item.Attributes = $item.Attributes -bor [IO.FileAttributes]::ReadOnly
 }
 
 function Assert-SafePath {
@@ -304,9 +375,18 @@ function Get-GitHead {
 
 function Get-TelemetryProof {
     <#
-        The independent half of the zero-side-effect claim. The bundle ASSERTS
-        zero; this reads the production-test-only telemetry sink the child wrote
-        and counts what actually happened. Any non-zero count fails the capture.
+        The independent FALSIFIER for the zero-side-effect claim. The bundle
+        ASSERTS zero; this reads the production-test-only telemetry sink the child
+        wrote and counts what actually happened. Any non-zero side-effect count
+        fails the capture.
+
+        It is deliberately NOT a positive proof, and the difference matters: a
+        no-model capture stops before the model boundary, so it opens no provider
+        session and serves no recorded read. An empty sink is therefore the
+        correct outcome for an honest capture, and "no events" must never be read
+        as "nothing happened". The positive evidence that the production path
+        really ran is the published bundle's single model-boundary hit, which is
+        asserted separately.
     #>
     param([Parameter(Mandatory)][string]$TelemetryPath)
     $events = @()
@@ -323,8 +403,10 @@ function Get-TelemetryProof {
     $liveProcess = @($events | Where-Object { [string]$_.event -ceq 'provider.liveProcessStarted' })
     $liveWrite = @($events | Where-Object { [string]$_.event -ceq 'provider.liveWrite' })
     $writeTools = @($events | Where-Object { [string]$_.event -in @('tool.write', 'provider.write', 'delivery.posted') })
+    $replayServes = @($events | Where-Object { [string]$_.event -ceq 'provider.replayServed' })
     return [ordered]@{
         totalEvents               = [int]$events.Count
+        sealedReplayServes        = [int]$replayServes.Count
         childProcessStarts        = [int]$processStarts.Count
         modelOrAgencyStarts       = [int]$modelStarts.Count
         providerLiveProcessStarts = [int]$liveProcess.Count
@@ -339,21 +421,67 @@ function Test-CaptureBundle {
         claims is recomputed from the bytes on disk; nothing is taken on trust.
         Returns the list of problems, empty when the bundle verifies.
     #>
-    param([Parameter(Mandatory)][string]$BundleRoot, [hashtable]$Expected = @{})
+    param(
+        [Parameter(Mandatory)][string]$BundleRoot,
+        [Parameter(Mandatory)][byte[]]$SealKey,
+        [hashtable]$Expected = @{}
+    )
     $problems = [Collections.Generic.List[string]]::new()
     $manifestPath = Join-Path $BundleRoot 'capture-manifest.json'
     $blockedPath = Join-Path $BundleRoot 'capture-blocked.json'
-    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
-        if (Test-Path -LiteralPath $blockedPath -PathType Leaf) {
-            $blockedText = [IO.File]::ReadAllText($blockedPath, $Utf8)
-            try { Assert-Schema -Json $blockedText -SchemaName 'role-input-capture-blocked.schema.json' -Surface 'The typed blocker' }
-            catch { [void]$problems.Add($_.Exception.Message) }
-            return $problems.ToArray()
-        }
+    $sealPath = Join-Path $BundleRoot 'capture-seal.json'
+    $signedFile = if (Test-Path -LiteralPath $manifestPath -PathType Leaf) { 'capture-manifest.json' }
+        elseif (Test-Path -LiteralPath $blockedPath -PathType Leaf) { 'capture-blocked.json' }
+        else { '' }
+    if (-not $signedFile) {
         [void]$problems.Add('the bundle publishes neither a capture manifest nor a typed blocker')
         return $problems.ToArray()
     }
-    $manifestText = [IO.File]::ReadAllText($manifestPath, $Utf8)
+    $signedPath = Join-Path $BundleRoot $signedFile
+    $signedText = [IO.File]::ReadAllText($signedPath, $Utf8)
+    if (-not (Test-Path -LiteralPath $sealPath -PathType Leaf)) {
+        [void]$problems.Add('the bundle is missing capture-seal.json')
+    }
+    else {
+        try {
+            $seal = [IO.File]::ReadAllText($sealPath, $Utf8) | ConvertFrom-Json -Depth 8
+            $sealKeys = @($seal.PSObject.Properties.Name | Sort-Object)
+            $expectedSealKeys = @('algorithm', 'kind', 'manifestHmac', 'schemaVersion', 'signedFile', 'signedSha256')
+            if (($sealKeys -join "`n") -cne ($expectedSealKeys -join "`n") -or
+                [int]$seal.schemaVersion -ne 1 -or
+                [string]$seal.kind -cne 'reviewer-production-role-input-capture-seal' -or
+                [string]$seal.algorithm -cne 'HMACSHA256' -or
+                [string]$seal.signedFile -cne $signedFile -or
+                [string]$seal.signedSha256 -notmatch '^[0-9a-f]{64}$' -or
+                [string]$seal.manifestHmac -notmatch '^[0-9a-f]{64}$') {
+                [void]$problems.Add('capture-seal.json has an invalid or unexpected shape')
+            }
+            else {
+                if (-not (Test-FixedTimeHex -A ([string]$seal.signedSha256) -B (Get-Sha256Hex -Text $signedText))) {
+                    [void]$problems.Add('capture signed-file SHA-256 seal mismatch')
+                }
+                if (-not (Test-FixedTimeHex -A ([string]$seal.manifestHmac) -B (Get-HmacHex -Text $signedText -Key $SealKey))) {
+                    [void]$problems.Add('capture manifest HMAC seal mismatch')
+                }
+            }
+        }
+        catch { [void]$problems.Add("capture-seal.json could not be verified: $($_.Exception.Message)") }
+    }
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        try { Assert-Schema -Json $signedText -SchemaName 'role-input-capture-blocked.schema.json' -Surface 'The typed blocker' }
+        catch { [void]$problems.Add($_.Exception.Message) }
+        foreach ($file in @(Get-ChildItem -LiteralPath $BundleRoot -File -Recurse -Force)) {
+            if (($file.Attributes -band [IO.FileAttributes]::ReadOnly) -eq 0) {
+                [void]$problems.Add("bundle file is not read-only: $($file.Name)")
+            }
+            $rel = [IO.Path]::GetRelativePath($BundleRoot, $file.FullName).Replace('\', '/')
+            if ($rel -notin @('capture-blocked.json', 'capture-seal.json')) {
+                [void]$problems.Add("typed blocker carries an unbound file: $rel")
+            }
+        }
+        return $problems.ToArray()
+    }
+    $manifestText = $signedText
     try { Assert-Schema -Json $manifestText -SchemaName 'role-input-capture.schema.json' -Surface 'The capture manifest' }
     catch { [void]$problems.Add($_.Exception.Message) }
     $manifest = $manifestText | ConvertFrom-Json -Depth 64
@@ -380,6 +508,7 @@ function Test-CaptureBundle {
         [void]$onDisk.Remove($rel)
     }
     [void]$onDisk.Remove('capture-manifest.json')
+    [void]$onDisk.Remove('capture-seal.json')
     foreach ($unbound in @($onDisk.Keys)) { [void]$problems.Add("bundle carries an unbound file: $unbound") }
 
     if (-not [bool]$manifest.ready) { [void]$problems.Add('manifest is not marked ready') }
@@ -424,7 +553,8 @@ function Test-CaptureBundle {
 if ($PSCmdlet.ParameterSetName -eq 'Verify') {
     $bundleRoot = [IO.Path]::GetFullPath($OutputRoot)
     if (-not (Test-Path -LiteralPath $bundleRoot -PathType Container)) { throw "The capture bundle '$bundleRoot' does not exist." }
-    $problems = @(Test-CaptureBundle -BundleRoot $bundleRoot)
+    $sealKey = Get-CaptureSealKey
+    $problems = @(Test-CaptureBundle -BundleRoot $bundleRoot -SealKey $sealKey)
     if ($problems.Count -gt 0) {
         Write-Host "FAIL: capture bundle verification found $($problems.Count) problem(s):" -ForegroundColor Red
         foreach ($p in $problems) { Write-Host "  - $p" -ForegroundColor Red }
@@ -547,6 +677,7 @@ $readiness = [ordered]@{
 }
 
 if ($Preflight) {
+    [void](Get-CaptureSealKey)
     Write-Output (($readiness | ConvertTo-Json -Depth 32 -Compress))
     exit 0
 }
@@ -560,10 +691,11 @@ $outputParent = [IO.Path]::GetDirectoryName($outputFull)
 if (-not $outputParent -or -not (Test-Path -LiteralPath $outputParent -PathType Container)) {
     throw "The capture output root's parent directory must already exist."
 }
+$captureSealKey = Get-CaptureSealKey -Create
 
-$workRoot = Join-Path $outputParent (".$([IO.Path]::GetFileName($outputFull)).$((Get-Sha256Hex -Text $outputFull).Substring(0, 16)).capture-work")
-if (Test-Path -LiteralPath $workRoot) { Remove-Item -LiteralPath $workRoot -Recurse -Force }
-New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
+$workRoot = Join-Path $outputParent ('.' + [IO.Path]::GetFileName($outputFull) + '.capture-work-' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $workRoot | Out-Null
+$publicationStaging = Join-Path $outputParent ('.' + [IO.Path]::GetFileName($outputFull) + '.capture-staging-' + [Guid]::NewGuid().ToString('N'))
 $telemetryPath = Join-Path $workRoot 'telemetry.jsonl'
 $stdOutPath = Join-Path $workRoot 'child.stdout.log'
 $stdErrPath = Join-Path $workRoot 'child.stderr.log'
@@ -578,7 +710,7 @@ $reviewerArgs = @(
     '-ReplayRoot', $replayFull, '-ReplaySnapshotName', $ReplaySnapshotName,
     '-ReplayManifestDigest', $ReplayManifestDigest.ToLowerInvariant(),
     '-CaptureRoleInputRole', $Role, '-CaptureRoleInputModel', $Model,
-    '-CaptureRoleInputOutputRoot', $outputFull,
+    '-CaptureRoleInputOutputRoot', $publicationStaging,
     '-CaptureRoleInputExpectedRef', $ExpectedRef,
     '-CaptureRoleInputExpectedHeadCommit', $expectedHead,
     '-AcquisitionFixtureProjectionFile', $projectionFull
@@ -657,24 +789,72 @@ finally {
 }
 
 $telemetry = Get-TelemetryProof -TelemetryPath $telemetryPath
-$zeroProcessProven = ($telemetry.childProcessStarts -eq 0 -and $telemetry.modelOrAgencyStarts -eq 0 -and
+# Telemetry is a FALSIFIER here, not a verifier, and the distinction is stated
+# rather than papered over. A no-model capture stops before the model boundary,
+# so it opens no provider session and serves no recorded read: an empty sink is
+# the CORRECT outcome, and demanding events would fail every honest capture.
+# What telemetry can still do is disprove the claim - any process start, live
+# provider activity or write tool it records fails the run. The positive evidence
+# comes from the published bundle instead: exactly one model-boundary hit proves
+# the production path really ran all the way to the boundary and stopped there.
+$telemetryFalsifiesNothing = ($telemetry.childProcessStarts -eq 0 -and $telemetry.modelOrAgencyStarts -eq 0 -and
     $telemetry.providerLiveProcessStarts -eq 0 -and $telemetry.providerLiveWrites -eq 0 -and
     $telemetry.writeToolInvocations -eq 0)
+$zeroProcessProven = $telemetryFalsifiesNothing
 
 $childStdErr = if (Test-Path -LiteralPath $stdErrPath) { [IO.File]::ReadAllText($stdErrPath, $Utf8).Trim() } else { '' }
 $captured = ($childExitCode -eq 0)
 $problems = @()
-if ($captured) {
-    $problems = @(Test-CaptureBundle -BundleRoot $outputFull -Expected @{
-            role = $Role; model = $Model; prId = $PullRequestId
-            snapshotManifestDigest = $ReplayManifestDigest.ToLowerInvariant()
-            ref = $ExpectedRef; head = $expectedHead
-        })
-}
 if (-not $zeroProcessProven) {
     $problems = @($problems) + @("telemetry proves a side effect occurred: $(($telemetry.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' ')")
 }
-Remove-Item -LiteralPath $workRoot -Recurse -Force -ErrorAction SilentlyContinue
+$published = $false
+try {
+    if ($zeroProcessProven -and (Test-Path -LiteralPath $publicationStaging -PathType Container)) {
+        $signedFile = if (Test-Path -LiteralPath (Join-Path $publicationStaging 'capture-manifest.json') -PathType Leaf) {
+            'capture-manifest.json'
+        }
+        elseif (Test-Path -LiteralPath (Join-Path $publicationStaging 'capture-blocked.json') -PathType Leaf) {
+            'capture-blocked.json'
+        }
+        else { '' }
+        if (-not $signedFile) {
+            $problems = @($problems) + @('the child publication carries neither a capture manifest nor a typed blocker')
+        }
+        else {
+            Write-CaptureSeal -BundleRoot $publicationStaging -SignedFile $signedFile -Key $captureSealKey
+            $expected = if ($captured) {
+                @{
+                    role = $Role; model = $Model; prId = $PullRequestId
+                    snapshotManifestDigest = $ReplayManifestDigest.ToLowerInvariant()
+                    ref = $ExpectedRef; head = $expectedHead
+                }
+            }
+            else { @{} }
+            $problems = @($problems) + @(Test-CaptureBundle -BundleRoot $publicationStaging -SealKey $captureSealKey -Expected $expected)
+            if ($problems.Count -eq 0) {
+                if (Test-Path -LiteralPath $outputFull) {
+                    $problems = @($problems) + @("the capture output root '$outputFull' appeared during publication; it was not overwritten")
+                }
+                else {
+                    [IO.Directory]::Move($publicationStaging, $outputFull)
+                    $published = $true
+                }
+            }
+        }
+    }
+    elseif ($captured) {
+        $problems = @($problems) + @('the child reported success but published no staging bundle')
+    }
+}
+finally {
+    if (-not $published -and (Test-Path -LiteralPath $publicationStaging)) {
+        Get-ChildItem -LiteralPath $publicationStaging -File -Recurse -Force -ErrorAction SilentlyContinue |
+            ForEach-Object { try { $_.Attributes = [IO.FileAttributes]::Normal } catch { } }
+        Remove-Item -LiteralPath $publicationStaging -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -LiteralPath $workRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 $result = [ordered]@{
     schemaVersion   = 1

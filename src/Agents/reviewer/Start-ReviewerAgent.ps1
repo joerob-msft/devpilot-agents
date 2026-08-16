@@ -3079,6 +3079,7 @@ $script:ReviewerAcquisitionSingleShot = $false
 # boundary apart from a genuine production fault and classify a run that never
 # reached the boundary as typed blocked/degraded instead of fabricating one.
 $script:ReviewerRoleInputCaptureActive = $false
+$script:ReviewerRoleInputEphemeralStateRoot = ''
 $script:ReviewerRoleInputCapture = $null
 $script:ReviewerRoleInputCaptureBoundaryHits = 0
 $script:ReviewerRoleInputConventionPlan = $null
@@ -3324,7 +3325,12 @@ if ($CaptureRoleInputRole) {
         throw "Role input capture output parent '$captureOutputParent' does not exist."
     }
     if (-not $StateDir) {
+        # Only a state directory this mode synthesized may be deleted on the way
+        # out. A caller-supplied one is someone else's state - a capture that
+        # removed it would destroy replay attempts, gate decisions and signing
+        # keys that have nothing to do with the bundle it publishes.
         $StateDir = Join-Path $captureOutputParent ('.role-input-state-' + [Guid]::NewGuid().ToString('N'))
+        $script:ReviewerRoleInputEphemeralStateRoot = $StateDir
     }
 }
 if (-not $StateDir) {
@@ -16361,17 +16367,7 @@ function Invoke-ReviewerBlindedAcquisitionRun {
         #    capture hook records each attempt. One declaration => exactly one
         #    role/model invocation, except the existing bounded fresh-nonce retry
         #    for a RETRYABLE marker-emission failure.
-        $gen = $projection.generalist
-        if ($null -eq $gen) { throw "The generalist projection is missing its role context." }
-        $Bound = @{
-            PrId                     = [int]$binding.prId
-            SourceCommit             = [string]$binding.sourceCommit
-            SourceBranch             = [string]$gen.sourceBranch
-            AuthorAlias              = [string]$gen.authorAlias
-            DigestText               = [string]$gen.threadDigestText
-            AuthoritativeSourcesText = [string](Get-ReviewerHashValue -Container $gen -Key 'authoritativeSourcesText' -Default '')
-            PinnedSourceText         = [string](Get-ReviewerHashValue -Container $gen -Key 'pinnedSourceText' -Default '')
-        }
+        $Bound = New-ReviewerProjectionGeneralistBound -Projection $projection -Binding $binding
         $script:ReviewerAcquisitionActive = $true
         try {
             for ($attempt = 1; $attempt -le $script:ReviewerMarkerRetryAttempts; $attempt++) {
@@ -16796,8 +16792,10 @@ function Get-ReviewerRoleInputToolGrant {
 # measurements: the mode cannot launch a model, agency or provider process (the
 # boundary refuses before any process starts), cannot author a plan or mint a
 # token or take a lease (none of those paths are reachable), and cannot read or
-# write live (the run is sealed-replay only). The outer supervisor independently
-# corroborates them from telemetry rather than trusting this record.
+# write live (the run is sealed-replay only). The capture path launches no child
+# process of ANY kind - even HEAD is resolved by reading the git object store
+# directly - so these are not merely "no model processes". The outer supervisor
+# independently corroborates them from telemetry rather than trusting this record.
 $script:ReviewerRoleInputZeroSideEffects = [ordered]@{
     modelProcesses    = 0
     agencyProcesses   = 0
@@ -16830,6 +16828,116 @@ function Remove-ReviewerRoleInputTree {
     Get-ChildItem -LiteralPath $Root -File -Recurse -Force -ErrorAction SilentlyContinue |
         ForEach-Object { try { $_.Attributes = [IO.FileAttributes]::Normal } catch { } }
     Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+function Get-ReviewerRoleInputHeadCommit {
+    <#
+        Resolve the running checkout's HEAD by reading the git object store
+        directly, WITHOUT running git. Shelling out to `git rev-parse` would
+        start a child process, which is precisely what this mode exists to prove
+        it never does - so the one remaining launch on the capture path is
+        removed rather than excused. Supports a plain .git directory, a worktree
+        .git pointer file, a detached HEAD, symbolic refs and packed-refs.
+    #>
+    param([Parameter(Mandatory)][string]$RepoPath, [string]$Ref = 'HEAD')
+    $utf8 = [Text.UTF8Encoding]::new($false, $true)
+    $dotGit = Join-Path $RepoPath '.git'
+    $gitDirectory = $null
+    if (Test-Path -LiteralPath $dotGit -PathType Container) {
+        $gitDirectory = (Resolve-Path -LiteralPath $dotGit).Path
+    }
+    elseif (Test-Path -LiteralPath $dotGit -PathType Leaf) {
+        $pointer = [IO.File]::ReadAllText($dotGit, $utf8).Trim()
+        if ($pointer -notmatch '^gitdir:\s*(.+)$') { throw "RepoPath '$RepoPath' has an invalid .git pointer." }
+        $gitDirectory = $Matches[1]
+        if (-not [IO.Path]::IsPathRooted($gitDirectory)) { $gitDirectory = Join-Path $RepoPath $gitDirectory }
+        $gitDirectory = [IO.Path]::GetFullPath($gitDirectory)
+    }
+    if (-not $gitDirectory -or -not (Test-Path -LiteralPath $gitDirectory -PathType Container)) {
+        throw "The running RepoPath '$RepoPath' is not a readable git worktree; capture fails closed on HEAD resolution."
+    }
+    $commonDirectory = $gitDirectory
+    $commonPointer = Join-Path $gitDirectory 'commondir'
+    if (Test-Path -LiteralPath $commonPointer -PathType Leaf) {
+        $commonValue = [IO.File]::ReadAllText($commonPointer, $utf8).Trim()
+        $commonDirectory = if ([IO.Path]::IsPathRooted($commonValue)) { [IO.Path]::GetFullPath($commonValue) }
+        else { [IO.Path]::GetFullPath((Join-Path $gitDirectory $commonValue)) }
+    }
+    $roots = @($gitDirectory, $commonDirectory) | Select-Object -Unique
+    $current = $Ref
+    for ($depth = 0; $depth -le 8; $depth++) {
+        $value = $null
+        foreach ($root in $roots) {
+            $candidate = if ($current -ceq 'HEAD') { Join-Path $root 'HEAD' }
+            else { Join-Path $root ($current -replace '/', [IO.Path]::DirectorySeparatorChar) }
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                $value = [IO.File]::ReadAllText($candidate, $utf8).Trim()
+                break
+            }
+        }
+        if ($null -eq $value -and $current -cne 'HEAD') {
+            $packedRefs = Join-Path $commonDirectory 'packed-refs'
+            if (Test-Path -LiteralPath $packedRefs -PathType Leaf) {
+                foreach ($line in [IO.File]::ReadAllLines($packedRefs, $utf8)) {
+                    if ($line.StartsWith('#') -or $line.StartsWith('^')) { continue }
+                    $parts = $line.Split(' ', 2, [StringSplitOptions]::RemoveEmptyEntries)
+                    if ($parts.Count -eq 2 -and $parts[1].Trim() -ceq $current -and $parts[0] -match '^[0-9a-fA-F]{40}$') {
+                        return $parts[0].ToLowerInvariant()
+                    }
+                }
+            }
+        }
+        if ($null -eq $value) {
+            throw "The running RepoPath '$RepoPath' does not resolve '$current'; capture fails closed on HEAD resolution."
+        }
+        if ($value -match '^[0-9a-fA-F]{40}$') { return $value.ToLowerInvariant() }
+        if ($value -match '^ref:\s*(refs/.+)$') { $current = $Matches[1].Trim(); continue }
+        throw "The running RepoPath '$RepoPath' has an unreadable '$current'; capture fails closed on HEAD resolution."
+    }
+    throw "The running RepoPath '$RepoPath' has a cyclic HEAD; capture fails closed on HEAD resolution."
+}
+
+function Publish-ReviewerRoleInputBundle {
+    <#
+        Publishes a staged bundle with a single fail-closed rename.
+
+        Move-Item is NOT a fail-on-exists rename: for the FileSystem provider a
+        directory destination that already exists is treated as a container, so
+        a losing racer would silently nest its staging tree inside the winner's
+        published, read-only bundle and still report success - contaminating the
+        winner and letting the loser claim a bundle that is not its own.
+        Directory.Move throws when the destination exists, which makes the
+        publish genuinely atomic instead of a check followed by a merge.
+    #>
+    param([Parameter(Mandatory)][string]$Staging, [Parameter(Mandatory)][string]$OutputRoot)
+    try { [IO.Directory]::Move($Staging, $OutputRoot) }
+    catch {
+        throw ("Role input capture could not publish its bundle to '$OutputRoot': " +
+            "$($_.Exception.Message). A capture never overwrites or merges into an existing output root.")
+    }
+}
+
+function New-ReviewerProjectionGeneralistBound {
+    <#
+        THE single mapping from a sealed projection to the generalist's bound
+        facts. Both the blinded acquisition adapter and the no-model role input
+        capture call this, so the prompt-byte equality the capture suite proves
+        cannot be satisfied by two copies of the same mapping drifting together.
+        Prompt construction itself stays where it has always been, in
+        Invoke-ReviewerModelPass.
+    #>
+    param([Parameter(Mandatory)]$Projection, [Parameter(Mandatory)]$Binding)
+    $gen = $Projection.generalist
+    if ($null -eq $gen) { throw "The generalist projection is missing its role context." }
+    return @{
+        PrId                     = [int]$Binding.prId
+        SourceCommit             = [string]$Binding.sourceCommit
+        SourceBranch             = [string]$gen.sourceBranch
+        AuthorAlias              = [string]$gen.authorAlias
+        DigestText               = [string]$gen.threadDigestText
+        AuthoritativeSourcesText = [string](Get-ReviewerHashValue -Container $gen -Key 'authoritativeSourcesText' -Default '')
+        PinnedSourceText         = [string](Get-ReviewerHashValue -Container $gen -Key 'pinnedSourceText' -Default '')
+    }
 }
 
 function Invoke-ReviewerRoleInputCaptureRun {
@@ -16966,19 +17074,12 @@ function Invoke-ReviewerRoleInputCaptureRun {
         throw "Role input capture requires -CaptureRoleInputExpectedRef as a full ref (refs/...)."
     }
     $resolvedRepoPath = (Resolve-Path -LiteralPath $RepoPath).Path
-    $headNow = (& git -C $RepoPath rev-parse HEAD 2>$null)
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$headNow)) {
-        throw "The running RepoPath '$resolvedRepoPath' is not a readable git worktree; capture fails closed on HEAD resolution."
-    }
-    $headNow = ([string]$headNow).Trim().ToLowerInvariant()
+    $headNow = Get-ReviewerRoleInputHeadCommit -RepoPath $resolvedRepoPath
     if ($headNow -cne $CaptureRoleInputExpectedHeadCommit.ToLowerInvariant()) {
         throw "The running checkout HEAD '$headNow' does not match -CaptureRoleInputExpectedHeadCommit."
     }
-    $refCommit = (& git -C $RepoPath rev-parse --verify --quiet "$CaptureRoleInputExpectedRef^{commit}" 2>$null)
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$refCommit)) {
-        throw "The expected ref '$CaptureRoleInputExpectedRef' does not resolve to a commit in the running worktree."
-    }
-    if (($refCommit.Trim().ToLowerInvariant()) -cne $headNow) {
+    $refCommit = Get-ReviewerRoleInputHeadCommit -RepoPath $resolvedRepoPath -Ref $CaptureRoleInputExpectedRef
+    if ($refCommit -cne $headNow) {
         throw "The expected ref '$CaptureRoleInputExpectedRef' does not resolve to the running checkout HEAD."
     }
 
@@ -17082,17 +17183,7 @@ function Invoke-ReviewerRoleInputCaptureRun {
     try {
         switch ($CaptureRoleInputRole) {
             'generalist' {
-                $gen = $projection.generalist
-                if ($null -eq $gen) { throw "The generalist projection is missing its role context." }
-                $Bound = @{
-                    PrId                     = [int]$binding.prId
-                    SourceCommit             = [string]$binding.sourceCommit
-                    SourceBranch             = [string]$gen.sourceBranch
-                    AuthorAlias              = [string]$gen.authorAlias
-                    DigestText               = [string]$gen.threadDigestText
-                    AuthoritativeSourcesText = [string](Get-ReviewerHashValue -Container $gen -Key 'authoritativeSourcesText' -Default '')
-                    PinnedSourceText         = [string](Get-ReviewerHashValue -Container $gen -Key 'pinnedSourceText' -Default '')
-                }
+                $Bound = New-ReviewerProjectionGeneralistBound -Projection $projection -Binding $binding
                 [void](Invoke-ReviewerModelPass -AgencyPath $agencyPathSentinel -CycleNumber 1 `
                         -Bound $Bound -PassModel $model -PassNumber 1 -PassCount 1)
             }
@@ -17256,7 +17347,7 @@ function Invoke-ReviewerRoleInputCaptureRun {
             }
             [IO.File]::WriteAllText((Join-Path $staging 'capture-blocked.json'), $blockerText, $script:ReviewerUtf8)
             Set-ReviewerRoleInputTreeReadOnly -Root $staging
-            Move-Item -LiteralPath $staging -Destination $outputRoot
+            Publish-ReviewerRoleInputBundle -Staging $staging -OutputRoot $outputRoot
             $published = $true
             Write-Host ("Role input capture BLOCKED: status=$status reason=$blockedReason " +
                 "role=$CaptureRoleInputRole model=$model -> $outputRoot") -ForegroundColor Yellow
@@ -17466,30 +17557,34 @@ function Invoke-ReviewerRoleInputCaptureRun {
         [IO.File]::WriteAllText((Join-Path $staging 'capture-manifest.json'), $manifestText, $script:ReviewerUtf8)
 
         Set-ReviewerRoleInputTreeReadOnly -Root $staging
-        Move-Item -LiteralPath $staging -Destination $outputRoot
+        Publish-ReviewerRoleInputBundle -Staging $staging -OutputRoot $outputRoot
         $published = $true
         Write-Host ("Role input capture READY: role=$CaptureRoleInputRole model=$model " +
             "promptBytes=$([int]$capture.promptBytes) boundaryHits=1 modelSubprocesses=0 -> $outputRoot") -ForegroundColor Green
-        Write-Output (Get-ReviewerCanonicalJson -Value ([ordered]@{
-                    kind           = 'reviewer-production-role-input-capture-result'
-                    ready          = $true
-                    role           = $CaptureRoleInputRole
-                    model          = $model
-                    outputRoot     = $outputRoot
-                    manifestSha256 = (Get-ReviewerTextSha256 -Text $manifestText)
-                    inputSha256    = [string]$capture.promptSha256
-                }))
+        # Written straight to the console stream, never to the pipeline: this
+        # function's only pipeline value is its status code, and `exit` needs
+        # that code to stay a scalar.
+        [Console]::Out.WriteLine((Get-ReviewerCanonicalJson -Value ([ordered]@{
+                        kind           = 'reviewer-production-role-input-capture-result'
+                        ready          = $true
+                        role           = $CaptureRoleInputRole
+                        model          = $model
+                        outputRoot     = $outputRoot
+                        manifestSha256 = (Get-ReviewerTextSha256 -Text $manifestText)
+                        inputSha256    = [string]$capture.promptSha256
+                    })))
         return 0
     }
     finally {
-        # An unpublished staging tree is never left behind, and the throwaway
-        # state directory a capture was given is removed whole: a no-model
+        # An unpublished staging tree is never left behind, and only a state
+        # directory this mode synthesized for itself is removed: a no-model
         # capture leaves exactly the bundle it published and nothing else.
         if (-not $published -and (Test-Path -LiteralPath $staging)) {
             Remove-ReviewerRoleInputTree -Root $staging
         }
-        if ($StateDir -and (Test-Path -LiteralPath $StateDir)) {
-            Remove-ReviewerRoleInputTree -Root $StateDir
+        if ($script:ReviewerRoleInputEphemeralStateRoot -and
+            (Test-Path -LiteralPath $script:ReviewerRoleInputEphemeralStateRoot)) {
+            Remove-ReviewerRoleInputTree -Root $script:ReviewerRoleInputEphemeralStateRoot
         }
     }
 }
@@ -17506,7 +17601,10 @@ function Invoke-ReviewerRoleInputCaptureRun {
 # which would make a no-model capture depend on the very executable it exists to
 # prove it never runs.
 if ($CaptureRoleInputRole) {
-    exit (Invoke-ReviewerRoleInputCaptureRun)
+    # The status code must survive as a scalar: anything the run leaked to the
+    # pipeline would turn a typed blocker's exit 3 into a silent exit 0.
+    $captureStatus = Invoke-ReviewerRoleInputCaptureRun
+    exit ([int]($captureStatus | Select-Object -Last 1))
 }
 
 if ($DryRun) {

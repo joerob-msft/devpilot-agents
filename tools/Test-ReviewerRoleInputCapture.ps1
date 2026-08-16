@@ -45,6 +45,7 @@ Import-Module (Join-Path $RepoRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarn
 
 $runId = [Guid]::NewGuid().ToString('N')
 $runRoot = Join-Path $RepoRoot ("_role_input_test_tmp-" + $runId)
+$captureSealKeyPath = Join-Path $runRoot 'capture-seal.key'
 
 $script:Results = [Collections.Generic.List[object]]::new()
 function Check {
@@ -233,7 +234,7 @@ function Get-CaptureArgs {
         '-ReplayManifestDigest', $Bundle.Digest, '-PullRequestId', '4242',
         '-ExpectedHeadCommit', $(if ($HeadOverride) { $HeadOverride } else { $head }),
         '-ExpectedRef', $(if ($RefOverride) { $RefOverride } else { $ref }),
-        '-OutputRoot', $Out, '-RepoRoot', $RepoRoot
+        '-OutputRoot', $Out, '-RepoRoot', $RepoRoot, '-SealKeyPath', $captureSealKeyPath
     )
     if (($Role ? $Role : $Bundle.Role) -cne 'generalist') {
         # The surrounding configured models the orchestration needs. The convention
@@ -249,6 +250,7 @@ $exitCode = 0
 try {
     Remove-Tree $runRoot
     New-Item -ItemType Directory -Force -Path $runRoot | Out-Null
+    [IO.File]::WriteAllBytes($captureSealKeyPath, ([byte[]](1..32)))
 
     # -- 1. Generalist: the exact production prompt, and nothing else ---------
     Write-Host '1/8 generalist capture reaches the exact model boundary and launches nothing' -ForegroundColor Cyan
@@ -300,7 +302,7 @@ try {
 
     # -- 2. Independent re-verification and tamper detection -----------------
     Write-Host '2/8 the published bundle is independently verifiable and tamper-evident' -ForegroundColor Cyan
-    $verify = Invoke-Tool -Arguments @('-VerifyOnly', '-OutputRoot', $genOut)
+    $verify = Invoke-Tool -Arguments @('-VerifyOnly', '-OutputRoot', $genOut, '-SealKeyPath', $captureSealKeyPath)
     Check 'read-only verification of the published bundle succeeds' ($verify.ExitCode -eq 0) ($verify.Text -replace '\s+', ' ')
 
     $tamperOut = Join-Path $runRoot 'capture-tampered'
@@ -311,7 +313,7 @@ try {
     Get-ChildItem -LiteralPath $tamperOut -Recurse -File -Force | ForEach-Object {
         $_.Attributes = $_.Attributes -bor [IO.FileAttributes]::ReadOnly
     }
-    $tamper = Invoke-Tool -Arguments @('-VerifyOnly', '-OutputRoot', $tamperOut)
+    $tamper = Invoke-Tool -Arguments @('-VerifyOnly', '-OutputRoot', $tamperOut, '-SealKeyPath', $captureSealKeyPath)
     Check 'a substituted prompt is detected by verification' ($tamper.ExitCode -ne 0 -and $tamper.Text -match 'changed|disagrees')
 
     $unboundOut = Join-Path $runRoot 'capture-unbound'
@@ -319,8 +321,28 @@ try {
     $extra = Join-Path $unboundOut 'smuggled.json'
     [IO.File]::WriteAllText($extra, '{"note":"unbound"}', $Utf8)
     (Get-Item -LiteralPath $extra).Attributes = 'ReadOnly'
-    $unbound = Invoke-Tool -Arguments @('-VerifyOnly', '-OutputRoot', $unboundOut)
+    $unbound = Invoke-Tool -Arguments @('-VerifyOnly', '-OutputRoot', $unboundOut, '-SealKeyPath', $captureSealKeyPath)
     Check 'an unbound smuggled file is detected by verification' ($unbound.ExitCode -ne 0 -and $unbound.Text -match 'unbound')
+
+    $wrongSealKey = Join-Path $runRoot 'wrong-capture-seal.key'
+    [IO.File]::WriteAllBytes($wrongSealKey, ([byte[]](33..64)))
+    $wrongKeyVerify = Invoke-Tool -Arguments @('-VerifyOnly', '-OutputRoot', $genOut, '-SealKeyPath', $wrongSealKey)
+    Check 'a different HMAC key cannot authenticate the capture' (
+        $wrongKeyVerify.ExitCode -ne 0 -and $wrongKeyVerify.Text -match 'HMAC seal mismatch')
+
+    $manifestTamperOut = Join-Path $runRoot 'capture-manifest-tampered'
+    Copy-Item -LiteralPath $genOut -Destination $manifestTamperOut -Recurse -Force
+    Get-ChildItem -LiteralPath $manifestTamperOut -Recurse -File -Force | ForEach-Object { $_.Attributes = 'Normal' }
+    $tamperedManifestPath = Join-Path $manifestTamperOut 'capture-manifest.json'
+    $tamperedManifest = [IO.File]::ReadAllText($tamperedManifestPath, $Utf8) | ConvertFrom-Json -Depth 64
+    $tamperedManifest.timings.totalDurationMs = [int]$tamperedManifest.timings.totalDurationMs + 1
+    [IO.File]::WriteAllText($tamperedManifestPath, ($tamperedManifest | ConvertTo-Json -Depth 64 -Compress), $Utf8)
+    Get-ChildItem -LiteralPath $manifestTamperOut -Recurse -File -Force | ForEach-Object {
+        $_.Attributes = $_.Attributes -bor [IO.FileAttributes]::ReadOnly
+    }
+    $manifestTamper = Invoke-Tool -Arguments @('-VerifyOnly', '-OutputRoot', $manifestTamperOut, '-SealKeyPath', $captureSealKeyPath)
+    Check 'an edited capture manifest fails its HMAC seal' (
+        $manifestTamper.ExitCode -ne 0 -and $manifestTamper.Text -match 'HMAC seal mismatch')
 
     # -- 3. Prompt-byte equivalence with the PR49 adapter path ---------------
     Write-Host '3/8 the captured prompt equals the PR49 adapter prompt for the equivalent fixture' -ForegroundColor Cyan
@@ -349,8 +371,20 @@ try {
         # The ONLY per-attempt difference between the two stimuli is the nonce the
         # runtime context carries. Aligning it and re-hashing proves the remaining
         # bytes - the whole prompt and the whole runtime context - are identical.
+        # The substitution must be provably confined: a global Replace that hit
+        # nonce-shaped bytes elsewhere could mask a real difference, so count the
+        # occurrences on both sides before rewriting anything.
+        $captureNonceCount = ($promptText.Split([string[]]@($captureNonce), [StringSplitOptions]::None).Length - 1)
+        $acqNonceInCapture = ($promptText.Split([string[]]@($acqNonce), [StringSplitOptions]::None).Length - 1)
+        Check 'the capture nonce occurs exactly once in the captured prompt' ($captureNonceCount -eq 1) `
+            "occurrences=$captureNonceCount"
+        Check 'the acquisition nonce does not already occur in the captured prompt' ($acqNonceInCapture -eq 0) `
+            "occurrences=$acqNonceInCapture"
         $aligned = $promptText.Replace($captureNonce, $acqNonce)
         Check 'the capture nonce actually occurs in the captured prompt' ($aligned -cne $promptText)
+        Check 'aligning the nonce changed the prompt length by exactly the nonce delta' (
+            ($aligned.Length - $promptText.Length) -eq ($acqNonce.Length - $captureNonce.Length)) `
+            "delta=$($aligned.Length - $promptText.Length) expected=$($acqNonce.Length - $captureNonce.Length)"
         Check 'captured prompt bytes equal the PR49 adapter prompt bytes' (
             (TextSha $aligned) -ceq [string]$acqManifest.digests.inputSha256) `
             "capture=$((TextSha $aligned).Substring(0,12)) acquisition=$(([string]$acqManifest.digests.inputSha256).Substring(0,12))"
@@ -482,15 +516,69 @@ try {
 
     # -- 7. Concurrency and atomicity ---------------------------------------
     Write-Host '7/8 a capture is atomic and never overwrites a published bundle' -ForegroundColor Cyan
+    # Recorded BEFORE the re-run: comparing the published manifest against itself
+    # afterwards would be true no matter what the re-run did.
+    $publishedManifestSha = Sha (Join-Path $genOut 'capture-manifest.json')
     $again = Invoke-Tool -Arguments (Get-CaptureArgs -Bundle $genBundle -Out $genOut)
     Check 'a second capture into a published root is refused' (
         $again.ExitCode -ne 0 -and $again.Text -like '*already exists*') ($again.Text -replace '\s+', ' ')
     Check 'the published bundle survived the refused re-run byte for byte' (
-        (Sha (Join-Path $genOut 'capture-manifest.json')) -ceq (Sha (Join-Path $genOut 'capture-manifest.json')) -and
+        (Sha (Join-Path $genOut 'capture-manifest.json')) -ceq $publishedManifestSha -and
         (TextSha ([IO.File]::ReadAllText((Join-Path $genOut 'role-input-prompt.txt'), $Utf8))) -ceq (TextSha $promptText))
     Check 'no staging directory was left behind' (
         @(Get-ChildItem -LiteralPath $runRoot -Force -Directory |
                 Where-Object { $_.Name -like '*.capture-work' -or $_.Name -like '*staging*' }).Count -eq 0)
+
+    # A GENUINE race, not a sequential re-run: two supervisors are started against
+    # the same output root and released together, so they contend inside the
+    # check-to-publish window the sequential case can never reach.
+    $raceOut = Join-Path $runRoot 'capture-race'
+    $raceArgs = @(Get-CaptureArgs -Bundle $genBundle -Out $raceOut)
+    $raceScript = Join-Path $RepoRoot 'tools\Invoke-ReviewerRoleInputCapture.ps1'
+    $raceGate = Join-Path $runRoot 'race-gate.txt'
+    $raceRunner = {
+        param($Pwsh, $Script, $ToolArgs, $Gate)
+        while (-not (Test-Path -LiteralPath $Gate)) { Start-Sleep -Milliseconds 15 }
+        $out = & $Pwsh -NoProfile -File $Script @ToolArgs 2>&1
+        [pscustomobject]@{ ExitCode = $LASTEXITCODE; Text = (($out | Out-String) -replace '\s+', ' ') }
+    }
+    $pwshPath = (Get-Process -Id $PID).Path
+    $raceJobs = @(1, 2 | ForEach-Object {
+            Start-Job -ScriptBlock $raceRunner -ArgumentList $pwshPath, $raceScript, $raceArgs, $raceGate
+        })
+    Start-Sleep -Milliseconds 400
+    Set-Content -LiteralPath $raceGate -Value 'go' -NoNewline
+    $raceResults = @($raceJobs | Wait-Job -Timeout 600 | Receive-Job)
+    $raceJobs | Remove-Job -Force -ErrorAction SilentlyContinue
+    $raceWinners = @($raceResults | Where-Object { $_.ExitCode -eq 0 })
+    $raceLosers = @($raceResults | Where-Object { $_.ExitCode -ne 0 })
+    Check 'two concurrent captures both ran to a verdict' ($raceResults.Count -eq 2) `
+        "results=$($raceResults.Count)"
+    Check 'exactly one concurrent capture won' ($raceWinners.Count -eq 1) `
+        "winners=$($raceWinners.Count) losers=$($raceLosers.Count) texts=$(($raceResults | ForEach-Object { "exit=$($_.ExitCode)" }) -join ' ')"
+    $raceLoserText = if ($raceLosers.Count -eq 1) { $raceLosers[0].Text } else { "losers=$($raceLosers.Count)" }
+    Check 'the losing concurrent capture was refused, not merged' (
+        $raceLosers.Count -eq 1 -and (
+            $raceLosers[0].Text -like '*not overwritten*' -or $raceLosers[0].Text -like '*already*' -or
+            $raceLosers[0].Text -like '*another capture*' -or $raceLosers[0].Text -like '*lock*' -or
+            $raceLosers[0].Text -like '*in progress*' -or $raceLosers[0].Text -like '*appeared during publication*')) `
+        $raceLoserText
+    $raceVerify = Invoke-Tool -Arguments @('-VerifyOnly', '-OutputRoot', $raceOut, '-SealKeyPath', $captureSealKeyPath)
+    Check 'the raced bundle independently re-verifies clean' ($raceVerify.ExitCode -eq 0) `
+        ($raceVerify.Text -replace '\s+', ' ')
+    Check 'the race left no staging, work or lock residue' (
+        @(Get-ChildItem -LiteralPath $runRoot -Force |
+                Where-Object {
+                    $_.Name -like '*capture-race*' -and $_.Name -ne 'capture-race'
+                }).Count -eq 0)
+
+    # Telemetry is a falsifier, not a verifier, for a no-model capture: the run
+    # stops before the model boundary, so it opens no provider session and an
+    # empty sink is the correct outcome. The POSITIVE evidence that the real
+    # production path ran is the sealed manifest's single model-boundary hit,
+    # which the supervisor asserts and which is covered by the HMAC seal.
+    Check 'the sealed manifest positively proves the production path reached the boundary exactly once' (
+        [int]$manifest.launch.boundaryHits -eq 1) "boundaryHits=$([int]$manifest.launch.boundaryHits)"
 
     # -- 8. Preflight is readiness only -------------------------------------
     Write-Host '8/8 Preflight performs every readiness check and writes nothing' -ForegroundColor Cyan
@@ -538,7 +626,7 @@ try {
             Check "$role capture reached the boundary exactly once and started nothing" (
                 [int]$m.launch.boundaryHits -eq 1 -and [string]$m.role -ceq $role -and
                 @($m.sideEffects.PSObject.Properties | Where-Object { [int]$_.Value -ne 0 }).Count -eq 0)
-            $v = Invoke-Tool -Arguments @('-VerifyOnly', '-OutputRoot', $out)
+            $v = Invoke-Tool -Arguments @('-VerifyOnly', '-OutputRoot', $out, '-SealKeyPath', $captureSealKeyPath)
             Check "$role bundle re-verifies independently" ($v.ExitCode -eq 0) $v.Text
         }
         elseif ($isBlocked) {
@@ -550,7 +638,7 @@ try {
                 "status=$([string]$b.status) reason=$([string]$b.blockedReason)"
             Check "$role blocker publishes no prompt it could not legitimately build" (
                 -not (Test-Path -LiteralPath (Join-Path $out 'role-input-prompt.txt')))
-            $bv = Invoke-Tool -Arguments @('-VerifyOnly', '-OutputRoot', $out)
+            $bv = Invoke-Tool -Arguments @('-VerifyOnly', '-OutputRoot', $out, '-SealKeyPath', $captureSealKeyPath)
             Check "$role typed blocker re-verifies independently" ($bv.ExitCode -eq 0) $bv.Text
         }
         else {
