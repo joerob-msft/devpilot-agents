@@ -92,6 +92,17 @@ function Get-AllConstructIds {
 }
 
 try {
+    # This adapter stands in for the MCP/tool-side child during deterministic
+    # acquisition. It must inherit neither write-provider nor Copilot
+    # authentication credentials. Name a violating variable, never its value.
+    foreach ($credentialName in @(
+            'AZURE_DEVOPS_EXT_PAT', 'SYSTEM_ACCESSTOKEN',
+            'COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')) {
+        if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($credentialName))) {
+            throw "Offline adapter credential boundary violated: $credentialName is present."
+        }
+    }
+
     $manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json -Depth 64
     if ([string]$manifest.kind -cne 'reviewer-offline-model-adapter' -or
         [int]$manifest.schemaVersion -ne 1) {

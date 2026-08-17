@@ -24,7 +24,8 @@
       * holds an atomic CreateNew launch lease (no resume / replacement /
         automatic next role);
       * runs the exact current build/clean/ref checks;
-      * scrubs Azure DevOps / GitHub credentials from the child environment;
+      * scrubs Azure DevOps write-provider credentials from the reviewer child
+        while preserving the GitHub credential Copilot itself authenticates with;
       * supervises the reviewer child with DIRECT stdout/stderr files, a per-call
         and a total deadline, an activity watchdog, a bounded drain, recursive
         owned-tree cancellation and exit code 124 on timeout, identifying the
@@ -174,10 +175,16 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $Utf8 = [System.Text.UTF8Encoding]::new($false, $true)
 
-# Credentials that must never reach the child or the sealed package.
-$SensitiveEnvironmentVariables = @(
-    'AZURE_DEVOPS_EXT_PAT', 'SYSTEM_ACCESSTOKEN',
-    'COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN'
+# The reviewer child is the Copilot path, not an MCP/provider child. Copilot
+# authenticates with the first available GitHub credential in
+# COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN precedence, so stripping that
+# family here prevents the authorized model subprocess from starting. ADO
+# credentials are write-provider authority the reviewer/Copilot path never
+# needs, and remain scrubbed. Start-ReviewerAgent applies its stricter
+# $McpSensitiveEnvironmentVariables boundary to every MCP/tool child, removing
+# both credential families there.
+$CopilotSensitiveEnvironmentVariables = @(
+    'AZURE_DEVOPS_EXT_PAT', 'SYSTEM_ACCESSTOKEN'
 )
 
 $ReviewerScript = Join-Path $RepoRoot 'src\Agents\reviewer\Start-ReviewerAgent.ps1'
@@ -693,8 +700,8 @@ function Invoke-SupervisedReviewer {
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     foreach ($argument in $Arguments) { [void]$psi.ArgumentList.Add($argument) }
-    foreach ($name in $EnvironmentVariablesToRemove) { [void]$psi.Environment.Remove($name) }
     foreach ($name in $Environment.Keys) { $psi.Environment[[string]$name] = [string]$Environment[$name] }
+    foreach ($name in $EnvironmentVariablesToRemove) { [void]$psi.Environment.Remove($name) }
 
     # The environment belongs only to this ProcessStartInfo. In particular, the
     # production-test-only telemetry switch never mutates the supervisor's global
@@ -1564,7 +1571,7 @@ try {
     }
     $supervisorResult = Invoke-SupervisedReviewer -Arguments $reviewerArgs -StdOutPath $stdOutPath `
         -StdErrPath $stdErrPath -TotalSeconds $TotalTimeoutSeconds -ActivitySeconds $ActivityTimeoutSeconds `
-        -Environment $childEnvironment -EnvironmentVariablesToRemove $SensitiveEnvironmentVariables
+        -Environment $childEnvironment -EnvironmentVariablesToRemove $CopilotSensitiveEnvironmentVariables
 }
 finally {
     # Drop the supervisor-held child environment and token references the instant

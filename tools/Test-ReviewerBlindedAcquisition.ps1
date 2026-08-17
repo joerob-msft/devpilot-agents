@@ -15,7 +15,7 @@
     grandchild timeout -> exit 124 with recursive tree kill; every input gate (oracle
     leakage, wrong role/model/HEAD/ref/base/snapshot/token, verifier-before-discovery,
     candidate-on-non-verifier, duplicate/consumed lease); verifier candidate independence
-    + cluster-hash binding; credential scrub + zero-write proof; oracle-free sealed
+    + cluster-hash binding; asymmetric credential boundary + zero-write proof; oracle-free sealed
     package; and tamper / missing / cross-substitution seal verification.
 #>
 [CmdletBinding()]
@@ -473,35 +473,170 @@ $sd = Invoke-Tool -ToolArgs (Get-CommonArgs -Out $sdOut -Role generalist -Projec
 Check 'snapshotDigestMismatch refuses (exit!=0)' ($sd.Exit -ne 0) ("exit=$($sd.Exit)")
 Check 'snapshotDigestMismatch leaves no sealed package' (-not (Test-Path -LiteralPath (Join-Path $sdOut 'package\transcript-package.json')))
 
-# Production telemetry wiring regression: put a harmless renamed pwsh executable
-# at the agency boundary. It cannot run a model, but reaching it proves the
-# reviewer accepted production acquisition without adapter parameters. Because
-# process.started is environment-gated, its presence in the owned sink also proves
-# the exact mode/path reached the child without an -OfflineTelemetryPath argument.
+# Production telemetry and credential-boundary regression: put a harmless
+# pwsh-backed executable at the agency boundary. It records only credential
+# variable NAMES/booleans to a test-owned file, never values, then exits before a
+# model or tool can run. This proves the exact Copilot subprocess receives GitHub
+# authentication variables (whose precedence remains owned by Copilot CLI) but
+# no ADO/write credential.
 $prodOut = New-OutDir 'production_telemetry_wiring'
 $fakeAgencyDir = Join-Path $runRoot 'fake-agency'
 New-Item -ItemType Directory -Force -Path $fakeAgencyDir | Out-Null
+$fakeAgencyScript = Join-Path $fakeAgencyDir 'fake-agency.ps1'
 $fakeAgencyPath = Join-Path $fakeAgencyDir 'agency.cmd'
+@'
+$ErrorActionPreference = 'Stop'
+$githubNames = @('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')
+$adoNames = @('AZURE_DEVOPS_EXT_PAT', 'SYSTEM_ACCESSTOKEN')
+$presentGithub = @($githubNames | Where-Object {
+        -not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($_))
+    })
+$presentAdo = @($adoNames | Where-Object {
+        -not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($_))
+    })
+$selected = if ($presentGithub.Count -gt 0) { [string]$presentGithub[0] } else { '' }
+$reportPath = Join-Path $PSScriptRoot 'credential-probe.json'
+[pscustomobject][ordered]@{
+    githubAuthPresent = [bool]$selected
+    githubAuthVariable = $selected
+    githubVariablesPresent = $presentGithub
+    adoCredentialsPresent = ($presentAdo.Count -gt 0)
+} | ConvertTo-Json -Compress | Set-Content -LiteralPath $reportPath -Encoding utf8
+$null = [Console]::In.ReadToEnd()
+if (-not $selected) {
+    [Console]::Error.WriteLine('error: No authentication information found for this host.')
+}
+else {
+    [Console]::Error.WriteLine('credential boundary probe stopped before model launch')
+}
+exit 70
+'@ | Set-Content -LiteralPath $fakeAgencyScript -Encoding utf8
 Set-Content -LiteralPath $fakeAgencyPath -Encoding ascii -Value `
-    '@pwsh -NoProfile -Command "$null=[Console]::In.ReadToEnd(); exit 70"'
+    '@pwsh -NoProfile -File "%~dp0fake-agency.ps1" %*'
 $sentinelTelemetry = Join-Path $runRoot 'parent-telemetry-must-not-be-used.jsonl'
-$savedPath = $env:PATH
-$savedTelemetryMode = $env:DEVPILOT_OFFLINE_TELEMETRY_MODE
-$savedTelemetryPath = $env:DEVPILOT_OFFLINE_TELEMETRY_PATH
-try {
-    $env:PATH = $fakeAgencyDir + [IO.Path]::PathSeparator + $savedPath
-    $env:DEVPILOT_OFFLINE_TELEMETRY_MODE = 'parent-sentinel'
-    $env:DEVPILOT_OFFLINE_TELEMETRY_PATH = $sentinelTelemetry
-    $prod = Invoke-Tool -ToolArgs (Get-ProductionArgs -Out $prodOut) -LogName 'production-telemetry-wiring.log'
-    if ($prod.Exit -ne 0) {
-        throw "Production acquisition did not reach the stub model boundary without adapter parameters (exit=$($prod.Exit))."
+$credentialVariableNames = @(
+    'AZURE_DEVOPS_EXT_PAT', 'SYSTEM_ACCESSTOKEN',
+    'COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN'
+)
+function Invoke-ProductionCredentialProbe {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Out,
+        [string[]]$GitHubNames = @(),
+        [switch]$AssertTelemetryIsolation
+    )
+    $trackedNames = @($credentialVariableNames) + @(
+        'PATH', 'DEVPILOT_OFFLINE_TELEMETRY_MODE',
+        'DEVPILOT_OFFLINE_TELEMETRY_PATH'
+    )
+    $saved = @{}
+    foreach ($nameToSave in $trackedNames) {
+        $saved[$nameToSave] = [Environment]::GetEnvironmentVariable($nameToSave)
+    }
+    $sentinels = [System.Collections.Generic.List[string]]::new()
+    $probePath = Join-Path $fakeAgencyDir 'credential-probe.json'
+    try {
+        Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+        foreach ($credentialName in $credentialVariableNames) {
+            Remove-Item "Env:$credentialName" -ErrorAction SilentlyContinue
+        }
+        foreach ($adoName in @('AZURE_DEVOPS_EXT_PAT', 'SYSTEM_ACCESSTOKEN')) {
+            $value = "$adoName-ACQ-$([Guid]::NewGuid().ToString('N'))"
+            Set-Item "Env:$adoName" $value
+            [void]$sentinels.Add($value)
+        }
+        foreach ($githubName in $GitHubNames) {
+            $value = "$githubName-ACQ-$([Guid]::NewGuid().ToString('N'))"
+            Set-Item "Env:$githubName" $value
+            [void]$sentinels.Add($value)
+        }
+        $env:PATH = $fakeAgencyDir + [IO.Path]::PathSeparator + [string]$saved['PATH']
+        if ($AssertTelemetryIsolation) {
+            $env:DEVPILOT_OFFLINE_TELEMETRY_MODE = 'parent-sentinel'
+            $env:DEVPILOT_OFFLINE_TELEMETRY_PATH = $sentinelTelemetry
+        }
+        $run = Invoke-Tool -ToolArgs (Get-ProductionArgs -Out $Out) -LogName "production-$Name.log"
+    }
+    finally {
+        foreach ($nameToRestore in $trackedNames) {
+            if ($null -eq $saved[$nameToRestore]) {
+                Remove-Item "Env:$nameToRestore" -ErrorAction SilentlyContinue
+            }
+            else { Set-Item "Env:$nameToRestore" $saved[$nameToRestore] }
+        }
+    }
+    $parentUnchanged = @($trackedNames | Where-Object {
+            [Environment]::GetEnvironmentVariable($_) -cne $saved[$_]
+        }).Count -eq 0
+    return [pscustomobject]@{
+        Run = $run
+        Probe = if (Test-Path -LiteralPath $probePath) { Read-Json $probePath } else { $null }
+        ProbePath = $probePath
+        Sentinels = @($sentinels)
+        ParentUnchanged = $parentUnchanged
     }
 }
-finally {
-    $env:PATH = $savedPath
-    $env:DEVPILOT_OFFLINE_TELEMETRY_MODE = $savedTelemetryMode
-    $env:DEVPILOT_OFFLINE_TELEMETRY_PATH = $savedTelemetryPath
+
+$prodProbe = Invoke-ProductionCredentialProbe -Name 'all-auth' -Out $prodOut `
+    -GitHubNames @('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN') -AssertTelemetryIsolation
+$prod = $prodProbe.Run
+if ($prod.Exit -ne 0) {
+    throw "Production acquisition did not reach the stub model boundary without adapter parameters (exit=$($prod.Exit))."
 }
+Check 'Copilot boundary retains GitHub authentication' `
+    ($null -ne $prodProbe.Probe -and [bool]$prodProbe.Probe.githubAuthPresent)
+Check 'Copilot boundary preserves all GitHub auth names for CLI-owned precedence' `
+    ((@($prodProbe.Probe.githubVariablesPresent) -join ',') -ceq
+        'COPILOT_GITHUB_TOKEN,GH_TOKEN,GITHUB_TOKEN')
+Check 'Copilot boundary receives no ADO/write-provider credential' `
+    (-not [bool]$prodProbe.Probe.adoCredentialsPresent)
+Check 'production probe leaves parent environment unchanged' $prodProbe.ParentUnchanged
+
+$ghProbeOut = New-OutDir 'production_auth_gh'
+$ghProbe = Invoke-ProductionCredentialProbe -Name 'gh-auth' -Out $ghProbeOut `
+    -GitHubNames @('GH_TOKEN')
+Check 'GH_TOKEN independently reaches the Copilot boundary' `
+    ([string]$ghProbe.Probe.githubAuthVariable -ceq 'GH_TOKEN') `
+    ("observed=$([string]$ghProbe.Probe.githubAuthVariable)")
+Check 'GH_TOKEN probe leaves parent environment unchanged' $ghProbe.ParentUnchanged
+
+$githubProbeOut = New-OutDir 'production_auth_github'
+$githubProbe = Invoke-ProductionCredentialProbe -Name 'github-auth' -Out $githubProbeOut `
+    -GitHubNames @('GITHUB_TOKEN')
+Check 'GITHUB_TOKEN independently reaches the Copilot boundary' `
+    ([string]$githubProbe.Probe.githubAuthVariable -ceq 'GITHUB_TOKEN') `
+    ("observed=$([string]$githubProbe.Probe.githubAuthVariable)")
+Check 'GITHUB_TOKEN probe leaves parent environment unchanged' $githubProbe.ParentUnchanged
+
+$missingAuthOut = New-OutDir 'production_auth_missing'
+$missingAuthProbe = Invoke-ProductionCredentialProbe -Name 'missing-auth' -Out $missingAuthOut
+Check 'missing GitHub auth reaches boundary as absent' `
+    ($null -ne $missingAuthProbe.Probe -and -not [bool]$missingAuthProbe.Probe.githubAuthPresent -and
+        [string]::IsNullOrEmpty([string]$missingAuthProbe.Probe.githubAuthVariable))
+Check 'missing-auth probe leaves parent environment unchanged' $missingAuthProbe.ParentUnchanged
+$missingAuthManifest = Read-Json (Join-Path $missingAuthOut 'package\transcript-package.json')
+$missingAuthAttempt = @($missingAuthManifest.attempts)[-1]
+Check 'missing GitHub auth is a typed environment failure' `
+    ([string]$missingAuthAttempt.markerStatus -ceq 'environment') `
+    ("status=$([string]$missingAuthAttempt.markerStatus)")
+Check 'missing GitHub auth reports authentication failure' `
+    ([string]$missingAuthAttempt.reason -match 'could not authenticate to GitHub') `
+    ("reason=$([string]$missingAuthAttempt.reason)")
+
+$allCredentialSentinels = @(
+    @($prodProbe.Sentinels) + @($ghProbe.Sentinels) +
+    @($githubProbe.Sentinels) + @($missingAuthProbe.Sentinels)
+)
+$credentialBoundaryFiles = @(Get-ChildItem -LiteralPath $runRoot -Recurse -File)
+$credentialLeakFiles = @($credentialBoundaryFiles | Where-Object {
+        $text = Get-Content -LiteralPath $_.FullName -Raw -ErrorAction SilentlyContinue
+        @($allCredentialSentinels | Where-Object {
+                $text -match [regex]::Escape($_)
+            }).Count -gt 0
+    })
+Check 'no unique credential sentinel in package/stdout/stderr/telemetry/probe files' `
+    ($credentialLeakFiles.Count -eq 0) ("leakedFiles=$($credentialLeakFiles.Count)")
+
 $prodTelemetryPath = Join-Path $prodOut 'work\telemetry.jsonl'
 $prodEvents = if (Test-Path -LiteralPath $prodTelemetryPath) {
     @(Get-Content -LiteralPath $prodTelemetryPath -Encoding UTF8 | Where-Object { $_ } |
@@ -1011,13 +1146,18 @@ finally {
 # ---------------------------------------------------------------------------
 Write-Host "`n== Group I: credential scrub / zero-write ==" -ForegroundColor Cyan
 $sentinel = 'ACQ_SENTINEL_' + ([Guid]::NewGuid().ToString('N'))
-$prevAdo = $env:AZURE_DEVOPS_EXT_PAT; $prevGh = $env:GITHUB_TOKEN
-$env:AZURE_DEVOPS_EXT_PAT = "ado-$sentinel"; $env:GITHUB_TOKEN = "gh-$sentinel"
+$credentialParentValues = @{}
+foreach ($credentialName in $credentialVariableNames) {
+    $credentialParentValues[$credentialName] = [Environment]::GetEnvironmentVariable($credentialName)
+    Set-Item "Env:$credentialName" "$credentialName-$sentinel-$([Guid]::NewGuid().ToString('N'))"
+}
 try {
     $credOut = New-OutDir 'cred_scrub'
     $credMan = New-VariantManifest -Tag 'cred' -Behavior 'success'
     $cr = Invoke-Tool -ToolArgs (Get-CommonArgs -Out $credOut -Role generalist -Projection $genProjection -Model claude-opus-5 -Manifest $credMan) -LogName 'cred-scrub.log'
     Check 'credential run seals successfully' ($cr.Exit -eq 0) ("exit=$($cr.Exit)")
+    Check 'offline MCP/tool adapter receives neither credential family' ($cr.Exit -eq 0) `
+        'the adapter fails closed if any ADO or GitHub credential is present'
     $leaks = @(Get-ChildItem -LiteralPath $credOut -Recurse -File | Where-Object { (Get-Content -LiteralPath $_.FullName -Raw -ErrorAction SilentlyContinue) -match [regex]::Escape($sentinel) })
     Check 'no credential value written to any acquisition artifact' ($leaks.Count -eq 0) ("leakedFiles=$($leaks.Count)")
     $logLeak = (Get-Content -LiteralPath $cr.Log -Raw -ErrorAction SilentlyContinue) -match [regex]::Escape($sentinel)
@@ -1027,11 +1167,33 @@ try {
     Check 'telemetry proves no provider/tool write' ([int]$cm.telemetry.providerLiveWrites -eq 0 -and [int]$cm.telemetry.writeToolInvocations -eq 0)
     $pkgText = (Get-ChildItem -LiteralPath (Join-Path $credOut 'package') -File -Recurse -Force | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }) -join "`n"
     Check 'no authorization token persisted in the package' (-not ($pkgText -match 'authorizationToken')) ''
+
+    $adapterGuardLog = Join-Path $logDir 'credential-adapter-negative.log'
+    $emptyBinding = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{}'))
+    & pwsh -NoProfile -File $adapterReal -ManifestPath $baseManifest -Role blind-opus `
+        -Model claude-opus-5 -ExpectedBaseCommit $expectedBase -BindingBase64 $emptyBinding `
+        *> $adapterGuardLog
+    $adapterGuardExit = $LASTEXITCODE
+    $adapterGuardText = Get-Content -LiteralPath $adapterGuardLog -Raw
+    Check 'offline adapter fails closed when invoked with a credential' `
+        ($adapterGuardExit -ne 0 -and
+            $adapterGuardText -match 'credential boundary violated: AZURE_DEVOPS_EXT_PAT is present') `
+        ("exit=$adapterGuardExit")
+    Check 'offline adapter refusal reports no credential value' `
+        (-not ($adapterGuardText -match [regex]::Escape($sentinel)))
 }
 finally {
-    $env:AZURE_DEVOPS_EXT_PAT = $prevAdo; $env:GITHUB_TOKEN = $prevGh
+    foreach ($credentialName in $credentialVariableNames) {
+        if ($null -eq $credentialParentValues[$credentialName]) {
+            Remove-Item "Env:$credentialName" -ErrorAction SilentlyContinue
+        }
+        else { Set-Item "Env:$credentialName" $credentialParentValues[$credentialName] }
+    }
 }
-Check 'parent credential environment restored after run' ($env:AZURE_DEVOPS_EXT_PAT -eq $prevAdo -and $env:GITHUB_TOKEN -eq $prevGh)
+Check 'parent credential environment restored after run' `
+    (@($credentialVariableNames | Where-Object {
+                [Environment]::GetEnvironmentVariable($_) -cne $credentialParentValues[$_]
+            }).Count -eq 0)
 
 # ---------------------------------------------------------------------------
 # Group J - Specialist: REAL execution through the exact production specialist

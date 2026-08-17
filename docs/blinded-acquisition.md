@@ -63,16 +63,19 @@ authored oracle; nothing here may be presented as that step.
   require the explicit `-UseOfflineStubAdapter` switch; the reviewer then pins
   execution to the repository's sealed offline stub adapter, checked by both
   expected file hash and path containment. The adapter manifest may select a stub
-  *behavior* but can never swap the pinned script or executable. Without the
-  test-only switch no offline adapter is wired and the reviewer would use its real
-  production model boundary — which the harness never launches.
+  *behavior* but can never swap the pinned script or executable. One credential
+  regression reaches the production subprocess boundary through a local
+  pwsh-backed fake that exits before any model or tool can run; no real model
+  executable or provider is launched.
 * **No provider access or write.** Replay is permanently preview-only with no
   live fallback. Repository, provider, comment, vote, work-item and delivery
-  paths are refused. Azure DevOps and GitHub credentials are scrubbed from the
-  child environment. Direct telemetry proves that zero provider processes and
-  zero live writes occurred. Production launches the one authorized model;
-  deterministic tests use the pinned stub and additionally prove zero real-model
-  starts.
+  paths are refused. Azure DevOps/write-provider credentials are scrubbed from
+  the reviewer and Copilot path. Copilot's GitHub authentication credential is
+  preserved along that path through the Copilot subprocess boundary; every
+  MCP/tool child is scrubbed of both Azure DevOps and GitHub credentials. Direct
+  telemetry proves that zero provider processes and zero live writes occurred. Production
+  launches the one authorized model; deterministic tests use the pinned stub
+  and additionally prove zero real-model starts.
 * **Immutable, credential-free seal.** The package captures raw stdout/stderr,
   the parsed result marker, the reported model, role, fresh nonce and its hash,
   the request/input/prompt/schema/config/script/snapshot/candidate digests, the
@@ -108,7 +111,8 @@ split in two, and all prompt/parser/subprocess logic lives only in the reviewer:
   and validates the model through the module registry, runs the exact current
   build/clean/ref/ancestor checks, authors and schema-validates a single
   authorized acquisition plan, holds the atomic launch lease, scrubs
-  credentials, supervises the reviewer child with direct stdout/stderr files,
+  write-provider credentials while retaining Copilot's GitHub authentication,
+  supervises the reviewer child with direct stdout/stderr files,
   per-call and total deadlines, an activity watchdog, a bounded drain, recursive
   owned-tree cancellation and exit code 124 on timeout, then seals the package
   and verifies zero-write telemetry. It identifies the child by PID/handle, never
@@ -391,10 +395,10 @@ the pinned adapter script.
 
 ## Tests
 
-`tools/Test-ReviewerBlindedAcquisition.ps1` is the deterministic suite. It runs
-only against the sealed offline stub adapter — **no real model executable is ever
-invoked** — and drives the exact production prompt/parser path with a stub
-subprocess for **all three roles**. It covers: generalist, specialist and
+`tools/Test-ReviewerBlindedAcquisition.ps1` is the deterministic suite. It drives
+all three roles against the sealed offline stub adapter and uses one local fake
+executable to probe the production authentication boundary — **no real model
+executable is ever invoked**. It covers: generalist, specialist and
 verifier success sealed through their exact production input builders; each
 role's marker-failure retry policy (generalist/specialist bounded fresh-nonce
 retry, verifier terminal no-retry); terminal schema/binding failure with no
@@ -410,7 +414,8 @@ launch); the child's re-derivation of the verifier candidate/cluster from the
 sealed discovery marker with exact-equality enforcement; adapter containment
 (test-only switch required, pinned-script hash/path enforced); duplicate and
 truly-concurrent differing-input launches; a consumed one-shot lease and its
-replay refusal; resume refusal; oracle-leakage refusal; credential scrubbing and
+replay refusal; resume refusal; oracle-leakage refusal; asymmetric credential
+scrubbing, all three Copilot GitHub auth names, missing-auth classification, and
 zero-write telemetry; recursive evidence integrity (seal tamper, missing file,
 nested-file injection, reparse-point and empty-directory rejection, recursive
 read-only sealing that fails closed on any still-writable bound artifact
