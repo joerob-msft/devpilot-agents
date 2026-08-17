@@ -83,8 +83,12 @@ $markerPrefix = [string]$core.resultMarkerPrefix
 if (-not $sourceModel -or -not $markerPrefix) {
     throw "The discovery capture-core is missing its requestedModel or resultMarkerPrefix binding."
 }
-if ($PSBoundParameters.ContainsKey('ExpectedSourceScriptSha256') -and
-    ([string]$core.digests.scriptSha256).ToLowerInvariant() -cne
+if (-not $PSBoundParameters.ContainsKey('ExpectedSourceScriptSha256')) {
+    $ExpectedSourceScriptSha256 = (Get-FileHash -LiteralPath (
+            Join-Path $RepoRoot 'src\Agents\reviewer\Start-ReviewerAgent.ps1'
+        ) -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+if (([string]$core.digests.scriptSha256).ToLowerInvariant() -cne
     $ExpectedSourceScriptSha256.ToLowerInvariant()) {
     throw "The authenticated discovery package does not match the explicitly pinned source reviewer script."
 }

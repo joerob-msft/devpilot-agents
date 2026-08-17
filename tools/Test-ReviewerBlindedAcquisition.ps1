@@ -1855,7 +1855,8 @@ if (Test-Path -LiteralPath $spCandidate) {
     $spStalePackage = Copy-ResealedPackageWithStaleScript -SourcePackage $spPackage
     $spStaleCandidate = Join-Path $runRoot 'specialist-stale-script-candidate.json'
     & pwsh -NoProfile -File $extractTool -DiscoveryPackageRoot $spStalePackage -SealKeyPath $sealKey `
-        -OutputFile $spStaleCandidate *> (Join-Path $logDir 'specialist-stale-script-extract.log')
+        -ExpectedSourceScriptSha256 ('0' * 64) -OutputFile $spStaleCandidate `
+        *> (Join-Path $logDir 'specialist-stale-script-extract.log')
     Check 'authenticated stale-script specialist package can be independently decoded for gate testing' (
         ($LASTEXITCODE -eq 0) -and (Test-Path -LiteralPath $spStaleCandidate))
     $specialistRejects = @(
