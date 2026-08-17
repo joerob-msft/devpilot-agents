@@ -104,14 +104,24 @@ param(
     [Parameter(ParameterSetName = 'Verify')]
     [string]$SealKeyPath,
 
-    # Verifier role only: the independently captured discovery candidate the
-    # cross-check is about, and the sealed discovery result marker it came from.
+    # Verifier role only: the independently captured discovery candidate and its
+    # authenticated acquisition transcript package.
     [Parameter(ParameterSetName = 'Capture')]
     [Parameter(ParameterSetName = 'Preflight')]
     [string]$CandidateInputFile,
     [Parameter(ParameterSetName = 'Capture')]
     [Parameter(ParameterSetName = 'Preflight')]
     [string]$DiscoveryMarkerFile,
+    [Parameter(ParameterSetName = 'Capture')]
+    [Parameter(ParameterSetName = 'Preflight')]
+    [string]$DiscoveryPackageRoot,
+    [Parameter(ParameterSetName = 'Capture')]
+    [Parameter(ParameterSetName = 'Preflight')]
+    [ValidatePattern('^[0-9a-fA-F]{64}$')]
+    [string]$DiscoverySourceScriptSha256,
+    [Parameter(ParameterSetName = 'Capture')]
+    [Parameter(ParameterSetName = 'Preflight')]
+    [string]$DiscoverySealKeyPath,
 
     # The surrounding configured model set the production orchestration needs in
     # order to build the exact input for the one captured role.
@@ -149,6 +159,13 @@ Set-StrictMode -Version Latest
 $Utf8 = [Text.UTF8Encoding]::new($false, $true)
 $SchemaDir = Join-Path $RepoRoot 'src\Agents\reviewer\acquisition\v1'
 $ReviewerScript = Join-Path $RepoRoot 'src\Agents\reviewer\Start-ReviewerAgent.ps1'
+. (Join-Path $RepoRoot 'src\Agents\reviewer\AcquisitionPackage.ps1')
+. (Join-Path $RepoRoot 'src\Agents\reviewer\SourceTransport.ps1')
+. (Join-Path $RepoRoot 'src\Agents\reviewer\ConventionSpecialist.ps1')
+. (Join-Path $RepoRoot 'src\Agents\reviewer\CrossVerification.ps1')
+$CrossVerificationPolicyPath = Join-Path $RepoRoot 'src\Agents\reviewer\verification\v1\policy.json'
+$EffectiveCrossVerificationPolicy = ConvertTo-ReviewerVerificationEffectivePolicy `
+    -Policy (Get-Content -LiteralPath $CrossVerificationPolicyPath -Raw | ConvertFrom-Json -Depth 32)
 $HarnessModule = Join-Path $RepoRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1'
 
 # Provider credentials are removed from THIS process before the child starts, so
@@ -726,6 +743,10 @@ $candidateFull = ''
 if ($CandidateInputFile) { $candidateFull = Assert-SafePath -Path $CandidateInputFile -Surface 'The discovery candidate input' }
 $markerFull = ''
 if ($DiscoveryMarkerFile) { $markerFull = Assert-SafePath -Path $DiscoveryMarkerFile -Surface 'The discovery result marker' }
+$discoveryPackageFull = ''
+if ($DiscoveryPackageRoot) {
+    $discoveryPackageFull = Assert-SafePath -Path $DiscoveryPackageRoot -Surface 'The discovery package'
+}
 $legacyFull = ''
 if ($LegacyProjectionFile) { $legacyFull = Assert-SafePath -Path $LegacyProjectionFile -Surface 'The legacy benchmark projection' }
 
@@ -738,11 +759,16 @@ if ($Role -ceq 'verifier' -and -not $candidateFull) {
 # The verifier's subject must also be traceable to the sealed discovery result it
 # was extracted from, so the capture cannot cross-check a candidate that no
 # sealed discovery ever produced.
-if ($Role -ceq 'verifier' -and -not $markerFull) {
-    throw 'A verifier role input capture requires -DiscoveryMarkerFile: the candidate must be traceable to the sealed discovery result marker it came from.'
+if ($Role -ceq 'verifier' -and -not $markerFull -and -not $discoveryPackageFull) {
+    throw 'A verifier role input capture requires a discovery marker or authenticated acquisition package.'
 }
-if ($Role -cne 'verifier' -and ($candidateFull -or $markerFull)) {
-    throw "A $Role role input capture takes no discovery candidate or marker; those belong to the verifier role alone."
+if ($Role -ceq 'verifier' -and
+    ([bool]$discoveryPackageFull -ne [bool]$DiscoverySealKeyPath)) {
+    throw 'A discovery package and its -DiscoverySealKeyPath must be supplied together.'
+}
+if ($Role -cne 'verifier' -and ($candidateFull -or $markerFull -or
+        $discoveryPackageFull -or $DiscoverySealKeyPath)) {
+    throw "A $Role role input capture takes no discovery candidate/package; those belong to the verifier role alone."
 }
 
 $requestText = [IO.File]::ReadAllText($requestFull, $Utf8)
@@ -835,6 +861,20 @@ if ($DiscoveryGeneralistModel) {
     }
 }
 $discoveryModel = if ($DiscoveryGeneralistModel) { $DiscoveryGeneralistModel } else { $Model }
+if ($Role -ceq 'verifier') {
+    if (-not $SecondGeneralistModel -or -not $ConventionSpecialistModel) {
+        throw 'A verifier role input capture requires the second generalist and convention specialist models.'
+    }
+    if ([string]$discoveryModel -ceq [string]$SecondGeneralistModel) {
+        throw 'A verifier role input capture requires two distinct configured generalist models.'
+    }
+    if ([string]$Model -cnotin @([string]$discoveryModel, [string]$SecondGeneralistModel)) {
+        throw "Verifier model '$Model' is not one of the two configured generalist models."
+    }
+    if ([string]$Model -ceq [string]$ConventionSpecialistModel) {
+        throw "The convention specialist '$ConventionSpecialistModel' cannot be a verifier."
+    }
+}
 
 # The reviewer configuration is the third identity the capture is bound to, next
 # to the request and the sealed snapshot. It is operator-supplied and is NOT
@@ -842,7 +882,9 @@ $discoveryModel = if ($DiscoveryGeneralistModel) { $DiscoveryGeneralistModel } e
 # its repository identity must match the snapshot the stimulus was sealed from.
 # Capturing role input for one repository out of another repository's config
 # would silently produce a prompt no production run could ever have issued.
-$configObject = [IO.File]::ReadAllText($configFull, $Utf8) | ConvertFrom-Json -Depth 64
+$configLoad = Get-AgentConfig -Path $configFull -AgentDir (Split-Path $ReviewerScript -Parent) `
+    -SupportedSchemaVersions @(1) -PromptFileField 'promptFile'
+$configObject = $configLoad.Raw
 Assert-NoForbiddenKeys -Node $configObject -Surface 'The reviewer configuration'
 $configRepositoryId = ''
 if ($configObject.PSObject.Properties.Name -ccontains 'repository' -and
@@ -852,6 +894,185 @@ if ($configObject.PSObject.Properties.Name -ccontains 'repository' -and
 $snapshotRepositoryId = [string]$snapshot.Binding.RepositoryId
 if ($configRepositoryId -and $snapshotRepositoryId -and $configRepositoryId -cne $snapshotRepositoryId) {
     throw "The reviewer configuration is bound to repository '$configRepositoryId' but the sealed snapshot is bound to '$snapshotRepositoryId'."
+}
+
+$discoveryPackage = $null
+if ($Role -ceq 'verifier') {
+    $candidateText = [IO.File]::ReadAllText($candidateFull, $Utf8)
+    Assert-Schema -Json $candidateText -SchemaName 'discovery-candidate.schema.json' `
+        -Surface 'The discovery candidate input'
+    $candidateObject = $candidateText | ConvertFrom-Json -Depth 64
+    Assert-NoForbiddenKeys -Node $candidateObject -Surface 'The discovery candidate input'
+    $sourceRole = [string]$candidateObject.sourceRole
+    $sourceModel = [string]$candidateObject.sourceModel
+    if ($sourceRole -cnotin @('generalist', 'specialist')) {
+        throw "The verifier source package role '$sourceRole' is neither generalist nor specialist."
+    }
+    if ($sourceRole -ceq 'specialist' -and
+        (-not $discoveryPackageFull -or -not $DiscoverySealKeyPath)) {
+        throw 'A specialist verifier source requires its authenticated -DiscoveryPackageRoot and -DiscoverySealKeyPath.'
+    }
+    if ([string]$Model -cnotin @([string]$discoveryModel, [string]$SecondGeneralistModel) -or
+        [string]$Model -ceq [string]$ConventionSpecialistModel) {
+        throw 'The verifier capture target must be one of two distinct configured generalists; the specialist never verifies.'
+    }
+    if (-not $discoveryPackageFull) {
+        if ($sourceRole -cne 'generalist') {
+            throw 'Only the unchanged generalist marker flow may omit an authenticated package.'
+        }
+    }
+    else {
+        $discoveryPackage = Assert-ReviewerAcquisitionTranscriptPackage `
+            -PackageRoot $discoveryPackageFull -SealKeyPath $DiscoverySealKeyPath `
+            -SchemaPath (Join-Path $SchemaDir 'transcript-package.schema.json') -RequireCaptured
+        $sourceCore = $discoveryPackage.Core
+        if ([string]$sourceCore.role -cne $sourceRole) {
+            throw 'The discovery candidate role does not match the authenticated source package.'
+        }
+        $sourceModel = [string]$sourceCore.requestedModel
+    }
+    $configuredGeneralists = @([string]$Model, [string]$SecondGeneralistModel)
+    if ($sourceRole -ceq 'generalist' -and $configuredGeneralists -cnotcontains $sourceModel) {
+        throw "The source generalist model '$sourceModel' is not one of the configured generalist pair."
+    }
+    if ($sourceRole -ceq 'specialist' -and
+        $sourceModel -cne [string]$ConventionSpecialistModel) {
+        throw "The source specialist model '$sourceModel' does not equal the configured convention specialist '$ConventionSpecialistModel'."
+    }
+    if ($discoveryPackage -and ([string]$candidateObject.sourceRole -cne $sourceRole -or
+        [string]$candidateObject.sourceModel -cne $sourceModel -or
+        [string]$candidateObject.sourceFixtureId -cne [string]$sourceCore.fixtureId)) {
+        throw 'The discovery candidate role/model/fixture does not match the authenticated source package.'
+    }
+    if (-not $discoveryPackage) {
+        $sourceModel = [string]$candidateObject.sourceModel
+    }
+    if (-not $discoveryPackage) {
+        # Existing generalist marker-only capture path.
+        $sourceCore = $null
+    }
+    if ($discoveryPackage) {
+    $sourceSnapshot = $sourceCore.snapshotIdentity
+    if (([string]$sourceCore.digests.snapshotManifestDigest).ToLowerInvariant() -cne
+        ([string]$sourceSnapshot.manifestDigest).ToLowerInvariant()) {
+        throw 'The authenticated source package disagrees internally on its snapshot digest.'
+    }
+    $sourceReplayDigestMatches = (
+        ([string]$sourceSnapshot.manifestDigest).ToLowerInvariant() -ceq
+        ([string]$ReplayManifestDigest).ToLowerInvariant())
+    if (-not $sourceReplayDigestMatches -and
+        [string]$snapshot.Classification.SealKind -ceq 'offlineCorpusSeal') {
+        $lineageDigest = [string]$snapshot.Classification.Sidecar.sourceManifestDigest
+        $sourceReplayDigestMatches = (
+            $lineageDigest.ToLowerInvariant() -ceq
+            ([string]$sourceSnapshot.manifestDigest).ToLowerInvariant())
+    }
+    if (-not $sourceReplayDigestMatches) {
+        throw 'The authenticated source package snapshot digest does not match the capture replay or its authenticated corpus-seal lineage.'
+    }
+    foreach ($identityCheck in @(
+            @('snapshot name', [string]$sourceSnapshot.snapshotName, [string]$ReplaySnapshotName),
+            @('PR', [string]$sourceSnapshot.prId, [string]$snapshot.Binding.PullRequestId),
+            @('repository', [string]$sourceSnapshot.repositoryId, [string]$snapshot.Binding.RepositoryId),
+            @('project', [string]$sourceSnapshot.project, [string]$snapshot.Binding.Project),
+            @('source commit', [string]$sourceSnapshot.sourceCommit, [string]$snapshot.Binding.SourceCommit),
+            @('target commit', [string]$sourceSnapshot.targetCommit, [string]$snapshot.Binding.TargetCommit),
+            @('change set', [string]$sourceSnapshot.changeSetDigest, [string]$snapshot.Binding.ChangeSetSha256))) {
+        if (([string]$identityCheck[1]).ToLowerInvariant() -cne
+            ([string]$identityCheck[2]).ToLowerInvariant()) {
+            throw "The authenticated source package $($identityCheck[0]) does not match the capture replay."
+        }
+    }
+    $sourcePromptPath = if ($sourceRole -ceq 'specialist') {
+        Join-Path (Split-Path $ReviewerScript -Parent) 'convention-review.prompt.md'
+    }
+    else { [string]$configLoad.PromptFilePath }
+    $expectedDiscoveryScriptSha256 = if ($PSBoundParameters.ContainsKey('DiscoverySourceScriptSha256')) {
+        $DiscoverySourceScriptSha256
+    }
+    else { Get-FileSha256Hex -Path $ReviewerScript }
+    foreach ($digestCheck in @(
+            @('config', [string]$sourceCore.digests.configSha256, (Get-FileSha256Hex -Path $configFull)),
+            @('script', [string]$sourceCore.digests.scriptSha256, $expectedDiscoveryScriptSha256),
+            @('prompt', [string]$sourceCore.digests.promptSha256, (Get-FileSha256Hex -Path $sourcePromptPath)))) {
+        if (([string]$digestCheck[1]).ToLowerInvariant() -cne
+            ([string]$digestCheck[2]).ToLowerInvariant()) {
+            throw "The authenticated source package $($digestCheck[0]) digest is stale or mismatched."
+        }
+    }
+    $packageMarkerText = [string]$discoveryPackage.MarkerText
+    $packageOutcome = Get-AgentCliJsonOutcome -StdOutText $packageMarkerText
+    $packageAnswer = if ($packageOutcome -and $packageOutcome.Answer) {
+        [string]$packageOutcome.Answer
+    }
+    else { $packageMarkerText }
+    $packagePrefix = [string]$sourceCore.resultMarkerPrefix
+    $packagePrefixIndex = $packageAnswer.IndexOf($packagePrefix, [StringComparison]::Ordinal)
+    if ($packagePrefixIndex -lt 0 -or
+        [string]$candidateObject.resultMarkerPrefix -cne $packagePrefix) {
+        throw 'The discovery candidate/package result-marker prefix binding is invalid.'
+    }
+    $packageMarker = $packageAnswer.Substring($packagePrefixIndex + $packagePrefix.Length).Trim() |
+        ConvertFrom-Json -Depth 64
+    $sourceSpecialistCandidates = @()
+    if ($sourceRole -ceq 'specialist') {
+        if ($packagePrefix -cne [string]$script:ReviewerConventionSpecialistMarkerPrefix) {
+            throw 'The specialist source does not use the exact production convention result-marker prefix.'
+        }
+        $sourceSchema = Get-ReviewerConventionSpecialistMarkerSchema `
+            -ExpectedProject ([string]$snapshot.Binding.Project) -ExpectedNonce ([string]$sourceCore.nonce)
+        $sourceOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText $packageMarkerText `
+            -MarkerPrefix $packagePrefix -Schema $sourceSchema `
+            -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars)
+        if ([string]$sourceOutcome.Status -cne 'success') {
+            throw "The specialist source marker failed the exact production schema: $([string]$sourceOutcome.Status)."
+        }
+        $packageMarker = $sourceOutcome.Value
+        $sourceSpecialistCandidates = @(
+            Get-ReviewerAuthenticatedSpecialistCandidates -Core $sourceCore -Marker $packageMarker)
+    }
+    $sourceDerived = @(ConvertTo-ReviewerIndependentDiscoveryCandidates `
+            -SourceRole $sourceRole -SourceModel $sourceModel -Marker $packageMarker `
+            -SpecialistCandidates $sourceSpecialistCandidates)
+    $derivedPairs = @($sourceDerived | ForEach-Object {
+            "$([string]$_.candidateId)`n$([string]$_.candidateHash)" } | Sort-Object)
+    $providedPairs = @(@($candidateObject.candidates) | ForEach-Object {
+            "$([string]$_.candidateId)`n$([string]$_.candidateHash)" } | Sort-Object)
+    if ($sourceDerived.Count -eq 0 -or ($derivedPairs -join '|') -cne ($providedPairs -join '|')) {
+        throw 'The discovery candidate is not the exact production-derived projection of its authenticated package.'
+    }
+    $derivedClusters = @(Get-ReviewerVerificationClusters -Candidates $sourceDerived `
+            -MaxCandidates ([int]$EffectiveCrossVerificationPolicy.maxCandidates) `
+            -MaxClusterSize ([int]$EffectiveCrossVerificationPolicy.maxClusterSize) `
+            -NearExactJaccard ([double]$EffectiveCrossVerificationPolicy.nearExactJaccard) `
+            -SemanticJaccard ([double]$EffectiveCrossVerificationPolicy.semanticJaccard))
+    $derivedClusterIds = @(@($derivedClusters | ForEach-Object {
+                [string]$_.clusterId
+            }) | Sort-Object -Unique)
+    $namedClusters = @($derivedClusters | Where-Object {
+            [string]$_.clusterId -ceq [string]$candidateObject.clusterId
+        })
+    if ($namedClusters.Count -ne 1 -or [string]$namedClusters[0].status -cne 'ready') {
+        throw 'The discovery candidate cluster does not match its authenticated source projection.'
+    }
+    if ($sourceRole -ceq 'specialist') {
+        $derivedById = @{}
+        foreach ($item in $sourceDerived) { $derivedById[[string]$item.candidateId] = $item }
+        foreach ($item in @($candidateObject.candidates)) {
+            $derivedItem = $derivedById[[string]$item.candidateId]
+            if ($null -eq $derivedItem -or [string]$item.originKind -cne 'convention' -or
+                [string]$item.originModel -cne [string]$derivedItem.originModel -or
+                [string]$item.originArtifactSha256 -cne [string]$derivedItem.originArtifactSha256) {
+                throw "The specialist candidate's convention origin/provenance is missing or fabricated."
+            }
+        }
+    }
+    $packageMarker = [IO.Path]::GetFullPath([string]$discoveryPackage.MarkerPath)
+    if ($markerFull -and [IO.Path]::GetFullPath($markerFull) -cne $packageMarker) {
+        throw 'The supplied discovery marker is not the authenticated package result marker.'
+    }
+    $markerFull = $packageMarker
+    }
 }
 
 $readiness = [ordered]@{
@@ -894,6 +1115,8 @@ if (-not $outputParent -or -not (Test-Path -LiteralPath $outputParent -PathType 
 }
 $outputLockPath = Join-Path $outputParent ('.' + [IO.Path]::GetFileName($outputFull) + '.capture.lock')
 $outputLock = $null
+$discoveryCoreLock = $null
+$discoveryMarkerLock = $null
 try {
     $outputLock = [IO.FileStream]::new(
         $outputLockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite,
@@ -915,6 +1138,22 @@ $telemetryPath = Join-Path $workRoot 'telemetry.jsonl'
 $stdOutPath = Join-Path $workRoot 'child.stdout.log'
 $stdErrPath = Join-Path $workRoot 'child.stderr.log'
 $stateDir = Join-Path $workRoot 'state'
+if ($discoveryPackage) {
+    # Consume the exact package bytes verified earlier, not caller-controlled
+    # paths that can change between authentication and the child capture.
+    $discoveryStage = Join-Path $workRoot 'authenticated-discovery'
+    New-Item -ItemType Directory -Path $discoveryStage | Out-Null
+    $stagedCorePath = Join-Path $discoveryStage 'capture-core.json'
+    $markerFull = Join-Path $discoveryStage 'result-marker.txt'
+    [IO.File]::WriteAllBytes($stagedCorePath, [byte[]]$discoveryPackage.CoreBytes)
+    [IO.File]::WriteAllBytes($markerFull, [byte[]]$discoveryPackage.MarkerBytes)
+    (Get-Item -LiteralPath $stagedCorePath -Force).Attributes = [IO.FileAttributes]::ReadOnly
+    (Get-Item -LiteralPath $markerFull -Force).Attributes = [IO.FileAttributes]::ReadOnly
+    $discoveryCoreLock = [IO.File]::Open(
+        $stagedCorePath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $discoveryMarkerLock = [IO.File]::Open(
+        $markerFull, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+}
 
 $reviewerArgs = @(
     '-NoProfile', '-File', $ReviewerScript,
@@ -947,6 +1186,9 @@ if ($Role -ceq 'verifier') {
         '-AcquisitionCandidateInputFile', $candidateFull
     )
     if ($markerFull) { $reviewerArgs += @('-AcquisitionDiscoveryMarkerFile', $markerFull) }
+    if ($discoveryPackage) {
+        $reviewerArgs += @('-AcquisitionDiscoveryCoreFile', $stagedCorePath)
+    }
 }
 
 $removedEnvironment = @{}
@@ -1100,6 +1342,14 @@ try {
     }
 }
 finally {
+    if ($discoveryMarkerLock) {
+        $discoveryMarkerLock.Dispose()
+        $discoveryMarkerLock = $null
+    }
+    if ($discoveryCoreLock) {
+        $discoveryCoreLock.Dispose()
+        $discoveryCoreLock = $null
+    }
     if (-not $published -and (Test-Path -LiteralPath $publicationStaging)) {
         Get-ChildItem -LiteralPath $publicationStaging -File -Recurse -Force -ErrorAction SilentlyContinue |
             ForEach-Object { try { $_.Attributes = [IO.FileAttributes]::Normal } catch { } }
@@ -1149,5 +1399,7 @@ Write-Host "Role input capture verified: role=$Role model=$Model, zero model/age
 exit 0
 }
 finally {
+    if ($discoveryMarkerLock) { $discoveryMarkerLock.Dispose() }
+    if ($discoveryCoreLock) { $discoveryCoreLock.Dispose() }
     if ($null -ne $outputLock) { $outputLock.Dispose() }
 }

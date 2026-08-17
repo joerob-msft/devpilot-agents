@@ -46,6 +46,9 @@
         "properties": {
           "candidateId": { "type": "string", "minLength": 1, "maxLength": 256 },
           "candidateHash": { "type": "string", "pattern": "^[0-9a-f]{8,64}$" },
+          "originKind": { "enum": ["generalist", "convention"] },
+          "originModel": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "originArtifactSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
           "severity": { "type": "string", "maxLength": 32 },
           "filePath": { "type": "string", "maxLength": 400 },
           "line": { "type": "integer", "minimum": 0, "maximum": 1000000 },
@@ -53,5 +56,23 @@
         }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "sourceRole": { "const": "specialist" } },
+        "required": ["sourceRole"]
+      },
+      "then": {
+        "properties": {
+          "candidates": {
+            "items": {
+              "required": ["originKind", "originModel", "originArtifactSha256"],
+              "properties": { "originKind": { "const": "convention" } }
+            }
+          }
+        }
+      }
+    }
+  ]
 }
