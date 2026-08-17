@@ -130,6 +130,34 @@ function New-ClassifiedReplay {
     }
     return $loaded
 }
+function New-V2ReplaySource {
+    <#
+        Upgrade the synthetic v1 snapshot to schemaVersion 2, which is the only
+        schema whose sealed binding carries a merge base and an iteration. The
+        real historical packs are v2, so without this the "the seal carries it
+        and the request omits it" half of the identity pairing has no coverage.
+    #>
+    param([Parameter(Mandatory)][string]$Destination)
+    Copy-Item -LiteralPath $ReplayPath -Destination $Destination -Recurse -Force
+    Get-ChildItem -LiteralPath $Destination -Recurse -Force | ForEach-Object { try { $_.Attributes = 'Normal' } catch { } }
+    $transportPath = Join-Path $Destination 'source-transport.json'
+    Write-Utf8 $transportPath (Canon ([ordered]@{ schemaVersion = 1; mode = 'mcpFlat'; files = @() }))
+    $mPath = Join-Path $Destination 'manifest.json'
+    $m = Get-Content $mPath -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -Depth 64
+    $m.schemaVersion = 2
+    $m.binding['iterationId'] = 1
+    $m.binding['commonCommit'] = [string]$m.binding.targetCommit
+    $m['sourceTransport'] = [ordered]@{
+        mode = 'mcpFlat'; artifactFile = 'source-transport.json'
+        artifactSha256 = Sha $transportPath
+        artifactByteLength = [long](Get-Item $transportPath).Length
+    }
+    $m.Remove('manifestDigest')
+    $m.manifestDigest = TextSha (Canon $m)
+    Write-Utf8 $mPath (Canon $m)
+    [void](New-AgentReplaySnapshot -ReplayRoot (Split-Path $Destination -Parent) -SnapshotName (Split-Path $Destination -Leaf) `
+            -ExpectedManifestDigest ([string]$m.manifestDigest))
+}
 function Remove-Tree {
     param([string]$Path)
     if (Test-Path -LiteralPath $Path) {
@@ -677,6 +705,33 @@ try {
         (Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-unbacked-iteration') -Request $unbackedIteration) `
         "declares 'iteration'"
 
+    # The mirror direction, which only a v2 seal can exercise: the snapshot DOES
+    # carry a merge base and an iteration, and a request that stays silent about
+    # them must be refused rather than quietly capturing under an identity it
+    # never committed to. The real historical packs are all v2.
+    $v2Source = Join-Path $runRoot 'v2-replay-source\synthetic-pr'
+    New-V2ReplaySource -Destination $v2Source
+    $v2Bundle = New-CaptureBundle -Role generalist -Tag v2 -ReplaySource $v2Source
+    $v2Request = Get-Content -LiteralPath $v2Bundle.Request -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -Depth 64
+    Check 'a v2 seal makes the request declare both the merge base and the iteration' (
+        $v2Request.identity.Contains('common') -and $v2Request.identity.Contains('iteration'))
+    foreach ($omitted in @('common', 'iteration')) {
+        $omitFile = Join-Path $runRoot "request-omits-$omitted.json"
+        $omitObject = Get-Content -LiteralPath $v2Bundle.Request -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -Depth 64
+        $omitObject.identity.Remove($omitted)
+        Write-Utf8 $omitFile (ConvertTo-Json $omitObject -Depth 64)
+        Invoke-ExpectedFailure "a request omitting the $omitted the seal carries is refused" `
+            (Get-CaptureArgs -Bundle $v2Bundle -Out (Join-Path $runRoot "capture-omits-$omitted") -Request $omitFile) `
+            "omits '$omitted'"
+    }
+    $v2Wrong = Join-Path $runRoot 'request-v2-wrong-common.json'
+    $v2WrongObject = Get-Content -LiteralPath $v2Bundle.Request -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -Depth 64
+    $v2WrongObject.identity.common = ('b' * 40)
+    Write-Utf8 $v2Wrong (ConvertTo-Json $v2WrongObject -Depth 64)
+    Invoke-ExpectedFailure 'a request whose merge base disagrees with the seal is refused' `
+        (Get-CaptureArgs -Bundle $v2Bundle -Out (Join-Path $runRoot 'capture-v2-wrong-common') -Request $v2Wrong) `
+        "common does not match"
+
     # -- 6. Candidate binding and missing sealed material --------------------
     Write-Host '6/8 the verifier requires an independent candidate; missing sealed material blocks' -ForegroundColor Cyan
     $verBundle = New-CaptureBundle -Role verifier
@@ -944,6 +999,34 @@ try {
             Check "$role did not fabricate a ready bundle after failure" (-not $isReady -or $r.ExitCode -ne 0) $r.Text
         }
     }
+
+    # -- 10. The captured model and the discovery generalist model separate ----
+    Write-Host '10/10 a specialist capture may run a different model from the discovery generalist' -ForegroundColor Cyan
+    $splitRequest = Join-Path $runRoot 'specialist-split-model-request.json'
+    $splitObject = Get-Content $specBundle.Request -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -Depth 64
+    $splitObject.model = 'claude-sonnet-5'
+    Write-Utf8 $splitRequest (Canon $splitObject)
+    $splitOut = Join-Path $runRoot 'capture-specialist-split-model'
+    $split = Invoke-Tool -Arguments (Get-CaptureArgs -Bundle $specBundle -Out $splitOut -Model 'claude-sonnet-5' `
+            -Request $splitRequest -Extra @('-DiscoveryGeneralistModel', 'claude-opus-5'))
+    $splitManifest = Join-Path $splitOut 'capture-manifest.json'
+    Check 'a specialist capture separates the captured model from the discovery generalist' (
+        $split.ExitCode -eq 0 -and (Test-Path -LiteralPath $splitManifest)) $split.Text
+    if (Test-Path -LiteralPath $splitManifest) {
+        $splitM = Get-Content $splitManifest -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 64
+        Check 'the separated capture records the specialist model, not the discovery model' (
+            [string]$splitM.model -ceq 'claude-sonnet-5' -and [string]$splitM.role -ceq 'specialist' -and
+            [int]$splitM.launch.boundaryHits -eq 1 -and
+            @($splitM.sideEffects.PSObject.Properties | Where-Object { [int]$_.Value -ne 0 }).Count -eq 0)
+    }
+    Invoke-ExpectedFailure 'a generalist capture may not separate the discovery generalist model' (
+        Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-generalist-split-refused') `
+            -Extra @('-DiscoveryGeneralistModel', 'claude-sonnet-5')
+    ) 'generalist capture is the discovery generalist'
+    Invoke-ExpectedFailure 'an unsealed discovery generalist model is refused' (
+        Get-CaptureArgs -Bundle $specBundle -Out (Join-Path $runRoot 'capture-specialist-unsealed-discovery') `
+            -Extra @('-DiscoveryGeneralistModel', 'gpt-4o-not-sealed')
+    ) 'is not among the models the sealed snapshot was captured for'
 
     # -- Schemas are versioned and strict ------------------------------------
     foreach ($schema in @(

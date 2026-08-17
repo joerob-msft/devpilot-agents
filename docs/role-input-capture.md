@@ -54,6 +54,43 @@ The pipeline order is therefore:
 3. materialize that output with PR50; and
 4. run PR49 Preflight over the materialized bundle.
 
+### Feeding the PR50 materializer
+
+Step 3 consumes a legacy `blinded-reviewer-adapter-input` projection together
+with the role provenance capture emitted. Supply the legacy identity to capture
+with `-LegacyProjectionFile`, and capture re-materializes it with the role
+provenance appended into `projections/`; that file is what PR50 takes as
+`-LegacyProjectionFile`. Without it a capture still publishes, but it publishes
+only the standalone `projection.json`, whose `bindingSha256` is computed over the
+capture projection's own binding shape and therefore does not satisfy PR50's
+legacy binding check.
+
+This is **not** the PR51 circularity returning. The legacy identity a
+materializer-ready capture needs is derivable from the sealed pack alone — the
+provider/repository/PR/iteration/commit binding plus the sealed replay manifest
+as a hash-and-length-bound resource — and carries no role provenance whatsoever.
+Capture is what supplies the role provenance, which is precisely the dependency
+that PR51 had backwards. A minimal legacy identity of this shape is built by
+`New-CaptureBundle` in `tools/Test-ReviewerRoleInputCapture.ps1`.
+
+Pass `-ReplaySnapshotPath` and `-ExpectedReplayManifestFileSha256` to PR50 as the
+**original** sealed pack and its manifest bytes, not the classified copy capture
+consumed: the legacy projection seals the original manifest, and PR50 checks the
+independent replay manifest against exactly those bytes.
+
+### Separating the captured model from the discovery generalist
+
+`-Model` is the model of the role being captured. For a specialist or verifier
+capture the surrounding production run still needs its first generalist model,
+which is legitimately a different model — a configuration whose convention
+specialist is `claude-sonnet-5` while discovery runs `claude-opus-5` is ordinary.
+Pass that first generalist with `-DiscoveryGeneralistModel`; it defaults to
+`-Model`, and for a generalist capture it may not differ from `-Model`, because a
+generalist capture *is* the discovery generalist. Both models must be among the
+models the sealed snapshot was captured for. Without this separation such a
+configuration cannot be captured at all: production refuses the pairing before it
+ever reaches the boundary.
+
 `-Preflight` performs every readiness check (including requiring an existing
 32-byte seal key) and leaves the filesystem
 byte-for-byte untouched — no output root, no lease, no plan, no token, no
@@ -88,6 +125,15 @@ The supervisor:
 Missing or empty telemetry is not proof of zero activity and fails closed. A
 successful capture must positively show that production consumed its sealed
 snapshot, while recording no model/agency/provider process or live/write event.
+
+State the positive half precisely: `provider.replayServed` is emitted when a read
+is dispatched against the sealed corpus rather than after the payload validates,
+so the serve count is a count of sealed reads **issued**, not a per-resource
+consumption ledger. That is what this gate needs — it separates a run that
+genuinely exercised the sealed corpus from an empty or truncated sink passing off
+"nothing happened" as "nothing bad happened". The zero-side-effect half does not
+depend on it at all: those events must be *absent*, so a truncated sink can only
+make the capture fail, never pass.
 
 The bundle supplies the complementary boundary evidence:
 

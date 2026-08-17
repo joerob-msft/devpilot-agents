@@ -114,6 +114,15 @@ param(
     [Parameter(ParameterSetName = 'Preflight')]
     [string]$ConventionSpecialistModel,
 
+    # The first configured generalist model, which drives discovery. It is only
+    # separable from -Model for a specialist or verifier capture, where the
+    # captured role legitimately runs a different model from the generalist that
+    # discovered the findings. Defaults to -Model, which is the only correct
+    # value for a generalist capture.
+    [Parameter(ParameterSetName = 'Capture')]
+    [Parameter(ParameterSetName = 'Preflight')]
+    [string]$DiscoveryGeneralistModel,
+
     # Optional legacy benchmark projection to re-materialize alongside the
     # capture. Read-only: every sealed resource is re-verified by hash and length.
     [Parameter(ParameterSetName = 'Capture')]
@@ -392,6 +401,17 @@ function Get-TelemetryProof {
         before it loaded the snapshot - never to a published capture. Requiring
         a serve therefore rejects vacuous "proof" without failing any honest
         capture, and the suite pins both directions.
+
+        The exact strength of this claim, stated precisely: the harness emits
+        provider.replayServed when it dispatches a read against the sealed
+        corpus, not after the payload validates, so N serves prove N sealed
+        reads were ISSUED - they are not a per-resource consumption ledger. That
+        is sufficient for what this gate is for: distinguishing a run that
+        actually exercised the sealed corpus from an empty or truncated sink
+        that could otherwise pass off "nothing happened" as "nothing bad
+        happened". The zero-side-effect half of the proof is unaffected, because
+        it is asserted over process, live-provider and write events, each of
+        which must be ABSENT rather than present.
     #>
     param([Parameter(Mandatory)][string]$TelemetryPath)
     if (-not (Test-Path -LiteralPath $TelemetryPath -PathType Leaf)) {
@@ -677,17 +697,46 @@ foreach ($pair in @(
         throw "The capture request $($pair[0]) does not match the sealed replay snapshot."
     }
 }
-if ($snapshot.Binding.Contains('CommonCommit') -and
-    ([string]$captureRequest.identity.common).ToLowerInvariant() -cne ([string]$snapshot.Binding.CommonCommit).ToLowerInvariant()) {
-    throw 'The capture request common does not match the sealed replay snapshot.'
-}
-if ($snapshot.Binding.Contains('IterationId') -and
-    [int]$captureRequest.identity.iteration -ne [int]$snapshot.Binding.IterationId) {
-    throw 'The capture request iteration does not match the sealed replay snapshot.'
+# The optional merge base and iteration are checked BOTH ways: a request may not
+# assert identity the seal cannot back, and may not omit identity the seal does
+# carry. The declared/sealed presence pair is resolved first so that an omitted
+# field reports the designed mismatch rather than a StrictMode property fault.
+foreach ($optional in @(
+        @('common', 'CommonCommit'), @('iteration', 'IterationId'))) {
+    $declared = [bool]$captureRequest.identity.PSObject.Properties[$optional[0]]
+    $sealed = [bool]$snapshot.Binding.Contains($optional[1])
+    if ($declared -ne $sealed) {
+        throw $(if ($declared) {
+                "The capture request declares '$($optional[0])', which the sealed replay snapshot cannot back."
+            }
+            else {
+                "The capture request omits '$($optional[0])', which the sealed replay snapshot carries."
+            })
+    }
+    if (-not $sealed) { continue }
+    $requested = $captureRequest.identity.($optional[0])
+    $sealedValue = $snapshot.Binding[$optional[1]]
+    $matches = if ($optional[0] -ceq 'iteration') { [int]$requested -eq [int]$sealedValue }
+    else { ([string]$requested).ToLowerInvariant() -ceq ([string]$sealedValue).ToLowerInvariant() }
+    if (-not $matches) {
+        throw "The capture request $($optional[0]) does not match the sealed replay snapshot."
+    }
 }
 if (@($snapshot.Bindings.Models) -cnotcontains $Model) {
     throw "Model '$Model' is not among the models the sealed snapshot was captured for."
 }
+# A generalist capture IS the discovery generalist, so the two cannot diverge.
+# For a specialist or verifier they legitimately can, and the discovery model
+# must still be one the snapshot was sealed for.
+if ($DiscoveryGeneralistModel) {
+    if ($Role -ceq 'generalist' -and $DiscoveryGeneralistModel -cne $Model) {
+        throw 'A generalist capture is the discovery generalist; -DiscoveryGeneralistModel may not differ from -Model.'
+    }
+    if (@($snapshot.Bindings.Models) -cnotcontains $DiscoveryGeneralistModel) {
+        throw "Discovery generalist model '$DiscoveryGeneralistModel' is not among the models the sealed snapshot was captured for."
+    }
+}
+$discoveryModel = if ($DiscoveryGeneralistModel) { $DiscoveryGeneralistModel } else { $Model }
 
 # The reviewer configuration is the third identity the capture is bound to, next
 # to the request and the sealed snapshot. It is operator-supplied and is NOT
@@ -713,6 +762,7 @@ $readiness = [ordered]@{
     ready          = $true
     role           = $Role
     model          = $Model
+    discoveryGeneralistModel = $discoveryModel
     prId           = $PullRequestId
     fixtureId      = [string]$captureRequest.fixtureId
     snapshot       = [ordered]@{
@@ -773,7 +823,7 @@ $reviewerArgs = @(
     '-Once', '-RepoPath', $repoFull,
     '-ConfigFile', $configFull, '-StateDir', $stateDir,
     '-OperatorAlias', 'role-input-capture', '-PullRequestId', "$PullRequestId",
-    '-Model', $Model, '-CycleTimeoutSeconds', "$TimeoutSeconds",
+    '-Model', $discoveryModel, '-CycleTimeoutSeconds', "$TimeoutSeconds",
     '-ReplayRoot', $replayFull, '-ReplaySnapshotName', $ReplaySnapshotName,
     '-ReplayManifestDigest', $ReplayManifestDigest.ToLowerInvariant(),
     '-CaptureRoleInputRole', $Role, '-CaptureRoleInputModel', $Model,
@@ -806,6 +856,7 @@ $savedTelemetryMode = $env:DEVPILOT_OFFLINE_TELEMETRY_MODE
 $savedTelemetryPath = $env:DEVPILOT_OFFLINE_TELEMETRY_PATH
 $childExitCode = -1
 $supervision = $null
+$proc = $null
 try {
     foreach ($name in $SensitiveEnvironmentVariables) {
         $value = [Environment]::GetEnvironmentVariable($name)
@@ -850,6 +901,13 @@ try {
     }
 }
 finally {
+    # If supervision itself threw after the child started, the child is still
+    # live and would keep running unsupervised - and an unsupervised child is
+    # exactly what this tool exists to make impossible. Terminate it here before
+    # anything else, so the guarantee does not depend on the happy path.
+    if ($null -ne $proc) {
+        try { if (-not $proc.HasExited) { Stop-ProcessTree -Process $proc; [void]$proc.WaitForExit(5000) } } catch { }
+    }
     foreach ($name in $removedEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name, $removedEnvironment[$name]) }
     $env:DEVPILOT_OFFLINE_TELEMETRY_MODE = $savedTelemetryMode
     $env:DEVPILOT_OFFLINE_TELEMETRY_PATH = $savedTelemetryPath
