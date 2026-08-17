@@ -58,6 +58,24 @@ jobs:
           $agents = Get-DevPilotAgentPath
           Write-Host "Agent assets resolved at: $agents"
 
+  tests:
+    name: Targeted Pester tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Pester
+        shell: pwsh
+        run: Install-Module Pester -MinimumVersion 5.7.1 -Force -Scope CurrentUser -ErrorAction Stop
+
+      - name: Run targeted tests
+        shell: pwsh
+        run: |
+          $result = Invoke-Pester -Path ./tests -Output Detailed -PassThru
+          if ($result.FailedCount -gt 0) {
+              throw "Pester reported $($result.FailedCount) failed test(s)."
+          }
+
   selfcheck:
     name: Agent self-checks (-DryRun)
     runs-on: windows-latest

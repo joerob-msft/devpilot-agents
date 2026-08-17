@@ -159,6 +159,7 @@ if (-not $importedHarness) {
 $HarnessPath = $importedHarness.Path
 
 $ResultMarkerPrefix = "REVIEW_HANDLER_RESULT_V1:"
+$script:HandlerRejectedResumeSessionIds = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 
 # ---------------------------------------------------------------------------
 # CODE-DEFINED security policy (never config-supplied; a forked config file
@@ -1600,6 +1601,72 @@ function Get-HandlerReviewerVoteSummary {
     return @{ Approvals = $approvals; NegativeVotes = $negativeVotes }
 }
 
+function Get-HandlerUsableSessionMatches {
+    param(
+        [AllowNull()][object[]]$Sessions,
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.HashSet[string]]$RejectedSessionIds
+    )
+    return @(@($Sessions) | Where-Object {
+            $_ -and -not $RejectedSessionIds.Contains([string]$_.SessionId)
+        })
+}
+
+function Test-HandlerUnknownResumeTarget {
+    param(
+        [Parameter(Mandatory)][hashtable]$Run,
+        [AllowNull()][string]$ResumeSessionId
+    )
+    if ([string]::IsNullOrWhiteSpace($ResumeSessionId) -or $Run.TimedOut -or $Run.ExitCode -eq 0) { return $false }
+    return ([string]$Run.StdErr -match '(?i)\bNo session, task, or name matched\b')
+}
+
+function Invoke-HandlerCopilotLaunch {
+    param(
+        [Parameter(Mandatory)][string]$AgencyPath,
+        [Parameter(Mandatory)][string[]]$ResumeArgumentList,
+        [Parameter(Mandatory)][string[]]$FreshArgumentList,
+        [Parameter(Mandatory)][string]$StandardInputContent,
+        [Parameter(Mandatory)][string]$WorkingDirectory,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$EnvironmentVariablesToRemove,
+        [Parameter(Mandatory)][int]$TimeoutSeconds,
+        [AllowNull()][string]$ResumeSessionId,
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.HashSet[string]]$RejectedSessionIds,
+        [scriptblock]$ProcessInvoker
+    )
+    if (-not $ProcessInvoker) {
+        $ProcessInvoker = {
+            param([hashtable]$Parameters)
+            Invoke-TimedProcess @Parameters
+        }
+    }
+
+    $processParameters = @{
+        FilePath                     = $AgencyPath
+        ArgumentList                 = $ResumeArgumentList
+        StandardInputContent         = $StandardInputContent
+        CaptureStdOut                = $true
+        CaptureStdErr                = $true
+        WorkingDirectory             = $WorkingDirectory
+        EnvironmentVariablesToRemove = $EnvironmentVariablesToRemove
+        TimeoutSeconds               = $TimeoutSeconds
+    }
+    $run = & $ProcessInvoker $processParameters
+    $retriedFresh = $false
+
+    if (Test-HandlerUnknownResumeTarget -Run $run -ResumeSessionId $ResumeSessionId) {
+        [void]$RejectedSessionIds.Add($ResumeSessionId)
+        Write-Warning "Copilot rejected resume session '$ResumeSessionId'; retrying this cycle once with a fresh session."
+        $processParameters.ArgumentList = $FreshArgumentList
+        $run = & $ProcessInvoker $processParameters
+        $retriedFresh = $true
+    }
+
+    return @{
+        Run          = $run
+        RetriedFresh = $retriedFresh
+    }
+}
+
 function Invoke-HandlerCycle {
     param(
         [Parameter(Mandatory)][string]$AgencyPath,
@@ -1696,7 +1763,9 @@ function Invoke-HandlerCycle {
             # concurrently and each pick up only the PRs it wrote.
             $candidateSessions = $null
             if ($RequireCodingSession) {
-                $candidateSessions = Find-CopilotSessionForBranch -Branch $candidateBranch
+                $candidateSessions = Get-HandlerUsableSessionMatches `
+                    -Sessions (Find-CopilotSessionForBranch -Branch $candidateBranch) `
+                    -RejectedSessionIds $script:HandlerRejectedResumeSessionIds
                 if (-not $candidateSessions -or $candidateSessions.Count -eq 0) {
                     Write-Host "  PR $prId skipped (no local coding session for '$candidateBranch'; -RequireCodingSession is set, so another Dev Box owns it)." -ForegroundColor DarkGray
                     continue
@@ -1740,7 +1809,14 @@ function Invoke-HandlerCycle {
         # Reuse the scan from the ownership gate when -RequireCodingSession
         # already performed it, so the disk scan happens once per cycle.
         $resolvedSessionId = "none"
-        $sessionMatches = if ($bound.Sessions) { $bound.Sessions } else { Find-CopilotSessionForBranch -Branch $bound.SourceBranch }
+        $sessionMatches = if ($bound.Sessions) {
+            $bound.Sessions
+        }
+        else {
+            Get-HandlerUsableSessionMatches `
+                -Sessions (Find-CopilotSessionForBranch -Branch $bound.SourceBranch) `
+                -RejectedSessionIds $script:HandlerRejectedResumeSessionIds
+        }
         if ($sessionMatches -and $sessionMatches.Count -gt 0) {
             $preferred = @($sessionMatches | Where-Object { $_.GitRoot -eq $worktreePath })
             $chosen = if ($preferred.Count -gt 0) { $preferred[0] } else { $sessionMatches[0] }
@@ -1765,11 +1841,22 @@ function Invoke-HandlerCycle {
         $modelArg = if ($EffectiveModel -eq (Get-AgentDefaultModelSentinel)) { $null } else { $EffectiveModel }
         $agencyArgs = Get-AgentCopilotArgs -AgentName $CopilotAgentName -Source $CopilotAgentSource `
             -AllowTools $allowTools -DenyTools $denyTools -Model $modelArg -UseYolo:$Yolo -ResumeSessionId $resumeId -JsonOutput
+        $freshAgencyArgs = if ($resumeId) {
+            Get-AgentCopilotArgs -AgentName $CopilotAgentName -Source $CopilotAgentSource `
+                -AllowTools $allowTools -DenyTools $denyTools -Model $modelArg -UseYolo:$Yolo -JsonOutput
+        }
+        else {
+            $agencyArgs
+        }
         Write-Host "Launching Copilot (mode=$permissionMode, timeout=${CycleTimeoutSeconds}s, resume=$([bool]$resumeId))..." -ForegroundColor Cyan
 
-        $run = Invoke-TimedProcess -FilePath $AgencyPath -ArgumentList $agencyArgs -StandardInputContent $stdin `
-            -CaptureStdOut -CaptureStdErr -WorkingDirectory $worktreePath `
-            -EnvironmentVariablesToRemove $SensitiveEnvironmentVariables -TimeoutSeconds $CycleTimeoutSeconds
+        $launch = Invoke-HandlerCopilotLaunch -AgencyPath $AgencyPath `
+            -ResumeArgumentList $agencyArgs -FreshArgumentList $freshAgencyArgs `
+            -StandardInputContent $stdin -WorkingDirectory $worktreePath `
+            -EnvironmentVariablesToRemove $SensitiveEnvironmentVariables `
+            -TimeoutSeconds $CycleTimeoutSeconds -ResumeSessionId $resumeId `
+            -RejectedSessionIds $script:HandlerRejectedResumeSessionIds
+        $run = $launch.Run
 
         # -- Step 7: marker validation (hostile input) ------------------------
         # Prefer the CLI's structured JSONL channel; fall back to raw stdout so
@@ -2081,6 +2168,3 @@ catch {
     Write-Error $_
     exit 1
 }
-
-
-

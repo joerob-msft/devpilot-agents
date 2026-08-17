@@ -942,6 +942,29 @@ function Get-TaskTextBeforeDeadline {
     catch { return @{ Completed = $true; Text = "" } }
 }
 
+function Test-IsClosedChildStdinException {
+    param([Parameter(Mandatory)][System.Exception]$Exception)
+
+    $pending = New-Object System.Collections.Generic.Queue[System.Exception]
+    $pending.Enqueue($Exception)
+    while ($pending.Count -gt 0) {
+        $current = $pending.Dequeue()
+        if ($current -is [System.IO.IOException]) {
+            $nativeError = $current.HResult -band 0xFFFF
+            if ($nativeError -in @(109, 232)) { return $true }
+        }
+        if ($current -is [System.AggregateException]) {
+            foreach ($inner in $current.InnerExceptions) {
+                if ($inner) { $pending.Enqueue($inner) }
+            }
+        }
+        elseif ($current.InnerException) {
+            $pending.Enqueue($current.InnerException)
+        }
+    }
+    return $false
+}
+
 function Invoke-TimedProcess {
     <#
         Runs a child process with async stdout/stderr capture, UTF-8 (no BOM)
@@ -990,11 +1013,18 @@ function Invoke-TimedProcess {
             $stdinBytes = $utf8Encoding.GetBytes($StandardInputContent)
             $writeTask = $proc.StandardInput.BaseStream.WriteAsync($stdinBytes, 0, $stdinBytes.Length)
             $writeDeadlineMs = [Math]::Max(0, [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-            if (-not $writeTask.Wait($writeDeadlineMs)) {
-                $timedOut = $true
+            try {
+                if (-not $writeTask.Wait($writeDeadlineMs)) {
+                    $timedOut = $true
+                }
             }
-            else {
-                try { $proc.StandardInput.Close() } catch {}
+            catch {
+                if (-not (Test-IsClosedChildStdinException -Exception $_.Exception)) { throw }
+            }
+            finally {
+                if ($writeTask.IsCompleted) {
+                    try { $proc.StandardInput.Close() } catch {}
+                }
             }
         }
 
@@ -2440,6 +2470,5 @@ Export-ModuleMember -Function @(
     "Get-AgentProviderValidationRun",
     "Set-AgentProviderPullRequestVote"
 )
-
 
 
