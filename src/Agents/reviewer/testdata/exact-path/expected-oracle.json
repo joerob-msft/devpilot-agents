@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "kind": "reviewer-orchestration-expected-oracle",
   "fixtureId": "synthetic-exact-path",
-  "expectedSemanticSha256": "68f41342736068ddb4924cb1cb908f76bcd585eb0665a724cdbe872aee9a01ff",
+  "expectedSemanticSha256": "fb92b9ffe8ec781502605602f1fc13e40bca86062e54be1c7d3604941106d78d",
   "provenance": {
     "author": "hand-authored synthetic fixture",
     "modelQualityClaim": false,

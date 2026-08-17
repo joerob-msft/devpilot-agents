@@ -17660,8 +17660,8 @@ function Invoke-ReviewerRoleInputCaptureRun {
                     throw 'The production specialist path did not produce both sealed plans.'
                 }
                 [ordered]@{
-                    conventionPlanJson = Get-ReviewerCanonicalJson -Value $script:ReviewerRoleInputConventionPlan
-                    factPlanJson = Get-ReviewerCanonicalJson -Value $script:ReviewerRoleInputFactPlan
+                    conventionPlanJson = ConvertTo-ReviewerVerificationCanonicalJson -Value $script:ReviewerRoleInputConventionPlan
+                    factPlanJson = ConvertTo-ReviewerVerificationCanonicalJson -Value $script:ReviewerRoleInputFactPlan
                 }
             }
             'verifier' {
