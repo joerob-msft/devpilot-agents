@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "reviewer.production-role-input-capture-request.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "kind", "fixtureId", "role", "model", "identity", "snapshot", "resources"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "kind": { "const": "reviewer-role-input-capture-request" },
+    "fixtureId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+    "role": { "enum": ["generalist", "specialist", "verifier"] },
+    "model": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "organization", "project", "repositoryId", "prId", "source", "target", "changeSet"],
+      "properties": {
+        "provider": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "organization": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "project": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "repositoryId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "prId": { "type": "integer", "minimum": 1 },
+        "iteration": { "type": "integer", "minimum": 1 },
+        "source": { "$ref": "#/$defs/commit" },
+        "common": { "$ref": "#/$defs/commit" },
+        "target": { "$ref": "#/$defs/commit" },
+        "changeSet": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "manifestDigest", "manifestFileSha256", "configSha256"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" },
+        "manifestDigest": { "$ref": "#/$defs/hash" },
+        "manifestFileSha256": { "$ref": "#/$defs/hash" },
+        "configSha256": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "resources": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1024,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["mediaRole", "sealedPath", "sha256", "byteLength"],
+        "properties": {
+          "mediaRole": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+          "sealedPath": { "type": "string", "minLength": 1, "maxLength": 512 },
+          "sha256": { "$ref": "#/$defs/hash" },
+          "byteLength": { "type": "integer", "minimum": 1 }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+  }
+}

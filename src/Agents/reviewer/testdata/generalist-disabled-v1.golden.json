@@ -163,6 +163,10 @@
       {
         "sha256": "6f6c02324459e6a98dada749a1253f65bc2fab5e437c70b06205f334e19bf224",
         "reason": "Thread the cycle-level authoritative-source configured/resolved counts and the withheld-degrade flag onto the bound item and into the convention-source summary call, so an offline replay that could not answer a configured generalist authoritative source is reported honestly (N of M resolved; K withheld) and degrades cross-verification instead of being silently summarized as a configuration gap. No change to the disabled generalist discovery or delivery path."
+      },
+      {
+        "sha256": "620d9b32c0b0b7fae72a811685ecb5a0082b123b9b198ce3f03abb7220fb1a82",
+        "reason": "CURRENT and authoritative. Route the generalist role through the existing single-role acquisition dispatch so a no-model role input capture drives the EXACT production cycle rather than a hand-built projection Bound. The guard that already returned early for the specialist now also does so for the generalist, which is what lets capture emit a production-derived role-scoped projection instead of consuming one. The disabled generalist discovery, cross-verification and delivery paths are unchanged: the dispatch is reachable only while an acquisition or capture target role is active."
       }
     ],
     "Write-ReviewerConventionSpecialistPreview": [

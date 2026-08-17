@@ -1831,6 +1831,20 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
     $script:knownNonce = ('abc123' * 6)
     $script:timedProcessCalled = $false
     $script:cannedStdOut = ''
+    # This block exercises the REAL extracted model-pass/subprocess functions, so
+    # it must also stand up the module-scope state Start-ReviewerAgent.ps1 sets up
+    # before any pass runs. Their production defaults are all "inactive": without
+    # them StrictMode aborts at the capture boundary before the pass is reached.
+    $script:ReviewerRoleInputCaptureActive = $false
+    $script:ReviewerRoleInputCapture = $null
+    $script:ReviewerRoleInputCaptureBoundaryHits = 0
+    $script:ReviewerRoleInputConventionPlan = $null
+    $script:ReviewerRoleInputFactPlan = $null
+    $script:ReviewerAcquisitionActive = $false
+    $script:ReviewerAcquisitionSingleShot = $false
+    $script:ReviewerAcquisitionCaptures = [System.Collections.Generic.List[object]]::new()
+    $script:ReviewerAcquisitionTargetRole = ''
+    $script:ReviewerOfflineModelAdapterActive = $false
 
     function New-AgentNonce { $script:knownNonce }
     function Get-ReviewerRuntimeContext { param($Nonce, $PrId, $RepositoryId, $SourceCommit, $SourceBranch, $AuthorAlias, $ThreadDigestText, $AuthoritativeSourcesText, $PinnedSourceText) '' }
@@ -1841,6 +1855,7 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
     function Get-ReviewerEffectiveDenyTools { param($ConfigDeny) @() }
     function Get-AgentDefaultModelSentinel { 'DEFAULT_SENTINEL' }
     function Get-AgentCopilotArgs { param($AgentName, $Source, $AvailableTools, $AllowTools, $DenyTools, $Model, [switch]$JsonOutput) @('--json') }
+    function Add-ReviewerAcquisitionCapture { param($Run, $Role, $Model, $StandardInputContent, $Binding) }
     function Invoke-TimedProcess {
         param($FilePath, $ArgumentList, $StandardInputContent, [switch]$CaptureStdOut, [switch]$CaptureStdErr, $WorkingDirectory, $EnvironmentVariablesToRemove, $TimeoutSeconds)
         $script:timedProcessCalled = $true

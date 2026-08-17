@@ -31,13 +31,28 @@ Use the supervisor, which adds the outside half of the guarantee:
 ```powershell
 ./tools/Invoke-ReviewerRoleInputCapture.ps1 `
     -Role generalist -Model claude-opus-5 `
-    -FixtureProjectionFile ./bundle/projection.json `
+    -CaptureRequestFile ./bundle/capture-request.json `
     -ConfigFile ./bundle/config/reviewer.config.json `
     -ReplayRoot ./bundle/replay -ReplaySnapshotName <snapshot> `
     -ReplayManifestDigest <64-hex> -PullRequestId <id> `
     -ExpectedHeadCommit <40-hex> -ExpectedRef refs/heads/<branch> `
     -OutputRoot ./captures/<name> -SealKeyPath <private-32-byte-key>
 ```
+
+The request is intentionally smaller than a PR50 fixture projection. It contains
+only fixture/role/model, sealed provider/repository/PR/iteration and
+source/common/target/change-set identity, snapshot/config bindings, and
+hash-and-length-bound paths inside the snapshot. Its strict schema has no place
+for role provenance, prompt/input/script hashes, findings, decisions or expected
+results. An optional legacy projection is accepted only as another minimal
+identity/resource source and is refused if it already contains role provenance.
+
+The pipeline order is therefore:
+
+1. capture from the independently classified replay plus the minimal request;
+2. emit production-derived role provenance and a role-scoped projection;
+3. materialize that output with PR50; and
+4. run PR49 Preflight over the materialized bundle.
 
 `-Preflight` performs every readiness check (including requiring an existing
 32-byte seal key) and leaves the filesystem
@@ -49,37 +64,32 @@ stored in the bundle.
 
 The supervisor:
 
-* validates the projection against `fixture-projection.schema.json` and scans
-  the projection **and** the reviewer configuration recursively for oracle /
+* validates the minimal request against `role-input-capture-request.schema.json`
+  and scans the request **and** reviewer configuration recursively for oracle /
   expected-decision keys, and every input path for oracle-ish path segments, so
   an answer key can reach the run neither as data nor as a file name;
 * re-resolves `-ExpectedRef` and HEAD from the git object store directly, never
   by running `git`, and fails closed on any disagreement;
 * refuses a promotable snapshot, a model the snapshot was not captured for, a
-  PR the projection is not bound to, a role the projection does not declare, and
+  PR the request is not bound to, a role the request does not declare, and
   a configuration bound to a different repository than the sealed snapshot;
 * requires the verifier role to be handed an **independently** captured
   candidate plus the sealed discovery marker it came from, and forbids the other
   roles from carrying either;
 * scrubs provider credentials out of the environment the child inherits, so a
   live read or write is impossible rather than merely unused; and
-* reads the production-test-only offline telemetry sink and **fails the capture**
-  if it records any child process, model/agency start, provider process, live
+* requires a present, parseable, non-empty production-test-only telemetry sink
+  with at least one `provider.replayServed` event, then **fails the capture** if
+  it records any child process, model/agency start, provider process, live
   provider write or write-tool invocation.
 
-### Telemetry falsifies; the seal proves
+### Telemetry must be positive and side-effect-free
 
-The telemetry sink is deliberately a *falsifier*, not a *verifier*, and the
-distinction is worth stating plainly. A no-model capture stops before the model
-boundary, so it never opens a provider session and never serves a recorded read
-— an **empty sink is the correct outcome**, and this mode must not treat "no
-events recorded" as "nothing happened". Absence of evidence is not evidence of
-absence, so nothing is inferred from an empty sink.
+Missing or empty telemetry is not proof of zero activity and fails closed. A
+successful capture must positively show that production consumed its sealed
+snapshot, while recording no model/agency/provider process or live/write event.
 
-What telemetry *can* do is disprove the claim: any side-effecting event it
-records fails the run outright.
-
-The positive evidence comes from elsewhere:
+The bundle supplies the complementary boundary evidence:
 
 * `launch.boundaryHits` is exactly `1` in the published manifest, which proves
   the production path really ran all the way to the model boundary and stopped
@@ -97,9 +107,12 @@ shelling out to `git rev-parse`.
 
 ## What a capture publishes
 
-A capture is published atomically — staged in a sibling working directory and
-moved into place only once complete — and the published tree is recursively
-read-only. It never overwrites: an existing output root is refused.
+A capture holds a create-new, no-sharing lock for its output name for the entire
+run. A concurrent caller is refused before creating work. The winner uses one
+GUID for its private same-volume work and staging roots, moves the verified
+staging tree into place atomically, and deletes only paths carrying that GUID.
+The published tree is recursively read-only and an existing output is never
+overwritten.
 
 | File | Contents |
 | --- | --- |
@@ -108,15 +121,16 @@ read-only. It never overwrites: an existing output root is refused.
 | `role-input-prompt.txt` | the exact prompt bytes the model would have received |
 | `role-input-request.json` | the role request record the boundary was called with |
 | `role-input-marker-schema.json` | the exact result-marker schema for the role |
-| `projection.json` | the blinded stimulus projection the capture consumed |
-| `sealed-resources/…` | the sealed role provenance the stimulus came from |
+| `capture-request.json` | the minimal oracle-free identity/resource request |
+| `projection.json` | role context derived by production and emitted by capture |
+| `sealed-resources/…` | capture-generated model-visible role provenance |
 
 The manifest binds identity (snapshot, PR, repository, project, source / common
 / target commits, change-set digest), role and model, the sealed resource
 inventory with a per-resource request and payload digest, the launch deny set,
 the non-promotability and build/ref facts, and this hash set:
 
-`inputSha256` (the prompt bytes), `requestSha256`, `promptSha256`,
+`inputSha256` (the prompt bytes), `captureRequestSha256`, `requestSha256`, `promptSha256`,
 `schemaSha256`, `configSha256`, `scriptSha256`, `snapshotManifestDigest`, and —
 for the verifier — `candidateInputSha256`.
 
@@ -135,22 +149,28 @@ role, it publishes a **typed blocker** (`capture-blocked.json`, schema
 `boundaryHits: 0`. The supervisor exits `3`. Gates that fail before the capture
 driver can publish anything leave no bundle at all.
 
+`-VerifyOnly` applies the same HMAC/SHA seal, recursive read-only,
+reparse-point, and exact unbound-file inventory checks to a typed blocker. Its
+success message describes only those checks; it does not infer runtime facts
+that are absent from the two-file blocker bundle.
+
 ## Prompt equivalence with the blinded adapter path
 
-`tools/Test-ReviewerRoleInputCapture.ps1` builds a synthetic benchmark pack,
-materializes it into a sealed non-promotable snapshot, captures the generalist
-role input, and then runs the blinded acquisition path
+`tools/Test-ReviewerRoleInputCapture.ps1` captures from a minimal request, emits
+role provenance, materializes that output through PR50, and runs PR49 Preflight.
+It then runs the blinded acquisition path
 (`tools/Invoke-ReviewerBlindedAcquisition.ps1`) over the equivalent fixture with
 the offline stub adapter. The only per-attempt difference between the two
 stimuli is the nonce the runtime context carries; aligning it and re-hashing
 shows the captured prompt bytes equal the adapter's recorded `inputSha256`
 exactly. The two paths also agree on the request and prompt-file digests.
 
-The suite additionally covers the specialist and verifier roles, candidate
+All three roles successfully exercise capture -> PR50 materialize -> PR49
+Preflight. The suite additionally covers candidate
 binding, missing and unsealed sealed material, oracle paths and keys, wrong
 identity / model / role / configuration / ref, stimulus substitution, tamper and
-smuggled-file detection, concurrency, read-only publication and `-Preflight`
-byte-for-byte inertness.
+smuggled-file detection, blocked-bundle inventory, a simultaneous output-lock
+race, read-only publication and `-Preflight` byte-for-byte inertness.
 
 ## Fixture regeneration
 
@@ -173,12 +193,9 @@ These are deliberate, and are recorded here rather than hidden.
   records the **running** `configSha256` and `scriptSha256` alongside the
   snapshot's `manifestDigest`, so a consumer can always see which build and
   configuration were combined with which sealed material.
-* **Only the generalist reaches the boundary from a purely static projection.**
-  The specialist runs the real `Invoke-ReviewerCycle`, and the verifier runs the
-  blinded-acquisition verifier entry point; both are existing production
-  surfaces rather than capture-only forks, but they need more surrounding sealed
-  material (selected packs, a sealed discovery marker) before they reach the
-  boundary. Without it they publish a typed `degraded`/`blocked` outcome, which
-  is the intended fail-closed behaviour.
+* **No role accepts a role projection as input.** Generalist and specialist run
+  the real `Invoke-ReviewerCycle`; verifier derives its cluster through the
+  production extraction path from an independent marker/candidate. Missing
+  sealed sources publish a typed `degraded`/`blocked` outcome.
 * **Telemetry cannot positively corroborate a no-model run.** See
   "Telemetry falsifies; the seal proves" above.

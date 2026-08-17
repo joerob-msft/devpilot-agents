@@ -32,13 +32,11 @@ $Utf8 = [Text.UTF8Encoding]::new($false, $true)
 $CaptureTool = Join-Path $PSScriptRoot 'Invoke-ReviewerRoleInputCapture.ps1'
 $MaterializeTool = Join-Path $PSScriptRoot 'Convert-ReviewerBlindedBenchmarkPack.ps1'
 $AcquireTool = Join-Path $PSScriptRoot 'Invoke-ReviewerBlindedAcquisition.ps1'
-$ReviewerScript = Join-Path $RepoRoot 'src\Agents\reviewer\Start-ReviewerAgent.ps1'
 $FixtureRoot = Join-Path $RepoRoot 'src\Agents\reviewer\testdata\exact-path'
 $ReplayPath = Join-Path $RepoRoot 'src\Agents\reviewer\testdata\replay-v1\synthetic-pr'
 $ConfigFile = Join-Path $FixtureRoot 'reviewer.config.json'
 $PromptFile = Join-Path $RepoRoot 'src\Agents\reviewer\review-cycle.prompt.md'
 $AdapterManifest = Join-Path $FixtureRoot 'adapter-manifest.json'
-$GeneralistProjection = Join-Path $RepoRoot 'tools\testdata\reviewer-acquisition-generalist-projection.json'
 $SchemaDir = Join-Path $RepoRoot 'src\Agents\reviewer\acquisition\v1'
 
 Import-Module (Join-Path $RepoRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force
@@ -62,6 +60,76 @@ function Write-Utf8 {
     New-Item -ItemType Directory -Force -Path (Split-Path $Path -Parent) | Out-Null
     [IO.File]::WriteAllText($Path, $Text, $Utf8)
 }
+function New-SpecialistReplay {
+    param([Parameter(Mandatory)][string]$Destination)
+    Copy-Item -LiteralPath $ReplayPath -Destination $Destination -Recurse -Force
+    $repoPayload = [ordered]@{
+        jsonrpc = '2.0'; id = 1
+        result = [ordered]@{ content = @([ordered]@{
+                    type = 'text'
+                    text = '{"id":"11111111-2222-3333-4444-555555555555","projectReference":{"name":"Widgets"}}'
+                }) }
+    }
+    $payloadPath = Join-Path $Destination 'payloads\repository.json'
+    Write-Utf8 $payloadPath (Canon $repoPayload)
+    $arguments = [ordered]@{
+        action = 'get'; project = 'Widgets'
+        repositoryNameOrId = '11111111-2222-3333-4444-555555555555'
+    }
+    $requestKey = Get-AgentReplayRequestKey -Name 'repo_repository' -Arguments $arguments
+    $mPath = Join-Path $Destination 'manifest.json'
+    $m = Get-Content $mPath -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -Depth 64
+    $m.bindings.models = @('claude-opus-5', 'gpt-5.6-sol', 'claude-sonnet-5')
+    $m.resources = @($m.resources) + @([ordered]@{
+            tool = 'repo_repository'; arguments = $arguments; requestSha256 = [string]$requestKey.Key
+            payloadFile = 'payloads/repository.json'; payloadSha256 = Sha $payloadPath
+            payloadByteLength = [long](Get-Item $payloadPath).Length
+        })
+    $m.Remove('manifestDigest')
+    $m.manifestDigest = TextSha (Canon $m)
+    Write-Utf8 $mPath (Canon $m)
+    [void](New-AgentReplaySnapshot -ReplayRoot (Split-Path $Destination -Parent) -SnapshotName (Split-Path $Destination -Leaf) `
+            -ExpectedManifestDigest ([string]$m.manifestDigest))
+}
+function New-ClassifiedReplay {
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination,
+        [string[]]$Models = @('claude-opus-5', 'gpt-5.6-sol', 'claude-sonnet-5')
+    )
+    Copy-Item -LiteralPath $Source -Destination $Destination -Recurse -Force
+    $manifestPath = Join-Path $Destination 'manifest.json'
+    $manifest = Get-Content $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -Depth 64
+    $manifest.bindings.models = @($Models)
+    if ([int]$manifest.schemaVersion -eq 1) { $manifest.schemaVersion = 3 }
+
+    $sidecarName = 'offline-corpus-seal.json'
+    $sidecarPath = Join-Path $Destination $sidecarName
+    $sidecar = [ordered]@{
+        schemaVersion  = 1
+        kind           = 'reviewer-role-input-capture-synthetic-seal'
+        snapshotId     = [string]$manifest.snapshotId
+        sealKind       = 'offlineCorpusSeal'
+        nonPromotable  = $true
+        oracleFree     = $true
+        writesPermitted = $false
+    }
+    Write-Utf8 $sidecarPath (Canon $sidecar)
+    $manifest.Remove('manifestDigest')
+    $manifest['classification'] = [ordered]@{
+        sealKind = 'offlineCorpusSeal'; nonPromotable = $true
+        sidecarFile = $sidecarName; sidecarSha256 = Sha $sidecarPath
+    }
+    $manifest.manifestDigest = TextSha (Canon $manifest)
+    Write-Utf8 $manifestPath (Canon $manifest)
+    $loaded = New-AgentReplaySnapshot -ReplayRoot (Split-Path $Destination -Parent) `
+        -SnapshotName (Split-Path $Destination -Leaf) -ExpectedManifestDigest ([string]$manifest.manifestDigest)
+    if (-not [bool]$loaded.Classification.NonPromotable -or
+        [string]$loaded.Classification.SealKind -cne 'offlineCorpusSeal') {
+        throw 'Synthetic replay did not load as an independently classified non-promotable snapshot.'
+    }
+    return $loaded
+}
 function Remove-Tree {
     param([string]$Path)
     if (Test-Path -LiteralPath $Path) {
@@ -71,8 +139,8 @@ function Remove-Tree {
     }
 }
 function Invoke-Tool {
-    param([Parameter(Mandatory)][string[]]$Arguments)
-    $out = & pwsh -NoProfile -File $CaptureTool @Arguments 2>&1
+    param([Parameter(Mandatory)][string[]]$Arguments, [string]$ToolPath = $CaptureTool)
+    $out = & pwsh -NoProfile -File $ToolPath @Arguments 2>&1
     # PowerShell's concise error view wraps long messages and prefixes the
     # continuation lines with '|', so normalize before any message assertion.
     $flat = (($out | Out-String) -replace '[\r\n]+', ' ') -replace '\s*\|\s*', ' '
@@ -109,14 +177,15 @@ try {
 finally { Pop-Location }
 
 # ---------------------------------------------------------------------------
-# Synthetic legacy pack -> PR50 materializer -> non-promotable sealed bundle
+# Independent synthetic seal used as capture input. PR50 runs only after capture.
 # ---------------------------------------------------------------------------
 $manifestPath = Join-Path $ReplayPath 'manifest.json'
 $manifestSha = Sha $manifestPath
 $configSha = Sha $ConfigFile
 $promptSha = Sha $PromptFile
-$scriptSha = Sha $ReviewerScript
 $sourceManifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -Depth 64
+$v1Digest = [string]$sourceManifest.manifestDigest
+$replayRootV1 = Split-Path $ReplayPath -Parent
 $packBinding = [ordered]@{
     provider     = 'Synthetic'
     repository   = 'example/widgets'
@@ -127,108 +196,108 @@ $packBinding = [ordered]@{
     source       = [string]$sourceManifest.binding.sourceCommit
     target       = [string]$sourceManifest.binding.targetCommit
 }
-# The generalist role context is taken VERBATIM from the repo's own blinded
-# generalist projection, so the capture and the PR49 adapter path are given
-# byte-identical stimulus and their prompts are directly comparable.
-$generalistFixture = Get-Content -LiteralPath $GeneralistProjection -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 64
-$roleContexts = @{
-    generalist = [ordered]@{
-        sourceBranch             = [string]$generalistFixture.generalist.sourceBranch
-        authorAlias              = [string]$generalistFixture.generalist.authorAlias
-        title                    = [string]$generalistFixture.generalist.title
-        threadDigestText         = [string]$generalistFixture.generalist.threadDigestText
-        authoritativeSourcesText = [string]$generalistFixture.generalist.authoritativeSourcesText
-        pinnedSourceText         = [string]$generalistFixture.generalist.pinnedSourceText
-    }
-    specialist = [ordered]@{ conventionPlanJson = '{"planVersion":1,"status":"synthetic"}'; factPlanJson = '{}' }
-    verifier   = [ordered]@{
-        targetCommit    = [string]$sourceManifest.binding.targetCommit
-        changeSetDigest = [string]$sourceManifest.binding.changeSetSha256
-        configSha256    = $configSha
-        scriptSha256    = $scriptSha
-        promptSha256    = $promptSha
-    }
-}
-
 function New-CaptureBundle {
     <#
-        Build a synthetic legacy benchmark pack and run it through PR50's
-        materializer, producing exactly the artifact a capture consumes: a
-        role-scoped blinded projection plus a permanently non-promotable sealed
-        replay snapshot, config and prompt evidence.
+        Build only the minimal request, config and independently classified
+        replay that capture consumes. No role provenance or role-scoped
+        projection exists until production reaches the model boundary.
     #>
     param([Parameter(Mandatory)][ValidateSet('generalist', 'specialist', 'verifier')][string]$Role,
-        [string]$Tag = '')
+        [string]$Tag = '', [string]$ConfigSource = $ConfigFile, [string]$ReplaySource = $ReplayPath)
     $name = if ($Tag) { "$Role-$Tag" } else { $Role }
     $packRoot = Join-Path $runRoot "pack-$name"
+    $out = Join-Path $runRoot "bundle-$name"
+    $configDir = Join-Path $out 'config'
+    New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+    Copy-Item -LiteralPath $ConfigSource -Destination (Join-Path $configDir 'reviewer.config.json')
+    Copy-Item -LiteralPath $PromptFile -Destination (Join-Path $configDir 'review-cycle.prompt.md')
+
+    $snapshotName = [string]((Get-Content (Join-Path $ReplaySource 'manifest.json') -Raw -Encoding UTF8 |
+            ConvertFrom-Json -Depth 64).snapshotId)
+    $materializedReplayRoot = Join-Path $out 'replay'
+    $classifiedPath = Join-Path $materializedReplayRoot $snapshotName
+    New-Item -ItemType Directory -Force -Path $materializedReplayRoot | Out-Null
+    $loaded = New-ClassifiedReplay -Source $ReplaySource -Destination $classifiedPath
+    $materializedManifest = Join-Path $classifiedPath 'manifest.json'
+
+    $bundleConfigSha = Sha (Join-Path $configDir 'reviewer.config.json')
+    $bundleManifestPath = Join-Path $ReplaySource 'manifest.json'
+    $bundleManifestSha = Sha $bundleManifestPath
     $sealed = Join-Path $packRoot 'sealed-resources'
     New-Item -ItemType Directory -Force -Path $sealed | Out-Null
-    $manifestSealed = Join-Path $sealed "$manifestSha-manifest.json"
-    [IO.File]::WriteAllBytes($manifestSealed, [IO.File]::ReadAllBytes($manifestPath))
-    $provenance = [ordered]@{
-        schemaVersion = 1
-        kind          = 'reviewer-model-visible-role-provenance'
-        fixtureId     = "synthetic-$name-capture"
-        role          = $Role
-        bindingSha256 = TextSha (Canon $packBinding)
-        configSha256  = $configSha
-        scriptSha256  = $scriptSha
-        promptSha256  = $promptSha
-        context       = $roleContexts[$Role]
-    }
-    $provTmp = Join-Path $packRoot 'role.tmp.json'
-    Write-Utf8 $provTmp (Canon $provenance)
-    $provSha = Sha $provTmp
-    $provSealed = Join-Path $sealed "$provSha-role-$Role.json"
-    Move-Item -LiteralPath $provTmp -Destination $provSealed
-    $legacy = [ordered]@{
+    $manifestSealed = Join-Path $sealed "$bundleManifestSha-manifest.json"
+    [IO.File]::WriteAllBytes($manifestSealed, [IO.File]::ReadAllBytes($bundleManifestPath))
+
+    $minimalLegacy = [ordered]@{
         schemaVersion       = 1
         kind                = 'blinded-reviewer-adapter-input'
         fixtureId           = "synthetic-$name-capture"
         fixtureVersion      = 1
         binding             = $packBinding
-        bindingSha256       = [string]$provenance.bindingSha256
+        bindingSha256       = TextSha (Canon $packBinding)
         fixtureIndexBinding = [ordered]@{
             fixtureIndexSha256        = ('1' * 64)
             fixtureRecordHash         = ('2' * 64)
             originalFixtureFileSha256 = ('3' * 64)
         }
-        resources           = @(
-            [ordered]@{ mediaRole = 'replay-manifest'; sealedPath = "sealed-resources/$manifestSha-manifest.json"; sha256 = $manifestSha; byteLength = [long](Get-Item $manifestSealed).Length },
-            [ordered]@{ mediaRole = "role-provenance-$Role"; sealedPath = "sealed-resources/$provSha-role-$Role.json"; sha256 = $provSha; byteLength = [long](Get-Item $provSealed).Length }
-        )
+        resources           = @([ordered]@{
+                mediaRole = 'replay-manifest'; sealedPath = "sealed-resources/$bundleManifestSha-manifest.json"
+                sha256 = $bundleManifestSha; byteLength = [long](Get-Item $manifestSealed).Length
+            })
     }
-    $legacyFile = Join-Path $packRoot 'projections\fixture.blinded.json'
-    Write-Utf8 $legacyFile (ConvertTo-Json $legacy -Depth 64)
-    $out = Join-Path $runRoot "bundle-$name"
-    $json = & pwsh -NoProfile -File $MaterializeTool @(
-        '-PackRoot', $packRoot, '-LegacyProjectionFile', $legacyFile, '-Role', $Role,
-        '-RoleProvenanceFile', $provSealed, '-ReplaySnapshotPath', $ReplayPath,
-        '-ConfigFile', $ConfigFile, '-PromptFile', $PromptFile,
-        '-ExpectedReplayManifestFileSha256', $manifestSha, '-ExpectedConfigSha256', $configSha,
-        '-ExpectedPromptSha256', $promptSha, '-OutputRoot', $out, '-RepoRoot', $RepoRoot)
-    if ($LASTEXITCODE -ne 0) { throw "materialization failed for $name : $($json -join '')" }
-    $result = ($json -join '') | ConvertFrom-Json
+    $minimalLegacyFile = Join-Path $packRoot 'projections\fixture.minimal.blinded.json'
+    Write-Utf8 $minimalLegacyFile (Canon $minimalLegacy)
+
+    # Declare 'common'/'iteration' ONLY when the sealed binding actually carries
+    # them. This snapshot carries neither, and capture now refuses a request that
+    # asserts identity the seal cannot back, so declaring them unconditionally
+    # would be asserting an unverifiable merge base and iteration.
+    $identity = [ordered]@{
+        provider = [string]$loaded.Provider; organization = [string]$loaded.Binding.Organization
+        project = [string]$loaded.Binding.Project; repositoryId = [string]$loaded.Binding.RepositoryId
+        prId = [int]$loaded.Binding.PullRequestId
+        source = [string]$loaded.Binding.SourceCommit
+        target = [string]$loaded.Binding.TargetCommit; changeSet = [string]$loaded.Binding.ChangeSetSha256
+    }
+    if ($loaded.Binding.Contains('CommonCommit')) { $identity['common'] = [string]$loaded.Binding.CommonCommit }
+    if ($loaded.Binding.Contains('IterationId')) { $identity['iteration'] = [int]$loaded.Binding.IterationId }
+    $request = [ordered]@{
+        schemaVersion = 1; kind = 'reviewer-role-input-capture-request'
+        fixtureId = "synthetic-$name-capture"; role = $Role; model = 'claude-opus-5'
+        identity = $identity
+        snapshot = [ordered]@{
+            name = $snapshotName; manifestDigest = [string]$loaded.ManifestDigest
+            manifestFileSha256 = Sha $materializedManifest
+            configSha256 = $bundleConfigSha
+        }
+        resources = @([ordered]@{
+                mediaRole = 'replay-manifest'; sealedPath = 'manifest.json'; sha256 = Sha $materializedManifest
+                byteLength = [long](Get-Item $materializedManifest).Length
+            })
+    }
+    $requestFile = Join-Path $out 'capture-request.json'
+    Write-Utf8 $requestFile (Canon $request)
     return [pscustomobject]@{
         Role         = $Role
         Root         = $out
-        Projection   = Join-Path $out 'projection.json'
-        ConfigFile   = Join-Path $out 'config\reviewer.config.json'
-        ReplayRoot   = Join-Path $out 'replay'
-        SnapshotName = [string]$result.replaySnapshotName
-        Digest       = [string]$result.replayManifestDigest
-        LegacyFile   = $legacyFile
+        Request      = $requestFile
+        ConfigFile   = Join-Path $configDir 'reviewer.config.json'
+        ReplayRoot   = $materializedReplayRoot
+        SnapshotName = $snapshotName
+        Digest       = [string]$loaded.ManifestDigest
+        LegacyFile   = $minimalLegacyFile
+        ReplaySource = $ReplaySource
     }
 }
 
 function Get-CaptureArgs {
     param([Parameter(Mandatory)]$Bundle, [Parameter(Mandatory)][string]$Out,
-        [string]$Model = 'claude-opus-5', [string]$Role, [string]$Projection,
+        [string]$Model = 'claude-opus-5', [string]$Role, [string]$Request,
         [string]$ConfigOverride, [string]$RefOverride, [string]$HeadOverride, [string[]]$Extra = @())
     $a = @(
         '-Role', $(if ($Role) { $Role } else { $Bundle.Role }),
         '-Model', $Model,
-        '-FixtureProjectionFile', $(if ($Projection) { $Projection } else { $Bundle.Projection }),
+        '-CaptureRequestFile', $(if ($Request) { $Request } else { $Bundle.Request }),
         '-ConfigFile', $(if ($ConfigOverride) { $ConfigOverride } else { $Bundle.ConfigFile }),
         '-ReplayRoot', $Bundle.ReplayRoot, '-ReplaySnapshotName', $Bundle.SnapshotName,
         '-ReplayManifestDigest', $Bundle.Digest, '-PullRequestId', '4242',
@@ -246,6 +315,57 @@ function Get-CaptureArgs {
     return @($a + $Extra)
 }
 
+function Invoke-CapturedRolePipeline {
+        param(
+            [Parameter(Mandatory)][string]$Role,
+            [Parameter(Mandatory)][string]$CaptureRoot,
+            [Parameter(Mandatory)]$Bundle,
+            [Parameter(Mandatory)][string]$Model,
+            [string]$Candidate,
+            [string]$DiscoveryPackage
+        )
+        $projection = Get-ChildItem (Join-Path $CaptureRoot 'projections') -Filter '*.blinded.json' | Select-Object -First 1
+        $provenance = Get-ChildItem (Join-Path $CaptureRoot 'sealed-resources') -Filter "*-role-$Role.json" | Select-Object -First 1
+        $materialized = Join-Path $runRoot "pipeline-materialized-$Role"
+        $sourceManifestPath = Join-Path $Bundle.ReplaySource 'manifest.json'
+        $raw = & pwsh -NoProfile -File $MaterializeTool @(
+            '-PackRoot', $CaptureRoot, '-LegacyProjectionFile', $projection.FullName, '-Role', $Role,
+            '-RoleProvenanceFile', $provenance.FullName, '-ReplaySnapshotPath', $Bundle.ReplaySource,
+            '-ConfigFile', $Bundle.ConfigFile, '-PromptFile', $PromptFile,
+            '-ExpectedReplayManifestFileSha256', (Sha $sourceManifestPath),
+            '-ExpectedConfigSha256', (Sha $Bundle.ConfigFile), '-ExpectedPromptSha256', $promptSha,
+            '-OutputRoot', $materialized, '-RepoRoot', $RepoRoot) 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            return [pscustomobject]@{ Ready = $false; Detail = (($raw | Out-String).Trim()) }
+        }
+        $m = (($raw -join '') | ConvertFrom-Json)
+        $preflightOut = Join-Path $runRoot "pipeline-preflight-$Role"
+        $args = @(
+            '-Role', $Role, '-FixtureProjectionFile', (Join-Path $materialized 'projection.json'), '-Model', $Model,
+            '-ConfigFile', (Join-Path $materialized 'config\reviewer.config.json'),
+            '-ReplayRoot', (Join-Path $materialized 'replay'), '-ReplaySnapshotName', ([string]$m.replaySnapshotName),
+            '-ReplayManifestDigest', ([string]$m.replayManifestDigest), '-ExpectedReviewerBaseCommit', $expectedBase,
+            '-PullRequestId', '4242', '-ExpectedHeadCommit', $head, '-ExpectedRef', $ref,
+            '-OutputRoot', $preflightOut, '-RepoRoot', $RepoRoot,
+            '-SealKeyPath', (Join-Path $runRoot 'seal.key'), '-AllowDirtyWorktree', '-Preflight'
+        )
+        if ($Role -cne 'generalist') {
+            $args += @('-DiscoveryGeneralistModel', 'claude-opus-5',
+                '-SecondGeneralistModel', 'gpt-5.6-sol', '-ConventionSpecialistModel',
+                $(if ($Role -ceq 'specialist') { $Model } else { 'claude-sonnet-5' }))
+        }
+        if ($Role -ceq 'verifier') {
+            $args += @('-ConventionVerifierModel', $Model, '-CandidateInputFile', $Candidate,
+                '-DiscoveryPackageRoot', $DiscoveryPackage)
+        }
+        $pf = & pwsh -NoProfile -File $AcquireTool @args 2>&1
+        $pfText = ($pf | Out-String).Trim()
+        return [pscustomobject]@{
+            Ready = ($LASTEXITCODE -eq 0 -and $pfText -match '"ready"\s*:\s*true' -and -not (Test-Path $preflightOut))
+            Detail = $pfText
+        }
+}
+
 $exitCode = 0
 try {
     Remove-Tree $runRoot
@@ -256,7 +376,8 @@ try {
     Write-Host '1/8 generalist capture reaches the exact model boundary and launches nothing' -ForegroundColor Cyan
     $genBundle = New-CaptureBundle -Role generalist
     $genOut = Join-Path $runRoot 'capture-generalist'
-    $gen = Invoke-Tool -Arguments (Get-CaptureArgs -Bundle $genBundle -Out $genOut)
+    $gen = Invoke-Tool -Arguments (Get-CaptureArgs -Bundle $genBundle -Out $genOut `
+            -Extra @('-LegacyProjectionFile', $genBundle.LegacyFile))
     Check 'generalist capture succeeds' ($gen.ExitCode -eq 0) ($gen.Text -replace '\s+', ' ')
     $genResult = $null
     if ($gen.ExitCode -eq 0) {
@@ -264,10 +385,47 @@ try {
     }
     Check 'supervisor proves zero model/agency/provider processes' (
         $null -ne $genResult -and [bool]$genResult.zeroSideEffects -and
+        [bool]$genResult.telemetry.fileExists -and
+        -not [string]$genResult.telemetry.parseError -and
+        -not [string]$genResult.telemetry.proofError -and
+        [int]$genResult.telemetry.totalEvents -gt 0 -and
+        [int]$genResult.telemetry.sealedReplayServes -gt 0 -and
         [int]$genResult.telemetry.childProcessStarts -eq 0 -and
         [int]$genResult.telemetry.modelOrAgencyStarts -eq 0 -and
         [int]$genResult.telemetry.providerLiveProcessStarts -eq 0 -and
         [int]$genResult.telemetry.providerLiveWrites -eq 0)
+
+    $supervisorText = [IO.File]::ReadAllText($CaptureTool, $Utf8)
+    $telemetryNeedle = '$telemetryFailure = '''''
+    Check 'the telemetry sabotage seam is unique in the supervisor' (
+        ($supervisorText.Split([string[]]@($telemetryNeedle), [StringSplitOptions]::None).Length - 1) -eq 1)
+    foreach ($telemetryCase in @(
+            @{
+                Name = 'deleted'
+                Prefix = "Remove-Item -LiteralPath `$telemetryPath -Force -ErrorAction SilentlyContinue`r`n"
+                Pattern = 'Telemetry proof is missing'
+            },
+            @{
+                Name = 'blank'
+                Prefix = "[IO.File]::WriteAllText(`$telemetryPath, '', `$Utf8)`r`n"
+                Pattern = 'Telemetry proof is empty'
+            },
+            @{
+                Name = 'no-replay'
+                Prefix = "`$withoutReplay = @(Get-Content -LiteralPath `$telemetryPath | Where-Object { [string](`$_ | ConvertFrom-Json).event -cne 'provider.replayServed' })`r`n[IO.File]::WriteAllLines(`$telemetryPath, `$withoutReplay, `$Utf8)`r`n"
+                Pattern = 'no provider\.replayServed'
+            })) {
+        $sabotagedTool = Join-Path $runRoot "Invoke-ReviewerRoleInputCapture-$($telemetryCase.Name).ps1"
+        Write-Utf8 $sabotagedTool ($supervisorText.Replace(
+                $telemetryNeedle, ([string]$telemetryCase.Prefix + $telemetryNeedle)))
+        $sabotagedOut = Join-Path $runRoot "capture-telemetry-$($telemetryCase.Name)"
+        $sabotaged = Invoke-Tool -ToolPath $sabotagedTool -Arguments (
+            Get-CaptureArgs -Bundle $genBundle -Out $sabotagedOut)
+        Check "$($telemetryCase.Name) telemetry sink is refused without publication" (
+            $sabotaged.ExitCode -eq 2 -and
+            $sabotaged.Text -match [string]$telemetryCase.Pattern -and
+            -not (Test-Path -LiteralPath $sabotagedOut)) $sabotaged.Text
+    }
 
     $manifest = Get-Content (Join-Path $genOut 'capture-manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 64
     Check 'the exact boundary was reached exactly once' ([int]$manifest.launch.boundaryHits -eq 1)
@@ -346,17 +504,28 @@ try {
 
     # -- 3. Prompt-byte equivalence with the PR49 adapter path ---------------
     Write-Host '3/8 the captured prompt equals the PR49 adapter prompt for the equivalent fixture' -ForegroundColor Cyan
+    $captureProjection = Get-ChildItem (Join-Path $genOut 'projections') -Filter '*.blinded.json' | Select-Object -First 1
+    $captureProvenance = Get-ChildItem (Join-Path $genOut 'sealed-resources') -Filter '*-role-generalist.json' | Select-Object -First 1
+    $captureMaterialized = Join-Path $runRoot 'capture-materialized-generalist'
+    $materializedRaw = & pwsh -NoProfile -File $MaterializeTool @(
+        '-PackRoot', $genOut, '-LegacyProjectionFile', $captureProjection.FullName, '-Role', 'generalist',
+        '-RoleProvenanceFile', $captureProvenance.FullName, '-ReplaySnapshotPath', $ReplayPath,
+        '-ConfigFile', $ConfigFile, '-PromptFile', $PromptFile,
+        '-ExpectedReplayManifestFileSha256', $manifestSha, '-ExpectedConfigSha256', $configSha,
+        '-ExpectedPromptSha256', $promptSha, '-OutputRoot', $captureMaterialized, '-RepoRoot', $RepoRoot) 2>&1
+    $materializedExit = $LASTEXITCODE
+    Check 'capture output materializes through PR50' ($materializedExit -eq 0) (($materializedRaw | Out-String).Trim())
+    $captureMaterializedResult = if ($materializedExit -eq 0) { (($materializedRaw -join '') | ConvertFrom-Json) } else { $null }
     $acqOut = Join-Path $runRoot 'acquisition-generalist'
     $acqConfigDir = Join-Path $runRoot 'acq-config'
     New-Item -ItemType Directory -Force -Path $acqConfigDir | Out-Null
     Copy-Item $ConfigFile (Join-Path $acqConfigDir 'reviewer.config.json') -Force
     Copy-Item $PromptFile (Join-Path $acqConfigDir 'review-cycle.prompt.md') -Force
-    $replayRootV1 = Split-Path $ReplayPath -Parent
-    $v1Digest = [string]((Get-Content $manifestPath -Raw | ConvertFrom-Json).manifestDigest)
     $acqRaw = & pwsh -NoProfile -File $AcquireTool @(
-        '-Role', 'generalist', '-FixtureProjectionFile', $GeneralistProjection, '-Model', 'claude-opus-5',
-        '-ConfigFile', (Join-Path $acqConfigDir 'reviewer.config.json'), '-ReplayRoot', $replayRootV1,
-        '-ReplaySnapshotName', 'synthetic-pr', '-ReplayManifestDigest', $v1Digest,
+        '-Role', 'generalist', '-FixtureProjectionFile', (Join-Path $captureMaterialized 'projection.json'), '-Model', 'claude-opus-5',
+        '-ConfigFile', (Join-Path $acqConfigDir 'reviewer.config.json'), '-ReplayRoot', (Join-Path $captureMaterialized 'replay'),
+        '-ReplaySnapshotName', ([string]$captureMaterializedResult.replaySnapshotName),
+        '-ReplayManifestDigest', ([string]$captureMaterializedResult.replayManifestDigest),
         '-OfflineModelAdapterManifest', $AdapterManifest, '-ExpectedReviewerBaseCommit', $expectedBase,
         '-PullRequestId', '4242', '-ExpectedHeadCommit', $head, '-ExpectedRef', $ref,
         '-OutputRoot', $acqOut, '-SealKeyPath', (Join-Path $runRoot 'seal.key'),
@@ -396,33 +565,34 @@ try {
     else {
         Check 'PR49 adapter acquisition produced a comparable package' $false (($acqRaw | Out-String).Trim() -replace '\s+', ' ')
     }
+    $genPipeline = Invoke-CapturedRolePipeline -Role generalist -CaptureRoot $genOut -Bundle $genBundle -Model 'claude-opus-5'
+    Check 'generalist capture -> PR50 materialize -> PR49 Preflight succeeds' $genPipeline.Ready $genPipeline.Detail
 
     # -- 4. Oracle and expected-decision refusal -----------------------------
     Write-Host '4/8 oracle and expected-decision inputs are refused recursively' -ForegroundColor Cyan
     $oracleDir = Join-Path $runRoot 'expected-oracle'
     New-Item -ItemType Directory -Force -Path $oracleDir | Out-Null
-    Copy-Item -LiteralPath $genBundle.Projection -Destination (Join-Path $oracleDir 'projection.json') -Force
+    Copy-Item -LiteralPath $genBundle.Request -Destination (Join-Path $oracleDir 'request.json') -Force
     Invoke-ExpectedFailure 'an oracle-named PATH is refused' `
-        (Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-badpath') -Projection (Join-Path $oracleDir 'projection.json')) `
+        (Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-badpath') -Request (Join-Path $oracleDir 'request.json')) `
         'names an oracle'
 
     # Both key cases keep every PATH innocuous, so the refusal can only come from
     # the recursive KEY scan and not incidentally from the path scan.
     $keyedProjection = Join-Path $runRoot 'keyed-projection.json'
-    $keyed = Get-Content -LiteralPath $genBundle.Projection -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -Depth 64
+    $keyed = Get-Content -LiteralPath $genBundle.Request -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -Depth 64
     $keyed['expectedDecision'] = 'approve'
     Write-Utf8 $keyedProjection (ConvertTo-Json $keyed -Depth 64)
     Invoke-ExpectedFailure 'a top-level oracle KEY is refused, naming the field' `
-        (Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-keyed') -Projection $keyedProjection) `
+        (Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-keyed') -Request $keyedProjection) `
         'expectedDecision'
 
     $nestedProjection = Join-Path $runRoot 'nested-projection.json'
-    $nested = Get-Content -LiteralPath $genBundle.Projection -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -Depth 64
-    $nested['generalist']['pinnedSourceText'] = 'plain stimulus'
-    $nested['binding']['groundTruth'] = 'approve'
+    $nested = Get-Content -LiteralPath $genBundle.Request -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -Depth 64
+    $nested['identity']['groundTruth'] = 'approve'
     Write-Utf8 $nestedProjection (ConvertTo-Json $nested -Depth 64)
     Invoke-ExpectedFailure 'a NESTED oracle key is refused, naming the field' `
-        (Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-nested') -Projection $nestedProjection) `
+        (Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-nested') -Request $nestedProjection) `
         'groundTruth'
 
     # The reviewer configuration is not covered by a fixture schema, so this case
@@ -444,7 +614,7 @@ try {
         'declares role'
     Invoke-ExpectedFailure 'a model the sealed snapshot never covered is refused' `
         (Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-wrong-model') -Model 'gpt-5.6-sol') `
-        'not among the models'
+        'declares model'
     Invoke-ExpectedFailure 'a head commit that is not HEAD is refused' `
         (Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-wrong-head') -HeadOverride ('0' * 40)) `
         'resolves to'
@@ -460,18 +630,52 @@ try {
     Copy-Item $PromptFile (Join-Path (Split-Path $wrongConfig -Parent) 'review-cycle.prompt.md') -Force
     $wrongCfg = Invoke-Tool -Arguments (Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-wrong-config') -ConfigOverride $wrongConfig)
     Check 'a config bound to another repository is refused' (
-        $wrongCfg.ExitCode -ne 0 -and $wrongCfg.Text -match 'bound to repository') $wrongCfg.Text
+        $wrongCfg.ExitCode -ne 0 -and $wrongCfg.Text -match 'configSha256|bound to repository') $wrongCfg.Text
+    Invoke-ExpectedFailure 'a missing reviewer config is refused before capture' `
+        (Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-missing-config') `
+            -ConfigOverride (Join-Path $runRoot 'missing-config\reviewer.config.json')) `
+        'does not exist'
+
+    $missingIdentityRequest = Join-Path $runRoot 'request-missing-identity.json'
+    $missingIdentity = Get-Content -LiteralPath $genBundle.Request -Raw -Encoding UTF8 |
+        ConvertFrom-Json -AsHashtable -Depth 64
+    $missingIdentity.identity.Remove('project')
+    Write-Utf8 $missingIdentityRequest (ConvertTo-Json $missingIdentity -Depth 64)
+    Invoke-ExpectedFailure 'a request missing sealed project identity is schema-refused' `
+        (Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-missing-identity') `
+            -Request $missingIdentityRequest) `
+        'identity/project|project'
 
     $substituted = Join-Path $runRoot 'substituted-projection.json'
-    $substitutedObject = Get-Content -LiteralPath $genBundle.Projection -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -Depth 64
-    $substitutedObject.generalist.title = 'Substituted role stimulus'
+    $substitutedObject = Get-Content -LiteralPath $genBundle.Request -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -Depth 64
+    $substitutedObject.identity.source = ('f' * 40)
     Write-Utf8 $substituted (ConvertTo-Json $substitutedObject -Depth 64)
     $subOut = Join-Path $runRoot 'capture-substituted'
-    $sub = Invoke-Tool -Arguments (Get-CaptureArgs -Bundle $genBundle -Out $subOut -Projection $substituted)
+    $sub = Invoke-Tool -Arguments (Get-CaptureArgs -Bundle $genBundle -Out $subOut -Request $substituted)
     $subPrompt = ''
     if ($sub.ExitCode -eq 0) { $subPrompt = [IO.File]::ReadAllText((Join-Path $subOut 'role-input-prompt.txt'), $Utf8) }
     Check 'a substituted stimulus produces a different prompt, never the original' (
         $sub.ExitCode -ne 0 -or ((TextSha $subPrompt) -cne (TextSha $promptText)))
+
+    # This snapshot's sealed binding carries neither a merge base nor an
+    # iteration, so a request that declares either is asserting identity nothing
+    # can verify. Before the two-way pairing check these were silently ignored,
+    # which let a request state an arbitrary merge base and still be accepted.
+    $unbackedCommon = Join-Path $runRoot 'request-unbacked-common.json'
+    $unbackedObject = Get-Content -LiteralPath $genBundle.Request -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -Depth 64
+    $unbackedObject.identity.common = ('a' * 40)
+    Write-Utf8 $unbackedCommon (ConvertTo-Json $unbackedObject -Depth 64)
+    Invoke-ExpectedFailure 'a request declaring a merge base the seal does not carry is refused' `
+        (Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-unbacked-common') -Request $unbackedCommon) `
+        "declares 'common'"
+
+    $unbackedIteration = Join-Path $runRoot 'request-unbacked-iteration.json'
+    $unbackedIterationObject = Get-Content -LiteralPath $genBundle.Request -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -Depth 64
+    $unbackedIterationObject.identity.iteration = 99
+    Write-Utf8 $unbackedIteration (ConvertTo-Json $unbackedIterationObject -Depth 64)
+    Invoke-ExpectedFailure 'a request declaring an iteration the seal does not carry is refused' `
+        (Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-unbacked-iteration') -Request $unbackedIteration) `
+        "declares 'iteration'"
 
     # -- 6. Candidate binding and missing sealed material --------------------
     Write-Host '6/8 the verifier requires an independent candidate; missing sealed material blocks' -ForegroundColor Cyan
@@ -494,7 +698,7 @@ try {
     $victim = Get-ChildItem -LiteralPath (Join-Path $strippedRoot "$($genBundle.SnapshotName)\payloads") -File | Select-Object -First 1
     Remove-Item -LiteralPath $victim.FullName -Force
     $strippedBundle = [pscustomobject]@{
-        Role = 'generalist'; Root = $genBundle.Root; Projection = $genBundle.Projection
+        Role = 'generalist'; Root = $genBundle.Root; Request = $genBundle.Request
         ConfigFile = $genBundle.ConfigFile; ReplayRoot = $strippedRoot
         SnapshotName = $genBundle.SnapshotName; Digest = $genBundle.Digest; LegacyFile = $genBundle.LegacyFile
     }
@@ -505,8 +709,88 @@ try {
         -not (Test-Path -LiteralPath $missingOut) -or
         -not (Test-Path -LiteralPath (Join-Path $missingOut 'capture-manifest.json')))
 
+    $missingResourceRequest = Join-Path $runRoot 'request-missing-resource.json'
+    $missingResource = Get-Content -LiteralPath $genBundle.Request -Raw -Encoding UTF8 |
+        ConvertFrom-Json -AsHashtable -Depth 64
+    $missingResource.resources[0].sealedPath = 'payloads/missing-capture-resource.json'
+    Write-Utf8 $missingResourceRequest (ConvertTo-Json $missingResource -Depth 64)
+    $missingResourceOut = Join-Path $runRoot 'capture-missing-resource'
+    $missingResourceResult = Invoke-Tool -Arguments (Get-CaptureArgs -Bundle $genBundle `
+            -Out $missingResourceOut -Request $missingResourceRequest)
+    Check 'a missing request resource with vacuous telemetry is refused without publication' (
+        $missingResourceResult.ExitCode -eq 2 -and
+        $missingResourceResult.Text -match 'telemetry proof is (missing|empty)' -and
+        -not (Test-Path -LiteralPath $missingResourceOut)) `
+        $missingResourceResult.Text
+
+    $legacyWithProvenance = Join-Path $runRoot 'pack-generalist\projections\fixture.with-provenance.blinded.json'
+    $legacyObject = Get-Content $genBundle.LegacyFile -Raw -Encoding UTF8 |
+        ConvertFrom-Json -AsHashtable -Depth 64
+    $legacyObject.resources += [ordered]@{
+        mediaRole = 'role-provenance-generalist'
+        sealedPath = [string]$legacyObject.resources[0].sealedPath
+        sha256 = [string]$legacyObject.resources[0].sha256
+        byteLength = [long]$legacyObject.resources[0].byteLength
+    }
+    Write-Utf8 $legacyWithProvenance (Canon $legacyObject)
+    Invoke-ExpectedFailure 'legacy identity input containing role provenance is refused' `
+        (Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-legacy-provenance') `
+            -Extra @('-LegacyProjectionFile', $legacyWithProvenance)) `
+        'must not contain role provenance'
+
+    $degradedSpecialistBundle = New-CaptureBundle -Role specialist -Tag degraded
+    $degradedSpecialistOut = Join-Path $runRoot 'capture-specialist-degraded'
+    $degradedSpecialistResult = Invoke-Tool -Arguments (Get-CaptureArgs -Bundle $degradedSpecialistBundle `
+            -Out $degradedSpecialistOut -Model 'claude-opus-5')
+    $degradedPath = Join-Path $degradedSpecialistOut 'capture-blocked.json'
+    $degradedCapture = if (Test-Path -LiteralPath $degradedPath) {
+        Get-Content $degradedPath -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 32
+    } else { $null }
+    Check 'a missing authoritative convention source produces typed degraded capture' (
+        $degradedSpecialistResult.ExitCode -eq 3 -and $null -ne $degradedCapture -and
+        [string]$degradedCapture.status -ceq 'degraded' -and
+        [string]$degradedCapture.blockedReason -ceq 'noModelBoundaryReached' -and
+        [string]$degradedCapture.blockedDetail -match 'authoritative-source-unavailable') `
+        $degradedSpecialistResult.Text
+    $degradedVerify = Invoke-Tool -Arguments @(
+        '-VerifyOnly', '-OutputRoot', $degradedSpecialistOut, '-SealKeyPath', $captureSealKeyPath)
+    Check 'a typed blocked bundle passes its exact schema/seal/inventory verification' (
+        $degradedVerify.ExitCode -eq 0 -and
+        $degradedVerify.Text -match 'HMAC/SHA seal' -and
+        $degradedVerify.Text -match 'exact two-file inventory') $degradedVerify.Text
+
+    $blockedUnbound = Join-Path $runRoot 'capture-blocked-unbound'
+    Copy-Item -LiteralPath $degradedSpecialistOut -Destination $blockedUnbound -Recurse -Force
+    $blockedExtra = Join-Path $blockedUnbound 'extra.json'
+    Write-Utf8 $blockedExtra '{"unbound":true}'
+    (Get-Item -LiteralPath $blockedExtra).Attributes = [IO.FileAttributes]::ReadOnly
+    $blockedUnboundVerify = Invoke-Tool -Arguments @(
+        '-VerifyOnly', '-OutputRoot', $blockedUnbound, '-SealKeyPath', $captureSealKeyPath)
+    Check 'blocked-bundle verification rejects an unbound file' (
+        $blockedUnboundVerify.ExitCode -eq 2 -and $blockedUnboundVerify.Text -match 'unbound file') `
+        $blockedUnboundVerify.Text
+
+    $blockedWritable = Join-Path $runRoot 'capture-blocked-writable'
+    Copy-Item -LiteralPath $degradedSpecialistOut -Destination $blockedWritable -Recurse -Force
+    (Get-Item -LiteralPath (Join-Path $blockedWritable 'capture-blocked.json') -Force).Attributes =
+        [IO.FileAttributes]::Normal
+    $blockedWritableVerify = Invoke-Tool -Arguments @(
+        '-VerifyOnly', '-OutputRoot', $blockedWritable, '-SealKeyPath', $captureSealKeyPath)
+    Check 'blocked-bundle verification rejects a writable bound file' (
+        $blockedWritableVerify.ExitCode -eq 2 -and $blockedWritableVerify.Text -match 'not read-only') `
+        $blockedWritableVerify.Text
+
+    $blockedReparse = Join-Path $runRoot 'capture-blocked-reparse'
+    Copy-Item -LiteralPath $degradedSpecialistOut -Destination $blockedReparse -Recurse -Force
+    [void](New-Item -ItemType Junction -Path (Join-Path $blockedReparse 'linked') -Target $genBundle.Root)
+    $blockedReparseVerify = Invoke-Tool -Arguments @(
+        '-VerifyOnly', '-OutputRoot', $blockedReparse, '-SealKeyPath', $captureSealKeyPath)
+    Check 'blocked-bundle verification rejects a reparse-point directory' (
+        $blockedReparseVerify.ExitCode -eq 2 -and $blockedReparseVerify.Text -match 'reparse-point directory') `
+        $blockedReparseVerify.Text
+
     $promotableBundle = [pscustomobject]@{
-        Role = 'generalist'; Root = $genBundle.Root; Projection = $GeneralistProjection
+        Role = 'generalist'; Root = $genBundle.Root; Request = $genBundle.Request
         ConfigFile = $ConfigFile; ReplayRoot = $replayRootV1
         SnapshotName = 'synthetic-pr'; Digest = $v1Digest; LegacyFile = $genBundle.LegacyFile
     }
@@ -519,12 +803,17 @@ try {
     # Recorded BEFORE the re-run: comparing the published manifest against itself
     # afterwards would be true no matter what the re-run did.
     $publishedManifestSha = Sha (Join-Path $genOut 'capture-manifest.json')
+    $foreignWorkRoot = Join-Path $runRoot '.capture-generalist.capture-work-00000000000000000000000000000000'
+    New-Item -ItemType Directory -Path $foreignWorkRoot | Out-Null
+    Write-Utf8 (Join-Path $foreignWorkRoot 'owner.txt') 'another-run'
     $again = Invoke-Tool -Arguments (Get-CaptureArgs -Bundle $genBundle -Out $genOut)
     Check 'a second capture into a published root is refused' (
         $again.ExitCode -ne 0 -and $again.Text -like '*already exists*') ($again.Text -replace '\s+', ' ')
     Check 'the published bundle survived the refused re-run byte for byte' (
         (Sha (Join-Path $genOut 'capture-manifest.json')) -ceq $publishedManifestSha -and
         (TextSha ([IO.File]::ReadAllText((Join-Path $genOut 'role-input-prompt.txt'), $Utf8))) -ceq (TextSha $promptText))
+    Check 'a refused capture never deletes another run work root' (
+        (Test-Path -LiteralPath (Join-Path $foreignWorkRoot 'owner.txt') -PathType Leaf))
     Check 'no staging directory was left behind' (
         @(Get-ChildItem -LiteralPath $runRoot -Force -Directory |
                 Where-Object { $_.Name -like '*.capture-work' -or $_.Name -like '*staging*' }).Count -eq 0)
@@ -558,10 +847,9 @@ try {
         "winners=$($raceWinners.Count) losers=$($raceLosers.Count) texts=$(($raceResults | ForEach-Object { "exit=$($_.ExitCode)" }) -join ' ')"
     $raceLoserText = if ($raceLosers.Count -eq 1) { $raceLosers[0].Text } else { "losers=$($raceLosers.Count)" }
     Check 'the losing concurrent capture was refused, not merged' (
-        $raceLosers.Count -eq 1 -and (
-            $raceLosers[0].Text -like '*not overwritten*' -or $raceLosers[0].Text -like '*already*' -or
-            $raceLosers[0].Text -like '*another capture*' -or $raceLosers[0].Text -like '*lock*' -or
-            $raceLosers[0].Text -like '*in progress*' -or $raceLosers[0].Text -like '*appeared during publication*')) `
+        $raceLosers.Count -eq 1 -and
+        $raceLosers[0].Text -match 'output lock' -and
+        $raceLosers[0].Text -match 'another capture') `
         $raceLoserText
     $raceVerify = Invoke-Tool -Arguments @('-VerifyOnly', '-OutputRoot', $raceOut, '-SealKeyPath', $captureSealKeyPath)
     Check 'the raced bundle independently re-verifies clean' ($raceVerify.ExitCode -eq 0) `
@@ -603,13 +891,30 @@ try {
     Check 'Preflight creates no output root' (-not (Test-Path -LiteralPath $preflightOut))
     Check 'Preflight changes no existing byte' (($before -join "`n") -ceq ($after -join "`n"))
 
-    # -- 9. Specialist and verifier always land on a TYPED outcome -----------
-    Write-Host '9/9 specialist and verifier land on a typed outcome, never on fabrication' -ForegroundColor Cyan
-    $specBundle = New-CaptureBundle -Role specialist
+    # -- 9. Specialist and verifier successfully reach the production boundary -
+    Write-Host '9/9 specialist and verifier capture successfully from production-derived context' -ForegroundColor Cyan
+    $specConfig = Join-Path $runRoot 'specialist-source\reviewer.config.json'
+    $specConfigObject = Get-Content $ConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -Depth 64
+    $specConfigObject.repoConventions.conventionPacks.packs[0].changedPathGlobs = @('**/*.cs')
+    $specConfigObject.repoConventions.authoritativeSources.sources[0].expectedByteLength = 220
+    $specConfigObject.repoConventions.authoritativeSources.sources[0].expectedSha256 = '4b63e99eb07cf85e89dfdff08eca824ecfc305dcf2ba6ca4b71a691c978b8e12'
+    Write-Utf8 $specConfig (ConvertTo-Json $specConfigObject -Depth 64)
+    $specReplay = Join-Path $runRoot 'specialist-replay-source\synthetic-pr'
+    New-SpecialistReplay -Destination $specReplay
+    $specBundle = New-CaptureBundle -Role specialist -ConfigSource $specConfig -ReplaySource $specReplay
+    $verSuccessBundle = New-CaptureBundle -Role verifier -Tag success -ReplaySource $specReplay
+    $derivedCandidate = Join-Path $runRoot 'independent-discovery-candidate.json'
+    $extractRaw = & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Get-ReviewerDiscoveryCandidate.ps1') `
+        -DiscoveryPackageRoot (Join-Path $acqOut 'package') -OutputFile $derivedCandidate -RepoRoot $RepoRoot 2>&1
+    Check 'verifier candidate is derived from an independent sealed discovery transcript' (
+        $LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $derivedCandidate)) (($extractRaw | Out-String).Trim())
     $roleCases = @(
-        @{ Role = 'specialist'; Bundle = $specBundle; Model = 'claude-opus-5'; Extra = @() },
-        @{ Role = 'verifier'; Bundle = $verBundle; Model = 'claude-opus-5'; Extra = @(
-                '-CandidateInputFile', (Join-Path $RepoRoot 'tools\testdata\reviewer-acquisition-discovery-candidate.json')) }
+        @{ Role = 'specialist'; Bundle = $specBundle; Model = 'claude-opus-5'; Extra = @(
+                '-LegacyProjectionFile', $specBundle.LegacyFile) },
+        @{ Role = 'verifier'; Bundle = $verSuccessBundle; Model = 'claude-opus-5'; Extra = @(
+                '-CandidateInputFile', $derivedCandidate,
+                '-DiscoveryMarkerFile', (Join-Path $acqOut 'package\result-marker.txt'),
+                '-LegacyProjectionFile', $verSuccessBundle.LegacyFile) }
     )
     foreach ($case in $roleCases) {
         $role = [string]$case.Role
@@ -619,8 +924,10 @@ try {
         $blocked = Join-Path $out 'capture-blocked.json'
         $isReady = Test-Path -LiteralPath $readyBundle
         $isBlocked = Test-Path -LiteralPath $blocked
-        Check "$role capture lands on exactly one typed artifact" (
-            ($isReady -bxor $isBlocked) -or (-not $isReady -and -not $isBlocked -and $r.ExitCode -ne 0)) $r.Text
+        Check "$role capture succeeds at exactly one typed boundary" (
+            $r.ExitCode -eq 0 -and $isReady -and -not $isBlocked) $(if ($isBlocked) {
+                [string]((Get-Content $blocked -Raw | ConvertFrom-Json).blockedDetail)
+            } else { $r.Text })
         if ($isReady) {
             $m = Get-Content $readyBundle -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 64
             Check "$role capture reached the boundary exactly once and started nothing" (
@@ -628,27 +935,21 @@ try {
                 @($m.sideEffects.PSObject.Properties | Where-Object { [int]$_.Value -ne 0 }).Count -eq 0)
             $v = Invoke-Tool -Arguments @('-VerifyOnly', '-OutputRoot', $out, '-SealKeyPath', $captureSealKeyPath)
             Check "$role bundle re-verifies independently" ($v.ExitCode -eq 0) $v.Text
-        }
-        elseif ($isBlocked) {
-            $b = Get-Content $blocked -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 64
-            Check "$role blocker is typed, reaches no boundary and invents nothing" (
-                @('blocked', 'degraded') -ccontains [string]$b.status -and
-                [int]$b.boundaryHits -eq 0 -and [string]$b.blockedReason -and -not [bool]$b.ready -and
-                @($b.sideEffects.PSObject.Properties | Where-Object { [int]$_.Value -ne 0 }).Count -eq 0) `
-                "status=$([string]$b.status) reason=$([string]$b.blockedReason)"
-            Check "$role blocker publishes no prompt it could not legitimately build" (
-                -not (Test-Path -LiteralPath (Join-Path $out 'role-input-prompt.txt')))
-            $bv = Invoke-Tool -Arguments @('-VerifyOnly', '-OutputRoot', $out, '-SealKeyPath', $captureSealKeyPath)
-            Check "$role typed blocker re-verifies independently" ($bv.ExitCode -eq 0) $bv.Text
+            $pipeline = Invoke-CapturedRolePipeline -Role $role -CaptureRoot $out -Bundle $case.Bundle `
+                -Model ([string]$case.Model) -Candidate $(if ($role -ceq 'verifier') { $derivedCandidate } else { '' }) `
+                -DiscoveryPackage $(if ($role -ceq 'verifier') { Join-Path $acqOut 'package' } else { '' })
+            Check "$role capture -> PR50 materialize -> PR49 Preflight succeeds" $pipeline.Ready $pipeline.Detail
         }
         else {
-            Check "$role refusal names its cause and leaves nothing behind" (
-                $r.ExitCode -ne 0 -and -not (Test-Path -LiteralPath $out)) $r.Text
+            Check "$role did not fabricate a ready bundle after failure" (-not $isReady -or $r.ExitCode -ne 0) $r.Text
         }
     }
 
     # -- Schemas are versioned and strict ------------------------------------
-    foreach ($schema in @('role-input-capture.schema.json', 'role-input-capture-blocked.schema.json')) {
+    foreach ($schema in @(
+            'role-input-capture-request.schema.json',
+            'role-input-capture.schema.json',
+            'role-input-capture-blocked.schema.json')) {
         $text = Get-Content (Join-Path $SchemaDir $schema) -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 64
         Check "$schema is strict about unknown fields" ([bool]($text.additionalProperties -eq $false))
     }

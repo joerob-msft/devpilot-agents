@@ -40,13 +40,13 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "fixtureProjectionSha256", "requestSha256", "inputSha256", "promptSha256",
+        "captureRequestSha256", "requestSha256", "inputSha256", "promptSha256",
         "schemaSha256", "configSha256", "scriptSha256", "launchArgumentsSha256",
         "bindingSha256", "snapshotManifestDigest", "candidateInputSha256",
         "clusterHash", "discoveryMarkerSha256", "derivedCandidateHash", "derivedClusterHash"
       ],
       "properties": {
-        "fixtureProjectionSha256": { "$ref": "#/$defs/hash" },
+        "captureRequestSha256": { "$ref": "#/$defs/hash" },
         "requestSha256": { "$ref": "#/$defs/hash" },
         "inputSha256": { "$ref": "#/$defs/hash" },
         "promptSha256": { "$ref": "#/$defs/hash" },
