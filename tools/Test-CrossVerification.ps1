@@ -2756,7 +2756,30 @@ Assert-Verification (@($missingEvidence.eligible).Count -eq 0 -and
 # Execute the production pass and safe wrapper with external I/O replaced by bounded
 # deterministic fixtures. This catches candidate-local admission failures escaping
 # into the pass-wide degradation boundary.
+$verificationInputHashesText = Get-VerificationFunctionText -Text $wrapperText `
+    -Name "New-ReviewerVerificationInputArtifactHashes"
+# The verifier input inventory is hashed into inputManifestSha, which is embedded
+# in the model input, so a second inventory built anywhere else is a silent
+# divergence from the production boundary rather than a duplicate. Pin it to one
+# definition: every 'generalist-pass' and 'verification-library' entry in the
+# whole reviewer must originate in this builder.
+foreach ($inventoryPin in @(
+        @("generalist-pass", 'generalist-pass'),
+        @("convention-specialist", 'kind\s*=\s*["'']convention-specialist["'']'),
+        @("verification-library", 'verification-library'),
+        @("verification-schema", 'verification-schema')
+    )) {
+    $inventoryKind = [string]$inventoryPin[0]
+    $kindPattern = [string]$inventoryPin[1]
+    $wholeFile = [regex]::Matches($wrapperText, $kindPattern).Count
+    $inBuilder = [regex]::Matches($verificationInputHashesText, $kindPattern).Count
+    Assert-Verification ($wholeFile -eq $inBuilder -and $inBuilder -ge 1) `
+        ("The verifier input artifact inventory entry '$inventoryKind' is built outside " +
+        "New-ReviewerVerificationInputArtifactHashes ($wholeFile occurrences, $inBuilder in the builder); " +
+        "a parallel inventory silently changes inputManifestSha.")
+}
 . ([scriptblock]::Create($verificationInputBodyText))
+. ([scriptblock]::Create($verificationInputHashesText))
 . ([scriptblock]::Create($verificationRunInputText))
 . ([scriptblock]::Create($crossPassText))
 . ([scriptblock]::Create($safeVerificationText))

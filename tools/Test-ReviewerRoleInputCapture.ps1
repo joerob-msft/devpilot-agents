@@ -166,13 +166,44 @@ function Remove-Tree {
         Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+function ConvertTo-FlatText {
+    # Tool output arrives as an ARRAY of lines, PowerShell's error formatter
+    # hard-wraps long messages so a child error routinely arrives split mid
+    # sentence, and the coloured error view injects ANSI/VT escape sequences
+    # BETWEEN characters of that message. The terminal renders those escapes
+    # invisibly, so a message can look byte-correct on screen and still not
+    # contain the phrase. Matching a phrase against the raw value therefore
+    # silently fails for formatting reasons, which is how a refusal assertion
+    # gets "fixed" into something that no longer asserts the refusal. Strip the
+    # escapes and all whitespace from BOTH sides instead.
+    param([Parameter(Mandatory)][AllowNull()]$Value)
+    $joined = (@($Value) -join ' ')
+    $joined = $joined -replace "`e\][^`a`e]*(`a|`e\\)", ''
+    $joined = $joined -replace "`e\[[0-9;?]*[A-Za-z]", ''
+    return ($joined -replace '\s+', '')
+}
+
+function Test-TextContains {
+    param(
+        [Parameter(Mandatory)][AllowNull()]$Text,
+        [Parameter(Mandatory)][string]$Phrase
+    )
+    return (ConvertTo-FlatText $Text).IndexOf(($Phrase -replace '\s+', ''),
+        [StringComparison]::Ordinal) -ge 0
+}
+
 function Invoke-Tool {
     param([Parameter(Mandatory)][string[]]$Arguments, [string]$ToolPath = $CaptureTool)
     $out = & pwsh -NoProfile -File $ToolPath @Arguments 2>&1
-    # PowerShell's concise error view wraps long messages and prefixes the
-    # continuation lines with '|', so normalize before any message assertion.
-    $flat = (($out | Out-String) -replace '[\r\n]+', ' ') -replace '\s*\|\s*', ' '
-    return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Text = ($flat -replace '\s+', ' ').Trim(); Raw = (($out | Out-String).Trim()) }
+    # PowerShell's concise error view wraps long messages, prefixes continuation
+    # lines with '|', and injects ANSI/VT colour escapes between characters of
+    # the message. The escapes render invisibly, so an un-stripped assertion can
+    # read as correct on screen and still never match. Strip both.
+    $raw = ($out | Out-String)
+    $raw = $raw -replace "`e\][^`a`e]*(`a|`e\\)", ''
+    $raw = $raw -replace "`e\[[0-9;?]*[A-Za-z]", ''
+    $flat = ($raw -replace '[\r\n]+', ' ') -replace '\s*\|\s*', ' '
+    return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Text = ($flat -replace '\s+', ' ').Trim(); Raw = $raw.Trim() }
 }
 function Invoke-ExpectedFailure {
     param([string]$Name, [string[]]$Arguments, [string]$Pattern)
@@ -806,11 +837,50 @@ try {
     $missingResourceOut = Join-Path $runRoot 'capture-missing-resource'
     $missingResourceResult = Invoke-Tool -Arguments (Get-CaptureArgs -Bundle $genBundle `
             -Out $missingResourceOut -Request $missingResourceRequest)
-    Check 'a missing request resource is refused without publication, on sealed-read grounds' (
-        $missingResourceResult.ExitCode -eq 2 -and
-        $missingResourceResult.Text -match 'telemetry proof is (missing|empty)|no provider\.replayServed' -and
-        -not (Test-Path -LiteralPath $missingResourceOut)) `
-        $missingResourceResult.Text
+    # The real cause must survive to the operator. This used to be deferred into
+    # the capture body to publish a typed blocker, but that fires before any role
+    # runs, so no sealed read ever happens, the telemetry proof fails and NO
+    # bundle is published -- the operator was left with "no provider.replayServed"
+    # for what is actually a pack whose bytes do not match its request.
+    # PowerShell's error formatter hard-wraps long messages, so a child error can
+    # arrive with a newline in the middle of a sentence. Match on whitespace-
+    # normalized text or these assertions fail for formatting reasons and get
+    # "fixed" by weakening them into something vacuous.
+    $missingResourceText = ConvertTo-FlatText $missingResourceResult.Text
+    $missingResourceNamed = Test-TextContains -Text $missingResourceResult.Text -Phrase 'is missing from the replay snapshot'
+    $missingResourceNoRoot = -not (Test-Path -LiteralPath $missingResourceOut)
+    Check 'a missing request resource is refused without publication, naming the resource' (
+        $missingResourceResult.ExitCode -ne 0 -and $missingResourceNamed -and $missingResourceNoRoot) `
+        ("exit=$($missingResourceResult.ExitCode) named=$missingResourceNamed " +
+        "noRoot=$missingResourceNoRoot :: $missingResourceText")
+
+    $tamperedResourceRequest = Join-Path $runRoot 'request-tampered-resource.json'
+    $tamperedResource = Get-Content -LiteralPath $genBundle.Request -Raw -Encoding UTF8 |
+        ConvertFrom-Json -AsHashtable -Depth 64
+    $tamperedResource.resources[0].byteLength = [long]$tamperedResource.resources[0].byteLength + 1
+    Write-Utf8 $tamperedResourceRequest (ConvertTo-Json $tamperedResource -Depth 64)
+    $tamperedResourceOut = Join-Path $runRoot 'capture-tampered-resource'
+    $tamperedResourceResult = Invoke-Tool -Arguments (Get-CaptureArgs -Bundle $genBundle `
+            -Out $tamperedResourceOut -Request $tamperedResourceRequest)
+    Check 'a request resource whose declared length does not match its bytes is refused' (
+        $tamperedResourceResult.ExitCode -ne 0 -and
+        (Test-TextContains -Text $tamperedResourceResult.Text -Phrase 'failed its hash/length binding') -and
+        -not (Test-Path -LiteralPath $tamperedResourceOut)) `
+        $tamperedResourceResult.Text
+
+    $escapingResourceRequest = Join-Path $runRoot 'request-escaping-resource.json'
+    $escapingResource = Get-Content -LiteralPath $genBundle.Request -Raw -Encoding UTF8 |
+        ConvertFrom-Json -AsHashtable -Depth 64
+    $escapingResource.resources[0].sealedPath = '../escaped-resource.json'
+    Write-Utf8 $escapingResourceRequest (ConvertTo-Json $escapingResource -Depth 64)
+    $escapingResourceOut = Join-Path $runRoot 'capture-escaping-resource'
+    $escapingResourceResult = Invoke-Tool -Arguments (Get-CaptureArgs -Bundle $genBundle `
+            -Out $escapingResourceOut -Request $escapingResourceRequest)
+    Check 'a request resource path that escapes the snapshot is refused' (
+        $escapingResourceResult.ExitCode -ne 0 -and
+        (Test-TextContains -Text $escapingResourceResult.Text -Phrase 'escapes the replay snapshot') -and
+        -not (Test-Path -LiteralPath $escapingResourceOut)) `
+        $escapingResourceResult.Text
 
     $legacyWithProvenance = Join-Path $runRoot 'pack-generalist\projections\fixture.with-provenance.blinded.json'
     $legacyObject = Get-Content $genBundle.LegacyFile -Raw -Encoding UTF8 |

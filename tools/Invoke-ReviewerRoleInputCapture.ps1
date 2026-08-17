@@ -17,10 +17,18 @@
       * it re-resolves the declared full ref and HEAD from the git object store
         itself (never by running git) and fails closed on any disagreement;
       * it scrubs provider credentials out of the environment the child
-        inherits, so a live read or write is not merely unused but impossible;
+        inherits, removing the easiest accidental route to a live call. This is
+        a structural guard over this code path, NOT a capability sandbox: it
+        does not remove ambient machine credentials and cannot prevent arbitrary
+        outbound HTTP. What actually forecloses a live provider read or write is
+        that capture stops at the model boundary against a sealed replay
+        snapshot;
       * it wires the production-test-only offline telemetry sink and afterwards
         proves from that telemetry that ZERO model, agency or provider child
-        processes started and that ZERO live reads or writes occurred;
+        processes started and that ZERO live reads or writes occurred. The child
+        emits that telemetry about itself, so this detects an instrumented
+        regression; it is not a containment mechanism against a child that
+        deliberately misreports;
       * it independently re-verifies the published bundle - schema, per-file
         length and SHA-256, recursive read-only, zero side effects, exactly one
         boundary hit, and identity/role/model agreement with what was requested.

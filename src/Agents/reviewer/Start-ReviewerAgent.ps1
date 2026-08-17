@@ -11260,6 +11260,69 @@ function New-ReviewerVerificationInputBody {
     }
 }
 
+function New-ReviewerVerificationInputArtifactHashes {
+    # THE single inventory the verifier input manifest is hashed over. Both the
+    # production cross-verification pass and the capture path call this: a second,
+    # "simplified" inventory built alongside the real one is exactly how a capture
+    # silently stops being the production boundary, because the inventory is
+    # hashed into inputManifestSha and inputManifestSha is embedded in the model
+    # input. Artifacts a caller genuinely does not have are zero-hashed here, in
+    # this order, rather than omitted.
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$RawGeneralistPasses,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$ConventionSpecialistModel,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$SpecialistArtifactSha256,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$ConventionPlanPath,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$FactPlanPath,
+        [Parameter(Mandatory)][string]$ConfigSha256,
+        [Parameter(Mandatory)][string]$ScriptSha256,
+        [Parameter(Mandatory)][string]$VerificationLibrarySha256,
+        [Parameter(Mandatory)][string]$VerificationPromptSha256,
+        [Parameter(Mandatory)][string]$VerificationPolicySha256,
+        [Parameter(Mandatory)][string]$VerificationSchemaSha256
+    )
+    $zero = "0" * 64
+    $hashes = [System.Collections.Generic.List[object]]::new()
+    foreach ($pass in @($RawGeneralistPasses)) {
+        [void]$hashes.Add([pscustomobject][ordered]@{
+                kind = "generalist-pass"
+                id = [string]$pass.model
+                sha256 = [string]$pass.markerSha256
+            })
+    }
+    [void]$hashes.Add([pscustomobject][ordered]@{
+            kind = "convention-specialist"; id = $ConventionSpecialistModel
+            sha256 = $(if ($SpecialistArtifactSha256) { $SpecialistArtifactSha256 } else { $zero })
+        })
+    foreach ($item in @(
+            @("convention-plan", $ConventionPlanPath),
+            @("fact-plan", $FactPlanPath)
+        )) {
+        $sha = if ([string]$item[1] -and (Test-Path -LiteralPath ([string]$item[1]))) {
+            (Get-FileHash -LiteralPath ([string]$item[1]) -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+        else {
+            $zero
+        }
+        [void]$hashes.Add([pscustomobject][ordered]@{
+                kind = [string]$item[0]; id = [IO.Path]::GetFileName([string]$item[1]); sha256 = $sha
+            })
+    }
+    foreach ($item in @(
+            @("config", $ConfigSha256.ToLowerInvariant()),
+            @("reviewer-script", $ScriptSha256.ToLowerInvariant()),
+            @("verification-library", $VerificationLibrarySha256),
+            @("verification-prompt", $VerificationPromptSha256),
+            @("verification-policy", $VerificationPolicySha256),
+            @("verification-schema", $VerificationSchemaSha256)
+        )) {
+        [void]$hashes.Add([pscustomobject][ordered]@{
+                kind = [string]$item[0]; id = [string]$item[0]; sha256 = [string]$item[1]
+            })
+    }
+    return , @($hashes.ToArray())
+}
+
 function Get-ReviewerVerificationRunInput {
     param(
         [Parameter(Mandatory)]$Cluster,
@@ -11374,7 +11437,6 @@ function Invoke-ReviewerCrossVerificationPass {
     $changeEntries = @($sessionData.Changes)
     $resolvedSources = @($sessionData.Sources)
     $rawPasses = [System.Collections.Generic.List[object]]::new()
-    $inputHashes = [System.Collections.Generic.List[object]]::new()
     foreach ($pass in @($PassResults)) {
         $marker = Get-ReviewerVerificationValue $pass "Marker"
         $markerJson = if ($marker) {
@@ -11390,11 +11452,6 @@ function Invoke-ReviewerCrossVerificationPass {
                 reason = [string](Get-ReviewerVerificationValue $pass "Reason" "")
                 markerJson = $markerJson
                 markerSha256 = $markerSha
-            })
-        [void]$inputHashes.Add([pscustomobject][ordered]@{
-                kind = "generalist-pass"
-                id = [string](Get-ReviewerVerificationValue $pass "Model" "")
-                sha256 = $markerSha
             })
     }
     if ($rawPasses.Count -ne @($ReviewPassModels).Count -or
@@ -11442,36 +11499,15 @@ function Invoke-ReviewerCrossVerificationPass {
     else {
         "0" * 64
     }
-    [void]$inputHashes.Add([pscustomobject][ordered]@{
-            kind = "convention-specialist"; id = $EffectiveConventionSpecialistModel
-            sha256 = $specialistArtifactSha
-        })
-    foreach ($item in @(
-            @("convention-plan", [string]$Bound.ConventionPlanPath),
-            @("fact-plan", [string]$Bound.FactPlanPath)
-        )) {
-        $sha = if ([string]$item[1] -and (Test-Path -LiteralPath ([string]$item[1]))) {
-            (Get-FileHash -LiteralPath ([string]$item[1]) -Algorithm SHA256).Hash.ToLowerInvariant()
-        }
-        else {
-            "0" * 64
-        }
-        [void]$inputHashes.Add([pscustomobject][ordered]@{
-                kind = [string]$item[0]; id = [IO.Path]::GetFileName([string]$item[1]); sha256 = $sha
-            })
-    }
-    foreach ($item in @(
-            @("config", $ConfigSha256.ToLowerInvariant()),
-            @("reviewer-script", $ScriptSelfSha256.ToLowerInvariant()),
-            @("verification-library", $CrossVerificationLibrarySha256),
-            @("verification-prompt", $CrossVerificationPromptSha256),
-            @("verification-policy", $CrossVerificationPolicySha256),
-            @("verification-schema", $CrossVerificationSchemaSha256)
-        )) {
-        [void]$inputHashes.Add([pscustomobject][ordered]@{
-                kind = [string]$item[0]; id = [string]$item[0]; sha256 = [string]$item[1]
-            })
-    }
+    $inputHashes = @(New-ReviewerVerificationInputArtifactHashes -RawGeneralistPasses $rawPasses.ToArray() `
+            -ConventionSpecialistModel $EffectiveConventionSpecialistModel `
+            -SpecialistArtifactSha256 $specialistArtifactSha `
+            -ConventionPlanPath ([string]$Bound.ConventionPlanPath) -FactPlanPath ([string]$Bound.FactPlanPath) `
+            -ConfigSha256 $ConfigSha256 -ScriptSha256 $ScriptSelfSha256 `
+            -VerificationLibrarySha256 $CrossVerificationLibrarySha256 `
+            -VerificationPromptSha256 $CrossVerificationPromptSha256 `
+            -VerificationPolicySha256 $CrossVerificationPolicySha256 `
+            -VerificationSchemaSha256 $CrossVerificationSchemaSha256)
     $normalizedPasses = @($rawPasses | ForEach-Object {
             [pscustomobject][ordered]@{
                 model = [string]$_.model
@@ -11605,7 +11641,7 @@ function Invoke-ReviewerCrossVerificationPass {
         -CandidateEvidenceOptions $candidateEvidenceOptions.ToArray() -AssignmentCoverage $assignmentCoverage `
         -Candidates @($candidates) -TotalCandidateCount ([int]$candidatePlan.totalCandidateCount) `
         -PreVerificationWithheld @($preVerificationWithheld) -Clusters @($clusters) `
-        -Assignments @($assignments) -AllInputArtifactHashes $inputHashes.ToArray()
+        -Assignments @($assignments) -AllInputArtifactHashes $inputHashes
     $inputManifestSha = Get-ReviewerVerificationObjectSha256 -Value $inputBody
     $inputManifest = [pscustomobject][ordered]@{
         kind = $inputBody.kind
@@ -11893,7 +11929,7 @@ function Invoke-ReviewerCrossVerificationPass {
         -Withheld @($replay.withheld) -Eligible @($replay.eligible) `
         -AllCandidates @($candidatePlan.candidates) `
         -ReconciliationManifest $reconciliationManifest `
-        -InputArtifactHashes $inputHashes.ToArray() `
+        -InputArtifactHashes $inputHashes `
         -TotalCandidateCount ([int]$candidatePlan.totalCandidateCount) `
         -ReplaySha256 ([string]$replay.replaySha256)
     Write-ReviewerCycleMetadata -Fields @{
@@ -15929,6 +15965,10 @@ function Invoke-ReviewerAcquisitionVerifierCapture {
     # only independently sealed discovery evidence and replay-derived source data,
     # so unavailable specialist/fact/thread surfaces are explicit empty values
     # rather than being omitted by a second, simplified manifest path.
+    # Hash the SAME production inventory, through the same builder. Capture has no
+    # convention specialist, convention plan or fact plan, so those are zero-hashed
+    # by the shared builder in production's own order and under production's own
+    # kind/id names - not omitted, and not renamed by a parallel inventory.
     $markerJson = ConvertTo-ReviewerVerificationCanonicalJson -Value $DiscoveryMarker
     $markerSha = Get-ReviewerVerificationSha256 -Text $markerJson
     $rawDiscoveryPass = [pscustomobject][ordered]@{
@@ -15938,14 +15978,15 @@ function Invoke-ReviewerAcquisitionVerifierCapture {
         markerJson = $markerJson
         markerSha256 = $markerSha
     }
-    $inputHashes = @(
-        [pscustomobject][ordered]@{ kind = 'generalist-pass'; id = $rawDiscoveryPass.model; sha256 = $markerSha }
-        [pscustomobject][ordered]@{ kind = 'configuration'; id = 'configuration'; sha256 = $ConfigSha256 }
-        [pscustomobject][ordered]@{ kind = 'reviewer-script'; id = 'reviewer-script'; sha256 = $ScriptSelfSha256 }
-        [pscustomobject][ordered]@{ kind = 'verification-prompt'; id = 'verification-prompt'; sha256 = $CrossVerificationPromptSha256 }
-        [pscustomobject][ordered]@{ kind = 'verification-policy'; id = 'verification-policy'; sha256 = $CrossVerificationPolicySha256 }
-        [pscustomobject][ordered]@{ kind = 'verification-schema'; id = 'verification-schema'; sha256 = $CrossVerificationSchemaSha256 }
-    )
+    $inputHashes = @(New-ReviewerVerificationInputArtifactHashes `
+            -RawGeneralistPasses @($rawDiscoveryPass) `
+            -ConventionSpecialistModel $EffectiveConventionSpecialistModel `
+            -SpecialistArtifactSha256 '' -ConventionPlanPath '' -FactPlanPath '' `
+            -ConfigSha256 $ConfigSha256 -ScriptSha256 $ScriptSelfSha256 `
+            -VerificationLibrarySha256 $CrossVerificationLibrarySha256 `
+            -VerificationPromptSha256 $CrossVerificationPromptSha256 `
+            -VerificationPolicySha256 $CrossVerificationPolicySha256 `
+            -VerificationSchemaSha256 $CrossVerificationSchemaSha256)
     $inputBody = New-ReviewerVerificationInputBody -Binding $binding `
         -RawGeneralistPasses @($rawDiscoveryPass) -SpecialistStatus 'unavailable' `
         -SpecialistArtifactPath '' -SpecialistArtifactSha256 '' -SpecialistManifest $null `
@@ -17178,24 +17219,42 @@ function Invoke-ReviewerRoleInputCaptureRun {
     if ($manifestFileSha256 -cne ([string]$captureRequest.snapshot.manifestFileSha256).ToLowerInvariant()) {
         throw "The capture request manifestFileSha256 does not match the loaded replay manifest bytes."
     }
-    $resourceValidationFailure = ''
+    # Refuse a bad sealed resource HERE, at detection, with the real reason.
+    # Deferring these into the capture try-block to publish a typed blocker cannot
+    # work: the re-throw fires before any role runs, so the child performs zero
+    # sealed reads, the supervisor's telemetry proof finds no provider.replayServed
+    # and refuses to publish ANY bundle - blocked ones included. The deferral
+    # therefore bought no artifact and cost the operator the actual cause, which
+    # is the one thing worth knowing when a pack's bytes do not match its request.
     foreach ($resource in @($captureRequest.resources)) {
         $relative = ([string]$resource.sealedPath).Replace('/', [IO.Path]::DirectorySeparatorChar)
         if ([IO.Path]::IsPathRooted($relative) -or $relative -match '(^|[\\/])\.\.([\\/]|$)') {
-            $resourceValidationFailure = "The capture request sealed resource path '$([string]$resource.sealedPath)' escapes the replay snapshot."
-            break
+            throw "The capture request sealed resource path '$([string]$resource.sealedPath)' escapes the replay snapshot."
         }
         $resourcePath = [IO.Path]::GetFullPath((Join-Path $replaySnapshotRoot $relative))
         if (-not $resourcePath.StartsWith($replaySnapshotRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or
             -not (Test-Path -LiteralPath $resourcePath -PathType Leaf)) {
-            $resourceValidationFailure = "The capture request sealed resource '$([string]$resource.sealedPath)' is missing from the replay snapshot."
-            break
+            throw "The capture request sealed resource '$([string]$resource.sealedPath)' is missing from the replay snapshot."
+        }
+        # Symmetric with the legacy pack walk: a declared resource may not be
+        # reached through a reparse point, even though these are only hashed and
+        # never copied, so that "inside the snapshot" means the same thing on both
+        # inputs rather than depending on what each one happens to do next.
+        $walk = Get-Item -LiteralPath $resourcePath -Force
+        while ($null -ne $walk -and
+            ([IO.Path]::GetFullPath($walk.FullName).TrimEnd([IO.Path]::DirectorySeparatorChar) -cne
+                $replaySnapshotRoot.TrimEnd([IO.Path]::DirectorySeparatorChar))) {
+            if (($walk.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw ("The capture request sealed resource '$([string]$resource.sealedPath)' is reached " +
+                    "through a reparse point ('$($walk.Name)') and is not inside the replay snapshot.")
+            }
+            $walkParent = Split-Path $walk.FullName -Parent
+            $walk = if ($walkParent) { Get-Item -LiteralPath $walkParent -Force } else { $null }
         }
         if ((Get-FileHash -LiteralPath $resourcePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne
             ([string]$resource.sha256).ToLowerInvariant() -or
             [long](Get-Item -LiteralPath $resourcePath).Length -ne [long]$resource.byteLength) {
-            $resourceValidationFailure = "The capture request sealed resource '$([string]$resource.sealedPath)' failed its hash/length binding."
-            break
+            throw "The capture request sealed resource '$([string]$resource.sealedPath)' failed its hash/length binding."
         }
     }
 
@@ -17335,7 +17394,6 @@ function Invoke-ReviewerRoleInputCaptureRun {
     $script:ReviewerRoleInputFactPlan = $null
     $script:ReviewerRoleInputCaptureActive = $true
     try {
-        if ($resourceValidationFailure) { throw $resourceValidationFailure }
         switch ($CaptureRoleInputRole) {
             'generalist' {
                 $script:ReviewerAcquisitionRolePassResult = $null

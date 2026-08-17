@@ -183,10 +183,24 @@ The bundle supplies the complementary boundary evidence:
   the production path really ran all the way to the model boundary and stopped
   there — a capture that never got that far cannot claim it did;
 * the manifest is covered by an HMAC seal (`capture-seal.json`) under a key the
-  verifier holds independently, so the boundary-hit claim cannot be forged by
-  editing the bundle; and
+  verifier holds independently, so the claim cannot be **altered** after the fact
+  by editing the bundle — the seal establishes integrity and authorship, not the
+  truth of what the child asserted; and
 * the interception is the first statement of `Invoke-ReviewerModelSubprocess`,
   so no model process can start regardless of what any counter says.
+
+Be precise about what that adds up to. The child instruments itself and seals its
+own assertions, so the seal makes the assertions tamper-evident, not true. The
+independent, non-self-reported evidence is narrower and worth naming separately:
+the interception sits at the first statement of the subprocess launcher, capture
+runs against a permanently non-promotable sealed replay snapshot with no live
+fallback, and the supervisor itself observes the published tree, the exit code,
+the absence of any output root or lease outside the declared one, and the child's
+own process handle. Against an honest-but-broken run — the failure this mode
+actually exists to catch — that is sufficient. Against a child deliberately
+forging its own instrumentation it is not, and no self-instrumentation could be;
+containment of that case would need OS-level enforcement (a Job Object, a network
+sandbox), which this mode does not implement and does not claim.
 
 The capture path launches **no child process of any kind** — not merely no model
 processes. Even the running checkout's HEAD is resolved by reading `.git/HEAD`,
@@ -293,7 +307,18 @@ These are deliberate, and are recorded here rather than hidden.
   hashed input manifest depends on. The run is then scoped to the
   `(clusterId, verifierModel)` group production would have launched, so a
   multi-finding marker that legitimately derives several clusters is capturable
-  without leaking another cluster's evidence into the prompt. Missing sealed
-  sources publish a typed `degraded`/`blocked` outcome.
+  without leaking another cluster's evidence into the prompt. The hashed input
+  inventory comes from the same builder production uses
+  (`New-ReviewerVerificationInputArtifactHashes`), pinned by test to a single
+  definition, because that inventory is hashed into `inputManifestSha` and
+  `inputManifestSha` is embedded in the model input — a second, "simplified"
+  inventory is precisely how a capture stops being the production boundary
+  without anyone noticing. State the scope honestly: capture has no convention
+  specialist and no convention/fact plans, so those entries are zero-hashed. The
+  captured manifest is therefore the manifest production computes **for the
+  inputs capture actually holds** — a sealed discovery marker with the specialist
+  unavailable — not the manifest of a full production cycle that had a live
+  specialist. Missing sealed sources publish a typed `degraded`/`blocked`
+  outcome.
 * **Telemetry falsifies and bounds the run; it does not authenticate it.** See
   "Telemetry must be positive, complete and side-effect-free" above.
