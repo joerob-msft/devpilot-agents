@@ -5,10 +5,10 @@
 
 .DESCRIPTION
     Exercises tools/Invoke-ReviewerBlindedAcquisition.ps1 end-to-end against the offline
-    deterministic adapter ONLY. No real model, network, provider, ADO or GitHub write is
-    ever performed: every launched scenario asserts telemetry.realModelStarts == 0 while
-    still driving the exact production prompt construction / result-marker parser / retry
-    accounting / sealed routing / model-subprocess boundary inside Start-ReviewerAgent.ps1.
+    deterministic adapter. A telemetry-wiring regression also drives the production
+    subprocess boundary into a local pwsh-backed stub. No real model, network, provider,
+    ADO or GitHub write is ever performed; adapter scenarios assert zero real-model starts,
+    while the production-boundary regression proves the real-model event detector fires.
 
     Coverage: success (opus + gpt); missing / truncated / saturated marker retry with a
     fresh distinct nonce; terminal schema/binding failure with no retry; crash; hanging
@@ -173,6 +173,19 @@ function Get-CommonArgs {
     )
 }
 
+function Get-ProductionArgs {
+    param([Parameter(Mandatory)][string]$Out)
+    return @(
+        '-Role', 'generalist', '-FixtureProjectionFile', $genProjection, '-Model', 'claude-opus-5',
+        '-ConfigFile', $configFile, '-ReplayRoot', $replayRoot,
+        '-ReplaySnapshotName', 'synthetic-pr', '-ReplayManifestDigest', $digest,
+        '-ExpectedReviewerBaseCommit', $expectedBase,
+        '-PullRequestId', '4242', '-ExpectedHeadCommit', $head, '-ExpectedRef', $ref,
+        '-OutputRoot', $Out, '-SealKeyPath', $sealKey, '-AllowDirtyWorktree',
+        '-PerCallTimeoutSeconds', '30', '-TotalTimeoutSeconds', '90', '-ActivityTimeoutSeconds', '30'
+    )
+}
+
 function Invoke-Tool {
     param([Parameter(Mandatory)][string[]]$ToolArgs, [Parameter(Mandatory)][string]$LogName)
     $log = Join-Path $logDir $LogName
@@ -269,7 +282,8 @@ function Invoke-ChildDirect {
     param(
         [Parameter(Mandatory)][string]$Label, [Parameter(Mandatory)][string]$PlanFile,
         [Parameter(Mandatory)][string]$Projection, [string]$Model = 'claude-opus-5',
-        [hashtable]$Env = @{}, [switch]$OmitTestOnlySwitch, [string]$AdapterManifest,
+        [hashtable]$Env = @{}, [switch]$OmitTestOnlySwitch, [switch]$ForbiddenTelemetryOnly,
+        [string]$AdapterManifest,
         [string]$RepoPathOverride, [string]$OutputRootOverride, [string]$StateDirOverride
     )
     $man = if ($AdapterManifest) { $AdapterManifest } else { $baseManifest }
@@ -283,12 +297,20 @@ function Invoke-ChildDirect {
         '-ConfigFile', $configFile, '-StateDir', $st, '-OperatorAlias', 'acquisition-operator',
         '-PullRequestId', '4242', '-Model', $Model, '-CycleTimeoutSeconds', '45',
         '-ReplayRoot', $replayRoot, '-ReplaySnapshotName', 'synthetic-pr', '-ReplayManifestDigest', $digest,
-        '-ExpectedReviewerBaseCommit', $expectedBase, '-OfflineTelemetryPath', $tp,
+        '-ExpectedReviewerBaseCommit', $expectedBase,
         '-AcquireTranscriptRole', 'generalist', '-AcquisitionPlanFile', $PlanFile,
-        '-AcquisitionFixtureProjectionFile', $Projection, '-AcquisitionOutputRoot', $od,
-        '-EnableOfflineModelAdapter', '-OfflineModelAdapterManifest', $man
+        '-AcquisitionFixtureProjectionFile', $Projection, '-AcquisitionOutputRoot', $od
     )
-    if (-not $OmitTestOnlySwitch) { $childArgs += '-AcquisitionTestOnlyOfflineAdapter' }
+    if ($ForbiddenTelemetryOnly) {
+        $childArgs += @('-OfflineTelemetryPath', $tp)
+    }
+    else {
+        $childArgs += @(
+            '-OfflineTelemetryPath', $tp,
+            '-EnableOfflineModelAdapter', '-OfflineModelAdapterManifest', $man
+        )
+        if (-not $OmitTestOnlySwitch) { $childArgs += '-AcquisitionTestOnlyOfflineAdapter' }
+    }
     $log = Join-Path $logDir ("direct-" + $Label + ".log")
     $prev = @{}
     foreach ($k in $Env.Keys) { $prev[$k] = [Environment]::GetEnvironmentVariable($k); Set-Item "Env:$k" $Env[$k] }
@@ -451,6 +473,73 @@ $sd = Invoke-Tool -ToolArgs (Get-CommonArgs -Out $sdOut -Role generalist -Projec
 Check 'snapshotDigestMismatch refuses (exit!=0)' ($sd.Exit -ne 0) ("exit=$($sd.Exit)")
 Check 'snapshotDigestMismatch leaves no sealed package' (-not (Test-Path -LiteralPath (Join-Path $sdOut 'package\transcript-package.json')))
 
+# Production telemetry wiring regression: put a harmless renamed pwsh executable
+# at the agency boundary. It cannot run a model, but reaching it proves the
+# reviewer accepted production acquisition without adapter parameters. Because
+# process.started is environment-gated, its presence in the owned sink also proves
+# the exact mode/path reached the child without an -OfflineTelemetryPath argument.
+$prodOut = New-OutDir 'production_telemetry_wiring'
+$fakeAgencyDir = Join-Path $runRoot 'fake-agency'
+New-Item -ItemType Directory -Force -Path $fakeAgencyDir | Out-Null
+$fakeAgencyPath = Join-Path $fakeAgencyDir 'agency.cmd'
+Set-Content -LiteralPath $fakeAgencyPath -Encoding ascii -Value `
+    '@pwsh -NoProfile -Command "$null=[Console]::In.ReadToEnd(); exit 70"'
+$sentinelTelemetry = Join-Path $runRoot 'parent-telemetry-must-not-be-used.jsonl'
+$savedPath = $env:PATH
+$savedTelemetryMode = $env:DEVPILOT_OFFLINE_TELEMETRY_MODE
+$savedTelemetryPath = $env:DEVPILOT_OFFLINE_TELEMETRY_PATH
+try {
+    $env:PATH = $fakeAgencyDir + [IO.Path]::PathSeparator + $savedPath
+    $env:DEVPILOT_OFFLINE_TELEMETRY_MODE = 'parent-sentinel'
+    $env:DEVPILOT_OFFLINE_TELEMETRY_PATH = $sentinelTelemetry
+    $prod = Invoke-Tool -ToolArgs (Get-ProductionArgs -Out $prodOut) -LogName 'production-telemetry-wiring.log'
+    if ($prod.Exit -ne 0) {
+        throw "Production acquisition did not reach the stub model boundary without adapter parameters (exit=$($prod.Exit))."
+    }
+}
+finally {
+    $env:PATH = $savedPath
+    $env:DEVPILOT_OFFLINE_TELEMETRY_MODE = $savedTelemetryMode
+    $env:DEVPILOT_OFFLINE_TELEMETRY_PATH = $savedTelemetryPath
+}
+$prodTelemetryPath = Join-Path $prodOut 'work\telemetry.jsonl'
+$prodEvents = if (Test-Path -LiteralPath $prodTelemetryPath) {
+    @(Get-Content -LiteralPath $prodTelemetryPath -Encoding UTF8 | Where-Object { $_ } |
+        ForEach-Object { $_ | ConvertFrom-Json -Depth 32 })
+} else { @() }
+$prodStarts = @($prodEvents | Where-Object { [string]$_.event -ceq 'process.started' })
+$prodReady = @($prodEvents | Where-Object { [string]$_.event -ceq 'acquisition.childReady' })
+if ($prodReady.Count -ne 1 -or
+    [bool]$prodReady[0].data.offlineTelemetryArgumentPresent -or
+    [bool]$prodReady[0].data.offlineAdapterArgumentPresent) {
+    throw "Production child argv requested offline adapter telemetry (ready events=$($prodReady.Count))."
+}
+if ($prodReady.Count -ne 1 -or
+    [string]$prodReady[0].data.telemetryMode -cne 'production-test-only' -or
+    [IO.Path]::GetFullPath([string]$prodReady[0].data.telemetryPath) -cne [IO.Path]::GetFullPath($prodTelemetryPath) -or
+    (Test-Path -LiteralPath $sentinelTelemetry)) {
+    throw 'Production child did not receive the exact owned telemetry mode/path.'
+}
+$outerSource = Get-Content -LiteralPath $tool -Raw
+if ($outerSource -match '\$env:DEVPILOT_OFFLINE_TELEMETRY_(MODE|PATH)\s*=') {
+    throw 'The acquisition supervisor mutates the global telemetry environment.'
+}
+$prodManifestPath = Join-Path $prodOut 'package\transcript-package.json'
+if (Test-Path -LiteralPath $prodManifestPath) {
+    $prodManifest = Read-Json $prodManifestPath
+    $prodTelemetryFile = @($prodManifest.files | Where-Object { [string]$_.name -ceq 'telemetry.jsonl' })
+    if ($prodStarts.Count -lt 1 -or [int]$prodManifest.telemetry.realModelStarts -lt 1) {
+        throw "Production telemetry missed the stubbed real-model boundary (starts=$($prodStarts.Count), real=$([int]$prodManifest.telemetry.realModelStarts))."
+    }
+    if (-not [bool]$prodManifest.telemetry.fileExists -or [int]$prodManifest.telemetry.totalEvents -le 0 -or
+        $prodTelemetryFile.Count -ne 1 -or
+        [int64]$prodTelemetryFile[0].bytes -ne [int64]$prodManifest.telemetry.sinkBytes -or
+        [string]$prodTelemetryFile[0].sha256 -cne [string]$prodManifest.telemetry.sinkSha256) {
+        throw 'Production package telemetry did not bind the owned sink hash, length, and events.'
+    }
+}
+else { throw "Production telemetry package is missing: $prodManifestPath" }
+
 # Blocker 2: a blinded projection whose canonical binding disagrees with the sealed
 # replay Bound (here a DIFFERENT sourceCommit) is refused by the outer supervisor
 # BEFORE any lease / plan / launch. Caller-supplied projection identity can never
@@ -510,7 +599,13 @@ function Test-Behavior {
     Check ("$Name attempts=$ExpectAttempts") (@($m.attempts).Count -eq $ExpectAttempts) ("got=$(@($m.attempts).Count)")
     Check ("$Name reportedModel='$ExpectReported'") ([string]$m.reportedModel -eq $ExpectReported) ("got='$([string]$m.reportedModel)'")
     Check ("$Name zero real-model starts") ([int]$m.telemetry.realModelStarts -eq 0 -and [int]$m.telemetry.modelSubprocessStarts -ge 1) ("real=$([int]$m.telemetry.realModelStarts) sub=$([int]$m.telemetry.modelSubprocessStarts)")
-    Check ("$Name zeroWriteVerified") ([bool]$m.telemetry.zeroWriteVerified) ''
+    $telemetryFile = @($m.files | Where-Object { [string]$_.name -ceq 'telemetry.jsonl' })
+    Check ("$Name zeroWriteVerified and telemetry sink bound") `
+        ([bool]$m.telemetry.zeroWriteVerified -and
+        [bool]$m.telemetry.fileExists -and [int]$m.telemetry.totalEvents -gt 0 -and
+        $telemetryFile.Count -eq 1 -and
+        [int64]$telemetryFile[0].bytes -eq [int64]$m.telemetry.sinkBytes -and
+        [string]$telemetryFile[0].sha256 -ceq [string]$m.telemetry.sinkSha256) ''
     # Blocker 3: the stub adapter emits a result envelope (usage) and an
     # assistant.message whenever the model "ran" -> reportedModel is non-empty.
     # In that case the exact production parser MUST surface real usage (modelRan
@@ -565,7 +660,13 @@ Check 'timeout writes terminal evidence' (Test-Path -LiteralPath $tePath)
 if (Test-Path -LiteralPath $tePath) {
     $te = Read-Json $tePath
     Check 'timeout terminalStatus=timeout' ([string]$te.terminalStatus -eq 'timeout') ("got=$([string]$te.terminalStatus)")
-    Check 'timeout evidence proves zero real-model' ([int]$te.telemetry.realModelStarts -eq 0)
+    $teTelemetryFile = @($te.files | Where-Object { [string]$_.name -ceq 'telemetry.jsonl' })
+    Check 'timeout evidence proves zero real-model and binds telemetry sink' `
+        ([int]$te.telemetry.realModelStarts -eq 0 -and
+        [bool]$te.telemetry.fileExists -and [int]$te.telemetry.totalEvents -gt 0 -and
+        $teTelemetryFile.Count -eq 1 -and
+        [int64]$teTelemetryFile[0].bytes -eq [int64]$te.telemetry.sinkBytes -and
+        [string]$teTelemetryFile[0].sha256 -ceq [string]$te.telemetry.sinkSha256)
     $childPid = [int]$te.supervisor.ProcessId
     $alive = $null
     try { $alive = Get-Process -Id $childPid -ErrorAction SilentlyContinue } catch { $alive = $null }
@@ -1016,6 +1117,20 @@ else {
     $k3 = Invoke-ChildDirect -Label 'noSwitch' -PlanFile $kPlan -Projection $genProjection -Env @{ REVIEWER_ACQUISITION_TOKEN = ('f' * 64) } -OmitTestOnlySwitch
     Check 'direct child without the test-only switch refuses (containment)' (($k3.Exit -ne 0) -and -not $k3.Captured) ("exit=$($k3.Exit)")
     Check 'no-switch cites the missing test-only switch' ($k3.Log -match 'AcquisitionTestOnlyOfflineAdapter') ''
+    # The production acquisition accepts ExpectedReviewerBaseCommit as a plan
+    # binding, but the forbidden telemetry CLI switch still requests adapter mode
+    # and must reproduce the original partial-adapter rejection.
+    $kTelemetryEnv = @{
+        REVIEWER_ACQUISITION_TOKEN       = ('f' * 64)
+        DEVPILOT_OFFLINE_TELEMETRY_MODE = 'production-test-only'
+        DEVPILOT_OFFLINE_TELEMETRY_PATH = (Join-Path $runRoot 'direct-forbidden-env.jsonl')
+    }
+    $kForbidden = Invoke-ChildDirect -Label 'forbiddenTelemetry' -PlanFile $kPlan `
+        -Projection $genProjection -Env $kTelemetryEnv -ForbiddenTelemetryOnly
+    if ($kForbidden.Exit -eq 0 -or $kForbidden.Captured -or
+        $kForbidden.Log -notmatch 'offline model adapter requires all of') {
+        throw "Forbidden production -OfflineTelemetryPath did not reproduce the partial-adapter rejection (exit=$($kForbidden.Exit))."
+    }
     # Adapter containment: a manifest pointing at a NON-pinned adapter script -> refuse.
     $wrongAdapterDir = Join-Path $runRoot 'wrong-adapter'
     New-Item -ItemType Directory -Force -Path $wrongAdapterDir | Out-Null

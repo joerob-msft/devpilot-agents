@@ -425,22 +425,6 @@ function Set-PathReadOnly {
     }
 }
 
-function Remove-SensitiveEnvironment {
-    # Scrub Azure DevOps / GitHub credentials from THIS process so the inherited
-    # child never sees them. Returns the removed pairs for restoration.
-    $removed = @{}
-    foreach ($name in $SensitiveEnvironmentVariables) {
-        $value = [Environment]::GetEnvironmentVariable($name)
-        if ($null -ne $value) { $removed[$name] = $value; [Environment]::SetEnvironmentVariable($name, $null) }
-    }
-    return $removed
-}
-
-function Restore-Environment {
-    param([Parameter(Mandatory)][hashtable]$Removed)
-    foreach ($name in $Removed.Keys) { [Environment]::SetEnvironmentVariable($name, $Removed[$name]) }
-}
-
 # ---------------------------------------------------------------------------
 # Telemetry evaluation (direct proof of no provider process or write)
 # ---------------------------------------------------------------------------
@@ -448,7 +432,12 @@ function Restore-Environment {
 function Get-TelemetrySummary {
     param([Parameter(Mandatory)][string]$TelemetryPath)
     $events = @()
-    if (Test-Path -LiteralPath $TelemetryPath) {
+    $fileExists = Test-Path -LiteralPath $TelemetryPath -PathType Leaf
+    $sinkBytes = 0L
+    $sinkSha256 = ''
+    if ($fileExists) {
+        $sinkBytes = [int64](Get-Item -LiteralPath $TelemetryPath).Length
+        $sinkSha256 = Get-FileSha256Hex -Path $TelemetryPath
         $events = @(Get-Content -LiteralPath $TelemetryPath -Encoding UTF8 |
                 Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json -Depth 32 })
     }
@@ -463,13 +452,17 @@ function Get-TelemetrySummary {
     $writeTools = @($events | Where-Object { [string]$_.event -in @('tool.write', 'provider.write', 'delivery.posted') })
     return [ordered]@{
         mode                      = if ($UseOfflineStubAdapter) { 'production-test-only' } else { 'production' }
+        fileExists                = $fileExists
+        sinkBytes                 = $sinkBytes
+        sinkSha256                = $sinkSha256
         totalEvents               = $events.Count
         modelSubprocessStarts     = $processStarts.Count
         realModelStarts           = $realModelStarts.Count
         providerLiveProcessStarts = $liveProcess.Count
         providerLiveWrites        = $liveWrite.Count
         writeToolInvocations      = $writeTools.Count
-        zeroWriteVerified         = ($liveProcess.Count -eq 0 -and $liveWrite.Count -eq 0 -and
+        zeroWriteVerified         = ($fileExists -and $events.Count -gt 0 -and
+            $liveProcess.Count -eq 0 -and $liveWrite.Count -eq 0 -and
             $writeTools.Count -eq 0)
     }
 }
@@ -687,14 +680,44 @@ function Invoke-SupervisedReviewer {
         [Parameter(Mandatory)][string]$StdOutPath,
         [Parameter(Mandatory)][string]$StdErrPath,
         [Parameter(Mandatory)][int]$TotalSeconds,
-        [Parameter(Mandatory)][int]$ActivitySeconds
+        [Parameter(Mandatory)][int]$ActivitySeconds,
+        [hashtable]$Environment = @{},
+        [string[]]$EnvironmentVariablesToRemove = @()
     )
     Import-Module $HarnessModule -Force -ErrorAction Stop
     $pwshPath = (Get-Command pwsh -ErrorAction Stop).Source
-    # DIRECT files: Start-Process wires the child's stdout/stderr straight to the
-    # files. No Tee, no in-process pump, no detach.
-    $proc = Start-Process -FilePath $pwshPath -ArgumentList $Arguments -NoNewWindow -PassThru `
-        -RedirectStandardOutput $StdOutPath -RedirectStandardError $StdErrPath
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $pwshPath
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    foreach ($argument in $Arguments) { [void]$psi.ArgumentList.Add($argument) }
+    foreach ($name in $EnvironmentVariablesToRemove) { [void]$psi.Environment.Remove($name) }
+    foreach ($name in $Environment.Keys) { $psi.Environment[[string]$name] = [string]$Environment[$name] }
+
+    # The environment belongs only to this ProcessStartInfo. In particular, the
+    # production-test-only telemetry switch never mutates the supervisor's global
+    # environment and cannot leak into a concurrent or later launch.
+    $proc = [System.Diagnostics.Process]::new()
+    $proc.StartInfo = $psi
+    $stdOutStream = [IO.FileStream]::new(
+        $StdOutPath, [IO.FileMode]::Create, [IO.FileAccess]::Write,
+        [IO.FileShare]::ReadWrite, 4096, [IO.FileOptions]::Asynchronous)
+    $stdErrStream = [IO.FileStream]::new(
+        $StdErrPath, [IO.FileMode]::Create, [IO.FileAccess]::Write,
+        [IO.FileShare]::ReadWrite, 4096, [IO.FileOptions]::Asynchronous)
+    try {
+        if (-not $proc.Start()) { throw "Failed to start the reviewer child process." }
+        $stdOutCopy = $proc.StandardOutput.BaseStream.CopyToAsync($stdOutStream)
+        $stdErrCopy = $proc.StandardError.BaseStream.CopyToAsync($stdErrStream)
+    }
+    catch {
+        $stdOutStream.Dispose()
+        $stdErrStream.Dispose()
+        $proc.Dispose()
+        throw
+    }
     $processId = [int]$proc.Id
     $startedUtc = [DateTime]::UtcNow
     $deadline = $startedUtc.AddSeconds($TotalSeconds)
@@ -723,16 +746,40 @@ function Invoke-SupervisedReviewer {
         try { Stop-ProcessTree -Process $proc } catch { }
         [void]$proc.WaitForExit(5000)
     }
+    $drainFailure = ''
+    try {
+        try {
+            $drained = [Threading.Tasks.Task]::WaitAll(
+                [Threading.Tasks.Task[]]@($stdOutCopy, $stdErrCopy), 5000)
+            if (-not $drained) { $drainFailure = 'outputDrainDeadline' }
+        }
+        catch [AggregateException] {
+            $drainFailure = 'outputDrainFailure'
+        }
+        if ($drainFailure -and -not $proc.HasExited) {
+            try { Stop-ProcessTree -Process $proc } catch { }
+            [void]$proc.WaitForExit(5000)
+        }
+    }
+    finally {
+        $stdOutStream.Dispose()
+        $stdErrStream.Dispose()
+    }
     $exitCode = -1
-    if (-not $timedOut) { try { $exitCode = [int]$proc.ExitCode } catch { $exitCode = -1 } }
-    return [ordered]@{
+    if (-not $timedOut -and -not $drainFailure) {
+        try { $exitCode = [int]$proc.ExitCode } catch { $exitCode = -1 }
+    }
+    $result = [ordered]@{
         ProcessId     = $processId
         ExitCode      = $exitCode
         TimedOut      = $timedOut
         TimeoutReason = $timeoutReason
+        FailureReason = $drainFailure
         StartedUtc    = $startedUtc.ToString('o')
         EndedUtc      = [DateTime]::UtcNow.ToString('o')
     }
+    $proc.Dispose()
+    return $result
 }
 
 # ---------------------------------------------------------------------------
@@ -1420,7 +1467,7 @@ $planSigKey = $null
 $supervisorResult = $null
 $terminalStatus = 'captureFailedTerminal'
 $exitCode = 1
-$removedEnv = @{}
+$childEnvironment = $null
 try {
     $leaseBytes = $Utf8.GetBytes((ConvertTo-Json -InputObject ([ordered]@{
                     planId = $planId; role = $Role; model = $Model; pid = $PID
@@ -1428,15 +1475,6 @@ try {
                 }) -Depth 8))
     $leaseStream.Write($leaseBytes, 0, $leaseBytes.Length)
     $leaseStream.Flush()
-
-    # -- Credential scrub for the inherited child ----------------------------
-    $removedEnv = Remove-SensitiveEnvironment
-
-    # -- Hand the real authorization token to the child through a scrubbed
-    #    environment variable (never argv, never a file, never a log). The inner
-    #    acquisition gate constant-time verifies its SHA-256 against the plan
-    #    binding before any launch. It is removed again in the finally below.
-    $env:REVIEWER_ACQUISITION_TOKEN = $AuthorizationToken
 
     # The child's primary -Model is the generalist first-pass model for the cycle.
     # For the generalist and verifier roles that IS the captured acquisition model
@@ -1456,7 +1494,6 @@ try {
         '-ReplayRoot', $replayRootFull, '-ReplaySnapshotName', $ReplaySnapshotName,
         '-ReplayManifestDigest', $ReplayManifestDigest,
         '-ExpectedReviewerBaseCommit', $ExpectedReviewerBaseCommit.ToLowerInvariant(),
-        '-OfflineTelemetryPath', $telemetryPath,
         '-AcquireTranscriptRole', $Role,
         '-AcquisitionPlanFile', $planPath,
         '-AcquisitionFixtureProjectionFile', $projectionFull,
@@ -1503,6 +1540,7 @@ try {
     if ($UseOfflineStubAdapter) {
         $reviewerArgs += @(
             '-EnableOfflineModelAdapter', '-OfflineModelAdapterManifest', $adapterFull,
+            '-OfflineTelemetryPath', $telemetryPath,
             '-AcquisitionTestOnlyOfflineAdapter'
         )
     }
@@ -1514,15 +1552,25 @@ try {
         $reviewerArgs += @('-AcquisitionDiscoveryMarkerFile', $discoveryMarkerPath)
     }
 
+    # The real authorization token and telemetry wiring are child-scoped PSI
+    # environment entries: never argv, never a file/log, and never global state in
+    # this supervisor. The telemetry writer is environment-driven in both real and
+    # deterministic adapter acquisitions; only adapter mode receives its required
+    # -OfflineTelemetryPath compatibility parameter above.
+    $childEnvironment = @{
+        REVIEWER_ACQUISITION_TOKEN       = $AuthorizationToken
+        DEVPILOT_OFFLINE_TELEMETRY_MODE = 'production-test-only'
+        DEVPILOT_OFFLINE_TELEMETRY_PATH = $telemetryPath
+    }
     $supervisorResult = Invoke-SupervisedReviewer -Arguments $reviewerArgs -StdOutPath $stdOutPath `
-        -StdErrPath $stdErrPath -TotalSeconds $TotalTimeoutSeconds -ActivitySeconds $ActivityTimeoutSeconds
+        -StdErrPath $stdErrPath -TotalSeconds $TotalTimeoutSeconds -ActivitySeconds $ActivityTimeoutSeconds `
+        -Environment $childEnvironment -EnvironmentVariablesToRemove $SensitiveEnvironmentVariables
 }
 finally {
-    # Scrub the authorization token from this process's environment and memory
-    # the instant the child has exited: it is never persisted or logged.
-    Remove-Item Env:REVIEWER_ACQUISITION_TOKEN -ErrorAction SilentlyContinue
+    # Drop the supervisor-held child environment and token references the instant
+    # the child exits. Neither was ever installed in the supervisor environment.
+    if ($null -ne $childEnvironment) { $childEnvironment.Clear() }
     $AuthorizationToken = $null
-    if ($removedEnv.Count -gt 0) { Restore-Environment -Removed $removedEnv }
     if ($leaseStream) { $leaseStream.Dispose() }
 }
 

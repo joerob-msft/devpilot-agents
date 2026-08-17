@@ -3045,9 +3045,12 @@ if ($ReplaySnapshotName -or $ReplayRoot -or $ReplayManifestDigest) {
     }
 }
 
+# ExpectedReviewerBaseCommit is also an authenticated acquisition-plan binding.
+# During acquisition it does not request the offline adapter by itself; the other
+# adapter-only parameters still fail closed when supplied partially.
 $offlineAdapterRequested = ([bool]$EnableOfflineModelAdapter -or
-    [bool]$OfflineModelAdapterManifest -or [bool]$ExpectedReviewerBaseCommit -or
-    [bool]$OfflineTelemetryPath)
+    [bool]$OfflineModelAdapterManifest -or [bool]$OfflineTelemetryPath -or
+    ([bool]$ExpectedReviewerBaseCommit -and -not [bool]$AcquireTranscriptRole))
 $script:ReviewerOfflineModelAdapterActive = $false
 $script:ReviewerOfflineModelAdapterManifestPath = ""
 $script:ReviewerOfflineModelAdapterScriptPath = ""
@@ -17965,6 +17968,14 @@ function Invoke-ReviewerRoleInputCaptureRun {
 # lease, and reads and writes nothing live - so it must not resolve `agency`,
 # which would make a no-model capture depend on the very executable it exists to
 # prove it never runs.
+if ($AcquireTranscriptRole) {
+    Add-AgentOfflineTelemetryEvent -Event 'acquisition.childReady' -Data @{
+        offlineAdapterArgumentPresent   = [bool]$EnableOfflineModelAdapter
+        offlineTelemetryArgumentPresent = $PSBoundParameters.ContainsKey('OfflineTelemetryPath')
+        telemetryMode                   = [string]$env:DEVPILOT_OFFLINE_TELEMETRY_MODE
+        telemetryPath                   = [string]$env:DEVPILOT_OFFLINE_TELEMETRY_PATH
+    }
+}
 if ($CaptureRoleInputRole) {
     # The status code must survive as a scalar: anything the run leaked to the
     # pipeline would turn a typed blocker's exit 3 into a silent exit 0.
