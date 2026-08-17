@@ -113,8 +113,14 @@ The supervisor:
 * requires the verifier role to be handed an **independently** captured
   candidate plus the sealed discovery marker it came from, and forbids the other
   roles from carrying either;
-* scrubs provider credentials out of the environment the child inherits, so a
-  live read or write is impossible rather than merely unused; and
+* scrubs provider credentials out of the environment the child inherits, so the
+  replay code path has no ambient credential to reach for. This is a structural
+  guard over *this* code path, not a capability sandbox: it does not remove
+  ambient machine credentials such as CLI token caches, credential managers or
+  managed identity, and it cannot stop arbitrary outbound HTTP from a PowerShell
+  child. What forecloses a live provider read or write is that the capture stops
+  at the model boundary and the provider is a sealed replay snapshot; the scrub
+  removes the easiest accident on top of that; and
 * requires a present, parseable, non-empty production-test-only telemetry sink
   with at least one `provider.replayServed` event **and** a terminal
   `capture.completed` record that covers the published bundle, then **fails the
@@ -143,17 +149,33 @@ append-only JSONL, so a partially written final line fails JSON parse and fails
 closed, but a **line-aligned prefix** parses cleanly and could hide a later
 `process.started` — which would silently weaken the zero-side-effect claim, the
 one guarantee this mode exists to make. The reviewer therefore emits a terminal
-`capture.completed` event carrying the published manifest's nonce as the last
-thing the run writes, and the supervisor requires that record to be present,
-unique and **last** in the sink. A truncated prefix loses it, a stale sink from a
-previous run carries the wrong nonce, and anything appended afterwards is
-rejected outright.
+`capture.completed` event as the last thing the run writes, bound to the SHA-256
+of the document it published, and the supervisor requires that record to be
+present, unique, **last**, and bound to the document it just verified. A
+truncated prefix loses it, a stale sink from a previous run carries a different
+digest, and anything appended afterwards is rejected outright.
+
+The binding is the published document's digest rather than the capture nonce so
+that it covers the **blocked** bundle too. A typed blocker is published,
+HMAC-sealed and reported with the same zero-side-effect claim as a success, but
+it stops before the model boundary and so has no nonce to bind to. Gating the
+completeness check on success would have left the prefix-truncation hole open on
+exactly the path most likely to have gone wrong, so it applies to *any* published
+bundle.
 
 This is a completeness and freshness check, not authentication: it establishes
 that the sink covers the whole run that produced *this* bundle. It cannot settle
 a child that deliberately forges its own instrumentation, and no
 self-instrumentation could. The bundle seal below is what makes the boundary
 claim unforgeable.
+
+Two of the side-effect counters are deliberately forward-looking. `process.started`,
+`provider.liveProcessStarted`, `provider.liveWrite` and `provider.replayServed`
+have live emitters in the harness; the write-tool names the supervisor also
+refuses (`tool.write`, `provider.write`, `delivery.posted`) currently have none,
+so that particular counter is a reserved guard that will bind the day such an
+emitter is added, not present-day evidence. It is listed here rather than left to
+imply coverage it does not yet have.
 
 The bundle supplies the complementary boundary evidence:
 
@@ -263,10 +285,15 @@ These are deliberate, and are recorded here rather than hidden.
   the real `Invoke-ReviewerCycle`; verifier derives its cluster through the
   production extraction path from an independent marker/candidate, clustering it
   under the **same** `maxCandidates` / `maxClusterSize` / `nearExactJaccard` /
-  `semanticJaccard` policy values production passes, and selecting the cluster
-  the request names rather than requiring the marker to collapse to exactly one
-  — production assigns verifier work per ready cluster, so an ordinary
-  multi-finding historical marker must remain capturable. Missing sealed sources
-  publish a typed `degraded`/`blocked` outcome.
+  `semanticJaccard` policy values production passes, and planning its assignment
+  set with the production planner (`Get-ReviewerVerificationAssignments`) rather
+  than a hand-rolled array — the planner is what decides assignment identity,
+  shape, changed-path anchoring, ordering, and the fact that every ready
+  candidate is assigned to both configured generalist models, all of which the
+  hashed input manifest depends on. The run is then scoped to the
+  `(clusterId, verifierModel)` group production would have launched, so a
+  multi-finding marker that legitimately derives several clusters is capturable
+  without leaking another cluster's evidence into the prompt. Missing sealed
+  sources publish a typed `degraded`/`blocked` outcome.
 * **Telemetry falsifies and bounds the run; it does not authenticate it.** See
   "Telemetry must be positive, complete and side-effect-free" above.

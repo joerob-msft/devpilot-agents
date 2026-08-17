@@ -15820,6 +15820,7 @@ function Invoke-ReviewerAcquisitionVerifierCapture {
         [Parameter(Mandatory)][string]$VerifierModel,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Candidates,
         [Parameter(Mandatory)]$Cluster,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Clusters,
         [Parameter(Mandatory)]$DiscoveryMarker
     )
     # The sealed replay-derived change set: the same pinned read the production
@@ -15843,15 +15844,71 @@ function Invoke-ReviewerAcquisitionVerifierCapture {
     # Never wrap in @(): the helper returns a protected array that nests.
     $changedFileAnchors = Get-ReviewerConventionSpecialistChangedFileIndex -ChangeEntries $changeEntries `
         -RightHandRangesByPath @{}
-    # Exact production evidence assembly for the assigned candidates. No sealed
-    # source report and no fact plan exist for an acquisition capture, so both are
-    # left at their production defaults rather than passed as an explicit null.
+    # Exact production evidence assembly, over exactly the production candidate
+    # set: the cross-verification pass hunks only candidates that live in a READY
+    # cluster, so an unassignable cluster's findings never reach the evidence
+    # pool. No sealed source report and no fact plan exist for an acquisition
+    # capture, so both are left at their production defaults rather than passed
+    # as an explicit null.
+    $readyCandidateIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($readyCluster in @($Clusters | Where-Object { [string]$_.status -ceq 'ready' })) {
+        foreach ($member in @($readyCluster.members)) {
+            [void]$readyCandidateIds.Add([string]$member.candidateId)
+        }
+    }
+    $verifiableCandidates = @($Candidates | Where-Object {
+            $readyCandidateIds.Contains([string]$_.candidateId)
+        })
     $evidenceHunks = @(Get-ReviewerVerificationSourceHunks -AgencyPath $AgencyPath `
-            -SourceCommit $SourceCommit -Candidates $Candidates -ChangedPaths $changedPaths `
+            -SourceCommit $SourceCommit -Candidates $verifiableCandidates -ChangedPaths $changedPaths `
             -ChangedFileAnchors $changedFileAnchors)
-    $candidateIds = @($Candidates | ForEach-Object { [string]$_.candidateId })
+    # The assignment set is PLANNED BY PRODUCTION, never fabricated here. The
+    # production planner is what decides the assignment identity ("va1:" over
+    # clusterId/candidateHash/model), the full assignment shape, the changed-path
+    # anchoring filter, the ordinal ordering, and the fact that EVERY ready
+    # candidate is assigned to BOTH configured generalist models. A hand-rolled
+    # assignment array reproduced none of that, so the input manifest it hashed -
+    # and therefore the binding the verifier echoes - was not the manifest
+    # production computes for the same marker.
+    $assignments = @(Get-ReviewerVerificationAssignments -Clusters $Clusters `
+            -GeneralistModels $ReviewPassModels -ConventionVerifierModel $EffectiveConventionVerifierModel `
+            -ChangedPaths $changedPaths)
+    $assignmentCoverage = Assert-ReviewerVerificationAssignmentCoverage -Clusters $Clusters `
+        -Assignments $assignments -RequiredVerifierModels $ReviewPassModels `
+        -MaxVerifierRuns ([int]$EffectiveCrossVerificationPolicy.maxVerifierRuns)
+    # Production groups assignments by (clusterId, verifierModel) and launches ONE
+    # run per group with only that group's candidates. Selecting the same group is
+    # what keeps the captured stimulus scoped: taking every derived candidate
+    # instead would hand this run evidence hunks belonging to OTHER clusters and
+    # empty the sibling-evidence set, neither of which production would do.
+    $groupKey = [string]$Cluster.clusterId + "`n" + $VerifierModel
+    $groupAssignments = @($assignments | Where-Object {
+            ([string]$_.clusterId + "`n" + [string]$_.verifierModel) -ceq $groupKey
+        })
+    if ($groupAssignments.Count -eq 0) {
+        throw ("The production assignment planner planned no run for cluster " +
+            "'$([string]$Cluster.clusterId)' and verifier model '$VerifierModel'; capture refuses a " +
+            'stimulus production would never have launched.')
+    }
+    $candidateIds = @($groupAssignments | ForEach-Object { [string]$_.candidateId })
     $runInput = Get-ReviewerVerificationRunInput -Cluster $Cluster -VerifierModel $VerifierModel `
         -CandidateIds $candidateIds -EvidenceHunks $evidenceHunks -ThreadFacts @() -FactPlan $null
+    # The per-candidate evidence options in the manifest are production's, built
+    # over every verifiable candidate against its OWN cluster's siblings - not the
+    # single run's assigned evidence, which covers only this group.
+    $candidateEvidenceOptions = @($verifiableCandidates | ForEach-Object {
+            $candidate = $_
+            $candidateCluster = @($Clusters | Where-Object {
+                    @($_.memberHashes) -ccontains [string]$candidate.candidateHash
+                } | Select-Object -First 1)
+            $siblingCandidates = if ($candidateCluster.Count -eq 1) { @($candidateCluster[0].members) } else { @() }
+            [pscustomobject][ordered]@{
+                candidateId = [string]$candidate.candidateId
+                options = @(Get-ReviewerVerificationEvidenceOptions -Candidate $candidate `
+                        -ThreadFacts @() -EvidenceHunks $evidenceHunks -SiblingCandidates $siblingCandidates `
+                        -ExistingThreadJaccard ([double]$EffectiveCrossVerificationPolicy.existingThreadJaccard))
+            }
+        })
     # The sealed identity the verifier must echo back, built exactly as the
     # production cross-verification pass builds it (same fields, same casing, same
     # running config/script/prompt digests), so Test-ReviewerVerificationBinding
@@ -15881,15 +15938,6 @@ function Invoke-ReviewerAcquisitionVerifierCapture {
         markerJson = $markerJson
         markerSha256 = $markerSha
     }
-    $assignments = @($Candidates | ForEach-Object {
-            [pscustomobject][ordered]@{
-                assignmentId = Get-ReviewerVerificationSha256 -Text (
-                    "$([string]$Cluster.clusterId)`n$VerifierModel`n$([string]$_.candidateId)")
-                clusterId = [string]$Cluster.clusterId
-                verifierModel = $VerifierModel
-                candidateId = [string]$_.candidateId
-            }
-        })
     $inputHashes = @(
         [pscustomobject][ordered]@{ kind = 'generalist-pass'; id = $rawDiscoveryPass.model; sha256 = $markerSha }
         [pscustomobject][ordered]@{ kind = 'configuration'; id = 'configuration'; sha256 = $ConfigSha256 }
@@ -15904,9 +15952,9 @@ function Invoke-ReviewerAcquisitionVerifierCapture {
         -ConventionPlan $null -FactPlan $null -ResolvedSources @() -EvidenceHunks $evidenceHunks `
         -ChangedEntries $changeEntries -ChangedPaths $changedPaths `
         -CrossCheckModels @($ReviewPassModels | Sort-Object) -ThreadFacts @() `
-        -CandidateEvidenceOptions @($runInput.assignedEvidence) -AssignmentCoverage $null `
+        -CandidateEvidenceOptions $candidateEvidenceOptions -AssignmentCoverage $assignmentCoverage `
         -Candidates $Candidates -TotalCandidateCount $Candidates.Count -PreVerificationWithheld @() `
-        -Clusters @($Cluster) -Assignments $assignments -AllInputArtifactHashes $inputHashes
+        -Clusters $Clusters -Assignments $assignments -AllInputArtifactHashes $inputHashes
     $inputManifestSha = Get-ReviewerVerificationObjectSha256 -Value $inputBody
     # One authorized invocation, terminal: the production verifier run has no
     # marker retry of its own, and the single-shot boundary refuses any second
@@ -16440,7 +16488,7 @@ function Invoke-ReviewerBlindedAcquisitionRun {
                 $verifierRunRecord = Invoke-ReviewerAcquisitionVerifierCapture -AgencyPath $AgencyPath `
                     -PrId ([int]$binding.prId) -SourceCommit ([string]$binding.sourceCommit) `
                     -VerifierModel $model -Candidates $derivedCandidates -Cluster $verifierCluster `
-                    -DiscoveryMarker $discoveryMarker
+                    -Clusters $derivedClusters -DiscoveryMarker $discoveryMarker
             }
             finally {
                 $script:ReviewerAcquisitionActive = $false
@@ -17251,10 +17299,14 @@ function Invoke-ReviewerRoleInputCaptureRun {
         # the whole marker collapse into a single cluster - which would refuse
         # ordinary multi-finding historical markers for no contract reason. The
         # named cluster must still be one this marker actually derived.
-        $verifierCluster = @($derivedClusters | Where-Object { [string]$_.clusterId -ceq [string]$candidate.clusterId })[0]
-        if ($null -eq $verifierCluster) {
+        # Materialize the match set BEFORE indexing: StrictMode makes [0] on an
+        # empty array throw an opaque index error, which would make the guard
+        # below dead code and hide the clusterId that was actually wrong.
+        $namedClusters = @($derivedClusters | Where-Object { [string]$_.clusterId -ceq [string]$candidate.clusterId })
+        if ($namedClusters.Count -eq 0) {
             throw "The supplied discovery candidate clusterId '$([string]$candidate.clusterId)' is not among the $($derivedClusterIds.Count) cluster(s) derived from the discovery marker."
         }
+        $verifierCluster = $namedClusters[0]
         if ([string]$verifierCluster.status -cne 'ready') {
             throw "The derived verification cluster is not assignable (status '$([string]$verifierCluster.status)'); capture refuses a run production would not have assigned."
         }
@@ -17317,7 +17369,7 @@ function Invoke-ReviewerRoleInputCaptureRun {
                 [void](Invoke-ReviewerAcquisitionVerifierCapture -AgencyPath $agencyPathSentinel `
                         -PrId ([int]$binding.prId) -SourceCommit ([string]$binding.sourceCommit) `
                         -VerifierModel $model -Candidates $derivedCandidates -Cluster $verifierCluster `
-                        -DiscoveryMarker $discoveryMarker)
+                        -Clusters $derivedClusters -DiscoveryMarker $discoveryMarker)
             }
         }
     }
@@ -17465,6 +17517,19 @@ function Invoke-ReviewerRoleInputCaptureRun {
             Set-ReviewerRoleInputTreeReadOnly -Root $staging
             Publish-ReviewerRoleInputBundle -Staging $staging -OutputRoot $outputRoot
             $published = $true
+            # A blocked capture publishes a sealed bundle and asserts zero side
+            # effects exactly as a successful one does, so it needs the same
+            # terminal record: without it a line-aligned truncation that dropped a
+            # later process.started would read as "no process started" on the one
+            # path that is MORE likely to have gone wrong. A blocked run stops
+            # before the model boundary and so has no nonce; the binding is the
+            # published blocker document's own digest.
+            Add-AgentOfflineTelemetryEvent -Event 'capture.completed' -Data @{
+                nonce          = [string]$captureNonce
+                role           = [string]$CaptureRoleInputRole
+                outcome        = 'blocked'
+                documentSha256 = (Get-ReviewerTextSha256 -Text $blockerText)
+            }
             Write-Host ("Role input capture BLOCKED: status=$status reason=$blockedReason " +
                 "role=$CaptureRoleInputRole model=$model -> $outputRoot") -ForegroundColor Yellow
             if ($blockedDetail) { Write-Host "  $blockedDetail" -ForegroundColor Yellow }
@@ -17602,6 +17667,18 @@ function Invoke-ReviewerRoleInputCaptureRun {
                 throw 'The legacy benchmark projection identity does not match the sealed replay snapshot.'
             }
             $legacyPackRoot = Split-Path (Split-Path $legacyPath -Parent) -Parent
+            # Canonical containment, not a string test. The textual rooted/".."
+            # refusal below cannot see a REPARSE POINT: a junction or symlink
+            # planted inside the pack resolves outside it, and Join-Path plus
+            # Copy-Item would happily dereference it and package an external file
+            # under a sealed-looking name. A capture-first flow onboards packs
+            # that arrive from elsewhere, so the pack is exactly the input that
+            # must not be trusted to stay inside itself.
+            $packRootFull = [IO.Path]::GetFullPath($legacyPackRoot).TrimEnd([IO.Path]::DirectorySeparatorChar)
+            $packRootItem = Get-Item -LiteralPath $packRootFull -Force
+            if (($packRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw 'The legacy benchmark pack root is a reparse point; its sealed resources cannot be bound to it.'
+            }
             foreach ($resource in @($legacy.resources)) {
                 $relative = ([string]$resource.sealedPath).Replace('/', [IO.Path]::DirectorySeparatorChar)
                 if ([IO.Path]::IsPathRooted($relative) -or $relative -match '(^|[\\/])\.\.([\\/]|$)') {
@@ -17610,6 +17687,22 @@ function Invoke-ReviewerRoleInputCaptureRun {
                 $source = Join-Path $legacyPackRoot $relative
                 if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
                     throw "The legacy sealed resource '$([string]$resource.sealedPath)' is missing from its pack."
+                }
+                # Walk from the resource up to the pack root: the file itself and
+                # every directory in between must be a real, contained entry.
+                $sourceFull = [IO.Path]::GetFullPath($source)
+                if (-not $sourceFull.StartsWith($packRootFull + [IO.Path]::DirectorySeparatorChar, [StringComparison]::Ordinal)) {
+                    throw "The legacy sealed resource '$([string]$resource.sealedPath)' resolves outside its pack."
+                }
+                $walk = Get-Item -LiteralPath $sourceFull -Force
+                while ($null -ne $walk -and
+                    ([IO.Path]::GetFullPath($walk.FullName).TrimEnd([IO.Path]::DirectorySeparatorChar) -cne $packRootFull)) {
+                    if (($walk.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                        throw ("The legacy sealed resource '$([string]$resource.sealedPath)' is reached through a " +
+                            "reparse point ('$($walk.Name)'); a pack may not link its sealed material in from outside.")
+                    }
+                    $parent = Split-Path $walk.FullName -Parent
+                    $walk = if ($parent) { Get-Item -LiteralPath $parent -Force } else { $null }
                 }
                 if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant() -cne ([string]$resource.sha256).ToLowerInvariant() -or
                     [long](Get-Item -LiteralPath $source).Length -ne [long]$resource.byteLength) {
@@ -17719,16 +17812,19 @@ function Invoke-ReviewerRoleInputCaptureRun {
         Set-ReviewerRoleInputTreeReadOnly -Root $staging
         Publish-ReviewerRoleInputBundle -Staging $staging -OutputRoot $outputRoot
         $published = $true
-        # The terminal telemetry record, emitted after publication and as the
-        # last thing this run writes to the sink. The supervisor requires it to
-        # be present, unique, LAST, and to carry this capture's nonce, which is
-        # what lets it treat the sink as the COMPLETE record of the run rather
-        # than a prefix of one. Without it, a line-aligned truncation that
-        # dropped a later process.started would read as "no process started".
-        # No-ops unless the production-test-only sink is wired.
+        # The terminal telemetry record, emitted after publication and as the last
+        # thing this run writes to the sink. The supervisor requires it to be
+        # present, unique, LAST, and to be bound to the document it actually
+        # verified, which is what lets it treat the sink as the COMPLETE record of
+        # THIS run rather than a prefix of one or a stale sink from another. The
+        # binding is the published document's own digest, so it covers the blocked
+        # bundle too - a blocked run reaches no boundary and therefore has no
+        # nonce to bind to. No-ops unless the production-test-only sink is wired.
         Add-AgentOfflineTelemetryEvent -Event 'capture.completed' -Data @{
-            nonce = [string]$captureNonce
-            role  = [string]$CaptureRoleInputRole
+            nonce          = [string]$captureNonce
+            role           = [string]$CaptureRoleInputRole
+            outcome        = 'captured'
+            documentSha256 = (Get-ReviewerTextSha256 -Text $manifestText)
         }
         Write-Host ("Role input capture READY: role=$CaptureRoleInputRole model=$model " +
             "promptBytes=$([int]$capture.promptBytes) boundaryHits=1 modelSubprocesses=0 -> $outputRoot") -ForegroundColor Green

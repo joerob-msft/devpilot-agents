@@ -703,16 +703,21 @@ try {
             -Request $missingIdentityRequest) `
         'identity/project|project'
 
+    # A substituted sealed identity is REFUSED outright, so there is no prompt to
+    # compare. Asserting "refused OR the prompt differs" read as a prompt-divergence
+    # check but could only ever exercise the refusal branch: the tool never reaches
+    # a prompt, so the disjunction degraded into "exits non-zero", which every
+    # neighbouring case already covers. Assert the refusal it actually proves, by
+    # its specific sealed-identity message rather than by exit code alone.
     $substituted = Join-Path $runRoot 'substituted-projection.json'
     $substitutedObject = Get-Content -LiteralPath $genBundle.Request -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -Depth 64
     $substitutedObject.identity.source = ('f' * 40)
     Write-Utf8 $substituted (ConvertTo-Json $substitutedObject -Depth 64)
-    $subOut = Join-Path $runRoot 'capture-substituted'
-    $sub = Invoke-Tool -Arguments (Get-CaptureArgs -Bundle $genBundle -Out $subOut -Request $substituted)
-    $subPrompt = ''
-    if ($sub.ExitCode -eq 0) { $subPrompt = [IO.File]::ReadAllText((Join-Path $subOut 'role-input-prompt.txt'), $Utf8) }
-    Check 'a substituted stimulus produces a different prompt, never the original' (
-        $sub.ExitCode -ne 0 -or ((TextSha $subPrompt) -cne (TextSha $promptText)))
+    Invoke-ExpectedFailure 'a substituted sealed source identity is refused before any stimulus is built' `
+        (Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-substituted') -Request $substituted) `
+        'capture request source does not match the sealed replay snapshot'
+    Check 'a refused substitution publishes no bundle at all' (
+        -not (Test-Path -LiteralPath (Join-Path $runRoot 'capture-substituted')))
 
     # This snapshot's sealed binding carries neither a merge base nor an
     # iteration, so a request that declares either is asserting identity nothing
@@ -801,9 +806,9 @@ try {
     $missingResourceOut = Join-Path $runRoot 'capture-missing-resource'
     $missingResourceResult = Invoke-Tool -Arguments (Get-CaptureArgs -Bundle $genBundle `
             -Out $missingResourceOut -Request $missingResourceRequest)
-    Check 'a missing request resource with vacuous telemetry is refused without publication' (
+    Check 'a missing request resource is refused without publication, on sealed-read grounds' (
         $missingResourceResult.ExitCode -eq 2 -and
-        $missingResourceResult.Text -match 'telemetry proof is (missing|empty)' -and
+        $missingResourceResult.Text -match 'telemetry proof is (missing|empty)|no provider\.replayServed' -and
         -not (Test-Path -LiteralPath $missingResourceOut)) `
         $missingResourceResult.Text
 
@@ -821,6 +826,35 @@ try {
         (Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-legacy-provenance') `
             -Extra @('-LegacyProjectionFile', $legacyWithProvenance)) `
         'must not contain role provenance'
+
+    # A pack arrives from elsewhere in a capture-first flow, so it must not be
+    # able to link its own "sealed" material in from outside itself. The textual
+    # rooted/".." refusal cannot see this: the path stays relative and the hash
+    # binding still matches, because the file really is the one it claims to be —
+    # it just lives outside the pack.
+    $genPackRoot = Join-Path $runRoot 'pack-generalist'
+    $outsidePack = Join-Path $runRoot 'outside-any-pack'
+    New-Item -ItemType Directory -Force -Path $outsidePack | Out-Null
+    $smuggledLeaf = "$($legacyObject.resources[0].sha256)-manifest.json"
+    Copy-Item -LiteralPath (Join-Path $genPackRoot ([string]$legacyObject.resources[0].sealedPath).Replace('/', '\')) `
+        -Destination (Join-Path $outsidePack $smuggledLeaf)
+    $junction = Join-Path $genPackRoot 'linked-resources'
+    $junctionMade = $true
+    try { New-Item -ItemType Junction -Path $junction -Target $outsidePack -ErrorAction Stop | Out-Null }
+    catch { $junctionMade = $false }
+    if ($junctionMade) {
+        $legacyJunction = Join-Path $genPackRoot 'projections\fixture.junction.blinded.json'
+        $junctionObject = Get-Content $genBundle.LegacyFile -Raw -Encoding UTF8 |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $junctionObject.resources[0].sealedPath = "linked-resources/$smuggledLeaf"
+        Write-Utf8 $legacyJunction (Canon $junctionObject)
+        Invoke-ExpectedFailure 'a legacy pack may not reach its sealed material through a junction' `
+            (Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-legacy-junction') `
+                -Extra @('-LegacyProjectionFile', $legacyJunction)) `
+            'reparse point'
+    } else {
+        Write-Host '  SKIP  junction containment (this filesystem/session cannot create junctions)'
+    }
 
     $degradedSpecialistBundle = New-CaptureBundle -Role specialist -Tag degraded
     $degradedSpecialistOut = Join-Path $runRoot 'capture-specialist-degraded'
@@ -842,6 +876,26 @@ try {
         $degradedVerify.ExitCode -eq 0 -and
         $degradedVerify.Text -match 'HMAC/SHA seal' -and
         $degradedVerify.Text -match 'exact two-file inventory') $degradedVerify.Text
+
+    # The prefix-truncation hole on the BLOCKED path. A typed blocker is published,
+    # HMAC-sealed and reported with the same zero-side-effect claim as a success,
+    # so it needs the same terminal-record coverage. While coverage was gated on
+    # child exit 0, a line-aligned truncation of a blocked run's sink parsed
+    # cleanly, satisfied the one-serve floor and published a sealed blocker that
+    # asserted "no child process started" even if a later process.started had been
+    # truncated away. Sabotage the blocked run, not the successful one.
+    $blockedSabotageTool = Join-Path $runRoot 'Invoke-ReviewerRoleInputCapture-blocked-prefix.ps1'
+    Write-Utf8 $blockedSabotageTool ($supervisorText.Replace(
+            $telemetryNeedle,
+            ("`$kept = @(Get-Content -LiteralPath `$telemetryPath | Where-Object { `$_ } | Select-Object -SkipLast 1)`r`n" +
+                "[IO.File]::WriteAllLines(`$telemetryPath, `$kept, `$Utf8)`r`n" + $telemetryNeedle)))
+    $blockedSabotageOut = Join-Path $runRoot 'capture-blocked-prefix'
+    $blockedSabotage = Invoke-Tool -ToolPath $blockedSabotageTool -Arguments (
+        Get-CaptureArgs -Bundle $degradedSpecialistBundle -Out $blockedSabotageOut -Model 'claude-opus-5')
+    Check 'a truncated telemetry sink is refused on the BLOCKED path too, publishing nothing' (
+        $blockedSabotage.ExitCode -eq 2 -and
+        $blockedSabotage.Text -match 'terminal capture\.completed' -and
+        -not (Test-Path -LiteralPath $blockedSabotageOut)) $blockedSabotage.Text
 
     $blockedUnbound = Join-Path $runRoot 'capture-blocked-unbound'
     Copy-Item -LiteralPath $degradedSpecialistOut -Destination $blockedUnbound -Recurse -Force

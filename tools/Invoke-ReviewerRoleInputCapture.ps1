@@ -414,9 +414,13 @@ function Get-TelemetryProof {
         This "at least one serve" floor rejects an empty or replay-stripped
         sink, but on its own it does NOT reject a sink truncated to a valid
         PREFIX of an honest one - the child appends as it runs, so one surviving
-        serve satisfies a fixed floor of 1. Test-TelemetryCoversCapture raises
-        the floor to an expectation derived from the capture's own published
-        inventory; read it for the completeness half of the argument.
+        serve satisfies a fixed floor of 1. A floor derived from the capture's
+        own sealed inventory would NOT fix that and was deliberately reverted as
+        unsound: the inventory is the lookup table the replay provider answers
+        FROM, not a ledger of reads served, so an honest capture reads a subset
+        of it. Test-TelemetryCoversCapture closes the gap a different way, by
+        requiring a terminal record bound to the published document; read it for
+        the completeness half of the argument.
     #>
     param([Parameter(Mandatory)][string]$TelemetryPath)
     if (-not (Test-Path -LiteralPath $TelemetryPath -PathType Leaf)) {
@@ -470,12 +474,19 @@ function Test-TelemetryCoversCapture {
         when a child process did start. A partially written final line fails the
         JSONL parse and so fails closed, but a LINE-ALIGNED prefix does not.
 
-        The child therefore emits one terminal capture.completed record carrying
-        the capture nonce, after its bundle is staged and as the last thing it
-        does. Requiring that record to be present, unique, LAST, and to carry
-        the nonce the published manifest names closes the window: any truncation
-        that could drop a side-effect record also drops the terminal record, and
-        a stale sink from an earlier run carries the wrong nonce.
+        The child therefore emits one terminal capture.completed record bound to
+        the document it published, after the bundle is staged and as the last
+        thing it does. Requiring that record to be present, unique, LAST, and to
+        carry the digest of the document THIS supervisor verified closes the
+        window: any truncation that could drop a side-effect record also drops
+        the terminal record, and a stale sink from an earlier run carries a
+        different digest.
+
+        The binding is the document digest rather than the capture nonce because
+        this must cover the BLOCKED bundle too. A blocked capture publishes a
+        sealed bundle and asserts zero side effects exactly as a successful one
+        does - on the path that is more likely to have gone wrong - but it stops
+        before the model boundary and so has no nonce to bind to.
 
         What this deliberately does NOT claim: the child writes its own sink, so
         this is completeness evidence against truncation, loss and staleness -
@@ -489,14 +500,15 @@ function Test-TelemetryCoversCapture {
     #>
     param(
         [Parameter(Mandatory)][string]$TelemetryPath,
-        [Parameter(Mandatory)][string]$ManifestPath
+        [Parameter(Mandatory)][string]$DocumentPath,
+        [Parameter(Mandatory)][ValidateSet('captured', 'blocked')][string]$Outcome
     )
-    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
-        return @('the published capture carries no manifest to check the telemetry against')
+    if (-not (Test-Path -LiteralPath $DocumentPath -PathType Leaf)) {
+        return @('the published capture carries no document to check the telemetry against')
     }
-    $manifest = $null
-    try { $manifest = [IO.File]::ReadAllText($ManifestPath, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json -Depth 64 }
-    catch { return @("the published capture manifest could not be parsed for telemetry coverage: $($_.Exception.Message)") }
+    $documentSha = ''
+    try { $documentSha = (Get-FileHash -LiteralPath $DocumentPath -Algorithm SHA256).Hash.ToLowerInvariant() }
+    catch { return @("the published capture document could not be digested for telemetry coverage: $($_.Exception.Message)") }
     $events = @()
     try {
         $events = @(Get-Content -LiteralPath $TelemetryPath -Encoding UTF8 |
@@ -516,11 +528,17 @@ function Test-TelemetryCoversCapture {
         $problems += 'the terminal capture.completed record is not the last telemetry event; the sink continued after the capture finished'
     }
     $terminal = $events[$terminalIndexes[-1]]
-    $terminalNonce = ''
-    if ($terminal.PSObject.Properties['data'] -and $terminal.data.PSObject.Properties['nonce']) { $terminalNonce = [string]$terminal.data.nonce }
-    $manifestNonce = if ($manifest.PSObject.Properties['nonce']) { [string]$manifest.nonce } else { '' }
-    if (-not $manifestNonce -or $terminalNonce -cne $manifestNonce) {
-        $problems += 'the terminal capture.completed record does not carry the published capture nonce; the sink is not this run''s'
+    $terminalSha = ''
+    $terminalOutcome = ''
+    if ($terminal.PSObject.Properties['data']) {
+        if ($terminal.data.PSObject.Properties['documentSha256']) { $terminalSha = ([string]$terminal.data.documentSha256).ToLowerInvariant() }
+        if ($terminal.data.PSObject.Properties['outcome']) { $terminalOutcome = [string]$terminal.data.outcome }
+    }
+    if (-not $terminalSha -or $terminalSha -cne $documentSha) {
+        $problems += 'the terminal capture.completed record is not bound to the published capture document; the sink is not this run''s'
+    }
+    if ($terminalOutcome -cne $Outcome) {
+        $problems += "the terminal capture.completed record reports outcome '$terminalOutcome', not the published '$Outcome'"
     }
     return @($problems)
 }
@@ -1050,10 +1068,14 @@ try {
             }
             else { @{} }
             $problems = @($problems) + @(Test-CaptureBundle -BundleRoot $publicationStaging -SealKey $captureSealKey -Expected $expected)
-            if ($captured) {
-                $problems = @($problems) + @(Test-TelemetryCoversCapture -TelemetryPath $telemetryPath `
-                        -ManifestPath (Join-Path $publicationStaging 'capture-manifest.json'))
-            }
+            # Coverage is required for ANY published, sealed bundle - not just a
+            # successful one. A typed blocker is published, signed and reported
+            # with the same zero-side-effect claim, so leaving it uncovered would
+            # have left the prefix-truncation hole open on the very path most
+            # likely to have gone wrong.
+            $problems = @($problems) + @(Test-TelemetryCoversCapture -TelemetryPath $telemetryPath `
+                    -DocumentPath (Join-Path $publicationStaging $signedFile) `
+                    -Outcome $(if ($captured) { 'captured' } else { 'blocked' }))
             if ($problems.Count -eq 0) {
                 if (Test-Path -LiteralPath $outputFull) {
                     $problems = @($problems) + @("the capture output root '$outputFull' appeared during publication; it was not overwritten")
