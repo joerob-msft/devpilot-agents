@@ -421,7 +421,8 @@ try {
         [int]$genResult.telemetry.childProcessStarts -eq 0 -and
         [int]$genResult.telemetry.modelOrAgencyStarts -eq 0 -and
         [int]$genResult.telemetry.providerLiveProcessStarts -eq 0 -and
-        [int]$genResult.telemetry.providerLiveWrites -eq 0)
+        [int]$genResult.telemetry.providerLiveWrites -eq 0 -and
+        [int]$genResult.telemetry.writeToolInvocations -eq 0)
 
     $supervisorText = [IO.File]::ReadAllText($CaptureTool, $Utf8)
     $telemetryNeedle = '$telemetryFailure = '''''
@@ -442,6 +443,24 @@ try {
                 Name = 'no-replay'
                 Prefix = "`$withoutReplay = @(Get-Content -LiteralPath `$telemetryPath | Where-Object { [string](`$_ | ConvertFrom-Json).event -cne 'provider.replayServed' })`r`n[IO.File]::WriteAllLines(`$telemetryPath, `$withoutReplay, `$Utf8)`r`n"
                 Pattern = 'no provider\.replayServed'
+            },
+            @{
+                # A LINE-ALIGNED prefix: still valid JSONL, still carries serves,
+                # so the "at least one serve" floor alone would admit it. It is
+                # the dangerous shape, because a prefix that stops short of a
+                # later process.started reads as "no child process started". The
+                # terminal capture.completed record is what refuses it.
+                Name = 'prefix-truncated'
+                Prefix = "`$kept = @(Get-Content -LiteralPath `$telemetryPath | Where-Object { `$_ } | Select-Object -First 2)`r`n[IO.File]::WriteAllLines(`$telemetryPath, `$kept, `$Utf8)`r`n"
+                Pattern = 'terminal capture\.completed'
+            },
+            @{
+                # A sink that continued past the terminal record: whatever wrote
+                # the extra events was not the capture, so the sink is no longer
+                # a complete account of it.
+                Name = 'appended-after-terminal'
+                Prefix = "[IO.File]::AppendAllText(`$telemetryPath, (ConvertTo-Json -Compress -InputObject ([ordered]@{ schemaVersion = 1; event = 'process.started'; processId = `$PID; recordedAtUtc = [DateTime]::UtcNow.ToString('o'); data = [ordered]@{ executable = 'notepad' } })) + [Environment]::NewLine, `$Utf8)`r`n"
+                Pattern = 'telemetry proves a side effect occurred|not the last telemetry event'
             })) {
         $sabotagedTool = Join-Path $runRoot "Invoke-ReviewerRoleInputCapture-$($telemetryCase.Name).ps1"
         Write-Utf8 $sabotagedTool ($supervisorText.Replace(
@@ -656,9 +675,19 @@ try {
     $wrongConfigObject.repository.id = '99999999-8888-7777-6666-555555555555'
     Write-Utf8 $wrongConfig (ConvertTo-Json $wrongConfigObject -Depth 64)
     Copy-Item $PromptFile (Join-Path (Split-Path $wrongConfig -Parent) 'review-cycle.prompt.md') -Force
-    $wrongCfg = Invoke-Tool -Arguments (Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-wrong-config') -ConfigOverride $wrongConfig)
+    # The request must name the MUTATED config's digest. Left pointing at the
+    # original, the run is refused by the configSha256 gate before it can reach
+    # the repository binding at all, and this check would silently degrade into
+    # a second copy of the config-hash test rather than covering the gate it is
+    # named for.
+    $wrongCfgRequest = Join-Path $runRoot 'request-wrong-config.json'
+    $wrongCfgRequestObject = Get-Content -LiteralPath $genBundle.Request -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -Depth 64
+    $wrongCfgRequestObject.snapshot.configSha256 = (Sha $wrongConfig)
+    Write-Utf8 $wrongCfgRequest (Canon $wrongCfgRequestObject)
+    $wrongCfg = Invoke-Tool -Arguments (Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-wrong-config') `
+            -Request $wrongCfgRequest -ConfigOverride $wrongConfig)
     Check 'a config bound to another repository is refused' (
-        $wrongCfg.ExitCode -ne 0 -and $wrongCfg.Text -match 'configSha256|bound to repository') $wrongCfg.Text
+        $wrongCfg.ExitCode -ne 0 -and $wrongCfg.Text -match 'bound to repository') $wrongCfg.Text
     Invoke-ExpectedFailure 'a missing reviewer config is refused before capture' `
         (Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-missing-config') `
             -ConfigOverride (Join-Path $runRoot 'missing-config\reviewer.config.json')) `
@@ -1012,6 +1041,18 @@ try {
     $splitManifest = Join-Path $splitOut 'capture-manifest.json'
     Check 'a specialist capture separates the captured model from the discovery generalist' (
         $split.ExitCode -eq 0 -and (Test-Path -LiteralPath $splitManifest)) $split.Text
+    # The captured model is observable in the manifest, but the DISCOVERY model
+    # is not - it is production's primary generalist, which a no-model capture
+    # never records. Without reading it back off the supervisor's own result the
+    # positive assertion below would hold just as well for a regression that
+    # passed the captured model as the discovery model, which is precisely the
+    # conflation this section exists to pin.
+    $splitResult = $null
+    try { $splitResult = (@($split.Raw -split "`n") | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -First 1) | ConvertFrom-Json -Depth 32 }
+    catch { $splitResult = $null }
+    Check 'the supervisor reports the discovery generalist distinctly from the captured model' (
+        $null -ne $splitResult -and [string]$splitResult.discoveryGeneralistModel -ceq 'claude-opus-5' -and
+        [string]$splitResult.model -ceq 'claude-sonnet-5') $split.Text
     if (Test-Path -LiteralPath $splitManifest) {
         $splitM = Get-Content $splitManifest -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 64
         Check 'the separated capture records the specialist model, not the discovery model' (

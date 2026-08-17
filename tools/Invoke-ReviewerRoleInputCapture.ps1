@@ -405,13 +405,18 @@ function Get-TelemetryProof {
         The exact strength of this claim, stated precisely: the harness emits
         provider.replayServed when it dispatches a read against the sealed
         corpus, not after the payload validates, so N serves prove N sealed
-        reads were ISSUED - they are not a per-resource consumption ledger. That
-        is sufficient for what this gate is for: distinguishing a run that
-        actually exercised the sealed corpus from an empty or truncated sink
-        that could otherwise pass off "nothing happened" as "nothing bad
-        happened". The zero-side-effect half of the proof is unaffected, because
-        it is asserted over process, live-provider and write events, each of
-        which must be ABSENT rather than present.
+        reads were ISSUED - they are not a per-resource consumption ledger. The
+        zero-side-effect half of the proof is unaffected, because it is asserted
+        over process, live-provider and write events, each of which must be
+        ABSENT rather than present, so any record ADDED to the sink can only
+        fail the check.
+
+        This "at least one serve" floor rejects an empty or replay-stripped
+        sink, but on its own it does NOT reject a sink truncated to a valid
+        PREFIX of an honest one - the child appends as it runs, so one surviving
+        serve satisfies a fixed floor of 1. Test-TelemetryCoversCapture raises
+        the floor to an expectation derived from the capture's own published
+        inventory; read it for the completeness half of the argument.
     #>
     param([Parameter(Mandatory)][string]$TelemetryPath)
     if (-not (Test-Path -LiteralPath $TelemetryPath -PathType Leaf)) {
@@ -451,6 +456,73 @@ function Get-TelemetryProof {
         providerLiveWrites        = [int]$liveWrite.Count
         writeToolInvocations      = [int]$writeTools.Count
     }
+}
+
+function Test-TelemetryCoversCapture {
+    <#
+        The completeness half of the telemetry argument.
+
+        A floor of "at least one sealed replay serve" rejects an empty, blank or
+        replay-stripped sink. It does NOT reject a sink truncated to a valid
+        PREFIX of an honest one, and that gap is not academic: the sink is also
+        the evidence for the ABSENCE of side effects, so a prefix that stops
+        short of a later process.started reads as "no child process started"
+        when a child process did start. A partially written final line fails the
+        JSONL parse and so fails closed, but a LINE-ALIGNED prefix does not.
+
+        The child therefore emits one terminal capture.completed record carrying
+        the capture nonce, after its bundle is staged and as the last thing it
+        does. Requiring that record to be present, unique, LAST, and to carry
+        the nonce the published manifest names closes the window: any truncation
+        that could drop a side-effect record also drops the terminal record, and
+        a stale sink from an earlier run carries the wrong nonce.
+
+        What this deliberately does NOT claim: the child writes its own sink, so
+        this is completeness evidence against truncation, loss and staleness -
+        not authentication against a child that forges its own instrumentation.
+        A capture is a supervised run of this repository's own reviewer, and no
+        self-instrumentation can settle the forgery case. The zero-side-effect
+        half needs no such trust either way: those events must be ABSENT, so
+        adding records can only fail the check.
+
+        Returns the list of problems, empty when the sink covers the capture.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$TelemetryPath,
+        [Parameter(Mandatory)][string]$ManifestPath
+    )
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+        return @('the published capture carries no manifest to check the telemetry against')
+    }
+    $manifest = $null
+    try { $manifest = [IO.File]::ReadAllText($ManifestPath, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json -Depth 64 }
+    catch { return @("the published capture manifest could not be parsed for telemetry coverage: $($_.Exception.Message)") }
+    $events = @()
+    try {
+        $events = @(Get-Content -LiteralPath $TelemetryPath -Encoding UTF8 |
+                Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json -Depth 32 -ErrorAction Stop })
+    }
+    catch { return @("telemetry could not be re-read for coverage: $($_.Exception.Message)") }
+    $terminalIndexes = @(0..([Math]::Max($events.Count - 1, 0)) |
+            Where-Object { $events.Count -gt 0 -and [string]$events[$_].event -ceq 'capture.completed' })
+    if ($terminalIndexes.Count -eq 0) {
+        return @('telemetry carries no terminal capture.completed record, so it cannot be shown to be the complete sink for this run')
+    }
+    $problems = @()
+    if ($terminalIndexes.Count -gt 1) {
+        $problems += "telemetry carries $($terminalIndexes.Count) terminal capture.completed records; exactly one run may write this sink"
+    }
+    if ($terminalIndexes[-1] -ne ($events.Count - 1)) {
+        $problems += 'the terminal capture.completed record is not the last telemetry event; the sink continued after the capture finished'
+    }
+    $terminal = $events[$terminalIndexes[-1]]
+    $terminalNonce = ''
+    if ($terminal.PSObject.Properties['data'] -and $terminal.data.PSObject.Properties['nonce']) { $terminalNonce = [string]$terminal.data.nonce }
+    $manifestNonce = if ($manifest.PSObject.Properties['nonce']) { [string]$manifest.nonce } else { '' }
+    if (-not $manifestNonce -or $terminalNonce -cne $manifestNonce) {
+        $problems += 'the terminal capture.completed record does not carry the published capture nonce; the sink is not this run''s'
+    }
+    return @($problems)
 }
 
 function Test-CaptureBundle {
@@ -716,9 +788,9 @@ foreach ($optional in @(
     if (-not $sealed) { continue }
     $requested = $captureRequest.identity.($optional[0])
     $sealedValue = $snapshot.Binding[$optional[1]]
-    $matches = if ($optional[0] -ceq 'iteration') { [int]$requested -eq [int]$sealedValue }
+    $matched = if ($optional[0] -ceq 'iteration') { [int]$requested -eq [int]$sealedValue }
     else { ([string]$requested).ToLowerInvariant() -ceq ([string]$sealedValue).ToLowerInvariant() }
-    if (-not $matches) {
+    if (-not $matched) {
         throw "The capture request $($optional[0]) does not match the sealed replay snapshot."
     }
 }
@@ -905,8 +977,16 @@ finally {
     # live and would keep running unsupervised - and an unsupervised child is
     # exactly what this tool exists to make impossible. Terminate it here before
     # anything else, so the guarantee does not depend on the happy path.
-    if ($null -ne $proc) {
-        try { if (-not $proc.HasExited) { Stop-ProcessTree -Process $proc; [void]$proc.WaitForExit(5000) } } catch { }
+    #
+    # The kill is NOT gated on HasExited. A root that exits after spawning a
+    # detached descendant is precisely the case a HasExited guard would skip,
+    # and Stop-ProcessTree is built for it: it snapshots descendants from
+    # Win32_Process ParentProcessId, which outlives the root, before falling
+    # back to Kill. It is gated on supervision not having completed instead, so
+    # the settled happy path does not sweep for descendants of a PID the OS is
+    # already free to reissue.
+    if ($null -ne $proc -and $null -eq $supervision) {
+        try { Stop-ProcessTree -Process $proc; [void]$proc.WaitForExit(5000) } catch { }
     }
     foreach ($name in $removedEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name, $removedEnvironment[$name]) }
     $env:DEVPILOT_OFFLINE_TELEMETRY_MODE = $savedTelemetryMode
@@ -970,6 +1050,10 @@ try {
             }
             else { @{} }
             $problems = @($problems) + @(Test-CaptureBundle -BundleRoot $publicationStaging -SealKey $captureSealKey -Expected $expected)
+            if ($captured) {
+                $problems = @($problems) + @(Test-TelemetryCoversCapture -TelemetryPath $telemetryPath `
+                        -ManifestPath (Join-Path $publicationStaging 'capture-manifest.json'))
+            }
             if ($problems.Count -eq 0) {
                 if (Test-Path -LiteralPath $outputFull) {
                     $problems = @($problems) + @("the capture output root '$outputFull' appeared during publication; it was not overwritten")
@@ -1000,6 +1084,11 @@ $result = [ordered]@{
     ready           = ($captured -and $problems.Count -eq 0)
     role            = $Role
     model           = $Model
+    # The discovery generalist is reported alongside the captured role's model
+    # so the separation between them is OBSERVABLE in capture mode, not only in
+    # the Preflight readiness record. A regression that re-conflated the two
+    # would otherwise leave no artifact any test could read.
+    discoveryGeneralistModel = $discoveryModel
     outputRoot      = $outputFull
     supervision     = $supervision
     telemetry       = $telemetry

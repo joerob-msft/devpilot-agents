@@ -16752,11 +16752,18 @@ function Assert-ReviewerRoleInputSafePath {
 
 function Get-ReviewerRoleInputSealedResourceInventory {
     <#
-        The exact inventory of sealed replay resources this process loaded: one
-        record per served read, bound by tool, request digest and payload digest.
-        Recorded so a capture proves WHICH sealed material built its prompt, and
-        so a later reader can detect a snapshot that no longer serves the same
-        reads. No payload bytes and no arguments are copied out.
+        The exact inventory of sealed replay resources this process LOADED: one
+        record per recorded read the snapshot holds, bound by tool, request
+        digest and payload digest. Recorded so a capture proves WHICH sealed
+        material was available to build its prompt, and so a later reader can
+        detect a snapshot that no longer holds the same reads.
+
+        This is the loaded corpus, not a consumption ledger: Snapshot.Served is
+        the lookup table Get-AgentReplayResponse answers FROM, so a resource
+        appears here whether or not this role's path happened to read it. Do not
+        treat its cardinality as a floor on provider.replayServed events - a
+        capture legitimately reads a subset. No payload bytes and no arguments
+        are copied out.
     #>
     $served = $script:ReviewerReplaySnapshot.Served
     $records = [System.Collections.Generic.List[object]]::new()
@@ -17214,26 +17221,40 @@ function Invoke-ReviewerRoleInputCaptureRun {
             throw "The discovery result marker identity does not match the canonical target; the discovery is for a different PR/commit."
         }
         # The EXACT production extraction and clustering, from the discovery
-        # model's own marker - never from truth, never fabricated.
+        # model's own marker - never from truth, never fabricated. Clustering is
+        # driven by the SAME effective cross-verification policy production
+        # uses; letting it fall back to the function defaults would silently
+        # derive a different cluster - and therefore a different verifier prompt
+        # - on any build whose policy tunes candidate caps or Jaccard bands.
         $discoveryOnlyPass = @{ Model = [string]$candidate.sourceModel; Marker = $discoveryMarker; Reason = '' }
         $derivedCandidates = @(ConvertTo-ReviewerVerificationCandidates -GeneralistPasses @($discoveryOnlyPass))
         if ($derivedCandidates.Count -eq 0) {
             throw "The discovery result marker yielded no candidates; a verifier capture requires at least one discovery finding."
         }
-        $derivedClusters = @(Get-ReviewerVerificationClusters -Candidates $derivedCandidates)
+        $derivedClusters = @(Get-ReviewerVerificationClusters -Candidates $derivedCandidates `
+            -MaxCandidates ([int]$EffectiveCrossVerificationPolicy.maxCandidates) `
+            -MaxClusterSize ([int]$EffectiveCrossVerificationPolicy.maxClusterSize) `
+            -NearExactJaccard ([double]$EffectiveCrossVerificationPolicy.nearExactJaccard) `
+            -SemanticJaccard ([double]$EffectiveCrossVerificationPolicy.semanticJaccard))
         $derivedPairs = @($derivedCandidates | ForEach-Object { "$([string]$_.candidateId)`n$([string]$_.candidateHash)" } | Sort-Object)
         $providedPairs = @(@($candidate.candidates) | ForEach-Object { "$([string]$_.candidateId)`n$([string]$_.candidateHash)" } | Sort-Object)
         if (($derivedPairs -join '|') -cne ($providedPairs -join '|')) {
             throw "The supplied discovery candidate set does not match the set derived from the discovery marker; the verifier candidate must be the exact projection of that discovery."
         }
         $derivedClusterIds = @(@($derivedClusters | ForEach-Object { [string]$_.clusterId }) | Sort-Object -Unique)
-        if ($derivedClusterIds.Count -ne 1) {
-            throw "The discovery result marker derived $($derivedClusterIds.Count) clusters; capture binds a single-cluster discovery candidate."
+        if ($derivedClusterIds.Count -eq 0) {
+            throw "The discovery result marker derived no clusters; a verifier capture requires an assignable cluster."
         }
-        if ([string]$candidate.clusterId -cne [string]$derivedClusterIds[0]) {
-            throw "The supplied discovery candidate clusterId does not match the cluster derived from the discovery marker."
+        # Production assigns verifier work PER ready cluster, so a real discovery
+        # marker carrying several unrelated findings legitimately derives several
+        # clusters. Capture binds the ONE the request named rather than demanding
+        # the whole marker collapse into a single cluster - which would refuse
+        # ordinary multi-finding historical markers for no contract reason. The
+        # named cluster must still be one this marker actually derived.
+        $verifierCluster = @($derivedClusters | Where-Object { [string]$_.clusterId -ceq [string]$candidate.clusterId })[0]
+        if ($null -eq $verifierCluster) {
+            throw "The supplied discovery candidate clusterId '$([string]$candidate.clusterId)' is not among the $($derivedClusterIds.Count) cluster(s) derived from the discovery marker."
         }
-        $verifierCluster = $derivedClusters[0]
         if ([string]$verifierCluster.status -cne 'ready') {
             throw "The derived verification cluster is not assignable (status '$([string]$verifierCluster.status)'); capture refuses a run production would not have assigned."
         }
@@ -17698,6 +17719,17 @@ function Invoke-ReviewerRoleInputCaptureRun {
         Set-ReviewerRoleInputTreeReadOnly -Root $staging
         Publish-ReviewerRoleInputBundle -Staging $staging -OutputRoot $outputRoot
         $published = $true
+        # The terminal telemetry record, emitted after publication and as the
+        # last thing this run writes to the sink. The supervisor requires it to
+        # be present, unique, LAST, and to carry this capture's nonce, which is
+        # what lets it treat the sink as the COMPLETE record of the run rather
+        # than a prefix of one. Without it, a line-aligned truncation that
+        # dropped a later process.started would read as "no process started".
+        # No-ops unless the production-test-only sink is wired.
+        Add-AgentOfflineTelemetryEvent -Event 'capture.completed' -Data @{
+            nonce = [string]$captureNonce
+            role  = [string]$CaptureRoleInputRole
+        }
         Write-Host ("Role input capture READY: role=$CaptureRoleInputRole model=$model " +
             "promptBytes=$([int]$capture.promptBytes) boundaryHits=1 modelSubprocesses=0 -> $outputRoot") -ForegroundColor Green
         # Written straight to the console stream, never to the pipeline: this

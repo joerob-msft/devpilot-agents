@@ -116,11 +116,12 @@ The supervisor:
 * scrubs provider credentials out of the environment the child inherits, so a
   live read or write is impossible rather than merely unused; and
 * requires a present, parseable, non-empty production-test-only telemetry sink
-  with at least one `provider.replayServed` event, then **fails the capture** if
-  it records any child process, model/agency start, provider process, live
-  provider write or write-tool invocation.
+  with at least one `provider.replayServed` event **and** a terminal
+  `capture.completed` record that covers the published bundle, then **fails the
+  capture** if it records any child process, model/agency start, provider
+  process, live provider write or write-tool invocation.
 
-### Telemetry must be positive and side-effect-free
+### Telemetry must be positive, complete and side-effect-free
 
 Missing or empty telemetry is not proof of zero activity and fails closed. A
 successful capture must positively show that production consumed its sealed
@@ -129,11 +130,30 @@ snapshot, while recording no model/agency/provider process or live/write event.
 State the positive half precisely: `provider.replayServed` is emitted when a read
 is dispatched against the sealed corpus rather than after the payload validates,
 so the serve count is a count of sealed reads **issued**, not a per-resource
-consumption ledger. That is what this gate needs — it separates a run that
-genuinely exercised the sealed corpus from an empty or truncated sink passing off
-"nothing happened" as "nothing bad happened". The zero-side-effect half does not
-depend on it at all: those events must be *absent*, so a truncated sink can only
-make the capture fail, never pass.
+consumption ledger. It is deliberately *not* compared against
+`snapshot.resources`: that inventory is the sealed lookup table the replay
+provider answers *from*, so a legitimate capture reads only a subset of it and
+any inventory-derived floor would be unsound. The serve floor's job is narrower —
+it separates a run that genuinely exercised the sealed corpus from an empty,
+blank or replay-stripped sink passing off "nothing happened" as "nothing bad
+happened".
+
+The serve floor alone does not make the sink *complete*. Telemetry is
+append-only JSONL, so a partially written final line fails JSON parse and fails
+closed, but a **line-aligned prefix** parses cleanly and could hide a later
+`process.started` — which would silently weaken the zero-side-effect claim, the
+one guarantee this mode exists to make. The reviewer therefore emits a terminal
+`capture.completed` event carrying the published manifest's nonce as the last
+thing the run writes, and the supervisor requires that record to be present,
+unique and **last** in the sink. A truncated prefix loses it, a stale sink from a
+previous run carries the wrong nonce, and anything appended afterwards is
+rejected outright.
+
+This is a completeness and freshness check, not authentication: it establishes
+that the sink covers the whole run that produced *this* bundle. It cannot settle
+a child that deliberately forges its own instrumentation, and no
+self-instrumentation could. The bundle seal below is what makes the boundary
+claim unforgeable.
 
 The bundle supplies the complementary boundary evidence:
 
@@ -241,7 +261,12 @@ These are deliberate, and are recorded here rather than hidden.
   configuration were combined with which sealed material.
 * **No role accepts a role projection as input.** Generalist and specialist run
   the real `Invoke-ReviewerCycle`; verifier derives its cluster through the
-  production extraction path from an independent marker/candidate. Missing
-  sealed sources publish a typed `degraded`/`blocked` outcome.
-* **Telemetry cannot positively corroborate a no-model run.** See
-  "Telemetry falsifies; the seal proves" above.
+  production extraction path from an independent marker/candidate, clustering it
+  under the **same** `maxCandidates` / `maxClusterSize` / `nearExactJaccard` /
+  `semanticJaccard` policy values production passes, and selecting the cluster
+  the request names rather than requiring the marker to collapse to exactly one
+  — production assigns verifier work per ready cluster, so an ordinary
+  multi-finding historical marker must remain capturable. Missing sealed sources
+  publish a typed `degraded`/`blocked` outcome.
+* **Telemetry falsifies and bounds the run; it does not authenticate it.** See
+  "Telemetry must be positive, complete and side-effect-free" above.
