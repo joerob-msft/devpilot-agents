@@ -306,9 +306,13 @@ function Copy-MutatedCandidate {
     return $path
 }
 
-function Copy-ResealedPackageWithStaleScript {
-    param([Parameter(Mandatory)][string]$SourcePackage)
-    $root = New-OutDir 'specialist_stale_script'
+function Copy-ResealedPackageVariant {
+    param(
+        [Parameter(Mandatory)][string]$SourcePackage,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][scriptblock]$Mutation
+    )
+    $root = New-OutDir $Name
     Remove-Tree $root
     $package = Join-Path $root 'package'
     Copy-Item -LiteralPath $SourcePackage -Destination $package -Recurse -Force
@@ -318,15 +322,14 @@ function Copy-ResealedPackageWithStaleScript {
     $corePath = Join-Path $package 'capture-core.json'
     $core = Get-Content -LiteralPath $corePath -Raw -Encoding UTF8 |
         ConvertFrom-Json -AsHashtable -Depth 64
-    $core.digests.scriptSha256 = ('0' * 64)
+    $manifestPath = Join-Path $package 'transcript-package.json'
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 |
+        ConvertFrom-Json -AsHashtable -Depth 64
+    & $Mutation $core $manifest
     $coreText = ConvertTo-ReviewerAcquisitionPackageCanonicalText -JsonText (
         $core | ConvertTo-Json -Depth 64 -Compress)
     [IO.File]::WriteAllText($corePath, $coreText, [Text.UTF8Encoding]::new($false))
 
-    $manifestPath = Join-Path $package 'transcript-package.json'
-    $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 |
-        ConvertFrom-Json -AsHashtable -Depth 64
-    $manifest.digests.scriptSha256 = ('0' * 64)
     $coreEntry = @($manifest.files | Where-Object { [string]$_.name -ceq 'capture-core.json' })[0]
     $coreEntry.bytes = [IO.File]::ReadAllBytes($corePath).Length
     $coreEntry.sha256 = (Get-FileHash -LiteralPath $corePath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -355,6 +358,25 @@ function Copy-ResealedPackageWithStaleScript {
     Get-ChildItem -LiteralPath $package -File -Recurse -Force |
         ForEach-Object { $_.Attributes = $_.Attributes -bor [IO.FileAttributes]::ReadOnly }
     return $package
+}
+
+function Copy-ResealedPackageWithStaleScript {
+    param([Parameter(Mandatory)][string]$SourcePackage)
+    return Copy-ResealedPackageVariant -SourcePackage $SourcePackage `
+        -Name 'specialist_stale_script' -Mutation {
+            param($core, $manifest)
+            $core.digests.scriptSha256 = ('0' * 64)
+            $manifest.digests.scriptSha256 = ('0' * 64)
+        }
+}
+
+function Copy-ResealedPackageWithoutSourceProjection {
+    param([Parameter(Mandatory)][string]$SourcePackage)
+    return Copy-ResealedPackageVariant -SourcePackage $SourcePackage `
+        -Name 'specialist_legacy_package' -Mutation {
+            param($core, $manifest)
+            [void]$core.Remove('sourceProjection')
+        }
 }
 
 # Build the full specialist acquisition arg set against the convention snapshot
@@ -1415,10 +1437,27 @@ Assert-ExactAttempt -Attempt (@($spWrong.attempts)[-1]) -Label 'specialist wrong
 $specialistPackage = Join-Path (New-OutDir 'sp_success') 'package'
 $specialistCandidate = Join-Path $runRoot 'specialist-discovery-candidate.json'
 & pwsh -NoProfile -File $extractTool -DiscoveryPackageRoot $specialistPackage `
-    -SealKeyPath $sealKey -OutputFile $specialistCandidate *> (Join-Path $logDir 'specialist-extract.log')
+    -SealKeyPath $sealKey -ExpectedSourceScriptSha256 $currentReviewerSha `
+    -OutputFile $specialistCandidate *> (Join-Path $logDir 'specialist-extract.log')
 $specialistExtractExit = $LASTEXITCODE
 Check 'specialist package extracts an authenticated candidate' (
     $specialistExtractExit -eq 0 -and (Test-Path -LiteralPath $specialistCandidate)) "exit=$specialistExtractExit"
+$wrongPinCandidate = Join-Path $runRoot 'specialist-wrong-script-pin-candidate.json'
+& pwsh -NoProfile -File $extractTool -DiscoveryPackageRoot $specialistPackage `
+    -SealKeyPath $sealKey -ExpectedSourceScriptSha256 ('0' * 64) `
+    -OutputFile $wrongPinCandidate *> (Join-Path $logDir 'specialist-extract-wrong-script-pin.log')
+Check 'specialist candidate extraction rejects a mismatched explicit source-script pin' (
+    $LASTEXITCODE -ne 0 -and -not (Test-Path -LiteralPath $wrongPinCandidate))
+
+$legacySpecialistPackage = Copy-ResealedPackageWithoutSourceProjection -SourcePackage $specialistPackage
+$legacySpecialistCandidate = Join-Path $runRoot 'specialist-legacy-discovery-candidate.json'
+& pwsh -NoProfile -File $extractTool -DiscoveryPackageRoot $legacySpecialistPackage `
+    -SealKeyPath $sealKey -ExpectedSourceScriptSha256 $currentReviewerSha `
+    -OutputFile $legacySpecialistCandidate *> (Join-Path $logDir 'specialist-legacy-extract.log')
+$legacySpecialistExtractExit = $LASTEXITCODE
+Check 'authenticated pre-sourceProjection specialist package derives a convention candidate' (
+    $legacySpecialistExtractExit -eq 0 -and (Test-Path -LiteralPath $legacySpecialistCandidate)) `
+    "exit=$legacySpecialistExtractExit"
 if (Test-Path -LiteralPath $specialistCandidate) {
     $sc = Read-Json $specialistCandidate
     Check 'specialist candidate preserves specialist/convention origin' (
@@ -1431,13 +1470,15 @@ if (Test-Path -LiteralPath $specialistCandidate) {
             }).Count -eq 0)
 
     foreach ($target in @(
-            @{ Tag = 'opus'; Model = 'claude-opus-5'; RoleName = 'reciprocal-opus-verifier' },
-            @{ Tag = 'gpt'; Model = 'gpt-5.6-sol'; RoleName = 'reciprocal-gpt-verifier' })) {
+            @{ Tag = 'opus'; Model = 'claude-opus-5'; RoleName = 'reciprocal-opus-verifier';
+                Package = $specialistPackage; Candidate = $specialistCandidate },
+            @{ Tag = 'gpt'; Model = 'gpt-5.6-sol'; RoleName = 'reciprocal-gpt-verifier';
+                Package = $legacySpecialistPackage; Candidate = $legacySpecialistCandidate })) {
         $out = New-OutDir "specialist_verifier_$($target.Tag)"
         $manifest = New-VariantManifest -Tag "specialistVerifier$($target.Tag)" `
             -Behavior 'success' -RoleName $target.RoleName
         $run = Invoke-Tool -ToolArgs (Get-VerifierArgs -Out $out -Manifest $manifest `
-                -DiscoveryPackage $specialistPackage -Candidate $specialistCandidate `
+                -DiscoveryPackage $target.Package -Candidate $target.Candidate `
                 -Model $target.Model -UseConventionSnapshot) -LogName "specialist-verifier-$($target.Tag).log"
         Check "specialist candidate -> $($target.Tag) verifier succeeds" ($run.Exit -eq 0) "exit=$($run.Exit)"
         if (Test-Path -LiteralPath (Join-Path $out 'package\transcript-package.json')) {

@@ -117,6 +117,10 @@ param(
     [string]$DiscoveryPackageRoot,
     [Parameter(ParameterSetName = 'Capture')]
     [Parameter(ParameterSetName = 'Preflight')]
+    [ValidatePattern('^[0-9a-fA-F]{64}$')]
+    [string]$DiscoverySourceScriptSha256,
+    [Parameter(ParameterSetName = 'Capture')]
+    [Parameter(ParameterSetName = 'Preflight')]
     [string]$DiscoverySealKeyPath,
 
     # The surrounding configured model set the production orchestration needs in
@@ -983,9 +987,13 @@ if ($Role -ceq 'verifier') {
         Join-Path (Split-Path $ReviewerScript -Parent) 'convention-review.prompt.md'
     }
     else { [string]$configLoad.PromptFilePath }
+    $expectedDiscoveryScriptSha256 = if ($PSBoundParameters.ContainsKey('DiscoverySourceScriptSha256')) {
+        $DiscoverySourceScriptSha256
+    }
+    else { Get-FileSha256Hex -Path $ReviewerScript }
     foreach ($digestCheck in @(
             @('config', [string]$sourceCore.digests.configSha256, (Get-FileSha256Hex -Path $configFull)),
-            @('script', [string]$sourceCore.digests.scriptSha256, (Get-FileSha256Hex -Path $ReviewerScript)),
+            @('script', [string]$sourceCore.digests.scriptSha256, $expectedDiscoveryScriptSha256),
             @('prompt', [string]$sourceCore.digests.promptSha256, (Get-FileSha256Hex -Path $sourcePromptPath)))) {
         if (([string]$digestCheck[1]).ToLowerInvariant() -cne
             ([string]$digestCheck[2]).ToLowerInvariant()) {
@@ -1020,28 +1028,8 @@ if ($Role -ceq 'verifier') {
             throw "The specialist source marker failed the exact production schema: $([string]$sourceOutcome.Status)."
         }
         $packageMarker = $sourceOutcome.Value
-        if (-not $sourceCore.PSObject.Properties['sourceProjection'] -or
-            [string]$sourceCore.sourceProjection.sourceRole -cne 'specialist' -or
-            -not $sourceCore.sourceProjection.PSObject.Properties['binding'] -or
-            -not $sourceCore.sourceProjection.PSObject.Properties['digests']) {
-            throw 'The specialist source package is missing its production-resolved projection.'
-        }
-        $specialistBinding = $sourceCore.sourceProjection.binding
-        $specialistDigests = $sourceCore.sourceProjection.digests
-        if (-not (Test-ReviewerConventionSpecialistBinding -Marker $packageMarker `
-                -PrId ([int]$specialistBinding.prId) `
-                -RepositoryId ([string]$specialistBinding.repositoryId) `
-                -SourceCommit ([string]$specialistBinding.sourceCommit) `
-                -TargetCommit ([string]$specialistBinding.targetCommit) `
-                -ChangeSetDigest ([string]$specialistBinding.changeSetDigest) `
-                -ConventionPlanSha256 ([string]$specialistDigests.conventionPlanSha256) `
-                -FactPlanSha256 ([string]$specialistDigests.factPlanSha256) `
-                -ConfigSha256 ([string]$specialistDigests.configSha256) `
-                -ScriptSha256 ([string]$specialistDigests.scriptSha256) `
-                -PromptSha256 ([string]$specialistDigests.promptSha256))) {
-            throw 'The specialist source marker does not match its authenticated package identities.'
-        }
-        $sourceSpecialistCandidates = @($sourceCore.sourceProjection.candidates)
+        $sourceSpecialistCandidates = @(
+            Get-ReviewerAuthenticatedSpecialistCandidates -Core $sourceCore -Marker $packageMarker)
     }
     $sourceDerived = @(ConvertTo-ReviewerIndependentDiscoveryCandidates `
             -SourceRole $sourceRole -SourceModel $sourceModel -Marker $packageMarker `

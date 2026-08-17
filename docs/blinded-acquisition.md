@@ -286,6 +286,19 @@ without a valid sealed discovery package, or with a candidate that does not
 re-derive from the declared source, is refused — the verifier's target-generalist
 pass is rebuilt from that sealed evidence, never from truth.
 
+A dependent verifier may consume a successful specialist package emitted by a
+trusted earlier reviewer build without rerunning that specialist. In that case,
+pin the package's recorded build with `-ExpectedSourceScriptSha256` during
+candidate extraction and `-DiscoverySourceScriptSha256` during capture and
+acquisition. Omitting the pin preserves the default same-build requirement.
+The source package's config and role prompt must still match the current build;
+the exception is deliberately limited to the explicitly pinned reviewer script.
+Pre-`sourceProjection` specialist packages are accepted only through their
+HMAC-authenticated successful capture core and exact production specialist
+marker schema/bindings. When the verifier replay and discovery replay are sibling
+benchmark materializations, `-DiscoveryReplayRoot` supplies the authenticated
+source replay so both lineages must resolve to the same sealed source manifest.
+
 ## Role execution scope
 
 All three roles execute the **full exact production path** end-to-end and seal a
@@ -355,6 +368,7 @@ extraction/clustering functions; it never reads truth):
 ./tools/Get-ReviewerDiscoveryCandidate.ps1 `
     -DiscoveryPackageRoot <path-to-sealed-discovery-package> `
     -SealKeyPath <path-to-acquisition-seal-key> `
+    -ExpectedSourceScriptSha256 <trusted-source-reviewer-script-sha256> `
     -OutputFile <path-to-discovery-candidate.json>
 ```
 
@@ -369,6 +383,8 @@ and requires exact equality before launch:
     -FixtureProjectionFile <path-to-blinded-verifier-projection.json> `
     -CandidateInputFile <path-to-discovery-candidate.json> `
     -DiscoveryPackageRoot <path-to-sealed-discovery-package> `
+    -DiscoverySourceScriptSha256 <trusted-source-reviewer-script-sha256> `
+    -DiscoveryReplayRoot <path-to-authenticated-discovery-replay-root> `
     -Model <verifier-model-id> `
     -SecondGeneralistModel <second-generalist-model-id> `
     -ConventionSpecialistModel <convention-specialist-model-id> `

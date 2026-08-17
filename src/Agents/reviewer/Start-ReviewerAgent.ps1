@@ -15903,7 +15903,11 @@ function Invoke-ReviewerAcquisitionVerifierCapture {
     }
     $pinned = $sessionData.Pinned
     $changeEntries = @($pinned.Entries)
-    $changedPaths = @($sessionData.ChangedPaths)
+    # Get-ReviewerChangedPaths intentionally protects its array from pipeline
+    # unrolling. Flatten that one protected layer here; otherwise a multi-file PR
+    # becomes the literal path "System.Object[]" and production assignment planning
+    # incorrectly filters every changed-file candidate.
+    $changedPaths = @($sessionData.ChangedPaths | ForEach-Object { $_ })
     # Never wrap in @(): the helper returns a protected array that nests.
     $changedFileAnchors = Get-ReviewerConventionSpecialistChangedFileIndex -ChangeEntries $changeEntries `
         -RightHandRangesByPath @{}
@@ -16415,14 +16419,6 @@ function Invoke-ReviewerBlindedAcquisitionRun {
         try { $discoveryMarker = $discoveryAnswer | ConvertFrom-Json -Depth 64 }
         catch { throw "The sealed discovery result marker is not valid JSON; the verifier cannot rebuild its discovery pass." }
         if ($discoverySourceRole -ceq 'specialist') {
-            if (-not $discoveryCore.PSObject.Properties['sourceProjection'] -or
-                [string]$discoveryCore.sourceProjection.sourceRole -cne 'specialist' -or
-                -not $discoveryCore.sourceProjection.PSObject.Properties['binding'] -or
-                -not $discoveryCore.sourceProjection.PSObject.Properties['digests']) {
-                throw "The sealed specialist capture-core is missing its production-resolved source projection."
-            }
-            $specialistBinding = $discoveryCore.sourceProjection.binding
-            $specialistDigests = $discoveryCore.sourceProjection.digests
             $specialistSchema = Get-ReviewerConventionSpecialistMarkerSchema `
                 -ExpectedProject ([string]$planTarget.project) -ExpectedNonce ([string]$discoveryCore.nonce)
             $specialistOutcome = ConvertFrom-AgentResultMarkerOutcome `
@@ -16432,17 +16428,6 @@ function Invoke-ReviewerBlindedAcquisitionRun {
                 throw "The sealed specialist result marker failed the exact production schema: $([string]$specialistOutcome.Status)."
             }
             $discoveryMarker = $specialistOutcome.Value
-            if (-not (Test-ReviewerConventionSpecialistBinding -Marker $discoveryMarker `
-                    -PrId ([int]$specialistBinding.prId) -RepositoryId ([string]$specialistBinding.repositoryId) `
-                    -SourceCommit ([string]$specialistBinding.sourceCommit) -TargetCommit ([string]$specialistBinding.targetCommit) `
-                    -ChangeSetDigest ([string]$specialistBinding.changeSetDigest) `
-                    -ConventionPlanSha256 ([string]$specialistDigests.conventionPlanSha256) `
-                    -FactPlanSha256 ([string]$specialistDigests.factPlanSha256) `
-                    -ConfigSha256 ([string]$specialistDigests.configSha256) `
-                    -ScriptSha256 ([string]$specialistDigests.scriptSha256) `
-                    -PromptSha256 ([string]$specialistDigests.promptSha256))) {
-                throw "The sealed specialist result marker does not match its exact package identities and production digests."
-            }
         }
 
         # -- Blocker 1: the signed plan binds the result-marker prefix + FULL
@@ -16499,11 +16484,8 @@ function Invoke-ReviewerBlindedAcquisitionRun {
         #    set (candidateId + candidateHash) and the same clusterId.
         $specialistCandidates = @()
         if ($discoverySourceRole -ceq 'specialist') {
-            if (-not $discoveryCore.PSObject.Properties['sourceProjection'] -or
-                [string]$discoveryCore.sourceProjection.sourceRole -cne 'specialist') {
-                throw "The sealed specialist capture-core is missing its production-resolved source projection."
-            }
-            $specialistCandidates = @($discoveryCore.sourceProjection.candidates)
+            $specialistCandidates = @(
+                Get-ReviewerAuthenticatedSpecialistCandidates -Core $discoveryCore -Marker $discoveryMarker)
         }
         $derivedCandidates = @(ConvertTo-ReviewerIndependentDiscoveryCandidates `
                 -SourceRole $discoverySourceRole -SourceModel $discoverySourceModel `
@@ -17487,13 +17469,6 @@ function Invoke-ReviewerRoleInputCaptureRun {
                 $model -ceq [string]$candidate.sourceModel) {
                 throw "A convention specialist cannot be the verifier; the capture target must be one configured generalist."
             }
-            if (-not $discoveryCore.PSObject.Properties['sourceProjection'] -or
-                [string]$discoveryCore.sourceProjection.sourceRole -cne 'specialist' -or
-                -not $discoveryCore.sourceProjection.PSObject.Properties['binding'] -or
-                -not $discoveryCore.sourceProjection.PSObject.Properties['digests']) {
-                throw "The authenticated specialist package is missing its production-resolved source projection."
-            }
-            $specialistCandidates = @($discoveryCore.sourceProjection.candidates)
         }
         $discoveryMarkerText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $AcquisitionDiscoveryMarkerFile).Path, $script:ReviewerUtf8)
         $discoveryMarkerSha256 = Get-ReviewerTextSha256 -Text $discoveryMarkerText
@@ -17515,8 +17490,6 @@ function Invoke-ReviewerRoleInputCaptureRun {
         try { $discoveryMarker = $discoveryAnswer | ConvertFrom-Json -Depth 64 }
         catch { throw "The discovery result marker is not valid JSON; the verifier cannot rebuild its discovery pass." }
         if ($discoverySourceRole -ceq 'specialist') {
-            $specialistBinding = $discoveryCore.sourceProjection.binding
-            $specialistDigests = $discoveryCore.sourceProjection.digests
             $specialistSchema = Get-ReviewerConventionSpecialistMarkerSchema `
                 -ExpectedProject ([string]$binding.project) -ExpectedNonce ([string]$discoveryCore.nonce)
             $specialistOutcome = ConvertFrom-AgentResultMarkerOutcome `
@@ -17526,18 +17499,8 @@ function Invoke-ReviewerRoleInputCaptureRun {
                 throw "The sealed specialist result marker failed the exact production schema: $([string]$specialistOutcome.Status)."
             }
             $discoveryMarker = $specialistOutcome.Value
-            if (-not (Test-ReviewerConventionSpecialistBinding -Marker $discoveryMarker `
-                    -PrId ([int]$specialistBinding.prId) -RepositoryId ([string]$specialistBinding.repositoryId) `
-                    -SourceCommit ([string]$specialistBinding.sourceCommit) `
-                    -TargetCommit ([string]$specialistBinding.targetCommit) `
-                    -ChangeSetDigest ([string]$specialistBinding.changeSetDigest) `
-                    -ConventionPlanSha256 ([string]$specialistDigests.conventionPlanSha256) `
-                    -FactPlanSha256 ([string]$specialistDigests.factPlanSha256) `
-                    -ConfigSha256 ([string]$specialistDigests.configSha256) `
-                    -ScriptSha256 ([string]$specialistDigests.scriptSha256) `
-                    -PromptSha256 ([string]$specialistDigests.promptSha256))) {
-                throw "The specialist result marker does not match its authenticated package identities and production digests."
-            }
+            $specialistCandidates = @(
+                Get-ReviewerAuthenticatedSpecialistCandidates -Core $discoveryCore -Marker $discoveryMarker)
         }
         if ([int]$discoveryMarker.prId -ne [int]$binding.prId -or
             [string]$discoveryMarker.repositoryId -cne [string]$binding.repositoryId -or

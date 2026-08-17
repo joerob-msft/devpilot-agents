@@ -99,6 +99,18 @@ param(
     [Parameter(ParameterSetName = 'Acquire')]
     [string]$DiscoveryPackageRoot,
 
+    # Optional explicit pin for a trusted earlier reviewer build that produced the
+    # independent discovery package. Without it, the package must match this build.
+    [Parameter(ParameterSetName = 'Acquire')]
+    [ValidatePattern('^[0-9a-fA-F]{64}$')]
+    [string]$DiscoverySourceScriptSha256,
+
+    # Optional authenticated replay root for the discovery package's exact source
+    # snapshot. This is required only when source and verifier are sibling benchmark
+    # materializations of the same independently sealed replay.
+    [Parameter(ParameterSetName = 'Acquire')]
+    [string]$DiscoveryReplayRoot,
+
     # Cross-check model set for the specialist and verifier roles. The reviewer's
     # convention specialist and reciprocal cross-verification are intrinsically a
     # multi-model orchestration: the cycle is configured with a generalist model
@@ -1135,6 +1147,13 @@ if ($Role -eq 'verifier') {
     $sourceReplayDigestMatches = (
         ([string]$sourceSnapshot.manifestDigest).ToLowerInvariant() -ceq
         ([string]$ReplayManifestDigest).ToLowerInvariant())
+    $authenticatedSourceReplay = $null
+    if ($DiscoveryReplayRoot) {
+        $discoveryReplayRootFull = (Resolve-Path -LiteralPath $DiscoveryReplayRoot -ErrorAction Stop).Path
+        $authenticatedSourceReplay = New-AgentReplaySnapshot -ReplayRoot $discoveryReplayRootFull `
+            -SnapshotName ([string]$sourceSnapshot.snapshotName) `
+            -ExpectedManifestDigest ([string]$sourceSnapshot.manifestDigest)
+    }
     if (-not $sourceReplayDigestMatches) {
         # A verifier commonly consumes the non-promotable replay materialized from
         # a role-input capture rather than the source replay that produced the
@@ -1151,6 +1170,14 @@ if ($Role -eq 'verifier') {
             $sourceReplayDigestMatches = (
                 $lineageDigest.ToLowerInvariant() -ceq
                 ([string]$sourceSnapshot.manifestDigest).ToLowerInvariant())
+            if (-not $sourceReplayDigestMatches -and $authenticatedSourceReplay -and
+                [string]$authenticatedSourceReplay.Classification.SealKind -ceq 'benchmarkPackMaterialization') {
+                $sourceLineageDigest =
+                    [string]$authenticatedSourceReplay.Classification.Sidecar.sourceManifestDigest
+                $sourceReplayDigestMatches = (
+                    $lineageDigest.ToLowerInvariant() -ceq
+                    $sourceLineageDigest.ToLowerInvariant())
+            }
         }
     }
     if (-not $sourceReplayDigestMatches) {
@@ -1176,9 +1203,13 @@ if ($Role -eq 'verifier') {
         [string](Get-AgentConfig -Path $configFull -AgentDir (Split-Path $reviewerScriptFull -Parent) `
             -SupportedSchemaVersions @(1) -PromptFileField 'promptFile').PromptFilePath
     }
+    $expectedDiscoveryScriptSha256 = if ($PSBoundParameters.ContainsKey('DiscoverySourceScriptSha256')) {
+        $DiscoverySourceScriptSha256
+    }
+    else { Get-FileSha256Hex -Path $reviewerScriptFull }
     foreach ($digestCheck in @(
             @('config', [string]$discoveryCore.digests.configSha256, (Get-FileSha256Hex -Path $configFull)),
-            @('script', [string]$discoveryCore.digests.scriptSha256, (Get-FileSha256Hex -Path $reviewerScriptFull)),
+            @('script', [string]$discoveryCore.digests.scriptSha256, $expectedDiscoveryScriptSha256),
             @('prompt', [string]$discoveryCore.digests.promptSha256, (Get-FileSha256Hex -Path $sourcePromptPath)))) {
         if (([string]$digestCheck[1]).ToLowerInvariant() -cne
             ([string]$digestCheck[2]).ToLowerInvariant()) {
@@ -1229,26 +1260,8 @@ if ($Role -eq 'verifier') {
             throw "The sealed specialist result marker failed the exact production schema: $([string]$specialistOutcome.Status)."
         }
         $discoveryMarkerJson = $specialistOutcome.Value
-        if (-not $discoveryCore.PSObject.Properties['sourceProjection'] -or
-            [string]$discoveryCore.sourceProjection.sourceRole -cne 'specialist' -or
-            -not $discoveryCore.sourceProjection.PSObject.Properties['binding'] -or
-            -not $discoveryCore.sourceProjection.PSObject.Properties['digests']) {
-            throw "The sealed specialist package is missing its production-resolved source projection."
-        }
-        $specialistBinding = $discoveryCore.sourceProjection.binding
-        $specialistDigests = $discoveryCore.sourceProjection.digests
-        if (-not (Test-ReviewerConventionSpecialistBinding -Marker $discoveryMarkerJson `
-                -PrId ([int]$specialistBinding.prId) -RepositoryId ([string]$specialistBinding.repositoryId) `
-                -SourceCommit ([string]$specialistBinding.sourceCommit) -TargetCommit ([string]$specialistBinding.targetCommit) `
-                -ChangeSetDigest ([string]$specialistBinding.changeSetDigest) `
-                -ConventionPlanSha256 ([string]$specialistDigests.conventionPlanSha256) `
-                -FactPlanSha256 ([string]$specialistDigests.factPlanSha256) `
-                -ConfigSha256 ([string]$specialistDigests.configSha256) `
-                -ScriptSha256 ([string]$specialistDigests.scriptSha256) `
-                -PromptSha256 ([string]$specialistDigests.promptSha256))) {
-            throw "The sealed specialist result marker does not match the package's exact identities and production digests."
-        }
-        $specialistCandidates = @($discoveryCore.sourceProjection.candidates)
+        $specialistCandidates = @(
+            Get-ReviewerAuthenticatedSpecialistCandidates -Core $discoveryCore -Marker $discoveryMarkerJson)
     }
     $sourceDerivedCandidates = @(ConvertTo-ReviewerIndependentDiscoveryCandidates `
             -SourceRole $discoverySourceRole -SourceModel $discoveryModel `

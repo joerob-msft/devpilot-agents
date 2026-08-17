@@ -1006,6 +1006,79 @@ function ConvertTo-ReviewerIndependentDiscoveryCandidates {
     return $derived
 }
 
+function Get-ReviewerAuthenticatedSpecialistCandidates {
+    <#
+        Returns the convention candidates authenticated by one successful specialist
+        capture. Current packages carry the supervisor-resolved sourceProjection.
+        Packages emitted by the immediately preceding reviewer build do not; their
+        HMAC-bound capture core instead records a successful production parse and the
+        marker itself carries every source/config/script/prompt binding. Supporting
+        that legacy shape is what lets a dependent verifier consume an already-run
+        specialist without rerunning the model.
+    #>
+    param(
+        [Parameter(Mandatory)]$Core,
+        [Parameter(Mandatory)]$Marker
+    )
+
+    if (-not $Core.PSObject.Properties['snapshotIdentity'] -or
+        -not $Core.PSObject.Properties['digests']) {
+        throw "The authenticated specialist capture-core is missing its snapshot or digest bindings."
+    }
+    $snapshot = $Core.snapshotIdentity
+    $digests = $Core.digests
+
+    if ($Core.PSObject.Properties['sourceProjection']) {
+        $projection = $Core.sourceProjection
+        if ([string]$projection.sourceRole -cne 'specialist' -or
+            [string]$projection.sourceModel -cne [string]$Core.requestedModel -or
+            -not $projection.PSObject.Properties['binding'] -or
+            -not $projection.PSObject.Properties['digests'] -or
+            -not $projection.PSObject.Properties['candidates']) {
+            throw "The authenticated specialist source projection is malformed or mismatched."
+        }
+        $binding = $projection.binding
+        $projectionDigests = $projection.digests
+        if (-not (Test-ReviewerConventionSpecialistBinding -Marker $Marker `
+                -PrId ([int]$binding.prId) -RepositoryId ([string]$binding.repositoryId) `
+                -SourceCommit ([string]$binding.sourceCommit) -TargetCommit ([string]$binding.targetCommit) `
+                -ChangeSetDigest ([string]$binding.changeSetDigest) `
+                -ConventionPlanSha256 ([string]$projectionDigests.conventionPlanSha256) `
+                -FactPlanSha256 ([string]$projectionDigests.factPlanSha256) `
+                -ConfigSha256 ([string]$projectionDigests.configSha256) `
+                -ScriptSha256 ([string]$projectionDigests.scriptSha256) `
+                -PromptSha256 ([string]$projectionDigests.promptSha256))) {
+            throw "The specialist result marker does not match its authenticated package identities and production digests."
+        }
+        return @($projection.candidates)
+    }
+
+    # Before sourceProjection existed, a successful specialist capture had already
+    # run this exact production binding check before it could publish terminalStatus
+    # "captured". Recheck every independently available identity here. Its specialist
+    # plan change-set digest is marker-scoped (and can differ from the replay
+    # materialization digest), so the trusted source build's successful parse is the
+    # authority for that field. The caller must separately pin digests.scriptSha256
+    # to the exact trusted source build.
+    if (-not (Test-ReviewerConventionSpecialistBinding -Marker $Marker `
+            -PrId ([int]$snapshot.prId) -RepositoryId ([string]$snapshot.repositoryId) `
+            -SourceCommit ([string]$snapshot.sourceCommit) -TargetCommit ([string]$snapshot.targetCommit) `
+            -ChangeSetDigest ([string]$Marker.changeSetDigest) `
+            -ConventionPlanSha256 ([string]$Marker.conventionPlanSha256) `
+            -FactPlanSha256 ([string]$Marker.factPlanSha256) `
+            -ConfigSha256 ([string]$digests.configSha256) `
+            -ScriptSha256 ([string]$digests.scriptSha256) `
+            -PromptSha256 ([string]$digests.promptSha256))) {
+        throw "The legacy specialist result marker does not match its authenticated package identities and production digests."
+    }
+    return @(@($Marker.candidates) | ForEach-Object {
+            $normalized = (ConvertTo-ReviewerVerificationCanonicalJson -Value $_) |
+                ConvertFrom-Json -Depth 32
+            $normalized.filePath = ConvertTo-ReviewerVerificationPath -Path ([string]$normalized.filePath)
+            $normalized
+        })
+}
+
 function Get-ReviewerVerificationCandidatePlan {
     param(
         [object[]]$GeneralistPasses = @(),

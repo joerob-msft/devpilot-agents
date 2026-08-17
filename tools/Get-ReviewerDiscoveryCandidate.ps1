@@ -50,6 +50,7 @@ param(
     [Parameter(Mandatory)][string]$DiscoveryPackageRoot,
     [Parameter(Mandatory)][string]$OutputFile,
     [Parameter(Mandatory)][string]$SealKeyPath,
+    [ValidatePattern('^[0-9a-fA-F]{64}$')][string]$ExpectedSourceScriptSha256,
     [string]$SourceFixtureId,
     [string]$RepoRoot = (Split-Path $PSScriptRoot -Parent)
 )
@@ -81,6 +82,11 @@ $sourceModel = [string]$core.requestedModel
 $markerPrefix = [string]$core.resultMarkerPrefix
 if (-not $sourceModel -or -not $markerPrefix) {
     throw "The discovery capture-core is missing its requestedModel or resultMarkerPrefix binding."
+}
+if ($PSBoundParameters.ContainsKey('ExpectedSourceScriptSha256') -and
+    ([string]$core.digests.scriptSha256).ToLowerInvariant() -cne
+    $ExpectedSourceScriptSha256.ToLowerInvariant()) {
+    throw "The authenticated discovery package does not match the explicitly pinned source reviewer script."
 }
 # The candidate's source fixture is DERIVED from the sealed discovery package's own
 # capture-core evidence (blocker 1), never from operator input. A package that does
@@ -123,28 +129,7 @@ if ($sourceRole -ceq 'specialist') {
         throw "The sealed specialist result marker failed the exact production schema: $([string]$specialistOutcome.Status)."
     }
     $marker = $specialistOutcome.Value
-    if (-not $core.PSObject.Properties['sourceProjection'] -or
-        [string]$core.sourceProjection.sourceRole -cne 'specialist' -or
-        -not $core.sourceProjection.PSObject.Properties['binding'] -or
-        -not $core.sourceProjection.PSObject.Properties['digests']) {
-        throw 'The sealed specialist capture-core is missing its production-resolved source projection.'
-    }
-    $specialistBinding = $core.sourceProjection.binding
-    $specialistDigests = $core.sourceProjection.digests
-    if (-not (Test-ReviewerConventionSpecialistBinding -Marker $marker `
-            -PrId ([int]$specialistBinding.prId) `
-            -RepositoryId ([string]$specialistBinding.repositoryId) `
-            -SourceCommit ([string]$specialistBinding.sourceCommit) `
-            -TargetCommit ([string]$specialistBinding.targetCommit) `
-            -ChangeSetDigest ([string]$specialistBinding.changeSetDigest) `
-            -ConventionPlanSha256 ([string]$specialistDigests.conventionPlanSha256) `
-            -FactPlanSha256 ([string]$specialistDigests.factPlanSha256) `
-            -ConfigSha256 ([string]$specialistDigests.configSha256) `
-            -ScriptSha256 ([string]$specialistDigests.scriptSha256) `
-            -PromptSha256 ([string]$specialistDigests.promptSha256))) {
-        throw 'The sealed specialist result marker does not match its package identities and production digests.'
-    }
-    $specialistCandidates = @($core.sourceProjection.candidates)
+    $specialistCandidates = @(Get-ReviewerAuthenticatedSpecialistCandidates -Core $core -Marker $marker)
 }
 $derived = @(ConvertTo-ReviewerIndependentDiscoveryCandidates -SourceRole $sourceRole `
         -SourceModel $sourceModel -Marker $marker -SpecialistCandidates $specialistCandidates)
