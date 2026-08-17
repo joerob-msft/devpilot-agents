@@ -227,6 +227,10 @@ jobs:
         shell: pwsh
         run: ./tools/Test-ReviewerBlindedAcquisition.ps1
 
+      - name: blinded benchmark-pack materializer and no-model preflight
+        shell: pwsh
+        run: ./tools/Test-ReviewerBenchmarkPackMaterializer.ps1
+
       - name: reviewer - offline replay is fail-closed and preview-only
         shell: pwsh
         run: |

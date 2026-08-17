@@ -145,6 +145,116 @@ change is proven to be only the self-hash, never an orchestration change.
 | Output root | where the sealed package is written |
 | Authorization token | cryptographically random; only its SHA-256 is persisted |
 
+## Materializing legacy blinded benchmark packs
+
+`tools/Convert-ReviewerBlindedBenchmarkPack.ps1` converts the legacy
+`blinded-reviewer-adapter-input` shape into a role-scoped
+`reviewer-blinded-fixture-projection` and a production-loadable acquisition
+bundle. It does not infer role context from fixture names or reconstruct replay,
+config, or prompt content.
+
+The conversion requires:
+
+* exactly one replay manifest already sealed by the legacy projection;
+* one exact `reviewer-model-visible-role-provenance` resource already sealed by
+  that projection with media role `role-provenance-<role>`;
+* an independently supplied replay snapshot whose manifest bytes equal the
+  sealed manifest;
+* independently supplied config and prompt bytes pinned by operator SHA-256
+  (and by the replay manifest whenever it records nonzero bindings).
+
+Every declared resource is schema-, path-, SHA-256-, and length-checked.
+Oracle/expected fields and oracle-bearing or aliased paths are rejected
+recursively. The output is staged, accepted by `New-AgentReplaySnapshot`, fully
+inventoried in `transformation-manifest.json`, marked read-only, and atomically
+renamed into place. Missing or ambiguous provenance blocks conversion; the tool
+never fills gaps from a live repository or a human-authored guess.
+
+The classified replay sidecar binds the exact config, production prompt, and
+reviewer script hashes. Acquisition rechecks those bindings against the running
+bytes. Specialist acquisition additionally requires both sealed convention and
+fact plans and compares them to the production-generated plans before the model
+boundary; a merely role-labeled placeholder is not accepted.
+
+Legacy materialization is therefore proven safe **when that evidence already
+exists**. A historical pack that sealed only a replay manifest and selected
+payloads is not enough. It needs a separate, current-production capture before
+acquisition; adding that capture flow is intentionally outside this tool.
+
+The minimum generic capture interface would emit:
+
+* a `reviewer-model-visible-role-provenance` document for one declared role,
+  fixture id, and legacy binding hash, containing exactly that role's
+  model-visible projection fields plus the exact config, prompt, and reviewer
+  script SHA-256 values;
+* the exact production prompt bytes and SHA-256;
+* the exact production config bytes and SHA-256, with its relative `promptFile`
+  resolving to those prompt bytes;
+* the exact replay manifest/snapshot identity from which those fields were
+  observed; and
+* a projection resource entry sealing the role-provenance path, length, SHA-256,
+  and `role-provenance-<role>` media role.
+
+Until those outputs are independently captured and sealed, readiness is
+`blocked`; this materializer does not synthesize them.
+
+```pwsh
+./tools/Convert-ReviewerBlindedBenchmarkPack.ps1 `
+    -PackRoot <legacy-pack-root> `
+    -LegacyProjectionFile <fixture.blinded.json> `
+    -Role generalist `
+    -RoleProvenanceFile <sealed-role-provenance.json> `
+    -ReplaySnapshotPath <exact-snapshot-directory> `
+    -ConfigFile <exact-reviewer-config.json> `
+    -PromptFile <exact-review-cycle.prompt.md> `
+    -ExpectedReplayManifestFileSha256 <64-hex> `
+    -ExpectedConfigSha256 <64-hex> `
+    -ExpectedPromptSha256 <64-hex> `
+    -OutputRoot <new-bundle-directory>
+```
+
+Re-verification is read-only and requires the transformation manifest's pinned
+file SHA-256:
+
+```pwsh
+./tools/Convert-ReviewerBlindedBenchmarkPack.ps1 -VerifyOnly `
+    -OutputRoot <bundle-directory> `
+    -ExpectedTransformationManifestSha256 <64-hex>
+```
+
+## No-model acquisition Preflight
+
+Pass `-Preflight` with the same acquisition declaration to run all projection,
+replay, config, model, role, candidate, exact HEAD/ref/RepoPath, plan-shape, and
+output-collision checks before the mutation boundary. It emits one
+`reviewer-blinded-acquisition-readiness` JSON document and exits without
+minting a token or plan, taking a lease, creating state, starting a process or
+model, or writing to a provider.
+
+The production reviewer itself performs the config-contract validation
+in-process. HEAD and the full ref are resolved directly from Git worktree
+metadata, so Preflight does not need to start `git`; Acquire repeats the checks
+with Git and additionally enforces cleanliness and base ancestry.
+
+The collision result is advisory: a later Acquire still takes the authoritative
+atomic `CreateNew` lease and may lose to a concurrent caller after Preflight.
+
+```pwsh
+./tools/Invoke-ReviewerBlindedAcquisition.ps1 -Preflight `
+    -Role generalist `
+    -FixtureProjectionFile <bundle\projection.json> `
+    -Model <supported-model-id> `
+    -ConfigFile <bundle\config\reviewer.config.json> `
+    -ReplayRoot <bundle\replay> `
+    -ReplaySnapshotName <snapshot-name> `
+    -ReplayManifestDigest <materialized-manifest-digest> `
+    -ExpectedReviewerBaseCommit <40-hex> `
+    -PullRequestId <n> `
+    -ExpectedHeadCommit <40-hex> `
+    -ExpectedRef refs/heads/<branch> `
+    -OutputRoot <unused-new-output-path>
+```
+
 The verifier's candidate is **derived from the sealed discovery evidence, never
 from truth**. The operator produces it with
 `tools/Get-ReviewerDiscoveryCandidate.ps1`, which loads the sealed discovery

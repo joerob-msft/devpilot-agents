@@ -1792,7 +1792,7 @@ function Invoke-TimedProcess {
 # ---------------------------------------------------------------------------
 
 # Code-defined, not manifest-defined: a bound a snapshot can raise is not a bound.
-$script:AgentReplaySchemaVersions = @(1, 2)
+$script:AgentReplaySchemaVersions = @(1, 2, 3)
 $script:AgentReplayKind = "agent-replay-snapshot"
 $script:AgentReplayMaxResources = 4096
 $script:AgentReplayMaxPayloadBytes = 25165824
@@ -1805,7 +1805,7 @@ $script:AgentReplayHexPattern = '^[0-9a-f]{64}\z'
 # Seal kinds a manifest classification may declare. A classification only ever
 # WITHDRAWS promotability, so every kind here is non-promotable by definition;
 # the list exists so an unknown label is refused rather than honoured blindly.
-$script:AgentReplayNonPromotableSealKinds = @("offlineCorpusSeal")
+$script:AgentReplayNonPromotableSealKinds = @("offlineCorpusSeal", "benchmarkPackMaterialization")
 # Reference-identity seal, not a string: a constant that a hand-built hashtable
 # can carry would let any in-process caller present itself as a loaded snapshot
 # and skip every check in New-AgentReplaySnapshot. Same pattern as the
@@ -2123,7 +2123,7 @@ function New-AgentReplaySnapshot {
     catch { throw "Replay manifest is not valid JSON." }
     if ($manifest -isnot [System.Management.Automation.PSCustomObject]) { throw "Replay manifest must be a JSON object." }
 
-    $schemaVersion = Get-AgentReplayManifestField -Object $manifest -Name "schemaVersion" -Type int -Min 1 -Max 2
+    $schemaVersion = Get-AgentReplayManifestField -Object $manifest -Name "schemaVersion" -Type int -Min 1 -Max 3
     $manifestKeys = @(
         "schemaVersion", "kind", "snapshotId", "capturedUtc", "provider",
         "binding", "bindings", "resources", "manifestDigest"
@@ -2137,10 +2137,13 @@ function New-AgentReplaySnapshot {
     # schema v1 and pre-existing v2 snapshots are.
     $hasClassification = [bool]$manifest.PSObject.Properties["classification"]
     if ($hasClassification) {
-        if ($schemaVersion -ne 2) {
-            throw "Replay manifest carries a classification but declares schema version $schemaVersion; classification is a schema-v2 field."
+        if ($schemaVersion -eq 1) {
+            throw "Replay manifest carries a classification but declares schema version 1; classification is a schema-v2 field or a schema-v3 required field."
         }
         $manifestKeys += "classification"
+    }
+    elseif ($schemaVersion -eq 3) {
+        throw "Replay manifest schema version 3 requires a non-promotable classification."
     }
     Assert-AgentReplayExactKeys -Object $manifest -Where "Replay manifest" -Expected $manifestKeys
     if ($script:AgentReplaySchemaVersions -notcontains $schemaVersion) {
