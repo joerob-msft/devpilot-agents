@@ -17,10 +17,18 @@
       * it re-resolves the declared full ref and HEAD from the git object store
         itself (never by running git) and fails closed on any disagreement;
       * it scrubs provider credentials out of the environment the child
-        inherits, so a live read or write is not merely unused but impossible;
+        inherits, removing the easiest accidental route to a live call. This is
+        a structural guard over this code path, NOT a capability sandbox: it
+        does not remove ambient machine credentials and cannot prevent arbitrary
+        outbound HTTP. What actually forecloses a live provider read or write is
+        that capture stops at the model boundary against a sealed replay
+        snapshot;
       * it wires the production-test-only offline telemetry sink and afterwards
         proves from that telemetry that ZERO model, agency or provider child
-        processes started and that ZERO live reads or writes occurred;
+        processes started and that ZERO live reads or writes occurred. The child
+        emits that telemetry about itself, so this detects an instrumented
+        regression; it is not a containment mechanism against a child that
+        deliberately misreports;
       * it independently re-verifies the published bundle - schema, per-file
         length and SHA-256, recursive read-only, zero side effects, exactly one
         boundary hit, and identity/role/model agreement with what was requested.
@@ -35,7 +43,7 @@
 
 .EXAMPLE
     ./tools/Invoke-ReviewerRoleInputCapture.ps1 -Role generalist `
-        -Model claude-opus-5 -FixtureProjectionFile ./bundle/projection.json `
+        -Model claude-opus-5 -CaptureRequestFile ./bundle/capture-request.json `
         -ConfigFile ./bundle/config/reviewer.config.json `
         -ReplayRoot ./bundle/replay -ReplaySnapshotName synthetic-pr `
         -ReplayManifestDigest <64-hex> -PullRequestId 4242 `
@@ -54,7 +62,7 @@ param(
 
     [Parameter(Mandatory, ParameterSetName = 'Capture')]
     [Parameter(Mandatory, ParameterSetName = 'Preflight')]
-    [string]$FixtureProjectionFile,
+    [string]$CaptureRequestFile,
 
     [Parameter(Mandatory, ParameterSetName = 'Capture')]
     [Parameter(Mandatory, ParameterSetName = 'Preflight')]
@@ -113,6 +121,15 @@ param(
     [Parameter(ParameterSetName = 'Capture')]
     [Parameter(ParameterSetName = 'Preflight')]
     [string]$ConventionSpecialistModel,
+
+    # The first configured generalist model, which drives discovery. It is only
+    # separable from -Model for a specialist or verifier capture, where the
+    # captured role legitimately runs a different model from the generalist that
+    # discovered the findings. Defaults to -Model, which is the only correct
+    # value for a generalist capture.
+    [Parameter(ParameterSetName = 'Capture')]
+    [Parameter(ParameterSetName = 'Preflight')]
+    [string]$DiscoveryGeneralistModel,
 
     # Optional legacy benchmark projection to re-materialize alongside the
     # capture. Read-only: every sealed resource is re-verified by hash and length.
@@ -375,24 +392,56 @@ function Get-GitHead {
 
 function Get-TelemetryProof {
     <#
-        The independent FALSIFIER for the zero-side-effect claim. The bundle
-        ASSERTS zero; this reads the production-test-only telemetry sink the child
-        wrote and counts what actually happened. Any non-zero side-effect count
-        fails the capture.
+        Independent telemetry evidence for the zero-side-effect claim. A usable
+        proof must be a present, parseable, non-empty sink and must contain at
+        least one sealed replay serve. Missing or vacuous telemetry proves
+        nothing and fails closed.
 
-        It is deliberately NOT a positive proof, and the difference matters: a
-        no-model capture stops before the model boundary, so it opens no provider
-        session and serves no recorded read. An empty sink is therefore the
-        correct outcome for an honest capture, and "no events" must never be read
-        as "nothing happened". The positive evidence that the production path
-        really ran is the published bundle's single model-boundary hit, which is
-        asserted separately.
+        This supersedes the earlier reading that an empty sink is the CORRECT
+        outcome because a no-model capture "never opens a provider session and
+        never serves a recorded read". That premise conflated the MODEL boundary
+        with the REPLAY PROVIDER. A capture does stop before the model, but it
+        reaches the boundary only by reading the sealed snapshot THROUGH the
+        replay provider, so it necessarily records serves. Measured on the
+        capture suite's three success paths, every published capture carries a
+        non-zero sealedReplayServes against zero process, live-provider and
+        write events, while every observed empty sink belonged to a run refused
+        before it loaded the snapshot - never to a published capture. Requiring
+        a serve therefore rejects vacuous "proof" without failing any honest
+        capture, and the suite pins both directions.
+
+        The exact strength of this claim, stated precisely: the harness emits
+        provider.replayServed when it dispatches a read against the sealed
+        corpus, not after the payload validates, so N serves prove N sealed
+        reads were ISSUED - they are not a per-resource consumption ledger. The
+        zero-side-effect half of the proof is unaffected, because it is asserted
+        over process, live-provider and write events, each of which must be
+        ABSENT rather than present, so any record ADDED to the sink can only
+        fail the check.
+
+        This "at least one serve" floor rejects an empty or replay-stripped
+        sink, but on its own it does NOT reject a sink truncated to a valid
+        PREFIX of an honest one - the child appends as it runs, so one surviving
+        serve satisfies a fixed floor of 1. A floor derived from the capture's
+        own sealed inventory would NOT fix that and was deliberately reverted as
+        unsound: the inventory is the lookup table the replay provider answers
+        FROM, not a ledger of reads served, so an honest capture reads a subset
+        of it. Test-TelemetryCoversCapture closes the gap a different way, by
+        requiring a terminal record bound to the published document; read it for
+        the completeness half of the argument.
     #>
     param([Parameter(Mandatory)][string]$TelemetryPath)
+    if (-not (Test-Path -LiteralPath $TelemetryPath -PathType Leaf)) {
+        throw 'Telemetry proof is missing: the child did not create its production-test-only sink.'
+    }
     $events = @()
-    if (Test-Path -LiteralPath $TelemetryPath) {
+    try {
         $events = @(Get-Content -LiteralPath $TelemetryPath -Encoding UTF8 |
-                Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json -Depth 32 })
+                Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json -Depth 32 -ErrorAction Stop })
+    }
+    catch { throw "Telemetry proof is malformed: $($_.Exception.Message)" }
+    if ($events.Count -eq 0) {
+        throw 'Telemetry proof is empty and cannot establish a sealed replay execution.'
     }
     $processStarts = @($events | Where-Object { [string]$_.event -ceq 'process.started' })
     $modelStarts = @($processStarts | Where-Object {
@@ -404,7 +453,13 @@ function Get-TelemetryProof {
     $liveWrite = @($events | Where-Object { [string]$_.event -ceq 'provider.liveWrite' })
     $writeTools = @($events | Where-Object { [string]$_.event -in @('tool.write', 'provider.write', 'delivery.posted') })
     $replayServes = @($events | Where-Object { [string]$_.event -ceq 'provider.replayServed' })
+    if ($replayServes.Count -eq 0) {
+        throw 'Telemetry proof contains no provider.replayServed event.'
+    }
     return [ordered]@{
+        fileExists               = $true
+        parseError               = ''
+        proofError               = ''
         totalEvents               = [int]$events.Count
         sealedReplayServes        = [int]$replayServes.Count
         childProcessStarts        = [int]$processStarts.Count
@@ -413,6 +468,87 @@ function Get-TelemetryProof {
         providerLiveWrites        = [int]$liveWrite.Count
         writeToolInvocations      = [int]$writeTools.Count
     }
+}
+
+function Test-TelemetryCoversCapture {
+    <#
+        The completeness half of the telemetry argument.
+
+        A floor of "at least one sealed replay serve" rejects an empty, blank or
+        replay-stripped sink. It does NOT reject a sink truncated to a valid
+        PREFIX of an honest one, and that gap is not academic: the sink is also
+        the evidence for the ABSENCE of side effects, so a prefix that stops
+        short of a later process.started reads as "no child process started"
+        when a child process did start. A partially written final line fails the
+        JSONL parse and so fails closed, but a LINE-ALIGNED prefix does not.
+
+        The child therefore emits one terminal capture.completed record bound to
+        the document it published, after the bundle is staged and as the last
+        thing it does. Requiring that record to be present, unique, LAST, and to
+        carry the digest of the document THIS supervisor verified closes the
+        window: any truncation that could drop a side-effect record also drops
+        the terminal record, and a stale sink from an earlier run carries a
+        different digest.
+
+        The binding is the document digest rather than the capture nonce because
+        this must cover the BLOCKED bundle too. A blocked capture publishes a
+        sealed bundle and asserts zero side effects exactly as a successful one
+        does - on the path that is more likely to have gone wrong - but it stops
+        before the model boundary and so has no nonce to bind to.
+
+        What this deliberately does NOT claim: the child writes its own sink, so
+        this is completeness evidence against truncation, loss and staleness -
+        not authentication against a child that forges its own instrumentation.
+        A capture is a supervised run of this repository's own reviewer, and no
+        self-instrumentation can settle the forgery case. The zero-side-effect
+        half needs no such trust either way: those events must be ABSENT, so
+        adding records can only fail the check.
+
+        Returns the list of problems, empty when the sink covers the capture.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$TelemetryPath,
+        [Parameter(Mandatory)][string]$DocumentPath,
+        [Parameter(Mandatory)][ValidateSet('captured', 'blocked')][string]$Outcome
+    )
+    if (-not (Test-Path -LiteralPath $DocumentPath -PathType Leaf)) {
+        return @('the published capture carries no document to check the telemetry against')
+    }
+    $documentSha = ''
+    try { $documentSha = (Get-FileHash -LiteralPath $DocumentPath -Algorithm SHA256).Hash.ToLowerInvariant() }
+    catch { return @("the published capture document could not be digested for telemetry coverage: $($_.Exception.Message)") }
+    $events = @()
+    try {
+        $events = @(Get-Content -LiteralPath $TelemetryPath -Encoding UTF8 |
+                Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json -Depth 32 -ErrorAction Stop })
+    }
+    catch { return @("telemetry could not be re-read for coverage: $($_.Exception.Message)") }
+    $terminalIndexes = @(0..([Math]::Max($events.Count - 1, 0)) |
+            Where-Object { $events.Count -gt 0 -and [string]$events[$_].event -ceq 'capture.completed' })
+    if ($terminalIndexes.Count -eq 0) {
+        return @('telemetry carries no terminal capture.completed record, so it cannot be shown to be the complete sink for this run')
+    }
+    $problems = @()
+    if ($terminalIndexes.Count -gt 1) {
+        $problems += "telemetry carries $($terminalIndexes.Count) terminal capture.completed records; exactly one run may write this sink"
+    }
+    if ($terminalIndexes[-1] -ne ($events.Count - 1)) {
+        $problems += 'the terminal capture.completed record is not the last telemetry event; the sink continued after the capture finished'
+    }
+    $terminal = $events[$terminalIndexes[-1]]
+    $terminalSha = ''
+    $terminalOutcome = ''
+    if ($terminal.PSObject.Properties['data']) {
+        if ($terminal.data.PSObject.Properties['documentSha256']) { $terminalSha = ([string]$terminal.data.documentSha256).ToLowerInvariant() }
+        if ($terminal.data.PSObject.Properties['outcome']) { $terminalOutcome = [string]$terminal.data.outcome }
+    }
+    if (-not $terminalSha -or $terminalSha -cne $documentSha) {
+        $problems += 'the terminal capture.completed record is not bound to the published capture document; the sink is not this run''s'
+    }
+    if ($terminalOutcome -cne $Outcome) {
+        $problems += "the terminal capture.completed record reports outcome '$terminalOutcome', not the published '$Outcome'"
+    }
+    return @($problems)
 }
 
 function Test-CaptureBundle {
@@ -467,18 +603,36 @@ function Test-CaptureBundle {
         }
         catch { [void]$problems.Add("capture-seal.json could not be verified: $($_.Exception.Message)") }
     }
+
+    $rootItem = Get-Item -LiteralPath $BundleRoot -Force
+    if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        [void]$problems.Add('bundle root is a reparse point')
+    }
+    foreach ($directory in @(Get-ChildItem -LiteralPath $BundleRoot -Directory -Recurse -Force)) {
+        if (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            $relativeDirectory = [IO.Path]::GetRelativePath($BundleRoot, $directory.FullName).Replace('\', '/')
+            [void]$problems.Add("bundle contains a reparse-point directory: $relativeDirectory")
+        }
+    }
+    $onDisk = @{}
+    foreach ($file in @(Get-ChildItem -LiteralPath $BundleRoot -File -Recurse -Force)) {
+        $rel = [IO.Path]::GetRelativePath($BundleRoot, $file.FullName).Replace('\', '/')
+        if (($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            [void]$problems.Add("bundle contains a reparse-point file: $rel")
+            continue
+        }
+        if (($file.Attributes -band [IO.FileAttributes]::ReadOnly) -eq 0) {
+            [void]$problems.Add("bundle file is not read-only: $rel")
+        }
+        $onDisk[$rel] = $file
+    }
+
     if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
         try { Assert-Schema -Json $signedText -SchemaName 'role-input-capture-blocked.schema.json' -Surface 'The typed blocker' }
         catch { [void]$problems.Add($_.Exception.Message) }
-        foreach ($file in @(Get-ChildItem -LiteralPath $BundleRoot -File -Recurse -Force)) {
-            if (($file.Attributes -band [IO.FileAttributes]::ReadOnly) -eq 0) {
-                [void]$problems.Add("bundle file is not read-only: $($file.Name)")
-            }
-            $rel = [IO.Path]::GetRelativePath($BundleRoot, $file.FullName).Replace('\', '/')
-            if ($rel -notin @('capture-blocked.json', 'capture-seal.json')) {
-                [void]$problems.Add("typed blocker carries an unbound file: $rel")
-            }
-        }
+        [void]$onDisk.Remove('capture-blocked.json')
+        [void]$onDisk.Remove('capture-seal.json')
+        foreach ($unbound in @($onDisk.Keys)) { [void]$problems.Add("typed blocker carries an unbound file: $unbound") }
         return $problems.ToArray()
     }
     $manifestText = $signedText
@@ -486,19 +640,6 @@ function Test-CaptureBundle {
     catch { [void]$problems.Add($_.Exception.Message) }
     $manifest = $manifestText | ConvertFrom-Json -Depth 64
 
-    $rootFull = [IO.Path]::GetFullPath($BundleRoot).TrimEnd('\', '/')
-    $onDisk = @{}
-    foreach ($file in @(Get-ChildItem -LiteralPath $BundleRoot -File -Recurse -Force)) {
-        if (($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            [void]$problems.Add("bundle contains a reparse-point file: $($file.Name)")
-            continue
-        }
-        if (($file.Attributes -band [IO.FileAttributes]::ReadOnly) -eq 0) {
-            [void]$problems.Add("bundle file is not read-only: $($file.Name)")
-        }
-        $rel = ($file.FullName.Substring($rootFull.Length)).TrimStart('\', '/').Replace('\', '/')
-        $onDisk[$rel] = $file
-    }
     foreach ($entry in @($manifest.files)) {
         $rel = [string]$entry.path
         if (-not $onDisk.ContainsKey($rel)) { [void]$problems.Add("bound file is missing: $rel"); continue }
@@ -561,9 +702,9 @@ if ($PSCmdlet.ParameterSetName -eq 'Verify') {
         exit 2
     }
     $kind = if (Test-Path -LiteralPath (Join-Path $bundleRoot 'capture-blocked.json') -PathType Leaf) {
-        'typed blocker (schema, per-file length+SHA-256, read-only, zero side effects, no boundary hit)'
+        'typed blocker (schema, HMAC/SHA seal, recursive read-only/reparse-free, exact two-file inventory)'
     }
-    else { 'capture bundle (schema, per-file length+SHA-256, read-only, zero side effects, one boundary hit)' }
+    else { 'capture bundle (schema, HMAC/SHA seal, bound-file hashes/lengths, recursive read-only/reparse-free, one declared boundary hit)' }
     Write-Host "PASS: $kind verified." -ForegroundColor Green
     exit 0
 }
@@ -573,11 +714,11 @@ if ($PSCmdlet.ParameterSetName -eq 'Verify') {
 # ---------------------------------------------------------------------------
 
 $repoFull = [IO.Path]::GetFullPath($RepoRoot)
-$projectionFull = Assert-SafePath -Path $FixtureProjectionFile -Surface 'The blinded fixture projection'
+$requestFull = Assert-SafePath -Path $CaptureRequestFile -Surface 'The role input capture request'
 $configFull = Assert-SafePath -Path $ConfigFile -Surface 'The reviewer configuration'
 $replayFull = Assert-SafePath -Path $ReplayRoot -Surface 'The sealed replay root'
 $outputFull = Assert-SafePath -Path $OutputRoot -Surface 'The capture output root'
-foreach ($required in @($projectionFull, $configFull, $ReviewerScript)) {
+foreach ($required in @($requestFull, $configFull, $ReviewerScript)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Required input '$required' does not exist." }
 }
 if (-not (Test-Path -LiteralPath $replayFull -PathType Container)) { throw "The sealed replay root '$replayFull' does not exist." }
@@ -604,15 +745,18 @@ if ($Role -cne 'verifier' -and ($candidateFull -or $markerFull)) {
     throw "A $Role role input capture takes no discovery candidate or marker; those belong to the verifier role alone."
 }
 
-$projectionText = [IO.File]::ReadAllText($projectionFull, $Utf8)
-Assert-Schema -Json $projectionText -SchemaName 'fixture-projection.schema.json' -Surface 'The blinded fixture projection'
-$projection = $projectionText | ConvertFrom-Json -Depth 64
-Assert-NoForbiddenKeys -Node $projection -Surface 'The blinded fixture projection'
-if ([string]$projection.role -cne $Role) {
-    throw "The blinded projection declares role '$([string]$projection.role)' but '$Role' was requested."
+$requestText = [IO.File]::ReadAllText($requestFull, $Utf8)
+Assert-Schema -Json $requestText -SchemaName 'role-input-capture-request.schema.json' -Surface 'The role input capture request'
+$captureRequest = $requestText | ConvertFrom-Json -Depth 64
+Assert-NoForbiddenKeys -Node $captureRequest -Surface 'The role input capture request'
+if ([string]$captureRequest.role -cne $Role) {
+    throw "The capture request declares role '$([string]$captureRequest.role)' but '$Role' was requested."
 }
-if ([int]$projection.binding.prId -ne $PullRequestId) {
-    throw "The blinded projection is bound to PR $([int]$projection.binding.prId) but PR $PullRequestId was requested."
+if ([string]$captureRequest.model -cne $Model) {
+    throw "The capture request declares model '$([string]$captureRequest.model)' but '$Model' was requested."
+}
+if ([int]$captureRequest.identity.prId -ne $PullRequestId) {
+    throw "The capture request is bound to PR $([int]$captureRequest.identity.prId) but PR $PullRequestId was requested."
 }
 
 $layout = Get-GitLayout -RepositoryRoot $repoFull
@@ -631,12 +775,69 @@ if (-not [bool]$snapshot.Classification.NonPromotable) {
 if ([int]$snapshot.Binding.PullRequestId -ne $PullRequestId) {
     throw "The sealed snapshot is bound to PR $([int]$snapshot.Binding.PullRequestId) but PR $PullRequestId was requested."
 }
+if ([string]$captureRequest.snapshot.name -cne $ReplaySnapshotName -or
+    ([string]$captureRequest.snapshot.manifestDigest).ToLowerInvariant() -cne $ReplayManifestDigest.ToLowerInvariant()) {
+    throw 'The capture request snapshot identity does not match the selected replay snapshot.'
+}
+$precheckedConfigObject = [IO.File]::ReadAllText($configFull, $Utf8) | ConvertFrom-Json -Depth 64
+Assert-NoForbiddenKeys -Node $precheckedConfigObject -Surface 'The reviewer configuration'
+if (([string]$captureRequest.snapshot.configSha256).ToLowerInvariant() -cne (Get-FileSha256Hex -Path $configFull)) {
+    throw 'The capture request configSha256 does not match the selected reviewer configuration.'
+}
+foreach ($pair in @(
+        @('repositoryId', [string]$captureRequest.identity.repositoryId, [string]$snapshot.Binding.RepositoryId),
+        @('project', [string]$captureRequest.identity.project, [string]$snapshot.Binding.Project),
+        @('organization', [string]$captureRequest.identity.organization, [string]$snapshot.Binding.Organization),
+        @('source', [string]$captureRequest.identity.source, [string]$snapshot.Binding.SourceCommit),
+        @('target', [string]$captureRequest.identity.target, [string]$snapshot.Binding.TargetCommit),
+        @('changeSet', [string]$captureRequest.identity.changeSet, [string]$snapshot.Binding.ChangeSetSha256))) {
+    if (([string]$pair[1]).ToLowerInvariant() -cne ([string]$pair[2]).ToLowerInvariant()) {
+        throw "The capture request $($pair[0]) does not match the sealed replay snapshot."
+    }
+}
+# The optional merge base and iteration are checked BOTH ways: a request may not
+# assert identity the seal cannot back, and may not omit identity the seal does
+# carry. The declared/sealed presence pair is resolved first so that an omitted
+# field reports the designed mismatch rather than a StrictMode property fault.
+foreach ($optional in @(
+        @('common', 'CommonCommit'), @('iteration', 'IterationId'))) {
+    $declared = [bool]$captureRequest.identity.PSObject.Properties[$optional[0]]
+    $sealed = [bool]$snapshot.Binding.Contains($optional[1])
+    if ($declared -ne $sealed) {
+        throw $(if ($declared) {
+                "The capture request declares '$($optional[0])', which the sealed replay snapshot cannot back."
+            }
+            else {
+                "The capture request omits '$($optional[0])', which the sealed replay snapshot carries."
+            })
+    }
+    if (-not $sealed) { continue }
+    $requested = $captureRequest.identity.($optional[0])
+    $sealedValue = $snapshot.Binding[$optional[1]]
+    $matched = if ($optional[0] -ceq 'iteration') { [int]$requested -eq [int]$sealedValue }
+    else { ([string]$requested).ToLowerInvariant() -ceq ([string]$sealedValue).ToLowerInvariant() }
+    if (-not $matched) {
+        throw "The capture request $($optional[0]) does not match the sealed replay snapshot."
+    }
+}
 if (@($snapshot.Bindings.Models) -cnotcontains $Model) {
     throw "Model '$Model' is not among the models the sealed snapshot was captured for."
 }
+# A generalist capture IS the discovery generalist, so the two cannot diverge.
+# For a specialist or verifier they legitimately can, and the discovery model
+# must still be one the snapshot was sealed for.
+if ($DiscoveryGeneralistModel) {
+    if ($Role -ceq 'generalist' -and $DiscoveryGeneralistModel -cne $Model) {
+        throw 'A generalist capture is the discovery generalist; -DiscoveryGeneralistModel may not differ from -Model.'
+    }
+    if (@($snapshot.Bindings.Models) -cnotcontains $DiscoveryGeneralistModel) {
+        throw "Discovery generalist model '$DiscoveryGeneralistModel' is not among the models the sealed snapshot was captured for."
+    }
+}
+$discoveryModel = if ($DiscoveryGeneralistModel) { $DiscoveryGeneralistModel } else { $Model }
 
 # The reviewer configuration is the third identity the capture is bound to, next
-# to the projection and the sealed snapshot. It is operator-supplied and is NOT
+# to the request and the sealed snapshot. It is operator-supplied and is NOT
 # covered by a fixture schema, so it gets its own recursive oracle key scan, and
 # its repository identity must match the snapshot the stimulus was sealed from.
 # Capturing role input for one repository out of another repository's config
@@ -659,8 +860,9 @@ $readiness = [ordered]@{
     ready          = $true
     role           = $Role
     model          = $Model
+    discoveryGeneralistModel = $discoveryModel
     prId           = $PullRequestId
-    fixtureId      = [string]$projection.fixtureId
+    fixtureId      = [string]$captureRequest.fixtureId
     snapshot       = [ordered]@{
         name           = $ReplaySnapshotName
         manifestDigest = $ReplayManifestDigest.ToLowerInvariant()
@@ -686,16 +888,29 @@ if ($Preflight) {
 # Capture
 # ---------------------------------------------------------------------------
 
-if (Test-Path -LiteralPath $outputFull) { throw "The capture output root '$outputFull' already exists; a capture never overwrites." }
 $outputParent = [IO.Path]::GetDirectoryName($outputFull)
 if (-not $outputParent -or -not (Test-Path -LiteralPath $outputParent -PathType Container)) {
     throw "The capture output root's parent directory must already exist."
 }
+$outputLockPath = Join-Path $outputParent ('.' + [IO.Path]::GetFileName($outputFull) + '.capture.lock')
+$outputLock = $null
+try {
+    $outputLock = [IO.FileStream]::new(
+        $outputLockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite,
+        [IO.FileShare]::None, 1, [IO.FileOptions]::DeleteOnClose)
+}
+catch [IO.IOException] {
+    throw "The capture output lock '$outputLockPath' is already held; another capture for this output is in progress."
+}
+
+try {
+if (Test-Path -LiteralPath $outputFull) { throw "The capture output root '$outputFull' already exists; a capture never overwrites." }
 $captureSealKey = Get-CaptureSealKey -Create
 
-$workRoot = Join-Path $outputParent ('.' + [IO.Path]::GetFileName($outputFull) + '.capture-work-' + [Guid]::NewGuid().ToString('N'))
+$runId = [Guid]::NewGuid().ToString('N')
+$workRoot = Join-Path $outputParent ('.' + [IO.Path]::GetFileName($outputFull) + ".capture-work-$runId")
 New-Item -ItemType Directory -Path $workRoot | Out-Null
-$publicationStaging = Join-Path $outputParent ('.' + [IO.Path]::GetFileName($outputFull) + '.capture-staging-' + [Guid]::NewGuid().ToString('N'))
+$publicationStaging = Join-Path $outputParent ('.' + [IO.Path]::GetFileName($outputFull) + ".capture-staging-$runId")
 $telemetryPath = Join-Path $workRoot 'telemetry.jsonl'
 $stdOutPath = Join-Path $workRoot 'child.stdout.log'
 $stdErrPath = Join-Path $workRoot 'child.stderr.log'
@@ -706,14 +921,14 @@ $reviewerArgs = @(
     '-Once', '-RepoPath', $repoFull,
     '-ConfigFile', $configFull, '-StateDir', $stateDir,
     '-OperatorAlias', 'role-input-capture', '-PullRequestId', "$PullRequestId",
-    '-Model', $Model, '-CycleTimeoutSeconds', "$TimeoutSeconds",
+    '-Model', $discoveryModel, '-CycleTimeoutSeconds', "$TimeoutSeconds",
     '-ReplayRoot', $replayFull, '-ReplaySnapshotName', $ReplaySnapshotName,
     '-ReplayManifestDigest', $ReplayManifestDigest.ToLowerInvariant(),
     '-CaptureRoleInputRole', $Role, '-CaptureRoleInputModel', $Model,
     '-CaptureRoleInputOutputRoot', $publicationStaging,
     '-CaptureRoleInputExpectedRef', $ExpectedRef,
     '-CaptureRoleInputExpectedHeadCommit', $expectedHead,
-    '-AcquisitionFixtureProjectionFile', $projectionFull
+    '-CaptureRoleInputRequestFile', $requestFull
 )
 if ($legacyFull) { $reviewerArgs += @('-CaptureRoleInputLegacyProjectionFile', $legacyFull) }
 if ($Role -cne 'generalist') {
@@ -739,6 +954,7 @@ $savedTelemetryMode = $env:DEVPILOT_OFFLINE_TELEMETRY_MODE
 $savedTelemetryPath = $env:DEVPILOT_OFFLINE_TELEMETRY_PATH
 $childExitCode = -1
 $supervision = $null
+$proc = $null
 try {
     foreach ($name in $SensitiveEnvironmentVariables) {
         $value = [Environment]::GetEnvironmentVariable($name)
@@ -783,29 +999,57 @@ try {
     }
 }
 finally {
+    # If supervision itself threw after the child started, the child is still
+    # live and would keep running unsupervised - and an unsupervised child is
+    # exactly what this tool exists to make impossible. Terminate it here before
+    # anything else, so the guarantee does not depend on the happy path.
+    #
+    # The kill is NOT gated on HasExited. A root that exits after spawning a
+    # detached descendant is precisely the case a HasExited guard would skip,
+    # and Stop-ProcessTree is built for it: it snapshots descendants from
+    # Win32_Process ParentProcessId, which outlives the root, before falling
+    # back to Kill. It is gated on supervision not having completed instead, so
+    # the settled happy path does not sweep for descendants of a PID the OS is
+    # already free to reissue.
+    if ($null -ne $proc -and $null -eq $supervision) {
+        try { Stop-ProcessTree -Process $proc; [void]$proc.WaitForExit(5000) } catch { }
+    }
     foreach ($name in $removedEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name, $removedEnvironment[$name]) }
     $env:DEVPILOT_OFFLINE_TELEMETRY_MODE = $savedTelemetryMode
     $env:DEVPILOT_OFFLINE_TELEMETRY_PATH = $savedTelemetryPath
 }
 
-$telemetry = Get-TelemetryProof -TelemetryPath $telemetryPath
-# Telemetry is a FALSIFIER here, not a verifier, and the distinction is stated
-# rather than papered over. A no-model capture stops before the model boundary,
-# so it opens no provider session and serves no recorded read: an empty sink is
-# the CORRECT outcome, and demanding events would fail every honest capture.
-# What telemetry can still do is disprove the claim - any process start, live
-# provider activity or write tool it records fails the run. The positive evidence
-# comes from the published bundle instead: exactly one model-boundary hit proves
-# the production path really ran all the way to the boundary and stopped there.
-$telemetryFalsifiesNothing = ($telemetry.childProcessStarts -eq 0 -and $telemetry.modelOrAgencyStarts -eq 0 -and
+$telemetryFailure = ''
+try { $telemetry = Get-TelemetryProof -TelemetryPath $telemetryPath }
+catch {
+    $telemetryFailure = [string]$_.Exception.Message
+    $telemetry = [ordered]@{
+        fileExists = [bool](Test-Path -LiteralPath $telemetryPath -PathType Leaf)
+        parseError = ''
+        proofError = $telemetryFailure
+        totalEvents = 0
+        sealedReplayServes = 0
+        childProcessStarts = 0
+        modelOrAgencyStarts = 0
+        providerLiveProcessStarts = 0
+        providerLiveWrites = 0
+        writeToolInvocations = 0
+    }
+}
+$telemetryComplete = ($telemetry.fileExists -and -not $telemetry.parseError -and -not $telemetry.proofError -and
+    $telemetry.totalEvents -gt 0 -and $telemetry.sealedReplayServes -gt 0)
+$telemetryShowsNoSideEffects = ($telemetry.childProcessStarts -eq 0 -and $telemetry.modelOrAgencyStarts -eq 0 -and
     $telemetry.providerLiveProcessStarts -eq 0 -and $telemetry.providerLiveWrites -eq 0 -and
     $telemetry.writeToolInvocations -eq 0)
-$zeroProcessProven = $telemetryFalsifiesNothing
+$zeroProcessProven = ($telemetryComplete -and $telemetryShowsNoSideEffects)
 
 $childStdErr = if (Test-Path -LiteralPath $stdErrPath) { [IO.File]::ReadAllText($stdErrPath, $Utf8).Trim() } else { '' }
 $captured = ($childExitCode -eq 0)
 $problems = @()
-if (-not $zeroProcessProven) {
+if ($telemetryFailure) {
+    $problems = @($problems) + @($telemetryFailure)
+}
+if (-not $telemetryShowsNoSideEffects) {
     $problems = @($problems) + @("telemetry proves a side effect occurred: $(($telemetry.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' ')")
 }
 $published = $false
@@ -832,6 +1076,14 @@ try {
             }
             else { @{} }
             $problems = @($problems) + @(Test-CaptureBundle -BundleRoot $publicationStaging -SealKey $captureSealKey -Expected $expected)
+            # Coverage is required for ANY published, sealed bundle - not just a
+            # successful one. A typed blocker is published, signed and reported
+            # with the same zero-side-effect claim, so leaving it uncovered would
+            # have left the prefix-truncation hole open on the very path most
+            # likely to have gone wrong.
+            $problems = @($problems) + @(Test-TelemetryCoversCapture -TelemetryPath $telemetryPath `
+                    -DocumentPath (Join-Path $publicationStaging $signedFile) `
+                    -Outcome $(if ($captured) { 'captured' } else { 'blocked' }))
             if ($problems.Count -eq 0) {
                 if (Test-Path -LiteralPath $outputFull) {
                     $problems = @($problems) + @("the capture output root '$outputFull' appeared during publication; it was not overwritten")
@@ -862,6 +1114,11 @@ $result = [ordered]@{
     ready           = ($captured -and $problems.Count -eq 0)
     role            = $Role
     model           = $Model
+    # The discovery generalist is reported alongside the captured role's model
+    # so the separation between them is OBSERVABLE in capture mode, not only in
+    # the Preflight readiness record. A regression that re-conflated the two
+    # would otherwise leave no artifact any test could read.
+    discoveryGeneralistModel = $discoveryModel
     outputRoot      = $outputFull
     supervision     = $supervision
     telemetry       = $telemetry
@@ -871,6 +1128,7 @@ $result = [ordered]@{
 Write-Output (($result | ConvertTo-Json -Depth 32 -Compress))
 if ($problems.Count -gt 0) {
     foreach ($p in $problems) { Write-Host "  - $p" -ForegroundColor Red }
+    if ($childStdErr) { Write-Host "  $childStdErr" -ForegroundColor Red }
     exit 2
 }
 if (-not $captured) {
@@ -889,3 +1147,7 @@ if (-not $captured) {
 }
 Write-Host "Role input capture verified: role=$Role model=$Model, zero model/agency/provider processes, zero live reads or writes." -ForegroundColor Green
 exit 0
+}
+finally {
+    if ($null -ne $outputLock) { $outputLock.Dispose() }
+}

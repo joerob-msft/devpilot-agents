@@ -4592,6 +4592,7 @@ Export-ModuleMember -Function @(
     "Assert-AgentReplaySnapshotPromotable",
     "Get-AgentReplayResponse",
     "Test-AgentReplaySnapshotHasResponse",
+    "Add-AgentOfflineTelemetryEvent",
     "Get-AgentSupportedProvider",
     "Test-AgentProviderSupported",
     "New-AgentProviderContext",
