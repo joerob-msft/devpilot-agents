@@ -120,8 +120,37 @@ New-Item -ItemType Directory -Force -Path $spConfigDir | Out-Null
 Copy-Item (Join-Path $conventionReplayRoot 'reviewer.config.json') (Join-Path $spConfigDir 'reviewer.config.json') -Force
 Copy-Item $promptSrc (Join-Path $spConfigDir 'review-cycle.prompt.md') -Force
 $spConfigFile = Join-Path $spConfigDir 'reviewer.config.json'
-$spProjection = (Resolve-Path (Join-Path $RepoRoot 'tools\testdata\reviewer-acquisition-specialist-projection.json')).Path
 $reviewerScript = (Resolve-Path (Join-Path $RepoRoot 'src\Agents\reviewer\Start-ReviewerAgent.ps1')).Path
+. (Join-Path $RepoRoot 'src\Agents\reviewer\AcquisitionPackage.ps1')
+. (Join-Path $RepoRoot 'src\Agents\reviewer\ReviewFacts.ps1')
+
+# The production plan binds the current reviewer script. Materialize a run-local
+# fixture projection so any legitimate wrapper edit keeps the fixture exact while
+# stale or tampered script bindings are still rejected by the child.
+$spProjection = Join-Path $runRoot 'specialist-projection.json'
+$spProjectionObject = Get-Content `
+    (Join-Path $RepoRoot 'tools\testdata\reviewer-acquisition-specialist-projection.json') -Raw |
+    ConvertFrom-Json -Depth 100
+$currentReviewerSha = (Get-FileHash -LiteralPath $reviewerScript -Algorithm SHA256).Hash.ToLowerInvariant()
+$spConventionPlan = $spProjectionObject.specialist.conventionPlanJson | ConvertFrom-Json -Depth 100
+$spConventionPlan.scriptSha256 = $currentReviewerSha
+$spProjectionObject.specialist.conventionPlanJson = $spConventionPlan | ConvertTo-Json -Depth 100 -Compress
+$spFactPlan = $spProjectionObject.specialist.factPlanJson | ConvertFrom-Json -Depth 100
+@($spFactPlan.hashes.scriptClosure | Where-Object {
+        [string]$_.path -ceq 'Start-ReviewerAgent.ps1'
+    })[0].sha256 = $currentReviewerSha
+$spFactBody = [pscustomobject][ordered]@{
+    planVersion = $spFactPlan.planVersion; schemaVersion = $spFactPlan.schemaVersion
+    extractorVersion = $spFactPlan.extractorVersion; status = $spFactPlan.status
+    binding = $spFactPlan.binding; hashes = $spFactPlan.hashes; domains = $spFactPlan.domains
+    facts = $spFactPlan.facts; factCount = $spFactPlan.factCount
+}
+$spFactCanonical = ConvertTo-ReviewerFactCanonicalJson -Value $spFactBody
+$spFactPlan.canonicalBytes = [Text.UTF8Encoding]::new($false).GetByteCount($spFactCanonical)
+$spFactPlan.planSha256 = Get-ReviewerFactSha256 -Text $spFactCanonical
+$spProjectionObject.specialist.factPlanJson = $spFactPlan | ConvertTo-Json -Depth 100 -Compress
+[IO.File]::WriteAllText($spProjection, ($spProjectionObject | ConvertTo-Json -Depth 100),
+    [Text.UTF8Encoding]::new($false))
 
 # ---------------------------------------------------------------------------
 # Result harness
@@ -233,7 +262,9 @@ function Assert-ExactAttempt {
 function Get-VerifierArgs {
     param([Parameter(Mandatory)][string]$Out, [Parameter(Mandatory)][string]$Manifest,
         [Parameter(Mandatory)][string]$DiscoveryPackage, [Parameter(Mandatory)][string]$Candidate,
-        [string]$Model = 'claude-opus-5', [int]$PerCall = 45, [int]$Total = 160, [int]$Activity = 60)
+        [string]$Model = 'claude-opus-5', [string]$SpecialistModel = 'claude-sonnet-5',
+        [int]$PerCall = 45, [int]$Total = 160, [int]$Activity = 60,
+        [switch]$UseConventionSnapshot)
     # The reciprocal cross-verification pair is the canonical {opus, gpt} generalist
     # pair; the verifier model to capture is one of them, so the OTHER configured
     # generalist model is simply its partner. Naming the partner (never the verifier
@@ -241,17 +272,89 @@ function Get-VerifierArgs {
     # models distinct while still binding the sealed discovery (opus) model as one of
     # them - a GPT verifier therefore pairs with opus, an opus verifier with gpt.
     $partnerGeneralist = if ($Model -ceq 'gpt-5.6-sol') { 'claude-opus-5' } else { 'gpt-5.6-sol' }
+    $verifierConfig = if ($UseConventionSnapshot) { $spConfigFile } else { $configFile }
+    $verifierReplayRoot = if ($UseConventionSnapshot) { $conventionReplayRoot } else { $replayRoot }
+    $verifierSnapshot = if ($UseConventionSnapshot) { 'synthetic-convention-pr' } else { 'synthetic-pr' }
+    $verifierDigest = if ($UseConventionSnapshot) { $conventionDigest } else { $digest }
     return @(
         '-Role', 'verifier', '-FixtureProjectionFile', $verProjection, '-Model', $Model,
-        '-ConfigFile', $configFile, '-ReplayRoot', $replayRoot,
-        '-ReplaySnapshotName', 'synthetic-pr', '-ReplayManifestDigest', $digest,
+        '-ConfigFile', $verifierConfig, '-ReplayRoot', $verifierReplayRoot,
+        '-ReplaySnapshotName', $verifierSnapshot, '-ReplayManifestDigest', $verifierDigest,
         '-OfflineModelAdapterManifest', $Manifest, '-ExpectedReviewerBaseCommit', $expectedBase,
         '-PullRequestId', '4242', '-ExpectedHeadCommit', $head, '-ExpectedRef', $ref,
         '-OutputRoot', $Out, '-SealKeyPath', $sealKey, '-AllowDirtyWorktree', '-UseOfflineStubAdapter',
         '-CandidateInputFile', $Candidate, '-DiscoveryPackageRoot', $DiscoveryPackage,
-        '-SecondGeneralistModel', $partnerGeneralist, '-ConventionSpecialistModel', 'claude-sonnet-5',
+        '-SecondGeneralistModel', $partnerGeneralist, '-ConventionSpecialistModel', $SpecialistModel,
         '-PerCallTimeoutSeconds', "$PerCall", '-TotalTimeoutSeconds', "$Total", '-ActivityTimeoutSeconds', "$Activity"
     )
+}
+
+function Copy-MutatedCandidate {
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][scriptblock]$Mutation
+    )
+    $candidate = Get-Content -LiteralPath $Source -Raw -Encoding UTF8 |
+        ConvertFrom-Json -AsHashtable -Depth 64
+    & $Mutation $candidate
+    $path = Join-Path $runRoot $Name
+    [IO.File]::WriteAllText(
+        $path,
+        ($candidate | ConvertTo-Json -Depth 64),
+        [Text.UTF8Encoding]::new($false))
+    return $path
+}
+
+function Copy-ResealedPackageWithStaleScript {
+    param([Parameter(Mandatory)][string]$SourcePackage)
+    $root = New-OutDir 'specialist_stale_script'
+    Remove-Tree $root
+    $package = Join-Path $root 'package'
+    Copy-Item -LiteralPath $SourcePackage -Destination $package -Recurse -Force
+    Get-ChildItem -LiteralPath $package -Recurse -Force |
+        ForEach-Object { try { $_.Attributes = 'Normal' } catch { } }
+
+    $corePath = Join-Path $package 'capture-core.json'
+    $core = Get-Content -LiteralPath $corePath -Raw -Encoding UTF8 |
+        ConvertFrom-Json -AsHashtable -Depth 64
+    $core.digests.scriptSha256 = ('0' * 64)
+    $coreText = ConvertTo-ReviewerAcquisitionPackageCanonicalText -JsonText (
+        $core | ConvertTo-Json -Depth 64 -Compress)
+    [IO.File]::WriteAllText($corePath, $coreText, [Text.UTF8Encoding]::new($false))
+
+    $manifestPath = Join-Path $package 'transcript-package.json'
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 |
+        ConvertFrom-Json -AsHashtable -Depth 64
+    $manifest.digests.scriptSha256 = ('0' * 64)
+    $coreEntry = @($manifest.files | Where-Object { [string]$_.name -ceq 'capture-core.json' })[0]
+    $coreEntry.bytes = [IO.File]::ReadAllBytes($corePath).Length
+    $coreEntry.sha256 = (Get-FileHash -LiteralPath $corePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $manifestText = ConvertTo-ReviewerAcquisitionPackageCanonicalText -JsonText (
+        $manifest | ConvertTo-Json -Depth 64 -Compress)
+    [IO.File]::WriteAllText($manifestPath, $manifestText, [Text.UTF8Encoding]::new($false))
+
+    $key = [IO.File]::ReadAllBytes($sealKey)
+    $hmac = [Security.Cryptography.HMACSHA256]::new($key)
+    try {
+        $hmacHex = [Convert]::ToHexString(
+            $hmac.ComputeHash([Text.UTF8Encoding]::new($false).GetBytes($manifestText))).ToLowerInvariant()
+    }
+    finally { $hmac.Dispose() }
+    $seal = [ordered]@{
+        schemaVersion = 1
+        kind = 'reviewer-blinded-transcript-package-seal'
+        manifestSha256 = Get-ReviewerAcquisitionPackageTextSha256 -Text $manifestText
+        manifestHmac = $hmacHex
+        sealedUtc = [DateTime]::UtcNow.ToString('o')
+    }
+    [IO.File]::WriteAllText(
+        (Join-Path $package 'transcript-package.seal'),
+        ($seal | ConvertTo-Json -Depth 8),
+        [Text.UTF8Encoding]::new($false))
+    Get-ChildItem -LiteralPath $package -File -Recurse -Force |
+        ForEach-Object { $_.Attributes = $_.Attributes -bor [IO.FileAttributes]::ReadOnly }
+    return $package
 }
 
 # Build the full specialist acquisition arg set against the convention snapshot
@@ -930,7 +1033,8 @@ $discPkg = Join-Path (New-OutDir 'beh_successOpus') 'package'   # reuse Group C'
 $extractTool = Join-Path $PSScriptRoot 'Get-ReviewerDiscoveryCandidate.ps1'
 $genFixtureId = [string]((Get-Content $genProjection -Raw | ConvertFrom-Json).fixtureId)
 $derivedCand = Join-Path $runRoot 'derived-candidate.json'
-& pwsh -NoProfile -File $extractTool -DiscoveryPackageRoot $discPkg -OutputFile $derivedCand -SourceFixtureId $genFixtureId *> (Join-Path $logDir 'extract-candidate.log')
+& pwsh -NoProfile -File $extractTool -DiscoveryPackageRoot $discPkg -SealKeyPath $sealKey `
+    -OutputFile $derivedCand -SourceFixtureId $genFixtureId *> (Join-Path $logDir 'extract-candidate.log')
 $exExtract = $LASTEXITCODE
 Check 'discovery candidate extracted from the sealed discovery marker' (($exExtract -eq 0) -and (Test-Path -LiteralPath $derivedCand)) ("exit=$exExtract")
 
@@ -1104,14 +1208,16 @@ Check 'verifier refuses a candidate sourceFixtureId != sealed package fixtureId 
 # package and REFUSES an operator -SourceFixtureId that disagrees with the sealed
 # evidence: the operator can confirm the fixture but can never assert it.
 $hxLog = Join-Path $logDir 'extract-crossfixture.log'
-& pwsh -NoProfile -File $extractTool -DiscoveryPackageRoot $discPkg -OutputFile (Join-Path $runRoot 'unused-crossfixture.json') -SourceFixtureId 'not-the-package-fixture' *> $hxLog
+& pwsh -NoProfile -File $extractTool -DiscoveryPackageRoot $discPkg -SealKeyPath $sealKey `
+    -OutputFile (Join-Path $runRoot 'unused-crossfixture.json') -SourceFixtureId 'not-the-package-fixture' *> $hxLog
 $hxExit = $LASTEXITCODE
 Check 'extraction helper refuses a -SourceFixtureId != sealed package fixtureId (blocker 1)' ($hxExit -ne 0) ("exit=$hxExit")
 
 # G10 (blocker 1) - with NO -SourceFixtureId the helper derives the fixture SOLELY from
 # the sealed package evidence, and the derived candidate's sourceFixtureId equals it.
 $derivedNoFix = Join-Path $runRoot 'derived-candidate-nofix.json'
-& pwsh -NoProfile -File $extractTool -DiscoveryPackageRoot $discPkg -OutputFile $derivedNoFix *> (Join-Path $logDir 'extract-nofix.log')
+& pwsh -NoProfile -File $extractTool -DiscoveryPackageRoot $discPkg -SealKeyPath $sealKey `
+    -OutputFile $derivedNoFix *> (Join-Path $logDir 'extract-nofix.log')
 $nfExit = $LASTEXITCODE
 Check 'extraction helper derives a candidate without -SourceFixtureId (blocker 1)' (($nfExit -eq 0) -and (Test-Path -LiteralPath $derivedNoFix)) ("exit=$nfExit")
 if (Test-Path -LiteralPath $derivedNoFix) {
@@ -1231,7 +1337,61 @@ function Test-Specialist {
         Check "specialist $Name first attempt was retryable" ([bool]@($m.attempts)[0].retryable) ''
     }
 }
-Test-Specialist -Name 'success' -Behavior 'success' -ExpectAttempts 1 -ExpectStatus 'captured'
+$specialistFindingTemplate = [ordered]@{
+    schemaVersion = 2
+    prId = '{{binding.prId}}'
+    repositoryId = '{{binding.repositoryId}}'
+    project = '{{binding.project}}'
+    reviewedSourceCommit = '{{binding.reviewedSourceCommit}}'
+    targetCommit = '{{binding.targetCommit}}'
+    changeSetDigest = '{{binding.changeSetDigest}}'
+    conventionPlanSha256 = '{{binding.conventionPlanSha256}}'
+    factPlanSha256 = '{{binding.factPlanSha256}}'
+    configSha256 = '{{binding.configSha256}}'
+    scriptSha256 = '{{binding.scriptSha256}}'
+    promptSha256 = '{{binding.promptSha256}}'
+    candidates = @([ordered]@{
+            candidateId = 'immutable-state-reassignment'; category = 'convention'
+            severity = 'suggestion'; anchorKind = 'changedFile'; filePath = '/src/Widget.cs'; line = 15
+            primaryTarget = 'cf0:15'; manifestations = ''; packName = 'widget-core'
+            ruleSourceId = 'widget-rules'
+            ruleSourceRepositoryId = '11111111-2222-3333-4444-555555555555'
+            ruleSourcePath = '/docs/conventions.md'
+            ruleSourceCommit = 'f0e1d2c3b4a5f6e7d8c9b0a1f2e3d4c5b6a7f8e9'
+            ruleSourceSha256 = '4b63e99eb07cf85e89dfdff08eca824ecfc305dcf2ba6ca4b71a691c978b8e12'
+            ruleSection = 'Immutable state'; ruleQuote = 'never reassigning it'
+            diffEvidence = 'The changed Rename method reassigns widgetId after construction.'
+            impactCategory = 'none'
+            impact = 'The object no longer preserves the authoritative immutable-state convention.'
+            expectedFixOrValidation = 'Remove the reassignment or construct a new immutable widget.'
+            siblingStatus = 'notRequired'; siblingEvidence = ''
+            siblingNotRequiredReason = 'The violation is fully established by the changed assignment.'
+            factIds = ''; confidence = 'high'; residualRiskSummary = ''
+            semanticCandidateVersion = 2
+            changedCodeFix = [ordered]@{
+                action = 'remove'; targets = 'cf0:15'; conventionKey = 'ImmutableState'
+                valueSource = 'authoritativeRule'; evidenceFactIds = ''
+            }
+            existingDebtFollowUp = [ordered]@{
+                status = 'none'; evidenceFactId = ''; selectorKey = ''; scopeKind = ''; scopePath = ''
+                comparableCount = 0; compliantCount = 0; action = ''
+            }
+        })
+    ruleCoverage = @([ordered]@{
+            ruleRef = 'rs0'
+            ruleSourceSha256 = '4b63e99eb07cf85e89dfdff08eca824ecfc305dcf2ba6ca4b71a691c978b8e12'
+            ruleQuote = 'never reassigning it'; status = 'violation'; scope = 'none'
+            violatingConstructs = 'as0'; compliantConstructs = ''
+            notInReachConstructs = 'dc0'; unknownConstructs = ''
+            violatingChangedFileTargets = 'cf0:15'
+            codeEvidence = 'The changed line reassigns widgetId after construction.'
+            siblingStatus = 'notRequired'; siblingEvidence = ''
+            candidateId = 'immutable-state-reassignment'; notes = ''
+        })
+    withheld = @(); residualRisks = @(); nonce = '{{binding.nonce}}'
+}
+Test-Specialist -Name 'success' -Behavior 'success' -RoleExtra @{ markerTemplate = $specialistFindingTemplate } `
+    -ExpectAttempts 1 -ExpectStatus 'captured'
 Test-Specialist -Name 'missingMarker' -Behavior 'missingMarker' -ExpectAttempts 3 -ExpectStatus 'captureFailedRetriesExhausted' -DistinctNonces
 Test-Specialist -Name 'truncatedMarker' -Behavior 'truncatedMarker' -ExpectAttempts 3 -ExpectStatus 'captureFailedRetriesExhausted' -DistinctNonces
 Test-Specialist -Name 'schemaInvalidMarker' -Behavior 'schemaInvalidMarker' -ExpectAttempts 3 -ExpectStatus 'captureFailedRetriesExhausted' -DistinctNonces
@@ -1249,6 +1409,67 @@ $spSchema = Read-Json (Join-Path (New-OutDir 'sp_schemaInvalidMarker') 'package\
 Assert-ExactAttempt -Attempt (@($spSchema.attempts)[0]) -Label 'specialist schemaInvalidMarker' -ExpectStatus 'schemaInvalid' -ExpectRetryable $true -ExpectDetailNonEmpty
 $spWrong = Read-Json (Join-Path (New-OutDir 'sp_wrongBinding') 'package\transcript-package.json')
 Assert-ExactAttempt -Attempt (@($spWrong.attempts)[-1]) -Label 'specialist wrongBinding' -ExpectStatus 'wrongBinding' -ExpectRetryable $false -ExpectDetail 'nonce'
+
+# J2 - an authenticated specialist package projects convention-origin candidates,
+# and either configured generalist can verify them. The specialist itself cannot.
+$specialistPackage = Join-Path (New-OutDir 'sp_success') 'package'
+$specialistCandidate = Join-Path $runRoot 'specialist-discovery-candidate.json'
+& pwsh -NoProfile -File $extractTool -DiscoveryPackageRoot $specialistPackage `
+    -SealKeyPath $sealKey -OutputFile $specialistCandidate *> (Join-Path $logDir 'specialist-extract.log')
+$specialistExtractExit = $LASTEXITCODE
+Check 'specialist package extracts an authenticated candidate' (
+    $specialistExtractExit -eq 0 -and (Test-Path -LiteralPath $specialistCandidate)) "exit=$specialistExtractExit"
+if (Test-Path -LiteralPath $specialistCandidate) {
+    $sc = Read-Json $specialistCandidate
+    Check 'specialist candidate preserves specialist/convention origin' (
+        [string]$sc.sourceRole -ceq 'specialist' -and
+        [string]$sc.sourceModel -ceq 'claude-sonnet-5' -and
+        @($sc.candidates).Count -gt 0 -and
+        @($sc.candidates | Where-Object {
+                [string]$_.originKind -cne 'convention' -or
+                [string]$_.originModel -cne 'claude-sonnet-5'
+            }).Count -eq 0)
+
+    foreach ($target in @(
+            @{ Tag = 'opus'; Model = 'claude-opus-5'; RoleName = 'reciprocal-opus-verifier' },
+            @{ Tag = 'gpt'; Model = 'gpt-5.6-sol'; RoleName = 'reciprocal-gpt-verifier' })) {
+        $out = New-OutDir "specialist_verifier_$($target.Tag)"
+        $manifest = New-VariantManifest -Tag "specialistVerifier$($target.Tag)" `
+            -Behavior 'success' -RoleName $target.RoleName
+        $run = Invoke-Tool -ToolArgs (Get-VerifierArgs -Out $out -Manifest $manifest `
+                -DiscoveryPackage $specialistPackage -Candidate $specialistCandidate `
+                -Model $target.Model -UseConventionSnapshot) -LogName "specialist-verifier-$($target.Tag).log"
+        Check "specialist candidate -> $($target.Tag) verifier succeeds" ($run.Exit -eq 0) "exit=$($run.Exit)"
+        if (Test-Path -LiteralPath (Join-Path $out 'package\transcript-package.json')) {
+            $sealedVerifier = Read-Json (Join-Path $out 'package\transcript-package.json')
+            Check "$($target.Tag) verifier seals exact target model" (
+                [string]$sealedVerifier.role -ceq 'verifier' -and
+                [string]$sealedVerifier.requestedModel -ceq [string]$target.Model -and
+                [string]$sealedVerifier.terminalStatus -ceq 'captured')
+        }
+    }
+
+    $badOrigin = Join-Path $runRoot 'specialist-candidate-badorigin.json'
+    $badOriginObject = Read-Json $specialistCandidate
+    $badOriginObject.candidates[0].originKind = 'generalist'
+    ($badOriginObject | ConvertTo-Json -Depth 64) | Set-Content -LiteralPath $badOrigin -Encoding UTF8
+    $badOriginOut = New-OutDir 'specialist_verifier_badorigin'
+    $badOriginManifest = New-VariantManifest -Tag 'specialistVerifierBadOrigin' `
+        -Behavior 'success' -RoleName 'reciprocal-opus-verifier'
+    $badOriginRun = Invoke-Tool -ToolArgs (Get-VerifierArgs -Out $badOriginOut `
+            -Manifest $badOriginManifest -DiscoveryPackage $specialistPackage `
+            -Candidate $badOrigin -UseConventionSnapshot) -LogName 'specialist-verifier-badorigin.log'
+    Check 'specialist candidate with fabricated generalist origin is rejected' ($badOriginRun.Exit -ne 0) "exit=$($badOriginRun.Exit)"
+
+    $specialistTargetOut = New-OutDir 'specialist_as_verifier'
+    $specialistTargetManifest = New-VariantManifest -Tag 'specialistAsVerifier' `
+        -Behavior 'success' -RoleName 'reciprocal-opus-verifier'
+    $specialistTargetRun = Invoke-Tool -ToolArgs (Get-VerifierArgs -Out $specialistTargetOut `
+            -Manifest $specialistTargetManifest -DiscoveryPackage $specialistPackage `
+            -Candidate $specialistCandidate -Model 'claude-sonnet-5' -UseConventionSnapshot) `
+        -LogName 'specialist-as-verifier.log'
+    Check 'configured specialist is rejected as verifier target' ($specialistTargetRun.Exit -ne 0) "exit=$($specialistTargetRun.Exit)"
+}
 
 # ---------------------------------------------------------------------------
 # Group K - Inner authorization-token gate + adapter containment, proven by
@@ -1511,6 +1732,103 @@ if ($script:WrongRef) {
 }
 else {
     Write-Host '  [SKIP] no parent commit available to materialize a valid-but-wrong ref' -ForegroundColor Yellow
+}
+
+# ---------------------------------------------------------------------------
+# Group O - An authenticated specialist convention package is an independent
+#           discovery source for either generalist verifier. The specialist
+#           itself remains ineligible as a verifier, and every role/model/
+#           fixture/snapshot/candidate provenance mismatch fails before launch.
+# ---------------------------------------------------------------------------
+Write-Host "`n== Group O: specialist-origin verifier acquisition ==" -ForegroundColor Cyan
+$spPackage = $specialistPackage
+$spCandidate = $specialistCandidate
+Check 'specialist-origin rejection matrix has an authenticated source package and candidate' (
+    (Test-Path -LiteralPath (Join-Path $spPackage 'transcript-package.json')) -and
+    (Test-Path -LiteralPath $spCandidate))
+if (Test-Path -LiteralPath $spCandidate) {
+    $spCandidateJson = Read-Json $spCandidate
+    Check 'specialist candidate binds the configured specialist model and role' (
+        [string]$spCandidateJson.sourceRole -ceq 'specialist' -and
+        [string]$spCandidateJson.sourceModel -ceq 'claude-sonnet-5')
+    Check 'every specialist-origin candidate is a convention candidate' (
+        @($spCandidateJson.candidates).Count -gt 0 -and
+        @($spCandidateJson.candidates | Where-Object {
+                [string]$_.originKind -cne 'convention' -or
+                [string]$_.originModel -cne [string]$spCandidateJson.sourceModel
+            }).Count -eq 0)
+
+    foreach ($target in @('gpt-5.6-sol', 'claude-opus-5')) {
+        $roleName = if ($target -ceq 'gpt-5.6-sol') {
+            'reciprocal-gpt-verifier'
+        } else {
+            'reciprocal-opus-verifier'
+        }
+        $targetOut = New-OutDir ("specialist_to_" + $roleName)
+        $targetManifest = New-VariantManifest -Tag ("specialistTo" + $roleName) -Behavior 'success' -RoleName $roleName
+        $targetRun = Invoke-Tool -ToolArgs (Get-VerifierArgs -Out $targetOut -Manifest $targetManifest `
+                -DiscoveryPackage $spPackage -Candidate $spCandidate -Model $target -UseConventionSnapshot) `
+            -LogName ("specialist-to-" + $roleName + '.log')
+        Check "specialist package can seed a fresh $target verifier" (
+            ($targetRun.Exit -eq 0) -and
+            (Test-Path -LiteralPath (Join-Path $targetOut 'package\transcript-package.json'))) `
+            ("exit=$($targetRun.Exit)")
+    }
+
+    $spWrongRole = Copy-MutatedCandidate -Source $spCandidate -Name 'specialist-wrong-role.json' -Mutation {
+        param($c) $c.sourceRole = 'generalist'
+    }
+    $spWrongProvenance = Copy-MutatedCandidate -Source $spCandidate -Name 'specialist-wrong-provenance.json' -Mutation {
+        param($c) $c.candidates[0].originKind = 'generalist'
+    }
+    $spWrongHash = Copy-MutatedCandidate -Source $spCandidate -Name 'specialist-wrong-hash.json' -Mutation {
+        param($c) $c.candidates[0].candidateHash = ('0' * 64)
+    }
+    $spWrongFixture = Copy-MutatedCandidate -Source $spCandidate -Name 'specialist-wrong-fixture.json' -Mutation {
+        param($c) $c.sourceFixtureId = 'fabricated-specialist-fixture'
+    }
+    $spStalePackage = Copy-ResealedPackageWithStaleScript -SourcePackage $spPackage
+    $spStaleCandidate = Join-Path $runRoot 'specialist-stale-script-candidate.json'
+    & pwsh -NoProfile -File $extractTool -DiscoveryPackageRoot $spStalePackage -SealKeyPath $sealKey `
+        -OutputFile $spStaleCandidate *> (Join-Path $logDir 'specialist-stale-script-extract.log')
+    Check 'authenticated stale-script specialist package can be independently decoded for gate testing' (
+        ($LASTEXITCODE -eq 0) -and (Test-Path -LiteralPath $spStaleCandidate))
+    $specialistRejects = @(
+        @{ Name = 'wrong specialist candidate role'; Candidate = $spWrongRole; SpecialistModel = 'claude-sonnet-5'; Convention = $true; Target = 'gpt-5.6-sol' },
+        @{ Name = 'wrong specialist candidate provenance'; Candidate = $spWrongProvenance; SpecialistModel = 'claude-sonnet-5'; Convention = $true; Target = 'gpt-5.6-sol' },
+        @{ Name = 'fabricated specialist candidate hash'; Candidate = $spWrongHash; SpecialistModel = 'claude-sonnet-5'; Convention = $true; Target = 'gpt-5.6-sol' },
+        @{ Name = 'cross-fixture specialist candidate'; Candidate = $spWrongFixture; SpecialistModel = 'claude-sonnet-5'; Convention = $true; Target = 'gpt-5.6-sol' },
+        @{ Name = 'wrong configured specialist model'; Candidate = $spCandidate; SpecialistModel = 'gpt-5.4'; Convention = $true; Target = 'gpt-5.6-sol' },
+        @{ Name = 'cross-snapshot specialist package'; Candidate = $spCandidate; SpecialistModel = 'claude-sonnet-5'; Convention = $false; Target = 'gpt-5.6-sol' },
+        @{ Name = 'specialist target verifier'; Candidate = $spCandidate; SpecialistModel = 'claude-sonnet-5'; Convention = $true; Target = 'claude-sonnet-5' }
+    )
+    foreach ($case in $specialistRejects) {
+        $caseOut = New-OutDir ('reject_' + ([regex]::Replace([string]$case.Name, '[^a-zA-Z0-9]+', '_')))
+        $caseManifest = New-VariantManifest -Tag ([regex]::Replace([string]$case.Name, '[^a-zA-Z0-9]+', '')) `
+            -Behavior 'success' -RoleName 'reciprocal-gpt-verifier'
+        $caseArgs = Get-VerifierArgs -Out $caseOut -Manifest $caseManifest -DiscoveryPackage $spPackage `
+            -Candidate ([string]$case.Candidate) -Model ([string]$case.Target) `
+            -SpecialistModel ([string]$case.SpecialistModel)
+        if ([bool]$case.Convention) { $caseArgs += '-UseConventionSnapshot' }
+        $caseRun = Invoke-Tool -ToolArgs $caseArgs -LogName (
+            'reject-' + ([regex]::Replace([string]$case.Name, '[^a-zA-Z0-9]+', '-')) + '.log')
+        Check "$($case.Name) is refused before a verifier capture" (
+            ($caseRun.Exit -ne 0) -and
+            -not (Test-Path -LiteralPath (Join-Path $caseOut 'package\transcript-package.json'))) `
+            ("exit=$($caseRun.Exit)")
+    }
+    if (Test-Path -LiteralPath $spStaleCandidate) {
+        $staleOut = New-OutDir 'reject_specialist_stale_script'
+        $staleManifest = New-VariantManifest -Tag 'specialistStaleScript' -Behavior 'success' `
+            -RoleName 'reciprocal-gpt-verifier'
+        $staleRun = Invoke-Tool -ToolArgs (Get-VerifierArgs -Out $staleOut -Manifest $staleManifest `
+                -DiscoveryPackage $spStalePackage -Candidate $spStaleCandidate -Model 'gpt-5.6-sol' `
+                -UseConventionSnapshot) -LogName 'reject-specialist-stale-script.log'
+        Check 'stale reviewer-script identity in an authenticated specialist package is refused' (
+            ($staleRun.Exit -ne 0) -and
+            -not (Test-Path -LiteralPath (Join-Path $staleOut 'package\transcript-package.json'))) `
+            ("exit=$($staleRun.Exit)")
+    }
 }
 
 # ---------------------------------------------------------------------------

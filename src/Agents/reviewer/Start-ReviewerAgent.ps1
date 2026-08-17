@@ -408,6 +408,11 @@ param(
     # its digest against the plan), never from truth.
     [string]$AcquisitionDiscoveryMarkerFile,
 
+    # The HMAC-authenticated package's bound capture-core. Specialist discovery
+    # uses its production-resolved convention candidate projection; acquisition
+    # plans bind these exact bytes before the child reads them.
+    [string]$AcquisitionDiscoveryCoreFile,
+
     # Test-only switch. Required for blinded acquisition to accept the offline
     # stub adapter at all; it also pins execution to the repository's own sealed
     # offline adapter script (containment). Without it, acquisition refuses the
@@ -10265,7 +10270,7 @@ function Invoke-ReviewerConventionSpecialistPass {
                     -ExpectedProject $ExpectedProject -ExpectedNonce $nonce
                 try {
                     $specialistScanWindow = Assert-ReviewerModelResultContractFits -Surface "convention specialist" `
-                        -Schema $specialistSchema -ScanWindowChars $script:ReviewerConventionSpecialistScanWindowChars `
+                        -Schema $specialistSchema -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars) `
                         -MaxOutputBytes $script:ReviewerConventionSpecialistMaxOutputBytes
                 }
                 catch {
@@ -16365,6 +16370,15 @@ function Invoke-ReviewerBlindedAcquisitionRun {
         if (-not $AcquisitionDiscoveryMarkerFile -or -not (Test-Path -LiteralPath $AcquisitionDiscoveryMarkerFile -PathType Leaf)) {
             throw "The verifier role requires -AcquisitionDiscoveryMarkerFile naming the discovery result marker extracted from the sealed discovery package."
         }
+        if (-not $AcquisitionDiscoveryCoreFile -or -not (Test-Path -LiteralPath $AcquisitionDiscoveryCoreFile -PathType Leaf)) {
+            throw "The verifier role requires -AcquisitionDiscoveryCoreFile naming the sealed discovery capture-core."
+        }
+        $discoveryCorePath = (Resolve-Path -LiteralPath $AcquisitionDiscoveryCoreFile).Path
+        $discoveryCoreSha256 = (Get-FileHash -LiteralPath $discoveryCorePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($discoveryCoreSha256 -cne [string]$planDiscovery.sourceCoreSha256) {
+            throw "The discovery capture-core SHA-256 does not match the plan's sealed discovery binding."
+        }
+        $discoveryCore = [IO.File]::ReadAllText($discoveryCorePath, $script:ReviewerUtf8) | ConvertFrom-Json -Depth 64
         $discoveryMarkerText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $AcquisitionDiscoveryMarkerFile).Path, $script:ReviewerUtf8)
         $discoveryMarkerSha256 = Get-ReviewerTextSha256 -Text $discoveryMarkerText
         if ($discoveryMarkerSha256 -cne [string]$planDiscovery.markerSha256) {
@@ -16375,8 +16389,10 @@ function Invoke-ReviewerBlindedAcquisitionRun {
             [string]$planDiscovery.sourceFixtureId -cne [string]$planCandidate.sourceFixtureId) {
             throw "The sealed discovery provenance identity does not agree with the plan's candidate binding."
         }
-        if ([string]$planDiscovery.sourceRole -cne 'generalist') {
-            throw "The sealed discovery provenance must be a generalist discovery capture, not '$([string]$planDiscovery.sourceRole)'."
+        $discoverySourceRole = [string]$planDiscovery.sourceRole
+        if ($discoverySourceRole -cnotin @('generalist', 'specialist') -or
+            [string]$discoveryCore.role -cne $discoverySourceRole) {
+            throw "The sealed discovery role is not an authenticated generalist or specialist source."
         }
         # Parse the discovery model's marker with the EXACT production CLI-envelope
         # reader, then rebuild the single generalist pass the verifier cross-checks.
@@ -16386,13 +16402,48 @@ function Invoke-ReviewerBlindedAcquisitionRun {
         $discoveryCliOutcome = Get-AgentCliJsonOutcome -StdOutText $discoveryMarkerText
         $discoveryAnswer = if ($discoveryCliOutcome -and $discoveryCliOutcome.Answer) { [string]$discoveryCliOutcome.Answer } else { $discoveryMarkerText }
         $discoveryAnswer = $discoveryAnswer.Trim()
-        $discoveryPrefixIndex = $discoveryAnswer.IndexOf($ResultMarkerPrefix, [System.StringComparison]::Ordinal)
-        if ($discoveryPrefixIndex -ge 0) {
-            $discoveryAnswer = $discoveryAnswer.Substring($discoveryPrefixIndex + $ResultMarkerPrefix.Length).Trim()
+        $expectedDiscoveryPrefix = if ($discoverySourceRole -ceq 'specialist') {
+            [string]$script:ReviewerConventionSpecialistMarkerPrefix
         }
+        else { [string]$ResultMarkerPrefix }
+        $discoveryPrefixIndex = $discoveryAnswer.IndexOf($expectedDiscoveryPrefix, [System.StringComparison]::Ordinal)
+        if ($discoveryPrefixIndex -lt 0) {
+            throw "The sealed discovery result marker does not carry its role's production result-marker prefix."
+        }
+        $discoveryAnswer = $discoveryAnswer.Substring($discoveryPrefixIndex + $expectedDiscoveryPrefix.Length).Trim()
         $discoveryMarker = $null
         try { $discoveryMarker = $discoveryAnswer | ConvertFrom-Json -Depth 64 }
         catch { throw "The sealed discovery result marker is not valid JSON; the verifier cannot rebuild its discovery pass." }
+        if ($discoverySourceRole -ceq 'specialist') {
+            if (-not $discoveryCore.PSObject.Properties['sourceProjection'] -or
+                [string]$discoveryCore.sourceProjection.sourceRole -cne 'specialist' -or
+                -not $discoveryCore.sourceProjection.PSObject.Properties['binding'] -or
+                -not $discoveryCore.sourceProjection.PSObject.Properties['digests']) {
+                throw "The sealed specialist capture-core is missing its production-resolved source projection."
+            }
+            $specialistBinding = $discoveryCore.sourceProjection.binding
+            $specialistDigests = $discoveryCore.sourceProjection.digests
+            $specialistSchema = Get-ReviewerConventionSpecialistMarkerSchema `
+                -ExpectedProject ([string]$planTarget.project) -ExpectedNonce ([string]$discoveryCore.nonce)
+            $specialistOutcome = ConvertFrom-AgentResultMarkerOutcome `
+                -StdOutText $discoveryMarkerText -MarkerPrefix $expectedDiscoveryPrefix `
+                -Schema $specialistSchema -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars)
+            if ([string]$specialistOutcome.Status -cne 'success') {
+                throw "The sealed specialist result marker failed the exact production schema: $([string]$specialistOutcome.Status)."
+            }
+            $discoveryMarker = $specialistOutcome.Value
+            if (-not (Test-ReviewerConventionSpecialistBinding -Marker $discoveryMarker `
+                    -PrId ([int]$specialistBinding.prId) -RepositoryId ([string]$specialistBinding.repositoryId) `
+                    -SourceCommit ([string]$specialistBinding.sourceCommit) -TargetCommit ([string]$specialistBinding.targetCommit) `
+                    -ChangeSetDigest ([string]$specialistBinding.changeSetDigest) `
+                    -ConventionPlanSha256 ([string]$specialistDigests.conventionPlanSha256) `
+                    -FactPlanSha256 ([string]$specialistDigests.factPlanSha256) `
+                    -ConfigSha256 ([string]$specialistDigests.configSha256) `
+                    -ScriptSha256 ([string]$specialistDigests.scriptSha256) `
+                    -PromptSha256 ([string]$specialistDigests.promptSha256))) {
+                throw "The sealed specialist result marker does not match its exact package identities and production digests."
+            }
+        }
 
         # -- Blocker 1: the signed plan binds the result-marker prefix + FULL
         #    binding the supervisor DERIVED from the sealed discovery marker.
@@ -16401,8 +16452,8 @@ function Invoke-ReviewerBlindedAcquisitionRun {
         #    metadata for provenance. The prefix must be the exact production
         #    result-marker prefix this build scans for, and the binding must cover
         #    the fixture PR / repository / project / source commit.
-        if ([string]$planDiscovery.resultMarkerPrefix -cne $ResultMarkerPrefix) {
-            throw "The plan's sealed discovery resultMarkerPrefix does not match this build's production result-marker prefix."
+        if ([string]$planDiscovery.resultMarkerPrefix -cne $expectedDiscoveryPrefix) {
+            throw "The plan's sealed discovery resultMarkerPrefix does not match this role's production result-marker prefix."
         }
         if ($null -eq $planDiscovery.resultMarkerBinding) {
             throw "The plan's sealed discovery provenance is missing its resultMarkerBinding."
@@ -16426,8 +16477,18 @@ function Invoke-ReviewerBlindedAcquisitionRun {
         # of this build's configured generalist models, so the candidate the
         # verifier scores is one production discovery could actually have produced.
         $discoverySourceModel = [string]$planDiscovery.sourceModel
-        if (-not (@($ReviewPassModels) | Where-Object { [string]$_ -ceq $discoverySourceModel })) {
+        if ($discoverySourceRole -ceq 'generalist' -and
+            -not (@($ReviewPassModels) | Where-Object { [string]$_ -ceq $discoverySourceModel })) {
             throw "The sealed discovery model '$discoverySourceModel' is not one of this build's configured generalist models."
+        }
+        if ($discoverySourceRole -ceq 'specialist') {
+            if ($discoverySourceModel -cne [string]$EffectiveConventionSpecialistModel) {
+                throw "The sealed specialist source model '$discoverySourceModel' is not the configured convention specialist '$EffectiveConventionSpecialistModel'."
+            }
+            if (-not (@($ReviewPassModels) | Where-Object { [string]$_ -ceq [string]$plan.model }) -or
+                [string]$plan.model -ceq $discoverySourceModel) {
+                throw "A convention specialist cannot be the verifier; the authorized verifier must be one configured generalist."
+            }
         }
 
         # -- Blocker A: PROVE the candidate is the projection of the sealed
@@ -16436,8 +16497,17 @@ function Invoke-ReviewerBlindedAcquisitionRun {
         #    clustering functions, then require the independently supplied
         #    candidate file to match that derivation EXACTLY - the same candidate
         #    set (candidateId + candidateHash) and the same clusterId.
-        $discoveryOnlyPass = @{ Model = $discoverySourceModel; Marker = $discoveryMarker; Reason = '' }
-        $derivedCandidates = @(ConvertTo-ReviewerVerificationCandidates -GeneralistPasses @($discoveryOnlyPass))
+        $specialistCandidates = @()
+        if ($discoverySourceRole -ceq 'specialist') {
+            if (-not $discoveryCore.PSObject.Properties['sourceProjection'] -or
+                [string]$discoveryCore.sourceProjection.sourceRole -cne 'specialist') {
+                throw "The sealed specialist capture-core is missing its production-resolved source projection."
+            }
+            $specialistCandidates = @($discoveryCore.sourceProjection.candidates)
+        }
+        $derivedCandidates = @(ConvertTo-ReviewerIndependentDiscoveryCandidates `
+                -SourceRole $discoverySourceRole -SourceModel $discoverySourceModel `
+                -Marker $discoveryMarker -SpecialistCandidates $specialistCandidates)
         if ($derivedCandidates.Count -eq 0) {
             throw "The sealed discovery marker yielded no candidates; a verifier cross-check requires at least one discovery finding."
         }
@@ -16784,6 +16854,16 @@ function Invoke-ReviewerBlindedAcquisitionRun {
     }
     $terminalMarkerText = if ($terminalCliOutcome -and $terminalCliOutcome.Answer) { [string]$terminalCliOutcome.Answer } else { [string]$terminalCap.stdOut }
     [IO.File]::WriteAllText((Join-Path $outputRoot 'result-marker.txt'), $terminalMarkerText, $script:ReviewerUtf8)
+    $terminalSpecialistMarker = $null
+    if ($AcquireTranscriptRole -ceq 'specialist' -and $terminalStatus -ceq 'captured') {
+        $terminalSpecialistOutcome = ConvertFrom-AgentResultMarkerOutcome `
+            -StdOutText $terminalMarkerText -MarkerPrefix ([string]$script:ReviewerConventionSpecialistMarkerPrefix) `
+            -Schema $roleMarkerSchema -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars)
+        if ([string]$terminalSpecialistOutcome.Status -cne 'success') {
+            throw "The captured specialist marker could not be revalidated for its sealed source projection."
+        }
+        $terminalSpecialistMarker = $terminalSpecialistOutcome.Value
+    }
 
     $endedUtc = [DateTime]::UtcNow
     $captureCore = [ordered]@{
@@ -16808,6 +16888,36 @@ function Invoke-ReviewerBlindedAcquisitionRun {
         }
         terminalStatus    = $terminalStatus
         createdUtc        = $endedUtc.ToString('o')
+    }
+    if ($AcquireTranscriptRole -ceq 'specialist') {
+        # Preserve the exact convention candidates returned by the production
+        # semantic resolver. The outer package binds this file by SHA-256 and
+        # HMAC; later verifier paths still rebuild their candidate/cluster shape
+        # through CrossVerification.ps1 rather than trusting caller metadata.
+        $sourceConventionPlan = [string]$projection.specialist.conventionPlanJson |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $sourceFactPlan = [string]$projection.specialist.factPlanJson |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $captureCore['sourceProjection'] = [ordered]@{
+            sourceRole = 'specialist'
+            sourceModel = $model
+            binding = [ordered]@{
+                prId = [int]$sourceConventionPlan.pullRequestId
+                repositoryId = [string]$sourceConventionPlan.repositoryId
+                project = [string]$sourceConventionPlan.project
+                sourceCommit = ([string]$sourceConventionPlan.sourceCommit).ToLowerInvariant()
+                targetCommit = ([string]$sourceConventionPlan.targetCommit).ToLowerInvariant()
+                changeSetDigest = ([string]$sourceConventionPlan.changeSetDigest).ToLowerInvariant()
+            }
+            digests = [ordered]@{
+                conventionPlanSha256 = Get-ReviewerConventionSpecialistObjectSha256 -Value $sourceConventionPlan
+                factPlanSha256 = ([string]$sourceFactPlan.planSha256).ToLowerInvariant()
+                configSha256 = ([string]$ConfigSha256).ToLowerInvariant()
+                scriptSha256 = ([string]$ScriptSelfSha256).ToLowerInvariant()
+                promptSha256 = ([string]$ConventionSpecialistPromptSha256).ToLowerInvariant()
+            }
+            candidates = @((Get-ReviewerHashValue -Container $rolePassResult -Key 'Candidates' -Default @()))
+        }
     }
     [IO.File]::WriteAllText((Join-Path $outputRoot 'capture-core.json'),
         ($captureCore | ConvertTo-Json -Depth 32), $script:ReviewerUtf8)
@@ -17316,6 +17426,7 @@ function Invoke-ReviewerRoleInputCaptureRun {
     $candidateInputSha256 = ''
     $clusterHash = ''
     $discoveryMarkerSha256 = ''
+    $discoveryCoreSha256 = ''
     $derivedCandidateHash = ''
     $derivedClusterHash = ''
     $derivedCandidates = @()
@@ -17340,24 +17451,94 @@ function Invoke-ReviewerRoleInputCaptureRun {
             [string]$candidate.sourceRole -ceq 'verifier') {
             throw "The discovery candidate cannot itself be a verifier capture of the same fixture."
         }
-        if ([string]$candidate.sourceRole -cne 'generalist') {
-            throw "The discovery candidate must come from an independent generalist discovery capture."
+        $discoverySourceRole = [string]$candidate.sourceRole
+        if ($discoverySourceRole -cnotin @('generalist', 'specialist')) {
+            throw "The discovery candidate must come from an independent generalist or specialist discovery capture."
         }
-        if (-not (@($ReviewPassModels) | Where-Object { [string]$_ -ceq [string]$candidate.sourceModel })) {
+        $discoveryCore = $null
+        if ($AcquisitionDiscoveryCoreFile) {
+            if (-not (Test-Path -LiteralPath $AcquisitionDiscoveryCoreFile -PathType Leaf)) {
+                throw "The verifier source capture-core does not exist."
+            }
+            $discoveryCorePath = (Resolve-Path -LiteralPath $AcquisitionDiscoveryCoreFile).Path
+            $discoveryCoreSha256 = (Get-FileHash -LiteralPath $discoveryCorePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $discoveryCore = [IO.File]::ReadAllText($discoveryCorePath, $script:ReviewerUtf8) |
+                ConvertFrom-Json -Depth 64
+            if ([string]$discoveryCore.role -cne $discoverySourceRole -or
+                [string]$discoveryCore.terminalStatus -cne 'captured' -or
+                [string]$discoveryCore.requestedModel -cne [string]$candidate.sourceModel -or
+                [string]$discoveryCore.fixtureId -cne [string]$candidate.sourceFixtureId) {
+                throw "The discovery candidate role/model/fixture does not match its authenticated source capture-core."
+            }
+        }
+        elseif ($discoverySourceRole -ceq 'specialist') {
+            throw "A specialist verifier source requires its authenticated source capture-core."
+        }
+        if ($discoverySourceRole -ceq 'generalist' -and
+            -not (@($ReviewPassModels) | Where-Object { [string]$_ -ceq [string]$candidate.sourceModel })) {
             throw "The discovery candidate source model '$([string]$candidate.sourceModel)' is not one of this build's configured generalist models."
+        }
+        $specialistCandidates = @()
+        if ($discoverySourceRole -ceq 'specialist') {
+            if ([string]$candidate.sourceModel -cne [string]$EffectiveConventionSpecialistModel) {
+                throw "The specialist candidate does not match a captured package from the configured convention specialist."
+            }
+            if (-not (@($ReviewPassModels) | Where-Object { [string]$_ -ceq $model }) -or
+                $model -ceq [string]$candidate.sourceModel) {
+                throw "A convention specialist cannot be the verifier; the capture target must be one configured generalist."
+            }
+            if (-not $discoveryCore.PSObject.Properties['sourceProjection'] -or
+                [string]$discoveryCore.sourceProjection.sourceRole -cne 'specialist' -or
+                -not $discoveryCore.sourceProjection.PSObject.Properties['binding'] -or
+                -not $discoveryCore.sourceProjection.PSObject.Properties['digests']) {
+                throw "The authenticated specialist package is missing its production-resolved source projection."
+            }
+            $specialistCandidates = @($discoveryCore.sourceProjection.candidates)
         }
         $discoveryMarkerText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $AcquisitionDiscoveryMarkerFile).Path, $script:ReviewerUtf8)
         $discoveryMarkerSha256 = Get-ReviewerTextSha256 -Text $discoveryMarkerText
         $discoveryCliOutcome = Get-AgentCliJsonOutcome -StdOutText $discoveryMarkerText
         $discoveryAnswer = if ($discoveryCliOutcome -and $discoveryCliOutcome.Answer) { [string]$discoveryCliOutcome.Answer } else { $discoveryMarkerText }
         $discoveryAnswer = $discoveryAnswer.Trim()
-        $discoveryPrefixIndex = $discoveryAnswer.IndexOf($ResultMarkerPrefix, [System.StringComparison]::Ordinal)
+        $expectedDiscoveryPrefix = if ($discoverySourceRole -ceq 'specialist') {
+            [string]$script:ReviewerConventionSpecialistMarkerPrefix
+        }
+        else { [string]$ResultMarkerPrefix }
+        if ([string]$candidate.resultMarkerPrefix -cne $expectedDiscoveryPrefix) {
+            throw "The discovery candidate result-marker prefix does not match its source role."
+        }
+        $discoveryPrefixIndex = $discoveryAnswer.IndexOf($expectedDiscoveryPrefix, [System.StringComparison]::Ordinal)
         if ($discoveryPrefixIndex -lt 0) {
             throw "The discovery result marker does not carry this build's production result-marker prefix."
         }
-        $discoveryAnswer = $discoveryAnswer.Substring($discoveryPrefixIndex + $ResultMarkerPrefix.Length).Trim()
+        $discoveryAnswer = $discoveryAnswer.Substring($discoveryPrefixIndex + $expectedDiscoveryPrefix.Length).Trim()
         try { $discoveryMarker = $discoveryAnswer | ConvertFrom-Json -Depth 64 }
         catch { throw "The discovery result marker is not valid JSON; the verifier cannot rebuild its discovery pass." }
+        if ($discoverySourceRole -ceq 'specialist') {
+            $specialistBinding = $discoveryCore.sourceProjection.binding
+            $specialistDigests = $discoveryCore.sourceProjection.digests
+            $specialistSchema = Get-ReviewerConventionSpecialistMarkerSchema `
+                -ExpectedProject ([string]$binding.project) -ExpectedNonce ([string]$discoveryCore.nonce)
+            $specialistOutcome = ConvertFrom-AgentResultMarkerOutcome `
+                -StdOutText $discoveryMarkerText -MarkerPrefix $expectedDiscoveryPrefix `
+                -Schema $specialistSchema -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars)
+            if ([string]$specialistOutcome.Status -cne 'success') {
+                throw "The sealed specialist result marker failed the exact production schema: $([string]$specialistOutcome.Status)."
+            }
+            $discoveryMarker = $specialistOutcome.Value
+            if (-not (Test-ReviewerConventionSpecialistBinding -Marker $discoveryMarker `
+                    -PrId ([int]$specialistBinding.prId) -RepositoryId ([string]$specialistBinding.repositoryId) `
+                    -SourceCommit ([string]$specialistBinding.sourceCommit) `
+                    -TargetCommit ([string]$specialistBinding.targetCommit) `
+                    -ChangeSetDigest ([string]$specialistBinding.changeSetDigest) `
+                    -ConventionPlanSha256 ([string]$specialistDigests.conventionPlanSha256) `
+                    -FactPlanSha256 ([string]$specialistDigests.factPlanSha256) `
+                    -ConfigSha256 ([string]$specialistDigests.configSha256) `
+                    -ScriptSha256 ([string]$specialistDigests.scriptSha256) `
+                    -PromptSha256 ([string]$specialistDigests.promptSha256))) {
+                throw "The specialist result marker does not match its authenticated package identities and production digests."
+            }
+        }
         if ([int]$discoveryMarker.prId -ne [int]$binding.prId -or
             [string]$discoveryMarker.repositoryId -cne [string]$binding.repositoryId -or
             [string]$discoveryMarker.project -cne [string]$binding.project -or
@@ -17370,8 +17551,9 @@ function Invoke-ReviewerRoleInputCaptureRun {
         # uses; letting it fall back to the function defaults would silently
         # derive a different cluster - and therefore a different verifier prompt
         # - on any build whose policy tunes candidate caps or Jaccard bands.
-        $discoveryOnlyPass = @{ Model = [string]$candidate.sourceModel; Marker = $discoveryMarker; Reason = '' }
-        $derivedCandidates = @(ConvertTo-ReviewerVerificationCandidates -GeneralistPasses @($discoveryOnlyPass))
+        $derivedCandidates = @(ConvertTo-ReviewerIndependentDiscoveryCandidates `
+                -SourceRole $discoverySourceRole -SourceModel ([string]$candidate.sourceModel) `
+                -Marker $discoveryMarker -SpecialistCandidates $specialistCandidates)
         if ($derivedCandidates.Count -eq 0) {
             throw "The discovery result marker yielded no candidates; a verifier capture requires at least one discovery finding."
         }
@@ -17384,6 +17566,19 @@ function Invoke-ReviewerRoleInputCaptureRun {
         $providedPairs = @(@($candidate.candidates) | ForEach-Object { "$([string]$_.candidateId)`n$([string]$_.candidateHash)" } | Sort-Object)
         if (($derivedPairs -join '|') -cne ($providedPairs -join '|')) {
             throw "The supplied discovery candidate set does not match the set derived from the discovery marker; the verifier candidate must be the exact projection of that discovery."
+        }
+        if ($discoverySourceRole -ceq 'specialist') {
+            $derivedById = @{}
+            foreach ($item in $derivedCandidates) { $derivedById[[string]$item.candidateId] = $item }
+            foreach ($item in @($candidate.candidates)) {
+                $derivedItem = $derivedById[[string]$item.candidateId]
+                if ($null -eq $derivedItem -or
+                    [string]$item.originKind -cne [string]$derivedItem.originKind -or
+                    [string]$item.originModel -cne [string]$derivedItem.originModel -or
+                    [string]$item.originArtifactSha256 -cne [string]$derivedItem.originArtifactSha256) {
+                    throw "The specialist candidate's convention origin/provenance does not match the production-derived projection."
+                }
+            }
         }
         $derivedClusterIds = @(@($derivedClusters | ForEach-Object { [string]$_.clusterId }) | Sort-Object -Unique)
         if ($derivedClusterIds.Count -eq 0) {
@@ -17409,8 +17604,8 @@ function Invoke-ReviewerRoleInputCaptureRun {
         $derivedCandidateHash = Get-ReviewerTextSha256 -Text ($derivedPairs -join '|')
         $derivedClusterHash = Get-ReviewerTextSha256 -Text ($derivedClusterIds -join '|')
     }
-    elseif ($AcquisitionCandidateInputFile -or $AcquisitionDiscoveryMarkerFile) {
-        throw "A discovery candidate / marker is only valid for the verifier role."
+    elseif ($AcquisitionCandidateInputFile -or $AcquisitionDiscoveryMarkerFile -or $AcquisitionDiscoveryCoreFile) {
+        throw "A discovery candidate / marker / capture-core is only valid for the verifier role."
     }
 
     Write-Host ("Role input capture: role=$CaptureRoleInputRole model=$model fixture=$($captureRequest.fixtureId) " +
@@ -17559,6 +17754,7 @@ function Invoke-ReviewerRoleInputCaptureRun {
         candidateInputSha256    = $candidateInputSha256
         clusterHash             = $clusterHash
         discoveryMarkerSha256   = $discoveryMarkerSha256
+        discoveryCoreSha256     = $discoveryCoreSha256
         derivedCandidateHash    = $derivedCandidateHash
         derivedClusterHash      = $derivedClusterHash
     }

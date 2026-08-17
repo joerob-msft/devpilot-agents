@@ -62,12 +62,13 @@
     "discovery": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["packageManifestSha256", "markerSha256", "sourceModel", "sourceRole", "sourceFixtureId", "candidateExtractionHash", "resultMarkerPrefix", "resultMarkerBinding"],
+      "required": ["packageManifestSha256", "sourceCoreSha256", "markerSha256", "sourceModel", "sourceRole", "sourceFixtureId", "candidateExtractionHash", "resultMarkerPrefix", "resultMarkerBinding"],
       "properties": {
         "packageManifestSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "sourceCoreSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
         "markerSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
         "sourceModel": { "type": "string", "minLength": 1, "maxLength": 128 },
-        "sourceRole": { "const": "generalist" },
+        "sourceRole": { "enum": ["generalist", "specialist"] },
         "sourceFixtureId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
         "candidateExtractionHash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
         "resultMarkerPrefix": { "type": "string", "minLength": 1, "maxLength": 64 },

@@ -189,6 +189,7 @@ $CopilotSensitiveEnvironmentVariables = @(
 
 $ReviewerScript = Join-Path $RepoRoot 'src\Agents\reviewer\Start-ReviewerAgent.ps1'
 $SchemaDir = Join-Path $RepoRoot 'src\Agents\reviewer\acquisition\v1'
+. (Join-Path $RepoRoot 'src\Agents\reviewer\AcquisitionPackage.ps1')
 $HarnessModule = Join-Path $RepoRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psm1'
 
 # ---------------------------------------------------------------------------
@@ -585,54 +586,13 @@ function Write-SealedPackage {
 function Test-SealedPackage {
     # Read-only verification used by tamper / missing / cross-substitution tests.
     param([Parameter(Mandatory)][string]$PackageDir)
-    $problems = [System.Collections.Generic.List[string]]::new()
-    $manifestPath = Join-Path $PackageDir 'transcript-package.json'
-    $sealPath = Join-Path $PackageDir 'transcript-package.seal'
-    if (-not (Test-Path -LiteralPath $manifestPath)) { return @('missing transcript-package.json') }
-    if (-not (Test-Path -LiteralPath $sealPath)) { return @('missing transcript-package.seal') }
-    $canonical = [IO.File]::ReadAllText($manifestPath, $Utf8)
-    $manifest = $canonical | ConvertFrom-Json -Depth 32
-    # Re-canonicalization must round-trip (detects manifest byte tamper). Canonicalize
-    # from the on-disk TEXT so string values (ISO timestamps) are compared exactly.
-    if ((ConvertTo-CanonicalJsonText -JsonText $canonical) -cne $canonical) {
-        [void]$problems.Add('manifest is not canonical (tampered)')
+    try {
+        [void](Assert-ReviewerAcquisitionTranscriptPackage -PackageRoot $PackageDir `
+                -SealKeyPath (Get-AcquisitionSealKeyPath) `
+                -SchemaPath (Join-Path $SchemaDir 'transcript-package.schema.json'))
+        return @()
     }
-    $seal = (Get-Content -LiteralPath $sealPath -Raw) | ConvertFrom-Json -Depth 8
-    $key = Get-AcquisitionSealKey
-    if ([string]$seal.manifestSha256 -cne (Get-Sha256Hex -Text $canonical)) { [void]$problems.Add('manifest SHA-256 seal mismatch') }
-    if ([string]$seal.manifestHmac -cne (Get-HmacHex -Text $canonical -Key $key)) { [void]$problems.Add('manifest HMAC seal mismatch') }
-    $bound = @{}
-    foreach ($entry in @($manifest.files)) {
-        $rel = [string]$entry.name
-        $bound[$rel] = $entry
-        # A bound path may never escape the package via traversal or an absolute
-        # root; such a name is itself evidence of tampering.
-        if ($rel -match '(^|/)\.\.(/|$)' -or $rel -match '^([a-zA-Z]:|/|\\)') {
-            [void]$problems.Add("illegal bound path: $rel"); continue
-        }
-        $filePath = Join-Path $PackageDir ($rel -replace '/', [IO.Path]::DirectorySeparatorChar)
-        if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) { [void]$problems.Add("missing bound file: $rel"); continue }
-        $actualSha = Get-FileSha256Hex -Path $filePath
-        $actualBytes = [int](Get-Item -LiteralPath $filePath -Force).Length
-        if ($actualSha -cne [string]$entry.sha256) { [void]$problems.Add("SHA-256 mismatch: $rel") }
-        if ($actualBytes -ne [int]$entry.bytes) { [void]$problems.Add("byte-length mismatch: $rel") }
-    }
-    # Any content file anywhere in the tree that is not bound is a
-    # substitution/injection - including a file smuggled into a nested directory.
-    $rootFull = [IO.Path]::GetFullPath($PackageDir).TrimEnd('\', '/')
-    foreach ($file in @(Get-ChildItem -LiteralPath $PackageDir -File -Recurse -Force)) {
-        $rel = ($file.FullName.Substring($rootFull.Length)).TrimStart('\', '/').Replace('\', '/')
-        if (($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { [void]$problems.Add("reparse-point file present: $rel"); continue }
-        # Every sealed file - the manifest, its seal, and every bound artifact -
-        # must carry the read-only bit. A writable file anywhere in the tree (even
-        # a hidden or nested one, which -Force surfaces) means the package is not
-        # immutable, so the seal verification fails closed.
-        if (($file.Attributes -band [IO.FileAttributes]::ReadOnly) -eq 0) { [void]$problems.Add("writable file present (not read-only): $rel") }
-        if ($rel -in @('transcript-package.json', 'transcript-package.seal')) { continue }
-        if (-not $bound.ContainsKey($rel)) { [void]$problems.Add("unbound file present: $rel") }
-    }
-    foreach ($p in @(Get-SealedDirectoryProblems -PackageDir $PackageDir -Manifest $manifest)) { [void]$problems.Add($p) }
-    return $problems.ToArray()
+    catch { return @([string]$_.Exception.Message) }
 }
 
 function Test-SealedTerminalEvidence {
@@ -903,6 +863,9 @@ $projectionSha256 = Get-Sha256Hex -Text $projectionText
 # -- Validate the model through the shared module registry (fail fast, before
 #    any lease or child launch). The same registry gate re-runs inside the child.
 Import-Module $HarnessModule -Force -ErrorAction Stop
+. (Join-Path $RepoRoot 'src\Agents\reviewer\SourceTransport.ps1')
+. (Join-Path $RepoRoot 'src\Agents\reviewer\ConventionSpecialist.ps1')
+. (Join-Path $RepoRoot 'src\Agents\reviewer\CrossVerification.ps1')
 if (-not (Get-Command Assert-AgentSupportedModel -ErrorAction SilentlyContinue)) {
     throw "The agent harness does not export Assert-AgentSupportedModel; the model cannot be validated through the registry."
 }
@@ -922,6 +885,12 @@ elseif ($Role -eq 'verifier') {
     }
     [void](Assert-AgentSupportedModel -Model $SecondGeneralistModel)
     [void](Assert-AgentSupportedModel -Model $ConventionSpecialistModel)
+    if ([string]$Model -ceq [string]$SecondGeneralistModel) {
+        throw 'Verifier acquisition requires two distinct configured generalist models.'
+    }
+    if ([string]$Model -ceq [string]$ConventionSpecialistModel) {
+        throw "The convention specialist '$ConventionSpecialistModel' cannot be a verifier; -Model must name one configured generalist."
+    }
 }
 
 # -- Canonical target identity from the authoritative sealed replay Bound ------
@@ -1109,22 +1078,16 @@ if ($Role -eq 'verifier') {
     if (-not $DiscoveryPackageRoot -or -not (Test-Path -LiteralPath $DiscoveryPackageRoot -PathType Container)) {
         throw "The verifier role requires -DiscoveryPackageRoot naming the sealed discovery transcript package the candidate was extracted from."
     }
-    $discoveryRootFull = (Resolve-Path -LiteralPath $DiscoveryPackageRoot).Path
-    $discoveryProblems = @(Test-SealedPackage -PackageDir $discoveryRootFull)
-    if ($discoveryProblems.Count -gt 0) {
-        throw "The sealed discovery transcript package failed verification: $($discoveryProblems -join '; ')."
-    }
-    $discoveryCorePath = Join-Path $discoveryRootFull 'capture-core.json'
-    $discoveryMarkerPath = Join-Path $discoveryRootFull 'result-marker.txt'
-    if (-not (Test-Path -LiteralPath $discoveryCorePath -PathType Leaf) -or -not (Test-Path -LiteralPath $discoveryMarkerPath -PathType Leaf)) {
-        throw "The sealed discovery transcript package is missing its capture-core or result marker."
-    }
-    $discoveryCore = ([IO.File]::ReadAllText($discoveryCorePath, $Utf8)) | ConvertFrom-Json -Depth 32
-    if ([string]$discoveryCore.role -cne 'generalist') {
-        throw "The sealed discovery package is a '$([string]$discoveryCore.role)' capture; the verifier requires an independent GENERALIST discovery capture."
-    }
-    if ([string]$discoveryCore.terminalStatus -cne 'captured') {
-        throw "The sealed discovery package did not capture a marker (status '$([string]$discoveryCore.terminalStatus)'); it cannot seed a verifier cross-check."
+    $discoveryPackage = Assert-ReviewerAcquisitionTranscriptPackage `
+        -PackageRoot $DiscoveryPackageRoot -SealKeyPath (Get-AcquisitionSealKeyPath) `
+        -SchemaPath (Join-Path $SchemaDir 'transcript-package.schema.json') -RequireCaptured
+    $discoveryRootFull = [string]$discoveryPackage.Root
+    $discoveryCorePath = [string]$discoveryPackage.CorePath
+    $discoveryMarkerPath = [string]$discoveryPackage.MarkerPath
+    $discoveryCore = $discoveryPackage.Core
+    $discoverySourceRole = [string]$discoveryCore.role
+    if ($discoverySourceRole -cnotin @('generalist', 'specialist')) {
+        throw "The sealed discovery package is a '$discoverySourceRole' capture; a verifier requires an independent generalist or specialist discovery capture."
     }
     $discoveryModel = [string]$discoveryCore.requestedModel
     if ([string]$candidate.sourceModel -cne $discoveryModel) {
@@ -1141,15 +1104,87 @@ if ($Role -eq 'verifier') {
     if ([string]$candidate.sourceFixtureId -cne $discoveryFixtureId) {
         throw "The discovery candidate's sourceFixtureId '$([string]$candidate.sourceFixtureId)' does not match the sealed discovery package fixtureId '$discoveryFixtureId'; the source fixture is established by the sealed package, never by candidate metadata."
     }
-    if ([string]$candidate.sourceRole -cne 'generalist') {
-        throw "The discovery candidate's source role must be 'generalist' to match its sealed discovery package."
+    if ([string]$candidate.sourceRole -cne $discoverySourceRole) {
+        throw "The discovery candidate's source role '$([string]$candidate.sourceRole)' does not match its sealed '$discoverySourceRole' package."
     }
-    # The candidate must NOT be a self-run of the fixture being verified.
-    if ([string]$discoveryCore.role -ceq 'verifier') {
-        throw "The sealed discovery package cannot itself be a verifier capture."
+    $configuredGeneralists = @([string]$Model, [string]$SecondGeneralistModel)
+    if ($discoverySourceRole -ceq 'generalist' -and
+        $configuredGeneralists -cnotcontains $discoveryModel) {
+        throw "The sealed generalist source model '$discoveryModel' is not one of the configured generalist pair."
+    }
+    if ($discoverySourceRole -ceq 'specialist' -and
+        $discoveryModel -cne [string]$ConventionSpecialistModel) {
+        throw "The sealed specialist source model '$discoveryModel' does not equal the configured convention specialist '$ConventionSpecialistModel'."
+    }
+    if ($configuredGeneralists -cnotcontains [string]$Model -or
+        [string]$Model -ceq [string]$ConventionSpecialistModel) {
+        throw "The authorized verifier '$Model' must be one of the configured generalists and never the convention specialist."
+    }
+
+    # The authenticated source must be the exact replay identity (or its
+    # authenticated materialization lineage) plus current config/script/prompt.
+    # This rejects a valid but stale or cross-fixture package.
+    $sourceSnapshot = $discoveryCore.snapshotIdentity
+    if (([string]$discoveryCore.digests.snapshotManifestDigest).ToLowerInvariant() -cne
+        ([string]$sourceSnapshot.manifestDigest).ToLowerInvariant()) {
+        throw "The sealed discovery package disagrees internally on its snapshot digest."
+    }
+    $sourceReplayDigestMatches = (
+        ([string]$sourceSnapshot.manifestDigest).ToLowerInvariant() -ceq
+        ([string]$ReplayManifestDigest).ToLowerInvariant())
+    if (-not $sourceReplayDigestMatches) {
+        # A verifier commonly consumes the non-promotable replay materialized from
+        # a role-input capture rather than the source replay that produced the
+        # discovery package. Authenticate that lineage in both Preflight and the
+        # real acquisition path. Omitting ExpectedManifestDigest here preserves
+        # the child's terminal-evidence path for an operator-pinned digest mismatch.
+        $lineageReplay = $validatedReplay
+        if ($null -eq $lineageReplay) {
+            $lineageReplay = New-AgentReplaySnapshot -ReplayRoot $replayRootFull `
+                -SnapshotName $ReplaySnapshotName
+        }
+        if ([string]$lineageReplay.Classification.SealKind -ceq 'benchmarkPackMaterialization') {
+            $lineageDigest = [string]$lineageReplay.Classification.Sidecar.sourceManifestDigest
+            $sourceReplayDigestMatches = (
+                $lineageDigest.ToLowerInvariant() -ceq
+                ([string]$sourceSnapshot.manifestDigest).ToLowerInvariant())
+        }
+    }
+    if (-not $sourceReplayDigestMatches) {
+        throw "The sealed discovery package snapshot digest does not match the verifier replay identity or its authenticated materialization lineage."
+    }
+    foreach ($identityCheck in @(
+            @('snapshot name', [string]$sourceSnapshot.snapshotName, [string]$ReplaySnapshotName),
+            @('PR', [string]$sourceSnapshot.prId, [string]$planTarget.prId),
+            @('repository', [string]$sourceSnapshot.repositoryId, [string]$planTarget.repositoryId),
+            @('project', [string]$sourceSnapshot.project, [string]$planTarget.project),
+            @('source commit', [string]$sourceSnapshot.sourceCommit, [string]$planTarget.sourceCommit),
+            @('target commit', [string]$sourceSnapshot.targetCommit, [string]$planTarget.targetCommit),
+            @('change set', [string]$sourceSnapshot.changeSetDigest, [string]$planTarget.changeSetDigest))) {
+        if (([string]$identityCheck[1]).ToLowerInvariant() -cne
+            ([string]$identityCheck[2]).ToLowerInvariant()) {
+            throw "The sealed discovery package $($identityCheck[0]) does not match the verifier replay identity."
+        }
+    }
+    $sourcePromptPath = if ($discoverySourceRole -ceq 'specialist') {
+        Join-Path (Split-Path $reviewerScriptFull -Parent) 'convention-review.prompt.md'
+    }
+    else {
+        [string](Get-AgentConfig -Path $configFull -AgentDir (Split-Path $reviewerScriptFull -Parent) `
+            -SupportedSchemaVersions @(1) -PromptFileField 'promptFile').PromptFilePath
+    }
+    foreach ($digestCheck in @(
+            @('config', [string]$discoveryCore.digests.configSha256, (Get-FileSha256Hex -Path $configFull)),
+            @('script', [string]$discoveryCore.digests.scriptSha256, (Get-FileSha256Hex -Path $reviewerScriptFull)),
+            @('prompt', [string]$discoveryCore.digests.promptSha256, (Get-FileSha256Hex -Path $sourcePromptPath)))) {
+        if (([string]$digestCheck[1]).ToLowerInvariant() -cne
+            ([string]$digestCheck[2]).ToLowerInvariant()) {
+            throw "The sealed discovery package $($digestCheck[0]) digest is stale or mismatched."
+        }
     }
     $discoveryManifestPath = Join-Path $discoveryRootFull 'transcript-package.json'
-    $discoveryPackageManifestSha256 = Get-FileSha256Hex -Path $discoveryManifestPath
+    $discoveryPackageManifestSha256 = [string]$discoveryPackage.ManifestSha256
+    $discoveryCoreSha256 = Get-FileSha256Hex -Path $discoveryCorePath
     $discoveryMarkerText = [IO.File]::ReadAllText($discoveryMarkerPath, $Utf8)
     $discoveryMarkerSha256 = Get-Sha256Hex -Text $discoveryMarkerText
 
@@ -1177,6 +1212,72 @@ if ($Role -eq 'verifier') {
     $discoveryMarkerJson = $null
     try { $discoveryMarkerJson = $discoveryBody | ConvertFrom-Json -Depth 32 }
     catch { throw "The sealed discovery marker body is not valid JSON; provenance cannot be established." }
+    $specialistCandidates = @()
+    if ($discoverySourceRole -ceq 'specialist') {
+        if ($discoveryPrefix -cne [string]$script:ReviewerConventionSpecialistMarkerPrefix) {
+            throw "The sealed specialist package does not use the exact production convention result-marker prefix."
+        }
+        $specialistSchema = Get-ReviewerConventionSpecialistMarkerSchema `
+            -ExpectedProject ([string]$planTarget.project) -ExpectedNonce ([string]$discoveryCore.nonce)
+        $specialistOutcome = ConvertFrom-AgentResultMarkerOutcome `
+            -StdOutText $discoveryMarkerText -MarkerPrefix $discoveryPrefix `
+            -Schema $specialistSchema -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars)
+        if ([string]$specialistOutcome.Status -cne 'success') {
+            throw "The sealed specialist result marker failed the exact production schema: $([string]$specialistOutcome.Status)."
+        }
+        $discoveryMarkerJson = $specialistOutcome.Value
+        if (-not $discoveryCore.PSObject.Properties['sourceProjection'] -or
+            [string]$discoveryCore.sourceProjection.sourceRole -cne 'specialist' -or
+            -not $discoveryCore.sourceProjection.PSObject.Properties['binding'] -or
+            -not $discoveryCore.sourceProjection.PSObject.Properties['digests']) {
+            throw "The sealed specialist package is missing its production-resolved source projection."
+        }
+        $specialistBinding = $discoveryCore.sourceProjection.binding
+        $specialistDigests = $discoveryCore.sourceProjection.digests
+        if (-not (Test-ReviewerConventionSpecialistBinding -Marker $discoveryMarkerJson `
+                -PrId ([int]$specialistBinding.prId) -RepositoryId ([string]$specialistBinding.repositoryId) `
+                -SourceCommit ([string]$specialistBinding.sourceCommit) -TargetCommit ([string]$specialistBinding.targetCommit) `
+                -ChangeSetDigest ([string]$specialistBinding.changeSetDigest) `
+                -ConventionPlanSha256 ([string]$specialistDigests.conventionPlanSha256) `
+                -FactPlanSha256 ([string]$specialistDigests.factPlanSha256) `
+                -ConfigSha256 ([string]$specialistDigests.configSha256) `
+                -ScriptSha256 ([string]$specialistDigests.scriptSha256) `
+                -PromptSha256 ([string]$specialistDigests.promptSha256))) {
+            throw "The sealed specialist result marker does not match the package's exact identities and production digests."
+        }
+        $specialistCandidates = @($discoveryCore.sourceProjection.candidates)
+    }
+    $sourceDerivedCandidates = @(ConvertTo-ReviewerIndependentDiscoveryCandidates `
+            -SourceRole $discoverySourceRole -SourceModel $discoveryModel `
+            -Marker $discoveryMarkerJson -SpecialistCandidates $specialistCandidates)
+    if ($sourceDerivedCandidates.Count -eq 0) {
+        throw "The sealed discovery package yielded no production-derived candidates."
+    }
+    $sourceDerivedClusters = @(Get-ReviewerVerificationClusters -Candidates $sourceDerivedCandidates)
+    $sourceDerivedPairs = @($sourceDerivedCandidates | ForEach-Object {
+            "$([string]$_.candidateId)`n$([string]$_.candidateHash)" } | Sort-Object)
+    $sourceProvidedPairs = @(@($candidate.candidates) | ForEach-Object {
+            "$([string]$_.candidateId)`n$([string]$_.candidateHash)" } | Sort-Object)
+    if (($sourceDerivedPairs -join '|') -cne ($sourceProvidedPairs -join '|')) {
+        throw "The supplied discovery candidate set is not the exact production-derived projection of the authenticated source package."
+    }
+    $sourceClusterIds = @(@($sourceDerivedClusters | ForEach-Object { [string]$_.clusterId }) | Sort-Object -Unique)
+    if ($sourceClusterIds.Count -ne 1 -or [string]$candidate.clusterId -cne $sourceClusterIds[0]) {
+        throw "The supplied discovery candidate cluster does not match the production-derived source cluster."
+    }
+    if ($discoverySourceRole -ceq 'specialist') {
+        $sourceDerivedById = @{}
+        foreach ($item in $sourceDerivedCandidates) { $sourceDerivedById[[string]$item.candidateId] = $item }
+        foreach ($item in @($candidate.candidates)) {
+            $derivedItem = $sourceDerivedById[[string]$item.candidateId]
+            if ($null -eq $derivedItem -or [string]$item.originKind -cne 'convention' -or
+                [string]$item.originKind -cne [string]$derivedItem.originKind -or
+                [string]$item.originModel -cne [string]$derivedItem.originModel -or
+                [string]$item.originArtifactSha256 -cne [string]$derivedItem.originArtifactSha256) {
+                throw "The specialist candidate's convention origin/provenance is missing or fabricated."
+            }
+        }
+    }
     $derivedMarkerBinding = [ordered]@{
         prId         = [int]$discoveryMarkerJson.prId
         repositoryId = [string]$discoveryMarkerJson.repositoryId
@@ -1203,9 +1304,10 @@ if ($Role -eq 'verifier') {
     }
     $planDiscovery = [ordered]@{
         packageManifestSha256   = $discoveryPackageManifestSha256
+        sourceCoreSha256         = $discoveryCoreSha256
         markerSha256            = $discoveryMarkerSha256
         sourceModel             = $discoveryModel
-        sourceRole              = 'generalist'
+        sourceRole              = $discoverySourceRole
         sourceFixtureId         = $discoveryFixtureId
         candidateExtractionHash = $candidateSha256
         resultMarkerPrefix      = $discoveryPrefix
@@ -1557,6 +1659,7 @@ try {
         # argv); the child re-verifies its SHA-256 against the plan's sealed
         # discovery binding before rebuilding the single generalist pass.
         $reviewerArgs += @('-AcquisitionDiscoveryMarkerFile', $discoveryMarkerPath)
+        $reviewerArgs += @('-AcquisitionDiscoveryCoreFile', $discoveryCorePath)
     }
 
     # The real authorization token and telemetry wiring are child-scoped PSI

@@ -259,24 +259,31 @@ atomic `CreateNew` lease and may lose to a concurrent caller after Preflight.
     -OutputRoot <unused-new-output-path>
 ```
 
-The verifier's candidate is **derived from the sealed discovery evidence, never
+The verifier's candidate is **derived from sealed discovery evidence, never
 from truth**. The operator produces it with
-`tools/Get-ReviewerDiscoveryCandidate.ps1`, which loads the sealed discovery
-package's single generalist pass and runs the **exact production candidate
-extraction and clustering functions** (`ConvertTo-ReviewerVerificationCandidates`
-+ `Get-ReviewerVerificationClusters`) to emit a schema-valid, single-cluster
-candidate. The verifier additionally requires the *sealed* discovery transcript
-package the candidate came from: the supervisor validates that package's seal,
-recursive inventory and result marker, and its exact fixture, source PR, repo,
-project, commit, model, role and result-marker prefix binding. The child then
+`tools/Get-ReviewerDiscoveryCandidate.ps1`, which authenticates the package
+with its acquisition seal key, loads exactly one captured `generalist` or
+`specialist` result, and runs the **exact production role-aware candidate
+conversion and clustering functions**. Generalist sources must use one of the
+configured generalist models. Specialist sources must use exactly the configured
+convention-specialist model and can emit only convention-origin candidates.
+The verifier additionally requires the *sealed* discovery transcript package
+the candidate came from: the supervisor validates that package's HMAC seal,
+recursive inventory and result marker, and its exact fixture, snapshot, source
+PR, repo, project, commits, config, prompt, script, role, model and result-marker
+prefix binding. Unknown or mismatched roles/models, tampering, stale scripts,
+cross-fixture/snapshot substitution, and fabricated candidates are refused.
+The verifier target itself must be one of the configured generalist pair; the
+specialist model is never a verifier. The child then
 **re-derives the candidate and clusters from the sealed discovery marker through
 those same production functions and requires exact candidate and single-cluster
 equality** before it will launch — it never constructs the candidate from truth
-or from an arbitrary sibling pass. The source package manifest digest, the
+or from an arbitrary sibling pass. The source package manifest digest, source
+capture-core digest, the
 discovery marker digest, the candidate extraction hash and the candidate/cluster
 hash are all bound into the authorized plan and the final package. A verifier run
 without a valid sealed discovery package, or with a candidate that does not
-re-derive from the declared source, is refused — the verifier's single generalist
+re-derive from the declared source, is refused — the verifier's target-generalist
 pass is rebuilt from that sealed evidence, never from truth.
 
 ## Role execution scope
@@ -347,6 +354,7 @@ extraction/clustering functions; it never reads truth):
 ```pwsh
 ./tools/Get-ReviewerDiscoveryCandidate.ps1 `
     -DiscoveryPackageRoot <path-to-sealed-discovery-package> `
+    -SealKeyPath <path-to-acquisition-seal-key> `
     -OutputFile <path-to-discovery-candidate.json>
 ```
 

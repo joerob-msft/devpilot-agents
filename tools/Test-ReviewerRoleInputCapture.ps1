@@ -43,6 +43,7 @@ $CrossVerificationLibrary = Join-Path $RepoRoot 'src\Agents\reviewer\CrossVerifi
 
 Import-Module (Join-Path $RepoRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force
 . $CrossVerificationLibrary
+. (Join-Path $RepoRoot 'src\Agents\reviewer\ReviewFacts.ps1')
 
 $runId = [Guid]::NewGuid().ToString('N')
 $runRoot = Join-Path $RepoRoot ("_role_input_test_tmp-" + $runId)
@@ -337,6 +338,7 @@ function New-ClassifiedReplay {
         nonPromotable  = $true
         oracleFree     = $true
         writesPermitted = $false
+        sourceManifestDigest = [string]$manifest.manifestDigest
     }
     Write-Utf8 $sidecarPath (Canon $sidecar)
     $manifest.Remove('manifestDigest')
@@ -354,6 +356,28 @@ function New-ClassifiedReplay {
     }
     return $loaded
 }
+
+function New-MultiModelReplaySource {
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination
+    )
+    Copy-Item -LiteralPath $Source -Destination $Destination -Recurse -Force
+    Get-ChildItem -LiteralPath $Destination -Recurse -Force |
+        ForEach-Object { try { $_.Attributes = 'Normal' } catch { } }
+    $manifestPath = Join-Path $Destination 'manifest.json'
+    $manifest = Get-Content $manifestPath -Raw -Encoding UTF8 |
+        ConvertFrom-Json -AsHashtable -Depth 64
+    $manifest.bindings.models = @('claude-opus-5', 'gpt-5.6-sol', 'claude-sonnet-5')
+    $manifest.Remove('manifestDigest')
+    $manifest.manifestDigest = TextSha (Canon $manifest)
+    Write-Utf8 $manifestPath (Canon $manifest)
+    [void](New-AgentReplaySnapshot -ReplayRoot (Split-Path $Destination -Parent) `
+            -SnapshotName (Split-Path $Destination -Leaf) `
+            -ExpectedManifestDigest ([string]$manifest.manifestDigest))
+    return $Destination
+}
+
 function New-V2ReplaySource {
     <#
         Upgrade the synthetic v1 snapshot to schemaVersion 2, which is the only
@@ -486,7 +510,9 @@ function New-CaptureBundle {
         projection exists until production reaches the model boundary.
     #>
     param([Parameter(Mandatory)][ValidateSet('generalist', 'specialist', 'verifier')][string]$Role,
-        [string]$Tag = '', [string]$ConfigSource = $ConfigFile, [string]$ReplaySource = $ReplayPath)
+        [string]$Tag = '', [string]$ConfigSource = $ConfigFile, [string]$ReplaySource = $ReplayPath,
+        [string]$Model = 'claude-opus-5', [string]$FixtureId,
+        [switch]$PreserveReplayIdentity)
     $name = if ($Tag) { "$Role-$Tag" } else { $Role }
     $packRoot = Join-Path $runRoot "pack-$name"
     $out = Join-Path $runRoot "bundle-$name"
@@ -500,7 +526,19 @@ function New-CaptureBundle {
     $materializedReplayRoot = Join-Path $out 'replay'
     $classifiedPath = Join-Path $materializedReplayRoot $snapshotName
     New-Item -ItemType Directory -Force -Path $materializedReplayRoot | Out-Null
-    $loaded = New-ClassifiedReplay -Source $ReplaySource -Destination $classifiedPath
+    if ($PreserveReplayIdentity) {
+        Copy-Item -LiteralPath $ReplaySource -Destination $classifiedPath -Recurse -Force
+        Get-ChildItem -LiteralPath $classifiedPath -Recurse -Force |
+            ForEach-Object { try { $_.Attributes = 'Normal' } catch { } }
+        $preservedManifest = Get-Content (Join-Path $classifiedPath 'manifest.json') -Raw |
+            ConvertFrom-Json -Depth 64
+        $loaded = New-AgentReplaySnapshot -ReplayRoot $materializedReplayRoot `
+            -SnapshotName $snapshotName `
+            -ExpectedManifestDigest ([string]$preservedManifest.manifestDigest)
+    }
+    else {
+        $loaded = New-ClassifiedReplay -Source $ReplaySource -Destination $classifiedPath
+    }
     $materializedManifest = Join-Path $classifiedPath 'manifest.json'
 
     $bundleConfigSha = Sha (Join-Path $configDir 'reviewer.config.json')
@@ -514,7 +552,7 @@ function New-CaptureBundle {
     $minimalLegacy = [ordered]@{
         schemaVersion       = 1
         kind                = 'blinded-reviewer-adapter-input'
-        fixtureId           = "synthetic-$name-capture"
+        fixtureId           = $(if ($FixtureId) { $FixtureId } else { "synthetic-$name-capture" })
         fixtureVersion      = 1
         binding             = $packBinding
         bindingSha256       = TextSha (Canon $packBinding)
@@ -546,7 +584,8 @@ function New-CaptureBundle {
     if ($loaded.Binding.Contains('IterationId')) { $identity['iteration'] = [int]$loaded.Binding.IterationId }
     $request = [ordered]@{
         schemaVersion = 1; kind = 'reviewer-role-input-capture-request'
-        fixtureId = "synthetic-$name-capture"; role = $Role; model = 'claude-opus-5'
+        fixtureId = $(if ($FixtureId) { $FixtureId } else { "synthetic-$name-capture" })
+        role = $Role; model = $Model
         identity = $identity
         snapshot = [ordered]@{
             name = $snapshotName; manifestDigest = [string]$loaded.ManifestDigest
@@ -609,7 +648,9 @@ function Invoke-CapturedRolePipeline {
         )
         $projection = Get-ChildItem (Join-Path $CaptureRoot 'projections') -Filter '*.blinded.json' | Select-Object -First 1
         $provenance = Get-ChildItem (Join-Path $CaptureRoot 'sealed-resources') -Filter "*-role-$Role.json" | Select-Object -First 1
-        $materialized = Join-Path $runRoot "pipeline-materialized-$Role"
+        $pipelineTag = [IO.Path]::GetFileName($CaptureRoot.TrimEnd(
+                [IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar))
+        $materialized = Join-Path $runRoot "pipeline-materialized-$pipelineTag"
         $sourceManifestPath = Join-Path $Bundle.ReplaySource 'manifest.json'
         $raw = & pwsh -NoProfile -File $MaterializeTool @(
             '-PackRoot', $CaptureRoot, '-LegacyProjectionFile', $projection.FullName, '-Role', $Role,
@@ -622,7 +663,7 @@ function Invoke-CapturedRolePipeline {
             return [pscustomobject]@{ Ready = $false; Detail = (($raw | Out-String).Trim()) }
         }
         $m = (($raw -join '') | ConvertFrom-Json)
-        $preflightOut = Join-Path $runRoot "pipeline-preflight-$Role"
+        $preflightOut = Join-Path $runRoot "pipeline-preflight-$pipelineTag"
         $args = @(
             '-Role', $Role, '-FixtureProjectionFile', (Join-Path $materialized 'projection.json'), '-Model', $Model,
             '-ConfigFile', (Join-Path $materialized 'config\reviewer.config.json'),
@@ -630,21 +671,48 @@ function Invoke-CapturedRolePipeline {
             '-ReplayManifestDigest', ([string]$m.replayManifestDigest), '-ExpectedReviewerBaseCommit', $expectedBase,
             '-PullRequestId', '4242', '-ExpectedHeadCommit', $head, '-ExpectedRef', $ref,
             '-OutputRoot', $preflightOut, '-RepoRoot', $RepoRoot,
-            '-SealKeyPath', (Join-Path $runRoot 'seal.key'), '-AllowDirtyWorktree', '-Preflight'
+            '-SealKeyPath', (Join-Path $runRoot 'seal.key'), '-AllowDirtyWorktree'
         )
         if ($Role -cne 'generalist') {
+            $secondGeneralistModel = if ($Role -ceq 'verifier' -and
+                $Model -ceq 'gpt-5.6-sol') { 'claude-opus-5' } else { 'gpt-5.6-sol' }
             $args += @('-DiscoveryGeneralistModel', 'claude-opus-5',
-                '-SecondGeneralistModel', 'gpt-5.6-sol', '-ConventionSpecialistModel',
+                '-SecondGeneralistModel', $secondGeneralistModel, '-ConventionSpecialistModel',
                 $(if ($Role -ceq 'specialist') { $Model } else { 'claude-sonnet-5' }))
         }
         if ($Role -ceq 'verifier') {
             $args += @('-ConventionVerifierModel', $Model, '-CandidateInputFile', $Candidate,
                 '-DiscoveryPackageRoot', $DiscoveryPackage)
         }
-        $pf = & pwsh -NoProfile -File $AcquireTool @args 2>&1
+        $pf = & pwsh -NoProfile -File $AcquireTool @($args + '-Preflight') 2>&1
         $pfText = ($pf | Out-String).Trim()
+        $preflightReady = ($LASTEXITCODE -eq 0 -and
+            $pfText -match '"ready"\s*:\s*true' -and
+            -not (Test-Path $preflightOut))
+        if ($preflightReady -and $Role -ceq 'verifier') {
+            $acquisitionOut = Join-Path $runRoot "pipeline-acquisition-$pipelineTag"
+            $acquisitionArgs = [Collections.Generic.List[string]]::new()
+            for ($i = 0; $i -lt $args.Count; $i++) {
+                if ($args[$i] -ceq '-OutputRoot') {
+                    [void]$acquisitionArgs.Add($args[$i])
+                    [void]$acquisitionArgs.Add($acquisitionOut)
+                    $i++
+                    continue
+                }
+                [void]$acquisitionArgs.Add($args[$i])
+            }
+            $acquired = & pwsh -NoProfile -File $AcquireTool @($acquisitionArgs.ToArray()) 2>&1
+            $acquiredText = ($acquired | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0 -or
+                -not (Test-Path -LiteralPath (Join-Path $acquisitionOut 'package\transcript-package.json'))) {
+                return [pscustomobject]@{
+                    Ready = $false
+                    Detail = "Preflight passed, but acquisition from the same materialized replay failed: $acquiredText"
+                }
+            }
+        }
         return [pscustomobject]@{
-            Ready = ($LASTEXITCODE -eq 0 -and $pfText -match '"ready"\s*:\s*true' -and -not (Test-Path $preflightOut))
+            Ready = $preflightReady
             Detail = $pfText
         }
 }
@@ -864,11 +932,18 @@ try {
     New-Item -ItemType Directory -Force -Path $acqConfigDir | Out-Null
     Copy-Item $ConfigFile (Join-Path $acqConfigDir 'reviewer.config.json') -Force
     Copy-Item $PromptFile (Join-Path $acqConfigDir 'review-cycle.prompt.md') -Force
+    $verifierReplaySource = Join-Path $runRoot 'verifier-replay-source\synthetic-pr'
+    [void](New-MultiModelReplaySource -Source $ReplayPath -Destination $verifierReplaySource)
+    $verSuccessBundle = New-CaptureBundle -Role verifier -Tag success `
+        -ConfigSource (Join-Path $acqConfigDir 'reviewer.config.json') `
+        -ReplaySource $verifierReplaySource -FixtureId 'synthetic-generalist-capture'
     $acqRaw = & pwsh -NoProfile -File $AcquireTool @(
         '-Role', 'generalist', '-FixtureProjectionFile', (Join-Path $captureMaterialized 'projection.json'), '-Model', 'claude-opus-5',
-        '-ConfigFile', (Join-Path $acqConfigDir 'reviewer.config.json'), '-ReplayRoot', (Join-Path $captureMaterialized 'replay'),
-        '-ReplaySnapshotName', ([string]$captureMaterializedResult.replaySnapshotName),
-        '-ReplayManifestDigest', ([string]$captureMaterializedResult.replayManifestDigest),
+        '-ConfigFile', (Join-Path $acqConfigDir 'reviewer.config.json'),
+        '-ReplayRoot', (Split-Path $verifierReplaySource -Parent),
+        '-ReplaySnapshotName', (Split-Path $verifierReplaySource -Leaf),
+        '-ReplayManifestDigest', ([string]((Get-Content (Join-Path $verifierReplaySource 'manifest.json') -Raw |
+                    ConvertFrom-Json -Depth 64).manifestDigest)),
         '-OfflineModelAdapterManifest', $AdapterManifest, '-ExpectedReviewerBaseCommit', $expectedBase,
         '-PullRequestId', '4242', '-ExpectedHeadCommit', $head, '-ExpectedRef', $ref,
         '-OutputRoot', $acqOut, '-SealKeyPath', (Join-Path $runRoot 'seal.key'),
@@ -1075,7 +1150,7 @@ try {
     Invoke-ExpectedFailure 'a verifier candidate with no sealed discovery marker is refused' `
         (Get-CaptureArgs -Bundle $verBundle -Out (Join-Path $runRoot 'capture-verifier-nomarker') `
             -Extra @('-CandidateInputFile', (Join-Path $RepoRoot 'tools\testdata\reviewer-acquisition-discovery-candidate.json'))) `
-        'DiscoveryMarkerFile'
+        'discovery marker'
 
     $strippedRoot = Join-Path $runRoot 'stripped-replay'
     Copy-Item -LiteralPath $genBundle.ReplayRoot -Destination $strippedRoot -Recurse -Force
@@ -1414,10 +1489,10 @@ try {
     $specReplay = Join-Path $runRoot 'specialist-replay-source\synthetic-pr'
     New-SpecialistReplay -Destination $specReplay
     $specBundle = New-CaptureBundle -Role specialist -ConfigSource $specConfig -ReplaySource $specReplay
-    $verSuccessBundle = New-CaptureBundle -Role verifier -Tag success -ReplaySource $specReplay
     $derivedCandidate = Join-Path $runRoot 'independent-discovery-candidate.json'
     $extractRaw = & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Get-ReviewerDiscoveryCandidate.ps1') `
-        -DiscoveryPackageRoot (Join-Path $acqOut 'package') -OutputFile $derivedCandidate -RepoRoot $RepoRoot 2>&1
+        -DiscoveryPackageRoot (Join-Path $acqOut 'package') -SealKeyPath (Join-Path $runRoot 'seal.key') `
+        -OutputFile $derivedCandidate -RepoRoot $RepoRoot 2>&1
     Check 'verifier candidate is derived from an independent sealed discovery transcript' (
         $LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $derivedCandidate)) (($extractRaw | Out-String).Trim())
     $roleCases = @(
@@ -1426,6 +1501,8 @@ try {
         @{ Role = 'verifier'; Bundle = $verSuccessBundle; Model = 'claude-opus-5'; Extra = @(
                 '-CandidateInputFile', $derivedCandidate,
                 '-DiscoveryMarkerFile', (Join-Path $acqOut 'package\result-marker.txt'),
+                '-DiscoveryPackageRoot', (Join-Path $acqOut 'package'),
+                '-DiscoverySealKeyPath', (Join-Path $runRoot 'seal.key'),
                 '-LegacyProjectionFile', $verSuccessBundle.LegacyFile) }
     )
     foreach ($case in $roleCases) {
@@ -1464,6 +1541,121 @@ try {
         }
         else {
             Check "$role did not fabricate a ready bundle after failure" (-not $isReady -or $r.ExitCode -ne 0) $r.Text
+        }
+    }
+
+    $conventionReplayRoot = Join-Path $RepoRoot 'tools\testdata\replay-convention'
+    $conventionSnapshot = Join-Path $conventionReplayRoot 'synthetic-convention-pr'
+    $conventionDigest = [string]((Get-Content (Join-Path $conventionSnapshot 'manifest.json') -Raw |
+            ConvertFrom-Json -Depth 64).manifestDigest)
+    $conventionConfigDir = Join-Path $runRoot 'specialist-source-config'
+    New-Item -ItemType Directory -Force -Path $conventionConfigDir | Out-Null
+    Copy-Item (Join-Path $conventionReplayRoot 'reviewer.config.json') `
+        (Join-Path $conventionConfigDir 'reviewer.config.json') -Force
+    Copy-Item $PromptFile (Join-Path $conventionConfigDir 'review-cycle.prompt.md') -Force
+    $conventionVerifierSource = Join-Path $runRoot `
+        'specialist-verifier-replay-source\synthetic-convention-pr'
+    [void](New-MultiModelReplaySource -Source $conventionSnapshot `
+            -Destination $conventionVerifierSource)
+    $specialistVerifierBundles = @{}
+    foreach ($targetModel in @('gpt-5.6-sol', 'claude-opus-5')) {
+        $tag = if ($targetModel -ceq 'gpt-5.6-sol') { 'gpt' } else { 'opus' }
+        $specialistVerifierBundles[$tag] = New-CaptureBundle -Role verifier `
+            -Tag "specialist-source-$tag" `
+            -ConfigSource (Join-Path $conventionConfigDir 'reviewer.config.json') `
+            -ReplaySource $conventionVerifierSource -Model $targetModel `
+            -FixtureId 'synthetic-specialist-acq'
+    }
+    $specialistAcquisitionBundle = $specialistVerifierBundles['gpt']
+    $specialistAcqOut = Join-Path $runRoot 'acquisition-specialist'
+    $specialistProjection = Join-Path $runRoot 'specialist-source-projection.json'
+    $specialistProjectionObject = Get-Content `
+        (Join-Path $RepoRoot 'tools\testdata\reviewer-acquisition-specialist-projection.json') -Raw |
+        ConvertFrom-Json -Depth 100
+    $currentReviewerSha = (Get-FileHash -LiteralPath $ReviewerScript -Algorithm SHA256).Hash.ToLowerInvariant()
+    $specialistConventionPlan = $specialistProjectionObject.specialist.conventionPlanJson |
+        ConvertFrom-Json -Depth 100
+    $specialistConventionPlan.scriptSha256 = $currentReviewerSha
+    $specialistProjectionObject.specialist.conventionPlanJson =
+        $specialistConventionPlan | ConvertTo-Json -Depth 100 -Compress
+    $specialistFactPlan = $specialistProjectionObject.specialist.factPlanJson |
+        ConvertFrom-Json -Depth 100
+    @($specialistFactPlan.hashes.scriptClosure | Where-Object {
+            [string]$_.path -ceq 'Start-ReviewerAgent.ps1'
+        })[0].sha256 = $currentReviewerSha
+    $specialistFactBody = [pscustomobject][ordered]@{
+        planVersion = $specialistFactPlan.planVersion; schemaVersion = $specialistFactPlan.schemaVersion
+        extractorVersion = $specialistFactPlan.extractorVersion; status = $specialistFactPlan.status
+        binding = $specialistFactPlan.binding; hashes = $specialistFactPlan.hashes
+        domains = $specialistFactPlan.domains; facts = $specialistFactPlan.facts
+        factCount = $specialistFactPlan.factCount
+    }
+    $specialistFactCanonical = ConvertTo-ReviewerFactCanonicalJson -Value $specialistFactBody
+    $specialistFactPlan.canonicalBytes =
+        [Text.UTF8Encoding]::new($false).GetByteCount($specialistFactCanonical)
+    $specialistFactPlan.planSha256 = Get-ReviewerFactSha256 -Text $specialistFactCanonical
+    $specialistProjectionObject.specialist.factPlanJson =
+        $specialistFactPlan | ConvertTo-Json -Depth 100 -Compress
+    Write-Utf8 $specialistProjection ($specialistProjectionObject | ConvertTo-Json -Depth 100)
+    $specialistRaw = & pwsh -NoProfile -File $AcquireTool @(
+        '-Role', 'specialist', '-FixtureProjectionFile', $specialistProjection,
+        '-Model', 'claude-sonnet-5',
+        '-ConfigFile', (Join-Path $conventionConfigDir 'reviewer.config.json'),
+        '-ReplayRoot', (Split-Path $conventionVerifierSource -Parent),
+        '-ReplaySnapshotName', (Split-Path $conventionVerifierSource -Leaf),
+        '-ReplayManifestDigest', ([string]((Get-Content (Join-Path $conventionVerifierSource 'manifest.json') -Raw |
+                    ConvertFrom-Json -Depth 64).manifestDigest)),
+        '-OfflineModelAdapterManifest', $AdapterManifest,
+        '-ExpectedReviewerBaseCommit', $expectedBase,
+        '-PullRequestId', '4242', '-ExpectedHeadCommit', $head, '-ExpectedRef', $ref,
+        '-OutputRoot', $specialistAcqOut, '-SealKeyPath', (Join-Path $runRoot 'seal.key'),
+        '-AllowDirtyWorktree', '-UseOfflineStubAdapter',
+        '-DiscoveryGeneralistModel', 'claude-opus-5',
+        '-SecondGeneralistModel', 'gpt-5.6-sol',
+        '-ConventionSpecialistModel', 'claude-sonnet-5',
+        '-PerCallTimeoutSeconds', '45', '-TotalTimeoutSeconds', '180',
+        '-ActivityTimeoutSeconds', '60') 2>&1
+    $specialistAcqExit = $LASTEXITCODE
+    $specialistPackage = Join-Path $specialistAcqOut 'package'
+    Check 'specialist acquisition creates an authenticated convention discovery package' (
+        $specialistAcqExit -eq 0 -and
+        (Test-Path -LiteralPath (Join-Path $specialistPackage 'transcript-package.json'))) `
+        (($specialistRaw | Out-String).Trim())
+
+    $specialistCandidate = Join-Path $runRoot 'specialist-discovery-candidate.json'
+    $specialistExtractRaw = & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Get-ReviewerDiscoveryCandidate.ps1') `
+        -DiscoveryPackageRoot $specialistPackage -SealKeyPath (Join-Path $runRoot 'seal.key') `
+        -OutputFile $specialistCandidate -RepoRoot $RepoRoot 2>&1
+    $specialistExtractExit = $LASTEXITCODE
+    Check 'specialist convention candidate derives only from the authenticated source package' (
+        $specialistExtractExit -eq 0 -and (Test-Path -LiteralPath $specialistCandidate)) `
+        (($specialistExtractRaw | Out-String).Trim())
+
+    if ($specialistExtractExit -eq 0) {
+        foreach ($targetModel in @('gpt-5.6-sol', 'claude-opus-5')) {
+            $tag = if ($targetModel -ceq 'gpt-5.6-sol') { 'gpt' } else { 'opus' }
+            $verifierBundle = $specialistVerifierBundles[$tag]
+            $verifierCaptureOut = Join-Path $runRoot "capture-specialist-source-$tag"
+            $verifierCaptureArgs = Get-CaptureArgs -Bundle $verifierBundle -Out $verifierCaptureOut `
+                -Model $targetModel -Extra @(
+                    '-CandidateInputFile', $specialistCandidate,
+                    '-DiscoveryMarkerFile', (Join-Path $specialistPackage 'result-marker.txt'),
+                    '-DiscoveryPackageRoot', $specialistPackage,
+                    '-DiscoverySealKeyPath', (Join-Path $runRoot 'seal.key'),
+                    '-DiscoveryGeneralistModel', 'claude-opus-5',
+                    '-LegacyProjectionFile', $verifierBundle.LegacyFile)
+            $verifierCapture = Invoke-Tool -Arguments $verifierCaptureArgs
+            Check "authenticated specialist package captures a $targetModel verifier projection" (
+                $verifierCapture.ExitCode -eq 0 -and
+                (Test-Path -LiteralPath (Join-Path $verifierCaptureOut 'capture-manifest.json'))) `
+                $verifierCapture.Text
+            if ($verifierCapture.ExitCode -eq 0) {
+                $pipeline = Invoke-CapturedRolePipeline -Role verifier -CaptureRoot $verifierCaptureOut `
+                    -Bundle $verifierBundle -Model $targetModel -Candidate $specialistCandidate `
+                    -DiscoveryPackage $specialistPackage
+                Check "specialist package -> $targetModel capture -> materialize -> Preflight succeeds" `
+                    $pipeline.Ready $pipeline.Detail
+            }
         }
     }
 

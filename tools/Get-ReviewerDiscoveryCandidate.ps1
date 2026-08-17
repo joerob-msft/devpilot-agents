@@ -2,14 +2,15 @@
 <#
 .SYNOPSIS
     Extracts the independently captured discovery candidate a verifier acquisition
-    consumes, projecting it SOLELY from a sealed generalist discovery transcript
+    consumes, projecting it SOLELY from a sealed generalist or specialist discovery
+    transcript
     package through the EXACT production candidate-extraction and clustering path.
 
 .DESCRIPTION
     A verifier blinded acquisition may NEVER derive its candidate from truth, from a
     co-run discovery pass, or from any expected answer. It consumes exactly one
     artifact: a candidate set that was extracted from a SEPARATE, already-sealed
-    generalist discovery capture.
+    generalist or convention-specialist discovery capture.
 
     This is the operator-facing extraction step that produces that artifact. It reads
     ONLY the sealed discovery package's own result marker, parses it with the exact
@@ -31,6 +32,9 @@
 .PARAMETER OutputFile
     Path the extracted candidate JSON is written to (UTF-8, no BOM).
 
+.PARAMETER SealKeyPath
+    HMAC key used to authenticate the immutable acquisition transcript package.
+
 .PARAMETER SourceFixtureId
     OPTIONAL cross-check only. The candidate's sourceFixtureId is DERIVED from the
     sealed discovery package's own capture-core evidence (its fixtureId), never from
@@ -45,6 +49,7 @@
 param(
     [Parameter(Mandatory)][string]$DiscoveryPackageRoot,
     [Parameter(Mandatory)][string]$OutputFile,
+    [Parameter(Mandatory)][string]$SealKeyPath,
     [string]$SourceFixtureId,
     [string]$RepoRoot = (Split-Path $PSScriptRoot -Parent)
 )
@@ -58,22 +63,20 @@ $Utf8 = [System.Text.UTF8Encoding]::new($false, $true)
 # its own script-scoped limits), so dot-sourcing it standalone is faithful.
 Import-Module (Join-Path $RepoRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psm1') -Force -DisableNameChecking
 . (Join-Path $RepoRoot 'src\Agents\reviewer\SourceTransport.ps1')
+. (Join-Path $RepoRoot 'src\Agents\reviewer\ConventionSpecialist.ps1')
 . (Join-Path $RepoRoot 'src\Agents\reviewer\CrossVerification.ps1')
+. (Join-Path $RepoRoot 'src\Agents\reviewer\AcquisitionPackage.ps1')
 
-$pkg = (Resolve-Path -LiteralPath $DiscoveryPackageRoot).Path
-$corePath = Join-Path $pkg 'capture-core.json'
-$markerPath = Join-Path $pkg 'result-marker.txt'
-if (-not (Test-Path -LiteralPath $corePath -PathType Leaf) -or
-    -not (Test-Path -LiteralPath $markerPath -PathType Leaf)) {
-    throw "The discovery package is missing capture-core.json or result-marker.txt."
-}
-
-$core = [IO.File]::ReadAllText($corePath, $Utf8) | ConvertFrom-Json -Depth 32
-if ([string]$core.role -cne 'generalist') {
-    throw "The discovery package is a '$([string]$core.role)' capture; candidate extraction requires an independent GENERALIST discovery capture."
-}
-if ([string]$core.terminalStatus -cne 'captured') {
-    throw "The discovery package did not capture a marker (status '$([string]$core.terminalStatus)'); it cannot seed a verifier candidate."
+$package = Assert-ReviewerAcquisitionTranscriptPackage -PackageRoot $DiscoveryPackageRoot `
+    -SealKeyPath $SealKeyPath `
+    -SchemaPath (Join-Path $RepoRoot 'src\Agents\reviewer\acquisition\v1\transcript-package.schema.json') `
+    -RequireCaptured
+$pkg = [string]$package.Root
+$core = $package.Core
+$markerPath = [string]$package.MarkerPath
+$sourceRole = [string]$core.role
+if ($sourceRole -notin @('generalist', 'specialist')) {
+    throw "The discovery package is a '$sourceRole' capture; candidate extraction requires an independent generalist or specialist discovery capture."
 }
 $sourceModel = [string]$core.requestedModel
 $markerPrefix = [string]$core.resultMarkerPrefix
@@ -107,10 +110,45 @@ $marker = $null
 try { $marker = $answer | ConvertFrom-Json -Depth 64 }
 catch { throw "The sealed discovery result marker is not valid JSON; cannot extract a candidate." }
 
-# Derive candidates and clusters through the EXACT production functions from the SINGLE
-# discovery pass. The sole input is the sealed discovery marker - never truth.
-$pass = @{ Model = $sourceModel; Marker = $marker }
-$derived = @(ConvertTo-ReviewerVerificationCandidates -GeneralistPasses @($pass))
+# Derive candidates and clusters through the EXACT production functions from the
+# single authenticated source marker. Specialist findings enter the same blind union
+# as convention-origin candidates; the specialist itself is never a verifier.
+$specialistCandidates = @()
+if ($sourceRole -ceq 'specialist') {
+    $specialistSchema = Get-ReviewerConventionSpecialistMarkerSchema `
+        -ExpectedProject ([string]$core.snapshotIdentity.project) -ExpectedNonce ([string]$core.nonce)
+    $specialistOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText $markerText `
+        -MarkerPrefix $markerPrefix -Schema $specialistSchema `
+        -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars)
+    if ([string]$specialistOutcome.Status -cne 'success') {
+        throw "The sealed specialist result marker failed the exact production schema: $([string]$specialistOutcome.Status)."
+    }
+    $marker = $specialistOutcome.Value
+    if (-not $core.PSObject.Properties['sourceProjection'] -or
+        [string]$core.sourceProjection.sourceRole -cne 'specialist' -or
+        -not $core.sourceProjection.PSObject.Properties['binding'] -or
+        -not $core.sourceProjection.PSObject.Properties['digests']) {
+        throw 'The sealed specialist capture-core is missing its production-resolved source projection.'
+    }
+    $specialistBinding = $core.sourceProjection.binding
+    $specialistDigests = $core.sourceProjection.digests
+    if (-not (Test-ReviewerConventionSpecialistBinding -Marker $marker `
+            -PrId ([int]$specialistBinding.prId) `
+            -RepositoryId ([string]$specialistBinding.repositoryId) `
+            -SourceCommit ([string]$specialistBinding.sourceCommit) `
+            -TargetCommit ([string]$specialistBinding.targetCommit) `
+            -ChangeSetDigest ([string]$specialistBinding.changeSetDigest) `
+            -ConventionPlanSha256 ([string]$specialistDigests.conventionPlanSha256) `
+            -FactPlanSha256 ([string]$specialistDigests.factPlanSha256) `
+            -ConfigSha256 ([string]$specialistDigests.configSha256) `
+            -ScriptSha256 ([string]$specialistDigests.scriptSha256) `
+            -PromptSha256 ([string]$specialistDigests.promptSha256))) {
+        throw 'The sealed specialist result marker does not match its package identities and production digests.'
+    }
+    $specialistCandidates = @($core.sourceProjection.candidates)
+}
+$derived = @(ConvertTo-ReviewerIndependentDiscoveryCandidates -SourceRole $sourceRole `
+        -SourceModel $sourceModel -Marker $marker -SpecialistCandidates $specialistCandidates)
 if ($derived.Count -eq 0) {
     throw "The sealed discovery marker yielded no candidates; a verifier cross-check requires at least one discovery finding."
 }
@@ -124,6 +162,9 @@ $candidateList = @($derived | ForEach-Object {
         [ordered]@{
             candidateId   = [string]$_.candidateId
             candidateHash = [string]$_.candidateHash
+            originKind    = [string]$_.originKind
+            originModel   = [string]$_.originModel
+            originArtifactSha256 = [string]$_.originArtifactSha256
             severity      = [string]$_.severity
             filePath      = [string]$_.filePath
             line          = [int]$_.line
@@ -135,7 +176,7 @@ $candidate = [ordered]@{
     schemaVersion       = 1
     kind                = 'reviewer-discovery-candidate-input'
     sourceFixtureId     = $packageFixtureId
-    sourceRole          = 'generalist'
+    sourceRole          = $sourceRole
     sourceModel         = $sourceModel
     resultMarkerPrefix  = $markerPrefix
     resultMarkerBinding = [ordered]@{

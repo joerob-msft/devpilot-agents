@@ -952,6 +952,60 @@ function ConvertTo-ReviewerVerificationCandidates {
     return $ordered.ToArray()
 }
 
+function ConvertTo-ReviewerIndependentDiscoveryCandidates {
+    <#
+        Rebuild the verifier subject from one independently sealed discovery
+        result. Generalist findings and production-resolved convention-specialist
+        candidates deliberately enter through their existing production
+        conversion paths; callers do not restate either projection.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateSet("generalist", "specialist")][string]$SourceRole,
+        [Parameter(Mandatory)][string]$SourceModel,
+        [Parameter(Mandatory)]$Marker,
+        [AllowEmptyCollection()][object[]]$SpecialistCandidates = @()
+    )
+    if ($SourceRole -ceq "generalist") {
+        return @(ConvertTo-ReviewerVerificationCandidates -GeneralistPasses @(
+                @{ Model = $SourceModel; Marker = $Marker; Reason = "" }))
+    }
+
+    $markerCandidates = @(Get-ReviewerVerificationValue $Marker "candidates" @())
+    $artifactSha256 = Get-ReviewerVerificationObjectSha256 -Value $Marker
+    $normalizedMarkerCandidates = @($markerCandidates | ForEach-Object {
+            $normalized = (ConvertTo-ReviewerVerificationCanonicalJson -Value $_) |
+                ConvertFrom-Json -Depth 32
+            $normalized.filePath = ConvertTo-ReviewerVerificationPath -Path ([string]$normalized.filePath)
+            $normalized
+        })
+    $markerDerived = @(ConvertTo-ReviewerVerificationCandidates `
+            -ConventionCandidates $normalizedMarkerCandidates `
+            -ConventionModel $SourceModel `
+            -ConventionArtifactSha256 $artifactSha256)
+    $derived = @(ConvertTo-ReviewerVerificationCandidates `
+            -ConventionCandidates @($SpecialistCandidates) `
+            -ConventionModel $SourceModel `
+            -ConventionArtifactSha256 $artifactSha256)
+    $markerPairs = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($candidate in $markerDerived) {
+        [void]$markerPairs.Add("$([string]$candidate.candidateId)`n$([string]$candidate.candidateHash)")
+    }
+    foreach ($candidate in $derived) {
+        $pair = "$([string]$candidate.candidateId)`n$([string]$candidate.candidateHash)"
+        if (-not $markerPairs.Contains($pair)) {
+            throw "The sealed specialist projection contains a candidate that is not semantically present in its result marker."
+        }
+    }
+    foreach ($candidate in $derived) {
+        if ([string]$candidate.originKind -cne "convention" -or
+            [string]$candidate.originModel -cne $SourceModel -or
+            [string]$candidate.originArtifactSha256 -cne $artifactSha256) {
+            throw "The specialist candidate projection lost its convention origin or sealed-marker provenance."
+        }
+    }
+    return $derived
+}
+
 function Get-ReviewerVerificationCandidatePlan {
     param(
         [object[]]$GeneralistPasses = @(),
@@ -1990,6 +2044,10 @@ function Get-ReviewerVerificationFreshBindingBudget {
     }
 }
 
+
+function Get-ReviewerConventionSpecialistScanWindowChars {
+    return 327680
+}
 
 function Get-ReviewerVerificationMarkerSchema {
     param(
