@@ -164,6 +164,9 @@
       "additionalProperties": false,
       "required": [
         "mode",
+        "fileExists",
+        "sinkBytes",
+        "sinkSha256",
         "totalEvents",
         "modelSubprocessStarts",
         "realModelStarts",
@@ -174,7 +177,10 @@
       ],
       "properties": {
         "mode": { "enum": ["production", "production-test-only"] },
-        "totalEvents": { "type": "integer", "minimum": 0 },
+        "fileExists": { "const": true },
+        "sinkBytes": { "type": "integer", "minimum": 1 },
+        "sinkSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "totalEvents": { "type": "integer", "minimum": 1 },
         "modelSubprocessStarts": { "type": "integer", "minimum": 0 },
         "realModelStarts": { "type": "integer", "minimum": 0 },
         "providerLiveProcessStarts": { "type": "integer", "minimum": 0, "maximum": 0 },
