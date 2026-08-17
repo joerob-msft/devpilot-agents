@@ -73,7 +73,6 @@ $package = Assert-ReviewerAcquisitionTranscriptPackage -PackageRoot $DiscoveryPa
     -RequireCaptured
 $pkg = [string]$package.Root
 $core = $package.Core
-$markerPath = [string]$package.MarkerPath
 $sourceRole = [string]$core.role
 if ($sourceRole -notin @('generalist', 'specialist')) {
     throw "The discovery package is a '$sourceRole' capture; candidate extraction requires an independent generalist or specialist discovery capture."
@@ -98,7 +97,7 @@ if ($PSBoundParameters.ContainsKey('SourceFixtureId') -and $SourceFixtureId -and
 # Parse the sealed discovery marker with the EXACT production CLI-envelope reader,
 # then strip the production result-marker prefix - byte-for-byte the same rebuild the
 # acquisition child performs, so the derived candidate/cluster hashes match exactly.
-$markerText = [IO.File]::ReadAllText($markerPath, $Utf8)
+$markerText = [string]$package.MarkerText
 $cliOutcome = Get-AgentCliJsonOutcome -StdOutText $markerText
 $answer = if ($cliOutcome -and $cliOutcome.Answer) { [string]$cliOutcome.Answer } else { $markerText }
 $answer = $answer.Trim()

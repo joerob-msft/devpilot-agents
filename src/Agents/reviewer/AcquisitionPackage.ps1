@@ -62,6 +62,12 @@ function Get-ReviewerAcquisitionPackageFileSha256 {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Get-ReviewerAcquisitionPackageBytesSha256 {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes)
+    return ([Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData($Bytes))).ToLowerInvariant()
+}
+
 function Get-ReviewerAcquisitionPackageHmac {
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
@@ -131,6 +137,7 @@ function Assert-ReviewerAcquisitionTranscriptPackage {
     }
 
     $boundFiles = @{}
+    $boundFileBytes = @{}
     foreach ($entry in @($manifest.files)) {
         $relative = [string]$entry.name
         if ($boundFiles.ContainsKey($relative) -or
@@ -149,10 +156,15 @@ function Assert-ReviewerAcquisitionTranscriptPackage {
         if (($item.Attributes -band [IO.FileAttributes]::ReadOnly) -eq 0) {
             throw "writable file present (not read-only): $relative"
         }
-        if ([long]$item.Length -ne [long]$entry.bytes -or
-            (Get-ReviewerAcquisitionPackageFileSha256 -Path $path) -cne [string]$entry.sha256) {
+        # Read each authenticated payload exactly once. Every downstream parse,
+        # digest, and supervisor-owned child copy consumes these same bytes rather
+        # than reopening caller-controlled paths after verification.
+        [byte[]]$bytes = [IO.File]::ReadAllBytes($path)
+        if ([long]$bytes.Length -ne [long]$entry.bytes -or
+            (Get-ReviewerAcquisitionPackageBytesSha256 -Bytes $bytes) -cne [string]$entry.sha256) {
             throw "The acquisition package bound file '$relative' failed its byte/hash binding."
         }
+        $boundFileBytes[$relative] = $bytes
     }
 
     $rootFull = [IO.Path]::GetFullPath($root).TrimEnd('\', '/')
@@ -194,8 +206,14 @@ function Assert-ReviewerAcquisitionTranscriptPackage {
         }
     }
 
-    $core = [IO.File]::ReadAllText($corePath, $script:ReviewerAcquisitionPackageUtf8) |
-        ConvertFrom-Json -Depth 64
+    [byte[]]$coreBytes = $boundFileBytes['capture-core.json']
+    [byte[]]$markerBytes = $boundFileBytes['result-marker.txt']
+    if ($null -eq $coreBytes -or $null -eq $markerBytes) {
+        throw 'The acquisition package manifest does not bind its capture core and result marker.'
+    }
+    $coreText = $script:ReviewerAcquisitionPackageUtf8.GetString($coreBytes)
+    $markerText = $script:ReviewerAcquisitionPackageUtf8.GetString($markerBytes)
+    $core = $coreText | ConvertFrom-Json -Depth 64
     if ([string]$manifest.role -cne [string]$core.role -or
         [string]$manifest.requestedModel -cne [string]$core.requestedModel -or
         [string]$manifest.reportedModel -cne [string]$core.reportedModel -or
@@ -217,7 +235,13 @@ function Assert-ReviewerAcquisitionTranscriptPackage {
         ManifestPath   = $manifestPath
         ManifestSha256 = $manifestSha
         Core           = $core
+        CoreBytes      = $coreBytes
+        CoreText       = $coreText
+        CoreSha256     = Get-ReviewerAcquisitionPackageBytesSha256 -Bytes $coreBytes
         CorePath       = $corePath
+        MarkerBytes    = $markerBytes
+        MarkerText     = $markerText
+        MarkerSha256   = Get-ReviewerAcquisitionPackageBytesSha256 -Bytes $markerBytes
         MarkerPath     = $markerPath
     }
 }

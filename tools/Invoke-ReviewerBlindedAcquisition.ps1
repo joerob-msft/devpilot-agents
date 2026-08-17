@@ -1046,6 +1046,9 @@ $clusterHash = $null
 $planCandidate = $null
 $planDiscovery = $null
 $discoveryMarkerPath = $null
+$discoveryCorePath = $null
+$discoveryCoreBytes = $null
+$discoveryMarkerBytes = $null
 if ($Role -eq 'verifier') {
     if (-not $CandidateInputFile -or -not (Test-Path -LiteralPath $CandidateInputFile -PathType Leaf)) {
         throw "The verifier role requires -CandidateInputFile naming an independently captured discovery candidate."
@@ -1082,8 +1085,8 @@ if ($Role -eq 'verifier') {
         -PackageRoot $DiscoveryPackageRoot -SealKeyPath (Get-AcquisitionSealKeyPath) `
         -SchemaPath (Join-Path $SchemaDir 'transcript-package.schema.json') -RequireCaptured
     $discoveryRootFull = [string]$discoveryPackage.Root
-    $discoveryCorePath = [string]$discoveryPackage.CorePath
-    $discoveryMarkerPath = [string]$discoveryPackage.MarkerPath
+    [byte[]]$discoveryCoreBytes = $discoveryPackage.CoreBytes
+    [byte[]]$discoveryMarkerBytes = $discoveryPackage.MarkerBytes
     $discoveryCore = $discoveryPackage.Core
     $discoverySourceRole = [string]$discoveryCore.role
     if ($discoverySourceRole -cnotin @('generalist', 'specialist')) {
@@ -1184,9 +1187,9 @@ if ($Role -eq 'verifier') {
     }
     $discoveryManifestPath = Join-Path $discoveryRootFull 'transcript-package.json'
     $discoveryPackageManifestSha256 = [string]$discoveryPackage.ManifestSha256
-    $discoveryCoreSha256 = Get-FileSha256Hex -Path $discoveryCorePath
-    $discoveryMarkerText = [IO.File]::ReadAllText($discoveryMarkerPath, $Utf8)
-    $discoveryMarkerSha256 = Get-Sha256Hex -Text $discoveryMarkerText
+    $discoveryCoreSha256 = [string]$discoveryPackage.CoreSha256
+    $discoveryMarkerText = [string]$discoveryPackage.MarkerText
+    $discoveryMarkerSha256 = [string]$discoveryPackage.MarkerSha256
 
     # -- Blocker 1: derive the result-marker prefix + FULL binding DIRECTLY from
     #    the sealed discovery marker. Caller-supplied candidate metadata can never
@@ -1577,7 +1580,26 @@ $supervisorResult = $null
 $terminalStatus = 'captureFailedTerminal'
 $exitCode = 1
 $childEnvironment = $null
+$discoveryCoreLock = $null
+$discoveryMarkerLock = $null
 try {
+    if ($Role -eq 'verifier') {
+        # The authenticated package may live in a caller-controlled directory.
+        # Give the child only supervisor-owned copies of the exact verified bytes,
+        # and hold deny-write/delete handles until the child exits.
+        $discoveryStage = Join-Path $workDir 'authenticated-discovery'
+        New-Item -ItemType Directory -Path $discoveryStage | Out-Null
+        $discoveryCorePath = Join-Path $discoveryStage 'capture-core.json'
+        $discoveryMarkerPath = Join-Path $discoveryStage 'result-marker.txt'
+        [IO.File]::WriteAllBytes($discoveryCorePath, $discoveryCoreBytes)
+        [IO.File]::WriteAllBytes($discoveryMarkerPath, $discoveryMarkerBytes)
+        (Get-Item -LiteralPath $discoveryCorePath -Force).Attributes = [IO.FileAttributes]::ReadOnly
+        (Get-Item -LiteralPath $discoveryMarkerPath -Force).Attributes = [IO.FileAttributes]::ReadOnly
+        $discoveryCoreLock = [IO.File]::Open(
+            $discoveryCorePath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        $discoveryMarkerLock = [IO.File]::Open(
+            $discoveryMarkerPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    }
     $leaseBytes = $Utf8.GetBytes((ConvertTo-Json -InputObject ([ordered]@{
                     planId = $planId; role = $Role; model = $Model; pid = $PID
                     createdUtc = [DateTime]::UtcNow.ToString('o')
@@ -1681,6 +1703,8 @@ finally {
     # the child exits. Neither was ever installed in the supervisor environment.
     if ($null -ne $childEnvironment) { $childEnvironment.Clear() }
     $AuthorizationToken = $null
+    if ($discoveryMarkerLock) { $discoveryMarkerLock.Dispose() }
+    if ($discoveryCoreLock) { $discoveryCoreLock.Dispose() }
     if ($leaseStream) { $leaseStream.Dispose() }
 }
 

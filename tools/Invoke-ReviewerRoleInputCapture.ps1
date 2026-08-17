@@ -992,7 +992,7 @@ if ($Role -ceq 'verifier') {
             throw "The authenticated source package $($digestCheck[0]) digest is stale or mismatched."
         }
     }
-    $packageMarkerText = [IO.File]::ReadAllText([string]$discoveryPackage.MarkerPath, $Utf8)
+    $packageMarkerText = [string]$discoveryPackage.MarkerText
     $packageOutcome = Get-AgentCliJsonOutcome -StdOutText $packageMarkerText
     $packageAnswer = if ($packageOutcome -and $packageOutcome.Answer) {
         [string]$packageOutcome.Answer
@@ -1127,6 +1127,8 @@ if (-not $outputParent -or -not (Test-Path -LiteralPath $outputParent -PathType 
 }
 $outputLockPath = Join-Path $outputParent ('.' + [IO.Path]::GetFileName($outputFull) + '.capture.lock')
 $outputLock = $null
+$discoveryCoreLock = $null
+$discoveryMarkerLock = $null
 try {
     $outputLock = [IO.FileStream]::new(
         $outputLockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite,
@@ -1148,6 +1150,22 @@ $telemetryPath = Join-Path $workRoot 'telemetry.jsonl'
 $stdOutPath = Join-Path $workRoot 'child.stdout.log'
 $stdErrPath = Join-Path $workRoot 'child.stderr.log'
 $stateDir = Join-Path $workRoot 'state'
+if ($discoveryPackage) {
+    # Consume the exact package bytes verified earlier, not caller-controlled
+    # paths that can change between authentication and the child capture.
+    $discoveryStage = Join-Path $workRoot 'authenticated-discovery'
+    New-Item -ItemType Directory -Path $discoveryStage | Out-Null
+    $stagedCorePath = Join-Path $discoveryStage 'capture-core.json'
+    $markerFull = Join-Path $discoveryStage 'result-marker.txt'
+    [IO.File]::WriteAllBytes($stagedCorePath, [byte[]]$discoveryPackage.CoreBytes)
+    [IO.File]::WriteAllBytes($markerFull, [byte[]]$discoveryPackage.MarkerBytes)
+    (Get-Item -LiteralPath $stagedCorePath -Force).Attributes = [IO.FileAttributes]::ReadOnly
+    (Get-Item -LiteralPath $markerFull -Force).Attributes = [IO.FileAttributes]::ReadOnly
+    $discoveryCoreLock = [IO.File]::Open(
+        $stagedCorePath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $discoveryMarkerLock = [IO.File]::Open(
+        $markerFull, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+}
 
 $reviewerArgs = @(
     '-NoProfile', '-File', $ReviewerScript,
@@ -1181,7 +1199,7 @@ if ($Role -ceq 'verifier') {
     )
     if ($markerFull) { $reviewerArgs += @('-AcquisitionDiscoveryMarkerFile', $markerFull) }
     if ($discoveryPackage) {
-        $reviewerArgs += @('-AcquisitionDiscoveryCoreFile', [string]$discoveryPackage.CorePath)
+        $reviewerArgs += @('-AcquisitionDiscoveryCoreFile', $stagedCorePath)
     }
 }
 
@@ -1336,6 +1354,14 @@ try {
     }
 }
 finally {
+    if ($discoveryMarkerLock) {
+        $discoveryMarkerLock.Dispose()
+        $discoveryMarkerLock = $null
+    }
+    if ($discoveryCoreLock) {
+        $discoveryCoreLock.Dispose()
+        $discoveryCoreLock = $null
+    }
     if (-not $published -and (Test-Path -LiteralPath $publicationStaging)) {
         Get-ChildItem -LiteralPath $publicationStaging -File -Recurse -Force -ErrorAction SilentlyContinue |
             ForEach-Object { try { $_.Attributes = [IO.FileAttributes]::Normal } catch { } }
@@ -1385,5 +1411,7 @@ Write-Host "Role input capture verified: role=$Role model=$Model, zero model/age
 exit 0
 }
 finally {
+    if ($discoveryMarkerLock) { $discoveryMarkerLock.Dispose() }
+    if ($discoveryCoreLock) { $discoveryCoreLock.Dispose() }
     if ($null -ne $outputLock) { $outputLock.Dispose() }
 }

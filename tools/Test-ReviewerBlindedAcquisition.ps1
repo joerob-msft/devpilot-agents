@@ -1747,6 +1747,30 @@ Check 'specialist-origin rejection matrix has an authenticated source package an
     (Test-Path -LiteralPath (Join-Path $spPackage 'transcript-package.json')) -and
     (Test-Path -LiteralPath $spCandidate))
 if (Test-Path -LiteralPath $spCandidate) {
+    $snapshotPackage = Join-Path $runRoot 'specialist-byte-snapshot-package'
+    Copy-Item -LiteralPath $spPackage -Destination $snapshotPackage -Recurse -Force
+    $verifiedByteSnapshot = Assert-ReviewerAcquisitionTranscriptPackage `
+        -PackageRoot $snapshotPackage -SealKeyPath $sealKey `
+        -SchemaPath (Join-Path $RepoRoot 'src\Agents\reviewer\acquisition\v1\transcript-package.schema.json') `
+        -RequireCaptured
+    $testUtf8 = [Text.UTF8Encoding]::new($false, $true)
+    $mutableSnapshotMarker = Join-Path $snapshotPackage 'result-marker.txt'
+    (Get-Item -LiteralPath $mutableSnapshotMarker -Force).Attributes = [IO.FileAttributes]::Normal
+    [IO.File]::WriteAllText($mutableSnapshotMarker, 'post-verification replacement', $testUtf8)
+    Check 'authenticated package verifier retains the exact verified marker bytes after source mutation' (
+        [string]$verifiedByteSnapshot.MarkerText -cne
+            [IO.File]::ReadAllText($mutableSnapshotMarker, $testUtf8) -and
+        (Get-ReviewerAcquisitionPackageBytesSha256 -Bytes ([byte[]]$verifiedByteSnapshot.MarkerBytes)) -ceq
+            [string]$verifiedByteSnapshot.MarkerSha256)
+    $acquisitionToolText = [IO.File]::ReadAllText($tool, $testUtf8)
+    $captureToolText = [IO.File]::ReadAllText(
+        (Join-Path $PSScriptRoot 'Invoke-ReviewerRoleInputCapture.ps1'), $testUtf8)
+    Check 'verifier supervisors stage authenticated bytes instead of reopening package payload paths' (
+        $acquisitionToolText -match 'discoveryPackage\.MarkerBytes' -and
+        $acquisitionToolText -notmatch 'ReadAllText\(\$discoveryMarkerPath' -and
+        $captureToolText -match 'discoveryPackage\.MarkerBytes' -and
+        $captureToolText -notmatch 'ReadAllText\(\[string\]\$discoveryPackage\.MarkerPath')
+
     $spCandidateJson = Read-Json $spCandidate
     Check 'specialist candidate binds the configured specialist model and role' (
         [string]$spCandidateJson.sourceRole -ceq 'specialist' -and
