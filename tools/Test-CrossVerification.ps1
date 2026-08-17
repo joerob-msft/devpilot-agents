@@ -2780,6 +2780,41 @@ foreach ($inventoryPin in @(
 }
 . ([scriptblock]::Create($verificationInputBodyText))
 . ([scriptblock]::Create($verificationInputHashesText))
+# Token pinning cannot see runtime shape. A comma-protected return survives the
+# caller's @(...) wrap and nests the whole inventory one level deeper, which
+# changes the hashed input body without changing any token. Assert the shape the
+# callers actually bind: a FLAT array of typed entries, in the production order.
+$inventoryProbe = @(New-ReviewerVerificationInputArtifactHashes `
+        -RawGeneralistPasses @([pscustomobject]@{ model = "m-a"; markerSha256 = ("a" * 64) },
+        [pscustomobject]@{ model = "m-b"; markerSha256 = ("b" * 64) }) `
+        -ConventionSpecialistModel "spec-model" -SpecialistArtifactSha256 ("c" * 64) `
+        -ConventionPlanPath "" -FactPlanPath "" `
+        -ConfigSha256 ("D" * 64) -ScriptSha256 ("E" * 64) `
+        -VerificationLibrarySha256 ("f" * 64) -VerificationPromptSha256 ("1" * 64) `
+        -VerificationPolicySha256 ("2" * 64) -VerificationSchemaSha256 ("3" * 64))
+$inventoryExpectedKinds = @("generalist-pass", "generalist-pass", "convention-specialist",
+    "convention-plan", "fact-plan", "config", "reviewer-script", "verification-library",
+    "verification-prompt", "verification-policy", "verification-schema")
+Assert-Verification (@($inventoryProbe).Count -eq $inventoryExpectedKinds.Count) `
+    ("The verifier input artifact inventory returned $(@($inventoryProbe).Count) entries, " +
+    "expected $($inventoryExpectedKinds.Count); a nested return silently changes inputManifestSha.")
+Assert-Verification (@($inventoryProbe | Where-Object { $_ -is [object[]] }).Count -eq 0) `
+    "The verifier input artifact inventory returned a nested array instead of flat entries."
+Assert-Verification (@(for ($i = 0; $i -lt $inventoryExpectedKinds.Count; $i++) {
+            $inventoryProbe[$i].kind }) -join "," -ceq ($inventoryExpectedKinds -join ",")) `
+    "The verifier input artifact inventory changed its entry kinds or their order."
+Assert-Verification (@($inventoryProbe | Where-Object {
+            -not ($_.PSObject.Properties.Name -ccontains "kind") -or
+            -not ($_.PSObject.Properties.Name -ccontains "id") -or
+            $_.sha256 -isnot [string] -or $_.sha256.Length -ne 64 }).Count -eq 0) `
+    "A verifier input artifact inventory entry is not a typed kind/id/sha256 record."
+Assert-Verification (($inventoryProbe | Where-Object kind -ceq "config").sha256 -ceq ("d" * 64) -and
+    ($inventoryProbe | Where-Object kind -ceq "reviewer-script").sha256 -ceq ("e" * 64)) `
+    ("The verifier input artifact inventory did not lowercase the config/script digests, " +
+    "which arrive uppercase from Get-FileHash.")
+Assert-Verification (($inventoryProbe | Where-Object kind -ceq "convention-plan").sha256 -ceq ("0" * 64) -and
+    ($inventoryProbe | Where-Object kind -ceq "fact-plan").sha256 -ceq ("0" * 64)) `
+    "The verifier input artifact inventory omitted rather than zero-hashed an absent artifact."
 . ([scriptblock]::Create($verificationRunInputText))
 . ([scriptblock]::Create($crossPassText))
 . ([scriptblock]::Create($safeVerificationText))

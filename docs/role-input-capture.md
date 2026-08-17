@@ -7,6 +7,16 @@ the exact production model boundary. It is the answer to a single research
 question: *what stimulus would production actually hand this model, byte for
 byte?* — answered without ever launching a model.
 
+Read "byte for byte" precisely: the stimulus is built by the production
+builders, from the inputs the capture actually holds. For the generalist and
+the specialist those inputs are the ones a production cycle has at that point.
+The **verifier** is the qualified case: capture holds a sealed discovery marker
+with the convention specialist unavailable and no convention/fact plans, which
+is a production-builder-compatible input set rather than a state a full
+production cycle reaches. The verifier section below states that scope, and the
+absent artifacts are zero-hashed rather than omitted so the difference is
+visible in the hashed manifest instead of hidden by it.
+
 It is not a review, not an acquisition and not a benchmark run. It authors no
 plan file, mints no token, takes no lease, reads nothing live, writes nothing
 live, and never promotes anything.
@@ -243,13 +253,24 @@ counter in the manifest is zero, and `launch.boundaryHits` is exactly `1`.
 
 ## When it cannot capture
 
-A capture never fabricates and never falls back to anything live. If the sealed
-material is missing or the production path legitimately declines to launch the
-role, it publishes a **typed blocker** (`capture-blocked.json`, schema
-`role-input-capture-blocked.schema.json`) carrying `status` (`blocked` or
-`degraded`), a machine-readable `blockedReason`, human detail, and
-`boundaryHits: 0`. The supervisor exits `3`. Gates that fail before the capture
-driver can publish anything leave no bundle at all.
+A capture never fabricates and never falls back to anything live. Two distinct
+outcomes are possible, and they are not interchangeable:
+
+- **Pre-capture refusal — no bundle at all.** A capture request that declares a
+  resource which escapes the snapshot, is absent from it, or whose bytes do not
+  match its declared `sha256`/`byteLength` is refused *where the defect is
+  detected*, before the role runs. Nothing is published: a run that stops before
+  the role executes performs no sealed replay read, so telemetry proof is
+  incomplete by construction and the supervisor's publish branch is skipped.
+  Deferring such a refusal in the hope of emitting a typed blocker does not
+  work — it yields no artifact *and* reports the wrong cause — so the refusal is
+  immediate and the child's real message is surfaced by the supervisor.
+- **Typed blocker — a published, sealed two-file bundle.** Once replay has
+  begun, if role-required data is missing or the production path legitimately
+  declines to launch the role, the capture publishes a **typed blocker**
+  (`capture-blocked.json`, schema `role-input-capture-blocked.schema.json`)
+  carrying `status` (`blocked` or `degraded`), a machine-readable
+  `blockedReason`, human detail, and `boundaryHits: 0`. The supervisor exits `3`.
 
 `-VerifyOnly` applies the same HMAC/SHA seal, recursive read-only,
 reparse-point, and exact unbound-file inventory checks to a typed blocker. Its

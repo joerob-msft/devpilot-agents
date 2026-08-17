@@ -11320,7 +11320,11 @@ function New-ReviewerVerificationInputArtifactHashes {
                 kind = [string]$item[0]; id = [string]$item[0]; sha256 = [string]$item[1]
             })
     }
-    return , @($hashes.ToArray())
+    # Return the entries as a plain array. The caller wraps the call in @(...),
+    # which restores the array shape for the 0- and 1-element cases; a
+    # comma-protected return would survive that wrap and nest the whole
+    # inventory one level deeper, silently changing the hashed input body.
+    return $hashes.ToArray()
 }
 
 function Get-ReviewerVerificationRunInput {
@@ -15848,6 +15852,16 @@ function Invoke-ReviewerAcquisitionVerifierCapture {
         This is STIMULUS ONLY. It records the exact production run classification
         onto the capture and returns the production run record; it never decides
         whether a verdict is correct and never delivers anything.
+
+        SCOPE, stated honestly: the stimulus is assembled by the production
+        builders from the inputs capture holds - a sealed discovery marker, one
+        generalist pass, the convention specialist unavailable and no
+        convention/fact plans. Production itself declines to verify in that
+        state, so this is a production-builder-compatible input set rather than
+        a replay of a state a full production cycle reaches. The absent
+        artifacts are zero-hashed by the shared inventory builder rather than
+        omitted, so the difference is visible in inputManifestSha instead of
+        being hidden by it.
     #>
     param(
         [Parameter(Mandatory)][string]$AgencyPath,
@@ -17214,6 +17228,17 @@ function Invoke-ReviewerRoleInputCaptureRun {
         throw "The capture request configSha256 does not match the loaded reviewer configuration."
     }
     $replaySnapshotRoot = Join-Path (Resolve-Path -LiteralPath $ReplayRoot).Path $ReplaySnapshotName
+    # Canonicalize the root the same way the legacy pack path does, and check the
+    # root itself for a reparse point. Two reasons this cannot be skipped here:
+    # the containment anchor below must be comparable to what Get-Item reports
+    # for a directory (which is the ON-DISK casing, not the operator's), and a
+    # snapshot root that is itself a junction would otherwise be accepted on this
+    # path while being refused on the legacy one.
+    $replaySnapshotRootItem = Get-Item -LiteralPath $replaySnapshotRoot -Force
+    if (($replaySnapshotRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "The replay snapshot root '$ReplaySnapshotName' is a reparse point and cannot be sealed material."
+    }
+    $replaySnapshotRoot = [IO.Path]::GetFullPath($replaySnapshotRootItem.FullName).TrimEnd([IO.Path]::DirectorySeparatorChar)
     $replayManifestPath = Join-Path $replaySnapshotRoot 'manifest.json'
     $manifestFileSha256 = (Get-FileHash -LiteralPath $replayManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($manifestFileSha256 -cne ([string]$captureRequest.snapshot.manifestFileSha256).ToLowerInvariant()) {
@@ -17242,8 +17267,8 @@ function Invoke-ReviewerRoleInputCaptureRun {
         # inputs rather than depending on what each one happens to do next.
         $walk = Get-Item -LiteralPath $resourcePath -Force
         while ($null -ne $walk -and
-            ([IO.Path]::GetFullPath($walk.FullName).TrimEnd([IO.Path]::DirectorySeparatorChar) -cne
-                $replaySnapshotRoot.TrimEnd([IO.Path]::DirectorySeparatorChar))) {
+            ([IO.Path]::GetFullPath($walk.FullName).TrimEnd([IO.Path]::DirectorySeparatorChar) -ine
+                $replaySnapshotRoot)) {
             if (($walk.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
                 throw ("The capture request sealed resource '$([string]$resource.sealedPath)' is reached " +
                     "through a reparse point ('$($walk.Name)') and is not inside the replay snapshot.")
@@ -17732,11 +17757,17 @@ function Invoke-ReviewerRoleInputCaptureRun {
             # under a sealed-looking name. A capture-first flow onboards packs
             # that arrive from elsewhere, so the pack is exactly the input that
             # must not be trusted to stay inside itself.
-            $packRootFull = [IO.Path]::GetFullPath($legacyPackRoot).TrimEnd([IO.Path]::DirectorySeparatorChar)
-            $packRootItem = Get-Item -LiteralPath $packRootFull -Force
+            $packRootItem = Get-Item -LiteralPath ([IO.Path]::GetFullPath($legacyPackRoot)) -Force
             if (($packRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
                 throw 'The legacy benchmark pack root is a reparse point; its sealed resources cannot be bound to it.'
             }
+            # Anchor on the ON-DISK canonical path. Get-Item reports a directory
+            # with the casing the filesystem stores, not the casing the caller
+            # typed, so a case-sensitive anchor here would never match the root
+            # and the walk would climb past the containment boundary to the drive
+            # root -- turning any junction in an unrelated ancestor (a redirected
+            # profile or Temp) into a false, actively misleading refusal.
+            $packRootFull = $packRootItem.FullName.TrimEnd([IO.Path]::DirectorySeparatorChar)
             foreach ($resource in @($legacy.resources)) {
                 $relative = ([string]$resource.sealedPath).Replace('/', [IO.Path]::DirectorySeparatorChar)
                 if ([IO.Path]::IsPathRooted($relative) -or $relative -match '(^|[\\/])\.\.([\\/]|$)') {
@@ -17749,12 +17780,12 @@ function Invoke-ReviewerRoleInputCaptureRun {
                 # Walk from the resource up to the pack root: the file itself and
                 # every directory in between must be a real, contained entry.
                 $sourceFull = [IO.Path]::GetFullPath($source)
-                if (-not $sourceFull.StartsWith($packRootFull + [IO.Path]::DirectorySeparatorChar, [StringComparison]::Ordinal)) {
+                if (-not $sourceFull.StartsWith($packRootFull + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
                     throw "The legacy sealed resource '$([string]$resource.sealedPath)' resolves outside its pack."
                 }
                 $walk = Get-Item -LiteralPath $sourceFull -Force
                 while ($null -ne $walk -and
-                    ([IO.Path]::GetFullPath($walk.FullName).TrimEnd([IO.Path]::DirectorySeparatorChar) -cne $packRootFull)) {
+                    ([IO.Path]::GetFullPath($walk.FullName).TrimEnd([IO.Path]::DirectorySeparatorChar) -ine $packRootFull)) {
                     if (($walk.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
                         throw ("The legacy sealed resource '$([string]$resource.sealedPath)' is reached through a " +
                             "reparse point ('$($walk.Name)'); a pack may not link its sealed material in from outside.")

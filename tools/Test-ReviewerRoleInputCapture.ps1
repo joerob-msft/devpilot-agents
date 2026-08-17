@@ -824,7 +824,13 @@ try {
     }
     $missingOut = Join-Path $runRoot 'capture-missing-payload'
     $missing = Invoke-Tool -Arguments (Get-CaptureArgs -Bundle $strippedBundle -Out $missingOut)
-    Check 'a sealed snapshot missing a payload fails closed' ($missing.ExitCode -ne 0) $missing.Text
+    # Assert the outcome AND that nothing was published: "exits non-zero" alone
+    # would still hold if the run failed for an unrelated reason after writing a
+    # partial bundle.
+    Check 'a sealed snapshot missing a payload fails closed' (
+        $missing.ExitCode -ne 0 -and -not (Test-Path -LiteralPath $missingOut)) `
+        ("exit=$($missing.ExitCode) published=$(Test-Path -LiteralPath $missingOut) :: " +
+        (ConvertTo-FlatText $missing.Text))
     Check 'a failed-closed capture publishes no bundle and falls back to nothing live' (
         -not (Test-Path -LiteralPath $missingOut) -or
         -not (Test-Path -LiteralPath (Join-Path $missingOut 'capture-manifest.json')))
@@ -847,7 +853,10 @@ try {
     # normalized text or these assertions fail for formatting reasons and get
     # "fixed" by weakening them into something vacuous.
     $missingResourceText = ConvertTo-FlatText $missingResourceResult.Text
-    $missingResourceNamed = Test-TextContains -Text $missingResourceResult.Text -Phrase 'is missing from the replay snapshot'
+    # Assert BOTH the refusal phrase and the specific resource path. The phrase
+    # alone would still pass if the refusal named the wrong resource.
+    $missingResourceNamed = (Test-TextContains -Text $missingResourceResult.Text -Phrase 'is missing from the replay snapshot') -and
+        (Test-TextContains -Text $missingResourceResult.Text -Phrase 'payloads/missing-capture-resource.json')
     $missingResourceNoRoot = -not (Test-Path -LiteralPath $missingResourceOut)
     Check 'a missing request resource is refused without publication, naming the resource' (
         $missingResourceResult.ExitCode -ne 0 -and $missingResourceNamed -and $missingResourceNoRoot) `
@@ -924,6 +933,36 @@ try {
             'reparse point'
     } else {
         Write-Host '  SKIP  junction containment (this filesystem/session cannot create junctions)'
+    }
+
+    # The containment walk anchors on the pack root, and Get-Item reports a
+    # DIRECTORY with the casing the filesystem stores rather than the casing the
+    # operator typed. A case-sensitive anchor therefore never matches the root:
+    # the walk climbs past the containment boundary and any junction in an
+    # unrelated ancestor -- a redirected profile, a relocated Temp -- turns every
+    # sealed resource into a false refusal that names a directory nowhere near
+    # the pack. Reproduce exactly that shape: real pack under a junction ancestor,
+    # referenced with different casing. It must capture, not refuse.
+    $caseRoot = Join-Path $runRoot 'case-anchor'
+    $caseReal = Join-Path $caseRoot 'real'
+    New-Item -ItemType Directory -Force -Path $caseReal | Out-Null
+    $caseLink = Join-Path $caseRoot 'link'
+    $caseLinkMade = $true
+    try { New-Item -ItemType Junction -Path $caseLink -Target $caseReal -ErrorAction Stop | Out-Null }
+    catch { $caseLinkMade = $false }
+    if ($caseLinkMade) {
+        Copy-Item -LiteralPath $genPackRoot -Destination (Join-Path $caseReal 'Pack') -Recurse -Force
+        # Lower-case 'pack' where the filesystem stores 'Pack'.
+        $caseProjection = Join-Path $caseLink ('pack\projections\' + (Split-Path $genBundle.LegacyFile -Leaf))
+        $caseOut = Join-Path $runRoot 'capture-case-anchor'
+        $caseResult = Invoke-Tool -Arguments (Get-CaptureArgs -Bundle $genBundle -Out $caseOut `
+                -Extra @('-LegacyProjectionFile', $caseProjection))
+        Check 'a pack referenced with different casing under a junction ancestor is not falsely refused' (
+            $caseResult.ExitCode -eq 0 -and
+            -not (Test-TextContains -Text $caseResult.Text -Phrase 'reparse point')) `
+            ("exit=$($caseResult.ExitCode) :: " + (ConvertTo-FlatText $caseResult.Text))
+    } else {
+        Write-Host '  SKIP  case-anchor containment (this filesystem/session cannot create junctions)'
     }
 
     $degradedSpecialistBundle = New-CaptureBundle -Role specialist -Tag degraded
