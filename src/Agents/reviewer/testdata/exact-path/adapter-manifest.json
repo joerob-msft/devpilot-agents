@@ -4,7 +4,7 @@
   "fixtureId": "synthetic-exact-path",
   "expectedBaseCommit": "ccbf14632064118f008539becec2fef77030cf54",
   "adapterScript": "../../offline/Invoke-ReviewerModelAdapter.ps1",
-  "adapterScriptSha256": "b238c98506df62e5829f9b206295d7f7d024d491f0016a6bf132d6928e980fc7",
+  "adapterScriptSha256": "61999931274dad7057d92658c357def2ce834d717fa7e1e397f4c269eb91bcee",
   "classification": {
     "offlineOnly": true,
     "nonPromotable": true,
