@@ -38,8 +38,11 @@ $ConfigFile = Join-Path $FixtureRoot 'reviewer.config.json'
 $PromptFile = Join-Path $RepoRoot 'src\Agents\reviewer\review-cycle.prompt.md'
 $AdapterManifest = Join-Path $FixtureRoot 'adapter-manifest.json'
 $SchemaDir = Join-Path $RepoRoot 'src\Agents\reviewer\acquisition\v1'
+$ReviewerScript = Join-Path $RepoRoot 'src\Agents\reviewer\Start-ReviewerAgent.ps1'
+$CrossVerificationLibrary = Join-Path $RepoRoot 'src\Agents\reviewer\CrossVerification.ps1'
 
 Import-Module (Join-Path $RepoRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force
+. $CrossVerificationLibrary
 
 $runId = [Guid]::NewGuid().ToString('N')
 $runRoot = Join-Path $RepoRoot ("_role_input_test_tmp-" + $runId)
@@ -59,6 +62,227 @@ function Write-Utf8 {
     param([string]$Path, [string]$Text)
     New-Item -ItemType Directory -Force -Path (Split-Path $Path -Parent) | Out-Null
     [IO.File]::WriteAllText($Path, $Text, $Utf8)
+}
+function Get-TestJsonElement {
+    param(
+        [Parameter(Mandatory)][System.Text.Json.JsonElement]$Root,
+        [Parameter(Mandatory)][object[]]$Path
+    )
+    $current = $Root
+    foreach ($part in $Path) {
+        if ($part -is [int]) {
+            $items = @($current.EnumerateArray())
+            $current = $items[[int]$part]
+        }
+        else {
+            $current = $current.GetProperty([string]$part)
+        }
+    }
+    return $current
+}
+function Test-TestJsonArray {
+    param(
+        [Parameter(Mandatory)][System.Text.Json.JsonElement]$Root,
+        [Parameter(Mandatory)][object[]]$Path,
+        [Parameter(Mandatory)][int]$Count
+    )
+    $element = Get-TestJsonElement -Root $Root -Path $Path
+    return (
+        $element.ValueKind -eq [System.Text.Json.JsonValueKind]::Array -and
+        $element.GetArrayLength() -eq $Count)
+}
+function ConvertTo-TestScalarCollapsedShape {
+    param([AllowNull()][AllowEmptyCollection()]$Value)
+    if ($null -eq $Value -or $Value -is [string] -or $Value -is [ValueType]) { return $Value }
+    if ($Value -is [System.Collections.IDictionary] -or
+        $Value -is [System.Management.Automation.PSCustomObject]) {
+        $copy = [ordered]@{}
+        $properties = if ($Value -is [System.Collections.IDictionary]) {
+            @($Value.Keys | ForEach-Object {
+                    [pscustomobject]@{ Name = [string]$_; Value = $Value[$_] }
+                })
+        }
+        else { @($Value.PSObject.Properties) }
+        foreach ($property in $properties) {
+            $copy[[string]$property.Name] = ConvertTo-TestScalarCollapsedShape -Value $property.Value
+        }
+        return $copy
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $items = @(foreach ($item in $Value) { ConvertTo-TestScalarCollapsedShape -Value $item })
+        if ($items.Count -eq 0) { return $null }
+        if ($items.Count -eq 1) { return $items[0] }
+        return , $items
+    }
+    return $Value
+}
+function New-TestSpecialistPlans {
+    param([Parameter(Mandatory)][ValidateRange(0, 2)][int]$ArrayCount)
+    [object[]]$strings = @(
+        for ($i = 0; $i -lt $ArrayCount; $i++) { "item-$i" }
+    )
+    [object[]]$evidence = @(
+        for ($i = 0; $i -lt $ArrayCount; $i++) {
+            [ordered]@{
+                sourceType = 'pinnedChangeSet'; path = "src/Widget$i.cs"
+                lineStart = 0; lineEnd = 0; field = 'current'; sha256 = ''
+            }
+        }
+    )
+    [object[]]$matchedPaths = @(
+        for ($i = 0; $i -lt $ArrayCount; $i++) {
+            [ordered]@{
+                path = "src/Widget$i.cs"; role = 'current'
+                changeTypes = [object[]]@($strings); globs = [object[]]@($strings)
+            }
+        }
+    )
+    [object[]]$selectedPacks = @(
+        for ($i = 0; $i -lt $ArrayCount; $i++) {
+            [ordered]@{
+                name = "pack-$i"; priority = 100 - $i
+                matchedPaths = [object[]]@($matchedPaths); sources = [object[]]@()
+                status = 'selected'; reason = ''
+            }
+        }
+    )
+    [object[]]$withheldPacks = @(
+        for ($i = 0; $i -lt $ArrayCount; $i++) {
+            [ordered]@{ name = "withheld-$i"; status = 'withheld'; reason = 'budget' }
+        }
+    )
+    return [pscustomobject]@{
+        Fact = [ordered]@{
+            planVersion = 1; schemaVersion = 1; extractorVersion = 'review-facts-v1'
+            status = 'complete'
+            facts = [object[]]@(
+                [ordered]@{
+                    id = "rf1:$('a' * 64)"; domain = 'changes'; kind = 'changedFile'
+                    subject = 'src/Widget.cs#current'; state = 'true'; unknownReason = ''
+                    value = [ordered]@{
+                        path = 'src/Widget.cs'; role = 'current'
+                        changeTypes = [object[]]@($strings)
+                    }
+                    evidence = [object[]]@($evidence)
+                    provenance = [ordered]@{
+                        extractorVersion = 'review-facts-v1'; inputSha256 = ('b' * 64)
+                        trustTier = 'wrapper-observed'
+                    }
+                },
+                [ordered]@{
+                    id = "rf1:$('c' * 64)"; domain = 'threads'; kind = 'reviewThread'
+                    subject = '1'; state = 'true'; unknownReason = ''
+                    value = [ordered]@{
+                        fingerprint = ('d' * 64); status = 'active'
+                        authorClasses = [object[]]@($strings)
+                        filePath = ''; line = 0; commentCount = 1
+                    }
+                    evidence = [object[]]@($evidence)
+                    provenance = [ordered]@{
+                        extractorVersion = 'review-facts-v1'; inputSha256 = ('e' * 64)
+                        trustTier = 'untrusted-author-controlled'
+                    }
+                })
+            factCount = 2
+        }
+        Convention = [ordered]@{
+            planVersion = 1; schemaVersion = 1; status = 'ready'
+            selectedPacks = [object[]]@($selectedPacks)
+            withheldPacks = [object[]]@($withheldPacks)
+            totalContextBytes = 0; maxTotalBytes = 131072
+        }
+    }
+}
+function Test-TestSpecialistPlanArrayShape {
+    param(
+        [Parameter(Mandatory)][string]$FactPlanJson,
+        [Parameter(Mandatory)][string]$ConventionPlanJson,
+        [Parameter(Mandatory)][ValidateRange(0, 2)][int]$ArrayCount
+    )
+    $factDocument = [System.Text.Json.JsonDocument]::Parse($FactPlanJson)
+    $conventionDocument = [System.Text.Json.JsonDocument]::Parse($ConventionPlanJson)
+    try {
+        $factRoot = $factDocument.RootElement
+        $conventionRoot = $conventionDocument.RootElement
+        $valid = (
+            (Test-TestJsonArray -Root $factRoot -Path @('facts', 0, 'evidence') -Count $ArrayCount) -and
+            (Test-TestJsonArray -Root $factRoot -Path @('facts', 0, 'value', 'changeTypes') -Count $ArrayCount) -and
+            (Test-TestJsonArray -Root $factRoot -Path @('facts', 1, 'evidence') -Count $ArrayCount) -and
+            (Test-TestJsonArray -Root $factRoot -Path @('facts', 1, 'value', 'authorClasses') -Count $ArrayCount) -and
+            (Test-TestJsonArray -Root $conventionRoot -Path @('selectedPacks') -Count $ArrayCount) -and
+            (Test-TestJsonArray -Root $conventionRoot -Path @('withheldPacks') -Count $ArrayCount))
+        if ($valid -and $ArrayCount -gt 0) {
+            $valid = (
+                (Test-TestJsonArray -Root $conventionRoot -Path @('selectedPacks', 0, 'matchedPaths') -Count $ArrayCount) -and
+                (Test-TestJsonArray -Root $conventionRoot -Path @('selectedPacks', 0, 'matchedPaths', 0, 'globs') -Count $ArrayCount) -and
+                (Test-TestJsonArray -Root $conventionRoot -Path @('selectedPacks', 0, 'matchedPaths', 0, 'changeTypes') -Count $ArrayCount))
+        }
+        return $valid
+    }
+    catch { return $false }
+    finally {
+        $factDocument.Dispose()
+        $conventionDocument.Dispose()
+    }
+}
+function Test-TestCapturedSpecialistProductionArrays {
+    param(
+        [Parameter(Mandatory)][string]$FactPlanJson,
+        [Parameter(Mandatory)][string]$ConventionPlanJson
+    )
+    $factDocument = [System.Text.Json.JsonDocument]::Parse($FactPlanJson)
+    $conventionDocument = [System.Text.Json.JsonDocument]::Parse($ConventionPlanJson)
+    try {
+        $facts = $factDocument.RootElement.GetProperty('facts')
+        $selectedPacks = $conventionDocument.RootElement.GetProperty('selectedPacks')
+        $withheldPacks = $conventionDocument.RootElement.GetProperty('withheldPacks')
+        if ($facts.ValueKind -ne [System.Text.Json.JsonValueKind]::Array -or
+            $selectedPacks.ValueKind -ne [System.Text.Json.JsonValueKind]::Array -or
+            $withheldPacks.ValueKind -ne [System.Text.Json.JsonValueKind]::Array -or
+            $facts.GetArrayLength() -eq 0 -or $selectedPacks.GetArrayLength() -eq 0) {
+            return $false
+        }
+        $sawChangeTypes = $false
+        $sawAuthorClasses = $false
+        $sawMatchedPath = $false
+        foreach ($fact in $facts.EnumerateArray()) {
+            if ($fact.GetProperty('evidence').ValueKind -ne [System.Text.Json.JsonValueKind]::Array) {
+                return $false
+            }
+            $value = $fact.GetProperty('value')
+            if ($value.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { continue }
+            $valueProperties = @($value.EnumerateObject() | ForEach-Object { $_.Name })
+            if ($valueProperties -ccontains 'changeTypes') {
+                $sawChangeTypes = $true
+                if ($value.GetProperty('changeTypes').ValueKind -ne [System.Text.Json.JsonValueKind]::Array) {
+                    return $false
+                }
+            }
+            if ($valueProperties -ccontains 'authorClasses') {
+                $sawAuthorClasses = $true
+                if ($value.GetProperty('authorClasses').ValueKind -ne [System.Text.Json.JsonValueKind]::Array) {
+                    return $false
+                }
+            }
+        }
+        foreach ($pack in $selectedPacks.EnumerateArray()) {
+            $matchedPaths = $pack.GetProperty('matchedPaths')
+            if ($matchedPaths.ValueKind -ne [System.Text.Json.JsonValueKind]::Array) { return $false }
+            foreach ($matchedPath in $matchedPaths.EnumerateArray()) {
+                $sawMatchedPath = $true
+                if ($matchedPath.GetProperty('globs').ValueKind -ne [System.Text.Json.JsonValueKind]::Array -or
+                    $matchedPath.GetProperty('changeTypes').ValueKind -ne [System.Text.Json.JsonValueKind]::Array) {
+                    return $false
+                }
+            }
+        }
+        return ($sawChangeTypes -and $sawAuthorClasses -and $sawMatchedPath)
+    }
+    catch { return $false }
+    finally {
+        $factDocument.Dispose()
+        $conventionDocument.Dispose()
+    }
 }
 function New-SpecialistReplay {
     param([Parameter(Mandatory)][string]$Destination)
@@ -430,6 +654,47 @@ try {
     Remove-Tree $runRoot
     New-Item -ItemType Directory -Force -Path $runRoot | Out-Null
     [IO.File]::WriteAllBytes($captureSealKeyPath, ([byte[]](1..32)))
+
+    # -- 0. Specialist plan capture preserves JSON array identity -------------
+    Write-Host '0/10 specialist capture serialization preserves empty, singleton and multi arrays' -ForegroundColor Cyan
+    $reviewerScriptText = [IO.File]::ReadAllText($ReviewerScript, $Utf8)
+    Check 'only the two specialist capture serializers use verification canonical JSON' (
+        ($reviewerScriptText -match
+            'conventionPlanJson\s*=\s*ConvertTo-ReviewerVerificationCanonicalJson\s+-Value\s+\$script:ReviewerRoleInputConventionPlan') -and
+        ($reviewerScriptText -match
+            'factPlanJson\s*=\s*ConvertTo-ReviewerVerificationCanonicalJson\s+-Value\s+\$script:ReviewerRoleInputFactPlan') -and
+        ($reviewerScriptText -notmatch
+            'conventionPlanJson\s*=\s*Get-ReviewerCanonicalJson\s+-Value\s+\$script:ReviewerRoleInputConventionPlan') -and
+        ($reviewerScriptText -notmatch
+            'factPlanJson\s*=\s*Get-ReviewerCanonicalJson\s+-Value\s+\$script:ReviewerRoleInputFactPlan'))
+
+    foreach ($arrayCount in 0..2) {
+        $plans = New-TestSpecialistPlans -ArrayCount $arrayCount
+        $factPlanHashBeforeBoundary = Get-ReviewerVerificationObjectSha256 -Value $plans.Fact
+        $conventionPlanHashBeforeBoundary = Get-ReviewerVerificationObjectSha256 -Value $plans.Convention
+        $capturedFactPlanJson = ConvertTo-ReviewerVerificationCanonicalJson -Value $plans.Fact
+        $capturedConventionPlanJson = ConvertTo-ReviewerVerificationCanonicalJson -Value $plans.Convention
+        Check "captured production-shaped plans retain every $arrayCount-element array as JSON arrays" (
+            Test-TestSpecialistPlanArrayShape -FactPlanJson $capturedFactPlanJson `
+                -ConventionPlanJson $capturedConventionPlanJson -ArrayCount $arrayCount)
+
+        $parsedFactPlan = $capturedFactPlanJson | ConvertFrom-Json -AsHashtable -Depth 64
+        $parsedConventionPlan = $capturedConventionPlanJson | ConvertFrom-Json -AsHashtable -Depth 64
+        Check "captured $arrayCount-element fact plan hashes exactly like its in-memory pre-boundary plan" (
+            (Get-ReviewerVerificationObjectSha256 -Value $parsedFactPlan) -ceq $factPlanHashBeforeBoundary)
+        Check "captured $arrayCount-element convention plan hashes exactly like its in-memory pre-boundary plan" (
+            (Get-ReviewerVerificationObjectSha256 -Value $parsedConventionPlan) -ceq $conventionPlanHashBeforeBoundary)
+
+        if ($arrayCount -lt 2) {
+            $collapsedFactPlanJson = ConvertTo-ReviewerVerificationCanonicalJson -Value (
+                ConvertTo-TestScalarCollapsedShape -Value $plans.Fact)
+            $collapsedConventionPlanJson = ConvertTo-ReviewerVerificationCanonicalJson -Value (
+                ConvertTo-TestScalarCollapsedShape -Value $plans.Convention)
+            Check "scalar collapse sabotage is detected for $arrayCount-element plan arrays" (
+                -not (Test-TestSpecialistPlanArrayShape -FactPlanJson $collapsedFactPlanJson `
+                        -ConventionPlanJson $collapsedConventionPlanJson -ArrayCount $arrayCount))
+        }
+    }
 
     # -- 1. Generalist: the exact production prompt, and nothing else ---------
     Write-Host '1/8 generalist capture reaches the exact model boundary and launches nothing' -ForegroundColor Cyan
@@ -1180,6 +1445,16 @@ try {
             Check "$role capture reached the boundary exactly once and started nothing" (
                 [int]$m.launch.boundaryHits -eq 1 -and [string]$m.role -ceq $role -and
                 @($m.sideEffects.PSObject.Properties | Where-Object { [int]$_.Value -ne 0 }).Count -eq 0)
+            if ($role -ceq 'specialist') {
+                $capturedProjection = Get-Content (Join-Path $out 'projection.json') `
+                    -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 64
+                Check 'production specialist capture retains every plan collection as a JSON array' (
+                    [string]$capturedProjection.role -ceq 'specialist' -and
+                    $null -ne $capturedProjection.PSObject.Properties['specialist'] -and
+                    (Test-TestCapturedSpecialistProductionArrays `
+                        -FactPlanJson ([string]$capturedProjection.specialist.factPlanJson) `
+                        -ConventionPlanJson ([string]$capturedProjection.specialist.conventionPlanJson)))
+            }
             $v = Invoke-Tool -Arguments @('-VerifyOnly', '-OutputRoot', $out, '-SealKeyPath', $captureSealKeyPath)
             Check "$role bundle re-verifies independently" ($v.ExitCode -eq 0) $v.Text
             $pipeline = Invoke-CapturedRolePipeline -Role $role -CaptureRoot $out -Bundle $case.Bundle `
