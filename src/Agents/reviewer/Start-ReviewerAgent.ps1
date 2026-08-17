@@ -422,7 +422,12 @@ param(
     # model, agency or provider process is ever launched, no plan / token / lease
     # is authored or consumed, and no live read or write is issued. It emits a
     # role-scoped, read-only capture whose prompt bytes are exactly the bytes the
-    # production pass would have written to the model's standard input.
+    # production pass would have written to the model's standard input. For the
+    # verifier that equality is scoped to the inputs capture holds - see
+    # Invoke-ReviewerAcquisitionVerifierCapture, which states it precisely: the
+    # builders are production's, but the surrounding cross-verification cycle is
+    # not re-run, so the stimulus is production-builder-compatible rather than a
+    # replay of a state a full production cycle reaches.
     #
     # The offline stub adapter is REFUSED in this mode: capture stands at the
     # real production boundary, and there is nothing to stub because nothing is
@@ -17065,6 +17070,10 @@ function Invoke-ReviewerRoleInputCaptureRun {
         surfaces, configuration, model registry and role entry points verbatim -
         no prompt logic is restated here - and adds nothing to the launch path
         except the boundary refusal, which happens before any process starts.
+        The generalist and specialist run through their production role entry
+        points; the verifier calls the production verification builders directly
+        rather than re-running a cross-verification cycle, with the scope stated
+        on Invoke-ReviewerAcquisitionVerifierCapture.
 
         It authors no plan, mints no token, takes no lease, opens no live
         transport, and performs no provider read or write. It refuses oracle /

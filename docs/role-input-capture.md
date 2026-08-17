@@ -32,7 +32,11 @@ follow.
 
 Everything upstream of that line is untouched production code — the same
 builders, the same parser, the same configuration loader and the same model
-registry. There is no second prompt implementation to drift.
+registry. There is no second prompt implementation to drift. The one place worth
+stating precisely is the verifier: capture assembles that stimulus by calling the
+production builders directly rather than by running a full cross-verification
+pass, from the inputs described in the verifier section below. The builders are
+production's; the surrounding cycle is not re-run.
 
 ## Running one
 
@@ -189,9 +193,12 @@ imply coverage it does not yet have.
 
 The bundle supplies the complementary boundary evidence:
 
-* `launch.boundaryHits` is exactly `1` in the published manifest, which proves
-  the production path really ran all the way to the model boundary and stopped
-  there — a capture that never got that far cannot claim it did;
+* `launch.boundaryHits` is exactly `1` in the published manifest. That is the
+  child's own record that the production path ran all the way to the model
+  boundary and stopped there — tamper-evident once sealed, but self-reported: it
+  is evidence of reaching the boundary, not independent proof of it. A capture
+  that never got that far cannot silently claim it did, because the counter is
+  incremented at the interception itself and the manifest is sealed;
 * the manifest is covered by an HMAC seal (`capture-seal.json`) under a key the
   verifier holds independently, so the claim cannot be **altered** after the fact
   by editing the bundle — the seal establishes integrity and authorship, not the
