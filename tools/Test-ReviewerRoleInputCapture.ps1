@@ -803,6 +803,8 @@ exit 91
     $modelIndexes = @()
     $captureModelIndexes = @()
     $secondIndexes = @()
+    $specialistEnableIndexes = @()
+    $specialistModelIndexes = @()
     if ($childArgv.Count -gt 0) {
         $modelIndexes = @(0..($childArgv.Count - 1) | Where-Object {
                 [string]$childArgv[$_] -ceq '-Model'
@@ -812,6 +814,12 @@ exit 91
             })
         $secondIndexes = @(0..($childArgv.Count - 1) | Where-Object {
                 [string]$childArgv[$_] -ceq '-SecondPassModel'
+            })
+        $specialistEnableIndexes = @(0..($childArgv.Count - 1) | Where-Object {
+                [string]$childArgv[$_] -ceq '-EnableConventionSpecialist'
+            })
+        $specialistModelIndexes = @(0..($childArgv.Count - 1) | Where-Object {
+                [string]$childArgv[$_] -ceq '-ConventionSpecialistModel'
             })
     }
     Check 'Opus discovery/captured plus GPT second reaches the exact production child boundary' (
@@ -823,6 +831,9 @@ exit 91
         [string]$childArgv[$captureModelIndexes[0] + 1] -ceq [string]$generalistPair.First -and
         $secondIndexes.Count -eq 1 -and
         [string]$childArgv[$secondIndexes[0] + 1] -ceq [string]$generalistPair.Second) (
+        $childArgv -join ' ')
+    Check 'a no-specialist generalist config forwards no specialist switch or model' (
+        $specialistEnableIndexes.Count -eq 0 -and $specialistModelIndexes.Count -eq 0) (
         $childArgv -join ' ')
 
     Remove-Item -LiteralPath $argvCapture -Force -ErrorAction SilentlyContinue
@@ -868,6 +879,111 @@ exit 91
         $omittedSecond.Text -match 'Verification preview requires two explicitly named independent generalist passes' -and
         -not (Test-Path -LiteralPath (Join-Path $runRoot 'capture-generalist-second-omitted'))) `
         $omittedSecond.Text
+
+    Remove-Item -LiteralPath $argvCapture -Force -ErrorAction SilentlyContinue
+    $previewStubOut = Join-Path $runRoot 'capture-generalist-verification-stub'
+    $previewStub = Invoke-Tool -ToolPath $stubSupervisor -Arguments (
+        Get-CaptureArgs -Bundle $twoPassRequiredBundle -Out $previewStubOut `
+            -Model $generalistPair.First -Extra @(
+                '-SecondGeneralistModel', $generalistPair.Second))
+    $previewChildArgv = @()
+    if (Test-Path -LiteralPath $argvCapture -PathType Leaf) {
+        $previewChildArgv = @([IO.File]::ReadAllText($argvCapture, $Utf8) | ConvertFrom-Json)
+    }
+    $previewEnableIndexes = @()
+    $previewSpecialistModelIndexes = @()
+    if ($previewChildArgv.Count -gt 0) {
+        $previewEnableIndexes = @(0..($previewChildArgv.Count - 1) | Where-Object {
+                [string]$previewChildArgv[$_] -ceq '-EnableConventionSpecialist'
+            })
+        $previewSpecialistModelIndexes = @(0..($previewChildArgv.Count - 1) | Where-Object {
+                [string]$previewChildArgv[$_] -ceq '-ConventionSpecialistModel'
+            })
+    }
+    Check 'verification-enabled generalist capture reaches the production child boundary' (
+        $previewStub.ExitCode -ne 0 -and $previewChildArgv.Count -gt 0) $previewStub.Text
+    Check 'verification-enabled generalist capture forwards the configured specialist enable/model exactly once' (
+        $previewEnableIndexes.Count -eq 1 -and
+        $previewSpecialistModelIndexes.Count -eq 1 -and
+        [string]$previewChildArgv[$previewSpecialistModelIndexes[0] + 1] -ceq 'claude-sonnet-5') (
+        $previewChildArgv -join ' ')
+
+    $omittedSpecialistSupervisor = Join-Path $runRoot 'Invoke-ReviewerRoleInputCapture-specialist-omitted.ps1'
+    $specialistForwardingCondition = 'if ($capturePlansConventionSpecialist) {'
+    Check 'the specialist forwarding condition has one argv use' (
+        ($supervisorText.Split([string[]]@($specialistForwardingCondition),
+                [StringSplitOptions]::None).Length - 1) -eq 1)
+    Write-Utf8 $omittedSpecialistSupervisor (
+        $supervisorText.Replace($specialistForwardingCondition, 'if ($false) {'))
+    $omittedSpecialistOut = Join-Path $runRoot 'capture-generalist-specialist-omitted'
+    $omittedSpecialist = Invoke-Tool -ToolPath $omittedSpecialistSupervisor -Arguments (
+        Get-CaptureArgs -Bundle $twoPassRequiredBundle -Out $omittedSpecialistOut `
+            -Model $generalistPair.First -Extra @(
+                '-SecondGeneralistModel', $generalistPair.Second))
+    Check 'omitting specialist forwarding reproduces the production layer-5 refusal' (
+        $omittedSpecialist.ExitCode -ne 0 -and
+        $omittedSpecialist.Text -match 'Verification preview requires -EnableConventionSpecialist so all layer-5 inputs are present' -and
+        -not (Test-Path -LiteralPath $omittedSpecialistOut)) $omittedSpecialist.Text
+
+    $unsupportedSpecialistConfig = Join-Path $runRoot 'unsupported-specialist-config\reviewer.config.json'
+    $unsupportedSpecialistConfigObject = Get-Content $twoPassConfig -Raw -Encoding UTF8 |
+        ConvertFrom-Json -AsHashtable -Depth 64
+    $unsupportedSpecialistConfigObject.review.conventionSpecialistModel = 'unsupported-specialist'
+    Write-Utf8 $unsupportedSpecialistConfig (
+        ConvertTo-Json $unsupportedSpecialistConfigObject -Depth 64)
+    $unsupportedSpecialistBundle = New-CaptureBundle -Role generalist -Tag 'unsupported-specialist' `
+        -ConfigSource $unsupportedSpecialistConfig -Model $generalistPair.First
+    Remove-Item -LiteralPath $argvCapture -Force -ErrorAction SilentlyContinue
+    $unsupportedSpecialist = Invoke-Tool -ToolPath $stubSupervisor -Arguments (
+        Get-CaptureArgs -Bundle $unsupportedSpecialistBundle `
+            -Out (Join-Path $runRoot 'capture-generalist-unsupported-specialist') `
+            -Model $generalistPair.First -Extra @(
+                '-SecondGeneralistModel', $generalistPair.Second))
+    Check 'an unsupported configured specialist is rejected before the child boundary' (
+        $unsupportedSpecialist.ExitCode -ne 0 -and
+        $unsupportedSpecialist.Text -match 'unsupported model id' -and
+        -not (Test-Path -LiteralPath $argvCapture)) $unsupportedSpecialist.Text
+
+    Remove-Item -LiteralPath $argvCapture -Force -ErrorAction SilentlyContinue
+    $overriddenSpecialist = Invoke-Tool -ToolPath $stubSupervisor -Arguments (
+        Get-CaptureArgs -Bundle $twoPassRequiredBundle `
+            -Out (Join-Path $runRoot 'capture-generalist-overridden-specialist') `
+            -Model $generalistPair.First -Extra @(
+                '-SecondGeneralistModel', $generalistPair.Second,
+                '-ConventionSpecialistModel', 'claude-haiku-4.5'))
+    $overrideChildArgv = @()
+    if (Test-Path -LiteralPath $argvCapture -PathType Leaf) {
+        $overrideChildArgv = @([IO.File]::ReadAllText($argvCapture, $Utf8) | ConvertFrom-Json)
+    }
+    $overrideSpecialistModelIndexes = @()
+    if ($overrideChildArgv.Count -gt 0) {
+        $overrideSpecialistModelIndexes = @(0..($overrideChildArgv.Count - 1) | Where-Object {
+                [string]$overrideChildArgv[$_] -ceq '-ConventionSpecialistModel'
+            })
+    }
+    Check 'an explicit specialist model overrides the configured model at the child boundary' (
+        $overriddenSpecialist.ExitCode -ne 0 -and
+        $overrideSpecialistModelIndexes.Count -eq 1 -and
+        [string]$overrideChildArgv[$overrideSpecialistModelIndexes[0] + 1] -ceq 'claude-haiku-4.5') (
+        $overrideChildArgv -join ' ')
+
+    $previewGenOut = Join-Path $runRoot 'capture-generalist-verification'
+    $previewGen = Invoke-Tool -Arguments (
+        Get-CaptureArgs -Bundle $twoPassRequiredBundle -Out $previewGenOut `
+            -Model $generalistPair.First -Extra @(
+                '-SecondGeneralistModel', $generalistPair.Second))
+    Check 'verification-enabled generalist capture succeeds at the requested boundary' (
+        $previewGen.ExitCode -eq 0) $previewGen.Text
+    if ($previewGen.ExitCode -eq 0) {
+        $previewManifest = Get-Content (Join-Path $previewGenOut 'capture-manifest.json') `
+            -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 64
+        Check 'verification-enabled capture records one generalist boundary and zero child models' (
+            [string]$previewManifest.role -ceq 'generalist' -and
+            [string]$previewManifest.model -ceq [string]$generalistPair.First -and
+            [int]$previewManifest.launch.boundaryHits -eq 1 -and
+            [int]$previewManifest.sideEffects.modelProcesses -eq 0 -and
+            [int]$previewManifest.sideEffects.agencyProcesses -eq 0)
+    }
 
     $genOut = Join-Path $runRoot 'capture-generalist'
     $gen = Invoke-Tool -Arguments (Get-CaptureArgs -Bundle $genBundle -Out $genOut `
