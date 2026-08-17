@@ -53,6 +53,7 @@
               "truncatedMarker",
               "multipleMarkers",
               "wrongBinding",
+              "schemaInvalidMarker",
               "timeout",
               "crash",
               "stdoutSaturation",

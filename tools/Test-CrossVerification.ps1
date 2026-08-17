@@ -2652,6 +2652,11 @@ Assert-Verification ($prodManifest.Count -eq 1 -and [int]$prodManifest[0].line -
     "Anchors built by the production changed-file index must resolve a cross-file manifestation hunk; the nested @() form would leave only the anchor hunk and split the verifiers."
 $crossPassText = Get-VerificationFunctionText -Text $wrapperText `
     -Name "Invoke-ReviewerCrossVerificationPass"
+$verificationInputBodyText = Get-VerificationFunctionText -Text $wrapperText `
+    -Name "New-ReviewerVerificationInputBody"
+$verificationRunInputText = Get-VerificationFunctionText -Text $wrapperText `
+    -Name "Get-ReviewerVerificationRunInput"
+$crossPassIntegrationText = $crossPassText + "`n" + $verificationInputBodyText + "`n" + $verificationRunInputText
 foreach ($policyUse in @(
         "Get-ReviewerVerificationCandidatePlan", "nearExactJaccard", "semanticJaccard",
         "existingThreadJaccard", "maxInputBytes", "maxArtifactBytes",
@@ -2659,7 +2664,7 @@ foreach ($policyUse in @(
         "Get-ReviewerVerificationCandidateFactPartition",
         "Get-ReviewerVerificationClusterFactPartition"
     )) {
-    Assert-Verification ($crossPassText.IndexOf(
+    Assert-Verification ($crossPassIntegrationText.IndexOf(
             $policyUse, [StringComparison]::Ordinal) -ge 0) `
         "Effective verification policy '$policyUse' is sealed but does not drive production behavior."
 }
@@ -2695,7 +2700,8 @@ Assert-Verification ($replayIdentityText -match 'ReviewerReplayActive' -and
     "The replay identity block must be defined exactly once, only in replay, and never promotable."
 foreach ($functionName in @(
         "Write-ReviewerVerificationDecisionPreview", "Invoke-ReviewerVerificationModelRun",
-        "Get-ReviewerVerificationSourceHunks", "Invoke-ReviewerCrossVerificationPass",
+        "Get-ReviewerVerificationSourceHunks", "New-ReviewerVerificationInputBody",
+        "Get-ReviewerVerificationRunInput", "Invoke-ReviewerCrossVerificationPass",
         "Invoke-ReviewerCrossVerificationSafely"
     )) {
     $integrationText = Get-VerificationFunctionText -Text $wrapperText -Name $functionName
@@ -2750,6 +2756,8 @@ Assert-Verification (@($missingEvidence.eligible).Count -eq 0 -and
 # Execute the production pass and safe wrapper with external I/O replaced by bounded
 # deterministic fixtures. This catches candidate-local admission failures escaping
 # into the pass-wide degradation boundary.
+. ([scriptblock]::Create($verificationInputBodyText))
+. ([scriptblock]::Create($verificationRunInputText))
 . ([scriptblock]::Create($crossPassText))
 . ([scriptblock]::Create($safeVerificationText))
 $script:passCandidates = @()
