@@ -105,6 +105,14 @@ models the sealed snapshot was captured for. Without this separation such a
 configuration cannot be captured at all: production refuses the pairing before it
 ever reaches the boundary.
 
+A generalist capture still carries the surrounding layer-5 configuration when
+verification preview is enabled. Supply the explicit second generalist and
+convention-specialist model (or bind the latter in
+`config.review.conventionSpecialistModel`); the supervisor forwards the
+specialist enable/model inputs needed by production validation, but capture's
+single-role guard still intercepts only the requested generalist boundary and
+never launches the specialist.
+
 `-Preflight` performs every readiness check (including requiring an existing
 32-byte seal key) and leaves the filesystem
 byte-for-byte untouched — no output root, no lease, no plan, no token, no

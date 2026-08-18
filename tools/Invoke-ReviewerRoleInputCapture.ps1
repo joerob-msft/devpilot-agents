@@ -900,6 +900,37 @@ $configLoad = Get-AgentConfig -Path $configFull -AgentDir (Split-Path $ReviewerS
     -SupportedSchemaVersions @(1) -PromptFileField 'promptFile'
 $configObject = $configLoad.Raw
 Assert-NoForbiddenKeys -Node $configObject -Surface 'The reviewer configuration'
+$configConventionSpecialistModel = ''
+$configVerificationEnabled = $false
+if ($configObject.PSObject.Properties.Name -ccontains 'review') {
+    $configReview = $configObject.review
+    if ($configReview.PSObject.Properties.Name -ccontains 'conventionSpecialistModel') {
+        $configConventionSpecialistModel = [string]$configReview.conventionSpecialistModel
+    }
+    if ($configReview.PSObject.Properties.Name -ccontains 'verification' -and
+        $configReview.verification.PSObject.Properties.Name -ccontains 'enabled') {
+        $configVerificationEnabled = [bool]$configReview.verification.enabled
+    }
+}
+$capturePlansConventionSpecialist = (
+    $Role -cne 'generalist' -or
+    $configVerificationEnabled -or
+    [bool]$ConventionSpecialistModel)
+$captureConventionSpecialistModel = $ConventionSpecialistModel
+if ($Role -ceq 'generalist' -and $capturePlansConventionSpecialist) {
+    $captureConventionSpecialistModel = if ($ConventionSpecialistModel) {
+        $ConventionSpecialistModel
+    }
+    else {
+        $configConventionSpecialistModel
+    }
+    if (-not $captureConventionSpecialistModel) {
+        throw ("A $Role role input capture with verification/convention specialist enabled requires " +
+            'an explicit -ConventionSpecialistModel or config.review.conventionSpecialistModel.')
+    }
+    [void](Assert-AgentSupportedModel -ModelId $captureConventionSpecialistModel `
+            -Where 'role input capture convention specialist model')
+}
 $configRepositoryId = ''
 if ($configObject.PSObject.Properties.Name -ccontains 'repository' -and
     $configObject.repository.PSObject.Properties.Name -ccontains 'id') {
@@ -1187,11 +1218,15 @@ if ($legacyFull) { $reviewerArgs += @('-CaptureRoleInputLegacyProjectionFile', $
 if ($SecondGeneralistModel) {
     $reviewerArgs += @('-SecondPassModel', $SecondGeneralistModel)
 }
-if ($Role -cne 'generalist') {
-    if (-not $SecondGeneralistModel) { throw "A $Role role input capture requires -SecondGeneralistModel (the second configured generalist model)." }
-    if (-not $ConventionSpecialistModel) { throw "A $Role role input capture requires -ConventionSpecialistModel (the configured convention specialist model)." }
+if ($capturePlansConventionSpecialist) {
+    if ($Role -cne 'generalist' -and -not $SecondGeneralistModel) {
+        throw "A $Role role input capture requires -SecondGeneralistModel (the second configured generalist model)."
+    }
+    if ($Role -cne 'generalist' -and -not $ConventionSpecialistModel) {
+        throw "A $Role role input capture requires -ConventionSpecialistModel (the configured convention specialist model)."
+    }
     $reviewerArgs += @(
-        '-EnableConventionSpecialist', '-ConventionSpecialistModel', $ConventionSpecialistModel,
+        '-EnableConventionSpecialist', '-ConventionSpecialistModel', $captureConventionSpecialistModel,
         '-ConventionSpecialistTimeoutSeconds', "$TimeoutSeconds"
     )
 }
