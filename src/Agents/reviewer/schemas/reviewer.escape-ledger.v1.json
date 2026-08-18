@@ -1,0 +1,212 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/schemas/reviewer.escape-ledger.v1.json",
+  "title": "Reviewer escape ledger v1",
+  "description": "Versioned, employer-neutral record of defects that escaped review into a merged coordinator change, together with the escape budget whose breach triggers a control-plane decision.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "kind",
+    "ledgerVersion",
+    "coverageWindow",
+    "vocabulary",
+    "budget",
+    "incidents",
+    "gateObservations",
+    "decision"
+  ],
+  "properties": {
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "kind": { "type": "string", "const": "reviewer-escape-ledger" },
+    "ledgerVersion": { "type": "integer", "minimum": 1 },
+    "description": { "type": "string", "minLength": 1 },
+    "coverageWindow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["startGate", "startCommit", "endCommit", "coordinatorPullRequestsObserved"],
+      "properties": {
+        "startGate": { "type": "string", "minLength": 1 },
+        "startCommit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+        "endCommit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+        "coordinatorPullRequestsObserved": { "type": "integer", "minimum": 0 },
+        "notes": { "type": "string" }
+      }
+    },
+    "vocabulary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["categories", "executionStages", "statuses"],
+      "properties": {
+        "categories": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "definition"],
+            "properties": {
+              "id": {
+                "type": "string",
+                "enum": ["typeBinding", "logic", "modelProtocol", "supervision", "external"]
+              },
+              "definition": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "executionStages": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "definition"],
+            "properties": {
+              "id": { "type": "string", "enum": ["deterministic", "shadow", "live"] },
+              "definition": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "statuses": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "definition"],
+            "properties": {
+              "id": { "type": "string", "enum": ["remediated", "openDebt", "accepted"] },
+              "definition": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "statement", "threshold", "window", "action", "state"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "statement": { "type": "string", "minLength": 1 },
+        "threshold": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["category", "reachedExecutionStages", "count"],
+          "properties": {
+            "category": { "type": "string", "enum": ["typeBinding", "logic", "modelProtocol", "supervision", "external"] },
+            "reachedExecutionStages": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "type": "string", "enum": ["deterministic", "shadow", "live"] }
+            },
+            "count": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "window": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["coordinatorPullRequests", "days", "combinator"],
+          "properties": {
+            "coordinatorPullRequests": { "type": "integer", "minimum": 1 },
+            "days": { "type": "integer", "minimum": 1 },
+            "combinator": { "type": "string", "enum": ["either", "both"] }
+          }
+        },
+        "action": { "type": "string", "minLength": 1 },
+        "state": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["qualifyingIncidentIds", "qualifyingCount", "triggered"],
+          "properties": {
+            "qualifyingIncidentIds": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "type": "string", "pattern": "^ESC-[0-9]{4}$" }
+            },
+            "qualifyingCount": { "type": "integer", "minimum": 0 },
+            "triggered": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "incidents": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "title",
+          "category",
+          "executionStage",
+          "reachedShadowOrLive",
+          "status",
+          "summary",
+          "detector",
+          "regressionGuard"
+        ],
+        "properties": {
+          "id": { "type": "string", "pattern": "^ESC-[0-9]{4}$" },
+          "title": { "type": "string", "minLength": 1 },
+          "category": { "type": "string", "enum": ["typeBinding", "logic", "modelProtocol", "supervision", "external"] },
+          "executionStage": { "type": "string", "enum": ["deterministic", "shadow", "live"] },
+          "reachedShadowOrLive": { "type": "boolean" },
+          "status": { "type": "string", "enum": ["remediated", "openDebt", "accepted"] },
+          "summary": { "type": "string", "minLength": 1 },
+          "detector": { "type": "string", "minLength": 1 },
+          "regressionGuard": { "type": "string", "minLength": 1 },
+          "introducedCommit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+          "remediatedCommit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+          "siteCount": { "type": "integer", "minimum": 1 }
+        }
+      }
+    },
+    "gateObservations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["gate", "observation", "decisionYieldPercent", "externalWrites", "noWriteInvariantHeld"],
+        "properties": {
+          "gate": { "type": "string", "minLength": 1 },
+          "observation": { "type": "string", "minLength": 1 },
+          "decisionYieldPercent": { "type": "number", "minimum": 0, "maximum": 100 },
+          "externalWrites": { "type": "integer", "minimum": 0 },
+          "noWriteInvariantHeld": { "type": "boolean" }
+        }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status", "statement", "prerequisites"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "status": { "type": "string", "enum": ["notTaken", "conditional", "taken", "rejected"] },
+        "statement": { "type": "string", "minLength": 1 },
+        "prerequisites": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "title", "complete", "evidence"],
+            "properties": {
+              "id": { "type": "string", "minLength": 1 },
+              "title": { "type": "string", "minLength": 1 },
+              "complete": { "type": "boolean" },
+              "evidence": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -4,7 +4,9 @@
     Finds selected PowerShell empty-output-to-null hazards with the PowerShell AST.
 
 .DESCRIPTION
-    Reports three deliberately narrow rule classes:
+    Reports deliberately narrow rule classes.
+
+    Empty-output-to-null hazards:
       PSEN001 - a bare command/pipeline flows into a typed array assignment or a
                 mandatory typed-array parameter declared in the analyzed files;
       PSEN002 - an array subexpression contains an explicit $null without a
@@ -12,17 +14,47 @@
       PSEN003 - Measure-Object -Sum is dereferenced through .Sum without a
                 recognized default or non-empty input guard.
 
+    Boundary-hardening hazards (a collection, a closure, or a serialized
+    contract changes shape as it crosses a call, capture, or file boundary):
+      PSEN004 - a function returns a locally constructed .NET collection bare,
+                so PowerShell enumerates it and an empty collection becomes
+                $null at the call site;
+      PSEN005 - .Count/.Length or an index is taken directly on an
+                unconstrained parenthesized command or pipeline expression;
+      PSEN006 - a script block references an unqualified variable that this
+                file also assigns at script scope, so the captured value
+                depends on ambient state rather than explicit capture;
+      PSEN007 - ConvertTo-Json is called without an explicit -Depth, so the
+                serialized contract depth is whatever the host defaults to;
+      PSEN008 - a ConvertTo-Json result is written to a file without an
+                explicit -Compress decision, leaving the on-disk form of a
+                contract implicit; and
+      PSEN009 - a non-preserved command/statement result is assigned and later
+                indexed or counted, so a single result flattens to a scalar; and
+      PSEN010 - a .GetNewClosure() script block calls a function defined in the
+                analyzed files by name, but GetNewClosure captures variables,
+                not function definitions, so the call resolves against whatever
+                scope later invokes the closure; and
+      PSEN011 - @(...) wraps a call to a function that deliberately protects its
+                collection return, which nests that return as a single element
+                instead of flattening it.
+
     This is a heuristic prevention aid, not a PowerShell type or control-flow
     prover. Use -OutputFormat Json for CI or measurement consumers.
 
 .EXAMPLE
     ./tools/Find-PowerShellEmptyNullHazard.ps1 -Path ./src -Recurse -OutputFormat Json
+
+.EXAMPLE
+    ./tools/Find-PowerShellEmptyNullHazard.ps1 -Path ./src -Recurse -RuleId PSEN004, PSEN006
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string[]]$Path,
     [switch]$Recurse,
-    [ValidateSet('Object', 'Json')][string]$OutputFormat = 'Object'
+    [ValidateSet('Object', 'Json')][string]$OutputFormat = 'Object',
+    [ValidateSet('PSEN001', 'PSEN002', 'PSEN003', 'PSEN004', 'PSEN005',
+        'PSEN006', 'PSEN007', 'PSEN008', 'PSEN009', 'PSEN010', 'PSEN011')][string[]]$RuleId
 )
 
 $ErrorActionPreference = 'Stop'
@@ -288,6 +320,287 @@ function Test-MeasureGuarded {
     return $false
 }
 
+function Test-ProtectedCollectionReturn {
+    <#
+    .SYNOPSIS
+        True when a function deliberately returns a collection as one object.
+
+    .DESCRIPTION
+        Write-Output -NoEnumerate and a unary-comma return both hand the caller
+        the collection itself instead of its elements. Callers must assign such
+        a result before wrapping it, because @(f) collects the pipeline output
+        rather than flattening the object that arrived on it.
+    #>
+    param([Management.Automation.Language.FunctionDefinitionAst]$Function)
+
+    foreach ($command in $Function.Body.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.CommandAst]
+            }, $true)) {
+        if ([string]$command.GetCommandName() -ine 'Write-Output') { continue }
+        if (Test-CommandParameterPresent -Command $command -Prefix 'NoEnum') { return $true }
+    }
+    foreach ($return in $Function.Body.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.ReturnStatementAst]
+            }, $true)) {
+        if ($null -eq $return.Pipeline) { continue }
+        $pipeline = $return.Pipeline
+        if ($pipeline -isnot [Management.Automation.Language.PipelineAst]) { continue }
+        $elements = @($pipeline.PipelineElements)
+        if ($elements.Count -ne 1) { continue }
+        $element = $elements[0]
+        if ($element -isnot [Management.Automation.Language.CommandExpressionAst]) { continue }
+        $expression = $element.Expression
+        # ", $x" parses as a one-element array literal whose extent starts with
+        # the comma; that is the protected-return form, unlike "@(1, 2)".
+        if ($expression -is [Management.Automation.Language.ArrayLiteralAst] -and
+            @($expression.Elements).Count -eq 1 -and
+            ([string]$expression.Extent.Text).TrimStart().StartsWith(',')) {
+            return $true
+        }
+        if ($expression -is [Management.Automation.Language.UnaryExpressionAst] -and
+            $expression.TokenKind -eq [Management.Automation.Language.TokenKind]::Comma) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-ProtectedReturnSource {
+    <#
+    .SYNOPSIS
+        True when an expression is exactly one call to a function that protects
+        its own collection return.
+    #>
+    param(
+        [Management.Automation.Language.Ast]$Ast,
+        [System.Collections.Generic.HashSet[string]]$ProtectedNames
+    )
+
+    if ($null -eq $ProtectedNames -or $ProtectedNames.Count -eq 0) { return $false }
+    $current = $Ast
+    while ($current -is [Management.Automation.Language.ParenExpressionAst]) {
+        $current = $current.Pipeline
+    }
+    if ($current -isnot [Management.Automation.Language.PipelineAst]) { return $false }
+    $elements = @($current.PipelineElements)
+    if ($elements.Count -ne 1) { return $false }
+    $command = $elements[0]
+    if ($command -isnot [Management.Automation.Language.CommandAst]) { return $false }
+    $commandName = $command.GetCommandName()
+    if ([string]::IsNullOrWhiteSpace($commandName)) { return $false }
+    return $ProtectedNames.Contains($commandName)
+}
+
+$script:EnumeratingCollectionTypePattern =
+'(^|\.)(List|HashSet|SortedSet|ArrayList|Queue|Stack|Collection|BlockingCollection|ConcurrentBag|ConcurrentQueue|ConcurrentStack)(`\d+)?(\[|$)'
+
+function Get-VariableName {
+    param([System.Management.Automation.VariablePath]$VariablePath)
+
+    $userPath = [string]$VariablePath.UserPath
+    $separator = $userPath.LastIndexOf(':')
+    if ($separator -lt 0) { return $userPath }
+    return $userPath.Substring($separator + 1)
+}
+
+function Test-EnumeratingCollectionTypeName {
+    param([AllowEmptyString()][string]$TypeName)
+
+    if ([string]::IsNullOrWhiteSpace($TypeName)) { return $false }
+    return $TypeName -match $script:EnumeratingCollectionTypePattern
+}
+
+# A locally constructed List/HashSet/ArrayList is the shape that silently
+# becomes $null when it is empty and the function returns it bare, because the
+# return enumerates it into zero pipeline objects.
+function Test-EnumeratingCollectionConstruction {
+    param([Management.Automation.Language.Ast]$Ast)
+
+    $current = $Ast
+    while ($current -is [Management.Automation.Language.PipelineAst] -or
+        $current -is [Management.Automation.Language.CommandExpressionAst] -or
+        $current -is [Management.Automation.Language.ParenExpressionAst]) {
+        if ($current -is [Management.Automation.Language.PipelineAst]) {
+            if (@($current.PipelineElements).Count -ne 1) { return $false }
+            $current = $current.PipelineElements[0]
+        }
+        elseif ($current -is [Management.Automation.Language.CommandExpressionAst]) {
+            $current = $current.Expression
+        }
+        else {
+            $current = $current.Pipeline
+        }
+    }
+    if ($current -is [Management.Automation.Language.InvokeMemberExpressionAst] -and
+        $current.Expression -is [Management.Automation.Language.TypeExpressionAst] -and
+        $current.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
+        [string]$current.Member.Value -ieq 'new') {
+        return Test-EnumeratingCollectionTypeName -TypeName $current.Expression.TypeName.FullName
+    }
+    if ($current -is [Management.Automation.Language.CommandAst] -and
+        $current.GetCommandName() -in 'New-Object', 'new-object') {
+        foreach ($element in @($current.CommandElements)) {
+            if ($element -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                (Test-EnumeratingCollectionTypeName -TypeName ([string]$element.Value))) {
+                return $true
+            }
+        }
+    }
+    return $false
+}
+
+function Get-BareVariableName {
+    param([Management.Automation.Language.Ast]$Ast)
+
+    $current = $Ast
+    while ($current -is [Management.Automation.Language.PipelineAst] -or
+        $current -is [Management.Automation.Language.CommandExpressionAst] -or
+        $current -is [Management.Automation.Language.ParenExpressionAst]) {
+        if ($current -is [Management.Automation.Language.PipelineAst]) {
+            if (@($current.PipelineElements).Count -ne 1) { return $null }
+            $current = $current.PipelineElements[0]
+        }
+        elseif ($current -is [Management.Automation.Language.CommandExpressionAst]) {
+            $current = $current.Expression
+        }
+        else {
+            $current = $current.Pipeline
+        }
+    }
+    if ($current -isnot [Management.Automation.Language.VariableExpressionAst]) { return $null }
+    return [string]$current.VariablePath.UserPath
+}
+
+function Test-UnwrappedArrayPreservation {
+    param([Management.Automation.Language.Ast]$Ast)
+
+    $current = $Ast
+    while ($current -is [Management.Automation.Language.PipelineAst] -or
+        $current -is [Management.Automation.Language.CommandExpressionAst] -or
+        $current -is [Management.Automation.Language.ParenExpressionAst]) {
+        if ($current -is [Management.Automation.Language.PipelineAst]) {
+            if (@($current.PipelineElements).Count -ne 1) { return $false }
+            $current = $current.PipelineElements[0]
+        }
+        elseif ($current -is [Management.Automation.Language.CommandExpressionAst]) {
+            $current = $current.Expression
+        }
+        else {
+            $current = $current.Pipeline
+        }
+    }
+    return (Test-ExplicitArrayPreservation -Ast $current)
+}
+
+function Get-UnconstrainedCommandSource {
+    param(
+        [Management.Automation.Language.Ast]$Ast,
+        [System.Collections.Generic.HashSet[string]]$ProtectedNames
+    )
+
+    if ($Ast -is [Management.Automation.Language.ParenExpressionAst]) {
+        if ((Test-UnwrappedArrayPreservation -Ast $Ast.Pipeline)) { return $null }
+        # A call to a function that emits its collection without enumerating it has a
+        # known cardinality at the call site, so counting or indexing it is safe.
+        if ((Test-ProtectedReturnSource -Ast $Ast.Pipeline -ProtectedNames $ProtectedNames)) { return $null }
+        if (-not (Test-ContainsCommandOutput -Ast $Ast.Pipeline)) { return $null }
+        return $Ast
+    }
+    if ($Ast -is [Management.Automation.Language.SubExpressionAst]) {
+        $statements = @($Ast.SubExpression.Statements)
+        if ($statements.Count -eq 1 -and (Test-UnwrappedArrayPreservation -Ast $statements[0])) { return $null }
+        if ($statements.Count -eq 1 -and (Test-ProtectedReturnSource -Ast $statements[0] -ProtectedNames $ProtectedNames)) { return $null }
+        if (-not (Test-ContainsCommandOutput -Ast $Ast.SubExpression)) { return $null }
+        return $Ast
+    }
+    return $null
+}
+
+function Get-ScriptScopedNames {
+    param([Management.Automation.Language.Ast]$Ast)
+
+    $names = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($assignment in $Ast.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.AssignmentStatementAst]
+            }, $true)) {
+        $left = $assignment.Left
+        if ($left -is [Management.Automation.Language.ConvertExpressionAst]) { $left = $left.Child }
+        if ($left -is [Management.Automation.Language.VariableExpressionAst] -and
+            $left.VariablePath.IsScript) {
+            [void]$names.Add((Get-VariableName -VariablePath $left.VariablePath))
+        }
+    }
+    Write-Output -NoEnumerate $names
+}
+
+function Get-ScriptBlockLocalNames {
+    param([Management.Automation.Language.ScriptBlockAst]$ScriptBlock)
+
+    $names = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+    if ($null -ne $ScriptBlock.ParamBlock) {
+        foreach ($parameter in @($ScriptBlock.ParamBlock.Parameters)) {
+            [void]$names.Add((Get-VariableName -VariablePath $parameter.Name.VariablePath))
+        }
+    }
+    foreach ($assignment in $ScriptBlock.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.AssignmentStatementAst]
+            }, $true)) {
+        $left = $assignment.Left
+        if ($left -is [Management.Automation.Language.ConvertExpressionAst]) { $left = $left.Child }
+        if ($left -is [Management.Automation.Language.VariableExpressionAst]) {
+            [void]$names.Add((Get-VariableName -VariablePath $left.VariablePath))
+        }
+    }
+    foreach ($loop in $ScriptBlock.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.ForEachStatementAst]
+            }, $true)) {
+        [void]$names.Add((Get-VariableName -VariablePath $loop.Variable.VariablePath))
+    }
+    Write-Output -NoEnumerate $names
+}
+
+function Test-CommandParameterPresent {
+    param(
+        [Management.Automation.Language.CommandAst]$Command,
+        [string]$NamePrefix
+    )
+
+    foreach ($element in @($Command.CommandElements)) {
+        if ($element -is [Management.Automation.Language.CommandParameterAst] -and
+            ([string]$element.ParameterName).StartsWith($NamePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+$script:ContractWriteCommands = @('Set-Content', 'Out-File', 'Add-Content')
+$script:ContractWriteMembers = @('WriteAllText', 'AppendAllText', 'WriteAllLines', 'WriteAllBytes')
+
+function Test-ContractWriteContext {
+    param([Management.Automation.Language.Ast]$Ast)
+
+    $statement = $Ast
+    while ($null -ne $statement.Parent -and
+        $statement.Parent -isnot [Management.Automation.Language.StatementBlockAst] -and
+        $statement.Parent -isnot [Management.Automation.Language.NamedBlockAst]) {
+        $statement = $statement.Parent
+    }
+    return @($statement.FindAll({
+                param($node)
+                ($node -is [Management.Automation.Language.CommandAst] -and
+                $node.GetCommandName() -in $script:ContractWriteCommands) -or
+                ($node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and
+                $node.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                [string]$node.Member.Value -in $script:ContractWriteMembers)
+            }, $true)).Count -gt 0
+}
+
 function New-Finding {
     param(
         [string]$RuleId,
@@ -296,19 +609,23 @@ function New-Finding {
         [Management.Automation.Language.Ast]$Ast
     )
 
+    $snippet = [string]$Ast.Extent.Text
+    if ($snippet.Length -gt 240) { $snippet = $snippet.Substring(0, 240) + '...' }
     [pscustomobject][ordered]@{
         RuleId = $RuleId
         File = $File
         Line = $Ast.Extent.StartLineNumber
         Column = $Ast.Extent.StartColumnNumber
         Message = $Message
-        Snippet = $Ast.Extent.Text
+        Snippet = $snippet
     }
 }
 
 $files = @(Get-InputFiles -InputPath $Path -Recursive $Recurse | Sort-Object FullName -Unique)
-$parsed = New-Object System.Collections.Generic.List[object]
+$parsed = [System.Collections.Generic.List[object]]::new()
 $knownFunctions = @{}
+$definedFunctions = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$protectedReturnFunctions = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 
 foreach ($file in $files) {
     $tokens = $null
@@ -327,6 +644,10 @@ foreach ($file in $files) {
                 param($node)
                 $node -is [Management.Automation.Language.FunctionDefinitionAst]
             }, $true)) {
+        [void]$definedFunctions.Add([string]$function.Name)
+        if (Test-ProtectedCollectionReturn -Function $function) {
+            [void]$protectedReturnFunctions.Add([string]$function.Name)
+        }
         $parameters = @()
         if ($null -ne $function.Body.ParamBlock) {
             $parameters = @($function.Body.ParamBlock.Parameters)
@@ -344,7 +665,7 @@ foreach ($file in $files) {
     }
 }
 
-$findings = New-Object System.Collections.Generic.List[object]
+$findings = [System.Collections.Generic.List[object]]::new()
 foreach ($document in $parsed) {
     $ast = $document.Ast
     $file = $document.File
@@ -438,9 +759,257 @@ foreach ($document in $parsed) {
                         -Message 'Default .Sum or prove the Measure-Object -Sum input is non-empty before access.'))
         }
     }
+
+    # PSEN004: a function that constructs a .NET collection locally and then
+    # returns the variable bare. The return enumerates it, so zero elements
+    # arrive at the caller as $null and one element arrives as a scalar.
+    foreach ($function in $ast.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst]
+            }, $true)) {
+        $collectionNames = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($assignment in $function.Body.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.AssignmentStatementAst]
+                }, $true)) {
+            $left = $assignment.Left
+            if ($left -is [Management.Automation.Language.ConvertExpressionAst]) { $left = $left.Child }
+            if ($left -isnot [Management.Automation.Language.VariableExpressionAst]) { continue }
+            if (Test-EnumeratingCollectionConstruction -Ast $assignment.Right) {
+                [void]$collectionNames.Add((Get-VariableName -VariablePath $left.VariablePath))
+            }
+        }
+        if ($collectionNames.Count -eq 0) { continue }
+
+        $returns = @($function.Body.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.ReturnStatementAst]
+                }, $true))
+        foreach ($return in $returns) {
+            if ($null -eq $return.Pipeline) { continue }
+            $name = Get-BareVariableName -Ast $return.Pipeline
+            if ($null -ne $name -and $collectionNames.Contains($name)) {
+                [void]$findings.Add((New-Finding -RuleId 'PSEN004' -File $file -Ast $return `
+                            -Message "Return the '$name' collection without enumerating it (Write-Output -NoEnumerate or a leading comma); a bare return turns an empty collection into `$null."))
+            }
+        }
+        foreach ($namedBlock in @($function.Body.BeginBlock, $function.Body.ProcessBlock, $function.Body.EndBlock)) {
+            if ($null -eq $namedBlock) { continue }
+            $statements = @($namedBlock.Statements)
+            if ($statements.Count -eq 0) { continue }
+            $last = $statements[$statements.Count - 1]
+            if ($last -is [Management.Automation.Language.ReturnStatementAst]) { continue }
+            $name = Get-BareVariableName -Ast $last
+            if ($null -ne $name -and $collectionNames.Contains($name)) {
+                [void]$findings.Add((New-Finding -RuleId 'PSEN004' -File $file -Ast $last `
+                            -Message "Emit the '$name' collection without enumerating it (Write-Output -NoEnumerate or a leading comma); a bare trailing expression turns an empty collection into `$null."))
+            }
+        }
+    }
+
+    # PSEN005: counting or indexing straight into an unconstrained command or
+    # pipeline expression, whose cardinality is not statically known.
+    foreach ($member in $ast.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.MemberExpressionAst] -and
+                $node -isnot [Management.Automation.Language.InvokeMemberExpressionAst] -and
+                $node.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                [string]$node.Member.Value -iin @('Count', 'Length')
+            }, $true)) {
+        if ($null -ne (Get-UnconstrainedCommandSource -Ast $member.Expression -ProtectedNames $protectedReturnFunctions)) {
+            [void]$findings.Add((New-Finding -RuleId 'PSEN005' -File $file -Ast $member `
+                        -Message "Wrap the command result in @(...) before reading .$($member.Member.Value); an unconstrained pipeline can yield `$null or a scalar."))
+        }
+    }
+    foreach ($index in $ast.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.IndexExpressionAst]
+            }, $true)) {
+        if ($null -ne (Get-UnconstrainedCommandSource -Ast $index.Target -ProtectedNames $protectedReturnFunctions)) {
+            [void]$findings.Add((New-Finding -RuleId 'PSEN005' -File $file -Ast $index `
+                        -Message 'Wrap the command result in @(...) before indexing it; an unconstrained pipeline can yield $null or a scalar.'))
+        }
+    }
+
+    # PSEN006: a script block that reads a name this file also assigns at script
+    # scope, without qualifying it. Whether the block sees the value captured at
+    # definition time or the ambient value at invocation time then depends on
+    # GetNewClosure and on the runspace state, not on the code.
+    $scriptScoped = Get-ScriptScopedNames -Ast $ast
+    if ($scriptScoped.Count -gt 0) {
+        foreach ($block in $ast.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.ScriptBlockExpressionAst]
+                }, $true)) {
+            $local = Get-ScriptBlockLocalNames -ScriptBlock $block.ScriptBlock
+            foreach ($variable in $block.FindAll({
+                        param($node)
+                        $node -is [Management.Automation.Language.VariableExpressionAst]
+                    }, $true)) {
+                $variablePath = $variable.VariablePath
+                if ($variablePath.IsScript -or $variablePath.IsGlobal -or $variablePath.IsPrivate -or
+                    -not [string]::IsNullOrEmpty($variablePath.DriveName)) {
+                    continue
+                }
+                $name = (Get-VariableName -VariablePath $variablePath)
+                if ($name -iin @('_', 'null', 'true', 'false', 'PSItem', 'args', 'this', 'input')) { continue }
+                if ($local.Contains($name) -or -not $scriptScoped.Contains($name)) { continue }
+                [void]$findings.Add((New-Finding -RuleId 'PSEN006' -File $file -Ast $variable `
+                            -Message "Capture '`$$name' explicitly (a parameter, an argument, or `$script:$name); this script block reads a script-scoped name unqualified."))
+            }
+        }
+    }
+
+    foreach ($command in $ast.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.CommandAst] -and
+                $node.GetCommandName() -in 'ConvertTo-Json', 'convertto-json'
+            }, $true)) {
+        # PSEN007: without an explicit -Depth the serialized shape of a contract
+        # is whatever the host defaults to, and nested collections truncate.
+        if (-not (Test-CommandParameterPresent -Command $command -NamePrefix 'Dep')) {
+            [void]$findings.Add((New-Finding -RuleId 'PSEN007' -File $file -Ast $command `
+                        -Message 'Pass an explicit -Depth to ConvertTo-Json; the default depth silently truncates nested contract collections.'))
+        }
+        # PSEN008: a contract that reaches a file must state its on-disk form.
+        if (-not (Test-CommandParameterPresent -Command $command -NamePrefix 'Com') -and
+            (Test-ContractWriteContext -Ast $command)) {
+            [void]$findings.Add((New-Finding -RuleId 'PSEN008' -File $file -Ast $command `
+                        -Message 'State -Compress (or -Compress:$false) explicitly for a ConvertTo-Json result that is written to a file.'))
+        }
+    }
+
+    # PSEN011: @(...) around a call to a function that deliberately protects its
+    # collection return does not flatten that return, it nests it as a single
+    # element. This is how an index built from a protected array collapsed to one
+    # bogus entry while every count still looked plausible.
+    foreach ($wrap in $ast.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.ArrayExpressionAst]
+            }, $true)) {
+        $statements = @($wrap.SubExpression.Statements)
+        if ($statements.Count -ne 1) { continue }
+        $inner = $statements[0]
+        if ($inner -isnot [Management.Automation.Language.PipelineAst]) { continue }
+        $elements = @($inner.PipelineElements)
+        if ($elements.Count -ne 1) { continue }
+        $command = $elements[0]
+        if ($command -isnot [Management.Automation.Language.CommandAst]) { continue }
+        $wrappedName = $command.GetCommandName()
+        if ([string]::IsNullOrWhiteSpace($wrappedName) -or
+            -not $protectedReturnFunctions.Contains($wrappedName)) {
+            continue
+        }
+        [void]$findings.Add((New-Finding -RuleId 'PSEN011' -File $file -Ast $wrap `
+                    -Message "Assign '$wrappedName' to a variable and wrap the variable; @($wrappedName ...) nests the protected collection as one element instead of flattening it."))
+    }
+
+    # PSEN010: GetNewClosure captures variables, not function definitions. A
+    # closure that calls a repository function by name resolves that name in
+    # whatever scope later invokes it, which is how a closure that worked in the
+    # defining scope failed once it ran under a different reader.
+    foreach ($closure in $ast.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and
+                $node.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                [string]$node.Member.Value -ieq 'GetNewClosure' -and
+                $node.Expression -is [Management.Automation.Language.ScriptBlockExpressionAst]
+            }, $true)) {
+        $reported = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($call in $closure.Expression.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.CommandAst]
+                }, $true)) {
+            $callName = $call.GetCommandName()
+            if ([string]::IsNullOrWhiteSpace($callName) -or
+                -not $definedFunctions.Contains($callName) -or
+                -not $reported.Add($callName)) {
+                continue
+            }
+            [void]$findings.Add((New-Finding -RuleId 'PSEN010' -File $file -Ast $call `
+                        -Message "Capture '$callName' explicitly (for example `${function:$callName}) and invoke it through the captured reference; GetNewClosure captures variables, not function definitions."))
+        }
+    }
+
+    # PSEN009: a non-preserved command result is assigned, then counted or
+    # indexed later in the same scope, so a single result flattens to a scalar
+    # and an empty result becomes $null. One cardinality-use index is built per
+    # file so this stays linear in AST size.
+    $cardinalityUses = @{}
+    foreach ($use in $ast.FindAll({
+                param($node)
+                if ($node -is [Management.Automation.Language.MemberExpressionAst] -and
+                    $node -isnot [Management.Automation.Language.InvokeMemberExpressionAst] -and
+                    $node.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                    [string]$node.Member.Value -iin @('Count', 'Length')) {
+                    return $node.Expression -is [Management.Automation.Language.VariableExpressionAst]
+                }
+                return ($node -is [Management.Automation.Language.IndexExpressionAst] -and
+                    $node.Target -is [Management.Automation.Language.VariableExpressionAst])
+            }, $true)) {
+        $target = if ($use -is [Management.Automation.Language.IndexExpressionAst]) { $use.Target } else { $use.Expression }
+        $useName = (Get-VariableName -VariablePath $target.VariablePath).ToLowerInvariant()
+        if (-not $cardinalityUses.ContainsKey($useName)) {
+            $cardinalityUses[$useName] = [System.Collections.Generic.List[object]]::new()
+        }
+        [void]$cardinalityUses[$useName].Add($use)
+    }
+
+    foreach ($assignment in $ast.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $node.Operator -eq [Management.Automation.Language.TokenKind]::Equals -and
+                $node.Left -is [Management.Automation.Language.VariableExpressionAst]
+            }, $true)) {
+        $variablePath = $assignment.Left.VariablePath
+        if (-not $variablePath.IsUnqualified) { continue }
+        $displayName = (Get-VariableName -VariablePath $variablePath)
+        $name = $displayName.ToLowerInvariant()
+        if (-not $cardinalityUses.ContainsKey($name)) { continue }
+        if (-not (Test-ContainsCommandOutput -Ast $assignment.Right) -or
+            (Test-UnwrappedArrayPreservation -Ast $assignment.Right)) {
+            continue
+        }
+        # A call to a function that protects its own collection return already
+        # hands the caller the collection itself; wrapping it here would nest it.
+        if (Test-ProtectedReturnSource -Ast $assignment.Right -ProtectedNames $protectedReturnFunctions) {
+            continue
+        }
+        $scope = $assignment.Parent
+        while ($null -ne $scope -and
+            $scope -isnot [Management.Automation.Language.FunctionDefinitionAst] -and
+            $scope -isnot [Management.Automation.Language.ScriptBlockAst]) {
+            $scope = $scope.Parent
+        }
+        if ($null -eq $scope) { continue }
+        $matched = $false
+        foreach ($use in $cardinalityUses[$name]) {
+            if ($use.Extent.StartOffset -ge $assignment.Extent.EndOffset -and
+                $use.Extent.StartOffset -ge $scope.Extent.StartOffset -and
+                $use.Extent.EndOffset -le $scope.Extent.EndOffset) {
+                $matched = $true
+                break
+            }
+        }
+        if ($matched) {
+            [void]$findings.Add((New-Finding -RuleId 'PSEN009' -File $file -Ast $assignment `
+                        -Message "Preserve '`$$displayName' with @(...) at assignment; it is later counted or indexed, and a single command result flattens to a scalar."))
+        }
+    }
 }
 
-$ordered = @($findings | Sort-Object File, Line, Column, RuleId)
+$deduped = [System.Collections.Generic.List[object]]::new()
+$seen = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::Ordinal)
+foreach ($finding in $findings) {
+    if ($seen.Add("$($finding.RuleId)|$($finding.File)|$($finding.Line)|$($finding.Column)")) {
+        [void]$deduped.Add($finding)
+    }
+}
+$selected = $deduped
+if ($PSBoundParameters.ContainsKey('RuleId')) {
+    $selected = @($deduped | Where-Object { $RuleId -contains $_.RuleId })
+}
+$ordered = @($selected | Sort-Object File, Line, Column, RuleId)
 if ($OutputFormat -eq 'Json') {
     ConvertTo-Json -InputObject $ordered -Depth 4 -Compress
 }
