@@ -35,10 +35,11 @@
     "hexLength": 40
   },
   "buddyBuild": {
-    "note": "The live PR-validation pipeline this repository runs on pull requests. Set pipelineId and pipelineName to your own validation pipeline.",
+    "note": "The live PR-validation pipeline this repository runs on pull requests. validityMinutes should match the build-validation policy lifetime; use 0 to disable age-based expiry checks.",
     "pipelineId": 1234,
     "pipelineName": "Example-Service-PullRequest",
-    "prMergeRefTemplate": "refs/pull/{prId}/merge"
+    "prMergeRefTemplate": "refs/pull/{prId}/merge",
+    "validityMinutes": 720
   },
   "threadClassification": {
     "note": "Used to disambiguate a reviewer agent's own findings (posted AS the operator) from the operator's genuine replies, and to identify comments that are not human review feedback at all.",
