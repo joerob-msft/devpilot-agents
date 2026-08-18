@@ -35,6 +35,13 @@
     "reportedModel": { "type": "string", "maxLength": 128 },
     "requestedModel": { "type": "string", "minLength": 1, "maxLength": 128 },
     "secondGeneralistModel": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "conventionSpecialistEnabled": { "type": "boolean" },
+    "conventionSpecialistModel": {
+      "oneOf": [
+        { "type": "string", "minLength": 1, "maxLength": 128 },
+        { "type": "null" }
+      ]
+    },
     "nonce": { "type": "string", "pattern": "^[0-9a-f]{16,64}$" },
     "nonceSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "resultMarkerPrefix": { "type": "string", "minLength": 1, "maxLength": 64 },
@@ -211,5 +218,23 @@
       "enum": ["captured", "captureFailedRetriesExhausted", "captureFailedTerminal", "timeout", "crash"]
     },
     "createdUtc": { "type": "string", "format": "date-time" }
-  }
+  },
+  "oneOf": [
+    {
+      "required": ["conventionSpecialistEnabled", "conventionSpecialistModel"],
+      "allOf": [
+        {
+          "if": { "properties": { "conventionSpecialistEnabled": { "const": true } } },
+          "then": { "properties": { "conventionSpecialistModel": { "type": "string", "minLength": 1 } } },
+          "else": { "properties": { "conventionSpecialistModel": { "type": "null" } } }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "not": { "required": ["conventionSpecialistEnabled"] } },
+        { "not": { "required": ["conventionSpecialistModel"] } }
+      ]
+    }
+  ]
 }

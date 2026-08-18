@@ -32,6 +32,8 @@ param(
     [Parameter(ParameterSetName = 'Materialize', Mandatory)]
     [string]$SecondGeneralistModel,
     [Parameter(ParameterSetName = 'Materialize')]
+    [string]$ConventionSpecialistModel,
+    [Parameter(ParameterSetName = 'Materialize')]
     [string]$ReviewerScriptFile,
     [Parameter(Mandatory)][string]$OutputRoot,
     [Parameter(ParameterSetName = 'Verify', Mandatory)][switch]$VerifyOnly,
@@ -217,6 +219,15 @@ function New-DirectoryInventory {
     return , $items.ToArray()
 }
 
+function Test-SpecialistBindingShape {
+    param([Parameter(Mandatory)]$Enabled, [AllowNull()]$Model)
+    if ($Enabled -isnot [bool]) { return $false }
+    if ([bool]$Enabled) {
+        return ($Model -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$Model))
+    }
+    return $null -eq $Model
+}
+
 function Test-Bundle {
     param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$ExpectedManifestSha256)
     $problems = [Collections.Generic.List[string]]::new()
@@ -228,6 +239,18 @@ function Test-Bundle {
     try {
         $text = [IO.File]::ReadAllText($manifestPath, $Utf8)
         $manifest = $text | ConvertFrom-Json -AsHashtable -Depth 64
+        if (-not (Test-SpecialistBindingShape `
+                -Enabled $manifest.source.conventionSpecialistEnabled `
+                -Model $manifest.source.conventionSpecialistModel) -or
+            -not (Test-SpecialistBindingShape `
+                -Enabled $manifest.output.conventionSpecialistEnabled `
+                -Model $manifest.output.conventionSpecialistModel) -or
+            $manifest.source.conventionSpecialistEnabled -cne
+                $manifest.output.conventionSpecialistEnabled -or
+            $manifest.source.conventionSpecialistModel -cne
+                $manifest.output.conventionSpecialistModel) {
+            [void]$problems.Add('transformation manifest convention specialist binding mismatch')
+        }
         $withoutDigest = [ordered]@{}
         foreach ($key in $manifest.Keys) { if ($key -cne 'manifestDigest') { $withoutDigest[$key] = $manifest[$key] } }
         if ([string]$manifest.manifestDigest -cne (Get-TextSha256 (Get-CanonicalJson $withoutDigest))) {
@@ -292,6 +315,18 @@ function Test-Bundle {
         if (-not [bool]$snapshot.Classification.NonPromotable -or
             [string]$snapshot.Classification.SealKind -cne 'benchmarkPackMaterialization') {
             [void]$problems.Add('materialized replay is not classified benchmarkPackMaterialization/non-promotable')
+        }
+        $sidecar = $snapshot.Classification.Sidecar
+        if (-not $sidecar.PSObject.Properties['conventionSpecialistEnabled'] -or
+            -not $sidecar.PSObject.Properties['conventionSpecialistModel'] -or
+            -not (Test-SpecialistBindingShape `
+                -Enabled $sidecar.conventionSpecialistEnabled `
+                -Model $sidecar.conventionSpecialistModel) -or
+            $sidecar.conventionSpecialistEnabled -cne
+                $manifest.output.conventionSpecialistEnabled -or
+            $sidecar.conventionSpecialistModel -cne
+                $manifest.output.conventionSpecialistModel) {
+            [void]$problems.Add('materialization sidecar convention specialist binding mismatch')
         }
     }
     catch { [void]$problems.Add($_.Exception.Message) }
@@ -459,7 +494,25 @@ $scriptFull = (Resolve-Path -LiteralPath $ReviewerScriptFile).Path
 Assert-NoAlternateDataStreams -Path $configFull -Surface 'Config'
 Assert-NoAlternateDataStreams -Path $promptFull -Surface 'Prompt'
 Assert-NoAlternateDataStreams -Path $scriptFull -Surface 'Reviewer script'
-$configBytes = [IO.File]::ReadAllBytes($configFull)
+$configStream = [IO.File]::Open(
+    $configFull, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+try {
+    $configBytes = [byte[]]::new($configStream.Length)
+    $configOffset = 0
+    while ($configOffset -lt $configBytes.Length) {
+        $configRead = $configStream.Read(
+            $configBytes, $configOffset, $configBytes.Length - $configOffset)
+        if ($configRead -le 0) {
+            throw 'Config changed or became unreadable while acquiring its immutable byte snapshot.'
+        }
+        $configOffset += $configRead
+    }
+    $configLoad = Get-AgentConfig -Path $configFull -AgentDir (Split-Path $scriptFull -Parent) `
+        -SupportedSchemaVersions @(1) -PromptFileField 'promptFile'
+}
+finally {
+    $configStream.Dispose()
+}
 $promptBytes = [IO.File]::ReadAllBytes($promptFull)
 $scriptBytes = [IO.File]::ReadAllBytes($scriptFull)
 $configSha = Get-BytesSha256 $configBytes
@@ -480,9 +533,44 @@ foreach ($bindingCheck in @(
         throw "Independent $($bindingCheck.Name) bytes do not match the replay manifest binding."
     }
 }
-$configLoad = Get-AgentConfig -Path $configFull -AgentDir (Split-Path $scriptFull -Parent) `
-    -SupportedSchemaVersions @(1) -PromptFileField 'promptFile'
 $config = $configLoad.Raw
+$configuredConventionSpecialistModel = ''
+$configVerificationEnabled = $false
+if ($config.PSObject.Properties.Name -ccontains 'review') {
+    $configReview = $config.review
+    if ($configReview.PSObject.Properties.Name -ccontains 'conventionSpecialistModel') {
+        if ($configReview.conventionSpecialistModel -isnot [string]) {
+            throw "review.conventionSpecialistModel must be a string when configured."
+        }
+        $configuredConventionSpecialistModel = [string]$configReview.conventionSpecialistModel
+    }
+    if ($configReview.PSObject.Properties.Name -ccontains 'verification' -and
+        $configReview.verification.PSObject.Properties.Name -ccontains 'enabled') {
+        if ($configReview.verification.enabled -isnot [bool]) {
+            throw "review.verification.enabled must be a JSON boolean."
+        }
+        $configVerificationEnabled = [bool]$configReview.verification.enabled
+    }
+}
+$conventionSpecialistEnabled = (
+    $Role -cne 'generalist' -or
+    $configVerificationEnabled -or
+    [bool]$ConventionSpecialistModel)
+$effectiveConventionSpecialistModel = $null
+if ($conventionSpecialistEnabled) {
+    $effectiveConventionSpecialistModel = if ($ConventionSpecialistModel) {
+        $ConventionSpecialistModel
+    }
+    else {
+        $configuredConventionSpecialistModel
+    }
+    if (-not $effectiveConventionSpecialistModel) {
+        throw ("A $Role benchmark materialization with verification/convention specialist enabled " +
+            'requires an explicit -ConventionSpecialistModel or config.review.conventionSpecialistModel.')
+    }
+    [void](Assert-AgentSupportedModel -ModelId $effectiveConventionSpecialistModel `
+            -Where 'benchmark materialization convention specialist model')
+}
 $resolvedPromptFull = [IO.Path]::GetFullPath([string]$configLoad.PromptFilePath)
 if ($resolvedPromptFull -cne [IO.Path]::GetFullPath($promptFull)) {
     throw "Config promptFile resolves to '$resolvedPromptFull', not the independently supplied prompt '$promptFull'."
@@ -599,13 +687,16 @@ try {
         promptSha256 = $promptSha
         reviewerScriptSha256 = $scriptSha
         secondGeneralistModel = $SecondGeneralistModel
+        conventionSpecialistEnabled = [bool]$conventionSpecialistEnabled
+        conventionSpecialistModel = $effectiveConventionSpecialistModel
     }
     $sidecarName = 'benchmark-pack-materialization.json'
     $sidecarPath = Join-Path $stagedSnapshot $sidecarName
     [IO.File]::WriteAllText($sidecarPath, (Get-CanonicalJson $sidecar), $Utf8)
     $sourceManifest.Remove('manifestDigest')
     $sourceManifest.bindings.models = @(
-        @($sourceManifest.bindings.models) + $SecondGeneralistModel |
+        @($sourceManifest.bindings.models) + $SecondGeneralistModel +
+            @($effectiveConventionSpecialistModel) |
             Select-Object -Unique)
     if ([int]$sourceManifest.schemaVersion -eq 1) {
         # Version 3 is the classified counterpart of the v1 shape: it adds only
@@ -652,10 +743,14 @@ try {
             promptSha256 = $promptSha
             reviewerScriptSha256 = $scriptSha
             secondGeneralistModel = $SecondGeneralistModel
+            conventionSpecialistEnabled = [bool]$conventionSpecialistEnabled
+            conventionSpecialistModel = $effectiveConventionSpecialistModel
         }
         output = [ordered]@{
             role = $Role
             secondGeneralistModel = $SecondGeneralistModel
+            conventionSpecialistEnabled = [bool]$conventionSpecialistEnabled
+            conventionSpecialistModel = $effectiveConventionSpecialistModel
             projectionSha256 = Get-FileSha256 $projectionPath
             snapshotName = $snapshotName
             replayManifestDigest = $materializedDigest
@@ -697,6 +792,8 @@ try {
             replayManifestDigest = $materializedDigest
             configFile = (Join-Path $outputFull 'config\reviewer.config.json')
             secondGeneralistModel = $SecondGeneralistModel
+            conventionSpecialistEnabled = [bool]$conventionSpecialistEnabled
+            conventionSpecialistModel = $effectiveConventionSpecialistModel
         } | ConvertTo-Json -Depth 8 -Compress)
 }
 finally {

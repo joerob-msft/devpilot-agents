@@ -107,6 +107,13 @@ New-Item -ItemType Directory -Force -Path $configDir, $logDir, $manRoot | Out-Nu
 Copy-Item (Join-Path $fixtureRoot 'reviewer.config.json') (Join-Path $configDir 'reviewer.config.json') -Force
 Copy-Item $promptSrc (Join-Path $configDir 'review-cycle.prompt.md') -Force
 $configFile = Join-Path $configDir 'reviewer.config.json'
+$verificationConfigFile = Join-Path $configDir 'reviewer-verification.config.json'
+$verificationConfig = Get-Content $configFile -Raw | ConvertFrom-Json -Depth 64
+$verificationConfig.review.conventionSpecialistModel = 'claude-sonnet-5'
+$verificationConfig.review.verification.enabled = $true
+$verificationConfig.review.verification.conventionVerifierModel = 'gpt-5.6-sol'
+[IO.File]::WriteAllText($verificationConfigFile,
+    ($verificationConfig | ConvertTo-Json -Depth 64), [Text.UTF8Encoding]::new($false))
 $sealKey = Join-Path $runRoot 'seal.key'
 
 # -- Convention snapshot inputs (specialist role): a sealed replay snapshot that
@@ -190,12 +197,14 @@ function Get-CommonArgs {
         [Parameter(Mandatory)][string]$Projection, [Parameter(Mandatory)][string]$Model,
         [Parameter(Mandatory)][string]$Manifest, [string]$SnapshotDigest = $digest,
         [string]$SecondGeneralistModel = $(if ($Model -ceq 'gpt-5.6-sol') { 'claude-opus-5' } else { 'gpt-5.6-sol' }),
+        [string]$Config = $configFile,
+        [string]$SpecialistModel,
         [switch]$OmitSecondGeneralistModel,
         [int]$PerCall = 30, [int]$Total = 90, [int]$Activity = 30
     )
     $args = @(
         '-Role', $Role, '-FixtureProjectionFile', $Projection, '-Model', $Model,
-        '-ConfigFile', $configFile, '-ReplayRoot', $replayRoot,
+        '-ConfigFile', $Config, '-ReplayRoot', $replayRoot,
         '-ReplaySnapshotName', 'synthetic-pr', '-ReplayManifestDigest', $SnapshotDigest,
         '-OfflineModelAdapterManifest', $Manifest, '-ExpectedReviewerBaseCommit', $expectedBase,
         '-PullRequestId', '4242', '-ExpectedHeadCommit', $head, '-ExpectedRef', $ref,
@@ -204,6 +213,9 @@ function Get-CommonArgs {
     )
     if (-not $OmitSecondGeneralistModel) {
         $args += @('-SecondGeneralistModel', $SecondGeneralistModel)
+    }
+    if ($SpecialistModel) {
+        $args += @('-ConventionSpecialistModel', $SpecialistModel)
     }
     return $args
 }
@@ -383,6 +395,10 @@ function Copy-ResealedPackageWithoutSourceProjection {
         -Name 'specialist_legacy_package' -Mutation {
             param($core, $manifest)
             [void]$core.Remove('sourceProjection')
+            [void]$core.Remove('conventionSpecialistEnabled')
+            [void]$core.Remove('conventionSpecialistModel')
+            [void]$manifest.Remove('conventionSpecialistEnabled')
+            [void]$manifest.Remove('conventionSpecialistModel')
         }
 }
 
@@ -416,7 +432,9 @@ function Invoke-ChildDirect {
         [Parameter(Mandatory)][string]$Projection, [string]$Model = 'claude-opus-5',
         [hashtable]$Env = @{}, [switch]$OmitTestOnlySwitch, [switch]$ForbiddenTelemetryOnly,
         [string]$AdapterManifest,
-        [string]$RepoPathOverride, [string]$OutputRootOverride, [string]$StateDirOverride
+        [string]$RepoPathOverride, [string]$OutputRootOverride, [string]$StateDirOverride,
+        [string]$Config = $configFile, [switch]$EnableSpecialist,
+        [string]$SpecialistModel
     )
     $man = if ($AdapterManifest) { $AdapterManifest } else { $baseManifest }
     $od = if ($OutputRootOverride) { $OutputRootOverride } else { $p = New-OutDir ("direct_" + $Label); Remove-Tree $p; New-Item -ItemType Directory -Force -Path $p | Out-Null; $p }
@@ -426,7 +444,7 @@ function Invoke-ChildDirect {
     $tp = Join-Path $runRoot ("directtel_" + $Label + ".jsonl")
     $childArgs = @(
         '-NoProfile', '-File', $reviewerScript, '-Once', '-RepoPath', $rp,
-        '-ConfigFile', $configFile, '-StateDir', $st, '-OperatorAlias', 'acquisition-operator',
+        '-ConfigFile', $Config, '-StateDir', $st, '-OperatorAlias', 'acquisition-operator',
         '-PullRequestId', '4242', '-Model', $Model, '-CycleTimeoutSeconds', '45',
         '-SecondPassModel', 'gpt-5.6-sol',
         '-ReplayRoot', $replayRoot, '-ReplaySnapshotName', 'synthetic-pr', '-ReplayManifestDigest', $digest,
@@ -434,6 +452,11 @@ function Invoke-ChildDirect {
         '-AcquireTranscriptRole', 'generalist', '-AcquisitionPlanFile', $PlanFile,
         '-AcquisitionFixtureProjectionFile', $Projection, '-AcquisitionOutputRoot', $od
     )
+    if ($EnableSpecialist) {
+        $childArgs += @(
+            '-EnableConventionSpecialist', '-ConventionSpecialistModel', $SpecialistModel,
+            '-ConventionSpecialistTimeoutSeconds', '45')
+    }
     if ($ForbiddenTelemetryOnly) {
         $childArgs += @('-OfflineTelemetryPath', $tp)
     }
@@ -451,7 +474,15 @@ function Invoke-ChildDirect {
     $ec = $LASTEXITCODE
     $captured = Test-Path -LiteralPath (Join-Path $od 'capture-core.json')
     $logText = if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -Raw } else { '' }
-    return [pscustomobject]@{ Exit = $ec; Captured = $captured; Log = [string]$logText }
+    $modelStarts = if (Test-Path -LiteralPath $tp) {
+        @(Get-Content -LiteralPath $tp | Where-Object { $_ } |
+            ForEach-Object { $_ | ConvertFrom-Json -Depth 16 } |
+            Where-Object { [string]$_.event -ceq 'process.started' }).Count
+    } else { 0 }
+    return [pscustomobject]@{
+        Exit = $ec; Captured = $captured; Log = [string]$logText
+        ModelStarts = [int]$modelStarts
+    }
 }
 
 # Recompute the outer supervisor's plan HMAC (key = SHA-256(token) bytes, HMAC-SHA256
@@ -669,10 +700,10 @@ $argvOut = New-OutDir 'generalist_child_argv'
 & pwsh -NoProfile -File $argvSupervisor @(
     Get-CommonArgs -Out $argvOut -Role generalist -Projection $genProjection `
         -Model 'claude-opus-5' -Manifest $baseManifest) *> (Join-Path $logDir 'generalist-child-argv.log')
-$capturedChildArgv = if (Test-Path -LiteralPath $argvCapture) {
+[object[]]$capturedChildArgv = @(if (Test-Path -LiteralPath $argvCapture) {
     @([IO.File]::ReadAllText($argvCapture, [Text.UTF8Encoding]::new($false, $true)) |
             ConvertFrom-Json)
-} else { @() }
+} else { @() })
 $primaryIndexes = @()
 $secondIndexes = @()
 if ($capturedChildArgv.Count -gt 0) {
@@ -691,6 +722,96 @@ Check 'generalist production child receives GPT second pass exactly once' (
     $secondIndexes.Count -eq 1 -and
     [string]$capturedChildArgv[$secondIndexes[0] + 1] -ceq 'gpt-5.6-sol') (
     $capturedChildArgv -join ' ')
+Check 'generalist production child remains specialist-disabled for unchanged config' (
+    @($capturedChildArgv | Where-Object {
+            [string]$_ -cin @('-EnableConventionSpecialist', '-ConventionSpecialistModel')
+        }).Count -eq 0) ($capturedChildArgv -join ' ')
+
+$verificationArgvCapture = Join-Path $runRoot 'generalist-verification-child-argv.json'
+$verificationArgvStub = Join-Path $runRoot 'Start-ReviewerAgent-verification-argv-stub.ps1'
+$escapedVerificationArgvCapture = $verificationArgvCapture.Replace("'", "''")
+@"
+[IO.File]::WriteAllText('$escapedVerificationArgvCapture', (`$args | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new(`$false))
+exit 91
+"@ | Set-Content -LiteralPath $verificationArgvStub -Encoding UTF8
+$verificationArgvSupervisor = Join-Path $runRoot 'Invoke-ReviewerBlindedAcquisition-verification-argv-stub.ps1'
+$verificationStubAssignment = "`$ReviewerScript = '$($verificationArgvStub.Replace("'", "''"))'"
+[IO.File]::WriteAllText($verificationArgvSupervisor,
+    $supervisorSource.Replace($reviewerAssignment, $verificationStubAssignment),
+    [Text.UTF8Encoding]::new($false))
+$verificationArgvOut = New-OutDir 'generalist_verification_child_argv'
+$verificationArgvLog = Join-Path $logDir 'generalist-verification-child-argv.log'
+& pwsh -NoProfile -File $verificationArgvSupervisor @(
+    Get-CommonArgs -Out $verificationArgvOut -Role generalist -Projection $genProjection `
+        -Model 'claude-opus-5' -Manifest $baseManifest -Config $verificationConfigFile) *> $verificationArgvLog
+[object[]]$verificationChildArgv = @(if (Test-Path -LiteralPath $verificationArgvCapture) {
+    @([IO.File]::ReadAllText($verificationArgvCapture, [Text.UTF8Encoding]::new($false, $true)) |
+            ConvertFrom-Json)
+} else { @() })
+$verificationEnableIndexes = @()
+$verificationModelIndexes = @()
+if ($verificationChildArgv.Count -gt 0) {
+    $verificationEnableIndexes = @(0..($verificationChildArgv.Count - 1) |
+        Where-Object { [string]$verificationChildArgv[$_] -ceq '-EnableConventionSpecialist' })
+    $verificationModelIndexes = @(0..($verificationChildArgv.Count - 1) |
+        Where-Object { [string]$verificationChildArgv[$_] -ceq '-ConventionSpecialistModel' })
+}
+Check 'verification-enabled generalist child receives specialist enable exactly once' (
+    $verificationEnableIndexes.Count -eq 1) ($verificationChildArgv -join ' ')
+Check 'verification-enabled generalist child receives configured specialist model exactly once' (
+    $verificationModelIndexes.Count -eq 1 -and
+    [string]$verificationChildArgv[$verificationModelIndexes[0] + 1] -ceq
+        'claude-sonnet-5') ($verificationChildArgv -join ' ')
+$verificationPrimaryIndex = [Array]::IndexOf($verificationChildArgv, '-Model')
+$verificationSecondIndex = [Array]::IndexOf($verificationChildArgv, '-SecondPassModel')
+Check 'verification-enabled generalist child still receives the exact Opus plus GPT pair' (
+    @($verificationChildArgv | Where-Object { [string]$_ -ceq '-Model' }).Count -eq 1 -and
+    @($verificationChildArgv | Where-Object { [string]$_ -ceq '-SecondPassModel' }).Count -eq 1 -and
+    [string]$verificationChildArgv[$verificationPrimaryIndex + 1] -ceq 'claude-opus-5' -and
+    [string]$verificationChildArgv[$verificationSecondIndex + 1] -ceq 'gpt-5.6-sol') (
+    $verificationChildArgv -join ' ')
+
+$overrideArgvCapture = Join-Path $runRoot 'generalist-override-child-argv.json'
+$overrideArgvStub = Join-Path $runRoot 'Start-ReviewerAgent-override-argv-stub.ps1'
+$escapedOverrideArgvCapture = $overrideArgvCapture.Replace("'", "''")
+@"
+[IO.File]::WriteAllText('$escapedOverrideArgvCapture', (`$args | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new(`$false))
+exit 91
+"@ | Set-Content -LiteralPath $overrideArgvStub -Encoding UTF8
+$overrideArgvSupervisor = Join-Path $runRoot 'Invoke-ReviewerBlindedAcquisition-override-argv-stub.ps1'
+$overrideStubAssignment = "`$ReviewerScript = '$($overrideArgvStub.Replace("'", "''"))'"
+[IO.File]::WriteAllText($overrideArgvSupervisor,
+    $supervisorSource.Replace($reviewerAssignment, $overrideStubAssignment),
+    [Text.UTF8Encoding]::new($false))
+$overrideArgvOut = New-OutDir 'generalist_override_child_argv'
+& pwsh -NoProfile -File $overrideArgvSupervisor @(
+    Get-CommonArgs -Out $overrideArgvOut -Role generalist -Projection $genProjection `
+        -Model 'claude-opus-5' -Manifest $baseManifest -Config $verificationConfigFile `
+        -SpecialistModel 'claude-haiku-4.5') *> (
+    Join-Path $logDir 'generalist-override-child-argv.log')
+[object[]]$overrideChildArgv = @(if (Test-Path -LiteralPath $overrideArgvCapture) {
+    @([IO.File]::ReadAllText($overrideArgvCapture, [Text.UTF8Encoding]::new($false, $true)) |
+            ConvertFrom-Json)
+} else { @() })
+$overrideModelIndexes = @()
+if ($overrideChildArgv.Count -gt 0) {
+    $overrideModelIndexes = @(0..($overrideChildArgv.Count - 1) | Where-Object {
+            [string]$overrideChildArgv[$_] -ceq '-ConventionSpecialistModel'
+        })
+}
+Check 'explicit generalist specialist override takes precedence exactly once' (
+    $overrideModelIndexes.Count -eq 1 -and
+    [string]$overrideChildArgv[$overrideModelIndexes[0] + 1] -ceq
+        'claude-haiku-4.5') ($overrideChildArgv -join ' ')
+
+$unsupportedSpecialistOut = New-OutDir 'gate_unsupported_generalist_specialist'
+Test-Gate 'unsupportedGeneralistSpecialist' (Get-CommonArgs -Out $unsupportedSpecialistOut `
+        -Role generalist -Projection $genProjection -Model 'claude-opus-5' -Manifest $baseManifest `
+        -Config $verificationConfigFile -SpecialistModel 'unsupported-specialist') `
+    $unsupportedSpecialistOut 'unsupported model id'
+Check 'unsupported generalist specialist is rejected before reviewer launch' (
+    -not (Test-Path -LiteralPath (
+            Join-Path $unsupportedSpecialistOut 'work\reviewer-stdout.log')))
 
 $forwardingFragment = "'-Model', `$childPrimaryModel, '-SecondPassModel', `$SecondGeneralistModel,"
 Check 'second-pass forwarding has one sabotage point' (
@@ -715,6 +836,34 @@ Check 'omitting second-pass forwarding reproduces the child pre-boundary refusal
     $omittedForwardLog -match 'SecondPassModel|secondGeneralistModel' -and
     -not (Test-Path -LiteralPath (Join-Path $omittedForwardOut 'package\transcript-package.json'))) `
     $omittedForwardLog
+
+$generalistSpecialistCondition = "if (`$Role -eq 'generalist' -and `$conventionSpecialistEnabled)"
+Check 'generalist specialist forwarding has one omission-sabotage point' (
+    ($supervisorSource.Split([string[]]@($generalistSpecialistCondition),
+            [StringSplitOptions]::None).Length - 1) -eq 1)
+$omittedSpecialistSupervisor = Join-Path $runRoot 'Invoke-ReviewerBlindedAcquisition-specialist-omitted.ps1'
+[IO.File]::WriteAllText($omittedSpecialistSupervisor,
+    $supervisorSource.Replace($generalistSpecialistCondition,
+        "if (`$Role -eq 'generalist' -and `$false)"),
+    [Text.UTF8Encoding]::new($false))
+$omittedSpecialistOut = New-OutDir 'generalist_specialist_omitted'
+$omittedSpecialistLogPath = Join-Path $logDir 'generalist-specialist-omitted.log'
+& pwsh -NoProfile -File $omittedSpecialistSupervisor @(
+    Get-CommonArgs -Out $omittedSpecialistOut -Role generalist -Projection $genProjection `
+        -Model 'claude-opus-5' -Manifest $baseManifest -Config $verificationConfigFile) *> $omittedSpecialistLogPath
+$omittedSpecialistExit = $LASTEXITCODE
+$omittedSpecialistLog = Get-Content $omittedSpecialistLogPath -Raw
+$omittedSpecialistChildStderr = Join-Path $omittedSpecialistOut 'work\reviewer-stderr.log'
+if (Test-Path -LiteralPath $omittedSpecialistChildStderr) {
+    $omittedSpecialistLog += "`n" + (Get-Content -LiteralPath $omittedSpecialistChildStderr -Raw)
+}
+Check 'omitting generalist specialist forwarding reproduces verification refusal' (
+    $omittedSpecialistExit -ne 0 -and
+    $omittedSpecialistLog -match
+        'Verification preview requires -EnableConventionSpecialist' -and
+    -not (Test-Path -LiteralPath (
+            Join-Path $omittedSpecialistOut 'package\transcript-package.json'))) `
+    $omittedSpecialistLog
 
 # ---------------------------------------------------------------------------
 # Group B - Snapshot digest mismatch is refused inside the sealed child
@@ -1031,10 +1180,65 @@ Test-Behavior -Name 'stdoutSaturation' -Behavior 'stdoutSaturation' -Model 'clau
 Test-Behavior -Name 'wrongBinding' -Behavior 'wrongBinding' -Model 'claude-opus-5' -ExpectExit 0 -ExpectStatus 'captureFailedTerminal' -ExpectAttempts 1 -ExpectReported 'claude-opus-5'
 Test-Behavior -Name 'crash' -Behavior 'crash' -Model 'claude-opus-5' -RoleExtra @{ exitCode = 70 } -ExpectExit 0 -ExpectStatus 'crash' -ExpectAttempts 1 -ExpectReported ''
 
+$verificationEnabledOut = New-OutDir 'beh_verificationEnabledGeneralist'
+$verificationEnabledManifest = New-VariantManifest -Tag 'verificationEnabledGeneralist' `
+    -Behavior 'success'
+$verificationEnabledRun = Invoke-Tool -ToolArgs (
+    Get-CommonArgs -Out $verificationEnabledOut -Role generalist -Projection $genProjection `
+        -Model 'claude-opus-5' -Manifest $verificationEnabledManifest `
+        -Config $verificationConfigFile) -LogName 'beh-verification-enabled-generalist.log'
+Check 'verification-enabled generalist acquisition succeeds' (
+    $verificationEnabledRun.Exit -eq 0) "exit=$($verificationEnabledRun.Exit)"
+$verificationEnabledPackagePath = Join-Path $verificationEnabledOut 'package\transcript-package.json'
+if (Test-Path -LiteralPath $verificationEnabledPackagePath) {
+    $verificationEnabledPackage = Read-Json $verificationEnabledPackagePath
+    Check 'verification-enabled package remains generalist and binds specialist configuration' (
+        [string]$verificationEnabledPackage.role -ceq 'generalist' -and
+        [bool]$verificationEnabledPackage.conventionSpecialistEnabled -and
+        [string]$verificationEnabledPackage.conventionSpecialistModel -ceq 'claude-sonnet-5')
+    Check 'verification-enabled generalist starts exactly one model subprocess' (
+        [int]$verificationEnabledPackage.telemetry.modelSubprocessStarts -eq 1 -and
+        [int]$verificationEnabledPackage.telemetry.realModelStarts -eq 0) (
+        "subprocesses=$([int]$verificationEnabledPackage.telemetry.modelSubprocessStarts)")
+    $verificationTelemetry = @(Get-Content (
+            Join-Path $verificationEnabledOut 'package\telemetry.jsonl') |
+        Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json -Depth 32 })
+    $verificationStarts = @($verificationTelemetry | Where-Object {
+            [string]$_.event -ceq 'process.started'
+        })
+    Check 'verification-enabled boundary has one generalist and zero specialist starts' (
+        $verificationStarts.Count -eq 1 -and
+        (([string]$verificationStarts[0].data.arguments) -match 'blind-opus') -and
+        (([string]$verificationStarts[0].data.arguments) -notmatch 'specialist')) (
+        $verificationStarts | ConvertTo-Json -Depth 16 -Compress)
+    $packageSchema = Join-Path $RepoRoot `
+        'src\Agents\reviewer\acquisition\v1\transcript-package.schema.json'
+    foreach ($invalidSpecialistBinding in @(
+            @{ Enabled = $true; Model = $null; Name = 'enabled/null' },
+            @{ Enabled = $false; Model = 'claude-sonnet-5'; Name = 'disabled/model' })) {
+        $invalidPackage = $verificationEnabledPackage | ConvertTo-Json -Depth 64 |
+            ConvertFrom-Json -AsHashtable -Depth 64
+        $invalidPackage.conventionSpecialistEnabled = $invalidSpecialistBinding.Enabled
+        $invalidPackage.conventionSpecialistModel = $invalidSpecialistBinding.Model
+        $invalidPackageValid = ConvertTo-Json $invalidPackage -Depth 64 |
+            Test-Json -SchemaFile $packageSchema -ErrorAction SilentlyContinue
+        Check "package schema rejects $($invalidSpecialistBinding.Name) specialist binding" (
+            -not $invalidPackageValid)
+    }
+}
+else {
+    Check 'verification-enabled package is present' $false $verificationEnabledRun.Log
+}
+
 $successOpusPlan = Read-Json (Join-Path (New-OutDir 'beh_successOpus') 'work\acquisition-plan.json')
 Check 'authored generalist plan hash-binds the second model' (
     [string]$successOpusPlan.model -ceq 'claude-opus-5' -and
     [string]$successOpusPlan.secondGeneralistModel -ceq 'gpt-5.6-sol')
+$verificationEnabledPlan = Read-Json (
+    Join-Path $verificationEnabledOut 'work\acquisition-plan.json')
+Check 'verification-enabled plan hash-binds specialist enable and model' (
+    [bool]$verificationEnabledPlan.conventionSpecialistEnabled -and
+    [string]$verificationEnabledPlan.conventionSpecialistModel -ceq 'claude-sonnet-5')
 
 # Blocker 3: the generalist attempt ledger also preserves the exact production
 # parser status/reason (never a coarse remap). A retryable emission slip keeps its
@@ -1095,6 +1299,60 @@ $pairMismatch = Invoke-Tool -ToolArgs @(
 ) -LogName 'verify-second-generalist-mismatch.log'
 Check 'manifest/core second-generalist mismatch -> exit 2' (
     $pairMismatch.Exit -eq 2) ("exit=$($pairMismatch.Exit)")
+
+$specialistMismatchPackage = Copy-ResealedPackageVariant `
+    -SourcePackage (Join-Path $verificationEnabledOut 'package') `
+    -Name 'specialist-manifest-core-mismatch' -Mutation {
+        param($core, $manifest)
+        $manifest.conventionSpecialistModel = 'claude-haiku-4.5'
+    }
+$specialistMismatchRoot = Split-Path $specialistMismatchPackage -Parent
+$specialistMismatch = Invoke-Tool -ToolArgs @(
+    '-VerifyOnly', '-OutputRoot', $specialistMismatchRoot, '-SealKeyPath', $sealKey
+) -LogName 'verify-specialist-mismatch.log'
+Check 'manifest/core convention-specialist mismatch -> exit 2' (
+    $specialistMismatch.Exit -eq 2) ("exit=$($specialistMismatch.Exit)")
+
+$specialistCoreTypePackage = Copy-ResealedPackageVariant `
+    -SourcePackage (Join-Path $verificationEnabledOut 'package') `
+    -Name 'specialist-core-boolean-string' -Mutation {
+        param($core, $manifest)
+        $core.conventionSpecialistEnabled = 'true'
+    }
+$specialistCoreTypeRoot = Split-Path $specialistCoreTypePackage -Parent
+$specialistCoreType = Invoke-Tool -ToolArgs @(
+    '-VerifyOnly', '-OutputRoot', $specialistCoreTypeRoot, '-SealKeyPath', $sealKey
+) -LogName 'verify-specialist-core-boolean-string.log'
+Check 'capture core string specialist-enabled value -> exit 2' (
+    $specialistCoreType.Exit -eq 2) ("exit=$($specialistCoreType.Exit)")
+
+$disabledCoreModelPackage = Copy-ResealedPackageVariant `
+    -SourcePackage (Join-Path $sealBase 'package') `
+    -Name 'disabled-core-empty-specialist-model' -Mutation {
+        param($core, $manifest)
+        $core.conventionSpecialistModel = ''
+    }
+$disabledCoreModelRoot = Split-Path $disabledCoreModelPackage -Parent
+$disabledCoreModel = Invoke-Tool -ToolArgs @(
+    '-VerifyOnly', '-OutputRoot', $disabledCoreModelRoot, '-SealKeyPath', $sealKey
+) -LogName 'verify-disabled-core-empty-specialist-model.log'
+Check 'disabled capture core empty specialist model -> exit 2' (
+    $disabledCoreModel.Exit -eq 2) ("exit=$($disabledCoreModel.Exit)")
+
+$partialLegacyCorePackage = Copy-ResealedPackageVariant `
+    -SourcePackage (Join-Path $verificationEnabledOut 'package') `
+    -Name 'partial-legacy-core-specialist-binding' -Mutation {
+        param($core, $manifest)
+        [void]$manifest.Remove('conventionSpecialistEnabled')
+        [void]$manifest.Remove('conventionSpecialistModel')
+        [void]$core.Remove('conventionSpecialistModel')
+    }
+$partialLegacyCoreRoot = Split-Path $partialLegacyCorePackage -Parent
+$partialLegacyCore = Invoke-Tool -ToolArgs @(
+    '-VerifyOnly', '-OutputRoot', $partialLegacyCoreRoot, '-SealKeyPath', $sealKey
+) -LogName 'verify-partial-legacy-core-specialist-binding.log'
+Check 'partial legacy capture core specialist binding -> exit 2' (
+    $partialLegacyCore.Exit -eq 2) ("exit=$($partialLegacyCore.Exit)")
 
 # Read-only seal: bound files at EVERY depth must carry the ReadOnly attribute.
 $pkgDir = Join-Path $sealBase 'package'
@@ -1759,6 +2017,45 @@ else {
         Check 're-signed second-model substitution refuses before launch' (
             $c1Second.Exit -ne 0 -and -not $c1Second.Captured -and
             $c1Second.Log -match 'secondGeneralistModel binding') ("exit=$($c1Second.Exit)")
+
+        $kcVerificationBase = New-OutDir 'direct_known_verification_planbase'
+        $kcVerificationManifest = New-VariantManifest -Tag 'directKnownVerificationPlanBase' `
+            -Behavior 'success'
+        $kcVerification = Invoke-Tool -ToolArgs ((
+                Get-CommonArgs -Out $kcVerificationBase -Role generalist `
+                    -Projection $genProjection -Model claude-opus-5 `
+                    -Manifest $kcVerificationManifest -Config $verificationConfigFile) +
+            @('-AuthorizationToken', $knownToken)) -LogName 'direct-known-verification-planbase.log'
+        Check 'known-token verification plan-base run sealed' (
+            $kcVerification.Exit -eq 0) "exit=$($kcVerification.Exit)"
+        $kcVerificationPlan = Join-Path $kcVerificationBase 'work\acquisition-plan.json'
+        $tamperedSpecialistPlan = Join-Path $runRoot 'plan-specialist-tampered.json'
+        $tamperedSpecialistText = [IO.File]::ReadAllText($kcVerificationPlan, $u8).
+            Replace('"claude-sonnet-5"', '"claude-haiku-4.5"')
+        [IO.File]::WriteAllText($tamperedSpecialistPlan, $tamperedSpecialistText, $u8)
+        Copy-Item -LiteralPath "$kcVerificationPlan.sig" `
+            -Destination "$tamperedSpecialistPlan.sig" -Force
+        $tamperedSpecialist = Invoke-ChildDirect -Label 'tamperedSpecialistPlan' `
+            -PlanFile $tamperedSpecialistPlan -Projection $genProjection `
+            -Config $verificationConfigFile -EnableSpecialist `
+            -SpecialistModel 'claude-sonnet-5' `
+            -Env @{ REVIEWER_ACQUISITION_TOKEN = $knownToken }
+        Check 'specialist-model plan tamper is HMAC-refused before launch' (
+            $tamperedSpecialist.Exit -ne 0 -and -not $tamperedSpecialist.Captured -and
+            $tamperedSpecialist.Log -match 'tampered or replayed') (
+            "exit=$($tamperedSpecialist.Exit)")
+
+        $mismatchedSpecialist = Invoke-ChildDirect -Label 'mismatchedSpecialistArgv' `
+            -PlanFile $kcVerificationPlan -Projection $genProjection `
+            -Config $verificationConfigFile -EnableSpecialist `
+            -SpecialistModel 'claude-haiku-4.5' `
+            -Env @{ REVIEWER_ACQUISITION_TOKEN = $knownToken }
+        Check 'supported specialist argv/plan mismatch refuses before launch' (
+            $mismatchedSpecialist.Exit -ne 0 -and
+            -not $mismatchedSpecialist.Captured -and
+            $mismatchedSpecialist.ModelStarts -eq 0 -and
+            $mismatchedSpecialist.Log -match 'effective convention specialist model') (
+            "exit=$($mismatchedSpecialist.Exit)")
 
         # C2 wrong-root / replay into a different context: present the VALID token + the
         # authentic plan + its real signature, but an output root that is NOT the plan's
