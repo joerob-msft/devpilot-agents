@@ -11,6 +11,18 @@ finding into them would bias the evidence toward the very pivot the evidence is 
 decide. The gate enforces the split — a near miss must record `mergedBeforeDetection: false`,
 must say why it is not an escape, and must not appear in the budget window.
 
+Near misses have an admission criterion, or the collection becomes a defect log. A finding
+is recorded here only if it **invalidated a blocking control or a published assurance
+claim** — a gate that could not fail, a detector that reported green without checking, a
+count that was wrong in a document someone would act on. An ordinary bug found in review,
+including in test code, is not a near miss.
+
+The classification is not taken on trust. "Merged" is a git fact, so under `-VerifyCommits`
+an escape's `introducedCommit` must be reachable from the coverage window's end commit and
+a near miss's must not. Moving a merged incident into `nearMisses` to drop it out of the
+type-binding total therefore fails on ancestry rather than on prose, and the rule is probed
+in both directions against commits the ledger already cites.
+
 The machine-readable ledger is [`escape-ledger.v1.json`](escape-ledger.v1.json), validated
 against
 [`reviewer.escape-ledger.v1.json`](../src/Agents/reviewer/schemas/reviewer.escape-ledger.v1.json)
@@ -157,8 +169,9 @@ changes push incidents out of the ordinal window while they are still days old. 
 case proves that an incident outside both windows stops counting.
 
 The trigger deliberately counts only escapes that reach shadow or live. Deterministic
-escapes are caught by the machinery in this repository and are evidence that the machinery
-works; escapes that survive into a run with real inputs are evidence that it does not.
+escapes were caught by the machinery in this repository *after* they had merged, which is
+evidence of later detection rather than of prevention; escapes that survive into a run with
+real inputs are evidence that it does not.
 Shadow counts on equal terms with live: a shadow run exercises the same code and discards
 its output, so it preserves the no-write invariant by construction, and treating a shadow
 escape as inconsistent with that invariant would make the shadow arm of the trigger
@@ -201,14 +214,15 @@ in CI. **In force** means production code actually goes through it today.
 
 | Prerequisite | Built | In force | Evidence |
 | --- | --- | --- | --- |
-| Cardinality and property corpus over every collection-bearing stage contract | yes | no — 0 of 1652 producer-path cells; no stage is driven | `tools/testdata/reviewer-collection-inventory.v1.json` (236 fields, 12 stages), `tools/Test-ReviewerCollectionCardinality.ps1` (7 variants per field, 11 escape shapes, 9 sabotage checks), `tools/testdata/reviewer-collection-cardinality-matrix.v1.json` |
+| Cardinality and property corpus over the inventoried collection-bearing stage contracts | yes | no — 0 of 1652 producer-path cells; no stage is driven | `tools/testdata/reviewer-collection-inventory.v1.json` (236 fields, 12 stages), `tools/Test-ReviewerCollectionCardinality.ps1` (7 variants per field, 11 escape shapes, 9 sabotage checks), `tools/testdata/reviewer-collection-cardinality-matrix.v1.json` |
 | Versioned file contract for stage child outputs | yes | no — no stage writes or reads its artifacts through it yet | `src/Agents/reviewer/StageContract.ps1`, `src/Agents/reviewer/schemas/reviewer.stage-envelope.v1.json`, `tools/Test-ReviewerStageContract.ps1` |
 | Boundary hardening analyzer with a blocking new-violation gate | yes | yes — every push is scanned and any new violation fails CI | `tools/Find-PowerShellEmptyNullHazard.ps1` (11 rules), `tools/Test-PowerShellBoundaryHardening.ps1`, `tools/testdata/powershell-boundary-baseline.v1.json` |
-| Escape ledger and budget with a registered trigger | yes | yes — counts, window, and trigger are recomputed and enforced in CI | this document, `docs/escape-ledger.v1.json`, `tools/Test-EscapeLedger.ps1` |
+| Escape ledger and budget with a registered trigger | yes | no — counts, window, and trigger are recomputed and enforced in CI, but the window clock is hand-maintained, so the trigger cannot be read as current | this document, `docs/escape-ledger.v1.json`, `tools/Test-EscapeLedger.ps1` |
 
-Two of the four are inert today. That is the honest reading: this layer makes new escapes
-detectable and makes the existing ones counted, and only the analyzer and the ledger
-currently act on live code. It does not yet protect a running stage boundary.
+Three of the four are inert today. That is the honest reading: this layer makes escapes of
+the *recognized shapes* detectable and makes the existing ones counted, and only the
+analyzer currently acts on live code. It does not yet protect a running stage boundary, and
+the budget cannot be read as current until its clock has an authority outside this file.
 
 The pivot becomes mandatory if the budget triggers. It may be reconsidered earlier if these
 prerequisites fail to detect a new type-binding escape class — that failure would itself be

@@ -25,13 +25,22 @@ wrong input fails:
 | Analyzer rules detect their hazard | Every rule has a positive fixture; every rule has a negative fixture proving it ignores the corrected form |
 | A test stub cannot silence a rule | A cross-file gate builds a producer, a consumer, and a same-named unprotected mock and requires identical `PSEN011` findings with and without the mock; reverting the fix makes it fail |
 | The coverage clock is derived, not asserted | The sabotage checks re-run the real derivation on a mutated ledger, with a positive control on the unmutated one |
+| A merged escape cannot be reclassified out of the budget | Moving a merged incident into `nearMisses` fails the git ancestry check, with both directions probed against real cited commits |
 | The budget would fire | Sabotaged ledger copies with qualifying escapes are required to trigger it |
 
 A gate without a negative control proves that its own happy path still runs. That is worth
-little, and none of the counts below rest on one. Two checks in an earlier round of this
+little, and none of the counts below rest on one. Three checks in an earlier round of this
 change *were* of that kind — one structurally always true, two tautological — and are
 recorded as `NM-0002` rather than quietly repaired, because "the negative control was not
 negative" is the failure mode this whole page is about.
+
+One classification is checked against git rather than against itself. Whether a defect is
+an escape or a near miss decides what the budget counts, so it cannot rest on an author's
+boolean: under `-VerifyCommits`, an escape's `introducedCommit` must be reachable from the
+coverage window's end commit and a near miss's must not. Reclassifying a merged escape into
+`nearMisses` fails on that ancestry, not on its prose. The residual limitation is that this
+check needs git and only runs under `-VerifyCommits`; a schema-only validation still sees
+the booleans as authored.
 
 ## Known false negatives are fixed; blind spots are not
 
@@ -61,10 +70,18 @@ them otherwise:
 - Fixture scores (15 TP / 0 FP / 0 FN / 12 TN) are **scores on the fixture set**, not
   precision and recall on this repository. They say the rules behave as labeled on cases
   chosen to characterize them.
-- The escape ledger's window is bounded by hand. "Coordinator changes" are not derivable
-  from git history in this repository, so the clock advances from incident ordinals and can
-  only lag, never race; the staleness bound is derived from observed commits-per-change so
-  that the lag is bounded and visible rather than assumed away.
+- **The escape ledger's budget clock is not authoritative, and its lag is not bounded.**
+  "Coordinator changes" are not derivable from git history here, so
+  `coordinatorChangesObserved` advances only when an incident carries a higher ordinal. An
+  incident-free coordinator change — the common case — does not move it, and `evaluatedOn`
+  tracks the newest incident rather than the present, so the ledger has no valid refresh
+  after a quiet period. Commits-per-change bounds *staleness of the end commit*; it does
+  not bound how far the change ordinal can drift, because forty commits may contain zero
+  coordinator changes or forty. The ordinals are authored, so the honest statement is that
+  the clock is **hand-maintained**, not that it lags predictably. The budget is therefore
+  recorded as **built but not in force**, and the gate refuses to let it be declared in
+  force while `clockAuthority` is `authoredOrdinals`. Gate 5 must supply an authoritative
+  current ordinal and date rather than reading this clock as current.
 
 ## Built here versus adopted
 

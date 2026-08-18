@@ -212,6 +212,7 @@
           "summary",
           "detector",
           "regressionGuard",
+          "introducedCommit",
           "detectedOn",
           "coordinatorChangeOrdinal"
         ],
@@ -300,6 +301,7 @@
               "complete": { "type": "boolean" },
               "inForce": { "type": "boolean" },
               "inForceNote": { "type": "string", "minLength": 1 },
+              "clockAuthority": { "enum": ["authoredOrdinals", "coordinatorChangeRegistry"] },
               "evidence": { "type": "string", "minLength": 1 }
             }
           }

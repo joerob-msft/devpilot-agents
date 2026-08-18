@@ -387,7 +387,7 @@
       "detector": "Independent review of the change",
       "regressionGuard": "The cross-file gate now asserts only the falsifiable property - identical bare-collection-return findings on the wrapped call site with and without the mock - and pins the conservative-exemption imprecision on a second unwrapped consumer as an expectation, so a future improvement is reported rather than passing silently. Reverting the exemption/nesting split makes the gate fail. The coverage-clock derivation is extracted into Measure-LedgerCoverageClock and the sabotage checks re-run that function on the mutated ledger, with a positive control asserting it agrees on the unmutated one.",
       "introducedCommit": "cc5983c",
-      "remediatedCommit": "cc5983c",
+      "remediatedCommit": "4a3c3ec",
       "siteCount": 2,
       "detectedOn": "2026-08-18",
       "coordinatorChangeOrdinal": 10,
@@ -427,7 +427,7 @@
         "complete": true,
         "inForce": false,
         "inForceNote": "Built, not in force: the corpus drives the shared contract, not the owning stages. All 1652 producer-path cells are open, so no live stage boundary is covered by it today.",
-        "evidence": "tools/testdata/reviewer-collection-inventory.v1.json inventories 236 collection fields across twelve stages; tools/Test-ReviewerCollectionCardinality.ps1 exercises all of them at seven cardinality variants, routes the five map-valued fields through the stage contract's map validator rather than its list normalizer, proves eleven escape shapes as properties, runs nine sabotage checks, and verifies all 416 producer and consumer citations still resolve to files that mention the field - a liveness check on the rows that exist, not a completeness check on the inventory, whose completeness remains unverified; tools/testdata/reviewer-collection-cardinality-matrix.v1.json records coverage per field, keeps the uncovered producer-path dimension separate, and does not claim full coverage."
+        "evidence": "tools/testdata/reviewer-collection-inventory.v1.json inventories 236 collection fields across twelve stages; tools/Test-ReviewerCollectionCardinality.ps1 exercises all of them at seven cardinality variants, routes the five map-valued fields through the stage contract's map validator rather than its list normalizer, proves eleven escape shapes as properties, runs nine sabotage checks, and checks 419 producer and consumer citations, of which 258 resolve to a file that mentions the field's leaf token and 161 name a variable with no leaf to match and are published as unverified rather than counted as checked - a liveness check on the rows that exist, not a completeness check on the inventory, whose completeness remains unverified; tools/testdata/reviewer-collection-cardinality-matrix.v1.json records coverage per field, keeps the uncovered producer-path dimension separate, and does not claim full coverage."
       },
       {
         "id": "file-contract",
@@ -449,8 +449,9 @@
         "id": "escape-ledger",
         "title": "Escape ledger and budget with a registered trigger",
         "complete": true,
-        "inForce": true,
-        "inForceNote": "In force: counts, the rolling window, and the trigger are recomputed from the incident data on every push, and the evaluation clock is derived from git rather than authored.",
+        "inForce": false,
+        "inForceNote": "Built, not in force. Counts, the rolling window, and the trigger are recomputed from the incident data on every push, and the staleness bound is derived from git history. The window clock itself is not: coordinatorChangesObserved advances only when an incident carries a higher ordinal, so an incident-free coordinator change does not move it, and evaluatedOn tracks the newest incident rather than the present. Until an authoritative coordinator-change registry exists, Gate 5 must refuse to read the trigger as current and must require an externally supplied ordinal and date.",
+        "clockAuthority": "authoredOrdinals",
         "evidence": "This ledger, its schema, and tools/Test-EscapeLedger.ps1, which validates the schema, recomputes every count from the incident list, and re-evaluates the trigger."
       }
     ],

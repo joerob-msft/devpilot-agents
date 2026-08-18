@@ -428,8 +428,56 @@ foreach ($prerequisite in @($ledger.decision.prerequisites)) {
     }
 }
 
-# Every regression guard and detector must name a file that exists, so a deleted guard
-# cannot leave a remediated incident silently unguarded.
+# The budget is only "in force" if something other than the ledger's own authors advances
+# its clock. coordinatorChangesObserved moves only when an incident carries a higher
+# ordinal, so an incident-free coordinator change - the common case - does not move it, and
+# evaluatedOn tracks the newest incident rather than the present. A clock with that
+# authority can lag arbitrarily, so declaring the trigger in force on top of it would be
+# the same failure mode as a detector that fails open. The gate refuses the combination.
+$ledgerPrerequisite = @($ledger.decision.prerequisites | Where-Object { $_.id -eq 'escape-ledger' })
+Assert-Ledger ($ledgerPrerequisite.Count -eq 1) 'The decision record does not declare the escape-ledger prerequisite exactly once.'
+
+function Test-ClockAuthorityConsistent {
+    <#
+        Returns $true when the escape-ledger prerequisite's in-force claim is compatible
+        with the authority of the clock underneath it.
+    #>
+    param([Parameter(Mandatory)][object]$Prerequisite)
+    $names = @($Prerequisite.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($names -notcontains 'clockAuthority') { return $false }
+    if ([string]$Prerequisite.clockAuthority -ne 'authoredOrdinals') { return $true }
+    return (-not [bool]$Prerequisite.inForce)
+}
+
+if ($ledgerPrerequisite.Count -eq 1) {
+    $ledgerPrereqNames = @($ledgerPrerequisite[0].PSObject.Properties | ForEach-Object { $_.Name })
+    Assert-Ledger ($ledgerPrereqNames -contains 'clockAuthority') `
+        "The escape-ledger prerequisite does not declare a clockAuthority, so a reader cannot tell whether the window clock is authoritative."
+    if ($ledgerPrereqNames -contains 'clockAuthority') {
+        $clockAuthority = [string]$ledgerPrerequisite[0].clockAuthority
+        Assert-Ledger ($clockAuthority -in @('authoredOrdinals', 'coordinatorChangeRegistry')) `
+            "Unknown clockAuthority '$clockAuthority'."
+        Assert-Ledger (Test-ClockAuthorityConsistent -Prerequisite $ledgerPrerequisite[0]) `
+            'The escape-ledger prerequisite is declared in force while its window clock advances only from authored incident ordinals. An incident-free coordinator change does not move that clock, so the trigger cannot be treated as current. Either supply a coordinator-change registry and set clockAuthority to coordinatorChangeRegistry, or leave inForce false.'
+        if ($clockAuthority -eq 'authoredOrdinals') {
+            Assert-Ledger ([string]$ledgerPrerequisite[0].inForceNote -match 'Gate 5') `
+                'The escape-ledger prerequisite runs on an authored clock but its note does not state what Gate 5 must require before reading the trigger as current.'
+        }
+    }
+
+    # The rule has to be able to fail on the combination it exists to forbid, and has to
+    # accept the combination it exists to permit. Neither is true by construction.
+    $forcedClock = (Get-LedgerObject -Json $ledgerJson).decision.prerequisites | Where-Object { $_.id -eq 'escape-ledger' }
+    $forcedClock.inForce = $true
+    $forcedClock.clockAuthority = 'authoredOrdinals'
+    Assert-Ledger (-not (Test-ClockAuthorityConsistent -Prerequisite $forcedClock)) `
+        'An escape-ledger prerequisite declared in force on an authored clock was accepted.'
+    $registryClock = (Get-LedgerObject -Json $ledgerJson).decision.prerequisites | Where-Object { $_.id -eq 'escape-ledger' }
+    $registryClock.inForce = $true
+    $registryClock.clockAuthority = 'coordinatorChangeRegistry'
+    Assert-Ledger (Test-ClockAuthorityConsistent -Prerequisite $registryClock) `
+        'The clock-authority rule rejects an in-force budget backed by a coordinator-change registry, so it forbids the fix as well as the fault.'
+}
 foreach ($incident in $incidents) {
     $cited = [regex]::Matches("$($incident.detector) $($incident.regressionGuard)", '(?<path>(?:src|tools|docs)/[A-Za-z0-9_./-]+\.(?:ps1|json|md))')
     foreach ($match in $cited) {
@@ -516,6 +564,57 @@ if ($VerifyCommits) {
         }
     }
 
+    # The escape-versus-near-miss split decides what the budget counts, so it cannot rest on
+    # a self-declared boolean. "Merged" is a git fact: a commit reachable from the coverage
+    # window's end commit is on the merged mainline the window describes, and a commit that
+    # is not reachable from it is not. That makes both classifications checkable against
+    # something outside the file, which is the whole point of the distinction.
+    $windowEnd = [string]$ledger.coverageWindow.endCommit
+
+    function Test-CommitMerged {
+        param([Parameter(Mandatory)][string]$Sha, [Parameter(Mandatory)][string]$WindowEnd, [Parameter(Mandatory)][string]$RepoRoot)
+        & git -C $RepoRoot merge-base --is-ancestor $Sha $WindowEnd 2>$null
+        return ($LASTEXITCODE -eq 0)
+    }
+
+    foreach ($incident in $incidents) {
+        if ($incident.PSObject.Properties.Name -notcontains 'introducedCommit') { continue }
+        Assert-Ledger (Test-CommitMerged -Sha ([string]$incident.introducedCommit) -WindowEnd $windowEnd -RepoRoot $repoRoot) `
+            "Escape $($incident.id) was introduced at $($incident.introducedCommit), which is not reachable from the coverage window's end commit $windowEnd. An escape is a defect that entered a merged coordinator change; if this one never merged it belongs in nearMisses."
+    }
+
+    foreach ($nearMiss in $nearMisses) {
+        $nearMissNames = @($nearMiss.PSObject.Properties | ForEach-Object { $_.Name })
+        Assert-Ledger ($nearMissNames -contains 'introducedCommit') `
+            "Near miss $($nearMiss.id) cites no introducedCommit, so its claim never to have merged cannot be checked against git."
+        if ($nearMissNames -notcontains 'introducedCommit') { continue }
+        $introduced = [string]$nearMiss.introducedCommit
+        Assert-Ledger (-not (Test-CommitMerged -Sha $introduced -WindowEnd $windowEnd -RepoRoot $repoRoot)) `
+            "Near miss $($nearMiss.id) was introduced at $introduced, which IS reachable from the coverage window's end commit $windowEnd. A defect on the merged mainline is an escape and must be counted against the budget; it cannot be reclassified out of the window by declaring mergedBeforeDetection false."
+
+        # A single commit cannot both introduce and remediate the same defect, and a
+        # remediation cannot precede what it remediates.
+        if ($nearMissNames -contains 'remediatedCommit') {
+            $remediated = [string]$nearMiss.remediatedCommit
+            Assert-Ledger ($remediated -ne $introduced) `
+                "Near miss $($nearMiss.id) cites $remediated as both its introducing and its remediating commit. One commit cannot do both; if the remediation ships in a commit whose hash does not exist yet, omit remediatedCommit and let status plus the regression guard carry it."
+            & git -C $repoRoot merge-base --is-ancestor $introduced $remediated 2>$null
+            Assert-Ledger ($LASTEXITCODE -eq 0) `
+                "Near miss $($nearMiss.id) claims remediation at $remediated, which does not descend from the introducing commit $introduced, so it cannot contain the fix."
+        }
+    }
+
+    # The two rules must be able to fail, and must fail in opposite directions. Feed each
+    # the other's commits.
+    $mergedProbe = @($incidents | Where-Object { $_.PSObject.Properties.Name -contains 'introducedCommit' } | Select-Object -First 1)
+    $unmergedProbe = @($nearMisses | Where-Object { $_.PSObject.Properties.Name -contains 'introducedCommit' } | Select-Object -First 1)
+    if ($mergedProbe.Count -eq 1 -and $unmergedProbe.Count -eq 1) {
+        Assert-Ledger (Test-CommitMerged -Sha ([string]$mergedProbe[0].introducedCommit) -WindowEnd $windowEnd -RepoRoot $repoRoot) `
+            'The merged-commit test does not recognise a commit the ledger records as merged, so the escape rule proves nothing.'
+        Assert-Ledger (-not (Test-CommitMerged -Sha ([string]$unmergedProbe[0].introducedCommit) -WindowEnd $windowEnd -RepoRoot $repoRoot)) `
+            'The merged-commit test reports an unmerged commit as merged, so the near-miss rule proves nothing.'
+    }
+
     # The window closes at a named commit, so its evaluation date is that commit's date and
     # nothing else. Deriving it from git is what stops the ledger from being re-dated by hand
     # without the window actually moving.
@@ -554,7 +653,7 @@ if ($VerifyCommits) {
             $windowCommits = [int]((& git -C $repoRoot rev-list --count "$startCommit..$endCommit").Trim())
             $observedChanges = [int]$ledger.coverageWindow.coordinatorChangesObserved
             if ($observedChanges -gt 0) {
-                $commitsPerChange = [math]::Floor($windowCommits / $observedChanges)
+                $commitsPerChange = [math]::Max(1, [math]::Floor($windowCommits / $observedChanges))
                 $maxStaleAfter = $commitsPerChange * 2
                 Assert-Ledger ($staleAfter -le $maxStaleAfter) `
                     "The coverage window allows the clock to fall $staleAfter commit(s) behind HEAD, but $windowCommits commit(s) across $observedChanges coordinator change(s) put a change at about $commitsPerChange commit(s), so the bound may not exceed $maxStaleAfter."
