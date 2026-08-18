@@ -395,6 +395,15 @@ param(
 
     [string]$AcquisitionOutputRoot,
 
+    [ValidateRange(0, 3600)]
+    [int]$AcquisitionPerCallTimeoutSeconds = 0,
+
+    [ValidateRange(0, 7200)]
+    [int]$AcquisitionActivityTimeoutSeconds = 0,
+
+    [ValidateRange(0, 7200)]
+    [int]$AcquisitionTotalTimeoutSeconds = 0,
+
     # The verifier role requires an INDEPENDENTLY captured discovery candidate
     # input, bound by source fixture/model/role and result-marker. The candidate
     # is never derived from truth or from a co-run discovery pass.
@@ -10405,13 +10414,21 @@ function Invoke-ReviewerConventionSpecialistPass {
                 # project/nonce fields mismatched - terminal, never retried) and
                 # from a clean success. The same window the pre-launch gate
                 # validated is used, so launch bound and capture bound are one.
-                $markerOutcome = ConvertFrom-AgentResultMarkerOutcome -StdOutText $markerSource `
-                    -MarkerPrefix $script:ReviewerConventionSpecialistMarkerPrefix `
-                    -Schema $specialistSchema -ScanWindowChars $specialistScanWindow
+                $markerOutcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
+                    -StdOutText $markerSource -Schema $specialistSchema `
+                    -ScanWindowChars $specialistScanWindow
                 $specialistMarkerStatus = [string]$markerOutcome.Status
                 $marker = if ($specialistMarkerStatus -ceq 'success') { $markerOutcome.Value } else { $null }
+                $markerReason = [string]$markerOutcome.Reason
+                $markerDetail = [string]$markerOutcome.Field
+                if (@($markerOutcome.NormalizedFields).Count -gt 0) {
+                    $normalization = @($markerOutcome.NormalizedFields)[0]
+                    $markerDetail = [string]$normalization.Field
+                    $markerReason = ("Compatibility-normalized an exact empty JSON array to the schema's empty string at " +
+                        "'$markerDetail'. Original typed reason: $([string]$normalization.OriginalTypedReason)")
+                }
                 & $emitSpecialistAcct $specialistAttempt $nonce $specialistMarkerStatus $specialistModelRan $specialistUsage `
-                    ([string]$markerOutcome.Reason) ([string]$markerOutcome.Field)
+                    $markerReason $markerDetail
                 # A successful parse is terminal for the marker loop: a PR16769813
                 # specialist marker that parses cleanly and only later fails a
                 # SEMANTIC remediation check must NOT be re-launched - that is not
@@ -16188,6 +16205,45 @@ function Invoke-ReviewerBlindedAcquisitionRun {
     if (-not (Test-ReviewerArtifactSignature -ManifestJson $planText -Key $planKeyBytes -Signature ([string]$planSig.signature))) {
         throw "The acquisition plan signature does not match the plan bytes under the presented token; a tampered or replayed plan is refused before any launch."
     }
+    $expectedMaximumAttempts = switch ($AcquireTranscriptRole) {
+        'generalist' { [int]$script:ReviewerMarkerRetryAttempts }
+        'specialist' { [int]$script:ReviewerConventionSpecialistMarkerRetryAttempts }
+        'verifier' { 1 }
+        default { 0 }
+    }
+    $timeoutBindings = @(
+        @('perCallTimeoutSeconds', [int]$AcquisitionPerCallTimeoutSeconds),
+        @('activityTimeoutSeconds', [int]$AcquisitionActivityTimeoutSeconds),
+        @('totalTimeoutSeconds', [int]$AcquisitionTotalTimeoutSeconds),
+        @('teardownMarginSeconds', 30),
+        @('maximumAttempts', $expectedMaximumAttempts)
+    )
+    foreach ($timeoutBinding in $timeoutBindings) {
+        $name = [string]$timeoutBinding[0]
+        $runtimeValue = [int]$timeoutBinding[1]
+        if (-not $plan.timeouts.PSObject.Properties[$name] -or
+            [int]$plan.timeouts.PSObject.Properties[$name].Value -ne $runtimeValue) {
+            throw "The running acquisition $name=$runtimeValue does not match the signed plan timeout binding."
+        }
+    }
+    if ([int]$plan.timeouts.activityTimeoutSeconds -lt
+        ([int]$plan.timeouts.perCallTimeoutSeconds + [int]$plan.timeouts.teardownMarginSeconds)) {
+        throw "The signed acquisition activity timeout does not cover one full per-call timeout plus bounded teardown."
+    }
+    $minimumTotalTimeout = ([long]$plan.timeouts.perCallTimeoutSeconds *
+        [long]$plan.timeouts.maximumAttempts) + [long]$plan.timeouts.teardownMarginSeconds
+    if ([long]$plan.timeouts.totalTimeoutSeconds -lt $minimumTotalTimeout) {
+        throw "The signed acquisition total timeout does not cover its configured bounded retry count."
+    }
+    $rolePerCallTimeout = switch ($AcquireTranscriptRole) {
+        'generalist' { [int]$CycleTimeoutSeconds }
+        'specialist' { [int]$ConventionSpecialistTimeoutSeconds }
+        'verifier' { [int]$VerificationTimeoutSeconds }
+        default { 0 }
+    }
+    if ($rolePerCallTimeout -ne [int]$plan.timeouts.perCallTimeoutSeconds) {
+        throw "The role's effective inner timeout does not match the signed acquisition per-call timeout."
+    }
     $planConventionSpecialistEnabled = [bool]$plan.conventionSpecialistEnabled
     if ($planConventionSpecialistEnabled -ne [bool]$EnableConventionSpecialist) {
         throw "The configured -EnableConventionSpecialist does not match the acquisition plan's conventionSpecialistEnabled binding."
@@ -16474,9 +16530,9 @@ function Invoke-ReviewerBlindedAcquisitionRun {
         if ($discoverySourceRole -ceq 'specialist') {
             $specialistSchema = Get-ReviewerConventionSpecialistMarkerSchema `
                 -ExpectedProject ([string]$planTarget.project) -ExpectedNonce ([string]$discoveryCore.nonce)
-            $specialistOutcome = ConvertFrom-AgentResultMarkerOutcome `
-                -StdOutText $discoveryMarkerText -MarkerPrefix $expectedDiscoveryPrefix `
-                -Schema $specialistSchema -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars)
+            $specialistOutcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
+                -StdOutText $discoveryMarkerText -Schema $specialistSchema `
+                -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars)
             if ([string]$specialistOutcome.Status -cne 'success') {
                 throw "The sealed specialist result marker failed the exact production schema: $([string]$specialistOutcome.Status)."
             }
@@ -16891,9 +16947,9 @@ function Invoke-ReviewerBlindedAcquisitionRun {
     [IO.File]::WriteAllText((Join-Path $outputRoot 'result-marker.txt'), $terminalMarkerText, $script:ReviewerUtf8)
     $terminalSpecialistMarker = $null
     if ($AcquireTranscriptRole -ceq 'specialist' -and $terminalStatus -ceq 'captured') {
-        $terminalSpecialistOutcome = ConvertFrom-AgentResultMarkerOutcome `
-            -StdOutText $terminalMarkerText -MarkerPrefix ([string]$script:ReviewerConventionSpecialistMarkerPrefix) `
-            -Schema $roleMarkerSchema -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars)
+        $terminalSpecialistOutcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
+            -StdOutText $terminalMarkerText -Schema $roleMarkerSchema `
+            -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars)
         if ([string]$terminalSpecialistOutcome.Status -cne 'success') {
             throw "The captured specialist marker could not be revalidated for its sealed source projection."
         }
@@ -17548,9 +17604,9 @@ function Invoke-ReviewerRoleInputCaptureRun {
         if ($discoverySourceRole -ceq 'specialist') {
             $specialistSchema = Get-ReviewerConventionSpecialistMarkerSchema `
                 -ExpectedProject ([string]$binding.project) -ExpectedNonce ([string]$discoveryCore.nonce)
-            $specialistOutcome = ConvertFrom-AgentResultMarkerOutcome `
-                -StdOutText $discoveryMarkerText -MarkerPrefix $expectedDiscoveryPrefix `
-                -Schema $specialistSchema -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars)
+            $specialistOutcome = ConvertFrom-ReviewerConventionSpecialistResultMarkerOutcome `
+                -StdOutText $discoveryMarkerText -Schema $specialistSchema `
+                -ScanWindowChars (Get-ReviewerConventionSpecialistScanWindowChars)
             if ([string]$specialistOutcome.Status -cne 'success') {
                 throw "The sealed specialist result marker failed the exact production schema: $([string]$specialistOutcome.Status)."
             }
