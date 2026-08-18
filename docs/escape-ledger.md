@@ -26,15 +26,22 @@ reclassify it. The baseline was originally the author's choice, and bounding it 
 reachability from the window end is satisfied by every commit in the window, and a lower bound
 on its date is satisfied by every non-tip commit sharing a calendar day with `detectedOn`.
 Either way, naming an old enough baseline made any merged escape look unmerged at a cost of one
-field value. So the baseline is no longer bounded; it is derived. The mainline as of a date is
-a single commit — `git rev-list -1 --before="<detectedOn> 23:59:59" <windowEnd>` — and the
-recorded baseline must be exactly that commit. `detectedOn` is what the derivation reads, so it
-is bounded in turn: it may not precede the day of the finding's own introducing commit, since a
-defect cannot be detected before the change that introduced it exists. Moving a merged incident
-into `nearMisses` to drop it out of the type-binding total therefore fails on ancestry rather
-than on prose, the rule is probed in both directions against commits the ledger already cites,
-and controls run the production validator against the coverage window's start commit, against a
-commit sharing the detection date, and against a backdated `detectedOn`.
+field value. Deriving it instead — the mainline as of `detectedOn`, via
+`git rev-list -1 --before="<detectedOn> 23:59:59" <windowEnd>` — removed the author's choice but
+introduced a worse defect, because the derivation reads the window end: advancing the window to a
+later commit on the same day silently changed the expected baseline and false-failed both
+honestly filed near misses. A rule whose verdict on unchanged data moves when unrelated history
+is appended is not an anchor, so the derivation was removed. The ledger is instead treated as
+what it is — a frozen snapshot of a closed window — and `classifiedAgainstCommit` must equal the
+coverage window's own pinned `endCommit`. The baseline is then not chosen at all, and advancing
+the window authors a *new* snapshot in which the near misses are re-judged, rather than editing
+this one in place. `detectedOn` is bounded in turn: it may not precede the day of the finding's
+own introducing commit, since a defect cannot be detected before the change that introduced it
+exists. Moving a merged incident into `nearMisses` to drop it out of the type-binding total
+therefore fails on ancestry rather than on prose, the rule is probed in both directions against
+commits the ledger already cites, and controls run the production validator against the coverage
+window's start commit, against a commit sharing the detection date, and against a backdated
+`detectedOn`.
 
 That is a one-way check, and worth being precise about what it does not do. Reachability
 shows a commit is in a history; it does not show that the defective state entered an
@@ -44,8 +51,10 @@ each commit reachable, and a defect on an operational side branch is reachable f
 So an ancestry failure proves a misfiling, while an ancestry pass leaves the classification
 resting on the recorded rationale. `introducedCommit` is required on both lists precisely so
 that a finding cannot leave the check by omitting a field, but its *value* is not tied to the
-defect it names. [`hardening-limitations.md`](hardening-limitations.md) carries these as named
-residuals.
+defect it names — so a merged escape can still be reclassified out of the budget by moving it
+into `nearMisses` and rewriting `introducedCommit` to a branch commit unreachable from the frozen
+baseline, which moves `typeBinding`, `openDebt` and `inWindow` together on one falsified field.
+[`hardening-limitations.md`](hardening-limitations.md) carries these as named residuals.
 
 `category` is the field with the most leverage over the pivot decision, because the trigger
 counts type-binding escapes. It cannot be derived — what a defect was is a judgement — so the
@@ -63,7 +72,7 @@ author who rewrites a detector to name nothing recognised, moves the category to
 does not count, and declares the exception with a rationale still passes, and the count still
 falls by one — what the rule buys is that this is three coordinated edits in a reviewed list
 rather than one silent field. Both fields are still authored, so this is an internal
-consistency constraint, not corroboration by independent evidence. It is reported as `categoryDetectorConsistent` — 11 ofthe twelve escapes; `ESC-0011` was found by review of a guard and has no detector to anchor to
+consistency constraint, not corroboration by independent evidence. It is reported as `categoryDetectorConsistent` — 11 ofthe twelve escapes; `ESC-0011` was found by review of a guard and has no detector to anchor to
 — and that count is **not** offered as assurance evidence. Detector family does not establish
 root cause.
 
@@ -168,9 +177,22 @@ Open debt is the only status that raises a published count, so it is the one an 
 interest in relabelling. `remediated` already required a remediating commit reachable from the
 window end, but `accepted` was unconstrained — flipping one enum value moved the open-debt
 count to zero with every check green. A finding marked `accepted` now has to record an
-`acceptanceRationale` and an `acceptedOnCommit` that git can reach from the window end, so
-accepting a risk costs the same kind of evidence as fixing it. A control flips the real
-open-debt finding to `accepted` and requires the gate to reject it.
+`acceptanceRationale` and an `acceptedOnCommit`, so accepting a risk costs the same kind of
+evidence as fixing it. Reachability from the window end alone was not enough: it let a risk be
+accepted at a commit that *predates the defect*, and accepting the sole open debt at the commit
+that introduced its whole family passed while moving the count to zero. The acceptance commit
+must therefore also descend from the finding's own `introducedCommit` and not be dated before
+`detectedOn`. A control flips the real open-debt finding to `accepted` and requires the gate to
+reject it; a second control accepts it at the commit that introduced it and requires the same.
+
+Each of these rules lives in exactly one validator that both the production loop and its control
+call, so neutering the rule makes its own control fail. That protects the rule's body but not
+its call site — a control invokes the validator directly and cannot see whether production still
+does, and replacing a production assertion with an unconditional success left the gate green
+without even moving the check count. Each validator therefore records its entry, and the expected
+number of entries — the production invocations the real ledger requires plus the fixed number of
+control invocations — is asserted. Deleting any of the seven production call sites now fails a
+check that no control can supply.
 
 ## Near misses
 
@@ -226,7 +248,12 @@ hand-maintained — `coordinatorChangesObserved` advances only when an incident 
 higher ordinal, so an incident-free coordinator change does not move it. The machine-readable
 budget says so in its own `operationalStatus: historicalSnapshot` and `asOfCommit` fields, so
 a parser cannot pick up the counts without the caveat attached, and the gate refuses to let
-the prerequisite be declared in force while the clock's authority is authored ordinals.
+the prerequisite be declared in force while the clock's authority is authored ordinals. For the
+same reason the window's staleness bound is reported rather than enforced: `commitsBehindHead`
+records how far the pinned window end sits behind `HEAD`, but exceeding `staleAfterCommits` only
+fails the gate once the prerequisite is in force. Enforcing it against a frozen snapshot would
+fail on every later unrelated commit and teach the reader to raise the bound instead of
+re-judging the data.
 
 Current state, as of the coverage window's end commit: **0 qualifying escapes, trigger not
 fired.** That is because no shadow or live run has ever been performed, not because escapes

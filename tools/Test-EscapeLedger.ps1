@@ -32,6 +32,39 @@ $docPath = Join-Path $repoRoot 'docs/escape-ledger.md'
 
 $script:Failures = [System.Collections.Generic.List[string]]::new()
 $script:Checks = 0
+$script:ValidatorCalls = @{}
+
+function Register-ValidatorCall {
+    <#
+        .SYNOPSIS
+        Records that a shared validator was entered.
+
+        .DESCRIPTION
+        Extracting each rule into one validator that production and its control both call made
+        the rule bodies falsifiable, but it moved the protected surface from the predicate to
+        the function body: the controls call the validator directly, so they are blind to
+        whether the production loop calls it at all. Replacing a production Assert-Ledger with
+        an unconditional success left every check green and did not even move the check count.
+        Counting entries makes the call itself observable - a deleted production call drops the
+        count below what the control invocations alone can supply, and no control can make that
+        good.
+    #>
+    param([Parameter(Mandatory)][string]$Name)
+    if (-not $script:ValidatorCalls.ContainsKey($Name)) { $script:ValidatorCalls[$Name] = 0 }
+    $script:ValidatorCalls[$Name]++
+}
+
+function Assert-ValidatorInvoked {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][int]$Expected,
+        [Parameter(Mandatory)][string]$Rule
+    )
+    $actual = 0
+    if ($script:ValidatorCalls.ContainsKey($Name)) { $actual = [int]$script:ValidatorCalls[$Name] }
+    Assert-Ledger ($actual -eq $Expected) `
+        "The $Rule validator was entered $actual time(s), not the expected $Expected. Its controls call it directly, so a count below the expected total means the production path stopped calling it and the rule is no longer enforced on the real ledger; a count above means a call was added without recording it here."
+}
 
 function Assert-Ledger {
     param(
@@ -550,6 +583,7 @@ Assert-Ledger ($docText -match 'Gate 5') 'docs/escape-ledger.md does not record 
 # --- 10. Optional commit verification -----------------------------------------------------
 
 $commitsVerified = 0
+$script:CommitsBehindHead = -1
 # A near miss was introduced and detected inside the same unmerged change, so it never
 # entered a merged coordinator change and is not an escape. Keeping the two collections
 # separate is load-bearing: the budget decision reads escape category totals, and a
@@ -612,6 +646,7 @@ foreach ($exposed in @(@($incidents) + @($nearMisses)) | Where-Object { $true -e
 # control green if the real check disappeared.
 function Test-ExposureFieldsAgree {
     param([Parameter(Mandatory)][object]$Finding)
+    Register-ValidatorCall -Name 'exposure'
     return (([bool]$Finding.reachedShadowOrLive) -eq ([string]$Finding.executionStage -in @('shadow', 'live')))
 }
 foreach ($finding in @(@($incidents) + @($nearMisses))) {
@@ -622,14 +657,35 @@ foreach ($finding in @(@($incidents) + @($nearMisses))) {
 # An open debt is a published count, and 'accepted' was the one status that closed it with no
 # evidence at all: 'remediated' already demands a remediating commit, so flipping openDebt to
 # accepted moved the number by one enum edit. Acceptance is a decision, so it has to be
-# recorded as one.
+# recorded as one. One validator, called by production and by the control below, so that
+# deleting the rule breaks the control that is supposed to prove it.
+function Get-AcceptanceObjection {
+    param([Parameter(Mandatory)][object]$Finding)
+    Register-ValidatorCall -Name 'acceptance'
+    if ([string]$Finding.status -ne 'accepted') { return $null }
+    $names = @($Finding.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($names -notcontains 'acceptanceRationale' -or [string]::IsNullOrWhiteSpace([string]$Finding.acceptanceRationale)) {
+        return "Finding $($Finding.id) is marked accepted but records no acceptanceRationale. Accepting a risk lowers the open-debt count, so it cannot be done by changing one enum value."
+    }
+    if ($names -notcontains 'acceptedOnCommit' -or [string]::IsNullOrWhiteSpace([string]$Finding.acceptedOnCommit)) {
+        return "Finding $($Finding.id) is marked accepted but records no acceptedOnCommit, so the acceptance is asserted against no point in the history."
+    }
+    return $null
+}
+
 foreach ($finding in @(@($incidents) + @($nearMisses))) {
-    if ([string]$finding.status -ne 'accepted') { continue }
-    $acceptanceNames = @($finding.PSObject.Properties | ForEach-Object { $_.Name })
-    Assert-Ledger ($acceptanceNames -contains 'acceptanceRationale' -and -not [string]::IsNullOrWhiteSpace([string]$finding.acceptanceRationale)) `
-        "Finding $($finding.id) is marked accepted but records no acceptanceRationale. Accepting a risk lowers the open-debt count, so it cannot be done by changing one enum value."
-    Assert-Ledger ($acceptanceNames -contains 'acceptedOnCommit') `
-        "Finding $($finding.id) is marked accepted but records no acceptedOnCommit, so the acceptance is asserted against no point in the history."
+    $acceptanceObjection = Get-AcceptanceObjection -Finding $finding
+    Assert-Ledger ($null -eq $acceptanceObjection) ([string]$acceptanceObjection)
+}
+
+# The control has to run the production validator, not a restatement of it.
+$acceptanceProbe = @(Get-LedgerObject -Json $ledgerJson).incidents | Where-Object { [string]$_.status -eq 'openDebt' } | Select-Object -First 1
+if ($null -ne $acceptanceProbe) {
+    Assert-Ledger ($null -eq (Get-AcceptanceObjection -Finding $acceptanceProbe)) `
+        "The acceptance validator objects to $($acceptanceProbe.id) as filed, so it would fail on honest records."
+    $acceptanceProbe.status = 'accepted'
+    Assert-Ledger ($null -ne (Get-AcceptanceObjection -Finding $acceptanceProbe)) `
+        "Relabelling the open-debt finding $($acceptanceProbe.id) as accepted was accepted with no evidence, so the open-debt count still moves by one enum edit."
 }
 
 # The undercount direction is the one that was open, so it is the one that gets a control.
@@ -688,6 +744,7 @@ function Get-CategoryObjection {
         [Parameter(Mandatory)][string[]]$ControlFlowRules,
         [Parameter(Mandatory)][string[]]$CountedCategories
     )
+    Register-ValidatorCall -Name 'category'
     $implied = Get-DetectorImpliedCategory -Text ([string]$Incident.detector) -CollapseRules $CollapseRules -ControlFlowRules $ControlFlowRules
     if ($null -eq $implied) {
         # The forward rule has nothing to say here, so the converse carries the weight: a
@@ -717,8 +774,25 @@ foreach ($incident in $incidents) {
 # incident's detector to name nothing recognised would quietly drop it out of the anchored set
 # and free its category, showing up only as a published counter falling by one.
 $declaredExceptionIds = @($ledger.categoryAnchorExceptions | ForEach-Object { [string]$_.id })
-Assert-Ledger ((@($unanchoredIds | Sort-Object) -join ',') -eq (@($declaredExceptionIds | Sort-Object) -join ',')) `
-    "The escapes whose detector implies no category ($((@($unanchoredIds | Sort-Object) -join ', '))) do not match the ledger's declared categoryAnchorExceptions ($((@($declaredExceptionIds | Sort-Object) -join ', '))). Removing an escape from the anchored set has to be recorded, not inferred from a counter."
+
+# The set equality was asserted inline, so disabling it let an undeclared exception through
+# while every control stayed green. One validator, called by production and by the control.
+function Get-ExceptionSetObjection {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$ComputedIds,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$DeclaredIds
+    )
+    Register-ValidatorCall -Name 'exceptionSet'
+    $computed = (@($ComputedIds | Sort-Object) -join ',')
+    $declared = (@($DeclaredIds | Sort-Object) -join ',')
+    if ($computed -ne $declared) {
+        return "The escapes whose detector implies no category ($computed) do not match the ledger's declared categoryAnchorExceptions ($declared). Removing an escape from the anchored set has to be recorded, not inferred from a counter."
+    }
+    return $null
+}
+
+$exceptionSetObjection = Get-ExceptionSetObjection -ComputedIds @($unanchoredIds) -DeclaredIds @($declaredExceptionIds)
+Assert-Ledger ($null -eq $exceptionSetObjection) ([string]$exceptionSetObjection)
 function Get-ExceptionObjection {
     <#
         .SYNOPSIS
@@ -728,6 +802,7 @@ function Get-ExceptionObjection {
         [Parameter(Mandatory)][object]$Exception,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Incidents
     )
+    Register-ValidatorCall -Name 'exceptionEntry'
     $matched = @($Incidents | Where-Object { [string]$_.id -eq [string]$Exception.id })
     if ($matched.Count -ne 1) {
         return "categoryAnchorExceptions names $($Exception.id), which is not an escape in this ledger."
@@ -785,7 +860,7 @@ if ($categoryProbe.Count -eq 1) {
     if ($null -eq (Get-DetectorImpliedCategory -Text ([string]$deAnchored.detector) -CollapseRules $collapseRules -ControlFlowRules $controlFlowRules)) {
         $recomputed.Add([string]$deAnchored.id)
     }
-    Assert-Ledger ((@($recomputed | Sort-Object) -join ',') -ne (@($declaredExceptionIds | Sort-Object) -join ',')) `
+    Assert-Ledger ($null -ne (Get-ExceptionSetObjection -ComputedIds @($recomputed) -DeclaredIds @($declaredExceptionIds))) `
         "Rewriting $($categoryProbe[0].id)'s detector to name nothing recognised leaves the computed exception set matching the declared one, so de-anchoring would pass unrecorded."
 }
 
@@ -897,6 +972,7 @@ if ($VerifyCommits) {
             [Parameter(Mandatory)][string]$WindowEnd,
             [Parameter(Mandatory)][string]$RepoRoot
         )
+        Register-ValidatorCall -Name 'nearMissBaseline'
         $reasons = New-Object System.Collections.Generic.List[string]
         $introduced = [string]$NearMiss.introducedCommit
         $baseline = [string]$NearMiss.classifiedAgainstCommit
@@ -909,28 +985,28 @@ if ($VerifyCommits) {
             $reasons.Add("Near miss $($NearMiss.id) was introduced at $introduced, which IS reachable from the mainline commit $baseline it was classified against. A defect already on the mainline is an escape and must be counted against the budget; it cannot be reclassified out of the window by declaring mergedBeforeDetection false.")
         }
 
-        # The baseline is derived, not merely bounded. Reachability from the window end bounds
-        # nothing - every commit in the window satisfies it - and a lower bound on the
-        # baseline's date bounds almost nothing either, because every non-tip commit sharing a
-        # calendar day with detectedOn still qualifies. Either form left the escape-to-near-miss
-        # reclassification available at a cost of one field value, which is the exploit this
-        # field was introduced to close. The mainline as of a detection date is a single commit,
-        # so the gate computes it and requires an exact match; the residual interval collapses
-        # to nothing rather than narrowing.
-        $expected = (& git -C $RepoRoot rev-list -1 --before="$detectedOn 23:59:59" $WindowEnd 2>$null)
-        if ([string]::IsNullOrWhiteSpace($expected)) {
-            $reasons.Add("Near miss $($NearMiss.id) records detectedOn $detectedOn, before which the coverage window contains no commit, so there is no mainline it could have been classified against.")
-        }
-        elseif (-not $expected.StartsWith($baseline) -and -not $baseline.StartsWith($expected)) {
-            $reasons.Add("Near miss $($NearMiss.id) was detected on $detectedOn, when the mainline stood at $expected, but it records a baseline of $baseline. The mainline as of a date is one commit; choosing any other is choosing how much history to ignore, and choosing enough of it turns a merged escape into a near miss.")
+        # The baseline is not chosen, derived, or bounded: it is the snapshot's own anchor.
+        # Bounding it did not work - reachability from the window end admits every commit in
+        # the window, and a lower bound on its date admits every non-tip commit sharing a
+        # calendar day with detectedOn. Deriving it from detectedOn did not work either,
+        # because the derivation reads the window end: advancing the window to a later commit
+        # on the same calendar day silently moved the expected baseline and false-failed both
+        # honestly filed near misses. A derivation whose result changes when unrelated history
+        # lands is the same directional defect as the date comparison it replaced.
+        #
+        # This ledger is a frozen historical snapshot, so the mainline a finding was judged
+        # against is the one the snapshot is anchored to, and there is exactly one such commit.
+        # Advancing the window is not an edit to this record; it is the authoring of a new
+        # snapshot, at which point every near miss is re-judged against the new anchor.
+        if (-not $WindowEnd.StartsWith($baseline) -and -not $baseline.StartsWith($WindowEnd)) {
+            $reasons.Add("Near miss $($NearMiss.id) records a baseline of $baseline, but this ledger is a snapshot anchored at $WindowEnd. A finding is judged against the snapshot's own anchor; choosing any other commit is choosing how much history to ignore, and choosing enough of it turns a merged escape into a near miss. Advancing the window is not an edit to this record - it authors a new snapshot, in which every near miss is re-judged against the new anchor and any whose introducing commit has since become reachable is an escape.")
         }
 
-        # ...and the detection date is what the baseline is derived from, so it cannot be moved
-        # backwards freely either: a defect cannot be detected before the commit that
-        # introduced it exists.
+        # detectedOn no longer selects a commit, but it still orders the record, and a defect
+        # cannot be detected before the change that introduced it exists.
         $introducedDay = Get-CommitDay -Sha $introduced -RepoRoot $RepoRoot
         if (-not [string]::IsNullOrWhiteSpace($introducedDay) -and $detectedOn -lt $introducedDay) {
-            $reasons.Add("Near miss $($NearMiss.id) records detectedOn $detectedOn but its introducing commit $introduced is dated $introducedDay. A finding cannot be detected before the change that introduced it, and backdating detectedOn moves the mainline the baseline is derived from.")
+            $reasons.Add("Near miss $($NearMiss.id) records detectedOn $detectedOn but its introducing commit $introduced is dated $introducedDay. A finding cannot be detected before the change that introduced it.")
         }
         return @($reasons)
     }
@@ -955,22 +1031,60 @@ if ($VerifyCommits) {
         Assert-RemediationCommit -Finding $nearMiss -RepoRoot $repoRoot
     }
 
-    # An acceptance has to be anchored to a real point in the history, not merely declared.
-    foreach ($accepted in @(@($incidents) + @($nearMisses) | Where-Object { [string]$_.status -eq 'accepted' })) {
-        $acceptedNames = @($accepted.PSObject.Properties | ForEach-Object { $_.Name })
-        if ($acceptedNames -notcontains 'acceptedOnCommit') { continue }
-        Assert-Ledger (Test-CommitMerged -Sha ([string]$accepted.acceptedOnCommit) -WindowEnd $windowEnd -RepoRoot $repoRoot) `
-            "Finding $($accepted.id) records an acceptance at $($accepted.acceptedOnCommit), which is not reachable from the coverage window's end commit $windowEnd."
+    # An acceptance has to be anchored to a real point in the history, not merely declared, and
+    # it cannot predate the defect: reachability from the window end alone only proves the
+    # commit exists somewhere earlier, so naming the window's own start commit closed the debt.
+    function Get-AcceptanceCommitObjection {
+        param(
+            [Parameter(Mandatory)][object]$Finding,
+            [Parameter(Mandatory)][string]$WindowEnd,
+            [Parameter(Mandatory)][string]$RepoRoot
+        )
+        Register-ValidatorCall -Name 'acceptanceCommit'
+        if ([string]$Finding.status -ne 'accepted') { return $null }
+        $names = @($Finding.PSObject.Properties | ForEach-Object { $_.Name })
+        if ($names -notcontains 'acceptedOnCommit') { return $null }
+        $acceptedOn = [string]$Finding.acceptedOnCommit
+        if (-not (Test-CommitMerged -Sha $acceptedOn -WindowEnd $WindowEnd -RepoRoot $RepoRoot)) {
+            return "Finding $($Finding.id) records an acceptance at $acceptedOn, which is not reachable from the coverage window's end commit $WindowEnd."
+        }
+        if ($names -contains 'introducedCommit') {
+            $introduced = [string]$Finding.introducedCommit
+            if (-not (Test-CommitMerged -Sha $introduced -WindowEnd $acceptedOn -RepoRoot $RepoRoot)) {
+                return "Finding $($Finding.id) records an acceptance at $acceptedOn, which does not descend from the introducing commit $introduced. A risk cannot be accepted at a point in the history before the defect existed."
+            }
+        }
+        if ($names -contains 'detectedOn') {
+            $acceptedDay = Get-CommitDay -Sha $acceptedOn -RepoRoot $RepoRoot
+            if (-not [string]::IsNullOrWhiteSpace($acceptedDay) -and $acceptedDay -lt [string]$Finding.detectedOn) {
+                return "Finding $($Finding.id) records an acceptance at $acceptedOn, dated $acceptedDay, before the finding's own detectedOn of $($Finding.detectedOn). A risk cannot be accepted before it is known."
+            }
+        }
+        return $null
+    }
+
+    foreach ($accepted in @(@($incidents) + @($nearMisses))) {
+        $acceptanceCommitObjection = Get-AcceptanceCommitObjection -Finding $accepted -WindowEnd $windowEnd -RepoRoot $repoRoot
+        Assert-Ledger ($null -eq $acceptanceCommitObjection) ([string]$acceptanceCommitObjection)
     }
 
     # The acceptance rule exists to stop an open debt being closed by one enum edit, so it has
-    # to be shown to reject exactly that edit on the finding that actually carries the debt.
+    # to be shown to reject exactly that edit on the finding that actually carries the debt -
+    # and to reject the cheapest evidence an author could attach to it, which is a commit old
+    # enough to predate the defect.
     $debtProbe = @(Get-LedgerObject -Json $ledgerJson).incidents | Where-Object { [string]$_.status -eq 'openDebt' } | Select-Object -First 1
     if ($null -ne $debtProbe) {
+        Assert-Ledger ($null -eq (Get-AcceptanceObjection -Finding $debtProbe)) `
+            "The acceptance validator objects to the open debt $($debtProbe.id) as filed, so it would fail on honest records."
         $debtProbe.status = 'accepted'
-        $probeNames = @($debtProbe.PSObject.Properties | ForEach-Object { $_.Name })
-        Assert-Ledger (($probeNames -notcontains 'acceptanceRationale') -or ($probeNames -notcontains 'acceptedOnCommit')) `
+        Assert-Ledger ($null -ne (Get-AcceptanceObjection -Finding $debtProbe)) `
             "The open debt $($debtProbe.id) already carries acceptance evidence, so flipping its status to accepted would not be rejected and the open-debt count could still be closed by one field."
+        $debtProbe | Add-Member -NotePropertyName 'acceptanceRationale' -NotePropertyValue 'Accepted because correcting it properly means changing a producer contract and all of its call sites, which is out of scope here.' -Force
+        $debtProbe | Add-Member -NotePropertyName 'acceptedOnCommit' -NotePropertyValue ([string]$ledger.coverageWindow.startCommit) -Force
+        Assert-Ledger ($null -eq (Get-AcceptanceObjection -Finding $debtProbe)) `
+            "The acceptance validator still objects to $($debtProbe.id) once both evidence fields are present, so the commit rule below is not the thing being tested."
+        Assert-Ledger ($null -ne (Get-AcceptanceCommitObjection -Finding $debtProbe -WindowEnd $windowEnd -RepoRoot $repoRoot)) `
+            "The open debt $($debtProbe.id) was accepted at the coverage window's start commit, before the defect existed, and the gate allowed it. Reachability alone only proves the commit exists somewhere earlier in the history."
     }
 
     # The two rules must be able to fail, and must fail in opposite directions. Feed each
@@ -1087,9 +1201,41 @@ if ($VerifyCommits) {
             }
         }
 
-        Assert-Ledger ($behind -le $staleAfter) `
-            "The coverage window ends $behind commit(s) behind HEAD, past its declared bound of $staleAfter; re-evaluate the ledger before merging further coordinator changes."
+        # Staleness is reported, not enforced, while the budget is not in force. Requiring a
+        # frozen historical snapshot to advance is self-contradictory: advancing the window
+        # moves the anchor every near miss is judged against, so it is the authoring of a new
+        # snapshot rather than an edit to this one. The bound is still validated as declared,
+        # so that it is already agreed when Gate 5 supplies an authoritative integration
+        # snapshot and the budget goes in force - at which point it becomes a hard failure.
+        $budgetInForce = $false
+        foreach ($prerequisite in @($ledger.decision.prerequisites)) {
+            if ([string]$prerequisite.id -eq 'escape-ledger' -and [bool]$prerequisite.inForce) { $budgetInForce = $true }
+        }
+        if ($budgetInForce) {
+            Assert-Ledger ($behind -le $staleAfter) `
+                "The coverage window ends $behind commit(s) behind HEAD, past its declared bound of $staleAfter; re-evaluate the ledger before merging further coordinator changes."
+        }
+        $script:CommitsBehindHead = $behind
     }
+}
+
+# Every shared validator's entry count is asserted against the production invocations the real
+# ledger requires plus the fixed number of control invocations. This is the check that survives
+# call-site deletion: removing a production Assert-Ledger leaves the rule body intact and every
+# control green, and does not move the check count, so nothing else in this gate notices. The
+# numbers are deliberately explicit - adding or removing a control has to be recorded here.
+$findingCount = @($incidents).Count + @($nearMisses).Count
+Assert-ValidatorInvoked -Name 'exposure' -Expected ($findingCount + 2) -Rule 'stage/exposure equivalence'
+Assert-ValidatorInvoked -Name 'category' -Expected (@($incidents).Count + 4) -Rule 'category anchor'
+Assert-ValidatorInvoked -Name 'exceptionSet' -Expected 2 -Rule 'exception set equality'
+Assert-ValidatorInvoked -Name 'exceptionEntry' -Expected (@($ledger.categoryAnchorExceptions).Count + 2) -Rule 'exception entry'
+if ($VerifyCommits) {
+    Assert-ValidatorInvoked -Name 'acceptance' -Expected ($findingCount + 5) -Rule 'acceptance evidence'
+    Assert-ValidatorInvoked -Name 'nearMissBaseline' -Expected (@($nearMisses).Count + 4) -Rule 'near-miss baseline'
+    Assert-ValidatorInvoked -Name 'acceptanceCommit' -Expected ($findingCount + 1) -Rule 'acceptance commit'
+}
+else {
+    Assert-ValidatorInvoked -Name 'acceptance' -Expected ($findingCount + 2) -Rule 'acceptance evidence'
 }
 
 $report = [ordered]@{
@@ -1112,6 +1258,7 @@ $report = [ordered]@{
     qualifyingCount = $measured.QualifyingCount
     triggered = $measured.Triggered
     commitsVerified = $commitsVerified
+    commitsBehindHead = $script:CommitsBehindHead
     checks = $script:Checks
     failed = $script:Failures.Count
 }
