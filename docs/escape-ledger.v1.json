@@ -99,8 +99,7 @@
         "ESC-0009",
         "ESC-0010",
         "ESC-0011",
-        "ESC-0012",
-        "ESC-0013"
+        "ESC-0012"
       ]
     }
   },
@@ -271,7 +270,6 @@
       "detectedOn": "2026-08-13",
       "coordinatorChangeOrdinal": 9
     },
-
     {
       "id": "ESC-0012",
       "title": "Latent protected-return wrapping sites present in current code",
@@ -338,19 +336,23 @@
           "assessment": "Deliberate hazards authored so the rule can be shown to fire. Excluded from the repository scan by name."
         }
       ]
-    },
+    }
+  ],
+  "nearMisses": [
     {
-      "id": "ESC-0013",
+      "id": "NM-0001",
       "title": "Verification tooling failed open: exemption holes, name-collision silencing, and container-for-leaf citation matching",
-      "category": "typeBinding",
+      "category": "verificationLogic",
       "executionStage": "deterministic",
+      "mergedBeforeDetection": false,
       "reachedShadowOrLive": false,
+      "whyNotAnEscape": "Introduced and detected inside the same unmerged change, so it never entered a merged coordinator change. The mechanism is verification logic - exit-shape inference, cross-file name resolution, and citation token selection - not runtime type binding. Counting it as a type-binding escape would bias the budget evidence toward the typed pivot without establishing that a typed host would have prevented it.",
       "status": "remediated",
       "summary": "Independent review of this prerequisite layer found three ways its own detectors reported green while not checking what they claimed. The protected-return exemption counted an unrecognised exit as nothing, so one protected exit silenced the assignment rules for a whole function even when another exit returned a multi-element pipeline or a cast to an enumerating collection type. Cross-file name resolution skipped the nesting fact along with the exemption, so a single unprotected same-named stub in a test file disabled the bare-collection-return rule on every production call site of that name and raised a false flattening finding there. And the inventory citation check accepted any path segment, so a citation pointing at the wrong file passed whenever that file mentioned the generic container name; five live citations were wrong under that rule. A detector that fails open is worse than no detector, because it is recorded as evidence.",
       "detector": "Independent review of the change, reproduced by fixtures in tools/testdata/boundary-hardening-analyzer.fixtures.ps1 and sabotage checks in tools/Test-ReviewerCollectionCardinality.ps1",
       "regressionGuard": "Two exemption-soundness fixtures (multi-element pipeline exit and enumerating-cast exit) and a cross-file gate that builds a producer, a consumer, and a same-named unprotected mock in a temporary tree and requires identical findings with and without the mock, all in tools/Test-PowerShellBoundaryHardening.ps1. Three citation sabotage checks pin container-is-not-leaf, short-leaf retention, and prose-suffix rejection; the five wrong citations are corrected and the unverifiable rows are published as citationsUnverified rather than counted as checked.",
-      "introducedCommit": "74e476a",
-      "remediatedCommit": "unreleased",
+      "introducedCommit": "fc11fae",
+      "remediatedCommit": "cc5983c",
       "siteCount": 3,
       "detectedOn": "2026-08-18",
       "coordinatorChangeOrdinal": 10,
@@ -369,6 +371,36 @@
           "location": "inventory citation field matching",
           "risk": "remediated",
           "assessment": "Any path segment satisfied the check, so the container name stood in for the leaf. Five citations named the wrong file and passed. The leaf is now required, both path notations are handled, no minimum token length is applied, and rows with no leaf are published as unverified."
+        }
+      ]
+    },
+    {
+      "id": "NM-0002",
+      "title": "Two of the new verification checks were unfalsifiable, and one asserted a property the analyzer deliberately does not hold",
+      "category": "verificationLogic",
+      "executionStage": "deterministic",
+      "mergedBeforeDetection": false,
+      "reachedShadowOrLive": false,
+      "whyNotAnEscape": "Introduced by the previous round of fixes in this same unmerged change and found by the next round of review before merge. Like NM-0001 the mechanism is verification logic, not runtime type binding, and counting it against the type-binding budget would bias the pivot decision with evidence about test authorship rather than about the language.",
+      "status": "remediated",
+      "summary": "The cross-file gate added for NM-0001 asserted that a same-named mock does not raise a flattening finding on a production call site, using an @()-preserved consumer. A preserved assignment can never draw that rule, so the assertion was structurally always true. Worse, the property it named is one the analyzer deliberately does not hold: on an unwrapped call site the conservative exemption withdraws and the finding does fire, which is the accepted imprecision behind two baseline entries. Separately, the two new coverage-clock sabotage checks set a value and then asserted it differed from a value it had been constructed to differ from, never re-running the derivation on the mutated copy, so neither exercised the detection it was written to guard.",
+      "detector": "Independent review of the change",
+      "regressionGuard": "The cross-file gate now asserts only the falsifiable property - identical bare-collection-return findings on the wrapped call site with and without the mock - and pins the conservative-exemption imprecision on a second unwrapped consumer as an expectation, so a future improvement is reported rather than passing silently. Reverting the exemption/nesting split makes the gate fail. The coverage-clock derivation is extracted into Measure-LedgerCoverageClock and the sabotage checks re-run that function on the mutated ledger, with a positive control asserting it agrees on the unmutated one.",
+      "introducedCommit": "cc5983c",
+      "remediatedCommit": "cc5983c",
+      "siteCount": 2,
+      "detectedOn": "2026-08-18",
+      "coordinatorChangeOrdinal": 10,
+      "sites": [
+        {
+          "location": "cross-file name-resolution gate, flattening-rule half",
+          "risk": "remediated",
+          "assessment": "Structurally always zero on an @()-preserved consumer, so the assertion could not fail. Replaced by a falsifiable identity assertion plus an explicit pin of the known imprecision on an unwrapped consumer."
+        },
+        {
+          "location": "coverage-window clock sabotage checks",
+          "risk": "remediated",
+          "assessment": "Tautologies of the form n+1 != n. The derivation is now a function that the sabotage checks re-invoke on the mutated ledger, with a positive control."
         }
       ]
     }

@@ -2,8 +2,14 @@
 
 Every escape in the type-binding category of the [escape ledger](escape-ledger.md) has the
 same shape: a collection with zero or one element crossed a boundary and arrived as
-something else. The corpus exists so that shape is exercised everywhere it can occur, rather
-than wherever somebody remembered to write a test.
+something else. The corpus exists so that shape is exercised for every inventoried row
+through the shared contract, rather than wherever somebody remembered to write a test. What
+it does *not* do is exercise the production writer, or prove the inventory complete; both
+limitations are stated plainly below and published in the matrix.
+
+
+> **Scope.** What this does *not* prove is stated in
+> [what the hardening layer does not prove](hardening-limitations.md).
 
 ## Inventory
 
@@ -115,7 +121,10 @@ code and assert that the detector fires. Eight target the analyzer rules `PSEN00
 asserts it fails closed.
 
 Sabotage answers the question a passing test suite cannot: *would this have caught the
-escape?* Each historical collapse in the ledger has a sabotage check that reproduces it.
+escape?* Each of the eight analyzer-detectable collapse shapes in the ledger has a sabotage
+check that reproduces it. `NM-0001` — the round where the detectors themselves failed open —
+is guarded by fixtures and cross-file tests in the boundary suite rather than by a sabotage
+check here.
 
 The claim is bounded: a sabotage check proves the detector recognises the escape *shape* as
 re-authored here, not that it would have fired on the exact historical source. Proving the

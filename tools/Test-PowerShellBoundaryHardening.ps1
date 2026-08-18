@@ -131,7 +131,16 @@ foreach ($case in $cases) {
 # silenced by an unrelated same-named definition elsewhere in the scan. A
 # one-line unprotected mock in a test file used to remove the name from the
 # nesting set entirely, which turned off the rule on every production call
-# site of that name and simultaneously raised a false PSEN009 there.
+# site of that name.
+#
+# The mock also makes PSEN009 fire on an *unwrapped* production call site,
+# because the exemption rule is deliberately conservative: a visible
+# unprotected definition withdraws the exemption. That is accepted
+# imprecision, not a regression, and it is the reason the two
+# Get-AgentCopilotArgs entries sit in the recorded baseline. This gate pins
+# it as observed behaviour rather than asserting it away — a wrapped call
+# site must stay clean either way, and the divergence must stay confined to
+# PSEN009 on the unwrapped site.
 $crossFileRoot = Join-Path ([IO.Path]::GetTempPath()) ("boundary-crossfile-" + [guid]::NewGuid().ToString('N').Substring(0, 12))
 $crossFileFailures = [System.Collections.Generic.List[string]]::new()
 try {
@@ -149,24 +158,48 @@ function Get-CrossFileArgs {
 $wrapped = @(Get-CrossFileArgs -Rows @(1, 2))
 $wrapped.Count
 '@, $encoding)
+    [IO.File]::WriteAllText((Join-Path $crossFileRoot 'consumer-unwrapped.ps1'), @'
+$cmdArgs = Get-CrossFileArgs -Rows @(1, 2)
+$cmdArgs[0]
+'@, $encoding)
 
     $mockPath = Join-Path $crossFileRoot 'mock.ps1'
-    $withoutMock = @(& $analyzer -Path $crossFileRoot -Recurse -RuleId $boundaryRules -OutputFormat Json | ConvertFrom-Json)
+    $withoutMock = @(& $analyzer -Path $crossFileRoot -Recurse -RuleId $boundaryRules -OutputFormat Json | Out-String | ConvertFrom-Json)
     [IO.File]::WriteAllText($mockPath, "function Get-CrossFileArgs { param([object[]]`$Rows = @()) return @(`$Rows) }`n", $encoding)
-    $withMock = @(& $analyzer -Path $crossFileRoot -Recurse -RuleId $boundaryRules -OutputFormat Json | ConvertFrom-Json)
+    $withMock = @(& $analyzer -Path $crossFileRoot -Recurse -RuleId $boundaryRules -OutputFormat Json | Out-String | ConvertFrom-Json)
+
+    function Measure-CrossFileRule {
+        param([object[]]$Findings, [string]$Leaf, [string]$RuleId)
+        return @($Findings | Where-Object { ([string]$_.File).EndsWith($Leaf) -and $_.RuleId -eq $RuleId }).Count
+    }
 
     foreach ($probe in @(
             @{ Label = 'without mock'; Findings = $withoutMock },
             @{ Label = 'with mock'; Findings = $withMock })) {
-        $consumerFindings = @($probe.Findings | Where-Object { ([string]$_.File).EndsWith('consumer.ps1') })
-        $nesting = @($consumerFindings | Where-Object { $_.RuleId -eq 'PSEN011' })
-        $flatten = @($consumerFindings | Where-Object { $_.RuleId -eq 'PSEN009' })
-        if ($nesting.Count -ne 1) {
-            [void]$crossFileFailures.Add("PSEN011 must fire once on the production call site $($probe.Label); got $($nesting.Count).")
+        # The actual regression guard: the mock must not change PSEN011 on the
+        # wrapped production call site. Reverting the $nesting/$exempt split makes
+        # this fail on the "with mock" probe. PSEN011 is a rule about @()-wrapped
+        # call sites, so it has nothing to say about the unwrapped consumer.
+        $nesting = Measure-CrossFileRule -Findings $probe.Findings -Leaf 'consumer.ps1' -RuleId 'PSEN011'
+        if ($nesting -ne 1) {
+            [void]$crossFileFailures.Add("PSEN011 must fire once on the wrapped production call site $($probe.Label); got $nesting.")
         }
-        if ($flatten.Count -ne 0) {
-            [void]$crossFileFailures.Add("PSEN009 must not fire on correct production code $($probe.Label); got $($flatten.Count).")
+        # A preserved assignment must never draw PSEN009, mock or no mock.
+        $wrappedFlatten = Measure-CrossFileRule -Findings $probe.Findings -Leaf 'consumer.ps1' -RuleId 'PSEN009'
+        if ($wrappedFlatten -ne 0) {
+            [void]$crossFileFailures.Add("PSEN009 must not fire on an @()-preserved call site $($probe.Label); got $wrappedFlatten.")
         }
+    }
+
+    # Pinned imprecision, stated as an expectation so a future improvement is
+    # reported here rather than passing silently.
+    $unwrappedWithout = Measure-CrossFileRule -Findings $withoutMock -Leaf 'consumer-unwrapped.ps1' -RuleId 'PSEN009'
+    $unwrappedWith = Measure-CrossFileRule -Findings $withMock -Leaf 'consumer-unwrapped.ps1' -RuleId 'PSEN009'
+    if ($unwrappedWithout -ne 0) {
+        [void]$crossFileFailures.Add("An unwrapped call site of an all-protected producer drew $unwrappedWithout PSEN009 finding(s) with no mock present; the exemption is not being granted.")
+    }
+    if ($unwrappedWith -ne 1) {
+        [void]$crossFileFailures.Add("The conservative-exemption imprecision changed: an unwrapped call site drew $unwrappedWith PSEN009 finding(s) with a same-named unprotected mock present, but this gate and docs/empty-null-static-analysis.md record exactly 1. Update both together.")
     }
 } finally {
     if (Test-Path -LiteralPath $crossFileRoot) { Remove-Item -LiteralPath $crossFileRoot -Recurse -Force }

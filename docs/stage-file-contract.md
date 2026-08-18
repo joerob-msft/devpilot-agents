@@ -15,10 +15,17 @@ back as part of the contract.
 > stages changes live coordinator behaviour and is deliberately out of scope for a
 > prerequisite change that runs no models.
 
+
+> **Scope.** What this does *not* prove is stated in
+> [what the hardening layer does not prove](hardening-limitations.md).
+
 ## The envelope
 
-Every stage artifact is a JSON object with a fixed shape, validated against
-[`reviewer.stage-envelope.v1.json`](../src/Agents/reviewer/schemas/reviewer.stage-envelope.v1.json):
+Every stage artifact is a JSON object with a fixed shape. The shape is documented by
+[`reviewer.stage-envelope.v1.json`](../src/Agents/reviewer/schemas/reviewer.stage-envelope.v1.json)
+and enforced at runtime by hand-coded checks in `StageContract.ps1` — PowerShell ships no
+JSON Schema validator, so the schema is a specification the checks are written against, not
+an artifact they execute:
 
 ```json
 {
@@ -42,8 +49,8 @@ A contract declares its kind, its current version, its collection fields, and an
 from older versions:
 
 ```powershell
-Register-ReviewerStageContract -Kind 'reviewer.specialist.plan' -Version 2 `
-    -CollectionFields @('captureTargets', 'evidenceFactIds', 'notes[].tags') `
+Register-ReviewerStageContract -Kind 'reviewer.specialist.plan' -ContractVersion 2 `
+    -CollectionFields @('captureTargets', 'evidenceFactIds', 'notes[*].tags') `
     -MapFields @('countsByPath') `
     -RequiredFields @('planId', 'captureTargets') `
     -Adapters @{ 1 = { param($payload) ... } }
@@ -77,8 +84,9 @@ already cross the boundary intact.
 
 `Write-ReviewerStageArtifact` takes a caller-specified path — never standard output — and:
 
-- normalizes every declared collection field, so a scalar, a null, or a missing field is
-  written as an array of the right cardinality;
+- normalizes every declared collection field that is *present*, so a scalar or a null is
+  written as an array of the right cardinality — a field the producer omitted is rejected,
+  not invented (see below);
 - serializes with an explicit depth and an explicit compact-or-indented form;
 - writes UTF-8 **without** a byte order mark, with `\n` line endings and exactly one
   trailing newline;

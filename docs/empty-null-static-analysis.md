@@ -4,6 +4,10 @@
 It began as three rules for empty-output hazards and now carries eleven, split into
 two families.
 
+
+> **Scope.** What this does *not* prove is stated in
+> [what the hardening layer does not prove](hardening-limitations.md).
+
 ## Empty-output hazards
 
 | Rule | Reports |
@@ -89,12 +93,23 @@ Two fixture corpora measure the analyzer, and both are blocking.
 `tools/Test-PowerShellEmptyNullHazardAnalyzer.ps1` scores 15 labeled fixtures for the
 empty-output family: 7 TP, 0 FP, 0 FN, 8 TN.
 
-`tools/Test-PowerShellBoundaryHardening.ps1` scores 25 labeled fixtures in
-`tools/testdata/boundary-hardening-analyzer.fixtures.ps1` for the boundary family: 13 TP,
+`tools/Test-PowerShellBoundaryHardening.ps1` scores 27 labeled fixtures in
+`tools/testdata/boundary-hardening-analyzer.fixtures.ps1` for the boundary family: 15 TP,
 0 FP, 0 FN, 12 TN. Every boundary rule has at least one positive fixture proving it detects
 its hazard and at least one negative fixture proving it ignores the corrected form. A rule
 that stops detecting its own hazard, or starts reporting its own counterexample, fails the
-check.
+check. A separate cross-file gate builds a producer, a consumer, and a same-named
+unprotected mock in a temporary tree and requires identical `PSEN011` findings with and
+without the mock, so a test-side stub cannot silence a rule on production code. Reverting
+the exemption/nesting split makes that gate fail.
+
+The same gate pins the one thing it cannot honestly assert away. Because the exemption rule
+is deliberately conservative, a visible unprotected definition withdraws the exemption, so
+an *unwrapped* call site of an otherwise-protected producer draws exactly one `PSEN009`
+finding once the mock is present — and zero without it. That is accepted imprecision, and
+it is the same mechanism as the two `Get-AgentCopilotArgs` entries in the baseline. The gate
+records the count as an expectation rather than asserting it is zero: if the analyzer ever
+becomes precise enough to drop it, the gate reports the change instead of passing silently.
 
 Three of those fixtures exist specifically to pin the exemption rules above: a helper that
 protects its return only on some paths must still be reported when its result is counted and

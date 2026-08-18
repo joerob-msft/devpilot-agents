@@ -222,27 +222,48 @@ Assert-Ledger ([int]$ledger.coverageWindow.coordinatorChangesObserved -ge 1) `
 # Both clocks the rolling window turns on used to be hand-authored, so the ledger could sit
 # frozen while real changes landed and every check still passed. They are derived here and
 # the published values only confirm the derivation.
-$derivedObserved = 0
-$derivedEvaluatedOn = ''
-foreach ($incident in $incidents) {
-    if ([int]$incident.coordinatorChangeOrdinal -gt $derivedObserved) { $derivedObserved = [int]$incident.coordinatorChangeOrdinal }
-    if ([string]$incident.detectedOn -gt $derivedEvaluatedOn) { $derivedEvaluatedOn = [string]$incident.detectedOn }
+function Measure-LedgerCoverageClock {
+    param([Parameter(Mandatory)][object]$Ledger)
+    $observed = 0
+    $evaluatedOn = ''
+    foreach ($incident in @($Ledger.incidents)) {
+        if ([int]$incident.coordinatorChangeOrdinal -gt $observed) { $observed = [int]$incident.coordinatorChangeOrdinal }
+        if ([string]$incident.detectedOn -gt $evaluatedOn) { $evaluatedOn = [string]$incident.detectedOn }
+    }
+    return [pscustomobject]@{
+        DerivedObserved       = $observed
+        DerivedEvaluatedOn    = $evaluatedOn
+        PublishedObserved     = [int]$Ledger.coverageWindow.coordinatorChangesObserved
+        PublishedEvaluatedOn  = [string]$Ledger.coverageWindow.evaluatedOn
+        ObservedAgrees        = ([int]$Ledger.coverageWindow.coordinatorChangesObserved -eq $observed)
+        EvaluatedOnAgrees     = ([string]$Ledger.coverageWindow.evaluatedOn -eq $evaluatedOn)
+    }
 }
-Assert-Ledger ([int]$ledger.coverageWindow.coordinatorChangesObserved -eq $derivedObserved) `
-    "The coverage window claims $($ledger.coverageWindow.coordinatorChangesObserved) coordinator change(s) but the incidents record $derivedObserved; the window is not being advanced with the ledger."
-Assert-Ledger ([string]$ledger.coverageWindow.evaluatedOn -eq $derivedEvaluatedOn) `
-    "The coverage window is evaluated on $($ledger.coverageWindow.evaluatedOn) but the newest incident was detected on $derivedEvaluatedOn; the evaluation date is not being advanced with the ledger."
+
+$clock = Measure-LedgerCoverageClock -Ledger $ledger
+$derivedObserved = $clock.DerivedObserved
+$derivedEvaluatedOn = $clock.DerivedEvaluatedOn
+Assert-Ledger ($clock.ObservedAgrees) `
+    "The coverage window claims $($clock.PublishedObserved) coordinator change(s) but the incidents record $derivedObserved; the window is not being advanced with the ledger."
+Assert-Ledger ($clock.EvaluatedOnAgrees) `
+    "The coverage window is evaluated on $($clock.PublishedEvaluatedOn) but the newest incident was detected on $derivedEvaluatedOn; the evaluation date is not being advanced with the ledger."
 
 # ...and the derivation has to be able to fail, or it is decoration. Freeze each clock on a
-# copy and require the mismatch to be visible.
+# copy and require the SAME derivation, re-run on the mutated ledger, to report disagreement.
+# Asserting only that the mutated value differs from the derived one would be a tautology:
+# it must be the comparison above that changes verdict.
 $frozenClock = Get-LedgerObject -Json $ledgerJson
 $frozenClock.coverageWindow.coordinatorChangesObserved = [int]$derivedObserved + 1
-Assert-Ledger ([int]$frozenClock.coverageWindow.coordinatorChangesObserved -ne $derivedObserved) `
+Assert-Ledger (-not (Measure-LedgerCoverageClock -Ledger $frozenClock).ObservedAgrees) `
     'A coordinator-change count that disagrees with the incidents was not distinguishable from the derived one.'
 $frozenDate = Get-LedgerObject -Json $ledgerJson
 $frozenDate.coverageWindow.evaluatedOn = '2000-01-01'
-Assert-Ledger ([string]$frozenDate.coverageWindow.evaluatedOn -ne $derivedEvaluatedOn) `
+Assert-Ledger (-not (Measure-LedgerCoverageClock -Ledger $frozenDate).EvaluatedOnAgrees) `
     'An evaluation date that disagrees with the newest incident was not distinguishable from the derived one.'
+# The negative controls must be genuinely negative: the same derivation on the unmutated
+# ledger has to agree, or the two checks above would pass on anything.
+Assert-Ledger ((Measure-LedgerCoverageClock -Ledger (Get-LedgerObject -Json $ledgerJson)).ObservedAgrees) `
+    'The coverage-clock derivation disagrees with the unmutated ledger, so its sabotage checks prove nothing.'
 
 # The window is only meaningful if it is computed. Every incident carries the date it was
 # detected and the coordinator change it was detected under, and the recorded in-window set
@@ -455,28 +476,40 @@ Assert-Ledger ($docText -match 'Gate 5') 'docs/escape-ledger.md does not record 
 # --- 10. Optional commit verification -----------------------------------------------------
 
 $commitsVerified = 0
-# A remediation that ships in the same change as its own ledger entry cannot cite a commit
-# hash, because that hash does not exist until the entry is committed. The sentinel makes
-# that state explicit and bounded rather than letting it hide as a missing property: only a
-# remediated incident may use it, and only one incident may be unreleased at a time, so it
-# cannot accumulate into a backlog of unverifiable claims.
-$unreleasedSentinel = 'unreleased'
-$unreleased = @($incidents | Where-Object {
-        $_.PSObject.Properties.Name -contains 'remediatedCommit' -and
-        [string]$_.remediatedCommit -eq $unreleasedSentinel
-    })
-Assert-Ledger ($unreleased.Count -le 1) `
-    "More than one incident cites the '$unreleasedSentinel' remediation sentinel: $(($unreleased.id) -join ', '). Replace the merged ones with their commit."
-foreach ($incident in $unreleased) {
-    Assert-Ledger ($incident.status -eq 'remediated') `
-        "Incident $($incident.id) cites the '$unreleasedSentinel' remediation sentinel but is not marked remediated."
+# A near miss was introduced and detected inside the same unmerged change, so it never
+# entered a merged coordinator change and is not an escape. Keeping the two collections
+# separate is load-bearing: the budget decision reads escape category totals, and a
+# self-referential pre-merge finding counted as a type-binding escape would bias that
+# evidence toward the very pivot it is supposed to inform.
+$nearMisses = @()
+if ($ledger.PSObject.Properties.Name -contains 'nearMisses') { $nearMisses = @($ledger.nearMisses) }
+$incidentIdSet = [System.Collections.Generic.HashSet[string]]::new([string[]]@($incidents | ForEach-Object { [string]$_.id }))
+$nearMissIndex = 0
+foreach ($nearMiss in $nearMisses) {
+    $nearMissIndex++
+    $expectedId = 'NM-{0:d4}' -f $nearMissIndex
+    Assert-Ledger ([string]$nearMiss.id -eq $expectedId) `
+        "Near miss $($nearMiss.id) is out of sequence; expected $expectedId at position $nearMissIndex."
+    Assert-Ledger (-not $incidentIdSet.Contains([string]$nearMiss.id)) `
+        "Near miss $($nearMiss.id) also appears in the incident list; a finding is one or the other."
+    Assert-Ledger ($false -eq $nearMiss.mergedBeforeDetection) `
+        "Near miss $($nearMiss.id) records mergedBeforeDetection true, which makes it an escape and not a near miss."
+    Assert-Ledger ($false -eq $nearMiss.reachedShadowOrLive) `
+        "Near miss $($nearMiss.id) reached shadow or live execution, which makes it an escape."
+    Assert-Ledger (-not [string]::IsNullOrWhiteSpace([string]$nearMiss.whyNotAnEscape)) `
+        "Near miss $($nearMiss.id) does not state why it is not an escape."
+    Assert-Ledger ($recordedInWindow -notcontains [string]$nearMiss.id) `
+        "Near miss $($nearMiss.id) is recorded in the budget window; near misses are not budget evidence."
+    if ($docText) {
+        Assert-Ledger ($docText -match [regex]::Escape([string]$nearMiss.id)) `
+            "docs/escape-ledger.md does not mention near miss $($nearMiss.id)."
+    }
 }
 if ($VerifyCommits) {
-    foreach ($incident in $incidents) {
+    foreach ($incident in (@($incidents) + @($nearMisses))) {
         foreach ($property in @('introducedCommit', 'remediatedCommit')) {
             if ($incident.PSObject.Properties.Name -notcontains $property) { continue }
             $sha = [string]$incident.$property
-            if ($sha -eq $unreleasedSentinel) { continue }
             & git -C $repoRoot cat-file -e "$sha^{commit}" 2>$null
             Assert-Ledger ($LASTEXITCODE -eq 0) "Incident $($incident.id) cites commit $sha, which is not in this repository's history."
             $commitsVerified++
@@ -502,9 +535,34 @@ if ($VerifyCommits) {
         # A rolling budget that is never re-evaluated is a running total. Once the head has
         # moved further than the declared bound, the ledger has to be brought forward before
         # anything else merges.
+        #
+        # The bound is not a free number. coordinatorChangesObserved is derived from incident
+        # ordinals, so a run of incident-free coordinator changes does not advance it - the
+        # clock can only lag, never race. Bounding that lag in commits requires knowing what a
+        # coordinator change costs in commits, which the window itself supplies: the commits
+        # it spans divided by the changes it observed. The declared bound must stay inside two
+        # coordinator changes at that observed rate, so the clock can never fall behind by a
+        # fifth of the ten-change budget window.
         $behind = [int]((& git -C $repoRoot rev-list --count "$endCommit..HEAD").Trim())
         $staleAfter = [int]$ledger.coverageWindow.staleAfterCommitsBehindHead
         Assert-Ledger ($staleAfter -ge 1) 'The coverage window declares no staleness bound, so it can never be forced forward.'
+
+        $startCommit = [string]$ledger.coverageWindow.startCommit
+        & git -C $repoRoot cat-file -e "$startCommit^{commit}" 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            $commitsVerified++
+            $windowCommits = [int]((& git -C $repoRoot rev-list --count "$startCommit..$endCommit").Trim())
+            $observedChanges = [int]$ledger.coverageWindow.coordinatorChangesObserved
+            if ($observedChanges -gt 0) {
+                $commitsPerChange = [math]::Floor($windowCommits / $observedChanges)
+                $maxStaleAfter = $commitsPerChange * 2
+                Assert-Ledger ($staleAfter -le $maxStaleAfter) `
+                    "The coverage window allows the clock to fall $staleAfter commit(s) behind HEAD, but $windowCommits commit(s) across $observedChanges coordinator change(s) put a change at about $commitsPerChange commit(s), so the bound may not exceed $maxStaleAfter."
+                Assert-Ledger ($staleAfter -ge $commitsPerChange) `
+                    "The coverage window's staleness bound of $staleAfter commit(s) is under one coordinator change (about $commitsPerChange commits), so it would demand re-evaluation mid-change."
+            }
+        }
+
         Assert-Ledger ($behind -le $staleAfter) `
             "The coverage window ends $behind commit(s) behind HEAD, past its declared bound of $staleAfter; re-evaluate the ledger before merging further coordinator changes."
     }
@@ -513,6 +571,7 @@ if ($VerifyCommits) {
 $report = [ordered]@{
     check = 'reviewer-escape-ledger'
     incidents = $incidents.Count
+    nearMisses = @($nearMisses).Count
     remediated = @($incidents | Where-Object { $_.status -eq 'remediated' }).Count
     openDebt = @($incidents | Where-Object { $_.status -eq 'openDebt' }).Count
     typeBinding = @($incidents | Where-Object { $_.category -eq 'typeBinding' }).Count

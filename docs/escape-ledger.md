@@ -4,6 +4,13 @@ An *escape* is a defect that got past review and into a merged coordinator chang
 ledger records every escape since Gate 0, classifies it, and states the budget whose breach
 makes the conditional typed control-plane pivot mandatory rather than optional.
 
+A defect that was introduced and caught inside the same unmerged change is a **near miss**,
+not an escape, and is recorded separately in `nearMisses`. That separation is load-bearing
+rather than tidy: the budget decision reads escape category totals, so folding a pre-merge
+finding into them would bias the evidence toward the very pivot the evidence is meant to
+decide. The gate enforces the split — a near miss must record `mergedBeforeDetection: false`,
+must say why it is not an escape, and must not appear in the budget window.
+
 The machine-readable ledger is [`escape-ledger.v1.json`](escape-ledger.v1.json), validated
 against
 [`reviewer.escape-ledger.v1.json`](../src/Agents/reviewer/schemas/reviewer.escape-ledger.v1.json)
@@ -11,10 +18,15 @@ by `tools/Test-EscapeLedger.ps1`. That check is not a schema check alone: it rec
 every published count from the incident list, re-evaluates the trigger, and proves with
 sabotaged copies of the ledger that a qualifying escape would actually fire it.
 
+
+> **Scope.** What this does *not* prove is stated in
+> [what the hardening layer does not prove](hardening-limitations.md).
+
 ## Why a ledger
 
-Each escape in this repository was fixed the day it was found, and each fix looked
-sufficient at the time. Read one at a time they are unrelated accidents. Read together they
+Each escape in this repository was fixed when it was found, with one exception recorded as
+open debt below, and each fix looked sufficient at the time. Read one at a time they are
+unrelated accidents. Read together they
 are a distribution, and the distribution is what decides whether the control plane should
 stay in a dynamically-typed shell language. A ledger is the only way to see the
 distribution, and a budget is the only way to make it produce a decision instead of a
@@ -63,9 +75,8 @@ identifiers, work-item numbers, programme code names, or addresses appear in the
 | `ESC-0010` | logic | deterministic | remediated | Second all-withheld aggregate crash in a sibling renderer |
 | `ESC-0011` | supervision | deterministic | remediated | Empty-aggregate guard accepted a same-block dominance loophole |
 | `ESC-0012` | typeBinding | deterministic | openDebt | Latent protected-return wrapping sites present in current code |
-| `ESC-0013` | typeBinding | deterministic | remediated | Verification tooling failed open: exemption holes, name-collision silencing, container-for-leaf citation matching |
 
-Seven of the thirteen are type-binding. None reached shadow or live execution, because no shadow
+Six of the twelve are type-binding. None reached shadow or live execution, because no shadow
 or live coordinator run has ever been performed. That is a statement about exposure, not
 about containment: the budget stands at zero because the denominator is zero, which is why
 the exposure obligation below exists.
@@ -84,32 +95,48 @@ of its call sites, and the rest are test-side assertions or deliberate analyzer 
 The remaining findings stay in `tools/testdata/powershell-boundary-baseline.v1.json`; the
 boundary gate blocks any new one.
 
-`ESC-0013` is the uncomfortable one, because the thing that failed was the verification
+## Near misses
+
+| ID | Category | Stage | Status | Summary |
+| --- | --- | --- | --- | --- |
+| `NM-0001` | verificationLogic | deterministic | remediated | Verification tooling failed open: exemption holes, name-collision silencing, container-for-leaf citation matching |
+| `NM-0002` | verificationLogic | deterministic | remediated | Two of the checks added to fix `NM-0001` were unfalsifiable, and one asserted a property the analyzer deliberately does not hold |
+
+`NM-0001` is the uncomfortable one, because the thing that failed was the verification
 itself. Independent review of this change found three ways its own detectors reported green
 while not checking what they claimed. The protected-return exemption counted an unrecognised
 exit as *nothing*, so one protected exit silenced the assignment rules for an entire function
 even when a sibling exit returned a multi-element pipeline or a cast to an enumerating
 collection type. Cross-file name resolution dropped the nesting fact along with the
 exemption, so a single unprotected one-line stub in a test file disabled `PSEN011` — the rule
-that found the three live defects above — on every production call site of that name, while
-raising a false flattening finding there. And the inventory citation check accepted any
+that found the three production defects above — on every production call site of that name,
+while raising a false flattening finding there. And the inventory citation check accepted any
 segment of a field path, so a citation pointing at the wrong file passed whenever that file
 mentioned the generic container name; five live citations were wrong under that rule and are
 corrected here.
 
-None of the three had reached execution, and only the third had produced a wrong recorded
-result. They are logged as a type-binding escape anyway, because a detector that fails open
-is worse than no detector: it is recorded as evidence, and the whole argument for deferring
-the typed control plane rests on evidence of this kind. Each is now pinned by a test that
-fails on the old behaviour — two exemption-soundness fixtures, a cross-file gate that builds
-a producer, a consumer, and a same-named mock and requires identical findings with and
-without the mock, and three citation sabotage checks.
+Each is now pinned by a test that fails on the old behaviour — two exemption-soundness
+fixtures, a cross-file gate that builds a producer, a consumer, and a same-named mock and
+requires identical findings with and without the mock, and three citation sabotage checks.
 
-> **Convention.** A remediation that ships in the same change as its own ledger entry cannot
-> cite a commit hash, so it records `remediatedCommit: "unreleased"`. The gate allows at most
-> one such incident at a time and requires it to be marked remediated, so the state is
-> bounded and visible rather than hidden as a missing field.
+`NM-0002` is the sequel, and it is the more useful of the two. The next review round found
+that two of the checks written to fix `NM-0001` could not fail. One asserted that a
+same-named mock does not raise a flattening finding on a production call site, using an
+`@()`-preserved consumer — a form that rule structurally never reports, so the assertion was
+always true. It also named a property the analyzer deliberately does not hold: on an
+*unwrapped* call site the conservative exemption withdraws and the finding does fire, which
+is the accepted imprecision behind two baseline entries. The other two were coverage-clock
+sabotage checks of the form "set *n*+1, assert *n*+1 ≠ *n*", which never re-ran the
+derivation they were guarding.
 
+The pattern across both is worth naming, because it is the argument for the ledger in
+miniature: a check that only ever runs against correct input records confidence rather than
+evidence. Both are fixed by making the negative control re-invoke the real derivation —
+reverting the exemption/nesting split now makes the cross-file gate fail, and the coverage
+clock is extracted into `Measure-LedgerCoverageClock`, which the sabotage checks call on the
+mutated ledger with a positive control on the unmutated one. The imprecision that could not
+honestly be asserted away is pinned as an expectation instead, so improving it reports here
+rather than passing silently.
 ## The budget
 
 > If **two or more type-binding escapes reach shadow or live execution** within **either the
