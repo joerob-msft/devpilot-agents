@@ -517,6 +517,88 @@ try {
     Assert-True -Name 'read/accepts-read-only-artifact' `
         -Condition (@($readOnlyRead.Payload.items).Count -eq 1) `
         -Detail 'a read-only contract artifact could not be read'
+
+    # -----------------------------------------------------------------------
+    # Member access must hand back the value itself
+    # -----------------------------------------------------------------------
+    # Write-Output -NoEnumerate wraps a scalar in a one-element list, which made
+    # every non-array member arrive as a container: a nested object stopped
+    # answering the has-member test, so a valid nested collection path was
+    # rejected as missing, and a bare scalar looked like an object to any shape
+    # check. These pin the accessor to the value's own identity.
+    Assert-True -Name 'member/returns-scalar-unwrapped' `
+        -Condition ((Get-ReviewerStageMember -Node ([ordered]@{ v = 'x' }) -Name 'v') -is [string]) `
+        -Detail 'a scalar member came back wrapped in a container'
+    Assert-True -Name 'member/returns-nested-object-unwrapped' `
+        -Condition ((Get-ReviewerStageMember -Node ([ordered]@{ v = [ordered]@{ k = 1 } }) -Name 'v') -is [System.Collections.IDictionary]) `
+        -Detail 'a nested dictionary member came back wrapped in a container'
+    Assert-True -Name 'member/keeps-empty-array-a-collection' `
+        -Condition ((Get-ReviewerStageMember -Node ([ordered]@{ v = @() }) -Name 'v') -is [System.Array]) `
+        -Detail 'an empty collection member did not survive as a collection'
+    Assert-True -Name 'shape/accepts-valid-nested-collection-path' `
+        -Condition ((Test-ReviewerStageCollectionShape -Payload ([ordered]@{ outer = [ordered]@{ inner = @('a') } }) -CollectionFields @('outer.inner')).Count -eq 0) `
+        -Detail 'a well-formed nested collection path was reported as a violation'
+    Assert-True -Name 'shape/names-the-real-collapsed-type' `
+        -Condition (((Test-ReviewerStageCollectionShape -Payload ([ordered]@{ v = 'x' }) -CollectionFields @('v')) -join ';') -like '*String*') `
+        -Detail 'a collapsed collection was reported as the wrong type'
+
+    # -----------------------------------------------------------------------
+    # Declared maps
+    # -----------------------------------------------------------------------
+    # A map is not a list and has no repair from an array or a scalar, so it is
+    # validated and never normalized.
+    Assert-True -Name 'map/accepts-keyed-object' `
+        -Condition ((Test-ReviewerStageMapShape -Payload ([ordered]@{ m = [ordered]@{ k = 'v' } }) -MapFields @('m')).Count -eq 0) `
+        -Detail 'a well-formed map was rejected'
+    Assert-True -Name 'map/accepts-empty-object' `
+        -Condition ((Test-ReviewerStageMapShape -Payload ([ordered]@{ m = [ordered]@{} }) -MapFields @('m')).Count -eq 0) `
+        -Detail 'an empty map was rejected'
+    Assert-True -Name 'map/rejects-array' `
+        -Condition (((Test-ReviewerStageMapShape -Payload ([ordered]@{ m = @('a') }) -MapFields @('m')) -join ';') -like '*array*') `
+        -Detail 'an array in a declared map field was accepted'
+    Assert-True -Name 'map/rejects-scalar' `
+        -Condition (((Test-ReviewerStageMapShape -Payload ([ordered]@{ m = 'a' }) -MapFields @('m')) -join ';') -like '*String*') `
+        -Detail 'a scalar in a declared map field was accepted'
+    Assert-True -Name 'map/rejects-null-and-missing-distinctly' `
+        -Condition ((((Test-ReviewerStageMapShape -Payload ([ordered]@{ m = $null }) -MapFields @('m')) -join ';') -like '*null*') -and
+        (((Test-ReviewerStageMapShape -Payload ([ordered]@{}) -MapFields @('m')) -join ';') -like '*missing*')) `
+        -Detail 'a null map and an absent map were not distinguished'
+
+    Register-ReviewerStageContract -Kind 'fixture.stage.map' -ContractVersion 1 `
+        -RequiredFields @('m') -MapFields @('m') | Out-Null
+    Assert-Throws -Name 'register/rejects-collection-and-map-conflict' `
+        -Action { Register-ReviewerStageContract -Kind 'fixture.stage.conflict' -ContractVersion 1 -RequiredFields @('m') -CollectionFields @('m') -MapFields @('m') } `
+        -Expect 'both a collection and a map'
+
+    $mapDir = Join-Path $root 'maps'
+    New-Item -ItemType Directory -Path $mapDir | Out-Null
+    $mapPath = Join-Path $mapDir 'map.json'
+    Write-ReviewerStageArtifact -Path $mapPath -Kind 'fixture.stage.map' -Depth 8 -Form compact `
+        -Payload ([ordered]@{ m = [ordered]@{ 'k-0' = 'v-0' } }) | Out-Null
+    $mapRead = Read-ReviewerStageArtifact -Path $mapPath -Kind 'fixture.stage.map'
+    Assert-True -Name 'map/round-trips-through-a-file' `
+        -Condition (@($mapRead.Payload.m.PSObject.Properties | ForEach-Object { $_.Name }).Count -eq 1) `
+        -Detail 'a declared map did not survive a write and read'
+    Assert-Throws -Name 'write/rejects-array-in-declared-map' `
+        -Action { Write-ReviewerStageArtifact -Path (Join-Path $mapDir 'bad.json') -Kind 'fixture.stage.map' -Depth 8 -Form compact -Payload ([ordered]@{ m = @('a') }) } `
+        -Expect 'unusable map field'
+    Assert-Throws -Name 'write/rejects-scalar-in-declared-map' `
+        -Action { Write-ReviewerStageArtifact -Path (Join-Path $mapDir 'bad2.json') -Kind 'fixture.stage.map' -Depth 8 -Form compact -Payload ([ordered]@{ m = 'a' }) } `
+        -Expect 'unusable map field'
+
+    $collapsedMapEnvelope = ConvertTo-Json -Depth 8 -Compress -InputObject ([ordered]@{
+            envelopeVersion = 1
+            kind = 'fixture.stage.map'
+            contractVersion = 1
+            form = 'compact'
+            depth = 8
+            payload = [ordered]@{ m = @('a') }
+        })
+    $collapsedMapPath = Join-Path $mapDir 'collapsed.json'
+    [IO.File]::WriteAllText($collapsedMapPath, $collapsedMapEnvelope + "`n", (New-Object Text.UTF8Encoding $false))
+    Assert-Throws -Name 'read/rejects-array-in-declared-map' `
+        -Action { Read-ReviewerStageArtifact -Path $collapsedMapPath -Kind 'fixture.stage.map' } `
+        -Expect 'lost map shape'
 }
 finally {
     Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |

@@ -87,6 +87,15 @@ Register-ReviewerStageContract `
     -RequiredFields @('id', 'values') `
     -CollectionFields @('values') | Out-Null
 
+# Map-valued rows are judged by the same shared contract as list-valued rows, but
+# against its map shape rather than its collection shape. Registering a second
+# probe kind is what lets the matrix claim both dimensions honestly.
+Register-ReviewerStageContract `
+    -Kind 'reviewer.cardinality.mapprobe' `
+    -ContractVersion 1 `
+    -RequiredFields @('id', 'values') `
+    -MapFields @('values') | Out-Null
+
 function New-VariantValue {
     <#
     .SYNOPSIS
@@ -199,6 +208,10 @@ function Test-MapVariant {
         not as [], a one-key map must not read back as its single value, and a scalar in a
         declared map field has no meaningful repair, so it must be refused rather than
         wrapped. Treating these rows as arrays would test none of that.
+
+        Every judgement here is delegated to Test-ReviewerStageMapShape in the shared
+        stage contract, so a map row exercises the same enforcement a list row does and
+        the coverage matrix is not claiming shared-contract coverage it never ran.
     #>
     param(
         [Parameter(Mandatory)][string]$RowId,
@@ -210,19 +223,24 @@ function Test-MapVariant {
 
     if ($Variant -eq 'wrongScalar') {
         # There is no repair for a scalar where a map was declared: a map has keys and a
-        # scalar has none, so wrapping it would invent one. The only correct answer is to
-        # refuse it, which is what a map-shaped consumer must do.
+        # scalar has none, so wrapping it would invent one. The contract must refuse it.
         $scalarPayload = [ordered]@{ id = $RowId; values = $rawValue }
-        $json = ConvertTo-Json -InputObject $scalarPayload -Depth 12 -Compress
-        $restored = ($json | ConvertFrom-Json -Depth 12).values
-        if ($restored -isnot [string]) {
-            throw 'a scalar in a declared map field did not read back as a scalar, so a consumer cannot detect the collapse'
+        $scalarViolations = Test-ReviewerStageMapShape -Payload $scalarPayload -MapFields @('values')
+        if ($scalarViolations.Count -eq 0) {
+            throw 'a bare scalar in a declared map field was not refused by the contract'
+        }
+        # And it must still be refused after the artifact has been through JSON, because
+        # that is the form a consuming stage actually receives.
+        $restored = (ConvertTo-Json -InputObject $scalarPayload -Depth 12 -Compress | ConvertFrom-Json -Depth 12)
+        if ((Test-ReviewerStageMapShape -Payload $restored -MapFields @('values')).Count -eq 0) {
+            throw 'a scalar map field read back as an acceptable map after a JSON round trip'
         }
         return
     }
 
     if ($Variant -eq 'nullVsMissing') {
-        $nullJson = ConvertTo-Json -InputObject ([ordered]@{ id = $RowId; values = $rawValue }) -Depth 12 -Compress
+        $nullPayload = [ordered]@{ id = $RowId; values = $rawValue }
+        $nullJson = ConvertTo-Json -InputObject $nullPayload -Depth 12 -Compress
         if (-not $nullJson.Contains('"values":null')) {
             throw 'a null map field did not serialize as null, so null and empty are no longer distinguishable'
         }
@@ -237,10 +255,25 @@ function Test-MapVariant {
         if (-not $nullPresent -or $missingPresent) {
             throw 'null and missing map fields became indistinguishable after a round trip'
         }
+        # The contract has to separate the two verdicts rather than reporting one shape
+        # for both, or a consumer cannot tell an omitted map from an emptied one.
+        $nullViolations = Test-ReviewerStageMapShape -Payload $restoredNull -MapFields @('values')
+        $missingViolations = Test-ReviewerStageMapShape -Payload $restoredMissing -MapFields @('values')
+        if ($nullViolations.Count -eq 0 -or $missingViolations.Count -eq 0) {
+            throw 'the contract accepted a null or absent map field'
+        }
+        if (-not ("$nullViolations" -like '*null*') -or -not ("$missingViolations" -like '*missing*')) {
+            throw 'the contract reported the same verdict for a null map and an absent map'
+        }
         return
     }
 
     $payload = [ordered]@{ id = $RowId; values = $rawValue }
+    $preViolations = Test-ReviewerStageMapShape -Payload $payload -MapFields @('values')
+    if ($preViolations.Count -ne 0) {
+        throw "the contract rejected a well-formed map: $($preViolations -join '; ')"
+    }
+
     $json = ConvertTo-Json -InputObject $payload -Depth 12 -Compress
     if ($Variant -eq 'zero' -and -not $json.Contains('"values":{}')) {
         throw 'an empty map did not serialize as {}'
@@ -249,10 +282,14 @@ function Test-MapVariant {
         throw 'a map field serialized as an array, which is the collapse this row exists to catch'
     }
 
-    $restored = ($json | ConvertFrom-Json -Depth 12).values
-    if ($restored -isnot [psobject]) {
-        throw "a map field read back as $($restored.GetType().Name) instead of an object"
+    $restoredPayload = ($json | ConvertFrom-Json -Depth 12)
+    $postViolations = Test-ReviewerStageMapShape -Payload $restoredPayload -MapFields @('values')
+    if ($postViolations.Count -ne 0) {
+        throw "the map lost its shape across a JSON round trip: $($postViolations -join '; ')"
     }
+    Test-ReviewerStagePayloadField -Payload $restoredPayload -Contract (Get-ReviewerStageContract -Kind 'reviewer.cardinality.mapprobe')
+
+    $restored = $restoredPayload.values
     # Member enumeration over an empty property collection throws under Set-StrictMode,
     # which is the same empty-collection hazard this corpus exists to catch. Project the
     # names explicitly instead.
@@ -355,15 +392,39 @@ if ($variantFailures.Count -gt 0) {
 }
 
 # The map path must reject the array collapse it exists to catch, or its passes mean
-# nothing. Feed it the wrong container and require a failure.
+# nothing. Feed the shared contract the wrong container and require it to refuse.
 $mapSabotageFired = $false
 try {
-    $sabotageJson = ConvertTo-Json -InputObject ([ordered]@{ id = 'x'; values = @('element-0') }) -Depth 12 -Compress
-    if ($sabotageJson.Contains('"values":[')) { $mapSabotageFired = $true }
+    $sabotaged = ([ordered]@{ id = 'x'; values = @('element-0') } |
+            ConvertTo-Json -Depth 12 -Compress | ConvertFrom-Json -Depth 12)
+    $mapSabotageFired = ((Test-ReviewerStageMapShape -Payload $sabotaged -MapFields @('values')).Count -gt 0)
 }
 catch { $mapSabotageFired = $false }
 [void](Assert-True -Name 'map-variant/sabotage-array-collapse' -Condition $mapSabotageFired `
-        -Detail 'a map field carrying an array was not recognisable as an array, so the map assertions cannot detect the collapse')
+        -Detail 'the stage contract accepted an array in a declared map field, so no map row can detect that collapse')
+
+# ...and it must not reject a well-formed map, or the previous check would pass for the
+# trivial reason that the validator refuses everything.
+$mapAcceptsGoodShape = $false
+try {
+    $wellFormed = ([ordered]@{ id = 'x'; values = [ordered]@{ 'key-0' = 'element-0' } } |
+            ConvertTo-Json -Depth 12 -Compress | ConvertFrom-Json -Depth 12)
+    $mapAcceptsGoodShape = ((Test-ReviewerStageMapShape -Payload $wellFormed -MapFields @('values')).Count -eq 0)
+}
+catch { $mapAcceptsGoodShape = $false }
+[void](Assert-True -Name 'map-variant/accepts-well-formed-map' -Condition $mapAcceptsGoodShape `
+        -Detail 'the stage contract refused a well-formed map, so its refusals carry no information')
+
+# A field cannot be both a list and a map: the two normalizations contradict each other.
+$mapShapeConflictRejected = $false
+try {
+    Register-ReviewerStageContract -Kind 'reviewer.cardinality.conflict' -ContractVersion 1 `
+        -RequiredFields @('values') -CollectionFields @('values') -MapFields @('values') | Out-Null
+}
+catch { $mapShapeConflictRejected = $true }
+[void](Assert-True -Name 'map-variant/rejects-list-and-map-conflict' -Condition $mapShapeConflictRejected `
+        -Detail 'a field declared as both a collection and a map was registered, so one normalization silently wins')
+
 $mapRowCount = @($inventoryFields | Where-Object { [string]$_.kind -eq 'jsonObjectMap' }).Count
 [void](Assert-True -Name 'map-variant/rows-exist' -Condition ($mapRowCount -gt 0) `
         -Detail 'no inventoried field is a map, so the map path ran on nothing')
@@ -741,7 +802,7 @@ finally {
 }
 
 # ---------------------------------------------------------------------------
-# Inventory rot: every cited source file must exist and mention the field
+# Citation liveness: every cited source file must exist and mention the field
 # ---------------------------------------------------------------------------
 
 $script:SourceTextCache = @{}
@@ -766,7 +827,7 @@ function Resolve-CitedPath {
     }
     # Inventory rows cite files by whatever suffix identified them unambiguously at the
     # time, from a bare name to a full repository path. A suffix that now matches nothing,
-    # or matches several files, is exactly the rot this check exists to surface.
+    # or matches several files, is exactly the drift this check exists to surface.
     $suffix = '/' + $normalized
     $matches = [System.Collections.Generic.List[string]]::new()
     foreach ($candidate in $script:RepoFileIndex) {
@@ -809,23 +870,45 @@ function Get-CitedFileToken {
     Write-Output -NoEnumerate $tokens.ToArray()
 }
 
-function Get-FieldTokens {
+function Get-FieldLeafToken {
+    <#
+        The token that must be present is the *leaf* of the JSON path, not any segment of
+        it. Accepting any segment made the check vacuous for nested paths: a citation of
+        the wrong file passes whenever that file happens to mention the generic container
+        name, so renaming or misciting the leaf - the thing the row is actually about -
+        stayed invisible. Returns $null when the row has no JSON path to take a leaf from;
+        those rows are reported as unverified rather than counted as checked.
+    #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Field)
+    param([AllowNull()][string]$Field)
 
-    $tokens = [System.Collections.Generic.List[string]]::new()
-    foreach ($segment in ($Field -split '[^A-Za-z0-9_]')) {
-        $trimmed = ([string]$segment).Trim()
-        if ($trimmed.Length -lt 4) { continue }
-        if ($trimmed -in @('string', 'return', 'ToArray', 'HashSet', 'List')) { continue }
-        if ($trimmed -match '^[A-Za-z_][A-Za-z0-9_]*$' -and -not $tokens.Contains($trimmed)) {
-            [void]$tokens.Add($trimmed)
-        }
+    if ([string]::IsNullOrWhiteSpace($Field)) { return $null }
+    # Two path notations are in use: JSONPath ("$.a.b[*].c") for stage payloads and JSON
+    # pointer ("/a/b[*]/c") for schema-anchored rows. Both have a leaf. A bare "$name" is
+    # a producer-local PowerShell variable, which the consuming file knows by its own
+    # parameter name, so it has no leaf to require.
+    $isJsonPath = $Field.StartsWith('$.', [System.StringComparison]::Ordinal)
+    $isPointer = $Field.StartsWith('/', [System.StringComparison]::Ordinal)
+    if (-not ($isJsonPath -or $isPointer)) { return $null }
+    # Some rows carry a prose qualifier after the path ("$.[] (root is JSON array)").
+    # Only the path itself names a field.
+    $path = $Field
+    foreach ($terminator in @(' ', '(')) {
+        $cut = $path.IndexOf($terminator, [System.StringComparison]::Ordinal)
+        if ($cut -ge 0) { $path = $path.Substring(0, $cut) }
     }
-    Write-Output -NoEnumerate $tokens.ToArray()
+    if ($isJsonPath) { $path = $path.Substring(2) }
+    $path = [regex]::Replace($path, '\[[^\]]*\]', '')
+    $segments = @($path -split '[./]' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($segments.Count -eq 0) { return $null }
+    $leaf = ([string]$segments[-1]).Trim()
+    if ($leaf -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { return $null }
+    return $leaf
 }
 
 $rotChecked = 0
+$rotTokenVerified = 0
+$rotUnverified = [System.Collections.Generic.List[string]]::new()
 $rotMissingFile = [System.Collections.Generic.List[string]]::new()
 $rotAmbiguous = [System.Collections.Generic.List[string]]::new()
 $rotMissingToken = [System.Collections.Generic.List[string]]::new()
@@ -833,7 +916,7 @@ $rotMissingToken = [System.Collections.Generic.List[string]]::new()
 foreach ($row in $inventoryFields) {
     $rowId = [string]$row.id
     $fieldName = [string]$row.field
-    $tokens = Get-FieldTokens -Field $fieldName
+    $leaf = Get-FieldLeafToken -Field $fieldName
     foreach ($citationName in @('producer', 'consumer')) {
         $citation = [string]$row.$citationName
         foreach ($cited in (Get-CitedFileToken -Citation $citation)) {
@@ -847,43 +930,59 @@ foreach ($row in $inventoryFields) {
                 [void]$rotAmbiguous.Add("$rowId :: $citationName :: $cited :: $resolved")
                 continue
             }
-            if ($tokens.Count -eq 0) { continue }
-            # A field named for a producer-local PowerShell variable has no meaning in the
-            # consuming file, which knows it by its own parameter name. Those rows get the
-            # file-existence check only.
-            if ($fieldName.StartsWith('$', [System.StringComparison]::Ordinal) -and -not $fieldName.StartsWith('$.', [System.StringComparison]::Ordinal)) { continue }
+            # A field named for a producer-local PowerShell variable, or a whole-document
+            # row with no leaf, has no name to look for in the cited file. Those rows get
+            # the file-existence check only, and are published as unverified rather than
+            # folded into the token-verified count.
+            if ($null -eq $leaf) {
+                [void]$rotUnverified.Add("$rowId :: $citationName :: $resolved :: no leaf token in '$fieldName'")
+                continue
+            }
             $text = Get-CitedSourceText -RelativePath $resolved
-            $found = $false
-            foreach ($token in $tokens) {
-                # Case-insensitive: PowerShell reaches JSON fields through case-insensitive
-                # property access, so `ResidualRisks` referring to `residualRisks` is the
-                # normal spelling in the cited code, not rot.
-                if ($text.IndexOf($token, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $found = $true; break }
+            # Case-insensitive: PowerShell reaches JSON fields through case-insensitive
+            # property access, so `ResidualRisks` referring to `residualRisks` is the
+            # normal spelling in the cited code, not rot.
+            if ($text.IndexOf($leaf, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
+                [void]$rotMissingToken.Add("$rowId :: $citationName :: $resolved :: leaf '$leaf' absent")
+                continue
             }
-            if (-not $found) {
-                [void]$rotMissingToken.Add("$rowId :: $citationName :: $resolved :: none of [$($tokens -join ', ')]")
-            }
+            $rotTokenVerified++
         }
     }
 }
 
-[void](Assert-True -Name 'inventory-rot/citations-resolved' -Condition ($rotChecked -ge 300) -Detail "the rot detector resolved only $rotChecked citations, which is too few to prove anything")
-[void](Assert-True -Name 'inventory-rot/files-exist' -Condition ($rotMissingFile.Count -eq 0) -Detail "inventory cites files that no longer exist: $($rotMissingFile -join '; ')")
-[void](Assert-True -Name 'inventory-rot/files-unambiguous' -Condition ($rotAmbiguous.Count -eq 0) -Detail "inventory cites file names that now match more than one file: $($rotAmbiguous -join '; ')")
-[void](Assert-True -Name 'inventory-rot/fields-mentioned' -Condition ($rotMissingToken.Count -eq 0) -Detail "inventory cites files that no longer mention the field: $($rotMissingToken -join '; ')")
+[void](Assert-True -Name 'citation-liveness/citations-resolved' -Condition ($rotChecked -ge 300) -Detail "the citation-liveness check resolved only $rotChecked citations, which is too few to prove anything")
+[void](Assert-True -Name 'citation-liveness/leaf-tokens-verified' -Condition ($rotTokenVerified -ge 250) -Detail "only $rotTokenVerified citations were leaf-token verified, which is too few to prove anything")
+[void](Assert-True -Name 'citation-liveness/files-exist' -Condition ($rotMissingFile.Count -eq 0) -Detail "inventory cites files that no longer exist: $($rotMissingFile -join '; ')")
+[void](Assert-True -Name 'citation-liveness/files-unambiguous' -Condition ($rotAmbiguous.Count -eq 0) -Detail "inventory cites file names that now match more than one file: $($rotAmbiguous -join '; ')")
+[void](Assert-True -Name 'citation-liveness/fields-mentioned' -Condition ($rotMissingToken.Count -eq 0) -Detail "inventory cites files that do not mention the field's leaf name: $($rotMissingToken -join '; ')")
 
 # A detector that reports nothing is indistinguishable from one that is broken, so prove
 # each half fires on a citation that is deliberately wrong.
-[void](Assert-True -Name 'inventory-rot/sabotage-missing-file' `
+[void](Assert-True -Name 'citation-liveness/sabotage-missing-file' `
         -Condition ($null -eq (Resolve-CitedPath -Citation 'src/Agents/reviewer/ThisFileWasDeleted.ps1')) `
         -Detail 'a citation of a nonexistent file resolved anyway')
-[void](Assert-True -Name 'inventory-rot/sabotage-real-file' `
+[void](Assert-True -Name 'citation-liveness/sabotage-real-file' `
         -Condition ('src/Agents/reviewer/StageContract.ps1' -eq (Resolve-CitedPath -Citation 'StageContract.ps1')) `
         -Detail 'a bare file name that exists exactly once failed to resolve')
-$sabotageTokens = Get-FieldTokens -Field '$.thisFieldNameWasRenamedAway'
-[void](Assert-True -Name 'inventory-rot/sabotage-missing-token' `
-        -Condition ($sabotageTokens.Count -eq 1 -and (Get-CitedSourceText -RelativePath 'src/Agents/reviewer/StageContract.ps1').IndexOf($sabotageTokens[0], [System.StringComparison]::OrdinalIgnoreCase) -lt 0) `
+$sabotageLeaf = Get-FieldLeafToken -Field '$.thisFieldNameWasRenamedAway'
+[void](Assert-True -Name 'citation-liveness/sabotage-missing-token' `
+        -Condition ($sabotageLeaf -eq 'thisFieldNameWasRenamedAway' -and (Get-CitedSourceText -RelativePath 'src/Agents/reviewer/StageContract.ps1').IndexOf($sabotageLeaf, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) `
         -Detail 'a field name that appears nowhere was reported as mentioned')
+# The container segment must not stand in for the leaf. This is the hole that let five
+# wrong citations pass: `contractVersion` exists in StageContract.ps1, so a nested path
+# under it used to verify no matter what the leaf was called.
+[void](Assert-True -Name 'citation-liveness/sabotage-container-not-leaf' `
+        -Condition ((Get-FieldLeafToken -Field '$.contractVersion.thisLeafDoesNotExist') -eq 'thisLeafDoesNotExist') `
+        -Detail 'a nested path yielded a container segment instead of its leaf')
+# Short leaf names are exactly the ones a length filter drops, and they are common.
+[void](Assert-True -Name 'citation-liveness/sabotage-short-leaf' `
+        -Condition ((Get-FieldLeafToken -Field '$.evidence[*].ids') -eq 'ids') `
+        -Detail 'a short leaf name was dropped instead of required')
+# A row with prose after the path must not require the prose word.
+[void](Assert-True -Name 'citation-liveness/sabotage-prose-suffix' `
+        -Condition ($null -eq (Get-FieldLeafToken -Field '$.[] (root is JSON array)')) `
+        -Detail 'a prose qualifier was mistaken for a field name')
 
 # ---------------------------------------------------------------------------
 # Coverage matrix, derived from what actually ran
@@ -893,6 +992,8 @@ $matrixFields = [System.Collections.Generic.List[object]]::new()
 $boundaryCovered = 0
 $boundaryGaps = 0
 $producerGaps = 0
+$mapCellCount = 0
+$listCellCount = 0
 $producerCoverage = [ordered]@{}
 foreach ($variant in $variants) { $producerCoverage[$variant] = 'gap' }
 
@@ -900,10 +1001,15 @@ foreach ($row in ($inventoryFields | Sort-Object { [string]$_.id })) {
     $rowId = [string]$row.id
     $observed = $variantResults[$rowId]
     $boundary = [ordered]@{}
+    # Which validator actually judged this row. A map row is judged by the map
+    # shape check and never by the list normalizer, so recording one name for
+    # both would overstate what the list path covers.
+    $validator = if ([string]$row.kind -eq 'jsonObjectMap') { 'mapShape' } else { 'collectionShape' }
     foreach ($variant in $variants) {
         $status = [string]$observed[$variant]
         $boundary[$variant] = $status
         if ($status -eq 'covered') { $boundaryCovered++ } else { $boundaryGaps++ }
+        if ($validator -eq 'mapShape') { $mapCellCount++ } else { $listCellCount++ }
         $producerGaps++
     }
     [void]$matrixFields.Add([ordered]@{
@@ -913,6 +1019,7 @@ foreach ($row in ($inventoryFields | Sort-Object { [string]$_.id })) {
             field = [string]$row.field
             kind = [string]$row.kind
             knownEscapeShape = [bool]$row.knownEscapeShape
+            boundaryValidator = $validator
             boundaryNormalizer = $boundary
             producerPath = $producerCoverage
         })
@@ -934,7 +1041,7 @@ $matrix = [ordered]@{
     description = 'Coverage of the required cardinality variants for every inventoried collection field. Derived from the run that produced it, not asserted by hand.'
     variants = $variants
     coverageDimensions = [ordered]@{
-        boundaryNormalizer = 'The field is driven through the shared stage-contract normalizer, shape validator, and a JSON round trip at this cardinality.'
+        boundaryNormalizer = 'The field is driven through the shared stage contract at this cardinality and judged by the validator named in boundaryValidator: collectionShape rows go through the list normalizer, shape validator, and a JSON round trip; mapShape rows go through the map shape validator and a JSON round trip and are never normalized, because there is no correct rewrite from an array or a scalar to a keyed object.'
         producerPath = 'The real producing and consuming stage code is driven at this cardinality. Not attempted in this layer: the corpus is deliberately employer-neutral and runs no stage.'
     }
     fullCoverageClaimed = $false
@@ -945,12 +1052,16 @@ $matrix = [ordered]@{
         cellsPerDimension = ($matrixFields.Count * $variants.Count)
         boundaryNormalizerCovered = $boundaryCovered
         boundaryNormalizerGaps = $boundaryGaps
+        collectionShapeCells = $listCellCount
+        mapShapeCells = $mapCellCount
         producerPathCovered = 0
         producerPathGaps = $producerGaps
         knownEscapeShapeFields = @($inventoryFields | Where-Object { [bool]$_.knownEscapeShape }).Count
         escapeShapeProperties = $escapeShapes.Count
         sabotageChecks = $sabotageResults.Count
         citationsChecked = $rotChecked
+        citationsLeafVerified = $rotTokenVerified
+        citationsUnverified = $rotUnverified.Count
         byStage = $byStage
         byKind = $byKind
     }
@@ -996,6 +1107,8 @@ $report = [ordered]@{
     escapeShapes = $escapeShapes.Count
     sabotageChecks = $sabotageResults.Count
     citationsChecked = $rotChecked
+        citationsLeafVerified = $rotTokenVerified
+        citationsUnverified = $rotUnverified.Count
     failed = $script:Failures.Count
 }
 if (-not $Quiet) {

@@ -7,9 +7,9 @@ than wherever somebody remembered to write a test.
 
 ## Inventory
 
-`tools/testdata/reviewer-collection-inventory.v1.json` inventories every collection-bearing
-field in the reviewer's stage contracts — **236 fields across twelve stages**, in pipeline
-order:
+`tools/testdata/reviewer-collection-inventory.v1.json` is a hand-curated inventory of the
+collection-bearing fields in the reviewer's stage contracts — **236 fields across twelve
+stages**, in pipeline order:
 
 | Stage | Fields | | Stage | Fields |
 |---|---:|---|---|---:|
@@ -31,6 +31,11 @@ source readers.
 Field kinds distinguish what can go wrong. A `jsonArray` collapses on serialization; a
 `hashSet` collapses on return; a `psCollectionReturn` collapses on assignment. The variant
 generator produces a different hazardous value for each.
+
+The inventory was built by reading the pipeline stage by stage, so its **completeness is
+unverified**: nothing in this repository proves that a collection-bearing field cannot exist
+without a row here. The [citation liveness](#citation-liveness) check keeps the rows that do
+exist honest; it cannot vouch for the ones that were never written.
 
 ## Variants
 
@@ -80,9 +85,11 @@ has keys and a scalar has none, so the only correct answer is to refuse it. The 
 variant for a map is duplicate *values* under distinct keys, since a map cannot carry a
 duplicate key at all.
 
-Those rows run through a separate map path with those assertions instead of the array
-harness. Driving them as arrays would have reported seven covered variants each while
-testing none of the failures that actually apply to them.
+Those rows are judged by the stage contract's map validator rather than its list normalizer,
+and the matrix records which validator ran per row in `boundaryValidator`. A map is validated
+and never repaired: there is no correct rewrite from an array or a scalar to a keyed object.
+Driving them as arrays would have reported seven covered variants each while testing none of
+the failures that actually apply to them.
 
 ## Escape-shape properties
 
@@ -115,23 +122,48 @@ re-authored here, not that it would have fired on the exact historical source. P
 stronger claim means running the analyzer against the pre-fix snapshots themselves, which
 is left as a follow-up rather than asserted here.
 
-## Inventory rot
+## Citation liveness
 
 An inventory is only useful while its citations are true. Every row names a producer and a
 consumer, and the check resolves each cited file against the repository and confirms the
-file still mentions the field. 416 citations are checked. A row that cites a deleted file,
-a bare file name that now matches more than one file, or a file that no longer mentions the
-field fails the build.
+file still mentions the field. 419 citations are checked, of which 258 are leaf-verified. A
+row that cites a deleted file, a bare file name that now matches more than one file, or a
+file that no longer mentions the field fails the build.
+
+The token that must be present is the **leaf** of the path, not any segment of it — the last
+segment of `$.selectedPacks[*].matchedPaths` is `matchedPaths`, not `selectedPacks`.
+Accepting any segment made the check vacuous for nested paths: a citation pointing at the
+wrong file passes whenever that file happens to mention the generic container name, so a
+renamed or miscited leaf — the thing the row is actually about — stayed invisible. Five live
+citations were wrong under the weaker rule and are corrected here; a sabotage check pins the
+container-is-not-the-leaf distinction so the hole cannot reopen. Both path notations in use
+are handled, JSONPath (`$.a.b[*].c`) and JSON pointer (`/a/b[*]/c`), and no minimum token
+length is applied, because short leaf names like `ids` and `sha` are exactly the ones a
+length filter would silently drop.
 
 Two exemptions are deliberate and narrow. A quoted literal inside a citation is data the
 cited code contains, not a second citation. And a row whose field is a producer-local
-PowerShell variable rather than a serialized field gets the file-existence check only,
-because the consuming file knows that value by its own parameter name.
+PowerShell variable rather than a serialized field has no leaf to require — the consuming
+file knows that value by its own parameter name — so it gets the file-existence check only.
+Those 161 rows are published as `citationsUnverified` rather than folded into the verified
+count, because a check that silently skips is a check that overstates itself.
 
-The detector has its own sabotage checks: a citation of a nonexistent file must fail to
-resolve, a bare name that exists exactly once must resolve, and a field name that appears
-nowhere must be reported as absent. A rot detector that reports nothing is otherwise
+The check has its own sabotage checks: a citation of a nonexistent file must fail to
+resolve, a bare name that exists exactly once must resolve, a field name that appears
+nowhere must be reported as absent, a nested path must yield its leaf and not its container,
+a short leaf must be required rather than dropped, and a prose qualifier after a path must
+not be mistaken for a field name. A liveness check that reports nothing is otherwise
 indistinguishable from one that is broken.
+
+**What this does not do.** It is a liveness check on existing rows, not a completeness
+check on the inventory. It cannot see a newly added collection field that was never
+inventoried, it does not verify that the cited file still *owns* the field rather than
+merely mentioning it, and it does not detect a row whose `kind` has drifted. A token match
+is a weak witness on purpose: it is case-insensitive, because PowerShell property access is,
+and it accepts the leaf anywhere in the file. The inventory therefore remains
+hand-curated and its completeness is unverified. Establishing completeness would require
+generating rows from schema and contract registrations, or a two-way scan that fails on a
+collection declaration with no inventory row; neither is attempted here.
 
 ## Coverage matrix, and what it does not claim
 
@@ -147,13 +179,22 @@ The matrix records **two coverage dimensions that are never merged**:
 
 | Dimension | Covered | Gaps | Meaning |
 |---|---:|---:|---|
-| `boundaryNormalizer` | 1652 | 0 | The variant was written, serialized, read back, and counted through the shared contract |
+| `boundaryNormalizer` | 1652 | 0 | The variant was written, serialized, read back, and counted through the shared contract — by the list validator for `collectionShape` rows and by the map validator for `mapShape` rows, as recorded per row in `boundaryValidator` |
 | `producerPath` | 0 | 1652 | The variant was produced by the real stage that owns the field |
 
 `producerPath` is zero for every field, and the matrix says so. The corpus is deliberately
 employer-neutral and runs no stage: it proves the boundary machinery handles every declared
-shape, not that each stage actually emits those shapes. Closing that dimension requires
-running the stages, which requires models, which this layer excludes.
+shape, not that each stage actually emits those shapes.
+
+Closing that dimension does **not** uniformly require models, and it would be convenient but
+untrue to say so. Most of the inventoried boundaries are deterministic — parsers,
+serializers, readers, reconcilers, and the consumers that index their results — and can be
+driven directly at each cardinality with no model at all. Even the model-facing consumers can
+be driven from synthetic response envelopes. What genuinely requires models is only the
+representative end-to-end case: proving that the shapes a real model actually produces are
+the shapes the corpus assumes. The dimension is open here because driving real stage code is
+a larger change than a prerequisite layer should make, not because it is impossible without
+models.
 
 `fullCoverageClaimed` is therefore `false`, and the check enforces it mechanically: full
 coverage may only be claimed when every inventoried field has every required variant in

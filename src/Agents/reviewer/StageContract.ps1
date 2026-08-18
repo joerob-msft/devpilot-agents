@@ -58,6 +58,7 @@ function Register-ReviewerStageContract {
         [string[]]$RequiredFields = @(),
         [string[]]$OptionalFields = @(),
         [string[]]$CollectionFields = @(),
+        [string[]]$MapFields = @(),
         [int[]]$SupportedVersions = @(),
         [System.Collections.IDictionary]$Adapters = $null
     )
@@ -75,6 +76,15 @@ function Register-ReviewerStageContract {
     $overlap = @($required | Where-Object { $optional -contains $_ })
     if ($overlap.Count -gt 0) {
         throw "Stage contract '$Kind' declares '$($overlap -join ", ")' as both required and optional."
+    }
+    $collections = [string[]]@($CollectionFields)
+    $maps = [string[]]@($MapFields)
+    # A field is either a list or a keyed map. Declaring both would ask the
+    # normalizer to rewrite the same site into two incompatible shapes, and the
+    # last writer would silently win.
+    $shapeOverlap = @($collections | Where-Object { $maps -contains $_ })
+    if ($shapeOverlap.Count -gt 0) {
+        throw "Stage contract '$Kind' declares '$($shapeOverlap -join ", ")' as both a collection and a map."
     }
     # A hashtable, not an ordered dictionary: an OrderedDictionary indexed by an
     # integer resolves the positional overload, so integer version keys would
@@ -108,7 +118,8 @@ function Register-ReviewerStageContract {
         SupportedVersions = $supported
         RequiredFields = $required
         OptionalFields = $optional
-        CollectionFields = [string[]]@($CollectionFields)
+        CollectionFields = $collections
+        MapFields = $maps
         Adapters = $adapterTable
     }
     return $script:ReviewerStageContractRegistry[$Kind]
@@ -189,7 +200,19 @@ function Get-ReviewerStageMember {
         $value = $property.Value
     }
     if ($null -eq $value) { return $null }
-    Write-Output -NoEnumerate $value
+    # Write-Output -NoEnumerate binds a scalar to its [PSObject[]] parameter and
+    # hands back a one-element list, so every non-array member would arrive at
+    # the caller as a wrapper instead of itself: a nested object would stop
+    # answering Test-ReviewerStageHasMember, and a bare scalar would look like a
+    # container. Only a genuine enumerable needs the no-enumerate guard; a
+    # string, a dictionary, and a PSObject already cross the boundary intact.
+    if ($value -is [System.Collections.IEnumerable] -and
+        $value -isnot [string] -and
+        $value -isnot [System.Collections.IDictionary]) {
+        Write-Output -NoEnumerate $value
+        return
+    }
+    return $value
 }
 
 function ConvertTo-ReviewerStageArray {
@@ -367,6 +390,52 @@ function Test-ReviewerStageCollectionShape {
     Write-Output -NoEnumerate ([string[]]$violations.ToArray())
 }
 
+function Test-ReviewerStageMapShape {
+    <#
+    .SYNOPSIS
+        Returns the list of declared map fields whose value is not a keyed
+        object. An empty result means every declared map survived.
+
+    .DESCRIPTION
+        A map is not a list, and the two collapse in opposite directions. An
+        empty map that reaches JSON as [] can never read back as a keyed object,
+        and a scalar where a map was declared has no repair at all: a map has
+        keys and a scalar has none, so inventing one would fabricate data the
+        producer never emitted. Both are reported here rather than normalized.
+    #>
+    param(
+        [Parameter(Mandatory)]$Payload,
+        [string[]]$MapFields = @()
+    )
+
+    $violations = [System.Collections.Generic.List[string]]::new()
+    foreach ($fieldPath in @($MapFields)) {
+        $sites = Get-ReviewerStageFieldSite -Payload $Payload -FieldPath $fieldPath
+        foreach ($site in $sites) {
+            if (-not (Test-ReviewerStageHasMember -Node $site.Parent -Name $site.Name)) {
+                [void]$violations.Add("$($site.Path) is missing")
+                continue
+            }
+            $value = Get-ReviewerStageMember -Node $site.Parent -Name $site.Name
+            if ($null -eq $value) {
+                [void]$violations.Add("$($site.Path) collapsed to null")
+                continue
+            }
+            if ($value -is [System.Array]) {
+                [void]$violations.Add("$($site.Path) collapsed to an array")
+                continue
+            }
+            if ($value -is [System.Collections.IDictionary]) { continue }
+            if ($value -is [psobject] -and $value.PSObject.BaseObject -isnot [System.Array] -and
+                $value.PSObject.BaseObject -isnot [string] -and $value.PSObject.BaseObject -isnot [ValueType]) {
+                continue
+            }
+            [void]$violations.Add("$($site.Path) collapsed to $($value.GetType().Name)")
+        }
+    }
+    Write-Output -NoEnumerate ([string[]]$violations.ToArray())
+}
+
 function Test-ReviewerStagePayloadField {
     param(
         [Parameter(Mandatory)]$Payload,
@@ -444,6 +513,12 @@ function Write-ReviewerStageArtifact {
     $collapsed = Test-ReviewerStageCollectionShape -Payload $normalized -CollectionFields $contract.CollectionFields
     if ($collapsed.Count -gt 0) {
         throw "Stage contract '$Kind' could not preserve collection field(s): $($collapsed -join '; ')."
+    }
+    # Maps are checked but never repaired: there is no correct rewrite from an
+    # array or a scalar to a keyed object.
+    $mapCollapsed = Test-ReviewerStageMapShape -Payload $normalized -MapFields $contract.MapFields
+    if ($mapCollapsed.Count -gt 0) {
+        throw "Stage contract '$Kind' received unusable map field(s): $($mapCollapsed -join '; ')."
     }
 
     $envelope = [ordered]@{
@@ -592,6 +667,10 @@ function Read-ReviewerStageArtifact {
     $collapsed = Test-ReviewerStageCollectionShape -Payload $payload -CollectionFields $contract.CollectionFields
     if ($collapsed.Count -gt 0) {
         throw "Stage contract '$Kind' artifact '$Path' lost collection shape: $($collapsed -join '; ')."
+    }
+    $mapCollapsed = Test-ReviewerStageMapShape -Payload $payload -MapFields $contract.MapFields
+    if ($mapCollapsed.Count -gt 0) {
+        throw "Stage contract '$Kind' artifact '$Path' lost map shape: $($mapCollapsed -join '; ')."
     }
 
     return [pscustomobject][ordered]@{

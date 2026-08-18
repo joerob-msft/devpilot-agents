@@ -44,12 +44,34 @@ from older versions:
 ```powershell
 Register-ReviewerStageContract -Kind 'reviewer.specialist.plan' -Version 2 `
     -CollectionFields @('captureTargets', 'evidenceFactIds', 'notes[].tags') `
+    -MapFields @('countsByPath') `
     -RequiredFields @('planId', 'captureTargets') `
     -Adapters @{ 1 = { param($payload) ... } }
 ```
 
 Collection fields use a dotted path with `[]` to descend into every element of an array, so
 a field nested inside a repeated structure is declared once rather than per index.
+
+## Lists and maps are different declarations
+
+A field is declared either as a collection or as a map, never both — registering it as both
+is refused, because the two normalizations contradict each other and one would silently win.
+
+The difference is not cosmetic. A declared collection is **repaired**: a scalar, a null, or
+an unrolled singleton is rewritten into an array of the right cardinality, because there is
+an unambiguous correct answer. A declared map is **only validated**: an array or a scalar
+where a map was declared is refused on both write and read, because a map has keys and a
+scalar has none, so any repair would fabricate a key the producer never emitted. An empty
+map must serialize as `{}`; if it ever reaches JSON as `[]` it can never read back as a
+keyed object.
+
+Member access underpins both. `Get-ReviewerStageMember` returns the member itself, not a
+container holding it. The obvious implementation — `Write-Output -NoEnumerate $value` — binds
+a scalar to its `[PSObject[]]` parameter and hands back a one-element list, which made a
+nested object stop answering the has-member test (so a *valid* nested collection path was
+rejected as missing) and made a bare scalar look like an object to any shape check. Only a
+genuine enumerable needs the no-enumerate guard; a string, a dictionary, and a `PSObject`
+already cross the boundary intact.
 
 ## Writing
 
@@ -109,8 +131,10 @@ mutate the result in place. This is the shape that escaped as `ESC-0005`.
 
 ## Tests
 
-`tools/Test-ReviewerStageContract.ps1` runs 62 checks: round trips at zero, one, and many
+`tools/Test-ReviewerStageContract.ps1` runs 87 checks: round trips at zero, one, and many
 elements; singleton and empty serialization; the no-BOM, single-trailing-newline, no-CR
 encoding rules; the indented form; every writer rejection; more than twenty reader
 rejections; version adapters in both the accepted and the refused direction; write
-atomicity; and the read-only inventory.
+atomicity; the read-only inventory; member access returning the value itself rather than a
+container; and declared maps, including refusal of an array, a scalar, a null, and an absent
+map on both write and read.

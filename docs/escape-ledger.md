@@ -63,8 +63,9 @@ identifiers, work-item numbers, programme code names, or addresses appear in the
 | `ESC-0010` | logic | deterministic | remediated | Second all-withheld aggregate crash in a sibling renderer |
 | `ESC-0011` | supervision | deterministic | remediated | Empty-aggregate guard accepted a same-block dominance loophole |
 | `ESC-0012` | typeBinding | deterministic | openDebt | Latent protected-return wrapping sites present in current code |
+| `ESC-0013` | typeBinding | deterministic | remediated | Verification tooling failed open: exemption holes, name-collision silencing, container-for-leaf citation matching |
 
-Six of the twelve are type-binding. None reached shadow or live execution, because no shadow
+Seven of the thirteen are type-binding. None reached shadow or live execution, because no shadow
 or live coordinator run has ever been performed. That is a statement about exposure, not
 about containment: the budget stands at zero because the denominator is zero, which is why
 the exposure obligation below exists.
@@ -83,10 +84,36 @@ of its call sites, and the rest are test-side assertions or deliberate analyzer 
 The remaining findings stay in `tools/testdata/powershell-boundary-baseline.v1.json`; the
 boundary gate blocks any new one.
 
+`ESC-0013` is the uncomfortable one, because the thing that failed was the verification
+itself. Independent review of this change found three ways its own detectors reported green
+while not checking what they claimed. The protected-return exemption counted an unrecognised
+exit as *nothing*, so one protected exit silenced the assignment rules for an entire function
+even when a sibling exit returned a multi-element pipeline or a cast to an enumerating
+collection type. Cross-file name resolution dropped the nesting fact along with the
+exemption, so a single unprotected one-line stub in a test file disabled `PSEN011` — the rule
+that found the three live defects above — on every production call site of that name, while
+raising a false flattening finding there. And the inventory citation check accepted any
+segment of a field path, so a citation pointing at the wrong file passed whenever that file
+mentioned the generic container name; five live citations were wrong under that rule and are
+corrected here.
+
+None of the three had reached execution, and only the third had produced a wrong recorded
+result. They are logged as a type-binding escape anyway, because a detector that fails open
+is worse than no detector: it is recorded as evidence, and the whole argument for deferring
+the typed control plane rests on evidence of this kind. Each is now pinned by a test that
+fails on the old behaviour — two exemption-soundness fixtures, a cross-file gate that builds
+a producer, a consumer, and a same-named mock and requires identical findings with and
+without the mock, and three citation sabotage checks.
+
+> **Convention.** A remediation that ships in the same change as its own ledger entry cannot
+> cite a commit hash, so it records `remediatedCommit: "unreleased"`. The gate allows at most
+> one such incident at a time and requires it to be marked remediated, so the state is
+> bounded and visible rather than hidden as a missing field.
+
 ## The budget
 
-> If **two or more type-binding escapes reach shadow or live execution** within a window of
-> **ten merged coordinator changes or sixty days**, whichever comes first, the conditional
+> If **two or more type-binding escapes reach shadow or live execution** within **either the
+> last ten merged coordinator changes or the last sixty days**, the conditional
 > typed control-plane pivot stops being optional and is scheduled as the next coordinator
 > change.
 
@@ -141,12 +168,20 @@ observations so the obligation cannot be quietly declared satisfied.
 The typed control-plane pivot is recorded as **conditional**. It is *not* taken in this
 change: this change contains no compiled coordinator and runs no models.
 
-| Prerequisite | Complete | Evidence |
-| --- | --- | --- |
-| Cardinality and property corpus over every collection-bearing stage contract | yes | `tools/testdata/reviewer-collection-inventory.v1.json` (236 fields, 12 stages), `tools/Test-ReviewerCollectionCardinality.ps1` (7 variants per field, 11 escape shapes, 9 sabotage checks), `tools/testdata/reviewer-collection-cardinality-matrix.v1.json` |
-| Versioned file contract for stage child outputs | yes | `src/Agents/reviewer/StageContract.ps1`, `src/Agents/reviewer/schemas/reviewer.stage-envelope.v1.json`, `tools/Test-ReviewerStageContract.ps1` |
-| Boundary hardening analyzer with a blocking new-violation gate | yes | `tools/Find-PowerShellEmptyNullHazard.ps1` (11 rules), `tools/Test-PowerShellBoundaryHardening.ps1`, `tools/testdata/powershell-boundary-baseline.v1.json` |
-| Escape ledger and budget with a registered trigger | yes | this document, `docs/escape-ledger.v1.json`, `tools/Test-EscapeLedger.ps1` |
+Each prerequisite is scored on two separate axes, because an artifact that exists is not the
+same as a boundary that is protected. **Built** means the artifact and its gate exist and run
+in CI. **In force** means production code actually goes through it today.
+
+| Prerequisite | Built | In force | Evidence |
+| --- | --- | --- | --- |
+| Cardinality and property corpus over every collection-bearing stage contract | yes | no — 0 of 1652 producer-path cells; no stage is driven | `tools/testdata/reviewer-collection-inventory.v1.json` (236 fields, 12 stages), `tools/Test-ReviewerCollectionCardinality.ps1` (7 variants per field, 11 escape shapes, 9 sabotage checks), `tools/testdata/reviewer-collection-cardinality-matrix.v1.json` |
+| Versioned file contract for stage child outputs | yes | no — no stage writes or reads its artifacts through it yet | `src/Agents/reviewer/StageContract.ps1`, `src/Agents/reviewer/schemas/reviewer.stage-envelope.v1.json`, `tools/Test-ReviewerStageContract.ps1` |
+| Boundary hardening analyzer with a blocking new-violation gate | yes | yes — every push is scanned and any new violation fails CI | `tools/Find-PowerShellEmptyNullHazard.ps1` (11 rules), `tools/Test-PowerShellBoundaryHardening.ps1`, `tools/testdata/powershell-boundary-baseline.v1.json` |
+| Escape ledger and budget with a registered trigger | yes | yes — counts, window, and trigger are recomputed and enforced in CI | this document, `docs/escape-ledger.v1.json`, `tools/Test-EscapeLedger.ps1` |
+
+Two of the four are inert today. That is the honest reading: this layer makes new escapes
+detectable and makes the existing ones counted, and only the analyzer and the ledger
+currently act on live code. It does not yet protect a running stage boundary.
 
 The pivot becomes mandatory if the budget triggers. It may be reconsidered earlier if these
 prerequisites fail to detect a new type-binding escape class — that failure would itself be

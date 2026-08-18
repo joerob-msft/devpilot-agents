@@ -200,3 +200,35 @@ function Positive-WrapsMixedProtectionHelperResult {
     $wrapped = @(Helper-MixedProtectionCollectionSource -Rows $Rows)
     return $wrapped.Count
 }
+
+# A multi-element pipeline return enumerates just like a bare return does, so
+# an unrecognised exit shape must count against the exemption rather than be
+# counted as nothing.
+function Helper-PipelineExitCollectionSource {
+    param([object[]]$Rows = @())
+    $selected = $Rows | Where-Object { $_ }
+    if (@($Rows).Count -eq 0) { Write-Output -NoEnumerate ([object[]]$selected) ; return }
+    return $selected | Sort-Object
+}
+
+function Positive-CountsPipelineExitHelperResult {
+    param([object[]]$Rows = @())
+    $found = Helper-PipelineExitCollectionSource -Rows $Rows
+    return $found.Count
+}
+
+# [List[object]]$x ends in "]" but not "[]", so a suffix test reads it as a
+# scalar cast. It enumerates on return, so it is an unprotected exit.
+function Helper-ListCastExitCollectionSource {
+    param([object[]]$Rows = @())
+    $selected = [System.Collections.Generic.List[object]]::new()
+    foreach ($row in $Rows) { [void]$selected.Add($row) }
+    if (@($Rows).Count -eq 0) { Write-Output -NoEnumerate ([object[]]$selected) ; return }
+    return [System.Collections.Generic.List[object]]$selected
+}
+
+function Positive-CountsListCastExitHelperResult {
+    param([object[]]$Rows = @())
+    $found = Helper-ListCastExitCollectionSource -Rows $Rows
+    return $found.Count
+}

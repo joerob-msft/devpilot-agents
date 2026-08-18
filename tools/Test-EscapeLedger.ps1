@@ -219,6 +219,31 @@ Assert-Ledger ($ledger.budget.window.combinator -eq 'either') 'The registered tr
 Assert-Ledger ([int]$ledger.coverageWindow.coordinatorChangesObserved -ge 1) `
     'The coverage window observes no coordinator changes.'
 
+# Both clocks the rolling window turns on used to be hand-authored, so the ledger could sit
+# frozen while real changes landed and every check still passed. They are derived here and
+# the published values only confirm the derivation.
+$derivedObserved = 0
+$derivedEvaluatedOn = ''
+foreach ($incident in $incidents) {
+    if ([int]$incident.coordinatorChangeOrdinal -gt $derivedObserved) { $derivedObserved = [int]$incident.coordinatorChangeOrdinal }
+    if ([string]$incident.detectedOn -gt $derivedEvaluatedOn) { $derivedEvaluatedOn = [string]$incident.detectedOn }
+}
+Assert-Ledger ([int]$ledger.coverageWindow.coordinatorChangesObserved -eq $derivedObserved) `
+    "The coverage window claims $($ledger.coverageWindow.coordinatorChangesObserved) coordinator change(s) but the incidents record $derivedObserved; the window is not being advanced with the ledger."
+Assert-Ledger ([string]$ledger.coverageWindow.evaluatedOn -eq $derivedEvaluatedOn) `
+    "The coverage window is evaluated on $($ledger.coverageWindow.evaluatedOn) but the newest incident was detected on $derivedEvaluatedOn; the evaluation date is not being advanced with the ledger."
+
+# ...and the derivation has to be able to fail, or it is decoration. Freeze each clock on a
+# copy and require the mismatch to be visible.
+$frozenClock = Get-LedgerObject -Json $ledgerJson
+$frozenClock.coverageWindow.coordinatorChangesObserved = [int]$derivedObserved + 1
+Assert-Ledger ([int]$frozenClock.coverageWindow.coordinatorChangesObserved -ne $derivedObserved) `
+    'A coordinator-change count that disagrees with the incidents was not distinguishable from the derived one.'
+$frozenDate = Get-LedgerObject -Json $ledgerJson
+$frozenDate.coverageWindow.evaluatedOn = '2000-01-01'
+Assert-Ledger ([string]$frozenDate.coverageWindow.evaluatedOn -ne $derivedEvaluatedOn) `
+    'An evaluation date that disagrees with the newest incident was not distinguishable from the derived one.'
+
 # The window is only meaningful if it is computed. Every incident carries the date it was
 # detected and the coordinator change it was detected under, and the recorded in-window set
 # must be the set those two facts imply.
@@ -430,15 +455,58 @@ Assert-Ledger ($docText -match 'Gate 5') 'docs/escape-ledger.md does not record 
 # --- 10. Optional commit verification -----------------------------------------------------
 
 $commitsVerified = 0
+# A remediation that ships in the same change as its own ledger entry cannot cite a commit
+# hash, because that hash does not exist until the entry is committed. The sentinel makes
+# that state explicit and bounded rather than letting it hide as a missing property: only a
+# remediated incident may use it, and only one incident may be unreleased at a time, so it
+# cannot accumulate into a backlog of unverifiable claims.
+$unreleasedSentinel = 'unreleased'
+$unreleased = @($incidents | Where-Object {
+        $_.PSObject.Properties.Name -contains 'remediatedCommit' -and
+        [string]$_.remediatedCommit -eq $unreleasedSentinel
+    })
+Assert-Ledger ($unreleased.Count -le 1) `
+    "More than one incident cites the '$unreleasedSentinel' remediation sentinel: $(($unreleased.id) -join ', '). Replace the merged ones with their commit."
+foreach ($incident in $unreleased) {
+    Assert-Ledger ($incident.status -eq 'remediated') `
+        "Incident $($incident.id) cites the '$unreleasedSentinel' remediation sentinel but is not marked remediated."
+}
 if ($VerifyCommits) {
     foreach ($incident in $incidents) {
         foreach ($property in @('introducedCommit', 'remediatedCommit')) {
             if ($incident.PSObject.Properties.Name -notcontains $property) { continue }
-            $sha = $incident.$property
+            $sha = [string]$incident.$property
+            if ($sha -eq $unreleasedSentinel) { continue }
             & git -C $repoRoot cat-file -e "$sha^{commit}" 2>$null
             Assert-Ledger ($LASTEXITCODE -eq 0) "Incident $($incident.id) cites commit $sha, which is not in this repository's history."
             $commitsVerified++
         }
+    }
+
+    # The window closes at a named commit, so its evaluation date is that commit's date and
+    # nothing else. Deriving it from git is what stops the ledger from being re-dated by hand
+    # without the window actually moving.
+    $endCommit = [string]$ledger.coverageWindow.endCommit
+    & git -C $repoRoot cat-file -e "$endCommit^{commit}" 2>$null
+    Assert-Ledger ($LASTEXITCODE -eq 0) "The coverage window ends at commit $endCommit, which is not in this repository's history."
+    if ($LASTEXITCODE -eq 0) {
+        $commitsVerified++
+        $endCommitDate = (& git -C $repoRoot show -s --format=%cs $endCommit).Trim()
+        Assert-Ledger ([string]$ledger.coverageWindow.evaluatedOn -eq $endCommitDate) `
+            "The coverage window is evaluated on $($ledger.coverageWindow.evaluatedOn) but its end commit $endCommit was committed on $endCommitDate."
+
+        & git -C $repoRoot merge-base --is-ancestor $endCommit HEAD 2>$null
+        Assert-Ledger ($LASTEXITCODE -eq 0) `
+            "The coverage window ends at commit $endCommit, which is not an ancestor of HEAD; the ledger is describing a history this branch does not have."
+
+        # A rolling budget that is never re-evaluated is a running total. Once the head has
+        # moved further than the declared bound, the ledger has to be brought forward before
+        # anything else merges.
+        $behind = [int]((& git -C $repoRoot rev-list --count "$endCommit..HEAD").Trim())
+        $staleAfter = [int]$ledger.coverageWindow.staleAfterCommitsBehindHead
+        Assert-Ledger ($staleAfter -ge 1) 'The coverage window declares no staleness bound, so it can never be forced forward.'
+        Assert-Ledger ($behind -le $staleAfter) `
+            "The coverage window ends $behind commit(s) behind HEAD, past its declared bound of $staleAfter; re-evaluate the ledger before merging further coordinator changes."
     }
 }
 

@@ -356,9 +356,19 @@ function Get-CollectionReturnProtection {
             }, $true)) {
         if ($null -eq $return.Pipeline) { continue }
         $pipeline = $return.Pipeline
-        if ($pipeline -isnot [Management.Automation.Language.PipelineAst]) { continue }
+        if ($pipeline -isnot [Management.Automation.Language.PipelineAst]) {
+            # Unrecognised exit shape. Counting it as nothing would let one
+            # protected exit buy the exemption for the whole function.
+            $unprotectedExits++
+            continue
+        }
         $elements = @($pipeline.PipelineElements)
-        if ($elements.Count -ne 1) { continue }
+        if ($elements.Count -ne 1) {
+            # "return $items | Sort-Object" enumerates, so it is an unprotected
+            # exit, not an unknown one.
+            $unprotectedExits++
+            continue
+        }
         $element = $elements[0]
         if ($element -isnot [Management.Automation.Language.CommandExpressionAst]) {
             # "return f x" hands the caller whatever the command emits.
@@ -423,6 +433,9 @@ function Test-ScalarReturnExpression {
     if ($Expression -is [Management.Automation.Language.ConvertExpressionAst]) {
         $typeName = [string]$Expression.Type.TypeName.FullName
         if ($typeName -match '\[\s*\]$') { return $false }
+        # [List[object]]$x and [ArrayList]$x end in "]" but not "[]", and they
+        # enumerate on return exactly like an array does.
+        if (Test-EnumeratingCollectionTypeName -TypeName $typeName) { return $false }
         return $true
     }
     return $false
@@ -743,6 +756,14 @@ $findings = [System.Collections.Generic.List[object]]::new()
 # name: a protected Get-Foo in one file must not exempt call sites of a
 # different, unprotected Get-Foo in another. A definition from elsewhere is
 # honoured only when the name is defined exactly once across the scan.
+#
+# Exemption and nesting are resolved separately because they fail in opposite
+# directions. Granting an exemption that was not earned hides a real collapse,
+# so it stays conservative: an ambiguous name earns nothing. Withholding the
+# nesting fact hides PSEN011, which is the rule that finds bare collection
+# returns, so it stays permissive: any visible protected definition is enough.
+# Otherwise a one-line unprotected mock in a test file silences PSEN011 on
+# every production call site of that name.
 $definitionsByName = @{}
 foreach ($definition in $functionDefinitions) {
     $key = $definition.Name.ToLowerInvariant()
@@ -759,14 +780,22 @@ foreach ($document in $parsed) {
     foreach ($key in $definitionsByName.Keys) {
         $allDefinitions = @($definitionsByName[$key])
         $localDefinitions = @($allDefinitions | Where-Object { $_.File -eq $document.File })
-        $visible = $localDefinitions
-        if ($localDefinitions.Count -eq 0) {
-            if ($allDefinitions.Count -ne 1) { continue }
-            $visible = $allDefinitions
+        $name = $allDefinitions[0].Name
+
+        $exemptScope = $localDefinitions
+        if ($localDefinitions.Count -eq 0 -and $allDefinitions.Count -eq 1) {
+            $exemptScope = $allDefinitions
         }
-        $name = $visible[0].Name
-        if (@($visible | Where-Object { -not $_.AllProtected }).Count -eq 0) { [void]$exempt.Add($name) }
-        if (@($visible | Where-Object { $_.AnyProtected }).Count -gt 0) { [void]$nesting.Add($name) }
+        if ($exemptScope.Count -gt 0 -and
+            @($exemptScope | Where-Object { -not $_.AllProtected }).Count -eq 0) {
+            [void]$exempt.Add($name)
+        }
+
+        $nestingScope = $localDefinitions
+        if ($localDefinitions.Count -eq 0) { $nestingScope = $allDefinitions }
+        if (@($nestingScope | Where-Object { $_.AnyProtected }).Count -gt 0) {
+            [void]$nesting.Add($name)
+        }
     }
     $exemptByFile[$document.File] = $exempt
     $nestingByFile[$document.File] = $nesting

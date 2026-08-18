@@ -2306,7 +2306,7 @@
       "kind": "jsonArray",
       "required": "False",
       "producer": "src/Agents/reviewer/ConventionPacks.ps1 ~613-619 (Select-ReviewerConventionPacks, $matches.ToArray())",
-      "consumer": "src/Agents/reviewer/Start-ReviewerAgent.ps1 ~15618 (count display only); no direct iteration found in scope files",
+      "consumer": "src/Agents/reviewer/CrossVerification.ps1:674 (@(Get-ReviewerVerificationValue $pack \"matchedPaths\" @()) | Where-Object); src/Agents/reviewer/ConventionPacks.ps1:755,769 (routing evidence)",
       "collapseRisk": "1-element matchedPaths collapses to a scalar PSCustomObject on ConvertFrom-Json without @(). The producing code guarantees Count>0 (a pack with 0 matches goes to withheld), but a single-match pack would be singleton on round-trip.",
       "knownEscapeShape": false
     },
@@ -2425,7 +2425,7 @@
       "field": "$.hashes.scriptClosure",
       "kind": "jsonArray",
       "required": "True",
-      "producer": "src/Agents/reviewer/ReviewFacts.ps1 (scriptClosure array built during plan construction)",
+      "producer": "src/Agents/reviewer/Start-ReviewerAgent.ps1:15569 (scriptClosure = $ReviewFactScriptClosure); src/Agents/reviewer/facts/v1/schema.json:74,79 (required array)",
       "consumer": "src/Agents/reviewer/ConventionSpecialist.ps1 ~1116 ($closure = @(Get-ReviewerConventionSpecialistValue $hashes 'scriptClosure' @())); ~1117 ($wrapper = @($closure | Where-Object {…}))",
       "collapseRisk": "minItems:3 in schema. @() wrap on both reads guards against singleton collapse. A 1-item closure would collapse without @().",
       "knownEscapeShape": false
@@ -2438,7 +2438,7 @@
       "kind": "jsonArray",
       "required": "False",
       "producer": "src/Agents/reviewer/facts/v1/policy.json ~34 (static config array)",
-      "consumer": "src/Agents/reviewer/ReviewFacts.ps1 (manifest file discovery)",
+      "consumer": "src/Agents/reviewer/Start-ReviewerAgent.ps1:4366,4376 (@($ReviewFactPolicy.cloudTest.manifestFileNames | Where-Object))",
       "collapseRisk": "Static 2-item array.",
       "knownEscapeShape": false
     },
@@ -2474,7 +2474,7 @@
       "kind": "jsonArray",
       "required": "False",
       "producer": "src/Agents/reviewer/facts/v1/policy.json ~52 (static empty array [])",
-      "consumer": "src/Agents/reviewer/ReviewFacts.ps1 fanOut domain",
+      "consumer": "src/Agents/reviewer/ReviewFacts.ps1:798 (foreach ($rule in @($Policy.companionRules)))",
       "collapseRisk": "KNOWN ESCAPE SHAPE: configured as [] (empty). ConvertFrom-Json of [] is $null on PS 5.x but @() on PS 7.x. All code #requires 7.0, but this is the exact empty-array concern: any consumer without @() guard would get $null and fail .Count.",
       "knownEscapeShape": true
     },
@@ -2486,7 +2486,7 @@
       "kind": "jsonArray",
       "required": "False",
       "producer": "src/Agents/reviewer/facts/v1/policy.json ~46 (static config array)",
-      "consumer": "src/Agents/reviewer/ReviewFacts.ps1 fanOut domain",
+      "consumer": "src/Agents/reviewer/Start-ReviewerAgent.ps1:4417 (@($ReviewFactPolicy.fanOut.filePathGlobs | Where-Object))",
       "collapseRisk": "5 items — safe. @() wrap at consumer.",
       "knownEscapeShape": false
     },
@@ -2834,7 +2834,7 @@
       "kind": "jsonArray",
       "required": "not required at candidate level (existingDebtEvidence is nullable); no minItems in schema",
       "producer": "specialist manifest (generalist or convention candidate)",
-      "consumer": "CrossVerification.ps1:847 `existingDebtEvidence = Get-ReviewerVerificationValue $RawCandidate \"existingDebtEvidence\" $null` — passed through opaquely",
+      "consumer": "src/Agents/reviewer/ConventionSpecialist.ps1:213,335,339 (@(Get-ReviewerConventionSpecialistValue $Evidence \"attributeFrequency\" @())); produced at src/Agents/reviewer/ChangedConstructs.ps1:1115. The verifier stage passes the enclosing existingDebtEvidence object through opaquely and never reads this leaf.",
       "collapseRisk": "If serialized via ConvertTo-ReviewerVerificationCanonicalJson the array is preserved correctly. If serialized via default ConvertTo-Json without -Depth ≥3, elements inside the nullable object would be truncated. The canonical path uses Depth 32, so safe.",
       "knownEscapeShape": false
     },

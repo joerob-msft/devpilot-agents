@@ -43,14 +43,36 @@ A function with several exits needs two different answers, so the analyzer compu
 A mixed function therefore keeps its `PSEN011` finding *and* loses its counting exemption,
 which is the conservative answer in both directions. "Provably scalar" is a deliberately
 narrow allow-list — literals, strings, hashtables, scriptblocks, `$null`/`$true`/`$false`,
-and non-array type conversions. Anything the analyzer cannot classify counts as a
-collection-bearing exit.
+and type conversions to non-array, non-enumerating types. Anything the analyzer cannot
+classify counts as a collection-bearing exit, including a return whose pipeline has more
+than one element (`return $items | Sort-Object` enumerates) and a cast to an enumerating
+type (`[List[object]]$x` ends in `]` but not `[]`, and it enumerates on return exactly as an
+array does). Counting an unrecognised exit as *nothing* would let one protected exit buy the
+exemption for a whole function, which is the escape shape these rules exist to catch.
 
-Protection is also resolved per file. A call is exempt only when every definition of that
-name *in the calling file* is protected, or when the name is defined exactly once in the
-repository and that definition is protected. Seven function names in this repository are
-defined in more than one file with divergent protection, and resolving them by bare name
-would have handed out exemptions the callee does not honour.
+Exemption and nesting are resolved per file, and separately, because they fail in opposite
+directions:
+
+* **Exemption** (`PSEN005`/`PSEN009` standing down) stays conservative. A call is exempt only
+  when every definition of that name *in the calling file* is protected, or when the name is
+  defined exactly once in the repository and that definition is protected. An ambiguous name
+  earns nothing, because granting an exemption that was not earned hides a real collapse.
+* **Nesting** (`PSEN011` firing) stays permissive. Any visible protected definition is enough.
+  Withholding the nesting fact is what hides `PSEN011`, and a single unprotected one-line mock
+  in a test file would otherwise disable the rule on every production call site of that name —
+  the rule that found three of the live defects this branch fixes. An unnecessary `PSEN011` is
+  a comment; a missing one is the bug class.
+
+Seven function names in this repository are defined in more than one file with divergent
+protection, so this split is load-bearing rather than theoretical. `Get-AgentCopilotArgs` is
+the clearest case: the real definition in `src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1`
+protects its single exit, while `tools/Test-ConventionSpecialist.ps1` defines an unprotected
+one-line stub of the same name. The two `PSEN009` findings at its production call sites
+(`src/Agents/review-handler/Start-ReviewHandlerAgent.ps1` and
+`src/Agents/reviewer/Start-ReviewerAgent.ps1`) are baselined debt rather than defects: the
+production code is correct, and the exemption is withheld only because the analyzer will not
+guess which same-named definition a call resolves to. Removing them requires an import graph,
+not a code change, so they are recorded as analyzer imprecision, not as a hazard.
 
 Run it over one file or a tree, optionally filtering by rule:
 
@@ -115,8 +137,11 @@ Current baseline: **442 findings across 372 fingerprints.**
 
 `PSEN011` was not baselined in bulk. Each of the eleven sites was read against its producer
 and its consumer: three were live defects and are fixed in this change, one is latent behind
-a caller-side non-empty precondition, and seven are compensated by an explicit flattening
-step on the consuming side. The per-site adjudication is recorded in
+a caller-side non-empty precondition, one is compensated by an explicit flattening step on
+the consuming side, and six are test-harness assertions whose own assertions pin the shape.
+That leaves eight in the baseline — two in production code and six in test harnesses. The
+analyzer's own fixture corpus is excluded from the repository scan by name and is not part
+of that count. The per-site adjudication is recorded in
 [`escape-ledger.v1.json`](escape-ledger.v1.json) under `ESC-0012`, not summarised away here.
 
 `PSEN004` at zero is the point of the gate. The rule was written from an escape that had

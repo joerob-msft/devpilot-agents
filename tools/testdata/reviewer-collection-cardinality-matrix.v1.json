@@ -12,7 +12,7 @@
     "wrongScalar"
   ],
   "coverageDimensions": {
-    "boundaryNormalizer": "The field is driven through the shared stage-contract normalizer, shape validator, and a JSON round trip at this cardinality.",
+    "boundaryNormalizer": "The field is driven through the shared stage contract at this cardinality and judged by the validator named in boundaryValidator: collectionShape rows go through the list normalizer, shape validator, and a JSON round trip; mapShape rows go through the map shape validator and a JSON round trip and are never normalized, because there is no correct rewrite from an array or a scalar to a keyed object.",
     "producerPath": "The real producing and consuming stage code is driven at this cardinality. Not attempted in this layer: the corpus is deliberately employer-neutral and runs no stage."
   },
   "fullCoverageClaimed": false,
@@ -23,12 +23,16 @@
     "cellsPerDimension": 1652,
     "boundaryNormalizerCovered": 1652,
     "boundaryNormalizerGaps": 0,
+    "collectionShapeCells": 1617,
+    "mapShapeCells": 35,
     "producerPathCovered": 0,
     "producerPathGaps": 1652,
     "knownEscapeShapeFields": 15,
     "escapeShapeProperties": 11,
     "sabotageChecks": 9,
-    "citationsChecked": 416,
+    "citationsChecked": 419,
+    "citationsLeafVerified": 258,
+    "citationsUnverified": 161,
     "byStage": {
       "capture": 12,
       "source": 24,
@@ -192,6 +196,7 @@
       "field": "$expanded.Ids",
       "kind": "psCollectionReturn",
       "knownEscapeShape": true,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -218,6 +223,7 @@
       "field": "$expanded.Duplicated",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -244,6 +250,7 @@
       "field": "$claims = @(Get-ReviewerFactValue $data 'Claims' @())",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -270,6 +277,7 @@
       "field": "$files = @(Get-ReviewerFactValue $data 'ChangedFiles' @())",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -296,6 +304,7 @@
       "field": "$manifests = @(Get-ReviewerFactValue $data 'Manifests' @())",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -322,6 +331,7 @@
       "field": "$.execution.categories",
       "kind": "jsonArray",
       "knownEscapeShape": true,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -348,6 +358,7 @@
       "field": "$request.Requested",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -374,6 +385,7 @@
       "field": "$request.Unrequested",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -400,6 +412,7 @@
       "field": "$.candidates",
       "kind": "jsonArray",
       "knownEscapeShape": true,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -426,6 +439,7 @@
       "field": "$.candidates[*].factIds",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -452,6 +466,7 @@
       "field": "$.residualRisks",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -478,6 +493,7 @@
       "field": "$.ruleCoverage",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -504,6 +520,7 @@
       "field": "$.withheld",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -530,6 +547,7 @@
       "field": "$.candidates[*].changedCodeFix.evidenceFactIds",
       "kind": "jsonArray",
       "knownEscapeShape": true,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -556,6 +574,7 @@
       "field": "$.ruleCoverage[*].compliantConstructs",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -582,6 +601,7 @@
       "field": "$.ruleCoverage[*].notInReachConstructs",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -608,6 +628,7 @@
       "field": "$.ruleCoverage[*].unknownConstructs",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -634,6 +655,7 @@
       "field": "$.ruleCoverage[*].violatingChangedFileTargets",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -660,6 +682,7 @@
       "field": "$.ruleCoverage[*].violatingConstructs",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -686,6 +709,7 @@
       "field": "$coverage.Rows",
       "kind": "list",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -712,6 +736,7 @@
       "field": "$coverage.UnemittedViolations",
       "kind": "list",
       "knownEscapeShape": true,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -738,6 +763,7 @@
       "field": "$resolvedTargets.Targets",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -764,6 +790,7 @@
       "field": "$resolvedTargets.Errors",
       "kind": "list",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -790,6 +817,7 @@
       "field": "$.verdicts[*].adjudication.matchedIssueIds",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -816,6 +844,7 @@
       "field": "$.verdicts[*].labels[*].matchedIssueIds",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -842,6 +871,7 @@
       "field": "$.verdicts[*].labels",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -868,6 +898,7 @@
       "field": "$.verdicts",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -894,6 +925,7 @@
       "field": "$.candidates",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -920,6 +952,7 @@
       "field": "$.eligible",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -946,6 +979,7 @@
       "field": "$.decisions",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -972,6 +1006,7 @@
       "field": "$.withheld (post-verification)",
       "kind": "jsonArray",
       "knownEscapeShape": true,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -998,6 +1033,7 @@
       "field": "$.eligible[*].origins",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1024,6 +1060,7 @@
       "field": "$.derivation.models.generalists",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1050,6 +1087,7 @@
       "field": "$.derivation.results",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1076,6 +1114,7 @@
       "field": "$.derivation.results[*].claims",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1102,6 +1141,7 @@
       "field": "$.findings (in generalist marker)",
       "kind": "jsonArray",
       "knownEscapeShape": true,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1128,6 +1168,7 @@
       "field": "$allCandidates",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1154,6 +1195,7 @@
       "field": "$.candidates (bounded candidate list)",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1180,6 +1222,7 @@
       "field": "$.withheld (cap-exceeded candidates)",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1206,6 +1249,7 @@
       "field": "$.clusters[*].members",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1232,6 +1276,7 @@
       "field": "$.clusters[*].memberHashes",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1258,6 +1303,7 @@
       "field": "$.clusters[*].origins",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1284,6 +1330,7 @@
       "field": "$.preVerificationWithheld",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1310,6 +1357,7 @@
       "field": "$.candidates[*]",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1336,6 +1384,7 @@
       "field": "$.resources[*]",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1362,6 +1411,7 @@
       "field": "$.resources[*]",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1388,6 +1438,7 @@
       "field": "$.files[*]",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1414,6 +1465,7 @@
       "field": "$.launch.allowTools",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1440,6 +1492,7 @@
       "field": "$.launch.arguments",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1466,6 +1519,7 @@
       "field": "$.launch.availableTools",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1492,6 +1546,7 @@
       "field": "$.launch.denySet",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1518,6 +1573,7 @@
       "field": "$.snapshot.resources[*]",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1544,6 +1600,7 @@
       "field": "$.attempts[*]",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1570,6 +1627,7 @@
       "field": "$.directories[*]",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1596,6 +1654,7 @@
       "field": "$.files[*]",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1622,6 +1681,7 @@
       "field": "$.corrections[*]",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1648,6 +1708,7 @@
       "field": "$.examples[*]",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1674,6 +1735,7 @@
       "field": "$.examples[*].adjudication.issueIds",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1700,6 +1762,7 @@
       "field": "$.examples[*].groundTruth.issueIds",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1726,6 +1789,7 @@
       "field": "$.examples[*].inventory[*]",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1752,6 +1816,7 @@
       "field": "$.examples[*].labels[*]",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1778,6 +1843,7 @@
       "field": "$.examples[*].labels[*].issueIds",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1804,6 +1870,7 @@
       "field": "$.strata",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1830,6 +1897,7 @@
       "field": "/qualifiableScopes",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1856,6 +1924,7 @@
       "field": "/arms",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1882,6 +1951,7 @@
       "field": "/arms[*]/issueClassRecall",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1908,6 +1978,7 @@
       "field": "/corpusPopulation/byStratum",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1934,6 +2005,7 @@
       "field": "/corpusPopulation/deficits",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1960,6 +2032,7 @@
       "field": "/qualification/globalVetoes",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -1986,6 +2059,7 @@
       "field": "/qualification/requirements",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2012,6 +2086,7 @@
       "field": "/qualification/requirements[*]/reasonCodes",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2038,6 +2113,7 @@
       "field": "/transcriptionInput/comment/scopes",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2064,6 +2140,7 @@
       "field": "/candidates[*]/humanPromotedCommentReasons",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2090,6 +2167,7 @@
       "field": "/candidates[*]/unattendedCommentReasons",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2116,6 +2194,7 @@
       "field": "/candidates",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2142,6 +2221,7 @@
       "field": "/gateImportantOrHigherKeys",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2168,6 +2248,7 @@
       "field": "/humanPromotableComments",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2194,6 +2275,7 @@
       "field": "/runReasonCodes",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2220,6 +2302,7 @@
       "field": "/unattendedComments",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2246,6 +2329,7 @@
       "field": "/unattendedSuggestions",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2272,6 +2356,7 @@
       "field": "/packs",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2298,6 +2383,7 @@
       "field": "/approval/requiredCheckNames",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2324,6 +2410,7 @@
       "field": "/comment/scopes",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2350,6 +2437,7 @@
       "field": "/agentBinding/generalistModels",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2376,6 +2464,7 @@
       "field": "$seen.ToArray() (with leading `, ` prefix)",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2402,6 +2491,7 @@
       "field": "$kept.ToArray() (with leading `, ` prefix)",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2428,6 +2518,7 @@
       "field": "$changedNormalized (HashSet[string] — changed-path duplicate suppression)",
       "kind": "hashSet",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2454,6 +2545,7 @@
       "field": "$ChangedPaths (string[] parameter)",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2480,6 +2572,7 @@
       "field": "$ThreadFacts (object[] parameter)",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2506,6 +2599,7 @@
       "field": "$ids (HashSet[string] — accounting duplicate detection)",
       "kind": "hashSet",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2532,6 +2626,7 @@
       "field": "$(thread).comments",
       "kind": "jsonArray",
       "knownEscapeShape": true,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2558,6 +2653,7 @@
       "field": "$Bound.ExistingFingerprints",
       "kind": "hashSet",
       "knownEscapeShape": true,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2584,6 +2680,7 @@
       "field": "$freshFingerprints (from Get-ReviewerExistingFingerprints after posting)",
       "kind": "hashSet",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2610,6 +2707,7 @@
       "field": "$.confirmedImportantOrHigherKeys",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2636,6 +2734,7 @@
       "field": "$.gateImportantOrHigherKeys",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2662,6 +2761,7 @@
       "field": "$PriorRunFingerprintMatches (scalar bool from fingerprint comparison)",
       "kind": "hashSet",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2688,6 +2788,7 @@
       "field": "$IntendedFingerprints",
       "kind": "list",
       "knownEscapeShape": true,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2714,6 +2815,7 @@
       "field": "$ConfirmedFingerprints",
       "kind": "hashSet",
       "knownEscapeShape": true,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2740,6 +2842,7 @@
       "field": "/rows[*]/anchors[*]/perRunVerdicts",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2766,6 +2869,7 @@
       "field": "/candidates[*]/presentInRuns",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2792,6 +2896,7 @@
       "field": "/candidates[*]/absentInRuns",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2818,6 +2923,7 @@
       "field": "/candidates[*]/identityErrors",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2844,6 +2950,7 @@
       "field": "/candidates[*]/perRunCounts",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2870,6 +2977,7 @@
       "field": "/candidates[*]/presentationVariants",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2896,6 +3004,7 @@
       "field": "/emptyRunAccounting/withheld",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2922,6 +3031,7 @@
       "field": "/ruleCoverage/changedConstructs  /ruleCoverage/changedFileAnchors  /ruleCoverage/constructFiles  /ruleCoverage/remediationFacts",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2948,6 +3058,7 @@
       "field": "return.OnlyLeft / return.OnlyRight",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -2974,6 +3085,7 @@
       "field": "$nonces (HashSet[string] — nonce duplicate detection)",
       "kind": "hashSet",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3000,6 +3112,7 @@
       "field": "/expectedRunSha256",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3026,6 +3139,7 @@
       "field": "/candidates",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3052,6 +3166,7 @@
       "field": "/problems",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3078,6 +3193,7 @@
       "field": "/rows",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3104,6 +3220,7 @@
       "field": "/runs",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3130,6 +3247,7 @@
       "field": "/ruleCoverage/{missing,duplicates,unknown,unaccountedCandidates}",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3156,6 +3274,7 @@
       "field": "/ruleCoverage/rows",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3182,6 +3301,7 @@
       "field": "/rows[*]/anchors",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3208,6 +3328,7 @@
       "field": "/rows[*]/disagreements",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3234,6 +3355,7 @@
       "field": "/rows[*]/notInReachConstructs",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3260,6 +3382,7 @@
       "field": "/rows[*]/rawStatuses",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3286,6 +3409,7 @@
       "field": "/rows[*]/readings",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3312,6 +3436,7 @@
       "field": "/rows[*]/violatingConstructs",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3338,6 +3463,7 @@
       "field": "/rows[*]/violatingChangedFileTargets",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3364,6 +3490,7 @@
       "field": "/anchor/constructs",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3390,6 +3517,7 @@
       "field": "/evidence/factIds",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3416,6 +3544,7 @@
       "field": "/evidence/violations",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3442,6 +3571,7 @@
       "field": "/manifestations",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3468,6 +3598,7 @@
       "field": "/remediation/changedCodeFix/evidenceFactIds",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3494,6 +3625,7 @@
       "field": "/remediation/changedCodeFix/targets",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3520,6 +3652,7 @@
       "field": "$payloads (PS array from corpus-index.json payloads field)",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3546,6 +3679,7 @@
       "field": "Import-ReviewerCorpusIndex return value — .Payloads (Dictionary[string,object])",
       "kind": "jsonObjectMap",
       "knownEscapeShape": false,
+      "boundaryValidator": "mapShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3572,6 +3706,7 @@
       "field": "$authoritativePaths (PS in-memory, CorpusSeal.ps1)",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3598,6 +3733,7 @@
       "field": "$authoritativeRightHand (HashSet[string] in New-ReviewerCorpusSealPlan)",
       "kind": "hashSet",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3624,6 +3760,7 @@
       "field": "$authoritativeSeen / $requestKeys / $payloadFiles / $contestedPaths (HashSet[string] membership checks in CorpusSeal.ps1)",
       "kind": "hashSet",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3650,6 +3787,7 @@
       "field": "$noRightHandPaths (PS in-memory, CorpusSeal.ps1)",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3676,6 +3814,7 @@
       "field": "$Plan.Evidence.siblings / rules / threads / facts (arrays in plan hashtable)",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3702,6 +3841,7 @@
       "field": "$plannedResources (List[object] in New-ReviewerCorpusSealPlan)",
       "kind": "list",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3728,6 +3868,7 @@
       "field": "$script:ReviewerCorpusIndexKinds",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3754,6 +3895,7 @@
       "field": "$script:ReviewerCorpusSealEnvelopes / $script:ReviewerCorpusSealTransportModes / $script:ReviewerCorpusSealSourceKinds",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3780,6 +3922,7 @@
       "field": "$script:ReviewerCorpusSealReservedFiles",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3806,6 +3949,7 @@
       "field": "Get-ReviewerCorpusSealSpanEvidence return value (OrderedDictionary path→@spans)",
       "kind": "jsonObjectMap",
       "knownEscapeShape": false,
+      "boundaryValidator": "mapShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3832,6 +3976,7 @@
       "field": "$.evidence.siblings / $.evidence.rules / $.evidence.threads / $.evidence.facts (in sidecar)",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3858,6 +4003,7 @@
       "field": "$.sourceTransport.gateReasonCodes (in offline-corpus-seal.json sidecar)",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3884,6 +4030,7 @@
       "field": "$.bindings.models",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3910,6 +4057,7 @@
       "field": "$.changedFiles[*]",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3936,6 +4084,7 @@
       "field": "$.changedFiles[*].changeKinds",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3962,6 +4111,7 @@
       "field": "$.changedFiles[*].spans",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -3988,6 +4138,7 @@
       "field": "$.changeSet.digestOrder",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4014,6 +4165,7 @@
       "field": "$.evidence.siblings / $.evidence.rules / $.evidence.threads / $.evidence.facts",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4040,6 +4192,7 @@
       "field": "$.resources[*]",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4066,6 +4219,7 @@
       "field": "$.sourceCensus.noRightHandPaths",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4092,6 +4246,7 @@
       "field": "$.sourceTransport.expected.gateReasonCodes",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4118,6 +4273,7 @@
       "field": "$arguments (List[string] in New-ReviewerQualificationSlotArgument)",
       "kind": "list",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4144,6 +4300,7 @@
       "field": "$marked (filtered prelaunch output lines)",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4170,6 +4327,7 @@
       "field": "$script:ReviewerQualificationRefusedSwitches",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4196,6 +4354,7 @@
       "field": "$.bindings.models",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4222,6 +4381,7 @@
       "field": "$.resources[*]",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4248,6 +4408,7 @@
       "field": "$.[] (root is JSON array)",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4274,6 +4435,7 @@
       "field": "$script:ReviewerSourceNonContentKinds",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4300,6 +4462,7 @@
       "field": "$script:ReviewerSourceNonTextExtensions",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4326,6 +4489,7 @@
       "field": "$script:ReviewerSourceNoSourceReasons",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4352,6 +4516,7 @@
       "field": "$script:ReviewerSourceNothingToReadReasons",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4378,6 +4543,7 @@
       "field": "$script:ReviewerSourceOmissionReasons",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4404,6 +4570,7 @@
       "field": "$script:ReviewerSourceReaderAuthoredRejections",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4430,6 +4597,7 @@
       "field": "Get-ReviewerSourceAzChangePage return value — .Changes",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4456,6 +4624,7 @@
       "field": "Get-ReviewerSourceAzIdentityCapture return value — .Response.changes",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4482,6 +4651,7 @@
       "field": "Get-ReviewerSourceAzIterationBinding return value — .ReasonNames",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4508,6 +4678,7 @@
       "field": "Get-ReviewerSourceChangedSpans return value (OrderedDictionary path→@spans)",
       "kind": "jsonObjectMap",
       "knownEscapeShape": false,
+      "boundaryValidator": "mapShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4534,6 +4705,7 @@
       "field": "Get-ReviewerSourceChangeKinds return value",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4560,6 +4732,7 @@
       "field": "Get-ReviewerSourceChangeKindsByPath return value (OrderedDictionary path→[string[]])",
       "kind": "jsonObjectMap",
       "knownEscapeShape": false,
+      "boundaryValidator": "mapShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4586,6 +4759,7 @@
       "field": "Get-ReviewerSourceDegenerateChanges return value (OrderedDictionary path→obj)",
       "kind": "jsonObjectMap",
       "knownEscapeShape": false,
+      "boundaryValidator": "mapShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4612,6 +4786,7 @@
       "field": "Get-ReviewerSourceDeterministicDiffResult return value — .Spans",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4638,6 +4813,7 @@
       "field": "Get-ReviewerSourceIterationPageBinding return value — .Changes, .ReasonNames",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4664,6 +4840,7 @@
       "field": "Get-ReviewerSourceRawChangedPaths return value",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4690,6 +4867,7 @@
       "field": "Get-ReviewerSourceRecoveredSpans return value — .RecoveredPaths, .SpansByPath, .SpanBasisByPath, .ExpectedSpanCountByPath, .AuthoritativeNoSourceByPath, .RecoveryFailureByPath",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4716,6 +4894,7 @@
       "field": "Get-ReviewerSourceSiblingSpans return value",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4742,6 +4921,7 @@
       "field": "New-ReviewerSourceFileEntry return value — .Slices, .SiblingSlices, .RawSpans",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4768,6 +4948,7 @@
       "field": "New-ReviewerSourceFileSlices return value — .Slices, .SiblingSlices",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4794,6 +4975,7 @@
       "field": "New-ReviewerSourceTransportReport return value — .Files",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4820,6 +5002,7 @@
       "field": "Resolve-ReviewerSourceChangeEntries return value",
       "kind": "psCollectionReturn",
       "knownEscapeShape": true,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4846,6 +5029,7 @@
       "field": "Split-ReviewerSourceLines return value",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4872,6 +5056,7 @@
       "field": "$.allowedMimeTypes",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4898,6 +5083,7 @@
       "field": "$Constructs (psCollectionReturn from Get-ReviewerChangedInvocations / Get-ReviewerChangedDeclarations)",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4924,6 +5110,7 @@
       "field": "$.attributeFrequency (from Get-ReviewerConstructAttributeFrequency)",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4950,6 +5137,7 @@
       "field": "$.construct.absentHere",
       "kind": "jsonArray",
       "knownEscapeShape": true,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -4976,6 +5164,7 @@
       "field": "$.construct.attributes",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5002,6 +5191,7 @@
       "field": "$.construct.siblingAttributes",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5028,6 +5218,7 @@
       "field": "$.Lines / $.CommentLines (from Get-ReviewerConstructMaskedLines)",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5054,6 +5245,7 @@
       "field": "$changedFileIndex (returned from Get-ReviewerConventionSpecialistChangedFileIndex)",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5080,6 +5272,7 @@
       "field": "$.changedFileIndex[*].rightHandRanges",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5106,6 +5299,7 @@
       "field": "$.selectedPacks",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5132,6 +5326,7 @@
       "field": "$.selectedPacks[*].matchedPaths",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5158,6 +5353,7 @@
       "field": "$.selectedPacks[*].sources",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5184,6 +5380,7 @@
       "field": "$.withheldPacks",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5210,6 +5407,7 @@
       "field": "$.selectedPacks[*].matchedPaths[*].changeTypes",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5236,6 +5434,7 @@
       "field": "$.selectedPacks[*].matchedPaths[*].globs",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5262,6 +5461,7 @@
       "field": "$.Packs[*].AuthoritativeSourceRefs",
       "kind": "list",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5288,6 +5488,7 @@
       "field": "$.Packs[*].ChangedPathGlobs",
       "kind": "list",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5314,6 +5515,7 @@
       "field": "$.Packs[*].RepositorySources",
       "kind": "list",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5340,6 +5542,7 @@
       "field": "$.cloudTest.manifestFileNames",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5366,6 +5569,7 @@
       "field": "$.cloudTest.projectExtensions",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5392,6 +5596,7 @@
       "field": "$.cloudTest.testPathGlobs",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5418,6 +5623,7 @@
       "field": "$.fanOut.companionRules",
       "kind": "jsonArray",
       "knownEscapeShape": true,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5444,6 +5650,7 @@
       "field": "$.fanOut.filePathGlobs",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5470,6 +5677,7 @@
       "field": "$.metadata.requiredSections",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5496,6 +5704,7 @@
       "field": "$.metadata.tagNames",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5522,6 +5731,7 @@
       "field": "$.domains",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5548,6 +5758,7 @@
       "field": "$.facts",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5574,6 +5785,7 @@
       "field": "$.hashes.scriptClosure",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5600,6 +5812,7 @@
       "field": "$.facts[*].value.categories",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5626,6 +5839,7 @@
       "field": "$.facts[*].value.categorySha256",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5652,6 +5866,7 @@
       "field": "$.facts[*].evidence",
       "kind": "jsonArray",
       "knownEscapeShape": true,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5678,6 +5893,7 @@
       "field": "$seenOriginIds (HashSet[string] — per-origin duplicate suppression)",
       "kind": "hashSet",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5704,6 +5920,7 @@
       "field": "$result (→ $result.ToArray())",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5730,6 +5947,7 @@
       "field": "$result (→ $result.ToArray())",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5756,6 +5974,7 @@
       "field": "return.eligible / return.withheld / return.decisions",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5782,6 +6001,7 @@
       "field": "threadFact.authorClasses",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5808,6 +6028,7 @@
       "field": "$records (→ $records.ToArray())",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5834,6 +6055,7 @@
       "field": "/decisions",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5860,6 +6082,7 @@
       "field": "/eligiblePreviewCandidates",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5886,6 +6109,7 @@
       "field": "/candidates",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5912,6 +6136,7 @@
       "field": "/withheld",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5938,6 +6163,7 @@
       "field": "$script:ReviewerVerificationOutcomes",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5964,6 +6190,7 @@
       "field": "$script:ReviewerVerificationWithheldReasons",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -5990,6 +6217,7 @@
       "field": "/selectedPacks",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -6016,6 +6244,7 @@
       "field": "/selectedPacks[*]/matchedPaths",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -6042,6 +6271,7 @@
       "field": "/selectedPacks[*]/sources",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -6068,6 +6298,7 @@
       "field": "$assignments (→ $assignments.ToArray())",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -6094,6 +6325,7 @@
       "field": "$bindings (→ $bindings.ToArray())",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -6120,6 +6352,7 @@
       "field": "$list (→ $list.ToArray())",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -6146,6 +6379,7 @@
       "field": "$cluster.members  (→ cluster[].members array)",
       "kind": "psCollectionReturn",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -6172,6 +6406,7 @@
       "field": "$cluster.memberHashes",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -6198,6 +6433,7 @@
       "field": "$cluster.origins (from HashSet[string] → List → ToArray())",
       "kind": "hashSet",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -6224,6 +6460,7 @@
       "field": "/ruleCoverage/changedFileAnchors",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -6250,6 +6487,7 @@
       "field": "/ruleCoverage/changedFileAnchors[*]/rightHandRanges",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -6276,6 +6514,7 @@
       "field": "/existingDebtEvidence/attributeFrequency",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",
@@ -6302,6 +6541,7 @@
       "field": "/findings",
       "kind": "jsonArray",
       "knownEscapeShape": false,
+      "boundaryValidator": "collectionShape",
       "boundaryNormalizer": {
         "zero": "covered",
         "one": "covered",

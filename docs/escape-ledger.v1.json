@@ -9,6 +9,9 @@
     "endCommit": "74e476a",
     "notes": "Gate 0 is the first coordinator-authored change merged into this repository (introduction of the reviewer agent). The window closes at the head this hardening layer is stacked on. Ten coordinator changes have been merged in the window; every incident below was found in deterministic execution because no shadow or live coordinator run has ever been performed.",
     "coordinatorChangesObserved": 10,
+    "coordinatorChangesObservedRule": "Derived, not asserted: the highest coordinatorChangeOrdinal recorded on any incident. CI recomputes it and fails when this published value disagrees.",
+    "evaluatedOnRule": "Derived, not asserted: the committer date of endCommit, which must also equal the newest incident detectedOn. CI recomputes both and fails when this published value disagrees.",
+    "staleAfterCommitsBehindHead": 40,
     "evaluatedOn": "2026-08-18"
   },
   "vocabulary": {
@@ -65,7 +68,7 @@
   },
   "budget": {
     "id": "typed-control-plane-trigger",
-    "statement": "If two or more type-binding escapes reach shadow or live execution within a window of ten merged coordinator changes or sixty days, whichever comes first, the conditional typed control-plane pivot stops being optional and is scheduled as the next coordinator change.",
+    "statement": "If two or more type-binding escapes reach shadow or live execution within either the last ten merged coordinator changes or the last sixty days, the conditional typed control-plane pivot stops being optional and is scheduled as the next coordinator change.",
     "threshold": {
       "category": "typeBinding",
       "reachedExecutionStages": [
@@ -96,7 +99,8 @@
         "ESC-0009",
         "ESC-0010",
         "ESC-0011",
-        "ESC-0012"
+        "ESC-0012",
+        "ESC-0013"
       ]
     }
   },
@@ -267,6 +271,7 @@
       "detectedOn": "2026-08-13",
       "coordinatorChangeOrdinal": 9
     },
+
     {
       "id": "ESC-0012",
       "title": "Latent protected-return wrapping sites present in current code",
@@ -274,9 +279,9 @@
       "executionStage": "deterministic",
       "reachedShadowOrLive": false,
       "status": "openDebt",
-      "summary": "The rule introduced for ESC-0002 finds eleven further sites in current source and test code that wrap a protected collection return in an array subexpression. Each is the same nesting hazard; none has been rewritten in this change because mechanically rewriting unrelated code is out of scope for a prerequisite layer.",
+      "summary": "The rule introduced for ESC-0002 finds eleven further sites in current source and test code that wrap a protected collection return in an array subexpression. Each was read against its producer and consumer rather than baselined in bulk: three were live production defects and are fixed in this change, one is latent behind a caller-side non-empty precondition, one is compensated by an explicit flattening step at the consumer, and six are test-harness assertions. The eight that remain are carried as debt because rewriting them means changing producer contracts and call sites that this prerequisite layer must not touch.",
       "detector": "PSEN011 in tools/Find-PowerShellEmptyNullHazard.ps1",
-      "regressionGuard": "The eleven sites are recorded in tools/testdata/powershell-boundary-baseline.v1.json with rationale; tools/Test-PowerShellBoundaryHardening.ps1 blocks any twelfth site.",
+      "regressionGuard": "The eight sites that were not rewritten are recorded in tools/testdata/powershell-boundary-baseline.v1.json with rationale - two in production code and six in test harnesses; tools/Test-PowerShellBoundaryHardening.ps1 blocks any further site. The analyzer fixture corpus is excluded from the repository scan by name and is not part of that count.",
       "introducedCommit": "74e476a",
       "siteCount": 11,
       "detectedOn": "2026-08-18",
@@ -333,12 +338,45 @@
           "assessment": "Deliberate hazards authored so the rule can be shown to fire. Excluded from the repository scan by name."
         }
       ]
+    },
+    {
+      "id": "ESC-0013",
+      "title": "Verification tooling failed open: exemption holes, name-collision silencing, and container-for-leaf citation matching",
+      "category": "typeBinding",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "remediated",
+      "summary": "Independent review of this prerequisite layer found three ways its own detectors reported green while not checking what they claimed. The protected-return exemption counted an unrecognised exit as nothing, so one protected exit silenced the assignment rules for a whole function even when another exit returned a multi-element pipeline or a cast to an enumerating collection type. Cross-file name resolution skipped the nesting fact along with the exemption, so a single unprotected same-named stub in a test file disabled the bare-collection-return rule on every production call site of that name and raised a false flattening finding there. And the inventory citation check accepted any path segment, so a citation pointing at the wrong file passed whenever that file mentioned the generic container name; five live citations were wrong under that rule. A detector that fails open is worse than no detector, because it is recorded as evidence.",
+      "detector": "Independent review of the change, reproduced by fixtures in tools/testdata/boundary-hardening-analyzer.fixtures.ps1 and sabotage checks in tools/Test-ReviewerCollectionCardinality.ps1",
+      "regressionGuard": "Two exemption-soundness fixtures (multi-element pipeline exit and enumerating-cast exit) and a cross-file gate that builds a producer, a consumer, and a same-named unprotected mock in a temporary tree and requires identical findings with and without the mock, all in tools/Test-PowerShellBoundaryHardening.ps1. Three citation sabotage checks pin container-is-not-leaf, short-leaf retention, and prose-suffix rejection; the five wrong citations are corrected and the unverifiable rows are published as citationsUnverified rather than counted as checked.",
+      "introducedCommit": "74e476a",
+      "remediatedCommit": "unreleased",
+      "siteCount": 3,
+      "detectedOn": "2026-08-18",
+      "coordinatorChangeOrdinal": 10,
+      "sites": [
+        {
+          "location": "protected-return exemption, unrecognised exit shapes",
+          "risk": "remediated",
+          "assessment": "A return whose pipeline had more than one element, and a cast to List/ArrayList/Collection, were both counted as neither protected nor unprotected. One protected exit then bought the exemption for the whole function. Latent in this repository today - no current finding changed - but it is the exact escape shape the rules exist to catch."
+        },
+        {
+          "location": "cross-file function name resolution",
+          "risk": "remediated",
+          "assessment": "When a name was defined in more than one file and not locally, both the exemption and the nesting fact were skipped. Skipping the nesting fact disabled PSEN011, the rule that found three live defects in this change, on every production call site of that name. Now split: exemption stays conservative, nesting stays permissive."
+        },
+        {
+          "location": "inventory citation field matching",
+          "risk": "remediated",
+          "assessment": "Any path segment satisfied the check, so the container name stood in for the leaf. Five citations named the wrong file and passed. The leaf is now required, both path notations are handled, no minimum token length is applied, and rows with no leaf are published as unverified."
+        }
+      ]
     }
   ],
   "gateObservations": [
     {
       "gate": "Gate 5",
-      "observation": "The gate produced no deliverable decision: every candidate was withheld or reconciled away, so the decision yield was zero per cent. The no-write invariant held throughout, which is why no incident in this ledger reached shadow or live execution.",
+      "observation": "The gate produced no deliverable decision: every candidate was withheld or reconciled away, so the decision yield was zero per cent. No incident in this ledger reached shadow or live execution because no shadow or live run has ever been performed - not because those runs were contained. Separately, the no-write invariant held throughout: zero external writes were made. The two are independent, since a shadow run invokes models and discards its output and is therefore compatible with zero writes.",
       "decisionYieldPercent": 0,
       "externalWrites": 0,
       "noWriteInvariantHeld": true,
@@ -355,24 +393,32 @@
         "id": "cardinality-corpus",
         "title": "Cardinality and property corpus over every collection-bearing stage contract",
         "complete": true,
-        "evidence": "tools/testdata/reviewer-collection-inventory.v1.json inventories 236 collection fields across twelve stages; tools/Test-ReviewerCollectionCardinality.ps1 exercises all of them at seven cardinality variants, routes the five map-valued fields through map-specific assertions rather than array ones, proves eleven escape shapes as properties, runs nine sabotage checks, and verifies all 416 producer and consumer citations still resolve to files that mention the field; tools/testdata/reviewer-collection-cardinality-matrix.v1.json records coverage per field, keeps the uncovered producer-path dimension separate, and does not claim full coverage."
+        "inForce": false,
+        "inForceNote": "Built, not in force: the corpus drives the shared contract, not the owning stages. All 1652 producer-path cells are open, so no live stage boundary is covered by it today.",
+        "evidence": "tools/testdata/reviewer-collection-inventory.v1.json inventories 236 collection fields across twelve stages; tools/Test-ReviewerCollectionCardinality.ps1 exercises all of them at seven cardinality variants, routes the five map-valued fields through the stage contract's map validator rather than its list normalizer, proves eleven escape shapes as properties, runs nine sabotage checks, and verifies all 416 producer and consumer citations still resolve to files that mention the field - a liveness check on the rows that exist, not a completeness check on the inventory, whose completeness remains unverified; tools/testdata/reviewer-collection-cardinality-matrix.v1.json records coverage per field, keeps the uncovered producer-path dimension separate, and does not claim full coverage."
       },
       {
         "id": "file-contract",
         "title": "Versioned file contract for stage child outputs",
         "complete": true,
-        "evidence": "src/Agents/reviewer/StageContract.ps1 and src/Agents/reviewer/schemas/reviewer.stage-envelope.v1.json require a contract version and kind, write UTF-8 without a byte order mark to a caller-specified file, fix the JSON depth and form explicitly, and fail closed on unknown, missing, truncated, empty, scalar-collapsed, or stream-contaminated payloads; tools/Test-ReviewerStageContract.ps1 covers every rejection plus atomicity and the read-only inventory."
+        "inForce": false,
+        "inForceNote": "Built, not in force: no stage writes or reads its child outputs through this contract yet. Adoption is a separate change.",
+        "evidence": "src/Agents/reviewer/StageContract.ps1 and src/Agents/reviewer/schemas/reviewer.stage-envelope.v1.json require a contract version and kind, write UTF-8 without a byte order mark to a caller-specified file, fix the JSON depth and form explicitly, and fail closed on unknown, missing, truncated, empty, scalar-collapsed, or stream-contaminated payloads, and validate declared maps separately from declared collections because a map has no correct repair from an array or a scalar; tools/Test-ReviewerStageContract.ps1 covers every rejection plus atomicity and the read-only inventory."
       },
       {
         "id": "boundary-analyzer",
         "title": "Boundary hardening analyzer with a blocking new-violation gate",
         "complete": true,
+        "inForce": true,
+        "inForceNote": "In force: every push is scanned and any finding absent from the baseline fails CI.",
         "evidence": "tools/Find-PowerShellEmptyNullHazard.ps1 implements eleven rules; tools/Test-PowerShellBoundaryHardening.ps1 proves each rule against labelled fixtures and blocks any finding absent from tools/testdata/powershell-boundary-baseline.v1.json, whose entries carry per-rule rationale."
       },
       {
         "id": "escape-ledger",
         "title": "Escape ledger and budget with a registered trigger",
         "complete": true,
+        "inForce": true,
+        "inForceNote": "In force: counts, the rolling window, and the trigger are recomputed from the incident data on every push, and the evaluation clock is derived from git rather than authored.",
         "evidence": "This ledger, its schema, and tools/Test-EscapeLedger.ps1, which validates the schema, recomputes every count from the incident list, and re-evaluates the trigger."
       }
     ],

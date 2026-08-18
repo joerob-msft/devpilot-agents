@@ -80,6 +80,8 @@ $cases = @(
     @{ Label = 'Positive-CountsInputObjectHelperResult'; Positive = $true; RuleId = 'PSEN009' }
     @{ Label = 'Positive-CountsMixedProtectionHelperResult'; Positive = $true; RuleId = 'PSEN009' }
     @{ Label = 'Positive-WrapsMixedProtectionHelperResult'; Positive = $true; RuleId = 'PSEN011' }
+    @{ Label = 'Positive-CountsPipelineExitHelperResult'; Positive = $true; RuleId = 'PSEN009' }
+    @{ Label = 'Positive-CountsListCastExitHelperResult'; Positive = $true; RuleId = 'PSEN009' }
 )
 
 $tokens = $null
@@ -121,6 +123,57 @@ foreach ($case in $cases) {
             RuleId = $case.RuleId
             Classification = $classification
         })
+}
+
+# ------------------------------------------- cross-file name-resolution gate
+
+# PSEN011 is the rule that finds bare collection returns, so it must not be
+# silenced by an unrelated same-named definition elsewhere in the scan. A
+# one-line unprotected mock in a test file used to remove the name from the
+# nesting set entirely, which turned off the rule on every production call
+# site of that name and simultaneously raised a false PSEN009 there.
+$crossFileRoot = Join-Path ([IO.Path]::GetTempPath()) ("boundary-crossfile-" + [guid]::NewGuid().ToString('N').Substring(0, 12))
+$crossFileFailures = [System.Collections.Generic.List[string]]::new()
+try {
+    [void](New-Item -ItemType Directory -Path $crossFileRoot)
+    $encoding = [Text.UTF8Encoding]::new($false)
+    [IO.File]::WriteAllText((Join-Path $crossFileRoot 'producer.ps1'), @'
+function Get-CrossFileArgs {
+    param([object[]]$Rows = @())
+    $list = [System.Collections.Generic.List[object]]::new()
+    foreach ($row in $Rows) { [void]$list.Add($row) }
+    return , $list
+}
+'@, $encoding)
+    [IO.File]::WriteAllText((Join-Path $crossFileRoot 'consumer.ps1'), @'
+$wrapped = @(Get-CrossFileArgs -Rows @(1, 2))
+$wrapped.Count
+'@, $encoding)
+
+    $mockPath = Join-Path $crossFileRoot 'mock.ps1'
+    $withoutMock = @(& $analyzer -Path $crossFileRoot -Recurse -RuleId $boundaryRules -OutputFormat Json | ConvertFrom-Json)
+    [IO.File]::WriteAllText($mockPath, "function Get-CrossFileArgs { param([object[]]`$Rows = @()) return @(`$Rows) }`n", $encoding)
+    $withMock = @(& $analyzer -Path $crossFileRoot -Recurse -RuleId $boundaryRules -OutputFormat Json | ConvertFrom-Json)
+
+    foreach ($probe in @(
+            @{ Label = 'without mock'; Findings = $withoutMock },
+            @{ Label = 'with mock'; Findings = $withMock })) {
+        $consumerFindings = @($probe.Findings | Where-Object { ([string]$_.File).EndsWith('consumer.ps1') })
+        $nesting = @($consumerFindings | Where-Object { $_.RuleId -eq 'PSEN011' })
+        $flatten = @($consumerFindings | Where-Object { $_.RuleId -eq 'PSEN009' })
+        if ($nesting.Count -ne 1) {
+            [void]$crossFileFailures.Add("PSEN011 must fire once on the production call site $($probe.Label); got $($nesting.Count).")
+        }
+        if ($flatten.Count -ne 0) {
+            [void]$crossFileFailures.Add("PSEN009 must not fire on correct production code $($probe.Label); got $($flatten.Count).")
+        }
+    }
+} finally {
+    if (Test-Path -LiteralPath $crossFileRoot) { Remove-Item -LiteralPath $crossFileRoot -Recurse -Force }
+}
+if ($crossFileFailures.Count -gt 0) {
+    foreach ($failure in $crossFileFailures) { Write-Host "FAIL: $failure" -ForegroundColor Red }
+    exit 1
 }
 
 # --------------------------------------------------------------- repository gate

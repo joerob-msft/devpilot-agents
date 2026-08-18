@@ -24,13 +24,16 @@
     "coverageWindow": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["startGate", "startCommit", "endCommit", "coordinatorChangesObserved", "evaluatedOn"],
+      "required": ["startGate", "startCommit", "endCommit", "coordinatorChangesObserved", "coordinatorChangesObservedRule", "evaluatedOn", "evaluatedOnRule", "staleAfterCommitsBehindHead"],
       "properties": {
         "startGate": { "type": "string", "minLength": 1 },
         "startCommit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
         "endCommit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
         "coordinatorChangesObserved": { "type": "integer", "minimum": 0 },
+        "coordinatorChangesObservedRule": { "type": "string", "minLength": 1 },
         "evaluatedOn": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+        "evaluatedOnRule": { "type": "string", "minLength": 1 },
+        "staleAfterCommitsBehindHead": { "type": "integer", "minimum": 1 },
         "notes": { "type": "string" }
       }
     },
@@ -172,7 +175,7 @@
           "detectedOn": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
           "coordinatorChangeOrdinal": { "type": "integer", "minimum": 1 },
           "introducedCommit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
-          "remediatedCommit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+          "remediatedCommit": { "type": "string", "pattern": "^([0-9a-f]{7,40}|unreleased)$" },
           "siteCount": { "type": "integer", "minimum": 1 },
           "sites": {
             "type": "array",
@@ -235,11 +238,13 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["id", "title", "complete", "evidence"],
+            "required": ["id", "title", "complete", "inForce", "inForceNote", "evidence"],
             "properties": {
               "id": { "type": "string", "minLength": 1 },
               "title": { "type": "string", "minLength": 1 },
               "complete": { "type": "boolean" },
+              "inForce": { "type": "boolean" },
+              "inForceNote": { "type": "string", "minLength": 1 },
               "evidence": { "type": "string", "minLength": 1 }
             }
           }
