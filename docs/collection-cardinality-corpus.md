@@ -42,13 +42,47 @@ cardinality variants:
 | `zero` | empty collection | 0 elements |
 | `one` | single element | 1 element |
 | `many` | three elements | 3 elements |
-| `max` | the declared maximum | that many elements |
+| `max` | a fixed upper-bound sample of 32 elements | 32 elements |
 | `duplicate` | repeated elements | all of them, duplicates intact |
 | `nullVsMissing` | `$null` where the field is declared | 0 elements, distinguishable from absent |
 | `wrongScalar` | a bare scalar where a collection is declared | 1 element |
 
 That is **1,652 boundary cases**, each written through the stage contract, serialized, read
 back, and counted.
+
+## What a boundary case actually exercises
+
+Each case drives one inventoried field's declared *kind* and *cardinality* through the
+shared contract using a neutral probe payload. It does **not** invoke the stage that owns
+the field, and it does not use the field's own name, declared maximum, or producer. The
+inventory row supplies the field kind and the variant set; the rest of the row — producer,
+consumer, contract, required-ness — is inventory metadata, not test input.
+
+Two consequences follow, and neither is hidden by the matrix:
+
+* `max` is a fixed 32-element sample, not a per-field declared maximum. No stage contract in
+  this repository declares a maximum element count, so there is nothing to read; 32 is
+  chosen to exceed every cardinality the corpus otherwise exercises.
+* `wrongScalar` passes because the contract writer repairs an unrolled singleton, which is
+  the behaviour under test. The producer-side question — whether the stage should have
+  emitted a scalar at all — is answered by `-StrictShape`, which reports the collapse
+  instead of repairing it, not by this variant.
+
+This is why the matrix keeps `producerPath` as a separate, entirely uncovered dimension
+rather than folding it into a single coverage number.
+
+## Maps are not arrays
+
+Five inventoried fields are JSON objects used as maps, and they collapse differently. An
+empty map must serialize as `{}` and not `[]`; a one-key map must not read back as its
+single value; and a scalar where a map was declared has no meaningful repair, because a map
+has keys and a scalar has none, so the only correct answer is to refuse it. The `duplicate`
+variant for a map is duplicate *values* under distinct keys, since a map cannot carry a
+duplicate key at all.
+
+Those rows run through a separate map path with those assertions instead of the array
+harness. Driving them as arrays would have reported seven covered variants each while
+testing none of the failures that actually apply to them.
 
 ## Escape-shape properties
 
@@ -75,6 +109,29 @@ asserts it fails closed.
 
 Sabotage answers the question a passing test suite cannot: *would this have caught the
 escape?* Each historical collapse in the ledger has a sabotage check that reproduces it.
+
+The claim is bounded: a sabotage check proves the detector recognises the escape *shape* as
+re-authored here, not that it would have fired on the exact historical source. Proving the
+stronger claim means running the analyzer against the pre-fix snapshots themselves, which
+is left as a follow-up rather than asserted here.
+
+## Inventory rot
+
+An inventory is only useful while its citations are true. Every row names a producer and a
+consumer, and the check resolves each cited file against the repository and confirms the
+file still mentions the field. 416 citations are checked. A row that cites a deleted file,
+a bare file name that now matches more than one file, or a file that no longer mentions the
+field fails the build.
+
+Two exemptions are deliberate and narrow. A quoted literal inside a citation is data the
+cited code contains, not a second citation. And a row whose field is a producer-local
+PowerShell variable rather than a serialized field gets the file-existence check only,
+because the consuming file knows that value by its own parameter name.
+
+The detector has its own sabotage checks: a citation of a nonexistent file must fail to
+resolve, a bare name that exists exactly once must resolve, and a field name that appears
+nowhere must be reported as absent. A rot detector that reports nothing is otherwise
+indistinguishable from one that is broken.
 
 ## Coverage matrix, and what it does not claim
 

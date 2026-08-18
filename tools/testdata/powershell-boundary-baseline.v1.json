@@ -11,7 +11,7 @@
     "tools/testdata/boundary-hardening-analyzer.fixtures.ps1",
     "tools/testdata/collection-escape-shapes.fixtures.ps1"
   ],
-  "totalFindings": 444.0,
+  "totalFindings": 442.0,
   "rules": [
     {
       "ruleId": "PSEN001",
@@ -21,7 +21,7 @@
     },
     {
       "ruleId": "PSEN002",
-      "count": 39,
+      "count": 38,
       "status": "debt",
       "rationale": "Array subexpressions that can retain an explicit null. Most surviving sites are adversarial fixtures and predicate references, kept as debt rather than rewritten mechanically."
     },
@@ -63,7 +63,7 @@
     },
     {
       "ruleId": "PSEN009",
-      "count": 165,
+      "count": 167,
       "status": "debt",
       "rationale": "Non-preserved command result later counted or indexed. The largest debt class and the one with the weakest static evidence, so it is reported, never auto-rewritten."
     },
@@ -75,7 +75,7 @@
     },
     {
       "ruleId": "PSEN011",
-      "count": 11,
+      "count": 8,
       "status": "debt",
       "rationale": "An @() wrap around a deliberately protected collection return, which nests instead of flattens. This is the anchor-index nesting shape; the baseline is expected to stay small and every new site is blocked."
     }
@@ -83,44 +83,68 @@
   "entries": [
     {
       "ruleId": "PSEN005",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "5b02c963c95570c1",
+      "file": "tools/Invoke-ReviewerBlindedAcquisition.ps1",
+      "fingerprint": "76caeb8437c48afd",
       "count": 1
     },
     {
-      "ruleId": "PSEN007",
+      "ruleId": "PSEN009",
       "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "728aefca8f324a70",
+      "fingerprint": "9bf7327712fe8081",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "b1aaef9bfa100ec0",
+      "count": 3
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "5b46b459f92c168f",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "0b0e7decfe640465",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN001",
+      "file": "tools/Test-CrossVerification.ps1",
+      "fingerprint": "3a46211b8737051a",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN001",
+      "file": "tools/Test-CrossVerification.ps1",
+      "fingerprint": "7cf68c6d7d277987",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "fbb7cb2787b5c293",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "403cfd7d044ef164",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "1768d897003756d9",
       "count": 1
     },
     {
       "ruleId": "PSEN001",
       "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "60bdf0fee2898aa8",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-ConventionSpecialist.ps1",
-      "fingerprint": "81f4e5fb963cbd1c",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "fafd321b2643b17a",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
-      "fingerprint": "ad85e5c862a4ae3c",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN007",
-      "file": "tools/Invoke-ReviewerBlindedAcquisition.ps1",
-      "fingerprint": "592708f9ddcaa76e",
+      "fingerprint": "f75bf0fcf4a66522",
       "count": 1
     },
     {
@@ -131,92 +155,50 @@
     },
     {
       "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "97242d87ecad8e5d",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "e3d9690584bd9a67",
+      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
+      "fingerprint": "246f817844eaaafa",
       "count": 1
     },
     {
       "ruleId": "PSEN002",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "2778c90524cc8ff2",
+      "file": "src/Agents/reviewer/offline/Invoke-ReviewerModelAdapter.ps1",
+      "fingerprint": "96f41c58b4c036fa",
       "count": 1
     },
     {
       "ruleId": "PSEN009",
-      "file": "tools/Convert-ReviewerBlindedBenchmarkPack.ps1",
-      "fingerprint": "5209f651e77c6092",
+      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
+      "fingerprint": "26af730e46a03c7a",
       "count": 1
     },
     {
-      "ruleId": "PSEN001",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "f42207018ee3a731",
-      "count": 3
-    },
-    {
-      "ruleId": "PSEN007",
-      "file": "tools/Test-ReviewerExactPath.ps1",
-      "fingerprint": "e9049d5c01a28ea1",
-      "count": 4
-    },
-    {
-      "ruleId": "PSEN009",
+      "ruleId": "PSEN005",
       "file": "tools/Test-ReviewerBenchmarkPackMaterializer.ps1",
-      "fingerprint": "70fb253ba4738b48",
+      "fingerprint": "4731bd7d11246096",
       "count": 1
     },
     {
-      "ruleId": "PSEN008",
-      "file": "tools/Test-ReviewerReplayQualification.ps1",
-      "fingerprint": "17718e1d3b1ce490",
+      "ruleId": "PSEN009",
+      "file": "tools/New-SealParityVectors.ps1",
+      "fingerprint": "4898ba6f8485e9b3",
       "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/ConventionSpecialist.ps1",
+      "fingerprint": "ac470a7441b26828",
+      "count": 2
     },
     {
       "ruleId": "PSEN009",
       "file": "tools/Test-CorpusReplaySeal.ps1",
-      "fingerprint": "61a869cf5ab7a522",
+      "fingerprint": "6ad9ef24d7e3a4ea",
       "count": 1
     },
     {
       "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/SourceTransport.ps1",
-      "fingerprint": "c6bdd3470ebee0be",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "tools/Test-ReviewerEvaluation.ps1",
-      "fingerprint": "fb532fff7f61eb25",
-      "count": 3
-    },
-    {
-      "ruleId": "PSEN003",
-      "file": "tools/Test-PowerShellBoundaryHardening.ps1",
-      "fingerprint": "19bf40bb1564a6e1",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-CrossVerification.ps1",
-      "fingerprint": "4d658b0e5632046a",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "734e7b0cf4202469",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN011",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "5f185055529828f6",
+      "file": "tools/Invoke-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "b891a375f40965f3",
       "count": 1
     },
     {
@@ -232,94 +214,52 @@
       "count": 1
     },
     {
-      "ruleId": "PSEN009",
-      "file": "tools/Convert-ReviewerBlindedBenchmarkPack.ps1",
-      "fingerprint": "eb906e5ecb76a9cb",
+      "ruleId": "PSEN005",
+      "file": "tools/Test-CrossVerification.ps1",
+      "fingerprint": "5e74ee3cdb1d6157",
       "count": 1
     },
     {
-      "ruleId": "PSEN009",
-      "file": "tools/Compare-DuplicatedFunctions.ps1",
-      "fingerprint": "5f06a237946434f4",
-      "count": 1
+      "ruleId": "PSEN005",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "135a04e740d66088",
+      "count": 3
     },
     {
       "ruleId": "PSEN002",
       "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "1bb5bc168814f141",
+      "fingerprint": "1df03e532e7bf465",
       "count": 1
     },
     {
       "ruleId": "PSEN009",
       "file": "tools/Test-ConventionSpecialist.ps1",
-      "fingerprint": "829e3ca2e8bffceb",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "74a371daf84f8950",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
-      "fingerprint": "5656802c3a0c5488",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "6856ee36096b3985",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/RunReconciliation.ps1",
-      "fingerprint": "3234eb5eff5030ac",
+      "fingerprint": "98c423d079617e27",
       "count": 1
     },
     {
       "ruleId": "PSEN008",
-      "file": "tools/Invoke-AgentControl.ps1",
-      "fingerprint": "371287b4849c6bf9",
-      "count": 1
+      "file": "tools/Test-ReviewerBlindedAcquisition.ps1",
+      "fingerprint": "deed55e3c5c9e4d5",
+      "count": 3
     },
     {
-      "ruleId": "PSEN007",
-      "file": "tools/Invoke-ReviewerBlindedAcquisition.ps1",
-      "fingerprint": "263cf98446bdc505",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
+      "ruleId": "PSEN010",
       "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "67d9c430286e4989",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "tools/Test-ReplaySnapshot.ps1",
-      "fingerprint": "c2f7723585a5b423",
-      "count": 4
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/ConventionPacks.ps1",
-      "fingerprint": "36dc425a62e342d6",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "tools/Test-ConventionSpecialist.ps1",
-      "fingerprint": "6cce7b52b408d93f",
+      "fingerprint": "49d420592ca4ac24",
       "count": 1
     },
     {
       "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/ConventionPacks.ps1",
-      "fingerprint": "35d1db38dc2791d3",
+      "file": "src/Agents/reviewer/SourceTransport.ps1",
+      "fingerprint": "c6bdd3470ebee0be",
       "count": 1
+    },
+    {
+      "ruleId": "PSEN010",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "d808e1a33b36f247",
+      "count": 2
     },
     {
       "ruleId": "PSEN008",
@@ -328,291 +268,15 @@
       "count": 1
     },
     {
-      "ruleId": "PSEN008",
-      "file": "tools/Invoke-ReviewerReplayQualification.ps1",
-      "fingerprint": "366bbf39e8776cd8",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN001",
+      "ruleId": "PSEN009",
       "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "b25f16fcf7799e7c",
-      "count": 2
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/ConventionSpecialist.ps1",
-      "fingerprint": "ac470a7441b26828",
-      "count": 2
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Invoke-ReviewerReplayQualification.ps1",
-      "fingerprint": "13791ce7aa558db8",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/SourceTransport.ps1",
-      "fingerprint": "4399cb39578f05eb",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN006",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "d0c990cbf18c13f7",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "274fbe0d6b333e04",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "f3456986e6dc9f7f",
+      "fingerprint": "5c1b2f99fa3c37ab",
       "count": 1
     },
     {
       "ruleId": "PSEN009",
       "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "7700bc0ddb4d5246",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "1867f518cc1fe2e5",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/SourceTransport.ps1",
-      "fingerprint": "1bb73e73c58d18ec",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "228e061ffcbe11ec",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "6de1b72b3cca11b0",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-CrossVerification.ps1",
-      "fingerprint": "2f6eae5079963c01",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Invoke-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "b891a375f40965f3",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "src/Agents/reviewer/DeliveryGates.ps1",
-      "fingerprint": "fb6510678f0764b0",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "692c649d796bb1a1",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "tools/Test-ReviewerExactPath.ps1",
-      "fingerprint": "ef438dfface92c0b",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "b48433607bbfcd15",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
-      "fingerprint": "8afc342a4d6bfdc4",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "src/Agents/reviewer/SourceTransport.ps1",
-      "fingerprint": "04984a9837a47f40",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
-      "fingerprint": "89d7822527d317e2",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN007",
-      "file": "tools/Invoke-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "755e3ee3db57b63f",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "tools/Test-ReplaySnapshot.ps1",
-      "fingerprint": "cd239efac6da5931",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "7a37e40c82d18d8e",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-ConventionSpecialist.ps1",
-      "fingerprint": "4ee1b8e77a5899b8",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "src/Agents/reviewer/evaluation/Evaluation.ps1",
-      "fingerprint": "eb1ec05bc095e9ee",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "28f18911b3e3f74a",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "tools/Test-ReviewerBenchmarkPackMaterializer.ps1",
-      "fingerprint": "ba1183398097e570",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "6ba88066a7ede7b3",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "tools/Test-ReviewerExactPath.ps1",
-      "fingerprint": "f463bc092b49533a",
-      "count": 3
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "e29950d7497a977e",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-NoEmployerSpecifics.ps1",
-      "fingerprint": "bc786ec85726ef1d",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "086270d4c66b9979",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/AcquisitionPackage.ps1",
-      "fingerprint": "3322ea3dc60cc61d",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "tools/Test-ReviewerExactPath.ps1",
-      "fingerprint": "ea58f23ccebc25ce",
-      "count": 3
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "4ed34299fb4ef9a9",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
-      "fingerprint": "752decc2cd7a57e8",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/ConventionPacks.ps1",
-      "fingerprint": "c58053ea3b442df4",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-CrossVerification.ps1",
-      "fingerprint": "7cf68c6d7d277987",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "f47112bc7ea43d53",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "tools/Invoke-ReviewerBlindedAcquisition.ps1",
-      "fingerprint": "76caeb8437c48afd",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "6ea28327a26b328a",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN010",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "4319088851c3278f",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-CrossVerification.ps1",
-      "fingerprint": "fbad1d218fa28268",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN010",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "19f559cff6ce9cf1",
-      "count": 4
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Compare-DuplicatedFunctions.ps1",
-      "fingerprint": "21292774e47b8f4d",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "f75bf0fcf4a66522",
+      "fingerprint": "a389507b8a08813b",
       "count": 1
     },
     {
@@ -623,572 +287,8 @@
     },
     {
       "ruleId": "PSEN009",
-      "file": "tools/Test-ReplaySnapshot.ps1",
-      "fingerprint": "f6e794c9e0478be9",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Invoke-ReviewerBlindedAcquisition.ps1",
-      "fingerprint": "7aa127782161232a",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
       "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "8c36b7800747e723",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/CorpusSeal.ps1",
-      "fingerprint": "abbfa1caf7e3a238",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "ed5d1f6dc125727b",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "7af960081d06e245",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "8a922eb9aceb5111",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "28520c597a01ffeb",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
-      "fingerprint": "239a501725a5fa3e",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
-      "fingerprint": "e8ceefb098a25d4e",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "9b919a9d9c92c487",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/ConventionPacks.ps1",
-      "fingerprint": "1f1a68cc62757b2f",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "9c6e40b0f2d5d0bc",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Invoke-ReviewerBlindedAcquisition.ps1",
-      "fingerprint": "846f43cf8c2450ab",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "75caa889790261c5",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "f2c21002d008f963",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-CorpusReplaySeal.ps1",
-      "fingerprint": "5a1d8bd722511eb7",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
-      "fingerprint": "3fddaaf951f317c9",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-CrossVerification.ps1",
-      "fingerprint": "acb570fc5adae8e7",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "tools/Test-DeliveryGates.ps1",
-      "fingerprint": "d077a23ddb7b5985",
-      "count": 2
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "c9bade803603b0f9",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "src/Agents/reviewer/evaluation/Evaluation.ps1",
-      "fingerprint": "28dd68a40e7d77e7",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN007",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "d101a05cdc3313cc",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "328a9e878856b9ff",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "tools/Test-CrossVerification.ps1",
-      "fingerprint": "819da4d7f3266c21",
-      "count": 2
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-CorpusSealQualification.ps1",
-      "fingerprint": "52309c427c2968dd",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "299ec7bdbb258061",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN007",
-      "file": "src/Agents/reviewer/AcquisitionPackage.ps1",
-      "fingerprint": "a1489166363480a1",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "tools/Test-ConventionSpecialist.ps1",
-      "fingerprint": "303fae6d14e3b808",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "tools/Test-ReplaySnapshot.ps1",
-      "fingerprint": "83226dac370ba77b",
-      "count": 2
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
-      "fingerprint": "aa490b60e560cb96",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "cef44c7e69353811",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
-      "fingerprint": "61a1bf2873a663c5",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-CorpusSealQualification.ps1",
-      "fingerprint": "a027663713fc9b61",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Compare-ReviewerReplayRuns.ps1",
-      "fingerprint": "72eb2831639d2806",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "tools/Test-ReplaySnapshot.ps1",
-      "fingerprint": "69142f2e973c248d",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "403cfd7d044ef164",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Find-PowerShellEmptyNullHazard.ps1",
-      "fingerprint": "db87fc8bf07019be",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "tools/Invoke-ReviewerBlindedAcquisition.ps1",
-      "fingerprint": "60f9563593df7dd2",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "9dc35476ed746f13",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN007",
-      "file": "src/Agents/reviewer/CrossVerification.ps1",
-      "fingerprint": "8443bbb998ee6102",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "c9dde1651178271d",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "97db44f73f2c3761",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/SourceTransport.ps1",
-      "fingerprint": "cedc111625cb5843",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-CrossVerification.ps1",
-      "fingerprint": "a97d5dcca2888d04",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
-      "fingerprint": "eb4d2ae8d28ed9fb",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "tools/Test-ReviewerReplayQualification.ps1",
-      "fingerprint": "54cdd2d22cd594d8",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "tools/Test-CrossVerification.ps1",
-      "fingerprint": "30b9dc37ab0e1dfe",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-ReviewerBenchmarkPackMaterializer.ps1",
-      "fingerprint": "1eb8093c824bff70",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "src/Agents/reviewer/ConventionSpecialist.ps1",
-      "fingerprint": "9a39a2ac902b4c2a",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
-      "fingerprint": "c08aeb6dad042562",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "cf89e5fc287d1ddf",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "tools/Test-ReplaySnapshot.ps1",
-      "fingerprint": "42d5fc45f360e01f",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "703841a0dc375860",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN010",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "49d420592ca4ac24",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
-      "fingerprint": "89e0caf2c6077a4a",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN010",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "ba305106166273e7",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "b00bc8683837deeb",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "7858961baa09bb20",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "9bf7327712fe8081",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/CorpusSeal.ps1",
-      "fingerprint": "bbe8f3ddce6f927e",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "tools/Test-ReviewerEvaluation.ps1",
-      "fingerprint": "cdf9d9cec9fd93ba",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "tools/Test-ReviewerReplayQualification.ps1",
-      "fingerprint": "4b3c25c1cbe40bf9",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Invoke-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "ae3dda189fc3a089",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN010",
-      "file": "tools/Test-ReplaySnapshot.ps1",
-      "fingerprint": "c51dea047fb87038",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "d54484c8cff93a9b",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/CorpusSeal.ps1",
-      "fingerprint": "88548b51281e7aad",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "64ad3901f2c3b75c",
-      "count": 2
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/New-SealParityVectors.ps1",
-      "fingerprint": "03b7179ab3135e17",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
-      "fingerprint": "e641c9f4e9c144be",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "tools/Test-ReplaySnapshot.ps1",
-      "fingerprint": "78ddfbcbb3bbd556",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "1768d897003756d9",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "0b0e7decfe640465",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "27e749c2c809b52d",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "src/Agents/reviewer/CorpusSeal.ps1",
-      "fingerprint": "0688414d9fe2402e",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "tools/Invoke-ReviewerBlindedAcquisition.ps1",
-      "fingerprint": "be3f6cab4b4a3092",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN007",
-      "file": "src/Agents/reviewer/ConventionSpecialist.ps1",
-      "fingerprint": "0845cec5f94c8582",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN010",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "2799849ba2ba5f08",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "a1f48f70bc2d0b7f",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "3e992fc29bfadd77",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-CorpusReplaySeal.ps1",
-      "fingerprint": "6afec226d5bb497a",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-CrossVerification.ps1",
-      "fingerprint": "644e7ea128894fbc",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "tools/Test-ReplaySnapshot.ps1",
-      "fingerprint": "aab0b688f38a5bc6",
-      "count": 4
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "tools/Test-ReviewerBlindedAcquisition.ps1",
-      "fingerprint": "0c6416f3d554f96f",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "0362e040349c7acc",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
-      "fingerprint": "e2ba8bead3f7a2b4",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN011",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "e1dc8396785fa59e",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "bf6be40d3098df3c",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN003",
-      "file": "src/Agents/reviewer/ConventionPacks.ps1",
-      "fingerprint": "d39b48fa898c2725",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "tools/Test-ReplaySnapshot.ps1",
-      "fingerprint": "09704cb8508f3d4c",
-      "count": 2
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "src/Agents/reviewer/offline/Invoke-ReviewerModelAdapter.ps1",
-      "fingerprint": "53cfe6bd9e08650e",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN010",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "79c3525a65590db0",
-      "count": 2
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "tools/Test-CrossVerification.ps1",
-      "fingerprint": "ddd75b9efd5e62cc",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN010",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "fe0a0b93876e430a",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-ConventionPacks.ps1",
-      "fingerprint": "83821905d21889b7",
+      "fingerprint": "c2ff5a43e377ab27",
       "count": 1
     },
     {
@@ -1199,86 +299,20 @@
     },
     {
       "ruleId": "PSEN009",
-      "file": "tools/Test-ConventionSpecialist.ps1",
-      "fingerprint": "98c423d079617e27",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
-      "fingerprint": "e5a389c2148d97fe",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "c1c9a78c2bffb870",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "tools/Test-ReviewerEvaluation.ps1",
-      "fingerprint": "1a697afb2f99d205",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "tools/Test-ReviewFacts.ps1",
-      "fingerprint": "36204eb678807d87",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "5c1b2f99fa3c37ab",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "97198c95eafd4e8f",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "b84c9f7e755bd4f1",
       "count": 1
     },
     {
       "ruleId": "PSEN008",
-      "file": "src/Agents/reviewer/CorpusSeal.ps1",
-      "fingerprint": "61d21f431c0fbdef",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "1da023f23e2d220b",
+      "file": "src/Agents/reviewer/ConventionSpecialist.ps1",
+      "fingerprint": "9a39a2ac902b4c2a",
       "count": 1
     },
     {
       "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "c6c04b8eaefb571b",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "tools/Test-ReplaySnapshot.ps1",
-      "fingerprint": "5a56ba5035e09f84",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "6b1fa877cf527d27",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-ReviewerEvaluation.ps1",
-      "fingerprint": "a5d76c1587d49055",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "tools/Test-ReviewerBenchmarkPackMaterializer.ps1",
-      "fingerprint": "4acbb71e916dcfdf",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "64d17e8f6af61c03",
       "count": 1
     },
     {
@@ -1288,75 +322,129 @@
       "count": 1
     },
     {
-      "ruleId": "PSEN009",
-      "file": "tools/Convert-ReviewerBlindedBenchmarkPack.ps1",
-      "fingerprint": "0eaeafe370fac9bb",
+      "ruleId": "PSEN007",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "f4e722ec8a9f71bf",
       "count": 1
     },
     {
-      "ruleId": "PSEN010",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "444265919738be9e",
+      "ruleId": "PSEN002",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "e68e3f2ac960b188",
       "count": 1
     },
     {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-Provider.ps1",
-      "fingerprint": "0ecbaa2b091a6121",
+      "ruleId": "PSEN001",
+      "file": "tools/Test-CrossVerification.ps1",
+      "fingerprint": "acb570fc5adae8e7",
       "count": 1
     },
     {
       "ruleId": "PSEN001",
       "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "2a016dd503913aa7",
+      "fingerprint": "e29950d7497a977e",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-ConventionSpecialist.ps1",
+      "fingerprint": "829e3ca2e8bffceb",
       "count": 1
     },
     {
       "ruleId": "PSEN007",
       "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
-      "fingerprint": "a7940563d226181a",
+      "fingerprint": "6180e1656deddcdf",
+      "count": 2
+    },
+    {
+      "ruleId": "PSEN007",
+      "file": "src/Agents/reviewer/CrossVerification.ps1",
+      "fingerprint": "6eeb49faf035c232",
       "count": 1
     },
     {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-ReplaySnapshot.ps1",
-      "fingerprint": "ec8b2106a987fb95",
+      "ruleId": "PSEN001",
+      "file": "src/Agents/reviewer/CorpusSeal.ps1",
+      "fingerprint": "0688414d9fe2402e",
       "count": 1
     },
     {
       "ruleId": "PSEN007",
-      "file": "tools/Test-SealParity.ps1",
-      "fingerprint": "0c9ac897d50aa5f8",
-      "count": 3
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "af9fc52a5dd77775",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "tools/Invoke-ReviewerBlindedAcquisition.ps1",
-      "fingerprint": "66cf463a93bc412a",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "src/Agents/reviewer/CrossVerification.ps1",
-      "fingerprint": "91a0f8b9ae523425",
+      "file": "tools/Invoke-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "755e3ee3db57b63f",
       "count": 1
     },
     {
       "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "b1aaef9bfa100ec0",
+      "file": "tools/Compare-DuplicatedFunctions.ps1",
+      "fingerprint": "21292774e47b8f4d",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "tools/Test-CorpusReplaySeal.ps1",
+      "fingerprint": "021c044056639e47",
       "count": 3
     },
     {
-      "ruleId": "PSEN002",
+      "ruleId": "PSEN003",
+      "file": "src/Agents/reviewer/ConventionPacks.ps1",
+      "fingerprint": "d39b48fa898c2725",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
       "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "ef8fff4403cbc73e",
+      "fingerprint": "12218b70c83c81ab",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN007",
+      "file": "tools/Test-ReviewerExactPath.ps1",
+      "fingerprint": "e9049d5c01a28ea1",
+      "count": 4
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "ed5d1f6dc125727b",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-ConventionPacks.ps1",
+      "fingerprint": "83821905d21889b7",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN011",
+      "file": "tools/Test-ConventionSpecialist.ps1",
+      "fingerprint": "1ae67b881d38de42",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Invoke-ReviewerBlindedAcquisition.ps1",
+      "fingerprint": "a219b344a4fb28b0",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "b00bc8683837deeb",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
+      "fingerprint": "752decc2cd7a57e8",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "src/Agents/reviewer/evaluation/Evaluation.ps1",
+      "fingerprint": "eb1ec05bc095e9ee",
       "count": 1
     },
     {
@@ -1366,27 +454,27 @@
       "count": 1
     },
     {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "f9869c35851b8e83",
+      "ruleId": "PSEN009",
+      "file": "tools/Test-CorpusSealQualification.ps1",
+      "fingerprint": "a027663713fc9b61",
       "count": 1
     },
     {
-      "ruleId": "PSEN008",
-      "file": "tools/Test-ReviewerReplayQualification.ps1",
-      "fingerprint": "22242868fc0f4330",
+      "ruleId": "PSEN002",
+      "file": "tools/Test-ReviewFacts.ps1",
+      "fingerprint": "7161cea92d9521de",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "tools/Test-ReviewerBlindedAcquisition.ps1",
+      "fingerprint": "0c6416f3d554f96f",
       "count": 1
     },
     {
       "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "63bebd89d047a08d",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "004a805cdb34420f",
+      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
+      "fingerprint": "61a1bf2873a663c5",
       "count": 1
     },
     {
@@ -1396,27 +484,63 @@
       "count": 2
     },
     {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "b84c9f7e755bd4f1",
+      "ruleId": "PSEN005",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "c1c9a78c2bffb870",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "src/Agents/reviewer/CrossVerification.ps1",
+      "fingerprint": "91a0f8b9ae523425",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "tools/Get-ReviewerReplayQualificationStatus.ps1",
+      "fingerprint": "66c898b58aaa31db",
       "count": 1
     },
     {
       "ruleId": "PSEN009",
-      "file": "tools/Test-CorpusReplaySeal.ps1",
-      "fingerprint": "76552804336102d0",
+      "file": "src/Agents/reviewer/CorpusSeal.ps1",
+      "fingerprint": "20280fbb61af2207",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-ReplaySnapshot.ps1",
+      "fingerprint": "f6e794c9e0478be9",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "tools/Test-ReplaySnapshot.ps1",
+      "fingerprint": "d6e176ad5b8f9d36",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "9add46fc21ed38fb",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "9b919a9d9c92c487",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "tools/Test-ConventionSpecialist.ps1",
+      "fingerprint": "303fae6d14e3b808",
       "count": 1
     },
     {
       "ruleId": "PSEN005",
       "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
-      "fingerprint": "5762df247599b458",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-CrossVerification.ps1",
-      "fingerprint": "3a46211b8737051a",
+      "fingerprint": "798c3a2b224aaba1",
       "count": 1
     },
     {
@@ -1428,385 +552,7 @@
     {
       "ruleId": "PSEN009",
       "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "6775ef0c1d703d68",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
       "fingerprint": "745f63d92a1aeba5",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "a352a1aa0b960a3e",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "a78b8a025449e5eb",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "tools/Get-ReviewerReplayQualificationStatus.ps1",
-      "fingerprint": "66c898b58aaa31db",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
-      "fingerprint": "7ca6b073740b1163",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/evaluation/Evaluation.ps1",
-      "fingerprint": "ce39c4e4979a745c",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
-      "fingerprint": "aeee3a558957bb33",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "tools/Test-ReviewerBenchmarkPackMaterializer.ps1",
-      "fingerprint": "4731bd7d11246096",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "f3c40480bb3818fa",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-DeliveryGates.ps1",
-      "fingerprint": "eb04f95d64c35c49",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "fe29a6fe65bb9afd",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "tools/Test-ReviewFacts.ps1",
-      "fingerprint": "22e6ee0c540bfa8f",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN007",
-      "file": "src/Agents/reviewer/SourceTransport.ps1",
-      "fingerprint": "65d9cd434b4dcee6",
-      "count": 2
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "tools/Invoke-ReviewerBlindedAcquisition.ps1",
-      "fingerprint": "a8cf1623f6a944be",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-CorpusReplaySeal.ps1",
-      "fingerprint": "6ad9ef24d7e3a4ea",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "tools/Test-CrossVerification.ps1",
-      "fingerprint": "5e74ee3cdb1d6157",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "tools/Save-AgentReplaySnapshot.ps1",
-      "fingerprint": "274852982fba8b8d",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "src/Agents/reviewer/CrossVerification.ps1",
-      "fingerprint": "b1a08b380f4d10c3",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-ReviewFacts.ps1",
-      "fingerprint": "059c14c7bafd0135",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "c2ff5a43e377ab27",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "a88da97f62d178eb",
-      "count": 2
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "88b40834878e0b98",
-      "count": 2
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "f081db3edf71acd0",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "78602884297a7b3d",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "c848343e0819cece",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/SourceTransport.ps1",
-      "fingerprint": "3e309686943190b0",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN011",
-      "file": "src/Agents/reviewer/SourceTransport.ps1",
-      "fingerprint": "511c1ec02137799c",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
-      "fingerprint": "3876a6e5e23cb74c",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "tools/Test-ReviewerBenchmarkPackMaterializer.ps1",
-      "fingerprint": "def72d7f92793d64",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "ff600d3f8dc613ce",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "f031a55c04ce1ae4",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "7c808ea18c3319ce",
-      "count": 2
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "68caf96807839f3a",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN011",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "617a8d3824122375",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Invoke-ReviewerBlindedAcquisition.ps1",
-      "fingerprint": "bcda942b4ada85e5",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "tools/Test-ReviewerBlindedAcquisition.ps1",
-      "fingerprint": "deed55e3c5c9e4d5",
-      "count": 3
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "1159f86f3dd56eaa",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "ac2fe1ce22d42221",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN011",
-      "file": "tools/Test-CrossVerification.ps1",
-      "fingerprint": "e8b672ea5619e484",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "tools/Test-CrossVerification.ps1",
-      "fingerprint": "299cf2ed8fb232e4",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "0c380fa47cf41f9a",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN011",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "62ff193e78e7db1a",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "tools/Test-CrossVerification.ps1",
-      "fingerprint": "e81d867af624fe19",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Convert-ReviewerBlindedBenchmarkPack.ps1",
-      "fingerprint": "65e7529ab5472966",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN007",
-      "file": "src/Agents/reviewer/SourceTransport.ps1",
-      "fingerprint": "a54aaa121121cedb",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "tools/Test-ReviewerBlindedAcquisition.ps1",
-      "fingerprint": "8c6aa85f1ce57447",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "1f0375f1f933990d",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Compare-DuplicatedFunctions.ps1",
-      "fingerprint": "7a0a9b7f6b8d6001",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-GitHubProviderLive.ps1",
-      "fingerprint": "c9042df3df1631d9",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN007",
-      "file": "tools/Test-ReviewerBlindedAcquisition.ps1",
-      "fingerprint": "1052042beb71f89d",
-      "count": 4
-    },
-    {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-CrossVerification.ps1",
-      "fingerprint": "0647eb0b2b4564fd",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN007",
-      "file": "src/Agents/reviewer/CrossVerification.ps1",
-      "fingerprint": "6eeb49faf035c232",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN010",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "4c39b0aa1d350a8c",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "a64a2e04dda9df37",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
-      "fingerprint": "581d5ff247351e7a",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "tools/Test-CorpusReplaySeal.ps1",
-      "fingerprint": "eaa458e41eb17087",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "70ceb18566883337",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "9bbd5d27f66358ef",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "src/Agents/reviewer/DeliveryGates.ps1",
-      "fingerprint": "7a86b7f734387c93",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "1ba3c30fd236cf91",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN002",
-      "file": "tools/Test-ReviewFacts.ps1",
-      "fingerprint": "7161cea92d9521de",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN010",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "0143f5d7d9e32f92",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/ChangedConstructs.ps1",
-      "fingerprint": "c82f2cd96b7bdb07",
       "count": 1
     },
     {
@@ -1818,19 +564,151 @@
     {
       "ruleId": "PSEN001",
       "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "4649814a90797c5b",
+      "fingerprint": "f47112bc7ea43d53",
       "count": 1
     },
     {
       "ruleId": "PSEN009",
       "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "f77061f20efaa327",
+      "fingerprint": "0fa4b264b2069a6a",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "88b40834878e0b98",
+      "count": 2
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
+      "fingerprint": "3876a6e5e23cb74c",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "tools/Convert-ReviewerBlindedBenchmarkPack.ps1",
+      "fingerprint": "549eb1398df9f1e0",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "tools/Test-ReviewerExactPath.ps1",
+      "fingerprint": "ea58f23ccebc25ce",
+      "count": 3
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "tools/Test-ReplaySnapshot.ps1",
+      "fingerprint": "42d5fc45f360e01f",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "265e3256115b7ac7",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/RunReconciliation.ps1",
+      "fingerprint": "3234eb5eff5030ac",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "33bc3b7660c18f09",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/ConventionPacks.ps1",
+      "fingerprint": "35d1db38dc2791d3",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "70ceb18566883337",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
+      "fingerprint": "5762df247599b458",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "97db44f73f2c3761",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "f3c40480bb3818fa",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
+      "fingerprint": "412e05e7def5e515",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN011",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "5f185055529828f6",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/evaluation/Evaluation.ps1",
+      "fingerprint": "13f7b7faf2c4220e",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "tools/Test-CorpusSealQualification.ps1",
+      "fingerprint": "77d979197760830a",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN001",
+      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "f5c1028af21014e2",
       "count": 1
     },
     {
       "ruleId": "PSEN009",
       "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
-      "fingerprint": "2a51b8ebdb7d515f",
+      "fingerprint": "239a501725a5fa3e",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "src/Agents/reviewer/DeliveryGates.ps1",
+      "fingerprint": "7a86b7f734387c93",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN003",
+      "file": "tools/Test-PowerShellBoundaryHardening.ps1",
+      "fingerprint": "19bf40bb1564a6e1",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "1607cce3a7862487",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "1867f518cc1fe2e5",
       "count": 1
     },
     {
@@ -1840,15 +718,501 @@
       "count": 1
     },
     {
-      "ruleId": "PSEN007",
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/DeliveryGates.ps1",
+      "fingerprint": "bd496fc20523bbcd",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
       "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "0905505575ac626d",
+      "fingerprint": "a352a1aa0b960a3e",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "tools/Test-ReviewerExactPath.ps1",
+      "fingerprint": "f463bc092b49533a",
+      "count": 3
+    },
+    {
+      "ruleId": "PSEN010",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "19f559cff6ce9cf1",
+      "count": 4
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Invoke-ReviewerBlindedAcquisition.ps1",
+      "fingerprint": "4b6f7d5e48a45c46",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN011",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "e1dc8396785fa59e",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Invoke-ReviewerBlindedAcquisition.ps1",
+      "fingerprint": "0dda9a3b0b55b6c1",
       "count": 1
     },
     {
       "ruleId": "PSEN005",
-      "file": "tools/Test-ReviewFacts.ps1",
-      "fingerprint": "5d38403013a50018",
+      "file": "tools/Test-ReviewerBenchmarkPackMaterializer.ps1",
+      "fingerprint": "ba1183398097e570",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN001",
+      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "410af051f5658aed",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
+      "fingerprint": "ad85e5c862a4ae3c",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN007",
+      "file": "src/Agents/reviewer/ConventionSpecialist.ps1",
+      "fingerprint": "0845cec5f94c8582",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN001",
+      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "f2c21002d008f963",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN001",
+      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "af9fc52a5dd77775",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Compare-DuplicatedFunctions.ps1",
+      "fingerprint": "7a0a9b7f6b8d6001",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/CorpusSeal.ps1",
+      "fingerprint": "88548b51281e7aad",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN003",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "0db38857ae38979e",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN001",
+      "file": "tools/Test-CrossVerification.ps1",
+      "fingerprint": "4d658b0e5632046a",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "tools/Test-ReviewerBenchmarkPackMaterializer.ps1",
+      "fingerprint": "4acbb71e916dcfdf",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "6856ee36096b3985",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN011",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "cf16fbc01e02e920",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "tools/Test-ReplaySnapshot.ps1",
+      "fingerprint": "78ddfbcbb3bbd556",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "e1c0f2a681a79ac5",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-ReviewerBenchmarkPackMaterializer.ps1",
+      "fingerprint": "1df2c1f64e02e650",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/CrossVerification.ps1",
+      "fingerprint": "955cbed3ed877ec6",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN007",
+      "file": "src/Agents/reviewer/ReviewFacts.ps1",
+      "fingerprint": "658737ce1b668e6c",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "tools/Test-ConventionSpecialist.ps1",
+      "fingerprint": "d50423a44759225c",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN001",
+      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "1da023f23e2d220b",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN006",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "d0c990cbf18c13f7",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "f3456986e6dc9f7f",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN011",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "62ff193e78e7db1a",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
+      "fingerprint": "e8ceefb098a25d4e",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "1159f86f3dd56eaa",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN001",
+      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "6ea28327a26b328a",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "6ba88066a7ede7b3",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-CorpusSealQualification.ps1",
+      "fingerprint": "498c70e3c07d8232",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN001",
+      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "8f96cd146689ae1d",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "src/Agents/reviewer/CrossVerification.ps1",
+      "fingerprint": "36c2adf7468882ee",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "tools/Test-ReviewerReplayQualification.ps1",
+      "fingerprint": "5adfde5a7a80376b",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "tools/Test-ReviewerEvaluation.ps1",
+      "fingerprint": "fb532fff7f61eb25",
+      "count": 3
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "tools/Test-CorpusSealQualification.ps1",
+      "fingerprint": "528aab4d599fcbf5",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN001",
+      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "2a016dd503913aa7",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/ChangedConstructs.ps1",
+      "fingerprint": "c82f2cd96b7bdb07",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "f9e4c0f264d2d4ba",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "tools/Test-CrossVerification.ps1",
+      "fingerprint": "f81d7888d4edf32e",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-ConventionSpecialist.ps1",
+      "fingerprint": "bd5599e3609d8e9a",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "7a17b508c4c026bb",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN007",
+      "file": "tools/Test-SealParity.ps1",
+      "fingerprint": "0c9ac897d50aa5f8",
+      "count": 3
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-DeliveryGates.ps1",
+      "fingerprint": "eb04f95d64c35c49",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
+      "fingerprint": "e641c9f4e9c144be",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "87e3c523f3d37282",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "43e5a5ffa563a378",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "7c808ea18c3319ce",
+      "count": 2
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
+      "fingerprint": "eb4d2ae8d28ed9fb",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "tools/Test-CrossVerification.ps1",
+      "fingerprint": "97c68f6d7f126c15",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-ConventionSpecialist.ps1",
+      "fingerprint": "81f4e5fb963cbd1c",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "004a805cdb34420f",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "tools/Test-ReplaySnapshot.ps1",
+      "fingerprint": "5a56ba5035e09f84",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "tools/Invoke-ReviewerBlindedAcquisition.ps1",
+      "fingerprint": "a8cf1623f6a944be",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN007",
+      "file": "src/Agents/reviewer/AcquisitionPackage.ps1",
+      "fingerprint": "6ff6dae54c7d7869",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN007",
+      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
+      "fingerprint": "a7940563d226181a",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN010",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "2799849ba2ba5f08",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "f45ed5206fa31147",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "tools/Test-ReplaySnapshot.ps1",
+      "fingerprint": "c2f7723585a5b423",
+      "count": 4
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "tools/Test-DeliveryGates.ps1",
+      "fingerprint": "d077a23ddb7b5985",
+      "count": 2
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
+      "fingerprint": "8afc342a4d6bfdc4",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Invoke-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "4c8c768079d0d2b5",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "c848343e0819cece",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN010",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "444265919738be9e",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "5ad4d48bf27eb595",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-CorpusReplaySeal.ps1",
+      "fingerprint": "61a869cf5ab7a522",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN007",
+      "file": "src/Agents/reviewer/SourceTransport.ps1",
+      "fingerprint": "65d9cd434b4dcee6",
+      "count": 2
+    },
+    {
+      "ruleId": "PSEN001",
+      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "dafcded79bff84f9",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "ffcdb7ac197878ea",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Compare-DuplicatedFunctions.ps1",
+      "fingerprint": "80a20356b822a8e8",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "086270d4c66b9979",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN001",
+      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "cf89e5fc287d1ddf",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN010",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "4c39b0aa1d350a8c",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "4711319109adf425",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "31dc400bbbabcd4d",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN001",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "b25f16fcf7799e7c",
+      "count": 2
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "da7cf753be849bcc",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN001",
+      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "7a37e40c82d18d8e",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/evaluation/Evaluation.ps1",
+      "fingerprint": "9523c41659ec4f28",
       "count": 1
     },
     {
@@ -1864,117 +1228,45 @@
       "count": 1
     },
     {
-      "ruleId": "PSEN011",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "212d6813b8dc8b97",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "tools/Test-ReviewerExactPath.ps1",
-      "fingerprint": "34fcce551b30ed16",
-      "count": 4
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/DeliveryGates.ps1",
-      "fingerprint": "bd496fc20523bbcd",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "5b46b459f92c168f",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN011",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "0e388ba7cdfa5ecf",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
+      "ruleId": "PSEN001",
       "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "adafca1f82dfb855",
+      "fingerprint": "703841a0dc375860",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "7700bc0ddb4d5246",
       "count": 1
     },
     {
       "ruleId": "PSEN010",
       "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "d808e1a33b36f247",
+      "fingerprint": "c5b5494a1c3de20f",
       "count": 2
     },
     {
       "ruleId": "PSEN008",
       "file": "tools/Test-ReviewerReplayQualification.ps1",
-      "fingerprint": "3f2273e53f9af27e",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "tools/Test-CorpusReplaySeal.ps1",
-      "fingerprint": "204b01b8599131aa",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "135a04e740d66088",
-      "count": 3
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "57e530ca03611017",
-      "count": 3
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "754d1274b92d2687",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "7899470e4fc6f4a0",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/CrossVerification.ps1",
-      "fingerprint": "955cbed3ed877ec6",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN007",
-      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
-      "fingerprint": "13b817b6f671d63d",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "d2ac75a448b1d9be",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-ConventionSpecialist.ps1",
-      "fingerprint": "bd5599e3609d8e9a",
+      "fingerprint": "4b3c25c1cbe40bf9",
       "count": 1
     },
     {
       "ruleId": "PSEN008",
-      "file": "tools/Test-CorpusReplaySeal.ps1",
-      "fingerprint": "021c044056639e47",
-      "count": 3
+      "file": "tools/Test-ReviewerEvaluation.ps1",
+      "fingerprint": "0bf46971c35dd4f2",
+      "count": 2
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/ConventionPacks.ps1",
+      "fingerprint": "c58053ea3b442df4",
+      "count": 1
     },
     {
       "ruleId": "PSEN009",
       "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "fe1e1cf94ab088ed",
+      "fingerprint": "9bbd5d27f66358ef",
       "count": 1
     },
     {
@@ -1985,14 +1277,254 @@
     },
     {
       "ruleId": "PSEN009",
+      "file": "tools/Compare-ReviewerReplayRuns.ps1",
+      "fingerprint": "72eb2831639d2806",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
       "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "27def3787f83bd34",
+      "fingerprint": "bf6be40d3098df3c",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
+      "fingerprint": "7ca6b073740b1163",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "6b1fa877cf527d27",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
+      "fingerprint": "89d7822527d317e2",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "tools/Test-ReviewFacts.ps1",
+      "fingerprint": "36204eb678807d87",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "tools/Test-ReplaySnapshot.ps1",
+      "fingerprint": "45491df824ebda6b",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "4ed34299fb4ef9a9",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "tools/Test-ReplaySnapshot.ps1",
+      "fingerprint": "e0328ed54f0ffdd5",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "fe1e1cf94ab088ed",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "97198c95eafd4e8f",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-CorpusReplaySeal.ps1",
+      "fingerprint": "5a1d8bd722511eb7",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "3e992fc29bfadd77",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "tools/Test-ReviewerEvaluation.ps1",
+      "fingerprint": "21e3a2ecb402111f",
       "count": 1
     },
     {
       "ruleId": "PSEN008",
-      "file": "tools/New-SealParityVectors.ps1",
-      "fingerprint": "d299e670f62b0d1a",
+      "file": "tools/Test-ReviewerExactPath.ps1",
+      "fingerprint": "ef438dfface92c0b",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/AcquisitionPackage.ps1",
+      "fingerprint": "3322ea3dc60cc61d",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "7af960081d06e245",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/SourceTransport.ps1",
+      "fingerprint": "1bb73e73c58d18ec",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "ff600d3f8dc613ce",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "tools/Test-ReviewerReplayQualification.ps1",
+      "fingerprint": "54cdd2d22cd594d8",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "tools/Test-ReviewFacts.ps1",
+      "fingerprint": "5d38403013a50018",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-CorpusReplaySeal.ps1",
+      "fingerprint": "6afec226d5bb497a",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN001",
+      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "fe29a6fe65bb9afd",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "tools/Test-ReplaySnapshot.ps1",
+      "fingerprint": "aab0b688f38a5bc6",
+      "count": 4
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/ConventionPacks.ps1",
+      "fingerprint": "36dc425a62e342d6",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "b48433607bbfcd15",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Convert-ReviewerBlindedBenchmarkPack.ps1",
+      "fingerprint": "0eaeafe370fac9bb",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "tools/Test-ReviewFacts.ps1",
+      "fingerprint": "22e6ee0c540bfa8f",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "tools/Test-CrossVerification.ps1",
+      "fingerprint": "ddd75b9efd5e62cc",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "5b02c963c95570c1",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "tools/Invoke-ReviewerBlindedAcquisition.ps1",
+      "fingerprint": "be3f6cab4b4a3092",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-ReplaySnapshot.ps1",
+      "fingerprint": "ec8b2106a987fb95",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "8c36b7800747e723",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "e8ca4cd64db57232",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
+      "fingerprint": "2a51b8ebdb7d515f",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN001",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "ac2fe1ce22d42221",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "28f18911b3e3f74a",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "tools/Test-CorpusReplaySeal.ps1",
+      "fingerprint": "eaa458e41eb17087",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "1ba3c30fd236cf91",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
+      "fingerprint": "aa490b60e560cb96",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
+      "fingerprint": "c08aeb6dad042562",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "tools/Test-ReviewerReplayQualification.ps1",
+      "fingerprint": "17718e1d3b1ce490",
       "count": 1
     },
     {
@@ -2002,69 +1534,117 @@
       "count": 1
     },
     {
-      "ruleId": "PSEN001",
-      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "97a312dbc9d06672",
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "6de1b72b3cca11b0",
       "count": 1
     },
     {
-      "ruleId": "PSEN005",
-      "file": "tools/Convert-ReviewerBlindedBenchmarkPack.ps1",
-      "fingerprint": "549eb1398df9f1e0",
+      "ruleId": "PSEN009",
+      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
+      "fingerprint": "aeee3a558957bb33",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN007",
+      "file": "src/Agents/reviewer/CrossVerification.ps1",
+      "fingerprint": "8443bbb998ee6102",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN007",
+      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
+      "fingerprint": "13b817b6f671d63d",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN010",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "fe0a0b93876e430a",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
+      "fingerprint": "e5a389c2148d97fe",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-GitHubProviderLive.ps1",
+      "fingerprint": "c9042df3df1631d9",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "tools/Test-ReplaySnapshot.ps1",
+      "fingerprint": "0cb55bca3e4f2f34",
       "count": 1
     },
     {
       "ruleId": "PSEN009",
       "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "4f16eedc1284b508",
+      "fingerprint": "1f0375f1f933990d",
       "count": 1
     },
     {
       "ruleId": "PSEN009",
-      "file": "tools/Test-CorpusSealQualification.ps1",
-      "fingerprint": "498c70e3c07d8232",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN003",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "0db38857ae38979e",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "tools/Test-CorpusSealQualification.ps1",
-      "fingerprint": "77d979197760830a",
+      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
+      "fingerprint": "32b62c31812d84ff",
       "count": 1
     },
     {
       "ruleId": "PSEN009",
       "file": "tools/Invoke-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "d1f0c2ae38aae6c6",
+      "fingerprint": "ae3dda189fc3a089",
       "count": 1
     },
     {
       "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/evaluation/Evaluation.ps1",
-      "fingerprint": "13f7b7faf2c4220e",
+      "file": "tools/Compare-DuplicatedFunctions.ps1",
+      "fingerprint": "5f06a237946434f4",
       "count": 1
     },
     {
-      "ruleId": "PSEN008",
-      "file": "tools/Test-ReviewerBlindedAcquisition.ps1",
-      "fingerprint": "8cf3f95cf4c10faf",
-      "count": 11
+      "ruleId": "PSEN007",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "728aefca8f324a70",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN001",
+      "file": "tools/Test-CrossVerification.ps1",
+      "fingerprint": "790806293df31bd2",
+      "count": 4
     },
     {
       "ruleId": "PSEN009",
       "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "f11b483b0dc3cdd5",
+      "fingerprint": "692c649d796bb1a1",
       "count": 1
     },
     {
       "ruleId": "PSEN005",
+      "file": "tools/Test-CorpusReplaySeal.ps1",
+      "fingerprint": "204b01b8599131aa",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
       "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "12218b70c83c81ab",
+      "fingerprint": "8a922eb9aceb5111",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "a88da97f62d178eb",
+      "count": 2
+    },
+    {
+      "ruleId": "PSEN007",
+      "file": "src/Agents/reviewer/ConventionSpecialist.ps1",
+      "fingerprint": "cd45a93a03f87bc8",
       "count": 1
     },
     {
@@ -2074,9 +1654,27 @@
       "count": 1
     },
     {
-      "ruleId": "PSEN002",
-      "file": "tools/Test-ReviewerEvaluation.ps1",
-      "fingerprint": "b1e83f5e80ca6c3f",
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "97242d87ecad8e5d",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "e3d9690584bd9a67",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/SourceTransport.ps1",
+      "fingerprint": "4399cb39578f05eb",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN007",
+      "file": "tools/Invoke-ReviewerBlindedAcquisition.ps1",
+      "fingerprint": "592708f9ddcaa76e",
       "count": 1
     },
     {
@@ -2086,27 +1684,51 @@
       "count": 1
     },
     {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "0c380fa47cf41f9a",
+      "count": 1
+    },
+    {
       "ruleId": "PSEN002",
       "file": "tools/Test-CrossVerification.ps1",
-      "fingerprint": "770c614fae032382",
+      "fingerprint": "43970415e2340233",
       "count": 1
     },
     {
-      "ruleId": "PSEN002",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "5ad4d48bf27eb595",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "f45ed5206fa31147",
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/ConventionPacks.ps1",
+      "fingerprint": "1f1a68cc62757b2f",
       "count": 1
     },
     {
       "ruleId": "PSEN007",
-      "file": "src/Agents/reviewer/ReviewFacts.ps1",
-      "fingerprint": "658737ce1b668e6c",
+      "file": "tools/Invoke-ReviewerBlindedAcquisition.ps1",
+      "fingerprint": "263cf98446bdc505",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "tools/Test-ReviewerEvaluation.ps1",
+      "fingerprint": "1a697afb2f99d205",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "299ec7bdbb258061",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-NoEmployerSpecifics.ps1",
+      "fingerprint": "bc786ec85726ef1d",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "tools/Test-ReviewerBlindedAcquisition.ps1",
+      "fingerprint": "8c6aa85f1ce57447",
       "count": 1
     },
     {
@@ -2117,146 +1739,242 @@
     },
     {
       "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "a389507b8a08813b",
+      "file": "tools/Test-CorpusSealQualification.ps1",
+      "fingerprint": "52309c427c2968dd",
       "count": 1
     },
     {
-      "ruleId": "PSEN005",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "33bc3b7660c18f09",
+      "ruleId": "PSEN001",
+      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "a1f48f70bc2d0b7f",
       "count": 1
     },
     {
       "ruleId": "PSEN007",
+      "file": "tools/Test-ReviewerBlindedAcquisition.ps1",
+      "fingerprint": "1052042beb71f89d",
+      "count": 4
+    },
+    {
+      "ruleId": "PSEN001",
       "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "f4e722ec8a9f71bf",
+      "fingerprint": "f42207018ee3a731",
+      "count": 3
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Find-PowerShellEmptyNullHazard.ps1",
+      "fingerprint": "db87fc8bf07019be",
       "count": 1
     },
     {
       "ruleId": "PSEN001",
       "file": "tools/Test-CrossVerification.ps1",
-      "fingerprint": "790806293df31bd2",
-      "count": 4
+      "fingerprint": "a97d5dcca2888d04",
+      "count": 1
     },
     {
-      "ruleId": "PSEN008",
-      "file": "tools/Test-ReviewerEvaluation.ps1",
-      "fingerprint": "0bf46971c35dd4f2",
+      "ruleId": "PSEN009",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "67d9c430286e4989",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "64ad3901f2c3b75c",
       "count": 2
     },
     {
-      "ruleId": "PSEN002",
-      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "1df03e532e7bf465",
+      "ruleId": "PSEN005",
+      "file": "src/Agents/reviewer/evaluation/Evaluation.ps1",
+      "fingerprint": "28dd68a40e7d77e7",
       "count": 1
     },
     {
       "ruleId": "PSEN001",
       "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "410af051f5658aed",
+      "fingerprint": "9dc35476ed746f13",
       "count": 1
     },
     {
-      "ruleId": "PSEN007",
-      "file": "src/Agents/reviewer/ConventionSpecialist.ps1",
-      "fingerprint": "cd45a93a03f87bc8",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
-      "fingerprint": "412e05e7def5e515",
+      "ruleId": "PSEN001",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "0362e040349c7acc",
       "count": 1
     },
     {
       "ruleId": "PSEN009",
-      "file": "tools/Invoke-ReviewerBlindedAcquisition.ps1",
-      "fingerprint": "a219b344a4fb28b0",
+      "file": "tools/Test-ReviewerBenchmarkPackMaterializer.ps1",
+      "fingerprint": "1eb8093c824bff70",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-ReviewerBenchmarkPackMaterializer.ps1",
+      "fingerprint": "70fb253ba4738b48",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "15cfdc318d10bae7",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN001",
+      "file": "tools/Test-CrossVerification.ps1",
+      "fingerprint": "2f6eae5079963c01",
       "count": 1
     },
     {
       "ruleId": "PSEN002",
       "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
-      "fingerprint": "4711319109adf425",
+      "fingerprint": "228e061ffcbe11ec",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN001",
+      "file": "tools/Test-CrossVerification.ps1",
+      "fingerprint": "0647eb0b2b4564fd",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-ConventionSpecialist.ps1",
+      "fingerprint": "4ee1b8e77a5899b8",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "tools/Invoke-ReviewerReplayQualification.ps1",
+      "fingerprint": "366bbf39e8776cd8",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "tools/Test-ReviewerBlindedAcquisition.ps1",
+      "fingerprint": "8cf3f95cf4c10faf",
+      "count": 11
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "tools/Test-ReplaySnapshot.ps1",
+      "fingerprint": "03b9bcaec4dc1260",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "28520c597a01ffeb",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Invoke-ReviewerBlindedAcquisition.ps1",
+      "fingerprint": "262b5ae404d5449b",
       "count": 1
     },
     {
       "ruleId": "PSEN010",
       "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "c5b5494a1c3de20f",
+      "fingerprint": "79c3525a65590db0",
       "count": 2
     },
     {
       "ruleId": "PSEN009",
-      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
-      "fingerprint": "246f817844eaaafa",
+      "file": "tools/Test-Provider.ps1",
+      "fingerprint": "0ecbaa2b091a6121",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "f11b483b0dc3cdd5",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "tools/Invoke-AgentControl.ps1",
+      "fingerprint": "371287b4849c6bf9",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "4f16eedc1284b508",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN010",
+      "file": "tools/Test-ReplaySnapshot.ps1",
+      "fingerprint": "c51dea047fb87038",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "57e530ca03611017",
+      "count": 3
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "tools/Save-AgentReplaySnapshot.ps1",
+      "fingerprint": "274852982fba8b8d",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "c6c04b8eaefb571b",
       "count": 1
     },
     {
       "ruleId": "PSEN009",
       "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "43e5a5ffa563a378",
+      "fingerprint": "adafca1f82dfb855",
       "count": 1
     },
     {
       "ruleId": "PSEN008",
-      "file": "tools/Test-ReplaySnapshot.ps1",
-      "fingerprint": "180ebb2180112280",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN011",
-      "file": "tools/Test-ConventionSpecialist.ps1",
-      "fingerprint": "1ae67b881d38de42",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "1607cce3a7862487",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN007",
-      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
-      "fingerprint": "6180e1656deddcdf",
-      "count": 2
-    },
-    {
-      "ruleId": "PSEN011",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "cf16fbc01e02e920",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN008",
-      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
-      "fingerprint": "205f3611d96f9430",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "tools/Invoke-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "9532a6bd4e4c1896",
-      "count": 1
+      "file": "tools/Test-ReviewerExactPath.ps1",
+      "fingerprint": "34fcce551b30ed16",
+      "count": 4
     },
     {
       "ruleId": "PSEN009",
       "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
-      "fingerprint": "97351d480b914c02",
+      "fingerprint": "581d5ff247351e7a",
       "count": 1
     },
     {
       "ruleId": "PSEN007",
-      "file": "tools/Test-ReplaySnapshot.ps1",
-      "fingerprint": "d24653c741cbdde3",
-      "count": 3
+      "file": "src/Agents/reviewer/SourceTransport.ps1",
+      "fingerprint": "a54aaa121121cedb",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "tools/Invoke-ReviewerBlindedAcquisition.ps1",
+      "fingerprint": "60f9563593df7dd2",
+      "count": 1
     },
     {
       "ruleId": "PSEN009",
-      "file": "tools/Test-ReviewerBenchmarkPackMaterializer.ps1",
-      "fingerprint": "1df2c1f64e02e650",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "228e1cc74673e215",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "f031a55c04ce1ae4",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN011",
+      "file": "tools/Test-CrossVerification.ps1",
+      "fingerprint": "e8b672ea5619e484",
       "count": 1
     },
     {
@@ -2268,49 +1986,331 @@
     {
       "ruleId": "PSEN001",
       "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "f5c1028af21014e2",
+      "fingerprint": "97a312dbc9d06672",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "63bebd89d047a08d",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/SourceTransport.ps1",
+      "fingerprint": "cedc111625cb5843",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-CrossVerification.ps1",
+      "fingerprint": "644e7ea128894fbc",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-CorpusReplaySeal.ps1",
+      "fingerprint": "76552804336102d0",
       "count": 1
     },
     {
       "ruleId": "PSEN008",
-      "file": "tools/Test-CorpusSealQualification.ps1",
-      "fingerprint": "528aab4d599fcbf5",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN005",
-      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
-      "fingerprint": "798c3a2b224aaba1",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Compare-DuplicatedFunctions.ps1",
-      "fingerprint": "80a20356b822a8e8",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "tools/Test-SourceTransport.ps1",
-      "fingerprint": "da7cf753be849bcc",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN009",
-      "file": "src/Agents/reviewer/evaluation/Evaluation.ps1",
-      "fingerprint": "9523c41659ec4f28",
-      "count": 1
-    },
-    {
-      "ruleId": "PSEN007",
-      "file": "src/Agents/reviewer/AcquisitionPackage.ps1",
-      "fingerprint": "6ff6dae54c7d7869",
+      "file": "tools/Test-ReplaySnapshot.ps1",
+      "fingerprint": "180ebb2180112280",
       "count": 1
     },
     {
       "ruleId": "PSEN001",
       "file": "tools/Test-ReviewerRoleInputCapture.ps1",
-      "fingerprint": "8f96cd146689ae1d",
+      "fingerprint": "f0b0d2a1ebdb703e",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "tools/Test-ReviewerEvaluation.ps1",
+      "fingerprint": "cdf9d9cec9fd93ba",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "tools/New-SealParityVectors.ps1",
+      "fingerprint": "d299e670f62b0d1a",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
+      "fingerprint": "3fddaaf951f317c9",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN010",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "0143f5d7d9e32f92",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN007",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "0905505575ac626d",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN007",
+      "file": "src/Agents/reviewer/AcquisitionPackage.ps1",
+      "fingerprint": "a1489166363480a1",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/SourceTransport.ps1",
+      "fingerprint": "3e309686943190b0",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "27def3787f83bd34",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "6775ef0c1d703d68",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
+      "fingerprint": "e2ba8bead3f7a2b4",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN001",
+      "file": "tools/Test-CrossVerification.ps1",
+      "fingerprint": "fbad1d218fa28268",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "tools/Test-ReviewerBenchmarkPackMaterializer.ps1",
+      "fingerprint": "def72d7f92793d64",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "c9bade803603b0f9",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "src/Agents/reviewer/CorpusSeal.ps1",
+      "fingerprint": "61d21f431c0fbdef",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "74a371daf84f8950",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN007",
+      "file": "tools/Test-ReplaySnapshot.ps1",
+      "fingerprint": "d24653c741cbdde3",
+      "count": 3
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
+      "fingerprint": "97351d480b914c02",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/review-handler/Start-ReviewHandlerAgent.ps1",
+      "fingerprint": "5656802c3a0c5488",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Convert-ReviewerBlindedBenchmarkPack.ps1",
+      "fingerprint": "65e7529ab5472966",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "tools/Invoke-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "9532a6bd4e4c1896",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "tools/Test-ReviewerReplayQualification.ps1",
+      "fingerprint": "3f2273e53f9af27e",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN010",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "4319088851c3278f",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Convert-ReviewerBlindedBenchmarkPack.ps1",
+      "fingerprint": "5209f651e77c6092",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN011",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "617a8d3824122375",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "tools/Test-CrossVerification.ps1",
+      "fingerprint": "819da4d7f3266c21",
+      "count": 2
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/CorpusSeal.ps1",
+      "fingerprint": "bbe8f3ddce6f927e",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "7858961baa09bb20",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "27e749c2c809b52d",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "2445fdb3b209940c",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/evaluation/Evaluation.ps1",
+      "fingerprint": "ce39c4e4979a745c",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "cef44c7e69353811",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "tools/Test-ReplaySnapshot.ps1",
+      "fingerprint": "69142f2e973c248d",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "tools/Invoke-ReviewerBlindedAcquisition.ps1",
+      "fingerprint": "66cf463a93bc412a",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "78602884297a7b3d",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Convert-ReviewerBlindedBenchmarkPack.ps1",
+      "fingerprint": "d60310621e2fc586",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "6a1cc11a54e4d04e",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN001",
+      "file": "tools/Test-ReviewerEvaluation.ps1",
+      "fingerprint": "a5d76c1587d49055",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-ReviewFacts.ps1",
+      "fingerprint": "059c14c7bafd0135",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "src/Agents/reviewer/DeliveryGates.ps1",
+      "fingerprint": "fb6510678f0764b0",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN005",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "a78b8a025449e5eb",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "328a9e878856b9ff",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN008",
+      "file": "src/DevPilot.AgentHarness/DevPilot.AgentHarness.psm1",
+      "fingerprint": "205f3611d96f9430",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN002",
+      "file": "tools/Test-CrossVerification.ps1",
+      "fingerprint": "770c614fae032382",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "754d1274b92d2687",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN010",
+      "file": "tools/Test-SourceTransport.ps1",
+      "fingerprint": "ba305106166273e7",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN007",
+      "file": "src/Agents/reviewer/Start-ReviewerAgent.ps1",
+      "fingerprint": "d101a05cdc3313cc",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN001",
+      "file": "tools/Test-ReviewerRoleInputCapture.ps1",
+      "fingerprint": "4649814a90797c5b",
+      "count": 1
+    },
+    {
+      "ruleId": "PSEN009",
+      "file": "tools/Invoke-ReviewerReplayQualification.ps1",
+      "fingerprint": "13791ce7aa558db8",
       "count": 1
     }
   ]

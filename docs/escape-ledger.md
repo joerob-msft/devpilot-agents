@@ -65,15 +65,23 @@ identifiers, work-item numbers, programme code names, or addresses appear in the
 | `ESC-0012` | typeBinding | deterministic | openDebt | Latent protected-return wrapping sites present in current code |
 
 Six of the twelve are type-binding. None reached shadow or live execution, because no shadow
-or live coordinator run has ever been performed — which is the same fact recorded as the
-no-write invariant below, and the reason the budget currently stands at zero.
+or live coordinator run has ever been performed. That is a statement about exposure, not
+about containment: the budget stands at zero because the denominator is zero, which is why
+the exposure obligation below exists.
 
-`ESC-0012` is open debt by design. The rule introduced for `ESC-0002` finds eleven further
-sites in current source and test code with the same nesting hazard. They are recorded with
-rationale in `tools/testdata/powershell-boundary-baseline.v1.json`; the boundary gate blocks
-a twelfth. Mechanically rewriting eleven unrelated call sites is not the job of a
-prerequisite layer, and doing it blind would risk introducing exactly the class of defect the
-layer exists to detect.
+`ESC-0012` is open debt by design. The rule introduced for `ESC-0002` found eleven further
+sites in current source and test code with the same nesting hazard. Every site is
+adjudicated individually in the ledger's `sites` array rather than baselined as a block,
+because "eleven findings" is not an assessment. Three of them turned out to be live
+defects and are fixed in this change: a change-kind accumulator that recorded a
+space-joined string instead of separate kinds, a gate revalidation path whose nested thread
+list made the duplicate-post fingerprint scan return an empty set, and a capture manifest
+that serialized its resource inventory one level too deep. One site is compensated by an
+explicit flattening on the following line, one is latent behind a caller-side guard and is
+carried as debt because correcting it properly means changing a producer contract and all
+of its call sites, and the rest are test-side assertions or deliberate analyzer fixtures.
+The remaining findings stay in `tools/testdata/powershell-boundary-baseline.v1.json`; the
+boundary gate blocks any new one.
 
 ## The budget
 
@@ -84,15 +92,30 @@ layer exists to detect.
 
 Current state: **0 qualifying escapes, trigger not fired.**
 
+The window is computed, not asserted. Every incident carries the date it was detected and
+the ordinal of the merged coordinator change it was detected under, and
+`tools/Test-EscapeLedger.ps1` recomputes the in-window set from those two facts against the
+ledger's evaluation date. The combinator is deliberately **either**: an incident counts if
+it falls inside the last ten coordinator changes *or* inside the last sixty days. A trigger
+that required both windows to agree could be waited out twice over — by going quiet, since
+no new changes age nothing out of the ordinal window, and by shipping quickly, since many
+changes push incidents out of the ordinal window while they are still days old. A sabotage
+case proves that an incident outside both windows stops counting.
+
 The trigger deliberately counts only escapes that reach shadow or live. Deterministic
 escapes are caught by the machinery in this repository and are evidence that the machinery
-works; escapes that survive into a run with real inputs are evidence that it does not. The
-literal threshold, stages, and window are asserted by `tools/Test-EscapeLedger.ps1`, so
-weakening the trigger requires a reviewed diff rather than a quiet edit.
+works; escapes that survive into a run with real inputs are evidence that it does not.
+Shadow counts on equal terms with live: a shadow run exercises the same code and discards
+its output, so it preserves the no-write invariant by construction, and treating a shadow
+escape as inconsistent with that invariant would make the shadow arm of the trigger
+unusable. The literal threshold, stages, and window are asserted by
+`tools/Test-EscapeLedger.ps1`, so weakening the trigger requires a reviewed diff rather than
+a quiet edit.
 
 `tools/Test-EscapeLedger.ps1` also sabotages copies of the ledger to prove the arithmetic is
-real: one qualifying escape must not fire the trigger, two must, and two `logic` escapes
-reaching live must not.
+real: one qualifying escape must not fire the trigger, two must, two reaching only shadow
+must, two `logic` escapes reaching live must not, and incidents outside both windows must
+drop out of the count.
 
 ## Gate 5 observation
 
@@ -100,12 +123,18 @@ Gate 5 produced **no deliverable decision — a decision yield of zero per cent*
 candidate was withheld or reconciled away. The **no-write invariant held**: the run performed
 zero writes outside the repository.
 
-Both facts are recorded in the ledger and asserted by the check. They matter to the pivot
-decision in opposite directions. Zero yield means the current control plane has not yet
-demonstrated end-to-end value, which argues against spending the pivot now. Zero external
-writes means every escape so far has been contained, which argues that the current
-containment is adequate — and both readings are only defensible while the budget stands at
-zero.
+Both facts are recorded in the ledger and asserted by the check. Neither is evidence for or
+against the pivot, and the earlier framing that read them as opposing arguments was wrong:
+decision yield and escape rate answer different questions. Zero yield says the current
+control plane has not yet demonstrated end-to-end value. Zero external writes says nothing
+about containment quality, because **zero shadow and zero live runs have ever been
+performed** — an escape rate measured over no exposure is abstention, not a result.
+
+The ledger therefore records an explicit **exposure obligation**: the conditional decision
+is due for re-evaluation only after ten shadow runs have actually been performed, by the
+twentieth merged coordinator change. Until then the observed escape rate carries no weight
+in either direction, and the check asserts the recorded shadow-run count against the gate
+observations so the obligation cannot be quietly declared satisfied.
 
 ## Decision status
 
@@ -129,9 +158,11 @@ an incident here.
    `ESC-nnnn` identifier. Identifiers must be contiguous; the check enforces it.
 2. Set `executionStage` honestly. `reachedShadowOrLive` must agree with it — the check
    enforces that too.
-3. Name a `detector` and a `regressionGuard`, each citing a file that exists. A remediated
+3. Set `detectedOn` and `coordinatorChangeOrdinal`. These are what the rolling window is
+   computed from; an incident with no date does not age.
+4. Name a `detector` and a `regressionGuard`, each citing a file that exists. A remediated
    incident with no guard is an incident waiting to recur.
-4. Update `budget.state` to the recomputed values, or let the check tell you what they
+5. Update `budget.state` to the recomputed values, or let the check tell you what they
    should be.
-5. Add a row to the table above. The check fails if the ledger and this document disagree
+6. Add a row to the table above. The check fails if the ledger and this document disagree
    about which incidents exist.

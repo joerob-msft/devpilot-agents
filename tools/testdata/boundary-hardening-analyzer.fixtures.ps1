@@ -161,3 +161,42 @@ function Negative-AssignsProtectedCollectionBeforeWrapping {
     $wrapped = @($value)
     return $wrapped.Count
 }
+
+# --- exemption soundness: a helper must earn the protected-return exemption ---
+
+# Write-Output with some other named parameter still enumerates, so counting
+# this helper's result is a real flattening hazard the exemption must not hide.
+function Helper-InputObjectCollectionSource {
+    param([object[]]$Rows = @())
+    $selected = $Rows | Where-Object { $_ }
+    Write-Output -InputObject $selected
+}
+
+function Positive-CountsInputObjectHelperResult {
+    param([object[]]$Rows = @())
+    $found = Helper-InputObjectCollectionSource -Rows $Rows
+    return $found.Count
+}
+
+# One protected exit does not make the function protected: the bare return
+# still enumerates, so the exemption must be withdrawn for the whole helper.
+function Helper-MixedProtectionCollectionSource {
+    param([object[]]$Rows = @())
+    $selected = $Rows | Where-Object { $_ }
+    if (@($Rows).Count -eq 0) { return $selected }
+    Write-Output -NoEnumerate ([object[]]$selected)
+}
+
+function Positive-CountsMixedProtectionHelperResult {
+    param([object[]]$Rows = @())
+    $found = Helper-MixedProtectionCollectionSource -Rows $Rows
+    return $found.Count
+}
+
+# The wrapping rule must still fire for a mixed helper: the protected exit
+# nests, so @() yields one element holding the whole collection.
+function Positive-WrapsMixedProtectionHelperResult {
+    param([object[]]$Rows = @())
+    $wrapped = @(Helper-MixedProtectionCollectionSource -Rows $Rows)
+    return $wrapped.Count
+}

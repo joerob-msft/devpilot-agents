@@ -1322,7 +1322,7 @@
       "kind": "jsonArray",
       "required": "not required; no minItems in schema — schema says \"Empty means the declaration fixes only how many runs will count, which is the weaker form\"",
       "producer": "New-ReviewerGateQualification tool (out of scope)",
-      "consumer": "RunReconciliation.ps1:114 (fields check via Get-ReviewerConventionSpecialistValue); wrapper uses it to validate run set membership",
+      "consumer": "tools/Compare-ReviewerReplayRuns.ps1:226 and :323 (@(Get-ReviewerConventionSpecialistValue $runSet \"expectedRunSha256\" @())); re-emitted at :369",
       "collapseRisk": "ESCAPE SHAPE: empty array is EXPLICITLY legal per schema description. A declaration with expectedRunSha256=[] still seals plannedRunCount but does not bind specific artifacts — weaker integrity guarantee.",
       "knownEscapeShape": false
     },
@@ -2402,7 +2402,7 @@
       "kind": "jsonArray",
       "required": "True",
       "producer": "src/Agents/reviewer/ReviewFacts.ps1 (New-ReviewerFactDomainResult accumulation → array of 5 domain objects in Build-ReviewerFactPlan or equivalent)",
-      "consumer": "src/Agents/reviewer/ConventionSpecialist.ps1 ~1116 (@(Get-ReviewerConventionSpecialistValue $hashes 'scriptClosure' @())); facts schema requires minItems:5 maxItems:5",
+      "consumer": "src/Agents/reviewer/ReviewFacts.ps1:1213 (domains = $body.domains) and :1248 (domains = Get-ReviewerFactValue $Plan \"domains\"); facts schema requires minItems:5 maxItems:5",
       "collapseRisk": "Schema enforces exactly 5 items; collapse to scalar impossible (5 elements never singleton). Still, ConvertFrom-Json without -Depth guard on older PowerShell could truncate nested objects.",
       "knownEscapeShape": false
     },
@@ -2641,8 +2641,8 @@
       "field": "/eligiblePreviewCandidates",
       "kind": "jsonArray",
       "required": "no; LEGALLY EMPTY (no verified candidates = eligible=[])",
-      "producer": "CrossVerification.ps1 (wrapper writes eligible list to preview)",
-      "consumer": "RunReconciliation.ps1:405 `@(Get-ReviewerRunReconciliationValue $VerificationManifest \"eligiblePreviewCandidates\" @()).Count`; DeliveryGates.ps1 (via wrapper)",
+      "producer": "src/Agents/reviewer/Start-ReviewerAgent.ps1:10794 (eligiblePreviewCandidates = @($Eligible))",
+      "consumer": "src/Agents/reviewer/RunReconciliation.ps1:405 `@(Get-ReviewerRunReconciliationValue $VerificationManifest \"eligiblePreviewCandidates\" @()).Count`",
       "collapseRisk": "ESCAPE SHAPE: 0-element eligible list triggers empty-run path. Wrapped in @() at every read.",
       "knownEscapeShape": false
     },

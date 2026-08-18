@@ -77,6 +77,9 @@ $cases = @(
     @{ Label = 'Negative-ClosureCapturesFunctionReference'; Positive = $false; RuleId = 'PSEN010' }
     @{ Label = 'Positive-WrapsProtectedCollectionReturn'; Positive = $true; RuleId = 'PSEN011' }
     @{ Label = 'Negative-AssignsProtectedCollectionBeforeWrapping'; Positive = $false; RuleId = 'PSEN011' }
+    @{ Label = 'Positive-CountsInputObjectHelperResult'; Positive = $true; RuleId = 'PSEN009' }
+    @{ Label = 'Positive-CountsMixedProtectionHelperResult'; Positive = $true; RuleId = 'PSEN009' }
+    @{ Label = 'Positive-WrapsMixedProtectionHelperResult'; Positive = $true; RuleId = 'PSEN011' }
 )
 
 $tokens = $null

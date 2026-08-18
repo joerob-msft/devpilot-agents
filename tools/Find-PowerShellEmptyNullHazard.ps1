@@ -320,25 +320,35 @@ function Test-MeasureGuarded {
     return $false
 }
 
-function Test-ProtectedCollectionReturn {
+function Get-CollectionReturnProtection {
     <#
     .SYNOPSIS
-        True when a function deliberately returns a collection as one object.
+        Classifies how a function hands a collection back to its caller.
 
     .DESCRIPTION
         Write-Output -NoEnumerate and a unary-comma return both hand the caller
-        the collection itself instead of its elements. Callers must assign such
-        a result before wrapping it, because @(f) collects the pipeline output
-        rather than flattening the object that arrived on it.
+        the collection itself instead of its elements. Two different questions
+        follow from that, and they need different answers:
+
+        Any   - at least one exit is protected, so @(f) nests rather than
+                flattens on that path. Wrapping such a call is a hazard even
+                when other exits enumerate (PSEN011).
+        All   - every exit is protected or provably scalar, so assigning the
+                result cannot collapse. Only this earns an exemption from the
+                assignment rules (PSEN005/PSEN009). A function with one bare
+                collection exit and one protected exit is exactly the escape
+                shape those rules exist to catch, so it earns nothing.
     #>
     param([Management.Automation.Language.FunctionDefinitionAst]$Function)
 
+    $protectedExits = 0
+    $unprotectedExits = 0
     foreach ($command in $Function.Body.FindAll({
                 param($node)
                 $node -is [Management.Automation.Language.CommandAst]
             }, $true)) {
         if ([string]$command.GetCommandName() -ine 'Write-Output') { continue }
-        if (Test-CommandParameterPresent -Command $command -Prefix 'NoEnum') { return $true }
+        if (Test-CommandParameterPresent -Command $command -NamePrefix 'NoEnum') { $protectedExits++ }
     }
     foreach ($return in $Function.Body.FindAll({
                 param($node)
@@ -350,19 +360,70 @@ function Test-ProtectedCollectionReturn {
         $elements = @($pipeline.PipelineElements)
         if ($elements.Count -ne 1) { continue }
         $element = $elements[0]
-        if ($element -isnot [Management.Automation.Language.CommandExpressionAst]) { continue }
-        $expression = $element.Expression
-        # ", $x" parses as a one-element array literal whose extent starts with
-        # the comma; that is the protected-return form, unlike "@(1, 2)".
-        if ($expression -is [Management.Automation.Language.ArrayLiteralAst] -and
-            @($expression.Elements).Count -eq 1 -and
-            ([string]$expression.Extent.Text).TrimStart().StartsWith(',')) {
-            return $true
+        if ($element -isnot [Management.Automation.Language.CommandExpressionAst]) {
+            # "return f x" hands the caller whatever the command emits.
+            $unprotectedExits++
+            continue
         }
-        if ($expression -is [Management.Automation.Language.UnaryExpressionAst] -and
-            $expression.TokenKind -eq [Management.Automation.Language.TokenKind]::Comma) {
-            return $true
+        if (Test-ProtectedReturnExpression -Expression $element.Expression) {
+            $protectedExits++
+            continue
         }
+        if (-not (Test-ScalarReturnExpression -Expression $element.Expression)) { $unprotectedExits++ }
+    }
+    return [pscustomobject]@{
+        Any = ($protectedExits -gt 0)
+        All = ($protectedExits -gt 0 -and $unprotectedExits -eq 0)
+    }
+}
+
+function Test-ProtectedReturnExpression {
+    <#
+    .SYNOPSIS
+        True for the unary-comma return form, which preserves the collection.
+    #>
+    param([Management.Automation.Language.Ast]$Expression)
+
+    # ", $x" parses as a one-element array literal whose extent starts with
+    # the comma; that is the protected-return form, unlike "@(1, 2)".
+    if ($Expression -is [Management.Automation.Language.ArrayLiteralAst] -and
+        @($Expression.Elements).Count -eq 1 -and
+        ([string]$Expression.Extent.Text).TrimStart().StartsWith(',')) {
+        return $true
+    }
+    if ($Expression -is [Management.Automation.Language.UnaryExpressionAst] -and
+        $Expression.TokenKind -eq [Management.Automation.Language.TokenKind]::Comma) {
+        return $true
+    }
+    return $false
+}
+
+function Test-ScalarReturnExpression {
+    <#
+    .SYNOPSIS
+        True when a return expression cannot carry a collection, so it neither
+        protects nor breaks the caller's flattening assumption.
+
+    .DESCRIPTION
+        Deliberately narrow: anything not recognised here is treated as a
+        collection-bearing exit, which withdraws the exemption rather than
+        granting one that was not earned.
+    #>
+    param([Management.Automation.Language.Ast]$Expression)
+
+    if ($Expression -is [Management.Automation.Language.ConstantExpressionAst]) { return $true }
+    if ($Expression -is [Management.Automation.Language.StringConstantExpressionAst]) { return $true }
+    if ($Expression -is [Management.Automation.Language.ExpandableStringExpressionAst]) { return $true }
+    if ($Expression -is [Management.Automation.Language.HashtableAst]) { return $true }
+    if ($Expression -is [Management.Automation.Language.ScriptBlockExpressionAst]) { return $true }
+    if ($Expression -is [Management.Automation.Language.VariableExpressionAst]) {
+        $name = [string]$Expression.VariablePath.UserPath
+        return ($name -iin @('null', 'true', 'false'))
+    }
+    if ($Expression -is [Management.Automation.Language.ConvertExpressionAst]) {
+        $typeName = [string]$Expression.Type.TypeName.FullName
+        if ($typeName -match '\[\s*\]$') { return $false }
+        return $true
     }
     return $false
 }
@@ -565,11 +626,15 @@ function Get-ScriptBlockLocalNames {
 }
 
 function Test-CommandParameterPresent {
+    [CmdletBinding()]
     param(
         [Management.Automation.Language.CommandAst]$Command,
         [string]$NamePrefix
     )
 
+    if ([string]::IsNullOrEmpty($NamePrefix)) {
+        throw "Test-CommandParameterPresent requires a non-empty -NamePrefix."
+    }
     foreach ($element in @($Command.CommandElements)) {
         if ($element -is [Management.Automation.Language.CommandParameterAst] -and
             ([string]$element.ParameterName).StartsWith($NamePrefix, [StringComparison]::OrdinalIgnoreCase)) {
@@ -609,7 +674,10 @@ function New-Finding {
         [Management.Automation.Language.Ast]$Ast
     )
 
-    $snippet = [string]$Ast.Extent.Text
+    # Normalize before truncating: a 240-character cut applied to raw text lands
+    # at a different point under CRLF than under LF, which would make the
+    # checked-in fingerprint a property of the clone rather than of the code.
+    $snippet = ([string]$Ast.Extent.Text -replace '\s+', ' ').Trim()
     if ($snippet.Length -gt 240) { $snippet = $snippet.Substring(0, 240) + '...' }
     [pscustomobject][ordered]@{
         RuleId = $RuleId
@@ -625,7 +693,7 @@ $files = @(Get-InputFiles -InputPath $Path -Recursive $Recurse | Sort-Object Ful
 $parsed = [System.Collections.Generic.List[object]]::new()
 $knownFunctions = @{}
 $definedFunctions = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-$protectedReturnFunctions = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$functionDefinitions = [System.Collections.Generic.List[object]]::new()
 
 foreach ($file in $files) {
     $tokens = $null
@@ -645,9 +713,13 @@ foreach ($file in $files) {
                 $node -is [Management.Automation.Language.FunctionDefinitionAst]
             }, $true)) {
         [void]$definedFunctions.Add([string]$function.Name)
-        if (Test-ProtectedCollectionReturn -Function $function) {
-            [void]$protectedReturnFunctions.Add([string]$function.Name)
-        }
+        $protection = Get-CollectionReturnProtection -Function $function
+        [void]$functionDefinitions.Add([pscustomobject]@{
+                File         = $file.FullName
+                Name         = [string]$function.Name
+                AnyProtected = [bool]$protection.Any
+                AllProtected = [bool]$protection.All
+            })
         $parameters = @()
         if ($null -ne $function.Body.ParamBlock) {
             $parameters = @($function.Body.ParamBlock.Parameters)
@@ -666,9 +738,47 @@ foreach ($file in $files) {
 }
 
 $findings = [System.Collections.Generic.List[object]]::new()
+
+# The protected-return exemption is resolved per file, never repo-wide by bare
+# name: a protected Get-Foo in one file must not exempt call sites of a
+# different, unprotected Get-Foo in another. A definition from elsewhere is
+# honoured only when the name is defined exactly once across the scan.
+$definitionsByName = @{}
+foreach ($definition in $functionDefinitions) {
+    $key = $definition.Name.ToLowerInvariant()
+    if (-not $definitionsByName.ContainsKey($key)) {
+        $definitionsByName[$key] = [System.Collections.Generic.List[object]]::new()
+    }
+    [void]$definitionsByName[$key].Add($definition)
+}
+$exemptByFile = @{}
+$nestingByFile = @{}
+foreach ($document in $parsed) {
+    $exempt = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $nesting = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($key in $definitionsByName.Keys) {
+        $allDefinitions = @($definitionsByName[$key])
+        $localDefinitions = @($allDefinitions | Where-Object { $_.File -eq $document.File })
+        $visible = $localDefinitions
+        if ($localDefinitions.Count -eq 0) {
+            if ($allDefinitions.Count -ne 1) { continue }
+            $visible = $allDefinitions
+        }
+        $name = $visible[0].Name
+        if (@($visible | Where-Object { -not $_.AllProtected }).Count -eq 0) { [void]$exempt.Add($name) }
+        if (@($visible | Where-Object { $_.AnyProtected }).Count -gt 0) { [void]$nesting.Add($name) }
+    }
+    $exemptByFile[$document.File] = $exempt
+    $nestingByFile[$document.File] = $nesting
+}
+
 foreach ($document in $parsed) {
     $ast = $document.Ast
     $file = $document.File
+    # Assignment rules only stand down when every exit is protected; the
+    # wrapping rule fires whenever any exit is, because that path nests.
+    $protectedReturnFunctions = $exemptByFile[$file]
+    $nestingReturnFunctions = $nestingByFile[$file]
 
     foreach ($assignment in $ast.FindAll({
                 param($node)
@@ -897,7 +1007,7 @@ foreach ($document in $parsed) {
         if ($command -isnot [Management.Automation.Language.CommandAst]) { continue }
         $wrappedName = $command.GetCommandName()
         if ([string]::IsNullOrWhiteSpace($wrappedName) -or
-            -not $protectedReturnFunctions.Contains($wrappedName)) {
+            -not $nestingReturnFunctions.Contains($wrappedName)) {
             continue
         }
         [void]$findings.Add((New-Finding -RuleId 'PSEN011' -File $file -Ast $wrap `

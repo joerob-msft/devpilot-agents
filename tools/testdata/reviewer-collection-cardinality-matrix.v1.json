@@ -28,6 +28,7 @@
     "knownEscapeShapeFields": 15,
     "escapeShapeProperties": 11,
     "sabotageChecks": 9,
+    "citationsChecked": 416,
     "byStage": {
       "capture": 12,
       "source": 24,

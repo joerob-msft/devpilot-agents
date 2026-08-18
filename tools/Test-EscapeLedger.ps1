@@ -53,26 +53,56 @@ function Get-LedgerObject {
 
 # Recomputes every derived number in the ledger from the incident list. The ledger is only
 # trustworthy if the numbers it publishes are the numbers its own contents imply.
+#
+# The registered trigger is a rolling window, so it has to be computed as one. The
+# combinator is deliberately "either": an incident qualifies when it falls inside the last
+# N coordinator changes OR inside the last D days. A safety trigger that only fires when
+# both windows agree can be silenced by going quiet (no new changes ages nothing out of
+# the ordinal window) or by shipping quickly (many changes push incidents out of the
+# ordinal window while they are still days old). Firing on either window removes both
+# ways of waiting out the budget.
 function Measure-LedgerBudget {
     param([Parameter(Mandatory)][object]$Ledger)
 
     $threshold = $Ledger.budget.threshold
+    $window = $Ledger.budget.window
     $stages = @($threshold.reachedExecutionStages)
+    $evaluatedOn = [datetime]::ParseExact(
+        [string]$Ledger.coverageWindow.evaluatedOn, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+    $observed = [int]$Ledger.coverageWindow.coordinatorChangesObserved
+    $oldestOrdinalInWindow = $observed - [int]$window.coordinatorChanges + 1
+    $earliestDateInWindow = $evaluatedOn.AddDays(-[int]$window.days)
+
     $qualifying = [System.Collections.Generic.List[string]]::new()
+    $inWindow = [System.Collections.Generic.List[string]]::new()
 
     foreach ($incident in @($Ledger.incidents)) {
+        $detectedOn = [datetime]::ParseExact(
+            [string]$incident.detectedOn, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+        $withinOrdinal = ([int]$incident.coordinatorChangeOrdinal -ge $oldestOrdinalInWindow)
+        $withinDays = ($detectedOn -ge $earliestDateInWindow)
+        $withinWindow = if ($window.combinator -eq 'both') { $withinOrdinal -and $withinDays }
+        else { $withinOrdinal -or $withinDays }
+        if (-not $withinWindow) { continue }
+        $inWindow.Add([string]$incident.id)
+
         if ($incident.category -ne $threshold.category) { continue }
         if (-not $incident.reachedShadowOrLive) { continue }
         if ($stages -notcontains $incident.executionStage) { continue }
-        $qualifying.Add($incident.id)
+        $qualifying.Add([string]$incident.id)
     }
 
     $ids = [string[]]::new($qualifying.Count)
     $qualifying.CopyTo($ids, 0)
+    $inWindowIds = [string[]]::new($inWindow.Count)
+    $inWindow.CopyTo($inWindowIds, 0)
 
     return [pscustomobject]@{
         QualifyingIds = $ids
         QualifyingCount = $qualifying.Count
+        InWindowIds = $inWindowIds
+        OldestOrdinalInWindow = $oldestOrdinalInWindow
+        EarliestDateInWindow = $earliestDateInWindow.ToString('yyyy-MM-dd')
         Triggered = ($qualifying.Count -ge [int]$threshold.count)
     }
 }
@@ -183,11 +213,39 @@ Assert-Ledger ([int]$ledger.budget.threshold.count -eq 2) 'The registered trigge
 $triggerStages = @($ledger.budget.threshold.reachedExecutionStages)
 Assert-Ledger ($triggerStages.Count -eq 2 -and $triggerStages -contains 'shadow' -and $triggerStages -contains 'live') `
     'The registered trigger no longer watches shadow and live execution.'
-Assert-Ledger ([int]$ledger.budget.window.coordinatorPullRequests -eq 10) 'The registered trigger window is no longer ten coordinator changes.'
+Assert-Ledger ([int]$ledger.budget.window.coordinatorChanges -eq 10) 'The registered trigger window is no longer ten coordinator changes.'
 Assert-Ledger ([int]$ledger.budget.window.days -eq 60) 'The registered trigger window is no longer sixty days.'
 Assert-Ledger ($ledger.budget.window.combinator -eq 'either') 'The registered trigger window combinator changed.'
-Assert-Ledger ([int]$ledger.coverageWindow.coordinatorPullRequestsObserved -ge 1) `
+Assert-Ledger ([int]$ledger.coverageWindow.coordinatorChangesObserved -ge 1) `
     'The coverage window observes no coordinator changes.'
+
+# The window is only meaningful if it is computed. Every incident carries the date it was
+# detected and the coordinator change it was detected under, and the recorded in-window set
+# must be the set those two facts imply.
+$recordedInWindow = @($ledger.budget.state.inWindowIncidentIds)
+Assert-Ledger ($recordedInWindow.Count -eq $measured.InWindowIds.Count) `
+    "The ledger records $($recordedInWindow.Count) in-window incident(s) but the window implies $($measured.InWindowIds.Count)."
+foreach ($id in $measured.InWindowIds) {
+    Assert-Ledger ($recordedInWindow -contains $id) "Incident $id falls inside the budget window but is not recorded in the budget state."
+}
+foreach ($incident in $incidents) {
+    Assert-Ledger ([int]$incident.coordinatorChangeOrdinal -le [int]$ledger.coverageWindow.coordinatorChangesObserved) `
+        "Incident $($incident.id) claims coordinator change ordinal $($incident.coordinatorChangeOrdinal), beyond the $($ledger.coverageWindow.coordinatorChangesObserved) observed."
+    Assert-Ledger ([string]$incident.detectedOn -le [string]$ledger.coverageWindow.evaluatedOn) `
+        "Incident $($incident.id) was detected on $($incident.detectedOn), after the ledger evaluation date."
+}
+
+# An incident aged out of both windows must stop counting, or the budget is a running total
+# rather than a rolling one.
+$agedOut = Get-LedgerObject -Json $ledgerJson
+foreach ($incident in @($agedOut.incidents)) {
+    $incident.detectedOn = '2020-01-01'
+    $incident.coordinatorChangeOrdinal = 1
+}
+$agedOut.coverageWindow.coordinatorChangesObserved = 400
+$agedMeasured = Measure-LedgerBudget -Ledger $agedOut
+Assert-Ledger ($agedMeasured.InWindowIds.Count -eq 0) `
+    'Incidents outside both the ordinal and the day window were still counted as in-window.'
 
 # --- 5. Sabotage: the trigger must actually fire -----------------------------------------
 
@@ -227,6 +285,28 @@ foreach ($incident in @($otherCategory.incidents)) {
 $otherMeasured = Measure-LedgerBudget -Ledger $otherCategory
 Assert-Ledger (-not $otherMeasured.Triggered) 'Logic escapes reaching live incorrectly fired the type-binding trigger.'
 
+# Shadow is not a lesser arm of the trigger. A shadow run discards its output, so it
+# preserves the no-write invariant while still exercising the code under test - which is
+# exactly why an escape that reaches shadow has to count. Two shadow escapes must fire.
+$shadowOnly = Get-LedgerObject -Json $ledgerJson
+$shadowIndexes = @()
+for ($i = 0; $i -lt $shadowOnly.incidents.Count; $i++) {
+    if ($shadowOnly.incidents[$i].category -eq 'typeBinding') { $shadowIndexes += $i }
+}
+if ($shadowIndexes.Count -ge 2) {
+    foreach ($i in $shadowIndexes[0..1]) {
+        $shadowOnly.incidents[$i].executionStage = 'shadow'
+        $shadowOnly.incidents[$i].reachedShadowOrLive = $true
+    }
+    foreach ($observation in @($shadowOnly.gateObservations)) {
+        $observation.externalWrites = 0
+        $observation.noWriteInvariantHeld = $true
+    }
+    $shadowMeasured = Measure-LedgerBudget -Ledger $shadowOnly
+    Assert-Ledger ($shadowMeasured.QualifyingCount -eq 2 -and $shadowMeasured.Triggered) `
+        'Two type-binding escapes reaching shadow did not fire the registered trigger.'
+}
+
 # A drifted count must be caught rather than believed.
 $driftedCount = Get-LedgerObject -Json $ledgerJson
 $driftedCount.budget.state.qualifyingCount = 7
@@ -242,20 +322,41 @@ if ($gateFive.Count -eq 1) {
     Assert-Ledger ([double]$gateFive[0].decisionYieldPercent -eq 0) 'The recorded Gate 5 decision yield is not zero per cent.'
     Assert-Ledger ([int]$gateFive[0].externalWrites -eq 0) 'The recorded Gate 5 run performed external writes.'
     Assert-Ledger ($gateFive[0].noWriteInvariantHeld -eq $true) 'The recorded Gate 5 run did not hold the no-write invariant.'
+    Assert-Ledger ([int]$gateFive[0].shadowRunsPerformed -ge 0) 'The Gate 5 observation records no shadow run count.'
+    Assert-Ledger ([int]$gateFive[0].liveRunsPerformed -ge 0) 'The Gate 5 observation records no live run count.'
 }
 
 foreach ($observation in @($ledger.gateObservations)) {
     $writesConsistent = (([int]$observation.externalWrites -eq 0) -eq [bool]$observation.noWriteInvariantHeld)
     Assert-Ledger $writesConsistent `
         "Gate observation '$($observation.gate)' records $($observation.externalWrites) external write(s) but claims noWriteInvariantHeld=$($observation.noWriteInvariantHeld)."
+    Assert-Ledger ([int]$observation.liveRunsPerformed -eq 0 -or [int]$observation.externalWrites -gt 0 -or -not $observation.noWriteInvariantHeld) `
+        "Gate observation '$($observation.gate)' claims live runs while also claiming zero external writes."
 }
 
-# No incident may claim to have reached shadow or live while every gate observation reports
-# that the no-write invariant held and no shadow or live run has been performed.
-$anyReached = @($incidents | Where-Object { $_.reachedShadowOrLive })
+# Only live execution contradicts the no-write invariant. Shadow execution runs the code
+# and discards the output, so it writes nothing externally by construction: treating a
+# shadow escape as inconsistent with the invariant would make the shadow arm of the
+# registered trigger unusable, which is the opposite of what it is for.
+$reachedLive = @($incidents | Where-Object { $_.executionStage -eq 'live' })
 $allHeld = -not (@($ledger.gateObservations | Where-Object { -not $_.noWriteInvariantHeld }).Count)
-Assert-Ledger (-not ($anyReached.Count -gt 0 -and $allHeld)) `
-    'The ledger claims escapes reached shadow or live while also claiming the no-write invariant always held.'
+Assert-Ledger (-not ($reachedLive.Count -gt 0 -and $allHeld)) `
+    'The ledger claims escapes reached live execution while also claiming the no-write invariant always held.'
+
+# Abstention is not evidence. Never running shadow keeps the escape rate at zero for ever,
+# so the ledger has to state the shadow exposure the decision is conditional on and report
+# honestly how much of it has been performed.
+$obligation = $ledger.decision.exposureObligation
+Assert-Ledger ([int]$obligation.requiredShadowRuns -ge 1) `
+    'The decision records no required shadow exposure, so a zero escape rate could be produced by never running.'
+$performed = 0
+foreach ($observation in @($ledger.gateObservations)) { $performed += [int]$observation.shadowRunsPerformed }
+Assert-Ledger ([int]$obligation.shadowRunsPerformed -eq $performed) `
+    "The decision records $($obligation.shadowRunsPerformed) shadow run(s) but the gate observations total $performed."
+Assert-Ledger ([bool]$obligation.satisfied -eq ($performed -ge [int]$obligation.requiredShadowRuns)) `
+    "The decision claims the exposure obligation is satisfied=$($obligation.satisfied) with $performed of $($obligation.requiredShadowRuns) required shadow run(s)."
+Assert-Ledger ([int]$obligation.byCoordinatorChange -gt [int]$ledger.coverageWindow.coordinatorChangesObserved) `
+    'The exposure obligation is not due after the coordinator changes already observed, so it records no future commitment.'
 
 # --- 7. Decision status and prerequisite completion --------------------------------------
 
@@ -347,7 +448,8 @@ $report = [ordered]@{
     remediated = @($incidents | Where-Object { $_.status -eq 'remediated' }).Count
     openDebt = @($incidents | Where-Object { $_.status -eq 'openDebt' }).Count
     typeBinding = @($incidents | Where-Object { $_.category -eq 'typeBinding' }).Count
-    reachedShadowOrLive = $anyReached.Count
+    reachedShadowOrLive = @($incidents | Where-Object { $_.reachedShadowOrLive }).Count
+    inWindow = $measured.InWindowIds.Count
     qualifyingCount = $measured.QualifyingCount
     triggered = $measured.Triggered
     commitsVerified = $commitsVerified

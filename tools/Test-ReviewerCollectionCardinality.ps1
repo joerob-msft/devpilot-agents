@@ -149,6 +149,128 @@ function Get-ExpectedCount {
     return -1
 }
 
+function New-VariantMapValue {
+    <#
+    .SYNOPSIS
+        Builds the raw producer-side value for one cardinality variant of a field whose
+        declared container is a JSON object used as a map, not an array.
+    #>
+    param([Parameter(Mandatory)][string]$Variant)
+
+    switch ($Variant) {
+        'nullVsMissing' { return $null }
+        'wrongScalar' { return 'element-0' }
+    }
+
+    $map = [ordered]@{}
+    switch ($Variant) {
+        'zero' { }
+        'one' { $map['key-0'] = 'element-0' }
+        'many' { for ($i = 0; $i -lt 3; $i++) { $map["key-$i"] = "element-$i" } }
+        'max' { for ($i = 0; $i -lt $maxElements; $i++) { $map["key-$i"] = "element-$i" } }
+        # A map cannot carry a duplicate key, so the duplicate variant is duplicate
+        # *values* under distinct keys: the shape that a set-like consumer collapses.
+        'duplicate' { for ($i = 0; $i -lt 3; $i++) { $map["key-$i"] = 'element-0' } }
+    }
+    return $map
+}
+
+function Get-ExpectedMapCount {
+    param([Parameter(Mandatory)][string]$Variant)
+
+    switch ($Variant) {
+        'zero' { return 0 }
+        'one' { return 1 }
+        'many' { return 3 }
+        'max' { return $maxElements }
+        'duplicate' { return 3 }
+        'nullVsMissing' { return 0 }
+        'wrongScalar' { return 0 }
+    }
+    return -1
+}
+
+function Test-MapVariant {
+    <#
+    .SYNOPSIS
+        Drives one map-valued field through one cardinality variant.
+    .DESCRIPTION
+        A map collapses differently from an array. An empty map must serialize as {} and
+        not as [], a one-key map must not read back as its single value, and a scalar in a
+        declared map field has no meaningful repair, so it must be refused rather than
+        wrapped. Treating these rows as arrays would test none of that.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$RowId,
+        [Parameter(Mandatory)][string]$Variant
+    )
+
+    $rawValue = New-VariantMapValue -Variant $Variant
+    $expected = Get-ExpectedMapCount -Variant $Variant
+
+    if ($Variant -eq 'wrongScalar') {
+        # There is no repair for a scalar where a map was declared: a map has keys and a
+        # scalar has none, so wrapping it would invent one. The only correct answer is to
+        # refuse it, which is what a map-shaped consumer must do.
+        $scalarPayload = [ordered]@{ id = $RowId; values = $rawValue }
+        $json = ConvertTo-Json -InputObject $scalarPayload -Depth 12 -Compress
+        $restored = ($json | ConvertFrom-Json -Depth 12).values
+        if ($restored -isnot [string]) {
+            throw 'a scalar in a declared map field did not read back as a scalar, so a consumer cannot detect the collapse'
+        }
+        return
+    }
+
+    if ($Variant -eq 'nullVsMissing') {
+        $nullJson = ConvertTo-Json -InputObject ([ordered]@{ id = $RowId; values = $rawValue }) -Depth 12 -Compress
+        if (-not $nullJson.Contains('"values":null')) {
+            throw 'a null map field did not serialize as null, so null and empty are no longer distinguishable'
+        }
+        $missingJson = ConvertTo-Json -InputObject ([ordered]@{ id = $RowId }) -Depth 12 -Compress
+        if ($missingJson.Contains('"values"')) {
+            throw 'a missing map field was materialized'
+        }
+        $restoredNull = ($nullJson | ConvertFrom-Json -Depth 12)
+        $restoredMissing = ($missingJson | ConvertFrom-Json -Depth 12)
+        $nullPresent = $null -ne ($restoredNull.PSObject.Properties['values'])
+        $missingPresent = $null -ne ($restoredMissing.PSObject.Properties['values'])
+        if (-not $nullPresent -or $missingPresent) {
+            throw 'null and missing map fields became indistinguishable after a round trip'
+        }
+        return
+    }
+
+    $payload = [ordered]@{ id = $RowId; values = $rawValue }
+    $json = ConvertTo-Json -InputObject $payload -Depth 12 -Compress
+    if ($Variant -eq 'zero' -and -not $json.Contains('"values":{}')) {
+        throw 'an empty map did not serialize as {}'
+    }
+    if ($json.Contains('"values":[')) {
+        throw 'a map field serialized as an array, which is the collapse this row exists to catch'
+    }
+
+    $restored = ($json | ConvertFrom-Json -Depth 12).values
+    if ($restored -isnot [psobject]) {
+        throw "a map field read back as $($restored.GetType().Name) instead of an object"
+    }
+    # Member enumeration over an empty property collection throws under Set-StrictMode,
+    # which is the same empty-collection hazard this corpus exists to catch. Project the
+    # names explicitly instead.
+    $keys = @($restored.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    if ($keys.Count -ne $expected) {
+        throw "expected $expected key(s) after a JSON round trip, observed $($keys.Count)"
+    }
+    for ($i = 0; $i -lt $expected; $i++) {
+        if ($keys[$i] -cne "key-$i") { throw "key order changed at index $i" }
+    }
+    if ($Variant -eq 'duplicate') {
+        $values = @($keys | ForEach-Object { [string]$restored.$_ })
+        if (@($values | Sort-Object -Unique).Count -ne 1) {
+            throw 'duplicate map values did not survive the round trip'
+        }
+    }
+}
+
 $variantResults = @{}
 $variantFailures = [System.Collections.Generic.List[string]]::new()
 
@@ -159,6 +281,11 @@ foreach ($row in $inventoryFields) {
     foreach ($variant in $variants) {
         $status = 'covered'
         try {
+            if ($kind -eq 'jsonObjectMap') {
+                Test-MapVariant -RowId $rowId -Variant $variant
+                $perVariant[$variant] = $status
+                continue
+            }
             $rawValue = New-VariantValue -Variant $variant -Kind $kind
             $payload = [ordered]@{ id = $rowId; values = $rawValue }
 
@@ -226,6 +353,20 @@ if ($variantFailures.Count -gt 0) {
     $shown = @($variantFailures | Select-Object -First 10)
     Add-Failure "Boundary variant harness failed $($variantFailures.Count) case(s): $($shown -join ' | ')"
 }
+
+# The map path must reject the array collapse it exists to catch, or its passes mean
+# nothing. Feed it the wrong container and require a failure.
+$mapSabotageFired = $false
+try {
+    $sabotageJson = ConvertTo-Json -InputObject ([ordered]@{ id = 'x'; values = @('element-0') }) -Depth 12 -Compress
+    if ($sabotageJson.Contains('"values":[')) { $mapSabotageFired = $true }
+}
+catch { $mapSabotageFired = $false }
+[void](Assert-True -Name 'map-variant/sabotage-array-collapse' -Condition $mapSabotageFired `
+        -Detail 'a map field carrying an array was not recognisable as an array, so the map assertions cannot detect the collapse')
+$mapRowCount = @($inventoryFields | Where-Object { [string]$_.kind -eq 'jsonObjectMap' }).Count
+[void](Assert-True -Name 'map-variant/rows-exist' -Condition ($mapRowCount -gt 0) `
+        -Detail 'no inventoried field is a map, so the map path ran on nothing')
 
 # ---------------------------------------------------------------------------
 # Part 2 - escape-shape property tests
@@ -600,6 +741,151 @@ finally {
 }
 
 # ---------------------------------------------------------------------------
+# Inventory rot: every cited source file must exist and mention the field
+# ---------------------------------------------------------------------------
+
+$script:SourceTextCache = @{}
+
+$script:RepoFileIndex = [System.Collections.Generic.List[string]]::new()
+foreach ($scanRoot in @('src', 'tools', 'docs', '.github')) {
+    $scanFull = Join-Path -Path $repoRoot -ChildPath $scanRoot
+    if (-not (Test-Path -LiteralPath $scanFull)) { continue }
+    foreach ($file in (Get-ChildItem -LiteralPath $scanFull -Recurse -File)) {
+        $relative = [System.IO.Path]::GetRelativePath($repoRoot, $file.FullName).Replace('\', '/')
+        [void]$script:RepoFileIndex.Add($relative)
+    }
+}
+
+function Resolve-CitedPath {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Citation)
+
+    $normalized = $Citation.Replace('\', '/').Trim()
+    foreach ($candidate in $script:RepoFileIndex) {
+        if ($candidate -eq $normalized) { return $candidate }
+    }
+    # Inventory rows cite files by whatever suffix identified them unambiguously at the
+    # time, from a bare name to a full repository path. A suffix that now matches nothing,
+    # or matches several files, is exactly the rot this check exists to surface.
+    $suffix = '/' + $normalized
+    $matches = [System.Collections.Generic.List[string]]::new()
+    foreach ($candidate in $script:RepoFileIndex) {
+        if ($candidate.EndsWith($suffix, [System.StringComparison]::Ordinal)) { [void]$matches.Add($candidate) }
+    }
+    if ($matches.Count -eq 1) { return [string]$matches[0] }
+    if ($matches.Count -gt 1) { return "AMBIGUOUS:$($matches.Count)" }
+    return $null
+}
+
+function Get-CitedSourceText {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$RelativePath)
+
+    if ($script:SourceTextCache.ContainsKey($RelativePath)) {
+        return [string]$script:SourceTextCache[$RelativePath]
+    }
+    $full = Join-Path -Path $repoRoot -ChildPath $RelativePath
+    $text = [System.IO.File]::ReadAllText($full)
+    $script:SourceTextCache[$RelativePath] = $text
+    return $text
+}
+
+function Get-CitedFileToken {
+    [CmdletBinding()]
+    param([AllowNull()][string]$Citation)
+
+    $tokens = [System.Collections.Generic.List[string]]::new()
+    if ([string]::IsNullOrWhiteSpace($Citation)) {
+        Write-Output -NoEnumerate $tokens.ToArray()
+        return
+    }
+    # A quoted literal inside a citation is data the cited code contains, not a second
+    # citation. Strip them before looking for file names.
+    $withoutLiterals = [regex]::Replace($Citation, "'[^']*'", ' ')
+    foreach ($match in [regex]::Matches($withoutLiterals, '[A-Za-z0-9_./\-]+\.(?:ps1|psm1|psd1|json|cs|yml|yaml|md)')) {
+        $value = [string]$match.Value
+        if (-not $tokens.Contains($value)) { [void]$tokens.Add($value) }
+    }
+    Write-Output -NoEnumerate $tokens.ToArray()
+}
+
+function Get-FieldTokens {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Field)
+
+    $tokens = [System.Collections.Generic.List[string]]::new()
+    foreach ($segment in ($Field -split '[^A-Za-z0-9_]')) {
+        $trimmed = ([string]$segment).Trim()
+        if ($trimmed.Length -lt 4) { continue }
+        if ($trimmed -in @('string', 'return', 'ToArray', 'HashSet', 'List')) { continue }
+        if ($trimmed -match '^[A-Za-z_][A-Za-z0-9_]*$' -and -not $tokens.Contains($trimmed)) {
+            [void]$tokens.Add($trimmed)
+        }
+    }
+    Write-Output -NoEnumerate $tokens.ToArray()
+}
+
+$rotChecked = 0
+$rotMissingFile = [System.Collections.Generic.List[string]]::new()
+$rotAmbiguous = [System.Collections.Generic.List[string]]::new()
+$rotMissingToken = [System.Collections.Generic.List[string]]::new()
+
+foreach ($row in $inventoryFields) {
+    $rowId = [string]$row.id
+    $fieldName = [string]$row.field
+    $tokens = Get-FieldTokens -Field $fieldName
+    foreach ($citationName in @('producer', 'consumer')) {
+        $citation = [string]$row.$citationName
+        foreach ($cited in (Get-CitedFileToken -Citation $citation)) {
+            $rotChecked++
+            $resolved = Resolve-CitedPath -Citation $cited
+            if ($null -eq $resolved) {
+                [void]$rotMissingFile.Add("$rowId :: $citationName :: $cited")
+                continue
+            }
+            if ($resolved.StartsWith('AMBIGUOUS:', [System.StringComparison]::Ordinal)) {
+                [void]$rotAmbiguous.Add("$rowId :: $citationName :: $cited :: $resolved")
+                continue
+            }
+            if ($tokens.Count -eq 0) { continue }
+            # A field named for a producer-local PowerShell variable has no meaning in the
+            # consuming file, which knows it by its own parameter name. Those rows get the
+            # file-existence check only.
+            if ($fieldName.StartsWith('$', [System.StringComparison]::Ordinal) -and -not $fieldName.StartsWith('$.', [System.StringComparison]::Ordinal)) { continue }
+            $text = Get-CitedSourceText -RelativePath $resolved
+            $found = $false
+            foreach ($token in $tokens) {
+                # Case-insensitive: PowerShell reaches JSON fields through case-insensitive
+                # property access, so `ResidualRisks` referring to `residualRisks` is the
+                # normal spelling in the cited code, not rot.
+                if ($text.IndexOf($token, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $found = $true; break }
+            }
+            if (-not $found) {
+                [void]$rotMissingToken.Add("$rowId :: $citationName :: $resolved :: none of [$($tokens -join ', ')]")
+            }
+        }
+    }
+}
+
+[void](Assert-True -Name 'inventory-rot/citations-resolved' -Condition ($rotChecked -ge 300) -Detail "the rot detector resolved only $rotChecked citations, which is too few to prove anything")
+[void](Assert-True -Name 'inventory-rot/files-exist' -Condition ($rotMissingFile.Count -eq 0) -Detail "inventory cites files that no longer exist: $($rotMissingFile -join '; ')")
+[void](Assert-True -Name 'inventory-rot/files-unambiguous' -Condition ($rotAmbiguous.Count -eq 0) -Detail "inventory cites file names that now match more than one file: $($rotAmbiguous -join '; ')")
+[void](Assert-True -Name 'inventory-rot/fields-mentioned' -Condition ($rotMissingToken.Count -eq 0) -Detail "inventory cites files that no longer mention the field: $($rotMissingToken -join '; ')")
+
+# A detector that reports nothing is indistinguishable from one that is broken, so prove
+# each half fires on a citation that is deliberately wrong.
+[void](Assert-True -Name 'inventory-rot/sabotage-missing-file' `
+        -Condition ($null -eq (Resolve-CitedPath -Citation 'src/Agents/reviewer/ThisFileWasDeleted.ps1')) `
+        -Detail 'a citation of a nonexistent file resolved anyway')
+[void](Assert-True -Name 'inventory-rot/sabotage-real-file' `
+        -Condition ('src/Agents/reviewer/StageContract.ps1' -eq (Resolve-CitedPath -Citation 'StageContract.ps1')) `
+        -Detail 'a bare file name that exists exactly once failed to resolve')
+$sabotageTokens = Get-FieldTokens -Field '$.thisFieldNameWasRenamedAway'
+[void](Assert-True -Name 'inventory-rot/sabotage-missing-token' `
+        -Condition ($sabotageTokens.Count -eq 1 -and (Get-CitedSourceText -RelativePath 'src/Agents/reviewer/StageContract.ps1').IndexOf($sabotageTokens[0], [System.StringComparison]::OrdinalIgnoreCase) -lt 0) `
+        -Detail 'a field name that appears nowhere was reported as mentioned')
+
+# ---------------------------------------------------------------------------
 # Coverage matrix, derived from what actually ran
 # ---------------------------------------------------------------------------
 
@@ -664,6 +950,7 @@ $matrix = [ordered]@{
         knownEscapeShapeFields = @($inventoryFields | Where-Object { [bool]$_.knownEscapeShape }).Count
         escapeShapeProperties = $escapeShapes.Count
         sabotageChecks = $sabotageResults.Count
+        citationsChecked = $rotChecked
         byStage = $byStage
         byKind = $byKind
     }
@@ -708,6 +995,7 @@ $report = [ordered]@{
     producerGaps = $producerGaps
     escapeShapes = $escapeShapes.Count
     sabotageChecks = $sabotageResults.Count
+    citationsChecked = $rotChecked
     failed = $script:Failures.Count
 }
 if (-not $Quiet) {

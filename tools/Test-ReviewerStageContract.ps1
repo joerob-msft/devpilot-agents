@@ -113,6 +113,15 @@ Register-ReviewerStageContract `
     -RequiredFields @('items') `
     -CollectionFields @('items') | Out-Null
 
+# A path whose last segment is [*] is accepted by the segment parser, so the
+# boundary has to judge it from the parent value: a null or zero-element value
+# has no elements to walk, and those are exactly the shapes that must fail.
+Register-ReviewerStageContract `
+    -Kind 'fixture.stage.each' `
+    -ContractVersion 1 `
+    -RequiredFields @('values') `
+    -CollectionFields @('values[*]') | Out-Null
+
 $root = Join-Path ([IO.Path]::GetTempPath()) ("reviewer-stage-contract-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root | Out-Null
 
@@ -250,12 +259,72 @@ try {
         -Action { Write-ReviewerStageArtifact -Path (Join-Path $root 'array.json') -Kind 'fixture.stage.union' -Payload ([object[]]@(1, 2)) -Depth 12 -Form compact }
 
     $repairPath = Join-Path $root 'repair-scalar.json'
-    Write-ReviewerStageArtifact -Path $repairPath -Kind 'fixture.stage.union' `
-        -Payload ([ordered]@{ items = 'one-item'; fingerprints = [object[]]@() }) -Depth 12 -Form compact | Out-Null
+    Write-ReviewerStageArtifact -Path $repairPath -Kind 'fixture.stage.other' `
+        -Payload ([ordered]@{ items = 'one-item' }) -Depth 12 -Form compact | Out-Null
     $repaired = [IO.File]::ReadAllText($repairPath)
     Assert-True -Name 'write/repairs-unrolled-singleton-into-array' `
         -Condition ($repaired.Contains('"items":["one-item"]')) `
         -Detail 'a singleton that PowerShell unrolled to a scalar was not restored to an array'
+
+    # A repaired singleton is still only repaired in shape. An element that does
+    # not carry a declared nested collection is a producer defect, and the
+    # writer has to say so rather than publish a payload a strict-mode consumer
+    # would throw on.
+    Assert-Throws -Name 'write/rejects-element-missing-declared-nested-collection' `
+        -Expect 'evidenceFactIds is missing' `
+        -Action {
+            Write-ReviewerStageArtifact -Path (Join-Path $root 'nested-missing.json') -Kind 'fixture.stage.union' `
+                -Payload ([ordered]@{ items = 'one-item'; fingerprints = [object[]]@() }) -Depth 12 -Form compact
+        }
+
+    # -StrictShape reports the producer's own collapse instead of repairing it.
+    Assert-Throws -Name 'write/strict-shape-reports-producer-collapse' `
+        -Expect 'received collapsed collection field' `
+        -Action {
+            Write-ReviewerStageArtifact -Path (Join-Path $root 'strict.json') -Kind 'fixture.stage.other' `
+                -Payload ([ordered]@{ items = 'one-item' }) -Depth 12 -Form compact -StrictShape
+        }
+
+    $lenientPath = Join-Path $root 'lenient.json'
+    Write-ReviewerStageArtifact -Path $lenientPath -Kind 'fixture.stage.other' `
+        -Payload ([ordered]@{ items = [object[]]@('a') }) -Depth 12 -Form compact -StrictShape | Out-Null
+    Assert-True -Name 'write/strict-shape-accepts-conforming-producer' `
+        -Condition ([IO.File]::ReadAllText($lenientPath).Contains('"items":["a"]')) `
+        -Detail 'a producer that already emitted a real array was rejected under -StrictShape'
+
+    # Terminal [*] must be judged from the parent value, not from elements that
+    # a null or empty value does not have.
+    $terminalNull = $null
+    foreach ($terminalCase in @(
+            @{ Label = 'null'; Value = $terminalNull; Violates = $true }
+            @{ Label = 'scalar'; Value = 'x'; Violates = $true }
+            @{ Label = 'empty'; Value = [object[]]@(); Violates = $false }
+            @{ Label = 'many'; Value = [object[]]@('a', 'b'); Violates = $false }
+        )) {
+        $terminalPayload = [ordered]@{ values = $terminalCase.Value }
+        $terminalViolations = Test-ReviewerStageCollectionShape -Payload $terminalPayload -CollectionFields @('values[*]')
+        Assert-True -Name "shape/terminal-each-$($terminalCase.Label)" `
+            -Condition (($terminalViolations.Count -gt 0) -eq $terminalCase.Violates) `
+            -Detail "values[*] with a $($terminalCase.Label) value reported $($terminalViolations.Count) violation(s)"
+    }
+
+    $terminalMissing = Test-ReviewerStageCollectionShape -Payload ([ordered]@{ other = 1 }) -CollectionFields @('values[*]')
+    Assert-True -Name 'shape/terminal-each-missing' `
+        -Condition ($terminalMissing.Count -eq 1 -and $terminalMissing[0] -eq 'values is missing') `
+        -Detail "an absent values[*] reported: $($terminalMissing -join '; ')"
+
+    Assert-Throws -Name 'read/rejects-null-terminal-each' -Expect 'lost collection shape' -Action {
+        $eachPath = Join-Path $root 'each-null.json'
+        [IO.File]::WriteAllText($eachPath, (ConvertTo-Json -Depth 32 -Compress -InputObject ([ordered]@{
+                        envelopeVersion = 1
+                        kind = 'fixture.stage.each'
+                        contractVersion = 1
+                        form = 'compact'
+                        depth = 12
+                        payload = [ordered]@{ values = $null }
+                    })), [Text.UTF8Encoding]::new($false))
+        Read-ReviewerStageArtifact -Path $eachPath -Kind 'fixture.stage.each'
+    }
 
     Assert-Throws -Name 'write/rejects-unregistered-kind' `
         -Expect 'is not registered' `
@@ -327,6 +396,13 @@ try {
         @{ Name = 'read/rejects-missing-payload-field'; Text = (New-Envelope -Overrides @{ payload = [ordered]@{ items = [object[]]@() } }); Expect = 'missing required field' }
         @{ Name = 'read/rejects-unknown-payload-field'; Text = (New-Envelope -Overrides @{ payload = [ordered]@{ items = [object[]]@(); fingerprints = [object[]]@(); rogue = 1 } }); Expect = 'unknown field' }
         @{ Name = 'read/rejects-scalar-payload'; Text = (New-Envelope -Overrides @{ payload = 'collapsed' }); Expect = 'collapsed to a bare' }
+        # An element that omits a declared nested collection used to read clean,
+        # then throw in the consumer under Set-StrictMode. Absent is a boundary
+        # rejection, not a silently skipped site.
+        @{ Name = 'read/rejects-element-missing-nested-collection'
+            Text = (New-Envelope -Overrides @{ payload = [ordered]@{ items = [object[]]@([ordered]@{ id = 'x' }); fingerprints = [object[]]@() } })
+            Expect = 'evidenceFactIds is missing'
+        }
     )
     foreach ($case in $envelopeCases) {
         $path = Write-RawArtifact -Name ("envelope-" + ($case.Name -replace '[^a-z0-9]', '-') + '.json') -Text $case.Text

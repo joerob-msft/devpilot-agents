@@ -12607,7 +12607,10 @@ function Invoke-ReviewerGateRevalidation {
         catch {
             return @{ Ok = $false; Reason = "the change set could not be pinned during dedicated gate revalidation: $($_.Exception.Message)" }
         }
-        $threads = @(Get-ReviewerPullRequestThreads -Session $gateSession -PrId $PrId)
+        # Never wrap in @(): the helper protects its array, so @() would nest the
+        # whole thread list as one element and the fingerprint scan below would
+        # read no comments at all, defeating duplicate-post prevention.
+        $threads = Get-ReviewerPullRequestThreads -Session $gateSession -PrId $PrId
         $capabilities = Get-ReviewerGateProviderCapabilities -Provider $provider -TargetBranch $TargetBranch `
             -HeadSha $(if ($currentSourceCommit -match '^[0-9a-fA-F]{40}$') { $currentSourceCommit } else { "0" * 40 }) `
             -RequiredCheckNames $RequiredCheckNames
@@ -18144,6 +18147,10 @@ function Invoke-ReviewerRoleInputCaptureRun {
                     byteLength = [long]$_.Length
                 }
             })
+        # Assigned before the manifest literal: the inventory helper protects its
+        # array, so @() around the call would nest it and serialize the resource
+        # list one level too deep.
+        $sealedResourceInventory = Get-ReviewerRoleInputSealedResourceInventory
         $captureManifest = [ordered]@{
             schemaVersion  = 1
             kind           = 'reviewer-production-role-input-capture'
@@ -18181,7 +18188,7 @@ function Invoke-ReviewerRoleInputCaptureRun {
                 manifestDigest = ([string]$ReplayManifestDigest).ToLowerInvariant()
                 nonPromotable  = $true
                 sealKind       = [string]$script:ReviewerReplaySnapshot.Classification.SealKind
-                resources      = @(Get-ReviewerRoleInputSealedResourceInventory)
+                resources      = $sealedResourceInventory
             }
             build          = [ordered]@{
                 repoPath           = $resolvedRepoPath

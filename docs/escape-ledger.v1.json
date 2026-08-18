@@ -7,8 +7,9 @@
     "startGate": "Gate 0",
     "startCommit": "ac2c592",
     "endCommit": "74e476a",
-    "coordinatorPullRequestsObserved": 10,
-    "notes": "Gate 0 is the first coordinator-authored change merged into this repository (introduction of the reviewer agent). The window closes at the head this hardening layer is stacked on. Ten coordinator changes have been merged in the window; every incident below was found in deterministic execution because no shadow or live coordinator run has ever been performed."
+    "notes": "Gate 0 is the first coordinator-authored change merged into this repository (introduction of the reviewer agent). The window closes at the head this hardening layer is stacked on. Ten coordinator changes have been merged in the window; every incident below was found in deterministic execution because no shadow or live coordinator run has ever been performed.",
+    "coordinatorChangesObserved": 10,
+    "evaluatedOn": "2026-08-18"
   },
   "vocabulary": {
     "categories": [
@@ -67,19 +68,36 @@
     "statement": "If two or more type-binding escapes reach shadow or live execution within a window of ten merged coordinator changes or sixty days, whichever comes first, the conditional typed control-plane pivot stops being optional and is scheduled as the next coordinator change.",
     "threshold": {
       "category": "typeBinding",
-      "reachedExecutionStages": ["shadow", "live"],
+      "reachedExecutionStages": [
+        "shadow",
+        "live"
+      ],
       "count": 2
     },
     "window": {
-      "coordinatorPullRequests": 10,
       "days": 60,
-      "combinator": "either"
+      "combinator": "either",
+      "coordinatorChanges": 10
     },
     "action": "Schedule the typed control-plane pivot as the next coordinator change and record the decision transition in this ledger.",
     "state": {
       "qualifyingIncidentIds": [],
       "qualifyingCount": 0,
-      "triggered": false
+      "triggered": false,
+      "inWindowIncidentIds": [
+        "ESC-0001",
+        "ESC-0002",
+        "ESC-0003",
+        "ESC-0004",
+        "ESC-0005",
+        "ESC-0006",
+        "ESC-0007",
+        "ESC-0008",
+        "ESC-0009",
+        "ESC-0010",
+        "ESC-0011",
+        "ESC-0012"
+      ]
     }
   },
   "incidents": [
@@ -94,7 +112,9 @@
       "detector": "PSEN004 (local collection returned bare) in tools/Find-PowerShellEmptyNullHazard.ps1",
       "regressionGuard": "tools/Test-PowerShellBoundaryHardening.ps1 keeps the PSEN004 baseline at zero findings, so any new bare collection return blocks; tools/Test-ReviewerCollectionCardinality.ps1 exercises the zero and singleton variants of every inventoried hash-set field.",
       "introducedCommit": "ac2c592",
-      "remediatedCommit": "74e476a"
+      "remediatedCommit": "74e476a",
+      "detectedOn": "2026-08-18",
+      "coordinatorChangeOrdinal": 10
     },
     {
       "id": "ESC-0002",
@@ -108,7 +128,9 @@
       "regressionGuard": "PSEN011 fixtures in tools/testdata/boundary-hardening-analyzer.fixtures.ps1 assert both the hazard and its counterexample; the nesting property is proved directly by the protected-return escape shape in tools/Test-ReviewerCollectionCardinality.ps1.",
       "introducedCommit": "ac2c592",
       "remediatedCommit": "0bb809f",
-      "siteCount": 2
+      "siteCount": 2,
+      "detectedOn": "2026-08-12",
+      "coordinatorChangeOrdinal": 9
     },
     {
       "id": "ESC-0003",
@@ -121,7 +143,9 @@
       "detector": "Boundary variant harness in tools/Test-ReviewerCollectionCardinality.ps1 (specialistPlan stage, zero and singleton variants)",
       "regressionGuard": "Every specialistPlan collection field in tools/testdata/reviewer-collection-inventory.v1.json is exercised at zero, one, many, maximum, duplicate, null-versus-missing, and wrong-scalar.",
       "introducedCommit": "ac2c592",
-      "remediatedCommit": "91cabd3"
+      "remediatedCommit": "91cabd3",
+      "detectedOn": "2026-08-17",
+      "coordinatorChangeOrdinal": 9
     },
     {
       "id": "ESC-0004",
@@ -134,7 +158,9 @@
       "detector": "Boundary variant harness in tools/Test-ReviewerCollectionCardinality.ps1 (verifierAssignment and verdict stages)",
       "regressionGuard": "src/Agents/reviewer/StageContract.ps1 normalises declared collection fields on write and fails closed on scalar-collapsed fields on read; tools/Test-ReviewerStageContract.ps1 asserts both directions.",
       "introducedCommit": "ac2c592",
-      "remediatedCommit": "39c8ed1"
+      "remediatedCommit": "39c8ed1",
+      "detectedOn": "2026-08-10",
+      "coordinatorChangeOrdinal": 8
     },
     {
       "id": "ESC-0005",
@@ -147,7 +173,9 @@
       "detector": "PSEN004 and PSEN009 in tools/Find-PowerShellEmptyNullHazard.ps1",
       "regressionGuard": "tools/Test-ReviewerStageContract.ps1 asserts that the artifact inventory is returned non-enumerated at zero, one, and many artifacts and that the returned collection is read-only.",
       "introducedCommit": "ac2c592",
-      "remediatedCommit": "48eadd0"
+      "remediatedCommit": "48eadd0",
+      "detectedOn": "2026-08-16",
+      "coordinatorChangeOrdinal": 9
     },
     {
       "id": "ESC-0006",
@@ -160,7 +188,9 @@
       "detector": "PSEN006 and PSEN010 in tools/Find-PowerShellEmptyNullHazard.ps1",
       "regressionGuard": "PSEN006 and PSEN010 fixtures assert detection of unqualified script-scope reads and of closures that call repository functions by name; explicit closure-state capture is property-tested in tools/Test-ReviewerCollectionCardinality.ps1.",
       "introducedCommit": "ac2c592",
-      "remediatedCommit": "99f7b66"
+      "remediatedCommit": "99f7b66",
+      "detectedOn": "2026-08-18",
+      "coordinatorChangeOrdinal": 10
     },
     {
       "id": "ESC-0007",
@@ -173,7 +203,9 @@
       "detector": "PSEN010 in tools/Find-PowerShellEmptyNullHazard.ps1",
       "regressionGuard": "Same as ESC-0006; the explicit closure-state capture property test asserts that a captured copy is immune to later mutation while an uncaptured reference is not.",
       "introducedCommit": "ac2c592",
-      "remediatedCommit": "0191f8a"
+      "remediatedCommit": "0191f8a",
+      "detectedOn": "2026-08-18",
+      "coordinatorChangeOrdinal": 10
     },
     {
       "id": "ESC-0008",
@@ -186,7 +218,9 @@
       "detector": "PSEN006 and PSEN010 in tools/Find-PowerShellEmptyNullHazard.ps1",
       "regressionGuard": "Same as ESC-0006.",
       "introducedCommit": "ac2c592",
-      "remediatedCommit": "acb1273"
+      "remediatedCommit": "acb1273",
+      "detectedOn": "2026-08-08",
+      "coordinatorChangeOrdinal": 5
     },
     {
       "id": "ESC-0009",
@@ -199,7 +233,9 @@
       "detector": "PSEN003 (property read on a possibly-empty aggregate) in tools/Find-PowerShellEmptyNullHazard.ps1",
       "regressionGuard": "The zero variant of every inventoried numeric-bearing collection is exercised in tools/Test-ReviewerCollectionCardinality.ps1, and PSEN003 is part of the blocking boundary gate.",
       "introducedCommit": "ac2c592",
-      "remediatedCommit": "696fb3a"
+      "remediatedCommit": "696fb3a",
+      "detectedOn": "2026-08-13",
+      "coordinatorChangeOrdinal": 9
     },
     {
       "id": "ESC-0010",
@@ -212,7 +248,9 @@
       "detector": "PSEN003 in tools/Find-PowerShellEmptyNullHazard.ps1",
       "regressionGuard": "The tightened guard requires the numeric-zero form in the same block, so a sibling site cannot pass by accident.",
       "introducedCommit": "ac2c592",
-      "remediatedCommit": "05d96d7"
+      "remediatedCommit": "05d96d7",
+      "detectedOn": "2026-08-13",
+      "coordinatorChangeOrdinal": 9
     },
     {
       "id": "ESC-0011",
@@ -225,7 +263,9 @@
       "detector": "Review of the guard itself; recorded so the ledger counts guard escapes as escapes.",
       "regressionGuard": "Guards added by this hardening layer assert properties over an inventory rather than individual sites: the cardinality corpus is generated from tools/testdata/reviewer-collection-inventory.v1.json and the analyzer gate is baseline-diffed rather than site-listed.",
       "introducedCommit": "696fb3a",
-      "remediatedCommit": "3a338a7"
+      "remediatedCommit": "3a338a7",
+      "detectedOn": "2026-08-13",
+      "coordinatorChangeOrdinal": 9
     },
     {
       "id": "ESC-0012",
@@ -238,7 +278,61 @@
       "detector": "PSEN011 in tools/Find-PowerShellEmptyNullHazard.ps1",
       "regressionGuard": "The eleven sites are recorded in tools/testdata/powershell-boundary-baseline.v1.json with rationale; tools/Test-PowerShellBoundaryHardening.ps1 blocks any twelfth site.",
       "introducedCommit": "74e476a",
-      "siteCount": 11
+      "siteCount": 11,
+      "detectedOn": "2026-08-18",
+      "coordinatorChangeOrdinal": 10,
+      "sites": [
+        {
+          "location": "source transport change-kind accumulation",
+          "risk": "remediated",
+          "assessment": "The wrap nested a protected string array, so the caller cast the whole array to one string and recorded a space-joined kind, or an empty string when the change carried no kinds. Fixed in this change by iterating the assigned result."
+        },
+        {
+          "location": "coordinator dedicated-gate thread revalidation",
+          "risk": "remediated",
+          "assessment": "The wrap nested the protected thread list, so the fingerprint scan read a single array element that carried no comments and returned an empty set - the duplicate-post guard silently disabled. Fixed in this change by assigning the protected result directly."
+        },
+        {
+          "location": "role-input capture manifest sealed resource inventory",
+          "risk": "remediated",
+          "assessment": "The wrap nested the protected inventory, serializing the resource list one level deeper than the manifest declares. Fixed in this change by assigning before the manifest literal."
+        },
+        {
+          "location": "convention pack authoritative snapshot selection",
+          "risk": "latent",
+          "assessment": "The producer is mixed: it protects only its empty return and emits the populated case bare. The wrap therefore misreports only the empty case, which the caller already guards against by requiring at least one configured source. Correcting it properly means changing the producer contract and every call site, which is outside a hardening change that must not rewrite unrelated code. Carried as debt with the analyzer finding baselined."
+        },
+        {
+          "location": "convention specialist changed-path acquisition",
+          "risk": "compensated",
+          "assessment": "The wrap nests, and the next statement flattens that exact layer with an explicit projection and an inline comment explaining why. Behaviour is correct today; the finding is retained so the compensation is not silently removed."
+        },
+        {
+          "location": "convention specialist remediation-error test harness",
+          "risk": "testOnly",
+          "assessment": "Test-side assertion helper. A nested result would fail the assertion it feeds rather than reach any execution stage."
+        },
+        {
+          "location": "cross-verification changed-file index test harness",
+          "risk": "testOnly",
+          "assessment": "Test-side assertion helper, same reasoning."
+        },
+        {
+          "location": "source transport change-kind test assertions",
+          "risk": "testOnly",
+          "assessment": "Test-side assertions over a protected helper; the assertions themselves pin the shape."
+        },
+        {
+          "location": "source transport deterministic diff-span test assertions (three sites)",
+          "risk": "testOnly",
+          "assessment": "Test-side assertions over a protected helper; the assertions themselves pin the shape."
+        },
+        {
+          "location": "analyzer fixture corpus",
+          "risk": "testOnly",
+          "assessment": "Deliberate hazards authored so the rule can be shown to fire. Excluded from the repository scan by name."
+        }
+      ]
     }
   ],
   "gateObservations": [
@@ -247,7 +341,9 @@
       "observation": "The gate produced no deliverable decision: every candidate was withheld or reconciled away, so the decision yield was zero per cent. The no-write invariant held throughout, which is why no incident in this ledger reached shadow or live execution.",
       "decisionYieldPercent": 0,
       "externalWrites": 0,
-      "noWriteInvariantHeld": true
+      "noWriteInvariantHeld": true,
+      "shadowRunsPerformed": 0,
+      "liveRunsPerformed": 0
     }
   ],
   "decision": {
@@ -259,7 +355,7 @@
         "id": "cardinality-corpus",
         "title": "Cardinality and property corpus over every collection-bearing stage contract",
         "complete": true,
-        "evidence": "tools/testdata/reviewer-collection-inventory.v1.json inventories 236 collection fields across twelve stages; tools/Test-ReviewerCollectionCardinality.ps1 exercises all of them at seven cardinality variants, proves eleven escape shapes as properties, and runs nine sabotage checks; tools/testdata/reviewer-collection-cardinality-matrix.v1.json records coverage per field and does not claim full coverage."
+        "evidence": "tools/testdata/reviewer-collection-inventory.v1.json inventories 236 collection fields across twelve stages; tools/Test-ReviewerCollectionCardinality.ps1 exercises all of them at seven cardinality variants, routes the five map-valued fields through map-specific assertions rather than array ones, proves eleven escape shapes as properties, runs nine sabotage checks, and verifies all 416 producer and consumer citations still resolve to files that mention the field; tools/testdata/reviewer-collection-cardinality-matrix.v1.json records coverage per field, keeps the uncovered producer-path dimension separate, and does not claim full coverage."
       },
       {
         "id": "file-contract",
@@ -279,6 +375,13 @@
         "complete": true,
         "evidence": "This ledger, its schema, and tools/Test-EscapeLedger.ps1, which validates the schema, recomputes every count from the incident list, and re-evaluates the trigger."
       }
-    ]
+    ],
+    "exposureObligation": {
+      "statement": "A zero escape rate observed without running the pipeline is abstention, not evidence. The conditional decision is therefore due for re-evaluation only after the recorded shadow exposure has actually been performed; until then the escape rate carries no weight in either direction.",
+      "requiredShadowRuns": 10,
+      "byCoordinatorChange": 20,
+      "shadowRunsPerformed": 0,
+      "satisfied": false
+    }
   }
 }

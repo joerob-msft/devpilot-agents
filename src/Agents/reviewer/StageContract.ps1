@@ -182,7 +182,11 @@ function Get-ReviewerStageMember {
         $value = $Node[$Name]
     }
     else {
-        $value = $Node.PSObject.Properties[$Name].Value
+        # An absent property is $null, not an error: the caller distinguishes
+        # absent from empty with Test-ReviewerStageHasMember.
+        $property = $Node.PSObject.Properties[$Name]
+        if ($null -eq $property) { return $null }
+        $value = $property.Value
     }
     if ($null -eq $value) { return $null }
     Write-Output -NoEnumerate $value
@@ -231,6 +235,10 @@ function Set-ReviewerStageMember {
         $Node[$Name] = $Value
         return
     }
+    if ($null -eq $Node.PSObject.Properties[$Name]) {
+        Add-Member -InputObject $Node -MemberType NoteProperty -Name $Name -Value $Value -Force
+        return
+    }
     $Node.PSObject.Properties[$Name].Value = $Value
 }
 
@@ -253,10 +261,16 @@ function Get-ReviewerStageFieldSite {
 
     for ($index = 0; $index -lt $segments.Count; $index++) {
         $segment = $segments[$index]
+        $isLast = ($index -eq ($segments.Count - 1))
         $next = [System.Collections.Generic.List[object]]::new()
         foreach ($site in $sites) {
-            if (-not (Test-ReviewerStageHasMember -Node $site.Node -Name $segment.Name)) { continue }
-            if ($index -eq ($segments.Count - 1) -and -not $segment.Each) {
+            if ($isLast) {
+                # A terminal segment always registers a site, even when the
+                # member is absent and even when it is written "name[*]". A
+                # declared collection that an element simply omits, or that
+                # arrived as null or zero-element, has no children to walk -
+                # and those are precisely the shapes the boundary must judge,
+                # so pruning them here would make the reader fail open.
                 [void]$next.Add([pscustomobject]@{
                         Parent = $site.Node
                         Name = $segment.Name
@@ -264,19 +278,12 @@ function Get-ReviewerStageFieldSite {
                     })
                 continue
             }
+            if (-not (Test-ReviewerStageHasMember -Node $site.Node -Name $segment.Name)) { continue }
             $value = Get-ReviewerStageMember -Node $site.Node -Name $segment.Name
             if ($null -eq $value) { continue }
             if ($segment.Each) {
                 $elements = ConvertTo-ReviewerStageArray -Value $value
                 for ($elementIndex = 0; $elementIndex -lt $elements.Count; $elementIndex++) {
-                    if ($index -eq ($segments.Count - 1)) {
-                        [void]$next.Add([pscustomobject]@{
-                                Parent = $site.Node
-                                Name = $segment.Name
-                                Path = ($site.Prefix + $segment.Name)
-                            })
-                        break
-                    }
                     [void]$next.Add([pscustomobject]@{
                             Node = $elements[$elementIndex]
                             Prefix = ($site.Prefix + $segment.Name + "[$elementIndex].")
@@ -309,6 +316,11 @@ function ConvertTo-ReviewerStageCollection {
     foreach ($fieldPath in @($CollectionFields)) {
         $sites = Get-ReviewerStageFieldSite -Payload $Payload -FieldPath $fieldPath
         foreach ($site in $sites) {
+            # An absent member is left absent: fabricating it here would hide a
+            # missing required field from Test-ReviewerStagePayloadField and
+            # turn a producer defect into a silently well-formed artifact. The
+            # shape check reports it instead.
+            if (-not (Test-ReviewerStageHasMember -Node $site.Parent -Name $site.Name)) { continue }
             $value = Get-ReviewerStageMember -Node $site.Parent -Name $site.Name
             if ($null -eq $value) {
                 Set-ReviewerStageMember -Node $site.Parent -Name $site.Name -Value ([object[]]@())
@@ -338,6 +350,13 @@ function Test-ReviewerStageCollectionShape {
     foreach ($fieldPath in @($CollectionFields)) {
         $sites = Get-ReviewerStageFieldSite -Payload $Payload -FieldPath $fieldPath
         foreach ($site in $sites) {
+            if (-not (Test-ReviewerStageHasMember -Node $site.Parent -Name $site.Name)) {
+                # Absent is not the same as empty. A consumer under
+                # Set-StrictMode throws on the missing member, so the boundary
+                # has to reject it here rather than read past it.
+                [void]$violations.Add("$($site.Path) is missing")
+                continue
+            }
             $value = Get-ReviewerStageMember -Node $site.Parent -Name $site.Name
             if ($value -is [object[]] -or $value -is [System.Array]) { continue }
             $observed = 'null'
@@ -396,7 +415,8 @@ function Write-ReviewerStageArtifact {
         [Parameter(Mandatory)]$Payload,
         [Parameter(Mandatory)][ValidateRange(2, 64)][int]$Depth,
         [Parameter(Mandatory)][ValidateSet('compact', 'indented')][string]$Form,
-        [int]$MaxBytes = $script:ReviewerStageContractMaxBytes
+        [int]$MaxBytes = $script:ReviewerStageContractMaxBytes,
+        [switch]$StrictShape
     )
 
     $contract = Get-ReviewerStageContract -Kind $Kind
@@ -406,6 +426,17 @@ function Write-ReviewerStageArtifact {
     }
     if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
         throw "Stage artifact directory '$directory' does not exist."
+    }
+
+    if ($StrictShape) {
+        # Normalization repairs a collapsed collection, which is what a caller
+        # usually wants but also hides the producer defect that caused it. A
+        # stage that wants its own bugs reported rather than repaired asks for
+        # the pre-normalization verdict.
+        $producerCollapsed = Test-ReviewerStageCollectionShape -Payload $Payload -CollectionFields $contract.CollectionFields
+        if ($producerCollapsed.Count -gt 0) {
+            throw "Stage contract '$Kind' received collapsed collection field(s) from its producer: $($producerCollapsed -join '; ')."
+        }
     }
 
     $normalized = ConvertTo-ReviewerStageCollection -Payload $Payload -CollectionFields $contract.CollectionFields

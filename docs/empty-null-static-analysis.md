@@ -33,6 +33,25 @@ in [`escape-ledger.md`](escape-ledger.md).
 body emits its collection with `Write-Output -NoEnumerate` or `return ,$x`. Counting such a
 call is safe and is not reported; wrapping it in `@(...)` is the `PSEN011` hazard.
 
+A function with several exits needs two different answers, so the analyzer computes both:
+
+* **any** exit protected — enough for `PSEN011`, because one nesting return is one nesting
+  bug;
+* **every** exit protected or provably scalar — required before `PSEN005` and `PSEN009` will
+  stop reporting a call site, because a single unprotected exit is enough to collapse.
+
+A mixed function therefore keeps its `PSEN011` finding *and* loses its counting exemption,
+which is the conservative answer in both directions. "Provably scalar" is a deliberately
+narrow allow-list — literals, strings, hashtables, scriptblocks, `$null`/`$true`/`$false`,
+and non-array type conversions. Anything the analyzer cannot classify counts as a
+collection-bearing exit.
+
+Protection is also resolved per file. A call is exempt only when every definition of that
+name *in the calling file* is protected, or when the name is defined exactly once in the
+repository and that definition is protected. Seven function names in this repository are
+defined in more than one file with divergent protection, and resolving them by bare name
+would have handed out exemptions the callee does not honour.
+
 Run it over one file or a tree, optionally filtering by rule:
 
 ```powershell
@@ -48,12 +67,17 @@ Two fixture corpora measure the analyzer, and both are blocking.
 `tools/Test-PowerShellEmptyNullHazardAnalyzer.ps1` scores 15 labeled fixtures for the
 empty-output family: 7 TP, 0 FP, 0 FN, 8 TN.
 
-`tools/Test-PowerShellBoundaryHardening.ps1` scores 22 labeled fixtures in
-`tools/testdata/boundary-hardening-analyzer.fixtures.ps1` for the boundary family: 10 TP,
+`tools/Test-PowerShellBoundaryHardening.ps1` scores 25 labeled fixtures in
+`tools/testdata/boundary-hardening-analyzer.fixtures.ps1` for the boundary family: 13 TP,
 0 FP, 0 FN, 12 TN. Every boundary rule has at least one positive fixture proving it detects
 its hazard and at least one negative fixture proving it ignores the corrected form. A rule
 that stops detecting its own hazard, or starts reporting its own counterexample, fails the
 check.
+
+Three of those fixtures exist specifically to pin the exemption rules above: a helper that
+protects its return only on some paths must still be reported when its result is counted and
+when it is wrapped, and a helper whose protection comes from a named parameter must not be
+mistaken for a protected one.
 
 These are fixture-corpus results, not estimated production precision or recall.
 
@@ -73,25 +97,34 @@ reviewable act:
 ./tools/Test-PowerShellBoundaryHardening.ps1 -UpdateBaseline
 ```
 
-Current baseline: **444 findings across 372 fingerprints.**
+Current baseline: **442 findings across 372 fingerprints.**
 
 | Rule | Baseline count | Status | Rationale |
 |---|---:|---|---|
 | `PSEN001` | 45 | debt | Dominated by preserved returns the analyzer cannot prove; each is debt until the producing function states its output contract |
-| `PSEN002` | 39 | debt | Mostly adversarial fixtures and predicate references, kept as debt rather than rewritten mechanically |
+| `PSEN002` | 38 | debt | Mostly adversarial fixtures and predicate references, kept as debt rather than rewritten mechanically |
 | `PSEN003` | 3 | debt | Two of these were real incidents; the rest await an indirect-guard model |
 | `PSEN004` | 0 | **clean** | This is the empty-fingerprint-set shape. The baseline is deliberately empty, so any new site is blocked outright |
 | `PSEN005` | 43 | debt | The cheapest class to repair incrementally with `@()` |
 | `PSEN006` | 1 | debt | Pending explicit capture |
 | `PSEN007` | 41 | debt | Depth is implicit but stable at these sites; new contract writers must be explicit |
 | `PSEN008` | 76 | debt | Same, for on-disk form |
-| `PSEN009` | 165 | debt | The largest class; repairing it mechanically would risk the very defect the rule detects |
+| `PSEN009` | 167 | debt | The largest class; repairing it mechanically would risk the very defect the rule detects |
 | `PSEN010` | 20 | debt | Closure capture; each site needs individual reasoning |
-| `PSEN011` | 11 | debt | Recorded as `ESC-0012`. The same nesting hazard as `ESC-0002` at eleven further sites |
+| `PSEN011` | 8 | debt | Recorded as `ESC-0012`. Eleven sites were found; three were live defects and were fixed, and the remaining eight are adjudicated site by site in the ledger |
+
+`PSEN011` was not baselined in bulk. Each of the eleven sites was read against its producer
+and its consumer: three were live defects and are fixed in this change, one is latent behind
+a caller-side non-empty precondition, and seven are compensated by an explicit flattening
+step on the consuming side. The per-site adjudication is recorded in
+[`escape-ledger.v1.json`](escape-ledger.v1.json) under `ESC-0012`, not summarised away here.
 
 `PSEN004` at zero is the point of the gate. The rule was written from an escape that had
-already merged; keeping its baseline empty means that particular shape can never merge
-again.
+already merged; keeping its baseline empty means no *new instance the analyzer recognises*
+can merge again. That is a narrower claim than "this escape shape cannot recur": the rule
+matches a syntactic form, and a functionally identical collapse expressed another way — via
+a pipeline, a splat, a member invocation, a nested scriptblock — is outside what it can
+see. The baseline is a ratchet on recognised forms, not a proof of absence.
 
 Fixture files are excluded from the repository scan — they exist to contain hazards, so
 scanning them would record every deliberate counterexample as debt:
