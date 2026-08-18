@@ -992,6 +992,8 @@ function Invoke-ReviewerSourceNewContractTransport {
     }
     if ($null -eq $RecoveryReader) { $RecoveryReader = $Reader }
     if ($null -eq $RecoveryBaseReader) { $RecoveryBaseReader = $BaseReader }
+    $addResourceBindingFunction = ${function:Add-ReviewerSourceResourceBinding}
+    $getSourceValueFunction = ${function:Get-ReviewerSourceValue}
     $cache = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
     $recoverySourceCache = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
     $recoverySourceAttempted = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -1002,7 +1004,7 @@ function Invoke-ReviewerSourceNewContractTransport {
         $actualKinds = if ($kindsByPath.Contains($Path)) { @($kindsByPath[$Path]) } else { @($Kinds) }
         $resource = $null
         try {
-            $resource = Add-ReviewerSourceResourceBinding -Resource (
+            $resource = & $addResourceBindingFunction -Resource (
                 & $RecoveryReader $Path $actualKinds) -Binding $recoveryBinding
         }
         catch {
@@ -1023,16 +1025,16 @@ function Invoke-ReviewerSourceNewContractTransport {
                 $cache[$Path] = $null
                 return $null
             }
-            $rejected = [string](Get-ReviewerSourceValue -Object $recoveryResource -Name "Rejected" -Default "")
-            $byteLength = [int](Get-ReviewerSourceValue -Object $recoveryResource -Name "ByteLength" -Default -1)
+            $rejected = [string](& $getSourceValueFunction -Object $recoveryResource -Name "Rejected" -Default "")
+            $byteLength = [int](& $getSourceValueFunction -Object $recoveryResource -Name "ByteLength" -Default -1)
             if ($byteLength -gt [int]$Policy.maxFetchBytesPerFile) {
                 # Recovery may privately inspect more bytes than ordinary
                 # delivery. Do not let that wider object or its private decode
                 # classification reach slicing or the sealed block; retain only
                 # the ordinary oversize census.
-                $resource = Add-ReviewerSourceResourceBinding -Resource ([pscustomobject]@{
+                $resource = & $addResourceBindingFunction -Resource ([pscustomobject]@{
                         Rejected = "fileTooLarge"
-                        MimeType = [string](Get-ReviewerSourceValue -Object $recoveryResource -Name "MimeType" -Default "")
+                        MimeType = [string](& $getSourceValueFunction -Object $recoveryResource -Name "MimeType" -Default "")
                         ByteLength = $byteLength
                         Path = $Path
                         CommitSha = $SourceCommit
@@ -1047,7 +1049,7 @@ function Invoke-ReviewerSourceNewContractTransport {
             }
         }
         if ($null -eq $resource) {
-            $resource = Add-ReviewerSourceResourceBinding -Resource (
+            $resource = & $addResourceBindingFunction -Resource (
                 & $Reader $Path $actualKinds) -Binding $recoveryBinding
         }
         $cache[$Path] = $resource
@@ -1055,7 +1057,7 @@ function Invoke-ReviewerSourceNewContractTransport {
     }.GetNewClosure()
     $baseReader = {
         param([string]$Path, [string[]]$Kinds)
-        return Add-ReviewerSourceResourceBinding -Resource (
+        return & $addResourceBindingFunction -Resource (
             & $RecoveryBaseReader $Path $Kinds ([string]$recoveryBinding.BaseCommit)) -Binding $recoveryBinding
     }.GetNewClosure()
     $recovery = Get-ReviewerSourceRecoveredSpans -Response $aggregateResponse -SpansByPath $spans `

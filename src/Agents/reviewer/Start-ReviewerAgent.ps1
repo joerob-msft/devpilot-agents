@@ -9110,38 +9110,47 @@ function Get-ReviewerSourceTransportNewContract {
         [Parameter(Mandatory)][string]$SourceCommit,
         [Parameter(Mandatory)]$Capability
     )
+    [string]$project = [string]$ExpectedProject
+    [string]$repositoryId = ([string]$cfgRepoId).ToLowerInvariant()
+    [string]$repositoryName = [string]$RepositoryName
+    if ([string]::IsNullOrWhiteSpace($project) -or [string]::IsNullOrWhiteSpace($repositoryId) -or
+        [string]::IsNullOrWhiteSpace($repositoryName)) {
+        throw "The MCP source transport requires nonempty project, repository ID, and repository name."
+    }
+    $mcpInvokerFunction = ${function:Invoke-AgentMcpTool}
+    $boundSourceFunction = ${function:Get-ReviewerBoundSourceContent}
     $toolInvoker = {
         param([hashtable]$Arguments)
-        return Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments $Arguments
+        return & $mcpInvokerFunction -Session $Session -Name "repo_pull_request" -Arguments $Arguments
     }.GetNewClosure()
     $aggregateReader = {
-        return Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments @{
-            action = 'get_changes'; project = $ExpectedProject; repositoryId = $RepositoryName
+        return & $mcpInvokerFunction -Session $Session -Name "repo_pull_request" -Arguments @{
+            action = 'get_changes'; project = $project; repositoryId = $repositoryName
             pullRequestId = $PrId; includeDiffs = $true; includeLineContent = $true; top = 1000
         }
     }.GetNewClosure()
     $sourceReader = {
         param([string]$Path, [string[]]$Kinds)
-        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path -CommitSha $SourceCommit -ChangeKinds @($Kinds)
+        return & $boundSourceFunction -Session $Session -Path $Path -CommitSha $SourceCommit -ChangeKinds @($Kinds)
     }.GetNewClosure()
     $baseReader = {
         param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
-        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path -CommitSha $BaseCommit -ChangeKinds @($Kinds)
+        return & $boundSourceFunction -Session $Session -Path $Path -CommitSha $BaseCommit -ChangeKinds @($Kinds)
     }.GetNewClosure()
     [int]$recoveryBytesPerSide = [int]$script:ReviewerSourceMaxRecoveryBytesPerSide
     $recoverySourceReader = {
         param([string]$Path, [string[]]$Kinds)
-        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path -CommitSha $SourceCommit `
+        return & $boundSourceFunction -Session $Session -Path $Path -CommitSha $SourceCommit `
             -ChangeKinds @($Kinds) -MaxBytesPerFile $recoveryBytesPerSide
     }.GetNewClosure()
     $recoveryBaseReader = {
         param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
-        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path -CommitSha $BaseCommit `
+        return & $boundSourceFunction -Session $Session -Path $Path -CommitSha $BaseCommit `
             -ChangeKinds @($Kinds) -MaxBytesPerFile $recoveryBytesPerSide
     }.GetNewClosure()
     $result = Invoke-ReviewerSourceNewContractTransport -ToolInvoker $toolInvoker -Reader $sourceReader `
         -BaseReader $baseReader -RecoveryReader $recoverySourceReader -RecoveryBaseReader $recoveryBaseReader `
-        -Organization $Organization -Project $ExpectedProject -RepositoryId $cfgRepoId `
+        -Organization $Organization -Project $project -RepositoryId $repositoryId `
         -PrId $PrId -SourceCommit $SourceCommit -Capability $Capability -Policy $SourceTransportPolicy `
         -PolicySha256 $SourceTransportPolicySha256 -NonceFactory { New-AgentNonce } `
         -AggregateReader $aggregateReader
@@ -9161,46 +9170,55 @@ function Get-ReviewerSourceTransportAzCliFallback {
         [Parameter(Mandatory)][int]$PrId,
         [Parameter(Mandatory)][string]$SourceCommit
     )
+    [string]$project = [string]$ExpectedProject
+    [string]$repositoryId = ([string]$cfgRepoId).ToLowerInvariant()
+    [string]$repositoryName = [string]$RepositoryName
+    if ([string]::IsNullOrWhiteSpace($project) -or [string]::IsNullOrWhiteSpace($repositoryId) -or
+        [string]::IsNullOrWhiteSpace($repositoryName)) {
+        throw "The Azure DevOps CLI fallback requires nonempty project, repository ID, and repository name."
+    }
     $azInvoker = New-ReviewerSourceAzCliInvoker -Organization $Organization `
         -ExpectedTenantId $CfgAzCliFallbackTenantId
     $azCaptureFunction = ${function:Get-ReviewerSourceAzIdentityCapture}
+    $mcpInvokerFunction = ${function:Invoke-AgentMcpTool}
+    $boundSourceFunction = ${function:Get-ReviewerBoundSourceContent}
     $identityReader = {
-        return & $azCaptureFunction -AzInvoker $azInvoker -Project $ExpectedProject `
-            -RepositoryId $cfgRepoId.ToLowerInvariant() -PrId $PrId -SourceCommit $SourceCommit
+        return & $azCaptureFunction -AzInvoker $azInvoker -Project $project `
+            -RepositoryId $repositoryId -PrId $PrId -SourceCommit $SourceCommit
     }.GetNewClosure()
     $aggregateReader = {
-        return Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments @{
-            action = 'get_changes'; project = $ExpectedProject; repositoryId = $RepositoryName
+        return & $mcpInvokerFunction -Session $Session -Name "repo_pull_request" -Arguments @{
+            action = 'get_changes'; project = $project; repositoryId = $repositoryName
             pullRequestId = $PrId; includeDiffs = $true; includeLineContent = $true; top = 1000
         }
     }.GetNewClosure()
     $sourceReader = {
         param([string]$Path, [string[]]$Kinds)
-        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path `
+        return & $boundSourceFunction -Session $Session -Path $Path `
             -CommitSha $SourceCommit -ChangeKinds @($Kinds)
     }.GetNewClosure()
     $baseReader = {
         param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
-        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path `
+        return & $boundSourceFunction -Session $Session -Path $Path `
             -CommitSha $BaseCommit -ChangeKinds @($Kinds)
     }.GetNewClosure()
     [int]$recoveryBytesPerSide = [int]$script:ReviewerSourceMaxRecoveryBytesPerSide
     $recoverySourceReader = {
         param([string]$Path, [string[]]$Kinds)
-        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path `
+        return & $boundSourceFunction -Session $Session -Path $Path `
             -CommitSha $SourceCommit -ChangeKinds @($Kinds) `
             -MaxBytesPerFile $recoveryBytesPerSide
     }.GetNewClosure()
     $recoveryBaseReader = {
         param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
-        return Get-ReviewerBoundSourceContent -Session $Session -Path $Path `
+        return & $boundSourceFunction -Session $Session -Path $Path `
             -CommitSha $BaseCommit -ChangeKinds @($Kinds) `
             -MaxBytesPerFile $recoveryBytesPerSide
     }.GetNewClosure()
     $result = Invoke-ReviewerSourceNewContractTransport -IdentityReader $identityReader `
         -Reader $sourceReader -BaseReader $baseReader -RecoveryReader $recoverySourceReader `
         -RecoveryBaseReader $recoveryBaseReader -AggregateReader $aggregateReader `
-        -Organization $Organization -Project $ExpectedProject -RepositoryId $cfgRepoId `
+        -Organization $Organization -Project $project -RepositoryId $repositoryId `
         -PrId $PrId -SourceCommit $SourceCommit -Policy $SourceTransportPolicy `
         -PolicySha256 $SourceTransportPolicySha256 -NonceFactory { New-AgentNonce }
     return @{
