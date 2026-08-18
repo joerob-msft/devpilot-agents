@@ -33,6 +33,10 @@
     Required. The PR-author alias to monitor (e.g. "operator"). Only active,
     non-draft PRs whose createdBy alias matches this are handled.
 
+.PARAMETER PullRequestId
+    Handle exactly this PR and nothing else. The PR must still be active,
+    non-draft, and authored by OperatorAlias.
+
 .PARAMETER DryRun
     Validate config, harness, locks, state, marker/session/classification
     helpers, and command construction WITHOUT invoking Copilot or ADO. Works
@@ -49,6 +53,10 @@
 .EXAMPLE
     .\Start-ReviewHandlerAgent.ps1 -Once -OperatorAlias operator -EnableThreadReplies
     Run one advisory cycle: analyze feedback and reply, but make no code changes.
+
+.EXAMPLE
+    .\Start-ReviewHandlerAgent.ps1 -Once -OperatorAlias operator -PullRequestId 12345 -EnableThreadReplies
+    Handle reviewer feedback on one specific PR.
 
 .EXAMPLE
     .\Start-ReviewHandlerAgent.ps1 -Once -OperatorAlias operator -EnableCodeChanges -EnablePush -LocalValidation -EnableThreadReplies -ResumeCodingSession
@@ -87,6 +95,9 @@ param(
 
     [Parameter()]
     [string]$OperatorAlias,
+
+    [ValidateRange(0, 2147483647)]
+    [int]$PullRequestId = 0,
 
     # Opt-in mutating capabilities - ALL default OFF, ALL independently gated.
     [switch]$EnableCodeChanges,
@@ -928,7 +939,7 @@ function Write-HandlerCycleMetadata {
 
 function Invoke-DryRunSelfChecks {
     $failures = New-Object System.Collections.Generic.List[string]
-    $total = 21
+    $total = 22
 
     Write-Host "[DRY-RUN] Self-check 1/$total : parser validity of wrapper + harness + prompt presence" -ForegroundColor Cyan
     foreach ($p in @($PSCommandPath, $HarnessPath)) {
@@ -1390,6 +1401,13 @@ function Probe-Safe {
     if ($prunedProbe -ne 1 -or $staleProbe.ContainsKey("111") -or -not $staleProbe.ContainsKey("222")) { $failures.Add("Stale attempt pruning did not drop exactly the aged record.") }
     else { Write-Host "  OK - aged failure records pruned; recent ones retained" -ForegroundColor Green }
 
+    Write-Host "[DRY-RUN] Self-check 22/$total : specific-PR selection uses direct lookup and preserves eligibility checks" -ForegroundColor Cyan
+    $cycleSelectionSource = (Get-Command Invoke-HandlerCycle).ScriptBlock.ToString()
+    if ($cycleSelectionSource -notmatch 'if \(\$PullRequestId -gt 0\)') { $failures.Add("Specific-PR selection does not branch on -PullRequestId.") }
+    elseif ($cycleSelectionSource -notmatch '(?s)action = ''get''.*pullRequestId = \$PullRequestId') { $failures.Add("Specific-PR selection does not use a direct pull-request lookup.") }
+    elseif ($cycleSelectionSource -notmatch '(?s)isDraft.*createdBy.*OperatorAlias') { $failures.Add("Specific-PR selection does not pass through the ordinary draft/author eligibility checks.") }
+    else { Write-Host "  OK - one PR is fetched directly and still checked for active non-draft operator ownership" -ForegroundColor Green }
+
     Write-Host ""
     if ($failures.Count -gt 0) {        Write-Host "[DRY-RUN] FAILED - $($failures.Count) self-check failure(s):" -ForegroundColor Red
         foreach ($f in $failures) { Write-Host "  - $f" -ForegroundColor Red }
@@ -1680,16 +1698,30 @@ function Invoke-HandlerCycle {
             -Organization $Organization -Toolsets @("repos", "builds") -TimeoutSeconds $McpTimeoutSeconds
 
         # -- Step 1: candidate list (wrapper-owned, deterministic) ------------
-        $rawPrs = Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
-            action = 'list'; project = $ExpectedProject; repositoryId = $RepositoryName
-            status = 'Active'; createdByMe = $true; top = 100
+        if ($PullRequestId -gt 0) {
+            $direct = Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
+                action = 'get'; project = $ExpectedProject; repositoryId = $RepositoryName; pullRequestId = $PullRequestId
+            }
+            $rawPrs = if ($direct) { @($direct) } else { @() }
+        }
+        else {
+            $rawPrs = Invoke-AgentMcpTool -Session $session -Name "repo_pull_request" -Arguments @{
+                action = 'list'; project = $ExpectedProject; repositoryId = $RepositoryName
+                status = 'Active'; createdByMe = $true; top = 100
+            }
         }
         $candidates = @(@($rawPrs) | Where-Object {
                 $_ -and -not [bool](Get-HandlerHashValue -Container $_ -Key 'isDraft' -Default $false) -and
+                ([string](Get-HandlerHashValue -Container $_ -Key 'status' -Default '')) -ieq 'Active' -and
                 ((Get-HandlerAlias -UniqueName ([string](Get-HandlerHashValue -Container (Get-HandlerHashValue -Container $_ -Key 'createdBy') -Key 'uniqueName' -Default ''))) -ieq $OperatorAlias)
             } | Sort-Object { [int](Get-HandlerHashValue -Container $_ -Key 'pullRequestId' -Default 0) })
 
-        Write-Host "Candidates: $($candidates.Count) active non-draft PR(s) authored by '$OperatorAlias'." -ForegroundColor Cyan
+        if ($PullRequestId -gt 0) {
+            Write-Host "Candidates: restricted to PR $PullRequestId ($($candidates.Count) eligible)." -ForegroundColor Cyan
+        }
+        else {
+            Write-Host "Candidates: $($candidates.Count) active non-draft PR(s) authored by '$OperatorAlias'." -ForegroundColor Cyan
+        }
 
         $handledState = Get-JsonState -Path $handledStatePath
         $attemptsState = Get-JsonState -Path $attemptsStatePath
@@ -2138,6 +2170,7 @@ try {
     }
 
     Write-Host "review-handler: operator=$OperatorAlias org=$Organization project=$ExpectedProject repo=$RepositoryName" -ForegroundColor Cyan
+    if ($PullRequestId -gt 0) { Write-Host "Target: PR $PullRequestId only." -ForegroundColor Cyan }
     Write-Host "Capabilities: codeChanges=$([bool]$EnableCodeChanges) push=$([bool]$EnablePush) threadReplies=$([bool]$EnableThreadReplies) localValidation=$([bool]$LocalValidation) buddyRequeue=$([bool]$EnableBuddyRequeue) autoComplete=$([bool]$EnableAutoComplete) teams=$([bool]$EnableTeamsNotifications)" -ForegroundColor Cyan
     Write-Host "Session: resume=$([bool]$ResumeCodingSession) requireLocalSession=$([bool]$RequireCodingSession)$(if ($RequireCodingSession) { ' (ownership mode - only PRs coded on this box)' })" -ForegroundColor Cyan
 

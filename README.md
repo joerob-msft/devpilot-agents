@@ -70,6 +70,11 @@ Import-Module ./src/DevPilot.AgentHarness/DevPilot.AgentHarness.psd1
 ./src/Agents/review-handler/Start-ReviewHandlerAgent.ps1 -Once `
     -ConfigFile <your-repo>/.github/copilot/agents/review-handler.config.json `
     -OperatorAlias <your-alias>
+
+# Target one of your PRs explicitly:
+./src/Agents/review-handler/Start-ReviewHandlerAgent.ps1 -Once `
+    -ConfigFile <your-repo>/.github/copilot/agents/review-handler.config.json `
+    -OperatorAlias <your-alias> -PullRequestId 12345
 ```
 
 The config's **location** tells the agent which repository to operate on, so it
