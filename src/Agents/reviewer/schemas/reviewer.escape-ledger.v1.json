@@ -184,6 +184,8 @@
           "coordinatorChangeOrdinal": { "type": "integer", "minimum": 1 },
           "introducedCommit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
           "remediatedCommit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+          "acceptanceRationale": { "comment": "Required when status is accepted. Without it, an open debt could be closed by editing one enum value, which moves a published count with no evidence at all.", "type": "string", "minLength": 40 },
+          "acceptedOnCommit": { "comment": "Required when status is accepted: the recorded point at which the risk was accepted. It must be a real commit reachable from the coverage window end, so an acceptance cannot be asserted against nothing.", "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
           "siteCount": { "type": "integer", "minimum": 1 },
           "sites": {
             "type": "array",
@@ -249,6 +251,8 @@
           "coordinatorChangeOrdinal": { "type": "integer", "minimum": 1 },
           "introducedCommit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
           "remediatedCommit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+          "acceptanceRationale": { "comment": "Required when status is accepted. Without it, an open debt could be closed by editing one enum value, which moves a published count with no evidence at all.", "type": "string", "minLength": 40 },
+          "acceptedOnCommit": { "comment": "Required when status is accepted: the recorded point at which the risk was accepted. It must be a real commit reachable from the coverage window end, so an acceptance cannot be asserted against nothing.", "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
           "siteCount": { "type": "integer", "minimum": 1 },
           "sites": {
             "type": "array",
@@ -268,14 +272,15 @@
       }
     },
     "categoryAnchorExceptions": {
-      "comment": "The findings whose cited detector implies no category, listed explicitly. The gate requires this set to equal the set it computes, so de-anchoring a finding — which would otherwise let its category be edited freely in either direction — is a visible edit to this list rather than a silent one-point drop in a published counter.",
+      "comment": "The findings whose cited detector implies no category, listed explicitly with the category each is filed under. The gate requires this set to equal the set it computes and each entry's category to equal the finding's, so de-anchoring a finding — which would otherwise let its category be edited freely in either direction, including out of a counted category and into an uncounted one — is a visible edit to this list rather than a silent one-point drop in a published counter.",
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "rationale"],
+        "required": ["id", "category", "rationale"],
         "properties": {
           "id": { "type": "string", "pattern": "^(ESC|NM)-[0-9]{4}$" },
+          "category": { "type": "string", "enum": ["typeBinding", "logic", "modelProtocol", "supervision", "external"] },
           "rationale": { "type": "string", "minLength": 1 }
         }
       }

@@ -22,15 +22,19 @@ it. Under `-VerifyCommits` an escape's `introducedCommit` must be reachable from
 coverage window's end commit, and a near miss's must not be reachable from the mainline
 commit it was **classified against** — a fixed `classifiedAgainstCommit`, not the live
 window end, so that merging the change containing a near miss cannot retroactively
-reclassify it. The baseline is the author's choice, so it is held to the claim it makes: it
-may not predate the finding's own `detectedOn`, and every escape the ledger records as
-introduced before that date must be reachable from it. Without those two rules the
-reclassification was still available — reachability from the window end is satisfied by every
-commit in the window, so naming an old enough baseline made any escape look unmerged. Moving
-a merged incident into `nearMisses` to drop it out of the type-binding total therefore fails
-on ancestry rather than on prose, the rule is probed in both directions against commits the
-ledger already cites, and a control proves both baseline rules reject the coverage window's
-own start commit.
+reclassify it. The baseline was originally the author's choice, and bounding it did not work:
+reachability from the window end is satisfied by every commit in the window, and a lower bound
+on its date is satisfied by every non-tip commit sharing a calendar day with `detectedOn`.
+Either way, naming an old enough baseline made any merged escape look unmerged at a cost of one
+field value. So the baseline is no longer bounded; it is derived. The mainline as of a date is
+a single commit — `git rev-list -1 --before="<detectedOn> 23:59:59" <windowEnd>` — and the
+recorded baseline must be exactly that commit. `detectedOn` is what the derivation reads, so it
+is bounded in turn: it may not precede the day of the finding's own introducing commit, since a
+defect cannot be detected before the change that introduced it exists. Moving a merged incident
+into `nearMisses` to drop it out of the type-binding total therefore fails on ancestry rather
+than on prose, the rule is probed in both directions against commits the ledger already cites,
+and controls run the production validator against the coverage window's start commit, against a
+commit sharing the detection date, and against a backdated `detectedOn`.
 
 That is a one-way check, and worth being precise about what it does not do. Reachability
 shows a commit is in a history; it does not show that the defective state entered an
@@ -52,12 +56,14 @@ rule (`PSEN001`, `PSEN002`, `PSEN003`, `PSEN006`, `PSEN010`) must be `logic`; co
 escape may not be classified into a category the budget counts unless its detector implies
 that category. The converse matters because the forward rule alone left the *inflating* edit
 open: the one escape the anchor cannot reach had a free category, so `typeBinding` could be
-walked up by a single field. Escaping the anchor is not a way out either — the set of findings
-whose detector implies nothing must equal the ledger's declared `categoryAnchorExceptions`, so
-rewriting a detector to de-anchor a finding is a visible edit rather than a counter falling by
-one. Both fields are still authored, so this is an internal consistency constraint, not
-corroboration by independent evidence. It is reported as `categoryDetectorConsistent` — 11 of
-the twelve escapes; `ESC-0011` was found by review of a guard and has no detector to anchor to
+walked up by a single field. Escaping the anchor is a visible edit rather than a blocked one:
+the set of findings whose detector implies nothing must equal the ledger's declared
+`categoryAnchorExceptions`, and each entry pins the category the escape is filed under. An
+author who rewrites a detector to name nothing recognised, moves the category to one the budget
+does not count, and declares the exception with a rationale still passes, and the count still
+falls by one — what the rule buys is that this is three coordinated edits in a reviewed list
+rather than one silent field. Both fields are still authored, so this is an internal
+consistency constraint, not corroboration by independent evidence. It is reported as `categoryDetectorConsistent` — 11 ofthe twelve escapes; `ESC-0011` was found by review of a guard and has no detector to anchor to
 — and that count is **not** offered as assurance evidence. Detector family does not establish
 root cause.
 
@@ -157,6 +163,14 @@ carried as debt because correcting it properly means changing a producer contrac
 of its call sites, and the rest are test-side assertions or deliberate analyzer fixtures.
 The remaining findings stay in `tools/testdata/powershell-boundary-baseline.v1.json`; the
 boundary gate blocks any new one.
+
+Open debt is the only status that raises a published count, so it is the one an author has an
+interest in relabelling. `remediated` already required a remediating commit reachable from the
+window end, but `accepted` was unconstrained — flipping one enum value moved the open-debt
+count to zero with every check green. A finding marked `accepted` now has to record an
+`acceptanceRationale` and an `acceptedOnCommit` that git can reach from the window end, so
+accepting a risk costs the same kind of evidence as fixing it. A control flips the real
+open-debt finding to `accepted` and requires the gate to reject it.
 
 ## Near misses
 

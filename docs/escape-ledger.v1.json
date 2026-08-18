@@ -412,9 +412,11 @@
   "categoryAnchorExceptions": [
     {
       "id": "ESC-0011",
+      "category": "supervision",
       "rationale": "The escape was the regression guard itself, found by reading the guard rather than by any analyzer rule, so there is no cited detector whose family could imply a category. Listing it here is what makes the absence of an anchor a reviewable fact: its category cannot be edited to typeBinding, because a category the budget counts must be implied by a detector, and de-anchoring any other finding changes this list."
     }
-  ],  "gateObservations": [
+  ],
+  "gateObservations": [
     {
       "gate": "Gate 5",
       "observation": "The gate produced no deliverable decision: every candidate was withheld or reconciled away, so the decision yield was zero per cent. No incident in this ledger reached shadow or live execution because no shadow or live run has ever been performed - not because those runs were contained. Separately, the no-write invariant held throughout: zero external writes were made. The two are independent, since a shadow run invokes models and discards its output and is therefore compatible with zero writes.",

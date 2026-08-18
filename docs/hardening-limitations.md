@@ -25,13 +25,15 @@ wrong input fails:
 | Analyzer rules detect their hazard | Every rule has a positive fixture; every rule has a negative fixture proving it ignores the corrected form |
 | A test stub cannot silence a rule | A cross-file gate builds a producer, a consumer, and a same-named unprotected mock and requires identical `PSEN011` findings with and without the mock; reverting the fix makes it fail |
 | The coverage clock is derived, not asserted | The sabotage checks re-run the real derivation on a mutated ledger, with a positive control on the unmutated one |
-| A merged escape cannot be reclassified out of the budget | Moving a merged incident into `nearMisses` fails the git ancestry check, with both directions probed against real cited commits, and choosing an older baseline to evade that fails the baseline-currency rules |
+| A merged escape cannot be reclassified out of the budget | Moving a merged incident into `nearMisses` fails the git ancestry check, with both directions probed against real cited commits, and the baseline that would evade it is derived rather than chosen |
 | The clock cannot be switched on by asserting an authority | Setting `inForce: true` fails; so does naming an authority the schema version does not define, which is checked separately from the in-force flag |
 | The near-miss baseline is load-bearing | Each near miss's introducing commit is required to be reachable from `HEAD` yet unreachable from its own `classifiedAgainstCommit`, so a baseline that distinguished nothing would fail |
-| The baseline cannot be backdated | A baseline may not predate the finding's `detectedOn`, and every escape introduced before that date must be reachable from it; a control proves both rules reject the coverage window's own start commit |
+| The baseline cannot be chosen | The baseline is not bounded but derived: it must equal the mainline as of `detectedOn`, and `detectedOn` may not precede the introducing commit's own day. Controls run the production validator against the coverage window's start commit, against a commit sharing the detection date, and against a backdated `detectedOn` |
 | The ancestry rule cannot be opted out of | `introducedCommit` is required by the schema on both lists and its absence is a gate failure, so a finding cannot leave the git check by dropping a field |
 | `category` cannot be edited alone, in either direction | Reclassifying a type-binding escape as `logic` contradicts the collection-collapse detector it cites; classifying an escape into a counted category with no detector implying it fails too, and a control asserts the unanchored escape is the one that would be inflated |
-| An escape cannot be freed by de-anchoring it | The set of findings whose detector implies no category must equal the ledger's declared `categoryAnchorExceptions`, so rewriting a detector to escape the anchor fails rather than lowering a counter |
+| De-anchoring an escape is visible, not free | The set of findings whose detector implies no category must equal the ledger's declared `categoryAnchorExceptions`, and each entry pins the category the escape is filed under. Rewriting a detector to escape the anchor therefore requires a matching edit to a reviewed list with a written rationale. It is *not* prevented: an author who rewrites the detector, moves the category to an uncounted one, and declares the exception passes every check, and the published count falls by one. What the gate buys is that the change is three coordinated edits in a reviewed list rather than one silent field |
+| Debt cannot be closed by relabelling it | A finding marked `accepted` must record an `acceptanceRationale` and an `acceptedOnCommit` reachable from the window end, and a control flips the real open-debt finding to `accepted` and requires rejection |
+| A control cannot outlive the rule it tests | Each rule is one validator called by both the production loop and its control, so deleting the rule's body makes the control fail. Verified for the baseline, category, exception and exposure validators |
 | A runtime exposure cannot be hidden by one field | `executionStage` and `reachedShadowOrLive` are checked as equivalent on both lists, and a control mutates a real near miss to shadow and requires the check to reject it |
 | The budget would fire | Sabotaged ledger copies with qualifying escapes are required to trigger it |
 
@@ -59,17 +61,26 @@ Four residuals are named rather than closed.
   an ancestry *pass* leaves the classification resting on the recorded rationale. Closing this
   properly needs a recorded integration revision in which the defect was actually present,
   checked against named operational refs — deferred, not done.
-- **The baseline is authored.** `classifiedAgainstCommit` is pinned so that merging a change
-  cannot retroactively reclassify the near misses it contains, but the pin itself is chosen by
-  the author. Requiring only that it sit on the mainline bounded nothing — every commit in the
-  window satisfies that, so naming an old enough baseline restored the escape-to-near-miss
-  reclassification through the field meant to close it. It is now held to the claim it makes:
-  the baseline's commit date may not precede the finding's `detectedOn`, and every escape the
-  ledger records as introduced before that date must be reachable from it. A control proves
-  both rules reject the coverage window's own start commit — the most plausible bad baseline,
-  since it is on the mainline and old enough to make any escape look unmerged. What remains
-  unproven is the exact commit: any commit in the short interval between the last prior escape
-  and the detection date satisfies both rules, and `detectedOn` is itself authored.
+- **The baseline is derived, and what is left authored is the date.** `classifiedAgainstCommit`
+  is pinned so that merging a change cannot retroactively reclassify the near misses it
+  contains, but the pin was originally chosen by the author. Requiring only that it sit on the
+  mainline bounded nothing — every commit in the window satisfies that — and a lower bound on
+  its date bounded almost nothing, because every non-tip commit sharing a calendar day with
+  `detectedOn` still qualified, and there were four. Either form left the escape-to-near-miss
+  reclassification available at a cost of one field value, through the field meant to close it.
+  The rule no longer bounds the baseline; it computes it. The mainline as of a date is a single
+  commit — `git rev-list -1 --before="<detectedOn> 23:59:59" <windowEnd>` — and the recorded
+  baseline must be that commit, so the interval an author may choose within collapses to
+  nothing rather than narrowing. `detectedOn` is what the derivation reads, so it is bounded in
+  turn: it may not precede the day of the finding's own `introducedCommit`, because a defect
+  cannot be detected before the change that introduced it exists. Moving it later only makes
+  the introducing commit more likely to be reachable from the derived baseline, which the
+  ancestry rule already rejects. An earlier form of this rule compared the baseline's date
+  against `detectedOn` with a lower bound; that was not merely gameable but directionally
+  wrong, since the newest mainline commit at detection normally *predates* detection, so it
+  would have false-failed an honest finding filed during any quiet period. What remains is that
+  `detectedOn` is authored within those bounds, and that the derivation trusts the recorded
+  window end.
 - **`introducedCommit`'s value is not tied to the defect.** Ancestry checks *where* a commit
   sits, not that it is the right commit. Naming a different real commit on the correct side of
   the boundary passes. The obvious anchor — requiring the introducing commit to touch a file
@@ -87,15 +98,28 @@ Four residuals are named rather than closed.
   detector that implies a category constrains the category, *and* a category the budget counts
   may not be asserted without a detector that implies it. The one-directional form left the
   inflating edit open, because the single escape the anchor cannot reach had a free category
-  and the trigger counts `typeBinding`. De-anchoring is now itself a visible edit: the set of
-  findings whose detector implies nothing must equal `categoryAnchorExceptions` in the ledger,
-  so rewriting a detector to escape the anchor fails rather than showing up as a published
-  counter falling by one. But **both fields are authored**, and detector family does not
+  and the trigger counts `typeBinding`. De-anchoring is now a visible edit rather than a
+  prevented one: the set of findings whose detector implies nothing must equal
+  `categoryAnchorExceptions` in the ledger, and each entry pins the category the escape is
+  filed under. An author who rewrites a detector to name nothing recognised, moves the
+  category to one the budget does not count, and declares the exception still passes every
+  check, and the published count still falls by one — the cost is three coordinated edits to a
+  reviewed list carrying a written rationale, not a single silent field. That is the limit of
+  what this anchor can do, because **both fields are authored**, and detector family does not
   establish root cause. `PSEN007` and `PSEN008` are serialization rules that legitimately
   imply neither family, and a detector naming both families implies nothing; either case is an
   exception that must be declared. Eleven of twelve escapes are consistent this way, reported
   as `categoryDetectorConsistent`; `ESC-0011` is a supervision finding detected by review, with
   no detector to check against. That count is deliberately not offered as assurance evidence.
+- **A control that restates a rule is not a control.** Every sabotage check in this gate calls
+  the same validator the production loop calls, on a freshly parsed copy of the real ledger.
+  The earlier form asserted the rule's predicate a second time inside the control, which meant
+  the control stayed green when the production assertion was deleted — verified by replacing
+  two real assertions with unconditional success and watching all checks still pass. Three
+  further controls added while closing that were themselves structurally unfalsifiable, which
+  is the same defect recorded as `NM-0002`. The shape is easy to reintroduce and nothing in
+  the gate detects it automatically; it is caught only by deleting a rule and confirming its
+  control fails.
 - **The check needs git and the switch.** It only runs under `-VerifyCommits`; a schema-only
   validation still sees the booleans as authored. CI runs it with `fetch-depth: 0`, so every
   push gets the ancestry rules, but a local run without the switch does not.
