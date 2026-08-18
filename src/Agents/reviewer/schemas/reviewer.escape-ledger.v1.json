@@ -13,6 +13,7 @@
     "vocabulary",
     "budget",
     "incidents",
+    "categoryAnchorExceptions",
     "gateObservations",
     "decision"
   ],
@@ -263,6 +264,19 @@
               }
             }
           }
+        }
+      }
+    },
+    "categoryAnchorExceptions": {
+      "comment": "The findings whose cited detector implies no category, listed explicitly. The gate requires this set to equal the set it computes, so de-anchoring a finding — which would otherwise let its category be edited freely in either direction — is a visible edit to this list rather than a silent one-point drop in a published counter.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "rationale"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^(ESC|NM)-[0-9]{4}$" },
+          "rationale": { "type": "string", "minLength": 1 }
         }
       }
     },

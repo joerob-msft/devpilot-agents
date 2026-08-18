@@ -25,11 +25,14 @@ wrong input fails:
 | Analyzer rules detect their hazard | Every rule has a positive fixture; every rule has a negative fixture proving it ignores the corrected form |
 | A test stub cannot silence a rule | A cross-file gate builds a producer, a consumer, and a same-named unprotected mock and requires identical `PSEN011` findings with and without the mock; reverting the fix makes it fail |
 | The coverage clock is derived, not asserted | The sabotage checks re-run the real derivation on a mutated ledger, with a positive control on the unmutated one |
-| A merged escape cannot be reclassified out of the budget | Moving a merged incident into `nearMisses` fails the git ancestry check, with both directions probed against real cited commits |
+| A merged escape cannot be reclassified out of the budget | Moving a merged incident into `nearMisses` fails the git ancestry check, with both directions probed against real cited commits, and choosing an older baseline to evade that fails the baseline-currency rules |
 | The clock cannot be switched on by asserting an authority | Setting `inForce: true` fails; so does naming an authority the schema version does not define, which is checked separately from the in-force flag |
 | The near-miss baseline is load-bearing | Each near miss's introducing commit is required to be reachable from `HEAD` yet unreachable from its own `classifiedAgainstCommit`, so a baseline that distinguished nothing would fail |
+| The baseline cannot be backdated | A baseline may not predate the finding's `detectedOn`, and every escape introduced before that date must be reachable from it; a control proves both rules reject the coverage window's own start commit |
 | The ancestry rule cannot be opted out of | `introducedCommit` is required by the schema on both lists and its absence is a gate failure, so a finding cannot leave the git check by dropping a field |
-| `category` cannot be edited alone | Reclassifying a type-binding escape as `logic` contradicts the collection-collapse detector it cites and fails; a probe asserts the anchor actually bites on a type-binding escape |
+| `category` cannot be edited alone, in either direction | Reclassifying a type-binding escape as `logic` contradicts the collection-collapse detector it cites; classifying an escape into a counted category with no detector implying it fails too, and a control asserts the unanchored escape is the one that would be inflated |
+| An escape cannot be freed by de-anchoring it | The set of findings whose detector implies no category must equal the ledger's declared `categoryAnchorExceptions`, so rewriting a detector to escape the anchor fails rather than lowering a counter |
+| A runtime exposure cannot be hidden by one field | `executionStage` and `reachedShadowOrLive` are checked as equivalent on both lists, and a control mutates a real near miss to shadow and requires the check to reject it |
 | The budget would fire | Sabotaged ledger copies with qualifying escapes are required to trigger it |
 
 A gate without a negative control proves that its own happy path still runs. That is worth
@@ -58,9 +61,15 @@ Four residuals are named rather than closed.
   checked against named operational refs — deferred, not done.
 - **The baseline is authored.** `classifiedAgainstCommit` is pinned so that merging a change
   cannot retroactively reclassify the near misses it contains, but the pin itself is chosen by
-  the author. It is constrained — it must lie on the mainline the coverage window describes,
-  and a commit the ledger records as merged must be reachable from it — which blocks the naive
-  attack of picking a baseline predating everything, but it is not proof.
+  the author. Requiring only that it sit on the mainline bounded nothing — every commit in the
+  window satisfies that, so naming an old enough baseline restored the escape-to-near-miss
+  reclassification through the field meant to close it. It is now held to the claim it makes:
+  the baseline's commit date may not precede the finding's `detectedOn`, and every escape the
+  ledger records as introduced before that date must be reachable from it. A control proves
+  both rules reject the coverage window's own start commit — the most plausible bad baseline,
+  since it is on the mainline and old enough to make any escape look unmerged. What remains
+  unproven is the exact commit: any commit in the short interval between the last prior escape
+  and the detection date satisfies both rules, and `detectedOn` is itself authored.
 - **`introducedCommit`'s value is not tied to the defect.** Ancestry checks *where* a commit
   sits, not that it is the right commit. Naming a different real commit on the correct side of
   the boundary passes. The obvious anchor — requiring the introducing commit to touch a file
@@ -70,15 +79,23 @@ Four residuals are named rather than closed.
   `Start-ReviewerAgent.ps1` in `b563d1b`, long after the commit that introduced the code. A
   rule needing a per-incident exemption list to stay green is the fail-open shape this page
   exists to name, so the gap is published instead.
-- **`category` is corroborated, not derived.** What a defect "was" is a judgement. The gate
-  holds the category consistent with the detector the incident cites — a collection-collapse
-  rule (`PSEN004`/`PSEN009`/`PSEN011`, or the cardinality boundary harness) implies
-  `typeBinding`, a control-flow rule (`PSEN003`/`PSEN006`/`PSEN010`) implies `logic` — so
-  walking the trigger count down now requires editing two mutually corroborating fields and
-  leaving a visible contradiction with the incident's own prose. It raises the cost of a quiet
-  edit; it does not make the assignment checkable. Eleven of twelve escapes are anchored this
-  way and the count is published as `categoryAnchored`; `ESC-0011` is a supervision finding
-  detected by review, with no detector to anchor to.
+- **`category` is an internal consistency constraint, not corroboration.** What a defect "was"
+  is a judgement. The gate holds the category consistent with the detector the incident cites
+  — a collection-collapse rule (`PSEN004`/`PSEN005`/`PSEN009`/`PSEN011`, or the cardinality
+  boundary harness) implies `typeBinding`, a control-flow rule
+  (`PSEN001`/`PSEN002`/`PSEN003`/`PSEN006`/`PSEN010`) implies `logic` — in both directions: a
+  detector that implies a category constrains the category, *and* a category the budget counts
+  may not be asserted without a detector that implies it. The one-directional form left the
+  inflating edit open, because the single escape the anchor cannot reach had a free category
+  and the trigger counts `typeBinding`. De-anchoring is now itself a visible edit: the set of
+  findings whose detector implies nothing must equal `categoryAnchorExceptions` in the ledger,
+  so rewriting a detector to escape the anchor fails rather than showing up as a published
+  counter falling by one. But **both fields are authored**, and detector family does not
+  establish root cause. `PSEN007` and `PSEN008` are serialization rules that legitimately
+  imply neither family, and a detector naming both families implies nothing; either case is an
+  exception that must be declared. Eleven of twelve escapes are consistent this way, reported
+  as `categoryDetectorConsistent`; `ESC-0011` is a supervision finding detected by review, with
+  no detector to check against. That count is deliberately not offered as assurance evidence.
 - **The check needs git and the switch.** It only runs under `-VerifyCommits`; a schema-only
   validation still sees the booleans as authored. CI runs it with `fetch-depth: 0`, so every
   push gets the ancestry rules, but a local run without the switch does not.

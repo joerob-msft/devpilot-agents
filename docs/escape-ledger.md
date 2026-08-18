@@ -22,9 +22,15 @@ it. Under `-VerifyCommits` an escape's `introducedCommit` must be reachable from
 coverage window's end commit, and a near miss's must not be reachable from the mainline
 commit it was **classified against** — a fixed `classifiedAgainstCommit`, not the live
 window end, so that merging the change containing a near miss cannot retroactively
-reclassify it. Moving a merged incident into `nearMisses` to drop it out of the type-binding
-total therefore fails on ancestry rather than on prose, and the rule is probed in both
-directions against commits the ledger already cites.
+reclassify it. The baseline is the author's choice, so it is held to the claim it makes: it
+may not predate the finding's own `detectedOn`, and every escape the ledger records as
+introduced before that date must be reachable from it. Without those two rules the
+reclassification was still available — reachability from the window end is satisfied by every
+commit in the window, so naming an old enough baseline made any escape look unmerged. Moving
+a merged incident into `nearMisses` to drop it out of the type-binding total therefore fails
+on ancestry rather than on prose, the rule is probed in both directions against commits the
+ledger already cites, and a control proves both baseline rules reject the coverage window's
+own start commit.
 
 That is a one-way check, and worth being precise about what it does not do. Reachability
 shows a commit is in a history; it does not show that the defective state entered an
@@ -38,15 +44,22 @@ defect it names. [`hardening-limitations.md`](hardening-limitations.md) carries 
 residuals.
 
 `category` is the field with the most leverage over the pivot decision, because the trigger
-counts type-binding escapes. It cannot be derived — what a defect was is a judgement — so it
-is corroborated instead: an incident detected by a collection-collapse rule
-(`PSEN004`, `PSEN009`, `PSEN011`, or the cardinality boundary harness) must be `typeBinding`,
-and one detected by a control-flow rule (`PSEN003`, `PSEN006`, `PSEN010`) must be `logic`.
-Walking the count down therefore takes two mutually corroborating edits and leaves a visible
-contradiction with the incident's own prose, rather than one quiet field change. Eleven of the
-twelve escapes are anchored this way; `ESC-0011` was found by review of a guard and has no
-detector to anchor to. This raises the cost of misfiling — it does not make the assignment
-checkable, and the limitations page says so.
+counts type-binding escapes. It cannot be derived — what a defect was is a judgement — so the
+gate holds it *consistent* with the detector the same incident cites, in both directions. An
+incident detected by a collection-collapse rule (`PSEN004`, `PSEN005`, `PSEN009`, `PSEN011`,
+or the cardinality boundary harness) must be `typeBinding`, and one detected by a control-flow
+rule (`PSEN001`, `PSEN002`, `PSEN003`, `PSEN006`, `PSEN010`) must be `logic`; conversely, an
+escape may not be classified into a category the budget counts unless its detector implies
+that category. The converse matters because the forward rule alone left the *inflating* edit
+open: the one escape the anchor cannot reach had a free category, so `typeBinding` could be
+walked up by a single field. Escaping the anchor is not a way out either — the set of findings
+whose detector implies nothing must equal the ledger's declared `categoryAnchorExceptions`, so
+rewriting a detector to de-anchor a finding is a visible edit rather than a counter falling by
+one. Both fields are still authored, so this is an internal consistency constraint, not
+corroboration by independent evidence. It is reported as `categoryDetectorConsistent` — 11 of
+the twelve escapes; `ESC-0011` was found by review of a guard and has no detector to anchor to
+— and that count is **not** offered as assurance evidence. Detector family does not establish
+root cause.
 
 Escapes are counted on one axis and runtime exposure on another. A *containment escape* is a
 defect that entered a merged coordinator change; a *runtime exposure finding* is one that
@@ -54,8 +67,12 @@ reached shadow or live execution, whether or not it ever merged. Only the first 
 evidence, but the second is what the typed-host decision most wants to read, so the near-miss
 schema deliberately does **not** pin `reachedShadowOrLive` closed. Pinning it would make the
 taxonomy unable to represent a pre-merge live failure at all, which is a way of not counting
-it. Both counts are published; today both are zero, because no shadow or live run has ever
-been performed.
+it. The two counts stand at **12 containment escapes and 0 runtime-exposed findings across 0
+runs**. The zero is a denominator, not an achievement, so the gate publishes it as a
+structure — `findingCount`, a per-category breakdown, `shadowRuns`, `liveRuns`, and
+`observationStatus: noRuns` — rather than as a bare zero a reader could mistake for
+containment. The per-category split matters because a live `external` or `logic` finding is
+not the same evidence for a typed host as a live `typeBinding` one.
 
 The machine-readable ledger is [`escape-ledger.v1.json`](escape-ledger.v1.json), validated
 against
