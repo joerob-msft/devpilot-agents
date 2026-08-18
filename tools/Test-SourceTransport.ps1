@@ -4833,6 +4833,129 @@ finally {
     Remove-Variable -Name Gate5LiveCaptureFixture -Scope Global -ErrorAction SilentlyContinue
 }
 
+# Execute the real library orchestrator from a child module. Its nested closures
+# must capture library helpers just as the live child-script wrapper does.
+$gate6Identity = [pscustomobject]@{
+    Binding = $fcBinding
+    Response = $azAggregateDegenerate
+    ChangeSetSha256 = (Get-ReviewerSourceChangeIdentityDigest -Response $azAggregateDegenerate)
+}
+$gate6OrdinaryIdentity = [pscustomobject]@{
+    Binding = $fcBinding
+    Response = $fcSingle
+    ChangeSetSha256 = (Get-ReviewerSourceChangeIdentityDigest -Response $fcSingle)
+}
+$gate6Module = New-Module -ArgumentList @(
+    (Join-Path $repoRoot "src/Agents/reviewer/SourceTransport.ps1"),
+    $gate6Identity,
+    $azAggregateDegenerate,
+    $gate6OrdinaryIdentity,
+    $fcSingle,
+    $policy,
+    $fcSource,
+    $fcRepoId,
+    $fcPr,
+    $sourceText,
+    $targetText
+) -ScriptBlock {
+    param(
+        [string]$SourceTransportPath,
+        $Identity,
+        $Aggregate,
+        $OrdinaryIdentity,
+        $OrdinaryAggregate,
+        [hashtable]$TransportPolicy,
+        [string]$SourceCommit,
+        [string]$RepositoryId,
+        [int]$PrId,
+        [string]$SourceText,
+        [string]$BaseText
+    )
+    . $SourceTransportPath
+    $script:Gate6Identity = $Identity
+    $script:Gate6Aggregate = $Aggregate
+    $script:Gate6OrdinaryIdentity = $OrdinaryIdentity
+    $script:Gate6OrdinaryAggregate = $OrdinaryAggregate
+    $script:Gate6Policy = $TransportPolicy
+    $script:Gate6SourceCommit = $SourceCommit
+    $script:Gate6RepositoryId = $RepositoryId
+    $script:Gate6PrId = $PrId
+    $script:Gate6SourceText = $SourceText
+    $script:Gate6BaseText = $BaseText
+    function Invoke-Gate6Orchestrator {
+        param([ValidateSet("ordinary", "recovery", "oversize")][string]$Shape)
+        $identity = if ($Shape -ceq "ordinary") {
+            $script:Gate6OrdinaryIdentity
+        } else {
+            $script:Gate6Identity
+        }
+        $aggregate = if ($Shape -ceq "ordinary") {
+            $script:Gate6OrdinaryAggregate
+        } else {
+            $script:Gate6Aggregate
+        }
+        $transportPolicy = $script:Gate6Policy
+        $sourceCommit = $script:Gate6SourceCommit
+        $repositoryId = $script:Gate6RepositoryId
+        $prId = $script:Gate6PrId
+        $sourceText = $script:Gate6SourceText
+        $baseText = $script:Gate6BaseText
+        $identityReader = { $identity }.GetNewClosure()
+        $aggregateReader = { $aggregate }.GetNewClosure()
+        $reader = {
+            param([string]$Path, [string[]]$Kinds)
+            if ($Shape -ceq "oversize") {
+                return [pscustomobject]@{
+                    Text = ""; MimeType = "text/plain"
+                    ByteLength = [int]$transportPolicy.maxFetchBytesPerFile + 1
+                    Sha256 = ""; Rejected = "fileTooLarge"; Path = $Path
+                    CommitSha = $sourceCommit; ChangeKinds = @($Kinds)
+                }
+            }
+            [pscustomobject]@{
+                Text = $sourceText; MimeType = "text/plain"
+                ByteLength = [Text.Encoding]::UTF8.GetByteCount($sourceText)
+                Sha256 = "0" * 64; Rejected = ""; Path = $Path
+                CommitSha = $sourceCommit; ChangeKinds = @($Kinds)
+            }
+        }.GetNewClosure()
+        $baseReader = {
+            param([string]$Path, [string[]]$Kinds, [string]$BaseCommit)
+            [pscustomobject]@{
+                Text = $baseText; MimeType = "text/plain"
+                ByteLength = [Text.Encoding]::UTF8.GetByteCount($baseText)
+                Sha256 = "0" * 64; Rejected = ""; Path = $Path
+                CommitSha = $BaseCommit; ChangeKinds = @($Kinds)
+            }
+        }.GetNewClosure()
+        Invoke-ReviewerSourceNewContractTransport -IdentityReader $identityReader `
+            -Reader $reader -BaseReader $baseReader -AggregateReader $aggregateReader `
+            -Organization "contoso" -Project "widgets" -RepositoryId $repositoryId `
+            -PrId $prId -SourceCommit $sourceCommit -Policy $transportPolicy `
+            -PolicySha256 "" -NonceFactory { "n" * 32 }
+    }
+    Export-ModuleMember -Function Invoke-Gate6Orchestrator
+}
+try {
+    $gate6Ordinary = & $gate6Module { Invoke-Gate6Orchestrator -Shape "ordinary" }
+    $gate6Recovery = & $gate6Module { Invoke-Gate6Orchestrator -Shape "recovery" }
+    $gate6Oversize = & $gate6Module { Invoke-Gate6Orchestrator -Shape "oversize" }
+    Assert-Source ($gate6Ordinary.Gate.Ok -and [int]$gate6Ordinary.Report.CoveredFiles -eq 1 -and
+        [int]$gate6Ordinary.Report.RecoveryAttemptedFileCount -eq 0) `
+        "Gate6 child-module ordinary reads resolve the captured binding helper"
+    Assert-Source ($gate6Recovery.Gate.Ok -and [int]$gate6Recovery.Report.CoveredFiles -eq 1 -and
+        [int]$gate6Recovery.Report.RecoveryAttemptedFileCount -eq 1 -and
+        [int]$gate6Recovery.Report.RecoveryRecoveredFileCount -eq 1 -and
+        $gate6Recovery.BlockText -match '"spanBasis":"recovered"') `
+        "Gate6 child-module recovery resolves captured library helpers inside every nested closure"
+    Assert-Source (-not $gate6Oversize.Gate.Ok -and
+        @($gate6Oversize.Report.Files | Where-Object Reason -CEQ "fileTooLarge").Count -eq 1) `
+        "Gate6 child-module oversize recovery resolves captured value and binding helpers"
+}
+finally {
+    Remove-Module $gate6Module -Force -ErrorAction SilentlyContinue
+}
+
 # -- Executable production-wrapper recovery readers --------------------------
 # Load only the two thin adapters from the production wrapper. Their dependencies
 # below are deterministic in-process recorders; no MCP, CLI process, or model runs.
