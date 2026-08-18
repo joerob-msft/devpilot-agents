@@ -861,6 +861,20 @@ if ($DiscoveryGeneralistModel) {
     }
 }
 $discoveryModel = if ($DiscoveryGeneralistModel) { $DiscoveryGeneralistModel } else { $Model }
+if ($SecondGeneralistModel) {
+    [void](Assert-AgentSupportedModel -ModelId $discoveryModel `
+            -Where 'role input capture discovery generalist model')
+    [void](Assert-AgentSupportedModel -ModelId $SecondGeneralistModel `
+            -Where 'role input capture second generalist model')
+    if ([string]$discoveryModel -ceq [string]$SecondGeneralistModel) {
+        throw 'A role input capture requires two distinct configured generalist models.'
+    }
+    if (-not (Test-AgentGeneralistModelPair -Models @($discoveryModel, $SecondGeneralistModel))) {
+        $requiredPair = Get-AgentGeneralistModelPair
+        throw ("A role input capture requires the configured generalist pairing: " +
+            "$($requiredPair.First) and $($requiredPair.Second).")
+    }
+}
 if ($Role -ceq 'verifier') {
     if (-not $SecondGeneralistModel -or -not $ConventionSpecialistModel) {
         throw 'A verifier role input capture requires the second generalist and convention specialist models.'
@@ -1170,11 +1184,13 @@ $reviewerArgs = @(
     '-CaptureRoleInputRequestFile', $requestFull
 )
 if ($legacyFull) { $reviewerArgs += @('-CaptureRoleInputLegacyProjectionFile', $legacyFull) }
+if ($SecondGeneralistModel) {
+    $reviewerArgs += @('-SecondPassModel', $SecondGeneralistModel)
+}
 if ($Role -cne 'generalist') {
     if (-not $SecondGeneralistModel) { throw "A $Role role input capture requires -SecondGeneralistModel (the second configured generalist model)." }
     if (-not $ConventionSpecialistModel) { throw "A $Role role input capture requires -ConventionSpecialistModel (the configured convention specialist model)." }
     $reviewerArgs += @(
-        '-SecondPassModel', $SecondGeneralistModel,
         '-EnableConventionSpecialist', '-ConventionSpecialistModel', $ConventionSpecialistModel,
         '-ConventionSpecialistTimeoutSeconds', "$TimeoutSeconds"
     )

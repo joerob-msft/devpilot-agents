@@ -767,9 +767,113 @@ try {
     # -- 1. Generalist: the exact production prompt, and nothing else ---------
     Write-Host '1/8 generalist capture reaches the exact model boundary and launches nothing' -ForegroundColor Cyan
     $genBundle = New-CaptureBundle -Role generalist
+    $generalistPair = Get-AgentGeneralistModelPair
+
+    # Replace only the production child boundary, leaving all supervisor
+    # readiness, identity and model validation intact. The stub records the exact
+    # native argv it receives and exits before it can create telemetry or output.
+    $argvCapture = Join-Path $runRoot 'generalist-two-pass-child-argv.json'
+    $reviewerStub = Join-Path $runRoot 'Start-ReviewerAgent-argv-stub.ps1'
+    $stubText = @'
+[IO.File]::WriteAllText(
+    '__ARGV_CAPTURE__',
+    (ConvertTo-Json -Compress -InputObject ([string[]]$args)),
+    [Text.UTF8Encoding]::new($false))
+exit 91
+'@.Replace('__ARGV_CAPTURE__', $argvCapture.Replace("'", "''"))
+    Write-Utf8 $reviewerStub $stubText
+    Copy-Item -LiteralPath $PromptFile -Destination (Join-Path $runRoot 'review-cycle.prompt.md') -Force
+    $supervisorText = [IO.File]::ReadAllText($CaptureTool, $Utf8)
+    $reviewerAssignment = '$ReviewerScript = Join-Path $RepoRoot ''src\Agents\reviewer\Start-ReviewerAgent.ps1'''
+    Check 'the production child boundary assignment is unique in the supervisor' (
+        ($supervisorText.Split([string[]]@($reviewerAssignment), [StringSplitOptions]::None).Length - 1) -eq 1)
+    $stubSupervisor = Join-Path $runRoot 'Invoke-ReviewerRoleInputCapture-argv-stub.ps1'
+    Write-Utf8 $stubSupervisor ($supervisorText.Replace(
+            $reviewerAssignment,
+            ("`$ReviewerScript = '$($reviewerStub.Replace("'", "''"))'")))
+
+    $stubOut = Join-Path $runRoot 'capture-generalist-two-pass-stub'
+    $stubRun = Invoke-Tool -ToolPath $stubSupervisor -Arguments (
+        Get-CaptureArgs -Bundle $genBundle -Out $stubOut -Model $generalistPair.First `
+            -Extra @('-SecondGeneralistModel', $generalistPair.Second))
+    $childArgv = @()
+    if (Test-Path -LiteralPath $argvCapture -PathType Leaf) {
+        $childArgv = @([IO.File]::ReadAllText($argvCapture, $Utf8) | ConvertFrom-Json)
+    }
+    $modelIndexes = @()
+    $captureModelIndexes = @()
+    $secondIndexes = @()
+    if ($childArgv.Count -gt 0) {
+        $modelIndexes = @(0..($childArgv.Count - 1) | Where-Object {
+                [string]$childArgv[$_] -ceq '-Model'
+            })
+        $captureModelIndexes = @(0..($childArgv.Count - 1) | Where-Object {
+                [string]$childArgv[$_] -ceq '-CaptureRoleInputModel'
+            })
+        $secondIndexes = @(0..($childArgv.Count - 1) | Where-Object {
+                [string]$childArgv[$_] -ceq '-SecondPassModel'
+            })
+    }
+    Check 'Opus discovery/captured plus GPT second reaches the exact production child boundary' (
+        $stubRun.ExitCode -ne 0 -and $childArgv.Count -gt 0) $stubRun.Text
+    Check 'the child argv carries each two-pass model switch and value exactly once' (
+        $modelIndexes.Count -eq 1 -and
+        [string]$childArgv[$modelIndexes[0] + 1] -ceq [string]$generalistPair.First -and
+        $captureModelIndexes.Count -eq 1 -and
+        [string]$childArgv[$captureModelIndexes[0] + 1] -ceq [string]$generalistPair.First -and
+        $secondIndexes.Count -eq 1 -and
+        [string]$childArgv[$secondIndexes[0] + 1] -ceq [string]$generalistPair.Second) (
+        $childArgv -join ' ')
+
+    Remove-Item -LiteralPath $argvCapture -Force -ErrorAction SilentlyContinue
+    $equalModels = Invoke-Tool -ToolPath $stubSupervisor -Arguments (
+        Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-generalist-equal-models') `
+            -Model $generalistPair.First -Extra @('-SecondGeneralistModel', $generalistPair.First))
+    Check 'equal discovery and second generalist models are rejected before the child boundary' (
+        $equalModels.ExitCode -ne 0 -and
+        $equalModels.Text -match 'two distinct configured generalist models' -and
+        -not (Test-Path -LiteralPath $argvCapture)) $equalModels.Text
+
+    $unsupportedSecond = Invoke-Tool -ToolPath $stubSupervisor -Arguments (
+        Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-generalist-unsupported-second') `
+            -Model $generalistPair.First -Extra @('-SecondGeneralistModel', 'unsupported-generalist'))
+    Check 'an unsupported second generalist model is rejected before the child boundary' (
+        $unsupportedSecond.ExitCode -ne 0 -and
+        $unsupportedSecond.Text -match 'unsupported model id' -and
+        -not (Test-Path -LiteralPath $argvCapture)) $unsupportedSecond.Text
+
+    $wrongSupportedPair = Invoke-Tool -ToolPath $stubSupervisor -Arguments (
+        Get-CaptureArgs -Bundle $genBundle -Out (Join-Path $runRoot 'capture-generalist-wrong-pair') `
+            -Model $generalistPair.First -Extra @('-SecondGeneralistModel', 'gpt-5.6-terra'))
+    Check 'a supported but non-current generalist pair is rejected before the child boundary' (
+        $wrongSupportedPair.ExitCode -ne 0 -and
+        $wrongSupportedPair.Text -match 'requires the configured generalist pairing' -and
+        -not (Test-Path -LiteralPath $argvCapture)) $wrongSupportedPair.Text
+
+    $twoPassConfig = Join-Path $runRoot 'two-pass-required-config\reviewer.config.json'
+    $twoPassConfigObject = Get-Content $ConfigFile -Raw -Encoding UTF8 |
+        ConvertFrom-Json -AsHashtable -Depth 64
+    $twoPassConfigObject.review.conventionSpecialistModel = 'claude-sonnet-5'
+    $twoPassConfigObject.review.verification.enabled = $true
+    $twoPassConfigObject.review.verification.conventionVerifierModel = $generalistPair.First
+    Write-Utf8 $twoPassConfig (ConvertTo-Json $twoPassConfigObject -Depth 64)
+    $twoPassRequiredBundle = New-CaptureBundle -Role generalist -Tag 'two-pass-required' `
+        -ConfigSource $twoPassConfig -Model $generalistPair.First
+    $omittedSecond = Invoke-Tool -Arguments (
+        Get-CaptureArgs -Bundle $twoPassRequiredBundle `
+            -Out (Join-Path $runRoot 'capture-generalist-second-omitted') `
+            -Model $generalistPair.First)
+    Check 'omitting the second model reproduces the production two-pass refusal' (
+        $omittedSecond.ExitCode -ne 0 -and
+        $omittedSecond.Text -match 'Verification preview requires two explicitly named independent generalist passes' -and
+        -not (Test-Path -LiteralPath (Join-Path $runRoot 'capture-generalist-second-omitted'))) `
+        $omittedSecond.Text
+
     $genOut = Join-Path $runRoot 'capture-generalist'
     $gen = Invoke-Tool -Arguments (Get-CaptureArgs -Bundle $genBundle -Out $genOut `
-            -Extra @('-LegacyProjectionFile', $genBundle.LegacyFile))
+            -Model $generalistPair.First -Extra @(
+                '-LegacyProjectionFile', $genBundle.LegacyFile,
+                '-SecondGeneralistModel', $generalistPair.Second))
     Check 'generalist capture succeeds' ($gen.ExitCode -eq 0) ($gen.Text -replace '\s+', ' ')
     $genResult = $null
     if ($gen.ExitCode -eq 0) {
@@ -788,7 +892,6 @@ try {
         [int]$genResult.telemetry.providerLiveWrites -eq 0 -and
         [int]$genResult.telemetry.writeToolInvocations -eq 0)
 
-    $supervisorText = [IO.File]::ReadAllText($CaptureTool, $Utf8)
     $telemetryNeedle = '$telemetryFailure = '''''
     Check 'the telemetry sabotage seam is unique in the supervisor' (
         ($supervisorText.Split([string[]]@($telemetryNeedle), [StringSplitOptions]::None).Length - 1) -eq 1)
