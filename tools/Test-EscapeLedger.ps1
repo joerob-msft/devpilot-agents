@@ -799,7 +799,11 @@ function Get-ClassificationBaselineObjection {
     if ($records.Count -ne $Baseline.Count) {
         return "The classification baseline has $($Baseline.Count) record(s), but the historical incident and near-miss lists have $($records.Count). A record was added, removed, or moved without updating the visible baseline."
     }
+    $baselineIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
     foreach ($expected in $Baseline) {
+        if (-not $baselineIds.Add([string]$expected.id)) {
+            return "Classification baseline identifier $($expected.id) is duplicated, leaving another historical record unpinned."
+        }
         $actual = @($records | Where-Object { [string]$_.id -eq [string]$expected.id })
         if ($actual.Count -ne 1) {
             return "Classification baseline entry $($expected.id) does not identify exactly one historical record."
@@ -808,6 +812,11 @@ function Get-ClassificationBaselineObjection {
             if ([string]$actual[0].$field -cne [string]$expected.$field) {
                 return "Historical record $($expected.id) changed $field from '$($expected.$field)' to '$($actual[0].$field)'. The edit is classification-affecting and cannot silently move the record out of the budget."
             }
+        }
+    }
+    foreach ($record in $records) {
+        if (-not $baselineIds.Contains([string]$record.id)) {
+            return "Historical record $($record.id) has no classification baseline entry."
         }
     }
     return $null
@@ -837,6 +846,10 @@ $classificationMoved.incidents = @($classificationMoved.incidents | Where-Object
 $classificationMoved.nearMisses = @($classificationMoved.nearMisses) + @($movedRecord)
 Assert-Ledger ($null -ne (Get-ClassificationBaselineObjection -Incidents @($classificationMoved.incidents) -NearMisses @($classificationMoved.nearMisses) -Baseline @($classificationMoved.classificationBaseline))) `
     'Moving a historical escape to nearMisses did not contradict the visible classification baseline.'
+$classificationDuplicated = Get-LedgerObject -Json $ledgerJson
+$classificationDuplicated.classificationBaseline[-1] = $classificationDuplicated.classificationBaseline[0]
+Assert-Ledger ($null -ne (Get-ClassificationBaselineObjection -Incidents @($classificationDuplicated.incidents) -NearMisses @($classificationDuplicated.nearMisses) -Baseline @($classificationDuplicated.classificationBaseline))) `
+    'Duplicating one baseline entry and dropping another left a historical record unpinned.'
 
 # Two axes, not one. A containment escape is a defect that entered a merged coordinator
 # change; a runtime exposure finding is one that reached shadow or live execution, whether
@@ -1206,6 +1219,7 @@ if ($VerifyCommits) {
             [Parameter(Mandatory)][object]$NearMiss,
             [Parameter(Mandatory)][string]$WindowEnd,
             [Parameter(Mandatory)][string]$ClassificationAnchor,
+            [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$PreservedNearMissIds,
             [Parameter(Mandatory)][string]$RepoRoot
         )
         Register-ValidatorCall -Name 'nearMissBaseline'
@@ -1219,6 +1233,10 @@ if ($VerifyCommits) {
         }
         if (Test-CommitMerged -Sha $introduced -WindowEnd $baseline -RepoRoot $RepoRoot) {
             $reasons.Add("Near miss $($NearMiss.id) was introduced at $introduced, which IS reachable from the mainline commit $baseline it was classified against. A defect already on the mainline is an escape and must be counted against the budget; it cannot be reclassified out of the window by declaring mergedBeforeDetection false.")
+        }
+        if ((Test-CommitMerged -Sha $introduced -WindowEnd $WindowEnd -RepoRoot $RepoRoot) -and
+            $PreservedNearMissIds -notcontains [string]$NearMiss.id) {
+            $reasons.Add("Near miss $($NearMiss.id) is reachable from the current coverage-window end but is not preserved by the digest-verified v1 snapshot. A new finding already in the current window is an escape.")
         }
 
         # The baseline is not chosen, derived, or bounded: it is the snapshot's own anchor.
@@ -1247,6 +1265,7 @@ if ($VerifyCommits) {
         return @($reasons)
     }
 
+    $preservedNearMissIds = @($v1Ledger.nearMisses | ForEach-Object { [string]$_.id })
     foreach ($nearMiss in $nearMisses) {
         $nearMissNames = @($nearMiss.PSObject.Properties | ForEach-Object { $_.Name })
         Assert-Ledger ($nearMissNames -contains 'introducedCommit') `
@@ -1260,7 +1279,7 @@ if ($VerifyCommits) {
         # contains a near miss makes its introducing commit reachable, and the gate would
         # then fail - or, worse, demand that a correctly filed near miss be reclassified as
         # an escape - for no reason other than that time passed.
-        Assert-Ledger ('' -eq ($baselineReasons = @(Test-NearMissBaseline -NearMiss $nearMiss -WindowEnd $windowEnd -ClassificationAnchor ([string]$ledger.previousSnapshot.asOfCommit) -RepoRoot $repoRoot) -join ' ')) `
+        Assert-Ledger ('' -eq ($baselineReasons = @(Test-NearMissBaseline -NearMiss $nearMiss -WindowEnd $windowEnd -ClassificationAnchor ([string]$ledger.previousSnapshot.asOfCommit) -PreservedNearMissIds $preservedNearMissIds -RepoRoot $repoRoot) -join ' ')) `
             $baselineReasons
 
         Assert-RemediationCommit -Finding $nearMiss -RepoRoot $repoRoot
@@ -1346,11 +1365,11 @@ if ($VerifyCommits) {
     $windowStart = [string]$ledger.coverageWindow.startCommit
     $baselineProbe = @(Get-LedgerObject -Json $ledgerJson).nearMisses | Select-Object -First 1
     if ($null -ne $baselineProbe -and -not [string]::IsNullOrWhiteSpace($windowStart)) {
-        Assert-Ledger ((@(Test-NearMissBaseline -NearMiss $baselineProbe -WindowEnd $windowEnd -ClassificationAnchor ([string]$ledger.previousSnapshot.asOfCommit) -RepoRoot $repoRoot)).Count -eq 0) `
+        Assert-Ledger ((@(Test-NearMissBaseline -NearMiss $baselineProbe -WindowEnd $windowEnd -ClassificationAnchor ([string]$ledger.previousSnapshot.asOfCommit) -PreservedNearMissIds $preservedNearMissIds -RepoRoot $repoRoot)).Count -eq 0) `
             'The near-miss baseline validator rejects an unmutated near miss, so it would fail on honest records.'
         $honestBaseline = [string]$baselineProbe.classifiedAgainstCommit
         $baselineProbe.classifiedAgainstCommit = $windowStart
-        Assert-Ledger ((@(Test-NearMissBaseline -NearMiss $baselineProbe -WindowEnd $windowEnd -ClassificationAnchor ([string]$ledger.previousSnapshot.asOfCommit) -RepoRoot $repoRoot)).Count -gt 0) `
+        Assert-Ledger ((@(Test-NearMissBaseline -NearMiss $baselineProbe -WindowEnd $windowEnd -ClassificationAnchor ([string]$ledger.previousSnapshot.asOfCommit) -PreservedNearMissIds $preservedNearMissIds -RepoRoot $repoRoot)).Count -gt 0) `
             "The near-miss baseline validator accepted the coverage window's start commit $windowStart as a baseline. That commit is old enough to make any merged escape look unmerged, so the escape-to-near-miss reclassification would still be available."
 
         # A baseline dated the same day as detection is the cheap version of the same move:
@@ -1360,7 +1379,7 @@ if ($VerifyCommits) {
         $sameDayDecoy = @($windowCommits | Where-Object { $_ -and ((Get-CommitDay -Sha $_ -RepoRoot $repoRoot) -eq [string]$baselineProbe.detectedOn) -and -not $honestBaseline.StartsWith($_) -and -not $_.StartsWith($honestBaseline) } | Select-Object -First 1)
         if ($sameDayDecoy.Count -eq 1) {
             $baselineProbe.classifiedAgainstCommit = [string]$sameDayDecoy[0]
-            Assert-Ledger ((@(Test-NearMissBaseline -NearMiss $baselineProbe -WindowEnd $windowEnd -ClassificationAnchor ([string]$ledger.previousSnapshot.asOfCommit) -RepoRoot $repoRoot)).Count -gt 0) `
+            Assert-Ledger ((@(Test-NearMissBaseline -NearMiss $baselineProbe -WindowEnd $windowEnd -ClassificationAnchor ([string]$ledger.previousSnapshot.asOfCommit) -PreservedNearMissIds $preservedNearMissIds -RepoRoot $repoRoot)).Count -gt 0) `
                 "The near-miss baseline validator accepted $($sameDayDecoy[0]), a commit sharing the detection date but not the mainline as of it. A date bound leaves every commit on that day available, which is enough to reclassify a merged escape."
         }
 
@@ -1368,9 +1387,15 @@ if ($VerifyCommits) {
         # choose an older mainline.
         $baselineProbe.classifiedAgainstCommit = $honestBaseline
         $baselineProbe.detectedOn = '2026-08-01'
-        Assert-Ledger ((@(Test-NearMissBaseline -NearMiss $baselineProbe -WindowEnd $windowEnd -ClassificationAnchor ([string]$ledger.previousSnapshot.asOfCommit) -RepoRoot $repoRoot)).Count -gt 0) `
+        Assert-Ledger ((@(Test-NearMissBaseline -NearMiss $baselineProbe -WindowEnd $windowEnd -ClassificationAnchor ([string]$ledger.previousSnapshot.asOfCommit) -PreservedNearMissIds $preservedNearMissIds -RepoRoot $repoRoot)).Count -gt 0) `
             'The near-miss baseline validator accepted a backdated detectedOn. The baseline is derived from that date, so moving it moves the mainline the unmerged claim is tested against.'
     }
+
+    $newNearMissProbe = Get-LedgerObject -Json ($nearMisses[0] | ConvertTo-Json -Depth 16)
+    $newNearMissProbe.id = 'NM-9999'
+    $newNearMissProbe.introducedCommit = $windowEnd
+    Assert-Ledger ((@(Test-NearMissBaseline -NearMiss $newNearMissProbe -WindowEnd $windowEnd -ClassificationAnchor ([string]$ledger.previousSnapshot.asOfCommit) -PreservedNearMissIds $preservedNearMissIds -RepoRoot $repoRoot)).Count -gt 0) `
+        'A newly filed near miss whose introducing commit is already in the current coverage window was accepted.'
 
     # The reason the near-miss rule reads classifiedAgainstCommit rather than the live
     # window end is not decorative, and this proves it: every near miss's introducing commit
@@ -1527,11 +1552,11 @@ Assert-ValidatorInvoked -Name 'exposure' -Expected ($findingCount + 2) -Rule 'st
 Assert-ValidatorInvoked -Name 'category' -Expected (@($categoryFindings).Count + 4) -Rule 'category anchor'
 Assert-ValidatorInvoked -Name 'exceptionSet' -Expected 2 -Rule 'exception set equality'
 Assert-ValidatorInvoked -Name 'exceptionEntry' -Expected (@($ledger.categoryAnchorExceptions).Count + 2) -Rule 'exception entry'
-$classificationBaselineExpected = if ($VerifyCommits) { 6 } else { 4 }
+$classificationBaselineExpected = if ($VerifyCommits) { 7 } else { 5 }
 Assert-ValidatorInvoked -Name 'classificationBaseline' -Expected $classificationBaselineExpected -Rule 'historical classification baseline'
 if ($VerifyCommits) {
     Assert-ValidatorInvoked -Name 'acceptance' -Expected ($historicalFindingCount + 5) -Rule 'acceptance evidence'
-    Assert-ValidatorInvoked -Name 'nearMissBaseline' -Expected (@($nearMisses).Count + 4) -Rule 'near-miss baseline'
+    Assert-ValidatorInvoked -Name 'nearMissBaseline' -Expected (@($nearMisses).Count + 5) -Rule 'near-miss baseline'
     Assert-ValidatorInvoked -Name 'acceptanceCommit' -Expected ($historicalFindingCount + 1) -Rule 'acceptance commit'
 }
 else {

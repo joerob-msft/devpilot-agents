@@ -284,6 +284,7 @@
       "description": "Pinned identities for the historical records. A record can move lists or change its asserted introducing commit only through a separately reviewed baseline edit, so introducedCommit falsification cannot silently remove an escape from the budget.",
       "type": "array",
       "minItems": 1,
+      "uniqueItems": true,
       "items": {
         "type": "object",
         "additionalProperties": false,
