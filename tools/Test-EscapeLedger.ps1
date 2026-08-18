@@ -674,8 +674,7 @@ function Get-AcceptanceObjection {
 }
 
 foreach ($finding in @(@($incidents) + @($nearMisses))) {
-    $acceptanceObjection = Get-AcceptanceObjection -Finding $finding
-    Assert-Ledger ($null -eq $acceptanceObjection) ([string]$acceptanceObjection)
+    Assert-Ledger ($null -eq ($acceptanceObjection = Get-AcceptanceObjection -Finding $finding)) ([string]$acceptanceObjection)
 }
 
 # The control has to run the production validator, not a restatement of it.
@@ -766,8 +765,7 @@ function Get-CategoryObjection {
 foreach ($incident in $incidents) {
     $implied = Get-DetectorImpliedCategory -Text ([string]$incident.detector) -CollapseRules $collapseRules -ControlFlowRules $controlFlowRules
     if ($null -eq $implied) { $unanchoredIds += [string]$incident.id } else { $categoryDetectorConsistent++ }
-    $objection = Get-CategoryObjection -Incident $incident -CollapseRules $collapseRules -ControlFlowRules $controlFlowRules -CountedCategories $budgetCountedCategories
-    Assert-Ledger ($null -eq $objection) ([string]$objection)
+    Assert-Ledger ($null -eq ($objection = Get-CategoryObjection -Incident $incident -CollapseRules $collapseRules -ControlFlowRules $controlFlowRules -CountedCategories $budgetCountedCategories)) ([string]$objection)
 }
 
 # De-anchoring is itself an edit, so it has to be a visible one. Without this, rewriting an
@@ -791,8 +789,7 @@ function Get-ExceptionSetObjection {
     return $null
 }
 
-$exceptionSetObjection = Get-ExceptionSetObjection -ComputedIds @($unanchoredIds) -DeclaredIds @($declaredExceptionIds)
-Assert-Ledger ($null -eq $exceptionSetObjection) ([string]$exceptionSetObjection)
+Assert-Ledger ($null -eq ($exceptionSetObjection = Get-ExceptionSetObjection -ComputedIds @($unanchoredIds) -DeclaredIds @($declaredExceptionIds))) ([string]$exceptionSetObjection)
 function Get-ExceptionObjection {
     <#
         .SYNOPSIS
@@ -820,8 +817,7 @@ function Get-ExceptionObjection {
 }
 
 foreach ($exception in @($ledger.categoryAnchorExceptions)) {
-    $exceptionObjection = Get-ExceptionObjection -Exception $exception -Incidents @($incidents)
-    Assert-Ledger ($null -eq $exceptionObjection) ([string]$exceptionObjection)
+    Assert-Ledger ($null -eq ($exceptionObjection = Get-ExceptionObjection -Exception $exception -Incidents @($incidents))) ([string]$exceptionObjection)
 }
 
 # The pin has to be able to fail, through the same validator production uses.
@@ -1024,9 +1020,8 @@ if ($VerifyCommits) {
         # contains a near miss makes its introducing commit reachable, and the gate would
         # then fail - or, worse, demand that a correctly filed near miss be reclassified as
         # an escape - for no reason other than that time passed.
-        $baselineReasons = @(Test-NearMissBaseline -NearMiss $nearMiss -WindowEnd $windowEnd -RepoRoot $repoRoot)
-        Assert-Ledger ($baselineReasons.Count -eq 0) `
-            ($baselineReasons -join ' ')
+        Assert-Ledger ('' -eq ($baselineReasons = @(Test-NearMissBaseline -NearMiss $nearMiss -WindowEnd $windowEnd -RepoRoot $repoRoot) -join ' ')) `
+            $baselineReasons
 
         Assert-RemediationCommit -Finding $nearMiss -RepoRoot $repoRoot
     }
@@ -1064,8 +1059,7 @@ if ($VerifyCommits) {
     }
 
     foreach ($accepted in @(@($incidents) + @($nearMisses))) {
-        $acceptanceCommitObjection = Get-AcceptanceCommitObjection -Finding $accepted -WindowEnd $windowEnd -RepoRoot $repoRoot
-        Assert-Ledger ($null -eq $acceptanceCommitObjection) ([string]$acceptanceCommitObjection)
+        Assert-Ledger ($null -eq ($acceptanceCommitObjection = Get-AcceptanceCommitObjection -Finding $accepted -WindowEnd $windowEnd -RepoRoot $repoRoot)) ([string]$acceptanceCommitObjection)
     }
 
     # The acceptance rule exists to stop an open debt being closed by one enum edit, so it has

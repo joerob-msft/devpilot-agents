@@ -191,8 +191,12 @@ its call site — a control invokes the validator directly and cannot see whethe
 does, and replacing a production assertion with an unconditional success left the gate green
 without even moving the check count. Each validator therefore records its entry, and the expected
 number of entries — the production invocations the real ledger requires plus the fixed number of
-control invocations — is asserted. Deleting any of the seven production call sites now fails a
-check that no control can supply.
+control invocations — is asserted. Each call is also written inside the assertion it feeds, so
+neutering the assertion removes the call rather than orphaning it and leaving the count intact.
+Deleting or neutering any of the seven production call sites now fails a check that no control
+can supply. What this does not stop is a deliberate edit that keeps the call and throws its
+verdict away; that residual is named in
+[`hardening-limitations.md`](hardening-limitations.md).
 
 ## Near misses
 

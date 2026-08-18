@@ -29,12 +29,12 @@ wrong input fails:
 | The clock cannot be switched on by asserting an authority | Setting `inForce: true` fails; so does naming an authority the schema version does not define, which is checked separately from the in-force flag |
 | The near-miss baseline is load-bearing | Each near miss's introducing commit is required to be reachable from `HEAD` yet unreachable from its own `classifiedAgainstCommit`, so a baseline that distinguished nothing would fail |
 | The baseline cannot be chosen | The baseline is frozen, not chosen: `classifiedAgainstCommit` must equal the coverage window's own pinned `endCommit`, and `detectedOn` may not precede the introducing commit's day. Controls run the production validator against the window's start commit, against a commit sharing the detection date, and against a backdated `detectedOn`. An earlier attempt derived the baseline from `git rev-list --before` instead; it was removed because it read the window end, so advancing the window silently moved the expected baseline and false-failed both honest near misses |
-| The validators cannot be bypassed at the call site | Extracting each rule into one validator made its body falsifiable but left the call blind: replacing a production assertion with an unconditional success kept every control green and did not even move the check count. Each validator now records its entry, and the expected entry count — production invocations plus the fixed number of control invocations — is asserted. Verified by deleting each of the seven production call sites in turn and confirming the gate fails |
+| The validators cannot be bypassed at the call site | Extracting each rule into one validator made its body falsifiable but left the call blind: replacing a production assertion with an unconditional success kept every control green and did not even move the check count. Each validator now records its entry, and the expected entry count — production invocations plus the fixed number of control invocations — is asserted; the call is also written *inside* the assertion it feeds, so neutering the predicate removes the call and drops the count. Verified at all seven sites, by deleting the call and by replacing the predicate with an unconditional success. A deliberate edit that keeps the call while discarding its result (`Assert-Ledger ((Get-…Objection …) -ne $null -or $true)`) still defeats this; what the counter buys is that the stock "disable this assertion" move no longer works silently |
 | The ancestry rule cannot be opted out of | `introducedCommit` is required by the schema on both lists and its absence is a gate failure, so a finding cannot leave the git check by dropping a field |
 | `category` cannot be edited alone, in either direction | Reclassifying a type-binding escape as `logic` contradicts the collection-collapse detector it cites; classifying an escape into a counted category with no detector implying it fails too, and a control asserts the unanchored escape is the one that would be inflated |
 | De-anchoring an escape is visible, not free | The set of findings whose detector implies no category must equal the ledger's declared `categoryAnchorExceptions`, and each entry pins the category the escape is filed under. Rewriting a detector to escape the anchor therefore requires a matching edit to a reviewed list with a written rationale. It is *not* prevented: an author who rewrites the detector, moves the category to an uncounted one, and declares the exception passes every check, and the published count falls by one. What the gate buys is that the change is three coordinated edits in a reviewed list rather than one silent field |
 | Debt cannot be closed by relabelling it | A finding marked `accepted` must record an `acceptanceRationale` and an `acceptedOnCommit` that is reachable from the window end, descends from the finding's own `introducedCommit`, and is not dated before `detectedOn` — a risk cannot be accepted at a point in the history before the defect existed. A control flips the real open-debt finding to `accepted`, and a second control accepts it at the commit that introduced it |
-| A control cannot outlive the rule it tests | Each rule is one validator called by both the production loop and its control, so deleting the rule's body makes the control fail; and each validator's entry count is asserted, so deleting the production call fails too. Verified for all seven validators — baseline, category, exception set, exception entry, exposure, acceptance and acceptance-commit — in both directions |
+| A control cannot outlive the rule it tests | Each rule is one validator called by both the production loop and its control, so deleting the rule's body makes the control fail; each validator's entry count is asserted, so deleting the production call fails too; and the call is written inside the assertion it feeds, so neutering the assertion also drops the count. Verified for all seven validators — baseline, category, exception set, exception entry, exposure, acceptance and acceptance-commit — in all three directions. It does not stop an edit that deliberately keeps the call and discards its verdict |
 | A runtime exposure cannot be hidden by one field | `executionStage` and `reachedShadowOrLive` are checked as equivalent on both lists, and a control mutates a real near miss to shadow and requires the check to reject it |
 | The budget would fire | Sabotaged ledger copies with qualifying escapes are required to trigger it |
 
@@ -131,11 +131,17 @@ Four residuals are named rather than closed.
   replacing any of four production assertions with unconditional success left the gate green
   *without even moving the check count*. Each validator therefore records its entry, and the
   expected entry count — production invocations plus the fixed number of control invocations —
-  is asserted near the report, so a deleted call fails a check no control can supply. This was
-  verified by deleting each of the seven production call sites in turn. The residual is that
-  the expected counts are hand-maintained: adding a control requires updating the number, and
-  the failure message says so. The unfalsifiable-control shape itself is still not detected
-  automatically; it is caught only by neutering a rule and confirming its control fails.
+  is asserted near the report, so a deleted call fails a check no control can supply. Counting
+  entries alone was still not enough, because six of the seven sites called the validator on
+  one line and asserted its result on the next: neutering the assertion left the call, and so
+  the count, intact. Each call is now written *inside* the assertion it feeds, so the two cannot
+  be separated by a one-line edit. Verified at all seven sites in both forms. Two residuals
+  remain, and neither is closed: an edit that deliberately keeps the call and discards its
+  verdict — `Assert-Ledger ((Get-…Objection …) -ne $null -or $true)` — still disables the rule
+  while satisfying the counter, and the expected counts are hand-maintained, so adding a control
+  requires updating a number (the failure message says so). The unfalsifiable-control shape
+  itself is still not detected automatically; it is caught only by neutering a rule and
+  confirming its control fails.
 - **The check needs git and the switch.** It only runs under `-VerifyCommits`; a schema-only
   validation still sees the booleans as authored. CI runs it with `fetch-depth: 0`, so every
   push gets the ancestry rules, but a local run without the switch does not.
