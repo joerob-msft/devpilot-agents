@@ -142,7 +142,7 @@ change is proven to be only the self-hash, never an orchestration change.
 | Fixture projection | one blinded projection JSON, strict schema + forbidden-key scan |
 | Discovery candidate | verifier only; independently captured, exact source/fixture/model/result-marker binding |
 | Discovery package | verifier only; the SEALED discovery transcript package the candidate was extracted from |
-| Cross-check models | specialist/verifier only; the surrounding configured generalist pair (+ convention specialist) the exact production cycle needs to build that role's input |
+| Cross-check models | every role binds the current distinct generalist pair; specialist/verifier also bind the convention models their exact production cycle needs |
 | Model | one supported id, validated through `Assert-AgentSupportedModel` |
 | Replay snapshot | one digest-bound, non-promotable sealed snapshot |
 | Expected commit / ref / RepoPath | exact HEAD, full `refs/heads/<branch>` resolving to that HEAD, and repository path |
@@ -168,6 +168,9 @@ The conversion requires:
   (and by the replay manifest whenever it records nonzero bindings).
 
 Every declared resource is schema-, path-, SHA-256-, and length-checked.
+Legacy replay manifests with an empty `bindings.models` list are intentionally
+out of scope: materialization requires the replay to bind the configured
+generalist paired with `-SecondGeneralistModel`.
 Oracle/expected fields and oracle-bearing or aliased paths are rejected
 recursively. The output is staged, accepted by `New-AgentReplaySnapshot`, fully
 inventoried in `transformation-manifest.json`, marked read-only, and atomically
@@ -176,7 +179,8 @@ never fills gaps from a live repository or a human-authored guess.
 
 The classified replay sidecar binds the exact config, production prompt, and
 reviewer script hashes. Acquisition rechecks those bindings against the running
-bytes. Specialist acquisition additionally requires both sealed convention and
+bytes. The materializer also requires and binds the current second generalist,
+and extends the classified replay's model binding with it. Specialist acquisition additionally requires both sealed convention and
 fact plans and compares them to the production-generated plans before the model
 boundary; a merely role-labeled placeholder is not accepted.
 
@@ -214,6 +218,7 @@ Until those outputs are independently captured and sealed, readiness is
     -ExpectedReplayManifestFileSha256 <64-hex> `
     -ExpectedConfigSha256 <64-hex> `
     -ExpectedPromptSha256 <64-hex> `
+    -SecondGeneralistModel <second-generalist-model-id> `
     -OutputRoot <new-bundle-directory>
 ```
 
@@ -248,6 +253,7 @@ atomic `CreateNew` lease and may lose to a concurrent caller after Preflight.
     -Role generalist `
     -FixtureProjectionFile <bundle\projection.json> `
     -Model <supported-model-id> `
+    -SecondGeneralistModel <second-generalist-model-id> `
     -ConfigFile <bundle\config\reviewer.config.json> `
     -ReplayRoot <bundle\replay> `
     -ReplaySnapshotName <snapshot-name> `
@@ -258,6 +264,13 @@ atomic `CreateNew` lease and may lose to a concurrent caller after Preflight.
     -ExpectedRef refs/heads/<branch> `
     -OutputRoot <unused-new-output-path>
 ```
+
+Plans, readiness documents, and transcript packages sealed before the
+second-generalist binding was introduced do not satisfy the current v1
+schemas and must be re-acquired; their authenticated manifests cannot be
+upgraded in place. Existing materialized benchmark bundles must be
+re-materialized with `-SecondGeneralistModel`; this changes their pinned replay
+manifest digest.
 
 The verifier's candidate is **derived from sealed discovery evidence, never
 from truth**. The operator produces it with
@@ -327,6 +340,7 @@ Acquire a generalist transcript (generic placeholders; no private identifiers):
     -Role generalist `
     -FixtureProjectionFile <path-to-blinded-projection.json> `
     -Model <supported-model-id> `
+    -SecondGeneralistModel <second-generalist-model-id> `
     -ConfigFile <path-to-reviewer.config.json> `
     -ReplayRoot <path-to-replay-root> `
     -ReplaySnapshotName synthetic-pr `

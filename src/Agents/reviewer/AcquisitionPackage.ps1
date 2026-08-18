@@ -217,6 +217,7 @@ function Assert-ReviewerAcquisitionTranscriptPackage {
     if ([string]$manifest.role -cne [string]$core.role -or
         [string]$manifest.requestedModel -cne [string]$core.requestedModel -or
         [string]$manifest.reportedModel -cne [string]$core.reportedModel -or
+        [string]$manifest.secondGeneralistModel -cne [string]$core.secondGeneralistModel -or
         [string]$manifest.nonce -cne [string]$core.nonce -or
         [string]$manifest.resultMarkerPrefix -cne [string]$core.resultMarkerPrefix -or
         [string]$manifest.terminalStatus -cne [string]$core.terminalStatus) {

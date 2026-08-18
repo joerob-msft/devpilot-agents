@@ -111,13 +111,14 @@ param(
     [Parameter(ParameterSetName = 'Acquire')]
     [string]$DiscoveryReplayRoot,
 
-    # Cross-check model set for the specialist and verifier roles. The reviewer's
+    # Cross-check model set for every role. The reviewer's
     # convention specialist and reciprocal cross-verification are intrinsically a
     # multi-model orchestration: the cycle is configured with a generalist model
     # pair plus a convention specialist model, exactly as production runs it. The
     # acquisition -Model names the ONE role/model whose transcript is captured and
     # sealed; these name the surrounding configured models the cycle needs to build
-    # the exact production input for that one role. Ignored for the generalist role.
+    # the exact production input for that one role. A generalist capture is its
+    # discovery model and still requires the configured second pass.
     [Parameter(ParameterSetName = 'Acquire')]
     [string]$SecondGeneralistModel,
 
@@ -883,23 +884,36 @@ if (-not (Get-Command Assert-AgentSupportedModel -ErrorAction SilentlyContinue))
 }
 [void](Assert-AgentSupportedModel -Model $Model)
 
-if ($Role -eq 'specialist') {
-    if (-not $DiscoveryGeneralistModel) { throw "Specialist acquisition requires -DiscoveryGeneralistModel (the configured generalist first-pass model)." }
-    if (-not $SecondGeneralistModel) { throw "Specialist acquisition requires -SecondGeneralistModel (the configured generalist model pair)." }
-    [void](Assert-AgentSupportedModel -Model $DiscoveryGeneralistModel)
-    [void](Assert-AgentSupportedModel -Model $SecondGeneralistModel)
+$discoveryGeneralistModel = if ($DiscoveryGeneralistModel) { $DiscoveryGeneralistModel } else { $Model }
+if ($Role -ceq 'generalist' -and [string]$discoveryGeneralistModel -cne [string]$Model) {
+    throw 'A generalist acquisition is the discovery generalist; -DiscoveryGeneralistModel may not differ from -Model.'
 }
-elseif ($Role -eq 'verifier') {
-    if (-not $SecondGeneralistModel) { throw "Verifier acquisition requires -SecondGeneralistModel (the second configured generalist model)." }
+if ($Role -ceq 'specialist' -and
+    (-not $PSBoundParameters.ContainsKey('DiscoveryGeneralistModel') -or
+        [string]::IsNullOrWhiteSpace([string]$DiscoveryGeneralistModel))) {
+    throw "Specialist acquisition requires -DiscoveryGeneralistModel (the configured generalist first-pass model)."
+}
+if (-not $SecondGeneralistModel) {
+    throw "$Role acquisition requires -SecondGeneralistModel (the configured second generalist model)."
+}
+[void](Assert-AgentSupportedModel -Model $discoveryGeneralistModel)
+[void](Assert-AgentSupportedModel -Model $SecondGeneralistModel)
+$pairPrimaryModel = if ($Role -ceq 'verifier') { $Model } else { $discoveryGeneralistModel }
+if ([string]$pairPrimaryModel -ceq [string]$SecondGeneralistModel) {
+    throw "$Role acquisition requires two distinct configured generalist models."
+}
+if (-not (Test-AgentGeneralistModelPair -Models @($pairPrimaryModel, $SecondGeneralistModel))) {
+    $requiredPair = Get-AgentGeneralistModelPair
+    throw ("$Role acquisition requires the current configured generalist pairing: " +
+        "$($requiredPair.First) and $($requiredPair.Second).")
+}
+
+if ($Role -eq 'verifier') {
     if (-not $ConventionSpecialistModel) { throw "Verifier acquisition requires -ConventionSpecialistModel (the configured convention specialist model)." }
     if ($ConventionVerifierModel -and ([string]$ConventionVerifierModel -cne [string]$Model)) {
         throw "Verifier acquisition captures exactly the authorized -Model '$Model'; a differing -ConventionVerifierModel '$ConventionVerifierModel' is refused."
     }
-    [void](Assert-AgentSupportedModel -Model $SecondGeneralistModel)
     [void](Assert-AgentSupportedModel -Model $ConventionSpecialistModel)
-    if ([string]$Model -ceq [string]$SecondGeneralistModel) {
-        throw 'Verifier acquisition requires two distinct configured generalist models.'
-    }
     if ([string]$Model -ceq [string]$ConventionSpecialistModel) {
         throw "The convention specialist '$ConventionSpecialistModel' cannot be a verifier; -Model must name one configured generalist."
     }
@@ -942,8 +956,8 @@ if ($Preflight) {
         ValidateConfigurationRole = $Role
         Model = $validationPrimaryModel
     }
+    $configurationValidationArgs['SecondPassModel'] = $SecondGeneralistModel
     if ($Role -cin @('specialist', 'verifier')) {
-        $configurationValidationArgs['SecondPassModel'] = $SecondGeneralistModel
         $configurationValidationArgs['ConventionSpecialistModel'] =
             $(if ($Role -ceq 'specialist') { $Model } else { $ConventionSpecialistModel })
     }
@@ -992,6 +1006,10 @@ if ($Preflight) {
                     ([string]$sidecarCheck.Actual).ToLowerInvariant()) {
                 throw "Preflight benchmark-pack materialization does not bind the supplied $($sidecarCheck.Name)."
             }
+        }
+        if (-not $materialization.PSObject.Properties['secondGeneralistModel'] -or
+            [string]$materialization.secondGeneralistModel -cne [string]$SecondGeneralistModel) {
+            throw 'Preflight benchmark-pack materialization does not bind the supplied secondGeneralistModel.'
         }
     }
     $boundModels = @($validatedReplay.Bindings.Models)
@@ -1408,6 +1426,7 @@ if ($Preflight) {
         createdUtc               = '2000-01-01T00:00:00.0000000Z'
         role                     = $Role
         model                    = $Model
+        secondGeneralistModel    = $SecondGeneralistModel
         fixtureId                = [string]$projection.fixtureId
         fixtureProjectionSha256  = $projectionSha256
         snapshotName             = $ReplaySnapshotName
@@ -1436,6 +1455,7 @@ if ($Preflight) {
         ready = $true
         role = $Role
         model = $Model
+        secondGeneralistModel = $SecondGeneralistModel
         fixture = [ordered]@{
             id = [string]$projection.fixtureId
             projectionPath = $projectionFull
@@ -1538,6 +1558,7 @@ $plan = [ordered]@{
     createdUtc               = [DateTime]::UtcNow.ToString('o')
     role                     = $Role
     model                    = $Model
+    secondGeneralistModel    = $SecondGeneralistModel
     fixtureId                = [string]$projection.fixtureId
     fixtureProjectionSha256  = $projectionSha256
     snapshotName             = $ReplaySnapshotName
@@ -1634,7 +1655,8 @@ try {
         '-Once', '-RepoPath', $RepoRoot,
         '-ConfigFile', $configFull, '-StateDir', $stateDir,
         '-OperatorAlias', $OperatorAlias, '-PullRequestId', "$PullRequestId",
-        '-Model', $childPrimaryModel, '-CycleTimeoutSeconds', "$PerCallTimeoutSeconds",
+        '-Model', $childPrimaryModel, '-SecondPassModel', $SecondGeneralistModel,
+        '-CycleTimeoutSeconds', "$PerCallTimeoutSeconds",
         '-ReplayRoot', $replayRootFull, '-ReplaySnapshotName', $ReplaySnapshotName,
         '-ReplayManifestDigest', $ReplayManifestDigest,
         '-ExpectedReviewerBaseCommit', $ExpectedReviewerBaseCommit.ToLowerInvariant(),
@@ -1643,21 +1665,19 @@ try {
         '-AcquisitionFixtureProjectionFile', $projectionFull,
         '-AcquisitionOutputRoot', $packageDir
     )
-    # -- Role model wiring. The generalist role captures a single static-projection
-    #    model pass (no cycle). The specialist and verifier roles drive the EXACT
+    # -- Role model wiring. Every role carries the hash-bound configured second
+    #    generalist exactly once above. The generalist role captures a single
+    #    static-projection model pass (no cycle). The specialist and verifier drive the EXACT
     #    production cycle under the replay session, so the child is configured with
     #    the surrounding cross-check model set the production orchestration needs to
     #    build the exact input for the one captured role.
     if ($Role -eq 'specialist') {
-        if (-not $SecondGeneralistModel) { throw "Specialist acquisition requires -SecondGeneralistModel (the configured generalist model pair)." }
         $reviewerArgs += @(
-            '-SecondPassModel', $SecondGeneralistModel,
             '-EnableConventionSpecialist', '-ConventionSpecialistModel', $Model,
             '-ConventionSpecialistTimeoutSeconds', "$PerCallTimeoutSeconds"
         )
     }
     elseif ($Role -eq 'verifier') {
-        if (-not $SecondGeneralistModel) { throw "Verifier acquisition requires -SecondGeneralistModel (the second configured generalist model)." }
         if (-not $ConventionSpecialistModel) { throw "Verifier acquisition requires -ConventionSpecialistModel (the configured convention specialist model)." }
         # Blocker B: the verifier captures EXACTLY the authorized -Model. A caller
         # may not redirect the captured verifier assignment to a different model
@@ -1668,7 +1688,6 @@ try {
         }
         $effectiveConventionVerifier = $Model
         $reviewerArgs += @(
-            '-SecondPassModel', $SecondGeneralistModel,
             '-EnableConventionSpecialist', '-ConventionSpecialistModel', $ConventionSpecialistModel,
             '-ConventionSpecialistTimeoutSeconds', "$PerCallTimeoutSeconds",
             '-EnableVerificationPreview', '-ConventionVerifierModel', $effectiveConventionVerifier,
@@ -1800,6 +1819,7 @@ if ($exitCode -eq 0 -and $core) {
         role               = [string]$core.role
         reportedModel      = [string]$core.reportedModel
         requestedModel     = [string]$core.requestedModel
+        secondGeneralistModel = [string]$core.secondGeneralistModel
         nonce              = [string]$core.nonce
         nonceSha256        = [string]$core.nonceSha256
         resultMarkerPrefix = [string]$core.resultMarkerPrefix
@@ -1883,6 +1903,7 @@ else {
         planId         = $planId
         role           = $Role
         requestedModel = $Model
+        secondGeneralistModel = $SecondGeneralistModel
         terminalStatus = $terminalStatus
         supervisor     = $supervisorResult
         telemetry      = $telemetry

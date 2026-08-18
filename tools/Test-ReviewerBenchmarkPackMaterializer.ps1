@@ -165,13 +165,45 @@ function Get-MaterializeArgs {
         '-Role', $Pack.Role, '-RoleProvenanceFile', $Pack.Provenance,
         '-ReplaySnapshotPath', $ReplayPath, '-ConfigFile', $ConfigFile, '-PromptFile', $PromptFile,
         '-ExpectedReplayManifestFileSha256', $manifestSha, '-ExpectedConfigSha256', $configSha,
-        '-ExpectedPromptSha256', $promptSha, '-OutputRoot', $Out, '-RepoRoot', $RepoRoot
+        '-ExpectedPromptSha256', $promptSha, '-SecondGeneralistModel', 'gpt-5.6-sol',
+        '-OutputRoot', $Out, '-RepoRoot', $RepoRoot
     )
 }
 
 try {
     Remove-Tree $runRoot
     New-Item -ItemType Directory -Path $runRoot | Out-Null
+
+    $nonPairSecondPack = New-Pack -Name 'non-pair-second' -Role generalist
+    $nonPairSecondArgs = @(Get-MaterializeArgs $nonPairSecondPack (
+            Join-Path $runRoot 'non-pair-second-out'))
+    $nonPairSecondIndex = [Array]::IndexOf(
+        $nonPairSecondArgs, '-SecondGeneralistModel')
+    $nonPairSecondArgs[$nonPairSecondIndex + 1] = 'gpt-5.6-terra'
+    Invoke-ExpectedFailure 'supported second generalist outside configured pair blocks' {
+        & pwsh -NoProfile -File $Tool @nonPairSecondArgs 2>&1
+    } 'requires one member of the current configured generalist pair'
+
+    $unsupportedSecondPack = New-Pack -Name 'unsupported-second' -Role generalist
+    $unsupportedSecondArgs = @(Get-MaterializeArgs $unsupportedSecondPack (
+            Join-Path $runRoot 'unsupported-second-out'))
+    $unsupportedSecondIndex = [Array]::IndexOf(
+        $unsupportedSecondArgs, '-SecondGeneralistModel')
+    $unsupportedSecondArgs[$unsupportedSecondIndex + 1] = 'unsupported-generalist'
+    Invoke-ExpectedFailure 'unsupported second generalist blocks' {
+        & pwsh -NoProfile -File $Tool @unsupportedSecondArgs 2>&1
+    } 'unsupported model id'
+
+    $missingPairedPack = New-Pack -Name 'missing-paired-generalist' -Role generalist
+    $missingPairedArgs = @(Get-MaterializeArgs $missingPairedPack (
+            Join-Path $runRoot 'missing-paired-generalist-out'))
+    $missingPairedIndex = [Array]::IndexOf(
+        $missingPairedArgs, '-SecondGeneralistModel')
+    $missingPairedArgs[$missingPairedIndex + 1] = 'claude-opus-5'
+    Invoke-ExpectedFailure 'source replay missing paired generalist blocks' {
+        & pwsh -NoProfile -File $Tool @missingPairedArgs 2>&1
+    } "does not bind the paired generalist 'gpt-5.6-sol'"
+
     $bundles = @{}
     foreach ($role in @('generalist', 'specialist', 'verifier')) {
         $pack = New-Pack -Name "pack-$role" -Role $role
@@ -216,6 +248,7 @@ try {
         $env:PATH = ''
         $preflightJson = & $pwshPath -NoProfile -File $Acquire -Preflight -Role generalist `
             -FixtureProjectionFile (Join-Path $generalist.Out 'projection.json') -Model 'claude-opus-5' `
+            -SecondGeneralistModel 'gpt-5.6-sol' `
             -ConfigFile (Join-Path $generalist.Out 'config\reviewer.config.json') `
             -ReplayRoot (Join-Path $generalist.Out 'replay') -ReplaySnapshotName $generalist.Result.replaySnapshotName `
             -ReplayManifestDigest $generalist.Result.replayManifestDigest -ExpectedReviewerBaseCommit $head `
@@ -229,7 +262,9 @@ try {
             "$($_.FullName.Substring($runRoot.Length))|$($_.Length)|$(Sha $_.FullName)"
         } | Sort-Object)
     Check 'Preflight returns typed ready JSON' ($LASTEXITCODE -eq 0 -and [bool]$preflight.ready -and
-        [string]$preflight.kind -ceq 'reviewer-blinded-acquisition-readiness')
+        [string]$preflight.kind -ceq 'reviewer-blinded-acquisition-readiness' -and
+        [string]$preflight.model -ceq 'claude-opus-5' -and
+        [string]$preflight.secondGeneralistModel -ceq 'gpt-5.6-sol')
     Check 'Preflight reports zero side effects' (
         [int]$preflight.sideEffects.planFilesCreated -eq 0 -and [int]$preflight.sideEffects.tokensMinted -eq 0 -and
         [int]$preflight.sideEffects.leasesCreated -eq 0 -and [int]$preflight.sideEffects.processesStarted -eq 0 -and
@@ -237,6 +272,31 @@ try {
     Check 'Preflight creates no output or lease' (-not (Test-Path $preflightOut) -and
         @(Get-ChildItem -LiteralPath $runRoot -Force | Where-Object { $_.Name -match $preflightLeasePattern }).Count -eq 0)
     Check 'Preflight changes no existing byte' (($before -join "`n") -ceq ($after -join "`n"))
+    $generalistTransformation = Get-Content `
+        (Join-Path $generalist.Out 'transformation-manifest.json') -Raw |
+        ConvertFrom-Json -Depth 32
+    $generalistSidecar = Get-Content (Join-Path $generalist.Out `
+            "replay\$($generalist.Result.replaySnapshotName)\benchmark-pack-materialization.json") `
+        -Raw | ConvertFrom-Json -Depth 32
+    Check 'materialized bundle binds the second generalist in manifest and replay sidecar' (
+        [string]$generalistTransformation.output.secondGeneralistModel -ceq 'gpt-5.6-sol' -and
+        [string]$generalistSidecar.secondGeneralistModel -ceq 'gpt-5.6-sol')
+
+    $secondModelTamperBundle = Join-Path $runRoot 'bundle-second-model-tampered'
+    Copy-Item -LiteralPath $generalist.Out -Destination $secondModelTamperBundle -Recurse
+    Get-ChildItem -LiteralPath $secondModelTamperBundle -File -Recurse -Force |
+        ForEach-Object { $_.Attributes = [IO.FileAttributes]::Normal }
+    $tamperedSidecarPath = Join-Path $secondModelTamperBundle `
+        "replay\$($generalist.Result.replaySnapshotName)\benchmark-pack-materialization.json"
+    $tamperedSidecar = Get-Content $tamperedSidecarPath -Raw |
+        ConvertFrom-Json -AsHashtable -Depth 32
+    $tamperedSidecar.secondGeneralistModel = 'gpt-5.6-terra'
+    Write-Utf8 $tamperedSidecarPath (Canon $tamperedSidecar)
+    Invoke-ExpectedFailure 'second-generalist bundle tamper blocks verification' {
+        & pwsh -NoProfile -File $Tool -VerifyOnly -OutputRoot $secondModelTamperBundle `
+            -ExpectedTransformationManifestSha256 $generalist.Result.transformationManifestSha256 `
+            -RepoRoot $RepoRoot 2>&1
+    } 'mismatch'
 
     $substitutedProjection = Join-Path $runRoot 'substituted-projection.json'
     $substitutedProjectionObject = Get-Content (Join-Path $generalist.Out 'projection.json') -Raw |
@@ -246,6 +306,7 @@ try {
     Invoke-ExpectedFailure 'Preflight rejects materialized projection substitution' {
         & $pwshPath -NoProfile -File $Acquire -Preflight -Role generalist `
             -FixtureProjectionFile $substitutedProjection -Model 'claude-opus-5' `
+            -SecondGeneralistModel 'gpt-5.6-sol' `
             -ConfigFile (Join-Path $generalist.Out 'config\reviewer.config.json') `
             -ReplayRoot (Join-Path $generalist.Out 'replay') `
             -ReplaySnapshotName $generalist.Result.replaySnapshotName `
@@ -263,6 +324,7 @@ try {
     Invoke-ExpectedFailure 'Preflight rejects materialized config substitution' {
         & $pwshPath -NoProfile -File $Acquire -Preflight -Role generalist `
             -FixtureProjectionFile (Join-Path $substitutedBundle 'projection.json') -Model 'claude-opus-5' `
+            -SecondGeneralistModel 'gpt-5.6-sol' `
             -ConfigFile $substitutedConfig -ReplayRoot (Join-Path $substitutedBundle 'replay') `
             -ReplaySnapshotName $generalist.Result.replaySnapshotName `
             -ReplayManifestDigest $generalist.Result.replayManifestDigest -ExpectedReviewerBaseCommit $head `
@@ -277,7 +339,8 @@ try {
             -Role generalist -RoleProvenanceFile (Join-Path $missingPack.Root 'does-not-exist.json') `
             -ReplaySnapshotPath $ReplayPath -ConfigFile $ConfigFile -PromptFile $PromptFile `
             -ExpectedReplayManifestFileSha256 $manifestSha -ExpectedConfigSha256 $configSha `
-            -ExpectedPromptSha256 $promptSha -OutputRoot $missingOut -RepoRoot $RepoRoot 2>&1
+            -ExpectedPromptSha256 $promptSha -SecondGeneralistModel 'gpt-5.6-sol' `
+            -OutputRoot $missingOut -RepoRoot $RepoRoot 2>&1
     } 'does not exist'
     Check 'missing provenance rejection writes no bundle' (-not (Test-Path $missingOut))
 
