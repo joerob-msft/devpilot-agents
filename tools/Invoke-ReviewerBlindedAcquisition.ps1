@@ -148,7 +148,7 @@ param(
     [int]$TotalTimeoutSeconds = 300,
 
     [Parameter(ParameterSetName = 'Acquire')]
-    [ValidateRange(10, 3600)]
+    [ValidateRange(10, 7200)]
     [int]$ActivityTimeoutSeconds = 120,
 
     # Production requires a clean worktree at the expected commit. Test harnesses
@@ -187,6 +187,27 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $Utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+$leaseStream = $null
+$configGuardStream = $null
+$SupervisorTeardownMarginSeconds = 30
+$MaximumAttempts = switch ($Role) {
+    'generalist' { 2 }
+    'specialist' { 3 }
+    'verifier' { 1 }
+    default { 1 }
+}
+$minimumTotalTimeoutSeconds = ([long]$PerCallTimeoutSeconds * [long]$MaximumAttempts) +
+    [long]$SupervisorTeardownMarginSeconds
+if ($PSCmdlet.ParameterSetName -eq 'Acquire' -and
+    [long]$TotalTimeoutSeconds -lt $minimumTotalTimeoutSeconds) {
+    throw ("TotalTimeoutSeconds=$TotalTimeoutSeconds cannot cover the bounded $MaximumAttempts " +
+        "attempt(s) at PerCallTimeoutSeconds=$PerCallTimeoutSeconds plus the " +
+        "${SupervisorTeardownMarginSeconds}s teardown margin; require at least " +
+        "$minimumTotalTimeoutSeconds seconds before launch.")
+}
+$EffectiveActivityTimeoutSeconds = [Math]::Max(
+    [int]$ActivityTimeoutSeconds,
+    [int]($PerCallTimeoutSeconds + $SupervisorTeardownMarginSeconds))
 
 # The reviewer child is the Copilot path, not an MCP/provider child. Copilot
 # authenticates with the first available GitHub credential in
@@ -654,6 +675,45 @@ function Test-SealedTerminalEvidence {
 # Supervised child launch (direct files, deadlines, watchdog, tree kill, 124)
 # ---------------------------------------------------------------------------
 
+function Measure-ReviewerSupervisorActivity {
+    param(
+        [Parameter(Mandatory)][hashtable]$State,
+        [Parameter(Mandatory)][string[]]$Paths,
+        [Parameter(Mandatory)][datetime]$NowUtc
+    )
+    $changed = $false
+    foreach ($path in $Paths) {
+        $length = if (Test-Path -LiteralPath $path -PathType Leaf) {
+            [int64](Get-Item -LiteralPath $path).Length
+        }
+        else { 0L }
+        if (-not $State.Lengths.ContainsKey($path)) {
+            $State.Lengths[$path] = $length
+            continue
+        }
+        if ([int64]$State.Lengths[$path] -ne $length) {
+            $State.Lengths[$path] = $length
+            $changed = $true
+        }
+    }
+    if ($changed) { $State.LastActivityUtc = $NowUtc }
+    return $changed
+}
+
+function Get-ReviewerSupervisorTimeoutReason {
+    param(
+        [Parameter(Mandatory)][datetime]$NowUtc,
+        [Parameter(Mandatory)][datetime]$TotalDeadlineUtc,
+        [Parameter(Mandatory)][datetime]$LastActivityUtc,
+        [Parameter(Mandatory)][int]$ActivitySeconds
+    )
+    if ($NowUtc -ge $TotalDeadlineUtc) { return 'totalDeadline' }
+    if (($NowUtc - $LastActivityUtc).TotalSeconds -ge $ActivitySeconds) {
+        return 'activityWatchdog'
+    }
+    return ''
+}
+
 function Invoke-SupervisedReviewer {
     param(
         [Parameter(Mandatory)][string[]]$Arguments,
@@ -661,6 +721,7 @@ function Invoke-SupervisedReviewer {
         [Parameter(Mandatory)][string]$StdErrPath,
         [Parameter(Mandatory)][int]$TotalSeconds,
         [Parameter(Mandatory)][int]$ActivitySeconds,
+        [string[]]$ActivityPaths = @(),
         [hashtable]$Environment = @{},
         [string[]]$EnvironmentVariablesToRemove = @()
     )
@@ -701,8 +762,13 @@ function Invoke-SupervisedReviewer {
     $processId = [int]$proc.Id
     $startedUtc = [DateTime]::UtcNow
     $deadline = $startedUtc.AddSeconds($TotalSeconds)
-    $lastActivityUtc = $startedUtc
-    $lastLength = -1L
+    $allActivityPaths = @($StdOutPath, $StdErrPath) + @($ActivityPaths)
+    $activityState = @{
+        LastActivityUtc = $startedUtc
+        Lengths = @{}
+    }
+    [void](Measure-ReviewerSupervisorActivity -State $activityState `
+            -Paths $allActivityPaths -NowUtc $startedUtc)
     $timedOut = $false
     $timeoutReason = ''
     while ($true) {
@@ -710,14 +776,14 @@ function Invoke-SupervisedReviewer {
         # as the child exits, or after the small slice for a liveness check.
         if ($proc.WaitForExit(250)) { break }
         $nowUtc = [DateTime]::UtcNow
-        if ($nowUtc -ge $deadline) { $timedOut = $true; $timeoutReason = 'totalDeadline'; break }
-        $currentLength = 0L
-        foreach ($p in @($StdOutPath, $StdErrPath)) {
-            if (Test-Path -LiteralPath $p) { $currentLength += [int64](Get-Item -LiteralPath $p).Length }
-        }
-        if ($currentLength -ne $lastLength) { $lastLength = $currentLength; $lastActivityUtc = $nowUtc }
-        elseif (($nowUtc - $lastActivityUtc).TotalSeconds -ge $ActivitySeconds) {
-            $timedOut = $true; $timeoutReason = 'activityWatchdog'; break
+        [void](Measure-ReviewerSupervisorActivity -State $activityState `
+                -Paths $allActivityPaths -NowUtc $nowUtc)
+        $timeoutReason = Get-ReviewerSupervisorTimeoutReason -NowUtc $nowUtc `
+            -TotalDeadlineUtc $deadline -LastActivityUtc ([datetime]$activityState.LastActivityUtc) `
+            -ActivitySeconds $ActivitySeconds
+        if ($timeoutReason) {
+            $timedOut = $true
+            break
         }
     }
     if ($timedOut) {
@@ -1510,6 +1576,13 @@ if ($Preflight) {
         configSha256             = (Get-FileSha256Hex -Path $configFull)
         authorizationTokenSha256 = ('0' * 64)
         nonce                    = ('0' * 32)
+        timeouts                 = [ordered]@{
+            perCallTimeoutSeconds = $PerCallTimeoutSeconds
+            activityTimeoutSeconds = $EffectiveActivityTimeoutSeconds
+            totalTimeoutSeconds = $TotalTimeoutSeconds
+            teardownMarginSeconds = $SupervisorTeardownMarginSeconds
+            maximumAttempts = $MaximumAttempts
+        }
         classification           = [ordered]@{
             blinded = $true; oracleFree = $true; nonPromotable = $true
             writesPermitted = $false; acquisitionOnly = $true
@@ -1545,6 +1618,13 @@ if ($Preflight) {
         config = [ordered]@{
             path = $configFull
             sha256 = (Get-FileSha256Hex -Path $configFull)
+        }
+        supervision = [ordered]@{
+            perCallTimeoutSeconds = $PerCallTimeoutSeconds
+            activityTimeoutSeconds = $EffectiveActivityTimeoutSeconds
+            totalTimeoutSeconds = $TotalTimeoutSeconds
+            teardownMarginSeconds = $SupervisorTeardownMarginSeconds
+            maximumAttempts = $MaximumAttempts
         }
         repository = [ordered]@{
             path = (Resolve-Path -LiteralPath $RepoRoot).Path
@@ -1647,6 +1727,13 @@ $plan = [ordered]@{
     configSha256             = (Get-FileSha256Hex -Path $configFull)
     authorizationTokenSha256 = $authorizationTokenSha256
     nonce                    = $planNonce
+    timeouts                 = [ordered]@{
+        perCallTimeoutSeconds = $PerCallTimeoutSeconds
+        activityTimeoutSeconds = $EffectiveActivityTimeoutSeconds
+        totalTimeoutSeconds = $TotalTimeoutSeconds
+        teardownMarginSeconds = $SupervisorTeardownMarginSeconds
+        maximumAttempts = $MaximumAttempts
+    }
     classification           = [ordered]@{
         blinded         = $true
         oracleFree      = $true
@@ -1739,7 +1826,10 @@ try {
         '-AcquireTranscriptRole', $Role,
         '-AcquisitionPlanFile', $planPath,
         '-AcquisitionFixtureProjectionFile', $projectionFull,
-        '-AcquisitionOutputRoot', $packageDir
+        '-AcquisitionOutputRoot', $packageDir,
+        '-AcquisitionPerCallTimeoutSeconds', "$PerCallTimeoutSeconds",
+        '-AcquisitionActivityTimeoutSeconds', "$EffectiveActivityTimeoutSeconds",
+        '-AcquisitionTotalTimeoutSeconds', "$TotalTimeoutSeconds"
     )
     # -- Role model wiring. Every role carries the hash-bound configured second
     #    generalist exactly once above. The generalist role captures a single
@@ -1810,7 +1900,8 @@ try {
         DEVPILOT_OFFLINE_TELEMETRY_PATH = $telemetryPath
     }
     $supervisorResult = Invoke-SupervisedReviewer -Arguments $reviewerArgs -StdOutPath $stdOutPath `
-        -StdErrPath $stdErrPath -TotalSeconds $TotalTimeoutSeconds -ActivitySeconds $ActivityTimeoutSeconds `
+        -StdErrPath $stdErrPath -TotalSeconds $TotalTimeoutSeconds `
+        -ActivitySeconds $EffectiveActivityTimeoutSeconds -ActivityPaths @($telemetryPath) `
         -Environment $childEnvironment -EnvironmentVariablesToRemove $CopilotSensitiveEnvironmentVariables
 }
 finally {

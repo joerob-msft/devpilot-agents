@@ -173,6 +173,21 @@ function Check {
 }
 
 function Read-Json { param([string]$Path) return (Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 64) }
+function Get-LiveFunctionText {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Name)
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile(
+        $Path, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count -gt 0) { throw "Could not parse '$Path' while extracting '$Name'." }
+    $functionAst = $ast.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq $Name
+        }, $true) | Select-Object -First 1
+    if (-not $functionAst) { throw "Function '$Name' was not found in '$Path'." }
+    return $functionAst.Extent.Text
+}
 
 # Clone the exact-path adapter manifest into its own directory, repoint adapterScript
 # at the real (unchanged) adapter via a RELATIVE path, and mutate the blinded generalist
@@ -408,7 +423,7 @@ function Copy-ResealedPackageWithoutSourceProjection {
 # generalist pair is named separately for the exact production input build.
 function Get-SpecialistArgs {
     param([Parameter(Mandatory)][string]$Out, [Parameter(Mandatory)][string]$Manifest,
-        [string]$Model = 'claude-sonnet-5', [int]$PerCall = 45, [int]$Total = 160, [int]$Activity = 60)
+        [string]$Model = 'claude-sonnet-5', [int]$PerCall = 45, [int]$Total = 165, [int]$Activity = 60)
     return @(
         '-Role', 'specialist', '-FixtureProjectionFile', $spProjection, '-Model', $Model,
         '-ConfigFile', $spConfigFile, '-ReplayRoot', $conventionReplayRoot,
@@ -434,7 +449,10 @@ function Invoke-ChildDirect {
         [string]$AdapterManifest,
         [string]$RepoPathOverride, [string]$OutputRootOverride, [string]$StateDirOverride,
         [string]$Config = $configFile, [switch]$EnableSpecialist,
-        [string]$SpecialistModel
+        [string]$SpecialistModel,
+        [int]$PerCallTimeoutOverride = 0,
+        [int]$ActivityTimeoutOverride = 0,
+        [int]$TotalTimeoutOverride = 0
     )
     $man = if ($AdapterManifest) { $AdapterManifest } else { $baseManifest }
     $od = if ($OutputRootOverride) { $OutputRootOverride } else { $p = New-OutDir ("direct_" + $Label); Remove-Tree $p; New-Item -ItemType Directory -Force -Path $p | Out-Null; $p }
@@ -442,20 +460,33 @@ function Invoke-ChildDirect {
     New-Item -ItemType Directory -Force -Path $st | Out-Null
     $rp = if ($RepoPathOverride) { $RepoPathOverride } else { $RepoRoot }
     $tp = Join-Path $runRoot ("directtel_" + $Label + ".jsonl")
+    $directPlan = Read-Json $PlanFile
+    $directPerCall = if ($PerCallTimeoutOverride -gt 0) {
+        $PerCallTimeoutOverride
+    } else { [int]$directPlan.timeouts.perCallTimeoutSeconds }
+    $directActivity = if ($ActivityTimeoutOverride -gt 0) {
+        $ActivityTimeoutOverride
+    } else { [int]$directPlan.timeouts.activityTimeoutSeconds }
+    $directTotal = if ($TotalTimeoutOverride -gt 0) {
+        $TotalTimeoutOverride
+    } else { [int]$directPlan.timeouts.totalTimeoutSeconds }
     $childArgs = @(
         '-NoProfile', '-File', $reviewerScript, '-Once', '-RepoPath', $rp,
         '-ConfigFile', $Config, '-StateDir', $st, '-OperatorAlias', 'acquisition-operator',
-        '-PullRequestId', '4242', '-Model', $Model, '-CycleTimeoutSeconds', '45',
+        '-PullRequestId', '4242', '-Model', $Model, '-CycleTimeoutSeconds', "$directPerCall",
         '-SecondPassModel', 'gpt-5.6-sol',
         '-ReplayRoot', $replayRoot, '-ReplaySnapshotName', 'synthetic-pr', '-ReplayManifestDigest', $digest,
         '-ExpectedReviewerBaseCommit', $expectedBase,
         '-AcquireTranscriptRole', 'generalist', '-AcquisitionPlanFile', $PlanFile,
-        '-AcquisitionFixtureProjectionFile', $Projection, '-AcquisitionOutputRoot', $od
+        '-AcquisitionFixtureProjectionFile', $Projection, '-AcquisitionOutputRoot', $od,
+        '-AcquisitionPerCallTimeoutSeconds', "$directPerCall",
+        '-AcquisitionActivityTimeoutSeconds', "$directActivity",
+        '-AcquisitionTotalTimeoutSeconds', "$directTotal"
     )
     if ($EnableSpecialist) {
         $childArgs += @(
             '-EnableConventionSpecialist', '-ConventionSpecialistModel', $SpecialistModel,
-            '-ConventionSpecialistTimeoutSeconds', '45')
+            '-ConventionSpecialistTimeoutSeconds', "$directPerCall")
     }
     if ($ForbiddenTelemetryOnly) {
         $childArgs += @('-OfflineTelemetryPath', $tp)
@@ -1234,6 +1265,12 @@ $successOpusPlan = Read-Json (Join-Path (New-OutDir 'beh_successOpus') 'work\acq
 Check 'authored generalist plan hash-binds the second model' (
     [string]$successOpusPlan.model -ceq 'claude-opus-5' -and
     [string]$successOpusPlan.secondGeneralistModel -ceq 'gpt-5.6-sol')
+Check 'authored plan hash-binds bounded supervision timeouts' (
+    [int]$successOpusPlan.timeouts.perCallTimeoutSeconds -eq 30 -and
+    [int]$successOpusPlan.timeouts.activityTimeoutSeconds -eq 60 -and
+    [int]$successOpusPlan.timeouts.totalTimeoutSeconds -eq 90 -and
+    [int]$successOpusPlan.timeouts.teardownMarginSeconds -eq 30 -and
+    [int]$successOpusPlan.timeouts.maximumAttempts -eq 2)
 $verificationEnabledPlan = Read-Json (
     Join-Path $verificationEnabledOut 'work\acquisition-plan.json')
 Check 'verification-enabled plan hash-binds specialist enable and model' (
@@ -1249,34 +1286,71 @@ $genWrong = Read-Json (Join-Path (New-OutDir 'beh_wrongBinding') 'package\transc
 Assert-ExactAttempt -Attempt (@($genWrong.attempts)[-1]) -Label 'generalist wrongBinding' -ExpectStatus 'wrongBinding' -ExpectRetryable $false
 
 # ---------------------------------------------------------------------------
-# Group D - Hanging grandchild -> per/total deadline -> exit 124 + tree kill
+# Group D - Activity supervision and bounded timeout declaration
 # ---------------------------------------------------------------------------
-Write-Host "`n== Group D: hanging grandchild timeout ==" -ForegroundColor Cyan
+Write-Information "`n== Group D: bounded activity supervision ==" -InformationAction Continue
+
+# Exercise the live deadline/activity helpers without any model or provider. A
+# retry telemetry event is child activity even when stdout/stderr are unchanged.
+. ([scriptblock]::Create((Get-LiveFunctionText -Path $tool -Name 'Measure-ReviewerSupervisorActivity')))
+. ([scriptblock]::Create((Get-LiveFunctionText -Path $tool -Name 'Get-ReviewerSupervisorTimeoutReason')))
+$supervisionDir = Join-Path $runRoot 'supervision-unit'
+New-Item -ItemType Directory -Force -Path $supervisionDir | Out-Null
+$supervisionOut = Join-Path $supervisionDir 'stdout.log'
+$supervisionErr = Join-Path $supervisionDir 'stderr.log'
+$supervisionTelemetry = Join-Path $supervisionDir 'telemetry.jsonl'
+[IO.File]::WriteAllText($supervisionOut, 'first attempt failed')
+[IO.File]::WriteAllText($supervisionErr, '')
+[IO.File]::WriteAllText($supervisionTelemetry, '{"event":"process.exited"}' + "`n")
+$t0 = [datetime]'2026-01-01T00:00:00Z'
+$activityState = @{ LastActivityUtc = $t0; Lengths = @{} }
+$activityPaths = @($supervisionOut, $supervisionErr, $supervisionTelemetry)
+[void](Measure-ReviewerSupervisorActivity -State $activityState -Paths $activityPaths -NowUtc $t0)
+$retryStart = $t0.AddSeconds(64)
+[IO.File]::AppendAllText($supervisionTelemetry, '{"event":"process.started","data":{"role":"model"}}' + "`n")
+$retryActivity = Measure-ReviewerSupervisorActivity -State $activityState `
+    -Paths $activityPaths -NowUtc $retryStart
+$beforeFullWindow = Get-ReviewerSupervisorTimeoutReason -NowUtc $retryStart.AddSeconds(89) `
+    -TotalDeadlineUtc $t0.AddSeconds(300) -LastActivityUtc $activityState.LastActivityUtc `
+    -ActivitySeconds 90
+Check 'retry process.started telemetry resets the activity deadline' (
+    $retryActivity -and [datetime]$activityState.LastActivityUtc -eq $retryStart -and
+    -not $beforeFullWindow)
+$silentRetryTimeout = Get-ReviewerSupervisorTimeoutReason -NowUtc $retryStart.AddSeconds(90) `
+    -TotalDeadlineUtc $t0.AddSeconds(300) -LastActivityUtc $activityState.LastActivityUtc `
+    -ActivitySeconds 90
+Check 'silent retry times out at the effective per-call plus teardown bound' (
+    [string]$silentRetryTimeout -ceq 'activityWatchdog')
+$assistantTurn = $retryStart.AddSeconds(80)
+[IO.File]::AppendAllText($supervisionTelemetry, '{"event":"assistant.turn"}' + "`n")
+$assistantActivity = Measure-ReviewerSupervisorActivity -State $activityState `
+    -Paths $activityPaths -NowUtc $assistantTurn
+Check 'telemetry growth from an assistant turn counts as child activity' (
+    $assistantActivity -and [datetime]$activityState.LastActivityUtc -eq $assistantTurn)
+$hardCap = Get-ReviewerSupervisorTimeoutReason -NowUtc $t0.AddSeconds(300) `
+    -TotalDeadlineUtc $t0.AddSeconds(300) -LastActivityUtc $t0.AddSeconds(299) `
+    -ActivitySeconds 90
+Check 'total hard cap wins despite recent activity' ([string]$hardCap -ceq 'totalDeadline')
+$supervisorText = Get-LiveFunctionText -Path $tool -Name 'Invoke-SupervisedReviewer'
+Check 'live supervisor includes declared telemetry activity paths' (
+    $supervisorText -match 'ActivityPaths' -and
+    $supervisorText -match 'Measure-ReviewerSupervisorActivity')
+
+# An impossible timeout declaration fails before any lease, plan or process.
 $toOut = New-OutDir 'beh_timeout'
 $toMan = New-VariantManifest -Tag 'timeout' -Behavior 'timeout' -RoleExtra @{ delaySeconds = 45 }
 $to = Invoke-Tool -ToolArgs (Get-CommonArgs -Out $toOut -Role generalist -Projection $genProjection -Model claude-opus-5 -Manifest $toMan -PerCall 30 -Total 12 -Activity 10) -LogName 'beh-timeout.log'
-Check 'timeout exit=124' ($to.Exit -eq 124) ("got=$($to.Exit)")
-Check 'timeout leaves no sealed package' (-not (Test-Path -LiteralPath (Join-Path $toOut 'package\transcript-package.json')))
-$tePath = Join-Path $toOut 'package\terminal-evidence.json'
-Check 'timeout writes terminal evidence' (Test-Path -LiteralPath $tePath)
-if (Test-Path -LiteralPath $tePath) {
-    $te = Read-Json $tePath
-    Check 'timeout terminalStatus=timeout' ([string]$te.terminalStatus -eq 'timeout') ("got=$([string]$te.terminalStatus)")
-    Check 'timeout evidence binds second generalist' (
-        [string]$te.secondGeneralistModel -ceq 'gpt-5.6-sol') (
-        "got='$([string]$te.secondGeneralistModel)'")
-    $teTelemetryFile = @($te.files | Where-Object { [string]$_.name -ceq 'telemetry.jsonl' })
-    Check 'timeout evidence proves zero real-model and binds telemetry sink' `
-        ([int]$te.telemetry.realModelStarts -eq 0 -and
-        [bool]$te.telemetry.fileExists -and [int]$te.telemetry.totalEvents -gt 0 -and
-        $teTelemetryFile.Count -eq 1 -and
-        [int64]$teTelemetryFile[0].bytes -eq [int64]$te.telemetry.sinkBytes -and
-        [string]$teTelemetryFile[0].sha256 -ceq [string]$te.telemetry.sinkSha256)
-    $childPid = [int]$te.supervisor.ProcessId
-    $alive = $null
-    try { $alive = Get-Process -Id $childPid -ErrorAction SilentlyContinue } catch { $alive = $null }
-    Check 'timeout recursively killed the owned tree (child pid gone)' ($null -eq $alive) ("pid=$childPid")
-}
+Check 'undersized total timeout is refused before launch' (
+    $to.Exit -ne 0 -and -not (Test-Path -LiteralPath $toOut) -and
+    (Get-Content -LiteralPath $to.Log -Raw) -match 'cannot cover the bounded')
+$advertisedOut = New-OutDir 'invalid_900_inner'
+$advertisedArgs = Get-SpecialistArgs -Out $advertisedOut -Manifest $toMan `
+    -PerCall 900 -Total 300 -Activity 300
+$advertisedArgs += '-Preflight'
+$advertised = Invoke-Tool -ToolArgs $advertisedArgs -LogName 'invalid-900-inner.log'
+Check 'preflight cannot advertise a 900s inner timeout under 300s outer bounds' (
+    $advertised.Exit -ne 0 -and -not (Test-Path -LiteralPath $advertisedOut) -and
+    (Get-Content -LiteralPath $advertised.Log -Raw) -match 'require at least 2730')
 
 # ---------------------------------------------------------------------------
 # Group E - Seal integrity: intact / tamper / missing / cross-substitution
@@ -2006,6 +2080,39 @@ else {
         Check 'direct child with a TAMPERED plan refuses (blocker C)' (($c1.Exit -ne 0) -and -not $c1.Captured) ("exit=$($c1.Exit)")
         Check 'tampered-plan cites a tampered/replayed plan' ($c1.Log -match 'tampered or replayed') ''
 
+        $timeoutTamperPlan = Join-Path $runRoot 'plan-timeout-tampered.json'
+        $timeoutTamperText = [IO.File]::ReadAllText($kcPlan, $u8)
+        $originalActivityTimeout = [int]$kcPlanObj.timeouts.activityTimeoutSeconds
+        $timeoutTamperText = $timeoutTamperText.Replace(
+            '"activityTimeoutSeconds": ' + $originalActivityTimeout,
+            '"activityTimeoutSeconds": ' + ($originalActivityTimeout + 1))
+        [IO.File]::WriteAllText($timeoutTamperPlan, $timeoutTamperText, $u8)
+        Copy-Item -LiteralPath $kcSig -Destination "$timeoutTamperPlan.sig" -Force
+        $timeoutTamper = Invoke-ChildDirect -Label 'tamperedTimeoutPlan' `
+            -PlanFile $timeoutTamperPlan -Projection $genProjection `
+            -Env @{ REVIEWER_ACQUISITION_TOKEN = $knownToken }
+        Check 'timeout-field plan tamper is HMAC-refused before launch' (
+            $timeoutTamper.Exit -ne 0 -and -not $timeoutTamper.Captured -and
+            $timeoutTamper.Log -match 'tampered or replayed')
+
+        $resignedTimeoutPlan = Join-Path $runRoot 'plan-timeout-resigned.json'
+        [IO.File]::WriteAllText($resignedTimeoutPlan, $timeoutTamperText, $u8)
+        $resignedTimeoutSignature = [ordered]@{
+            schemaVersion = 1
+            kind = 'reviewer-blinded-acquisition-plan-signature'
+            algorithm = 'HMACSHA256'
+            signature = (Get-TestPlanHmacHex -Text $timeoutTamperText -Token $knownToken)
+        }
+        [IO.File]::WriteAllText("$resignedTimeoutPlan.sig",
+            ($resignedTimeoutSignature | ConvertTo-Json -Depth 8), $u8)
+        $resignedTimeout = Invoke-ChildDirect -Label 'resignedTimeoutPlan' `
+            -PlanFile $resignedTimeoutPlan -Projection $genProjection `
+            -ActivityTimeoutOverride $originalActivityTimeout `
+            -Env @{ REVIEWER_ACQUISITION_TOKEN = $knownToken }
+        Check 're-signed timeout substitution fails the runtime plan binding' (
+            $resignedTimeout.Exit -ne 0 -and -not $resignedTimeout.Captured -and
+            $resignedTimeout.Log -match 'does not match the signed plan timeout binding')
+
         # Even a correctly re-signed plan cannot substitute the second model: the
         # child binds that authenticated field to its one configured argv value.
         $c1SecondPlan = Join-Path $runRoot 'plan-second-substituted.json'
@@ -2190,15 +2297,11 @@ if (Test-Path -LiteralPath $gptCore) {
 }
 else { Check 'cross-substitution prerequisite (beh_successGpt) present' $false 'missing gpt package' }
 
-# M3 - the HMAC-authenticated TIMEOUT terminal evidence rejects seal tamper and
-#      nested injection; every timeout artifact is read-only.
+# M3 - an impossible timeout declaration fails before mutation, so there is no
+#      unauthenticated partial terminal package to mistake for run evidence.
 $toPkgDir = Join-Path (New-OutDir 'beh_timeout') 'package'
-if (Test-Path -LiteralPath (Join-Path $toPkgDir 'terminal-evidence.json')) {
-    $toRo = @(Get-ChildItem -LiteralPath $toPkgDir -File -Recurse -Force | Where-Object { -not ($_.Attributes -band [IO.FileAttributes]::ReadOnly) })
-    Check 'timeout terminal artifacts are read-only' ($toRo.Count -eq 0) ("writable=$($toRo.Count)")
-    Test-TerminalEvidenceTamper -SrcPackageDir $toPkgDir -Name 'timeout'
-}
-else { Check 'timeout terminal-evidence prerequisite present' $false 'missing timeout evidence' }
+Check 'invalid timeout declaration leaves no terminal evidence package' (
+    -not (Test-Path -LiteralPath (Join-Path $toPkgDir 'terminal-evidence.json')))
 
 # M4 - the HMAC-authenticated CRASH terminal evidence rejects seal tamper and
 #      nested injection. The wrong-snapshot child (Group B) crashes at replay

@@ -4,7 +4,7 @@
   "title": "Reviewer blinded acquisition readiness",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "kind", "ready", "role", "model", "secondGeneralistModel", "conventionSpecialistEnabled", "conventionSpecialistModel", "fixture", "replay", "config", "repository", "candidate", "output", "checks", "sideEffects"],
+  "required": ["schemaVersion", "kind", "ready", "role", "model", "secondGeneralistModel", "conventionSpecialistEnabled", "conventionSpecialistModel", "fixture", "replay", "config", "supervision", "repository", "candidate", "output", "checks", "sideEffects"],
   "properties": {
     "schemaVersion": { "const": 1 },
     "kind": { "const": "reviewer-blinded-acquisition-readiness" },
@@ -49,6 +49,18 @@
       "properties": {
         "path": { "type": "string", "minLength": 1 },
         "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "supervision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["perCallTimeoutSeconds", "activityTimeoutSeconds", "totalTimeoutSeconds", "teardownMarginSeconds", "maximumAttempts"],
+      "properties": {
+        "perCallTimeoutSeconds": { "type": "integer", "minimum": 5, "maximum": 3600 },
+        "activityTimeoutSeconds": { "type": "integer", "minimum": 10, "maximum": 7200 },
+        "totalTimeoutSeconds": { "type": "integer", "minimum": 10, "maximum": 7200 },
+        "teardownMarginSeconds": { "const": 30 },
+        "maximumAttempts": { "type": "integer", "minimum": 1, "maximum": 3 }
       }
     },
     "repository": {
