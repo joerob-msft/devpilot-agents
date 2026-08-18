@@ -26,6 +26,10 @@ wrong input fails:
 | A test stub cannot silence a rule | A cross-file gate builds a producer, a consumer, and a same-named unprotected mock and requires identical `PSEN011` findings with and without the mock; reverting the fix makes it fail |
 | The coverage clock is derived, not asserted | The sabotage checks re-run the real derivation on a mutated ledger, with a positive control on the unmutated one |
 | A merged escape cannot be reclassified out of the budget | Moving a merged incident into `nearMisses` fails the git ancestry check, with both directions probed against real cited commits |
+| The clock cannot be switched on by asserting an authority | Setting `inForce: true` fails; so does naming an authority the schema version does not define, which is checked separately from the in-force flag |
+| The near-miss baseline is load-bearing | Each near miss's introducing commit is required to be reachable from `HEAD` yet unreachable from its own `classifiedAgainstCommit`, so a baseline that distinguished nothing would fail |
+| The ancestry rule cannot be opted out of | `introducedCommit` is required by the schema on both lists and its absence is a gate failure, so a finding cannot leave the git check by dropping a field |
+| `category` cannot be edited alone | Reclassifying a type-binding escape as `logic` contradicts the collection-collapse detector it cites and fails; a probe asserts the anchor actually bites on a type-binding escape |
 | The budget would fire | Sabotaged ledger copies with qualifying escapes are required to trigger it |
 
 A gate without a negative control proves that its own happy path still runs. That is worth
@@ -34,13 +38,58 @@ change *were* of that kind — one structurally always true, two tautological �
 recorded as `NM-0002` rather than quietly repaired, because "the negative control was not
 negative" is the failure mode this whole page is about.
 
-One classification is checked against git rather than against itself. Whether a defect is
-an escape or a near miss decides what the budget counts, so it cannot rest on an author's
-boolean: under `-VerifyCommits`, an escape's `introducedCommit` must be reachable from the
-coverage window's end commit and a near miss's must not. Reclassifying a merged escape into
-`nearMisses` fails on that ancestry, not on its prose. The residual limitation is that this
-check needs git and only runs under `-VerifyCommits`; a schema-only validation still sees
-the booleans as authored.
+One classification is checked against git, but git contradicts it rather than establishing
+it. Whether a defect is an escape or a near miss decides what the budget counts, so it
+cannot rest on an author's boolean: under `-VerifyCommits`, an escape's `introducedCommit`
+must be reachable from the coverage window's end commit, and a near miss's must not be
+reachable from the fixed `classifiedAgainstCommit` it was filed against. Reclassifying a
+merged escape into `nearMisses` fails on that ancestry, not on its prose.
+
+Four residuals are named rather than closed.
+
+- **Reachability is not presence.** That a commit is in a history does not establish that the
+  defective state entered an integrated coordinator revision before it was detected. A squash
+  or cherry-pick lands the same defect under a different hash, so a real escape can look
+  unmerged. A non-squash merge of a branch that both introduced and fixed a defect makes both
+  commits reachable, so a genuine near miss can look merged. A defect on an operational side
+  branch is reachable from neither. An ancestry *failure* is therefore proof of a misfiling;
+  an ancestry *pass* leaves the classification resting on the recorded rationale. Closing this
+  properly needs a recorded integration revision in which the defect was actually present,
+  checked against named operational refs — deferred, not done.
+- **The baseline is authored.** `classifiedAgainstCommit` is pinned so that merging a change
+  cannot retroactively reclassify the near misses it contains, but the pin itself is chosen by
+  the author. It is constrained — it must lie on the mainline the coverage window describes,
+  and a commit the ledger records as merged must be reachable from it — which blocks the naive
+  attack of picking a baseline predating everything, but it is not proof.
+- **`introducedCommit`'s value is not tied to the defect.** Ancestry checks *where* a commit
+  sits, not that it is the right commit. Naming a different real commit on the correct side of
+  the boundary passes. The obvious anchor — requiring the introducing commit to touch a file
+  the remediating commit also touches — was tried and rejected because it produces a false
+  failure on correctly filed data: `ESC-0006`'s defect was remediated in
+  `src/Agents/reviewer/SourceTransport.ps1`, a file extracted from
+  `Start-ReviewerAgent.ps1` in `b563d1b`, long after the commit that introduced the code. A
+  rule needing a per-incident exemption list to stay green is the fail-open shape this page
+  exists to name, so the gap is published instead.
+- **`category` is corroborated, not derived.** What a defect "was" is a judgement. The gate
+  holds the category consistent with the detector the incident cites — a collection-collapse
+  rule (`PSEN004`/`PSEN009`/`PSEN011`, or the cardinality boundary harness) implies
+  `typeBinding`, a control-flow rule (`PSEN003`/`PSEN006`/`PSEN010`) implies `logic` — so
+  walking the trigger count down now requires editing two mutually corroborating fields and
+  leaving a visible contradiction with the incident's own prose. It raises the cost of a quiet
+  edit; it does not make the assignment checkable. Eleven of twelve escapes are anchored this
+  way and the count is published as `categoryAnchored`; `ESC-0011` is a supervision finding
+  detected by review, with no detector to anchor to.
+- **The check needs git and the switch.** It only runs under `-VerifyCommits`; a schema-only
+  validation still sees the booleans as authored. CI runs it with `fetch-depth: 0`, so every
+  push gets the ancestry rules, but a local run without the switch does not.
+- **The clock is hand-maintained.** See below.
+
+Because reachability cannot settle it, the near-miss category is not allowed to swallow
+runtime evidence. `reachedShadowOrLive` is deliberately *not* pinned false for near misses:
+a defect can reach shadow or live execution without ever merging, and a taxonomy that could
+not express that would drop the strongest available evidence for the typed-host decision on
+a technicality. Containment escapes and runtime exposure findings are counted on separate
+axes and both are published; only the first is budget evidence.
 
 ## Known false negatives are fixed; blind spots are not
 
@@ -80,8 +129,17 @@ them otherwise:
   coordinator changes or forty. The ordinals are authored, so the honest statement is that
   the clock is **hand-maintained**, not that it lags predictably. The budget is therefore
   recorded as **built but not in force**, and the gate refuses to let it be declared in
-  force while `clockAuthority` is `authoredOrdinals`. Gate 5 must supply an authoritative
-  current ordinal and date rather than reading this clock as current.
+  force while `clockAuthority` is `authoredOrdinals`. Only that one authority is defined in
+  this schema version, deliberately: an earlier form of the rule accepted any other authority
+  and blessed the in-force claim on sight, so two string edits — name a registry that does not
+  exist, set the flag — produced a green but still authority-free clock. A new authority may
+  be named only in the change that also adds the data it reads and the checks that establish
+  that data is current. The counts themselves carry `operationalStatus: historicalSnapshot`
+  and `asOfCommit` in the machine-readable budget, so a parser cannot lift them without the
+  caveat. Gate 5 must supply an authoritative current ordinal and date rather than reading
+  this clock as current. The trigger is nonetheless pre-registered rather than deferred,
+  because fixing a threshold before any run exists to read is what stops it moving after
+  results are seen.
 
 ## Built here versus adopted
 

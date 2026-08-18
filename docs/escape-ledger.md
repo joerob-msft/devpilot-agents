@@ -17,11 +17,45 @@ claim** — a gate that could not fail, a detector that reported green without c
 count that was wrong in a document someone would act on. An ordinary bug found in review,
 including in test code, is not a near miss.
 
-The classification is not taken on trust. "Merged" is a git fact, so under `-VerifyCommits`
-an escape's `introducedCommit` must be reachable from the coverage window's end commit and
-a near miss's must not. Moving a merged incident into `nearMisses` to drop it out of the
-type-binding total therefore fails on ancestry rather than on prose, and the rule is probed
-in both directions against commits the ledger already cites.
+The classification is authored, and git is used to contradict it rather than to establish
+it. Under `-VerifyCommits` an escape's `introducedCommit` must be reachable from the
+coverage window's end commit, and a near miss's must not be reachable from the mainline
+commit it was **classified against** — a fixed `classifiedAgainstCommit`, not the live
+window end, so that merging the change containing a near miss cannot retroactively
+reclassify it. Moving a merged incident into `nearMisses` to drop it out of the type-binding
+total therefore fails on ancestry rather than on prose, and the rule is probed in both
+directions against commits the ledger already cites.
+
+That is a one-way check, and worth being precise about what it does not do. Reachability
+shows a commit is in a history; it does not show that the defective state entered an
+integrated revision before detection. A squash or cherry-pick lands the same defect under a
+different hash, a non-squash merge of a branch that both introduced and fixed a defect makes
+each commit reachable, and a defect on an operational side branch is reachable from neither.
+So an ancestry failure proves a misfiling, while an ancestry pass leaves the classification
+resting on the recorded rationale. `introducedCommit` is required on both lists precisely so
+that a finding cannot leave the check by omitting a field, but its *value* is not tied to the
+defect it names. [`hardening-limitations.md`](hardening-limitations.md) carries these as named
+residuals.
+
+`category` is the field with the most leverage over the pivot decision, because the trigger
+counts type-binding escapes. It cannot be derived — what a defect was is a judgement — so it
+is corroborated instead: an incident detected by a collection-collapse rule
+(`PSEN004`, `PSEN009`, `PSEN011`, or the cardinality boundary harness) must be `typeBinding`,
+and one detected by a control-flow rule (`PSEN003`, `PSEN006`, `PSEN010`) must be `logic`.
+Walking the count down therefore takes two mutually corroborating edits and leaves a visible
+contradiction with the incident's own prose, rather than one quiet field change. Eleven of the
+twelve escapes are anchored this way; `ESC-0011` was found by review of a guard and has no
+detector to anchor to. This raises the cost of misfiling — it does not make the assignment
+checkable, and the limitations page says so.
+
+Escapes are counted on one axis and runtime exposure on another. A *containment escape* is a
+defect that entered a merged coordinator change; a *runtime exposure finding* is one that
+reached shadow or live execution, whether or not it ever merged. Only the first is budget
+evidence, but the second is what the typed-host decision most wants to read, so the near-miss
+schema deliberately does **not** pin `reachedShadowOrLive` closed. Pinning it would make the
+taxonomy unable to represent a pre-merge live failure at all, which is a way of not counting
+it. Both counts are published; today both are zero, because no shadow or live run has ever
+been performed.
 
 The machine-readable ledger is [`escape-ledger.v1.json`](escape-ledger.v1.json), validated
 against
@@ -156,9 +190,28 @@ rather than passing silently.
 > typed control-plane pivot stops being optional and is scheduled as the next coordinator
 > change.
 
-Current state: **0 qualifying escapes, trigger not fired.**
+**Read the state below as a dated snapshot, not as a live reading.** The window clock is
+hand-maintained — `coordinatorChangesObserved` advances only when an incident carries a
+higher ordinal, so an incident-free coordinator change does not move it. The machine-readable
+budget says so in its own `operationalStatus: historicalSnapshot` and `asOfCommit` fields, so
+a parser cannot pick up the counts without the caveat attached, and the gate refuses to let
+the prerequisite be declared in force while the clock's authority is authored ordinals.
 
-The window is computed, not asserted. Every incident carries the date it was detected and
+Current state, as of the coverage window's end commit: **0 qualifying escapes, trigger not
+fired.** That is because no shadow or live run has ever been performed, not because escapes
+were contained.
+
+The threshold is pre-registered for a reason: fixing it now, before any run exists to read,
+is what stops it being moved after results are seen. The window is computed, not asserted.
+Every incident carries the date it was detected and
+the ordinal of the merged coordinator change it was detected under, and
+`tools/Test-EscapeLedger.ps1` recomputes the in-window set from those two facts against the
+ledger's evaluation date. The combinator is deliberately **either**: an incident counts if
+it falls inside the last ten coordinator changes *or* inside the last sixty days. A trigger
+that required both windows to agree could be waited out twice over — by going quiet, since
+no new changes age nothing out of the ordinal window, and by shipping quickly, since many
+changes push incidents out of the ordinal window while they are still days old. A sabotage
+case proves that an incident outside both windows stops counting.
 the ordinal of the merged coordinator change it was detected under, and
 `tools/Test-EscapeLedger.ps1` recomputes the in-window set from those two facts against the
 ledger's evaluation date. The combinator is deliberately **either**: an incident counts if

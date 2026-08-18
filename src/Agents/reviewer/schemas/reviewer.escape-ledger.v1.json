@@ -92,9 +92,15 @@
     "budget": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "statement", "threshold", "window", "action", "state"],
+      "required": ["id", "operationalStatus", "asOfCommit", "statement", "threshold", "window", "action", "state"],
       "properties": {
         "id": { "type": "string", "minLength": 1 },
+        "operationalStatus": {
+          "comment": "The budget is pre-registered so the threshold cannot be moved after results are seen, but its window clock is authored rather than derived. Until a coordinator-change registry exists the only honest status is a dated snapshot, and this field sits beside the counts so a reader of the machine-readable form cannot take them as current.",
+          "type": "string",
+          "enum": ["historicalSnapshot"]
+        },
+        "asOfCommit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
         "statement": { "type": "string", "minLength": 1 },
         "threshold": {
           "type": "object",
@@ -159,6 +165,7 @@
           "summary",
           "detector",
           "regressionGuard",
+          "introducedCommit",
           "detectedOn",
           "coordinatorChangeOrdinal"
         ],
@@ -195,7 +202,7 @@
       }
     },
     "nearMisses": {
-      "comment": "A defect introduced and detected inside the same unmerged change never entered a merged coordinator change, so it is not an escape. Keeping these separate stops them inflating the escape category totals the budget decision reads, while still recording them.",
+      "comment": "A defect introduced and detected inside the same unmerged change never entered a merged coordinator change, so it is not a containment escape. Keeping these separate stops them inflating the escape category totals the budget decision reads, while still recording them. The classification is authored: git can contradict it but cannot establish it, which is why classifiedAgainstCommit is required and pinned.",
       "type": "array",
       "items": {
         "type": "object",
@@ -213,6 +220,7 @@
           "detector",
           "regressionGuard",
           "introducedCommit",
+          "classifiedAgainstCommit",
           "detectedOn",
           "coordinatorChangeOrdinal"
         ],
@@ -222,7 +230,15 @@
           "category": { "type": "string", "enum": ["verificationLogic", "typeBinding", "logic", "modelProtocol", "supervision", "external"] },
           "executionStage": { "type": "string", "enum": ["deterministic", "shadow", "live"] },
           "mergedBeforeDetection": { "type": "boolean", "const": false },
-          "reachedShadowOrLive": { "type": "boolean", "const": false },
+          "reachedShadowOrLive": {
+            "comment": "Deliberately not pinned false. A defect can reach shadow or live execution without ever having been merged, and that is strong evidence for the typed-host decision even though it is not a containment escape. Pinning this closed would make the taxonomy unable to represent the finding at all, which is a way of not counting it.",
+            "type": "boolean"
+          },
+          "classifiedAgainstCommit": {
+            "comment": "The mainline commit this finding was classified against, fixed at classification time. The unmerged check is run against this commit rather than the live coverage-window end so that merging the change which contains the near miss does not retroactively reclassify it.",
+            "type": "string",
+            "pattern": "^[0-9a-f]{7,40}$"
+          },
           "whyNotAnEscape": { "type": "string", "minLength": 1 },
           "status": { "type": "string", "enum": ["remediated", "openDebt", "accepted"] },
           "summary": { "type": "string", "minLength": 1 },
@@ -301,7 +317,10 @@
               "complete": { "type": "boolean" },
               "inForce": { "type": "boolean" },
               "inForceNote": { "type": "string", "minLength": 1 },
-              "clockAuthority": { "enum": ["authoredOrdinals", "coordinatorChangeRegistry"] },
+              "clockAuthority": {
+                "comment": "Only one value is legal in this schema version. coordinatorChangeRegistry is deliberately absent: naming an authority that has no data and no currentness check behind it would let two string edits produce a green, in-force, still authority-free clock. Add the value in the same change that adds the registry and the checks that read it.",
+                "enum": ["authoredOrdinals"]
+              },
               "evidence": { "type": "string", "minLength": 1 }
             }
           }

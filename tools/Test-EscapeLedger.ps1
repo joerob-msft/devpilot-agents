@@ -441,11 +441,17 @@ function Test-ClockAuthorityConsistent {
     <#
         Returns $true when the escape-ledger prerequisite's in-force claim is compatible
         with the authority of the clock underneath it.
+
+        Only one authority is legal in this schema version. An earlier form of this rule
+        accepted any authority other than authoredOrdinals and blessed the in-force claim
+        on sight, which meant two string edits - name an authority that does not exist,
+        set inForce true - produced a green but still authority-free clock. A rule that can
+        be satisfied by asserting the thing it is meant to verify is not a rule.
     #>
     param([Parameter(Mandatory)][object]$Prerequisite)
     $names = @($Prerequisite.PSObject.Properties | ForEach-Object { $_.Name })
     if ($names -notcontains 'clockAuthority') { return $false }
-    if ([string]$Prerequisite.clockAuthority -ne 'authoredOrdinals') { return $true }
+    if ([string]$Prerequisite.clockAuthority -ne 'authoredOrdinals') { return $false }
     return (-not [bool]$Prerequisite.inForce)
 }
 
@@ -455,28 +461,48 @@ if ($ledgerPrerequisite.Count -eq 1) {
         "The escape-ledger prerequisite does not declare a clockAuthority, so a reader cannot tell whether the window clock is authoritative."
     if ($ledgerPrereqNames -contains 'clockAuthority') {
         $clockAuthority = [string]$ledgerPrerequisite[0].clockAuthority
-        Assert-Ledger ($clockAuthority -in @('authoredOrdinals', 'coordinatorChangeRegistry')) `
-            "Unknown clockAuthority '$clockAuthority'."
+        Assert-Ledger ($clockAuthority -eq 'authoredOrdinals') `
+            "Unknown clockAuthority '$clockAuthority'. Only authoredOrdinals is defined in this schema version; a new authority may be named only in the change that also adds the data it reads and the checks that establish that data is current."
         Assert-Ledger (Test-ClockAuthorityConsistent -Prerequisite $ledgerPrerequisite[0]) `
-            'The escape-ledger prerequisite is declared in force while its window clock advances only from authored incident ordinals. An incident-free coordinator change does not move that clock, so the trigger cannot be treated as current. Either supply a coordinator-change registry and set clockAuthority to coordinatorChangeRegistry, or leave inForce false.'
-        if ($clockAuthority -eq 'authoredOrdinals') {
-            Assert-Ledger ([string]$ledgerPrerequisite[0].inForceNote -match 'Gate 5') `
-                'The escape-ledger prerequisite runs on an authored clock but its note does not state what Gate 5 must require before reading the trigger as current.'
-        }
+            'The escape-ledger prerequisite is declared in force while its window clock advances only from authored incident ordinals. An incident-free coordinator change does not move that clock, so the trigger cannot be treated as current. Leave inForce false until a coordinator-change registry and the checks that read it exist.'
+        Assert-Ledger ([string]$ledgerPrerequisite[0].inForceNote -match 'Gate 5') `
+            'The escape-ledger prerequisite runs on an authored clock but its note does not state what Gate 5 must require before reading the trigger as current.'
     }
 
-    # The rule has to be able to fail on the combination it exists to forbid, and has to
-    # accept the combination it exists to permit. Neither is true by construction.
+    # The rule has to be able to fail on each combination it exists to forbid, and has to
+    # accept the one it exists to permit. None of that is true by construction.
     $forcedClock = (Get-LedgerObject -Json $ledgerJson).decision.prerequisites | Where-Object { $_.id -eq 'escape-ledger' }
     $forcedClock.inForce = $true
     $forcedClock.clockAuthority = 'authoredOrdinals'
     Assert-Ledger (-not (Test-ClockAuthorityConsistent -Prerequisite $forcedClock)) `
         'An escape-ledger prerequisite declared in force on an authored clock was accepted.'
-    $registryClock = (Get-LedgerObject -Json $ledgerJson).decision.prerequisites | Where-Object { $_.id -eq 'escape-ledger' }
-    $registryClock.inForce = $true
-    $registryClock.clockAuthority = 'coordinatorChangeRegistry'
-    Assert-Ledger (Test-ClockAuthorityConsistent -Prerequisite $registryClock) `
-        'The clock-authority rule rejects an in-force budget backed by a coordinator-change registry, so it forbids the fix as well as the fault.'
+    $inventedClock = (Get-LedgerObject -Json $ledgerJson).decision.prerequisites | Where-Object { $_.id -eq 'escape-ledger' }
+    $inventedClock.inForce = $true
+    $inventedClock.clockAuthority = 'coordinatorChangeRegistry'
+    Assert-Ledger (-not (Test-ClockAuthorityConsistent -Prerequisite $inventedClock)) `
+        'The clock-authority rule accepted an in-force budget backed by an authority this schema version does not define, so the clock can be switched on by naming a registry that does not exist.'
+    $restingClock = (Get-LedgerObject -Json $ledgerJson).decision.prerequisites | Where-Object { $_.id -eq 'escape-ledger' }
+    $restingClock.inForce = $false
+    $restingClock.clockAuthority = 'authoredOrdinals'
+    Assert-Ledger (Test-ClockAuthorityConsistent -Prerequisite $restingClock) `
+        'The clock-authority rule rejects the only combination this schema version permits, so it forbids the honest state as well as the dishonest ones.'
+}
+
+# The counts and the trigger state live in the machine-readable budget, so whatever tells a
+# reader they are a dated snapshot rather than a live reading has to live there too. A caveat
+# that appears only in prose is not attached to the data anyone parses.
+$budgetNames = @($ledger.budget.PSObject.Properties | ForEach-Object { $_.Name })
+Assert-Ledger ($budgetNames -contains 'operationalStatus') `
+    'The budget publishes qualifying counts and a triggered flag without an operationalStatus, so a machine reader cannot tell that its window clock is authored rather than derived.'
+if ($budgetNames -contains 'operationalStatus') {
+    Assert-Ledger ([string]$ledger.budget.operationalStatus -eq 'historicalSnapshot') `
+        "The budget declares operationalStatus '$($ledger.budget.operationalStatus)'. While clockAuthority is authoredOrdinals the only defensible status is historicalSnapshot."
+}
+Assert-Ledger ($budgetNames -contains 'asOfCommit') `
+    'The budget does not say which commit its counts were taken at, so the snapshot has no date attached to it.'
+if ($budgetNames -contains 'asOfCommit') {
+    Assert-Ledger ([string]$ledger.budget.asOfCommit -eq [string]$ledger.coverageWindow.endCommit) `
+        "The budget is stated as of $($ledger.budget.asOfCommit) but the coverage window ends at $($ledger.coverageWindow.endCommit); the counts and the window they are drawn from must agree."
 }
 foreach ($incident in $incidents) {
     $cited = [regex]::Matches("$($incident.detector) $($incident.regressionGuard)", '(?<path>(?:src|tools|docs)/[A-Za-z0-9_./-]+\.(?:ps1|json|md))')
@@ -542,8 +568,6 @@ foreach ($nearMiss in $nearMisses) {
         "Near miss $($nearMiss.id) also appears in the incident list; a finding is one or the other."
     Assert-Ledger ($false -eq $nearMiss.mergedBeforeDetection) `
         "Near miss $($nearMiss.id) records mergedBeforeDetection true, which makes it an escape and not a near miss."
-    Assert-Ledger ($false -eq $nearMiss.reachedShadowOrLive) `
-        "Near miss $($nearMiss.id) reached shadow or live execution, which makes it an escape."
     Assert-Ledger (-not [string]::IsNullOrWhiteSpace([string]$nearMiss.whyNotAnEscape)) `
         "Near miss $($nearMiss.id) does not state why it is not an escape."
     Assert-Ledger ($recordedInWindow -notcontains [string]$nearMiss.id) `
@@ -553,6 +577,76 @@ foreach ($nearMiss in $nearMisses) {
             "docs/escape-ledger.md does not mention near miss $($nearMiss.id)."
     }
 }
+
+# Two axes, not one. A containment escape is a defect that entered a merged coordinator
+# change; a runtime exposure finding is one that reached shadow or live execution, whether
+# or not it ever merged. Only the first is budget evidence, but the second is the evidence
+# the typed-host decision most wants to read, and a taxonomy that cannot represent
+# "reached live before merge" is a taxonomy that quietly drops it. So the near-miss schema
+# no longer pins reachedShadowOrLive false, and the count is published across both lists.
+$runtimeExposureIds = @(@(@($incidents) + @($nearMisses)) | Where-Object { $true -eq $_.reachedShadowOrLive } | ForEach-Object { [string]$_.id })
+$runtimeExposure = $runtimeExposureIds.Count
+$runsPerformed = [int]$ledger.gateObservations.shadowRunsPerformed + [int]$ledger.gateObservations.liveRunsPerformed
+if ($runsPerformed -eq 0) {
+    Assert-Ledger ($runtimeExposure -eq 0) `
+        "The ledger records $runtimeExposure finding(s) that reached shadow or live execution ($($runtimeExposureIds -join ', ')), but gateObservations reports no shadow or live run has ever been performed. One of the two is wrong."
+}
+foreach ($exposed in @(@($incidents) + @($nearMisses)) | Where-Object { $true -eq $_.reachedShadowOrLive }) {
+    Assert-Ledger ([string]$exposed.executionStage -in @('shadow', 'live')) `
+        "Finding $($exposed.id) reached shadow or live execution but records executionStage '$($exposed.executionStage)'."
+}
+
+# The trigger counts type-binding escapes, so `category` is the single field with the most
+# leverage over the pivot decision, and on its own it was pure assertion: changing one
+# incident from typeBinding to logic walked the count down with nothing to object. It cannot
+# be derived - what a defect "was" is a judgement - but it can be held consistent with the
+# detector the same incident already cites. A collection-collapse rule and a control-flow
+# rule are not interchangeable, so an incident detected by one and classified as the other is
+# a contradiction inside the record. This raises the cost of a quiet edit from one field to
+# two mutually corroborating ones; it is not proof, and docs/hardening-limitations.md says so.
+$collapseRules = @('PSEN004', 'PSEN009', 'PSEN011')
+$controlFlowRules = @('PSEN003', 'PSEN006', 'PSEN010')
+
+function Get-DetectorImpliedCategory {
+    <#
+        Returns 'typeBinding', 'logic', or $null when the cited detector does not imply a
+        category - either because it names rules from both families or because it names no
+        recognised detector at all. A null is not a pass by default; it means this particular
+        anchor has nothing to say, which the caller records rather than hides.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][string[]]$CollapseRules,
+        [Parameter(Mandatory)][string[]]$ControlFlowRules
+    )
+    $named = @([regex]::Matches($Text, 'PSEN\d{3}') | ForEach-Object { $_.Value } | Sort-Object -Unique)
+    $collapse = @($named | Where-Object { $CollapseRules -contains $_ })
+    $controlFlow = @($named | Where-Object { $ControlFlowRules -contains $_ })
+    if ($Text -match '(?i)boundary variant harness|Test-ReviewerCollectionCardinality') { $collapse = @($collapse) + @('cardinality') }
+    if ($collapse.Count -gt 0 -and $controlFlow.Count -eq 0) { return 'typeBinding' }
+    if ($controlFlow.Count -gt 0 -and $collapse.Count -eq 0) { return 'logic' }
+    return $null
+}
+
+$categoryAnchored = 0
+foreach ($incident in $incidents) {
+    $implied = Get-DetectorImpliedCategory -Text ([string]$incident.detector) -CollapseRules $collapseRules -ControlFlowRules $controlFlowRules
+    if ($null -eq $implied) { continue }
+    $categoryAnchored++
+    Assert-Ledger ([string]$incident.category -eq $implied) `
+        "Escape $($incident.id) is classified '$($incident.category)' but the detector it cites is a $implied detector. A collection-collapse rule and a control-flow rule are not interchangeable, so one of the two fields is wrong; the trigger counts type-binding escapes and cannot be moved by editing the category alone."
+}
+
+# The anchor has to be able to fail, and has to bite on the field the budget actually reads.
+$categoryProbe = @($incidents | Where-Object { $_.category -eq 'typeBinding' -and $null -ne (Get-DetectorImpliedCategory -Text ([string]$_.detector) -CollapseRules $collapseRules -ControlFlowRules $controlFlowRules) } | Select-Object -First 1)
+Assert-Ledger ($categoryProbe.Count -eq 1) `
+    'No type-binding escape has a detector-anchored category, so the anchor constrains nothing the budget reads.'
+if ($categoryProbe.Count -eq 1) {
+    $reclassified = 'logic'
+    Assert-Ledger ((Get-DetectorImpliedCategory -Text ([string]$categoryProbe[0].detector) -CollapseRules $collapseRules -ControlFlowRules $controlFlowRules) -ne $reclassified) `
+        "Reclassifying $($categoryProbe[0].id) as '$reclassified' does not contradict its cited detector, so the category anchor would not have caught it."
+}
+
 if ($VerifyCommits) {
     foreach ($incident in (@($incidents) + @($nearMisses))) {
         foreach ($property in @('introducedCommit', 'remediatedCommit')) {
@@ -565,10 +659,18 @@ if ($VerifyCommits) {
     }
 
     # The escape-versus-near-miss split decides what the budget counts, so it cannot rest on
-    # a self-declared boolean. "Merged" is a git fact: a commit reachable from the coverage
-    # window's end commit is on the merged mainline the window describes, and a commit that
-    # is not reachable from it is not. That makes both classifications checkable against
-    # something outside the file, which is the whole point of the distinction.
+    # a self-declared boolean alone. Git is used here as a contradiction check, not as an
+    # oracle: reachability establishes that a commit is in a history, not that the defective
+    # state entered an integrated coordinator revision before it was detected. It is one-way
+    # useful. An escape claimed to be merged whose introducing commit is not reachable from
+    # the window end is provably misfiled, and a near miss claimed never to have merged whose
+    # introducing commit was already on the mainline it was classified against is provably
+    # misfiled. Neither direction proves the honest case; both catch the dishonest one.
+    #
+    # Known limits, recorded in docs/hardening-limitations.md rather than papered over: a
+    # squash or cherry-pick lands the same defect under a different hash, a non-squash merge
+    # of a branch that introduced and fixed a defect makes both commits reachable, and a
+    # defect on an operational side branch is reachable from neither.
     $windowEnd = [string]$ledger.coverageWindow.endCommit
 
     function Test-CommitMerged {
@@ -577,42 +679,86 @@ if ($VerifyCommits) {
         return ($LASTEXITCODE -eq 0)
     }
 
+    # Applied to escapes and near misses alike. Filing this only on the near-miss side left
+    # the escape side able to name one commit as both the cause and the cure.
+    function Assert-RemediationCommit {
+        param([Parameter(Mandatory)][object]$Finding, [Parameter(Mandatory)][string]$RepoRoot)
+        $names = @($Finding.PSObject.Properties | ForEach-Object { $_.Name })
+        if ($names -notcontains 'remediatedCommit' -or $names -notcontains 'introducedCommit') { return }
+        $introduced = [string]$Finding.introducedCommit
+        $remediated = [string]$Finding.remediatedCommit
+        Assert-Ledger ($remediated -ne $introduced) `
+            "Finding $($Finding.id) cites $remediated as both its introducing and its remediating commit. One commit cannot do both; if the remediation ships in a commit whose hash does not exist yet, omit remediatedCommit and let status plus the regression guard carry it."
+        & git -C $RepoRoot merge-base --is-ancestor $introduced $remediated 2>$null
+        Assert-Ledger ($LASTEXITCODE -eq 0) `
+            "Finding $($Finding.id) claims remediation at $remediated, which does not descend from the introducing commit $introduced, so it cannot contain the fix."
+    }
+
+    # The ancestry rule must not be opt-out. An earlier form skipped an incident that simply
+    # omitted introducedCommit, so an author could take a finding out of the git check - in
+    # either direction - by deleting one optional field rather than by asserting a false
+    # fact. The field is required by the schema and its absence is a failure here too.
     foreach ($incident in $incidents) {
-        if ($incident.PSObject.Properties.Name -notcontains 'introducedCommit') { continue }
+        $incidentNames = @($incident.PSObject.Properties | ForEach-Object { $_.Name })
+        Assert-Ledger ($incidentNames -contains 'introducedCommit') `
+            "Escape $($incident.id) cites no introducedCommit, so its claim to have entered a merged coordinator change cannot be checked against git and it would be counted against the budget unexamined."
+        if ($incidentNames -notcontains 'introducedCommit') { continue }
         Assert-Ledger (Test-CommitMerged -Sha ([string]$incident.introducedCommit) -WindowEnd $windowEnd -RepoRoot $repoRoot) `
             "Escape $($incident.id) was introduced at $($incident.introducedCommit), which is not reachable from the coverage window's end commit $windowEnd. An escape is a defect that entered a merged coordinator change; if this one never merged it belongs in nearMisses."
+        Assert-RemediationCommit -Finding $incident -RepoRoot $repoRoot
     }
 
     foreach ($nearMiss in $nearMisses) {
         $nearMissNames = @($nearMiss.PSObject.Properties | ForEach-Object { $_.Name })
         Assert-Ledger ($nearMissNames -contains 'introducedCommit') `
             "Near miss $($nearMiss.id) cites no introducedCommit, so its claim never to have merged cannot be checked against git."
-        if ($nearMissNames -notcontains 'introducedCommit') { continue }
+        Assert-Ledger ($nearMissNames -contains 'classifiedAgainstCommit') `
+            "Near miss $($nearMiss.id) cites no classifiedAgainstCommit, so there is no fixed mainline to test its unmerged claim against."
+        if ($nearMissNames -notcontains 'introducedCommit' -or $nearMissNames -notcontains 'classifiedAgainstCommit') { continue }
         $introduced = [string]$nearMiss.introducedCommit
-        Assert-Ledger (-not (Test-CommitMerged -Sha $introduced -WindowEnd $windowEnd -RepoRoot $repoRoot)) `
-            "Near miss $($nearMiss.id) was introduced at $introduced, which IS reachable from the coverage window's end commit $windowEnd. A defect on the merged mainline is an escape and must be counted against the budget; it cannot be reclassified out of the window by declaring mergedBeforeDetection false."
+        $classifiedAgainst = [string]$nearMiss.classifiedAgainstCommit
 
-        # A single commit cannot both introduce and remediate the same defect, and a
-        # remediation cannot precede what it remediates.
-        if ($nearMissNames -contains 'remediatedCommit') {
-            $remediated = [string]$nearMiss.remediatedCommit
-            Assert-Ledger ($remediated -ne $introduced) `
-                "Near miss $($nearMiss.id) cites $remediated as both its introducing and its remediating commit. One commit cannot do both; if the remediation ships in a commit whose hash does not exist yet, omit remediatedCommit and let status plus the regression guard carry it."
-            & git -C $repoRoot merge-base --is-ancestor $introduced $remediated 2>$null
-            Assert-Ledger ($LASTEXITCODE -eq 0) `
-                "Near miss $($nearMiss.id) claims remediation at $remediated, which does not descend from the introducing commit $introduced, so it cannot contain the fix."
-        }
+        # The test runs against the commit the finding was classified against, not the live
+        # window end. Using the live end would be a time bomb: merging the very change that
+        # contains a near miss makes its introducing commit reachable, and the gate would
+        # then fail - or, worse, demand that a correctly filed near miss be reclassified as
+        # an escape - for no reason other than that time passed.
+        Assert-Ledger (Test-CommitMerged -Sha $classifiedAgainst -WindowEnd $windowEnd -RepoRoot $repoRoot) `
+            "Near miss $($nearMiss.id) was classified against $classifiedAgainst, which is not reachable from the coverage window's end commit $windowEnd. A finding must be classified against a commit on the mainline the window describes."
+        Assert-Ledger (-not (Test-CommitMerged -Sha $introduced -WindowEnd $classifiedAgainst -RepoRoot $repoRoot)) `
+            "Near miss $($nearMiss.id) was introduced at $introduced, which IS reachable from the mainline commit $classifiedAgainst it was classified against. A defect already on the mainline is an escape and must be counted against the budget; it cannot be reclassified out of the window by declaring mergedBeforeDetection false."
+
+        Assert-RemediationCommit -Finding $nearMiss -RepoRoot $repoRoot
     }
 
     # The two rules must be able to fail, and must fail in opposite directions. Feed each
-    # the other's commits.
+    # the other's commits, against the same reference each rule actually uses.
     $mergedProbe = @($incidents | Where-Object { $_.PSObject.Properties.Name -contains 'introducedCommit' } | Select-Object -First 1)
-    $unmergedProbe = @($nearMisses | Where-Object { $_.PSObject.Properties.Name -contains 'introducedCommit' } | Select-Object -First 1)
+    $unmergedProbe = @($nearMisses | Where-Object { $_.PSObject.Properties.Name -contains 'classifiedAgainstCommit' } | Select-Object -First 1)
     if ($mergedProbe.Count -eq 1 -and $unmergedProbe.Count -eq 1) {
+        $probeBaseline = [string]$unmergedProbe[0].classifiedAgainstCommit
         Assert-Ledger (Test-CommitMerged -Sha ([string]$mergedProbe[0].introducedCommit) -WindowEnd $windowEnd -RepoRoot $repoRoot) `
             'The merged-commit test does not recognise a commit the ledger records as merged, so the escape rule proves nothing.'
-        Assert-Ledger (-not (Test-CommitMerged -Sha ([string]$unmergedProbe[0].introducedCommit) -WindowEnd $windowEnd -RepoRoot $repoRoot)) `
+        Assert-Ledger (-not (Test-CommitMerged -Sha ([string]$unmergedProbe[0].introducedCommit) -WindowEnd $probeBaseline -RepoRoot $repoRoot)) `
             'The merged-commit test reports an unmerged commit as merged, so the near-miss rule proves nothing.'
+        Assert-Ledger (Test-CommitMerged -Sha ([string]$mergedProbe[0].introducedCommit) -WindowEnd $probeBaseline -RepoRoot $repoRoot) `
+            'A commit the ledger records as merged is not reachable from the mainline commit the near misses were classified against, so the near-miss rule is being applied against a baseline that would accept a genuine escape.'
+    }
+
+    # The reason the near-miss rule reads classifiedAgainstCommit rather than the live
+    # window end is not decorative, and this proves it: every near miss's introducing commit
+    # IS reachable from HEAD - it is in this branch - while being unreachable from the
+    # mainline it was classified against. A rule anchored to a moving reference would
+    # therefore flip these findings to "merged" the moment the change containing them lands,
+    # reclassifying correctly filed near misses as escapes purely because time passed.
+    foreach ($nearMiss in $nearMisses) {
+        $nearMissNames = @($nearMiss.PSObject.Properties | ForEach-Object { $_.Name })
+        if ($nearMissNames -notcontains 'introducedCommit' -or $nearMissNames -notcontains 'classifiedAgainstCommit') { continue }
+        $introduced = [string]$nearMiss.introducedCommit
+        Assert-Ledger (Test-CommitMerged -Sha $introduced -WindowEnd 'HEAD' -RepoRoot $repoRoot) `
+            "Near miss $($nearMiss.id) cites an introducing commit $introduced that is not reachable from HEAD, so this branch does not contain the change it describes."
+        Assert-Ledger (-not (Test-CommitMerged -Sha $introduced -WindowEnd ([string]$nearMiss.classifiedAgainstCommit) -RepoRoot $repoRoot)) `
+            "Near miss $($nearMiss.id) is reachable from its own classification baseline, so the baseline distinguishes nothing."
     }
 
     # The window closes at a named commit, so its evaluation date is that commit's date and
@@ -671,6 +817,8 @@ $report = [ordered]@{
     check = 'reviewer-escape-ledger'
     incidents = $incidents.Count
     nearMisses = @($nearMisses).Count
+    runtimeExposure = $runtimeExposure
+    categoryAnchored = $categoryAnchored
     remediated = @($incidents | Where-Object { $_.status -eq 'remediated' }).Count
     openDebt = @($incidents | Where-Object { $_.status -eq 'openDebt' }).Count
     typeBinding = @($incidents | Where-Object { $_.category -eq 'typeBinding' }).Count

@@ -68,6 +68,8 @@
   },
   "budget": {
     "id": "typed-control-plane-trigger",
+    "operationalStatus": "historicalSnapshot",
+    "asOfCommit": "74e476a",
     "statement": "If two or more type-binding escapes reach shadow or live execution within either the last ten merged coordinator changes or the last sixty days, the conditional typed control-plane pivot stops being optional and is scheduled as the next coordinator change.",
     "threshold": {
       "category": "typeBinding",
@@ -352,6 +354,7 @@
       "detector": "Independent review of the change, reproduced by fixtures in tools/testdata/boundary-hardening-analyzer.fixtures.ps1 and sabotage checks in tools/Test-ReviewerCollectionCardinality.ps1",
       "regressionGuard": "Two exemption-soundness fixtures (multi-element pipeline exit and enumerating-cast exit) and a cross-file gate that builds a producer, a consumer, and a same-named unprotected mock in a temporary tree and requires identical findings with and without the mock, all in tools/Test-PowerShellBoundaryHardening.ps1. Three citation sabotage checks pin container-is-not-leaf, short-leaf retention, and prose-suffix rejection; the five wrong citations are corrected and the unverifiable rows are published as citationsUnverified rather than counted as checked.",
       "introducedCommit": "fc11fae",
+      "classifiedAgainstCommit": "74e476a",
       "remediatedCommit": "cc5983c",
       "siteCount": 3,
       "detectedOn": "2026-08-18",
@@ -387,6 +390,7 @@
       "detector": "Independent review of the change",
       "regressionGuard": "The cross-file gate now asserts only the falsifiable property - identical bare-collection-return findings on the wrapped call site with and without the mock - and pins the conservative-exemption imprecision on a second unwrapped consumer as an expectation, so a future improvement is reported rather than passing silently. Reverting the exemption/nesting split makes the gate fail. The coverage-clock derivation is extracted into Measure-LedgerCoverageClock and the sabotage checks re-run that function on the mutated ledger, with a positive control asserting it agrees on the unmutated one.",
       "introducedCommit": "cc5983c",
+      "classifiedAgainstCommit": "74e476a",
       "remediatedCommit": "4a3c3ec",
       "siteCount": 2,
       "detectedOn": "2026-08-18",
