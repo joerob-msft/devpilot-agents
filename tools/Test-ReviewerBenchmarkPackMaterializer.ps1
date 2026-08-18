@@ -160,7 +160,7 @@ function New-Pack {
 
 function Get-MaterializeArgs {
     param($Pack, [string]$Out)
-    return @(
+    $args = @(
         '-PackRoot', $Pack.Root, '-LegacyProjectionFile', $Pack.Projection,
         '-Role', $Pack.Role, '-RoleProvenanceFile', $Pack.Provenance,
         '-ReplaySnapshotPath', $ReplayPath, '-ConfigFile', $ConfigFile, '-PromptFile', $PromptFile,
@@ -168,6 +168,10 @@ function Get-MaterializeArgs {
         '-ExpectedPromptSha256', $promptSha, '-SecondGeneralistModel', 'gpt-5.6-sol',
         '-OutputRoot', $Out, '-RepoRoot', $RepoRoot
     )
+    if ([string]$Pack.Role -cne 'generalist') {
+        $args += @('-ConventionSpecialistModel', 'claude-sonnet-5')
+    }
+    return $args
 }
 
 try {
@@ -214,6 +218,11 @@ try {
         $bundles[$role] = [pscustomobject]@{ Pack = $pack; Out = $out; Result = $result }
         $projection = Get-Content (Join-Path $out 'projection.json') -Raw | ConvertFrom-Json
         Check "$role projection is role-scoped" ([string]$projection.role -ceq $role -and $null -ne $projection.$role)
+        $expectedSpecialistEnabled = ($role -cne 'generalist')
+        Check "$role bundle binds specialist configuration without changing role" (
+            [bool]$result.conventionSpecialistEnabled -eq $expectedSpecialistEnabled -and
+            [string]$result.conventionSpecialistModel -ceq
+                $(if ($expectedSpecialistEnabled) { 'claude-sonnet-5' } else { '' }))
         $files = @(Get-ChildItem -LiteralPath $out -File -Recurse -Force)
         Check "$role bundle is recursively read-only" (@($files | Where-Object {
                     ($_.Attributes -band [IO.FileAttributes]::ReadOnly) -eq 0
@@ -222,6 +231,50 @@ try {
             -ExpectedTransformationManifestSha256 ([string]$result.transformationManifestSha256) -RepoRoot $RepoRoot
         Check "$role read-only verification succeeds" ($LASTEXITCODE -eq 0 -and ($verify -join '') -match 'reviewer-blinded-benchmark-pack-transformation')
     }
+
+    $baseConfigFile = $ConfigFile
+    $baseConfigSha = $configSha
+    $verificationConfigFile = Join-Path $runRoot 'verification-config\reviewer.config.json'
+    $verificationConfig = Get-Content $baseConfigFile -Raw | ConvertFrom-Json -Depth 64
+    $verificationConfig.review.conventionSpecialistModel = 'claude-sonnet-5'
+    $verificationConfig.review.verification.enabled = $true
+    $verificationConfig.review.verification.conventionVerifierModel = 'gpt-5.6-sol'
+    Write-Utf8 $verificationConfigFile ($verificationConfig | ConvertTo-Json -Depth 64)
+    $ConfigFile = $verificationConfigFile
+    $configSha = Sha $ConfigFile
+    $verificationPack = New-Pack -Name 'pack-generalist-verification' -Role generalist
+    $verificationBundleOut = Join-Path $runRoot 'bundle-generalist-verification'
+    $verificationBundleJson = & pwsh -NoProfile -File $Tool @(
+        Get-MaterializeArgs $verificationPack $verificationBundleOut)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Verification-enabled generalist materialization failed: $($verificationBundleJson -join '')"
+    }
+    $verificationBundleResult = ($verificationBundleJson -join '') | ConvertFrom-Json
+    Check 'verification-enabled generalist bundle binds configured specialist' (
+        [bool]$verificationBundleResult.conventionSpecialistEnabled -and
+        [string]$verificationBundleResult.conventionSpecialistModel -ceq 'claude-sonnet-5')
+    $verificationBundlePreflightOut = Join-Path $runRoot 'verification-preflight-would-write'
+    $verificationBundlePreflightJson = & (Get-Process -Id $PID).Path -NoProfile -File $Acquire `
+        -Preflight -Role generalist `
+        -FixtureProjectionFile (Join-Path $verificationBundleOut 'projection.json') `
+        -Model 'claude-opus-5' -SecondGeneralistModel 'gpt-5.6-sol' `
+        -ConfigFile (Join-Path $verificationBundleOut 'config\reviewer.config.json') `
+        -ReplayRoot (Join-Path $verificationBundleOut 'replay') `
+        -ReplaySnapshotName $verificationBundleResult.replaySnapshotName `
+        -ReplayManifestDigest $verificationBundleResult.replayManifestDigest `
+        -ExpectedReviewerBaseCommit $head -PullRequestId 4242 -ExpectedHeadCommit $head `
+        -ExpectedRef $ref -OutputRoot $verificationBundlePreflightOut `
+        -RepoRoot $RepoRoot -AllowDirtyWorktree
+    $verificationBundlePreflight = ($verificationBundlePreflightJson -join '') |
+        ConvertFrom-Json -Depth 32
+    Check 'verification-enabled materialization reaches zero-process Preflight' (
+        $LASTEXITCODE -eq 0 -and
+        [bool]$verificationBundlePreflight.conventionSpecialistEnabled -and
+        [string]$verificationBundlePreflight.conventionSpecialistModel -ceq
+            'claude-sonnet-5' -and
+        [int]$verificationBundlePreflight.sideEffects.processesStarted -eq 0)
+    $ConfigFile = $baseConfigFile
+    $configSha = $baseConfigSha
 
     $missingContextProjection = Get-Content (Join-Path $bundles.generalist.Out 'projection.json') -Raw |
         ConvertFrom-Json -AsHashtable -Depth 64
@@ -272,6 +325,20 @@ try {
     Check 'Preflight creates no output or lease' (-not (Test-Path $preflightOut) -and
         @(Get-ChildItem -LiteralPath $runRoot -Force | Where-Object { $_.Name -match $preflightLeasePattern }).Count -eq 0)
     Check 'Preflight changes no existing byte' (($before -join "`n") -ceq ($after -join "`n"))
+    $readinessSchema = Join-Path $RepoRoot `
+        'src\Agents\reviewer\acquisition\v1\acquisition-readiness.schema.json'
+    foreach ($invalidSpecialistBinding in @(
+            @{ Enabled = $true; Model = $null; Name = 'enabled/null' },
+            @{ Enabled = $false; Model = 'claude-sonnet-5'; Name = 'disabled/model' })) {
+        $invalidReadiness = $preflight | ConvertTo-Json -Depth 32 |
+            ConvertFrom-Json -AsHashtable -Depth 32
+        $invalidReadiness.conventionSpecialistEnabled = $invalidSpecialistBinding.Enabled
+        $invalidReadiness.conventionSpecialistModel = $invalidSpecialistBinding.Model
+        $invalidReadinessValid = ConvertTo-Json $invalidReadiness -Depth 32 |
+            Test-Json -SchemaFile $readinessSchema -ErrorAction SilentlyContinue
+        Check "readiness schema rejects $($invalidSpecialistBinding.Name) specialist binding" (
+            -not $invalidReadinessValid)
+    }
     $generalistTransformation = Get-Content `
         (Join-Path $generalist.Out 'transformation-manifest.json') -Raw |
         ConvertFrom-Json -Depth 32
@@ -297,6 +364,68 @@ try {
             -ExpectedTransformationManifestSha256 $generalist.Result.transformationManifestSha256 `
             -RepoRoot $RepoRoot 2>&1
     } 'mismatch'
+
+    $specialistTamperBundle = Join-Path $runRoot 'bundle-specialist-model-tampered'
+    Copy-Item -LiteralPath $verificationBundleOut -Destination $specialistTamperBundle -Recurse
+    Get-ChildItem -LiteralPath $specialistTamperBundle -File -Recurse -Force |
+        ForEach-Object { $_.Attributes = [IO.FileAttributes]::Normal }
+    $specialistTamperSidecarPath = Join-Path $specialistTamperBundle `
+        "replay\$($verificationBundleResult.replaySnapshotName)\benchmark-pack-materialization.json"
+    $specialistTamperSidecar = Get-Content $specialistTamperSidecarPath -Raw |
+        ConvertFrom-Json -AsHashtable -Depth 32
+    $specialistTamperSidecar.conventionSpecialistModel = 'claude-haiku-4.5'
+    Write-Utf8 $specialistTamperSidecarPath (Canon $specialistTamperSidecar)
+    Invoke-ExpectedFailure 'convention-specialist bundle tamper blocks verification' {
+        & pwsh -NoProfile -File $Tool -VerifyOnly -OutputRoot $specialistTamperBundle `
+            -ExpectedTransformationManifestSha256 `
+                $verificationBundleResult.transformationManifestSha256 `
+            -RepoRoot $RepoRoot 2>&1
+    } 'mismatch'
+
+    $bindingMismatchOut = Join-Path $runRoot 'specialist-binding-mismatch-acquisition'
+    $adapterManifest = Join-Path $RepoRoot `
+        'src\Agents\reviewer\testdata\exact-path\adapter-manifest.json'
+    $adapterExpectedBase = [string](
+        Get-Content $adapterManifest -Raw | ConvertFrom-Json).expectedBaseCommit
+    $bindingMismatchOutput = & $pwshPath -NoProfile -File $Acquire -Role generalist `
+        -FixtureProjectionFile (Join-Path $verificationBundleOut 'projection.json') `
+        -Model 'claude-opus-5' -SecondGeneralistModel 'gpt-5.6-sol' `
+        -ConventionSpecialistModel 'claude-haiku-4.5' `
+        -ConfigFile (Join-Path $verificationBundleOut 'config\reviewer.config.json') `
+        -ReplayRoot (Join-Path $verificationBundleOut 'replay') `
+        -ReplaySnapshotName $verificationBundleResult.replaySnapshotName `
+        -ReplayManifestDigest $verificationBundleResult.replayManifestDigest `
+        -OfflineModelAdapterManifest $adapterManifest `
+        -ExpectedReviewerBaseCommit $adapterExpectedBase -PullRequestId 4242 `
+        -ExpectedHeadCommit $head -ExpectedRef $ref -OutputRoot $bindingMismatchOut `
+        -SealKeyPath (Join-Path $runRoot 'binding-mismatch-seal.key') `
+        -RepoRoot $RepoRoot -AllowDirtyWorktree -UseOfflineStubAdapter 2>&1
+    $bindingMismatchExit = $LASTEXITCODE
+    $bindingMismatchStderr = Join-Path $bindingMismatchOut 'work\reviewer-stderr.log'
+    $bindingMismatchText = ($bindingMismatchOutput -join "`n") + "`n" +
+        $(if (Test-Path $bindingMismatchStderr) {
+                Get-Content $bindingMismatchStderr -Raw
+            } else { '' })
+    $bindingMismatchTelemetry = Join-Path $bindingMismatchOut 'work\telemetry.jsonl'
+    $bindingMismatchTelemetryExists = Test-Path $bindingMismatchTelemetry
+    $bindingMismatchEvents = if ($bindingMismatchTelemetryExists) {
+        @(Get-Content $bindingMismatchTelemetry | Where-Object { $_ } |
+            ForEach-Object { $_ | ConvertFrom-Json -Depth 16 })
+    } else { @() }
+    $bindingMismatchStarts = @($bindingMismatchEvents | Where-Object {
+            [string]$_.event -ceq 'process.started'
+        }).Count
+    $bindingMismatchReady = @($bindingMismatchEvents | Where-Object {
+            [string]$_.event -ceq 'acquisition.childReady'
+        }).Count
+    Check 'non-Preflight specialist override cannot bypass materialized binding' (
+        $bindingMismatchExit -ne 0 -and
+        $bindingMismatchText -match 'does not bind the running conventionSpecialistModel') (
+        "exit=$bindingMismatchExit")
+    Check 'materialized specialist mismatch starts zero models' (
+        $bindingMismatchTelemetryExists -and $bindingMismatchReady -eq 1 -and
+        $bindingMismatchStarts -eq 0) (
+        "telemetry=$bindingMismatchTelemetryExists ready=$bindingMismatchReady starts=$bindingMismatchStarts")
 
     $substitutedProjection = Join-Path $runRoot 'substituted-projection.json'
     $substitutedProjectionObject = Get-Content (Join-Path $generalist.Out 'projection.json') -Raw |

@@ -13,6 +13,8 @@
     "role",
     "model",
     "secondGeneralistModel",
+    "conventionSpecialistEnabled",
+    "conventionSpecialistModel",
     "fixtureId",
     "fixtureProjectionSha256",
     "snapshotName",
@@ -36,6 +38,13 @@
     "role": { "enum": ["generalist", "specialist", "verifier"] },
     "model": { "type": "string", "minLength": 1, "maxLength": 128 },
     "secondGeneralistModel": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "conventionSpecialistEnabled": { "type": "boolean" },
+    "conventionSpecialistModel": {
+      "oneOf": [
+        { "type": "string", "minLength": 1, "maxLength": 128 },
+        { "type": "null" }
+      ]
+    },
     "fixtureId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
     "fixtureProjectionSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "snapshotName": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
@@ -114,6 +123,11 @@
     }
   },
   "allOf": [
+    {
+      "if": { "properties": { "conventionSpecialistEnabled": { "const": true } } },
+      "then": { "properties": { "conventionSpecialistModel": { "type": "string", "minLength": 1 } } },
+      "else": { "properties": { "conventionSpecialistModel": { "type": "null" } } }
+    },
     {
       "if": { "properties": { "role": { "const": "verifier" } } },
       "then": { "required": ["candidate", "discovery"] }

@@ -214,10 +214,42 @@ function Assert-ReviewerAcquisitionTranscriptPackage {
     $coreText = $script:ReviewerAcquisitionPackageUtf8.GetString($coreBytes)
     $markerText = $script:ReviewerAcquisitionPackageUtf8.GetString($markerBytes)
     $core = $coreText | ConvertFrom-Json -Depth 64
+    $manifestHasSpecialistEnabled = $null -ne
+        $manifest.PSObject.Properties['conventionSpecialistEnabled']
+    $manifestHasSpecialistModel = $null -ne
+        $manifest.PSObject.Properties['conventionSpecialistModel']
+    $coreHasSpecialistEnabled = $null -ne
+        $core.PSObject.Properties['conventionSpecialistEnabled']
+    $coreHasSpecialistModel = $null -ne
+        $core.PSObject.Properties['conventionSpecialistModel']
+    if ($manifestHasSpecialistEnabled -ne $manifestHasSpecialistModel -or
+        $coreHasSpecialistEnabled -ne $coreHasSpecialistModel) {
+        throw 'The acquisition package has a partial convention specialist binding.'
+    }
+    $manifestHasSpecialistBinding = $manifestHasSpecialistEnabled
+    $coreHasSpecialistBinding = $coreHasSpecialistEnabled
+    if ($manifestHasSpecialistBinding -ne $coreHasSpecialistBinding) {
+        throw 'The acquisition package manifest and capture core disagree on convention specialist binding presence.'
+    }
+    if ($coreHasSpecialistBinding -and $core.conventionSpecialistEnabled -isnot [bool]) {
+        throw 'The acquisition package capture core has an invalid convention specialist binding.'
+    }
+    if ($coreHasSpecialistBinding -and [bool]$core.conventionSpecialistEnabled) {
+        if ($core.conventionSpecialistModel -isnot [string] -or
+            [string]::IsNullOrWhiteSpace([string]$core.conventionSpecialistModel)) {
+            throw 'The acquisition package capture core has an invalid convention specialist binding.'
+        }
+    }
+    elseif ($coreHasSpecialistBinding -and $null -ne $core.conventionSpecialistModel) {
+        throw 'The acquisition package capture core has an invalid convention specialist binding.'
+    }
     if ([string]$manifest.role -cne [string]$core.role -or
         [string]$manifest.requestedModel -cne [string]$core.requestedModel -or
         [string]$manifest.reportedModel -cne [string]$core.reportedModel -or
         [string]$manifest.secondGeneralistModel -cne [string]$core.secondGeneralistModel -or
+        ($coreHasSpecialistBinding -and
+            ($manifest.conventionSpecialistEnabled -cne $core.conventionSpecialistEnabled -or
+                $manifest.conventionSpecialistModel -cne $core.conventionSpecialistModel)) -or
         [string]$manifest.nonce -cne [string]$core.nonce -or
         [string]$manifest.resultMarkerPrefix -cne [string]$core.resultMarkerPrefix -or
         [string]$manifest.terminalStatus -cne [string]$core.terminalStatus) {

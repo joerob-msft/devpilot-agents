@@ -2780,7 +2780,11 @@ if ($ValidateConfigurationOnly) {
         }
         [void](Assert-AgentSupportedModel -ModelId $CfgConventionVerifierModel -Where "config convention verifier model")
     }
-    if ($ValidateConfigurationRole -cin @("specialist", "verifier")) {
+    $validationNeedsSpecialist = (
+        $ValidateConfigurationRole -cin @("specialist", "verifier") -or
+        $CfgVerificationEnabled -or
+        [bool]$ConventionSpecialistModel)
+    if ($validationNeedsSpecialist) {
         if (-not $SecondPassModel) {
             throw "$ValidateConfigurationRole configuration validation requires the eventual -SecondPassModel."
         }
@@ -2805,16 +2809,18 @@ if ($ValidateConfigurationOnly) {
                 ($missingSpecialistPermissions -join ', '))
         }
     }
-    if ($ValidateConfigurationRole -ceq "verifier") {
+    if ($ValidateConfigurationRole -ceq "verifier" -or $CfgVerificationEnabled) {
         if (-not (Test-AgentGeneralistModelPair -Models @($validatedPrimaryModel, $validatedSecondModel))) {
-            throw ("Verifier configuration validation requires the explicit " +
+            throw ("Verification configuration validation requires the explicit " +
                 "$($script:ReviewerGeneralistModelPair.First) and " +
                 "$($script:ReviewerGeneralistModelPair.Second) generalist pairing.")
         }
         if ($ConventionSpecialistModel -ceq $validatedPrimaryModel -or
             $ConventionSpecialistModel -ceq $validatedSecondModel) {
-            throw "Verifier configuration validation requires a specialist model distinct from both generalists."
+            throw "Verification configuration validation requires a specialist model distinct from both generalists."
         }
+    }
+    if ($ValidateConfigurationRole -ceq "verifier") {
         if (-not $ConventionVerifierModel) {
             throw "Verifier configuration validation requires the eventual -ConventionVerifierModel."
         }
@@ -16182,6 +16188,20 @@ function Invoke-ReviewerBlindedAcquisitionRun {
     if (-not (Test-ReviewerArtifactSignature -ManifestJson $planText -Key $planKeyBytes -Signature ([string]$planSig.signature))) {
         throw "The acquisition plan signature does not match the plan bytes under the presented token; a tampered or replayed plan is refused before any launch."
     }
+    $planConventionSpecialistEnabled = [bool]$plan.conventionSpecialistEnabled
+    if ($planConventionSpecialistEnabled -ne [bool]$EnableConventionSpecialist) {
+        throw "The configured -EnableConventionSpecialist does not match the acquisition plan's conventionSpecialistEnabled binding."
+    }
+    if ($planConventionSpecialistEnabled) {
+        $planConventionSpecialistModel = Assert-AgentSupportedModel -Model (
+            [string]$plan.conventionSpecialistModel)
+        if ([string]$EffectiveConventionSpecialistModel -cne [string]$planConventionSpecialistModel) {
+            throw "The effective convention specialist model does not match the acquisition plan's conventionSpecialistModel binding."
+        }
+    }
+    elseif ($null -ne $plan.conventionSpecialistModel -or $EffectiveConventionSpecialistModel) {
+        throw "A disabled convention specialist acquisition plan must not carry an effective specialist model."
+    }
 
     # -- Bind every runtime identity to the signed plan (fail closed) ----------
     $resolvedRepoPath = (Resolve-Path -LiteralPath $RepoPath).Path
@@ -16226,6 +16246,27 @@ function Invoke-ReviewerBlindedAcquisitionRun {
                     ([string]$bindingCheck[1]).ToLowerInvariant()) {
                 throw "The benchmark-pack materialization sidecar does not bind the running $name."
             }
+        }
+        if (-not $materialization.PSObject.Properties['secondGeneralistModel'] -or
+            [string]$materialization.secondGeneralistModel -cne [string]$plan.secondGeneralistModel) {
+            throw "The benchmark-pack materialization sidecar does not bind the running secondGeneralistModel."
+        }
+        if (-not $materialization.PSObject.Properties['conventionSpecialistEnabled'] -or
+            $materialization.conventionSpecialistEnabled -isnot [bool] -or
+            $materialization.conventionSpecialistEnabled -cne $planConventionSpecialistEnabled) {
+            throw "The benchmark-pack materialization sidecar does not bind the running conventionSpecialistEnabled."
+        }
+        if ($planConventionSpecialistEnabled) {
+            if (-not $materialization.PSObject.Properties['conventionSpecialistModel'] -or
+                $materialization.conventionSpecialistModel -isnot [string] -or
+                [string]::IsNullOrWhiteSpace([string]$materialization.conventionSpecialistModel) -or
+                $materialization.conventionSpecialistModel -cne
+                    [string]$planConventionSpecialistModel) {
+                throw "The benchmark-pack materialization sidecar does not bind the running conventionSpecialistModel."
+            }
+        }
+        elseif ($null -ne $materialization.conventionSpecialistModel) {
+            throw "A disabled benchmark-pack materialization must not bind a convention specialist model."
         }
     }
 
@@ -16869,6 +16910,8 @@ function Invoke-ReviewerBlindedAcquisitionRun {
         requestedModel    = $model
         reportedModel     = $reportedModel
         secondGeneralistModel = [string]$plan.secondGeneralistModel
+        conventionSpecialistEnabled = [bool]$plan.conventionSpecialistEnabled
+        conventionSpecialistModel = $plan.conventionSpecialistModel
         nonce             = $terminalNonce
         nonceSha256       = (Get-ReviewerTextSha256 -Text $terminalNonce)
         resultMarkerPrefix = [string]$roleMarkerPrefix

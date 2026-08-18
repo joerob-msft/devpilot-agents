@@ -142,7 +142,7 @@ change is proven to be only the self-hash, never an orchestration change.
 | Fixture projection | one blinded projection JSON, strict schema + forbidden-key scan |
 | Discovery candidate | verifier only; independently captured, exact source/fixture/model/result-marker binding |
 | Discovery package | verifier only; the SEALED discovery transcript package the candidate was extracted from |
-| Cross-check models | every role binds the current distinct generalist pair; specialist/verifier also bind the convention models their exact production cycle needs |
+| Cross-check models | every role binds the current distinct generalist pair plus whether the convention specialist is enabled and its effective model; specialist/verifier always enable it, while generalist follows verification config or an explicit override |
 | Model | one supported id, validated through `Assert-AgentSupportedModel` |
 | Replay snapshot | one digest-bound, non-promotable sealed snapshot |
 | Expected commit / ref / RepoPath | exact HEAD, full `refs/heads/<branch>` resolving to that HEAD, and repository path |
@@ -179,8 +179,11 @@ never fills gaps from a live repository or a human-authored guess.
 
 The classified replay sidecar binds the exact config, production prompt, and
 reviewer script hashes. Acquisition rechecks those bindings against the running
-bytes. The materializer also requires and binds the current second generalist,
-and extends the classified replay's model binding with it. Specialist acquisition additionally requires both sealed convention and
+bytes. The materializer also requires and binds the current second generalist. When
+the role or verification config requires the convention specialist, it binds
+that enablement and effective model too. `-ConventionSpecialistModel` takes
+precedence over `config.review.conventionSpecialistModel`; both models extend
+the classified replay's model binding. Specialist acquisition additionally requires both sealed convention and
 fact plans and compares them to the production-generated plans before the model
 boundary; a merely role-labeled placeholder is not accepted.
 
@@ -219,6 +222,7 @@ Until those outputs are independently captured and sealed, readiness is
     -ExpectedConfigSha256 <64-hex> `
     -ExpectedPromptSha256 <64-hex> `
     -SecondGeneralistModel <second-generalist-model-id> `
+    -ConventionSpecialistModel <specialist-model-id-if-required-or-overridden> `
     -OutputRoot <new-bundle-directory>
 ```
 
@@ -319,7 +323,9 @@ transcript; none stops at the model-launch boundary:
 
 * `generalist` runs the reviewer's generalist pass through the exact prompt
   construction, result-marker parser, schemas, scan windows and subprocess
-  boundary, with the generalist bounded fresh-nonce retry.
+  boundary, with the generalist bounded fresh-nonce retry. Verification-enabled
+  configuration is forwarded so production can build the same layer-5 inputs,
+  but acquisition still starts only the authorized generalist role.
 * `specialist` runs the reviewer's convention-specialist path through its exact
   production input builder (`New-ReviewerConventionSpecialistInput`) and its own
   bounded fresh-nonce retry, against a convention replay snapshot.
@@ -341,6 +347,7 @@ Acquire a generalist transcript (generic placeholders; no private identifiers):
     -FixtureProjectionFile <path-to-blinded-projection.json> `
     -Model <supported-model-id> `
     -SecondGeneralistModel <second-generalist-model-id> `
+    -ConventionSpecialistModel <optional-explicit-override> `
     -ConfigFile <path-to-reviewer.config.json> `
     -ReplayRoot <path-to-replay-root> `
     -ReplaySnapshotName synthetic-pr `

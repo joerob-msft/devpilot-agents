@@ -804,6 +804,7 @@ $outputLeaf = [IO.Path]::GetFileName($outputRootFull.TrimEnd(
 $leaseKey = (Get-Sha256Hex -Text $outputRootFull).Substring(0, 16)
 $leasePath = Join-Path $outputParent (".$outputLeaf.$leaseKey.acquisition.lease")
 $leaseStream = $null
+$configGuardStream = $null
 if (Test-Path -LiteralPath $leasePath) {
     throw "A launch lease already exists at '$leasePath'; acquisition never resumes, replaces or auto-advances a consumed lease."
 }
@@ -848,6 +849,13 @@ if (-not $UseOfflineStubAdapter -and $OfflineModelAdapterManifest) {
 }
 $reviewerScriptFull = (Resolve-Path -LiteralPath $ReviewerScript).Path
 $configFull = (Resolve-Path -LiteralPath $ConfigFile).Path
+$configGuardStream = [IO.File]::Open(
+    $configFull, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+trap {
+    if ($configGuardStream) { try { $configGuardStream.Dispose() } catch { } }
+    if ($leaseStream) { try { $leaseStream.Dispose() } catch { } }
+    break
+}
 $projectionFull = (Resolve-Path -LiteralPath $FixtureProjectionFile).Path
 $adapterFull = if ($UseOfflineStubAdapter) {
     (Resolve-Path -LiteralPath $OfflineModelAdapterManifest).Path
@@ -919,6 +927,50 @@ if ($Role -eq 'verifier') {
     }
 }
 
+$acquisitionConfigLoad = Get-AgentConfig -Path $configFull `
+    -AgentDir (Join-Path $RepoRoot 'src\Agents\reviewer') `
+    -SupportedSchemaVersions @(1) -PromptFileField 'promptFile'
+$acquisitionConfig = $acquisitionConfigLoad.Raw
+$configuredConventionSpecialistModel = ''
+$configVerificationEnabled = $false
+if ($acquisitionConfig.PSObject.Properties.Name -ccontains 'review') {
+    $configReview = $acquisitionConfig.review
+    if ($configReview.PSObject.Properties.Name -ccontains 'conventionSpecialistModel') {
+        if ($configReview.conventionSpecialistModel -isnot [string]) {
+            throw "review.conventionSpecialistModel must be a string when configured."
+        }
+        $configuredConventionSpecialistModel = [string]$configReview.conventionSpecialistModel
+    }
+    if ($configReview.PSObject.Properties.Name -ccontains 'verification' -and
+        $configReview.verification.PSObject.Properties.Name -ccontains 'enabled') {
+        if ($configReview.verification.enabled -isnot [bool]) {
+            throw "review.verification.enabled must be a JSON boolean."
+        }
+        $configVerificationEnabled = [bool]$configReview.verification.enabled
+    }
+}
+$conventionSpecialistEnabled = (
+    $Role -cne 'generalist' -or
+    $configVerificationEnabled -or
+    [bool]$ConventionSpecialistModel)
+$effectiveConventionSpecialistModel = $null
+if ($conventionSpecialistEnabled) {
+    $effectiveConventionSpecialistModel = if ($Role -ceq 'specialist') {
+        $Model
+    }
+    elseif ($ConventionSpecialistModel) {
+        $ConventionSpecialistModel
+    }
+    else {
+        $configuredConventionSpecialistModel
+    }
+    if (-not $effectiveConventionSpecialistModel) {
+        throw ("A $Role acquisition with verification/convention specialist enabled requires " +
+            'an explicit -ConventionSpecialistModel or config.review.conventionSpecialistModel.')
+    }
+    [void](Assert-AgentSupportedModel -Model $effectiveConventionSpecialistModel)
+}
+
 # -- Canonical target identity from the authoritative sealed replay Bound ------
 # The sealed replay snapshot manifest is the single source of truth for the PR /
 # repository / project / source+target commit / change-set the run reproduces.
@@ -946,8 +998,7 @@ if ($Preflight) {
     if (-not [bool]$validatedReplay.Classification.NonPromotable) {
         throw "Preflight requires a classified non-promotable replay snapshot."
     }
-    $validatedConfig = Get-AgentConfig -Path $configFull -AgentDir (Split-Path $reviewerScriptFull -Parent) `
-        -SupportedSchemaVersions @(1) -PromptFileField 'promptFile'
+    $validatedConfig = $acquisitionConfigLoad
     $validationPrimaryModel = if ($Role -ceq 'specialist') { $DiscoveryGeneralistModel } else { $Model }
     $configurationValidationArgs = @{
         ConfigFile = $configFull
@@ -957,9 +1008,8 @@ if ($Preflight) {
         Model = $validationPrimaryModel
     }
     $configurationValidationArgs['SecondPassModel'] = $SecondGeneralistModel
-    if ($Role -cin @('specialist', 'verifier')) {
-        $configurationValidationArgs['ConventionSpecialistModel'] =
-            $(if ($Role -ceq 'specialist') { $Model } else { $ConventionSpecialistModel })
+    if ($conventionSpecialistEnabled) {
+        $configurationValidationArgs['ConventionSpecialistModel'] = $effectiveConventionSpecialistModel
     }
     if ($Role -ceq 'verifier') {
         $configurationValidationArgs['ConventionVerifierModel'] = $Model
@@ -1011,10 +1061,29 @@ if ($Preflight) {
             [string]$materialization.secondGeneralistModel -cne [string]$SecondGeneralistModel) {
             throw 'Preflight benchmark-pack materialization does not bind the supplied secondGeneralistModel.'
         }
+        if (-not $materialization.PSObject.Properties['conventionSpecialistEnabled'] -or
+            $materialization.conventionSpecialistEnabled -isnot [bool] -or
+            $materialization.conventionSpecialistEnabled -cne $conventionSpecialistEnabled -or
+            -not $materialization.PSObject.Properties['conventionSpecialistModel']) {
+            throw 'Preflight benchmark-pack materialization does not bind the effective convention specialist configuration.'
+        }
+        if ($conventionSpecialistEnabled) {
+            if ($materialization.conventionSpecialistModel -isnot [string] -or
+                [string]::IsNullOrWhiteSpace([string]$materialization.conventionSpecialistModel) -or
+                $materialization.conventionSpecialistModel -cne
+                    $effectiveConventionSpecialistModel) {
+                throw 'Preflight benchmark-pack materialization does not bind the effective convention specialist configuration.'
+            }
+        }
+        elseif ($null -ne $materialization.conventionSpecialistModel -or
+            $null -ne $effectiveConventionSpecialistModel) {
+            throw 'Preflight benchmark-pack materialization does not bind the effective convention specialist configuration.'
+        }
     }
     $boundModels = @($validatedReplay.Bindings.Models)
     $requestedModels = @($Model, $DiscoveryGeneralistModel, $SecondGeneralistModel,
-        $ConventionSpecialistModel, $ConventionVerifierModel) | Where-Object { $_ } | Select-Object -Unique
+        $ConventionSpecialistModel, $ConventionVerifierModel, $effectiveConventionSpecialistModel) |
+        Where-Object { $_ } | Select-Object -Unique
     foreach ($requestedModel in $requestedModels) {
         if ($boundModels.Count -gt 0 -and $boundModels -cnotcontains $requestedModel) {
             throw "Preflight model '$requestedModel' is not bound by the replay manifest."
@@ -1427,6 +1496,8 @@ if ($Preflight) {
         role                     = $Role
         model                    = $Model
         secondGeneralistModel    = $SecondGeneralistModel
+        conventionSpecialistEnabled = [bool]$conventionSpecialistEnabled
+        conventionSpecialistModel = $effectiveConventionSpecialistModel
         fixtureId                = [string]$projection.fixtureId
         fixtureProjectionSha256  = $projectionSha256
         snapshotName             = $ReplaySnapshotName
@@ -1456,6 +1527,8 @@ if ($Preflight) {
         role = $Role
         model = $Model
         secondGeneralistModel = $SecondGeneralistModel
+        conventionSpecialistEnabled = [bool]$conventionSpecialistEnabled
+        conventionSpecialistModel = $effectiveConventionSpecialistModel
         fixture = [ordered]@{
             id = [string]$projection.fixtureId
             projectionPath = $projectionFull
@@ -1519,6 +1592,7 @@ if ($Preflight) {
     Assert-AcquisitionSchema -JsonText $readinessJson -SchemaName 'acquisition-readiness.schema.json' `
         -Surface 'The acquisition readiness report'
     Write-Output $readinessJson
+    $configGuardStream.Dispose()
     exit 0
 }
 
@@ -1559,6 +1633,8 @@ $plan = [ordered]@{
     role                     = $Role
     model                    = $Model
     secondGeneralistModel    = $SecondGeneralistModel
+    conventionSpecialistEnabled = [bool]$conventionSpecialistEnabled
+    conventionSpecialistModel = $effectiveConventionSpecialistModel
     fixtureId                = [string]$projection.fixtureId
     fixtureProjectionSha256  = $projectionSha256
     snapshotName             = $ReplaySnapshotName
@@ -1671,7 +1747,14 @@ try {
     #    production cycle under the replay session, so the child is configured with
     #    the surrounding cross-check model set the production orchestration needs to
     #    build the exact input for the one captured role.
-    if ($Role -eq 'specialist') {
+    if ($Role -eq 'generalist' -and $conventionSpecialistEnabled) {
+        $reviewerArgs += @(
+            '-EnableConventionSpecialist',
+            '-ConventionSpecialistModel', $effectiveConventionSpecialistModel,
+            '-ConventionSpecialistTimeoutSeconds', "$PerCallTimeoutSeconds"
+        )
+    }
+    elseif ($Role -eq 'specialist') {
         $reviewerArgs += @(
             '-EnableConventionSpecialist', '-ConventionSpecialistModel', $Model,
             '-ConventionSpecialistTimeoutSeconds', "$PerCallTimeoutSeconds"
@@ -1820,6 +1903,8 @@ if ($exitCode -eq 0 -and $core) {
         reportedModel      = [string]$core.reportedModel
         requestedModel     = [string]$core.requestedModel
         secondGeneralistModel = [string]$core.secondGeneralistModel
+        conventionSpecialistEnabled = [bool]$core.conventionSpecialistEnabled
+        conventionSpecialistModel = $core.conventionSpecialistModel
         nonce              = [string]$core.nonce
         nonceSha256        = [string]$core.nonceSha256
         resultMarkerPrefix = [string]$core.resultMarkerPrefix
@@ -1904,6 +1989,8 @@ else {
         role           = $Role
         requestedModel = $Model
         secondGeneralistModel = $SecondGeneralistModel
+        conventionSpecialistEnabled = [bool]$conventionSpecialistEnabled
+        conventionSpecialistModel = $effectiveConventionSpecialistModel
         terminalStatus = $terminalStatus
         supervisor     = $supervisorResult
         telemetry      = $telemetry
@@ -1933,5 +2020,6 @@ else {
         "exit=$exitCode timeoutReason='$([string]$supervisorResult.TimeoutReason)'. Terminal evidence at $terminalPath.")
 }
 
+if ($configGuardStream) { try { $configGuardStream.Dispose() } catch { } }
 if ($leaseStream) { try { $leaseStream.Dispose() } catch { } }
 exit $exitCode

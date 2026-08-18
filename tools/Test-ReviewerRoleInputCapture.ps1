@@ -654,14 +654,20 @@ function Invoke-CapturedRolePipeline {
         $sourceManifestPath = Join-Path $Bundle.ReplaySource 'manifest.json'
         $pipelineSecondGeneralistModel = if ($Role -ceq 'verifier' -and
             $Model -ceq 'gpt-5.6-sol') { 'claude-opus-5' } else { 'gpt-5.6-sol' }
-        $raw = & pwsh -NoProfile -File $MaterializeTool @(
+        $materializeArgs = @(
             '-PackRoot', $CaptureRoot, '-LegacyProjectionFile', $projection.FullName, '-Role', $Role,
             '-RoleProvenanceFile', $provenance.FullName, '-ReplaySnapshotPath', $Bundle.ReplaySource,
             '-ConfigFile', $Bundle.ConfigFile, '-PromptFile', $PromptFile,
             '-ExpectedReplayManifestFileSha256', (Sha $sourceManifestPath),
             '-ExpectedConfigSha256', (Sha $Bundle.ConfigFile), '-ExpectedPromptSha256', $promptSha,
             '-SecondGeneralistModel', $pipelineSecondGeneralistModel,
-            '-OutputRoot', $materialized, '-RepoRoot', $RepoRoot) 2>&1
+            '-OutputRoot', $materialized, '-RepoRoot', $RepoRoot)
+        if ($Role -cne 'generalist') {
+            $materializeArgs += @(
+                '-ConventionSpecialistModel',
+                $(if ($Role -ceq 'specialist') { $Model } else { 'claude-sonnet-5' }))
+        }
+        $raw = & pwsh -NoProfile -File $MaterializeTool @materializeArgs 2>&1
         if ($LASTEXITCODE -ne 0) {
             return [pscustomobject]@{ Ready = $false; Detail = (($raw | Out-String).Trim()) }
         }
