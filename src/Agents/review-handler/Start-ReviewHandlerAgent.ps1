@@ -490,17 +490,30 @@ function Test-HandlerReadyToComplete {
 }
 
 function Test-HandlerShouldRequeueBuddy {
-    <# Requeue the buddy build for refs/pull/<id>/merge when a commit was pushed
-       and the latest build is missing, terminally not-Succeeded, or older than
-       the pushed commit. Max one requeue per cycle (enforced by the caller). #>
-    param([AllowNull()][string]$PushedCommit, [AllowNull()]$LatestBuild)
-    if ([string]::IsNullOrEmpty($PushedCommit)) { return $false }
+    <# Requeue the buddy build for refs/pull/<id>/merge when the latest build is
+       missing, terminally not-Succeeded, older than a pushed commit, or older
+       than the repository's configured validation lifetime. This also covers
+       comment-only handling cycles that do not produce a commit. Max one
+       requeue per cycle is enforced by the caller. #>
+    param(
+        [AllowNull()][string]$PushedCommit,
+        [AllowNull()]$LatestBuild,
+        [ValidateRange(0, 43200)][int]$ValidityMinutes,
+        [DateTimeOffset]$NowUtc = [DateTimeOffset]::UtcNow
+    )
     if ($null -eq $LatestBuild) { return $true }
     $status = [string](Get-HandlerHashValue -Container $LatestBuild -Key 'status' -Default '')
     $result = [string](Get-HandlerHashValue -Container $LatestBuild -Key 'result' -Default '')
     $sourceVersion = [string](Get-HandlerHashValue -Container $LatestBuild -Key 'sourceVersion' -Default '')
-    if ($sourceVersion -and ($sourceVersion -ine $PushedCommit)) { return $true }
+    if ($PushedCommit -and $sourceVersion -and ($sourceVersion -ine $PushedCommit)) { return $true }
     if (($status -ieq 'completed') -and ($result -and ($result -ine 'succeeded'))) { return $true }
+    if (($status -ieq 'completed') -and ($result -ieq 'succeeded') -and $ValidityMinutes -gt 0) {
+        $finishText = [string](Get-HandlerHashValue -Container $LatestBuild -Key 'finishTime' -Default '')
+        $finishTime = [DateTimeOffset]::MinValue
+        if ($finishText -and [DateTimeOffset]::TryParse($finishText, [ref]$finishTime)) {
+            if (($NowUtc.ToUniversalTime() - $finishTime.ToUniversalTime()).TotalMinutes -ge $ValidityMinutes) { return $true }
+        }
+    }
     return $false
 }
 
@@ -610,6 +623,7 @@ $ConsecutiveFailureThreshold = Get-AgentConfigInt -Object $timing -Name "consecu
 $buddy = Get-AgentConfigObject -Object $Cfg -Name "buddyBuild" -Where "config"
 $BuddyPipelineId = Get-AgentConfigInt -Object $buddy -Name "pipelineId" -Where "config.buddyBuild" -Min 1 -Max ([int]::MaxValue)
 $BuddyMergeRefTemplate = Get-AgentConfigString -Object $buddy -Name "prMergeRefTemplate" -Where "config.buddyBuild" -MaxLength 128
+$BuddyValidityMinutes = Get-AgentConfigInt -Object $buddy -Name "validityMinutes" -Where "config.buddyBuild" -Min 0 -Max 43200
 
 $threadCfg = Get-AgentConfigObject -Object $Cfg -Name "threadClassification" -Where "config"
 $AgentSignatureMarkers = Get-AgentConfigStringArray -Object $threadCfg -Name "agentSignatureMarkers" -Where "config.threadClassification"
@@ -1149,12 +1163,17 @@ function Invoke-DryRunSelfChecks {
     if ([array]::IndexOf($yolo, "--yolo") -lt 0 -or (($yolo -join ' ') -notmatch 'ado\(repo_pull_request_write\)')) { $failures.Add("Yolo mode dropped --yolo or the mandatory deny-list.") } else { Write-Host "  OK - yolo still applies the mandatory deny-list" -ForegroundColor Green }
 
     Write-Host "[DRY-RUN] Self-check 14/$total : buddy-requeue + auto-complete gating truth tables" -ForegroundColor Cyan
-    if (Test-HandlerShouldRequeueBuddy -PushedCommit $null -LatestBuild $null) { $failures.Add("Requeue proposed with no pushed commit.") }
-    if (-not (Test-HandlerShouldRequeueBuddy -PushedCommit ("d" * 40) -LatestBuild $null)) { $failures.Add("Requeue not proposed when no build exists for a pushed commit.") }
-    if (-not (Test-HandlerShouldRequeueBuddy -PushedCommit ("d" * 40) -LatestBuild @{ status = 'completed'; result = 'partiallySucceeded'; sourceVersion = ("d" * 40) })) { $failures.Add("Requeue not proposed for a terminal non-Succeeded build.") }
-    if (Test-HandlerShouldRequeueBuddy -PushedCommit ("d" * 40) -LatestBuild @{ status = 'completed'; result = 'succeeded'; sourceVersion = ("d" * 40) }) { $failures.Add("Requeue proposed for a Succeeded up-to-date build.") }
-    if (-not (Test-HandlerShouldRequeueBuddy -PushedCommit ("d" * 40) -LatestBuild @{ status = 'completed'; result = 'succeeded'; sourceVersion = ("e" * 40) })) { $failures.Add("Requeue not proposed when build is older than pushed commit.") }
-    if (-not ($failures -match "Requeue")) { Write-Host "  OK - buddy requeue gating holds (missing/stale/non-succeeded => requeue)" -ForegroundColor Green }
+    $nowProbe = [DateTimeOffset]::Parse('2026-08-18T12:00:00Z')
+    if (-not (Test-HandlerShouldRequeueBuddy -PushedCommit $null -LatestBuild $null -ValidityMinutes 720 -NowUtc $nowProbe)) { $failures.Add("Requeue not proposed for a missing build after a comment-only cycle.") }
+    if (-not (Test-HandlerShouldRequeueBuddy -PushedCommit ("d" * 40) -LatestBuild $null -ValidityMinutes 720 -NowUtc $nowProbe)) { $failures.Add("Requeue not proposed when no build exists for a pushed commit.") }
+    if (-not (Test-HandlerShouldRequeueBuddy -PushedCommit ("d" * 40) -LatestBuild @{ status = 'completed'; result = 'partiallySucceeded'; sourceVersion = ("d" * 40) } -ValidityMinutes 720 -NowUtc $nowProbe)) { $failures.Add("Requeue not proposed for a terminal non-Succeeded build.") }
+    if (Test-HandlerShouldRequeueBuddy -PushedCommit $null -LatestBuild @{ status = 'inProgress'; result = ''; finishTime = '' } -ValidityMinutes 720 -NowUtc $nowProbe) { $failures.Add("Requeue proposed while the current build is still running.") }
+    if (Test-HandlerShouldRequeueBuddy -PushedCommit $null -LatestBuild @{ status = 'completed'; result = 'succeeded'; finishTime = '2026-08-18T01:00:01Z' } -ValidityMinutes 720 -NowUtc $nowProbe) { $failures.Add("Requeue proposed for a fresh Succeeded build after a comment-only cycle.") }
+    if (-not (Test-HandlerShouldRequeueBuddy -PushedCommit $null -LatestBuild @{ status = 'completed'; result = 'succeeded'; finishTime = '2026-08-18T00:00:00Z' } -ValidityMinutes 720 -NowUtc $nowProbe)) { $failures.Add("Requeue not proposed for an expired Succeeded build after a comment-only cycle.") }
+    if (Test-HandlerShouldRequeueBuddy -PushedCommit $null -LatestBuild @{ status = 'completed'; result = 'succeeded'; finishTime = 'not-a-date' } -ValidityMinutes 720 -NowUtc $nowProbe) { $failures.Add("Requeue proposed from an unreadable build timestamp.") }
+    if (Test-HandlerShouldRequeueBuddy -PushedCommit ("d" * 40) -LatestBuild @{ status = 'completed'; result = 'succeeded'; sourceVersion = ("d" * 40); finishTime = '2026-08-18T01:00:01Z' } -ValidityMinutes 720 -NowUtc $nowProbe) { $failures.Add("Requeue proposed for a Succeeded up-to-date build.") }
+    if (-not (Test-HandlerShouldRequeueBuddy -PushedCommit ("d" * 40) -LatestBuild @{ status = 'completed'; result = 'succeeded'; sourceVersion = ("e" * 40); finishTime = '2026-08-18T01:00:01Z' } -ValidityMinutes 720 -NowUtc $nowProbe)) { $failures.Add("Requeue not proposed when build is older than pushed commit.") }
+    if (-not ($failures -match "Requeue")) { Write-Host "  OK - buddy requeue gating covers missing, failed, stale-commit and expired builds, including comment-only cycles" -ForegroundColor Green }
     $readyMarker = @{ readyToComplete = $true; threadsAddressed = 8; validation = 'passed' }
     if (Test-HandlerShouldSetAutoComplete -Marker $readyMarker -RemainingActionableThreadCount 1 -ApprovalCount 1 -NegativeVoteCount 0 -BuddyResult 'succeeded') { $failures.Add("Auto-complete proposed while actionable threads remain.") }
     if (Test-HandlerShouldSetAutoComplete -Marker $readyMarker -RemainingActionableThreadCount 0 -ApprovalCount 0 -NegativeVoteCount 0 -BuddyResult 'succeeded') { $failures.Add("Auto-complete proposed with zero approvals.") }
@@ -1987,9 +2006,9 @@ function Invoke-HandlerCycle {
         $requeued = $false
         $autoCompleted = $false
 
-        if ($EnableBuddyRequeue -and $pushedCommit) {
+        if ($EnableBuddyRequeue) {
             $latestBuild = Get-HandlerLatestBuddyBuild -Session $session -PrId $prId
-            if (Test-HandlerShouldRequeueBuddy -PushedCommit $pushedCommit -LatestBuild $latestBuild) {
+            if (Test-HandlerShouldRequeueBuddy -PushedCommit $pushedCommit -LatestBuild $latestBuild -ValidityMinutes $BuddyValidityMinutes) {
                 # Same contract hazard as auto-complete: read the reply as text,
                 # then confirm by re-reading the build list. A queued build that
                 # reported an unreadable response must not be queued twice.
