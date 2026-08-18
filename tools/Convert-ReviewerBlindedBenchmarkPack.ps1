@@ -29,6 +29,8 @@ param(
     [ValidatePattern('^[0-9a-fA-F]{64}$')][string]$ExpectedConfigSha256,
     [Parameter(ParameterSetName = 'Materialize', Mandatory)]
     [ValidatePattern('^[0-9a-fA-F]{64}$')][string]$ExpectedPromptSha256,
+    [Parameter(ParameterSetName = 'Materialize', Mandatory)]
+    [string]$SecondGeneralistModel,
     [Parameter(ParameterSetName = 'Materialize')]
     [string]$ReviewerScriptFile,
     [Parameter(Mandatory)][string]$OutputRoot,
@@ -423,6 +425,19 @@ if ([long]$sourceManifestAfterLoad.Length -ne [long]$sourceManifestBytes.Length 
 if ([bool]$sourceSnapshot.Classification.NonPromotable) {
     throw "The source replay is already classified '$([string]$sourceSnapshot.Classification.SealKind)'; materialization will not replace existing non-promotable lineage."
 }
+$generalistPair = Get-AgentGeneralistModelPair
+[void](Assert-AgentSupportedModel -ModelId $SecondGeneralistModel `
+        -Where 'benchmark materialization second generalist model')
+if (@($generalistPair.Models) -cnotcontains $SecondGeneralistModel) {
+    throw ("Benchmark materialization requires one member of the current configured " +
+        "generalist pair: $($generalistPair.First) and $($generalistPair.Second).")
+}
+$pairedGeneralistModel = @($generalistPair.Models | Where-Object {
+        [string]$_ -cne [string]$SecondGeneralistModel
+    })[0]
+if (@($sourceSnapshot.Bindings.Models) -cnotcontains $pairedGeneralistModel) {
+    throw "The source replay does not bind the paired generalist '$pairedGeneralistModel'."
+}
 
 $replayBinding = $sourceSnapshot.Binding
 $legacyBinding = $legacy.binding
@@ -583,11 +598,15 @@ try {
         configSha256 = $configSha
         promptSha256 = $promptSha
         reviewerScriptSha256 = $scriptSha
+        secondGeneralistModel = $SecondGeneralistModel
     }
     $sidecarName = 'benchmark-pack-materialization.json'
     $sidecarPath = Join-Path $stagedSnapshot $sidecarName
     [IO.File]::WriteAllText($sidecarPath, (Get-CanonicalJson $sidecar), $Utf8)
     $sourceManifest.Remove('manifestDigest')
+    $sourceManifest.bindings.models = @(
+        @($sourceManifest.bindings.models) + $SecondGeneralistModel |
+            Select-Object -Unique)
     if ([int]$sourceManifest.schemaVersion -eq 1) {
         # Version 3 is the classified counterpart of the v1 shape: it adds only
         # the digest-bound non-promotable classification. Version 2 remains the
@@ -632,9 +651,11 @@ try {
             configSha256 = $configSha
             promptSha256 = $promptSha
             reviewerScriptSha256 = $scriptSha
+            secondGeneralistModel = $SecondGeneralistModel
         }
         output = [ordered]@{
             role = $Role
+            secondGeneralistModel = $SecondGeneralistModel
             projectionSha256 = Get-FileSha256 $projectionPath
             snapshotName = $snapshotName
             replayManifestDigest = $materializedDigest
@@ -675,6 +696,7 @@ try {
             replaySnapshotName = $snapshotName
             replayManifestDigest = $materializedDigest
             configFile = (Join-Path $outputFull 'config\reviewer.config.json')
+            secondGeneralistModel = $SecondGeneralistModel
         } | ConvertTo-Json -Depth 8 -Compress)
 }
 finally {

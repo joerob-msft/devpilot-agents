@@ -652,12 +652,15 @@ function Invoke-CapturedRolePipeline {
                 [IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar))
         $materialized = Join-Path $runRoot "pipeline-materialized-$pipelineTag"
         $sourceManifestPath = Join-Path $Bundle.ReplaySource 'manifest.json'
+        $pipelineSecondGeneralistModel = if ($Role -ceq 'verifier' -and
+            $Model -ceq 'gpt-5.6-sol') { 'claude-opus-5' } else { 'gpt-5.6-sol' }
         $raw = & pwsh -NoProfile -File $MaterializeTool @(
             '-PackRoot', $CaptureRoot, '-LegacyProjectionFile', $projection.FullName, '-Role', $Role,
             '-RoleProvenanceFile', $provenance.FullName, '-ReplaySnapshotPath', $Bundle.ReplaySource,
             '-ConfigFile', $Bundle.ConfigFile, '-PromptFile', $PromptFile,
             '-ExpectedReplayManifestFileSha256', (Sha $sourceManifestPath),
             '-ExpectedConfigSha256', (Sha $Bundle.ConfigFile), '-ExpectedPromptSha256', $promptSha,
+            '-SecondGeneralistModel', $pipelineSecondGeneralistModel,
             '-OutputRoot', $materialized, '-RepoRoot', $RepoRoot) 2>&1
         if ($LASTEXITCODE -ne 0) {
             return [pscustomobject]@{ Ready = $false; Detail = (($raw | Out-String).Trim()) }
@@ -671,13 +674,12 @@ function Invoke-CapturedRolePipeline {
             '-ReplayManifestDigest', ([string]$m.replayManifestDigest), '-ExpectedReviewerBaseCommit', $expectedBase,
             '-PullRequestId', '4242', '-ExpectedHeadCommit', $head, '-ExpectedRef', $ref,
             '-OutputRoot', $preflightOut, '-RepoRoot', $RepoRoot,
-            '-SealKeyPath', (Join-Path $runRoot 'seal.key'), '-AllowDirtyWorktree'
+            '-SealKeyPath', (Join-Path $runRoot 'seal.key'), '-AllowDirtyWorktree',
+            '-SecondGeneralistModel', $pipelineSecondGeneralistModel
         )
         if ($Role -cne 'generalist') {
-            $secondGeneralistModel = if ($Role -ceq 'verifier' -and
-                $Model -ceq 'gpt-5.6-sol') { 'claude-opus-5' } else { 'gpt-5.6-sol' }
             $args += @('-DiscoveryGeneralistModel', 'claude-opus-5',
-                '-SecondGeneralistModel', $secondGeneralistModel, '-ConventionSpecialistModel',
+                '-ConventionSpecialistModel',
                 $(if ($Role -ceq 'specialist') { $Model } else { 'claude-sonnet-5' }))
         }
         if ($Role -ceq 'verifier') {
@@ -1142,7 +1144,8 @@ exit 91
         '-RoleProvenanceFile', $captureProvenance.FullName, '-ReplaySnapshotPath', $ReplayPath,
         '-ConfigFile', $ConfigFile, '-PromptFile', $PromptFile,
         '-ExpectedReplayManifestFileSha256', $manifestSha, '-ExpectedConfigSha256', $configSha,
-        '-ExpectedPromptSha256', $promptSha, '-OutputRoot', $captureMaterialized, '-RepoRoot', $RepoRoot) 2>&1
+        '-ExpectedPromptSha256', $promptSha, '-SecondGeneralistModel', 'gpt-5.6-sol',
+        '-OutputRoot', $captureMaterialized, '-RepoRoot', $RepoRoot) 2>&1
     $materializedExit = $LASTEXITCODE
     Check 'capture output materializes through PR50' ($materializedExit -eq 0) (($materializedRaw | Out-String).Trim())
     $captureMaterializedResult = if ($materializedExit -eq 0) { (($materializedRaw -join '') | ConvertFrom-Json) } else { $null }
@@ -1158,6 +1161,7 @@ exit 91
         -ReplaySource $verifierReplaySource -FixtureId 'synthetic-generalist-capture'
     $acqRaw = & pwsh -NoProfile -File $AcquireTool @(
         '-Role', 'generalist', '-FixtureProjectionFile', (Join-Path $captureMaterialized 'projection.json'), '-Model', 'claude-opus-5',
+        '-SecondGeneralistModel', 'gpt-5.6-sol',
         '-ConfigFile', (Join-Path $acqConfigDir 'reviewer.config.json'),
         '-ReplayRoot', (Split-Path $verifierReplaySource -Parent),
         '-ReplaySnapshotName', (Split-Path $verifierReplaySource -Leaf),

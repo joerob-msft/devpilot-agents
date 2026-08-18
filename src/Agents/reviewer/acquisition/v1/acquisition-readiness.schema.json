@@ -4,13 +4,14 @@
   "title": "Reviewer blinded acquisition readiness",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "kind", "ready", "role", "model", "fixture", "replay", "config", "repository", "candidate", "output", "checks", "sideEffects"],
+  "required": ["schemaVersion", "kind", "ready", "role", "model", "secondGeneralistModel", "fixture", "replay", "config", "repository", "candidate", "output", "checks", "sideEffects"],
   "properties": {
     "schemaVersion": { "const": 1 },
     "kind": { "const": "reviewer-blinded-acquisition-readiness" },
     "ready": { "const": true },
     "role": { "enum": ["generalist", "specialist", "verifier"] },
     "model": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "secondGeneralistModel": { "type": "string", "minLength": 1, "maxLength": 128 },
     "fixture": {
       "type": "object",
       "additionalProperties": false,

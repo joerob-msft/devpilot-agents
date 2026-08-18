@@ -16127,6 +16127,18 @@ function Invoke-ReviewerBlindedAcquisitionRun {
 
     # -- Bind model, snapshot, base commit -----------------------------------
     Assert-AgentSupportedModel -Model ([string]$plan.model)
+    $planSecondGeneralistModel = Assert-AgentSupportedModel -Model ([string]$plan.secondGeneralistModel)
+    if (-not $EffectiveSecondPassModel -or
+        [string]$EffectiveSecondPassModel -cne [string]$planSecondGeneralistModel) {
+        throw "The configured -SecondPassModel does not match the acquisition plan's secondGeneralistModel binding."
+    }
+    if (-not (Test-AgentGeneralistModelPair -Models @($EffectiveModel, $EffectiveSecondPassModel))) {
+        throw "The acquisition child does not carry the current configured generalist model pair."
+    }
+    if ($AcquireTranscriptRole -cin @('generalist', 'verifier') -and
+        [string]$plan.model -cne [string]$EffectiveModel) {
+        throw "The acquisition plan model does not match the configured discovery generalist -Model."
+    }
     if ([string]$plan.snapshotName -cne [string]$ReplaySnapshotName) {
         throw "The plan snapshotName does not match the sealed replay snapshot."
     }
@@ -16856,6 +16868,7 @@ function Invoke-ReviewerBlindedAcquisitionRun {
         role              = $AcquireTranscriptRole
         requestedModel    = $model
         reportedModel     = $reportedModel
+        secondGeneralistModel = [string]$plan.secondGeneralistModel
         nonce             = $terminalNonce
         nonceSha256       = (Get-ReviewerTextSha256 -Text $terminalNonce)
         resultMarkerPrefix = [string]$roleMarkerPrefix

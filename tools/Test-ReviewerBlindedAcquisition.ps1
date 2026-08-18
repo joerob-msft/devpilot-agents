@@ -189,9 +189,11 @@ function Get-CommonArgs {
         [Parameter(Mandatory)][string]$Out, [Parameter(Mandatory)][string]$Role,
         [Parameter(Mandatory)][string]$Projection, [Parameter(Mandatory)][string]$Model,
         [Parameter(Mandatory)][string]$Manifest, [string]$SnapshotDigest = $digest,
+        [string]$SecondGeneralistModel = $(if ($Model -ceq 'gpt-5.6-sol') { 'claude-opus-5' } else { 'gpt-5.6-sol' }),
+        [switch]$OmitSecondGeneralistModel,
         [int]$PerCall = 30, [int]$Total = 90, [int]$Activity = 30
     )
-    return @(
+    $args = @(
         '-Role', $Role, '-FixtureProjectionFile', $Projection, '-Model', $Model,
         '-ConfigFile', $configFile, '-ReplayRoot', $replayRoot,
         '-ReplaySnapshotName', 'synthetic-pr', '-ReplayManifestDigest', $SnapshotDigest,
@@ -200,12 +202,17 @@ function Get-CommonArgs {
         '-OutputRoot', $Out, '-SealKeyPath', $sealKey, '-AllowDirtyWorktree', '-UseOfflineStubAdapter',
         '-PerCallTimeoutSeconds', "$PerCall", '-TotalTimeoutSeconds', "$Total", '-ActivityTimeoutSeconds', "$Activity"
     )
+    if (-not $OmitSecondGeneralistModel) {
+        $args += @('-SecondGeneralistModel', $SecondGeneralistModel)
+    }
+    return $args
 }
 
 function Get-ProductionArgs {
     param([Parameter(Mandatory)][string]$Out)
     return @(
         '-Role', 'generalist', '-FixtureProjectionFile', $genProjection, '-Model', 'claude-opus-5',
+        '-SecondGeneralistModel', 'gpt-5.6-sol',
         '-ConfigFile', $configFile, '-ReplayRoot', $replayRoot,
         '-ReplaySnapshotName', 'synthetic-pr', '-ReplayManifestDigest', $digest,
         '-ExpectedReviewerBaseCommit', $expectedBase,
@@ -421,6 +428,7 @@ function Invoke-ChildDirect {
         '-NoProfile', '-File', $reviewerScript, '-Once', '-RepoPath', $rp,
         '-ConfigFile', $configFile, '-StateDir', $st, '-OperatorAlias', 'acquisition-operator',
         '-PullRequestId', '4242', '-Model', $Model, '-CycleTimeoutSeconds', '45',
+        '-SecondPassModel', 'gpt-5.6-sol',
         '-ReplayRoot', $replayRoot, '-ReplaySnapshotName', 'synthetic-pr', '-ReplayManifestDigest', $digest,
         '-ExpectedReviewerBaseCommit', $expectedBase,
         '-AcquireTranscriptRole', 'generalist', '-AcquisitionPlanFile', $PlanFile,
@@ -525,7 +533,8 @@ function Test-Gate {
     Check ("gate/$Name refuses (exit!=0)") ($r.Exit -ne 0) ("exit=$($r.Exit)")
     Check ("gate/$Name leaves no sealed package") (-not $sealed)
     if ($ExpectedError) {
-        Check ("gate/$Name reports expected refusal") ((Get-Content -LiteralPath $r.Log -Raw) -like "*$ExpectedError*")
+        $gateLog = Get-Content -LiteralPath $r.Log -Raw
+        Check ("gate/$Name reports expected refusal") ($gateLog -like "*$ExpectedError*") $gateLog
     }
 }
 
@@ -538,6 +547,52 @@ Test-Gate 'wrongRole' (Get-CommonArgs -Out $wrOut -Role generalist -Projection $
 $umOut = New-OutDir 'gate_badModel'
 Test-Gate 'unsupportedModel' (Get-CommonArgs -Out $umOut -Role generalist -Projection $genProjection -Model 'totally-not-a-model' -Manifest $baseManifest) $umOut
 
+$missingSecondOut = New-OutDir 'gate_missingSecond'
+Test-Gate 'missingSecondGeneralist' (Get-CommonArgs -Out $missingSecondOut -Role generalist `
+        -Projection $genProjection -Model 'claude-opus-5' -Manifest $baseManifest `
+        -OmitSecondGeneralistModel) $missingSecondOut 'requires -SecondGeneralistModel'
+
+$equalSecondOut = New-OutDir 'gate_equalSecond'
+Test-Gate 'equalSecondGeneralist' (Get-CommonArgs -Out $equalSecondOut -Role generalist `
+        -Projection $genProjection -Model 'claude-opus-5' -Manifest $baseManifest `
+        -SecondGeneralistModel 'claude-opus-5') $equalSecondOut 'requires two distinct'
+
+$unsupportedSecondOut = New-OutDir 'gate_unsupportedSecond'
+Test-Gate 'unsupportedSecondGeneralist' (Get-CommonArgs -Out $unsupportedSecondOut -Role generalist `
+        -Projection $genProjection -Model 'claude-opus-5' -Manifest $baseManifest `
+        -SecondGeneralistModel 'unsupported-generalist') $unsupportedSecondOut 'unsupported model id'
+
+$nonCurrentSecondOut = New-OutDir 'gate_nonCurrentSecond'
+Test-Gate 'nonCurrentSecondGeneralist' (Get-CommonArgs -Out $nonCurrentSecondOut -Role generalist `
+        -Projection $genProjection -Model 'claude-opus-5' -Manifest $baseManifest `
+        -SecondGeneralistModel 'gpt-5.6-terra') $nonCurrentSecondOut 'current configured generalist pairing'
+
+$differentDiscoveryOut = New-OutDir 'gate_differentDiscovery'
+Test-Gate 'differentDiscoveryGeneralist' ((Get-CommonArgs -Out $differentDiscoveryOut -Role generalist `
+            -Projection $genProjection -Model 'claude-opus-5' -Manifest $baseManifest) +
+        @('-DiscoveryGeneralistModel', 'gpt-5.6-sol')) $differentDiscoveryOut `
+    'generalist acquisition is the discovery generalist'
+
+$missingDiscoveryOut = New-OutDir 'gate_missingDiscovery'
+$missingDiscoveryArgs = @(Get-SpecialistArgs -Out $missingDiscoveryOut -Manifest $baseManifest)
+$missingDiscoveryArgs = @(for ($i = 0; $i -lt $missingDiscoveryArgs.Count; $i++) {
+        if ([string]$missingDiscoveryArgs[$i] -ceq '-DiscoveryGeneralistModel') {
+            $i++
+            continue
+        }
+        $missingDiscoveryArgs[$i]
+    })
+Test-Gate 'missingDiscoveryGeneralist' $missingDiscoveryArgs $missingDiscoveryOut `
+    'requires -DiscoveryGeneralistModel'
+
+$emptyDiscoveryOut = New-OutDir 'gate_emptyDiscovery'
+$emptyDiscoveryArgs = @(Get-SpecialistArgs -Out $emptyDiscoveryOut -Manifest $baseManifest)
+$emptyDiscoveryIndex = [Array]::IndexOf(
+    $emptyDiscoveryArgs, '-DiscoveryGeneralistModel')
+$emptyDiscoveryArgs[$emptyDiscoveryIndex + 1] = ' '
+Test-Gate 'emptyDiscoveryGeneralist' $emptyDiscoveryArgs $emptyDiscoveryOut `
+    'requires -DiscoveryGeneralistModel'
+
 $whOut = New-OutDir 'gate_wrongHead'
 $whArgs = (Get-CommonArgs -Out $whOut -Role generalist -Projection $genProjection -Model claude-opus-5 -Manifest $baseManifest)
 $whArgs = $whArgs | ForEach-Object { if ($_ -ceq $head) { '0000000000000000000000000000000000000000' } else { $_ } }
@@ -545,6 +600,7 @@ Test-Gate 'wrongHead' $whArgs $whOut
 
 $wfOut = New-OutDir 'gate_wrongRef'
 $wfArgs = @('-Role', 'generalist', '-FixtureProjectionFile', $genProjection, '-Model', 'claude-opus-5',
+    '-SecondGeneralistModel', 'gpt-5.6-sol',
     '-ConfigFile', $configFile, '-ReplayRoot', $replayRoot, '-ReplaySnapshotName', 'synthetic-pr',
     '-ReplayManifestDigest', $digest,
     '-ExpectedReviewerBaseCommit', $expectedBase, '-PullRequestId', '4242', '-ExpectedHeadCommit', $head,
@@ -553,6 +609,7 @@ Test-Gate 'wrongRef' $wfArgs $wfOut 'Expected ref'
 
 $nbOut = New-OutDir 'gate_nonAncestorBase'
 $nbArgs = @('-Role', 'generalist', '-FixtureProjectionFile', $genProjection, '-Model', 'claude-opus-5',
+    '-SecondGeneralistModel', 'gpt-5.6-sol',
     '-ConfigFile', $configFile, '-ReplayRoot', $replayRoot, '-ReplaySnapshotName', 'synthetic-pr',
     '-ReplayManifestDigest', $digest,
     '-ExpectedReviewerBaseCommit', '1111111111111111111111111111111111111111', '-PullRequestId', '4242',
@@ -561,6 +618,7 @@ Test-Gate 'nonAncestorBase' $nbArgs $nbOut
 
 $smOut = New-OutDir 'gate_stubMissingManifest'
 $smArgs = @('-Role', 'generalist', '-FixtureProjectionFile', $genProjection, '-Model', 'claude-opus-5',
+    '-SecondGeneralistModel', 'gpt-5.6-sol',
     '-ConfigFile', $configFile, '-ReplayRoot', $replayRoot, '-ReplaySnapshotName', 'synthetic-pr',
     '-ReplayManifestDigest', $digest, '-ExpectedReviewerBaseCommit', $expectedBase, '-PullRequestId', '4242',
     '-ExpectedHeadCommit', $head, '-ExpectedRef', $ref, '-OutputRoot', $smOut, '-SealKeyPath', $sealKey,
@@ -569,6 +627,7 @@ Test-Gate 'stubMissingManifest' $smArgs $smOut 'requires -OfflineModelAdapterMan
 
 $tmOut = New-OutDir 'gate_manifestWithoutStub'
 $tmArgs = @('-Role', 'generalist', '-FixtureProjectionFile', $genProjection, '-Model', 'claude-opus-5',
+    '-SecondGeneralistModel', 'gpt-5.6-sol',
     '-ConfigFile', $configFile, '-ReplayRoot', $replayRoot, '-ReplaySnapshotName', 'synthetic-pr',
     '-ReplayManifestDigest', $digest, '-OfflineModelAdapterManifest', $baseManifest,
     '-ExpectedReviewerBaseCommit', $expectedBase, '-PullRequestId', '4242', '-ExpectedHeadCommit', $head,
@@ -586,6 +645,76 @@ Test-Gate 'weakTokenTooShort' ((Get-CommonArgs -Out $wtOut -Role generalist -Pro
 
 $leOut = New-OutDir 'gate_lowEntropyToken'
 Test-Gate 'lowEntropyToken' ((Get-CommonArgs -Out $leOut -Role generalist -Projection $genProjection -Model claude-opus-5 -Manifest $baseManifest) + @('-AuthorizationToken', ('a' * 40))) $leOut
+
+# Capture the production child argv without starting the reviewer. This isolates
+# the supervisor's exact Start-ReviewerAgent invocation from the offline adapter.
+$argvCapture = Join-Path $runRoot 'generalist-child-argv.json'
+$reviewerArgvStub = Join-Path $runRoot 'Start-ReviewerAgent-argv-stub.ps1'
+$escapedArgvCapture = $argvCapture.Replace("'", "''")
+@"
+[IO.File]::WriteAllText('$escapedArgvCapture', (`$args | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new(`$false))
+exit 91
+"@ | Set-Content -LiteralPath $reviewerArgvStub -Encoding UTF8
+$supervisorSource = [IO.File]::ReadAllText($tool, [Text.UTF8Encoding]::new($false, $true))
+$reviewerAssignment = "`$ReviewerScript = Join-Path `$RepoRoot 'src\Agents\reviewer\Start-ReviewerAgent.ps1'"
+Check 'production reviewer assignment has one replacement point' (
+    ($supervisorSource.Split([string[]]@($reviewerAssignment),
+            [StringSplitOptions]::None).Length - 1) -eq 1)
+$argvSupervisor = Join-Path $runRoot 'Invoke-ReviewerBlindedAcquisition-argv-stub.ps1'
+$stubAssignment = "`$ReviewerScript = '$($reviewerArgvStub.Replace("'", "''"))'"
+[IO.File]::WriteAllText($argvSupervisor,
+    $supervisorSource.Replace($reviewerAssignment, $stubAssignment),
+    [Text.UTF8Encoding]::new($false))
+$argvOut = New-OutDir 'generalist_child_argv'
+& pwsh -NoProfile -File $argvSupervisor @(
+    Get-CommonArgs -Out $argvOut -Role generalist -Projection $genProjection `
+        -Model 'claude-opus-5' -Manifest $baseManifest) *> (Join-Path $logDir 'generalist-child-argv.log')
+$capturedChildArgv = if (Test-Path -LiteralPath $argvCapture) {
+    @([IO.File]::ReadAllText($argvCapture, [Text.UTF8Encoding]::new($false, $true)) |
+            ConvertFrom-Json)
+} else { @() }
+$primaryIndexes = @()
+$secondIndexes = @()
+if ($capturedChildArgv.Count -gt 0) {
+    $primaryIndexes = @(0..($capturedChildArgv.Count - 1) | Where-Object {
+            [string]$capturedChildArgv[$_] -ceq '-Model'
+        })
+    $secondIndexes = @(0..($capturedChildArgv.Count - 1) | Where-Object {
+            [string]$capturedChildArgv[$_] -ceq '-SecondPassModel'
+        })
+}
+Check 'generalist production child receives Opus primary exactly once' (
+    $primaryIndexes.Count -eq 1 -and
+    [string]$capturedChildArgv[$primaryIndexes[0] + 1] -ceq 'claude-opus-5') (
+    $capturedChildArgv -join ' ')
+Check 'generalist production child receives GPT second pass exactly once' (
+    $secondIndexes.Count -eq 1 -and
+    [string]$capturedChildArgv[$secondIndexes[0] + 1] -ceq 'gpt-5.6-sol') (
+    $capturedChildArgv -join ' ')
+
+$forwardingFragment = "'-Model', `$childPrimaryModel, '-SecondPassModel', `$SecondGeneralistModel,"
+Check 'second-pass forwarding has one sabotage point' (
+    ($supervisorSource.Split([string[]]@($forwardingFragment),
+            [StringSplitOptions]::None).Length - 1) -eq 1)
+$omittedSecondSupervisor = Join-Path $runRoot 'Invoke-ReviewerBlindedAcquisition-second-omitted.ps1'
+[IO.File]::WriteAllText($omittedSecondSupervisor,
+    $supervisorSource.Replace($forwardingFragment, "'-Model', `$childPrimaryModel,"),
+    [Text.UTF8Encoding]::new($false))
+$omittedForwardOut = New-OutDir 'generalist_second_omitted'
+& pwsh -NoProfile -File $omittedSecondSupervisor @(
+    Get-CommonArgs -Out $omittedForwardOut -Role generalist -Projection $genProjection `
+        -Model 'claude-opus-5' -Manifest $baseManifest) *> (Join-Path $logDir 'generalist-second-omitted.log')
+$omittedForwardExit = $LASTEXITCODE
+$omittedForwardLog = Get-Content (Join-Path $logDir 'generalist-second-omitted.log') -Raw
+$omittedChildStderr = Join-Path $omittedForwardOut 'work\reviewer-stderr.log'
+if (Test-Path -LiteralPath $omittedChildStderr) {
+    $omittedForwardLog += "`n" + (Get-Content -LiteralPath $omittedChildStderr -Raw)
+}
+Check 'omitting second-pass forwarding reproduces the child pre-boundary refusal' (
+    $omittedForwardExit -ne 0 -and
+    $omittedForwardLog -match 'SecondPassModel|secondGeneralistModel' -and
+    -not (Test-Path -LiteralPath (Join-Path $omittedForwardOut 'package\transcript-package.json'))) `
+    $omittedForwardLog
 
 # ---------------------------------------------------------------------------
 # Group B - Snapshot digest mismatch is refused inside the sealed child
@@ -858,6 +987,10 @@ function Test-Behavior {
     Check ("$Name status=$ExpectStatus") ([string]$m.terminalStatus -eq $ExpectStatus) ("got=$([string]$m.terminalStatus)")
     Check ("$Name attempts=$ExpectAttempts") (@($m.attempts).Count -eq $ExpectAttempts) ("got=$(@($m.attempts).Count)")
     Check ("$Name reportedModel='$ExpectReported'") ([string]$m.reportedModel -eq $ExpectReported) ("got='$([string]$m.reportedModel)'")
+    $expectedSecond = if ($Model -ceq 'gpt-5.6-sol') { 'claude-opus-5' } else { 'gpt-5.6-sol' }
+    Check ("$Name bundle binds second generalist") (
+        [string]$m.secondGeneralistModel -ceq $expectedSecond) (
+        "got='$([string]$m.secondGeneralistModel)'")
     Check ("$Name zero real-model starts") ([int]$m.telemetry.realModelStarts -eq 0 -and [int]$m.telemetry.modelSubprocessStarts -ge 1) ("real=$([int]$m.telemetry.realModelStarts) sub=$([int]$m.telemetry.modelSubprocessStarts)")
     $telemetryFile = @($m.files | Where-Object { [string]$_.name -ceq 'telemetry.jsonl' })
     Check ("$Name zeroWriteVerified and telemetry sink bound") `
@@ -898,6 +1031,11 @@ Test-Behavior -Name 'stdoutSaturation' -Behavior 'stdoutSaturation' -Model 'clau
 Test-Behavior -Name 'wrongBinding' -Behavior 'wrongBinding' -Model 'claude-opus-5' -ExpectExit 0 -ExpectStatus 'captureFailedTerminal' -ExpectAttempts 1 -ExpectReported 'claude-opus-5'
 Test-Behavior -Name 'crash' -Behavior 'crash' -Model 'claude-opus-5' -RoleExtra @{ exitCode = 70 } -ExpectExit 0 -ExpectStatus 'crash' -ExpectAttempts 1 -ExpectReported ''
 
+$successOpusPlan = Read-Json (Join-Path (New-OutDir 'beh_successOpus') 'work\acquisition-plan.json')
+Check 'authored generalist plan hash-binds the second model' (
+    [string]$successOpusPlan.model -ceq 'claude-opus-5' -and
+    [string]$successOpusPlan.secondGeneralistModel -ceq 'gpt-5.6-sol')
+
 # Blocker 3: the generalist attempt ledger also preserves the exact production
 # parser status/reason (never a coarse remap). A retryable emission slip keeps its
 # typed class; a wrong binding is the typed terminal 'wrongBinding'.
@@ -920,6 +1058,9 @@ Check 'timeout writes terminal evidence' (Test-Path -LiteralPath $tePath)
 if (Test-Path -LiteralPath $tePath) {
     $te = Read-Json $tePath
     Check 'timeout terminalStatus=timeout' ([string]$te.terminalStatus -eq 'timeout') ("got=$([string]$te.terminalStatus)")
+    Check 'timeout evidence binds second generalist' (
+        [string]$te.secondGeneralistModel -ceq 'gpt-5.6-sol') (
+        "got='$([string]$te.secondGeneralistModel)'")
     $teTelemetryFile = @($te.files | Where-Object { [string]$_.name -ceq 'telemetry.jsonl' })
     Check 'timeout evidence proves zero real-model and binds telemetry sink' `
         ([int]$te.telemetry.realModelStarts -eq 0 -and
@@ -941,6 +1082,19 @@ $sealBase = New-OutDir 'beh_successOpus'   # reuse the sealed opus package from 
 $verifyArgs = @('-VerifyOnly', '-OutputRoot', $sealBase, '-SealKeyPath', $sealKey)
 $vi = Invoke-Tool -ToolArgs $verifyArgs -LogName 'verify-intact.log'
 Check 'verifyOnly intact -> exit 0' ($vi.Exit -eq 0) ("exit=$($vi.Exit)")
+
+$pairMismatchPackage = Copy-ResealedPackageVariant `
+    -SourcePackage (Join-Path $sealBase 'package') `
+    -Name 'second-generalist-manifest-core-mismatch' -Mutation {
+        param($core, $manifest)
+        $manifest.secondGeneralistModel = 'claude-opus-5'
+    }
+$pairMismatchRoot = Split-Path $pairMismatchPackage -Parent
+$pairMismatch = Invoke-Tool -ToolArgs @(
+    '-VerifyOnly', '-OutputRoot', $pairMismatchRoot, '-SealKeyPath', $sealKey
+) -LogName 'verify-second-generalist-mismatch.log'
+Check 'manifest/core second-generalist mismatch -> exit 2' (
+    $pairMismatch.Exit -eq 2) ("exit=$($pairMismatch.Exit)")
 
 # Read-only seal: bound files at EVERY depth must carry the ReadOnly attribute.
 $pkgDir = Join-Path $sealBase 'package'
@@ -1593,6 +1747,18 @@ else {
         $c1 = Invoke-ChildDirect -Label 'tamperedPlan' -PlanFile $c1Plan -Projection $genProjection -Env @{ REVIEWER_ACQUISITION_TOKEN = $knownToken }
         Check 'direct child with a TAMPERED plan refuses (blocker C)' (($c1.Exit -ne 0) -and -not $c1.Captured) ("exit=$($c1.Exit)")
         Check 'tampered-plan cites a tampered/replayed plan' ($c1.Log -match 'tampered or replayed') ''
+
+        # Even a correctly re-signed plan cannot substitute the second model: the
+        # child binds that authenticated field to its one configured argv value.
+        $c1SecondPlan = Join-Path $runRoot 'plan-second-substituted.json'
+        New-ResignedPlan -SrcPlan $kcPlan -DstPlan $c1SecondPlan -Token $knownToken `
+            -Replace @(@{ Old = 'gpt-5.6-sol'; New = 'gpt-5.6-terra' })
+        $c1Second = Invoke-ChildDirect -Label 'substitutedSecondModel' `
+            -PlanFile $c1SecondPlan -Projection $genProjection `
+            -Env @{ REVIEWER_ACQUISITION_TOKEN = $knownToken }
+        Check 're-signed second-model substitution refuses before launch' (
+            $c1Second.Exit -ne 0 -and -not $c1Second.Captured -and
+            $c1Second.Log -match 'secondGeneralistModel binding') ("exit=$($c1Second.Exit)")
 
         # C2 wrong-root / replay into a different context: present the VALID token + the
         # authentic plan + its real signature, but an output root that is NOT the plan's
