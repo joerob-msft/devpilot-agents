@@ -161,7 +161,7 @@ them otherwise:
   runs without a live capture or a model. The score is read back out of the contract ledger,
   which records the element count the boundary actually judged, so a cell states what was
   published rather than that a validator returned: of 1652 producer cells, 1120 are
-  cardinalities the producing function published (889 matching the constructed count, 231
+  cardinalities the producing function published (1009 matching the constructed count, 111
   legitimately reshaped by deduplication or union), 472 are refusals of the null-vs-missing
   and wrong-scalar shapes and are not counted as published cardinalities, 60 belong to the
   capture stage, and 0 remain gaps. What it still does not do is execute a stage end to end
@@ -201,7 +201,7 @@ external scrutiny, and the reason this page exists.
   no-write invariant is asserted, not relaxed.
 - **Producer-path coverage.** The remaining increment is narrower than it was, and named
   precisely: 60 cells on the capture stage need a live acquisition to mint a sealed package,
-  231 cells are reshaped rather than passed through, 230 rows are covered through their stage
+  111 cells are reshaped rather than passed through, 230 rows are covered through their stage
   boundary rather than their own call site, and 112 rows name a producer with no caller in
   `src/` today.
 - **On-disk file contract.** The versioned envelope is still test-only. No shipping path

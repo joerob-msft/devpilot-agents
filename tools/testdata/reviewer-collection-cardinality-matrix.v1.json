@@ -39,8 +39,8 @@
     "collectionShapeCells": 1617,
     "mapShapeCells": 35,
     "producerPathCovered": 1120,
-    "producerPathCensusMatched": 889,
-    "producerPathCensusReshaped": 231,
+    "producerPathCensusMatched": 1009,
+    "producerPathCensusReshaped": 111,
     "producerPathBoundaryRefusal": 472,
     "producerPathBoundaryOnly": 60,
     "producerPathGaps": 0,
@@ -8544,19 +8544,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -8591,19 +8591,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -8638,19 +8638,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -8685,19 +8685,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -8732,19 +8732,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -8779,19 +8779,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -8826,19 +8826,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -8873,19 +8873,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -8920,19 +8920,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -8967,19 +8967,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -9014,19 +9014,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -9061,19 +9061,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -9108,19 +9108,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -9155,19 +9155,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -9202,19 +9202,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -9249,19 +9249,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -9296,19 +9296,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -9343,19 +9343,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -9390,19 +9390,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -9437,19 +9437,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -9484,19 +9484,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -9531,19 +9531,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -9578,19 +9578,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -9625,19 +9625,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -9672,19 +9672,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -9719,19 +9719,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -9766,19 +9766,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -9813,19 +9813,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -9860,19 +9860,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }
@@ -9907,19 +9907,19 @@
       "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
-        "one": 0,
-        "many": 0,
-        "max": 0,
-        "duplicate": 0,
+        "one": 1,
+        "many": 3,
+        "max": 32,
+        "duplicate": 3,
         "nullVsMissing": -1,
         "wrongScalar": -1
       },
       "producerPath": {
         "zero": "producerCensusMatched",
-        "one": "producerCensusReshaped",
-        "many": "producerCensusReshaped",
-        "max": "producerCensusReshaped",
-        "duplicate": "producerCensusReshaped",
+        "one": "producerCensusMatched",
+        "many": "producerCensusMatched",
+        "max": "producerCensusMatched",
+        "duplicate": "producerCensusMatched",
         "nullVsMissing": "boundaryRefusal",
         "wrongScalar": "boundaryRefusal"
       }

@@ -200,8 +200,8 @@ than leaving it green.
 
 | Status | Cells | Meaning |
 |---|---:|---|
-| `producerCensusMatched` | 889 | The shipping producer ran and the boundary judged a census whose element count equals the cardinality the harness constructed |
-| `producerCensusReshaped` | 231 | The shipping producer ran and the boundary judged its census, but the count differs because the producer legitimately deduplicates, unions, or folds; `producerObservedCensus` records what the boundary saw |
+| `producerCensusMatched` | 1009 | The shipping producer ran and the boundary judged a census whose element count equals the cardinality the harness constructed |
+| `producerCensusReshaped` | 111 | The shipping producer ran and the boundary judged its census, but the count differs because the producer legitimately deduplicates, unions, or folds; `producerObservedCensus` records what the boundary saw |
 | `boundaryRefusal` | 472 | Not a census: the null-vs-missing and wrong-scalar variants are shapes a producer must never publish, and the evidence is the boundary refusing them **by name** before any consumer runs |
 | `boundaryOnly` | 60 | The registered boundary ran through the production builder, but the producing function needs a live capture |
 | `gap` | 0 | Neither ran |

@@ -71,6 +71,27 @@ function Assert-AdoptionThrows {
 # Static adoption: does the real producer call its builder and read the verdict?
 # ---------------------------------------------------------------------------
 
+function Get-ProducerLedgerCensus {
+    <#
+        The element count the boundary judged for one field on the most recent
+        assertion of a kind, or -1 when it recorded none. Asserting on this
+        rather than on "an array came back" is what separates a preparation that
+        drove a census from one that drove an empty list past a shape test.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Kind,
+        [Parameter(Mandatory)][string]$Field
+    )
+    $observed = -1
+    foreach ($entry in (Get-ReviewerStageContractLedger)) {
+        if ([string]$entry.Operation -cne 'assert' -or [string]$entry.Kind -cne $Kind) { continue }
+        $counts = $entry.ObservedCounts
+        if ($null -eq $counts -or -not $counts.Contains($Field)) { continue }
+        $observed = [int]$counts[$Field]
+    }
+    return $observed
+}
+
 function Test-ReviewerStageUnreachableCondition {
     <#
         True when a condition is a literal that can never hold. A boundary call
@@ -587,6 +608,30 @@ try {
         }
     }
 
+    # The ledger is bounded. The agent is one process looping on an interval, so
+    # an uncapped ledger is a leak that no -Once run can observe: it only shows up
+    # after weeks of continuous operation, which is exactly when nobody is looking.
+    Clear-ReviewerStageContractLedger
+    $ledgerCap = [int]$script:ReviewerStageContractLedgerMaxEntries
+    Assert-Adoption ($ledgerCap -gt 0) "The stage contract ledger declares no bound."
+    $overfillTarget = $ledgerCap + 25
+    for ($i = 0; $i -lt $overfillTarget; $i++) {
+        $null = New-ReviewerSourceStageContract -ChangedPaths ([string[]]@("src/f$i.ps1"))
+    }
+    $bounded = Get-ReviewerStageContractLedger
+    Assert-Adoption ([int]@($bounded).Count -eq $ledgerCap) `
+        "The ledger grew to $(@($bounded).Count) entries against a declared bound of $ledgerCap."
+    # Oldest-first eviction, and sequence numbers that stay monotonic across it, so
+    # a reader can tell a trimmed ledger from a short one.
+    Assert-Adoption ([int]$bounded[$bounded.Count - 1].Sequence -eq $overfillTarget) `
+        "The ledger's newest entry is sequence $($bounded[$bounded.Count - 1].Sequence), not $overfillTarget; eviction dropped the wrong end."
+    Assert-Adoption ([int]$bounded[0].Sequence -eq ($overfillTarget - $ledgerCap + 1)) `
+        "The ledger's oldest surviving entry is sequence $($bounded[0].Sequence); eviction is not oldest-first."
+    Clear-ReviewerStageContractLedger
+    $cleared = Get-ReviewerStageContractLedger
+    Assert-Adoption ([int]@($cleared).Count -eq 0) `
+        "Clearing the ledger left $([int]@($cleared).Count) entries behind."
+
     # -----------------------------------------------------------------------
     # 6. File contract adoption across all twelve kinds.
     # -----------------------------------------------------------------------
@@ -770,10 +815,19 @@ try {
     Assert-Adoption ($fingerprintPrepared -clike 'approval:*') `
         "The synthetic fingerprints preparation did not mint an approval coverage key."
 
+    # A modelled extension and a call that spans lines, so the invocation census
+    # is non-empty. A `.ps1` path is swept into partialFiles before any construct
+    # is enumerated, and a call that opens and closes on one line is not a
+    # multi-line construct - either mistake makes this preparation assert an
+    # empty census while looking like it exercised the boundary.
     $planPrepared = Get-ReviewerChangedConstructs -Files @(
-        @{ Path = 'src/one.ps1'; Lines = @('function Get-One {', '    Write-Output 1', '}'); ChangedLines = @(1, 2, 3) })
+        @{ Path = 'src/one.cs'; Lines = @('        // reviewer note', '        var value = Helper.Compute(', '            1);'); ChangedLines = @(1, 2, 3) })
     Assert-Adoption ($planPrepared.Files -is [System.Array] -and $planPrepared.PartiallyUnderstoodFiles -is [System.Array]) `
         "The synthetic specialist-plan preparation lost one of its six censuses."
+    Assert-Adoption ([int]@($planPrepared.Files).Count -eq 1) `
+        "The synthetic specialist-plan preparation understood no file, so its censuses prove nothing."
+    Assert-Adoption ([int](Get-ProducerLedgerCensus -Kind 'reviewer.stage.specialistplan.v1' -Field 'invocations') -eq 1) `
+        "The synthetic specialist-plan preparation published an empty invocation census."
 
     $assignmentPrepared = Get-ReviewerVerificationAssignments -Clusters $unionPrepared `
         -GeneralistModels ([string[]]@('model-a', 'model-b'))

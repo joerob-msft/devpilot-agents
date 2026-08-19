@@ -1201,16 +1201,24 @@ function Invoke-RealStageProducer {
         }
         'specialistPlan' {
             # The judged slot is the invocation census, so every synthetic file
-            # carries one changed invocation line. A file whose only changed line is
-            # a declaration would publish an empty invocation census at every
-            # cardinality and prove nothing about N.
+            # has to carry one construct the enumerator actually recognises.
+            # Two things make that so, and both were once wrong here:
+            # the extension must be a modelled one - a `.ps1` file is swept
+            # straight into partialFiles before any construct is enumerated -
+            # and the call must SPAN lines, because a call that opens and closes
+            # on one line is deliberately not a multi-line construct. A fixture
+            # that misses either publishes an empty invocation census at every
+            # cardinality and proves nothing about N.
             $files = [System.Collections.Generic.List[object]]::new()
             for ($i = 0; $i -lt $Count; $i++) {
                 $suffix = & $index $i
                 [void]$files.Add(@{
-                        Path = "src/f$i.ps1"
-                        Lines = @("Get-ReviewerThing$suffix -Value 1")
-                        ChangedLines = @(1)
+                        Path = "src/f$i.cs"
+                        Lines = @(
+                            "        // reviewer thing $suffix",
+                            "        var value$suffix = Helper.Compute$suffix(",
+                            "            1);")
+                        ChangedLines = @(1, 2, 3)
                     })
             }
             $null = Get-ReviewerChangedConstructs -Files ([object[]]$files.ToArray())
@@ -1409,6 +1417,34 @@ foreach ($stage in $inventoryDocument.stageOrder) {
     [void](Assert-True -Name "producer-path/stage-driven/$stage" `
             -Condition ($stageProducerDrive.ContainsKey([string]$stage)) `
             -Detail "the inventory declares stage '$stage' but no producer boundary was driven for it")
+}
+
+# A producer that runs but publishes the same census at every cardinality has not
+# been driven at those cardinalities - it has been handed input it discards. The
+# specialistPlan fixture once did exactly this: it named `.ps1` files, which are
+# swept aside before any construct is enumerated, so `zero` and `max` produced
+# byte-identical evidence that was nonetheless classified as reshaped. Requiring
+# the census to move is what makes an inert fixture fail instead of scoring.
+foreach ($stage in $inventoryDocument.stageOrder) {
+    $stageKey = [string]$stage
+    if (-not $stageProducerCensus.ContainsKey($stageKey)) { continue }
+    $drive = $stageProducerCensus[$stageKey]
+    $statuses = $stageProducerDrive[$stageKey]
+    $drivenByProducer = $false
+    foreach ($variant in @('zero', 'one', 'many', 'max')) {
+        if (-not $statuses.Contains($variant)) { continue }
+        if ([string]$statuses[$variant] -cin @('producerCensusMatched', 'producerCensusReshaped')) { $drivenByProducer = $true }
+    }
+    if (-not $drivenByProducer) { continue }
+    $distinct = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($variant in @('zero', 'one', 'many', 'max')) {
+        if (-not $drive.Contains($variant)) { continue }
+        [void]$distinct.Add([string]$drive[$variant])
+    }
+    [void](Assert-True -Name "producer-path/census-varies/$stageKey" `
+            -Condition ($distinct.Count -ge 2) `
+            -Detail ("the '$stageKey' producer published the same census at every cardinality " +
+                "($(@($distinct) -join ',')), so its cells record a fixture that never reached the boundary"))
 }
 
 # The producer path must refuse the historical collapse BEFORE the consumer runs,

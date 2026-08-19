@@ -48,6 +48,16 @@ $script:ReviewerStageContractRegistry =
 # The ledger is what makes adoption observable: a stage that stops calling the
 # boundary stops appearing, and a test can say so by name instead of waiting for
 # a downstream symptom.
+#
+# It is bounded. The reviewer agent is a single process that loops on an interval
+# for as long as it is left running, and every boundary crossing appends here, so
+# an uncapped list is a slow leak that no -Once test run can observe. The cap
+# keeps the most recent entries, which is what every reader of this ledger wants:
+# adoption is a claim about the run that just happened. Sequence numbers are
+# monotonic across evictions so a reader can still tell a trimmed ledger from a
+# short one.
+$script:ReviewerStageContractLedgerMaxEntries = 4096
+$script:ReviewerStageContractLedgerSequence = 0
 $script:ReviewerStageContractLedger = [System.Collections.Generic.List[object]]::new()
 
 function Register-ReviewerStageContract {
@@ -555,8 +565,9 @@ function Add-ReviewerStageContractLedgerEntry {
     if ($null -ne $ObservedCounts -and $ObservedCounts -is [System.Collections.IDictionary]) {
         foreach ($key in $ObservedCounts.Keys) { $counts[[string]$key] = [int]$ObservedCounts[$key] }
     }
+    $script:ReviewerStageContractLedgerSequence++
     [void]$script:ReviewerStageContractLedger.Add([pscustomobject][ordered]@{
-            Sequence = ($script:ReviewerStageContractLedger.Count + 1)
+            Sequence = $script:ReviewerStageContractLedgerSequence
             Kind = $Kind
             Producer = $Producer
             Operation = $Operation
@@ -565,6 +576,11 @@ function Add-ReviewerStageContractLedgerEntry {
             # which is not evidence that any particular census crossed the boundary.
             ObservedCounts = $counts
         })
+    # Evict oldest-first rather than growing without bound. RemoveRange is one
+    # shift instead of one per entry, so a long-lived process pays this once per
+    # overflow rather than on every crossing.
+    $overflow = $script:ReviewerStageContractLedger.Count - $script:ReviewerStageContractLedgerMaxEntries
+    if ($overflow -gt 0) { $script:ReviewerStageContractLedger.RemoveRange(0, $overflow) }
 }
 
 function Measure-ReviewerStageFieldCardinality {
@@ -613,6 +629,7 @@ function Get-ReviewerStageContractLedger {
 }
 
 function Clear-ReviewerStageContractLedger {
+    $script:ReviewerStageContractLedgerSequence = 0
     $script:ReviewerStageContractLedger = [System.Collections.Generic.List[object]]::new()
 }
 
