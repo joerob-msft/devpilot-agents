@@ -45,9 +45,13 @@ internal sealed class RunLease : IDisposable
     /// <summary>True when this run adopted a lease whose holder was gone.</summary>
     internal bool TookOverAbandoned { get; }
 
+    private static string LiveChildMessage(CoordinatorRequest request, string child) =>
+        $"The output root '{request.OutputRoot}' still has {child}. " +
+        "A coordinator that was killed leaves its child running; this run does not write alongside it. " +
+        "Wait for that child to exit, or end it, and run again.";
+
     internal static RunLease Acquire(CoordinatorRequest request)
-    {
-        Directory.CreateDirectory(request.CoordinatorRoot);
+    {        Directory.CreateDirectory(request.CoordinatorRoot);
         var tookOver = false;
 
         // A dead coordinator's lease can be taken over; a dead coordinator's CHILD
@@ -59,10 +63,7 @@ internal sealed class RunLease : IDisposable
         // own right, whatever the lease file says.
         if (ChildToolInvoker.DescribeLiveRecordedChild(request) is { } liveChild)
         {
-            throw new LeaseConflictException(
-                $"The output root '{request.OutputRoot}' still has {liveChild}. " +
-                "A coordinator that was killed leaves its child running; this run does not write alongside it. " +
-                "Wait for that child to exit, or end it, and run again.");
+            throw new LeaseConflictException(LiveChildMessage(request, liveChild));
         }
 
         for (var attempt = 0; attempt < 2; attempt++)
@@ -85,6 +86,25 @@ internal sealed class RunLease : IDisposable
                     var bytes = StrictJson.StrictUtf8.GetBytes(CanonicalJson.Readable(record));
                     handle.Write(bytes, 0, bytes.Length);
                     handle.Flush(flushToDisk: true);
+                    // Re-read the journals while the lease is HELD. The check above
+                    // is only an early, friendlier refusal: on its own it races a
+                    // coordinator that starts a child and is killed in the window
+                    // between that check and this acquisition, which would leave
+                    // this run holding the lease beside a live writer. Deciding it
+                    // again from inside the lease is what actually settles it,
+                    // because no third coordinator can be launching a child here.
+                    if (ChildToolInvoker.DescribeLiveRecordedChild(request) is { } racedChild)
+                    {
+                        throw new LeaseConflictException(LiveChildMessage(request, racedChild));
+                    }
+                }
+                catch (LeaseConflictException)
+                {
+                    // Give the lease back before reporting: a conflict this run did
+                    // not cause must not leave a lease file behind that outlives it.
+                    handle.Dispose();
+                    File.Delete(request.LeasePath);
+                    throw;
                 }
                 catch
                 {

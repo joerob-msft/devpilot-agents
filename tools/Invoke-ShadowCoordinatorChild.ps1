@@ -194,9 +194,11 @@ function Invoke-ShadowChildCorpusSeal {
     $replayRoot = Get-ShadowChildField -Request $Request -Name 'replayRoot'
     $validateOnly = Get-ShadowChildField -Request $Request -Name 'validateOnly' -Type bool
 
-    # The caller binds the recipe by content, not by path, and the check is made
-    # again here, in the process that actually reads the file. A path the
-    # coordinator hashed a moment ago is not the bytes this child seals.
+    # The caller binds the recipe by content, not by path. The digest is checked
+    # here for a clear early failure, and passed to the sealer so the SAME digest
+    # is checked over the exact bytes it parses - which is what actually closes
+    # the window, because a path the coordinator hashed a moment ago is not
+    # necessarily the bytes this child seals.
     if (-not (Test-Path -LiteralPath $recipePath -PathType Leaf)) {
         throw "The corpus recipe '$recipePath' does not exist."
     }
@@ -215,7 +217,7 @@ function Invoke-ShadowChildCorpusSeal {
     $tool = Join-Path $ToolkitRoot 'tools\Save-CorpusReplaySeal.ps1'
     if ($validateOnly) {
         & $tool -CorpusRoot $corpusRoot -CorpusIndexSha256 $indexSha -Recipe $recipePath `
-            -ReplayRoot $replayRoot -ValidateOnly | Out-Null
+            -RecipeSha256 $recipeSha -ReplayRoot $replayRoot -ValidateOnly | Out-Null
         return @{ validateOnly = $true; replayRoot = [string]$replayRoot }
     }
 
@@ -230,7 +232,7 @@ function Invoke-ShadowChildCorpusSeal {
     if ($null -ne $adopted) { return $adopted }
 
     $sealed = & $tool -CorpusRoot $corpusRoot -CorpusIndexSha256 $indexSha -Recipe $recipePath `
-        -ReplayRoot $replayRoot
+        -RecipeSha256 $recipeSha -ReplayRoot $replayRoot
     $sealed = @($sealed)[-1]
     if ($null -eq $sealed -or -not $sealed.PSObject.Properties['SnapshotId']) {
         throw 'The corpus sealer produced no snapshot record.'

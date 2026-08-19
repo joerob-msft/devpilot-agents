@@ -89,14 +89,25 @@ Beyond shape, the run is refused when:
   signs, so the two exist together or not at all,
 * the recipe file named by the request no longer hashes to the digest `corpusValidated` recorded
   for it. A resume skips the validation that blessed the recipe, so the seal re-checks the
-  content it is about to consume — in the coordinator before the child request is built, and
-  again in the child that reads the file,
+  content it is about to consume — in the coordinator before the child request is built, again
+  in the child, and finally inside the sealer itself: `Save-CorpusReplaySeal.ps1` takes an
+  optional `-RecipeSha256` and checks it over the exact bytes it parses, which is what closes
+  the window rather than narrowing it, because those bytes are never read a second time,
 * another live process holds the lease on the output root,
 * a child this output root's launch journal records as running is still alive. A coordinator
   killed from outside never runs its own cleanup, so the `pwsh` it started outlives it; the
   lease handle closes but the writer does not stop. The journal records the child's process ID
   *and* its start time at the moment it starts and clears them when it exits, so the next run
-  refuses while that exact process is alive and proceeds once it is gone.
+  refuses while that exact process is alive and proceeds once it is gone. The journals are read
+  twice: once before the lease is taken, for an early and friendlier refusal, and once from
+  inside the lease, which is the check that settles it — the first one on its own races a
+  coordinator that starts a child and is killed in the window before this one acquires.
+
+Liveness is always re-derived from the live process table and never trusted from a file, so a
+journal left behind by a crash, a full disk or a machine that was rebooted cannot wedge an output
+root: the recorded process is simply gone. A recorded identity that matches only by process ID
+is not the child either, so a recycled ID can produce a false conflict — which is safe — but
+never a false clearance.
 
 A child result is refused, even when it is genuine, correlated and correctly digested, when it
 disagrees with the record about *which subject* it is describing. A signature proves a run set
