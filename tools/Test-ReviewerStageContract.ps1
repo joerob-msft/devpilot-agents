@@ -599,6 +599,58 @@ try {
     Assert-Throws -Name 'read/rejects-array-in-declared-map' `
         -Action { Read-ReviewerStageArtifact -Path $collapsedMapPath -Kind 'fixture.stage.map' } `
         -Expect 'lost map shape'
+
+    # ------------------------------------------------------------------
+    # Canonical key order is ordinal and type-independent.
+    #
+    # Sorting with Sort-Object -CaseSensitive is culture-AWARE: -CaseSensitive
+    # changes case handling, not collation, and the default comparer follows the
+    # current culture. With keys that are file paths or identifiers, en-US,
+    # da-DK and tr-TR each produce a different order, so identical evidence
+    # digests differently depending on where it was canonicalized.
+    # These keys are deliberately case-distinct: PowerShell dictionaries are
+    # case-insensitive, so a fixture with 'aa' and 'AA' would silently collapse
+    # and test nothing. 'aa' sorts after 'z' in da-DK, and a hyphen is ignored by
+    # cultural collation but is 0x2D ordinally, so each of these separates the
+    # ordinal answer from the cultural one.
+    $orderingKeys = @('Ab', 'Za', 'aa', 'aa-bb', 'aabb', 'i', 'ig', 'z')
+    $orderingSeed = [ordered]@{}
+    foreach ($key in $orderingKeys) { $orderingSeed[$key] = $key.Length }
+
+    $cultureOrders = [System.Collections.Generic.List[string]]::new()
+    $originalCulture = [System.Threading.Thread]::CurrentThread.CurrentCulture
+    try {
+        foreach ($cultureName in @('en-US', 'da-DK', 'tr-TR', 'sv-SE')) {
+            [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::new($cultureName)
+            $ordered = ConvertTo-ReviewerStageDeterministicKeyOrder -Node $orderingSeed
+            $cultureOrders.Add((@($ordered.Keys) -join '|'))
+        }
+    }
+    finally { [System.Threading.Thread]::CurrentThread.CurrentCulture = $originalCulture }
+    Assert-True -Name 'canonical/key-order-is-culture-independent' `
+        -Condition (@($cultureOrders | Select-Object -Unique).Count -eq 1) `
+        -Detail "Four cultures produced these orders: $($cultureOrders -join ' ;; ')"
+
+    $expectedOrder = [string[]]$orderingKeys
+    [Array]::Sort($expectedOrder, [StringComparer]::Ordinal)
+    Assert-True -Name 'canonical/key-order-is-ordinal' `
+        -Condition ($cultureOrders[0] -ceq ($expectedOrder -join '|')) `
+        -Detail "Ordered as '$($cultureOrders[0])' rather than '$($expectedOrder -join '|')'."
+
+    # A JSON object has no order to preserve, so wire identity must not depend on
+    # which PowerShell type the producer happened to build it with.
+    $asHashtable = @{}
+    foreach ($key in $orderingKeys) { $asHashtable[$key] = $key.Length }
+    $asCustomObject = [pscustomobject]$orderingSeed
+    $shapes = @(
+        (ConvertTo-ReviewerStageDeterministicKeyOrder -Node $orderingSeed),
+        (ConvertTo-ReviewerStageDeterministicKeyOrder -Node $asHashtable),
+        (ConvertTo-ReviewerStageDeterministicKeyOrder -Node $asCustomObject)
+    )
+    $shapeTexts = @($shapes | ForEach-Object { ConvertTo-Json -InputObject $_ -Depth 8 -Compress })
+    Assert-True -Name 'canonical/key-order-is-type-independent' `
+        -Condition (@($shapeTexts | Select-Object -Unique).Count -eq 1) `
+        -Detail "Ordered dictionary, hashtable and PSCustomObject serialized as: $($shapeTexts -join ' ;; ')"
 }
 finally {
     Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |
@@ -622,3 +674,4 @@ if ($script:Failures.Count -gt 0) {
 }
 
 Write-Host "PASS: stage contract enforcement ($($report.passed) checks)."
+

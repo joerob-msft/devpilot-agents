@@ -31,38 +31,43 @@ internal static class Program
         string? targetName = null;
         string? haltAfterName = null;
 
-        for (var index = 0; index < args.Length; index++)
-        {
-            switch (args[index])
-            {
-                case "--request":
-                    requestPath = Next(args, ref index, "--request");
-                    break;
-                case "--target":
-                    targetName = Next(args, ref index, "--target");
-                    break;
-                case "--halt-after":
-                    haltAfterName = Next(args, ref index, "--halt-after");
-                    break;
-                case "--help":
-                    Console.Out.WriteLine(Usage);
-                    return ExitOk;
-                default:
-                    Console.Error.WriteLine($"Unrecognised argument '{args[index]}'.");
-                    Console.Error.WriteLine(Usage);
-                    return ExitUsage;
-            }
-        }
-
-        if (requestPath is null)
-        {
-            Console.Error.WriteLine("A --request path is required.");
-            Console.Error.WriteLine(Usage);
-            return ExitUsage;
-        }
-
+        // The parse runs inside the same guard as the rest of the entry point.
+        // A missing option value is a usage fault, and a usage fault that escapes
+        // as an unhandled exception would print a stack trace and exit with a
+        // code outside the documented set, in a tool whose whole premise is that
+        // the exit code is the only machine-readable thing on the console.
         try
         {
+            for (var index = 0; index < args.Length; index++)
+            {
+                switch (args[index])
+                {
+                    case "--request":
+                        requestPath = Next(args, ref index, "--request");
+                        break;
+                    case "--target":
+                        targetName = Next(args, ref index, "--target");
+                        break;
+                    case "--halt-after":
+                        haltAfterName = Next(args, ref index, "--halt-after");
+                        break;
+                    case "--help":
+                        Console.Out.WriteLine(Usage);
+                        return ExitOk;
+                    default:
+                        Console.Error.WriteLine($"Unrecognised argument '{args[index]}'.");
+                        Console.Error.WriteLine(Usage);
+                        return ExitUsage;
+                }
+            }
+
+            if (requestPath is null)
+            {
+                Console.Error.WriteLine("A --request path is required.");
+                Console.Error.WriteLine(Usage);
+                return ExitUsage;
+            }
+
             var request = CoordinatorRequest.Load(requestPath);
             var target = targetName is null ? PreparationState.RunSetReady : PreparationStateNames.Parse(targetName);
             var haltAfter = haltAfterName is null ? (PreparationState?)null : PreparationStateNames.Parse(haltAfterName);
@@ -94,12 +99,12 @@ internal static class Program
         Directory.CreateDirectory(request.OutputRoot);
         Directory.CreateDirectory(request.CoordinatorRoot);
 
-        var key = CoordinatorState.LoadOrMintKey(request);
-
-        // The lease is taken before the state file is read, so two coordinators
-        // pointed at one output root cannot both decide they are the resumer.
+        // The lease is taken before the state file is read AND before the state
+        // key is minted, so two coordinators pointed at one output root cannot
+        // both decide they are the resumer, and cannot race to create the key.
         using var lease = RunLease.Acquire(request);
 
+        var key = CoordinatorState.LoadOrMintKey(request);
         var state = CoordinatorState.LoadOrFresh(request, key);
         var index = StageArtifactIndex.FromSchema(request.ToolkitRoot);
         var invoker = new ChildToolInvoker(request);

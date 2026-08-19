@@ -559,11 +559,22 @@ function New-ReviewerCorpusSealFixture {
     [System.IO.File]::WriteAllBytes($recipePath,
         $script:CorpusFixtureUtf8.GetBytes(($recipe | ConvertTo-Json -Depth 24 -Compress:$false)))
 
+    # The changed-path census, derived from the corpus the recipe binds rather
+    # than written out separately, so the census a caller declares is a fact about
+    # the evidence and not a second independent assertion about it.
+    $authoritative = ($script:CorpusFixtureUtf8.GetString(
+            (Get-ReviewerCorpusSealPayload -Index $index -Path ([string]$recipe.changeSet.authoritative.corpusPath)).Bytes) |
+            ConvertFrom-Json -Depth 24)
+    $censusPaths = [string[]]@(Get-ReviewerSourceRawChangedPaths -Response $authoritative |
+            ForEach-Object { ConvertTo-ReviewerSourcePath -Path ([string]$_) })
+    [Array]::Sort($censusPaths, [StringComparer]::Ordinal)
+
     return [pscustomobject][ordered]@{
         Identity = $identity
         CorpusRoot = [string]([IO.Path]::GetFullPath($corpusRoot))
         CorpusIndexSha256 = $indexSha
         RecipePath = [string]([IO.Path]::GetFullPath($recipePath))
         SnapshotName = [string]$recipe.snapshotId
+        ChangedPaths = $censusPaths
     }
 }

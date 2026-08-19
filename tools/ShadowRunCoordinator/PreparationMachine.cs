@@ -87,7 +87,7 @@ internal sealed class PreparationMachine(
             _ => throw new ContractException($"'{PreparationStateNames.ToName(next)}' is not a transition this coordinator performs.")
         };
         _state.Commit(_request, _stateKey, next, evidence, detail);
-        _log.WriteLine($"commit {PreparationStateNames.ToName(next)} sequence={_state.Sequence.ToString(CultureInfo.InvariantCulture)} evidence={evidence}");
+        _log.WriteLine($"commit {PreparationStateNames.ToName(next)} sequence={_state.Sequence.ToString(CultureInfo.InvariantCulture)} evidence={_state.EvidenceDigestOf(next)} detail={detail}");
     }
 
     private string SequenceOf(PreparationState state)
@@ -104,10 +104,16 @@ internal sealed class PreparationMachine(
 
     /// <summary>
     /// Recovers the in-memory values a later transition needs when an earlier one
-    /// is being skipped after a restart. Recovered from files on disk rather than
-    /// from the state record, so a resumed run is reading the same evidence a
-    /// fresh one would.
+    /// is being skipped after a restart.
     /// </summary>
+    /// <remarks>
+    /// The values are re-read from the files on disk, so a resumed run reads the
+    /// same evidence a fresh one would - but every file is first checked against
+    /// the digest the signed state committed for it. The exchange directory holds
+    /// no signature of its own, so without that check a resumed run could bind to
+    /// a snapshot or run set other than the one its own record was committed
+    /// against, and every downstream check would be self-consistent and pass.
+    /// </remarks>
     private void RehydrateFor(PreparationState state)
     {
         switch (state)
@@ -115,10 +121,92 @@ internal sealed class PreparationMachine(
             case PreparationState.SnapshotSealed:
                 ReadSealResult();
                 break;
+            case PreparationState.RecipePlanned:
+                RecheckRecordedArtifacts();
+                break;
             case PreparationState.RunSetDeclared:
                 ReadDeclareResult();
                 break;
         }
+    }
+
+    /// <summary>
+    /// Rehashes every stage artifact the recipePlanned transition committed.
+    /// </summary>
+    /// <remarks>
+    /// A resumed run inherits the artifact census from its signed record rather
+    /// than reindexing a directory, but inheriting a census is only worth
+    /// anything if the files it names are still the files it named. Without this
+    /// a run killed after publication could be resumed against artifacts that had
+    /// been edited in between, and the audit would still index the digests from
+    /// before the edit.
+    /// </remarks>
+    private void RecheckRecordedArtifacts()
+    {
+        var evidence = _state.EvidenceFor(PreparationState.RecipePlanned);
+        if (evidence?.Get("artifacts") is not ListNode artifacts)
+        {
+            return;
+        }
+        var recordedDirectory = evidence.GetText("artifactDirectory");
+        if (recordedDirectory is null)
+        {
+            throw new ContractException("The recipePlanned record carries an artifact census but no directory to resolve it against.");
+        }
+        var checkedCount = 0;
+        foreach (var item in artifacts.Items)
+        {
+            if (item is not MapNode artifact)
+            {
+                continue;
+            }
+            var name = artifact.GetText("name");
+            var recorded = artifact.GetText("sha256");
+            if (name is null || recorded is null)
+            {
+                throw new ContractException("A censused stage artifact carries no name or no digest, so the resume cannot prove it is unchanged.");
+            }
+            var path = Path.Combine(recordedDirectory, name);
+            if (!File.Exists(path))
+            {
+                throw new ContractException($"The stage artifact '{path}' recorded at recipePlanned is gone; this run cannot be resumed against a censused artifact set it no longer has.");
+            }
+            var actual = CanonicalJson.Sha256HexOfFile(path);
+            if (!string.Equals(actual, recorded, StringComparison.Ordinal))
+            {
+                throw new ContractException($"The stage artifact '{path}' now digests to {actual} and was committed as {recorded}.");
+            }
+            checkedCount++;
+        }
+        if (checkedCount != _index.Boundaries.Count)
+        {
+            throw new ContractException($"The resume rehashed {checkedCount.ToString(CultureInfo.InvariantCulture)} stage artifact(s) and the record censused {_index.Boundaries.Count.ToString(CultureInfo.InvariantCulture)}.");
+        }
+        _log.WriteLine($"resume rehashed {checkedCount.ToString(CultureInfo.InvariantCulture)} stage artifact(s) (correlationId={_request.CorrelationId})");
+    }
+
+    /// <summary>
+    /// Reads a child result file back on resume, refusing it unless it is byte
+    /// for byte the file the transition was committed against.
+    /// </summary>
+    private JsonElement ReadCommittedChildResult(PreparationState state, string step, string label)
+    {
+        var path = Path.Combine(_request.ExchangeRoot, _request.CorrelationId + "-" + step + ".result.json");
+        var committed = _state.EvidenceFor(state)?.GetText("childResultSha256");
+        if (committed is null)
+        {
+            throw new ContractException($"The committed {PreparationStateNames.ToName(state)} evidence records no child result digest to resume against.");
+        }
+        if (!File.Exists(path))
+        {
+            throw new ContractException($"The {label} at '{path}' is gone; this run cannot be resumed without the result its record was committed against.");
+        }
+        var actual = CanonicalJson.Sha256HexOfFile(path);
+        if (!string.Equals(actual, committed, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The {label} at '{path}' now digests to {actual} and the committed record binds {committed}.");
+        }
+        return StrictJson.ReadObjectFile(path, label);
     }
 
     // -----------------------------------------------------------------------
@@ -259,16 +347,30 @@ internal sealed class PreparationMachine(
     // -----------------------------------------------------------------------
     private (MapNode Evidence, string Detail) PlanRecipe()
     {
+        var census = ReadDeclaredChangedPaths();
         var childRequest = new MapNode()
             .Set("contractVersion", ChildRequestContractVersion)
             .Set("toolkitRoot", _request.ToolkitRoot)
             .Set("artifactDirectory", _request.StageArtifactRoot)
-            .Set("changedPaths", ChangedPathsForPlan());
+            .Set("changedPaths", census);
 
         var outcome = _invoker.Invoke("stagePreparation", ChildScript(), childRequest, "artifactDirectory", "publishedCount");
 
         var published = StrictJson.RequireInt(outcome.Result, "publishedCount", "'stagePreparation' child result", 1, 4096);
-        var directory = StrictJson.RequireString(outcome.Result, "artifactDirectory", "'stagePreparation' child result");
+        var reported = StrictJson.RequireString(outcome.Result, "artifactDirectory", "'stagePreparation' child result");
+
+        // The child is told where to publish and does not get to answer with
+        // somewhere else. Indexing the directory the child names rather than the
+        // one the request declared would let a replaced adapter satisfy every
+        // check below with twelve well-formed artifacts written anywhere on the
+        // filesystem, and the committed evidence would then record artifacts from
+        // outside the declared output root.
+        var declaredDirectory = Path.GetFullPath(_request.StageArtifactRoot);
+        if (!string.Equals(Path.GetFullPath(reported), declaredDirectory, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ContractException($"The stage preparation published into '{reported}' and the request declared '{declaredDirectory}'.");
+        }
+        var directory = declaredDirectory;
 
         // The coordinator does not take the child's word for what it published.
         // Every artifact is read back here, through a different runtime and a
@@ -304,6 +406,8 @@ internal sealed class PreparationMachine(
 
         var evidence = new MapNode()
             .Set("artifactDirectory", directory)
+            .Set("changedPathCount", census.Count)
+            .Set("changedPathsSha256", CanonicalJson.Sha256HexOfFile(_request.ChangedPathsPath))
             .Set("publishedCount", published)
             .Set("rereadCount", rereadCount)
             .Set("boundaryCount", _index.Boundaries.Count)
@@ -314,16 +418,60 @@ internal sealed class PreparationMachine(
 
     /// <summary>
     /// The changed-path census the preparation publishes at the source boundary.
-    /// Derived from the subject rather than invented, so two runs of the same
-    /// request publish the same census.
     /// </summary>
-    private ListNode ChangedPathsForPlan()
+    /// <remarks>
+    /// Declared by the caller and validated here; never synthesised. A control
+    /// plane that invents the census it then publishes as evidence is fabricating
+    /// evidence, not coordinating, and no downstream check can tell the
+    /// difference because every artifact derived from it is internally
+    /// consistent. C# validates the shape and passes it through; deriving it from
+    /// the bound corpus stays with the PowerShell acquisition path that owns it.
+    /// </remarks>
+    private ListNode ReadDeclaredChangedPaths()
     {
-        var list = new ListNode();
-        list.Add($"/prepared/{_request.PullRequestId.ToString(CultureInfo.InvariantCulture)}/iteration-{_request.IterationId.ToString(CultureInfo.InvariantCulture)}/source.ps1");
-        list.Add($"/prepared/{_request.PullRequestId.ToString(CultureInfo.InvariantCulture)}/iteration-{_request.IterationId.ToString(CultureInfo.InvariantCulture)}/target.ps1");
-        return list;
+        const string label = "changed path census";
+        var path = _request.ChangedPathsPath;
+        if (!File.Exists(path))
+        {
+            throw new ContractException($"The declared changed-path census '{path}' does not exist.");
+        }
+        var root = StrictJson.ReadObjectFile(path, label);
+        StrictJson.RequireNoUnknownFields(root, label, "contractVersion", "kind", "changedPaths");
+        StrictJson.RequireLiteral(root, "contractVersion", ChangedPathsContractVersion, label);
+        StrictJson.RequireLiteral(root, "kind", "shadow-run-coordinator-changed-paths", label);
+
+        var declared = StrictJson.RequireStringArray(root, "changedPaths", label);
+        if (declared.Count == 0)
+        {
+            throw new ContractException($"The {label} declares no changed path; a preparation with nothing to prepare is a request fault, not an empty plan.");
+        }
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var previous = string.Empty;
+        var census = new ListNode();
+        foreach (var entry in declared)
+        {
+            if (entry.Length == 0)
+            {
+                throw new ContractException($"The {label} holds an empty path.");
+            }
+            if (!seen.Add(entry))
+            {
+                throw new ContractException($"The {label} repeats '{entry}'.");
+            }
+            // Ordinal ascending, required rather than imposed. Sorting it here
+            // would hide a producer whose census order is unstable, and the order
+            // reaches the published bytes.
+            if (previous.Length > 0 && string.CompareOrdinal(previous, entry) >= 0)
+            {
+                throw new ContractException($"The {label} is not in ordinal ascending order at '{entry}'.");
+            }
+            previous = entry;
+            census.Add(entry);
+        }
+        return census;
     }
+
+    private const string ChangedPathsContractVersion = "devpilot.shadow-run-coordinator.changed-paths.v1";
 
     // -----------------------------------------------------------------------
     // snapshotValidateOnly / snapshotSealed / snapshotVerified
@@ -432,9 +580,7 @@ internal sealed class PreparationMachine(
 
     private void ReadSealResult()
     {
-        var path = Path.Combine(_request.ExchangeRoot, _request.CorrelationId + "-corpusSeal.result.json");
-        var result = StrictJson.ReadObjectFile(path, "'corpusSeal' child result");
-        ApplySealResult(result);
+        ApplySealResult(ReadCommittedChildResult(PreparationState.SnapshotSealed, "corpusSeal", "'corpusSeal' child result"));
     }
 
     // -----------------------------------------------------------------------
@@ -506,7 +652,8 @@ internal sealed class PreparationMachine(
             childRequest,
             "launchTokenPresent",
             "plannedRunCount",
-            "slotAttemptCount");
+            "slotAttemptCount",
+            "modelInvocationCount");
 
         const string label = "'runSetStatus' child result";
         if (!StrictJson.RequireBool(outcome.Result, "launchTokenPresent", label))
@@ -526,12 +673,20 @@ internal sealed class PreparationMachine(
         {
             throw new ContractException($"The preparation observed {attempts.ToString(CultureInfo.InvariantCulture)} slot attempt(s); this coordinator prepares a run set and launches nothing.");
         }
+        // Observed the same way, rather than asserted. A hard-coded zero here
+        // would be a policy statement dressed as an audit: it would read exactly
+        // the same on a run that had invoked a model as on one that had not.
+        var models = StrictJson.RequireInt(outcome.Result, "modelInvocationCount", label, 0, int.MaxValue);
+        if (models != 0)
+        {
+            throw new ContractException($"The preparation observed {models.ToString(CultureInfo.InvariantCulture)} model invocation(s); this coordinator invokes no model.");
+        }
 
         var evidence = new MapNode()
             .Set("launchTokenPresent", true)
             .Set("plannedRunCount", planned)
             .Set("slotAttemptCount", attempts)
-            .Set("modelInvocationCount", 0)
+            .Set("modelInvocationCount", models)
             .Set("childResultSha256", outcome.ResultSha256);
         return (evidence, $"plannedRunCount={planned.ToString(CultureInfo.InvariantCulture)} slotAttempts=0");
     }
@@ -561,8 +716,7 @@ internal sealed class PreparationMachine(
 
     private void ReadDeclareResult()
     {
-        var path = Path.Combine(_request.ExchangeRoot, _request.CorrelationId + "-runSetDeclare.result.json");
-        ApplyDeclareResult(StrictJson.ReadObjectFile(path, "'runSetDeclare' child result"));
+        ApplyDeclareResult(ReadCommittedChildResult(PreparationState.RunSetDeclared, "runSetDeclare", "'runSetDeclare' child result"));
     }
 
     private string ChildScript() => Path.Combine(_request.ToolkitRoot, "tools", ChildScriptName);
@@ -586,6 +740,12 @@ internal sealed class PreparationMachine(
         {
             stages.Set(PreparationStateNames.ToName(transition.State), transition.Evidence);
         }
+        // Read out of the committed evidence rather than restated here. The
+        // readiness transition refuses a non-zero census, so these are the
+        // observed values that transition was allowed to commit on, and an audit
+        // that restated them as constants would say the same thing whatever had
+        // happened.
+        var readiness = _state.EvidenceFor(PreparationState.RunSetReady);
         var audit = new MapNode()
             .Set("contractVersion", "devpilot.shadow-run-coordinator.audit.v1")
             .Set("kind", "shadow-run-coordinator-audit")
@@ -594,8 +754,10 @@ internal sealed class PreparationMachine(
             .Set("subjectSha256", CoordinatorState.SubjectDigest(_request))
             .Set("finalState", PreparationStateNames.ToName(_state.State))
             .Set("sequence", _state.Sequence)
-            .Set("modelInvocationCount", 0)
-            .Set("slotLaunchCount", 0)
+            .Set("modelInvocationCount", readiness?.Get("modelInvocationCount") ?? Node.Null())
+            .Set("slotLaunchCount", readiness?.Get("slotAttemptCount") ?? Node.Null())
+            .Set("childLaunchCount", _invoker.LaunchCount)
+            .Set("childResultAdoptedCount", _invoker.AdoptedCount)
             .Set("stages", stages);
         var transitions = new ListNode();
         foreach (var transition in _state.Transitions)

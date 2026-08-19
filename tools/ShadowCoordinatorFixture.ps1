@@ -207,6 +207,19 @@ function New-ShadowCoordinatorFixture {
     $schemaSha = (Get-FileHash -LiteralPath $schemaPath -Algorithm SHA256).Hash.ToLowerInvariant()
     $promptSha = Get-ShadowCoordinatorPromptAssetDigest -ToolkitRoot $build.ToolkitCopy
 
+    # The changed-path census the request declares. The coordinator validates and
+    # passes it through rather than inventing one, so the fixture has to supply a
+    # real file, exactly as a production caller would.
+    $changedPathsPath = Join-Path $Sandbox 'inputs\changed-paths.json'
+    $changedPaths = [ordered]@{
+        contractVersion = 'devpilot.shadow-run-coordinator.changed-paths.v1'
+        kind = 'shadow-run-coordinator-changed-paths'
+        changedPaths = @($corpus.ChangedPaths)
+    }
+    $changedPathsText = (ConvertTo-Json -InputObject ([pscustomobject]$changedPaths) -Depth 8 -Compress:$false) + "`n"
+    [IO.File]::WriteAllBytes($changedPathsPath,
+        ([Text.UTF8Encoding]::new($false)).GetBytes($changedPathsText))
+
     $request = @{
         contractVersion = 'devpilot.shadow-run-coordinator.request.v1'
         kind = 'shadow-run-preparation'
@@ -227,6 +240,7 @@ function New-ShadowCoordinatorFixture {
             root = $corpus.CorpusRoot
             indexSha256 = $corpus.CorpusIndexSha256
             recipePath = $corpus.RecipePath
+            changedPathsPath = [string]([IO.Path]::GetFullPath($changedPathsPath))
         }
         output = @{ root = [string]([IO.Path]::GetFullPath((Join-Path $Sandbox 'shadow-output'))) }
         children = @{
@@ -255,6 +269,7 @@ function New-ShadowCoordinatorFixture {
         CorpusRoot = $corpus.CorpusRoot
         CorpusIndexSha256 = $corpus.CorpusIndexSha256
         RecipePath = $corpus.RecipePath
+        ChangedPathsPath = [string]([IO.Path]::GetFullPath($changedPathsPath))
         SnapshotName = $corpus.SnapshotName
         ConfigPath = [string]([IO.Path]::GetFullPath($configPath))
         RunSetKeyPath = [string]([IO.Path]::GetFullPath($keyPath))

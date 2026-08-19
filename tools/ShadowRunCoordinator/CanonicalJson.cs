@@ -81,8 +81,13 @@ internal abstract class Node
 
     internal abstract void Write(StringBuilder builder, bool canonical, int indent);
 
+    /// <summary>The string this node carries, or null when it is not a string.</summary>
+    internal virtual string? AsText => null;
+
     private sealed class TextNode(string value) : Node
     {
+        internal override string? AsText => value;
+
         internal override void Write(StringBuilder builder, bool canonical, int indent) =>
             CanonicalJson.WriteString(value, builder);
     }
@@ -135,6 +140,22 @@ internal sealed class MapNode : Node
 
     internal void Remove(string name) => _entries.RemoveAll(entry => string.Equals(entry.Key, name, StringComparison.Ordinal));
 
+    /// <summary>The node stored under a name, or null when there is none.</summary>
+    internal Node? Get(string name)
+    {
+        foreach (var entry in _entries)
+        {
+            if (string.Equals(entry.Key, name, StringComparison.Ordinal))
+            {
+                return entry.Value;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>The string stored under a name, or null when it is absent or not a string.</summary>
+    internal string? GetText(string name) => Get(name)?.AsText;
+
     internal override void Write(StringBuilder builder, bool canonical, int indent)
     {
         var entries = canonical
@@ -170,6 +191,9 @@ internal sealed class ListNode : Node
     private readonly List<Node> _items = [];
 
     internal int Count => _items.Count;
+
+    /// <summary>The items, in the order they were added.</summary>
+    internal IReadOnlyList<Node> Items => _items;
 
     internal ListNode Add(Node item)
     {

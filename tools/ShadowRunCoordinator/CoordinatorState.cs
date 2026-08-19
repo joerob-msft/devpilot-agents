@@ -247,6 +247,32 @@ internal sealed class CoordinatorState
 
     internal void RecordArtifact(MapNode artifact) => _artifacts.Add(artifact);
 
+    /// <summary>The committed evidence digest for a state, or a placeholder when it holds none.</summary>
+    internal string EvidenceDigestOf(PreparationState state)
+    {
+        foreach (var transition in _transitions)
+        {
+            if (transition.State == state)
+            {
+                return transition.EvidenceSha256;
+            }
+        }
+        return "none";
+    }
+
+    /// <summary>The committed evidence for a state, or null when there is none.</summary>
+    internal MapNode? EvidenceFor(PreparationState state)
+    {
+        foreach (var transition in _transitions)
+        {
+            if (transition.State == state)
+            {
+                return transition.Evidence;
+            }
+        }
+        return null;
+    }
+
     /// <summary>
     /// Commits one transition. The state file on disk is replaced before this
     /// returns, so the caller may be killed immediately afterwards and a resume
@@ -325,19 +351,32 @@ internal sealed class CoordinatorState
         Directory.CreateDirectory(request.CoordinatorRoot);
         if (File.Exists(request.StateKeyPath))
         {
-            var existing = File.ReadAllBytes(request.StateKeyPath);
-            if (existing.Length != 32)
-            {
-                throw new ContractException($"The coordinator state key at '{request.StateKeyPath}' is {existing.Length.ToString(CultureInfo.InvariantCulture)} bytes, not 32.");
-            }
-            return existing;
+            return ReadKey(request);
         }
         var minted = RandomNumberGenerator.GetBytes(32);
-        using (var stream = new FileStream(request.StateKeyPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+        try
         {
+            using var stream = new FileStream(request.StateKeyPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
             stream.Write(minted, 0, minted.Length);
             stream.Flush(flushToDisk: true);
         }
+        catch (IOException) when (File.Exists(request.StateKeyPath))
+        {
+            // Belt and braces behind the lease: if anything else won the race to
+            // create the key, adopt theirs. Minting a second key would make every
+            // record written under the first one unverifiable.
+            return ReadKey(request);
+        }
         return minted;
+    }
+
+    private static byte[] ReadKey(CoordinatorRequest request)
+    {
+        var existing = File.ReadAllBytes(request.StateKeyPath);
+        if (existing.Length != 32)
+        {
+            throw new ContractException($"The coordinator state key at '{request.StateKeyPath}' is {existing.Length.ToString(CultureInfo.InvariantCulture)} bytes, not 32.");
+        }
+        return existing;
     }
 }

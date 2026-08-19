@@ -106,16 +106,54 @@ reach its terminal state without the files.
 
 The PowerShell preparation path is unchanged and remains the default; nothing routes to the
 coordinator unless a caller runs it. `tools/Test-ShadowRunCoordinator.ps1` runs the same
-request down both paths and compares the twelve published artifacts byte for byte, so
-"equivalent up to run-set-ready" is a checked claim rather than an intention.
+request down both paths and compares the twelve published artifacts byte for byte.
+
+Read that for what it is. It proves the two paths *publish* the same stage artifacts; it does
+not prove anything about reviewer decisions, because neither path makes one. There is no
+reviewer judgement in this slice to differ.
+
+## The pre-commit window
+
+The one fault a state machine cannot halt its way out of: a child completes a durable,
+non-repeatable side effect and its coordinator dies before committing the transition. The
+sealer refuses an existing snapshot id without `-Force`, and the qualification tool refuses a
+second declaration, so a naive resume re-runs the identical step, fails identically, and the
+output root is wedged for good.
+
+Two layers close it, and neither uses `-Force` - forcing would let a different request
+silently overwrite sealed evidence:
+
+- The **invoker** adopts an existing, valid, successful result for the same step, correlation
+  id and child-request digest instead of relaunching. Launch intent is journalled atomically
+  before the process starts.
+- The **child** adopts its own already-published side effect after re-verifying it through the
+  production loader, and reports `adopted` so the adoption is visible in the record.
+
+Two things deliberately do *not* recover. A run whose signed state file is destroyed fails
+closed rather than re-deriving a record over standing artifacts - if it could, the record
+would not be load-bearing. And a resumed run refuses any child result whose bytes are not the
+ones its own committed record binds, and rehashes every censused stage artifact before
+inheriting it.
+
+The stage preparation step is separately made re-enterable by clearing its declared artifact
+directory before publishing, because the stage writer names artifacts by a per-call sequence
+and a lost attempt's twelve artifacts would otherwise accumulate into a census of twenty-four.
 
 ## Tests
 
 `tools/Test-ShadowRunCoordinator.ps1` (CI, offline, no model) covers: an offline restore and
 build against an empty feed; a hermetic sandbox with a genuinely sealed synthetic corpus; a
 kill and restart at *every* transition; the full path to `run-set-ready`; the twelve-artifact
-audit; the rollback differential; the request boundary matrix; stale head, stale identity and
-tampered state; the lease conflict and the abandoned-lease recovery; the child fault matrix
-(non-zero exit, missing, malformed, byte-order-marked, truncated, partial, wrong correlation,
-wrong step, stdout chatter, and a hang bounded by timeout); an external kill mid-transition;
-and a final check that no child process and no repository modification survived the run.
+audit; the stage publication differential; the request boundary matrix; stale head, stale
+identity and tampered state; the lease conflict and the abandoned-lease recovery; the child
+fault matrix (non-zero exit, missing, malformed, byte-order-marked, truncated, partial, wrong
+correlation, wrong step, stdout chatter, a stray publication directory, a mismatched request
+digest, and a hang bounded by timeout); an external kill mid-transition; the pre-commit window
+on both non-repeatable side effects; resume integrity against edited child results and edited
+stage artifacts; the changed-path census boundary; and a final check that no child process and
+no repository modification survived the run.
+
+The canonical key order that makes any of this reproducible is covered in
+`tools/Test-ReviewerStageContract.ps1`, which asserts the same bytes under `en-US`, `da-DK`,
+`tr-TR` and `sv-SE`, and asserts that a hashtable, an ordered dictionary and a `PSCustomObject`
+holding the same content serialize identically.

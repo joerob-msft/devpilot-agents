@@ -57,7 +57,7 @@ function Read-ShadowChildRequest {
     if ($request -isnot [System.Management.Automation.PSCustomObject]) {
         throw "The child request '$Path' is not a JSON object."
     }
-    foreach ($name in @('contractVersion', 'correlationId', 'step', 'resultPath')) {
+    foreach ($name in @('contractVersion', 'correlationId', 'step', 'resultPath', 'childRequestSha256')) {
         if (-not $request.PSObject.Properties[$name]) {
             throw "The child request '$Path' is missing '$name'."
         }
@@ -115,6 +115,7 @@ function Write-ShadowChildResult {
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][string]$CorrelationId,
         [Parameter(Mandatory)][string]$Step,
+        [Parameter(Mandatory)][string]$ChildRequestSha256,
         [Parameter(Mandatory)][bool]$Ok,
         [hashtable]$Fields = @{},
         [string]$ErrorText = ''
@@ -124,6 +125,11 @@ function Write-ShadowChildResult {
         kind = 'shadow-run-coordinator-child-result'
         correlationId = $CorrelationId
         step = $Step
+        # Echoed, not recomputed. It binds this result to the exact child request
+        # that asked for the work, which is what lets a coordinator that was
+        # killed before it could commit adopt this result instead of re-running a
+        # step that refuses to repeat itself.
+        childRequestSha256 = $ChildRequestSha256
         ok = $Ok
     }
     foreach ($name in ($Fields.Keys | Sort-Object)) { $result[$name] = $Fields[$name] }
@@ -149,11 +155,20 @@ function Invoke-ShadowChildStagePreparation {
         throw "The stage preparation needs at least two changed paths; it was given $($changed.Count)."
     }
     . (Join-Path $ToolkitRoot 'src\Agents\reviewer\ShadowPreparation.ps1')
+    # The step must be re-enterable: a coordinator killed after publication but
+    # before its commit runs this again, and the stage writer names artifacts by
+    # a per-call sequence, so leftovers from the lost attempt would accumulate.
+    $stale = @()
+    if (Test-Path -LiteralPath $directory) {
+        $stale = @(Get-ChildItem -LiteralPath $directory -Filter '*.json' -File -ErrorAction SilentlyContinue)
+        foreach ($item in $stale) { Remove-Item -LiteralPath $item.FullName -Force }
+    }
     $prepared = Invoke-ReviewerShadowPreparation -Directory $directory `
         -ChangedPath ([string[]]$changed)
     return @{
         artifactDirectory = [string]$prepared.Directory
         publishedCount = [int]$prepared.PublishedCount
+        discardedCount = [int]$stale.Count
     }
 }
 
@@ -179,6 +194,16 @@ function Invoke-ShadowChildCorpusSeal {
         return @{ validateOnly = $true; replayRoot = [string]$replayRoot }
     }
 
+    # A snapshot this request already published is adopted rather than resealed.
+    # The snapshot id is deterministic from the recipe, and the sealer refuses an
+    # existing id without -Force, so a coordinator killed after publication but
+    # before it could commit would otherwise wedge this output root permanently:
+    # every later resume would reseal, be refused, and fail identically. Passing
+    # -Force instead would be worse, because it would let a genuinely different
+    # request quietly overwrite sealed evidence.
+    $adopted = Get-ShadowChildPublishedSnapshot -RecipePath $recipePath -ReplayRoot $replayRoot -ToolkitRoot $ToolkitRoot
+    if ($null -ne $adopted) { return $adopted }
+
     $sealed = & $tool -CorpusRoot $corpusRoot -CorpusIndexSha256 $indexSha -Recipe $recipePath `
         -ReplayRoot $replayRoot
     $sealed = @($sealed)[-1]
@@ -196,6 +221,54 @@ function Invoke-ShadowChildCorpusSeal {
         manifestSha256 = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
         manifestDigest = ([string]$sealed.ManifestDigest).ToLowerInvariant()
         validateOnly = $false
+        adopted = $false
+    }
+}
+
+function Get-ShadowChildPublishedSnapshot {
+    <#
+    .SYNOPSIS
+        The snapshot this recipe already published under this replay root, or
+        nothing when there is none.
+    .DESCRIPTION
+        Adoption is never a matter of trusting what is on disk. The candidate is
+        re-verified with the production loader against the digest its own manifest
+        declares, so a snapshot that was truncated, tampered with or only half
+        published is not adopted: it is left for the sealer to refuse.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$RecipePath,
+        [Parameter(Mandatory)][string]$ReplayRoot,
+        [Parameter(Mandatory)][string]$ToolkitRoot
+    )
+    if (-not (Test-Path -LiteralPath $RecipePath -PathType Leaf)) { return $null }
+    $recipe = [IO.File]::ReadAllText($RecipePath) | ConvertFrom-Json -Depth 32
+    $recipeNames = @($recipe.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($recipeNames -notcontains 'snapshotId') { return $null }
+    $snapshotId = [string]$recipe.snapshotId
+    if ([string]::IsNullOrWhiteSpace($snapshotId)) { return $null }
+
+    $manifestPath = Join-Path (Join-Path $ReplayRoot $snapshotId) 'manifest.json'
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { return $null }
+
+    $manifest = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json -Depth 32
+    $manifestNames = @($manifest.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($manifestNames -notcontains 'manifestDigest') { return $null }
+    $digest = ([string]$manifest.manifestDigest).ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($digest)) { return $null }
+
+    Import-Module (Join-Path $ToolkitRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force -ErrorAction Stop
+    # The production loader, bound to the digest the manifest declares. If this
+    # refuses, the snapshot is not adoptable and the caller reseals.
+    [void](New-AgentReplaySnapshot -ReplayRoot $ReplayRoot -SnapshotName $snapshotId -ExpectedManifestDigest $digest)
+
+    return @{
+        snapshotName = $snapshotId
+        manifestPath = [string]([IO.Path]::GetFullPath($manifestPath))
+        manifestSha256 = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        manifestDigest = $digest
+        validateOnly = $false
+        adopted = $true
     }
 }
 
@@ -220,9 +293,29 @@ function Invoke-ShadowChildRunSetDeclare {
     }
 
     $tool = Join-Path $ToolkitRoot 'tools\Invoke-ReviewerReplayQualification.ps1'
+    $runSetDirectory = Join-Path $qualificationRoot 'runset'
+
+    # Adoption, for the same reason the sealer has it: a declaration this request
+    # already published is adopted rather than declared a second time. The
+    # qualification tool refuses a second declaration outright, so re-running it
+    # after a kill that landed between publication and the coordinator's commit
+    # would wedge the run permanently.
+    $existing = @(Get-ChildItem -LiteralPath $runSetDirectory -Filter 'runset-*.json' -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notlike '*.sig' })
+    if ($existing.Count -eq 1) {
+        $tokenPath = Join-Path $runSetDirectory 'launch-authorization.token'
+        return @{
+            runSetPath = [string]$existing[0].FullName
+            launchTokenPresent = [bool](Test-Path -LiteralPath $tokenPath -PathType Leaf)
+            adopted = $true
+        }
+    }
+    if ($existing.Count -gt 1) {
+        throw "'$runSetDirectory' already holds $($existing.Count) run set(s); exactly one or none was expected."
+    }
+
     & $tool @arguments | Out-Null
 
-    $runSetDirectory = Join-Path $qualificationRoot 'runset'
     $declared = @(Get-ChildItem -LiteralPath $runSetDirectory -Filter 'runset-*.json' -File -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -notlike '*.sig' })
     if ($declared.Count -ne 1) {
@@ -232,6 +325,7 @@ function Invoke-ShadowChildRunSetDeclare {
     return @{
         runSetPath = [string]$declared[0].FullName
         launchTokenPresent = [bool](Test-Path -LiteralPath $tokenPath -PathType Leaf)
+        adopted = $false
     }
 }
 
@@ -293,6 +387,13 @@ function Invoke-ShadowChildRunSetStatus {
         plannedRunCount = [int]$status.declaration.plannedRunCount
         setId = [string]$status.declaration.setId
         slotAttemptCount = [int]$status.slotsAttempted
+        # Measured by enumeration rather than asserted. Every reviewer invocation
+        # that could reach a model leaves a slot attempt record behind, so the
+        # census of those records on disk is the census of model invocations this
+        # preparation caused. A hard-coded zero would read identically on a run
+        # that had invoked a model and on one that had not.
+        modelInvocationCount = @(Get-ChildItem -LiteralPath $qualificationRoot -Filter 'slot*-attempt.json' `
+                -File -Recurse -ErrorAction SilentlyContinue).Count
         statusReportPath = [string]([IO.Path]::GetFullPath($reportPath))
     }
 }
@@ -304,6 +405,7 @@ $request = Read-ShadowChildRequest -Path $RequestPath
 $correlationId = [string]$request.correlationId
 $step = [string]$request.step
 $resultPath = [string]$request.resultPath
+$childRequestSha256 = [string]$request.childRequestSha256
 
 try {
     $toolkitRoot = Get-ShadowChildField -Request $request -Name 'toolkitRoot'
@@ -319,14 +421,16 @@ try {
         'runSetStatus' { Invoke-ShadowChildRunSetStatus -Request $request -ToolkitRoot $toolkitRoot }
         default { throw "'$step' is not a step this adapter performs." }
     }
-    Write-ShadowChildResult -Path $resultPath -CorrelationId $correlationId -Step $step -Ok $true -Fields $fields
+    Write-ShadowChildResult -Path $resultPath -CorrelationId $correlationId -Step $step `
+        -ChildRequestSha256 $childRequestSha256 -Ok $true -Fields $fields
     Write-Host "$correlationId $step ok" -ForegroundColor DarkGray
     exit 0
 }
 catch {
     $message = [string]$_.Exception.Message
     try {
-        Write-ShadowChildResult -Path $resultPath -CorrelationId $correlationId -Step $step -Ok $false -ErrorText $message
+        Write-ShadowChildResult -Path $resultPath -CorrelationId $correlationId -Step $step `
+            -ChildRequestSha256 $childRequestSha256 -Ok $false -ErrorText $message
     }
     catch {
         # A result that cannot be written is reported by exit code alone; the

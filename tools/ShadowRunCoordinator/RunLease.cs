@@ -87,6 +87,19 @@ internal sealed class RunLease : IDisposable
                     throw new LeaseConflictException(
                         $"Process {holder.Value.ProcessId.ToString(CultureInfo.InvariantCulture)} already holds the coordinator lease at '{request.LeasePath}'.");
                 }
+                if (holder is null && IsWithinPublishGrace(request.LeasePath))
+                {
+                    // The file exists but carries no readable holder record, and it
+                    // was created moments ago. That is overwhelmingly the winner of
+                    // the CreateNew race in the instant between creating the lease
+                    // and flushing its record, not an abandoned one. Stealing it
+                    // here would be fatal on a platform whose unlink succeeds
+                    // against an open handle: both coordinators would then believe
+                    // they held the same output root, which is the single outcome
+                    // this lease exists to prevent.
+                    throw new LeaseConflictException(
+                        $"The coordinator lease at '{request.LeasePath}' was created within the last {PublishGraceSeconds.ToString(CultureInfo.InvariantCulture)} second(s) and has not published its holder record yet; it is treated as live rather than stolen.");
+                }
                 // The holder is gone, so the lease is evidence of a kill rather
                 // than of a live run. Remove it and try once more; if that second
                 // attempt loses the CreateNew race to somebody else, the loop ends
@@ -110,8 +123,35 @@ internal sealed class RunLease : IDisposable
         throw new LeaseConflictException($"The coordinator lease at '{request.LeasePath}' was taken by another process.");
     }
 
-    private static (int ProcessId, DateTime StartedAtUtc)? ReadHolder(string path)
+    private const int PublishGraceSeconds = 30;
+
+    /// <summary>
+    /// True when the lease file was created so recently that a holder record it
+    /// has not published yet is better explained by an in-flight acquisition than
+    /// by an abandoned one.
+    /// </summary>
+    private static bool IsWithinPublishGrace(string path)
     {
+        try
+        {
+            var info = new FileInfo(path);
+            // Creation time is not recorded on every file system, so the newer of
+            // the two stamps is used; a just-created empty file is 'now' by either.
+            var stamped = info.CreationTimeUtc > info.LastWriteTimeUtc ? info.CreationTimeUtc : info.LastWriteTimeUtc;
+            var age = DateTime.UtcNow - stamped;
+            return age >= TimeSpan.Zero && age < TimeSpan.FromSeconds(PublishGraceSeconds);
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static (int ProcessId, DateTime StartedAtUtc)? ReadHolder(string path)    {
         try
         {
             const string label = "coordinator lease";

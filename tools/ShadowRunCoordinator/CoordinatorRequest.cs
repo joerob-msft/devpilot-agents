@@ -55,6 +55,9 @@ internal sealed record CoordinatorRequest
 
     internal required string CorpusRecipePath { get; init; }
 
+    /// <summary>The caller-declared changed-path census this preparation publishes.</summary>
+    internal required string ChangedPathsPath { get; init; }
+
     internal required string OutputRoot { get; init; }
 
     internal required string PowerShellPath { get; init; }
@@ -141,7 +144,7 @@ internal sealed record CoordinatorRequest
         StrictJson.RequireNoUnknownFields(digests, label + " digests", "configSha256", "promptSha256", "schemaSha256");
 
         var corpus = StrictJson.RequireObject(root, "corpus", label);
-        StrictJson.RequireNoUnknownFields(corpus, label + " corpus", "root", "indexSha256", "recipePath");
+        StrictJson.RequireNoUnknownFields(corpus, label + " corpus", "root", "indexSha256", "recipePath", "changedPathsPath");
 
         var output = StrictJson.RequireObject(root, "output", label);
         StrictJson.RequireNoUnknownFields(output, label + " output", "root");
@@ -183,6 +186,7 @@ internal sealed record CoordinatorRequest
             CorpusRoot = StrictJson.RequireString(corpus, "root", label + " corpus"),
             CorpusIndexSha256 = StrictJson.RequireHex(corpus, "indexSha256", label + " corpus", 64),
             CorpusRecipePath = StrictJson.RequireString(corpus, "recipePath", label + " corpus"),
+            ChangedPathsPath = StrictJson.RequireString(corpus, "changedPathsPath", label + " corpus"),
             OutputRoot = StrictJson.RequireString(output, "root", label + " output"),
             PowerShellPath = StrictJson.RequireString(children, "powerShellPath", label + " children"),
             ChildTimeoutSeconds = StrictJson.RequireInt(children, "timeoutSeconds", label + " children", 1, 14400),

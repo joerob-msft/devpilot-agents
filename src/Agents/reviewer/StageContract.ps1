@@ -586,7 +586,7 @@ function Add-ReviewerStageContractLedgerEntry {
 function ConvertTo-ReviewerStageDeterministicKeyOrder {
     <#
     .SYNOPSIS
-        A payload whose unordered dictionaries have been given a stable key order.
+        A payload whose object keys have been given a stable, ordinal order.
     .DESCRIPTION
         The published bytes are the hashed artifact, so any part of serialization
         that is not a function of the payload's content becomes a digest that
@@ -596,11 +596,19 @@ function ConvertTo-ReviewerStageDeterministicKeyOrder {
         serialize to two different byte streams and defeat the differential the
         artifact exists to support.
 
-        Only genuinely unordered dictionaries are reordered, and they are sorted
-        ordinal. An OrderedDictionary and a PSCustomObject both carry an order the
-        author chose deliberately, so both are preserved exactly as given: guessing
-        that a declared order was accidental would corrupt a real intent to fix an
-        imaginary one.
+        EVERY object is ordered, whatever PowerShell type it arrived as. Ordering
+        only the unordered types would make wire identity a function of the type
+        the producer happened to build with: the same logical object would hash
+        one way as a hashtable, another as an ordered dictionary and a third as a
+        PSCustomObject. A JSON object has no order to preserve, so there is no
+        author intent to lose here - and where order genuinely carries meaning it
+        belongs in an array, which is left exactly as given.
+
+        The comparison is ordinal, not cultural. Sort-Object collates under the
+        current culture even with -CaseSensitive, so a key set containing paths or
+        mixed case can order differently on two hosts, or on one host after an ICU
+        update, and the artifact digest would then be a function of the machine's
+        locale rather than of the evidence.
     #>
     param([AllowNull()]$Node, [int]$Depth = 0)
 
@@ -612,23 +620,26 @@ function ConvertTo-ReviewerStageDeterministicKeyOrder {
 
     if ($Node -is [System.Collections.IDictionary]) {
         $ordered = [ordered]@{}
-        $keys = @($Node.Keys)
-        # An OrderedDictionary already states its order; anything else does not
-        # have one to state, so ordinal sorting is the only reading of it that two
-        # processes can agree on.
-        if ($Node -isnot [System.Collections.Specialized.OrderedDictionary]) {
-            $keys = @($keys | Sort-Object -Property { [string]$_ } -CaseSensitive)
-        }
+        $keys = [string[]]@($Node.Keys | ForEach-Object { [string]$_ })
+        [Array]::Sort($keys, [StringComparer]::Ordinal)
         foreach ($key in $keys) {
-            $ordered[[string]$key] = ConvertTo-ReviewerStageDeterministicKeyOrder -Node $Node[$key] -Depth ($Depth + 1)
+            $ordered[$key] = ConvertTo-ReviewerStageDeterministicKeyOrder -Node $Node[$key] -Depth ($Depth + 1)
         }
         return $ordered
     }
 
     if ($Node -is [System.Management.Automation.PSCustomObject]) {
         $ordered = [ordered]@{}
+        $properties = @{}
+        $names = [System.Collections.Generic.List[string]]::new()
         foreach ($property in $Node.PSObject.Properties) {
-            $ordered[[string]$property.Name] = ConvertTo-ReviewerStageDeterministicKeyOrder -Node $property.Value -Depth ($Depth + 1)
+            $properties[[string]$property.Name] = $property.Value
+            [void]$names.Add([string]$property.Name)
+        }
+        $sorted = [string[]]$names.ToArray()
+        [Array]::Sort($sorted, [StringComparer]::Ordinal)
+        foreach ($name in $sorted) {
+            $ordered[$name] = ConvertTo-ReviewerStageDeterministicKeyOrder -Node $properties[$name] -Depth ($Depth + 1)
         }
         return [pscustomobject]$ordered
     }
