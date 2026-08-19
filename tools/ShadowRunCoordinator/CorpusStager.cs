@@ -313,12 +313,16 @@ internal sealed class CorpusStager(CoordinatorRequest request, CorpusStageReques
             var standing = Path.Combine(destination, CorpusStageRequest.IndexFileName);
             if (!File.Exists(standing))
             {
+                // This run has just proven it will never publish, so it has no
+                // further claim on the copy it staged.
+                DiscardOwnedIncompleteStagingBeforeRefusal();
                 throw new ContractException(
                     $"'{destination}' exists and holds no {CorpusStageRequest.IndexFileName}. It is not this run's published corpus and it is not empty, so nothing is written into it.");
             }
             var standingDigest = CanonicalJson.Sha256HexOfFile(standing);
             if (!string.Equals(standingDigest, stagedIndexDigest, StringComparison.Ordinal))
             {
+                DiscardOwnedIncompleteStagingBeforeRefusal();
                 throw new ContractException(
                     $"'{destination}' already holds a corpus whose index digests to {standingDigest}, and this run staged {stagedIndexDigest}. " +
                     "A published corpus is never replaced, merged into, or written over.");
@@ -432,6 +436,29 @@ internal sealed class CorpusStager(CoordinatorRequest request, CorpusStageReques
             throw new ContractException($"The staged corpus index at '{indexPath}' digests to {actual} and this run committed {digest}.");
         }
         ValidateStagedTree(staging, actual, new FileInfo(indexPath).Length);
+    }
+
+    /// <summary>
+    /// Discards this run's staging directory on a path that is already failing,
+    /// leaving the failure that got here as the refusal the caller reports.
+    /// </summary>
+    /// <remarks>
+    /// A journal that turns out to belong to another request is itself a refusal,
+    /// but it is a less informative one than the refusal already in flight, and
+    /// raising it here would replace "the destination holds a different corpus"
+    /// with "the journal is not yours". Nothing is swallowed: the caller throws
+    /// on the next line either way.
+    /// </remarks>
+    private void DiscardOwnedIncompleteStagingBeforeRefusal()
+    {
+        try
+        {
+            DiscardOwnedIncompleteStaging();
+        }
+        catch (ContractException error)
+        {
+            _log.WriteLine($"corpus-stage leaving unowned staging in place: {error.Message}");
+        }
     }
 
     /// <summary>

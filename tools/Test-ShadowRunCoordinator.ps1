@@ -2384,6 +2384,40 @@ try {
     Assert-Coordinator ($lostRun.Output -match 'no longer holds a corpus index|is gone') `
         "The lost-staging refusal does not say what was lost.`n$($lostRun.Output)"
 
+    # A destination that appears after staging was committed. The publish is a
+    # different transition from the check, and often a different process, so the
+    # window is real. Both refusals must take this run's own staging copy with
+    # them: a run that has proven it will never publish has no claim on it, and
+    # leaving it behind wedges the root forever because every later resume
+    # re-enters the same refusal.
+    $occupiedCases = [Collections.Generic.List[hashtable]]::new()
+    [void]$occupiedCases.Add(@{ Name = 'occupied-no-index'; Index = ''; Match = 'holds no corpus-index.json' })
+    [void]$occupiedCases.Add(@{ Name = 'occupied-other-corpus'; Index = '{"kind":"not-ours"}'; Match = 'already holds a corpus' })
+    foreach ($occupied in $occupiedCases) {
+        $variant = New-CoordinatorStageVariant -BasePath $stageFixture.RequestPath -Name $occupied.Name -Root $faultRoot
+        Assert-Coordinator ((Invoke-Coordinator -RequestPath $variant.RequestPath -HaltAfter 'corpusStaging').ExitCode -eq 9) `
+            "The $($occupied.Name) setup did not halt after staging."
+        [void](New-Item -ItemType Directory -Force -Path $variant.CorpusRoot)
+        if ([string]$occupied.Index -ne '') {
+            [IO.File]::WriteAllBytes((Join-Path $variant.CorpusRoot 'corpus-index.json'),
+                ([Text.UTF8Encoding]::new($false, $true)).GetBytes([string]$occupied.Index))
+        }
+        else {
+            [void](New-Item -ItemType Directory -Force -Path (Join-Path $variant.CorpusRoot 'squatter'))
+        }
+        $blocked = Invoke-Coordinator -RequestPath $variant.RequestPath -Target 'corpusValidated'
+        Assert-Coordinator ($blocked.ExitCode -eq 2) `
+            "The $($occupied.Name) publish exited $($blocked.ExitCode) rather than refusing.`n$($blocked.Output)"
+        Assert-Coordinator ($blocked.Output -match [regex]::Escape($occupied.Match)) `
+            "The $($occupied.Name) refusal does not name what it found.`n$($blocked.Output)"
+        $left = @(Get-ChildItem -LiteralPath $faultRoot -Directory -Force |
+                Where-Object { $_.Name -like '.corpus-staging-*' })
+        Assert-Coordinator ($left.Count -eq 0) `
+            "The $($occupied.Name) refusal left $($left.Count) staging directories behind."
+        Assert-Coordinator (-not (Test-Path -LiteralPath (Join-Path (Join-Path $variant.OutputRoot 'coordinator') 'corpus-stage.journal.json'))) `
+            "The $($occupied.Name) refusal left its staging journal behind."
+    }
+
     # A journal opened by somebody else is not this run's to clean up.
     $foreignJournal = New-CoordinatorStageVariant -BasePath $stageFixture.RequestPath -Name 'foreign-journal' -Root $faultRoot
     $foreignCoordinatorRoot = Join-Path $foreignJournal.OutputRoot 'coordinator'

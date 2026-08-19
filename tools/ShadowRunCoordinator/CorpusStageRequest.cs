@@ -219,10 +219,38 @@ internal sealed record CorpusStageRequest
         CorpusPayloadRole.Resource
     ];
 
-    internal static CorpusStageRequest Load(string path)
+    /// <summary>
+    /// Reads the declaration this run will obey, from the one set of bytes whose
+    /// digest is checked against <paramref name="boundSha256"/>.
+    /// </summary>
+    /// <remarks>
+    /// The bytes are read exactly once. Hashing the file and then parsing the
+    /// file are two reads of a path that another process may own, and between
+    /// them a declaration can change its payload forms, roles or source paths
+    /// while still satisfying a digest taken before the change and an index
+    /// digest taken after it. The window is closed by never having one: the
+    /// caller's bound digest is checked against this buffer, and this buffer is
+    /// what is parsed and what <see cref="RequestSha256"/> reports.
+    /// </remarks>
+    internal static CorpusStageRequest Load(string path, string boundSha256)
     {
         const string label = "corpus stage request";
-        var root = StrictJson.ReadObjectFile(path, label);
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            throw new ContractException($"The {label} path is empty.");
+        }
+        if (!File.Exists(path))
+        {
+            throw new ContractException($"The {label} at '{path}' does not exist.");
+        }
+        var bytes = File.ReadAllBytes(path);
+        var requestSha256 = CanonicalJson.Sha256Hex(bytes);
+        if (!string.IsNullOrEmpty(boundSha256) && !string.Equals(requestSha256, boundSha256, StringComparison.Ordinal))
+        {
+            throw new ContractException(
+                $"The {label} at '{path}' digests to {requestSha256}, and the request binds {boundSha256}.");
+        }
+        var root = StrictJson.ReadObjectBytes(bytes, path, label);
         StrictJson.RequireNoUnknownFields(
             root,
             label,
@@ -340,7 +368,6 @@ internal sealed record CorpusStageRequest
 
         RequireRoleCardinality(payloads, identity, label);
 
-        var bytes = File.ReadAllBytes(path);
         return new CorpusStageRequest
         {
             ContractVersion = contractVersion,
@@ -353,7 +380,7 @@ internal sealed record CorpusStageRequest
             CorpusKind = RequireCorpusKind(root, label),
             Identity = identity,
             Payloads = payloads,
-            RequestSha256 = CanonicalJson.Sha256Hex(bytes)
+            RequestSha256 = requestSha256
         };
     }
 

@@ -381,8 +381,9 @@ internal sealed class PreparationMachine(
             return _stager;
         }
         var authorization = _request.RequireCorpusStaging();
-        RequireDigest(authorization.RequestPath, authorization.RequestSha256, "corpus stage request");
-        var declaration = CorpusStageRequest.Load(authorization.RequestPath);
+        // The digest is checked inside Load, against the same buffer Load parses,
+        // so the declaration that is obeyed is the declaration that was proven.
+        var declaration = CorpusStageRequest.Load(authorization.RequestPath, authorization.RequestSha256);
         var stager = new CorpusStager(_request, declaration, _log);
         // Two files that both describe one subject are two chances to describe two
         // subjects. They are reconciled here, once, before a single byte is read.
