@@ -367,7 +367,15 @@ memory, and the prerequisite's `inForce` stays `false`. What the opt-in path *is
 recorded in `adoptionScope` instead of being smuggled into the boolean, and the coupling runs
 both ways: `tools/Test-EscapeLedger.ps1` fails if the ledger claims production enables the
 switch when no shipping file calls it, and equally if a shipping file starts calling it while
-the ledger still reads "not enabled".
+the ledger still reads "not enabled". The second direction forces a fresh look, not a
+particular answer, because a reference can exist without production reaching it — a string, a
+dead branch, an uncalled helper. So `adoptionScope.scope` has three landing places rather than
+two: `production-path`, `opt-in-shadow-with-reviewed-reference` for a reference examined and
+found not to reach production, and `opt-in-offline-shadow` for a tree that does not reference
+it at all. The middle one is itself a claim, so the note has to say *why* the reference is
+inert and it cannot be combined with `inForce: true`. Without that third value a harmless
+reference would leave no representable honest state, and the gate would be demanding a false
+record instead of a re-derivation.
 
 Three further residuals are stated rather than absorbed. What flows downstream is the
 in-memory object the boundary judged, with the reread payload used as evidence that it

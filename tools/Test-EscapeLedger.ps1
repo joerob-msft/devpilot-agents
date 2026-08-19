@@ -738,8 +738,27 @@ function Get-FileContractAdoptionViolation {
         # conclude is that "opt-in offline, nothing calls it" has expired as a
         # description and the record has to be re-derived from the new call site
         # rather than left standing.
+        # There are three honest answers once a reference exists, not two. The
+        # reference may put production on the on-disk half ('production-path'); it
+        # may have been looked at and found not to ('opt-in-shadow-with-reviewed-
+        # reference' - a string, a dead branch, a helper nothing calls); or it may
+        # not have been looked at yet, which is the only state refused here. If the
+        # scope could only be 'production-path' or 'opt-in-offline-shadow', a
+        # harmless reference would make every representable value false and the
+        # record unwritable, so the gate would be forcing a lie rather than a look.
         if ([string]$scopeValue.scope -ceq 'opt-in-offline-shadow') {
-            [void]$violations.Add("A shipping file under src/ now contains a static call to Enable-ReviewerStageShadowContract, so the adoption scope cannot still read 'opt-in-offline-shadow' unexamined; re-derive the scope from that call site.")
+            [void]$violations.Add("A shipping file under src/ now contains a static call to Enable-ReviewerStageShadowContract, so the adoption scope cannot still read 'opt-in-offline-shadow' unexamined; re-derive the scope from that call site as 'production-path' or 'opt-in-shadow-with-reviewed-reference'.")
+        }
+        if ([string]$scopeValue.scope -ceq 'opt-in-shadow-with-reviewed-reference') {
+            # Claiming the reference was reviewed and found inert is a claim, so it
+            # has to say WHY, and it cannot be combined with an in-force claim: an
+            # inert reference is by definition not production going through it.
+            if ([string]$scopeValue.note -notmatch 'dead branch|never reached|not reached|inert|string literal|not on the production path') {
+                [void]$violations.Add("The file contract adoption scope claims the shipping reference to Enable-ReviewerStageShadowContract was reviewed and found not to put production on the on-disk half, but the note never says why it does not - name the dead branch, the string literal, or the unreached helper.")
+            }
+            if ([bool]$Prerequisite.inForce) {
+                [void]$violations.Add('The file contract adoption scope says the shipping reference was reviewed and found inert, yet the prerequisite is declared in force; an inert reference is not production going through the on-disk half.')
+            }
         }
         if ([string]$scopeValue.note -match 'no file under src|nothing under src|no shipping file') {
             [void]$violations.Add('A shipping file under src/ now contains a static call to Enable-ReviewerStageShadowContract, but the adoption scope note still asserts that nothing calls it, so the note describes a tree that no longer exists.')
@@ -973,6 +992,51 @@ if ($fileContractPrerequisite.Count -eq 1) {
         # alone. A call on a branch production never takes is still a call.
         Assert-Ledger (@($wiredInViolations | Where-Object { $_ -match 'inForce' }).Count -eq 0) `
             'A static call site alone was treated as proof the on-disk half is in force, which is the equation this coupling exists to avoid.'
+
+        # A detected reference that is a string, or sits on a branch production
+        # never takes, must leave a TRUE value the record can hold. If the only
+        # alternatives were 'production-path' and 'opt-in-offline-shadow', both
+        # would be false and the gate would be demanding a lie. The third state
+        # exists for exactly that case - and it is a claim, so it has to say why
+        # the reference is inert and it cannot sit next to an in-force claim.
+        $reviewedRef = Get-LedgerObject -Json $ledgerJson
+        $reviewedRefClaim = @($reviewedRef.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $reviewedRefClaim.adoptionScope.staticCallSiteInProduction = $true
+        $reviewedRefClaim.adoptionScope.scope = 'opt-in-shadow-with-reviewed-reference'
+        $reviewedRefClaim.adoptionScope.note = 'Reached only through the opt-in Enable-ReviewerStageShadowContract switch; the reference under src/ sits on a dead branch that production never takes.'
+        $reviewedRefViolations = @(Get-FileContractAdoptionViolation -Prerequisite $reviewedRefClaim -ProductionRoot $detectorProof)
+        Assert-Ledger ($reviewedRefViolations.Count -eq 0) `
+            "A reviewed, inert reference has no representable adoption scope: $($reviewedRefViolations -join ' | ')"
+
+        $unexplainedRef = Get-LedgerObject -Json $ledgerJson
+        $unexplainedRefClaim = @($unexplainedRef.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $unexplainedRefClaim.adoptionScope.staticCallSiteInProduction = $true
+        $unexplainedRefClaim.adoptionScope.scope = 'opt-in-shadow-with-reviewed-reference'
+        # A note that satisfies the opt-in clause and says nothing about why the
+        # reference does not reach production - the label without the reason.
+        $unexplainedRefClaim.adoptionScope.note = 'Reached only through the opt-in Enable-ReviewerStageShadowContract switch.'
+        $unexplainedRefViolations = @(Get-FileContractAdoptionViolation -Prerequisite $unexplainedRefClaim -ProductionRoot $detectorProof)
+        Assert-Ledger (@($unexplainedRefViolations | Where-Object { $_ -match 'never says why it does not' }).Count -eq 1) `
+            'The reviewed-reference scope was accepted without the note saying why the shipping reference is inert, which makes it an unfalsifiable label.'
+
+        $inForceRef = Get-LedgerObject -Json $ledgerJson
+        $inForceRefClaim = @($inForceRef.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $inForceRefClaim.adoptionScope.staticCallSiteInProduction = $true
+        $inForceRefClaim.adoptionScope.scope = 'opt-in-shadow-with-reviewed-reference'
+        $inForceRefClaim.adoptionScope.note = 'Reached only through the opt-in switch; the reference sits on a dead branch.'
+        $inForceRefClaim.inForce = $true
+        $inForceRefViolations = @(Get-FileContractAdoptionViolation -Prerequisite $inForceRefClaim -ProductionRoot $detectorProof)
+        Assert-Ledger (@($inForceRefViolations | Where-Object { $_ -match 'an inert reference is not production going through' }).Count -eq 1) `
+            'The ledger accepted "the reference is inert" and "the on-disk half is in force" at the same time, which cannot both be true.'
+
+        # And the third state is not a way to dodge the no-call-site clause: with
+        # nothing under src/ naming the switch, "a reference was reviewed" is false.
+        Remove-Item -LiteralPath $callerPath -Force
+        $noRefClaim = @((Get-LedgerObject -Json $ledgerJson).decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $noRefClaim.adoptionScope.scope = 'opt-in-shadow-with-reviewed-reference'
+        $noRefViolations = @(Get-FileContractAdoptionViolation -Prerequisite $noRefClaim -ProductionRoot $detectorProof)
+        Assert-Ledger (@($noRefViolations | Where-Object { $_ -match 'while no shipping file under src/ calls the switch' }).Count -eq 1) `
+            'The reviewed-reference scope was accepted against a tree that contains no reference at all.'
     }
     finally {
         Remove-Item -LiteralPath $detectorProof -Recurse -Force -ErrorAction SilentlyContinue

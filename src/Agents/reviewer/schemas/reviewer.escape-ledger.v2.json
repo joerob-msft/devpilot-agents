@@ -467,7 +467,7 @@
                 "additionalProperties": false,
                 "required": ["scope", "staticCallSiteInProduction", "note"],
                 "properties": {
-                  "scope": { "enum": ["production-path", "opt-in-offline-shadow"] },
+                  "scope": { "enum": ["production-path", "opt-in-offline-shadow", "opt-in-shadow-with-reviewed-reference"] },
                   "staticCallSiteInProduction": { "type": "boolean" },
                   "note": { "type": "string", "minLength": 1 }
                 }
