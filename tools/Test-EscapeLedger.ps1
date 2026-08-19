@@ -730,6 +730,9 @@ function Get-FileContractAdoptionViolation {
         if ([string]$scopeValue.scope -cne 'opt-in-offline-shadow') {
             [void]$violations.Add("The file contract adoption scope claims '$([string]$scopeValue.scope)' while no shipping file under src/ calls the switch.")
         }
+        if ($null -ne $scopeValue.PSObject.Properties['reviewedReferenceReason']) {
+            [void]$violations.Add('The file contract adoption scope records a reviewedReferenceReason while no shipping file under src/ references the switch at all, so it reviews a reference that no longer exists.')
+        }
     }
     else {
         # The mirror clause, and it stops short of forcing inForce true on
@@ -749,16 +752,34 @@ function Get-FileContractAdoptionViolation {
         if ([string]$scopeValue.scope -ceq 'opt-in-offline-shadow') {
             [void]$violations.Add("A shipping file under src/ now contains a static call to Enable-ReviewerStageShadowContract, so the adoption scope cannot still read 'opt-in-offline-shadow' unexamined; re-derive the scope from that call site as 'production-path' or 'opt-in-shadow-with-reviewed-reference'.")
         }
+        $reason = $scopeValue.PSObject.Properties['reviewedReferenceReason']
         if ([string]$scopeValue.scope -ceq 'opt-in-shadow-with-reviewed-reference') {
             # Claiming the reference was reviewed and found inert is a claim, so it
             # has to say WHY, and it cannot be combined with an in-force claim: an
             # inert reference is by definition not production going through it.
-            if ([string]$scopeValue.note -notmatch 'dead branch|never reached|not reached|inert|string literal|not on the production path') {
-                [void]$violations.Add("The file contract adoption scope claims the shipping reference to Enable-ReviewerStageShadowContract was reviewed and found not to put production on the on-disk half, but the note never says why it does not - name the dead branch, the string literal, or the unreached helper.")
+            #
+            # The WHY lives in its own field rather than being keyword-grepped out
+            # of the shared note. The note is prose that already explains the scheme
+            # itself, so a grep for words like "inert" or "dead branch" is satisfied
+            # by the definition of the enum value and passes while nobody has said
+            # anything about the actual reference. A dedicated field cannot be
+            # pre-satisfied by prose written for another purpose, and requiring it to
+            # name a path under src/ ties it to the reference it is about.
+            if ($null -eq $reason -or [string]::IsNullOrWhiteSpace([string]$reason.Value)) {
+                [void]$violations.Add('The file contract adoption scope claims the shipping reference to Enable-ReviewerStageShadowContract was reviewed and found not to put production on the on-disk half, but records no reviewedReferenceReason saying why.')
+            }
+            elseif ([string]$reason.Value -notmatch 'src/') {
+                [void]$violations.Add("The file contract adoption scope records a reviewedReferenceReason that never names a path under src/, so it does not say which reference was reviewed.")
             }
             if ([bool]$Prerequisite.inForce) {
                 [void]$violations.Add('The file contract adoption scope says the shipping reference was reviewed and found inert, yet the prerequisite is declared in force; an inert reference is not production going through the on-disk half.')
             }
+        }
+        elseif ($null -ne $reason) {
+            # The reason is meaningful only for the scope that needs it. Left behind
+            # under another scope it would read as a live finding about a tree that
+            # has moved on.
+            [void]$violations.Add("The file contract adoption scope records a reviewedReferenceReason while its scope is '$([string]$scopeValue.scope)', so a review of an inert reference is being carried under a scope that does not describe one.")
         }
         if ([string]$scopeValue.note -match 'no file under src|nothing under src|no shipping file') {
             [void]$violations.Add('A shipping file under src/ now contains a static call to Enable-ReviewerStageShadowContract, but the adoption scope note still asserts that nothing calls it, so the note describes a tree that no longer exists.')
@@ -1003,7 +1024,9 @@ if ($fileContractPrerequisite.Count -eq 1) {
         $reviewedRefClaim = @($reviewedRef.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
         $reviewedRefClaim.adoptionScope.staticCallSiteInProduction = $true
         $reviewedRefClaim.adoptionScope.scope = 'opt-in-shadow-with-reviewed-reference'
-        $reviewedRefClaim.adoptionScope.note = 'Reached only through the opt-in Enable-ReviewerStageShadowContract switch; the reference under src/ sits on a dead branch that production never takes.'
+        $reviewedRefClaim.adoptionScope.note = 'Reached only through the opt-in Enable-ReviewerStageShadowContract switch.'
+        $reviewedRefClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferenceReason' `
+            -NotePropertyValue 'The only reference is in src/Agents/reviewer/Caller.ps1, on a branch guarded by a constant that production never takes.'
         $reviewedRefViolations = @(Get-FileContractAdoptionViolation -Prerequisite $reviewedRefClaim -ProductionRoot $detectorProof)
         Assert-Ledger ($reviewedRefViolations.Count -eq 0) `
             "A reviewed, inert reference has no representable adoption scope: $($reviewedRefViolations -join ' | ')"
@@ -1012,18 +1035,38 @@ if ($fileContractPrerequisite.Count -eq 1) {
         $unexplainedRefClaim = @($unexplainedRef.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
         $unexplainedRefClaim.adoptionScope.staticCallSiteInProduction = $true
         $unexplainedRefClaim.adoptionScope.scope = 'opt-in-shadow-with-reviewed-reference'
-        # A note that satisfies the opt-in clause and says nothing about why the
-        # reference does not reach production - the label without the reason.
-        $unexplainedRefClaim.adoptionScope.note = 'Reached only through the opt-in Enable-ReviewerStageShadowContract switch.'
+        # Deliberately the REAL shipped note, edited only where it would otherwise
+        # describe a tree with no reference in it. That note is prose about the
+        # scheme and already contains words like "inert" and "dead branch", so a
+        # keyword grep over it would pass while nobody had explained the actual
+        # reference. Nothing short of the dedicated field may satisfy this.
+        $unexplainedRefClaim.adoptionScope.note = ([string]$unexplainedRefClaim.adoptionScope.note).Replace(
+            'No file under src/ contains a static call to it', 'A shipping file under src/ now names it')
         $unexplainedRefViolations = @(Get-FileContractAdoptionViolation -Prerequisite $unexplainedRefClaim -ProductionRoot $detectorProof)
-        Assert-Ledger (@($unexplainedRefViolations | Where-Object { $_ -match 'never says why it does not' }).Count -eq 1) `
-            'The reviewed-reference scope was accepted without the note saying why the shipping reference is inert, which makes it an unfalsifiable label.'
+        Assert-Ledger ([string]$unexplainedRefClaim.adoptionScope.note -match 'inert|dead branch') `
+            'The negative proof no longer exercises a note containing the very words a keyword grep would have accepted.'
+        Assert-Ledger (@($unexplainedRefViolations | Where-Object { $_ -match 'records no reviewedReferenceReason' }).Count -eq 1) `
+            'The reviewed-reference scope was accepted with no reviewedReferenceReason, so the shared note pre-satisfied the explanation the gate claims to require.'
+
+        # ...and a reason that never names the reference it reviewed is not one.
+        $vagueRef = Get-LedgerObject -Json $ledgerJson
+        $vagueRefClaim = @($vagueRef.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $vagueRefClaim.adoptionScope.staticCallSiteInProduction = $true
+        $vagueRefClaim.adoptionScope.scope = 'opt-in-shadow-with-reviewed-reference'
+        $vagueRefClaim.adoptionScope.note = 'Reached only through the opt-in Enable-ReviewerStageShadowContract switch.'
+        $vagueRefClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferenceReason' `
+            -NotePropertyValue 'Looked at it and it is fine.'
+        $vagueRefViolations = @(Get-FileContractAdoptionViolation -Prerequisite $vagueRefClaim -ProductionRoot $detectorProof)
+        Assert-Ledger (@($vagueRefViolations | Where-Object { $_ -match 'never names a path under src/' }).Count -eq 1) `
+            'A reviewed-reference reason that names no reference at all was accepted as an explanation of one.'
 
         $inForceRef = Get-LedgerObject -Json $ledgerJson
         $inForceRefClaim = @($inForceRef.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
         $inForceRefClaim.adoptionScope.staticCallSiteInProduction = $true
         $inForceRefClaim.adoptionScope.scope = 'opt-in-shadow-with-reviewed-reference'
-        $inForceRefClaim.adoptionScope.note = 'Reached only through the opt-in switch; the reference sits on a dead branch.'
+        $inForceRefClaim.adoptionScope.note = 'Reached only through the opt-in Enable-ReviewerStageShadowContract switch.'
+        $inForceRefClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferenceReason' `
+            -NotePropertyValue 'The only reference is in src/Agents/reviewer/Caller.ps1, on a branch production never takes.'
         $inForceRefClaim.inForce = $true
         $inForceRefViolations = @(Get-FileContractAdoptionViolation -Prerequisite $inForceRefClaim -ProductionRoot $detectorProof)
         Assert-Ledger (@($inForceRefViolations | Where-Object { $_ -match 'an inert reference is not production going through' }).Count -eq 1) `
@@ -1034,9 +1077,29 @@ if ($fileContractPrerequisite.Count -eq 1) {
         Remove-Item -LiteralPath $callerPath -Force
         $noRefClaim = @((Get-LedgerObject -Json $ledgerJson).decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
         $noRefClaim.adoptionScope.scope = 'opt-in-shadow-with-reviewed-reference'
+        $noRefClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferenceReason' `
+            -NotePropertyValue 'The only reference is in src/Agents/reviewer/Caller.ps1, on a branch production never takes.'
         $noRefViolations = @(Get-FileContractAdoptionViolation -Prerequisite $noRefClaim -ProductionRoot $detectorProof)
         Assert-Ledger (@($noRefViolations | Where-Object { $_ -match 'while no shipping file under src/ calls the switch' }).Count -eq 1) `
             'The reviewed-reference scope was accepted against a tree that contains no reference at all.'
+        Assert-Ledger (@($noRefViolations | Where-Object { $_ -match 'reviews a reference that no longer exists' }).Count -eq 1) `
+            'A reviewedReferenceReason survived the disappearance of the reference it reviewed.'
+
+        # The reason belongs to one scope only; carried under another it is a stale
+        # finding about a tree that has moved on.
+        [IO.File]::WriteAllText($callerPath,
+            "`$state = Enable-ReviewerStageShadowContract -Directory `$dir`n",
+            [Text.UTF8Encoding]::new($false))
+        $strayReason = Get-LedgerObject -Json $ledgerJson
+        $strayReasonClaim = @($strayReason.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $strayReasonClaim.adoptionScope.staticCallSiteInProduction = $true
+        $strayReasonClaim.adoptionScope.scope = 'production-path'
+        $strayReasonClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferenceReason' `
+            -NotePropertyValue 'The only reference is in src/Agents/reviewer/Caller.ps1, on a branch production never takes.'
+        $strayReasonViolations = @(Get-FileContractAdoptionViolation -Prerequisite $strayReasonClaim -ProductionRoot $detectorProof)
+        Assert-Ledger (@($strayReasonViolations | Where-Object { $_ -match 'under a scope that does not describe one' }).Count -eq 1) `
+            'A reviewed-reference reason was carried under production-path, where it describes nothing.'
+        Remove-Item -LiteralPath $callerPath -Force
     }
     finally {
         Remove-Item -LiteralPath $detectorProof -Recurse -Force -ErrorAction SilentlyContinue
