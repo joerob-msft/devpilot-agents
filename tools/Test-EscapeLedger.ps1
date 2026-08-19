@@ -896,8 +896,10 @@ function Get-ShadowSwitchStaticCallSitePath {
         that cannot be checked against what is actually there is decoration: a
         reason naming no path, a path that does not exist, or a path that exists
         while a second unreviewed reference sits beside it would all pass an
-        unbound check. Paths come back repository-relative with forward slashes so
-        a citation reads the same on either platform.
+        unbound check. Paths come back repository-relative when the file is under
+        the repository root - and absolute otherwise, which is what -Root pointed
+        at a temporary proof tree produces - with forward slashes either way, so a
+        citation of a shipping file reads the same on either platform.
 
         Same detection and therefore the same blind spots as the presence scan.
     #>
