@@ -469,6 +469,7 @@
                 "properties": {
                   "scope": { "enum": ["production-path", "opt-in-offline-shadow", "opt-in-shadow-with-reviewed-reference"] },
                   "reviewedReferenceReason": { "type": "string", "minLength": 1 },
+                  "reviewedReferencePath": { "type": "array", "items": { "type": "string", "minLength": 1 } },
                   "staticCallSiteInProduction": { "type": "boolean" },
                   "note": { "type": "string", "minLength": 1 }
                 }

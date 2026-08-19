@@ -373,8 +373,10 @@ dead branch, an uncalled helper. So `adoptionScope.scope` has three landing plac
 two: `production-path`, `opt-in-shadow-with-reviewed-reference` for a reference examined and
 found not to reach production, and `opt-in-offline-shadow` for a tree that does not reference
 it at all. The middle one is itself a claim, so it has to carry a separate
-`reviewedReferenceReason` that names a path under `src/`, and it cannot be combined with
-`inForce: true`. The reason is a dedicated field rather than a keyword grep over the shared
+`reviewedReferenceReason` **and** a `reviewedReferencePath` whose cited files are exactly the
+files the detector reports as referencing the switch — a citation that names a file nothing
+references, or that reviews one reference while a second sits beside it, is refused — and it
+cannot be combined with `inForce: true`. The reason is a dedicated field rather than a keyword grep over the shared
 note on purpose: the note is prose about this scheme and already contains the words such a
 grep would look for, so grepping it would accept a record in which nobody had said anything
 about the actual reference. The field is also refused under any other scope, and refused when

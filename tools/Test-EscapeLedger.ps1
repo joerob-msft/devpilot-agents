@@ -730,7 +730,8 @@ function Get-FileContractAdoptionViolation {
         if ([string]$scopeValue.scope -cne 'opt-in-offline-shadow') {
             [void]$violations.Add("The file contract adoption scope claims '$([string]$scopeValue.scope)' while no shipping file under src/ calls the switch.")
         }
-        if ($null -ne $scopeValue.PSObject.Properties['reviewedReferenceReason']) {
+        if ($null -ne $scopeValue.PSObject.Properties['reviewedReferenceReason'] -or
+            $null -ne $scopeValue.PSObject.Properties['reviewedReferencePath']) {
             [void]$violations.Add('The file contract adoption scope records a reviewedReferenceReason while no shipping file under src/ references the switch at all, so it reviews a reference that no longer exists.')
         }
     }
@@ -768,14 +769,35 @@ function Get-FileContractAdoptionViolation {
             if ($null -eq $reason -or [string]::IsNullOrWhiteSpace([string]$reason.Value)) {
                 [void]$violations.Add('The file contract adoption scope claims the shipping reference to Enable-ReviewerStageShadowContract was reviewed and found not to put production on the on-disk half, but records no reviewedReferenceReason saying why.')
             }
-            elseif ([string]$reason.Value -notmatch 'src/') {
-                [void]$violations.Add("The file contract adoption scope records a reviewedReferenceReason that never names a path under src/, so it does not say which reference was reviewed.")
+            # The citation is checked against the tree, not merely for shape. An
+            # unbound citation - a reason that says "src/" and nothing more, or a
+            # path nothing references - is decoration, and a citation that covers
+            # only some of the references leaves the rest unreviewed while reading
+            # as a complete review. So the cited set has to equal the detected set.
+            $detected = [string[]]@(Get-ShadowSwitchStaticCallSitePath -Root $ProductionRoot)
+            $citedProperty = $scopeValue.PSObject.Properties['reviewedReferencePath']
+            $cited = [string[]]@()
+            if ($null -ne $citedProperty -and $null -ne $citedProperty.Value) {
+                $cited = [string[]]@(@($citedProperty.Value) | ForEach-Object { [string]$_ })
+            }
+            if ($cited.Count -eq 0) {
+                [void]$violations.Add('The file contract adoption scope claims a reviewed reference but cites no reviewedReferencePath, so nothing binds the claim to the reference it reviewed.')
+            }
+            else {
+                $uncited = [string[]]@($detected | Where-Object { $cited -notcontains $_ })
+                if ($uncited.Count -gt 0) {
+                    [void]$violations.Add("The file contract adoption scope reviews a reference but does not cite $($uncited -join ', '), which also references Enable-ReviewerStageShadowContract, so part of the tree is unreviewed under a record that reads as complete.")
+                }
+                $unreal = [string[]]@($cited | Where-Object { $detected -notcontains $_ })
+                if ($unreal.Count -gt 0) {
+                    [void]$violations.Add("The file contract adoption scope cites $($unreal -join ', ') as a reviewed reference to Enable-ReviewerStageShadowContract, but nothing there references it.")
+                }
             }
             if ([bool]$Prerequisite.inForce) {
                 [void]$violations.Add('The file contract adoption scope says the shipping reference was reviewed and found inert, yet the prerequisite is declared in force; an inert reference is not production going through the on-disk half.')
             }
         }
-        elseif ($null -ne $reason) {
+        elseif ($null -ne $reason -or $null -ne $scopeValue.PSObject.Properties['reviewedReferencePath']) {
             # The reason is meaningful only for the scope that needs it. Left behind
             # under another scope it would read as a live finding about a tree that
             # has moved on.
@@ -856,6 +878,55 @@ function Test-ShadowSwitchStaticCallSitePresent {
         if (@($references).Count -gt 0) { return $true }
     }
     return $false
+}
+
+function Get-ShadowSwitchStaticCallSitePath {
+    <#
+        The same scan as Test-ShadowSwitchStaticCallSitePresent, reporting WHICH
+        files reference the switch rather than whether any does. A record that
+        claims a reference was reviewed has to cite the reference, and a citation
+        that cannot be checked against what is actually there is decoration: a
+        reason naming no path, a path that does not exist, or a path that exists
+        while a second unreviewed reference sits beside it would all pass an
+        unbound check. Paths come back repository-relative with forward slashes so
+        a citation reads the same on either platform.
+
+        Same detection and therefore the same blind spots as the presence scan.
+    #>
+    param([string]$Root = (Join-Path $repoRoot 'src'))
+
+    $paths = [System.Collections.Generic.List[string]]::new()
+    if (-not (Test-Path -LiteralPath $Root)) { return $paths.ToArray() }
+    $powerShellExtensions = [string[]]@('.ps1', '.psm1', '.psd1')
+    foreach ($file in (Get-ChildItem -LiteralPath $Root -Recurse -File)) {
+        if ($powerShellExtensions -notcontains [string]$file.Extension.ToLowerInvariant()) { continue }
+        $tokens = $null
+        $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            $file.FullName, [ref]$tokens, [ref]$errors)
+        if ($null -eq $ast) { continue }
+        $references = $ast.FindAll({
+                param($node)
+                if ($node -is [System.Management.Automation.Language.CommandAst]) {
+                    return ([string]$node.GetCommandName() -eq 'Enable-ReviewerStageShadowContract')
+                }
+                if ($node -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                    return ([string]$node.Value).Contains('Enable-ReviewerStageShadowContract')
+                }
+                if ($node -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
+                    return ([string]$node.Value).Contains('Enable-ReviewerStageShadowContract')
+                }
+                return $false
+            }, $true)
+        if (@($references).Count -eq 0) { continue }
+        $relative = [string]$file.FullName
+        $rootPrefix = [string]$repoRoot
+        if ($relative.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            $relative = $relative.Substring($rootPrefix.Length).TrimStart('\', '/')
+        }
+        [void]$paths.Add($relative.Replace('\', '/'))
+    }
+    return $paths.ToArray()
 }
 
 $cardinalityMatrix = $null
@@ -1026,7 +1097,12 @@ if ($fileContractPrerequisite.Count -eq 1) {
         $reviewedRefClaim.adoptionScope.scope = 'opt-in-shadow-with-reviewed-reference'
         $reviewedRefClaim.adoptionScope.note = 'Reached only through the opt-in Enable-ReviewerStageShadowContract switch.'
         $reviewedRefClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferenceReason' `
-            -NotePropertyValue 'The only reference is in src/Agents/reviewer/Caller.ps1, on a branch guarded by a constant that production never takes.'
+            -NotePropertyValue 'The reference sits on a branch guarded by a constant that production never takes.'
+        # The citation is the path the detector reports, spelled independently of
+        # the detector so the proof is not circular.
+        $citedPath = ([string]$callerPath).Replace('\', '/')
+        $reviewedRefClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferencePath' `
+            -NotePropertyValue ([string[]]@($citedPath))
         $reviewedRefViolations = @(Get-FileContractAdoptionViolation -Prerequisite $reviewedRefClaim -ProductionRoot $detectorProof)
         Assert-Ledger ($reviewedRefViolations.Count -eq 0) `
             "A reviewed, inert reference has no representable adoption scope: $($reviewedRefViolations -join ' | ')"
@@ -1048,17 +1124,53 @@ if ($fileContractPrerequisite.Count -eq 1) {
         Assert-Ledger (@($unexplainedRefViolations | Where-Object { $_ -match 'records no reviewedReferenceReason' }).Count -eq 1) `
             'The reviewed-reference scope was accepted with no reviewedReferenceReason, so the shared note pre-satisfied the explanation the gate claims to require.'
 
-        # ...and a reason that never names the reference it reviewed is not one.
+        # ...and a reason that cites nothing is not a review of anything. A prose
+        # gesture at "src/" is the shape the old check would have taken for a
+        # citation, so it is the shape this refuses.
         $vagueRef = Get-LedgerObject -Json $ledgerJson
         $vagueRefClaim = @($vagueRef.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
         $vagueRefClaim.adoptionScope.staticCallSiteInProduction = $true
         $vagueRefClaim.adoptionScope.scope = 'opt-in-shadow-with-reviewed-reference'
         $vagueRefClaim.adoptionScope.note = 'Reached only through the opt-in Enable-ReviewerStageShadowContract switch.'
         $vagueRefClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferenceReason' `
-            -NotePropertyValue 'Looked at it and it is fine.'
+            -NotePropertyValue 'Reviewed src/ generally and it is fine.'
         $vagueRefViolations = @(Get-FileContractAdoptionViolation -Prerequisite $vagueRefClaim -ProductionRoot $detectorProof)
-        Assert-Ledger (@($vagueRefViolations | Where-Object { $_ -match 'never names a path under src/' }).Count -eq 1) `
-            'A reviewed-reference reason that names no reference at all was accepted as an explanation of one.'
+        Assert-Ledger (@($vagueRefViolations | Where-Object { $_ -match 'cites no reviewedReferencePath' }).Count -eq 1) `
+            'A reviewed-reference reason that gestures at src/ without citing a file was accepted as a review of a reference.'
+
+        # A citation nothing references is a citation of nothing.
+        $unrealRef = Get-LedgerObject -Json $ledgerJson
+        $unrealRefClaim = @($unrealRef.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $unrealRefClaim.adoptionScope.staticCallSiteInProduction = $true
+        $unrealRefClaim.adoptionScope.scope = 'opt-in-shadow-with-reviewed-reference'
+        $unrealRefClaim.adoptionScope.note = 'Reached only through the opt-in Enable-ReviewerStageShadowContract switch.'
+        $unrealRefClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferenceReason' `
+            -NotePropertyValue 'The reference sits on a branch production never takes.'
+        $unrealRefClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferencePath' `
+            -NotePropertyValue ([string[]]@('src/Agents/reviewer/NoSuchFile.ps1'))
+        $unrealRefViolations = @(Get-FileContractAdoptionViolation -Prerequisite $unrealRefClaim -ProductionRoot $detectorProof)
+        Assert-Ledger (@($unrealRefViolations | Where-Object { $_ -match 'but nothing there references it' }).Count -eq 1) `
+            'A reviewed-reference citation naming a file that references nothing was accepted.'
+
+        # And a citation that covers one reference while a second sits beside it
+        # reads as a complete review of an incompletely reviewed tree.
+        $secondCallerPath = Join-Path $detectorProof 'SecondCaller.ps1'
+        [IO.File]::WriteAllText($secondCallerPath,
+            "`$state = Enable-ReviewerStageShadowContract -Directory `$dir`n",
+            [Text.UTF8Encoding]::new($false))
+        $partialRef = Get-LedgerObject -Json $ledgerJson
+        $partialRefClaim = @($partialRef.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $partialRefClaim.adoptionScope.staticCallSiteInProduction = $true
+        $partialRefClaim.adoptionScope.scope = 'opt-in-shadow-with-reviewed-reference'
+        $partialRefClaim.adoptionScope.note = 'Reached only through the opt-in Enable-ReviewerStageShadowContract switch.'
+        $partialRefClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferenceReason' `
+            -NotePropertyValue 'The reference sits on a branch production never takes.'
+        $partialRefClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferencePath' `
+            -NotePropertyValue ([string[]]@(([string]$callerPath).Replace('\', '/')))
+        $partialRefViolations = @(Get-FileContractAdoptionViolation -Prerequisite $partialRefClaim -ProductionRoot $detectorProof)
+        Assert-Ledger (@($partialRefViolations | Where-Object { $_ -match 'part of the tree is unreviewed' }).Count -eq 1) `
+            'A reviewed-reference citation covering one of two references was accepted as a complete review.'
+        Remove-Item -LiteralPath $secondCallerPath -Force
 
         $inForceRef = Get-LedgerObject -Json $ledgerJson
         $inForceRefClaim = @($inForceRef.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
@@ -1066,7 +1178,9 @@ if ($fileContractPrerequisite.Count -eq 1) {
         $inForceRefClaim.adoptionScope.scope = 'opt-in-shadow-with-reviewed-reference'
         $inForceRefClaim.adoptionScope.note = 'Reached only through the opt-in Enable-ReviewerStageShadowContract switch.'
         $inForceRefClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferenceReason' `
-            -NotePropertyValue 'The only reference is in src/Agents/reviewer/Caller.ps1, on a branch production never takes.'
+            -NotePropertyValue 'The reference sits on a branch production never takes.'
+        $inForceRefClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferencePath' `
+            -NotePropertyValue ([string[]]@(([string]$callerPath).Replace('\', '/')))
         $inForceRefClaim.inForce = $true
         $inForceRefViolations = @(Get-FileContractAdoptionViolation -Prerequisite $inForceRefClaim -ProductionRoot $detectorProof)
         Assert-Ledger (@($inForceRefViolations | Where-Object { $_ -match 'an inert reference is not production going through' }).Count -eq 1) `
@@ -1078,7 +1192,7 @@ if ($fileContractPrerequisite.Count -eq 1) {
         $noRefClaim = @((Get-LedgerObject -Json $ledgerJson).decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
         $noRefClaim.adoptionScope.scope = 'opt-in-shadow-with-reviewed-reference'
         $noRefClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferenceReason' `
-            -NotePropertyValue 'The only reference is in src/Agents/reviewer/Caller.ps1, on a branch production never takes.'
+            -NotePropertyValue 'The reference sat on a branch production never takes.'
         $noRefViolations = @(Get-FileContractAdoptionViolation -Prerequisite $noRefClaim -ProductionRoot $detectorProof)
         Assert-Ledger (@($noRefViolations | Where-Object { $_ -match 'while no shipping file under src/ calls the switch' }).Count -eq 1) `
             'The reviewed-reference scope was accepted against a tree that contains no reference at all.'
@@ -1095,7 +1209,7 @@ if ($fileContractPrerequisite.Count -eq 1) {
         $strayReasonClaim.adoptionScope.staticCallSiteInProduction = $true
         $strayReasonClaim.adoptionScope.scope = 'production-path'
         $strayReasonClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferenceReason' `
-            -NotePropertyValue 'The only reference is in src/Agents/reviewer/Caller.ps1, on a branch production never takes.'
+            -NotePropertyValue 'The reference sits on a branch production never takes.'
         $strayReasonViolations = @(Get-FileContractAdoptionViolation -Prerequisite $strayReasonClaim -ProductionRoot $detectorProof)
         Assert-Ledger (@($strayReasonViolations | Where-Object { $_ -match 'under a scope that does not describe one' }).Count -eq 1) `
             'A reviewed-reference reason was carried under production-path, where it describes nothing.'
