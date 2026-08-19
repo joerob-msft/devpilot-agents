@@ -1082,6 +1082,15 @@ function Get-ProducerObservedCensus {
         the field would silently inherit the census of an earlier helper assertion
         of the same kind, and the cell would report evidence the producer never
         produced.
+
+        The mark is an ordinal over the assertions of one kind that are still in
+        the bounded ledger, so ledger eviction between the mark and this read can
+        only over-skip, never under-skip: the answer degrades to -1, which the
+        caller turns into a failed cell, rather than into a census belonging to
+        some other assertion. One full run of this harness makes on the order of
+        a hundred appends against a cap of 4096, so eviction is not reachable
+        here today; the point is that if it ever becomes reachable it announces
+        itself instead of publishing a wrong number.
     #>
     param(
         [Parameter(Mandatory)][string]$Kind,
