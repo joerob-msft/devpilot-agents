@@ -144,9 +144,17 @@ internal sealed class PreparationMachine(
     private void RecheckRecordedArtifacts()
     {
         var evidence = _state.EvidenceFor(PreparationState.RecipePlanned);
-        if (evidence?.Get("artifacts") is not ListNode artifacts)
+        if (evidence is null)
         {
-            return;
+            throw new ContractException("The state record is past recipePlanned but carries no evidence for it, so the resume has no census to prove.");
+        }
+        if (evidence.Get("artifacts") is not ListNode artifacts)
+        {
+            // Returning here would make the whole recheck opt-out: a record whose
+            // census was removed or replaced with a scalar would resume with
+            // nothing verified and nothing said. The shape of committed evidence
+            // is not something to assume.
+            throw new ContractException("The recipePlanned record carries no stage artifact census, so the resume cannot prove its artifacts are unchanged.");
         }
         var recordedDirectory = evidence.GetText("artifactDirectory");
         if (recordedDirectory is null)
@@ -158,7 +166,7 @@ internal sealed class PreparationMachine(
         {
             if (item is not MapNode artifact)
             {
-                continue;
+                throw new ContractException("The recipePlanned census holds an entry that is not an artifact record.");
             }
             var name = artifact.GetText("name");
             var recorded = artifact.GetText("sha256");
@@ -625,8 +633,25 @@ internal sealed class PreparationMachine(
         }
         var setId = StrictJson.RequireString(outcome.Result, "setId", "'runSetVerify' child result");
 
+        // A genuine signature proves the declaration was made under this key. It
+        // does NOT prove the declaration is about the snapshot this run sealed:
+        // one key signs every declaration in an output root, so a declaration
+        // left behind by an earlier subject verifies perfectly. The verified
+        // manifest names its own snapshot, so the binding is checked here rather
+        // than assumed by the evidence written at runSetDeclared.
+        if (_sealedSnapshotName.Length == 0)
+        {
+            ReadSealResult();
+        }
+        var declaredSnapshot = StrictJson.RequireString(outcome.Result, "snapshotName", "'runSetVerify' child result");
+        if (!string.Equals(declaredSnapshot, _sealedSnapshotName, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The verified run set is bound to snapshot '{declaredSnapshot}' and this preparation sealed '{_sealedSnapshotName}'.");
+        }
+
         var evidence = new MapNode()
             .Set("setId", setId)
+            .Set("snapshotName", declaredSnapshot)
             .Set("signatureVerified", true)
             .Set("runSetSha256", CanonicalJson.Sha256HexOfFile(_runSetPath))
             .Set("childResultSha256", outcome.ResultSha256);
@@ -656,6 +681,20 @@ internal sealed class PreparationMachine(
             "modelInvocationCount");
 
         const string label = "'runSetStatus' child result";
+        // The declaration this step reports on has to be the one the previous
+        // step verified. Without this, a declaration swapped between
+        // runSetVerified and runSetReady would be signed off by a record whose
+        // setId names a different run set entirely.
+        var verifiedSetId = _state.EvidenceFor(PreparationState.RunSetVerified)?.GetText("setId");
+        if (verifiedSetId is null || verifiedSetId.Length == 0)
+        {
+            throw new ContractException("The runSetVerified record carries no setId, so readiness cannot be tied to a verified declaration.");
+        }
+        var reportedSetId = StrictJson.RequireString(outcome.Result, "setId", label);
+        if (!string.Equals(reportedSetId, verifiedSetId, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The status read reports run set '{reportedSetId}' and this preparation verified '{verifiedSetId}'.");
+        }
         if (!StrictJson.RequireBool(outcome.Result, "launchTokenPresent", label))
         {
             throw new ContractException("The run set is not ready: its launch authorization is absent.");
@@ -684,6 +723,7 @@ internal sealed class PreparationMachine(
 
         var evidence = new MapNode()
             .Set("launchTokenPresent", true)
+            .Set("setId", reportedSetId)
             .Set("plannedRunCount", planned)
             .Set("slotAttemptCount", attempts)
             .Set("modelInvocationCount", models)
@@ -746,6 +786,21 @@ internal sealed class PreparationMachine(
         // that restated them as constants would say the same thing whatever had
         // happened.
         var readiness = _state.EvidenceFor(PreparationState.RunSetReady);
+        // Counted out of the durable record, not out of this process. Every
+        // transition that ran a child committed that child's result digest, so
+        // the census of transitions carrying one is the census of child results
+        // the run stands on - and it reads the same after eight restarts as it
+        // does on an uninterrupted run. The in-memory launch counter cannot see
+        // a launch made by an earlier process, so it could neither prove nor
+        // disprove the very thing it looked like it was proving.
+        var childBackedTransitions = 0;
+        foreach (var transition in _state.Transitions)
+        {
+            if (transition.Evidence.GetText("childResultSha256") is { Length: > 0 })
+            {
+                childBackedTransitions++;
+            }
+        }
         var audit = new MapNode()
             .Set("contractVersion", "devpilot.shadow-run-coordinator.audit.v1")
             .Set("kind", "shadow-run-coordinator-audit")
@@ -753,11 +808,21 @@ internal sealed class PreparationMachine(
             .Set("requestSha256", _request.RequestSha256)
             .Set("subjectSha256", CoordinatorState.SubjectDigest(_request))
             .Set("finalState", PreparationStateNames.ToName(_state.State))
-            .Set("sequence", _state.Sequence)
-            .Set("modelInvocationCount", readiness?.Get("modelInvocationCount") ?? Node.Null())
-            .Set("slotLaunchCount", readiness?.Get("slotAttemptCount") ?? Node.Null())
-            .Set("childLaunchCount", _invoker.LaunchCount)
-            .Set("childResultAdoptedCount", _invoker.AdoptedCount)
+            .Set("sequence", _state.Sequence);
+        // A run stopped short of readiness has not OBSERVED either count, and a
+        // null here would be read as zero by any consumer that coerces it - the
+        // reassuring answer, arrived at by never having asked. The fields are
+        // absent instead, and an explicit flag says why.
+        var observed = readiness is not null;
+        audit.Set("invariantCountsObserved", observed);
+        if (observed)
+        {
+            audit
+                .Set("modelInvocationCount", readiness!.Get("modelInvocationCount") ?? Node.Null())
+                .Set("slotLaunchCount", readiness.Get("slotAttemptCount") ?? Node.Null());
+        }
+        audit
+            .Set("childResultTransitionCount", childBackedTransitions)
             .Set("stages", stages);
         var transitions = new ListNode();
         foreach (var transition in _state.Transitions)

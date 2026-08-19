@@ -620,21 +620,40 @@ function ConvertTo-ReviewerStageDeterministicKeyOrder {
 
     if ($Node -is [System.Collections.IDictionary]) {
         $ordered = [ordered]@{}
-        $keys = [string[]]@($Node.Keys | ForEach-Object { [string]$_ })
+        # The ORIGINAL key object is kept alongside its string projection: a
+        # dictionary may be keyed by something that is not a string, and looking
+        # the value up by the projection would silently miss it and publish a
+        # null where evidence was. Two keys whose projections collide are a
+        # refusal, not a last-writer-wins.
+        $byName = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+        $names = [System.Collections.Generic.List[string]]::new()
+        foreach ($key in $Node.Keys) {
+            $name = [string]$key
+            if ($byName.ContainsKey($name)) {
+                throw "Stage payload holds two keys that render as '$name'; a JSON object cannot carry both."
+            }
+            $byName[$name] = $Node[$key]
+            [void]$names.Add($name)
+        }
+        $keys = [string[]]$names.ToArray()
         [Array]::Sort($keys, [StringComparer]::Ordinal)
         foreach ($key in $keys) {
-            $ordered[$key] = ConvertTo-ReviewerStageDeterministicKeyOrder -Node $Node[$key] -Depth ($Depth + 1)
+            $ordered[$key] = ConvertTo-ReviewerStageDeterministicKeyOrder -Node $byName[$key] -Depth ($Depth + 1)
         }
         return $ordered
     }
 
     if ($Node -is [System.Management.Automation.PSCustomObject]) {
         $ordered = [ordered]@{}
-        $properties = @{}
+        $properties = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
         $names = [System.Collections.Generic.List[string]]::new()
         foreach ($property in $Node.PSObject.Properties) {
-            $properties[[string]$property.Name] = $property.Value
-            [void]$names.Add([string]$property.Name)
+            $name = [string]$property.Name
+            if ($properties.ContainsKey($name)) {
+                throw "Stage payload holds two properties named '$name'; a JSON object cannot carry both."
+            }
+            $properties[$name] = $property.Value
+            [void]$names.Add($name)
         }
         $sorted = [string[]]$names.ToArray()
         [Array]::Sort($sorted, [StringComparer]::Ordinal)

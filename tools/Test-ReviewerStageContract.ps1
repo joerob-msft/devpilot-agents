@@ -651,6 +651,35 @@ try {
     Assert-True -Name 'canonical/key-order-is-type-independent' `
         -Condition (@($shapeTexts | Select-Object -Unique).Count -eq 1) `
         -Detail "Ordered dictionary, hashtable and PSCustomObject serialized as: $($shapeTexts -join ' ;; ')"
+
+    # A dictionary key need not be a string. Ordering has to project keys to text
+    # to sort them, and a projection used to look the value back up silently
+    # yields nothing for a key that is not a string - so the value would be
+    # published as null and hashed as though the producer had emitted nothing.
+    $typedKeys = [System.Collections.Generic.Dictionary[object, object]]::new()
+    $typedKeys.Add('alpha', 'text-key')
+    $typedKeys.Add(7, 'integer-key')
+    $typedKeys.Add([guid]'0f7d4a1c-9a5e-4d3b-8c2f-1e6b5a4d3c2b', 'guid-key')
+    $projected = ConvertTo-ReviewerStageDeterministicKeyOrder -Node $typedKeys
+    $projectedPairs = @($projected.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" })
+    Assert-True -Name 'canonical/non-string-keys-keep-their-values' `
+        -Condition (@($projectedPairs | Where-Object { $_ -notmatch '=$' }).Count -eq 3) `
+        -Detail "Projected pairs were: $($projectedPairs -join ' ;; ')"
+    Assert-True -Name 'canonical/non-string-keys-are-ordinally-ordered' `
+        -Condition ((@($projected.Keys) -join '|') -ceq '0f7d4a1c-9a5e-4d3b-8c2f-1e6b5a4d3c2b|7|alpha') `
+        -Detail "Ordered as '$(@($projected.Keys) -join '|')'."
+
+    # Two distinct keys can project to the same text. Publishing either one and
+    # dropping the other would make the wire form depend on enumeration order,
+    # which is the one thing a canonicalizer must never do.
+    $collidingKeys = [System.Collections.Generic.Dictionary[object, object]]::new()
+    $collidingKeys.Add('7', 'the string seven')
+    $collidingKeys.Add(7, 'the number seven')
+    $collisionRefused = $false
+    try { [void](ConvertTo-ReviewerStageDeterministicKeyOrder -Node $collidingKeys) }
+    catch { $collisionRefused = $true }
+    Assert-True -Name 'canonical/colliding-key-projection-is-refused' -Condition $collisionRefused `
+        -Detail 'Two keys projecting to the same text were canonicalized rather than refused.'
 }
 finally {
     Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |

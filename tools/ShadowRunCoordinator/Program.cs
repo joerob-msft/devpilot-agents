@@ -104,8 +104,8 @@ internal static class Program
         // both decide they are the resumer, and cannot race to create the key.
         using var lease = RunLease.Acquire(request);
 
-        var key = CoordinatorState.LoadOrMintKey(request);
-        var state = CoordinatorState.LoadOrFresh(request, key);
+        var key = CoordinatorState.LoadOrMintKey(request, out var keyPreexisted);
+        var state = CoordinatorState.LoadOrFresh(request, key, keyPreexisted);
         var index = StageArtifactIndex.FromSchema(request.ToolkitRoot);
         var invoker = new ChildToolInvoker(request);
 

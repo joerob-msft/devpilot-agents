@@ -80,7 +80,16 @@ Beyond shape, the run is refused when:
 * a configuration, prompt-asset or schema digest does not match what the request declared,
 * the corpus index digest does not match the corpus on disk,
 * the durable state file's own integrity check fails, or its correlation ID is not this run's,
+* a signing key exists in the output root but the state record it was minted alongside does not,
 * another live process holds the lease on the output root.
+
+A child result is refused, even when it is genuine, correlated and correctly digested, when it
+disagrees with the record about *which subject* it is describing. A signature proves a run set
+was declared under this output root's key; one key signs every declaration in a root, so a
+declaration left behind by an earlier subject verifies perfectly. So the verified manifest's
+snapshot must be the snapshot this preparation sealed, the status read's set must be the set the
+previous transition verified, and the declaring child re-reads a standing declaration's manifest
+and adopts it only when its snapshot, manifest digest and planned run count match this request.
 
 The lease records the holder's process ID *and* its process start time, and liveness is decided
 by looking up that exact identity. A recycled process ID with a different start time is not the
@@ -131,13 +140,31 @@ silently overwrite sealed evidence:
 
 Two things deliberately do *not* recover. A run whose signed state file is destroyed fails
 closed rather than re-deriving a record over standing artifacts - if it could, the record
-would not be load-bearing. And a resumed run refuses any child result whose bytes are not the
-ones its own committed record binds, and rehashes every censused stage artifact before
-inheriting it.
+would not be load-bearing. That refusal is raised from the signing key's own presence, before
+anything is mutated, rather than later by happening to trip over a standing side effect: a key
+is minted with the first record, so a key without a record is proof a record was removed. And a
+resumed run refuses any child result whose bytes are not the ones its own committed record
+binds, and rehashes every censused stage artifact before inheriting it - refusing outright if
+that census is absent or malformed, rather than treating an unreadable census as an empty one.
 
 The stage preparation step is separately made re-enterable by clearing its declared artifact
 directory before publishing, because the stage writer names artifacts by a per-call sequence
 and a lost attempt's twelve artifacts would otherwise accumulate into a census of twenty-four.
+The sweep is narrowed to this producer's own `*.stage.json` output and each artifact's
+`.reservation` sibling. A blanket `*.json` sweep would take the directory's ownership marker
+with it, and the stage switch refuses to adopt a populated directory carrying no marker - so
+the cleanup that exists to make the retry possible would be the thing that made it impossible.
+
+## What the audit may claim
+
+The audit is written from the durable record, not from what this process happened to do. Its
+child-backed transition census counts committed transitions carrying a child-result digest, so
+a run that resumes over work an earlier process did reports the same census as an uninterrupted
+one; a per-process counter structurally could not support the "no duplicate launch" claim it was
+there to make. The model and slot censuses are *omitted* rather than published as null when the
+run stopped short of readiness and never observed them, because `[int]$null` is `0` in
+PowerShell and an unobserved run would otherwise read as a clean zero; `invariantCountsObserved`
+says which of the two an audit is.
 
 ## Tests
 
@@ -149,11 +176,16 @@ identity and tampered state; the lease conflict and the abandoned-lease recovery
 fault matrix (non-zero exit, missing, malformed, byte-order-marked, truncated, partial, wrong
 correlation, wrong step, stdout chatter, a stray publication directory, a mismatched request
 digest, and a hang bounded by timeout); an external kill mid-transition; the pre-commit window
-on both non-repeatable side effects; resume integrity against edited child results and edited
-stage artifacts; the changed-path census boundary; and a final check that no child process and
-no repository modification survived the run.
+on both non-repeatable side effects and on the stage publication; resume integrity against
+edited child results and edited stage artifacts; the changed-path census boundary; a run set
+that belongs to another preparation, refused both at the child's adoption and at the
+coordinator's own snapshot and set bindings; the audit's resume-invariance and its refusal to
+publish a census it never observed; and a final check that no child process and no repository
+modification survived the run.
 
 The canonical key order that makes any of this reproducible is covered in
 `tools/Test-ReviewerStageContract.ps1`, which asserts the same bytes under `en-US`, `da-DK`,
-`tr-TR` and `sv-SE`, and asserts that a hashtable, an ordered dictionary and a `PSCustomObject`
-holding the same content serialize identically.
+`tr-TR` and `sv-SE`; asserts that a hashtable, an ordered dictionary and a `PSCustomObject`
+holding the same content serialize identically; and asserts that a dictionary whose keys are not
+strings keeps its values rather than publishing nulls, and that two keys projecting to the same
+text are refused rather than silently reduced to one.

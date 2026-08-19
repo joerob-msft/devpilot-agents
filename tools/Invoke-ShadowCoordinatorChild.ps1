@@ -158,10 +158,23 @@ function Invoke-ShadowChildStagePreparation {
     # The step must be re-enterable: a coordinator killed after publication but
     # before its commit runs this again, and the stage writer names artifacts by
     # a per-call sequence, so leftovers from the lost attempt would accumulate.
+    #
+    # Only this producer's own output is removed. A blanket '*.json' sweep would
+    # take the directory's ownership marker with it, and the stage switch refuses
+    # to adopt a populated directory that carries no marker - so the cleanup that
+    # exists to make the retry possible would be the thing that made it
+    # impossible. The empty reservation tombstones are named after the artifacts
+    # they reserve and go with them.
     $stale = @()
     if (Test-Path -LiteralPath $directory) {
-        $stale = @(Get-ChildItem -LiteralPath $directory -Filter '*.json' -File -ErrorAction SilentlyContinue)
-        foreach ($item in $stale) { Remove-Item -LiteralPath $item.FullName -Force }
+        $stale = @(Get-ChildItem -LiteralPath $directory -Filter '*.stage.json' -File -ErrorAction SilentlyContinue)
+        foreach ($item in $stale) {
+            $reservation = "$($item.FullName).reservation"
+            if (Test-Path -LiteralPath $reservation -PathType Leaf) {
+                Remove-Item -LiteralPath $reservation -Force
+            }
+            Remove-Item -LiteralPath $item.FullName -Force
+        }
     }
     $prepared = Invoke-ReviewerShadowPreparation -Directory $directory `
         -ChangedPath ([string[]]$changed)
@@ -300,10 +313,38 @@ function Invoke-ShadowChildRunSetDeclare {
     # qualification tool refuses a second declaration outright, so re-running it
     # after a kill that landed between publication and the coordinator's commit
     # would wedge the run permanently.
+    #
+    # A found declaration is not evidence on its own. Adoption re-reads it and
+    # requires it to name THIS request's snapshot, snapshot manifest digest and
+    # planned run count before it is accepted, so a run set left behind by some
+    # other preparation cannot be adopted into this one just by being the only
+    # file in the directory.
     $existing = @(Get-ChildItem -LiteralPath $runSetDirectory -Filter 'runset-*.json' -File -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -notlike '*.sig' })
     if ($existing.Count -eq 1) {
         $tokenPath = Join-Path $runSetDirectory 'launch-authorization.token'
+        $adoptedText = [IO.File]::ReadAllText($existing[0].FullName, $script:ShadowChildUtf8)
+        $adoptedRecord = $adoptedText | ConvertFrom-Json -Depth 24
+        if (-not $adoptedRecord.PSObject.Properties['manifestJson']) {
+            throw "The standing run set '$($existing[0].Name)' carries no manifest."
+        }
+        $adoptedManifest = [string]$adoptedRecord.manifestJson | ConvertFrom-Json -Depth 24
+        $expected = [ordered]@{
+            snapshotName = [string]$arguments.ReplaySnapshotName
+            snapshotManifestDigest = [string]$arguments.ReplayManifestDigest
+            plannedRunCount = [int]$arguments.SlotCount
+        }
+        foreach ($field in @($expected.Keys)) {
+            if (-not $adoptedManifest.PSObject.Properties[$field]) {
+                throw "The standing run set declares no '$field'."
+            }
+            $found = $adoptedManifest.$field
+            $want = $expected[$field]
+            $agrees = if ($want -is [int]) { ([int]$found -eq [int]$want) } else { ([string]$found -ceq [string]$want) }
+            if (-not $agrees) {
+                throw "The standing run set declares $field '$found' and this request prepared '$want'; it belongs to another preparation and is not adopted."
+            }
+        }
         return @{
             runSetPath = [string]$existing[0].FullName
             launchTokenPresent = [bool](Test-Path -LiteralPath $tokenPath -PathType Leaf)

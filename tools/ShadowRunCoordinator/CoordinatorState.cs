@@ -125,10 +125,26 @@ internal sealed class CoordinatorState
     /// refusal, never a fresh start: silently starting over would relaunch
     /// children whose evidence is already on disk.
     /// </summary>
-    internal static CoordinatorState LoadOrFresh(CoordinatorRequest request, byte[] key)
+    /// <param name="keyPreexisted">
+    /// Whether the signing key was already on disk when this process started. A
+    /// key is minted exactly once per output root, at the same moment the first
+    /// record is about to be written, so a key WITHOUT a record means a record
+    /// that existed has since been removed. Treating that as a fresh start is
+    /// what would make the signed record merely decorative: the run would mint
+    /// transitions, clear and republish stage artifacts, and only later notice a
+    /// standing snapshot. The refusal happens here, before anything is mutated.
+    /// </param>
+    internal static CoordinatorState LoadOrFresh(CoordinatorRequest request, byte[] key, bool keyPreexisted)
     {
         if (!File.Exists(request.StatePath))
         {
+            if (keyPreexisted)
+            {
+                throw new ContractException(
+                    $"The output root '{request.OutputRoot}' carries a coordinator signing key but no state record at '{request.StatePath}'. " +
+                    "A key is minted with the first record, so the record this run would have resumed from has been removed. " +
+                    "This root is not resumable and is not started over; use a fresh output root.");
+            }
             return Fresh(request);
         }
 
@@ -346,11 +362,12 @@ internal sealed class CoordinatorState
     /// would make every existing record unverifiable and turn a restart into a
     /// silent fresh start.
     /// </summary>
-    internal static byte[] LoadOrMintKey(CoordinatorRequest request)
+    internal static byte[] LoadOrMintKey(CoordinatorRequest request, out bool preexisted)
     {
         Directory.CreateDirectory(request.CoordinatorRoot);
         if (File.Exists(request.StateKeyPath))
         {
+            preexisted = true;
             return ReadKey(request);
         }
         var minted = RandomNumberGenerator.GetBytes(32);
@@ -365,8 +382,10 @@ internal sealed class CoordinatorState
             // Belt and braces behind the lease: if anything else won the race to
             // create the key, adopt theirs. Minting a second key would make every
             // record written under the first one unverifiable.
+            preexisted = true;
             return ReadKey(request);
         }
+        preexisted = false;
         return minted;
     }
 
