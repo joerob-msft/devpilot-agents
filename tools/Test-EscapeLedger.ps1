@@ -730,9 +730,14 @@ function Get-FileContractAdoptionViolation {
         if ([string]$scopeValue.scope -cne 'opt-in-offline-shadow') {
             [void]$violations.Add("The file contract adoption scope claims '$([string]$scopeValue.scope)' while no shipping file under src/ calls the switch.")
         }
-        if ($null -ne $scopeValue.PSObject.Properties['reviewedReferenceReason'] -or
-            $null -ne $scopeValue.PSObject.Properties['reviewedReferencePath']) {
-            [void]$violations.Add('The file contract adoption scope records a reviewedReferenceReason while no shipping file under src/ references the switch at all, so it reviews a reference that no longer exists.')
+        # Either field alone is a review of a reference that is not there. The
+        # message names whichever survived, because a message that only ever says
+        # "reason" reads as if the path field were exempt.
+        $staleReviewFields = [string[]]@(
+            'reviewedReferenceReason', 'reviewedReferencePath' |
+                Where-Object { $null -ne $scopeValue.PSObject.Properties[$_] })
+        if ($staleReviewFields.Count -gt 0) {
+            [void]$violations.Add("The file contract adoption scope records $($staleReviewFields -join ' and ') while no shipping file under src/ references the switch at all, so it reviews a reference that no longer exists.")
         }
     }
     else {
@@ -801,7 +806,10 @@ function Get-FileContractAdoptionViolation {
             # The reason is meaningful only for the scope that needs it. Left behind
             # under another scope it would read as a live finding about a tree that
             # has moved on.
-            [void]$violations.Add("The file contract adoption scope records a reviewedReferenceReason while its scope is '$([string]$scopeValue.scope)', so a review of an inert reference is being carried under a scope that does not describe one.")
+            $strayFields = [string[]]@(
+                'reviewedReferenceReason', 'reviewedReferencePath' |
+                    Where-Object { $null -ne $scopeValue.PSObject.Properties[$_] })
+            [void]$violations.Add("The file contract adoption scope records $($strayFields -join ' and ') while its scope is '$([string]$scopeValue.scope)', so a review of an inert reference is being carried under a scope that does not describe one.")
         }
         if ([string]$scopeValue.note -match 'no file under src|nothing under src|no shipping file') {
             [void]$violations.Add('A shipping file under src/ now contains a static call to Enable-ReviewerStageShadowContract, but the adoption scope note still asserts that nothing calls it, so the note describes a tree that no longer exists.')
@@ -1196,8 +1204,18 @@ if ($fileContractPrerequisite.Count -eq 1) {
         $noRefViolations = @(Get-FileContractAdoptionViolation -Prerequisite $noRefClaim -ProductionRoot $detectorProof)
         Assert-Ledger (@($noRefViolations | Where-Object { $_ -match 'while no shipping file under src/ calls the switch' }).Count -eq 1) `
             'The reviewed-reference scope was accepted against a tree that contains no reference at all.'
-        Assert-Ledger (@($noRefViolations | Where-Object { $_ -match 'reviews a reference that no longer exists' }).Count -eq 1) `
+        Assert-Ledger (@($noRefViolations | Where-Object { $_ -match 'records reviewedReferenceReason while no shipping file' }).Count -eq 1) `
             'A reviewedReferenceReason survived the disappearance of the reference it reviewed.'
+
+        # The path field is not exempt from that clause just because it is the
+        # optional half of the pair. Left behind alone it still cites a reference
+        # the tree no longer contains.
+        $noRefPathClaim = @((Get-LedgerObject -Json $ledgerJson).decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $noRefPathClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferencePath' `
+            -NotePropertyValue ([string[]]@(([string]$callerPath).Replace('\', '/')))
+        $noRefPathViolations = @(Get-FileContractAdoptionViolation -Prerequisite $noRefPathClaim -ProductionRoot $detectorProof)
+        Assert-Ledger (@($noRefPathViolations | Where-Object { $_ -match 'records reviewedReferencePath while no shipping file' }).Count -eq 1) `
+            'A reviewedReferencePath left behind alone survived the disappearance of the reference it cited.'
 
         # The reason belongs to one scope only; carried under another it is a stale
         # finding about a tree that has moved on.
@@ -1213,6 +1231,17 @@ if ($fileContractPrerequisite.Count -eq 1) {
         $strayReasonViolations = @(Get-FileContractAdoptionViolation -Prerequisite $strayReasonClaim -ProductionRoot $detectorProof)
         Assert-Ledger (@($strayReasonViolations | Where-Object { $_ -match 'under a scope that does not describe one' }).Count -eq 1) `
             'A reviewed-reference reason was carried under production-path, where it describes nothing.'
+
+        # ...and the path field alone, under the same scope, for the same reason.
+        $strayPath = Get-LedgerObject -Json $ledgerJson
+        $strayPathClaim = @($strayPath.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $strayPathClaim.adoptionScope.staticCallSiteInProduction = $true
+        $strayPathClaim.adoptionScope.scope = 'production-path'
+        $strayPathClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferencePath' `
+            -NotePropertyValue ([string[]]@(([string]$callerPath).Replace('\', '/')))
+        $strayPathViolations = @(Get-FileContractAdoptionViolation -Prerequisite $strayPathClaim -ProductionRoot $detectorProof)
+        Assert-Ledger (@($strayPathViolations | Where-Object { $_ -match 'records reviewedReferencePath while its scope' }).Count -eq 1) `
+            'A reviewed-reference citation was carried under production-path, where it describes nothing.'
         Remove-Item -LiteralPath $callerPath -Force
     }
     finally {
