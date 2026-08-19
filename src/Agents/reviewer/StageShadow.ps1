@@ -499,8 +499,16 @@ function Publish-ReviewerStageShadowArtifact {
     if ([string]$read.Form -cne [string]$written.Form -or [int]$read.Depth -ne [int]$written.Depth) {
         throw "Stage contract '$Kind' producer '$Producer' read back a different serialization decision from '$path'."
     }
-    $expected = ConvertTo-ReviewerStageShadowComparable -Value $Payload -Depth $depth
-    $actual = ConvertTo-ReviewerStageShadowComparable -Value $read.Payload -Depth $depth
+    # Both sides are put through the writer's own key ordering before they are
+    # compared. The expected side is still the in-memory payload with its
+    # unordered dictionaries, and the actual side is already in file order, so
+    # without this the check would report a round-trip loss for a payload that
+    # round-tripped perfectly and merely got its keys written down in the one
+    # order two processes can agree on.
+    $expected = ConvertTo-ReviewerStageShadowComparable `
+        -Value (ConvertTo-ReviewerStageDeterministicKeyOrder -Node $Payload) -Depth $depth
+    $actual = ConvertTo-ReviewerStageShadowComparable `
+        -Value (ConvertTo-ReviewerStageDeterministicKeyOrder -Node $read.Payload) -Depth $depth
     if ($expected -cne $actual) {
         throw "Stage contract '$Kind' producer '$Producer' did not survive its own file round trip at '$path'."
     }

@@ -8,9 +8,10 @@ back as part of the contract.
 
 `src/Agents/reviewer/StageContract.ps1` makes that boundary explicit and fails closed.
 
-> **Adoption status: in-memory half in force on the ordinary path; on-disk half built and
-> CI-verified but NOT in force — it runs only behind an opt-in switch that nothing under
-> `src/` turns on.**
+> **Adoption status: in force. The in-memory half runs on the ordinary path, and the on-disk
+> half now runs on a shipping path with a real compiled consumer depending on the files it
+> writes — still only in a no-model, no-write preparation, because the switch that opens it
+> refuses to open while any delivery capability is live.**
 > [`src/Agents/reviewer/StageProducers.ps1`](../src/Agents/reviewer/StageProducers.ps1)
 > registers a versioned contract kind for each of twelve enumerated stages —
 > capture, source, snapshot, corpus, blindResults, candidateUnion, fingerprints,
@@ -92,23 +93,31 @@ back as part of the contract.
 > both statically and dynamically.
 > [`tools/Invoke-ReviewerStageShadowRun.ps1`](../tools/Invoke-ReviewerStageShadowRun.ps1)
 > produces all twelve stage artifacts in one no-model run.
+> [`src/Agents/reviewer/ShadowPreparation.ps1`](../src/Agents/reviewer/ShadowPreparation.ps1)
+> is the shipping entry point that turns the switch on and publishes all twelve, and
+> [`tools/ShadowRunCoordinator`](../tools/ShadowRunCoordinator) is the compiled consumer that
+> rereads every one of them before its audit will close — which is what moved this from a
+> recipe to a path.
 >
-> **Residual: the switch is opt-in, so the on-disk half is exercised only when a caller
-> turns it on, and no shipping entry point does.** That is why the escape ledger scores this
-> prerequisite's on-disk half as *not* in force and records what it really is under
-> `adoptionScope` instead; `tools/Test-EscapeLedger.ps1` fails if that record and `src/`
-> disagree in either direction. Migrating the coordinator's ordinary path onto on-disk
-> publication changes live behaviour and stays out of scope for a prerequisite change that
-> runs no models. Two further residuals: one artifact is not byte-reproducible across
-> processes — the capture census is built from a `Hashtable`'s key order, and .NET randomizes
-> string hashing per process — so the run report pins a second digest alongside the exact one
-> in which two individually named capture fields, `packageFiles` and `packageDirectories`,
-> are compared as multisets. On those two fields only, that digest cannot see an ordering
-> regression; every other stage and every other field keeps its order in both digests. And
-> the run tools themselves are manual evidence recipes whose execution is not CI-verified: CI
-> runs the suites that pin the switch's code, but nothing in CI executes either tool and
-> neither checks in a report, so their artifact counts and digests are transcriptions of a
-> hand-run command.
+> **Residuals, named rather than rounded off.** The switch is still opt-in: it opens only
+> where no delivery capability is live, so a delivery-capable reviewer run does not take this
+> path, and migrating that run onto on-disk publication remains out of scope for a change
+> that launches no models. What flows downstream is still the in-memory object the boundary
+> judged, with the reread standing as evidence of a real round trip rather than as the value
+> consumed. The run tools themselves are manual evidence recipes whose execution is not
+> CI-verified: CI runs the suites that pin the switch's code, but nothing in CI executes
+> either tool and neither checks in a report, so their artifact counts and digests are
+> transcriptions of a hand-run command.
+>
+> One hazard that used to sit here has been removed rather than documented. The capture
+> census was not byte-reproducible across processes because it was serialized from a
+> `Hashtable` whose key order .NET randomizes per process, which made the published digest a
+> function of something other than the payload. `Write-ReviewerStageArtifact` now imposes an
+> ordinal key order on genuinely unordered dictionaries before serializing — an
+> `OrderedDictionary` or a `PSCustomObject` states an order its author chose and is left
+> exactly as given — so two runs over the same evidence now produce the same bytes. The
+> multiset comparison on `packageFiles` and `packageDirectories` still cannot see an ordering
+> regression on those two fields; that is a property of the comparison, not of the writer.
 
 
 > **Scope.** What this does *not* prove is stated in

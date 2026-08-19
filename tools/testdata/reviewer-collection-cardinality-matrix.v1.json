@@ -47,7 +47,7 @@
     "producerDirectRows": 6,
     "producerStageEquivalentRows": 230,
     "producerResidualRows": 12,
-    "producerTestOnlyReachRows": 112,
+    "producerTestOnlyReachRows": 12,
     "producerBoundariesInForce": 12,
     "knownEscapeShapeFields": 15,
     "escapeShapeProperties": 11,
@@ -235,8 +235,10 @@
       "producerFile": "src/Agents/reviewer/ConventionSpecialist.ps1",
       "producerEquivalence": "direct",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -280,8 +282,10 @@
       "producerFile": "src/Agents/reviewer/ConventionSpecialist.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -325,8 +329,10 @@
       "producerFile": "src/Agents/reviewer/ConventionSpecialist.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -370,8 +376,10 @@
       "producerFile": "src/Agents/reviewer/ConventionSpecialist.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -415,8 +423,10 @@
       "producerFile": "src/Agents/reviewer/ConventionSpecialist.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -460,8 +470,10 @@
       "producerFile": "src/Agents/reviewer/ConventionSpecialist.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -505,8 +517,10 @@
       "producerFile": "src/Agents/reviewer/ConventionSpecialist.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -550,8 +564,10 @@
       "producerFile": "src/Agents/reviewer/ConventionSpecialist.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -595,8 +611,10 @@
       "producerFile": "src/Agents/reviewer/ConventionSpecialist.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -640,8 +658,10 @@
       "producerFile": "src/Agents/reviewer/ConventionSpecialist.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -685,8 +705,10 @@
       "producerFile": "src/Agents/reviewer/ConventionSpecialist.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -730,8 +752,10 @@
       "producerFile": "src/Agents/reviewer/ConventionSpecialist.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -775,8 +799,10 @@
       "producerFile": "src/Agents/reviewer/ConventionSpecialist.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -820,8 +846,10 @@
       "producerFile": "src/Agents/reviewer/ConventionSpecialist.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -865,8 +893,10 @@
       "producerFile": "src/Agents/reviewer/ConventionSpecialist.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -910,8 +940,10 @@
       "producerFile": "src/Agents/reviewer/ConventionSpecialist.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -955,8 +987,10 @@
       "producerFile": "src/Agents/reviewer/ConventionSpecialist.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -1000,8 +1034,10 @@
       "producerFile": "src/Agents/reviewer/ConventionSpecialist.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -1045,8 +1081,10 @@
       "producerFile": "src/Agents/reviewer/ConventionSpecialist.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -1090,8 +1128,10 @@
       "producerFile": "src/Agents/reviewer/ConventionSpecialist.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -1135,8 +1175,10 @@
       "producerFile": "src/Agents/reviewer/ConventionSpecialist.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -1180,8 +1222,10 @@
       "producerFile": "src/Agents/reviewer/ConventionSpecialist.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -1225,8 +1269,10 @@
       "producerFile": "src/Agents/reviewer/ConventionSpecialist.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -1271,6 +1317,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -1318,6 +1365,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -1365,6 +1413,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -1412,6 +1461,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -1459,6 +1509,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -1506,6 +1557,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -1553,6 +1605,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -1600,6 +1653,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -1647,6 +1701,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -1694,6 +1749,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -1741,6 +1797,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -1788,6 +1845,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -1835,6 +1893,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -1882,6 +1941,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -1929,6 +1989,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -1976,6 +2037,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -2023,6 +2085,7 @@
       "producerEquivalence": "direct",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -2070,6 +2133,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -2117,6 +2181,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -2164,6 +2229,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -2750,8 +2816,10 @@
       "producerFile": "src/Agents/reviewer/evaluation/Evaluation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -2795,8 +2863,10 @@
       "producerFile": "src/Agents/reviewer/evaluation/Evaluation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -2840,8 +2910,10 @@
       "producerFile": "src/Agents/reviewer/evaluation/Evaluation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -2885,8 +2957,10 @@
       "producerFile": "src/Agents/reviewer/evaluation/Evaluation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -2930,8 +3004,10 @@
       "producerFile": "src/Agents/reviewer/evaluation/Evaluation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -2975,8 +3051,10 @@
       "producerFile": "src/Agents/reviewer/evaluation/Evaluation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -3020,8 +3098,10 @@
       "producerFile": "src/Agents/reviewer/evaluation/Evaluation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -3065,8 +3145,10 @@
       "producerFile": "src/Agents/reviewer/evaluation/Evaluation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -3111,6 +3193,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -3158,6 +3241,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -3205,6 +3289,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -3252,6 +3337,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -3299,6 +3385,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -3346,6 +3433,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -3393,6 +3481,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -3440,6 +3529,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -3487,6 +3577,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -3534,6 +3625,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -3581,6 +3673,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -3628,6 +3721,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -3675,6 +3769,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -3722,6 +3817,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -3769,6 +3865,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -3816,6 +3913,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -3863,6 +3961,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -3910,6 +4009,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -3957,6 +4057,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -4004,6 +4105,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -4051,6 +4153,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -4098,6 +4201,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -4145,6 +4249,7 @@
       "producerEquivalence": "direct",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -4192,6 +4297,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -4239,6 +4345,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -4286,6 +4393,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -4333,6 +4441,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -4380,6 +4489,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -4427,6 +4537,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -4474,6 +4585,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -4521,6 +4633,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -4568,6 +4681,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -4615,6 +4729,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -4662,6 +4777,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -4709,6 +4825,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -4755,8 +4872,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -4800,8 +4919,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -4845,8 +4966,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -4890,8 +5013,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -4935,8 +5060,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -4980,8 +5107,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -5025,8 +5154,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -5070,8 +5201,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -5115,8 +5248,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "direct",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -5160,8 +5295,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -5205,8 +5342,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -5250,8 +5389,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -5295,8 +5436,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -5340,8 +5483,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -5385,8 +5530,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -5430,8 +5577,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -5475,8 +5624,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -5520,8 +5671,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -5565,8 +5718,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -5610,8 +5765,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -5655,8 +5812,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -5700,8 +5859,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -5745,8 +5906,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -5790,8 +5953,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -5835,8 +6000,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -5880,8 +6047,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -5925,8 +6094,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -5970,8 +6141,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -6015,8 +6188,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -6060,8 +6235,10 @@
       "producerFile": "src/Agents/reviewer/RunReconciliation.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -6105,8 +6282,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -6150,8 +6329,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -6195,8 +6376,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -6240,8 +6423,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -6285,8 +6470,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -6330,8 +6517,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -6375,8 +6564,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -6420,8 +6611,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -6465,8 +6658,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -6510,8 +6705,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -6555,8 +6752,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -6600,8 +6799,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -6645,8 +6846,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -6690,8 +6893,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -6735,8 +6940,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -6780,8 +6987,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -6825,8 +7034,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -6870,8 +7081,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -6915,8 +7128,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -6960,8 +7175,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -7005,8 +7222,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -7050,8 +7269,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -7095,8 +7316,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -7140,8 +7363,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -7185,8 +7410,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -7230,8 +7457,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -7275,8 +7504,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -7320,8 +7551,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -7365,8 +7598,10 @@
       "producerFile": "src/Agents/reviewer/CorpusSeal.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -7411,7 +7646,8 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
-        "src/Agents/reviewer/CorpusSeal.ps1"
+        "src/Agents/reviewer/CorpusSeal.ps1",
+        "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
       "producerProductionReachable": true,
       "producerObservedCensus": {
@@ -7458,7 +7694,8 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
-        "src/Agents/reviewer/CorpusSeal.ps1"
+        "src/Agents/reviewer/CorpusSeal.ps1",
+        "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
       "producerProductionReachable": true,
       "producerObservedCensus": {
@@ -7505,7 +7742,8 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
-        "src/Agents/reviewer/CorpusSeal.ps1"
+        "src/Agents/reviewer/CorpusSeal.ps1",
+        "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
       "producerProductionReachable": true,
       "producerObservedCensus": {
@@ -7552,7 +7790,8 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
-        "src/Agents/reviewer/CorpusSeal.ps1"
+        "src/Agents/reviewer/CorpusSeal.ps1",
+        "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
       "producerProductionReachable": true,
       "producerObservedCensus": {
@@ -7599,7 +7838,8 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
-        "src/Agents/reviewer/CorpusSeal.ps1"
+        "src/Agents/reviewer/CorpusSeal.ps1",
+        "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
       "producerProductionReachable": true,
       "producerObservedCensus": {
@@ -7646,7 +7886,8 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
-        "src/Agents/reviewer/CorpusSeal.ps1"
+        "src/Agents/reviewer/CorpusSeal.ps1",
+        "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
       "producerProductionReachable": true,
       "producerObservedCensus": {
@@ -7693,7 +7934,8 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
-        "src/Agents/reviewer/CorpusSeal.ps1"
+        "src/Agents/reviewer/CorpusSeal.ps1",
+        "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
       "producerProductionReachable": true,
       "producerObservedCensus": {
@@ -7740,7 +7982,8 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
-        "src/Agents/reviewer/CorpusSeal.ps1"
+        "src/Agents/reviewer/CorpusSeal.ps1",
+        "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
       "producerProductionReachable": true,
       "producerObservedCensus": {
@@ -7787,7 +8030,8 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
-        "src/Agents/reviewer/CorpusSeal.ps1"
+        "src/Agents/reviewer/CorpusSeal.ps1",
+        "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
       "producerProductionReachable": true,
       "producerObservedCensus": {
@@ -7834,7 +8078,8 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
-        "src/Agents/reviewer/CorpusSeal.ps1"
+        "src/Agents/reviewer/CorpusSeal.ps1",
+        "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
       "producerProductionReachable": true,
       "producerObservedCensus": {
@@ -7881,7 +8126,8 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
-        "src/Agents/reviewer/CorpusSeal.ps1"
+        "src/Agents/reviewer/CorpusSeal.ps1",
+        "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
       "producerProductionReachable": true,
       "producerObservedCensus": {
@@ -7928,7 +8174,8 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
-        "src/Agents/reviewer/CorpusSeal.ps1"
+        "src/Agents/reviewer/CorpusSeal.ps1",
+        "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
       "producerProductionReachable": true,
       "producerObservedCensus": {
@@ -7975,7 +8222,8 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
-        "src/Agents/reviewer/CorpusSeal.ps1"
+        "src/Agents/reviewer/CorpusSeal.ps1",
+        "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
       "producerProductionReachable": true,
       "producerObservedCensus": {
@@ -8022,7 +8270,8 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
-        "src/Agents/reviewer/CorpusSeal.ps1"
+        "src/Agents/reviewer/CorpusSeal.ps1",
+        "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
       "producerProductionReachable": true,
       "producerObservedCensus": {
@@ -8069,7 +8318,8 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
-        "src/Agents/reviewer/CorpusSeal.ps1"
+        "src/Agents/reviewer/CorpusSeal.ps1",
+        "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
       "producerProductionReachable": true,
       "producerObservedCensus": {
@@ -8116,7 +8366,8 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
-        "src/Agents/reviewer/CorpusSeal.ps1"
+        "src/Agents/reviewer/CorpusSeal.ps1",
+        "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
       "producerProductionReachable": true,
       "producerObservedCensus": {
@@ -8163,7 +8414,8 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
-        "src/Agents/reviewer/CorpusSeal.ps1"
+        "src/Agents/reviewer/CorpusSeal.ps1",
+        "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
       "producerProductionReachable": true,
       "producerObservedCensus": {
@@ -8210,7 +8462,8 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
-        "src/Agents/reviewer/CorpusSeal.ps1"
+        "src/Agents/reviewer/CorpusSeal.ps1",
+        "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
       "producerProductionReachable": true,
       "producerObservedCensus": {
@@ -8257,7 +8510,8 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
-        "src/Agents/reviewer/CorpusSeal.ps1"
+        "src/Agents/reviewer/CorpusSeal.ps1",
+        "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
       "producerProductionReachable": true,
       "producerObservedCensus": {
@@ -8304,7 +8558,8 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
-        "src/Agents/reviewer/CorpusSeal.ps1"
+        "src/Agents/reviewer/CorpusSeal.ps1",
+        "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
       "producerProductionReachable": true,
       "producerObservedCensus": {
@@ -8351,7 +8606,8 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
-        "src/Agents/reviewer/CorpusSeal.ps1"
+        "src/Agents/reviewer/CorpusSeal.ps1",
+        "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
       "producerProductionReachable": true,
       "producerObservedCensus": {
@@ -8398,7 +8654,8 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
-        "src/Agents/reviewer/CorpusSeal.ps1"
+        "src/Agents/reviewer/CorpusSeal.ps1",
+        "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
       "producerProductionReachable": true,
       "producerObservedCensus": {
@@ -8445,7 +8702,8 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
-        "src/Agents/reviewer/CorpusSeal.ps1"
+        "src/Agents/reviewer/CorpusSeal.ps1",
+        "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
       "producerProductionReachable": true,
       "producerObservedCensus": {
@@ -8492,7 +8750,8 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
-        "src/Agents/reviewer/CorpusSeal.ps1"
+        "src/Agents/reviewer/CorpusSeal.ps1",
+        "src/Agents/reviewer/ShadowPreparation.ps1"
       ],
       "producerProductionReachable": true,
       "producerObservedCensus": {
@@ -8539,6 +8798,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -8586,6 +8846,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -8633,6 +8894,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -8680,6 +8942,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -8727,6 +8990,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -8774,6 +9038,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -8821,6 +9086,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -8868,6 +9134,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -8915,6 +9182,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -8962,6 +9230,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -9009,6 +9278,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -9056,6 +9326,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -9103,6 +9374,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -9150,6 +9422,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -9197,6 +9470,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -9244,6 +9518,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -9291,6 +9566,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -9338,6 +9614,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -9385,6 +9662,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -9432,6 +9710,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -9479,6 +9758,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -9526,6 +9806,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -9573,6 +9854,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -9620,6 +9902,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -9667,6 +9950,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -9714,6 +9998,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -9761,6 +10046,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -9808,6 +10094,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -9855,6 +10142,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -9902,6 +10190,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -9948,8 +10237,10 @@
       "producerFile": "src/Agents/reviewer/CrossVerification.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -9993,8 +10284,10 @@
       "producerFile": "src/Agents/reviewer/CrossVerification.ps1",
       "producerEquivalence": "direct",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -10038,8 +10331,10 @@
       "producerFile": "src/Agents/reviewer/CrossVerification.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -10083,8 +10378,10 @@
       "producerFile": "src/Agents/reviewer/CrossVerification.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -10128,8 +10425,10 @@
       "producerFile": "src/Agents/reviewer/CrossVerification.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -10173,8 +10472,10 @@
       "producerFile": "src/Agents/reviewer/CrossVerification.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -10218,8 +10519,10 @@
       "producerFile": "src/Agents/reviewer/CrossVerification.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -10263,8 +10566,10 @@
       "producerFile": "src/Agents/reviewer/CrossVerification.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -10308,8 +10613,10 @@
       "producerFile": "src/Agents/reviewer/CrossVerification.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -10353,8 +10660,10 @@
       "producerFile": "src/Agents/reviewer/CrossVerification.ps1",
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
-      "producerProductionCallers": [],
-      "producerProductionReachable": false,
+      "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1"
+      ],
+      "producerProductionReachable": true,
       "producerObservedCensus": {
         "zero": 0,
         "one": 1,
@@ -10399,6 +10708,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -10446,6 +10756,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -10493,6 +10804,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -10540,6 +10852,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -10587,6 +10900,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -10634,6 +10948,7 @@
       "producerEquivalence": "direct",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -10681,6 +10996,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -10728,6 +11044,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -10775,6 +11092,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -10822,6 +11140,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -10869,6 +11188,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -10916,6 +11236,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -10963,6 +11284,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -11010,6 +11332,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,
@@ -11057,6 +11380,7 @@
       "producerEquivalence": "stageBoundaryEquivalent",
       "producerResidual": "",
       "producerProductionCallers": [
+        "src/Agents/reviewer/ShadowPreparation.ps1",
         "src/Agents/reviewer/Start-ReviewerAgent.ps1"
       ],
       "producerProductionReachable": true,

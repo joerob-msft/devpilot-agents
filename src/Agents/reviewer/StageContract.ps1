@@ -583,6 +583,71 @@ function Add-ReviewerStageContractLedgerEntry {
     if ($overflow -gt 0) { $script:ReviewerStageContractLedger.RemoveRange(0, $overflow) }
 }
 
+function ConvertTo-ReviewerStageDeterministicKeyOrder {
+    <#
+    .SYNOPSIS
+        A payload whose unordered dictionaries have been given a stable key order.
+    .DESCRIPTION
+        The published bytes are the hashed artifact, so any part of serialization
+        that is not a function of the payload's content becomes a digest that
+        differs between two runs that observed exactly the same evidence. A plain
+        hashtable enumerates in whatever order its buckets happen to sit in, which
+        is not part of what the caller expressed, so two identical payloads can
+        serialize to two different byte streams and defeat the differential the
+        artifact exists to support.
+
+        Only genuinely unordered dictionaries are reordered, and they are sorted
+        ordinal. An OrderedDictionary and a PSCustomObject both carry an order the
+        author chose deliberately, so both are preserved exactly as given: guessing
+        that a declared order was accidental would corrupt a real intent to fix an
+        imaginary one.
+    #>
+    param([AllowNull()]$Node, [int]$Depth = 0)
+
+    if ($Depth -gt 64) {
+        throw 'Stage payload nested deeper than 64 levels while ordering keys.'
+    }
+    if ($null -eq $Node) { return $null }
+    if ($Node -is [string] -or $Node -is [System.ValueType]) { return $Node }
+
+    if ($Node -is [System.Collections.IDictionary]) {
+        $ordered = [ordered]@{}
+        $keys = @($Node.Keys)
+        # An OrderedDictionary already states its order; anything else does not
+        # have one to state, so ordinal sorting is the only reading of it that two
+        # processes can agree on.
+        if ($Node -isnot [System.Collections.Specialized.OrderedDictionary]) {
+            $keys = @($keys | Sort-Object -Property { [string]$_ } -CaseSensitive)
+        }
+        foreach ($key in $keys) {
+            $ordered[[string]$key] = ConvertTo-ReviewerStageDeterministicKeyOrder -Node $Node[$key] -Depth ($Depth + 1)
+        }
+        return $ordered
+    }
+
+    if ($Node -is [System.Management.Automation.PSCustomObject]) {
+        $ordered = [ordered]@{}
+        foreach ($property in $Node.PSObject.Properties) {
+            $ordered[[string]$property.Name] = ConvertTo-ReviewerStageDeterministicKeyOrder -Node $property.Value -Depth ($Depth + 1)
+        }
+        return [pscustomobject]$ordered
+    }
+
+    if ($Node -is [System.Collections.IEnumerable]) {
+        $items = [System.Collections.Generic.List[object]]::new()
+        foreach ($item in $Node) {
+            [void]$items.Add((ConvertTo-ReviewerStageDeterministicKeyOrder -Node $item -Depth ($Depth + 1)))
+        }
+        # Rebuilt as object[] and returned through the comma operator rather than
+        # bare: a returned array unrolls, so an empty one would come back as null
+        # and a single-element one as a scalar, collapsing exactly the cardinality
+        # the collection normalizer just finished protecting.
+        return ,([object[]]$items.ToArray())
+    }
+
+    return $Node
+}
+
 function Measure-ReviewerStageFieldCardinality {
     <#
     .SYNOPSIS
@@ -754,7 +819,7 @@ function Write-ReviewerStageArtifact {
         contractVersion = $contract.ContractVersion
         form = $Form
         depth = $Depth
-        payload = $normalized
+        payload = (ConvertTo-ReviewerStageDeterministicKeyOrder -Node $normalized)
     }
     $compact = ($Form -ceq 'compact')
     $json = ConvertTo-Json -InputObject $envelope -Depth $Depth -Compress:$compact

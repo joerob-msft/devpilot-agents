@@ -1,0 +1,206 @@
+using System.Diagnostics;
+using System.Globalization;
+
+namespace DevPilot.ShadowRunCoordinator;
+
+/// <summary>
+/// Thrown when another live coordinator already holds this output root.
+/// </summary>
+internal sealed class LeaseConflictException(string message) : Exception(message);
+
+/// <summary>
+/// One coordinator per output root, decided from files rather than from a
+/// process list.
+/// </summary>
+/// <remarks>
+/// The hard part of a lease is not taking it, it is deciding whether a lease
+/// left behind by a killed process is still live. Two mistakes are available and
+/// this takes neither. Trusting the recorded identifier alone would hand the
+/// root to nobody forever after a kill, because the operating system reuses
+/// identifiers and some unrelated process now answers to that number. Matching on
+/// what a process looks like - its command text - would be worse, because command
+/// text is attacker-controlled, locale-dependent and unavailable for processes
+/// this user cannot open.
+///
+/// So the lease records the identifier AND the exact process start time, and a
+/// holder counts as live only when both agree. A reused identifier belongs to a
+/// process that started later than the record says, so it fails the second half
+/// and the lease is correctly treated as abandoned.
+/// </remarks>
+internal sealed class RunLease : IDisposable
+{
+    private const string ContractVersionValue = "devpilot.shadow-run-coordinator.lease.v1";
+
+    private readonly string _path;
+    private FileStream? _handle;
+    private bool _released;
+
+    private RunLease(string path, FileStream handle, bool tookOverAbandoned)
+    {
+        _path = path;
+        _handle = handle;
+        TookOverAbandoned = tookOverAbandoned;
+    }
+
+    /// <summary>True when this run adopted a lease whose holder was gone.</summary>
+    internal bool TookOverAbandoned { get; }
+
+    internal static RunLease Acquire(CoordinatorRequest request)
+    {
+        Directory.CreateDirectory(request.CoordinatorRoot);
+        var tookOver = false;
+
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            try
+            {
+                // CreateNew is the whole race: two coordinators reaching this line
+                // together cannot both succeed, and the loser never looks at the
+                // holder record to decide, so it cannot talk itself into taking over.
+                var handle = new FileStream(request.LeasePath, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
+                try
+                {
+                    var current = Process.GetCurrentProcess();
+                    var record = new MapNode()
+                        .Set("contractVersion", ContractVersionValue)
+                        .Set("correlationId", request.CorrelationId)
+                        .Set("processId", current.Id)
+                        .Set("processStartedAtUtc", current.StartTime.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture))
+                        .Set("acquiredAtUtc", DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture));
+                    var bytes = StrictJson.StrictUtf8.GetBytes(CanonicalJson.Readable(record));
+                    handle.Write(bytes, 0, bytes.Length);
+                    handle.Flush(flushToDisk: true);
+                }
+                catch
+                {
+                    handle.Dispose();
+                    File.Delete(request.LeasePath);
+                    throw;
+                }
+                return new RunLease(request.LeasePath, handle, tookOver);
+            }
+            catch (IOException) when (File.Exists(request.LeasePath))
+            {
+                var holder = ReadHolder(request.LeasePath);
+                if (holder is not null && IsHolderLive(holder.Value.ProcessId, holder.Value.StartedAtUtc))
+                {
+                    throw new LeaseConflictException(
+                        $"Process {holder.Value.ProcessId.ToString(CultureInfo.InvariantCulture)} already holds the coordinator lease at '{request.LeasePath}'.");
+                }
+                // The holder is gone, so the lease is evidence of a kill rather
+                // than of a live run. Remove it and try once more; if that second
+                // attempt loses the CreateNew race to somebody else, the loop ends
+                // and the conflict is reported rather than forced.
+                tookOver = true;
+                try
+                {
+                    File.Delete(request.LeasePath);
+                }
+                catch (IOException)
+                {
+                    throw new LeaseConflictException($"The coordinator lease at '{request.LeasePath}' is held open by another process.");
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    throw new LeaseConflictException($"The coordinator lease at '{request.LeasePath}' cannot be removed by this user.");
+                }
+            }
+        }
+
+        throw new LeaseConflictException($"The coordinator lease at '{request.LeasePath}' was taken by another process.");
+    }
+
+    private static (int ProcessId, DateTime StartedAtUtc)? ReadHolder(string path)
+    {
+        try
+        {
+            const string label = "coordinator lease";
+            var root = StrictJson.ReadObjectFile(path, label, maximumBytes: 64 * 1024);
+            var processId = StrictJson.RequireInt(root, "processId", label, 1, int.MaxValue);
+            var startedText = StrictJson.RequireString(root, "processStartedAtUtc", label);
+            // RoundtripKind alone: it already honours the offset the writer emitted,
+            // and combining it with a conversion style is rejected outright. Getting
+            // this wrong once turned an abandoned lease into an unhandled crash
+            // rather than into the takeover it should have been.
+            if (!DateTime.TryParse(
+                    startedText,
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.RoundtripKind,
+                    out var started))
+            {
+                return null;
+            }
+            return (processId, started.ToUniversalTime());
+        }
+        catch (ContractException)
+        {
+            // An unreadable lease is a lease no live holder wrote completely. It
+            // is treated as abandoned rather than as a conflict, because refusing
+            // forever on a corrupt byte would make a single bad write permanent.
+            return null;
+        }
+        catch (FormatException)
+        {
+            return null;
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+    }
+
+    private static bool IsHolderLive(int processId, DateTime startedAtUtc)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            if (process.HasExited)
+            {
+                return false;
+            }
+            var actual = process.StartTime.ToUniversalTime();
+            // A whole second of tolerance, because the recorded value round-trips
+            // through text. Identifier reuse takes far longer than that in
+            // practice, so this stays a discriminating test.
+            return Math.Abs((actual - startedAtUtc).TotalSeconds) < 1.0;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+        // A holder this user cannot inspect is deliberately NOT treated as dead:
+        // stealing a lease from a process we cannot see is the one direction where
+        // being wrong runs two coordinators at once.
+        catch (System.ComponentModel.Win32Exception)
+        {
+            return true;
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_released)
+        {
+            return;
+        }
+        _released = true;
+        _handle?.Dispose();
+        _handle = null;
+        try
+        {
+            File.Delete(_path);
+        }
+        catch (IOException)
+        {
+            // A lease left behind is recoverable on the next run by exactly the
+            // takeover path above; failing the run over it would be worse.
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+    }
+}

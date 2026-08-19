@@ -208,6 +208,16 @@ jobs:
         shell: pwsh
         run: ./tools/Test-ReviewerCoordinatorContract.ps1
 
+      # The typed control plane itself. Restores and builds offline against an
+      # empty feed, drives the full preparation from a typed request to an
+      # immutable run-set-ready with no model and no slot, and proves the durable
+      # state survives a kill at every transition. Runs the child fault matrix,
+      # the lease conflict, the stale-head and tamper refusals, and a rollback
+      # differential against the PowerShell preparation path.
+      - name: shadow run coordinator
+        shell: pwsh
+        run: ./tools/Test-ShadowRunCoordinator.ps1
+
       # Every inventoried collection field at zero, one, many, maximum,
       # duplicate, null-versus-missing, and wrong-scalar, plus the escape-shape
       # properties and the sabotage suite that proves each historical collapse

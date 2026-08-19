@@ -1,0 +1,121 @@
+# Shadow run coordinator
+
+`tools/ShadowRunCoordinator` is the first slice of the typed control plane the escape ledger's
+`typed-control-plane-pivot` decision registers. It is a dependency-free .NET 10 console
+application that carries one shadow preparation from a typed request to an immutable,
+signed `run-set-ready` state — and stops there.
+
+> **It launches no model and no slot, and it writes nothing outside its own output root.**
+> That is not a convention. The audit it emits records `modelInvocationCount` and
+> `slotLaunchCount`, the suite asserts both are zero, and there is no model client, provider
+> credential, HTTP type or prompt string anywhere in the project for one to be made from.
+> `tools/Test-ReviewerCoordinatorContract.ps1` fails the build if that stops being true.
+
+## What it is for
+
+The reviewer's preparation path is PowerShell, and it stays PowerShell. What moves here is
+*coordination*: the ordering of steps, the durability of the state between them, the
+supervision of child processes, and the refusal of anything that does not match its contract.
+Those are the failure modes the escape ledger's incident list is made of, and they are the
+ones a typed, compiled host is actually better at.
+
+Judgement does not move. No prompt text, no model name, no candidate severity, no verdict
+rule, and no reconciliation semantics exist in this project. When the coordinator needs one of
+those, it invokes the already-reviewed PowerShell tool that owns it.
+
+## The strangler seam
+
+```mermaid
+flowchart LR
+    R[typed request<br/>JSON file] --> C[ShadowRunCoordinator]
+    C -->|versioned request file| A[Invoke-ShadowCoordinatorChild.ps1]
+    A --> T1[Save-CorpusReplaySeal.ps1]
+    A --> T2[run-set declaration<br/>preflight and status tools]
+    T1 --> RF[versioned result file]
+    T2 --> RF
+    RF --> C
+    C --> S[(durable state<br/>+ audit)]
+```
+
+Every arrow crossing the seam is a **file**. The coordinator writes a request file, starts one
+child, waits for it under a bounded timeout, and reads a result file. Standard output is
+captured to a log and is never a contract surface: a child that prints a perfectly well-formed
+result to stdout and writes nothing to its result path has failed.
+
+One child at a time, always. A second child requested while one is in flight is a refusal, not
+a queue — concurrency here would mean two writers on one output root, which is the thing the
+lease exists to prevent.
+
+## The state machine
+
+```
+requestValidated -> corpusValidated -> recipePlanned -> snapshotValidateOnly
+    -> snapshotSealed -> snapshotVerified -> runSetDeclared -> runSetVerified -> runSetReady
+```
+
+There is no other order and no way to skip. Each transition appends a record to a durable
+state file under a monotonic sequence, and the file is replaced atomically. Restarting the
+coordinator at any point re-reads that file, recognises the transitions already recorded, and
+resumes at the next one — it does not re-run a child whose transition is already committed.
+
+Each transition record carries the evidence it was committed on and a digest over that
+evidence. The audit is built from those records rather than from anything the process
+accumulated in memory, so an audit written after a restart is identical to one written by a
+run that was never interrupted. That is the property that makes "kill it anywhere" a test
+rather than a hope.
+
+`--halt-after <state>` stops deliberately after a named transition and exits 9. It exists so
+the suite can stop the process at every single transition and start it again.
+
+## Refusals
+
+The request is strict JSON, UTF-8 with no byte-order mark, read from a file. It is refused for
+an unknown field, a missing field, a null where a value is required, a scalar where an object
+or array belongs, a byte-order mark, a truncated document, an empty file, a top-level array,
+and a nesting depth beyond 32. The same strictness applies to every child result.
+
+Beyond shape, the run is refused when:
+
+* the repository head is not the exact commit the request binds,
+* a configuration, prompt-asset or schema digest does not match what the request declared,
+* the corpus index digest does not match the corpus on disk,
+* the durable state file's own integrity check fails, or its correlation ID is not this run's,
+* another live process holds the lease on the output root.
+
+The lease records the holder's process ID *and* its process start time, and liveness is decided
+by looking up that exact identity. A recycled process ID with a different start time is not the
+holder. Nothing reads a command line to decide whether a process is alive. A lease whose holder
+cannot be alive is treated as abandoned rather than as a permanent conflict, so a crash cannot
+wedge an output root for ever.
+
+Exit codes: `0` ok, `1` usage, `2` request contract, `3` lease conflict, `4` child failure,
+`9` deliberate halt.
+
+## Stage artifacts
+
+`src/Agents/reviewer/ShadowPreparation.ps1` is the shipping entry point that turns on the stage
+file contract and publishes all twelve stage artifacts. The coordinator rereads every one of
+them through the strict reader and indexes them by kind, byte length and digest; its audit does
+not close unless all twelve distinct kinds are present and every one was reread.
+
+This is what moved the file contract from "built and CI-verified" to "in force" in
+`docs/escape-ledger.v2.json`: not a document saying so, but a compiled consumer that cannot
+reach its terminal state without the files.
+
+## Rollback
+
+The PowerShell preparation path is unchanged and remains the default; nothing routes to the
+coordinator unless a caller runs it. `tools/Test-ShadowRunCoordinator.ps1` runs the same
+request down both paths and compares the twelve published artifacts byte for byte, so
+"equivalent up to run-set-ready" is a checked claim rather than an intention.
+
+## Tests
+
+`tools/Test-ShadowRunCoordinator.ps1` (CI, offline, no model) covers: an offline restore and
+build against an empty feed; a hermetic sandbox with a genuinely sealed synthetic corpus; a
+kill and restart at *every* transition; the full path to `run-set-ready`; the twelve-artifact
+audit; the rollback differential; the request boundary matrix; stale head, stale identity and
+tampered state; the lease conflict and the abandoned-lease recovery; the child fault matrix
+(non-zero exit, missing, malformed, byte-order-marked, truncated, partial, wrong correlation,
+wrong step, stdout chatter, and a hang bounded by timeout); an external kill mid-transition;
+and a final check that no child process and no repository modification survived the run.
