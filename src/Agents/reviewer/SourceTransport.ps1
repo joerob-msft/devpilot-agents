@@ -39,6 +39,21 @@
 
 Set-StrictMode -Version Latest
 
+# The twelve stage producer boundaries are declared in one shared file, so a
+# stage and the corpus that drives it can never exercise two different copies of
+# the same contract.
+#
+# The guard asks whether THIS script scope already holds the producer table, not
+# whether the commands are merely visible. A dot-sourced library resolves
+# $script: variables against the scope of whoever is running it, so a script that
+# can see an outer scope's functions but never loaded the libraries itself would
+# reach a registry that does not exist there - and it would only find out at the
+# first boundary call, which is exactly the call that must not fail for the wrong
+# reason.
+if (-not (Get-Variable -Name 'ReviewerStageProducerContracts' -Scope Script -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot 'StageProducers.ps1')
+}
+
 $script:ReviewerSourceTransportVersion = 1
 $script:ReviewerSourceSpanBasisVersion = 1
 $script:ReviewerSourceSpanBases = @("changeSet", "recovered")
@@ -1474,7 +1489,13 @@ function Get-ReviewerSourceRawChangedPaths {
         if (-not $path) { $path = [string](Get-ReviewerSourceValue -Object $change -Name "path" -Default "") }
         if ($path) { [void]$paths.Add($path) }
     }
-    return $paths.ToArray()
+    # The source stage boundary, in force. The census is judged before any caller
+    # sees it - including the empty one, which is the shape that used to reach a
+    # consumer as "no change set was read" instead of "the change set named no
+    # file". The answer below is read back out of the judged payload, so a
+    # removed assertion is a missing variable, not a silently unchecked return.
+    $asserted = New-ReviewerSourceStageContract -ChangedPaths $paths
+    return ([string[]]@($asserted.changedPaths))
 }
 
 function Get-ReviewerSourceChangeIdentityDigest {

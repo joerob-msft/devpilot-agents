@@ -183,6 +183,15 @@ jobs:
         shell: pwsh
         run: ./tools/Test-ReviewerStageContract.ps1
 
+      # Adoption of that contract by the twelve real stage producers: each one
+      # must call its boundary, consume the verdict, and reach it from its own
+      # entry point. The suite reads the producers' syntax trees, so deleting a
+      # call or assigning its verdict to $null fails here rather than silently
+      # unwiring a boundary.
+      - name: stage producer contract adoption
+        shell: pwsh
+        run: ./tools/Test-ReviewerStageProducerContract.ps1
+
       # Every inventoried collection field at zero, one, many, maximum,
       # duplicate, null-versus-missing, and wrong-scalar, plus the escape-shape
       # properties and the sabotage suite that proves each historical collapse

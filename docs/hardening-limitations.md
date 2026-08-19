@@ -156,9 +156,18 @@ them otherwise:
   function reached through an imported module is not analyzed.
 - **Type flow.** The analyzer reasons about syntactic shape, not types. A variable that
   holds a collection only on some paths is judged by how it is written, not what it holds.
-- **Producer paths.** The corpus drives variants through the shared contract. It does not
-  execute the production writers, so the matrix publishes 1652 producer gaps against 0
-  boundary gaps, and that ratio is the honest summary of its reach.
+- **Producer paths.** The corpus drives variants through the registered contract each stage
+  publishes through, and through the shipping producer function itself wherever that function
+  runs without a live capture or a model. The score is read back out of the contract ledger,
+  which records the element count the boundary actually judged, so a cell states what was
+  published rather than that a validator returned: of 1652 producer cells, 1120 are
+  cardinalities the producing function published (889 matching the constructed count, 231
+  legitimately reshaped by deduplication or union), 472 are refusals of the null-vs-missing
+  and wrong-scalar shapes and are not counted as published cardinalities, 60 belong to the
+  capture stage, and 0 remain gaps. What it still does not do is execute a stage end to end
+  against a real repository, so 230 of the 236 rows are covered through their stage boundary
+  rather than their own call site, and 112 rows name a producer that nothing in `src/` calls
+  today.
 
 ## No completeness, precision, or recall claim
 
@@ -190,8 +199,13 @@ external scrutiny, and the reason this page exists.
 
 - **Shadow exposure.** Nothing here runs a model or writes to an external system. The
   no-write invariant is asserted, not relaxed.
-- **Producer-path coverage.** Driving variants through the real writers is the next
-  increment; the 1652 producer gaps name it precisely.
+- **Producer-path coverage.** The remaining increment is narrower than it was, and named
+  precisely: 60 cells on the capture stage need a live acquisition to mint a sealed package,
+  231 cells are reshaped rather than passed through, 230 rows are covered through their stage
+  boundary rather than their own call site, and 112 rows name a producer with no caller in
+  `src/` today.
+- **On-disk file contract.** The versioned envelope is still test-only. No shipping path
+  writes or reads one, so no consumer has yet seen a `kind` or a `contractVersion` on disk.
 - **Historical replay of sabotage.** Sabotage proves the detector recognises the escape
   *shape* as re-authored here, not that it would have fired on the original source.
 - **Behaviour-versus-build-identity hashing.** The exact-path oracle hash still mixes both,

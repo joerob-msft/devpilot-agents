@@ -2,6 +2,21 @@
 
 Set-StrictMode -Version Latest
 
+# The twelve stage producer boundaries are declared in one shared file, so a
+# stage and the corpus that drives it can never exercise two different copies of
+# the same contract.
+#
+# The guard asks whether THIS script scope already holds the producer table, not
+# whether the commands are merely visible. A dot-sourced library resolves
+# $script: variables against the scope of whoever is running it, so a script that
+# can see an outer scope's functions but never loaded the libraries itself would
+# reach a registry that does not exist there - and it would only find out at the
+# first boundary call, which is exactly the call that must not fail for the wrong
+# reason.
+if (-not (Get-Variable -Name 'ReviewerStageProducerContracts' -Scope Script -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot 'StageProducers.ps1')
+}
+
 $script:ReviewerAcquisitionPackageUtf8 = [Text.UTF8Encoding]::new($false, $true)
 
 function ConvertTo-ReviewerAcquisitionPackageCanonicalElement {
@@ -262,6 +277,34 @@ function Assert-ReviewerAcquisitionTranscriptPackage {
         throw 'The acquisition package is not a successful, model-matched result-marker capture.'
     }
 
+    # The capture stage boundary, in force. A package's three inventories - the
+    # bound files, the bound directories, and the per-attempt marker statuses -
+    # are judged as censuses here, before any downstream consumer treats them as
+    # complete. The single-file package whose file list arrives as a bare string,
+    # and the zero-attempt package whose status list arrives as null, are exactly
+    # the shapes that read downstream as a smaller package than was sealed.
+    $attemptMarkerStatuses = [System.Collections.Generic.List[string]]::new()
+    if ($core.PSObject.Properties['attempts']) {
+        foreach ($attempt in @($core.attempts)) {
+            if ($null -eq $attempt) { continue }
+            $markerStatus = ''
+            if ($attempt.PSObject.Properties['markerStatus']) { $markerStatus = [string]$attempt.markerStatus }
+            [void]$attemptMarkerStatuses.Add($markerStatus)
+        }
+    }
+    $capture = New-ReviewerCaptureStageContract `
+        -PackageFiles ([string[]]@($boundFiles.Keys)) `
+        -PackageDirectories ([string[]]@($boundDirectories.Keys)) `
+        -AttemptMarkerStatuses $attemptMarkerStatuses
+    # The verdict is read, not merely produced: the judged censuses have to still
+    # agree with the bindings this function proved above, so a boundary that was
+    # deleted takes the comparison - and the variable it reads - with it.
+    if ([int]$capture.packageFiles.Count -ne [int]$boundFiles.Count -or
+        [int]$capture.packageDirectories.Count -ne [int]$boundDirectories.Count -or
+        [int]$capture.attemptMarkerStatuses.Count -ne [int]$attemptMarkerStatuses.Count) {
+        throw 'The acquisition package inventory census does not match its verified bindings.'
+    }
+
     return [pscustomobject]@{
         Root           = $root
         Manifest       = $manifest
@@ -276,5 +319,8 @@ function Assert-ReviewerAcquisitionTranscriptPackage {
         MarkerText     = $markerText
         MarkerSha256   = Get-ReviewerAcquisitionPackageBytesSha256 -Bytes $markerBytes
         MarkerPath     = $markerPath
+        # The judged census travels with the package, so the boundary's answer is
+        # what downstream reads rather than a parallel recount of the same inputs.
+        AttemptMarkerStatuses = [string[]]@($capture.attemptMarkerStatuses)
     }
 }

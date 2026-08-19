@@ -44,6 +44,11 @@ $script:ReviewerStageContractForms = @('compact', 'indented')
 $script:ReviewerStageContractMaxBytes = 33554432
 $script:ReviewerStageContractRegistry =
 [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
+# Every Assert/Write/Read that judged a contract is recorded here, in call order.
+# The ledger is what makes adoption observable: a stage that stops calling the
+# boundary stops appearing, and a test can say so by name instead of waiting for
+# a downstream symptom.
+$script:ReviewerStageContractLedger = [System.Collections.Generic.List[object]]::new()
 
 function Register-ReviewerStageContract {
     <#
@@ -426,6 +431,19 @@ function Test-ReviewerStageMapShape {
                 continue
             }
             if ($value -is [System.Collections.IDictionary]) { continue }
+            # A list is not a map, and it is the collapse the array test above
+            # cannot see: List<T>, ArrayList and HashSet are all non-array
+            # enumerables that PowerShell hands back inside a PSObject, so the
+            # keyed-object test below would otherwise wave them through and a
+            # per-path span map would reach JSON as a bare sequence of spans
+            # with every path silently dropped.
+            $enumerable = $value
+            if ($value -is [psobject] -and $null -ne $value.PSObject.BaseObject) { $enumerable = $value.PSObject.BaseObject }
+            if ($enumerable -is [System.Collections.IEnumerable] -and $enumerable -isnot [string] -and
+                $enumerable -isnot [System.Collections.IDictionary]) {
+                [void]$violations.Add("$($site.Path) collapsed to a $($enumerable.GetType().Name) sequence")
+                continue
+            }
             if ($value -is [psobject] -and $value.PSObject.BaseObject -isnot [System.Array] -and
                 $value.PSObject.BaseObject -isnot [string] -and $value.PSObject.BaseObject -isnot [ValueType]) {
                 continue
@@ -464,6 +482,198 @@ function Test-ReviewerStagePayloadField {
     if ($unknown.Count -gt 0) {
         throw "Stage contract '$($Contract.Kind)' payload has unknown field(s): $($unknown -join ', '). Add them to the contract before writing them."
     }
+}
+
+function Test-ReviewerStageProducerCollectionShape {
+    <#
+    .SYNOPSIS
+        Returns the declared collection fields a PRODUCER may not hand over.
+
+    .DESCRIPTION
+        The write-side shape check judges what is already an array, which is the
+        right question for bytes on their way to disk and the wrong one for a
+        producer: a stage legitimately builds its result in a List or a HashSet,
+        and demanding it pre-materialize an object[] would only move the
+        conversion - and the chance to get it wrong - back into the stage.
+
+        What a producer may never hand over is a value that has already lost its
+        cardinality: $null (an empty result that became "no result"), a bare
+        string or value type (a one-element result that became its element), or a
+        dictionary where a list was declared. Those are refused here, before the
+        normalizer would repair them into a plausible-looking array and hide the
+        defect that produced them. Everything else is a real collection and is
+        materialized by ConvertTo-ReviewerStageCollection.
+    #>
+    param(
+        [Parameter(Mandatory)]$Payload,
+        [string[]]$CollectionFields = @()
+    )
+
+    $violations = [System.Collections.Generic.List[string]]::new()
+    foreach ($fieldPath in @($CollectionFields)) {
+        $sites = Get-ReviewerStageFieldSite -Payload $Payload -FieldPath $fieldPath
+        foreach ($site in $sites) {
+            if (-not (Test-ReviewerStageHasMember -Node $site.Parent -Name $site.Name)) {
+                [void]$violations.Add("$($site.Path) is missing")
+                continue
+            }
+            $value = Get-ReviewerStageMember -Node $site.Parent -Name $site.Name
+            if ($null -eq $value) {
+                [void]$violations.Add("$($site.Path) collapsed to null")
+                continue
+            }
+            if ($value -is [string]) {
+                [void]$violations.Add("$($site.Path) collapsed to a bare String")
+                continue
+            }
+            if ($value -is [System.Collections.IDictionary]) {
+                [void]$violations.Add("$($site.Path) collapsed to a keyed $($value.GetType().Name)")
+                continue
+            }
+            if ($value -is [System.Collections.IEnumerable]) { continue }
+            $base = $value
+            if ($base -is [psobject] -and $null -ne $base.PSObject.BaseObject) { $base = $base.PSObject.BaseObject }
+            if ($base -is [System.Collections.IEnumerable] -and $base -isnot [string] -and
+                $base -isnot [System.Collections.IDictionary]) {
+                continue
+            }
+            [void]$violations.Add("$($site.Path) collapsed to a bare $($value.GetType().Name)")
+        }
+    }
+    Write-Output -NoEnumerate ([string[]]$violations.ToArray())
+}
+
+function Add-ReviewerStageContractLedgerEntry {
+    param(
+        [Parameter(Mandatory)][string]$Kind,
+        [Parameter(Mandatory)][string]$Producer,
+        [Parameter(Mandatory)][ValidateSet('assert', 'write', 'read')][string]$Operation,
+        [AllowNull()]$ObservedCounts = $null
+    )
+
+    $counts = [ordered]@{}
+    if ($null -ne $ObservedCounts -and $ObservedCounts -is [System.Collections.IDictionary]) {
+        foreach ($key in $ObservedCounts.Keys) { $counts[[string]$key] = [int]$ObservedCounts[$key] }
+    }
+    [void]$script:ReviewerStageContractLedger.Add([pscustomobject][ordered]@{
+            Sequence = ($script:ReviewerStageContractLedger.Count + 1)
+            Kind = $Kind
+            Producer = $Producer
+            Operation = $Operation
+            # The cardinality the boundary actually judged, per declared collection
+            # field. Without this the ledger only proves that a validator returned,
+            # which is not evidence that any particular census crossed the boundary.
+            ObservedCounts = $counts
+        })
+}
+
+function Measure-ReviewerStageFieldCardinality {
+    <#
+    .SYNOPSIS
+        The element count of every declared collection field in a normalized
+        payload, without enumerating the payload into the pipeline.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowNull()]$Payload,
+        [AllowNull()][string[]]$CollectionFields = @()
+    )
+
+    $counts = [ordered]@{}
+    if ($null -eq $Payload -or $null -eq $CollectionFields) { return $counts }
+    foreach ($field in $CollectionFields) {
+        if (-not (Test-ReviewerStageHasMember -Node $Payload -Name $field)) { continue }
+        $value = Get-ReviewerStageMember -Node $Payload -Name $field
+        if ($null -eq $value) { $counts[[string]$field] = -1; continue }
+        $collection = $value -as [System.Collections.ICollection]
+        if ($null -ne $collection) {
+            $counts[[string]$field] = [int]$collection.Count
+            continue
+        }
+        if ($value -is [System.Collections.IEnumerable] -and $value -isnot [string]) {
+            $observed = 0
+            $enumerator = $value.GetEnumerator()
+            while ($enumerator.MoveNext()) { $observed++ }
+            $counts[[string]$field] = $observed
+            continue
+        }
+        # A scalar that reached here is a collapse the caller is about to refuse;
+        # -1 keeps it distinguishable from a genuine empty census.
+        $counts[[string]$field] = -1
+    }
+    return $counts
+}
+
+function Get-ReviewerStageContractLedger {
+    <#
+    .SYNOPSIS
+        The recorded boundary calls, in call order, as a real collection at zero,
+        one, and many entries.
+    #>
+    Write-Output -NoEnumerate ([object[]]$script:ReviewerStageContractLedger.ToArray())
+}
+
+function Clear-ReviewerStageContractLedger {
+    $script:ReviewerStageContractLedger = [System.Collections.Generic.List[object]]::new()
+}
+
+function Assert-ReviewerStageContract {
+    <#
+    .SYNOPSIS
+        Judges one stage payload at the producer boundary and hands back the
+        normalized payload the stage must go on to use.
+
+    .DESCRIPTION
+        This is the in-memory half of the file contract: the same registered
+        kind, the same required/unknown field policy, and the same collection and
+        map shape rules, applied before the value is consumed downstream or
+        persisted, rather than after it has already crossed a boundary.
+
+        The verdict is the return value, not a side effect. A stage assigns it
+        and reads its own result back out of it, so a removed or neutered call
+        does not leave a quietly unvalidated payload behind - it leaves an
+        undefined variable, which fails under Set-StrictMode at the first read.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Kind,
+        [Parameter(Mandatory)][AllowNull()]$Payload,
+        [Parameter(Mandatory)][string]$Producer,
+        [switch]$AllowRepair
+    )
+
+    $contract = Get-ReviewerStageContract -Kind $Kind
+    if ([string]::IsNullOrWhiteSpace($Producer)) {
+        throw "Stage contract '$Kind' was asserted without naming its producer."
+    }
+    if ($null -eq $Payload) {
+        throw "Stage contract '$Kind' producer '$Producer' handed over a null payload."
+    }
+    if (-not $AllowRepair) {
+        # Repairing here would turn the producer's own collapse into a
+        # well-formed artifact, which is the failure this boundary exists to
+        # make visible. Callers that are deliberately re-shaping an inherited
+        # artifact ask for the repair explicitly.
+        $producerViolations = Test-ReviewerStageProducerCollectionShape -Payload $Payload `
+            -CollectionFields $contract.CollectionFields
+        if ($producerViolations.Count -gt 0) {
+            throw "Stage contract '$Kind' producer '$Producer' handed over collapsed collection field(s): $($producerViolations -join '; ')."
+        }
+    }
+
+    $normalized = ConvertTo-ReviewerStageCollection -Payload $Payload -CollectionFields $contract.CollectionFields
+    Test-ReviewerStagePayloadField -Payload $normalized -Contract $contract
+    $collapsed = Test-ReviewerStageCollectionShape -Payload $normalized -CollectionFields $contract.CollectionFields
+    if ($collapsed.Count -gt 0) {
+        throw "Stage contract '$Kind' producer '$Producer' could not preserve collection field(s): $($collapsed -join '; ')."
+    }
+    $mapCollapsed = Test-ReviewerStageMapShape -Payload $normalized -MapFields $contract.MapFields
+    if ($mapCollapsed.Count -gt 0) {
+        throw "Stage contract '$Kind' producer '$Producer' handed over unusable map field(s): $($mapCollapsed -join '; ')."
+    }
+
+    Add-ReviewerStageContractLedgerEntry -Kind $contract.Kind -Producer $Producer -Operation 'assert' `
+        -ObservedCounts (Measure-ReviewerStageFieldCardinality -Payload $normalized `
+            -CollectionFields $contract.CollectionFields)
+    return $normalized
 }
 
 function Write-ReviewerStageArtifact {
@@ -556,6 +766,11 @@ function Write-ReviewerStageArtifact {
     }
     $digest = [Convert]::ToHexString(
         [Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+    # The digest is taken over the bytes that were written, never over a second
+    # serialization of the same payload: re-serializing to hash would let the
+    # recorded digest and the published file drift apart the moment the
+    # serializer's output depended on anything but the payload.
+    Add-ReviewerStageContractLedgerEntry -Kind $contract.Kind -Producer 'Write-ReviewerStageArtifact' -Operation 'write'
     return [pscustomobject][ordered]@{
         Path = $Path
         Kind = $contract.Kind
@@ -673,6 +888,7 @@ function Read-ReviewerStageArtifact {
         throw "Stage contract '$Kind' artifact '$Path' lost map shape: $($mapCollapsed -join '; ')."
     }
 
+    Add-ReviewerStageContractLedgerEntry -Kind $contract.Kind -Producer 'Read-ReviewerStageArtifact' -Operation 'read'
     return [pscustomobject][ordered]@{
         Path = $Path
         Kind = $contract.Kind

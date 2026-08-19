@@ -79,8 +79,9 @@ Two consequences follow, and neither is hidden by the matrix:
   emitted a scalar at all — is answered by `-StrictShape`, which reports the collapse
   instead of repairing it, not by this variant.
 
-This is why the matrix keeps `producerPath` as a separate, entirely uncovered dimension
-rather than folding it into a single coverage number.
+This is why the matrix keeps `producerPath` as a separate dimension rather than folding it
+into a single coverage number: the two answer different questions, and only one of them can
+be answered without running the stage that owns the field.
 
 ## Maps are not arrays
 
@@ -189,11 +190,52 @@ The matrix records **two coverage dimensions that are never merged**:
 | Dimension | Covered | Gaps | Meaning |
 |---|---:|---:|---|
 | `boundaryNormalizer` | 1652 | 0 | The variant was written, serialized, read back, and counted through the shared contract — by the list validator for `collectionShape` rows and by the map validator for `mapShape` rows, as recorded per row in `boundaryValidator` |
-| `producerPath` | 0 | 1652 | The variant was produced by the real stage that owns the field |
+| `producerPath` | 1120 producer-published + 472 boundaryRefusal + 60 boundaryOnly | 0 | The variant was pushed through the registered contract its stage publishes through — via the production builder in `src/Agents/reviewer/StageProducers.ps1` — and, for every stage whose producer runs without a live capture or a model, through the shipping producer function itself |
 
-`producerPath` is zero for every field, and the matrix says so. The corpus is deliberately
-employer-neutral and runs no stage: it proves the boundary machinery handles every declared
-shape, not that each stage actually emits those shapes.
+`producerPath` is evidence of execution, and the evidence is the census, not the call. Every
+assertion records the element count the boundary judged for each declared collection field,
+and the cell is classified from that count, so "a validator returned successfully" is never
+enough on its own. Deleting a producer's validation call turns the cell into a gap rather
+than leaving it green.
+
+| Status | Cells | Meaning |
+|---|---:|---|
+| `producerCensusMatched` | 889 | The shipping producer ran and the boundary judged a census whose element count equals the cardinality the harness constructed |
+| `producerCensusReshaped` | 231 | The shipping producer ran and the boundary judged its census, but the count differs because the producer legitimately deduplicates, unions, or folds; `producerObservedCensus` records what the boundary saw |
+| `boundaryRefusal` | 472 | Not a census: the null-vs-missing and wrong-scalar variants are shapes a producer must never publish, and the evidence is the boundary refusing them **by name** before any consumer runs |
+| `boundaryOnly` | 60 | The registered boundary ran through the production builder, but the producing function needs a live capture |
+| `gap` | 0 | Neither ran |
+
+The refusal cells are deliberately not folded into the producer-published total. Refusing a
+collapse and publishing a census are different facts, and a summary that added them together
+would claim 1592 producer-driven cardinalities where only 1120 exist.
+
+Four residuals are published rather than rounded away:
+
+- **`boundaryOnly` (60 cells).** The capture stage's producer authenticates a sealed on-disk
+  transcript package that only a live acquisition can mint. Its twelve rows are driven
+  through the same registered boundary the producer calls, but not through the producer
+  itself, and `producerResidual` on those rows says so.
+- **`stageBoundaryEquivalent` (230 of 236 rows).** Most inventoried fields are internal
+  collections inside a stage rather than the stage's published census. They are covered
+  through the boundary their stage publishes through — production-equivalent, and driven by
+  production code — but not through their own call site. Only 6 rows are `direct`.
+- **Test-only reach (112 rows).** `producerProductionReachable` is scanned, not asserted: a
+  producer that nothing under `src/` calls today is in force where it stands, but it is not
+  yet on a live coordinator path. `producerProductionCallers` lists the shipping files that
+  do call it.
+- **Census, not pipeline unrolling.** `producerCensusMatched` is evidence about what the
+  boundary judged, which is where the collapse this corpus exists to catch happens. It is not
+  a claim about what PowerShell's pipeline does to the producer's `return` statement: a
+  function returning an array still unrolls, so a caller that assigns without `@()` sees
+  `$null` for zero elements and a scalar for one. That is unchanged from the base commit,
+  is what the repository's own `PSEN004` debt of 0 records as materialized, and is handled
+  at the call sites. Closing it would mean rewriting the return convention of every producer,
+  which this change deliberately does not do.
+
+Because these residuals are non-zero, `fullCoverageClaimed` stays `false`. The corpus is still
+employer-neutral: every producer above is called with synthetic, production-shaped input, and
+no model, session, or external write is involved.
 
 Closing that dimension does **not** uniformly require models, and it would be convenient but
 untrue to say so. Most of the inventoried boundaries are deterministic — parsers,

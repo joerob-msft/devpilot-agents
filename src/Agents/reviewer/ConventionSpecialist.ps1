@@ -2,6 +2,21 @@
 
 Set-StrictMode -Version Latest
 
+# The twelve stage producer boundaries are declared in one shared file, so a
+# stage and the corpus that drives it can never exercise two different copies of
+# the same contract.
+#
+# The guard asks whether THIS script scope already holds the producer table, not
+# whether the commands are merely visible. A dot-sourced library resolves
+# $script: variables against the scope of whoever is running it, so a script that
+# can see an outer scope's functions but never loaded the libraries itself would
+# reach a registry that does not exist there - and it would only find out at the
+# first boundary call, which is exactly the call that must not fail for the wrong
+# reason.
+if (-not (Get-Variable -Name 'ReviewerStageProducerContracts' -Scope Script -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot 'StageProducers.ps1')
+}
+
 $script:ReviewerConventionSpecialistMarkerPrefix = "CONVENTION_REVIEW_RESULT_V2:"
 $script:ReviewerConventionSpecialistArtifactKind = "convention-specialist-preview"
 $script:ReviewerConventionSpecialistArtifactVersion = 2
@@ -391,6 +406,31 @@ $script:ReviewerConventionSpecialistConstructPrefixes = @{
     invocation = "mi"; declaration = "dc"; comment = "cm"; assignment = "as"
 }
 
+function New-ReviewerConventionSpecialistConstructIdResult {
+    <#
+        The blind-results stage boundary for one accounted construct-id field.
+
+        Every exit from the id reader goes through here, including the
+        unreadable ones: an empty id list is exactly the shape that turned a
+        sealed anchor set into "every anchor is missing a verdict", so it has to
+        be judged rather than waved through because it carries no elements. The
+        judged payload is what the caller's answer is built from, so removing
+        the boundary removes the answer with it.
+    #>
+    param(
+        [Parameter(Mandatory)][bool]$Ok,
+        [Parameter(Mandatory)][AllowNull()]$Ids,
+        [Parameter(Mandatory)][AllowNull()]$Duplicated
+    )
+
+    $asserted = New-ReviewerBlindResultsStageContract -ConstructIds $Ids -DuplicatedConstructIds $Duplicated
+    return @{
+        Ok = $Ok
+        Ids = [object[]]$asserted.constructIds
+        Duplicated = [object[]]$asserted.duplicatedConstructIds
+    }
+}
+
 function Expand-ReviewerConventionSpecialistConstructIds {
     <#
         Reads a construct-id list that may use inclusive ranges - `mi0-mi37` for
@@ -417,17 +457,17 @@ function Expand-ReviewerConventionSpecialistConstructIds {
     $scanCeiling = $MaxIds * 4
     foreach ($part in @(($Text -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
         $match = [regex]::Match($part, '^([a-z]{2})([0-9]{1,3})(?:-([a-z]{2})([0-9]{1,3}))?$')
-        if (-not $match.Success) { return @{ Ok = $false; Ids = @(); Duplicated = @() } }
+        if (-not $match.Success) { return New-ReviewerConventionSpecialistConstructIdResult -Ok $false -Ids ([object[]]@()) -Duplicated ([object[]]@()) }
         $prefix = $match.Groups[1].Value
         if (@($script:ReviewerConventionSpecialistConstructPrefixes.Values) -cnotcontains $prefix) {
-            return @{ Ok = $false; Ids = @(); Duplicated = @() }
+            return New-ReviewerConventionSpecialistConstructIdResult -Ok $false -Ids ([object[]]@()) -Duplicated ([object[]]@())
         }
         $first = [int]$match.Groups[2].Value
         $last = $first
         if ($match.Groups[3].Success) {
-            if ($match.Groups[3].Value -cne $prefix) { return @{ Ok = $false; Ids = @(); Duplicated = @() } }
+            if ($match.Groups[3].Value -cne $prefix) { return New-ReviewerConventionSpecialistConstructIdResult -Ok $false -Ids ([object[]]@()) -Duplicated ([object[]]@()) }
             $last = [int]$match.Groups[4].Value
-            if ($last -lt $first) { return @{ Ok = $false; Ids = @(); Duplicated = @() } }
+            if ($last -lt $first) { return New-ReviewerConventionSpecialistConstructIdResult -Ok $false -Ids ([object[]]@()) -Duplicated ([object[]]@()) }
         }
         for ($index = $first; $index -le $last; $index++) {
             # Two ceilings, because they catch different shapes. `MaxIds`
@@ -438,7 +478,7 @@ function Expand-ReviewerConventionSpecialistConstructIds {
             # full - 1.6 seconds per call, three times over if the specialist
             # retries.
             if ($ids.Count -ge $MaxIds -or $scanned -ge $scanCeiling) {
-                return @{ Ok = $false; Ids = @(); Duplicated = @() }
+                return New-ReviewerConventionSpecialistConstructIdResult -Ok $false -Ids ([object[]]@()) -Duplicated ([object[]]@())
             }
             $scanned++
             $id = "$prefix$index"
@@ -450,7 +490,7 @@ function Expand-ReviewerConventionSpecialistConstructIds {
             elseif ($duplicatedSeen.Add($id)) { [void]$duplicated.Add($id) }
         }
     }
-    return @{ Ok = $true; Ids = @($ids.ToArray()); Duplicated = @($duplicated.ToArray()) }
+    return New-ReviewerConventionSpecialistConstructIdResult -Ok $true -Ids $ids -Duplicated $duplicated
 }
 
 function Get-ReviewerConventionSpecialistShortened {
