@@ -38,6 +38,11 @@ $ProgressPreference = 'SilentlyContinue'
 
 $script:ShadowChildResultContract = 'devpilot.shadow-run-coordinator.child-result.v1'
 $script:ShadowChildRequestContract = 'devpilot.shadow-run-coordinator.child-request.v1'
+# The two versioned files the reconciliation step exchanges with its caller. They
+# are named here rather than at their use sites so the writer and the reader can
+# never drift onto different versions of the same document.
+$script:ShadowReconciliationRequestVersion = 'devpilot.shadow-run-coordinator.reconciliation-request.v1'
+$script:ShadowReconciliationSummaryVersion = 'devpilot.shadow-run-coordinator.reconciliation-summary.v1'
 $script:ShadowChildUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
 
 function Read-ShadowChildRequest {
@@ -615,6 +620,30 @@ function Get-ShadowChildSlotContext {
         throw "Slot '$slotName' is not part of this $($plan.SlotCount)-slot plan."
     }
 
+    # The caller may declare, opaquely, which sealed arguments this slot must
+    # have been planned with. The strings are never interpreted here either -
+    # they are matched against the slot's own sealed argv, which the plan digest
+    # covers. That makes the declaration a BINDING rather than an instruction:
+    # the caller cannot choose what the slot runs, only refuse to proceed if the
+    # reviewed plan did not already choose what the caller expected.
+    $bindSealed = Get-ShadowChildField -Request $Request -Name 'bindSealedArguments' -Type bool
+    if ($bindSealed) {
+        $declaredArguments = @(Get-ShadowChildField -Request $Request -Name 'opaqueSlotArguments' -Type array)
+        if (@($declaredArguments).Count -eq 0) {
+            throw "Slot '$slotName' asks to bind sealed arguments and declares none."
+        }
+        $sealedArguments = @(@($target.Arguments) | ForEach-Object { [string]$_ })
+        foreach ($declared in $declaredArguments) {
+            if ($sealedArguments -cnotcontains [string]$declared) {
+                # The value is not echoed. A caller that guessed wrongly learns
+                # that it guessed wrongly, and a log of this refusal does not
+                # become a record of what was guessed.
+                throw ("Slot '$slotName' was declared with an argument the reviewed plan did not seal for it, " +
+                    "so the plan the caller expected is not the plan this set was declared under.")
+            }
+        }
+    }
+
     $compareTool = Join-Path $ToolkitRoot 'tools\Compare-ReviewerReplayRuns.ps1'
     $keyPath = Get-ShadowChildField -Request $Request -Name 'runSetKeyPath'
     $verified = Get-VerifiedRunSetDeclaration -RunSetDirectory $runSetDirectory `
@@ -845,6 +874,520 @@ function Invoke-ShadowChildSlotVerify {
     }
 }
 
+function Get-ShadowChildReplayDerivedKey {
+    <#
+    .SYNOPSIS
+        The replay-domain key for one signing key file, so a sealed comparison
+        can be opened rather than merely parsed.
+    .DESCRIPTION
+        The chain this walks - key file, replay artifact domain, then the preview
+        domain the envelope is signed under - is pinned by the seal-parity vector
+        'replay-runset-domain-chain', so a divergence between this derivation and
+        the one the comparison sealed with is a failing parity vector rather than
+        a signature error nobody can explain. Read-only: the reviewer's own
+        reader mints a key when the file is absent, and a comparison verified
+        against a freshly-invented key would have verified nothing.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    # A signing key is 32 bytes plus a short format prefix; reading an operator
+    # typo that happens to be a gigabyte helps nobody. The size is taken through
+    # [IO.FileInfo] rather than Get-Item so no command result is assigned and
+    # then measured, which is the flattening shape PSEN009 exists to refuse.
+    $info = [IO.FileInfo]::new($Path)
+    if (-not $info.Exists) { throw "The signing key at '$Path' does not exist." }
+    if ($info.Length -gt 8192) {
+        throw "The signing key at '$Path' is $($info.Length) bytes; a key file is a single short line."
+    }
+    $line = ([IO.File]::ReadAllText($Path)).Trim()
+    $format = $(if ($IsWindows) { 'dpapi' } else { 'raw' })
+    $separator = $line.IndexOf(':')
+    if ($separator -gt 0) {
+        $format = $line.Substring(0, $separator)
+        $line = $line.Substring($separator + 1)
+    }
+    $stored = [Convert]::FromBase64String($line)
+    $master = switch ($format) {
+        'raw' { $stored }
+        'dpapi' {
+            try {
+                [Security.Cryptography.ProtectedData]::Unprotect(
+                    $stored, $null, [Security.Cryptography.DataProtectionScope]::CurrentUser)
+            }
+            catch { throw "The signing key at '$Path' could not be decrypted for this user." }
+        }
+        default { throw "The signing key at '$Path' declares an unknown storage format '$format'." }
+    }
+    if ($master.Length -lt 32) { throw "Artifact signing key '$Path' is too short." }
+    $hmac = [Security.Cryptography.HMACSHA256]::new($master)
+    try { return , $hmac.ComputeHash([Text.UTF8Encoding]::new($false).GetBytes('devpilot.reviewer.replay.artifact.v1')) }
+    finally { $hmac.Dispose() }
+}
+
+function Get-ShadowChildReconcileContext {
+    <#
+    .SYNOPSIS
+        Rebuilds the reviewed plan for the whole declared set and puts it through
+        the production readiness gate.
+    .DESCRIPTION
+        Every judgement is the reviewed code's. This function verifies the sealed
+        declaration under its key, confirms the published inventory, reproduces
+        the plan digest the set was sealed under, and requires every slot to have
+        completed with no live child - all through
+        Assert-ReviewerQualificationSetReconcilable, which is the same gate the
+        qualification tool's own -Mode Reconcile calls. What is added here is the
+        locating of each slot's sealed run artifact and signing key, so the
+        comparison runs over the runs this set declared rather than over whatever
+        happens to be on disk.
+    #>
+    param([Parameter(Mandatory)]$Request, [Parameter(Mandatory)][string]$ToolkitRoot)
+
+    $qualificationRoot = Get-ShadowChildField -Request $Request -Name 'qualificationRoot'
+    $requiredRunCount = Get-ShadowChildField -Request $Request -Name 'requiredRunCount' -Type int
+    $outputDirectory = Get-ShadowChildField -Request $Request -Name 'reconciliationOutputDirectory'
+    $reviewerScriptPath = Get-ShadowChildOptionalField -Request $Request -Name 'reviewerScriptPath'
+    if (-not $reviewerScriptPath) {
+        $reviewerScriptPath = Join-Path $ToolkitRoot 'src\Agents\reviewer\Start-ReviewerAgent.ps1'
+    }
+    $runSetDirectory = Join-Path $qualificationRoot 'runset'
+    # Reconciliation holds no authorization of its own; it reads the token the
+    # published set carries. The caller still presents the token it was given, so
+    # a caller acting on a set other than the one it was authorized for is
+    # refused here rather than discovered afterwards in the plan digest.
+    $publishedToken = Assert-ReviewerQualificationPublishedInventory -RunSetDirectory $runSetDirectory
+    $tokenPath = Get-ShadowChildField -Request $Request -Name 'launchAuthorizationTokenPath'
+    if (-not (Test-Path -LiteralPath $tokenPath -PathType Leaf)) {
+        throw "The launch-authorization token '$tokenPath' does not exist."
+    }
+    $presentedToken = ([IO.File]::ReadAllText($tokenPath)).Trim()
+    if ($presentedToken -cne $publishedToken) {
+        throw ('The launch-authorization token presented for this reconciliation is not the token the published ' +
+            'run set carries, so the plan it was sealed under cannot be reproduced.')
+    }
+    $launchHash = Get-ReviewerQualificationLaunchTokenHash -Token $publishedToken
+
+    $plan = New-ReviewerReplayQualificationPlan `
+        -RepoPath (Get-ShadowChildField -Request $Request -Name 'reviewerRepositoryPath') `
+        -ConfigFile (Get-ShadowChildField -Request $Request -Name 'reviewerConfigPath') `
+        -OperatorAlias (Get-ShadowChildField -Request $Request -Name 'operatorAlias') `
+        -PullRequestId (Get-ShadowChildField -Request $Request -Name 'pullRequestId' -Type int) `
+        -ReplayRoot (Get-ShadowChildField -Request $Request -Name 'replayRoot') `
+        -ReplaySnapshotName (Get-ShadowChildField -Request $Request -Name 'snapshotName') `
+        -ReplayManifestDigest (Get-ShadowChildField -Request $Request -Name 'manifestDigest') `
+        -QualificationRoot $qualificationRoot `
+        -ReviewerScriptPath $reviewerScriptPath `
+        -ToolkitRepositoryPath '' `
+        -ExpectedCommit (Get-ShadowChildField -Request $Request -Name 'expectedCommit') `
+        -RequiredRef (Get-ShadowChildField -Request $Request -Name 'requiredRef') `
+        -SlotCount (Get-ShadowChildField -Request $Request -Name 'plannedRunCount' -Type int) `
+        -LaunchAuthorizationHash $launchHash
+    if ([int]$plan.SlotCount -ne $requiredRunCount) {
+        throw "The reconciliation was asked for $requiredRunCount run(s) and the plan declares $([int]$plan.SlotCount)."
+    }
+
+    $compareTool = Join-Path $ToolkitRoot 'tools\Compare-ReviewerReplayRuns.ps1'
+    $keyPath = Get-ShadowChildField -Request $Request -Name 'runSetKeyPath'
+    # The shared readiness gate, which throws unless every slot completed and no
+    # recorded child is alive. Reaching the next line is the whole of this
+    # adapter's claim that the set is reconcilable.
+    $reconciled = Assert-ReviewerQualificationSetReconcilable -Plan $plan `
+        -CompareTool $compareTool -RunSetKeyPath $keyPath
+    $setId = [string]$reconciled.Declaration.setId
+    $planDigest = [string]$reconciled.Declaration.planDigest
+
+    $expectedPlanDigest = Get-ShadowChildOptionalField -Request $Request -Name 'expectedPlanDigest'
+    if ($expectedPlanDigest -and $expectedPlanDigest -cne $planDigest) {
+        throw "The verified declaration seals plan '$planDigest' and the caller authorized '$expectedPlanDigest'."
+    }
+    $expectedSetId = Get-ShadowChildOptionalField -Request $Request -Name 'expectedSetId'
+    if ($expectedSetId -and $expectedSetId -cne $setId) {
+        throw "The published run set is '$setId' and the caller authorized '$expectedSetId'."
+    }
+
+    # The gate above already refused anything but exactly one sealed declaration
+    # under this directory, so naming it here cannot pick between candidates.
+    $declarationPaths = @(Get-ChildItem -LiteralPath $runSetDirectory -Filter 'runset-*.json' -File `
+            -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '*.sig' } | ForEach-Object { $_.FullName })
+    if (@($declarationPaths).Count -ne 1) {
+        throw "Expected exactly one sealed run-set declaration under '$runSetDirectory'; found $(@($declarationPaths).Count)."
+    }
+
+    # One sealed run artifact per slot, and exactly one. A slot directory holding
+    # two would leave the comparison to choose, and a comparison that chose which
+    # of a run's artifacts to believe would be making the very judgement this
+    # whole path exists to keep out of the caller.
+    $artifactPaths = @()
+    $keyPaths = @()
+    foreach ($slot in @($plan.Slots)) {
+        $previewDirectory = Join-Path ([string]$slot.StateDir) 'convention-specialist-previews'
+        $found = @()
+        if (Test-Path -LiteralPath $previewDirectory -PathType Container) {
+            $found = @(Get-ChildItem -LiteralPath $previewDirectory -Filter '*.json' -File -ErrorAction SilentlyContinue |
+                    Sort-Object -Property Name | ForEach-Object { $_.FullName })
+        }
+        if (@($found).Count -ne 1) {
+            throw ("Slot '$($slot.Name)' offers $(@($found).Count) sealed run artifact(s) under '$previewDirectory'; " +
+                'a reconciliation compares exactly one run per slot.')
+        }
+        $slotKeyPath = Join-Path ([string]$slot.StateDir) 'artifact-signing.key'
+        if (-not (Test-Path -LiteralPath $slotKeyPath -PathType Leaf)) {
+            throw "Slot '$($slot.Name)' has no artifact signing key at '$slotKeyPath', so its run artifact cannot be opened."
+        }
+        $artifactPaths += @($found)[0]
+        $keyPaths += $slotKeyPath
+    }
+
+    return @{
+        Plan = $plan
+        PlanDigest = $planDigest
+        SetId = $setId
+        RunSetDirectory = $runSetDirectory
+        RunSetPath = [string]@($declarationPaths)[0]
+        RunSetKeyPath = $keyPath
+        CompareTool = $compareTool
+        OutputDirectory = $outputDirectory
+        RequiredRunCount = $requiredRunCount
+        ArtifactPaths = @($artifactPaths)
+        KeyPaths = @($keyPaths)
+        AttemptPath = (Join-Path $outputDirectory 'reconcile-attempt.json')
+        ReconciledSlots = @($reconciled.Slots)
+    }
+}
+
+function Invoke-ShadowChildReconcilePlan {
+    <#
+    .SYNOPSIS
+        Reports the comparison a reconciliation would run, and whether its single
+        authorization is still available. Compares nothing.
+    #>
+    param([Parameter(Mandatory)]$Request, [Parameter(Mandatory)][string]$ToolkitRoot)
+    Import-Module (Join-Path $ToolkitRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force -ErrorAction Stop
+    . (Join-Path $ToolkitRoot 'src\Agents\reviewer\QualificationPreflight.ps1')
+    . (Join-Path $ToolkitRoot 'src\Agents\reviewer\ReplayQualification.ps1')
+    $context = Get-ShadowChildReconcileContext -Request $Request -ToolkitRoot $ToolkitRoot
+    $plan = $context.Plan
+    $perCallTimeoutSeconds = [Math]::Max(
+        (Get-ShadowChildArgumentValue -Argv @($plan.Slots)[0].Arguments -Name '-CycleTimeoutSeconds'),
+        [Math]::Max(
+            (Get-ShadowChildArgumentValue -Argv @($plan.Slots)[0].Arguments -Name '-ConventionSpecialistTimeoutSeconds'),
+            (Get-ShadowChildArgumentValue -Argv @($plan.Slots)[0].Arguments -Name '-VerificationTimeoutSeconds')))
+    return @{
+        setId = $context.SetId
+        planDigest = $context.PlanDigest
+        requiredRunCount = [int]$context.RequiredRunCount
+        artifactCount = @($context.ArtifactPaths).Count
+        outputDirectory = [string]$context.OutputDirectory
+        reconciliationAttemptExists = [bool](Test-Path -LiteralPath $context.AttemptPath)
+        # Reaching this line means the shared readiness gate accepted the set; it
+        # throws rather than returning a false.
+        reconciliationReady = $true
+        slotTimeoutSeconds = [int]$plan.SlotTimeoutSeconds
+        progressTimeoutSeconds = [int]$plan.ProgressTimeoutSeconds
+        perCallTimeoutSeconds = $perCallTimeoutSeconds
+        head = [string]$plan.GitIdentity.head
+        requiredRef = [string]$plan.GitIdentity.requiredRef
+        headClean = [bool]$plan.GitIdentity.clean
+        deliveryMode = [string]$plan.DeliveryMode
+        promotable = [bool]$plan.Promotable
+    }
+}
+
+function Invoke-ShadowChildReconcileRun {
+    <#
+    .SYNOPSIS
+        Runs the production comparison over the declared set exactly once, and
+        writes the versioned summary its caller reads.
+    .DESCRIPTION
+        -FailOnDisagreement is deliberately NOT passed. Turning disagreement into
+        a non-zero exit would hand the caller a reading of the runs, and the
+        caller is a program that must never form one. The exit code travels as an
+        opaque number instead, and the comparison's own sealed artifact is the
+        record of what it found.
+    #>
+    param([Parameter(Mandatory)]$Request, [Parameter(Mandatory)][string]$ToolkitRoot)
+    Import-Module (Join-Path $ToolkitRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force -ErrorAction Stop
+    . (Join-Path $ToolkitRoot 'src\Agents\reviewer\QualificationPreflight.ps1')
+    . (Join-Path $ToolkitRoot 'src\Agents\reviewer\ReplayQualification.ps1')
+    $context = Get-ShadowChildReconcileContext -Request $Request -ToolkitRoot $ToolkitRoot
+
+    $reconcileInput = Read-ShadowChildReconcileInput -Request $Request -Context $context
+
+    if (-not (Test-Path -LiteralPath $context.OutputDirectory -PathType Container)) {
+        [void](New-Item -ItemType Directory -Force -Path $context.OutputDirectory)
+    }
+    # The attempt record is made with CreateNew before anything runs, so a
+    # second comparison of the same set is refused by the file system rather
+    # than by a check that a racing process could pass at the same instant.
+    $attemptJson = ConvertTo-Json -InputObject ([ordered]@{
+            kind = 'devpilot.shadow-run-coordinator.reconcile-attempt.v1'
+            correlationId = [string]$Request.correlationId
+            setId = $context.SetId
+            planDigest = $context.PlanDigest
+            recordedAtUtc = [DateTime]::UtcNow.ToString('o')
+        }) -Depth 5
+    try {
+        $attemptStream = [IO.File]::Open($context.AttemptPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    }
+    catch [IO.IOException] {
+        throw ("This set has already been reconciled: '$($context.AttemptPath)' exists. A reconciliation is consumed " +
+            'when it is attempted, whether or not it finished.')
+    }
+    try {
+        $attemptBytes = [Text.UTF8Encoding]::new($false).GetBytes($attemptJson)
+        $attemptStream.Write($attemptBytes, 0, $attemptBytes.Length)
+    }
+    finally { $attemptStream.Dispose() }
+    Set-ItemProperty -LiteralPath $context.AttemptPath -Name IsReadOnly -Value $true
+
+    $before = @(Get-ChildItem -LiteralPath $context.OutputDirectory -Filter 'reconciliation-*' -File `
+            -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+
+    $global:LASTEXITCODE = 0
+    & $context.CompareTool -ArtifactPath @($context.ArtifactPaths) -KeyPath @($context.KeyPaths) `
+        -RunSetPath $context.RunSetPath -RunSetKeyPath $context.RunSetKeyPath `
+        -RequiredRunCount ([int]$context.RequiredRunCount) -OutputDirectory $context.OutputDirectory | Out-Null
+    $comparisonExitCode = if ($null -eq $global:LASTEXITCODE) { -1 } else { [int]$global:LASTEXITCODE }
+
+    $after = @(Get-ChildItem -LiteralPath $context.OutputDirectory -Filter 'reconciliation-*' -File `
+            -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    $produced = @($after | Where-Object { $before -notcontains $_ })
+    $reportPath = @($produced | Where-Object { $_ -like '*.md' })
+    $artifactPath = @($produced | Where-Object { $_ -like '*.json' })
+    if (@($reportPath).Count -ne 1 -or @($artifactPath).Count -ne 1) {
+        throw ("The comparison produced $(@($reportPath).Count) report(s) and $(@($artifactPath).Count) sealed " +
+            "artifact(s) under '$($context.OutputDirectory)'; exactly one of each is the contract.")
+    }
+
+    $summary = [ordered]@{
+        contractVersion = $script:ShadowReconciliationSummaryVersion
+        kind = 'shadow-run-coordinator-reconciliation-summary'
+        correlationId = [string]$Request.correlationId
+        reconciliationRequestSha256 = [string]$reconcileInput.RequestSha256
+        setId = $context.SetId
+        planDigest = $context.PlanDigest
+        requiredRunCount = [int]$context.RequiredRunCount
+        comparisonExitCode = $comparisonExitCode
+        reportPath = [string]@($reportPath)[0]
+        artifactPath = [string]@($artifactPath)[0]
+        generatedAtUtc = [DateTime]::UtcNow.ToString('o')
+    }
+    $summaryPath = [string]$reconcileInput.SummaryPath
+    $summaryDirectory = Split-Path -Parent $summaryPath
+    if ($summaryDirectory -and -not (Test-Path -LiteralPath $summaryDirectory -PathType Container)) {
+        [void](New-Item -ItemType Directory -Force -Path $summaryDirectory)
+    }
+    $summaryText = ConvertTo-Json -InputObject $summary -Depth 6
+    [IO.File]::WriteAllText($summaryPath, $summaryText, [Text.UTF8Encoding]::new($false))
+    $summaryBytes = [IO.File]::ReadAllBytes($summaryPath)
+    $reportBytes = [IO.File]::ReadAllBytes(@($reportPath)[0])
+    $artifactBytes = [IO.File]::ReadAllBytes(@($artifactPath)[0])
+
+    return @{
+        summaryWritten = $true
+        summaryPath = $summaryPath
+        summarySha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($summaryBytes)).ToLowerInvariant()
+        comparisonExitCode = $comparisonExitCode
+        setId = $context.SetId
+        planDigest = $context.PlanDigest
+        # Digested where they were produced, so the caller can pin them now and
+        # require the verification step to have read these exact bytes rather
+        # than whatever stands at the same paths by then.
+        reportPath = [string]@($reportPath)[0]
+        reportSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($reportBytes)).ToLowerInvariant()
+        artifactPath = [string]@($artifactPath)[0]
+        artifactSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($artifactBytes)).ToLowerInvariant()
+    }
+}
+
+function Invoke-ShadowChildReconcileVerify {
+    <#
+    .SYNOPSIS
+        Opens the sealed comparison under its key and reports its status, its
+        digests and a census of its own numbers.
+    .DESCRIPTION
+        No finding identity, no finding text, no severity and no verdict crosses
+        this boundary. What the caller receives is the reconciliation's own
+        outcome digest, the digests of the two files it produced, and a list of
+        named counts it may carry without being able to reason about any of them.
+    #>
+    param([Parameter(Mandatory)]$Request, [Parameter(Mandatory)][string]$ToolkitRoot)
+    Import-Module (Join-Path $ToolkitRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force -ErrorAction Stop
+    . (Join-Path $ToolkitRoot 'src\Agents\reviewer\QualificationPreflight.ps1')
+    . (Join-Path $ToolkitRoot 'src\Agents\reviewer\ReplayQualification.ps1')
+    # The comparison's own sources, loaded so its artifact is opened with the
+    # primitives that sealed it. Re-deriving an HMAC here would be a second
+    # implementation of the seal, and a second implementation is a second thing
+    # that can disagree with the first.
+    . (Join-Path $ToolkitRoot 'src\Agents\reviewer\SourceTransport.ps1')
+    . (Join-Path $ToolkitRoot 'src\Agents\reviewer\ConventionSpecialist.ps1')
+    . (Join-Path $ToolkitRoot 'src\Agents\reviewer\CrossVerification.ps1')
+    . (Join-Path $ToolkitRoot 'src\Agents\reviewer\RunReconciliation.ps1')
+    $context = Get-ShadowChildReconcileContext -Request $Request -ToolkitRoot $ToolkitRoot
+
+    $summaryPath = Get-ShadowChildField -Request $Request -Name 'summaryPath'
+    if (-not (Test-Path -LiteralPath $summaryPath -PathType Leaf)) {
+        throw "The reconciliation summary '$summaryPath' does not exist."
+    }
+    $summaryBytes = [IO.File]::ReadAllBytes($summaryPath)
+    $summary = [Text.UTF8Encoding]::new($false).GetString($summaryBytes) | ConvertFrom-Json
+    foreach ($name in @('contractVersion', 'setId', 'planDigest', 'requiredRunCount', 'reportPath', 'artifactPath')) {
+        if (-not $summary.PSObject.Properties[$name]) {
+            throw "The reconciliation summary at '$summaryPath' is missing '$name'."
+        }
+    }
+    if ([string]$summary.contractVersion -cne $script:ShadowReconciliationSummaryVersion) {
+        throw "The reconciliation summary at '$summaryPath' declares contract '$([string]$summary.contractVersion)'."
+    }
+    if ([string]$summary.setId -cne $context.SetId) {
+        throw "The reconciliation summary names run set '$([string]$summary.setId)', not '$($context.SetId)'."
+    }
+    if ([string]$summary.planDigest -cne $context.PlanDigest) {
+        throw "The reconciliation summary names plan '$([string]$summary.planDigest)', not '$($context.PlanDigest)'."
+    }
+
+    $reportPath = [string]$summary.reportPath
+    $artifactPath = [string]$summary.artifactPath
+    foreach ($produced in @($reportPath, $artifactPath)) {
+        if (-not (Test-Path -LiteralPath $produced -PathType Leaf)) {
+            throw "The reconciliation summary names '$produced', which does not exist."
+        }
+    }
+
+    # Each file is read ONCE, and everything said about it - the signature check,
+    # the parse, the digest returned to the caller - is said about those exact
+    # bytes. Two reads of one path are two different files if anything replaces
+    # it in between, and the digest returned here is what binds this verification
+    # to the artifact the run watched being produced.
+    $artifactBytes = [IO.File]::ReadAllBytes($artifactPath)
+    $reportBytes = [IO.File]::ReadAllBytes($reportPath)
+    $artifactText = ([Text.UTF8Encoding]::new($false, $true)).GetString($artifactBytes)
+    $reportText = ([Text.UTF8Encoding]::new($false, $true)).GetString($reportBytes)
+
+    # Opened with the reviewed primitives under the first run's key, which is the
+    # key the comparison sealed it with. A cleartext read would accept a file
+    # anybody could have written into the output directory afterwards.
+    $masterKey = Get-ShadowChildReplayDerivedKey -Path @($context.KeyPaths)[0]
+    $envelope = $artifactText | ConvertFrom-Json
+    $manifestJson = [string](Get-ReviewerConventionSpecialistValue $envelope 'manifestJson' '')
+    $signature = [string](Get-ReviewerConventionSpecialistValue $envelope 'signature' '')
+    $domainKey = Get-ReviewerConventionSpecialistDomainKey -MasterKey $masterKey -Domain preview
+    if (-not $manifestJson -or -not (Test-ReviewerConventionSpecialistSignature -Json $manifestJson -Key $domainKey -Signature $signature)) {
+        throw "The sealed comparison at '$artifactPath' does not verify under the run set's key."
+    }
+    $manifest = $manifestJson | ConvertFrom-Json -Depth 32
+    if ([string]$manifest.kind -cne $script:ReviewerRunReconciliationKind) {
+        throw "The sealed comparison at '$artifactPath' declares kind '$([string]$manifest.kind)'."
+    }
+    # The declaration lives INSIDE the seal, and this is where it earns its
+    # place. Without these three checks the only thing tying the artifact to
+    # this run set is the unsealed summary that named its path, so a different
+    # comparison sealed under the same key - another set's, or an earlier one's -
+    # would be read and reported as this set's outcome.
+    $sealedQualification = $manifest.qualification
+    if ($null -eq $sealedQualification) {
+        throw "The sealed comparison at '$artifactPath' carries no qualification, so it cannot be shown to be this run set's."
+    }
+    if ([string]$sealedQualification.setId -cne $context.SetId) {
+        throw "The sealed comparison at '$artifactPath' is for run set '$([string]$sealedQualification.setId)', not '$($context.SetId)'."
+    }
+    if ([int]$sealedQualification.plannedRunCount -ne [int]$context.RequiredRunCount) {
+        throw ("The sealed comparison at '$artifactPath' declares $([int]$sealedQualification.plannedRunCount) planned run(s) " +
+            "and this set plans $([int]$context.RequiredRunCount).")
+    }
+    # The Markdown is not signed, but its digest is - so the report is read back
+    # and hashed with the same primitive the comparison sealed it with. A report
+    # rewritten after the comparison is refused here rather than reported.
+    if ([string]$manifest.reportPath -cne [string]$reportPath) {
+        throw "The sealed comparison names its report '$([string]$manifest.reportPath)' and the summary names '$reportPath'."
+    }
+    $sealedReportSha = Get-ReviewerConventionSpecialistSha256 -Text $reportText
+    if ([string]$manifest.reportSha256 -cne [string]$sealedReportSha) {
+        throw "The comparison report at '$reportPath' digests to $sealedReportSha and its seal binds $([string]$manifest.reportSha256)."
+    }
+    $reconciliation = $manifest.reconciliation
+    if ($null -eq $reconciliation) {
+        throw "The sealed comparison at '$artifactPath' carries no reconciliation."
+    }
+
+    return @{
+        summarySha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($summaryBytes)).ToLowerInvariant()
+        # The comparison's own words, passed through. This adapter does not decide
+        # whether a set reconciled; it reports what the reviewed code decided.
+        reconciliationStatus = [string]$(if ([bool]$reconciliation.reconciled) { 'reconciled' } else { 'unreconciled' })
+        reconciliationSha256 = [string]$reconciliation.reconciliationSha256
+        reportPath = [string]$reportPath
+        reportSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($reportBytes)).ToLowerInvariant()
+        artifactPath = [string]$artifactPath
+        artifactSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($artifactBytes)).ToLowerInvariant()
+        artifactSignatureVerified = $true
+        artifactPromotable = [bool]$manifest.promotable
+        runCount = [int]$reconciliation.runCount
+        requiredRunCount = [int]$reconciliation.requiredRunCount
+        setId = $context.SetId
+        planDigest = $context.PlanDigest
+        # A census, in a fixed order, of numbers the comparison computed. The
+        # names are labels for a human reading the audit; the caller carries them
+        # without being able to act on any of them.
+        counts = @(
+            [ordered]@{ name = 'runs'; value = [int]$reconciliation.runCount }
+            [ordered]@{ name = 'requiredRuns'; value = [int]$reconciliation.requiredRunCount }
+            [ordered]@{ name = 'stableRows'; value = [int]$reconciliation.stableRowCount }
+            [ordered]@{ name = 'unstableRows'; value = [int]$reconciliation.unstableRowCount }
+            [ordered]@{ name = 'agreedCandidates'; value = [int]$reconciliation.agreedCandidateCount }
+            [ordered]@{ name = 'candidates'; value = @($reconciliation.candidates).Count }
+            [ordered]@{ name = 'problems'; value = @($reconciliation.problems).Count }
+        )
+    }
+}
+
+function Read-ShadowChildReconcileInput {
+    <#
+    .SYNOPSIS
+        Reads the caller's strict versioned reconciliation input and binds it to
+        this set.
+    #>
+    param([Parameter(Mandatory)]$Request, [Parameter(Mandatory)]$Context)
+    $inputPath = Get-ShadowChildField -Request $Request -Name 'reconciliationRequestPath'
+    $expectedSha = Get-ShadowChildField -Request $Request -Name 'reconciliationRequestSha256'
+    if (-not (Test-Path -LiteralPath $inputPath -PathType Leaf)) {
+        throw "The reconciliation input '$inputPath' does not exist."
+    }
+    $text = [IO.File]::ReadAllText($inputPath, [Text.UTF8Encoding]::new($false))
+    $document = $text | ConvertFrom-Json
+    foreach ($name in @('contractVersion', 'correlationId', 'setId', 'planDigest', 'requiredRunCount', 'outputDirectory', 'summaryPath')) {
+        if (-not $document.PSObject.Properties[$name]) {
+            throw "The reconciliation input at '$inputPath' is missing '$name'."
+        }
+    }
+    if ([string]$document.contractVersion -cne $script:ShadowReconciliationRequestVersion) {
+        throw "The reconciliation input at '$inputPath' declares contract '$([string]$document.contractVersion)'."
+    }
+    if ([string]$document.correlationId -cne [string]$Request.correlationId) {
+        throw "The reconciliation input at '$inputPath' belongs to correlation '$([string]$document.correlationId)'."
+    }
+    if ([string]$document.setId -cne $Context.SetId) {
+        throw "The reconciliation input at '$inputPath' names run set '$([string]$document.setId)'."
+    }
+    if ([string]$document.planDigest -cne $Context.PlanDigest) {
+        throw "The reconciliation input at '$inputPath' names plan '$([string]$document.planDigest)'."
+    }
+    if ([int]$document.requiredRunCount -ne [int]$Context.RequiredRunCount) {
+        throw "The reconciliation input at '$inputPath' asks for $([int]$document.requiredRunCount) run(s)."
+    }
+    # Compared over the canonical bytes the caller committed a digest for, so a
+    # file edited between the caller's commit and this read is refused here
+    # rather than acted on.
+    $actualSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+            [IO.File]::ReadAllBytes($inputPath))).ToLowerInvariant()
+    if ($actualSha -cne $expectedSha) {
+        throw ("The reconciliation input at '$inputPath' hashes to $actualSha and the caller committed " +
+            "$expectedSha; the file changed after it was authorized.")
+    }
+    return @{
+        SummaryPath = [string]$document.summaryPath
+        RequestSha256 = $actualSha
+    }
+}
+
 # ---------------------------------------------------------------------------
 # One step, one tool, one result file.
 # ---------------------------------------------------------------------------
@@ -859,20 +1402,39 @@ try {
     if (-not (Test-Path -LiteralPath $toolkitRoot -PathType Container)) {
         throw "The toolkit root '$toolkitRoot' does not exist."
     }
-    $fields = switch ($step) {
-        'stagePreparation' { Invoke-ShadowChildStagePreparation -Request $request -ToolkitRoot $toolkitRoot }
-        'corpusSealValidate' { Invoke-ShadowChildCorpusSeal -Request $request -ToolkitRoot $toolkitRoot }
-        'corpusSeal' { Invoke-ShadowChildCorpusSeal -Request $request -ToolkitRoot $toolkitRoot }
-        'runSetDeclare' { Invoke-ShadowChildRunSetDeclare -Request $request -ToolkitRoot $toolkitRoot }
-        'runSetVerify' { Invoke-ShadowChildRunSetVerify -Request $request -ToolkitRoot $toolkitRoot }
-        'runSetStatus' { Invoke-ShadowChildRunSetStatus -Request $request -ToolkitRoot $toolkitRoot }
-        'slotPlan' { Invoke-ShadowChildSlotPlan -Request $request -ToolkitRoot $toolkitRoot }
+    # The step name carries the slot it acts on, and so does the request. They
+    # have to agree: a request that named slot1 while the caller invoked the
+    # slot2 step would run one slot under the other's exchange file, its nonce
+    # and its adoption scope, and every later check would be self-consistent.
+    if ($step -match '^slot([0-9]+)(Plan|Prelaunch|Run|Verify)\z') {
+        $stepSlotName = "slot$($Matches[1])"
+        $requestSlotName = Get-ShadowChildField -Request $request -Name 'slotName'
+        if ($requestSlotName -cne $stepSlotName) {
+            throw "Step '$step' acts on '$stepSlotName' and the request names slot '$requestSlotName'."
+        }
+    }
+    $fields = switch -Regex ($step) {
+        '^stagePreparation$' { Invoke-ShadowChildStagePreparation -Request $request -ToolkitRoot $toolkitRoot }
+        '^corpusSealValidate$' { Invoke-ShadowChildCorpusSeal -Request $request -ToolkitRoot $toolkitRoot }
+        '^corpusSeal$' { Invoke-ShadowChildCorpusSeal -Request $request -ToolkitRoot $toolkitRoot }
+        '^runSetDeclare$' { Invoke-ShadowChildRunSetDeclare -Request $request -ToolkitRoot $toolkitRoot }
+        '^runSetVerify$' { Invoke-ShadowChildRunSetVerify -Request $request -ToolkitRoot $toolkitRoot }
+        '^runSetStatus$' { Invoke-ShadowChildRunSetStatus -Request $request -ToolkitRoot $toolkitRoot }
+        # One step name per slot, so each slot's derivation, launch and
+        # verification live in their own exchange files. A shared name would let
+        # a result published for one slot be adopted as the other's answer, and
+        # the two would then differ only by whatever the request happened to say.
+        '^slot[0-9]+Plan$' { Invoke-ShadowChildSlotPlan -Request $request -ToolkitRoot $toolkitRoot }
         # The same derivation under a second name. The caller uses it as a probe
         # immediately before the irreversible launch, and a distinct step keeps
         # that probe out of the adoption path the committed plan result lives in.
-        'slotPrelaunch' { Invoke-ShadowChildSlotPlan -Request $request -ToolkitRoot $toolkitRoot }
-        'slotRun' { Invoke-ShadowChildSlotRun -Request $request -ToolkitRoot $toolkitRoot }
-        'slotVerify' { Invoke-ShadowChildSlotVerify -Request $request -ToolkitRoot $toolkitRoot }
+        '^slot[0-9]+Prelaunch$' { Invoke-ShadowChildSlotPlan -Request $request -ToolkitRoot $toolkitRoot }
+        '^slot[0-9]+Run$' { Invoke-ShadowChildSlotRun -Request $request -ToolkitRoot $toolkitRoot }
+        '^slot[0-9]+Verify$' { Invoke-ShadowChildSlotVerify -Request $request -ToolkitRoot $toolkitRoot }
+        '^reconcilePlan$' { Invoke-ShadowChildReconcilePlan -Request $request -ToolkitRoot $toolkitRoot }
+        '^reconcilePrelaunch$' { Invoke-ShadowChildReconcilePlan -Request $request -ToolkitRoot $toolkitRoot }
+        '^reconcileRun$' { Invoke-ShadowChildReconcileRun -Request $request -ToolkitRoot $toolkitRoot }
+        '^reconcileVerify$' { Invoke-ShadowChildReconcileVerify -Request $request -ToolkitRoot $toolkitRoot }
         default { throw "'$step' is not a step this adapter performs." }
     }
     Write-ShadowChildResult -Path $resultPath -CorrelationId $correlationId -Step $step `

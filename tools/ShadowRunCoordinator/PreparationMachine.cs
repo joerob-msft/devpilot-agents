@@ -46,8 +46,42 @@ internal sealed class PreparationMachine(
     private string _sealedManifestDigest = string.Empty;
     private string _sealedSnapshotDigest = string.Empty;
     private string _runSetPath = string.Empty;
-    private SlotPlan? _slotPlan;
+    private readonly Dictionary<int, SlotPlan> _slotPlans = [];
+    private ReconciliationPlan? _reconciliationPlan;
     private CorpusStager? _stager;
+
+    /// <summary>The two slots this coordinator declares, in the only order it runs them.</summary>
+    private static readonly SlotStage Slot1Stage = new(
+        1,
+        CoordinatorRequest.FirstSlotName,
+        PreparationState.Slot1Authorized,
+        PreparationState.Slot1Launching,
+        PreparationState.Slot1Running,
+        PreparationState.Slot1TerminalObserved,
+        PreparationState.Slot1TerminalVerified,
+        PreparationState.Slot1TerminalFailed,
+        PreparationState.Slot1TerminalTimedOut,
+        "slot1Plan",
+        "slot1Prelaunch",
+        "slot1Run",
+        "slot1Verify");
+
+    private static readonly SlotStage Slot2Stage = new(
+        2,
+        CoordinatorRequest.SecondSlotName,
+        PreparationState.Slot2Authorized,
+        PreparationState.Slot2Launching,
+        PreparationState.Slot2Running,
+        PreparationState.Slot2TerminalObserved,
+        PreparationState.Slot2TerminalVerified,
+        PreparationState.Slot2TerminalFailed,
+        PreparationState.Slot2TerminalTimedOut,
+        "slot2Plan",
+        "slot2Prelaunch",
+        "slot2Run",
+        "slot2Verify");
+
+    private static readonly SlotStage[] Stages = [Slot1Stage, Slot2Stage];
 
     /// <summary>
     /// The file name the qualification path publishes its single-use launch
@@ -56,6 +90,15 @@ internal sealed class PreparationMachine(
     private const string PublishedLaunchTokenName = "launch-authorization.token";
 
     /// <summary>Runs until the target state is reached, halting early only when instructed to.</summary>
+    /// <remarks>
+    /// The walk stops of its own accord when a supervised slot records a terminal
+    /// that is not 'complete'. That is not a judgement about the run: it is the
+    /// reviewed set's own rule, which never runs a later slot after a failed or
+    /// timed-out one and never reconciles a partial set. Stopping here rather
+    /// than refusing at the next transition is what lets the audit be written and
+    /// the ending reported, instead of burying the outcome under a contract
+    /// error about a precondition the run was never going to meet.
+    /// </remarks>
     internal void Run(PreparationState target, PreparationState? haltAfter)
     {
         var targetRank = PreparationStateNames.RankOf(target);
@@ -72,6 +115,13 @@ internal sealed class PreparationMachine(
                 _log.WriteLine($"halt-after {PreparationStateNames.ToName(committed)} (correlationId={_request.CorrelationId}, sequence={_state.Sequence.ToString(CultureInfo.InvariantCulture)})");
                 throw new DeliberateHaltException(committed);
             }
+            if (PreparationStateNames.IsUnsuccessfulTerminal(committed))
+            {
+                _log.WriteLine(
+                    $"stop after {PreparationStateNames.ToName(committed)} (correlationId={_request.CorrelationId}): " +
+                    "a set never advances past a slot that did not complete.");
+                break;
+            }
         }
         WriteAudit();
     }
@@ -86,26 +136,35 @@ internal sealed class PreparationMachine(
             RehydrateFor(recorded);
             return recorded;
         }
-        // The terminal rank is the one place where WHICH state gets committed is
+        // A terminal rank is the one place where WHICH state gets committed is
         // not known before the work is done, because it is the supervised run's
         // own artifact that says whether the run completed, failed or timed out.
-        if (rank == PreparationStateNames.TerminalRank)
+        if (SlotStageAtTerminalRank(rank) is { } terminalStage)
         {
-            var (outcome, terminalEvidence, terminalDetail) = VerifySlot1Terminal();
+            var (outcome, terminalEvidence, terminalDetail) = VerifySlotTerminal(terminalStage);
             _log.WriteLine($"enter {PreparationStateNames.ToName(outcome)} (correlationId={_request.CorrelationId})");
             _state.Commit(_request, _stateKey, outcome, terminalEvidence, terminalDetail);
             _log.WriteLine($"commit {PreparationStateNames.ToName(outcome)} sequence={_state.Sequence.ToString(CultureInfo.InvariantCulture)} evidence={_state.EvidenceDigestOf(outcome)} detail={terminalDetail}");
             return outcome;
         }
 
-        // The running state is committed by its own transition, in the middle of
+        // A running state is committed by its own transition, in the middle of
         // it rather than at the end: the identity of a child has to be durable
         // BEFORE the wait that may outlive this process.
-        if (rank == PreparationStateNames.RankOf(PreparationState.Slot1Running))
+        if (SlotStageAtRunningRank(rank) is { } runningStage)
         {
-            _log.WriteLine($"enter slot1Running (correlationId={_request.CorrelationId})");
-            RunSlot1();
-            return PreparationState.Slot1Running;
+            _log.WriteLine($"enter {PreparationStateNames.ToName(runningStage.Running)} (correlationId={_request.CorrelationId})");
+            RunSlot(runningStage);
+            return runningStage.Running;
+        }
+
+        // The comparison is a supervised child too, and is committed the same way
+        // and for the same reason.
+        if (rank == PreparationStateNames.RankOf(PreparationState.ReconciliationRunning))
+        {
+            _log.WriteLine($"enter {PreparationStateNames.ToName(PreparationState.ReconciliationRunning)} (correlationId={_request.CorrelationId})");
+            RunComparison();
+            return PreparationState.ReconciliationRunning;
         }
 
         var next = PreparationStateNames.StateAtRank(rank);
@@ -123,14 +182,45 @@ internal sealed class PreparationMachine(
             PreparationState.RunSetDeclared => DeclareRunSet(),
             PreparationState.RunSetVerified => VerifyRunSet(),
             PreparationState.RunSetReady => ConfirmRunSetReady(),
-            PreparationState.Slot1Authorized => AuthorizeSlot1(),
-            PreparationState.Slot1Launching => BeginSlot1Launch(),
-            PreparationState.Slot1TerminalObserved => ObserveSlot1Terminal(),
+            PreparationState.Slot1Authorized => AuthorizeSlot(Slot1Stage),
+            PreparationState.Slot1Launching => BeginSlotLaunch(Slot1Stage),
+            PreparationState.Slot1TerminalObserved => ObserveSlotTerminal(Slot1Stage),
+            PreparationState.Slot2Authorized => AuthorizeSlot(Slot2Stage),
+            PreparationState.Slot2Launching => BeginSlotLaunch(Slot2Stage),
+            PreparationState.Slot2TerminalObserved => ObserveSlotTerminal(Slot2Stage),
+            PreparationState.ReconciliationAuthorized => AuthorizeReconciliation(),
+            PreparationState.ReconciliationLaunching => BeginReconciliationLaunch(),
+            PreparationState.ReconciliationTerminalObserved => ObserveReconciliationTerminal(),
+            PreparationState.ReconciliationVerified => VerifyReconciliation(),
             _ => throw new ContractException($"'{PreparationStateNames.ToName(next)}' is not a transition this coordinator performs.")
         };
         _state.Commit(_request, _stateKey, next, evidence, detail);
         _log.WriteLine($"commit {PreparationStateNames.ToName(next)} sequence={_state.Sequence.ToString(CultureInfo.InvariantCulture)} evidence={_state.EvidenceDigestOf(next)} detail={detail}");
         return next;
+    }
+
+    private static SlotStage? SlotStageAtTerminalRank(int rank)
+    {
+        foreach (var stage in Stages)
+        {
+            if (PreparationStateNames.RankOf(stage.TerminalVerified) == rank)
+            {
+                return stage;
+            }
+        }
+        return null;
+    }
+
+    private static SlotStage? SlotStageAtRunningRank(int rank)
+    {
+        foreach (var stage in Stages)
+        {
+            if (PreparationStateNames.RankOf(stage.Running) == rank)
+            {
+                return stage;
+            }
+        }
+        return null;
     }
 
     /// <summary>
@@ -198,7 +288,13 @@ internal sealed class PreparationMachine(
                 ReadDeclareResult();
                 break;
             case PreparationState.Slot1Authorized:
-                ReadSlotPlanResult();
+                ReadSlotPlanResult(Slot1Stage);
+                break;
+            case PreparationState.Slot2Authorized:
+                ReadSlotPlanResult(Slot2Stage);
+                break;
+            case PreparationState.ReconciliationAuthorized:
+                ReadReconciliationPlanResult();
                 break;
         }
     }
@@ -905,13 +1001,14 @@ internal sealed class PreparationMachine(
     }
 
     // -----------------------------------------------------------------------
-    // slot1Authorized / slot1Launching / slot1Running / slot1TerminalObserved
-    // / slot1Terminal{Verified,Failed,TimedOut}
+    // slotNAuthorized / slotNLaunching / slotNRunning / slotNTerminalObserved
+    // / slotNTerminal{Verified,Failed,TimedOut}, for each of the two declared
+    // slots in turn.
     // -----------------------------------------------------------------------
 
     /// <summary>
-    /// Establishes that this run may launch one slot, and binds every identity
-    /// the launch will be judged against.
+    /// Establishes that this run may launch one named slot, and binds every
+    /// identity the launch will be judged against.
     /// </summary>
     /// <remarks>
     /// Authorization is separated from launching because the launch consumes
@@ -920,12 +1017,20 @@ internal sealed class PreparationMachine(
     /// exactly one chance. Everything that could refuse the launch is therefore
     /// checked and committed BEFORE any state exists that says a launch is due.
     ///
+    /// The second slot is refused outright until this run's own signed record
+    /// says the first one ended verified-complete. The reviewed predecessor gate
+    /// makes the same demand of the artifacts on disk, and both are wanted: the
+    /// reviewed gate is the authority over the run set, and this one is the
+    /// authority over THIS coordinator, which must not be able to reach a
+    /// second launch by any path its own record does not already justify.
+    ///
     /// Nothing here judges the run. It reads a plan, compares identities, hashes
     /// a token, and refuses on mismatch.
     /// </remarks>
-    private (MapNode Evidence, string Detail) AuthorizeSlot1()
+    private (MapNode Evidence, string Detail) AuthorizeSlot(SlotStage stage)
     {
-        var authorization = _request.RequireSlotAuthorization();
+        var authorization = _request.RequireSlot(stage.Ordinal);
+        RequirePredecessorVerified(stage);
 
         // The declaration this slot will consume must be the one this run
         // verified and then observed ready. Reading both records rather than one
@@ -992,15 +1097,34 @@ internal sealed class PreparationMachine(
             }
         }
 
-        var plan = ReadSlotPlan(RequestSlotPlan());
+        var plan = ReadSlotPlan(stage, RequestSlotPlan(stage));
 
         if (!string.Equals(plan.SetId, verifiedSetId, StringComparison.Ordinal))
         {
             throw new ContractException($"The qualification plan is built for run set '{plan.SetId}' and this run verified '{verifiedSetId}'.");
         }
-        if (!string.Equals(plan.SlotName, CoordinatorRequest.SupervisedSlotName, StringComparison.Ordinal))
+        if (!string.Equals(plan.SlotName, stage.Name, StringComparison.Ordinal))
         {
-            throw new ContractException($"The qualification plan describes slot '{plan.SlotName}'; this coordinator supervises '{CoordinatorRequest.SupervisedSlotName}' only.");
+            throw new ContractException($"The qualification plan describes slot '{plan.SlotName}'; this transition supervises '{stage.Name}'.");
+        }
+        if (!string.Equals(plan.SlotName, authorization.Name, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The qualification plan describes slot '{plan.SlotName}' and the request declared '{authorization.Name}' at this position.");
+        }
+        // The two file identities the request declared for this slot, checked
+        // against the ones the reviewed plan actually placed. Without this a
+        // request could declare two slots whose names differed while both bound
+        // to one state directory or one terminal file, and the second run would
+        // overwrite or adopt the first one's evidence.
+        var plannedStateDirName = LeafNameOf(plan.SlotStateDir);
+        if (!string.Equals(plannedStateDirName, authorization.StateDirName, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The qualification plan places slot '{plan.SlotName}' state under '{plannedStateDirName}' and the request declared '{authorization.StateDirName}'.");
+        }
+        var plannedTerminalName = LeafNameOf(plan.SlotTerminalPath);
+        if (!string.Equals(plannedTerminalName, authorization.TerminalName, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The qualification plan names slot '{plan.SlotName}' terminal evidence '{plannedTerminalName}' and the request declared '{authorization.TerminalName}'.");
         }
         if (!string.Equals(plan.LaunchAuthorizationHash, tokenHash, StringComparison.Ordinal))
         {
@@ -1073,29 +1197,29 @@ internal sealed class PreparationMachine(
     /// committed first, the record distinguishes the two, and the resume path can
     /// refuse rather than guess.
     /// </remarks>
-    private (MapNode Evidence, string Detail) BeginSlot1Launch()
+    private (MapNode Evidence, string Detail) BeginSlotLaunch(SlotStage stage)
     {
-        var authorized = _state.EvidenceFor(PreparationState.Slot1Authorized)
+        var authorized = _state.EvidenceFor(stage.Authorized)
             ?? throw new ContractException("Nothing authorized a launch, so no launch is due.");
-        var setId = authorized.GetText("setId") ?? throw new ContractException("The slot1Authorized record carries no setId.");
-        var planDigest = authorized.GetText("planDigest") ?? throw new ContractException("The slot1Authorized record carries no plan digest.");
+        var setId = authorized.GetText("setId") ?? throw new ContractException($"The {PreparationStateNames.ToName(stage.Authorized)} record carries no setId.");
+        var planDigest = authorized.GetText("planDigest") ?? throw new ContractException($"The {PreparationStateNames.ToName(stage.Authorized)} record carries no plan digest.");
         var evidence = new MapNode()
             .Set("setId", setId)
             .Set("planDigest", planDigest)
-            .Set("slotName", CoordinatorRequest.SupervisedSlotName)
+            .Set("slotName", stage.Name)
             .Set("launchDue", true);
-        return (evidence, $"slot={CoordinatorRequest.SupervisedSlotName} planDigest={planDigest}");
+        return (evidence, $"slot={stage.Name} planDigest={planDigest}");
     }
 
     /// <summary>
     /// Starts the supervised child, makes its identity durable, then watches it
     /// until it stops or a plan deadline says to stop watching.
     /// </summary>
-    private void RunSlot1()
+    private void RunSlot(SlotStage stage)
     {
-        var authorized = _state.EvidenceFor(PreparationState.Slot1Authorized)
+        var authorized = _state.EvidenceFor(stage.Authorized)
             ?? throw new ContractException("Nothing authorized a launch, so nothing may be run.");
-        var authorizedDigest = authorized.GetText("planDigest") ?? throw new ContractException("The slot1Authorized record carries no plan digest.");
+        var authorizedDigest = authorized.GetText("planDigest") ?? throw new ContractException($"The {PreparationStateNames.ToName(stage.Authorized)} record carries no plan digest.");
 
         // Re-derived here rather than re-read from the authorization's committed
         // result, and that difference is the whole check. The committed result
@@ -1110,16 +1234,20 @@ internal sealed class PreparationMachine(
         // request rather than re-running it. Adoption is right for work that must
         // not repeat; it is wrong for a probe, whose previous answer is worthless
         // by definition.
-        var probePath = Path.Combine(_request.ExchangeRoot, _request.CorrelationId + "-slotPrelaunch.result.json");
+        var probePath = Path.Combine(_request.ExchangeRoot, _request.CorrelationId + "-" + stage.PrelaunchStep + ".result.json");
         if (File.Exists(probePath))
         {
             File.Delete(probePath);
         }
-        var plan = ReadSlotPlan(RequestSlotPlan("slotPrelaunch"));
+        var plan = ReadSlotPlan(stage, RequestSlotPlan(stage, stage.PrelaunchStep));
         if (!string.Equals(plan.PlanDigest, authorizedDigest, StringComparison.Ordinal))
         {
             throw new ContractException($"The plan now digests to {plan.PlanDigest} and the authorization was committed against {authorizedDigest}.");
         }
+        // Re-checked immediately before the irreversible step for the same reason
+        // the attempt census is: a record that said slot1 was verified when slot2
+        // was authorized has to still say so now.
+        RequirePredecessorVerified(stage);
 
         // The last gate before the irreversible step. The authorization proved
         // there was no attempt record when it was written; time has passed since,
@@ -1133,7 +1261,7 @@ internal sealed class PreparationMachine(
         var childRequest = SlotChildRequest(plan.Authorization)
             .Set("expectedPlanDigest", plan.PlanDigest)
             .Set("expectedSetId", plan.SetId);
-        var launch = _supervisor.Start("slotRun", ChildScript(), childRequest);
+        var launch = _supervisor.Start(stage.RunStep, ChildScript(), childRequest);
 
         // Committed BEFORE the wait. This is the whole reason the supervisor is
         // two-phase: a coordinator killed during a slot that ran for an hour must
@@ -1146,11 +1274,11 @@ internal sealed class PreparationMachine(
             .Set("deadlines", plan.Deadlines.Describe())
             .Set("child", launch.DescribeIdentity())
             .Set("supervisionStartedAtUtc", DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture));
-        _state.Commit(_request, _stateKey, PreparationState.Slot1Running, running, $"childProcessId={launch.ProcessId.ToString(CultureInfo.InvariantCulture)}");
-        _log.WriteLine($"commit slot1Running sequence={_state.Sequence.ToString(CultureInfo.InvariantCulture)} childProcessId={launch.ProcessId.ToString(CultureInfo.InvariantCulture)}");
+        _state.Commit(_request, _stateKey, stage.Running, running, $"childProcessId={launch.ProcessId.ToString(CultureInfo.InvariantCulture)}");
+        _log.WriteLine($"commit {PreparationStateNames.ToName(stage.Running)} sequence={_state.Sequence.ToString(CultureInfo.InvariantCulture)} childProcessId={launch.ProcessId.ToString(CultureInfo.InvariantCulture)}");
 
         var observation = _supervisor.Await(launch, plan.Deadlines, plan.SlotStateDir);
-        _log.WriteLine($"observed slot child disposition={observation.Disposition} exitCode={observation.ExitCode.ToString(CultureInfo.InvariantCulture)}");
+        _log.WriteLine($"observed {stage.Name} child disposition={observation.Disposition} exitCode={observation.ExitCode.ToString(CultureInfo.InvariantCulture)}");
         _observedRun = observation;
         _observedLaunch = launch;
     }
@@ -1168,19 +1296,19 @@ internal sealed class PreparationMachine(
     /// owner's immutable terminal artifact. An exit of zero with no terminal
     /// artifact is refused exactly as loudly as a hang.
     /// </remarks>
-    private (MapNode Evidence, string Detail) ObserveSlot1Terminal()
+    private (MapNode Evidence, string Detail) ObserveSlotTerminal(SlotStage stage)
     {
-        var running = _state.EvidenceFor(PreparationState.Slot1Running)
+        var running = _state.EvidenceFor(stage.Running)
             ?? throw new ContractException("No slot was recorded running, so there is nothing to observe.");
-        if (_slotPlan is null)
+        if (!_slotPlans.ContainsKey(stage.Ordinal))
         {
-            ReadSlotPlanResult();
+            ReadSlotPlanResult(stage);
         }
-        var plan = _slotPlan!;
+        var plan = _slotPlans[stage.Ordinal];
 
         if (_observedRun is null || _observedLaunch is null)
         {
-            (_observedLaunch, _observedRun) = ResumeSupervision(running, plan);
+            (_observedLaunch, _observedRun) = ResumeSupervision(stage, running, plan);
         }
         var launch = _observedLaunch!;
         var observation = _observedRun!;
@@ -1205,7 +1333,7 @@ internal sealed class PreparationMachine(
             "slotName",
             "setId",
             "planDigest");
-        const string label = "'slotRun' child result";
+        var label = $"'{stage.RunStep}' child result";
         if (!StrictJson.RequireBool(outcome.Result, "terminalWritten", label))
         {
             throw new ContractException(
@@ -1247,23 +1375,23 @@ internal sealed class PreparationMachine(
     /// plausibility. This coordinator has no opinion about whether a run should
     /// have failed, and holds no rule that could form one.
     /// </remarks>
-    private (PreparationState Outcome, MapNode Evidence, string Detail) VerifySlot1Terminal()
+    private (PreparationState Outcome, MapNode Evidence, string Detail) VerifySlotTerminal(SlotStage stage)
     {
-        var observed = _state.EvidenceFor(PreparationState.Slot1TerminalObserved)
+        var observed = _state.EvidenceFor(stage.TerminalObserved)
             ?? throw new ContractException("No terminal evidence was observed, so there is nothing to verify.");
-        if (_slotPlan is null)
+        if (!_slotPlans.ContainsKey(stage.Ordinal))
         {
-            ReadSlotPlanResult();
+            ReadSlotPlanResult(stage);
         }
-        var plan = _slotPlan!;
+        var plan = _slotPlans[stage.Ordinal];
         var observedTerminalSha = observed.GetText("terminalSha256")
-            ?? throw new ContractException("The slot1TerminalObserved record carries no terminal digest.");
+            ?? throw new ContractException($"The {PreparationStateNames.ToName(stage.TerminalObserved)} record carries no terminal digest.");
 
         var childRequest = SlotChildRequest(plan.Authorization)
             .Set("expectedPlanDigest", plan.PlanDigest)
             .Set("expectedSetId", plan.SetId);
         var outcome = _invoker.Invoke(
-            "slotVerify",
+            stage.VerifyStep,
             ChildScript(),
             childRequest,
             "terminalStatus",
@@ -1278,7 +1406,7 @@ internal sealed class PreparationMachine(
             "inventoryVerified",
             "slotAttemptCount",
             "modelInvocationCount");
-        const string label = "'slotVerify' child result";
+        var label = $"'{stage.VerifyStep}' child result";
 
         // The bytes the verifier read must be the bytes this run observed. The
         // artifact is written read-only by its owner, so a changed digest here is
@@ -1304,12 +1432,16 @@ internal sealed class PreparationMachine(
         StrictJson.RequireLiteral(outcome.Result, "terminalPlanDigest", plan.PlanDigest, label);
         StrictJson.RequireLiteral(outcome.Result, "terminalSlot", plan.SlotName, label);
 
-        // Exactly one attempt, and it is this one. A second attempt record would
-        // mean something launched the slot again behind this coordinator's back.
+        // Exactly as many attempt records as slots this run has launched, and no
+        // more. A higher census means something launched a slot behind this
+        // coordinator's back; a lower one means an attempt record this run made
+        // has been removed.
         var attempts = StrictJson.RequireInt(outcome.Result, "slotAttemptCount", label, 0, int.MaxValue);
-        if (attempts != 1)
+        if (attempts != stage.Ordinal)
         {
-            throw new ContractException($"The run set carries {attempts.ToString(CultureInfo.InvariantCulture)} slot attempt(s); this coordinator supervises exactly one.");
+            throw new ContractException(
+                $"The run set carries {attempts.ToString(CultureInfo.InvariantCulture)} slot attempt(s) after supervising '{stage.Name}'; " +
+                $"exactly {stage.Ordinal.ToString(CultureInfo.InvariantCulture)} launch(es) can have been made by this point.");
         }
         // Observed, not asserted. This coordinator invokes no model, but the run
         // it supervised may have invoked several, and reporting the census it was
@@ -1321,15 +1453,15 @@ internal sealed class PreparationMachine(
         var exitCode = StrictJson.RequireInt(outcome.Result, "terminalExitCode", label, int.MinValue, int.MaxValue);
         var state = status switch
         {
-            "complete" => PreparationState.Slot1TerminalVerified,
-            "failed" => PreparationState.Slot1TerminalFailed,
-            "timedOut" => PreparationState.Slot1TerminalTimedOut,
+            "complete" => stage.TerminalVerified,
+            "failed" => stage.TerminalFailed,
+            "timedOut" => stage.TerminalTimedOut,
             _ => throw new ContractException($"The terminal evidence reports status '{status}', which is not one of the three endings its contract allows.")
         };
         // The two statements the artifact makes about a timeout have to agree. A
         // 'complete' that also claims to have timed out is a corrupt record, and
         // picking whichever field suited would be inventing a reading.
-        if (timedOut != (state == PreparationState.Slot1TerminalTimedOut))
+        if (timedOut != (state == stage.TerminalTimedOut))
         {
             throw new ContractException($"The terminal evidence reports status '{status}' and a timedOut flag of {(timedOut ? "true" : "false")}, which contradict each other.");
         }
@@ -1347,7 +1479,7 @@ internal sealed class PreparationMachine(
             .Set("slotAttemptCount", attempts)
             .Set("modelInvocationCount", models)
             .Set("childResultSha256", outcome.ResultSha256);
-        return (state, evidence, $"terminalStatus={status} attempts=1 modelInvocations={models.ToString(CultureInfo.InvariantCulture)}");
+        return (state, evidence, $"terminalStatus={status} attempts={attempts.ToString(CultureInfo.InvariantCulture)} modelInvocations={models.ToString(CultureInfo.InvariantCulture)}");
     }
 
     /// <summary>
@@ -1361,22 +1493,97 @@ internal sealed class PreparationMachine(
     /// unrecoverable. Relaunching is not among the options: the attempt record is
     /// spent.
     /// </remarks>
-    private (SlotLaunch Launch, SlotObservation Observation) ResumeSupervision(MapNode running, SlotPlan plan)
+    private (SlotLaunch Launch, SlotObservation Observation) ResumeSupervision(SlotStage stage, MapNode running, SlotPlan plan) =>
+        ResumeSupervision(
+            PreparationStateNames.ToName(stage.Running),
+            stage.Name,
+            stage.RunStep,
+            running,
+            plan.Deadlines,
+            plan.SlotStateDir);
+
+    /// <summary>
+    /// Re-attaches to the child a running record names, rather than starting a
+    /// second one.
+    /// </summary>
+    /// <remarks>
+    /// Shared by the slots and by the reconciliation because the recovery is the
+    /// same recovery: the record names a process id AND a start time, the
+    /// supervisor adopts only that exact identity, and the wait resumes on the
+    /// same plan budget the launch was made under.
+    /// </remarks>
+    private (SlotLaunch Launch, SlotObservation Observation) ResumeSupervision(
+        string runningName,
+        string label,
+        string runStep,
+        MapNode running,
+        SlotDeadlines deadlines,
+        string activityDirectory)
     {
         var child = running.Get("child") as MapNode
-            ?? throw new ContractException("The slot1Running record carries no child identity, so a resumed run cannot find what it left behind.");
+            ?? throw new ContractException($"The {runningName} record carries no child identity, so a resumed run cannot find what it left behind.");
         var processId = child.GetInteger("childProcessId")
-            ?? throw new ContractException("The slot1Running record carries no child process id.");
+            ?? throw new ContractException($"The {runningName} record carries no child process id.");
         var startedAt = child.GetText("childStartedAtUtc") is { Length: > 0 } recordedStart
             ? recordedStart
-            : throw new ContractException("The slot1Running record carries no child start time, so a recycled process id could be mistaken for the child.");
+            : throw new ContractException($"The {runningName} record carries no child start time, so a recycled process id could be mistaken for the child.");
         var childRequestSha = child.GetText("childRequestSha256")
-            ?? throw new ContractException("The slot1Running record carries no child request digest.");
+            ?? throw new ContractException($"The {runningName} record carries no child request digest.");
 
-        var launch = _supervisor.Adopt("slotRun", childRequestSha, (int)processId, startedAt);
-        _log.WriteLine($"resume supervising recorded slot child processId={processId.ToString(CultureInfo.InvariantCulture)} startedAtUtc={startedAt}");
-        var observation = _supervisor.Await(launch, plan.Deadlines, plan.SlotStateDir);
+        var launch = _supervisor.Adopt(runStep, childRequestSha, (int)processId, startedAt);
+        _log.WriteLine($"resume supervising recorded {label} child processId={processId.ToString(CultureInfo.InvariantCulture)} startedAtUtc={startedAt}");
+        var observation = _supervisor.Await(launch, deadlines, activityDirectory);
         return (launch, observation);
+    }
+
+    /// <summary>
+    /// Refuses a slot whose predecessor this run's own record does not show
+    /// ending verified-complete.
+    /// </summary>
+    /// <remarks>
+    /// The reviewed predecessor gate reads the artifacts and is the authority
+    /// over the run set. This one reads the signed state and is the authority
+    /// over the coordinator, and it exists because those are different
+    /// questions: a coordinator that never supervised slot1 could still find a
+    /// complete slot1 terminal on disk, put there by a hand-run, and would then
+    /// report a two-slot set it had only half performed.
+    /// </remarks>
+    private void RequirePredecessorVerified(SlotStage stage)
+    {
+        if (stage.Ordinal <= 1)
+        {
+            return;
+        }
+        var predecessor = Stages[stage.Ordinal - 2];
+        var predecessorRank = PreparationStateNames.RankOf(predecessor.TerminalVerified);
+        PreparationState? recorded = null;
+        foreach (var transition in _state.Transitions)
+        {
+            if (PreparationStateNames.RankOf(transition.State) == predecessorRank)
+            {
+                recorded = transition.State;
+            }
+        }
+        if (recorded is null)
+        {
+            throw new ContractException(
+                $"Slot '{stage.Name}' cannot be authorized before this run records a terminal for '{predecessor.Name}'. " +
+                "The set advances one proven slot at a time.");
+        }
+        if (recorded != predecessor.TerminalVerified)
+        {
+            throw new ContractException(
+                $"Slot '{stage.Name}' cannot be authorized: this run recorded '{PreparationStateNames.ToName(recorded.Value)}' for '{predecessor.Name}'. " +
+                "A later slot never follows one that did not complete.");
+        }
+    }
+
+    /// <summary>The last path component of a path, without touching the file system.</summary>
+    private static string LeafNameOf(string path)
+    {
+        var trimmed = path.TrimEnd('/', '\\');
+        var leaf = Path.GetFileName(trimmed);
+        return leaf.Length > 0 ? leaf : trimmed;
     }
 
     /// <summary>
@@ -1414,14 +1621,21 @@ internal sealed class PreparationMachine(
             .Set("manifestDigest", _sealedSnapshotDigest)
             .Set("reviewerScriptPath", authorization.ReviewerScriptPath)
             .Set("slotName", authorization.Name)
-            .Set("launchAuthorizationTokenPath", authorization.LaunchAuthorizationTokenPath);
+            .Set("launchAuthorizationTokenPath", authorization.LaunchAuthorizationTokenPath)
+            // Forwarded verbatim and never read. The strings are the reviewed
+            // path's to interpret; what this coordinator does with them is put
+            // them in the signed request, hand them over, and commit their
+            // digest. Nothing here compares one to a literal, and there is no
+            // branch anywhere in this program that could.
+            .Set("bindSealedArguments", authorization.ModelPlan.BindSealedArguments)
+            .Set("opaqueSlotArguments", authorization.ModelPlan.AsList());
     }
 
-    private ChildOutcome RequestSlotPlan(string step = "slotPlan")
+    private ChildOutcome RequestSlotPlan(SlotStage stage, string? step = null)
     {
-        var authorization = _request.RequireSlotAuthorization();
+        var authorization = _request.RequireSlot(stage.Ordinal);
         return _invoker.Invoke(
-            step,
+            step ?? stage.PlanStep,
             ChildScript(),
             SlotChildRequest(authorization),
             "setId",
@@ -1441,10 +1655,10 @@ internal sealed class PreparationMachine(
             "headClean");
     }
 
-    private SlotPlan ReadSlotPlan(ChildOutcome outcome)
+    private SlotPlan ReadSlotPlan(SlotStage stage, ChildOutcome outcome)
     {
-        const string label = "'slotPlan' child result";
-        var authorization = _request.RequireSlotAuthorization();
+        var label = $"'{stage.PlanStep}' child result";
+        var authorization = _request.RequireSlot(stage.Ordinal);
         var plan = new SlotPlan(
             StrictJson.RequireString(outcome.Result, "setId", label),
             StrictJson.RequireHex(outcome.Result, "planDigest", label, 64),
@@ -1465,17 +1679,18 @@ internal sealed class PreparationMachine(
                 authorization.SupervisionGraceSeconds),
             authorization,
             outcome.ResultSha256);
-        _slotPlan = plan;
+        _slotPlans[stage.Ordinal] = plan;
         return plan;
     }
 
-    private void ReadSlotPlanResult()
+    private void ReadSlotPlanResult(SlotStage stage)
     {
-        var committed = _state.EvidenceFor(PreparationState.Slot1Authorized);
-        var result = ReadCommittedChildResult(PreparationState.Slot1Authorized, "slotPlan", "'slotPlan' child result");
-        var plan = ReadSlotPlan(new ChildOutcome(
+        var committed = _state.EvidenceFor(stage.Authorized);
+        var label = $"'{stage.PlanStep}' child result";
+        var result = ReadCommittedChildResult(stage.Authorized, stage.PlanStep, label);
+        var plan = ReadSlotPlan(stage, new ChildOutcome(
             0,
-            Path.Combine(_request.ExchangeRoot, _request.CorrelationId + "-slotPlan.result.json"),
+            Path.Combine(_request.ExchangeRoot, _request.CorrelationId + "-" + stage.PlanStep + ".result.json"),
             result,
             committed?.GetText("childResultSha256") ?? string.Empty));
         // The plan is re-read from the result the authorization committed rather
@@ -1504,6 +1719,8 @@ internal sealed class PreparationMachine(
 
     private SlotObservation? _observedRun;
     private SlotLaunch? _observedLaunch;
+    private SlotObservation? _observedReconcileRun;
+    private SlotLaunch? _observedReconcileLaunch;
 
     private MapNode QualificationRequest() => new MapNode()
         .Set("contractVersion", ChildRequestContractVersion)
@@ -1523,7 +1740,7 @@ internal sealed class PreparationMachine(
         // hash, so a declaration made without naming the agent a later slot names
         // would be a declaration that slot could never reproduce. Empty means the
         // production agent, which is what the preparation slice always meant.
-        .Set("reviewerScriptPath", _request.Slot?.ReviewerScriptPath ?? string.Empty);
+        .Set("reviewerScriptPath", _request.SlotReviewerScriptPath);
 
     private void ApplyDeclareResult(JsonElement result)
     {
@@ -1542,6 +1759,622 @@ internal sealed class PreparationMachine(
     private string ChildScript() => Path.Combine(_request.ToolkitRoot, "tools", ChildScriptName);
 
     private const string ChildRequestContractVersion = "devpilot.shadow-run-coordinator.child-request.v1";
+
+    private const string ReconciliationRequestContractVersion = "devpilot.shadow-run-coordinator.reconciliation-request.v1";
+
+    private const string ReconciliationSummaryContractVersion = "devpilot.shadow-run-coordinator.reconciliation-summary.v1";
+
+    // -----------------------------------------------------------------------
+    // reconciliationAuthorized / reconciliationLaunching
+    // / reconciliationTerminalObserved / reconciliationVerified
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Establishes that the whole declared set may now be compared, and binds
+    /// the comparison to the plan both slots ran under.
+    /// </summary>
+    /// <remarks>
+    /// Two gates, deliberately not one. This coordinator's own record must show
+    /// every declared slot ending verified-complete, and the reviewed readiness
+    /// gate - which reads the immutable terminals, their binding to the sealed
+    /// declaration, and whether any recorded child is still alive - must accept
+    /// the set. Neither substitutes for the other: the first is what stops this
+    /// program reaching a reconciliation it did not itself earn, and the second
+    /// is what stops any program reconciling a set the artifacts do not support.
+    ///
+    /// Nothing here reads a finding. The comparison is the reviewed tool's, and
+    /// what this transition binds is which set, which plan and which output
+    /// directory it will run over.
+    /// </remarks>
+    private (MapNode Evidence, string Detail) AuthorizeReconciliation()
+    {
+        var reconciliation = _request.RequireSlotSet().Reconciliation.Require();
+        RequireEverySlotVerified();
+
+        var verified = _state.EvidenceFor(PreparationState.RunSetVerified)
+            ?? throw new ContractException("The run holds no runSetVerified record, so there is no verified declaration to reconcile.");
+        var verifiedSetId = verified.GetText("setId") ?? throw new ContractException("The runSetVerified record carries no setId.");
+
+        var plan = ReadReconciliationPlan(RequestReconciliationPlan(ReconcilePlanStep));
+        if (!string.Equals(plan.SetId, verifiedSetId, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The reconciliation is built for run set '{plan.SetId}' and this run verified '{verifiedSetId}'.");
+        }
+        // Every slot this run supervised must be the plan digest the
+        // reconciliation is about to compare under, or the comparison would be
+        // over runs from a different question.
+        foreach (var stage in Stages)
+        {
+            var terminal = _state.EvidenceAtRank(PreparationStateNames.RankOf(stage.TerminalVerified))
+                ?? throw new ContractException($"The run holds no terminal record for '{stage.Name}'.");
+            var terminalDigest = terminal.GetText("planDigest")
+                ?? throw new ContractException($"The terminal record for '{stage.Name}' carries no plan digest.");
+            if (!string.Equals(terminalDigest, plan.PlanDigest, StringComparison.Ordinal))
+            {
+                throw new ContractException($"Slot '{stage.Name}' ran under plan {terminalDigest} and the reconciliation is built for {plan.PlanDigest}.");
+            }
+        }
+        if (plan.RequiredRunCount != reconciliation.RequiredRunCount)
+        {
+            throw new ContractException(
+                $"The reconciliation covers {plan.RequiredRunCount.ToString(CultureInfo.InvariantCulture)} run(s) and the request authorized {reconciliation.RequiredRunCount.ToString(CultureInfo.InvariantCulture)}.");
+        }
+        if (plan.RequiredRunCount != _request.PlannedRunCount)
+        {
+            throw new ContractException(
+                $"The reconciliation covers {plan.RequiredRunCount.ToString(CultureInfo.InvariantCulture)} run(s) and the declaration plans {_request.PlannedRunCount.ToString(CultureInfo.InvariantCulture)}.");
+        }
+        if (plan.ArtifactCount != plan.RequiredRunCount)
+        {
+            throw new ContractException(
+                $"The set offers {plan.ArtifactCount.ToString(CultureInfo.InvariantCulture)} run artifact(s) for a {plan.RequiredRunCount.ToString(CultureInfo.InvariantCulture)}-run comparison.");
+        }
+        // One shot, for the same reason a slot has one. The comparison writes a
+        // stamped artifact every time it runs, so a second one would leave two
+        // reports of the same set with no record of which this run stands on.
+        if (plan.AttemptExists)
+        {
+            throw new ContractException(
+                "The reconciliation already carries an attempt record, so its single authorization is spent. This coordinator does not reconcile a set twice.");
+        }
+        if (!string.Equals(plan.Head, _request.ToolkitHead, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The reconciliation is built at toolkit head {plan.Head} and this request authorizes {_request.ToolkitHead}.");
+        }
+        var observedHead = GitHead.Resolve(_request.ToolkitRoot);
+        if (!string.Equals(observedHead, _request.ToolkitHead, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The toolkit is at head {observedHead} and this request authorizes {_request.ToolkitHead}.");
+        }
+        plan.Deadlines.RequireConsistent("reconciliation plan");
+
+        var evidence = new MapNode()
+            .Set("setId", plan.SetId)
+            .Set("planDigest", plan.PlanDigest)
+            .Set("requiredRunCount", plan.RequiredRunCount)
+            .Set("artifactCount", plan.ArtifactCount)
+            .Set("outputDirectory", plan.OutputDirectory)
+            .Set("head", plan.Head)
+            .Set("deadlines", plan.Deadlines.Describe())
+            .Set("authorization", reconciliation.Describe())
+            .Set("childResultSha256", plan.ChildResultSha256);
+        return (evidence, $"setId={plan.SetId} runs={plan.RequiredRunCount.ToString(CultureInfo.InvariantCulture)} planDigest={plan.PlanDigest}");
+    }
+
+    /// <summary>
+    /// Publishes the strict versioned input the comparison will be run from, and
+    /// records that a reconciliation is now due. It starts nothing.
+    /// </summary>
+    /// <remarks>
+    /// The file is written here rather than at launch so that the bytes the
+    /// child is asked to work from are on disk, and their digest is committed,
+    /// before anything could have started. A crash between this state and the
+    /// observation is then readable: the input exists, the attempt record says
+    /// whether a comparison began, and nothing has to be guessed.
+    /// </remarks>
+    private (MapNode Evidence, string Detail) BeginReconciliationLaunch()
+    {
+        var authorized = _state.EvidenceFor(PreparationState.ReconciliationAuthorized)
+            ?? throw new ContractException("Nothing authorized a reconciliation, so none is due.");
+        var setId = authorized.GetText("setId") ?? throw new ContractException("The reconciliationAuthorized record carries no setId.");
+        var planDigest = authorized.GetText("planDigest") ?? throw new ContractException("The reconciliationAuthorized record carries no plan digest.");
+        var outputDirectory = authorized.GetText("outputDirectory") ?? throw new ContractException("The reconciliationAuthorized record carries no output directory.");
+        var requiredRunCount = authorized.GetInteger("requiredRunCount")
+            ?? throw new ContractException("The reconciliationAuthorized record carries no required run count.");
+
+        Directory.CreateDirectory(_request.ReconciliationRoot);
+        var input = new MapNode()
+            .Set("contractVersion", ReconciliationRequestContractVersion)
+            .Set("kind", "shadow-run-coordinator-reconciliation-request")
+            .Set("correlationId", _request.CorrelationId)
+            .Set("setId", setId)
+            .Set("planDigest", planDigest)
+            .Set("requiredRunCount", requiredRunCount)
+            .Set("outputDirectory", outputDirectory)
+            .Set("summaryPath", _request.ReconciliationSummaryPath);
+        CanonicalJson.WriteFileAtomic(_request.ReconciliationRequestPath, CanonicalJson.Readable(input));
+        // Digested as the bytes that are on disk, because the bytes on disk are
+        // what the reader will hash. A digest over a canonical rendering the
+        // reader never sees would bind a document nobody is going to read.
+        var inputSha = CanonicalJson.Sha256HexOfFile(_request.ReconciliationRequestPath);
+
+        var evidence = new MapNode()
+            .Set("setId", setId)
+            .Set("planDigest", planDigest)
+            .Set("reconciliationRequestPath", _request.ReconciliationRequestPath)
+            .Set("reconciliationRequestSha256", inputSha)
+            .Set("summaryPath", _request.ReconciliationSummaryPath)
+            .Set("reconciliationDue", true);
+        return (evidence, $"reconciliationRequestSha256={inputSha}");
+    }
+
+    /// <summary>
+    /// Runs the reviewed comparison once, under supervision, making the child's
+    /// identity durable before the wait that may outlive this process.
+    /// </summary>
+    /// <remarks>
+    /// The exit code is data. The reviewed tool is invoked without the switch
+    /// that turns disagreement into a non-zero exit, because reacting to
+    /// disagreement is precisely the judgement this coordinator must not make;
+    /// what it requires instead is that the comparison ran and wrote its
+    /// summary. A missing summary is refused as loudly as a hang.
+    ///
+    /// The comparison mints its attempt record before it starts, so a
+    /// coordinator killed while it runs comes back to a spent authorization. The
+    /// record committed here is what makes that recoverable rather than terminal:
+    /// a resumed run finds the child it named and waits for THAT one, exactly as
+    /// a slot does, instead of concluding that somebody else consumed the single
+    /// attempt.
+    /// </remarks>
+    private void RunComparison()
+    {
+        var due = _state.EvidenceFor(PreparationState.ReconciliationLaunching)
+            ?? throw new ContractException("No reconciliation was recorded due, so there is nothing to run.");
+        var authorizedDigest = _state.EvidenceFor(PreparationState.ReconciliationAuthorized)?.GetText("planDigest")
+            ?? throw new ContractException("The reconciliationAuthorized record carries no plan digest.");
+        var inputSha = due.GetText("reconciliationRequestSha256")
+            ?? throw new ContractException("The reconciliationLaunching record carries no input digest.");
+        if (!File.Exists(_request.ReconciliationRequestPath))
+        {
+            throw new ContractException($"The reconciliation input at '{_request.ReconciliationRequestPath}' is gone.");
+        }
+
+        // Re-derived immediately before the irreversible step, and under its own
+        // probe step name with any previous answer deleted, for the reason given
+        // on the slot prelaunch probe: a resumed run must not read its own older
+        // answer about whether a comparison has already been attempted.
+        var probePath = Path.Combine(_request.ExchangeRoot, _request.CorrelationId + "-" + ReconcilePrelaunchStep + ".result.json");
+        if (File.Exists(probePath))
+        {
+            File.Delete(probePath);
+        }
+        var plan = ReadReconciliationPlan(RequestReconciliationPlan(ReconcilePrelaunchStep));
+        if (!string.Equals(plan.PlanDigest, authorizedDigest, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The reconciliation plan now digests to {plan.PlanDigest} and the authorization was committed against {authorizedDigest}.");
+        }
+        RequireEverySlotVerified();
+        if (plan.AttemptExists)
+        {
+            throw new ContractException(
+                "The reconciliation acquired an attempt record between authorization and launch, so its single authorization has already been used.");
+        }
+
+        var childRequest = ReconciliationChildRequest()
+            .Set("expectedPlanDigest", plan.PlanDigest)
+            .Set("expectedSetId", plan.SetId)
+            .Set("reconciliationRequestPath", _request.ReconciliationRequestPath)
+            .Set("reconciliationRequestSha256", inputSha);
+        var launch = _supervisor.Start(ReconcileRunStep, ChildScript(), childRequest);
+
+        var running = new MapNode()
+            .Set("setId", plan.SetId)
+            .Set("planDigest", plan.PlanDigest)
+            .Set("deadlines", plan.Deadlines.Describe())
+            .Set("child", launch.DescribeIdentity())
+            .Set("supervisionStartedAtUtc", DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture));
+        _state.Commit(_request, _stateKey, PreparationState.ReconciliationRunning, running, $"childProcessId={launch.ProcessId.ToString(CultureInfo.InvariantCulture)}");
+        _log.WriteLine($"commit {PreparationStateNames.ToName(PreparationState.ReconciliationRunning)} sequence={_state.Sequence.ToString(CultureInfo.InvariantCulture)} childProcessId={launch.ProcessId.ToString(CultureInfo.InvariantCulture)}");
+
+        var observation = _supervisor.Await(launch, plan.Deadlines, plan.OutputDirectory);
+        _log.WriteLine($"observed reconciliation child disposition={observation.Disposition} exitCode={observation.ExitCode.ToString(CultureInfo.InvariantCulture)}");
+        _observedReconcileRun = observation;
+        _observedReconcileLaunch = launch;
+    }
+
+    /// <summary>
+    /// Reads what the supervised comparison left behind, without deciding what it
+    /// means.
+    /// </summary>
+    private (MapNode Evidence, string Detail) ObserveReconciliationTerminal()
+    {
+        var running = _state.EvidenceFor(PreparationState.ReconciliationRunning)
+            ?? throw new ContractException("No reconciliation was recorded running, so there is nothing to observe.");
+        if (_reconciliationPlan is null)
+        {
+            ReadReconciliationPlanResult();
+        }
+        var plan = _reconciliationPlan
+            ?? throw new ContractException("The reconciliation plan could not be recovered, so there is nothing to observe against.");
+
+        if (_observedReconcileRun is null || _observedReconcileLaunch is null)
+        {
+            (_observedReconcileLaunch, _observedReconcileRun) = ResumeSupervision(
+                PreparationStateNames.ToName(PreparationState.ReconciliationRunning),
+                "reconciliation",
+                ReconcileRunStep,
+                running,
+                plan.Deadlines,
+                plan.OutputDirectory);
+        }
+        var launch = _observedReconcileLaunch!;
+        var observation = _observedReconcileRun!;
+
+        if (observation.Disposition is SlotObservation.HardDeadlineKill or SlotObservation.ActivityDeadlineKill)
+        {
+            throw new ChildFailureException(
+                $"The reconciliation was stopped by this coordinator on a plan deadline ({observation.Disposition}) after " +
+                $"{observation.ObservedSeconds.ToString(CultureInfo.InvariantCulture)} second(s).");
+        }
+
+        var outcome = _supervisor.ReadResult(
+            launch,
+            "summaryWritten",
+            "summaryPath",
+            "summarySha256",
+            "comparisonExitCode",
+            "setId",
+            "planDigest",
+            "reportPath",
+            "reportSha256",
+            "artifactPath",
+            "artifactSha256");
+        const string label = "'reconcileRun' child result";
+        if (!StrictJson.RequireBool(outcome.Result, "summaryWritten", label))
+        {
+            throw new ContractException("The reconciliation produced no versioned summary, so there is nothing this coordinator may report about it.");
+        }
+        StrictJson.RequireLiteral(outcome.Result, "setId", plan.SetId, label);
+        StrictJson.RequireLiteral(outcome.Result, "planDigest", plan.PlanDigest, label);
+        var summaryPath = StrictJson.RequireString(outcome.Result, "summaryPath", label);
+        if (!PathsAreSame(summaryPath, _request.ReconciliationSummaryPath))
+        {
+            throw new ContractException($"The reconciliation wrote its summary to '{summaryPath}' and this run asked for '{_request.ReconciliationSummaryPath}'.");
+        }
+        if (!File.Exists(summaryPath))
+        {
+            throw new ContractException($"The reconciliation reports a summary at '{summaryPath}', which does not exist.");
+        }
+        var reportedSummarySha = StrictJson.RequireHex(outcome.Result, "summarySha256", label, 64);
+        var actualSummarySha = CanonicalJson.Sha256HexOfFile(summaryPath);
+        if (!string.Equals(reportedSummarySha, actualSummarySha, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The reconciliation summary digests to {actualSummarySha} and the child reported {reportedSummarySha}.");
+        }
+        // The two files the comparison produced are pinned HERE, where they were
+        // just made, so the verification step reads the same bytes this step saw
+        // rather than whatever stands at those paths later. Nothing is read out of
+        // them; only the paths and their digests are carried.
+        var reportPath = StrictJson.RequireString(outcome.Result, "reportPath", label);
+        var artifactPath = StrictJson.RequireString(outcome.Result, "artifactPath", label);
+        var reportSha = StrictJson.RequireHex(outcome.Result, "reportSha256", label, 64);
+        var artifactSha = StrictJson.RequireHex(outcome.Result, "artifactSha256", label, 64);
+        // Recorded, never acted upon. The reviewed tool is not asked to fail on
+        // disagreement, so a non-zero here is a fault in the comparison rather
+        // than a reading of the runs - and either way this coordinator only
+        // reports the number.
+        var comparisonExit = StrictJson.RequireInt(outcome.Result, "comparisonExitCode", label, int.MinValue, int.MaxValue);
+
+        var evidence = new MapNode()
+            .Set("setId", plan.SetId)
+            .Set("planDigest", plan.PlanDigest)
+            .Set("summaryPath", summaryPath)
+            .Set("summarySha256", actualSummarySha)
+            .Set("reportPath", reportPath)
+            .Set("reportSha256", reportSha)
+            .Set("artifactPath", artifactPath)
+            .Set("artifactSha256", artifactSha)
+            .Set("comparisonExitCode", comparisonExit)
+            .Set("supervision", observation.Describe())
+            .Set("childResultSha256", outcome.ResultSha256);
+        return (evidence, $"disposition={observation.Disposition} comparisonExitCode={comparisonExit.ToString(CultureInfo.InvariantCulture)}");
+    }
+
+    /// <summary>
+    /// Has the reviewed reader parse the sealed comparison, and records its
+    /// status, its digests and its census - and nothing else.
+    /// </summary>
+    /// <remarks>
+    /// The counters arrive as an ordered list of name and value pairs and are
+    /// copied across unread. That shape is the point: a map this program indexed
+    /// by name would be a place for a rule about a particular count to grow, and
+    /// there is no count whose meaning this coordinator is entitled to know. The
+    /// status word and the outcome digest are the reviewed tool's own, checked
+    /// here for structure and binding, never for plausibility.
+    /// </remarks>
+    private (MapNode Evidence, string Detail) VerifyReconciliation()
+    {
+        var observed = _state.EvidenceFor(PreparationState.ReconciliationTerminalObserved)
+            ?? throw new ContractException("No reconciliation summary was observed, so there is nothing to verify.");
+        var observedSummarySha = observed.GetText("summarySha256")
+            ?? throw new ContractException("The reconciliationTerminalObserved record carries no summary digest.");
+        var authorized = _state.EvidenceFor(PreparationState.ReconciliationAuthorized)
+            ?? throw new ContractException("Nothing authorized a reconciliation, so there is nothing to verify.");
+        var setId = authorized.GetText("setId") ?? throw new ContractException("The reconciliationAuthorized record carries no setId.");
+        var planDigest = authorized.GetText("planDigest") ?? throw new ContractException("The reconciliationAuthorized record carries no plan digest.");
+
+        var childRequest = ReconciliationChildRequest()
+            .Set("expectedPlanDigest", planDigest)
+            .Set("expectedSetId", setId)
+            .Set("reconciliationRequestPath", _request.ReconciliationRequestPath)
+            .Set("summaryPath", _request.ReconciliationSummaryPath);
+        var outcome = _invoker.Invoke(
+            ReconcileVerifyStep,
+            ChildScript(),
+            childRequest,
+            "summarySha256",
+            "reconciliationStatus",
+            "reconciliationSha256",
+            "reportPath",
+            "reportSha256",
+            "artifactPath",
+            "artifactSha256",
+            "artifactSignatureVerified",
+            "artifactPromotable",
+            "runCount",
+            "requiredRunCount",
+            "setId",
+            "planDigest",
+            "counts");
+        const string label = "'reconcileVerify' child result";
+
+        var verifiedSummarySha = StrictJson.RequireHex(outcome.Result, "summarySha256", label, 64);
+        if (!string.Equals(verifiedSummarySha, observedSummarySha, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The verified reconciliation summary digests to {verifiedSummarySha} and this run observed {observedSummarySha}.");
+        }
+        if (!StrictJson.RequireBool(outcome.Result, "artifactSignatureVerified", label))
+        {
+            throw new ContractException("The sealed comparison artifact did not verify under its key, so it stands on nothing.");
+        }
+        // A comparison that claimed to be promotable would be claiming to be
+        // something this whole path is built never to produce.
+        if (StrictJson.RequireBool(outcome.Result, "artifactPromotable", label))
+        {
+            throw new ContractException("The sealed comparison artifact claims to be promotable; an evaluation-only reconciliation never is.");
+        }
+        StrictJson.RequireLiteral(outcome.Result, "setId", setId, label);
+        StrictJson.RequireLiteral(outcome.Result, "planDigest", planDigest, label);
+
+        var requiredRunCount = StrictJson.RequireInt(outcome.Result, "requiredRunCount", label, 2, 16);
+        var runCount = StrictJson.RequireInt(outcome.Result, "runCount", label, 0, 16);
+        if (runCount != requiredRunCount)
+        {
+            throw new ContractException(
+                $"The comparison covered {runCount.ToString(CultureInfo.InvariantCulture)} run(s) of a required {requiredRunCount.ToString(CultureInfo.InvariantCulture)}.");
+        }
+        if (requiredRunCount != _request.PlannedRunCount)
+        {
+            throw new ContractException(
+                $"The comparison requires {requiredRunCount.ToString(CultureInfo.InvariantCulture)} run(s) and the declaration plans {_request.PlannedRunCount.ToString(CultureInfo.InvariantCulture)}.");
+        }
+
+        var status = StrictJson.RequireString(outcome.Result, "reconciliationStatus", label);
+        var reconciliationSha = StrictJson.RequireHex(outcome.Result, "reconciliationSha256", label, 64);
+        var reportPath = StrictJson.RequireString(outcome.Result, "reportPath", label);
+        var reportSha = StrictJson.RequireHex(outcome.Result, "reportSha256", label, 64);
+        var artifactPath = StrictJson.RequireString(outcome.Result, "artifactPath", label);
+        var artifactSha = StrictJson.RequireHex(outcome.Result, "artifactSha256", label, 64);
+        // The two files this run watched the comparison produce are the two files
+        // that must have been read here. Without this the verification is over
+        // whatever now stands at the paths a summary names, and a sealed artifact
+        // that verifies under the same key but belongs to another set would be
+        // reported as this set's result.
+        RequireObservedFile(observed, "report", reportPath, reportSha);
+        RequireObservedFile(observed, "artifact", artifactPath, artifactSha);
+        var counts = ReadOpaqueCounts(outcome.Result, label);
+
+        var evidence = new MapNode()
+            .Set("setId", setId)
+            .Set("planDigest", planDigest)
+            .Set("summarySha256", verifiedSummarySha)
+            .Set("reconciliationStatus", status)
+            .Set("reconciliationSha256", reconciliationSha)
+            .Set("reportPath", reportPath)
+            .Set("reportSha256", reportSha)
+            .Set("artifactPath", artifactPath)
+            .Set("artifactSha256", artifactSha)
+            .Set("artifactSignatureVerified", true)
+            .Set("promotable", false)
+            .Set("runCount", runCount)
+            .Set("requiredRunCount", requiredRunCount)
+            .Set("counts", counts)
+            .Set("childResultSha256", outcome.ResultSha256);
+        return (evidence, $"reconciliationStatus={status} reconciliationSha256={reconciliationSha} runs={runCount.ToString(CultureInfo.InvariantCulture)}");
+    }
+
+    /// <summary>
+    /// Requires one of the comparison's two output files to be the same file, with
+    /// the same bytes, that the observation committed.
+    /// </summary>
+    private static void RequireObservedFile(MapNode observed, string role, string path, string sha256)
+    {
+        var observedPath = observed.GetText(role + "Path")
+            ?? throw new ContractException($"The reconciliationTerminalObserved record carries no {role} path.");
+        var observedSha = observed.GetText(role + "Sha256")
+            ?? throw new ContractException($"The reconciliationTerminalObserved record carries no {role} digest.");
+        if (!PathsAreSame(path, observedPath))
+        {
+            throw new ContractException($"The verified comparison {role} is at '{path}' and this run observed '{observedPath}'.");
+        }
+        if (!string.Equals(sha256, observedSha, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The verified comparison {role} digests to {sha256} and this run observed {observedSha}.");
+        }
+    }
+
+    /// <summary>
+    /// Copies the comparison's census across without reading any of it.
+    /// </summary>
+    /// <remarks>
+    /// The only things checked are that a name is a plain identifier and a value
+    /// is a non-negative whole number, because a record has to be safe to print.
+    /// No name is compared to a literal here or anywhere else in this program:
+    /// the census is evidence to be carried, not a set of variables to reason
+    /// over.
+    /// </remarks>
+    private static ListNode ReadOpaqueCounts(JsonElement result, string label)
+    {
+        if (!result.TryGetProperty("counts", out var counts) || counts.ValueKind != JsonValueKind.Array)
+        {
+            throw new ContractException($"The {label} carries no 'counts' array.");
+        }
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var carried = new ListNode();
+        var index = 0;
+        foreach (var entry in counts.EnumerateArray())
+        {
+            var entryLabel = $"{label} count {index.ToString(CultureInfo.InvariantCulture)}";
+            if (entry.ValueKind != JsonValueKind.Object)
+            {
+                throw new ContractException($"The {entryLabel} is not an object.");
+            }
+            var name = StrictJson.RequireString(entry, "name", entryLabel);
+            if (name.Length is 0 or > 64 || !name.All(character => char.IsAsciiLetterOrDigit(character)))
+            {
+                throw new ContractException($"The {entryLabel} is named '{name}', which is not a plain identifier.");
+            }
+            if (!seen.Add(name))
+            {
+                throw new ContractException($"The {label} names '{name}' twice, so its census is ambiguous.");
+            }
+            var value = StrictJson.RequireInt(entry, "value", entryLabel, 0, int.MaxValue);
+            carried.Add(new MapNode().Set("name", name).Set("value", value));
+            index++;
+        }
+        if (index == 0)
+        {
+            throw new ContractException($"The {label} carries an empty census, so the comparison reported nothing countable.");
+        }
+        return carried;
+    }
+
+    /// <summary>Refuses a reconciliation this run's own record does not support.</summary>
+    private void RequireEverySlotVerified()
+    {
+        foreach (var stage in Stages)
+        {
+            var rank = PreparationStateNames.RankOf(stage.TerminalVerified);
+            PreparationState? recorded = null;
+            foreach (var transition in _state.Transitions)
+            {
+                if (PreparationStateNames.RankOf(transition.State) == rank)
+                {
+                    recorded = transition.State;
+                }
+            }
+            if (recorded is null)
+            {
+                throw new ContractException(
+                    $"The reconciliation covers every declared slot and this run recorded no terminal for '{stage.Name}'. A partial set is never reconciled.");
+            }
+            if (recorded != stage.TerminalVerified)
+            {
+                throw new ContractException(
+                    $"The reconciliation covers every declared slot and this run recorded '{PreparationStateNames.ToName(recorded.Value)}' for '{stage.Name}'. A failed set is never reconciled.");
+            }
+        }
+    }
+
+    private MapNode ReconciliationChildRequest()
+    {
+        var reconciliation = _request.RequireSlotSet().Reconciliation.Require();
+        if (_sealedSnapshotName.Length == 0)
+        {
+            ReadSealResult();
+        }
+        return QualificationRequest()
+            .Set("snapshotName", _sealedSnapshotName)
+            .Set("manifestDigest", _sealedSnapshotDigest)
+            .Set("launchAuthorizationTokenPath", reconciliation.LaunchAuthorizationTokenPath)
+            .Set("reconciliationOutputDirectory", reconciliation.OutputDirectory)
+            .Set("requiredRunCount", reconciliation.RequiredRunCount);
+    }
+
+    private ChildOutcome RequestReconciliationPlan(string step) => _invoker.Invoke(
+        step,
+        ChildScript(),
+        ReconciliationChildRequest(),
+        "setId",
+        "planDigest",
+        "requiredRunCount",
+        "artifactCount",
+        "outputDirectory",
+        "reconciliationAttemptExists",
+        "reconciliationReady",
+        "slotTimeoutSeconds",
+        "progressTimeoutSeconds",
+        "perCallTimeoutSeconds",
+        "head",
+        "requiredRef",
+        "headClean");
+
+    private ReconciliationPlan ReadReconciliationPlan(ChildOutcome outcome)
+    {
+        const string label = "'reconcilePlan' child result";
+        var reconciliation = _request.RequireSlotSet().Reconciliation.Require();
+        if (!StrictJson.RequireBool(outcome.Result, "reconciliationReady", label))
+        {
+            throw new ContractException("The reviewed readiness gate does not accept this set for reconciliation.");
+        }
+        if (!StrictJson.RequireBool(outcome.Result, "headClean", label))
+        {
+            throw new ContractException("The toolkit working tree is not clean, so the head a comparison would be attributed to is not the head that would run.");
+        }
+        StrictJson.RequireLiteral(outcome.Result, "requiredRef", _request.RequiredRef, label);
+        var outputDirectory = StrictJson.RequireString(outcome.Result, "outputDirectory", label);
+        if (!PathsAreSame(outputDirectory, reconciliation.OutputDirectory))
+        {
+            throw new ContractException($"The reconciliation would write to '{outputDirectory}' and the request authorized '{reconciliation.OutputDirectory}'.");
+        }
+        var plan = new ReconciliationPlan(
+            StrictJson.RequireString(outcome.Result, "setId", label),
+            StrictJson.RequireHex(outcome.Result, "planDigest", label, 64),
+            StrictJson.RequireInt(outcome.Result, "requiredRunCount", label, 2, 16),
+            StrictJson.RequireInt(outcome.Result, "artifactCount", label, 0, 16),
+            outputDirectory,
+            StrictJson.RequireBool(outcome.Result, "reconciliationAttemptExists", label),
+            StrictJson.RequireString(outcome.Result, "head", label),
+            new SlotDeadlines(
+                StrictJson.RequireInt(outcome.Result, "slotTimeoutSeconds", label, 1, 14400),
+                StrictJson.RequireInt(outcome.Result, "progressTimeoutSeconds", label, 0, 14400),
+                StrictJson.RequireInt(outcome.Result, "perCallTimeoutSeconds", label, 1, 14400),
+                reconciliation.SupervisionGraceSeconds),
+            outcome.ResultSha256);
+        _reconciliationPlan = plan;
+        return plan;
+    }
+
+    private void ReadReconciliationPlanResult()
+    {
+        var committed = _state.EvidenceFor(PreparationState.ReconciliationAuthorized);
+        var result = ReadCommittedChildResult(PreparationState.ReconciliationAuthorized, ReconcilePlanStep, "'reconcilePlan' child result");
+        var plan = ReadReconciliationPlan(new ChildOutcome(
+            0,
+            Path.Combine(_request.ExchangeRoot, _request.CorrelationId + "-" + ReconcilePlanStep + ".result.json"),
+            result,
+            committed?.GetText("childResultSha256") ?? string.Empty));
+        var authorizedDigest = committed?.GetText("planDigest");
+        if (authorizedDigest is not null && !string.Equals(plan.PlanDigest, authorizedDigest, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The resumed reconciliation plan digests to {plan.PlanDigest} and the authorization was committed against {authorizedDigest}.");
+        }
+    }
+
+    private const string ReconcilePlanStep = "reconcilePlan";
+    private const string ReconcilePrelaunchStep = "reconcilePrelaunch";
+    private const string ReconcileRunStep = "reconcileRun";
+    private const string ReconcileVerifyStep = "reconcileVerify";
 
     /// <summary>
     /// Writes the audit from the durable state alone.
@@ -1601,20 +2434,26 @@ internal sealed class PreparationMachine(
                 .Set("modelInvocationCount", readiness!.Get("modelInvocationCount") ?? Node.Null())
                 .Set("slotLaunchCount", readiness.Get("slotAttemptCount") ?? Node.Null());
         }
-        // The supervised slice reports separately, and only when it happened. A
-        // preparation that never authorized a launch says so rather than
-        // publishing zeroed slot fields that would read like a slot that ran and
-        // did nothing.
-        var terminal = _state.EvidenceAtRank(PreparationStateNames.TerminalRank);
-        var supervised = terminal is not null;
-        audit.Set("slotSupervised", supervised);
-        if (supervised)
+        // The supervised slice reports separately, and only for the slots that
+        // actually happened. A preparation that never authorized a launch
+        // publishes an empty list rather than zeroed slot fields that would read
+        // like a slot that ran and did nothing.
+        var slotRecords = new ListNode();
+        var supervisedCount = 0;
+        foreach (var stage in Stages)
         {
+            var terminal = _state.EvidenceAtRank(PreparationStateNames.RankOf(stage.TerminalVerified));
+            if (terminal is null)
+            {
+                continue;
+            }
+            supervisedCount++;
             // Every one of these is a passthrough of what the reviewed verifier
             // read out of the owner's immutable artifact. This coordinator adds
             // no interpretation, and the audit must not read as though it had.
-            audit
-                .Set("slotName", terminal!.Get("slotName") ?? Node.Null())
+            slotRecords.Add(new MapNode()
+                .Set("slotOrdinal", stage.Ordinal)
+                .Set("slotName", terminal.Get("slotName") ?? Node.Null())
                 .Set("slotSetId", terminal.Get("setId") ?? Node.Null())
                 .Set("slotPlanDigest", terminal.Get("planDigest") ?? Node.Null())
                 .Set("slotTerminalStatus", terminal.Get("terminalStatus") ?? Node.Null())
@@ -1622,9 +2461,30 @@ internal sealed class PreparationMachine(
                 .Set("slotTerminalTimedOut", terminal.Get("terminalTimedOut") ?? Node.Null())
                 .Set("slotTerminalSha256", terminal.Get("terminalSha256") ?? Node.Null())
                 .Set("slotAttemptCount", terminal.Get("slotAttemptCount") ?? Node.Null())
-                .Set("slotModelInvocationCount", terminal.Get("modelInvocationCount") ?? Node.Null());
-            var supervision = _state.EvidenceFor(PreparationState.Slot1TerminalObserved)?.Get("supervision");
-            audit.Set("slotSupervision", supervision ?? Node.Null());
+                .Set("slotModelInvocationCount", terminal.Get("modelInvocationCount") ?? Node.Null())
+                .Set("slotSupervision", _state.EvidenceFor(stage.TerminalObserved)?.Get("supervision") ?? Node.Null()));
+        }
+        audit.Set("declaredSlotCount", CoordinatorRequest.DeclaredSlotCount);
+        audit.Set("supervisedSlotCount", supervisedCount);
+        audit.Set("slots", slotRecords);
+        // The reconciliation reports status, digests and an opaque census, and
+        // nothing else. The counters are copied across by position with their
+        // names attached; no line in this program compares one of those names to
+        // anything, so no reading of the comparison can leak into the audit as a
+        // judgement dressed up as a field.
+        var reconciled = _state.EvidenceFor(PreparationState.ReconciliationVerified);
+        audit.Set("reconciliationPerformed", reconciled is not null);
+        if (reconciled is not null)
+        {
+            audit
+                .Set("reconciliationStatus", reconciled.Get("reconciliationStatus") ?? Node.Null())
+                .Set("reconciliationSha256", reconciled.Get("reconciliationSha256") ?? Node.Null())
+                .Set("reconciliationReportSha256", reconciled.Get("reportSha256") ?? Node.Null())
+                .Set("reconciliationArtifactSha256", reconciled.Get("artifactSha256") ?? Node.Null())
+                .Set("reconciliationSummarySha256", reconciled.Get("summarySha256") ?? Node.Null())
+                .Set("reconciliationRunCount", reconciled.Get("runCount") ?? Node.Null())
+                .Set("reconciliationPromotable", reconciled.Get("promotable") ?? Node.Null())
+                .Set("reconciliationCounts", reconciled.Get("counts") ?? Node.Null());
         }
         // Named for a reader who wants the one-line answer to "did this write
         // anything anywhere". The whole slice has no delivery path and no
@@ -1686,4 +2546,50 @@ internal sealed record SlotPlan(
     bool HeadClean,
     SlotDeadlines Deadlines,
     SlotAuthorization Authorization,
+    string ChildResultSha256);
+
+/// <summary>
+/// One declared slot's position in the walk: which states it commits, and which
+/// child steps carry its work.
+/// </summary>
+/// <remarks>
+/// Every slot-shaped method takes one of these rather than reading a slot name
+/// out of a field, so there is no code path that supervises "the slot" and could
+/// be pointed at the wrong one. The step names differ per slot too, which is what
+/// gives each slot its own exchange files, its own nonces and its own adoption
+/// scope: a result published for slot1 can never be adopted as slot2's answer.
+/// </remarks>
+internal sealed record SlotStage(
+    int Ordinal,
+    string Name,
+    PreparationState Authorized,
+    PreparationState Launching,
+    PreparationState Running,
+    PreparationState TerminalObserved,
+    PreparationState TerminalVerified,
+    PreparationState TerminalFailed,
+    PreparationState TerminalTimedOut,
+    string PlanStep,
+    string PrelaunchStep,
+    string RunStep,
+    string VerifyStep);
+
+/// <summary>
+/// The reviewed comparison as the coordinator needs to see it: which set, which
+/// plan, how many runs, where the output goes, and whether the single
+/// authorization has been spent.
+/// </summary>
+/// <remarks>
+/// Nothing in it describes a finding, a candidate or a verdict, because nothing
+/// this coordinator does with a reconciliation requires knowing what one said.
+/// </remarks>
+internal sealed record ReconciliationPlan(
+    string SetId,
+    string PlanDigest,
+    int RequiredRunCount,
+    int ArtifactCount,
+    string OutputDirectory,
+    bool AttemptExists,
+    string Head,
+    SlotDeadlines Deadlines,
     string ChildResultSha256);

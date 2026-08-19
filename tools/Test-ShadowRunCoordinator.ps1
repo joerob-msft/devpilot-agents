@@ -159,6 +159,12 @@ function Set-CoordinatorOutputRoot {
     #>
     param([Parameter(Mandatory)]$Request, [Parameter(Mandatory)][string]$Root)
     $Request.output.root = $Root
+    # The reconciliation writes under the output root too, and a scenario whose
+    # comparison landed in another scenario's directory would be reading a set
+    # it never declared.
+    if ($Request.PSObject.Properties['slots']) {
+        $Request.slots.reconciliation.outputDirectory = [string]([IO.Path]::GetFullPath((Join-Path $Root 'reconciliation')))
+    }
 }
 
 function New-FaultyChildAdapter {
@@ -262,22 +268,27 @@ function New-SlotStubAdapter {
     <#
     .SYNOPSIS
         Replaces the sandbox build's child adapter with one that performs every
-        PREPARATION step for real and synthesizes the three slot steps.
+        PREPARATION step for real and synthesizes the slot and reconciliation
+        steps.
 
     .DESCRIPTION
         The one place this suite stands something in, and the reason is that the
         alternative is not a cheaper test but a different test: a real slot runs
         the reviewer, and the reviewer calls models. What is under test here is
-        the typed lifecycle - authorization, durable identity, supervision,
-        restart, and the refusals - and every one of those is C#'s own. So the
-        preparation steps still run through the reviewed adapter, the run set is
-        still really declared and really signed, the launch token is still the
-        published one, and only the slot's own execution is stood in for.
+        the typed lifecycle - authorization, ordering, durable identity,
+        supervision, restart, and the refusals - and every one of those is C#'s
+        own. So the preparation steps still run through the reviewed adapter, the
+        run set is still really declared and really signed, the launch token is
+        still the published one, and only the execution is stood in for.
 
         The stub's plan is deliberately NOT a real qualification plan. It reports
         a digest of its own, so a scenario that tampered with the plan is a
         scenario the coordinator refuses on its own committed digest rather than
         on anything the qualification tools would have said.
+
+        A fault mode names the slot it applies to. Every other slot behaves, so
+        a scenario can put slot2 in a state slot1 never reached and see what the
+        set does about it rather than only what a single slot does.
 
         What the stub never does is invoke a model, and the suite asserts that
         rather than trusting this comment: the verify step reports a census of
@@ -288,7 +299,16 @@ function New-SlotStubAdapter {
         [Parameter(Mandatory)][string]$RealAdapter,
         [Parameter(Mandatory)][ValidateSet('complete', 'failed', 'timedOut', 'noTerminal', 'hang',
             'nonzeroNoTerminal', 'wrongSlot', 'wrongSetId', 'contradictoryTimeout',
-            'writableTerminal', 'secondAttempt')][string]$Mode,
+            'writableTerminal', 'secondAttempt', 'crossSlotTerminal',
+            'reconcileNoSummary', 'reconcileWrongSummaryPath', 'reconcileTamperSummary',
+            'reconcileHang', 'reconcileNonzeroNoSummary', 'reconcileUnsigned',
+            'reconcilePromotable', 'reconcileShortRuns', 'reconcileEmptyCounts',
+            'reconcileDuplicateCounts', 'reconcileBadCountName', 'reconcileWrongSetId',
+            'reconcileNotReady', 'reconcileAttemptPresent', 'reconcileSwapArtifact',
+            'reconcileRewriteReport')][string]$Mode,
+        # The slot a slot-scoped fault mode applies to. Slots other than this one
+        # always complete, so a two-slot scenario can isolate the failure.
+        [ValidateRange(1, 2)][int]$ModeSlot = 1,
         [int]$SlotTimeoutSeconds = 900,
         [int]$ProgressTimeoutSeconds = 0,
         [int]$PerCallTimeoutSeconds = 300,
@@ -306,6 +326,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $mode = '__MODE__'
+$modeSlot = __MODESLOT__
 $real = '__REAL__'
 $slotTimeoutSeconds = __SLOTTIMEOUT__
 $progressTimeoutSeconds = __PROGRESSTIMEOUT__
@@ -318,8 +339,8 @@ $resultPath = [string]$request.resultPath
 $correlationId = [string]$request.correlationId
 $childRequestSha256 = [string]$request.childRequestSha256
 
-# Preparation is not stood in for. Only the slot is.
-if (-not $step.StartsWith('slot')) {
+# Preparation is not stood in for. Only the slots and the comparison are.
+if (-not ($step.StartsWith('slot') -or $step.StartsWith('reconcile'))) {
     $global:LASTEXITCODE = 0
     & $real -RequestPath $RequestPath
     exit ([int]$global:LASTEXITCODE)
@@ -349,9 +370,6 @@ function Get-StubSha256Text {
 
 $qualificationRoot = [string]$request.qualificationRoot
 $stubRoot = Join-Path $qualificationRoot 'stub'
-$stateDir = Join-Path $stubRoot 'slot1-state'
-$attemptPath = Join-Path $stubRoot 'slot1-attempt.json'
-$terminalPath = Join-Path $stubRoot 'slot1-terminal.json'
 
 # The run set identity is taken from the coordinator's own committed
 # verification result rather than re-derived, because re-deriving it means
@@ -369,13 +387,221 @@ $publishedToken = Join-Path (Join-Path $qualificationRoot 'runset') 'launch-auth
 $launchHash = Get-StubSha256Text -Text (([IO.File]::ReadAllText($publishedToken)).Trim())
 $planDigest = Get-StubSha256Text -Text "stub-plan|$setId|$mode"
 
-if ($step -eq 'slotPlan' -or $step -eq 'slotPrelaunch') {
+# ---------------------------------------------------------------------------
+# The comparison, stood in for.
+# ---------------------------------------------------------------------------
+if ($step.StartsWith('reconcile')) {
+    $outputDirectory = [string]$request.reconciliationOutputDirectory
+    $attemptPath = Join-Path $outputDirectory 'reconcile-attempt.json'
+    $requiredRunCount = [int]$request.requiredRunCount
+    $reconcileSetId = $(if ($mode -eq 'reconcileWrongSetId') { 'not-this-run-set' } else { $setId })
+
+    if ($step -eq 'reconcilePlan' -or $step -eq 'reconcilePrelaunch') {
+        $artifacts = 0
+        foreach ($ordinal in 1..$requiredRunCount) {
+            if (Test-Path -LiteralPath (Join-Path $stubRoot "slot$ordinal-terminal.json") -PathType Leaf) { $artifacts++ }
+        }
+        Write-StubResult -Fields ([ordered]@{
+                setId = $reconcileSetId
+                planDigest = $planDigest
+                requiredRunCount = $requiredRunCount
+                artifactCount = $artifacts
+                outputDirectory = $outputDirectory
+                reconciliationAttemptExists = [bool]((Test-Path -LiteralPath $attemptPath) -or ($mode -eq 'reconcileAttemptPresent'))
+                reconciliationReady = [bool]($mode -ne 'reconcileNotReady')
+                slotTimeoutSeconds = $(if ($mode -eq 'reconcileHang') { 1 } else { $slotTimeoutSeconds })
+                progressTimeoutSeconds = $progressTimeoutSeconds
+                perCallTimeoutSeconds = $(if ($mode -eq 'reconcileHang') { 1 } else { $perCallTimeoutSeconds })
+                head = [string](& git -C ([string]$request.toolkitRoot) rev-parse HEAD).Trim()
+                requiredRef = [string]$request.requiredRef
+                headClean = $true
+            })
+        exit 0
+    }
+
+    if ($step -eq 'reconcileRun') {
+        $inputPath = [string]$request.reconciliationRequestPath
+        if (-not (Test-Path -LiteralPath $inputPath -PathType Leaf)) {
+            throw "The reconciliation input '$inputPath' does not exist."
+        }
+        $inputDocument = Get-Content -LiteralPath $inputPath -Raw | ConvertFrom-Json -Depth 12
+        $actualInputSha = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($inputPath))).ToLowerInvariant()
+        if ($actualInputSha -cne [string]$request.reconciliationRequestSha256) {
+            throw "The reconciliation input at '$inputPath' is not the document the caller committed."
+        }
+        [void](New-Item -ItemType Directory -Force -Path $outputDirectory)
+        # CreateNew, exactly as the reviewed comparison adapter does it: the
+        # attempt record is the single-use marker for the whole set.
+        $attempt = [IO.File]::Open($attemptPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write)
+        try {
+            $attemptBytes = ([Text.UTF8Encoding]::new($false, $true)).GetBytes("{`"setId`":`"$setId`"}")
+            $attempt.Write($attemptBytes, 0, $attemptBytes.Length)
+        }
+        finally { $attempt.Dispose() }
+
+        if ($mode -eq 'reconcileHang') { Start-Sleep -Seconds 600; exit 0 }
+        if ($runDelaySeconds -gt 0) {
+            # Touched rather than merely slept through, so a supervisor bounded by
+            # an activity deadline sees the comparison working rather than idle.
+            $deadline = [DateTime]::UtcNow.AddSeconds($runDelaySeconds)
+            while ([DateTime]::UtcNow -lt $deadline) {
+                [IO.File]::WriteAllText((Join-Path $outputDirectory 'heartbeat.json'),
+                    ('{"atUtc":"' + [DateTime]::UtcNow.ToString('o') + '"}'))
+                Start-Sleep -Milliseconds 500
+            }
+        }
+        if ($mode -eq 'reconcileNonzeroNoSummary') { exit 9 }
+        if ($mode -eq 'reconcileNoSummary') {
+            Write-StubResult -Fields ([ordered]@{
+                    summaryWritten = $false
+                    summaryPath = [string]$inputDocument.summaryPath
+                    summarySha256 = ('0' * 64)
+                    comparisonExitCode = 0
+                    setId = $reconcileSetId
+                    planDigest = $planDigest
+                    reportPath = (Join-Path $outputDirectory 'no-report.md')
+                    reportSha256 = ('0' * 64)
+                    artifactPath = (Join-Path $outputDirectory 'no-artifact.json')
+                    artifactSha256 = ('0' * 64)
+                })
+            exit 0
+        }
+
+        $summaryPath = [string]$inputDocument.summaryPath
+        if ($mode -eq 'reconcileWrongSummaryPath') {
+            $summaryPath = Join-Path $outputDirectory 'somewhere-else.json'
+        }
+        $reportPath = Join-Path $outputDirectory 'reconciliation-stub.md'
+        $artifactPath = Join-Path $outputDirectory 'reconciliation-stub.json'
+        [IO.File]::WriteAllText($reportPath, "# stub reconciliation`n")
+        [IO.File]::WriteAllText($artifactPath, '{"kind":"reviewer.run-reconciliation"}')
+        $summary = [ordered]@{
+            contractVersion = 'devpilot.shadow-run-coordinator.reconciliation-summary.v1'
+            kind = 'shadow-run-coordinator-reconciliation-summary'
+            correlationId = $correlationId
+            reconciliationRequestSha256 = $actualInputSha
+            setId = $reconcileSetId
+            planDigest = $planDigest
+            requiredRunCount = $requiredRunCount
+            comparisonExitCode = 0
+            reportPath = $reportPath
+            artifactPath = $artifactPath
+            generatedAtUtc = [DateTime]::UtcNow.ToString('o')
+        }
+        $summaryText = ConvertTo-Json -InputObject $summary -Depth 8
+        [void](New-Item -ItemType Directory -Force -Path (Split-Path $summaryPath -Parent))
+        [IO.File]::WriteAllText($summaryPath, $summaryText, [Text.UTF8Encoding]::new($false))
+        $summarySha = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($summaryPath))).ToLowerInvariant()
+        if ($mode -eq 'reconcileTamperSummary') {
+            # Reported honestly, then changed underneath. The coordinator rehashes
+            # the file it was pointed at rather than believing the number.
+            [IO.File]::WriteAllText($summaryPath, $summaryText + "`n", [Text.UTF8Encoding]::new($false))
+        }
+        Write-StubResult -Fields ([ordered]@{
+                summaryWritten = $true
+                summaryPath = $summaryPath
+                summarySha256 = $summarySha
+                comparisonExitCode = 0
+                setId = $reconcileSetId
+                planDigest = $planDigest
+                reportPath = $reportPath
+                reportSha256 = [Convert]::ToHexString(
+                    [Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($reportPath))).ToLowerInvariant()
+                artifactPath = $artifactPath
+                artifactSha256 = [Convert]::ToHexString(
+                    [Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($artifactPath))).ToLowerInvariant()
+            })
+        exit 0
+    }
+
+    if ($step -eq 'reconcileVerify') {
+        $summaryPath = [string]$request.summaryPath
+        if (-not (Test-Path -LiteralPath $summaryPath -PathType Leaf)) {
+            throw "The reconciliation summary '$summaryPath' does not exist."
+        }
+        $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json -Depth 12
+        $summarySha = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($summaryPath))).ToLowerInvariant()
+        $reportPath = [string]$summary.reportPath
+        $artifactPath = [string]$summary.artifactPath
+        if ($mode -eq 'reconcileSwapArtifact') {
+            # A different sealed comparison, verifying perfectly well on its own
+            # terms, offered in place of the one this run watched being produced.
+            $artifactPath = Join-Path $outputDirectory 'another-reconciliation.json'
+            [IO.File]::WriteAllText($artifactPath, '{"kind":"reviewer.run-reconciliation","other":true}')
+        }
+        if ($mode -eq 'reconcileRewriteReport') {
+            # Same path, rewritten between the comparison and the verification.
+            [IO.File]::WriteAllText($reportPath, "# stub reconciliation`n# and one more line`n")
+        }
+        $counts = @(
+            [ordered]@{ name = 'runs'; value = $requiredRunCount }
+            [ordered]@{ name = 'stableRows'; value = 3 }
+            [ordered]@{ name = 'unstableRows'; value = 0 }
+        )
+        if ($mode -eq 'reconcileEmptyCounts') { $counts = @() }
+        if ($mode -eq 'reconcileDuplicateCounts') {
+            $counts = @(
+                [ordered]@{ name = 'runs'; value = $requiredRunCount }
+                [ordered]@{ name = 'runs'; value = 1 }
+            )
+        }
+        if ($mode -eq 'reconcileBadCountName') {
+            $counts = @([ordered]@{ name = 'runs-total'; value = $requiredRunCount })
+        }
+        Write-StubResult -Fields ([ordered]@{
+                summarySha256 = $summarySha
+                reconciliationStatus = 'reconciled'
+                reconciliationSha256 = (Get-StubSha256Text -Text "stub-reconciliation|$setId")
+                reportPath = $reportPath
+                reportSha256 = [Convert]::ToHexString(
+                    [Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($reportPath))).ToLowerInvariant()
+                artifactPath = $artifactPath
+                artifactSha256 = [Convert]::ToHexString(
+                    [Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($artifactPath))).ToLowerInvariant()
+                artifactSignatureVerified = [bool]($mode -ne 'reconcileUnsigned')
+                artifactPromotable = [bool]($mode -eq 'reconcilePromotable')
+                runCount = $(if ($mode -eq 'reconcileShortRuns') { 1 } else { $requiredRunCount })
+                requiredRunCount = $requiredRunCount
+                setId = $reconcileSetId
+                planDigest = $planDigest
+                counts = $counts
+            })
+        exit 0
+    }
+    throw "'$step' is not a step this stub adapter performs."
+}
+
+# ---------------------------------------------------------------------------
+# The slots, stood in for. One state root, attempt record and terminal each.
+# ---------------------------------------------------------------------------
+if ($step -match '^slot([0-9]+)(Plan|Prelaunch|Run|Verify)\z') {
+    $ordinal = [int]$Matches[1]
+    $phase = [string]$Matches[2]
+}
+else {
+    throw "'$step' is not a step this stub adapter performs."
+}
+$slotName = "slot$ordinal"
+if ([string]$request.slotName -cne $slotName) {
+    throw "Step '$step' acts on '$slotName' and the request names slot '$([string]$request.slotName)'."
+}
+$stateDir = Join-Path $stubRoot "$slotName-state"
+$attemptPath = Join-Path $stubRoot "$slotName-attempt.json"
+$terminalPath = Join-Path $stubRoot "$slotName-terminal.json"
+# A fault mode belongs to one slot. Every other slot completes, so a scenario
+# sees the set's reaction to one bad slot rather than to a broken stub.
+$slotMode = $(if ($ordinal -eq $modeSlot -and -not $mode.StartsWith('reconcile')) { $mode } else { 'complete' })
+
+if ($phase -eq 'Plan' -or $phase -eq 'Prelaunch') {
     Write-StubResult -Fields ([ordered]@{
             setId = $setId
             planDigest = $planDigest
             launchAuthorizationHash = $launchHash
             reviewerScriptSha256 = (Get-FileHash -LiteralPath ([string]$request.reviewerScriptPath) -Algorithm SHA256).Hash.ToLowerInvariant()
-            slotName = 'slot1'
+            slotName = $slotName
             slotStateDir = [string]$stateDir
             slotTerminalPath = [string]$terminalPath
             slotAttemptExists = [bool](Test-Path -LiteralPath $attemptPath)
@@ -392,7 +618,7 @@ if ($step -eq 'slotPlan' -or $step -eq 'slotPrelaunch') {
     exit 0
 }
 
-if ($step -eq 'slotRun') {
+if ($phase -eq 'Run') {
     [void](New-Item -ItemType Directory -Force -Path $stubRoot)
     [void](New-Item -ItemType Directory -Force -Path $stateDir)
     # CreateNew, exactly as the reviewed slot runner does it: the attempt record
@@ -400,16 +626,17 @@ if ($step -eq 'slotRun') {
     # system rather than on a check something could skip.
     $attempt = [IO.File]::Open($attemptPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write)
     try {
-        $attemptBytes = ([Text.UTF8Encoding]::new($false, $true)).GetBytes("{`"slot`":`"slot1`",`"setId`":`"$setId`"}")
+        $attemptBytes = ([Text.UTF8Encoding]::new($false, $true)).GetBytes("{`"slot`":`"$slotName`",`"setId`":`"$setId`"}")
         $attempt.Write($attemptBytes, 0, $attemptBytes.Length)
     }
     finally { $attempt.Dispose() }
-    if ($mode -eq 'secondAttempt') {
-        # A second attempt record appearing behind the coordinator's back, which
-        # is what a hand-run of the PowerShell path alongside it would leave.
-        [IO.File]::WriteAllText((Join-Path $stubRoot 'slot2-attempt.json'), '{"slot":"slot2"}')
+    if ($slotMode -eq 'secondAttempt') {
+        # A second attempt record for this same slot appearing behind the
+        # coordinator's back, which is what a hand-run of the PowerShell path
+        # alongside it would leave.
+        [IO.File]::WriteAllText((Join-Path $stubRoot 'slot9-attempt.json'), '{"slot":"slot9"}')
     }
-    if ($mode -eq 'hang') { Start-Sleep -Seconds 600; exit 0 }
+    if ($slotMode -eq 'hang') { Start-Sleep -Seconds 600; exit 0 }
     if ($runDelaySeconds -gt 0) {
         # Touched rather than merely slept through, so a supervisor bounded by an
         # activity deadline sees the slot working rather than idle.
@@ -420,30 +647,33 @@ if ($step -eq 'slotRun') {
             Start-Sleep -Milliseconds 500
         }
     }
-    if ($mode -eq 'noTerminal') {
+    if ($slotMode -eq 'noTerminal') {
         Write-StubResult -Fields ([ordered]@{
                 terminalWritten = $false
                 terminalPath = [string]$terminalPath
                 childExitCode = 0
-                slotName = 'slot1'
+                slotName = $slotName
                 setId = $setId
                 planDigest = $planDigest
             })
         exit 0
     }
-    if ($mode -eq 'nonzeroNoTerminal') { exit 7 }
+    if ($slotMode -eq 'nonzeroNoTerminal') { exit 7 }
 
-    $status = switch ($mode) {
+    $status = switch ($slotMode) {
         'failed' { 'failed' }
         'timedOut' { 'timedOut' }
         default { 'complete' }
     }
     $timedOut = ($status -eq 'timedOut')
-    if ($mode -eq 'contradictoryTimeout') { $timedOut = $true }
+    if ($slotMode -eq 'contradictoryTimeout') { $timedOut = $true }
+    $terminalSlot = $slotName
+    if ($slotMode -eq 'wrongSlot') { $terminalSlot = "slot$(($ordinal % 2) + 1)" }
+    if ($slotMode -eq 'crossSlotTerminal') { $terminalSlot = 'slot9' }
     $terminal = [ordered]@{
         kind = 'reviewer.replay-qualification.terminal.v1'
-        slot = $(if ($mode -eq 'wrongSlot') { 'slot2' } else { 'slot1' })
-        setId = $(if ($mode -eq 'wrongSetId') { 'not-this-run-set' } else { $setId })
+        slot = $terminalSlot
+        setId = $(if ($slotMode -eq 'wrongSetId') { 'not-this-run-set' } else { $setId })
         planDigest = $planDigest
         status = $status
         exitCode = $(if ($status -eq 'complete') { 0 } else { 3 })
@@ -454,14 +684,14 @@ if ($step -eq 'slotRun') {
     }
     $terminalText = ConvertTo-Json -InputObject $terminal -Depth 8 -Compress:$false
     [IO.File]::WriteAllBytes($terminalPath, ([Text.UTF8Encoding]::new($false, $true)).GetBytes($terminalText))
-    if ($mode -ne 'writableTerminal') {
+    if ($slotMode -ne 'writableTerminal') {
         (Get-Item -LiteralPath $terminalPath).IsReadOnly = $true
     }
     Write-StubResult -Fields ([ordered]@{
             terminalWritten = $true
             terminalPath = [string]$terminalPath
             childExitCode = [int]$terminal.exitCode
-            slotName = 'slot1'
+            slotName = $slotName
             setId = $setId
             planDigest = $planDigest
         })
@@ -471,35 +701,33 @@ if ($step -eq 'slotRun') {
     exit ([int]$terminal.exitCode)
 }
 
-if ($step -eq 'slotVerify') {
-    if (-not (Test-Path -LiteralPath $terminalPath -PathType Leaf)) {
-        throw "Slot 'slot1' has no terminal evidence under '$stubRoot'."
-    }
-    $terminal = Get-Content -LiteralPath $terminalPath -Raw | ConvertFrom-Json -Depth 8
-    $bytes = [IO.File]::ReadAllBytes($terminalPath)
-    $attempts = @(Get-ChildItem -LiteralPath $stubRoot -Filter 'slot*-attempt.json' -File -ErrorAction SilentlyContinue)
-    Write-StubResult -Fields ([ordered]@{
-            terminalStatus = [string]$terminal.status
-            terminalExitCode = [int]$terminal.exitCode
-            terminalTimedOut = [bool]$terminal.timedOut
-            terminalImmutable = [bool](Get-Item -LiteralPath $terminalPath).IsReadOnly
-            terminalSetId = [string]$terminal.setId
-            terminalPlanDigest = [string]$terminal.planDigest
-            terminalSlot = [string]$terminal.slot
-            terminalPath = [string]$terminalPath
-            terminalSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
-            signatureVerified = $true
-            inventoryVerified = $true
-            slotAttemptCount = [int]$attempts.Count
-            modelInvocationCount = 0
-            deliveryMode = 'PreviewOnly'
-            promotable = $false
-        })
-    exit 0
+if (-not (Test-Path -LiteralPath $terminalPath -PathType Leaf)) {
+    throw "Slot '$slotName' has no terminal evidence under '$stubRoot'."
 }
-throw "'$step' is not a step this stub adapter performs."
+$terminal = Get-Content -LiteralPath $terminalPath -Raw | ConvertFrom-Json -Depth 8
+$bytes = [IO.File]::ReadAllBytes($terminalPath)
+$attempts = @(Get-ChildItem -LiteralPath $stubRoot -Filter 'slot*-attempt.json' -File -ErrorAction SilentlyContinue)
+Write-StubResult -Fields ([ordered]@{
+        terminalStatus = [string]$terminal.status
+        terminalExitCode = [int]$terminal.exitCode
+        terminalTimedOut = [bool]$terminal.timedOut
+        terminalImmutable = [bool](Get-Item -LiteralPath $terminalPath).IsReadOnly
+        terminalSetId = [string]$terminal.setId
+        terminalPlanDigest = [string]$terminal.planDigest
+        terminalSlot = [string]$terminal.slot
+        terminalPath = [string]$terminalPath
+        terminalSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+        signatureVerified = $true
+        inventoryVerified = $true
+        slotAttemptCount = [int]$attempts.Count
+        modelInvocationCount = 0
+        deliveryMode = 'PreviewOnly'
+        promotable = $false
+    })
+exit 0
 '@
     $rendered = $body -replace '__MODE__', $Mode
+    $rendered = $rendered -replace '__MODESLOT__', [string]$ModeSlot
     $rendered = $rendered -replace '__REAL__', ($RealAdapter -replace '\\', '\\')
     $rendered = $rendered -replace '__SLOTTIMEOUT__', [string]$SlotTimeoutSeconds
     $rendered = $rendered -replace '__PROGRESSTIMEOUT__', [string]$ProgressTimeoutSeconds
@@ -536,8 +764,19 @@ function Initialize-SlotRunSet {
     )
     Restore-ChildAdapter -ToolkitCopy $Fixture.ToolkitCopy -RepoRoot $RepositoryRoot
     $setup = Invoke-Coordinator -RequestPath $RequestPath -Target 'runSetReady'
+    # A setup failure is reported with the child's own stderr, because a bare
+    # exit code from a step that ran the real qualification tools names nothing
+    # a reader could act on.
+    $setupDetail = ''
+    $logDirectory = Join-Path $OutputRoot 'coordinator\logs'
+    if (Test-Path -LiteralPath $logDirectory -PathType Container) {
+        foreach ($childLog in @(Get-ChildItem -LiteralPath $logDirectory -Filter '*.log' -File |
+                Where-Object { $_.Length -gt 0 } | Sort-Object -Property LastWriteTimeUtc | Select-Object -Last 4)) {
+            $setupDetail += "`n--- $($childLog.Name) ---`n" + [IO.File]::ReadAllText($childLog.FullName)
+        }
+    }
     Assert-Coordinator ($setup.ExitCode -eq 0) `
-        "The $Label setup did not reach run-set-ready (exit $($setup.ExitCode)).`n$($setup.Output)"
+        "The $Label setup did not reach run-set-ready (exit $($setup.ExitCode)).`n$($setup.Output)$setupDetail"
     [void](Publish-ShadowCoordinatorLaunchToken `
             -RunSetDirectory (Join-Path $OutputRoot 'qualification\runset') `
             -TokenPath $Fixture.LaunchTokenPath)
@@ -581,7 +820,7 @@ try {
     # resolve against whatever scope happens to run the closure later.
     $setOutputRoot = ${function:Set-CoordinatorOutputRoot}
 
-    Write-Host '1/23 offline restore and build' -ForegroundColor Cyan
+    Write-Host '1/26 offline restore and build' -ForegroundColor Cyan
     $project = Join-Path $RepoRoot 'tools\ShadowRunCoordinator\ShadowRunCoordinator.csproj'
     Assert-Coordinator (Test-Path -LiteralPath $project -PathType Leaf) `
         'The shadow run coordinator project is missing.'
@@ -600,7 +839,7 @@ try {
         'The coordinator assembly was not produced.'
 
     # -----------------------------------------------------------------------
-    Write-Host '2/23 sandbox, sealed corpus and typed request' -ForegroundColor Cyan
+    Write-Host '2/26 sandbox, sealed corpus and typed request' -ForegroundColor Cyan
     Import-Module (Join-Path $RepoRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force
     . (Join-Path $RepoRoot 'src\Agents\reviewer\SourceTransport.ps1')
     . (Join-Path $RepoRoot 'src\Agents\reviewer\CorpusSeal.ps1')
@@ -617,7 +856,7 @@ try {
         'The request does not bind a prompt-asset digest.'
 
     # -----------------------------------------------------------------------
-    Write-Host '3/23 restart at every transition' -ForegroundColor Cyan
+    Write-Host '3/26 restart at every transition' -ForegroundColor Cyan
     $states = @('requestValidated', 'corpusStaging', 'corpusPublished', 'corpusValidated',
         'recipePlanned', 'snapshotValidateOnly', 'snapshotSealed', 'snapshotVerified',
         'runSetDeclared', 'runSetVerified')
@@ -645,7 +884,7 @@ try {
             "Resuming to an already-reached '$state' advanced the sequence to $($repeat.sequence)."
     }
 
-    Write-Host '4/23 preparation reaches run-set-ready' -ForegroundColor Cyan
+    Write-Host '4/26 preparation reaches run-set-ready' -ForegroundColor Cyan
     $final = Invoke-Coordinator -RequestPath $fixture.RequestPath
     Assert-Coordinator ($final.ExitCode -eq 0) "The preparation did not reach run-set-ready (exit $($final.ExitCode)): $($final.Output)"
     $durable = Get-CoordinatorState -OutputRoot $fixture.OutputRoot
@@ -674,7 +913,7 @@ try {
         "Replaying a completed preparation advanced the sequence to $($afterReplay.sequence)."
 
     # -----------------------------------------------------------------------
-    Write-Host '5/23 audit indexes all twelve stage artifacts' -ForegroundColor Cyan
+    Write-Host '5/26 audit indexes all twelve stage artifacts' -ForegroundColor Cyan
     $auditPath = Join-Path $fixture.OutputRoot 'coordinator\audit.json'
     Assert-Coordinator (Test-Path -LiteralPath $auditPath -PathType Leaf) 'The coordinator wrote no audit.'
     $audit = Get-Content -LiteralPath $auditPath -Raw | ConvertFrom-Json -Depth 32
@@ -700,7 +939,7 @@ try {
         'The preparation observed a slot attempt.'
 
     # -----------------------------------------------------------------------
-    Write-Host '6/23 stage publication parity with the PowerShell path' -ForegroundColor Cyan
+    Write-Host '6/26 stage publication parity with the PowerShell path' -ForegroundColor Cyan
     # The same stage publication, driven directly through the existing PowerShell
     # entry point instead of through the coordinator's child process. Byte
     # identical artifacts are what makes the rollback switch real at THIS seam:
@@ -741,7 +980,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    Write-Host '7/23 request boundary: unknown, missing, scalar, null, BOM, truncated' -ForegroundColor Cyan
+    Write-Host '7/26 request boundary: unknown, missing, scalar, null, BOM, truncated' -ForegroundColor Cyan
     # Built through a list rather than an @(...) literal: the mutators set fields
     # to $null on purpose, and inside an array expression that reads as an array
     # that can carry a null element. It cannot -- the nulls are inside script
@@ -756,7 +995,7 @@ try {
     [void]$variants.Add(@{ Name = 'null-string'; Mutate = { param($r) $r.qualification.operatorAlias = $null }; Match = 'operatorAlias' })
     [void]$variants.Add(@{ Name = 'short-hex'; Mutate = { param($r) $r.toolkit.head = 'abc' }; Match = 'head' })
     [void]$variants.Add(@{ Name = 'upper-hex'; Mutate = { param($r) $r.digests.configSha256 = ($r.digests.configSha256).ToUpperInvariant() }; Match = 'configSha256' })
-    [void]$variants.Add(@{ Name = 'wrong-contract'; Mutate = { param($r) $r.contractVersion = 'devpilot.shadow-run-coordinator.request.v2' }; Match = 'contractVersion' })
+    [void]$variants.Add(@{ Name = 'wrong-contract'; Mutate = { param($r) $r.contractVersion = 'devpilot.shadow-run-coordinator.request.v3' }; Match = 'contractVersion' })
     [void]$variants.Add(@{ Name = 'wrong-kind'; Mutate = { param($r) $r.kind = 'something-else' }; Match = 'kind' })
     [void]$variants.Add(@{ Name = 'run-count-low'; Mutate = { param($r) $r.qualification.plannedRunCount = 1 }; Match = 'plannedRunCount' })
     [void]$variants.Add(@{ Name = 'run-count-high'; Mutate = { param($r) $r.qualification.plannedRunCount = 17 }; Match = 'plannedRunCount' })
@@ -789,7 +1028,7 @@ try {
         'A missing request file was not refused.'
 
     # -----------------------------------------------------------------------
-    Write-Host '8/23 stale head, stale identity and tampered state' -ForegroundColor Cyan
+    Write-Host '8/26 stale head, stale identity and tampered state' -ForegroundColor Cyan
     $staleHeadPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'stale-head' -Mutate {
         param($r)
         $r.toolkit.head = ('f' * 40)
@@ -848,7 +1087,7 @@ try {
         "A state file from another correlation was adopted (exit $($foreign.ExitCode))."
 
     # -----------------------------------------------------------------------
-    Write-Host '9/23 single-run lease' -ForegroundColor Cyan
+    Write-Host '9/26 single-run lease' -ForegroundColor Cyan
     $leaseRoot = Join-Path $sandbox 'out-lease'
     $leasePath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'lease' -Mutate {
         param($r) & $setOutputRoot -Request $r -Root $leaseRoot
@@ -883,7 +1122,7 @@ try {
         "An abandoned lease wedged the output root (exit $($recovered.ExitCode))."
 
     # -----------------------------------------------------------------------
-    Write-Host '10/23 child fault matrix' -ForegroundColor Cyan
+    Write-Host '10/26 child fault matrix' -ForegroundColor Cyan
     $faults = @(
         @{ Name = 'nonzero'; Expect = 4 },
         @{ Name = 'missing'; Expect = 4 },
@@ -951,7 +1190,7 @@ try {
     Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot
 
     # -----------------------------------------------------------------------
-    Write-Host '11/23 killed mid-transition' -ForegroundColor Cyan
+    Write-Host '11/26 killed mid-transition' -ForegroundColor Cyan
     # A real external kill, not a cooperative halt: the coordinator is stopped
     # while a child is running, and the root must still converge.
     $killRoot = Join-Path $sandbox 'out-kill'
@@ -988,7 +1227,7 @@ try {
         "The resumed preparation left $($declared.Count) declared run sets rather than one."
 
     # -----------------------------------------------------------------------
-    Write-Host '12/23 pre-commit window: a published side effect is adopted' -ForegroundColor Cyan
+    Write-Host '12/26 pre-commit window: a published side effect is adopted' -ForegroundColor Cyan
     # The fault a control plane cannot test its way out of by halting: a child
     # completes a durable, NON-REPEATABLE side effect and the coordinator dies
     # before it can commit the transition. Every --halt-after case above stops
@@ -1188,7 +1427,7 @@ try {
     Assert-Coordinator (@(Get-ChildItem -LiteralPath $stageDirectory -File -Filter '*.stage.json').Count -eq 12) `
         'The retry accumulated stage artifacts instead of replacing them.'
     # -----------------------------------------------------------------------
-    Write-Host '13/23 resume integrity and the declared artifact directory' -ForegroundColor Cyan
+    Write-Host '13/26 resume integrity and the declared artifact directory' -ForegroundColor Cyan
     # A resumed run re-reads its child results from the exchange directory, which
     # carries no signature of its own. Without binding them to the digest the
     # signed record committed, a resume could adopt a snapshot or run set other
@@ -1260,7 +1499,7 @@ try {
         'A missing option value escaped as an unhandled exception.'
 
     # -----------------------------------------------------------------------
-    Write-Host '14/23 changed-path census boundary' -ForegroundColor Cyan
+    Write-Host '14/26 changed-path census boundary' -ForegroundColor Cyan
     # The census is declared by the caller and validated here, never synthesised.
     # Zero, one, many, duplicated, misordered, scalar, null and unknown all have
     # to have an answer, because the census reaches the published bytes.
@@ -1299,7 +1538,7 @@ try {
         'A missing changed-path census was not refused.'
 
     # -----------------------------------------------------------------------
-    Write-Host '15/23 a declaration must belong to this preparation' -ForegroundColor Cyan
+    Write-Host '15/26 a declaration must belong to this preparation' -ForegroundColor Cyan
     # A signature proves a declaration was made under this output root's key. It
     # does NOT prove the declaration is about the snapshot this run sealed - one
     # key signs every declaration in a root, so a declaration left behind by an
@@ -1435,7 +1674,7 @@ try {
         "The refusal did not name the plan the declaration was sealed under.`n$borrowReason"
 
     # -----------------------------------------------------------------------
-    Write-Host '16/23 the audit says only what the record can support' -ForegroundColor Cyan
+    Write-Host '16/26 the audit says only what the record can support' -ForegroundColor Cyan
     # An audit whose counters come from this process cannot see work an earlier
     # process did, and a null count coerces to the reassuring zero in every
     # consumer that reads it. Both are properties of the durable record here.
@@ -1470,7 +1709,7 @@ try {
         'The resumed audit did not grow its child-backed transition census.'
 
     # -----------------------------------------------------------------------
-    Write-Host '17/23 a root that has done nothing is not wedged' -ForegroundColor Cyan
+    Write-Host '17/26 a root that has done nothing is not wedged' -ForegroundColor Cyan
     # The refusal that protects a destroyed record must not be reachable by a
     # first attempt that simply failed. A run refused at requestValidated has
     # published nothing, so the same root with a corrected request has to work -
@@ -1612,7 +1851,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    Write-Host '18/23 slot authorization against the real qualification plan' -ForegroundColor Cyan
+    Write-Host '18/26 slot authorization against the real qualification plan' -ForegroundColor Cyan
     # The one slot scenario that stands NOTHING in. The plan is built by the
     # production builder, bound to the signed declaration by the production
     # assertions, and the launch token is the one the declaration published. It
@@ -1625,7 +1864,7 @@ try {
         -Mutate {
             param($r)
             & $setOutputRoot -Request $r -Root $authRoot
-            $r.slot.shadowSlotEnabled = $true
+            $r.slots.shadowSlotsEnabled = $true
         }.GetNewClosure()
     Assert-Coordinator ((Invoke-Coordinator -RequestPath $authPath -Target 'runSetReady').ExitCode -eq 0) `
         'The slot-authorization setup did not reach run-set-ready.'
@@ -1654,19 +1893,58 @@ try {
     [void](Publish-ShadowCoordinatorLaunchToken -RunSetDirectory $authRunSet `
             -TokenPath $fixture.LaunchTokenPath)
     $disabledPath = New-CoordinatorRequestVariant -BasePath $authPath -Name 'slot-disabled' `
-        -Mutate { param($r) $r.slot.shadowSlotEnabled = $false }
+        -Mutate { param($r) $r.slots.shadowSlotsEnabled = $false }
     $disabled = Invoke-Coordinator -RequestPath $disabledPath -Target 'slot1Authorized'
     Assert-Coordinator ($disabled.ExitCode -eq 2) `
         "A slot target without the shadow flag exited $($disabled.ExitCode) rather than refusing."
-    Assert-Coordinator ($disabled.Output -match "shadowSlotEnabled") `
+    Assert-Coordinator ($disabled.Output -match "shadowSlotsEnabled") `
         "The refusal did not name the disabled shadow flag.`n$($disabled.Output)"
-    $slot2Path = New-CoordinatorRequestVariant -BasePath $authPath -Name 'slot-two' `
-        -Mutate { param($r) $r.slot.name = 'slot2' }
-    $slot2 = Invoke-Coordinator -RequestPath $slot2Path -Target 'slot1Authorized'
-    Assert-Coordinator ($slot2.ExitCode -eq 2) `
-        "A request naming slot2 exited $($slot2.ExitCode) rather than refusing."
-    Assert-Coordinator ($slot2.Output -match 'supervises exactly one slot') `
-        "The refusal did not say this build supervises one slot.`n$($slot2.Output)"
+    # A request whose declared set is not the shape this build supervises is
+    # refused before anything is authorized, and the refusal names the shape
+    # rather than quietly supervising whichever slots it recognized.
+    $oneSlotPath = New-CoordinatorRequestVariant -BasePath $authPath -Name 'slot-one' `
+        -Mutate { param($r) $r.slots.declared = @($r.slots.declared[0]) }
+    $oneSlot = Invoke-Coordinator -RequestPath $oneSlotPath -Target 'slot1Authorized'
+    Assert-Coordinator ($oneSlot.ExitCode -eq 2) `
+        "A request declaring one slot exited $($oneSlot.ExitCode) rather than refusing."
+    Assert-Coordinator ($oneSlot.Output -match 'supervises exactly 2') `
+        "The refusal did not say this build supervises exactly two slots.`n$($oneSlot.Output)"
+    # Both slots are declared from creation, in order. A set whose second entry
+    # calls itself slot1 would be one slot authorized twice.
+    $swappedPath = New-CoordinatorRequestVariant -BasePath $authPath -Name 'slot-swapped' `
+        -Mutate { param($r) $r.slots.declared[1].name = 'slot1' }
+    $swapped = Invoke-Coordinator -RequestPath $swappedPath -Target 'slot1Authorized'
+    Assert-Coordinator ($swapped.ExitCode -eq 2) `
+        "A set naming slot1 twice exited $($swapped.ExitCode) rather than refusing."
+    Assert-Coordinator ($swapped.Output -match "position reserved for 'slot2'") `
+        "The refusal did not name the position.`n$($swapped.Output)"
+    # Two slots that share a state root are one slot run twice into one place.
+    $sharedPath = New-CoordinatorRequestVariant -BasePath $authPath -Name 'slot-shared' `
+        -Mutate { param($r) $r.slots.declared[1].stateDirName = $r.slots.declared[0].stateDirName }
+    $shared = Invoke-Coordinator -RequestPath $sharedPath -Target 'slot1Authorized'
+    Assert-Coordinator ($shared.ExitCode -eq 2) `
+        "A set sharing a state root exited $($shared.ExitCode) rather than refusing."
+    Assert-Coordinator ($shared.Output -match 'two runs that share a state root are not two runs') `
+        "The refusal did not name the shared state root.`n$($shared.Output)"
+    $sharedTerminalPath = New-CoordinatorRequestVariant -BasePath $authPath -Name 'slot-shared-terminal' `
+        -Mutate { param($r) $r.slots.declared[1].terminalName = $r.slots.declared[0].terminalName }
+    $sharedTerminal = Invoke-Coordinator -RequestPath $sharedTerminalPath -Target 'slot1Authorized'
+    Assert-Coordinator ($sharedTerminal.ExitCode -eq 2) `
+        "A set sharing a terminal artifact exited $($sharedTerminal.ExitCode) rather than refusing."
+    # One qualification plan seals one agent, so a set naming two could never
+    # reproduce the plan it was declared under.
+    $twoAgentPath = New-CoordinatorRequestVariant -BasePath $authPath -Name 'slot-two-agents' `
+        -Mutate { param($r) $r.slots.declared[1].reviewerScriptPath = $r.slots.declared[0].reviewerScriptPath + '.other' }
+    $twoAgent = Invoke-Coordinator -RequestPath $twoAgentPath -Target 'slot1Authorized'
+    Assert-Coordinator ($twoAgent.ExitCode -eq 2) `
+        "A set naming two agents exited $($twoAgent.ExitCode) rather than refusing."
+    # A reconciliation that closes over fewer runs than were declared is closing
+    # over a set nobody declared.
+    $shortReconcilePath = New-CoordinatorRequestVariant -BasePath $authPath -Name 'slot-short-reconcile' `
+        -Mutate { param($r) $r.slots.reconciliation.requiredRunCount = 3 }
+    $shortReconcile = Invoke-Coordinator -RequestPath $shortReconcilePath -Target 'slot1Authorized'
+    Assert-Coordinator ($shortReconcile.ExitCode -eq 2) `
+        "A reconciliation over the wrong run count exited $($shortReconcile.ExitCode) rather than refusing."
 
     # The default target is unchanged, which is what makes the rollback posture
     # real: a caller that does not ask for a slot never gets one.
@@ -1702,14 +1980,14 @@ try {
         'Authorizing a launch created a run directory.'
 
     # -----------------------------------------------------------------------
-    Write-Host '19/23 one supervised slot, halted and resumed at every slot state' -ForegroundColor Cyan
+    Write-Host '19/26 one supervised slot, halted and resumed at every slot state' -ForegroundColor Cyan
     $slotStates = @('slot1Authorized', 'slot1Launching', 'slot1Running', 'slot1TerminalObserved')
     $lifecycleRoot = Join-Path $sandbox 'slot-lifecycle'
     $lifecyclePath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'slot-lifecycle' `
         -Mutate {
             param($r)
             & $setOutputRoot -Request $r -Root $lifecycleRoot
-            $r.slot.shadowSlotEnabled = $true
+            $r.slots.shadowSlotsEnabled = $true
         }.GetNewClosure()
     Initialize-SlotRunSet -Fixture $fixture -RepositoryRoot $RepoRoot -RequestPath $lifecyclePath `
         -OutputRoot $lifecycleRoot -Label 'slot-lifecycle'
@@ -1771,7 +2049,10 @@ try {
 
         $slotAudit = Get-Content -LiteralPath (Join-Path $lifecycleRoot 'coordinator\audit.json') -Raw |
             ConvertFrom-Json -Depth 32
-        Assert-Coordinator ([bool]$slotAudit.slotSupervised) 'The audit does not record a supervised slot.'
+        Assert-Coordinator ([int]$slotAudit.declaredSlotCount -eq 2) `
+            "The audit declares $($slotAudit.declaredSlotCount) slot(s) rather than two."
+        Assert-Coordinator ([int]$slotAudit.supervisedSlotCount -eq 1) `
+            "The audit reports $($slotAudit.supervisedSlotCount) supervised slot(s) after slot1 alone."
         Assert-Coordinator ([int]$slotAudit.slotLaunchCount -eq 0) `
             ("The readiness census reports $($slotAudit.slotLaunchCount) attempt records at run-set-ready; " +
                 'a ready run set is one where nothing has run yet.')
@@ -1780,11 +2061,16 @@ try {
         Assert-Coordinator ([int]$slotAudit.providerWriteCount -eq 0 -and
             [string]$slotAudit.deliveryMode -ceq 'previewOnly') `
             'The audit does not record a preview-only run with no provider writes.'
-        Assert-Coordinator ([string]$slotAudit.slotTerminalStatus -ceq 'complete') `
-            "The audit reports terminal status '$([string]$slotAudit.slotTerminalStatus)'."
-        Assert-Coordinator ([int]$slotAudit.slotAttemptCount -eq 1) `
-            "The audit reports $($slotAudit.slotAttemptCount) slot attempts rather than one."
-        Assert-Coordinator ([string]$slotAudit.slotTerminalSha256 -cmatch '^[0-9a-f]{64}$') `
+        Assert-Coordinator (-not [bool]$slotAudit.reconciliationPerformed) `
+            'The audit claims a reconciliation that this run never authorized.'
+        $slotOne = @($slotAudit.slots)[0]
+        Assert-Coordinator ([int]$slotOne.slotOrdinal -eq 1 -and [string]$slotOne.slotName -ceq 'slot1') `
+            'The audit does not index the first slot by its ordinal and name.'
+        Assert-Coordinator ([string]$slotOne.slotTerminalStatus -ceq 'complete') `
+            "The audit reports terminal status '$([string]$slotOne.slotTerminalStatus)'."
+        Assert-Coordinator ([int]$slotOne.slotAttemptCount -eq 1) `
+            "The audit reports $($slotOne.slotAttemptCount) slot attempts rather than one."
+        Assert-Coordinator ([string]$slotOne.slotTerminalSha256 -cmatch '^[0-9a-f]{64}$') `
             'The audit indexes the terminal evidence without a digest.'
 
         # Replaying a finished lifecycle is a no-op, including its single launch.
@@ -1806,7 +2092,7 @@ try {
             -Mutate {
                 param($r)
                 & $setOutputRoot -Request $r -Root $killRoot
-                $r.slot.shadowSlotEnabled = $true
+                $r.slots.shadowSlotsEnabled = $true
             }.GetNewClosure()
         Initialize-SlotRunSet -Fixture $fixture -RepositoryRoot $RepoRoot -RequestPath $killPath `
             -OutputRoot $killRoot -Label 'slot-kill'
@@ -1846,7 +2132,7 @@ try {
         $resumed = Invoke-Coordinator -RequestPath $killPath -Target 'slot1TerminalVerified'
         Assert-Coordinator ($resumed.ExitCode -eq 0) `
             "The resumed run did not finish the slot it adopted (exit $($resumed.ExitCode)).`n$($resumed.Output)"
-        Assert-Coordinator ($resumed.Output -match 'resume supervising recorded slot child') `
+        Assert-Coordinator ($resumed.Output -match 'resume supervising recorded slot1 child') `
             "The resumed run did not report adopting the recorded child.`n$($resumed.Output)"
         $killAttempts = @(Get-ChildItem -LiteralPath (Join-Path $killRoot 'qualification\stub') `
                 -Filter 'slot*-attempt.json' -File)
@@ -1854,7 +2140,7 @@ try {
             "A kill and resume left $($killAttempts.Count) attempt records; the slot was launched twice."
         $killAudit = Get-Content -LiteralPath (Join-Path $killRoot 'coordinator\audit.json') -Raw |
             ConvertFrom-Json -Depth 32
-        Assert-Coordinator ([bool]$killAudit.slotSupervision.observedAcrossRestart) `
+        Assert-Coordinator ([bool](@($killAudit.slots)[0].slotSupervision.observedAcrossRestart)) `
             'The audit does not record that the observation crossed a restart.'
 
         # A resume that finds the attempt already spent but no running record is
@@ -1864,7 +2150,7 @@ try {
             -Mutate {
                 param($r)
                 & $setOutputRoot -Request $r -Root $spentRoot
-                $r.slot.shadowSlotEnabled = $true
+                $r.slots.shadowSlotsEnabled = $true
             }.GetNewClosure()
         Initialize-SlotRunSet -Fixture $fixture -RepositoryRoot $RepoRoot -RequestPath $spentPath `
             -OutputRoot $spentRoot -Label 'spent-authorization'
@@ -1885,7 +2171,7 @@ try {
     finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
 
     # -----------------------------------------------------------------------
-    Write-Host '20/23 slot terminal endings and the slot fault matrix' -ForegroundColor Cyan
+    Write-Host '20/26 slot terminal endings and the slot fault matrix' -ForegroundColor Cyan
     # Every case gets its own output root, because a slot's launch authorization
     # is single-use and a root that has spent it can never be reused.
     $slotCases = @(
@@ -1904,7 +2190,7 @@ try {
         @{ Name = 'writable'; Mode = 'writableTerminal'; Exit = 2; State = 'slot1TerminalObserved'
             Pattern = 'writable' },
         @{ Name = 'twoattempts'; Mode = 'secondAttempt'; Exit = 2; State = 'slot1TerminalObserved'
-            Pattern = 'supervises exactly one' }
+            Pattern = 'exactly 1 launch' }
     )
     foreach ($case in $slotCases) {
         $caseRoot = Join-Path $sandbox "slot-$($case.Name)"
@@ -1912,7 +2198,7 @@ try {
             -Mutate {
                 param($r)
                 & $setOutputRoot -Request $r -Root $caseRoot
-                $r.slot.shadowSlotEnabled = $true
+                $r.slots.shadowSlotsEnabled = $true
             }.GetNewClosure()
         Initialize-SlotRunSet -Fixture $fixture -RepositoryRoot $RepoRoot -RequestPath $casePath `
             -OutputRoot $caseRoot -Label "'$($case.Name)'"
@@ -1945,8 +2231,9 @@ try {
         -Mutate {
             param($r)
             & $setOutputRoot -Request $r -Root $hangRoot
-            $r.slot.shadowSlotEnabled = $true
-            $r.slot.supervisionGraceSeconds = 30
+            $r.slots.shadowSlotsEnabled = $true
+            foreach ($declared in @($r.slots.declared)) { $declared.supervisionGraceSeconds = 30 }
+            $r.slots.reconciliation.supervisionGraceSeconds = 30
         }.GetNewClosure()
     Initialize-SlotRunSet -Fixture $fixture -RepositoryRoot $RepoRoot -RequestPath $hangPath `
         -OutputRoot $hangRoot -Label 'slot-hang'
@@ -1976,7 +2263,7 @@ try {
         -Mutate {
             param($r)
             & $setOutputRoot -Request $r -Root $tamperRoot
-            $r.slot.shadowSlotEnabled = $true
+            $r.slots.shadowSlotsEnabled = $true
         }.GetNewClosure()
     Initialize-SlotRunSet -Fixture $fixture -RepositoryRoot $RepoRoot -RequestPath $tamperPath `
         -OutputRoot $tamperRoot -Label 'slot-tamper'
@@ -1999,7 +2286,7 @@ try {
     finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
 
     # -----------------------------------------------------------------------
-    Write-Host '21/23 typed corpus staging from an immutable source' -ForegroundColor Cyan
+    Write-Host '21/26 typed corpus staging from an immutable source' -ForegroundColor Cyan
     # A SECOND sandbox, whose corpus is built as a read-only source and whose
     # request names a corpus root that does not exist. This is the condition the
     # preparation this slice replaces died on, made ordinary.
@@ -2113,7 +2400,7 @@ try {
         'Replaying a staged preparation rewrote the published corpus.'
 
     # -----------------------------------------------------------------------
-    Write-Host '22/23 corpus staging fault matrix' -ForegroundColor Cyan
+    Write-Host '22/26 corpus staging fault matrix' -ForegroundColor Cyan
     $stageInputs = Split-Path ([string]$stageFixture.StageRequestPath) -Parent
     $faultRoot = Join-Path $sandbox 'stage-faults'
     [void](New-Item -ItemType Directory -Force -Path $faultRoot)
@@ -2499,7 +2786,475 @@ try {
         "The contested staging left $($raceResidue.Count) staging director(ies) behind."
 
     # -----------------------------------------------------------------------
-    Write-Host '23/23 no orphans, no external writes' -ForegroundColor Cyan
+    Write-Host '23/26 two declared slots, in order, and the opaque reconciliation' -ForegroundColor Cyan
+    # No model anywhere in this section. Preparation is real, the declaration is
+    # real and signed, both slots are declared before either runs, and only the
+    # execution and the comparison are stood in for. What is under test is the
+    # ordering, the per-slot lease, and the reconciliation the set closes with.
+    $setStates = @('slot1Authorized', 'slot1Launching', 'slot1Running', 'slot1TerminalObserved',
+        'slot1TerminalVerified', 'slot2Authorized', 'slot2Launching', 'slot2Running',
+        'slot2TerminalObserved', 'slot2TerminalVerified', 'reconciliationAuthorized',
+        'reconciliationLaunching', 'reconciliationRunning', 'reconciliationTerminalObserved')
+    $setRoot = Join-Path $sandbox 'slot-set'
+    $setPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'slot-set' `
+        -Mutate {
+            param($r)
+            & $setOutputRoot -Request $r -Root $setRoot
+            $r.slots.shadowSlotsEnabled = $true
+            $r.slots.reconciliation.reconciliationEnabled = $true
+        }.GetNewClosure()
+    Initialize-SlotRunSet -Fixture $fixture -RepositoryRoot $RepoRoot -RequestPath $setPath `
+        -OutputRoot $setRoot -Label 'slot-set'
+    New-SlotStubAdapter -ToolkitCopy $fixture.ToolkitCopy -RealAdapter $realAdapter -Mode 'complete'
+    try {
+        # Ordering is proven where it can be observed: at each halt, nothing
+        # later than the halted state has been launched. The set advances one
+        # proven slot at a time, so slot2 has no attempt record while slot1 is
+        # still in flight, and the comparison has none while either slot is.
+        $slot1AttemptFile = Join-Path $setRoot 'qualification\stub\slot1-attempt.json'
+        $slot2AttemptFile = Join-Path $setRoot 'qualification\stub\slot2-attempt.json'
+        $reconcileAttemptFile = Join-Path $setRoot 'reconciliation\reconcile-attempt.json'
+        $reconcileInputFile = Join-Path $setRoot 'coordinator\reconciliation\reconciliation-request.json'
+
+        $expectedSequence = 11
+        $stateIndex = -1
+        foreach ($state in $setStates) {
+            $expectedSequence++
+            $stateIndex++
+            $halted = Invoke-Coordinator -RequestPath $setPath -HaltAfter $state -Target 'reconciliationVerified'
+            Assert-Coordinator ($halted.ExitCode -eq 9) `
+                "Halting after '$state' did not report a deliberate halt (exit $($halted.ExitCode)).`n$($halted.Output)"
+            $durable = Get-CoordinatorState -OutputRoot $setRoot
+            Assert-Coordinator ($durable -and $durable.state -ceq $state) `
+                "The durable state after halting at '$state' is '$(if ($durable) { $durable.state } else { 'none' })'."
+            Assert-Coordinator ($durable -and [int]$durable.sequence -eq $expectedSequence) `
+                "The sequence after '$state' is $(if ($durable) { $durable.sequence } else { 'none' }), not $expectedSequence."
+            # Nothing later than the halted state has started. A launch is the one
+            # thing that cannot be taken back, so each is checked on disk at every
+            # point before the state that is entitled to perform it.
+            if ($stateIndex -lt 2) {
+                Assert-Coordinator (-not (Test-Path -LiteralPath $slot1AttemptFile)) `
+                    "slot1 was launched at '$state', before the state that launches it."
+            }
+            if ($stateIndex -lt 7) {
+                Assert-Coordinator (-not (Test-Path -LiteralPath $slot2AttemptFile)) `
+                    "slot2 was launched at '$state', before slot1 finished."
+            }
+            if ($stateIndex -lt 11) {
+                Assert-Coordinator (-not (Test-Path -LiteralPath $reconcileInputFile)) `
+                    "The comparison input was published at '$state', before the set was reconcilable."
+            }
+            if ($stateIndex -lt 12) {
+                Assert-Coordinator (-not (Test-Path -LiteralPath $reconcileAttemptFile)) `
+                    "The comparison ran at '$state', before both slots were verified."
+            }
+            # Resuming to a state already reached must launch nothing a second
+            # time. Each slot's attempt record and the set's single reconciliation
+            # attempt are all one-shot, so a second launch is unrecoverable.
+            $again = Invoke-Coordinator -RequestPath $setPath -Target $state
+            Assert-Coordinator ($again.ExitCode -eq 0) `
+                "Resuming to an already-reached '$state' failed (exit $($again.ExitCode)).`n$($again.Output)"
+            Assert-Coordinator ($again.Output -match "skip $state") `
+                "Resuming to an already-reached '$state' did not report it as already recorded."
+            Assert-Coordinator ([int](Get-CoordinatorState -OutputRoot $setRoot).sequence -eq $expectedSequence) `
+                "Resuming to an already-reached '$state' advanced the sequence."
+        }
+
+        $setVerified = Invoke-Coordinator -RequestPath $setPath -Target 'reconciliationVerified'
+        Assert-Coordinator ($setVerified.ExitCode -eq 0) `
+            "The two-slot set did not reconcile (exit $($setVerified.ExitCode)).`n$($setVerified.Output)"
+        $setState = Get-CoordinatorState -OutputRoot $setRoot
+        Assert-Coordinator ($setState.state -ceq 'reconciliationVerified' -and [int]$setState.sequence -eq 26) `
+            "The durable state is '$($setState.state)' at sequence $($setState.sequence)."
+        Assert-Coordinator (@($setState.transitions).Count -eq 26) `
+            "The state records $(@($setState.transitions).Count) transitions rather than twenty-six."
+
+        # Exactly one launch per slot, and exactly one comparison, counted on
+        # disk rather than believed from the log.
+        $setAttempts = @(Get-ChildItem -LiteralPath (Join-Path $setRoot 'qualification\stub') `
+                -Filter 'slot*-attempt.json' -File)
+        Assert-Coordinator ($setAttempts.Count -eq 2) `
+            "The set left $($setAttempts.Count) slot attempt records rather than two."
+        Assert-Coordinator ((@($setAttempts | ForEach-Object { $_.Name }) -join ',') -ceq 'slot1-attempt.json,slot2-attempt.json') `
+            'The set did not launch slot1 then slot2 exactly once each.'
+        $reconcileAttempts = @(Get-ChildItem -LiteralPath (Join-Path $setRoot 'reconciliation') `
+                -Filter 'reconcile-attempt.json' -File)
+        Assert-Coordinator ($reconcileAttempts.Count -eq 1) `
+            "The set left $($reconcileAttempts.Count) reconciliation attempt records rather than one."
+
+        # The strict versioned exchange is on disk, both halves of it.
+        $reconcileExchange = Join-Path $setRoot 'coordinator\reconciliation'
+        $reconcileRequestFile = Join-Path $reconcileExchange 'reconciliation-request.json'
+        $reconcileSummaryFile = Join-Path $reconcileExchange 'reconciliation-summary.json'
+        Assert-Coordinator (Test-Path -LiteralPath $reconcileRequestFile -PathType Leaf) `
+            'The reconciliation published no versioned input.'
+        Assert-Coordinator (Test-Path -LiteralPath $reconcileSummaryFile -PathType Leaf) `
+            'The reconciliation produced no versioned summary.'
+        $reconcileRequestDoc = Get-Content -LiteralPath $reconcileRequestFile -Raw | ConvertFrom-Json -Depth 12
+        Assert-Coordinator ([string]$reconcileRequestDoc.contractVersion -ceq 'devpilot.shadow-run-coordinator.reconciliation-request.v1') `
+            "The reconciliation input declares contract '$([string]$reconcileRequestDoc.contractVersion)'."
+        Assert-Coordinator ([int]$reconcileRequestDoc.requiredRunCount -eq 2) `
+            'The reconciliation input does not close over both declared runs.'
+
+        $setAudit = Get-Content -LiteralPath (Join-Path $setRoot 'coordinator\audit.json') -Raw |
+            ConvertFrom-Json -Depth 32
+        Assert-Coordinator ([int]$setAudit.declaredSlotCount -eq 2 -and [int]$setAudit.supervisedSlotCount -eq 2) `
+            "The audit reports $($setAudit.supervisedSlotCount) of $($setAudit.declaredSlotCount) slots supervised."
+        Assert-Coordinator (@($setAudit.slots).Count -eq 2) `
+            "The audit indexes $(@($setAudit.slots).Count) slots rather than two."
+        $auditNames = @($setAudit.slots | ForEach-Object { [string]$_.slotName }) -join ','
+        Assert-Coordinator ($auditNames -ceq 'slot1,slot2') `
+            "The audit indexes slots '$auditNames' rather than slot1 then slot2."
+        foreach ($record in @($setAudit.slots)) {
+            Assert-Coordinator ([string]$record.slotTerminalStatus -ceq 'complete') `
+                "The audit reports '$([string]$record.slotName)' terminal status '$([string]$record.slotTerminalStatus)'."
+            Assert-Coordinator ([string]$record.slotTerminalSha256 -cmatch '^[0-9a-f]{64}$') `
+                "The audit indexes '$([string]$record.slotName)' without a terminal digest."
+            Assert-Coordinator ([int]$record.slotModelInvocationCount -eq 0) `
+                "The audit claims '$([string]$record.slotName)' invoked a model."
+        }
+        Assert-Coordinator ([bool]$setAudit.reconciliationPerformed) `
+            'The audit does not record the reconciliation this run performed.'
+        Assert-Coordinator ([string]$setAudit.reconciliationStatus -ceq 'reconciled') `
+            "The audit reports reconciliation status '$([string]$setAudit.reconciliationStatus)'."
+        foreach ($digestField in @('reconciliationSha256', 'reconciliationReportSha256',
+                'reconciliationArtifactSha256', 'reconciliationSummarySha256')) {
+            Assert-Coordinator ([string]$setAudit.$digestField -cmatch '^[0-9a-f]{64}$') `
+                "The audit carries no digest under '$digestField'."
+        }
+        Assert-Coordinator ([int]$setAudit.reconciliationRunCount -eq 2) `
+            "The audit reports a comparison over $($setAudit.reconciliationRunCount) run(s)."
+        Assert-Coordinator (-not [bool]$setAudit.reconciliationPromotable) `
+            'The audit records a promotable reconciliation.'
+        Assert-Coordinator (@($setAudit.reconciliationCounts).Count -ge 1) `
+            'The audit carries an empty opaque census.'
+        foreach ($count in @($setAudit.reconciliationCounts)) {
+            Assert-Coordinator ([string]$count.name -cmatch '^[A-Za-z0-9]+$' -and [int]$count.value -ge 0) `
+                "The opaque census carries an entry this coordinator could not have copied verbatim."
+        }
+        Assert-Coordinator ([int]$setAudit.providerWriteCount -eq 0 -and
+            [string]$setAudit.deliveryMode -ceq 'previewOnly') `
+            'A reconciled two-slot set is not recorded as a preview-only run with no provider writes.'
+        Assert-Coordinator ([int]$setAudit.modelInvocationCount -eq 0) `
+            'The reconciled set claims to have invoked a model.'
+        # There is no delivery state in this build. Asserted on the transition
+        # names rather than on the whole record, because the reviewed plan the
+        # record carries legitimately says it runs in preview-only delivery mode.
+        $setStateNames = @($setState.transitions | ForEach-Object { [string]$_.state })
+        Assert-Coordinator (@($setStateNames | Where-Object { $_ -match '(?i)deliver' }).Count -eq 0) `
+            'The durable record names a delivery transition this build does not have.'
+
+        # Replaying a reconciled set is a no-op, including its single comparison.
+        $setReplay = Invoke-Coordinator -RequestPath $setPath -Target 'reconciliationVerified'
+        Assert-Coordinator ($setReplay.ExitCode -eq 0) 'Replaying a reconciled set failed.'
+        Assert-Coordinator ([int](Get-CoordinatorState -OutputRoot $setRoot).sequence -eq 26) `
+            'Replaying a reconciled set advanced the sequence.'
+        Assert-Coordinator (@(Get-ChildItem -LiteralPath (Join-Path $setRoot 'qualification\stub') `
+                    -Filter 'slot*-attempt.json' -File).Count -eq 2) `
+            'Replaying a reconciled set launched a slot again.'
+        Assert-Coordinator (@(Get-ChildItem -LiteralPath (Join-Path $setRoot 'reconciliation') `
+                    -Filter 'reconcile-attempt.json' -File).Count -eq 1) `
+            'Replaying a reconciled set compared again.'
+
+        # Every slot's exchange is its own. A per-slot step name is what keeps a
+        # result published for one slot from being adopted as the other's answer.
+        $exchangeFiles = @(Get-ChildItem -LiteralPath (Join-Path $setRoot 'coordinator\exchange') `
+                -Filter '*.result.json' -File | ForEach-Object { $_.Name })
+        foreach ($required in @('slot1Plan', 'slot1Run', 'slot1Verify', 'slot2Plan', 'slot2Run',
+                'slot2Verify', 'reconcilePlan', 'reconcileRun', 'reconcileVerify')) {
+            Assert-Coordinator (@($exchangeFiles | Where-Object { $_ -like "*-$required.result.json" }).Count -eq 1) `
+                "The exchange carries no distinct result for '$required'."
+        }
+        # Each step's request binds to its own digest, which is what a result must
+        # carry to be adopted. Two steps sharing one would be two steps that could
+        # answer for each other.
+        $stepDigests = @(Get-ChildItem -LiteralPath (Join-Path $setRoot 'coordinator\exchange') `
+                -Filter '*.request.json' -File | ForEach-Object {
+                [string]((Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json -Depth 24).childRequestSha256)
+            })
+        Assert-Coordinator (@($stepDigests | Where-Object { $_ -cmatch '^[0-9a-f]{64}$' }).Count -eq @($stepDigests).Count) `
+            'A child request was written without its binding digest.'
+        Assert-Coordinator ((@($stepDigests | Sort-Object -Unique).Count) -eq @($stepDigests).Count) `
+            'Two child requests share a binding digest, so one could answer for the other.'
+    }
+    finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
+
+    # -----------------------------------------------------------------------
+    Write-Host '24/26 a failed slot closes the set' -ForegroundColor Cyan
+    # A slot that ends unsuccessfully is a durable ending, and everything that
+    # would have followed it is refused rather than skipped. Both orderings are
+    # exercised: slot1 failing before slot2 is authorized, and slot2 failing
+    # before the reconciliation is.
+    $blockCases = @(
+        @{ Name = 'slot1'; ModeSlot = 1; Mode = 'failed'; State = 'slot1TerminalFailed'
+            Blocked = 'slot2Authorized'; Attempts = 1 },
+        @{ Name = 'slot2'; ModeSlot = 2; Mode = 'failed'; State = 'slot2TerminalFailed'
+            Blocked = 'reconciliationAuthorized'; Attempts = 2 },
+        @{ Name = 'slot2timeout'; ModeSlot = 2; Mode = 'timedOut'; State = 'slot2TerminalTimedOut'
+            Blocked = 'reconciliationAuthorized'; Attempts = 2 }
+    )
+    foreach ($case in $blockCases) {
+        $blockRoot = Join-Path $sandbox "slot-block-$($case.Name)"
+        $blockPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name "slot-block-$($case.Name)" `
+            -Mutate {
+                param($r)
+                & $setOutputRoot -Request $r -Root $blockRoot
+                $r.slots.shadowSlotsEnabled = $true
+                $r.slots.reconciliation.reconciliationEnabled = $true
+            }.GetNewClosure()
+        Initialize-SlotRunSet -Fixture $fixture -RepositoryRoot $RepoRoot -RequestPath $blockPath `
+            -OutputRoot $blockRoot -Label "slot-block-$($case.Name)"
+        New-SlotStubAdapter -ToolkitCopy $fixture.ToolkitCopy -RealAdapter $realAdapter `
+            -Mode $case.Mode -ModeSlot $case.ModeSlot
+        try {
+            $blockRun = Invoke-Coordinator -RequestPath $blockPath -Target 'reconciliationVerified'
+            Assert-Coordinator ($blockRun.ExitCode -eq 5) `
+                "A set whose $($case.Name) ended '$($case.Mode)' exited $($blockRun.ExitCode) rather than 5.`n$($blockRun.Output)"
+            $blockState = Get-CoordinatorState -OutputRoot $blockRoot
+            Assert-Coordinator ($blockState.state -ceq $case.State) `
+                "The set stands at '$($blockState.state)' rather than '$($case.State)'."
+            # And the transition that would have followed is refused on its own,
+            # so the ending is a gate rather than a place the walk happened to stop.
+            $blocked = Invoke-Coordinator -RequestPath $blockPath -Target $case.Blocked
+            Assert-Coordinator ($blocked.ExitCode -ne 0) `
+                "'$($case.Blocked)' after a $($case.Mode) slot exited 0."
+            Assert-Coordinator ((Get-CoordinatorState -OutputRoot $blockRoot).state -ceq $case.State) `
+                "A refused '$($case.Blocked)' advanced the record past '$($case.State)'."
+            $blockAttempts = @(Get-ChildItem -LiteralPath (Join-Path $blockRoot 'qualification\stub') `
+                    -Filter 'slot*-attempt.json' -File -ErrorAction SilentlyContinue)
+            Assert-Coordinator ($blockAttempts.Count -eq $case.Attempts) `
+                "The blocked set left $($blockAttempts.Count) attempt records rather than $($case.Attempts)."
+            Assert-Coordinator (-not (Test-Path -LiteralPath (Join-Path $blockRoot 'reconciliation\reconcile-attempt.json'))) `
+                'A set with an unsuccessful slot still attempted a comparison.'
+            $blockAudit = Get-Content -LiteralPath (Join-Path $blockRoot 'coordinator\audit.json') -Raw |
+                ConvertFrom-Json -Depth 32
+            Assert-Coordinator (-not [bool]$blockAudit.reconciliationPerformed) `
+                'The audit of a blocked set claims a reconciliation.'
+        }
+        finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
+    }
+
+    # -----------------------------------------------------------------------
+    Write-Host '25/26 reconciliation fault matrix' -ForegroundColor Cyan
+    # Each case gets a fresh root, because a reconciliation is authorized once
+    # and consumed when it is attempted.
+    $reconcileCases = @(
+        @{ Name = 'notready'; Mode = 'reconcileNotReady'; Exit = 2; State = 'slot2TerminalVerified'
+            Pattern = 'readiness gate' },
+        @{ Name = 'spent'; Mode = 'reconcileAttemptPresent'; Exit = 2; State = 'slot2TerminalVerified'
+            Pattern = 'authorization is spent' },
+        @{ Name = 'nosummary'; Mode = 'reconcileNoSummary'; Exit = 2; State = 'reconciliationRunning'
+            Pattern = 'no versioned summary' },
+        @{ Name = 'wrongsummary'; Mode = 'reconcileWrongSummaryPath'; Exit = 2; State = 'reconciliationRunning'
+            Pattern = 'wrote its summary to' },
+        # Named 'editedsummary' and not 'tampered' on purpose. The readiness tool
+        # classifies a corrupt declaration by matching words against a message
+        # that embeds absolute paths, so a case root containing the word
+        # 'tampered' made the run set look corrupt before the case even began.
+        @{ Name = 'editedsummary'; Mode = 'reconcileTamperSummary'; Exit = 2; State = 'reconciliationRunning'
+            Pattern = 'summary digests to' },
+        @{ Name = 'nonzero'; Mode = 'reconcileNonzeroNoSummary'; Exit = 4; State = 'reconciliationRunning'
+            Pattern = 'does not exist|left no result' },
+        @{ Name = 'unsigned'; Mode = 'reconcileUnsigned'; Exit = 2; State = 'reconciliationTerminalObserved'
+            Pattern = 'did not verify under its key' },
+        @{ Name = 'promotable'; Mode = 'reconcilePromotable'; Exit = 2; State = 'reconciliationTerminalObserved'
+            Pattern = 'claims to be promotable' },
+        @{ Name = 'shortruns'; Mode = 'reconcileShortRuns'; Exit = 2; State = 'reconciliationTerminalObserved'
+            Pattern = 'covered 1 run' },
+        @{ Name = 'emptycensus'; Mode = 'reconcileEmptyCounts'; Exit = 2; State = 'reconciliationTerminalObserved'
+            Pattern = 'empty census' },
+        @{ Name = 'duplicatecensus'; Mode = 'reconcileDuplicateCounts'; Exit = 2; State = 'reconciliationTerminalObserved'
+            Pattern = 'twice' },
+        @{ Name = 'badcountname'; Mode = 'reconcileBadCountName'; Exit = 2; State = 'reconciliationTerminalObserved'
+            Pattern = 'not a plain identifier' },
+        @{ Name = 'swapartifact'; Mode = 'reconcileSwapArtifact'; Exit = 2; State = 'reconciliationTerminalObserved'
+            Pattern = 'artifact is at' },
+        @{ Name = 'rewrittenreport'; Mode = 'reconcileRewriteReport'; Exit = 2; State = 'reconciliationTerminalObserved'
+            Pattern = 'report digests to' },
+        @{ Name = 'wrongsetid'; Mode = 'reconcileWrongSetId'; Exit = 2; State = 'slot2TerminalVerified'
+            Pattern = 'built for run set' }
+    )
+    foreach ($case in $reconcileCases) {
+        $caseRoot = Join-Path $sandbox "reconcile-$($case.Name)"
+        $casePath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name "reconcile-$($case.Name)" `
+            -Mutate {
+                param($r)
+                & $setOutputRoot -Request $r -Root $caseRoot
+                $r.slots.shadowSlotsEnabled = $true
+                $r.slots.reconciliation.reconciliationEnabled = $true
+            }.GetNewClosure()
+        Initialize-SlotRunSet -Fixture $fixture -RepositoryRoot $RepoRoot -RequestPath $casePath `
+            -OutputRoot $caseRoot -Label "reconcile-$($case.Name)"
+        New-SlotStubAdapter -ToolkitCopy $fixture.ToolkitCopy -RealAdapter $realAdapter -Mode $case.Mode
+        try {
+            $run = Invoke-Coordinator -RequestPath $casePath -Target 'reconciliationVerified'
+            Assert-Coordinator ($run.ExitCode -eq $case.Exit) `
+                "The '$($case.Name)' reconciliation exited $($run.ExitCode) rather than $($case.Exit).`n$($run.Output)"
+            $state = Get-CoordinatorState -OutputRoot $caseRoot
+            Assert-Coordinator ($state -and $state.state -ceq $case.State) `
+                "The '$($case.Name)' reconciliation left the record at '$(if ($state) { $state.state } else { 'none' })' rather than '$($case.State)'."
+            if ($case.Pattern) {
+                Assert-Coordinator ($run.Output -match $case.Pattern) `
+                    "The '$($case.Name)' refusal did not name its cause.`n$($run.Output)"
+            }
+            # A refused comparison is never counted as one that happened, and it
+            # never leaves a second attempt behind for a retry to trip over.
+            $caseAttempts = @(Get-ChildItem -LiteralPath (Join-Path $caseRoot 'reconciliation') `
+                    -Filter 'reconcile-attempt.json' -File -ErrorAction SilentlyContinue)
+            Assert-Coordinator ($caseAttempts.Count -le 1) `
+                "The '$($case.Name)' reconciliation left $($caseAttempts.Count) attempt records."
+            $caseAuditPath = Join-Path $caseRoot 'coordinator\audit.json'
+            Assert-Coordinator (Test-Path -LiteralPath $caseAuditPath -PathType Leaf) `
+                "The '$($case.Name)' reconciliation wrote no audit."
+            if (Test-Path -LiteralPath $caseAuditPath -PathType Leaf) {
+                $caseAudit = Get-Content -LiteralPath $caseAuditPath -Raw | ConvertFrom-Json -Depth 32
+                Assert-Coordinator (-not [bool]$caseAudit.reconciliationPerformed) `
+                    "The '$($case.Name)' audit claims a reconciliation it refused."
+                Assert-Coordinator ([int]$caseAudit.providerWriteCount -eq 0) `
+                    "The '$($case.Name)' audit records a provider write."
+            }
+        }
+        finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
+    }
+
+    # A comparison that never returns is stopped by this coordinator on the
+    # plan's own budget, and the stop leaves no summary to report.
+    $reconcileHangRoot = Join-Path $sandbox 'reconcile-hang'
+    $reconcileHangPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'reconcile-hang' `
+        -Mutate {
+            param($r)
+            & $setOutputRoot -Request $r -Root $reconcileHangRoot
+            $r.slots.shadowSlotsEnabled = $true
+            $r.slots.reconciliation.reconciliationEnabled = $true
+            foreach ($declared in @($r.slots.declared)) { $declared.supervisionGraceSeconds = 30 }
+            $r.slots.reconciliation.supervisionGraceSeconds = 30
+        }.GetNewClosure()
+    Initialize-SlotRunSet -Fixture $fixture -RepositoryRoot $RepoRoot -RequestPath $reconcileHangPath `
+        -OutputRoot $reconcileHangRoot -Label 'reconcile-hang'
+    New-SlotStubAdapter -ToolkitCopy $fixture.ToolkitCopy -RealAdapter $realAdapter `
+        -Mode 'reconcileHang'
+    try {
+        $reconcileHangRun = Invoke-Coordinator -RequestPath $reconcileHangPath -Target 'reconciliationVerified'
+        Assert-Coordinator ($reconcileHangRun.ExitCode -eq 4) `
+            "A hung comparison exited $($reconcileHangRun.ExitCode) rather than reporting a stopped child.`n$($reconcileHangRun.Output)"
+        Assert-Coordinator ($reconcileHangRun.Output -match 'HardDeadlineKill|ActivityDeadlineKill|deadline') `
+            "The refusal did not name the deadline kill.`n$($reconcileHangRun.Output)"
+        Assert-Coordinator ((Get-CoordinatorState -OutputRoot $reconcileHangRoot).state -ceq 'reconciliationRunning') `
+            'A hung comparison advanced the durable record past the child it named.'
+        Start-Sleep -Seconds 2
+        Assert-Coordinator ((Get-DescendantPwshCount -SandboxToken $sandboxToken) -eq 0) `
+            'The deadline kill left a comparison child running.'
+    }
+    finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
+
+    # A coordinator killed while the comparison is running has to adopt the child
+    # it already named rather than start a second one.
+    $reconcileKillRoot = Join-Path $sandbox 'reconcile-kill'
+    $reconcileKillPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'reconcile-kill' `
+        -Mutate {
+            param($r)
+            & $setOutputRoot -Request $r -Root $reconcileKillRoot
+            $r.slots.shadowSlotsEnabled = $true
+            $r.slots.reconciliation.reconciliationEnabled = $true
+        }.GetNewClosure()
+    Initialize-SlotRunSet -Fixture $fixture -RepositoryRoot $RepoRoot -RequestPath $reconcileKillPath `
+        -OutputRoot $reconcileKillRoot -Label 'reconcile-kill'
+    New-SlotStubAdapter -ToolkitCopy $fixture.ToolkitCopy -RealAdapter $realAdapter -Mode 'complete'
+    try {
+        Assert-Coordinator ((Invoke-Coordinator -RequestPath $reconcileKillPath `
+                    -HaltAfter 'reconciliationLaunching' -Target 'reconciliationVerified').ExitCode -eq 9) `
+            'The reconcile-kill setup did not halt with a comparison due.'
+        # Killed and resumed. The comparison is fast, so what this proves is that
+        # a resumed run never mints a second attempt record.
+        $resumedReconcile = Invoke-Coordinator -RequestPath $reconcileKillPath -Target 'reconciliationVerified'
+        Assert-Coordinator ($resumedReconcile.ExitCode -eq 0) `
+            "The resumed reconciliation failed (exit $($resumedReconcile.ExitCode)).`n$($resumedReconcile.Output)"
+        Assert-Coordinator (@(Get-ChildItem -LiteralPath (Join-Path $reconcileKillRoot 'reconciliation') `
+                    -Filter 'reconcile-attempt.json' -File).Count -eq 1) `
+            'A resumed reconciliation left more than one attempt record.'
+        # Re-running the whole target now that the set is consumed must not start
+        # a second comparison either.
+        $secondReconcile = Invoke-Coordinator -RequestPath $reconcileKillPath -Target 'reconciliationVerified'
+        Assert-Coordinator ($secondReconcile.ExitCode -eq 0) 'Replaying a consumed reconciliation failed.'
+        Assert-Coordinator (@(Get-ChildItem -LiteralPath (Join-Path $reconcileKillRoot 'reconciliation') `
+                    -Filter 'reconcile-attempt.json' -File).Count -eq 1) `
+            'Replaying a consumed reconciliation compared a second time.'
+    }
+    finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
+
+    # The window that matters: the comparison has already minted its single-use
+    # attempt record, so a run that came back and re-derived the plan would find
+    # the authorization spent and refuse forever. This kills the coordinator while
+    # the comparison child is genuinely still running, which puts the run set
+    # exactly there, and the resume must adopt the child it named rather than
+    # conclude somebody else consumed the one attempt.
+    $reconcileAdoptRoot = Join-Path $sandbox 'reconcile-adopt'
+    $reconcileAdoptPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'reconcile-adopt' `
+        -Mutate {
+            param($r)
+            & $setOutputRoot -Request $r -Root $reconcileAdoptRoot
+            $r.slots.shadowSlotsEnabled = $true
+            $r.slots.reconciliation.reconciliationEnabled = $true
+        }.GetNewClosure()
+    Initialize-SlotRunSet -Fixture $fixture -RepositoryRoot $RepoRoot -RequestPath $reconcileAdoptPath `
+        -OutputRoot $reconcileAdoptRoot -Label 'reconcile-adopt'
+    New-SlotStubAdapter -ToolkitCopy $fixture.ToolkitCopy -RealAdapter $realAdapter -Mode 'complete' `
+        -SlotTimeoutSeconds 300 -PerCallTimeoutSeconds 300 -RunDelaySeconds 20
+    try {
+        Assert-Coordinator ((Invoke-Coordinator -RequestPath $reconcileAdoptPath `
+                    -HaltAfter 'reconciliationLaunching' -Target 'reconciliationVerified').ExitCode -eq 9) `
+            'The reconcile-adopt setup did not halt with a comparison due.'
+        $adoptJob = Start-Process -FilePath 'dotnet' -PassThru -WindowStyle Hidden -ArgumentList @(
+            $script:CoordinatorDll, '--request', $reconcileAdoptPath, '--target', 'reconciliationVerified')
+        $adoptKilled = $false
+        try {
+            $adoptDeadline = [DateTime]::UtcNow.AddSeconds(120)
+            while ([DateTime]::UtcNow -lt $adoptDeadline) {
+                $adoptProbe = Get-CoordinatorState -OutputRoot $reconcileAdoptRoot
+                if ($adoptProbe -and $adoptProbe.state -ceq 'reconciliationRunning') { break }
+                Start-Sleep -Milliseconds 250
+            }
+            $atAdoptKill = Get-CoordinatorState -OutputRoot $reconcileAdoptRoot
+            Assert-Coordinator ($atAdoptKill -and $atAdoptKill.state -ceq 'reconciliationRunning') `
+                "The comparison never recorded a running child to kill (state '$(if ($atAdoptKill) { $atAdoptKill.state } else { 'none' })')."
+            if (-not $adoptJob.HasExited) { Stop-Process -Id $adoptJob.Id -Force -ErrorAction SilentlyContinue }
+            $adoptJob.WaitForExit(60000) | Out-Null
+            $adoptKilled = $true
+        }
+        finally {
+            if (-not $adoptKilled -and -not $adoptJob.HasExited) {
+                Stop-Process -Id $adoptJob.Id -Force -ErrorAction SilentlyContinue
+            }
+        }
+        Assert-Coordinator ((Get-CoordinatorState -OutputRoot $reconcileAdoptRoot).state -ceq 'reconciliationRunning') `
+            'A coordinator killed mid-comparison did not leave the record naming its child.'
+        # The single-use attempt record is spent by now. Without the running
+        # record this is precisely the state that could never be resumed. The
+        # child outlives the coordinator that started it, so this waits for the
+        # record rather than reading the instant the parent died.
+        $adoptAttemptFile = Join-Path $reconcileAdoptRoot 'reconciliation\reconcile-attempt.json'
+        $attemptDeadline = [DateTime]::UtcNow.AddSeconds(60)
+        while ([DateTime]::UtcNow -lt $attemptDeadline -and
+            -not (Test-Path -LiteralPath $adoptAttemptFile -PathType Leaf)) {
+            Start-Sleep -Milliseconds 250
+        }
+        Assert-Coordinator (Test-Path -LiteralPath $adoptAttemptFile -PathType Leaf) `
+            'The killed comparison never minted the attempt record this case exists to survive.'
+        $adoptResume = Invoke-Coordinator -RequestPath $reconcileAdoptPath -Target 'reconciliationVerified'
+        Assert-Coordinator ($adoptResume.ExitCode -eq 0) `
+            "A reconciliation resumed over a spent attempt record failed (exit $($adoptResume.ExitCode)).`n$($adoptResume.Output)"
+        Assert-Coordinator ($adoptResume.Output -match 'resume supervising recorded reconciliation child') `
+            "The resumed reconciliation did not adopt the child it had named.`n$($adoptResume.Output)"
+        Assert-Coordinator (@(Get-ChildItem -LiteralPath (Join-Path $reconcileAdoptRoot 'reconciliation') `
+                    -Filter 'reconcile-attempt.json' -File).Count -eq 1) `
+            'An adopted reconciliation minted a second attempt record.'
+        Assert-Coordinator ((Get-CoordinatorState -OutputRoot $reconcileAdoptRoot).state -ceq 'reconciliationVerified') `
+            'An adopted reconciliation did not reach its verified terminal.'
+    }
+    finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
+
+    # -----------------------------------------------------------------------
+    Write-Host '26/26 no orphans, no external writes' -ForegroundColor Cyan
     Start-Sleep -Seconds 2
     $orphans = Get-DescendantPwshCount -SandboxToken $sandboxToken
     Assert-Coordinator ($orphans -eq 0) "The suite left $orphans PowerShell process(es) running."

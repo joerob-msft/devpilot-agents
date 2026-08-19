@@ -213,7 +213,11 @@ function New-ShadowCoordinatorFixture {
         [Parameter(Mandatory)][string]$ToolkitRoot,
         [string]$CorrelationId = ('shadow-' + [Guid]::NewGuid().ToString('N').Substring(0, 12)),
         [ValidateRange(1, 14400)][int]$ChildTimeoutSeconds = 900,
-        [switch]$ShadowSlotEnabled,
+        [switch]$ShadowSlotsEnabled,
+        # Reconciliation is authorized separately from the slots. A set may be
+        # declared and run without one, and a fixture that always enabled it
+        # could not express the case the coordinator must refuse.
+        [switch]$ReconciliationEnabled,
         # Build the corpus through the typed control plane instead of handing the
         # coordinator one that already exists. The source corpus is written
         # read-only, which is what a real captured corpus is.
@@ -270,6 +274,8 @@ function New-ShadowCoordinatorFixture {
     $launchTokenPath = Join-Path $Sandbox 'inputs\launch-authorization.token'
 
     $outputRoot = [string]([IO.Path]::GetFullPath((Join-Path $Sandbox 'shadow-output')))
+    $reviewerScriptPath = [string]([IO.Path]::GetFullPath(
+            (Join-Path $build.ToolkitCopy 'src\Agents\reviewer\Start-ReviewerAgent.ps1')))
 
     # The stage declaration, written only when this run is the one that builds
     # the corpus. Absent otherwise, which is what every request written before
@@ -289,7 +295,7 @@ function New-ShadowCoordinatorFixture {
     }
 
     $request = @{
-        contractVersion = 'devpilot.shadow-run-coordinator.request.v1'
+        contractVersion = 'devpilot.shadow-run-coordinator.request.v2'
         kind = 'shadow-run-preparation'
         correlationId = $CorrelationId
         toolkit = @{ repositoryRoot = $build.ToolkitCopy; head = $build.Head }
@@ -330,13 +336,40 @@ function New-ShadowCoordinatorFixture {
         # token file named here does not exist yet - it is minted by the
         # declaration this request has not made. A fixture that pre-created it
         # would be describing a run set nobody declared.
-        slot = @{
-            shadowSlotEnabled = $ShadowSlotEnabled.IsPresent
-            name = 'slot1'
-            reviewerScriptPath = [string]([IO.Path]::GetFullPath(
-                    (Join-Path $build.ToolkitCopy 'src\Agents\reviewer\Start-ReviewerAgent.ps1')))
-            launchAuthorizationTokenPath = [string]([IO.Path]::GetFullPath($launchTokenPath))
-            supervisionGraceSeconds = $SupervisionGraceSeconds
+        #
+        # BOTH slots are declared here, before any of them runs. A request that
+        # named one slot and grew a second later would be a different request,
+        # and the run set the first slot was launched under would no longer be
+        # the set the second belongs to.
+        slots = @{
+            shadowSlotsEnabled = $ShadowSlotsEnabled.IsPresent
+            declared = @(
+                @{
+                    name = 'slot1'
+                    reviewerScriptPath = $reviewerScriptPath
+                    launchAuthorizationTokenPath = [string]([IO.Path]::GetFullPath($launchTokenPath))
+                    supervisionGraceSeconds = $SupervisionGraceSeconds
+                    stateDirName = 'slot1-state'
+                    terminalName = 'slot1-terminal.json'
+                    modelPlan = @{ bindSealedArguments = $false; opaqueArguments = @() }
+                },
+                @{
+                    name = 'slot2'
+                    reviewerScriptPath = $reviewerScriptPath
+                    launchAuthorizationTokenPath = [string]([IO.Path]::GetFullPath($launchTokenPath))
+                    supervisionGraceSeconds = $SupervisionGraceSeconds
+                    stateDirName = 'slot2-state'
+                    terminalName = 'slot2-terminal.json'
+                    modelPlan = @{ bindSealedArguments = $false; opaqueArguments = @() }
+                }
+            )
+            reconciliation = @{
+                reconciliationEnabled = $ReconciliationEnabled.IsPresent
+                outputDirectory = [string]([IO.Path]::GetFullPath((Join-Path $outputRoot 'reconciliation')))
+                requiredRunCount = 2
+                launchAuthorizationTokenPath = [string]([IO.Path]::GetFullPath($launchTokenPath))
+                supervisionGraceSeconds = $SupervisionGraceSeconds
+            }
         }
     }
 
@@ -370,7 +403,8 @@ function New-ShadowCoordinatorFixture {
         LaunchTokenPath = [string]([IO.Path]::GetFullPath($launchTokenPath))
         RunSetDirectory = [string]([IO.Path]::GetFullPath(
                 (Join-Path $request.output.root 'qualification\runset')))
-        ReviewerScriptPath = [string]$request.slot.reviewerScriptPath
+        ReviewerScriptPath = [string]$reviewerScriptPath
+        ReconciliationDirectory = [string]$request.slots.reconciliation.outputDirectory
         OutputRoot = [string]$request.output.root
         CorrelationId = $CorrelationId
         RequestPath = $requestPath
