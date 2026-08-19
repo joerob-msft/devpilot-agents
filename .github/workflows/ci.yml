@@ -192,6 +192,22 @@ jobs:
         shell: pwsh
         run: ./tools/Test-ReviewerStageProducerContract.ps1
 
+      # The opt-in shadow path that puts the on-disk half of that contract in
+      # force: all twelve boundaries publish through the atomic writer and read
+      # straight back through the strict reader, and the reread verdict is
+      # consumed. The suite proves the switch is off by default, refuses to open
+      # while any delivery capability is live, and fails on every fault the
+      # boundary exists to catch.
+      - name: stage contract shadow adoption
+        shell: pwsh
+        run: ./tools/Test-ReviewerStageShadow.ps1
+
+      # The rule a future C# coordinator has to satisfy, fixed before the port:
+      # it consumes these schemas and may not carry prompt or verdict logic.
+      - name: coordinator stage contract architecture
+        shell: pwsh
+        run: ./tools/Test-ReviewerCoordinatorContract.ps1
+
       # Every inventoried collection field at zero, one, many, maximum,
       # duplicate, null-versus-missing, and wrong-scalar, plus the escape-shape
       # properties and the sabotage suite that proves each historical collapse

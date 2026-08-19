@@ -200,12 +200,51 @@ external scrutiny, and the reason this page exists.
 - **Shadow exposure.** Nothing here runs a model or writes to an external system. The
   no-write invariant is asserted, not relaxed.
 - **Producer-path coverage.** The remaining increment is narrower than it was, and named
-  precisely: 60 cells on the capture stage need a live acquisition to mint a sealed package,
-  111 cells are reshaped rather than passed through, 230 rows are covered through their stage
-  boundary rather than their own call site, and 112 rows name a producer with no caller in
-  `src/` today.
-- **On-disk file contract.** The versioned envelope is still test-only. No shipping path
-  writes or reads one, so no consumer has yet seen a `kind` or a `contractVersion` on disk.
+  precisely: 60 cells on the capture stage need a live acquisition to mint a sealed package —
+  the producer has since been run over three real sealed packages offline, which reaches the
+  one-element cell — 111 cells are reshaped rather than passed through, 230 rows are covered
+  through their stage boundary rather than their own call site, and 112 rows name a producer
+  with no caller in `src/` today.
+- **Capture cells that are untested rather than impossible.** Two different reasons, kept
+  apart on purpose, and they split differently per collection. Unreachable by schema: the
+  transcript package sets `minItems: 1` on both `files` and `attempts`, so neither an
+  empty file census nor an empty attempt ledger can be minted, and `attempts` is capped at
+  `maxItems: 8`, so the corpus max cell of 32 statuses cannot exist. Unreachable by producer
+  rather than by schema — worth keeping apart, because the schema declares no `uniqueItems`
+  anywhere: duplicate bound names are refused by the package assertion and by the filesystem,
+  for `files` and `directories`. Merely untested: `directories` has no
+  `minItems`, so a package with zero directories is schema-legal and no census has minted one;
+  `attempts` has no `uniqueItems`, so two attempts may share a terminal status; and `files`
+  and `directories` are uncapped, so 32 of either is legal and simply not produced by any
+  synthetic fixture. Those cells are held by the registered boundary driven directly, and are
+  not counted as producer-path covered.
+- **On-disk file contract.** The versioned envelope is written and read back by the real
+  producers, but only when a caller opts into the shadow switch, and nothing under `src/` calls
+  `Enable-ReviewerStageShadowContract` — so the on-disk half is built and CI-verified but **not
+  in force**, and the escape ledger scores it that way. The payload that flows downstream is
+  the in-memory object the boundary judged; the reread payload is proof the object survived a
+  real file round trip, not the value consumed. That proves serializability and rereadability,
+  not substitutability: comparing two serializations is blind to CLR type collapse such as
+  `Int32` against `Int64` or `DateTimeOffset` against `DateTime`, which matters for a future
+  consumer that reads these files rather than for anything running today. The capture artifact
+  is not byte-reproducible across processes, so exact-byte equality is claimed only within a
+  process and the run additionally pins a digest in which two named capture fields are compared
+  as multisets — a compensation for a known producer-order defect that, on those two fields
+  only, cannot see an ordering regression.
+- **Stage registry completeness.** The producer and coordinator contract checkers prove that
+  every *registered* stage kind has a shipping producer that validates through it, and that a
+  future consumer of these files carries schema only. Neither proves the registry is
+  *complete*. The twelve kinds are an enumeration adopted by hand from the reviewer's current
+  handoffs; a thirteenth handoff introduced without a registration would satisfy every suite
+  here while crossing a boundary no contract covers.
+- **Shadow run tools are manual evidence recipes, and their execution is not CI-verified.**
+  CI runs the suites that pin the switch's *code*, and the shadow suite token-scans
+  `tools/Invoke-ReviewerStageShadowRun.ps1` against a fixed denylist of direct provider, model
+  and external-write API names — a name check, neither transitive nor behavioural. Nothing in CI
+  executes that runner or `tools/Invoke-ReviewerCaptureCellCensus.ps1`, and no report either
+  produces is checked in, so every count and digest attributed to either of those two tools is a
+  transcription of a hand-run command, not a machine-enforced fact. Reproduce them before
+  relying on them.
 - **Historical replay of sabotage.** Sabotage proves the detector recognises the escape
   *shape* as re-authored here, not that it would have fired on the original source.
 - **Behaviour-versus-build-identity hashing.** The exact-path oracle hash still mixes both,

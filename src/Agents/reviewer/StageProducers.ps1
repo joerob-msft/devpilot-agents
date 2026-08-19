@@ -30,15 +30,24 @@
     leaves an undefined variable that fails at the first read under
     Set-StrictMode rather than silently reverting to the unchecked shape.
 
-    Nothing here reads a file, opens a session, calls a model, or writes
-    anything. Persisting a boundary payload is Write-ReviewerStageArtifact's job
-    and stays with the caller that owns the path.
+    Each builder ends by handing its judged payload to
+    Publish-ReviewerStageShadowArtifact. With the shadow switch off - every
+    ordinary run - that is the identity function and nothing is written. With
+    the switch on, the payload is published as a versioned envelope through the
+    shared atomic writer and read straight back through the strict reader
+    before it is returned, so the on-disk half of the contract is in force at
+    the same twelve boundaries as the in-memory half. What is returned is
+    always the in-memory payload, never a JSON reconstruction of it, so no
+    decision downstream can change shape because a file was written.
 #>
 
 Set-StrictMode -Version Latest
 
 if (-not (Get-Variable -Name 'ReviewerStageContractRegistry' -Scope Script -ErrorAction SilentlyContinue)) {
     . (Join-Path $PSScriptRoot 'StageContract.ps1')
+}
+if (-not (Get-Variable -Name 'ReviewerStageShadowMarkerName' -Scope Script -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot 'StageShadow.ps1')
 }
 
 $script:ReviewerStageProducerContractVersion = 1
@@ -256,11 +265,13 @@ function New-ReviewerCaptureStageContract {
         [string]$Producer = 'Assert-ReviewerAcquisitionTranscriptPackage'
     )
 
-    return Assert-ReviewerStageContract -Kind 'reviewer.stage.capture.v1' -Producer $Producer -Payload ([ordered]@{
+    $judged = Assert-ReviewerStageContract -Kind 'reviewer.stage.capture.v1' -Producer $Producer -Payload ([ordered]@{
             packageFiles = $PackageFiles
             packageDirectories = $PackageDirectories
             attemptMarkerStatuses = $AttemptMarkerStatuses
         })
+    return Publish-ReviewerStageShadowArtifact -Stage 'capture' -Kind 'reviewer.stage.capture.v1' `
+        -Payload $judged -Producer $Producer
 }
 
 function New-ReviewerSourceStageContract {
@@ -269,9 +280,11 @@ function New-ReviewerSourceStageContract {
         [string]$Producer = 'Get-ReviewerSourceRawChangedPaths'
     )
 
-    return Assert-ReviewerStageContract -Kind 'reviewer.stage.source.v1' -Producer $Producer -Payload ([ordered]@{
+    $judged = Assert-ReviewerStageContract -Kind 'reviewer.stage.source.v1' -Producer $Producer -Payload ([ordered]@{
             changedPaths = $ChangedPaths
         })
+    return Publish-ReviewerStageShadowArtifact -Stage 'source' -Kind 'reviewer.stage.source.v1' `
+        -Payload $judged -Producer $Producer
 }
 
 function New-ReviewerSnapshotStageContract {
@@ -281,10 +294,12 @@ function New-ReviewerSnapshotStageContract {
         [string]$Producer = 'Get-ReviewerCorpusSealSpanEvidence'
     )
 
-    return Assert-ReviewerStageContract -Kind 'reviewer.stage.snapshot.v1' -Producer $Producer -Payload ([ordered]@{
+    $judged = Assert-ReviewerStageContract -Kind 'reviewer.stage.snapshot.v1' -Producer $Producer -Payload ([ordered]@{
             spanPaths = $SpanPaths
             spansByPath = $SpansByPath
         })
+    return Publish-ReviewerStageShadowArtifact -Stage 'snapshot' -Kind 'reviewer.stage.snapshot.v1' `
+        -Payload $judged -Producer $Producer
 }
 
 function New-ReviewerCorpusStageContract {
@@ -294,10 +309,12 @@ function New-ReviewerCorpusStageContract {
         [string]$Producer = 'Get-ReviewerEvalGroundTruth'
     )
 
-    return Assert-ReviewerStageContract -Kind 'reviewer.stage.corpus.v1' -Producer $Producer -Payload ([ordered]@{
+    $judged = Assert-ReviewerStageContract -Kind 'reviewer.stage.corpus.v1' -Producer $Producer -Payload ([ordered]@{
             issueIds = $IssueIds
             reasonCodes = $ReasonCodes
         })
+    return Publish-ReviewerStageShadowArtifact -Stage 'corpus' -Kind 'reviewer.stage.corpus.v1' `
+        -Payload $judged -Producer $Producer
 }
 
 function New-ReviewerBlindResultsStageContract {
@@ -307,10 +324,12 @@ function New-ReviewerBlindResultsStageContract {
         [string]$Producer = 'Expand-ReviewerConventionSpecialistConstructIds'
     )
 
-    return Assert-ReviewerStageContract -Kind 'reviewer.stage.blindresults.v1' -Producer $Producer -Payload ([ordered]@{
+    $judged = Assert-ReviewerStageContract -Kind 'reviewer.stage.blindresults.v1' -Producer $Producer -Payload ([ordered]@{
             constructIds = $ConstructIds
             duplicatedConstructIds = $DuplicatedConstructIds
         })
+    return Publish-ReviewerStageShadowArtifact -Stage 'blindResults' -Kind 'reviewer.stage.blindresults.v1' `
+        -Payload $judged -Producer $Producer
 }
 
 function New-ReviewerCandidateUnionStageContract {
@@ -320,10 +339,12 @@ function New-ReviewerCandidateUnionStageContract {
         [string]$Producer = 'Get-ReviewerVerificationClusters'
     )
 
-    return Assert-ReviewerStageContract -Kind 'reviewer.stage.candidateunion.v1' -Producer $Producer -Payload ([ordered]@{
+    $judged = Assert-ReviewerStageContract -Kind 'reviewer.stage.candidateunion.v1' -Producer $Producer -Payload ([ordered]@{
             clusters = $Clusters
             overflowCandidateHashes = $OverflowCandidateHashes
         })
+    return Publish-ReviewerStageShadowArtifact -Stage 'candidateUnion' -Kind 'reviewer.stage.candidateunion.v1' `
+        -Payload $judged -Producer $Producer
 }
 
 function New-ReviewerFingerprintsStageContract {
@@ -333,10 +354,12 @@ function New-ReviewerFingerprintsStageContract {
         [string]$Producer = 'Get-ReviewerGateApprovalCoverageKey'
     )
 
-    return Assert-ReviewerStageContract -Kind 'reviewer.stage.fingerprints.v1' -Producer $Producer -Payload ([ordered]@{
+    $judged = Assert-ReviewerStageContract -Kind 'reviewer.stage.fingerprints.v1' -Producer $Producer -Payload ([ordered]@{
             gateImportantOrHigherKeys = $GateImportantOrHigherKeys
             confirmedImportantOrHigherKeys = $ConfirmedImportantOrHigherKeys
         })
+    return Publish-ReviewerStageShadowArtifact -Stage 'fingerprints' -Kind 'reviewer.stage.fingerprints.v1' `
+        -Payload $judged -Producer $Producer
 }
 
 function New-ReviewerSpecialistPlanStageContract {
@@ -350,7 +373,7 @@ function New-ReviewerSpecialistPlanStageContract {
         [string]$Producer = 'Get-ReviewerChangedConstructs'
     )
 
-    return Assert-ReviewerStageContract -Kind 'reviewer.stage.specialistplan.v1' -Producer $Producer -Payload ([ordered]@{
+    $judged = Assert-ReviewerStageContract -Kind 'reviewer.stage.specialistplan.v1' -Producer $Producer -Payload ([ordered]@{
             invocations = $Invocations
             declarations = $Declarations
             comments = $Comments
@@ -358,6 +381,8 @@ function New-ReviewerSpecialistPlanStageContract {
             partialFiles = $PartialFiles
             fileSummaries = $FileSummaries
         })
+    return Publish-ReviewerStageShadowArtifact -Stage 'specialistPlan' -Kind 'reviewer.stage.specialistplan.v1' `
+        -Payload $judged -Producer $Producer
 }
 
 function New-ReviewerVerifierAssignmentStageContract {
@@ -367,10 +392,12 @@ function New-ReviewerVerifierAssignmentStageContract {
         [string]$Producer = 'Get-ReviewerVerificationAssignments'
     )
 
-    return Assert-ReviewerStageContract -Kind 'reviewer.stage.verifierassignment.v1' -Producer $Producer -Payload ([ordered]@{
+    $judged = Assert-ReviewerStageContract -Kind 'reviewer.stage.verifierassignment.v1' -Producer $Producer -Payload ([ordered]@{
             assignments = $Assignments
             verifierModels = $VerifierModels
         })
+    return Publish-ReviewerStageShadowArtifact -Stage 'verifierAssignment' -Kind 'reviewer.stage.verifierassignment.v1' `
+        -Payload $judged -Producer $Producer
 }
 
 function New-ReviewerVerdictStageContract {
@@ -379,9 +406,11 @@ function New-ReviewerVerdictStageContract {
         [string]$Producer = 'Get-ReviewerVerificationAcceptedConventionCandidates'
     )
 
-    return Assert-ReviewerStageContract -Kind 'reviewer.stage.verdict.v1' -Producer $Producer -Payload ([ordered]@{
+    $judged = Assert-ReviewerStageContract -Kind 'reviewer.stage.verdict.v1' -Producer $Producer -Payload ([ordered]@{
             acceptedCandidates = $AcceptedCandidates
         })
+    return Publish-ReviewerStageShadowArtifact -Stage 'verdict' -Kind 'reviewer.stage.verdict.v1' `
+        -Payload $judged -Producer $Producer
 }
 
 function New-ReviewerReconciliationStageContract {
@@ -391,10 +420,12 @@ function New-ReviewerReconciliationStageContract {
         [string]$Producer = 'Get-ReviewerRunReconciliationDifference'
     )
 
-    return Assert-ReviewerStageContract -Kind 'reviewer.stage.reconciliation.v1' -Producer $Producer -Payload ([ordered]@{
+    $judged = Assert-ReviewerStageContract -Kind 'reviewer.stage.reconciliation.v1' -Producer $Producer -Payload ([ordered]@{
             onlyLeft = $OnlyLeft
             onlyRight = $OnlyRight
         })
+    return Publish-ReviewerStageShadowArtifact -Stage 'reconciliation' -Kind 'reviewer.stage.reconciliation.v1' `
+        -Payload $judged -Producer $Producer
 }
 
 function New-ReviewerDeliveryDecisionStageContract {
@@ -403,9 +434,11 @@ function New-ReviewerDeliveryDecisionStageContract {
         [string]$Producer = 'Select-ReviewerGateSubset'
     )
 
-    return Assert-ReviewerStageContract -Kind 'reviewer.stage.deliverydecision.v1' -Producer $Producer -Payload ([ordered]@{
+    $judged = Assert-ReviewerStageContract -Kind 'reviewer.stage.deliverydecision.v1' -Producer $Producer -Payload ([ordered]@{
             selectedEntries = $SelectedEntries
         })
+    return Publish-ReviewerStageShadowArtifact -Stage 'deliveryDecision' -Kind 'reviewer.stage.deliverydecision.v1' `
+        -Payload $judged -Producer $Producer
 }
 
 function Invoke-ReviewerStageProducerBuilder {
