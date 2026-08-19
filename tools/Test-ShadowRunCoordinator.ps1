@@ -1275,6 +1275,51 @@ try {
     Assert-Coordinator ((Invoke-Coordinator -RequestPath $livePath -Target 'snapshotValidateOnly').ExitCode -eq 0) `
         'The root stayed conflicted after its recorded child exited.'
 
+    # The child hashes the recipe once on entry, and then reads it a second time
+    # to decide whether an already published snapshot can be adopted. A swap in
+    # between would steer adoption at bytes nothing bound, so that second read
+    # carries the digest too. Exercised directly, because reproducing the window
+    # end to end would mean racing the child.
+    $adapterSource = Join-Path $RepoRoot 'tools\Invoke-ShadowCoordinatorChild.ps1'
+    $adapterAst = [Management.Automation.Language.Parser]::ParseFile($adapterSource, [ref]$null, [ref]$null)
+    $lookupAst = $adapterAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq 'Get-ShadowChildPublishedSnapshot'
+        }, $true)
+    Assert-Coordinator ($null -ne $lookupAst) 'The adapter no longer defines the published-snapshot lookup.'
+    if ($lookupAst) {
+        . ([scriptblock]::Create($lookupAst.Extent.Text))
+        $script:ShadowChildUtf8 = [Text.UTF8Encoding]::new($false, $true)
+        $lookupRoot = Join-Path $sandbox 'adoption-binding'
+        [void](New-Item -ItemType Directory -Force -Path $lookupRoot)
+        $lookupRecipe = Join-Path $lookupRoot 'recipe.json'
+        $lookupText = (ConvertTo-Json -InputObject ([pscustomobject]@{ snapshotId = 'planted-snapshot' }) -Depth 8) + "`n"
+        [IO.File]::WriteAllBytes($lookupRecipe, ([Text.UTF8Encoding]::new($false)).GetBytes($lookupText))
+        $lookupSha = (Get-FileHash -LiteralPath $lookupRecipe -Algorithm SHA256).Hash.ToLowerInvariant()
+
+        $lookupError = ''
+        try {
+            [void](Get-ShadowChildPublishedSnapshot -RecipePath $lookupRecipe -RecipeSha256 ('0' * 64) `
+                    -ReplayRoot $lookupRoot -ToolkitRoot $RepoRoot)
+        }
+        catch { $lookupError = [string]$_ }
+        Assert-Coordinator ($lookupError -match 'hashes to .* and the request bound') `
+            "The adoption lookup accepted a recipe the request never bound.`n$lookupError"
+
+        # And the bound digest is the only thing that refuses: the same recipe,
+        # correctly bound, gets as far as looking for a snapshot that is not there.
+        $boundError = ''
+        $boundResult = 'unset'
+        try {
+            $boundResult = Get-ShadowChildPublishedSnapshot -RecipePath $lookupRecipe -RecipeSha256 $lookupSha `
+                -ReplayRoot $lookupRoot -ToolkitRoot $RepoRoot
+        }
+        catch { $boundError = [string]$_ }
+        Assert-Coordinator (($boundError -eq '') -and ($null -eq $boundResult)) `
+            "A correctly bound recipe did not survive the adoption lookup.`n$boundError"
+    }
+
     # -----------------------------------------------------------------------
     Write-Host '18/18 no orphans, no external writes' -ForegroundColor Cyan
     Start-Sleep -Seconds 2

@@ -92,7 +92,10 @@ Beyond shape, the run is refused when:
   content it is about to consume — in the coordinator before the child request is built, again
   in the child, and finally inside the sealer itself: `Save-CorpusReplaySeal.ps1` takes an
   optional `-RecipeSha256` and checks it over the exact bytes it parses, which is what closes
-  the window rather than narrowing it, because those bytes are never read a second time,
+  the window rather than narrowing it, because those bytes are never read a second time. The
+  child's other read of the recipe — the one that derives the deterministic snapshot id used to
+  decide whether an already published snapshot can be adopted — carries the same digest, so a
+  swap cannot steer adoption at a snapshot the request never bound either,
 * another live process holds the lease on the output root,
 * a child this output root's launch journal records as running is still alive. A coordinator
   killed from outside never runs its own cleanup, so the `pwsh` it started outlives it; the

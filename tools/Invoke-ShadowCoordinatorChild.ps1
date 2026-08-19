@@ -228,7 +228,8 @@ function Invoke-ShadowChildCorpusSeal {
     # every later resume would reseal, be refused, and fail identically. Passing
     # -Force instead would be worse, because it would let a genuinely different
     # request quietly overwrite sealed evidence.
-    $adopted = Get-ShadowChildPublishedSnapshot -RecipePath $recipePath -ReplayRoot $replayRoot -ToolkitRoot $ToolkitRoot
+    $adopted = Get-ShadowChildPublishedSnapshot -RecipePath $recipePath -RecipeSha256 $recipeSha `
+        -ReplayRoot $replayRoot -ToolkitRoot $ToolkitRoot
     if ($null -ne $adopted) { return $adopted }
 
     $sealed = & $tool -CorpusRoot $corpusRoot -CorpusIndexSha256 $indexSha -Recipe $recipePath `
@@ -265,11 +266,21 @@ function Get-ShadowChildPublishedSnapshot {
     #>
     param(
         [Parameter(Mandatory)][string]$RecipePath,
+        [Parameter(Mandatory)][string]$RecipeSha256,
         [Parameter(Mandatory)][string]$ReplayRoot,
         [Parameter(Mandatory)][string]$ToolkitRoot
     )
     if (-not (Test-Path -LiteralPath $RecipePath -PathType Leaf)) { return $null }
-    $recipe = [IO.File]::ReadAllText($RecipePath) | ConvertFrom-Json -Depth 32
+    # Read the bytes ONCE and bind them before deriving anything from them. The
+    # snapshot id chosen here decides which published snapshot is adopted, so a
+    # recipe swapped after the caller hashed it could otherwise point adoption at
+    # a snapshot no request in this preparation ever asked for.
+    $recipeBytes = [IO.File]::ReadAllBytes($RecipePath)
+    $recipeActual = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($recipeBytes)).ToLowerInvariant()
+    if ($recipeActual -cne ([string]$RecipeSha256).ToLowerInvariant()) {
+        throw "The corpus recipe '$RecipePath' hashes to $recipeActual and the request bound $RecipeSha256."
+    }
+    $recipe = $script:ShadowChildUtf8.GetString($recipeBytes) | ConvertFrom-Json -Depth 32
     $recipeNames = @($recipe.PSObject.Properties | ForEach-Object { $_.Name })
     if ($recipeNames -notcontains 'snapshotId') { return $null }
     $snapshotId = [string]$recipe.snapshotId
