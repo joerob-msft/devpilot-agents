@@ -54,6 +54,15 @@ internal sealed class RunLease : IDisposable
     {        Directory.CreateDirectory(request.CoordinatorRoot);
         var tookOver = false;
 
+        // The one child a live-child conflict must NOT refuse: the supervised slot
+        // this root's own signed record says it left running. A coordinator killed
+        // during an hour-long slot leaves exactly that, and the whole point of
+        // committing the child's identity before waiting on it is that the next run
+        // can adopt it. Read from the signed record rather than from the journal, so
+        // a planted journal cannot claim the exemption, and read-only, so this
+        // decision writes nothing and mints no key.
+        var adoptable = CoordinatorState.TryReadRecordedSlotChild(request);
+
         // A dead coordinator's lease can be taken over; a dead coordinator's CHILD
         // cannot be reasoned away. When a coordinator is killed from outside it
         // never runs its own cleanup, so the pwsh process it started keeps writing
@@ -61,7 +70,7 @@ internal sealed class RunLease : IDisposable
         // two writers in one root, which is the single thing the lease exists to
         // prevent - so a recorded child that is still alive is a conflict in its
         // own right, whatever the lease file says.
-        if (ChildToolInvoker.DescribeLiveRecordedChild(request) is { } liveChild)
+        if (DescribeConflictingChild(request, adoptable) is { } liveChild)
         {
             throw new LeaseConflictException(LiveChildMessage(request, liveChild));
         }
@@ -93,7 +102,7 @@ internal sealed class RunLease : IDisposable
                     // this run holding the lease beside a live writer. Deciding it
                     // again from inside the lease is what actually settles it,
                     // because no third coordinator can be launching a child here.
-                    if (ChildToolInvoker.DescribeLiveRecordedChild(request) is { } racedChild)
+                    if (DescribeConflictingChild(request, adoptable) is { } racedChild)
                     {
                         throw new LeaseConflictException(LiveChildMessage(request, racedChild));
                     }
@@ -159,6 +168,36 @@ internal sealed class RunLease : IDisposable
     }
 
     private const int PublishGraceSeconds = 30;
+
+    /// <summary>
+    /// Describes a live recorded child that this run may not write alongside, or
+    /// null when every live recorded child is the slot this root's signed record
+    /// entitles the run to adopt.
+    /// </summary>
+    /// <remarks>
+    /// The exemption is exact: the same process id AND the same recorded start
+    /// time as the committed record. A recycled id fails the second half and is
+    /// therefore still a conflict, which is the safe direction to be wrong in.
+    /// </remarks>
+    private static string? DescribeConflictingChild(
+        CoordinatorRequest request,
+        (int ProcessId, string StartedAtUtc)? adoptable)
+    {
+        foreach (var recorded in ChildJournal.EnumerateRecordedChildren(request))
+        {
+            if (adoptable is { } owned
+                && recorded.ProcessId == owned.ProcessId
+                && string.Equals(recorded.StartedAtUtc, owned.StartedAtUtc, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            if (ChildJournal.IsAlive(recorded))
+            {
+                return ChildJournal.Describe(recorded);
+            }
+        }
+        return null;
+    }
 
     /// <summary>
     /// True when the lease file was created so recently that a holder record it

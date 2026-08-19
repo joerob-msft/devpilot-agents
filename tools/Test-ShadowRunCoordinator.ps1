@@ -258,13 +258,293 @@ exit 0
     Set-Content -LiteralPath $path -Encoding utf8NoBOM -Value $rendered
 }
 
+function New-SlotStubAdapter {
+    <#
+    .SYNOPSIS
+        Replaces the sandbox build's child adapter with one that performs every
+        PREPARATION step for real and synthesizes the three slot steps.
+
+    .DESCRIPTION
+        The one place this suite stands something in, and the reason is that the
+        alternative is not a cheaper test but a different test: a real slot runs
+        the reviewer, and the reviewer calls models. What is under test here is
+        the typed lifecycle - authorization, durable identity, supervision,
+        restart, and the refusals - and every one of those is C#'s own. So the
+        preparation steps still run through the reviewed adapter, the run set is
+        still really declared and really signed, the launch token is still the
+        published one, and only the slot's own execution is stood in for.
+
+        The stub's plan is deliberately NOT a real qualification plan. It reports
+        a digest of its own, so a scenario that tampered with the plan is a
+        scenario the coordinator refuses on its own committed digest rather than
+        on anything the qualification tools would have said.
+
+        What the stub never does is invoke a model, and the suite asserts that
+        rather than trusting this comment: the verify step reports a census of
+        attempt records, and the audit is checked for a zero model count.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ToolkitCopy,
+        [Parameter(Mandatory)][string]$RealAdapter,
+        [Parameter(Mandatory)][ValidateSet('complete', 'failed', 'timedOut', 'noTerminal', 'hang',
+            'nonzeroNoTerminal', 'wrongSlot', 'wrongSetId', 'contradictoryTimeout',
+            'writableTerminal', 'secondAttempt')][string]$Mode,
+        [int]$SlotTimeoutSeconds = 900,
+        [int]$ProgressTimeoutSeconds = 0,
+        [int]$PerCallTimeoutSeconds = 300,
+        # How long the stub's slot stays alive after publishing its attempt
+        # record. A kill-mid-slot test needs a child that is genuinely still
+        # running when its coordinator dies, and a slot that finishes in
+        # milliseconds would make that a race the suite usually loses.
+        [int]$RunDelaySeconds = 0
+    )
+    $path = Join-Path $ToolkitCopy 'tools\Invoke-ShadowCoordinatorChild.ps1'
+    $body = @'
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$RequestPath)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$mode = '__MODE__'
+$real = '__REAL__'
+$slotTimeoutSeconds = __SLOTTIMEOUT__
+$progressTimeoutSeconds = __PROGRESSTIMEOUT__
+$perCallTimeoutSeconds = __PERCALLTIMEOUT__
+$runDelaySeconds = __RUNDELAY__
+
+$request = Get-Content -LiteralPath $RequestPath -Raw | ConvertFrom-Json -Depth 24
+$step = [string]$request.step
+$resultPath = [string]$request.resultPath
+$correlationId = [string]$request.correlationId
+$childRequestSha256 = [string]$request.childRequestSha256
+
+# Preparation is not stood in for. Only the slot is.
+if (-not $step.StartsWith('slot')) {
+    $global:LASTEXITCODE = 0
+    & $real -RequestPath $RequestPath
+    exit ([int]$global:LASTEXITCODE)
+}
+
+function Write-StubResult {
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Fields)
+    $payload = [ordered]@{
+        contractVersion = 'devpilot.shadow-run-coordinator.child-result.v1'
+        kind = 'shadow-run-coordinator-child-result'
+        correlationId = $correlationId
+        step = $step
+        childRequestSha256 = $childRequestSha256
+        ok = $true
+    }
+    foreach ($key in @($Fields.Keys)) { $payload[[string]$key] = $Fields[$key] }
+    $text = ConvertTo-Json -InputObject $payload -Depth 12 -Compress:$false
+    [void](New-Item -ItemType Directory -Force -Path (Split-Path $resultPath -Parent))
+    [IO.File]::WriteAllBytes($resultPath, ([Text.UTF8Encoding]::new($false, $true)).GetBytes($text))
+}
+
+function Get-StubSha256Text {
+    param([Parameter(Mandatory)][string]$Text)
+    $bytes = ([Text.UTF8Encoding]::new($false, $true)).GetBytes($Text)
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+}
+
+$qualificationRoot = [string]$request.qualificationRoot
+$stubRoot = Join-Path $qualificationRoot 'stub'
+$stateDir = Join-Path $stubRoot 'slot1-state'
+$attemptPath = Join-Path $stubRoot 'slot1-attempt.json'
+$terminalPath = Join-Path $stubRoot 'slot1-terminal.json'
+
+# The run set identity is taken from the coordinator's own committed
+# verification result rather than re-derived, because re-deriving it means
+# re-verifying a signature this stub has no business re-implementing.
+$exchange = Split-Path $resultPath -Parent
+$verifyResult = Join-Path $exchange "$correlationId-runSetVerify.result.json"
+if (-not (Test-Path -LiteralPath $verifyResult -PathType Leaf)) {
+    throw "The stub adapter found no committed run-set verification to take a set identity from."
+}
+$setId = [string]((Get-Content -LiteralPath $verifyResult -Raw | ConvertFrom-Json -Depth 16).setId)
+
+# Hashed from the PUBLISHED token, not from the one the request presents, so a
+# request carrying the wrong token still fails the coordinator's comparison.
+$publishedToken = Join-Path (Join-Path $qualificationRoot 'runset') 'launch-authorization.token'
+$launchHash = Get-StubSha256Text -Text (([IO.File]::ReadAllText($publishedToken)).Trim())
+$planDigest = Get-StubSha256Text -Text "stub-plan|$setId|$mode"
+
+if ($step -eq 'slotPlan' -or $step -eq 'slotPrelaunch') {
+    Write-StubResult -Fields ([ordered]@{
+            setId = $setId
+            planDigest = $planDigest
+            launchAuthorizationHash = $launchHash
+            reviewerScriptSha256 = (Get-FileHash -LiteralPath ([string]$request.reviewerScriptPath) -Algorithm SHA256).Hash.ToLowerInvariant()
+            slotName = 'slot1'
+            slotStateDir = [string]$stateDir
+            slotTerminalPath = [string]$terminalPath
+            slotAttemptExists = [bool](Test-Path -LiteralPath $attemptPath)
+            slotTerminalExists = [bool](Test-Path -LiteralPath $terminalPath)
+            slotTimeoutSeconds = $slotTimeoutSeconds
+            progressTimeoutSeconds = $progressTimeoutSeconds
+            perCallTimeoutSeconds = $perCallTimeoutSeconds
+            head = [string](& git -C ([string]$request.toolkitRoot) rev-parse HEAD).Trim()
+            requiredRef = [string]$request.requiredRef
+            headClean = $true
+            deliveryMode = 'PreviewOnly'
+            promotable = $false
+        })
+    exit 0
+}
+
+if ($step -eq 'slotRun') {
+    [void](New-Item -ItemType Directory -Force -Path $stubRoot)
+    [void](New-Item -ItemType Directory -Force -Path $stateDir)
+    # CreateNew, exactly as the reviewed slot runner does it: the attempt record
+    # is the single-use marker, and a second attempt has to fail on the file
+    # system rather than on a check something could skip.
+    $attempt = [IO.File]::Open($attemptPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write)
+    try {
+        $attemptBytes = ([Text.UTF8Encoding]::new($false, $true)).GetBytes("{`"slot`":`"slot1`",`"setId`":`"$setId`"}")
+        $attempt.Write($attemptBytes, 0, $attemptBytes.Length)
+    }
+    finally { $attempt.Dispose() }
+    if ($mode -eq 'secondAttempt') {
+        # A second attempt record appearing behind the coordinator's back, which
+        # is what a hand-run of the PowerShell path alongside it would leave.
+        [IO.File]::WriteAllText((Join-Path $stubRoot 'slot2-attempt.json'), '{"slot":"slot2"}')
+    }
+    if ($mode -eq 'hang') { Start-Sleep -Seconds 600; exit 0 }
+    if ($runDelaySeconds -gt 0) {
+        # Touched rather than merely slept through, so a supervisor bounded by an
+        # activity deadline sees the slot working rather than idle.
+        $deadline = [DateTime]::UtcNow.AddSeconds($runDelaySeconds)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            [IO.File]::WriteAllText((Join-Path $stateDir 'heartbeat.json'),
+                ('{"atUtc":"' + [DateTime]::UtcNow.ToString('o') + '"}'))
+            Start-Sleep -Milliseconds 500
+        }
+    }
+    if ($mode -eq 'noTerminal') {
+        Write-StubResult -Fields ([ordered]@{
+                terminalWritten = $false
+                terminalPath = [string]$terminalPath
+                childExitCode = 0
+                slotName = 'slot1'
+                setId = $setId
+                planDigest = $planDigest
+            })
+        exit 0
+    }
+    if ($mode -eq 'nonzeroNoTerminal') { exit 7 }
+
+    $status = switch ($mode) {
+        'failed' { 'failed' }
+        'timedOut' { 'timedOut' }
+        default { 'complete' }
+    }
+    $timedOut = ($status -eq 'timedOut')
+    if ($mode -eq 'contradictoryTimeout') { $timedOut = $true }
+    $terminal = [ordered]@{
+        kind = 'reviewer.replay-qualification.terminal.v1'
+        slot = $(if ($mode -eq 'wrongSlot') { 'slot2' } else { 'slot1' })
+        setId = $(if ($mode -eq 'wrongSetId') { 'not-this-run-set' } else { $setId })
+        planDigest = $planDigest
+        status = $status
+        exitCode = $(if ($status -eq 'complete') { 0 } else { 3 })
+        timedOut = $timedOut
+        childProcessId = $PID
+        startedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+        endedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+    }
+    $terminalText = ConvertTo-Json -InputObject $terminal -Depth 8 -Compress:$false
+    [IO.File]::WriteAllBytes($terminalPath, ([Text.UTF8Encoding]::new($false, $true)).GetBytes($terminalText))
+    if ($mode -ne 'writableTerminal') {
+        (Get-Item -LiteralPath $terminalPath).IsReadOnly = $true
+    }
+    Write-StubResult -Fields ([ordered]@{
+            terminalWritten = $true
+            terminalPath = [string]$terminalPath
+            childExitCode = [int]$terminal.exitCode
+            slotName = 'slot1'
+            setId = $setId
+            planDigest = $planDigest
+        })
+    # The reviewed runner propagates the reviewed run's own exit code, so a
+    # failed slot exits non-zero with perfectly good evidence. Mirrored here so
+    # the coordinator's "exit code is data" claim is actually exercised.
+    exit ([int]$terminal.exitCode)
+}
+
+if ($step -eq 'slotVerify') {
+    if (-not (Test-Path -LiteralPath $terminalPath -PathType Leaf)) {
+        throw "Slot 'slot1' has no terminal evidence under '$stubRoot'."
+    }
+    $terminal = Get-Content -LiteralPath $terminalPath -Raw | ConvertFrom-Json -Depth 8
+    $bytes = [IO.File]::ReadAllBytes($terminalPath)
+    $attempts = @(Get-ChildItem -LiteralPath $stubRoot -Filter 'slot*-attempt.json' -File -ErrorAction SilentlyContinue)
+    Write-StubResult -Fields ([ordered]@{
+            terminalStatus = [string]$terminal.status
+            terminalExitCode = [int]$terminal.exitCode
+            terminalTimedOut = [bool]$terminal.timedOut
+            terminalImmutable = [bool](Get-Item -LiteralPath $terminalPath).IsReadOnly
+            terminalSetId = [string]$terminal.setId
+            terminalPlanDigest = [string]$terminal.planDigest
+            terminalSlot = [string]$terminal.slot
+            terminalPath = [string]$terminalPath
+            terminalSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+            signatureVerified = $true
+            inventoryVerified = $true
+            slotAttemptCount = [int]$attempts.Count
+            modelInvocationCount = 0
+            deliveryMode = 'PreviewOnly'
+            promotable = $false
+        })
+    exit 0
+}
+throw "'$step' is not a step this stub adapter performs."
+'@
+    $rendered = $body -replace '__MODE__', $Mode
+    $rendered = $rendered -replace '__REAL__', ($RealAdapter -replace '\\', '\\')
+    $rendered = $rendered -replace '__SLOTTIMEOUT__', [string]$SlotTimeoutSeconds
+    $rendered = $rendered -replace '__PROGRESSTIMEOUT__', [string]$ProgressTimeoutSeconds
+    $rendered = $rendered -replace '__PERCALLTIMEOUT__', [string]$PerCallTimeoutSeconds
+    $rendered = $rendered -replace '__RUNDELAY__', [string]$RunDelaySeconds
+    Set-Content -LiteralPath $path -Encoding utf8NoBOM -Value $rendered
+}
+
 function Restore-ChildAdapter {
     param([Parameter(Mandatory)][string]$ToolkitCopy, [Parameter(Mandatory)][string]$RepoRoot)
     Copy-Item -Force (Join-Path $RepoRoot 'tools\Invoke-ShadowCoordinatorChild.ps1') `
         (Join-Path $ToolkitCopy 'tools\Invoke-ShadowCoordinatorChild.ps1')
 }
 
+function Initialize-SlotRunSet {
+    <#
+    .SYNOPSIS
+        Carries one slot scenario's output root to a real, signed run-set-ready and
+        hands over the launch-authorization token the declaration published.
+
+    .DESCRIPTION
+        Preparation is always done by the reviewed adapter in a clean tree, and the
+        reason is not tidiness: the reviewed declaration preflight refuses a dirty
+        qualification worktree, and standing the adapter in IS a dirty worktree. So
+        every slot scenario reaches run-set-ready for real first, and only then is
+        the slot's own execution stood in for.
+    #>
+    param(
+        [Parameter(Mandatory)]$Fixture,
+        [Parameter(Mandatory)][string]$RepositoryRoot,
+        [Parameter(Mandatory)][string]$RequestPath,
+        [Parameter(Mandatory)][string]$OutputRoot,
+        [Parameter(Mandatory)][string]$Label
+    )
+    Restore-ChildAdapter -ToolkitCopy $Fixture.ToolkitCopy -RepoRoot $RepositoryRoot
+    $setup = Invoke-Coordinator -RequestPath $RequestPath -Target 'runSetReady'
+    Assert-Coordinator ($setup.ExitCode -eq 0) `
+        "The $Label setup did not reach run-set-ready (exit $($setup.ExitCode)).`n$($setup.Output)"
+    [void](Publish-ShadowCoordinatorLaunchToken `
+            -RunSetDirectory (Join-Path $OutputRoot 'qualification\runset') `
+            -TokenPath $Fixture.LaunchTokenPath)
+}
+
 function Get-DescendantPwshCount {
+
     <#
     .SYNOPSIS
         Counts PowerShell processes this suite is responsible for, which is how an
@@ -301,7 +581,7 @@ try {
     # resolve against whatever scope happens to run the closure later.
     $setOutputRoot = ${function:Set-CoordinatorOutputRoot}
 
-    Write-Host '1/18 offline restore and build' -ForegroundColor Cyan
+    Write-Host '1/21 offline restore and build' -ForegroundColor Cyan
     $project = Join-Path $RepoRoot 'tools\ShadowRunCoordinator\ShadowRunCoordinator.csproj'
     Assert-Coordinator (Test-Path -LiteralPath $project -PathType Leaf) `
         'The shadow run coordinator project is missing.'
@@ -320,7 +600,7 @@ try {
         'The coordinator assembly was not produced.'
 
     # -----------------------------------------------------------------------
-    Write-Host '2/18 sandbox, sealed corpus and typed request' -ForegroundColor Cyan
+    Write-Host '2/21 sandbox, sealed corpus and typed request' -ForegroundColor Cyan
     Import-Module (Join-Path $RepoRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force
     . (Join-Path $RepoRoot 'src\Agents\reviewer\SourceTransport.ps1')
     . (Join-Path $RepoRoot 'src\Agents\reviewer\CorpusSeal.ps1')
@@ -337,7 +617,7 @@ try {
         'The request does not bind a prompt-asset digest.'
 
     # -----------------------------------------------------------------------
-    Write-Host '3/18 restart at every transition' -ForegroundColor Cyan
+    Write-Host '3/21 restart at every transition' -ForegroundColor Cyan
     $states = @('requestValidated', 'corpusValidated', 'recipePlanned', 'snapshotValidateOnly',
         'snapshotSealed', 'snapshotVerified', 'runSetDeclared', 'runSetVerified')
     $expectedSequence = 0
@@ -364,7 +644,7 @@ try {
             "Resuming to an already-reached '$state' advanced the sequence to $($repeat.sequence)."
     }
 
-    Write-Host '4/18 preparation reaches run-set-ready' -ForegroundColor Cyan
+    Write-Host '4/21 preparation reaches run-set-ready' -ForegroundColor Cyan
     $final = Invoke-Coordinator -RequestPath $fixture.RequestPath
     Assert-Coordinator ($final.ExitCode -eq 0) "The preparation did not reach run-set-ready (exit $($final.ExitCode)): $($final.Output)"
     $durable = Get-CoordinatorState -OutputRoot $fixture.OutputRoot
@@ -383,7 +663,7 @@ try {
         "Replaying a completed preparation advanced the sequence to $($afterReplay.sequence)."
 
     # -----------------------------------------------------------------------
-    Write-Host '5/18 audit indexes all twelve stage artifacts' -ForegroundColor Cyan
+    Write-Host '5/21 audit indexes all twelve stage artifacts' -ForegroundColor Cyan
     $auditPath = Join-Path $fixture.OutputRoot 'coordinator\audit.json'
     Assert-Coordinator (Test-Path -LiteralPath $auditPath -PathType Leaf) 'The coordinator wrote no audit.'
     $audit = Get-Content -LiteralPath $auditPath -Raw | ConvertFrom-Json -Depth 32
@@ -409,7 +689,7 @@ try {
         'The preparation observed a slot attempt.'
 
     # -----------------------------------------------------------------------
-    Write-Host '6/18 stage publication parity with the PowerShell path' -ForegroundColor Cyan
+    Write-Host '6/21 stage publication parity with the PowerShell path' -ForegroundColor Cyan
     # The same stage publication, driven directly through the existing PowerShell
     # entry point instead of through the coordinator's child process. Byte
     # identical artifacts are what makes the rollback switch real at THIS seam:
@@ -450,7 +730,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    Write-Host '7/18 request boundary: unknown, missing, scalar, null, BOM, truncated' -ForegroundColor Cyan
+    Write-Host '7/21 request boundary: unknown, missing, scalar, null, BOM, truncated' -ForegroundColor Cyan
     # Built through a list rather than an @(...) literal: the mutators set fields
     # to $null on purpose, and inside an array expression that reads as an array
     # that can carry a null element. It cannot -- the nulls are inside script
@@ -498,7 +778,7 @@ try {
         'A missing request file was not refused.'
 
     # -----------------------------------------------------------------------
-    Write-Host '8/18 stale head, stale identity and tampered state' -ForegroundColor Cyan
+    Write-Host '8/21 stale head, stale identity and tampered state' -ForegroundColor Cyan
     $staleHeadPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'stale-head' -Mutate {
         param($r)
         $r.toolkit.head = ('f' * 40)
@@ -557,7 +837,7 @@ try {
         "A state file from another correlation was adopted (exit $($foreign.ExitCode))."
 
     # -----------------------------------------------------------------------
-    Write-Host '9/18 single-run lease' -ForegroundColor Cyan
+    Write-Host '9/21 single-run lease' -ForegroundColor Cyan
     $leaseRoot = Join-Path $sandbox 'out-lease'
     $leasePath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'lease' -Mutate {
         param($r) & $setOutputRoot -Request $r -Root $leaseRoot
@@ -592,7 +872,7 @@ try {
         "An abandoned lease wedged the output root (exit $($recovered.ExitCode))."
 
     # -----------------------------------------------------------------------
-    Write-Host '10/18 child fault matrix' -ForegroundColor Cyan
+    Write-Host '10/21 child fault matrix' -ForegroundColor Cyan
     $faults = @(
         @{ Name = 'nonzero'; Expect = 4 },
         @{ Name = 'missing'; Expect = 4 },
@@ -660,7 +940,7 @@ try {
     Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot
 
     # -----------------------------------------------------------------------
-    Write-Host '11/18 killed mid-transition' -ForegroundColor Cyan
+    Write-Host '11/21 killed mid-transition' -ForegroundColor Cyan
     # A real external kill, not a cooperative halt: the coordinator is stopped
     # while a child is running, and the root must still converge.
     $killRoot = Join-Path $sandbox 'out-kill'
@@ -697,7 +977,7 @@ try {
         "The resumed preparation left $($declared.Count) declared run sets rather than one."
 
     # -----------------------------------------------------------------------
-    Write-Host '12/18 pre-commit window: a published side effect is adopted' -ForegroundColor Cyan
+    Write-Host '12/21 pre-commit window: a published side effect is adopted' -ForegroundColor Cyan
     # The fault a control plane cannot test its way out of by halting: a child
     # completes a durable, NON-REPEATABLE side effect and the coordinator dies
     # before it can commit the transition. Every --halt-after case above stops
@@ -897,7 +1177,7 @@ try {
     Assert-Coordinator (@(Get-ChildItem -LiteralPath $stageDirectory -File -Filter '*.stage.json').Count -eq 12) `
         'The retry accumulated stage artifacts instead of replacing them.'
     # -----------------------------------------------------------------------
-    Write-Host '13/18 resume integrity and the declared artifact directory' -ForegroundColor Cyan
+    Write-Host '13/21 resume integrity and the declared artifact directory' -ForegroundColor Cyan
     # A resumed run re-reads its child results from the exchange directory, which
     # carries no signature of its own. Without binding them to the digest the
     # signed record committed, a resume could adopt a snapshot or run set other
@@ -969,7 +1249,7 @@ try {
         'A missing option value escaped as an unhandled exception.'
 
     # -----------------------------------------------------------------------
-    Write-Host '14/18 changed-path census boundary' -ForegroundColor Cyan
+    Write-Host '14/21 changed-path census boundary' -ForegroundColor Cyan
     # The census is declared by the caller and validated here, never synthesised.
     # Zero, one, many, duplicated, misordered, scalar, null and unknown all have
     # to have an answer, because the census reaches the published bytes.
@@ -1008,7 +1288,7 @@ try {
         'A missing changed-path census was not refused.'
 
     # -----------------------------------------------------------------------
-    Write-Host '15/18 a declaration must belong to this preparation' -ForegroundColor Cyan
+    Write-Host '15/21 a declaration must belong to this preparation' -ForegroundColor Cyan
     # A signature proves a declaration was made under this output root's key. It
     # does NOT prove the declaration is about the snapshot this run sealed - one
     # key signs every declaration in a root, so a declaration left behind by an
@@ -1144,7 +1424,7 @@ try {
         "The refusal did not name the plan the declaration was sealed under.`n$borrowReason"
 
     # -----------------------------------------------------------------------
-    Write-Host '16/18 the audit says only what the record can support' -ForegroundColor Cyan
+    Write-Host '16/21 the audit says only what the record can support' -ForegroundColor Cyan
     # An audit whose counters come from this process cannot see work an earlier
     # process did, and a null count coerces to the reassuring zero in every
     # consumer that reads it. Both are properties of the durable record here.
@@ -1179,7 +1459,7 @@ try {
         'The resumed audit did not grow its child-backed transition census.'
 
     # -----------------------------------------------------------------------
-    Write-Host '17/18 a root that has done nothing is not wedged' -ForegroundColor Cyan
+    Write-Host '17/21 a root that has done nothing is not wedged' -ForegroundColor Cyan
     # The refusal that protects a destroyed record must not be reachable by a
     # first attempt that simply failed. A run refused at requestValidated has
     # published nothing, so the same root with a corrected request has to work -
@@ -1321,7 +1601,394 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    Write-Host '18/18 no orphans, no external writes' -ForegroundColor Cyan
+    Write-Host '18/21 slot authorization against the real qualification plan' -ForegroundColor Cyan
+    # The one slot scenario that stands NOTHING in. The plan is built by the
+    # production builder, bound to the signed declaration by the production
+    # assertions, and the launch token is the one the declaration published. It
+    # stops at slot1Authorized, which is the last state before anything runs, so
+    # the whole check costs no model and no reviewer.
+    $realAdapter = Join-Path $RepoRoot 'tools\Invoke-ShadowCoordinatorChild.ps1'
+
+    $authRoot = Join-Path $sandbox 'slot-authorize'
+    $authPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'slot-authorize' `
+        -Mutate {
+            param($r)
+            & $setOutputRoot -Request $r -Root $authRoot
+            $r.slot.shadowSlotEnabled = $true
+        }.GetNewClosure()
+    Assert-Coordinator ((Invoke-Coordinator -RequestPath $authPath -Target 'runSetReady').ExitCode -eq 0) `
+        'The slot-authorization setup did not reach run-set-ready.'
+    $authRunSet = Join-Path $authRoot 'qualification\runset'
+
+    # Refusals first, because none of them writes state: the same root serves
+    # every one of them and then goes on to authorize for real.
+    $noToken = Invoke-Coordinator -RequestPath $authPath -Target 'slot1Authorized'
+    Assert-Coordinator ($noToken.ExitCode -eq 2) `
+        "A launch authorized without a token exited $($noToken.ExitCode) rather than refusing."
+    Assert-Coordinator ($noToken.Output -match 'launch-authorization token .* does not exist') `
+        "The refusal did not name the missing token.`n$($noToken.Output)"
+
+    [void](Publish-ShadowCoordinatorLaunchToken -RunSetDirectory $authRunSet `
+            -TokenPath $fixture.LaunchTokenPath -Corrupt)
+    $wrongToken = Invoke-Coordinator -RequestPath $authPath -Target 'slot1Authorized'
+    Assert-Coordinator ($wrongToken.ExitCode -eq 2) `
+        "A launch authorized on a token the set never published exited $($wrongToken.ExitCode)."
+    Assert-Coordinator ($wrongToken.Output -match 'not the token the published run set carries') `
+        "The refusal did not name the token mismatch.`n$($wrongToken.Output)"
+    # And the refusal message publishes no digest, because a message that printed
+    # both sides of a failed token comparison would be an oracle for guessing it.
+    Assert-Coordinator ($wrongToken.Output -notmatch '[0-9a-f]{64}') `
+        'The token refusal printed a 64-hex digest.'
+
+    [void](Publish-ShadowCoordinatorLaunchToken -RunSetDirectory $authRunSet `
+            -TokenPath $fixture.LaunchTokenPath)
+    $disabledPath = New-CoordinatorRequestVariant -BasePath $authPath -Name 'slot-disabled' `
+        -Mutate { param($r) $r.slot.shadowSlotEnabled = $false }
+    $disabled = Invoke-Coordinator -RequestPath $disabledPath -Target 'slot1Authorized'
+    Assert-Coordinator ($disabled.ExitCode -eq 2) `
+        "A slot target without the shadow flag exited $($disabled.ExitCode) rather than refusing."
+    Assert-Coordinator ($disabled.Output -match "shadowSlotEnabled") `
+        "The refusal did not name the disabled shadow flag.`n$($disabled.Output)"
+    $slot2Path = New-CoordinatorRequestVariant -BasePath $authPath -Name 'slot-two' `
+        -Mutate { param($r) $r.slot.name = 'slot2' }
+    $slot2 = Invoke-Coordinator -RequestPath $slot2Path -Target 'slot1Authorized'
+    Assert-Coordinator ($slot2.ExitCode -eq 2) `
+        "A request naming slot2 exited $($slot2.ExitCode) rather than refusing."
+    Assert-Coordinator ($slot2.Output -match 'supervises exactly one slot') `
+        "The refusal did not say this build supervises one slot.`n$($slot2.Output)"
+
+    # The default target is unchanged, which is what makes the rollback posture
+    # real: a caller that does not ask for a slot never gets one.
+    $defaultTarget = Invoke-Coordinator -RequestPath $authPath
+    Assert-Coordinator ($defaultTarget.ExitCode -eq 0) 'A default-target run over a ready root failed.'
+    $beforeAuthorize = Get-CoordinatorState -OutputRoot $authRoot
+    Assert-Coordinator ($beforeAuthorize.state -ceq 'runSetReady') `
+        "A default-target run advanced to '$($beforeAuthorize.state)'; the default must never launch."
+
+    $authorized = Invoke-Coordinator -RequestPath $authPath -Target 'slot1Authorized'
+    Assert-Coordinator ($authorized.ExitCode -eq 0) `
+        "Authorizing a launch against the real plan failed (exit $($authorized.ExitCode)).`n$($authorized.Output)"
+    $authState = Get-CoordinatorState -OutputRoot $authRoot
+    Assert-Coordinator ($authState.state -ceq 'slot1Authorized' -and [int]$authState.sequence -eq 10) `
+        "The durable state is '$($authState.state)' at sequence $($authState.sequence)."
+    $authEvidence = @($authState.transitions | Where-Object { $_.state -ceq 'slot1Authorized' })[0].evidence
+    Assert-Coordinator ([string]$authEvidence.planDigest -cmatch '^[0-9a-f]{64}$') `
+        'The authorization committed no plan digest.'
+    Assert-Coordinator ([string]$authEvidence.slotName -ceq 'slot1') `
+        "The authorization names slot '$([string]$authEvidence.slotName)'."
+    $readySetId = [string](@($beforeAuthorize.transitions | Where-Object { $_.state -ceq 'runSetVerified' })[0].evidence.setId)
+    Assert-Coordinator ([string]$authEvidence.setId -ceq $readySetId) `
+        'The authorization is not bound to the run set this preparation verified.'
+    # The token's TEXT must appear nowhere durable. Its digest is the binding.
+    $authStateText = [IO.File]::ReadAllText((Join-Path $authRoot 'coordinator\state.json'))
+    $tokenText = ([IO.File]::ReadAllText($fixture.LaunchTokenPath)).Trim()
+    Assert-Coordinator (-not $authStateText.Contains($tokenText)) `
+        'The launch-authorization token was written into the durable state record.'
+    Assert-Coordinator (-not $authorized.Output.Contains($tokenText)) `
+        'The launch-authorization token was written to the console.'
+    # Nothing was launched to get here.
+    Assert-Coordinator (-not (Test-Path -LiteralPath (Join-Path $authRoot 'qualification\runs'))) `
+        'Authorizing a launch created a run directory.'
+
+    # -----------------------------------------------------------------------
+    Write-Host '19/21 one supervised slot, halted and resumed at every slot state' -ForegroundColor Cyan
+    $slotStates = @('slot1Authorized', 'slot1Launching', 'slot1Running', 'slot1TerminalObserved')
+    $lifecycleRoot = Join-Path $sandbox 'slot-lifecycle'
+    $lifecyclePath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'slot-lifecycle' `
+        -Mutate {
+            param($r)
+            & $setOutputRoot -Request $r -Root $lifecycleRoot
+            $r.slot.shadowSlotEnabled = $true
+        }.GetNewClosure()
+    Initialize-SlotRunSet -Fixture $fixture -RepositoryRoot $RepoRoot -RequestPath $lifecyclePath `
+        -OutputRoot $lifecycleRoot -Label 'slot-lifecycle'
+    New-SlotStubAdapter -ToolkitCopy $fixture.ToolkitCopy -RealAdapter $realAdapter -Mode 'complete'
+    try {
+        $expectedSequence = 9
+        foreach ($state in $slotStates) {
+            $expectedSequence++
+            $halted = Invoke-Coordinator -RequestPath $lifecyclePath -HaltAfter $state -Target 'slot1TerminalVerified'
+            Assert-Coordinator ($halted.ExitCode -eq 9) `
+                "Halting after '$state' did not report a deliberate halt (exit $($halted.ExitCode)).`n$($halted.Output)"
+            $durable = Get-CoordinatorState -OutputRoot $lifecycleRoot
+            Assert-Coordinator ($durable -and $durable.state -ceq $state) `
+                "The durable state after halting at '$state' is '$(if ($durable) { $durable.state } else { 'none' })'."
+            Assert-Coordinator ($durable -and [int]$durable.sequence -eq $expectedSequence) `
+                "The sequence after '$state' is $(if ($durable) { $durable.sequence } else { 'none' }), not $expectedSequence."
+
+            # Resuming to a slot state already reached must not launch a second
+            # time. The attempt record is single-use, so a second launch is not a
+            # wasted run but an unrecoverable one.
+            $again = Invoke-Coordinator -RequestPath $lifecyclePath -Target $state
+            Assert-Coordinator ($again.ExitCode -eq 0) `
+                "Resuming to an already-reached '$state' failed (exit $($again.ExitCode)).`n$($again.Output)"
+            Assert-Coordinator ($again.Output -match "skip $state") `
+                "Resuming to an already-reached '$state' did not report it as already recorded."
+            $repeat = Get-CoordinatorState -OutputRoot $lifecycleRoot
+            Assert-Coordinator ([int]$repeat.sequence -eq $expectedSequence) `
+                "Resuming to an already-reached '$state' advanced the sequence to $($repeat.sequence)."
+            $attempts = @(Get-ChildItem -LiteralPath (Join-Path $lifecycleRoot 'qualification\stub') `
+                    -Filter 'slot*-attempt.json' -File -ErrorAction SilentlyContinue)
+            Assert-Coordinator ($attempts.Count -le 1) `
+                "After resuming at '$state' the run set carries $($attempts.Count) attempt records."
+        }
+
+        # The identity a resumed run would adopt has to be durable BEFORE the
+        # wait, or a coordinator killed during an hour-long slot cannot name what
+        # it left behind.
+        $runningState = Get-CoordinatorState -OutputRoot $lifecycleRoot
+        $runningEvidence = @($runningState.transitions | Where-Object { $_.state -ceq 'slot1Running' })[0].evidence
+        Assert-Coordinator ([int]$runningEvidence.child.childProcessId -gt 0) `
+            'The running record carries no child process id.'
+        # Read as text, not through ConvertFrom-Json: PowerShell turns an ISO-8601
+        # string into a DateTime, and what is under test here is the shape the
+        # record actually carries.
+        $runningRaw = [IO.File]::ReadAllText((Join-Path $lifecycleRoot 'coordinator\state.json'))
+        Assert-Coordinator ($runningRaw -cmatch '"childStartedAtUtc"\s*:\s*"\d{4}-\d{2}-\d{2}T[\d:.]+Z"') `
+            'The running record carries no child start time, so a recycled pid could be mistaken for the child.'
+        Assert-Coordinator ([string]$runningEvidence.child.childRequestSha256 -cmatch '^[0-9a-f]{64}$') `
+            'The running record carries no child request digest.'
+
+        $verified = Invoke-Coordinator -RequestPath $lifecyclePath -Target 'slot1TerminalVerified'
+        Assert-Coordinator ($verified.ExitCode -eq 0) `
+            "The supervised slot did not reach a verified terminal (exit $($verified.ExitCode)).`n$($verified.Output)"
+        $finalState = Get-CoordinatorState -OutputRoot $lifecycleRoot
+        Assert-Coordinator ($finalState.state -ceq 'slot1TerminalVerified' -and [int]$finalState.sequence -eq 14) `
+            "The durable state is '$($finalState.state)' at sequence $($finalState.sequence)."
+        Assert-Coordinator (@($finalState.transitions).Count -eq 14) `
+            "The state records $(@($finalState.transitions).Count) transitions rather than fourteen."
+
+        $slotAudit = Get-Content -LiteralPath (Join-Path $lifecycleRoot 'coordinator\audit.json') -Raw |
+            ConvertFrom-Json -Depth 32
+        Assert-Coordinator ([bool]$slotAudit.slotSupervised) 'The audit does not record a supervised slot.'
+        Assert-Coordinator ([int]$slotAudit.slotLaunchCount -eq 0) `
+            ("The readiness census reports $($slotAudit.slotLaunchCount) attempt records at run-set-ready; " +
+                'a ready run set is one where nothing has run yet.')
+        Assert-Coordinator ([int]$slotAudit.modelInvocationCount -eq 0) `
+            'The coordinator claims to have invoked a model.'
+        Assert-Coordinator ([int]$slotAudit.providerWriteCount -eq 0 -and
+            [string]$slotAudit.deliveryMode -ceq 'previewOnly') `
+            'The audit does not record a preview-only run with no provider writes.'
+        Assert-Coordinator ([string]$slotAudit.slotTerminalStatus -ceq 'complete') `
+            "The audit reports terminal status '$([string]$slotAudit.slotTerminalStatus)'."
+        Assert-Coordinator ([int]$slotAudit.slotAttemptCount -eq 1) `
+            "The audit reports $($slotAudit.slotAttemptCount) slot attempts rather than one."
+        Assert-Coordinator ([string]$slotAudit.slotTerminalSha256 -cmatch '^[0-9a-f]{64}$') `
+            'The audit indexes the terminal evidence without a digest.'
+
+        # Replaying a finished lifecycle is a no-op, including its single launch.
+        $slotReplay = Invoke-Coordinator -RequestPath $lifecyclePath -Target 'slot1TerminalVerified'
+        Assert-Coordinator ($slotReplay.ExitCode -eq 0) 'Replaying a completed slot lifecycle failed.'
+        Assert-Coordinator ([int](Get-CoordinatorState -OutputRoot $lifecycleRoot).sequence -eq 14) `
+            'Replaying a completed slot lifecycle advanced the sequence.'
+        $replayAttempts = @(Get-ChildItem -LiteralPath (Join-Path $lifecycleRoot 'qualification\stub') `
+                -Filter 'slot*-attempt.json' -File)
+        Assert-Coordinator ($replayAttempts.Count -eq 1) `
+            "Replaying a completed slot lifecycle left $($replayAttempts.Count) attempt records."
+
+        # -------------------------------------------------------------------
+        # A killed coordinator, mid-slot, is the fault the two-phase supervisor
+        # exists for. The child is left alive, the record already names it, and
+        # the resumed run has to adopt it rather than start a second one.
+        $killRoot = Join-Path $sandbox 'slot-kill'
+        $killPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'slot-kill' `
+            -Mutate {
+                param($r)
+                & $setOutputRoot -Request $r -Root $killRoot
+                $r.slot.shadowSlotEnabled = $true
+            }.GetNewClosure()
+        Initialize-SlotRunSet -Fixture $fixture -RepositoryRoot $RepoRoot -RequestPath $killPath `
+            -OutputRoot $killRoot -Label 'slot-kill'
+        New-SlotStubAdapter -ToolkitCopy $fixture.ToolkitCopy -RealAdapter $realAdapter -Mode 'complete' `
+            -SlotTimeoutSeconds 300 -PerCallTimeoutSeconds 300 -RunDelaySeconds 30
+        Assert-Coordinator ((Invoke-Coordinator -RequestPath $killPath -HaltAfter 'slot1Launching' `
+                    -Target 'slot1TerminalVerified').ExitCode -eq 9) `
+            'The slot-kill setup did not halt with a launch due.'
+
+        # Now run the launch in a process this suite can kill, and kill it while
+        # the child is alive.
+        $killJob = Start-Process -FilePath 'dotnet' -PassThru -WindowStyle Hidden -ArgumentList @(
+            $script:CoordinatorDll, '--request', $killPath, '--target', 'slot1TerminalVerified')
+        $killed = $false
+        try {
+            $deadline = [DateTime]::UtcNow.AddSeconds(120)
+            while ([DateTime]::UtcNow -lt $deadline) {
+                $probe = Get-CoordinatorState -OutputRoot $killRoot
+                if ($probe -and $probe.state -ceq 'slot1Running') { break }
+                Start-Sleep -Milliseconds 250
+            }
+            $atKill = Get-CoordinatorState -OutputRoot $killRoot
+            Assert-Coordinator ($atKill -and $atKill.state -ceq 'slot1Running') `
+                "The launch never recorded a running slot to kill (state '$(if ($atKill) { $atKill.state } else { 'none' })')."
+            if (-not $killJob.HasExited) { Stop-Process -Id $killJob.Id -Force -ErrorAction SilentlyContinue }
+            $killJob.WaitForExit(60000) | Out-Null
+            $killed = $true
+        }
+        finally {
+            if (-not $killed -and -not $killJob.HasExited) {
+                Stop-Process -Id $killJob.Id -Force -ErrorAction SilentlyContinue
+            }
+        }
+        $afterKill = Get-CoordinatorState -OutputRoot $killRoot
+        Assert-Coordinator ($afterKill.state -ceq 'slot1Running') `
+            "A coordinator killed mid-slot left the record at '$($afterKill.state)'."
+        $resumed = Invoke-Coordinator -RequestPath $killPath -Target 'slot1TerminalVerified'
+        Assert-Coordinator ($resumed.ExitCode -eq 0) `
+            "The resumed run did not finish the slot it adopted (exit $($resumed.ExitCode)).`n$($resumed.Output)"
+        Assert-Coordinator ($resumed.Output -match 'resume supervising recorded slot child') `
+            "The resumed run did not report adopting the recorded child.`n$($resumed.Output)"
+        $killAttempts = @(Get-ChildItem -LiteralPath (Join-Path $killRoot 'qualification\stub') `
+                -Filter 'slot*-attempt.json' -File)
+        Assert-Coordinator ($killAttempts.Count -eq 1) `
+            "A kill and resume left $($killAttempts.Count) attempt records; the slot was launched twice."
+        $killAudit = Get-Content -LiteralPath (Join-Path $killRoot 'coordinator\audit.json') -Raw |
+            ConvertFrom-Json -Depth 32
+        Assert-Coordinator ([bool]$killAudit.slotSupervision.observedAcrossRestart) `
+            'The audit does not record that the observation crossed a restart.'
+
+        # A resume that finds the attempt already spent but no running record is
+        # the one case where relaunching would be catastrophic, so it refuses.
+        $spentRoot = Join-Path $sandbox 'slot-spent'
+        $spentPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'slot-spent' `
+            -Mutate {
+                param($r)
+                & $setOutputRoot -Request $r -Root $spentRoot
+                $r.slot.shadowSlotEnabled = $true
+            }.GetNewClosure()
+        Initialize-SlotRunSet -Fixture $fixture -RepositoryRoot $RepoRoot -RequestPath $spentPath `
+            -OutputRoot $spentRoot -Label 'spent-authorization'
+        New-SlotStubAdapter -ToolkitCopy $fixture.ToolkitCopy -RealAdapter $realAdapter -Mode 'complete'
+        Assert-Coordinator ((Invoke-Coordinator -RequestPath $spentPath -HaltAfter 'slot1Launching' `
+                    -Target 'slot1TerminalVerified').ExitCode -eq 9) `
+            'The spent-authorization setup did not halt with a launch due.'
+        # Something else consumes the single-use launch behind the coordinator.
+        $spentStub = Join-Path $spentRoot 'qualification\stub'
+        [void](New-Item -ItemType Directory -Force -Path $spentStub)
+        [IO.File]::WriteAllText((Join-Path $spentStub 'slot1-attempt.json'), '{"slot":"slot1"}')
+        $spentRun = Invoke-Coordinator -RequestPath $spentPath -Target 'slot1TerminalVerified'
+        Assert-Coordinator ($spentRun.ExitCode -eq 2) `
+            "A launch over a spent authorization exited $($spentRun.ExitCode) rather than refusing."
+        Assert-Coordinator ($spentRun.Output -match 'already been used|single-use launch') `
+            "The refusal did not name the spent authorization.`n$($spentRun.Output)"
+    }
+    finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
+
+    # -----------------------------------------------------------------------
+    Write-Host '20/21 slot terminal endings and the slot fault matrix' -ForegroundColor Cyan
+    # Every case gets its own output root, because a slot's launch authorization
+    # is single-use and a root that has spent it can never be reused.
+    $slotCases = @(
+        @{ Name = 'failed'; Mode = 'failed'; Exit = 5; State = 'slot1TerminalFailed'; Pattern = '' },
+        @{ Name = 'timedout'; Mode = 'timedOut'; Exit = 5; State = 'slot1TerminalTimedOut'; Pattern = '' },
+        @{ Name = 'noterminal'; Mode = 'noTerminal'; Exit = 2; State = 'slot1Running'
+            Pattern = 'produced no terminal evidence' },
+        @{ Name = 'nonzero'; Mode = 'nonzeroNoTerminal'; Exit = 4; State = 'slot1Running'
+            Pattern = 'does not exist|left no result' },
+        @{ Name = 'wrongslot'; Mode = 'wrongSlot'; Exit = 2; State = 'slot1TerminalObserved'
+            Pattern = 'terminalSlot|is slot' },
+        @{ Name = 'wrongsetid'; Mode = 'wrongSetId'; Exit = 2; State = 'slot1TerminalObserved'
+            Pattern = 'terminalSetId|run set' },
+        @{ Name = 'contradiction'; Mode = 'contradictoryTimeout'; Exit = 2; State = 'slot1TerminalObserved'
+            Pattern = 'contradict each other' },
+        @{ Name = 'writable'; Mode = 'writableTerminal'; Exit = 2; State = 'slot1TerminalObserved'
+            Pattern = 'writable' },
+        @{ Name = 'twoattempts'; Mode = 'secondAttempt'; Exit = 2; State = 'slot1TerminalObserved'
+            Pattern = 'supervises exactly one' }
+    )
+    foreach ($case in $slotCases) {
+        $caseRoot = Join-Path $sandbox "slot-$($case.Name)"
+        $casePath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name "slot-$($case.Name)" `
+            -Mutate {
+                param($r)
+                & $setOutputRoot -Request $r -Root $caseRoot
+                $r.slot.shadowSlotEnabled = $true
+            }.GetNewClosure()
+        Initialize-SlotRunSet -Fixture $fixture -RepositoryRoot $RepoRoot -RequestPath $casePath `
+            -OutputRoot $caseRoot -Label "'$($case.Name)'"
+        New-SlotStubAdapter -ToolkitCopy $fixture.ToolkitCopy -RealAdapter $realAdapter -Mode $case.Mode
+        try {
+            $run = Invoke-Coordinator -RequestPath $casePath -Target 'slot1TerminalVerified'
+            Assert-Coordinator ($run.ExitCode -eq $case.Exit) `
+                "The '$($case.Name)' slot exited $($run.ExitCode) rather than $($case.Exit).`n$($run.Output)"
+            $state = Get-CoordinatorState -OutputRoot $caseRoot
+            Assert-Coordinator ($state -and $state.state -ceq $case.State) `
+                "The '$($case.Name)' slot left the record at '$(if ($state) { $state.state } else { 'none' })' rather than '$($case.State)'."
+            if ($case.Pattern) {
+                Assert-Coordinator ($run.Output -match $case.Pattern) `
+                    "The '$($case.Name)' refusal did not explain itself.`n$($run.Output)"
+            }
+            # Whatever happened, exactly one launch happened.
+            $caseAttempts = @(Get-ChildItem -LiteralPath (Join-Path $caseRoot 'qualification\stub') `
+                    -Filter 'slot1-attempt.json' -File -ErrorAction SilentlyContinue)
+            Assert-Coordinator ($caseAttempts.Count -eq 1) `
+                "The '$($case.Name)' slot left $($caseAttempts.Count) slot1 attempt records."
+        }
+        finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
+    }
+
+    # A child that never stops is stopped by the supervisor, and the kill leaves
+    # no terminal evidence, so the run refuses rather than summarising a run it
+    # ended itself. The plan's own budget is what bounds it.
+    $hangRoot = Join-Path $sandbox 'slot-hang'
+    $hangPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'slot-hang' `
+        -Mutate {
+            param($r)
+            & $setOutputRoot -Request $r -Root $hangRoot
+            $r.slot.shadowSlotEnabled = $true
+            $r.slot.supervisionGraceSeconds = 30
+        }.GetNewClosure()
+    Initialize-SlotRunSet -Fixture $fixture -RepositoryRoot $RepoRoot -RequestPath $hangPath `
+        -OutputRoot $hangRoot -Label 'slot-hang'
+    New-SlotStubAdapter -ToolkitCopy $fixture.ToolkitCopy -RealAdapter $realAdapter -Mode 'hang' `
+        -SlotTimeoutSeconds 1 -PerCallTimeoutSeconds 1
+    try {
+        $hangRun = Invoke-Coordinator -RequestPath $hangPath -Target 'slot1TerminalVerified'
+        Assert-Coordinator ($hangRun.ExitCode -eq 4) `
+            "A hung slot exited $($hangRun.ExitCode) rather than reporting a stopped child.`n$($hangRun.Output)"
+        Assert-Coordinator ($hangRun.Output -match 'hardDeadlineKill|activityDeadlineKill') `
+            "The refusal did not name the deadline kill.`n$($hangRun.Output)"
+        $hangState = Get-CoordinatorState -OutputRoot $hangRoot
+        Assert-Coordinator ($hangState.state -ceq 'slot1Running') `
+            "A hung slot left the record at '$($hangState.state)'."
+        # The kill is a TREE kill: nothing the child started is still running.
+        Start-Sleep -Seconds 2
+        Assert-Coordinator ((Get-DescendantPwshCount -SandboxToken $sandboxToken) -eq 0) `
+            'The deadline kill left a supervised child running.'
+    }
+    finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
+
+    # Terminal evidence rewritten between the observation and the verification.
+    # The artifact is written read-only by its owner, so a changed digest is a
+    # tamper rather than a race, and the run refuses on its own committed digest.
+    $tamperRoot = Join-Path $sandbox 'slot-tamper'
+    $tamperPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'slot-tamper' `
+        -Mutate {
+            param($r)
+            & $setOutputRoot -Request $r -Root $tamperRoot
+            $r.slot.shadowSlotEnabled = $true
+        }.GetNewClosure()
+    Initialize-SlotRunSet -Fixture $fixture -RepositoryRoot $RepoRoot -RequestPath $tamperPath `
+        -OutputRoot $tamperRoot -Label 'slot-tamper'
+    New-SlotStubAdapter -ToolkitCopy $fixture.ToolkitCopy -RealAdapter $realAdapter -Mode 'complete'
+    try {
+        Assert-Coordinator ((Invoke-Coordinator -RequestPath $tamperPath -HaltAfter 'slot1TerminalObserved' `
+                    -Target 'slot1TerminalVerified').ExitCode -eq 9) `
+            'The slot-tamper setup did not halt after observing terminal evidence.'
+        $tamperTarget = Join-Path $tamperRoot 'qualification\stub\slot1-terminal.json'
+        (Get-Item -LiteralPath $tamperTarget).IsReadOnly = $false
+        $tamperText = [IO.File]::ReadAllText($tamperTarget)
+        [IO.File]::WriteAllText($tamperTarget, $tamperText + ' ')
+        (Get-Item -LiteralPath $tamperTarget).IsReadOnly = $true
+        $tamperRun = Invoke-Coordinator -RequestPath $tamperPath -Target 'slot1TerminalVerified'
+        Assert-Coordinator ($tamperRun.ExitCode -eq 2) `
+            "Rewritten terminal evidence exited $($tamperRun.ExitCode) rather than refusing.`n$($tamperRun.Output)"
+        Assert-Coordinator ($tamperRun.Output -match 'digests to .* and this run observed') `
+            "The refusal did not name the changed evidence.`n$($tamperRun.Output)"
+    }
+    finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
+
+    # -----------------------------------------------------------------------
+    Write-Host '21/21 no orphans, no external writes' -ForegroundColor Cyan
     Start-Sleep -Seconds 2
     $orphans = Get-DescendantPwshCount -SandboxToken $sandboxToken
     Assert-Coordinator ($orphans -eq 0) "The suite left $orphans PowerShell process(es) running."

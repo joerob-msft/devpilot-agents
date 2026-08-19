@@ -28,6 +28,7 @@ internal sealed class PreparationMachine(
     byte[] stateKey,
     StageArtifactIndex index,
     ChildToolInvoker invoker,
+    SlotSupervisor supervisor,
     TextWriter log)
 {
     private const string ChildScriptName = "Invoke-ShadowCoordinatorChild.ps1";
@@ -37,6 +38,7 @@ internal sealed class PreparationMachine(
     private readonly byte[] _stateKey = stateKey;
     private readonly StageArtifactIndex _index = index;
     private readonly ChildToolInvoker _invoker = invoker;
+    private readonly SlotSupervisor _supervisor = supervisor;
     private readonly TextWriter _log = log;
 
     private string _sealedSnapshotName = string.Empty;
@@ -44,34 +46,68 @@ internal sealed class PreparationMachine(
     private string _sealedManifestDigest = string.Empty;
     private string _sealedSnapshotDigest = string.Empty;
     private string _runSetPath = string.Empty;
+    private SlotPlan? _slotPlan;
+
+    /// <summary>
+    /// The file name the qualification path publishes its single-use launch
+    /// authorization under, beside the declaration it authorizes.
+    /// </summary>
+    private const string PublishedLaunchTokenName = "launch-authorization.token";
 
     /// <summary>Runs until the target state is reached, halting early only when instructed to.</summary>
     internal void Run(PreparationState target, PreparationState? haltAfter)
     {
-        foreach (var next in PreparationStateNames.Ordered)
+        var targetRank = PreparationStateNames.RankOf(target);
+        var haltRank = haltAfter is { } halt ? PreparationStateNames.RankOf(halt) : -1;
+        foreach (var rank in PreparationStateNames.Ranks)
         {
-            if (next > target)
+            if (rank > targetRank)
             {
                 break;
             }
-            Advance(next);
-            if (haltAfter == next)
+            var committed = Advance(rank);
+            if (rank == haltRank)
             {
-                _log.WriteLine($"halt-after {PreparationStateNames.ToName(next)} (correlationId={_request.CorrelationId}, sequence={_state.Sequence.ToString(CultureInfo.InvariantCulture)})");
-                throw new DeliberateHaltException(next);
+                _log.WriteLine($"halt-after {PreparationStateNames.ToName(committed)} (correlationId={_request.CorrelationId}, sequence={_state.Sequence.ToString(CultureInfo.InvariantCulture)})");
+                throw new DeliberateHaltException(committed);
             }
         }
         WriteAudit();
     }
 
-    private void Advance(PreparationState next)
+    /// <summary>Performs, or recognises as already performed, the transition at one rank.</summary>
+    private PreparationState Advance(int rank)
     {
-        if (_state.State >= next)
+        if (PreparationStateNames.RankOf(_state.State) >= rank)
         {
-            _log.WriteLine($"skip {PreparationStateNames.ToName(next)} (already recorded at sequence {SequenceOf(next)}, correlationId={_request.CorrelationId})");
-            RehydrateFor(next);
-            return;
+            var recorded = RecordedStateAtRank(rank);
+            _log.WriteLine($"skip {PreparationStateNames.ToName(recorded)} (already recorded at sequence {SequenceOf(recorded)}, correlationId={_request.CorrelationId})");
+            RehydrateFor(recorded);
+            return recorded;
         }
+        // The terminal rank is the one place where WHICH state gets committed is
+        // not known before the work is done, because it is the supervised run's
+        // own artifact that says whether the run completed, failed or timed out.
+        if (rank == PreparationStateNames.TerminalRank)
+        {
+            var (outcome, terminalEvidence, terminalDetail) = VerifySlot1Terminal();
+            _log.WriteLine($"enter {PreparationStateNames.ToName(outcome)} (correlationId={_request.CorrelationId})");
+            _state.Commit(_request, _stateKey, outcome, terminalEvidence, terminalDetail);
+            _log.WriteLine($"commit {PreparationStateNames.ToName(outcome)} sequence={_state.Sequence.ToString(CultureInfo.InvariantCulture)} evidence={_state.EvidenceDigestOf(outcome)} detail={terminalDetail}");
+            return outcome;
+        }
+
+        // The running state is committed by its own transition, in the middle of
+        // it rather than at the end: the identity of a child has to be durable
+        // BEFORE the wait that may outlive this process.
+        if (rank == PreparationStateNames.RankOf(PreparationState.Slot1Running))
+        {
+            _log.WriteLine($"enter slot1Running (correlationId={_request.CorrelationId})");
+            RunSlot1();
+            return PreparationState.Slot1Running;
+        }
+
+        var next = PreparationStateNames.StateAtRank(rank);
         _log.WriteLine($"enter {PreparationStateNames.ToName(next)} (correlationId={_request.CorrelationId})");
         var (evidence, detail) = next switch
         {
@@ -84,10 +120,35 @@ internal sealed class PreparationMachine(
             PreparationState.RunSetDeclared => DeclareRunSet(),
             PreparationState.RunSetVerified => VerifyRunSet(),
             PreparationState.RunSetReady => ConfirmRunSetReady(),
+            PreparationState.Slot1Authorized => AuthorizeSlot1(),
+            PreparationState.Slot1Launching => BeginSlot1Launch(),
+            PreparationState.Slot1TerminalObserved => ObserveSlot1Terminal(),
             _ => throw new ContractException($"'{PreparationStateNames.ToName(next)}' is not a transition this coordinator performs.")
         };
         _state.Commit(_request, _stateKey, next, evidence, detail);
         _log.WriteLine($"commit {PreparationStateNames.ToName(next)} sequence={_state.Sequence.ToString(CultureInfo.InvariantCulture)} evidence={_state.EvidenceDigestOf(next)} detail={detail}");
+        return next;
+    }
+
+    /// <summary>
+    /// The state actually recorded at a rank a resume is skipping over. It is read
+    /// from the durable transitions rather than assumed, because the terminal rank
+    /// could hold any one of three.
+    /// </summary>
+    private PreparationState RecordedStateAtRank(int rank)
+    {
+        foreach (var transition in _state.Transitions)
+        {
+            if (PreparationStateNames.RankOf(transition.State) == rank)
+            {
+                return transition.State;
+            }
+        }
+        // A record can be past a rank without carrying its transition only if it
+        // was truncated or rewritten; guessing which sibling to name would be an
+        // invention.
+        throw new ContractException(
+            $"The state record stands at '{PreparationStateNames.ToName(_state.State)}' but carries no transition at rank {rank.ToString(CultureInfo.InvariantCulture)}, so the resume has nothing to skip over.");
     }
 
     private string SequenceOf(PreparationState state)
@@ -126,6 +187,9 @@ internal sealed class PreparationMachine(
                 break;
             case PreparationState.RunSetDeclared:
                 ReadDeclareResult();
+                break;
+            case PreparationState.Slot1Authorized:
+                ReadSlotPlanResult();
                 break;
         }
     }
@@ -753,6 +817,607 @@ internal sealed class PreparationMachine(
         return (evidence, $"plannedRunCount={planned.ToString(CultureInfo.InvariantCulture)} slotAttempts=0");
     }
 
+    // -----------------------------------------------------------------------
+    // slot1Authorized / slot1Launching / slot1Running / slot1TerminalObserved
+    // / slot1Terminal{Verified,Failed,TimedOut}
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Establishes that this run may launch one slot, and binds every identity
+    /// the launch will be judged against.
+    /// </summary>
+    /// <remarks>
+    /// Authorization is separated from launching because the launch consumes
+    /// something that cannot be un-consumed: the PowerShell owner makes its
+    /// attempt record with CreateNew before it starts any work, so there is
+    /// exactly one chance. Everything that could refuse the launch is therefore
+    /// checked and committed BEFORE any state exists that says a launch is due.
+    ///
+    /// Nothing here judges the run. It reads a plan, compares identities, hashes
+    /// a token, and refuses on mismatch.
+    /// </remarks>
+    private (MapNode Evidence, string Detail) AuthorizeSlot1()
+    {
+        var authorization = _request.RequireSlotAuthorization();
+
+        // The declaration this slot will consume must be the one this run
+        // verified and then observed ready. Reading both records rather than one
+        // is the point: readiness alone would let a run set verified under a
+        // different subject satisfy a readiness record written for this one.
+        var verified = _state.EvidenceFor(PreparationState.RunSetVerified)
+            ?? throw new ContractException("The run holds no runSetVerified record, so there is no verified declaration to authorize a launch against.");
+        var ready = _state.EvidenceFor(PreparationState.RunSetReady)
+            ?? throw new ContractException("The run holds no runSetReady record, so nothing has been observed ready to launch.");
+        var verifiedSetId = verified.GetText("setId") ?? throw new ContractException("The runSetVerified record carries no setId.");
+        var readySetId = ready.GetText("setId") ?? throw new ContractException("The runSetReady record carries no setId.");
+        if (!string.Equals(verifiedSetId, readySetId, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The verified declaration is '{verifiedSetId}' and readiness was observed for '{readySetId}'.");
+        }
+
+        // The declaration file itself has to be the bytes the verification was
+        // committed against. A re-declared run set at the same path would verify
+        // perfectly under the same key and be a different set entirely.
+        if (_runSetPath.Length == 0)
+        {
+            ReadDeclareResult();
+        }
+        var committedRunSetSha = verified.GetText("runSetSha256")
+            ?? throw new ContractException("The runSetVerified record carries no declaration digest to bind the launch to.");
+        if (!File.Exists(_runSetPath))
+        {
+            throw new ContractException($"The declaration at '{_runSetPath}' is gone; no launch may be authorized against a declaration this run no longer has.");
+        }
+        var actualRunSetSha = CanonicalJson.Sha256HexOfFile(_runSetPath);
+        if (!string.Equals(actualRunSetSha, committedRunSetSha, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The declaration at '{_runSetPath}' now digests to {actualRunSetSha} and was verified as {committedRunSetSha}.");
+        }
+
+        // The token is read here and never leaves this method as text. What is
+        // committed, logged and audited is its digest, computed the way the
+        // qualification path computes it so that the comparison below is a real
+        // check and not an echo.
+        var tokenHash = ReadLaunchTokenHash(authorization.LaunchAuthorizationTokenPath);
+
+        // An authorization check, and therefore this coordinator's own: the
+        // credential presented must be the credential the set published. It is
+        // made here, before any child runs, because a wrong token cannot rebuild
+        // the plan at all - the reviewed code would refuse it as an unreproducible
+        // plan, which reads like a broken declaration rather than like the
+        // ordinary mistake it is. The reviewed inventory check still runs inside
+        // the child; this one only makes the refusal legible and cheap.
+        var runSetDirectory = Path.GetDirectoryName(_runSetPath);
+        if (runSetDirectory is { Length: > 0 })
+        {
+            var publishedTokenPath = Path.Combine(runSetDirectory, PublishedLaunchTokenName);
+            if (!File.Exists(publishedTokenPath))
+            {
+                throw new ContractException($"The published run set under '{runSetDirectory}' carries no launch-authorization token, so no launch can be authorized against it.");
+            }
+            // Compared as digests so that neither token's text can be recovered
+            // from a message, a core dump or a log this method might later grow.
+            if (!string.Equals(ReadLaunchTokenHash(publishedTokenPath), tokenHash, StringComparison.Ordinal))
+            {
+                throw new ContractException(
+                    "The launch-authorization token this request names is not the token the published run set carries, " +
+                    "so the plan it was sealed under cannot be reproduced.");
+            }
+        }
+
+        var plan = ReadSlotPlan(RequestSlotPlan());
+
+        if (!string.Equals(plan.SetId, verifiedSetId, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The qualification plan is built for run set '{plan.SetId}' and this run verified '{verifiedSetId}'.");
+        }
+        if (!string.Equals(plan.SlotName, CoordinatorRequest.SupervisedSlotName, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The qualification plan describes slot '{plan.SlotName}'; this coordinator supervises '{CoordinatorRequest.SupervisedSlotName}' only.");
+        }
+        if (!string.Equals(plan.LaunchAuthorizationHash, tokenHash, StringComparison.Ordinal))
+        {
+            // Deliberately no digests in the message. The plan's hash is sealed
+            // into the plan digest, so printing both sides of a failed comparison
+            // would publish a working oracle for guessing the token.
+            throw new ContractException("The launch-authorization token this request names does not hash to the authorization the declaration sealed.");
+        }
+        if (!string.Equals(plan.Head, _request.ToolkitHead, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The qualification plan is built at toolkit head {plan.Head} and this request authorizes {_request.ToolkitHead}.");
+        }
+        if (!string.Equals(plan.RequiredRef, _request.RequiredRef, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The qualification plan requires ref '{plan.RequiredRef}' and this request authorizes '{_request.RequiredRef}'.");
+        }
+        if (!plan.HeadClean)
+        {
+            throw new ContractException("The toolkit working tree is not clean, so the head a launch would be attributed to is not the head that would run.");
+        }
+        // A live head check of this process's own view, so that a plan built
+        // moments ago cannot carry a head this run has since moved off.
+        var observedHead = GitHead.Resolve(_request.ToolkitRoot);
+        if (!string.Equals(observedHead, _request.ToolkitHead, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The toolkit is at head {observedHead} and this request authorizes {_request.ToolkitHead}.");
+        }
+        // One shot. An attempt record that already exists means this declaration's
+        // single launch authorization was consumed - by this coordinator before a
+        // crash, or by a hand-run of the PowerShell path. Either way, authorizing
+        // a launch now would be authorizing a second one.
+        if (plan.SlotAttemptExists)
+        {
+            throw new ContractException(
+                $"Slot '{plan.SlotName}' already carries an attempt record, so its single-use launch authorization is spent. " +
+                "This coordinator does not launch a slot twice.");
+        }
+        if (plan.SlotTerminalExists)
+        {
+            throw new ContractException($"Slot '{plan.SlotName}' already carries terminal evidence, so its run is over and cannot be authorized again.");
+        }
+
+        plan.Deadlines.RequireConsistent("qualification plan");
+
+        var evidence = new MapNode()
+            .Set("setId", plan.SetId)
+            .Set("planDigest", plan.PlanDigest)
+            .Set("slotName", plan.SlotName)
+            .Set("launchAuthorizationHash", plan.LaunchAuthorizationHash)
+            .Set("reviewerScriptSha256", plan.ReviewerScriptSha256)
+            .Set("slotTerminalPath", plan.SlotTerminalPath)
+            .Set("slotStateDir", plan.SlotStateDir)
+            .Set("head", plan.Head)
+            .Set("requiredRef", plan.RequiredRef)
+            .Set("headClean", true)
+            .Set("deadlines", plan.Deadlines.Describe())
+            .Set("authorization", authorization.Describe())
+            .Set("childResultSha256", plan.ChildResultSha256);
+        return (evidence, $"setId={plan.SetId} slot={plan.SlotName} planDigest={plan.PlanDigest}");
+    }
+
+    /// <summary>
+    /// The durable statement that a launch is now due. It starts nothing.
+    /// </summary>
+    /// <remarks>
+    /// This looks like a state with no work in it, and that is exactly its value.
+    /// A crash between "authorized" and "running" is otherwise unreadable: there
+    /// is no way to tell a run that had not started its child yet from one that
+    /// had started it and died before it could record it. With this state
+    /// committed first, the record distinguishes the two, and the resume path can
+    /// refuse rather than guess.
+    /// </remarks>
+    private (MapNode Evidence, string Detail) BeginSlot1Launch()
+    {
+        var authorized = _state.EvidenceFor(PreparationState.Slot1Authorized)
+            ?? throw new ContractException("Nothing authorized a launch, so no launch is due.");
+        var setId = authorized.GetText("setId") ?? throw new ContractException("The slot1Authorized record carries no setId.");
+        var planDigest = authorized.GetText("planDigest") ?? throw new ContractException("The slot1Authorized record carries no plan digest.");
+        var evidence = new MapNode()
+            .Set("setId", setId)
+            .Set("planDigest", planDigest)
+            .Set("slotName", CoordinatorRequest.SupervisedSlotName)
+            .Set("launchDue", true);
+        return (evidence, $"slot={CoordinatorRequest.SupervisedSlotName} planDigest={planDigest}");
+    }
+
+    /// <summary>
+    /// Starts the supervised child, makes its identity durable, then watches it
+    /// until it stops or a plan deadline says to stop watching.
+    /// </summary>
+    private void RunSlot1()
+    {
+        var authorized = _state.EvidenceFor(PreparationState.Slot1Authorized)
+            ?? throw new ContractException("Nothing authorized a launch, so nothing may be run.");
+        var authorizedDigest = authorized.GetText("planDigest") ?? throw new ContractException("The slot1Authorized record carries no plan digest.");
+
+        // Re-derived here rather than re-read from the authorization's committed
+        // result, and that difference is the whole check. The committed result
+        // records the world as it was when the launch was authorized; what has to
+        // be true is that the slot is STILL unattempted at the instant before the
+        // irreversible step. A resumed run reading its own older answer would
+        // relaunch a slot something else had started in the meantime. Deriving a
+        // plan launches nothing.
+        //
+        // Carried under its own step name, and with any previous answer deleted
+        // first, because the invoker adopts a valid result for the same step and
+        // request rather than re-running it. Adoption is right for work that must
+        // not repeat; it is wrong for a probe, whose previous answer is worthless
+        // by definition.
+        var probePath = Path.Combine(_request.ExchangeRoot, _request.CorrelationId + "-slotPrelaunch.result.json");
+        if (File.Exists(probePath))
+        {
+            File.Delete(probePath);
+        }
+        var plan = ReadSlotPlan(RequestSlotPlan("slotPrelaunch"));
+        if (!string.Equals(plan.PlanDigest, authorizedDigest, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The plan now digests to {plan.PlanDigest} and the authorization was committed against {authorizedDigest}.");
+        }
+
+        // The last gate before the irreversible step. The authorization proved
+        // there was no attempt record when it was written; time has passed since,
+        // and this run has to be the one that creates it.
+        if (plan.SlotAttemptExists || plan.SlotTerminalExists)
+        {
+            throw new ContractException(
+                $"Slot '{plan.SlotName}' acquired attempt or terminal evidence between authorization and launch, so its single launch has already been used.");
+        }
+
+        var childRequest = SlotChildRequest(plan.Authorization)
+            .Set("expectedPlanDigest", plan.PlanDigest)
+            .Set("expectedSetId", plan.SetId);
+        var launch = _supervisor.Start("slotRun", ChildScript(), childRequest);
+
+        // Committed BEFORE the wait. This is the whole reason the supervisor is
+        // two-phase: a coordinator killed during a slot that ran for an hour must
+        // come back able to name the child it left behind, and a record written
+        // after the wait would only ever describe runs that did not need it.
+        var running = new MapNode()
+            .Set("setId", plan.SetId)
+            .Set("planDigest", plan.PlanDigest)
+            .Set("slotName", plan.SlotName)
+            .Set("deadlines", plan.Deadlines.Describe())
+            .Set("child", launch.DescribeIdentity())
+            .Set("supervisionStartedAtUtc", DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture));
+        _state.Commit(_request, _stateKey, PreparationState.Slot1Running, running, $"childProcessId={launch.ProcessId.ToString(CultureInfo.InvariantCulture)}");
+        _log.WriteLine($"commit slot1Running sequence={_state.Sequence.ToString(CultureInfo.InvariantCulture)} childProcessId={launch.ProcessId.ToString(CultureInfo.InvariantCulture)}");
+
+        var observation = _supervisor.Await(launch, plan.Deadlines, plan.SlotStateDir);
+        _log.WriteLine($"observed slot child disposition={observation.Disposition} exitCode={observation.ExitCode.ToString(CultureInfo.InvariantCulture)}");
+        _observedRun = observation;
+        _observedLaunch = launch;
+    }
+
+    /// <summary>
+    /// Reads what the supervised child left behind, without deciding what it
+    /// means.
+    /// </summary>
+    /// <remarks>
+    /// The exit code is recorded and is deliberately not acted upon. A failed
+    /// qualification slot exits non-zero by design - the PowerShell owner
+    /// propagates the reviewed run's own exit code - so treating non-zero as a
+    /// child failure would turn every legitimately failed run into a coordinator
+    /// error. What this transition requires is not success but EVIDENCE: the
+    /// owner's immutable terminal artifact. An exit of zero with no terminal
+    /// artifact is refused exactly as loudly as a hang.
+    /// </remarks>
+    private (MapNode Evidence, string Detail) ObserveSlot1Terminal()
+    {
+        var running = _state.EvidenceFor(PreparationState.Slot1Running)
+            ?? throw new ContractException("No slot was recorded running, so there is nothing to observe.");
+        if (_slotPlan is null)
+        {
+            ReadSlotPlanResult();
+        }
+        var plan = _slotPlan!;
+
+        if (_observedRun is null || _observedLaunch is null)
+        {
+            (_observedLaunch, _observedRun) = ResumeSupervision(running, plan);
+        }
+        var launch = _observedLaunch!;
+        var observation = _observedRun!;
+
+        // A child this coordinator stopped is reported as stopped, before anything
+        // looks for a result. Falling through to "there is no result file" would
+        // be true and useless: it describes the consequence of the deadline rather
+        // than the deadline, and the operator has to know which budget ran out.
+        if (observation.Disposition is SlotObservation.HardDeadlineKill or SlotObservation.ActivityDeadlineKill)
+        {
+            throw new ChildFailureException(
+                $"The supervised slot was stopped by this coordinator on a plan deadline ({observation.Disposition}) after " +
+                $"{observation.ObservedSeconds.ToString(CultureInfo.InvariantCulture)} second(s). " +
+                "A run this coordinator ended has no terminal evidence of its own, and none is invented for it.");
+        }
+
+        var outcome = _supervisor.ReadResult(
+            launch,
+            "terminalWritten",
+            "terminalPath",
+            "childExitCode",
+            "slotName",
+            "setId",
+            "planDigest");
+        const string label = "'slotRun' child result";
+        if (!StrictJson.RequireBool(outcome.Result, "terminalWritten", label))
+        {
+            throw new ContractException(
+                $"The supervised slot produced no terminal evidence. A run that ends without the artifact its owner writes is unfinished, " +
+                "whatever it exited with, and this coordinator will not summarise it.");
+        }
+        StrictJson.RequireLiteral(outcome.Result, "slotName", plan.SlotName, label);
+        StrictJson.RequireLiteral(outcome.Result, "setId", plan.SetId, label);
+        StrictJson.RequireLiteral(outcome.Result, "planDigest", plan.PlanDigest, label);
+        var terminalPath = StrictJson.RequireString(outcome.Result, "terminalPath", label);
+        if (!PathsAreSame(terminalPath, plan.SlotTerminalPath))
+        {
+            throw new ContractException($"The supervised slot reports terminal evidence at '{terminalPath}' and the plan places it at '{plan.SlotTerminalPath}'.");
+        }
+        if (!File.Exists(terminalPath))
+        {
+            throw new ContractException($"The supervised slot reports terminal evidence at '{terminalPath}', which does not exist.");
+        }
+
+        var evidence = new MapNode()
+            .Set("setId", plan.SetId)
+            .Set("planDigest", plan.PlanDigest)
+            .Set("slotName", plan.SlotName)
+            .Set("terminalPath", terminalPath)
+            .Set("terminalSha256", CanonicalJson.Sha256HexOfFile(terminalPath))
+            .Set("supervision", observation.Describe())
+            .Set("childResultSha256", outcome.ResultSha256);
+        return (evidence, $"disposition={observation.Disposition} childExitCode={observation.ExitCode.ToString(CultureInfo.InvariantCulture)}");
+    }
+
+    /// <summary>
+    /// Has the reviewed verifier read the terminal evidence, and records which of
+    /// the three durable endings this run reached.
+    /// </summary>
+    /// <remarks>
+    /// The status this commits is a passthrough. The words complete, failed and
+    /// timedOut are the owner's, written into an immutable artifact and checked
+    /// here for structure, signature, binding and immutability - never for
+    /// plausibility. This coordinator has no opinion about whether a run should
+    /// have failed, and holds no rule that could form one.
+    /// </remarks>
+    private (PreparationState Outcome, MapNode Evidence, string Detail) VerifySlot1Terminal()
+    {
+        var observed = _state.EvidenceFor(PreparationState.Slot1TerminalObserved)
+            ?? throw new ContractException("No terminal evidence was observed, so there is nothing to verify.");
+        if (_slotPlan is null)
+        {
+            ReadSlotPlanResult();
+        }
+        var plan = _slotPlan!;
+        var observedTerminalSha = observed.GetText("terminalSha256")
+            ?? throw new ContractException("The slot1TerminalObserved record carries no terminal digest.");
+
+        var childRequest = SlotChildRequest(plan.Authorization)
+            .Set("expectedPlanDigest", plan.PlanDigest)
+            .Set("expectedSetId", plan.SetId);
+        var outcome = _invoker.Invoke(
+            "slotVerify",
+            ChildScript(),
+            childRequest,
+            "terminalStatus",
+            "terminalExitCode",
+            "terminalTimedOut",
+            "terminalImmutable",
+            "terminalSetId",
+            "terminalPlanDigest",
+            "terminalSlot",
+            "terminalSha256",
+            "signatureVerified",
+            "inventoryVerified",
+            "slotAttemptCount",
+            "modelInvocationCount");
+        const string label = "'slotVerify' child result";
+
+        // The bytes the verifier read must be the bytes this run observed. The
+        // artifact is written read-only by its owner, so a changed digest here is
+        // a tampered or replaced artifact rather than an ordinary race.
+        var verifiedTerminalSha = StrictJson.RequireHex(outcome.Result, "terminalSha256", label, 64);
+        if (!string.Equals(verifiedTerminalSha, observedTerminalSha, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The verified terminal evidence digests to {verifiedTerminalSha} and this run observed {observedTerminalSha}.");
+        }
+        if (!StrictJson.RequireBool(outcome.Result, "terminalImmutable", label))
+        {
+            throw new ContractException("The terminal evidence is writable, so it is not the immutable record its contract requires.");
+        }
+        if (!StrictJson.RequireBool(outcome.Result, "signatureVerified", label))
+        {
+            throw new ContractException("The declaration this terminal evidence belongs to did not verify under its key.");
+        }
+        if (!StrictJson.RequireBool(outcome.Result, "inventoryVerified", label))
+        {
+            throw new ContractException("The published inventory for this run set did not verify, so its terminal evidence stands on nothing.");
+        }
+        StrictJson.RequireLiteral(outcome.Result, "terminalSetId", plan.SetId, label);
+        StrictJson.RequireLiteral(outcome.Result, "terminalPlanDigest", plan.PlanDigest, label);
+        StrictJson.RequireLiteral(outcome.Result, "terminalSlot", plan.SlotName, label);
+
+        // Exactly one attempt, and it is this one. A second attempt record would
+        // mean something launched the slot again behind this coordinator's back.
+        var attempts = StrictJson.RequireInt(outcome.Result, "slotAttemptCount", label, 0, int.MaxValue);
+        if (attempts != 1)
+        {
+            throw new ContractException($"The run set carries {attempts.ToString(CultureInfo.InvariantCulture)} slot attempt(s); this coordinator supervises exactly one.");
+        }
+        // Observed, not asserted. This coordinator invokes no model, but the run
+        // it supervised may have invoked several, and reporting the census it was
+        // given is the only honest thing to do with it.
+        var models = StrictJson.RequireInt(outcome.Result, "modelInvocationCount", label, 0, int.MaxValue);
+
+        var status = StrictJson.RequireString(outcome.Result, "terminalStatus", label);
+        var timedOut = StrictJson.RequireBool(outcome.Result, "terminalTimedOut", label);
+        var exitCode = StrictJson.RequireInt(outcome.Result, "terminalExitCode", label, int.MinValue, int.MaxValue);
+        var state = status switch
+        {
+            "complete" => PreparationState.Slot1TerminalVerified,
+            "failed" => PreparationState.Slot1TerminalFailed,
+            "timedOut" => PreparationState.Slot1TerminalTimedOut,
+            _ => throw new ContractException($"The terminal evidence reports status '{status}', which is not one of the three endings its contract allows.")
+        };
+        // The two statements the artifact makes about a timeout have to agree. A
+        // 'complete' that also claims to have timed out is a corrupt record, and
+        // picking whichever field suited would be inventing a reading.
+        if (timedOut != (state == PreparationState.Slot1TerminalTimedOut))
+        {
+            throw new ContractException($"The terminal evidence reports status '{status}' and a timedOut flag of {(timedOut ? "true" : "false")}, which contradict each other.");
+        }
+
+        var evidence = new MapNode()
+            .Set("setId", plan.SetId)
+            .Set("planDigest", plan.PlanDigest)
+            .Set("slotName", plan.SlotName)
+            .Set("terminalStatus", status)
+            .Set("terminalExitCode", exitCode)
+            .Set("terminalTimedOut", timedOut)
+            .Set("terminalSha256", verifiedTerminalSha)
+            .Set("signatureVerified", true)
+            .Set("inventoryVerified", true)
+            .Set("slotAttemptCount", attempts)
+            .Set("modelInvocationCount", models)
+            .Set("childResultSha256", outcome.ResultSha256);
+        return (state, evidence, $"terminalStatus={status} attempts=1 modelInvocations={models.ToString(CultureInfo.InvariantCulture)}");
+    }
+
+    /// <summary>
+    /// Re-attaches to a slot a previous run launched, or refuses if it cannot.
+    /// </summary>
+    /// <remarks>
+    /// There are only two honest outcomes here. Either the recorded child is
+    /// still alive, in which case this run waits for it exactly as the launching
+    /// run would have; or it is gone, in which case its terminal artifact - if it
+    /// wrote one - is the whole of what is known and the exit code is
+    /// unrecoverable. Relaunching is not among the options: the attempt record is
+    /// spent.
+    /// </remarks>
+    private (SlotLaunch Launch, SlotObservation Observation) ResumeSupervision(MapNode running, SlotPlan plan)
+    {
+        var child = running.Get("child") as MapNode
+            ?? throw new ContractException("The slot1Running record carries no child identity, so a resumed run cannot find what it left behind.");
+        var processId = child.GetInteger("childProcessId")
+            ?? throw new ContractException("The slot1Running record carries no child process id.");
+        var startedAt = child.GetText("childStartedAtUtc") is { Length: > 0 } recordedStart
+            ? recordedStart
+            : throw new ContractException("The slot1Running record carries no child start time, so a recycled process id could be mistaken for the child.");
+        var childRequestSha = child.GetText("childRequestSha256")
+            ?? throw new ContractException("The slot1Running record carries no child request digest.");
+
+        var launch = _supervisor.Adopt("slotRun", childRequestSha, (int)processId, startedAt);
+        _log.WriteLine($"resume supervising recorded slot child processId={processId.ToString(CultureInfo.InvariantCulture)} startedAtUtc={startedAt}");
+        var observation = _supervisor.Await(launch, plan.Deadlines, plan.SlotStateDir);
+        return (launch, observation);
+    }
+
+    /// <summary>
+    /// Reads the single-use launch token and returns only its digest, computed
+    /// the way the qualification path computes it.
+    /// </summary>
+    /// <remarks>
+    /// The token text is never returned, committed, logged or audited. What a
+    /// reader of the state file learns is that a token hashing to a particular
+    /// value was presented, which is what the plan digest already seals - so the
+    /// record adds a binding without adding a secret.
+    /// </remarks>
+    private static string ReadLaunchTokenHash(string tokenPath)
+    {
+        if (!File.Exists(tokenPath))
+        {
+            throw new ContractException($"The launch-authorization token at '{tokenPath}' does not exist, so no launch can be authorized.");
+        }
+        var token = File.ReadAllText(tokenPath, StrictJson.StrictUtf8).Trim();
+        if (token.Length != 64 || !token.All(character => character is >= '0' and <= '9' or >= 'a' and <= 'f'))
+        {
+            throw new ContractException($"The launch-authorization token at '{tokenPath}' is not 64 lowercase hex characters.");
+        }
+        return CanonicalJson.Sha256HexOfText(token);
+    }
+
+    private MapNode SlotChildRequest(SlotAuthorization authorization)
+    {
+        if (_sealedSnapshotName.Length == 0)
+        {
+            ReadSealResult();
+        }
+        return QualificationRequest()
+            .Set("snapshotName", _sealedSnapshotName)
+            .Set("manifestDigest", _sealedSnapshotDigest)
+            .Set("reviewerScriptPath", authorization.ReviewerScriptPath)
+            .Set("slotName", authorization.Name)
+            .Set("launchAuthorizationTokenPath", authorization.LaunchAuthorizationTokenPath);
+    }
+
+    private ChildOutcome RequestSlotPlan(string step = "slotPlan")
+    {
+        var authorization = _request.RequireSlotAuthorization();
+        return _invoker.Invoke(
+            step,
+            ChildScript(),
+            SlotChildRequest(authorization),
+            "setId",
+            "planDigest",
+            "launchAuthorizationHash",
+            "reviewerScriptSha256",
+            "slotName",
+            "slotStateDir",
+            "slotTerminalPath",
+            "slotTimeoutSeconds",
+            "progressTimeoutSeconds",
+            "perCallTimeoutSeconds",
+            "slotAttemptExists",
+            "slotTerminalExists",
+            "head",
+            "requiredRef",
+            "headClean");
+    }
+
+    private SlotPlan ReadSlotPlan(ChildOutcome outcome)
+    {
+        const string label = "'slotPlan' child result";
+        var authorization = _request.RequireSlotAuthorization();
+        var plan = new SlotPlan(
+            StrictJson.RequireString(outcome.Result, "setId", label),
+            StrictJson.RequireHex(outcome.Result, "planDigest", label, 64),
+            StrictJson.RequireHex(outcome.Result, "launchAuthorizationHash", label, 64),
+            StrictJson.RequireHex(outcome.Result, "reviewerScriptSha256", label, 64),
+            StrictJson.RequireString(outcome.Result, "slotName", label),
+            StrictJson.RequireString(outcome.Result, "slotStateDir", label),
+            StrictJson.RequireString(outcome.Result, "slotTerminalPath", label),
+            StrictJson.RequireBool(outcome.Result, "slotAttemptExists", label),
+            StrictJson.RequireBool(outcome.Result, "slotTerminalExists", label),
+            StrictJson.RequireString(outcome.Result, "head", label),
+            StrictJson.RequireString(outcome.Result, "requiredRef", label),
+            StrictJson.RequireBool(outcome.Result, "headClean", label),
+            new SlotDeadlines(
+                StrictJson.RequireInt(outcome.Result, "slotTimeoutSeconds", label, 1, 14400),
+                StrictJson.RequireInt(outcome.Result, "progressTimeoutSeconds", label, 0, 14400),
+                StrictJson.RequireInt(outcome.Result, "perCallTimeoutSeconds", label, 1, 14400),
+                authorization.SupervisionGraceSeconds),
+            authorization,
+            outcome.ResultSha256);
+        _slotPlan = plan;
+        return plan;
+    }
+
+    private void ReadSlotPlanResult()
+    {
+        var committed = _state.EvidenceFor(PreparationState.Slot1Authorized);
+        var result = ReadCommittedChildResult(PreparationState.Slot1Authorized, "slotPlan", "'slotPlan' child result");
+        var plan = ReadSlotPlan(new ChildOutcome(
+            0,
+            Path.Combine(_request.ExchangeRoot, _request.CorrelationId + "-slotPlan.result.json"),
+            result,
+            committed?.GetText("childResultSha256") ?? string.Empty));
+        // The plan is re-read from the result the authorization committed rather
+        // than re-derived, so a resumed run works from the same plan the launch
+        // was authorized against. The digest comparison below is what makes that
+        // safe: a committed result that no longer matches its own recorded digest
+        // is refused by the reader before it gets here.
+        var authorizedDigest = committed?.GetText("planDigest");
+        if (authorizedDigest is not null && !string.Equals(plan.PlanDigest, authorizedDigest, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The resumed plan digests to {plan.PlanDigest} and the authorization was committed against {authorizedDigest}.");
+        }
+    }
+
+    private static bool PathsAreSame(string left, string right)
+    {
+        try
+        {
+            return string.Equals(Path.GetFullPath(left), Path.GetFullPath(right), StringComparison.OrdinalIgnoreCase);
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    private SlotObservation? _observedRun;
+    private SlotLaunch? _observedLaunch;
+
     private MapNode QualificationRequest() => new MapNode()
         .Set("contractVersion", ChildRequestContractVersion)
         .Set("toolkitRoot", _request.ToolkitRoot)
@@ -765,7 +1430,13 @@ internal sealed class PreparationMachine(
         .Set("expectedCommit", _request.ExpectedCommit)
         .Set("requiredRef", _request.RequiredRef)
         .Set("plannedRunCount", _request.PlannedRunCount)
-        .Set("runSetKeyPath", _request.RunSetKeyPath);
+        .Set("runSetKeyPath", _request.RunSetKeyPath)
+        // Carried on every qualification step, including the ones the preparation
+        // slice already had. The plan digest seals the agent's path and content
+        // hash, so a declaration made without naming the agent a later slot names
+        // would be a declaration that slot could never reproduce. Empty means the
+        // production agent, which is what the preparation slice always meant.
+        .Set("reviewerScriptPath", _request.Slot?.ReviewerScriptPath ?? string.Empty);
 
     private void ApplyDeclareResult(JsonElement result)
     {
@@ -843,6 +1514,38 @@ internal sealed class PreparationMachine(
                 .Set("modelInvocationCount", readiness!.Get("modelInvocationCount") ?? Node.Null())
                 .Set("slotLaunchCount", readiness.Get("slotAttemptCount") ?? Node.Null());
         }
+        // The supervised slice reports separately, and only when it happened. A
+        // preparation that never authorized a launch says so rather than
+        // publishing zeroed slot fields that would read like a slot that ran and
+        // did nothing.
+        var terminal = _state.EvidenceAtRank(PreparationStateNames.TerminalRank);
+        var supervised = terminal is not null;
+        audit.Set("slotSupervised", supervised);
+        if (supervised)
+        {
+            // Every one of these is a passthrough of what the reviewed verifier
+            // read out of the owner's immutable artifact. This coordinator adds
+            // no interpretation, and the audit must not read as though it had.
+            audit
+                .Set("slotName", terminal!.Get("slotName") ?? Node.Null())
+                .Set("slotSetId", terminal.Get("setId") ?? Node.Null())
+                .Set("slotPlanDigest", terminal.Get("planDigest") ?? Node.Null())
+                .Set("slotTerminalStatus", terminal.Get("terminalStatus") ?? Node.Null())
+                .Set("slotTerminalExitCode", terminal.Get("terminalExitCode") ?? Node.Null())
+                .Set("slotTerminalTimedOut", terminal.Get("terminalTimedOut") ?? Node.Null())
+                .Set("slotTerminalSha256", terminal.Get("terminalSha256") ?? Node.Null())
+                .Set("slotAttemptCount", terminal.Get("slotAttemptCount") ?? Node.Null())
+                .Set("slotModelInvocationCount", terminal.Get("modelInvocationCount") ?? Node.Null());
+            var supervision = _state.EvidenceFor(PreparationState.Slot1TerminalObserved)?.Get("supervision");
+            audit.Set("slotSupervision", supervision ?? Node.Null());
+        }
+        // Named for a reader who wants the one-line answer to "did this write
+        // anything anywhere". The whole slice has no delivery path and no
+        // provider write, so the claim is structural rather than measured - and
+        // it is stated here so that a future slice that gained one would have to
+        // come and change a line that says it did not.
+        audit.Set("deliveryMode", "previewOnly");
+        audit.Set("providerWriteCount", 0);
         audit
             .Set("childResultTransitionCount", childBackedTransitions)
             .Set("stages", stages);
@@ -870,3 +1573,30 @@ internal sealed class DeliberateHaltException(PreparationState state) : Exceptio
 {
     internal PreparationState State { get; } = state;
 }
+
+/// <summary>
+/// The qualification plan as the coordinator needs to see it: identities to bind
+/// against, paths to watch, budgets to supervise within, and two facts about
+/// whether the single launch has been spent.
+/// </summary>
+/// <remarks>
+/// It is a read of the reviewed PowerShell plan, never a second construction of
+/// one. Nothing here selects a model, orders work, or decides what the run should
+/// do; those live in the plan builder this record merely reports.
+/// </remarks>
+internal sealed record SlotPlan(
+    string SetId,
+    string PlanDigest,
+    string LaunchAuthorizationHash,
+    string ReviewerScriptSha256,
+    string SlotName,
+    string SlotStateDir,
+    string SlotTerminalPath,
+    bool SlotAttemptExists,
+    bool SlotTerminalExists,
+    string Head,
+    string RequiredRef,
+    bool HeadClean,
+    SlotDeadlines Deadlines,
+    SlotAuthorization Authorization,
+    string ChildResultSha256);

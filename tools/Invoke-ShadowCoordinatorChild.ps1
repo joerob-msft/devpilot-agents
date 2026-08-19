@@ -110,6 +110,27 @@ function Get-ShadowChildField {
     }
 }
 
+function Get-ShadowChildOptionalField {
+    <#
+    .SYNOPSIS
+        A field that may legitimately be absent, returned as '' when it is.
+    .DESCRIPTION
+        Kept separate from Get-ShadowChildField rather than added to it as a
+        switch. A step that reads a required field must fail when it is missing,
+        and one shared getter with an -Optional flag makes that failure one
+        forgotten parameter away. Two getters make the choice visible at every
+        call site.
+    #>
+    param(
+        [Parameter(Mandatory)]$Request,
+        [Parameter(Mandatory)][string]$Name
+    )
+    if (-not $Request.PSObject.Properties[$Name]) { return '' }
+    $value = $Request.$Name
+    if ($value -isnot [string]) { throw "The child request field '$Name' is not a string." }
+    return [string]$value
+}
+
 function Write-ShadowChildResult {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -313,6 +334,14 @@ function Get-ShadowChildPublishedSnapshot {
 function Invoke-ShadowChildRunSetDeclare {
     param([Parameter(Mandatory)]$Request, [Parameter(Mandatory)][string]$ToolkitRoot)
     $qualificationRoot = Get-ShadowChildField -Request $Request -Name 'qualificationRoot'
+    # Optional, and resolved to the production agent when absent. It is the plan
+    # digest's business rather than this adapter's which agent runs: the digest
+    # seals the script path AND its content hash, so a declaration made naming
+    # one agent cannot be launched naming another.
+    $reviewerScriptPath = Get-ShadowChildOptionalField -Request $Request -Name 'reviewerScriptPath'
+    if (-not $reviewerScriptPath) {
+        $reviewerScriptPath = Join-Path $ToolkitRoot 'src\Agents\reviewer\Start-ReviewerAgent.ps1'
+    }
     $arguments = @{
         Mode = 'Declare'
         RepoPath = (Get-ShadowChildField -Request $Request -Name 'reviewerRepositoryPath')
@@ -325,6 +354,7 @@ function Invoke-ShadowChildRunSetDeclare {
         QualificationRoot = $qualificationRoot
         ExpectedCommit = (Get-ShadowChildField -Request $Request -Name 'expectedCommit')
         RequiredRef = (Get-ShadowChildField -Request $Request -Name 'requiredRef')
+        ReviewerScriptPath = $reviewerScriptPath
         SlotCount = (Get-ShadowChildField -Request $Request -Name 'plannedRunCount' -Type int)
         RunSetKeyPath = (Get-ShadowChildField -Request $Request -Name 'runSetKeyPath')
         Purpose = 'shadow-run-coordinator preparation'
@@ -374,7 +404,7 @@ function Invoke-ShadowChildRunSetDeclare {
             -PullRequestId $arguments.PullRequestId -ReplayRoot $arguments.ReplayRoot `
             -ReplaySnapshotName $arguments.ReplaySnapshotName `
             -ReplayManifestDigest $arguments.ReplayManifestDigest -QualificationRoot $qualificationRoot `
-            -ReviewerScriptPath (Join-Path $ToolkitRoot 'src\Agents\reviewer\Start-ReviewerAgent.ps1') `
+            -ReviewerScriptPath $arguments.ReviewerScriptPath `
             -ToolkitRepositoryPath '' -ExpectedCommit $arguments.ExpectedCommit `
             -RequiredRef $arguments.RequiredRef -SlotCount $arguments.SlotCount `
             -LaunchAuthorizationHash $adoptionLaunchHash
@@ -458,6 +488,8 @@ function Invoke-ShadowChildRunSetStatus {
         SlotCount = (Get-ShadowChildField -Request $Request -Name 'plannedRunCount' -Type int)
         ReportPath = $reportPath
     }
+    $statusReviewerScript = Get-ShadowChildOptionalField -Request $Request -Name 'reviewerScriptPath'
+    if ($statusReviewerScript) { $arguments.ReviewerScriptPath = $statusReviewerScript }
     $tool = Join-Path $ToolkitRoot 'tools\Get-ReviewerReplayQualificationStatus.ps1'
     $status = & $tool @arguments
     $status = @($status | Where-Object { $_ -is [System.Management.Automation.PSCustomObject] })[-1]
@@ -488,6 +520,332 @@ function Invoke-ShadowChildRunSetStatus {
 }
 
 # ---------------------------------------------------------------------------
+# Supervised slot steps.
+#
+# The coordinator owns authorization, durable state and process supervision. It
+# owns none of what follows: the plan, the declaration binding, the launch
+# authorization, the run itself and the terminal evidence are all the reviewed
+# qualification path's, and these three steps do no more than run it and report
+# what it produced. Nothing here selects a model, ranks a candidate, arbitrates a
+# severity or reaches a verdict, and nothing here writes to any provider.
+# ---------------------------------------------------------------------------
+
+function Get-ShadowChildArgumentValue {
+    <#
+    .SYNOPSIS
+        One integer value out of a slot's sealed argument array.
+    .DESCRIPTION
+        Read from the argv the plan digest seals rather than from a parameter
+        default, so the number a supervisor is bounded by is the number the
+        declaration was signed over. An absent or unparsable value is refused: a
+        default substituted here would be a budget nobody sealed.
+    #>
+    param(
+        [Parameter(Mandatory)][string[]]$Argv,
+        [Parameter(Mandatory)][string]$Name
+    )
+    for ($index = 0; $index -lt $Argv.Count - 1; $index++) {
+        if ($Argv[$index] -ceq $Name) {
+            $parsed = 0
+            if (-not [int]::TryParse($Argv[$index + 1], [ref]$parsed)) {
+                throw "The sealed slot argument '$Name' carries '$($Argv[$index + 1])', which is not an integer."
+            }
+            return $parsed
+        }
+    }
+    throw "The sealed slot arguments carry no '$Name'."
+}
+
+function Get-ShadowChildSlotContext {
+    <#
+    .SYNOPSIS
+        Rebuilds the reviewed qualification plan for one slot and binds it to the
+        signed declaration.
+    .DESCRIPTION
+        A read, not a second construction. The plan comes from the production
+        builder and the binding from the production assertions, so a plan this
+        adapter could build but the declaration was not sealed under is refused
+        by the same code that refuses it in the qualification tool itself.
+    #>
+    param([Parameter(Mandatory)]$Request, [Parameter(Mandatory)][string]$ToolkitRoot)
+
+    $qualificationRoot = Get-ShadowChildField -Request $Request -Name 'qualificationRoot'
+    $slotName = Get-ShadowChildField -Request $Request -Name 'slotName'
+    $tokenPath = Get-ShadowChildField -Request $Request -Name 'launchAuthorizationTokenPath'
+    $reviewerScriptPath = Get-ShadowChildOptionalField -Request $Request -Name 'reviewerScriptPath'
+    if (-not $reviewerScriptPath) {
+        $reviewerScriptPath = Join-Path $ToolkitRoot 'src\Agents\reviewer\Start-ReviewerAgent.ps1'
+    }
+    if (-not (Test-Path -LiteralPath $tokenPath -PathType Leaf)) {
+        throw "The launch-authorization token '$tokenPath' does not exist."
+    }
+
+    $runSetDirectory = Join-Path $qualificationRoot 'runset'
+    # The inventory check comes first and returns the token the published set
+    # actually carries. A set whose token is gone is an incomplete publish, and
+    # reading the caller's token file instead would let a slot launch against a
+    # set that is missing the very thing its plan digest seals.
+    $publishedToken = Assert-ReviewerQualificationPublishedInventory -RunSetDirectory $runSetDirectory
+    $presentedToken = ([IO.File]::ReadAllText($tokenPath)).Trim()
+    if ($presentedToken -cne $publishedToken) {
+        throw ('The launch-authorization token presented for this slot is not the token the published run set ' +
+            'carries, so the plan it was sealed under cannot be reproduced.')
+    }
+    $launchHash = Get-ReviewerQualificationLaunchTokenHash -Token $presentedToken
+
+    $plan = New-ReviewerReplayQualificationPlan `
+        -RepoPath (Get-ShadowChildField -Request $Request -Name 'reviewerRepositoryPath') `
+        -ConfigFile (Get-ShadowChildField -Request $Request -Name 'reviewerConfigPath') `
+        -OperatorAlias (Get-ShadowChildField -Request $Request -Name 'operatorAlias') `
+        -PullRequestId (Get-ShadowChildField -Request $Request -Name 'pullRequestId' -Type int) `
+        -ReplayRoot (Get-ShadowChildField -Request $Request -Name 'replayRoot') `
+        -ReplaySnapshotName (Get-ShadowChildField -Request $Request -Name 'snapshotName') `
+        -ReplayManifestDigest (Get-ShadowChildField -Request $Request -Name 'manifestDigest') `
+        -QualificationRoot $qualificationRoot `
+        -ReviewerScriptPath $reviewerScriptPath `
+        -ToolkitRepositoryPath '' `
+        -ExpectedCommit (Get-ShadowChildField -Request $Request -Name 'expectedCommit') `
+        -RequiredRef (Get-ShadowChildField -Request $Request -Name 'requiredRef') `
+        -SlotCount (Get-ShadowChildField -Request $Request -Name 'plannedRunCount' -Type int) `
+        -LaunchAuthorizationHash $launchHash
+    $planDigest = Get-ReviewerQualificationPlanDigest -Plan $plan
+
+    $target = @(@($plan.Slots) | Where-Object { $_.Name -ceq $slotName }) | Select-Object -First 1
+    if (-not $target) {
+        throw "Slot '$slotName' is not part of this $($plan.SlotCount)-slot plan."
+    }
+
+    $compareTool = Join-Path $ToolkitRoot 'tools\Compare-ReviewerReplayRuns.ps1'
+    $keyPath = Get-ShadowChildField -Request $Request -Name 'runSetKeyPath'
+    $verified = Get-VerifiedRunSetDeclaration -RunSetDirectory $runSetDirectory `
+        -CompareTool $compareTool -RunSetKeyPath $keyPath
+    Assert-ReviewerQualificationDeclarationMatchesPlan -Declaration $verified.Declaration `
+        -Plan $plan -ExpectedPlanDigest $planDigest
+
+    # The caller declared which plan and which set it authorized. Checked here so
+    # a plan that drifted between authorization and use is refused by the step
+    # that would have acted on it, rather than noticed afterwards.
+    $expectedPlanDigest = Get-ShadowChildOptionalField -Request $Request -Name 'expectedPlanDigest'
+    if ($expectedPlanDigest -and $expectedPlanDigest -cne $planDigest) {
+        throw "The rebuilt qualification plan digests to '$planDigest' and the caller authorized '$expectedPlanDigest'."
+    }
+    $expectedSetId = Get-ShadowChildOptionalField -Request $Request -Name 'expectedSetId'
+    if ($expectedSetId -and $expectedSetId -cne [string]$verified.Declaration.setId) {
+        throw "The published run set is '$([string]$verified.Declaration.setId)' and the caller authorized '$expectedSetId'."
+    }
+
+    return @{
+        Plan = $plan
+        PlanDigest = $planDigest
+        Target = $target
+        SetId = [string]$verified.Declaration.setId
+        LaunchHash = $launchHash
+        LaunchTokenPath = ([IO.Path]::GetFullPath($tokenPath))
+        RunSetDirectory = $runSetDirectory
+        RunSetKeyPath = $keyPath
+        ReviewerScriptPath = $reviewerScriptPath
+        AttemptPath = (Join-Path $plan.RunDirectory "$($target.Name)-attempt.json")
+    }
+}
+
+function Invoke-ShadowChildSlotPlan {
+    <#
+    .SYNOPSIS
+        Reports the plan a launch would use, and whether the launch is still
+        available. Launches nothing.
+    .NOTES
+        The reviewed qualification sources are loaded HERE rather than inside the
+        context builder. Dot-sourcing from inside a function defines its
+        functions in that function's own scope, which is gone the moment it
+        returns; loading at the step keeps them alive for the whole step and,
+        because a called function runs in a child scope, the context builder sees
+        them too.
+    #>
+    param([Parameter(Mandatory)]$Request, [Parameter(Mandatory)][string]$ToolkitRoot)
+    Import-Module (Join-Path $ToolkitRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force -ErrorAction Stop
+    . (Join-Path $ToolkitRoot 'src\Agents\reviewer\QualificationPreflight.ps1')
+    . (Join-Path $ToolkitRoot 'src\Agents\reviewer\ReplayQualification.ps1')
+    $context = Get-ShadowChildSlotContext -Request $Request -ToolkitRoot $ToolkitRoot
+    $plan = $context.Plan
+    $target = $context.Target
+    # Read through the production resolver rather than by constructing a path.
+    # On Windows a constructed open is case-insensitive, so a physical
+    # 'Slot1-terminal.json' would answer for 'slot1-terminal.json'.
+    $terminalPath = Resolve-ReviewerQualificationSlotTerminalPath -RunDirectory $plan.RunDirectory `
+        -SlotName $target.Name
+    # The one budget the plan does not publish as a field: the longest a single
+    # reviewed call may take. It is read back out of the slot's own sealed argv,
+    # which the plan digest covers, so a supervisor bounded by it is bounded by
+    # the sealed plan rather than by a number invented here.
+    $perCallTimeoutSeconds = [Math]::Max(
+        (Get-ShadowChildArgumentValue -Argv $target.Arguments -Name '-CycleTimeoutSeconds'),
+        [Math]::Max(
+            (Get-ShadowChildArgumentValue -Argv $target.Arguments -Name '-ConventionSpecialistTimeoutSeconds'),
+            (Get-ShadowChildArgumentValue -Argv $target.Arguments -Name '-VerificationTimeoutSeconds')))
+    return @{
+        setId = $context.SetId
+        planDigest = $context.PlanDigest
+        launchAuthorizationHash = $context.LaunchHash
+        reviewerScriptSha256 = [string]$plan.ReviewerScriptSha256
+        slotName = [string]$target.Name
+        slotStateDir = [string]$target.StateDir
+        slotTerminalPath = [string]$target.TerminalPath
+        slotAttemptExists = [bool](Test-Path -LiteralPath $context.AttemptPath)
+        slotTerminalExists = [bool]($null -ne $terminalPath)
+        slotTimeoutSeconds = [int]$plan.SlotTimeoutSeconds
+        progressTimeoutSeconds = [int]$plan.ProgressTimeoutSeconds
+        perCallTimeoutSeconds = $perCallTimeoutSeconds
+        head = [string]$plan.GitIdentity.head
+        requiredRef = [string]$plan.GitIdentity.requiredRef
+        headClean = [bool]$plan.GitIdentity.clean
+        deliveryMode = [string]$plan.DeliveryMode
+        promotable = [bool]$plan.Promotable
+    }
+}
+
+function Invoke-ShadowChildSlotRun {
+    <#
+    .SYNOPSIS
+        Runs exactly one slot through the reviewed qualification tool and reports
+        that it produced terminal evidence.
+    .DESCRIPTION
+        The exit code is DATA here, not a verdict. A qualification slot whose
+        reviewed run fails exits non-zero by design and writes an immutable
+        terminal record saying so - a perfectly successful supervision of an
+        unsuccessful run. So this step succeeds when the evidence exists and
+        fails when it does not, and the exit code travels alongside as an opaque
+        number for the caller's record.
+
+        Loads the reviewed sources at this scope for the reason given on
+        Invoke-ShadowChildSlotPlan.
+    #>
+    param([Parameter(Mandatory)]$Request, [Parameter(Mandatory)][string]$ToolkitRoot)
+    Import-Module (Join-Path $ToolkitRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force -ErrorAction Stop
+    . (Join-Path $ToolkitRoot 'src\Agents\reviewer\QualificationPreflight.ps1')
+    . (Join-Path $ToolkitRoot 'src\Agents\reviewer\ReplayQualification.ps1')
+    $context = Get-ShadowChildSlotContext -Request $Request -ToolkitRoot $ToolkitRoot
+    $plan = $context.Plan
+    $target = $context.Target
+    if (Test-Path -LiteralPath $context.AttemptPath) {
+        throw ("Slot '$($target.Name)' has already been attempted; its single-use launch authorization is spent " +
+            'and this adapter does not attempt a slot twice.')
+    }
+
+    $tool = Join-Path $ToolkitRoot 'tools\Invoke-ReviewerReplayQualification.ps1'
+    $arguments = @{
+        Mode = 'RunSlot'
+        Slot = [string]$target.Name
+        RepoPath = (Get-ShadowChildField -Request $Request -Name 'reviewerRepositoryPath')
+        ConfigFile = (Get-ShadowChildField -Request $Request -Name 'reviewerConfigPath')
+        OperatorAlias = (Get-ShadowChildField -Request $Request -Name 'operatorAlias')
+        PullRequestId = (Get-ShadowChildField -Request $Request -Name 'pullRequestId' -Type int)
+        ReplayRoot = (Get-ShadowChildField -Request $Request -Name 'replayRoot')
+        ReplaySnapshotName = (Get-ShadowChildField -Request $Request -Name 'snapshotName')
+        ReplayManifestDigest = (Get-ShadowChildField -Request $Request -Name 'manifestDigest')
+        QualificationRoot = (Get-ShadowChildField -Request $Request -Name 'qualificationRoot')
+        ExpectedCommit = (Get-ShadowChildField -Request $Request -Name 'expectedCommit')
+        RequiredRef = (Get-ShadowChildField -Request $Request -Name 'requiredRef')
+        ReviewerScriptPath = $context.ReviewerScriptPath
+        SlotCount = (Get-ShadowChildField -Request $Request -Name 'plannedRunCount' -Type int)
+        RunSetKeyPath = $context.RunSetKeyPath
+        LaunchAuthorizationTokenPath = $context.LaunchTokenPath
+    }
+
+    # Invoked as a child script rather than dot-sourced. The tool ends in `exit`,
+    # which dot-sourced would terminate this adapter before it could write its
+    # own result file - and a supervised step that leaves no result is exactly
+    # the fault the file contract exists to catch.
+    $global:LASTEXITCODE = 0
+    & $tool @arguments
+    $slotExitCode = if ($null -eq $global:LASTEXITCODE) { -1 } else { [int]$global:LASTEXITCODE }
+
+    $terminalPath = Resolve-ReviewerQualificationSlotTerminalPath -RunDirectory $plan.RunDirectory `
+        -SlotName $target.Name
+    return @{
+        terminalWritten = [bool]($null -ne $terminalPath)
+        terminalPath = [string]$(if ($terminalPath) { $terminalPath } else { $target.TerminalPath })
+        childExitCode = $slotExitCode
+        slotName = [string]$target.Name
+        setId = $context.SetId
+        planDigest = $context.PlanDigest
+    }
+}
+
+function Invoke-ShadowChildSlotVerify {
+    <#
+    .SYNOPSIS
+        Reads the slot's immutable terminal evidence through the reviewed
+        readers and reports it verbatim.
+    .DESCRIPTION
+        Every judgement in the result below belongs to something else. The status
+        word is the terminal artifact's, the signature is the declaration's, the
+        inventory is the published set's, and the counts are censuses of files on
+        disk. This step adds structure and nothing else.
+
+        Loads the reviewed sources at this scope for the reason given on
+        Invoke-ShadowChildSlotPlan.
+    #>
+    param([Parameter(Mandatory)]$Request, [Parameter(Mandatory)][string]$ToolkitRoot)
+    Import-Module (Join-Path $ToolkitRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force -ErrorAction Stop
+    . (Join-Path $ToolkitRoot 'src\Agents\reviewer\QualificationPreflight.ps1')
+    . (Join-Path $ToolkitRoot 'src\Agents\reviewer\ReplayQualification.ps1')
+    $context = Get-ShadowChildSlotContext -Request $Request -ToolkitRoot $ToolkitRoot
+    $plan = $context.Plan
+    $target = $context.Target
+
+    $terminalPath = Resolve-ReviewerQualificationSlotTerminalPath -RunDirectory $plan.RunDirectory `
+        -SlotName $target.Name
+    if (-not $terminalPath) {
+        throw "Slot '$($target.Name)' has no terminal evidence under '$($plan.RunDirectory)'."
+    }
+    # Refuses a writable terminal on the caller's behalf, so immutability is
+    # asserted by the reviewed reader rather than re-implemented here.
+    $terminal = Read-ReviewerQualificationSlotTerminal -TerminalPath $terminalPath
+    if ($null -eq $terminal) {
+        throw "Slot '$($target.Name)' terminal evidence at '$terminalPath' could not be read."
+    }
+    foreach ($name in @('kind', 'slot', 'setId', 'planDigest', 'status', 'exitCode', 'timedOut')) {
+        if (-not $terminal.PSObject.Properties[$name]) {
+            throw "The terminal evidence at '$terminalPath' is missing '$name'."
+        }
+    }
+    if ([string]$terminal.kind -cne 'reviewer.replay-qualification.terminal.v1') {
+        throw "The terminal evidence at '$terminalPath' declares kind '$([string]$terminal.kind)'."
+    }
+    if ([string]$terminal.slot -cne [string]$target.Name) {
+        throw "The terminal evidence at '$terminalPath' is slot '$([string]$terminal.slot)', not '$($target.Name)'."
+    }
+
+    $attempts = @(Get-ChildItem -LiteralPath $plan.RunDirectory -Filter 'slot*-attempt.json' `
+            -File -ErrorAction SilentlyContinue)
+    $bytes = [IO.File]::ReadAllBytes($terminalPath)
+    return @{
+        terminalStatus = [string]$terminal.status
+        terminalExitCode = [int]$terminal.exitCode
+        terminalTimedOut = [bool]$terminal.timedOut
+        terminalImmutable = [bool](Get-Item -LiteralPath $terminalPath).IsReadOnly
+        terminalSetId = [string]$terminal.setId
+        terminalPlanDigest = [string]$terminal.planDigest
+        terminalSlot = [string]$terminal.slot
+        terminalPath = [string]$terminalPath
+        terminalSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+        # Reaching this line means the declaration verified under its key and the
+        # published inventory was complete: both are asserted by the shared
+        # context builder, which throws rather than returning a false.
+        signatureVerified = $true
+        inventoryVerified = $true
+        slotAttemptCount = [int]$attempts.Count
+        # A census of the attempt records on disk, which is the census of reviewer
+        # invocations that could have reached a model. Counted rather than
+        # asserted: a constant here would read the same whatever had happened.
+        modelInvocationCount = @(Get-ChildItem -LiteralPath (Get-ShadowChildField -Request $Request -Name 'qualificationRoot') `
+                -Filter 'slot*-attempt.json' -File -Recurse -ErrorAction SilentlyContinue).Count
+        deliveryMode = [string]$plan.DeliveryMode
+        promotable = [bool]$plan.Promotable
+    }
+}
+
+# ---------------------------------------------------------------------------
 # One step, one tool, one result file.
 # ---------------------------------------------------------------------------
 $request = Read-ShadowChildRequest -Path $RequestPath
@@ -508,6 +866,13 @@ try {
         'runSetDeclare' { Invoke-ShadowChildRunSetDeclare -Request $request -ToolkitRoot $toolkitRoot }
         'runSetVerify' { Invoke-ShadowChildRunSetVerify -Request $request -ToolkitRoot $toolkitRoot }
         'runSetStatus' { Invoke-ShadowChildRunSetStatus -Request $request -ToolkitRoot $toolkitRoot }
+        'slotPlan' { Invoke-ShadowChildSlotPlan -Request $request -ToolkitRoot $toolkitRoot }
+        # The same derivation under a second name. The caller uses it as a probe
+        # immediately before the irreversible launch, and a distinct step keeps
+        # that probe out of the adoption path the committed plan result lives in.
+        'slotPrelaunch' { Invoke-ShadowChildSlotPlan -Request $request -ToolkitRoot $toolkitRoot }
+        'slotRun' { Invoke-ShadowChildSlotRun -Request $request -ToolkitRoot $toolkitRoot }
+        'slotVerify' { Invoke-ShadowChildSlotVerify -Request $request -ToolkitRoot $toolkitRoot }
         default { throw "'$step' is not a step this adapter performs." }
     }
     Write-ShadowChildResult -Path $resultPath -CorrelationId $correlationId -Step $step `

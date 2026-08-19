@@ -23,6 +23,8 @@ internal static class Program
     private const int ExitContract = 2;
     private const int ExitLeaseConflict = 3;
     private const int ExitChildFailure = 4;
+    /// <summary>A supervised slot reached a terminal that was not 'complete'. Not a coordinator fault.</summary>
+    private const int ExitSlotNotComplete = 5;
     private const int ExitHalted = 9;
 
     internal static int Main(string[] args)
@@ -71,9 +73,20 @@ internal static class Program
             var request = CoordinatorRequest.Load(requestPath);
             var target = targetName is null ? PreparationState.RunSetReady : PreparationStateNames.Parse(targetName);
             var haltAfter = haltAfterName is null ? (PreparationState?)null : PreparationStateNames.Parse(haltAfterName);
-            if (haltAfter is not null && haltAfter > target)
+            // Compared by rank, not by enum value. The three terminal outcomes
+            // share a rank, so a halt at slot1TerminalFailed inside a target of
+            // slot1TerminalVerified is the same boundary rather than a step past
+            // it - and an ordinal comparison would call it out of range.
+            if (haltAfter is { } halt && PreparationStateNames.RankOf(halt) > PreparationStateNames.RankOf(target))
             {
-                throw new ContractException($"--halt-after '{PreparationStateNames.ToName(haltAfter.Value)}' is beyond --target '{PreparationStateNames.ToName(target)}'.");
+                throw new ContractException($"--halt-after '{PreparationStateNames.ToName(halt)}' is beyond --target '{PreparationStateNames.ToName(target)}'.");
+            }
+            // Naming a slot state as the target is a request to launch, so it is
+            // refused unless the request carries an explicit authorization. The
+            // default remains what it was: prepare, and launch nothing.
+            if (PreparationStateNames.IsSlotState(target))
+            {
+                request.RequireSlotAuthorization();
             }
             return Run(request, target, haltAfter);
         }
@@ -108,11 +121,12 @@ internal static class Program
         var state = CoordinatorState.LoadOrFresh(request, key, keyPreexisted);
         var index = StageArtifactIndex.FromSchema(request.ToolkitRoot);
         var invoker = new ChildToolInvoker(request);
+        var supervisor = new SlotSupervisor(request);
 
         var log = Console.Out;
         log.WriteLine($"shadow-run-coordinator correlationId={request.CorrelationId} state={PreparationStateNames.ToName(state.State)} target={PreparationStateNames.ToName(target)}");
 
-        var machine = new PreparationMachine(request, state, key, index, invoker, log);
+        var machine = new PreparationMachine(request, state, key, index, invoker, supervisor, log);
         try
         {
             machine.Run(target, haltAfter);
@@ -126,6 +140,14 @@ internal static class Program
         log.WriteLine($"reached {PreparationStateNames.ToName(state.State)} sequence={state.Sequence.ToString(CultureInfo.InvariantCulture)}");
         log.WriteLine($"state file: {request.StatePath}");
         log.WriteLine($"audit file: {request.AuditPath}");
+        // A supervised run that ended other than complete is reported with its own
+        // exit code, and that is a PASSTHROUGH of the terminal artifact's status
+        // rather than a judgement formed here. The coordinator did its job in all
+        // three cases: the run it supervised did not.
+        if (state.State == PreparationState.Slot1TerminalFailed || state.State == PreparationState.Slot1TerminalTimedOut)
+        {
+            return ExitSlotNotComplete;
+        }
         return ExitOk;
     }
 
@@ -148,8 +170,15 @@ internal static class Program
 
         States: requestValidated corpusValidated recipePlanned snapshotValidateOnly
                 snapshotSealed snapshotVerified runSetDeclared runSetVerified runSetReady
+                slot1Authorized slot1Launching slot1Running slot1TerminalObserved
+                slot1TerminalVerified slot1TerminalFailed slot1TerminalTimedOut
+
+        The slot states require an explicit 'slot' authorization in the request.
+        Without one the coordinator prepares a run set and launches nothing, which
+        leaves the PowerShell qualification path the way slots are run.
 
         Exit codes: 0 reached, 1 usage, 2 contract refusal, 3 lease conflict,
-                    4 child failure, 9 deliberate halt.
+                    4 child failure, 5 supervised slot ended not-complete,
+                    9 deliberate halt.
         """;
 }
