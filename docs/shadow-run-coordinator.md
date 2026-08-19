@@ -62,7 +62,8 @@ of a fixed step timeout.
 ## The state machine
 
 ```
-requestValidated -> corpusValidated -> recipePlanned -> snapshotValidateOnly
+requestValidated -> corpusStaging -> corpusPublished -> corpusValidated -> recipePlanned
+    -> snapshotValidateOnly
     -> snapshotSealed -> snapshotVerified -> runSetDeclared -> runSetVerified -> runSetReady
     -> slot1Authorized -> slot1Launching -> slot1Running -> slot1TerminalObserved
     -> slot1TerminalVerified | slot1TerminalFailed | slot1TerminalTimedOut
@@ -86,6 +87,63 @@ rather than a hope.
 
 `--halt-after <state>` stops deliberately after a named transition and exits 9. It exists so
 the suite can stop the process at every single transition and start it again.
+
+## Building the corpus
+
+`corpusStaging` and `corpusPublished` exist because a corpus used to be built by a private
+script, and the way that script failed is instructive. It copied a captured corpus wholesale —
+including the previous run's identity witness — and then tried to overwrite the witness inside
+the copy. The captured corpus was read-only, as captured evidence should be, so the overwrite
+failed with access denied, and it failed *before* the coordinator had any record that a corpus
+was being built at all. The visible symptom was a permission error. The actual defect was that
+a corpus's identity was whatever had been inherited from whatever was copied, and nothing typed
+was accountable for it.
+
+Both are fixed the same way: the corpus is built from a declaration rather than from a
+directory, and it is built in the control plane rather than beside it.
+
+The declaration is `devpilot.shadow-run-coordinator.corpus-stage-request.v1`, named by the
+request's optional `corpusStage` section and bound there by digest. It names, per payload, the
+corpus-relative path, the absolute source path, the exact SHA-256, the exact byte length, the
+form (`utf8Text` or `binary`) and the role. It names the identity witness's fields outright, and
+it names the digest the finished index must have. Every source it names is read and never
+written, so a read-only source corpus is an ordinary input rather than a failure.
+
+The order is the contract:
+
+1. A journal is written into the coordinator root **before** the staging directory exists, so
+   there is no instant at which a staging directory exists that no journal claims.
+2. The staging directory is created empty, beside the destination and therefore on its volume.
+3. The **identity witness is written first**. A staging directory that exists at all already
+   says which subject it is for.
+4. Each remaining payload is read once from its immutable source — length checked against the
+   declaration, exactly that many bytes read, end-of-file asserted — and the digest compared
+   against the declaration is computed over the bytes actually read. A source rewritten between
+   a hash and a read cannot pass. Each file is then re-read from disk and re-digested.
+5. The index is **generated last**, from the declaration, through the same canonical rendering
+   the PowerShell canonicalizer produces. PowerShell remains normative; the C# side has only to
+   agree, and it refuses to publish if the index it generated does not digest to what was
+   declared.
+6. The staged tree is validated as a set: every declared path present, no extras, no
+   duplicates, no reparse points, every length and digest re-read.
+7. Publication is a single `Directory.Move` onto a path that must not exist. That is what makes
+   two concurrent builders resolve to exactly one winner without a lock.
+8. The published corpus is made read-only, and the result contract
+   `devpilot.shadow-run-coordinator.corpus-stage-result.v1` is written.
+
+A run killed at any point in that sequence leaves either no journal and no directory, or a
+journal naming a directory that may be complete, partial or absent — and in every one of those
+cases the next run can tell whether the leftovers are its own. It removes only a staging
+directory its own journal claims; a journal opened by another correlation is a refusal rather
+than a licence to tidy up. A published corpus is never replaced, merged into, or written over:
+a destination that already holds a corpus with the digest this run staged is adopted, and one
+with any other digest is refused.
+
+Staging is optional. Without a `corpusStage` section both transitions commit
+`staged: false` and touch nothing, which is the retained PowerShell default: the corpus is
+built the old way and `corpusValidated` reads it exactly as before. They are two ranks rather
+than one because the on-disk shape either side of the move is completely different, and a
+single rank could not say which side a resumed run was on.
 
 ## The supervised slot
 
@@ -160,6 +218,19 @@ Beyond shape, the run is refused when:
 * the repository head is not the exact commit the request binds,
 * a configuration, prompt-asset or schema digest does not match what the request declared,
 * the corpus index digest does not match the corpus on disk,
+* a corpus stage declaration disagrees with the request that carries it — a different
+  correlation, toolkit head, output root, corpus root, index digest or subject identity,
+* a corpus stage declaration is not internally sound: a path that is not a canonical corpus
+  path, a payload declared twice or aliased by case, two payloads reading one source, payloads
+  out of ascending ordinal order, an index declared as a payload, no identity witness or more
+  than one, a witness whose path is not the one the identity names, or a missing mandatory role,
+* a declared source does not exist, is a reparse point, is a different length, grew while it was
+  being read, digests to something other than the declaration, or — where the payload is
+  declared textual — opens with a byte-order mark or is not valid UTF-8,
+* a corpus destination already exists when staging begins, appears between the check and the
+  move, or already holds a corpus whose index digests to something other than what this run
+  staged,
+* a staging journal in this output root was opened by another correlation, for another request,
 * the durable state file's own integrity check fails, or its correlation ID is not this run's,
 * a signing key exists in the output root **and** that root holds standing work — an audit,
   exchange records, stage artifacts, a replay root or a qualification root — but the state
@@ -273,6 +344,10 @@ Rolling back the slot slice is deleting the `slot` section from the request. The
 `RunSlot` path is reached through the same arguments it has always been reached through, so
 running it directly is the rollback, not a fallback that has to be built.
 
+Rolling back the corpus staging slice is deleting the `corpusStage` section from the request.
+Both corpus transitions then commit `staged: false`, the coordinator reads a corpus somebody
+else built exactly as it did before, and the PowerShell path that builds one is untouched.
+
 ## The pre-commit window
 
 The one fault a state machine cannot halt its way out of: a child completes a durable,
@@ -354,6 +429,28 @@ anything and which must therefore still be usable, alongside the wiped-record re
 guard exists for; a recipe rewritten between validation and the seal; a still-live recorded child
 refusing the next run and then releasing it once that child exits; and a final check that no
 child process and no repository modification survived the run.
+
+For the typed corpus staging it adds two scenarios. The first builds a corpus from a genuinely
+read-only source corpus into a destination that does not exist, halts after `corpusStaging` and
+checks that nothing was published and that the scratch directory already carries its identity
+witness and an index digesting to what the declaration bound, resumes to a signed run set,
+and then checks that the published index is byte-identical to the one the PowerShell
+canonicalizer produced, that the binary payload survived verbatim, that every published file is
+read-only, that the journal is gone and no staging directory is left, that the stage result says
+what was built, that the source corpus is unchanged and still read-only, and that a replay
+rewrites nothing.
+
+The second is the fault matrix: a destination that already exists; a source rewritten after the
+declaration was written; a byte-order mark and invalid UTF-8 on a payload declared textual; a
+missing source; a duplicated path; a traversal path; the index declared as a payload; payloads
+out of order; a witness alias; a wrong subject and a wrong commit; a foreign correlation; a
+wrong index digest; a relabelled corpus kind; a declaration edited after the request bound its
+digest; a source locked against reading part way through a staging, followed by the same request
+succeeding once it is readable again; a staging directory destroyed while its owner was dead; a
+journal another run opened, which is refused rather than cleaned up; a destination parent that is
+a reparse point; and two builders started together against one destination, of which exactly one
+may perform the move. Every refusal is held to the same three properties: a contract exit, a
+refusal naming the fault, and nothing published and nothing left behind.
 
 For the supervised slot it adds: an authorization built by the production plan builder against
 the real signed declaration, with no stand-in anywhere, refused for a missing token and for a

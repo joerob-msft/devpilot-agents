@@ -47,6 +47,7 @@ internal sealed class PreparationMachine(
     private string _sealedSnapshotDigest = string.Empty;
     private string _runSetPath = string.Empty;
     private SlotPlan? _slotPlan;
+    private CorpusStager? _stager;
 
     /// <summary>
     /// The file name the qualification path publishes its single-use launch
@@ -112,6 +113,8 @@ internal sealed class PreparationMachine(
         var (evidence, detail) = next switch
         {
             PreparationState.RequestValidated => ValidateRequest(),
+            PreparationState.CorpusStaging => StageCorpus(),
+            PreparationState.CorpusPublished => PublishCorpus(),
             PreparationState.CorpusValidated => ValidateCorpus(),
             PreparationState.RecipePlanned => PlanRecipe(),
             PreparationState.SnapshotValidateOnly => ValidateSnapshotOnly(),
@@ -179,6 +182,12 @@ internal sealed class PreparationMachine(
     {
         switch (state)
         {
+            case PreparationState.CorpusStaging:
+                if (_request.CorpusStagingRequested)
+                {
+                    Stager().RecheckStaged(CommittedEvidence(PreparationState.CorpusStaging));
+                }
+                break;
             case PreparationState.SnapshotSealed:
                 ReadSealResult();
                 break;
@@ -355,6 +364,83 @@ internal sealed class PreparationMachine(
         {
             throw new ContractException($"The {label} at '{path}' digests to {actual}, and the request binds {expected}.");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // corpusStaging / corpusPublished - where the corpus is built, not found
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// The stage declaration this run builds from, read once and checked against
+    /// both the authorization's digest and the request that carries it.
+    /// </summary>
+    private CorpusStager Stager()
+    {
+        if (_stager is not null)
+        {
+            return _stager;
+        }
+        var authorization = _request.RequireCorpusStaging();
+        RequireDigest(authorization.RequestPath, authorization.RequestSha256, "corpus stage request");
+        var declaration = CorpusStageRequest.Load(authorization.RequestPath);
+        var stager = new CorpusStager(_request, declaration, _log);
+        // Two files that both describe one subject are two chances to describe two
+        // subjects. They are reconciled here, once, before a single byte is read.
+        stager.RequireAgreementWithRequest();
+        _stager = stager;
+        return stager;
+    }
+
+    /// <summary>
+    /// The evidence a previous transition committed, read back from the signed
+    /// record rather than recomputed.
+    /// </summary>
+    private MapNode CommittedEvidence(PreparationState state)
+    {
+        foreach (var transition in _state.Transitions)
+        {
+            if (transition.State == state)
+            {
+                return transition.Evidence;
+            }
+        }
+        throw new ContractException(
+            $"The state record carries no '{PreparationStateNames.ToName(state)}' transition, so there is no evidence to continue from.");
+    }
+
+    /// <summary>
+    /// The evidence a run that builds no corpus commits at these two ranks.
+    /// </summary>
+    /// <remarks>
+    /// A no-op, and recorded as one. The alternative - skipping the rank - would
+    /// make the sequence numbers of a staging run and a non-staging run differ,
+    /// and every downstream check that names a sequence would then have to know
+    /// which kind of run it was reading. An explicit false is cheaper than that
+    /// and says more.
+    /// </remarks>
+    private (MapNode Evidence, string Detail) NoCorpusConstruction(string phase)
+    {
+        var reason = _request.CorpusStage is null
+            ? "the request carries no corpusStage section"
+            : "the request's corpusStage section sets stagingEnabled to false";
+        var evidence = new MapNode()
+            .Set("staged", false)
+            .Set("phase", phase)
+            .Set("reason", reason)
+            .Set("corpusRoot", _request.CorpusRoot);
+        return (evidence, "staged=false");
+    }
+
+    private (MapNode Evidence, string Detail) StageCorpus() =>
+        _request.CorpusStagingRequested ? Stager().Stage() : NoCorpusConstruction("staging");
+
+    private (MapNode Evidence, string Detail) PublishCorpus()
+    {
+        if (!_request.CorpusStagingRequested)
+        {
+            return NoCorpusConstruction("publish");
+        }
+        return Stager().Publish(CommittedEvidence(PreparationState.CorpusStaging));
     }
 
     // -----------------------------------------------------------------------

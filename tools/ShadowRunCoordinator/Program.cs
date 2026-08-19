@@ -168,10 +168,16 @@ internal static class Program
           --target      Stop once this state is reached. Defaults to runSetReady.
           --halt-after  Exit 9 immediately after committing this state. For fault tests.
 
-        States: requestValidated corpusValidated recipePlanned snapshotValidateOnly
-                snapshotSealed snapshotVerified runSetDeclared runSetVerified runSetReady
+        States: requestValidated corpusStaging corpusPublished corpusValidated
+                recipePlanned snapshotValidateOnly snapshotSealed snapshotVerified
+                runSetDeclared runSetVerified runSetReady
                 slot1Authorized slot1Launching slot1Running slot1TerminalObserved
                 slot1TerminalVerified slot1TerminalFailed slot1TerminalTimedOut
+
+        The corpus states build the corpus from declared immutable sources and
+        require an explicit 'corpusStage' section in the request. Without one they
+        commit that nothing was built and the corpus named by 'corpus.root' is
+        expected to exist already, which is how every earlier request reads.
 
         The slot states require an explicit 'slot' authorization in the request.
         Without one the coordinator prepares a run set and launches nothing, which
