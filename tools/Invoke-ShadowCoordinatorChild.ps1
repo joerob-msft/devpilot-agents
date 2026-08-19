@@ -190,8 +190,20 @@ function Invoke-ShadowChildCorpusSeal {
     $corpusRoot = Get-ShadowChildField -Request $Request -Name 'corpusRoot'
     $indexSha = Get-ShadowChildField -Request $Request -Name 'corpusIndexSha256'
     $recipePath = Get-ShadowChildField -Request $Request -Name 'recipePath'
+    $recipeSha = Get-ShadowChildField -Request $Request -Name 'recipeSha256'
     $replayRoot = Get-ShadowChildField -Request $Request -Name 'replayRoot'
     $validateOnly = Get-ShadowChildField -Request $Request -Name 'validateOnly' -Type bool
+
+    # The caller binds the recipe by content, not by path, and the check is made
+    # again here, in the process that actually reads the file. A path the
+    # coordinator hashed a moment ago is not the bytes this child seals.
+    if (-not (Test-Path -LiteralPath $recipePath -PathType Leaf)) {
+        throw "The corpus recipe '$recipePath' does not exist."
+    }
+    $recipeActual = (Get-FileHash -LiteralPath $recipePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($recipeActual -cne ([string]$recipeSha).ToLowerInvariant()) {
+        throw "The corpus recipe '$recipePath' hashes to $recipeActual and the request bound $recipeSha."
+    }
 
     # The sealer resolves its replay root as a real path, so the directory has to
     # exist before it is named. Creating it here is not the same as writing a
@@ -314,40 +326,63 @@ function Invoke-ShadowChildRunSetDeclare {
     # after a kill that landed between publication and the coordinator's commit
     # would wedge the run permanently.
     #
-    # A found declaration is not evidence on its own. Adoption re-reads it and
-    # requires it to name THIS request's snapshot, snapshot manifest digest and
-    # planned run count before it is accepted, so a run set left behind by some
-    # other preparation cannot be adopted into this one just by being the only
-    # file in the directory.
+    # A found declaration is not evidence on its own. Adoption re-verifies its
+    # signature and then binds it to the FULL plan this request would have
+    # declared - the reviewed repository, the config, the operator, the commit and
+    # ref, the models and every timeout - through the same production assertions
+    # the qualification tool itself uses. Snapshot, digest and slot count alone
+    # cannot see a declaration that was sealed for a different qualification, and
+    # a signature cannot either: one key signs every declaration in a root.
     $existing = @(Get-ChildItem -LiteralPath $runSetDirectory -Filter 'runset-*.json' -File -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -notlike '*.sig' })
     if ($existing.Count -eq 1) {
+        Import-Module (Join-Path $ToolkitRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force -ErrorAction Stop
+        . (Join-Path $ToolkitRoot 'src\Agents\reviewer\QualificationPreflight.ps1')
+        . (Join-Path $ToolkitRoot 'src\Agents\reviewer\ReplayQualification.ps1')
+        $compareTool = Join-Path $ToolkitRoot 'tools\Compare-ReviewerReplayRuns.ps1'
         $tokenPath = Join-Path $runSetDirectory 'launch-authorization.token'
-        $adoptedText = [IO.File]::ReadAllText($existing[0].FullName, $script:ShadowChildUtf8)
-        $adoptedRecord = $adoptedText | ConvertFrom-Json -Depth 24
-        if (-not $adoptedRecord.PSObject.Properties['manifestJson']) {
-            throw "The standing run set '$($existing[0].Name)' carries no manifest."
+        # The plan digest binds the launch-authorization hash, and Declare mints
+        # that token at random - so the plan is reproducible only by reading the
+        # token the declaration itself minted, exactly as the RunSlot path does.
+        # A declaration whose token is gone is not adoptable: without it the plan
+        # cannot be reproduced, and adopting on the strength of the fields that
+        # remain is the substitution this check exists to refuse.
+        if (-not (Test-Path -LiteralPath $tokenPath -PathType Leaf)) {
+            throw ("The standing run set at '$runSetDirectory' has no launch-authorization token, " +
+                'so the plan it was sealed under cannot be reproduced and it is not adopted.')
         }
-        $adoptedManifest = [string]$adoptedRecord.manifestJson | ConvertFrom-Json -Depth 24
-        $expected = [ordered]@{
-            snapshotName = [string]$arguments.ReplaySnapshotName
-            snapshotManifestDigest = [string]$arguments.ReplayManifestDigest
-            plannedRunCount = [int]$arguments.SlotCount
+        $adoptionLaunchHash = Get-ReviewerQualificationLaunchTokenHash `
+            -Token (([IO.File]::ReadAllText($tokenPath)).Trim())
+        # Reproduced exactly as the qualification tool builds it, so the digest
+        # below is the digest the declaration was sealed under or the declaration
+        # is not this preparation's.
+        $adoptionPlan = New-ReviewerReplayQualificationPlan -RepoPath $arguments.RepoPath `
+            -ConfigFile $arguments.ConfigFile -OperatorAlias $arguments.OperatorAlias `
+            -PullRequestId $arguments.PullRequestId -ReplayRoot $arguments.ReplayRoot `
+            -ReplaySnapshotName $arguments.ReplaySnapshotName `
+            -ReplayManifestDigest $arguments.ReplayManifestDigest -QualificationRoot $qualificationRoot `
+            -ReviewerScriptPath (Join-Path $ToolkitRoot 'src\Agents\reviewer\Start-ReviewerAgent.ps1') `
+            -ToolkitRepositoryPath '' -ExpectedCommit $arguments.ExpectedCommit `
+            -RequiredRef $arguments.RequiredRef -SlotCount $arguments.SlotCount `
+            -LaunchAuthorizationHash $adoptionLaunchHash
+        $adoptionPlanDigest = Get-ReviewerQualificationPlanDigest -Plan $adoptionPlan
+        # Verification and plan binding share one refusal: adoption is a POSITIVE
+        # proof that the standing declaration is this preparation's, so anything
+        # that stops that proof - an unverifiable seal as much as a foreign plan -
+        # means the set is not adopted.
+        try {
+            $adoptionVerified = Get-VerifiedRunSetDeclaration -RunSetDirectory $runSetDirectory `
+                -CompareTool $compareTool -RunSetKeyPath $arguments.RunSetKeyPath
+            Assert-ReviewerQualificationDeclarationMatchesPlan -Declaration $adoptionVerified.Declaration `
+                -Plan $adoptionPlan -ExpectedPlanDigest $adoptionPlanDigest
         }
-        foreach ($field in @($expected.Keys)) {
-            if (-not $adoptedManifest.PSObject.Properties[$field]) {
-                throw "The standing run set declares no '$field'."
-            }
-            $found = $adoptedManifest.$field
-            $want = $expected[$field]
-            $agrees = if ($want -is [int]) { ([int]$found -eq [int]$want) } else { ([string]$found -ceq [string]$want) }
-            if (-not $agrees) {
-                throw "The standing run set declares $field '$found' and this request prepared '$want'; it belongs to another preparation and is not adopted."
-            }
+        catch {
+            throw ("The standing run set belongs to another preparation and is not adopted: " +
+                "$($_.Exception.Message)")
         }
         return @{
-            runSetPath = [string]$existing[0].FullName
-            launchTokenPresent = [bool](Test-Path -LiteralPath $tokenPath -PathType Leaf)
+            runSetPath = [string]$adoptionVerified.Path
+            launchTokenPresent = $true
             adopted = $true
         }
     }

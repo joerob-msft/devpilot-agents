@@ -50,6 +50,21 @@ internal sealed class RunLease : IDisposable
         Directory.CreateDirectory(request.CoordinatorRoot);
         var tookOver = false;
 
+        // A dead coordinator's lease can be taken over; a dead coordinator's CHILD
+        // cannot be reasoned away. When a coordinator is killed from outside it
+        // never runs its own cleanup, so the pwsh process it started keeps writing
+        // this output root. Taking the lease over the top of that child would put
+        // two writers in one root, which is the single thing the lease exists to
+        // prevent - so a recorded child that is still alive is a conflict in its
+        // own right, whatever the lease file says.
+        if (ChildToolInvoker.DescribeLiveRecordedChild(request) is { } liveChild)
+        {
+            throw new LeaseConflictException(
+                $"The output root '{request.OutputRoot}' still has {liveChild}. " +
+                "A coordinator that was killed leaves its child running; this run does not write alongside it. " +
+                "Wait for that child to exit, or end it, and run again.");
+        }
+
         for (var attempt = 0; attempt < 2; attempt++)
         {
             try

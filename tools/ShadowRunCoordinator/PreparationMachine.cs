@@ -563,14 +563,36 @@ internal sealed class PreparationMachine(
         return (evidence, $"manifest={actual[..12]}");
     }
 
-    private MapNode SealRequest(bool validateOnly) => new MapNode()
-        .Set("contractVersion", ChildRequestContractVersion)
-        .Set("toolkitRoot", _request.ToolkitRoot)
-        .Set("corpusRoot", _request.CorpusRoot)
-        .Set("corpusIndexSha256", _request.CorpusIndexSha256)
-        .Set("recipePath", _request.CorpusRecipePath)
-        .Set("replayRoot", _request.ReplayRoot)
-        .Set("validateOnly", validateOnly);
+    private MapNode SealRequest(bool validateOnly)
+    {
+        // The request binds a recipe PATH; the record binds its CONTENT. A resume
+        // skips corpusValidated, so without this the file at that path could have
+        // been rewritten between validation and the seal that consumes it, and the
+        // snapshot would be sealed from a recipe this preparation never validated.
+        var committed = _state.EvidenceFor(PreparationState.CorpusValidated)?.GetText("recipeSha256");
+        if (committed is null || committed.Length == 0)
+        {
+            throw new ContractException("The corpusValidated record carries no recipe digest, so the seal cannot be tied to the recipe this run validated.");
+        }
+        if (!File.Exists(_request.CorpusRecipePath))
+        {
+            throw new ContractException($"The corpus recipe '{_request.CorpusRecipePath}' validated by this run is gone.");
+        }
+        var current = CanonicalJson.Sha256HexOfFile(_request.CorpusRecipePath);
+        if (!string.Equals(current, committed, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The corpus recipe at '{_request.CorpusRecipePath}' now hashes to {current} and this run validated {committed}. The recipe changed under the preparation that bound it.");
+        }
+        return new MapNode()
+            .Set("contractVersion", ChildRequestContractVersion)
+            .Set("toolkitRoot", _request.ToolkitRoot)
+            .Set("corpusRoot", _request.CorpusRoot)
+            .Set("corpusIndexSha256", _request.CorpusIndexSha256)
+            .Set("recipePath", _request.CorpusRecipePath)
+            .Set("recipeSha256", committed)
+            .Set("replayRoot", _request.ReplayRoot)
+            .Set("validateOnly", validateOnly);
+    }
 
     private void ApplySealResult(JsonElement result)
     {

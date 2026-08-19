@@ -126,23 +126,30 @@ internal sealed class CoordinatorState
     /// children whose evidence is already on disk.
     /// </summary>
     /// <param name="keyPreexisted">
-    /// Whether the signing key was already on disk when this process started. A
-    /// key is minted exactly once per output root, at the same moment the first
-    /// record is about to be written, so a key WITHOUT a record means a record
-    /// that existed has since been removed. Treating that as a fresh start is
-    /// what would make the signed record merely decorative: the run would mint
-    /// transitions, clear and republish stage artifacts, and only later notice a
-    /// standing snapshot. The refusal happens here, before anything is mutated.
+    /// Whether the signing key was already on disk when this process started. The
+    /// key is written with the first record and only then, so a key WITHOUT a
+    /// record means a record that existed has since been removed. Treating that as
+    /// a fresh start is what would make the signed record merely decorative: the
+    /// run would mint transitions, clear and republish stage artifacts, and only
+    /// later notice a standing snapshot. The refusal happens here, before anything
+    /// is mutated.
     /// </param>
     internal static CoordinatorState LoadOrFresh(CoordinatorRequest request, byte[] key, bool keyPreexisted)
     {
         if (!File.Exists(request.StatePath))
         {
-            if (keyPreexisted)
+            // The key is a strong signal, not a sufficient one. A crash between
+            // writing the key and writing the record it signs leaves the same
+            // shape as a destroyed record, and refusing on that alone would make
+            // a first attempt that died before it committed anything - a failed
+            // validation, an interrupted start - permanently unrecoverable, which
+            // is the very failure class the rest of this machine exists to avoid.
+            // What actually distinguishes the two is whether the root holds WORK.
+            if (keyPreexisted && DescribeStandingWork(request) is { } work)
             {
                 throw new ContractException(
-                    $"The output root '{request.OutputRoot}' carries a coordinator signing key but no state record at '{request.StatePath}'. " +
-                    "A key is minted with the first record, so the record this run would have resumed from has been removed. " +
+                    $"The output root '{request.OutputRoot}' carries a coordinator signing key and {work}, but no state record at '{request.StatePath}'. " +
+                    "The record this run would have resumed from has been removed, so its side effects cannot be accounted for. " +
                     "This root is not resumable and is not started over; use a fresh output root.");
             }
             return Fresh(request);
@@ -314,9 +321,12 @@ internal sealed class CoordinatorState
 
     internal void Save(CoordinatorRequest request, byte[] key)
     {
+        // The key goes down first, and only ever here. Until a record exists there
+        // is nothing for it to sign, and its presence is what later proves a
+        // record was removed rather than never written.
+        var effective = PersistKey(request, key);
         var unsigned = Compose(includeSignature: false);
-        var signature = CanonicalJson.HmacHex(key, CanonicalJson.Canonical(unsigned));
-        var signed = Compose(includeSignature: false);
+        var signature = CanonicalJson.HmacHex(effective, CanonicalJson.Canonical(unsigned));        var signed = Compose(includeSignature: false);
         signed.Set("signature", new MapNode().Set("algorithm", "HMACSHA256").Set("value", signature));
         CanonicalJson.WriteFileAtomic(request.StatePath, CanonicalJson.Readable(signed));
     }
@@ -358,10 +368,18 @@ internal sealed class CoordinatorState
 
     /// <summary>
     /// The signing key for this output root, minted once and reused. A run that
-    /// finds no key mints one; a resume that finds one uses it, because a new key
-    /// would make every existing record unverifiable and turn a restart into a
-    /// silent fresh start.
+    /// finds no key mints one in memory; a resume that finds one uses it, because
+    /// a new key would make every existing record unverifiable and turn a restart
+    /// into a silent fresh start.
     /// </summary>
+    /// <remarks>
+    /// A minted key is deliberately NOT written here. The key's presence is the
+    /// evidence that a record once existed, so writing it before the record it
+    /// signs would make an ordinary first-attempt crash - a failed validation, a
+    /// kill before the first commit - indistinguishable from a destroyed record,
+    /// and would wedge a root that has published nothing at all. It is persisted
+    /// by <see cref="Save"/>, alongside the first record, and only then.
+    /// </remarks>
     internal static byte[] LoadOrMintKey(CoordinatorRequest request, out bool preexisted)
     {
         Directory.CreateDirectory(request.CoordinatorRoot);
@@ -370,23 +388,74 @@ internal sealed class CoordinatorState
             preexisted = true;
             return ReadKey(request);
         }
-        var minted = RandomNumberGenerator.GetBytes(32);
+        preexisted = false;
+        return RandomNumberGenerator.GetBytes(32);
+    }
+
+    /// <summary>
+    /// Writes the minted key if this root has none, and adopts an existing one if
+    /// something else won the race. Minting a second key would make every record
+    /// written under the first unverifiable.
+    /// </summary>
+    /// <summary>
+    /// Names the first durable side effect this output root holds, or null when it
+    /// holds none. Only these say that a preparation got far enough to do
+    /// something a later run would have to account for.
+    /// </summary>
+    private static string? DescribeStandingWork(CoordinatorRequest request)
+    {
+        if (File.Exists(request.AuditPath))
+        {
+            return "a published audit";
+        }
+        if (HasAnyFile(request.ExchangeRoot))
+        {
+            return "child exchange records";
+        }
+        if (HasAnyFile(request.StageArtifactRoot))
+        {
+            return "published stage artifacts";
+        }
+        if (HasAnyFile(request.ReplayRoot))
+        {
+            return "a sealed replay root";
+        }
+        if (HasAnyFile(request.QualificationRoot))
+        {
+            return "a qualification root";
+        }
+        return null;
+    }
+
+    private static bool HasAnyFile(string directory) =>
+        Directory.Exists(directory) && Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories).Any();
+
+    private static byte[] PersistKey(CoordinatorRequest request, byte[] key)
+    {
+        if (File.Exists(request.StateKeyPath))
+        {
+            var standing = ReadKey(request);
+            if (!CryptographicOperations.FixedTimeEquals(standing, key))
+            {
+                throw new ContractException(
+                    $"The coordinator signing key at '{request.StateKeyPath}' is not the key this run holds. " +
+                    "Another writer minted a key for this output root; the record this run would sign could not be verified against it.");
+            }
+            return standing;
+        }
         try
         {
             using var stream = new FileStream(request.StateKeyPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
-            stream.Write(minted, 0, minted.Length);
+            stream.Write(key, 0, key.Length);
             stream.Flush(flushToDisk: true);
         }
         catch (IOException) when (File.Exists(request.StateKeyPath))
         {
-            // Belt and braces behind the lease: if anything else won the race to
-            // create the key, adopt theirs. Minting a second key would make every
-            // record written under the first one unverifiable.
-            preexisted = true;
-            return ReadKey(request);
+            throw new ContractException(
+                $"Another writer created the coordinator signing key at '{request.StateKeyPath}' while this run was minting one. " +
+                "Two coordinators are writing this output root.");
         }
-        preexisted = false;
-        return minted;
+        return key;
     }
 
     private static byte[] ReadKey(CoordinatorRequest request)

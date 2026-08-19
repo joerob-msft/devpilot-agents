@@ -80,16 +80,45 @@ Beyond shape, the run is refused when:
 * a configuration, prompt-asset or schema digest does not match what the request declared,
 * the corpus index digest does not match the corpus on disk,
 * the durable state file's own integrity check fails, or its correlation ID is not this run's,
-* a signing key exists in the output root but the state record it was minted alongside does not,
-* another live process holds the lease on the output root.
+* a signing key exists in the output root **and** that root holds standing work — an audit,
+  exchange records, stage artifacts, a replay root or a qualification root — but the state
+  record those were produced under does not. A key on its own is not that condition: a first
+  attempt refused for an ordinary reason (a mistyped digest, a moved toolkit, a head that has
+  since advanced) has published nothing, and the corrected second attempt against the same root
+  must work. The key is therefore written from inside the save that produces the record it
+  signs, so the two exist together or not at all,
+* the recipe file named by the request no longer hashes to the digest `corpusValidated` recorded
+  for it. A resume skips the validation that blessed the recipe, so the seal re-checks the
+  content it is about to consume — in the coordinator before the child request is built, and
+  again in the child that reads the file,
+* another live process holds the lease on the output root,
+* a child this output root's launch journal records as running is still alive. A coordinator
+  killed from outside never runs its own cleanup, so the `pwsh` it started outlives it; the
+  lease handle closes but the writer does not stop. The journal records the child's process ID
+  *and* its start time at the moment it starts and clears them when it exits, so the next run
+  refuses while that exact process is alive and proceeds once it is gone.
 
 A child result is refused, even when it is genuine, correlated and correctly digested, when it
 disagrees with the record about *which subject* it is describing. A signature proves a run set
 was declared under this output root's key; one key signs every declaration in a root, so a
 declaration left behind by an earlier subject verifies perfectly. So the verified manifest's
 snapshot must be the snapshot this preparation sealed, the status read's set must be the set the
-previous transition verified, and the declaring child re-reads a standing declaration's manifest
-and adopts it only when its snapshot, manifest digest and planned run count match this request.
+previous transition verified, and a standing declaration is adopted only when it was sealed
+under the *whole* plan this request would have declared.
+
+That last binding is the production one, not a paraphrase. The declaring child rebuilds the
+qualification plan with `New-ReviewerReplayQualificationPlan`, reproduces the launch-authorization
+hash by reading the token the declaration itself minted — the plan digest binds that hash, and
+`Declare` mints it at random, so the token is the only way to reproduce the plan — and then binds
+the standing declaration through `Get-VerifiedRunSetDeclaration` and
+`Assert-ReviewerQualificationDeclarationMatchesPlan`. The plan digest covers the reviewed
+repository, the config, the operator, the commit and ref, the models, the timeouts and every slot
+argument vector, so a declaration that agrees on snapshot, manifest digest and run count but was
+made for a different qualification is refused. A declaration whose token is gone is not adoptable
+either: without it the plan cannot be reproduced, and adopting on the strength of the fields that
+remain is exactly the substitution this check exists to refuse. Verification failure and plan
+mismatch share one refusal, because adoption is a positive proof and anything that stops the
+proof means the set is not this preparation's.
 
 The lease records the holder's process ID *and* its process start time, and liveness is decided
 by looking up that exact identity. A recycled process ID with a different start time is not the
@@ -178,10 +207,14 @@ correlation, wrong step, stdout chatter, a stray publication directory, a mismat
 digest, and a hang bounded by timeout); an external kill mid-transition; the pre-commit window
 on both non-repeatable side effects and on the stage publication; resume integrity against
 edited child results and edited stage artifacts; the changed-path census boundary; a run set
-that belongs to another preparation, refused both at the child's adoption and at the
-coordinator's own snapshot and set bindings; the audit's resume-invariance and its refusal to
-publish a census it never observed; and a final check that no child process and no repository
-modification survived the run.
+that belongs to another preparation, refused both at the child's adoption — including a
+declaration made for a different operator that agrees on snapshot, digest and run count — and at
+the coordinator's own snapshot and set bindings; the audit's resume-invariance and its refusal to
+publish a census it never observed; a root whose first attempt was refused before it published
+anything and which must therefore still be usable, alongside the wiped-record refusal that same
+guard exists for; a recipe rewritten between validation and the seal; a still-live recorded child
+refusing the next run and then releasing it once that child exits; and a final check that no
+child process and no repository modification survived the run.
 
 The canonical key order that makes any of this reproducible is covered in
 `tools/Test-ReviewerStageContract.ps1`, which asserts the same bytes under `en-US`, `da-DK`,

@@ -301,7 +301,7 @@ try {
     # resolve against whatever scope happens to run the closure later.
     $setOutputRoot = ${function:Set-CoordinatorOutputRoot}
 
-    Write-Host '1/17 offline restore and build' -ForegroundColor Cyan
+    Write-Host '1/18 offline restore and build' -ForegroundColor Cyan
     $project = Join-Path $RepoRoot 'tools\ShadowRunCoordinator\ShadowRunCoordinator.csproj'
     Assert-Coordinator (Test-Path -LiteralPath $project -PathType Leaf) `
         'The shadow run coordinator project is missing.'
@@ -320,7 +320,7 @@ try {
         'The coordinator assembly was not produced.'
 
     # -----------------------------------------------------------------------
-    Write-Host '2/17 sandbox, sealed corpus and typed request' -ForegroundColor Cyan
+    Write-Host '2/18 sandbox, sealed corpus and typed request' -ForegroundColor Cyan
     Import-Module (Join-Path $RepoRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force
     . (Join-Path $RepoRoot 'src\Agents\reviewer\SourceTransport.ps1')
     . (Join-Path $RepoRoot 'src\Agents\reviewer\CorpusSeal.ps1')
@@ -337,7 +337,7 @@ try {
         'The request does not bind a prompt-asset digest.'
 
     # -----------------------------------------------------------------------
-    Write-Host '3/17 restart at every transition' -ForegroundColor Cyan
+    Write-Host '3/18 restart at every transition' -ForegroundColor Cyan
     $states = @('requestValidated', 'corpusValidated', 'recipePlanned', 'snapshotValidateOnly',
         'snapshotSealed', 'snapshotVerified', 'runSetDeclared', 'runSetVerified')
     $expectedSequence = 0
@@ -364,7 +364,7 @@ try {
             "Resuming to an already-reached '$state' advanced the sequence to $($repeat.sequence)."
     }
 
-    Write-Host '4/17 preparation reaches run-set-ready' -ForegroundColor Cyan
+    Write-Host '4/18 preparation reaches run-set-ready' -ForegroundColor Cyan
     $final = Invoke-Coordinator -RequestPath $fixture.RequestPath
     Assert-Coordinator ($final.ExitCode -eq 0) "The preparation did not reach run-set-ready (exit $($final.ExitCode)): $($final.Output)"
     $durable = Get-CoordinatorState -OutputRoot $fixture.OutputRoot
@@ -383,7 +383,7 @@ try {
         "Replaying a completed preparation advanced the sequence to $($afterReplay.sequence)."
 
     # -----------------------------------------------------------------------
-    Write-Host '5/17 audit indexes all twelve stage artifacts' -ForegroundColor Cyan
+    Write-Host '5/18 audit indexes all twelve stage artifacts' -ForegroundColor Cyan
     $auditPath = Join-Path $fixture.OutputRoot 'coordinator\audit.json'
     Assert-Coordinator (Test-Path -LiteralPath $auditPath -PathType Leaf) 'The coordinator wrote no audit.'
     $audit = Get-Content -LiteralPath $auditPath -Raw | ConvertFrom-Json -Depth 32
@@ -409,7 +409,7 @@ try {
         'The preparation observed a slot attempt.'
 
     # -----------------------------------------------------------------------
-    Write-Host '6/17 stage publication parity with the PowerShell path' -ForegroundColor Cyan
+    Write-Host '6/18 stage publication parity with the PowerShell path' -ForegroundColor Cyan
     # The same stage publication, driven directly through the existing PowerShell
     # entry point instead of through the coordinator's child process. Byte
     # identical artifacts are what makes the rollback switch real at THIS seam:
@@ -450,7 +450,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    Write-Host '7/17 request boundary: unknown, missing, scalar, null, BOM, truncated' -ForegroundColor Cyan
+    Write-Host '7/18 request boundary: unknown, missing, scalar, null, BOM, truncated' -ForegroundColor Cyan
     # Built through a list rather than an @(...) literal: the mutators set fields
     # to $null on purpose, and inside an array expression that reads as an array
     # that can carry a null element. It cannot -- the nulls are inside script
@@ -498,7 +498,7 @@ try {
         'A missing request file was not refused.'
 
     # -----------------------------------------------------------------------
-    Write-Host '8/17 stale head, stale identity and tampered state' -ForegroundColor Cyan
+    Write-Host '8/18 stale head, stale identity and tampered state' -ForegroundColor Cyan
     $staleHeadPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'stale-head' -Mutate {
         param($r)
         $r.toolkit.head = ('f' * 40)
@@ -557,7 +557,7 @@ try {
         "A state file from another correlation was adopted (exit $($foreign.ExitCode))."
 
     # -----------------------------------------------------------------------
-    Write-Host '9/17 single-run lease' -ForegroundColor Cyan
+    Write-Host '9/18 single-run lease' -ForegroundColor Cyan
     $leaseRoot = Join-Path $sandbox 'out-lease'
     $leasePath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'lease' -Mutate {
         param($r) & $setOutputRoot -Request $r -Root $leaseRoot
@@ -592,7 +592,7 @@ try {
         "An abandoned lease wedged the output root (exit $($recovered.ExitCode))."
 
     # -----------------------------------------------------------------------
-    Write-Host '10/17 child fault matrix' -ForegroundColor Cyan
+    Write-Host '10/18 child fault matrix' -ForegroundColor Cyan
     $faults = @(
         @{ Name = 'nonzero'; Expect = 4 },
         @{ Name = 'missing'; Expect = 4 },
@@ -660,7 +660,7 @@ try {
     Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot
 
     # -----------------------------------------------------------------------
-    Write-Host '11/17 killed mid-transition' -ForegroundColor Cyan
+    Write-Host '11/18 killed mid-transition' -ForegroundColor Cyan
     # A real external kill, not a cooperative halt: the coordinator is stopped
     # while a child is running, and the root must still converge.
     $killRoot = Join-Path $sandbox 'out-kill'
@@ -697,7 +697,7 @@ try {
         "The resumed preparation left $($declared.Count) declared run sets rather than one."
 
     # -----------------------------------------------------------------------
-    Write-Host '12/17 pre-commit window: a published side effect is adopted' -ForegroundColor Cyan
+    Write-Host '12/18 pre-commit window: a published side effect is adopted' -ForegroundColor Cyan
     # The fault a control plane cannot test its way out of by halting: a child
     # completes a durable, NON-REPEATABLE side effect and the coordinator dies
     # before it can commit the transition. Every --halt-after case above stops
@@ -781,7 +781,7 @@ try {
     $keptKey = Invoke-Coordinator -RequestPath $wipedPath
     Assert-Coordinator ($keptKey.ExitCode -eq 2) `
         "A run whose record was removed under a standing key exited $($keptKey.ExitCode) rather than refusing.`n$($keptKey.Output)"
-    Assert-Coordinator ($keptKey.Output -match 'signing key but no state record') `
+    Assert-Coordinator ($keptKey.Output -match 'signing key and .*, but no state record') `
         "The refusal did not name the missing record.`n$($keptKey.Output)"
     Assert-Coordinator (-not (Test-Path -LiteralPath (Join-Path $wipedRoot 'coordinator\state.json'))) `
         'The refusing run wrote a fresh record over the destroyed one.'
@@ -897,7 +897,7 @@ try {
     Assert-Coordinator (@(Get-ChildItem -LiteralPath $stageDirectory -File -Filter '*.stage.json').Count -eq 12) `
         'The retry accumulated stage artifacts instead of replacing them.'
     # -----------------------------------------------------------------------
-    Write-Host '13/17 resume integrity and the declared artifact directory' -ForegroundColor Cyan
+    Write-Host '13/18 resume integrity and the declared artifact directory' -ForegroundColor Cyan
     # A resumed run re-reads its child results from the exchange directory, which
     # carries no signature of its own. Without binding them to the digest the
     # signed record committed, a resume could adopt a snapshot or run set other
@@ -969,7 +969,7 @@ try {
         'A missing option value escaped as an unhandled exception.'
 
     # -----------------------------------------------------------------------
-    Write-Host '14/17 changed-path census boundary' -ForegroundColor Cyan
+    Write-Host '14/18 changed-path census boundary' -ForegroundColor Cyan
     # The census is declared by the caller and validated here, never synthesised.
     # Zero, one, many, duplicated, misordered, scalar, null and unknown all have
     # to have an answer, because the census reaches the published bytes.
@@ -1008,7 +1008,7 @@ try {
         'A missing changed-path census was not refused.'
 
     # -----------------------------------------------------------------------
-    Write-Host '15/17 a declaration must belong to this preparation' -ForegroundColor Cyan
+    Write-Host '15/18 a declaration must belong to this preparation' -ForegroundColor Cyan
     # A signature proves a declaration was made under this output root's key. It
     # does NOT prove the declaration is about the snapshot this run sealed - one
     # key signs every declaration in a root, so a declaration left behind by an
@@ -1104,8 +1104,47 @@ try {
             "The coordinator committed '$($binding.Target)' over a child result that contradicted its own record."
     }
 
+    # A standing declaration is adopted only when it was made for THIS
+    # qualification. Snapshot name, manifest digest and run count agreeing is not
+    # enough: two preparations can differ in repository, config, operator, commit
+    # or timeouts and still agree on all three.
+    $donorRoot = Join-Path $sandbox 'plan-donor'
+    $donorPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'plan-donor' `
+        -Mutate { param($r) & $setOutputRoot -Request $r -Root $donorRoot }.GetNewClosure()
+    Assert-Coordinator ((Invoke-Coordinator -RequestPath $donorPath -HaltAfter 'runSetDeclared').ExitCode -eq 9) `
+        'The plan-donor setup did not produce a declaration.'
+    $borrowRoot = Join-Path $sandbox 'plan-borrower'
+    $borrowPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'plan-borrower' `
+        -Mutate {
+            param($r)
+            & $setOutputRoot -Request $r -Root $borrowRoot
+            # Same snapshot, same manifest, same run count - a different operator.
+            $r.qualification.operatorAlias = 'someone-else'
+        }.GetNewClosure()
+    Assert-Coordinator ((Invoke-Coordinator -RequestPath $borrowPath -Target 'snapshotVerified').ExitCode -eq 0) `
+        'The plan-borrower setup did not reach a verified snapshot.'
+    $donorQualification = Join-Path $donorRoot 'qualification'
+    $borrowQualification = Join-Path $borrowRoot 'qualification'
+    Remove-Item -Recurse -Force -LiteralPath $borrowQualification -ErrorAction SilentlyContinue
+    Copy-Item -Recurse -Force -LiteralPath $donorQualification -Destination $borrowQualification
+    $borrowRun = Invoke-Coordinator -RequestPath $borrowPath -Target 'runSetDeclared'
+    Assert-Coordinator ($borrowRun.ExitCode -eq 4) `
+        ("A declaration made for another qualification exited $($borrowRun.ExitCode) " +
+        "rather than being refused.`n$($borrowRun.Output)")
+    $borrowLogs = @(Get-ChildItem -LiteralPath (Join-Path $borrowRoot 'coordinator\logs') -File `
+            -Filter '*-runSetDeclare.*.log')
+    $borrowResults = @(Get-ChildItem -LiteralPath (Join-Path $borrowRoot 'coordinator\exchange') -File `
+            -Filter '*-runSetDeclare.result.json' -ErrorAction SilentlyContinue)
+    $borrowReason = (@($borrowLogs + $borrowResults | ForEach-Object {
+                Get-Content -LiteralPath $_.FullName -Raw
+            })) -join "`n"
+    Assert-Coordinator ($borrowReason -match 'belongs to another preparation') `
+        "The refusal did not say the declaration was another preparation's.`n$borrowReason"
+    Assert-Coordinator ($borrowReason -match 'was made for plan') `
+        "The refusal did not name the plan the declaration was sealed under.`n$borrowReason"
+
     # -----------------------------------------------------------------------
-    Write-Host '16/17 the audit says only what the record can support' -ForegroundColor Cyan
+    Write-Host '16/18 the audit says only what the record can support' -ForegroundColor Cyan
     # An audit whose counters come from this process cannot see work an earlier
     # process did, and a null count coerces to the reassuring zero in every
     # consumer that reads it. Both are properties of the durable record here.
@@ -1140,7 +1179,104 @@ try {
         'The resumed audit did not grow its child-backed transition census.'
 
     # -----------------------------------------------------------------------
-    Write-Host '17/17 no orphans, no external writes' -ForegroundColor Cyan
+    Write-Host '17/18 a root that has done nothing is not wedged' -ForegroundColor Cyan
+    # The refusal that protects a destroyed record must not be reachable by a
+    # first attempt that simply failed. A run refused at requestValidated has
+    # published nothing, so the same root with a corrected request has to work -
+    # otherwise a mistyped digest costs an operator their output root for ever,
+    # and the earliest point of the run becomes the one place a kill is fatal.
+    $freshRoot = Join-Path $sandbox 'wedge-check'
+    $badFirst = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'wedge-check-bad' `
+        -Mutate {
+            param($r)
+            & $setOutputRoot -Request $r -Root $freshRoot
+            $r.toolkit.head = ('b' * 40)
+        }.GetNewClosure()
+    $wedgeFirst = Invoke-Coordinator -RequestPath $badFirst
+    Assert-Coordinator ($wedgeFirst.ExitCode -eq 2) `
+        "A request naming the wrong head exited $($wedgeFirst.ExitCode) rather than refusing."
+    Assert-Coordinator (-not (Test-Path -LiteralPath (Join-Path $freshRoot 'coordinator\state.json'))) `
+        'A refused first attempt still wrote a state record.'
+    $goodSecond = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'wedge-check-good' `
+        -Mutate { param($r) & $setOutputRoot -Request $r -Root $freshRoot }.GetNewClosure()
+    $wedgeSecond = Invoke-Coordinator -RequestPath $goodSecond -Target 'corpusValidated'
+    Assert-Coordinator ($wedgeSecond.ExitCode -eq 0) `
+        ("A corrected request against a root whose first attempt was refused exited " +
+        "$($wedgeSecond.ExitCode); the root is wedged.`n$($wedgeSecond.Output)")
+
+    # The refusal still fires when the root holds work, which is the case it is
+    # actually for.
+    $wipedWork = Join-Path $sandbox 'wedge-check-work'
+    $wipedWorkPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'wedge-check-work' `
+        -Mutate { param($r) & $setOutputRoot -Request $r -Root $wipedWork }.GetNewClosure()
+    Assert-Coordinator ((Invoke-Coordinator -RequestPath $wipedWorkPath -Target 'recipePlanned').ExitCode -eq 0) `
+        'The standing-work setup did not publish any stage artifacts.'
+    Remove-Item -LiteralPath (Join-Path $wipedWork 'coordinator\state.json') -Force
+    $wipedWorkRun = Invoke-Coordinator -RequestPath $wipedWorkPath
+    Assert-Coordinator ($wipedWorkRun.ExitCode -eq 2) `
+        "A destroyed record over standing work exited $($wipedWorkRun.ExitCode) rather than refusing."
+    Assert-Coordinator ($wipedWorkRun.Output -match 'signing key and .*, but no state record') `
+        "The refusal did not name the work it found.`n$($wipedWorkRun.Output)"
+
+    # The recipe is bound by content, not by path. A resume skips corpusValidated,
+    # so without this the file could be rewritten between the validation that
+    # blessed it and the seal that consumes it.
+    $recipeRoot = Join-Path $sandbox 'recipe-binding'
+    $recipeRequestPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'recipe-binding' `
+        -Mutate { param($r) & $setOutputRoot -Request $r -Root $recipeRoot }.GetNewClosure()
+    Assert-Coordinator ((Invoke-Coordinator -RequestPath $recipeRequestPath -Target 'corpusValidated').ExitCode -eq 0) `
+        'The recipe-binding setup did not validate its corpus.'
+    $recipeDocument = Get-Content -LiteralPath $recipeRequestPath -Raw | ConvertFrom-Json -Depth 24
+    $recipeFile = [string]$recipeDocument.corpus.recipePath
+    $recipeOriginal = [IO.File]::ReadAllBytes($recipeFile)
+    try {
+        $recipeText = [Text.Encoding]::UTF8.GetString($recipeOriginal)
+        [IO.File]::WriteAllBytes($recipeFile, ([Text.UTF8Encoding]::new($false)).GetBytes($recipeText + " `n"))
+        $recipeRun = Invoke-Coordinator -RequestPath $recipeRequestPath -Target 'snapshotValidateOnly'
+        Assert-Coordinator ($recipeRun.ExitCode -eq 2) `
+            "A recipe rewritten after validation exited $($recipeRun.ExitCode) rather than refusing."
+        Assert-Coordinator ($recipeRun.Output -match 'recipe .* now hashes to|changed under the preparation') `
+            "The refusal did not name the changed recipe.`n$($recipeRun.Output)"
+    }
+    finally { [IO.File]::WriteAllBytes($recipeFile, $recipeOriginal) }
+    Assert-Coordinator ((Invoke-Coordinator -RequestPath $recipeRequestPath -Target 'snapshotValidateOnly').ExitCode -eq 0) `
+        'The restored recipe did not let the preparation continue.'
+
+    # A coordinator killed from outside cannot clean up after itself, so its child
+    # outlives it. The next run must not write alongside that child.
+    $liveRoot = Join-Path $sandbox 'live-child'
+    $livePath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'live-child' `
+        -Mutate { param($r) & $setOutputRoot -Request $r -Root $liveRoot }.GetNewClosure()
+    Assert-Coordinator ((Invoke-Coordinator -RequestPath $livePath -Target 'recipePlanned').ExitCode -eq 0) `
+        'The live-child setup did not reach a planned recipe.'
+    $liveJournal = @(Get-ChildItem -LiteralPath (Join-Path $liveRoot 'coordinator\exchange') -File `
+            -Filter '*.journal.json')[0]
+    $survivor = Start-Process -FilePath 'pwsh' -PassThru -WindowStyle Hidden -ArgumentList @(
+        '-NoProfile', '-NonInteractive', '-Command', "Start-Sleep -Seconds 90 # $sandboxToken")
+    try {
+        $survivorStart = $survivor.StartTime.ToUniversalTime().ToString('O', [Globalization.CultureInfo]::InvariantCulture)
+        $liveEntry = Get-Content -LiteralPath $liveJournal.FullName -Raw | ConvertFrom-Json -Depth 16
+        $liveEntry | Add-Member -NotePropertyName 'childProcessId' -NotePropertyValue $survivor.Id -Force
+        $liveEntry | Add-Member -NotePropertyName 'childStartedAtUtc' -NotePropertyValue $survivorStart -Force
+        $liveText = (ConvertTo-Json -InputObject $liveEntry -Depth 16 -Compress:$false) + "`n"
+        [IO.File]::WriteAllBytes($liveJournal.FullName, ([Text.UTF8Encoding]::new($false)).GetBytes($liveText))
+        $liveRun = Invoke-Coordinator -RequestPath $livePath
+        Assert-Coordinator ($liveRun.ExitCode -eq 3) `
+            "A run over a still-live recorded child exited $($liveRun.ExitCode) rather than reporting a conflict."
+        Assert-Coordinator ($liveRun.Output -match 'still has a .* child') `
+            "The conflict did not name the surviving child.`n$($liveRun.Output)"
+    }
+    finally {
+        Stop-Process -Id $survivor.Id -Force -ErrorAction SilentlyContinue
+        $survivor.WaitForExit(30000) | Out-Null
+    }
+    # And once that child is gone, the same root runs again: a liveness record is
+    # a conflict while it is true and nothing at all afterwards.
+    Assert-Coordinator ((Invoke-Coordinator -RequestPath $livePath -Target 'snapshotValidateOnly').ExitCode -eq 0) `
+        'The root stayed conflicted after its recorded child exited.'
+
+    # -----------------------------------------------------------------------
+    Write-Host '18/18 no orphans, no external writes' -ForegroundColor Cyan
     Start-Sleep -Seconds 2
     $orphans = Get-DescendantPwshCount -SandboxToken $sandboxToken
     Assert-Coordinator ($orphans -eq 0) "The suite left $orphans PowerShell process(es) running."

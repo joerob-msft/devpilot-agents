@@ -108,13 +108,7 @@ internal sealed class ChildToolInvoker(CoordinatorRequest request)
         // Written even on a first attempt, because the interesting reader is the
         // resume that has to explain a missing result.
         var attempt = ReadJournalAttempt(journalPath, step, childRequestSha256) + 1;
-        CanonicalJson.WriteFileAtomic(journalPath, CanonicalJson.Readable(new MapNode()
-            .Set("contractVersion", JournalContractVersion)
-            .Set("correlationId", _request.CorrelationId)
-            .Set("step", step)
-            .Set("childRequestSha256", childRequestSha256)
-            .Set("attempt", attempt)
-            .Set("launchedAtUtc", DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture))));
+        WriteJournal(journalPath, step, childRequestSha256, attempt, null);
 
         var start = new ProcessStartInfo
         {
@@ -144,6 +138,12 @@ internal sealed class ChildToolInvoker(CoordinatorRequest request)
         try
         {
             process = Process.Start(start) ?? throw new ChildFailureException($"The '{step}' child did not start.");
+            // The child's exact identity goes into the journal the moment it
+            // exists. A coordinator killed from outside cannot clean up after
+            // itself, so this record is the only thing that can tell a later run
+            // that a writer of this output root is still alive. PID alone would
+            // not do: process ids are recycled.
+            WriteJournal(journalPath, step, childRequestSha256, attempt, process);
             process.OutputDataReceived += (_, args) => { if (args.Data is not null) { standardOut.AppendLine(args.Data); } };
             process.ErrorDataReceived += (_, args) => { if (args.Data is not null) { standardError.AppendLine(args.Data); } };
             process.BeginOutputReadLine();
@@ -188,6 +188,10 @@ internal sealed class ChildToolInvoker(CoordinatorRequest request)
                 }
                 process.Dispose();
             }
+            // The child is gone, so the journal must stop claiming a live writer.
+            // Written last, and unconditionally: a stale liveness claim would
+            // refuse every later run against this root.
+            TryClearJournalChild(journalPath, step, childRequestSha256, attempt);
         }
 
         var label = $"'{step}' child result";
@@ -292,6 +296,120 @@ internal sealed class ChildToolInvoker(CoordinatorRequest request)
             // unreadable one must not be able to stop a run.
             return 0;
         }
+    }
+
+    /// <summary>
+    /// Writes the launch journal for this step. When a process is supplied the
+    /// entry additionally records that exact child - its id AND its start time,
+    /// because process ids are recycled and an id alone would let an unrelated
+    /// process masquerade as a live writer of this output root.
+    /// </summary>
+    private void WriteJournal(string journalPath, string step, string childRequestSha256, int attempt, Process? process)
+    {
+        var entry = new MapNode()
+            .Set("contractVersion", JournalContractVersion)
+            .Set("correlationId", _request.CorrelationId)
+            .Set("step", step)
+            .Set("childRequestSha256", childRequestSha256)
+            .Set("attempt", attempt)
+            .Set("launchedAtUtc", DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture));
+        if (process is not null)
+        {
+            entry.Set("childProcessId", process.Id);
+            entry.Set("childStartedAtUtc", ProcessStartedAtUtc(process));
+        }
+        CanonicalJson.WriteFileAtomic(journalPath, CanonicalJson.Readable(entry));
+    }
+
+    private void TryClearJournalChild(string journalPath, string step, string childRequestSha256, int attempt)
+    {
+        try
+        {
+            WriteJournal(journalPath, step, childRequestSha256, attempt, null);
+        }
+        catch (IOException)
+        {
+            // The journal is a diagnostic aid. Failing to clear it must not turn a
+            // successful step into a failed one; the liveness reader below checks
+            // the recorded process itself rather than trusting the entry.
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+    }
+
+    private static string ProcessStartedAtUtc(Process process)
+    {
+        try
+        {
+            return process.StartTime.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture);
+        }
+        catch (Exception error) when (error is InvalidOperationException or System.ComponentModel.Win32Exception or NotSupportedException)
+        {
+            return string.Empty;
+        }
+    }
+
+    /// <summary>
+    /// Describes a child this output root's journals still record as running, or
+    /// null when none is. A coordinator killed from outside cannot clear its own
+    /// journal, so its child outlives it; taking the lease over the top of that
+    /// child would put two writers in one output root. Identity is the id AND the
+    /// start time together, so a recycled id is not the recorded child.
+    /// </summary>
+    internal static string? DescribeLiveRecordedChild(CoordinatorRequest request)
+    {
+        if (!Directory.Exists(request.ExchangeRoot))
+        {
+            return null;
+        }
+        foreach (var journalPath in Directory.EnumerateFiles(request.ExchangeRoot, "*.journal.json", SearchOption.TopDirectoryOnly))
+        {
+            JsonElement root;
+            try
+            {
+                root = StrictJson.ReadObjectFile(journalPath, "child step journal", maximumBytes: 64 * 1024);
+            }
+            catch (ContractException)
+            {
+                continue;
+            }
+            if (!root.TryGetProperty("childProcessId", out var idNode) || idNode.ValueKind != JsonValueKind.Number
+                || !root.TryGetProperty("childStartedAtUtc", out var startedNode) || startedNode.ValueKind != JsonValueKind.String)
+            {
+                continue;
+            }
+            var recordedStart = startedNode.GetString() ?? string.Empty;
+            if (recordedStart.Length == 0 || !idNode.TryGetInt32(out var recordedId))
+            {
+                continue;
+            }
+            Process candidate;
+            try
+            {
+                candidate = Process.GetProcessById(recordedId);
+            }
+            catch (ArgumentException)
+            {
+                continue;
+            }
+            catch (InvalidOperationException)
+            {
+                continue;
+            }
+            using (candidate)
+            {
+                if (!string.Equals(ProcessStartedAtUtc(candidate), recordedStart, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+                var step = root.TryGetProperty("step", out var stepNode) && stepNode.ValueKind == JsonValueKind.String
+                    ? stepNode.GetString()
+                    : "unknown";
+                return $"a '{step}' child (process {recordedId.ToString(CultureInfo.InvariantCulture)}, started {recordedStart}) recorded in '{Path.GetFileName(journalPath)}'";
+            }
+        }
+        return null;
     }
 
     private static void KillTree(Process process)
