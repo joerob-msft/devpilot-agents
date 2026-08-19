@@ -268,6 +268,12 @@ Nothing passes between them on a command line or through an environment variable
 that the set is reconcilable. It commits the set ID, the plan digest and the required run count,
 which must equal the declaration's planned run count of two.
 
+The one run each slot offers is found where the reviewer writes it — under
+`<slot-state>/replay/<snapshot>/convention-specialist-previews`, beside the signing key that
+opens it — and the snapshot naming that directory is the one *the plan seals*, never one read
+off the disk. A slot state directory that has replayed two snapshots therefore still offers the
+reconciliation exactly one candidate, and a sibling left by some other snapshot can never be it.
+
 **`reconciliationLaunching`** publishes the input document and commits its digest.
 
 **`reconciliationRunning`** commits the child's identity before the wait, for the reason given
@@ -617,6 +623,13 @@ comparison and the verification, and a comparison that never returns and is stop
 own deadline. The crash-consistency case that matters most is the one that kills the coordinator
 in the window after the comparison has minted its single-use attempt record: the resume must
 adopt the child it named, reach `reconciliationVerified`, and leave exactly one attempt record.
+
+Because the comparison itself is stood in, the *layout* the reconciliation reads a slot's run
+from was never exercised by any earlier case, and the first build shipped looking for it loose in
+the slot state directory. A separate case now pins that layout from both ends: the reviewer's own
+exact-path test and this adapter must agree that a replayed run lives under
+`replay/<snapshot>`, and the selection is then run against a state directory holding two
+replayed snapshots, where only the plan-sealed one may be chosen.
 
 `tools/Test-ReviewerCoordinatorContract.ps1` is the architecture boundary: it asserts that the
 coordinator sources contain no prompt, model, severity, candidate or verdict vocabulary and no

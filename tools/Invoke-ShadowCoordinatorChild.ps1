@@ -1015,10 +1015,19 @@ function Get-ShadowChildReconcileContext {
     # two would leave the comparison to choose, and a comparison that chose which
     # of a run's artifacts to believe would be making the very judgement this
     # whole path exists to keep out of the caller.
+    #
+    # A slot's artifacts are not loose in its state directory: the reviewer keeps
+    # a replayed run under 'replay/<snapshot>' so two snapshots replayed into one
+    # state directory cannot blur together. The snapshot named here is the one
+    # THE PLAN seals, not one read off the disk, so a stray sibling directory
+    # left by some other snapshot can never be the one compared. The defect this
+    # closes is a reconciliation that looked directly under the state directory,
+    # found nothing, and refused a set whose two runs had both completed.
     $artifactPaths = @()
     $keyPaths = @()
     foreach ($slot in @($plan.Slots)) {
-        $previewDirectory = Join-Path ([string]$slot.StateDir) 'convention-specialist-previews'
+        $runRoot = Join-Path (Join-Path ([string]$slot.StateDir) 'replay') ([string]$plan.Snapshot.Name)
+        $previewDirectory = Join-Path $runRoot 'convention-specialist-previews'
         $found = @()
         if (Test-Path -LiteralPath $previewDirectory -PathType Container) {
             $found = @(Get-ChildItem -LiteralPath $previewDirectory -Filter '*.json' -File -ErrorAction SilentlyContinue |
@@ -1028,7 +1037,7 @@ function Get-ShadowChildReconcileContext {
             throw ("Slot '$($slot.Name)' offers $(@($found).Count) sealed run artifact(s) under '$previewDirectory'; " +
                 'a reconciliation compares exactly one run per slot.')
         }
-        $slotKeyPath = Join-Path ([string]$slot.StateDir) 'artifact-signing.key'
+        $slotKeyPath = Join-Path $runRoot 'artifact-signing.key'
         if (-not (Test-Path -LiteralPath $slotKeyPath -PathType Leaf)) {
             throw "Slot '$($slot.Name)' has no artifact signing key at '$slotKeyPath', so its run artifact cannot be opened."
         }

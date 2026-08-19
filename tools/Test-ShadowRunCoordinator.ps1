@@ -820,7 +820,7 @@ try {
     # resolve against whatever scope happens to run the closure later.
     $setOutputRoot = ${function:Set-CoordinatorOutputRoot}
 
-    Write-Host '1/26 offline restore and build' -ForegroundColor Cyan
+    Write-Host '1/27 offline restore and build' -ForegroundColor Cyan
     $project = Join-Path $RepoRoot 'tools\ShadowRunCoordinator\ShadowRunCoordinator.csproj'
     Assert-Coordinator (Test-Path -LiteralPath $project -PathType Leaf) `
         'The shadow run coordinator project is missing.'
@@ -839,7 +839,7 @@ try {
         'The coordinator assembly was not produced.'
 
     # -----------------------------------------------------------------------
-    Write-Host '2/26 sandbox, sealed corpus and typed request' -ForegroundColor Cyan
+    Write-Host '2/27 sandbox, sealed corpus and typed request' -ForegroundColor Cyan
     Import-Module (Join-Path $RepoRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force
     . (Join-Path $RepoRoot 'src\Agents\reviewer\SourceTransport.ps1')
     . (Join-Path $RepoRoot 'src\Agents\reviewer\CorpusSeal.ps1')
@@ -856,7 +856,7 @@ try {
         'The request does not bind a prompt-asset digest.'
 
     # -----------------------------------------------------------------------
-    Write-Host '3/26 restart at every transition' -ForegroundColor Cyan
+    Write-Host '3/27 restart at every transition' -ForegroundColor Cyan
     $states = @('requestValidated', 'corpusStaging', 'corpusPublished', 'corpusValidated',
         'recipePlanned', 'snapshotValidateOnly', 'snapshotSealed', 'snapshotVerified',
         'runSetDeclared', 'runSetVerified')
@@ -884,7 +884,7 @@ try {
             "Resuming to an already-reached '$state' advanced the sequence to $($repeat.sequence)."
     }
 
-    Write-Host '4/26 preparation reaches run-set-ready' -ForegroundColor Cyan
+    Write-Host '4/27 preparation reaches run-set-ready' -ForegroundColor Cyan
     $final = Invoke-Coordinator -RequestPath $fixture.RequestPath
     Assert-Coordinator ($final.ExitCode -eq 0) "The preparation did not reach run-set-ready (exit $($final.ExitCode)): $($final.Output)"
     $durable = Get-CoordinatorState -OutputRoot $fixture.OutputRoot
@@ -913,7 +913,7 @@ try {
         "Replaying a completed preparation advanced the sequence to $($afterReplay.sequence)."
 
     # -----------------------------------------------------------------------
-    Write-Host '5/26 audit indexes all twelve stage artifacts' -ForegroundColor Cyan
+    Write-Host '5/27 audit indexes all twelve stage artifacts' -ForegroundColor Cyan
     $auditPath = Join-Path $fixture.OutputRoot 'coordinator\audit.json'
     Assert-Coordinator (Test-Path -LiteralPath $auditPath -PathType Leaf) 'The coordinator wrote no audit.'
     $audit = Get-Content -LiteralPath $auditPath -Raw | ConvertFrom-Json -Depth 32
@@ -939,7 +939,7 @@ try {
         'The preparation observed a slot attempt.'
 
     # -----------------------------------------------------------------------
-    Write-Host '6/26 stage publication parity with the PowerShell path' -ForegroundColor Cyan
+    Write-Host '6/27 stage publication parity with the PowerShell path' -ForegroundColor Cyan
     # The same stage publication, driven directly through the existing PowerShell
     # entry point instead of through the coordinator's child process. Byte
     # identical artifacts are what makes the rollback switch real at THIS seam:
@@ -980,7 +980,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    Write-Host '7/26 request boundary: unknown, missing, scalar, null, BOM, truncated' -ForegroundColor Cyan
+    Write-Host '7/27 request boundary: unknown, missing, scalar, null, BOM, truncated' -ForegroundColor Cyan
     # Built through a list rather than an @(...) literal: the mutators set fields
     # to $null on purpose, and inside an array expression that reads as an array
     # that can carry a null element. It cannot -- the nulls are inside script
@@ -1028,7 +1028,7 @@ try {
         'A missing request file was not refused.'
 
     # -----------------------------------------------------------------------
-    Write-Host '8/26 stale head, stale identity and tampered state' -ForegroundColor Cyan
+    Write-Host '8/27 stale head, stale identity and tampered state' -ForegroundColor Cyan
     $staleHeadPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'stale-head' -Mutate {
         param($r)
         $r.toolkit.head = ('f' * 40)
@@ -1087,7 +1087,7 @@ try {
         "A state file from another correlation was adopted (exit $($foreign.ExitCode))."
 
     # -----------------------------------------------------------------------
-    Write-Host '9/26 single-run lease' -ForegroundColor Cyan
+    Write-Host '9/27 single-run lease' -ForegroundColor Cyan
     $leaseRoot = Join-Path $sandbox 'out-lease'
     $leasePath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'lease' -Mutate {
         param($r) & $setOutputRoot -Request $r -Root $leaseRoot
@@ -1122,7 +1122,7 @@ try {
         "An abandoned lease wedged the output root (exit $($recovered.ExitCode))."
 
     # -----------------------------------------------------------------------
-    Write-Host '10/26 child fault matrix' -ForegroundColor Cyan
+    Write-Host '10/27 child fault matrix' -ForegroundColor Cyan
     $faults = @(
         @{ Name = 'nonzero'; Expect = 4 },
         @{ Name = 'missing'; Expect = 4 },
@@ -1190,7 +1190,7 @@ try {
     Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot
 
     # -----------------------------------------------------------------------
-    Write-Host '11/26 killed mid-transition' -ForegroundColor Cyan
+    Write-Host '11/27 killed mid-transition' -ForegroundColor Cyan
     # A real external kill, not a cooperative halt: the coordinator is stopped
     # while a child is running, and the root must still converge.
     $killRoot = Join-Path $sandbox 'out-kill'
@@ -1227,7 +1227,7 @@ try {
         "The resumed preparation left $($declared.Count) declared run sets rather than one."
 
     # -----------------------------------------------------------------------
-    Write-Host '12/26 pre-commit window: a published side effect is adopted' -ForegroundColor Cyan
+    Write-Host '12/27 pre-commit window: a published side effect is adopted' -ForegroundColor Cyan
     # The fault a control plane cannot test its way out of by halting: a child
     # completes a durable, NON-REPEATABLE side effect and the coordinator dies
     # before it can commit the transition. Every --halt-after case above stops
@@ -1427,7 +1427,7 @@ try {
     Assert-Coordinator (@(Get-ChildItem -LiteralPath $stageDirectory -File -Filter '*.stage.json').Count -eq 12) `
         'The retry accumulated stage artifacts instead of replacing them.'
     # -----------------------------------------------------------------------
-    Write-Host '13/26 resume integrity and the declared artifact directory' -ForegroundColor Cyan
+    Write-Host '13/27 resume integrity and the declared artifact directory' -ForegroundColor Cyan
     # A resumed run re-reads its child results from the exchange directory, which
     # carries no signature of its own. Without binding them to the digest the
     # signed record committed, a resume could adopt a snapshot or run set other
@@ -1499,7 +1499,7 @@ try {
         'A missing option value escaped as an unhandled exception.'
 
     # -----------------------------------------------------------------------
-    Write-Host '14/26 changed-path census boundary' -ForegroundColor Cyan
+    Write-Host '14/27 changed-path census boundary' -ForegroundColor Cyan
     # The census is declared by the caller and validated here, never synthesised.
     # Zero, one, many, duplicated, misordered, scalar, null and unknown all have
     # to have an answer, because the census reaches the published bytes.
@@ -1538,7 +1538,7 @@ try {
         'A missing changed-path census was not refused.'
 
     # -----------------------------------------------------------------------
-    Write-Host '15/26 a declaration must belong to this preparation' -ForegroundColor Cyan
+    Write-Host '15/27 a declaration must belong to this preparation' -ForegroundColor Cyan
     # A signature proves a declaration was made under this output root's key. It
     # does NOT prove the declaration is about the snapshot this run sealed - one
     # key signs every declaration in a root, so a declaration left behind by an
@@ -1674,7 +1674,7 @@ try {
         "The refusal did not name the plan the declaration was sealed under.`n$borrowReason"
 
     # -----------------------------------------------------------------------
-    Write-Host '16/26 the audit says only what the record can support' -ForegroundColor Cyan
+    Write-Host '16/27 the audit says only what the record can support' -ForegroundColor Cyan
     # An audit whose counters come from this process cannot see work an earlier
     # process did, and a null count coerces to the reassuring zero in every
     # consumer that reads it. Both are properties of the durable record here.
@@ -1709,7 +1709,7 @@ try {
         'The resumed audit did not grow its child-backed transition census.'
 
     # -----------------------------------------------------------------------
-    Write-Host '17/26 a root that has done nothing is not wedged' -ForegroundColor Cyan
+    Write-Host '17/27 a root that has done nothing is not wedged' -ForegroundColor Cyan
     # The refusal that protects a destroyed record must not be reachable by a
     # first attempt that simply failed. A run refused at requestValidated has
     # published nothing, so the same root with a corrected request has to work -
@@ -1851,7 +1851,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    Write-Host '18/26 slot authorization against the real qualification plan' -ForegroundColor Cyan
+    Write-Host '18/27 slot authorization against the real qualification plan' -ForegroundColor Cyan
     # The one slot scenario that stands NOTHING in. The plan is built by the
     # production builder, bound to the signed declaration by the production
     # assertions, and the launch token is the one the declaration published. It
@@ -1980,7 +1980,7 @@ try {
         'Authorizing a launch created a run directory.'
 
     # -----------------------------------------------------------------------
-    Write-Host '19/26 one supervised slot, halted and resumed at every slot state' -ForegroundColor Cyan
+    Write-Host '19/27 one supervised slot, halted and resumed at every slot state' -ForegroundColor Cyan
     $slotStates = @('slot1Authorized', 'slot1Launching', 'slot1Running', 'slot1TerminalObserved')
     $lifecycleRoot = Join-Path $sandbox 'slot-lifecycle'
     $lifecyclePath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'slot-lifecycle' `
@@ -2171,7 +2171,7 @@ try {
     finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
 
     # -----------------------------------------------------------------------
-    Write-Host '20/26 slot terminal endings and the slot fault matrix' -ForegroundColor Cyan
+    Write-Host '20/27 slot terminal endings and the slot fault matrix' -ForegroundColor Cyan
     # Every case gets its own output root, because a slot's launch authorization
     # is single-use and a root that has spent it can never be reused.
     $slotCases = @(
@@ -2286,7 +2286,7 @@ try {
     finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
 
     # -----------------------------------------------------------------------
-    Write-Host '21/26 typed corpus staging from an immutable source' -ForegroundColor Cyan
+    Write-Host '21/27 typed corpus staging from an immutable source' -ForegroundColor Cyan
     # A SECOND sandbox, whose corpus is built as a read-only source and whose
     # request names a corpus root that does not exist. This is the condition the
     # preparation this slice replaces died on, made ordinary.
@@ -2400,7 +2400,7 @@ try {
         'Replaying a staged preparation rewrote the published corpus.'
 
     # -----------------------------------------------------------------------
-    Write-Host '22/26 corpus staging fault matrix' -ForegroundColor Cyan
+    Write-Host '22/27 corpus staging fault matrix' -ForegroundColor Cyan
     $stageInputs = Split-Path ([string]$stageFixture.StageRequestPath) -Parent
     $faultRoot = Join-Path $sandbox 'stage-faults'
     [void](New-Item -ItemType Directory -Force -Path $faultRoot)
@@ -2786,7 +2786,7 @@ try {
         "The contested staging left $($raceResidue.Count) staging director(ies) behind."
 
     # -----------------------------------------------------------------------
-    Write-Host '23/26 two declared slots, in order, and the opaque reconciliation' -ForegroundColor Cyan
+    Write-Host '23/27 two declared slots, in order, and the opaque reconciliation' -ForegroundColor Cyan
     # No model anywhere in this section. Preparation is real, the declaration is
     # real and signed, both slots are declared before either runs, and only the
     # execution and the comparison are stood in for. What is under test is the
@@ -2980,7 +2980,7 @@ try {
     finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
 
     # -----------------------------------------------------------------------
-    Write-Host '24/26 a failed slot closes the set' -ForegroundColor Cyan
+    Write-Host '24/27 a failed slot closes the set' -ForegroundColor Cyan
     # A slot that ends unsuccessfully is a durable ending, and everything that
     # would have followed it is refused rather than skipped. Both orderings are
     # exercised: slot1 failing before slot2 is authorized, and slot2 failing
@@ -3035,7 +3035,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    Write-Host '25/26 reconciliation fault matrix' -ForegroundColor Cyan
+    Write-Host '25/27 reconciliation fault matrix' -ForegroundColor Cyan
     # Each case gets a fresh root, because a reconciliation is authorized once
     # and consumed when it is attempted.
     $reconcileCases = @(
@@ -3254,7 +3254,58 @@ try {
     finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
 
     # -----------------------------------------------------------------------
-    Write-Host '26/26 no orphans, no external writes' -ForegroundColor Cyan
+    Write-Host '26/27 the reconciliation reads a slot run where the reviewer writes it' -ForegroundColor Cyan
+    # The comparison is stubbed everywhere else in this suite, which is exactly
+    # how a reconciliation shipped that looked for each slot's sealed run loose
+    # in the slot state directory. The reviewer does not write it there: a
+    # replayed run lands under 'replay/<snapshot>', so the set that had both
+    # runs complete was refused for offering zero artifacts. Two independent
+    # readers must agree on that layout, and this asserts they do rather than
+    # trusting one of them.
+    $exactPathTool = Join-Path $RepoRoot 'tools\Test-ReviewerExactPath.ps1'
+    $childAdapterPath = Join-Path $RepoRoot 'tools\Invoke-ShadowCoordinatorChild.ps1'
+    Assert-Coordinator (Test-Path -LiteralPath $exactPathTool -PathType Leaf) `
+        'The exact-path test, which is the other reader of a replayed run layout, is missing.'
+    $exactPathText = [IO.File]::ReadAllText($exactPathTool)
+    $adapterText = [IO.File]::ReadAllText($childAdapterPath)
+    Assert-Coordinator ($exactPathText -match 'replay\\synthetic-pr') `
+        'The exact-path test no longer pins a replayed run under replay/<snapshot>; the layout this section guards has moved.'
+    Assert-Coordinator ($adapterText -match [regex]::Escape("Join-Path (Join-Path ([string]`$slot.StateDir) 'replay') ([string]`$plan.Snapshot.Name)")) `
+        'The reconciliation no longer derives a slot run root from the plan-sealed snapshot under replay/.'
+    Assert-Coordinator ($adapterText -notmatch [regex]::Escape("Join-Path ([string]`$slot.StateDir) 'convention-specialist-previews'")) `
+        'The reconciliation reads a slot artifact directly out of a state directory, where the reviewer never writes one.'
+    Assert-Coordinator ($adapterText -notmatch [regex]::Escape("Join-Path ([string]`$slot.StateDir) 'artifact-signing.key'")) `
+        'The reconciliation reads a slot signing key directly out of a state directory, where the reviewer never writes one.'
+    # The layout is not just asserted in prose: build the shape the reviewer
+    # produces and the shape it does not, and require the adapter's own
+    # expression to select the first and reject the second.
+    $layoutRoot = Join-Path $sandbox 'reconcile-layout'
+    $layoutState = Join-Path $layoutRoot 'slot1-state'
+    $layoutRun = Join-Path (Join-Path $layoutState 'replay') 'snap-a'
+    $layoutDecoy = Join-Path (Join-Path $layoutState 'replay') 'snap-b'
+    foreach ($directory in @((Join-Path $layoutRun 'convention-specialist-previews'),
+            (Join-Path $layoutDecoy 'convention-specialist-previews'))) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+    Set-Content -LiteralPath (Join-Path $layoutRun 'convention-specialist-previews\run.json') -Value '{}' -Encoding utf8NoBOM
+    Set-Content -LiteralPath (Join-Path $layoutRun 'artifact-signing.key') -Value 'raw:AAAA' -Encoding utf8NoBOM
+    Set-Content -LiteralPath (Join-Path $layoutDecoy 'convention-specialist-previews\run.json') -Value '{}' -Encoding utf8NoBOM
+    $slot = [pscustomobject]@{ Name = 'slot1'; StateDir = $layoutState }
+    $plan = [pscustomobject]@{ Snapshot = [pscustomobject]@{ Name = 'snap-a' } }
+    $selectedRoot = Join-Path (Join-Path ([string]$slot.StateDir) 'replay') ([string]$plan.Snapshot.Name)
+    $selected = @(Get-ChildItem -LiteralPath (Join-Path $selectedRoot 'convention-specialist-previews') `
+            -Filter '*.json' -File | ForEach-Object { $_.FullName })
+    Assert-Coordinator (@($selected).Count -eq 1) `
+        "The plan-sealed snapshot did not select exactly one slot run artifact (found $(@($selected).Count))."
+    Assert-Coordinator (@($selected)[0] -clike "*snap-a*") `
+        'The plan-sealed snapshot selected a run belonging to a different snapshot.'
+    Assert-Coordinator (Test-Path -LiteralPath (Join-Path $selectedRoot 'artifact-signing.key') -PathType Leaf) `
+        'The signing key does not sit beside the run the reconciliation opens.'
+    Assert-Coordinator (-not (Test-Path -LiteralPath (Join-Path $layoutState 'convention-specialist-previews'))) `
+        'The layout this case builds is not the layout the defect assumed, so it would not have caught it.'
+
+    # -----------------------------------------------------------------------
+    Write-Host '27/27 no orphans, no external writes' -ForegroundColor Cyan
     Start-Sleep -Seconds 2
     $orphans = Get-DescendantPwshCount -SandboxToken $sandboxToken
     Assert-Coordinator ($orphans -eq 0) "The suite left $orphans PowerShell process(es) running."
