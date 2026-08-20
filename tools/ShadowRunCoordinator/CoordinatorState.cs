@@ -459,6 +459,7 @@ internal sealed class CoordinatorState
         {
             throw new ContractException($"A transition to '{PreparationStateNames.ToName(next)}' from '{PreparationStateNames.ToName(State)}' skips a state; the machine only moves one step at a time.");
         }
+        var previousState = State;
         Sequence++;
         State = next;
         _transitions.Add(new TransitionRecord(
@@ -468,7 +469,23 @@ internal sealed class CoordinatorState
             CanonicalJson.Sha256HexOfText(CanonicalJson.Canonical(evidence)),
             detail,
             evidence));
-        Save(request, key);
+        try
+        {
+            Save(request, key);
+        }
+        catch
+        {
+            // The record never reached the disk, so this object stops claiming it
+            // did. Without the rollback the transition survives in memory, and
+            // anything that reads this state on the way out - the audit, above
+            // all - would describe and sign a transition the durable record does
+            // not contain. The audit is allowed to lag the state; it is never
+            // allowed to lead it.
+            _transitions.RemoveAt(_transitions.Count - 1);
+            State = previousState;
+            Sequence--;
+            throw;
+        }
     }
 
     internal void Save(CoordinatorRequest request, byte[] key)

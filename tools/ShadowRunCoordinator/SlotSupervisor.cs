@@ -135,12 +135,13 @@ internal sealed record SlotLaunch(
 /// exit code, a disposition, times - and the artifact the PowerShell owner wrote
 /// remains the only statement about what the run means.
 /// </remarks>
-internal sealed class SlotSupervisor(CoordinatorRequest request)
+internal sealed class SlotSupervisor(CoordinatorRequest request, LaunchLedger ledger)
 {
     /// <summary>How often the supervisor looks at a child it is watching.</summary>
     private const int PollMilliseconds = 500;
 
     private readonly CoordinatorRequest _request = request;
+    private readonly LaunchLedger _ledger = ledger;
     private readonly StringBuilder _standardOut = new();
     private readonly StringBuilder _standardError = new();
     private Process? _process;
@@ -214,26 +215,99 @@ internal sealed class SlotSupervisor(CoordinatorRequest request)
         start.ArgumentList.Add("-RequestPath");
         start.ArgumentList.Add(requestPath);
 
+        // The supervised launch is the one this coordinator can least afford to
+        // repeat: the authorization is single-use and the owner mints its attempt
+        // record before it works. So the intent goes down first here for exactly
+        // the reason it does for a short step, and it matters more.
+        var intent = _ledger.Open(step, childRequestSha256, start, requestPath, resultPath);
+
         LaunchCount++;
-        var process = Process.Start(start) ?? throw new ChildFailureException($"The '{step}' supervised child did not start.");
+        Process process;
+        try
+        {
+            process = Process.Start(start) ?? throw new ChildFailureException($"The '{step}' supervised child did not start.");
+        }
+        catch (Exception error)
+        {
+            _ledger.RecordNotStarted(intent, error.Message);
+            throw;
+        }
         _process = process;
         // The start time is half of the child's identity: without it the journal
         // records nothing a later run can recognise, and a resumed run would have
         // only a process id, which the operating system reuses. A child that
         // cannot be identified cannot be supervised across a restart, so it is
         // stopped here rather than left running unowned.
-        var startedAtUtc = ChildJournal.StartedAtUtc(process);
-        if (startedAtUtc.Length == 0)
+        //
+        // Everything between the start and the journal write is guarded, because a
+        // fault in any of it leaves a supervised reviewer already running against
+        // this output root with nothing holding it. A ledger write can fail on a
+        // full disk or a locked directory as readily as anything else, and letting
+        // that escape would trade a recorded child for an unowned one - the exact
+        // outcome the unidentifiable-child branch below kills a child to avoid.
+        string startedAtUtc;
+        try
         {
+            startedAtUtc = ChildJournal.StartedAtUtc(process);
+            // Recorded before the identity is judged, so that even a child whose
+            // start time this account cannot read is named by its process id in
+            // the ledger rather than disappearing into the unknown case.
+            _ledger.RecordStart(intent, process);
+        }
+        catch
+        {
+            var tornDown = false;
             try
             {
                 ChildJournal.KillTree(process, ChildToolInvoker.DrainMilliseconds);
+                tornDown = process.HasExited;
+            }
+            catch
+            {
+                tornDown = false;
             }
             finally
             {
                 process.Dispose();
                 _process = null;
                 ChildJournal.TryClearChild(journalPath, _request.CorrelationId, step, childRequestSha256, attempt);
+                if (tornDown)
+                {
+                    _ledger.Close(step, "unrecorded", "the child's identity could not be recorded, so it was stopped");
+                }
+                else
+                {
+                    _ledger.Abandon(step, "the child's identity could not be recorded and its tree could not be confirmed stopped");
+                }
+            }
+            throw;
+        }
+        if (startedAtUtc.Length == 0)
+        {
+            var stopped = false;
+            try
+            {
+                ChildJournal.KillTree(process, ChildToolInvoker.DrainMilliseconds);
+                stopped = process.HasExited;
+            }
+            finally
+            {
+                process.Dispose();
+                _process = null;
+                ChildJournal.TryClearChild(journalPath, _request.CorrelationId, step, childRequestSha256, attempt);
+                // Only a confirmed exit closes this. A child with no readable
+                // start time is one no later run can recognise, so if the kill
+                // could not be confirmed there is a supervised writer of this
+                // output root that nothing can name - and 'closed' would tell the
+                // next run it may start a second one.
+                if (stopped)
+                {
+                    _ledger.Close(step, "unidentifiable", "the child's start time could not be read, so it was stopped");
+                }
+                else
+                {
+                    _ledger.Abandon(step, "the child's start time could not be read and its tree could not be confirmed stopped");
+                }
             }
             throw new ChildFailureException(
                 $"The '{step}' supervised child started as process {process.Id.ToString(CultureInfo.InvariantCulture)} but its start time could not be read, so it could not be identified after a restart. It was stopped.");
@@ -304,6 +378,10 @@ internal sealed class SlotSupervisor(CoordinatorRequest request)
         var disposition = SlotObservation.Exited;
         var killed = false;
         var exitCode = -1;
+        // A child this run never held a handle for - one it adopted and then
+        // observed vanish - has no exit to wait on here, so the teardown below
+        // asks the operating system instead of assuming either answer.
+        var exited = true;
 
         try
         {
@@ -356,14 +434,49 @@ internal sealed class SlotSupervisor(CoordinatorRequest request)
                     // asynchronous reader can still be appending to is a data race,
                     // and this path must not turn a supervised timeout into a crash.
                     _process.WaitForExit(ChildToolInvoker.DrainMilliseconds);
+                    exited = _process.HasExited;
                     WriteLogs(launch);
                     _process.Dispose();
                     _process = null;
+                }
+                else
+                {
+                    // The adopted child - the resumed-run path, where this process
+                    // never held a handle. Every deadline kill above went through
+                    // ChildJournal.KillTree, which is best effort and returns
+                    // quietly whether or not the tree went, so 'stopped it' is not
+                    // an answer this can take from its own call. The process table
+                    // is asked instead, over the recorded identity, which is the
+                    // same question a later run would ask. Without this the one
+                    // path that needs 'abandoned' - a supervised reviewer that
+                    // survived a kill on a root this run is about to declare
+                    // closed - could never reach it.
+                    exited = !ChildJournal.IsAlive(
+                        new RecordedChild(launch.Step, launch.ProcessId, launch.StartedAtUtc, launch.JournalPath));
                 }
             }
             finally
             {
                 ChildJournal.TryClearChild(launch.JournalPath, _request.CorrelationId, launch.Step, launch.ChildRequestSha256, launch.Attempt);
+                // Addressed by step rather than by handle, because a resumed run
+                // is closing an intent a PREVIOUS process opened. That is the case
+                // that would otherwise leave a supervised launch open forever and
+                // wedge every later run against this root. A tree this run could
+                // not confirm stopped is recorded as abandoned instead: the slot
+                // authorization is single-use, so re-authorizing it over a child
+                // that may still be alive is the worst outcome available here.
+                if (exited)
+                {
+                    _ledger.Close(launch.Step, disposition, killed ? "the supervisor stopped the child on a plan deadline" : "the child was observed to stop");
+                }
+                else
+                {
+                    _ledger.Abandon(
+                        launch.Step,
+                        killed
+                            ? "the supervisor stopped the child on a plan deadline and its tree could not be confirmed stopped"
+                            : "the supervisor could not confirm the child's tree had stopped");
+                }
             }
         }
 

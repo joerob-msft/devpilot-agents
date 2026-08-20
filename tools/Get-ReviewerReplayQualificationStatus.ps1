@@ -301,6 +301,7 @@ if ($declarationSummary -and $declarationSummary.PSObject.Properties["plannedRun
 # yields false with an explicit reason. Without the full plan inputs the tool
 # never claims readiness; it only ever exposes the unauthenticated evidence view.
 $reconciliationReason = ""
+$declarationFaultCode = ""
 $declarationCorrupt = $false
 $gateReconciliationReady = $false
 if ($parityMode -and $declarationSummary -and -not $declarationSummary.PSObject.Properties["error"]) {
@@ -327,6 +328,7 @@ if ($parityMode -and $declarationSummary -and -not $declarationSummary.PSObject.
     catch {
         $declarationVerified = $false
         $reconciliationReason = $_.Exception.Message
+        $declarationFaultCode = Get-ReviewerQualificationFaultCode -ErrorRecord $_
     }
     $statusPlan = $null
     try {
@@ -352,6 +354,10 @@ if ($parityMode -and $declarationSummary -and -not $declarationSummary.PSObject.
         # priority as the reported reason.
         if (-not $reconciliationReason) {
             $reconciliationReason = "plan reconstruction failed: $($_.Exception.Message)"
+            # Never a statement about the published set. The plan could not be
+            # rebuilt from the CALLER's inputs; the bytes on disk were not even
+            # consulted, so nothing here can say whether they are sound.
+            $declarationFaultCode = $script:ReviewerQualificationPlanReconstructionFaultCode
         }
     }
     if ($statusPlan) {
@@ -364,17 +370,26 @@ if ($parityMode -and $declarationSummary -and -not $declarationSummary.PSObject.
             $gateReconciliationReady = $true
         }
         catch {
-            if (-not $reconciliationReason) { $reconciliationReason = $_.Exception.Message }
+            if (-not $reconciliationReason) {
+                $reconciliationReason = $_.Exception.Message
+                $declarationFaultCode = Get-ReviewerQualificationFaultCode -ErrorRecord $_
+            }
         }
     }
-    # A truncated/tampered declaration (signature verification failed), or a
-    # published set missing/malforming its launch-authorization token inventory,
-    # is classified explicitly as a CORRUPT published set: not reconcilable, not
-    # launchable, never silently valid. A plan mismatch (wrong count/snapshot) or
-    # a merely incomplete set (a slot not yet run) is NOT corrupt - those reasons
-    # are deliberately excluded so corruption is not over-reported.
-    $declarationCorrupt = [bool]($reconciliationReason -match `
-            'did not verify|verification failed|no manifest|corrupt|tampered|missing its launch-authorization|token .*is malformed')
+    # A truncated/tampered declaration, or a published set missing/malforming its
+    # launch-authorization token inventory, is classified explicitly as a CORRUPT
+    # published set: not reconcilable, not launchable, never silently valid. A
+    # plan mismatch (wrong count/snapshot) or a merely incomplete set (a slot not
+    # yet run) is NOT corrupt, so corruption is not over-reported.
+    #
+    # The verdict is read off the TYPED CODE the refusal carried, never off its
+    # text. Matching words in a message made the answer depend on strings this
+    # tool does not own: the qualification root's absolute path is interpolated
+    # into several of these messages, so a perfectly healthy set published under
+    # C:\repro\corrupt-declaration\ reported itself corrupt, and a reworded
+    # message would have stopped reporting a genuinely corrupt one. A code cannot
+    # be produced by a directory name.
+    $declarationCorrupt = Test-ReviewerQualificationCorruptFaultCode -Code $declarationFaultCode
     if ($declarationSummary.PSObject.Properties["signatureVerified"]) {
         $declarationSummary.signatureVerified = $declarationVerified
     }
@@ -408,6 +423,7 @@ $status = [pscustomobject][ordered]@{
     parityMode          = $parityMode
     signatureUnverified = (-not $declarationVerified)
     declarationCorrupt  = $declarationCorrupt
+    declarationFaultCode = $declarationFaultCode
     reconciliationReady = $reconciliationReady
     reconciliationReason = $reconciliationReason
     unexpectedSlots     = @($unexpectedSlots)
