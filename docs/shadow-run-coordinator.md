@@ -599,7 +599,10 @@ output root can encode the subject it was taken over, so the index publishes a c
 
 The word the cohort publishes about itself is committed into the signed journal *before* the index
 is written, so the two can never disagree and a kill between them leaves a record the next rebuild
-reproduces exactly.
+reproduces exactly. That commit is not covered by the leniency that lets a failed index write pass:
+the index is a report and can be rewritten from the journal, but a cohort that could not write down
+what it published has not published it, and letting that failure pass would mean exiting
+successfully while the record still said something else.
 
 `--rebuild-index` reconstructs it from the journal and the per-entry audits alone, launching
 nothing, which is what makes the index evidence rather than a log the runner happened to keep. The
@@ -614,11 +617,24 @@ for one.
 
 Because a resume has to find the same record, the journal root and the index path are declared as
 fully qualified absolute paths — rooted is not enough, since a drive-relative path is rooted and
-still resolves against the current directory. The index may not be declared over the journal, the
-journal key, the lease, the intent or log roots, any entry's request, or anywhere inside an entry's
-output root: the index is rewritten on every publish, including while the walk is still going, so
-declaring it over the record it is derived from would destroy that record before anyone read
-either.
+still resolves against the current directory. Every entry path is held to the same rule for a
+sharper reason: the child preparation is started with its working directory set to the toolkit
+checkout, so a relative output root would be checked by the parent against one directory and
+written by the child into another, and the parent would find nothing where the evidence belongs.
+The index may not be declared over the journal, the journal key, the lease, the intent or log
+roots, the manifest itself, any entry's request, any declared rule bundle, or anywhere inside an
+entry's output root: the index is rewritten on every publish, including before the entries are
+verified, so declaring it over the record it is derived from would destroy that record before
+anyone read either.
+
+**A completion is a claim, and a claim needs an account.** A preparation that exits cleanly has
+published its audit; that is what exiting cleanly means here. An entry that reports completion with
+nothing standing where its evidence belongs is refused (exit 11) rather than summarized as a
+preparation that ran and consumed nothing — a completed entry with no evidence, no model starts and
+no write counters is indistinguishable in the index from a cohort that genuinely cost nothing, and
+it cannot support the zero-write claim the whole cohort is run under. A preparation that faulted
+before it could write anything is a different case and keeps its absence, because nothing is being
+claimed on its behalf.
 
 Rolling the cohort back is not running it. The single-request mode is unchanged, the PowerShell
 preparation path is unchanged, and a cohort of one entry is a preparation with a journal around it.

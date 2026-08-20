@@ -170,7 +170,7 @@ internal sealed record CohortManifest
             Entries = entries,
             ManifestSha256 = CanonicalJson.Sha256Hex(bytes)
         };
-        RequireIndexIsolated(manifest, label);
+        RequireIndexIsolated(manifest, label, path);
         return manifest;
     }
 
@@ -181,12 +181,16 @@ internal sealed record CohortManifest
     /// <remarks>
     /// The index is the one file this runner replaces wholesale on every publish,
     /// and it is published repeatedly, including while the walk is still going. An
-    /// index declared over the journal, the journal's key, the lease, a sealed
-    /// request or an entry's output root would therefore destroy the very record
-    /// the index claims to be derived from, and the destruction would happen
-    /// before anyone read either.
+    /// index declared over the journal, the journal's key, the lease, the manifest
+    /// itself, a sealed request, a declared rule bundle or an entry's output root
+    /// would therefore destroy the very record the index claims to be derived
+    /// from, and the destruction would happen before anyone read either. The
+    /// manifest and the rule bundles matter as much as the journal here: the first
+    /// publish happens before the entries are verified, so an index declared over
+    /// one of them would be checked against a file this runner had already
+    /// overwritten.
     /// </remarks>
-    private static void RequireIndexIsolated(CohortManifest manifest, string label)
+    private static void RequireIndexIsolated(CohortManifest manifest, string label, string manifestPath)
     {
         var index = NormalizeRoot(manifest.IndexPath);
         foreach (var (path, what) in new[]
@@ -195,7 +199,8 @@ internal sealed record CohortManifest
             (manifest.JournalKeyPath, "the cohort journal's signing key"),
             (manifest.LeasePath, "the cohort lease"),
             (manifest.IntentRoot, "the cohort intent root"),
-            (manifest.LogRoot, "the cohort log root")
+            (manifest.LogRoot, "the cohort log root"),
+            (manifestPath, "this manifest")
         })
         {
             if (string.Equals(index, NormalizeRoot(path), StringComparison.OrdinalIgnoreCase))
@@ -219,6 +224,12 @@ internal sealed record CohortManifest
             {
                 throw new ContractException(
                     $"The {label} declares its audit index at '{manifest.IndexPath}', which is entry '{entry.EntryId}'s sealed request.");
+            }
+            if (string.Equals(index, NormalizeRoot(entry.RuleBundlePath), StringComparison.OrdinalIgnoreCase))
+            {
+                throw new ContractException(
+                    $"The {label} declares its audit index at '{manifest.IndexPath}', which is the rule bundle declaration entry " +
+                    $"'{entry.EntryId}' is pinned to. A bundle overwritten by the first publish is a bundle no entry could be verified against.");
             }
         }
     }
@@ -385,21 +396,24 @@ internal sealed record CohortManifest
     /// A relative path resolves against whatever directory the process happened
     /// to start in, so the same manifest run twice from two places would write two
     /// journals and two indexes - and a resume pointed at the wrong one would read
-    /// an empty journal and start entries that already ran. Rooted is not enough:
-    /// on Windows both a drive-relative path and a root-relative one are rooted
-    /// and still resolve against the current directory. The manifest has to say
-    /// where its own record lives, absolutely, or it is not a resumable record.
-    /// The value is returned fully resolved so that everything downstream compares
-    /// the same string.
+    /// an empty journal and start entries that already ran. The entry paths are
+    /// held to the same rule for a sharper reason: the child preparation is
+    /// started with its working directory set to the toolkit checkout, so a
+    /// relative output root would be validated by the parent against one directory
+    /// and written by the child into another. Rooted is not enough: on Windows both
+    /// a drive-relative path and a root-relative one are rooted and still resolve
+    /// against the current directory. The value is returned fully resolved so that
+    /// everything downstream compares the same string.
     /// </remarks>
-    private static string RequireRootedPath(string path, string field, string label)
+    internal static string RequireRootedPath(string path, string field, string label)
     {
         if (!Path.IsPathFullyQualified(path))
         {
             throw new ContractException(
-                $"The {label} declares a {field} '{path}' that is not fully qualified. Where a cohort's own record lives cannot depend " +
+                $"The {label} declares a {field} '{path}' that is not fully qualified. Where a cohort reads and writes cannot depend " +
                 "on which directory or which drive a run was started from, because a resume that read a different journal would start " +
-                "entries that already ran. Declare a fully qualified absolute path.");
+                "entries that already ran, and a child started elsewhere would publish its evidence somewhere nobody looks. " +
+                "Declare a fully qualified absolute path.");
         }
         return Path.GetFullPath(path);
     }
@@ -727,9 +741,9 @@ internal sealed record CohortEntry
         {
             Ordinal = ordinal,
             EntryId = entryId,
-            RequestPath = StrictJson.RequireString(request, "path", label + " request"),
+            RequestPath = CohortManifest.RequireRootedPath(StrictJson.RequireString(request, "path", label + " request"), "request path", label),
             RequestSha256 = StrictJson.RequireHex(request, "sha256", label + " request", 64),
-            OutputRoot = StrictJson.RequireString(output, "root", label + " output"),
+            OutputRoot = CohortManifest.RequireRootedPath(StrictJson.RequireString(output, "root", label + " output"), "output root", label),
             Organization = StrictJson.RequireString(subject, "organization", label + " subject"),
             Project = StrictJson.RequireString(subject, "project", label + " subject"),
             Repository = StrictJson.RequireString(subject, "repository", label + " subject"),
@@ -742,7 +756,7 @@ internal sealed record CohortEntry
             PromptSha256 = StrictJson.RequireHex(digests, "promptSha256", label + " digests", 64),
             SchemaSha256 = StrictJson.RequireHex(digests, "schemaSha256", label + " digests", 64),
             RuleBundleSourceKind = StrictJson.RequireString(ruleBundle, "sourceKind", label + " ruleBundle"),
-            RuleBundlePath = StrictJson.RequireString(ruleBundle, "declarationPath", label + " ruleBundle"),
+            RuleBundlePath = CohortManifest.RequireRootedPath(StrictJson.RequireString(ruleBundle, "declarationPath", label + " ruleBundle"), "rule bundle declaration path", label),
             RuleBundleSha256 = StrictJson.RequireHex(ruleBundle, "declarationSha256", label + " ruleBundle", 64),
             EstimatedModelStarts = StrictJson.RequireInt(estimate, "modelStarts", label + " planEstimate", 0, 1024),
             EstimatedVerifierAssignments = StrictJson.RequireInt(estimate, "verifierAssignments", label + " planEstimate", 0, 1024),

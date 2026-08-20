@@ -589,6 +589,19 @@ if ($cohortPresent.Count -eq $cohortSources.Count) {
         'The cohort manifest admits a drive-relative path, which is rooted and still resolves against the current directory.'
     Assert-Coordinator ($manifestText.Contains('RequireIndexIsolated')) `
         'The cohort manifest admits an index declared over the journal or an entry output root, so publishing would destroy the record it was derived from.'
+    foreach ($entryPath in @('RequestPath = CohortManifest.RequireRootedPath',
+            'OutputRoot = CohortManifest.RequireRootedPath',
+            'RuleBundlePath = CohortManifest.RequireRootedPath')) {
+        Assert-Coordinator ($manifestText.Contains($entryPath)) `
+            "The cohort manifest does not require '$entryPath'; the child is started in the toolkit checkout, so a path that is not fully qualified names one place in the parent and another in the child."
+    }
+    Assert-Coordinator ($runnerText.Contains('IsPathFullyQualified(request.OutputRoot)')) `
+        'The cohort admits a sealed request whose own output root is not fully qualified, so the child would publish its evidence somewhere the parent never looks.'
+
+    # A completion is a claim about what a preparation consumed and did not write.
+    # A completion with no evidence behind it is not a cheap one.
+    Assert-Coordinator ($runnerText.Contains('RequireEvidencePresent')) `
+        'The cohort accepts a completed entry that published no audit, which the index would report as a preparation that ran and consumed nothing.'
 
     # A signed journal cannot be repaired by hand, so the writer may never commit
     # a record its own reader refuses: the only way out of that would be a fresh
@@ -613,6 +626,8 @@ if ($cohortPresent.Count -eq $cohortSources.Count) {
         'The cohort journal keeps no record of the word its index published, so a rebuild would have to guess one.'
     Assert-Coordinator ($runnerText.Contains('HasTerminal')) `
         'The cohort runner derives a published outcome without first reading the one its journal already recorded.'
+    Assert-Coordinator ($runnerText -match 'journal\.RecordTerminal\([^)]*\);\s*\r?\n\s*try') `
+        'The cohort runner commits the word it publishes inside the guard that swallows a failed write, so a cohort could exit successfully while its record still said something else.'
 
     # The operator alias arrives on the command line. A cohort whose authorization
     # could be read out of the manifest would be a cohort a scheduled task could

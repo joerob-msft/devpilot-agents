@@ -217,12 +217,18 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
 
     private int Walk(CohortJournal journal, byte[] key)
     {
-        // Written on entry, after every commit, and on every way out - including
-        // the ones that are faults. An index that is only written when a cohort
-        // ends well is an index that is missing exactly when it is wanted.
-        PublishIndexSafely(journal, key, CohortIndex.ReasonRunning, "the cohort is in progress");
         try
         {
+            // Written on entry, after every commit, and on every way out -
+            // including the ones that are faults. An index that is only written
+            // when a cohort ends well is an index that is missing exactly when it
+            // is wanted. This one is inside the guard on purpose: it re-reads every
+            // ended entry's evidence, so it is one of the places a refusal can be
+            // raised, and a refusal raised here has to reach the handler that
+            // records it rather than escaping past a journal this call has already
+            // moved to 'running'.
+            PublishIndexSafely(journal, key, CohortIndex.ReasonRunning, "the cohort is in progress");
+
             RequireLiveToolkitHead();
 
             var stopped = false;
@@ -504,6 +510,7 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
         CohortEntrySummary summary;
         try
         {
+            RequireEvidencePresent(entry, outcome);
             summary = CohortSummaryReader.Read(entry, intended, elapsed, request.CorrelationId);
         }
         catch (Exception error) when (error is CohortBlockedException or IOException or UnauthorizedAccessException)
@@ -659,6 +666,20 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
                 throw new ContractException(
                     $"Entry '{entry.EntryId}' seals {name} {sealedValue} and its request carries {requestValue}.");
             }
+        }
+
+        // The child is started with its working directory set to the toolkit
+        // checkout, so a request declaring a relative output root would be
+        // resolved here against THIS process's directory and written by the child
+        // into a different one. The parent would then find nothing where the
+        // evidence belongs, and an entry with no audit standing in its root is
+        // exactly the shape a completed-but-unaccounted entry would take.
+        if (!Path.IsPathFullyQualified(request.OutputRoot))
+        {
+            throw new ContractException(
+                $"Entry '{entry.EntryId}' names a request writing to '{request.OutputRoot}', which is not fully qualified. " +
+                "The preparation is started in the toolkit checkout rather than in this directory, so a root that is not fully " +
+                "qualified names one place here and another place there.");
         }
 
         var declaredRoot = CohortManifest.NormalizeRoot(entry.OutputRoot);
@@ -853,18 +874,56 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
         }
     }
 
+    /// <summary>
+    /// Refuses a preparation that reports completion with nothing standing where
+    /// its evidence belongs.
+    /// </summary>
+    /// <remarks>
+    /// A preparation that exits cleanly has published its audit; that is what
+    /// exiting cleanly means here. An entry that reports completion with no audit
+    /// in its output root would otherwise be summarized as a preparation that ran
+    /// and consumed nothing - a completed entry with no evidence, no model starts
+    /// and no write counters, which is indistinguishable in the index from a
+    /// cohort that genuinely cost nothing. The counters that admission and the
+    /// zero-write claim are computed from would all be absent, so this is refused
+    /// rather than counted. A preparation that faulted before it could write
+    /// anything is a different case and keeps its absence: nothing is being
+    /// claimed on its behalf.
+    /// </remarks>
+    private static void RequireEvidencePresent(CohortEntry entry, string outcome)
+    {
+        if (!string.Equals(outcome, CohortEntryOutcomes.Complete, StringComparison.Ordinal))
+        {
+            return;
+        }
+        var path = CohortSummaryReader.AuditPathFor(entry);
+        if (!File.Exists(path))
+        {
+            throw new CohortBlockedException(
+                $"Entry '{entry.EntryId}' reported a completed preparation and published no audit at '{path}'. " +
+                "A completion with no evidence behind it cannot be counted against this cohort's ceiling, and it cannot support " +
+                "the claim that nothing was written, so the cohort stops rather than indexing it as a preparation that cost nothing.");
+        }
+    }
+
     /// <summary>Writes the index and refuses to let a failure to write it end the cohort.</summary>
     /// <remarks>
     /// The signed journal is authoritative; the index is a report derived from it.
     /// If the report cannot be written the cohort has still done what the journal
     /// says it did, and the next run over this root rewrites the index from the
-    /// journal without starting anything.
+    /// journal without starting anything. The word itself is committed outside
+    /// that leniency, because a cohort that could not write down what it published
+    /// has not published it: swallowing a failed journal replacement here would
+    /// let a cohort exit successfully while its record still said something else,
+    /// and every later rebuild would report that something else.
     /// </remarks>
     private void PublishIndexSafely(CohortJournal journal, byte[] key, string reason, string detail, string? spokenDetail = null)
     {
+        var terminalDetailSha256 = CanonicalJson.Sha256HexOfText(spokenDetail ?? detail);
+        journal.RecordTerminal(key, reason, detail, terminalDetailSha256);
         try
         {
-            PublishIndex(journal, key, reason, detail, spokenDetail);
+            PublishIndexCore(journal, key, reason, detail, terminalDetailSha256, recordTerminal: false);
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         {

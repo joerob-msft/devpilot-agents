@@ -1124,6 +1124,30 @@ try {
             "An unauthenticated audit ($($tamper.Id)) left outcome '$($recordTamper.outcome)'; expected evidenceRefused."
     }
 
+    # A preparation that exits cleanly has published its audit; that is what
+    # exiting cleanly means here. Absence is not a cheap success: summarized as
+    # not-run it would report a completed entry with no evidence, no model starts
+    # and no write counters, which is exactly the shape of a cohort claiming to
+    # have written nothing while having no idea what it did.
+    $caseHollow = Join-Path $sandboxRoot 'case-h-hollow'
+    $hollow = New-CohortEntryRequest -Sandbox $caseHollow -EntryId 'entry-one' `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918276
+    [void](New-StubControl -Path $hollow.ControlPath -ExitCode 0 -WriteAudit $false)
+    $manifestHollow = New-CohortManifestFile -Path (Join-Path $caseHollow 'cohort.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef `
+        -JournalRoot (Join-Path $caseHollow 'journal') -IndexPath (Join-Path $caseHollow 'index\cohort-index.json') `
+        -StubPath $stub -Entries @(
+        (New-CohortEntryDeclaration -Request $hollow -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runHollow = Invoke-Cohort -ManifestPath $manifestHollow
+    Assert-Cohort ($runHollow.ExitCode -eq 11) `
+        "A completed entry that published no audit exited $($runHollow.ExitCode); expected 11."
+    $recordHollow = Get-CohortJournalEntry -JournalRoot (Join-Path $caseHollow 'journal') -EntryId 'entry-one'
+    Assert-Cohort ($recordHollow.outcome -eq 'evidenceRefused') `
+        "A completed entry with no audit left outcome '$($recordHollow.outcome)'; expected evidenceRefused."
+    $indexHollow = Get-JsonFile -Path (Join-Path $caseHollow 'index\cohort-index.json')
+    Assert-Cohort ($indexHollow.terminalReason -eq 'blocked') `
+        "A completed entry with no audit published terminal reason '$($indexHollow.terminalReason)'; expected blocked."
+
     # -----------------------------------------------------------------------
     Write-Host '16/22 identity drift between the manifest and the request is refused' -ForegroundColor Cyan
     $caseI = Join-Path $sandboxRoot 'case-i'
@@ -1282,19 +1306,51 @@ try {
     # going, so declaring it over the record it is derived from would destroy that
     # record before anyone read either.
     $overJournalRoot = Join-Path $caseM 'journal-over-index'
+    $overCase = 0
     foreach ($over in @(
             (Join-Path $overJournalRoot 'cohort-journal.json'),
             (Join-Path $overJournalRoot 'cohort-journal.key'),
             (Join-Path $overJournalRoot 'intents'),
             $m1.Path,
+            $ruleBundle,
             (Join-Path $m1.OutputRoot 'coordinator\audit.json'))) {
-        $overIndex = New-CohortManifestFile -Path (Join-Path $caseM ('over-' + [IO.Path]::GetFileName($over) + '.json')) `
+        $overCase++
+        $overIndex = New-CohortManifestFile -Path (Join-Path $caseM "over-$overCase.json") `
             -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef `
             -JournalRoot $overJournalRoot -IndexPath $over `
             -StubPath $stub -Entries @($declarationM1)
         $runOverIndex = Invoke-Cohort -ManifestPath $overIndex
         Assert-Cohort ($runOverIndex.ExitCode -eq 2) `
             "A cohort declaring its index over '$([IO.Path]::GetFileName($over))' exited $($runOverIndex.ExitCode); expected 2."
+    }
+
+    # The manifest is the one input the whole cohort is read from, so an index
+    # declared over it would leave the cohort unable to be resumed at all.
+    $overSelfPath = Join-Path $caseM 'over-self.json'
+    [void](New-CohortManifestFile -Path $overSelfPath `
+            -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef `
+            -JournalRoot (Join-Path $caseM 'journal-over-self') -IndexPath $overSelfPath `
+            -StubPath $stub -Entries @($declarationM1))
+    $runOverSelf = Invoke-Cohort -ManifestPath $overSelfPath
+    Assert-Cohort ($runOverSelf.ExitCode -eq 2) `
+        "A cohort declaring its index over its own manifest exited $($runOverSelf.ExitCode); expected 2."
+
+    # An entry path is held to the same rule as the journal for a sharper reason:
+    # the child preparation is started in the toolkit checkout, so the parent and
+    # the child would resolve a relative one against two different directories.
+    foreach ($shape in @('request', 'output', 'ruleBundle')) {
+        $partialEntry = New-CohortEntryDeclaration -Request $m1 -Ordinal 1 -RuleBundlePath $ruleBundle
+        if ($shape -eq 'request') { $partialEntry.request.path = 'entry-one.request.json' }
+        if ($shape -eq 'output') { $partialEntry.output.root = 'runs\entry-one' }
+        if ($shape -eq 'ruleBundle') { $partialEntry.ruleBundle.declarationPath = 'rules\bundle.json' }
+        $partialManifest = New-CohortManifestFile -Path (Join-Path $caseM "entry-relative-$shape.json") `
+            -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef `
+            -JournalRoot (Join-Path $caseM "journal-entry-relative-$shape") `
+            -IndexPath (Join-Path $caseM "index\entry-relative-$shape.json") `
+            -StubPath $stub -Entries @($partialEntry)
+        $runPartialEntry = Invoke-Cohort -ManifestPath $partialManifest
+        Assert-Cohort ($runPartialEntry.ExitCode -eq 2) `
+            "A cohort declaring a relative entry $shape path exited $($runPartialEntry.ExitCode); expected 2."
     }
 
     $wrongKind = New-CohortManifestFile -Path (Join-Path $caseM 'kind.json') `
