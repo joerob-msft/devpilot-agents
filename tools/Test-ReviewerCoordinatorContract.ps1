@@ -210,9 +210,16 @@ $forbiddenCoordinatorTokens = [string[]]@(
     # adapter's step contract, never by name. Naming one would be this program
     # deciding how the comparison is invoked.
     'Compare-ReviewerReplayRuns', 'Resolve-ReviewerRunReconciliation',
-    # There is no delivery in this slice, and the names one would need are
-    # forbidden outright so that adding one is a change to this list first.
-    'DeliveryAuthorized', 'deliveryAuthorized', 'DeliverPreview'
+    # The delivery decision arrives the same way, through a step name. The
+    # reviewed evaluation, its gate library and its policy are never named here.
+    'New-ReviewerGateDecision', 'Save-ReviewerGateDecision', 'DeliveryGates',
+    # The delivery slice adds a whole vocabulary of judgement, and none of it may
+    # cross into C#. The coordinator carries a status word and a census of
+    # integers; a name from this list would be a name it had a rule about.
+    'DeliverPreview', 'PromoteCandidate', 'CastVote', 'ApprovePullRequest',
+    'UnattendedComment', 'unattendedComment', 'HumanPromotable', 'humanPromotable',
+    'ImportantOrHigher', 'importantOrHigher', 'EligiblePreview', 'eligiblePreview',
+    'NoFindings', 'noFindings', 'Withheld', 'withheld', 'Degraded', 'degraded'
 )
 foreach ($file in $csharpFiles) {
     $text = [IO.File]::ReadAllText($file.FullName)
@@ -273,26 +280,38 @@ if (Test-Path -LiteralPath $requestContract -PathType Leaf) {
 }
 
 # ---------------------------------------------------------------------------
-# No delivery, structurally.
+# A delivery exists, and no transition in it can write.
 # ---------------------------------------------------------------------------
-# The state enumeration is the one place a delivery transition would have to
-# appear, so the absence is asserted there rather than inferred from the absence
-# of a caller.
+# The earlier slices asserted the absence of a delivery. That claim has been
+# spent: there are now five delivery transitions. What replaces it is the
+# stronger claim the absence was standing in for - that every one of them is
+# preview-only, that the enumeration names them all, and that no name a provider
+# write would need appears anywhere in the enumeration. The forbidden-token sweep
+# above already applies the write vocabulary to this file along with every other,
+# so this section adds the positive half: the five states are present, in order,
+# and nothing in the file offers a sixth.
 $stateContract = Join-Path $repoRoot 'tools\ShadowRunCoordinator\CoordinatorState.cs'
 if (Test-Path -LiteralPath $stateContract -PathType Leaf) {
     $stateText = [IO.File]::ReadAllText($stateContract)
-    foreach ($deliveryState in @('Delivery', 'Deliver', 'Published to', 'ProviderWrite')) {
-        Assert-Coordinator (-not $stateText.Contains($deliveryState)) `
-            "The coordinator state enumeration reads '$deliveryState'; this slice has no delivery transition."
-    }
-    # The reconciliation is a state, and its ordering is what makes the set's
-    # comparison mean anything. Asserted here so that removing the gate is a
-    # change to a file this suite reads.
     foreach ($required in @('Slot1TerminalVerified', 'Slot2TerminalVerified',
-            'ReconciliationAuthorized', 'ReconciliationRunning', 'ReconciliationVerified')) {
+            'ReconciliationAuthorized', 'ReconciliationRunning', 'ReconciliationVerified',
+            'DeliveryAuthorized', 'DeliveryLaunching', 'DeliveryRunning',
+            'DeliveryTerminalObserved', 'DeliveryTerminalVerified')) {
         Assert-Coordinator ($stateText.Contains($required)) `
             "The coordinator state enumeration does not carry '$required'."
     }
+    # The five are the whole of the delivery. A sixth transition - anything that
+    # named a publish, a post or a promotion - would be a write-enabled state,
+    # and there is no such thing in this machine.
+    foreach ($writeState in @('DeliveryPublish', 'DeliveryPosted', 'DeliveryWritten',
+            'DeliveryPromoted', 'DeliveryCommitted', 'Published to', 'ProviderWrite')) {
+        Assert-Coordinator (-not $stateText.Contains($writeState)) `
+            "The coordinator state enumeration reads '$writeState'; no delivery transition in this machine may write."
+    }
+    # The delivery is the last rank, so a state added after it would be a state
+    # the machine reaches with a decision already sealed behind it.
+    Assert-Coordinator ($stateText -match 'DeliveryRank\s*=\s*31\b') `
+        'The coordinator state enumeration does not close its rank table at the delivery.'
 }
 
 # The comparison's result is carried, never read. The one function that copies
@@ -307,6 +326,116 @@ if (Test-Path -LiteralPath $machineContract -PathType Leaf) {
         'The coordinator does not gate its reconciliation on every declared slot.'
     Assert-Coordinator ($machineText.Contains('RequirePredecessorVerified')) `
         'The coordinator does not gate a later slot on its predecessor.'
+    # One definition of "may not write", applied wherever a capability is
+    # reported, and one definition of "wrote nothing", applied wherever a count
+    # is. A build that wanted to permit a write would have to change these two
+    # methods, and this suite reads their names.
+    Assert-Coordinator ($machineText.Contains('RequireNoWriteCapability')) `
+        'The coordinator does not refuse a reported write capability through a single method.'
+    Assert-Coordinator ($machineText.Contains('RequireZeroWrites')) `
+        'The coordinator does not refuse a reported write through a single method.'
+    # The refusal is applied at all three points a capability is reported: the
+    # plan the authorization is committed against, the probe taken immediately
+    # before the irreversible step, and the sealed decision.
+    $capabilityChecks = ([regex]::Matches($machineText, 'RequireNoWriteCapability\(')).Count
+    Assert-Coordinator ($capabilityChecks -ge 4) `
+        "The coordinator applies its write-capability refusal $capabilityChecks time(s); it is declared once and applied at authorization, at prelaunch and at verification."
+    $writeChecks = ([regex]::Matches($machineText, 'RequireZeroWrites\(')).Count
+    Assert-Coordinator ($writeChecks -ge 4) `
+        "The coordinator applies its zero-write refusal $writeChecks time(s); it belongs on every result that reports a count."
+    # Preview-only is a literal the coordinator compares against, not a default
+    # it falls back to.
+    Assert-Coordinator ($machineText.Contains('PreviewOnlyKind')) `
+        'The coordinator does not pin the one authorization kind it performs.'
+}
+
+# The one kind is defined once, in the request contract, and there is no second
+# value anywhere for a caller to select.
+if (Test-Path -LiteralPath $requestContract -PathType Leaf) {
+    $requestText = [IO.File]::ReadAllText($requestContract)
+    Assert-Coordinator ($requestText -match 'PreviewOnlyKind\s*=\s*"PreviewOnly"') `
+        'The typed request contract does not define the single preview-only authorization kind.'
+    foreach ($writeKind in @('"Write"', '"Publish"', '"Unattended"', '"Promote"', 'WriteEnabled')) {
+        Assert-Coordinator (-not $requestText.Contains($writeKind)) `
+            "The typed request contract offers '$writeKind' as an authorization; preview-only is the only kind this coordinator performs."
+    }
+    # A budget that could be raised is a budget. The range is fixed at zero
+    # through zero, so there is no number a request can write that permits one.
+    Assert-Coordinator ($requestText.Contains('providerWriteBudget')) `
+        'The typed request contract does not require a delivery to declare its provider write budget.'
+}
+
+# ---------------------------------------------------------------------------
+# Strict versioned files, and nothing on stdout.
+# ---------------------------------------------------------------------------
+# Every step boundary in this machine is a file with a version in it. A step that
+# exchanged a bare shape would be a step whose reader and writer could drift, and
+# a step that answered on stdout would be a step whose answer any console write
+# in any loaded module could corrupt.
+$childAdapter = Join-Path $repoRoot 'tools\Invoke-ShadowCoordinatorChild.ps1'
+if (Test-Path -LiteralPath $childAdapter -PathType Leaf) {
+    $childText = [IO.File]::ReadAllText($childAdapter)
+    foreach ($contract in @(
+            'devpilot.shadow-run-coordinator.child-result.v1',
+            'devpilot.shadow-run-coordinator.child-request.v1',
+            'devpilot.shadow-run-coordinator.reconciliation-request.v1',
+            'devpilot.shadow-run-coordinator.reconciliation-summary.v1',
+            'devpilot.shadow-run-coordinator.delivery-request.v1',
+            'devpilot.shadow-run-coordinator.delivery-summary.v1')) {
+        Assert-Coordinator ($childText.Contains($contract)) `
+            "The child adapter does not name the versioned contract '$contract'."
+    }
+    # The C# and the PowerShell must be talking about the same documents. A
+    # version bumped on one side only is the drift the versions exist to catch.
+    if (Test-Path -LiteralPath $machineContract -PathType Leaf) {
+        foreach ($shared in @(
+                'devpilot.shadow-run-coordinator.delivery-request.v1',
+                'devpilot.shadow-run-coordinator.delivery-summary.v1')) {
+            Assert-Coordinator ($machineText.Contains($shared)) `
+                "The coordinator does not name the versioned contract '$shared' that its child writes."
+        }
+    }
+    # Nothing contractual goes to stdout. Write-Output and a bare ConvertTo-Json
+    # at statement level are the two ways it could, and neither appears.
+    foreach ($stdout in @('Write-Output', 'Write-Information')) {
+        Assert-Coordinator (-not $childText.Contains($stdout)) `
+            "The child adapter uses '$stdout'; its answer travels in a result file, never on a stream a module can share."
+    }
+    foreach ($line in @($childText -split "`n")) {
+        $trimmed = $line.Trim()
+        Assert-Coordinator (-not ($trimmed -match '^ConvertTo-Json\b')) `
+            'The child adapter emits JSON at statement level, which would place a contractual document on stdout.'
+    }
+    # The delivery steps exist, are four, and are reached by name.
+    foreach ($step in @('deliveryPlan', 'deliveryPrelaunch', 'deliveryRun', 'deliveryVerify')) {
+        Assert-Coordinator ($childText.Contains("'^$step`$'")) `
+            "The child adapter has no dispatch arm for the '$step' step."
+    }
+    # A dot-source inside a function body defines its names in that body's scope and
+    # loses them on return, so a delivery step that loaded the reviewed gate library
+    # through a plain call would run with none of it and fail only against a real
+    # reviewer tree - which no stub in the suite can reach. Every load of that library
+    # is therefore required to be dotted, statically, here.
+    $undottedImports = @()
+    foreach ($line in @($childText -split "`n")) {
+        $trimmed = $line.Trim()
+        if ($trimmed -match '^\.?\s*Import-ShadowChildDeliverySource\b' -and $trimmed -notmatch '^\.\s') {
+            $undottedImports += $trimmed
+        }
+    }
+    Assert-Coordinator ($undottedImports.Count -eq 0) `
+        ("The child adapter loads the reviewed delivery libraries without dot-sourcing the load: '" +
+            ($undottedImports -join "', '") + "'. Those names would not survive the call.")
+    $dottedImports = @($childText -split "`n" | Where-Object { $_.Trim() -match '^\.\s+Import-ShadowChildDeliverySource\b' })
+    Assert-Coordinator ($dottedImports.Count -ge 3) `
+        "The child adapter's delivery steps do not each dot-source the reviewed gate library; $($dottedImports.Count) of 3 do."
+    # The adapter that evaluates a preview-only decision must hold no way to
+    # write to a provider, in the same way the coordinator holds none.
+    foreach ($write in @('Invoke-RestMethod', 'Invoke-WebRequest', 'System.Net.Http',
+            'az repos pr', 'PostComment', 'CreateThread')) {
+        Assert-Coordinator (-not $childText.Contains($write)) `
+            "The child adapter reads '$write'; the delivery it evaluates is preview-only and reaches no provider."
+    }
 }
 
 # The rule above can only bite on files it can see. If the port ever lands

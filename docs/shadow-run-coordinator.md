@@ -47,9 +47,13 @@ flowchart LR
     A --> T1[Save-CorpusReplaySeal.ps1]
     A --> T2[run-set declaration<br/>preflight and status tools]
     A --> T3[Invoke-ReviewerReplayQualification.ps1<br/>-Mode RunSlot]
+    A --> T4[Compare-ReviewerReplayRuns.ps1<br/>+ reconciliation resolver]
+    A --> T5[DeliveryGates.ps1<br/>preview-only, no writes]
     T1 --> RF[versioned result file]
     T2 --> RF
     T3 --> RF
+    T4 --> RF
+    T5 --> RF
     RF --> C
     C --> S[(durable state<br/>+ audit)]
 ```
@@ -77,6 +81,8 @@ requestValidated -> corpusStaging -> corpusPublished -> corpusValidated -> recip
     -> slot2TerminalVerified | slot2TerminalFailed | slot2TerminalTimedOut
     -> reconciliationAuthorized -> reconciliationLaunching -> reconciliationRunning
     -> reconciliationTerminalObserved -> reconciliationVerified
+    -> deliveryAuthorized -> deliveryLaunching -> deliveryRunning
+    -> deliveryTerminalObserved -> deliveryTerminalVerified
 ```
 
 There is no other order and no way to skip. Each transition appends a record to a durable
@@ -292,8 +298,61 @@ report on disk, the report and artifact are the same two files this run watched 
 the comparison covered exactly the declared number of runs, and the artifact does not claim to
 be promotable — an evaluation-only reconciliation never is. What the coordinator then records is
 a status word, four digests, two run counts and an ordered census of name/value integers copied
-across unread. No finding identity, no text, no severity and no verdict crosses that boundary,
-and there is no delivery state in this build for one to cross into.
+across unread. No finding identity, no text, no severity and no verdict crosses that boundary.
+
+## The delivery decision
+
+The set may close with one *preview-only* delivery decision, and there is no other kind. The
+decision is produced by the reviewed `src/Agents/reviewer/DeliveryGates.ps1` — unchanged,
+reached through the same child contract, evaluated with every write switch off. Whether a
+finding is worth surfacing, and to whom, is judgement this coordinator must not make; what it
+requires instead is that the evaluation ran, sealed its decision, and reported that it wrote
+nowhere.
+
+Delivery is declared in the request at creation, next to the slots and the reconciliation, or
+not at all. There is no argument, transition or code path that turns one on later, and the
+declaration is refused unless it names `authorizationKind: "PreviewOnly"`, sets
+`commentsEnabled`, `votesEnabled` and `gatesEnabled` to false, and sets `providerWriteBudget`
+to `0`. A declaration that asks for anything else is not a delivery this build can run.
+
+The exchange is two versioned files under the coordinator's own output root. The coordinator
+publishes `delivery-request.json` (`devpilot.shadow-run-coordinator.delivery-request.v1`),
+commits its digest, and the child refuses to act on any other bytes. That document is what
+binds the decision to everything it was made from: the sealed snapshot, the declared run set,
+the verified reconciliation and its sealed artifact, the config and policy digests, the
+required head, and the correlation this run carries. The child writes back
+`delivery-summary.json` (`…delivery-summary.v1`) at the one path the request names. Nothing
+passes between them on a command line or through an environment variable.
+
+**`deliveryAuthorized`** requires this coordinator's own signed `slot1TerminalVerified`,
+`slot2TerminalVerified` *and* `reconciliationVerified`, and independently requires the reviewed
+readiness gate to agree. It commits the set ID, the plan digest, the required run count, the
+reconciliation digest the decision must close over, and the capability the plan reports. That
+capability is not the adapter's own abstinence: the reviewed authority is asked with every
+write switch *on*, so what comes back says what the live policy would permit if a write were
+asked for, not what this run happened to ask for. Any write capability in reach — a kind other
+than `PreviewOnly`, comments, votes or gates on, a promotable outcome, or a non-zero write
+count — stops the run *here*, before a child is launched.
+
+**`deliveryLaunching`** publishes the input document and commits its digest.
+
+**`deliveryRunning`** commits the child's identity before the wait, for the same reason the
+comparison does: the delivery's attempt record is single-use and is minted before the
+evaluation starts.
+
+**`deliveryTerminalObserved`** reads the summary, rehashes it, checks it was written where the
+request asked, pins the sealed decision by path and digest, and refuses any reported write.
+
+**`deliveryTerminalVerified`** has the reviewed reader parse the sealed decision and checks what
+comes back against what was committed: the seal verifies under its key, the decision is *this*
+run set's, it closes over *this* reconciliation, it covered exactly the declared number of runs,
+it does not claim to be promotable, it still reports `PreviewOnly` with every capability off,
+and both `providerWriteCount` and `writeToolInvocations` are zero. What the coordinator then
+records is a status word, three digests, one run count, four flags and an ordered census of
+name/value integers copied across unread. It never compares that status word to a literal, and
+it has no branch on which one it got: a decision that found nothing, one that let nothing
+through, one that would be eligible in preview and one built over a run the comparison called
+unusable all reach the same terminal and record the same two zeroes.
 
 ## Refusals
 
@@ -463,6 +522,12 @@ reconciliation is deleting `slots.reconciliation`, or setting `reconciliationEna
 the set then stops at `slot2TerminalVerified` and the reviewed comparison is run by hand exactly
 as it always was.
 
+Rolling back the delivery slice is deleting `slots.delivery`, or setting `deliveryEnabled` to
+false: the set then stops at `reconciliationVerified` and the reviewed `DeliveryGates.ps1` is
+run by hand exactly as it always was, with whatever switches its own operator is entitled to
+use. The coordinator's copy of that decision is preview-only in every configuration it will
+accept, so removing it removes a decision that could never have written anything anyway.
+
 Rolling back the corpus staging slice is deleting the `corpusStage` section from the request.
 Both corpus transitions then commit `staged: false`, the coordinator reads a corpus somebody
 else built exactly as it did before, and the PowerShell path that builds one is untouched.
@@ -537,8 +602,16 @@ the reviewed tool chose; none is a reading of what the comparison found.
 `reconciliationPerformed` is false on any run that refused, so a blocked or failed set never
 publishes an audit that claims a comparison happened.
 
-`deliveryMode` is always `previewOnly` and `providerWriteCount` is always `0`, because this
-slice has no delivery path to write with.
+`deliveryMode` is always `previewOnly` and `providerWriteCount` and `writeToolInvocations` are
+always `0`, because there is no write-enabled transition in this build. When a delivery was
+declared and reached its verified terminal the audit also carries `deliveryPerformed`,
+`deliveryAuthorizationKind` (always `PreviewOnly`), `deliveryStatus`, `deliveryDecisionSha256`,
+`deliverySummarySha256`, `deliveryReconciliationSha256`, `deliveryRunCount`,
+`deliveryPromotable`, `deliveryCommentsEnabled`, `deliveryVotesEnabled`, `deliveryGatesEnabled`
+and the ordered `deliveryCounts` census. Every one of them is a digest, a count, a flag, or a
+word the reviewed tool chose. `deliveryPerformed` is false on any run that refused, so a blocked
+delivery never publishes an audit that claims a decision happened — and the two write counts
+read zero on those runs too.
 
 ## Tests
 
@@ -631,11 +704,41 @@ exact-path test and this adapter must agree that a replayed run lives under
 `replay/<snapshot>`, and the selection is then run against a state directory holding two
 replayed snapshots, where only the plan-sealed one may be chosen.
 
+For the preview-only delivery it adds: a set declaring its delivery from creation, halted and
+resumed at every one of the five delivery transitions with the sequence checked after each and
+with the input publication and the evaluation both checked *on disk* at every point before the
+state entitled to perform them — so the decision provably has no input file while the
+comparison is unverified, and no attempt record before `deliveryRunning`; exactly one attempt
+record, counted on disk; distinct exchange files for the plan, the pre-launch probe, the run
+and the verification; both halves of the versioned exchange, with the authorization, the three
+off switches and the zero write budget read back out of the file the child actually reads; an
+audit whose delivery fields are all digests, counts, flags or a status word; a replay that
+evaluates nothing a second time; the four outcomes — nothing found, nothing let through,
+eligible in preview, and built over a run the comparison called unusable — every one of which
+must reach the same terminal and record the same two zeroes, which is how "the coordinator does
+not branch on meaning" is checked rather than promised; and the delivery fault matrix — a
+readiness gate that says no, an authorization already spent, a plan built for another run set,
+a plan binding another comparison, a kind other than `PreviewOnly`, comments, votes or gates
+reported on, a promotable plan, a write count reported at planning time, no summary, a summary
+at the wrong path, a summary edited after it is reported, a non-zero exit leaving nothing, a
+seal that does not verify, a decision claiming to be promotable, one covering too few runs, a
+census that is empty, duplicated or badly named, a sealed decision swapped for another valid
+one, an evaluation that never returns and is stopped on the plan's own deadline, and — the
+cases the slice exists for — a provider write or a write tool invocation reported at the run or
+at the verification, each of which stops the run rather than being recorded. Every refusal is
+additionally held to the claim the whole slice makes: the audit it leaves behind reports zero
+provider writes and zero write tool invocations. The crash-consistency case is the same shape
+as the comparison's: the coordinator is killed after the delivery has minted its single-use
+attempt record, and the resume must adopt the child it named, reach `deliveryTerminalVerified`,
+leave exactly one attempt record, and still report both zeroes.
+
 `tools/Test-ReviewerCoordinatorContract.ps1` is the architecture boundary: it asserts that the
 coordinator sources contain no prompt, model, severity, candidate or verdict vocabulary and no
-provider write path, that no state in the enumeration names a delivery, that both slot terminals
-and the reconciliation states are present, and that the reconciliation is gated on every declared
-slot — so "no reviewer judgement in C#" is checked rather than promised.
+provider write path, that a delivery exists and that no transition in it can write, that both
+slot terminals and the reconciliation and delivery states are present, that the delivery is
+gated on the reconciliation and the reconciliation on every declared slot, and that every
+exchange with the reviewed PowerShell goes through a named versioned file contract rather than
+stdout — so "no reviewer judgement in C#" is checked rather than promised.
 
 The canonical key order that makes any of this reproducible is covered in
 `tools/Test-ReviewerStageContract.ps1`, which asserts the same bytes under `en-US`, `da-DK`,

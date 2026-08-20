@@ -43,6 +43,16 @@ $script:ShadowChildRequestContract = 'devpilot.shadow-run-coordinator.child-requ
 # never drift onto different versions of the same document.
 $script:ShadowReconciliationRequestVersion = 'devpilot.shadow-run-coordinator.reconciliation-request.v1'
 $script:ShadowReconciliationSummaryVersion = 'devpilot.shadow-run-coordinator.reconciliation-summary.v1'
+# The two versioned files the delivery decision exchanges with its caller, on the
+# same terms.
+$script:ShadowDeliveryRequestVersion = 'devpilot.shadow-run-coordinator.delivery-request.v1'
+$script:ShadowDeliverySummaryVersion = 'devpilot.shadow-run-coordinator.delivery-summary.v1'
+# The only authorization under which this adapter will evaluate a delivery
+# decision. There is no second value and no switch that produces one.
+$script:ShadowDeliveryPreviewOnlyKind = 'PreviewOnly'
+# A digest of all zeroes says "this decision depended on nothing here", which is
+# what the gate library's binding means by an absent dependency.
+$script:ShadowDeliveryAbsentDigest = '0' * 64
 $script:ShadowChildUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
 
 function Read-ShadowChildRequest {
@@ -1397,6 +1407,575 @@ function Read-ShadowChildReconcileInput {
     }
 }
 
+function Get-ShadowChildFileSha256 {
+    <#
+    .SYNOPSIS
+        The lowercase hex SHA-256 of one file's bytes.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "'$Path' does not exist, so it cannot be digested."
+    }
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($Path))).ToLowerInvariant()
+}
+
+function Import-ShadowChildDeliverySource {
+    <#
+    .SYNOPSIS
+        Loads the reviewed libraries a delivery decision is evaluated by.
+    .DESCRIPTION
+        The gate library is loaded, not reimplemented. Every judgement a delivery
+        decision contains - what a candidate is, whether it is eligible, what the
+        policy currently permits, how the decision is sealed - is made by
+        DeliveryGates.ps1, which is reviewed code with its own suite. This adapter
+        supplies inputs and carries the answer.
+
+        This must be DOT-SOURCED by its caller - '. Import-ShadowChildDeliverySource'
+        - because a dot-source inside a function body defines its names in that
+        function's scope and loses them on return. Dotting the call runs the body in
+        the caller's scope, where the loaded names stay visible to the caller and to
+        everything the caller goes on to call. Every other step in this adapter loads
+        the same libraries directly in its own handler body for the same reason.
+    #>
+    param([Parameter(Mandatory)][string]$ToolkitRoot)
+    Import-Module (Join-Path $ToolkitRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force -ErrorAction Stop
+    . (Join-Path $ToolkitRoot 'src\Agents\reviewer\QualificationPreflight.ps1')
+    . (Join-Path $ToolkitRoot 'src\Agents\reviewer\ReplayQualification.ps1')
+    . (Join-Path $ToolkitRoot 'src\Agents\reviewer\SourceTransport.ps1')
+    . (Join-Path $ToolkitRoot 'src\Agents\reviewer\ConventionSpecialist.ps1')
+    . (Join-Path $ToolkitRoot 'src\Agents\reviewer\CrossVerification.ps1')
+    . (Join-Path $ToolkitRoot 'src\Agents\reviewer\RunReconciliation.ps1')
+    . (Join-Path $ToolkitRoot 'src\Agents\reviewer\DeliveryGates.ps1')
+}
+
+function Get-ShadowChildDeliveryContext {
+    <#
+    .SYNOPSIS
+        Rebuilds everything a preview-only delivery decision would be evaluated
+        over, and answers - from the live policy, through the reviewed gate
+        library - what such a decision could currently write.
+    .DESCRIPTION
+        The set must already be reconcilable on the shared readiness gate's terms,
+        because a decision over a set whose runs are still moving is a decision
+        over nothing. On top of that this locates the one sealed comparison the
+        set produced, opens it under the run set's own key, and binds the decision
+        to that comparison's digest.
+
+        The capability answer is derived, never asserted: the shipped gate policy
+        is put through ConvertTo-ReviewerGateEffectivePolicy and then through
+        Get-ReviewerGateWritesCurrentlyRequested with every switch ON, which is
+        the same authority the production delivery path consults. Asking with the
+        switches on measures what the policy would currently PERMIT rather than
+        what this adapter chose to abstain from. A policy that
+        currently permitted a write would produce a true here, and the caller
+        refuses a true before it starts anything.
+    #>
+    param([Parameter(Mandatory)]$Request, [Parameter(Mandatory)][string]$ToolkitRoot)
+
+    $authorizationKind = Get-ShadowChildField -Request $Request -Name 'authorizationKind'
+    if ($authorizationKind -cne $script:ShadowDeliveryPreviewOnlyKind) {
+        throw ("This adapter evaluates a delivery decision under '$($script:ShadowDeliveryPreviewOnlyKind)' and nothing else; " +
+            "the caller asked for '$authorizationKind'.")
+    }
+    $reconcile = Get-ShadowChildReconcileContext -Request $Request -ToolkitRoot $ToolkitRoot
+    $outputDirectory = Get-ShadowChildField -Request $Request -Name 'deliveryOutputDirectory'
+    if ((Get-ShadowChildPathKey -Path $outputDirectory) -ceq (Get-ShadowChildPathKey -Path ([string]$reconcile.OutputDirectory))) {
+        throw ("The delivery would write into the comparison's own output directory '$outputDirectory', where the file it " +
+            'reads and the file it produces could not be told apart.')
+    }
+
+    # Exactly one sealed comparison, for the reason the comparison itself demands
+    # exactly one run artifact per slot: choosing between two would be a judgement
+    # about which comparison to believe.
+    $artifacts = @(Get-ChildItem -LiteralPath $reconcile.OutputDirectory -Filter 'reconciliation-*.json' -File `
+            -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    if (@($artifacts).Count -ne 1) {
+        throw ("Expected exactly one sealed comparison under '$($reconcile.OutputDirectory)'; found " +
+            "$(@($artifacts).Count). A delivery decision closes over one comparison.")
+    }
+    $artifactPath = [string]@($artifacts)[0]
+    $artifactBytes = [IO.File]::ReadAllBytes($artifactPath)
+    $artifactText = ([Text.UTF8Encoding]::new($false, $true)).GetString($artifactBytes)
+
+    # Opened under the run set's key with the reviewed primitives, so a comparison
+    # anybody could have dropped into the output directory is refused rather than
+    # decided over.
+    $masterKey = Get-ShadowChildReplayDerivedKey -Path @($reconcile.KeyPaths)[0]
+    $envelope = $artifactText | ConvertFrom-Json
+    $manifestJson = [string](Get-ReviewerConventionSpecialistValue $envelope 'manifestJson' '')
+    $signature = [string](Get-ReviewerConventionSpecialistValue $envelope 'signature' '')
+    $domainKey = Get-ReviewerConventionSpecialistDomainKey -MasterKey $masterKey -Domain preview
+    if (-not $manifestJson -or -not (Test-ReviewerConventionSpecialistSignature -Json $manifestJson -Key $domainKey -Signature $signature)) {
+        throw "The sealed comparison at '$artifactPath' does not verify under the run set's key."
+    }
+    $manifest = $manifestJson | ConvertFrom-Json -Depth 32
+    if ([string]$manifest.kind -cne $script:ReviewerRunReconciliationKind) {
+        throw "The sealed comparison at '$artifactPath' declares kind '$([string]$manifest.kind)'."
+    }
+    if ([bool]$manifest.promotable) {
+        throw "The sealed comparison at '$artifactPath' claims to be promotable; a preview-only delivery decides over nothing promotable."
+    }
+    $sealedQualification = $manifest.qualification
+    if ($null -eq $sealedQualification -or [string]$sealedQualification.setId -cne $reconcile.SetId) {
+        throw "The sealed comparison at '$artifactPath' is not this run set's, so no decision may be built over it."
+    }
+    $reconciliation = $manifest.reconciliation
+    if ($null -eq $reconciliation) {
+        throw "The sealed comparison at '$artifactPath' carries no reconciliation."
+    }
+    if ([int]$reconciliation.requiredRunCount -ne [int]$reconcile.RequiredRunCount) {
+        throw ("The sealed comparison requires $([int]$reconciliation.requiredRunCount) run(s) and this delivery was " +
+            "asked for $([int]$reconcile.RequiredRunCount).")
+    }
+
+    # The live policy, put through the reviewed reader, and then through the one
+    # authority that says what a write switch would be permitted to do.
+    #
+    # Every switch is asked ON here, deliberately. This adapter never sets a
+    # write switch and never will, so asking with them off would only measure
+    # its own abstinence and would answer false whatever the policy said. Asking
+    # with them on measures the POLICY: it answers whether a write capability is
+    # in reach at all, which is the question the typed side refuses on.
+    $configPath = Get-ShadowChildField -Request $Request -Name 'reviewerConfigPath'
+    $gateLibraryPath = Join-Path $ToolkitRoot 'src\Agents\reviewer\DeliveryGates.ps1'
+    $policyPath = Join-Path $ToolkitRoot 'src\Agents\reviewer\gates\v1\policy.json'
+    $verificationLibraryPath = Join-Path $ToolkitRoot 'src\Agents\reviewer\RunReconciliation.ps1'
+    $policy = [IO.File]::ReadAllText($policyPath, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+    $effective = ConvertTo-ReviewerGateEffectivePolicy -Policy $policy
+    $reachable = Get-ReviewerGateWritesCurrentlyRequested -EffectivePolicy $effective `
+        -CommentSwitchOn $true -SuggestionSwitchOn $true -ApprovalSwitchOn $true
+
+    return @{
+        Reconcile = $reconcile
+        SetId = [string]$reconcile.SetId
+        PlanDigest = [string]$reconcile.PlanDigest
+        RequiredRunCount = [int]$reconcile.RequiredRunCount
+        OutputDirectory = $outputDirectory
+        AttemptPath = (Join-Path $outputDirectory 'delivery-attempt.json')
+        DecisionBaseName = 'delivery-decision'
+        ArtifactPath = $artifactPath
+        ArtifactSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($artifactBytes)).ToLowerInvariant()
+        ReconciliationSha256 = [string]$reconciliation.reconciliationSha256
+        Reconciliation = $reconciliation
+        MasterKey = $masterKey
+        EffectivePolicy = $effective
+        ConfigSha256 = Get-ShadowChildFileSha256 -Path $configPath
+        PolicySha256 = Get-ShadowChildFileSha256 -Path $policyPath
+        GateLibrarySha256 = Get-ShadowChildFileSha256 -Path $gateLibraryPath
+        VerificationLibrarySha256 = Get-ShadowChildFileSha256 -Path $verificationLibraryPath
+        ScriptSha256 = Get-ShadowChildFileSha256 -Path $PSCommandPath
+        PullRequestId = Get-ShadowChildField -Request $Request -Name 'pullRequestId' -Type int
+        # Derived from the policy through the reviewed library, with every write
+        # switch asked ON, so these say what the world would currently PERMIT
+        # rather than what this adapter chose to ask for.
+        CommentsEnabled = [bool]($reachable.Comments -or $reachable.Suggestions)
+        VotesEnabled = [bool]$reachable.Approval
+        GatesEnabled = [bool](([string]$effective.mode -cne 'off') -or [bool]$effective.approval.enabled)
+    }
+}
+
+function Get-ShadowChildPathKey {
+    <# Case-folded, separator-folded comparison key for one path. #>
+    param([Parameter(Mandatory)][string]$Path)
+    return ([IO.Path]::GetFullPath($Path)).TrimEnd('\', '/').ToLowerInvariant()
+}
+
+function Invoke-ShadowChildDeliveryPlan {
+    <#
+    .SYNOPSIS
+        Reports the delivery decision that would be evaluated, what it would be
+        bound to, and what it could currently write. Decides nothing and writes
+        nothing.
+    #>
+    param([Parameter(Mandatory)]$Request, [Parameter(Mandatory)][string]$ToolkitRoot)
+    . Import-ShadowChildDeliverySource -ToolkitRoot $ToolkitRoot
+    $context = Get-ShadowChildDeliveryContext -Request $Request -ToolkitRoot $ToolkitRoot
+    $plan = $context.Reconcile.Plan
+    $perCallTimeoutSeconds = [Math]::Max(
+        (Get-ShadowChildArgumentValue -Argv @($plan.Slots)[0].Arguments -Name '-CycleTimeoutSeconds'),
+        [Math]::Max(
+            (Get-ShadowChildArgumentValue -Argv @($plan.Slots)[0].Arguments -Name '-ConventionSpecialistTimeoutSeconds'),
+            (Get-ShadowChildArgumentValue -Argv @($plan.Slots)[0].Arguments -Name '-VerificationTimeoutSeconds')))
+    return @{
+        setId = $context.SetId
+        planDigest = $context.PlanDigest
+        requiredRunCount = [int]$context.RequiredRunCount
+        outputDirectory = [string]$context.OutputDirectory
+        deliveryAttemptExists = [bool](Test-Path -LiteralPath $context.AttemptPath)
+        # Reaching this line means the shared readiness gate accepted the set and
+        # its one sealed comparison opened under the set's key; both throw rather
+        # than returning a false.
+        deliveryReady = $true
+        authorizationKind = $script:ShadowDeliveryPreviewOnlyKind
+        commentsEnabled = [bool]$context.CommentsEnabled
+        votesEnabled = [bool]$context.VotesEnabled
+        gatesEnabled = [bool]$context.GatesEnabled
+        # The reviewed plan's own answer, not this adapter's.
+        promotable = [bool]$plan.Promotable
+        providerWriteCount = 0
+        writeToolInvocations = 0
+        reconciliationSha256 = [string]$context.ReconciliationSha256
+        reconciliationArtifactPath = [string]$context.ArtifactPath
+        reconciliationArtifactSha256 = [string]$context.ArtifactSha256
+        configSha256 = [string]$context.ConfigSha256
+        policySha256 = [string]$context.PolicySha256
+        slotTimeoutSeconds = [int]$plan.SlotTimeoutSeconds
+        progressTimeoutSeconds = [int]$plan.ProgressTimeoutSeconds
+        perCallTimeoutSeconds = $perCallTimeoutSeconds
+        head = [string]$plan.GitIdentity.head
+        requiredRef = [string]$plan.GitIdentity.requiredRef
+        headClean = [bool]$plan.GitIdentity.clean
+    }
+}
+
+function Invoke-ShadowChildDeliveryRun {
+    <#
+    .SYNOPSIS
+        Evaluates the reviewed delivery decision exactly once, in preview only,
+        seals it, and writes the versioned summary its caller reads.
+    .DESCRIPTION
+        Nothing here posts, votes, sets a status or opens a connection. The gate
+        library is a pure function over inputs: it returns a manifest, and this
+        adapter seals that manifest to disk beside the comparison it closed over.
+        The two write counters this step reports are the count of provider
+        operations it performed, and they are constants because there is no
+        expression anywhere in this file that could make either of them anything
+        else.
+
+        The capability answer is taken again here rather than trusted from the
+        caller's file, so a policy edited between authorization and launch stops
+        the evaluation instead of being evaluated under.
+    #>
+    param([Parameter(Mandatory)]$Request, [Parameter(Mandatory)][string]$ToolkitRoot)
+    . Import-ShadowChildDeliverySource -ToolkitRoot $ToolkitRoot
+    $context = Get-ShadowChildDeliveryContext -Request $Request -ToolkitRoot $ToolkitRoot
+    if ($context.CommentsEnabled -or $context.VotesEnabled -or $context.GatesEnabled) {
+        throw ('The current gate policy permits a write (comments=' + [string]$context.CommentsEnabled +
+            ', votes=' + [string]$context.VotesEnabled + ', gates=' + [string]$context.GatesEnabled +
+            '). A preview-only delivery decision is not evaluated while anything could write.')
+    }
+    $deliveryInput = Read-ShadowChildDeliveryInput -Request $Request -Context $context
+
+    if (-not (Test-Path -LiteralPath $context.OutputDirectory -PathType Container)) {
+        [void](New-Item -ItemType Directory -Force -Path $context.OutputDirectory)
+    }
+    # CreateNew before anything is evaluated, so a second decision over the same
+    # set is refused by the file system rather than by a check a racing process
+    # could pass at the same instant.
+    $attemptJson = ConvertTo-Json -InputObject ([ordered]@{
+            kind = 'devpilot.shadow-run-coordinator.delivery-attempt.v1'
+            correlationId = [string]$Request.correlationId
+            setId = $context.SetId
+            planDigest = $context.PlanDigest
+            authorizationKind = $script:ShadowDeliveryPreviewOnlyKind
+            recordedAtUtc = [DateTime]::UtcNow.ToString('o')
+        }) -Depth 5
+    try {
+        $attemptStream = [IO.File]::Open($context.AttemptPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    }
+    catch [IO.IOException] {
+        throw ("This set has already had a delivery decision evaluated: '$($context.AttemptPath)' exists. The " +
+            'authorization is consumed when it is attempted, whether or not it finished.')
+    }
+    try {
+        $attemptBytes = [Text.UTF8Encoding]::new($false).GetBytes($attemptJson)
+        $attemptStream.Write($attemptBytes, 0, $attemptBytes.Length)
+    }
+    finally { $attemptStream.Dispose() }
+    Set-ItemProperty -LiteralPath $context.AttemptPath -Name IsReadOnly -Value $true
+
+    $evaluationExitCode = 0
+    $reconciliation = $context.Reconciliation
+    # The comparison's own candidates, carried into the gate library's facet
+    # shape. No field is invented and none is interpreted: what the comparison
+    # called a severity stays a severity, and an identity it refused to form
+    # stays empty, which the library treats as ineligible on its own terms.
+    $eligible = @(@($reconciliation.candidates) | ForEach-Object {
+            [pscustomobject][ordered]@{
+                candidateId = [string]$_.semanticCandidateId
+                candidateHash = [string]$_.semanticIdentitySha256
+                originKind = ''
+                severity = [string]$_.severity
+                filePath = [string]$_.filePath
+                line = [int]$_.line
+                comment = [string]$_.comment
+                evidence = ''
+                confidence = ''
+            }
+        })
+    # Computed outside the array expression: an argument list carrying an
+    # explicit null inside @() is exactly the phantom-element shape the boundary
+    # analyzer refuses, and hoisting it costs nothing.
+    $facetResult = Get-ReviewerGateCandidateFacets -Eligible $eligible -InputManifest $null -ConventionPlan $null
+    $facets = @($facetResult)
+    # The comparison's own conclusion about whether it produced a usable run,
+    # passed through. This adapter does not form a second opinion.
+    $runAccounting = [pscustomobject][ordered]@{
+        Ok = [bool]$reconciliation.reconciled
+        ReasonCodes = @(if ([bool]$reconciliation.reconciled) { @() } else { @('reconciliationUnreconciled') })
+    }
+    $head = ([string]$context.Reconcile.Plan.GitIdentity.head).ToLowerInvariant()
+    $binding = @{
+        prId = [int]$context.PullRequestId
+        repositoryId = [string]$context.SetId
+        organization = 'devpilot.shadow'
+        project = 'shadow-run-coordinator'
+        sourceCommit = $head
+        targetCommit = $head
+        changeSetDigest = [string]$context.PlanDigest
+        # The comparison IS this decision's verification: its outcome digest and
+        # the digest of the sealed file that carried it.
+        verificationDecisionSha256 = [string]$context.ReconciliationSha256
+        verificationInputSha256 = [string]$context.ArtifactSha256
+        specialistArtifactSha256 = [string]$context.ArtifactSha256
+        configSha256 = [string]$context.ConfigSha256
+        scriptSha256 = [string]$context.ScriptSha256
+        gateLibrarySha256 = [string]$context.GateLibrarySha256
+        gatePolicySha256 = [string]$context.PolicySha256
+        verificationLibrarySha256 = [string]$context.VerificationLibrarySha256
+        # All-zero means this decision depended on none of these, which is the
+        # honest answer: a shadow comparison has no convention plan, no fact
+        # plan, no pack policy, no gate qualification, no prompt, no thread set
+        # and no provider snapshot behind it.
+        conventionPlanSha256 = $script:ShadowDeliveryAbsentDigest
+        factPlanSha256 = $script:ShadowDeliveryAbsentDigest
+        packPolicySha256 = $script:ShadowDeliveryAbsentDigest
+        qualificationSha256 = $script:ShadowDeliveryAbsentDigest
+        verificationPromptSha256 = $script:ShadowDeliveryAbsentDigest
+        verificationPolicySha256 = $script:ShadowDeliveryAbsentDigest
+        verificationSchemaSha256 = $script:ShadowDeliveryAbsentDigest
+        threadSetDigest = $script:ShadowDeliveryAbsentDigest
+        checksSnapshotSha256 = $script:ShadowDeliveryAbsentDigest
+        policySnapshotSha256 = $script:ShadowDeliveryAbsentDigest
+        passesRequested = [int]$context.RequiredRunCount
+        generalistPassModels = ''
+    }
+    $decision = New-ReviewerGateDecision -Binding $binding -EffectivePolicy $context.EffectivePolicy `
+        -Qualification $null -Facets $facets -ChangedPaths @() -ThreadFacts @() `
+        -RunAccounting $runAccounting -SuggestionGateEnabled:$false -CreatedAtUtc ([DateTime]::UtcNow)
+    $decisionPath = Save-ReviewerGateDecision -Manifest $decision -Directory $context.OutputDirectory `
+        -BaseName $context.DecisionBaseName -MasterKey $context.MasterKey
+
+    $summary = [ordered]@{
+        contractVersion = $script:ShadowDeliverySummaryVersion
+        kind = 'shadow-run-coordinator-delivery-summary'
+        correlationId = [string]$Request.correlationId
+        deliveryRequestSha256 = [string]$deliveryInput.RequestSha256
+        setId = $context.SetId
+        planDigest = $context.PlanDigest
+        requiredRunCount = [int]$context.RequiredRunCount
+        authorizationKind = $script:ShadowDeliveryPreviewOnlyKind
+        reconciliationSha256 = [string]$context.ReconciliationSha256
+        reconciliationArtifactSha256 = [string]$context.ArtifactSha256
+        decisionPath = [string]$decisionPath
+        evaluationExitCode = $evaluationExitCode
+        providerWriteCount = 0
+        writeToolInvocations = 0
+        generatedAtUtc = [DateTime]::UtcNow.ToString('o')
+    }
+    $summaryPath = [string]$deliveryInput.SummaryPath
+    $summaryDirectory = Split-Path -Parent $summaryPath
+    if ($summaryDirectory -and -not (Test-Path -LiteralPath $summaryDirectory -PathType Container)) {
+        [void](New-Item -ItemType Directory -Force -Path $summaryDirectory)
+    }
+    [IO.File]::WriteAllText($summaryPath, (ConvertTo-Json -InputObject $summary -Depth 6 -Compress:$false), [Text.UTF8Encoding]::new($false))
+
+    return @{
+        summaryWritten = $true
+        summaryPath = $summaryPath
+        summarySha256 = Get-ShadowChildFileSha256 -Path $summaryPath
+        evaluationExitCode = $evaluationExitCode
+        setId = $context.SetId
+        planDigest = $context.PlanDigest
+        decisionPath = [string]$decisionPath
+        decisionSha256 = Get-ShadowChildFileSha256 -Path $decisionPath
+        # Constants because nothing in this file can produce any other value.
+        providerWriteCount = 0
+        writeToolInvocations = 0
+    }
+}
+
+function Invoke-ShadowChildDeliveryVerify {
+    <#
+    .SYNOPSIS
+        Opens the sealed decision under its key and reports its status, its
+        digests, its census, and the fact that it wrote nowhere.
+    .DESCRIPTION
+        No candidate identity, no finding text, no severity, no verdict and no
+        vote crosses this boundary. The status word is derived here, in
+        PowerShell, from the reviewed decision's own numbers, because deciding
+        what a decision means is exactly the judgement the caller must not hold.
+    #>
+    param([Parameter(Mandatory)]$Request, [Parameter(Mandatory)][string]$ToolkitRoot)
+    . Import-ShadowChildDeliverySource -ToolkitRoot $ToolkitRoot
+    $context = Get-ShadowChildDeliveryContext -Request $Request -ToolkitRoot $ToolkitRoot
+
+    $summaryPath = Get-ShadowChildField -Request $Request -Name 'summaryPath'
+    if (-not (Test-Path -LiteralPath $summaryPath -PathType Leaf)) {
+        throw "The delivery summary '$summaryPath' does not exist."
+    }
+    $summaryBytes = [IO.File]::ReadAllBytes($summaryPath)
+    $summary = ([Text.UTF8Encoding]::new($false, $true)).GetString($summaryBytes) | ConvertFrom-Json
+    foreach ($name in @('contractVersion', 'setId', 'planDigest', 'requiredRunCount', 'authorizationKind',
+            'decisionPath', 'reconciliationSha256', 'providerWriteCount', 'writeToolInvocations')) {
+        if (-not $summary.PSObject.Properties[$name]) {
+            throw "The delivery summary at '$summaryPath' is missing '$name'."
+        }
+    }
+    if ([string]$summary.contractVersion -cne $script:ShadowDeliverySummaryVersion) {
+        throw "The delivery summary at '$summaryPath' declares contract '$([string]$summary.contractVersion)'."
+    }
+    if ([string]$summary.setId -cne $context.SetId) {
+        throw "The delivery summary names run set '$([string]$summary.setId)', not '$($context.SetId)'."
+    }
+    if ([string]$summary.planDigest -cne $context.PlanDigest) {
+        throw "The delivery summary names plan '$([string]$summary.planDigest)', not '$($context.PlanDigest)'."
+    }
+    if ([string]$summary.authorizationKind -cne $script:ShadowDeliveryPreviewOnlyKind) {
+        throw "The delivery summary declares authorization '$([string]$summary.authorizationKind)'."
+    }
+    if ([string]$summary.reconciliationSha256 -cne [string]$context.ReconciliationSha256) {
+        throw ("The delivery summary closes over comparison $([string]$summary.reconciliationSha256) and this set's " +
+            "comparison is $([string]$context.ReconciliationSha256).")
+    }
+    if ([int]$summary.providerWriteCount -ne 0 -or [int]$summary.writeToolInvocations -ne 0) {
+        throw ("The delivery summary at '$summaryPath' records $([int]$summary.providerWriteCount) provider write(s) " +
+            "and $([int]$summary.writeToolInvocations) write tool invocation(s).")
+    }
+
+    $decisionPath = [string]$summary.decisionPath
+    if (-not (Test-Path -LiteralPath $decisionPath -PathType Leaf)) {
+        throw "The delivery summary names a sealed decision at '$decisionPath', which does not exist."
+    }
+    $decisionBytes = [IO.File]::ReadAllBytes($decisionPath)
+    # Opened with the reviewed reader, which verifies the envelope under the gate
+    # decision domain key and refuses any other kind or artifact version. A
+    # cleartext parse would accept a file anybody could have written here.
+    $decision = Read-ReviewerGateDecision -Path $decisionPath -MasterKey $context.MasterKey
+    if ([string]$decision.changeSetDigest -cne $context.PlanDigest) {
+        throw "The sealed decision at '$decisionPath' is bound to change set '$([string]$decision.changeSetDigest)'."
+    }
+    if ([string]$decision.verificationDecisionSha256 -cne [string]$context.ReconciliationSha256) {
+        throw ("The sealed decision at '$decisionPath' closes over comparison " +
+            "$([string]$decision.verificationDecisionSha256), not $([string]$context.ReconciliationSha256).")
+    }
+    if ([string]$decision.gatePolicySha256 -cne [string]$context.PolicySha256) {
+        throw "The sealed decision at '$decisionPath' was evaluated under a different gate policy than the one on disk."
+    }
+
+    $candidateCount = @($decision.candidates).Count
+    $unattendedCommentCount = @($decision.unattendedComments).Count
+    $unattendedSuggestionCount = @($decision.unattendedSuggestions).Count
+    $unattendedCount = $unattendedCommentCount + $unattendedSuggestionCount
+    # The judgement, made here and only here. The caller receives the word and
+    # carries it; it has no branch on any of these four values.
+    $status = $(if (-not [bool]$decision.runOk) { 'degraded' }
+        elseif ($candidateCount -eq 0) { 'noFindings' }
+        elseif ($unattendedCount -eq 0) { 'withheld' }
+        else { 'eligiblePreview' })
+    # A decision sealed in a mode that permits nothing can promote nothing. The
+    # answer is derived from the sealed manifest rather than asserted.
+    $promotable = [bool]([string]$decision.mode -cne 'off')
+
+    return @{
+        summarySha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($summaryBytes)).ToLowerInvariant()
+        deliveryStatus = $status
+        decisionPath = $decisionPath
+        decisionSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($decisionBytes)).ToLowerInvariant()
+        decisionSignatureVerified = $true
+        decisionPromotable = $promotable
+        authorizationKind = [string]$summary.authorizationKind
+        commentsEnabled = [bool]$context.CommentsEnabled
+        votesEnabled = [bool]$context.VotesEnabled
+        gatesEnabled = [bool]$context.GatesEnabled
+        providerWriteCount = 0
+        writeToolInvocations = 0
+        reconciliationSha256 = [string]$context.ReconciliationSha256
+        runCount = [int]$context.Reconciliation.runCount
+        requiredRunCount = [int]$context.Reconciliation.requiredRunCount
+        setId = $context.SetId
+        planDigest = $context.PlanDigest
+        # A census, in a fixed order, of numbers the reviewed evaluation computed.
+        # The names are labels for a human reading the audit; the caller carries
+        # them without being able to act on any of them.
+        counts = @(
+            [ordered]@{ name = 'runs'; value = [int]$context.Reconciliation.runCount }
+            [ordered]@{ name = 'requiredRuns'; value = [int]$context.Reconciliation.requiredRunCount }
+            [ordered]@{ name = 'candidates'; value = $candidateCount }
+            [ordered]@{ name = 'unattendedComments'; value = $unattendedCommentCount }
+            [ordered]@{ name = 'unattendedSuggestions'; value = $unattendedSuggestionCount }
+            [ordered]@{ name = 'humanPromotable'; value = [int]$decision.gateHumanPromotableCount }
+            [ordered]@{ name = 'importantOrHigher'; value = [int]$decision.gateImportantOrHigherCount }
+            [ordered]@{ name = 'runReasonCodes'; value = @($decision.runReasonCodes).Count }
+        )
+    }
+}
+
+function Read-ShadowChildDeliveryInput {
+    <#
+    .SYNOPSIS
+        Reads the caller's strict versioned delivery input, binds it to this set
+        and this comparison, and refuses any authorization but preview-only.
+    #>
+    param([Parameter(Mandatory)]$Request, [Parameter(Mandatory)]$Context)
+    $inputPath = Get-ShadowChildField -Request $Request -Name 'deliveryRequestPath'
+    $expectedSha = Get-ShadowChildOptionalField -Request $Request -Name 'deliveryRequestSha256'
+    if (-not (Test-Path -LiteralPath $inputPath -PathType Leaf)) {
+        throw "The delivery input '$inputPath' does not exist."
+    }
+    $text = [IO.File]::ReadAllText($inputPath, [Text.UTF8Encoding]::new($false))
+    $document = $text | ConvertFrom-Json
+    foreach ($name in @('contractVersion', 'correlationId', 'setId', 'planDigest', 'requiredRunCount',
+            'authorizationKind', 'commentsEnabled', 'votesEnabled', 'gatesEnabled', 'providerWriteBudget',
+            'reconciliationSha256', 'reconciliationArtifactSha256', 'outputDirectory', 'summaryPath')) {
+        if (-not $document.PSObject.Properties[$name]) {
+            throw "The delivery input at '$inputPath' is missing '$name'."
+        }
+    }
+    if ([string]$document.contractVersion -cne $script:ShadowDeliveryRequestVersion) {
+        throw "The delivery input at '$inputPath' declares contract '$([string]$document.contractVersion)'."
+    }
+    if ([string]$document.correlationId -cne [string]$Request.correlationId) {
+        throw "The delivery input at '$inputPath' belongs to correlation '$([string]$document.correlationId)'."
+    }
+    if ([string]$document.setId -cne $Context.SetId) {
+        throw "The delivery input at '$inputPath' names run set '$([string]$document.setId)'."
+    }
+    if ([string]$document.planDigest -cne $Context.PlanDigest) {
+        throw "The delivery input at '$inputPath' names plan '$([string]$document.planDigest)'."
+    }
+    if ([int]$document.requiredRunCount -ne [int]$Context.RequiredRunCount) {
+        throw "The delivery input at '$inputPath' asks for $([int]$document.requiredRunCount) run(s)."
+    }
+    if ([string]$document.authorizationKind -cne $script:ShadowDeliveryPreviewOnlyKind) {
+        throw "The delivery input at '$inputPath' authorizes '$([string]$document.authorizationKind)'."
+    }
+    if ([bool]$document.commentsEnabled -or [bool]$document.votesEnabled -or [bool]$document.gatesEnabled) {
+        throw "The delivery input at '$inputPath' turns on a write capability, which this adapter never evaluates under."
+    }
+    if ([int]$document.providerWriteBudget -ne 0) {
+        throw "The delivery input at '$inputPath' budgets $([int]$document.providerWriteBudget) provider write(s)."
+    }
+    # The comparison this decision is authorized to close over, byte for byte.
+    if ([string]$document.reconciliationSha256 -cne [string]$Context.ReconciliationSha256) {
+        throw ("The delivery input at '$inputPath' closes over comparison $([string]$document.reconciliationSha256) " +
+            "and this set's comparison is $([string]$Context.ReconciliationSha256).")
+    }
+    if ([string]$document.reconciliationArtifactSha256 -cne [string]$Context.ArtifactSha256) {
+        throw ("The delivery input at '$inputPath' binds artifact $([string]$document.reconciliationArtifactSha256) " +
+            "and the sealed comparison on disk digests to $([string]$Context.ArtifactSha256).")
+    }
+    $actualSha = Get-ShadowChildFileSha256 -Path $inputPath
+    if ($expectedSha -and $actualSha -cne $expectedSha) {
+        throw ("The delivery input at '$inputPath' hashes to $actualSha and the caller committed " +
+            "$expectedSha; the file changed after it was authorized.")
+    }
+    return @{
+        SummaryPath = [string]$document.summaryPath
+        RequestSha256 = $actualSha
+    }
+}
+
 # ---------------------------------------------------------------------------
 # One step, one tool, one result file.
 # ---------------------------------------------------------------------------
@@ -1444,6 +2023,12 @@ try {
         '^reconcilePrelaunch$' { Invoke-ShadowChildReconcilePlan -Request $request -ToolkitRoot $toolkitRoot }
         '^reconcileRun$' { Invoke-ShadowChildReconcileRun -Request $request -ToolkitRoot $toolkitRoot }
         '^reconcileVerify$' { Invoke-ShadowChildReconcileVerify -Request $request -ToolkitRoot $toolkitRoot }
+        '^deliveryPlan$' { Invoke-ShadowChildDeliveryPlan -Request $request -ToolkitRoot $toolkitRoot }
+        # The same derivation under a second name, used as the probe immediately
+        # before the irreversible evaluation, for the reason the slots have one.
+        '^deliveryPrelaunch$' { Invoke-ShadowChildDeliveryPlan -Request $request -ToolkitRoot $toolkitRoot }
+        '^deliveryRun$' { Invoke-ShadowChildDeliveryRun -Request $request -ToolkitRoot $toolkitRoot }
+        '^deliveryVerify$' { Invoke-ShadowChildDeliveryVerify -Request $request -ToolkitRoot $toolkitRoot }
         default { throw "'$step' is not a step this adapter performs." }
     }
     Write-ShadowChildResult -Path $resultPath -CorrelationId $correlationId -Step $step `

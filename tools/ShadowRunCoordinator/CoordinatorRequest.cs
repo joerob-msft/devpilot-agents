@@ -175,6 +175,15 @@ internal sealed record CoordinatorRequest
     /// <summary>The strict versioned file the reconciliation hands back.</summary>
     internal string ReconciliationSummaryPath => Path.Combine(ReconciliationRoot, "reconciliation-summary.json");
 
+    /// <summary>Where the strict versioned delivery exchange lives.</summary>
+    internal string DeliveryRoot => Path.Combine(CoordinatorRoot, "delivery");
+
+    /// <summary>The strict versioned file this coordinator hands the delivery evaluation.</summary>
+    internal string DeliveryRequestPath => Path.Combine(DeliveryRoot, "delivery-request.json");
+
+    /// <summary>The strict versioned file the delivery evaluation hands back.</summary>
+    internal string DeliverySummaryPath => Path.Combine(DeliveryRoot, "delivery-summary.json");
+
     internal static CoordinatorRequest Load(string path)
     {
         const string label = "shadow run coordinator request";
@@ -462,14 +471,15 @@ internal sealed record CorpusStageAuthorization
 }
 
 /// <summary>
-/// The authorization for the whole supervised set: both slots, in order, and
-/// the reconciliation that closes them.
+/// The authorization for the whole supervised set: both slots, in order, the
+/// reconciliation that closes them, and the preview-only delivery decision that
+/// may follow it.
 /// </summary>
 /// <remarks>
 /// Declared as a unit because it is sealed as a unit. The request digest covers
 /// this section whole, and the durable record binds that digest, so there is no
 /// resume under which a set can acquire a third slot, lose its second, or gain a
-/// reconciliation it was not written with.
+/// reconciliation or a delivery it was not written with.
 ///
 /// Nothing here decides anything about a review. The reviewer agent is named
 /// once for the set, because the qualification plan seals one agent for the set
@@ -484,6 +494,21 @@ internal sealed record SlotSetAuthorization
 
     internal required ReconciliationAuthorization Reconciliation { get; init; }
 
+    /// <summary>
+    /// The preview-only delivery decision this set was declared with, or null when
+    /// the request was written without one.
+    /// </summary>
+    /// <remarks>
+    /// Optional in exactly one direction. A request that omits the section
+    /// authorizes no delivery at all and every delivery transition refuses,
+    /// which is what keeps the reviewed PowerShell path the rollback default and
+    /// leaves every earlier slice's request valid unchanged. A request that
+    /// carries the section carries it whole, from creation, sealed inside the
+    /// same request digest as the slots it closes over - so no resume can add a
+    /// delivery to a set that was not declared with one.
+    /// </remarks>
+    internal DeliveryAuthorization? Delivery { get; init; }
+
     /// <summary>The one agent script the whole set names.</summary>
     internal string ReviewerScriptPath => Declared[0].ReviewerScriptPath;
 
@@ -493,7 +518,7 @@ internal sealed record SlotSetAuthorization
         {
             throw new ContractException($"The {label} is a {StrictJson.Describe(node.ValueKind)}, not an object.");
         }
-        StrictJson.RequireNoUnknownFields(node, label, "shadowSlotsEnabled", "declared", "reconciliation");
+        StrictJson.RequireNoUnknownFields(node, label, "shadowSlotsEnabled", "declared", "reconciliation", "delivery");
 
         var declaredNodes = StrictJson.RequireArray(node, "declared", label);
         if (declaredNodes.Count != CoordinatorRequest.DeclaredSlotCount)
@@ -542,11 +567,34 @@ internal sealed record SlotSetAuthorization
                 $"{declared.Count.ToString(CultureInfo.InvariantCulture)}. A reconciliation that closes over fewer runs than were declared is closing over a set nobody declared.");
         }
 
+        DeliveryAuthorization? delivery = null;
+        if (node.TryGetProperty("delivery", out var deliveryNode))
+        {
+            delivery = DeliveryAuthorization.Read(deliveryNode, label + " delivery");
+            if (delivery.RequiredRunCount != declared.Count)
+            {
+                throw new ContractException(
+                    $"The {label} delivery covers {delivery.RequiredRunCount.ToString(CultureInfo.InvariantCulture)} run(s) and the set declares " +
+                    $"{declared.Count.ToString(CultureInfo.InvariantCulture)}. A delivery decision over fewer runs than were declared is a decision about a set nobody declared.");
+            }
+            // Two evaluations writing into one directory would leave the
+            // reconciliation's artifacts and the delivery's indistinguishable by
+            // path, and the delivery is verified by pinning the files it
+            // produced. Refused in the request rather than discovered later.
+            if (string.Equals(delivery.OutputDirectory, reconciliation.OutputDirectory, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new ContractException(
+                    $"The {label} gives the reconciliation and the delivery the same output directory '{delivery.OutputDirectory}'; " +
+                    "each evaluation's artifacts must be distinguishable from the other's.");
+            }
+        }
+
         return new SlotSetAuthorization
         {
             ShadowSlotsEnabled = StrictJson.RequireBool(node, "shadowSlotsEnabled", label),
             Declared = declared,
-            Reconciliation = reconciliation
+            Reconciliation = reconciliation,
+            Delivery = delivery
         };
     }
 
@@ -560,7 +608,25 @@ internal sealed record SlotSetAuthorization
         return new MapNode()
             .Set("declaredSlotCount", Declared.Count)
             .Set("declared", slots)
-            .Set("reconciliation", Reconciliation.Describe());
+            .Set("reconciliation", Reconciliation.Describe())
+            .Set("deliveryDeclared", Delivery is not null)
+            .Set("delivery", Delivery is null ? Node.Null() : Delivery.Describe());
+    }
+
+    /// <summary>
+    /// The delivery authorization this set holds, or a refusal naming why it holds
+    /// none. Every delivery transition asks for it this way.
+    /// </summary>
+    internal DeliveryAuthorization RequireDelivery()
+    {
+        if (Delivery is null)
+        {
+            throw new ContractException(
+                "This request's slots section carries no 'delivery' section, so it authorizes no delivery decision. " +
+                "The reviewed PowerShell delivery path remains the default; a delivery is declared when the request is " +
+                "written or it is not declared at all.");
+        }
+        return Delivery.Require();
     }
 }
 
@@ -765,7 +831,9 @@ internal sealed record SlotModelPlan
 /// the comparison is the existing PowerShell tool, the report and the sealed
 /// artifact are its outputs, and what this coordinator gets back is a strict
 /// versioned summary of status, digests and named counts it copies without
-/// reading. There is no delivery here and no field that could become one.
+/// reading. There is no delivery in this record: a delivery is a separate,
+/// separately-declared authorization that runs after this one and writes
+/// nowhere either.
 /// </remarks>
 internal sealed record ReconciliationAuthorization
 {
@@ -822,4 +890,128 @@ internal sealed record ReconciliationAuthorization
         .Set("outputDirectory", OutputDirectory)
         .Set("requiredRunCount", RequiredRunCount)
         .Set("supervisionGraceSeconds", SupervisionGraceSeconds);
+}
+
+/// <summary>
+/// The authorization to evaluate one delivery decision over a reconciled set,
+/// in preview only, writing to no provider.
+/// </summary>
+/// <remarks>
+/// Every field here is a refusal wearing the shape of a setting. The
+/// authorization kind is a literal this contract will accept exactly one value
+/// for; the three capability flags are literals this contract will accept
+/// exactly <c>false</c> for; the write budget is a literal this contract will
+/// accept exactly zero for. There is no permissive value to write, so a request
+/// asking for a write is not a request this program can load - and that is
+/// checked here, at the boundary, before any child of any kind is started.
+///
+/// The delivery itself is the reviewed PowerShell's. What crosses back into this
+/// program is a status word, some digests, and a census of integers, none of
+/// which anything here compares to a literal or branches on. This record cannot
+/// widen that: it is authorization and binding, and there is no field in it that
+/// names a comment, a vote, a thread, a severity or a finding.
+/// </remarks>
+internal sealed record DeliveryAuthorization
+{
+    /// <summary>The one authorization kind this build accepts. There is no second one.</summary>
+    internal const string PreviewOnlyKind = "PreviewOnly";
+
+    internal required bool DeliveryEnabled { get; init; }
+
+    /// <summary>Always <see cref="PreviewOnlyKind"/>; any other value is refused at load.</summary>
+    internal required string AuthorizationKind { get; init; }
+
+    /// <summary>Where the reviewed evaluation writes its decision artifact and report.</summary>
+    internal required string OutputDirectory { get; init; }
+
+    /// <summary>How many runs the decision closes over, which is the declared slot count.</summary>
+    internal required int RequiredRunCount { get; init; }
+
+    /// <summary>The single-use authorization the delivery presents.</summary>
+    internal required string LaunchAuthorizationTokenPath { get; init; }
+
+    internal required int SupervisionGraceSeconds { get; init; }
+
+    internal static DeliveryAuthorization Read(JsonElement node, string label)
+    {
+        if (node.ValueKind != JsonValueKind.Object)
+        {
+            throw new ContractException($"The {label} is a {StrictJson.Describe(node.ValueKind)}, not an object.");
+        }
+        StrictJson.RequireNoUnknownFields(
+            node,
+            label,
+            "deliveryEnabled",
+            "authorizationKind",
+            "outputDirectory",
+            "requiredRunCount",
+            "launchAuthorizationTokenPath",
+            "supervisionGraceSeconds",
+            "commentsEnabled",
+            "votesEnabled",
+            "gatesEnabled",
+            "providerWriteBudget");
+
+        var kind = StrictJson.RequireString(node, "authorizationKind", label);
+        if (!string.Equals(kind, PreviewOnlyKind, StringComparison.Ordinal))
+        {
+            throw new ContractException(
+                $"The {label} declares authorization kind '{kind}'. This build authorizes exactly one kind, " +
+                $"'{PreviewOnlyKind}', and there is no transition it could perform under any other.");
+        }
+        // Read as literals rather than as booleans that happen to be false today.
+        // A boolean read would make "true" a value this program accepts and then
+        // refuses somewhere downstream; a literal makes it a request that never
+        // loads.
+        foreach (var capability in new[] { "commentsEnabled", "votesEnabled", "gatesEnabled" })
+        {
+            if (StrictJson.RequireBool(node, capability, label))
+            {
+                throw new ContractException(
+                    $"The {label} sets '{capability}' to true. Every write capability is off in this build and there " +
+                    "is no code path that could honour one, so a request asking for it is refused before anything starts.");
+            }
+        }
+        var writeBudget = StrictJson.RequireInt(node, "providerWriteBudget", label, 0, 0);
+
+        return new DeliveryAuthorization
+        {
+            DeliveryEnabled = StrictJson.RequireBool(node, "deliveryEnabled", label),
+            AuthorizationKind = kind,
+            OutputDirectory = StrictJson.RequireString(node, "outputDirectory", label),
+            RequiredRunCount = StrictJson.RequireInt(node, "requiredRunCount", label, 2, 16),
+            LaunchAuthorizationTokenPath = StrictJson.RequireString(node, "launchAuthorizationTokenPath", label),
+            SupervisionGraceSeconds = StrictJson.RequireInt(node, "supervisionGraceSeconds", label, 30, 3600),
+            ProviderWriteBudget = writeBudget
+        };
+    }
+
+    /// <summary>Zero, and refused at load if it is anything else.</summary>
+    internal required int ProviderWriteBudget { get; init; }
+
+    /// <summary>
+    /// The delivery authorization this run holds, or a refusal naming why it holds
+    /// none.
+    /// </summary>
+    internal DeliveryAuthorization Require()
+    {
+        if (!DeliveryEnabled)
+        {
+            throw new ContractException(
+                "The request's delivery section sets 'deliveryEnabled' to false, which is an explicit refusal to " +
+                "evaluate a delivery decision. The set may still run and reconcile; nothing is evaluated and nothing is written.");
+        }
+        return this;
+    }
+
+    internal MapNode Describe() => new MapNode()
+        .Set("deliveryEnabled", DeliveryEnabled)
+        .Set("authorizationKind", AuthorizationKind)
+        .Set("outputDirectory", OutputDirectory)
+        .Set("requiredRunCount", RequiredRunCount)
+        .Set("supervisionGraceSeconds", SupervisionGraceSeconds)
+        .Set("commentsEnabled", false)
+        .Set("votesEnabled", false)
+        .Set("gatesEnabled", false)
+        .Set("providerWriteBudget", ProviderWriteBudget);
 }
