@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 
 namespace DevPilot.ShadowRunCoordinator;
@@ -14,11 +15,27 @@ namespace DevPilot.ShadowRunCoordinator;
 /// </remarks>
 internal sealed record CoordinatorRequest
 {
-    internal const string ContractVersionValue = "devpilot.shadow-run-coordinator.request.v1";
+    internal const string ContractVersionValue = "devpilot.shadow-run-coordinator.request.v2";
     internal const string KindValue = "shadow-run-preparation";
 
-    /// <summary>The one slot name this build supervises. There is no second slot to name.</summary>
-    internal const string SupervisedSlotName = "slot1";
+    /// <summary>
+    /// The slot names this build supervises, in the only order it supervises
+    /// them, and the only cardinality it accepts.
+    /// </summary>
+    /// <remarks>
+    /// Both are declared when the request is written, or neither is. A run set
+    /// whose second slot appears after the first has already run is a set whose
+    /// size changed under a signature, and the whole point of declaring the pair
+    /// up front is that the declaration, the plan digest and the request digest
+    /// all describe the same two runs from the moment anything is sealed.
+    /// </remarks>
+    internal static readonly string[] DeclaredSlotNames = ["slot1", "slot2"];
+
+    internal const string FirstSlotName = "slot1";
+
+    internal const string SecondSlotName = "slot2";
+
+    internal const int DeclaredSlotCount = 2;
 
     internal required string ContractVersion { get; init; }
 
@@ -85,18 +102,22 @@ internal sealed record CoordinatorRequest
     internal required string RequestSha256 { get; init; }
 
     /// <summary>
-    /// The one-slot supervision authorization, or null when this request does not
+    /// The two-slot supervision authorization, or null when this request does not
     /// carry one.
     /// </summary>
     /// <remarks>
     /// Optional in one direction only. Absent means the request authorizes no
-    /// launch at all, which is the PowerShell rollback posture and the state of
-    /// every request written for the preparation slice; it is not a field being
-    /// defaulted, it is an authorization that was never given. Present-and-disabled
-    /// says the same thing explicitly. Only a present section carrying an explicit
-    /// true selects the typed slot path.
+    /// launch at all, which is the PowerShell rollback posture; it is not a field
+    /// being defaulted, it is an authorization that was never given.
+    /// Present-and-disabled says the same thing explicitly. Only a present
+    /// section carrying an explicit true selects the typed slot path.
+    ///
+    /// A present section declares BOTH slots and the reconciliation that closes
+    /// them, in one file, digested as a unit. There is no way to declare one slot
+    /// now and the other later: the state record binds the request digest, so a
+    /// request that grew a slot is a different request and refuses to resume.
     /// </remarks>
-    internal SlotAuthorization? Slot { get; init; }
+    internal SlotSetAuthorization? Slots { get; init; }
 
     /// <summary>
     /// The authorization to build this run's corpus, or null when the caller
@@ -137,6 +158,15 @@ internal sealed record CoordinatorRequest
 
     internal string QualificationRoot => Path.Combine(OutputRoot, "qualification");
 
+    /// <summary>Where the strict versioned reconciliation exchange lives.</summary>
+    internal string ReconciliationRoot => Path.Combine(CoordinatorRoot, "reconciliation");
+
+    /// <summary>The strict versioned file this coordinator hands the reconciliation.</summary>
+    internal string ReconciliationRequestPath => Path.Combine(ReconciliationRoot, "reconciliation-request.json");
+
+    /// <summary>The strict versioned file the reconciliation hands back.</summary>
+    internal string ReconciliationSummaryPath => Path.Combine(ReconciliationRoot, "reconciliation-summary.json");
+
     internal static CoordinatorRequest Load(string path)
     {
         const string label = "shadow run coordinator request";
@@ -154,7 +184,7 @@ internal sealed record CoordinatorRequest
             "output",
             "children",
             "qualification",
-            "slot",
+            "slots",
             "corpusStage");
 
         var contractVersion = StrictJson.RequireLiteral(root, "contractVersion", ContractVersionValue, label);
@@ -205,10 +235,10 @@ internal sealed record CoordinatorRequest
         // Optional, and read fail-closed when present: a section that exists must
         // be complete and well shaped. The only thing absence buys is "no
         // authorization", never a default value for one.
-        SlotAuthorization? slot = null;
-        if (root.TryGetProperty("slot", out var slotNode))
+        SlotSetAuthorization? slots = null;
+        if (root.TryGetProperty("slots", out var slotsNode))
         {
-            slot = SlotAuthorization.Read(slotNode, label + " slot");
+            slots = SlotSetAuthorization.Read(slotsNode, label + " slots");
         }
 
         CorpusStageAuthorization? corpusStage = null;
@@ -218,6 +248,16 @@ internal sealed record CoordinatorRequest
         }
 
         var bytes = File.ReadAllBytes(path);
+        var plannedRunCount = StrictJson.RequireInt(qualification, "plannedRunCount", label + " qualification", 2, 16);
+        // Exact, not merely compatible. A set that plans three runs while the
+        // request declares two would leave a slot nobody supervises and a
+        // reconciliation that closes over a set it never saw whole.
+        if (slots is not null && plannedRunCount != slots.Declared.Count)
+        {
+            throw new ContractException(
+                $"The request plans {plannedRunCount.ToString(System.Globalization.CultureInfo.InvariantCulture)} run(s) and declares " +
+                $"{slots.Declared.Count.ToString(System.Globalization.CultureInfo.InvariantCulture)} slot(s). A declared run set is the slots it declares, exactly.");
+        }
         return new CoordinatorRequest
         {            ContractVersion = contractVersion,
             Kind = kind,
@@ -247,10 +287,10 @@ internal sealed record CoordinatorRequest
             ReviewerRepositoryPath = StrictJson.RequireString(qualification, "reviewerRepositoryPath", label + " qualification"),
             ExpectedCommit = StrictJson.RequireHex(qualification, "expectedCommit", label + " qualification", 40),
             RequiredRef = StrictJson.RequireString(qualification, "requiredRef", label + " qualification"),
-            PlannedRunCount = StrictJson.RequireInt(qualification, "plannedRunCount", label + " qualification", 2, 16),
+            PlannedRunCount = plannedRunCount,
             RunSetKeyPath = StrictJson.RequireString(qualification, "runSetKeyPath", label + " qualification"),
             RequestSha256 = CanonicalJson.Sha256Hex(bytes),
-            Slot = slot,
+            Slots = slots,
             CorpusStage = corpusStage
         };
     }
@@ -294,27 +334,50 @@ internal sealed record CoordinatorRequest
         .Set("corpusIndexSha256", CorpusIndexSha256);
 
     /// <summary>
-    /// The slot authorization this run holds, or a refusal naming why it holds
-    /// none. Every slot transition asks for it this way, so there is exactly one
-    /// place where "no authorization" becomes a refusal.
+    /// The slot set this run holds, or a refusal naming why it holds none. Every
+    /// slot and reconciliation transition asks for it this way, so there is
+    /// exactly one place where "no authorization" becomes a refusal.
     /// </summary>
-    internal SlotAuthorization RequireSlotAuthorization()
+    internal SlotSetAuthorization RequireSlotSet()
     {
-        if (Slot is null)
+        if (Slots is null)
         {
             throw new ContractException(
-                "This request carries no 'slot' section, so it authorizes no launch. " +
-                "The PowerShell qualification path remains the default; add an explicit slot section with " +
-                "'shadowSlotEnabled': true to select the typed supervisor.");
+                "This request carries no 'slots' section, so it authorizes no launch. " +
+                "The PowerShell qualification path remains the default; add an explicit slots section with " +
+                "'shadowSlotsEnabled': true to select the typed supervisor.");
         }
-        if (!Slot.ShadowSlotEnabled)
+        if (!Slots.ShadowSlotsEnabled)
         {
             throw new ContractException(
-                "The request's slot section sets 'shadowSlotEnabled' to false, which is an explicit refusal to " +
+                "The request's slots section sets 'shadowSlotsEnabled' to false, which is an explicit refusal to " +
                 "launch through the typed supervisor. Nothing is launched.");
         }
-        return Slot;
+        return Slots;
     }
+
+    /// <summary>The declared slot at an ordinal, or a refusal. Ordinals are one-based.</summary>
+    internal SlotAuthorization RequireSlot(int ordinal)
+    {
+        var set = RequireSlotSet();
+        foreach (var slot in set.Declared)
+        {
+            if (slot.Ordinal == ordinal)
+            {
+                return slot;
+            }
+        }
+        throw new ContractException(
+            $"This request declares no slot at ordinal {ordinal.ToString(System.Globalization.CultureInfo.InvariantCulture)}; " +
+            $"it declares {string.Join(", ", set.Declared.Select(entry => "'" + entry.Name + "'"))}.");
+    }
+
+    /// <summary>
+    /// The reviewer agent every declared slot names. Read through the set so that
+    /// a request naming two different agents is refused once, here, rather than
+    /// discovered when the second slot fails to reproduce the first's plan.
+    /// </summary>
+    internal string SlotReviewerScriptPath => Slots?.ReviewerScriptPath ?? string.Empty;
 
     /// <summary>
     /// Whether this run builds its own corpus. Absent and present-and-disabled
@@ -391,14 +454,120 @@ internal sealed record CorpusStageAuthorization
 }
 
 /// <summary>
+/// The authorization for the whole supervised set: both slots, in order, and
+/// the reconciliation that closes them.
+/// </summary>
+/// <remarks>
+/// Declared as a unit because it is sealed as a unit. The request digest covers
+/// this section whole, and the durable record binds that digest, so there is no
+/// resume under which a set can acquire a third slot, lose its second, or gain a
+/// reconciliation it was not written with.
+///
+/// Nothing here decides anything about a review. The reviewer agent is named
+/// once for the set, because the qualification plan seals one agent for the set
+/// and two slots naming two agents could never reproduce one plan.
+/// </remarks>
+internal sealed record SlotSetAuthorization
+{
+    internal required bool ShadowSlotsEnabled { get; init; }
+
+    /// <summary>The declared slots, in ordinal order, and there are exactly two.</summary>
+    internal required IReadOnlyList<SlotAuthorization> Declared { get; init; }
+
+    internal required ReconciliationAuthorization Reconciliation { get; init; }
+
+    /// <summary>The one agent script the whole set names.</summary>
+    internal string ReviewerScriptPath => Declared[0].ReviewerScriptPath;
+
+    internal static SlotSetAuthorization Read(JsonElement node, string label)
+    {
+        if (node.ValueKind != JsonValueKind.Object)
+        {
+            throw new ContractException($"The {label} is a {StrictJson.Describe(node.ValueKind)}, not an object.");
+        }
+        StrictJson.RequireNoUnknownFields(node, label, "shadowSlotsEnabled", "declared", "reconciliation");
+
+        var declaredNodes = StrictJson.RequireArray(node, "declared", label);
+        if (declaredNodes.Count != CoordinatorRequest.DeclaredSlotCount)
+        {
+            throw new ContractException(
+                $"The {label} declares {declaredNodes.Count.ToString(CultureInfo.InvariantCulture)} slot(s). " +
+                $"This build supervises exactly {CoordinatorRequest.DeclaredSlotCount.ToString(CultureInfo.InvariantCulture)}, " +
+                $"named {string.Join(" then ", CoordinatorRequest.DeclaredSlotNames)}, and both are declared when the request is written.");
+        }
+        var declared = new List<SlotAuthorization>();
+        for (var index = 0; index < declaredNodes.Count; index++)
+        {
+            var expected = CoordinatorRequest.DeclaredSlotNames[index];
+            declared.Add(SlotAuthorization.Read(declaredNodes[index], $"{label} declared[{index.ToString(CultureInfo.InvariantCulture)}]", expected, index + 1));
+        }
+
+        // One agent for the set. Read as an equality rather than as a preference
+        // so that the refusal names the disagreement instead of silently
+        // preferring the first slot's answer.
+        if (!string.Equals(declared[0].ReviewerScriptPath, declared[1].ReviewerScriptPath, StringComparison.Ordinal))
+        {
+            throw new ContractException(
+                $"The {label} names '{declared[0].ReviewerScriptPath}' for '{declared[0].Name}' and '{declared[1].ReviewerScriptPath}' for '{declared[1].Name}'. " +
+                "One qualification plan seals one agent, so a set whose slots name two could never reproduce the plan it was declared under.");
+        }
+        // Two slots that share a state root are one slot run twice into the same
+        // place. The names are declared rather than derived, so the collision is
+        // caught in the request instead of when the second run overwrites the
+        // first's evidence.
+        if (string.Equals(declared[0].StateDirName, declared[1].StateDirName, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ContractException($"The {label} gives both slots the state root '{declared[0].StateDirName}'; two runs that share a state root are not two runs.");
+        }
+        if (string.Equals(declared[0].TerminalName, declared[1].TerminalName, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ContractException($"The {label} gives both slots the terminal artifact '{declared[0].TerminalName}'; the second would overwrite the first's evidence.");
+        }
+
+        var reconciliation = ReconciliationAuthorization.Read(
+            StrictJson.RequireObject(node, "reconciliation", label),
+            label + " reconciliation");
+        if (reconciliation.RequiredRunCount != declared.Count)
+        {
+            throw new ContractException(
+                $"The {label} reconciliation requires {reconciliation.RequiredRunCount.ToString(CultureInfo.InvariantCulture)} run(s) and the set declares " +
+                $"{declared.Count.ToString(CultureInfo.InvariantCulture)}. A reconciliation that closes over fewer runs than were declared is closing over a set nobody declared.");
+        }
+
+        return new SlotSetAuthorization
+        {
+            ShadowSlotsEnabled = StrictJson.RequireBool(node, "shadowSlotsEnabled", label),
+            Declared = declared,
+            Reconciliation = reconciliation
+        };
+    }
+
+    internal MapNode Describe()
+    {
+        var slots = new ListNode();
+        foreach (var slot in Declared)
+        {
+            slots.Add(slot.Describe());
+        }
+        return new MapNode()
+            .Set("declaredSlotCount", Declared.Count)
+            .Set("declared", slots)
+            .Set("reconciliation", Reconciliation.Describe());
+    }
+}
+
+/// <summary>
 /// The authorization for exactly one supervised slot.
 /// </summary>
 /// <remarks>
-/// Everything here is authorization or supervision. There is no model, no
-/// prompt, no candidate rule and no verdict rule, and there is no second slot to
-/// name: <see cref="CoordinatorRequest.SupervisedSlotName"/> is the only value
-/// the name field accepts, so a request cannot ask this build for slot two by
-/// writing one down.
+/// Everything here is authorization, binding or supervision. There is no prompt,
+/// no candidate rule and no verdict rule, and the one thing here that touches a
+/// model is opaque: <see cref="ModelPlan"/> carries argument strings this
+/// coordinator forwards and digests but never reads, compares by value, or
+/// branches on. Which models a slot runs is the reviewed plan's decision, sealed
+/// into the plan digest; what a slot may do here is say that it expects that
+/// decision to contain particular sealed arguments, and let the reviewed side
+/// answer.
 ///
 /// The deadlines are NOT here. They come from the signed qualification plan, so
 /// a caller cannot widen a slot's budget by editing its own request; what the
@@ -408,19 +577,28 @@ internal sealed record CorpusStageAuthorization
 /// </remarks>
 internal sealed record SlotAuthorization
 {
-    internal required bool ShadowSlotEnabled { get; init; }
-
     internal required string Name { get; init; }
+
+    /// <summary>One-based position in the declared order, which is the order slots run in.</summary>
+    internal required int Ordinal { get; init; }
 
     /// <summary>The agent script the qualification plan names, bound by the plan digest.</summary>
     internal required string ReviewerScriptPath { get; init; }
 
-    /// <summary>The single-use launch-authorization token the declaration minted.</summary>
+    /// <summary>The single-use launch-authorization token this slot presents.</summary>
     internal required string LaunchAuthorizationTokenPath { get; init; }
 
     internal required int SupervisionGraceSeconds { get; init; }
 
-    internal static SlotAuthorization Read(JsonElement node, string label)
+    /// <summary>The leaf name this slot's state root must carry.</summary>
+    internal required string StateDirName { get; init; }
+
+    /// <summary>The leaf name this slot's terminal artifact must carry.</summary>
+    internal required string TerminalName { get; init; }
+
+    internal required SlotModelPlan ModelPlan { get; init; }
+
+    internal static SlotAuthorization Read(JsonElement node, string label, string expectedName, int ordinal)
     {
         if (node.ValueKind != JsonValueKind.Object)
         {
@@ -429,35 +607,211 @@ internal sealed record SlotAuthorization
         StrictJson.RequireNoUnknownFields(
             node,
             label,
-            "shadowSlotEnabled",
             "name",
             "reviewerScriptPath",
             "launchAuthorizationTokenPath",
-            "supervisionGraceSeconds");
+            "supervisionGraceSeconds",
+            "stateDirName",
+            "terminalName",
+            "modelPlan");
 
         var name = StrictJson.RequireString(node, "name", label);
-        if (!string.Equals(name, CoordinatorRequest.SupervisedSlotName, StringComparison.Ordinal))
+        // Position and name are checked against each other rather than either
+        // being inferred. A set whose second entry calls itself slot1 would
+        // otherwise run the same slot twice under two authorizations.
+        if (!string.Equals(name, expectedName, StringComparison.Ordinal))
         {
             throw new ContractException(
-                $"The {label} names slot '{name}'. This build supervises exactly one slot, '{CoordinatorRequest.SupervisedSlotName}', " +
-                "and has no reconciliation to close a set with.");
+                $"The {label} names slot '{name}' at the position reserved for '{expectedName}'. " +
+                $"This build supervises {string.Join(" then ", CoordinatorRequest.DeclaredSlotNames)}, in that order.");
         }
         return new SlotAuthorization
         {
-            ShadowSlotEnabled = StrictJson.RequireBool(node, "shadowSlotEnabled", label),
             Name = name,
+            Ordinal = ordinal,
             ReviewerScriptPath = StrictJson.RequireString(node, "reviewerScriptPath", label),
             LaunchAuthorizationTokenPath = StrictJson.RequireString(node, "launchAuthorizationTokenPath", label),
             // A grace of zero would mean the supervisor kills at the same instant
             // the plan's own deadline fires, and the race decides whether the
             // immutable terminal artifact gets written at all. The floor makes the
             // PowerShell owner the writer of its own terminal in every ordering.
-            SupervisionGraceSeconds = StrictJson.RequireInt(node, "supervisionGraceSeconds", label, 30, 3600)
+            SupervisionGraceSeconds = StrictJson.RequireInt(node, "supervisionGraceSeconds", label, 30, 3600),
+            StateDirName = RequireLeafName(node, "stateDirName", label),
+            TerminalName = RequireLeafName(node, "terminalName", label),
+            ModelPlan = SlotModelPlan.Read(StrictJson.RequireObject(node, "modelPlan", label), label + " modelPlan")
         };
+    }
+
+    /// <summary>
+    /// A single path component, refused if it could climb out of the directory
+    /// the reviewed plan places a slot's evidence in.
+    /// </summary>
+    private static string RequireLeafName(JsonElement node, string field, string label)
+    {
+        var value = StrictJson.RequireString(node, field, label);
+        if (value.Length is 0 or > 128)
+        {
+            throw new ContractException($"The {label} field '{field}' must be 1 to 128 characters.");
+        }
+        foreach (var character in value)
+        {
+            var ok = character is (>= 'a' and <= 'z') or (>= 'A' and <= 'Z') or (>= '0' and <= '9') or '-' or '_' or '.';
+            if (!ok)
+            {
+                throw new ContractException($"The {label} field '{field}' accepts only letters, digits, hyphen, underscore and dot; it is a single path component, not a path.");
+            }
+        }
+        if (value is "." or ".." || value.Contains("..", StringComparison.Ordinal))
+        {
+            throw new ContractException($"The {label} field '{field}' is '{value}', which is not a single path component.");
+        }
+        return value;
     }
 
     internal MapNode Describe() => new MapNode()
         .Set("name", Name)
+        .Set("ordinal", Ordinal)
         .Set("reviewerScriptPath", ReviewerScriptPath)
+        .Set("supervisionGraceSeconds", SupervisionGraceSeconds)
+        .Set("stateDirName", StateDirName)
+        .Set("terminalName", TerminalName)
+        .Set("modelPlan", ModelPlan.Describe());
+}
+
+/// <summary>
+/// What a slot expects its sealed plan arguments to contain, as opaque text.
+/// </summary>
+/// <remarks>
+/// This is the one place a model name may reach the typed control plane, and it
+/// reaches it as a string in a signed request that this code forwards and
+/// digests without reading. There is no comparison by value here, no lookup
+/// table, no selection and no default: the arguments are handed to the reviewed
+/// side, which owns what they mean, and the answer comes back as a boolean the
+/// reviewed side computed.
+///
+/// <see cref="BindSealedArguments"/> is explicit rather than inferred from an
+/// empty list, because "I declare no expectation" and "I declare an empty
+/// expectation" are different statements and only one of them is an authorization
+/// to skip a check.
+/// </remarks>
+internal sealed record SlotModelPlan
+{
+    internal required bool BindSealedArguments { get; init; }
+
+    /// <summary>Opaque argument text, forwarded verbatim and never interpreted here.</summary>
+    internal required IReadOnlyList<string> OpaqueArguments { get; init; }
+
+    internal static SlotModelPlan Read(JsonElement node, string label)
+    {
+        StrictJson.RequireNoUnknownFields(node, label, "bindSealedArguments", "opaqueArguments");
+        var bind = StrictJson.RequireBool(node, "bindSealedArguments", label);
+        var arguments = StrictJson.RequireStringArray(node, "opaqueArguments", label);
+        if (arguments.Count > 64)
+        {
+            throw new ContractException($"The {label} carries {arguments.Count.ToString(CultureInfo.InvariantCulture)} opaque argument(s); 64 is the most a slot may declare.");
+        }
+        foreach (var argument in arguments)
+        {
+            if (argument.Length is 0 or > 256)
+            {
+                throw new ContractException($"The {label} carries an opaque argument of {argument.Length.ToString(CultureInfo.InvariantCulture)} characters; each is 1 to 256.");
+            }
+        }
+        if (bind && arguments.Count == 0)
+        {
+            throw new ContractException(
+                $"The {label} asks for its sealed arguments to be bound and declares none. " +
+                "An empty expectation binds nothing; say 'bindSealedArguments': false to declare that no binding was asked for.");
+        }
+        return new SlotModelPlan { BindSealedArguments = bind, OpaqueArguments = arguments };
+    }
+
+    /// <summary>The opaque arguments as a list node, for forwarding to the reviewed side.</summary>
+    internal ListNode AsList()
+    {
+        var list = new ListNode();
+        foreach (var argument in OpaqueArguments)
+        {
+            list.Add(argument);
+        }
+        return list;
+    }
+
+    /// <summary>
+    /// The record's view of the declaration: whether a binding was asked for,
+    /// how many arguments it names, and their digest. The argument text is
+    /// deliberately not committed, so a state file never becomes a place to read
+    /// a model roster out of.
+    /// </summary>
+    internal MapNode Describe() => new MapNode()
+        .Set("bindSealedArguments", BindSealedArguments)
+        .Set("opaqueArgumentCount", OpaqueArguments.Count)
+        .Set("opaqueArgumentsSha256", CanonicalJson.Sha256HexOfText(CanonicalJson.Canonical(AsList())));
+}
+
+/// <summary>
+/// The authorization to close a completed set with the reviewed comparison.
+/// </summary>
+/// <remarks>
+/// It carries no rule about what reconciliation should conclude, and it cannot:
+/// the comparison is the existing PowerShell tool, the report and the sealed
+/// artifact are its outputs, and what this coordinator gets back is a strict
+/// versioned summary of status, digests and named counts it copies without
+/// reading. There is no delivery here and no field that could become one.
+/// </remarks>
+internal sealed record ReconciliationAuthorization
+{
+    internal required bool ReconciliationEnabled { get; init; }
+
+    /// <summary>Where the reviewed comparison writes its report and sealed artifact.</summary>
+    internal required string OutputDirectory { get; init; }
+
+    /// <summary>How many runs the comparison is required to cover, which is the declared slot count.</summary>
+    internal required int RequiredRunCount { get; init; }
+
+    /// <summary>The single-use authorization the reconciliation presents.</summary>
+    internal required string LaunchAuthorizationTokenPath { get; init; }
+
+    internal required int SupervisionGraceSeconds { get; init; }
+
+    internal static ReconciliationAuthorization Read(JsonElement node, string label)
+    {
+        StrictJson.RequireNoUnknownFields(
+            node,
+            label,
+            "reconciliationEnabled",
+            "outputDirectory",
+            "requiredRunCount",
+            "launchAuthorizationTokenPath",
+            "supervisionGraceSeconds");
+        return new ReconciliationAuthorization
+        {
+            ReconciliationEnabled = StrictJson.RequireBool(node, "reconciliationEnabled", label),
+            OutputDirectory = StrictJson.RequireString(node, "outputDirectory", label),
+            RequiredRunCount = StrictJson.RequireInt(node, "requiredRunCount", label, 2, 16),
+            LaunchAuthorizationTokenPath = StrictJson.RequireString(node, "launchAuthorizationTokenPath", label),
+            SupervisionGraceSeconds = StrictJson.RequireInt(node, "supervisionGraceSeconds", label, 30, 3600)
+        };
+    }
+
+    /// <summary>
+    /// The reconciliation authorization this run holds, or a refusal naming why
+    /// it holds none.
+    /// </summary>
+    internal ReconciliationAuthorization Require()
+    {
+        if (!ReconciliationEnabled)
+        {
+            throw new ContractException(
+                "The request's reconciliation section sets 'reconciliationEnabled' to false, which is an explicit refusal to " +
+                "close this set. The two slots may still run; nothing is reconciled and nothing is delivered.");
+        }
+        return this;
+    }
+
+    internal MapNode Describe() => new MapNode()
+        .Set("reconciliationEnabled", ReconciliationEnabled)
+        .Set("outputDirectory", OutputDirectory)
+        .Set("requiredRunCount", RequiredRunCount)
         .Set("supervisionGraceSeconds", SupervisionGraceSeconds);
 }

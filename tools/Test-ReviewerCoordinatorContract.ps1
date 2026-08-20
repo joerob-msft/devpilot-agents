@@ -190,7 +190,29 @@ $forbiddenCoordinatorTokens = [string[]]@(
     # so the names a provider write would need are forbidden outright rather than
     # left to review.
     'PostComment', 'CreateComment', 'PublishComment', 'WriteComment', 'CreateThread',
-    'UpdatePullRequest', 'http://', 'https://'
+    'UpdatePullRequest', 'http://', 'https://',
+    # Slice three adds a second slot and a reconciliation, and both bring a new
+    # way for judgement to arrive. A model name written down in C# would be a
+    # choice this program made; the names reach it only inside the signed
+    # request's opaque argument list, are forwarded verbatim and are never
+    # compared, so no literal one may appear here.
+    'gpt-', 'claude-', 'gemini', 'o3-', 'ModelName', 'modelName', 'ReviewerModel',
+    # The reconciliation's own vocabulary. Its census is copied across by
+    # position; a coordinator that named one of these counters would be a
+    # coordinator that had a rule about it.
+    'StableRow', 'stableRow', 'UnstableRow', 'unstableRow',
+    'AgreedCandidate', 'agreedCandidate', 'CandidateText', 'FindingText', 'findingText',
+    # The switch that turns disagreement into a failure is the reviewed tool's to
+    # own. Asking for it would be asking the comparison to form the opinion this
+    # program is forbidden to hold.
+    'FailOnDisagreement',
+    # The reviewed comparison and reconciliation are reached through the child
+    # adapter's step contract, never by name. Naming one would be this program
+    # deciding how the comparison is invoked.
+    'Compare-ReviewerReplayRuns', 'Resolve-ReviewerRunReconciliation',
+    # There is no delivery in this slice, and the names one would need are
+    # forbidden outright so that adding one is a change to this list first.
+    'DeliveryAuthorized', 'deliveryAuthorized', 'DeliverPreview'
 )
 foreach ($file in $csharpFiles) {
     $text = [IO.File]::ReadAllText($file.FullName)
@@ -226,6 +248,65 @@ if (Test-Path -LiteralPath $requestContract -PathType Leaf) {
     }
     Assert-Coordinator ($requestText.Contains('supervisionGraceSeconds')) `
         'The typed request contract no longer carries the supervision grace, which is the one budget a caller may set.'
+
+    # ---------------------------------------------------------------------
+    # Exactly two slots, declared from creation.
+    # ---------------------------------------------------------------------
+    # A set whose size could change between its declaration and its comparison
+    # is a set whose comparison is over an unknown number of runs. The count is
+    # therefore a constant in the contract rather than a length read off the
+    # request, and the names are positional, so a request cannot rename its way
+    # into a different set.
+    Assert-Coordinator ($requestText -match 'DeclaredSlotCount\s*=\s*2\b') `
+        'The typed request contract does not fix the declared slot count at two.'
+    Assert-Coordinator ($requestText.Contains('DeclaredSlotNames')) `
+        'The typed request contract does not name its declared slots.'
+    foreach ($slotName in @('slot1', 'slot2')) {
+        Assert-Coordinator ($requestText.Contains($slotName)) `
+            "The typed request contract does not declare '$slotName'."
+    }
+    # And no dynamic membership: nothing in the contract may add a slot.
+    foreach ($growth in @('AddSlot', 'AppendSlot', 'slotCount =', 'ResizeSlot')) {
+        Assert-Coordinator (-not $requestText.Contains($growth)) `
+            "The typed request contract reads '$growth'; the declared set is fixed at creation and never grows."
+    }
+}
+
+# ---------------------------------------------------------------------------
+# No delivery, structurally.
+# ---------------------------------------------------------------------------
+# The state enumeration is the one place a delivery transition would have to
+# appear, so the absence is asserted there rather than inferred from the absence
+# of a caller.
+$stateContract = Join-Path $repoRoot 'tools\ShadowRunCoordinator\CoordinatorState.cs'
+if (Test-Path -LiteralPath $stateContract -PathType Leaf) {
+    $stateText = [IO.File]::ReadAllText($stateContract)
+    foreach ($deliveryState in @('Delivery', 'Deliver', 'Published to', 'ProviderWrite')) {
+        Assert-Coordinator (-not $stateText.Contains($deliveryState)) `
+            "The coordinator state enumeration reads '$deliveryState'; this slice has no delivery transition."
+    }
+    # The reconciliation is a state, and its ordering is what makes the set's
+    # comparison mean anything. Asserted here so that removing the gate is a
+    # change to a file this suite reads.
+    foreach ($required in @('Slot1TerminalVerified', 'Slot2TerminalVerified',
+            'ReconciliationAuthorized', 'ReconciliationRunning', 'ReconciliationVerified')) {
+        Assert-Coordinator ($stateText.Contains($required)) `
+            "The coordinator state enumeration does not carry '$required'."
+    }
+}
+
+# The comparison's result is carried, never read. The one function that copies
+# the census across must not compare a name to anything, so the file that holds
+# it is asserted to contain the carrier and none of the counters.
+$machineContract = Join-Path $repoRoot 'tools\ShadowRunCoordinator\PreparationMachine.cs'
+if (Test-Path -LiteralPath $machineContract -PathType Leaf) {
+    $machineText = [IO.File]::ReadAllText($machineContract)
+    Assert-Coordinator ($machineText.Contains('ReadOpaqueCounts')) `
+        'The coordinator does not carry the comparison census through a single opaque reader.'
+    Assert-Coordinator ($machineText.Contains('RequireEverySlotVerified')) `
+        'The coordinator does not gate its reconciliation on every declared slot.'
+    Assert-Coordinator ($machineText.Contains('RequirePredecessorVerified')) `
+        'The coordinator does not gate a later slot on its predecessor.'
 }
 
 # The rule above can only bite on files it can see. If the port ever lands

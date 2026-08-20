@@ -6,19 +6,27 @@ namespace DevPilot.ShadowRunCoordinator;
 
 /// <summary>The transitions this coordinator owns, in the only order they may occur.</summary>
 /// <remarks>
-/// Two slices live here. The first prepares a run set and stops at
-/// <see cref="RunSetReady"/>. The second supervises exactly ONE slot from there,
-/// and stops at a terminal.
+/// Three slices live here. The first prepares a run set and stops at
+/// <see cref="RunSetReady"/>. The second supervises the first slot from there.
+/// The third supervises the second slot, and only then closes the set with a
+/// reconciliation.
 ///
-/// No model, no candidate, no severity and no verdict appears in this
-/// enumeration, and neither does a second slot, a reconciliation or a delivery.
-/// What cannot be named here cannot be reached by mistake.
+/// No model, no candidate, no severity, no verdict and no delivery appears in
+/// this enumeration. What cannot be named here cannot be reached by mistake, and
+/// the absence of a delivery state is the structural reason this coordinator
+/// cannot write anywhere: there is no transition under which it would.
 ///
-/// The last rank has three members rather than one. A supervised run ends
-/// verified, failed or timed out, and those are three different durable facts
-/// about the same transition - not three points on a line. They are therefore
-/// siblings at one rank, and the machine walks ranks rather than enum values;
-/// see <see cref="PreparationStateNames.RankOf"/>.
+/// Two ranks hold three members rather than one. A supervised run ends verified,
+/// failed or timed out, and those are three different durable facts about the
+/// same transition - not three points on a line. They are therefore siblings at
+/// one rank, and the machine walks ranks rather than enum values; see
+/// <see cref="PreparationStateNames.RankOf"/>. The reconciliation has no such
+/// fan-out: it either produced the reviewed comparison's own artifacts or it
+/// did not, and not producing them is an exception rather than a durable
+/// ending, because there is no second reading of a comparison for this
+/// coordinator to record. It is one-shot all the same, which is why it has a
+/// running rank: a resumed run adopts the comparison it already started rather
+/// than discovering a spent authorization it cannot explain.
 /// </remarks>
 internal enum PreparationState
 {
@@ -40,13 +48,31 @@ internal enum PreparationState
     Slot1TerminalObserved = 15,
     Slot1TerminalVerified = 16,
     Slot1TerminalFailed = 17,
-    Slot1TerminalTimedOut = 18
+    Slot1TerminalTimedOut = 18,
+    Slot2Authorized = 19,
+    Slot2Launching = 20,
+    Slot2Running = 21,
+    Slot2TerminalObserved = 22,
+    Slot2TerminalVerified = 23,
+    Slot2TerminalFailed = 24,
+    Slot2TerminalTimedOut = 25,
+    ReconciliationAuthorized = 26,
+    ReconciliationLaunching = 27,
+    ReconciliationRunning = 28,
+    ReconciliationTerminalObserved = 29,
+    ReconciliationVerified = 30
 }
 
 internal static class PreparationStateNames
 {
-    /// <summary>The rank every terminal outcome shares, and the last rank there is.</summary>
-    internal const int TerminalRank = 16;
+    /// <summary>The rank the first slot's three terminal outcomes share.</summary>
+    internal const int Slot1TerminalRank = 16;
+
+    /// <summary>The rank the second slot's three terminal outcomes share.</summary>
+    internal const int Slot2TerminalRank = 21;
+
+    /// <summary>The last rank there is, and the only ending the whole set has.</summary>
+    internal const int ReconciliationRank = 26;
 
     /// <summary>The last rank the preparation slice reaches on its own.</summary>
     internal const int PreparationRank = 11;
@@ -74,10 +100,29 @@ internal static class PreparationStateNames
         (PreparationState.Slot1Launching, "slot1Launching", 13),
         (PreparationState.Slot1Running, "slot1Running", 14),
         (PreparationState.Slot1TerminalObserved, "slot1TerminalObserved", 15),
-        (PreparationState.Slot1TerminalVerified, "slot1TerminalVerified", TerminalRank),
-        (PreparationState.Slot1TerminalFailed, "slot1TerminalFailed", TerminalRank),
-        (PreparationState.Slot1TerminalTimedOut, "slot1TerminalTimedOut", TerminalRank)
+        (PreparationState.Slot1TerminalVerified, "slot1TerminalVerified", Slot1TerminalRank),
+        (PreparationState.Slot1TerminalFailed, "slot1TerminalFailed", Slot1TerminalRank),
+        (PreparationState.Slot1TerminalTimedOut, "slot1TerminalTimedOut", Slot1TerminalRank),
+        (PreparationState.Slot2Authorized, "slot2Authorized", 17),
+        (PreparationState.Slot2Launching, "slot2Launching", 18),
+        (PreparationState.Slot2Running, "slot2Running", 19),
+        (PreparationState.Slot2TerminalObserved, "slot2TerminalObserved", 20),
+        (PreparationState.Slot2TerminalVerified, "slot2TerminalVerified", Slot2TerminalRank),
+        (PreparationState.Slot2TerminalFailed, "slot2TerminalFailed", Slot2TerminalRank),
+        (PreparationState.Slot2TerminalTimedOut, "slot2TerminalTimedOut", Slot2TerminalRank),
+        (PreparationState.ReconciliationAuthorized, "reconciliationAuthorized", 22),
+        (PreparationState.ReconciliationLaunching, "reconciliationLaunching", 23),
+        // A running rank for the same reason each slot has one: the comparison is
+        // a child process, and a coordinator killed while it runs must be able to
+        // name what it left behind instead of finding a spent attempt record it
+        // can never account for.
+        (PreparationState.ReconciliationRunning, "reconciliationRunning", 24),
+        (PreparationState.ReconciliationTerminalObserved, "reconciliationTerminalObserved", 25),
+        (PreparationState.ReconciliationVerified, "reconciliationVerified", ReconciliationRank)
     ];
+
+    /// <summary>The ranks at which a supervised run records one of three endings.</summary>
+    internal static IReadOnlyList<int> SlotTerminalRanks { get; } = [Slot1TerminalRank, Slot2TerminalRank];
 
     internal static string ToName(PreparationState state) =>
         Pairs.First(pair => pair.State == state).Name;
@@ -85,9 +130,20 @@ internal static class PreparationStateNames
     internal static int RankOf(PreparationState state) =>
         Pairs.First(pair => pair.State == state).Rank;
 
-    /// <summary>True when a state is one of the three ways a supervised slot ends.</summary>
+    /// <summary>True when a state is one of the ways a supervised slot ends.</summary>
     internal static bool IsTerminalOutcome(PreparationState state) =>
-        RankOf(state) == TerminalRank;
+        SlotTerminalRanks.Contains(RankOf(state));
+
+    /// <summary>
+    /// True when a supervised slot ended in a way that stops the set. The words
+    /// belong to the terminal artifact, not to this method: all it does is
+    /// recognise which of the three durable endings was recorded.
+    /// </summary>
+    internal static bool IsUnsuccessfulTerminal(PreparationState state) =>
+        state is PreparationState.Slot1TerminalFailed
+            or PreparationState.Slot1TerminalTimedOut
+            or PreparationState.Slot2TerminalFailed
+            or PreparationState.Slot2TerminalTimedOut;
 
     internal static PreparationState Parse(string name)
     {
@@ -103,22 +159,23 @@ internal static class PreparationStateNames
 
     /// <summary>
     /// The ranks the machine walks, in order. Rank is what advances; which of the
-    /// three terminal states the terminal rank commits is decided by observed
+    /// three terminal states a terminal rank commits is decided by observed
     /// evidence, not by position in a list.
     /// </summary>
     internal static IReadOnlyList<int> Ranks =>
-        Enumerable.Range(1, TerminalRank).ToList();
+        Enumerable.Range(1, ReconciliationRank).ToList();
 
     /// <summary>
-    /// The single state at a rank. Refused for the terminal rank on purpose: no
-    /// caller may pick one of three outcomes by position, because the outcome is
-    /// something the supervised run reports rather than something the walk knows.
+    /// The single state at a rank. Refused for the two terminal ranks on purpose:
+    /// no caller may pick one of three outcomes by position, because the outcome
+    /// is something the supervised run reports rather than something the walk
+    /// knows.
     /// </summary>
     internal static PreparationState StateAtRank(int rank)
     {
-        if (rank == TerminalRank)
+        if (SlotTerminalRanks.Contains(rank))
         {
-            throw new ContractException("The terminal rank holds three outcomes; which one is committed is decided by the evidence, not by rank.");
+            throw new ContractException("A supervised slot's terminal rank holds three outcomes; which one is committed is decided by the evidence, not by rank.");
         }
         foreach (var pair in Pairs)
         {
@@ -130,7 +187,7 @@ internal static class PreparationStateNames
         throw new ContractException($"Rank {rank.ToString(CultureInfo.InvariantCulture)} is not a transition this coordinator performs.");
     }
 
-    /// <summary>True when a state belongs to the supervised slot lifecycle.</summary>
+    /// <summary>True when a state belongs to a supervised slot or to the reconciliation.</summary>
     internal static bool IsSlotState(PreparationState state) => RankOf(state) > PreparationRank;
 }
 
@@ -488,16 +545,21 @@ internal sealed class CoordinatorState
     }
 
     /// <summary>
-    /// The slot child this output root's signed record says it left running, or
-    /// null when the record names none, cannot be verified, or does not exist.
+    /// The supervised child this output root's signed record says it left running,
+    /// or null when the record names none, cannot be verified, or does not exist.
     /// </summary>
     /// <remarks>
     /// Read before the lease is taken, and therefore deliberately read-only: it
     /// mints no key, writes nothing, and answers null for every root that has not
-    /// already committed a running slot under a key it holds. Its only use is to
+    /// already committed a running child under a key it holds. Its only use is to
     /// tell the one child a resumed run is entitled to adopt from a child that
     /// merely happens to be alive - and because the answer comes from the signed
     /// record, a forged journal cannot manufacture that entitlement.
+    ///
+    /// The reconciliation is asked about first and the slots in reverse order,
+    /// which is simply latest-first: only the most recently committed running
+    /// record can name a child that is still alive, and an earlier one names a
+    /// process this run has already watched end.
     /// </remarks>
     internal static (int ProcessId, string StartedAtUtc)? TryReadRecordedSlotChild(CoordinatorRequest request)
     {
@@ -521,7 +583,9 @@ internal sealed class CoordinatorState
         {
             return null;
         }
-        var child = state.EvidenceFor(PreparationState.Slot1Running)?.Get("child") as MapNode;
+        var child = state.EvidenceFor(PreparationState.ReconciliationRunning)?.Get("child") as MapNode
+            ?? state.EvidenceFor(PreparationState.Slot2Running)?.Get("child") as MapNode
+            ?? state.EvidenceFor(PreparationState.Slot1Running)?.Get("child") as MapNode;
         if (child is null)
         {
             return null;

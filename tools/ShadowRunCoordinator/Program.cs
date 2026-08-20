@@ -86,7 +86,7 @@ internal static class Program
             // default remains what it was: prepare, and launch nothing.
             if (PreparationStateNames.IsSlotState(target))
             {
-                request.RequireSlotAuthorization();
+                request.RequireSlotSet();
             }
             return Run(request, target, haltAfter);
         }
@@ -143,8 +143,10 @@ internal static class Program
         // A supervised run that ended other than complete is reported with its own
         // exit code, and that is a PASSTHROUGH of the terminal artifact's status
         // rather than a judgement formed here. The coordinator did its job in all
-        // three cases: the run it supervised did not.
-        if (state.State == PreparationState.Slot1TerminalFailed || state.State == PreparationState.Slot1TerminalTimedOut)
+        // three cases: the run it supervised did not. It reads the same for either
+        // slot, because a set that stops at slot1 and one that stops at slot2 have
+        // stopped for exactly the same reason.
+        if (PreparationStateNames.IsUnsuccessfulTerminal(state.State))
         {
             return ExitSlotNotComplete;
         }
@@ -164,7 +166,7 @@ internal static class Program
     private const string Usage = """
         ShadowRunCoordinator --request <path> [--target <state>] [--halt-after <state>]
 
-          --request     Path to a devpilot.shadow-run-coordinator.request.v1 JSON file.
+          --request     Path to a devpilot.shadow-run-coordinator.request.v2 JSON file.
           --target      Stop once this state is reached. Defaults to runSetReady.
           --halt-after  Exit 9 immediately after committing this state. For fault tests.
 
@@ -173,15 +175,25 @@ internal static class Program
                 runSetDeclared runSetVerified runSetReady
                 slot1Authorized slot1Launching slot1Running slot1TerminalObserved
                 slot1TerminalVerified slot1TerminalFailed slot1TerminalTimedOut
+                slot2Authorized slot2Launching slot2Running slot2TerminalObserved
+                slot2TerminalVerified slot2TerminalFailed slot2TerminalTimedOut
+                reconciliationAuthorized reconciliationLaunching
+                reconciliationTerminalObserved reconciliationVerified
 
         The corpus states build the corpus from declared immutable sources and
         require an explicit 'corpusStage' section in the request. Without one they
         commit that nothing was built and the corpus named by 'corpus.root' is
         expected to exist already, which is how every earlier request reads.
 
-        The slot states require an explicit 'slot' authorization in the request.
-        Without one the coordinator prepares a run set and launches nothing, which
+        The slot and reconciliation states require an explicit 'slots'
+        authorization in the request, which declares BOTH slots from the moment
+        the request is written; there is no way to add one later. Without that
+        section the coordinator prepares a run set and launches nothing, which
         leaves the PowerShell qualification path the way slots are run.
+
+        slot2 is refused until slot1 has ended verified-complete, and the
+        reconciliation is refused until both have. There is no delivery state,
+        and no transition under which this program writes to a provider.
 
         Exit codes: 0 reached, 1 usage, 2 contract refusal, 3 lease conflict,
                     4 child failure, 5 supervised slot ended not-complete,

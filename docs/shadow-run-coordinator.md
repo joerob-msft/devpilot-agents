@@ -3,8 +3,9 @@
 `tools/ShadowRunCoordinator` is the typed control plane the escape ledger's
 `typed-control-plane-pivot` decision registers. It is a dependency-free .NET 10 console
 application that carries one shadow preparation from a typed request to an immutable,
-signed `run-set-ready` state, and — in its second slice, and only when the request explicitly
-authorizes it — supervises exactly **one** replay-qualification slot to a verified terminal.
+signed `run-set-ready` state, and — in its third slice, and only when the request explicitly
+authorizes it — supervises **exactly two** declared replay-qualification slots to verified
+terminals and then has the reviewed comparison reconcile them.
 
 > **It writes nothing outside its own output root, and it makes no reviewer decision.**
 > The coordinator holds no prompt text, no model name, no candidate, no severity and no
@@ -13,12 +14,17 @@ authorizes it — supervises exactly **one** replay-qualification slot to a veri
 > build if that stops being true.
 >
 > By default it also launches nothing: the target state is `runSetReady`, `slotLaunchCount`
-> is zero, and the suite asserts it. A request that carries no `slot` section, or one that
-> sets `shadowSlotEnabled` to `false`, cannot reach a slot state at all. When a slot *is*
-> authorized, the process it starts is the already-reviewed PowerShell qualification runner,
-> which is what invokes models. The coordinator supervises that process — it does not read
-> its findings. Model attempts reach the audit only as `slotModelInvocationCount`, an opaque
-> passthrough of what the reviewed verifier read out of the owner's terminal artifact.
+> is zero, and the suite asserts it. A request that carries no `slots` section, or one that
+> sets `shadowSlotsEnabled` to `false`, cannot reach a slot state at all; a request whose
+> `slots.reconciliation` is absent or disabled cannot reach a reconciliation state. When a
+> slot *is* authorized, the process it starts is the already-reviewed PowerShell
+> qualification runner, which is what invokes models. The coordinator supervises that
+> process — it does not read its findings. Model attempts reach the audit only as
+> `slotModelInvocationCount`, an opaque passthrough of what the reviewed verifier read out of
+> the owner's terminal artifact. The reconciliation is the same arrangement one level up: the
+> comparison is `tools/Compare-ReviewerReplayRuns.ps1`, unchanged, and what returns to the
+> coordinator is a status word, four digests and a census of integers it copies without
+> reading.
 
 ## What it is for
 
@@ -67,6 +73,10 @@ requestValidated -> corpusStaging -> corpusPublished -> corpusValidated -> recip
     -> snapshotSealed -> snapshotVerified -> runSetDeclared -> runSetVerified -> runSetReady
     -> slot1Authorized -> slot1Launching -> slot1Running -> slot1TerminalObserved
     -> slot1TerminalVerified | slot1TerminalFailed | slot1TerminalTimedOut
+    -> slot2Authorized -> slot2Launching -> slot2Running -> slot2TerminalObserved
+    -> slot2TerminalVerified | slot2TerminalFailed | slot2TerminalTimedOut
+    -> reconciliationAuthorized -> reconciliationLaunching -> reconciliationRunning
+    -> reconciliationTerminalObserved -> reconciliationVerified
 ```
 
 There is no other order and no way to skip. Each transition appends a record to a durable
@@ -74,10 +84,27 @@ state file under a monotonic sequence, and the file is replaced atomically. Rest
 coordinator at any point re-reads that file, recognises the transitions already recorded, and
 resumes at the next one — it does not re-run a child whose transition is already committed.
 
-The three terminal states are siblings, not a sequence: they share one rank, and they are the
-three things a finished slot can be. `--target slot1TerminalVerified` therefore reaches any of
-them; the exit code, not the target, says which. Everything from `slot1Authorized` on happens
-only when the request turns the slot on, so the default path still stops at `runSetReady`.
+The three terminal states of each slot are siblings, not a sequence: they share one rank, and
+they are the three things a finished slot can be. `--target slot1TerminalVerified` therefore
+reaches any of them; the exit code, not the target, says which. Everything from
+`slot1Authorized` on happens only when the request turns the slots on, so the default path
+still stops at `runSetReady`.
+
+Both slots are declared in the request from the moment the request is signed, and the
+declaration is what the whole set is prepared against: the run set is planned for exactly two
+runs, and there is no transition, argument or code path that adds a third or resumes a set
+under a changed declaration. Ordering is enforced twice over. `slot2Authorized` requires this
+coordinator's own signed `slot1TerminalVerified` record, and the reconciliation requires both
+slots' — so a slot that fails or times out is a slot that closes the set, because
+`slot1TerminalFailed` is not `slot1TerminalVerified` and nothing downgrades that. The reviewed
+PowerShell readiness gate is asked the same question independently and must also agree.
+
+`reconciliationRunning` is not decoration. The reviewed comparison mints its single-use
+attempt record as its first act, so a coordinator killed while the comparison runs comes back
+to an authorization that is already spent. Committing the child's identity *before* the wait
+is what makes that recoverable: the resumed run adopts the process its own signed record names
+instead of concluding that somebody else consumed the one attempt. It is the same shape as
+`slot1Running`, for the same reason, and the suite kills the coordinator in exactly that window.
 
 Each transition record carries the evidence it was committed on and a digest over that
 evidence. The audit is built from those records rather than from anything the process
@@ -145,12 +172,20 @@ built the old way and `corpusValidated` reads it exactly as before. They are two
 than one because the on-disk shape either side of the move is completely different, and a
 single rank could not say which side a resumed run was on.
 
-## The supervised slot
+## The supervised slots
 
-The slot slice adds no reviewer logic. What runs the slot is
+The slot slices add no reviewer logic. What runs a slot is
 `tools/Invoke-ReviewerReplayQualification.ps1 -Mode RunSlot`, unchanged, reached through the same
 one-step-one-file child contract every other transition uses. What the coordinator adds is
 authorization, a durable identity for the child, and supervision.
+
+Both slots take the same five states and the descriptions below apply to each, with `slot2`
+substituted for `slot1` throughout. What differs is only the gate in front of them: `slot1` may
+be authorized once the run set is ready, and `slot2` may be authorized only once this
+coordinator's own signed record says `slot1TerminalVerified`. Each slot carries its own
+one-shot launch-authorization token, its own nonce, its own state root, its own child step
+names and its own exchange files, so no result published for one can be adopted as the other's
+answer.
 
 **`slot1Authorized`** is the only state that decides anything. The launch-authorization token
 named by the request is compared against the token the run set published beside its declaration —
@@ -205,6 +240,60 @@ names, attempt counts — is opaque. The coordinator indexes it, digests it and 
 shape; it never reads it for meaning. `tools/Test-ReviewerCoordinatorContract.ps1` enforces that
 mechanically: the C# sources may not mention prompts, models, severities, candidates, verdicts or
 provider writes at all.
+
+Model names are not an exception to that. A slot's request may carry an `opaqueArguments` list
+and a model plan, both of which are strings inside the signed request, and both of which the
+coordinator forwards verbatim to the child and never inspects. They exist so the operator can
+say which reviewed configuration each slot runs; the coordinator has no branch that reads them,
+and the contract suite fails if one appears.
+
+## The reconciliation
+
+The set closes with one comparison of its two runs, and the comparison is
+`tools/Compare-ReviewerReplayRuns.ps1` followed by the reviewed reconciliation resolver —
+unchanged, reached through the same child contract, and invoked *without* the switch that turns
+disagreement into a non-zero exit. Reacting to disagreement is precisely the judgement this
+coordinator must not make. What it requires instead is that the comparison ran, sealed its
+artifact, and wrote its summary.
+
+The exchange is two versioned files under the coordinator's own output root. The coordinator
+publishes `reconciliation-request.json`
+(`devpilot.shadow-run-coordinator.reconciliation-request.v1`), commits its digest, and the child
+refuses to act on any other bytes. The child writes back
+`reconciliation-summary.json` (`…reconciliation-summary.v1`) at the one path the request names.
+Nothing passes between them on a command line or through an environment variable.
+
+**`reconciliationAuthorized`** requires this coordinator's own signed `slot1TerminalVerified`
+*and* `slot2TerminalVerified`, and independently requires the reviewed readiness gate to agree
+that the set is reconcilable. It commits the set ID, the plan digest and the required run count,
+which must equal the declaration's planned run count of two.
+
+The one run each slot offers is found where the reviewer writes it — under
+`<slot-state>/replay/<snapshot>/convention-specialist-previews`, beside the signing key that
+opens it — and the snapshot naming that directory is the one *the plan seals*, never one read
+off the disk. A slot state directory that has replayed two snapshots therefore still offers the
+reconciliation exactly one candidate, and a sibling left by some other snapshot can never be it.
+
+**`reconciliationLaunching`** publishes the input document and commits its digest.
+
+**`reconciliationRunning`** commits the child's identity before the wait, for the reason given
+in the state machine section: the comparison's attempt record is single-use and is minted before
+the comparison starts, so without this record a crash in that window would leave the set
+permanently unreconcilable.
+
+**`reconciliationTerminalObserved`** reads the summary, rehashes it, checks it was written where
+the request asked, and pins the two files the comparison produced — the Markdown report and the
+sealed artifact — by path and digest, taken where they were made.
+
+**`reconciliationVerified`** has the reviewed reader parse the sealed artifact and checks what
+comes back against what was committed: the seal verifies under its key, the sealed
+declaration is *this* run set's and plans *this* many runs, the sealed report digest matches the
+report on disk, the report and artifact are the same two files this run watched being produced,
+the comparison covered exactly the declared number of runs, and the artifact does not claim to
+be promotable — an evaluation-only reconciliation never is. What the coordinator then records is
+a status word, four digests, two run counts and an ordered census of name/value integers copied
+across unread. No finding identity, no text, no severity and no verdict crosses that boundary,
+and there is no delivery state in this build for one to cross into.
 
 ## Refusals
 
@@ -314,6 +403,33 @@ A supervised slot is refused when:
   `slot1TerminalObserved`. The artifact is written read-only by its owner, so a changed digest is
   a tamper rather than a race.
 
+`slot2` adds one refusal to that list: it is refused unless this coordinator's own signed record
+already says `slot1TerminalVerified`. `slot1TerminalFailed` and `slot1TerminalTimedOut` are not
+that, so a slot that fails or times out closes the set — and the set stays closed, because
+nothing in this build re-authorizes a spent slot or resumes a set under a changed declaration.
+
+A reconciliation is refused when:
+
+* either declared slot is not verified complete in this coordinator's own signed record, or the
+  reviewed readiness gate does not independently agree the set is reconcilable,
+* the reviewed plan is for another run set, digests differently than the digest the
+  authorization was committed against, or plans a different number of runs than the declaration,
+* a comparison attempt record already exists at authorization or appears between authorization
+  and launch — the comparison, like a slot launch, is single-use,
+* the child was stopped by this coordinator on a plan deadline, or exited leaving no result, or
+  a result that is absent, malformed, wrongly correlated or wrongly digested,
+* the comparison wrote no summary, wrote it somewhere other than the one path the request named,
+  or wrote one whose bytes do not digest to what the child reported,
+* the sealed artifact does not verify under its key, declares another kind, carries no
+  declaration, is for another run set, plans a different run count, or binds a report digest that
+  is not the report on disk,
+* the report or the artifact offered to the verification step is not the same file, with the same
+  bytes, that this run watched the comparison produce,
+* the comparison covered a different number of runs than the set requires, or the artifact claims
+  to be promotable,
+* the opaque census is empty, names anything twice, or names anything that is not a plain
+  alphanumeric identifier.
+
 Exit codes: `0` ok, `1` usage, `2` request contract, `3` lease conflict, `4` child failure,
 `5` a slot that finished failed or timed out, `9` deliberate halt.
 
@@ -340,9 +456,12 @@ Read that for what it is. It proves the two paths *publish* the same stage artif
 not prove anything about reviewer decisions, because neither path makes one. There is no
 reviewer judgement in this slice to differ.
 
-Rolling back the slot slice is deleting the `slot` section from the request. The reviewed
+Rolling back the slot slice is deleting the `slots` section from the request. The reviewed
 `RunSlot` path is reached through the same arguments it has always been reached through, so
-running it directly is the rollback, not a fallback that has to be built.
+running it directly is the rollback, not a fallback that has to be built. Rolling back only the
+reconciliation is deleting `slots.reconciliation`, or setting `reconciliationEnabled` to false:
+the set then stops at `slot2TerminalVerified` and the reviewed comparison is run by hand exactly
+as it always was.
 
 Rolling back the corpus staging slice is deleting the `corpusStage` section from the request.
 Both corpus transitions then commit `staged: false`, the coordinator reads a corpus somebody
@@ -393,21 +512,33 @@ run stopped short of readiness and never observed them, because `[int]$null` is 
 PowerShell and an unobserved run would otherwise read as a clean zero; `invariantCountsObserved`
 says which of the two an audit is.
 
-The slot's own fields are separate from the readiness census, and the distinction matters:
+The slots' own fields are separate from the readiness census, and the distinction matters:
 `slotLaunchCount` and `modelInvocationCount` are what the reviewed verifier saw *at
-run-set-ready*, when by definition nothing has run yet, so both are zero on a healthy run.
-`slotAttemptCount`, `slotModelInvocationCount`, `slotTerminalStatus`, `slotTerminalExitCode`,
-`slotTerminalTimedOut` and `slotTerminalSha256` are the census taken after the slot finished.
-The model count is a passthrough: the coordinator neither produces it nor interprets it, and
-publishes it exactly as the reviewed inventory reported it. The slot fields are omitted entirely
-when no slot was authorized, for the same reason the readiness census is — a zeroed slot block
-would read like a slot that ran and did nothing.
+run-set-ready*, when by definition nothing has run yet, so both are zero on a healthy run. The
+per-slot census taken after each slot finished is indexed under `slots`, one entry per declared
+slot in declaration order, each carrying `slotName`, `slotAttemptCount`,
+`slotModelInvocationCount`, `slotTerminalStatus`, `slotTerminalExitCode`, `slotTerminalTimedOut`
+and `slotTerminalSha256`, beside `declaredSlotCount` and `supervisedSlotCount` so a partly
+supervised set cannot read as a complete one. The model count is a passthrough: the coordinator
+neither produces it nor interprets it, and publishes it exactly as the reviewed inventory
+reported it. The slot fields are omitted entirely when no slot was authorized, for the same
+reason the readiness census is — a zeroed slot block would read like a slot that ran and did
+nothing.
 
-`slotSupervision` reports how the wait ended, and only what this coordinator can actually know:
+`slotSupervision` reports how each wait ended, and only what this coordinator can actually know:
 the disposition, the child's exit code, whether the supervisor stopped it, the recorded identity,
-the observed span, and whether the observation crossed a restart. `deliveryMode` is always
-`previewOnly` and `providerWriteCount` is always `0`, because this slice has no delivery path to
-write with.
+the observed span, and whether the observation crossed a restart.
+
+The reconciliation's fields are `reconciliationPerformed`, `reconciliationStatus`,
+`reconciliationSha256`, `reconciliationReportSha256`, `reconciliationArtifactSha256`,
+`reconciliationSummarySha256`, `reconciliationRunCount`, `reconciliationPromotable` and the
+ordered `reconciliationCounts` census. Every one of them is either a digest, a count, or a word
+the reviewed tool chose; none is a reading of what the comparison found.
+`reconciliationPerformed` is false on any run that refused, so a blocked or failed set never
+publishes an audit that claims a comparison happened.
+
+`deliveryMode` is always `previewOnly` and `providerWriteCount` is always `0`, because this
+slice has no delivery path to write with.
 
 ## Tests
 
@@ -471,11 +602,40 @@ corpus and a genuinely signed declaration, and the authorization scenario builds
 production builder and the production assertions — but the `RunSlot` invocation itself is replaced
 by a child that writes the artifacts a slot writes and never invokes a model. What that leaves
 unexercised in CI is the reviewed runner, which is reviewed and tested elsewhere; what it exercises
-is the lifecycle, which is the only thing this slice adds.
+is the lifecycle, which is the only thing this slice adds. The comparison is stood in for the
+same way and for the same reason.
+
+For the two declared slots and the reconciliation it adds: a set whose two slots are declared
+before either runs, halted and resumed at every one of its twenty-six transitions with the
+sequence checked after each, and with the launch of everything later than the halted state
+checked *on disk* at every point before the state entitled to perform it — so slot2 provably has
+no attempt record while slot1 is in flight, and the comparison provably has none while either
+slot is; exactly one attempt record per slot and exactly one for the comparison, counted on disk
+rather than believed from the log; distinct exchange files and distinct child-request digests per
+step, so no step can answer for another; a first slot that fails, closing the set and refusing
+both the second slot and the comparison; and the reconciliation fault matrix — a readiness gate
+that says no, an authorization already spent, a comparison that writes no summary, one that
+writes it to the wrong path, one whose summary is edited after it is reported, one that exits
+non-zero leaving nothing, one whose seal does not verify, one that claims to be promotable, one
+that covered too few runs, a census that is empty, duplicated or badly named, a plan built for
+another run set, a sealed artifact swapped for another valid one, a report rewritten between the
+comparison and the verification, and a comparison that never returns and is stopped on the plan's
+own deadline. The crash-consistency case that matters most is the one that kills the coordinator
+in the window after the comparison has minted its single-use attempt record: the resume must
+adopt the child it named, reach `reconciliationVerified`, and leave exactly one attempt record.
+
+Because the comparison itself is stood in, the *layout* the reconciliation reads a slot's run
+from was never exercised by any earlier case, and the first build shipped looking for it loose in
+the slot state directory. A separate case now pins that layout from both ends: the reviewer's own
+exact-path test and this adapter must agree that a replayed run lives under
+`replay/<snapshot>`, and the selection is then run against a state directory holding two
+replayed snapshots, where only the plan-sealed one may be chosen.
 
 `tools/Test-ReviewerCoordinatorContract.ps1` is the architecture boundary: it asserts that the
 coordinator sources contain no prompt, model, severity, candidate or verdict vocabulary and no
-provider write path, so "no reviewer judgement in C#" is checked rather than promised.
+provider write path, that no state in the enumeration names a delivery, that both slot terminals
+and the reconciliation states are present, and that the reconciliation is gated on every declared
+slot — so "no reviewer judgement in C#" is checked rather than promised.
 
 The canonical key order that makes any of this reproducible is covered in
 `tools/Test-ReviewerStageContract.ps1`, which asserts the same bytes under `en-US`, `da-DK`,
