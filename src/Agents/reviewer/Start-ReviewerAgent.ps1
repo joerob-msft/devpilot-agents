@@ -4736,7 +4736,7 @@ function Get-ReviewerExistingFingerprints {
             if ($fp) { [void]$set.Add($fp) }
         }
     }
-    return $set
+    Write-Output -NoEnumerate $set
 }
 
 function Get-ReviewerFindingFingerprint {
@@ -5862,8 +5862,30 @@ function Invoke-DryRunSelfChecks {
     elseif ($fpA -ceq (Get-ReviewerCommentFingerprint -Content "**[CRITICAL]** A completely different problem.")) { $failures.Add("The fingerprint collided across different comments.") }
     else { Write-Host "  OK - the fingerprint ignores whitespace but still distinguishes content" -ForegroundColor Green }
     $existing = Get-ReviewerExistingFingerprints -Threads @(@{ comments = @(@{ content = $body }) })
-    if (-not $existing.Contains($fpA)) { $failures.Add("An already-posted comment was not recognized from the PR, so it would be posted twice.") }
+    if ($existing -isnot [Collections.Generic.HashSet[string]]) {
+        $failures.Add("A nonempty fingerprint result did not retain its HashSet[string] type.")
+    }
+    elseif (-not $existing.Contains($fpA)) { $failures.Add("An already-posted comment was not recognized from the PR, so it would be posted twice.") }
+    elseif (-not $existing.Add('self-check-add') -or -not $existing.Contains('self-check-add')) {
+        $failures.Add("A nonempty fingerprint result no longer supports HashSet Add/Contains semantics.")
+    }
     else { Write-Host "  OK - an already-posted comment is recognized from the PR itself, not from local state" -ForegroundColor Green }
+    $zeroThreadSet = Get-ReviewerExistingFingerprints -Threads @()
+    $emptyCommentsSet = Get-ReviewerExistingFingerprints -Threads @(@{ comments = @() })
+    foreach ($emptySet in @($zeroThreadSet, $emptyCommentsSet)) {
+        if ($null -eq $emptySet -or
+            $emptySet -isnot [Collections.Generic.HashSet[string]] -or
+            $emptySet.Count -ne 0 -or
+            -not [object]::ReferenceEquals($emptySet.Comparer, [StringComparer]::Ordinal)) {
+            $failures.Add("Zero threads or a thread with zero comments did not return one empty ordinal HashSet[string].")
+            break
+        }
+    }
+    $pipelineSet = Get-ReviewerExistingFingerprints -Threads @()
+    if ($pipelineSet -isnot [Collections.Generic.HashSet[string]] -or $pipelineSet.Count -ne 0) {
+        $failures.Add("Pipeline assignment enumerated an empty fingerprint set into null.")
+    }
+    else { Write-Host "  OK - empty and nonempty fingerprint scans retain one mutable ordinal HashSet through the pipeline" -ForegroundColor Green }
     # The same sentence at two call sites is two findings. A body-only
     # fingerprint would treat the second as already posted, drop it, and still
     # count it - which then satisfies the "everything is visible" precondition
