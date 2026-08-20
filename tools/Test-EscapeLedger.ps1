@@ -568,6 +568,9 @@ foreach ($prerequisite in @($ledger.decision.prerequisites)) {
 $producerContractSchemaPath = Join-Path $repoRoot 'src/Agents/reviewer/schemas/reviewer.stage-producer-contracts.v1.json'
 $producerAdoptionSuitePath = Join-Path $repoRoot 'tools/Test-ReviewerStageProducerContract.ps1'
 $producerTablePath = Join-Path $repoRoot 'src/Agents/reviewer/StageProducers.ps1'
+$shadowSwitchPath = Join-Path $repoRoot 'src/Agents/reviewer/StageShadow.ps1'
+$shadowSuitePath = Join-Path $repoRoot 'tools/Test-ReviewerStageShadow.ps1'
+$shadowRunToolPath = Join-Path $repoRoot 'tools/Invoke-ReviewerStageShadowRun.ps1'
 $cardinalityMatrixPath = Join-Path $repoRoot 'tools/testdata/reviewer-collection-cardinality-matrix.v1.json'
 $ciWorkflowPath = Join-Path $repoRoot '.github/workflows/ci.yml'
 $expectedStageBoundaries = 12
@@ -630,6 +633,312 @@ function Test-CardinalityAdoptionProven {
     return $true
 }
 
+function Get-FileContractAdoptionViolation {
+    <#
+        Returns the reasons the file-contract prerequisite's recorded status is not
+        supported by what is on disk, or nothing when it is.
+
+        This prerequisite has two halves adopted on two different paths, so it is
+        scored on two fields and both are coupled to the tree. The in-memory half
+        needs the production table and the suite that proves the producers call and
+        consume it. The on-disk half is reached only through an opt-in switch, so it
+        needs the switch that publishes an artifact and reads it back, the suite that
+        proves the reread verdict is consumed rather than logged, the runner that
+        drives all twelve stages, a CI step that runs that suite, and a note that
+        states the opt-in scope.
+
+        The load-bearing coupling is the last one: whether a shipping file
+        statically calls the switch is a fact about src/, not an opinion, so the
+        ledger's answer is checked against it in BOTH directions - but the two
+        directions do NOT carry the same weight, and pretending they did would
+        repeat the error this coupling exists to prevent. With no call site
+        anywhere, an in-force claim is refused: that is sound, because no
+        ordinary path can reach a command nothing names. With a call site
+        present, the record is required to be re-derived rather than concluded
+        in force, because a call may sit on a branch production never takes.
+        A boolean edit alone satisfies none of this. What the detector can and
+        cannot establish is documented on Test-ShadowSwitchStaticCallSitePresent:
+        it is static call-site detection, not a reachability proof.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowNull()]$Prerequisite,
+        [string]$ProductionRoot = (Join-Path $repoRoot 'src'))
+
+    $violations = [System.Collections.Generic.List[string]]::new()
+    if ($null -eq $Prerequisite) {
+        [void]$violations.Add('The file contract prerequisite record is missing.')
+        return $violations.ToArray()
+    }
+    if (-not (Test-Path -LiteralPath $producerTablePath)) {
+        [void]$violations.Add('The file contract is declared adopted without src/Agents/reviewer/StageProducers.ps1, which is what registers the stage kinds in production code.')
+    }
+    if (-not (Test-Path -LiteralPath $producerAdoptionSuitePath)) {
+        [void]$violations.Add('The file contract is declared adopted without tools/Test-ReviewerStageProducerContract.ps1, which is what proves the producers call and consume it.')
+    }
+    if (-not (Test-Path -LiteralPath $producerContractSchemaPath)) {
+        [void]$violations.Add('The file contract is declared adopted without the pinned stage producer contract schema.')
+    }
+    else {
+        $producerSchema = Get-Content -LiteralPath $producerContractSchemaPath -Raw | ConvertFrom-Json -Depth 12
+        if (@($producerSchema.boundaries).Count -ne $expectedStageBoundaries) {
+            [void]$violations.Add("The pinned stage producer contract schema declares $(@($producerSchema.boundaries).Count) boundaries, not $expectedStageBoundaries.")
+        }
+    }
+    if (-not (Test-Path -LiteralPath $shadowSwitchPath)) {
+        [void]$violations.Add('The file contract is declared adopted without src/Agents/reviewer/StageShadow.ps1, which is what publishes a stage artifact and reads it back.')
+    }
+    if (-not (Test-Path -LiteralPath $shadowSuitePath)) {
+        [void]$violations.Add('The file contract is declared adopted without tools/Test-ReviewerStageShadow.ps1, which is what proves the on-disk half is consumed rather than logged.')
+    }
+    if (-not (Test-Path -LiteralPath $shadowRunToolPath)) {
+        [void]$violations.Add('The file contract is declared adopted without tools/Invoke-ReviewerStageShadowRun.ps1, which is what produces all twelve stage artifacts in one run.')
+    }
+    $ciText = if (Test-Path -LiteralPath $ciWorkflowPath) { Get-Content -LiteralPath $ciWorkflowPath -Raw } else { '' }
+    if ($ciText -notmatch 'Test-ReviewerStageProducerContract\.ps1') {
+        [void]$violations.Add('The file contract is declared adopted but CI never runs the adoption suite that keeps it in force.')
+    }
+    if ($ciText -notmatch 'Test-ReviewerStageShadow\.ps1') {
+        [void]$violations.Add('The file contract is declared adopted but CI never runs the shadow adoption suite that keeps the on-disk half honest.')
+    }
+
+    $scope = $Prerequisite.PSObject.Properties['adoptionScope']
+    if ($null -eq $scope -or $null -eq $scope.Value) {
+        [void]$violations.Add('The file contract prerequisite records no adoptionScope, so there is nothing saying which of its two halves production actually goes through.')
+        return $violations.ToArray()
+    }
+    $scopeValue = $scope.Value
+    if ([string]$scopeValue.note -notmatch 'opt-in|Enable-ReviewerStageShadowContract') {
+        [void]$violations.Add('The file contract adoption scope does not record that the on-disk half is reached only through an opt-in switch, which is the scope of the claim.')
+    }
+    # Deliberately NOT named "enabled". A static call site is neither necessary
+    # nor sufficient for the switch to actually run: a call on a dead branch is
+    # present but never reached, and a dynamic invocation is reached but absent.
+    # What follows uses it only in the directions where it is sound.
+    $callSitePresent = Test-ShadowSwitchStaticCallSitePresent -Root $ProductionRoot
+    if ([bool]$scopeValue.staticCallSiteInProduction -ne $callSitePresent) {
+        $observed = if ($callSitePresent) { 'does' } else { 'does not' }
+        [void]$violations.Add("The file contract adoption scope says staticCallSiteInProduction is $([bool]$scopeValue.staticCallSiteInProduction), but src/ $observed contain a static call to Enable-ReviewerStageShadowContract.")
+    }
+    if (-not $callSitePresent) {
+        # Sound as a necessary condition, with one stated blind spot. No static
+        # call site means no ordinary path reaches the switch, so an in-force
+        # claim cannot stand - unless production enables it dynamically, which
+        # this detector cannot see and which nothing in this repository does.
+        if ([bool]$Prerequisite.inForce) {
+            [void]$violations.Add('The file contract is declared in force, but no shipping file under src/ even names Enable-ReviewerStageShadowContract as a command, and this ledger defines in force as production code actually going through it today.')
+        }
+        if ([string]$scopeValue.scope -cne 'opt-in-offline-shadow') {
+            [void]$violations.Add("The file contract adoption scope claims '$([string]$scopeValue.scope)' while no shipping file under src/ calls the switch.")
+        }
+        # Either field alone is a review of a reference that is not there. The
+        # message names whichever survived, because a message that only ever says
+        # "reason" reads as if the path field were exempt.
+        $staleReviewFields = [string[]]@(
+            'reviewedReferenceReason', 'reviewedReferencePath' |
+                Where-Object { $null -ne $scopeValue.PSObject.Properties[$_] })
+        if ($staleReviewFields.Count -gt 0) {
+            [void]$violations.Add("The file contract adoption scope records $($staleReviewFields -join ' and ') while no shipping file under src/ references the switch at all, so it reviews a reference that no longer exists.")
+        }
+    }
+    else {
+        # The mirror clause, and it stops short of forcing inForce true on
+        # purpose: a call site that exists may still sit on a branch production
+        # never takes, so this cannot conclude the switch runs. What it CAN
+        # conclude is that "opt-in offline, nothing calls it" has expired as a
+        # description and the record has to be re-derived from the new call site
+        # rather than left standing.
+        # There are three honest answers once a reference exists, not two. The
+        # reference may put production on the on-disk half ('production-path'); it
+        # may have been looked at and found not to ('opt-in-shadow-with-reviewed-
+        # reference' - a string, a dead branch, a helper nothing calls); or it may
+        # not have been looked at yet, which is the only state refused here. If the
+        # scope could only be 'production-path' or 'opt-in-offline-shadow', a
+        # harmless reference would make every representable value false and the
+        # record unwritable, so the gate would be forcing a lie rather than a look.
+        if ([string]$scopeValue.scope -ceq 'opt-in-offline-shadow') {
+            [void]$violations.Add("A shipping file under src/ now contains a static call to Enable-ReviewerStageShadowContract, so the adoption scope cannot still read 'opt-in-offline-shadow' unexamined; re-derive the scope from that call site as 'production-path' or 'opt-in-shadow-with-reviewed-reference'.")
+        }
+        $reason = $scopeValue.PSObject.Properties['reviewedReferenceReason']
+        if ([string]$scopeValue.scope -ceq 'opt-in-shadow-with-reviewed-reference') {
+            # Claiming the reference was reviewed and found inert is a claim, so it
+            # has to say WHY, and it cannot be combined with an in-force claim: an
+            # inert reference is by definition not production going through it.
+            #
+            # The WHY lives in its own field rather than being keyword-grepped out
+            # of the shared note. The note is prose that already explains the scheme
+            # itself, so a grep for words like "inert" or "dead branch" is satisfied
+            # by the definition of the enum value and passes while nobody has said
+            # anything about the actual reference. A dedicated field cannot be
+            # pre-satisfied by prose written for another purpose, and requiring it to
+            # name a path under src/ ties it to the reference it is about.
+            if ($null -eq $reason -or [string]::IsNullOrWhiteSpace([string]$reason.Value)) {
+                [void]$violations.Add('The file contract adoption scope claims the shipping reference to Enable-ReviewerStageShadowContract was reviewed and found not to put production on the on-disk half, but records no reviewedReferenceReason saying why.')
+            }
+            # The citation is checked against the tree, not merely for shape. An
+            # unbound citation - a reason that says "src/" and nothing more, or a
+            # path nothing references - is decoration, and a citation that covers
+            # only some of the references leaves the rest unreviewed while reading
+            # as a complete review. So the cited set has to equal the detected set.
+            $detected = [string[]]@(Get-ShadowSwitchStaticCallSitePath -Root $ProductionRoot)
+            $citedProperty = $scopeValue.PSObject.Properties['reviewedReferencePath']
+            $cited = [string[]]@()
+            if ($null -ne $citedProperty -and $null -ne $citedProperty.Value) {
+                $cited = [string[]]@(@($citedProperty.Value) | ForEach-Object { [string]$_ })
+            }
+            if ($cited.Count -eq 0) {
+                [void]$violations.Add('The file contract adoption scope claims a reviewed reference but cites no reviewedReferencePath, so nothing binds the claim to the reference it reviewed.')
+            }
+            else {
+                $uncited = [string[]]@($detected | Where-Object { $cited -notcontains $_ })
+                if ($uncited.Count -gt 0) {
+                    [void]$violations.Add("The file contract adoption scope reviews a reference but does not cite $($uncited -join ', '), which also references Enable-ReviewerStageShadowContract, so part of the tree is unreviewed under a record that reads as complete.")
+                }
+                $unreal = [string[]]@($cited | Where-Object { $detected -notcontains $_ })
+                if ($unreal.Count -gt 0) {
+                    [void]$violations.Add("The file contract adoption scope cites $($unreal -join ', ') as a reviewed reference to Enable-ReviewerStageShadowContract, but nothing there references it.")
+                }
+            }
+            if ([bool]$Prerequisite.inForce) {
+                [void]$violations.Add('The file contract adoption scope says the shipping reference was reviewed and found inert, yet the prerequisite is declared in force; an inert reference is not production going through the on-disk half.')
+            }
+        }
+        elseif ($null -ne $reason -or $null -ne $scopeValue.PSObject.Properties['reviewedReferencePath']) {
+            # The reason is meaningful only for the scope that needs it. Left behind
+            # under another scope it would read as a live finding about a tree that
+            # has moved on.
+            $strayFields = [string[]]@(
+                'reviewedReferenceReason', 'reviewedReferencePath' |
+                    Where-Object { $null -ne $scopeValue.PSObject.Properties[$_] })
+            [void]$violations.Add("The file contract adoption scope records $($strayFields -join ' and ') while its scope is '$([string]$scopeValue.scope)', so a review of an inert reference is being carried under a scope that does not describe one.")
+        }
+        if ([string]$scopeValue.note -match 'no file under src|nothing under src|no shipping file') {
+            [void]$violations.Add('A shipping file under src/ now contains a static call to Enable-ReviewerStageShadowContract, but the adoption scope note still asserts that nothing calls it, so the note describes a tree that no longer exists.')
+        }
+    }
+    return $violations.ToArray()
+}
+
+function Test-ShadowSwitchStaticCallSitePresent {
+    <#
+        Does any shipping file statically reference
+        Enable-ReviewerStageShadowContract? The switch is inert until that
+        function is called, so a tree that never names it certainly does not go
+        through the on-disk half - and that, not "the switch is enabled", is the
+        question this answers. The name says call site rather than enabled on
+        purpose: presence is a prerequisite for enablement, not evidence of it.
+
+        This is static reference detection, not a reachability proof, and the
+        difference matters in both directions. It parses each file and looks for
+        the name in TWO forms, because either one can enable the switch:
+
+          1. A CommandAst whose command name is the function - an ordinary call.
+          2. A string constant, bare or expandable, whose text contains the name
+             - which is what & $name, Invoke-Expression, Get-Command and a
+             runtime-built script block all need in order to reach it.
+
+        Together those close the dynamic-invocation hole a CommandAst-only scan
+        leaves open. A comment or a block comment is still not a reference,
+        because comments are tokens rather than AST nodes. What remains
+        undetectable is a name assembled from fragments at runtime, and a name
+        that only ever exists outside the PowerShell files this scan parses - in
+        JSON, in a data file, in an environment variable - since the scan reads
+        the source it walks and nothing else. Nothing in this repository does
+        either. In the other direction a reference it DOES
+        see may sit on a branch that never executes, which is why presence never
+        concludes "in force".
+
+        Every PowerShell file type under the root is parsed, not just .ps1:
+        src/ ships a .psm1 module that the reviewer entry point imports, and a
+        call added there would otherwise be a silent false negative in exactly
+        the direction that matters.
+
+        -Root exists so the detector can be proven against a tree that DOES call
+        it. A detector that has only ever been run where the answer is no has not
+        been shown to be able to say yes.
+    #>
+    param([string]$Root = (Join-Path $repoRoot 'src'))
+
+    if (-not (Test-Path -LiteralPath $shadowSwitchPath)) { return $false }
+    if (-not (Test-Path -LiteralPath $Root)) { return $false }
+    $powerShellExtensions = [string[]]@('.ps1', '.psm1', '.psd1')
+    foreach ($file in (Get-ChildItem -LiteralPath $Root -Recurse -File)) {
+        if ($powerShellExtensions -notcontains [string]$file.Extension.ToLowerInvariant()) { continue }
+        $tokens = $null
+        $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            $file.FullName, [ref]$tokens, [ref]$errors)
+        if ($null -eq $ast) { continue }
+        $references = $ast.FindAll({
+                param($node)
+                if ($node -is [System.Management.Automation.Language.CommandAst]) {
+                    return ([string]$node.GetCommandName() -eq 'Enable-ReviewerStageShadowContract')
+                }
+                # A dynamic invocation cannot name the function without carrying
+                # the name as text somewhere, so string constants count too.
+                if ($node -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                    return ([string]$node.Value).Contains('Enable-ReviewerStageShadowContract')
+                }
+                if ($node -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
+                    return ([string]$node.Value).Contains('Enable-ReviewerStageShadowContract')
+                }
+                return $false
+            }, $true)
+        if (@($references).Count -gt 0) { return $true }
+    }
+    return $false
+}
+
+function Get-ShadowSwitchStaticCallSitePath {
+    <#
+        The same scan as Test-ShadowSwitchStaticCallSitePresent, reporting WHICH
+        files reference the switch rather than whether any does. A record that
+        claims a reference was reviewed has to cite the reference, and a citation
+        that cannot be checked against what is actually there is decoration: a
+        reason naming no path, a path that does not exist, or a path that exists
+        while a second unreviewed reference sits beside it would all pass an
+        unbound check. Paths come back repository-relative when the file is under
+        the repository root - and absolute otherwise, which is what -Root pointed
+        at a temporary proof tree produces - with forward slashes either way, so a
+        citation of a shipping file reads the same on either platform.
+
+        Same detection and therefore the same blind spots as the presence scan.
+    #>
+    param([string]$Root = (Join-Path $repoRoot 'src'))
+
+    $paths = [System.Collections.Generic.List[string]]::new()
+    if (-not (Test-Path -LiteralPath $Root)) { return $paths.ToArray() }
+    $powerShellExtensions = [string[]]@('.ps1', '.psm1', '.psd1')
+    foreach ($file in (Get-ChildItem -LiteralPath $Root -Recurse -File)) {
+        if ($powerShellExtensions -notcontains [string]$file.Extension.ToLowerInvariant()) { continue }
+        $tokens = $null
+        $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            $file.FullName, [ref]$tokens, [ref]$errors)
+        if ($null -eq $ast) { continue }
+        $references = $ast.FindAll({
+                param($node)
+                if ($node -is [System.Management.Automation.Language.CommandAst]) {
+                    return ([string]$node.GetCommandName() -eq 'Enable-ReviewerStageShadowContract')
+                }
+                if ($node -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                    return ([string]$node.Value).Contains('Enable-ReviewerStageShadowContract')
+                }
+                if ($node -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
+                    return ([string]$node.Value).Contains('Enable-ReviewerStageShadowContract')
+                }
+                return $false
+            }, $true)
+        if (@($references).Count -eq 0) { continue }
+        $relative = [string]$file.FullName
+        $rootPrefix = [string]$repoRoot
+        if ($relative.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            $relative = $relative.Substring($rootPrefix.Length).TrimStart('\', '/')
+        }
+        [void]$paths.Add($relative.Replace('\', '/'))
+    }
+    return $paths.ToArray()
+}
+
 $cardinalityMatrix = $null
 if (Test-Path -LiteralPath $cardinalityMatrixPath) {
     $cardinalityMatrix = Get-Content -LiteralPath $cardinalityMatrixPath -Raw | ConvertFrom-Json -Depth 20
@@ -640,20 +949,10 @@ foreach ($prerequisite in @($ledger.decision.prerequisites)) {
         Assert-Ledger (Test-CardinalityAdoptionProven -Matrix $cardinalityMatrix) `
             'The cardinality corpus is declared in force, but the recorded coverage matrix does not show every inventoried row bound to a shipping producer contract with no producer-path gap across all twelve stage boundaries.'
     }
-    if ([string]$prerequisite.id -eq 'file-contract' -and [bool]$prerequisite.inForce) {
-        Assert-Ledger (Test-Path -LiteralPath $producerTablePath) `
-            'The file contract is declared in force without src/Agents/reviewer/StageProducers.ps1, which is what registers the stage kinds in production code.'
-        Assert-Ledger (Test-Path -LiteralPath $producerAdoptionSuitePath) `
-            'The file contract is declared in force without tools/Test-ReviewerStageProducerContract.ps1, which is what proves the producers call and consume it.'
-        Assert-Ledger (Test-Path -LiteralPath $producerContractSchemaPath) `
-            'The file contract is declared in force without the pinned stage producer contract schema.'
-        if (Test-Path -LiteralPath $producerContractSchemaPath) {
-            $producerSchema = Get-Content -LiteralPath $producerContractSchemaPath -Raw | ConvertFrom-Json -Depth 12
-            Assert-Ledger (@($producerSchema.boundaries).Count -eq $expectedStageBoundaries) `
-                "The pinned stage producer contract schema declares $(@($producerSchema.boundaries).Count) boundaries, not $expectedStageBoundaries."
+    if ([string]$prerequisite.id -eq 'file-contract') {
+        foreach ($violation in (Get-FileContractAdoptionViolation -Prerequisite $prerequisite)) {
+            Assert-Ledger $false $violation
         }
-        Assert-Ledger ((Get-Content -LiteralPath $ciWorkflowPath -Raw) -match 'Test-ReviewerStageProducerContract\.ps1') `
-            'The file contract is declared in force but CI never runs the adoption suite that keeps it in force.'
     }
 }
 
@@ -687,6 +986,270 @@ Assert-Ledger (-not (Test-CardinalityAdoptionProven -Matrix $unbuiltMatrix)) `
     'The adoption coupling accepted a coverage matrix with a row bound to no producer builder.'
 Assert-Ledger (Test-CardinalityAdoptionProven -Matrix $cardinalityMatrix) `
     'The adoption coupling rejects the coverage matrix this repository actually records, so it can never be satisfied.'
+
+# The same standard for the file contract's on-disk half. It is recorded as adopted behind
+# an opt-in switch and NOT in force, and every part of that sentence has to be refusable:
+# a scope note that drops the opt-in, an in-force claim while nothing enables the switch,
+# and a scope record that disagrees with what src/ actually calls.
+$fileContractPrerequisite = @($ledger.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })
+Assert-Ledger ($fileContractPrerequisite.Count -eq 1) `
+    'The decision record does not declare the file-contract prerequisite exactly once.'
+if ($fileContractPrerequisite.Count -eq 1) {
+    $scopelessNote = Get-LedgerObject -Json $ledgerJson
+    $scopelessClaim = @($scopelessNote.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+    $scopelessClaim.adoptionScope.note = 'Adopted.'
+    Assert-Ledger (@(Get-FileContractAdoptionViolation -Prerequisite $scopelessClaim).Count -gt 0) `
+        'The file contract coupling accepted an adoption record that drops the opt-in scope the on-disk half is actually reached through.'
+
+    $overclaimed = Get-LedgerObject -Json $ledgerJson
+    $overclaimedClaim = @($overclaimed.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+    $overclaimedClaim.inForce = $true
+    Assert-Ledger (@(Get-FileContractAdoptionViolation -Prerequisite $overclaimedClaim).Count -gt 0) `
+        'The file contract coupling accepted an in-force claim while nothing under src/ enables the on-disk half.'
+
+    $mislabelled = Get-LedgerObject -Json $ledgerJson
+    $mislabelledClaim = @($mislabelled.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+    $mislabelledClaim.adoptionScope.staticCallSiteInProduction = $true
+    Assert-Ledger (@(Get-FileContractAdoptionViolation -Prerequisite $mislabelledClaim).Count -gt 0) `
+        'The file contract coupling accepted a claim that production enables the switch when no shipping file calls it.'
+
+    $scopeless = Get-LedgerObject -Json $ledgerJson
+    $scopelessRecord = @($scopeless.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+    $scopelessRecord.PSObject.Properties.Remove('adoptionScope')
+    Assert-Ledger (@(Get-FileContractAdoptionViolation -Prerequisite $scopelessRecord).Count -gt 0) `
+        'The file contract coupling accepted a prerequisite that records no adoption scope at all.'
+
+    $absentPrerequisite = $null
+    Assert-Ledger (@(Get-FileContractAdoptionViolation -Prerequisite $absentPrerequisite).Count -gt 0) `
+        'The file contract coupling accepted a missing prerequisite record as proof of adoption.'
+    Assert-Ledger (@(Get-FileContractAdoptionViolation -Prerequisite $fileContractPrerequisite[0]).Count -eq 0) `
+        'The file contract coupling rejects the adoption this repository actually records, so it can never be satisfied.'
+    Assert-Ledger (-not (Test-ShadowSwitchStaticCallSitePresent)) `
+        'A file under src/ enables the stage shadow switch, so the ledger''s not-in-force record for the on-disk half is stale.'
+
+    # The detector has to be able to answer YES, or "nothing enables it" is just
+    # the only answer it knows how to give. Prove it against a tree that does.
+    $detectorProof = Join-Path ([IO.Path]::GetTempPath()) ("ledger-detector-" + [Guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Path $detectorProof -Force
+    try {
+        $callerPath = Join-Path $detectorProof 'Caller.ps1'
+        [IO.File]::WriteAllText($callerPath,
+            "`$state = Enable-ReviewerStageShadowContract -Directory `$dir`n",
+            [Text.UTF8Encoding]::new($false))
+        Assert-Ledger (Test-ShadowSwitchStaticCallSitePresent -Root $detectorProof) `
+            'The shadow-switch detector cannot see a call it is looking at, so its answer for src/ proves nothing.'
+
+        # ...and it must not count a comment or the definition itself as a call.
+        [IO.File]::WriteAllText($callerPath,
+            "# Enable-ReviewerStageShadowContract is described here, not called.`nfunction Enable-ReviewerStageShadowContract {`n}`n",
+            [Text.UTF8Encoding]::new($false))
+        Assert-Ledger (-not (Test-ShadowSwitchStaticCallSitePresent -Root $detectorProof)) `
+            'The shadow-switch detector counts a comment or the function definition as a production call.'
+
+        # A block comment is still not a reference - comments are tokens, not AST
+        # nodes - and this is the reason the detector parses instead of grepping.
+        [IO.File]::WriteAllText($callerPath,
+            "<#`nEnable-ReviewerStageShadowContract -Directory `$d`n#>`nWrite-Output 'nothing here'`n",
+            [Text.UTF8Encoding]::new($false))
+        Assert-Ledger (-not (Test-ShadowSwitchStaticCallSitePresent -Root $detectorProof)) `
+            'The shadow-switch detector counts a block comment as a production reference.'
+
+        # A STRING literal, on the other hand, must count, and deliberately so:
+        # & $name, Invoke-Expression and Get-Command all need the name as text,
+        # so ignoring strings is exactly the dynamic-invocation hole that would
+        # let production enable the switch with the ledger none the wiser.
+        [IO.File]::WriteAllText($callerPath,
+            "`$name = 'Enable-ReviewerStageShadowContract'`n& `$name -Directory `$d`n",
+            [Text.UTF8Encoding]::new($false))
+        Assert-Ledger (Test-ShadowSwitchStaticCallSitePresent -Root $detectorProof) `
+            'The shadow-switch detector misses a dynamic invocation through a string-held command name.'
+
+        # A module file counts too. src/ ships one that the reviewer entry point
+        # imports, so a .ps1-only scan would miss the switch being wired in there.
+        Remove-Item -LiteralPath $callerPath -Force
+        $modulePath = Join-Path $detectorProof 'Caller.psm1'
+        [IO.File]::WriteAllText($modulePath,
+            "function Invoke-Thing {`n    `$state = Enable-ReviewerStageShadowContract -Directory `$dir`n}`n",
+            [Text.UTF8Encoding]::new($false))
+        Assert-Ledger (Test-ShadowSwitchStaticCallSitePresent -Root $detectorProof) `
+            'The shadow-switch detector ignores .psm1 module files, so a shipping module could enable the switch without moving the ledger.'
+        Remove-Item -LiteralPath $modulePath -Force
+
+        # The mirror direction of the ledger coupling: against a tree that DOES
+        # call the switch, the record this repository ships today - not in force,
+        # opt-in scope - has to be refused by name, not merely by the
+        # staticCallSiteInProduction mismatch.
+        [IO.File]::WriteAllText($callerPath,
+            "`$state = Enable-ReviewerStageShadowContract -Directory `$dir`n",
+            [Text.UTF8Encoding]::new($false))
+        $wiredIn = Get-LedgerObject -Json $ledgerJson
+        $wiredInClaim = @($wiredIn.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $wiredInClaim.adoptionScope.staticCallSiteInProduction = $true
+        $wiredInViolations = @(Get-FileContractAdoptionViolation -Prerequisite $wiredInClaim -ProductionRoot $detectorProof)
+        Assert-Ledger (@($wiredInViolations | Where-Object { $_ -match "cannot still read 'opt-in-offline-shadow'" }).Count -eq 1) `
+            'A shipping call to the shadow switch leaves the opt-in adoption scope standing unexamined.'
+        Assert-Ledger (@($wiredInViolations | Where-Object { $_ -match 'still asserts that nothing calls it' }).Count -eq 1) `
+            'A shipping call to the shadow switch leaves an adoption note still asserting that nothing calls it.'
+        # ...and it must NOT conclude the switch is in force from a call site
+        # alone. A call on a branch production never takes is still a call.
+        Assert-Ledger (@($wiredInViolations | Where-Object { $_ -match 'inForce' }).Count -eq 0) `
+            'A static call site alone was treated as proof the on-disk half is in force, which is the equation this coupling exists to avoid.'
+
+        # A detected reference that is a string, or sits on a branch production
+        # never takes, must leave a TRUE value the record can hold. If the only
+        # alternatives were 'production-path' and 'opt-in-offline-shadow', both
+        # would be false and the gate would be demanding a lie. The third state
+        # exists for exactly that case - and it is a claim, so it has to say why
+        # the reference is inert and it cannot sit next to an in-force claim.
+        $reviewedRef = Get-LedgerObject -Json $ledgerJson
+        $reviewedRefClaim = @($reviewedRef.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $reviewedRefClaim.adoptionScope.staticCallSiteInProduction = $true
+        $reviewedRefClaim.adoptionScope.scope = 'opt-in-shadow-with-reviewed-reference'
+        $reviewedRefClaim.adoptionScope.note = 'Reached only through the opt-in Enable-ReviewerStageShadowContract switch.'
+        $reviewedRefClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferenceReason' `
+            -NotePropertyValue 'The reference sits on a branch guarded by a constant that production never takes.'
+        # The citation is the path the detector reports, spelled independently of
+        # the detector so the proof is not circular.
+        $citedPath = ([string]$callerPath).Replace('\', '/')
+        $reviewedRefClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferencePath' `
+            -NotePropertyValue ([string[]]@($citedPath))
+        $reviewedRefViolations = @(Get-FileContractAdoptionViolation -Prerequisite $reviewedRefClaim -ProductionRoot $detectorProof)
+        Assert-Ledger ($reviewedRefViolations.Count -eq 0) `
+            "A reviewed, inert reference has no representable adoption scope: $($reviewedRefViolations -join ' | ')"
+
+        $unexplainedRef = Get-LedgerObject -Json $ledgerJson
+        $unexplainedRefClaim = @($unexplainedRef.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $unexplainedRefClaim.adoptionScope.staticCallSiteInProduction = $true
+        $unexplainedRefClaim.adoptionScope.scope = 'opt-in-shadow-with-reviewed-reference'
+        # Deliberately the REAL shipped note, edited only where it would otherwise
+        # describe a tree with no reference in it. That note is prose about the
+        # scheme and already contains words like "inert" and "dead branch", so a
+        # keyword grep over it would pass while nobody had explained the actual
+        # reference. Nothing short of the dedicated field may satisfy this.
+        $unexplainedRefClaim.adoptionScope.note = ([string]$unexplainedRefClaim.adoptionScope.note).Replace(
+            'No file under src/ contains a static call to it', 'A shipping file under src/ now names it')
+        $unexplainedRefViolations = @(Get-FileContractAdoptionViolation -Prerequisite $unexplainedRefClaim -ProductionRoot $detectorProof)
+        Assert-Ledger ([string]$unexplainedRefClaim.adoptionScope.note -match 'inert|dead branch') `
+            'The negative proof no longer exercises a note containing the very words a keyword grep would have accepted.'
+        Assert-Ledger (@($unexplainedRefViolations | Where-Object { $_ -match 'records no reviewedReferenceReason' }).Count -eq 1) `
+            'The reviewed-reference scope was accepted with no reviewedReferenceReason, so the shared note pre-satisfied the explanation the gate claims to require.'
+
+        # ...and a reason that cites nothing is not a review of anything. A prose
+        # gesture at "src/" is the shape the old check would have taken for a
+        # citation, so it is the shape this refuses.
+        $vagueRef = Get-LedgerObject -Json $ledgerJson
+        $vagueRefClaim = @($vagueRef.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $vagueRefClaim.adoptionScope.staticCallSiteInProduction = $true
+        $vagueRefClaim.adoptionScope.scope = 'opt-in-shadow-with-reviewed-reference'
+        $vagueRefClaim.adoptionScope.note = 'Reached only through the opt-in Enable-ReviewerStageShadowContract switch.'
+        $vagueRefClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferenceReason' `
+            -NotePropertyValue 'Reviewed src/ generally and it is fine.'
+        $vagueRefViolations = @(Get-FileContractAdoptionViolation -Prerequisite $vagueRefClaim -ProductionRoot $detectorProof)
+        Assert-Ledger (@($vagueRefViolations | Where-Object { $_ -match 'cites no reviewedReferencePath' }).Count -eq 1) `
+            'A reviewed-reference reason that gestures at src/ without citing a file was accepted as a review of a reference.'
+
+        # A citation nothing references is a citation of nothing.
+        $unrealRef = Get-LedgerObject -Json $ledgerJson
+        $unrealRefClaim = @($unrealRef.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $unrealRefClaim.adoptionScope.staticCallSiteInProduction = $true
+        $unrealRefClaim.adoptionScope.scope = 'opt-in-shadow-with-reviewed-reference'
+        $unrealRefClaim.adoptionScope.note = 'Reached only through the opt-in Enable-ReviewerStageShadowContract switch.'
+        $unrealRefClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferenceReason' `
+            -NotePropertyValue 'The reference sits on a branch production never takes.'
+        $unrealRefClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferencePath' `
+            -NotePropertyValue ([string[]]@('src/Agents/reviewer/NoSuchFile.ps1'))
+        $unrealRefViolations = @(Get-FileContractAdoptionViolation -Prerequisite $unrealRefClaim -ProductionRoot $detectorProof)
+        Assert-Ledger (@($unrealRefViolations | Where-Object { $_ -match 'but nothing there references it' }).Count -eq 1) `
+            'A reviewed-reference citation naming a file that references nothing was accepted.'
+
+        # And a citation that covers one reference while a second sits beside it
+        # reads as a complete review of an incompletely reviewed tree.
+        $secondCallerPath = Join-Path $detectorProof 'SecondCaller.ps1'
+        [IO.File]::WriteAllText($secondCallerPath,
+            "`$state = Enable-ReviewerStageShadowContract -Directory `$dir`n",
+            [Text.UTF8Encoding]::new($false))
+        $partialRef = Get-LedgerObject -Json $ledgerJson
+        $partialRefClaim = @($partialRef.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $partialRefClaim.adoptionScope.staticCallSiteInProduction = $true
+        $partialRefClaim.adoptionScope.scope = 'opt-in-shadow-with-reviewed-reference'
+        $partialRefClaim.adoptionScope.note = 'Reached only through the opt-in Enable-ReviewerStageShadowContract switch.'
+        $partialRefClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferenceReason' `
+            -NotePropertyValue 'The reference sits on a branch production never takes.'
+        $partialRefClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferencePath' `
+            -NotePropertyValue ([string[]]@(([string]$callerPath).Replace('\', '/')))
+        $partialRefViolations = @(Get-FileContractAdoptionViolation -Prerequisite $partialRefClaim -ProductionRoot $detectorProof)
+        Assert-Ledger (@($partialRefViolations | Where-Object { $_ -match 'part of the tree is unreviewed' }).Count -eq 1) `
+            'A reviewed-reference citation covering one of two references was accepted as a complete review.'
+        Remove-Item -LiteralPath $secondCallerPath -Force
+
+        $inForceRef = Get-LedgerObject -Json $ledgerJson
+        $inForceRefClaim = @($inForceRef.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $inForceRefClaim.adoptionScope.staticCallSiteInProduction = $true
+        $inForceRefClaim.adoptionScope.scope = 'opt-in-shadow-with-reviewed-reference'
+        $inForceRefClaim.adoptionScope.note = 'Reached only through the opt-in Enable-ReviewerStageShadowContract switch.'
+        $inForceRefClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferenceReason' `
+            -NotePropertyValue 'The reference sits on a branch production never takes.'
+        $inForceRefClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferencePath' `
+            -NotePropertyValue ([string[]]@(([string]$callerPath).Replace('\', '/')))
+        $inForceRefClaim.inForce = $true
+        $inForceRefViolations = @(Get-FileContractAdoptionViolation -Prerequisite $inForceRefClaim -ProductionRoot $detectorProof)
+        Assert-Ledger (@($inForceRefViolations | Where-Object { $_ -match 'an inert reference is not production going through' }).Count -eq 1) `
+            'The ledger accepted "the reference is inert" and "the on-disk half is in force" at the same time, which cannot both be true.'
+
+        # And the third state is not a way to dodge the no-call-site clause: with
+        # nothing under src/ naming the switch, "a reference was reviewed" is false.
+        Remove-Item -LiteralPath $callerPath -Force
+        $noRefClaim = @((Get-LedgerObject -Json $ledgerJson).decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $noRefClaim.adoptionScope.scope = 'opt-in-shadow-with-reviewed-reference'
+        $noRefClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferenceReason' `
+            -NotePropertyValue 'The reference sat on a branch production never takes.'
+        $noRefViolations = @(Get-FileContractAdoptionViolation -Prerequisite $noRefClaim -ProductionRoot $detectorProof)
+        Assert-Ledger (@($noRefViolations | Where-Object { $_ -match 'while no shipping file under src/ calls the switch' }).Count -eq 1) `
+            'The reviewed-reference scope was accepted against a tree that contains no reference at all.'
+        Assert-Ledger (@($noRefViolations | Where-Object { $_ -match 'records reviewedReferenceReason while no shipping file' }).Count -eq 1) `
+            'A reviewedReferenceReason survived the disappearance of the reference it reviewed.'
+
+        # The path field is not exempt from that clause just because it is the
+        # optional half of the pair. Left behind alone it still cites a reference
+        # the tree no longer contains.
+        $noRefPathClaim = @((Get-LedgerObject -Json $ledgerJson).decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $noRefPathClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferencePath' `
+            -NotePropertyValue ([string[]]@(([string]$callerPath).Replace('\', '/')))
+        $noRefPathViolations = @(Get-FileContractAdoptionViolation -Prerequisite $noRefPathClaim -ProductionRoot $detectorProof)
+        Assert-Ledger (@($noRefPathViolations | Where-Object { $_ -match 'records reviewedReferencePath while no shipping file' }).Count -eq 1) `
+            'A reviewedReferencePath left behind alone survived the disappearance of the reference it cited.'
+
+        # The reason belongs to one scope only; carried under another it is a stale
+        # finding about a tree that has moved on.
+        [IO.File]::WriteAllText($callerPath,
+            "`$state = Enable-ReviewerStageShadowContract -Directory `$dir`n",
+            [Text.UTF8Encoding]::new($false))
+        $strayReason = Get-LedgerObject -Json $ledgerJson
+        $strayReasonClaim = @($strayReason.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $strayReasonClaim.adoptionScope.staticCallSiteInProduction = $true
+        $strayReasonClaim.adoptionScope.scope = 'production-path'
+        $strayReasonClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferenceReason' `
+            -NotePropertyValue 'The reference sits on a branch production never takes.'
+        $strayReasonViolations = @(Get-FileContractAdoptionViolation -Prerequisite $strayReasonClaim -ProductionRoot $detectorProof)
+        Assert-Ledger (@($strayReasonViolations | Where-Object { $_ -match 'under a scope that does not describe one' }).Count -eq 1) `
+            'A reviewed-reference reason was carried under production-path, where it describes nothing.'
+
+        # ...and the path field alone, under the same scope, for the same reason.
+        $strayPath = Get-LedgerObject -Json $ledgerJson
+        $strayPathClaim = @($strayPath.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $strayPathClaim.adoptionScope.staticCallSiteInProduction = $true
+        $strayPathClaim.adoptionScope.scope = 'production-path'
+        $strayPathClaim.adoptionScope | Add-Member -NotePropertyName 'reviewedReferencePath' `
+            -NotePropertyValue ([string[]]@(([string]$callerPath).Replace('\', '/')))
+        $strayPathViolations = @(Get-FileContractAdoptionViolation -Prerequisite $strayPathClaim -ProductionRoot $detectorProof)
+        Assert-Ledger (@($strayPathViolations | Where-Object { $_ -match 'records reviewedReferencePath while its scope' }).Count -eq 1) `
+            'A reviewed-reference citation was carried under production-path, where it describes nothing.'
+        Remove-Item -LiteralPath $callerPath -Force
+    }
+    finally {
+        Remove-Item -LiteralPath $detectorProof -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
 
 # its clock. coordinatorChangesObserved moves only when an incident carries a higher
 # ordinal, so an incident-free coordinator change - the common case - does not move it, and

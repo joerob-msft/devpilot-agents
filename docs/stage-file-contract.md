@@ -8,9 +8,11 @@ back as part of the contract.
 
 `src/Agents/reviewer/StageContract.ps1` makes that boundary explicit and fails closed.
 
-> **Adoption status: in-memory half in force, on-disk half not adopted.**
+> **Adoption status: in-memory half in force on the ordinary path; on-disk half built and
+> CI-verified but NOT in force — it runs only behind an opt-in switch that nothing under
+> `src/` turns on.**
 > [`src/Agents/reviewer/StageProducers.ps1`](../src/Agents/reviewer/StageProducers.ps1)
-> registers a versioned contract kind for each of the twelve stages the coordinator runs —
+> registers a versioned contract kind for each of twelve enumerated stages —
 > capture, source, snapshot, corpus, blindResults, candidateUnion, fingerprints,
 > specialistPlan, verifierAssignment, verdict, reconciliation, deliveryDecision — and each
 > shipping producer validates its own output against its contract before any consumer or
@@ -19,18 +21,94 @@ back as part of the contract.
 > [`tools/Test-ReviewerStageProducerContract.ps1`](../tools/Test-ReviewerStageProducerContract.ps1),
 > which reads the producer's syntax tree rather than its text.
 >
-> What is validated at those boundaries is the payload *shape* — the same registered kind,
-> the same required and unknown field policy, the same collection and map rules — held in
-> memory, not an envelope on disk.
+> Note the shape of that claim: the checkers prove every *registered* kind has a producer
+> that validates through it. Nothing here proves the registry is *complete* — that the
+> twelve are every handoff a coordinator crosses. The twelve are an enumeration adopted by
+> hand, and a thirteenth handoff added without a registration would be invisible to these
+> suites.
 >
-> **Residual: the on-disk contract is not in force.** No coordinator stage writes or reads
-> one of these artifacts today, so no consumer has yet seen a `kind` or a `contractVersion`
-> come off disk. `Write-ReviewerStageArtifact` and `Read-ReviewerStageArtifact` are proven
-> across all twelve kinds by test — atomic publication, exact bytes, and the full fault
-> matrix — rather than exercised by a live run, and the escape ledger records this
-> prerequisite as not in force for exactly that reason. Migrating a stage onto on-disk
-> publication changes live coordinator behaviour and stays out of scope for a prerequisite
-> change that runs no models.
+> What is validated at those boundaries is the payload *shape* — the same registered kind,
+> the same required and unknown field policy, the same collection and map rules. By default
+> that verdict is held in memory and nothing is written.
+>
+> [`src/Agents/reviewer/StageShadow.ps1`](../src/Agents/reviewer/StageShadow.ps1) adds the
+> switch that exercises the on-disk half. With it enabled, all twelve boundaries publish
+> their judged payload through `Write-ReviewerStageArtifact` under `-StrictShape` and
+> immediately read it back through `Read-ReviewerStageArtifact` before the payload goes
+> anywhere downstream. The reread verdict is consumed, not logged: the contract version *the
+> file itself declares*, adapted-ness, byte digest and length, declared form and depth, and
+> the full serialized payload must all agree with what was written, or the boundary throws.
+> The reader's registry-held kind and version are deliberately not compared, because those
+> are the reader echoing the caller's own request and cannot disagree with themselves. The
+> publish path also compares the kind the file declared, but that one is deliberately counted
+> as redundancy rather than evidence: `Read-ReviewerStageArtifact` already refuses a kind
+> mismatch itself, so with the shipped reader that comparison cannot fail, and it is kept
+> only against a future reader that stops refusing. A run with the switch on cannot reach a
+> downstream stage with a payload that did not survive a real file round trip.
+>
+> Three properties keep this safe to ship:
+>
+> * **Default off.** With the switch disabled, `Publish-ReviewerStageShadowArtifact` returns
+>   the very object it was handed and touches no filesystem. Ordinary production behaviour is
+>   unchanged.
+> * **No semantic change.** What flows downstream is the in-memory payload the boundary
+>   already judged, never a JSON reconstruction of it. The reread payload is *evidence* — it
+>   must serialize identically to what was written — so no decision is ever taken on a parsed
+>   value. Be precise about what that buys: it proves the payload is **serializable and
+>   rereadable**, not that the reconstruction is **substitutable** for the original. The
+>   comparison is between two serializations, and a serialization is lossy about CLR types —
+>   `ConvertFrom-Json` reconstructs an integral JSON number within the `Int64` range as
+>   `Int64`, so `Int32` and every narrower integer type returns widened, while one outside
+>   that range returns as a `BigInteger`; a non-integral one may return as `Double`, so a
+>   `Decimal` loses its type; a `DateTimeOffset` returns as a string or a `DateTime`; and
+>   `NaN`/`Infinity` are written and returned as strings. Nothing downstream
+>   consumes the reconstruction, so that gap cannot
+>   change a decision here; it is a real limit on what a future off-disk consumer may assume.
+> * **No external delivery writes.** The switch writes files — that is its purpose — but only
+>   private state under a directory it owns. It refuses to open while any delivery capability
+>   is live,
+>   recomputing that through `Get-ReviewerGateWritesCurrentlyRequested` rather than accepting
+>   a caller's verdict — though the policy object it judges is still caller-supplied, so this
+>   is a constraint on declared configuration rather than an observation of a live run.
+>   Artifacts land only under a directory the switch owns and marks — a marker is a
+>   convention anything with write access could forge, so it refuses the accident rather than
+>   an adversary. Each artifact is made read-only when published, which is an advisory
+>   attribute rather than enforcement; the load-bearing guarantee is that a name collision
+>   with existing evidence is refused outright rather than resolved in favour of the newcomer.
+>   That refusal is an atomic `CreateNew` reservation on a `.reservation` sidecar rather than a
+>   look at the artifact path, so two concurrent publishers cannot both pass and the artifact
+>   path itself is never briefly visible as a zero-byte file. The sidecar is kept, not cleaned
+>   up: it is what keeps the name unusable, and it is outside the `*.stage.json` inventory.
+>   A reused directory seeds its sequence past reserved names as well as published ones, so a
+>   publish that reserved a name and then refused its payload cannot brick the directory for
+>   later sessions, and a refusal always means a live collision.
+>
+> Evidence: [`tools/Test-ReviewerStageShadow.ps1`](../tools/Test-ReviewerStageShadow.ps1)
+> drives every stage kind at zero, one, many, max, and duplicate through a real file and
+> compares the census read back off disk against the census that went in; refuses null and
+> wrong-scalar at the boundary with nothing written; runs the BOM, truncation, stdout
+> prologue/epilogue, unknown-field, missing-field, foreign-kind, unsupported-version,
+> form-disagreement and collapsed-collection fault matrix; and sabotages the publish path
+> both statically and dynamically.
+> [`tools/Invoke-ReviewerStageShadowRun.ps1`](../tools/Invoke-ReviewerStageShadowRun.ps1)
+> produces all twelve stage artifacts in one no-model run.
+>
+> **Residual: the switch is opt-in, so the on-disk half is exercised only when a caller
+> turns it on, and no shipping entry point does.** That is why the escape ledger scores this
+> prerequisite's on-disk half as *not* in force and records what it really is under
+> `adoptionScope` instead; `tools/Test-EscapeLedger.ps1` fails if that record and `src/`
+> disagree in either direction. Migrating the coordinator's ordinary path onto on-disk
+> publication changes live behaviour and stays out of scope for a prerequisite change that
+> runs no models. Two further residuals: one artifact is not byte-reproducible across
+> processes — the capture census is built from a `Hashtable`'s key order, and .NET randomizes
+> string hashing per process — so the run report pins a second digest alongside the exact one
+> in which two individually named capture fields, `packageFiles` and `packageDirectories`,
+> are compared as multisets. On those two fields only, that digest cannot see an ordering
+> regression; every other stage and every other field keeps its order in both digests. And
+> the run tools themselves are manual evidence recipes whose execution is not CI-verified: CI
+> runs the suites that pin the switch's code, but nothing in CI executes either tool and
+> neither checks in a report, so their artifact counts and digests are transcriptions of a
+> hand-run command.
 
 
 > **Scope.** What this does *not* prove is stated in

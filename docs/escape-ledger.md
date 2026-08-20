@@ -333,7 +333,7 @@ in CI. **In force** means production code actually goes through it today.
 | Prerequisite | Built | In force | Evidence |
 | --- | --- | --- | --- |
 | Cardinality and property corpus over the inventoried collection-bearing stage contracts | yes | yes — 236 of 236 rows bound to a shipping producer contract, no gaps; 1120 of 1652 producer-path cells are cardinalities the shipping producer published and the boundary judged (1009 census-matched, 111 legitimately reshaped), 472 are boundary refusals of the two shapes a producer must never publish, and 60 are the capture residual | `tools/testdata/reviewer-collection-inventory.v1.json` (236 fields, 12 stages), `src/Agents/reviewer/StageProducers.ps1` (12 boundaries), `tools/Test-ReviewerCollectionCardinality.ps1` (7 variants per field, 11 escape shapes, 9 sabotage checks), `tools/testdata/reviewer-collection-cardinality-matrix.v1.json` |
-| Versioned file contract for stage child outputs | yes | partly — the in-memory half is in force (all 12 stage kinds registered in production code, each validated by its own producer before publication); the on-disk half is **not** in force, because no shipping path writes or reads a versioned envelope today | `src/Agents/reviewer/StageContract.ps1`, `src/Agents/reviewer/StageProducers.ps1`, `src/Agents/reviewer/schemas/reviewer.stage-envelope.v1.json`, `src/Agents/reviewer/schemas/reviewer.stage-producer-contracts.v1.json`, `tools/Test-ReviewerStageContract.ps1`, `tools/Test-ReviewerStageProducerContract.ps1` |
+| Versioned file contract for stage child outputs | yes | split — in-memory half: **yes**, on the ordinary path (all 12 stage kinds registered in production code, each validated by its own producer before publication). On-disk half: **no** — all 12 boundaries publish through the atomic versioned writer and reread through the strict reader before any downstream use, but only behind an opt-in switch that is off by default and that nothing under `src/` calls, so production does not go through it today (`adoptionScope` in the JSON records this, and `tools/Test-EscapeLedger.ps1` fails if either direction of that claim goes stale) | `src/Agents/reviewer/StageContract.ps1`, `src/Agents/reviewer/StageProducers.ps1`, `src/Agents/reviewer/StageShadow.ps1`, `src/Agents/reviewer/schemas/reviewer.stage-envelope.v1.json`, `src/Agents/reviewer/schemas/reviewer.stage-producer-contracts.v1.json`, `tools/Test-ReviewerStageContract.ps1`, `tools/Test-ReviewerStageProducerContract.ps1`, `tools/Test-ReviewerStageShadow.ps1`, `tools/Invoke-ReviewerStageShadowRun.ps1` |
 | Boundary hardening analyzer with a blocking new-violation gate | yes | yes — every push is scanned and any new violation fails CI | `tools/Find-PowerShellEmptyNullHazard.ps1` (11 rules), `tools/Test-PowerShellBoundaryHardening.ps1`, `tools/testdata/powershell-boundary-baseline.v1.json` |
 | Escape ledger and budget with a registered trigger | yes | yes — authoritative Gate 5 integration snapshot, current-head staleness, recomputed counts, fired trigger | this document, `docs/escape-ledger.v2.json`, `tools/Test-EscapeLedger.ps1` |
 
@@ -350,11 +350,58 @@ acquisition can mint. 230 of 236 rows are covered through their stage boundary r
 their own named call site, and 112 rows name a producer that nothing in `src/` calls today.
 
 The versioned file contract is a different story and is described as one. Its in-memory half
-is adopted; its on-disk half is not. No coordinator artifact is written through the atomic
-versioned writer or read back through the strict reader on any shipping path, so no consumer
-has yet seen a `kind` or a `contractVersion` on disk, and the entry stays not-in-force until
-one does. None of this changes the integration result: the fired trigger still makes the C#
-control-plane pivot mandatory, and the port itself remains explicitly outstanding.
+is adopted on the ordinary path. Its on-disk half is **built but not in force**, and the
+ledger scores it that way even though the machinery is complete, because the column above
+means one thing only: production code goes through it today. It does not. With
+`src/Agents/reviewer/StageShadow.ps1` enabled, every one of the twelve producers publishes
+its judged payload through the atomic versioned writer and reads it straight back through
+the strict reader before the payload reaches any downstream stage, and the reread verdict is
+consumed — the contract version the file itself declares, adapted-ness, byte digest and
+length, declared form and depth, and the full serialized payload all have to agree or the
+boundary throws. The kind the file declares is compared as well, but counted as redundancy
+rather than evidence: the strict reader already refuses a kind mismatch itself, so that
+comparison cannot fail with the shipped reader. `tools/Invoke-ReviewerStageShadowRun.ps1` drives all twelve stages that way
+in one run with no model and no provider. But nothing under `src/` calls
+`Enable-ReviewerStageShadowContract`, so the ordinary production path keeps its verdicts in
+memory, and the prerequisite's `inForce` stays `false`. What the opt-in path *is* worth is
+recorded in `adoptionScope` instead of being smuggled into the boolean, and the coupling runs
+both ways: `tools/Test-EscapeLedger.ps1` fails if the ledger claims production enables the
+switch when no shipping file calls it, and equally if a shipping file starts calling it while
+the ledger still reads "not enabled". The second direction forces a fresh look, not a
+particular answer, because a reference can exist without production reaching it — a string, a
+dead branch, an uncalled helper. So `adoptionScope.scope` has three landing places rather than
+two: `production-path`, `opt-in-shadow-with-reviewed-reference` for a reference examined and
+found not to reach production, and `opt-in-offline-shadow` for a tree that does not reference
+it at all. The middle one is itself a claim, so it has to carry a separate
+`reviewedReferenceReason` **and** a `reviewedReferencePath` whose cited files are exactly the
+files the detector reports as referencing the switch — a citation that names a file nothing
+references, or that reviews one reference while a second sits beside it, is refused — and it
+cannot be combined with `inForce: true`. The reason is a dedicated field rather than a keyword grep over the shared
+note on purpose: the note is prose about this scheme and already contains the words such a
+grep would look for, so grepping it would accept a record in which nobody had said anything
+about the actual reference. The field is also refused under any other scope, and refused when
+no reference exists at all, so it cannot be left behind as a finding about a tree that has
+moved on. Without that third value a harmless
+reference would leave no representable honest state, and the gate would be demanding a false
+record instead of a re-derivation.
+
+Three further residuals are stated rather than absorbed. What flows downstream is the
+in-memory object the boundary judged, with the reread payload used as evidence that it
+survived a real round trip rather than as the value consumed — which proves the payload is
+serializable and rereadable, not that a JSON reconstruction is substitutable for it, since
+comparing two serializations is blind to CLR type collapse. The capture artifact is not
+byte-reproducible across processes, so the run pins a second digest beside the exact one in
+which two individually named capture fields are compared as multisets; on those two fields
+that digest cannot see an ordering regression, and the exact digest is the primary. And
+`tools/Invoke-ReviewerStageShadowRun.ps1` and `tools/Invoke-ReviewerCaptureCellCensus.ps1`
+are manual evidence recipes whose *execution* is not CI-verified: CI runs the suites that pin
+the switch's code, and the shadow suite token-scans the runner against a fixed denylist of
+direct provider, model and external-write API names - a name check, neither transitive nor
+behavioural, but nothing in CI executes either tool and neither produces a report that is checked
+in — so every count and digest attributed to either of those two tools is a transcription of
+a hand-run command. None of this changes the integration result: the fired
+trigger still makes the C# control-plane pivot mandatory, and the port itself remains
+explicitly outstanding.
 
 ## Adding an incident
 

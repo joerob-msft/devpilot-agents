@@ -909,6 +909,12 @@ function Read-ReviewerStageArtifact {
     return [pscustomobject][ordered]@{
         Path = $Path
         Kind = $contract.Kind
+        # The kind and version the FILE declared, as distinct from the kind and
+        # version the registry holds. The registry pair is what the reader was
+        # asked for and can never disagree with itself; only these two carry what
+        # actually came off disk, so a caller comparing provenance has something
+        # to compare.
+        SourceKind = [string]$envelope.kind
         ContractVersion = $contract.ContractVersion
         SourceVersion = $observedVersion
         Adapted = $adapted

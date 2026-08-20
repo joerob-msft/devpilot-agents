@@ -461,6 +461,19 @@
               "complete": { "type": "boolean" },
               "inForce": { "type": "boolean" },
               "inForceNote": { "type": "string", "minLength": 1 },
+              "adoptionScope": {
+                "comment": "Optional second axis for a prerequisite whose halves are adopted on different paths. inForce answers one question only - does production code go through this today - and a prerequisite that is built, gated in CI, and reachable only behind an explicit opt-in switch must answer that question no. This object records what the opt-in half actually is, so the honest answer does not have to be an understatement.",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["scope", "staticCallSiteInProduction", "note"],
+                "properties": {
+                  "scope": { "enum": ["production-path", "opt-in-offline-shadow", "opt-in-shadow-with-reviewed-reference"] },
+                  "reviewedReferenceReason": { "type": "string", "minLength": 1 },
+                  "reviewedReferencePath": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+                  "staticCallSiteInProduction": { "type": "boolean" },
+                  "note": { "type": "string", "minLength": 1 }
+                }
+              },
               "clockAuthority": {
                 "comment": "authoredOrdinals is legal only for an out-of-force historical snapshot. gate5IntegrationSnapshot is legal for the in-force state only when the version 2 snapshot and its currentness checks pass.",
                 "enum": ["authoredOrdinals", "gate5IntegrationSnapshot"]
