@@ -438,6 +438,168 @@ if (Test-Path -LiteralPath $childAdapter -PathType Leaf) {
     }
 }
 
+# ---------------------------------------------------------------------------
+# The cohort scales the machine; it does not soften it.
+# ---------------------------------------------------------------------------
+# A cohort is the one place in this toolkit where a single operator action starts
+# many preparations, so it is the one place where a quietly relaxed rule would be
+# multiplied rather than noticed. The properties below are the ones a reviewer
+# would have to re-derive by reading four files, so they are asserted instead:
+# one entry at a time, preview-only, no write budget, and no path by which an
+# entry that ended is attempted again.
+$cohortManifestSource = Join-Path $repoRoot 'tools\ShadowRunCoordinator\CohortManifest.cs'
+$cohortJournalSource = Join-Path $repoRoot 'tools\ShadowRunCoordinator\CohortJournal.cs'
+$cohortAuditSource = Join-Path $repoRoot 'tools\ShadowRunCoordinator\CohortAudit.cs'
+$cohortRunnerSource = Join-Path $repoRoot 'tools\ShadowRunCoordinator\CohortRunner.cs'
+$cohortSources = @($cohortManifestSource, $cohortJournalSource, $cohortAuditSource, $cohortRunnerSource)
+$cohortPresent = @($cohortSources | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+if ($cohortPresent.Count -eq $cohortSources.Count) {
+    $manifestText = [IO.File]::ReadAllText($cohortManifestSource)
+    $journalText = [IO.File]::ReadAllText($cohortJournalSource)
+    $cohortAuditText = [IO.File]::ReadAllText($cohortAuditSource)
+    $runnerText = [IO.File]::ReadAllText($cohortRunnerSource)
+    $cohortText = $manifestText + $journalText + $cohortAuditText + $runnerText
+
+    # One at a time is a constant, not a default. A cohort that read its own
+    # parallelism from the manifest could be given a larger number by the same
+    # file it validates, and two preparations sharing one toolkit checkout is a
+    # different experiment from the one this build has evidence for.
+    Assert-Coordinator ($manifestText -match 'SupportedConcurrency\s*=\s*1\b') `
+        'The cohort manifest does not fix its supported concurrency at one.'
+    foreach ($parallel in @('Parallel.For', 'Task.WhenAll', 'ThreadPool', 'Parallel.ForEach', 'MaxDegreeOfParallelism')) {
+        Assert-Coordinator (-not $cohortText.Contains($parallel)) `
+            "The cohort reads '$parallel'; entries in this build are prepared one after another."
+    }
+
+    # The same single authorization kind the coordinator performs, pinned again
+    # at the cohort boundary so a cohort cannot admit an entry the coordinator
+    # would have refused.
+    Assert-Coordinator ($manifestText -match 'PreviewOnlyKind\s*=\s*"PreviewOnly"') `
+        'The cohort manifest does not pin the one authorization kind it admits.'
+    Assert-Coordinator ($cohortText.Contains('RequireNoWriteCapability')) `
+        'The cohort does not refuse a reported write capability through the coordinator''s own definition.'
+    Assert-Coordinator ($cohortText.Contains('RequireZeroWrites')) `
+        'The cohort does not refuse a reported write through the coordinator''s own definition.'
+    Assert-Coordinator ($runnerText.Contains('RequireSlotSet') -and $runnerText.Contains('RequireDelivery')) `
+        'The cohort admits an entry without checking that it declares the whole reviewed pipeline.'
+
+    # An entry that ended is finished. Retrying it would run a second preparation
+    # against a subject whose first preparation already produced evidence, and
+    # replacing it would change what the cohort was authorized to do after the
+    # operator authorized it.
+    foreach ($retry in @('RetryEntry', 'RequeueEntry', 'ReplaceEntry', 'AddEntry', 'RemoveEntry',
+            'RetryCount', 'MaxRetries', 'retryPolicy', 'Reattempt')) {
+        Assert-Coordinator (-not $cohortText.Contains($retry)) `
+            "The cohort reads '$retry'; an entry that ended is never attempted again and the declared set never changes."
+    }
+    Assert-Coordinator ($journalText.Contains('HasEnded')) `
+        'The cohort journal has no single test for an entry that already ended.'
+
+    # The ceiling is consulted before the entry that would cross it, using what
+    # the cohort has actually spent. A ceiling checked afterwards is a ceiling
+    # that has already been exceeded.
+    Assert-Coordinator ($runnerText.Contains('DescribeBudgetStop')) `
+        'The cohort has no single admission check against its global ceiling.'
+    Assert-Coordinator ($runnerText.IndexOf('DescribeBudgetStop(journal)') -lt $runnerText.IndexOf('RunEntry(')) `
+        'The cohort checks its global ceiling after starting the entry that would cross it.'
+
+    # Every cohort document is versioned and every one of them is a file. Nothing
+    # here answers on a stream.
+    foreach ($contract in @('devpilot.shadow-cohort.manifest.v1', 'devpilot.shadow-cohort.journal.v1',
+            'devpilot.shadow-cohort.index.v1', 'devpilot.shadow-cohort.launch-intent.v1',
+            'devpilot.shadow-cohort.lease.v1')) {
+        Assert-Coordinator ($cohortText.Contains($contract)) `
+            "The cohort does not name the versioned contract '$contract'."
+    }
+    Assert-Coordinator ($cohortText.Contains('Console.Out.Write') -eq $false) `
+        'The cohort writes to stdout; its documents travel in files and its progress on the error stream.'
+
+    # The index is an accounting document, not a review. It may carry digests and
+    # counts; it may not carry anything a reader could mistake for a judgement,
+    # and it may not carry the subject it was taken over.
+    foreach ($judgement in @('Verdict', 'Severity', 'Promotable', 'Finding', 'Confidence', 'Score', 'Rank(')) {
+        Assert-Coordinator (-not $cohortAuditText.Contains($judgement)) `
+            "The cohort summary reads '$judgement'; a cohort index reports what ran, never what was concluded."
+    }
+    foreach ($identity in @('"organization"', '"repository"', '"pullRequestId"', '"sourceCommit"')) {
+        Assert-Coordinator (-not ($cohortAuditText -match [Regex]::Escape("Set($identity"))) `
+            "The cohort index publishes $identity; an entry is identified in the index by digest alone."
+    }
+
+    # An entry whose evidence this build could not read is closed, not left open.
+    # An entry recorded as running once its child is gone is an entry a later run
+    # would read as resumable and start a second time.
+    Assert-Coordinator ($journalText.Contains('EvidenceRefused')) `
+        'The cohort journal has no ending for an entry whose published evidence was refused.'
+    Assert-Coordinator ($runnerText.Contains('CohortEntryOutcomes.EvidenceRefused')) `
+        'The cohort runner never closes an entry whose evidence it refused, so a resume could start it again.'
+    Assert-Coordinator ($runnerText.Contains('EndedRefused')) `
+        'The cohort runner walks past an entry whose evidence was refused instead of staying stopped.'
+
+    # Liveness is decided from a process id AND a start time, because process ids
+    # are recycled. A record that cannot answer "is it still running?" refuses
+    # rather than answers no.
+    Assert-Coordinator ($journalText -match 'ChildProcessId\s*<=\s*0') `
+        'The cohort journal treats an unusable child identity as a dead child, which would permit a second launch.'
+    Assert-Coordinator ($journalText.Contains('ChildStartedAtUtc')) `
+        'The cohort journal records no child start time, so a recycled process id could pass for a live child.'
+
+    # An index that claims to be rebuildable has to notice when the artifacts it
+    # names have changed under it, or a removed audit would simply be re-signed
+    # as an entry that never ran.
+    Assert-Coordinator ($runnerText.Contains('RequireCommittedDigests')) `
+        'The cohort index is rebuilt without checking the rebuilt summaries against the digests its journal committed.'
+    Assert-Coordinator ($runnerText.Contains('DeriveOutcome')) `
+        'A rebuilt cohort index does not derive its outcome from the journal, so a rebuild could launder a stop.'
+
+    # A refusal's own words can name an output root, and an output root can encode
+    # the subject it was taken over. The words go to the operator's log; the index
+    # carries their digest.
+    Assert-Coordinator ($cohortAuditText.Contains('terminalDetailSha256')) `
+        'The cohort index publishes no digest of the refusal it reports.'
+    Assert-Coordinator ($runnerText.Contains('PublishIndexOnFault')) `
+        'The cohort publishes fault messages straight into its index instead of digesting them.'
+
+    # An audit found standing in an entry's output root is only that entry's audit
+    # if it says so. Otherwise a cohort would count evidence left there by
+    # something else.
+    Assert-Coordinator ($cohortAuditText.Contains('expectedCorrelationId')) `
+        'The cohort reads an entry audit without binding it to the request that entry declared.'
+    Assert-Coordinator ($cohortAuditText.Contains('RequireWriteCount')) `
+        'The cohort reads its write counters leniently; an unreadable counter is not the zero the cohort has to prove.'
+
+    # Where a cohort's own record lives cannot depend on the directory a run
+    # started from, or a resume would read a different journal.
+    Assert-Coordinator ($manifestText.Contains('RequireRootedPath')) `
+        'The cohort manifest admits a relative journal or index path, so a resume could read a different record.'
+
+    # A signed journal cannot be repaired by hand, so the writer may never commit
+    # a record its own reader refuses: the only way out of that would be a fresh
+    # root, which reopens every ended entry and re-launches subjects that ran.
+    Assert-Coordinator ($journalText.Contains('RequireWritable')) `
+        'The cohort journal commits records without first checking that its own reader would admit them.'
+    Assert-Coordinator ($journalText -match 'ExitCode\s*=\s*StrictJson\.RequireInt\(node,\s*"exitCode",\s*label,\s*int\.MinValue') `
+        'The cohort journal bounds the child exit code below what the operating system can report, so a hard-dying child would wedge it.'
+    Assert-Coordinator ($runnerText.Contains('RecordedStartTime')) `
+        'The cohort runner commits the raw child start time, which is empty when it cannot be read and unreadable once written.'
+    Assert-Coordinator ($cohortAuditText.Contains('RequireRepresentable')) `
+        'The cohort narrows its ceiling counters with an unchecked cast, which would let a wrapped total disable the ceiling.'
+    Assert-Coordinator ($journalText.Contains('HasRecordedIntent')) `
+        'The cohort journal cannot tell a mint that got no further from a journal somebody removed.'
+
+    # The operator alias arrives on the command line. A cohort whose authorization
+    # could be read out of the manifest would be a cohort a scheduled task could
+    # start by writing a file.
+    $programContract = Join-Path $repoRoot 'tools\ShadowRunCoordinator\Program.cs'
+    if (Test-Path -LiteralPath $programContract -PathType Leaf) {
+        $programText = [IO.File]::ReadAllText($programContract)
+        Assert-Coordinator ($programText.Contains('--authorized-by')) `
+            'The entry point does not require a cohort to name the operator who started it.'
+        Assert-Coordinator (-not $manifestText.Contains('authorizedBy')) `
+            'The cohort manifest carries an operator alias; the authorization is an argument an operator types, not a field a file can hold.'
+    }
+}
+
 # The rule above can only bite on files it can see. If the port ever lands
 # somewhere this suite does not look, the suite would stay green while holding
 # nothing, so the search root is asserted rather than assumed.

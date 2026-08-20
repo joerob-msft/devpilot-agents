@@ -503,6 +503,125 @@ This is what moved the file contract from "built and CI-verified" to "in force" 
 `docs/escape-ledger.v2.json`: not a document saying so, but a compiled consumer that cannot
 reach its terminal state without the files.
 
+## The cohort
+
+Everything above prepares one pull request. The cohort is the operator-initiated layer that runs
+that same preparation across several of them, one after another, and it deliberately adds nothing
+to what a preparation does — it adds only the accounting that makes running many of them
+answerable afterwards.
+
+It is a separate mode of the same executable:
+
+```
+ShadowRunCoordinator --cohort <manifest.json> --authorized-by <alias>
+ShadowRunCoordinator --cohort <manifest.json> --authorized-by <alias> --rebuild-index
+```
+
+The alias is an argument, not a manifest field, and that is the point. A cohort whose
+authorization could be read out of a file would be a cohort a scheduled task could start by
+writing that file. There is no unattended path to this mode.
+
+**One manifest, sealed before anything runs.** `devpilot.shadow-cohort.manifest.v1` declares the
+cohort id and correlation, the exact toolkit checkout and required ref, the global ceilings, and
+an ordered list of entries. Each entry pins one already-written typed request by path *and*
+digest, restates that request's subject and its three configuration digests, declares where the
+reviewer rules it will be run under came from, names its own immutable output root, and carries a
+sealed plan estimate. The manifest is read as strict UTF-8 without a byte-order mark, through the
+same strict reader everything else uses; an unknown field, a missing one, a repeated pull request,
+two entries sharing an output root, an ordinal that disagrees with its position, or a set of
+estimates that cannot fit the cohort's own ceiling is a refusal before any process starts. Nothing
+is read from stdin and nothing contractual is written to stdout.
+
+**Concurrency is one, as a constant.** `SupportedConcurrency` is a literal in the contract and a
+manifest declaring anything else is refused. Two preparations sharing one toolkit checkout is a
+different experiment from the one this build has evidence for, so it is not offered.
+
+**Every entry is the whole pipeline.** Before an entry is launched the runner re-reads its request
+and checks that the bytes still digest to what the manifest sealed, that the subject still matches
+field for field, that the toolkit head and required ref are the cohort's, that the rule bundle
+declaration still digests to what was declared, that the output root is the one that was declared,
+and that the request declares both slots, the reconciliation and a `PreviewOnly` delivery with a
+zero write budget. An entry that declares less than the full pipeline is refused rather than run
+in a reduced shape.
+
+**Sequential, journalled, and never retried.** The cohort journal
+(`devpilot.shadow-cohort.journal.v1`) is signed and replaced atomically, and it moves an entry
+through `pending → launchIntended → running → ended`. The launch intent — including the entry's
+digests and the exact command — is committed *before* the process exists, and the child's process
+id and its exact start time are committed as soon as it does, which is what makes "did this entry
+already start?" answerable after a machine dies rather than inferred. An entry that reached
+`ended` is finished: the journal refuses to reopen it, so a resume can never produce a second
+preparation over a subject whose first preparation already published evidence. There is no retry,
+no requeue, and no replacement — a cohort that needs a different set is a different cohort, with
+its own manifest and its own operator.
+
+A resume that finds an entry still `running` checks whether the recorded child is genuinely alive,
+by process id *and* start time. If it is, the resume refuses (exit 6) rather than running beside
+it; once that child is gone the entry is relaunched from a clean attempt, and the entries before
+it are not touched. A `running` record that carries neither a usable process id nor a start time
+cannot answer that question at all, so it refuses too: answering "not alive" by default is exactly
+how a second preparation gets started over a live output root.
+
+**The ceiling is checked before the entry that would cross it.** Admission uses what the cohort
+has actually spent, taken from the ended entries' own audits, plus the sealed estimate of the
+entry about to start. If that would cross the declared maximum model starts, verifier assignments
+or wall clock, the cohort stops (exit 10), the remaining entries stay `pending`, and the index says
+so. A ceiling checked afterwards is a ceiling that has already been exceeded.
+
+**Stop policy, and what it does not mean.** `failFast` stops at the first entry that ends other
+than complete; `continueOnTerminalFailure` carries on to the next one. Neither re-attempts
+anything. Two conditions ignore the policy entirely and stop the whole cohort: an entry audit this
+build cannot read, and any reported provider write or write tool invocation (exit 11). An audit
+standing in an entry's output root counts as that entry's audit only if it names the correlation
+the entry's own sealed request declares, and the two write counters are read strictly — absent,
+negative or non-integral is a refusal, never the zero the cohort is trying to prove. A write
+observed anywhere in a cohort invalidates the claim the whole cohort was run under, so it is not
+something the cohort continues past. An entry whose evidence was refused is *closed* with the
+outcome `evidenceRefused` before the refusal travels — an entry left recorded as `running` once
+its child is gone would be read as resumable by the next run — and a cohort holding such an entry
+stays refused on every later run until an operator settles those artifacts by hand.
+
+**The index says what ran, never what was concluded.** `devpilot.shadow-cohort.index.v1` carries
+one summary per declared entry, in declared order: the preparation's final state and terminal
+reason, the snapshot, run-set, reconciliation and delivery evidence digests, the model start, slot,
+supervised slot, verifier assignment and provider write counts, the wall time, and the entry's
+subject *digest*. It carries no organization, repository, pull request id, finding text, severity
+or verdict, and it is self-hashed and signed. A refusal's own words can name an output root, and an
+output root can encode the subject it was taken over, so the index publishes a closed phrase plus
+`terminalDetailSha256` and the words themselves go to the operator's log.
+
+`--rebuild-index` reconstructs it from the journal and the per-entry audits alone, launching
+nothing, which is what makes the index evidence rather than a log the runner happened to keep. The
+rebuild is checked, not merely repeated: each ended entry's recomputed audit and summary digests
+must equal the ones its ending committed, so an audit that was removed, replaced or edited after
+the fact is refused (exit 11) instead of being quietly re-signed as an entry that never ran. The
+rebuild also derives its terminal reason from the journal, so re-publishing a budget stop or a
+`failFast` stop cannot launder it into a completed cohort.
+
+Because a resume has to find the same record, the journal root and the index path are declared as
+absolute paths. A relative one would resolve against whatever directory the run happened to start
+in, and a resume that read a different journal would start entries that had already run.
+
+Rolling the cohort back is not running it. The single-request mode is unchanged, the PowerShell
+preparation path is unchanged, and a cohort of one entry is a preparation with a journal around it.
+
+**Running one.** `samples/shadow-cohort.sample.json` is a complete two-entry manifest in the exact
+shape this build parses, with every path, digest and identity field zeroed. An operator fills it in
+from artifacts they already have — the same per-pull-request request documents the single-run mode
+takes, the rule bundle declarations those requests were built against, and the digests of both —
+and then runs:
+
+```
+ShadowRunCoordinator --cohort <manifest> --authorized-by <alias>
+```
+
+The alias is a command-line argument on purpose. It is never read from the manifest, so a cohort
+cannot be started by a scheduled task that writes a file: somebody has to type it. Exit 0 means
+every entry ended complete; 5 means the cohort was walked but an entry ended other than complete;
+10 means a ceiling stopped it with entries still pending; 11 means it was blocked and needs an
+operator; 6 means a committed launch could not be resolved and needs one too. Re-running the same
+command resumes; it never retries.
+
 ## Rollback
 
 The PowerShell preparation path is unchanged and remains the default; nothing routes to the
@@ -732,13 +851,55 @@ as the comparison's: the coordinator is killed after the delivery has minted its
 attempt record, and the resume must adopt the child it named, reach `deliveryTerminalVerified`,
 leave exactly one attempt record, and still report both zeroes.
 
+`tools/Test-ShadowCohortRunner.ps1` (CI, offline, no model) covers the cohort layer, and it
+inverts the stand-in: the *runner* under test is the shipping runner with no test mode, and the
+*entries* are stood in. What a cohort adds over a preparation is entirely about accounting across
+processes — committing an intent before a child exists, refusing to reopen an entry that ended,
+admitting the next entry against a global ceiling, surviving a kill between entries — and none of
+that depends on how faithfully the child reviews anything, while a suite that ran the real
+preparation per entry could not kill a runner at a chosen instant. So each entry is a real child
+process, started against a real typed request that the real loader validates, writing a real audit
+at the real path that the real summary reader parses; it simply reaches its outcome by reading a
+control file.
+
+It covers: a three-entry cohort through a completion, a supervised run that ended other than
+complete, and a fault, under both stop policies, with the continue policy reaching every entry and
+`failFast` provably leaving the entry after the stop with no output root at all; the index's
+ordering, its per-entry counts and its opacity, checked by looking for sentinel identity that
+cannot occur inside a digest; a second run of a finished cohort, which must re-attempt nothing and
+must leave exactly three launch intents in the journal; `--rebuild-index` reproducing the summaries
+and the totals from the journal and the audits after the index is deleted; a child that hangs,
+killed at the entry's declared ceiling with its process confirmed gone; a runner killed mid-entry
+*without* its child, so the entry's preparation outlives its parent, followed by a resume that
+refuses to run beside that live child, and then — once it is gone — a resume that carries the
+interrupted entry to an ending on a second attempt, never touches the entry before it, and goes on
+to the entry after it; a journal edited after it was written; a manifest edited between runs; a
+journal key with no journal; the global ceiling stopping the cohort before the entry that would
+cross it, again confirmed by the absence of that entry's output; a reported provider write and an
+unreadable entry audit, each stopping the whole cohort regardless of policy; a subject that drifted
+between the manifest and the request, a request edited after the manifest sealed it, a rule bundle
+that changed under its declaration, and a toolkit checkout that moved — each refused with the entry
+provably never started; the manifest shapes this build never runs (concurrency two, no entries, one
+pull request declared twice, a shared output root, a self-contradicting order, estimates that
+cannot fit their own ceiling, an unknown field, an authorization kind other than preview-only, and
+a non-zero write budget); an entry declaring no delivery; and the invocation refusals that keep a
+cohort an operator action — no `--authorized-by`, a cohort mixed with a single request, a
+malformed alias, and `--rebuild-index` outside a cohort.
+
 `tools/Test-ReviewerCoordinatorContract.ps1` is the architecture boundary: it asserts that the
 coordinator sources contain no prompt, model, severity, candidate or verdict vocabulary and no
 provider write path, that a delivery exists and that no transition in it can write, that both
 slot terminals and the reconciliation and delivery states are present, that the delivery is
 gated on the reconciliation and the reconciliation on every declared slot, and that every
 exchange with the reviewed PowerShell goes through a named versioned file contract rather than
-stdout — so "no reviewer judgement in C#" is checked rather than promised.
+stdout — so "no reviewer judgement in C#" is checked rather than promised. For the cohort it adds
+the properties a reviewer would otherwise have to re-derive across four files: that concurrency is
+a literal one and no parallel primitive appears anywhere in it, that preview-only is pinned again
+at the cohort boundary and the coordinator's own write refusals are the ones applied, that no
+retry, requeue, replacement or set-mutation vocabulary exists, that the global ceiling is consulted
+before the entry that would cross it rather than after, that every cohort document is a named
+versioned file, that the index carries no judgement vocabulary and publishes no subject identity,
+and that the operator alias is an argument rather than a manifest field.
 
 The canonical key order that makes any of this reproducible is covered in
 `tools/Test-ReviewerStageContract.ps1`, which asserts the same bytes under `en-US`, `da-DK`,

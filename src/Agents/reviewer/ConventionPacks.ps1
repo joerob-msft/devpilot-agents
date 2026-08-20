@@ -334,11 +334,12 @@ function ConvertTo-ReviewerConventionChangeSet {
         }
         foreach ($pathRecord in $paths) {
             $relative = ConvertTo-ReviewerConventionRelativePath -Path $pathRecord.RawPath -Where "changed path '$($pathRecord.RawPath)'"
-            if ($relative.Length + 1 -gt $script:ReviewerConventionMaxPathLength) {
+            $anchored = "/" + $relative
+            if ($anchored.Length -gt $script:ReviewerConventionMaxPathLength) {
                 throw "Changed path '$($pathRecord.RawPath)' exceeds $script:ReviewerConventionMaxPathLength characters when anchored."
             }
             [void]$records.Add([pscustomobject]@{
-                    Path        = "/" + $relative
+                    Path        = $anchored
                     OriginalPath = [string]$pathRecord.RawPath
                     Role        = [string]$pathRecord.Role
                     ChangeTypes = @($types)

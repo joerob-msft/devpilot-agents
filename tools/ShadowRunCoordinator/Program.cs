@@ -18,22 +18,25 @@ namespace DevPilot.ShadowRunCoordinator;
 /// </remarks>
 internal static class Program
 {
-    private const int ExitOk = 0;
-    private const int ExitUsage = 1;
-    private const int ExitContract = 2;
-    private const int ExitLeaseConflict = 3;
-    private const int ExitChildFailure = 4;
+    private const int ExitOk = CoordinatorExitCodes.Ok;
+    private const int ExitUsage = CoordinatorExitCodes.Usage;
+    private const int ExitContract = CoordinatorExitCodes.Contract;
+    private const int ExitLeaseConflict = CoordinatorExitCodes.LeaseConflict;
+    private const int ExitChildFailure = CoordinatorExitCodes.ChildFailure;
     /// <summary>A supervised slot reached a terminal that was not 'complete'. Not a coordinator fault.</summary>
-    private const int ExitSlotNotComplete = 5;
+    private const int ExitSlotNotComplete = CoordinatorExitCodes.SlotNotComplete;
     /// <summary>A previous run's launch was never accounted for, so this one refuses to guess.</summary>
-    private const int ExitUnresolvedLaunch = 6;
-    private const int ExitHalted = 9;
+    private const int ExitUnresolvedLaunch = CoordinatorExitCodes.UnresolvedLaunch;
+    private const int ExitHalted = CoordinatorExitCodes.Halted;
 
     internal static int Main(string[] args)
     {
         string? requestPath = null;
         string? targetName = null;
         string? haltAfterName = null;
+        string? cohortPath = null;
+        string? operatorAlias = null;
+        var rebuildIndex = false;
 
         // The parse runs inside the same guard as the rest of the entry point.
         // A missing option value is a usage fault, and a usage fault that escapes
@@ -55,6 +58,15 @@ internal static class Program
                     case "--halt-after":
                         haltAfterName = Next(args, ref index, "--halt-after");
                         break;
+                    case "--cohort":
+                        cohortPath = Next(args, ref index, "--cohort");
+                        break;
+                    case "--authorized-by":
+                        operatorAlias = Next(args, ref index, "--authorized-by");
+                        break;
+                    case "--rebuild-index":
+                        rebuildIndex = true;
+                        break;
                     case "--help":
                         Console.Out.WriteLine(Usage);
                         return ExitOk;
@@ -63,6 +75,23 @@ internal static class Program
                         Console.Error.WriteLine(Usage);
                         return ExitUsage;
                 }
+            }
+
+            if (cohortPath is not null)
+            {
+                return RunCohort(cohortPath, operatorAlias, rebuildIndex, requestPath, targetName, haltAfterName);
+            }
+            if (rebuildIndex)
+            {
+                Console.Error.WriteLine("--rebuild-index applies to a cohort and needs --cohort.");
+                Console.Error.WriteLine(Usage);
+                return ExitUsage;
+            }
+            if (operatorAlias is not null)
+            {
+                Console.Error.WriteLine("--authorized-by applies to a cohort and needs --cohort.");
+                Console.Error.WriteLine(Usage);
+                return ExitUsage;
             }
 
             if (requestPath is null)
@@ -111,11 +140,64 @@ internal static class Program
             Console.Error.WriteLine(error.Message);
             return ExitUnresolvedLaunch;
         }
+        catch (CohortUnresolvedLaunchException error)
+        {
+            // The same event one level up: a cohort that committed the intent to
+            // start an entry and cannot prove that entry is not still running.
+            Console.Error.WriteLine(error.Message);
+            return ExitUnresolvedLaunch;
+        }
+        catch (CohortBlockedException error)
+        {
+            // Its own code because it is not a stop policy outcome. Something was
+            // observed that stops the WHOLE set regardless of policy, and an
+            // operator must not read it as 'one entry failed'.
+            Console.Error.WriteLine(error.Message);
+            return CoordinatorExitCodes.CohortBlocked;
+        }
         catch (ChildFailureException error)
         {
             Console.Error.WriteLine(error.Message);
             return ExitChildFailure;
         }
+    }
+
+    /// <summary>
+    /// The cohort entry mode: operator-initiated, one manifest, one entry at a
+    /// time.
+    /// </summary>
+    /// <remarks>
+    /// The alias is required rather than defaulted, and it is required on the
+    /// COMMAND LINE rather than read out of the manifest. A manifest is a file,
+    /// and a file can be left somewhere a timer finds it; requiring the
+    /// authorization at the point of invocation is what keeps this an
+    /// operator-initiated action rather than a scheduled one. Nothing here checks
+    /// who the operator is - that is not a claim this program is in a position to
+    /// make - it records the claim the invoker made, so the account names someone.
+    /// </remarks>
+    private static int RunCohort(
+        string cohortPath,
+        string? operatorAlias,
+        bool rebuildIndex,
+        string? requestPath,
+        string? targetName,
+        string? haltAfterName)
+    {
+        if (requestPath is not null || targetName is not null || haltAfterName is not null)
+        {
+            Console.Error.WriteLine("--cohort runs a declared set and takes its request, target and halt points from the manifest.");
+            Console.Error.WriteLine(Usage);
+            return ExitUsage;
+        }
+        if (operatorAlias is null)
+        {
+            Console.Error.WriteLine("--cohort requires --authorized-by <alias>: a cohort is started by an operator, never by a timer.");
+            Console.Error.WriteLine(Usage);
+            return ExitUsage;
+        }
+        CohortManifest.RequireOpaqueShape(operatorAlias, "cohort invocation", "--authorized-by", 3, 64);
+        var manifest = CohortManifest.Load(cohortPath);
+        return CohortRunner.Run(manifest, operatorAlias, rebuildIndex, Console.Out);
     }
 
     private static int Run(CoordinatorRequest request, PreparationState target, PreparationState? haltAfter)
@@ -180,10 +262,19 @@ internal static class Program
 
     private const string Usage = """
         ShadowRunCoordinator --request <path> [--target <state>] [--halt-after <state>]
+        ShadowRunCoordinator --cohort <path> --authorized-by <alias> [--rebuild-index]
 
-          --request     Path to a devpilot.shadow-run-coordinator.request.v2 JSON file.
-          --target      Stop once this state is reached. Defaults to runSetReady.
-          --halt-after  Exit 9 immediately after committing this state. For fault tests.
+          --request       Path to a devpilot.shadow-run-coordinator.request.v2 JSON file.
+          --target        Stop once this state is reached. Defaults to runSetReady.
+          --halt-after    Exit 9 immediately after committing this state. For fault tests.
+          --cohort        Path to a devpilot.shadow-cohort.manifest.v1 JSON file. Runs the
+                          declared entries one at a time, each as its own preparation
+                          against its own immutable output root.
+          --authorized-by The operator alias this cohort is started under. Required for
+                          --cohort, recorded in the journal and the index, and never
+                          defaulted: a cohort is an operator action, not a timer's.
+          --rebuild-index Rebuild the cohort index from the journal and the published
+                          per-entry audits, and start nothing.
 
         States: requestValidated corpusStaging corpusPublished corpusValidated
                 recipePlanned snapshotValidateOnly snapshotSealed snapshotVerified
@@ -213,5 +304,15 @@ internal static class Program
         Exit codes: 0 reached, 1 usage, 2 contract refusal, 3 lease conflict,
                     4 child failure, 5 supervised slot ended not-complete,
                     6 a previous run's launch is unaccounted for, 9 deliberate halt.
+
+        A cohort adds two codes and reuses the rest unchanged: 5 also means the
+        cohort walked to its stop point with at least one entry other than
+        complete, 10 means the cohort stopped on one of its own global budgets
+        with its remaining entries left pending, and 11 means something was
+        observed that stops the whole set whatever its stop policy says.
+
+        A cohort never retries an entry, never replaces one, and never substitutes
+        another subject for one that failed. Its stop policy chooses only between
+        ending at the first unsuccessful entry and walking the rest of the set.
         """;
 }
