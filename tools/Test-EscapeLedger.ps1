@@ -987,31 +987,63 @@ Assert-Ledger (-not (Test-CardinalityAdoptionProven -Matrix $unbuiltMatrix)) `
 Assert-Ledger (Test-CardinalityAdoptionProven -Matrix $cardinalityMatrix) `
     'The adoption coupling rejects the coverage matrix this repository actually records, so it can never be satisfied.'
 
-# The same standard for the file contract's on-disk half. It is recorded as adopted behind
-# an opt-in switch and NOT in force, and every part of that sentence has to be refusable:
-# a scope note that drops the opt-in, an in-force claim while nothing enables the switch,
-# and a scope record that disagrees with what src/ actually calls.
+# The same standard for the file contract's on-disk half. It is now recorded as reached on a
+# shipping path and in force, and every part of that sentence still has to be refusable. The
+# negative proofs below deliberately do NOT inherit the shipped record's answers: a mutant
+# built by editing one field of a record that already says "in force, production path" tests
+# whichever fields it forgot to reset. Each one states the pre-adoption baseline it needs, so
+# what it exercises is the rule rather than today's values.
 $fileContractPrerequisite = @($ledger.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })
 Assert-Ledger ($fileContractPrerequisite.Count -eq 1) `
     'The decision record does not declare the file-contract prerequisite exactly once.'
+
+function Get-PreAdoptionFileContractClaim {
+    <#
+        A file-contract claim reset to the record this repository shipped before a
+        shipping file called the switch: not in force, opt-in scope, no static call
+        site, and a note that asserts nothing calls it. The negative proofs need
+        that baseline to have anything to refuse, and reconstructing it explicitly
+        keeps them meaningful after the real record moved on.
+    #>
+    param([Parameter(Mandatory)][string]$Json)
+    $claim = @((Get-LedgerObject -Json $Json).decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+    $claim.inForce = $false
+    $claim.adoptionScope.scope = 'opt-in-offline-shadow'
+    $claim.adoptionScope.staticCallSiteInProduction = $false
+    $claim.adoptionScope.note = 'The on-disk half runs only when a caller calls Enable-ReviewerStageShadowContract, which refuses to open while any delivery capability is live. No file under src/ contains a static call to it. A reference reviewed and found inert - a string literal, a dead branch, an uncalled helper - would have to be recorded as such.'
+    return $claim
+}
+
 if ($fileContractPrerequisite.Count -eq 1) {
-    $scopelessNote = Get-LedgerObject -Json $ledgerJson
-    $scopelessClaim = @($scopelessNote.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
-    $scopelessClaim.adoptionScope.note = 'Adopted.'
-    Assert-Ledger (@(Get-FileContractAdoptionViolation -Prerequisite $scopelessClaim).Count -gt 0) `
-        'The file contract coupling accepted an adoption record that drops the opt-in scope the on-disk half is actually reached through.'
+    $emptyProductionRoot = Join-Path ([IO.Path]::GetTempPath()) ("ledger-noref-" + [Guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Path $emptyProductionRoot -Force
+    try {
+        $scopelessClaim = Get-PreAdoptionFileContractClaim -Json $ledgerJson
+        $scopelessClaim.adoptionScope.note = 'Adopted.'
+        Assert-Ledger (@(Get-FileContractAdoptionViolation -Prerequisite $scopelessClaim -ProductionRoot $emptyProductionRoot).Count -gt 0) `
+            'The file contract coupling accepted an adoption record that drops the opt-in scope the on-disk half is actually reached through.'
 
-    $overclaimed = Get-LedgerObject -Json $ledgerJson
-    $overclaimedClaim = @($overclaimed.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
-    $overclaimedClaim.inForce = $true
-    Assert-Ledger (@(Get-FileContractAdoptionViolation -Prerequisite $overclaimedClaim).Count -gt 0) `
-        'The file contract coupling accepted an in-force claim while nothing under src/ enables the on-disk half.'
+        $overclaimedClaim = Get-PreAdoptionFileContractClaim -Json $ledgerJson
+        $overclaimedClaim.inForce = $true
+        Assert-Ledger (@(Get-FileContractAdoptionViolation -Prerequisite $overclaimedClaim -ProductionRoot $emptyProductionRoot |
+                    Where-Object { $_ -match 'no shipping file under src/ even names' }).Count -eq 1) `
+            'The file contract coupling accepted an in-force claim while nothing under src/ enables the on-disk half.'
 
-    $mislabelled = Get-LedgerObject -Json $ledgerJson
-    $mislabelledClaim = @($mislabelled.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
-    $mislabelledClaim.adoptionScope.staticCallSiteInProduction = $true
-    Assert-Ledger (@(Get-FileContractAdoptionViolation -Prerequisite $mislabelledClaim).Count -gt 0) `
-        'The file contract coupling accepted a claim that production enables the switch when no shipping file calls it.'
+        $mislabelledClaim = Get-PreAdoptionFileContractClaim -Json $ledgerJson
+        $mislabelledClaim.adoptionScope.staticCallSiteInProduction = $true
+        Assert-Ledger (@(Get-FileContractAdoptionViolation -Prerequisite $mislabelledClaim -ProductionRoot $emptyProductionRoot).Count -gt 0) `
+            'The file contract coupling accepted a claim that production enables the switch when no shipping file calls it.'
+
+        # The mirror of that mislabelling, which is the direction the record now
+        # sits on: denying a call site that src/ really does contain.
+        $deniedClaim = @((Get-LedgerObject -Json $ledgerJson).decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $deniedClaim.adoptionScope.staticCallSiteInProduction = $false
+        Assert-Ledger (@(Get-FileContractAdoptionViolation -Prerequisite $deniedClaim).Count -gt 0) `
+            'The file contract coupling accepted a record denying a static call site that src/ actually contains.'
+    }
+    finally {
+        Remove-Item -LiteralPath $emptyProductionRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
 
     $scopeless = Get-LedgerObject -Json $ledgerJson
     $scopelessRecord = @($scopeless.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
@@ -1024,8 +1056,10 @@ if ($fileContractPrerequisite.Count -eq 1) {
         'The file contract coupling accepted a missing prerequisite record as proof of adoption.'
     Assert-Ledger (@(Get-FileContractAdoptionViolation -Prerequisite $fileContractPrerequisite[0]).Count -eq 0) `
         'The file contract coupling rejects the adoption this repository actually records, so it can never be satisfied.'
-    Assert-Ledger (-not (Test-ShadowSwitchStaticCallSitePresent)) `
-        'A file under src/ enables the stage shadow switch, so the ledger''s not-in-force record for the on-disk half is stale.'
+    # The load-bearing direction, now that the record claims a production path:
+    # src/ must really contain the call site the record is derived from.
+    Assert-Ledger (Test-ShadowSwitchStaticCallSitePresent) `
+        'The ledger records a production-path adoption for the on-disk half, but no shipping file under src/ calls the stage shadow switch.'
 
     # The detector has to be able to answer YES, or "nothing enables it" is just
     # the only answer it knows how to give. Prove it against a tree that does.
@@ -1082,8 +1116,7 @@ if ($fileContractPrerequisite.Count -eq 1) {
         [IO.File]::WriteAllText($callerPath,
             "`$state = Enable-ReviewerStageShadowContract -Directory `$dir`n",
             [Text.UTF8Encoding]::new($false))
-        $wiredIn = Get-LedgerObject -Json $ledgerJson
-        $wiredInClaim = @($wiredIn.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $wiredInClaim = Get-PreAdoptionFileContractClaim -Json $ledgerJson
         $wiredInClaim.adoptionScope.staticCallSiteInProduction = $true
         $wiredInViolations = @(Get-FileContractAdoptionViolation -Prerequisite $wiredInClaim -ProductionRoot $detectorProof)
         Assert-Ledger (@($wiredInViolations | Where-Object { $_ -match "cannot still read 'opt-in-offline-shadow'" }).Count -eq 1) `
@@ -1101,8 +1134,7 @@ if ($fileContractPrerequisite.Count -eq 1) {
         # would be false and the gate would be demanding a lie. The third state
         # exists for exactly that case - and it is a claim, so it has to say why
         # the reference is inert and it cannot sit next to an in-force claim.
-        $reviewedRef = Get-LedgerObject -Json $ledgerJson
-        $reviewedRefClaim = @($reviewedRef.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $reviewedRefClaim = Get-PreAdoptionFileContractClaim -Json $ledgerJson
         $reviewedRefClaim.adoptionScope.staticCallSiteInProduction = $true
         $reviewedRefClaim.adoptionScope.scope = 'opt-in-shadow-with-reviewed-reference'
         $reviewedRefClaim.adoptionScope.note = 'Reached only through the opt-in Enable-ReviewerStageShadowContract switch.'
@@ -1117,8 +1149,7 @@ if ($fileContractPrerequisite.Count -eq 1) {
         Assert-Ledger ($reviewedRefViolations.Count -eq 0) `
             "A reviewed, inert reference has no representable adoption scope: $($reviewedRefViolations -join ' | ')"
 
-        $unexplainedRef = Get-LedgerObject -Json $ledgerJson
-        $unexplainedRefClaim = @($unexplainedRef.decision.prerequisites | Where-Object { $_.id -eq 'file-contract' })[0]
+        $unexplainedRefClaim = Get-PreAdoptionFileContractClaim -Json $ledgerJson
         $unexplainedRefClaim.adoptionScope.staticCallSiteInProduction = $true
         $unexplainedRefClaim.adoptionScope.scope = 'opt-in-shadow-with-reviewed-reference'
         # Deliberately the REAL shipped note, edited only where it would otherwise
