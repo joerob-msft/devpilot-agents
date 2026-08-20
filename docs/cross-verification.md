@@ -105,47 +105,54 @@ One function, `Get-ReviewerVerificationPhaseBudgetPlan`, is the only source of b
 the admission decision and the per-invocation timeout, so the number a run is
 launched with is by construction the number the preflight reserved for it.
 
-What is budgeted is **assignments, not invocations**. The requirement is that every
-candidate is cross-checked once by GPT and once by Opus, so the unit the phase must
-be able to afford is the `2N` assignment set - the same unit the acceptance
-boundaries are stated in. Budgeting the grouped invocation count instead was a
-defect: grouping is an optimisation, and an optimisation that shrinks the
-reservation makes the reservation a promise about the implementation rather than
-about the work.
+Coverage and time use different units. Every candidate is still cross-checked once
+by GPT and once by Opus, so the exact `2N` assignment set is validated against the
+128-assignment hard cap. Wall-clock admission uses the actual serial invocation
+count: one `(cluster, verifier)` process has one timeout even when it covers several
+assignments. An invocation count above the assignment count is contradictory and
+throws.
 
 The plan divides the phase rather than reserving a ceiling per run:
 
 ```
 remaining     = max(0, min(policy phase seconds, 3600) - elapsed - reservedOverhead)
-share         = floor(remaining / assignments)
-perAssignment = min(configured run timeout, share)
 perInvocation = min(configured run timeout, floor(remaining / invocations))
-admit         <=> assignments <= effective max assignments AND perAssignment >= minAssignment
-minAssignment = min(configured run timeout, 300)
+admit         <=> assignments <= effective max assignments AND perInvocation >= minInvocation
+minInvocation = min(configured run timeout, 150)
 ```
 
-Admission is decided on `share`, the conservative per-*assignment* slice. Time is
-handed out per *invocation*, and invocations are never more numerous than the
-assignments they cover, so `invocations x perInvocation <= remaining` holds however
-the assignments are grouped. That is what makes the accounting safe under batching
-without having to launch one process per assignment. An invocation count above the
-assignment count is a contradiction and throws.
+Because `perInvocation` is `floor(remaining / invocations)` capped by the configured
+timeout, `invocations x perInvocation <= remaining` always holds. Admission and the
+timeout handed to `Start-ReviewerAgent` therefore use the same serial work count.
 
 Reserving the configured per-run *ceiling* for every planned run was the earlier
 behaviour, and it refused ordinary work: at the shipped 900 s run timeout, a
 3-candidate pull request needs 6 assignments and a 5-candidate one needs 10,
-demanding 5400 s or 9000 s against a 3600 s phase - so zero verifiers launched, even
-though each of those runs finishes in far less. That treated a ceiling as if it were
-a cost.
+demanding 5400 s or 9000 s against a 3600 s phase - so zero verifiers launched even
+when each run consumed only a fraction of that ceiling. That treated a ceiling as
+if it were a cost.
 
-The 300 s `minAssignment` floor is measured, not guessed. Across the sealed replay
-runs kept as qualification evidence, a bounded single-model cross-verifier CLI
-phase completed in **136-295 wall-clock seconds**; 300 s sits just above the
-slowest observation. It is a floor on what may be *handed* to a run, not a
-prediction of what a run will take: below it a launch is not a shorter review, it
-is a review that ends in `timeout` and produces nothing. The floor never exceeds
-what the operator configured, because a deployment that declares short verifier
-runs is describing its own runs.
+The 150 s `minInvocation` floor is an explicit admission policy, not an empirical
+worst-case timing guarantee. With the 120 s overhead reserve it permits at most
+`floor((3600 - 120) / 150) = 23` serial invocations under the hard phase cap and
+refuses any larger set wholesale instead of handing each process an arbitrarily
+small timeout. It is a floor on what may be handed to an invocation, not an
+assignment cost; prompt size and cluster cardinality are bounded separately. The
+floor never exceeds what the operator configured, because a deployment that
+declares short verifier runs is describing its own runs.
+
+Admission does not promise completion: an invocation may still reach its own
+timeout and degrade its grouped assignments. The floor trades overly conservative
+whole-set refusal for that bounded per-invocation failure mode.
+
+The budget-plan result is version 2. Its unit-bearing fields are
+`requiredAssignmentCount`, `invocationCount`, `effectiveMaxAssignments`,
+`minInvocationSeconds`, and `maxSupportedInvocationCount`; the ambiguous v1
+`perAssignmentTimeoutSeconds`, `minAssignmentSeconds`, and
+`maxSupportedAssignmentCount` fields are not emitted. This internal plan is not a
+sealed artifact. The signed verification input and policy remain schema version 1
+because their shapes did not change: assignment coverage remains in assignment
+units, while the existing verification-library digest binds this admission code.
 
 `reservedOverhead` is 120 s and exists because the hard wall-clock bound is a bound
 on the **phase**, not on the launches inside it. Clustering, fresh nonce binding,
@@ -188,9 +195,8 @@ runs, exactly as an overrun would. The deadline is then re-evaluated immediately
 line while re-binding still withholds every finding.
 
 With the shipped defaults (3600 s phase, 900 s configured run timeout, 120 s
-reserved overhead) the phase admits up to **11 assignments**; 6 assignments get
-580 s each and 10 get 348 s each. Twelve cannot give every assignment a usable
-slice and is refused before any launch.
+reserved overhead), serial-time admission supports up to **23 invocations** at the
+150 s floor. The separate 128-assignment cap still applies to exact `2N` coverage.
 
 Everything else about the bound is unchanged. The 3600 s phase and 128-run hard
 caps stay absolute and no policy can widen them; admission is still computed once
