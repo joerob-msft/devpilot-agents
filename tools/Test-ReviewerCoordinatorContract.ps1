@@ -614,6 +614,14 @@ if ($cohortPresent.Count -eq $cohortSources.Count) {
     # root, which reopens every ended entry and re-launches subjects that ran.
     Assert-Coordinator ($journalText.Contains('RequireWritable')) `
         'The cohort journal commits records without first checking that its own reader would admit them.'
+    # A journal is signed, so nothing in it can be corrected afterwards. The one
+    # record this build never writes is an ordinary ending with no evidence behind
+    # it, and a journal that holds one was not written by this build - reading it
+    # would walk past a preparation on counters nothing published.
+    Assert-Coordinator ($journalText -match 'state, CohortEntryStates\.Ended[\s\S]{0,200}auditSha256, "none"[\s\S]{0,200}EvidenceRefused') `
+        'The cohort journal reader admits an ended record with no audit digest that is not the refusal itself, so a journal from somewhere else resumes as though its entries cost nothing.'
+    Assert-Coordinator ($journalText -match 'record\.HasEnded\s*&&\s*string\.Equals\(record\.AuditSha256, "none"[\s\S]{0,120}!record\.EndedRefused') `
+        'The cohort journal writer may commit an ended record with no audit digest that its own reader refuses, which would wedge a signed account.'
     Assert-Coordinator ($journalText -match 'ExitCode\s*=\s*StrictJson\.RequireInt\(node,\s*"exitCode",\s*label,\s*int\.MinValue') `
         'The cohort journal bounds the child exit code below what the operating system can report, so a hard-dying child would wedge it.'
     Assert-Coordinator ($runnerText.Contains('RecordedStartTime')) `

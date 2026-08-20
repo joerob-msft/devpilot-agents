@@ -208,6 +208,21 @@ internal sealed record CohortEntryRecord
         {
             throw new ContractException($"The {label} says the entry ended and records no outcome; an ending is the outcome it recorded.");
         }
+        // An ended entry with no audit digest is an entry nobody can account for:
+        // what it consumed is unknown and its zero write counters were never
+        // published by anything. This build never commits one except as the
+        // refusal itself, so a record that says otherwise was written by
+        // something else, and reading it would let the accounting walk past a
+        // preparation on the strength of counters no evidence supports.
+        var auditSha256 = StrictJson.RequireString(node, "auditSha256", label);
+        if (string.Equals(state, CohortEntryStates.Ended, StringComparison.Ordinal)
+            && string.Equals(auditSha256, "none", StringComparison.Ordinal)
+            && !string.Equals(outcome, CohortEntryOutcomes.EvidenceRefused, StringComparison.Ordinal))
+        {
+            throw new ContractException(
+                $"The {label} says the entry ended '{outcome}' with no audit digest. An entry that published no evidence is refused " +
+                "rather than accounted for, so this journal was not written by this build and is not resumed.");
+        }
 
         return new CohortEntryRecord
         {
@@ -233,7 +248,7 @@ internal sealed record CohortEntryRecord
             SlotLaunchCount = StrictJson.RequireInt(node, "slotLaunchCount", label, 0, int.MaxValue),
             ProviderWriteCount = StrictJson.RequireInt(node, "providerWriteCount", label, 0, int.MaxValue),
             WriteToolInvocationCount = StrictJson.RequireInt(node, "writeToolInvocationCount", label, 0, int.MaxValue),
-            AuditSha256 = StrictJson.RequireString(node, "auditSha256", label),
+            AuditSha256 = auditSha256,
             SummarySha256 = StrictJson.RequireString(node, "summarySha256", label)
         };
     }
@@ -711,6 +726,15 @@ internal sealed class CohortJournal
         if (record.HasEnded && string.Equals(record.Outcome, "none", StringComparison.Ordinal))
         {
             throw new ContractException($"Entry '{record.EntryId}' would be committed as ended with no outcome; an ending is the outcome it recorded.");
+        }
+        if (record.HasEnded
+            && string.Equals(record.AuditSha256, "none", StringComparison.Ordinal)
+            && !record.EndedRefused)
+        {
+            throw new ContractException(
+                $"Entry '{record.EntryId}' would be committed as ended '{record.Outcome}' with no audit digest. An entry that published " +
+                "no evidence is closed as refused and stops the cohort; committing it as an ordinary ending would put counters no " +
+                "evidence supports into a signed account.");
         }
     }
 

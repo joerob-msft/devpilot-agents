@@ -578,6 +578,18 @@ therefore blocks the whole cohort (exit 11) whatever the stop policy says, the e
 about that output root. `continueOnTerminalFailure` carries on past an entry that failed *and*
 published its audit, which is a failure the cohort can account for.
 
+This is a narrow window in practice: the preparation writes its audit before it does any work and
+rewrites it on every fault, including its own contract refusals, so an entry that reached the
+preparation at all leaves one. What does not leave one is a child killed or crashed before that
+first write, and a refusal that happens before the preparation starts — a lease conflict on the
+entry's output root is the realistic case. Blocking there is deliberate: a lease conflict means
+something else is holding that root, and this runner is not the thing that should decide what.
+
+A journal that holds an ended entry with no audit digest and any outcome other than the refusal
+itself is refused on sight, by both the reader and the writer. This build never commits such a
+record, so a journal containing one was written by something else, and resuming it would walk past
+a preparation on counters nothing published.
+
 **Stop policy, and what it does not mean.** `failFast` stops at the first entry that ends other
 than complete; `continueOnTerminalFailure` carries on to the next one. Neither re-attempts
 anything. Three conditions ignore the policy entirely and stop the whole cohort: an entry that
