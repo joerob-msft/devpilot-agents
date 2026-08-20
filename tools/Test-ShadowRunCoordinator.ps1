@@ -164,6 +164,44 @@ function Set-CoordinatorOutputRoot {
     # it never declared.
     if ($Request.PSObject.Properties['slots']) {
         $Request.slots.reconciliation.outputDirectory = [string]([IO.Path]::GetFullPath((Join-Path $Root 'reconciliation')))
+        # And so does the delivery decision, when one is declared.
+        if ($Request.slots.PSObject.Properties['delivery'] -or
+            ($Request.slots -is [hashtable] -and $Request.slots.ContainsKey('delivery'))) {
+            $Request.slots.delivery.outputDirectory = [string]([IO.Path]::GetFullPath((Join-Path $Root 'delivery')))
+        }
+    }
+}
+
+function Add-CoordinatorDelivery {
+    <#
+    .SYNOPSIS
+        Declares a preview-only delivery on a request, at creation.
+
+    .DESCRIPTION
+        The declaration is written into the request BEFORE the file is sealed, so
+        every case that uses it describes a set that was going to end in a
+        decision from the moment it was created. There is no path in this suite
+        that adds one to a request the coordinator has already read, because
+        there is no such path in the coordinator either.
+    #>
+    param([Parameter(Mandatory)]$Request, [Parameter(Mandatory)][string]$Root)
+    $delivery = [pscustomobject][ordered]@{
+        deliveryEnabled = $true
+        authorizationKind = 'PreviewOnly'
+        outputDirectory = [string]([IO.Path]::GetFullPath((Join-Path $Root 'delivery')))
+        requiredRunCount = 2
+        launchAuthorizationTokenPath = [string]$Request.slots.reconciliation.launchAuthorizationTokenPath
+        supervisionGraceSeconds = [int]$Request.slots.reconciliation.supervisionGraceSeconds
+        commentsEnabled = $false
+        votesEnabled = $false
+        gatesEnabled = $false
+        providerWriteBudget = 0
+    }
+    if ($Request.slots.PSObject.Properties['delivery']) {
+        $Request.slots.delivery = $delivery
+    }
+    else {
+        $Request.slots | Add-Member -NotePropertyName delivery -NotePropertyValue $delivery
     }
 }
 
@@ -305,7 +343,21 @@ function New-SlotStubAdapter {
             'reconcilePromotable', 'reconcileShortRuns', 'reconcileEmptyCounts',
             'reconcileDuplicateCounts', 'reconcileBadCountName', 'reconcileWrongSetId',
             'reconcileNotReady', 'reconcileAttemptPresent', 'reconcileSwapArtifact',
-            'reconcileRewriteReport')][string]$Mode,
+            'reconcileRewriteReport',
+            # The delivery decision. Everything a comparison can go wrong by, and
+            # then the four ways a run could claim it wrote something - none of
+            # which this coordinator has a transition for.
+            'deliveryNoSummary', 'deliveryWrongSummaryPath', 'deliveryTamperSummary',
+            'deliveryHang', 'deliveryNonzeroNoSummary', 'deliveryUnsigned',
+            'deliveryPromotable', 'deliveryShortRuns', 'deliveryEmptyCounts',
+            'deliveryDuplicateCounts', 'deliveryBadCountName', 'deliveryWrongSetId',
+            'deliveryNotReady', 'deliveryAttemptPresent', 'deliverySwapDecision',
+            'deliveryWrongReconciliation', 'deliveryWrongKind', 'deliveryVerifyWrongKind',
+            'deliveryCommentCapability', 'deliveryVoteCapability', 'deliveryGateCapability',
+            'deliveryVerifyCommentCapability', 'deliveryPlanPromotable',
+            'deliveryPlanProviderWrite', 'deliveryProviderWrite', 'deliveryRunWriteTool',
+            'deliveryVerifyProviderWrite', 'deliveryWriteTool',
+            'deliveryStatusWithheld', 'deliveryStatusEligible', 'deliveryStatusDegraded')][string]$Mode,
         # The slot a slot-scoped fault mode applies to. Slots other than this one
         # always complete, so a two-slot scenario can isolate the failure.
         [ValidateRange(1, 2)][int]$ModeSlot = 1,
@@ -339,8 +391,9 @@ $resultPath = [string]$request.resultPath
 $correlationId = [string]$request.correlationId
 $childRequestSha256 = [string]$request.childRequestSha256
 
-# Preparation is not stood in for. Only the slots and the comparison are.
-if (-not ($step.StartsWith('slot') -or $step.StartsWith('reconcile'))) {
+# Preparation is not stood in for. Only the slots, the comparison and the
+# delivery decision are.
+if (-not ($step.StartsWith('slot') -or $step.StartsWith('reconcile') -or $step.StartsWith('delivery'))) {
     $global:LASTEXITCODE = 0
     & $real -RequestPath $RequestPath
     exit ([int]$global:LASTEXITCODE)
@@ -575,6 +628,229 @@ if ($step.StartsWith('reconcile')) {
 }
 
 # ---------------------------------------------------------------------------
+# The preview-only delivery decision, stood in for.
+# ---------------------------------------------------------------------------
+# Four outcomes travel this path - a decision that found nothing, one that let
+# nothing through, one that would be eligible in preview, and one built over a
+# run the comparison called unusable - and every one of them reports the same
+# two zeroes. That is the point of the modes: the coordinator must reach the
+# same terminal for all four, because it has no branch on which one it got.
+if ($step.StartsWith('delivery')) {
+    $deliveryOutput = [string]$request.deliveryOutputDirectory
+    $reconcileOutput = [string]$request.reconciliationOutputDirectory
+    $attemptPath = Join-Path $deliveryOutput 'delivery-attempt.json'
+    $requiredRunCount = [int]$request.requiredRunCount
+    $deliverySetId = $(if ($mode -eq 'deliveryWrongSetId') { 'not-this-run-set' } else { $setId })
+    # The same value the comparison stub reports, so the coordinator's binding of
+    # the decision to the comparison it verified is exercised rather than
+    # accidentally satisfied.
+    $reconciliationSha = Get-StubSha256Text -Text "stub-reconciliation|$setId"
+    if ($mode -eq 'deliveryWrongReconciliation') {
+        $reconciliationSha = Get-StubSha256Text -Text "some-other-reconciliation|$setId"
+    }
+    $reconcileArtifact = Join-Path $reconcileOutput 'reconciliation-stub.json'
+    $reconcileArtifactSha = ('0' * 64)
+    if (Test-Path -LiteralPath $reconcileArtifact -PathType Leaf) {
+        $reconcileArtifactSha = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($reconcileArtifact))).ToLowerInvariant()
+    }
+    $decisionPath = Join-Path $deliveryOutput 'delivery-decision.json'
+
+    if ($step -eq 'deliveryPlan' -or $step -eq 'deliveryPrelaunch') {
+        Write-StubResult -Fields ([ordered]@{
+                setId = $deliverySetId
+                planDigest = $planDigest
+                requiredRunCount = $requiredRunCount
+                outputDirectory = $deliveryOutput
+                deliveryAttemptExists = [bool]((Test-Path -LiteralPath $attemptPath) -or ($mode -eq 'deliveryAttemptPresent'))
+                deliveryReady = [bool]($mode -ne 'deliveryNotReady')
+                authorizationKind = $(if ($mode -eq 'deliveryWrongKind') { 'Write' } else { 'PreviewOnly' })
+                commentsEnabled = [bool]($mode -eq 'deliveryCommentCapability')
+                votesEnabled = [bool]($mode -eq 'deliveryVoteCapability')
+                gatesEnabled = [bool]($mode -eq 'deliveryGateCapability')
+                promotable = [bool]($mode -eq 'deliveryPlanPromotable')
+                providerWriteCount = $(if ($mode -eq 'deliveryPlanProviderWrite') { 1 } else { 0 })
+                writeToolInvocations = 0
+                reconciliationSha256 = $reconciliationSha
+                reconciliationArtifactPath = $reconcileArtifact
+                reconciliationArtifactSha256 = $reconcileArtifactSha
+                configSha256 = (Get-StubSha256Text -Text "stub-config|$setId")
+                policySha256 = (Get-StubSha256Text -Text "stub-policy|$setId")
+                slotTimeoutSeconds = $(if ($mode -eq 'deliveryHang') { 1 } else { $slotTimeoutSeconds })
+                progressTimeoutSeconds = $progressTimeoutSeconds
+                perCallTimeoutSeconds = $(if ($mode -eq 'deliveryHang') { 1 } else { $perCallTimeoutSeconds })
+                head = [string](& git -C ([string]$request.toolkitRoot) rev-parse HEAD).Trim()
+                requiredRef = [string]$request.requiredRef
+                headClean = $true
+            })
+        exit 0
+    }
+
+    if ($step -eq 'deliveryRun') {
+        $inputPath = [string]$request.deliveryRequestPath
+        if (-not (Test-Path -LiteralPath $inputPath -PathType Leaf)) {
+            throw "The delivery input '$inputPath' does not exist."
+        }
+        $inputDocument = Get-Content -LiteralPath $inputPath -Raw | ConvertFrom-Json -Depth 12
+        $actualInputSha = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($inputPath))).ToLowerInvariant()
+        if ($actualInputSha -cne [string]$request.deliveryRequestSha256) {
+            throw "The delivery input at '$inputPath' is not the document the caller committed."
+        }
+        # The authorization is read out of the caller's own file, so a stub that
+        # ran under anything but preview-only refuses exactly where the real
+        # adapter does.
+        if ([string]$inputDocument.authorizationKind -cne 'PreviewOnly') {
+            throw "The delivery input at '$inputPath' authorizes '$([string]$inputDocument.authorizationKind)'."
+        }
+        [void](New-Item -ItemType Directory -Force -Path $deliveryOutput)
+        $attempt = [IO.File]::Open($attemptPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write)
+        try {
+            $attemptBytes = ([Text.UTF8Encoding]::new($false, $true)).GetBytes("{`"setId`":`"$setId`"}")
+            $attempt.Write($attemptBytes, 0, $attemptBytes.Length)
+        }
+        finally { $attempt.Dispose() }
+
+        if ($mode -eq 'deliveryHang') { Start-Sleep -Seconds 600; exit 0 }
+        if ($runDelaySeconds -gt 0) {
+            $deadline = [DateTime]::UtcNow.AddSeconds($runDelaySeconds)
+            while ([DateTime]::UtcNow -lt $deadline) {
+                [IO.File]::WriteAllText((Join-Path $deliveryOutput 'heartbeat.json'),
+                    ('{"atUtc":"' + [DateTime]::UtcNow.ToString('o') + '"}'))
+                Start-Sleep -Milliseconds 500
+            }
+        }
+        if ($mode -eq 'deliveryNonzeroNoSummary') { exit 9 }
+
+        [IO.File]::WriteAllText($decisionPath, '{"kind":"reviewer.gate-decision","stub":true}')
+        $decisionSha = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($decisionPath))).ToLowerInvariant()
+
+        if ($mode -eq 'deliveryNoSummary') {
+            Write-StubResult -Fields ([ordered]@{
+                    summaryWritten = $false
+                    summaryPath = [string]$inputDocument.summaryPath
+                    summarySha256 = ('0' * 64)
+                    evaluationExitCode = 0
+                    setId = $deliverySetId
+                    planDigest = $planDigest
+                    decisionPath = $decisionPath
+                    decisionSha256 = $decisionSha
+                    providerWriteCount = 0
+                    writeToolInvocations = 0
+                })
+            exit 0
+        }
+
+        $summaryPath = [string]$inputDocument.summaryPath
+        if ($mode -eq 'deliveryWrongSummaryPath') {
+            $summaryPath = Join-Path $deliveryOutput 'somewhere-else.json'
+        }
+        $summary = [ordered]@{
+            contractVersion = 'devpilot.shadow-run-coordinator.delivery-summary.v1'
+            kind = 'shadow-run-coordinator-delivery-summary'
+            correlationId = $correlationId
+            deliveryRequestSha256 = $actualInputSha
+            setId = $deliverySetId
+            planDigest = $planDigest
+            requiredRunCount = $requiredRunCount
+            authorizationKind = 'PreviewOnly'
+            reconciliationSha256 = $reconciliationSha
+            reconciliationArtifactSha256 = $reconcileArtifactSha
+            decisionPath = $decisionPath
+            evaluationExitCode = 0
+            providerWriteCount = 0
+            writeToolInvocations = 0
+            generatedAtUtc = [DateTime]::UtcNow.ToString('o')
+        }
+        $summaryText = ConvertTo-Json -InputObject $summary -Depth 8
+        [void](New-Item -ItemType Directory -Force -Path (Split-Path $summaryPath -Parent))
+        [IO.File]::WriteAllText($summaryPath, $summaryText, [Text.UTF8Encoding]::new($false))
+        $summarySha = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($summaryPath))).ToLowerInvariant()
+        if ($mode -eq 'deliveryTamperSummary') {
+            [IO.File]::WriteAllText($summaryPath, $summaryText + "`n", [Text.UTF8Encoding]::new($false))
+        }
+        Write-StubResult -Fields ([ordered]@{
+                summaryWritten = $true
+                summaryPath = $summaryPath
+                summarySha256 = $summarySha
+                evaluationExitCode = 0
+                setId = $deliverySetId
+                planDigest = $planDigest
+                decisionPath = $decisionPath
+                decisionSha256 = $decisionSha
+                # The one number a run could report that says something happened.
+                providerWriteCount = $(if ($mode -eq 'deliveryProviderWrite') { 1 } else { 0 })
+                writeToolInvocations = $(if ($mode -eq 'deliveryRunWriteTool') { 1 } else { 0 })
+            })
+        exit 0
+    }
+
+    if ($step -eq 'deliveryVerify') {
+        $summaryPath = [string]$request.summaryPath
+        if (-not (Test-Path -LiteralPath $summaryPath -PathType Leaf)) {
+            throw "The delivery summary '$summaryPath' does not exist."
+        }
+        $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json -Depth 12
+        $summarySha = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($summaryPath))).ToLowerInvariant()
+        $verifyDecisionPath = [string]$summary.decisionPath
+        if ($mode -eq 'deliverySwapDecision') {
+            $verifyDecisionPath = Join-Path $deliveryOutput 'another-decision.json'
+            [IO.File]::WriteAllText($verifyDecisionPath, '{"kind":"reviewer.gate-decision","other":true}')
+        }
+        $counts = @(
+            [ordered]@{ name = 'runs'; value = $requiredRunCount }
+            [ordered]@{ name = 'requiredRuns'; value = $requiredRunCount }
+            [ordered]@{ name = 'candidates'; value = 0 }
+            [ordered]@{ name = 'unattendedComments'; value = 0 }
+        )
+        if ($mode -eq 'deliveryEmptyCounts') { $counts = @() }
+        if ($mode -eq 'deliveryDuplicateCounts') {
+            $counts = @(
+                [ordered]@{ name = 'runs'; value = $requiredRunCount }
+                [ordered]@{ name = 'runs'; value = 1 }
+            )
+        }
+        if ($mode -eq 'deliveryBadCountName') {
+            $counts = @([ordered]@{ name = 'runs-total'; value = $requiredRunCount })
+        }
+        # Four different words, all of which the coordinator must carry without
+        # acting on. The zeroes below do not move between them.
+        $status = switch ($mode) {
+            'deliveryStatusWithheld' { 'withheld' }
+            'deliveryStatusEligible' { 'eligiblePreview' }
+            'deliveryStatusDegraded' { 'degraded' }
+            default { 'noFindings' }
+        }
+        Write-StubResult -Fields ([ordered]@{
+                summarySha256 = $summarySha
+                deliveryStatus = $status
+                decisionPath = $verifyDecisionPath
+                decisionSha256 = [Convert]::ToHexString(
+                    [Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($verifyDecisionPath))).ToLowerInvariant()
+                decisionSignatureVerified = [bool]($mode -ne 'deliveryUnsigned')
+                decisionPromotable = [bool]($mode -eq 'deliveryPromotable')
+                authorizationKind = $(if ($mode -eq 'deliveryVerifyWrongKind') { 'Write' } else { 'PreviewOnly' })
+                commentsEnabled = [bool]($mode -eq 'deliveryVerifyCommentCapability')
+                votesEnabled = $false
+                gatesEnabled = $false
+                providerWriteCount = $(if ($mode -eq 'deliveryVerifyProviderWrite') { 1 } else { 0 })
+                writeToolInvocations = $(if ($mode -eq 'deliveryWriteTool') { 1 } else { 0 })
+                reconciliationSha256 = $reconciliationSha
+                runCount = $(if ($mode -eq 'deliveryShortRuns') { 1 } else { $requiredRunCount })
+                requiredRunCount = $requiredRunCount
+                setId = $deliverySetId
+                planDigest = $planDigest
+                counts = $counts
+            })
+        exit 0
+    }
+    throw "'$step' is not a step this stub adapter performs."
+}
+
+# ---------------------------------------------------------------------------
 # The slots, stood in for. One state root, attempt record and terminal each.
 # ---------------------------------------------------------------------------
 if ($step -match '^slot([0-9]+)(Plan|Prelaunch|Run|Verify)\z') {
@@ -593,7 +869,7 @@ $attemptPath = Join-Path $stubRoot "$slotName-attempt.json"
 $terminalPath = Join-Path $stubRoot "$slotName-terminal.json"
 # A fault mode belongs to one slot. Every other slot completes, so a scenario
 # sees the set's reaction to one bad slot rather than to a broken stub.
-$slotMode = $(if ($ordinal -eq $modeSlot -and -not $mode.StartsWith('reconcile')) { $mode } else { 'complete' })
+$slotMode = $(if ($ordinal -eq $modeSlot -and -not ($mode.StartsWith('reconcile') -or $mode.StartsWith('delivery'))) { $mode } else { 'complete' })
 
 if ($phase -eq 'Plan' -or $phase -eq 'Prelaunch') {
     Write-StubResult -Fields ([ordered]@{
@@ -819,8 +1095,9 @@ try {
     # through the reference. Calling it by name from inside a closure would
     # resolve against whatever scope happens to run the closure later.
     $setOutputRoot = ${function:Set-CoordinatorOutputRoot}
+    $addDelivery = ${function:Add-CoordinatorDelivery}
 
-    Write-Host '1/29 offline restore and build' -ForegroundColor Cyan
+    Write-Host '1/32 offline restore and build' -ForegroundColor Cyan
     $project = Join-Path $RepoRoot 'tools\ShadowRunCoordinator\ShadowRunCoordinator.csproj'
     Assert-Coordinator (Test-Path -LiteralPath $project -PathType Leaf) `
         'The shadow run coordinator project is missing.'
@@ -839,7 +1116,7 @@ try {
         'The coordinator assembly was not produced.'
 
     # -----------------------------------------------------------------------
-    Write-Host '2/29 sandbox, sealed corpus and typed request' -ForegroundColor Cyan
+    Write-Host '2/32 sandbox, sealed corpus and typed request' -ForegroundColor Cyan
     Import-Module (Join-Path $RepoRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force
     . (Join-Path $RepoRoot 'src\Agents\reviewer\SourceTransport.ps1')
     . (Join-Path $RepoRoot 'src\Agents\reviewer\CorpusSeal.ps1')
@@ -856,7 +1133,7 @@ try {
         'The request does not bind a prompt-asset digest.'
 
     # -----------------------------------------------------------------------
-    Write-Host '3/29 restart at every transition' -ForegroundColor Cyan
+    Write-Host '3/32 restart at every transition' -ForegroundColor Cyan
     $states = @('requestValidated', 'corpusStaging', 'corpusPublished', 'corpusValidated',
         'recipePlanned', 'snapshotValidateOnly', 'snapshotSealed', 'snapshotVerified',
         'runSetDeclared', 'runSetVerified')
@@ -884,7 +1161,7 @@ try {
             "Resuming to an already-reached '$state' advanced the sequence to $($repeat.sequence)."
     }
 
-    Write-Host '4/29 preparation reaches run-set-ready' -ForegroundColor Cyan
+    Write-Host '4/32 preparation reaches run-set-ready' -ForegroundColor Cyan
     $final = Invoke-Coordinator -RequestPath $fixture.RequestPath
     Assert-Coordinator ($final.ExitCode -eq 0) "The preparation did not reach run-set-ready (exit $($final.ExitCode)): $($final.Output)"
     $durable = Get-CoordinatorState -OutputRoot $fixture.OutputRoot
@@ -913,7 +1190,7 @@ try {
         "Replaying a completed preparation advanced the sequence to $($afterReplay.sequence)."
 
     # -----------------------------------------------------------------------
-    Write-Host '5/29 audit indexes all twelve stage artifacts' -ForegroundColor Cyan
+    Write-Host '5/32 audit indexes all twelve stage artifacts' -ForegroundColor Cyan
     $auditPath = Join-Path $fixture.OutputRoot 'coordinator\audit.json'
     Assert-Coordinator (Test-Path -LiteralPath $auditPath -PathType Leaf) 'The coordinator wrote no audit.'
     $audit = Get-Content -LiteralPath $auditPath -Raw | ConvertFrom-Json -Depth 32
@@ -939,7 +1216,7 @@ try {
         'The preparation observed a slot attempt.'
 
     # -----------------------------------------------------------------------
-    Write-Host '6/29 stage publication parity with the PowerShell path' -ForegroundColor Cyan
+    Write-Host '6/32 stage publication parity with the PowerShell path' -ForegroundColor Cyan
     # The same stage publication, driven directly through the existing PowerShell
     # entry point instead of through the coordinator's child process. Byte
     # identical artifacts are what makes the rollback switch real at THIS seam:
@@ -980,7 +1257,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    Write-Host '7/29 request boundary: unknown, missing, scalar, null, BOM, truncated' -ForegroundColor Cyan
+    Write-Host '7/32 request boundary: unknown, missing, scalar, null, BOM, truncated' -ForegroundColor Cyan
     # Built through a list rather than an @(...) literal: the mutators set fields
     # to $null on purpose, and inside an array expression that reads as an array
     # that can carry a null element. It cannot -- the nulls are inside script
@@ -1028,7 +1305,7 @@ try {
         'A missing request file was not refused.'
 
     # -----------------------------------------------------------------------
-    Write-Host '8/29 stale head, stale identity and tampered state' -ForegroundColor Cyan
+    Write-Host '8/32 stale head, stale identity and tampered state' -ForegroundColor Cyan
     $staleHeadPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'stale-head' -Mutate {
         param($r)
         $r.toolkit.head = ('f' * 40)
@@ -1087,7 +1364,7 @@ try {
         "A state file from another correlation was adopted (exit $($foreign.ExitCode))."
 
     # -----------------------------------------------------------------------
-    Write-Host '9/29 single-run lease' -ForegroundColor Cyan
+    Write-Host '9/32 single-run lease' -ForegroundColor Cyan
     $leaseRoot = Join-Path $sandbox 'out-lease'
     $leasePath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'lease' -Mutate {
         param($r) & $setOutputRoot -Request $r -Root $leaseRoot
@@ -1122,7 +1399,7 @@ try {
         "An abandoned lease wedged the output root (exit $($recovered.ExitCode))."
 
     # -----------------------------------------------------------------------
-    Write-Host '10/29 child fault matrix' -ForegroundColor Cyan
+    Write-Host '10/32 child fault matrix' -ForegroundColor Cyan
     $faults = @(
         @{ Name = 'nonzero'; Expect = 4 },
         @{ Name = 'missing'; Expect = 4 },
@@ -1190,7 +1467,7 @@ try {
     Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot
 
     # -----------------------------------------------------------------------
-    Write-Host '11/29 killed mid-transition' -ForegroundColor Cyan
+    Write-Host '11/32 killed mid-transition' -ForegroundColor Cyan
     # A real external kill, not a cooperative halt: the coordinator is stopped
     # while a child is running, and the root must still converge.
     $killRoot = Join-Path $sandbox 'out-kill'
@@ -1227,7 +1504,7 @@ try {
         "The resumed preparation left $($declared.Count) declared run sets rather than one."
 
     # -----------------------------------------------------------------------
-    Write-Host '12/29 pre-commit window: a published side effect is adopted' -ForegroundColor Cyan
+    Write-Host '12/32 pre-commit window: a published side effect is adopted' -ForegroundColor Cyan
     # The fault a control plane cannot test its way out of by halting: a child
     # completes a durable, NON-REPEATABLE side effect and the coordinator dies
     # before it can commit the transition. Every --halt-after case above stops
@@ -1427,7 +1704,7 @@ try {
     Assert-Coordinator (@(Get-ChildItem -LiteralPath $stageDirectory -File -Filter '*.stage.json').Count -eq 12) `
         'The retry accumulated stage artifacts instead of replacing them.'
     # -----------------------------------------------------------------------
-    Write-Host '13/29 resume integrity and the declared artifact directory' -ForegroundColor Cyan
+    Write-Host '13/32 resume integrity and the declared artifact directory' -ForegroundColor Cyan
     # A resumed run re-reads its child results from the exchange directory, which
     # carries no signature of its own. Without binding them to the digest the
     # signed record committed, a resume could adopt a snapshot or run set other
@@ -1499,7 +1776,7 @@ try {
         'A missing option value escaped as an unhandled exception.'
 
     # -----------------------------------------------------------------------
-    Write-Host '14/29 changed-path census boundary' -ForegroundColor Cyan
+    Write-Host '14/32 changed-path census boundary' -ForegroundColor Cyan
     # The census is declared by the caller and validated here, never synthesised.
     # Zero, one, many, duplicated, misordered, scalar, null and unknown all have
     # to have an answer, because the census reaches the published bytes.
@@ -1538,7 +1815,7 @@ try {
         'A missing changed-path census was not refused.'
 
     # -----------------------------------------------------------------------
-    Write-Host '15/29 a declaration must belong to this preparation' -ForegroundColor Cyan
+    Write-Host '15/32 a declaration must belong to this preparation' -ForegroundColor Cyan
     # A signature proves a declaration was made under this output root's key. It
     # does NOT prove the declaration is about the snapshot this run sealed - one
     # key signs every declaration in a root, so a declaration left behind by an
@@ -1674,7 +1951,7 @@ try {
         "The refusal did not name the plan the declaration was sealed under.`n$borrowReason"
 
     # -----------------------------------------------------------------------
-    Write-Host '16/29 the audit says only what the record can support' -ForegroundColor Cyan
+    Write-Host '16/32 the audit says only what the record can support' -ForegroundColor Cyan
     # An audit whose counters come from this process cannot see work an earlier
     # process did, and a null count coerces to the reassuring zero in every
     # consumer that reads it. Both are properties of the durable record here.
@@ -1709,7 +1986,7 @@ try {
         'The resumed audit did not grow its child-backed transition census.'
 
     # -----------------------------------------------------------------------
-    Write-Host '17/29 a root that has done nothing is not wedged' -ForegroundColor Cyan
+    Write-Host '17/32 a root that has done nothing is not wedged' -ForegroundColor Cyan
     # The refusal that protects a destroyed record must not be reachable by a
     # first attempt that simply failed. A run refused at requestValidated has
     # published nothing, so the same root with a corrected request has to work -
@@ -1851,7 +2128,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    Write-Host '18/29 slot authorization against the real qualification plan' -ForegroundColor Cyan
+    Write-Host '18/32 slot authorization against the real qualification plan' -ForegroundColor Cyan
     # The one slot scenario that stands NOTHING in. The plan is built by the
     # production builder, bound to the signed declaration by the production
     # assertions, and the launch token is the one the declaration published. It
@@ -1980,7 +2257,7 @@ try {
         'Authorizing a launch created a run directory.'
 
     # -----------------------------------------------------------------------
-    Write-Host '19/29 one supervised slot, halted and resumed at every slot state' -ForegroundColor Cyan
+    Write-Host '19/32 one supervised slot, halted and resumed at every slot state' -ForegroundColor Cyan
     $slotStates = @('slot1Authorized', 'slot1Launching', 'slot1Running', 'slot1TerminalObserved')
     $lifecycleRoot = Join-Path $sandbox 'slot-lifecycle'
     $lifecyclePath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'slot-lifecycle' `
@@ -2171,7 +2448,7 @@ try {
     finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
 
     # -----------------------------------------------------------------------
-    Write-Host '20/29 slot terminal endings and the slot fault matrix' -ForegroundColor Cyan
+    Write-Host '20/32 slot terminal endings and the slot fault matrix' -ForegroundColor Cyan
     # Every case gets its own output root, because a slot's launch authorization
     # is single-use and a root that has spent it can never be reused.
     $slotCases = @(
@@ -2286,7 +2563,7 @@ try {
     finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
 
     # -----------------------------------------------------------------------
-    Write-Host '21/29 typed corpus staging from an immutable source' -ForegroundColor Cyan
+    Write-Host '21/32 typed corpus staging from an immutable source' -ForegroundColor Cyan
     # A SECOND sandbox, whose corpus is built as a read-only source and whose
     # request names a corpus root that does not exist. This is the condition the
     # preparation this slice replaces died on, made ordinary.
@@ -2400,7 +2677,7 @@ try {
         'Replaying a staged preparation rewrote the published corpus.'
 
     # -----------------------------------------------------------------------
-    Write-Host '22/29 corpus staging fault matrix' -ForegroundColor Cyan
+    Write-Host '22/32 corpus staging fault matrix' -ForegroundColor Cyan
     $stageInputs = Split-Path ([string]$stageFixture.StageRequestPath) -Parent
     $faultRoot = Join-Path $sandbox 'stage-faults'
     [void](New-Item -ItemType Directory -Force -Path $faultRoot)
@@ -2786,7 +3063,7 @@ try {
         "The contested staging left $($raceResidue.Count) staging director(ies) behind."
 
     # -----------------------------------------------------------------------
-    Write-Host '23/29 two declared slots, in order, and the opaque reconciliation' -ForegroundColor Cyan
+    Write-Host '23/32 two declared slots, in order, and the opaque reconciliation' -ForegroundColor Cyan
     # No model anywhere in this section. Preparation is real, the declaration is
     # real and signed, both slots are declared before either runs, and only the
     # execution and the comparison are stood in for. What is under test is the
@@ -2937,12 +3214,13 @@ try {
             'A reconciled two-slot set is not recorded as a preview-only run with no provider writes.'
         Assert-Coordinator ([int]$setAudit.modelInvocationCount -eq 0) `
             'The reconciled set claims to have invoked a model.'
-        # There is no delivery state in this build. Asserted on the transition
-        # names rather than on the whole record, because the reviewed plan the
-        # record carries legitimately says it runs in preview-only delivery mode.
+        # This set declared no delivery, so it has no delivery transition. The
+        # claim is asserted on the transition names rather than on the whole
+        # record, because the reviewed plan the record carries legitimately says
+        # it runs in preview-only delivery mode.
         $setStateNames = @($setState.transitions | ForEach-Object { [string]$_.state })
         Assert-Coordinator (@($setStateNames | Where-Object { $_ -match '(?i)deliver' }).Count -eq 0) `
-            'The durable record names a delivery transition this build does not have.'
+            'A set that declared no delivery reached a delivery transition anyway.'
 
         # Replaying a reconciled set is a no-op, including its single comparison.
         $setReplay = Invoke-Coordinator -RequestPath $setPath -Target 'reconciliationVerified'
@@ -2980,7 +3258,7 @@ try {
     finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
 
     # -----------------------------------------------------------------------
-    Write-Host '24/29 a failed slot closes the set' -ForegroundColor Cyan
+    Write-Host '24/32 a failed slot closes the set' -ForegroundColor Cyan
     # A slot that ends unsuccessfully is a durable ending, and everything that
     # would have followed it is refused rather than skipped. Both orderings are
     # exercised: slot1 failing before slot2 is authorized, and slot2 failing
@@ -3035,7 +3313,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    Write-Host '25/29 reconciliation fault matrix' -ForegroundColor Cyan
+    Write-Host '25/32 reconciliation fault matrix' -ForegroundColor Cyan
     # Each case gets a fresh root, because a reconciliation is authorized once
     # and consumed when it is attempted.
     $reconcileCases = @(
@@ -3254,7 +3532,416 @@ try {
     finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
 
     # -----------------------------------------------------------------------
-    Write-Host '26/29 the reconciliation reads a slot run where the reviewer writes it' -ForegroundColor Cyan
+    Write-Host '26/32 the declared preview-only delivery, end to end' -ForegroundColor Cyan
+    # The whole set, declared with a delivery from creation, walked one transition
+    # at a time to its decision. What is under test is the ordering - nothing may
+    # be evaluated before both slots are verified AND the comparison is - the
+    # single authorization, and the two numbers that say the decision wrote
+    # nowhere.
+    $deliveryStates = @('reconciliationVerified', 'deliveryAuthorized', 'deliveryLaunching',
+        'deliveryRunning', 'deliveryTerminalObserved')
+    $deliverRoot = Join-Path $sandbox 'delivery-set'
+    $deliverPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'delivery-set' `
+        -Mutate {
+            param($r)
+            & $setOutputRoot -Request $r -Root $deliverRoot
+            $r.slots.shadowSlotsEnabled = $true
+            $r.slots.reconciliation.reconciliationEnabled = $true
+            & $addDelivery -Request $r -Root $deliverRoot
+        }.GetNewClosure()
+    Initialize-SlotRunSet -Fixture $fixture -RepositoryRoot $RepoRoot -RequestPath $deliverPath `
+        -OutputRoot $deliverRoot -Label 'delivery-set'
+    New-SlotStubAdapter -ToolkitCopy $fixture.ToolkitCopy -RealAdapter $realAdapter -Mode 'complete'
+    try {
+        $deliverAttemptFile = Join-Path $deliverRoot 'delivery\delivery-attempt.json'
+        $deliverInputFile = Join-Path $deliverRoot 'coordinator\delivery\delivery-request.json'
+        $deliverSummaryFile = Join-Path $deliverRoot 'coordinator\delivery\delivery-summary.json'
+
+        # A delivery is not reachable before the comparison it closes over.
+        $tooEarly = Invoke-Coordinator -RequestPath $deliverPath -HaltAfter 'slot2TerminalVerified' `
+            -Target 'deliveryTerminalVerified'
+        Assert-Coordinator ($tooEarly.ExitCode -eq 9) `
+            "The delivery walk did not halt at the verified second slot (exit $($tooEarly.ExitCode)).`n$($tooEarly.Output)"
+        Assert-Coordinator (-not (Test-Path -LiteralPath $deliverInputFile)) `
+            'A delivery input was published before the set was reconciled.'
+        Assert-Coordinator (-not (Test-Path -LiteralPath $deliverAttemptFile)) `
+            'A delivery was evaluated before the set was reconciled.'
+
+        $expectedSequence = 25
+        $deliveryIndex = -1
+        foreach ($state in $deliveryStates) {
+            $expectedSequence++
+            $deliveryIndex++
+            $halted = Invoke-Coordinator -RequestPath $deliverPath -HaltAfter $state -Target 'deliveryTerminalVerified'
+            Assert-Coordinator ($halted.ExitCode -eq 9) `
+                "Halting after '$state' did not report a deliberate halt (exit $($halted.ExitCode)).`n$($halted.Output)"
+            $durable = Get-CoordinatorState -OutputRoot $deliverRoot
+            Assert-Coordinator ($durable -and $durable.state -ceq $state) `
+                "The durable state after halting at '$state' is '$(if ($durable) { $durable.state } else { 'none' })'."
+            Assert-Coordinator ($durable -and [int]$durable.sequence -eq $expectedSequence) `
+                "The sequence after '$state' is $(if ($durable) { $durable.sequence } else { 'none' }), not $expectedSequence."
+            # The input is published by the launching transition and not before;
+            # the evaluation runs at the running transition and not before.
+            if ($deliveryIndex -lt 2) {
+                Assert-Coordinator (-not (Test-Path -LiteralPath $deliverInputFile)) `
+                    "The delivery input was published at '$state', before the transition that publishes it."
+            }
+            if ($deliveryIndex -lt 3) {
+                Assert-Coordinator (-not (Test-Path -LiteralPath $deliverAttemptFile)) `
+                    "The delivery was evaluated at '$state', before the transition that evaluates it."
+            }
+            # Resuming to a state already reached must evaluate nothing a second
+            # time: the delivery authorization is one-shot exactly as the
+            # comparison's is.
+            $again = Invoke-Coordinator -RequestPath $deliverPath -Target $state
+            Assert-Coordinator ($again.ExitCode -eq 0) `
+                "Resuming to an already-reached '$state' failed (exit $($again.ExitCode)).`n$($again.Output)"
+            Assert-Coordinator ([int](Get-CoordinatorState -OutputRoot $deliverRoot).sequence -eq $expectedSequence) `
+                "Resuming to an already-reached '$state' advanced the sequence."
+        }
+
+        $delivered = Invoke-Coordinator -RequestPath $deliverPath -Target 'deliveryTerminalVerified'
+        Assert-Coordinator ($delivered.ExitCode -eq 0) `
+            "The declared delivery did not verify (exit $($delivered.ExitCode)).`n$($delivered.Output)"
+        $deliverState = Get-CoordinatorState -OutputRoot $deliverRoot
+        Assert-Coordinator ($deliverState.state -ceq 'deliveryTerminalVerified' -and [int]$deliverState.sequence -eq 31) `
+            "The durable state is '$($deliverState.state)' at sequence $($deliverState.sequence)."
+        Assert-Coordinator (@($deliverState.transitions).Count -eq 31) `
+            "The state records $(@($deliverState.transitions).Count) transitions rather than thirty-one."
+        $deliverNames = @($deliverState.transitions | ForEach-Object { [string]$_.state })
+        foreach ($required in @('deliveryAuthorized', 'deliveryLaunching', 'deliveryRunning',
+                'deliveryTerminalObserved', 'deliveryTerminalVerified')) {
+            Assert-Coordinator (@($deliverNames | Where-Object { $_ -ceq $required }).Count -eq 1) `
+                "The durable record does not carry exactly one '$required'."
+        }
+        # Exactly one evaluation, counted on disk.
+        Assert-Coordinator (@(Get-ChildItem -LiteralPath (Join-Path $deliverRoot 'delivery') `
+                    -Filter 'delivery-attempt.json' -File).Count -eq 1) `
+            'The delivery left other than one attempt record.'
+
+        # Both halves of the strict versioned exchange, with the authorization and
+        # the budget written into the file the child reads.
+        Assert-Coordinator (Test-Path -LiteralPath $deliverInputFile -PathType Leaf) `
+            'The delivery published no versioned input.'
+        Assert-Coordinator (Test-Path -LiteralPath $deliverSummaryFile -PathType Leaf) `
+            'The delivery produced no versioned summary.'
+        $deliverInputDoc = Get-Content -LiteralPath $deliverInputFile -Raw | ConvertFrom-Json -Depth 12
+        Assert-Coordinator ([string]$deliverInputDoc.contractVersion -ceq 'devpilot.shadow-run-coordinator.delivery-request.v1') `
+            "The delivery input declares contract '$([string]$deliverInputDoc.contractVersion)'."
+        Assert-Coordinator ([string]$deliverInputDoc.authorizationKind -ceq 'PreviewOnly') `
+            "The delivery input authorizes '$([string]$deliverInputDoc.authorizationKind)'."
+        Assert-Coordinator (-not [bool]$deliverInputDoc.commentsEnabled -and -not [bool]$deliverInputDoc.votesEnabled -and
+            -not [bool]$deliverInputDoc.gatesEnabled -and [int]$deliverInputDoc.providerWriteBudget -eq 0) `
+            'The delivery input authorizes a write capability or a write budget.'
+        Assert-Coordinator ([string]$deliverInputDoc.reconciliationSha256 -cmatch '^[0-9a-f]{64}$') `
+            'The delivery input does not bind the comparison it closes over.'
+
+        $deliverAudit = Get-Content -LiteralPath (Join-Path $deliverRoot 'coordinator\audit.json') -Raw |
+            ConvertFrom-Json -Depth 32
+        Assert-Coordinator ([bool]$deliverAudit.deliveryPerformed) `
+            'The audit does not record the delivery this run performed.'
+        Assert-Coordinator ([string]$deliverAudit.deliveryAuthorizationKind -ceq 'PreviewOnly') `
+            "The audit records authorization '$([string]$deliverAudit.deliveryAuthorizationKind)'."
+        Assert-Coordinator ([int]$deliverAudit.providerWriteCount -eq 0 -and
+            [int]$deliverAudit.writeToolInvocations -eq 0) `
+            'A completed delivery is not recorded as having written nowhere.'
+        Assert-Coordinator (-not [bool]$deliverAudit.deliveryPromotable -and
+            -not [bool]$deliverAudit.deliveryCommentsEnabled -and
+            -not [bool]$deliverAudit.deliveryVotesEnabled -and
+            -not [bool]$deliverAudit.deliveryGatesEnabled) `
+            'The audit records a promotable or write-capable delivery.'
+        foreach ($digestField in @('deliveryDecisionSha256', 'deliverySummarySha256',
+                'deliveryReconciliationSha256')) {
+            Assert-Coordinator ([string]$deliverAudit.$digestField -cmatch '^[0-9a-f]{64}$') `
+                "The audit carries no digest under '$digestField'."
+        }
+        Assert-Coordinator (@($deliverAudit.deliveryCounts).Count -ge 1) `
+            'The audit carries an empty opaque delivery census.'
+        foreach ($count in @($deliverAudit.deliveryCounts)) {
+            Assert-Coordinator ([string]$count.name -cmatch '^[A-Za-z0-9]+$' -and [int]$count.value -ge 0) `
+                'The opaque delivery census carries an entry this coordinator could not have copied verbatim.'
+        }
+        Assert-Coordinator ([int]$deliverAudit.modelInvocationCount -eq 0) `
+            'The delivered set claims to have invoked a model.'
+        Assert-Coordinator ([string]$deliverAudit.deliveryStatus -cmatch '^[A-Za-z]+$') `
+            'The audit carries no delivery status word.'
+
+        # Replaying a delivered set is a no-op, including its single evaluation.
+        $deliverReplay = Invoke-Coordinator -RequestPath $deliverPath -Target 'deliveryTerminalVerified'
+        Assert-Coordinator ($deliverReplay.ExitCode -eq 0) 'Replaying a delivered set failed.'
+        Assert-Coordinator ([int](Get-CoordinatorState -OutputRoot $deliverRoot).sequence -eq 31) `
+            'Replaying a delivered set advanced the sequence.'
+        Assert-Coordinator (@(Get-ChildItem -LiteralPath (Join-Path $deliverRoot 'delivery') `
+                    -Filter 'delivery-attempt.json' -File).Count -eq 1) `
+            'Replaying a delivered set evaluated a second decision.'
+
+        # A distinct exchange file per delivery step, for the reason each slot has
+        # one: a result published for the probe must never be adopted as the
+        # committed plan's answer.
+        $deliverExchange = @(Get-ChildItem -LiteralPath (Join-Path $deliverRoot 'coordinator\exchange') `
+                -Filter '*.result.json' -File | ForEach-Object { $_.Name })
+        foreach ($required in @('deliveryPlan', 'deliveryPrelaunch', 'deliveryRun', 'deliveryVerify')) {
+            Assert-Coordinator (@($deliverExchange | Where-Object { $_ -like "*-$required.result.json" }).Count -eq 1) `
+                "The exchange carries no distinct result for '$required'."
+        }
+    }
+    finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
+
+    # -----------------------------------------------------------------------
+    Write-Host '27/32 the four delivery outcomes are one code path' -ForegroundColor Cyan
+    # A decision that found nothing, one that let nothing through, one that would
+    # be eligible in preview, and one built over a run the comparison called
+    # unusable. The coordinator must reach the same terminal for all four and
+    # record the same two zeroes, because it has no branch on which one it got.
+    foreach ($outcome in @(
+            @{ Name = 'nofindings'; Mode = 'complete'; Status = 'noFindings' },
+            @{ Name = 'nothingthrough'; Mode = 'deliveryStatusWithheld'; Status = 'withheld' },
+            @{ Name = 'eligible'; Mode = 'deliveryStatusEligible'; Status = 'eligiblePreview' },
+            @{ Name = 'unusable'; Mode = 'deliveryStatusDegraded'; Status = 'degraded' })) {
+        $outcomeRoot = Join-Path $sandbox "delivery-outcome-$($outcome.Name)"
+        $outcomePath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath `
+            -Name "delivery-outcome-$($outcome.Name)" -Mutate {
+                param($r)
+                & $setOutputRoot -Request $r -Root $outcomeRoot
+                $r.slots.shadowSlotsEnabled = $true
+                $r.slots.reconciliation.reconciliationEnabled = $true
+                & $addDelivery -Request $r -Root $outcomeRoot
+            }.GetNewClosure()
+        Initialize-SlotRunSet -Fixture $fixture -RepositoryRoot $RepoRoot -RequestPath $outcomePath `
+            -OutputRoot $outcomeRoot -Label "delivery-outcome-$($outcome.Name)"
+        New-SlotStubAdapter -ToolkitCopy $fixture.ToolkitCopy -RealAdapter $realAdapter -Mode $outcome.Mode
+        try {
+            $outcomeRun = Invoke-Coordinator -RequestPath $outcomePath -Target 'deliveryTerminalVerified'
+            Assert-Coordinator ($outcomeRun.ExitCode -eq 0) `
+                "The '$($outcome.Name)' delivery exited $($outcomeRun.ExitCode).`n$($outcomeRun.Output)"
+            Assert-Coordinator ((Get-CoordinatorState -OutputRoot $outcomeRoot).state -ceq 'deliveryTerminalVerified') `
+                "The '$($outcome.Name)' delivery did not reach the same terminal as the others."
+            $outcomeAudit = Get-Content -LiteralPath (Join-Path $outcomeRoot 'coordinator\audit.json') -Raw |
+                ConvertFrom-Json -Depth 32
+            Assert-Coordinator ([string]$outcomeAudit.deliveryStatus -ceq $outcome.Status) `
+                "The '$($outcome.Name)' audit carries status '$([string]$outcomeAudit.deliveryStatus)' rather than '$($outcome.Status)'."
+            Assert-Coordinator ([int]$outcomeAudit.providerWriteCount -eq 0 -and
+                [int]$outcomeAudit.writeToolInvocations -eq 0) `
+                "The '$($outcome.Name)' delivery is not recorded as having written nowhere."
+            Assert-Coordinator (-not [bool]$outcomeAudit.deliveryPromotable) `
+                "The '$($outcome.Name)' delivery is recorded as promotable."
+        }
+        finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
+    }
+
+    # -----------------------------------------------------------------------
+    Write-Host '28/32 delivery fault matrix, and every write refused' -ForegroundColor Cyan
+    # A delivery is authorized once and consumed when it is attempted, so each
+    # case gets a fresh root. The write cases are the point of the slice: a
+    # capability reported anywhere, or a count reported anywhere, stops the run
+    # rather than being recorded.
+    $deliveryCases = @(
+        @{ Name = 'notready'; Mode = 'deliveryNotReady'; Exit = 2; State = 'reconciliationVerified'
+            Pattern = 'readiness gate' },
+        @{ Name = 'spent'; Mode = 'deliveryAttemptPresent'; Exit = 2; State = 'reconciliationVerified'
+            Pattern = 'authorization is spent' },
+        @{ Name = 'wrongsetid'; Mode = 'deliveryWrongSetId'; Exit = 2; State = 'reconciliationVerified'
+            Pattern = 'built for run set' },
+        @{ Name = 'wrongcomparison'; Mode = 'deliveryWrongReconciliation'; Exit = 2; State = 'reconciliationVerified'
+            Pattern = 'reconciliation' },
+        # Any write capability present blocks before the child that would run.
+        @{ Name = 'wrongkind'; Mode = 'deliveryWrongKind'; Exit = 2; State = 'reconciliationVerified'
+            Pattern = 'authorization' },
+        @{ Name = 'commentcapability'; Mode = 'deliveryCommentCapability'; Exit = 2; State = 'reconciliationVerified'
+            Pattern = 'write capability' },
+        @{ Name = 'votecapability'; Mode = 'deliveryVoteCapability'; Exit = 2; State = 'reconciliationVerified'
+            Pattern = 'write capability' },
+        @{ Name = 'gatecapability'; Mode = 'deliveryGateCapability'; Exit = 2; State = 'reconciliationVerified'
+            Pattern = 'write capability' },
+        @{ Name = 'planpromotable'; Mode = 'deliveryPlanPromotable'; Exit = 2; State = 'reconciliationVerified'
+            Pattern = 'promotable' },
+        @{ Name = 'planwrote'; Mode = 'deliveryPlanProviderWrite'; Exit = 2; State = 'reconciliationVerified'
+            Pattern = 'write' },
+        @{ Name = 'nosummary'; Mode = 'deliveryNoSummary'; Exit = 2; State = 'deliveryRunning'
+            Pattern = 'no versioned summary' },
+        @{ Name = 'wrongsummary'; Mode = 'deliveryWrongSummaryPath'; Exit = 2; State = 'deliveryRunning'
+            Pattern = 'wrote its summary to' },
+        @{ Name = 'editedsummary'; Mode = 'deliveryTamperSummary'; Exit = 2; State = 'deliveryRunning'
+            Pattern = 'summary digests to' },
+        @{ Name = 'nonzero'; Mode = 'deliveryNonzeroNoSummary'; Exit = 4; State = 'deliveryRunning'
+            Pattern = 'does not exist|left no result' },
+        # The zero-write faults: an evaluation that came back claiming it wrote to
+        # a provider is a fault in what was supervised, not a result to record.
+        @{ Name = 'runwrote'; Mode = 'deliveryProviderWrite'; Exit = 2; State = 'deliveryRunning'
+            Pattern = 'write' },
+        @{ Name = 'runwritetool'; Mode = 'deliveryRunWriteTool'; Exit = 2; State = 'deliveryRunning'
+            Pattern = 'write' },
+        @{ Name = 'unsigned'; Mode = 'deliveryUnsigned'; Exit = 2; State = 'deliveryTerminalObserved'
+            Pattern = 'did not verify under its key' },
+        @{ Name = 'promotable'; Mode = 'deliveryPromotable'; Exit = 2; State = 'deliveryTerminalObserved'
+            Pattern = 'promotable' },
+        @{ Name = 'verifywrongkind'; Mode = 'deliveryVerifyWrongKind'; Exit = 2; State = 'deliveryTerminalObserved'
+            Pattern = 'authorization' },
+        @{ Name = 'verifycapability'; Mode = 'deliveryVerifyCommentCapability'; Exit = 2; State = 'deliveryTerminalObserved'
+            Pattern = 'write capability' },
+        @{ Name = 'verifywrote'; Mode = 'deliveryVerifyProviderWrite'; Exit = 2; State = 'deliveryTerminalObserved'
+            Pattern = 'write' },
+        @{ Name = 'verifywritetool'; Mode = 'deliveryWriteTool'; Exit = 2; State = 'deliveryTerminalObserved'
+            Pattern = 'write' },
+        @{ Name = 'shortruns'; Mode = 'deliveryShortRuns'; Exit = 2; State = 'deliveryTerminalObserved'
+            Pattern = 'covered 1 run' },
+        @{ Name = 'emptycensus'; Mode = 'deliveryEmptyCounts'; Exit = 2; State = 'deliveryTerminalObserved'
+            Pattern = 'empty census' },
+        @{ Name = 'duplicatecensus'; Mode = 'deliveryDuplicateCounts'; Exit = 2; State = 'deliveryTerminalObserved'
+            Pattern = 'twice' },
+        @{ Name = 'badcountname'; Mode = 'deliveryBadCountName'; Exit = 2; State = 'deliveryTerminalObserved'
+            Pattern = 'not a plain identifier' },
+        @{ Name = 'swapdecision'; Mode = 'deliverySwapDecision'; Exit = 2; State = 'deliveryTerminalObserved'
+            Pattern = 'decision is at' }
+    )
+    foreach ($case in $deliveryCases) {
+        $caseRoot = Join-Path $sandbox "delivery-$($case.Name)"
+        $casePath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name "delivery-$($case.Name)" `
+            -Mutate {
+                param($r)
+                & $setOutputRoot -Request $r -Root $caseRoot
+                $r.slots.shadowSlotsEnabled = $true
+                $r.slots.reconciliation.reconciliationEnabled = $true
+                & $addDelivery -Request $r -Root $caseRoot
+            }.GetNewClosure()
+        Initialize-SlotRunSet -Fixture $fixture -RepositoryRoot $RepoRoot -RequestPath $casePath `
+            -OutputRoot $caseRoot -Label "delivery-$($case.Name)"
+        New-SlotStubAdapter -ToolkitCopy $fixture.ToolkitCopy -RealAdapter $realAdapter -Mode $case.Mode
+        try {
+            $run = Invoke-Coordinator -RequestPath $casePath -Target 'deliveryTerminalVerified'
+            Assert-Coordinator ($run.ExitCode -eq $case.Exit) `
+                "The '$($case.Name)' delivery exited $($run.ExitCode) rather than $($case.Exit).`n$($run.Output)"
+            $state = Get-CoordinatorState -OutputRoot $caseRoot
+            Assert-Coordinator ($state -and $state.state -ceq $case.State) `
+                "The '$($case.Name)' delivery left the record at '$(if ($state) { $state.state } else { 'none' })' rather than '$($case.State)'."
+            if ($case.Pattern) {
+                Assert-Coordinator ($run.Output -match $case.Pattern) `
+                    "The '$($case.Name)' refusal did not name its cause.`n$($run.Output)"
+            }
+            $caseAttempts = @(Get-ChildItem -LiteralPath (Join-Path $caseRoot 'delivery') `
+                    -Filter 'delivery-attempt.json' -File -ErrorAction SilentlyContinue)
+            Assert-Coordinator ($caseAttempts.Count -le 1) `
+                "The '$($case.Name)' delivery left $($caseAttempts.Count) attempt records."
+            $caseAuditPath = Join-Path $caseRoot 'coordinator\audit.json'
+            Assert-Coordinator (Test-Path -LiteralPath $caseAuditPath -PathType Leaf) `
+                "The '$($case.Name)' delivery wrote no audit."
+            if (Test-Path -LiteralPath $caseAuditPath -PathType Leaf) {
+                $caseAudit = Get-Content -LiteralPath $caseAuditPath -Raw | ConvertFrom-Json -Depth 32
+                Assert-Coordinator (-not [bool]$caseAudit.deliveryPerformed) `
+                    "The '$($case.Name)' audit claims a delivery it refused."
+                # The claim the whole slice exists to make holds on every refusal
+                # too, including the ones provoked by a reported write.
+                Assert-Coordinator ([int]$caseAudit.providerWriteCount -eq 0 -and
+                    [int]$caseAudit.writeToolInvocations -eq 0) `
+                    "The '$($case.Name)' audit records a write."
+            }
+        }
+        finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
+    }
+
+    # An evaluation that never returns is stopped by this coordinator on the
+    # plan's own budget, and the stop leaves no decision to report.
+    $deliveryHangRoot = Join-Path $sandbox 'delivery-hang'
+    $deliveryHangPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'delivery-hang' `
+        -Mutate {
+            param($r)
+            & $setOutputRoot -Request $r -Root $deliveryHangRoot
+            $r.slots.shadowSlotsEnabled = $true
+            $r.slots.reconciliation.reconciliationEnabled = $true
+            foreach ($declared in @($r.slots.declared)) { $declared.supervisionGraceSeconds = 30 }
+            $r.slots.reconciliation.supervisionGraceSeconds = 30
+            & $addDelivery -Request $r -Root $deliveryHangRoot
+            $r.slots.delivery.supervisionGraceSeconds = 30
+        }.GetNewClosure()
+    Initialize-SlotRunSet -Fixture $fixture -RepositoryRoot $RepoRoot -RequestPath $deliveryHangPath `
+        -OutputRoot $deliveryHangRoot -Label 'delivery-hang'
+    New-SlotStubAdapter -ToolkitCopy $fixture.ToolkitCopy -RealAdapter $realAdapter -Mode 'deliveryHang'
+    try {
+        $deliveryHangRun = Invoke-Coordinator -RequestPath $deliveryHangPath -Target 'deliveryTerminalVerified'
+        Assert-Coordinator ($deliveryHangRun.ExitCode -eq 4) `
+            "A hung delivery exited $($deliveryHangRun.ExitCode) rather than reporting a stopped child.`n$($deliveryHangRun.Output)"
+        Assert-Coordinator ($deliveryHangRun.Output -match 'HardDeadlineKill|ActivityDeadlineKill|deadline') `
+            "The refusal did not name the deadline kill.`n$($deliveryHangRun.Output)"
+        Assert-Coordinator ((Get-CoordinatorState -OutputRoot $deliveryHangRoot).state -ceq 'deliveryRunning') `
+            'A hung delivery advanced the durable record past the child it named.'
+        Start-Sleep -Seconds 2
+        Assert-Coordinator ((Get-DescendantPwshCount -SandboxToken $sandboxToken) -eq 0) `
+            'The deadline kill left a delivery child running.'
+    }
+    finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
+
+    # A coordinator killed while the evaluation is running has to adopt the child
+    # it already named. The single-use attempt record is spent by then, so without
+    # the running record this is the state that could never be resumed.
+    $deliveryAdoptRoot = Join-Path $sandbox 'delivery-adopt'
+    $deliveryAdoptPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'delivery-adopt' `
+        -Mutate {
+            param($r)
+            & $setOutputRoot -Request $r -Root $deliveryAdoptRoot
+            $r.slots.shadowSlotsEnabled = $true
+            $r.slots.reconciliation.reconciliationEnabled = $true
+            & $addDelivery -Request $r -Root $deliveryAdoptRoot
+        }.GetNewClosure()
+    Initialize-SlotRunSet -Fixture $fixture -RepositoryRoot $RepoRoot -RequestPath $deliveryAdoptPath `
+        -OutputRoot $deliveryAdoptRoot -Label 'delivery-adopt'
+    New-SlotStubAdapter -ToolkitCopy $fixture.ToolkitCopy -RealAdapter $realAdapter -Mode 'complete' `
+        -SlotTimeoutSeconds 300 -PerCallTimeoutSeconds 300 -RunDelaySeconds 20
+    try {
+        Assert-Coordinator ((Invoke-Coordinator -RequestPath $deliveryAdoptPath `
+                    -HaltAfter 'deliveryLaunching' -Target 'deliveryTerminalVerified').ExitCode -eq 9) `
+            'The delivery-adopt setup did not halt with an evaluation due.'
+        $deliveryJob = Start-Process -FilePath 'dotnet' -PassThru -WindowStyle Hidden -ArgumentList @(
+            $script:CoordinatorDll, '--request', $deliveryAdoptPath, '--target', 'deliveryTerminalVerified')
+        $deliveryKilled = $false
+        try {
+            $deliveryDeadline = [DateTime]::UtcNow.AddSeconds(120)
+            while ([DateTime]::UtcNow -lt $deliveryDeadline) {
+                $deliveryProbe = Get-CoordinatorState -OutputRoot $deliveryAdoptRoot
+                if ($deliveryProbe -and $deliveryProbe.state -ceq 'deliveryRunning') { break }
+                Start-Sleep -Milliseconds 250
+            }
+            $atDeliveryKill = Get-CoordinatorState -OutputRoot $deliveryAdoptRoot
+            Assert-Coordinator ($atDeliveryKill -and $atDeliveryKill.state -ceq 'deliveryRunning') `
+                "The delivery never recorded a running child to kill (state '$(if ($atDeliveryKill) { $atDeliveryKill.state } else { 'none' })')."
+            if (-not $deliveryJob.HasExited) { Stop-Process -Id $deliveryJob.Id -Force -ErrorAction SilentlyContinue }
+            $deliveryJob.WaitForExit(60000) | Out-Null
+            $deliveryKilled = $true
+        }
+        finally {
+            if (-not $deliveryKilled -and -not $deliveryJob.HasExited) {
+                Stop-Process -Id $deliveryJob.Id -Force -ErrorAction SilentlyContinue
+            }
+        }
+        Assert-Coordinator ((Get-CoordinatorState -OutputRoot $deliveryAdoptRoot).state -ceq 'deliveryRunning') `
+            'A coordinator killed mid-delivery did not leave the record naming its child.'
+        $deliveryAttemptFile = Join-Path $deliveryAdoptRoot 'delivery\delivery-attempt.json'
+        $deliveryAttemptDeadline = [DateTime]::UtcNow.AddSeconds(60)
+        while ([DateTime]::UtcNow -lt $deliveryAttemptDeadline -and
+            -not (Test-Path -LiteralPath $deliveryAttemptFile -PathType Leaf)) {
+            Start-Sleep -Milliseconds 250
+        }
+        Assert-Coordinator (Test-Path -LiteralPath $deliveryAttemptFile -PathType Leaf) `
+            'The killed delivery never minted the attempt record this case exists to survive.'
+        $deliveryResume = Invoke-Coordinator -RequestPath $deliveryAdoptPath -Target 'deliveryTerminalVerified'
+        Assert-Coordinator ($deliveryResume.ExitCode -eq 0) `
+            "A delivery resumed over a spent attempt record failed (exit $($deliveryResume.ExitCode)).`n$($deliveryResume.Output)"
+        Assert-Coordinator ($deliveryResume.Output -match 'resume supervising recorded delivery child') `
+            "The resumed delivery did not adopt the child it had named.`n$($deliveryResume.Output)"
+        Assert-Coordinator (@(Get-ChildItem -LiteralPath (Join-Path $deliveryAdoptRoot 'delivery') `
+                    -Filter 'delivery-attempt.json' -File).Count -eq 1) `
+            'An adopted delivery minted a second attempt record.'
+        Assert-Coordinator ((Get-CoordinatorState -OutputRoot $deliveryAdoptRoot).state -ceq 'deliveryTerminalVerified') `
+            'An adopted delivery did not reach its verified terminal.'
+        $adoptAudit = Get-Content -LiteralPath (Join-Path $deliveryAdoptRoot 'coordinator\audit.json') -Raw |
+            ConvertFrom-Json -Depth 32
+        Assert-Coordinator ([int]$adoptAudit.providerWriteCount -eq 0 -and
+            [int]$adoptAudit.writeToolInvocations -eq 0) `
+            'An adopted delivery is not recorded as having written nowhere.'
+    }
+    finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
+
+    # -----------------------------------------------------------------------
+    Write-Host '29/32 the reconciliation reads a slot run where the reviewer writes it' -ForegroundColor Cyan
     # The comparison is stubbed everywhere else in this suite, which is exactly
     # how a reconciliation shipped that looked for each slot's sealed run loose
     # in the slot state directory. The reviewer does not write it there: a
@@ -3305,7 +3992,7 @@ try {
         'The layout this case builds is not the layout the defect assumed, so it would not have caught it.'
 
     # -----------------------------------------------------------------------
-    Write-Host '27/29 the launch intent journal accounts for every child' -ForegroundColor Cyan
+    Write-Host '30/32 the launch intent journal accounts for every child' -ForegroundColor Cyan
     # The window this case exists for is the one between Process.Start and the
     # record naming what was started. It is microseconds wide and it is the only
     # window in which a coordinator can die holding a child nothing can name.
@@ -3430,7 +4117,7 @@ try {
     finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
 
     # -----------------------------------------------------------------------
-    Write-Host '28/29 the audit is written on every exit, and never leads the state' -ForegroundColor Cyan
+    Write-Host '31/32 the audit is written on every exit, and never leads the state' -ForegroundColor Cyan
     # Two claims. The audit is published on the unsuccessful exits as well as the
     # successful one, so it never lags the record it describes; and a failure to
     # publish it cannot cost the run its work, because the record is what is
@@ -3570,7 +4257,7 @@ try {
         "Repairing the audit left $($repairedOpen.Count) launch intent(s) unaccounted for."
 
     # -----------------------------------------------------------------------
-    Write-Host '29/29 no orphans, no external writes' -ForegroundColor Cyan
+    Write-Host '32/32 no orphans, no external writes' -ForegroundColor Cyan
     Start-Sleep -Seconds 2
     $orphans = Get-DescendantPwshCount -SandboxToken $sandboxToken
     Assert-Coordinator ($orphans -eq 0) "The suite left $orphans PowerShell process(es) running."

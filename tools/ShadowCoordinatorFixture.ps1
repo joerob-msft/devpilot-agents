@@ -218,6 +218,10 @@ function New-ShadowCoordinatorFixture {
         # declared and run without one, and a fixture that always enabled it
         # could not express the case the coordinator must refuse.
         [switch]$ReconciliationEnabled,
+        # A delivery decision is authorized separately again, and only ever
+        # preview-only. It is declared from creation or not at all, so a set that
+        # ran without one can never acquire one afterwards.
+        [switch]$DeliveryEnabled,
         # Build the corpus through the typed control plane instead of handing the
         # coordinator one that already exists. The source corpus is written
         # read-only, which is what a real captured corpus is.
@@ -373,6 +377,28 @@ function New-ShadowCoordinatorFixture {
         }
     }
 
+    # Declared from creation or not at all, on the same terms as the slots and the
+    # comparison: a request that grew a delivery later would be a different
+    # request, and the set the slots ran under would not be the set the decision
+    # closed. Absent unless asked for, so every request written before this slice
+    # stays exactly as valid as it was.
+    if ($DeliveryEnabled.IsPresent) {
+        $request.slots.Add('delivery', @{
+                deliveryEnabled = $true
+                authorizationKind = 'PreviewOnly'
+                outputDirectory = [string]([IO.Path]::GetFullPath((Join-Path $outputRoot 'delivery')))
+                requiredRunCount = 2
+                launchAuthorizationTokenPath = [string]([IO.Path]::GetFullPath($launchTokenPath))
+                supervisionGraceSeconds = $SupervisionGraceSeconds
+                # Every capability off and no budget, written into the request
+                # rather than assumed by the code that reads it.
+                commentsEnabled = $false
+                votesEnabled = $false
+                gatesEnabled = $false
+                providerWriteBudget = 0
+            })
+    }
+
     if ($stage) {
         $request.Add('corpusStage', @{
                 stagingEnabled = $true
@@ -405,6 +431,7 @@ function New-ShadowCoordinatorFixture {
                 (Join-Path $request.output.root 'qualification\runset')))
         ReviewerScriptPath = [string]$reviewerScriptPath
         ReconciliationDirectory = [string]$request.slots.reconciliation.outputDirectory
+        DeliveryDirectory = $(if ($DeliveryEnabled.IsPresent) { [string]$request.slots.delivery.outputDirectory } else { $null })
         OutputRoot = [string]$request.output.root
         CorrelationId = $CorrelationId
         RequestPath = $requestPath

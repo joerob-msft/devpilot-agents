@@ -50,6 +50,7 @@ internal sealed class PreparationMachine(
     private string _runSetPath = string.Empty;
     private readonly Dictionary<int, SlotPlan> _slotPlans = [];
     private ReconciliationPlan? _reconciliationPlan;
+    private DeliveryPlan? _deliveryPlan;
     private CorpusStager? _stager;
 
     /// <summary>The two slots this coordinator declares, in the only order it runs them.</summary>
@@ -221,6 +222,15 @@ internal sealed class PreparationMachine(
             return PreparationState.ReconciliationRunning;
         }
 
+        // And so is the delivery evaluation, which is a supervised child that
+        // writes a decision to a file and to nowhere else.
+        if (rank == PreparationStateNames.RankOf(PreparationState.DeliveryRunning))
+        {
+            _log.WriteLine($"enter {PreparationStateNames.ToName(PreparationState.DeliveryRunning)} (correlationId={_request.CorrelationId})");
+            RunDelivery();
+            return PreparationState.DeliveryRunning;
+        }
+
         var next = PreparationStateNames.StateAtRank(rank);
         _log.WriteLine($"enter {PreparationStateNames.ToName(next)} (correlationId={_request.CorrelationId})");
         var (evidence, detail) = next switch
@@ -246,6 +256,10 @@ internal sealed class PreparationMachine(
             PreparationState.ReconciliationLaunching => BeginReconciliationLaunch(),
             PreparationState.ReconciliationTerminalObserved => ObserveReconciliationTerminal(),
             PreparationState.ReconciliationVerified => VerifyReconciliation(),
+            PreparationState.DeliveryAuthorized => AuthorizeDelivery(),
+            PreparationState.DeliveryLaunching => BeginDeliveryLaunch(),
+            PreparationState.DeliveryTerminalObserved => ObserveDeliveryTerminal(),
+            PreparationState.DeliveryTerminalVerified => VerifyDelivery(),
             _ => throw new ContractException($"'{PreparationStateNames.ToName(next)}' is not a transition this coordinator performs.")
         };
         _state.Commit(_request, _stateKey, next, evidence, detail);
@@ -300,6 +314,14 @@ internal sealed class PreparationMachine(
                 setId,
                 "reconciliation",
                 _request.ReconciliationSummaryPath);
+        }
+        if (rank == PreparationStateNames.RankOf(PreparationState.DeliveryRunning))
+        {
+            return new LaunchBinding(
+                PreparationStateNames.ToName(PreparationState.DeliveryRunning),
+                setId,
+                "delivery",
+                _request.DeliverySummaryPath);
         }
         return new LaunchBinding(PreparationStateNames.ToName(PreparationStateNames.StateAtRank(rank)), setId, string.Empty, string.Empty);
     }
@@ -400,6 +422,9 @@ internal sealed class PreparationMachine(
                 break;
             case PreparationState.ReconciliationAuthorized:
                 ReadReconciliationPlanResult();
+                break;
+            case PreparationState.DeliveryAuthorized:
+                ReadDeliveryPlanResult();
                 break;
         }
     }
@@ -1844,6 +1869,8 @@ internal sealed class PreparationMachine(
     private SlotLaunch? _observedLaunch;
     private SlotObservation? _observedReconcileRun;
     private SlotLaunch? _observedReconcileLaunch;
+    private SlotObservation? _observedDeliveryRun;
+    private SlotLaunch? _observedDeliveryLaunch;
 
     private MapNode QualificationRequest() => new MapNode()
         .Set("contractVersion", ChildRequestContractVersion)
@@ -1886,6 +1913,10 @@ internal sealed class PreparationMachine(
     private const string ReconciliationRequestContractVersion = "devpilot.shadow-run-coordinator.reconciliation-request.v1";
 
     private const string ReconciliationSummaryContractVersion = "devpilot.shadow-run-coordinator.reconciliation-summary.v1";
+
+    private const string DeliveryRequestContractVersion = "devpilot.shadow-run-coordinator.delivery-request.v1";
+
+    private const string DeliverySummaryContractVersion = "devpilot.shadow-run-coordinator.delivery-summary.v1";
 
     // -----------------------------------------------------------------------
     // reconciliationAuthorized / reconciliationLaunching
@@ -2512,6 +2543,676 @@ internal sealed class PreparationMachine(
     private const string ReconcileRunStep = "reconcileRun";
     private const string ReconcileVerifyStep = "reconcileVerify";
 
+    // -----------------------------------------------------------------------
+    // deliveryAuthorized / deliveryLaunching / deliveryRunning
+    // / deliveryTerminalObserved / deliveryTerminalVerified
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Establishes that a preview-only delivery decision may now be evaluated over
+    /// a set this run both completed and compared, and refuses before any child if
+    /// any write capability is anywhere in reach.
+    /// </summary>
+    /// <remarks>
+    /// Three gates, deliberately not one. Every declared slot must end
+    /// verified-complete in this run's own record; the reconciliation must be
+    /// recorded verified in that same record; and the reviewed evaluation's own
+    /// readiness answer must accept the set. A delivery over a set that was never
+    /// compared would be a decision about runs nobody had reconciled.
+    ///
+    /// The capability check is the reason this transition exists at all rather
+    /// than the launch simply happening. The reviewed side reports, as plain
+    /// booleans and integers, whether any comment, vote or gate capability is
+    /// currently requested and what it would be permitted to write. Every one of
+    /// them must be off and zero HERE, before the evaluation child is started, so
+    /// that a write-capable configuration or policy is a refusal rather than
+    /// something discovered afterwards in a summary.
+    ///
+    /// Nothing here reads a finding. What this transition binds is which set,
+    /// which plan, which reconciliation, which head and which correlation the
+    /// decision will be evaluated under.
+    /// </remarks>
+    private (MapNode Evidence, string Detail) AuthorizeDelivery()
+    {
+        var delivery = _request.RequireSlotSet().RequireDelivery();
+        RequireEverySlotVerified();
+        var reconciled = _state.EvidenceFor(PreparationState.ReconciliationVerified)
+            ?? throw new ContractException(
+                "This run holds no reconciliationVerified record, so there is no compared set to evaluate a delivery decision over. " +
+                "A delivery never runs ahead of the comparison that closes the set.");
+        var reconciliationSha = reconciled.GetText("reconciliationSha256")
+            ?? throw new ContractException("The reconciliationVerified record carries no outcome digest.");
+        var reconciliationSummarySha = reconciled.GetText("summarySha256")
+            ?? throw new ContractException("The reconciliationVerified record carries no summary digest.");
+        var reconciliationArtifactPath = reconciled.GetText("artifactPath")
+            ?? throw new ContractException("The reconciliationVerified record carries no artifact path.");
+        var reconciliationArtifactSha = reconciled.GetText("artifactSha256")
+            ?? throw new ContractException("The reconciliationVerified record carries no artifact digest.");
+
+        var verified = _state.EvidenceFor(PreparationState.RunSetVerified)
+            ?? throw new ContractException("The run holds no runSetVerified record, so there is no verified declaration to deliver over.");
+        var verifiedSetId = verified.GetText("setId") ?? throw new ContractException("The runSetVerified record carries no setId.");
+
+        var plan = ReadDeliveryPlan(RequestDeliveryPlan(DeliveryPlanStep));
+        if (!string.Equals(plan.SetId, verifiedSetId, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The delivery is built for run set '{plan.SetId}' and this run verified '{verifiedSetId}'.");
+        }
+        var reconciledSetId = reconciled.GetText("setId");
+        if (reconciledSetId is not null && !string.Equals(plan.SetId, reconciledSetId, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The delivery is built for run set '{plan.SetId}' and this run reconciled '{reconciledSetId}'.");
+        }
+        var reconciledPlanDigest = reconciled.GetText("planDigest");
+        if (reconciledPlanDigest is not null && !string.Equals(plan.PlanDigest, reconciledPlanDigest, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The delivery is built for plan {plan.PlanDigest} and the reconciliation was verified under {reconciledPlanDigest}.");
+        }
+        foreach (var stage in Stages)
+        {
+            var terminal = _state.EvidenceAtRank(PreparationStateNames.RankOf(stage.TerminalVerified))
+                ?? throw new ContractException($"The run holds no terminal record for '{stage.Name}'.");
+            var terminalDigest = terminal.GetText("planDigest")
+                ?? throw new ContractException($"The terminal record for '{stage.Name}' carries no plan digest.");
+            if (!string.Equals(terminalDigest, plan.PlanDigest, StringComparison.Ordinal))
+            {
+                throw new ContractException($"Slot '{stage.Name}' ran under plan {terminalDigest} and the delivery is built for {plan.PlanDigest}.");
+            }
+        }
+        if (plan.RequiredRunCount != delivery.RequiredRunCount)
+        {
+            throw new ContractException(
+                $"The delivery covers {plan.RequiredRunCount.ToString(CultureInfo.InvariantCulture)} run(s) and the request authorized {delivery.RequiredRunCount.ToString(CultureInfo.InvariantCulture)}.");
+        }
+        if (plan.RequiredRunCount != _request.PlannedRunCount)
+        {
+            throw new ContractException(
+                $"The delivery covers {plan.RequiredRunCount.ToString(CultureInfo.InvariantCulture)} run(s) and the declaration plans {_request.PlannedRunCount.ToString(CultureInfo.InvariantCulture)}.");
+        }
+        // The reconciliation this decision closes over is the one this run
+        // verified, byte for byte. Without this the delivery could be evaluated
+        // against a comparison that merely happens to be at the same path.
+        if (!string.Equals(plan.ReconciliationSha256, reconciliationSha, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The delivery binds reconciliation {plan.ReconciliationSha256} and this run verified {reconciliationSha}.");
+        }
+        if (!PathsAreSame(plan.ReconciliationArtifactPath, reconciliationArtifactPath))
+        {
+            throw new ContractException($"The delivery reads its comparison from '{plan.ReconciliationArtifactPath}' and this run verified '{reconciliationArtifactPath}'.");
+        }
+        if (!string.Equals(plan.ReconciliationArtifactSha256, reconciliationArtifactSha, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The comparison at '{reconciliationArtifactPath}' now digests to {plan.ReconciliationArtifactSha256} and this run verified {reconciliationArtifactSha}.");
+        }
+        // One shot, for the same reason a comparison has one. The evaluation
+        // seals a stamped decision every time it runs.
+        if (plan.AttemptExists)
+        {
+            throw new ContractException(
+                "The delivery already carries an attempt record, so its single authorization is spent. This coordinator does not evaluate a set twice.");
+        }
+        if (!string.Equals(plan.Head, _request.ToolkitHead, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The delivery is built at toolkit head {plan.Head} and this request authorizes {_request.ToolkitHead}.");
+        }
+        var observedHead = GitHead.Resolve(_request.ToolkitRoot);
+        if (!string.Equals(observedHead, _request.ToolkitHead, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The toolkit is at head {observedHead} and this request authorizes {_request.ToolkitHead}.");
+        }
+        plan.Deadlines.RequireConsistent("delivery plan");
+        RequireNoWriteCapability(plan.Capability, "the delivery plan");
+
+        var evidence = new MapNode()
+            .Set("setId", plan.SetId)
+            .Set("planDigest", plan.PlanDigest)
+            .Set("requiredRunCount", plan.RequiredRunCount)
+            .Set("outputDirectory", plan.OutputDirectory)
+            .Set("head", plan.Head)
+            .Set("reconciliationSha256", plan.ReconciliationSha256)
+            .Set("reconciliationSummarySha256", reconciliationSummarySha)
+            .Set("reconciliationArtifactPath", plan.ReconciliationArtifactPath)
+            .Set("reconciliationArtifactSha256", plan.ReconciliationArtifactSha256)
+            .Set("configSha256", plan.ConfigSha256)
+            .Set("policySha256", plan.PolicySha256)
+            .Set("capability", plan.Capability.Describe())
+            .Set("deadlines", plan.Deadlines.Describe())
+            .Set("authorization", delivery.Describe())
+            .Set("childResultSha256", plan.ChildResultSha256);
+        return (evidence, $"setId={plan.SetId} authorizationKind={plan.Capability.AuthorizationKind} planDigest={plan.PlanDigest}");
+    }
+
+    /// <summary>
+    /// Publishes the strict versioned input the delivery decision will be
+    /// evaluated from, and records that one is now due. It starts nothing.
+    /// </summary>
+    private (MapNode Evidence, string Detail) BeginDeliveryLaunch()
+    {
+        var authorized = _state.EvidenceFor(PreparationState.DeliveryAuthorized)
+            ?? throw new ContractException("Nothing authorized a delivery, so none is due.");
+        var setId = authorized.GetText("setId") ?? throw new ContractException("The deliveryAuthorized record carries no setId.");
+        var planDigest = authorized.GetText("planDigest") ?? throw new ContractException("The deliveryAuthorized record carries no plan digest.");
+        var outputDirectory = authorized.GetText("outputDirectory") ?? throw new ContractException("The deliveryAuthorized record carries no output directory.");
+        var requiredRunCount = authorized.GetInteger("requiredRunCount")
+            ?? throw new ContractException("The deliveryAuthorized record carries no required run count.");
+        var reconciliationSha = authorized.GetText("reconciliationSha256")
+            ?? throw new ContractException("The deliveryAuthorized record carries no reconciliation digest.");
+        var reconciliationArtifactSha = authorized.GetText("reconciliationArtifactSha256")
+            ?? throw new ContractException("The deliveryAuthorized record carries no comparison artifact digest.");
+
+        Directory.CreateDirectory(_request.DeliveryRoot);
+        var input = new MapNode()
+            .Set("contractVersion", DeliveryRequestContractVersion)
+            .Set("kind", "shadow-run-coordinator-delivery-request")
+            .Set("correlationId", _request.CorrelationId)
+            .Set("setId", setId)
+            .Set("planDigest", planDigest)
+            .Set("requiredRunCount", requiredRunCount)
+            // Written into the file the child reads, so the authorization the
+            // evaluation runs under is on disk and digested rather than implied
+            // by which code path invoked it.
+            .Set("authorizationKind", DeliveryAuthorization.PreviewOnlyKind)
+            .Set("commentsEnabled", false)
+            .Set("votesEnabled", false)
+            .Set("gatesEnabled", false)
+            .Set("providerWriteBudget", 0)
+            .Set("reconciliationSha256", reconciliationSha)
+            .Set("reconciliationArtifactSha256", reconciliationArtifactSha)
+            .Set("outputDirectory", outputDirectory)
+            .Set("summaryPath", _request.DeliverySummaryPath);
+        CanonicalJson.WriteFileAtomic(_request.DeliveryRequestPath, CanonicalJson.Readable(input));
+        var inputSha = CanonicalJson.Sha256HexOfFile(_request.DeliveryRequestPath);
+
+        var evidence = new MapNode()
+            .Set("setId", setId)
+            .Set("planDigest", planDigest)
+            .Set("deliveryRequestPath", _request.DeliveryRequestPath)
+            .Set("deliveryRequestSha256", inputSha)
+            .Set("summaryPath", _request.DeliverySummaryPath)
+            .Set("deliveryDue", true);
+        return (evidence, $"deliveryRequestSha256={inputSha}");
+    }
+
+    /// <summary>
+    /// Runs the reviewed delivery evaluation once, under supervision, in preview
+    /// only, making the child's identity durable before the wait.
+    /// </summary>
+    /// <remarks>
+    /// The exit code is data, for the reason it is data for the comparison: a
+    /// coordinator that reacted to it would be reacting to a reading of the runs.
+    /// What is required instead is that the evaluation ran, sealed its decision
+    /// and wrote its summary.
+    ///
+    /// The capability answer is re-derived immediately before the irreversible
+    /// step and refused again, because a policy edited between the authorization
+    /// and the launch is a different world from the one the authorization was
+    /// committed against.
+    /// </remarks>
+    private void RunDelivery()
+    {
+        var due = _state.EvidenceFor(PreparationState.DeliveryLaunching)
+            ?? throw new ContractException("No delivery was recorded due, so there is nothing to run.");
+        _ledger.RequireLaunchable(DeliveryRunStep);
+        var authorized = _state.EvidenceFor(PreparationState.DeliveryAuthorized)
+            ?? throw new ContractException("Nothing authorized a delivery, so there is nothing to run.");
+        var authorizedDigest = authorized.GetText("planDigest")
+            ?? throw new ContractException("The deliveryAuthorized record carries no plan digest.");
+        var authorizedReconciliationSha = authorized.GetText("reconciliationSha256")
+            ?? throw new ContractException("The deliveryAuthorized record carries no reconciliation digest.");
+        var inputSha = due.GetText("deliveryRequestSha256")
+            ?? throw new ContractException("The deliveryLaunching record carries no input digest.");
+        if (!File.Exists(_request.DeliveryRequestPath))
+        {
+            throw new ContractException($"The delivery input at '{_request.DeliveryRequestPath}' is gone.");
+        }
+
+        var probePath = Path.Combine(_request.ExchangeRoot, _request.CorrelationId + "-" + DeliveryPrelaunchStep + ".result.json");
+        if (File.Exists(probePath))
+        {
+            File.Delete(probePath);
+        }
+        var plan = ReadDeliveryPlan(RequestDeliveryPlan(DeliveryPrelaunchStep));
+        if (!string.Equals(plan.PlanDigest, authorizedDigest, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The delivery plan now digests to {plan.PlanDigest} and the authorization was committed against {authorizedDigest}.");
+        }
+        if (!string.Equals(plan.ReconciliationSha256, authorizedReconciliationSha, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The delivery now binds reconciliation {plan.ReconciliationSha256} and the authorization was committed against {authorizedReconciliationSha}.");
+        }
+        RequireEverySlotVerified();
+        RequireNoWriteCapability(plan.Capability, "the delivery prelaunch probe");
+        if (plan.AttemptExists)
+        {
+            throw new ContractException(
+                "The delivery acquired an attempt record between authorization and launch, so its single authorization has already been used.");
+        }
+
+        var childRequest = DeliveryChildRequest()
+            .Set("expectedPlanDigest", plan.PlanDigest)
+            .Set("expectedSetId", plan.SetId)
+            .Set("deliveryRequestPath", _request.DeliveryRequestPath)
+            .Set("deliveryRequestSha256", inputSha);
+        _ledger.Binding = new LaunchBinding(
+            PreparationStateNames.ToName(PreparationState.DeliveryRunning),
+            plan.SetId,
+            "delivery",
+            _request.DeliverySummaryPath);
+        _ledger.RequireLaunchable(DeliveryRunStep);
+        var launch = _supervisor.Start(DeliveryRunStep, ChildScript(), childRequest);
+
+        var running = new MapNode()
+            .Set("setId", plan.SetId)
+            .Set("planDigest", plan.PlanDigest)
+            .Set("deadlines", plan.Deadlines.Describe())
+            .Set("child", launch.DescribeIdentity())
+            .Set("supervisionStartedAtUtc", DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture));
+        _state.Commit(_request, _stateKey, PreparationState.DeliveryRunning, running, $"childProcessId={launch.ProcessId.ToString(CultureInfo.InvariantCulture)}");
+        _log.WriteLine($"commit {PreparationStateNames.ToName(PreparationState.DeliveryRunning)} sequence={_state.Sequence.ToString(CultureInfo.InvariantCulture)} childProcessId={launch.ProcessId.ToString(CultureInfo.InvariantCulture)}");
+        WriteAuditSafely(AuditReasonTransitionCommitted, $"committed '{PreparationStateNames.ToName(PreparationState.DeliveryRunning)}'");
+
+        var observation = _supervisor.Await(launch, plan.Deadlines, plan.OutputDirectory);
+        _log.WriteLine($"observed delivery child disposition={observation.Disposition} exitCode={observation.ExitCode.ToString(CultureInfo.InvariantCulture)}");
+        _observedDeliveryRun = observation;
+        _observedDeliveryLaunch = launch;
+    }
+
+    /// <summary>
+    /// Reads what the supervised evaluation left behind, without deciding what it
+    /// means.
+    /// </summary>
+    private (MapNode Evidence, string Detail) ObserveDeliveryTerminal()
+    {
+        var running = _state.EvidenceFor(PreparationState.DeliveryRunning)
+            ?? throw new ContractException("No delivery was recorded running, so there is nothing to observe.");
+        if (_deliveryPlan is null)
+        {
+            ReadDeliveryPlanResult();
+        }
+        var plan = _deliveryPlan
+            ?? throw new ContractException("The delivery plan could not be recovered, so there is nothing to observe against.");
+
+        if (_observedDeliveryRun is null || _observedDeliveryLaunch is null)
+        {
+            (_observedDeliveryLaunch, _observedDeliveryRun) = ResumeSupervision(
+                PreparationStateNames.ToName(PreparationState.DeliveryRunning),
+                "delivery",
+                DeliveryRunStep,
+                running,
+                plan.Deadlines,
+                plan.OutputDirectory);
+        }
+        var launch = _observedDeliveryLaunch!;
+        var observation = _observedDeliveryRun!;
+
+        if (observation.Disposition is SlotObservation.HardDeadlineKill or SlotObservation.ActivityDeadlineKill)
+        {
+            throw new ChildFailureException(
+                $"The delivery evaluation was stopped by this coordinator on a plan deadline ({observation.Disposition}) after " +
+                $"{observation.ObservedSeconds.ToString(CultureInfo.InvariantCulture)} second(s).");
+        }
+
+        var outcome = _supervisor.ReadResult(
+            launch,
+            "summaryWritten",
+            "summaryPath",
+            "summarySha256",
+            "evaluationExitCode",
+            "setId",
+            "planDigest",
+            "decisionPath",
+            "decisionSha256",
+            "providerWriteCount",
+            "writeToolInvocations");
+        const string label = "'deliveryRun' child result";
+        if (!StrictJson.RequireBool(outcome.Result, "summaryWritten", label))
+        {
+            throw new ContractException("The delivery produced no versioned summary, so there is nothing this coordinator may report about it.");
+        }
+        StrictJson.RequireLiteral(outcome.Result, "setId", plan.SetId, label);
+        StrictJson.RequireLiteral(outcome.Result, "planDigest", plan.PlanDigest, label);
+        var summaryPath = StrictJson.RequireString(outcome.Result, "summaryPath", label);
+        if (!PathsAreSame(summaryPath, _request.DeliverySummaryPath))
+        {
+            throw new ContractException($"The delivery wrote its summary to '{summaryPath}' and this run asked for '{_request.DeliverySummaryPath}'.");
+        }
+        if (!File.Exists(summaryPath))
+        {
+            throw new ContractException($"The delivery reports a summary at '{summaryPath}', which does not exist.");
+        }
+        var reportedSummarySha = StrictJson.RequireHex(outcome.Result, "summarySha256", label, 64);
+        var actualSummarySha = CanonicalJson.Sha256HexOfFile(summaryPath);
+        if (!string.Equals(reportedSummarySha, actualSummarySha, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The delivery summary digests to {actualSummarySha} and the child reported {reportedSummarySha}.");
+        }
+        var decisionPath = StrictJson.RequireString(outcome.Result, "decisionPath", label);
+        var decisionSha = StrictJson.RequireHex(outcome.Result, "decisionSha256", label, 64);
+        // Refused here as well as at verification, because this is the first
+        // moment the numbers exist. A run that wrote somewhere must not reach a
+        // second transition before it is stopped.
+        RequireZeroWrites(outcome.Result, label);
+        var evaluationExit = StrictJson.RequireInt(outcome.Result, "evaluationExitCode", label, int.MinValue, int.MaxValue);
+
+        var evidence = new MapNode()
+            .Set("setId", plan.SetId)
+            .Set("planDigest", plan.PlanDigest)
+            .Set("summaryPath", summaryPath)
+            .Set("summarySha256", actualSummarySha)
+            .Set("decisionPath", decisionPath)
+            .Set("decisionSha256", decisionSha)
+            .Set("evaluationExitCode", evaluationExit)
+            .Set("providerWriteCount", 0)
+            .Set("writeToolInvocations", 0)
+            .Set("supervision", observation.Describe())
+            .Set("childResultSha256", outcome.ResultSha256);
+        return (evidence, $"disposition={observation.Disposition} evaluationExitCode={evaluationExit.ToString(CultureInfo.InvariantCulture)}");
+    }
+
+    /// <summary>
+    /// Has the reviewed reader open the sealed decision, and records its status,
+    /// its digests, its census and the fact that it wrote nowhere - and nothing
+    /// else.
+    /// </summary>
+    /// <remarks>
+    /// The status word is the reviewed evaluation's own. It is carried, printed
+    /// and committed, and it is never compared to a literal: there is no branch in
+    /// this program on what a decision concluded, which is why a decision that
+    /// found nothing, one that let nothing through, one that would be eligible in
+    /// preview, and one built over a run the comparison called unusable all travel
+    /// the same code path and all end with the same zero counts.
+    ///
+    /// What IS compared to a literal is the shape of the authorization: the kind,
+    /// the three capability flags and the two write counters. Those are not
+    /// judgement, they are the claim that nothing happened.
+    /// </remarks>
+    private (MapNode Evidence, string Detail) VerifyDelivery()
+    {
+        var observed = _state.EvidenceFor(PreparationState.DeliveryTerminalObserved)
+            ?? throw new ContractException("No delivery summary was observed, so there is nothing to verify.");
+        var observedSummarySha = observed.GetText("summarySha256")
+            ?? throw new ContractException("The deliveryTerminalObserved record carries no summary digest.");
+        var authorized = _state.EvidenceFor(PreparationState.DeliveryAuthorized)
+            ?? throw new ContractException("Nothing authorized a delivery, so there is nothing to verify.");
+        var setId = authorized.GetText("setId") ?? throw new ContractException("The deliveryAuthorized record carries no setId.");
+        var planDigest = authorized.GetText("planDigest") ?? throw new ContractException("The deliveryAuthorized record carries no plan digest.");
+        var reconciliationSha = authorized.GetText("reconciliationSha256")
+            ?? throw new ContractException("The deliveryAuthorized record carries no reconciliation digest.");
+
+        var childRequest = DeliveryChildRequest()
+            .Set("expectedPlanDigest", planDigest)
+            .Set("expectedSetId", setId)
+            .Set("deliveryRequestPath", _request.DeliveryRequestPath)
+            .Set("summaryPath", _request.DeliverySummaryPath);
+        var outcome = _invoker.Invoke(
+            DeliveryVerifyStep,
+            ChildScript(),
+            childRequest,
+            "summarySha256",
+            "deliveryStatus",
+            "decisionPath",
+            "decisionSha256",
+            "decisionSignatureVerified",
+            "decisionPromotable",
+            "authorizationKind",
+            "commentsEnabled",
+            "votesEnabled",
+            "gatesEnabled",
+            "providerWriteCount",
+            "writeToolInvocations",
+            "reconciliationSha256",
+            "runCount",
+            "requiredRunCount",
+            "setId",
+            "planDigest",
+            "counts");
+        const string label = "'deliveryVerify' child result";
+
+        var verifiedSummarySha = StrictJson.RequireHex(outcome.Result, "summarySha256", label, 64);
+        if (!string.Equals(verifiedSummarySha, observedSummarySha, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The verified delivery summary digests to {verifiedSummarySha} and this run observed {observedSummarySha}.");
+        }
+        if (!StrictJson.RequireBool(outcome.Result, "decisionSignatureVerified", label))
+        {
+            throw new ContractException("The sealed delivery decision did not verify under its key, so it stands on nothing.");
+        }
+        if (StrictJson.RequireBool(outcome.Result, "decisionPromotable", label))
+        {
+            throw new ContractException("The sealed delivery decision claims to be promotable; a preview-only decision never is.");
+        }
+        StrictJson.RequireLiteral(outcome.Result, "authorizationKind", DeliveryAuthorization.PreviewOnlyKind, label);
+        StrictJson.RequireLiteral(outcome.Result, "setId", setId, label);
+        StrictJson.RequireLiteral(outcome.Result, "planDigest", planDigest, label);
+        StrictJson.RequireLiteral(outcome.Result, "reconciliationSha256", reconciliationSha, label);
+        RequireNoWriteCapability(DeliveryCapability.Read(outcome.Result, label, "decisionPromotable"), "the verified delivery decision");
+        RequireZeroWrites(outcome.Result, label);
+
+        var requiredRunCount = StrictJson.RequireInt(outcome.Result, "requiredRunCount", label, 2, 16);
+        var runCount = StrictJson.RequireInt(outcome.Result, "runCount", label, 0, 16);
+        if (runCount != requiredRunCount)
+        {
+            throw new ContractException(
+                $"The delivery decision covered {runCount.ToString(CultureInfo.InvariantCulture)} run(s) of a required {requiredRunCount.ToString(CultureInfo.InvariantCulture)}.");
+        }
+        if (requiredRunCount != _request.PlannedRunCount)
+        {
+            throw new ContractException(
+                $"The delivery decision requires {requiredRunCount.ToString(CultureInfo.InvariantCulture)} run(s) and the declaration plans {_request.PlannedRunCount.ToString(CultureInfo.InvariantCulture)}.");
+        }
+
+        // Carried, never compared. See the remarks above.
+        var status = StrictJson.RequireString(outcome.Result, "deliveryStatus", label);
+        var decisionPath = StrictJson.RequireString(outcome.Result, "decisionPath", label);
+        var decisionSha = StrictJson.RequireHex(outcome.Result, "decisionSha256", label, 64);
+        RequireObservedDeliveryFile(observed, "decision", decisionPath, decisionSha);
+        var counts = ReadOpaqueCounts(outcome.Result, label);
+
+        var evidence = new MapNode()
+            .Set("setId", setId)
+            .Set("planDigest", planDigest)
+            .Set("summarySha256", verifiedSummarySha)
+            .Set("deliveryStatus", status)
+            .Set("decisionPath", decisionPath)
+            .Set("decisionSha256", decisionSha)
+            .Set("decisionSignatureVerified", true)
+            .Set("reconciliationSha256", reconciliationSha)
+            .Set("authorizationKind", DeliveryAuthorization.PreviewOnlyKind)
+            .Set("promotable", false)
+            .Set("commentsEnabled", false)
+            .Set("votesEnabled", false)
+            .Set("gatesEnabled", false)
+            .Set("providerWriteCount", 0)
+            .Set("writeToolInvocations", 0)
+            .Set("runCount", runCount)
+            .Set("requiredRunCount", requiredRunCount)
+            .Set("counts", counts)
+            .Set("childResultSha256", outcome.ResultSha256);
+        return (evidence, $"deliveryStatus={status} decisionSha256={decisionSha} providerWriteCount=0");
+    }
+
+    /// <summary>
+    /// Requires the sealed decision this verification read to be the same file,
+    /// with the same bytes, that the observation committed.
+    /// </summary>
+    private static void RequireObservedDeliveryFile(MapNode observed, string role, string path, string sha256)
+    {
+        var observedPath = observed.GetText(role + "Path")
+            ?? throw new ContractException($"The deliveryTerminalObserved record carries no {role} path.");
+        var observedSha = observed.GetText(role + "Sha256")
+            ?? throw new ContractException($"The deliveryTerminalObserved record carries no {role} digest.");
+        if (!PathsAreSame(path, observedPath))
+        {
+            throw new ContractException($"The verified delivery {role} is at '{path}' and this run observed '{observedPath}'.");
+        }
+        if (!string.Equals(sha256, observedSha, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The verified delivery {role} digests to {sha256} and this run observed {observedSha}.");
+        }
+    }
+
+    /// <summary>
+    /// Refuses anything that reports a capability to write, wherever it is
+    /// reported from.
+    /// </summary>
+    /// <remarks>
+    /// One method rather than a check per call site, because the point is that
+    /// there is exactly one definition of "may not write" and it is applied at
+    /// authorization, at prelaunch and at verification. A build that wanted to
+    /// permit a write would have to change this method, and this method is read
+    /// by the architecture suite.
+    /// </remarks>
+    private static void RequireNoWriteCapability(DeliveryCapability capability, string source)
+    {
+        if (!string.Equals(capability.AuthorizationKind, DeliveryAuthorization.PreviewOnlyKind, StringComparison.Ordinal))
+        {
+            throw new ContractException(
+                $"{source} reports authorization kind '{capability.AuthorizationKind}'. " +
+                $"This coordinator performs exactly one kind of delivery, '{DeliveryAuthorization.PreviewOnlyKind}'.");
+        }
+        if (capability.CommentsEnabled || capability.VotesEnabled || capability.GatesEnabled)
+        {
+            throw new ContractException(
+                $"{source} reports a write capability in reach (comments={capability.CommentsEnabled.ToString(CultureInfo.InvariantCulture)}, " +
+                $"votes={capability.VotesEnabled.ToString(CultureInfo.InvariantCulture)}, gates={capability.GatesEnabled.ToString(CultureInfo.InvariantCulture)}). " +
+                "A delivery is refused before it starts when anything could write.");
+        }
+        if (capability.Promotable)
+        {
+            throw new ContractException($"{source} reports a promotable outcome; a preview-only delivery never produces one.");
+        }
+    }
+
+    /// <summary>Refuses any reported write, from any step, at any point.</summary>
+    private static void RequireZeroWrites(JsonElement result, string label)
+    {
+        var providerWrites = StrictJson.RequireInt(result, "providerWriteCount", label, 0, int.MaxValue);
+        var writeTools = StrictJson.RequireInt(result, "writeToolInvocations", label, 0, int.MaxValue);
+        if (providerWrites != 0 || writeTools != 0)
+        {
+            throw new ContractException(
+                $"The {label} reports {providerWrites.ToString(CultureInfo.InvariantCulture)} provider write(s) and " +
+                $"{writeTools.ToString(CultureInfo.InvariantCulture)} write tool invocation(s). This coordinator supervises no path that may write, " +
+                "so a non-zero count is a fault in what it supervised rather than a result to record.");
+        }
+    }
+
+    private MapNode DeliveryChildRequest()
+    {
+        var set = _request.RequireSlotSet();
+        var delivery = set.RequireDelivery();
+        var reconciliation = set.Reconciliation.Require();
+        if (_sealedSnapshotName.Length == 0)
+        {
+            ReadSealResult();
+        }
+        return QualificationRequest()
+            .Set("snapshotName", _sealedSnapshotName)
+            .Set("manifestDigest", _sealedSnapshotDigest)
+            .Set("launchAuthorizationTokenPath", delivery.LaunchAuthorizationTokenPath)
+            .Set("reconciliationOutputDirectory", reconciliation.OutputDirectory)
+            .Set("deliveryOutputDirectory", delivery.OutputDirectory)
+            .Set("requiredRunCount", delivery.RequiredRunCount)
+            // Asked for by name, so the evaluation cannot be invoked under any
+            // other authorization even by a caller that built its own request.
+            .Set("authorizationKind", DeliveryAuthorization.PreviewOnlyKind);
+    }
+
+    private ChildOutcome RequestDeliveryPlan(string step) => _invoker.Invoke(
+        step,
+        ChildScript(),
+        DeliveryChildRequest(),
+        "setId",
+        "planDigest",
+        "requiredRunCount",
+        "outputDirectory",
+        "deliveryAttemptExists",
+        "deliveryReady",
+        "authorizationKind",
+        "commentsEnabled",
+        "votesEnabled",
+        "gatesEnabled",
+        "promotable",
+        "providerWriteCount",
+        "writeToolInvocations",
+        "reconciliationSha256",
+        "reconciliationArtifactPath",
+        "reconciliationArtifactSha256",
+        "configSha256",
+        "policySha256",
+        "slotTimeoutSeconds",
+        "progressTimeoutSeconds",
+        "perCallTimeoutSeconds",
+        "head",
+        "requiredRef",
+        "headClean");
+
+    private DeliveryPlan ReadDeliveryPlan(ChildOutcome outcome)
+    {
+        const string label = "'deliveryPlan' child result";
+        var delivery = _request.RequireSlotSet().RequireDelivery();
+        if (!StrictJson.RequireBool(outcome.Result, "deliveryReady", label))
+        {
+            throw new ContractException("The reviewed readiness gate does not accept this set for a delivery decision.");
+        }
+        if (!StrictJson.RequireBool(outcome.Result, "headClean", label))
+        {
+            throw new ContractException("The toolkit working tree is not clean, so the head a decision would be attributed to is not the head that would run.");
+        }
+        StrictJson.RequireLiteral(outcome.Result, "requiredRef", _request.RequiredRef, label);
+        var outputDirectory = StrictJson.RequireString(outcome.Result, "outputDirectory", label);
+        if (!PathsAreSame(outputDirectory, delivery.OutputDirectory))
+        {
+            throw new ContractException($"The delivery would write to '{outputDirectory}' and the request authorized '{delivery.OutputDirectory}'.");
+        }
+        // Read before anything else about the plan is believed: a plan that
+        // reports a write capability is refused whatever else it says.
+        var capability = DeliveryCapability.Read(outcome.Result, label);
+        RequireZeroWrites(outcome.Result, label);
+        var plan = new DeliveryPlan(
+            StrictJson.RequireString(outcome.Result, "setId", label),
+            StrictJson.RequireHex(outcome.Result, "planDigest", label, 64),
+            StrictJson.RequireInt(outcome.Result, "requiredRunCount", label, 2, 16),
+            outputDirectory,
+            StrictJson.RequireBool(outcome.Result, "deliveryAttemptExists", label),
+            StrictJson.RequireString(outcome.Result, "head", label),
+            StrictJson.RequireHex(outcome.Result, "reconciliationSha256", label, 64),
+            StrictJson.RequireString(outcome.Result, "reconciliationArtifactPath", label),
+            StrictJson.RequireHex(outcome.Result, "reconciliationArtifactSha256", label, 64),
+            StrictJson.RequireHex(outcome.Result, "configSha256", label, 64),
+            StrictJson.RequireHex(outcome.Result, "policySha256", label, 64),
+            capability,
+            new SlotDeadlines(
+                StrictJson.RequireInt(outcome.Result, "slotTimeoutSeconds", label, 1, 14400),
+                StrictJson.RequireInt(outcome.Result, "progressTimeoutSeconds", label, 0, 14400),
+                StrictJson.RequireInt(outcome.Result, "perCallTimeoutSeconds", label, 1, 14400),
+                delivery.SupervisionGraceSeconds),
+            outcome.ResultSha256);
+        _deliveryPlan = plan;
+        return plan;
+    }
+
+    private void ReadDeliveryPlanResult()
+    {
+        var committed = _state.EvidenceFor(PreparationState.DeliveryAuthorized);
+        var result = ReadCommittedChildResult(PreparationState.DeliveryAuthorized, DeliveryPlanStep, "'deliveryPlan' child result");
+        var plan = ReadDeliveryPlan(new ChildOutcome(
+            0,
+            Path.Combine(_request.ExchangeRoot, _request.CorrelationId + "-" + DeliveryPlanStep + ".result.json"),
+            result,
+            committed?.GetText("childResultSha256") ?? string.Empty));
+        var authorizedDigest = committed?.GetText("planDigest");
+        if (authorizedDigest is not null && !string.Equals(plan.PlanDigest, authorizedDigest, StringComparison.Ordinal))
+        {
+            throw new ContractException($"The resumed delivery plan digests to {plan.PlanDigest} and the authorization was committed against {authorizedDigest}.");
+        }
+    }
+
+    private const string DeliveryPlanStep = "deliveryPlan";
+    private const string DeliveryPrelaunchStep = "deliveryPrelaunch";
+    private const string DeliveryRunStep = "deliveryRun";
+    private const string DeliveryVerifyStep = "deliveryVerify";
+
     /// <summary>The reasons an audit is written, which are the ways a run can be at rest.</summary>
     /// <remarks>
     /// A closed vocabulary rather than free text, because the point of the field
@@ -2701,12 +3402,40 @@ internal sealed class PreparationMachine(
                 .Set("reconciliationCounts", reconciled.Get("counts") ?? Node.Null());
         }
         // Named for a reader who wants the one-line answer to "did this write
-        // anything anywhere". The whole slice has no delivery path and no
-        // provider write, so the claim is structural rather than measured - and
-        // it is stated here so that a future slice that gained one would have to
-        // come and change a line that says it did not.
+        // anything anywhere". It is read out of the committed delivery record
+        // rather than restated as a constant, so the claim is measured on the
+        // runs that evaluated a decision - and the transition that committed it
+        // refuses any non-zero count, so there is no reachable record this could
+        // read a write out of. A run that never reached a delivery says so with
+        // the same two fields, because "no delivery happened" and "a delivery
+        // happened and wrote nothing" are both answers to the question and
+        // neither is a write.
+        var delivered = _state.EvidenceFor(PreparationState.DeliveryTerminalVerified);
+        audit.Set("deliveryPerformed", delivered is not null);
+        // The reviewed plan's own word for the posture, unchanged from the slice
+        // that could not deliver at all, because the posture has not changed.
         audit.Set("deliveryMode", "previewOnly");
-        audit.Set("providerWriteCount", 0);
+        audit.Set("deliveryAuthorizationKind", delivered?.Get("authorizationKind") ?? Node.Text(DeliveryAuthorization.PreviewOnlyKind));
+        audit.Set("providerWriteCount", delivered?.Get("providerWriteCount") ?? Node.Number(0));
+        audit.Set("writeToolInvocations", delivered?.Get("writeToolInvocations") ?? Node.Number(0));
+        if (delivered is not null)
+        {
+            // Status, digests and an opaque census, on exactly the terms the
+            // reconciliation gets: the names are labels for a human reading the
+            // audit, and no line in this program compares one of them to
+            // anything.
+            audit
+                .Set("deliveryStatus", delivered.Get("deliveryStatus") ?? Node.Null())
+                .Set("deliveryDecisionSha256", delivered.Get("decisionSha256") ?? Node.Null())
+                .Set("deliverySummarySha256", delivered.Get("summarySha256") ?? Node.Null())
+                .Set("deliveryReconciliationSha256", delivered.Get("reconciliationSha256") ?? Node.Null())
+                .Set("deliveryRunCount", delivered.Get("runCount") ?? Node.Null())
+                .Set("deliveryPromotable", delivered.Get("promotable") ?? Node.Null())
+                .Set("deliveryCommentsEnabled", delivered.Get("commentsEnabled") ?? Node.Null())
+                .Set("deliveryVotesEnabled", delivered.Get("votesEnabled") ?? Node.Null())
+                .Set("deliveryGatesEnabled", delivered.Get("gatesEnabled") ?? Node.Null())
+                .Set("deliveryCounts", delivered.Get("counts") ?? Node.Null());
+        }
         audit
             .Set("childResultTransitionCount", childBackedTransitions)
             .Set("stages", stages);
@@ -2822,5 +3551,66 @@ internal sealed record ReconciliationPlan(
     string OutputDirectory,
     bool AttemptExists,
     string Head,
+    SlotDeadlines Deadlines,
+    string ChildResultSha256);
+
+/// <summary>
+/// What a step reports about what it could write. Every field is a claim that
+/// something is off.
+/// </summary>
+/// <remarks>
+/// Deliberately a separate type from the plan it arrives with, because it is
+/// read from three different steps - the authorization's plan, the prelaunch
+/// probe and the verified decision - and all three are refused by one method
+/// over one shape. A capability that only some of those checked would be a
+/// capability that a resumed or re-entered run could carry past the one place
+/// that looked.
+/// </remarks>
+internal sealed record DeliveryCapability(
+    string AuthorizationKind,
+    bool CommentsEnabled,
+    bool VotesEnabled,
+    bool GatesEnabled,
+    bool Promotable)
+{
+    internal static DeliveryCapability Read(JsonElement result, string label, string promotableField = "promotable") => new(
+        StrictJson.RequireString(result, "authorizationKind", label),
+        StrictJson.RequireBool(result, "commentsEnabled", label),
+        StrictJson.RequireBool(result, "votesEnabled", label),
+        StrictJson.RequireBool(result, "gatesEnabled", label),
+        StrictJson.RequireBool(result, promotableField, label));
+
+    internal MapNode Describe() => new MapNode()
+        .Set("authorizationKind", AuthorizationKind)
+        .Set("commentsEnabled", CommentsEnabled)
+        .Set("votesEnabled", VotesEnabled)
+        .Set("gatesEnabled", GatesEnabled)
+        .Set("promotable", Promotable);
+}
+
+/// <summary>
+/// The reviewed delivery evaluation as the coordinator needs to see it: which
+/// set, which plan, which comparison it closes over, which config and policy it
+/// would run under, what it may write, and whether its single authorization has
+/// been spent.
+/// </summary>
+/// <remarks>
+/// Nothing in it describes a finding, a candidate, a severity or a verdict. The
+/// only thing it says about the decision itself is what the decision is not
+/// allowed to be.
+/// </remarks>
+internal sealed record DeliveryPlan(
+    string SetId,
+    string PlanDigest,
+    int RequiredRunCount,
+    string OutputDirectory,
+    bool AttemptExists,
+    string Head,
+    string ReconciliationSha256,
+    string ReconciliationArtifactPath,
+    string ReconciliationArtifactSha256,
+    string ConfigSha256,
+    string PolicySha256,
+    DeliveryCapability Capability,
     SlotDeadlines Deadlines,
     string ChildResultSha256);

@@ -6,15 +6,24 @@ namespace DevPilot.ShadowRunCoordinator;
 
 /// <summary>The transitions this coordinator owns, in the only order they may occur.</summary>
 /// <remarks>
-/// Three slices live here. The first prepares a run set and stops at
+/// Four slices live here. The first prepares a run set and stops at
 /// <see cref="RunSetReady"/>. The second supervises the first slot from there.
 /// The third supervises the second slot, and only then closes the set with a
-/// reconciliation.
+/// reconciliation. The fourth supervises one preview-only delivery decision over
+/// the reconciled set.
 ///
-/// No model, no candidate, no severity, no verdict and no delivery appears in
-/// this enumeration. What cannot be named here cannot be reached by mistake, and
-/// the absence of a delivery state is the structural reason this coordinator
-/// cannot write anywhere: there is no transition under which it would.
+/// No model, no candidate, no severity and no verdict appears in this
+/// enumeration. What cannot be named here cannot be reached by mistake.
+///
+/// The delivery states exist and are named, and none of them is a write. There
+/// is <see cref="DeliveryTerminalVerified"/> and there is no state after it: no
+/// published, no posted, no promoted, no voted. The evaluation runs in the
+/// reviewed PowerShell under an authorization this request can only express as
+/// preview-only, and what crosses back is a status, some digests and a census of
+/// integers. A slice that wanted to write anywhere would have to add a state
+/// here first, which is the point of naming them: the structural claim is now
+/// "there is no write-enabled transition", asserted against a list a reader can
+/// see, rather than "there is no delivery at all".
 ///
 /// Two ranks hold three members rather than one. A supervised run ends verified,
 /// failed or timed out, and those are three different durable facts about the
@@ -26,7 +35,8 @@ namespace DevPilot.ShadowRunCoordinator;
 /// ending, because there is no second reading of a comparison for this
 /// coordinator to record. It is one-shot all the same, which is why it has a
 /// running rank: a resumed run adopts the comparison it already started rather
-/// than discovering a spent authorization it cannot explain.
+/// than discovering a spent authorization it cannot explain. The delivery has
+/// the same shape and the same reason for it.
 /// </remarks>
 internal enum PreparationState
 {
@@ -60,7 +70,12 @@ internal enum PreparationState
     ReconciliationLaunching = 27,
     ReconciliationRunning = 28,
     ReconciliationTerminalObserved = 29,
-    ReconciliationVerified = 30
+    ReconciliationVerified = 30,
+    DeliveryAuthorized = 31,
+    DeliveryLaunching = 32,
+    DeliveryRunning = 33,
+    DeliveryTerminalObserved = 34,
+    DeliveryTerminalVerified = 35
 }
 
 internal static class PreparationStateNames
@@ -71,8 +86,14 @@ internal static class PreparationStateNames
     /// <summary>The rank the second slot's three terminal outcomes share.</summary>
     internal const int Slot2TerminalRank = 21;
 
-    /// <summary>The last rank there is, and the only ending the whole set has.</summary>
+    /// <summary>The rank at which the whole declared set is closed by its comparison.</summary>
     internal const int ReconciliationRank = 26;
+
+    /// <summary>
+    /// The last rank there is: one preview-only delivery decision over a set that
+    /// has already been compared. Nothing follows it, and nothing after it writes.
+    /// </summary>
+    internal const int DeliveryRank = 31;
 
     /// <summary>The last rank the preparation slice reaches on its own.</summary>
     internal const int PreparationRank = 11;
@@ -118,7 +139,22 @@ internal static class PreparationStateNames
         // can never account for.
         (PreparationState.ReconciliationRunning, "reconciliationRunning", 24),
         (PreparationState.ReconciliationTerminalObserved, "reconciliationTerminalObserved", 25),
-        (PreparationState.ReconciliationVerified, "reconciliationVerified", ReconciliationRank)
+        (PreparationState.ReconciliationVerified, "reconciliationVerified", ReconciliationRank),
+        // The delivery decision. Five ranks with the same shape as the
+        // reconciliation's four plus a running rank, for the same reasons: the
+        // authorization is one-shot, the input file is on disk and digested
+        // before anything starts, the child's identity is durable before the
+        // wait, and a resumed run adopts what it already launched.
+        //
+        // Not one of these is a write. The evaluation is the reviewed
+        // PowerShell's, it is invoked with every write capability switched off,
+        // and the verified ending records a status, some digests and a census of
+        // integers. There is deliberately no rank after this one.
+        (PreparationState.DeliveryAuthorized, "deliveryAuthorized", 27),
+        (PreparationState.DeliveryLaunching, "deliveryLaunching", 28),
+        (PreparationState.DeliveryRunning, "deliveryRunning", 29),
+        (PreparationState.DeliveryTerminalObserved, "deliveryTerminalObserved", 30),
+        (PreparationState.DeliveryTerminalVerified, "deliveryTerminalVerified", DeliveryRank)
     ];
 
     /// <summary>The ranks at which a supervised run records one of three endings.</summary>
@@ -163,7 +199,7 @@ internal static class PreparationStateNames
     /// evidence, not by position in a list.
     /// </summary>
     internal static IReadOnlyList<int> Ranks =>
-        Enumerable.Range(1, ReconciliationRank).ToList();
+        Enumerable.Range(1, DeliveryRank).ToList();
 
     /// <summary>
     /// The single state at a rank. Refused for the two terminal ranks on purpose:
@@ -576,7 +612,8 @@ internal sealed class CoordinatorState
     /// The reconciliation is asked about first and the slots in reverse order,
     /// which is simply latest-first: only the most recently committed running
     /// record can name a child that is still alive, and an earlier one names a
-    /// process this run has already watched end.
+    /// process this run has already watched end. The delivery is asked about
+    /// before all of them, because it is the latest of all.
     /// </remarks>
     internal static (int ProcessId, string StartedAtUtc)? TryReadRecordedSlotChild(CoordinatorRequest request)
     {
@@ -600,7 +637,8 @@ internal sealed class CoordinatorState
         {
             return null;
         }
-        var child = state.EvidenceFor(PreparationState.ReconciliationRunning)?.Get("child") as MapNode
+        var child = state.EvidenceFor(PreparationState.DeliveryRunning)?.Get("child") as MapNode
+            ?? state.EvidenceFor(PreparationState.ReconciliationRunning)?.Get("child") as MapNode
             ?? state.EvidenceFor(PreparationState.Slot2Running)?.Get("child") as MapNode
             ?? state.EvidenceFor(PreparationState.Slot1Running)?.Get("child") as MapNode;
         if (child is null)
