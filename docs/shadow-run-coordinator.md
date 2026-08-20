@@ -568,6 +568,14 @@ entry about to start. If that would cross the declared maximum model starts, ver
 or wall clock, the cohort stops (exit 10), the remaining entries stay `pending`, and the index says
 so. A ceiling checked afterwards is a ceiling that has already been exceeded.
 
+**An entry that left no audit is charged what it was admitted on.** A child can die or be killed
+part-way through a preparation, having already started models, without ever publishing an audit.
+There is no honest way to read what it spent, so the cohort charges it its own sealed estimate
+rather than zero: zero would mean a run nobody can account for silently funds the entries after it.
+An entry that ends *complete* with no audit is a different thing and is refused outright (exit 11),
+because a completion is a claim about what was consumed and what was not written, and there is
+nothing behind that claim. Wall clock is charged from the parent's own measurement either way.
+
 **Stop policy, and what it does not mean.** `failFast` stops at the first entry that ends other
 than complete; `continueOnTerminalFailure` carries on to the next one. Neither re-attempts
 anything. Two conditions ignore the policy entirely and stop the whole cohort: an entry audit this
@@ -909,7 +917,9 @@ refuses to run beside that live child, and then — once it is gone — a resume
 interrupted entry to an ending on a second attempt, never touches the entry before it, and goes on
 to the entry after it; a journal edited after it was written; a manifest edited between runs; a
 journal key with no journal; the global ceiling stopping the cohort before the entry that would
-cross it, again confirmed by the absence of that entry's output; a reported provider write and an
+cross it, again confirmed by the absence of that entry's output, and stopping it because an entry
+that died without publishing an audit was charged the estimate it was admitted on rather than
+nothing; a reported provider write and an
 unreadable entry audit, each stopping the whole cohort regardless of policy; a subject that drifted
 between the manifest and the request, a request edited after the manifest sealed it, a rule bundle
 that changed under its declaration, and a toolkit checkout that moved — each refused with the entry

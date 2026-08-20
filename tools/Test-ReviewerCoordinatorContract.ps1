@@ -599,9 +599,15 @@ if ($cohortPresent.Count -eq $cohortSources.Count) {
         'The cohort admits a sealed request whose own output root is not fully qualified, so the child would publish its evidence somewhere the parent never looks.'
 
     # A completion is a claim about what a preparation consumed and did not write.
-    # A completion with no evidence behind it is not a cheap one.
-    Assert-Coordinator ($runnerText.Contains('RequireEvidencePresent')) `
+    # A completion with no evidence behind it is not a cheap one, and a preparation
+    # that ended some other way without evidence is not a free one either: the
+    # ceiling admitted it on an estimate, so the estimate is what it costs.
+    Assert-Coordinator ($runnerText.Contains('RequireEvidenceAccountedFor')) `
         'The cohort accepts a completed entry that published no audit, which the index would report as a preparation that ran and consumed nothing.'
+    Assert-Coordinator ($runnerText -match 'RequireEvidenceAccountedFor\(entry, outcome, summary\)') `
+        'The cohort decides whether an entry is accounted for somewhere other than on the summary it read, so the audit could vanish between the check and the reading.'
+    Assert-Coordinator ($runnerText -match 'AuditSha256, "none"[\s\S]{0,240}EstimatedModelStarts') `
+        'The cohort charges an entry that published no audit nothing at all, so a child that died mid-preparation funds the entries after it.'
 
     # A signed journal cannot be repaired by hand, so the writer may never commit
     # a record its own reader refuses: the only way out of that would be a fresh

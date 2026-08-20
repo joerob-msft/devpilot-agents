@@ -1033,6 +1033,41 @@ try {
     Assert-Cohort (-not (Test-Path -LiteralPath (Join-Path $f3.OutputRoot 'coordinator\audit.json'))) `
         'The entry past the ceiling produced evidence, so the ceiling was checked too late.'
 
+    # An entry that ran and left no readable audit did not thereby cost nothing;
+    # it cost an amount nobody can state. Charging it zero would let a run that
+    # consumed its whole share fund the entries after it, so it is charged what it
+    # was admitted on - its own sealed estimate. Here the first entry dies without
+    # publishing anything, and its estimate alone is enough to close the ceiling
+    # against the second.
+    $caseFq = Join-Path $sandboxRoot 'case-f-unaccounted'
+    $fq1 = New-CohortEntryRequest -Sandbox $caseFq -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
+    $fq2 = New-CohortEntryRequest -Sandbox $caseFq -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
+    $fq3 = New-CohortEntryRequest -Sandbox $caseFq -EntryId 'entry-three' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918275
+    # The first entry overruns its estimate honestly and says so. The second dies
+    # without publishing anything: charged zero it would leave room for the third,
+    # and charged what it was admitted on it does not.
+    [void](New-StubControl -Path $fq1.ControlPath -ExitCode 0 -Slot1ModelInvocationCount 2 -Slot2ModelInvocationCount 2)
+    [void](New-StubControl -Path $fq2.ControlPath -ExitCode -1073741819 -WriteAudit $false)
+    [void](New-StubControl -Path $fq3.ControlPath -ExitCode 0)
+    $manifestFq = New-CohortManifestFile -Path (Join-Path $caseFq 'cohort.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -MaxModelStarts 7 -StopPolicy 'continueOnTerminalFailure' `
+        -JournalRoot (Join-Path $caseFq 'journal') -IndexPath (Join-Path $caseFq 'index\cohort-index.json') `
+        -StubPath $stub -Entries @(
+        (New-CohortEntryDeclaration -Request $fq1 -Ordinal 1 -RuleBundlePath $ruleBundle -EstimatedModelStarts 2),
+        (New-CohortEntryDeclaration -Request $fq2 -Ordinal 2 -RuleBundlePath $ruleBundle -EstimatedModelStarts 2),
+        (New-CohortEntryDeclaration -Request $fq3 -Ordinal 3 -RuleBundlePath $ruleBundle -EstimatedModelStarts 2))
+    $runFq = Invoke-Cohort -ManifestPath $manifestFq
+    Assert-Cohort ($runFq.ExitCode -eq 10) `
+        "A cohort holding an entry with no audit exited $($runFq.ExitCode); expected 10, which means its estimate was charged rather than zero."
+    $recordFq2 = Get-CohortJournalEntry -JournalRoot (Join-Path $caseFq 'journal') -EntryId 'entry-two'
+    Assert-Cohort ($recordFq2.auditSha256 -eq 'none') 'The unaccounted entry recorded an audit digest it never published.'
+    Assert-Cohort ($recordFq2.modelStartCount -eq 0) 'The unaccounted entry recorded model starts it never reported.'
+    $recordFq3 = Get-CohortJournalEntry -JournalRoot (Join-Path $caseFq 'journal') -EntryId 'entry-three'
+    Assert-Cohort ($recordFq3.state -eq 'pending' -and $recordFq3.attempt -eq 0) `
+        'The entry after an unaccounted one was started, so the ceiling was funded by a run nobody can account for.'
+    Assert-Cohort (-not (Test-Path -LiteralPath (Join-Path $fq3.OutputRoot 'coordinator\audit.json'))) `
+        'The entry past the ceiling produced evidence.'
+
     # -----------------------------------------------------------------------
     Write-Host '14/22 an observed provider write blocks the whole cohort' -ForegroundColor Cyan
     $caseG = Join-Path $sandboxRoot 'case-g'

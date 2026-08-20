@@ -510,8 +510,8 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
         CohortEntrySummary summary;
         try
         {
-            RequireEvidencePresent(entry, outcome);
             summary = CohortSummaryReader.Read(entry, intended, elapsed, request.CorrelationId);
+            RequireEvidenceAccountedFor(entry, outcome, summary);
         }
         catch (Exception error) when (error is CohortBlockedException or IOException or UnauthorizedAccessException)
         {
@@ -771,8 +771,23 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
             {
                 continue;
             }
-            models += record.ModelStartCount;
-            verifiers += record.VerifierAssignmentCount;
+            // An entry that ran and left no readable audit did not thereby cost
+            // nothing; it cost an amount nobody can state. Charging it zero would
+            // let a run that consumed its whole share fund the entries after it,
+            // so it is charged what it was admitted on instead - its own sealed
+            // estimate, which is the most this cohort ever authorized it to spend.
+            // The elapsed seconds are the parent's own measurement and stand
+            // either way.
+            if (string.Equals(record.AuditSha256, "none", StringComparison.Ordinal))
+            {
+                models += declared.EstimatedModelStarts;
+                verifiers += declared.EstimatedVerifierAssignments;
+            }
+            else
+            {
+                models += record.ModelStartCount;
+                verifiers += record.VerifierAssignmentCount;
+            }
             seconds += record.ElapsedSeconds;
             started++;
         }
@@ -888,21 +903,27 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
     /// zero-write claim are computed from would all be absent, so this is refused
     /// rather than counted. A preparation that faulted before it could write
     /// anything is a different case and keeps its absence: nothing is being
-    /// claimed on its behalf.
+    /// claimed on its behalf, and what it may have consumed is charged at its
+    /// sealed estimate instead of at zero.
+    ///
+    /// This reads the summary rather than the file system so that there is one
+    /// decision and not two. A separate existence check before the read would be
+    /// answering a question the read then asks again, and an audit removed between
+    /// the two answers would pass the first and be summarized away by the second.
     /// </remarks>
-    private static void RequireEvidencePresent(CohortEntry entry, string outcome)
+    private static void RequireEvidenceAccountedFor(CohortEntry entry, string outcome, CohortEntrySummary summary)
     {
         if (!string.Equals(outcome, CohortEntryOutcomes.Complete, StringComparison.Ordinal))
         {
             return;
         }
-        var path = CohortSummaryReader.AuditPathFor(entry);
-        if (!File.Exists(path))
+        if (string.Equals(summary.AuditSha256, "none", StringComparison.Ordinal))
         {
             throw new CohortBlockedException(
-                $"Entry '{entry.EntryId}' reported a completed preparation and published no audit at '{path}'. " +
-                "A completion with no evidence behind it cannot be counted against this cohort's ceiling, and it cannot support " +
-                "the claim that nothing was written, so the cohort stops rather than indexing it as a preparation that cost nothing.");
+                $"Entry '{entry.EntryId}' reported a completed preparation and published no audit at " +
+                $"'{CohortSummaryReader.AuditPathFor(entry)}'. A completion with no evidence behind it cannot be counted against " +
+                "this cohort's ceiling, and it cannot support the claim that nothing was written, so the cohort stops rather than " +
+                "indexing it as a preparation that cost nothing.");
         }
     }
 
