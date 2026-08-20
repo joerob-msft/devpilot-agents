@@ -82,10 +82,12 @@ deterministic failures count toward the configured starvation threshold. That
 trade-off prevents an anomalous empty transport response from silently weakening
 the review.
 
-Paths are repository-relative. ADO `/src/a.cs`, Windows `\src\a.cs`, and
-`src/a.cs` normalize to `src/a.cs`. Drive, UNC, control, empty, absolute config,
-and `.`/`..` forms are rejected. Comparison is ordinal case-insensitive without
-Unicode normalization. Configured globs are ASCII and support:
+Globs are repository-relative. For matching only, ADO `/src/a.cs`, Windows
+`\src\a.cs`, and `src/a.cs` normalize to `src/a.cs`. The canonical anchored path
+remains `/src/a.cs` in routing evidence and downstream artifacts. Drive, UNC,
+control, empty, doubled-separator, and `.`/`..` forms are rejected. Comparison is
+ordinal case-insensitive without Unicode normalization. Configured globs are
+ASCII and support:
 
 | Form | Meaning |
 |---|---|
