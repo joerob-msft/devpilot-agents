@@ -8,12 +8,29 @@ back as part of the contract.
 
 `src/Agents/reviewer/StageContract.ps1` makes that boundary explicit and fails closed.
 
-> **Adoption status: none.** No production stage calls `Write-ReviewerStageArtifact` or
-> `Read-ReviewerStageArtifact` yet. This layer ships the contract, its schema, and its
-> enforcement tests so that the stages can be migrated onto it one at a time; until a stage
-> is migrated, nothing it writes is covered by anything described below. Migrating the
-> stages changes live coordinator behaviour and is deliberately out of scope for a
-> prerequisite change that runs no models.
+> **Adoption status: in-memory half in force, on-disk half not adopted.**
+> [`src/Agents/reviewer/StageProducers.ps1`](../src/Agents/reviewer/StageProducers.ps1)
+> registers a versioned contract kind for each of the twelve stages the coordinator runs —
+> capture, source, snapshot, corpus, blindResults, candidateUnion, fingerprints,
+> specialistPlan, verifierAssignment, verdict, reconciliation, deliveryDecision — and each
+> shipping producer validates its own output against its contract before any consumer or
+> any persistence sees it. Removing that call, assigning its verdict to `$null`, or never
+> reading the verdict back fails
+> [`tools/Test-ReviewerStageProducerContract.ps1`](../tools/Test-ReviewerStageProducerContract.ps1),
+> which reads the producer's syntax tree rather than its text.
+>
+> What is validated at those boundaries is the payload *shape* — the same registered kind,
+> the same required and unknown field policy, the same collection and map rules — held in
+> memory, not an envelope on disk.
+>
+> **Residual: the on-disk contract is not in force.** No coordinator stage writes or reads
+> one of these artifacts today, so no consumer has yet seen a `kind` or a `contractVersion`
+> come off disk. `Write-ReviewerStageArtifact` and `Read-ReviewerStageArtifact` are proven
+> across all twelve kinds by test — atomic publication, exact bytes, and the full fault
+> matrix — rather than exercised by a live run, and the escape ledger records this
+> prerequisite as not in force for exactly that reason. Migrating a stage onto on-disk
+> publication changes live coordinator behaviour and stays out of scope for a prerequisite
+> change that runs no models.
 
 
 > **Scope.** What this does *not* prove is stated in

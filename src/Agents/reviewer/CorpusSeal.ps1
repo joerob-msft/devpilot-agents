@@ -36,6 +36,21 @@
 
 Set-StrictMode -Version Latest
 
+# The twelve stage producer boundaries are declared in one shared file, so a
+# stage and the corpus that drives it can never exercise two different copies of
+# the same contract.
+#
+# The guard asks whether THIS script scope already holds the producer table, not
+# whether the commands are merely visible. A dot-sourced library resolves
+# $script: variables against the scope of whoever is running it, so a script that
+# can see an outer scope's functions but never loaded the libraries itself would
+# reach a registry that does not exist there - and it would only find out at the
+# first boundary call, which is exactly the call that must not fail for the wrong
+# reason.
+if (-not (Get-Variable -Name 'ReviewerStageProducerContracts' -Scope Script -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot 'StageProducers.ps1')
+}
+
 $script:ReviewerCorpusSealKind = "reviewer-offline-corpus-seal"
 $script:ReviewerCorpusSealRecipeKind = "reviewer-offline-corpus-seal-recipe"
 $script:ReviewerCorpusIndexKinds = @(
@@ -368,7 +383,13 @@ function Get-ReviewerCorpusSealSpanEvidence {
         }
         $byPath[$path] = @($spans.ToArray())
     }
-    return $byPath
+    # The snapshot stage boundary, in force. Both halves of the census are judged
+    # together: the path list (which files the reviewer will be shown) and the
+    # per-path span map (which lines of them). A path that survives with its span
+    # list collapsed to a scalar is the exact shape that shows one hunk of a file
+    # and calls the rest reviewed.
+    $asserted = New-ReviewerSnapshotStageContract -SpanPaths ([string[]]@($byPath.Keys)) -SpansByPath $byPath
+    return $asserted.spansByPath
 }
 
 function Assert-ReviewerCorpusSealOutputPaths {

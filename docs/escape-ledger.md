@@ -332,15 +332,29 @@ in CI. **In force** means production code actually goes through it today.
 
 | Prerequisite | Built | In force | Evidence |
 | --- | --- | --- | --- |
-| Cardinality and property corpus over the inventoried collection-bearing stage contracts | yes | no — 0 of 1652 producer-path cells; no stage is driven | `tools/testdata/reviewer-collection-inventory.v1.json` (236 fields, 12 stages), `tools/Test-ReviewerCollectionCardinality.ps1` (7 variants per field, 11 escape shapes, 9 sabotage checks), `tools/testdata/reviewer-collection-cardinality-matrix.v1.json` |
-| Versioned file contract for stage child outputs | yes | no — no stage writes or reads its artifacts through it yet | `src/Agents/reviewer/StageContract.ps1`, `src/Agents/reviewer/schemas/reviewer.stage-envelope.v1.json`, `tools/Test-ReviewerStageContract.ps1` |
+| Cardinality and property corpus over the inventoried collection-bearing stage contracts | yes | yes — 236 of 236 rows bound to a shipping producer contract, no gaps; 1120 of 1652 producer-path cells are cardinalities the shipping producer published and the boundary judged (1009 census-matched, 111 legitimately reshaped), 472 are boundary refusals of the two shapes a producer must never publish, and 60 are the capture residual | `tools/testdata/reviewer-collection-inventory.v1.json` (236 fields, 12 stages), `src/Agents/reviewer/StageProducers.ps1` (12 boundaries), `tools/Test-ReviewerCollectionCardinality.ps1` (7 variants per field, 11 escape shapes, 9 sabotage checks), `tools/testdata/reviewer-collection-cardinality-matrix.v1.json` |
+| Versioned file contract for stage child outputs | yes | partly — the in-memory half is in force (all 12 stage kinds registered in production code, each validated by its own producer before publication); the on-disk half is **not** in force, because no shipping path writes or reads a versioned envelope today | `src/Agents/reviewer/StageContract.ps1`, `src/Agents/reviewer/StageProducers.ps1`, `src/Agents/reviewer/schemas/reviewer.stage-envelope.v1.json`, `src/Agents/reviewer/schemas/reviewer.stage-producer-contracts.v1.json`, `tools/Test-ReviewerStageContract.ps1`, `tools/Test-ReviewerStageProducerContract.ps1` |
 | Boundary hardening analyzer with a blocking new-violation gate | yes | yes — every push is scanned and any new violation fails CI | `tools/Find-PowerShellEmptyNullHazard.ps1` (11 rules), `tools/Test-PowerShellBoundaryHardening.ps1`, `tools/testdata/powershell-boundary-baseline.v1.json` |
 | Escape ledger and budget with a registered trigger | yes | yes — authoritative Gate 5 integration snapshot, current-head staleness, recomputed counts, fired trigger | this document, `docs/escape-ledger.v2.json`, `tools/Test-EscapeLedger.ps1` |
 
-The corpus and file contract remain built but not adopted by every production stage; that is
-an implementation risk, not a reason to discard the authoritative integration result. The
-fired trigger makes the C# control-plane pivot mandatory while leaving the implementation
-work explicitly outstanding.
+The corpus is in force at all twelve stage producer boundaries, and it is scored on what
+those boundaries actually judged rather than on the fact that a validator returned. Every
+shipping producer validates its own output shape against its registered contract before any
+consumer sees it, every inventoried field is bound to that contract, and no cell is a gap.
+The residuals are recorded rather than rounded away. Of the 1652 producer-path cells, 1120
+are cardinalities the producing function published and the boundary judged; 472 are the
+null-vs-missing and wrong-scalar variants, whose evidence is refusal by name and which are
+therefore not counted as producer-published cardinalities; and 60 belong to the capture
+producer, which authenticates a sealed on-disk transcript package that only a live
+acquisition can mint. 230 of 236 rows are covered through their stage boundary rather than
+their own named call site, and 112 rows name a producer that nothing in `src/` calls today.
+
+The versioned file contract is a different story and is described as one. Its in-memory half
+is adopted; its on-disk half is not. No coordinator artifact is written through the atomic
+versioned writer or read back through the strict reader on any shipping path, so no consumer
+has yet seen a `kind` or a `contractVersion` on disk, and the entry stays not-in-force until
+one does. None of this changes the integration result: the fired trigger still makes the C#
+control-plane pivot mandatory, and the port itself remains explicitly outstanding.
 
 ## Adding an incident
 

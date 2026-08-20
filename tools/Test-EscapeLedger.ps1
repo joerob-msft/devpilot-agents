@@ -559,7 +559,135 @@ foreach ($prerequisite in @($ledger.decision.prerequisites)) {
     }
 }
 
-# The budget is only "in force" if something other than the ledger's own authors advances
+# --- 7a. Adoption proof coupling -----------------------------------------------------------
+# Two prerequisites can be flipped to in force by editing a boolean. That is exactly the
+# failure this ledger exists to prevent, so each one is coupled to a machine-readable
+# artifact that only a passing run can produce. The rule reads the artifact rather than the
+# claim, and is proven below to refuse a forged one.
+
+$producerContractSchemaPath = Join-Path $repoRoot 'src/Agents/reviewer/schemas/reviewer.stage-producer-contracts.v1.json'
+$producerAdoptionSuitePath = Join-Path $repoRoot 'tools/Test-ReviewerStageProducerContract.ps1'
+$producerTablePath = Join-Path $repoRoot 'src/Agents/reviewer/StageProducers.ps1'
+$cardinalityMatrixPath = Join-Path $repoRoot 'tools/testdata/reviewer-collection-cardinality-matrix.v1.json'
+$ciWorkflowPath = Join-Path $repoRoot '.github/workflows/ci.yml'
+$expectedStageBoundaries = 12
+
+function Test-CardinalityAdoptionProven {
+    <#
+        Returns $true when the recorded coverage matrix itself shows the corpus reaching
+        every inventoried row through a shipping producer contract. A matrix with an
+        unbound row, an uncovered producer cell, or fewer than the twelve declared stage
+        boundaries does not prove the claim, whatever the ledger says.
+    #>
+    param([Parameter(Mandatory)][AllowNull()]$Matrix)
+
+    if ($null -eq $Matrix) { return $false }
+    $names = @($Matrix.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($names -notcontains 'summary') { return $false }
+    $summaryNames = @($Matrix.summary.PSObject.Properties | ForEach-Object { $_.Name })
+    foreach ($required in @('producerPathCovered', 'producerPathCensusMatched', 'producerPathCensusReshaped',
+            'producerPathBoundaryRefusal', 'producerPathBoundaryOnly', 'producerPathGaps',
+            'producerBoundariesInForce', 'cellsPerDimension', 'fields', 'variants')) {
+        if ($summaryNames -notcontains $required) { return $false }
+    }
+    if ([int]$Matrix.summary.producerPathGaps -ne 0) { return $false }
+    if ([int]$Matrix.summary.producerPathCovered -le 0) { return $false }
+    if ([int]$Matrix.summary.producerBoundariesInForce -ne $expectedStageBoundaries) { return $false }
+
+    # The summary is not taken on trust. Recount every cell from the per-row statuses and
+    # require the totals to agree, so a matrix whose headline numbers were edited without
+    # the run that produced them cannot satisfy the claim.
+    $fields = @($Matrix.fields)
+    if ($fields.Count -ne [int]$Matrix.summary.fields) { return $false }
+    $variantNames = @($Matrix.variants)
+    if ($variantNames.Count -ne [int]$Matrix.summary.variants) { return $false }
+    if (($fields.Count * $variantNames.Count) -ne [int]$Matrix.summary.cellsPerDimension) { return $false }
+    $tally = @{ producerCensusMatched = 0; producerCensusReshaped = 0; boundaryRefusal = 0; boundaryOnly = 0 }
+    foreach ($field in $fields) {
+        $fieldNames = @($field.PSObject.Properties | ForEach-Object { $_.Name })
+        foreach ($required in @('producerContract', 'producerValidator', 'producerBuilder',
+                'producerFunction', 'producerPath')) {
+            if ($fieldNames -notcontains $required) { return $false }
+        }
+        if ([string]$field.producerContract -eq '' -or [string]$field.producerValidator -eq '' -or
+            [string]$field.producerBuilder -eq '' -or [string]$field.producerFunction -eq '') {
+            return $false
+        }
+        foreach ($variant in $variantNames) {
+            $status = [string]$field.producerPath.$variant
+            if (-not $tally.ContainsKey($status)) { return $false }
+            $tally[$status]++
+        }
+    }
+    if ($tally['producerCensusMatched'] -ne [int]$Matrix.summary.producerPathCensusMatched) { return $false }
+    if ($tally['producerCensusReshaped'] -ne [int]$Matrix.summary.producerPathCensusReshaped) { return $false }
+    if ($tally['boundaryRefusal'] -ne [int]$Matrix.summary.producerPathBoundaryRefusal) { return $false }
+    if ($tally['boundaryOnly'] -ne [int]$Matrix.summary.producerPathBoundaryOnly) { return $false }
+    if (($tally['producerCensusMatched'] + $tally['producerCensusReshaped']) -ne
+        [int]$Matrix.summary.producerPathCovered) {
+        return $false
+    }
+    return $true
+}
+
+$cardinalityMatrix = $null
+if (Test-Path -LiteralPath $cardinalityMatrixPath) {
+    $cardinalityMatrix = Get-Content -LiteralPath $cardinalityMatrixPath -Raw | ConvertFrom-Json -Depth 20
+}
+
+foreach ($prerequisite in @($ledger.decision.prerequisites)) {
+    if ([string]$prerequisite.id -eq 'cardinality-corpus' -and [bool]$prerequisite.inForce) {
+        Assert-Ledger (Test-CardinalityAdoptionProven -Matrix $cardinalityMatrix) `
+            'The cardinality corpus is declared in force, but the recorded coverage matrix does not show every inventoried row bound to a shipping producer contract with no producer-path gap across all twelve stage boundaries.'
+    }
+    if ([string]$prerequisite.id -eq 'file-contract' -and [bool]$prerequisite.inForce) {
+        Assert-Ledger (Test-Path -LiteralPath $producerTablePath) `
+            'The file contract is declared in force without src/Agents/reviewer/StageProducers.ps1, which is what registers the stage kinds in production code.'
+        Assert-Ledger (Test-Path -LiteralPath $producerAdoptionSuitePath) `
+            'The file contract is declared in force without tools/Test-ReviewerStageProducerContract.ps1, which is what proves the producers call and consume it.'
+        Assert-Ledger (Test-Path -LiteralPath $producerContractSchemaPath) `
+            'The file contract is declared in force without the pinned stage producer contract schema.'
+        if (Test-Path -LiteralPath $producerContractSchemaPath) {
+            $producerSchema = Get-Content -LiteralPath $producerContractSchemaPath -Raw | ConvertFrom-Json -Depth 12
+            Assert-Ledger (@($producerSchema.boundaries).Count -eq $expectedStageBoundaries) `
+                "The pinned stage producer contract schema declares $(@($producerSchema.boundaries).Count) boundaries, not $expectedStageBoundaries."
+        }
+        Assert-Ledger ((Get-Content -LiteralPath $ciWorkflowPath -Raw) -match 'Test-ReviewerStageProducerContract\.ps1') `
+            'The file contract is declared in force but CI never runs the adoption suite that keeps it in force.'
+    }
+}
+
+# A rule that cannot fail is not a rule. Forge a matrix that reports the gaps the real one
+# does not, and require the coupling to refuse it.
+$forgedMatrix = Get-Content -LiteralPath $cardinalityMatrixPath -Raw | ConvertFrom-Json -Depth 20
+$forgedMatrix.summary.producerPathGaps = 1
+Assert-Ledger (-not (Test-CardinalityAdoptionProven -Matrix $forgedMatrix)) `
+    'The adoption coupling accepted a coverage matrix that still reports producer-path gaps.'
+$unboundMatrix = Get-Content -LiteralPath $cardinalityMatrixPath -Raw | ConvertFrom-Json -Depth 20
+$unboundMatrix.fields[0].producerContract = ''
+Assert-Ledger (-not (Test-CardinalityAdoptionProven -Matrix $unboundMatrix)) `
+    'The adoption coupling accepted a coverage matrix with a row bound to no producer contract.'
+$shrunkMatrix = Get-Content -LiteralPath $cardinalityMatrixPath -Raw | ConvertFrom-Json -Depth 20
+$shrunkMatrix.summary.producerBoundariesInForce = 11
+Assert-Ledger (-not (Test-CardinalityAdoptionProven -Matrix $shrunkMatrix)) `
+    'The adoption coupling accepted a coverage matrix that drove fewer than the twelve declared stage boundaries.'
+# The headline totals are the easiest thing to inflate, so a matrix whose summary no longer
+# agrees with its own per-cell statuses has to be refused.
+$inflatedMatrix = Get-Content -LiteralPath $cardinalityMatrixPath -Raw | ConvertFrom-Json -Depth 20
+$inflatedMatrix.summary.producerPathCensusMatched = [int]$inflatedMatrix.summary.producerPathCensusMatched + 1
+Assert-Ledger (-not (Test-CardinalityAdoptionProven -Matrix $inflatedMatrix)) `
+    'The adoption coupling accepted a coverage matrix whose census-matched total exceeds the cells it actually records.'
+$relabelledMatrix = Get-Content -LiteralPath $cardinalityMatrixPath -Raw | ConvertFrom-Json -Depth 20
+$relabelledMatrix.fields[0].producerPath.nullVsMissing = 'producerCensusMatched'
+Assert-Ledger (-not (Test-CardinalityAdoptionProven -Matrix $relabelledMatrix)) `
+    'The adoption coupling accepted a coverage matrix that relabelled a boundary refusal as a producer-published census.'
+$unbuiltMatrix = Get-Content -LiteralPath $cardinalityMatrixPath -Raw | ConvertFrom-Json -Depth 20
+$unbuiltMatrix.fields[0].producerBuilder = ''
+Assert-Ledger (-not (Test-CardinalityAdoptionProven -Matrix $unbuiltMatrix)) `
+    'The adoption coupling accepted a coverage matrix with a row bound to no producer builder.'
+Assert-Ledger (Test-CardinalityAdoptionProven -Matrix $cardinalityMatrix) `
+    'The adoption coupling rejects the coverage matrix this repository actually records, so it can never be satisfied.'
+
 # its clock. coordinatorChangesObserved moves only when an incident carries a higher
 # ordinal, so an incident-free coordinator change - the common case - does not move it, and
 # evaluatedOn tracks the newest incident rather than the present. A clock with that
