@@ -2,6 +2,10 @@
 
 Set-StrictMode -Version Latest
 
+if (-not (Get-Command Test-ReviewerConventionGlobMatch -CommandType Function -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "ConventionPacks.ps1")
+}
+
 $script:ReviewerFactSchemaVersion = 1
 $script:ReviewerFactPlanVersion = 1
 $script:ReviewerFactExtractorVersion = "review-facts-v1"
@@ -398,11 +402,7 @@ function Get-ReviewerMetadataFacts {
 
 function Test-ReviewerFactPathPattern {
     param([string]$Path, [string]$Pattern)
-    $normalizedPath = $Path.TrimStart("/", "\").Replace("\", "/")
-    $normalizedPattern = $Pattern.Replace("\", "/")
-    $escaped = [regex]::Escape($normalizedPattern)
-    $escaped = $escaped.Replace('\*\*/', '(?:.*/)?').Replace('\*\*', '.*').Replace('\*', '[^/]*').Replace('\?', '[^/]')
-    return [regex]::IsMatch($normalizedPath, "^" + $escaped + "$", [Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+    return Test-ReviewerConventionGlobMatch -Glob $Pattern -Path $Path
 }
 
 function ConvertFrom-ReviewerFactCloudTestManifest {
@@ -759,11 +759,18 @@ function Get-ReviewerFanOutFacts {
     $facts = [System.Collections.Generic.List[object]]::new()
     $identifierRecords = [System.Collections.Generic.List[object]]::new()
     foreach ($file in $files) {
-        $path = ([string](Get-ReviewerFactValue $file "Path" "")).TrimStart("/", "\").Replace("\", "/")
+        $path = [string](Get-ReviewerFactValue $file "Path" "")
+        $relativePath = ConvertTo-ReviewerConventionRelativePath -Path $path -Where "fan-out changed path '$path'"
         $content = [string](Get-ReviewerFactValue $file "Content" "")
         $contentSha256 = Get-ReviewerFactSha256 -Text $content
         foreach ($record in @(Get-ReviewerFactIdentifiers -File $file)) {
-            $entry = [pscustomobject]@{ Path = $path; Identifier = $record.Identifier; Line = $record.Line; Field = $record.Field }
+            $entry = [pscustomobject]@{
+                Path = $path
+                RelativePath = $relativePath
+                Identifier = $record.Identifier
+                Line = $record.Line
+                Field = $record.Field
+            }
             [void]$identifierRecords.Add($entry)
             $identifierHash = Get-ReviewerFactSha256 -Text $record.Identifier
             $identifierObservation = Get-ReviewerFactBoundedObservation -Text $record.Identifier `
@@ -792,8 +799,8 @@ function Get-ReviewerFanOutFacts {
         }
     }
     foreach ($entry in $identifierRecords) {
-        $directory = [IO.Path]::GetDirectoryName($entry.Path)
-        $namespace = $(if ($null -eq $directory) { "" } else { $directory.Replace("\", "/").TrimStart("/") })
+        $directory = [IO.Path]::GetDirectoryName($entry.RelativePath)
+        $namespace = $(if ($null -eq $directory) { "" } else { $directory.Replace("\", "/") })
         $surfaceNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         foreach ($rule in @($Policy.companionRules)) {
             $identifierPattern = [string](Get-ReviewerFactValue $rule "identifierPattern" "")

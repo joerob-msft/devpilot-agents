@@ -15,14 +15,14 @@
   "pullRequestId": 42,
   "sourceCommit": "cccccccccccccccccccccccccccccccccccccccc",
   "targetCommit": "dddddddddddddddddddddddddddddddddddddddd",
-  "changeSetDigest": "3f535a9e5766874ccbbb324fab39131581cac5a1e12ee1743fc8c7762c28ba8e",
+  "changeSetDigest": "a667fab393296e66a0e27f84b61c432ef08f062e91699be4e1babea5b4d3acb3",
   "selectedPacks": [
     {
       "name": "selected-pack",
       "priority": 100,
       "matchedPaths": [
         {
-          "path": "SRC/Api/Handler.cs",
+          "path": "/SRC/Api/Handler.cs",
           "role": "current",
           "changeTypes": [
             "edit"
@@ -50,7 +50,7 @@
       ],
       "contentBytes": 7,
       "provenanceBytes": 449,
-      "routingEvidenceBytes": 112,
+      "routingEvidenceBytes": 113,
       "contextBytes": 456,
       "maxBytes": 456,
       "status": "selected",
