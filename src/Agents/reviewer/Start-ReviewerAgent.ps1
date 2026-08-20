@@ -11768,20 +11768,16 @@ function Invoke-ReviewerCrossVerificationPass {
     $orderedGroupKeys = [System.Collections.Generic.List[string]]::new()
     foreach ($groupKey in $groups.Keys) { [void]$orderedGroupKeys.Add([string]$groupKey) }
     $orderedGroupKeys.Sort([StringComparer]::Ordinal)
-    # Deterministic 2N preflight: prove the WHOLE required verifier ASSIGNMENT set
-    # fits the declared run and time budget BEFORE launching a single model. The
-    # unit is assignments - every candidate once by GPT and once by Opus - not the
-    # grouped invocations they happen to be batched into, because grouping is an
-    # implementation detail and budgeting it would make the reservation a promise
-    # about batching rather than about the work. Either every required assignment
-    # can launch or none does: no partial launch that would cross-check some
-    # candidates and silently degrade the rest when the phase clock expires
-    # mid-loop.
+    # Deterministic preflight proves the WHOLE plan fits before launching a model.
+    # The exact 2N assignment count enforces complete GPT-and-Opus coverage and the
+    # assignment hard cap. Time admission uses the actual serial invocation count:
+    # each (cluster, verifier) group is one process with one timeout, even when it
+    # covers multiple assignments. Either every group launches or none does.
     #
     # The plan is also the ONLY source of the per-invocation timeout and of the
     # absolute phase deadline: the phase (less a reserved overhead slice for
     # setup, fresh binding, reconciliation and artifact writes) is divided among
-    # the required assignments, and each admitted group is handed exactly the
+    # the serial invocations, and each admitted group is handed exactly the
     # share the preflight reserved, so admission and invocation cannot disagree
     # about how long a run may take.
     $budgetPreflight = Assert-ReviewerVerificationBudgetPreflight `
@@ -11793,20 +11789,34 @@ function Invoke-ReviewerCrossVerificationPass {
         -ElapsedSeconds $verificationPhaseStopwatch.Elapsed.TotalSeconds
     $admittedRunTimeoutSeconds = [int]$budgetPreflight.perInvocationTimeoutSeconds
     $verificationPhaseDeadlineSeconds = [int]$budgetPreflight.phaseDeadlineSeconds
-    if (-not [bool]$budgetPreflight.canLaunch) {
+    if ([bool]$budgetPreflight.canLaunch) {
+        # Keep admitted-path telemetry deterministic: elapsed-derived values vary
+        # with setup and I/O timing and would destabilize replay artifact hashes.
+        Write-ReviewerCycleMetadata -Fields @{
+            cycle = $CycleNumber; mode = "verification-budget-preflight"; prId = $prId
+            sourceCommit = $sourceCommit; result = "admitted"; reason = ""
+            budgetPlanVersion = [int]$budgetPreflight.budgetPlanVersion
+            requiredAssignmentCount = [int]$budgetPreflight.requiredAssignmentCount
+            invocationCount = [int]$budgetPreflight.invocationCount
+            effectiveMaxAssignments = [int]$budgetPreflight.effectiveMaxAssignments
+            reservedOverheadSeconds = [int]$budgetPreflight.reservedOverheadSeconds
+            minInvocationSeconds = [int]$budgetPreflight.minInvocationSeconds
+        }
+    }
+    else {
         Write-ReviewerCycleMetadata -Fields @{
             cycle = $CycleNumber; mode = "verification-budget-preflight"; prId = $prId
             sourceCommit = $sourceCommit; result = "degraded"; reason = [string]$budgetPreflight.reason
+            budgetPlanVersion = [int]$budgetPreflight.budgetPlanVersion
             requiredAssignmentCount = [int]$budgetPreflight.requiredAssignmentCount
             invocationCount = [int]$budgetPreflight.invocationCount
             effectiveMaxAssignments = [int]$budgetPreflight.effectiveMaxAssignments
             requiredSeconds = [int]$budgetPreflight.requiredSeconds
             remainingSeconds = [int]$budgetPreflight.remainingSeconds
             reservedOverheadSeconds = [int]$budgetPreflight.reservedOverheadSeconds
-            perAssignmentTimeoutSeconds = [int]$budgetPreflight.perAssignmentTimeoutSeconds
             perInvocationTimeoutSeconds = [int]$budgetPreflight.perInvocationTimeoutSeconds
-            minAssignmentSeconds = [int]$budgetPreflight.minAssignmentSeconds
-            maxSupportedAssignmentCount = [int]$budgetPreflight.maxSupportedAssignmentCount
+            minInvocationSeconds = [int]$budgetPreflight.minInvocationSeconds
+            maxSupportedInvocationCount = [int]$budgetPreflight.maxSupportedInvocationCount
         }
         # No launch: mark every planned assignment degraded up front.
         foreach ($key in $orderedGroupKeys) {
@@ -11836,8 +11846,8 @@ function Invoke-ReviewerCrossVerificationPass {
         $clusterId = [string]$groupAssignments[0].clusterId
         $verifierModel = [string]$groupAssignments[0].verifierModel
         # No mid-loop budget re-check. The deterministic preflight above already
-        # proved the WHOLE admitted set fits the run and time budget by dividing
-        # the remaining phase among the required runs, so every admitted group
+        # proved the WHOLE admitted set fits the assignment cap and time budget by
+        # dividing the remaining phase among the serial invocations, so every group
         # launches with the exact share the preflight reserved for it. Re-checking
         # the phase clock here is what re-opened the partial-launch window: a run
         # that consumed most of its bound could strand a later planned group even

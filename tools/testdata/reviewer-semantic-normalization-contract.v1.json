@@ -3,7 +3,7 @@
   "kind": "reviewer-semantic-decision-normalization-contract",
   "excludedKeyPatterns": [
     "(?i)(?:run|session|attempt|assignment)Id$|nonce(?:Sha256)?$",
-    "(?i)(timestamp|^(?:at|(?:child)?processId|pid)$|(?:created|updated|started|ended|generated|captured|frozen|recorded)At|timeUtc|atUtc|epochSeconds|duration(?:Ms|Seconds)?|elapsed(?:Ms|Seconds)?)$",
+    "(?i)(timestamp|^(?:at|(?:child)?processId|pid|remainingSeconds|phaseRemainingSeconds|availableSeconds|maxSupportedInvocationCount)$|(?:created|updated|started|ended|generated|captured|frozen|recorded)At|timeUtc|atUtc|epochSeconds|duration(?:Ms|Seconds)?|elapsed(?:Ms|Seconds)?)$",
     "(?i)(hmac|signature|signingKey|keyMaterial|secretKey)$"
   ],
   "setArrayPaths": [
