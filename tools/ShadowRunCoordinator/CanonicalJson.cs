@@ -84,6 +84,9 @@ internal abstract class Node
     /// <summary>The string this node carries, or null when it is not a string.</summary>
     internal virtual string? AsText => null;
 
+    /// <summary>The integer this node carries, or null when it is not a number.</summary>
+    internal virtual long? AsInteger => null;
+
     private sealed class TextNode(string value) : Node
     {
         internal override string? AsText => value;
@@ -94,6 +97,8 @@ internal abstract class Node
 
     private sealed class NumberNode(long value) : Node
     {
+        internal override long? AsInteger => value;
+
         internal override void Write(StringBuilder builder, bool canonical, int indent) =>
             builder.Append(value.ToString(CultureInfo.InvariantCulture));
     }
@@ -155,6 +160,9 @@ internal sealed class MapNode : Node
 
     /// <summary>The string stored under a name, or null when it is absent or not a string.</summary>
     internal string? GetText(string name) => Get(name)?.AsText;
+
+    /// <summary>The integer stored under a name, or null when it is absent or not a number.</summary>
+    internal long? GetInteger(string name) => Get(name)?.AsInteger;
 
     internal override void Write(StringBuilder builder, bool canonical, int indent)
     {

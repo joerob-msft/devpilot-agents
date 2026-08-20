@@ -178,7 +178,19 @@ Write-Host "coordinator-contract: $($csharpFiles.Count) C# source file(s) in tre
 $stageKinds = [string[]]@($liveRows | ForEach-Object { [string]$_.Kind })
 $forbiddenCoordinatorTokens = [string[]]@(
     'systemPrompt', 'SystemPrompt', 'PromptTemplate', 'ChatCompletion', 'temperature',
-    'HttpClient', 'AcceptCandidate', 'CorrectSeverity', 'DecideVerdict', 'RenderPrompt'
+    'HttpClient', 'AcceptCandidate', 'CorrectSeverity', 'DecideVerdict', 'RenderPrompt',
+    # The machinery of judging a supervised run's OUTPUT. A coordinator that
+    # supervises a slot sees findings, candidates, severities and verdicts go
+    # past; the rule is that it may carry none of the code that forms an opinion
+    # about any of them.
+    'RejectCandidate', 'ScoreCandidate', 'RankCandidate', 'AssignSeverity', 'SeverityOf',
+    'ComputeVerdict', 'VerdictOf', 'ModelClient', 'InvokeModel', 'CallModel', 'Completions',
+    'OpenAI', 'Anthropic',
+    # Delivery. Slice two supervises a preview-only run and writes to no provider,
+    # so the names a provider write would need are forbidden outright rather than
+    # left to review.
+    'PostComment', 'CreateComment', 'PublishComment', 'WriteComment', 'CreateThread',
+    'UpdatePullRequest', 'http://', 'https://'
 )
 foreach ($file in $csharpFiles) {
     $text = [IO.File]::ReadAllText($file.FullName)
@@ -195,6 +207,25 @@ foreach ($file in $csharpFiles) {
         Assert-Coordinator (-not $text.Contains($token)) `
             "'$($file.Name)' mentions '$token'; a coordinator sequences stages and must not carry prompt or verdict logic."
     }
+}
+
+# ---------------------------------------------------------------------------
+# Where a supervised slot's budget is allowed to come from.
+# ---------------------------------------------------------------------------
+# A request that could name its own slot deadlines could give itself an
+# unbounded run by writing a larger number in a file it also authored. The
+# budgets therefore come from the signed qualification plan, and the ONE number
+# the request contributes is the supervision grace. Asserted structurally rather
+# than left to review, because the difference between the two is a single field.
+$requestContract = Join-Path $repoRoot 'tools\ShadowRunCoordinator\CoordinatorRequest.cs'
+if (Test-Path -LiteralPath $requestContract -PathType Leaf) {
+    $requestText = [IO.File]::ReadAllText($requestContract)
+    foreach ($budget in @('slotTimeoutSeconds', 'progressTimeoutSeconds', 'perCallTimeoutSeconds')) {
+        Assert-Coordinator (-not $requestText.Contains($budget)) `
+            "The typed request contract reads '$budget'; a supervised slot's budget must come from the signed plan, not from the request."
+    }
+    Assert-Coordinator ($requestText.Contains('supervisionGraceSeconds')) `
+        'The typed request contract no longer carries the supervision grace, which is the one budget a caller may set.'
 }
 
 # The rule above can only bite on files it can see. If the port ever lands

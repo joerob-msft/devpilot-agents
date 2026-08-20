@@ -4,11 +4,21 @@ using System.Text.Json;
 
 namespace DevPilot.ShadowRunCoordinator;
 
-/// <summary>The transitions this slice owns, in the only order they may occur.</summary>
+/// <summary>The transitions this coordinator owns, in the only order they may occur.</summary>
 /// <remarks>
-/// No slot and no model appear here on purpose. This slice prepares a run set and
-/// stops at the point where a run could be launched; launching is a later change
-/// and cannot be reached by mistake from this enumeration.
+/// Two slices live here. The first prepares a run set and stops at
+/// <see cref="RunSetReady"/>. The second supervises exactly ONE slot from there,
+/// and stops at a terminal.
+///
+/// No model, no candidate, no severity and no verdict appears in this
+/// enumeration, and neither does a second slot, a reconciliation or a delivery.
+/// What cannot be named here cannot be reached by mistake.
+///
+/// The last rank has three members rather than one. A supervised run ends
+/// verified, failed or timed out, and those are three different durable facts
+/// about the same transition - not three points on a line. They are therefore
+/// siblings at one rank, and the machine walks ranks rather than enum values;
+/// see <see cref="PreparationStateNames.RankOf"/>.
 /// </remarks>
 internal enum PreparationState
 {
@@ -21,27 +31,54 @@ internal enum PreparationState
     SnapshotVerified = 6,
     RunSetDeclared = 7,
     RunSetVerified = 8,
-    RunSetReady = 9
+    RunSetReady = 9,
+    Slot1Authorized = 10,
+    Slot1Launching = 11,
+    Slot1Running = 12,
+    Slot1TerminalObserved = 13,
+    Slot1TerminalVerified = 14,
+    Slot1TerminalFailed = 15,
+    Slot1TerminalTimedOut = 16
 }
 
 internal static class PreparationStateNames
 {
-    private static readonly (PreparationState State, string Name)[] Pairs =
+    /// <summary>The rank every terminal outcome shares, and the last rank there is.</summary>
+    internal const int TerminalRank = 14;
+
+    /// <summary>The last rank the preparation slice reaches on its own.</summary>
+    internal const int PreparationRank = 9;
+
+    private static readonly (PreparationState State, string Name, int Rank)[] Pairs =
     [
-        (PreparationState.Start, "start"),
-        (PreparationState.RequestValidated, "requestValidated"),
-        (PreparationState.CorpusValidated, "corpusValidated"),
-        (PreparationState.RecipePlanned, "recipePlanned"),
-        (PreparationState.SnapshotValidateOnly, "snapshotValidateOnly"),
-        (PreparationState.SnapshotSealed, "snapshotSealed"),
-        (PreparationState.SnapshotVerified, "snapshotVerified"),
-        (PreparationState.RunSetDeclared, "runSetDeclared"),
-        (PreparationState.RunSetVerified, "runSetVerified"),
-        (PreparationState.RunSetReady, "runSetReady")
+        (PreparationState.Start, "start", 0),
+        (PreparationState.RequestValidated, "requestValidated", 1),
+        (PreparationState.CorpusValidated, "corpusValidated", 2),
+        (PreparationState.RecipePlanned, "recipePlanned", 3),
+        (PreparationState.SnapshotValidateOnly, "snapshotValidateOnly", 4),
+        (PreparationState.SnapshotSealed, "snapshotSealed", 5),
+        (PreparationState.SnapshotVerified, "snapshotVerified", 6),
+        (PreparationState.RunSetDeclared, "runSetDeclared", 7),
+        (PreparationState.RunSetVerified, "runSetVerified", 8),
+        (PreparationState.RunSetReady, "runSetReady", PreparationRank),
+        (PreparationState.Slot1Authorized, "slot1Authorized", 10),
+        (PreparationState.Slot1Launching, "slot1Launching", 11),
+        (PreparationState.Slot1Running, "slot1Running", 12),
+        (PreparationState.Slot1TerminalObserved, "slot1TerminalObserved", 13),
+        (PreparationState.Slot1TerminalVerified, "slot1TerminalVerified", TerminalRank),
+        (PreparationState.Slot1TerminalFailed, "slot1TerminalFailed", TerminalRank),
+        (PreparationState.Slot1TerminalTimedOut, "slot1TerminalTimedOut", TerminalRank)
     ];
 
     internal static string ToName(PreparationState state) =>
         Pairs.First(pair => pair.State == state).Name;
+
+    internal static int RankOf(PreparationState state) =>
+        Pairs.First(pair => pair.State == state).Rank;
+
+    /// <summary>True when a state is one of the three ways a supervised slot ends.</summary>
+    internal static bool IsTerminalOutcome(PreparationState state) =>
+        RankOf(state) == TerminalRank;
 
     internal static PreparationState Parse(string name)
     {
@@ -55,8 +92,37 @@ internal static class PreparationStateNames
         throw new ContractException($"'{name}' is not a state this coordinator knows.");
     }
 
-    internal static IReadOnlyList<PreparationState> Ordered =>
-        Pairs.Where(pair => pair.State != PreparationState.Start).Select(pair => pair.State).ToList();
+    /// <summary>
+    /// The ranks the machine walks, in order. Rank is what advances; which of the
+    /// three terminal states rank 14 commits is decided by observed evidence, not
+    /// by position in a list.
+    /// </summary>
+    internal static IReadOnlyList<int> Ranks =>
+        Enumerable.Range(1, TerminalRank).ToList();
+
+    /// <summary>
+    /// The single state at a rank. Refused for the terminal rank on purpose: no
+    /// caller may pick one of three outcomes by position, because the outcome is
+    /// something the supervised run reports rather than something the walk knows.
+    /// </summary>
+    internal static PreparationState StateAtRank(int rank)
+    {
+        if (rank == TerminalRank)
+        {
+            throw new ContractException("The terminal rank holds three outcomes; which one is committed is decided by the evidence, not by rank.");
+        }
+        foreach (var pair in Pairs)
+        {
+            if (pair.Rank == rank)
+            {
+                return pair.State;
+            }
+        }
+        throw new ContractException($"Rank {rank.ToString(CultureInfo.InvariantCulture)} is not a transition this coordinator performs.");
+    }
+
+    /// <summary>True when a state belongs to the supervised slot lifecycle.</summary>
+    internal static bool IsSlotState(PreparationState state) => RankOf(state) > PreparationRank;
 }
 
 internal sealed record TransitionRecord(
@@ -297,13 +363,33 @@ internal sealed class CoordinatorState
     }
 
     /// <summary>
+    /// The committed evidence for a rank, whichever state at that rank was
+    /// recorded. The terminal rank has three members, so a reader that has to ask
+    /// "what did the run end on" cannot name the state it is looking for.
+    /// </summary>
+    internal MapNode? EvidenceAtRank(int rank)
+    {
+        foreach (var transition in _transitions)
+        {
+            if (PreparationStateNames.RankOf(transition.State) == rank)
+            {
+                return transition.Evidence;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
     /// Commits one transition. The state file on disk is replaced before this
     /// returns, so the caller may be killed immediately afterwards and a resume
     /// will still see the transition as done.
     /// </summary>
     internal void Commit(CoordinatorRequest request, byte[] key, PreparationState next, MapNode evidence, string detail)
     {
-        if ((int)next != (int)State + 1)
+        // Rank, not enum value. The three terminal outcomes share a rank because
+        // they are three answers to one transition; comparing raw enum values here
+        // would make 'failed' look like a step that follows 'verified'.
+        if (PreparationStateNames.RankOf(next) != PreparationStateNames.RankOf(State) + 1)
         {
             throw new ContractException($"A transition to '{PreparationStateNames.ToName(next)}' from '{PreparationStateNames.ToName(State)}' skips a state; the machine only moves one step at a time.");
         }
@@ -390,6 +476,53 @@ internal sealed class CoordinatorState
         }
         preexisted = false;
         return RandomNumberGenerator.GetBytes(32);
+    }
+
+    /// <summary>
+    /// The slot child this output root's signed record says it left running, or
+    /// null when the record names none, cannot be verified, or does not exist.
+    /// </summary>
+    /// <remarks>
+    /// Read before the lease is taken, and therefore deliberately read-only: it
+    /// mints no key, writes nothing, and answers null for every root that has not
+    /// already committed a running slot under a key it holds. Its only use is to
+    /// tell the one child a resumed run is entitled to adopt from a child that
+    /// merely happens to be alive - and because the answer comes from the signed
+    /// record, a forged journal cannot manufacture that entitlement.
+    /// </remarks>
+    internal static (int ProcessId, string StartedAtUtc)? TryReadRecordedSlotChild(CoordinatorRequest request)
+    {
+        if (!File.Exists(request.StateKeyPath) || !File.Exists(request.StatePath))
+        {
+            return null;
+        }
+        CoordinatorState state;
+        try
+        {
+            state = LoadOrFresh(request, ReadKey(request), keyPreexisted: true);
+        }
+        catch (ContractException)
+        {
+            // An unverifiable record grants no entitlement. The run that follows
+            // will refuse on the same record with a message about the record,
+            // which is a better refusal than one about a live child.
+            return null;
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        var child = state.EvidenceFor(PreparationState.Slot1Running)?.Get("child") as MapNode;
+        if (child is null)
+        {
+            return null;
+        }
+        var startedAt = child.GetText("childStartedAtUtc");
+        if (startedAt is not { Length: > 0 } || child.GetInteger("childProcessId") is not { } processId)
+        {
+            return null;
+        }
+        return ((int)processId, startedAt);
     }
 
     /// <summary>

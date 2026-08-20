@@ -1,15 +1,24 @@
 # Shadow run coordinator
 
-`tools/ShadowRunCoordinator` is the first slice of the typed control plane the escape ledger's
+`tools/ShadowRunCoordinator` is the typed control plane the escape ledger's
 `typed-control-plane-pivot` decision registers. It is a dependency-free .NET 10 console
 application that carries one shadow preparation from a typed request to an immutable,
-signed `run-set-ready` state — and stops there.
+signed `run-set-ready` state, and — in its second slice, and only when the request explicitly
+authorizes it — supervises exactly **one** replay-qualification slot to a verified terminal.
 
-> **It launches no model and no slot, and it writes nothing outside its own output root.**
-> That is not a convention. The audit it emits records `modelInvocationCount` and
-> `slotLaunchCount`, the suite asserts both are zero, and there is no model client, provider
-> credential, HTTP type or prompt string anywhere in the project for one to be made from.
-> `tools/Test-ReviewerCoordinatorContract.ps1` fails the build if that stops being true.
+> **It writes nothing outside its own output root, and it makes no reviewer decision.**
+> The coordinator holds no prompt text, no model name, no candidate, no severity and no
+> verdict rule; there is no model client, provider credential or HTTP type anywhere in the
+> project for one to be made from. `tools/Test-ReviewerCoordinatorContract.ps1` fails the
+> build if that stops being true.
+>
+> By default it also launches nothing: the target state is `runSetReady`, `slotLaunchCount`
+> is zero, and the suite asserts it. A request that carries no `slot` section, or one that
+> sets `shadowSlotEnabled` to `false`, cannot reach a slot state at all. When a slot *is*
+> authorized, the process it starts is the already-reviewed PowerShell qualification runner,
+> which is what invokes models. The coordinator supervises that process — it does not read
+> its findings. Model attempts reach the audit only as `slotModelInvocationCount`, an opaque
+> passthrough of what the reviewed verifier read out of the owner's terminal artifact.
 
 ## What it is for
 
@@ -31,8 +40,10 @@ flowchart LR
     C -->|versioned request file| A[Invoke-ShadowCoordinatorChild.ps1]
     A --> T1[Save-CorpusReplaySeal.ps1]
     A --> T2[run-set declaration<br/>preflight and status tools]
+    A --> T3[Invoke-ReviewerReplayQualification.ps1<br/>-Mode RunSlot]
     T1 --> RF[versioned result file]
     T2 --> RF
+    T3 --> RF
     RF --> C
     C --> S[(durable state<br/>+ audit)]
 ```
@@ -44,19 +55,28 @@ result to stdout and writes nothing to its result path has failed.
 
 One child at a time, always. A second child requested while one is in flight is a refusal, not
 a queue — concurrency here would mean two writers on one output root, which is the thing the
-lease exists to prevent.
+lease exists to prevent. The supervised slot is the same seam with a longer wait: the same
+single child, the same request and result files, watched under the plan's own deadlines instead
+of a fixed step timeout.
 
 ## The state machine
 
 ```
 requestValidated -> corpusValidated -> recipePlanned -> snapshotValidateOnly
     -> snapshotSealed -> snapshotVerified -> runSetDeclared -> runSetVerified -> runSetReady
+    -> slot1Authorized -> slot1Launching -> slot1Running -> slot1TerminalObserved
+    -> slot1TerminalVerified | slot1TerminalFailed | slot1TerminalTimedOut
 ```
 
 There is no other order and no way to skip. Each transition appends a record to a durable
 state file under a monotonic sequence, and the file is replaced atomically. Restarting the
 coordinator at any point re-reads that file, recognises the transitions already recorded, and
 resumes at the next one — it does not re-run a child whose transition is already committed.
+
+The three terminal states are siblings, not a sequence: they share one rank, and they are the
+three things a finished slot can be. `--target slot1TerminalVerified` therefore reaches any of
+them; the exit code, not the target, says which. Everything from `slot1Authorized` on happens
+only when the request turns the slot on, so the default path still stops at `runSetReady`.
 
 Each transition record carries the evidence it was committed on and a digest over that
 evidence. The audit is built from those records rather than from anything the process
@@ -66,6 +86,67 @@ rather than a hope.
 
 `--halt-after <state>` stops deliberately after a named transition and exits 9. It exists so
 the suite can stop the process at every single transition and start it again.
+
+## The supervised slot
+
+The slot slice adds no reviewer logic. What runs the slot is
+`tools/Invoke-ReviewerReplayQualification.ps1 -Mode RunSlot`, unchanged, reached through the same
+one-step-one-file child contract every other transition uses. What the coordinator adds is
+authorization, a durable identity for the child, and supervision.
+
+**`slot1Authorized`** is the only state that decides anything. The launch-authorization token
+named by the request is compared against the token the run set published beside its declaration —
+by digest, and the refusal names neither, so a wrong token is not an oracle. Then the reviewed
+`New-ReviewerReplayQualificationPlan` rebuilds the plan under that token's hash, the reviewed
+assertions bind it to the signed declaration, and the resulting plan digest, set ID, slot name and
+deadlines are committed. From here on the coordinator compares against what it committed, never
+against what a later child says.
+
+The deadlines are the *plan's*, not the request's. Hard and activity budgets are the plan's slot
+and progress timeouts; the per-call bound is read back out of the slot's sealed argument vector,
+which the plan digest covers. The request contributes exactly one number,
+`supervisionGraceSeconds` (30–3600), which is how long the supervisor waits past a plan deadline
+before it stops the child itself. A plan whose per-call or activity bound exceeds its hard bound
+is refused rather than clamped.
+
+**`slot1Launching`** re-probes eligibility immediately before the irreversible step, through a
+separate `slotPrelaunch` child whose previous result is deleted first. Adoption is right for work
+that must not repeat and wrong for a probe, so the probe does not share the plan step's result
+file. If an attempt record or terminal artifact has appeared since authorization, the single-use
+launch has already been spent and the run refuses rather than starting a second one.
+
+**`slot1Running`** is committed *before* the wait, carrying the child's process ID, its process
+start time, the digest of the child request and the attempt number. This ordering is the whole
+point: a coordinator killed during an hour-long slot must be able to name what it left behind.
+A process whose start time cannot be read is half-identified, and half an identity is none: it
+could not be told apart from whatever the operating system later gives that process ID to. Such a
+child is stopped at launch and the run fails, rather than being supervised or left unowned.
+
+**`slot1TerminalObserved`** is the wait. A resumed run adopts the child its own signed
+`slot1Running` record names — matched on process ID *and* start time — instead of launching
+another. Both halves must be present and equal; an unreadable start time on either side is never
+a match, so an unrelated process that inherited the ID is neither waited on nor killed. The
+lease's live-child refusal makes an exception for exactly that identity, derived from
+the signed record rather than from the forgeable journal, and for nothing else. When a deadline
+expires the child's whole process tree is stopped, output is drained with a bound, and the run
+reports the kill rather than reading whatever the corpse left. Stopping a tree is best effort by
+construction — a descendant that was already exiting cannot be killed again — so a partial kill
+never becomes the run's error. What settles the outcome is the bounded wait and the artifact the
+child did or did not write, and the journal entry is always cleared either way.
+
+**`slot1TerminalVerified`** hands the terminal artifact back to the reviewed verifier and to the
+reviewed inventory census, then checks what came back against the committed record: the artifact's
+kind and version, its slot, its set ID, its plan digest, that it is read-only, that its status and
+its timeout flag do not contradict each other, that exactly one attempt record exists, and that its
+digest is the one this run observed. `complete` commits `slot1TerminalVerified` and exits 0;
+`failed` and `timedOut` commit `slot1TerminalFailed` or `slot1TerminalTimedOut` and exit 5. Those
+are outcomes, not errors: a qualification slot that fails is *supposed* to exit non-zero.
+
+Everything inside the terminal artifact — findings, verdicts, severities, candidate text, model
+names, attempt counts — is opaque. The coordinator indexes it, digests it and refuses on its
+shape; it never reads it for meaning. `tools/Test-ReviewerCoordinatorContract.ps1` enforces that
+mechanically: the C# sources may not mention prompts, models, severities, candidates, verdicts or
+provider writes at all.
 
 ## Refusals
 
@@ -140,8 +221,30 @@ holder. Nothing reads a command line to decide whether a process is alive. A lea
 cannot be alive is treated as abandoned rather than as a permanent conflict, so a crash cannot
 wedge an output root for ever.
 
+A supervised slot is refused when:
+
+* the request turns the slot on but names no launch-authorization token, or names one that is
+  not the token the published run set carries,
+* the qualification plan the reviewed builder produces under that token does not bind to the
+  signed declaration,
+* an attempt record or terminal artifact already exists at authorization or reappears between
+  authorization and launch — the launch is single-use, and a second one is not a wasted run but
+  an unrecoverable one,
+* the plan's own deadlines are inconsistent: a hard bound of zero, or a per-call or activity
+  bound larger than the hard bound,
+* the child was stopped by this coordinator on a plan deadline. The run reports the kill; it does
+  not summarise a run it ended itself,
+* the child exited leaving no result, or a result that is absent, malformed, wrongly correlated
+  or wrongly digested,
+* the terminal artifact is missing, writable, of the wrong kind or version, for another slot,
+  for another run set, sealed under another plan digest, self-contradictory about its timeout, or
+  accompanied by anything other than exactly one attempt record,
+* the terminal artifact's digest is not the one this run observed before it committed
+  `slot1TerminalObserved`. The artifact is written read-only by its owner, so a changed digest is
+  a tamper rather than a race.
+
 Exit codes: `0` ok, `1` usage, `2` request contract, `3` lease conflict, `4` child failure,
-`9` deliberate halt.
+`5` a slot that finished failed or timed out, `9` deliberate halt.
 
 ## Stage artifacts
 
@@ -157,12 +260,18 @@ reach its terminal state without the files.
 ## Rollback
 
 The PowerShell preparation path is unchanged and remains the default; nothing routes to the
-coordinator unless a caller runs it. `tools/Test-ShadowRunCoordinator.ps1` runs the same
-request down both paths and compares the twelve published artifacts byte for byte.
+coordinator unless a caller runs it, and nothing runs a slot unless that caller also turns the
+slot on in the request and hands over the run set's own launch-authorization token.
+`tools/Test-ShadowRunCoordinator.ps1` runs the same request down both paths and compares the
+twelve published artifacts byte for byte.
 
 Read that for what it is. It proves the two paths *publish* the same stage artifacts; it does
 not prove anything about reviewer decisions, because neither path makes one. There is no
 reviewer judgement in this slice to differ.
+
+Rolling back the slot slice is deleting the `slot` section from the request. The reviewed
+`RunSlot` path is reached through the same arguments it has always been reached through, so
+running it directly is the rollback, not a fallback that has to be built.
 
 ## The pre-commit window
 
@@ -209,6 +318,22 @@ run stopped short of readiness and never observed them, because `[int]$null` is 
 PowerShell and an unobserved run would otherwise read as a clean zero; `invariantCountsObserved`
 says which of the two an audit is.
 
+The slot's own fields are separate from the readiness census, and the distinction matters:
+`slotLaunchCount` and `modelInvocationCount` are what the reviewed verifier saw *at
+run-set-ready*, when by definition nothing has run yet, so both are zero on a healthy run.
+`slotAttemptCount`, `slotModelInvocationCount`, `slotTerminalStatus`, `slotTerminalExitCode`,
+`slotTerminalTimedOut` and `slotTerminalSha256` are the census taken after the slot finished.
+The model count is a passthrough: the coordinator neither produces it nor interprets it, and
+publishes it exactly as the reviewed inventory reported it. The slot fields are omitted entirely
+when no slot was authorized, for the same reason the readiness census is — a zeroed slot block
+would read like a slot that ran and did nothing.
+
+`slotSupervision` reports how the wait ended, and only what this coordinator can actually know:
+the disposition, the child's exit code, whether the supervisor stopped it, the recorded identity,
+the observed span, and whether the observation crossed a restart. `deliveryMode` is always
+`previewOnly` and `providerWriteCount` is always `0`, because this slice has no delivery path to
+write with.
+
 ## Tests
 
 `tools/Test-ShadowRunCoordinator.ps1` (CI, offline, no model) covers: an offline restore and
@@ -229,6 +354,31 @@ anything and which must therefore still be usable, alongside the wiped-record re
 guard exists for; a recipe rewritten between validation and the seal; a still-live recorded child
 refusing the next run and then releasing it once that child exits; and a final check that no
 child process and no repository modification survived the run.
+
+For the supervised slot it adds: an authorization built by the production plan builder against
+the real signed declaration, with no stand-in anywhere, refused for a missing token and for a
+token that is not the published one; a halt and a resume at every one of the four slot states,
+with the sequence and the attempt census checked after each, so a resume that relaunched would
+fail; a coordinator killed while its slot child is genuinely still running, and a second run that
+adopts that exact child rather than starting another; a spent authorization consumed behind the
+coordinator's back; the three terminal endings; and the slot fault matrix — a slot that exits
+non-zero with no terminal, a slot that exits zero with no terminal, one that never stops and is
+stopped by the plan's own deadline, one whose terminal names another slot, another run set or a
+contradictory timeout, one whose terminal is left writable, one that wrote two attempt records,
+and terminal evidence rewritten between the observation and the verification.
+
+One thing in the slot tests is stood in for, and it is worth naming: the slot's own execution. A
+real slot runs the reviewer, and the reviewer calls models, which CI cannot do. So every slot
+scenario still reaches `run-set-ready` through the reviewed adapter against a genuinely sealed
+corpus and a genuinely signed declaration, and the authorization scenario builds its plan with the
+production builder and the production assertions — but the `RunSlot` invocation itself is replaced
+by a child that writes the artifacts a slot writes and never invokes a model. What that leaves
+unexercised in CI is the reviewed runner, which is reviewed and tested elsewhere; what it exercises
+is the lifecycle, which is the only thing this slice adds.
+
+`tools/Test-ReviewerCoordinatorContract.ps1` is the architecture boundary: it asserts that the
+coordinator sources contain no prompt, model, severity, candidate or verdict vocabulary and no
+provider write path, so "no reviewer judgement in C#" is checked rather than promised.
 
 The canonical key order that makes any of this reproducible is covered in
 `tools/Test-ReviewerStageContract.ps1`, which asserts the same bytes under `en-US`, `da-DK`,

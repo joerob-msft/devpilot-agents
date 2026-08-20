@@ -161,6 +161,42 @@ function New-ShadowCoordinatorRequestFile {
     return [string]([IO.Path]::GetFullPath($Path))
 }
 
+function Publish-ShadowCoordinatorLaunchToken {
+    <#
+    .SYNOPSIS
+        Moves the declaration's published launch-authorization token to the
+        operator-held path the request names.
+
+    .DESCRIPTION
+        Deliberately a copy of the PUBLISHED token rather than a fresh 64-hex
+        string: the slot step compares what the request presents against what the
+        run set published, and a fixture that minted its own value would test the
+        comparison against a constant instead of against the declaration.
+
+    .PARAMETER Corrupt
+        Write a well-formed but different token, for the refusal path.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RunSetDirectory,
+        [Parameter(Mandatory)][string]$TokenPath,
+        [switch]$Corrupt
+    )
+    $published = Join-Path $RunSetDirectory 'launch-authorization.token'
+    if (-not (Test-Path -LiteralPath $published -PathType Leaf)) {
+        throw "The run set under '$RunSetDirectory' published no launch-authorization token to hand over."
+    }
+    $token = ([IO.File]::ReadAllText($published)).Trim()
+    if ($Corrupt) {
+        $bytes = [byte[]]::new(32)
+        [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+        $token = ([BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
+    }
+    [void](New-Item -ItemType Directory -Force -Path (Split-Path $TokenPath -Parent))
+    [IO.File]::WriteAllBytes($TokenPath, ([Text.UTF8Encoding]::new($false)).GetBytes($token))
+    return [string]([IO.Path]::GetFullPath($TokenPath))
+}
+
 function New-ShadowCoordinatorFixture {
     <#
     .SYNOPSIS
@@ -176,7 +212,9 @@ function New-ShadowCoordinatorFixture {
         [Parameter(Mandatory)][string]$Sandbox,
         [Parameter(Mandatory)][string]$ToolkitRoot,
         [string]$CorrelationId = ('shadow-' + [Guid]::NewGuid().ToString('N').Substring(0, 12)),
-        [ValidateRange(1, 14400)][int]$ChildTimeoutSeconds = 900
+        [ValidateRange(1, 14400)][int]$ChildTimeoutSeconds = 900,
+        [switch]$ShadowSlotEnabled,
+        [ValidateRange(30, 3600)][int]$SupervisionGraceSeconds = 60
     )
 
     [void](New-Item -ItemType Directory -Force -Path $Sandbox)
@@ -220,6 +258,12 @@ function New-ShadowCoordinatorFixture {
     [IO.File]::WriteAllBytes($changedPathsPath,
         ([Text.UTF8Encoding]::new($false)).GetBytes($changedPathsText))
 
+    # Named, not created. The declaration mints this token; an operator moves it
+    # here out of band. Creating it now would let a slot launch on a token no
+    # declaration ever published, which is the exact authorization the one-shot
+    # lease exists to make impossible.
+    $launchTokenPath = Join-Path $Sandbox 'inputs\launch-authorization.token'
+
     $request = @{
         contractVersion = 'devpilot.shadow-run-coordinator.request.v1'
         kind = 'shadow-run-preparation'
@@ -256,6 +300,20 @@ function New-ShadowCoordinatorFixture {
             plannedRunCount = 2
             runSetKeyPath = [string]([IO.Path]::GetFullPath($keyPath))
         }
+        # The slot authorization is a SEPARATE section from the qualification one
+        # on purpose. Preparation is authorized by the request; starting a run is
+        # authorized by an operator who also holds the single-use token, and the
+        # token file named here does not exist yet - it is minted by the
+        # declaration this request has not made. A fixture that pre-created it
+        # would be describing a run set nobody declared.
+        slot = @{
+            shadowSlotEnabled = $ShadowSlotEnabled.IsPresent
+            name = 'slot1'
+            reviewerScriptPath = [string]([IO.Path]::GetFullPath(
+                    (Join-Path $build.ToolkitCopy 'src\Agents\reviewer\Start-ReviewerAgent.ps1')))
+            launchAuthorizationTokenPath = [string]([IO.Path]::GetFullPath($launchTokenPath))
+            supervisionGraceSeconds = $SupervisionGraceSeconds
+        }
     }
 
     $requestPath = New-ShadowCoordinatorRequestFile -Path (Join-Path $Sandbox 'inputs\request.json') -Request $request
@@ -273,6 +331,10 @@ function New-ShadowCoordinatorFixture {
         SnapshotName = $corpus.SnapshotName
         ConfigPath = [string]([IO.Path]::GetFullPath($configPath))
         RunSetKeyPath = [string]([IO.Path]::GetFullPath($keyPath))
+        LaunchTokenPath = [string]([IO.Path]::GetFullPath($launchTokenPath))
+        RunSetDirectory = [string]([IO.Path]::GetFullPath(
+                (Join-Path $request.output.root 'qualification\runset')))
+        ReviewerScriptPath = [string]$request.slot.reviewerScriptPath
         OutputRoot = [string]$request.output.root
         CorrelationId = $CorrelationId
         RequestPath = $requestPath
