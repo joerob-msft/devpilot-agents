@@ -1,8 +1,11 @@
 # Escape ledger and budget
 
-An *escape* is a defect that got past review and into a merged coordinator change. This
-ledger records every escape since Gate 0, classifies it, and states the budget whose breach
-makes the conditional typed control-plane pivot mandatory rather than optional.
+An *escape* is a defect that got past review and into a merged coordinator change. An
+*integration incident* is a defect observed in an authorized Gate 5 lineage whose private
+source is represented only by a public-safe evidence digest. This ledger preserves every
+historical escape and near miss from version 1, records the post-snapshot integration
+incidents separately, and states the budget whose breach makes the typed control-plane pivot
+mandatory.
 
 A defect that was introduced and caught inside the same unmerged change is a **near miss**,
 not an escape, and is recorded separately in `nearMisses`. That separation is load-bearing
@@ -33,9 +36,8 @@ later commit on the same day silently changed the expected baseline and false-fa
 honestly filed near misses. A rule whose verdict on unchanged data moves when unrelated history
 is appended is not an anchor, so the derivation was removed. The ledger is instead treated as
 what it is — a frozen snapshot of a closed window — and `classifiedAgainstCommit` must equal the
-coverage window's own pinned `endCommit`. The baseline is then not chosen at all, and advancing
-the window authors a *new* snapshot in which the near misses are re-judged, rather than editing
-this one in place. `detectedOn` is bounded in turn: it may not precede the day of the finding's
+version 1 snapshot's pinned `endCommit`. Version 2 advances the operational window without
+rewriting that historical classification. `detectedOn` is bounded in turn: it may not precede the day of the finding's
 own introducing commit, since a defect cannot be detected before the change that introduced it
 exists. Moving a merged incident into `nearMisses` to drop it out of the type-binding total
 therefore fails on ancestry rather than on prose, the rule is probed in both directions against
@@ -49,12 +51,14 @@ integrated revision before detection. A squash or cherry-pick lands the same def
 different hash, a non-squash merge of a branch that both introduced and fixed a defect makes
 each commit reachable, and a defect on an operational side branch is reachable from neither.
 So an ancestry failure proves a misfiling, while an ancestry pass leaves the classification
-resting on the recorded rationale. `introducedCommit` is required on both lists precisely so
-that a finding cannot leave the check by omitting a field, but its *value* is not tied to the
-defect it names — so a merged escape can still be reclassified out of the budget by moving it
-into `nearMisses` and rewriting `introducedCommit` to a branch commit unreachable from the frozen
-baseline, which moves `typeBinding`, `openDebt` and `inWindow` together on one falsified field.
-[`hardening-limitations.md`](hardening-limitations.md) carries these as named residuals.
+resting on the recorded rationale. `introducedCommit` remains required on both historical lists. Version 2 additionally pins
+every historical ID, list membership, category, execution stage, and introducing commit in
+`classificationBaseline`, which is digest-bound to the version 1 snapshot. Moving an escape
+to `nearMisses` or rewriting its introducing commit now fails a visible baseline validation
+and two sabotage cases. CI reads the retained, frozen v1 artifact,
+recomputes its SHA-256 over the LF-normalized file, and requires it to equal
+`previousSnapshot.ledgerSha256`; the digest is therefore an independently checked historical
+anchor rather than a literal repeated only inside version 2.
 
 `category` is the field with the most leverage over the pivot decision, because the trigger
 counts type-binding escapes. It cannot be derived — what a defect was is a judgement — so the
@@ -67,31 +71,28 @@ that category. The converse matters because the forward rule alone left the *inf
 open: the one escape the anchor cannot reach had a free category, so `typeBinding` could be
 walked up by a single field. Escaping the anchor is a visible edit rather than a blocked one:
 the set of findings whose detector implies nothing must equal the ledger's declared
-`categoryAnchorExceptions`, and each entry pins the category the escape is filed under. An
-author who rewrites a detector to name nothing recognised, moves the category to one the budget
-does not count, and declares the exception with a rationale still passes, and the count still
-falls by one — what the rule buys is that this is three coordinated edits in a reviewed list
-rather than one silent field. Both fields are still authored, so this is an internal
-consistency constraint, not corroboration by independent evidence. It is reported as `categoryDetectorConsistent` — 11 ofthe twelve escapes; `ESC-0011` was found by review of a guard and has no detector to anchor to
-— and that count is **not** offered as assurance evidence. Detector family does not establish
-root cause.
+`categoryAnchorExceptions`, and each entry pins the category the escape is filed under.
+Declared exceptions are first-class data: each pins the finding's category, is validated
+against exactly one finding, is reported in the machine-readable counts, and remains eligible
+for the budget when the finding says it is. This is still an internal consistency constraint,
+not independent proof of root cause.
 
 Escapes are counted on one axis and runtime exposure on another. A *containment escape* is a
 defect that entered a merged coordinator change; a *runtime exposure finding* is one that
-reached shadow or live execution, whether or not it ever merged. Only the first is budget
-evidence, but the second is what the typed-host decision most wants to read, so the near-miss
+reached shadow or live execution, whether or not it ever merged. Historical near misses are
+not budget evidence; explicitly eligible integration incidents are. Runtime exposure is what
+the typed-host decision most wants to read, so the near-miss
 schema deliberately does **not** pin `reachedShadowOrLive` closed. Pinning it would make the
 taxonomy unable to represent a pre-merge live failure at all, which is a way of not counting
-it. The two counts stand at **12 containment escapes and 0 runtime-exposed findings across 0
-runs**. The zero is a denominator, not an achievement, so the gate publishes it as a
-structure — `findingCount`, a per-category breakdown, `shadowRuns`, `liveRuns`, and
-`observationStatus: noRuns` — rather than as a bare zero a reader could mistake for
-containment. The per-category split matters because a live `external` or `logic` finding is
-not the same evidence for a typed host as a live `typeBinding` one.
+it. The counts now stand at **12 historical containment escapes, 2 historical near misses, and
+6 post-snapshot integration incidents**. All six integration incidents reached a Gate 5
+shadow or live-input preparation lineage; one lineage reached real discovery. Four are
+budget-eligible type-binding incidents, while two private recipe/finalizer failures are
+recorded as budget-ineligible logic/tooling evidence.
 
-The machine-readable ledger is [`escape-ledger.v1.json`](escape-ledger.v1.json), validated
+The machine-readable ledger is [`escape-ledger.v2.json`](escape-ledger.v2.json), validated
 against
-[`reviewer.escape-ledger.v1.json`](../src/Agents/reviewer/schemas/reviewer.escape-ledger.v1.json)
+[`reviewer.escape-ledger.v2.json`](../src/Agents/reviewer/schemas/reviewer.escape-ledger.v2.json)
 by `tools/Test-EscapeLedger.ps1`. That check is not a schema check alone: it recomputes
 every published count from the incident list, re-evaluates the trigger, and proves with
 sabotaged copies of the ledger that a qualifying escape would actually fire it.
@@ -130,11 +131,12 @@ Every incident carries a category and the furthest execution stage it reached.
 | Execution stage | Meaning |
 | --- | --- |
 | `deterministic` | Reached only paths that run with no model and no external writes: unit and structural tests, replay, dry runs. |
-| `shadow` | Reached a run that invoked models against real inputs but discarded the output. |
+| `shadow` | Reached an authorized no-delivery integration lineage, including preparation; model use is reported separately by the run counts and evidence. |
 | `live` | Reached a run whose output was delivered outside the repository. |
 
-Incidents are identified by this repository's own public commit hashes. No external review
-identifiers, work-item numbers, programme code names, or addresses appear in the ledger, and
+Historical incidents are identified by public repository commits; integration incidents use
+public-safe evidence digests. No external review identifiers, work-item numbers, programme
+code names, private paths, or addresses appear in the ledger, and
 `tools/Test-EscapeLedger.ps1` fails if any are introduced.
 
 ## Current incidents
@@ -154,10 +156,28 @@ identifiers, work-item numbers, programme code names, or addresses appear in the
 | `ESC-0011` | supervision | deterministic | remediated | Empty-aggregate guard accepted a same-block dominance loophole |
 | `ESC-0012` | typeBinding | deterministic | openDebt | Latent protected-return wrapping sites present in current code |
 
-Six of the twelve are type-binding. None reached shadow or live execution, because no shadow
-or live coordinator run has ever been performed. That is a statement about exposure, not
-about containment: the budget stands at zero because the denominator is zero, which is why
-the exposure obligation below exists.
+The historical table is unchanged from the digest-bound version 1 snapshot.
+
+Version 2 makes the Gate 5 integration meaning of `shadow` explicit: entry into an authorized
+no-delivery lineage, including its preparation and finalization phases, is exposure for this
+budget even when models were not launched. This is not a claim of model execution. The sealed
+snapshot reports model runs independently, and the four qualifying incidents are the
+type-binding failures in that lineage rather than the two tooling/logic failures.
+
+### Post-snapshot Gate 5 integration incidents
+
+| ID | Category | Phase | Budget eligible | Title |
+| --- | --- | --- | --- | --- |
+| `INT-0001` | typeBinding | live-capture preparation | yes | Dynamic source wrapper lost required identity bindings |
+| `INT-0002` | typeBinding | shadow post-discovery | yes | Empty discovered-fingerprint set collapsed to null |
+| `INT-0003` | typeBinding | shadow preparation | yes | Private configuration arrays collapsed during shadow preparation |
+| `INT-0004` | typeBinding | shadow preparation | yes | Empty exact-key difference collapsed before Count |
+| `INT-0005` | logic | shadow preparation | no | Private snapshot recipe used non-contract identity keys |
+| `INT-0006` | logic | snapshot finalization | no | Private snapshot finalizer depended on an unavailable helper |
+
+The private recipe and finalizer failures remain visible without inflating the type-binding
+count. Evidence is referenced only by sealed artifact or coordinator evidence SHA-256; no
+private review identifier, path, or code identifier is published.
 
 `ESC-0012` is open debt by design. The rule introduced for `ESC-0002` found eleven further
 sites in current source and test code with the same nesting hazard. Every site is
@@ -194,9 +214,10 @@ number of entries — the production invocations the real ledger requires plus t
 control invocations — is asserted. Each call is also written inside the assertion it feeds, so
 neutering the assertion removes the call rather than orphaning it and leaving the count intact.
 Deleting or neutering any of the seven production call sites now fails a check that no control
-can supply. What this does not stop is a deliberate edit that keeps the call and throws its
-verdict away; that residual is named in
-[`hardening-limitations.md`](hardening-limitations.md).
+can supply. The gate now parses its own AST and requires every shared validator call to sit inside the
+verdict argument of `Assert-Ledger`; a sabotage copy adds `-or $true` and must be rejected.
+This closes the known silent verdict-discard form without pretending the test script is
+tamper-proof against coordinated edits to its own trust root.
 
 ## Near misses
 
@@ -247,21 +268,14 @@ rather than passing silently.
 > typed control-plane pivot stops being optional and is scheduled as the next coordinator
 > change.
 
-**Read the state below as a dated snapshot, not as a live reading.** The window clock is
-hand-maintained — `coordinatorChangesObserved` advances only when an incident carries a
-higher ordinal, so an incident-free coordinator change does not move it. The machine-readable
-budget says so in its own `operationalStatus: historicalSnapshot` and `asOfCommit` fields, so
-a parser cannot pick up the counts without the caveat attached, and the gate refuses to let
-the prerequisite be declared in force while the clock's authority is authored ordinals. For the
-same reason the window's staleness bound is reported rather than enforced: `commitsBehindHead`
-records how far the pinned window end sits behind `HEAD`, but exceeding `staleAfterCommits` only
-fails the gate once the prerequisite is in force. Enforcing it against a frozen snapshot would
-fail on every later unrelated commit and teach the reader to raise the bound instead of
-re-judging the data.
+Version 2 is an **authoritative, in-force Gate 5 integration snapshot** at the current head.
+The version 1 historical snapshot remains pinned by its SHA-256. The integration snapshot
+binds cohort size, completed decisions, decision yield, unauthorized writes, qualifying
+incident IDs, and the complete set of public-safe evidence digests. The gate requires its
+`asOfCommit` to equal both the budget and coverage-window head and enforces the staleness
+bound while the prerequisite is in force.
 
-Current state, as of the coverage window's end commit: **0 qualifying escapes, trigger not
-fired.** That is because no shadow or live run has ever been performed, not because escapes
-were contained.
+Current state: **4 qualifying type-binding integration incidents; trigger fired.**
 
 The threshold is pre-registered for a reason: fixing it now, before any run exists to read,
 is what stops it being moved after results are seen. The window is computed, not asserted.
@@ -274,16 +288,7 @@ that required both windows to agree could be waited out twice over — by going 
 no new changes age nothing out of the ordinal window, and by shipping quickly, since many
 changes push incidents out of the ordinal window while they are still days old. A sabotage
 case proves that an incident outside both windows stops counting.
-the ordinal of the merged coordinator change it was detected under, and
-`tools/Test-EscapeLedger.ps1` recomputes the in-window set from those two facts against the
-ledger's evaluation date. The combinator is deliberately **either**: an incident counts if
-it falls inside the last ten coordinator changes *or* inside the last sixty days. A trigger
-that required both windows to agree could be waited out twice over — by going quiet, since
-no new changes age nothing out of the ordinal window, and by shipping quickly, since many
-changes push incidents out of the ordinal window while they are still days old. A sabotage
-case proves that an incident outside both windows stops counting.
-
-The trigger deliberately counts only escapes that reach shadow or live. Deterministic
+The trigger deliberately counts only budget-eligible incidents that reach shadow or live. Deterministic
 escapes were caught by the machinery in this repository *after* they had merged, which is
 evidence of later detection rather than of prevention; escapes that survive into a run with
 real inputs are evidence that it does not.
@@ -301,27 +306,25 @@ drop out of the count.
 
 ## Gate 5 observation
 
-Gate 5 produced **no deliverable decision — a decision yield of zero per cent**. Every
-candidate was withheld or reconciled away. The **no-write invariant held**: the run performed
-zero writes outside the repository.
+The initial two-item Gate 5 cohort produced **0 completed decisions — a decision yield of
+zero per cent**. One lineage reached real discovery and failed on the empty fingerprint
+binding; the other stopped during snapshot finalization. No finding was accepted or
+delivered. **Unauthorized writes and total external writes were both zero.**
 
-Both facts are recorded in the ledger and asserted by the check. Neither is evidence for or
-against the pivot, and the earlier framing that read them as opposing arguments was wrong:
-decision yield and escape rate answer different questions. Zero yield says the current
-control plane has not yet demonstrated end-to-end value. Zero external writes says nothing
-about containment quality, because **zero shadow and zero live runs have ever been
-performed** — an escape rate measured over no exposure is abstention, not a result.
+These facts are recorded in both the observation and authoritative integration snapshot and
+are recomputed by the gate. Zero yield and zero writes do not erase the four qualifying
+boundary incidents; those incidents are what fire the pre-registered trigger.
 
-The ledger therefore records an explicit **exposure obligation**: the conditional decision
-is due for re-evaluation only after ten shadow runs have actually been performed, by the
-twentieth merged coordinator change. Until then the observed escape rate carries no weight
-in either direction, and the check asserts the recorded shadow-run count against the gate
-observations so the obligation cannot be quietly declared satisfied.
+The ledger retains the explicit **exposure obligation** from version 1: ten shadow runs by
+the twentieth merged coordinator change. The fired trigger no longer waits on that obligation,
+but the shortfall remains visible as an implementation-quality requirement and the check
+prevents it being quietly declared satisfied.
 
 ## Decision status
 
-The typed control-plane pivot is recorded as **conditional**. It is *not* taken in this
-change: this change contains no compiled coordinator and runs no models.
+The conditional decision's prerequisites are satisfied and the trigger is **fired**. The
+decision to move the stage control plane to a typed, compiled C# host is therefore recorded
+as **taken**. The port itself is **not implemented or complete** by this ledger change.
 
 Each prerequisite is scored on two separate axes, because an artifact that exists is not the
 same as a boundary that is protected. **Built** means the artifact and its gate exist and run
@@ -332,21 +335,18 @@ in CI. **In force** means production code actually goes through it today.
 | Cardinality and property corpus over the inventoried collection-bearing stage contracts | yes | no — 0 of 1652 producer-path cells; no stage is driven | `tools/testdata/reviewer-collection-inventory.v1.json` (236 fields, 12 stages), `tools/Test-ReviewerCollectionCardinality.ps1` (7 variants per field, 11 escape shapes, 9 sabotage checks), `tools/testdata/reviewer-collection-cardinality-matrix.v1.json` |
 | Versioned file contract for stage child outputs | yes | no — no stage writes or reads its artifacts through it yet | `src/Agents/reviewer/StageContract.ps1`, `src/Agents/reviewer/schemas/reviewer.stage-envelope.v1.json`, `tools/Test-ReviewerStageContract.ps1` |
 | Boundary hardening analyzer with a blocking new-violation gate | yes | yes — every push is scanned and any new violation fails CI | `tools/Find-PowerShellEmptyNullHazard.ps1` (11 rules), `tools/Test-PowerShellBoundaryHardening.ps1`, `tools/testdata/powershell-boundary-baseline.v1.json` |
-| Escape ledger and budget with a registered trigger | yes | no — counts, window, and trigger are recomputed and enforced in CI, but the window clock is hand-maintained, so the trigger cannot be read as current | this document, `docs/escape-ledger.v1.json`, `tools/Test-EscapeLedger.ps1` |
+| Escape ledger and budget with a registered trigger | yes | yes — authoritative Gate 5 integration snapshot, current-head staleness, recomputed counts, fired trigger | this document, `docs/escape-ledger.v2.json`, `tools/Test-EscapeLedger.ps1` |
 
-Three of the four are inert today. That is the honest reading: this layer makes escapes of
-the *recognized shapes* detectable and makes the existing ones counted, and only the
-analyzer currently acts on live code. It does not yet protect a running stage boundary, and
-the budget cannot be read as current until its clock has an authority outside this file.
-
-The pivot becomes mandatory if the budget triggers. It may be reconsidered earlier if these
-prerequisites fail to detect a new type-binding escape class — that failure would itself be
-an incident here.
+The corpus and file contract remain built but not adopted by every production stage; that is
+an implementation risk, not a reason to discard the authoritative integration result. The
+fired trigger makes the C# control-plane pivot mandatory while leaving the implementation
+work explicitly outstanding.
 
 ## Adding an incident
 
-1. Append an entry to `incidents` in `docs/escape-ledger.v1.json` with the next sequential
-   `ESC-nnnn` identifier. Identifiers must be contiguous; the check enforces it.
+1. Append a historical containment escape to `incidents`, or post-snapshot operational
+   evidence to `integrationIncidents`, in `docs/escape-ledger.v2.json`, using the next
+   contiguous identifier.
 2. Set `executionStage` honestly. `reachedShadowOrLive` must agree with it — the check
    enforces that too.
 3. Set `detectedOn` and `coordinatorChangeOrdinal`. These are what the rolling window is

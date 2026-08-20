@@ -157,7 +157,7 @@ the consuming side, and six are test-harness assertions whose own assertions pin
 That leaves eight in the baseline — two in production code and six in test harnesses. The
 analyzer's own fixture corpus is excluded from the repository scan by name and is not part
 of that count. The per-site adjudication is recorded in
-[`escape-ledger.v1.json`](escape-ledger.v1.json) under `ESC-0012`, not summarised away here.
+[`escape-ledger.v2.json`](escape-ledger.v2.json) under `ESC-0012`, not summarised away here.
 
 `PSEN004` at zero is the point of the gate. The rule was written from an escape that had
 already merged; keeping its baseline empty means no *new instance the analyzer recognises*

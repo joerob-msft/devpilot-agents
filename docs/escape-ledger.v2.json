@@ -1,0 +1,685 @@
+{
+  "schemaVersion": 2,
+  "kind": "reviewer-escape-ledger",
+  "ledgerVersion": 2,
+  "description": "Employer-neutral record of historical containment escapes and post-snapshot Gate 5 integration incidents, the budget that governs the typed control-plane decision, and the sealed evidence digests that activate it. No external identifiers, programme code names, private paths, or private review references appear here.",
+  "previousSnapshot": {
+    "schemaVersion": 1,
+    "asOfCommit": "74e476a",
+    "artifactCommit": "5a8f106",
+    "artifactPath": "docs/escape-ledger.v1.json",
+    "ledgerSha256": "531bd43c8ef23b4d704b97b899f1f056bc5a2ee6d9cbfa5324e23c8707bb3b1b"
+  },
+  "coverageWindow": {
+    "startGate": "Gate 0",
+    "startCommit": "ac2c592",
+    "endCommit": "5a8f106",
+    "notes": "Gate 0 is the first coordinator-authored change merged into this repository. Version 1 remains digest-bound above as the frozen historical snapshot. Version 2 advances the window to the current integration head and adds the authoritative, post-snapshot Gate 5 evidence at coordinator ordinal 11.",
+    "coordinatorChangesObserved": 11,
+    "coordinatorChangesObservedRule": "The authoritative Gate 5 integration snapshot supplies ordinal 11; CI requires it to equal the highest ordinal across historical and integration incidents.",
+    "evaluatedOnRule": "Derived from endCommit and required to equal the newest historical or integration incident detectedOn.",
+    "staleAfterCommitsBehindHead": 40,
+    "evaluatedOn": "2026-08-18"
+  },
+  "vocabulary": {
+    "categories": [
+      {
+        "id": "typeBinding",
+        "definition": "The runtime bound a value to the wrong shape: a collection collapsed to a scalar or to null, a scalar was widened to a collection, or a collection was nested inside another collection. The logic was correct for the shape the author intended."
+      },
+      {
+        "id": "logic",
+        "definition": "The intended shape was preserved but the computation, guard, or control flow was wrong, including state captured at the wrong time by a closure."
+      },
+      {
+        "id": "modelProtocol",
+        "definition": "A model produced output that did not satisfy the contract the caller assumed: missing field, wrong envelope, prose where structured output was required, or a refusal handled as data."
+      },
+      {
+        "id": "supervision",
+        "definition": "A human or automated supervisor approved a change whose defect was visible in the diff or in existing test output."
+      },
+      {
+        "id": "external",
+        "definition": "A dependency, host, runtime, or service behaved differently from its documented contract."
+      }
+    ],
+    "executionStages": [
+      {
+        "id": "deterministic",
+        "definition": "Reached only code paths that run without a model and without external writes: unit and structural tests, replay, dry runs."
+      },
+      {
+        "id": "shadow",
+        "definition": "Reached an authorized no-delivery integration lineage, including preparation. Model use is reported independently by gate observation run counts and sealed evidence."
+      },
+      {
+        "id": "live",
+        "definition": "Reached a run whose output was delivered to a consumer outside the repository."
+      }
+    ],
+    "statuses": [
+      {
+        "id": "remediated",
+        "definition": "The defect was fixed and a named regression guard now fails if it returns."
+      },
+      {
+        "id": "openDebt",
+        "definition": "The defect class is detected and recorded but the affected sites have not been rewritten; the guard blocks new instances only."
+      },
+      {
+        "id": "accepted",
+        "definition": "The behaviour was reviewed and deliberately kept; the entry exists so the budget count stays honest."
+      }
+    ]
+  },
+  "budget": {
+    "id": "typed-control-plane-trigger",
+    "operationalStatus": "inForce",
+    "asOfCommit": "5a8f106",
+    "statement": "If two or more type-binding historical incidents or post-snapshot integration incidents reach shadow or live execution within either the last ten coordinator changes or the last sixty days, the conditional typed control-plane pivot stops being optional and is scheduled as the next coordinator change.",
+    "threshold": {
+      "category": "typeBinding",
+      "countedRecordKinds": [
+        "incident",
+        "integrationIncident"
+      ],
+      "reachedExecutionStages": [
+        "shadow",
+        "live"
+      ],
+      "count": 2
+    },
+    "window": {
+      "days": 60,
+      "combinator": "either",
+      "coordinatorChanges": 10
+    },
+    "action": "Schedule the typed control-plane pivot as the next coordinator change and record the decision transition in this ledger.",
+    "state": {
+      "qualifyingIncidentIds": [
+        "INT-0001",
+        "INT-0002",
+        "INT-0003",
+        "INT-0004"
+      ],
+      "qualifyingCount": 4,
+      "triggered": true,
+      "inWindowIncidentIds": [
+        "ESC-0001",
+        "ESC-0002",
+        "ESC-0003",
+        "ESC-0004",
+        "ESC-0005",
+        "ESC-0006",
+        "ESC-0007",
+        "ESC-0008",
+        "ESC-0009",
+        "ESC-0010",
+        "ESC-0011",
+        "ESC-0012",
+        "INT-0001",
+        "INT-0002",
+        "INT-0003",
+        "INT-0004",
+        "INT-0005",
+        "INT-0006"
+      ]
+    }
+  },
+  "incidents": [
+    {
+      "id": "ESC-0001",
+      "title": "Empty fingerprint set returned as null",
+      "category": "typeBinding",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "remediated",
+      "summary": "A helper built a set of candidate fingerprints in a local hash set and returned it with a bare return. The pipeline enumerated the set, so an empty result arrived at the caller as null and a one-element result arrived as its single member. Callers that counted the result crashed or silently treated an empty set as an absent one.",
+      "detector": "PSEN004 (local collection returned bare) in tools/Find-PowerShellEmptyNullHazard.ps1",
+      "regressionGuard": "tools/Test-PowerShellBoundaryHardening.ps1 keeps the PSEN004 baseline at zero findings, so any new bare collection return blocks; tools/Test-ReviewerCollectionCardinality.ps1 exercises the zero and singleton variants of every inventoried hash-set field.",
+      "introducedCommit": "ac2c592",
+      "remediatedCommit": "74e476a",
+      "detectedOn": "2026-08-18",
+      "coordinatorChangeOrdinal": 10
+    },
+    {
+      "id": "ESC-0002",
+      "title": "Anchor arrays nested one level deeper by array-subexpression wrapping",
+      "category": "typeBinding",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "remediated",
+      "summary": "Two call sites wrapped a helper that deliberately emits its collection as a single non-enumerated object in an array subexpression. Because the value crosses the pipeline as one object, the wrapper nested it instead of flattening it, producing a one-element array whose only element was the real array. Cross-file convention verification saw one anchor where there were none or many.",
+      "detector": "PSEN011 (array subexpression wrapping a protected collection return) in tools/Find-PowerShellEmptyNullHazard.ps1",
+      "regressionGuard": "PSEN011 fixtures in tools/testdata/boundary-hardening-analyzer.fixtures.ps1 assert both the hazard and its counterexample; the nesting property is proved directly by the protected-return escape shape in tools/Test-ReviewerCollectionCardinality.ps1.",
+      "introducedCommit": "ac2c592",
+      "remediatedCommit": "0bb809f",
+      "siteCount": 2,
+      "detectedOn": "2026-08-12",
+      "coordinatorChangeOrdinal": 9
+    },
+    {
+      "id": "ESC-0003",
+      "title": "Specialist capture plan arrays collapsed across the plan boundary",
+      "category": "typeBinding",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "remediated",
+      "summary": "Plan fields that carry a list of capture targets lost their array shape when a plan with a single target, or none, was serialised and read back. Downstream consumers indexed the field and received a character or a property instead of a target.",
+      "detector": "Boundary variant harness in tools/Test-ReviewerCollectionCardinality.ps1 (specialistPlan stage, zero and singleton variants)",
+      "regressionGuard": "Every specialistPlan collection field in tools/testdata/reviewer-collection-inventory.v1.json is exercised at zero, one, many, maximum, duplicate, null-versus-missing, and wrong-scalar.",
+      "introducedCommit": "ac2c592",
+      "remediatedCommit": "91cabd3",
+      "detectedOn": "2026-08-17",
+      "coordinatorChangeOrdinal": 9
+    },
+    {
+      "id": "ESC-0004",
+      "title": "Verifier JSON value shapes not preserved on round trip",
+      "category": "typeBinding",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "remediated",
+      "summary": "Verifier payload values changed shape when written and re-read: single-element arrays came back as bare values and absent collections came back as null rather than empty. Verdict comparison then treated two identical verdicts as different.",
+      "detector": "Boundary variant harness in tools/Test-ReviewerCollectionCardinality.ps1 (verifierAssignment and verdict stages)",
+      "regressionGuard": "src/Agents/reviewer/StageContract.ps1 normalises declared collection fields on write and fails closed on scalar-collapsed fields on read; tools/Test-ReviewerStageContract.ps1 asserts both directions.",
+      "introducedCommit": "ac2c592",
+      "remediatedCommit": "39c8ed1",
+      "detectedOn": "2026-08-10",
+      "coordinatorChangeOrdinal": 8
+    },
+    {
+      "id": "ESC-0005",
+      "title": "Shared inventory return flattened at the boundary",
+      "category": "typeBinding",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "remediated",
+      "summary": "A shared inventory helper returned its rows through the pipeline, so an inventory with one row was indistinguishable from a bare row and an empty inventory from a missing one. Containment checks then anchored on the wrong root.",
+      "detector": "PSEN004 and PSEN009 in tools/Find-PowerShellEmptyNullHazard.ps1",
+      "regressionGuard": "tools/Test-ReviewerStageContract.ps1 asserts that the artifact inventory is returned non-enumerated at zero, one, and many artifacts and that the returned collection is read-only.",
+      "introducedCommit": "ac2c592",
+      "remediatedCommit": "48eadd0",
+      "detectedOn": "2026-08-16",
+      "coordinatorChangeOrdinal": 9
+    },
+    {
+      "id": "ESC-0006",
+      "title": "Source transport helper closures captured the wrong binding",
+      "category": "logic",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "remediated",
+      "summary": "Script blocks referenced helper functions and script-scope variables by unqualified name and were invoked after the enclosing scope had moved on, so they observed a later value than the author intended.",
+      "detector": "PSEN006 and PSEN010 in tools/Find-PowerShellEmptyNullHazard.ps1",
+      "regressionGuard": "PSEN006 and PSEN010 fixtures assert detection of unqualified script-scope reads and of closures that call repository functions by name; explicit closure-state capture is property-tested in tools/Test-ReviewerCollectionCardinality.ps1.",
+      "introducedCommit": "ac2c592",
+      "remediatedCommit": "99f7b66",
+      "detectedOn": "2026-08-18",
+      "coordinatorChangeOrdinal": 10
+    },
+    {
+      "id": "ESC-0007",
+      "title": "Live source closure captured a mutated loop variable",
+      "category": "logic",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "remediated",
+      "summary": "A closure created inside a loop read the loop variable rather than a copy of it, so every deferred invocation used the final iteration's value.",
+      "detector": "PSEN010 in tools/Find-PowerShellEmptyNullHazard.ps1",
+      "regressionGuard": "Same as ESC-0006; the explicit closure-state capture property test asserts that a captured copy is immune to later mutation while an uncaptured reference is not.",
+      "introducedCommit": "ac2c592",
+      "remediatedCommit": "0191f8a",
+      "detectedOn": "2026-08-18",
+      "coordinatorChangeOrdinal": 10
+    },
+    {
+      "id": "ESC-0008",
+      "title": "Recovery reader closure captured state after reassignment",
+      "category": "logic",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "remediated",
+      "summary": "A recovery path built a reader script block whose captured state was reassigned before the block ran, so recovery read from the wrong location.",
+      "detector": "PSEN006 and PSEN010 in tools/Find-PowerShellEmptyNullHazard.ps1",
+      "regressionGuard": "Same as ESC-0006.",
+      "introducedCommit": "ac2c592",
+      "remediatedCommit": "acb1273",
+      "detectedOn": "2026-08-08",
+      "coordinatorChangeOrdinal": 5
+    },
+    {
+      "id": "ESC-0009",
+      "title": "Aggregate over an empty selection crashed under strict mode",
+      "category": "logic",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "remediated",
+      "summary": "A byte total was computed by aggregating a filtered collection and reading the aggregate's sum property. When every item was withheld the filter produced nothing, the aggregate produced nothing, and reading the property threw under strict mode instead of yielding zero.",
+      "detector": "PSEN003 (property read on a possibly-empty aggregate) in tools/Find-PowerShellEmptyNullHazard.ps1",
+      "regressionGuard": "The zero variant of every inventoried numeric-bearing collection is exercised in tools/Test-ReviewerCollectionCardinality.ps1, and PSEN003 is part of the blocking boundary gate.",
+      "introducedCommit": "ac2c592",
+      "remediatedCommit": "696fb3a",
+      "detectedOn": "2026-08-13",
+      "coordinatorChangeOrdinal": 9
+    },
+    {
+      "id": "ESC-0010",
+      "title": "Second all-withheld aggregate crash in a sibling renderer",
+      "category": "logic",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "remediated",
+      "summary": "The same empty-aggregate crash existed in a second renderer that the first fix did not cover, which is why the guard was subsequently tightened to reject the pattern rather than the instance.",
+      "detector": "PSEN003 in tools/Find-PowerShellEmptyNullHazard.ps1",
+      "regressionGuard": "The tightened guard requires the numeric-zero form in the same block, so a sibling site cannot pass by accident.",
+      "introducedCommit": "ac2c592",
+      "remediatedCommit": "05d96d7",
+      "detectedOn": "2026-08-13",
+      "coordinatorChangeOrdinal": 9
+    },
+    {
+      "id": "ESC-0011",
+      "title": "Empty-aggregate guard accepted a same-block dominance loophole",
+      "category": "supervision",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "remediated",
+      "summary": "The first regression guard for the empty-aggregate class was written narrowly enough that a second instance of the same defect passed it. The guard, not the code, was the escape: review accepted a test that asserted the fix rather than the property.",
+      "detector": "Review of the guard itself; recorded so the ledger counts guard escapes as escapes.",
+      "regressionGuard": "Guards added by this hardening layer assert properties over an inventory rather than individual sites: the cardinality corpus is generated from tools/testdata/reviewer-collection-inventory.v1.json and the analyzer gate is baseline-diffed rather than site-listed.",
+      "introducedCommit": "696fb3a",
+      "remediatedCommit": "3a338a7",
+      "detectedOn": "2026-08-13",
+      "coordinatorChangeOrdinal": 9
+    },
+    {
+      "id": "ESC-0012",
+      "title": "Latent protected-return wrapping sites present in current code",
+      "category": "typeBinding",
+      "executionStage": "deterministic",
+      "reachedShadowOrLive": false,
+      "status": "openDebt",
+      "summary": "The rule introduced for ESC-0002 finds eleven further sites in current source and test code that wrap a protected collection return in an array subexpression. Each was read against its producer and consumer rather than baselined in bulk: three were live production defects and are fixed in this change, one is latent behind a caller-side non-empty precondition, one is compensated by an explicit flattening step at the consumer, and six are test-harness assertions. The eight that remain are carried as debt because rewriting them means changing producer contracts and call sites that this prerequisite layer must not touch.",
+      "detector": "PSEN011 in tools/Find-PowerShellEmptyNullHazard.ps1",
+      "regressionGuard": "The eight sites that were not rewritten are recorded in tools/testdata/powershell-boundary-baseline.v1.json with rationale - two in production code and six in test harnesses; tools/Test-PowerShellBoundaryHardening.ps1 blocks any further site. The analyzer fixture corpus is excluded from the repository scan by name and is not part of that count.",
+      "introducedCommit": "74e476a",
+      "siteCount": 11,
+      "detectedOn": "2026-08-18",
+      "coordinatorChangeOrdinal": 10,
+      "sites": [
+        {
+          "location": "source transport change-kind accumulation",
+          "risk": "remediated",
+          "assessment": "The wrap nested a protected string array, so the caller cast the whole array to one string and recorded a space-joined kind, or an empty string when the change carried no kinds. Fixed in this change by iterating the assigned result."
+        },
+        {
+          "location": "coordinator dedicated-gate thread revalidation",
+          "risk": "remediated",
+          "assessment": "The wrap nested the protected thread list, so the fingerprint scan read a single array element that carried no comments and returned an empty set - the duplicate-post guard silently disabled. Fixed in this change by assigning the protected result directly."
+        },
+        {
+          "location": "role-input capture manifest sealed resource inventory",
+          "risk": "remediated",
+          "assessment": "The wrap nested the protected inventory, serializing the resource list one level deeper than the manifest declares. Fixed in this change by assigning before the manifest literal."
+        },
+        {
+          "location": "convention pack authoritative snapshot selection",
+          "risk": "latent",
+          "assessment": "The producer is mixed: it protects only its empty return and emits the populated case bare. The wrap therefore misreports only the empty case, which the caller already guards against by requiring at least one configured source. Correcting it properly means changing the producer contract and every call site, which is outside a hardening change that must not rewrite unrelated code. Carried as debt with the analyzer finding baselined."
+        },
+        {
+          "location": "convention specialist changed-path acquisition",
+          "risk": "compensated",
+          "assessment": "The wrap nests, and the next statement flattens that exact layer with an explicit projection and an inline comment explaining why. Behaviour is correct today; the finding is retained so the compensation is not silently removed."
+        },
+        {
+          "location": "convention specialist remediation-error test harness",
+          "risk": "testOnly",
+          "assessment": "Test-side assertion helper. A nested result would fail the assertion it feeds rather than reach any execution stage."
+        },
+        {
+          "location": "cross-verification changed-file index test harness",
+          "risk": "testOnly",
+          "assessment": "Test-side assertion helper, same reasoning."
+        },
+        {
+          "location": "source transport change-kind test assertions",
+          "risk": "testOnly",
+          "assessment": "Test-side assertions over a protected helper; the assertions themselves pin the shape."
+        },
+        {
+          "location": "source transport deterministic diff-span test assertions (three sites)",
+          "risk": "testOnly",
+          "assessment": "Test-side assertions over a protected helper; the assertions themselves pin the shape."
+        },
+        {
+          "location": "analyzer fixture corpus",
+          "risk": "testOnly",
+          "assessment": "Deliberate hazards authored so the rule can be shown to fire. Excluded from the repository scan by name."
+        }
+      ]
+    }
+  ],
+  "integrationIncidents": [
+    {
+      "id": "INT-0001",
+      "title": "Dynamic source wrapper lost required identity bindings",
+      "category": "typeBinding",
+      "executionStage": "shadow",
+      "integrationPhase": "liveCapturePreparation",
+      "reachedShadowOrLive": true,
+      "budgetEligible": true,
+      "status": "remediated",
+      "summary": "A live-input source wrapper was invoked from a dynamic module after its defining scope had gone away. Required project and repository identity values therefore arrived unbound while capture arguments were being prepared. The failure reached preparation for a no-delivery Gate 5 lineage and was reproduced across the same shared transport path.",
+      "detector": "Sealed coordinator diagnosis of the dynamic-module boundary; category is explicitly declared in categoryAnchorExceptions because scope loss is not implied by a collection analyzer family.",
+      "regressionGuard": "tools/Test-SourceTransport.ps1 exercises the production wrapper from a child dynamic module and covers the ordinary, recovered, and oversized-recovery binding paths.",
+      "detectedOn": "2026-08-18",
+      "coordinatorChangeOrdinal": 11,
+      "evidence": {
+        "kind": "sealedArtifact",
+        "sha256": "a3bb7c7b28936c889b0cf9ea8738a88bd4a041360284457d626d5cd9bdb9057e",
+        "disclosure": "publicDigestOnly",
+        "summary": "Digest of the employer-neutral diagnosis record; six subordinate evidence hashes verified with zero mismatches."
+      }
+    },
+    {
+      "id": "INT-0002",
+      "title": "Empty discovered-fingerprint set collapsed to null",
+      "category": "typeBinding",
+      "executionStage": "shadow",
+      "integrationPhase": "shadowPostDiscovery",
+      "reachedShadowOrLive": true,
+      "budgetEligible": true,
+      "status": "remediated",
+      "summary": "After real discovery produced a bounded candidate, an empty fingerprint HashSet crossed an enumerating PowerShell return boundary and arrived as null. The first slot failed before specialist or reciprocal verification, the second slot was not attempted, and no finding was accepted or delivered.",
+      "detector": "Boundary variant harness in tools/Test-ReviewerCollectionCardinality.ps1 plus the sealed Gate 5 final report.",
+      "regressionGuard": "tools/Test-ReviewerCollectionCardinality.ps1 requires an empty existing-fingerprint HashSet to reach its caller as a zero-count HashSet; the production dry-run self-check pins the same invariant.",
+      "detectedOn": "2026-08-18",
+      "coordinatorChangeOrdinal": 11,
+      "evidence": {
+        "kind": "sealedArtifact",
+        "sha256": "7dff082f3bc5755dbdd4bc3a321cbf6081431f5f79dc905e8d3aaf3c667a7ecb",
+        "disclosure": "publicDigestOnly",
+        "summary": "Digest of the final no-delivery Gate 5 report binding the snapshot, signed two-slot set, one consumed attempt, zero accepted decisions, and zero external writes."
+      }
+    },
+    {
+      "id": "INT-0003",
+      "title": "Private configuration arrays collapsed during shadow preparation",
+      "category": "typeBinding",
+      "executionStage": "shadow",
+      "integrationPhase": "shadowPreparation",
+      "reachedShadowOrLive": true,
+      "budgetEligible": true,
+      "status": "observed",
+      "summary": "A private configuration materializer normalized singleton and empty arrays through an enumerating boundary. The production loader refused the malformed configuration before the run set was declared. This is operational evidence about boundary shape, not a claim that a repository commit introduced the private tool.",
+      "detector": "Boundary variant harness in tools/Test-ReviewerCollectionCardinality.ps1 and the sealed Gate 5 preparation record.",
+      "regressionGuard": "The private preparation path asserted every declared array after loading; repository-side zero, singleton, and many variants remain covered by tools/Test-ReviewerCollectionCardinality.ps1.",
+      "detectedOn": "2026-08-18",
+      "coordinatorChangeOrdinal": 11,
+      "evidence": {
+        "kind": "sealedArtifact",
+        "sha256": "7dff082f3bc5755dbdd4bc3a321cbf6081431f5f79dc905e8d3aaf3c667a7ecb",
+        "disclosure": "publicDigestOnly",
+        "summary": "The final Gate 5 report retains the failed preparation lineage and the corrected, immutable lineage without exposing private configuration values."
+      }
+    },
+    {
+      "id": "INT-0004",
+      "title": "Empty exact-key difference collapsed before Count",
+      "category": "typeBinding",
+      "executionStage": "shadow",
+      "integrationPhase": "shadowPreparation",
+      "reachedShadowOrLive": true,
+      "budgetEligible": true,
+      "status": "observed",
+      "summary": "A private exact-key validator computed missing, extra, and alias differences through enumerating pipelines. The correct empty difference became null, so reading Count failed before identity publication, snapshot creation, run-set declaration, or model launch.",
+      "detector": "Boundary variant harness in tools/Test-ReviewerCollectionCardinality.ps1 and the coordinator terminal evidence digest.",
+      "regressionGuard": "The corpus includes the empty Where-Object difference property; preparation must materialize each difference as an array before Count.",
+      "detectedOn": "2026-08-18",
+      "coordinatorChangeOrdinal": 11,
+      "evidence": {
+        "kind": "coordinatorEvidenceDigest",
+        "sha256": "4d70927e8ffbcaf2c81ec5c03df1ff7238a51e642cf91614a9626b62fa6df501",
+        "disclosure": "publicDigestOnly",
+        "summary": "Digest of the coordinator terminal statement: the final attempt stopped before snapshot and models on empty-result Count handling, with no retry or external write."
+      }
+    },
+    {
+      "id": "INT-0005",
+      "title": "Private snapshot recipe used non-contract identity keys",
+      "category": "logic",
+      "executionStage": "shadow",
+      "integrationPhase": "shadowPreparation",
+      "reachedShadowOrLive": true,
+      "budgetEligible": false,
+      "status": "blocked",
+      "summary": "A private snapshot recipe used convenience identity aliases instead of the production recipe's exact key names. ValidateOnly failed closed before snapshot publication. This was recipe construction logic, not runtime type binding, and is excluded from the type-binding budget.",
+      "detector": "Coordinator terminal evidence from the production recipe ValidateOnly failure; category is explicitly declared in categoryAnchorExceptions.",
+      "regressionGuard": "tools/Test-CorpusReplaySeal.ps1 and tools/Test-CorpusSealQualification.ps1 enforce the production recipe schema and reject aliases or extra keys.",
+      "detectedOn": "2026-08-18",
+      "coordinatorChangeOrdinal": 11,
+      "evidence": {
+        "kind": "coordinatorEvidenceDigest",
+        "sha256": "409f3ccaa32ad8c9a469e6930c45e0aef1d878dd053413ec4edf555752937467",
+        "disclosure": "publicDigestOnly",
+        "summary": "Digest of the coordinator terminal statement binding the pre-snapshot ValidateOnly stop and zero model or write activity."
+      }
+    },
+    {
+      "id": "INT-0006",
+      "title": "Private snapshot finalizer depended on an unavailable helper",
+      "category": "logic",
+      "executionStage": "shadow",
+      "integrationPhase": "snapshotFinalization",
+      "reachedShadowOrLive": true,
+      "budgetEligible": false,
+      "status": "blocked",
+      "summary": "A private snapshot finalizer called a helper that was unavailable in its execution scope after source normalization had passed. Snapshot finalization failed before a run set or model launch. This was private tooling composition, not type binding, and is excluded from the type-binding budget.",
+      "detector": "Sealed terminal artifact from the snapshot-finalization failure; category is explicitly declared in categoryAnchorExceptions.",
+      "regressionGuard": "Use the supported production finalizer and its no-model qualification gates rather than an ad hoc private finalizer.",
+      "detectedOn": "2026-08-18",
+      "coordinatorChangeOrdinal": 11,
+      "evidence": {
+        "kind": "sealedArtifact",
+        "sha256": "09b2f805405b9a48ed83e3f318b1a946a1138cce6e08847ccc2d327c7482766e",
+        "disclosure": "publicDigestOnly",
+        "summary": "Digest of the preserved terminal failure artifact; source normalization passed, but snapshot finalization stopped before run-set publication, models, delivery, or external writes."
+      }
+    }
+  ],
+  "nearMisses": [
+    {
+      "id": "NM-0001",
+      "title": "Verification tooling failed open: exemption holes, name-collision silencing, and container-for-leaf citation matching",
+      "category": "verificationLogic",
+      "executionStage": "deterministic",
+      "mergedBeforeDetection": false,
+      "reachedShadowOrLive": false,
+      "whyNotAnEscape": "Introduced and detected inside the same unmerged change, so it never entered a merged coordinator change. The mechanism is verification logic - exit-shape inference, cross-file name resolution, and citation token selection - not runtime type binding. Counting it as a type-binding escape would bias the budget evidence toward the typed pivot without establishing that a typed host would have prevented it.",
+      "status": "remediated",
+      "summary": "Independent review of this prerequisite layer found three ways its own detectors reported green while not checking what they claimed. The protected-return exemption counted an unrecognised exit as nothing, so one protected exit silenced the assignment rules for a whole function even when another exit returned a multi-element pipeline or a cast to an enumerating collection type. Cross-file name resolution skipped the nesting fact along with the exemption, so a single unprotected same-named stub in a test file disabled the bare-collection-return rule on every production call site of that name and raised a false flattening finding there. And the inventory citation check accepted any path segment, so a citation pointing at the wrong file passed whenever that file mentioned the generic container name; five live citations were wrong under that rule. A detector that fails open is worse than no detector, because it is recorded as evidence.",
+      "detector": "Independent review of the change, reproduced by fixtures in tools/testdata/boundary-hardening-analyzer.fixtures.ps1 and sabotage checks in tools/Test-ReviewerCollectionCardinality.ps1",
+      "regressionGuard": "Two exemption-soundness fixtures (multi-element pipeline exit and enumerating-cast exit) and a cross-file gate that builds a producer, a consumer, and a same-named unprotected mock in a temporary tree and requires identical findings with and without the mock, all in tools/Test-PowerShellBoundaryHardening.ps1. Three citation sabotage checks pin container-is-not-leaf, short-leaf retention, and prose-suffix rejection; the five wrong citations are corrected and the unverifiable rows are published as citationsUnverified rather than counted as checked.",
+      "introducedCommit": "fc11fae",
+      "classifiedAgainstCommit": "74e476a",
+      "remediatedCommit": "cc5983c",
+      "siteCount": 3,
+      "detectedOn": "2026-08-18",
+      "coordinatorChangeOrdinal": 10,
+      "sites": [
+        {
+          "location": "protected-return exemption, unrecognised exit shapes",
+          "risk": "remediated",
+          "assessment": "A return whose pipeline had more than one element, and a cast to List/ArrayList/Collection, were both counted as neither protected nor unprotected. One protected exit then bought the exemption for the whole function. Latent in this repository today - no current finding changed - but it is the exact escape shape the rules exist to catch."
+        },
+        {
+          "location": "cross-file function name resolution",
+          "risk": "remediated",
+          "assessment": "When a name was defined in more than one file and not locally, both the exemption and the nesting fact were skipped. Skipping the nesting fact disabled PSEN011, the rule that found three live defects in this change, on every production call site of that name. Now split: exemption stays conservative, nesting stays permissive."
+        },
+        {
+          "location": "inventory citation field matching",
+          "risk": "remediated",
+          "assessment": "Any path segment satisfied the check, so the container name stood in for the leaf. Five citations named the wrong file and passed. The leaf is now required, both path notations are handled, no minimum token length is applied, and rows with no leaf are published as unverified."
+        }
+      ]
+    },
+    {
+      "id": "NM-0002",
+      "title": "Two of the new verification checks were unfalsifiable, and one asserted a property the analyzer deliberately does not hold",
+      "category": "verificationLogic",
+      "executionStage": "deterministic",
+      "mergedBeforeDetection": false,
+      "reachedShadowOrLive": false,
+      "whyNotAnEscape": "Introduced by the previous round of fixes in this same unmerged change and found by the next round of review before merge. Like NM-0001 the mechanism is verification logic, not runtime type binding, and counting it against the type-binding budget would bias the pivot decision with evidence about test authorship rather than about the language.",
+      "status": "remediated",
+      "summary": "The cross-file gate added for NM-0001 asserted that a same-named mock does not raise a flattening finding on a production call site, using an @()-preserved consumer. A preserved assignment can never draw that rule, so the assertion was structurally always true. Worse, the property it named is one the analyzer deliberately does not hold: on an unwrapped call site the conservative exemption withdraws and the finding does fire, which is the accepted imprecision behind two baseline entries. Separately, the two new coverage-clock sabotage checks set a value and then asserted it differed from a value it had been constructed to differ from, never re-running the derivation on the mutated copy, so neither exercised the detection it was written to guard.",
+      "detector": "Independent review of the change",
+      "regressionGuard": "The cross-file gate now asserts only the falsifiable property - identical bare-collection-return findings on the wrapped call site with and without the mock - and pins the conservative-exemption imprecision on a second unwrapped consumer as an expectation, so a future improvement is reported rather than passing silently. Reverting the exemption/nesting split makes the gate fail. The coverage-clock derivation is extracted into Measure-LedgerCoverageClock and the sabotage checks re-run that function on the mutated ledger, with a positive control asserting it agrees on the unmutated one.",
+      "introducedCommit": "cc5983c",
+      "classifiedAgainstCommit": "74e476a",
+      "remediatedCommit": "4a3c3ec",
+      "siteCount": 2,
+      "detectedOn": "2026-08-18",
+      "coordinatorChangeOrdinal": 10,
+      "sites": [
+        {
+          "location": "cross-file name-resolution gate, flattening-rule half",
+          "risk": "remediated",
+          "assessment": "Structurally always zero on an @()-preserved consumer, so the assertion could not fail. Replaced by a falsifiable identity assertion plus an explicit pin of the known imprecision on an unwrapped consumer."
+        },
+        {
+          "location": "coverage-window clock sabotage checks",
+          "risk": "remediated",
+          "assessment": "Tautologies of the form n+1 != n. The derivation is now a function that the sabotage checks re-invoke on the mutated ledger, with a positive control."
+        }
+      ]
+    }
+  ],
+  "classificationBaseline": [
+    { "id": "ESC-0001", "recordKind": "incident", "category": "typeBinding", "executionStage": "deterministic", "introducedCommit": "ac2c592" },
+    { "id": "ESC-0002", "recordKind": "incident", "category": "typeBinding", "executionStage": "deterministic", "introducedCommit": "ac2c592" },
+    { "id": "ESC-0003", "recordKind": "incident", "category": "typeBinding", "executionStage": "deterministic", "introducedCommit": "ac2c592" },
+    { "id": "ESC-0004", "recordKind": "incident", "category": "typeBinding", "executionStage": "deterministic", "introducedCommit": "ac2c592" },
+    { "id": "ESC-0005", "recordKind": "incident", "category": "typeBinding", "executionStage": "deterministic", "introducedCommit": "ac2c592" },
+    { "id": "ESC-0006", "recordKind": "incident", "category": "logic", "executionStage": "deterministic", "introducedCommit": "ac2c592" },
+    { "id": "ESC-0007", "recordKind": "incident", "category": "logic", "executionStage": "deterministic", "introducedCommit": "ac2c592" },
+    { "id": "ESC-0008", "recordKind": "incident", "category": "logic", "executionStage": "deterministic", "introducedCommit": "ac2c592" },
+    { "id": "ESC-0009", "recordKind": "incident", "category": "logic", "executionStage": "deterministic", "introducedCommit": "ac2c592" },
+    { "id": "ESC-0010", "recordKind": "incident", "category": "logic", "executionStage": "deterministic", "introducedCommit": "ac2c592" },
+    { "id": "ESC-0011", "recordKind": "incident", "category": "supervision", "executionStage": "deterministic", "introducedCommit": "696fb3a" },
+    { "id": "ESC-0012", "recordKind": "incident", "category": "typeBinding", "executionStage": "deterministic", "introducedCommit": "74e476a" },
+    { "id": "NM-0001", "recordKind": "nearMiss", "category": "verificationLogic", "executionStage": "deterministic", "introducedCommit": "fc11fae" },
+    { "id": "NM-0002", "recordKind": "nearMiss", "category": "verificationLogic", "executionStage": "deterministic", "introducedCommit": "cc5983c" }
+  ],
+  "categoryAnchorExceptions": [
+    {
+      "id": "ESC-0011",
+      "category": "supervision",
+      "rationale": "The escape was the regression guard itself, found by reading the guard rather than by any analyzer rule, so there is no cited detector whose family could imply a category. Listing it here is what makes the absence of an anchor a reviewable fact: its category cannot be edited to typeBinding, because a category the budget counts must be implied by a detector, and de-anchoring any other finding changes this list."
+    },
+    {
+      "id": "INT-0001",
+      "category": "typeBinding",
+      "rationale": "The integration failure was loss of required identity values at a dynamic scope boundary. No collection analyzer family implies that judgement, so the exception makes the authored type-binding classification visible and keeps the budget contribution explicit rather than silently de-anchored."
+    },
+    {
+      "id": "INT-0005",
+      "category": "logic",
+      "rationale": "The private recipe selected non-contract identity keys. That is tooling construction logic, not a collection collapse, and it is explicitly budget-ineligible."
+    },
+    {
+      "id": "INT-0006",
+      "category": "logic",
+      "rationale": "The private finalizer depended on a helper unavailable in its scope. That is tooling composition logic, not type binding, and it is explicitly budget-ineligible."
+    }
+  ],
+  "gateObservations": [
+    {
+      "gate": "Gate 5",
+      "observation": "The initial two-item Gate 5 integration cohort produced no deliverable decision, for a decision yield of zero per cent. One lineage reached real discovery and then stopped on a null fingerprint binding; the other stopped during snapshot finalization. Preparation failures are recorded separately rather than erased. No finding was delivered, and both unauthorized and total external writes were zero.",
+      "cohortSize": 2,
+      "completedDecisions": 0,
+      "decisionYieldPercent": 0,
+      "unauthorizedWrites": 0,
+      "externalWrites": 0,
+      "noWriteInvariantHeld": true,
+      "shadowRunsPerformed": 1,
+      "liveRunsPerformed": 0
+    }
+  ],
+  "integrationSnapshot": {
+    "status": "authoritative",
+    "asOfCommit": "5a8f106",
+    "observedOn": "2026-08-18",
+    "coordinatorChangeOrdinal": 11,
+    "cohortSize": 2,
+    "completedDecisions": 0,
+    "decisionYieldPercent": 0,
+    "unauthorizedWrites": 0,
+    "qualifyingIncidentIds": [
+      "INT-0001",
+      "INT-0002",
+      "INT-0003",
+      "INT-0004"
+    ],
+    "triggered": true,
+    "evidenceDigests": [
+      "09b2f805405b9a48ed83e3f318b1a946a1138cce6e08847ccc2d327c7482766e",
+      "409f3ccaa32ad8c9a469e6930c45e0aef1d878dd053413ec4edf555752937467",
+      "4d70927e8ffbcaf2c81ec5c03df1ff7238a51e642cf91614a9626b62fa6df501",
+      "7dff082f3bc5755dbdd4bc3a321cbf6081431f5f79dc905e8d3aaf3c667a7ecb",
+      "a3bb7c7b28936c889b0cf9ea8738a88bd4a041360284457d626d5cd9bdb9057e"
+    ]
+  },
+  "decision": {
+    "id": "typed-control-plane-pivot",
+    "status": "taken",
+    "statement": "The conditional decision's prerequisites are satisfied and the registered trigger is fired. The coordinator's stage control plane must move to a typed, compiled C# host. This records the decision and its evidence; it does not claim that the port is implemented or complete.",
+    "prerequisites": [
+      {
+        "id": "cardinality-corpus",
+        "title": "Cardinality and property corpus over every collection-bearing stage contract",
+        "complete": true,
+        "inForce": false,
+        "inForceNote": "Built, not in force: the corpus drives the shared contract, not the owning stages. All 1652 producer-path cells are open, so no live stage boundary is covered by it today.",
+        "evidence": "tools/testdata/reviewer-collection-inventory.v1.json inventories 236 collection fields across twelve stages; tools/Test-ReviewerCollectionCardinality.ps1 exercises all of them at seven cardinality variants, routes the five map-valued fields through the stage contract's map validator rather than its list normalizer, proves eleven escape shapes as properties, runs nine sabotage checks, and checks 419 producer and consumer citations, of which 258 resolve to a file that mentions the field's leaf token and 161 name a variable with no leaf to match and are published as unverified rather than counted as checked - a liveness check on the rows that exist, not a completeness check on the inventory, whose completeness remains unverified; tools/testdata/reviewer-collection-cardinality-matrix.v1.json records coverage per field, keeps the uncovered producer-path dimension separate, and does not claim full coverage."
+      },
+      {
+        "id": "file-contract",
+        "title": "Versioned file contract for stage child outputs",
+        "complete": true,
+        "inForce": false,
+        "inForceNote": "Built, not in force: no stage writes or reads its child outputs through this contract yet. Adoption is a separate change.",
+        "evidence": "src/Agents/reviewer/StageContract.ps1 and src/Agents/reviewer/schemas/reviewer.stage-envelope.v1.json require a contract version and kind, write UTF-8 without a byte order mark to a caller-specified file, fix the JSON depth and form explicitly, and fail closed on unknown, missing, truncated, empty, scalar-collapsed, or stream-contaminated payloads, and validate declared maps separately from declared collections because a map has no correct repair from an array or a scalar; tools/Test-ReviewerStageContract.ps1 covers every rejection plus atomicity and the read-only inventory."
+      },
+      {
+        "id": "boundary-analyzer",
+        "title": "Boundary hardening analyzer with a blocking new-violation gate",
+        "complete": true,
+        "inForce": true,
+        "inForceNote": "In force: every push is scanned and any finding absent from the baseline fails CI.",
+        "evidence": "tools/Find-PowerShellEmptyNullHazard.ps1 implements eleven rules; tools/Test-PowerShellBoundaryHardening.ps1 proves each rule against labelled fixtures and blocks any finding absent from tools/testdata/powershell-boundary-baseline.v1.json, whose entries carry per-rule rationale."
+      },
+      {
+        "id": "escape-ledger",
+        "title": "Escape ledger and budget with a registered trigger",
+        "complete": true,
+        "inForce": true,
+        "inForceNote": "In force at the authoritative Gate 5 integration snapshot. The snapshot pins the current integration head, cohort cardinality, zero decision yield, zero unauthorized writes, qualifying incident identities, and public-safe evidence digests; CI recomputes the budget and enforces current-head staleness.",
+        "clockAuthority": "gate5IntegrationSnapshot",
+        "evidence": "This ledger, its versioned schema, and tools/Test-EscapeLedger.ps1 validate the authoritative integration snapshot, recompute every count across historical and integration incidents, protect historical classifications with a baseline, and re-evaluate the trigger."
+      }
+    ],
+    "exposureObligation": {
+      "statement": "The version 1 exposure obligation remains visible after the trigger fires. It no longer gates the taken decision, but its shortfall remains an implementation-quality requirement and cannot be declared satisfied without the recorded shadow exposure.",
+      "requiredShadowRuns": 10,
+      "byCoordinatorChange": 20,
+      "shadowRunsPerformed": 1,
+      "satisfied": false
+    }
+  }
+}

@@ -26,8 +26,8 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$ledgerPath = Join-Path $repoRoot 'docs/escape-ledger.v1.json'
-$schemaPath = Join-Path $repoRoot 'src/Agents/reviewer/schemas/reviewer.escape-ledger.v1.json'
+$ledgerPath = Join-Path $repoRoot 'docs/escape-ledger.v2.json'
+$schemaPath = Join-Path $repoRoot 'src/Agents/reviewer/schemas/reviewer.escape-ledger.v2.json'
 $docPath = Join-Path $repoRoot 'docs/escape-ledger.md'
 
 $script:Failures = [System.Collections.Generic.List[string]]::new()
@@ -109,7 +109,15 @@ function Measure-LedgerBudget {
     $qualifying = [System.Collections.Generic.List[string]]::new()
     $inWindow = [System.Collections.Generic.List[string]]::new()
 
-    foreach ($incident in @($Ledger.incidents)) {
+    $budgetFindings = @()
+    $countedRecordKinds = @($threshold.countedRecordKinds)
+    if ($countedRecordKinds -contains 'incident') {
+        $budgetFindings += @($Ledger.incidents)
+    }
+    if ($countedRecordKinds -contains 'integrationIncident') {
+        $budgetFindings += @($Ledger.integrationIncidents)
+    }
+    foreach ($incident in $budgetFindings) {
         $detectedOn = [datetime]::ParseExact(
             [string]$incident.detectedOn, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
         $withinOrdinal = ([int]$incident.coordinatorChangeOrdinal -ge $oldestOrdinalInWindow)
@@ -119,6 +127,7 @@ function Measure-LedgerBudget {
         if (-not $withinWindow) { continue }
         $inWindow.Add([string]$incident.id)
 
+        if ($incident.PSObject.Properties.Name -contains 'budgetEligible' -and -not [bool]$incident.budgetEligible) { continue }
         if ($incident.category -ne $threshold.category) { continue }
         if (-not $incident.reachedShadowOrLive) { continue }
         if ($stages -notcontains $incident.executionStage) { continue }
@@ -140,6 +149,24 @@ function Measure-LedgerBudget {
     }
 }
 
+function Test-IntegrationBudgetEligibilityConsistent {
+    param(
+        [Parameter(Mandatory)][object]$Incident,
+        [Parameter(Mandatory)][string]$CountedCategory
+    )
+    Register-ValidatorCall -Name 'integrationBudgetEligibility'
+    return ([bool]$Incident.budgetEligible -eq ([string]$Incident.category -eq $CountedCategory))
+}
+
+function Test-IdSetsEqual {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Left,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Right
+    )
+    Register-ValidatorCall -Name 'idSetEquality'
+    return ((@($Left | Sort-Object) -join ',') -eq (@($Right | Sort-Object) -join ','))
+}
+
 if (-not (Test-Path -LiteralPath $ledgerPath)) { throw "Escape ledger not found at $ledgerPath." }
 if (-not (Test-Path -LiteralPath $schemaPath)) { throw "Escape ledger schema not found at $schemaPath." }
 if (-not (Test-Path -LiteralPath $docPath)) { throw "Escape ledger narrative not found at $docPath." }
@@ -152,7 +179,7 @@ $ledger = Get-LedgerObject -Json $ledgerJson
 Assert-Ledger ([bool](Test-Json -Json $ledgerJson -SchemaFile $schemaPath -ErrorAction SilentlyContinue)) `
     'The escape ledger does not satisfy its versioned schema.'
 
-Assert-Ledger ($ledger.schemaVersion -eq 1) 'The escape ledger declares an unexpected schema version.'
+Assert-Ledger ($ledger.schemaVersion -eq 2) 'The escape ledger declares an unexpected schema version.'
 Assert-Ledger ($ledger.kind -eq 'reviewer-escape-ledger') 'The escape ledger declares an unexpected kind.'
 
 # The schema is closed, so an unknown field must be rejected rather than ignored.
@@ -197,7 +224,9 @@ Assert-Ledger ($declaredStatuses.Count -ge 1) 'The escape ledger defines no inci
 # --- 3. Incident integrity ---------------------------------------------------------------
 
 $incidents = @($ledger.incidents)
+$integrationIncidents = @($ledger.integrationIncidents)
 Assert-Ledger ($incidents.Count -ge 1) 'The escape ledger records no incidents.'
+Assert-Ledger ($integrationIncidents.Count -ge 1) 'The escape ledger records no Gate 5 integration incidents.'
 
 $seenIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
 $index = 0
@@ -222,6 +251,24 @@ foreach ($incident in $incidents) {
         Assert-Ledger ($incident.PSObject.Properties.Name -contains 'remediatedCommit') `
             "Incident $($incident.id) is marked remediated but records no remediating commit."
     }
+
+}
+
+$integrationIndex = 0
+foreach ($integrationIncident in $integrationIncidents) {
+    $integrationIndex++
+    $expectedId = 'INT-{0:D4}' -f $integrationIndex
+    Assert-Ledger ($seenIds.Add([string]$integrationIncident.id)) "The escape ledger reuses incident identifier '$($integrationIncident.id)'."
+    Assert-Ledger ([string]$integrationIncident.id -eq $expectedId) `
+        "Integration incident $($integrationIncident.id) is out of sequence; expected $expectedId at position $integrationIndex."
+    Assert-Ledger ($declaredCategories -contains $integrationIncident.category) `
+        "Integration incident $($integrationIncident.id) uses category '$($integrationIncident.category)', which the vocabulary does not define."
+    Assert-Ledger ([string]$integrationIncident.executionStage -in @('shadow', 'live') -and [bool]$integrationIncident.reachedShadowOrLive) `
+        "Integration incident $($integrationIncident.id) does not record a shadow/live exposure consistently."
+    Assert-Ledger (Test-IntegrationBudgetEligibilityConsistent -Incident $integrationIncident -CountedCategory ([string]$ledger.budget.threshold.category)) `
+        "Integration incident $($integrationIncident.id) records budgetEligible=$($integrationIncident.budgetEligible), which disagrees with its category '$($integrationIncident.category)'."
+    Assert-Ledger ([string]$integrationIncident.evidence.sha256 -match '^[0-9a-f]{64}$') `
+        "Integration incident $($integrationIncident.id) does not carry a public-safe evidence digest."
 }
 
 # --- 4. Budget recomputation and the registered trigger ----------------------------------
@@ -243,6 +290,9 @@ Assert-Ledger ($ledger.budget.state.triggered -eq $measured.Triggered) `
 # it is a reviewed diff rather than a silent edit.
 Assert-Ledger ($ledger.budget.threshold.category -eq 'typeBinding') 'The registered trigger no longer watches type-binding escapes.'
 Assert-Ledger ([int]$ledger.budget.threshold.count -eq 2) 'The registered trigger no longer fires at two escapes.'
+$triggerRecordKinds = @($ledger.budget.threshold.countedRecordKinds)
+Assert-Ledger ($triggerRecordKinds.Count -eq 2 -and $triggerRecordKinds -contains 'incident' -and $triggerRecordKinds -contains 'integrationIncident') `
+    'The registered trigger no longer counts both historical and Gate 5 integration incidents.'
 $triggerStages = @($ledger.budget.threshold.reachedExecutionStages)
 Assert-Ledger ($triggerStages.Count -eq 2 -and $triggerStages -contains 'shadow' -and $triggerStages -contains 'live') `
     'The registered trigger no longer watches shadow and live execution.'
@@ -257,9 +307,10 @@ Assert-Ledger ([int]$ledger.coverageWindow.coordinatorChangesObserved -ge 1) `
 # the published values only confirm the derivation.
 function Measure-LedgerCoverageClock {
     param([Parameter(Mandatory)][object]$Ledger)
+    Register-ValidatorCall -Name 'coverageClock'
     $observed = 0
     $evaluatedOn = ''
-    foreach ($incident in @($Ledger.incidents)) {
+    foreach ($incident in @(@($Ledger.incidents) + @($Ledger.integrationIncidents))) {
         if ([int]$incident.coordinatorChangeOrdinal -gt $observed) { $observed = [int]$incident.coordinatorChangeOrdinal }
         if ([string]$incident.detectedOn -gt $evaluatedOn) { $evaluatedOn = [string]$incident.detectedOn }
     }
@@ -307,7 +358,7 @@ Assert-Ledger ($recordedInWindow.Count -eq $measured.InWindowIds.Count) `
 foreach ($id in $measured.InWindowIds) {
     Assert-Ledger ($recordedInWindow -contains $id) "Incident $id falls inside the budget window but is not recorded in the budget state."
 }
-foreach ($incident in $incidents) {
+foreach ($incident in @($incidents) + @($integrationIncidents)) {
     Assert-Ledger ([int]$incident.coordinatorChangeOrdinal -le [int]$ledger.coverageWindow.coordinatorChangesObserved) `
         "Incident $($incident.id) claims coordinator change ordinal $($incident.coordinatorChangeOrdinal), beyond the $($ledger.coverageWindow.coordinatorChangesObserved) observed."
     Assert-Ledger ([string]$incident.detectedOn -le [string]$ledger.coverageWindow.evaluatedOn) `
@@ -317,7 +368,7 @@ foreach ($incident in $incidents) {
 # An incident aged out of both windows must stop counting, or the budget is a running total
 # rather than a rolling one.
 $agedOut = Get-LedgerObject -Json $ledgerJson
-foreach ($incident in @($agedOut.incidents)) {
+foreach ($incident in @(@($agedOut.incidents) + @($agedOut.integrationIncidents))) {
     $incident.detectedOn = '2020-01-01'
     $incident.coordinatorChangeOrdinal = 1
 }
@@ -330,6 +381,7 @@ Assert-Ledger ($agedMeasured.InWindowIds.Count -eq 0) `
 
 # One qualifying escape is below the threshold.
 $oneEscape = Get-LedgerObject -Json $ledgerJson
+foreach ($integration in @($oneEscape.integrationIncidents)) { $integration.budgetEligible = $false }
 $oneEscape.incidents[0].executionStage = 'shadow'
 $oneEscape.incidents[0].reachedShadowOrLive = $true
 $oneMeasured = Measure-LedgerBudget -Ledger $oneEscape
@@ -338,6 +390,7 @@ Assert-Ledger ($oneMeasured.QualifyingCount -eq 1 -and -not $oneMeasured.Trigger
 
 # Two qualifying escapes must fire it.
 $twoEscapes = Get-LedgerObject -Json $ledgerJson
+foreach ($integration in @($twoEscapes.integrationIncidents)) { $integration.budgetEligible = $false }
 $typeBindingIndexes = @()
 for ($i = 0; $i -lt $twoEscapes.incidents.Count; $i++) {
     if ($twoEscapes.incidents[$i].category -eq 'typeBinding') { $typeBindingIndexes += $i }
@@ -355,6 +408,7 @@ if ($typeBindingIndexes.Count -ge 2) {
 
 # Escapes in another category must not fire it.
 $otherCategory = Get-LedgerObject -Json $ledgerJson
+foreach ($integration in @($otherCategory.integrationIncidents)) { $integration.budgetEligible = $false }
 foreach ($incident in @($otherCategory.incidents)) {
     if ($incident.category -eq 'logic') {
         $incident.executionStage = 'live'
@@ -368,6 +422,7 @@ Assert-Ledger (-not $otherMeasured.Triggered) 'Logic escapes reaching live incor
 # preserves the no-write invariant while still exercising the code under test - which is
 # exactly why an escape that reaches shadow has to count. Two shadow escapes must fire.
 $shadowOnly = Get-LedgerObject -Json $ledgerJson
+foreach ($integration in @($shadowOnly.integrationIncidents)) { $integration.budgetEligible = $false }
 $shadowIndexes = @()
 for ($i = 0; $i -lt $shadowOnly.incidents.Count; $i++) {
     if ($shadowOnly.incidents[$i].category -eq 'typeBinding') { $shadowIndexes += $i }
@@ -393,16 +448,29 @@ $driftedMeasured = Measure-LedgerBudget -Ledger $driftedCount
 Assert-Ledger ($driftedCount.budget.state.qualifyingCount -ne $driftedMeasured.QualifyingCount) `
     'A deliberately drifted qualifying count was not distinguishable from the recomputed one.'
 
+$driftedEligibility = Get-LedgerObject -Json $ledgerJson
+$driftedEligibility.integrationIncidents[0].budgetEligible = $false
+Assert-Ledger (-not (Test-IntegrationBudgetEligibilityConsistent -Incident $driftedEligibility.integrationIncidents[0] -CountedCategory ([string]$driftedEligibility.budget.threshold.category))) `
+    'A qualifying integration incident could be removed from the budget by changing budgetEligible alone.'
+
 # --- 6. Gate observations ----------------------------------------------------------------
 
 $gateFive = @($ledger.gateObservations | Where-Object { $_.gate -eq 'Gate 5' })
 Assert-Ledger ($gateFive.Count -eq 1) 'The escape ledger does not record exactly one Gate 5 observation.'
 if ($gateFive.Count -eq 1) {
+    Assert-Ledger ([int]$gateFive[0].cohortSize -eq 2) 'The Gate 5 integration cohort is not the registered initial two-item cohort.'
+    Assert-Ledger ([int]$gateFive[0].completedDecisions -eq 0) 'The Gate 5 cohort records a completed decision despite zero decision yield.'
     Assert-Ledger ([double]$gateFive[0].decisionYieldPercent -eq 0) 'The recorded Gate 5 decision yield is not zero per cent.'
+    Assert-Ledger ([int]$gateFive[0].unauthorizedWrites -eq 0) 'The Gate 5 run records unauthorized writes.'
     Assert-Ledger ([int]$gateFive[0].externalWrites -eq 0) 'The recorded Gate 5 run performed external writes.'
     Assert-Ledger ($gateFive[0].noWriteInvariantHeld -eq $true) 'The recorded Gate 5 run did not hold the no-write invariant.'
     Assert-Ledger ([int]$gateFive[0].shadowRunsPerformed -ge 0) 'The Gate 5 observation records no shadow run count.'
     Assert-Ledger ([int]$gateFive[0].liveRunsPerformed -ge 0) 'The Gate 5 observation records no live run count.'
+    $gateYield = if ([int]$gateFive[0].cohortSize -eq 0) { 0 } else {
+        100 * [double]$gateFive[0].completedDecisions / [int]$gateFive[0].cohortSize
+    }
+    Assert-Ledger ([double]$gateFive[0].decisionYieldPercent -eq $gateYield) `
+        'The Gate 5 decision yield does not equal completed decisions divided by cohort size.'
 }
 
 foreach ($observation in @($ledger.gateObservations)) {
@@ -413,11 +481,41 @@ foreach ($observation in @($ledger.gateObservations)) {
         "Gate observation '$($observation.gate)' claims live runs while also claiming zero external writes."
 }
 
+$snapshot = $ledger.integrationSnapshot
+Assert-Ledger ([string]$snapshot.status -eq 'authoritative') 'The Gate 5 integration snapshot is not authoritative.'
+Assert-Ledger ([int]$snapshot.coordinatorChangeOrdinal -eq [int]$ledger.coverageWindow.coordinatorChangesObserved) `
+    'The authoritative integration snapshot ordinal disagrees with the published coverage clock.'
+if ($gateFive.Count -eq 1) {
+    Assert-Ledger ([int]$snapshot.cohortSize -eq [int]$gateFive[0].cohortSize) 'The integration snapshot and Gate 5 observation disagree on cohort size.'
+    Assert-Ledger ([int]$snapshot.completedDecisions -eq [int]$gateFive[0].completedDecisions) 'The integration snapshot and Gate 5 observation disagree on completed decisions.'
+}
+$snapshotYield = if ([int]$snapshot.cohortSize -eq 0) { 0 } else {
+    100 * [double]$snapshot.completedDecisions / [int]$snapshot.cohortSize
+}
+Assert-Ledger ([double]$snapshot.decisionYieldPercent -eq $snapshotYield) `
+    'The integration snapshot decision yield does not equal completed decisions divided by cohort size.'
+Assert-Ledger ([double]$snapshot.decisionYieldPercent -eq 0 -and [int]$snapshot.completedDecisions -eq 0) `
+    'The authoritative integration snapshot does not reproduce the initial cohort zero-percent decision yield.'
+Assert-Ledger ([int]$snapshot.unauthorizedWrites -eq 0) 'The authoritative integration snapshot records unauthorized writes.'
+$snapshotQualifyingIds = @($snapshot.qualifyingIncidentIds)
+Assert-Ledger (Test-IdSetsEqual -Left $snapshotQualifyingIds -Right $measured.QualifyingIds) `
+    'The authoritative integration snapshot qualifying incidents disagree with the recomputed budget.'
+Assert-Ledger ([bool]$snapshot.triggered -eq $measured.Triggered) `
+    'The authoritative integration snapshot trigger verdict disagrees with the recomputed budget.'
+$incidentEvidenceDigests = @($integrationIncidents | ForEach-Object { [string]$_.evidence.sha256 } | Sort-Object -Unique)
+Assert-Ledger ((@($snapshot.evidenceDigests | Sort-Object) -join ',') -eq ($incidentEvidenceDigests -join ',')) `
+    'The authoritative integration snapshot evidence digest set does not equal the integration-incident evidence set.'
+
+$driftedSnapshotIds = Get-LedgerObject -Json $ledgerJson
+$driftedSnapshotIds.integrationSnapshot.qualifyingIncidentIds[0] = 'INT-9999'
+Assert-Ledger (-not (Test-IdSetsEqual -Left @($driftedSnapshotIds.integrationSnapshot.qualifyingIncidentIds) -Right $measured.QualifyingIds)) `
+    'A drifted authoritative snapshot qualifying-incident set was not distinguishable from the recomputed budget.'
+
 # Only live execution contradicts the no-write invariant. Shadow execution runs the code
 # and discards the output, so it writes nothing externally by construction: treating a
 # shadow escape as inconsistent with the invariant would make the shadow arm of the
 # registered trigger unusable, which is the opposite of what it is for.
-$reachedLive = @($incidents | Where-Object { $_.executionStage -eq 'live' })
+$reachedLive = @(@($incidents) + @($integrationIncidents) | Where-Object { $_.executionStage -eq 'live' })
 $allHeld = -not (@($ledger.gateObservations | Where-Object { -not $_.noWriteInvariantHeld }).Count)
 Assert-Ledger (-not ($reachedLive.Count -gt 0 -and $allHeld)) `
     'The ledger claims escapes reached live execution while also claiming the no-write invariant always held.'
@@ -439,8 +537,8 @@ Assert-Ledger ([int]$obligation.byCoordinatorChange -gt [int]$ledger.coverageWin
 
 # --- 7. Decision status and prerequisite completion --------------------------------------
 
-Assert-Ledger ($ledger.decision.status -eq 'conditional') `
-    "The typed control-plane decision is recorded as '$($ledger.decision.status)'; this change may only record it as conditional."
+Assert-Ledger ($ledger.decision.status -eq 'taken') `
+    "The typed control-plane decision is recorded as '$($ledger.decision.status)' even though the authoritative Gate 5 snapshot fired the registered trigger."
 
 $prerequisiteIds = @('cardinality-corpus', 'file-contract', 'boundary-analyzer', 'escape-ledger')
 $declaredPrerequisites = @($ledger.decision.prerequisites | ForEach-Object { $_.id })
@@ -481,11 +579,27 @@ function Test-ClockAuthorityConsistent {
         set inForce true - produced a green but still authority-free clock. A rule that can
         be satisfied by asserting the thing it is meant to verify is not a rule.
     #>
-    param([Parameter(Mandatory)][object]$Prerequisite)
+    param(
+        [Parameter(Mandatory)][object]$Prerequisite,
+        [Parameter(Mandatory)][object]$Ledger
+    )
+    Register-ValidatorCall -Name 'clockAuthority'
     $names = @($Prerequisite.PSObject.Properties | ForEach-Object { $_.Name })
     if ($names -notcontains 'clockAuthority') { return $false }
-    if ([string]$Prerequisite.clockAuthority -ne 'authoredOrdinals') { return $false }
-    return (-not [bool]$Prerequisite.inForce)
+    if ([string]$Prerequisite.clockAuthority -eq 'authoredOrdinals') {
+        return (-not [bool]$Prerequisite.inForce -and [string]$Ledger.budget.operationalStatus -eq 'historicalSnapshot')
+    }
+    if ([string]$Prerequisite.clockAuthority -ne 'gate5IntegrationSnapshot') { return $false }
+    $snapshot = $Ledger.integrationSnapshot
+    return (
+        [bool]$Prerequisite.inForce -and
+        [string]$Ledger.budget.operationalStatus -eq 'inForce' -and
+        [string]$snapshot.status -eq 'authoritative' -and
+        [string]$snapshot.asOfCommit -eq [string]$Ledger.budget.asOfCommit -and
+        [string]$snapshot.asOfCommit -eq [string]$Ledger.coverageWindow.endCommit -and
+        [bool]$snapshot.triggered -and
+        @($snapshot.evidenceDigests).Count -gt 0
+    )
 }
 
 if ($ledgerPrerequisite.Count -eq 1) {
@@ -494,12 +608,12 @@ if ($ledgerPrerequisite.Count -eq 1) {
         "The escape-ledger prerequisite does not declare a clockAuthority, so a reader cannot tell whether the window clock is authoritative."
     if ($ledgerPrereqNames -contains 'clockAuthority') {
         $clockAuthority = [string]$ledgerPrerequisite[0].clockAuthority
-        Assert-Ledger ($clockAuthority -eq 'authoredOrdinals') `
-            "Unknown clockAuthority '$clockAuthority'. Only authoredOrdinals is defined in this schema version; a new authority may be named only in the change that also adds the data it reads and the checks that establish that data is current."
-        Assert-Ledger (Test-ClockAuthorityConsistent -Prerequisite $ledgerPrerequisite[0]) `
-            'The escape-ledger prerequisite is declared in force while its window clock advances only from authored incident ordinals. An incident-free coordinator change does not move that clock, so the trigger cannot be treated as current. Leave inForce false until a coordinator-change registry and the checks that read it exist.'
+        Assert-Ledger ($clockAuthority -in @('authoredOrdinals', 'gate5IntegrationSnapshot')) `
+            "Unknown clockAuthority '$clockAuthority'."
+        Assert-Ledger (Test-ClockAuthorityConsistent -Prerequisite $ledgerPrerequisite[0] -Ledger $ledger) `
+            'The escape-ledger prerequisite, budget operational status, and authoritative Gate 5 integration snapshot disagree.'
         Assert-Ledger ([string]$ledgerPrerequisite[0].inForceNote -match 'Gate 5') `
-            'The escape-ledger prerequisite runs on an authored clock but its note does not state what Gate 5 must require before reading the trigger as current.'
+            'The escape-ledger prerequisite note does not identify Gate 5 as the authority for the in-force snapshot.'
     }
 
     # The rule has to be able to fail on each combination it exists to forbid, and has to
@@ -507,18 +621,28 @@ if ($ledgerPrerequisite.Count -eq 1) {
     $forcedClock = (Get-LedgerObject -Json $ledgerJson).decision.prerequisites | Where-Object { $_.id -eq 'escape-ledger' }
     $forcedClock.inForce = $true
     $forcedClock.clockAuthority = 'authoredOrdinals'
-    Assert-Ledger (-not (Test-ClockAuthorityConsistent -Prerequisite $forcedClock)) `
+    $forcedLedger = Get-LedgerObject -Json $ledgerJson
+    $forcedLedger.budget.operationalStatus = 'historicalSnapshot'
+    Assert-Ledger (-not (Test-ClockAuthorityConsistent -Prerequisite $forcedClock -Ledger $forcedLedger)) `
         'An escape-ledger prerequisite declared in force on an authored clock was accepted.'
     $inventedClock = (Get-LedgerObject -Json $ledgerJson).decision.prerequisites | Where-Object { $_.id -eq 'escape-ledger' }
     $inventedClock.inForce = $true
     $inventedClock.clockAuthority = 'coordinatorChangeRegistry'
-    Assert-Ledger (-not (Test-ClockAuthorityConsistent -Prerequisite $inventedClock)) `
+    Assert-Ledger (-not (Test-ClockAuthorityConsistent -Prerequisite $inventedClock -Ledger (Get-LedgerObject -Json $ledgerJson))) `
         'The clock-authority rule accepted an in-force budget backed by an authority this schema version does not define, so the clock can be switched on by naming a registry that does not exist.'
     $restingClock = (Get-LedgerObject -Json $ledgerJson).decision.prerequisites | Where-Object { $_.id -eq 'escape-ledger' }
     $restingClock.inForce = $false
     $restingClock.clockAuthority = 'authoredOrdinals'
-    Assert-Ledger (Test-ClockAuthorityConsistent -Prerequisite $restingClock) `
+    $restingLedger = Get-LedgerObject -Json $ledgerJson
+    $restingLedger.budget.operationalStatus = 'historicalSnapshot'
+    Assert-Ledger (Test-ClockAuthorityConsistent -Prerequisite $restingClock -Ledger $restingLedger) `
         'The clock-authority rule rejects the only combination this schema version permits, so it forbids the honest state as well as the dishonest ones.'
+
+    $driftedSnapshotLedger = Get-LedgerObject -Json $ledgerJson
+    $driftedSnapshotLedger.integrationSnapshot.asOfCommit = [string]$ledger.previousSnapshot.asOfCommit
+    $driftedSnapshotPrerequisite = $driftedSnapshotLedger.decision.prerequisites | Where-Object { $_.id -eq 'escape-ledger' }
+    Assert-Ledger (-not (Test-ClockAuthorityConsistent -Prerequisite $driftedSnapshotPrerequisite -Ledger $driftedSnapshotLedger)) `
+        'An in-force budget was accepted after its authoritative integration snapshot was moved away from the coverage-window head.'
 }
 
 # The counts and the trigger state live in the machine-readable budget, so whatever tells a
@@ -528,8 +652,8 @@ $budgetNames = @($ledger.budget.PSObject.Properties | ForEach-Object { $_.Name }
 Assert-Ledger ($budgetNames -contains 'operationalStatus') `
     'The budget publishes qualifying counts and a triggered flag without an operationalStatus, so a machine reader cannot tell that its window clock is authored rather than derived.'
 if ($budgetNames -contains 'operationalStatus') {
-    Assert-Ledger ([string]$ledger.budget.operationalStatus -eq 'historicalSnapshot') `
-        "The budget declares operationalStatus '$($ledger.budget.operationalStatus)'. While clockAuthority is authoredOrdinals the only defensible status is historicalSnapshot."
+    Assert-Ledger ([string]$ledger.budget.operationalStatus -eq 'inForce') `
+        "The budget declares operationalStatus '$($ledger.budget.operationalStatus)' despite the authoritative Gate 5 integration snapshot."
 }
 Assert-Ledger ($budgetNames -contains 'asOfCommit') `
     'The budget does not say which commit its counts were taken at, so the snapshot has no date attached to it.'
@@ -537,7 +661,7 @@ if ($budgetNames -contains 'asOfCommit') {
     Assert-Ledger ([string]$ledger.budget.asOfCommit -eq [string]$ledger.coverageWindow.endCommit) `
         "The budget is stated as of $($ledger.budget.asOfCommit) but the coverage window ends at $($ledger.coverageWindow.endCommit); the counts and the window they are drawn from must agree."
 }
-foreach ($incident in $incidents) {
+foreach ($incident in @($incidents) + @($integrationIncidents)) {
     $cited = [regex]::Matches("$($incident.detector) $($incident.regressionGuard)", '(?<path>(?:src|tools|docs)/[A-Za-z0-9_./-]+\.(?:ps1|json|md))')
     foreach ($match in $cited) {
         $candidate = Join-Path $repoRoot $match.Groups['path'].Value
@@ -559,7 +683,7 @@ $forbidden = @(
 
 $docText = Get-Content -LiteralPath $docPath -Raw
 foreach ($target in @(
-        @{ Name = 'docs/escape-ledger.v1.json'; Text = $ledgerJson },
+        @{ Name = 'docs/escape-ledger.v2.json'; Text = $ledgerJson },
         @{ Name = 'docs/escape-ledger.md'; Text = $docText })) {
     foreach ($rule in $forbidden) {
         $hit = [regex]::Match($target.Text, $rule.Pattern)
@@ -574,9 +698,18 @@ foreach ($incident in $incidents) {
     Assert-Ledger ($docText -match [regex]::Escape($incident.id)) `
         "docs/escape-ledger.md does not mention incident $($incident.id)."
 }
+foreach ($incident in $integrationIncidents) {
+    Assert-Ledger ($docText -match [regex]::Escape($incident.id)) `
+        "docs/escape-ledger.md does not mention integration incident $($incident.id)."
+}
 $documentedIds = @([regex]::Matches($docText, 'ESC-\d{4}') | ForEach-Object { $_.Value } | Sort-Object -Unique)
 foreach ($id in $documentedIds) {
     Assert-Ledger ($seenIds.Contains($id)) "docs/escape-ledger.md mentions incident $id, which the ledger does not record."
+}
+$documentedIntegrationIds = @([regex]::Matches($docText, 'INT-\d{4}') | ForEach-Object { $_.Value } | Sort-Object -Unique)
+$integrationIdSet = [System.Collections.Generic.HashSet[string]]::new([string[]]@($integrationIncidents | ForEach-Object { [string]$_.id }))
+foreach ($id in $documentedIntegrationIds) {
+    Assert-Ledger ($integrationIdSet.Contains($id)) "docs/escape-ledger.md mentions integration incident $id, which the ledger does not record."
 }
 Assert-Ledger ($docText -match 'Gate 5') 'docs/escape-ledger.md does not record the Gate 5 observation.'
 
@@ -612,26 +745,137 @@ foreach ($nearMiss in $nearMisses) {
     }
 }
 
+Assert-Ledger ([string]$ledger.previousSnapshot.asOfCommit -eq '74e476a') `
+    'The v2 ledger no longer identifies the historical v1 snapshot it supersedes.'
+Assert-Ledger ([string]$ledger.previousSnapshot.ledgerSha256 -eq '531bd43c8ef23b4d704b97b899f1f056bc5a2ee6d9cbfa5324e23c8707bb3b1b') `
+    'The digest binding the preserved v1 historical incidents and near misses changed.'
+Assert-Ledger ([string]$ledger.previousSnapshot.artifactCommit -eq '5a8f106') `
+    'The v2 ledger no longer identifies the commit containing the frozen v1 artifact.'
+Assert-Ledger ([string]$ledger.previousSnapshot.artifactPath -eq 'docs/escape-ledger.v1.json') `
+    'The v2 ledger no longer identifies the path of the frozen v1 artifact.'
+$v1Ledger = $null
+if ($VerifyCommits) {
+    $v1Spec = "$($ledger.previousSnapshot.artifactCommit):$($ledger.previousSnapshot.artifactPath)"
+    $v1Path = Join-Path $repoRoot ([string]$ledger.previousSnapshot.artifactPath)
+    Assert-Ledger (Test-Path -LiteralPath $v1Path) `
+        "The frozen v1 artifact '$v1Spec' is not retained at $($ledger.previousSnapshot.artifactPath)."
+    if (Test-Path -LiteralPath $v1Path) {
+        $v1Text = (Get-Content -LiteralPath $v1Path -Raw).Replace("`r`n", "`n")
+        $v1Bytes = [Text.Encoding]::UTF8.GetBytes($v1Text)
+        $v1Digest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($v1Bytes)).ToLowerInvariant()
+        Assert-Ledger ($v1Digest -eq [string]$ledger.previousSnapshot.ledgerSha256) `
+            "The frozen v1 artifact digest is $v1Digest, not $($ledger.previousSnapshot.ledgerSha256)."
+        $v1Ledger = $v1Text | ConvertFrom-Json
+    }
+}
+
+function Get-ClassificationBaselineObjection {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Incidents,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$NearMisses,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Baseline
+    )
+    Register-ValidatorCall -Name 'classificationBaseline'
+    $records = @(
+        @($Incidents | ForEach-Object {
+                [pscustomobject]@{
+                    id = [string]$_.id
+                    recordKind = 'incident'
+                    category = [string]$_.category
+                    executionStage = [string]$_.executionStage
+                    introducedCommit = [string]$_.introducedCommit
+                }
+            }) +
+        @($NearMisses | ForEach-Object {
+                [pscustomobject]@{
+                    id = [string]$_.id
+                    recordKind = 'nearMiss'
+                    category = [string]$_.category
+                    executionStage = [string]$_.executionStage
+                    introducedCommit = [string]$_.introducedCommit
+                }
+            })
+    )
+    if ($records.Count -ne $Baseline.Count) {
+        return "The classification baseline has $($Baseline.Count) record(s), but the historical incident and near-miss lists have $($records.Count). A record was added, removed, or moved without updating the visible baseline."
+    }
+    $baselineIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($expected in $Baseline) {
+        if (-not $baselineIds.Add([string]$expected.id)) {
+            return "Classification baseline identifier $($expected.id) is duplicated, leaving another historical record unpinned."
+        }
+        $actual = @($records | Where-Object { [string]$_.id -eq [string]$expected.id })
+        if ($actual.Count -ne 1) {
+            return "Classification baseline entry $($expected.id) does not identify exactly one historical record."
+        }
+        foreach ($field in @('recordKind', 'category', 'executionStage', 'introducedCommit')) {
+            if ([string]$actual[0].$field -cne [string]$expected.$field) {
+                return "Historical record $($expected.id) changed $field from '$($expected.$field)' to '$($actual[0].$field)'. The edit is classification-affecting and cannot silently move the record out of the budget."
+            }
+        }
+    }
+    foreach ($record in $records) {
+        if (-not $baselineIds.Contains([string]$record.id)) {
+            return "Historical record $($record.id) has no classification baseline entry."
+        }
+    }
+    return $null
+}
+
+Assert-Ledger ($null -eq ($classificationObjection = Get-ClassificationBaselineObjection -Incidents $incidents -NearMisses $nearMisses -Baseline @($ledger.classificationBaseline))) ([string]$classificationObjection)
+
+if ($VerifyCommits -and $null -ne $v1Ledger) {
+    Assert-Ledger ($null -eq ($v1BaselineObjection = Get-ClassificationBaselineObjection -Incidents @($v1Ledger.incidents) -NearMisses @($v1Ledger.nearMisses) -Baseline @($ledger.classificationBaseline))) `
+        ([string]$v1BaselineObjection)
+    $driftedHistoricalBaseline = Get-LedgerObject -Json $ledgerJson
+    $driftedHistoricalBaseline.classificationBaseline[0].category = 'logic'
+    Assert-Ledger ($null -ne (Get-ClassificationBaselineObjection -Incidents @($v1Ledger.incidents) -NearMisses @($v1Ledger.nearMisses) -Baseline @($driftedHistoricalBaseline.classificationBaseline))) `
+        'A v2 classification baseline that disagrees with the digest-verified v1 artifact was accepted.'
+}
+
+$classificationHonest = Get-LedgerObject -Json $ledgerJson
+Assert-Ledger ($null -eq (Get-ClassificationBaselineObjection -Incidents @($classificationHonest.incidents) -NearMisses @($classificationHonest.nearMisses) -Baseline @($classificationHonest.classificationBaseline))) `
+    'The classification baseline validator rejects the unmodified ledger.'
+$classificationFalsified = Get-LedgerObject -Json $ledgerJson
+$classificationFalsified.incidents[0].introducedCommit = [string]$classificationFalsified.nearMisses[0].introducedCommit
+Assert-Ledger ($null -ne (Get-ClassificationBaselineObjection -Incidents @($classificationFalsified.incidents) -NearMisses @($classificationFalsified.nearMisses) -Baseline @($classificationFalsified.classificationBaseline))) `
+    'Rewriting an escape introducedCommit to an unmerged branch commit did not contradict the visible classification baseline.'
+$classificationMoved = Get-LedgerObject -Json $ledgerJson
+$movedRecord = $classificationMoved.incidents[0]
+$classificationMoved.incidents = @($classificationMoved.incidents | Where-Object { [string]$_.id -ne [string]$movedRecord.id })
+$classificationMoved.nearMisses = @($classificationMoved.nearMisses) + @($movedRecord)
+Assert-Ledger ($null -ne (Get-ClassificationBaselineObjection -Incidents @($classificationMoved.incidents) -NearMisses @($classificationMoved.nearMisses) -Baseline @($classificationMoved.classificationBaseline))) `
+    'Moving a historical escape to nearMisses did not contradict the visible classification baseline.'
+$classificationDuplicated = Get-LedgerObject -Json $ledgerJson
+$classificationDuplicated.classificationBaseline[-1] = $classificationDuplicated.classificationBaseline[0]
+Assert-Ledger ($null -ne (Get-ClassificationBaselineObjection -Incidents @($classificationDuplicated.incidents) -NearMisses @($classificationDuplicated.nearMisses) -Baseline @($classificationDuplicated.classificationBaseline))) `
+    'Duplicating one baseline entry and dropping another left a historical record unpinned.'
+
 # Two axes, not one. A containment escape is a defect that entered a merged coordinator
 # change; a runtime exposure finding is one that reached shadow or live execution, whether
 # or not it ever merged. Only the first is budget evidence, but the second is the evidence
 # the typed-host decision most wants to read, and a taxonomy that cannot represent
 # "reached live before merge" is a taxonomy that quietly drops it. So the near-miss schema
 # no longer pins reachedShadowOrLive false, and the count is published across both lists.
-$runtimeExposureIds = @(@(@($incidents) + @($nearMisses)) | Where-Object { [string]$_.executionStage -in @('shadow', 'live') } | ForEach-Object { [string]$_.id })
+$runtimeFindings = @(@($incidents) + @($nearMisses) + @($integrationIncidents))
+$runtimeExposureIds = @($runtimeFindings | Where-Object { [string]$_.executionStage -in @('shadow', 'live') } | ForEach-Object { [string]$_.id })
 $runtimeExposure = $runtimeExposureIds.Count
 $runtimeExposureByCategory = [ordered]@{}
 foreach ($category in @($declaredCategories | Sort-Object)) {
-    $runtimeExposureByCategory[[string]$category] = @(@(@($incidents) + @($nearMisses)) | Where-Object { [string]$_.executionStage -in @('shadow', 'live') -and [string]$_.category -eq [string]$category }).Count
+    $runtimeExposureByCategory[[string]$category] = @($runtimeFindings | Where-Object { [string]$_.executionStage -in @('shadow', 'live') -and [string]$_.category -eq [string]$category }).Count
 }
-$shadowRuns = [int]$ledger.gateObservations.shadowRunsPerformed
-$liveRuns = [int]$ledger.gateObservations.liveRunsPerformed
+$shadowRuns = 0
+$liveRuns = 0
+foreach ($observation in @($ledger.gateObservations)) {
+    $shadowRuns += [int]$observation.shadowRunsPerformed
+    $liveRuns += [int]$observation.liveRunsPerformed
+}
 $runsPerformed = $shadowRuns + $liveRuns
 if ($runsPerformed -eq 0) {
     Assert-Ledger ($runtimeExposure -eq 0) `
         "The ledger records $runtimeExposure finding(s) that reached shadow or live execution ($($runtimeExposureIds -join ', ')), but gateObservations reports no shadow or live run has ever been performed. One of the two is wrong."
 }
-foreach ($exposed in @(@($incidents) + @($nearMisses)) | Where-Object { $true -eq $_.reachedShadowOrLive }) {
+foreach ($exposed in $runtimeFindings | Where-Object { $true -eq $_.reachedShadowOrLive }) {
     Assert-Ledger ([string]$exposed.executionStage -in @('shadow', 'live')) `
         "Finding $($exposed.id) reached shadow or live execution but records executionStage '$($exposed.executionStage)'."
 }
@@ -649,7 +893,7 @@ function Test-ExposureFieldsAgree {
     Register-ValidatorCall -Name 'exposure'
     return (([bool]$Finding.reachedShadowOrLive) -eq ([string]$Finding.executionStage -in @('shadow', 'live')))
 }
-foreach ($finding in @(@($incidents) + @($nearMisses))) {
+foreach ($finding in $runtimeFindings) {
     Assert-Ledger (Test-ExposureFieldsAgree -Finding $finding) `
         "Finding $($finding.id) records executionStage '$($finding.executionStage)' but reachedShadowOrLive is $($finding.reachedShadowOrLive). The two are the same fact; a stage of shadow or live with the flag false silently drops the finding out of the runtime exposure count."
 }
@@ -732,6 +976,9 @@ function Get-DetectorImpliedCategory {
 $categoryDetectorConsistent = 0
 $unanchoredIds = @()
 $budgetCountedCategories = @('typeBinding', 'logic')
+$categoryFindings = @(@($incidents) + @($integrationIncidents))
+$declaredExceptions = @($ledger.categoryAnchorExceptions)
+$declaredExceptionIds = @($declaredExceptions | ForEach-Object { [string]$_.id })
 
 # One validator for both directions, called by the production loop and by the controls, so
 # that removing the rule also breaks the control that is supposed to prove it. Returns the
@@ -741,7 +988,8 @@ function Get-CategoryObjection {
         [Parameter(Mandatory)][object]$Incident,
         [Parameter(Mandatory)][string[]]$CollapseRules,
         [Parameter(Mandatory)][string[]]$ControlFlowRules,
-        [Parameter(Mandatory)][string[]]$CountedCategories
+        [Parameter(Mandatory)][string[]]$CountedCategories,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Exceptions
     )
     Register-ValidatorCall -Name 'category'
     $implied = Get-DetectorImpliedCategory -Text ([string]$Incident.detector) -CollapseRules $CollapseRules -ControlFlowRules $ControlFlowRules
@@ -752,6 +1000,11 @@ function Get-CategoryObjection {
         # typeBinding could be inflated by a single field edit on the one incident the anchor
         # cannot reach.
         if ([string]$Incident.category -in $CountedCategories) {
+            $matchingException = @($Exceptions | Where-Object {
+                    [string]$_.id -eq [string]$Incident.id -and
+                    [string]$_.category -eq [string]$Incident.category
+                })
+            if ($matchingException.Count -eq 1) { return $null }
             return "Escape $($Incident.id) is classified '$($Incident.category)', which the budget counts, but the detector it cites implies no category. A category the trigger reads has to be corroborated by the detector family; record a detector that implies it, or classify the escape outside the counted categories."
         }
         return $null
@@ -762,17 +1015,15 @@ function Get-CategoryObjection {
     return $null
 }
 
-foreach ($incident in $incidents) {
+foreach ($incident in $categoryFindings) {
     $implied = Get-DetectorImpliedCategory -Text ([string]$incident.detector) -CollapseRules $collapseRules -ControlFlowRules $controlFlowRules
     if ($null -eq $implied) { $unanchoredIds += [string]$incident.id } else { $categoryDetectorConsistent++ }
-    Assert-Ledger ($null -eq ($objection = Get-CategoryObjection -Incident $incident -CollapseRules $collapseRules -ControlFlowRules $controlFlowRules -CountedCategories $budgetCountedCategories)) ([string]$objection)
+    Assert-Ledger ($null -eq ($objection = Get-CategoryObjection -Incident $incident -CollapseRules $collapseRules -ControlFlowRules $controlFlowRules -CountedCategories $budgetCountedCategories -Exceptions $declaredExceptions)) ([string]$objection)
 }
 
 # De-anchoring is itself an edit, so it has to be a visible one. Without this, rewriting an
 # incident's detector to name nothing recognised would quietly drop it out of the anchored set
 # and free its category, showing up only as a published counter falling by one.
-$declaredExceptionIds = @($ledger.categoryAnchorExceptions | ForEach-Object { [string]$_.id })
-
 # The set equality was asserted inline, so disabling it let an undeclared exception through
 # while every control stayed green. One validator, called by production and by the control.
 function Get-ExceptionSetObjection {
@@ -817,16 +1068,16 @@ function Get-ExceptionObjection {
 }
 
 foreach ($exception in @($ledger.categoryAnchorExceptions)) {
-    Assert-Ledger ($null -eq ($exceptionObjection = Get-ExceptionObjection -Exception $exception -Incidents @($incidents))) ([string]$exceptionObjection)
+    Assert-Ledger ($null -eq ($exceptionObjection = Get-ExceptionObjection -Exception $exception -Incidents $categoryFindings)) ([string]$exceptionObjection)
 }
 
 # The pin has to be able to fail, through the same validator production uses.
 $exceptionProbe = @(Get-LedgerObject -Json $ledgerJson).categoryAnchorExceptions | Select-Object -First 1
 if ($null -ne $exceptionProbe) {
-    Assert-Ledger ($null -eq (Get-ExceptionObjection -Exception $exceptionProbe -Incidents @($incidents))) `
+    Assert-Ledger ($null -eq (Get-ExceptionObjection -Exception $exceptionProbe -Incidents $categoryFindings)) `
         "The exception validator objects to $($exceptionProbe.id) as filed, so it would fail on honest records."
     $exceptionProbe.category = 'external'
-    Assert-Ledger ($null -ne (Get-ExceptionObjection -Exception $exceptionProbe -Incidents @($incidents))) `
+    Assert-Ledger ($null -ne (Get-ExceptionObjection -Exception $exceptionProbe -Incidents $categoryFindings)) `
         "The exception validator accepted a declared category that disagrees with the escape as filed, so an unanchored escape's category is still free."
 }
 
@@ -838,10 +1089,10 @@ Assert-Ledger ($categoryProbe.Count -eq 1) `
     'No type-binding escape has a detector-anchored category, so the anchor constrains nothing the budget reads.'
 if ($categoryProbe.Count -eq 1) {
     $deflated = @(Get-LedgerObject -Json $ledgerJson).incidents | Where-Object { [string]$_.id -eq [string]$categoryProbe[0].id } | Select-Object -First 1
-    Assert-Ledger ($null -eq (Get-CategoryObjection -Incident $deflated -CollapseRules $collapseRules -ControlFlowRules $controlFlowRules -CountedCategories $budgetCountedCategories)) `
+    Assert-Ledger ($null -eq (Get-CategoryObjection -Incident $deflated -CollapseRules $collapseRules -ControlFlowRules $controlFlowRules -CountedCategories $budgetCountedCategories -Exceptions $declaredExceptions)) `
         "The category validator objects to $($categoryProbe[0].id) as filed, so it would fail on honest records."
     $deflated.category = 'logic'
-    Assert-Ledger ($null -ne (Get-CategoryObjection -Incident $deflated -CollapseRules $collapseRules -ControlFlowRules $controlFlowRules -CountedCategories $budgetCountedCategories)) `
+    Assert-Ledger ($null -ne (Get-CategoryObjection -Incident $deflated -CollapseRules $collapseRules -ControlFlowRules $controlFlowRules -CountedCategories $budgetCountedCategories -Exceptions $declaredExceptions)) `
         "Reclassifying $($categoryProbe[0].id) as 'logic' does not contradict its cited detector, so the category anchor would not have caught it and the type-binding count could be walked down by one field."
 
     # De-anchoring has to be detected, and the check for it has to be able to fail. Comparing
@@ -862,13 +1113,14 @@ if ($categoryProbe.Count -eq 1) {
 
 # The inflation path was the live one: the single incident the anchor cannot reach had a free
 # category, and the budget counts typeBinding.
-$unanchoredProbe = @($incidents | Where-Object { $unanchoredIds -contains [string]$_.id } | Select-Object -First 1)
+$unanchoredProbe = @($categoryFindings | Where-Object { $unanchoredIds -contains [string]$_.id } | Select-Object -First 1)
 if ($unanchoredProbe.Count -eq 1) {
-    $inflated = @(Get-LedgerObject -Json $ledgerJson).incidents | Where-Object { [string]$_.id -eq [string]$unanchoredProbe[0].id } | Select-Object -First 1
-    Assert-Ledger ($null -eq (Get-CategoryObjection -Incident $inflated -CollapseRules $collapseRules -ControlFlowRules $controlFlowRules -CountedCategories $budgetCountedCategories)) `
+    $inflatedLedger = Get-LedgerObject -Json $ledgerJson
+    $inflated = @(@($inflatedLedger.incidents) + @($inflatedLedger.integrationIncidents)) | Where-Object { [string]$_.id -eq [string]$unanchoredProbe[0].id } | Select-Object -First 1
+    Assert-Ledger ($null -eq (Get-CategoryObjection -Incident $inflated -CollapseRules $collapseRules -ControlFlowRules $controlFlowRules -CountedCategories $budgetCountedCategories -Exceptions $declaredExceptions)) `
         "The category validator objects to the unanchored escape $($unanchoredProbe[0].id) as filed, so it would fail on honest records."
     $inflated.category = 'typeBinding'
-    Assert-Ledger ($null -ne (Get-CategoryObjection -Incident $inflated -CollapseRules $collapseRules -ControlFlowRules $controlFlowRules -CountedCategories $budgetCountedCategories)) `
+    Assert-Ledger ($null -ne (Get-CategoryObjection -Incident $inflated -CollapseRules $collapseRules -ControlFlowRules $controlFlowRules -CountedCategories $budgetCountedCategories -Exceptions $declaredExceptions)) `
         "Reclassifying the unanchored escape $($unanchoredProbe[0].id) as 'typeBinding' would not be rejected, so the budget count can still be inflated by one field."
 }
 
@@ -966,6 +1218,8 @@ if ($VerifyCommits) {
         param(
             [Parameter(Mandatory)][object]$NearMiss,
             [Parameter(Mandatory)][string]$WindowEnd,
+            [Parameter(Mandatory)][string]$ClassificationAnchor,
+            [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$PreservedNearMissIds,
             [Parameter(Mandatory)][string]$RepoRoot
         )
         Register-ValidatorCall -Name 'nearMissBaseline'
@@ -979,6 +1233,10 @@ if ($VerifyCommits) {
         }
         if (Test-CommitMerged -Sha $introduced -WindowEnd $baseline -RepoRoot $RepoRoot) {
             $reasons.Add("Near miss $($NearMiss.id) was introduced at $introduced, which IS reachable from the mainline commit $baseline it was classified against. A defect already on the mainline is an escape and must be counted against the budget; it cannot be reclassified out of the window by declaring mergedBeforeDetection false.")
+        }
+        if ((Test-CommitMerged -Sha $introduced -WindowEnd $WindowEnd -RepoRoot $RepoRoot) -and
+            $PreservedNearMissIds -notcontains [string]$NearMiss.id) {
+            $reasons.Add("Near miss $($NearMiss.id) is reachable from the current coverage-window end but is not preserved by the digest-verified v1 snapshot. A new finding already in the current window is an escape.")
         }
 
         # The baseline is not chosen, derived, or bounded: it is the snapshot's own anchor.
@@ -994,8 +1252,8 @@ if ($VerifyCommits) {
         # against is the one the snapshot is anchored to, and there is exactly one such commit.
         # Advancing the window is not an edit to this record; it is the authoring of a new
         # snapshot, at which point every near miss is re-judged against the new anchor.
-        if (-not $WindowEnd.StartsWith($baseline) -and -not $baseline.StartsWith($WindowEnd)) {
-            $reasons.Add("Near miss $($NearMiss.id) records a baseline of $baseline, but this ledger is a snapshot anchored at $WindowEnd. A finding is judged against the snapshot's own anchor; choosing any other commit is choosing how much history to ignore, and choosing enough of it turns a merged escape into a near miss. Advancing the window is not an edit to this record - it authors a new snapshot, in which every near miss is re-judged against the new anchor and any whose introducing commit has since become reachable is an escape.")
+        if (-not $ClassificationAnchor.StartsWith($baseline) -and -not $baseline.StartsWith($ClassificationAnchor)) {
+            $reasons.Add("Near miss $($NearMiss.id) records a baseline of $baseline, but its preserved historical classification is anchored at $ClassificationAnchor. Choosing any other commit changes how much history the classification ignores.")
         }
 
         # detectedOn no longer selects a commit, but it still orders the record, and a defect
@@ -1007,6 +1265,7 @@ if ($VerifyCommits) {
         return @($reasons)
     }
 
+    $preservedNearMissIds = @($v1Ledger.nearMisses | ForEach-Object { [string]$_.id })
     foreach ($nearMiss in $nearMisses) {
         $nearMissNames = @($nearMiss.PSObject.Properties | ForEach-Object { $_.Name })
         Assert-Ledger ($nearMissNames -contains 'introducedCommit') `
@@ -1020,7 +1279,7 @@ if ($VerifyCommits) {
         # contains a near miss makes its introducing commit reachable, and the gate would
         # then fail - or, worse, demand that a correctly filed near miss be reclassified as
         # an escape - for no reason other than that time passed.
-        Assert-Ledger ('' -eq ($baselineReasons = @(Test-NearMissBaseline -NearMiss $nearMiss -WindowEnd $windowEnd -RepoRoot $repoRoot) -join ' ')) `
+        Assert-Ledger ('' -eq ($baselineReasons = @(Test-NearMissBaseline -NearMiss $nearMiss -WindowEnd $windowEnd -ClassificationAnchor ([string]$ledger.previousSnapshot.asOfCommit) -PreservedNearMissIds $preservedNearMissIds -RepoRoot $repoRoot) -join ' ')) `
             $baselineReasons
 
         Assert-RemediationCommit -Finding $nearMiss -RepoRoot $repoRoot
@@ -1106,11 +1365,11 @@ if ($VerifyCommits) {
     $windowStart = [string]$ledger.coverageWindow.startCommit
     $baselineProbe = @(Get-LedgerObject -Json $ledgerJson).nearMisses | Select-Object -First 1
     if ($null -ne $baselineProbe -and -not [string]::IsNullOrWhiteSpace($windowStart)) {
-        Assert-Ledger ((@(Test-NearMissBaseline -NearMiss $baselineProbe -WindowEnd $windowEnd -RepoRoot $repoRoot)).Count -eq 0) `
+        Assert-Ledger ((@(Test-NearMissBaseline -NearMiss $baselineProbe -WindowEnd $windowEnd -ClassificationAnchor ([string]$ledger.previousSnapshot.asOfCommit) -PreservedNearMissIds $preservedNearMissIds -RepoRoot $repoRoot)).Count -eq 0) `
             'The near-miss baseline validator rejects an unmutated near miss, so it would fail on honest records.'
         $honestBaseline = [string]$baselineProbe.classifiedAgainstCommit
         $baselineProbe.classifiedAgainstCommit = $windowStart
-        Assert-Ledger ((@(Test-NearMissBaseline -NearMiss $baselineProbe -WindowEnd $windowEnd -RepoRoot $repoRoot)).Count -gt 0) `
+        Assert-Ledger ((@(Test-NearMissBaseline -NearMiss $baselineProbe -WindowEnd $windowEnd -ClassificationAnchor ([string]$ledger.previousSnapshot.asOfCommit) -PreservedNearMissIds $preservedNearMissIds -RepoRoot $repoRoot)).Count -gt 0) `
             "The near-miss baseline validator accepted the coverage window's start commit $windowStart as a baseline. That commit is old enough to make any merged escape look unmerged, so the escape-to-near-miss reclassification would still be available."
 
         # A baseline dated the same day as detection is the cheap version of the same move:
@@ -1120,7 +1379,7 @@ if ($VerifyCommits) {
         $sameDayDecoy = @($windowCommits | Where-Object { $_ -and ((Get-CommitDay -Sha $_ -RepoRoot $repoRoot) -eq [string]$baselineProbe.detectedOn) -and -not $honestBaseline.StartsWith($_) -and -not $_.StartsWith($honestBaseline) } | Select-Object -First 1)
         if ($sameDayDecoy.Count -eq 1) {
             $baselineProbe.classifiedAgainstCommit = [string]$sameDayDecoy[0]
-            Assert-Ledger ((@(Test-NearMissBaseline -NearMiss $baselineProbe -WindowEnd $windowEnd -RepoRoot $repoRoot)).Count -gt 0) `
+            Assert-Ledger ((@(Test-NearMissBaseline -NearMiss $baselineProbe -WindowEnd $windowEnd -ClassificationAnchor ([string]$ledger.previousSnapshot.asOfCommit) -PreservedNearMissIds $preservedNearMissIds -RepoRoot $repoRoot)).Count -gt 0) `
                 "The near-miss baseline validator accepted $($sameDayDecoy[0]), a commit sharing the detection date but not the mainline as of it. A date bound leaves every commit on that day available, which is enough to reclassify a merged escape."
         }
 
@@ -1128,9 +1387,15 @@ if ($VerifyCommits) {
         # choose an older mainline.
         $baselineProbe.classifiedAgainstCommit = $honestBaseline
         $baselineProbe.detectedOn = '2026-08-01'
-        Assert-Ledger ((@(Test-NearMissBaseline -NearMiss $baselineProbe -WindowEnd $windowEnd -RepoRoot $repoRoot)).Count -gt 0) `
+        Assert-Ledger ((@(Test-NearMissBaseline -NearMiss $baselineProbe -WindowEnd $windowEnd -ClassificationAnchor ([string]$ledger.previousSnapshot.asOfCommit) -PreservedNearMissIds $preservedNearMissIds -RepoRoot $repoRoot)).Count -gt 0) `
             'The near-miss baseline validator accepted a backdated detectedOn. The baseline is derived from that date, so moving it moves the mainline the unmerged claim is tested against.'
     }
+
+    $newNearMissProbe = Get-LedgerObject -Json ($nearMisses[0] | ConvertTo-Json -Depth 16)
+    $newNearMissProbe.id = 'NM-9999'
+    $newNearMissProbe.introducedCommit = $windowEnd
+    Assert-Ledger ((@(Test-NearMissBaseline -NearMiss $newNearMissProbe -WindowEnd $windowEnd -ClassificationAnchor ([string]$ledger.previousSnapshot.asOfCommit) -PreservedNearMissIds $preservedNearMissIds -RepoRoot $repoRoot)).Count -gt 0) `
+        'A newly filed near miss whose introducing commit is already in the current coverage window was accepted.'
 
     # The reason the near-miss rule reads classifiedAgainstCommit rather than the live
     # window end is not decorative, and this proves it: every near miss's introducing commit
@@ -1213,28 +1478,95 @@ if ($VerifyCommits) {
     }
 }
 
+function Get-DiscardedValidatorVerdicts {
+    param([Parameter(Mandatory)][string]$ScriptText)
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput($ScriptText, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count -gt 0) { return @('The validator-consumption probe could not parse its input.') }
+    $validatorNames = @(
+        'Test-IntegrationBudgetEligibilityConsistent',
+        'Test-IdSetsEqual',
+        'Test-ClockAuthorityConsistent',
+        'Test-ExposureFieldsAgree',
+        'Get-AcceptanceObjection',
+        'Get-CategoryObjection',
+        'Get-ExceptionSetObjection',
+        'Get-ExceptionObjection',
+        'Get-ClassificationBaselineObjection',
+        'Test-NearMissBaseline',
+        'Get-AcceptanceCommitObjection'
+    )
+    $objections = New-Object System.Collections.Generic.List[string]
+    $calls = $ast.FindAll({
+            param($node)
+            if ($node -isnot [Management.Automation.Language.CommandAst]) { return $false }
+            return ([string]$node.GetCommandName() -in $validatorNames)
+        }, $true)
+    foreach ($call in $calls) {
+        $parent = $call.Parent
+        $assertion = $null
+        while ($null -ne $parent) {
+            if ($parent -is [Management.Automation.Language.CommandAst] -and [string]$parent.GetCommandName() -eq 'Assert-Ledger') {
+                $assertion = $parent
+                break
+            }
+            if ($parent -is [Management.Automation.Language.FunctionDefinitionAst]) { break }
+            $parent = $parent.Parent
+        }
+        if ($null -eq $assertion -or $assertion.CommandElements.Count -lt 2) {
+            $objections.Add("Validator $($call.GetCommandName()) at line $($call.Extent.StartLineNumber) is not consumed by Assert-Ledger.")
+            continue
+        }
+        $verdictExtent = $assertion.CommandElements[1].Extent
+        if ($call.Extent.StartOffset -lt $verdictExtent.StartOffset -or $call.Extent.EndOffset -gt $verdictExtent.EndOffset) {
+            $objections.Add("Validator $($call.GetCommandName()) at line $($call.Extent.StartLineNumber) is not part of Assert-Ledger's verdict argument.")
+            continue
+        }
+        if ($verdictExtent.Text -match '(?i)(?:-or\s+\$true|-and\s+\$false)') {
+            $objections.Add("Validator $($call.GetCommandName()) at line $($call.Extent.StartLineNumber) has its verdict discarded by a constant boolean expression.")
+        }
+    }
+    return @($objections)
+}
+
+$selfText = Get-Content -LiteralPath $PSCommandPath -Raw
+Assert-Ledger (@(Get-DiscardedValidatorVerdicts -ScriptText $selfText).Count -eq 0) `
+    'A shared validator verdict is not consumed directly by Assert-Ledger.'
+$discardedVerdictProbe = $selfText + [Environment]::NewLine + 'Assert-Ledger ((Test-ExposureFieldsAgree -Finding $finding) -or $true) ''discarded'''
+Assert-Ledger (@(Get-DiscardedValidatorVerdicts -ScriptText $discardedVerdictProbe).Count -gt 0) `
+    'The validator-consumption sabotage accepted an explicit "-or $true" that discards a validator verdict.'
+
 # Every shared validator's entry count is asserted against the production invocations the real
 # ledger requires plus the fixed number of control invocations. This is the check that survives
 # call-site deletion: removing a production Assert-Ledger leaves the rule body intact and every
 # control green, and does not move the check count, so nothing else in this gate notices. The
 # numbers are deliberately explicit - adding or removing a control has to be recorded here.
-$findingCount = @($incidents).Count + @($nearMisses).Count
+$findingCount = @($runtimeFindings).Count
+$historicalFindingCount = @($incidents).Count + @($nearMisses).Count
+Assert-ValidatorInvoked -Name 'integrationBudgetEligibility' -Expected ($integrationIncidents.Count + 1) -Rule 'integration budget eligibility'
+Assert-ValidatorInvoked -Name 'idSetEquality' -Expected 2 -Rule 'qualifying incident set equality'
+Assert-ValidatorInvoked -Name 'coverageClock' -Expected 4 -Rule 'coverage clock derivation'
+Assert-ValidatorInvoked -Name 'clockAuthority' -Expected 5 -Rule 'clock authority consistency'
 Assert-ValidatorInvoked -Name 'exposure' -Expected ($findingCount + 2) -Rule 'stage/exposure equivalence'
-Assert-ValidatorInvoked -Name 'category' -Expected (@($incidents).Count + 4) -Rule 'category anchor'
+Assert-ValidatorInvoked -Name 'category' -Expected (@($categoryFindings).Count + 4) -Rule 'category anchor'
 Assert-ValidatorInvoked -Name 'exceptionSet' -Expected 2 -Rule 'exception set equality'
 Assert-ValidatorInvoked -Name 'exceptionEntry' -Expected (@($ledger.categoryAnchorExceptions).Count + 2) -Rule 'exception entry'
+$classificationBaselineExpected = if ($VerifyCommits) { 7 } else { 5 }
+Assert-ValidatorInvoked -Name 'classificationBaseline' -Expected $classificationBaselineExpected -Rule 'historical classification baseline'
 if ($VerifyCommits) {
-    Assert-ValidatorInvoked -Name 'acceptance' -Expected ($findingCount + 5) -Rule 'acceptance evidence'
-    Assert-ValidatorInvoked -Name 'nearMissBaseline' -Expected (@($nearMisses).Count + 4) -Rule 'near-miss baseline'
-    Assert-ValidatorInvoked -Name 'acceptanceCommit' -Expected ($findingCount + 1) -Rule 'acceptance commit'
+    Assert-ValidatorInvoked -Name 'acceptance' -Expected ($historicalFindingCount + 5) -Rule 'acceptance evidence'
+    Assert-ValidatorInvoked -Name 'nearMissBaseline' -Expected (@($nearMisses).Count + 5) -Rule 'near-miss baseline'
+    Assert-ValidatorInvoked -Name 'acceptanceCommit' -Expected ($historicalFindingCount + 1) -Rule 'acceptance commit'
 }
 else {
-    Assert-ValidatorInvoked -Name 'acceptance' -Expected ($findingCount + 2) -Rule 'acceptance evidence'
+    Assert-ValidatorInvoked -Name 'acceptance' -Expected ($historicalFindingCount + 2) -Rule 'acceptance evidence'
 }
 
 $report = [ordered]@{
     check = 'reviewer-escape-ledger'
     incidents = $incidents.Count
+    integrationIncidents = $integrationIncidents.Count
     nearMisses = @($nearMisses).Count
     runtimeExposure = [ordered]@{
         findingCount = $runtimeExposure
@@ -1244,13 +1576,20 @@ $report = [ordered]@{
         observationStatus = $(if ($runsPerformed -eq 0) { 'noRuns' } else { 'observed' })
     }
     categoryDetectorConsistent = $categoryDetectorConsistent
+    declaredCategoryAnchorExceptions = @($ledger.categoryAnchorExceptions).Count
+    budgetEligibleCategoryAnchorExceptions = @($ledger.categoryAnchorExceptions | Where-Object {
+            $id = [string]$_.id
+            @($integrationIncidents | Where-Object { [string]$_.id -eq $id -and [bool]$_.budgetEligible }).Count -eq 1
+        }).Count
     remediated = @($incidents | Where-Object { $_.status -eq 'remediated' }).Count
     openDebt = @($incidents | Where-Object { $_.status -eq 'openDebt' }).Count
-    typeBinding = @($incidents | Where-Object { $_.category -eq 'typeBinding' }).Count
-    reachedShadowOrLive = @($incidents | Where-Object { $_.reachedShadowOrLive }).Count
+    typeBinding = @($categoryFindings | Where-Object { $_.category -eq 'typeBinding' }).Count
+    reachedShadowOrLive = @($runtimeFindings | Where-Object { $_.reachedShadowOrLive }).Count
     inWindow = $measured.InWindowIds.Count
     qualifyingCount = $measured.QualifyingCount
     triggered = $measured.Triggered
+    decisionYieldPercent = [double]$snapshot.decisionYieldPercent
+    unauthorizedWrites = [int]$snapshot.unauthorizedWrites
     commitsVerified = $commitsVerified
     commitsBehindHead = $script:CommitsBehindHead
     checks = $script:Checks
@@ -1264,4 +1603,4 @@ if ($script:Failures.Count -gt 0) {
     throw "Escape ledger validation failed $($script:Failures.Count) check(s):$([Environment]::NewLine)$detail"
 }
 
-Write-Host "PASS: escape ledger ($($incidents.Count) incidents, $($script:Checks) checks, trigger not fired)."
+Write-Host "PASS: escape ledger ($($incidents.Count) historical + $($integrationIncidents.Count) integration incidents, $($script:Checks) checks, trigger fired)."

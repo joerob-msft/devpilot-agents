@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://example.invalid/schemas/reviewer.escape-ledger.v1.json",
-  "title": "Reviewer escape ledger v1",
+  "$id": "https://example.invalid/schemas/reviewer.escape-ledger.v2.json",
+  "title": "Reviewer escape ledger v2",
   "description": "Versioned, employer-neutral record of defects that escaped review into a merged coordinator change, together with the escape budget whose breach triggers a control-plane decision.",
   "type": "object",
   "additionalProperties": false,
@@ -9,19 +9,35 @@
     "schemaVersion",
     "kind",
     "ledgerVersion",
+    "previousSnapshot",
     "coverageWindow",
     "vocabulary",
     "budget",
     "incidents",
+    "integrationIncidents",
+    "classificationBaseline",
     "categoryAnchorExceptions",
     "gateObservations",
+    "integrationSnapshot",
     "decision"
   ],
   "properties": {
-    "schemaVersion": { "type": "integer", "const": 1 },
+    "schemaVersion": { "type": "integer", "const": 2 },
     "kind": { "type": "string", "const": "reviewer-escape-ledger" },
     "ledgerVersion": { "type": "integer", "minimum": 1 },
     "description": { "type": "string", "minLength": 1 },
+    "previousSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "asOfCommit", "artifactCommit", "artifactPath", "ledgerSha256"],
+      "properties": {
+        "schemaVersion": { "type": "integer", "const": 1 },
+        "asOfCommit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+        "artifactCommit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+        "artifactPath": { "type": "string", "const": "docs/escape-ledger.v1.json" },
+        "ledgerSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
     "coverageWindow": {
       "type": "object",
       "additionalProperties": false,
@@ -97,18 +113,24 @@
       "properties": {
         "id": { "type": "string", "minLength": 1 },
         "operationalStatus": {
-          "comment": "The budget is pre-registered so the threshold cannot be moved after results are seen, but its window clock is authored rather than derived. Until a coordinator-change registry exists the only honest status is a dated snapshot, and this field sits beside the counts so a reader of the machine-readable form cannot take them as current.",
+          "comment": "Version 1 was a historical snapshot. Version 2 permits inForce only when the Gate 5 integration snapshot, coverage-window head, budget head, evidence set, and trigger recomputation agree.",
           "type": "string",
-          "enum": ["historicalSnapshot"]
+          "enum": ["historicalSnapshot", "inForce"]
         },
         "asOfCommit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
         "statement": { "type": "string", "minLength": 1 },
         "threshold": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["category", "reachedExecutionStages", "count"],
+          "required": ["category", "countedRecordKinds", "reachedExecutionStages", "count"],
           "properties": {
             "category": { "type": "string", "enum": ["typeBinding", "logic", "modelProtocol", "supervision", "external"] },
+            "countedRecordKinds": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "type": "string", "enum": ["incident", "integrationIncident"] }
+            },
             "reachedExecutionStages": {
               "type": "array",
               "minItems": 1,
@@ -137,12 +159,12 @@
             "qualifyingIncidentIds": {
               "type": "array",
               "uniqueItems": true,
-              "items": { "type": "string", "pattern": "^ESC-[0-9]{4}$" }
+              "items": { "type": "string", "pattern": "^(ESC|INT)-[0-9]{4}$" }
             },
             "inWindowIncidentIds": {
               "type": "array",
               "uniqueItems": true,
-              "items": { "type": "string", "pattern": "^ESC-[0-9]{4}$" }
+              "items": { "type": "string", "pattern": "^(ESC|INT)-[0-9]{4}$" }
             },
             "qualifyingCount": { "type": "integer", "minimum": 0 },
             "triggered": { "type": "boolean" }
@@ -201,6 +223,78 @@
               }
             }
           }
+        }
+      }
+    },
+    "integrationIncidents": {
+      "description": "Post-snapshot integration incidents. These are evidence from an authorized Gate 5 lineage, not claims about which repository commit introduced a defect, so they deliberately carry sealed evidence instead of introducedCommit.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "title",
+          "category",
+          "executionStage",
+          "integrationPhase",
+          "reachedShadowOrLive",
+          "budgetEligible",
+          "status",
+          "summary",
+          "detector",
+          "regressionGuard",
+          "detectedOn",
+          "coordinatorChangeOrdinal",
+          "evidence"
+        ],
+        "properties": {
+          "id": { "type": "string", "pattern": "^INT-[0-9]{4}$" },
+          "title": { "type": "string", "minLength": 1 },
+          "category": { "type": "string", "enum": ["typeBinding", "logic", "modelProtocol", "supervision", "external"] },
+          "executionStage": { "type": "string", "enum": ["shadow", "live"] },
+          "integrationPhase": {
+            "type": "string",
+            "enum": ["liveCapturePreparation", "shadowPreparation", "shadowPostDiscovery", "snapshotFinalization"]
+          },
+          "reachedShadowOrLive": { "type": "boolean", "const": true },
+          "budgetEligible": { "type": "boolean" },
+          "status": { "type": "string", "enum": ["remediated", "observed", "blocked"] },
+          "summary": { "type": "string", "minLength": 1 },
+          "detector": { "type": "string", "minLength": 1 },
+          "regressionGuard": { "type": "string", "minLength": 1 },
+          "detectedOn": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+          "coordinatorChangeOrdinal": { "type": "integer", "minimum": 1 },
+          "evidence": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "sha256", "disclosure", "summary"],
+            "properties": {
+              "kind": { "type": "string", "enum": ["sealedArtifact", "coordinatorEvidenceDigest"] },
+              "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+              "disclosure": { "type": "string", "const": "publicDigestOnly" },
+              "summary": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    },
+    "classificationBaseline": {
+      "description": "Pinned identities for the historical records. A record can move lists or change its asserted introducing commit only through a separately reviewed baseline edit, so introducedCommit falsification cannot silently remove an escape from the budget.",
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "recordKind", "category", "executionStage", "introducedCommit"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^(ESC|NM)-[0-9]{4}$" },
+          "recordKind": { "type": "string", "enum": ["incident", "nearMiss"] },
+          "category": { "type": "string", "enum": ["verificationLogic", "typeBinding", "logic", "modelProtocol", "supervision", "external"] },
+          "executionStage": { "type": "string", "enum": ["deterministic", "shadow", "live"] },
+          "introducedCommit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" }
         }
       }
     },
@@ -279,7 +373,7 @@
         "additionalProperties": false,
         "required": ["id", "category", "rationale"],
         "properties": {
-          "id": { "type": "string", "pattern": "^(ESC|NM)-[0-9]{4}$" },
+          "id": { "type": "string", "pattern": "^(ESC|NM|INT)-[0-9]{4}$" },
           "category": { "type": "string", "enum": ["typeBinding", "logic", "modelProtocol", "supervision", "external"] },
           "rationale": { "type": "string", "minLength": 1 }
         }
@@ -291,15 +385,46 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["gate", "observation", "decisionYieldPercent", "externalWrites", "noWriteInvariantHeld", "shadowRunsPerformed", "liveRunsPerformed"],
+        "required": ["gate", "observation", "cohortSize", "completedDecisions", "decisionYieldPercent", "unauthorizedWrites", "externalWrites", "noWriteInvariantHeld", "shadowRunsPerformed", "liveRunsPerformed"],
         "properties": {
           "gate": { "type": "string", "minLength": 1 },
           "observation": { "type": "string", "minLength": 1 },
+          "cohortSize": { "type": "integer", "minimum": 1 },
+          "completedDecisions": { "type": "integer", "minimum": 0 },
           "decisionYieldPercent": { "type": "number", "minimum": 0, "maximum": 100 },
+          "unauthorizedWrites": { "type": "integer", "minimum": 0 },
           "externalWrites": { "type": "integer", "minimum": 0 },
           "noWriteInvariantHeld": { "type": "boolean" },
           "shadowRunsPerformed": { "type": "integer", "minimum": 0 },
           "liveRunsPerformed": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "integrationSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "asOfCommit", "observedOn", "coordinatorChangeOrdinal", "cohortSize", "completedDecisions", "decisionYieldPercent", "unauthorizedWrites", "qualifyingIncidentIds", "triggered", "evidenceDigests"],
+      "properties": {
+        "status": { "type": "string", "const": "authoritative" },
+        "asOfCommit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+        "observedOn": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+        "coordinatorChangeOrdinal": { "type": "integer", "minimum": 1 },
+        "cohortSize": { "type": "integer", "minimum": 1 },
+        "completedDecisions": { "type": "integer", "minimum": 0 },
+        "decisionYieldPercent": { "type": "number", "minimum": 0, "maximum": 100 },
+        "unauthorizedWrites": { "type": "integer", "minimum": 0 },
+        "qualifyingIncidentIds": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^(ESC|INT)-[0-9]{4}$" }
+        },
+        "triggered": { "type": "boolean", "const": true },
+        "evidenceDigests": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
         }
       }
     },
@@ -337,8 +462,8 @@
               "inForce": { "type": "boolean" },
               "inForceNote": { "type": "string", "minLength": 1 },
               "clockAuthority": {
-                "comment": "Only one value is legal in this schema version. coordinatorChangeRegistry is deliberately absent: naming an authority that has no data and no currentness check behind it would let two string edits produce a green, in-force, still authority-free clock. Add the value in the same change that adds the registry and the checks that read it.",
-                "enum": ["authoredOrdinals"]
+                "comment": "authoredOrdinals is legal only for an out-of-force historical snapshot. gate5IntegrationSnapshot is legal for the in-force state only when the version 2 snapshot and its currentness checks pass.",
+                "enum": ["authoredOrdinals", "gate5IntegrationSnapshot"]
               },
               "evidence": { "type": "string", "minLength": 1 }
             }
