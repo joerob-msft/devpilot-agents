@@ -1884,12 +1884,41 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
 # mocks and $script: config never leak into later tests.
 # ---------------------------------------------------------------------------
 & {
-    foreach ($fn in 'Get-ReviewerMarkerSchema', 'Test-ReviewerMarkerBinding', 'Get-ReviewerHashValue',
-        'Invoke-ReviewerModelSubprocess', 'Invoke-ReviewerModelPass') {
-        Invoke-Expression (Get-FunctionText -Text $wrapperText -Name $fn)
+    $logDir = Join-Path ([IO.Path]::GetTempPath()) ("SIMULATED-OFFLINE-reviewer-item1-{0}" -f ([guid]::NewGuid()))
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $sentinelProcessName = "devpilot-never-run-$([guid]::NewGuid().ToString('N'))"
+    $sentinelAgencyPath = Join-Path $logDir "$sentinelProcessName.exe"
+    $telemetryPath = Join-Path $logDir 'offline-telemetry.jsonl'
+    $priorTelemetryMode = [Environment]::GetEnvironmentVariable('DEVPILOT_OFFLINE_TELEMETRY_MODE', 'Process')
+    $priorTelemetryPath = [Environment]::GetEnvironmentVariable('DEVPILOT_OFFLINE_TELEMETRY_PATH', 'Process')
+    $env:DEVPILOT_OFFLINE_TELEMETRY_MODE = 'production-test-only'
+    $env:DEVPILOT_OFFLINE_TELEMETRY_PATH = $telemetryPath
+
+    $script:timedProcessCallCount = 0
+    $script:timedProcessCalls = [System.Collections.Generic.List[object]]::new()
+    $script:cannedStdOut = ''
+    # Define the interception boundary before importing the production functions.
+    # If command binding ever stops selecting this local function, the deliberately
+    # nonexistent AgencyPath below can only fail at Process.Start.
+    function Invoke-TimedProcess {
+        param($FilePath, $ArgumentList, $StandardInputContent, [switch]$CaptureStdOut, [switch]$CaptureStdErr, $WorkingDirectory, $EnvironmentVariablesToRemove, $TimeoutSeconds)
+        $script:timedProcessCallCount++
+        [void]$script:timedProcessCalls.Add([pscustomobject]@{
+                FilePath = [string]$FilePath
+                ProcessId = 0
+                Simulated = $true
+            })
+        Write-Host "[SIMULATED/OFFLINE STUB] Intercepted process call; no executable, model, provider, or network was started." -ForegroundColor DarkGray
+        @{ ProcessId = 0; StdOut = $script:cannedStdOut; StdErr = ''; ExitCode = 0; TimedOut = $false }
     }
-    # Assert-ReviewerModelResultContractFits was already defined above; the pass
-    # calls it as the real pre-launch gate.
+
+    try {
+        foreach ($fn in 'Get-ReviewerMarkerSchema', 'Test-ReviewerMarkerBinding', 'Get-ReviewerHashValue',
+            'Invoke-ReviewerModelSubprocess', 'Invoke-ReviewerModelPass') {
+            Invoke-Expression (Get-FunctionText -Text $wrapperText -Name $fn)
+        }
+        # Assert-ReviewerModelResultContractFits was already defined above; the
+        # pass calls it as the real pre-launch gate.
     $script:ReviewerUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
     $script:ReviewerSeverities = @("critical", "important", "suggestion")
     $script:ReviewerMaxModelInputBytes = 10485760
@@ -1906,13 +1935,9 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
     $CopilotSensitiveEnvironmentVariables = @()
     $RepoPath = $repoRoot
     $CycleTimeoutSeconds = 60
-    $logDir = Join-Path ([IO.Path]::GetTempPath()) ("reviewer-item1-{0}" -f ([guid]::NewGuid()))
-    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
     $PromptFile = Join-Path $logDir 'prompt.md'
     Set-Content -LiteralPath $PromptFile -Value 'PROMPT' -Encoding UTF8
     $script:knownNonce = ('abc123' * 6)
-    $script:timedProcessCalled = $false
-    $script:cannedStdOut = ''
     # This block exercises the REAL extracted model-pass/subprocess functions, so
     # it must also stand up the module-scope state Start-ReviewerAgent.ps1 sets up
     # before any pass runs. Their production defaults are all "inactive": without
@@ -1938,11 +1963,6 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
     function Get-AgentDefaultModelSentinel { 'DEFAULT_SENTINEL' }
     function Get-AgentCopilotArgs { param($AgentName, $Source, $AvailableTools, $AllowTools, $DenyTools, $Model, [switch]$JsonOutput) @('--json') }
     function Add-ReviewerAcquisitionCapture { param($Run, $Role, $Model, $StandardInputContent, $Binding) }
-    function Invoke-TimedProcess {
-        param($FilePath, $ArgumentList, $StandardInputContent, [switch]$CaptureStdOut, [switch]$CaptureStdErr, $WorkingDirectory, $EnvironmentVariablesToRemove, $TimeoutSeconds)
-        $script:timedProcessCalled = $true
-        @{ StdOut = $script:cannedStdOut; StdErr = ''; ExitCode = 0; TimedOut = $false }
-    }
 
     $sourceCommit = ('a' * 40)
     $Bound = @{ PrId = 42; SourceCommit = $sourceCommit; SourceBranch = 'b'; AuthorAlias = 'x'; DigestText = '' }
@@ -1958,9 +1978,9 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
 
     # (1) A valid, correctly bound marker succeeds - the whole point of the fix.
     $script:cannedStdOut = New-Transcript -Marker $validMarker
-    $script:timedProcessCalled = $false
-    $okRes = Invoke-ReviewerModelPass -AgencyPath 'copilot' -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1
-    Assert-Specialist ($script:timedProcessCalled -and [string]$okRes.RejectionClass -ceq 'success' -and
+    Write-Host "[SIMULATED/OFFLINE CASE: valid marker] The following production launch text is exercised with canned output only." -ForegroundColor DarkCyan
+    $okRes = Invoke-ReviewerModelPass -AgencyPath $sentinelAgencyPath -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1
+    Assert-Specialist ($script:timedProcessCallCount -eq 1 -and [string]$okRes.RejectionClass -ceq 'success' -and
         $null -ne $okRes.Marker -and [int]$okRes.Marker['prId'] -eq 42) `
         "The live Invoke-ReviewerModelPass rejected a valid, correctly bound marker (the module-scope status regression)."
     Assert-Specialist ([long]$okRes.Usage.PremiumRequests -eq 3 -and [long]$okRes.Usage.TotalApiDurationMs -eq 100 -and [bool]$okRes.ModelRan) `
@@ -1972,7 +1992,8 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
     $noNonce = [ordered]@{ schemaVersion = 1; prId = 42; repositoryId = $cfgRepoId; project = 'One'
         reviewedSourceCommit = $sourceCommit; findings = @(); recommendedVote = 'approve'; summary = '' }
     $script:cannedStdOut = New-Transcript -Marker $noNonce
-    $noNonceRes = Invoke-ReviewerModelPass -AgencyPath 'copilot' -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1
+    Write-Host "[SIMULATED/OFFLINE CASE: missing nonce] The following production launch text is exercised with canned output only." -ForegroundColor DarkCyan
+    $noNonceRes = Invoke-ReviewerModelPass -AgencyPath $sentinelAgencyPath -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1
     Assert-Specialist ([string]$noNonceRes.RejectionClass -ceq 'schemaInvalid' -and $null -eq $noNonceRes.Marker -and
         $noNonceRes.Reason -match 'nonce') `
         "The live pass did not classify a missing-nonce marker as the typed schemaInvalid (field nonce) slip."
@@ -1985,25 +2006,64 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
     $wrongPr = [ordered]@{ schemaVersion = 1; prId = 999; repositoryId = $cfgRepoId; project = 'One'
         reviewedSourceCommit = $sourceCommit; findings = @(); recommendedVote = 'approve'; summary = ''; nonce = $script:knownNonce }
     $script:cannedStdOut = New-Transcript -Marker $wrongPr
-    $wrongRes = Invoke-ReviewerModelPass -AgencyPath 'copilot' -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1
+    Write-Host "[SIMULATED/OFFLINE CASE: wrong PR] The following production launch text is exercised with canned output only." -ForegroundColor DarkCyan
+    $wrongRes = Invoke-ReviewerModelPass -AgencyPath $sentinelAgencyPath -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1
     Assert-Specialist ([string]$wrongRes.RejectionClass -ceq 'wrongBinding' -and $null -eq $wrongRes.Marker) `
         "The live pass did not refuse a marker bound to the wrong pull request as wrongBinding."
     Assert-Specialist (-not (Test-AgentMarkerStatusRetryable -Status ([string]$wrongRes.RejectionClass))) `
         "The live pass reported a wrong-binding marker as retryable, which is how a replay would be handed extra tries."
+    Assert-Specialist ($script:timedProcessCallCount -eq 3) `
+        "The three simulated marker cases did not make exactly three stub calls."
+    Assert-Specialist (@($script:timedProcessCalls | Where-Object {
+                [string]$_.FilePath -cne $sentinelAgencyPath -or [int]$_.ProcessId -ne 0 -or -not [bool]$_.Simulated
+            }).Count -eq 0) `
+        "A simulated marker case did not stay bound to the ProcessId=0 nonexistent-executable stub."
+    Assert-Specialist (-not (Test-Path -LiteralPath $sentinelAgencyPath) -and
+        $null -eq (Get-Process -Name $sentinelProcessName -ErrorAction SilentlyContinue) -and
+        -not (Test-Path -LiteralPath $telemetryPath)) `
+        "A sentinel executable/process or offline telemetry/model/provider event was observed."
 
     # (4) When the declared scan window cannot hold the schema's largest legal
     # marker, the pre-launch gate must refuse to launch: Invoke-TimedProcess is
     # never reached. Shrinking the window below the generalist worst case proves
     # the gate is a real launch barrier, not an isolated helper.
     $script:ReviewerMarkerScanWindowChars = 8
-    $script:timedProcessCalled = $false
     $gateBlocked = $false
-    try { Invoke-ReviewerModelPass -AgencyPath 'copilot' -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1 | Out-Null }
+    Write-Host "[SIMULATED/OFFLINE CASE: contract gate] No process-stub call is permitted." -ForegroundColor DarkCyan
+    try { Invoke-ReviewerModelPass -AgencyPath $sentinelAgencyPath -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1 | Out-Null }
     catch { $gateBlocked = $true }
-    Assert-Specialist ($gateBlocked -and -not $script:timedProcessCalled) `
+    Assert-Specialist ($gateBlocked -and $script:timedProcessCallCount -eq 3) `
         "An un-fittable generalist result contract still reached Invoke-TimedProcess instead of refusing to launch."
 
-    Remove-Item -LiteralPath $logDir -Recurse -Force -ErrorAction SilentlyContinue
+        # Deliberately remove the interception boundary once. The production
+        # Invoke-TimedProcess is then visible, but the nonexistent AgencyPath must
+        # fail at Process.Start, before a child or telemetry event can exist.
+        $script:ReviewerMarkerScanWindowChars = 65536
+        Remove-Item Function:\Invoke-TimedProcess
+        Write-Host "[SIMULATED/OFFLINE SABOTAGE] Stub removed; nonexistent sentinel must fail closed before any real launch." -ForegroundColor DarkCyan
+        $sabotageBlocked = $false
+        $sabotageError = $null
+        try {
+            Invoke-ReviewerModelPass -AgencyPath $sentinelAgencyPath -CycleNumber 1 -Bound $Bound -PassModel 'claude-opus-5' -PassNumber 1 -PassCount 1 | Out-Null
+        }
+        catch { $sabotageBlocked = $true; $sabotageError = $_ }
+        $nativeLaunchError = if ($null -ne $sabotageError) {
+            $sabotageError.Exception.GetBaseException()
+        } else { $null }
+        Assert-Specialist ($sabotageBlocked -and $script:timedProcessCallCount -eq 3 -and
+            $nativeLaunchError -is [System.ComponentModel.Win32Exception] -and
+            [int]$nativeLaunchError.NativeErrorCode -eq 2) `
+            "Removing the local process stub did not fail closed on the nonexistent sentinel executable."
+        Assert-Specialist (-not (Test-Path -LiteralPath $sentinelAgencyPath) -and
+            $null -eq (Get-Process -Name $sentinelProcessName -ErrorAction SilentlyContinue) -and
+            -not (Test-Path -LiteralPath $telemetryPath)) `
+            "Stub sabotage started a sentinel process or emitted offline telemetry/model/provider activity."
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable('DEVPILOT_OFFLINE_TELEMETRY_MODE', $priorTelemetryMode, 'Process')
+        [Environment]::SetEnvironmentVariable('DEVPILOT_OFFLINE_TELEMETRY_PATH', $priorTelemetryPath, 'Process')
+        Remove-Item -LiteralPath $logDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # ---------------------------------------------------------------------------
