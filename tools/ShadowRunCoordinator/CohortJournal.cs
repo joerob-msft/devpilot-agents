@@ -368,7 +368,7 @@ internal sealed class CohortJournal
             return ReadKey(manifest);
         }
         preexisted = false;
-        return RandomNumberGenerator.GetBytes(32);
+        return RandomNumberGenerator.GetBytes(CoordinatorState.SigningKeyLength);
     }
 
     /// <summary>
@@ -389,15 +389,13 @@ internal sealed class CohortJournal
             && Directory.EnumerateFiles(manifest.IntentRoot, "*.intent.json", SearchOption.TopDirectoryOnly).Any())
         || File.Exists(manifest.IndexPath);
 
-    private static byte[] ReadKey(CohortManifest manifest)
-    {
-        var text = File.ReadAllText(manifest.JournalKeyPath, StrictJson.StrictUtf8).Trim();
-        if (text.Length != 64 || !StrictJson.IsLowerHex(text))
-        {
-            throw new ContractException($"The cohort journal key at '{manifest.JournalKeyPath}' is not 64 lower-case hexadecimal characters.");
-        }
-        return Convert.FromHexString(text);
-    }
+    private static byte[] ReadKey(CohortManifest manifest) =>
+        // Legacy hexadecimal is accepted here and only here: a cohort root
+        // written by an earlier build holds one, and an operator resuming that
+        // root must not be told its own journal is unreadable. What this build
+        // writes is the raw key every other signature in this program is checked
+        // against.
+        CoordinatorState.ReadSigningKey(manifest.JournalKeyPath, "cohort journal key", allowLegacyHex: true);
 
     /// <summary>
     /// Loads the journal for this manifest, or opens a fresh one when there is
@@ -786,8 +784,7 @@ internal sealed class CohortJournal
         try
         {
             using var stream = new FileStream(_manifest.JournalKeyPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
-            var bytes = StrictJson.StrictUtf8.GetBytes(Convert.ToHexString(key).ToLowerInvariant());
-            stream.Write(bytes, 0, bytes.Length);
+            stream.Write(key, 0, key.Length);
             stream.Flush(flushToDisk: true);
             return key;
         }

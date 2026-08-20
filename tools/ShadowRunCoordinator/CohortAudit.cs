@@ -224,9 +224,20 @@ internal static class CohortSummaryReader
         }
 
         JsonElement audit;
+        string auditSha256;
         try
         {
-            audit = StrictJson.ReadObjectFile(path, label);
+            // Read once, then parse and digest the same bytes. Reading the file a
+            // second time to hash it would attest to a file this run never obeyed,
+            // and the digest the index publishes is the one thing that says which
+            // audit was read. The acquisition itself is inside the guard, so a
+            // locked or vanished audit is a refusal that blocks the cohort rather
+            // than a filesystem fault: the caller above treats a failure to write
+            // the index leniently, and an audit that could not be read must never
+            // be mistaken for one.
+            var bytes = StrictJson.ReadFileBytes(path, label);
+            audit = StrictJson.ReadObjectBytes(bytes, path, label);
+            auditSha256 = CanonicalJson.Sha256Hex(bytes);
             StrictJson.RequireLiteral(audit, "contractVersion", AuditContractVersion, label);
             StrictJson.RequireLiteral(audit, "kind", AuditKind, label);
             // The one binding that says this audit belongs to the preparation this
@@ -282,7 +293,7 @@ internal static class CohortSummaryReader
             ReconciliationReportSha256 = ReadText(audit, "reconciliationReportSha256"),
             DeliveryDecisionSha256 = ReadText(audit, "deliveryDecisionSha256"),
             DeliverySummarySha256 = ReadText(audit, "deliverySummarySha256"),
-            AuditSha256 = CanonicalJson.Sha256HexOfFile(path),
+            AuditSha256 = auditSha256,
             StateSha256 = ReadText(audit, "stateSha256"),
             ModelStartCount = RequireRepresentable(ReadCount(audit, "modelInvocationCount") + SlotModelStarts(audit), "modelInvocationCount", label),
             SlotLaunchCount = RequireRepresentable(ReadCount(audit, "slotLaunchCount"), "slotLaunchCount", label),
@@ -316,18 +327,23 @@ internal static class CohortSummaryReader
     private static void RequireAuthentic(CohortEntry entry, JsonElement audit, string path, string label)
     {
         var keyPath = StateKeyPathFor(entry);
-        if (!File.Exists(keyPath))
+        // Read once, not checked and then read: between an existence check and a
+        // read the file can go, and a key that goes missing mid-check must be one
+        // refusal naming the root, not a fault from underneath. The preparation's
+        // own reader, over the preparation's own format - a cohort that read the
+        // key its own way would be checking a signature against something other
+        // than what signed it.
+        byte[] key;
+        try
+        {
+            key = CoordinatorState.ReadSigningKey(keyPath, "signing key");
+        }
+        catch (ContractException error)
         {
             throw new ContractException(
-                $"The {label} at '{path}' stands in a root holding no signing key at '{keyPath}'. " +
-                "An audit whose key is gone cannot be shown to be the one that preparation published.");
+                $"The {label} at '{path}' stands in a root whose signing key could not be taken. {error.Message} " +
+                "An audit whose key cannot be read cannot be shown to be the one that preparation published.");
         }
-        var keyText = File.ReadAllText(keyPath, StrictJson.StrictUtf8).Trim();
-        if (keyText.Length != 64 || !StrictJson.IsLowerHex(keyText))
-        {
-            throw new ContractException($"The signing key at '{keyPath}' is not 64 lower-case hexadecimal characters.");
-        }
-        var key = Convert.FromHexString(keyText);
 
         var recordedSignature = StrictJson.RequireHex(audit, "signature", label, 64);
         var recordedSelfHash = StrictJson.RequireHex(audit, "auditSha256", label, 64);
@@ -643,7 +659,7 @@ internal static class CohortIndex
                 .Set("providerWrites", writes))
             .Set("entries", entries)
             .Set("journalSequence", journal.Sequence)
-            .Set("journalSha256", File.Exists(manifest.JournalPath) ? CanonicalJson.Sha256HexOfFile(manifest.JournalPath) : "none")
+            .Set("journalSha256", JournalDigest(manifest.JournalPath))
             .Set("terminalReason", terminalReason)
             .Set("terminalDetail", terminalDetail)
             // A refusal's own words can name the path it refused, and an entry's
@@ -661,4 +677,20 @@ internal static class CohortIndex
         }
         CanonicalJson.WriteFileAtomic(manifest.IndexPath, CanonicalJson.Readable(index));
     }
+
+    /// <summary>
+    /// The digest of the journal this index was derived from, or the word for
+    /// there being no journal yet.
+    /// </summary>
+    /// <remarks>
+    /// Read through the same guard every other artifact is read through. A
+    /// journal that cannot be opened is not a failure to write the index, and it
+    /// must not arrive at the caller as one: the lenient handler above exists for
+    /// an index that could not be written, and a journal nobody could read
+    /// arriving there would be reported as a cohort that carried on.
+    /// </remarks>
+    private static string JournalDigest(string journalPath) =>
+        File.Exists(journalPath)
+            ? CanonicalJson.Sha256Hex(StrictJson.ReadFileBytes(journalPath, "cohort journal"))
+            : "none";
 }

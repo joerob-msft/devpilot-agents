@@ -127,13 +127,27 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
             // fail-fast stop into a clean cohort every time it was re-published,
             // which is the opposite of what a rebuild is for.
             var (reason, detail) = runner.DeriveOutcome(journal);
-            runner.PublishIndexCore(
-                journal,
-                key,
-                reason,
-                detail,
-                journal.HasTerminal ? journal.TerminalDetailSha256 : CanonicalJson.Sha256HexOfText(detail),
-                recordTerminal: false);
+            try
+            {
+                runner.PublishIndexCore(
+                    journal,
+                    key,
+                    reason,
+                    detail,
+                    journal.HasTerminal ? journal.TerminalDetailSha256 : CanonicalJson.Sha256HexOfText(detail),
+                    recordTerminal: false);
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                // A run treats a failure to write the index leniently, because the
+                // journal is authoritative and the next run rewrites the report. A
+                // rebuild has no next run to defer to: writing the report is the
+                // whole of what it was asked to do, so it says so as a refusal
+                // rather than as a fault from underneath.
+                throw new ContractException(
+                    $"The cohort index at '{manifest.IndexPath}' could not be written: {error.Message} " +
+                    "A rebuild publishes the report and does nothing else, so it has not done what it was asked.");
+            }
             log.WriteLine($"index rebuilt: {manifest.IndexPath} terminalReason={reason}");
             return CoordinatorExitCodes.Ok;
         }
@@ -698,7 +712,7 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
         {
             throw new ContractException($"Entry '{entry.EntryId}' declares a rule bundle at '{entry.RuleBundlePath}', and there is no such file.");
         }
-        var bundleDigest = CanonicalJson.Sha256HexOfFile(entry.RuleBundlePath);
+        var bundleDigest = CanonicalJson.Sha256Hex(StrictJson.ReadFileBytes(entry.RuleBundlePath, $"entry '{entry.EntryId}' rule bundle", 8L * 1024 * 1024));
         if (!string.Equals(bundleDigest, entry.RuleBundleSha256, StringComparison.Ordinal))
         {
             throw new ContractException(

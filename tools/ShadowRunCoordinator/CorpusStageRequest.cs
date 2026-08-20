@@ -243,7 +243,7 @@ internal sealed record CorpusStageRequest
         {
             throw new ContractException($"The {label} at '{path}' does not exist.");
         }
-        var bytes = File.ReadAllBytes(path);
+        var bytes = StrictJson.ReadFileBytes(path, label);
         var requestSha256 = CanonicalJson.Sha256Hex(bytes);
         if (!string.IsNullOrEmpty(boundSha256) && !string.Equals(requestSha256, boundSha256, StringComparison.Ordinal))
         {

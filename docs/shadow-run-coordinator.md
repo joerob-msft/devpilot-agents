@@ -611,6 +611,26 @@ entry left recorded as `running` once its child is gone would be read as resumab
 — and a cohort holding such an entry stays refused on every later run until an operator settles
 those artifacts by hand.
 
+**One key format.** A signing key is 32 raw bytes: that is what the preparation mints, what it
+writes into `<output-root>/coordinator/state.key`, and what the cohort journal writes beside its own
+record. One reader accepts it, and the cohort authenticates an entry's audit with the same bytes,
+read the same way, that the preparation signed it with. Key material is not text — most 32-byte keys
+hold no valid sequence in any encoding — so a reader that decoded it would fail on the key rather
+than on the artifact it was asked to check, and would fail as a decoder fault rather than as a
+refusal an operator can act on. Every way of failing to acquire a key (absent, short, long, locked,
+unreadable) comes out as a refusal naming the absolute path, never as a crash. Cohort journal roots
+written before this rule hold a 64-character lower-case hexadecimal key; that one encoding is still
+read, named rather than sniffed and only for the journal key, so a root created by an earlier build
+still resumes. Nothing writes it any more.
+
+**One acquisition per artifact.** Every contract file a cohort obeys is read once, through one
+guarded reader, and the digest published for it is taken from the same bytes that were parsed. A
+file read twice — once to hash, once to obey — attests to bytes nobody read, and an artifact this
+runner cannot open is a fact about the artifact: it comes out as a refusal naming the file and
+blocks the cohort, never as a filesystem fault from underneath. The distinction matters because a
+failure to *write* the index is treated leniently — the journal is authoritative and the next run
+rewrites the report — and a failure to *read* an audit must never be mistaken for one.
+
 **The index says what ran, never what was concluded.** `devpilot.shadow-cohort.index.v1` carries
 one summary per declared entry, in declared order: the preparation's final state and terminal
 reason, the snapshot, run-set, reconciliation and delivery evidence digests, the model start, slot,

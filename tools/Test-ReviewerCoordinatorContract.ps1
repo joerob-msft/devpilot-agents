@@ -458,6 +458,7 @@ if ($cohortPresent.Count -eq $cohortSources.Count) {
     $journalText = [IO.File]::ReadAllText($cohortJournalSource)
     $cohortAuditText = [IO.File]::ReadAllText($cohortAuditSource)
     $runnerText = [IO.File]::ReadAllText($cohortRunnerSource)
+    $strictJsonText = [IO.File]::ReadAllText((Join-Path $repoRoot 'tools\ShadowRunCoordinator\StrictJson.cs'))
     $cohortText = $manifestText + $journalText + $cohortAuditText + $runnerText
 
     # One at a time is a constant, not a default. A cohort that read its own
@@ -632,6 +633,53 @@ if ($cohortPresent.Count -eq $cohortSources.Count) {
         'The cohort narrows its ceiling counters with an unchecked cast, which would let a wrapped total disable the ceiling.'
     Assert-Coordinator ($journalText.Contains('HasRecordedWork')) `
         'The cohort journal cannot tell a mint that got no further from a journal somebody removed.'
+
+    # One key format, one reader. A key is 32 raw bytes; a second reader with a
+    # second opinion about the format checks signatures against something other
+    # than what computed them, and a reader that decoded key material as text
+    # fails on the key rather than on the artifact - as a fault from underneath
+    # rather than as a refusal anybody can act on.
+    $keyReaderText = [IO.File]::ReadAllText((Join-Path $repoRoot 'tools\ShadowRunCoordinator\CoordinatorState.cs'))
+    Assert-Coordinator ($keyReaderText -match 'internal static byte\[\] ReadSigningKey\(string path, string label, bool allowLegacyHex = false\)') `
+        'There is no single signing-key reader, so the format a preparation writes and the format something else reads can drift apart.'
+    Assert-Coordinator ($cohortAuditText.Contains('CoordinatorState.ReadSigningKey(keyPath')) `
+        'The cohort authenticates an entry audit with a key it read its own way rather than the way the preparation wrote it.'
+    Assert-Coordinator ($journalText.Contains('CoordinatorState.ReadSigningKey(manifest.JournalKeyPath')) `
+        'The cohort journal reads its own signing key its own way, so two key formats live in one program again.'
+    Assert-Coordinator (-not ($cohortAuditText -match 'ReadAllText\([^)]*[Kk]eyPath')) `
+        'A signing key is read as text somewhere, which fails on key material that is not text in any encoding.'
+    Assert-Coordinator (-not ($journalText -match 'ReadAllText\([^)]*JournalKeyPath')) `
+        'The cohort journal key is read as text, which fails on key material that is not text in any encoding.'
+    Assert-Coordinator ($keyReaderText -match 'catch \(Exception error\) when \(error is IOException or UnauthorizedAccessException or NotSupportedException or ArgumentException\)') `
+        'A key that cannot be read leaves the reader as a runtime fault rather than as a typed refusal, which is a crash with nothing published about what ran.'
+    Assert-Coordinator ($keyReaderText.Contains('private static bool IsLowerHexAscii')) `
+        'The one legacy key encoding is recognized by decoding it first, which is the decode that must not happen to key material.'
+    Assert-Coordinator ($keyReaderText -match 'stream\.Write\(key, 0, key\.Length\)') `
+        'The coordinator writes its signing key as something other than the raw bytes it minted.'
+    Assert-Coordinator ($journalText -match 'stream\.Write\(key, 0, key\.Length\)') `
+        'The cohort journal writes its signing key in an encoding this build does not consider canonical.'
+
+    # One acquisition, one set of bytes. A contract file that is read to be parsed
+    # and read again to be hashed publishes a digest of something nobody obeyed,
+    # and every unguarded read of one is a filesystem fault escaping where a
+    # refusal was owed.
+    Assert-Coordinator ($strictJsonText -match 'internal static byte\[\] ReadFileBytes\(string path, string label, long maximumBytes') `
+        'There is no single guarded reader for contract files, so an unreadable artifact arrives as a runtime fault rather than as a refusal naming it.'
+    Assert-Coordinator ($strictJsonText -match 'if \(length > maximumBytes\)[\s\S]{0,600}?new byte\[length\][\s\S]{0,200}?stream\.ReadExactly\(bytes\)') `
+        'A contract file is allocated before its size is checked, so an oversized artifact exhausts memory instead of being refused.'
+    Assert-Coordinator (-not $cohortAuditText.Contains('Sha256HexOfFile')) `
+        'The cohort digests an artifact by reading it a second time, so the digest it publishes need not be of the bytes it read.'
+    Assert-Coordinator ($cohortAuditText.Contains('CanonicalJson.Sha256Hex(bytes)')) `
+        'The entry audit digest is not taken from the bytes the entry audit was parsed from.'
+    Assert-Coordinator ($runnerText -match "could not be written: \{error\.Message\}") `
+        'A rebuild that cannot write the index it was asked for ends as a fault from underneath rather than as a refusal.'
+    foreach ($readerSource in @('CohortManifest.cs', 'CoordinatorRequest.cs', 'CorpusStageRequest.cs')) {
+        $readerText = [IO.File]::ReadAllText((Join-Path $repoRoot ('tools\ShadowRunCoordinator\' + $readerSource)))
+        Assert-Coordinator (-not $readerText.Contains('File.ReadAllBytes')) `
+            "$readerSource acquires a contract file outside the one guarded reader, so a locked or vanished artifact escapes as a fault rather than as a refusal."
+    }
+    Assert-Coordinator (-not $runnerText.Contains('Sha256HexOfFile')) `
+        'The cohort runner digests a declared artifact by a read of its own, so a bundle it cannot open ends the run as a fault rather than as a refusal - and with no ceiling on what it reads.'
 
     # The word a cohort publishes about itself is committed before it is published,
     # so a rebuild reports the record rather than inferring one from entry states

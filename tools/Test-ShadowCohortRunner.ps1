@@ -26,6 +26,10 @@
     control file instead of by reviewing anything. The runner under test is the
     shipping runner, with no test mode.
 
+    ONE scenario is the exception: the last one runs a real preparation, driven
+    only as far as a snapshot state so no model is started, because the signing
+    key a real preparation writes is the one thing a stub cannot stand in for.
+
 .PARAMETER RepoRoot
     The toolkit under test. Defaults to this script's repository.
 
@@ -212,12 +216,35 @@ if ($control.startedMarker) {
 if ($control.sleepSeconds -gt 0) { Start-Sleep -Seconds $control.sleepSeconds }
 
 $coordinatorRoot = Join-Path $outputRoot 'coordinator'
+$signingKeyBytes = [Convert]::FromHexString([string]$control.stateKey)
 if ($control.writeStateKey) {
     [void](New-Item -ItemType Directory -Force -Path $coordinatorRoot)
     $keyPath = Join-Path $coordinatorRoot 'state.key'
     if (-not (Test-Path -LiteralPath $keyPath)) {
-        [IO.File]::WriteAllBytes($keyPath, ([Text.UTF8Encoding]::new($false, $true)).GetBytes([string]$control.stateKey))
+        # The production key format: 32 raw bytes, exactly as the real
+        # preparation writes it. The control file carries the same bytes as
+        # hexadecimal because JSON cannot hold bytes; what lands on disk is
+        # what the coordinator itself would have written. The other encodings
+        # exist so a reader that accepted them can be caught doing it.
+        # Each branch yields its array as ONE object. A switch branch that emits
+        # a bare empty array contributes nothing to the result, and the empty-key
+        # case would then write no key at all - passing for the wrong reason,
+        # because a preparation that published no key is a case already covered
+        # elsewhere.
+        $onDisk = switch ([string]$control.stateKeyEncoding) {
+            'legacyHex' { , ([Text.ASCIIEncoding]::new()).GetBytes([string]$control.stateKey) }
+            'short' { , [byte[]]$signingKeyBytes[0..30] }
+            'long' { , [byte[]]($signingKeyBytes + [byte[]]@(0)) }
+            'empty' { , [byte[]]@() }
+            default { , [byte[]]$signingKeyBytes }
+        }
+        [IO.File]::WriteAllBytes($keyPath, [byte[]]$onDisk)
     }
+}
+if ($control.signingKeyOverride) {
+    # The audit is signed with a key the root does not hold, which is what a
+    # forged audit and a rotated key look like from the outside.
+    $signingKeyBytes = [Convert]::FromHexString([string]$control.signingKeyOverride)
 }
 
 if ($control.writeAudit) {
@@ -286,7 +313,7 @@ if ($control.writeAudit) {
     $selfHash = Get-Sha256Text -Text (ConvertTo-CanonicalText -Value $audit)
     if ($control.tamperSelfHash) { $selfHash = [string]$control.evidenceSha256 }
     $audit['auditSha256'] = $selfHash
-    $keyBytes = [Convert]::FromHexString([string]$control.stateKey)
+    $keyBytes = $signingKeyBytes
     $signed = ([BitConverter]::ToString(
         [Security.Cryptography.HMACSHA256]::HashData(
             $keyBytes,
@@ -335,6 +362,8 @@ function New-StubControl {
         [string]$RequestSha256Override = '',
         [string]$SubjectSha256Override = '',
         [string]$StateKey = '',
+        [ValidateSet('raw', 'legacyHex', 'short', 'long', 'empty')][string]$StateKeyEncoding = 'raw',
+        [string]$SigningKeyOverride = '',
         [string[]]$TransitionStates = @(
             'requestValidated', 'snapshotVerified', 'runSetReady',
             'slot1TerminalVerified', 'slot2TerminalVerified',
@@ -347,6 +376,8 @@ function New-StubControl {
         writeAudit = $WriteAudit
         writeStateKey = $WriteStateKey
         stateKey = $(if ($StateKey) { $StateKey } else { (New-FakeDigest) })
+        stateKeyEncoding = $StateKeyEncoding
+        signingKeyOverride = $SigningKeyOverride
         tamperSelfHash = $TamperSelfHash
         tamperSignature = $TamperSignature
         requestSha256Override = $RequestSha256Override
@@ -558,6 +589,8 @@ function New-CohortManifestFile {
         [Parameter(Mandatory)][string]$IndexPath,
         [Parameter(Mandatory)][AllowEmptyCollection()][array]$Entries,
         [Parameter(Mandatory)][string]$StubPath,
+        [string]$CommandPath = '',
+        [string[]]$ArgumentPrefixOverride,
         [string]$CohortId = 'cohort-alpha-one',
         [string]$CorrelationId = 'cohort-correlation-one',
         [int]$Concurrency = 1,
@@ -572,6 +605,8 @@ function New-CohortManifestFile {
         [int]$ProviderWriteBudget = 0,
         [hashtable]$ExtraRoot
     )
+    $resolvedPrefix = [string[]]@('-NoProfile', '-NonInteractive', '-File', $StubPath)
+    if ($ArgumentPrefixOverride) { $resolvedPrefix = [string[]]@($ArgumentPrefixOverride) }
     $manifest = [ordered]@{
         contractVersion = 'devpilot.shadow-cohort.manifest.v1'
         kind = 'shadow-cohort-run'
@@ -582,8 +617,8 @@ function New-CohortManifestFile {
             concurrency = $Concurrency
             stopPolicy = $StopPolicy
             authorizationKind = $AuthorizationKind
-            commandPath = $script:PwshPath
-            argumentPrefix = @('-NoProfile', '-NonInteractive', '-File', $StubPath)
+            commandPath = $(if ($CommandPath) { $CommandPath } else { $script:PwshPath })
+            argumentPrefix = $resolvedPrefix
             target = $Target
             entryTimeoutSeconds = $EntryTimeoutSeconds
         }
@@ -644,7 +679,7 @@ Write-Host "sandbox: $sandboxRoot" -ForegroundColor DarkGray
 
 try {
     # -----------------------------------------------------------------------
-    Write-Host '1/22 build the shipping coordinator' -ForegroundColor Cyan
+    Write-Host '1/23 build the shipping coordinator' -ForegroundColor Cyan
     $project = Join-Path $RepoRoot 'tools\ShadowRunCoordinator\ShadowRunCoordinator.csproj'
     $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
     $env:DOTNET_NOLOGO = '1'
@@ -664,7 +699,7 @@ try {
         })
 
     # -----------------------------------------------------------------------
-    Write-Host '2/22 three-entry cohort: complete, not-complete, complete' -ForegroundColor Cyan
+    Write-Host '2/23 three-entry cohort: complete, not-complete, complete' -ForegroundColor Cyan
     $caseA = Join-Path $sandboxRoot 'case-a'
     $a1 = New-CohortEntryRequest -Sandbox $caseA -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $a2 = New-CohortEntryRequest -Sandbox $caseA -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -704,9 +739,20 @@ try {
     Assert-Cohort ($summaryTwo.verifierAssignmentCount -eq 2) `
         "Entry two counted $($summaryTwo.verifierAssignmentCount) verifier assignments; expected 2 from its committed verifier-backed transitions."
     Assert-Cohort ($summaryTwo.modelStartCount -eq 2) 'A partially completed entry did not contribute its actual model starts.'
+    # One key format across this program: the journal signs itself with 32 raw
+    # bytes, which is what the preparation writes into every entry root and what
+    # the one reader accepts.
+    $journalKeyA = Join-Path $caseA 'journal\cohort-journal.key'
+    $journalKeyLength = [IO.File]::ReadAllBytes($journalKeyA).Length
+    Assert-Cohort ($journalKeyLength -eq 32) `
+        "The cohort journal key is $journalKeyLength bytes; expected the 32 raw bytes this build writes."
+    $entryKeyA = Join-Path $a1.OutputRoot 'coordinator\state.key'
+    $entryKeyLength = [IO.File]::ReadAllBytes($entryKeyA).Length
+    Assert-Cohort ($entryKeyLength -eq 32) `
+        'An entry signing key is not the 32 raw bytes the preparation writes.'
 
     # -----------------------------------------------------------------------
-    Write-Host '3/22 the summary carries no subject, finding text or judgement' -ForegroundColor Cyan
+    Write-Host '3/23 the summary carries no subject, finding text or judgement' -ForegroundColor Cyan
     $indexText = Get-Content -LiteralPath (Join-Path $caseA 'index\cohort-index.json') -Raw
     # The sentinel names are chosen not to occur inside a hexadecimal digest, so
     # their absence is evidence rather than luck. The field names are checked
@@ -721,7 +767,7 @@ try {
     Assert-Cohort ($null -ne $indexA.indexSha256 -and $null -ne $indexA.signature) 'The index is neither self-hashed nor signed.'
 
     # -----------------------------------------------------------------------
-    Write-Host '4/22 an ended entry is never re-attempted' -ForegroundColor Cyan
+    Write-Host '4/23 an ended entry is never re-attempted' -ForegroundColor Cyan
     $rerunA = Invoke-Cohort -ManifestPath $manifestA
     Assert-Cohort ($rerunA.ExitCode -eq 5) "Re-running a finished cohort exited $($rerunA.ExitCode); expected the same 5."
     $journalA = Get-JsonFile -Path (Join-Path $caseA 'journal\cohort-journal.json')
@@ -733,7 +779,7 @@ try {
     Assert-Cohort ($launchEvents.Count -eq 3) "The journal records $($launchEvents.Count) launch intents for three entries; expected exactly three."
 
     # -----------------------------------------------------------------------
-    Write-Host '5/22 the index is rebuildable from the journal and the entry audits' -ForegroundColor Cyan
+    Write-Host '5/23 the index is rebuildable from the journal and the entry audits' -ForegroundColor Cyan
     $indexPathA = Join-Path $caseA 'index\cohort-index.json'
     $beforeRebuild = Get-JsonFile -Path $indexPathA
     Remove-Item -LiteralPath $indexPathA -Force
@@ -790,7 +836,7 @@ try {
         "The rebuilt index says '$($afterRebuild.terminalReason)' and the run published '$($beforeRebuild.terminalReason)'."
 
     # -----------------------------------------------------------------------
-    Write-Host '6/22 failFast leaves the remaining entries pending' -ForegroundColor Cyan
+    Write-Host '6/23 failFast leaves the remaining entries pending' -ForegroundColor Cyan
     $caseB = Join-Path $sandboxRoot 'case-b'
     $b1 = New-CohortEntryRequest -Sandbox $caseB -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $b2 = New-CohortEntryRequest -Sandbox $caseB -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -866,7 +912,7 @@ try {
     Assert-Cohort ($recordB2c3.outcome -eq 'complete') 'The continue policy did not carry on past an accounted-for failure.'
 
     # -----------------------------------------------------------------------
-    Write-Host '7/22 a child that hangs is killed at its declared ceiling' -ForegroundColor Cyan
+    Write-Host '7/23 a child that hangs is killed at its declared ceiling' -ForegroundColor Cyan
     $caseC = Join-Path $sandboxRoot 'case-c'
     $c1 = New-CohortEntryRequest -Sandbox $caseC -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $c2 = New-CohortEntryRequest -Sandbox $caseC -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -910,7 +956,7 @@ try {
         'A resume over a refused entry started the entry after it.'
 
     # -----------------------------------------------------------------------
-    Write-Host '8/22 kill at a cohort transition, then refuse to run beside a live child' -ForegroundColor Cyan
+    Write-Host '8/23 kill at a cohort transition, then refuse to run beside a live child' -ForegroundColor Cyan
     $caseD = Join-Path $sandboxRoot 'case-d'
     $d1 = New-CohortEntryRequest -Sandbox $caseD -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $d2 = New-CohortEntryRequest -Sandbox $caseD -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -966,7 +1012,7 @@ try {
         Start-Sleep -Milliseconds 500
     }
     # -----------------------------------------------------------------------
-    Write-Host '9/22 resume is idempotent and starts exactly the next entry' -ForegroundColor Cyan
+    Write-Host '9/23 resume is idempotent and starts exactly the next entry' -ForegroundColor Cyan
     [void](New-StubControl -Path $d2.ControlPath -ExitCode 0 -StartedMarker $markerD)
     $resumed = Invoke-Cohort -ManifestPath $manifestD
     Assert-Cohort ($resumed.ExitCode -eq 0) "The resumed cohort exited $($resumed.ExitCode); expected 0."
@@ -982,7 +1028,7 @@ try {
         'The resumed cohort did not publish a completed index over all three entries.'
 
     # -----------------------------------------------------------------------
-    Write-Host '10/22 a journal edited after it was written is refused' -ForegroundColor Cyan
+    Write-Host '10/23 a journal edited after it was written is refused' -ForegroundColor Cyan
     $journalPathD = Join-Path $journalD 'cohort-journal.json'
     $tamperedJournal = (Get-Content -LiteralPath $journalPathD -Raw) -replace '"attempt": 2', '"attempt": 3'
     [IO.File]::WriteAllBytes($journalPathD, ([Text.UTF8Encoding]::new($false)).GetBytes($tamperedJournal))
@@ -991,7 +1037,7 @@ try {
     Assert-Cohort ($tamperRun.Output -match 'signature') 'The refusal did not name the signature that failed.'
 
     # -----------------------------------------------------------------------
-    Write-Host '11/22 a manifest edited between runs is refused' -ForegroundColor Cyan
+    Write-Host '11/23 a manifest edited between runs is refused' -ForegroundColor Cyan
     $caseE = Join-Path $sandboxRoot 'case-e'
     $e1 = New-CohortEntryRequest -Sandbox $caseE -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     [void](New-StubControl -Path $e1.ControlPath -ExitCode 0)
@@ -1007,14 +1053,17 @@ try {
     Assert-Cohort ($editedRun.ExitCode -eq 2) "Resuming under an edited manifest exited $($editedRun.ExitCode); expected 2."
 
     # -----------------------------------------------------------------------
-    Write-Host '12/22 a journal key without its journal is not started over' -ForegroundColor Cyan
+    Write-Host '12/23 a journal key without its journal is not started over' -ForegroundColor Cyan
     Remove-Item -LiteralPath (Join-Path $caseE 'journal\cohort-journal.json') -Force
     $orphanKey = Invoke-Cohort -ManifestPath $manifestE
     Assert-Cohort ($orphanKey.ExitCode -eq 2) "A key without a journal exited $($orphanKey.ExitCode); expected 2."
     Assert-Cohort ($orphanKey.Output -match 'not resumable') 'The refusal did not say the journal root is not resumable.'
     # A key on its own is not a record. A runner killed after minting the key and
     # before its first journal reached the disk started nothing, and wedging a
-    # root that never launched anything is not a safety property.
+    # root that never launched anything is not a safety property. The key planted
+    # here is the 64-character hexadecimal form an earlier build wrote, which is
+    # the one legacy encoding this build still reads: an operator resuming a root
+    # written before this change must not be told his own journal is unreadable.
     $caseE2 = Join-Path $sandboxRoot 'case-e2'
     $e2 = New-CohortEntryRequest -Sandbox $caseE2 -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918281
     [void](New-StubControl -Path $e2.ControlPath -ExitCode 0)
@@ -1029,6 +1078,39 @@ try {
     Assert-Cohort ($mintedOnly.ExitCode -eq 0) "A key minted before any launch exited $($mintedOnly.ExitCode); expected 0."
     $recordE2 = Get-CohortJournalEntry -JournalRoot (Join-Path $caseE2 'journal') -EntryId 'entry-one'
     Assert-Cohort ($recordE2.attempt -eq 1) "The entry under the adopted key was attempted $($recordE2.attempt) time(s); expected 1."
+
+    # The same case under the format this build writes, so the raw path is not
+    # kept alive only by the legacy one, and a journal key of any other shape is
+    # refused rather than adopted.
+    $caseE2b = Join-Path $sandboxRoot 'case-e2b'
+    $e2b = New-CohortEntryRequest -Sandbox $caseE2b -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918283
+    [void](New-StubControl -Path $e2b.ControlPath -ExitCode 0)
+    $manifestE2b = New-CohortManifestFile -Path (Join-Path $caseE2b 'cohort.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef `
+        -JournalRoot (Join-Path $caseE2b 'journal') -IndexPath (Join-Path $caseE2b 'index\cohort-index.json') `
+        -StubPath $stub -Entries @((New-CohortEntryDeclaration -Request $e2b -Ordinal 1 -RuleBundlePath $ruleBundle))
+    [void](New-Item -ItemType Directory -Force -Path (Join-Path $caseE2b 'journal'))
+    $plantedKey = [byte[]]::new(32)
+    [Security.Cryptography.RandomNumberGenerator]::Fill($plantedKey)
+    [IO.File]::WriteAllBytes((Join-Path $caseE2b 'journal\cohort-journal.key'), $plantedKey)
+    $rawAdopted = Invoke-Cohort -ManifestPath $manifestE2b
+    Assert-Cohort ($rawAdopted.ExitCode -eq 0) "A raw key minted before any launch exited $($rawAdopted.ExitCode); expected 0."
+
+    $caseE2c = Join-Path $sandboxRoot 'case-e2c'
+    $e2c = New-CohortEntryRequest -Sandbox $caseE2c -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918284
+    [void](New-StubControl -Path $e2c.ControlPath -ExitCode 0)
+    $manifestE2c = New-CohortManifestFile -Path (Join-Path $caseE2c 'cohort.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef `
+        -JournalRoot (Join-Path $caseE2c 'journal') -IndexPath (Join-Path $caseE2c 'index\cohort-index.json') `
+        -StubPath $stub -Entries @((New-CohortEntryDeclaration -Request $e2c -Ordinal 1 -RuleBundlePath $ruleBundle))
+    [void](New-Item -ItemType Directory -Force -Path (Join-Path $caseE2c 'journal'))
+    [IO.File]::WriteAllBytes((Join-Path $caseE2c 'journal\cohort-journal.key'), `
+        ([Text.UTF8Encoding]::new($false)).GetBytes(('A' * 64)))
+    $badJournalKey = Invoke-Cohort -ManifestPath $manifestE2c
+    Assert-Cohort ($badJournalKey.ExitCode -eq 2) `
+        "A journal key of an encoding this build never wrote exited $($badJournalKey.ExitCode); expected 2."
+    Assert-Cohort ($badJournalKey.Output -notmatch 'Unhandled exception') `
+        'A journal key of the wrong encoding came out as a crash rather than as a refusal.'
 
     # A child reports whatever exit code the operating system gives it, and on
     # this platform an unhandled managed exception reports a negative one. A
@@ -1054,7 +1136,7 @@ try {
         "Resuming over a journal holding a negative exit code exited $($rerunE3.ExitCode); expected 11."
 
     # -----------------------------------------------------------------------
-    Write-Host '13/22 global budget exhaustion stops before the next entry' -ForegroundColor Cyan
+    Write-Host '13/23 global budget exhaustion stops before the next entry' -ForegroundColor Cyan
     $caseF = Join-Path $sandboxRoot 'case-f'
     $f1 = New-CohortEntryRequest -Sandbox $caseF -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $f2 = New-CohortEntryRequest -Sandbox $caseF -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -1121,7 +1203,7 @@ try {
         'The index does not report the unaccounted entry as ended.'
 
     # -----------------------------------------------------------------------
-    Write-Host '14/22 an observed provider write blocks the whole cohort' -ForegroundColor Cyan
+    Write-Host '14/23 an observed provider write blocks the whole cohort' -ForegroundColor Cyan
     $caseG = Join-Path $sandboxRoot 'case-g'
     $g1 = New-CohortEntryRequest -Sandbox $caseG -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $g2 = New-CohortEntryRequest -Sandbox $caseG -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -1167,7 +1249,7 @@ try {
         'The index totals report no provider write for a cohort that stopped because it observed one.'
 
     # -----------------------------------------------------------------------
-    Write-Host '15/22 an entry audit this build cannot read blocks the whole cohort' -ForegroundColor Cyan
+    Write-Host '15/23 an entry audit this build cannot read blocks the whole cohort' -ForegroundColor Cyan
     $caseH = Join-Path $sandboxRoot 'case-h'
     $h1 = New-CohortEntryRequest -Sandbox $caseH -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $h2 = New-CohortEntryRequest -Sandbox $caseH -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -1191,6 +1273,16 @@ try {
         @{ Id = 'careless'; Control = @{ TamperSelfHash = $true } },
         @{ Id = 'careful'; Control = @{ TamperSignature = $true } },
         @{ Id = 'keyless'; Control = @{ WriteStateKey = $false } },
+        # The key format itself. A key is 32 raw bytes; every other shape a file
+        # in that place could take is refused as a key this build never wrote,
+        # and refused as a refusal rather than as a fault from underneath. The
+        # hexadecimal one is the format an earlier build used for the COHORT
+        # journal key and never for this one, so it is not quietly adopted here.
+        @{ Id = 'hexkey'; Control = @{ StateKeyEncoding = 'legacyHex' }; ExpectKeyLength = 64 },
+        @{ Id = 'shortkey'; Control = @{ StateKeyEncoding = 'short' }; ExpectKeyLength = 31 },
+        @{ Id = 'longkey'; Control = @{ StateKeyEncoding = 'long' }; ExpectKeyLength = 33 },
+        @{ Id = 'emptykey'; Control = @{ StateKeyEncoding = 'empty' }; ExpectKeyLength = 0 },
+        @{ Id = 'wrongkey'; Control = @{ SigningKeyOverride = ('e' * 64) } },
         @{ Id = 'othersubject'; Control = @{ SubjectSha256Override = ('d' * 64) } })
     foreach ($tamper in $tampers) {
         $caseTamper = Join-Path $sandboxRoot ('case-h-' + $tamper.Id)
@@ -1209,7 +1301,143 @@ try {
         $recordTamper = Get-CohortJournalEntry -JournalRoot (Join-Path $caseTamper 'journal') -EntryId 'entry-one'
         Assert-Cohort ($recordTamper.outcome -eq 'evidenceRefused') `
             "An unauthenticated audit ($($tamper.Id)) left outcome '$($recordTamper.outcome)'; expected evidenceRefused."
+        # A key-format case that never wrote the key it names would be refused for
+        # the reason every keyless entry is refused, and would keep passing if the
+        # length rules it exists to pin were removed. So the file it planted is
+        # read back, and the refusal is required to be about that length.
+        if ($tamper.ContainsKey('ExpectKeyLength')) {
+            $tamperKeyPath = Join-Path $tamperRequest.OutputRoot 'coordinator\state.key'
+            Assert-Cohort (Test-Path -LiteralPath $tamperKeyPath) `
+                "The $($tamper.Id) case planted no key at all, so it does not test the key format."
+            $tamperKeyLength = [IO.File]::ReadAllBytes($tamperKeyPath).Length
+            Assert-Cohort ($tamperKeyLength -eq $tamper.ExpectKeyLength) `
+                "The $($tamper.Id) case planted a $tamperKeyLength byte key; expected $($tamper.ExpectKeyLength)."
+            Assert-Cohort ($runTamper.Output -match "is $tamperKeyLength bytes, not 32") `
+                "The $($tamper.Id) case was not refused for the length it planted. $($runTamper.Output)"
+        }
     }
+
+    # The absolute path of the key is in the refusal, because the operator's next
+    # action is to go and look at that file.
+    $caseKeyPath = Join-Path $sandboxRoot 'case-h-keypath'
+    $keyPathRequest = New-CohortEntryRequest -Sandbox $caseKeyPath -EntryId 'entry-one' `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918277
+    [void](New-StubControl -Path $keyPathRequest.ControlPath -ExitCode 0 -StateKeyEncoding 'short')
+    $manifestKeyPath = New-CohortManifestFile -Path (Join-Path $caseKeyPath 'cohort.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef `
+        -JournalRoot (Join-Path $caseKeyPath 'journal') -IndexPath (Join-Path $caseKeyPath 'index\cohort-index.json') `
+        -StubPath $stub -Entries @(
+        (New-CohortEntryDeclaration -Request $keyPathRequest -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runKeyPath = Invoke-Cohort -ManifestPath $manifestKeyPath
+    Assert-Cohort ($runKeyPath.ExitCode -eq 11) `
+        "A key of the wrong length exited $($runKeyPath.ExitCode); expected 11."
+    $expectedKeyFile = [string]([IO.Path]::GetFullPath((Join-Path $keyPathRequest.OutputRoot 'coordinator\state.key')))
+    Assert-Cohort ($runKeyPath.Output -match [Regex]::Escape($expectedKeyFile)) `
+        'The refusal did not name the absolute path of the key it could not take.'
+    Assert-Cohort ($runKeyPath.Output -match '31 bytes') `
+        'The refusal did not say what was found instead of a key.'
+
+    # A key that cannot be read at all, rather than one that reads as the wrong
+    # thing. This is the fault the pilot hit: a read that throws from underneath
+    # is a runtime crash, and a cohort that crashes has published nothing about
+    # what it did. It must come out as a refusal with an exit code.
+    $caseUnreadable = Join-Path $sandboxRoot 'case-h-unreadable'
+    $unreadable = New-CohortEntryRequest -Sandbox $caseUnreadable -EntryId 'entry-one' `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918278
+    [void](New-StubControl -Path $unreadable.ControlPath -ExitCode 0)
+    [void](New-Item -ItemType Directory -Force -Path (Join-Path $unreadable.OutputRoot 'coordinator\state.key'))
+    $manifestUnreadable = New-CohortManifestFile -Path (Join-Path $caseUnreadable 'cohort.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef `
+        -JournalRoot (Join-Path $caseUnreadable 'journal') -IndexPath (Join-Path $caseUnreadable 'index\cohort-index.json') `
+        -StubPath $stub -Entries @(
+        (New-CohortEntryDeclaration -Request $unreadable -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runUnreadable = Invoke-Cohort -ManifestPath $manifestUnreadable
+    Assert-Cohort ($runUnreadable.ExitCode -eq 11) `
+        "A key that could not be read exited $($runUnreadable.ExitCode); expected 11."
+    Assert-Cohort ($runUnreadable.Output -notmatch 'Unhandled exception') `
+        'A key that could not be read came out as a crash rather than as a refusal.'
+
+    # A key replaced after the entry was authenticated. The index is rebuilt from
+    # the artifacts, so the second reading is a fresh read of the same file, and a
+    # root whose key changed underneath cannot be shown to hold what it published.
+    $caseRotated = Join-Path $sandboxRoot 'case-h-rotated'
+    $rotated = New-CohortEntryRequest -Sandbox $caseRotated -EntryId 'entry-one' `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918279
+    [void](New-StubControl -Path $rotated.ControlPath -ExitCode 0)
+    $manifestRotated = New-CohortManifestFile -Path (Join-Path $caseRotated 'cohort.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef `
+        -JournalRoot (Join-Path $caseRotated 'journal') -IndexPath (Join-Path $caseRotated 'index\cohort-index.json') `
+        -StubPath $stub -Entries @(
+        (New-CohortEntryDeclaration -Request $rotated -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runRotated = Invoke-Cohort -ManifestPath $manifestRotated
+    Assert-Cohort ($runRotated.ExitCode -eq 0) `
+        "An entry signed with the key in its own root exited $($runRotated.ExitCode); expected 0."
+    $rotatedKeyPath = Join-Path $rotated.OutputRoot 'coordinator\state.key'
+    $replacement = [byte[]]::new(32)
+    [Security.Cryptography.RandomNumberGenerator]::Fill($replacement)
+    [IO.File]::WriteAllBytes($rotatedKeyPath, $replacement)
+    $rebuildRotated = Invoke-Cohort -ManifestPath $manifestRotated -RebuildIndex
+    Assert-Cohort ($rebuildRotated.ExitCode -eq 11) `
+        "A rebuild over a rotated key exited $($rebuildRotated.ExitCode); expected 11."
+
+
+    # A key that is not text in any encoding, which is what most 32-byte keys are.
+    # Deterministic where the real preparation's random key is one draw: these
+    # bytes decode as nothing, and the entry they sign must still authenticate.
+    $caseBinaryKey = Join-Path $sandboxRoot 'case-h-binarykey'
+    $binaryKey = New-CohortEntryRequest -Sandbox $caseBinaryKey -EntryId 'entry-one' `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918280
+    [void](New-StubControl -Path $binaryKey.ControlPath -ExitCode 0 -StateKey ('ff' * 32))
+    $manifestBinaryKey = New-CohortManifestFile -Path (Join-Path $caseBinaryKey 'cohort.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef `
+        -JournalRoot (Join-Path $caseBinaryKey 'journal') -IndexPath (Join-Path $caseBinaryKey 'index\cohort-index.json') `
+        -StubPath $stub -Entries @(
+        (New-CohortEntryDeclaration -Request $binaryKey -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runBinaryKey = Invoke-Cohort -ManifestPath $manifestBinaryKey
+    Assert-Cohort ($runBinaryKey.ExitCode -eq 0) `
+        "An entry signed with a key that is not valid UTF-8 exited $($runBinaryKey.ExitCode); expected 0. $($runBinaryKey.Output)"
+    $indexBinaryKey = Get-JsonFile -Path (Join-Path $caseBinaryKey 'index\cohort-index.json')
+    $summaryBinaryKey = Get-CohortIndexEntry -Index $indexBinaryKey -EntryId 'entry-one'
+    Assert-Cohort ($summaryBinaryKey.outcome -eq 'complete') `
+        "An entry under a non-textual key was recorded '$($summaryBinaryKey.outcome)'; expected complete."
+
+    # An audit that cannot be read at all. A cohort treats a failure to WRITE its
+    # index leniently - the journal is authoritative - so a failure to READ an
+    # audit must not arrive as the same kind of fault, or a locked artifact would
+    # be reported as a cohort that published nothing and carried on. It is a
+    # refusal that blocks the set, and under a rebuild it is still a refusal
+    # rather than a crash.
+    $caseLockedAudit = Join-Path $sandboxRoot 'case-h-lockedaudit'
+    $lockedAudit = New-CohortEntryRequest -Sandbox $caseLockedAudit -EntryId 'entry-one' `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918281
+    [void](New-StubControl -Path $lockedAudit.ControlPath -ExitCode 0)
+    $manifestLockedAudit = New-CohortManifestFile -Path (Join-Path $caseLockedAudit 'cohort.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef `
+        -JournalRoot (Join-Path $caseLockedAudit 'journal') -IndexPath (Join-Path $caseLockedAudit 'index\cohort-index.json') `
+        -StubPath $stub -Entries @(
+        (New-CohortEntryDeclaration -Request $lockedAudit -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runLockedAudit = Invoke-Cohort -ManifestPath $manifestLockedAudit
+    Assert-Cohort ($runLockedAudit.ExitCode -eq 0) `
+        "The run before the locked-audit rebuild exited $($runLockedAudit.ExitCode); expected 0."
+    $lockedAuditPath = Join-Path $lockedAudit.OutputRoot 'coordinator\audit.json'
+    $lockedHandle = [IO.File]::Open($lockedAuditPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+    try
+    {
+        $rebuildLocked = Invoke-Cohort -ManifestPath $manifestLockedAudit -RebuildIndex
+    }
+    finally
+    {
+        $lockedHandle.Dispose()
+    }
+    Assert-Cohort ($rebuildLocked.ExitCode -eq 11) `
+        "A rebuild over an audit no reader could open exited $($rebuildLocked.ExitCode); expected 11. $($rebuildLocked.Output)"
+    Assert-Cohort ($rebuildLocked.Output -notmatch 'Unhandled exception') `
+        'An audit that could not be opened came out as a crash rather than as a refusal.'
+    Assert-Cohort ($rebuildLocked.Output -match [regex]::Escape($lockedAuditPath)) `
+        'A rebuild refused over an unreadable audit did not name the audit it could not read.'
+    $rebuildAfterUnlock = Invoke-Cohort -ManifestPath $manifestLockedAudit -RebuildIndex
+    Assert-Cohort ($rebuildAfterUnlock.ExitCode -eq 0) `
+        "A rebuild after the audit was released exited $($rebuildAfterUnlock.ExitCode); expected 0."
 
     # A preparation that exits cleanly has published its audit; that is what
     # exiting cleanly means here. Absence is not a cheap success: summarized as
@@ -1236,7 +1464,7 @@ try {
         "A completed entry with no audit published terminal reason '$($indexHollow.terminalReason)'; expected blocked."
 
     # -----------------------------------------------------------------------
-    Write-Host '16/22 identity drift between the manifest and the request is refused' -ForegroundColor Cyan
+    Write-Host '16/23 identity drift between the manifest and the request is refused' -ForegroundColor Cyan
     $caseI = Join-Path $sandboxRoot 'case-i'
     $i1 = New-CohortEntryRequest -Sandbox $caseI -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     [void](New-StubControl -Path $i1.ControlPath -ExitCode 0)
@@ -1253,7 +1481,7 @@ try {
     Assert-Cohort ($indexI.terminalReason -eq 'contractRefusal') 'The refusal was not published in the index.'
 
     # -----------------------------------------------------------------------
-    Write-Host '17/22 a request edited after the manifest sealed it is refused' -ForegroundColor Cyan
+    Write-Host '17/23 a request edited after the manifest sealed it is refused' -ForegroundColor Cyan
     $caseJ = Join-Path $sandboxRoot 'case-j'
     $j1 = New-CohortEntryRequest -Sandbox $caseJ -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     [void](New-StubControl -Path $j1.ControlPath -ExitCode 0)
@@ -1268,7 +1496,7 @@ try {
     Assert-Cohort ($runJ.Output -match 'nobody authorized') 'The refusal did not say the request was never authorized.'
 
     # -----------------------------------------------------------------------
-    Write-Host '18/22 a rule bundle that changed under the declaration is refused' -ForegroundColor Cyan
+    Write-Host '18/23 a rule bundle that changed under the declaration is refused' -ForegroundColor Cyan
     $caseK = Join-Path $sandboxRoot 'case-k'
     $bundleK = Write-StrictJsonFile -Path (Join-Path $caseK 'inputs\rule-bundle.json') -Value ([pscustomobject]@{ declaredPaths = @('a') })
     $k1 = New-CohortEntryRequest -Sandbox $caseK -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
@@ -1282,7 +1510,7 @@ try {
     Assert-Cohort ($runK.ExitCode -eq 2) "A changed rule bundle exited $($runK.ExitCode); expected 2."
 
     # -----------------------------------------------------------------------
-    Write-Host '19/22 a toolkit that moved under the cohort is refused' -ForegroundColor Cyan
+    Write-Host '19/23 a toolkit that moved under the cohort is refused' -ForegroundColor Cyan
     $caseL = Join-Path $sandboxRoot 'case-l'
     $movedToolkit = New-CohortToolkit -Root (Join-Path $caseL 'toolkit') -Head $head
     $l1 = New-CohortEntryRequest -Sandbox $caseL -EntryId 'entry-one' -ToolkitRoot $movedToolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
@@ -1299,7 +1527,7 @@ try {
         'An entry was started under a checkout the manifest no longer describes.'
 
     # -----------------------------------------------------------------------
-    Write-Host '20/22 manifest shapes this build never runs' -ForegroundColor Cyan
+    Write-Host '20/23 manifest shapes this build never runs' -ForegroundColor Cyan
     $caseM = Join-Path $sandboxRoot 'case-m'
     $m1 = New-CohortEntryRequest -Sandbox $caseM -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $m2 = New-CohortEntryRequest -Sandbox $caseM -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -1453,7 +1681,7 @@ try {
     Assert-Cohort ((Invoke-Cohort -ManifestPath $writeBudget).ExitCode -eq 2) 'A cohort asking for a write budget was not refused.'
 
     # -----------------------------------------------------------------------
-    Write-Host '21/22 an entry that declares less than the full pipeline is refused' -ForegroundColor Cyan
+    Write-Host '21/23 an entry that declares less than the full pipeline is refused' -ForegroundColor Cyan
     $caseN = Join-Path $sandboxRoot 'case-n'
     $n1 = New-CohortEntryRequest -Sandbox $caseN -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273 -WithoutDelivery
     [void](New-StubControl -Path $n1.ControlPath -ExitCode 0)
@@ -1467,7 +1695,7 @@ try {
         'An entry declaring less than the full pipeline was started anyway.'
 
     # -----------------------------------------------------------------------
-    Write-Host '22/22 a cohort is an operator action, not an invocation shape' -ForegroundColor Cyan
+    Write-Host '22/23 a cohort is an operator action, not an invocation shape' -ForegroundColor Cyan
     $noAlias = Invoke-Cohort -ManifestPath $manifestA -OmitAuthorization
     Assert-Cohort ($noAlias.ExitCode -eq 1) "A cohort without --authorized-by exited $($noAlias.ExitCode); expected 1."
     Assert-Cohort ($noAlias.Output -match 'never by a timer') 'The refusal did not say a cohort is started by an operator.'
@@ -1485,6 +1713,88 @@ try {
         finally { $PSNativeCommandUseErrorActionPreference = $previous }
     }
     Assert-Cohort ($rebuildAlone.ExitCode -eq 1) "--rebuild-index outside a cohort exited $($rebuildAlone.ExitCode); expected 1."
+
+    # -----------------------------------------------------------------------
+    Write-Host '23/23 the key a real preparation writes is the key the cohort reads' -ForegroundColor Cyan
+    # The one entry in this suite that is NOT a stub. Everything else here proves
+    # accounting across processes and is faster and sharper for being stubbed;
+    # this proves the one thing a stub cannot, which is that the bytes the real
+    # preparation writes into its own root are bytes this runner can authenticate.
+    # A key is 32 random bytes and most such sequences are not text in any
+    # encoding, so a reader that decoded it would fail on almost every real root
+    # and on almost no fixture. That is exactly the defect this scenario exists
+    # to stop coming back.
+    #
+    # No model is started: the entry is driven to a snapshot state, which is
+    # before the first slot is declared, let alone launched.
+    Import-Module (Join-Path $RepoRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force
+    . (Join-Path $RepoRoot 'src\Agents\reviewer\SourceTransport.ps1')
+    . (Join-Path $RepoRoot 'src\Agents\reviewer\CorpusSeal.ps1')
+    . (Join-Path $RepoRoot 'tools\CorpusSealFixture.ps1')
+    . (Join-Path $RepoRoot 'tools\ShadowCoordinatorFixture.ps1')
+
+    $caseReal = Join-Path $sandboxRoot 'case-real'
+    $realFixture = New-ShadowCoordinatorFixture -Sandbox (Join-Path $caseReal 'fixture') `
+        -ToolkitRoot $RepoRoot -ShadowSlotsEnabled -ReconciliationEnabled -DeliveryEnabled
+    Assert-Cohort (Test-Path -LiteralPath $realFixture.RequestPath -PathType Leaf) `
+        'The real fixture did not write a coordinator request.'
+    $realEntry = [pscustomobject]@{
+        EntryId = 'entry-real'
+        Path = [string]$realFixture.RequestPath
+        Sha256 = (Get-Sha256 -Path $realFixture.RequestPath)
+        OutputRoot = [string]$realFixture.OutputRoot
+        Subject = $realFixture.Request.subject
+        Digests = $realFixture.Request.digests
+    }
+    $dotnetPath = [string](Get-Command dotnet -CommandType Application | Select-Object -First 1).Source
+    $manifestReal = New-CohortManifestFile -Path (Join-Path $caseReal 'cohort.json') `
+        -ToolkitRoot $realFixture.ToolkitCopy -Head $realFixture.Head -RequiredRef $realFixture.RequiredRef `
+        -JournalRoot (Join-Path $caseReal 'journal') -IndexPath (Join-Path $caseReal 'index\cohort-index.json') `
+        -StubPath $stub -CommandPath $dotnetPath -ArgumentPrefixOverride @($script:CohortDll) `
+        -Target 'snapshotVerified' -EntryTimeoutSeconds 900 `
+        -Entries @((New-CohortEntryDeclaration -Request $realEntry -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runReal = Invoke-Cohort -ManifestPath $manifestReal
+    Assert-Cohort ($runReal.ExitCode -eq 0) `
+        "A cohort over a real preparation exited $($runReal.ExitCode); expected 0. $($runReal.Output)"
+    $realKeyPath = Join-Path $realFixture.OutputRoot 'coordinator\state.key'
+    Assert-Cohort (Test-Path -LiteralPath $realKeyPath -PathType Leaf) `
+        'The real preparation wrote no signing key.'
+    $realKeyBytes = [IO.File]::ReadAllBytes($realKeyPath)
+    Assert-Cohort ($realKeyBytes.Length -eq 32) `
+        "The real preparation wrote a $($realKeyBytes.Length)-byte key; expected 32 raw bytes."
+    # Not a claim about this particular key - it is random - but a statement of
+    # what the format is: bytes, not characters. Recorded rather than asserted,
+    # because a reader that required text would be betting on the key happening
+    # to be text, and this run is one draw.
+    $decodable = $true
+    try { [void]([Text.UTF8Encoding]::new($false, $true)).GetString($realKeyBytes) }
+    catch { $decodable = $false }
+    Write-Host "  real key decodes as UTF-8: $decodable" -ForegroundColor DarkGray
+    $indexReal = Get-JsonFile -Path (Join-Path $caseReal 'index\cohort-index.json')
+    Assert-Cohort ($null -ne $indexReal) 'The cohort over a real preparation published no index.'
+    $summaryReal = Get-CohortIndexEntry -Index $indexReal -EntryId 'entry-real'
+    Assert-Cohort ($null -ne $summaryReal -and $summaryReal.auditSha256 -cmatch '^[0-9a-f]{64}$') `
+        'The real entry was summarized without an authenticated audit digest.'
+    Assert-Cohort ($indexReal.consumed.modelStarts -eq 0) `
+        "A cohort driven to a snapshot state reported $($indexReal.consumed.modelStarts) model starts; expected 0."
+    Assert-Cohort ($indexReal.consumed.providerWrites -eq 0) `
+        'A cohort over a real preparation reported a provider write.'
+    # The same real root read a second time, from the artifacts alone. This is the
+    # path the pilot crashed on.
+    $rebuildReal = Invoke-Cohort -ManifestPath $manifestReal -RebuildIndex
+    Assert-Cohort ($rebuildReal.ExitCode -eq 0) `
+        "A rebuild over a real preparation exited $($rebuildReal.ExitCode); expected 0. $($rebuildReal.Output)"
+    Assert-Cohort ($rebuildReal.Output -notmatch 'Unhandled exception') `
+        'A rebuild over a real key came out as a crash.'
+    # And the same root with the real key replaced: the signature is over bytes
+    # that are no longer there, so it is refused rather than accepted.
+    $realReplacement = [byte[]]::new(32)
+    [Security.Cryptography.RandomNumberGenerator]::Fill($realReplacement)
+    [IO.File]::WriteAllBytes($realKeyPath, $realReplacement)
+    $rebuildForged = Invoke-Cohort -ManifestPath $manifestReal -RebuildIndex
+    Assert-Cohort ($rebuildForged.ExitCode -eq 11) `
+        "A rebuild over a replaced real key exited $($rebuildForged.ExitCode); expected 11."
+    [IO.File]::WriteAllBytes($realKeyPath, $realKeyBytes)
 }
 finally {
     if (-not $KeepSandbox.IsPresent) {

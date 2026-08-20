@@ -275,24 +275,15 @@ internal sealed record CohortManifest
 
     private static byte[] ReadBytes(string path, string label)
     {
-        if (string.IsNullOrWhiteSpace(path))
-        {
-            throw new ContractException($"The {label} path is empty.");
-        }
-        var info = new FileInfo(path);
-        if (!info.Exists)
-        {
-            throw new ContractException($"The {label} file '{path}' does not exist.");
-        }
-        if (info.Length == 0)
+        // Through the one guarded reader, so a manifest or a bundle that is
+        // locked, vanished or unreadable is a refusal naming the file rather
+        // than a filesystem fault raised where a cohort was owed an answer.
+        var bytes = StrictJson.ReadFileBytes(path, label, 8L * 1024 * 1024);
+        if (bytes.Length == 0)
         {
             throw new ContractException($"The {label} file '{path}' is empty; a partial write must not read as an empty result.");
         }
-        if (info.Length > 8L * 1024 * 1024)
-        {
-            throw new ContractException($"The {label} file '{path}' is {info.Length.ToString(CultureInfo.InvariantCulture)} bytes, above the 8388608 byte limit.");
-        }
-        return File.ReadAllBytes(path);
+        return bytes;
     }
 
     /// <summary>
