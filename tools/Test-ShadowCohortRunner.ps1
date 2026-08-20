@@ -797,8 +797,10 @@ try {
     $b3 = New-CohortEntryRequest -Sandbox $caseB -EntryId 'entry-three' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918275
     [void](New-StubControl -Path $b1.ControlPath -ExitCode 0)
     # Exit 4 is a child failure inside the preparation itself, which is a
-    # different event from a supervised run ending other than complete.
-    [void](New-StubControl -Path $b2.ControlPath -ExitCode 4 -WriteAudit $false)
+    # different event from a supervised run ending other than complete. It
+    # published its audit before it fell over, so the cohort can account for it
+    # and the stop policy is the only thing deciding what happens next.
+    [void](New-StubControl -Path $b2.ControlPath -ExitCode 4)
     [void](New-StubControl -Path $b3.ControlPath -ExitCode 0)
     $manifestB = New-CohortManifestFile -Path (Join-Path $caseB 'cohort.json') `
         -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -StopPolicy 'failFast' `
@@ -833,6 +835,36 @@ try {
     Assert-Cohort ($indexBRebuilt.pendingEntryCount -eq 1) `
         "The rebuilt failFast index reports $($indexBRebuilt.pendingEntryCount) pending; expected 1."
 
+    # The other policy, over the same shape. An entry that failed and published its
+    # audit is an entry the cohort can account for, so continuing past it is a
+    # decision about policy rather than a guess about what happened.
+    $caseB2 = Join-Path $sandboxRoot 'case-b2'
+    $bc1 = New-CohortEntryRequest -Sandbox $caseB2 -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
+    $bc2 = New-CohortEntryRequest -Sandbox $caseB2 -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
+    $bc3 = New-CohortEntryRequest -Sandbox $caseB2 -EntryId 'entry-three' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918275
+    [void](New-StubControl -Path $bc1.ControlPath -ExitCode 0)
+    [void](New-StubControl -Path $bc2.ControlPath -ExitCode 4)
+    [void](New-StubControl -Path $bc3.ControlPath -ExitCode 0)
+    $manifestB2 = New-CohortManifestFile -Path (Join-Path $caseB2 'cohort.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -StopPolicy 'continueOnTerminalFailure' `
+        -JournalRoot (Join-Path $caseB2 'journal') -IndexPath (Join-Path $caseB2 'index\cohort-index.json') `
+        -StubPath $stub -Entries @(
+        (New-CohortEntryDeclaration -Request $bc1 -Ordinal 1 -RuleBundlePath $ruleBundle),
+        (New-CohortEntryDeclaration -Request $bc2 -Ordinal 2 -RuleBundlePath $ruleBundle),
+        (New-CohortEntryDeclaration -Request $bc3 -Ordinal 3 -RuleBundlePath $ruleBundle))
+    $runB2 = Invoke-Cohort -ManifestPath $manifestB2
+    Assert-Cohort ($runB2.ExitCode -eq 5) "The continuing cohort exited $($runB2.ExitCode); expected 5."
+    $indexB2 = Get-JsonFile -Path (Join-Path $caseB2 'index\cohort-index.json')
+    Assert-Cohort ($indexB2.terminalReason -eq 'completedWithEntryFailure') `
+        "The continuing cohort left terminal reason '$($indexB2.terminalReason)'; expected completedWithEntryFailure."
+    Assert-Cohort ($indexB2.pendingEntryCount -eq 0) `
+        "The continuing cohort left $($indexB2.pendingEntryCount) entries pending; expected 0."
+    $recordB2c2 = Get-CohortJournalEntry -JournalRoot (Join-Path $caseB2 'journal') -EntryId 'entry-two'
+    Assert-Cohort ($recordB2c2.outcome -eq 'preparationFaulted' -and $recordB2c2.auditSha256 -ne 'none') `
+        'The failed entry the cohort continued past did not end faulted with its own audit recorded.'
+    $recordB2c3 = Get-CohortJournalEntry -JournalRoot (Join-Path $caseB2 'journal') -EntryId 'entry-three'
+    Assert-Cohort ($recordB2c3.outcome -eq 'complete') 'The continue policy did not carry on past an accounted-for failure.'
+
     # -----------------------------------------------------------------------
     Write-Host '7/22 a child that hangs is killed at its declared ceiling' -ForegroundColor Cyan
     $caseC = Join-Path $sandboxRoot 'case-c'
@@ -849,16 +881,33 @@ try {
         (New-CohortEntryDeclaration -Request $c2 -Ordinal 2 -RuleBundlePath $ruleBundle))
 
     $runC = Invoke-Cohort -ManifestPath $manifestC
-    Assert-Cohort ($runC.ExitCode -eq 5) "The cohort with a hung entry exited $($runC.ExitCode); expected 5."
+    # A killed child publishes nothing, so there is no account of what it started
+    # or whether anything acted on its behalf. That stops the cohort regardless of
+    # policy rather than indexing an entry nobody can speak for.
+    Assert-Cohort ($runC.ExitCode -eq 11) "The cohort with a hung entry exited $($runC.ExitCode); expected 11."
     $recordC1 = Get-CohortJournalEntry -JournalRoot (Join-Path $caseC 'journal') -EntryId 'entry-one'
-    Assert-Cohort ($recordC1.outcome -eq 'timedOut') "The hung entry ended '$($recordC1.outcome)'; expected timedOut."
+    Assert-Cohort ($recordC1.state -eq 'ended' -and $recordC1.outcome -eq 'evidenceRefused') `
+        "The hung entry ended '$($recordC1.outcome)' in state '$($recordC1.state)'; expected an ended entry with its evidence refused."
     $recordC2 = Get-CohortJournalEntry -JournalRoot (Join-Path $caseC 'journal') -EntryId 'entry-two'
-    Assert-Cohort ($recordC2.outcome -eq 'complete') 'The continue policy did not carry on past a timed-out entry.'
+    Assert-Cohort ($recordC2.state -eq 'pending' -and $recordC2.attempt -eq 0) `
+        'The entry after a killed one was started, so a cohort carried on past a preparation it cannot account for.'
+    Assert-Cohort (-not (Test-Path -LiteralPath (Join-Path $c2.OutputRoot 'coordinator\audit.json'))) `
+        'The entry after a killed one produced evidence, so it was started.'
+    $indexC = Get-JsonFile -Path (Join-Path $caseC 'index\cohort-index.json')
+    Assert-Cohort ($indexC.terminalReason -eq 'blocked') `
+        "The cohort holding a killed entry published terminal reason '$($indexC.terminalReason)'; expected blocked."
     if (Test-Path -LiteralPath $marker -PathType Leaf) {
         $hungPid = [int]((Get-Content -LiteralPath $marker -Raw).Trim())
         $alive = $null -ne (Get-Process -Id $hungPid -ErrorAction SilentlyContinue)
         Assert-Cohort (-not $alive) "The hung child (process $hungPid) was still running after its entry timed out."
     }
+    # Running it again does not settle anything about that output root, so it does
+    # not un-block the cohort either.
+    $rerunC = Invoke-Cohort -ManifestPath $manifestC
+    Assert-Cohort ($rerunC.ExitCode -eq 11) "Resuming over a refused entry exited $($rerunC.ExitCode); expected 11."
+    $recordC2Again = Get-CohortJournalEntry -JournalRoot (Join-Path $caseC 'journal') -EntryId 'entry-two'
+    Assert-Cohort ($recordC2Again.state -eq 'pending' -and $recordC2Again.attempt -eq 0) `
+        'A resume over a refused entry started the entry after it.'
 
     # -----------------------------------------------------------------------
     Write-Host '8/22 kill at a cohort transition, then refuse to run beside a live child' -ForegroundColor Cyan
@@ -993,16 +1042,16 @@ try {
         -JournalRoot (Join-Path $caseE3 'journal') -IndexPath (Join-Path $caseE3 'index\cohort-index.json') `
         -StubPath $stub -Entries @((New-CohortEntryDeclaration -Request $e3 -Ordinal 1 -RuleBundlePath $ruleBundle))
     $runE3 = Invoke-Cohort -ManifestPath $manifestE3
-    Assert-Cohort ($runE3.ExitCode -eq 5) "A cohort whose child died hard exited $($runE3.ExitCode); expected 5."
+    Assert-Cohort ($runE3.ExitCode -eq 11) "A cohort whose child died hard exited $($runE3.ExitCode); expected 11."
     $recordE3 = Get-CohortJournalEntry -JournalRoot (Join-Path $caseE3 'journal') -EntryId 'entry-one'
-    Assert-Cohort ($recordE3.outcome -eq 'preparationFaulted') "The hard-dying entry ended '$($recordE3.outcome)'; expected preparationFaulted."
+    Assert-Cohort ($recordE3.outcome -eq 'evidenceRefused') "The hard-dying entry ended '$($recordE3.outcome)'; expected evidenceRefused."
     Assert-Cohort ($recordE3.exitCode -lt 0) "The hard-dying entry recorded exit code $($recordE3.exitCode); this case is only a case when it is negative."
     $rebuildE3 = Invoke-Cohort -ManifestPath $manifestE3 -RebuildIndex
     Assert-Cohort ($rebuildE3.ExitCode -eq 0) `
         "Rebuilding over a journal holding a negative exit code exited $($rebuildE3.ExitCode); expected 0."
     $rerunE3 = Invoke-Cohort -ManifestPath $manifestE3
-    Assert-Cohort ($rerunE3.ExitCode -eq 5) `
-        "Resuming over a journal holding a negative exit code exited $($rerunE3.ExitCode); expected 5."
+    Assert-Cohort ($rerunE3.ExitCode -eq 11) `
+        "Resuming over a journal holding a negative exit code exited $($rerunE3.ExitCode); expected 11."
 
     # -----------------------------------------------------------------------
     Write-Host '13/22 global budget exhaustion stops before the next entry' -ForegroundColor Cyan
@@ -1034,39 +1083,42 @@ try {
         'The entry past the ceiling produced evidence, so the ceiling was checked too late.'
 
     # An entry that ran and left no readable audit did not thereby cost nothing;
-    # it cost an amount nobody can state. Charging it zero would let a run that
-    # consumed its whole share fund the entries after it, so it is charged what it
-    # was admitted on - its own sealed estimate. Here the first entry dies without
-    # publishing anything, and its estimate alone is enough to close the ceiling
-    # against the second.
+    # it cost an amount nobody can state, and nothing it left behind says whether
+    # anything acted on its behalf. Neither the ceiling nor the zero-write claim
+    # can be computed over that, so the cohort stops there whatever the stop
+    # policy says, and stays stopped until an operator settles that output root.
     $caseFq = Join-Path $sandboxRoot 'case-f-unaccounted'
     $fq1 = New-CohortEntryRequest -Sandbox $caseFq -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $fq2 = New-CohortEntryRequest -Sandbox $caseFq -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
     $fq3 = New-CohortEntryRequest -Sandbox $caseFq -EntryId 'entry-three' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918275
-    # The first entry overruns its estimate honestly and says so. The second dies
-    # without publishing anything: charged zero it would leave room for the third,
-    # and charged what it was admitted on it does not.
-    [void](New-StubControl -Path $fq1.ControlPath -ExitCode 0 -Slot1ModelInvocationCount 2 -Slot2ModelInvocationCount 2)
+    [void](New-StubControl -Path $fq1.ControlPath -ExitCode 0)
     [void](New-StubControl -Path $fq2.ControlPath -ExitCode -1073741819 -WriteAudit $false)
     [void](New-StubControl -Path $fq3.ControlPath -ExitCode 0)
     $manifestFq = New-CohortManifestFile -Path (Join-Path $caseFq 'cohort.json') `
-        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -MaxModelStarts 7 -StopPolicy 'continueOnTerminalFailure' `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -MaxModelStarts 9 -StopPolicy 'continueOnTerminalFailure' `
         -JournalRoot (Join-Path $caseFq 'journal') -IndexPath (Join-Path $caseFq 'index\cohort-index.json') `
         -StubPath $stub -Entries @(
         (New-CohortEntryDeclaration -Request $fq1 -Ordinal 1 -RuleBundlePath $ruleBundle -EstimatedModelStarts 2),
         (New-CohortEntryDeclaration -Request $fq2 -Ordinal 2 -RuleBundlePath $ruleBundle -EstimatedModelStarts 2),
         (New-CohortEntryDeclaration -Request $fq3 -Ordinal 3 -RuleBundlePath $ruleBundle -EstimatedModelStarts 2))
     $runFq = Invoke-Cohort -ManifestPath $manifestFq
-    Assert-Cohort ($runFq.ExitCode -eq 10) `
-        "A cohort holding an entry with no audit exited $($runFq.ExitCode); expected 10, which means its estimate was charged rather than zero."
+    Assert-Cohort ($runFq.ExitCode -eq 11) `
+        "A cohort holding an entry with no audit exited $($runFq.ExitCode); expected 11, so the continue policy did not carry it past a preparation nobody can account for."
     $recordFq2 = Get-CohortJournalEntry -JournalRoot (Join-Path $caseFq 'journal') -EntryId 'entry-two'
+    Assert-Cohort ($recordFq2.outcome -eq 'evidenceRefused') "The unaccounted entry ended '$($recordFq2.outcome)'; expected evidenceRefused."
     Assert-Cohort ($recordFq2.auditSha256 -eq 'none') 'The unaccounted entry recorded an audit digest it never published.'
     Assert-Cohort ($recordFq2.modelStartCount -eq 0) 'The unaccounted entry recorded model starts it never reported.'
     $recordFq3 = Get-CohortJournalEntry -JournalRoot (Join-Path $caseFq 'journal') -EntryId 'entry-three'
     Assert-Cohort ($recordFq3.state -eq 'pending' -and $recordFq3.attempt -eq 0) `
         'The entry after an unaccounted one was started, so the ceiling was funded by a run nobody can account for.'
     Assert-Cohort (-not (Test-Path -LiteralPath (Join-Path $fq3.OutputRoot 'coordinator\audit.json'))) `
-        'The entry past the ceiling produced evidence.'
+        'The entry past an unaccounted one produced evidence.'
+    $indexFq = Get-JsonFile -Path (Join-Path $caseFq 'index\cohort-index.json')
+    Assert-Cohort ($indexFq.terminalReason -eq 'blocked') `
+        "The cohort holding an unaccounted entry published terminal reason '$($indexFq.terminalReason)'; expected blocked."
+    $summaryFq2 = Get-CohortIndexEntry -Index $indexFq -EntryId 'entry-two'
+    Assert-Cohort ($summaryFq2.providerWriteCount -eq 0 -and $summaryFq2.state -eq 'ended') `
+        'The index does not report the unaccounted entry as ended.'
 
     # -----------------------------------------------------------------------
     Write-Host '14/22 an observed provider write blocks the whole cohort' -ForegroundColor Cyan

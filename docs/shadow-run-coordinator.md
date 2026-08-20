@@ -568,18 +568,21 @@ entry about to start. If that would cross the declared maximum model starts, ver
 or wall clock, the cohort stops (exit 10), the remaining entries stay `pending`, and the index says
 so. A ceiling checked afterwards is a ceiling that has already been exceeded.
 
-**An entry that left no audit is charged what it was admitted on.** A child can die or be killed
-part-way through a preparation, having already started models, without ever publishing an audit.
-There is no honest way to read what it spent, so the cohort charges it its own sealed estimate
-rather than zero: zero would mean a run nobody can account for silently funds the entries after it.
-An entry that ends *complete* with no audit is a different thing and is refused outright (exit 11),
-because a completion is a claim about what was consumed and what was not written, and there is
-nothing behind that claim. Wall clock is charged from the parent's own measurement either way.
+**An entry that left no evidence stops the cohort.** A child can die, hang or be killed part-way
+through a preparation, having already started models, without ever publishing an audit. Nothing it
+left behind says what it consumed or whether anything acted on its behalf, so neither the ceiling
+nor the zero-write claim can be computed over it. Carrying it into the index would publish a zero
+write count for an entry that never proved one. Every launched entry with no readable audit
+therefore blocks the whole cohort (exit 11) whatever the stop policy says, the entries after it stay
+`pending`, and running the cohort again refuses again — running it a second time settles nothing
+about that output root. `continueOnTerminalFailure` carries on past an entry that failed *and*
+published its audit, which is a failure the cohort can account for.
 
 **Stop policy, and what it does not mean.** `failFast` stops at the first entry that ends other
 than complete; `continueOnTerminalFailure` carries on to the next one. Neither re-attempts
-anything. Two conditions ignore the policy entirely and stop the whole cohort: an entry audit this
-build cannot read, and any reported provider write or write tool invocation (exit 11). An audit
+anything. Three conditions ignore the policy entirely and stop the whole cohort: an entry that
+published no audit at all, an entry audit this build cannot read, and any reported provider write or
+write tool invocation (exit 11). An audit
 standing in an entry's output root counts as that entry's audit only if it names the correlation
 the entry's own sealed request declares, restates the request and subject digests the manifest
 sealed, and carries that entry's own signature over itself — the cohort verifies the audit's HMAC
@@ -917,9 +920,9 @@ refuses to run beside that live child, and then — once it is gone — a resume
 interrupted entry to an ending on a second attempt, never touches the entry before it, and goes on
 to the entry after it; a journal edited after it was written; a manifest edited between runs; a
 journal key with no journal; the global ceiling stopping the cohort before the entry that would
-cross it, again confirmed by the absence of that entry's output, and stopping it because an entry
-that died without publishing an audit was charged the estimate it was admitted on rather than
-nothing; a reported provider write and an
+cross it, again confirmed by the absence of that entry's output; a child that was killed at its
+ceiling and a child that died hard, each leaving no audit and each stopping the whole cohort with
+the entry after it untouched and a second run refusing again; a reported provider write and an
 unreadable entry audit, each stopping the whole cohort regardless of policy; a subject that drifted
 between the manifest and the request, a request edited after the manifest sealed it, a rule bundle
 that changed under its declaration, and a toolkit checkout that moved — each refused with the entry

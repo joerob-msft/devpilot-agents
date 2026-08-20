@@ -606,8 +606,8 @@ if ($cohortPresent.Count -eq $cohortSources.Count) {
         'The cohort accepts a completed entry that published no audit, which the index would report as a preparation that ran and consumed nothing.'
     Assert-Coordinator ($runnerText -match 'RequireEvidenceAccountedFor\(entry, outcome, summary\)') `
         'The cohort decides whether an entry is accounted for somewhere other than on the summary it read, so the audit could vanish between the check and the reading.'
-    Assert-Coordinator ($runnerText -match 'AuditSha256, "none"[\s\S]{0,240}EstimatedModelStarts') `
-        'The cohort charges an entry that published no audit nothing at all, so a child that died mid-preparation funds the entries after it.'
+    Assert-Coordinator ($runnerText -match 'private static void RequireEvidenceAccountedFor\([^)]*\)\s*\{\s*if \(!string\.Equals\(summary\.AuditSha256') `
+        'The cohort asks how an entry ended before it asks whether the entry left any evidence, so a crashed or killed preparation is carried into the index with a zero write count it never proved.'
 
     # A signed journal cannot be repaired by hand, so the writer may never commit
     # a record its own reader refuses: the only way out of that would be a fresh

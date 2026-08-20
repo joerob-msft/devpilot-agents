@@ -771,23 +771,8 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
             {
                 continue;
             }
-            // An entry that ran and left no readable audit did not thereby cost
-            // nothing; it cost an amount nobody can state. Charging it zero would
-            // let a run that consumed its whole share fund the entries after it,
-            // so it is charged what it was admitted on instead - its own sealed
-            // estimate, which is the most this cohort ever authorized it to spend.
-            // The elapsed seconds are the parent's own measurement and stand
-            // either way.
-            if (string.Equals(record.AuditSha256, "none", StringComparison.Ordinal))
-            {
-                models += declared.EstimatedModelStarts;
-                verifiers += declared.EstimatedVerifierAssignments;
-            }
-            else
-            {
-                models += record.ModelStartCount;
-                verifiers += record.VerifierAssignmentCount;
-            }
+            models += record.ModelStartCount;
+            verifiers += record.VerifierAssignmentCount;
             seconds += record.ElapsedSeconds;
             started++;
         }
@@ -890,8 +875,8 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
     }
 
     /// <summary>
-    /// Refuses a preparation that reports completion with nothing standing where
-    /// its evidence belongs.
+    /// Refuses a launched preparation with nothing standing where its evidence
+    /// belongs, whatever it says about how it ended.
     /// </summary>
     /// <remarks>
     /// A preparation that exits cleanly has published its audit; that is what
@@ -899,12 +884,19 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
     /// in its output root would otherwise be summarized as a preparation that ran
     /// and consumed nothing - a completed entry with no evidence, no model starts
     /// and no write counters, which is indistinguishable in the index from a
-    /// cohort that genuinely cost nothing. The counters that admission and the
-    /// zero-write claim are computed from would all be absent, so this is refused
-    /// rather than counted. A preparation that faulted before it could write
-    /// anything is a different case and keeps its absence: nothing is being
-    /// claimed on its behalf, and what it may have consumed is charged at its
-    /// sealed estimate instead of at zero.
+    /// cohort that genuinely cost nothing.
+    ///
+    /// A preparation that crashed, hung or was killed is no better off. It was
+    /// launched, so it may have started models and it may have had a provider act
+    /// on its behalf; nothing it left behind says either way. Carrying it into the
+    /// index would publish a zero write count for an entry that never proved one,
+    /// and the zero-write claim is the whole point of a preview-only cohort. The
+    /// admission arithmetic is in the same position: what it consumed is not a
+    /// number this runner can state, and a ceiling computed over an unknown is not
+    /// a ceiling. So every launched entry with no readable evidence stops the
+    /// cohort, whatever the stop policy says, and the walk keeps it stopped: a
+    /// resume over a refused entry refuses again, because nothing about that
+    /// output root has been settled by running the cohort a second time.
     ///
     /// This reads the summary rather than the file system so that there is one
     /// decision and not two. A separate existence check before the read would be
@@ -913,18 +905,15 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
     /// </remarks>
     private static void RequireEvidenceAccountedFor(CohortEntry entry, string outcome, CohortEntrySummary summary)
     {
-        if (!string.Equals(outcome, CohortEntryOutcomes.Complete, StringComparison.Ordinal))
+        if (!string.Equals(summary.AuditSha256, "none", StringComparison.Ordinal))
         {
             return;
         }
-        if (string.Equals(summary.AuditSha256, "none", StringComparison.Ordinal))
-        {
-            throw new CohortBlockedException(
-                $"Entry '{entry.EntryId}' reported a completed preparation and published no audit at " +
-                $"'{CohortSummaryReader.AuditPathFor(entry)}'. A completion with no evidence behind it cannot be counted against " +
-                "this cohort's ceiling, and it cannot support the claim that nothing was written, so the cohort stops rather than " +
-                "indexing it as a preparation that cost nothing.");
-        }
+        throw new CohortBlockedException(
+            $"Entry '{entry.EntryId}' ended '{outcome}' and published no audit at " +
+            $"'{CohortSummaryReader.AuditPathFor(entry)}'. A launched preparation with no evidence behind it cannot be counted " +
+            "against this cohort's ceiling, and it cannot support the claim that nothing was written, so the cohort stops rather " +
+            "than indexing it as a preparation that cost nothing.");
     }
 
     /// <summary>Writes the index and refuses to let a failure to write it end the cohort.</summary>
