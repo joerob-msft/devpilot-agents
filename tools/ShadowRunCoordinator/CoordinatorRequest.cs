@@ -150,6 +150,14 @@ internal sealed record CoordinatorRequest
 
     internal string ExchangeRoot => Path.Combine(CoordinatorRoot, "exchange");
 
+    /// <summary>
+    /// Where the signed intent to start a child is committed, before the child
+    /// exists. Kept apart from the exchange because these records outlive the
+    /// step they describe: they are the only evidence a coordinator killed
+    /// between deciding to launch and observing what it launched leaves behind.
+    /// </summary>
+    internal string LaunchIntentRoot => Path.Combine(CoordinatorRoot, "intents");
+
     internal string LogRoot => Path.Combine(CoordinatorRoot, "logs");
 
     internal string StageArtifactRoot => Path.Combine(OutputRoot, "stage-artifacts");

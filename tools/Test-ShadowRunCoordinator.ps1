@@ -820,7 +820,7 @@ try {
     # resolve against whatever scope happens to run the closure later.
     $setOutputRoot = ${function:Set-CoordinatorOutputRoot}
 
-    Write-Host '1/27 offline restore and build' -ForegroundColor Cyan
+    Write-Host '1/29 offline restore and build' -ForegroundColor Cyan
     $project = Join-Path $RepoRoot 'tools\ShadowRunCoordinator\ShadowRunCoordinator.csproj'
     Assert-Coordinator (Test-Path -LiteralPath $project -PathType Leaf) `
         'The shadow run coordinator project is missing.'
@@ -839,7 +839,7 @@ try {
         'The coordinator assembly was not produced.'
 
     # -----------------------------------------------------------------------
-    Write-Host '2/27 sandbox, sealed corpus and typed request' -ForegroundColor Cyan
+    Write-Host '2/29 sandbox, sealed corpus and typed request' -ForegroundColor Cyan
     Import-Module (Join-Path $RepoRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force
     . (Join-Path $RepoRoot 'src\Agents\reviewer\SourceTransport.ps1')
     . (Join-Path $RepoRoot 'src\Agents\reviewer\CorpusSeal.ps1')
@@ -856,7 +856,7 @@ try {
         'The request does not bind a prompt-asset digest.'
 
     # -----------------------------------------------------------------------
-    Write-Host '3/27 restart at every transition' -ForegroundColor Cyan
+    Write-Host '3/29 restart at every transition' -ForegroundColor Cyan
     $states = @('requestValidated', 'corpusStaging', 'corpusPublished', 'corpusValidated',
         'recipePlanned', 'snapshotValidateOnly', 'snapshotSealed', 'snapshotVerified',
         'runSetDeclared', 'runSetVerified')
@@ -884,7 +884,7 @@ try {
             "Resuming to an already-reached '$state' advanced the sequence to $($repeat.sequence)."
     }
 
-    Write-Host '4/27 preparation reaches run-set-ready' -ForegroundColor Cyan
+    Write-Host '4/29 preparation reaches run-set-ready' -ForegroundColor Cyan
     $final = Invoke-Coordinator -RequestPath $fixture.RequestPath
     Assert-Coordinator ($final.ExitCode -eq 0) "The preparation did not reach run-set-ready (exit $($final.ExitCode)): $($final.Output)"
     $durable = Get-CoordinatorState -OutputRoot $fixture.OutputRoot
@@ -913,7 +913,7 @@ try {
         "Replaying a completed preparation advanced the sequence to $($afterReplay.sequence)."
 
     # -----------------------------------------------------------------------
-    Write-Host '5/27 audit indexes all twelve stage artifacts' -ForegroundColor Cyan
+    Write-Host '5/29 audit indexes all twelve stage artifacts' -ForegroundColor Cyan
     $auditPath = Join-Path $fixture.OutputRoot 'coordinator\audit.json'
     Assert-Coordinator (Test-Path -LiteralPath $auditPath -PathType Leaf) 'The coordinator wrote no audit.'
     $audit = Get-Content -LiteralPath $auditPath -Raw | ConvertFrom-Json -Depth 32
@@ -939,7 +939,7 @@ try {
         'The preparation observed a slot attempt.'
 
     # -----------------------------------------------------------------------
-    Write-Host '6/27 stage publication parity with the PowerShell path' -ForegroundColor Cyan
+    Write-Host '6/29 stage publication parity with the PowerShell path' -ForegroundColor Cyan
     # The same stage publication, driven directly through the existing PowerShell
     # entry point instead of through the coordinator's child process. Byte
     # identical artifacts are what makes the rollback switch real at THIS seam:
@@ -980,7 +980,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    Write-Host '7/27 request boundary: unknown, missing, scalar, null, BOM, truncated' -ForegroundColor Cyan
+    Write-Host '7/29 request boundary: unknown, missing, scalar, null, BOM, truncated' -ForegroundColor Cyan
     # Built through a list rather than an @(...) literal: the mutators set fields
     # to $null on purpose, and inside an array expression that reads as an array
     # that can carry a null element. It cannot -- the nulls are inside script
@@ -1028,7 +1028,7 @@ try {
         'A missing request file was not refused.'
 
     # -----------------------------------------------------------------------
-    Write-Host '8/27 stale head, stale identity and tampered state' -ForegroundColor Cyan
+    Write-Host '8/29 stale head, stale identity and tampered state' -ForegroundColor Cyan
     $staleHeadPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'stale-head' -Mutate {
         param($r)
         $r.toolkit.head = ('f' * 40)
@@ -1087,7 +1087,7 @@ try {
         "A state file from another correlation was adopted (exit $($foreign.ExitCode))."
 
     # -----------------------------------------------------------------------
-    Write-Host '9/27 single-run lease' -ForegroundColor Cyan
+    Write-Host '9/29 single-run lease' -ForegroundColor Cyan
     $leaseRoot = Join-Path $sandbox 'out-lease'
     $leasePath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'lease' -Mutate {
         param($r) & $setOutputRoot -Request $r -Root $leaseRoot
@@ -1122,7 +1122,7 @@ try {
         "An abandoned lease wedged the output root (exit $($recovered.ExitCode))."
 
     # -----------------------------------------------------------------------
-    Write-Host '10/27 child fault matrix' -ForegroundColor Cyan
+    Write-Host '10/29 child fault matrix' -ForegroundColor Cyan
     $faults = @(
         @{ Name = 'nonzero'; Expect = 4 },
         @{ Name = 'missing'; Expect = 4 },
@@ -1190,7 +1190,7 @@ try {
     Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot
 
     # -----------------------------------------------------------------------
-    Write-Host '11/27 killed mid-transition' -ForegroundColor Cyan
+    Write-Host '11/29 killed mid-transition' -ForegroundColor Cyan
     # A real external kill, not a cooperative halt: the coordinator is stopped
     # while a child is running, and the root must still converge.
     $killRoot = Join-Path $sandbox 'out-kill'
@@ -1227,7 +1227,7 @@ try {
         "The resumed preparation left $($declared.Count) declared run sets rather than one."
 
     # -----------------------------------------------------------------------
-    Write-Host '12/27 pre-commit window: a published side effect is adopted' -ForegroundColor Cyan
+    Write-Host '12/29 pre-commit window: a published side effect is adopted' -ForegroundColor Cyan
     # The fault a control plane cannot test its way out of by halting: a child
     # completes a durable, NON-REPEATABLE side effect and the coordinator dies
     # before it can commit the transition. Every --halt-after case above stops
@@ -1427,7 +1427,7 @@ try {
     Assert-Coordinator (@(Get-ChildItem -LiteralPath $stageDirectory -File -Filter '*.stage.json').Count -eq 12) `
         'The retry accumulated stage artifacts instead of replacing them.'
     # -----------------------------------------------------------------------
-    Write-Host '13/27 resume integrity and the declared artifact directory' -ForegroundColor Cyan
+    Write-Host '13/29 resume integrity and the declared artifact directory' -ForegroundColor Cyan
     # A resumed run re-reads its child results from the exchange directory, which
     # carries no signature of its own. Without binding them to the digest the
     # signed record committed, a resume could adopt a snapshot or run set other
@@ -1499,7 +1499,7 @@ try {
         'A missing option value escaped as an unhandled exception.'
 
     # -----------------------------------------------------------------------
-    Write-Host '14/27 changed-path census boundary' -ForegroundColor Cyan
+    Write-Host '14/29 changed-path census boundary' -ForegroundColor Cyan
     # The census is declared by the caller and validated here, never synthesised.
     # Zero, one, many, duplicated, misordered, scalar, null and unknown all have
     # to have an answer, because the census reaches the published bytes.
@@ -1538,7 +1538,7 @@ try {
         'A missing changed-path census was not refused.'
 
     # -----------------------------------------------------------------------
-    Write-Host '15/27 a declaration must belong to this preparation' -ForegroundColor Cyan
+    Write-Host '15/29 a declaration must belong to this preparation' -ForegroundColor Cyan
     # A signature proves a declaration was made under this output root's key. It
     # does NOT prove the declaration is about the snapshot this run sealed - one
     # key signs every declaration in a root, so a declaration left behind by an
@@ -1674,7 +1674,7 @@ try {
         "The refusal did not name the plan the declaration was sealed under.`n$borrowReason"
 
     # -----------------------------------------------------------------------
-    Write-Host '16/27 the audit says only what the record can support' -ForegroundColor Cyan
+    Write-Host '16/29 the audit says only what the record can support' -ForegroundColor Cyan
     # An audit whose counters come from this process cannot see work an earlier
     # process did, and a null count coerces to the reassuring zero in every
     # consumer that reads it. Both are properties of the durable record here.
@@ -1709,7 +1709,7 @@ try {
         'The resumed audit did not grow its child-backed transition census.'
 
     # -----------------------------------------------------------------------
-    Write-Host '17/27 a root that has done nothing is not wedged' -ForegroundColor Cyan
+    Write-Host '17/29 a root that has done nothing is not wedged' -ForegroundColor Cyan
     # The refusal that protects a destroyed record must not be reachable by a
     # first attempt that simply failed. A run refused at requestValidated has
     # published nothing, so the same root with a corrected request has to work -
@@ -1851,7 +1851,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    Write-Host '18/27 slot authorization against the real qualification plan' -ForegroundColor Cyan
+    Write-Host '18/29 slot authorization against the real qualification plan' -ForegroundColor Cyan
     # The one slot scenario that stands NOTHING in. The plan is built by the
     # production builder, bound to the signed declaration by the production
     # assertions, and the launch token is the one the declaration published. It
@@ -1980,7 +1980,7 @@ try {
         'Authorizing a launch created a run directory.'
 
     # -----------------------------------------------------------------------
-    Write-Host '19/27 one supervised slot, halted and resumed at every slot state' -ForegroundColor Cyan
+    Write-Host '19/29 one supervised slot, halted and resumed at every slot state' -ForegroundColor Cyan
     $slotStates = @('slot1Authorized', 'slot1Launching', 'slot1Running', 'slot1TerminalObserved')
     $lifecycleRoot = Join-Path $sandbox 'slot-lifecycle'
     $lifecyclePath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'slot-lifecycle' `
@@ -2171,7 +2171,7 @@ try {
     finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
 
     # -----------------------------------------------------------------------
-    Write-Host '20/27 slot terminal endings and the slot fault matrix' -ForegroundColor Cyan
+    Write-Host '20/29 slot terminal endings and the slot fault matrix' -ForegroundColor Cyan
     # Every case gets its own output root, because a slot's launch authorization
     # is single-use and a root that has spent it can never be reused.
     $slotCases = @(
@@ -2286,7 +2286,7 @@ try {
     finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
 
     # -----------------------------------------------------------------------
-    Write-Host '21/27 typed corpus staging from an immutable source' -ForegroundColor Cyan
+    Write-Host '21/29 typed corpus staging from an immutable source' -ForegroundColor Cyan
     # A SECOND sandbox, whose corpus is built as a read-only source and whose
     # request names a corpus root that does not exist. This is the condition the
     # preparation this slice replaces died on, made ordinary.
@@ -2400,7 +2400,7 @@ try {
         'Replaying a staged preparation rewrote the published corpus.'
 
     # -----------------------------------------------------------------------
-    Write-Host '22/27 corpus staging fault matrix' -ForegroundColor Cyan
+    Write-Host '22/29 corpus staging fault matrix' -ForegroundColor Cyan
     $stageInputs = Split-Path ([string]$stageFixture.StageRequestPath) -Parent
     $faultRoot = Join-Path $sandbox 'stage-faults'
     [void](New-Item -ItemType Directory -Force -Path $faultRoot)
@@ -2786,7 +2786,7 @@ try {
         "The contested staging left $($raceResidue.Count) staging director(ies) behind."
 
     # -----------------------------------------------------------------------
-    Write-Host '23/27 two declared slots, in order, and the opaque reconciliation' -ForegroundColor Cyan
+    Write-Host '23/29 two declared slots, in order, and the opaque reconciliation' -ForegroundColor Cyan
     # No model anywhere in this section. Preparation is real, the declaration is
     # real and signed, both slots are declared before either runs, and only the
     # execution and the comparison are stood in for. What is under test is the
@@ -2980,7 +2980,7 @@ try {
     finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
 
     # -----------------------------------------------------------------------
-    Write-Host '24/27 a failed slot closes the set' -ForegroundColor Cyan
+    Write-Host '24/29 a failed slot closes the set' -ForegroundColor Cyan
     # A slot that ends unsuccessfully is a durable ending, and everything that
     # would have followed it is refused rather than skipped. Both orderings are
     # exercised: slot1 failing before slot2 is authorized, and slot2 failing
@@ -3035,7 +3035,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    Write-Host '25/27 reconciliation fault matrix' -ForegroundColor Cyan
+    Write-Host '25/29 reconciliation fault matrix' -ForegroundColor Cyan
     # Each case gets a fresh root, because a reconciliation is authorized once
     # and consumed when it is attempted.
     $reconcileCases = @(
@@ -3254,7 +3254,7 @@ try {
     finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
 
     # -----------------------------------------------------------------------
-    Write-Host '26/27 the reconciliation reads a slot run where the reviewer writes it' -ForegroundColor Cyan
+    Write-Host '26/29 the reconciliation reads a slot run where the reviewer writes it' -ForegroundColor Cyan
     # The comparison is stubbed everywhere else in this suite, which is exactly
     # how a reconciliation shipped that looked for each slot's sealed run loose
     # in the slot state directory. The reviewer does not write it there: a
@@ -3305,7 +3305,272 @@ try {
         'The layout this case builds is not the layout the defect assumed, so it would not have caught it.'
 
     # -----------------------------------------------------------------------
-    Write-Host '27/27 no orphans, no external writes' -ForegroundColor Cyan
+    Write-Host '27/29 the launch intent journal accounts for every child' -ForegroundColor Cyan
+    # The window this case exists for is the one between Process.Start and the
+    # record naming what was started. It is microseconds wide and it is the only
+    # window in which a coordinator can die holding a child nothing can name.
+    # Killing a real coordinator inside it is not reproducible, so the window's
+    # RESULT is reproduced instead: an intent that is on disk and unaccountable.
+    # A truncated intent is exactly that - it is what a coordinator killed while
+    # committing the intent, or after starting but before recording the pid,
+    # leaves behind - and the ledger is required to read it as the open case.
+    $intentRoot = Join-Path $sandbox 'intent-journal'
+    $intentPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'intent-journal' `
+        -Mutate {
+            param($r)
+            & $setOutputRoot -Request $r -Root $intentRoot
+            $r.slots.shadowSlotsEnabled = $true
+        }.GetNewClosure()
+    Initialize-SlotRunSet -Fixture $fixture -RepositoryRoot $RepoRoot -RequestPath $intentPath `
+        -OutputRoot $intentRoot -Label 'intent-journal'
+    New-SlotStubAdapter -ToolkitCopy $fixture.ToolkitCopy -RealAdapter $realAdapter -Mode 'complete'
+    try {
+        $intentDirectory = Join-Path $intentRoot 'coordinator\intents'
+        Assert-Coordinator (Test-Path -LiteralPath $intentDirectory -PathType Container) `
+            'A preparation that launched children left no launch intent journal.'
+        $intentFiles = @(Get-ChildItem -LiteralPath $intentDirectory -Filter '*.intent.json' -File)
+        Assert-Coordinator ($intentFiles.Count -gt 0) 'The launch intent journal is empty.'
+        $intents = @($intentFiles | ForEach-Object {
+                Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json -Depth 16
+            })
+        $openPhases = @($intents | Where-Object { [string]$_.phase -cne 'closed' })
+        Assert-Coordinator ($openPhases.Count -eq 0) `
+            "A completed preparation left $($openPhases.Count) launch intent(s) unclosed."
+        foreach ($intent in $intents) {
+            Assert-Coordinator ([string]$intent.contractVersion -ceq 'devpilot.shadow-run-coordinator.launch-intent.v1') `
+                "A launch intent carries contract version '$([string]$intent.contractVersion)'."
+            Assert-Coordinator ([string]$intent.signature.value -cmatch '^[0-9a-f]{64}$') `
+                "The launch intent for step '$([string]$intent.step)' is not signed."
+            Assert-Coordinator ([string]$intent.transition -cmatch '^\S') `
+                "The launch intent for step '$([string]$intent.step)' names no transition."
+            Assert-Coordinator ([string]$intent.childSpecSha256 -cmatch '^[0-9a-f]{64}$' -and
+                [string]$intent.childRequestSha256 -cmatch '^[0-9a-f]{64}$') `
+                "The launch intent for step '$([string]$intent.step)' does not bind the child it intended to start."
+            Assert-Coordinator ([string]$intent.expectedResultPath -cmatch '\S' -and [string]$intent.leasePath -cmatch '\S') `
+                "The launch intent for step '$([string]$intent.step)' names no expected output or lease."
+            Assert-Coordinator ([int]$intent.leaseProcessId -gt 0 -and [string]$intent.correlationId -cmatch '\S') `
+                "The launch intent for step '$([string]$intent.step)' cannot be tied back to the run that wrote it."
+        }
+        # One intent per step, and a dense launch sequence: two intents sharing a
+        # sequence, or a step holding two, is a second launch of a single-use step.
+        $sequences = @($intents | ForEach-Object { [long]$_.launchSequence } | Sort-Object -Unique)
+        Assert-Coordinator ($sequences.Count -eq $intents.Count) `
+            "The journal holds $($intents.Count) intents across $($sequences.Count) distinct launch sequences."
+        Assert-Coordinator ($sequences[0] -eq 1 -and $sequences[-1] -eq $intents.Count) `
+            "The launch sequence runs $($sequences[0])..$($sequences[-1]) over $($intents.Count) intents rather than densely from one."
+        $steps = @($intents | ForEach-Object { [string]$_.step } | Sort-Object -Unique)
+        Assert-Coordinator ($steps.Count -eq $intents.Count) `
+            "The journal records $($intents.Count) launches across only $($steps.Count) distinct steps, so a step was launched twice."
+
+        # The open case, planted on the one step where a duplicate launch is
+        # unrecoverable rather than merely wasteful.
+        $correlationId = [string]$intents[0].correlationId
+        $plantedIntent = Join-Path $intentDirectory "$correlationId-slot1Run-0001.intent.json"
+        Assert-Coordinator (-not (Test-Path -LiteralPath $plantedIntent)) `
+            'The slot run step already holds an intent before the slot has ever been launched.'
+        $donor = [IO.File]::ReadAllText($intentFiles[0].FullName)
+        [IO.File]::WriteAllText($plantedIntent, $donor.Substring(0, [int]($donor.Length / 2)))
+        $refused = Invoke-Coordinator -RequestPath $intentPath -Target 'slot1TerminalVerified'
+        Assert-Coordinator ($refused.ExitCode -eq 6) `
+            "An unaccounted-for launch did not report an unresolved launch (exit $($refused.ExitCode)).`n$($refused.Output)"
+        Assert-Coordinator ($refused.Output -match 'no record of what that launch became') `
+            "The refusal does not name the ambiguity it is refusing over.`n$($refused.Output)"
+        $refusedState = Get-CoordinatorState -OutputRoot $intentRoot
+        Assert-Coordinator (@($refusedState.transitions | Where-Object { $_.state -ceq 'slot1Running' }).Count -eq 0) `
+            "The refused run committed a running record for a launch it must not have made ('$($refusedState.state)')."
+        $plantedAttempts = @(Get-ChildItem -LiteralPath (Join-Path $intentRoot 'qualification\stub') `
+                -Filter 'slot*-attempt.json' -File -ErrorAction SilentlyContinue)
+        Assert-Coordinator ($plantedAttempts.Count -eq 0) `
+            "The refused run started $($plantedAttempts.Count) slot child(ren) over an unaccounted-for launch."
+        # The refusal is itself an exit, so it is audited like any other.
+        $refusedAudit = Get-Content -LiteralPath (Join-Path $intentRoot 'coordinator\audit.json') -Raw |
+            ConvertFrom-Json -Depth 32
+        Assert-Coordinator ([string]$refusedAudit.terminalReason -ceq 'unresolvedLaunch') `
+            "The refused run's audit reports terminal reason '$([string]$refusedAudit.terminalReason)'."
+        Assert-Coordinator (@($refusedAudit.launchIntents.unresolvedSteps) -ccontains 'slot1Run') `
+            'The audit census does not name the step whose launch is unaccounted for.'
+        # And it is a refusal, not a brick: the ambiguity removed, the same root
+        # runs the step exactly once.
+        Remove-Item -LiteralPath $plantedIntent -Force
+        $recovered = Invoke-Coordinator -RequestPath $intentPath -Target 'slot1TerminalVerified'
+        Assert-Coordinator ($recovered.ExitCode -eq 0) `
+            "The root did not resume once the ambiguity was removed (exit $($recovered.ExitCode)).`n$($recovered.Output)"
+        $recoveredAttempts = @(Get-ChildItem -LiteralPath (Join-Path $intentRoot 'qualification\stub') `
+                -Filter 'slot*-attempt.json' -File -ErrorAction SilentlyContinue)
+        Assert-Coordinator ($recoveredAttempts.Count -eq 1) `
+            "The resumed run left $($recoveredAttempts.Count) slot attempt records rather than one."
+        $slotIntentFile = Join-Path $intentDirectory "$correlationId-slot1Run-0001.intent.json"
+        Assert-Coordinator (Test-Path -LiteralPath $slotIntentFile -PathType Leaf) `
+            'The supervised slot launch left no intent behind.'
+        $slotIntent = Get-Content -LiteralPath $slotIntentFile -Raw | ConvertFrom-Json -Depth 16
+        Assert-Coordinator ([string]$slotIntent.phase -ceq 'closed') `
+            "The supervised slot's intent is left at phase '$([string]$slotIntent.phase)'."
+        Assert-Coordinator ([int]$slotIntent.childProcessId -gt 0) `
+            'The supervised slot intent records no process id, so a coordinator killed here could not name the child.'
+        # Read as text: ConvertFrom-Json turns the timestamp into a DateTime and
+        # what is under test is the shape the record carries.
+        $slotIntentRaw = [IO.File]::ReadAllText($slotIntentFile)
+        Assert-Coordinator ($slotIntentRaw -cmatch '"childStartedAtUtc"\s*:\s*"\d{4}-\d{2}-\d{2}T[\d:.]+Z"') `
+            'The supervised slot intent records no start time, so a recycled pid could pass for the child.'
+        Assert-Coordinator ([string]$slotIntent.slotName -ceq 'slot1' -and [string]$slotIntent.setId -cmatch '\S') `
+            'The supervised slot intent does not bind the slot and set it was launched for.'
+        # Resuming a reached state must not open a second intent for the step.
+        $before = @(Get-ChildItem -LiteralPath $intentDirectory -Filter '*-slot1Run-*.intent.json' -File).Count
+        $again = Invoke-Coordinator -RequestPath $intentPath -Target 'slot1TerminalVerified'
+        Assert-Coordinator ($again.ExitCode -eq 0) `
+            "Resuming a verified slot terminal failed (exit $($again.ExitCode)).`n$($again.Output)"
+        $after = @(Get-ChildItem -LiteralPath $intentDirectory -Filter '*-slot1Run-*.intent.json' -File).Count
+        Assert-Coordinator ($after -eq $before) `
+            "Resuming a verified slot terminal opened $($after - $before) further launch intent(s)."
+        $finalAttempts = @(Get-ChildItem -LiteralPath (Join-Path $intentRoot 'qualification\stub') `
+                -Filter 'slot*-attempt.json' -File -ErrorAction SilentlyContinue)
+        Assert-Coordinator ($finalAttempts.Count -eq 1) `
+            "Resuming a verified slot terminal left $($finalAttempts.Count) attempt records rather than one."
+    }
+    finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
+
+    # -----------------------------------------------------------------------
+    Write-Host '28/29 the audit is written on every exit, and never leads the state' -ForegroundColor Cyan
+    # Two claims. The audit is published on the unsuccessful exits as well as the
+    # successful one, so it never lags the record it describes; and a failure to
+    # publish it cannot cost the run its work, because the record is what is
+    # authoritative and the next run rebuilds the report from it.
+    $auditRoot = Join-Path $sandbox 'audit-exits'
+    $auditRequest = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'audit-exits' -Mutate {
+        param($r) & $setOutputRoot -Request $r -Root $auditRoot
+    }.GetNewClosure()
+    $auditFile = Join-Path $auditRoot 'coordinator\audit.json'
+    $haltedRun = Invoke-Coordinator -RequestPath $auditRequest -HaltAfter 'corpusPublished'
+    Assert-Coordinator ($haltedRun.ExitCode -eq 9) `
+        "The halted run did not report a deliberate halt (exit $($haltedRun.ExitCode)).`n$($haltedRun.Output)"
+    Assert-Coordinator (Test-Path -LiteralPath $auditFile -PathType Leaf) `
+        'A halted run published no audit, so the audit lags the state it describes.'
+    $haltAudit = Get-Content -LiteralPath $auditFile -Raw | ConvertFrom-Json -Depth 32
+    Assert-Coordinator ([string]$haltAudit.terminalReason -ceq 'deliberateHalt') `
+        "The halted run's audit reports terminal reason '$([string]$haltAudit.terminalReason)'."
+    Assert-Coordinator ([string]$haltAudit.finalState -ceq 'corpusPublished') `
+        "The halted run's audit reports final state '$([string]$haltAudit.finalState)'."
+    Assert-Coordinator ([string]$haltAudit.terminalDetail -match 'corpusPublished') `
+        'The halted audit does not say where the run stopped.'
+    Assert-Coordinator ([string]$haltAudit.signature -cmatch '^[0-9a-f]{64}$' -and
+        [string]$haltAudit.auditSha256 -cmatch '^[0-9a-f]{64}$') `
+        'The audit is not signed and self-hashed.'
+    # The digest binds the audit to the exact record it was derived from, so a
+    # report kept from an earlier run cannot pass for this one's.
+    $statePath = Join-Path $auditRoot 'coordinator\state.json'
+    $stateDigest = (Get-FileHash -LiteralPath $statePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    Assert-Coordinator ([string]$haltAudit.stateSha256 -ceq $stateDigest) `
+        'The audit does not carry the digest of the state record it describes.'
+    Assert-Coordinator ([int]$haltAudit.sequence -eq [int](Get-CoordinatorState -OutputRoot $auditRoot).sequence) `
+        'The audit sequence disagrees with the durable record.'
+
+    $finishedRun = Invoke-Coordinator -RequestPath $auditRequest -Target 'runSetReady'
+    Assert-Coordinator ($finishedRun.ExitCode -eq 0) `
+        "The resumed run did not reach run-set-ready (exit $($finishedRun.ExitCode)).`n$($finishedRun.Output)"
+    $doneAudit = Get-Content -LiteralPath $auditFile -Raw | ConvertFrom-Json -Depth 32
+    Assert-Coordinator ([string]$doneAudit.terminalReason -ceq 'completed' -and
+        [string]$doneAudit.finalState -ceq 'runSetReady') `
+        "The completed run's audit reports '$([string]$doneAudit.terminalReason)' at '$([string]$doneAudit.finalState)'."
+    $doneDigest = (Get-FileHash -LiteralPath $statePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    Assert-Coordinator ([string]$doneAudit.stateSha256 -ceq $doneDigest) `
+        'The completed run left an audit bound to an older state record.'
+
+    # A refusal is an exit too. A child that fails after the root already holds a
+    # real record is the ordinary unsuccessful ending, and it has to be audited
+    # like any other, or the report on disk describes the last run that happened
+    # to succeed rather than the one that just failed.
+    $refuseAuditRoot = Join-Path $sandbox 'audit-refusal'
+    $refuseAuditRequest = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'audit-refusal' -Mutate {
+        param($r) & $setOutputRoot -Request $r -Root $refuseAuditRoot
+    }.GetNewClosure()
+    $refusePrepared = Invoke-Coordinator -RequestPath $refuseAuditRequest -HaltAfter 'corpusPublished'
+    Assert-Coordinator ($refusePrepared.ExitCode -eq 9) `
+        "The refusal fixture did not reach its halt (exit $($refusePrepared.ExitCode)).`n$($refusePrepared.Output)"
+    $refuseAuditFile = Join-Path $refuseAuditRoot 'coordinator\audit.json'
+    $auditBeforeFailure = (Get-FileHash -LiteralPath $refuseAuditFile -Algorithm SHA256).Hash
+    New-FaultyChildAdapter -ToolkitCopy $fixture.ToolkitCopy -Fault 'nonzero'
+    try {
+        $failedWalk = Invoke-Coordinator -RequestPath $refuseAuditRequest -Target 'runSetReady'
+        Assert-Coordinator ($failedWalk.ExitCode -eq 4) `
+            "A failing child did not report a child failure (exit $($failedWalk.ExitCode)).`n$($failedWalk.Output)"
+        $auditAfterFailure = (Get-FileHash -LiteralPath $refuseAuditFile -Algorithm SHA256).Hash
+        Assert-Coordinator ($auditAfterFailure -cne $auditBeforeFailure) `
+            'A failed run left the audit written by the previous successful exit standing.'
+        $walkAudit = Get-Content -LiteralPath $refuseAuditFile -Raw | ConvertFrom-Json -Depth 32
+        Assert-Coordinator ([string]$walkAudit.terminalReason -ceq 'childFailure') `
+            "A failed run published an audit claiming terminal reason '$([string]$walkAudit.terminalReason)'."
+        Assert-Coordinator ([string]$walkAudit.terminalDetail -cmatch '\S') `
+            'The failed run published an audit that does not say why the run ended.'
+        Assert-Coordinator ([string]$walkAudit.finalState -ceq [string](Get-CoordinatorState -OutputRoot $refuseAuditRoot).state) `
+            'The failed run published an audit that disagrees with the durable state.'
+        $walkDigest = (Get-FileHash -LiteralPath (Join-Path $refuseAuditRoot 'coordinator\state.json') `
+                -Algorithm SHA256).Hash.ToLowerInvariant()
+        Assert-Coordinator ([string]$walkAudit.stateSha256 -ceq $walkDigest) `
+            'The failed run published an audit bound to a different record than the one on disk.'
+    }
+    finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
+
+    # The audit write itself is faulted, at every transition of a whole run, by
+    # standing a directory where the file belongs. No product hook is involved:
+    # this is a storage fault the coordinator has to survive, not a test seam.
+    $auditFaultRoot = Join-Path $sandbox 'audit-fault'
+    $auditFaultRequest = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'audit-fault' -Mutate {
+        param($r) & $setOutputRoot -Request $r -Root $auditFaultRoot
+    }.GetNewClosure()
+    $auditFaultFile = Join-Path $auditFaultRoot 'coordinator\audit.json'
+    New-Item -ItemType Directory -Path $auditFaultFile -Force | Out-Null
+    $faulted = Invoke-Coordinator -RequestPath $auditFaultRequest -Target 'runSetReady'
+    Assert-Coordinator ($faulted.ExitCode -eq 0) `
+        ("A run whose every audit write failed did not complete (exit $($faulted.ExitCode)). " +
+            "A report that cannot be written must not cost the run its work.`n$($faulted.Output)")
+    Assert-Coordinator ($faulted.Output -match 'audit not written') `
+        'The run absorbed the audit failures without saying so.'
+    Assert-Coordinator (Test-Path -LiteralPath $auditFaultFile -PathType Container) `
+        'The audit path is no longer the directory that was faulting the writes, so the fault did not hold.'
+    $faultedState = Get-CoordinatorState -OutputRoot $auditFaultRoot
+    Assert-Coordinator ($faultedState.state -ceq 'runSetReady' -and [int]$faultedState.sequence -eq 11) `
+        "The faulted run's durable state is '$($faultedState.state)' at sequence $($faultedState.sequence)."
+    $faultedDeclared = @(Get-ChildItem -LiteralPath (Join-Path $auditFaultRoot 'qualification\runset') `
+            -Filter 'runset-*.json' -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '*.sig' })
+    Assert-Coordinator ($faultedDeclared.Count -eq 1) `
+        "The faulted run declared $($faultedDeclared.Count) run sets rather than one."
+
+    # The fault removed, the very next run repairs the report from the record
+    # alone: no child is launched, nothing is re-declared, and the state does not
+    # move. That is what makes the audit safe to lose.
+    Remove-Item -LiteralPath $auditFaultFile -Recurse -Force
+    $exchangeBefore = @(Get-ChildItem -LiteralPath (Join-Path $auditFaultRoot 'coordinator\exchange') `
+            -Filter '*.result.json' -File | Sort-Object -Property Name |
+        ForEach-Object { $_.Name + ':' + (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }) -join '|'
+    $repair = Invoke-Coordinator -RequestPath $auditFaultRequest -Target 'runSetReady'
+    Assert-Coordinator ($repair.ExitCode -eq 0) `
+        "The repairing run failed (exit $($repair.ExitCode)).`n$($repair.Output)"
+    Assert-Coordinator (Test-Path -LiteralPath $auditFaultFile -PathType Leaf) `
+        'The next run over the root did not rebuild the audit that could not be written.'
+    $repaired = Get-Content -LiteralPath $auditFaultFile -Raw | ConvertFrom-Json -Depth 32
+    $repairedDigest = (Get-FileHash -LiteralPath (Join-Path $auditFaultRoot 'coordinator\state.json') `
+            -Algorithm SHA256).Hash.ToLowerInvariant()
+    Assert-Coordinator ([string]$repaired.stateSha256 -ceq $repairedDigest -and
+        [string]$repaired.finalState -ceq 'runSetReady' -and [int]$repaired.sequence -eq 11) `
+        'The rebuilt audit does not describe the record that was already on disk.'
+    $repairedState = Get-CoordinatorState -OutputRoot $auditFaultRoot
+    Assert-Coordinator ([int]$repairedState.sequence -eq 11) `
+        "Repairing the audit advanced the durable sequence to $($repairedState.sequence)."
+    $exchangeAfter = @(Get-ChildItem -LiteralPath (Join-Path $auditFaultRoot 'coordinator\exchange') `
+            -Filter '*.result.json' -File | Sort-Object -Property Name |
+        ForEach-Object { $_.Name + ':' + (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }) -join '|'
+    Assert-Coordinator ($exchangeAfter -ceq $exchangeBefore) `
+        'Repairing the audit relaunched a child.'
+    $repairedIntents = @(Get-ChildItem -LiteralPath (Join-Path $auditFaultRoot 'coordinator\intents') `
+            -Filter '*.intent.json' -File -ErrorAction SilentlyContinue)
+    $repairedOpen = @($repairedIntents | Where-Object {
+            [string](Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json -Depth 16).phase -cne 'closed'
+        })
+    Assert-Coordinator ($repairedOpen.Count -eq 0) `
+        "Repairing the audit left $($repairedOpen.Count) launch intent(s) unaccounted for."
+
+    # -----------------------------------------------------------------------
+    Write-Host '29/29 no orphans, no external writes' -ForegroundColor Cyan
     Start-Sleep -Seconds 2
     $orphans = Get-DescendantPwshCount -SandboxToken $sandboxToken
     Assert-Coordinator ($orphans -eq 0) "The suite left $orphans PowerShell process(es) running."

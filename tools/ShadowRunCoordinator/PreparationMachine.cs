@@ -29,6 +29,7 @@ internal sealed class PreparationMachine(
     StageArtifactIndex index,
     ChildToolInvoker invoker,
     SlotSupervisor supervisor,
+    LaunchLedger ledger,
     TextWriter log)
 {
     private const string ChildScriptName = "Invoke-ShadowCoordinatorChild.ps1";
@@ -39,6 +40,7 @@ internal sealed class PreparationMachine(
     private readonly StageArtifactIndex _index = index;
     private readonly ChildToolInvoker _invoker = invoker;
     private readonly SlotSupervisor _supervisor = supervisor;
+    private readonly LaunchLedger _ledger = ledger;
     private readonly TextWriter _log = log;
 
     private string _sealedSnapshotName = string.Empty;
@@ -101,34 +103,87 @@ internal sealed class PreparationMachine(
     /// </remarks>
     internal void Run(PreparationState target, PreparationState? haltAfter)
     {
+        // The audit is written on entry, after every commit, and on every way out
+        // of this method - including the ones that are faults. An audit that is
+        // only written when a run ends well is an audit that is missing exactly
+        // when it is wanted, and a resumed run would read a record describing a
+        // state the coordinator has already left.
+        WriteAuditSafely(AuditReasonRunning, "the run is in progress");
         var targetRank = PreparationStateNames.RankOf(target);
         var haltRank = haltAfter is { } halt ? PreparationStateNames.RankOf(halt) : -1;
-        foreach (var rank in PreparationStateNames.Ranks)
+        try
         {
-            if (rank > targetRank)
+            // Asked once, before anything is attempted, and asked of the whole
+            // root rather than of the steps this run happens to reach. A resumed
+            // run whose remaining ranks are already committed launches nothing,
+            // so a per-step gate would never see an open intent left by an
+            // earlier run - and this run would complete and publish an audit
+            // whose own census says a launch was never accounted for.
+            _ledger.RequireNothingUnaccounted();
+            foreach (var rank in PreparationStateNames.Ranks)
             {
-                break;
-            }
-            var committed = Advance(rank);
-            if (rank == haltRank)
-            {
-                _log.WriteLine($"halt-after {PreparationStateNames.ToName(committed)} (correlationId={_request.CorrelationId}, sequence={_state.Sequence.ToString(CultureInfo.InvariantCulture)})");
-                throw new DeliberateHaltException(committed);
-            }
-            if (PreparationStateNames.IsUnsuccessfulTerminal(committed))
-            {
-                _log.WriteLine(
-                    $"stop after {PreparationStateNames.ToName(committed)} (correlationId={_request.CorrelationId}): " +
-                    "a set never advances past a slot that did not complete.");
-                break;
+                if (rank > targetRank)
+                {
+                    break;
+                }
+                var committed = Advance(rank);
+                if (rank == haltRank)
+                {
+                    _log.WriteLine($"halt-after {PreparationStateNames.ToName(committed)} (correlationId={_request.CorrelationId}, sequence={_state.Sequence.ToString(CultureInfo.InvariantCulture)})");
+                    throw new DeliberateHaltException(committed);
+                }
+                if (PreparationStateNames.IsUnsuccessfulTerminal(committed))
+                {
+                    _log.WriteLine(
+                        $"stop after {PreparationStateNames.ToName(committed)} (correlationId={_request.CorrelationId}): " +
+                        "a set never advances past a slot that did not complete.");
+                    WriteAuditForFault(
+                        AuditReasonStoppedNotComplete,
+                        $"the set stopped at '{PreparationStateNames.ToName(committed)}' because a slot did not complete");
+                    return;
+                }
             }
         }
-        WriteAudit();
+        catch (DeliberateHaltException halted)
+        {
+            WriteAuditForFault(AuditReasonDeliberateHalt, $"the run was halted after '{PreparationStateNames.ToName(halted.State)}'");
+            throw;
+        }
+        catch (UnresolvedLaunchException error)
+        {
+            WriteAuditForFault(AuditReasonUnresolvedLaunch, error.Message);
+            throw;
+        }
+        catch (ContractException error)
+        {
+            WriteAuditForFault(AuditReasonContractRefusal, error.Message);
+            throw;
+        }
+        catch (ChildFailureException error)
+        {
+            WriteAuditForFault(AuditReasonChildFailure, error.Message);
+            throw;
+        }
+        catch (Exception error)
+        {
+            // Deliberately broad, and deliberately rethrowing. The audit is the
+            // only durable account of what this run touched, so it is written even
+            // for a fault this class did not anticipate - and then the fault is
+            // allowed to travel, because swallowing it here would turn an
+            // unexplained crash into a silent success.
+            WriteAuditForFault(AuditReasonUnexpectedFault, error.Message);
+            throw;
+        }
+        WriteAuditSafely(AuditReasonCompleted, "the run reached its target");
     }
 
     /// <summary>Performs, or recognises as already performed, the transition at one rank.</summary>
     private PreparationState Advance(int rank)
     {
+        // Every launch this rank makes is bound to the transition that wanted it
+        // before anything can start, so an intent found by a later run names the
+        // step it belongs to rather than merely the process that ran it.
+        _ledger.Binding = BindingForRank(rank);
         if (PreparationStateNames.RankOf(_state.State) >= rank)
         {
             var recorded = RecordedStateAtRank(rank);
@@ -143,8 +198,7 @@ internal sealed class PreparationMachine(
         {
             var (outcome, terminalEvidence, terminalDetail) = VerifySlotTerminal(terminalStage);
             _log.WriteLine($"enter {PreparationStateNames.ToName(outcome)} (correlationId={_request.CorrelationId})");
-            _state.Commit(_request, _stateKey, outcome, terminalEvidence, terminalDetail);
-            _log.WriteLine($"commit {PreparationStateNames.ToName(outcome)} sequence={_state.Sequence.ToString(CultureInfo.InvariantCulture)} evidence={_state.EvidenceDigestOf(outcome)} detail={terminalDetail}");
+            CommitAndAudit(outcome, terminalEvidence, terminalDetail);
             return outcome;
         }
 
@@ -196,7 +250,58 @@ internal sealed class PreparationMachine(
         };
         _state.Commit(_request, _stateKey, next, evidence, detail);
         _log.WriteLine($"commit {PreparationStateNames.ToName(next)} sequence={_state.Sequence.ToString(CultureInfo.InvariantCulture)} evidence={_state.EvidenceDigestOf(next)} detail={detail}");
+        WriteAuditSafely(AuditReasonTransitionCommitted, $"committed '{PreparationStateNames.ToName(next)}'");
         return next;
+    }
+
+    /// <summary>Commits a transition and refreshes the audit behind it, in that order.</summary>
+    /// <remarks>
+    /// The order is the whole point. State is authoritative and the audit is a
+    /// report of it, so the audit is never allowed to describe a transition that
+    /// is not yet durable. The reverse - an audit that lags a commit - is the
+    /// recoverable direction: the next run over the same root rewrites it from
+    /// the state record without relaunching anything.
+    /// </remarks>
+    private void CommitAndAudit(PreparationState next, MapNode evidence, string detail)
+    {
+        _state.Commit(_request, _stateKey, next, evidence, detail);
+        _log.WriteLine($"commit {PreparationStateNames.ToName(next)} sequence={_state.Sequence.ToString(CultureInfo.InvariantCulture)} evidence={_state.EvidenceDigestOf(next)} detail={detail}");
+        WriteAuditSafely(AuditReasonTransitionCommitted, $"committed '{PreparationStateNames.ToName(next)}'");
+    }
+
+    /// <summary>Names the transition, set and slot that a launch made at this rank belongs to.</summary>
+    /// <remarks>
+    /// The name is derived defensively because a terminal rank holds three
+    /// sibling states and refuses to name one: this method runs for every rank,
+    /// including those, and a binding is a label rather than a decision.
+    /// </remarks>
+    private LaunchBinding BindingForRank(int rank)
+    {
+        // Read from the durable record rather than from a field, so that a
+        // resumed run binds its launches to the same set the first run did.
+        var setId = _state.EvidenceFor(PreparationState.RunSetVerified)?.GetText("setId") ?? string.Empty;
+        foreach (var stage in Stages)
+        {
+            if (rank == PreparationStateNames.RankOf(stage.Running))
+            {
+                var terminal = _slotPlans.TryGetValue(stage.Ordinal, out var plan) ? plan.SlotTerminalPath : string.Empty;
+                return new LaunchBinding(PreparationStateNames.ToName(stage.Running), setId, stage.Name, terminal);
+            }
+            if (rank == PreparationStateNames.RankOf(stage.TerminalVerified))
+            {
+                var terminal = _slotPlans.TryGetValue(stage.Ordinal, out var plan) ? plan.SlotTerminalPath : string.Empty;
+                return new LaunchBinding(PreparationStateNames.ToName(stage.TerminalVerified), setId, stage.Name, terminal);
+            }
+        }
+        if (rank == PreparationStateNames.RankOf(PreparationState.ReconciliationRunning))
+        {
+            return new LaunchBinding(
+                PreparationStateNames.ToName(PreparationState.ReconciliationRunning),
+                setId,
+                "reconciliation",
+                _request.ReconciliationSummaryPath);
+        }
+        return new LaunchBinding(PreparationStateNames.ToName(PreparationStateNames.StateAtRank(rank)), setId, string.Empty, string.Empty);
     }
 
     private static SlotStage? SlotStageAtTerminalRank(int rank)
@@ -1219,6 +1324,11 @@ internal sealed class PreparationMachine(
     {
         var authorized = _state.EvidenceFor(stage.Authorized)
             ?? throw new ContractException("Nothing authorized a launch, so nothing may be run.");
+        // Asked FIRST, before the plan probe and before anything is written for
+        // the child. A step whose last launch is unaccounted for is refused at
+        // the gate, so the refusal names the ambiguity rather than whatever the
+        // probe happens to trip over on the way there.
+        _ledger.RequireLaunchable(stage.RunStep);
         var authorizedDigest = authorized.GetText("planDigest") ?? throw new ContractException($"The {PreparationStateNames.ToName(stage.Authorized)} record carries no plan digest.");
 
         // Re-derived here rather than re-read from the authorization's committed
@@ -1261,6 +1371,18 @@ internal sealed class PreparationMachine(
         var childRequest = SlotChildRequest(plan.Authorization)
             .Set("expectedPlanDigest", plan.PlanDigest)
             .Set("expectedSetId", plan.SetId);
+        // Re-bound now that the plan is known, so the intent this launch commits
+        // names the set, the slot and the terminal artifact it is supposed to
+        // produce rather than only the transition it happened at.
+        _ledger.Binding = new LaunchBinding(
+            PreparationStateNames.ToName(stage.Running),
+            plan.SetId,
+            plan.SlotName,
+            plan.SlotTerminalPath);
+        // Asked again immediately before the hand-over: the probe above is a
+        // child too, and a coordinator killed inside it must not find this step
+        // launchable on the next run merely because the gate was passed earlier.
+        _ledger.RequireLaunchable(stage.RunStep);
         var launch = _supervisor.Start(stage.RunStep, ChildScript(), childRequest);
 
         // Committed BEFORE the wait. This is the whole reason the supervisor is
@@ -1276,6 +1398,7 @@ internal sealed class PreparationMachine(
             .Set("supervisionStartedAtUtc", DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture));
         _state.Commit(_request, _stateKey, stage.Running, running, $"childProcessId={launch.ProcessId.ToString(CultureInfo.InvariantCulture)}");
         _log.WriteLine($"commit {PreparationStateNames.ToName(stage.Running)} sequence={_state.Sequence.ToString(CultureInfo.InvariantCulture)} childProcessId={launch.ProcessId.ToString(CultureInfo.InvariantCulture)}");
+        WriteAuditSafely(AuditReasonTransitionCommitted, $"committed '{PreparationStateNames.ToName(stage.Running)}'");
 
         var observation = _supervisor.Await(launch, plan.Deadlines, plan.SlotStateDir);
         _log.WriteLine($"observed {stage.Name} child disposition={observation.Disposition} exitCode={observation.ExitCode.ToString(CultureInfo.InvariantCulture)}");
@@ -1930,6 +2053,9 @@ internal sealed class PreparationMachine(
     {
         var due = _state.EvidenceFor(PreparationState.ReconciliationLaunching)
             ?? throw new ContractException("No reconciliation was recorded due, so there is nothing to run.");
+        // See RunSlot: asked before the probe, so an unaccounted-for previous
+        // launch is refused at the gate rather than downstream of a child.
+        _ledger.RequireLaunchable(ReconcileRunStep);
         var authorizedDigest = _state.EvidenceFor(PreparationState.ReconciliationAuthorized)?.GetText("planDigest")
             ?? throw new ContractException("The reconciliationAuthorized record carries no plan digest.");
         var inputSha = due.GetText("reconciliationRequestSha256")
@@ -1965,6 +2091,15 @@ internal sealed class PreparationMachine(
             .Set("expectedSetId", plan.SetId)
             .Set("reconciliationRequestPath", _request.ReconciliationRequestPath)
             .Set("reconciliationRequestSha256", inputSha);
+        // The comparison gets the same intent treatment as a slot, and for the
+        // same reason: its authorization is single-use, so a relaunch this
+        // coordinator cannot prove is safe must not happen.
+        _ledger.Binding = new LaunchBinding(
+            PreparationStateNames.ToName(PreparationState.ReconciliationRunning),
+            plan.SetId,
+            "reconciliation",
+            _request.ReconciliationSummaryPath);
+        _ledger.RequireLaunchable(ReconcileRunStep);
         var launch = _supervisor.Start(ReconcileRunStep, ChildScript(), childRequest);
 
         var running = new MapNode()
@@ -1975,6 +2110,7 @@ internal sealed class PreparationMachine(
             .Set("supervisionStartedAtUtc", DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture));
         _state.Commit(_request, _stateKey, PreparationState.ReconciliationRunning, running, $"childProcessId={launch.ProcessId.ToString(CultureInfo.InvariantCulture)}");
         _log.WriteLine($"commit {PreparationStateNames.ToName(PreparationState.ReconciliationRunning)} sequence={_state.Sequence.ToString(CultureInfo.InvariantCulture)} childProcessId={launch.ProcessId.ToString(CultureInfo.InvariantCulture)}");
+        WriteAuditSafely(AuditReasonTransitionCommitted, $"committed '{PreparationStateNames.ToName(PreparationState.ReconciliationRunning)}'");
 
         var observation = _supervisor.Await(launch, plan.Deadlines, plan.OutputDirectory);
         _log.WriteLine($"observed reconciliation child disposition={observation.Disposition} exitCode={observation.ExitCode.ToString(CultureInfo.InvariantCulture)}");
@@ -2376,6 +2512,80 @@ internal sealed class PreparationMachine(
     private const string ReconcileRunStep = "reconcileRun";
     private const string ReconcileVerifyStep = "reconcileVerify";
 
+    /// <summary>The reasons an audit is written, which are the ways a run can be at rest.</summary>
+    /// <remarks>
+    /// A closed vocabulary rather than free text, because the point of the field
+    /// is that a reader can tell an audit describing a finished run from one
+    /// describing a run that stopped in the middle - and a message can say
+    /// anything, including nothing.
+    /// </remarks>
+    private const string AuditReasonRunning = "running";
+    private const string AuditReasonTransitionCommitted = "transitionCommitted";
+    private const string AuditReasonCompleted = "completed";
+    private const string AuditReasonStoppedNotComplete = "stoppedAtUnsuccessfulTerminal";
+    private const string AuditReasonDeliberateHalt = "deliberateHalt";
+    private const string AuditReasonContractRefusal = "contractRefusal";
+    private const string AuditReasonChildFailure = "childFailure";
+    private const string AuditReasonUnresolvedLaunch = "unresolvedLaunch";
+    private const string AuditReasonUnexpectedFault = "unexpectedFault";
+
+    /// <summary>Writes the audit, and refuses to let a failure to write it end the run.</summary>
+    /// <remarks>
+    /// The asymmetry here is deliberate and is the whole reason this wrapper
+    /// exists. The signed state record is authoritative; the audit is a report
+    /// derived from it. If the report cannot be written - a full disk, a
+    /// directory sitting where the file should be, a hostile permission - the run
+    /// has still done what the state says it did, and turning that into a fault
+    /// would destroy work over a document that the very next run rebuilds from
+    /// the record without relaunching anything.
+    ///
+    /// Only the storage faults are absorbed. An exception from ASSEMBLING the
+    /// audit would mean the state record itself does not say what this class
+    /// thinks it says, and that is not a fault anybody should be able to write
+    /// off as a bad disk.
+    /// </remarks>
+    private void WriteAuditSafely(string terminalReason, string terminalDetail)
+    {
+        try
+        {
+            WriteAudit(terminalReason, terminalDetail);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            _log.WriteLine(
+                $"audit not written ({terminalReason}): {error.Message}. " +
+                "The state record is authoritative and the next run over this root rewrites the audit from it.");
+        }
+    }
+
+    /// <summary>
+    /// Writes the audit for a run that is already ending badly, absorbing
+    /// everything.
+    /// </summary>
+    /// <remarks>
+    /// The strict version above is right where the audit is the only thing that
+    /// could fail: an assembly fault there means the state record does not say
+    /// what this class thinks it says, and that must not be written off as a bad
+    /// disk. It is wrong inside a catch block. An exception raised while
+    /// REPORTING a fault would replace the fault being reported, so a child
+    /// failure or an unresolved launch - each with an exit code an operator acts
+    /// on - would surface as an unrelated crash. The original fault is the more
+    /// important of the two, so the reporting failure is logged and dropped.
+    /// </remarks>
+    private void WriteAuditForFault(string terminalReason, string terminalDetail)
+    {
+        try
+        {
+            WriteAudit(terminalReason, terminalDetail);
+        }
+        catch (Exception error)
+        {
+            _log.WriteLine(
+                $"audit not written ({terminalReason}): {error.Message}. " +
+                "The fault that ended this run is reported instead, and the next run over this root rewrites the audit from the record.");
+        }
+    }
+
     /// <summary>
     /// Writes the audit from the durable state alone.
     /// </summary>
@@ -2385,8 +2595,12 @@ internal sealed class PreparationMachine(
     /// exactly the audit an uninterrupted one would. An audit assembled from
     /// in-memory work would silently thin out on every restart, which is the
     /// opposite of what an audit is for.
+    ///
+    /// Called after every commit and on every way out of the walk, so the audit
+    /// cannot lag the state by more than the moment between the two writes - and
+    /// it lags in the recoverable direction, never the other way.
     /// </remarks>
-    private void WriteAudit()
+    private void WriteAudit(string terminalReason, string terminalDetail)
     {
         var stages = new MapNode();
         foreach (var transition in _state.Transitions)
@@ -2506,7 +2720,24 @@ internal sealed class PreparationMachine(
                 .Set("detail", transition.Detail));
         }
         audit.Set("transitions", transitions);
+        // Why this run is at rest, and what the record it reports on digests to.
+        // Together they are what lets a reader tell an audit that describes a
+        // finished run from one that describes a run that stopped in the middle,
+        // and tell an audit that matches the state beside it from one left over
+        // from an earlier walk.
+        audit.Set("terminalReason", terminalReason);
+        audit.Set("terminalDetail", terminalDetail);
+        audit.Set("stateSha256", File.Exists(_request.StatePath) ? CanonicalJson.Sha256HexOfFile(_request.StatePath) : "none");
+        // The launch census comes from the intent ledger rather than from a
+        // counter in this process, for the reason the child-result census does:
+        // an in-memory count cannot see a launch an earlier process made.
+        audit.Set("launchIntents", _ledger.DescribeCensus());
         audit.Set("auditSha256", CanonicalJson.Sha256HexOfText(CanonicalJson.Canonical(audit)));
+        // Signed with the same key the state record is signed with, so an audit
+        // that was edited after the fact cannot pass as one this coordinator
+        // wrote. The self-hash above catches a careless edit; only the signature
+        // catches a careful one, because a careful editor recomputes the hash.
+        audit.Set("signature", CanonicalJson.HmacHex(_stateKey, CanonicalJson.Canonical(audit)));
         CanonicalJson.WriteFileAtomic(_request.AuditPath, CanonicalJson.Readable(audit));
     }
 }

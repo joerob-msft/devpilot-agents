@@ -25,6 +25,8 @@ internal static class Program
     private const int ExitChildFailure = 4;
     /// <summary>A supervised slot reached a terminal that was not 'complete'. Not a coordinator fault.</summary>
     private const int ExitSlotNotComplete = 5;
+    /// <summary>A previous run's launch was never accounted for, so this one refuses to guess.</summary>
+    private const int ExitUnresolvedLaunch = 6;
     private const int ExitHalted = 9;
 
     internal static int Main(string[] args)
@@ -100,6 +102,15 @@ internal static class Program
             Console.Error.WriteLine(error.Message);
             return ExitLeaseConflict;
         }
+        catch (UnresolvedLaunchException error)
+        {
+            // Deliberately its own code. An unaccounted-for launch is neither a
+            // bad request nor a child that failed: it is this coordinator
+            // declining to relaunch something it cannot prove is not already
+            // running, and an operator has to be able to tell those apart.
+            Console.Error.WriteLine(error.Message);
+            return ExitUnresolvedLaunch;
+        }
         catch (ChildFailureException error)
         {
             Console.Error.WriteLine(error.Message);
@@ -120,13 +131,17 @@ internal static class Program
         var key = CoordinatorState.LoadOrMintKey(request, out var keyPreexisted);
         var state = CoordinatorState.LoadOrFresh(request, key, keyPreexisted);
         var index = StageArtifactIndex.FromSchema(request.ToolkitRoot);
-        var invoker = new ChildToolInvoker(request);
-        var supervisor = new SlotSupervisor(request);
+        // One ledger for every launch this run makes, short or supervised, so that
+        // the two things that start processes cannot disagree about what a launch
+        // that was never accounted for means.
+        var ledger = new LaunchLedger(request, key, keyPreexisted);
+        var invoker = new ChildToolInvoker(request, ledger);
+        var supervisor = new SlotSupervisor(request, ledger);
 
         var log = Console.Out;
         log.WriteLine($"shadow-run-coordinator correlationId={request.CorrelationId} state={PreparationStateNames.ToName(state.State)} target={PreparationStateNames.ToName(target)}");
 
-        var machine = new PreparationMachine(request, state, key, index, invoker, supervisor, log);
+        var machine = new PreparationMachine(request, state, key, index, invoker, supervisor, ledger, log);
         try
         {
             machine.Run(target, haltAfter);
@@ -197,6 +212,6 @@ internal static class Program
 
         Exit codes: 0 reached, 1 usage, 2 contract refusal, 3 lease conflict,
                     4 child failure, 5 supervised slot ended not-complete,
-                    9 deliberate halt.
+                    6 a previous run's launch is unaccounted for, 9 deliberate halt.
         """;
 }

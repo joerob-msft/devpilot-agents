@@ -33,7 +33,7 @@ internal sealed record ChildOutcome(int ExitCode, string ResultPath, JsonElement
 /// child exited zero, because a zero exit from a partially written step is
 /// exactly the fault a file contract exists to catch.
 /// </remarks>
-internal sealed class ChildToolInvoker(CoordinatorRequest request)
+internal sealed class ChildToolInvoker(CoordinatorRequest request, LaunchLedger ledger)
 {
     internal const string ResultContractVersion = "devpilot.shadow-run-coordinator.child-result.v1";
 
@@ -41,6 +41,7 @@ internal sealed class ChildToolInvoker(CoordinatorRequest request)
     internal const int DrainMilliseconds = 30_000;
 
     private readonly CoordinatorRequest _request = request;
+    private readonly LaunchLedger _ledger = ledger;
     private bool _childInFlight;
 
     /// <summary>Children this process actually started, as opposed to results it adopted.</summary>
@@ -77,7 +78,6 @@ internal sealed class ChildToolInvoker(CoordinatorRequest request)
         // than reimplement canonicalisation in a second language.
         var childRequestSha256 = CanonicalJson.Sha256HexOfText(CanonicalJson.Canonical(childRequest));
         childRequest.Set("childRequestSha256", childRequestSha256);
-        CanonicalJson.WriteFileAtomic(requestPath, CanonicalJson.Readable(childRequest));
 
         // ---------------------------------------------------------------------
         // Adoption. This is the fix for the one window a control plane cannot
@@ -98,12 +98,30 @@ internal sealed class ChildToolInvoker(CoordinatorRequest request)
             if (TryAdopt(step, resultPath, childRequestSha256, expectedResultFields, out var adopted))
             {
                 AdoptedCount++;
+                // The adopted result IS the account of the launch that produced
+                // it, so the intent that launch opened stops being open. Without
+                // this, the repair path that adoption exists to provide would
+                // itself leave the root refusing every later run.
+                _ledger.Close(step, "adopted", "a published result for this exact request was adopted");
                 return adopted;
             }
+        }
+
+        // Asked here, after adoption and before ANY write. Adoption comes first
+        // because it is the repair path - a published result accounts for the
+        // launch that produced it - but everything below this line either
+        // destroys evidence (the unadoptable result) or writes into an output
+        // root that an unaccounted-for child may still own, and a run that is
+        // about to refuse must do neither.
+        _ledger.RequireLaunchable(step);
+
+        if (File.Exists(resultPath))
+        {
             // A result that cannot be adopted would let a child that never ran
             // look like one that succeeded.
             File.Delete(resultPath);
         }
+        CanonicalJson.WriteFileAtomic(requestPath, CanonicalJson.Readable(childRequest));
 
         // Intent is journalled BEFORE the process starts, so a coordinator killed
         // during a child leaves behind the evidence that a child was in flight.
@@ -132,19 +150,41 @@ internal sealed class ChildToolInvoker(CoordinatorRequest request)
         start.ArgumentList.Add("-RequestPath");
         start.ArgumentList.Add(requestPath);
 
+        // The signed intent goes down before the process exists, and it refuses
+        // outright when a previous intent for this step was never accounted for.
+        // The journal above says what is running; this says what was ever meant
+        // to run, which is the only thing a coordinator killed inside
+        // Process.Start leaves behind.
+        var intent = _ledger.Open(step, childRequestSha256, start, requestPath, resultPath);
+
         _childInFlight = true;
         LaunchCount++;
         var standardOut = new StringBuilder();
         var standardError = new StringBuilder();
         Process? process = null;
+        var closure = "faulted";
+        var closureReason = "the step did not reach an outcome this coordinator recorded";
         try
         {
-            process = Process.Start(start) ?? throw new ChildFailureException($"The '{step}' child did not start.");
+            try
+            {
+                process = Process.Start(start) ?? throw new ChildFailureException($"The '{step}' child did not start.");
+            }
+            catch (Exception error)
+            {
+                // A start that FAILED is the one case where the absence of a child
+                // is provable rather than merely likely, so it is recorded as such:
+                // the next run may launch this step again without wondering what
+                // the last one left behind.
+                _ledger.RecordNotStarted(intent, error.Message);
+                throw;
+            }
             // The child's exact identity goes into the journal the moment it
             // exists. A coordinator killed from outside cannot clean up after
             // itself, so this record is the only thing that can tell a later run
             // that a writer of this output root is still alive. PID alone would
             // not do: process ids are recycled.
+            _ledger.RecordStart(intent, process);
             ChildJournal.Write(journalPath, _request.CorrelationId, step, childRequestSha256, attempt, process);
             process.OutputDataReceived += (_, args) => { if (args.Data is not null) { lock (standardOut) { standardOut.AppendLine(args.Data); } } };
             process.ErrorDataReceived += (_, args) => { if (args.Data is not null) { lock (standardError) { standardError.AppendLine(args.Data); } } };
@@ -163,6 +203,8 @@ internal sealed class ChildToolInvoker(CoordinatorRequest request)
                 // code rather than into the child failure it is.
                 process.WaitForExit();
                 WriteLogs(outLog, errorLog, standardOut, standardError);
+                closure = "timeoutKilled";
+                closureReason = $"the child exceeded its {_request.ChildTimeoutSeconds.ToString(CultureInfo.InvariantCulture)} second budget and its tree was killed";
                 throw new ChildFailureException(
                     $"The '{step}' child exceeded its {_request.ChildTimeoutSeconds.ToString(CultureInfo.InvariantCulture)} second budget and was killed with its process tree.");
             }
@@ -173,13 +215,21 @@ internal sealed class ChildToolInvoker(CoordinatorRequest request)
 
             if (process.ExitCode != 0)
             {
+                closure = "exitedNonZero";
+                closureReason = $"the child exited {process.ExitCode.ToString(CultureInfo.InvariantCulture)}";
                 throw new ChildFailureException(
                     $"The '{step}' child exited {process.ExitCode.ToString(CultureInfo.InvariantCulture)}; see '{errorLog}'.");
             }
+            closure = "exited";
+            closureReason = "the child exited zero";
         }
         finally
         {
             _childInFlight = false;
+            // Whether the child is provably gone, which is not the same question
+            // as whether the kill call returned. KillTree is best effort by
+            // construction, so this is re-asked after the drain.
+            var exited = true;
             if (process is not null)
             {
                 // Belt and braces against an orphan: if anything above threw
@@ -188,12 +238,27 @@ internal sealed class ChildToolInvoker(CoordinatorRequest request)
                 {
                     ChildJournal.KillTree(process, DrainMilliseconds);
                 }
+                exited = process.HasExited;
                 process.Dispose();
             }
             // The child is gone, so the journal must stop claiming a live writer.
             // Written last, and unconditionally: a stale liveness claim would
             // refuse every later run against this root.
             ChildJournal.TryClearChild(journalPath, _request.CorrelationId, step, childRequestSha256, attempt);
+            // And the intent stops being open, whichever way the step ended. An
+            // intent left open is read as an unknown launch, which refuses every
+            // later run - so this must happen on the failure paths too. A child
+            // this run could not prove had exited is recorded as abandoned rather
+            // than closed, because 'closed' says the step may be attempted again
+            // and that would be a second writer of one output root.
+            if (exited)
+            {
+                _ledger.Close(step, closure, closureReason);
+            }
+            else
+            {
+                _ledger.Abandon(step, $"{closureReason}, and its tree could not be confirmed stopped");
+            }
         }
 
         var label = $"'{step}' child result";
