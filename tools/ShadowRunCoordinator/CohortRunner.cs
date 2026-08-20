@@ -95,6 +95,17 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
         // resumer, and cannot race to create the key.
         using var lease = CohortLease.Acquire(manifest);
 
+        if (rebuildOnly && (!File.Exists(manifest.JournalPath) || !File.Exists(manifest.JournalKeyPath)))
+        {
+            // A rebuild republishes a record; it does not invent one. Without the
+            // journal and its key there is nothing to republish, and going ahead
+            // would write an index signed with a freshly minted key that nobody
+            // else holds - an index no later run and no reader could verify.
+            throw new ContractException(
+                $"There is no cohort journal at '{manifest.JournalPath}' with a key at '{manifest.JournalKeyPath}' to rebuild an index from. " +
+                "A rebuild reports what a run recorded; it does not stand in for one.");
+        }
+
         var key = CohortJournal.LoadOrMintKey(manifest, out var keyPreexisted);
         var journal = CohortJournal.LoadOrFresh(manifest, key, keyPreexisted);
         var runner = new CohortRunner(manifest, operatorAlias, log);
@@ -116,7 +127,13 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
             // fail-fast stop into a clean cohort every time it was re-published,
             // which is the opposite of what a rebuild is for.
             var (reason, detail) = runner.DeriveOutcome(journal);
-            runner.PublishIndex(journal, key, reason, detail);
+            runner.PublishIndexCore(
+                journal,
+                key,
+                reason,
+                detail,
+                journal.HasTerminal ? journal.TerminalDetailSha256 : CanonicalJson.Sha256HexOfText(detail),
+                recordTerminal: false);
             log.WriteLine($"index rebuilt: {manifest.IndexPath} terminalReason={reason}");
             return CoordinatorExitCodes.Ok;
         }
@@ -136,6 +153,16 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
     /// </remarks>
     internal (string Reason, string Detail) DeriveOutcome(CohortJournal journal)
     {
+        // The word the run published, when it published one. A cohort with
+        // entries still pending may have stopped on a ceiling, on an unresolvable
+        // launch, on a refusal, or because the runner was killed where it stood,
+        // and the records alone cannot tell those apart. The journal carries what
+        // was published so a rebuild reports it rather than picking one.
+        if (journal.HasTerminal)
+        {
+            return (journal.TerminalReason, journal.TerminalDetail);
+        }
+
         var anyUnsuccessful = false;
         var anyPending = false;
         var stopped = false;
@@ -176,7 +203,10 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
         }
         if (anyPending)
         {
-            return (CohortIndex.ReasonBudgetExhausted, "the cohort did not reach every declared entry; the remaining entries are still pending");
+            // Nothing here says WHY the walk stopped short, and this line does not
+            // pretend to: a journal that never recorded a published word is a
+            // journal from a runner that was killed before it published one.
+            return (CohortIndex.ReasonRunning, "the cohort did not reach every declared entry and recorded no word about why");
         }
         if (anyUnsuccessful)
         {
@@ -421,10 +451,14 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
             if (!process.WaitForExit(_manifest.Execution.EntryTimeoutSeconds * 1000))
             {
                 ChildJournal.KillTree(process, DrainMilliseconds);
-                // The same drain the ordinary path takes. Reading the builders
-                // while the asynchronous readers can still append to them is a
-                // data race on a type that is not thread safe.
-                process.WaitForExit();
+                // Bounded, deliberately. A kill that could not be delivered leaves
+                // a child this run cannot stop, and an unbounded wait here would
+                // hand the whole sequential cohort to it forever. What follows in
+                // the finally block records that case as abandoned, which is the
+                // honest account and the one that refuses to resume the entry.
+                // The log builders are read under their own lock, so a reader that
+                // is still appending is not a race.
+                process.WaitForExit(DrainMilliseconds);
                 outcome = CohortEntryOutcomes.TimedOut;
                 detail = $"the entry exceeded its {_manifest.Execution.EntryTimeoutSeconds.ToString(CultureInfo.InvariantCulture)} second budget and its tree was killed";
             }
@@ -472,13 +506,17 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
         {
             summary = CohortSummaryReader.Read(entry, intended, elapsed, request.CorrelationId);
         }
-        catch (CohortBlockedException)
+        catch (Exception error) when (error is CohortBlockedException or IOException or UnauthorizedAccessException)
         {
             // The refusal stands, but the entry is closed first. An entry left
             // recorded as running once its child is gone is an entry a later run
             // would read as resumable and start a second time - which is the one
             // thing a preview-only cohort must never do, and refusing to read its
-            // evidence is no reason to do it.
+            // evidence is no reason to do it. Every way of failing to acquire that
+            // evidence gets the same treatment, including the ones that are about
+            // the file system rather than the contract: the child is equally gone
+            // in all of them.
+            var blocked = error as CohortBlockedException;
             journal.Commit(
                 key,
                 intended with
@@ -487,11 +525,22 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
                     EndedAtUtc = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture),
                     ExitCode = exitCode,
                     Outcome = CohortEntryOutcomes.EvidenceRefused,
-                    ElapsedSeconds = elapsed
+                    ElapsedSeconds = elapsed,
+                    // Carried out of the refusal rather than defaulted. An entry
+                    // closed BECAUSE its audit reported a write must not be summed
+                    // into the index as having written nothing.
+                    ProviderWriteCount = blocked?.ObservedProviderWriteCount ?? 0,
+                    WriteToolInvocationCount = blocked?.ObservedWriteToolInvocationCount ?? 0
                 },
                 "ended",
                 "the entry's published evidence could not be read as this build's, and the entry is closed rather than left open");
-            throw;
+            if (blocked is not null)
+            {
+                throw;
+            }
+            throw new CohortBlockedException(
+                $"Entry '{entry.EntryId}' published evidence this run could not acquire: {error.Message} " +
+                "A cohort index is only worth what the artifacts it indexes are worth, so the whole cohort stops here.");
         }
         var ending = intended with
         {
@@ -504,6 +553,7 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
             VerifierAssignmentCount = summary.VerifierAssignmentCount,
             SlotLaunchCount = summary.SlotLaunchCount,
             ProviderWriteCount = summary.ProviderWriteCount,
+            WriteToolInvocationCount = summary.WriteToolInvocationCount,
             AuditSha256 = summary.AuditSha256
         };
         // Digested against the ENDED record, because that is the record every
@@ -860,8 +910,31 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
     /// after the fact is refused here rather than quietly re-signed into a new
     /// index that disagrees with the journal.
     /// </remarks>
-    private void PublishIndex(CohortJournal journal, byte[] key, string reason, string detail, string? spokenDetail = null)
+    private void PublishIndex(CohortJournal journal, byte[] key, string reason, string detail, string? spokenDetail = null) =>
+        PublishIndexCore(journal, key, reason, detail, CanonicalJson.Sha256HexOfText(spokenDetail ?? detail), recordTerminal: true);
+
+    /// <summary>
+    /// Commits the word being published and then writes the index that carries
+    /// it.
+    /// </summary>
+    /// <remarks>
+    /// The journal is written first and the index second, so a runner killed
+    /// between them leaves a signed record that already says what the missing
+    /// index would have said, and a rebuild reproduces it exactly. A rebuild
+    /// itself records nothing: it reports.
+    /// </remarks>
+    private void PublishIndexCore(
+        CohortJournal journal,
+        byte[] key,
+        string reason,
+        string detail,
+        string terminalDetailSha256,
+        bool recordTerminal)
     {
+        if (recordTerminal)
+        {
+            journal.RecordTerminal(key, reason, detail, terminalDetailSha256);
+        }
         var summaries = new List<CohortEntrySummary>(_manifest.Entries.Count);
         foreach (var entry in _manifest.Entries)
         {
@@ -887,7 +960,7 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
             summaries,
             reason,
             detail,
-            CanonicalJson.Sha256HexOfText(spokenDetail ?? detail));
+            terminalDetailSha256);
     }
 
     /// <summary>

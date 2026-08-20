@@ -133,6 +133,63 @@ function New-StubPreparation {
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Write-CanonicalScalarText {
+    param([string]$Text)
+    $builder = [Text.StringBuilder]::new()
+    [void]$builder.Append('"')
+    foreach ($character in $Text.ToCharArray()) {
+        $code = [int]$character
+        switch ($character) {
+            '"' { [void]$builder.Append('\"'); continue }
+            '\' { [void]$builder.Append('\\'); continue }
+        }
+        if ($code -lt 32 -or $code -eq 127) {
+            [void]$builder.Append('\u' + $code.ToString('x4'))
+        } else {
+            [void]$builder.Append($character)
+        }
+    }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function ConvertTo-CanonicalText {
+    <#
+        The same canonical form the coordinator's own writer produces: keys sorted
+        ordinally, no whitespace, integers unquoted. The stub signs what it writes
+        with the key it writes beside it, exactly as a real preparation does.
+    #>
+    param($Value)
+    if ($null -eq $Value) { return 'null' }
+    if ($Value -is [string]) { return (Write-CanonicalScalarText -Text $Value) }
+    if ($Value -is [bool]) { if ($Value) { return 'true' } else { return 'false' } }
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [int16] -or $Value -is [byte]) {
+        return ([long]$Value).ToString([Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($Value -is [Collections.IDictionary]) {
+        $names = [Collections.Generic.List[string]]::new()
+        foreach ($name in $Value.Keys) { [void]$names.Add([string]$name) }
+        $names.Sort([StringComparer]::Ordinal)
+        $parts = [Collections.Generic.List[string]]::new()
+        foreach ($name in $names) {
+            [void]$parts.Add((Write-CanonicalScalarText -Text $name) + ':' + (ConvertTo-CanonicalText -Value $Value[$name]))
+        }
+        return '{' + ($parts -join ',') + '}'
+    }
+    if ($Value -is [Collections.IEnumerable]) {
+        $items = [Collections.Generic.List[string]]::new()
+        foreach ($item in $Value) { [void]$items.Add((ConvertTo-CanonicalText -Value $item)) }
+        return '[' + ($items -join ',') + ']'
+    }
+    throw "The stub cannot canonicalize a $($Value.GetType().FullName)."
+}
+
+function Get-Sha256Text {
+    param([string]$Text)
+    $bytes = ([Text.UTF8Encoding]::new($false, $true)).GetBytes($Text)
+    return ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData($bytes))).Replace('-', '').ToLowerInvariant()
+}
+
 $parsed = @{}
 for ($index = 0; $index -lt $args.Count; $index++) {
     if ($args[$index] -like '--*') {
@@ -154,6 +211,15 @@ if ($control.startedMarker) {
 }
 if ($control.sleepSeconds -gt 0) { Start-Sleep -Seconds $control.sleepSeconds }
 
+$coordinatorRoot = Join-Path $outputRoot 'coordinator'
+if ($control.writeStateKey) {
+    [void](New-Item -ItemType Directory -Force -Path $coordinatorRoot)
+    $keyPath = Join-Path $coordinatorRoot 'state.key'
+    if (-not (Test-Path -LiteralPath $keyPath)) {
+        [IO.File]::WriteAllBytes($keyPath, ([Text.UTF8Encoding]::new($false, $true)).GetBytes([string]$control.stateKey))
+    }
+}
+
 if ($control.writeAudit) {
     $transitions = @()
     $sequence = 0
@@ -167,19 +233,36 @@ if ($control.writeAudit) {
             detail = 'stub'
         }
     }
+    $requestBytes = [IO.File]::ReadAllBytes($requestPath)
+    $requestSha256 = ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData($requestBytes))).Replace('-', '').ToLowerInvariant()
+    if ($control.requestSha256Override) { $requestSha256 = [string]$control.requestSha256Override }
+    $subject = [ordered]@{
+        organization = [string]$request.subject.organization
+        project = [string]$request.subject.project
+        repository = [string]$request.subject.repository
+        pullRequestId = [long]$request.subject.pullRequestId
+        iterationId = [long]$request.subject.iterationId
+        sourceCommit = [string]$request.subject.sourceCommit
+        commonCommit = [string]$request.subject.commonCommit
+        targetCommit = [string]$request.subject.targetCommit
+    }
+    $subjectSha256 = Get-Sha256Text -Text (ConvertTo-CanonicalText -Value $subject)
+    if ($control.subjectSha256Override) { $subjectSha256 = [string]$control.subjectSha256Override }
     $audit = [ordered]@{
         contractVersion = [string]$control.auditContractVersion
         kind = [string]$control.auditKind
         correlationId = [string]$request.correlationId
+        requestSha256 = $requestSha256
+        subjectSha256 = $subjectSha256
         finalState = [string]$control.finalState
         sequence = $sequence
-        modelInvocationCount = [int]$control.modelInvocationCount
-        slotLaunchCount = [int]$control.slotLaunchCount
-        declaredSlotCount = 2
-        supervisedSlotCount = [int]$control.supervisedSlotCount
+        modelInvocationCount = [long]$control.modelInvocationCount
+        slotLaunchCount = [long]$control.slotLaunchCount
+        declaredSlotCount = [long]2
+        supervisedSlotCount = [long]$control.supervisedSlotCount
         slots = @(
-            [ordered]@{ name = 'slot1'; slotModelInvocationCount = [int]$control.slot1ModelInvocationCount },
-            [ordered]@{ name = 'slot2'; slotModelInvocationCount = [int]$control.slot2ModelInvocationCount }
+            [ordered]@{ name = 'slot1'; slotModelInvocationCount = [long]$control.slot1ModelInvocationCount },
+            [ordered]@{ name = 'slot2'; slotModelInvocationCount = [long]$control.slot2ModelInvocationCount }
         )
         reconciliationPerformed = [bool]$control.reconciliationPerformed
         reconciliationSha256 = [string]$control.reconciliationSha256
@@ -192,19 +275,27 @@ if ($control.writeAudit) {
         deliveryGatesEnabled = $false
         deliveryDecisionSha256 = [string]$control.deliveryDecisionSha256
         deliverySummarySha256 = [string]$control.deliverySummarySha256
-        providerWriteCount = [int]$control.providerWriteCount
-        writeToolInvocations = [int]$control.writeToolInvocations
-        childResultTransitionCount = $sequence
+        providerWriteCount = [long]$control.providerWriteCount
+        writeToolInvocations = [long]$control.writeToolInvocations
+        childResultTransitionCount = [long]$sequence
         transitions = @($transitions)
         terminalReason = [string]$control.terminalReason
         terminalDetail = 'stub'
         stateSha256 = [string]$control.stateSha256
-        auditSha256 = [string]$control.auditSha256
-        signature = [ordered]@{ algorithm = 'HMACSHA256'; value = [string]$control.auditSha256 }
     }
-    $auditPath = Join-Path $outputRoot 'coordinator\audit.json'
-    [void](New-Item -ItemType Directory -Force -Path (Split-Path $auditPath -Parent))
-    $text = ConvertTo-Json -InputObject $audit -Depth 12 -Compress:$false
+    $selfHash = Get-Sha256Text -Text (ConvertTo-CanonicalText -Value $audit)
+    if ($control.tamperSelfHash) { $selfHash = [string]$control.evidenceSha256 }
+    $audit['auditSha256'] = $selfHash
+    $keyBytes = [Convert]::FromHexString([string]$control.stateKey)
+    $signed = ([BitConverter]::ToString(
+        [Security.Cryptography.HMACSHA256]::HashData(
+            $keyBytes,
+            ([Text.UTF8Encoding]::new($false, $true)).GetBytes((ConvertTo-CanonicalText -Value $audit))))).Replace('-', '').ToLowerInvariant()
+    if ($control.tamperSignature) { $signed = [string]$control.evidenceSha256 }
+    $audit['signature'] = $signed
+    $auditPath = Join-Path $coordinatorRoot 'audit.json'
+    [void](New-Item -ItemType Directory -Force -Path $coordinatorRoot)
+    $text = ConvertTo-CanonicalText -Value $audit
     [IO.File]::WriteAllBytes($auditPath, ([Text.UTF8Encoding]::new($false, $true)).GetBytes($text))
 }
 
@@ -238,6 +329,12 @@ function New-StubControl {
         [string]$AuditKind = 'shadow-run-coordinator-audit',
         [string]$DeliveryAuthorizationKind = 'PreviewOnly',
         [bool]$DeliveryCommentsEnabled = $false,
+        [bool]$WriteStateKey = $true,
+        [bool]$TamperSelfHash = $false,
+        [bool]$TamperSignature = $false,
+        [string]$RequestSha256Override = '',
+        [string]$SubjectSha256Override = '',
+        [string]$StateKey = '',
         [string[]]$TransitionStates = @(
             'requestValidated', 'snapshotVerified', 'runSetReady',
             'slot1TerminalVerified', 'slot2TerminalVerified',
@@ -248,6 +345,12 @@ function New-StubControl {
         exitCode = $ExitCode
         sleepSeconds = $SleepSeconds
         writeAudit = $WriteAudit
+        writeStateKey = $WriteStateKey
+        stateKey = $(if ($StateKey) { $StateKey } else { (New-FakeDigest) })
+        tamperSelfHash = $TamperSelfHash
+        tamperSignature = $TamperSignature
+        requestSha256Override = $RequestSha256Override
+        subjectSha256Override = $SubjectSha256Override
         finalState = $FinalState
         terminalReason = $TerminalReason
         modelInvocationCount = $ModelInvocationCount
@@ -659,6 +762,32 @@ try {
     $restoredIndex = Get-JsonFile -Path $indexPathA
     Assert-Cohort ((ConvertTo-Json -InputObject $restoredIndex.entries -Depth 24 -Compress) -eq (ConvertTo-Json -InputObject $beforeRebuild.entries -Depth 24 -Compress)) `
         'The index rebuilt after the audit was restored does not reproduce the original summaries.'
+    # A rebuild reports a record; it does not stand in for one. Pointed at a root
+    # holding no journal it must refuse, because going ahead would mint a key
+    # nobody else holds and sign an index no later run could verify.
+    $emptyRebuildRoot = Join-Path $sandboxRoot 'case-a-rebuild-empty'
+    $manifestEmptyRebuild = New-CohortManifestFile -Path (Join-Path $emptyRebuildRoot 'cohort.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef `
+        -JournalRoot (Join-Path $emptyRebuildRoot 'journal') -IndexPath (Join-Path $emptyRebuildRoot 'index\cohort-index.json') `
+        -StubPath $stub -Entries @(
+        (New-CohortEntryDeclaration -Request $a1 -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $rebuildEmpty = Invoke-Cohort -ManifestPath $manifestEmptyRebuild -RebuildIndex
+    Assert-Cohort ($rebuildEmpty.ExitCode -eq 2) `
+        "Rebuilding an index with no journal to rebuild it from exited $($rebuildEmpty.ExitCode); expected 2."
+    Assert-Cohort (-not (Test-Path -LiteralPath (Join-Path $emptyRebuildRoot 'index\cohort-index.json'))) `
+        'A rebuild with no journal published an index anyway.'
+    Assert-Cohort (-not (Test-Path -LiteralPath (Join-Path $emptyRebuildRoot 'journal\cohort-journal.key'))) `
+        'A rebuild with no journal left a signing key behind.'
+    # The word a cohort publishes about itself is committed into the signed
+    # journal, so a rebuild reports it rather than inferring one from the entry
+    # records - which cannot tell a budget stop from a killed runner.
+    $journalTerminalA = Get-JsonFile -Path (Join-Path $caseA 'journal\cohort-journal.json')
+    Assert-Cohort ($journalTerminalA.terminal.reason -eq $beforeRebuild.terminalReason) `
+        "The journal records terminal reason '$($journalTerminalA.terminal.reason)' and the index published '$($beforeRebuild.terminalReason)'."
+    Assert-Cohort ($journalTerminalA.terminal.detailSha256 -eq $beforeRebuild.terminalDetailSha256) `
+        'The journal and the index disagree about the digest of the word published.'
+    Assert-Cohort ($afterRebuild.terminalReason -eq $beforeRebuild.terminalReason) `
+        "The rebuilt index says '$($afterRebuild.terminalReason)' and the run published '$($beforeRebuild.terminalReason)'."
 
     # -----------------------------------------------------------------------
     Write-Host '6/22 failFast leaves the remaining entries pending' -ForegroundColor Cyan
@@ -941,6 +1070,14 @@ try {
     Assert-Cohort ($recordG2After.state -eq 'pending' -and $recordG2After.attempt -eq 0) `
         'A blocked cohort started its next entry on a later run.'
     Assert-Cohort (-not ($rerunG.Output -match 'contoso')) 'A cohort refusal spoke a subject on stdout or stderr.'
+    # The observed write survives into the index. An entry closed BECAUSE its audit
+    # reported a write must not be summarized as one that wrote nothing: that would
+    # publish, over a signature, the opposite of the fact that stopped the cohort.
+    $indexEntryG1 = Get-CohortIndexEntry -Index (Get-JsonFile -Path (Join-Path $caseG 'index\cohort-index.json')) -EntryId 'entry-one'
+    Assert-Cohort ($indexEntryG1.providerWriteCount -eq 1) `
+        "The index reports $($indexEntryG1.providerWriteCount) provider write(s) for the entry that was refused for writing; expected 1."
+    Assert-Cohort ($indexG.consumed.providerWrites -ge 1) `
+        'The index totals report no provider write for a cohort that stopped because it observed one.'
 
     # -----------------------------------------------------------------------
     Write-Host '15/22 an entry audit this build cannot read blocks the whole cohort' -ForegroundColor Cyan
@@ -957,6 +1094,35 @@ try {
         (New-CohortEntryDeclaration -Request $h2 -Ordinal 2 -RuleBundlePath $ruleBundle))
     $runH = Invoke-Cohort -ManifestPath $manifestH
     Assert-Cohort ($runH.ExitCode -eq 11) "An unreadable entry audit exited $($runH.ExitCode); expected 11."
+
+    # An audit is only worth what it can be shown to be. Each of these publishes a
+    # perfectly well-shaped audit at the right path with the right correlation, and
+    # each is refused: an unbound one, a carelessly edited one, a carefully edited
+    # one, and one whose key is gone.
+    $tampers = @(
+        @{ Id = 'unbound'; Control = @{ RequestSha256Override = ('c' * 64) } },
+        @{ Id = 'careless'; Control = @{ TamperSelfHash = $true } },
+        @{ Id = 'careful'; Control = @{ TamperSignature = $true } },
+        @{ Id = 'keyless'; Control = @{ WriteStateKey = $false } },
+        @{ Id = 'othersubject'; Control = @{ SubjectSha256Override = ('d' * 64) } })
+    foreach ($tamper in $tampers) {
+        $caseTamper = Join-Path $sandboxRoot ('case-h-' + $tamper.Id)
+        $tamperRequest = New-CohortEntryRequest -Sandbox $caseTamper -EntryId 'entry-one' `
+            -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918275
+        $tamperControl = @($tamper.Control)[0]
+        [void](New-StubControl -Path $tamperRequest.ControlPath -ExitCode 0 @tamperControl)
+        $manifestTamper = New-CohortManifestFile -Path (Join-Path $caseTamper 'cohort.json') `
+            -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef `
+            -JournalRoot (Join-Path $caseTamper 'journal') -IndexPath (Join-Path $caseTamper 'index\cohort-index.json') `
+            -StubPath $stub -Entries @(
+            (New-CohortEntryDeclaration -Request $tamperRequest -Ordinal 1 -RuleBundlePath $ruleBundle))
+        $runTamper = Invoke-Cohort -ManifestPath $manifestTamper
+        Assert-Cohort ($runTamper.ExitCode -eq 11) `
+            "An entry audit that could not be authenticated ($($tamper.Id)) exited $($runTamper.ExitCode); expected 11."
+        $recordTamper = Get-CohortJournalEntry -JournalRoot (Join-Path $caseTamper 'journal') -EntryId 'entry-one'
+        Assert-Cohort ($recordTamper.outcome -eq 'evidenceRefused') `
+            "An unauthenticated audit ($($tamper.Id)) left outcome '$($recordTamper.outcome)'; expected evidenceRefused."
+    }
 
     # -----------------------------------------------------------------------
     Write-Host '16/22 identity drift between the manifest and the request is refused' -ForegroundColor Cyan
@@ -1097,6 +1263,39 @@ try {
         -JournalRoot (Join-Path $caseM 'journal-relative-index') -IndexPath 'index\relative.json' `
         -StubPath $stub -Entries @($declarationM1)
     Assert-Cohort ((Invoke-Cohort -ManifestPath $relativeIndex).ExitCode -eq 2) 'A cohort declaring a relative index path was not refused.'
+
+    # Rooted is not enough on Windows: a drive-relative path and a root-relative
+    # one are both rooted and both still resolve against the current directory.
+    $partialIndex = 0
+    foreach ($partial in @('\cohort\index.json', 'C:cohort-index.json')) {
+        $partialIndex++
+        $partiallyQualified = New-CohortManifestFile -Path (Join-Path $caseM "partial-$partialIndex.json") `
+            -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef `
+            -JournalRoot (Join-Path $caseM "journal-partial-$partialIndex") -IndexPath $partial `
+            -StubPath $stub -Entries @($declarationM1)
+        $runPartial = Invoke-Cohort -ManifestPath $partiallyQualified
+        Assert-Cohort ($runPartial.ExitCode -eq 2) `
+            "A cohort declaring the partially qualified index path '$partial' exited $($runPartial.ExitCode); expected 2."
+    }
+
+    # The index is rewritten on every publish, including while the walk is still
+    # going, so declaring it over the record it is derived from would destroy that
+    # record before anyone read either.
+    $overJournalRoot = Join-Path $caseM 'journal-over-index'
+    foreach ($over in @(
+            (Join-Path $overJournalRoot 'cohort-journal.json'),
+            (Join-Path $overJournalRoot 'cohort-journal.key'),
+            (Join-Path $overJournalRoot 'intents'),
+            $m1.Path,
+            (Join-Path $m1.OutputRoot 'coordinator\audit.json'))) {
+        $overIndex = New-CohortManifestFile -Path (Join-Path $caseM ('over-' + [IO.Path]::GetFileName($over) + '.json')) `
+            -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef `
+            -JournalRoot $overJournalRoot -IndexPath $over `
+            -StubPath $stub -Entries @($declarationM1)
+        $runOverIndex = Invoke-Cohort -ManifestPath $overIndex
+        Assert-Cohort ($runOverIndex.ExitCode -eq 2) `
+            "A cohort declaring its index over '$([IO.Path]::GetFileName($over))' exited $($runOverIndex.ExitCode); expected 2."
+    }
 
     $wrongKind = New-CohortManifestFile -Path (Join-Path $caseM 'kind.json') `
         -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -AuthorizationKind 'PreviewAndComment' `

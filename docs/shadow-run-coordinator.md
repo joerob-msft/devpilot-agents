@@ -573,13 +573,20 @@ than complete; `continueOnTerminalFailure` carries on to the next one. Neither r
 anything. Two conditions ignore the policy entirely and stop the whole cohort: an entry audit this
 build cannot read, and any reported provider write or write tool invocation (exit 11). An audit
 standing in an entry's output root counts as that entry's audit only if it names the correlation
-the entry's own sealed request declares, and the two write counters are read strictly — absent,
-negative or non-integral is a refusal, never the zero the cohort is trying to prove. A write
-observed anywhere in a cohort invalidates the claim the whole cohort was run under, so it is not
-something the cohort continues past. An entry whose evidence was refused is *closed* with the
-outcome `evidenceRefused` before the refusal travels — an entry left recorded as `running` once
-its child is gone would be read as resumable by the next run — and a cohort holding such an entry
-stays refused on every later run until an operator settles those artifacts by hand.
+the entry's own sealed request declares, restates the request and subject digests the manifest
+sealed, and carries that entry's own signature over itself — the cohort verifies the audit's HMAC
+against the state key the preparation left in its output root, in constant time, and then its
+self-hash, before it believes a single counter inside it. Binding by the words alone would only
+prove the file describes the right entry; anyone who could write those words could write zero into
+the write counters beside them. The two write counters are then read strictly — absent, negative or
+non-integral is a refusal, never the zero the cohort is trying to prove. A write observed anywhere
+in a cohort invalidates the claim the whole cohort was run under, so it is not something the cohort
+continues past, and the count that was observed is carried into the entry's ending and into the
+index rather than being republished as zero once the entry is summarized as not-run. An entry whose
+evidence was refused is *closed* with the outcome `evidenceRefused` before the refusal travels — an
+entry left recorded as `running` once its child is gone would be read as resumable by the next run
+— and a cohort holding such an entry stays refused on every later run until an operator settles
+those artifacts by hand.
 
 **The index says what ran, never what was concluded.** `devpilot.shadow-cohort.index.v1` carries
 one summary per declared entry, in declared order: the preparation's final state and terminal
@@ -590,17 +597,28 @@ or verdict, and it is self-hashed and signed. A refusal's own words can name an 
 output root can encode the subject it was taken over, so the index publishes a closed phrase plus
 `terminalDetailSha256` and the words themselves go to the operator's log.
 
+The word the cohort publishes about itself is committed into the signed journal *before* the index
+is written, so the two can never disagree and a kill between them leaves a record the next rebuild
+reproduces exactly.
+
 `--rebuild-index` reconstructs it from the journal and the per-entry audits alone, launching
 nothing, which is what makes the index evidence rather than a log the runner happened to keep. The
 rebuild is checked, not merely repeated: each ended entry's recomputed audit and summary digests
 must equal the ones its ending committed, so an audit that was removed, replaced or edited after
 the fact is refused (exit 11) instead of being quietly re-signed as an entry that never ran. The
-rebuild also derives its terminal reason from the journal, so re-publishing a budget stop or a
-`failFast` stop cannot launder it into a completed cohort.
+rebuild reads its terminal reason out of the journal rather than inferring one, so re-publishing a
+ceiling stop or a `failFast` stop cannot launder it into a completed cohort, and a rebuild pointed
+at a root holding no journal or no key is refused (exit 2) rather than minting a key nobody holds
+and signing an index no later run could verify. A rebuild reports a record; it does not stand in
+for one.
 
 Because a resume has to find the same record, the journal root and the index path are declared as
-absolute paths. A relative one would resolve against whatever directory the run happened to start
-in, and a resume that read a different journal would start entries that had already run.
+fully qualified absolute paths — rooted is not enough, since a drive-relative path is rooted and
+still resolves against the current directory. The index may not be declared over the journal, the
+journal key, the lease, the intent or log roots, any entry's request, or anywhere inside an entry's
+output root: the index is rewritten on every publish, including while the walk is still going, so
+declaring it over the record it is derived from would destroy that record before anyone read
+either.
 
 Rolling the cohort back is not running it. The single-request mode is unchanged, the PowerShell
 preparation path is unchanged, and a cohort of one entry is a preparation with a journal around it.

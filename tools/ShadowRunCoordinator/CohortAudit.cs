@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Security.Cryptography;
 using System.Text.Json;
 
 namespace DevPilot.ShadowRunCoordinator;
@@ -13,7 +14,22 @@ namespace DevPilot.ShadowRunCoordinator;
 /// has no say over a cohort that has discovered it is not the cohort it was
 /// declared to be.
 /// </remarks>
-internal sealed class CohortBlockedException(string message) : Exception(message);
+internal sealed class CohortBlockedException(string message) : Exception(message)
+{
+    /// <summary>
+    /// The write counters the refused audit published, when the refusal is
+    /// itself about them.
+    /// </summary>
+    /// <remarks>
+    /// An observed write is the one reading a cohort must never lose. The entry
+    /// that published it is closed without a summary, so without carrying the
+    /// counts out with the refusal the closed record would report the zero the
+    /// cohort is trying to prove - which is exactly backwards.
+    /// </remarks>
+    internal int ObservedProviderWriteCount { get; init; }
+
+    internal int ObservedWriteToolInvocationCount { get; init; }
+}
 
 /// <summary>
 /// One entry's summary, read out of that entry's published audit and carrying
@@ -115,6 +131,12 @@ internal sealed record CohortEntrySummary
     }
 
     /// <summary>The summary of an entry that never ran, which is a shape rather than a set of readings.</summary>
+    /// <remarks>
+    /// The write counters are the one exception, and they are taken from the
+    /// record rather than assumed to be zero. An entry closed because its audit
+    /// reported a write is summarized here, and a summary that reported zero for
+    /// it would report the opposite of the fact that stopped the cohort.
+    /// </remarks>
     internal static CohortEntrySummary NotRun(CohortEntry entry, CohortEntryRecord record) => new()
     {
         Entry = entry,
@@ -135,8 +157,8 @@ internal sealed record CohortEntrySummary
         SlotLaunchCount = 0,
         SupervisedSlotCount = 0,
         VerifierAssignmentCount = 0,
-        ProviderWriteCount = 0,
-        WriteToolInvocationCount = 0,
+        ProviderWriteCount = record.ProviderWriteCount,
+        WriteToolInvocationCount = record.WriteToolInvocationCount,
         WallClockSeconds = record.ElapsedSeconds
     };
 }
@@ -160,6 +182,10 @@ internal static class CohortSummaryReader
     /// <summary>The audit an entry's output root publishes.</summary>
     internal static string AuditPathFor(CohortEntry entry) =>
         Path.Combine(entry.OutputRoot, "coordinator", "audit.json");
+
+    /// <summary>The key the entry's own preparation signed its record and its audit with.</summary>
+    internal static string StateKeyPathFor(CohortEntry entry) =>
+        Path.Combine(entry.OutputRoot, "coordinator", "state.key");
 
     /// <summary>
     /// The states at which a reviewed verifier read something on this
@@ -207,8 +233,14 @@ internal static class CohortSummaryReader
             // entry declared, rather than being an audit left standing in that root
             // by something else. The correlation is the request's own, read out of
             // the request the manifest sealed, so an audit adopted from another
-            // preparation is refused instead of counted.
+            // preparation is refused instead of counted. The digests beside it are
+            // what the manifest already pinned, so an audit left over from an
+            // earlier request against the same subject - or against the same
+            // correlation - is refused too.
             StrictJson.RequireLiteral(audit, "correlationId", expectedCorrelationId, label);
+            StrictJson.RequireLiteral(audit, "requestSha256", entry.RequestSha256, label);
+            StrictJson.RequireLiteral(audit, "subjectSha256", entry.SubjectSha256, label);
+            RequireAuthentic(entry, audit, path, label);
         }
         catch (ContractException error)
         {
@@ -260,6 +292,62 @@ internal static class CohortSummaryReader
             WriteToolInvocationCount = writeInvocations,
             WallClockSeconds = wallClockSeconds
         };
+    }
+
+    /// <summary>
+    /// Refuses an audit that does not match its own self-hash or its own
+    /// signature.
+    /// </summary>
+    /// <remarks>
+    /// The per-entry preparation self-hashes its audit and then signs it with the
+    /// same key it signs its state record with, and that key sits in the entry's
+    /// own output root. Recomputing both here is what makes the cohort index worth
+    /// more than the sum of files that happened to be lying in the declared roots:
+    /// without it, an index could be signed over readings that were edited after
+    /// the preparation published them. The self-hash catches a careless edit; only
+    /// the signature catches a careful one, because a careful editor recomputes
+    /// the hash.
+    ///
+    /// This is not claimed as an adversary defence, for the same reason the
+    /// single-run record does not claim it: the key sits beside the artifact under
+    /// the same ownership. What it establishes is that the readings the cohort
+    /// indexes are the readings its own preparations published.
+    /// </remarks>
+    private static void RequireAuthentic(CohortEntry entry, JsonElement audit, string path, string label)
+    {
+        var keyPath = StateKeyPathFor(entry);
+        if (!File.Exists(keyPath))
+        {
+            throw new ContractException(
+                $"The {label} at '{path}' stands in a root holding no signing key at '{keyPath}'. " +
+                "An audit whose key is gone cannot be shown to be the one that preparation published.");
+        }
+        var keyText = File.ReadAllText(keyPath, StrictJson.StrictUtf8).Trim();
+        if (keyText.Length != 64 || !StrictJson.IsLowerHex(keyText))
+        {
+            throw new ContractException($"The signing key at '{keyPath}' is not 64 lower-case hexadecimal characters.");
+        }
+        var key = Convert.FromHexString(keyText);
+
+        var recordedSignature = StrictJson.RequireHex(audit, "signature", label, 64);
+        var recordedSelfHash = StrictJson.RequireHex(audit, "auditSha256", label, 64);
+
+        var node = (MapNode)Node.FromJson(audit, label);
+        node.Remove("signature");
+        var expectedSignature = CanonicalJson.HmacHex(key, CanonicalJson.Canonical(node));
+        if (!CryptographicOperations.FixedTimeEquals(Convert.FromHexString(expectedSignature), Convert.FromHexString(recordedSignature)))
+        {
+            throw new ContractException(
+                $"The {label} at '{path}' does not match its own signature; it was truncated or edited after it was written.");
+        }
+
+        node.Remove("auditSha256");
+        var expectedSelfHash = CanonicalJson.Sha256HexOfText(CanonicalJson.Canonical(node));
+        if (!string.Equals(expectedSelfHash, recordedSelfHash, StringComparison.Ordinal))
+        {
+            throw new ContractException(
+                $"The {label} at '{path}' digests to {expectedSelfHash} and claims {recordedSelfHash}.");
+        }
     }
 
     /// <summary>
@@ -320,7 +408,11 @@ internal static class CohortSummaryReader
             throw new CohortBlockedException(
                 $"Entry '{entry.EntryId}' published an audit reporting {providerWrites.ToString(CultureInfo.InvariantCulture)} provider write(s) and " +
                 $"{writeInvocations.ToString(CultureInfo.InvariantCulture)} write tool invocation(s). This cohort is authorized preview-only and every " +
-                "remaining entry is abandoned rather than run beside a preparation that wrote.");
+                "remaining entry is abandoned rather than run beside a preparation that wrote.")
+            {
+                ObservedProviderWriteCount = providerWrites,
+                ObservedWriteToolInvocationCount = writeInvocations
+            };
         }
     }
 
@@ -469,6 +561,31 @@ internal static class CohortIndex
     internal const string ReasonContractRefusal = "contractRefusal";
 
     internal const string ReasonUnexpectedFault = "unexpectedFault";
+
+    /// <summary>
+    /// Every word this build publishes about a cohort at rest, and the only ones
+    /// its signed journal admits.
+    /// </summary>
+    /// <remarks>
+    /// The journal carries the published word so a rebuild reproduces it rather
+    /// than inferring it, and a journal that carried a word this build does not
+    /// know would produce an index nobody could compare with anything. The list
+    /// is closed here rather than at each writer so the two can never drift.
+    /// </remarks>
+    private static readonly string[] Reasons =
+    [
+        ReasonRunning,
+        ReasonCompleted,
+        ReasonCompletedWithFailure,
+        ReasonStoppedOnFailure,
+        ReasonBudgetExhausted,
+        ReasonBlocked,
+        ReasonUnresolvedLaunch,
+        ReasonContractRefusal,
+        ReasonUnexpectedFault
+    ];
+
+    internal static bool IsKnownReason(string reason) => Array.IndexOf(Reasons, reason) >= 0;
 
     internal static void Publish(
         CohortManifest manifest,

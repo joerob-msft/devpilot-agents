@@ -111,6 +111,8 @@ internal sealed record CohortEntryRecord
 
     internal required int ProviderWriteCount { get; init; }
 
+    internal required int WriteToolInvocationCount { get; init; }
+
     internal required string AuditSha256 { get; init; }
 
     internal required string SummarySha256 { get; init; }
@@ -133,6 +135,7 @@ internal sealed record CohortEntryRecord
         VerifierAssignmentCount = 0,
         SlotLaunchCount = 0,
         ProviderWriteCount = 0,
+        WriteToolInvocationCount = 0,
         AuditSha256 = "none",
         SummarySha256 = "none"
     };
@@ -154,6 +157,7 @@ internal sealed record CohortEntryRecord
         .Set("verifierAssignmentCount", VerifierAssignmentCount)
         .Set("slotLaunchCount", SlotLaunchCount)
         .Set("providerWriteCount", ProviderWriteCount)
+        .Set("writeToolInvocationCount", WriteToolInvocationCount)
         .Set("auditSha256", AuditSha256)
         .Set("summarySha256", SummarySha256);
 
@@ -182,6 +186,7 @@ internal sealed record CohortEntryRecord
             "verifierAssignmentCount",
             "slotLaunchCount",
             "providerWriteCount",
+            "writeToolInvocationCount",
             "auditSha256",
             "summarySha256");
 
@@ -227,6 +232,7 @@ internal sealed record CohortEntryRecord
             VerifierAssignmentCount = StrictJson.RequireInt(node, "verifierAssignmentCount", label, 0, int.MaxValue),
             SlotLaunchCount = StrictJson.RequireInt(node, "slotLaunchCount", label, 0, int.MaxValue),
             ProviderWriteCount = StrictJson.RequireInt(node, "providerWriteCount", label, 0, int.MaxValue),
+            WriteToolInvocationCount = StrictJson.RequireInt(node, "writeToolInvocationCount", label, 0, int.MaxValue),
             AuditSha256 = StrictJson.RequireString(node, "auditSha256", label),
             SummarySha256 = StrictJson.RequireString(node, "summarySha256", label)
         };
@@ -297,6 +303,28 @@ internal sealed class CohortJournal
 
     internal IReadOnlyList<MapNode> Events => _events;
 
+    /// <summary>
+    /// The word this cohort last published about itself, or "none" when it has
+    /// published nothing.
+    /// </summary>
+    /// <remarks>
+    /// A rebuild cannot derive this from the entry records alone. A cohort with
+    /// entries still pending may have stopped because a budget ceiling was
+    /// reached, because an entry's launch could not be resolved, because the
+    /// manifest was refused, or because the runner was killed - and those are
+    /// four different accounts of the same set of records. So the word and the
+    /// closed phrase beside it are committed into the signed journal when they
+    /// are published, and a rebuild reads them back rather than guessing.
+    /// </remarks>
+    internal string TerminalReason { get; private set; } = "none";
+
+    internal string TerminalDetail { get; private set; } = "none";
+
+    internal string TerminalDetailSha256 { get; private set; } = "none";
+
+    /// <summary>True when this journal carries a published word about the cohort as a whole.</summary>
+    internal bool HasTerminal => !string.Equals(TerminalReason, "none", StringComparison.Ordinal);
+
     /// <summary>The record for a declared entry, which always exists once the journal is open.</summary>
     internal CohortEntryRecord RecordFor(string entryId) =>
         _entries.TryGetValue(entryId, out var record)
@@ -329,17 +357,22 @@ internal sealed class CohortJournal
     }
 
     /// <summary>
-    /// True when this root records a launch this run cannot account for.
+    /// True when this root records work this run cannot account for.
     /// </summary>
     /// <remarks>
-    /// An intent is written before every attempt and never removed, so a root
-    /// holding one has started something. This is what separates "a first run
-    /// died before its journal reached the disk" from "somebody removed the
-    /// journal", which are otherwise the same two files on disk.
+    /// An intent is written before every attempt and never removed, and an index
+    /// is published before the first entry is reached, so a root holding either
+    /// has started something. This is what separates "a first run died before its
+    /// journal reached the disk" from "somebody removed the journal", which are
+    /// otherwise the same two files on disk. A root whose journal, intents and
+    /// index have ALL been removed is a fresh root by construction, and the
+    /// per-entry preparation refuses on its own to start over an output root that
+    /// still holds standing work.
     /// </remarks>
-    private static bool HasRecordedIntent(CohortManifest manifest) =>
-        Directory.Exists(manifest.IntentRoot)
-        && Directory.EnumerateFiles(manifest.IntentRoot, "*.intent.json", SearchOption.TopDirectoryOnly).Any();
+    private static bool HasRecordedWork(CohortManifest manifest) =>
+        (Directory.Exists(manifest.IntentRoot)
+            && Directory.EnumerateFiles(manifest.IntentRoot, "*.intent.json", SearchOption.TopDirectoryOnly).Any())
+        || File.Exists(manifest.IndexPath);
 
     private static byte[] ReadKey(CohortManifest manifest)
     {
@@ -367,14 +400,14 @@ internal sealed class CohortJournal
             // is one honest exception, and it is exactly the case a first run can
             // produce by itself - a runner killed after the key was written and
             // before the first journal reached the disk. That run committed
-            // nothing, so it also wrote no launch intent, and a root holding no
-            // intent has demonstrably started nothing. The refusal happens here,
-            // before anything is mutated.
-            if (keyPreexisted && HasRecordedIntent(manifest))
+            // nothing, so it also wrote no launch intent and published no index,
+            // and a root holding neither has demonstrably started nothing. The
+            // refusal happens here, before anything is mutated.
+            if (keyPreexisted && HasRecordedWork(manifest))
             {
                 throw new ContractException(
                     $"The cohort journal root '{manifest.JournalRoot}' carries a signing key and no journal at '{manifest.JournalPath}', " +
-                    "and the intent root records launches this run cannot account for. " +
+                    "and this root records work this run cannot account for. " +
                     "The record this run would have resumed from has been removed, so the entries it accounted for cannot be accounted for now. " +
                     "This journal root is not resumable and is not started over; use a fresh one.");
             }
@@ -393,6 +426,7 @@ internal sealed class CohortJournal
             "sequence",
             "entries",
             "events",
+            "terminal",
             "signature");
 
         StrictJson.RequireLiteral(root, "contractVersion", ContractVersionValue, Label);
@@ -409,6 +443,23 @@ internal sealed class CohortJournal
         var sequence = StrictJson.RequireInt(root, "sequence", Label, 0, int.MaxValue);
 
         var journal = new CohortJournal(manifest, bindingSha256) { Sequence = sequence };
+
+        var terminal = StrictJson.RequireObject(root, "terminal", Label);
+        StrictJson.RequireNoUnknownFields(terminal, Label + " terminal", "reason", "detail", "detailSha256");
+        var terminalReason = StrictJson.RequireString(terminal, "reason", Label + " terminal");
+        if (!string.Equals(terminalReason, "none", StringComparison.Ordinal) && !CohortIndex.IsKnownReason(terminalReason))
+        {
+            throw new ContractException($"The {Label} records terminal reason '{terminalReason}', which is not a reason this build publishes.");
+        }
+        var terminalDetailSha256 = StrictJson.RequireString(terminal, "detailSha256", Label + " terminal");
+        if (!string.Equals(terminalDetailSha256, "none", StringComparison.Ordinal)
+            && (terminalDetailSha256.Length != 64 || !StrictJson.IsLowerHex(terminalDetailSha256)))
+        {
+            throw new ContractException($"The {Label} terminal detail digest is neither 'none' nor 64 lower-case hexadecimal characters.");
+        }
+        journal.TerminalReason = terminalReason;
+        journal.TerminalDetail = StrictJson.RequireString(terminal, "detail", Label + " terminal");
+        journal.TerminalDetailSha256 = terminalDetailSha256;
 
         foreach (var entryNode in StrictJson.RequireArray(root, "entries", Label))
         {
@@ -556,6 +607,58 @@ internal sealed class CohortJournal
     }
 
     /// <summary>
+    /// Commits the word this cohort is publishing about itself, so a rebuild
+    /// reads it back rather than inferring it.
+    /// </summary>
+    /// <remarks>
+    /// Written before the index it describes, so a runner killed between the two
+    /// leaves a journal that already says what the missing index would have said
+    /// and a rebuild reproduces it. Unchanged is a no-op, because a cohort that
+    /// republished the same word on every entry would rewrite the journal for
+    /// nothing.
+    /// </remarks>
+    internal void RecordTerminal(byte[] key, string reason, string detail, string detailSha256)
+    {
+        if (string.Equals(TerminalReason, reason, StringComparison.Ordinal)
+            && string.Equals(TerminalDetail, detail, StringComparison.Ordinal)
+            && string.Equals(TerminalDetailSha256, detailSha256, StringComparison.Ordinal))
+        {
+            return;
+        }
+        if (!CohortIndex.IsKnownReason(reason))
+        {
+            throw new ContractException($"A cohort cannot publish terminal reason '{reason}'; it is not a reason this build writes.");
+        }
+        var previousReason = TerminalReason;
+        var previousDetail = TerminalDetail;
+        var previousDigest = TerminalDetailSha256;
+        var previousSequence = Sequence;
+        TerminalReason = reason;
+        TerminalDetail = detail;
+        TerminalDetailSha256 = detailSha256;
+        Sequence++;
+        _events.Add(new MapNode()
+            .Set("sequence", Sequence)
+            .Set("atUtc", DateTime.UtcNow.ToString("yyyyMMdd'T'HHmmss'Z'", CultureInfo.InvariantCulture))
+            .Set("entryId", "none")
+            .Set("kind", "terminal")
+            .Set("detail", reason));
+        try
+        {
+            Save(key);
+        }
+        catch
+        {
+            _events.RemoveAt(_events.Count - 1);
+            TerminalReason = previousReason;
+            TerminalDetail = previousDetail;
+            TerminalDetailSha256 = previousDigest;
+            Sequence = previousSequence;
+            throw;
+        }
+    }
+
+    /// <summary>
     /// Refuses a record this journal's own reader would not admit.
     /// </summary>
     /// <remarks>
@@ -579,6 +682,56 @@ internal sealed class CohortJournal
             throw new ContractException(
                 $"Entry '{record.EntryId}' would be committed with an empty child start time. A record the reader refuses cannot be " +
                 "written into a signed journal; a start time that could not be read is recorded as 'none' and refused on resume instead.");
+        }
+        // The rest of the reader's bounds, applied in the reader's own order, so
+        // the writer can never produce an account that loads back as a refusal.
+        RequireInRange(record, "ordinal", record.Ordinal, 1, 64);
+        RequireInRange(record, "attempt", record.Attempt, 0, MaximumAttempts);
+        RequireInRange(record, "childProcessId", record.ChildProcessId, 0, int.MaxValue);
+        RequireInRange(record, "elapsedSeconds", record.ElapsedSeconds, 0, int.MaxValue);
+        RequireInRange(record, "modelStartCount", record.ModelStartCount, 0, int.MaxValue);
+        RequireInRange(record, "verifierAssignmentCount", record.VerifierAssignmentCount, 0, int.MaxValue);
+        RequireInRange(record, "slotLaunchCount", record.SlotLaunchCount, 0, int.MaxValue);
+        RequireInRange(record, "providerWriteCount", record.ProviderWriteCount, 0, int.MaxValue);
+        RequireInRange(record, "writeToolInvocationCount", record.WriteToolInvocationCount, 0, int.MaxValue);
+        RequireSpoken(record, "entryId", record.EntryId);
+        RequireSpoken(record, "intentSha256", record.IntentSha256);
+        RequireSpoken(record, "startedAtUtc", record.StartedAtUtc);
+        RequireSpoken(record, "endedAtUtc", record.EndedAtUtc);
+        RequireSpoken(record, "auditSha256", record.AuditSha256);
+        RequireSpoken(record, "summarySha256", record.SummarySha256);
+        if (!CohortEntryStates.IsKnown(record.State))
+        {
+            throw new ContractException($"Entry '{record.EntryId}' would be committed in state '{record.State}', which is not a state this build writes.");
+        }
+        if (!string.Equals(record.Outcome, "none", StringComparison.Ordinal) && !CohortEntryOutcomes.IsKnown(record.Outcome))
+        {
+            throw new ContractException($"Entry '{record.EntryId}' would be committed with outcome '{record.Outcome}', which is not an outcome this build writes.");
+        }
+        if (record.HasEnded && string.Equals(record.Outcome, "none", StringComparison.Ordinal))
+        {
+            throw new ContractException($"Entry '{record.EntryId}' would be committed as ended with no outcome; an ending is the outcome it recorded.");
+        }
+    }
+
+    private static void RequireInRange(CohortEntryRecord record, string field, int value, int low, int high)
+    {
+        if (value < low || value > high)
+        {
+            throw new ContractException(
+                $"Entry '{record.EntryId}' would be committed with '{field}' of {value.ToString(CultureInfo.InvariantCulture)}, " +
+                $"outside the {low.ToString(CultureInfo.InvariantCulture)} to {high.ToString(CultureInfo.InvariantCulture)} " +
+                "the reader admits. A record the reader refuses cannot be written into a signed journal.");
+        }
+    }
+
+    private static void RequireSpoken(CohortEntryRecord record, string field, string value)
+    {
+        if (value.Length == 0)
+        {
+            throw new ContractException(
+                $"Entry '{record.EntryId}' would be committed with an empty '{field}'. Absent is written as 'none' so that the reader " +
+                "admits it; an empty string is a record this journal could not load back.");
         }
     }
 
@@ -642,7 +795,11 @@ internal sealed class CohortJournal
             .Set("bindingSha256", BindingSha256)
             .Set("sequence", Sequence)
             .Set("entries", entries)
-            .Set("events", events);
+            .Set("events", events)
+            .Set("terminal", new MapNode()
+                .Set("reason", TerminalReason)
+                .Set("detail", TerminalDetail)
+                .Set("detailSha256", TerminalDetailSha256));
     }
 
     /// <summary>
@@ -684,8 +841,7 @@ internal sealed class CohortJournal
         // is recycled; a record missing either cannot answer "is it still running?",
         // and answering "no" is precisely what would start a second preparation
         // against a live output root.
-        if (record.ChildProcessId <= 0 || record.ChildStartedAtUtc.Length == 0
-            || string.Equals(record.ChildStartedAtUtc, "none", StringComparison.Ordinal))
+        if (record.ChildProcessId <= 0 || !IsUsableStartTime(record.ChildStartedAtUtc))
         {
             throw new CohortUnresolvedLaunchException(
                 $"Entry '{record.EntryId}' records a started child whose identity is incomplete " +
@@ -703,14 +859,34 @@ internal sealed class CohortJournal
     }
 
     /// <summary>
+    /// True when a recorded child start time is one this build could have
+    /// written, and could therefore compare a live process against.
+    /// </summary>
+    /// <remarks>
+    /// A start time that is absent, sentinel, or simply not a round-trip instant
+    /// cannot be compared with a candidate process's own start time. Treating an
+    /// uncomparable time as a mismatch would read as "that child is gone", which
+    /// is the one answer that starts a second preparation against a live output
+    /// root. So it is uncomparable here and unresolved at the caller.
+    /// </remarks>
+    internal static bool IsUsableStartTime(string startedAtUtc) =>
+        startedAtUtc.Length != 0
+        && !string.Equals(startedAtUtc, "none", StringComparison.Ordinal)
+        && DateTime.TryParseExact(
+            startedAtUtc,
+            "O",
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.RoundtripKind,
+            out _);
+
+    /// <summary>
     /// True when the exact recorded child is still running. A matching identifier
     /// whose start time differs is a recycled identifier and is deliberately not
     /// the child.
     /// </summary>
     internal static bool IsRecordedChildAlive(CohortEntryRecord record)
     {
-        if (record.ChildProcessId <= 0 || record.ChildStartedAtUtc.Length == 0
-            || string.Equals(record.ChildStartedAtUtc, "none", StringComparison.Ordinal))
+        if (record.ChildProcessId <= 0 || !IsUsableStartTime(record.ChildStartedAtUtc))
         {
             return false;
         }

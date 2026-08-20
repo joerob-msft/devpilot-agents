@@ -170,7 +170,57 @@ internal sealed record CohortManifest
             Entries = entries,
             ManifestSha256 = CanonicalJson.Sha256Hex(bytes)
         };
+        RequireIndexIsolated(manifest, label);
         return manifest;
+    }
+
+    /// <summary>
+    /// Refuses an index declared on top of something the cohort has to be able to
+    /// read afterwards.
+    /// </summary>
+    /// <remarks>
+    /// The index is the one file this runner replaces wholesale on every publish,
+    /// and it is published repeatedly, including while the walk is still going. An
+    /// index declared over the journal, the journal's key, the lease, a sealed
+    /// request or an entry's output root would therefore destroy the very record
+    /// the index claims to be derived from, and the destruction would happen
+    /// before anyone read either.
+    /// </remarks>
+    private static void RequireIndexIsolated(CohortManifest manifest, string label)
+    {
+        var index = NormalizeRoot(manifest.IndexPath);
+        foreach (var (path, what) in new[]
+        {
+            (manifest.JournalPath, "the cohort journal"),
+            (manifest.JournalKeyPath, "the cohort journal's signing key"),
+            (manifest.LeasePath, "the cohort lease"),
+            (manifest.IntentRoot, "the cohort intent root"),
+            (manifest.LogRoot, "the cohort log root")
+        })
+        {
+            if (string.Equals(index, NormalizeRoot(path), StringComparison.OrdinalIgnoreCase))
+            {
+                throw new ContractException(
+                    $"The {label} declares its audit index at '{manifest.IndexPath}', which is {what}. The index is rewritten on every " +
+                    "publish, so declaring it over the record it is derived from would destroy that record.");
+            }
+        }
+        foreach (var entry in manifest.Entries)
+        {
+            var root = NormalizeRoot(entry.OutputRoot);
+            if (string.Equals(index, root, StringComparison.OrdinalIgnoreCase)
+                || index.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new ContractException(
+                    $"The {label} declares its audit index at '{manifest.IndexPath}', inside entry '{entry.EntryId}'s output root. " +
+                    "An entry's output root holds that preparation's own sealed evidence and nothing this cohort writes across it.");
+            }
+            if (string.Equals(index, NormalizeRoot(entry.RequestPath), StringComparison.OrdinalIgnoreCase))
+            {
+                throw new ContractException(
+                    $"The {label} declares its audit index at '{manifest.IndexPath}', which is entry '{entry.EntryId}'s sealed request.");
+            }
+        }
     }
 
     /// <summary>
@@ -335,19 +385,23 @@ internal sealed record CohortManifest
     /// A relative path resolves against whatever directory the process happened
     /// to start in, so the same manifest run twice from two places would write two
     /// journals and two indexes - and a resume pointed at the wrong one would read
-    /// an empty journal and start entries that already ran. The manifest has to say
+    /// an empty journal and start entries that already ran. Rooted is not enough:
+    /// on Windows both a drive-relative path and a root-relative one are rooted
+    /// and still resolve against the current directory. The manifest has to say
     /// where its own record lives, absolutely, or it is not a resumable record.
+    /// The value is returned fully resolved so that everything downstream compares
+    /// the same string.
     /// </remarks>
     private static string RequireRootedPath(string path, string field, string label)
     {
-        if (!Path.IsPathRooted(path))
+        if (!Path.IsPathFullyQualified(path))
         {
             throw new ContractException(
-                $"The {label} declares a relative {field} '{path}'. Where a cohort's own record lives cannot depend on which directory " +
-                "a run was started from, because a resume that read a different journal would start entries that already ran. " +
-                "Declare an absolute path.");
+                $"The {label} declares a {field} '{path}' that is not fully qualified. Where a cohort's own record lives cannot depend " +
+                "on which directory or which drive a run was started from, because a resume that read a different journal would start " +
+                "entries that already ran. Declare a fully qualified absolute path.");
         }
-        return path;
+        return Path.GetFullPath(path);
     }
 
     /// <summary>

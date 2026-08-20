@@ -568,10 +568,27 @@ if ($cohortPresent.Count -eq $cohortSources.Count) {
     Assert-Coordinator ($cohortAuditText.Contains('RequireWriteCount')) `
         'The cohort reads its write counters leniently; an unreadable counter is not the zero the cohort has to prove.'
 
+    # Binding an audit by the words inside it only proves it describes the right
+    # entry. Anyone who could write that file could write those words, so the
+    # cohort also checks the entry's own signature over it before believing a
+    # single counter it reports.
+    Assert-Coordinator ($cohortAuditText.Contains('RequireAuthentic')) `
+        'The cohort trusts an entry audit it never authenticated, so an edited audit could report zero writes.'
+    Assert-Coordinator ($cohortAuditText.Contains('FixedTimeEquals')) `
+        'The cohort compares an audit signature with an ordinary comparison.'
+    foreach ($pin in @('requestSha256', 'subjectSha256')) {
+        Assert-Coordinator ($cohortAuditText.Contains($pin)) `
+            "The cohort reads an entry audit without binding its $pin to the entry the manifest sealed."
+    }
+
     # Where a cohort's own record lives cannot depend on the directory a run
     # started from, or a resume would read a different journal.
     Assert-Coordinator ($manifestText.Contains('RequireRootedPath')) `
         'The cohort manifest admits a relative journal or index path, so a resume could read a different record.'
+    Assert-Coordinator ($manifestText.Contains('IsPathFullyQualified')) `
+        'The cohort manifest admits a drive-relative path, which is rooted and still resolves against the current directory.'
+    Assert-Coordinator ($manifestText.Contains('RequireIndexIsolated')) `
+        'The cohort manifest admits an index declared over the journal or an entry output root, so publishing would destroy the record it was derived from.'
 
     # A signed journal cannot be repaired by hand, so the writer may never commit
     # a record its own reader refuses: the only way out of that would be a fresh
@@ -582,10 +599,20 @@ if ($cohortPresent.Count -eq $cohortSources.Count) {
         'The cohort journal bounds the child exit code below what the operating system can report, so a hard-dying child would wedge it.'
     Assert-Coordinator ($runnerText.Contains('RecordedStartTime')) `
         'The cohort runner commits the raw child start time, which is empty when it cannot be read and unreadable once written.'
+    Assert-Coordinator ($journalText.Contains('IsUsableStartTime')) `
+        'The cohort journal admits a start time it cannot parse, so a malformed identity would decide whether a child is alive.'
     Assert-Coordinator ($cohortAuditText.Contains('RequireRepresentable')) `
         'The cohort narrows its ceiling counters with an unchecked cast, which would let a wrapped total disable the ceiling.'
-    Assert-Coordinator ($journalText.Contains('HasRecordedIntent')) `
+    Assert-Coordinator ($journalText.Contains('HasRecordedWork')) `
         'The cohort journal cannot tell a mint that got no further from a journal somebody removed.'
+
+    # The word a cohort publishes about itself is committed before it is published,
+    # so a rebuild reports the record rather than inferring one from entry states
+    # that cannot tell a ceiling stop from a killed runner.
+    Assert-Coordinator ($journalText.Contains('RecordTerminal')) `
+        'The cohort journal keeps no record of the word its index published, so a rebuild would have to guess one.'
+    Assert-Coordinator ($runnerText.Contains('HasTerminal')) `
+        'The cohort runner derives a published outcome without first reading the one its journal already recorded.'
 
     # The operator alias arrives on the command line. A cohort whose authorization
     # could be read out of the manifest would be a cohort a scheduled task could
