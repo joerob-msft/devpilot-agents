@@ -62,7 +62,11 @@ jobs:
     name: Agent self-checks (-DryRun)
     runs-on: windows-latest
     steps:
+      # Full history: the escape ledger cites this repository's own commits and
+      # the ledger check verifies that each one exists.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # Offline by design: no network, no Azure DevOps, no Copilot process.
       - name: review-handler -DryRun
@@ -163,6 +167,36 @@ jobs:
       - name: empty-to-null AST analyzer fixture measurement
         shell: pwsh
         run: ./tools/Test-PowerShellEmptyNullHazardAnalyzer.ps1
+
+      # Boundary hardening. The fixture half proves each rule still detects its
+      # own hazard and still ignores its own counterexample; the repository half
+      # blocks any finding that is not in the recorded baseline. Existing
+      # findings are debt, not approval.
+      - name: PowerShell boundary hardening gate
+        shell: pwsh
+        run: ./tools/Test-PowerShellBoundaryHardening.ps1
+
+      # The versioned file contract for stage child outputs: required kind and
+      # contract version, caller-specified file, explicit depth and form, UTF-8
+      # with no byte order mark, and fail-closed reads.
+      - name: stage file contract enforcement
+        shell: pwsh
+        run: ./tools/Test-ReviewerStageContract.ps1
+
+      # Every inventoried collection field at zero, one, many, maximum,
+      # duplicate, null-versus-missing, and wrong-scalar, plus the escape-shape
+      # properties and the sabotage suite that proves each historical collapse
+      # is still detected.
+      - name: collection cardinality corpus
+        shell: pwsh
+        run: ./tools/Test-ReviewerCollectionCardinality.ps1
+
+      # The escape ledger must agree with its own arithmetic: counts recomputed
+      # from the incident list, the registered budget trigger re-evaluated, and
+      # the narrative kept in step with the data.
+      - name: escape ledger and budget
+        shell: pwsh
+        run: ./tools/Test-EscapeLedger.ps1 -VerifyCommits
 
       - name: convention-pack schema and replay checks
         shell: pwsh

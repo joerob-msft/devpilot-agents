@@ -1588,7 +1588,7 @@ function Get-ReviewerSourceDegenerateChanges {
                     $originalPath = ConvertTo-ReviewerSourcePath -Path $rawOriginalPath
                     if (-not $originalPath -or $originalPath -cne $path) { $state.SamePath = $false }
                 }
-                foreach ($kind in @(Get-ReviewerSourceChangeKinds -Value (
+                foreach ($kind in (Get-ReviewerSourceChangeKinds -Value (
                             Get-ReviewerSourceValue -Object $change -Name "changeType" -Default $null))) {
                     if (-not $state.ChangeKinds.Contains([string]$kind)) { [void]$state.ChangeKinds.Add([string]$kind) }
                 }
