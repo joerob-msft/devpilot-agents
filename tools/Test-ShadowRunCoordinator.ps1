@@ -581,7 +581,7 @@ try {
     # resolve against whatever scope happens to run the closure later.
     $setOutputRoot = ${function:Set-CoordinatorOutputRoot}
 
-    Write-Host '1/21 offline restore and build' -ForegroundColor Cyan
+    Write-Host '1/23 offline restore and build' -ForegroundColor Cyan
     $project = Join-Path $RepoRoot 'tools\ShadowRunCoordinator\ShadowRunCoordinator.csproj'
     Assert-Coordinator (Test-Path -LiteralPath $project -PathType Leaf) `
         'The shadow run coordinator project is missing.'
@@ -600,7 +600,7 @@ try {
         'The coordinator assembly was not produced.'
 
     # -----------------------------------------------------------------------
-    Write-Host '2/21 sandbox, sealed corpus and typed request' -ForegroundColor Cyan
+    Write-Host '2/23 sandbox, sealed corpus and typed request' -ForegroundColor Cyan
     Import-Module (Join-Path $RepoRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force
     . (Join-Path $RepoRoot 'src\Agents\reviewer\SourceTransport.ps1')
     . (Join-Path $RepoRoot 'src\Agents\reviewer\CorpusSeal.ps1')
@@ -617,9 +617,10 @@ try {
         'The request does not bind a prompt-asset digest.'
 
     # -----------------------------------------------------------------------
-    Write-Host '3/21 restart at every transition' -ForegroundColor Cyan
-    $states = @('requestValidated', 'corpusValidated', 'recipePlanned', 'snapshotValidateOnly',
-        'snapshotSealed', 'snapshotVerified', 'runSetDeclared', 'runSetVerified')
+    Write-Host '3/23 restart at every transition' -ForegroundColor Cyan
+    $states = @('requestValidated', 'corpusStaging', 'corpusPublished', 'corpusValidated',
+        'recipePlanned', 'snapshotValidateOnly', 'snapshotSealed', 'snapshotVerified',
+        'runSetDeclared', 'runSetVerified')
     $expectedSequence = 0
     foreach ($state in $states) {
         $expectedSequence++
@@ -644,14 +645,24 @@ try {
             "Resuming to an already-reached '$state' advanced the sequence to $($repeat.sequence)."
     }
 
-    Write-Host '4/21 preparation reaches run-set-ready' -ForegroundColor Cyan
+    Write-Host '4/23 preparation reaches run-set-ready' -ForegroundColor Cyan
     $final = Invoke-Coordinator -RequestPath $fixture.RequestPath
     Assert-Coordinator ($final.ExitCode -eq 0) "The preparation did not reach run-set-ready (exit $($final.ExitCode)): $($final.Output)"
     $durable = Get-CoordinatorState -OutputRoot $fixture.OutputRoot
-    Assert-Coordinator ($durable.state -ceq 'runSetReady' -and [int]$durable.sequence -eq 9) `
+    Assert-Coordinator ($durable.state -ceq 'runSetReady' -and [int]$durable.sequence -eq 11) `
         "The durable state is '$($durable.state)' at sequence $($durable.sequence)."
-    Assert-Coordinator (@($durable.transitions).Count -eq 9) `
-        "The state records $(@($durable.transitions).Count) transitions rather than nine."
+    Assert-Coordinator (@($durable.transitions).Count -eq 11) `
+        "The state records $(@($durable.transitions).Count) transitions rather than eleven."
+
+    # This fixture hands the coordinator a corpus that already exists, so the two
+    # corpus-construction ranks are recorded as having built nothing. They are
+    # recorded rather than skipped, which is what keeps one sequence numbering
+    # for both postures.
+    $stagingTransition = @($durable.transitions | Where-Object { $_.state -ceq 'corpusStaging' })
+    Assert-Coordinator ($stagingTransition.Count -eq 1 -and $stagingTransition[0].evidence.staged -eq $false) `
+        'A request without a corpusStage section did not record that it staged nothing.'
+    Assert-Coordinator (-not (Test-Path -LiteralPath (Join-Path $fixture.OutputRoot 'coordinator\corpus-stage.journal.json'))) `
+        'A request that builds no corpus opened a staging journal.'
 
     # A completed preparation replayed is a no-op, including the child that
     # cannot be run twice: a second declaration into the same qualification root
@@ -659,11 +670,11 @@ try {
     $replay = Invoke-Coordinator -RequestPath $fixture.RequestPath
     Assert-Coordinator ($replay.ExitCode -eq 0) 'Replaying a completed preparation failed.'
     $afterReplay = Get-CoordinatorState -OutputRoot $fixture.OutputRoot
-    Assert-Coordinator ([int]$afterReplay.sequence -eq 9) `
+    Assert-Coordinator ([int]$afterReplay.sequence -eq 11) `
         "Replaying a completed preparation advanced the sequence to $($afterReplay.sequence)."
 
     # -----------------------------------------------------------------------
-    Write-Host '5/21 audit indexes all twelve stage artifacts' -ForegroundColor Cyan
+    Write-Host '5/23 audit indexes all twelve stage artifacts' -ForegroundColor Cyan
     $auditPath = Join-Path $fixture.OutputRoot 'coordinator\audit.json'
     Assert-Coordinator (Test-Path -LiteralPath $auditPath -PathType Leaf) 'The coordinator wrote no audit.'
     $audit = Get-Content -LiteralPath $auditPath -Raw | ConvertFrom-Json -Depth 32
@@ -689,7 +700,7 @@ try {
         'The preparation observed a slot attempt.'
 
     # -----------------------------------------------------------------------
-    Write-Host '6/21 stage publication parity with the PowerShell path' -ForegroundColor Cyan
+    Write-Host '6/23 stage publication parity with the PowerShell path' -ForegroundColor Cyan
     # The same stage publication, driven directly through the existing PowerShell
     # entry point instead of through the coordinator's child process. Byte
     # identical artifacts are what makes the rollback switch real at THIS seam:
@@ -730,7 +741,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    Write-Host '7/21 request boundary: unknown, missing, scalar, null, BOM, truncated' -ForegroundColor Cyan
+    Write-Host '7/23 request boundary: unknown, missing, scalar, null, BOM, truncated' -ForegroundColor Cyan
     # Built through a list rather than an @(...) literal: the mutators set fields
     # to $null on purpose, and inside an array expression that reads as an array
     # that can carry a null element. It cannot -- the nulls are inside script
@@ -778,7 +789,7 @@ try {
         'A missing request file was not refused.'
 
     # -----------------------------------------------------------------------
-    Write-Host '8/21 stale head, stale identity and tampered state' -ForegroundColor Cyan
+    Write-Host '8/23 stale head, stale identity and tampered state' -ForegroundColor Cyan
     $staleHeadPath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'stale-head' -Mutate {
         param($r)
         $r.toolkit.head = ('f' * 40)
@@ -837,7 +848,7 @@ try {
         "A state file from another correlation was adopted (exit $($foreign.ExitCode))."
 
     # -----------------------------------------------------------------------
-    Write-Host '9/21 single-run lease' -ForegroundColor Cyan
+    Write-Host '9/23 single-run lease' -ForegroundColor Cyan
     $leaseRoot = Join-Path $sandbox 'out-lease'
     $leasePath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'lease' -Mutate {
         param($r) & $setOutputRoot -Request $r -Root $leaseRoot
@@ -872,7 +883,7 @@ try {
         "An abandoned lease wedged the output root (exit $($recovered.ExitCode))."
 
     # -----------------------------------------------------------------------
-    Write-Host '10/21 child fault matrix' -ForegroundColor Cyan
+    Write-Host '10/23 child fault matrix' -ForegroundColor Cyan
     $faults = @(
         @{ Name = 'nonzero'; Expect = 4 },
         @{ Name = 'missing'; Expect = 4 },
@@ -940,7 +951,7 @@ try {
     Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot
 
     # -----------------------------------------------------------------------
-    Write-Host '11/21 killed mid-transition' -ForegroundColor Cyan
+    Write-Host '11/23 killed mid-transition' -ForegroundColor Cyan
     # A real external kill, not a cooperative halt: the coordinator is stopped
     # while a child is running, and the root must still converge.
     $killRoot = Join-Path $sandbox 'out-kill'
@@ -966,7 +977,7 @@ try {
     Assert-Coordinator ($resumed.ExitCode -eq 0) `
         "A killed preparation did not resume to run-set-ready (exit $($resumed.ExitCode)): $($resumed.Output)"
     $resumedState = Get-CoordinatorState -OutputRoot $killRoot
-    Assert-Coordinator ($resumedState.state -ceq 'runSetReady' -and [int]$resumedState.sequence -eq 9) `
+    Assert-Coordinator ($resumedState.state -ceq 'runSetReady' -and [int]$resumedState.sequence -eq 11) `
         "The resumed preparation ended at '$($resumedState.state)' sequence $($resumedState.sequence)."
     $killAudit = Get-Content -LiteralPath (Join-Path $killRoot 'coordinator\audit.json') -Raw | ConvertFrom-Json -Depth 32
     Assert-Coordinator ([int]$killAudit.stages.runSetReady.slotAttemptCount -eq 0) `
@@ -977,7 +988,7 @@ try {
         "The resumed preparation left $($declared.Count) declared run sets rather than one."
 
     # -----------------------------------------------------------------------
-    Write-Host '12/21 pre-commit window: a published side effect is adopted' -ForegroundColor Cyan
+    Write-Host '12/23 pre-commit window: a published side effect is adopted' -ForegroundColor Cyan
     # The fault a control plane cannot test its way out of by halting: a child
     # completes a durable, NON-REPEATABLE side effect and the coordinator dies
     # before it can commit the transition. Every --halt-after case above stops
@@ -1177,7 +1188,7 @@ try {
     Assert-Coordinator (@(Get-ChildItem -LiteralPath $stageDirectory -File -Filter '*.stage.json').Count -eq 12) `
         'The retry accumulated stage artifacts instead of replacing them.'
     # -----------------------------------------------------------------------
-    Write-Host '13/21 resume integrity and the declared artifact directory' -ForegroundColor Cyan
+    Write-Host '13/23 resume integrity and the declared artifact directory' -ForegroundColor Cyan
     # A resumed run re-reads its child results from the exchange directory, which
     # carries no signature of its own. Without binding them to the digest the
     # signed record committed, a resume could adopt a snapshot or run set other
@@ -1249,7 +1260,7 @@ try {
         'A missing option value escaped as an unhandled exception.'
 
     # -----------------------------------------------------------------------
-    Write-Host '14/21 changed-path census boundary' -ForegroundColor Cyan
+    Write-Host '14/23 changed-path census boundary' -ForegroundColor Cyan
     # The census is declared by the caller and validated here, never synthesised.
     # Zero, one, many, duplicated, misordered, scalar, null and unknown all have
     # to have an answer, because the census reaches the published bytes.
@@ -1288,7 +1299,7 @@ try {
         'A missing changed-path census was not refused.'
 
     # -----------------------------------------------------------------------
-    Write-Host '15/21 a declaration must belong to this preparation' -ForegroundColor Cyan
+    Write-Host '15/23 a declaration must belong to this preparation' -ForegroundColor Cyan
     # A signature proves a declaration was made under this output root's key. It
     # does NOT prove the declaration is about the snapshot this run sealed - one
     # key signs every declaration in a root, so a declaration left behind by an
@@ -1424,7 +1435,7 @@ try {
         "The refusal did not name the plan the declaration was sealed under.`n$borrowReason"
 
     # -----------------------------------------------------------------------
-    Write-Host '16/21 the audit says only what the record can support' -ForegroundColor Cyan
+    Write-Host '16/23 the audit says only what the record can support' -ForegroundColor Cyan
     # An audit whose counters come from this process cannot see work an earlier
     # process did, and a null count coerces to the reassuring zero in every
     # consumer that reads it. Both are properties of the durable record here.
@@ -1459,7 +1470,7 @@ try {
         'The resumed audit did not grow its child-backed transition census.'
 
     # -----------------------------------------------------------------------
-    Write-Host '17/21 a root that has done nothing is not wedged' -ForegroundColor Cyan
+    Write-Host '17/23 a root that has done nothing is not wedged' -ForegroundColor Cyan
     # The refusal that protects a destroyed record must not be reachable by a
     # first attempt that simply failed. A run refused at requestValidated has
     # published nothing, so the same root with a corrected request has to work -
@@ -1601,7 +1612,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    Write-Host '18/21 slot authorization against the real qualification plan' -ForegroundColor Cyan
+    Write-Host '18/23 slot authorization against the real qualification plan' -ForegroundColor Cyan
     # The one slot scenario that stands NOTHING in. The plan is built by the
     # production builder, bound to the signed declaration by the production
     # assertions, and the launch token is the one the declaration published. It
@@ -1669,7 +1680,7 @@ try {
     Assert-Coordinator ($authorized.ExitCode -eq 0) `
         "Authorizing a launch against the real plan failed (exit $($authorized.ExitCode)).`n$($authorized.Output)"
     $authState = Get-CoordinatorState -OutputRoot $authRoot
-    Assert-Coordinator ($authState.state -ceq 'slot1Authorized' -and [int]$authState.sequence -eq 10) `
+    Assert-Coordinator ($authState.state -ceq 'slot1Authorized' -and [int]$authState.sequence -eq 12) `
         "The durable state is '$($authState.state)' at sequence $($authState.sequence)."
     $authEvidence = @($authState.transitions | Where-Object { $_.state -ceq 'slot1Authorized' })[0].evidence
     Assert-Coordinator ([string]$authEvidence.planDigest -cmatch '^[0-9a-f]{64}$') `
@@ -1691,7 +1702,7 @@ try {
         'Authorizing a launch created a run directory.'
 
     # -----------------------------------------------------------------------
-    Write-Host '19/21 one supervised slot, halted and resumed at every slot state' -ForegroundColor Cyan
+    Write-Host '19/23 one supervised slot, halted and resumed at every slot state' -ForegroundColor Cyan
     $slotStates = @('slot1Authorized', 'slot1Launching', 'slot1Running', 'slot1TerminalObserved')
     $lifecycleRoot = Join-Path $sandbox 'slot-lifecycle'
     $lifecyclePath = New-CoordinatorRequestVariant -BasePath $fixture.RequestPath -Name 'slot-lifecycle' `
@@ -1704,7 +1715,7 @@ try {
         -OutputRoot $lifecycleRoot -Label 'slot-lifecycle'
     New-SlotStubAdapter -ToolkitCopy $fixture.ToolkitCopy -RealAdapter $realAdapter -Mode 'complete'
     try {
-        $expectedSequence = 9
+        $expectedSequence = 11
         foreach ($state in $slotStates) {
             $expectedSequence++
             $halted = Invoke-Coordinator -RequestPath $lifecyclePath -HaltAfter $state -Target 'slot1TerminalVerified'
@@ -1753,10 +1764,10 @@ try {
         Assert-Coordinator ($verified.ExitCode -eq 0) `
             "The supervised slot did not reach a verified terminal (exit $($verified.ExitCode)).`n$($verified.Output)"
         $finalState = Get-CoordinatorState -OutputRoot $lifecycleRoot
-        Assert-Coordinator ($finalState.state -ceq 'slot1TerminalVerified' -and [int]$finalState.sequence -eq 14) `
+        Assert-Coordinator ($finalState.state -ceq 'slot1TerminalVerified' -and [int]$finalState.sequence -eq 16) `
             "The durable state is '$($finalState.state)' at sequence $($finalState.sequence)."
-        Assert-Coordinator (@($finalState.transitions).Count -eq 14) `
-            "The state records $(@($finalState.transitions).Count) transitions rather than fourteen."
+        Assert-Coordinator (@($finalState.transitions).Count -eq 16) `
+            "The state records $(@($finalState.transitions).Count) transitions rather than sixteen."
 
         $slotAudit = Get-Content -LiteralPath (Join-Path $lifecycleRoot 'coordinator\audit.json') -Raw |
             ConvertFrom-Json -Depth 32
@@ -1779,7 +1790,7 @@ try {
         # Replaying a finished lifecycle is a no-op, including its single launch.
         $slotReplay = Invoke-Coordinator -RequestPath $lifecyclePath -Target 'slot1TerminalVerified'
         Assert-Coordinator ($slotReplay.ExitCode -eq 0) 'Replaying a completed slot lifecycle failed.'
-        Assert-Coordinator ([int](Get-CoordinatorState -OutputRoot $lifecycleRoot).sequence -eq 14) `
+        Assert-Coordinator ([int](Get-CoordinatorState -OutputRoot $lifecycleRoot).sequence -eq 16) `
             'Replaying a completed slot lifecycle advanced the sequence.'
         $replayAttempts = @(Get-ChildItem -LiteralPath (Join-Path $lifecycleRoot 'qualification\stub') `
                 -Filter 'slot*-attempt.json' -File)
@@ -1874,7 +1885,7 @@ try {
     finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
 
     # -----------------------------------------------------------------------
-    Write-Host '20/21 slot terminal endings and the slot fault matrix' -ForegroundColor Cyan
+    Write-Host '20/23 slot terminal endings and the slot fault matrix' -ForegroundColor Cyan
     # Every case gets its own output root, because a slot's launch authorization
     # is single-use and a root that has spent it can never be reused.
     $slotCases = @(
@@ -1988,7 +1999,507 @@ try {
     finally { Restore-ChildAdapter -ToolkitCopy $fixture.ToolkitCopy -RepoRoot $RepoRoot }
 
     # -----------------------------------------------------------------------
-    Write-Host '21/21 no orphans, no external writes' -ForegroundColor Cyan
+    Write-Host '21/23 typed corpus staging from an immutable source' -ForegroundColor Cyan
+    # A SECOND sandbox, whose corpus is built as a read-only source and whose
+    # request names a corpus root that does not exist. This is the condition the
+    # preparation this slice replaces died on, made ordinary.
+    $stageFixture = New-ShadowCoordinatorFixture -Sandbox (Join-Path $sandbox 'stage-fixture') `
+        -ToolkitRoot $RepoRoot -StageCorpus
+    $stageSourceRoot = [string]$stageFixture.SourceCorpusRoot
+    $stageDestinationRoot = [string]$stageFixture.CorpusRoot
+    $stageParent = Split-Path $stageDestinationRoot -Parent
+
+    $sourceFiles = @([IO.Directory]::EnumerateFiles($stageSourceRoot, '*', [IO.SearchOption]::AllDirectories))
+    $writableSources = @($sourceFiles | Where-Object { -not (Get-Item -LiteralPath $_ -Force).IsReadOnly })
+    Assert-Coordinator ($writableSources.Count -eq 0) `
+        "$($writableSources.Count) source corpus file(s) are writable; the source is supposed to be immutable."
+    Assert-Coordinator (-not (Test-Path -LiteralPath $stageDestinationRoot)) `
+        'The staged corpus root existed before the coordinator built it.'
+    $sourceIndexBefore = (Get-FileHash -LiteralPath (Join-Path $stageSourceRoot 'corpus-index.json') `
+            -Algorithm SHA256).Hash.ToLowerInvariant()
+
+    # Halt after staging: the corpus exists in a scratch directory and nowhere a
+    # reader would look. Nothing has been published.
+    $halted = Invoke-Coordinator -RequestPath $stageFixture.RequestPath -HaltAfter 'corpusStaging'
+    Assert-Coordinator ($halted.ExitCode -eq 9) `
+        "Halting after staging exited $($halted.ExitCode).`n$($halted.Output)"
+    Assert-Coordinator (-not (Test-Path -LiteralPath $stageDestinationRoot)) `
+        'The coordinator published a corpus before reaching the publish transition.'
+    $stagedDirs = @(Get-ChildItem -LiteralPath $stageParent -Directory -Force |
+            Where-Object { $_.Name -like '.corpus-staging-*' })
+    Assert-Coordinator ($stagedDirs.Count -eq 1) `
+        "The halted staging left $($stagedDirs.Count) staging directories rather than one."
+    $journalPath = Join-Path $stageFixture.OutputRoot 'coordinator\corpus-stage.journal.json'
+    Assert-Coordinator (Test-Path -LiteralPath $journalPath -PathType Leaf) `
+        'The staging wrote no journal naming the directory it owns.'
+    if ($stagedDirs.Count -eq 1) {
+        # The witness is written FIRST, so a staging directory that exists at all
+        # already says which subject it is for. The old path wrote it last, by
+        # overwriting an inherited one, and inherited whatever it had copied.
+        Assert-Coordinator (Test-Path -LiteralPath (Join-Path $stagedDirs[0].FullName 'identity.json') -PathType Leaf) `
+            'The halted staging directory carries no identity witness.'
+        # The index is generated last, from the declaration, and the halt is after
+        # the whole staging rank - so it is here, and it is already the exact
+        # bytes the declaration bound, before anything was published.
+        $haltedIndex = Join-Path $stagedDirs[0].FullName 'corpus-index.json'
+        Assert-Coordinator (Test-Path -LiteralPath $haltedIndex -PathType Leaf) `
+            'The halted staging directory carries no generated corpus index.'
+        Assert-Coordinator ((Get-FileHash -LiteralPath $haltedIndex -Algorithm SHA256).Hash.ToLowerInvariant() `
+                -ceq [string]$stageFixture.CorpusIndexSha256) `
+            'The staged index does not digest to what the declaration bound.'
+    }
+
+    # Resume: publish, finalize read-only, and carry on to a signed run set.
+    $stageRun = Invoke-Coordinator -RequestPath $stageFixture.RequestPath
+    Assert-Coordinator ($stageRun.ExitCode -eq 0) `
+        "The staged preparation did not reach run-set-ready (exit $($stageRun.ExitCode)).`n$($stageRun.Output)"
+    $stageState = Get-CoordinatorState -OutputRoot $stageFixture.OutputRoot
+    Assert-Coordinator ($stageState.state -ceq 'runSetReady' -and [int]$stageState.sequence -eq 11) `
+        "The staged preparation stands at '$($stageState.state)' at sequence $($stageState.sequence)."
+
+    $stagedIndexPath = Join-Path $stageDestinationRoot 'corpus-index.json'
+    $stagedIndexSha = (Get-FileHash -LiteralPath $stagedIndexPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    # The typed stager generated this index from the declaration alone; the
+    # fixture derived the same digest through the toolkit's PowerShell
+    # canonicalizer. Byte agreement across the two implementations is the whole
+    # parity claim, and it is asserted rather than assumed.
+    Assert-Coordinator ($stagedIndexSha -ceq [string]$stageFixture.CorpusIndexSha256) `
+        "The staged corpus index digests to $stagedIndexSha and the declaration bound $($stageFixture.CorpusIndexSha256)."
+
+    $publishedFiles = @([IO.Directory]::EnumerateFiles($stageDestinationRoot, '*', [IO.SearchOption]::AllDirectories))
+    Assert-Coordinator ($publishedFiles.Count -eq ([int]$stageFixture.StagePayloadCount + 1)) `
+        "The published corpus holds $($publishedFiles.Count) files rather than $([int]$stageFixture.StagePayloadCount + 1)."
+    $writablePublished = @($publishedFiles | Where-Object { -not (Get-Item -LiteralPath $_ -Force).IsReadOnly })
+    Assert-Coordinator ($writablePublished.Count -eq 0) `
+        "$($writablePublished.Count) published corpus file(s) are writable after finalization."
+
+    # The binary payload is copied, not decoded. It opens with the byte order
+    # mark sequence and carries bytes no UTF-8 reader accepts, so any round trip
+    # through a string would change it.
+    $stagedBlob = [IO.File]::ReadAllBytes((Join-Path $stageDestinationRoot 'capture\transport-blob.bin'))
+    $sourceBlob = [IO.File]::ReadAllBytes((Join-Path $stageSourceRoot 'capture\transport-blob.bin'))
+    Assert-Coordinator ([Convert]::ToHexString($stagedBlob) -ceq [Convert]::ToHexString($sourceBlob)) `
+        'The staged binary payload is not byte-identical to its source.'
+
+    Assert-Coordinator (-not (Test-Path -LiteralPath $journalPath)) `
+        'The staging journal survived a completed publication.'
+    $residue = @(Get-ChildItem -LiteralPath $stageParent -Directory -Force |
+            Where-Object { $_.Name -like '.corpus-staging-*' })
+    Assert-Coordinator ($residue.Count -eq 0) `
+        "A completed publication left $($residue.Count) staging director(ies) behind."
+    $stageResultPath = Join-Path $stageFixture.OutputRoot 'coordinator\corpus-stage.result.json'
+    Assert-Coordinator (Test-Path -LiteralPath $stageResultPath -PathType Leaf) `
+        'The publication wrote no stage result.'
+    $stageResult = Get-Content -LiteralPath $stageResultPath -Raw | ConvertFrom-Json -Depth 16
+    Assert-Coordinator ($stageResult.contractVersion -ceq 'devpilot.shadow-run-coordinator.corpus-stage-result.v1') `
+        "The stage result declares '$($stageResult.contractVersion)'."
+    Assert-Coordinator ([int]$stageResult.payloadCount -eq [int]$stageFixture.StagePayloadCount) `
+        "The stage result reports $($stageResult.payloadCount) payloads rather than $($stageFixture.StagePayloadCount)."
+
+    # The source was only ever read.
+    $sourceIndexAfter = (Get-FileHash -LiteralPath (Join-Path $stageSourceRoot 'corpus-index.json') `
+            -Algorithm SHA256).Hash.ToLowerInvariant()
+    Assert-Coordinator ($sourceIndexAfter -ceq $sourceIndexBefore) `
+        'The source corpus changed while it was being staged from.'
+    $sourceAfter = @([IO.Directory]::EnumerateFiles($stageSourceRoot, '*', [IO.SearchOption]::AllDirectories))
+    Assert-Coordinator ($sourceAfter.Count -eq $sourceFiles.Count) `
+        "The source corpus holds $($sourceAfter.Count) files rather than the $($sourceFiles.Count) it started with."
+
+    # Replayed, a published corpus is neither rebuilt nor rewritten.
+    $stageReplay = Invoke-Coordinator -RequestPath $stageFixture.RequestPath
+    Assert-Coordinator ($stageReplay.ExitCode -eq 0) `
+        "Replaying a staged preparation failed.`n$($stageReplay.Output)"
+    Assert-Coordinator ((Get-FileHash -LiteralPath $stagedIndexPath -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $stagedIndexSha) `
+        'Replaying a staged preparation rewrote the published corpus.'
+
+    # -----------------------------------------------------------------------
+    Write-Host '22/23 corpus staging fault matrix' -ForegroundColor Cyan
+    $stageInputs = Split-Path ([string]$stageFixture.StageRequestPath) -Parent
+    $faultRoot = Join-Path $sandbox 'stage-faults'
+    [void](New-Item -ItemType Directory -Force -Path $faultRoot)
+
+    function New-CoordinatorStageVariant {
+        <#
+        .SYNOPSIS
+            Writes a coordinator request and the stage declaration it binds, with
+            one of the two mutated, into a fresh output root and a fresh corpus
+            destination.
+
+        .DESCRIPTION
+            The declaration's digest is recomputed and rebound, because the point
+            of every fault below is a declaration the coordinator ACCEPTS as
+            authentic and then refuses on its content. A variant that failed the
+            digest check would prove only that the digest check works.
+        #>
+        param(
+            [Parameter(Mandatory)][string]$BasePath,
+            [Parameter(Mandatory)][string]$Name,
+            [Parameter(Mandatory)][string]$Root,
+            [scriptblock]$MutateStage,
+            [scriptblock]$MutateRequest,
+            [string]$Destination = ''
+        )
+        $utf8 = [Text.UTF8Encoding]::new($false, $true)
+        $request = Get-Content -LiteralPath $BasePath -Raw | ConvertFrom-Json -Depth 32
+        $stage = Get-Content -LiteralPath ([string]$request.corpusStage.requestPath) -Raw | ConvertFrom-Json -Depth 32
+
+        $outputRoot = Join-Path $Root "$Name-output"
+        $corpusRoot = $(if ($Destination) { $Destination } else { Join-Path $Root "$Name-corpus" })
+        $request.output.root = $outputRoot
+        $request.corpus.root = $corpusRoot
+        $stage.target.outputRoot = $outputRoot
+        $stage.target.corpusRoot = $corpusRoot
+        if ($MutateStage) { & $MutateStage $stage }
+
+        $stagePath = Join-Path $Root "corpus-stage-$Name.json"
+        [IO.File]::WriteAllBytes($stagePath,
+            $utf8.GetBytes((ConvertTo-Json -InputObject $stage -Depth 32 -Compress:$false)))
+        $request.corpusStage.requestPath = $stagePath
+        $request.corpusStage.requestSha256 = (Get-FileHash -LiteralPath $stagePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($MutateRequest) { & $MutateRequest $request }
+
+        $path = Join-Path $Root "request-$Name.json"
+        [IO.File]::WriteAllBytes($path,
+            $utf8.GetBytes((ConvertTo-Json -InputObject $request -Depth 32 -Compress:$false)))
+        return [pscustomobject][ordered]@{
+            RequestPath = $path
+            StagePath = $stagePath
+            OutputRoot = $outputRoot
+            CorpusRoot = $corpusRoot
+        }
+    }
+
+    function Assert-StageRefusal {
+        <#
+        .SYNOPSIS
+            Runs one staging fault and holds it to the same three properties
+            every refusal must have: a contract exit, a refusal that names the
+            fault, and nothing published or left behind.
+        #>
+        param(
+            [Parameter(Mandatory)]$Variant,
+            [Parameter(Mandatory)][string]$Match,
+            [Parameter(Mandatory)][string]$Label
+        )
+        $run = Invoke-Coordinator -RequestPath $Variant.RequestPath -Target 'corpusValidated'
+        Assert-Coordinator ($run.ExitCode -eq 2) `
+            "The '$Label' staging fault exited $($run.ExitCode) rather than refusing.`n$($run.Output)"
+        Assert-Coordinator ($run.Output -match $Match) `
+            "The '$Label' refusal does not name the fault.`n$($run.Output)"
+        Assert-Coordinator (-not (Test-Path -LiteralPath $Variant.CorpusRoot)) `
+            "The '$Label' staging fault published a corpus anyway."
+        $parent = Split-Path $Variant.CorpusRoot -Parent
+        $left = @()
+        if (Test-Path -LiteralPath $parent -PathType Container) {
+            $left = @(Get-ChildItem -LiteralPath $parent -Directory -Force |
+                    Where-Object { $_.Name -like '.corpus-staging-*' })
+        }
+        Assert-Coordinator ($left.Count -eq 0) `
+            "The '$Label' staging fault left $($left.Count) staging director(ies) behind."
+        return $run
+    }
+
+    # A destination that already exists is never merged into, written over, or
+    # adopted. This is also the concurrency resolution: the loser of a race sees
+    # exactly this.
+    $collision = New-CoordinatorStageVariant -BasePath $stageFixture.RequestPath -Name 'collision' -Root $faultRoot
+    [void](New-Item -ItemType Directory -Force -Path $collision.CorpusRoot)
+    $collisionRun = Invoke-Coordinator -RequestPath $collision.RequestPath -Target 'corpusValidated'
+    Assert-Coordinator ($collisionRun.ExitCode -eq 2) `
+        "A destination collision exited $($collisionRun.ExitCode) rather than refusing.`n$($collisionRun.Output)"
+    Assert-Coordinator ($collisionRun.Output -match 'already exists') `
+        "The destination collision refusal does not name the collision.`n$($collisionRun.Output)"
+    Assert-Coordinator (@(Get-ChildItem -LiteralPath $collision.CorpusRoot -Force).Count -eq 0) `
+        'The refused staging wrote into the directory that was already there.'
+
+    # A source rewritten after the declaration was written. The digest is
+    # computed over the bytes that were actually read, so this cannot pass.
+    $mutated = New-CoordinatorStageVariant -BasePath $stageFixture.RequestPath -Name 'mutated-source' -Root $faultRoot `
+        -MutateStage {
+            param($s)
+            $copy = Join-Path $faultRoot 'mutated-alpha.txt'
+            [IO.File]::WriteAllBytes($copy, ([Text.UTF8Encoding]::new($false, $true)).GetBytes('not the declared bytes'))
+            foreach ($payload in $s.payloads) {
+                if ($payload.path -ceq 'files/alpha.txt') { $payload.sourcePath = $copy }
+            }
+        }.GetNewClosure()
+    [void](Assert-StageRefusal -Variant $mutated -Match 'files/alpha.txt' -Label 'source mutated after declaration')
+
+    # A byte order mark on a payload declared textual. Refused rather than
+    # stripped: stripping it would change a digest the declaration already bound.
+    $bomSource = Join-Path $faultRoot 'bom-alpha.txt'
+    $bomVariant = New-CoordinatorStageVariant -BasePath $stageFixture.RequestPath -Name 'bom-text' -Root $faultRoot `
+        -MutateStage {
+            param($s)
+            foreach ($payload in $s.payloads) {
+                if ($payload.path -cne 'files/alpha.txt') { continue }
+                $original = [IO.File]::ReadAllBytes([string]$payload.sourcePath)
+                $bytes = [byte[]]@(0xEF, 0xBB, 0xBF) + $original
+                [IO.File]::WriteAllBytes($bomSource, $bytes)
+                $payload.sourcePath = $bomSource
+                $payload.length = $bytes.Length
+                $payload.sha256 = [Convert]::ToHexString(
+                    [Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+            }
+        }.GetNewClosure()
+    [void](Assert-StageRefusal -Variant $bomVariant -Match 'byte order mark' -Label 'byte order mark in a textual payload')
+
+    # Bytes that are not UTF-8 at all, declared textual. The same bytes declared
+    # binary are staged without complaint, which the published corpus above
+    # already proved.
+    $badUtf8Source = Join-Path $faultRoot 'invalid-utf8.txt'
+    $badUtf8 = New-CoordinatorStageVariant -BasePath $stageFixture.RequestPath -Name 'invalid-utf8' -Root $faultRoot `
+        -MutateStage {
+            param($s)
+            $bytes = [byte[]]@(0x68, 0x69, 0xFF, 0xFE, 0x80, 0x0A)
+            [IO.File]::WriteAllBytes($badUtf8Source, $bytes)
+            foreach ($payload in $s.payloads) {
+                if ($payload.path -cne 'files/alpha.txt') { continue }
+                $payload.sourcePath = $badUtf8Source
+                $payload.length = $bytes.Length
+                $payload.sha256 = [Convert]::ToHexString(
+                    [Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+            }
+        }.GetNewClosure()
+    [void](Assert-StageRefusal -Variant $badUtf8 -Match 'not valid UTF-8' -Label 'invalid UTF-8 in a textual payload')
+
+    # Declaration-shape faults, refused before a single byte is read.
+    $shapeFaults = [Collections.Generic.List[hashtable]]::new()
+    [void]$shapeFaults.Add(@{
+            Name = 'missing-source'
+            Match = 'does not exist'
+            Mutate = { param($s) $s.payloads[0].sourcePath = (Join-Path $faultRoot 'no-such-source.json') }
+        })
+    [void]$shapeFaults.Add(@{
+            Name = 'duplicate-path'
+            Match = 'more than once'
+            Mutate = { param($s) $s.payloads[2].path = [string]$s.payloads[1].path }
+        })
+    [void]$shapeFaults.Add(@{
+            Name = 'traversal'
+            Match = 'segment'
+            Mutate = { param($s) $s.payloads[0].path = '../escaped.json' }
+        })
+    [void]$shapeFaults.Add(@{
+            Name = 'index-declared'
+            Match = 'corpus-index.json'
+            Mutate = { param($s) $s.payloads[0].path = 'corpus-index.json' }
+        })
+    [void]$shapeFaults.Add(@{
+            Name = 'unsorted'
+            Match = 'ascending ordinal'
+            Mutate = {
+                param($s)
+                $reordered = @($s.payloads[1], $s.payloads[0]) + @($s.payloads | Select-Object -Skip 2)
+                $s.payloads = $reordered
+            }
+        })
+    [void]$shapeFaults.Add(@{
+            Name = 'witness-alias'
+            Match = 'as its identity witness'
+            Mutate = { param($s) $s.identity.witnessPath = 'end-identity.json' }
+        })
+    [void]$shapeFaults.Add(@{
+            Name = 'wrong-subject'
+            Match = 'identity.pullRequestId'
+            Mutate = { param($s) $s.identity.pullRequestId = 424242 }
+        })
+    [void]$shapeFaults.Add(@{
+            Name = 'wrong-commit'
+            Match = 'identity.sourceCommit'
+            Mutate = { param($s) $s.identity.sourceCommit = ('9' * 40) }
+        })
+    [void]$shapeFaults.Add(@{
+            Name = 'foreign-correlation'
+            Match = 'correlationId'
+            Mutate = { param($s) $s.correlationId = 'shadow-someone-else' }
+        })
+    [void]$shapeFaults.Add(@{
+            Name = 'wrong-index-digest'
+            Match = 'indexSha256'
+            Mutate = { param($s) $s.target.indexSha256 = ('0' * 64) }
+        })
+    [void]$shapeFaults.Add(@{
+            Name = 'relabelled-kind'
+            Match = 'corpusKind'
+            Mutate = { param($s) $s.corpusKind = 'private-non-promotable-research-corpus' }
+        })
+    foreach ($fault in $shapeFaults) {
+        $variant = New-CoordinatorStageVariant -BasePath $stageFixture.RequestPath -Name $fault.Name `
+            -Root $faultRoot -MutateStage $fault.Mutate
+        [void](Assert-StageRefusal -Variant $variant -Match $fault.Match -Label $fault.Name)
+    }
+
+    # A declaration whose bytes changed after the request bound their digest.
+    $rebound = New-CoordinatorStageVariant -BasePath $stageFixture.RequestPath -Name 'rebound' -Root $faultRoot
+    [IO.File]::AppendAllText($rebound.StagePath, ' ')
+    $reboundRun = Invoke-Coordinator -RequestPath $rebound.RequestPath -Target 'corpusValidated'
+    Assert-Coordinator ($reboundRun.ExitCode -eq 2) `
+        "An edited stage declaration exited $($reboundRun.ExitCode) rather than refusing.`n$($reboundRun.Output)"
+    Assert-Coordinator ($reboundRun.Output -match 'corpus stage request') `
+        "The edited-declaration refusal does not name the declaration.`n$($reboundRun.Output)"
+
+    # A source that cannot be read at the moment it is needed: a real IO failure
+    # part way through a staging, rather than a simulated one.
+    $locked = New-CoordinatorStageVariant -BasePath $stageFixture.RequestPath -Name 'locked-source' -Root $faultRoot
+    $lockTarget = Join-Path $stageSourceRoot 'policy\source-v1.json'
+    $lockStream = [IO.File]::Open($lockTarget, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+    try {
+        $lockedRun = Invoke-Coordinator -RequestPath $locked.RequestPath -Target 'corpusValidated'
+        Assert-Coordinator ($lockedRun.ExitCode -ne 0) `
+            'A staging whose source could not be read reported success.'
+        Assert-Coordinator (-not (Test-Path -LiteralPath $locked.CorpusRoot)) `
+            'A staging whose source could not be read published a corpus anyway.'
+        $lockedResidue = @(Get-ChildItem -LiteralPath $faultRoot -Directory -Force |
+                Where-Object { $_.Name -like '.corpus-staging-*' })
+        Assert-Coordinator ($lockedResidue.Count -eq 0) `
+            "A failed staging left $($lockedResidue.Count) staging director(ies) behind."
+    }
+    finally { $lockStream.Dispose() }
+    # The same request succeeds once the source is readable again, which proves
+    # the failure above cleaned up after itself rather than wedging the root.
+    $recovered = Invoke-Coordinator -RequestPath $locked.RequestPath -Target 'corpusValidated'
+    Assert-Coordinator ($recovered.ExitCode -eq 0) `
+        "The retried staging failed (exit $($recovered.ExitCode)).`n$($recovered.Output)"
+    Assert-Coordinator ((Get-FileHash -LiteralPath (Join-Path $locked.CorpusRoot 'corpus-index.json') `
+                -Algorithm SHA256).Hash.ToLowerInvariant() -ceq [string]$stageFixture.CorpusIndexSha256) `
+        'The retried staging published a corpus with a different index.'
+
+    # A staging directory destroyed while its owner was dead. The journal says
+    # the run owns it, so a resumed run rebuilds rather than refusing forever.
+    $restart = New-CoordinatorStageVariant -BasePath $stageFixture.RequestPath -Name 'restart' -Root $faultRoot
+    Assert-Coordinator ((Invoke-Coordinator -RequestPath $restart.RequestPath -HaltAfter 'corpusStaging').ExitCode -eq 9) `
+        'The restart setup did not halt after staging.'
+    $owned = @(Get-ChildItem -LiteralPath $faultRoot -Directory -Force |
+            Where-Object { $_.Name -like '.corpus-staging-*' })
+    Assert-Coordinator ($owned.Count -eq 1) `
+        "The halted staging left $($owned.Count) staging directories rather than one."
+    # The record still stands at corpusStaging, so the resume must find the
+    # directory it committed. Removing it is a genuine loss, and the refusal says
+    # so instead of quietly staging a second one.
+    foreach ($directory in $owned) { Remove-Item -Recurse -Force -LiteralPath $directory.FullName }
+    $lostRun = Invoke-Coordinator -RequestPath $restart.RequestPath -Target 'corpusValidated'
+    Assert-Coordinator ($lostRun.ExitCode -eq 2) `
+        "A resume whose staging directory was destroyed exited $($lostRun.ExitCode).`n$($lostRun.Output)"
+    Assert-Coordinator ($lostRun.Output -match 'no longer holds a corpus index|is gone') `
+        "The lost-staging refusal does not say what was lost.`n$($lostRun.Output)"
+
+    # A destination that appears after staging was committed. The publish is a
+    # different transition from the check, and often a different process, so the
+    # window is real. Both refusals must take this run's own staging copy with
+    # them: a run that has proven it will never publish has no claim on it, and
+    # leaving it behind wedges the root forever because every later resume
+    # re-enters the same refusal.
+    $occupiedCases = [Collections.Generic.List[hashtable]]::new()
+    [void]$occupiedCases.Add(@{ Name = 'occupied-no-index'; Index = ''; Match = 'holds no corpus-index.json' })
+    [void]$occupiedCases.Add(@{ Name = 'occupied-other-corpus'; Index = '{"kind":"not-ours"}'; Match = 'already holds a corpus' })
+    foreach ($occupied in $occupiedCases) {
+        $variant = New-CoordinatorStageVariant -BasePath $stageFixture.RequestPath -Name $occupied.Name -Root $faultRoot
+        Assert-Coordinator ((Invoke-Coordinator -RequestPath $variant.RequestPath -HaltAfter 'corpusStaging').ExitCode -eq 9) `
+            "The $($occupied.Name) setup did not halt after staging."
+        [void](New-Item -ItemType Directory -Force -Path $variant.CorpusRoot)
+        if ([string]$occupied.Index -ne '') {
+            [IO.File]::WriteAllBytes((Join-Path $variant.CorpusRoot 'corpus-index.json'),
+                ([Text.UTF8Encoding]::new($false, $true)).GetBytes([string]$occupied.Index))
+        }
+        else {
+            [void](New-Item -ItemType Directory -Force -Path (Join-Path $variant.CorpusRoot 'squatter'))
+        }
+        $blocked = Invoke-Coordinator -RequestPath $variant.RequestPath -Target 'corpusValidated'
+        Assert-Coordinator ($blocked.ExitCode -eq 2) `
+            "The $($occupied.Name) publish exited $($blocked.ExitCode) rather than refusing.`n$($blocked.Output)"
+        Assert-Coordinator ($blocked.Output -match [regex]::Escape($occupied.Match)) `
+            "The $($occupied.Name) refusal does not name what it found.`n$($blocked.Output)"
+        $left = @(Get-ChildItem -LiteralPath $faultRoot -Directory -Force |
+                Where-Object { $_.Name -like '.corpus-staging-*' })
+        Assert-Coordinator ($left.Count -eq 0) `
+            "The $($occupied.Name) refusal left $($left.Count) staging directories behind."
+        Assert-Coordinator (-not (Test-Path -LiteralPath (Join-Path (Join-Path $variant.OutputRoot 'coordinator') 'corpus-stage.journal.json'))) `
+            "The $($occupied.Name) refusal left its staging journal behind."
+    }
+
+    # A journal opened by somebody else is not this run's to clean up.
+    $foreignJournal = New-CoordinatorStageVariant -BasePath $stageFixture.RequestPath -Name 'foreign-journal' -Root $faultRoot
+    $foreignCoordinatorRoot = Join-Path $foreignJournal.OutputRoot 'coordinator'
+    [void](New-Item -ItemType Directory -Force -Path $foreignCoordinatorRoot)
+    $foreignDirectory = Join-Path $faultRoot 'not-ours'
+    [void](New-Item -ItemType Directory -Force -Path $foreignDirectory)
+    $foreignBody = [ordered]@{
+        contractVersion = 'devpilot.shadow-run-coordinator.corpus-stage-journal.v1'
+        kind = 'shadow-run-corpus-stage-journal'
+        correlationId = 'shadow-another-run'
+        requestSha256 = ('1' * 64)
+        stageRequestSha256 = ('2' * 64)
+        stagingDirectory = $foreignDirectory
+        corpusRoot = $foreignJournal.CorpusRoot
+        openedAtUtc = '20260101T000000Z'
+    }
+    [IO.File]::WriteAllBytes((Join-Path $foreignCoordinatorRoot 'corpus-stage.journal.json'),
+        ([Text.UTF8Encoding]::new($false, $true)).GetBytes(
+            (ConvertTo-Json -InputObject $foreignBody -Depth 8 -Compress:$false)))
+    $foreignRun = Invoke-Coordinator -RequestPath $foreignJournal.RequestPath -Target 'corpusValidated'
+    Assert-Coordinator ($foreignRun.ExitCode -eq 2) `
+        "A foreign staging journal exited $($foreignRun.ExitCode) rather than refusing.`n$($foreignRun.Output)"
+    Assert-Coordinator (Test-Path -LiteralPath $foreignDirectory -PathType Container) `
+        'The refusal deleted a staging directory another run claimed.'
+
+    # A destination whose parent redirects somewhere else. A corpus published
+    # through a reparse point is a corpus at a path nobody declared.
+    $junctionParent = Join-Path $faultRoot 'junction-parent'
+    $junctionTarget = Join-Path $faultRoot 'junction-target'
+    [void](New-Item -ItemType Directory -Force -Path $junctionTarget)
+    $junctionMade = $true
+    try { [void](New-Item -ItemType Junction -Path $junctionParent -Target $junctionTarget -ErrorAction Stop) }
+    catch { $junctionMade = $false }
+    if ($junctionMade) {
+        $reparse = New-CoordinatorStageVariant -BasePath $stageFixture.RequestPath -Name 'reparse' -Root $faultRoot `
+            -Destination (Join-Path $junctionParent 'corpus')
+        $reparseRun = Invoke-Coordinator -RequestPath $reparse.RequestPath -Target 'corpusValidated'
+        Assert-Coordinator ($reparseRun.ExitCode -eq 2) `
+            "A reparse-point destination parent exited $($reparseRun.ExitCode).`n$($reparseRun.Output)"
+        Assert-Coordinator ($reparseRun.Output -match 'reparse point') `
+            "The reparse refusal does not name the reparse point.`n$($reparseRun.Output)"
+    }
+
+    # Two builders, one destination, started together. Exactly one may publish,
+    # and the other must refuse rather than merge, wait or overwrite.
+    $sharedDestination = Join-Path $faultRoot 'contested-corpus'
+    $left = New-CoordinatorStageVariant -BasePath $stageFixture.RequestPath -Name 'race-left' `
+        -Root $faultRoot -Destination $sharedDestination
+    $right = New-CoordinatorStageVariant -BasePath $stageFixture.RequestPath -Name 'race-right' `
+        -Root $faultRoot -Destination $sharedDestination
+    $racers = @(
+        (Start-Job -ScriptBlock {
+                param($dll, $request)
+                $out = & dotnet $dll --request $request --target 'corpusValidated' 2>&1 | Out-String
+                return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $out }
+            } -ArgumentList $script:CoordinatorDll, $left.RequestPath),
+        (Start-Job -ScriptBlock {
+                param($dll, $request)
+                $out = & dotnet $dll --request $request --target 'corpusValidated' 2>&1 | Out-String
+                return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $out }
+            } -ArgumentList $script:CoordinatorDll, $right.RequestPath)
+    )
+    $raceResults = @($racers | Wait-Job -Timeout 300 | Receive-Job)
+    $racers | Remove-Job -Force -ErrorAction SilentlyContinue
+    Assert-Coordinator ($raceResults.Count -eq 2) `
+        "The contested staging produced $($raceResults.Count) results rather than two."
+    # Exactly one builder may CREATE the published corpus. A builder that arrives
+    # to find the identical corpus already there is entitled to carry on, but it
+    # is not entitled to have published it, so the move itself is what is counted.
+    $movers = @($raceResults | Where-Object { $_.Output -match 'corpus-publish moved' })
+    Assert-Coordinator ($movers.Count -eq 1) `
+        "$($movers.Count) of two contesting builders published the same corpus."
+    Assert-Coordinator ((Get-FileHash -LiteralPath (Join-Path $sharedDestination 'corpus-index.json') `
+                -Algorithm SHA256).Hash.ToLowerInvariant() -ceq [string]$stageFixture.CorpusIndexSha256) `
+        'The contested corpus is not the corpus either builder declared.'
+    $raceResidue = @(Get-ChildItem -LiteralPath $faultRoot -Directory -Force |
+            Where-Object { $_.Name -like '.corpus-staging-*' })
+    Assert-Coordinator ($raceResidue.Count -eq 0) `
+        "The contested staging left $($raceResidue.Count) staging director(ies) behind."
+
+    # -----------------------------------------------------------------------
+    Write-Host '23/23 no orphans, no external writes' -ForegroundColor Cyan
     Start-Sleep -Seconds 2
     $orphans = Get-DescendantPwshCount -SandboxToken $sandboxToken
     Assert-Coordinator ($orphans -eq 0) "The suite left $orphans PowerShell process(es) running."

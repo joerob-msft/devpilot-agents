@@ -24,47 +24,56 @@ internal enum PreparationState
 {
     Start = 0,
     RequestValidated = 1,
-    CorpusValidated = 2,
-    RecipePlanned = 3,
-    SnapshotValidateOnly = 4,
-    SnapshotSealed = 5,
-    SnapshotVerified = 6,
-    RunSetDeclared = 7,
-    RunSetVerified = 8,
-    RunSetReady = 9,
-    Slot1Authorized = 10,
-    Slot1Launching = 11,
-    Slot1Running = 12,
-    Slot1TerminalObserved = 13,
-    Slot1TerminalVerified = 14,
-    Slot1TerminalFailed = 15,
-    Slot1TerminalTimedOut = 16
+    CorpusStaging = 2,
+    CorpusPublished = 3,
+    CorpusValidated = 4,
+    RecipePlanned = 5,
+    SnapshotValidateOnly = 6,
+    SnapshotSealed = 7,
+    SnapshotVerified = 8,
+    RunSetDeclared = 9,
+    RunSetVerified = 10,
+    RunSetReady = 11,
+    Slot1Authorized = 12,
+    Slot1Launching = 13,
+    Slot1Running = 14,
+    Slot1TerminalObserved = 15,
+    Slot1TerminalVerified = 16,
+    Slot1TerminalFailed = 17,
+    Slot1TerminalTimedOut = 18
 }
 
 internal static class PreparationStateNames
 {
     /// <summary>The rank every terminal outcome shares, and the last rank there is.</summary>
-    internal const int TerminalRank = 14;
+    internal const int TerminalRank = 16;
 
     /// <summary>The last rank the preparation slice reaches on its own.</summary>
-    internal const int PreparationRank = 9;
+    internal const int PreparationRank = 11;
 
     private static readonly (PreparationState State, string Name, int Rank)[] Pairs =
     [
         (PreparationState.Start, "start", 0),
         (PreparationState.RequestValidated, "requestValidated", 1),
-        (PreparationState.CorpusValidated, "corpusValidated", 2),
-        (PreparationState.RecipePlanned, "recipePlanned", 3),
-        (PreparationState.SnapshotValidateOnly, "snapshotValidateOnly", 4),
-        (PreparationState.SnapshotSealed, "snapshotSealed", 5),
-        (PreparationState.SnapshotVerified, "snapshotVerified", 6),
-        (PreparationState.RunSetDeclared, "runSetDeclared", 7),
-        (PreparationState.RunSetVerified, "runSetVerified", 8),
+        // Building the corpus comes before validating it, because a corpus that
+        // does not exist yet cannot be validated and a corpus that has been
+        // published must not be rebuilt. Two ranks rather than one: what is on
+        // disk after a kill differs completely either side of the publish, and a
+        // single rank could not say which side a resumed run is on.
+        (PreparationState.CorpusStaging, "corpusStaging", 2),
+        (PreparationState.CorpusPublished, "corpusPublished", 3),
+        (PreparationState.CorpusValidated, "corpusValidated", 4),
+        (PreparationState.RecipePlanned, "recipePlanned", 5),
+        (PreparationState.SnapshotValidateOnly, "snapshotValidateOnly", 6),
+        (PreparationState.SnapshotSealed, "snapshotSealed", 7),
+        (PreparationState.SnapshotVerified, "snapshotVerified", 8),
+        (PreparationState.RunSetDeclared, "runSetDeclared", 9),
+        (PreparationState.RunSetVerified, "runSetVerified", 10),
         (PreparationState.RunSetReady, "runSetReady", PreparationRank),
-        (PreparationState.Slot1Authorized, "slot1Authorized", 10),
-        (PreparationState.Slot1Launching, "slot1Launching", 11),
-        (PreparationState.Slot1Running, "slot1Running", 12),
-        (PreparationState.Slot1TerminalObserved, "slot1TerminalObserved", 13),
+        (PreparationState.Slot1Authorized, "slot1Authorized", 12),
+        (PreparationState.Slot1Launching, "slot1Launching", 13),
+        (PreparationState.Slot1Running, "slot1Running", 14),
+        (PreparationState.Slot1TerminalObserved, "slot1TerminalObserved", 15),
         (PreparationState.Slot1TerminalVerified, "slot1TerminalVerified", TerminalRank),
         (PreparationState.Slot1TerminalFailed, "slot1TerminalFailed", TerminalRank),
         (PreparationState.Slot1TerminalTimedOut, "slot1TerminalTimedOut", TerminalRank)
@@ -94,8 +103,8 @@ internal static class PreparationStateNames
 
     /// <summary>
     /// The ranks the machine walks, in order. Rank is what advances; which of the
-    /// three terminal states rank 14 commits is decided by observed evidence, not
-    /// by position in a list.
+    /// three terminal states the terminal rank commits is decided by observed
+    /// evidence, not by position in a list.
     /// </summary>
     internal static IReadOnlyList<int> Ranks =>
         Enumerable.Range(1, TerminalRank).ToList();
@@ -540,6 +549,13 @@ internal sealed class CoordinatorState
         if (File.Exists(request.AuditPath))
         {
             return "a published audit";
+        }
+        // Only when this run was the one authorized to build the corpus. When it
+        // was not, the corpus is a caller-supplied input that was there before the
+        // run started, and an input is not this root's side effect.
+        if (request.CorpusStagingRequested && Directory.Exists(request.CorpusRoot))
+        {
+            return "a published corpus";
         }
         if (HasAnyFile(request.ExchangeRoot))
         {

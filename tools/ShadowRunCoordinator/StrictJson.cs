@@ -66,7 +66,28 @@ internal static class StrictJson
             throw new ContractException($"The {label} file '{path}' is {info.Length} bytes, above the {maximumBytes} byte limit.");
         }
 
-        var bytes = File.ReadAllBytes(path);
+        return ReadObjectBytes(File.ReadAllBytes(path), path, label);
+    }
+
+    /// <summary>
+    /// Reads a JSON object out of bytes the caller already holds, applying every
+    /// rule <see cref="ReadObjectFile"/> applies.
+    /// </summary>
+    /// <remarks>
+    /// A caller that must both digest a contract file and obey it has to do both
+    /// to the same bytes. Reading the file twice - once to hash, once to parse -
+    /// leaves a window in which the bytes that were proven and the bytes that are
+    /// obeyed are not the same bytes, and a digest that attests to a file nobody
+    /// read is worse than no digest at all. So the bytes are read once and passed
+    /// in here.
+    /// </remarks>
+    internal static JsonElement ReadObjectBytes(byte[] bytes, string path, string label)
+    {
+        ArgumentNullException.ThrowIfNull(bytes);
+        if (bytes.Length == 0)
+        {
+            throw new ContractException($"The {label} file '{path}' is empty; a partial write must not read as an empty result.");
+        }
         if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
         {
             throw new ContractException($"The {label} file '{path}' starts with a UTF-8 byte order mark; the contract is UTF-8 without one.");

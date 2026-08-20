@@ -89,15 +89,33 @@ internal sealed record CoordinatorRequest
     /// carry one.
     /// </summary>
     /// <remarks>
-    /// The only optional section in this contract, and optional in one direction
-    /// only. Absent means the request authorizes no launch at all, which is the
-    /// PowerShell rollback posture and the state of every request written for the
-    /// preparation slice; it is not a field being defaulted, it is an
-    /// authorization that was never given. Present-and-disabled says the same
-    /// thing explicitly. Only a present section carrying an explicit true selects
-    /// the typed slot path.
+    /// Optional in one direction only. Absent means the request authorizes no
+    /// launch at all, which is the PowerShell rollback posture and the state of
+    /// every request written for the preparation slice; it is not a field being
+    /// defaulted, it is an authorization that was never given. Present-and-disabled
+    /// says the same thing explicitly. Only a present section carrying an explicit
+    /// true selects the typed slot path.
     /// </remarks>
     internal SlotAuthorization? Slot { get; init; }
+
+    /// <summary>
+    /// The authorization to build this run's corpus, or null when the caller
+    /// supplied a corpus that already exists.
+    /// </summary>
+    /// <remarks>
+    /// Optional in the same one direction as <see cref="Slot"/>. Absent means the
+    /// corpus at <see cref="CorpusRoot"/> was produced by something else - the
+    /// PowerShell fixture path, an operator, an earlier run - and this run only
+    /// validates it. That is the retained rollback default and it is what every
+    /// request written before this slice says.
+    ///
+    /// Present-and-enabled says the opposite: the corpus does not exist yet, this
+    /// run builds it from the declared immutable sources, and a corpus root that
+    /// already exists is a refusal rather than something to reuse. Getting those
+    /// two postures confused is the whole failure this section exists to prevent,
+    /// so neither is ever inferred from whether a directory happens to be there.
+    /// </remarks>
+    internal CorpusStageAuthorization? CorpusStage { get; init; }
 
     internal string CoordinatorRoot => Path.Combine(OutputRoot, "coordinator");
 
@@ -136,7 +154,8 @@ internal sealed record CoordinatorRequest
             "output",
             "children",
             "qualification",
-            "slot");
+            "slot",
+            "corpusStage");
 
         var contractVersion = StrictJson.RequireLiteral(root, "contractVersion", ContractVersionValue, label);
         var kind = StrictJson.RequireLiteral(root, "kind", KindValue, label);
@@ -192,6 +211,12 @@ internal sealed record CoordinatorRequest
             slot = SlotAuthorization.Read(slotNode, label + " slot");
         }
 
+        CorpusStageAuthorization? corpusStage = null;
+        if (root.TryGetProperty("corpusStage", out var corpusStageNode))
+        {
+            corpusStage = CorpusStageAuthorization.Read(corpusStageNode, label + " corpusStage");
+        }
+
         var bytes = File.ReadAllBytes(path);
         return new CoordinatorRequest
         {            ContractVersion = contractVersion,
@@ -225,7 +250,8 @@ internal sealed record CoordinatorRequest
             PlannedRunCount = StrictJson.RequireInt(qualification, "plannedRunCount", label + " qualification", 2, 16),
             RunSetKeyPath = StrictJson.RequireString(qualification, "runSetKeyPath", label + " qualification"),
             RequestSha256 = CanonicalJson.Sha256Hex(bytes),
-            Slot = slot
+            Slot = slot,
+            CorpusStage = corpusStage
         };
     }
 
@@ -289,6 +315,79 @@ internal sealed record CoordinatorRequest
         }
         return Slot;
     }
+
+    /// <summary>
+    /// Whether this run builds its own corpus. Absent and present-and-disabled
+    /// both mean no, and both are read the same way everywhere.
+    /// </summary>
+    internal bool CorpusStagingRequested => CorpusStage is { StagingEnabled: true };
+
+    /// <summary>
+    /// The corpus staging authorization this run holds, or a refusal naming why
+    /// it holds none.
+    /// </summary>
+    internal CorpusStageAuthorization RequireCorpusStaging()
+    {
+        if (CorpusStage is null)
+        {
+            throw new ContractException(
+                "This request carries no 'corpusStage' section, so it authorizes no corpus construction. " +
+                "The corpus named by 'corpus.root' is expected to exist already; add an explicit corpusStage " +
+                "section with 'stagingEnabled': true to have the typed control plane build it.");
+        }
+        if (!CorpusStage.StagingEnabled)
+        {
+            throw new ContractException(
+                "The request's corpusStage section sets 'stagingEnabled' to false, which is an explicit refusal to " +
+                "build a corpus. Nothing is staged and nothing is published.");
+        }
+        return CorpusStage;
+    }
+}
+
+/// <summary>
+/// The authorization to build exactly one corpus from declared immutable
+/// sources.
+/// </summary>
+/// <remarks>
+/// Deliberately thin. It says whether to stage, which declaration to stage from,
+/// and what that declaration's bytes must digest to - and nothing else. Every
+/// fact about what the corpus contains lives in the declaration file, where it
+/// is digested as a unit, so a caller cannot move one payload into the request
+/// and have it escape that digest.
+/// </remarks>
+internal sealed record CorpusStageAuthorization
+{
+    internal required bool StagingEnabled { get; init; }
+
+    /// <summary>The corpus stage declaration this run builds from.</summary>
+    internal required string RequestPath { get; init; }
+
+    /// <summary>
+    /// The declaration's exact bytes, bound here so that a resumed run cannot be
+    /// pointed at an edited declaration under the same path.
+    /// </summary>
+    internal required string RequestSha256 { get; init; }
+
+    internal static CorpusStageAuthorization Read(JsonElement node, string label)
+    {
+        if (node.ValueKind != JsonValueKind.Object)
+        {
+            throw new ContractException($"The {label} is a {StrictJson.Describe(node.ValueKind)}, not an object.");
+        }
+        StrictJson.RequireNoUnknownFields(node, label, "stagingEnabled", "requestPath", "requestSha256");
+        return new CorpusStageAuthorization
+        {
+            StagingEnabled = StrictJson.RequireBool(node, "stagingEnabled", label),
+            RequestPath = StrictJson.RequireString(node, "requestPath", label),
+            RequestSha256 = StrictJson.RequireHex(node, "requestSha256", label, 64)
+        };
+    }
+
+    internal MapNode Describe() => new MapNode()
+        .Set("stagingEnabled", StagingEnabled)
+        .Set("requestPath", RequestPath)
+        .Set("requestSha256", RequestSha256);
 }
 
 /// <summary>

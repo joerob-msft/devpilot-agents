@@ -121,9 +121,26 @@ function Get-ReviewerCorpusFixtureContent {
     $policyBytes = [System.IO.File]::ReadAllBytes($policyPath)
     $policyText = $script:CorpusFixtureUtf8.GetString($policyBytes)
 
+    # The capture the corpus was transported from. Present so the corpus can say
+    # which capture produced it without anyone having to infer that from the
+    # payloads, and required by the typed stager for the same reason: a corpus
+    # that cannot name its own capture is a corpus nobody can trace.
+    $captureText = ([ordered]@{
+            kind = 'CaptureSourceTransportOnly'
+            mode = 'offlineCorpusCapture'
+            capturedUtc = '20260101T000000Z'
+            pullRequestId = $Identity.PullRequestId
+            iterationId = $Identity.IterationId
+            sourceCommit = $Identity.SourceCommit
+            commonCommit = $Identity.CommonCommit
+            targetCommit = $Identity.TargetCommit
+            changedPathCount = 3
+        } | ConvertTo-Json -Depth 6)
+
     $files = [ordered]@{
         'identity.json' = $identityText
         'end-identity.json' = $endIdentityText
+        'capture/source-transport.json' = $captureText
         'changes-authoritative.json' = $changeSetText
         'exact-spans.json' = (ConvertTo-Json -InputObject $spanEvidence -Depth 12)
         'files/alpha.txt' = $alphaText
@@ -138,8 +155,21 @@ function Get-ReviewerCorpusFixtureContent {
         'policy/source-v1.json' = $policyText
     }
 
+    # One payload that is NOT text, and is deliberately hostile to being treated
+    # as text: it opens with the UTF-8 byte order mark sequence, carries a lone
+    # 0xFF that no UTF-8 decoder accepts, and holds an embedded NUL. A stager
+    # that sniffed encodings, normalised line endings or round-tripped bytes
+    # through a string would corrupt this and nothing else in the corpus would
+    # notice.
+    $binaryFiles = [ordered]@{
+        'capture/transport-blob.bin' = [byte[]]@(
+            0xEF, 0xBB, 0xBF, 0x00, 0xFF, 0xFE, 0x01, 0x02,
+            0x0D, 0x0A, 0x0D, 0x00, 0x80, 0xC3, 0x28, 0x7F)
+    }
+
     return [pscustomobject][ordered]@{
         Files = $files
+        BinaryFiles = $binaryFiles
         PolicyBytes = $policyBytes
         PolicySha256 = (Get-ReviewerCorpusSealSha256 -Bytes ($script:CorpusFixtureUtf8.GetBytes($policyText)))
         ChangeSetText = $changeSetText
@@ -154,6 +184,15 @@ function Write-ReviewerCorpusFixtureRoot {
     .SYNOPSIS
         Writes the corpus to disk and mints its index. Returns the index digest,
         which is the only thing the sealer will accept as proof of the index.
+
+    .DESCRIPTION
+        The index is rendered through the toolkit's own canonical JSON writer,
+        with payloads in ascending ordinal path order. That is not cosmetic: the
+        typed stager generates the same index from a declaration rather than from
+        a directory walk, and the two are only allowed to be the same corpus if
+        they are the same BYTES. Rendering here the way the stager renders there
+        is what lets one seal recipe bind a PowerShell-built corpus and a
+        C#-staged one without either side re-deriving the other's digest.
     #>
     param(
         [Parameter(Mandatory)][string]$Root,
@@ -161,13 +200,23 @@ function Write-ReviewerCorpusFixtureRoot {
         [Parameter(Mandatory)]$Content
     )
     [void](New-Item -ItemType Directory -Force -Path $Root)
-    $entries = [System.Collections.Generic.List[object]]::new()
+    $written = [System.Collections.Generic.Dictionary[string, byte[]]]::new([StringComparer]::Ordinal)
     foreach ($relative in $Content.Files.Keys) {
-        $text = [string]$Content.Files[$relative]
+        $written[[string]$relative] = $script:CorpusFixtureUtf8.GetBytes([string]$Content.Files[$relative])
+    }
+    foreach ($relative in $Content.BinaryFiles.Keys) {
+        $written[[string]$relative] = [byte[]]$Content.BinaryFiles[$relative]
+    }
+
+    $ordered = [string[]]@($written.Keys)
+    [Array]::Sort($ordered, [StringComparer]::Ordinal)
+
+    $entries = [System.Collections.Generic.List[object]]::new()
+    foreach ($relative in $ordered) {
         $full = $Root
         foreach ($segment in ($relative -split '/')) { $full = Join-Path $full $segment }
         [void](New-Item -ItemType Directory -Force -Path (Split-Path $full -Parent))
-        $bytes = $script:CorpusFixtureUtf8.GetBytes($text)
+        $bytes = $written[$relative]
         [System.IO.File]::WriteAllBytes($full, $bytes)
         [void]$entries.Add([ordered]@{
                 path = $relative
@@ -194,8 +243,163 @@ function Write-ReviewerCorpusFixtureRoot {
     }
     $indexPath = Join-Path $Root 'corpus-index.json'
     [System.IO.File]::WriteAllBytes($indexPath,
-        $script:CorpusFixtureUtf8.GetBytes(($index | ConvertTo-Json -Depth 12 -Compress:$false)))
+        $script:CorpusFixtureUtf8.GetBytes((ConvertTo-AgentReplayCanonicalJson -Value $index)))
     return (Get-FileHash -LiteralPath $indexPath -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Get-ReviewerCorpusStagePayloadRole {
+    <#
+    .SYNOPSIS
+        The declared role of one corpus-relative path.
+
+    .DESCRIPTION
+        Declared by path rather than sniffed from content, because a role is a
+        statement about what a payload IS FOR and no amount of reading the bytes
+        recovers that. The typed stager refuses a declaration that omits any
+        mandatory role, so this mapping is what proves the fixture corpus is a
+        complete one rather than a plausible-looking subset.
+    #>
+    param([Parameter(Mandatory)][string]$Relative)
+    switch -CaseSensitive ($Relative) {
+        'identity.json' { return 'identityWitness' }
+        'capture/source-transport.json' { return 'captureSourceTransport' }
+        'changes-authoritative.json' { return 'authoritativeChange' }
+        'exact-spans.json' { return 'spanEvidence' }
+        'evidence/rules.json' { return 'rule' }
+    }
+    if ($Relative.StartsWith('files/', [StringComparison]::Ordinal)) { return 'changedFilePayload' }
+    if ($Relative.StartsWith('policy/', [StringComparison]::Ordinal)) { return 'config' }
+    if ($Relative.StartsWith('live/', [StringComparison]::Ordinal)) { return 'resource' }
+    return 'evidence'
+}
+
+function New-ReviewerCorpusStageRequestFile {
+    <#
+    .SYNOPSIS
+        Writes the typed corpus stage declaration that builds one corpus from an
+        existing immutable one.
+
+    .DESCRIPTION
+        Every payload is declared by corpus-relative path, absolute source path,
+        exact digest and exact byte length, read off the SOURCE corpus's own
+        index rather than recomputed, so the declaration cannot disagree with the
+        evidence it was derived from.
+
+        The finished index's digest is declared too, and it is the digest of the
+        source corpus's index. That is the parity assertion in its strongest
+        form: the stager generates its index from this declaration alone, and if
+        the C# rendering ever stopped matching the PowerShell one the run would
+        refuse rather than publish a corpus with a different digest.
+
+        The index itself is deliberately NOT declared as a payload. It is
+        generated last from the declaration, so a corpus can never carry an index
+        that describes something other than what was written.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$SourceCorpusRoot,
+        [Parameter(Mandatory)][string]$DestinationCorpusRoot,
+        [Parameter(Mandatory)][string]$OutputRoot,
+        [Parameter(Mandatory)][string]$CorrelationId,
+        [Parameter(Mandatory)][string]$ToolkitHead,
+        [Parameter(Mandatory)][string]$IndexSha256,
+        [Parameter(Mandatory)]$Identity,
+        [Parameter(Mandatory)]$Content,
+        [string]$WitnessPath = 'identity.json'
+    )
+    $index = Import-ReviewerCorpusIndex -CorpusRoot $SourceCorpusRoot -ExpectedIndexSha256 $IndexSha256
+    $binaryPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($relative in $Content.BinaryFiles.Keys) { [void]$binaryPaths.Add([string]$relative) }
+
+    $ordered = [string[]]@($index.Payloads.Keys | ForEach-Object { [string]$_ })
+    [Array]::Sort($ordered, [StringComparer]::Ordinal)
+
+    $payloads = [System.Collections.Generic.List[object]]::new()
+    foreach ($relative in $ordered) {
+        $entry = $index.Payloads[$relative]
+        $full = $SourceCorpusRoot
+        foreach ($segment in ($relative -split '/')) { $full = Join-Path $full $segment }
+        [void]$payloads.Add([ordered]@{
+                path = $relative
+                sourcePath = [string]([IO.Path]::GetFullPath($full))
+                sha256 = [string]$entry.sha256
+                length = [int]$entry.length
+                form = $(if ($binaryPaths.Contains($relative)) { 'binary' } else { 'utf8Text' })
+                role = (Get-ReviewerCorpusStagePayloadRole -Relative $relative)
+            })
+    }
+
+    $request = [ordered]@{
+        contractVersion = 'devpilot.shadow-run-coordinator.corpus-stage-request.v1'
+        kind = 'shadow-run-corpus-stage'
+        correlationId = $CorrelationId
+        toolkitHead = $ToolkitHead
+        target = [ordered]@{
+            outputRoot = [string]([IO.Path]::GetFullPath($OutputRoot))
+            corpusRoot = [string]([IO.Path]::GetFullPath($DestinationCorpusRoot))
+            indexSha256 = $IndexSha256
+        }
+        corpusKind = 'private-immutable-non-promotable-research-corpus'
+        identity = [ordered]@{
+            repository = "$($Identity.Organization)/$($Identity.Project)/$($Identity.RepositoryName)"
+            pullRequestId = $Identity.PullRequestId
+            iterationId = $Identity.IterationId
+            sourceCommit = $Identity.SourceCommit
+            commonCommit = $Identity.CommonCommit
+            targetCommit = $Identity.TargetCommit
+            status = 'active'
+            isDraft = $false
+            witnessPath = $WitnessPath
+        }
+        payloads = @($payloads.ToArray())
+    }
+
+    [void](New-Item -ItemType Directory -Force -Path (Split-Path $Path -Parent))
+    [System.IO.File]::WriteAllBytes($Path,
+        $script:CorpusFixtureUtf8.GetBytes((ConvertTo-Json -InputObject $request -Depth 12 -Compress:$false)))
+    return [pscustomobject][ordered]@{
+        Path = [string]([IO.Path]::GetFullPath($Path))
+        Sha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        PayloadCount = $payloads.Count
+        Request = $request
+    }
+}
+
+function Protect-ReviewerCorpusFixtureRoot {
+    <#
+    .SYNOPSIS
+        Makes a corpus immutable the way a real captured one is.
+
+    .DESCRIPTION
+        This is the condition that broke the preparation this slice replaces: a
+        read-only source corpus, copied wholesale, whose identity witness could
+        then not be rewritten in the copy. Reproducing it in the fixture is the
+        point - a stager that only works on writable inputs would pass a suite
+        that never gave it a read-only one.
+    #>
+    param([Parameter(Mandatory)][string]$Root)
+    foreach ($file in [IO.Directory]::EnumerateFiles($Root, '*', [IO.SearchOption]::AllDirectories)) {
+        $attributes = [IO.File]::GetAttributes($file)
+        [IO.File]::SetAttributes($file, $attributes -bor [IO.FileAttributes]::ReadOnly)
+    }
+}
+
+function Unprotect-ReviewerCorpusFixtureRoot {
+    <#
+    .SYNOPSIS
+        Clears the read-only attribute a fixture applied, so a sandbox can be
+        removed. Used only by teardown and by tests that deliberately mutate a
+        source between declaration and staging.
+    #>
+    param([Parameter(Mandatory)][string]$Root)
+    if (-not (Test-Path -LiteralPath $Root)) { return }
+    foreach ($file in [IO.Directory]::EnumerateFiles($Root, '*', [IO.SearchOption]::AllDirectories)) {
+        $attributes = [IO.File]::GetAttributes($file)
+        if ($attributes.HasFlag([IO.FileAttributes]::ReadOnly)) {
+            [IO.File]::SetAttributes($file, $attributes -band (-bnot [IO.FileAttributes]::ReadOnly))
+        }
+    }
 }
 
 function New-ReviewerCorpusFixtureBinding {
@@ -541,12 +745,17 @@ function New-ReviewerCorpusSealFixture {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Root,
-        [Parameter(Mandatory)][string]$ToolkitRoot
+        [Parameter(Mandatory)][string]$ToolkitRoot,
+        # Build the corpus as an immutable SOURCE and leave the corpus the
+        # request names absent, for the typed control plane to construct. The
+        # seal recipe is resolved against the source, and binds the staged corpus
+        # unchanged, because both render the same index bytes.
+        [switch]$AsImmutableSource
     )
     $identity = New-ReviewerCorpusFixtureIdentity
     $content = Get-ReviewerCorpusFixtureContent -Identity $identity -ToolkitRoot $ToolkitRoot
 
-    $corpusRoot = Join-Path $Root 'corpus'
+    $corpusRoot = Join-Path $Root ($AsImmutableSource.IsPresent ? 'corpus-source' : 'corpus')
     $indexSha = Write-ReviewerCorpusFixtureRoot -Root $corpusRoot -Identity $identity -Content $content
     $index = Import-ReviewerCorpusIndex -CorpusRoot $corpusRoot -ExpectedIndexSha256 $indexSha
 
@@ -569,9 +778,21 @@ function New-ReviewerCorpusSealFixture {
             ForEach-Object { ConvertTo-ReviewerSourcePath -Path ([string]$_) })
     [Array]::Sort($censusPaths, [StringComparer]::Ordinal)
 
+    # The corpus the request will name. When the typed control plane builds it,
+    # that path does not exist yet and the corpus written above is only a source
+    # to read from - which is exactly why it is made read-only here.
+    $publishedRoot = $corpusRoot
+    if ($AsImmutableSource.IsPresent) {
+        $publishedRoot = Join-Path $Root 'corpus'
+        Protect-ReviewerCorpusFixtureRoot -Root $corpusRoot
+    }
+
     return [pscustomobject][ordered]@{
         Identity = $identity
-        CorpusRoot = [string]([IO.Path]::GetFullPath($corpusRoot))
+        CorpusRoot = [string]([IO.Path]::GetFullPath($publishedRoot))
+        SourceCorpusRoot = [string]([IO.Path]::GetFullPath($corpusRoot))
+        IsImmutableSource = $AsImmutableSource.IsPresent
+        Content = $content
         CorpusIndexSha256 = $indexSha
         RecipePath = [string]([IO.Path]::GetFullPath($recipePath))
         SnapshotName = [string]$recipe.snapshotId

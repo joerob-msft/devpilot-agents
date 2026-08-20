@@ -214,12 +214,17 @@ function New-ShadowCoordinatorFixture {
         [string]$CorrelationId = ('shadow-' + [Guid]::NewGuid().ToString('N').Substring(0, 12)),
         [ValidateRange(1, 14400)][int]$ChildTimeoutSeconds = 900,
         [switch]$ShadowSlotEnabled,
+        # Build the corpus through the typed control plane instead of handing the
+        # coordinator one that already exists. The source corpus is written
+        # read-only, which is what a real captured corpus is.
+        [switch]$StageCorpus,
         [ValidateRange(30, 3600)][int]$SupervisionGraceSeconds = 60
     )
 
     [void](New-Item -ItemType Directory -Force -Path $Sandbox)
     $build = New-ShadowCoordinatorSandbox -Sandbox $Sandbox -ToolkitRoot $ToolkitRoot
-    $corpus = New-ReviewerCorpusSealFixture -Root $Sandbox -ToolkitRoot $ToolkitRoot
+    $corpus = New-ReviewerCorpusSealFixture -Root $Sandbox -ToolkitRoot $ToolkitRoot `
+        -AsImmutableSource:$StageCorpus.IsPresent
     $identity = $corpus.Identity
 
     $configPath = Join-Path $Sandbox 'inputs\reviewer.config.json'
@@ -264,6 +269,25 @@ function New-ShadowCoordinatorFixture {
     # lease exists to make impossible.
     $launchTokenPath = Join-Path $Sandbox 'inputs\launch-authorization.token'
 
+    $outputRoot = [string]([IO.Path]::GetFullPath((Join-Path $Sandbox 'shadow-output')))
+
+    # The stage declaration, written only when this run is the one that builds
+    # the corpus. Absent otherwise, which is what every request written before
+    # this slice says and what the PowerShell corpus path keeps saying.
+    $stage = $null
+    if ($StageCorpus.IsPresent) {
+        $stage = New-ReviewerCorpusStageRequestFile `
+            -Path (Join-Path $Sandbox 'inputs\corpus-stage.json') `
+            -SourceCorpusRoot $corpus.SourceCorpusRoot `
+            -DestinationCorpusRoot $corpus.CorpusRoot `
+            -OutputRoot $outputRoot `
+            -CorrelationId $CorrelationId `
+            -ToolkitHead $build.Head `
+            -IndexSha256 $corpus.CorpusIndexSha256 `
+            -Identity $identity `
+            -Content $corpus.Content
+    }
+
     $request = @{
         contractVersion = 'devpilot.shadow-run-coordinator.request.v1'
         kind = 'shadow-run-preparation'
@@ -286,7 +310,7 @@ function New-ShadowCoordinatorFixture {
             recipePath = $corpus.RecipePath
             changedPathsPath = [string]([IO.Path]::GetFullPath($changedPathsPath))
         }
-        output = @{ root = [string]([IO.Path]::GetFullPath((Join-Path $Sandbox 'shadow-output'))) }
+        output = @{ root = $outputRoot }
         children = @{
             powerShellPath = [string](Get-Process -Id $PID).Path
             timeoutSeconds = $ChildTimeoutSeconds
@@ -316,6 +340,14 @@ function New-ShadowCoordinatorFixture {
         }
     }
 
+    if ($stage) {
+        $request.Add('corpusStage', @{
+                stagingEnabled = $true
+                requestPath = $stage.Path
+                requestSha256 = $stage.Sha256
+            })
+    }
+
     $requestPath = New-ShadowCoordinatorRequestFile -Path (Join-Path $Sandbox 'inputs\request.json') -Request $request
 
     return [pscustomobject][ordered]@{
@@ -325,6 +357,10 @@ function New-ShadowCoordinatorFixture {
         RequiredRef = $build.RequiredRef
         Identity = $identity
         CorpusRoot = $corpus.CorpusRoot
+        SourceCorpusRoot = $corpus.SourceCorpusRoot
+        StageRequestPath = $(if ($stage) { $stage.Path } else { $null })
+        StageRequestSha256 = $(if ($stage) { $stage.Sha256 } else { $null })
+        StagePayloadCount = $(if ($stage) { $stage.PayloadCount } else { 0 })
         CorpusIndexSha256 = $corpus.CorpusIndexSha256
         RecipePath = $corpus.RecipePath
         ChangedPathsPath = [string]([IO.Path]::GetFullPath($changedPathsPath))
