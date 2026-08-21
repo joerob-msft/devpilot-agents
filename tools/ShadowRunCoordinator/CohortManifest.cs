@@ -33,7 +33,14 @@ namespace DevPilot.ShadowRunCoordinator;
 /// </remarks>
 internal sealed record CohortManifest
 {
-    internal const string ContractVersionValue = "devpilot.shadow-cohort.manifest.v1";
+    internal const string ContractVersionValue = "devpilot.shadow-cohort.manifest.v2";
+
+    /// <summary>
+    /// The contract this one replaced. Named so that a v1 manifest is refused
+    /// with the reason it is refused for, rather than with a generic mismatch.
+    /// </summary>
+    internal const string UnsafeBudgetContractVersion = "devpilot.shadow-cohort.manifest.v1";
+
     internal const string KindValue = "shadow-cohort-run";
 
     /// <summary>The only concurrency this build runs a cohort at.</summary>
@@ -108,6 +115,20 @@ internal sealed record CohortManifest
             "audit",
             "entries");
 
+        // A v1 manifest declared a model-start estimate with nothing behind it,
+        // and the runner it was written for counted reviewer processes rather
+        // than model starts. Re-reading one under this build would silently
+        // reinterpret both halves of its budget, so it is refused by name and the
+        // operator re-declares it with a sealed bound.
+        if (root.TryGetProperty("contractVersion", out var version)
+            && version.ValueKind == JsonValueKind.String
+            && string.Equals(version.GetString(), UnsafeBudgetContractVersion, StringComparison.Ordinal))
+        {
+            throw new ContractException(
+                $"The {label} declares contract '{UnsafeBudgetContractVersion}', whose model-start budget was measured in reviewer processes " +
+                "rather than in real model subprocess starts and carried no proof that its estimate was an upper bound. This build does not " +
+                $"reinterpret it: re-declare the cohort as '{ContractVersionValue}' with a sealed model-start bound per entry.");
+        }
         StrictJson.RequireLiteral(root, "contractVersion", ContractVersionValue, label);
         StrictJson.RequireLiteral(root, "kind", KindValue, label);
 
@@ -588,7 +609,7 @@ internal sealed record CohortBudgets
         return new CohortBudgets
         {
             MaximumPullRequests = StrictJson.RequireInt(node, "maxPullRequests", label, 1, 64),
-            MaximumModelStarts = StrictJson.RequireInt(node, "maxModelStarts", label, 0, 4096),
+            MaximumModelStarts = StrictJson.RequireInt(node, "maxModelStarts", label, 0, 65536),
             MaximumVerifierAssignments = StrictJson.RequireInt(node, "maxVerifierAssignments", label, 0, 4096),
             MaximumWallClockSeconds = StrictJson.RequireInt(node, "maxWallClockSeconds", label, 1, 604800),
             // A literal zero, for the reason the per-entry delivery budget is a
@@ -663,6 +684,21 @@ internal sealed record CohortEntry
 
     internal required int EstimatedModelStarts { get; init; }
 
+    /// <summary>
+    /// The sealed artifact that proves the model-start estimate is an upper
+    /// bound, and not a figure copied from what a quiet run happened to cost.
+    /// </summary>
+    /// <remarks>
+    /// Derived on the reviewed side by tools/New-ShadowModelStartBound.ps1, which
+    /// owns what a reviewer argument vector means. This build verifies the
+    /// artifact's digest, verifies it was taken over the same sealed request this
+    /// entry pins, and requires the declared estimate to be at least the bound it
+    /// publishes. It never reads a model name and never re-derives the bound.
+    /// </remarks>
+    internal required string ModelStartBoundPath { get; init; }
+
+    internal required string ModelStartBoundSha256 { get; init; }
+
     internal required int EstimatedVerifierAssignments { get; init; }
 
     internal required int EstimatedWallClockSeconds { get; init; }
@@ -726,7 +762,9 @@ internal sealed record CohortEntry
         StrictJson.RequireNoUnknownFields(ruleBundle, label + " ruleBundle", "sourceKind", "declarationPath", "declarationSha256");
 
         var estimate = StrictJson.RequireObject(node, "planEstimate", label);
-        StrictJson.RequireNoUnknownFields(estimate, label + " planEstimate", "modelStarts", "verifierAssignments", "wallClockSeconds");
+        StrictJson.RequireNoUnknownFields(estimate, label + " planEstimate", "modelStarts", "verifierAssignments", "wallClockSeconds", "modelStartBound");
+        var bound = StrictJson.RequireObject(estimate, "modelStartBound", label + " planEstimate");
+        StrictJson.RequireNoUnknownFields(bound, label + " planEstimate modelStartBound", "path", "sha256");
 
         return new CohortEntry
         {
@@ -749,7 +787,9 @@ internal sealed record CohortEntry
             RuleBundleSourceKind = StrictJson.RequireString(ruleBundle, "sourceKind", label + " ruleBundle"),
             RuleBundlePath = CohortManifest.RequireRootedPath(StrictJson.RequireString(ruleBundle, "declarationPath", label + " ruleBundle"), "rule bundle declaration path", label),
             RuleBundleSha256 = StrictJson.RequireHex(ruleBundle, "declarationSha256", label + " ruleBundle", 64),
-            EstimatedModelStarts = StrictJson.RequireInt(estimate, "modelStarts", label + " planEstimate", 0, 1024),
+            EstimatedModelStarts = StrictJson.RequireInt(estimate, "modelStarts", label + " planEstimate", 0, 8192),
+            ModelStartBoundPath = CohortManifest.RequireRootedPath(StrictJson.RequireString(bound, "path", label + " planEstimate modelStartBound"), "model start bound path", label),
+            ModelStartBoundSha256 = StrictJson.RequireHex(bound, "sha256", label + " planEstimate modelStartBound", 64),
             EstimatedVerifierAssignments = StrictJson.RequireInt(estimate, "verifierAssignments", label + " planEstimate", 0, 1024),
             EstimatedWallClockSeconds = StrictJson.RequireInt(estimate, "wallClockSeconds", label + " planEstimate", 1, 86400)
         };
@@ -789,6 +829,7 @@ internal sealed record CohortEntry
         .Set("ruleBundleSourceKind", RuleBundleSourceKind)
         .Set("ruleBundleSha256", RuleBundleSha256)
         .Set("estimatedModelStarts", EstimatedModelStarts)
+        .Set("modelStartBoundSha256", ModelStartBoundSha256)
         .Set("estimatedVerifierAssignments", EstimatedVerifierAssignments)
         .Set("estimatedWallClockSeconds", EstimatedWallClockSeconds);
 }

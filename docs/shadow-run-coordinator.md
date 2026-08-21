@@ -521,7 +521,7 @@ The alias is an argument, not a manifest field, and that is the point. A cohort 
 authorization could be read out of a file would be a cohort a scheduled task could start by
 writing that file. There is no unattended path to this mode.
 
-**One manifest, sealed before anything runs.** `devpilot.shadow-cohort.manifest.v1` declares the
+**One manifest, sealed before anything runs.** `devpilot.shadow-cohort.manifest.v2` declares the
 cohort id and correlation, the exact toolkit checkout and required ref, the global ceilings, and
 an ordered list of entries. Each entry pins one already-written typed request by path *and*
 digest, restates that request's subject and its three configuration digests, declares where the
@@ -545,7 +545,7 @@ zero write budget. An entry that declares less than the full pipeline is refused
 in a reduced shape.
 
 **Sequential, journalled, and never retried.** The cohort journal
-(`devpilot.shadow-cohort.journal.v1`) is signed and replaced atomically, and it moves an entry
+(`devpilot.shadow-cohort.journal.v2`) is signed and replaced atomically, and it moves an entry
 through `pending → launchIntended → running → ended`. The launch intent — including the entry's
 digests and the exact command — is committed *before* the process exists, and the child's process
 id and its exact start time are committed as soon as it does, which is what makes "did this entry
@@ -567,6 +567,31 @@ has actually spent, taken from the ended entries' own audits, plus the sealed es
 entry about to start. If that would cross the declared maximum model starts, verifier assignments
 or wall clock, the cohort stops (exit 10), the remaining entries stay `pending`, and the index says
 so. A ceiling checked afterwards is a ceiling that has already been exceeded.
+
+**And the estimates are proved before the first entry.** A `planEstimate` is an operator's
+number, and a cohort that budgets against a number nobody derived can authorize a run that
+starts more models than it declared. Each entry therefore carries a sealed
+`modelStartBound` — path and digest — produced by `tools/New-ShadowModelStartBound.ps1`, which
+lives on the reviewed side because what an argument vector means is the reviewed side's
+business. It re-hashes the reviewer configuration the request pins, rebuilds the slot arguments
+with the reviewed builder, and multiplies the toolkit's own per-attempt limits: for each declared
+slot, the configured generalist passes times the generalist retry limit, plus the specialist
+retry limit when verification is authorized, plus the capped maximum verifier launches times
+their per-run attempt limit. Reconciliation and delivery contribute none.
+
+Before anything launches, the runner checks that each bound file digests to what the manifest
+sealed, that it was taken over *this* entry's request bytes and this cohort's toolkit head, that
+the entry's declared `modelStarts` is not below the bound it publishes, and that the sum of the
+bounds fits the global ceiling. A missing, unreadable or mismatched bound is a refusal, and the
+bound is never re-derived here. `devpilot.shadow-cohort.manifest.v1` is refused by name: its
+model-start budget was measured in reviewer processes, so re-reading one under this build would
+silently reinterpret both halves of it.
+
+**An entry that spent more than the cohort was allowed ends it.** The estimates admit an entry;
+the actuals, read from each ended entry's signed audit, are what stop the set. When the real
+model starts already spent — plus the bounded allowance for slots that ended without a complete
+census — exceed the ceiling, the cohort ends at `budgetExceeded`, the entry's own result stands
+and is never re-run, and no further entry launches.
 
 **An entry that left no evidence stops the cohort.** A child can die, hang or be killed part-way
 through a preparation, having already started models, without ever publishing an audit. Nothing it
@@ -774,17 +799,81 @@ PowerShell and an unobserved run would otherwise read as a clean zero; `invarian
 says which of the two an audit is.
 
 The slots' own fields are separate from the readiness census, and the distinction matters:
-`slotLaunchCount` and `modelInvocationCount` are what the reviewed verifier saw *at
+`slotLaunchCount` and `preparationAttemptRecordCount` are what the reviewed verifier saw *at
 run-set-ready*, when by definition nothing has run yet, so both are zero on a healthy run. The
 per-slot census taken after each slot finished is indexed under `slots`, one entry per declared
 slot in declaration order, each carrying `slotName`, `slotAttemptCount`,
-`slotModelInvocationCount`, `slotTerminalStatus`, `slotTerminalExitCode`, `slotTerminalTimedOut`
-and `slotTerminalSha256`, beside `declaredSlotCount` and `supervisedSlotCount` so a partly
-supervised set cannot read as a complete one. The model count is a passthrough: the coordinator
-neither produces it nor interprets it, and publishes it exactly as the reviewed inventory
-reported it. The slot fields are omitted entirely when no slot was authorized, for the same
-reason the readiness census is — a zeroed slot block would read like a slot that ran and did
-nothing.
+`slotAttemptRecordCount`, `slotRealModelStartCount`, `slotTerminalStatus`,
+`slotTerminalExitCode`, `slotTerminalTimedOut` and `slotTerminalSha256`, beside
+`declaredSlotCount` and `supervisedSlotCount` so a partly supervised set cannot read as a
+complete one. Every count is a passthrough: the coordinator neither produces it nor interprets
+it, and publishes it exactly as the reviewed inventory reported it. The slot fields are omitted
+entirely when no slot was authorized, for the same reason the readiness census is — a zeroed
+slot block would read like a slot that ran and did nothing.
+
+### Real model starts, and what is not one
+
+Audit `v2` publishes two different things that earlier builds conflated under one name. A
+**real model start** is one model subprocess actually started, in any role and on any attempt —
+each generalist pass, each retry of one, the convention specialist, and each cross-verification
+launch. A **slot attempt record** is one reviewer process launch. A two-slot run in which each
+reviewer started two generalists is four real model starts and two attempt records, and the
+count a budget is spent in is the first one.
+
+The per-role census is taken on the reviewed side, from the reviewer's own published attempt
+accounting and from the distinct launch nonces its sealed verification previews carry, and is
+passed through unread: `realModelStartCount` with `realModelStartsGeneralist`,
+`realModelStartsSpecialist` and `realModelStartsVerifier`, which sum to it.
+`realModelStartsObserved` says whether any slot reached a durable ending,
+`realModelStartCensusComplete` says whether every slot that was launched published one, and
+`realModelStartUnmeasuredAllowance` is how many starts an entry could have made and never
+recorded — computed on the reviewed side against each run's own sealed plan, because the size of
+the gap depends on the evidence the run's own runner leaves. Every role publishes its record as
+soon as its subprocess returns, and that write is fatal: a reviewer that cannot record a launch it
+made fails rather than degrade past it, so a run that ended cleanly has no gap, and one that was
+interrupted hides at most the single attempt in flight. Against a runner that publishes no
+per-launch record for cross-verification the whole role is unmeasured however the run ended,
+because that role's only other witness is the end-of-phase seal — accumulated in memory,
+serialized once, and written *empty* by the degraded fallback, which returns normally. Whatever
+that seal cannot prove is charged. That allowance is what lets a ceiling be checked against an
+upper bound rather than against a floor. `slotAttemptRecordCount` remains, renamed, as a
+diagnostic; `verifierAssignmentCount` is a third and separate thing, taken from committed
+transitions.
+
+A cohort refuses to spend a budget against an audit that cannot answer this. A missing
+`realModelStartsObserved`, an unreadable counter, a role breakdown that does not sum to its
+total, a census the preparation marked incomplete, or an audit that launched slots and
+supervised none of them to an ending all stop the whole cohort rather than the entry, because
+an unread counter is not a zero.
+
+`preparationEnded` is asked before any of them. The audit is rewritten after every commit, so the
+copy on disk always describes the run as it then stood, and every way out of the walk — success,
+refusal, fault, deliberate halt — rewrites it once more with an ending. A coordinator killed
+outright writes no ending, and what it leaves is a mid-walk audit whose counters are honest for a
+point the run never got past and whose zeros are indistinguishable from those of a preparation
+that refused before launching anything. An audit that does not say it had ended, or that says it
+had not, stops the whole cohort.
+
+That answer is only worth asking for if the audit is this run's. A resumed preparation finds the
+previous invocation's ending already standing over its root, so a stale audit *file* is the one
+thing an opening write is not allowed to leave behind: the file is removed first and the `running`
+audit written second, and a preparation that cannot remove it refuses before it advances a single
+rank. A failure between the two leaves no audit at all, which every reader of this root already
+refuses — never the previous run's ending with this run's work underneath it. A path holding
+nothing, or holding a directory, carries no earlier ending and can be read as none, so a write that
+fails there is absorbed like every other audit write and the run keeps its work. The difference is
+read from the path's attributes rather than from `File.Exists`, which answers false for a path the
+process was not allowed to look at: an ending this preparation cannot stat is still an ending some
+other reader can, so an answer that cannot be trusted is treated as the hazard and the run refuses.
+
+The census itself has a matching floor. A model subprocess is created inside the harness, and the
+code that raises telemetry, drains the two output streams and writes standard input all runs
+after the process exists; a fault in any of it reaches a handler that degrades, and the accounting
+record — written when the harness returns — is never written at all. So the reviewer publishes a
+launch intent in the last statement before a process can exist, and a role's starts are the larger
+of its intents and its accounting records. The two refusals that can turn an invocation away, the
+role-input capture boundary and the single-shot acquisition guard, sit above the intent, so a run
+that refused before launching still counts zero.
 
 `slotSupervision` reports how each wait ended, and only what this coordinator can actually know:
 the disposition, the child's exit code, whether the supervisor stopped it, the recorded identity,

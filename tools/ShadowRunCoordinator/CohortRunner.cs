@@ -84,6 +84,12 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
     /// <summary>How long a killed entry tree is given to go before the runner stops waiting on it.</summary>
     private const int DrainMilliseconds = 30_000;
 
+    /// <summary>
+    /// The artifact this build accepts as proof of an entry's worst-case real
+    /// model consumption, produced by tools/New-ShadowModelStartBound.ps1.
+    /// </summary>
+    internal const string ModelStartBoundKind = "devpilot.shadow-cohort.model-start-bound.v1";
+
     internal static int Run(CohortManifest manifest, string operatorAlias, bool rebuildOnly, TextWriter log)
     {
         Directory.CreateDirectory(manifest.JournalRoot);
@@ -244,6 +250,7 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
             PublishIndexSafely(journal, key, CohortIndex.ReasonRunning, "the cohort is in progress");
 
             RequireLiveToolkitHead();
+            RequireSealedModelStartBounds();
 
             var stopped = false;
             var anyUnsuccessful = false;
@@ -288,6 +295,17 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
                 // already done.
                 journal.RequireResumable(record);
 
+                // What has already been spent, before what the next entry would
+                // cost. An entry that turned out to cost more than the whole
+                // cohort was allowed ends it here: its own result stands and is
+                // never re-run, and nothing further launches.
+                if (DescribeOverspend(journal) is { } already)
+                {
+                    _log.WriteLine($"stopping before entry {entry.Ordinal.ToString(CultureInfo.InvariantCulture)} '{entry.EntryId}': {already}");
+                    PublishIndexSafely(journal, key, CohortIndex.ReasonBudgetExceeded, already);
+                    return CoordinatorExitCodes.CohortBudgetExhausted;
+                }
+
                 if (DescribeBudgetStop(journal) is { } exhausted)
                 {
                     _log.WriteLine($"stopping before entry {entry.Ordinal.ToString(CultureInfo.InvariantCulture)} '{entry.EntryId}': {exhausted}");
@@ -309,6 +327,15 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
                 }
             }
 
+            if (DescribeOverspend(journal) is { } overspent)
+            {
+                // Reached when every entry has ended: the cohort spent more than
+                // it was allowed and says so, rather than reporting a clean
+                // completion that would hide the overspend behind a green result.
+                _log.WriteLine($"cohort budget exceeded: {overspent}");
+                PublishIndexSafely(journal, key, CohortIndex.ReasonBudgetExceeded, overspent);
+                return CoordinatorExitCodes.CohortBudgetExhausted;
+            }
             if (stopped)
             {
                 PublishIndexSafely(
@@ -571,6 +598,7 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
             Outcome = outcome,
             ElapsedSeconds = elapsed,
             ModelStartCount = summary.ModelStartCount,
+            ModelStartUnmeasuredAllowance = summary.ModelStartUnmeasuredAllowance,
             VerifierAssignmentCount = summary.VerifierAssignmentCount,
             SlotLaunchCount = summary.SlotLaunchCount,
             ProviderWriteCount = summary.ProviderWriteCount,
@@ -589,6 +617,9 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
         _log.WriteLine(
             $"entry '{entry.EntryId}' ended {outcome} in {elapsed.ToString(CultureInfo.InvariantCulture)}s " +
             $"modelStarts={summary.ModelStartCount.ToString(CultureInfo.InvariantCulture)} " +
+            $"(generalist={summary.ModelStartsGeneralist.ToString(CultureInfo.InvariantCulture)} " +
+            $"specialist={summary.ModelStartsSpecialist.ToString(CultureInfo.InvariantCulture)} " +
+            $"verifier={summary.ModelStartsVerifier.ToString(CultureInfo.InvariantCulture)}) " +
             $"verifierAssignments={summary.VerifierAssignmentCount.ToString(CultureInfo.InvariantCulture)} " +
             $"providerWrites={summary.ProviderWriteCount.ToString(CultureInfo.InvariantCulture)}");
         return outcome;
@@ -760,6 +791,87 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
     }
 
     /// <summary>
+    /// Proves, before anything launches, that every entry's declared model-start
+    /// estimate is an upper bound on the real model subprocess starts its sealed
+    /// plan could produce.
+    /// </summary>
+    /// <remarks>
+    /// The bound itself is derived on the reviewed side, where what a slot
+    /// argument vector means is already understood, and sealed into an artifact
+    /// bound to the exact request bytes. This build only checks the seals: the
+    /// artifact digests to what the manifest declared, it was taken over THIS
+    /// entry's request and toolkit head, and the estimate the manifest carries is
+    /// not below the bound the artifact publishes.
+    ///
+    /// Refusal is the only outcome for a missing, unreadable or mismatched bound.
+    /// An estimate with nothing behind it is what let a cohort declare a ceiling
+    /// of three for a run that really started four models, and a budget that can
+    /// be under-declared is not a budget.
+    /// </remarks>
+    private void RequireSealedModelStartBounds()
+    {
+        long bounded = 0;
+        foreach (var entry in _manifest.Entries)
+        {
+            var label = $"entry '{entry.EntryId}' model start bound";
+            if (!File.Exists(entry.ModelStartBoundPath))
+            {
+                throw new ContractException(
+                    $"Entry '{entry.EntryId}' declares a model start bound at '{entry.ModelStartBoundPath}', and there is no such file. " +
+                    "A cohort does not launch a preparation whose worst-case model consumption nobody proved.");
+            }
+            var bytes = StrictJson.ReadFileBytes(entry.ModelStartBoundPath, label, 4L * 1024 * 1024);
+            var digest = CanonicalJson.Sha256Hex(bytes);
+            if (!string.Equals(digest, entry.ModelStartBoundSha256, StringComparison.Ordinal))
+            {
+                throw new ContractException(
+                    $"Entry '{entry.EntryId}' seals a model start bound digesting to {entry.ModelStartBoundSha256} and the file at " +
+                    $"'{entry.ModelStartBoundPath}' digests to {digest}. A bound that changed after the cohort was declared is not the bound that was authorized.");
+            }
+
+            var root = StrictJson.ReadObjectBytes(bytes, entry.ModelStartBoundPath, label);
+            StrictJson.RequireLiteral(root, "kind", ModelStartBoundKind, label);
+            var boundRequest = StrictJson.RequireHex(root, "requestSha256", label, 64);
+            if (!string.Equals(boundRequest, entry.RequestSha256, StringComparison.Ordinal))
+            {
+                throw new ContractException(
+                    $"Entry '{entry.EntryId}' pins a request digesting to {entry.RequestSha256} and its model start bound was taken over " +
+                    $"{boundRequest}. A bound derived from a different plan bounds a different run.");
+            }
+            var boundHead = StrictJson.RequireString(root, "toolkitHead", label);
+            if (!string.Equals(boundHead, _manifest.ToolkitHead, StringComparison.Ordinal))
+            {
+                throw new ContractException(
+                    $"Entry '{entry.EntryId}' carries a model start bound taken at toolkit head {boundHead} and the cohort pins " +
+                    $"{_manifest.ToolkitHead}. The per-attempt limits the bound multiplies live in the toolkit, so a bound from another head is not this build's bound.");
+            }
+
+            var maximum = StrictJson.RequireInt(root, "maxRealModelStarts", label, 0, 65536);
+            if (entry.EstimatedModelStarts < maximum)
+            {
+                throw new ContractException(
+                    $"Entry '{entry.EntryId}' estimates {entry.EstimatedModelStarts.ToString(CultureInfo.InvariantCulture)} model start(s) and its sealed bound " +
+                    $"admits up to {maximum.ToString(CultureInfo.InvariantCulture)}. The estimate a cohort budgets against is an upper bound or it is a guess, " +
+                    "and a guess that runs low spends models nobody authorized.");
+            }
+            bounded += maximum;
+        }
+
+        // Restated against the global ceiling. The manifest already refused a set
+        // whose declared estimates could not fit, but the estimates are the
+        // operator's numbers and these are the derived ones; a ceiling that cannot
+        // hold the proven worst case is reported here rather than discovered as a
+        // hard stop partway through a set that had evidence to show for it.
+        if (bounded > _manifest.Budgets.MaximumModelStarts)
+        {
+            throw new ContractException(
+                $"The cohort's sealed bounds admit up to {bounded.ToString(CultureInfo.InvariantCulture)} real model start(s) across its entries and it " +
+                $"declares a ceiling of {_manifest.Budgets.MaximumModelStarts.ToString(CultureInfo.InvariantCulture)}. A cohort that cannot fit its own proven " +
+                "worst case is refused before it starts rather than stopped after it has produced evidence that will now be abandoned.");
+        }
+    }
+
+    /// <summary>
     /// Names the global ceiling the next entry would cross, or null when it fits.
     /// </summary>
     /// <remarks>
@@ -785,7 +897,7 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
             {
                 continue;
             }
-            models += record.ModelStartCount;
+            models += record.ModelStartCount + record.ModelStartUnmeasuredAllowance;
             verifiers += record.VerifierAssignmentCount;
             seconds += record.ElapsedSeconds;
             started++;
@@ -818,6 +930,55 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
         return null;
     }
 
+    /// <summary>
+    /// Names the ceiling the entries that have ALREADY ENDED have crossed, or
+    /// null when they fit.
+    /// </summary>
+    /// <remarks>
+    /// Actuals only, and read out of the signed journal, which carries what each
+    /// entry's own signed audit reported it really spent. This is the check with
+    /// teeth: the sealed estimates admit an entry before it runs, and this one
+    /// stops the cohort when what an entry actually cost turns out to be more
+    /// than the whole set was allowed. It is deliberately evaluated even when
+    /// nothing is left to launch, so a cohort that overspent on its last entry
+    /// reports that instead of a clean completion.
+    ///
+    /// The model figure is real model subprocess starts plus the bounded
+    /// allowance for slots interrupted before they could publish an attempt
+    /// record - an upper bound, because a ceiling checked against a floor is not
+    /// a ceiling.
+    /// </remarks>
+    private string? DescribeOverspend(CohortJournal journal)
+    {
+        long models = 0;
+        long verifiers = 0;
+        long seconds = 0;
+        foreach (var declared in _manifest.Entries)
+        {
+            var record = journal.RecordFor(declared.EntryId);
+            if (!record.HasEnded)
+            {
+                continue;
+            }
+            models += record.ModelStartCount + record.ModelStartUnmeasuredAllowance;
+            verifiers += record.VerifierAssignmentCount;
+            seconds += record.ElapsedSeconds;
+        }
+        if (models > _manifest.Budgets.MaximumModelStarts)
+        {
+            return Overspent("real model start", models, _manifest.Budgets.MaximumModelStarts);
+        }
+        if (verifiers > _manifest.Budgets.MaximumVerifierAssignments)
+        {
+            return Overspent("verifier assignment", verifiers, _manifest.Budgets.MaximumVerifierAssignments);
+        }
+        if (seconds > _manifest.Budgets.MaximumWallClockSeconds)
+        {
+            return Overspent("wall clock second", seconds, _manifest.Budgets.MaximumWallClockSeconds);
+        }
+        return null;
+    }
+
     private CohortEntry? NextPendingEntry(CohortJournal journal)
     {
         foreach (var declared in _manifest.Entries)
@@ -834,6 +995,11 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
         $"the cohort has consumed {consumed.ToString(CultureInfo.InvariantCulture)} {unit}(s), the next entry is sealed at " +
         $"{estimated.ToString(CultureInfo.InvariantCulture)}, and the ceiling is {ceiling.ToString(CultureInfo.InvariantCulture)}. " +
         "The remaining entries stay pending and nothing is truncated.";
+
+    private static string Overspent(string unit, long consumed, int ceiling) =>
+        $"the cohort has already consumed {consumed.ToString(CultureInfo.InvariantCulture)} {unit}(s) against a ceiling of " +
+        $"{ceiling.ToString(CultureInfo.InvariantCulture)}. The entries that ran keep their results and are never re-run; no further " +
+        "entry launches under this manifest.";
 
     /// <summary>
     /// The exact launch this runner committed an intent for, as a record a killed

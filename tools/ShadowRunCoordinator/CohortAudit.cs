@@ -79,7 +79,34 @@ internal sealed record CohortEntrySummary
 
     internal required string StateSha256 { get; init; }
 
+    /// <summary>
+    /// Real model subprocess starts, every role and every attempt, as the entry's
+    /// own audit counted them. THE figure a cohort budget is spent in.
+    /// </summary>
     internal required int ModelStartCount { get; init; }
+
+    internal required int ModelStartsGeneralist { get; init; }
+
+    internal required int ModelStartsSpecialist { get; init; }
+
+    internal required int ModelStartsVerifier { get; init; }
+
+    /// <summary>
+    /// Real model starts an interrupted entry may have made and could not record,
+    /// summed over its slots. Computed on the reviewed side against each run's own
+    /// sealed plan, because the size of the gap depends on which phase was
+    /// interrupted: an attempt in flight hides one start, while a cross-verifier
+    /// phase killed before it seals hides every launch it made. The ceiling is
+    /// checked against the measured total plus this.
+    /// </summary>
+    internal required int ModelStartUnmeasuredAllowance { get; init; }
+
+    /// <summary>
+    /// Reviewer PROCESS launches - one attempt record per slot. Diagnostic only:
+    /// no budget is checked against it, and the name says which of the two
+    /// censuses it is.
+    /// </summary>
+    internal required int SlotAttemptRecordCount { get; init; }
 
     internal required int SlotLaunchCount { get; init; }
 
@@ -119,6 +146,11 @@ internal sealed record CohortEntrySummary
             .Set("auditSha256", AuditSha256)
             .Set("stateSha256", StateSha256)
             .Set("modelStartCount", ModelStartCount)
+            .Set("modelStartsGeneralist", ModelStartsGeneralist)
+            .Set("modelStartsSpecialist", ModelStartsSpecialist)
+            .Set("modelStartsVerifier", ModelStartsVerifier)
+            .Set("modelStartUnmeasuredAllowance", ModelStartUnmeasuredAllowance)
+            .Set("slotAttemptRecordCount", SlotAttemptRecordCount)
             .Set("slotLaunchCount", SlotLaunchCount)
             .Set("supervisedSlotCount", SupervisedSlotCount)
             .Set("verifierAssignmentCount", VerifierAssignmentCount)
@@ -154,6 +186,11 @@ internal sealed record CohortEntrySummary
         AuditSha256 = "none",
         StateSha256 = "none",
         ModelStartCount = 0,
+        ModelStartsGeneralist = 0,
+        ModelStartsSpecialist = 0,
+        ModelStartsVerifier = 0,
+        ModelStartUnmeasuredAllowance = 0,
+        SlotAttemptRecordCount = 0,
         SlotLaunchCount = 0,
         SupervisedSlotCount = 0,
         VerifierAssignmentCount = 0,
@@ -176,7 +213,7 @@ internal sealed record CohortEntrySummary
 /// </remarks>
 internal static class CohortSummaryReader
 {
-    private const string AuditContractVersion = "devpilot.shadow-run-coordinator.audit.v1";
+    private const string AuditContractVersion = "devpilot.shadow-run-coordinator.audit.v2";
     private const string AuditKind = "shadow-run-coordinator-audit";
 
     /// <summary>The audit an entry's output root publishes.</summary>
@@ -278,6 +315,8 @@ internal static class CohortSummaryReader
         var writeInvocations = RequireWriteCount(audit, "writeToolInvocations", label);
         RequireZeroWrites(entry, providerWrites, writeInvocations);
         RequireNoWriteCapability(entry, audit, label);
+        RequireEnded(entry, audit, label);
+        var starts = RequireRealModelStarts(entry, audit, label);
 
         return new CohortEntrySummary
         {
@@ -295,7 +334,12 @@ internal static class CohortSummaryReader
             DeliverySummarySha256 = ReadText(audit, "deliverySummarySha256"),
             AuditSha256 = auditSha256,
             StateSha256 = ReadText(audit, "stateSha256"),
-            ModelStartCount = RequireRepresentable(ReadCount(audit, "modelInvocationCount") + SlotModelStarts(audit), "modelInvocationCount", label),
+            ModelStartCount = starts.Total,
+            ModelStartsGeneralist = starts.Generalist,
+            ModelStartsSpecialist = starts.Specialist,
+            ModelStartsVerifier = starts.Verifier,
+            ModelStartUnmeasuredAllowance = starts.UnmeasuredAllowance,
+            SlotAttemptRecordCount = RequireRepresentable(SlotAttemptRecords(audit), "slotAttemptRecordCount", label),
             SlotLaunchCount = RequireRepresentable(ReadCount(audit, "slotLaunchCount"), "slotLaunchCount", label),
             SupervisedSlotCount = RequireRepresentable(ReadCount(audit, "supervisedSlotCount"), "supervisedSlotCount", label),
             VerifierAssignmentCount = verifierAssignments,
@@ -303,6 +347,148 @@ internal static class CohortSummaryReader
             WriteToolInvocationCount = writeInvocations,
             WallClockSeconds = wallClockSeconds
         };
+    }
+
+    /// <summary>
+    /// Refuses an audit that nobody finished writing.
+    /// </summary>
+    /// <remarks>
+    /// The preparation rewrites its audit after every commit, so the copy on
+    /// disk always describes the run as it then stood, and every way out of the
+    /// walk - success, refusal, fault, deliberate halt - rewrites it once more
+    /// with an ending. A coordinator killed outright writes no ending, and what
+    /// is left is a mid-walk audit whose counters are honest for a point the run
+    /// had not yet passed. Its spend is not the entry's spend, and its zeros are
+    /// indistinguishable from those of a preparation that really refused before
+    /// launching anything.
+    ///
+    /// So this is asked before any counter is read, and it blocks the whole
+    /// cohort: an entry whose evidence stops mid-sentence is one whose cost is
+    /// unknown, and the next entry must not be launched against it. An audit
+    /// that does not carry the flag at all is evidence from a build that could
+    /// not answer the question, which is refused on the same terms.
+    /// </remarks>
+    private static void RequireEnded(CohortEntry entry, JsonElement audit, string label)
+    {
+        if (!audit.TryGetProperty("preparationEnded", out var ended)
+            || ended.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+        {
+            throw new CohortBlockedException(
+                $"The {label} publishes no 'preparationEnded'. This build refuses an audit that cannot say whether the " +
+                "preparation it describes had finished, because a mid-walk audit read as an ending reports the spend of a " +
+                "run that had not made it yet.");
+        }
+        if (ended.ValueKind != JsonValueKind.True)
+        {
+            throw new CohortBlockedException(
+                $"Entry '{entry.EntryId}' published an audit describing a preparation that was still running when the audit " +
+                "was written, which is what a coordinator killed outright leaves behind. What that entry spent is unknown " +
+                "rather than what the audit happens to say, so the cohort stops here instead of launching another entry.");
+        }
+    }
+
+    /// <summary>
+    /// The real model subprocess starts one entry made, read from its own signed
+    /// audit and refused rather than guessed.
+    /// </summary>
+    /// <remarks>
+    /// THE number a cohort budget is spent in. It is read, never derived: the
+    /// defect this replaced computed it from a census of reviewer processes, so a
+    /// two-slot entry that started four models was accounted as three and one
+    /// that started forty would still have been accounted as three.
+    ///
+    /// Four refusals, all of which block the whole cohort rather than the entry:
+    /// an audit that observed slots and published no total; a total whose role
+    /// breakdown does not add up to it; a census the preparation itself marked
+    /// incomplete; and a total too large to carry into the ceiling arithmetic.
+    /// The first is the important one - a missing counter must never read as the
+    /// zero that would let every remaining entry launch.
+    ///
+    /// The unmeasured allowance is the one place a number is added that was
+    /// not measured, and it is added in the safe direction: a slot interrupted
+    /// mid-phase may have started models whose records it never published, and
+    /// the reviewed side has already bounded how many from that run's own sealed
+    /// plan. The ceiling is checked against the total plus that allowance.
+    /// </remarks>
+    private static (int Total, int Generalist, int Specialist, int Verifier, int UnmeasuredAllowance) RequireRealModelStarts(
+        CohortEntry entry,
+        JsonElement audit,
+        string label)
+    {
+        var observed = audit.TryGetProperty("realModelStartsObserved", out var flag)
+            && flag.ValueKind is JsonValueKind.True or JsonValueKind.False
+            && flag.ValueKind == JsonValueKind.True;
+        if (!observed)
+        {
+            // A preparation that supervised no slot started no model, and says so
+            // by publishing the flag false. That is a reading, not an absence: the
+            // flag itself is required below by the same code path that requires the
+            // counters, because an audit missing both would otherwise be read as a
+            // preparation that quietly did nothing.
+            if (!audit.TryGetProperty("realModelStartsObserved", out _))
+            {
+                throw new CohortBlockedException(
+                    $"The {label} publishes no 'realModelStartsObserved'. This build spends a cohort budget in real model starts and " +
+                    "refuses an audit that does not say whether it counted any: an unread counter is not a zero.");
+            }
+            // Supervising no slot is only the same thing as starting no model when
+            // no slot was LAUNCHED either. A preparation that authorized a launch
+            // and then lost the child before it reached a durable ending may have
+            // started models it can no longer account for, and that is a stop.
+            var launched = RequireCounter(audit, "realModelStartLaunchedSlotCount", label);
+            if (launched > 0)
+            {
+                throw new CohortBlockedException(
+                    $"Entry '{entry.EntryId}' published an audit that launched {launched.ToString(CultureInfo.InvariantCulture)} slot(s) and " +
+                    "supervised none of them to a durable ending, so what those launches spent is unknown rather than nothing. The cohort stops here.");
+            }
+            return (0, 0, 0, 0, 0);
+        }
+        var total = RequireCounter(audit, "realModelStartCount", label);
+        var generalist = RequireCounter(audit, "realModelStartsGeneralist", label);
+        var specialist = RequireCounter(audit, "realModelStartsSpecialist", label);
+        var verifier = RequireCounter(audit, "realModelStartsVerifier", label);
+        if (generalist + specialist + verifier != total)
+        {
+            throw new CohortBlockedException(
+                $"The {label} reports {total.ToString(CultureInfo.InvariantCulture)} real model start(s) and a role breakdown summing to " +
+                $"{(generalist + specialist + verifier).ToString(CultureInfo.InvariantCulture)}. A cohort stops rather than spend a budget against a census " +
+                "whose parts contradict its total.");
+        }
+        if (!audit.TryGetProperty("realModelStartCensusComplete", out var complete) || complete.ValueKind != JsonValueKind.True)
+        {
+            throw new CohortBlockedException(
+                $"Entry '{entry.EntryId}' published an audit whose real model start census is not complete, so what it spent is unknown " +
+                "rather than small. The cohort stops here instead of launching another entry against a budget it can no longer measure.");
+        }
+        var unmeasured = RequireCounter(audit, "realModelStartUnmeasuredAllowance", label);
+        return (
+            RequireRepresentable(total, "realModelStartCount", label),
+            RequireRepresentable(generalist, "realModelStartsGeneralist", label),
+            RequireRepresentable(specialist, "realModelStartsSpecialist", label),
+            RequireRepresentable(verifier, "realModelStartsVerifier", label),
+            RequireRepresentable(unmeasured, "realModelStartUnmeasuredAllowance", label));
+    }
+
+    /// <summary>
+    /// A counter the budget rests on, read on the same terms as the write
+    /// counters: absent, negative or unreadable is a refusal, never a zero.
+    /// </summary>
+    private static long RequireCounter(JsonElement parent, string name, string label)
+    {
+        if (!parent.TryGetProperty(name, out var value) || value.ValueKind != JsonValueKind.Number)
+        {
+            throw new CohortBlockedException(
+                $"The {label} publishes no readable '{name}'. A cohort ceiling is only as good as the counter it is checked against, " +
+                "and an unreadable counter is not a zero.");
+        }
+        if (!value.TryGetInt64(out var number) || number < 0)
+        {
+            throw new CohortBlockedException(
+                $"The {label} publishes '{name}' as '{value.GetRawText()}', which is not a count this build can add up. " +
+                "The cohort stops rather than treat it as nothing.");
+        }
+        return number;
     }
 
     /// <summary>
@@ -488,10 +674,13 @@ internal static class CohortSummaryReader
         digests.TryGetValue(state, out var value) ? value : "none";
 
     /// <summary>
-    /// The model starts each supervised slot reported, added up. The audit copies
-    /// these across from the reviewed terminal artifact by position; so does this.
+    /// The reviewer processes each supervised slot reported having launched,
+    /// added up. Diagnostic only: this is a census of PROCESSES, and a budget
+    /// spent in model starts is never checked against it. It was once published
+    /// under a name that suggested otherwise, which is how a two-slot entry that
+    /// started four models came to be accounted as three.
     /// </summary>
-    private static long SlotModelStarts(JsonElement audit)
+    private static long SlotAttemptRecords(JsonElement audit)
     {
         if (!audit.TryGetProperty("slots", out var slots) || slots.ValueKind != JsonValueKind.Array)
         {
@@ -504,7 +693,7 @@ internal static class CohortSummaryReader
             {
                 continue;
             }
-            total += ReadCount(slot, "slotModelInvocationCount");
+            total += ReadCount(slot, "slotAttemptRecordCount");
         }
         return total;
     }
@@ -547,7 +736,7 @@ internal static class CohortSummaryReader
 /// </remarks>
 internal static class CohortIndex
 {
-    internal const string ContractVersionValue = "devpilot.shadow-cohort.index.v1";
+    internal const string ContractVersionValue = "devpilot.shadow-cohort.index.v2";
     internal const string KindValue = "shadow-cohort-index";
 
     /// <summary>The reviewed plan's own word for the posture, unchanged by scaling it across a set.</summary>
@@ -569,6 +758,20 @@ internal static class CohortIndex
     internal const string ReasonStoppedOnFailure = "stoppedOnEntryFailure";
 
     internal const string ReasonBudgetExhausted = "budgetExhausted";
+
+    /// <summary>
+    /// The cohort had already spent more than its ceiling allowed.
+    /// </summary>
+    /// <remarks>
+    /// Distinct from an exhausted budget on purpose. 'Exhausted' is the healthy
+    /// stop: the next entry's sealed estimate would not fit, so it is not
+    /// started. 'Exceeded' is the unhealthy one: an entry that has ALREADY run
+    /// turned out to cost more than the whole set was allowed, which means an
+    /// estimate was wrong or an audit reported more than its bound admitted. The
+    /// entry's own result stands either way, and no further entry is launched -
+    /// but an operator reading the index needs to be able to tell the two apart.
+    /// </remarks>
+    internal const string ReasonBudgetExceeded = "budgetExceeded";
 
     internal const string ReasonBlocked = "blocked";
 
@@ -595,6 +798,7 @@ internal static class CohortIndex
         ReasonCompletedWithFailure,
         ReasonStoppedOnFailure,
         ReasonBudgetExhausted,
+        ReasonBudgetExceeded,
         ReasonBlocked,
         ReasonUnresolvedLaunch,
         ReasonContractRefusal,

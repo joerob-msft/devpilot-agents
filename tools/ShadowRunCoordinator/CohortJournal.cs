@@ -103,7 +103,18 @@ internal sealed record CohortEntryRecord
 
     internal required int ElapsedSeconds { get; init; }
 
+    /// <summary>
+    /// Real model subprocess starts this entry made, from its signed audit.
+    /// Never a count of cycles, slots or reviewer processes.
+    /// </summary>
     internal required int ModelStartCount { get; init; }
+
+    /// <summary>
+    /// Real model starts an interrupted entry may have made without recording
+    /// them, bounded on the reviewed side from the run's own sealed plan. The
+    /// global ceiling is checked against the sum of both.
+    /// </summary>
+    internal required int ModelStartUnmeasuredAllowance { get; init; }
 
     internal required int VerifierAssignmentCount { get; init; }
 
@@ -132,6 +143,7 @@ internal sealed record CohortEntryRecord
         Outcome = "none",
         ElapsedSeconds = 0,
         ModelStartCount = 0,
+        ModelStartUnmeasuredAllowance = 0,
         VerifierAssignmentCount = 0,
         SlotLaunchCount = 0,
         ProviderWriteCount = 0,
@@ -154,6 +166,7 @@ internal sealed record CohortEntryRecord
         .Set("outcome", Outcome)
         .Set("elapsedSeconds", ElapsedSeconds)
         .Set("modelStartCount", ModelStartCount)
+        .Set("modelStartUnmeasuredAllowance", ModelStartUnmeasuredAllowance)
         .Set("verifierAssignmentCount", VerifierAssignmentCount)
         .Set("slotLaunchCount", SlotLaunchCount)
         .Set("providerWriteCount", ProviderWriteCount)
@@ -183,6 +196,7 @@ internal sealed record CohortEntryRecord
             "outcome",
             "elapsedSeconds",
             "modelStartCount",
+            "modelStartUnmeasuredAllowance",
             "verifierAssignmentCount",
             "slotLaunchCount",
             "providerWriteCount",
@@ -244,6 +258,7 @@ internal sealed record CohortEntryRecord
             Outcome = outcome,
             ElapsedSeconds = StrictJson.RequireInt(node, "elapsedSeconds", label, 0, int.MaxValue),
             ModelStartCount = StrictJson.RequireInt(node, "modelStartCount", label, 0, int.MaxValue),
+            ModelStartUnmeasuredAllowance = StrictJson.RequireInt(node, "modelStartUnmeasuredAllowance", label, 0, int.MaxValue),
             VerifierAssignmentCount = StrictJson.RequireInt(node, "verifierAssignmentCount", label, 0, int.MaxValue),
             SlotLaunchCount = StrictJson.RequireInt(node, "slotLaunchCount", label, 0, int.MaxValue),
             ProviderWriteCount = StrictJson.RequireInt(node, "providerWriteCount", label, 0, int.MaxValue),
@@ -296,7 +311,7 @@ internal sealed record CohortEntryRecord
 /// </remarks>
 internal sealed class CohortJournal
 {
-    internal const string ContractVersionValue = "devpilot.shadow-cohort.journal.v1";
+    internal const string ContractVersionValue = "devpilot.shadow-cohort.journal.v2";
     internal const string KindValue = "shadow-cohort-journal";
 
     private const string Label = "shadow cohort journal";
@@ -703,6 +718,7 @@ internal sealed class CohortJournal
         RequireInRange(record, "childProcessId", record.ChildProcessId, 0, int.MaxValue);
         RequireInRange(record, "elapsedSeconds", record.ElapsedSeconds, 0, int.MaxValue);
         RequireInRange(record, "modelStartCount", record.ModelStartCount, 0, int.MaxValue);
+        RequireInRange(record, "modelStartUnmeasuredAllowance", record.ModelStartUnmeasuredAllowance, 0, int.MaxValue);
         RequireInRange(record, "verifierAssignmentCount", record.VerifierAssignmentCount, 0, int.MaxValue);
         RequireInRange(record, "slotLaunchCount", record.SlotLaunchCount, 0, int.MaxValue);
         RequireInRange(record, "providerWriteCount", record.ProviderWriteCount, 0, int.MaxValue);

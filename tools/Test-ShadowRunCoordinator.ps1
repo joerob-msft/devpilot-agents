@@ -996,7 +996,16 @@ Write-StubResult -Fields ([ordered]@{
         signatureVerified = $true
         inventoryVerified = $true
         slotAttemptCount = [int]$attempts.Count
-        modelInvocationCount = 0
+        slotAttemptRecordCount = [int]$attempts.Count
+        realModelStartCount = 0
+        realModelStartsGeneralist = 0
+        realModelStartsSpecialist = 0
+        realModelStartsVerifier = 0
+        realModelStartCensusComplete = $true
+        realModelStartCensusExact = $true
+        realModelStartUnmeasuredAllowance = 0
+        realModelStartCensusBasis = 'stubNoModelRun'
+        realModelStartCensusDetail = 'stub'
         deliveryMode = 'PreviewOnly'
         promotable = $false
     })
@@ -1194,7 +1203,7 @@ try {
     $auditPath = Join-Path $fixture.OutputRoot 'coordinator\audit.json'
     Assert-Coordinator (Test-Path -LiteralPath $auditPath -PathType Leaf) 'The coordinator wrote no audit.'
     $audit = Get-Content -LiteralPath $auditPath -Raw | ConvertFrom-Json -Depth 32
-    Assert-Coordinator ([int]$audit.modelInvocationCount -eq 0 -and [int]$audit.slotLaunchCount -eq 0) `
+    Assert-Coordinator ([int]$audit.preparationAttemptRecordCount -eq 0 -and [int]$audit.slotLaunchCount -eq 0) `
         'The audit does not record a preparation that launched nothing.'
     $planned = $audit.stages.recipePlanned
     Assert-Coordinator ([int]$planned.publishedCount -eq 12) `
@@ -1551,8 +1560,8 @@ try {
     $windowAudit = Get-Content -LiteralPath (Join-Path $windowRoot 'coordinator\audit.json') -Raw | ConvertFrom-Json -Depth 24
     Assert-Coordinator ([string]$windowAudit.finalState -ceq 'runSetReady') `
         "The recovered run reached '$($windowAudit.finalState)' rather than run-set-ready."
-    Assert-Coordinator ([int]$windowAudit.modelInvocationCount -eq 0) `
-        'The recovered run recorded a model invocation.'
+    Assert-Coordinator ([int]$windowAudit.preparationAttemptRecordCount -eq 0) `
+        'The recovered run recorded a reviewer process at readiness.'
     $sealedBefore = @(Get-ChildItem -LiteralPath (Join-Path $windowRoot 'replay-root') -Directory)
     Assert-Coordinator ($sealedBefore.Count -eq 1) `
         "The recovered run left $($sealedBefore.Count) snapshots rather than adopting the one already sealed."
@@ -1659,7 +1668,7 @@ try {
     $declareAudit = Get-Content -LiteralPath (Join-Path $declareRoot 'coordinator\audit.json') -Raw | ConvertFrom-Json -Depth 24
     Assert-Coordinator ([string]$declareAudit.finalState -ceq 'runSetReady') `
         "The recovered declaration run reached '$($declareAudit.finalState)' rather than run-set-ready."
-    Assert-Coordinator ([int]$declareAudit.slotLaunchCount -eq 0 -and [int]$declareAudit.modelInvocationCount -eq 0) `
+    Assert-Coordinator ([int]$declareAudit.slotLaunchCount -eq 0 -and [int]$declareAudit.preparationAttemptRecordCount -eq 0) `
         'The recovered declaration run recorded a slot or model launch.'
     Assert-Coordinator ($sealedDigestBefore.Length -gt 0 -and $declaredBefore.Count -ge 1) `
         'The first pre-commit window did not leave the evidence the later cases compare against.'
@@ -1963,8 +1972,8 @@ try {
     $shortAudit = Get-Content -LiteralPath (Join-Path $auditRoot 'coordinator\audit.json') -Raw | ConvertFrom-Json -Depth 24
     Assert-Coordinator (-not [bool]$shortAudit.invariantCountsObserved) `
         'A run stopped short of readiness claimed it had observed the invariant counts.'
-    Assert-Coordinator (-not $shortAudit.PSObject.Properties['modelInvocationCount']) `
-        'A run that never observed a model census still published one, which reads as zero.'
+    Assert-Coordinator (-not $shortAudit.PSObject.Properties['preparationAttemptRecordCount']) `
+        'A run that never observed the readiness census still published one, which reads as zero.'
     Assert-Coordinator (-not $shortAudit.PSObject.Properties['slotLaunchCount']) `
         'A run that never observed a slot census still published one, which reads as zero.'
     $shortChildCount = [int]$shortAudit.childResultTransitionCount
@@ -1975,7 +1984,7 @@ try {
     $resumedAudit = Get-Content -LiteralPath (Join-Path $auditRoot 'coordinator\audit.json') -Raw | ConvertFrom-Json -Depth 24
     Assert-Coordinator ([bool]$resumedAudit.invariantCountsObserved) `
         'A completed run did not record that it had observed the invariant counts.'
-    Assert-Coordinator ([int]$resumedAudit.slotLaunchCount -eq 0 -and [int]$resumedAudit.modelInvocationCount -eq 0) `
+    Assert-Coordinator ([int]$resumedAudit.slotLaunchCount -eq 0 -and [int]$resumedAudit.preparationAttemptRecordCount -eq 0) `
         'The completed audit recorded a slot or model launch.'
     $uninterruptedAudit = Get-Content -LiteralPath (Join-Path $fixture.OutputRoot 'coordinator\audit.json') -Raw |
         ConvertFrom-Json -Depth 24
@@ -2333,8 +2342,8 @@ try {
         Assert-Coordinator ([int]$slotAudit.slotLaunchCount -eq 0) `
             ("The readiness census reports $($slotAudit.slotLaunchCount) attempt records at run-set-ready; " +
                 'a ready run set is one where nothing has run yet.')
-        Assert-Coordinator ([int]$slotAudit.modelInvocationCount -eq 0) `
-            'The coordinator claims to have invoked a model.'
+        Assert-Coordinator ([int]$slotAudit.preparationAttemptRecordCount -eq 0) `
+            'The readiness census claims a reviewer process had already run.'
         Assert-Coordinator ([int]$slotAudit.providerWriteCount -eq 0 -and
             [string]$slotAudit.deliveryMode -ceq 'previewOnly') `
             'The audit does not record a preview-only run with no provider writes.'
@@ -3187,8 +3196,8 @@ try {
                 "The audit reports '$([string]$record.slotName)' terminal status '$([string]$record.slotTerminalStatus)'."
             Assert-Coordinator ([string]$record.slotTerminalSha256 -cmatch '^[0-9a-f]{64}$') `
                 "The audit indexes '$([string]$record.slotName)' without a terminal digest."
-            Assert-Coordinator ([int]$record.slotModelInvocationCount -eq 0) `
-                "The audit claims '$([string]$record.slotName)' invoked a model."
+            Assert-Coordinator ([int]$record.slotRealModelStartCount -eq 0) `
+                "The audit claims '$([string]$record.slotName)' started a model."
         }
         Assert-Coordinator ([bool]$setAudit.reconciliationPerformed) `
             'The audit does not record the reconciliation this run performed.'
@@ -3212,8 +3221,31 @@ try {
         Assert-Coordinator ([int]$setAudit.providerWriteCount -eq 0 -and
             [string]$setAudit.deliveryMode -ceq 'previewOnly') `
             'A reconciled two-slot set is not recorded as a preview-only run with no provider writes.'
-        Assert-Coordinator ([int]$setAudit.modelInvocationCount -eq 0) `
-            'The reconciled set claims to have invoked a model.'
+        Assert-Coordinator ([int]$setAudit.preparationAttemptRecordCount -eq 0) `
+            'The reconciled set claims a reviewer process had already run at readiness.'
+        # The two censuses are different things and the audit must publish both.
+        # A stubbed set starts no model, so the real-start total is zero; what is
+        # asserted here is that the total is REPORTED, that its role breakdown
+        # adds up to it, and that the reviewer-process census sits beside it under
+        # its own name rather than standing in for it.
+        Assert-Coordinator ([bool]$setAudit.realModelStartsObserved) `
+            'A set that supervised two slots did not record that it had counted their model starts.'
+        Assert-Coordinator ([int]$setAudit.realModelStartCount -eq 0 -and
+            ([int]$setAudit.realModelStartsGeneralist + [int]$setAudit.realModelStartsSpecialist +
+                [int]$setAudit.realModelStartsVerifier) -eq [int]$setAudit.realModelStartCount) `
+            'The audit does not publish a real model start census whose roles add up to its total.'
+        Assert-Coordinator ([bool]$setAudit.realModelStartCensusComplete -and
+            [int]$setAudit.realModelStartUnmeasuredAllowance -eq 0) `
+            'A set whose slots both ended cleanly published an incomplete model start census.'
+        Assert-Coordinator ([int]$setAudit.realModelStartLaunchedSlotCount -eq 2 -and
+            [int]$setAudit.supervisedSlotCount -eq 2) `
+            'The audit does not account for both launched slots.'
+        foreach ($record in @($setAudit.slots)) {
+            Assert-Coordinator ([int]$record.slotAttemptRecordCount -eq [int]$record.slotAttemptCount) `
+                "The audit does not carry '$([string]$record.slotName)' reviewer process census."
+            Assert-Coordinator ([bool]$record.slotRealModelStartCensusExact) `
+                "The audit reports '$([string]$record.slotName)' as ending without an exact model start census."
+        }
         # This set declared no delivery, so it has no delivery transition. The
         # claim is asserted on the transition names rather than on the whole
         # record, because the reviewed plan the record carries legitimately says
@@ -3661,8 +3693,8 @@ try {
             Assert-Coordinator ([string]$count.name -cmatch '^[A-Za-z0-9]+$' -and [int]$count.value -ge 0) `
                 'The opaque delivery census carries an entry this coordinator could not have copied verbatim.'
         }
-        Assert-Coordinator ([int]$deliverAudit.modelInvocationCount -eq 0) `
-            'The delivered set claims to have invoked a model.'
+        Assert-Coordinator ([int]$deliverAudit.preparationAttemptRecordCount -eq 0) `
+            'The delivered set claims a reviewer process had already run at readiness.'
         Assert-Coordinator ([string]$deliverAudit.deliveryStatus -cmatch '^[A-Za-z]+$') `
             'The audit carries no delivery status word.'
 

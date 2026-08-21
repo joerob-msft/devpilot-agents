@@ -347,6 +347,35 @@ if (Test-Path -LiteralPath $machineContract -PathType Leaf) {
     # it falls back to.
     Assert-Coordinator ($machineText.Contains('PreviewOnlyKind')) `
         'The coordinator does not pin the one authorization kind it performs.'
+    # The opening audit decides whether an ending from an earlier invocation is
+    # standing over this root, and a wrong answer there lets a run walk beneath a
+    # document that claims it finished. File.Exists answers false for a path it
+    # was not allowed to look at, which is indistinguishable from absence, so the
+    # decision is taken from the attributes and an unreadable answer is the
+    # hazard rather than the safe case.
+    Assert-Coordinator ($machineText.Contains('ProbeAuditPathOrRefuse')) `
+        'The coordinator does not decide what stands at the audit path through a single fail-closed probe.'
+    $openingAudit = [regex]::Match($machineText,
+        'private void WriteOpeningAudit\(\)\s*\{.*?\n    \}', 'Singleline')
+    Assert-Coordinator ($openingAudit.Success) `
+        'The coordinator no longer opens its run by replacing whatever audit stands over the root.'
+    if ($openingAudit.Success) {
+        Assert-Coordinator (-not $openingAudit.Value.Contains('File.Exists')) `
+            'The opening audit decides on File.Exists, which cannot tell an absent audit from one this process may not stat.'
+        Assert-Coordinator ($openingAudit.Value.Contains('AuditPathKind.File')) `
+            'The opening audit does not act on a file standing where this run''s report belongs.'
+        Assert-Coordinator ($openingAudit.Value.Contains('File.Delete')) `
+            'The opening audit does not remove the earlier ending before writing its own.'
+    }
+    $probe = [regex]::Match($machineText,
+        'private AuditPathKind ProbeAuditPathOrRefuse\(string moment\)\s*\{.*?\n    \}', 'Singleline')
+    Assert-Coordinator ($probe.Success -and $probe.Value.Contains('File.GetAttributes')) `
+        'The audit path probe does not read the attributes it needs to tell a directory from a file.'
+    Assert-Coordinator ($probe.Success -and $probe.Value.Contains('FileNotFoundException') -and
+        $probe.Value.Contains('DirectoryNotFoundException')) `
+        'The audit path probe does not treat a genuinely absent path as absent.'
+    Assert-Coordinator ($probe.Success -and $probe.Value.Contains('throw new ContractException')) `
+        'The audit path probe does not refuse the run when it cannot tell what is there.'
 }
 
 # The one kind is defined once, in the request contract, and there is no second
@@ -506,12 +535,25 @@ if ($cohortPresent.Count -eq $cohortSources.Count) {
 
     # Every cohort document is versioned and every one of them is a file. Nothing
     # here answers on a stream.
-    foreach ($contract in @('devpilot.shadow-cohort.manifest.v1', 'devpilot.shadow-cohort.journal.v1',
-            'devpilot.shadow-cohort.index.v1', 'devpilot.shadow-cohort.launch-intent.v1',
-            'devpilot.shadow-cohort.lease.v1')) {
+    foreach ($contract in @('devpilot.shadow-cohort.manifest.v2', 'devpilot.shadow-cohort.journal.v2',
+            'devpilot.shadow-cohort.index.v2', 'devpilot.shadow-cohort.launch-intent.v1',
+            'devpilot.shadow-cohort.lease.v1', 'devpilot.shadow-cohort.model-start-bound.v1')) {
         Assert-Coordinator ($cohortText.Contains($contract)) `
             "The cohort does not name the versioned contract '$contract'."
     }
+
+    # The budget the cohort spends is measured in real model subprocess starts,
+    # read from the signed per-entry audit. A build that went back to inferring it
+    # from a count of reviewer processes would spend four models against a ceiling
+    # of three and call it compliant.
+    Assert-Coordinator ($cohortAuditText.Contains('RequireRealModelStarts')) `
+        'The cohort audit has no single reader for the real model start count its budget is spent in.'
+    Assert-Coordinator (-not $cohortAuditText.Contains('modelInvocationCount')) `
+        'The cohort audit still reads a model invocation count; that census counted reviewer processes, not model starts.'
+    Assert-Coordinator ($runnerText.Contains('RequireSealedModelStartBounds')) `
+        'The cohort does not prove its per-entry model start estimates are upper bounds before launching.'
+    Assert-Coordinator ($runnerText.IndexOf('RequireSealedModelStartBounds()') -lt $runnerText.IndexOf('RunEntry(')) `
+        'The cohort proves its model start bounds after starting an entry against them.'
     Assert-Coordinator ($cohortText.Contains('Console.Out.Write') -eq $false) `
         'The cohort writes to stdout; its documents travel in files and its progress on the error stream.'
 
