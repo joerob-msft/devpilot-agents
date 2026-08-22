@@ -43,6 +43,53 @@ internal sealed record CohortManifest
 
     internal const string KindValue = "shadow-cohort-run";
 
+    /// <summary>
+    /// The one other kind a cohort may declare, under which the fault-injection
+    /// arguments a fault test needs are permitted.
+    /// </summary>
+    /// <remarks>
+    /// A fault test has to be able to stop a preparation in the middle, and the
+    /// only way to do that is to pass the argument that stops it. An operator
+    /// cohort must never pass that argument, because a preparation halted before
+    /// its target is a preparation whose evidence is partial and whose exit code
+    /// says so - which is exactly the shape a completed entry would otherwise be
+    /// mistaken for.
+    ///
+    /// So the permission is a KIND rather than a flag, and the kind carries a
+    /// price: a cohort declaring it may not start the shipping preparation. It
+    /// must start a stub instead, and the stub is what is proved - the command
+    /// and its arguments may not name this program, and they must name a script.
+    /// A cohort that cannot reach the preparation cannot reach the reviewer the
+    /// preparation launches. That is the whole of the claim, and it is a property
+    /// of the launch rather than a promise in a field: a stub script is free to
+    /// start whatever IT likes, so this is a development affordance rather than a
+    /// proof of model isolation, and it is never an operator contract.
+    /// </remarks>
+    internal const string TestOnlyKindValue = "shadow-cohort-test-run";
+
+    /// <summary>This program, by file name, in both shapes it is started as.</summary>
+    internal static readonly string[] ShippingPreparationFileNames =
+    [
+        "ShadowRunCoordinator.dll",
+        "ShadowRunCoordinator.exe"
+    ];
+
+    /// <summary>
+    /// The framework host, by whole file name, in the two shapes it is named as.
+    /// </summary>
+    /// <remarks>
+    /// Whole names rather than a name-without-extension test, because the latter
+    /// admits <c>dotnet.com</c>, <c>dotnet.cmd</c> and <c>dotnet.scr</c> - none of
+    /// which is the host, all of which are launchable, and one of which Windows
+    /// would prefer over the real host on a bare <c>dotnet</c> lookup.
+    /// </remarks>
+    internal static readonly string[] DotnetHostFileNames =
+    [
+        "dotnet",
+        "dotnet.exe"
+    ];
+
+
     /// <summary>The only concurrency this build runs a cohort at.</summary>
     /// <remarks>
     /// One. A second concurrent entry would put two typed coordinators, two
@@ -63,6 +110,12 @@ internal sealed record CohortManifest
     internal required string CohortId { get; init; }
 
     internal required string CorrelationId { get; init; }
+
+    /// <summary>Which of the two kinds this cohort was declared under.</summary>
+    internal required string Kind { get; init; }
+
+    /// <summary>Whether this cohort may carry fault-injection arguments.</summary>
+    internal bool IsTestOnly => string.Equals(Kind, TestOnlyKindValue, StringComparison.Ordinal);
 
     internal required string ToolkitRoot { get; init; }
 
@@ -130,7 +183,14 @@ internal sealed record CohortManifest
                 $"reinterpret it: re-declare the cohort as '{ContractVersionValue}' with a sealed model-start bound per entry.");
         }
         StrictJson.RequireLiteral(root, "contractVersion", ContractVersionValue, label);
-        StrictJson.RequireLiteral(root, "kind", KindValue, label);
+        var kind = StrictJson.RequireString(root, "kind", label);
+        if (!string.Equals(kind, KindValue, StringComparison.Ordinal)
+            && !string.Equals(kind, TestOnlyKindValue, StringComparison.Ordinal))
+        {
+            throw new ContractException(
+                $"The {label} declares kind '{kind}'. This build runs '{KindValue}' and, for fault tests that may not name the " +
+                $"shipping reviewer, '{TestOnlyKindValue}'.");
+        }
 
         var cohortId = StrictJson.RequireString(root, "cohortId", label);
         RequireOpaqueShape(cohortId, label, "cohortId", 8, 64);
@@ -181,6 +241,7 @@ internal sealed record CohortManifest
         {
             CohortId = cohortId,
             CorrelationId = correlationId,
+            Kind = kind,
             ToolkitRoot = StrictJson.RequireString(toolkit, "repositoryRoot", label + " toolkit"),
             ToolkitHead = StrictJson.RequireHex(toolkit, "head", label + " toolkit", 40),
             RequiredRef = StrictJson.RequireString(toolkit, "requiredRef", label + " toolkit"),
@@ -427,7 +488,21 @@ internal sealed record CohortManifest
                 "entries that already ran, and a child started elsewhere would publish its evidence somewhere nobody looks. " +
                 "Declare a fully qualified absolute path.");
         }
-        return Path.GetFullPath(path);
+        try
+        {
+            return Path.GetFullPath(path);
+        }
+        catch (Exception error) when (error is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            // Fully qualified is not the same as resolvable. A path holding a NUL
+            // is fully qualified by inspection and throws here, and so does one too
+            // long for the platform to name. Both are manifests this build refuses
+            // to read, and a refusal is the typed contract exception with the field
+            // in it - not a fault from underneath with a stack trace on it, which
+            // is not one of the exit codes this program documents.
+            throw new ContractException(
+                $"The {label} declares a {field} '{path}' that cannot be resolved to an absolute path: {error.Message}");
+        }
     }
 
     /// <summary>
@@ -489,6 +564,38 @@ internal sealed record CohortExecution
     /// <summary>Opaque argument strings forwarded ahead of this runner's own two.</summary>
     internal required IReadOnlyList<string> ArgumentPrefix { get; init; }
 
+    /// <summary>
+    /// The tokens in <see cref="ArgumentPrefix"/> a production cohort may not
+    /// pass, each with the reason it was refused.
+    /// </summary>
+    /// <remarks>
+    /// Computed at load and enforced at launch rather than at load, because
+    /// rebuilding an index launches nothing: a frozen root written by an earlier
+    /// build has to stay readable so its evidence can be re-derived, and refusing
+    /// to parse its manifest would make the evidence unreachable rather than
+    /// unusable. What must never happen again is a LAUNCH under these arguments.
+    /// </remarks>
+    internal required IReadOnlyList<string> RefusedArguments { get; init; }
+
+    /// <summary>
+    /// Whether the command and its arguments name this program, which is the
+    /// thing that can start a reviewer and therefore a model.
+    /// </summary>
+    internal required bool NamesShippingPreparation { get; init; }
+
+    /// <summary>
+    /// Whether the command or its arguments name a script, which is the shape a
+    /// stub adapter takes.
+    /// </summary>
+    internal required bool NamesStubAdapter { get; init; }
+
+    /// <summary>
+    /// Whether the launch is one of the two enumerated shapes that start this
+    /// program directly, with nothing between the manifest's arguments and this
+    /// program's own parser.
+    /// </summary>
+    internal required bool IsShippingLaunchProfile { get; init; }
+
     /// <summary>The preparation state each entry is driven to.</summary>
     internal required string Target { get; init; }
 
@@ -549,6 +656,9 @@ internal sealed record CohortExecution
             {
                 throw new ContractException($"The {label} field 'argumentPrefix' holds an empty string at index {index.ToString(CultureInfo.InvariantCulture)}.");
             }
+            RequireNoControlCharacter(
+                prefix[index],
+                $"{label} field 'argumentPrefix' at index {index.ToString(CultureInfo.InvariantCulture)}");
         }
 
         // Parsed here purely so a manifest naming a state this build does not
@@ -556,17 +666,272 @@ internal sealed record CohortExecution
         var target = StrictJson.RequireString(node, "target", label);
         _ = PreparationStateNames.Parse(target);
 
+        var commandPath = StrictJson.RequireString(node, "commandPath", label);
+        RequireNoControlCharacter(commandPath, $"{label} field 'commandPath'");
+        var namesPreparation = NamesShipping(commandPath);
+        var namesStub = NamesScript(commandPath);
+        for (var index = 0; index < prefix.Count; index++)
+        {
+            namesPreparation |= NamesShipping(prefix[index]);
+            namesStub |= NamesScript(prefix[index]);
+        }
+
         return new CohortExecution
         {
             Concurrency = concurrency,
             StopPolicy = stopPolicy,
             AuthorizationKind = authorizationKind,
-            CommandPath = StrictJson.RequireString(node, "commandPath", label),
+            CommandPath = commandPath,
             ArgumentPrefix = prefix,
+            RefusedArguments = ClassifyArguments(prefix),
+            NamesShippingPreparation = namesPreparation,
+            NamesStubAdapter = namesStub,
+            IsShippingLaunchProfile = IsShippingProfile(commandPath, prefix),
             Target = target,
             EntryTimeoutSeconds = StrictJson.RequireInt(node, "entryTimeoutSeconds", label, 1, 86400)
         };
     }
+
+    /// <summary>
+    /// Refuses a launch token holding a character no path or argument has any use
+    /// for.
+    /// </summary>
+    /// <remarks>
+    /// A well-formedness refusal, and it exists because of exactly one character.
+    /// <c>Path.GetFileName</c> scans back from the END of a string to the last
+    /// separator; the Win32 process creation this token eventually reaches is
+    /// handed a null-terminated buffer and stops at the FIRST U+0000. So a token
+    /// such as <c>C:\windows\system32\whoami.exe\0\ShadowRunCoordinator.dll</c>
+    /// answers "yes, that names the shipping preparation" to every string test in
+    /// this file while starting something else entirely: the two functions read
+    /// opposite ends of the same string. No enumeration of launch shapes can hold
+    /// while that is true, because the shape being enumerated is not the shape
+    /// being run.
+    ///
+    /// The whole C0 range and DEL go, not U+0000 alone. None of them can appear in
+    /// a Windows path or in an argument this program parses, so refusing the range
+    /// costs nothing and leaves no second character to be clever with. It is a
+    /// load-time refusal, alongside the empty-token one above, because a token
+    /// that cannot be read the same way twice is malformed rather than merely
+    /// inadmissible - and no manifest that a real cohort ever wrote can contain
+    /// one, so nothing already on disk becomes unreadable.
+    /// </remarks>
+    private static void RequireNoControlCharacter(string token, string label)
+    {
+        for (var index = 0; index < token.Length; index++)
+        {
+            var character = token[index];
+            if (character >= ' ' && character != '\u007f')
+            {
+                continue;
+            }
+            throw new ContractException(
+                $"The {label} holds the control character U+{((int)character).ToString("X4", CultureInfo.InvariantCulture)} at " +
+                $"index {index.ToString(CultureInfo.InvariantCulture)}. A launch token is read here as text and executed elsewhere " +
+                "as a null-terminated buffer; a token those two readings disagree about names one program to this build and starts " +
+                "another, so it is refused rather than interpreted.");
+        }
+    }
+
+    /// <summary>Whether one token names a script this program never launches in production.</summary>
+    private static bool NamesScript(string token)
+    {
+        string extension;
+        try
+        {
+            extension = Path.GetExtension(token);
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        return extension.Length > 0 && StubAdapterExtensions.Contains(extension);
+    }
+
+    /// <summary>
+    /// Whether this launch is one of the two shapes that provably start this
+    /// program and nothing else.
+    /// </summary>
+    /// <remarks>
+    /// The question a production cohort has to answer is not "are these arguments
+    /// acceptable" but "does this launch reach a parser that will hold them to
+    /// that". Classifying the arguments alone answers the first and leaves the
+    /// second open: a cohort naming a shell can put every refused switch inside a
+    /// single token that is not an option and has no extension - <c>cmd /c "dotnet
+    /// ...\ShadowRunCoordinator.dll --halt-after deliveryTerminalVerified"</c> -
+    /// and the splitting that reintroduces them happens one process later, where
+    /// nothing here can see it.
+    ///
+    /// So the admissible launches are enumerated rather than filtered. Either the
+    /// command is this program, or the command is the dotnet host and the FIRST
+    /// argument is this program's assembly: in both, the very next thing to read
+    /// an argument is the preparation's own parser, which takes whole tokens and
+    /// knows no <c>--option=value</c> form. Anything else - a shell, a wrapper, a
+    /// script, this program named somewhere other than first - is refused without
+    /// asking what its arguments were.
+    /// </remarks>
+    private static bool IsShippingProfile(string commandPath, IReadOnlyList<string> prefix)
+    {
+        if (NamesShipping(commandPath))
+        {
+            return true;
+        }
+
+        string command;
+        try
+        {
+            command = Path.GetFileName(commandPath);
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        var namesHost = false;
+        foreach (var candidate in CohortManifest.DotnetHostFileNames)
+        {
+            namesHost |= string.Equals(command, candidate, StringComparison.OrdinalIgnoreCase);
+        }
+        if (!namesHost)
+        {
+            return false;
+        }
+        return prefix.Count > 0 && NamesShipping(prefix[0]);
+    }
+
+    /// <summary>Whether one token names this program by file name.</summary>
+    private static bool NamesShipping(string token)
+    {
+        string name;
+        try
+        {
+            name = Path.GetFileName(token);
+        }
+        catch (ArgumentException)
+        {
+            // A token that is not a path shape cannot be naming a file, and a
+            // question about a file name is answered 'no' rather than thrown.
+            return false;
+        }
+        foreach (var candidate in CohortManifest.ShippingPreparationFileNames)
+        {
+            if (string.Equals(name, candidate, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Every argument a production cohort may not forward to a preparation, and
+    /// the reason each one is refused.
+    /// </summary>
+    /// <remarks>
+    /// Whole tokens, compared as whole tokens. A substring test would refuse an
+    /// output root that happened to contain the word "fault" and would miss
+    /// nothing in exchange, because an argument list is already split: there is
+    /// no assembling to see through. The one shape that hides an option inside a
+    /// single token is <c>--option=value</c>, so the part before the first '=' is
+    /// compared as well as the whole.
+    ///
+    /// The comparison is case-insensitive even though the preparation's own parse
+    /// is ordinal. That is deliberate and is not a mistake about the parser: a
+    /// token this method let through in the wrong case would be refused by the
+    /// preparation as unrecognised, so refusing it here costs nothing, and being
+    /// stricter than the thing being guarded is the right direction for a guard.
+    /// </remarks>
+    private static IReadOnlyList<string> ClassifyArguments(IReadOnlyList<string> prefix)
+    {
+        var refused = new List<string>();
+        for (var index = 0; index < prefix.Count; index++)
+        {
+            var token = prefix[index];
+            var separator = token.IndexOf('=', StringComparison.Ordinal);
+            var option = separator < 0 ? token : token[..separator];
+
+            if (FaultInjectionOptions.Contains(option))
+            {
+                refused.Add($"'{token}' injects a fault or stops a preparation short of its target");
+                continue;
+            }
+            if (RunnerOwnedOptions.Contains(option))
+            {
+                refused.Add($"'{token}' is an argument this runner appends itself, and a second one would redirect the child");
+                continue;
+            }
+            if (ScriptHostOptions.Contains(option))
+            {
+                refused.Add($"'{token}' runs a script rather than the declared preparation");
+                continue;
+            }
+            var extension = Path.GetExtension(token);
+            if (extension.Length > 0 && StubAdapterExtensions.Contains(extension))
+            {
+                refused.Add($"'{token}' is a script, and a cohort that prepares live pull requests runs the compiled preparation");
+            }
+        }
+        return refused;
+    }
+
+    /// <summary>Arguments whose whole purpose is to make a preparation misbehave.</summary>
+    private static readonly HashSet<string> FaultInjectionOptions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "--halt-after",
+        "--halt",
+        "--halt-at",
+        "--stop-after",
+        "--fault",
+        "--faults",
+        "--inject-fault",
+        "--fault-after",
+        "--simulate",
+        "--simulate-fault",
+        "--crash",
+        "--crash-after",
+        "--fail-after",
+        "--abort-after",
+        "--exit-code",
+        "--force-exit",
+        "--stub",
+        "--stub-adapter",
+        "--test-only",
+        "--test-hook",
+        "--test-mode",
+        "--debug-hook",
+        "--debug-break"
+    };
+
+    /// <summary>Arguments this runner appends itself, so a manifest may not.</summary>
+    private static readonly HashSet<string> RunnerOwnedOptions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "--request",
+        "--target",
+        "--cohort",
+        "--authorized-by",
+        "--rebuild-index"
+    };
+
+    /// <summary>Ways of asking a shell to run something other than the preparation.</summary>
+    private static readonly HashSet<string> ScriptHostOptions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "-File",
+        "-Command",
+        "-c",
+        "-EncodedCommand",
+        "-e"
+    };
+
+    /// <summary>Extensions a stub adapter is written in.</summary>
+    private static readonly HashSet<string> StubAdapterExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".ps1",
+        ".psm1",
+        ".cmd",
+        ".bat",
+        ".sh",
+        ".py",
+        ".js"
+    };
 
     internal bool StopsOnFirstFailure => string.Equals(StopPolicy, CohortManifest.StopPolicyFailFast, StringComparison.Ordinal);
 }
@@ -669,6 +1034,20 @@ internal sealed record CohortEntry
 
     internal required string TargetCommit { get; init; }
 
+    /// <summary>
+    /// The branch this pull request merges into, as the provider names it, or
+    /// empty when the manifest did not pin one.
+    /// </summary>
+    /// <remarks>
+    /// Optional at load and required at launch. A frozen root written before this
+    /// field existed still has to be readable, or its evidence would become
+    /// unreachable; but an entry about to start a preparation has to be able to
+    /// prove that the configuration it is about to run under is the configuration
+    /// for the branch this pull request actually targets. Absent, therefore, is
+    /// not "any target" - it is "not yet proven", which blocks the launch.
+    /// </remarks>
+    internal required string TargetRefName { get; init; }
+
     internal required string ConfigSha256 { get; init; }
 
     internal required string PromptSha256 { get; init; }
@@ -753,7 +1132,8 @@ internal sealed record CohortEntry
             "iterationId",
             "sourceCommit",
             "commonCommit",
-            "targetCommit");
+            "targetCommit",
+            "targetRefName");
 
         var digests = StrictJson.RequireObject(node, "digests", label);
         StrictJson.RequireNoUnknownFields(digests, label + " digests", "configSha256", "promptSha256", "schemaSha256");
@@ -781,6 +1161,7 @@ internal sealed record CohortEntry
             SourceCommit = StrictJson.RequireHex(subject, "sourceCommit", label + " subject", 40),
             CommonCommit = StrictJson.RequireHex(subject, "commonCommit", label + " subject", 40),
             TargetCommit = StrictJson.RequireHex(subject, "targetCommit", label + " subject", 40),
+            TargetRefName = ReadOptionalTargetRefName(subject, label + " subject"),
             ConfigSha256 = StrictJson.RequireHex(digests, "configSha256", label + " digests", 64),
             PromptSha256 = StrictJson.RequireHex(digests, "promptSha256", label + " digests", 64),
             SchemaSha256 = StrictJson.RequireHex(digests, "schemaSha256", label + " digests", 64),
@@ -796,10 +1177,42 @@ internal sealed record CohortEntry
     }
 
     /// <summary>
+    /// Reads the optional pinned target ref, refusing a present-but-malformed one
+    /// rather than treating it as absent.
+    /// </summary>
+    private static string ReadOptionalTargetRefName(JsonElement subject, string label)
+    {
+        if (!subject.TryGetProperty("targetRefName", out _))
+        {
+            return string.Empty;
+        }
+        var text = StrictJson.RequireString(subject, "targetRefName", label);
+        if (!text.StartsWith("refs/", StringComparison.Ordinal))
+        {
+            throw new ContractException(
+                $"The {label} declares targetRefName '{text}'. A pinned target is compared with the reviewer configuration's own " +
+                "validated ref, which is fully qualified, so a short name would compare unequal to the branch it names.");
+        }
+        if (text.Length > 512)
+        {
+            throw new ContractException($"The {label} declares a targetRefName of {text.Length.ToString(CultureInfo.InvariantCulture)} characters.");
+        }
+        return text;
+    }
+
+    /// <summary>
     /// The subject binding, digested the way the typed coordinator digests its
     /// own, so the two can be compared without either restating the other's
     /// shape.
     /// </summary>
+    /// <remarks>
+    /// <see cref="TargetRefName"/> is deliberately absent. The typed request has
+    /// no such field, so digesting it here would make every manifest subject
+    /// compare unequal to the request it pins - and would silently change the
+    /// digest of every subject already recorded in a frozen root. The pinned ref
+    /// is checked against the reviewer configuration instead, which is where the
+    /// mismatch it exists to catch actually lives.
+    /// </remarks>
     internal MapNode DescribeSubject() => new MapNode()
         .Set("organization", Organization)
         .Set("project", Project)

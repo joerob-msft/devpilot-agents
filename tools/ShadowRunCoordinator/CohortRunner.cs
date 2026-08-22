@@ -207,7 +207,7 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
                     $"The cohort journal records entry '{entry.EntryId}' as ended after an earlier entry that never ended. " +
                     "A cohort prepares its entries in declared order, so this journal was not written by this build.");
             }
-            if (!record.EndedComplete)
+            if (!CountsAsComplete(entry, record))
             {
                 anyUnsuccessful = true;
                 if (_manifest.Execution.StopsOnFirstFailure)
@@ -277,7 +277,7 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
                     // to start it again would be the duplicate launch this whole
                     // design exists to prevent.
                     _log.WriteLine($"entry {entry.Ordinal.ToString(CultureInfo.InvariantCulture)} '{entry.EntryId}' already ended '{record.Outcome}'; not started again.");
-                    if (!record.EndedComplete)
+                    if (!CountsAsComplete(entry, record))
                     {
                         anyUnsuccessful = true;
                         if (_manifest.Execution.StopsOnFirstFailure)
@@ -605,6 +605,26 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
             WriteToolInvocationCount = summary.WriteToolInvocationCount,
             AuditSha256 = summary.AuditSha256
         };
+
+        // The exit code is not the only witness to whether the entry finished.
+        // A preparation told to stop at the cohort's target and stopping there
+        // exits non-zero to say it stopped on purpose, and reading that alone as
+        // a fault abandons an entry whose signed evidence says it arrived. The
+        // adoption is evaluated against the ending as it will be committed, so
+        // the decision a later rebuild makes is the decision made here.
+        if (!string.Equals(outcome, CohortEntryOutcomes.Complete, StringComparison.Ordinal))
+        {
+            var (adopted, why) = CohortCompletionAdoption.Evaluate(_manifest, summary with { Record = ending });
+            if (adopted)
+            {
+                _log.WriteLine(
+                    $"entry '{entry.EntryId}' exited {exitCode.ToString(CultureInfo.InvariantCulture)} and is adopted complete: {why}");
+                outcome = CohortEntryOutcomes.Complete;
+                detail = $"the entry exited {exitCode.ToString(CultureInfo.InvariantCulture)} and its authenticated audit proves the cohort's target was reached, so it is accounted complete";
+                ending = ending with { Outcome = outcome };
+            }
+        }
+
         // Digested against the ENDED record, because that is the record every
         // later reader will hold when it rebuilds this summary. A digest taken
         // over the pre-ending record would name a summary that no rebuild can
@@ -765,8 +785,158 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
                 $"Entry '{entry.EntryId}' declares a delivery this cohort cannot authorize. A cohort runs preview-only with a zero write budget, " +
                 "and it abandons every remaining entry rather than start one that declared otherwise.");
         }
+
+        RequireArgumentsAdmissible(entry);
+        RequireTargetCompatible(entry, request);
         return request;
     }
+
+    /// <summary>
+    /// Refuses to launch a preparation under arguments a live cohort may not pass.
+    /// </summary>
+    /// <remarks>
+    /// This is checked here, on the launch path, rather than when the manifest was
+    /// read. Reading is not running: a frozen root has to stay parseable so its
+    /// evidence can be re-derived by <c>--rebuild-index</c>, and a root written
+    /// under a fault argument is exactly the root whose evidence most needs
+    /// re-deriving. What the refusal protects is the launch.
+    ///
+    /// A cohort that declares the test-only kind may pass them, and pays for the
+    /// permission by not being allowed to start the shipping preparation: its
+    /// command and arguments may not name this program, and must name a stub.
+    ///
+    /// The production kind is held to the mirror image. Filtering the arguments
+    /// alone would leave a cohort free to name any executable at all and let that
+    /// executable decide what it starts, so the fault switches would be refused on
+    /// the manifest and reintroduced one process later by a wrapper. A production
+    /// cohort therefore has to name this program, directly, and may not name a
+    /// stub adapter alongside it. What remains outside the check is an operator
+    /// who renamed a binary on their own disk, which is not a boundary a manifest
+    /// reader can hold.
+    /// </remarks>
+    private void RequireArgumentsAdmissible(CohortEntry entry)
+    {
+        if (!_manifest.IsTestOnly)
+        {
+            if (_manifest.Execution.RefusedArguments.Count > 0)
+            {
+                throw new CohortBlockedException(
+                    $"The cohort forwards {string.Join("; ", _manifest.Execution.RefusedArguments)}. A cohort declared '{CohortManifest.KindValue}' " +
+                    "prepares live pull requests, and a preparation stopped short of its target leaves partial evidence carrying a non-zero exit - " +
+                    "the same shape a completed entry would otherwise be read as. Every remaining entry is abandoned rather than started this way.");
+            }
+            if (!_manifest.Execution.IsShippingLaunchProfile)
+            {
+                throw new CohortBlockedException(
+                    $"The cohort is declared '{CohortManifest.KindValue}' and its launch for entry '{entry.EntryId}' is not one this build starts. " +
+                    "A production launch is either the coordinator itself or the dotnet host with the coordinator's assembly first, so that the " +
+                    "next thing to read an argument is the coordinator's own parser. Anything interposed - a shell, a wrapper, a script - splits " +
+                    "its own arguments one process later, where the switches this kind refuses cannot be seen. Name the coordinator directly.");
+            }
+            if (_manifest.Execution.NamesStubAdapter)
+            {
+                throw new CohortBlockedException(
+                    $"The cohort is declared '{CohortManifest.KindValue}' and its launch for entry '{entry.EntryId}' names a script. " +
+                    "A production launch is the preparation and its own arguments; anything interposed decides for itself what it " +
+                    "starts and under which arguments.");
+            }
+            return;
+        }
+
+        if (_manifest.Execution.NamesShippingPreparation)
+        {
+            throw new CohortBlockedException(
+                $"The cohort is declared '{CohortManifest.TestOnlyKindValue}' and its launch for entry '{entry.EntryId}' names this program. " +
+                "That kind exists so a fault can be injected, and it is only safe while it cannot reach the preparation that launches a " +
+                "reviewer. A cohort that can inject faults into the shipping preparation is neither a test nor a run.");
+        }
+        if (!_manifest.Execution.NamesStubAdapter)
+        {
+            throw new CohortBlockedException(
+                $"The cohort is declared '{CohortManifest.TestOnlyKindValue}' and its launch for entry '{entry.EntryId}' names no stub adapter. " +
+                "The permission to inject faults is paid for by starting a stub, and a launch that cannot be shown to start one is refused " +
+                "rather than assumed harmless.");
+        }
+    }
+
+    /// <summary>
+    /// Refuses to launch an entry whose reviewer configuration was written for a
+    /// different branch than the one the pull request actually merges into.
+    /// </summary>
+    /// <remarks>
+    /// A pull request targeting a release branch reviewed under a configuration
+    /// bound to the trunk is not a review of that pull request. The mismatch does
+    /// not announce itself: the preparation gets far enough to fetch and to
+    /// reconcile before anything notices the branch it was told about is not the
+    /// branch the change lands on, by which point models may already have run.
+    ///
+    /// So the comparison happens here, before the intent is committed and before
+    /// any child exists. The configuration is read through the digest the request
+    /// already sealed, so a configuration edited after the cohort was declared is
+    /// refused as a digest mismatch rather than compared as though it were the
+    /// authorized one.
+    /// </remarks>
+    private void RequireTargetCompatible(CohortEntry entry, CoordinatorRequest request)
+    {
+        if (entry.TargetRefName.Length == 0)
+        {
+            throw new CohortBlockedException(
+                $"Entry '{entry.EntryId}' pins no subject targetRefName. An entry is launched only once the branch it merges into has been " +
+                "compared with the branch its reviewer configuration was written for, and an unpinned target cannot be compared. Re-declare " +
+                "the cohort with the target this pull request actually merges into.");
+        }
+
+        var configPath = request.ReviewerConfigPath;
+        byte[] bytes;
+        try
+        {
+            bytes = StrictJson.ReadFileBytes(configPath, $"entry '{entry.EntryId}' reviewer configuration", 8L * 1024 * 1024);
+        }
+        catch (ContractException error)
+        {
+            throw new CohortBlockedException(
+                $"Entry '{entry.EntryId}' names a reviewer configuration at '{configPath}' that could not be read ({error.Message}). " +
+                "A configuration that cannot be read cannot be proven to describe the branch this pull request merges into.");
+        }
+        catch (Exception error)
+        {
+            throw new CohortBlockedException(
+                $"Entry '{entry.EntryId}' names a reviewer configuration at '{configPath}' that could not be read ({error.GetType().Name}). " +
+                "A configuration that cannot be read cannot be proven to describe the branch this pull request merges into.");
+        }
+
+        var configDigest = CanonicalJson.Sha256Hex(bytes);
+        if (!string.Equals(configDigest, entry.ConfigSha256, StringComparison.Ordinal))
+        {
+            throw new CohortBlockedException(
+                $"Entry '{entry.EntryId}' seals a reviewer configuration digesting to {entry.ConfigSha256} and '{configPath}' digests to " +
+                $"{configDigest}. The configuration whose target is compared has to be the configuration the cohort authorized.");
+        }
+
+        string configured;
+        try
+        {
+            var root = StrictJson.ReadObjectBytes(bytes, configPath, $"entry '{entry.EntryId}' reviewer configuration");
+            var review = StrictJson.RequireObject(root, "review", $"entry '{entry.EntryId}' reviewer configuration");
+            configured = StrictJson.RequireString(review, "targetRefName", $"entry '{entry.EntryId}' reviewer configuration review");
+        }
+        catch (ContractException error)
+        {
+            throw new CohortBlockedException(
+                $"Entry '{entry.EntryId}' names a reviewer configuration at '{configPath}' that declares no readable review.targetRefName " +
+                $"({error.Message}). An entry whose configuration does not say which branch it reviews against is not launched.");
+        }
+
+        if (!string.Equals(configured, entry.TargetRefName, StringComparison.Ordinal))
+        {
+            throw new CohortBlockedException(
+                $"Entry '{entry.EntryId}' merges into '{entry.TargetRefName}' and its reviewer configuration reviews against '{configured}'. " +
+                "A pull request targeting one branch reviewed under a configuration bound to another is not a review of that pull request, so " +
+                "the cohort is abandoned rather than the entry started. Bind a configuration to the branch this pull request actually targets. " +
+                "The comparison is exact: a differently-cased ref names a different branch to the provider that resolves it.");
+        }
+    }
+
 
     /// <summary>
     /// The live head of the toolkit this cohort was declared against, or a
@@ -1225,6 +1395,44 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
         var correlation = CoordinatorRequest.Load(entry.RequestPath).CorrelationId;
         _correlations[entry.EntryId] = correlation;
         return correlation;
+    }
+
+    /// <summary>
+    /// Whether an already-ended entry counts as complete, by the same rule the
+    /// index publishes.
+    /// </summary>
+    /// <remarks>
+    /// A journal written by a build that read the exit code alone records an entry
+    /// that halted at the declared target as faulted. Judging a resume by that
+    /// record while the index adopts the same entry would let one run publish two
+    /// contradictory accounts of it - a stop policy that stopped, over an index
+    /// naming the entry it stopped for as adopted-complete. So both ask the same
+    /// question of the same artifacts, in the same order: the committed digests
+    /// first, then the adoption. Neither refusal is caught here. An audit that no
+    /// longer reproduces what it was accounted for is tamper wherever it is found,
+    /// and answering 'not complete' to it would let a walk carry on past evidence
+    /// the index is about to stop over anyway.
+    ///
+    /// Only a CLEAN ending short-circuits. A record already marked complete with a
+    /// non-zero exit is a record some earlier run adopted, and it is re-proved
+    /// here rather than taken on trust: the index publication at the top of the
+    /// walk would catch artifacts that moved since, but between that publication
+    /// and this loop is exactly the window in which the next entry would be
+    /// launched on the strength of an adoption that no longer holds.
+    /// </remarks>
+    private bool CountsAsComplete(CohortEntry entry, CohortEntryRecord record)
+    {
+        if (record.EndedComplete && record.ExitCode == CoordinatorExitCodes.Ok)
+        {
+            return true;
+        }
+        if (!record.HasEnded || record.EndedRefused || !CohortCompletionAdoption.IsAdoptableExit(record.ExitCode))
+        {
+            return false;
+        }
+        var summary = CohortSummaryReader.Read(entry, record, record.ElapsedSeconds, CorrelationOf(entry));
+        RequireCommittedDigests(entry, record, summary);
+        return CohortCompletionAdoption.Evaluate(_manifest, summary).Adopted;
     }
 
     private static void RequireCommittedDigests(CohortEntry entry, CohortEntryRecord record, CohortEntrySummary summary)

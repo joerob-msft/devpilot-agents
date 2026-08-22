@@ -119,7 +119,9 @@ run that was never interrupted. That is the property that makes "kill it anywher
 rather than a hope.
 
 `--halt-after <state>` stops deliberately after a named transition and exits 9. It exists so
-the suite can stop the process at every single transition and start it again.
+the suite can stop the process at every single transition and start it again. It is a fault-test
+argument and nothing else: a cohort declared `shadow-cohort-run` may not forward it, and the
+kind that may cannot start this program at all.
 
 ## Building the corpus
 
@@ -543,6 +545,95 @@ declaration still digests to what was declared, that the output root is the one 
 and that the request declares both slots, the reconciliation and a `PreviewOnly` delivery with a
 zero write budget. An entry that declares less than the full pipeline is refused rather than run
 in a reduced shape.
+
+**And every entry is reviewed under a configuration bound to the branch it is pinned to.** The
+entry's subject pins `targetRefName`, and immediately before the child is launched the runner reads
+the reviewer configuration that entry's request names — through the digest the manifest already
+sealed for it — and requires `review.targetRefName` to equal the pinned one, exactly. A pull
+request that merges into a release branch reviewed under a configuration bound to the trunk is not
+a review of that pull request, and the mismatch does not announce itself: the preparation gets as
+far as fetching and reconciling before anything notices, by which point models have run. A missing
+pin, a missing or unreadable configuration, a configuration whose bytes no longer match its sealed
+digest, or a ref that differs in any way including case blocks the entry before its preparation
+starts, and abandons the cohort rather than the entry.
+
+Be precise about what that proves and what it does not. It proves that the manifest and the
+reviewer configuration agree; it does **not** prove that either agrees with the branch the pull
+request currently merges into, and it cannot, because the runner performs no provider I/O of its
+own and the typed request carries commits rather than ref names. The manifest signer is
+authoritative for the pinned ref. Live drift — a pull request retargeted after the manifest was
+sealed — is caught one layer down, and specifically by the reviewer's own candidate predicate
+(`Get-ReviewerCandidateDecision`), which compares the live pull request's `targetRefName` with
+`config.review.targetRefName` and declines the pull request before any model process starts; every
+pull request goes through that predicate, including one named explicitly by `-PullRequestId`. It is
+*not* the pre/post identity capture that catches a retarget: that binds commits, status and
+repository, and detects movement *during* the capture rather than a stable mismatch before it. So
+the pin is what stops a stale or wrong configuration from being used; the predicate is what stops a
+retargeted pull request from being reviewed. The pin is deliberately *not* part of the subject
+digest: the typed request has no such field, so digesting it would make every entry's subject
+compare unequal to the request it pins.
+
+**A production cohort cannot pass a fault argument.** `execution.argumentPrefix` is forwarded to
+the child verbatim, and every token in it is classified when the manifest is read: fault injection
+and test-only switches (`--halt-after`, `--crash-after`, `--simulate`, `--stub`, `--test-only` and
+their neighbours), the arguments this runner appends itself (`--request`, `--target`, `--cohort`,
+`--authorized-by`, `--rebuild-index`), script-host switches (`-File`, `-Command`, `-EncodedCommand`)
+and script paths. Tokens are compared whole and case-insensitively, and `--option=value` is split
+at the first `=` so an option cannot hide inside a value; nothing is matched by substring, so an
+output root that happens to contain the word "fault" is not a refusal.
+
+A cohort declared `shadow-cohort-run` that forwards any of them is blocked *before* the launch,
+not at load — a frozen root written under a halt argument has to stay readable so `--rebuild-index`
+can re-derive its evidence, and refusing to parse it would make that evidence unreachable rather
+than unusable. Filtering the arguments would achieve little on its own, since a cohort free to name
+any executable could hand the refused switches straight back to whatever it started — `cmd /c
+"dotnet …\ShadowRunCoordinator.dll --halt-after …"` passes every argument test there is, because
+the splitting that reintroduces the switch happens one process later. So the admissible production
+launches are *enumerated* rather than filtered, and there are exactly two: the command is
+`ShadowRunCoordinator.dll` or `ShadowRunCoordinator.exe` by whole file name, or the command is
+`dotnet`/`dotnet.exe` by whole file name and the **first** argument names that assembly. In both,
+the next thing to read an argument is this program's own parser, which takes whole tokens and knows
+no `--option=value` form. A shell, a wrapper, a script, or this program named anywhere other than
+first is refused without being asked what its arguments were.
+
+Two smaller refusals hold that enumeration up. No launch token — command or argument — may contain
+a C0 control character or DEL; this is a load-time well-formedness refusal, because
+`Path.GetFileName` scans back from the end of a string while process creation stops at the first
+`U+0000`, so a token containing one would name this program to every check here and start something
+else. And the `dotnet` arm compares whole file names rather than the name without its extension, so
+`dotnet.com` and `dotnet.cmd` are not the host. What all of this still leaves outside the check is
+an operator who renamed a binary on their own disk, which is not a boundary a manifest reader can
+hold — the same operator can edit the manifest.
+
+A fault test that genuinely needs those arguments declares `kind: "shadow-cohort-test-run"` instead,
+and pays for the permission with the mirror image: neither the command nor its arguments may name
+`ShadowRunCoordinator`, and they must name a script. The claim is exactly that and no more — the
+declared launch does not directly name the preparation. A stub script is free to start whatever
+*it* likes, including the preparation, so the kind is a development affordance rather than a proof
+of model isolation, and it is not an operator contract. An operator cohort is always
+`shadow-cohort-run`.
+
+**A non-zero exit is not the last word on whether an entry finished.** A preparation told to stop
+at the cohort's declared target and stopping exactly there writes its evidence, writes its ending,
+and exits 9 to say it stopped on purpose. Reading the exit code alone calls that a fault and
+abandons every entry behind it, while every artifact needed to see that it was finished sits on
+disk, signed. So an entry that ended non-zero is adopted as complete when, and only when, its own
+authenticated audit proves it: the exit is 9 and no other non-zero code; the state it reports at
+rest is the cohort's declared target, so a run halted *earlier* is never adopted; it is at rest for
+`completed` or `deliberateHalt`, which are the two reasons a walk chooses; every transition and
+artifact digest the declared target's rank implies is published — a delivery target requires the
+delivery digests, an earlier target requires only what that rank cannot have been reached without,
+each threshold being the rank of the transition that publishes that digest, except that the
+snapshot digest is required at every rank, so adoption is deliberately *unsupported* below
+`snapshotVerified` rather than thinned out to nothing; the signed state record still standing in
+the output root is the one the audit was written over; and nothing was written to the provider. The
+audit's correlation, request digest and subject digest were already required to be the manifest's
+by the reader that produced the summary. An adopted entry is counted in `completedEntryCount` and
+named by ordinal in `adoptedCompleteEntryOrdinals`; its per-entry summary is left byte-for-byte as
+it was committed, because that summary is digest-bound to the journal and an index that rewrote it
+could no longer be checked against the record it claims to be derived from. A rebuild re-derives
+that proof rather than inheriting it: a journal recording an adoption whose artifacts no longer
+support it blocks the index rather than repeating the word it was given.
 
 **Sequential, journalled, and never retried.** The cohort journal
 (`devpilot.shadow-cohort.journal.v2`) is signed and replaced atomically, and it moves an entry

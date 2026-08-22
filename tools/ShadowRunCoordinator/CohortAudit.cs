@@ -734,6 +734,177 @@ internal static class CohortSummaryReader
 /// content. The self-hash catches a careless edit; only the signature catches a
 /// careful one, because a careful editor recomputes the hash.
 /// </remarks>
+/// <summary>
+/// Decides whether an entry that ended with a non-zero exit nevertheless proved,
+/// in its own authenticated audit, that it reached the state the cohort asked
+/// for.
+/// </summary>
+/// <remarks>
+/// This exists because of a real cohort. A preparation was told to stop the
+/// moment it verified its delivery terminal - which is the target the cohort
+/// declared - and it did exactly that: it verified the terminal, wrote its
+/// evidence, wrote its ending, and exited 9 to say it had stopped on purpose.
+/// The runner read only the exit code, called it a fault, and abandoned the two
+/// entries behind it. Every artifact needed to see that the entry was finished
+/// was on disk, signed, at the moment the decision was made.
+///
+/// So the exit code stops being the only witness. It is still a witness: an exit
+/// this class does not recognise is never adopted, and neither is a zero-exit
+/// entry, which needs no adoption. What is added is that the audit has to AGREE,
+/// and the agreement is checked against artifacts rather than inferred:
+///
+///   - the audit is the entry's own, authenticated - the reader that produced
+///     this summary already required its HMAC, its correlation, its request
+///     digest and its subject digest to be the ones the manifest sealed, and
+///     refused it otherwise;
+///   - the state it reports at rest is the state the cohort declared as its
+///     target, so a run halted EARLIER is never adopted no matter how it exited;
+///   - it is at rest for a reason that means the walk chose to stop, rather than
+///     one that means something went wrong;
+///   - every transition the target implies published evidence, so a run that
+///     claims the state without the artifacts behind it is refused;
+///   - the signed state record still on disk is the one the audit was written
+///     over, so an audit describing a root that has since moved on is refused;
+///   - and nothing was written to the provider, which the cohort's budget says
+///     is zero.
+///
+/// Nothing here reads a finding, a candidate, a verdict or a severity. The two
+/// words it compares are the preparation's own closed vocabularies, and it
+/// compares them to constants rather than interpreting them.
+/// </remarks>
+internal static class CohortCompletionAdoption
+{
+    /// <summary>The preparation stopped because it had nothing left to do.</summary>
+    private const string ReasonCompleted = "completed";
+
+    /// <summary>The preparation stopped because it had been told to stop here.</summary>
+    private const string ReasonDeliberateHalt = "deliberateHalt";
+
+    /// <summary>
+    /// The non-zero exits an adoption may be considered for at all.
+    /// </summary>
+    /// <remarks>
+    /// One code, and it is the code that means "stopped where you told me to".
+    /// A contract refusal, a child failure, an unresolved launch or an
+    /// unrecognised code all describe a preparation that did not choose its
+    /// ending, and no audit written by one of them is evidence that it did.
+    /// </remarks>
+    internal static bool IsAdoptableExit(int exitCode) => exitCode == CoordinatorExitCodes.Halted;
+
+    /// <summary>
+    /// Whether this ended-but-not-complete entry proved completion, and the words
+    /// for why it did or did not.
+    /// </summary>
+    internal static (bool Adopted, string Reason) Evaluate(CohortManifest manifest, CohortEntrySummary summary)
+    {
+        var record = summary.Record;
+        if (!record.HasEnded || record.EndedRefused)
+        {
+            return (false, "the entry has no ending this runner committed");
+        }
+        if (record.ExitCode == CoordinatorExitCodes.Ok)
+        {
+            return (false, "the entry exited cleanly and needs no adoption");
+        }
+        if (!IsAdoptableExit(record.ExitCode))
+        {
+            return (false, $"the entry exited {record.ExitCode.ToString(CultureInfo.InvariantCulture)}, which is not an ending a preparation chooses");
+        }
+
+        var target = manifest.Execution.Target;
+        if (!string.Equals(summary.PreparationFinalState, target, StringComparison.Ordinal))
+        {
+            return (false, $"its audit reports it at rest in '{summary.PreparationFinalState}' and the cohort asked for '{target}'");
+        }
+        if (!string.Equals(summary.PreparationTerminalReason, ReasonCompleted, StringComparison.Ordinal)
+            && !string.Equals(summary.PreparationTerminalReason, ReasonDeliberateHalt, StringComparison.Ordinal))
+        {
+            return (false, $"its audit is at rest for '{summary.PreparationTerminalReason}', which is not a reason a walk chooses");
+        }
+
+        // Evidence is required by the rank the cohort asked for, not by the
+        // deepest rank there is. A cohort declaring an earlier target is asking
+        // for a shorter walk, and demanding a delivery digest of a walk that was
+        // never asked to deliver would make adoption unreachable for it - refused
+        // rather than wrong, but unreachable all the same. Each entry below is the
+        // artifact a rank cannot have been reached without, and each threshold is
+        // the rank of the transition that publishes that artifact: run-set
+        // evidence IS the 'runSetReady' transition digest, so it is owed from
+        // PreparationRank rather than from the first slot's terminal.
+        //
+        // The snapshot digest is the one exception: it is required at every rank,
+        // which makes adoption unreachable for a target below 'snapshotVerified'.
+        // That is deliberate. No cohort has ever declared a corpus-stage target,
+        // and an adoption resting on no published transition digest at all would
+        // rest on the audit's own word for where it stopped.
+        var rank = PreparationStateNames.RankOf(PreparationStateNames.Parse(target));
+        var required = new List<(string Name, string Digest)>
+        {
+            ("snapshot evidence", summary.SnapshotEvidenceSha256)
+        };
+        if (rank >= PreparationStateNames.PreparationRank)
+        {
+            required.Add(("run set evidence", summary.RunSetEvidenceSha256));
+        }
+        if (rank >= PreparationStateNames.ReconciliationRank)
+        {
+            required.Add(("reconciliation evidence", summary.ReconciliationEvidenceSha256));
+            required.Add(("reconciliation", summary.ReconciliationSha256));
+            required.Add(("reconciliation report", summary.ReconciliationReportSha256));
+        }
+        if (rank >= PreparationStateNames.DeliveryRank)
+        {
+            required.Add(("delivery evidence", summary.DeliveryEvidenceSha256));
+            required.Add(("delivery decision", summary.DeliveryDecisionSha256));
+            required.Add(("delivery summary", summary.DeliverySummarySha256));
+        }
+        foreach (var (name, digest) in required)
+        {
+            if (!StrictJson.IsLowerHex(digest) || digest.Length != 64)
+            {
+                return (false, $"its audit publishes no {name} digest, so the state it claims stands on nothing");
+            }
+        }
+
+        if (summary.ProviderWriteCount > manifest.Budgets.ProviderWriteBudget
+            || summary.WriteToolInvocationCount > manifest.Budgets.ProviderWriteBudget)
+        {
+            return (false, "its audit reports a provider write, and a cohort that wrote is never adopted as complete");
+        }
+
+        if (!StrictJson.IsLowerHex(summary.StateSha256) || summary.StateSha256.Length != 64)
+        {
+            return (false, "its audit publishes no state record digest, so the state it claims stands on nothing");
+        }
+
+        var statePath = Path.Combine(summary.Entry.OutputRoot, "coordinator", "state.json");
+        if (!File.Exists(statePath))
+        {
+            return (false, "its output root holds no state record for the audit to have been written over");
+        }
+        string standing;
+        try
+        {
+            standing = CanonicalJson.Sha256Hex(
+                StrictJson.ReadFileBytes(statePath, $"entry '{summary.Entry.EntryId}' state record", 64L * 1024 * 1024));
+        }
+        catch (ContractException error)
+        {
+            return (false, $"its signed state record could not be read ({error.Message})");
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            return (false, $"its signed state record could not be read ({error.GetType().Name})");
+        }
+        if (!string.Equals(standing, summary.StateSha256, StringComparison.Ordinal))
+        {
+            return (false, "its audit was written over a state record other than the one now standing in its output root");
+        }
+
+        return (true, $"its authenticated audit reports '{target}' reached and at rest for '{summary.PreparationTerminalReason}' with every transition's evidence published and no provider write");
+    }
+}
+
 internal static class CohortIndex
 {
     internal const string ContractVersionValue = "devpilot.shadow-cohort.index.v2";
@@ -823,6 +994,7 @@ internal static class CohortIndex
         long writes = 0;
         var completed = 0;
         var pending = 0;
+        var adoptedOrdinals = new ListNode();
         foreach (var summary in summaries)
         {
             entries.Add(summary.Describe());
@@ -832,7 +1004,39 @@ internal static class CohortIndex
             writes += summary.ProviderWriteCount;
             if (summary.Record.EndedComplete)
             {
+                // Complete in the journal AND non-zero on the way out is an entry
+                // this build adopted. The journal's word is not enough on its own:
+                // a record saying "complete" beside artifacts that no longer prove
+                // it is exactly the shape a rebuild exists to catch, so the proof
+                // is re-run here rather than inherited. Published as an ordinal
+                // rather than as an identifier, because an identifier can carry a
+                // subject.
+                if (summary.Record.HasEnded && summary.Record.ExitCode != CoordinatorExitCodes.Ok)
+                {
+                    var (adopted, reason) = CohortCompletionAdoption.Evaluate(manifest, summary);
+                    if (!adopted)
+                    {
+                        throw new CohortBlockedException(
+                            $"Entry {summary.Entry.Ordinal.ToString(CultureInfo.InvariantCulture)} is recorded complete after exiting " +
+                            $"{summary.Record.ExitCode.ToString(CultureInfo.InvariantCulture)}, and this build cannot reproduce the proof it was " +
+                            $"adopted on: {reason}. An index that published a completion it could not re-derive would be a record standing on " +
+                            "artifacts that no longer say what it says.");
+                    }
+                    adoptedOrdinals.Add(Node.Number(summary.Entry.Ordinal));
+                }
                 completed++;
+            }
+            else if (CohortCompletionAdoption.Evaluate(manifest, summary).Adopted)
+            {
+                // A root written by an earlier build, whose journal recorded the
+                // exit code and called it a fault. The artifacts say otherwise and
+                // the artifacts are signed, so the count says what the artifacts
+                // say. The per-entry summary is left exactly as it was committed:
+                // it is digest-bound to the journal, and an index that rewrote it
+                // would be an index that could no longer be checked against the
+                // record it was derived from.
+                completed++;
+                adoptedOrdinals.Add(Node.Number(summary.Entry.Ordinal));
             }
             if (!summary.Record.HasEnded)
             {
@@ -854,6 +1058,7 @@ internal static class CohortIndex
             .Set("deliveryMode", PreviewOnlyMode)
             .Set("declaredEntryCount", manifest.Entries.Count)
             .Set("completedEntryCount", completed)
+            .Set("adoptedCompleteEntryOrdinals", adoptedOrdinals)
             .Set("pendingEntryCount", pending)
             .Set("budgets", manifest.Budgets.Describe())
             .Set("consumed", new MapNode()

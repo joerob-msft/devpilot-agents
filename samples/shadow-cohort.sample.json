@@ -12,8 +12,8 @@
     "concurrency": 1,
     "stopPolicy": "failFast",
     "authorizationKind": "PreviewOnly",
-    "commandPath": "D:/toolkit/devpilot-agents/tools/ShadowRunCoordinator/bin/Release/net10.0/ShadowRunCoordinator.exe",
-    "argumentPrefix": [],
+    "commandPath": "dotnet",
+    "argumentPrefix": ["D:/toolkit/devpilot-agents/tools/ShadowRunCoordinator/bin/Release/net10.0/ShadowRunCoordinator.dll"],
     "target": "deliveryTerminalVerified",
     "entryTimeoutSeconds": 2700
   },
@@ -49,7 +49,8 @@
         "iterationId": 1,
         "sourceCommit": "0000000000000000000000000000000000000000",
         "commonCommit": "0000000000000000000000000000000000000000",
-        "targetCommit": "0000000000000000000000000000000000000000"
+        "targetCommit": "0000000000000000000000000000000000000000",
+        "targetRefName": "refs/heads/main"
       },
       "digests": {
         "configSha256": "0000000000000000000000000000000000000000000000000000000000000000",
@@ -89,7 +90,8 @@
         "iterationId": 1,
         "sourceCommit": "0000000000000000000000000000000000000000",
         "commonCommit": "0000000000000000000000000000000000000000",
-        "targetCommit": "0000000000000000000000000000000000000000"
+        "targetCommit": "0000000000000000000000000000000000000000",
+        "targetRefName": "refs/heads/main"
       },
       "digests": {
         "configSha256": "0000000000000000000000000000000000000000000000000000000000000000",
