@@ -187,7 +187,13 @@ internal sealed record CoordinatorRequest
     internal static CoordinatorRequest Load(string path)
     {
         const string label = "shadow run coordinator request";
-        var root = StrictJson.ReadObjectFile(path, label);
+        // One acquisition. The request is both obeyed and digested, and reading it
+        // twice would leave a window in which the bytes that were obeyed and the
+        // bytes the digest attests to are not the same bytes - and would put an
+        // unguarded read where a refusal is owed, so a request that vanished
+        // mid-load would arrive at the caller as a filesystem fault.
+        var bytes = StrictJson.ReadFileBytes(path, label);
+        var root = StrictJson.ReadObjectBytes(bytes, path, label);
         StrictJson.RequireNoUnknownFields(
             root,
             label,
@@ -264,7 +270,6 @@ internal sealed record CoordinatorRequest
             corpusStage = CorpusStageAuthorization.Read(corpusStageNode, label + " corpusStage");
         }
 
-        var bytes = File.ReadAllBytes(path);
         var plannedRunCount = StrictJson.RequireInt(qualification, "plannedRunCount", label + " qualification", 2, 16);
         // Exact, not merely compatible. A set that plans three runs while the
         // request declares two would leave a slot nobody supervises and a

@@ -1956,6 +1956,14 @@ Assert-Specialist ($specialistPassText.Contains("& `$emitSpecialistAcct `$specia
     function New-AgentNonce { $script:knownNonce }
     function Get-ReviewerRuntimeContext { param($Nonce, $PrId, $RepositoryId, $SourceCommit, $SourceBranch, $AuthorAlias, $ThreadDigestText, $AuthoritativeSourcesText, $PinnedSourceText) '' }
     function Write-ReviewerCycleMetadata { param($Fields) }
+    # The real launch-intent writer publishes to the cycle log, which this
+    # harness does not stand up. Counted rather than ignored so the simulated
+    # boundary still shows one intent per intercepted process call.
+    $script:launchIntentCalls = [System.Collections.Generic.List[object]]::new()
+    function Write-ReviewerModelLaunchIntent {
+        param([string]$CensusRole, [string]$Model)
+        [void]$script:launchIntentCalls.Add([pscustomobject]@{ CensusRole = $CensusRole; Model = $Model })
+    }
     function Get-ReviewerEffectiveAllowTools { param($BaseAllow) @() }
     function Get-ReviewerLaunchAllowTools { param($Intended) @() }
     function ConvertTo-ReviewerAvailableToolNames { param($PermissionTools) @() }

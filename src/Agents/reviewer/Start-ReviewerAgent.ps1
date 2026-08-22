@@ -4766,6 +4766,100 @@ function Write-ReviewerCycleMetadata {
     Write-AgentMetadata -LogPath $logPath -Fields $base
 }
 
+# The marker that says a failure was a failure to RECORD a model start, rather
+# than a failure of the work the start was made for. It travels in the message
+# because that is the one part of a PowerShell error every enclosing handler in
+# this script can read without agreeing on an exception type first.
+$script:ReviewerModelStartAccountingSentinel = 'reviewer-model-start-accounting-unwritable'
+
+function Write-ReviewerModelStartAccounting {
+    <#
+    .SYNOPSIS
+        Publishes one role's per-launch model start record, fatally.
+
+    .DESCRIPTION
+        The budget a cohort is spent in is read from these records, so a record
+        that was not written is a model start that was made and cannot be
+        accounted for. Two of the three roles run inside handlers that turn any
+        fault into a degraded status and let the run continue to 'complete' - and
+        a complete run is exactly the one whose census is trusted as exact. A
+        swallowed write here would therefore not degrade the run, it would
+        silently shrink the number the next entry's launch is authorized against.
+
+        So the failure is re-thrown, carrying a marker the degraded handlers
+        re-throw rather than absorb. The run fails, its terminal is not
+        'complete', and the unmeasured allowance covers what it could not record.
+
+    .PARAMETER Fields
+        The record, exactly as the role built it.
+
+    .PARAMETER Role
+        The role whose launch this accounts for, named in the failure.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Fields,
+        [Parameter(Mandatory)][string]$Role
+    )
+    try {
+        Write-ReviewerCycleMetadata -Fields $Fields
+    }
+    catch {
+        throw ("$script:ReviewerModelStartAccountingSentinel: the $Role model start could not be recorded: " +
+            "$($_.Exception.Message). A model start that is not recorded is a start the budget cannot see, so " +
+            'this run fails rather than report a census it knows is short.')
+    }
+}
+
+function Write-ReviewerModelLaunchIntent {
+    <#
+    .SYNOPSIS
+        Publishes one record saying a model subprocess is about to be created.
+
+    .DESCRIPTION
+        The per-launch accounting records above are written after the subprocess
+        RETURNS, and everything between the process being created and that write
+        can throw: the harness raises telemetry, drains two output streams and
+        writes standard input after 'Process.Start' has already succeeded, and
+        the roles that degrade on any fault would absorb such a throw and still
+        reach 'complete' with the launch uncounted.
+
+        This record closes that window from the other side. It is written
+        immediately before the create call and nothing between the two can
+        fail, so a role whose intent count exceeds its accounting count has
+        started subprocesses it never got to account for, and the census takes
+        the larger of the two.
+
+        It is deliberately NOT written by the refusals above it - a capture
+        boundary or a single-shot guard throws before this point - so a run that
+        was refused before launching still counts zero.
+
+    .PARAMETER CensusRole
+        Which of the three counted roles this launch belongs to.
+
+    .PARAMETER Model
+        The opaque model request string, recorded but never compared.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('generalist', 'specialist', 'verifier')][string]$CensusRole,
+        [Parameter(Mandatory)][string]$Model
+    )
+    Write-ReviewerModelStartAccounting -Role "$CensusRole launch intent" -Fields @{
+        mode = 'model-launch-intent'
+        censusRole = [string]$CensusRole
+        model = [string]$Model
+    }
+}
+
+function Test-ReviewerModelStartAccountingFault {
+    <#
+        Whether a caught fault is a failure to record a model start. Handlers
+        that degrade on everything else must let this one through.
+    #>
+    param($Fault)
+    if ($null -eq $Fault) { return $false }
+    return ([string]$Fault) -like "*$script:ReviewerModelStartAccountingSentinel*"
+}
+
 # ---------------------------------------------------------------------------
 # Preview output (the default mode: report, do not post)
 # ---------------------------------------------------------------------------
@@ -10093,6 +10187,7 @@ function Invoke-ReviewerModelSubprocess {
         [Parameter(Mandatory)][string[]]$AgencyArguments,
         [Parameter(Mandatory)][string]$StandardInputContent,
         [Parameter(Mandatory)][string]$Role,
+        [Parameter(Mandatory)][ValidateSet('generalist', 'specialist', 'verifier')][string]$CensusRole,
         [Parameter(Mandatory)][string]$Model,
         [Parameter(Mandatory)][hashtable]$Binding,
         [Parameter(Mandatory)][int]$TimeoutSeconds
@@ -10123,6 +10218,11 @@ function Invoke-ReviewerModelSubprocess {
         throw "Blinded acquisition already captured its single authorized model invocation; no further model subprocess may launch."
     }
     if (-not $script:ReviewerOfflineModelAdapterActive) {
+        # The last statement before a process can exist. Everything above is a
+        # refusal that creates nothing; everything below - including the harness
+        # code between 'Process.Start' and its return - may leave a subprocess
+        # running whether or not it comes back to be accounted for.
+        Write-ReviewerModelLaunchIntent -CensusRole $CensusRole -Model $Model
         $run = Invoke-TimedProcess -FilePath $AgencyPath -ArgumentList $AgencyArguments `
             -StandardInputContent $StandardInputContent -CaptureStdOut -CaptureStdErr `
             -WorkingDirectory $RepoPath -EnvironmentVariablesToRemove $CopilotSensitiveEnvironmentVariables `
@@ -10143,6 +10243,11 @@ function Invoke-ReviewerModelSubprocess {
         "-ExpectedBaseCommit", $script:ReviewerOfflineModelAdapterExpectedBaseCommit,
         "-BindingBase64", $bindingBase64
     )
+    # The offline adapter is a subprocess too, and it stands exactly where a
+    # model stands. Recording its intent here keeps one rule for both branches:
+    # the intent is written by whatever is about to create a process, so the
+    # census never has to know which branch a run took.
+    Write-ReviewerModelLaunchIntent -CensusRole $CensusRole -Model $Model
     $run = Invoke-TimedProcess -FilePath $pwshPath -ArgumentList $adapterArgs `
         -StandardInputContent $StandardInputContent -CaptureStdOut -CaptureStdErr `
         -WorkingDirectory $RepoPath -EnvironmentVariablesToRemove $McpSensitiveEnvironmentVariables `
@@ -10259,12 +10364,16 @@ function Invoke-ReviewerConventionSpecialistPass {
             $emitSpecialistAcct = {
                 param([int]$Attempt, [string]$AttemptNonce, [string]$RejectionClass, [bool]$ModelRan, $Usage,
                     [string]$Reason = '', [string]$Detail = '')
-                Write-ReviewerCycleMetadata -Fields @{
+                Write-ReviewerModelStartAccounting -Role 'convention specialist' -Fields @{
                     cycle = $CycleNumber; mode = "specialist-attempt-accounting"; prId = $PrId
                     sourceCommit = $SourceCommit; model = [string]$EffectiveConventionSpecialistModel
                     attempt = $Attempt
                     nonceSha256 = (Get-ReviewerTextSha256 -Text $AttemptNonce)
                     rejectionClass = $RejectionClass
+                    # Always true here: the specialist's only pre-launch refusal
+                    # is the contract-fit throw above, which publishes its own
+                    # 'specialist-launch-refused' record and never reaches this.
+                    processStarted = $true
                     modelRan = $ModelRan
                     premiumRequests = $(if ($Usage) { $Usage.PremiumRequests } else { $null })
                     totalNanoAiu = $(if ($Usage) { $Usage.TotalNanoAiu } else { $null })
@@ -10341,7 +10450,7 @@ function Invoke-ReviewerConventionSpecialistPass {
                     throw
                 }
                 $run = Invoke-ReviewerModelSubprocess -AgencyPath $AgencyPath -AgencyArguments $agencyArgs `
-                    -StandardInputContent $specialistInput.Text -Role "specialist" `
+                    -StandardInputContent $specialistInput.Text -Role "specialist" -CensusRole 'specialist' `
                     -Model $EffectiveConventionSpecialistModel -Binding @{
                         nonce = $nonce; prId = $PrId; repositoryId = $cfgRepoId; project = $ExpectedProject
                         reviewedSourceCommit = $SourceCommit; targetCommit = $targetCommit
@@ -10540,6 +10649,11 @@ function Invoke-ReviewerConventionSpecialistPass {
     }
     catch {
         $diagnostic = $_.Exception.Message
+        # A failure to record a model start is not something to degrade past. The
+        # specialist launched, the record that says so did not survive, and a run
+        # that continued from here would report 'complete' with a census it knows
+        # is short - which is the one shape the cohort trusts as exact.
+        if (Test-ReviewerModelStartAccountingFault -Fault $diagnostic) { throw }
         Write-Warning "Convention specialist degraded for PR ${PrId}; generalist review remains unchanged: $diagnostic"
         $status = "degraded"
         $candidates = @()
@@ -10620,6 +10734,10 @@ function Invoke-ReviewerConventionSpecialistSafely {
     }
     catch {
         $escapedDiagnostic = $_.Exception.Message
+        # The outer boundary keeps the same exception: a lost model start record
+        # is not a specialist failure to absorb, it is a census this run can no
+        # longer stand behind.
+        if (Test-ReviewerModelStartAccountingFault -Fault $escapedDiagnostic) { throw }
         Write-Warning "Convention specialist escaped its degradation boundary for PR ${prId}; generalist result is unchanged: $escapedDiagnostic"
         try {
             [void](Write-ReviewerConventionSpecialistPreview -PrId $prId -SourceCommit $sourceCommit `
@@ -10824,6 +10942,7 @@ function Invoke-ReviewerVerificationModelRun {
         [AllowEmptyCollection()][object[]]$CandidateEvidence = @(),
         [AllowEmptyCollection()][object[]]$DeterministicFacts = @(),
         [AllowEmptyCollection()][object[]]$ThreadFacts = @(),
+        [int]$CycleNumber = 0,
         [ValidateRange(30, 3600)][int]$TimeoutSeconds = 900
     )
     $nonce = New-AgentNonce
@@ -10883,7 +11002,7 @@ function Invoke-ReviewerVerificationModelRun {
         "compatibility-verifier"
     }
     $run = Invoke-ReviewerModelSubprocess -AgencyPath $AgencyPath -AgencyArguments $agencyArgs `
-        -StandardInputContent $modelInput.text -Role $verifierRole -Model $VerifierModel `
+        -StandardInputContent $modelInput.text -Role $verifierRole -CensusRole 'verifier' -Model $VerifierModel `
         -Binding @{
             nonce = $nonce; prId = [int]$Binding.pullRequestId
             repositoryId = [string]$Binding.repositoryId; project = $ExpectedProject
@@ -10893,6 +11012,32 @@ function Invoke-ReviewerVerificationModelRun {
             configSha256 = [string]$Binding.configSha256; scriptSha256 = [string]$Binding.scriptSha256
             promptSha256 = [string]$Binding.promptSha256; verifierModel = $VerifierModel
         } -TimeoutSeconds $TimeoutSeconds
+    # One accounting record per ACTUAL cross-verifier launch, written as soon as
+    # the subprocess returns and before anything that can throw.
+    #
+    # The sealed preview is not a witness of a launch. Its verifierRuns are
+    # accumulated in memory across the whole cluster loop and serialized once at
+    # the end, so a phase that dies part way through - or that falls into the
+    # degraded fallback, which seals a preview with an EMPTY run list - reports
+    # zero launches for however many subprocesses it really started. That is the
+    # same unbounded under-count the generalist and specialist roles were fixed
+    # for, and it is fixed the same way: a per-attempt, monotonic record on disk.
+    # The preview nonces remain a cross-check, never the only evidence.
+    Write-ReviewerModelStartAccounting -Role 'cross-verifier' -Fields @{
+        cycle = $CycleNumber; mode = "verifier-attempt-accounting"
+        prId = [int]$Binding.pullRequestId; sourceCommit = [string]$Binding.sourceCommit
+        model = [string]$VerifierModel; clusterId = [string]$Cluster.clusterId
+        attempt = 1
+        nonceSha256 = (Get-ReviewerTextSha256 -Text $nonce)
+        processStarted = $true
+        # Deliberately absent: whether the CLI reported an assistant turn is not
+        # known until the outcome below is parsed, and this record is written
+        # first on purpose. Asserting it here would be a claim, not a reading.
+        # The census counts processStarted and never modelRan.
+        timedOut = [bool]$run.TimedOut
+        exitCode = $run.ExitCode
+        assignedCandidateCount = @($AssignedCandidates).Count
+    }
     $cliOutcome = Get-AgentCliJsonOutcome -StdOutText ([string]$run.StdOut)
     $markerSource = [string]$run.StdOut
     $requestedTools = @()
@@ -11862,7 +12007,7 @@ function Invoke-ReviewerCrossVerificationPass {
             -AssignedCandidates @($runInput.assignedCandidates) -SiblingEvidence @($runInput.siblingEvidence) `
             -EvidenceHunks @($runInput.assignedHunks) -CandidateEvidence @($runInput.assignedEvidence) `
             -DeterministicFacts @($runInput.relevantFacts) -ThreadFacts @($runInput.relevantThreads) `
-            -TimeoutSeconds $admittedRunTimeoutSeconds
+            -CycleNumber $CycleNumber -TimeoutSeconds $admittedRunTimeoutSeconds
         foreach ($assignment in $groupAssignments) {
             [void]$runRecords.Add([pscustomobject][ordered]@{
                     assignmentId = [string]$assignment.assignmentId
@@ -12060,6 +12205,12 @@ function Invoke-ReviewerCrossVerificationSafely {
     }
     catch {
         $diagnostic = $_.Exception.Message
+        # Same rule as the specialist's: cross-verification degrades on anything
+        # except losing the record of a launch it already made. This handler is
+        # the one that seals a preview with an EMPTY run list and returns
+        # normally, so absorbing an accounting failure here would erase every
+        # launch the phase made from the only witness that survives it.
+        if (Test-ReviewerModelStartAccountingFault -Fault $diagnostic) { throw }
         Write-Warning "Cross-verification degraded for PR ${prId}; current discovery and delivery remain unchanged: $diagnostic"
         try {
             [void](Write-ReviewerVerificationDecisionPreview -PrId $prId -SourceCommit $sourceCommit `
@@ -12378,8 +12529,11 @@ function Invoke-ReviewerModelPass {
         # it. Counting it retires the pull request after the configured
         # threshold, visibly, which is the honest outcome for a condition that
         # cannot improve on its own.
+        # PROCESS accounting, deliberately separate from ModelRan. Nothing was
+        # launched here: the input was refused for size before the subprocess, so
+        # this attempt spent no model start and must not be counted as one.
         return @{ Model = $PassModel; Marker = $null; Reason = $oversizeReason; EnvironmentFault = $false
-            RejectionClass = 'oversize'; Nonce = $nonce; ModelRan = $false; Usage = $null }
+            RejectionClass = 'oversize'; Nonce = $nonce; ModelRan = $false; ProcessStarted = $false; Usage = $null }
     }
 
     # -- Launch the model -----------------------------------------------------
@@ -12417,7 +12571,7 @@ function Invoke-ReviewerModelPass {
         "compatibility-generalist"
     }
     $run = Invoke-ReviewerModelSubprocess -AgencyPath $AgencyPath -AgencyArguments $agencyArgs `
-        -StandardInputContent $stdin -Role $generalistRole -Model $PassModel `
+        -StandardInputContent $stdin -Role $generalistRole -CensusRole 'generalist' -Model $PassModel `
         -Binding @{
             nonce = $nonce; prId = $prId; repositoryId = $cfgRepoId; project = $ExpectedProject
             reviewedSourceCommit = $sourceCommit
@@ -12475,7 +12629,8 @@ function Invoke-ReviewerModelPass {
     else { $bindingRejected = $false }
     if ($marker) {
         return @{ Model = $PassModel; Marker = $marker; Reason = ""; EnvironmentFault = $false
-            RejectionClass = 'success'; Nonce = $nonce; ModelRan = [bool]($cliOutcome -and $cliOutcome.ModelActuallyRan); Usage = $usage }
+            RejectionClass = 'success'; Nonce = $nonce; ModelRan = [bool]($cliOutcome -and $cliOutcome.ModelActuallyRan)
+            ProcessStarted = $true; Usage = $usage }
     }
 
     # A precise, typed reason - never a generic "invalid marker". A schema-shape
@@ -12536,7 +12691,8 @@ function Invoke-ReviewerModelPass {
     catch { Write-Warning "Could not write the failure transcript: $($_.Exception.Message)" }
 
     return @{ Model = $PassModel; Marker = $null; Reason = $reason; EnvironmentFault = [bool]$launchFailureReason
-        RejectionClass = $rejectionClass; Nonce = $nonce; ModelRan = $modelActuallyRan; Usage = $usage }
+        RejectionClass = $rejectionClass; Nonce = $nonce; ModelRan = $modelActuallyRan
+        ProcessStarted = $true; Usage = $usage }
 }
 
 # ---------------------------------------------------------------------------
@@ -14181,12 +14337,19 @@ function Invoke-ReviewerPullRequest {
             # reported (null when the CLI did not). This preserves each attempt's
             # figures instead of collapsing them into a single aggregate that
             # loses every nonce, rejection and per-run usage.
-            Write-ReviewerCycleMetadata -Fields @{
+            Write-ReviewerModelStartAccounting -Role 'generalist' -Fields @{
                 cycle = $CycleNumber; mode = "model-attempt-accounting"; prId = $prId; sourceCommit = $sourceCommit
                 pass = $passNumber; model = [string]$passModel
                 attempt = $attempt
                 nonceSha256 = (Get-ReviewerTextSha256 -Text ([string]$passResult.Nonce))
                 rejectionClass = [string]$passResult.RejectionClass
+                # Whether a subprocess was actually launched for this attempt.
+                # Distinct from modelRan, which says whether the CLI reported an
+                # assistant turn: a process that started and produced nothing is
+                # still a model start and is still spent, while an input refused
+                # for size before the launch is neither. The budget census counts
+                # this field, never modelRan.
+                processStarted = [bool]$passResult.ProcessStarted
                 modelRan = [bool]$passResult.ModelRan
                 premiumRequests = $(if ($u) { $u.PremiumRequests } else { $null })
                 totalNanoAiu = $(if ($u) { $u.TotalNanoAiu } else { $null })

@@ -523,13 +523,19 @@ function Invoke-ShadowChildRunSetStatus {
         plannedRunCount = [int]$status.declaration.plannedRunCount
         setId = [string]$status.declaration.setId
         slotAttemptCount = [int]$status.slotsAttempted
-        # Measured by enumeration rather than asserted. Every reviewer invocation
-        # that could reach a model leaves a slot attempt record behind, so the
-        # census of those records on disk is the census of model invocations this
-        # preparation caused. A hard-coded zero would read identically on a run
-        # that had invoked a model and on one that had not.
-        modelInvocationCount = @(Get-ChildItem -LiteralPath $qualificationRoot -Filter 'slot*-attempt.json' `
+        # A census of the reviewer processes this run set has launched: one attempt
+        # record per launch. Diagnostic, and named for what it counts rather than
+        # for what it was once mistaken for.
+        slotAttemptRecordCount = @(Get-ChildItem -LiteralPath $qualificationRoot -Filter 'slot*-attempt.json' `
                 -File -Recurse -ErrorAction SilentlyContinue).Count
+        # A census of the run directories a reviewer would have to have created
+        # before it could start a model. Measured by enumeration, so that the
+        # 'nothing has run yet' the coordinator asserts before launching is a
+        # reading of the disk and not a constant that would say the same either way.
+        preLaunchRunRootCount = @(Get-ChildItem -LiteralPath $qualificationRoot -Directory -Recurse `
+                -Filter 'replay' -ErrorAction SilentlyContinue |
+                ForEach-Object { @(Get-ChildItem -LiteralPath $_.FullName -Directory -ErrorAction SilentlyContinue) } |
+                Where-Object { $null -ne $_ }).Count
         statusReportPath = [string]([IO.Path]::GetFullPath($reportPath))
     }
 }
@@ -828,6 +834,7 @@ function Invoke-ShadowChildSlotVerify {
     Import-Module (Join-Path $ToolkitRoot 'src\DevPilot.AgentHarness\DevPilot.AgentHarness.psd1') -Force -ErrorAction Stop
     . (Join-Path $ToolkitRoot 'src\Agents\reviewer\QualificationPreflight.ps1')
     . (Join-Path $ToolkitRoot 'src\Agents\reviewer\ReplayQualification.ps1')
+    . (Join-Path $ToolkitRoot 'src\Agents\reviewer\ModelStartCensus.ps1')
     $context = Get-ShadowChildSlotContext -Request $Request -ToolkitRoot $ToolkitRoot
     $plan = $context.Plan
     $target = $context.Target
@@ -858,6 +865,122 @@ function Invoke-ShadowChildSlotVerify {
     $attempts = @(Get-ChildItem -LiteralPath $plan.RunDirectory -Filter 'slot*-attempt.json' `
             -File -ErrorAction SilentlyContinue)
     $bytes = [IO.File]::ReadAllBytes($terminalPath)
+
+    # The census of what this slot's run actually started, by role, taken from the
+    # run's own published per-attempt evidence. A run that ended 'complete'
+    # published everything it was going to publish, so its census is exact; a run
+    # that failed or was killed may have started an attempt whose record it never
+    # got to write, so its census is a measured floor and says so. The caller
+    # bounds that gap rather than assuming it is zero.
+    $runRoot = Join-Path (Join-Path ([string]$target.StateDir) 'replay') ([string]$plan.Snapshot.Name)
+    $censusExact = ([string]$terminal.status -ceq 'complete')
+    $census = $null
+    $censusFault = ''
+    if (Test-Path -LiteralPath $runRoot -PathType Container) {
+        try {
+            $census = Get-ReviewerModelStartCensus -RunRoot $runRoot -Argv ([string[]]$target.Arguments)
+        }
+        catch {
+            # A run that ended cleanly and left evidence this build cannot read is
+            # a contradiction and is refused. A run that failed or was killed
+            # mid-write is not: a truncated log or a half-sealed preview is the
+            # ordinary shape of an interruption, and refusing it would stop the
+            # whole cohort over an outcome the design already carries. That run is
+            # charged its plan's full bound below instead.
+            if ($censusExact) { throw }
+            $censusFault = [string]$_.Exception.Message
+        }
+    }
+    elseif ($censusExact) {
+        throw ("Slot '$($target.Name)' reports a complete run and left no run directory at '$runRoot', so the model " +
+            'starts it made cannot be counted. A completed run that published no evidence is refused, not read as zero.')
+    }
+    else {
+        # Nothing was created under the run root at all, so nothing published and
+        # nothing can be counted from it. Left as a null census, which is charged
+        # its plan's full bound below.
+        $censusFault = "The run root '$runRoot' does not exist."
+    }
+
+    # What this slot could have spent beyond what it managed to record. Zero for a
+    # run that ended cleanly; otherwise the reviewed side's own arithmetic over
+    # the sealed plan, which knows that an interrupted cross-verification phase
+    # hides every launch it made rather than one.
+    $unmeasuredAllowance = Get-ReviewerModelStartUnmeasuredAllowance -Argv ([string[]]$target.Arguments) `
+        -ReviewerScriptPath ([string]$context.ReviewerScriptPath) -RunEndedComplete $censusExact -Census $census
+    if ($null -eq $census) {
+        $census = [pscustomobject][ordered]@{
+            realModelStarts = 0
+            byRole = [pscustomobject][ordered]@{ generalist = 0; specialist = 0; verifier = 0 }
+            complete = $true
+            incompleteReason = ''
+            logRecordCount = 0
+            basis = 'unreadableEvidence'
+        }
+    }
+
+    # A run that ENDED CLEANLY and published cycle records without a single
+    # generalist attempt record contradicts itself: every complete run makes at
+    # least one first-pass attempt, so its evidence is missing rather than small
+    # and the census must not be spent against a ceiling. The same shape on a run
+    # that failed or timed out is a legitimate pre-launch refusal, and it is
+    # already carried by the unmeasured allowance rather than by stopping the
+    # cohort the entry belongs to.
+    $censusComplete = [bool]$census.complete
+    $censusDetail = [string]$census.incompleteReason
+    if ($censusFault.Length -gt 0) { $censusDetail = $censusFault }
+    if ($censusComplete -and $censusExact -and [int]$census.byRole.generalist -eq 0 -and
+        [int]$census.logRecordCount -gt 0) {
+        $censusComplete = $false
+        $censusDetail = ('The run ended complete having published cycle records and no generalist attempt record, so ' +
+            'the model starts it made cannot be counted from its own evidence.')
+    }
+
+    # The second census, of a second unit: the cross-verifier ASSIGNMENTS this
+    # slot's run stood on. Taken from the run's own sealed previews and kept
+    # entirely apart from the model-start census, because an assignment is not a
+    # process - grouping means one launch can serve a whole cluster - and adding
+    # or substituting one for the other is the defect this exists to remove.
+    $assignmentCensus = $null
+    $assignmentFault = ''
+    if (Test-Path -LiteralPath $runRoot -PathType Container) {
+        try {
+            $assignmentCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $runRoot -Argv ([string[]]$target.Arguments)
+        }
+        catch {
+            # Same asymmetry as the model-start census above: a run that ended
+            # cleanly and left unreadable assignment evidence contradicts itself
+            # and is refused; an interrupted one is charged its plan's bound.
+            if ($censusExact) { throw }
+            $assignmentFault = [string]$_.Exception.Message
+        }
+    }
+    elseif ($censusExact) {
+        throw ("Slot '$($target.Name)' reports a complete run and left no run directory at '$runRoot', so the verifier " +
+            'assignments it stood on cannot be counted. A completed run that published no evidence is refused, not read as zero.')
+    }
+    else {
+        $assignmentFault = "The run root '$runRoot' does not exist."
+    }
+    $assignmentAllowance = Get-ReviewerVerifierAssignmentUnmeasuredAllowance -Argv ([string[]]$target.Arguments) `
+        -ReviewerScriptPath ([string]$context.ReviewerScriptPath) -RunEndedComplete $censusExact -Census $assignmentCensus
+    $assignmentComplete = $true
+    $assignmentDetail = ''
+    $assignmentTotal = 0
+    $assignmentByModel = @()
+    $verifierProcessStarts = 0
+    if ($null -eq $assignmentCensus) {
+        $assignmentComplete = $false
+        $assignmentDetail = [string]$assignmentFault
+    }
+    else {
+        $assignmentComplete = [bool]$assignmentCensus.complete
+        $assignmentDetail = [string]$assignmentCensus.incompleteReason
+        $assignmentTotal = [int]$assignmentCensus.realVerifierAssignments
+        $assignmentByModel = @($assignmentCensus.byVerifierModel)
+        $verifierProcessStarts = [int]$assignmentCensus.verifierProcessStarts
+    }
+
     return @{
         terminalStatus = [string]$terminal.status
         terminalExitCode = [int]$terminal.exitCode
@@ -874,11 +997,37 @@ function Invoke-ShadowChildSlotVerify {
         signatureVerified = $true
         inventoryVerified = $true
         slotAttemptCount = [int]$attempts.Count
-        # A census of the attempt records on disk, which is the census of reviewer
-        # invocations that could have reached a model. Counted rather than
-        # asserted: a constant here would read the same whatever had happened.
-        modelInvocationCount = @(Get-ChildItem -LiteralPath (Get-ShadowChildField -Request $Request -Name 'qualificationRoot') `
+        # A census of the reviewer PROCESSES this run set has launched - one
+        # attempt record per launched slot, counted across the qualification root.
+        # Diagnostic only, and named for what it counts: it was once called a
+        # model invocation count, which is how a two-slot run that started four
+        # models came to be budgeted as three.
+        slotAttemptRecordCount = @(Get-ChildItem -LiteralPath (Get-ShadowChildField -Request $Request -Name 'qualificationRoot') `
                 -Filter 'slot*-attempt.json' -File -Recurse -ErrorAction SilentlyContinue).Count
+        realModelStartCount = [int]$census.realModelStarts
+        realModelStartsGeneralist = [int]$census.byRole.generalist
+        realModelStartsSpecialist = [int]$census.byRole.specialist
+        realModelStartsVerifier = [int]$census.byRole.verifier
+        realModelStartCensusComplete = [bool]$censusComplete
+        realModelStartCensusExact = [bool]$censusExact
+        # What this slot could have spent and could not record. The cohort ceiling
+        # is checked against the sum of this and the measured count, which is what
+        # makes the check an upper bound rather than a floor.
+        realModelStartUnmeasuredAllowance = [int]$unmeasuredAllowance
+        realModelStartCensusBasis = [string]$census.basis
+        realModelStartCensusDetail = [string]$censusDetail
+        # The assignment census. 'realVerifierAssignmentCount' is THE figure a
+        # cohort's verifier ceiling is spent in - one per candidate per required
+        # reciprocal model, distinct across every sealed preview. The process
+        # count beside it is the grouped launch census and is a diagnostic: a
+        # ceiling checked against it would be a ceiling that shrank the moment
+        # grouping worked.
+        realVerifierAssignmentCount = [int]$assignmentTotal
+        realVerifierAssignmentsByModel = @($assignmentByModel)
+        realVerifierAssignmentCensusComplete = [bool]$assignmentComplete
+        realVerifierAssignmentUnmeasuredAllowance = [int]$assignmentAllowance
+        realVerifierAssignmentCensusDetail = [string]$assignmentDetail
+        verifierProcessStartCount = [int]$verifierProcessStarts
         deliveryMode = [string]$plan.DeliveryMode
         promotable = [bool]$plan.Promotable
     }

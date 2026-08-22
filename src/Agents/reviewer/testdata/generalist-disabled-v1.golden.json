@@ -141,6 +141,14 @@
       {
         "sha256": "b7d74eb08b5025689274c248c468ec9a01f53bc38eeb7a5ab83edbcd58194622",
         "reason": "Route the already-gated generalist launch through the production-test-only offline subprocess boundary. Live execution still reaches Invoke-TimedProcess with the same arguments; sealed replay may select only the digest-bound deterministic adapter."
+      },
+      {
+        "sha256": "190a9dbe572739288692eb7a6fa742bb0c52e0a8a7b94302f03049dda0467016",
+        "reason": "History only, superseded below. Report ProcessStarted alongside ModelRan on every return of the generalist pass, so the shadow cohort budget census can tell an attempt that launched a subprocess from an input refused for size before any process existed. The two flags are deliberately distinct: a process that started and reported no assistant turn is still a real model start and is still spent. Nothing about the launch, the tool grant, the gating or the disabled discovery/delivery paths changes; the returned hashtable gains one boolean."
+      },
+      {
+        "sha256": "04db3321210d1a35b27a18ec525be69539ea2e64aa7a1c53f878c094cd177841",
+        "reason": "CURRENT and authoritative. Name the counted role at the generalist launch call, passing -CensusRole 'generalist' so the subprocess boundary can publish a launch intent before a process can exist. The intent closes the window between Process.Start succeeding inside the harness and the accounting record being written after it returns, during which a throw would lose a real model start. Only the argument list of the existing call changes; the launch, its arguments, the tool grant, the gating and the disabled discovery/delivery paths are untouched."
       }
     ],
     "Invoke-ReviewerPullRequest": [
@@ -167,6 +175,14 @@
       {
         "sha256": "620d9b32c0b0b7fae72a811685ecb5a0082b123b9b198ce3f03abb7220fb1a82",
         "reason": "CURRENT and authoritative. Route the generalist role through the existing single-role acquisition dispatch so a no-model role input capture drives the EXACT production cycle rather than a hand-built projection Bound. The guard that already returned early for the specialist now also does so for the generalist, which is what lets capture emit a production-derived role-scoped projection instead of consuming one. The disabled generalist discovery, cross-verification and delivery paths are unchanged: the dispatch is reachable only while an acquisition or capture target role is active."
+      },
+      {
+        "sha256": "507a017ae2af441756ed142256c785561fa68e9451b380542505e2252e55a25f",
+        "reason": "History only, superseded below. Publish processStarted on the generalist attempt-accounting record so the shadow cohort budget counts real model subprocess starts rather than attempt records."
+      },
+      {
+        "sha256": "404ec46ae7d3875731a9ed0c7d153b02d2b7af290016e4b2a6d09edfd4ff5d69",
+        "reason": "CURRENT and authoritative. Publish the generalist attempt-accounting record through Write-ReviewerModelStartAccounting instead of the plain cycle writer, so a failure to record a model start that was really made is fatal rather than swallowed into a run that would still report a complete, exact census. Only the writer the record travels through changed: the record's own fields, and every gate, launch, retry, discovery, cross-verification and delivery decision in this function, are untouched, and the disabled generalist paths are unchanged."
       }
     ],
     "Write-ReviewerConventionSpecialistPreview": [

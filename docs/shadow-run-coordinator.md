@@ -119,7 +119,9 @@ run that was never interrupted. That is the property that makes "kill it anywher
 rather than a hope.
 
 `--halt-after <state>` stops deliberately after a named transition and exits 9. It exists so
-the suite can stop the process at every single transition and start it again.
+the suite can stop the process at every single transition and start it again. It is a fault-test
+argument and nothing else: a cohort declared `shadow-cohort-run` may not forward it, and the
+kind that may cannot start this program at all.
 
 ## Building the corpus
 
@@ -503,6 +505,344 @@ This is what moved the file contract from "built and CI-verified" to "in force" 
 `docs/escape-ledger.v2.json`: not a document saying so, but a compiled consumer that cannot
 reach its terminal state without the files.
 
+## The cohort
+
+Everything above prepares one pull request. The cohort is the operator-initiated layer that runs
+that same preparation across several of them, one after another, and it deliberately adds nothing
+to what a preparation does — it adds only the accounting that makes running many of them
+answerable afterwards.
+
+It is a separate mode of the same executable:
+
+```
+ShadowRunCoordinator --cohort <manifest.json> --authorized-by <alias>
+ShadowRunCoordinator --cohort <manifest.json> --authorized-by <alias> --rebuild-index
+```
+
+The alias is an argument, not a manifest field, and that is the point. A cohort whose
+authorization could be read out of a file would be a cohort a scheduled task could start by
+writing that file. There is no unattended path to this mode.
+
+**One manifest, sealed before anything runs.** `devpilot.shadow-cohort.manifest.v3` declares the
+cohort id and correlation, the exact toolkit checkout and required ref, the global ceilings, and
+an ordered list of entries. Each entry pins one already-written typed request by path *and*
+digest, restates that request's subject and its three configuration digests, declares where the
+reviewer rules it will be run under came from, names its own immutable output root, and carries a
+sealed plan estimate. The manifest is read as strict UTF-8 without a byte-order mark, through the
+same strict reader everything else uses; an unknown field, a missing one, a repeated pull request,
+two entries sharing an output root, an ordinal that disagrees with its position, or a set of
+estimates that cannot fit the cohort's own ceiling is a refusal before any process starts. Nothing
+is read from stdin and nothing contractual is written to stdout.
+
+**Concurrency is one, as a constant.** `SupportedConcurrency` is a literal in the contract and a
+manifest declaring anything else is refused. Two preparations sharing one toolkit checkout is a
+different experiment from the one this build has evidence for, so it is not offered.
+
+**Every entry is the whole pipeline.** Before an entry is launched the runner re-reads its request
+and checks that the bytes still digest to what the manifest sealed, that the subject still matches
+field for field, that the toolkit head and required ref are the cohort's, that the rule bundle
+declaration still digests to what was declared, that the output root is the one that was declared,
+and that the request declares both slots, the reconciliation and a `PreviewOnly` delivery with a
+zero write budget. An entry that declares less than the full pipeline is refused rather than run
+in a reduced shape.
+
+**And every entry is reviewed under a configuration bound to the branch it is pinned to.** The
+entry's subject pins `targetRefName`, and immediately before the child is launched the runner reads
+the reviewer configuration that entry's request names — through the digest the manifest already
+sealed for it — and requires `review.targetRefName` to equal the pinned one, exactly. A pull
+request that merges into a release branch reviewed under a configuration bound to the trunk is not
+a review of that pull request, and the mismatch does not announce itself: the preparation gets as
+far as fetching and reconciling before anything notices, by which point models have run. A missing
+pin, a missing or unreadable configuration, a configuration whose bytes no longer match its sealed
+digest, or a ref that differs in any way including case blocks the entry before its preparation
+starts, and abandons the cohort rather than the entry.
+
+Be precise about what that proves and what it does not. It proves that the manifest and the
+reviewer configuration agree; it does **not** prove that either agrees with the branch the pull
+request currently merges into, and it cannot, because the runner performs no provider I/O of its
+own and the typed request carries commits rather than ref names. The manifest signer is
+authoritative for the pinned ref. Live drift — a pull request retargeted after the manifest was
+sealed — is caught one layer down, and specifically by the reviewer's own candidate predicate
+(`Get-ReviewerCandidateDecision`), which compares the live pull request's `targetRefName` with
+`config.review.targetRefName` and declines the pull request before any model process starts; every
+pull request goes through that predicate, including one named explicitly by `-PullRequestId`. It is
+*not* the pre/post identity capture that catches a retarget: that binds commits, status and
+repository, and detects movement *during* the capture rather than a stable mismatch before it. So
+the pin is what stops a stale or wrong configuration from being used; the predicate is what stops a
+retargeted pull request from being reviewed. The pin is deliberately *not* part of the subject
+digest: the typed request has no such field, so digesting it would make every entry's subject
+compare unequal to the request it pins.
+
+**A production cohort cannot pass a fault argument.** `execution.argumentPrefix` is forwarded to
+the child verbatim, and every token in it is classified when the manifest is read: fault injection
+and test-only switches (`--halt-after`, `--crash-after`, `--simulate`, `--stub`, `--test-only` and
+their neighbours), the arguments this runner appends itself (`--request`, `--target`, `--cohort`,
+`--authorized-by`, `--rebuild-index`), script-host switches (`-File`, `-Command`, `-EncodedCommand`)
+and script paths. Tokens are compared whole and case-insensitively, and `--option=value` is split
+at the first `=` so an option cannot hide inside a value; nothing is matched by substring, so an
+output root that happens to contain the word "fault" is not a refusal.
+
+A cohort declared `shadow-cohort-run` that forwards any of them is blocked *before* the launch,
+not at load — a frozen root written under a halt argument has to stay readable so `--rebuild-index`
+can re-derive its evidence, and refusing to parse it would make that evidence unreachable rather
+than unusable. Filtering the arguments would achieve little on its own, since a cohort free to name
+any executable could hand the refused switches straight back to whatever it started — `cmd /c
+"dotnet …\ShadowRunCoordinator.dll --halt-after …"` passes every argument test there is, because
+the splitting that reintroduces the switch happens one process later. So the admissible production
+launches are *enumerated* rather than filtered, and there are exactly two: the command is
+`ShadowRunCoordinator.dll` or `ShadowRunCoordinator.exe` by whole file name, or the command is
+`dotnet`/`dotnet.exe` by whole file name and the **first** argument names that assembly. In both,
+the next thing to read an argument is this program's own parser, which takes whole tokens and knows
+no `--option=value` form. A shell, a wrapper, a script, or this program named anywhere other than
+first is refused without being asked what its arguments were.
+
+Two smaller refusals hold that enumeration up. No launch token — command or argument — may contain
+a C0 control character or DEL; this is a load-time well-formedness refusal, because
+`Path.GetFileName` scans back from the end of a string while process creation stops at the first
+`U+0000`, so a token containing one would name this program to every check here and start something
+else. And the `dotnet` arm compares whole file names rather than the name without its extension, so
+`dotnet.com` and `dotnet.cmd` are not the host. What all of this still leaves outside the check is
+an operator who renamed a binary on their own disk, which is not a boundary a manifest reader can
+hold — the same operator can edit the manifest.
+
+A fault test that genuinely needs those arguments declares `kind: "shadow-cohort-test-run"` instead,
+and pays for the permission with the mirror image: neither the command nor its arguments may name
+`ShadowRunCoordinator`, and they must name a script. The claim is exactly that and no more — the
+declared launch does not directly name the preparation. A stub script is free to start whatever
+*it* likes, including the preparation, so the kind is a development affordance rather than a proof
+of model isolation, and it is not an operator contract. An operator cohort is always
+`shadow-cohort-run`.
+
+**A non-zero exit is not the last word on whether an entry finished.** A preparation told to stop
+at the cohort's declared target and stopping exactly there writes its evidence, writes its ending,
+and exits 9 to say it stopped on purpose. Reading the exit code alone calls that a fault and
+abandons every entry behind it, while every artifact needed to see that it was finished sits on
+disk, signed. So an entry that ended non-zero is adopted as complete when, and only when, its own
+authenticated audit proves it: the exit is 9 and no other non-zero code; the state it reports at
+rest is the cohort's declared target, so a run halted *earlier* is never adopted; it is at rest for
+`completed` or `deliberateHalt`, which are the two reasons a walk chooses; every transition and
+artifact digest the declared target's rank implies is published — a delivery target requires the
+delivery digests, an earlier target requires only what that rank cannot have been reached without,
+each threshold being the rank of the transition that publishes that digest, except that the
+snapshot digest is required at every rank, so adoption is deliberately *unsupported* below
+`snapshotVerified` rather than thinned out to nothing; the signed state record still standing in
+the output root is the one the audit was written over; and nothing was written to the provider. The
+audit's correlation, request digest and subject digest were already required to be the manifest's
+by the reader that produced the summary. An adopted entry is counted in `completedEntryCount` and
+named by ordinal in `adoptedCompleteEntryOrdinals`; its per-entry summary is left byte-for-byte as
+it was committed, because that summary is digest-bound to the journal and an index that rewrote it
+could no longer be checked against the record it claims to be derived from. A rebuild re-derives
+that proof rather than inheriting it: a journal recording an adoption whose artifacts no longer
+support it blocks the index rather than repeating the word it was given.
+
+**Sequential, journalled, and never retried.** The cohort journal
+(`devpilot.shadow-cohort.journal.v3`) is signed and replaced atomically, and it moves an entry
+through `pending → launchIntended → running → ended`. The launch intent — including the entry's
+digests and the exact command — is committed *before* the process exists, and the child's process
+id and its exact start time are committed as soon as it does, which is what makes "did this entry
+already start?" answerable after a machine dies rather than inferred. An entry that reached
+`ended` is finished: the journal refuses to reopen it, so a resume can never produce a second
+preparation over a subject whose first preparation already published evidence. There is no retry,
+no requeue, and no replacement — a cohort that needs a different set is a different cohort, with
+its own manifest and its own operator.
+
+A resume that finds an entry still `running` checks whether the recorded child is genuinely alive,
+by process id *and* start time. If it is, the resume refuses (exit 6) rather than running beside
+it; once that child is gone the entry is relaunched from a clean attempt, and the entries before
+it are not touched. A `running` record that carries neither a usable process id nor a start time
+cannot answer that question at all, so it refuses too: answering "not alive" by default is exactly
+how a second preparation gets started over a live output root.
+
+**The ceiling is checked before the entry that would cross it.** Admission uses what the cohort
+has actually spent, taken from the ended entries' own audits, plus the sealed estimate of the
+entry about to start. If that would cross the declared maximum model starts, verifier assignments
+or wall clock, the cohort stops (exit 10), the remaining entries stay `pending`, and the index says
+so. A ceiling checked afterwards is a ceiling that has already been exceeded.
+
+**And the estimates are proved before the first entry.** A `planEstimate` is an operator's
+number, and a cohort that budgets against a number nobody derived can authorize a run that
+starts more models than it declared. Each entry therefore carries a sealed
+`modelStartBound` — path and digest — produced by `tools/New-ShadowModelStartBound.ps1`, which
+lives on the reviewed side because what an argument vector means is the reviewed side's
+business. It re-hashes the reviewer configuration the request pins, rebuilds the slot arguments
+with the reviewed builder, and multiplies the toolkit's own per-attempt limits: for each declared
+slot, the configured generalist passes times the generalist retry limit, plus the specialist
+retry limit when verification is authorized, plus the capped maximum verifier launches times
+their per-run attempt limit. Reconciliation and delivery contribute none. The same artifact —
+`devpilot.shadow-cohort.model-start-bound.v2` — also publishes the per-slot maximum verifier
+*assignments*, which is a different unit and is summed into its own bound.
+
+Before anything launches, the runner checks that each bound file digests to what the manifest
+sealed, that it was taken over *this* entry's request bytes and this cohort's toolkit head, that
+the entry's declared `modelStarts` is not below the bound it publishes, that its declared
+`verifierAssignments` is not below the assignment bound the same artifact publishes, and that the
+sum of each kind of bound fits its global ceiling. A missing, unreadable or mismatched bound is a
+refusal, and the bound is never re-derived here.
+
+Both superseded manifest contracts are refused **by name**, each with the reason its budget was
+unsafe, rather than being reported as an unrecognised version.
+`devpilot.shadow-cohort.manifest.v1` measured its model-start budget in reviewer processes.
+`devpilot.shadow-cohort.manifest.v2` measured its verifier budget in committed verifier-backed
+terminal transitions — a list with eight members — so a run standing on forty reciprocal
+assignments was scored as four, and no run could ever cross the ceiling. Re-reading either under
+this build would silently reinterpret an operator's authorized number, in one case by a factor of
+ten.
+
+**The verifier ceiling is spent in assignments, not in the states a run reached.** An assignment
+is the verification contract's own identity: one candidate paired with one required reciprocal
+verifier model, minted as an `assignmentId` over the cluster, the candidate hash and the target
+model, with exactly one assignment per candidate per required model. The bound is therefore the
+plan's own cap — the reviewed side refuses a plan whose required assignments exceed the effective
+verifier ceiling, so that ceiling *is* the per-run assignment cap — summed across the declared
+slots. The actual is read from each entry's signed audit, which takes it from the run's own sealed
+verification previews and binds the total together with a per-slot and per-verifier-model
+breakdown.
+
+Grouped verifier **process** starts are counted too, under their own name, and no budget is ever
+checked against them: within one pass a launch can serve a whole cluster, so a pass's launches are
+at most its assignment rows and routinely far below, while across passes the identities dedupe and
+fresh nonces do not. The two are cross-checked but never required to be ordered, because grouping
+and repeated verification move them independently; what is refused is a contradiction, such as a
+slot reporting verifier model starts while claiming no assignment existed.
+
+**An entry that spent more than the cohort was allowed ends it.** The estimates admit an entry;
+the actuals, read from each ended entry's signed audit, are what stop the set. When the real
+model starts already spent — plus the bounded allowance for slots that ended without a complete
+census — exceed the ceiling, the cohort ends at `budgetExceeded`, the entry's own result stands
+and is never re-run, and no further entry launches. The verifier assignment ceiling is enforced on
+exactly the same terms and in its own unit.
+
+**An entry that left no evidence stops the cohort.** A child can die, hang or be killed part-way
+through a preparation, having already started models, without ever publishing an audit. Nothing it
+left behind says what it consumed or whether anything acted on its behalf, so neither the ceiling
+nor the zero-write claim can be computed over it. Carrying it into the index would publish a zero
+write count for an entry that never proved one. Every launched entry with no readable audit
+therefore blocks the whole cohort (exit 11) whatever the stop policy says, the entries after it stay
+`pending`, and running the cohort again refuses again — running it a second time settles nothing
+about that output root. `continueOnTerminalFailure` carries on past an entry that failed *and*
+published its audit, which is a failure the cohort can account for.
+
+This is a narrow window in practice: the preparation writes its audit before it does any work and
+rewrites it on every fault, including its own contract refusals, so an entry that reached the
+preparation at all leaves one. What does not leave one is a child killed or crashed before that
+first write, and a refusal that happens before the preparation starts — a lease conflict on the
+entry's output root is the realistic case. Blocking there is deliberate: a lease conflict means
+something else is holding that root, and this runner is not the thing that should decide what.
+
+A journal that holds an ended entry with no audit digest and any outcome other than the refusal
+itself is refused on sight, by both the reader and the writer. This build never commits such a
+record, so a journal containing one was written by something else, and resuming it would walk past
+a preparation on counters nothing published.
+
+**Stop policy, and what it does not mean.** `failFast` stops at the first entry that ends other
+than complete; `continueOnTerminalFailure` carries on to the next one. Neither re-attempts
+anything. Three conditions ignore the policy entirely and stop the whole cohort: an entry that
+published no audit at all, an entry audit this build cannot read, and any reported provider write or
+write tool invocation (exit 11). An audit
+standing in an entry's output root counts as that entry's audit only if it names the correlation
+the entry's own sealed request declares, restates the request and subject digests the manifest
+sealed, and carries that entry's own signature over itself — the cohort verifies the audit's HMAC
+against the state key the preparation left in its output root, in constant time, and then its
+self-hash, before it believes a single counter inside it. Binding by the words alone would only
+prove the file describes the right entry; anyone who could write those words could write zero into
+the write counters beside them. The two write counters are then read strictly — absent, negative or
+non-integral is a refusal, never the zero the cohort is trying to prove. A write observed anywhere
+in a cohort invalidates the claim the whole cohort was run under, so it is not something the cohort
+continues past, and the count that was observed is carried into the entry's ending and into the
+index rather than being republished as zero once the entry is summarized as not-run. An entry whose
+evidence was refused is *closed* with the outcome `evidenceRefused` before the refusal travels — an
+entry left recorded as `running` once its child is gone would be read as resumable by the next run
+— and a cohort holding such an entry stays refused on every later run until an operator settles
+those artifacts by hand.
+
+**One key format.** A signing key is 32 raw bytes: that is what the preparation mints, what it
+writes into `<output-root>/coordinator/state.key`, and what the cohort journal writes beside its own
+record. One reader accepts it, and the cohort authenticates an entry's audit with the same bytes,
+read the same way, that the preparation signed it with. Key material is not text — most 32-byte keys
+hold no valid sequence in any encoding — so a reader that decoded it would fail on the key rather
+than on the artifact it was asked to check, and would fail as a decoder fault rather than as a
+refusal an operator can act on. Every way of failing to acquire a key (absent, short, long, locked,
+unreadable) comes out as a refusal naming the absolute path, never as a crash. Cohort journal roots
+written before this rule hold a 64-character lower-case hexadecimal key; that one encoding is still
+read, named rather than sniffed and only for the journal key, so a root created by an earlier build
+still resumes. Nothing writes it any more.
+
+**One acquisition per artifact.** Every contract file a cohort obeys is read once, through one
+guarded reader, and the digest published for it is taken from the same bytes that were parsed. A
+file read twice — once to hash, once to obey — attests to bytes nobody read, and an artifact this
+runner cannot open is a fact about the artifact: it comes out as a refusal naming the file and
+blocks the cohort, never as a filesystem fault from underneath. The distinction matters because a
+failure to *write* the index is treated leniently — the journal is authoritative and the next run
+rewrites the report — and a failure to *read* an audit must never be mistaken for one.
+
+**The index says what ran, never what was concluded.** `devpilot.shadow-cohort.index.v3` carries
+one summary per declared entry, in declared order: the preparation's final state and terminal
+reason, the snapshot, run-set, reconciliation and delivery evidence digests, the model start, slot,
+supervised slot, verifier assignment and provider write counts, the wall time, and the entry's
+subject *digest*. It carries no organization, repository, pull request id, finding text, severity
+or verdict, and it is self-hashed and signed. A refusal's own words can name an output root, and an
+output root can encode the subject it was taken over, so the index publishes a closed phrase plus
+`terminalDetailSha256` and the words themselves go to the operator's log.
+
+The word the cohort publishes about itself is committed into the signed journal *before* the index
+is written, so the two can never disagree and a kill between them leaves a record the next rebuild
+reproduces exactly. That commit is not covered by the leniency that lets a failed index write pass:
+the index is a report and can be rewritten from the journal, but a cohort that could not write down
+what it published has not published it, and letting that failure pass would mean exiting
+successfully while the record still said something else.
+
+`--rebuild-index` reconstructs it from the journal and the per-entry audits alone, launching
+nothing, which is what makes the index evidence rather than a log the runner happened to keep. The
+rebuild is checked, not merely repeated: each ended entry's recomputed audit and summary digests
+must equal the ones its ending committed, so an audit that was removed, replaced or edited after
+the fact is refused (exit 11) instead of being quietly re-signed as an entry that never ran. The
+rebuild reads its terminal reason out of the journal rather than inferring one, so re-publishing a
+ceiling stop or a `failFast` stop cannot launder it into a completed cohort, and a rebuild pointed
+at a root holding no journal or no key is refused (exit 2) rather than minting a key nobody holds
+and signing an index no later run could verify. A rebuild reports a record; it does not stand in
+for one.
+
+Because a resume has to find the same record, the journal root and the index path are declared as
+fully qualified absolute paths — rooted is not enough, since a drive-relative path is rooted and
+still resolves against the current directory. Every entry path is held to the same rule for a
+sharper reason: the child preparation is started with its working directory set to the toolkit
+checkout, so a relative output root would be checked by the parent against one directory and
+written by the child into another, and the parent would find nothing where the evidence belongs.
+The index may not be declared over the journal, the journal key, the lease, the intent or log
+roots, the manifest itself, any entry's request, any declared rule bundle, or anywhere inside an
+entry's output root: the index is rewritten on every publish, including before the entries are
+verified, so declaring it over the record it is derived from would destroy that record before
+anyone read either.
+
+**A completion is a claim, and a claim needs an account.** A preparation that exits cleanly has
+published its audit; that is what exiting cleanly means here. An entry that reports completion with
+nothing standing where its evidence belongs is refused (exit 11) rather than summarized as a
+preparation that ran and consumed nothing — a completed entry with no evidence, no model starts and
+no write counters is indistinguishable in the index from a cohort that genuinely cost nothing, and
+it cannot support the zero-write claim the whole cohort is run under. A preparation that faulted
+before it could write anything is a different case and keeps its absence, because nothing is being
+claimed on its behalf.
+
+Rolling the cohort back is not running it. The single-request mode is unchanged, the PowerShell
+preparation path is unchanged, and a cohort of one entry is a preparation with a journal around it.
+
+**Running one.** `samples/shadow-cohort.sample.json` is a complete two-entry manifest in the exact
+shape this build parses, with every path, digest and identity field zeroed. An operator fills it in
+from artifacts they already have — the same per-pull-request request documents the single-run mode
+takes, the rule bundle declarations those requests were built against, and the digests of both —
+and then runs:
+
+```
+ShadowRunCoordinator --cohort <manifest> --authorized-by <alias>
+```
+
+The alias is a command-line argument on purpose. It is never read from the manifest, so a cohort
+cannot be started by a scheduled task that writes a file: somebody has to type it. Exit 0 means
+every entry ended complete; 5 means the cohort was walked but an entry ended other than complete;
+10 means a ceiling stopped it with entries still pending; 11 means it was blocked and needs an
+operator; 6 means a committed launch could not be resolved and needs one too. Re-running the same
+command resumes; it never retries.
+
 ## Rollback
 
 The PowerShell preparation path is unchanged and remains the default; nothing routes to the
@@ -578,17 +918,120 @@ PowerShell and an unobserved run would otherwise read as a clean zero; `invarian
 says which of the two an audit is.
 
 The slots' own fields are separate from the readiness census, and the distinction matters:
-`slotLaunchCount` and `modelInvocationCount` are what the reviewed verifier saw *at
+`slotLaunchCount` and `preparationAttemptRecordCount` are what the reviewed verifier saw *at
 run-set-ready*, when by definition nothing has run yet, so both are zero on a healthy run. The
 per-slot census taken after each slot finished is indexed under `slots`, one entry per declared
 slot in declaration order, each carrying `slotName`, `slotAttemptCount`,
-`slotModelInvocationCount`, `slotTerminalStatus`, `slotTerminalExitCode`, `slotTerminalTimedOut`
-and `slotTerminalSha256`, beside `declaredSlotCount` and `supervisedSlotCount` so a partly
-supervised set cannot read as a complete one. The model count is a passthrough: the coordinator
-neither produces it nor interprets it, and publishes it exactly as the reviewed inventory
-reported it. The slot fields are omitted entirely when no slot was authorized, for the same
-reason the readiness census is — a zeroed slot block would read like a slot that ran and did
-nothing.
+`slotAttemptRecordCount`, `slotRealModelStartCount`, `slotTerminalStatus`,
+`slotTerminalExitCode`, `slotTerminalTimedOut` and `slotTerminalSha256`, beside
+`declaredSlotCount` and `supervisedSlotCount` so a partly supervised set cannot read as a
+complete one. Every count is a passthrough: the coordinator neither produces it nor interprets
+it, and publishes it exactly as the reviewed inventory reported it. The slot fields are omitted
+entirely when no slot was authorized, for the same reason the readiness census is — a zeroed
+slot block would read like a slot that ran and did nothing.
+
+### Real model starts, and what is not one
+
+Audit `v2` publishes two different things that earlier builds conflated under one name. A
+**real model start** is one model subprocess actually started, in any role and on any attempt —
+each generalist pass, each retry of one, the convention specialist, and each cross-verification
+launch. A **slot attempt record** is one reviewer process launch. A two-slot run in which each
+reviewer started two generalists is four real model starts and two attempt records, and the
+count a budget is spent in is the first one.
+
+The per-role census is taken on the reviewed side, from the reviewer's own published attempt
+accounting and from the distinct launch nonces its sealed verification previews carry, and is
+passed through unread: `realModelStartCount` with `realModelStartsGeneralist`,
+`realModelStartsSpecialist` and `realModelStartsVerifier`, which sum to it.
+`realModelStartsObserved` says whether any slot reached a durable ending,
+`realModelStartCensusComplete` says whether every slot that was launched published one, and
+`realModelStartUnmeasuredAllowance` is how many starts an entry could have made and never
+recorded — computed on the reviewed side against each run's own sealed plan, because the size of
+the gap depends on the evidence the run's own runner leaves. Every role publishes its record as
+soon as its subprocess returns, and that write is fatal: a reviewer that cannot record a launch it
+made fails rather than degrade past it, so a run that ended cleanly has no gap, and one that was
+interrupted hides at most the single attempt in flight. Against a runner that publishes no
+per-launch record for cross-verification the whole role is unmeasured however the run ended,
+because that role's only other witness is the end-of-phase seal — accumulated in memory,
+serialized once, and written *empty* by the degraded fallback, which returns normally. Whatever
+that seal cannot prove is charged. That allowance is what lets a ceiling be checked against an
+upper bound rather than against a floor. `slotAttemptRecordCount` remains, renamed, as a
+diagnostic.
+
+A **real verifier assignment** is a third and separate unit, and it is the one the verifier
+ceiling is spent in. It is one candidate paired with one required reciprocal verifier model, and
+the census is taken over the distinct `assignmentId` values in the run's own sealed verification
+previews: `realVerifierAssignmentCount` with `realVerifierAssignmentsByModel`, which sums to it,
+`realVerifierAssignmentsObserved`, `realVerifierAssignmentCensusComplete` and
+`realVerifierAssignmentUnmeasuredAllowance` on exactly the same terms as their model-start
+counterparts. `verifierProcessStartCount` sits beside it as a diagnostic and no budget is checked
+against it: one launch can serve a whole cluster, so within a single pass it sits below the
+assignment count, but re-verification mints fresh nonces against identities that dedupe, so no
+ordering between the two holds in aggregate.
+
+It replaces a derivation that counted how many verifier-backed terminal transitions a run had
+committed. That census could not exceed the number of states it listed, so a run standing on forty
+assignments and a run standing on four both reported four, and a ceiling stated in it could never
+be crossed by any run.
+
+The assignment census has exactly one source, so completeness is judged strictly and on the record
+rather than on the review's conclusion. The reviewed side creates its preview directory before any
+review work happens, and its cross-verification fault path seals a preview carrying an *empty*
+assignment list and then returns normally — so neither the directory, the file, nor the run's own
+clean ending witnesses that anything was counted. That fault path is identified by the tuple it is
+forced to publish: a non-empty `diagnostic`, an empty `inputArtifactPath` and an all-zero
+`inputManifestSha256`. A census is complete only when an authorized run sealed at least one preview
+and *no* preview carries that tuple; otherwise the whole of what the sealed plan still admits is
+charged as unmeasured, however the run ended. The seal's own `status` is deliberately not consulted:
+a review reports `degraded` for four ordinary reasons — a verifier invocation that timed out, a
+degraded specialist, a degraded convention plan, a withheld authoritative source — and seals its
+full assignment list in every one of them.
+
+No ordering is required between assignments and process starts. Within one pass a launch is grouped
+by cluster and model and its nonce is stamped onto every assignment it served, so a pass can never
+mint more distinct launches than it published assignment rows — and that is checked per sealed
+preview. Across passes the relationship inverts: identities are content digests and dedupe, launch
+nonces are minted fresh, so a legitimate re-verification of the same candidates leaves a run root
+with more launches than assignments. One contradiction is refused per slot, where both figures
+describe one run: an assignment count of zero beside any verifier-role model start, because those
+two censuses are taken over the same phase and the model-start records survive an evidence loss the
+preview does not.
+
+A cohort refuses to spend a budget against an audit that cannot answer this. A missing
+`realModelStartsObserved` or `realVerifierAssignmentsObserved`, an unreadable counter, a role or
+per-model breakdown that does not sum to its total, a census the preparation marked incomplete, an
+entry claiming launches or verifier model starts while claiming no assignment existed, or an audit
+that launched slots and supervised none of them to an ending all stop the whole cohort rather than
+the entry, because an unread counter is not a zero.
+
+`preparationEnded` is asked before any of them. The audit is rewritten after every commit, so the
+copy on disk always describes the run as it then stood, and every way out of the walk — success,
+refusal, fault, deliberate halt — rewrites it once more with an ending. A coordinator killed
+outright writes no ending, and what it leaves is a mid-walk audit whose counters are honest for a
+point the run never got past and whose zeros are indistinguishable from those of a preparation
+that refused before launching anything. An audit that does not say it had ended, or that says it
+had not, stops the whole cohort.
+
+That answer is only worth asking for if the audit is this run's. A resumed preparation finds the
+previous invocation's ending already standing over its root, so a stale audit *file* is the one
+thing an opening write is not allowed to leave behind: the file is removed first and the `running`
+audit written second, and a preparation that cannot remove it refuses before it advances a single
+rank. A failure between the two leaves no audit at all, which every reader of this root already
+refuses — never the previous run's ending with this run's work underneath it. A path holding
+nothing, or holding a directory, carries no earlier ending and can be read as none, so a write that
+fails there is absorbed like every other audit write and the run keeps its work. The difference is
+read from the path's attributes rather than from `File.Exists`, which answers false for a path the
+process was not allowed to look at: an ending this preparation cannot stat is still an ending some
+other reader can, so an answer that cannot be trusted is treated as the hazard and the run refuses.
+
+The census itself has a matching floor. A model subprocess is created inside the harness, and the
+code that raises telemetry, drains the two output streams and writes standard input all runs
+after the process exists; a fault in any of it reaches a handler that degrades, and the accounting
+record — written when the harness returns — is never written at all. So the reviewer publishes a
+launch intent in the last statement before a process can exist, and a role's starts are the larger
+of its intents and its accounting records. The two refusals that can turn an invocation away, the
+role-input capture boundary and the single-shot acquisition guard, sit above the intent, so a run
+that refused before launching still counts zero.
 
 `slotSupervision` reports how each wait ended, and only what this coordinator can actually know:
 the disposition, the child's exit code, whether the supervisor stopped it, the recorded identity,
@@ -732,13 +1175,57 @@ as the comparison's: the coordinator is killed after the delivery has minted its
 attempt record, and the resume must adopt the child it named, reach `deliveryTerminalVerified`,
 leave exactly one attempt record, and still report both zeroes.
 
+`tools/Test-ShadowCohortRunner.ps1` (CI, offline, no model) covers the cohort layer, and it
+inverts the stand-in: the *runner* under test is the shipping runner with no test mode, and the
+*entries* are stood in. What a cohort adds over a preparation is entirely about accounting across
+processes — committing an intent before a child exists, refusing to reopen an entry that ended,
+admitting the next entry against a global ceiling, surviving a kill between entries — and none of
+that depends on how faithfully the child reviews anything, while a suite that ran the real
+preparation per entry could not kill a runner at a chosen instant. So each entry is a real child
+process, started against a real typed request that the real loader validates, writing a real audit
+at the real path that the real summary reader parses; it simply reaches its outcome by reading a
+control file.
+
+It covers: a three-entry cohort through a completion, a supervised run that ended other than
+complete, and a fault, under both stop policies, with the continue policy reaching every entry and
+`failFast` provably leaving the entry after the stop with no output root at all; the index's
+ordering, its per-entry counts and its opacity, checked by looking for sentinel identity that
+cannot occur inside a digest; a second run of a finished cohort, which must re-attempt nothing and
+must leave exactly three launch intents in the journal; `--rebuild-index` reproducing the summaries
+and the totals from the journal and the audits after the index is deleted; a child that hangs,
+killed at the entry's declared ceiling with its process confirmed gone; a runner killed mid-entry
+*without* its child, so the entry's preparation outlives its parent, followed by a resume that
+refuses to run beside that live child, and then — once it is gone — a resume that carries the
+interrupted entry to an ending on a second attempt, never touches the entry before it, and goes on
+to the entry after it; a journal edited after it was written; a manifest edited between runs; a
+journal key with no journal; the global ceiling stopping the cohort before the entry that would
+cross it, again confirmed by the absence of that entry's output; a child that was killed at its
+ceiling and a child that died hard, each leaving no audit and each stopping the whole cohort with
+the entry after it untouched and a second run refusing again; a reported provider write and an
+unreadable entry audit, each stopping the whole cohort regardless of policy; a subject that drifted
+between the manifest and the request, a request edited after the manifest sealed it, a rule bundle
+that changed under its declaration, and a toolkit checkout that moved — each refused with the entry
+provably never started; the manifest shapes this build never runs (concurrency two, no entries, one
+pull request declared twice, a shared output root, a self-contradicting order, estimates that
+cannot fit their own ceiling, an unknown field, an authorization kind other than preview-only, and
+a non-zero write budget); an entry declaring no delivery; and the invocation refusals that keep a
+cohort an operator action — no `--authorized-by`, a cohort mixed with a single request, a
+malformed alias, and `--rebuild-index` outside a cohort.
+
 `tools/Test-ReviewerCoordinatorContract.ps1` is the architecture boundary: it asserts that the
 coordinator sources contain no prompt, model, severity, candidate or verdict vocabulary and no
 provider write path, that a delivery exists and that no transition in it can write, that both
 slot terminals and the reconciliation and delivery states are present, that the delivery is
 gated on the reconciliation and the reconciliation on every declared slot, and that every
 exchange with the reviewed PowerShell goes through a named versioned file contract rather than
-stdout — so "no reviewer judgement in C#" is checked rather than promised.
+stdout — so "no reviewer judgement in C#" is checked rather than promised. For the cohort it adds
+the properties a reviewer would otherwise have to re-derive across four files: that concurrency is
+a literal one and no parallel primitive appears anywhere in it, that preview-only is pinned again
+at the cohort boundary and the coordinator's own write refusals are the ones applied, that no
+retry, requeue, replacement or set-mutation vocabulary exists, that the global ceiling is consulted
+before the entry that would cross it rather than after, that every cohort document is a named
+versioned file, that the index carries no judgement vocabulary and publishes no subject identity,
+and that the operator alias is an argument rather than a manifest field.
 
 The canonical key order that makes any of this reproducible is covered in
 `tools/Test-ReviewerStageContract.ps1`, which asserts the same bytes under `en-US`, `da-DK`,

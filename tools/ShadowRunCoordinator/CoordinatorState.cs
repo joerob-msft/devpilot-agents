@@ -594,8 +594,14 @@ internal sealed class CoordinatorState
             return ReadKey(request);
         }
         preexisted = false;
-        return RandomNumberGenerator.GetBytes(32);
+        return RandomNumberGenerator.GetBytes(SigningKeyLength);
     }
+
+    /// <summary>
+    /// The one length a signing key has, in bytes, as it is minted and as it is
+    /// written.
+    /// </summary>
+    internal const int SigningKeyLength = 32;
 
     /// <summary>
     /// The supervised child this output root's signed record says it left running,
@@ -726,13 +732,101 @@ internal sealed class CoordinatorState
         return key;
     }
 
-    private static byte[] ReadKey(CoordinatorRequest request)
+    /// <summary>
+    /// The signing key standing in one output root, read once, as the 32 bytes
+    /// every signature over that root is computed with.
+    /// </summary>
+    /// <remarks>
+    /// One format, one reader. A key is minted as 32 raw bytes and written as 32
+    /// raw bytes, and nothing has ever written it as anything else, so nothing
+    /// reads it as anything else. A reader that decoded it as text would be
+    /// treating key material as characters, and key material is not characters:
+    /// most 32-byte keys hold a sequence no decoder accepts, so such a reader
+    /// fails on the key itself rather than on anything about the artifact it was
+    /// asked to check, and fails as a decoder fault rather than as a refusal
+    /// anyone can act on. Every way of failing to acquire the key - absent,
+    /// short, long, locked, unreadable - is turned into a refusal that names the
+    /// root, because the caller's next sentence is which output root could not be
+    /// verified.
+    ///
+    /// This is the only reader. The cohort authenticates an entry's audit with
+    /// the same bytes, read the same way, that the preparation signed it with; a
+    /// second reader with a second opinion about the format is exactly the defect
+    /// this replaced.
+    ///
+    /// One caller passes <paramref name="allowLegacyHex"/>: the cohort journal
+    /// key, which earlier builds wrote as 64 lower-case hexadecimal characters
+    /// and which therefore already stands in roots an operator may still resume.
+    /// It is accepted by that caller and no other, it is named rather than
+    /// sniffed, and it is unambiguous because a raw key is 32 bytes and the
+    /// legacy encoding of one is 64. Nothing writes it any more. Accepting it
+    /// weakens nothing: a 64-byte file was never a key this build would have
+    /// accepted as raw, and the bytes it decodes to are the same bytes the
+    /// signatures over that root were computed with.
+    /// </remarks>
+    internal static byte[] ReadSigningKey(string path, string label, bool allowLegacyHex = false)
     {
-        var existing = File.ReadAllBytes(request.StateKeyPath);
-        if (existing.Length != 32)
+        byte[] existing;
+        try
         {
-            throw new ContractException($"The coordinator state key at '{request.StateKeyPath}' is {existing.Length.ToString(CultureInfo.InvariantCulture)} bytes, not 32.");
+            existing = File.ReadAllBytes(path);
         }
-        return existing;
+        catch (FileNotFoundException)
+        {
+            throw new ContractException(
+                $"The {label} at '{path}' is not there. " +
+                "A signature cannot be checked against a key this run could not acquire.");
+        }
+        catch (DirectoryNotFoundException)
+        {
+            throw new ContractException(
+                $"The {label} at '{path}' stands in no directory this run could open. " +
+                "A signature cannot be checked against a key this run could not acquire.");
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or NotSupportedException or ArgumentException)
+        {
+            throw new ContractException(
+                $"The {label} at '{path}' could not be read: {error.Message} " +
+                "A signature cannot be checked against a key this run could not acquire.");
+        }
+        if (existing.Length == SigningKeyLength)
+        {
+            return existing;
+        }
+        if (allowLegacyHex && existing.Length == SigningKeyLength * 2 && IsLowerHexAscii(existing))
+        {
+            return Convert.FromHexString(System.Text.Encoding.ASCII.GetString(existing));
+        }
+        throw new ContractException(
+            $"The {label} at '{path}' is {existing.Length.ToString(CultureInfo.InvariantCulture)} bytes, not " +
+            $"{SigningKeyLength.ToString(CultureInfo.InvariantCulture)}. A signing key is written as raw bytes and is read as raw " +
+            "bytes; a file of any other length or encoding is not one this build wrote.");
     }
+
+    /// <summary>
+    /// True when every byte is an ASCII digit or lower-case a-f, which is the
+    /// whole of the one legacy encoding this program still reads.
+    /// </summary>
+    /// <remarks>
+    /// Checked byte by byte rather than by decoding first, because decoding is
+    /// the thing that must not happen to key material: bytes that are not this
+    /// alphabet are rejected as a key of the wrong encoding, not raised as a
+    /// decoder fault from underneath.
+    /// </remarks>
+    private static bool IsLowerHexAscii(byte[] candidate)
+    {
+        foreach (var value in candidate)
+        {
+            var digit = value is >= (byte)'0' and <= (byte)'9';
+            var letter = value is >= (byte)'a' and <= (byte)'f';
+            if (!digit && !letter)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static byte[] ReadKey(CoordinatorRequest request) =>
+        ReadSigningKey(request.StateKeyPath, "coordinator state key");
 }
