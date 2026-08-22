@@ -667,9 +667,12 @@ See [`docs/adding-an-agent.md`](docs/adding-an-agent.md).
 
 The coordinator hands work to child processes and reads the results back. Almost every
 defect worth calling an escape has happened at that boundary, where a collection becomes a
-scalar, an empty result becomes null, and a partial write reads as a clean one. Four
+scalar, an empty result becomes null, and a partial write reads as a clean one. Five
 documents cover what is checked and what is not:
 
+- [Typed cohort-entry evidence](docs/cohort-entry-evidence.md) — one versioned operator
+  request in, one sealed cohort-entry package out, assembled through the reviewed read-only
+  capture surfaces with exact refusal codes. No model, no provider write, no oracle.
 - [Collection cardinality corpus](docs/collection-cardinality-corpus.md) — every
   collection-bearing field in the pipeline, driven through seven cardinality variants, with
   a coverage matrix that states plainly which dimension is uncovered.
