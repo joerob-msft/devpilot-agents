@@ -229,6 +229,20 @@ jobs:
         shell: pwsh
         run: ./tools/Test-ShadowCohortRunner.ps1
 
+      # The typed cohort-entry evidence builder that feeds the cohort above:
+      # exact wrapper-contract fixtures, one sabotage case per historical
+      # operator-assembly incident (BOM, identity aliases, the raw ADO repository
+      # shape, singleton arrays, exact-key nulls, a missing get_changes variant,
+      # a drifted resource URI, a target-config mismatch, census ordering, and a
+      # mutated read-only package), the cross-implementation prompt-asset digest
+      # parity, and the typed coordinator driven over a package this builder
+      # published. -IncludePreflight runs the coordinator assembly the step
+      # above built from an empty offline feed, so nothing here reaches a
+      # network. No model, no provider, nothing outside a temporary sandbox.
+      - name: typed cohort-entry evidence builder
+        shell: pwsh
+        run: ./tools/Test-ShadowCohortEntryEvidence.ps1 -IncludePreflight
+
       # Every inventoried collection field at zero, one, many, maximum,
       # duplicate, null-versus-missing, and wrong-scalar, plus the escape-shape
       # properties and the sabotage suite that proves each historical collapse
