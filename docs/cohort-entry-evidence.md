@@ -48,6 +48,50 @@ than a silently ignored intention.
 Both `subject.repositoryId` and `subject.repositoryName` are required, because the wrapper
 contract uses **both** and does not use them interchangeably — see the alias table below.
 
+### v2: the optional execution plan
+
+`reviewer.cohort-entry-evidence-request.v2.json`, `schemaVersion: 2`, is v1 plus **one**
+optional section, `executionPlan`. Nothing else moved. A v1 request stays loadable and
+still produces the byte-identical no-slot output it always did; a v2 request that omits
+`executionPlan` behaves exactly like a v1 request. Declaring `executionPlan` at
+`schemaVersion: 1` is a refusal (`CE700`), so the version and the capability cannot drift
+apart.
+
+Without a plan the builder emits a coordinator request with no `slots` section: the entry
+is *prepared*, and a slot declaration is somebody else's later edit. With a plan the
+builder emits the **complete** request — `slots`, `reconciliation` and `delivery` — during
+creation, before the request digest is taken. That is the whole point of the section. The
+digest covers the entire file, so there is no "after the hash" for a third slot, a write
+authorization or a redirected output directory to appear in; the tests demonstrate this by
+appending a slot to the published request and showing the digest no longer matches.
+
+| `executionPlan` field | What it fixes |
+| --- | --- |
+| `shadowSlotsEnabled` | Must be `true`. A plan that declares slots and disables them is a contradiction, not a configuration. |
+| `slots` | Exactly two, named `slot1` then `slot2` **by position**, sharing one reviewer script path and digest, with distinct state directories and terminal artifacts. |
+| `models` | The generalist pair, the convention specialist and the convention verifier, each restated and each checked. |
+| `supervision` | Per-call, slot, activity and grace timeouts. Per-call may not outlive the slot supervising it (`CE710`). |
+| `reconciliation` | Enabled, with a required run count that equals the declared slot count. |
+| `delivery` | `PreviewOnly`, comments/votes/gates all `false`, `providerWriteBudget` exactly `0` — every one of them a schema `const`. |
+
+**No write-enabled value is representable.** The four delivery capability fields are fixed
+by `const` in the schema, and the builder re-checks each one after reading (`CE707`), so a
+hand-edited request that never met the schema is refused a second time. `providerWriteBudget`
+is deliberately read across the full integer range and *then* compared to zero, so a budget
+of `1` refuses as "you asked to write" rather than as a malformed field.
+
+**Models are derived, not named.** `DevPilot.AgentHarness` owns the supported-model list and
+derives the generalist pair from it by family. The plan restates the pair it expects and the
+builder refuses any disagreement (`CE705`), and refuses a specialist that is itself one of the
+two generalists. It also refuses a plan whose models the reviewer configuration does not
+configure (`CE706`). The consequence is that when the registry moves, a stale plan fails
+loudly at build time instead of asking a slot for a model the agent no longer accepts.
+
+The builder still starts nothing. It mints no launch token, no lease and no slot, and it
+reads the model registry only to check names against it. The `slots` block it emits is a
+*declaration* that the typed coordinator will later act on under an operator's own
+authorization.
+
 ## What it captures, and through what
 
 Every read goes through the reviewed capture seam, in a closed plan that is declared before
@@ -214,12 +258,25 @@ acquisition path, not by this builder. An operator who has one passes
 `-PreflightTarget runSetReady`. Defaulting to `runSetReady` would make this tool claim a
 proof it cannot produce, so it does not.
 
+`runSetReady` additionally requires a **launch authorization token on disk**, held by the
+operator. The builder mints none — that is the property that makes it a no-model tool — so
+`runSetReady` stays reachable only for an operator who already holds one. The tests assert
+that after a complete v2 build the token path the plan names still does not exist.
+
 **Zero slots, models and tokens are consumed at any target.** The coordinator writes a
 launch intent before every child, including the short read-only PowerShell tools that stage
 a corpus; those consume nothing. A model run is the one that carries a slot, so the
-preflight reads the intents back and refuses (`CE601`) if any names a slot, a set or an
-expected terminal artifact. The generated request deliberately carries **no `slots`
-section**, so it cannot authorize a slot state in the first place.
+preflight reads the intents back and refuses (`CE601`) if any names a slot or an expected
+terminal artifact. A set identifier alone is **not** counted: once the run set is verified
+the coordinator stamps its `setId` on every subsequent child, including the read-only status
+probe, so counting it would call any `runSetReady` preflight a slot launch.
+
+A v1 request generates a coordinator request with **no `slots` section**, so it cannot
+authorize a slot state in the first place. A v2 request with an `executionPlan` does declare
+two slots — and the preflight still launches none of them, because declaring a slot and
+launching one are different acts and only the second needs an authorization the builder does
+not have. The suite runs the whole preflight and cohort-acceptance proof **twice**, once for
+each shape, and asserts zero slot intents both times.
 
 ## Refusals
 
@@ -234,10 +291,11 @@ process exit code, because an exit code is one byte and the catalogue is not.
 | `CE4xx` | 5 | The census and coverage: ordering, duplicates, path traversal, reparse points, the changed-file cap (`CE402`), the thread cap (`CE406`), the byte cap, a right-hand path whose content was not stored or a content coverage under the declared floor (`CE403`), a span that runs past the end of the file it describes (`CE404`), an empty census (`CE407`), target ref or config mismatch. |
 | `CE5xx` | 6 | The package: a staging or publish failure, a package that is not read-only including its own inventory and seal (`CE502`), an inventoried file whose bytes changed, an unlisted file, or a declared file that is absent (`CE503`), a reparse point (`CE505`), an inventory path that is not a plain relative path inside the package (`CE506`), a seal that does not authenticate. |
 | `CE6xx` | 7 | The preflight: the coordinator did not reach its target (`CE600`), or it consumed a slot, a model or a launch token (`CE601`). |
+| `CE7xx` | 8 | The execution plan: declared at a version that does not carry it (`CE700`), the wrong slot count or the wrong names in the wrong order (`CE701`), colliding slot state directories or terminal artifacts (`CE702`), a reviewer script that is absent or drifted from its declared digest (`CE703`), a model outside the shared registry (`CE704`), a generalist pair that is not the derived pair or a specialist that is one of the generalists (`CE705`), models the reviewer configuration does not configure (`CE706`), any delivery capability enabled or a non-zero provider write budget (`CE707`), reconciliation disabled or requiring a run count that is not the slot count (`CE708`), a slot count that is not the planned run count (`CE709`), a per-call timeout that outlives its slot (`CE710`), an output path outside the preparation root or a launch authorization inside the sealed package (`CE711`), a model-start bound that is not a positive finite estimate (`CE712`). |
 
 ## Tests
 
-`tools/Test-ShadowCohortEntryEvidence.ps1` — 154 checks offline, 163 with `-IncludePreflight`;
+`tools/Test-ShadowCohortEntryEvidence.ps1` — 249 checks offline, 268 with `-IncludePreflight`;
 no model, no network, everything in a temporary sandbox.
 
 - **Exact wrapper fixtures.** A synthetic but contract-exact replay snapshot for every tool
@@ -263,6 +321,31 @@ no model, no network, everything in a temporary sandbox.
   that one — is proof the entry was accepted.
 - **Cross-implementation parity.** The prompt-asset digest this builder binds is compared
   against the coordinator fixture's independent implementation of the same digest.
+- **v1 stays v1.** A v1 request and a v2 request without a plan are both asserted to emit no
+  `slots` section and to keep the v2 model-start bound contract, so the compatibility claim
+  is checked rather than assumed.
+- **The execution plan cannot be widened.** Roughly thirty sabotage cases: one slot, three
+  slots, slots out of order or misnamed, colliding state directories or terminal artifacts
+  case-insensitively, a drifted reviewer script digest, a model outside the registry, a
+  generalist pair that is not the derived pair, a specialist that is one of the generalists,
+  models the reviewer configuration does not configure, each delivery capability enabled in
+  turn, a non-zero provider write budget, an authorization kind other than `PreviewOnly`,
+  reconciliation disabled, a required run count that is not the slot count, a slot count that
+  is not the planned run count, a per-call timeout that outlives its slot, an output
+  directory escaping the preparation root, a launch authorization inside the sealed package,
+  a fault-injection argument, an undeclared field, an omitted section, and a capability
+  written as the string `"false"` — which PowerShell reads as `$true`. Each asserts the exact
+  code. A slot appended to the published request afterwards is shown to break the pinned
+  digest.
+- **The plan agrees with the typed reader about names.** Every state directory, terminal and
+  output name holding an embedded `..` is refused, because `SlotAuthorization.RequireLeafName`
+  in the shipping reader refuses any component containing one — a name accepted here and
+  refused there would only surface after the entry was sealed and frozen read-only.
+- **A present-but-null plan is a catalogued refusal.** `"executionPlan": null` refuses under
+  `CE700` and exits 8, rather than escaping as a parameter-binding error with no code.
+- **The reviewer configuration is read as strictly as the reviewer reads it.**
+  `review.verification.enabled` written as the string `"false"` or as `1` refuses under
+  `CE211`, so the model-pairing check can never see a coerced `$true`.
 - **Architecture and no-write.** No write tool, no credential and no model name is reachable
   from the capture surface; the schema carries no oracle-shaped field.
 
@@ -276,6 +359,13 @@ which builds one from an empty offline feed.
   recipe is a separate producer (`src/Agents/reviewer/CorpusSeal.ps1`), whose
   `sourceTransport` expectations are *converged* by probing the planner rather than
   computed. Until a cohort entry emits one, the honest default target is `recipePlanned`.
+  `runSetReady` also requires an operator-held launch authorization token, which this builder
+  deliberately never mints.
+- **The execution plan declares supervision timeouts it does not itself impose.** Only
+  `supervisionGraceSeconds` travels in the coordinator request; per-call, slot and activity
+  timeouts are read by the coordinator from the sealed qualification plan child result. The
+  plan therefore *records* the envelope it expects and signs it into the entry's model-start
+  bound, and the two are reconciled where they meet rather than here.
 - **Live Azure DevOps identity is not exercised in CI.** The suite is entirely offline, so
   the `live` capture mode is proven only against the reviewed capture seam, not against a
   live tenant. It has been exercised by hand against a real tenant, which is how the six

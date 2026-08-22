@@ -57,6 +57,13 @@ $script:ReviewerCohortEntryRequestKind = 'reviewer-cohort-entry-evidence-request
 $script:ReviewerCohortEntryPackageKind = 'devpilot.shadow-cohort.entry-evidence.v1'
 $script:ReviewerCohortEntryCoordinatorContract = 'devpilot.shadow-run-coordinator.request.v2'
 $script:ReviewerCohortEntryChangedPathsContract = 'devpilot.shadow-run-coordinator.changed-paths.v1'
+# One leaf name, spelled the way the shipping reader spells it. The character
+# class alone would accept 's1..x': the leading class rules out '.' and '..'
+# themselves but not a '..' further in, and SlotAuthorization.RequireLeafName
+# refuses ANY value containing '..'. A name this reader accepted and the typed
+# reader refused would be a refusal an operator could only discover by running
+# the coordinator - against an entry that is by then sealed and read-only.
+$script:ReviewerCohortEntryPathComponentPattern = '^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._-]*$'
 
 <#
     The exact refusal catalogue. Each code names exactly one condition, and a
@@ -119,6 +126,20 @@ $script:ReviewerCohortEntryErrorCatalog = [ordered]@{
     CE506 = 'A published path escapes the output root.'
     CE600 = 'The typed preflight did not reach runSetReady.'
     CE601 = 'The typed preflight consumed a slot, a model or a launch token.'
+    CE700 = 'An execution plan was declared at a schema version that does not carry one.'
+    CE701 = 'The execution plan does not enable shadow slots.'
+    CE702 = 'The execution plan does not declare exactly the two slots slot1 and slot2, in order.'
+    CE703 = 'The execution plan reviewer script is missing or disagrees with its pinned digest.'
+    CE704 = 'The execution plan names a model the supported-model registry does not carry.'
+    CE705 = 'The execution plan generalist pair is not the pair derived from the registry.'
+    CE706 = 'The execution plan specialist or verifier disagrees with the reviewer configuration.'
+    CE707 = 'The execution plan declares a delivery capability that writes.'
+    CE708 = 'The execution plan declares a slot state or terminal name that collides with another.'
+    CE709 = 'The execution plan slot count does not equal the declared planned run count.'
+    CE710 = 'The execution plan declares a supervision timeout outside the supervised range.'
+    CE711 = 'The execution plan names a launch authorization inside the sealed package.'
+    CE712 = 'The execution plan does not bound a non-zero finite model start and verifier estimate.'
+    CE713 = 'The execution plan reconciliation and delivery outputs are the same directory.'
 }
 
 function Get-ReviewerCohortEntryErrorCatalog {
@@ -358,6 +379,290 @@ function Assert-ReviewerCohortEntryRepositoryRelativePath {
     }
 }
 
+function Get-ReviewerCohortEntryModelRegistry {
+    <#
+    .SYNOPSIS
+        The shared supported-model registry and the generalist pair DERIVED from
+        it, read from the one module that owns both.
+
+    .DESCRIPTION
+        Loaded on demand rather than at file scope, because a preparation-only
+        build has no business requiring the agent harness to be installed - only
+        an execution plan names a model at all.
+
+        Nothing here restates a model version. The registry's own comment says it
+        plainly: a wrapper that names its own version is how a slot ends up asking
+        for a model the agent no longer accepts, and the fix was to make one edit
+        in one list move every consumer. This function is a consumer.
+    #>
+    if (-not (Get-Module DevPilot.AgentHarness)) {
+        $manifest = Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) 'DevPilot.AgentHarness\DevPilot.AgentHarness.psd1'
+        if (Test-Path -LiteralPath $manifest -PathType Leaf) { Import-Module $manifest -Force -ErrorAction Stop }
+        else { Import-Module DevPilot.AgentHarness -ErrorAction Stop }
+    }
+    # Assign before wrapping. Get-AgentSupportedModels returns its list with a
+    # unary comma, so the array survives the pipeline as ONE object; @() around
+    # the call therefore yields a single-element array holding the array, and
+    # the [string[]] cast then flattens that element to its joined ToString().
+    # Every membership check would have compared against one 295-character
+    # string. Binding to a variable first restores the twenty elements.
+    $supported = Get-AgentSupportedModels
+    $pair = Get-AgentGeneralistModelPair
+    return [pscustomobject][ordered]@{
+        Supported = [string[]]@($supported)
+        GeneralistPair = [string[]]@($pair.Models)
+    }
+}
+
+function Get-ReviewerCohortEntryBool {
+    <#
+    .SYNOPSIS
+        One required boolean field, required to be an actual JSON boolean.
+
+    .DESCRIPTION
+        A string "false" and the number 0 are both refused rather than coerced.
+        Every boolean this contract reads is a CAPABILITY switch, and PowerShell
+        reads the string "false" as $true - so a plan that wrote its delivery
+        capabilities as strings would enable all three while looking disabled.
+    #>
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Where
+    )
+    $value = $Object.$Name
+    if ($value -isnot [bool]) {
+        New-ReviewerCohortEntryRefusal -Code 'CE106' -Detail "The $Where field '$Name' is not a boolean."
+    }
+    return [bool]$value
+}
+
+function Read-ReviewerCohortEntryExecutionPlan {
+    <#
+    .SYNOPSIS
+        The optional v2 execution plan: the complete run declaration the emitted
+        coordinator request will carry, read strictly and closed to anything that
+        writes.
+
+    .DESCRIPTION
+        This section is what makes the difference between an entry that
+        authorizes a preparation and an entry that authorizes a whole shadow run
+        set. It is therefore read with the same rules as everything else here -
+        exact keys, exact types, exact values - and with two extra rules of its
+        own.
+
+        FIRST: every capability that could write is required to be its off value
+        rather than merely defaulted to it. The delivery kind must be
+        'PreviewOnly', the three capability switches must be $false and the
+        provider write budget must be 0. An operator cannot write a plan that
+        delivers a comment, and cannot write one that leaves the question open.
+
+        SECOND: the output directories are named by a single path COMPONENT, not
+        by a path. The builder joins them under the preparation root it derives
+        itself, so there is no string an operator can write here that puts a
+        run's output anywhere else - not next to the sealed package, not inside
+        it, not on another volume.
+    #>
+    param(
+        [Parameter(Mandatory)]$Plan,
+        [Parameter(Mandatory)][int]$PlannedRunCount
+    )
+
+    Assert-ReviewerCohortEntryExactKeys -Object $Plan -Where 'request executionPlan' -Required @(
+        'shadowSlotsEnabled', 'reviewerScript', 'models', 'timeouts', 'slots', 'reconciliation', 'delivery')
+
+    if (-not (Get-ReviewerCohortEntryBool -Object $Plan -Name 'shadowSlotsEnabled' -Where 'request executionPlan')) {
+        New-ReviewerCohortEntryRefusal -Code 'CE701' `
+            -Detail 'The execution plan sets shadowSlotsEnabled to false; a plan that declares a run set nothing may run is not a plan.'
+    }
+
+    $script = $Plan.reviewerScript
+    Assert-ReviewerCohortEntryExactKeys -Object $script -Where 'request executionPlan reviewerScript' -Required @('path', 'sha256')
+    $scriptPath = [IO.Path]::GetFullPath((Get-ReviewerCohortEntryString -Object $script -Name 'path' -Where 'request executionPlan reviewerScript'))
+    $scriptSha = Get-ReviewerCohortEntryString -Object $script -Name 'sha256' -Where 'request executionPlan reviewerScript' `
+        -Pattern '^[0-9a-f]{64}$' -MaxLength 64
+
+    $models = $Plan.models
+    Assert-ReviewerCohortEntryExactKeys -Object $models -Where 'request executionPlan models' -Required @(
+        'generalistPairSource', 'generalistPair', 'conventionSpecialistModel', 'conventionVerifierModel')
+    $pairSource = Get-ReviewerCohortEntryString -Object $models -Name 'generalistPairSource' -Where 'request executionPlan models' -MaxLength 64
+    if ($pairSource -cne 'derivedFromSupportedModelRegistry') {
+        New-ReviewerCohortEntryRefusal -Code 'CE106' `
+            -Detail "The execution plan declares generalistPairSource '$pairSource'; the pair is derived from the registry and from nothing else."
+    }
+    $declaredPair = @($models.generalistPair)
+    if ($declaredPair.Count -ne 2) {
+        New-ReviewerCohortEntryRefusal -Code 'CE705' `
+            -Detail "The execution plan declares $($declaredPair.Count) generalist model(s); an independent cross-check is exactly two."
+    }
+    foreach ($model in $declaredPair) {
+        if ($model -isnot [string] -or [string]$model -cnotmatch '^[a-z0-9][a-z0-9.-]*$') {
+            New-ReviewerCohortEntryRefusal -Code 'CE106' -Detail "The execution plan generalist pair carries '$model', which is not a model identifier."
+        }
+    }
+    $specialist = Get-ReviewerCohortEntryString -Object $models -Name 'conventionSpecialistModel' `
+        -Where 'request executionPlan models' -Pattern '^[a-z0-9][a-z0-9.-]*$' -MaxLength 64
+    $verifier = Get-ReviewerCohortEntryString -Object $models -Name 'conventionVerifierModel' `
+        -Where 'request executionPlan models' -Pattern '^[a-z0-9][a-z0-9.-]*$' -MaxLength 64
+
+    $timeouts = $Plan.timeouts
+    Assert-ReviewerCohortEntryExactKeys -Object $timeouts -Where 'request executionPlan timeouts' -Required @(
+        'perCallTimeoutSeconds', 'slotTimeoutSeconds', 'progressTimeoutSeconds', 'supervisionGraceSeconds')
+    $perCall = Get-ReviewerCohortEntryInt -Object $timeouts -Name 'perCallTimeoutSeconds' -Where 'request executionPlan timeouts' -Minimum 1 -Maximum 14400
+    $slotTimeout = Get-ReviewerCohortEntryInt -Object $timeouts -Name 'slotTimeoutSeconds' -Where 'request executionPlan timeouts' -Minimum 1 -Maximum 14400
+    $progress = Get-ReviewerCohortEntryInt -Object $timeouts -Name 'progressTimeoutSeconds' -Where 'request executionPlan timeouts' -Minimum 0 -Maximum 14400
+    # The one timeout that actually travels into the coordinator request, so its
+    # range is the coordinator's own range rather than a range chosen here: a
+    # value this reader accepted and the typed reader refused would be a refusal
+    # an operator could only discover by running the coordinator.
+    $grace = Get-ReviewerCohortEntryInt -Object $timeouts -Name 'supervisionGraceSeconds' -Where 'request executionPlan timeouts' -Minimum 30 -Maximum 3600
+    if ($perCall -gt $slotTimeout) {
+        New-ReviewerCohortEntryRefusal -Code 'CE710' `
+            -Detail "The execution plan allows $perCall second(s) per call inside a $slotTimeout second slot; one call could outlive the slot that supervises it."
+    }
+
+    $slots = @($Plan.slots)
+    if ($slots.Count -ne 2) {
+        New-ReviewerCohortEntryRefusal -Code 'CE702' `
+            -Detail "The execution plan declares $($slots.Count) slot(s); the typed coordinator declares exactly two, from creation."
+    }
+    if ($PlannedRunCount -ne $slots.Count) {
+        New-ReviewerCohortEntryRefusal -Code 'CE709' `
+            -Detail "The request plans $PlannedRunCount run(s) and the execution plan declares $($slots.Count) slot(s); the coordinator requires them equal."
+    }
+    $expectedNames = @('slot1', 'slot2')
+    $slotList = [System.Collections.Generic.List[object]]::new()
+    $seenDirs = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    for ($i = 0; $i -lt $slots.Count; $i++) {
+        $slot = $slots[$i]
+        Assert-ReviewerCohortEntryExactKeys -Object $slot -Where "request executionPlan slot $($i + 1)" -Required @(
+            'name', 'stateDirName', 'terminalName', 'launchAuthorizationTokenPath', 'modelPlan')
+        $name = Get-ReviewerCohortEntryString -Object $slot -Name 'name' -Where "request executionPlan slot $($i + 1)" -MaxLength 16
+        # By POSITION, not by set membership. The coordinator reads declaration
+        # zero as slot1 and declaration one as slot2; a plan that listed them the
+        # other way round would be accepted by a membership check and would then
+        # run slot2's state directory under slot1's supervision.
+        if ($name -cne $expectedNames[$i]) {
+            New-ReviewerCohortEntryRefusal -Code 'CE702' `
+                -Detail "The execution plan names declaration $($i + 1) '$name'; the coordinator reads it as '$($expectedNames[$i])'."
+        }
+        $stateDir = Get-ReviewerCohortEntryString -Object $slot -Name 'stateDirName' -Where "request executionPlan slot $name" `
+            -Pattern $script:ReviewerCohortEntryPathComponentPattern -MaxLength 128
+        $terminal = Get-ReviewerCohortEntryString -Object $slot -Name 'terminalName' -Where "request executionPlan slot $name" `
+            -Pattern $script:ReviewerCohortEntryPathComponentPattern -MaxLength 128
+        # Case-INSENSITIVE, because these are file system names on a file system
+        # that does not distinguish them: two slots whose state directories
+        # differed only in case would be one directory holding two runs.
+        foreach ($component in @($stateDir, $terminal)) {
+            if (-not $seenDirs.Add($component)) {
+                New-ReviewerCohortEntryRefusal -Code 'CE708' `
+                    -Detail "The execution plan uses '$component' for more than one slot state or terminal; two runs would share one path."
+            }
+        }
+        $tokenPath = [IO.Path]::GetFullPath((Get-ReviewerCohortEntryString -Object $slot -Name 'launchAuthorizationTokenPath' -Where "request executionPlan slot $name"))
+        $modelPlan = $slot.modelPlan
+        Assert-ReviewerCohortEntryExactKeys -Object $modelPlan -Where "request executionPlan slot $name modelPlan" -Required @('bindSealedArguments', 'opaqueArguments')
+        $bind = Get-ReviewerCohortEntryBool -Object $modelPlan -Name 'bindSealedArguments' -Where "request executionPlan slot $name modelPlan"
+        $opaque = [string[]]@($modelPlan.opaqueArguments)
+        if ($opaque.Count -gt 64) {
+            New-ReviewerCohortEntryRefusal -Code 'CE106' -Detail "The execution plan slot $name declares $($opaque.Count) opaque argument(s); the coordinator reads at most 64."
+        }
+        foreach ($argument in $opaque) {
+            if ([string]::IsNullOrEmpty($argument) -or $argument.Length -gt 256) {
+                New-ReviewerCohortEntryRefusal -Code 'CE106' -Detail "The execution plan slot $name declares an opaque argument of $($argument.Length) character(s)."
+            }
+            # A model plan carries arguments the builder does not interpret. It
+            # may not carry arguments that make the reviewer do something OTHER
+            # than review - a test hook, a fault injection or a forced outcome -
+            # because those are exactly the arguments an opaque list would hide.
+            if ($argument -match '(?i)(^|[^A-Za-z0-9])-{1,2}(test|fault|inject|simulate|force|dry-?run|whatif)') {
+                New-ReviewerCohortEntryRefusal -Code 'CE308' `
+                    -Detail "The execution plan slot $name declares the argument '$argument', which is a test or fault switch rather than a review argument."
+            }
+        }
+        if ($bind -and $opaque.Count -lt 1) {
+            New-ReviewerCohortEntryRefusal -Code 'CE106' `
+                -Detail "The execution plan slot $name binds sealed arguments and declares none; the coordinator requires at least one."
+        }
+        [void]$slotList.Add([pscustomobject][ordered]@{
+                Name = $name
+                StateDirName = $stateDir
+                TerminalName = $terminal
+                LaunchAuthorizationTokenPath = $tokenPath
+                BindSealedArguments = $bind
+                OpaqueArguments = $opaque
+            })
+    }
+
+    $reconciliation = $Plan.reconciliation
+    Assert-ReviewerCohortEntryExactKeys -Object $reconciliation -Where 'request executionPlan reconciliation' -Required @(
+        'reconciliationEnabled', 'outputDirName', 'launchAuthorizationTokenPath')
+    if (-not (Get-ReviewerCohortEntryBool -Object $reconciliation -Name 'reconciliationEnabled' -Where 'request executionPlan reconciliation')) {
+        New-ReviewerCohortEntryRefusal -Code 'CE701' `
+            -Detail 'The execution plan disables reconciliation; two runs nobody compares are not a cross-check.'
+    }
+    $reconciliationDir = Get-ReviewerCohortEntryString -Object $reconciliation -Name 'outputDirName' -Where 'request executionPlan reconciliation' `
+        -Pattern $script:ReviewerCohortEntryPathComponentPattern -MaxLength 128
+    $reconciliationToken = [IO.Path]::GetFullPath((Get-ReviewerCohortEntryString -Object $reconciliation -Name 'launchAuthorizationTokenPath' -Where 'request executionPlan reconciliation'))
+
+    $delivery = $Plan.delivery
+    Assert-ReviewerCohortEntryExactKeys -Object $delivery -Where 'request executionPlan delivery' -Required @(
+        'deliveryEnabled', 'authorizationKind', 'outputDirName', 'launchAuthorizationTokenPath',
+        'commentsEnabled', 'votesEnabled', 'gatesEnabled', 'providerWriteBudget')
+    if (-not (Get-ReviewerCohortEntryBool -Object $delivery -Name 'deliveryEnabled' -Where 'request executionPlan delivery')) {
+        New-ReviewerCohortEntryRefusal -Code 'CE701' -Detail 'The execution plan disables delivery; a plan present is a plan declared in full.'
+    }
+    $authorizationKind = Get-ReviewerCohortEntryString -Object $delivery -Name 'authorizationKind' -Where 'request executionPlan delivery' -MaxLength 32
+    if ($authorizationKind -cne 'PreviewOnly') {
+        New-ReviewerCohortEntryRefusal -Code 'CE707' `
+            -Detail "The execution plan declares delivery authorization '$authorizationKind'; this builder emits PreviewOnly and nothing else."
+    }
+    foreach ($capability in @('commentsEnabled', 'votesEnabled', 'gatesEnabled')) {
+        if (Get-ReviewerCohortEntryBool -Object $delivery -Name $capability -Where 'request executionPlan delivery') {
+            New-ReviewerCohortEntryRefusal -Code 'CE707' `
+                -Detail "The execution plan enables delivery capability '$capability'; a no-write entry authorizes none of them."
+        }
+    }
+    # Read over the WHOLE integer range and then compared, rather than
+    # range-checked to [0,0]. A range check would refuse a budget of 1 as a
+    # malformed field; it is not malformed, it is a request to write, and an
+    # operator has to be told which of those two things they did.
+    $writeBudget = Get-ReviewerCohortEntryInt -Object $delivery -Name 'providerWriteBudget' -Where 'request executionPlan delivery' -Minimum 0 -Maximum ([int]::MaxValue)
+    if ($writeBudget -ne 0) {
+        New-ReviewerCohortEntryRefusal -Code 'CE707' -Detail "The execution plan budgets $writeBudget provider write(s); a no-write entry budgets none."
+    }
+    $deliveryDir = Get-ReviewerCohortEntryString -Object $delivery -Name 'outputDirName' -Where 'request executionPlan delivery' `
+        -Pattern $script:ReviewerCohortEntryPathComponentPattern -MaxLength 128
+    $deliveryToken = [IO.Path]::GetFullPath((Get-ReviewerCohortEntryString -Object $delivery -Name 'launchAuthorizationTokenPath' -Where 'request executionPlan delivery'))
+    if ($deliveryDir.Equals($reconciliationDir, [StringComparison]::OrdinalIgnoreCase)) {
+        New-ReviewerCohortEntryRefusal -Code 'CE713' `
+            -Detail "The execution plan writes reconciliation and delivery both into '$deliveryDir'; the coordinator requires two distinct directories."
+    }
+    if ($seenDirs.Contains($reconciliationDir) -or $seenDirs.Contains($deliveryDir)) {
+        New-ReviewerCohortEntryRefusal -Code 'CE708' `
+            -Detail 'The execution plan reuses a slot state or terminal name for a reconciliation or delivery output.'
+    }
+
+    return [pscustomobject][ordered]@{
+        ShadowSlotsEnabled = $true
+        ReviewerScriptPath = $scriptPath
+        ReviewerScriptSha256 = $scriptSha
+        GeneralistPair = [string[]]@($declaredPair | ForEach-Object { [string]$_ })
+        ConventionSpecialistModel = $specialist
+        ConventionVerifierModel = $verifier
+        PerCallTimeoutSeconds = $perCall
+        SlotTimeoutSeconds = $slotTimeout
+        ProgressTimeoutSeconds = $progress
+        SupervisionGraceSeconds = $grace
+        Slots = [object[]]$slotList.ToArray()
+        ReconciliationOutputDirName = $reconciliationDir
+        ReconciliationTokenPath = $reconciliationToken
+        DeliveryOutputDirName = $deliveryDir
+        DeliveryTokenPath = $deliveryToken
+        DeliveryAuthorizationKind = 'PreviewOnly'
+    }
+}
+
 function Read-ReviewerCohortEntryRequest {
     <#
     .SYNOPSIS
@@ -395,9 +700,30 @@ function Read-ReviewerCohortEntryRequest {
 
     Assert-ReviewerCohortEntryExactKeys -Object $root -Where 'request' -Required @(
         'schemaVersion', 'kind', 'correlationId', 'toolkit', 'subject',
-        'reviewer', 'ruleBundle', 'capture', 'coverage', 'output')
+        'reviewer', 'ruleBundle', 'capture', 'coverage', 'output') -Optional @('executionPlan')
 
-    $schemaVersion = Get-ReviewerCohortEntryInt -Object $root -Name 'schemaVersion' -Where 'request' -Minimum 1 -Maximum 1
+    # Two versions are loadable, and they differ by exactly one section. A v1
+    # request can never grow slots - not by adding the section, not by any
+    # argument - so every request written before this slice keeps producing the
+    # identical preparation-only entry it produced then. A v2 request WITHOUT the
+    # section produces that same entry too; the version is the operator's
+    # statement of what they are authorizing, and the section is what they
+    # authorized.
+    $schemaVersion = Get-ReviewerCohortEntryInt -Object $root -Name 'schemaVersion' -Where 'request' -Minimum 1 -Maximum 2
+    $executionPlanProperty = $root.PSObject.Properties['executionPlan']
+    $hasExecutionPlan = $null -ne $executionPlanProperty
+    # An explicit null is a present property with no plan in it. Left to the
+    # plan reader it would fail on a MANDATORY parameter binding, which carries
+    # no catalogued code and exits 1 instead of 8 - so an operator scripting
+    # against the exit codes would read a contract refusal as a crash.
+    if ($hasExecutionPlan -and $null -eq $executionPlanProperty.Value) {
+        New-ReviewerCohortEntryRefusal -Code 'CE700' `
+            -Detail 'The request carries an executionPlan of null; omit the section to build a preparation-only entry.'
+    }
+    if ($hasExecutionPlan -and $schemaVersion -lt 2) {
+        New-ReviewerCohortEntryRefusal -Code 'CE700' `
+            -Detail "The request declares schemaVersion $schemaVersion and carries an executionPlan; the plan section arrived at version 2."
+    }
     $kind = [string]$root.kind
     if ($kind -cne $script:ReviewerCohortEntryRequestKind) {
         New-ReviewerCohortEntryRefusal -Code 'CE103' `
@@ -505,6 +831,24 @@ function Read-ReviewerCohortEntryRequest {
             -Detail "The output root '$outputRoot' is inside the toolkit '$toolkitRoot'; private evidence is kept one commit away from being published."
     }
 
+    $plannedRunCount = Get-ReviewerCohortEntryInt -Object $reviewer -Name 'plannedRunCount' -Where 'request reviewer' -Minimum 2 -Maximum 16
+    $executionPlan = $null
+    if ($hasExecutionPlan) {
+        $executionPlan = Read-ReviewerCohortEntryExecutionPlan -Plan $root.executionPlan -PlannedRunCount $plannedRunCount
+        # A launch authorization inside the package would be published with it,
+        # frozen read-only with it, and inventoried with it - which is to say the
+        # entry would ship the very token that lets it run. The builder mints no
+        # token; it also refuses to be pointed at one it would end up sealing.
+        foreach ($tokenPath in @(
+                @($executionPlan.Slots | ForEach-Object { [string]$_.LaunchAuthorizationTokenPath }) +
+                @($executionPlan.ReconciliationTokenPath, $executionPlan.DeliveryTokenPath))) {
+            if (Test-ReviewerCohortEntryPathWithin -Candidate $tokenPath -Root $outputRoot) {
+                New-ReviewerCohortEntryRefusal -Code 'CE711' `
+                    -Detail "The execution plan names the launch authorization '$tokenPath', which is inside the sealed package root '$outputRoot'."
+            }
+        }
+    }
+
     return [pscustomobject][ordered]@{
         SchemaVersion = $schemaVersion
         Kind = $kind
@@ -525,7 +869,7 @@ function Read-ReviewerCohortEntryRequest {
         OperatorAlias = (Get-ReviewerCohortEntryString -Object $reviewer -Name 'operatorAlias' -Where 'request reviewer' -Pattern '^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$' -MaxLength 64)
         PowerShellPath = [IO.Path]::GetFullPath((Get-ReviewerCohortEntryString -Object $reviewer -Name 'powerShellPath' -Where 'request reviewer'))
         ChildTimeoutSeconds = (Get-ReviewerCohortEntryInt -Object $reviewer -Name 'childTimeoutSeconds' -Where 'request reviewer' -Minimum 1 -Maximum 14400)
-        PlannedRunCount = (Get-ReviewerCohortEntryInt -Object $reviewer -Name 'plannedRunCount' -Where 'request reviewer' -Minimum 2 -Maximum 16)
+        PlannedRunCount = $plannedRunCount
         RunSetKeyPath = [IO.Path]::GetFullPath((Get-ReviewerCohortEntryString -Object $reviewer -Name 'runSetKeyPath' -Where 'request reviewer'))
         RuleBundleSourceKind = $ruleSourceKind
         RuleBundleDeclarationPath = [IO.Path]::GetFullPath((Get-ReviewerCohortEntryString -Object $ruleBundle -Name 'declarationPath' -Where 'request ruleBundle'))
@@ -546,6 +890,7 @@ function Read-ReviewerCohortEntryRequest {
         EntryId = (Get-ReviewerCohortEntryString -Object $output -Name 'entryId' -Where 'request output' -Pattern '^[A-Za-z0-9][A-Za-z0-9._-]{3,63}$' -MaxLength 64)
         Ordinal = (Get-ReviewerCohortEntryInt -Object $output -Name 'ordinal' -Where 'request output' -Minimum 1 -Maximum 64)
         SealKeyPath = [IO.Path]::GetFullPath((Get-ReviewerCohortEntryString -Object $output -Name 'sealKeyPath' -Where 'request output'))
+        ExecutionPlan = $executionPlan
     }
 }
 

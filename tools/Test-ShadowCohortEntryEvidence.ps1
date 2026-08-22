@@ -357,6 +357,21 @@ function New-CohortEntryFixture {
         RequestWithBom = $false
         MaxSiblingFiles = 1
         MinCoveragePercent = 60
+        # -- v2 execution plan -------------------------------------------
+        # Off by default, so every case written before the plan existed keeps
+        # exercising the v1 preparation-only request byte for byte.
+        SchemaVersion = 1
+        WithExecutionPlan = $false
+        ConfigDeclaresModels = $true
+        ConfigVerificationEnabled = $true
+        # A raw override, so a case can write the STRING "false" the way a hand
+        # edited reviewer configuration would - which PowerShell reads as $true.
+        ConfigVerificationEnabledRaw = $null
+        ConfigSpecialistModel = ''
+        ConfigVerifierModel = ''
+        MutateExecutionPlan = $null
+        ExecutionPlanIsNull = $false
+        PlannedRunCount = 2
     }
     if ($Mutate) { & $Mutate $state }
 
@@ -402,6 +417,37 @@ function New-CohortEntryFixture {
     }
 
     # -- reviewer configuration and rule bundle --------------------------
+    # The models the plan will be checked against are DERIVED from the shared
+    # registry here too, by family rather than by name. A fixture that wrote
+    # 'claude-opus-5' would go stale the day the registry moves and would then
+    # be testing that the builder accepts a retired model.
+    $registryPair = [string[]]@()
+    $fixtureSpecialist = ''
+    $fixtureVerifier = ''
+    if ($state.WithExecutionPlan -or $state.ConfigSpecialistModel -or $state.ConfigVerifierModel) {
+        # Read through the production registry accessor rather than importing the
+        # harness again here, so the fixture exercises the same flattening the
+        # builder does instead of a private copy that could drift from it.
+        $registry = Get-ReviewerCohortEntryModelRegistry
+        $supportedModels = [string[]]@($registry.Supported)
+        $registryPair = [string[]]@($registry.GeneralistPair)
+        $fixtureSpecialist = [string](@($supportedModels | Where-Object { $_ -cmatch '^claude-sonnet-' }) | Select-Object -First 1)
+        $fixtureVerifier = [string](@($supportedModels | Where-Object { $_ -cmatch '^gpt-' -and $_ -cnotmatch '(?:-mini|-codex)' }) | Select-Object -First 1)
+    }
+    $reviewSection = [ordered]@{ $state.ConfigTargetKeyName = $state.ConfigTargetRefName }
+    if (($state.WithExecutionPlan -or $state.ConfigSpecialistModel) -and $state.ConfigDeclaresModels) {
+        $specialistForConfig = if ($state.ConfigSpecialistModel) { [string]$state.ConfigSpecialistModel } else { $fixtureSpecialist }
+        $verifierForConfig = if ($state.ConfigVerifierModel) { [string]$state.ConfigVerifierModel } else { $fixtureVerifier }
+        $reviewSection['conventionSpecialistModel'] = $specialistForConfig
+        $verificationEnabledValue = if ($null -ne $state.ConfigVerificationEnabledRaw) {
+            $state.ConfigVerificationEnabledRaw
+        }
+        else { [bool]$state.ConfigVerificationEnabled }
+        $reviewSection['verification'] = [ordered]@{
+            enabled = $verificationEnabledValue
+            conventionVerifierModel = $verifierForConfig
+        }
+    }
     $configPath = Join-Path $Sandbox 'reviewer.config.json'
     Write-CohortEntryJsonFile -Path $configPath -Value ([ordered]@{
             repository = [ordered]@{
@@ -410,7 +456,7 @@ function New-CohortEntryFixture {
                 name = $state.RepositoryName
                 id = $state.RepositoryId
             }
-            review = [ordered]@{ $state.ConfigTargetKeyName = $state.ConfigTargetRefName }
+            review = $reviewSection
         })
 
     $rulePath = '/docs/rules/review.md'
@@ -509,8 +555,70 @@ function New-CohortEntryFixture {
     # -- the operator request --------------------------------------------
     $outputRoot = Join-Path $Sandbox 'private/entry'
     $requestPath = Join-Path $Sandbox 'entry-request.json'
-    Write-CohortEntryJsonFile -Path $requestPath -WithBom:$state.RequestWithBom -Value ([ordered]@{
-            schemaVersion = 1
+    $executionPlan = $null
+    if ($state.WithExecutionPlan) {
+        # A real file, hashed for real: the plan pins the reviewed script by
+        # digest and the builder re-hashes what is on disk.
+        $reviewerScriptPath = Join-Path $Sandbox 'Start-ReviewerAgent.fixture.ps1'
+        [IO.File]::WriteAllBytes($reviewerScriptPath, $script:Utf8.GetBytes("param()`n# fixture reviewer entry point`n"))
+        # Deliberately NOT created. The builder records the path and never mints,
+        # reads or requires a launch authorization; a fixture that pre-created one
+        # would be testing a builder that could launch itself.
+        $tokenPath = Join-Path $Sandbox 'launch/authorization.token'
+        $executionPlan = [ordered]@{
+            shadowSlotsEnabled = $true
+            reviewerScript = [ordered]@{
+                path = $reviewerScriptPath
+                sha256 = (Get-FileHash -LiteralPath $reviewerScriptPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+            models = [ordered]@{
+                generalistPairSource = 'derivedFromSupportedModelRegistry'
+                generalistPair = [object[]]@($registryPair)
+                conventionSpecialistModel = $fixtureSpecialist
+                conventionVerifierModel = $fixtureVerifier
+            }
+            timeouts = [ordered]@{
+                perCallTimeoutSeconds = 900
+                slotTimeoutSeconds = 5400
+                progressTimeoutSeconds = 1200
+                supervisionGraceSeconds = 120
+            }
+            slots = @(
+                [ordered]@{
+                    name = 'slot1'
+                    stateDirName = 'slot1-state'
+                    terminalName = 'slot1-terminal.json'
+                    launchAuthorizationTokenPath = $tokenPath
+                    modelPlan = [ordered]@{ bindSealedArguments = $false; opaqueArguments = @() }
+                },
+                [ordered]@{
+                    name = 'slot2'
+                    stateDirName = 'slot2-state'
+                    terminalName = 'slot2-terminal.json'
+                    launchAuthorizationTokenPath = $tokenPath
+                    modelPlan = [ordered]@{ bindSealedArguments = $false; opaqueArguments = @() }
+                }
+            )
+            reconciliation = [ordered]@{
+                reconciliationEnabled = $true
+                outputDirName = 'reconciliation'
+                launchAuthorizationTokenPath = $tokenPath
+            }
+            delivery = [ordered]@{
+                deliveryEnabled = $true
+                authorizationKind = 'PreviewOnly'
+                outputDirName = 'delivery'
+                launchAuthorizationTokenPath = $tokenPath
+                commentsEnabled = $false
+                votesEnabled = $false
+                gatesEnabled = $false
+                providerWriteBudget = 0
+            }
+        }
+        if ($state.MutateExecutionPlan) { & $state.MutateExecutionPlan $executionPlan $state }
+    }
+    $requestBody = [ordered]@{
+            schemaVersion = $state.SchemaVersion
             kind = 'reviewer-cohort-entry-evidence-request'
             correlationId = 'fixture-entry-001'
             toolkit = [ordered]@{ repositoryRoot = $toolkit; head = $toolkitHead; requiredRef = $toolkitRef }
@@ -528,7 +636,7 @@ function New-CohortEntryFixture {
                 operatorAlias = 'fixture-operator'
                 powerShellPath = (Get-Process -Id $PID).Path
                 childTimeoutSeconds = 600
-                plannedRunCount = 2
+                plannedRunCount = $state.PlannedRunCount
                 runSetKeyPath = $runSetKeyPath
             }
             ruleBundle = [ordered]@{
@@ -561,7 +669,10 @@ function New-CohortEntryFixture {
                 ordinal = 1
                 sealKeyPath = $sealKeyPath
             }
-        })
+        }
+    if ($state.ExecutionPlanIsNull) { [void]$requestBody.Add('executionPlan', $null) }
+    elseif ($null -ne $executionPlan) { [void]$requestBody.Add('executionPlan', $executionPlan) }
+    Write-CohortEntryJsonFile -Path $requestPath -WithBom:$state.RequestWithBom -Value $requestBody
 
     return [pscustomobject][ordered]@{
         Sandbox = $Sandbox
@@ -571,6 +682,9 @@ function New-CohortEntryFixture {
         ConfigPath = $configPath
         Toolkit = $toolkit
         ToolkitHead = $toolkitHead
+        GeneralistPair = $registryPair
+        SpecialistModel = $fixtureSpecialist
+        VerifierModel = $fixtureVerifier
         State = $state
     }
 }
@@ -1300,7 +1414,324 @@ try {
 finally { Remove-CohortEntrySandbox -Path $sandbox }
 
 # -------------------------------------------------------------------------
-# Cross-implementation parity: the prompt-asset digest this builder binds into
+# v2: the optional execution plan, and the complete coordinator request it
+# makes the builder emit FROM CREATION.
+# -------------------------------------------------------------------------
+Write-Host 'v2 execution plan: the complete request, emitted before it is hashed' -ForegroundColor Cyan
+
+# The registry accessor is the single place a model name enters the builder, and
+# it reads a list the harness returns with a unary comma. Wrapping that call in
+# @() and casting to [string[]] silently collapses twenty models into one joined
+# 295-character string, and every membership check then refuses every real
+# model. Assert the shape here rather than discovering it as a mystery CE704.
+$v2Registry = Get-ReviewerCohortEntryModelRegistry
+Assert-CohortEntry -Name 'the model registry returns discrete model identifiers' `
+    -Condition (@($v2Registry.Supported).Count -ge 4 -and
+        @(@($v2Registry.Supported) | Where-Object { [string]$_ -match '\s' }).Count -eq 0)
+Assert-CohortEntry -Name 'the generalist pair is two discrete registry members' `
+    -Condition (@($v2Registry.GeneralistPair).Count -eq 2 -and
+        @(@($v2Registry.GeneralistPair) | Where-Object { @($v2Registry.Supported) -ccontains [string]$_ }).Count -eq 2)
+
+$v2SchemaPath = Join-Path $repoRoot 'src/Agents/reviewer/schemas/reviewer.cohort-entry-evidence-request.v2.json'
+Assert-CohortEntry -Name 'the v2 request schema is present' -Condition (Test-Path -LiteralPath $v2SchemaPath -PathType Leaf)
+$v2SchemaText = [IO.File]::ReadAllText($v2SchemaPath)
+$v2Schema = $v2SchemaText | ConvertFrom-Json -Depth 64
+$v2Names = [string[]]@(Get-CohortEntrySchemaPropertyName -Node $v2Schema)
+Assert-CohortEntry -Name 'the v2 schema declares no oracle field' `
+    -Condition (@($v2Names | Where-Object { $_ -imatch 'expected|oracle|groundTruth|answerKey|verdict|severity|finding' }).Count -eq 0)
+Assert-CohortEntry -Name 'the v2 schema declares the execution plan' -Condition ($v2Names -ccontains 'executionPlan')
+Assert-CohortEntry -Name 'the v2 schema keeps the execution plan optional' `
+    -Condition (@($v2Schema.required) -cnotcontains 'executionPlan')
+# The strongest statement this contract makes is that a write-enabled plan is
+# not merely refused - it cannot be SPELLED. That is what 'const' does, so the
+# test checks the const and not a prose promise about it.
+$v2Delivery = $v2Schema.properties.executionPlan.properties.delivery.properties
+foreach ($capability in @('commentsEnabled', 'votesEnabled', 'gatesEnabled')) {
+    Assert-CohortEntry -Name "the v2 schema fixes delivery $capability to false" `
+        -Condition ($v2Delivery.$capability.PSObject.Properties['const'] -and ([bool]$v2Delivery.$capability.const -eq $false))
+}
+Assert-CohortEntry -Name 'the v2 schema fixes the provider write budget to zero' `
+    -Condition ([int]$v2Delivery.providerWriteBudget.const -eq 0)
+Assert-CohortEntry -Name 'the v2 schema fixes the delivery authorization to PreviewOnly' `
+    -Condition ([string]$v2Delivery.authorizationKind.const -ceq 'PreviewOnly')
+Assert-CohortEntry -Name 'the v2 schema declares exactly two slots' `
+    -Condition (([int]$v2Schema.properties.executionPlan.properties.slots.minItems -eq 2) -and
+        ([int]$v2Schema.properties.executionPlan.properties.slots.maxItems -eq 2))
+# Named by a leaf component, never by a path: that is what makes an output
+# directory unable to point anywhere but under the preparation root.
+foreach ($section in @('reconciliation', 'delivery')) {
+    $ref = [string]$v2Schema.properties.executionPlan.properties.$section.properties.outputDirName.'$ref'
+    Assert-CohortEntry -Name "the v2 schema names the $section output by a path component" `
+        -Condition ($ref -ceq '#/definitions/pathComponent')
+}
+
+# -- v1 is unchanged, and cannot grow slots ---------------------------------
+$v1Sandbox = New-CohortEntrySandbox -Name 'v1-noslot'
+try {
+    $v1Fixture = New-CohortEntryFixture -Sandbox $v1Sandbox
+    $v1Result = New-ReviewerCohortEntryEvidence -RequestPath $v1Fixture.RequestPath
+    $v1Request = [IO.File]::ReadAllText((Join-Path $v1Result.Root 'entry/coordinator-request.json')) | ConvertFrom-Json -Depth 32
+    Assert-CohortEntry -Name 'a v1 request still emits no slots section' `
+        -Condition (-not $v1Request.PSObject.Properties['slots'])
+    Assert-CohortEntry -Name 'a v1 entry reports no declared slot' -Condition ($v1Result.DeclaredSlots -eq 0)
+    Assert-CohortEntry -Name 'a v1 entry keeps the v2 model-start bound contract' `
+        -Condition ($v1Result.ModelStartBoundKind -ceq 'devpilot.shadow-cohort.model-start-bound.v2')
+}
+finally { Remove-CohortEntrySandbox -Path $v1Sandbox }
+
+# -- v2 without a plan is v1 -------------------------------------------------
+$v2BareSandbox = New-CohortEntrySandbox -Name 'v2-bare'
+try {
+    $v2BareFixture = New-CohortEntryFixture -Sandbox $v2BareSandbox -Mutate { param($s) $s.SchemaVersion = 2 }
+    $v2BareResult = New-ReviewerCohortEntryEvidence -RequestPath $v2BareFixture.RequestPath
+    $v2BareRequest = [IO.File]::ReadAllText((Join-Path $v2BareResult.Root 'entry/coordinator-request.json')) | ConvertFrom-Json -Depth 32
+    Assert-CohortEntry -Name 'a v2 request without a plan emits no slots section' `
+        -Condition (-not $v2BareRequest.PSObject.Properties['slots'])
+    Assert-CohortEntry -Name 'a v2 request without a plan reports schema version 2' -Condition ($v2BareResult.SchemaVersion -eq 2)
+}
+finally { Remove-CohortEntrySandbox -Path $v2BareSandbox }
+
+# -- v2 with a plan: the whole declaration, in the hashed region -------------
+$v2Sandbox = New-CohortEntrySandbox -Name 'v2-plan'
+try {
+    $v2Fixture = New-CohortEntryFixture -Sandbox $v2Sandbox -Mutate {
+        param($s) $s.SchemaVersion = 2; $s.WithExecutionPlan = $true
+    }
+    $v2Result = New-ReviewerCohortEntryEvidence -RequestPath $v2Fixture.RequestPath
+    $v2RequestPath = Join-Path $v2Result.Root 'entry/coordinator-request.json'
+    $v2RequestText = [IO.File]::ReadAllText($v2RequestPath)
+    $v2Request = $v2RequestText | ConvertFrom-Json -Depth 32
+
+    Assert-CohortEntry -Name 'a v2 plan emits a slots section' -Condition ([bool]$v2Request.PSObject.Properties['slots'])
+    Assert-CohortEntry -Name 'the emitted request enables shadow slots' -Condition ([bool]$v2Request.slots.shadowSlotsEnabled)
+    $v2Declared = @($v2Request.slots.declared)
+    Assert-CohortEntry -Name 'the emitted request declares exactly two slots' -Condition ($v2Declared.Count -eq 2)
+    Assert-CohortEntry -Name 'the emitted slots are named slot1 then slot2, in order' `
+        -Condition (([string]$v2Declared[0].name -ceq 'slot1') -and ([string]$v2Declared[1].name -ceq 'slot2'))
+    Assert-CohortEntry -Name 'both emitted slots launch the identical reviewer script' `
+        -Condition ([string]$v2Declared[0].reviewerScriptPath -ceq [string]$v2Declared[1].reviewerScriptPath)
+    Assert-CohortEntry -Name 'the emitted slots hold distinct state directories' `
+        -Condition ([string]$v2Declared[0].stateDirName -cne [string]$v2Declared[1].stateDirName)
+    Assert-CohortEntry -Name 'the emitted slots hold distinct terminal artifacts' `
+        -Condition ([string]$v2Declared[0].terminalName -cne [string]$v2Declared[1].terminalName)
+    Assert-CohortEntry -Name 'the emitted request pins the exact toolkit head' `
+        -Condition ([string]$v2Request.toolkit.head -ceq $v2Fixture.ToolkitHead)
+    Assert-CohortEntry -Name 'the emitted qualification plans exactly the declared slot count' `
+        -Condition ([int]$v2Request.qualification.plannedRunCount -eq $v2Declared.Count)
+
+    Assert-CohortEntry -Name 'the emitted request enables reconciliation' -Condition ([bool]$v2Request.slots.reconciliation.reconciliationEnabled)
+    Assert-CohortEntry -Name 'the emitted reconciliation requires both runs' `
+        -Condition ([int]$v2Request.slots.reconciliation.requiredRunCount -eq 2)
+    Assert-CohortEntry -Name 'the emitted delivery is PreviewOnly' `
+        -Condition ([string]$v2Request.slots.delivery.authorizationKind -ceq 'PreviewOnly')
+    foreach ($capability in @('commentsEnabled', 'votesEnabled', 'gatesEnabled')) {
+        Assert-CohortEntry -Name "the emitted delivery leaves $capability false" `
+            -Condition ([bool]$v2Request.slots.delivery.$capability -eq $false)
+    }
+    Assert-CohortEntry -Name 'the emitted delivery budgets no provider write' `
+        -Condition ([int]$v2Request.slots.delivery.providerWriteBudget -eq 0)
+    $v2Preparation = [IO.Path]::GetFullPath([string]$v2Request.output.root)
+    foreach ($directory in @([string]$v2Request.slots.reconciliation.outputDirectory, [string]$v2Request.slots.delivery.outputDirectory)) {
+        Assert-CohortEntry -Name "the emitted output '$([IO.Path]::GetFileName($directory))' is under the preparation root" `
+            -Condition (Test-ReviewerCohortEntryPathWithin -Candidate $directory -Root $v2Preparation)
+    }
+    Assert-CohortEntry -Name 'the emitted reconciliation and delivery outputs are distinct' `
+        -Condition ([string]$v2Request.slots.reconciliation.outputDirectory -cne [string]$v2Request.slots.delivery.outputDirectory)
+    Assert-CohortEntry -Name 'no emitted output escapes into the sealed package' `
+        -Condition (-not (Test-ReviewerCohortEntryPathWithin -Candidate $v2Preparation -Root $v2Result.Root))
+
+    # The load-bearing ordering claim. The slots are INSIDE the bytes the entry
+    # pins, so there is no "after the hash" for a slot to be added in.
+    $v2Entry = [IO.File]::ReadAllText((Join-Path $v2Result.Root 'entry/cohort-entry.json')) | ConvertFrom-Json -Depth 32
+    $v2FileSha = (Get-FileHash -LiteralPath $v2RequestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    Assert-CohortEntry -Name 'the entry pins the digest of the request that already carries its slots' `
+        -Condition (([string]$v2Entry.request.sha256 -ceq $v2FileSha) -and ($v2RequestText -cmatch '"slots"'))
+    $augmented = $v2RequestText | ConvertFrom-Json -Depth 32
+    $augmented.slots.declared = @(@($augmented.slots.declared) + @($augmented.slots.declared[0]))
+    $augmentedBytes = [byte[]]@($script:Utf8.GetBytes((ConvertTo-Json -InputObject $augmented -Depth 32)))
+    $augmentedSha = Get-CohortEntryBytesSha256 -Bytes $augmentedBytes
+    Assert-CohortEntry -Name 'a slot added after the hash no longer matches the pinned digest' `
+        -Condition ($augmentedSha -cne [string]$v2Entry.request.sha256)
+
+    # The bound, derived from the request that was actually emitted.
+    $v2Bound = [IO.File]::ReadAllText((Join-Path $v2Result.Root 'entry/model-start-bound.json')) | ConvertFrom-Json -Depth 32
+    Assert-CohortEntry -Name 'a v2 plan raises the model-start bound contract to v3' `
+        -Condition ([string]$v2Bound.kind -ceq 'devpilot.shadow-cohort.model-start-bound.v3')
+    Assert-CohortEntry -Name 'the bound estimates a non-zero finite model start count' `
+        -Condition (([int]$v2Bound.modelStarts -eq 2) -and ([int]$v2Bound.modelStarts -gt 0))
+    Assert-CohortEntry -Name 'the bound estimates a non-zero finite verifier assignment count' `
+        -Condition (([int]$v2Bound.verifierAssignments -eq 2) -and ([int]$v2Bound.verifierAssignments -gt 0))
+    Assert-CohortEntry -Name 'the bound wall clock covers both slots, the reconciliation and the delivery' `
+        -Condition ([int]$v2Bound.wallClockSeconds -eq ((5400 + 120) * 4))
+    Assert-CohortEntry -Name 'the bound records the supervision envelope the plan declared' `
+        -Condition (([int]$v2Bound.supervision.perCallTimeoutSeconds -eq 900) -and
+            ([int]$v2Bound.supervision.slotTimeoutSeconds -eq 5400) -and
+            ([int]$v2Bound.supervision.progressTimeoutSeconds -eq 1200) -and
+            ([int]$v2Bound.supervision.supervisionGraceSeconds -eq 120))
+    Assert-CohortEntry -Name 'the bound records the derived generalist pair' `
+        -Condition ((@($v2Bound.assignment.generalistPair) -join '|') -ceq (@($v2Fixture.GeneralistPair) -join '|'))
+    Assert-CohortEntry -Name 'the bound records the convention specialist and verifier' `
+        -Condition (([string]$v2Bound.assignment.conventionSpecialistModel -ceq $v2Fixture.SpecialistModel) -and
+            ([string]$v2Bound.assignment.conventionVerifierModel -ceq $v2Fixture.VerifierModel))
+    Assert-CohortEntry -Name 'the bound records a preview-only, zero-write assignment' `
+        -Condition (([string]$v2Bound.assignment.deliveryAuthorizationKind -ceq 'PreviewOnly') -and
+            ([int]$v2Bound.assignment.providerWriteBudget -eq 0))
+    Assert-CohortEntry -Name "the manifest entry's plan estimate is the bound" `
+        -Condition (([int]$v2Entry.planEstimate.modelStarts -eq [int]$v2Bound.modelStarts) -and
+            ([int]$v2Entry.planEstimate.verifierAssignments -eq [int]$v2Bound.verifierAssignments) -and
+            ([int]$v2Entry.planEstimate.wallClockSeconds -eq [int]$v2Bound.wallClockSeconds))
+    Assert-CohortEntry -Name 'the v2 build started no model' -Condition ($v2Result.ModelStarts -eq 0)
+    Assert-CohortEntry -Name 'the v2 build wrote nothing to a provider' -Condition ($v2Result.ProviderWrites -eq 0)
+    # The builder mints no launch authorization, so the token the plan names must
+    # still not exist after a complete build.
+    Assert-CohortEntry -Name 'the builder minted no launch authorization' `
+        -Condition (-not (Test-Path -LiteralPath (Join-Path $v2Sandbox 'launch/authorization.token')))
+    Assert-CohortEntry -Name 'the published v2 package is sealed and read-only' `
+        -Condition (Assert-ReviewerCohortEntryPublished -Root $v2Result.Root -SealKeyPath $v2Fixture.SealKeyPath)
+}
+finally { Remove-CohortEntrySandbox -Path $v2Sandbox }
+
+# -- sabotage: every way an execution plan can be wrong ----------------------
+Write-Host 'v2 execution plan: sabotage' -ForegroundColor Cyan
+$withPlan = {
+    param($MutatePlan)
+    return {
+        param($s)
+        $s.SchemaVersion = 2
+        $s.WithExecutionPlan = $true
+        if ($MutatePlan) { $s.MutateExecutionPlan = $MutatePlan }
+    }.GetNewClosure()
+}
+
+Invoke-CohortEntryCase -ExpectedCode '' -Name 'an exact execution plan' -Mutate (& $withPlan $null)
+Invoke-CohortEntryCase -ExpectedCode 'CE700' -Name 'an execution plan declared at schema version 1' -Mutate {
+    param($s) $s.SchemaVersion = 1; $s.WithExecutionPlan = $true
+}
+Invoke-CohortEntryCase -ExpectedCode 'CE701' -Name 'a plan that disables shadow slots' `
+    -Mutate (& $withPlan { param($p, $s) $p.shadowSlotsEnabled = $false })
+Invoke-CohortEntryCase -ExpectedCode 'CE701' -Name 'a plan that disables reconciliation' `
+    -Mutate (& $withPlan { param($p, $s) $p.reconciliation.reconciliationEnabled = $false })
+Invoke-CohortEntryCase -ExpectedCode 'CE701' -Name 'a plan that disables delivery' `
+    -Mutate (& $withPlan { param($p, $s) $p.delivery.deliveryEnabled = $false })
+Invoke-CohortEntryCase -ExpectedCode 'CE702' -Name 'a plan that declares one slot' `
+    -Mutate (& $withPlan { param($p, $s) $p.slots = @($p.slots[0]) })
+Invoke-CohortEntryCase -ExpectedCode 'CE702' -Name 'a plan that declares three slots' `
+    -Mutate (& $withPlan { param($p, $s) $p.slots = @($p.slots[0], $p.slots[1], $p.slots[1]) })
+Invoke-CohortEntryCase -ExpectedCode 'CE702' -Name 'a plan that declares its slots out of order' `
+    -Mutate (& $withPlan { param($p, $s) $p.slots = @($p.slots[1], $p.slots[0]) })
+Invoke-CohortEntryCase -ExpectedCode 'CE708' -Name 'two slots sharing one state directory' `
+    -Mutate (& $withPlan { param($p, $s) $p.slots[1].stateDirName = $p.slots[0].stateDirName })
+Invoke-CohortEntryCase -ExpectedCode 'CE708' -Name 'two slots sharing one state directory in another case' `
+    -Mutate (& $withPlan { param($p, $s) $p.slots[1].stateDirName = ([string]$p.slots[0].stateDirName).ToUpperInvariant() })
+Invoke-CohortEntryCase -ExpectedCode 'CE708' -Name 'a reconciliation output that collides with a slot state directory' `
+    -Mutate (& $withPlan { param($p, $s) $p.reconciliation.outputDirName = [string]$p.slots[0].stateDirName })
+Invoke-CohortEntryCase -ExpectedCode 'CE713' -Name 'a delivery output that collides with the reconciliation output' `
+    -Mutate (& $withPlan { param($p, $s) $p.delivery.outputDirName = [string]$p.reconciliation.outputDirName })
+Invoke-CohortEntryCase -ExpectedCode 'CE707' -Name 'a delivery authorized to do more than preview' `
+    -Mutate (& $withPlan { param($p, $s) $p.delivery.authorizationKind = 'Full' })
+Invoke-CohortEntryCase -ExpectedCode 'CE707' -Name 'a delivery that enables comments' `
+    -Mutate (& $withPlan { param($p, $s) $p.delivery.commentsEnabled = $true })
+Invoke-CohortEntryCase -ExpectedCode 'CE707' -Name 'a delivery that enables votes' `
+    -Mutate (& $withPlan { param($p, $s) $p.delivery.votesEnabled = $true })
+Invoke-CohortEntryCase -ExpectedCode 'CE707' -Name 'a delivery that enables gates' `
+    -Mutate (& $withPlan { param($p, $s) $p.delivery.gatesEnabled = $true })
+Invoke-CohortEntryCase -ExpectedCode 'CE707' -Name 'a delivery that budgets a provider write' `
+    -Mutate (& $withPlan { param($p, $s) $p.delivery.providerWriteBudget = 1 })
+Invoke-CohortEntryCase -ExpectedCode 'CE703' -Name 'a reviewer script that is not on disk' `
+    -Mutate (& $withPlan { param($p, $s) $p.reviewerScript.path = (Join-Path (Split-Path ([string]$p.reviewerScript.path) -Parent) 'absent.ps1') })
+Invoke-CohortEntryCase -ExpectedCode 'CE703' -Name 'a reviewer script whose bytes disagree with its pin' `
+    -Mutate (& $withPlan { param($p, $s) $p.reviewerScript.sha256 = ('f' * 64) })
+Invoke-CohortEntryCase -ExpectedCode 'CE704' -Name 'a model the registry does not carry' `
+    -Mutate (& $withPlan { param($p, $s) $p.models.conventionSpecialistModel = 'claude-opus-0.1' })
+Invoke-CohortEntryCase -ExpectedCode 'CE705' -Name 'a generalist pair declared in the wrong order' `
+    -Mutate (& $withPlan { param($p, $s) $p.models.generalistPair = @($p.models.generalistPair[1], $p.models.generalistPair[0]) })
+Invoke-CohortEntryCase -ExpectedCode 'CE705' -Name 'a specialist that is one of the two generalists' `
+    -Mutate (& $withPlan { param($p, $s) $p.models.conventionSpecialistModel = [string]$p.models.generalistPair[0] })
+Invoke-CohortEntryCase -ExpectedCode 'CE705' -Name 'a generalist pair of one model' `
+    -Mutate (& $withPlan { param($p, $s) $p.models.generalistPair = @([string]$p.models.generalistPair[0]) })
+Invoke-CohortEntryCase -ExpectedCode 'CE706' -Name 'a specialist the reviewer configuration does not configure' -Mutate {
+    param($s)
+    $s.SchemaVersion = 2
+    $s.WithExecutionPlan = $true
+    $s.ConfigSpecialistModel = 'claude-haiku-4.5'
+}
+Invoke-CohortEntryCase -ExpectedCode 'CE706' -Name 'a plan whose reviewer configuration disables verification' -Mutate {
+    param($s)
+    $s.SchemaVersion = 2
+    $s.WithExecutionPlan = $true
+    $s.ConfigVerificationEnabled = $false
+}
+Invoke-CohortEntryCase -ExpectedCode 'CE706' -Name 'a plan whose reviewer configuration names no models at all' -Mutate {
+    param($s)
+    $s.SchemaVersion = 2
+    $s.WithExecutionPlan = $true
+    $s.ConfigDeclaresModels = $false
+}
+# PowerShell reads the STRING "false" as $true. Without a strict read the
+# pairing check below would see verification enabled, seal the entry, and the
+# reviewer agent would then refuse the same configuration at startup.
+Invoke-CohortEntryCase -ExpectedCode 'CE211' -Name 'a reviewer configuration that spells verification.enabled as a string' -Mutate {
+    param($s)
+    $s.SchemaVersion = 2
+    $s.WithExecutionPlan = $true
+    $s.ConfigVerificationEnabledRaw = 'false'
+}
+Invoke-CohortEntryCase -ExpectedCode 'CE211' -Name 'a reviewer configuration that spells verification.enabled as a number' -Mutate {
+    param($s)
+    $s.SchemaVersion = 2
+    $s.WithExecutionPlan = $true
+    $s.ConfigVerificationEnabledRaw = 1
+}
+# The shipping SlotAuthorization.RequireLeafName refuses ANY component holding
+# '..', not just '.' and '..' themselves. A name this reader let through would
+# be captured, sealed and published before the coordinator refused to load it.
+Invoke-CohortEntryCase -ExpectedCode 'CE106' -Name 'a slot state directory holding a parent-directory hop' `
+    -Mutate (& $withPlan { param($p, $s) $p.slots[0].stateDirName = 's1..x' })
+Invoke-CohortEntryCase -ExpectedCode 'CE106' -Name 'a slot terminal name holding a parent-directory hop' `
+    -Mutate (& $withPlan { param($p, $s) $p.slots[1].terminalName = 't2..x' })
+Invoke-CohortEntryCase -ExpectedCode 'CE106' -Name 'a reconciliation output holding a parent-directory hop' `
+    -Mutate (& $withPlan { param($p, $s) $p.reconciliation.outputDirName = 'recon..x' })
+Invoke-CohortEntryCase -ExpectedCode 'CE106' -Name 'a delivery output holding a parent-directory hop' `
+    -Mutate (& $withPlan { param($p, $s) $p.delivery.outputDirName = 'deliver..x' })
+# A present property whose value is null. Left uncaught this fails on a
+# mandatory parameter binding, which has no catalogued code and exits 1 rather
+# than the 8 an operator scripts against.
+Invoke-CohortEntryCase -ExpectedCode 'CE700' -Name 'a request whose executionPlan is null' -Mutate {
+    param($s)
+    $s.SchemaVersion = 2
+    $s.ExecutionPlanIsNull = $true
+}
+Invoke-CohortEntryCase -ExpectedCode 'CE709' -Name 'a plan whose slot count is not the planned run count' -Mutate {
+    param($s)
+    $s.SchemaVersion = 2
+    $s.WithExecutionPlan = $true
+    $s.PlannedRunCount = 3
+}
+Invoke-CohortEntryCase -ExpectedCode 'CE710' -Name 'a per-call timeout that outlives the slot supervising it' `
+    -Mutate (& $withPlan { param($p, $s) $p.timeouts.perCallTimeoutSeconds = 7200 })
+Invoke-CohortEntryCase -ExpectedCode 'CE711' -Name 'a launch authorization inside the sealed package' `
+    -Mutate (& $withPlan {
+        param($p, $s)
+        $inside = Join-Path (Join-Path (Split-Path ([string]$p.reviewerScript.path) -Parent) 'private/entry') 'authorization.token'
+        $p.slots[0].launchAuthorizationTokenPath = $inside
+    })
+Invoke-CohortEntryCase -ExpectedCode 'CE308' -Name 'a model plan carrying a fault-injection argument' `
+    -Mutate (& $withPlan {
+        param($p, $s)
+        $p.slots[0].modelPlan.bindSealedArguments = $true
+        $p.slots[0].modelPlan.opaqueArguments = @('-FaultInjectionMode', 'terminal')
+    })
+Invoke-CohortEntryCase -ExpectedCode 'CE106' -Name 'a model plan that binds sealed arguments and declares none' `
+    -Mutate (& $withPlan { param($p, $s) $p.slots[0].modelPlan.bindSealedArguments = $true })
+Invoke-CohortEntryCase -ExpectedCode 'CE105' -Name 'an execution plan carrying a field this contract does not declare' `
+    -Mutate (& $withPlan { param($p, $s) $p['launchImmediately'] = $true })
+Invoke-CohortEntryCase -ExpectedCode 'CE104' -Name 'an execution plan that omits its delivery' `
+    -Mutate (& $withPlan { param($p, $s) $p.Remove('delivery') })
+Invoke-CohortEntryCase -ExpectedCode 'CE106' -Name 'a delivery capability written as a string rather than a boolean' `
+    -Mutate (& $withPlan { param($p, $s) $p.delivery.commentsEnabled = 'false' })
+
+# -------------------------------------------------------------------------
+
 # a coordinator request is computed HERE in PowerShell, but the coordinator
 # recomputes it in C# and refuses a mismatch. Two implementations of one digest
 # is exactly the drift this deliverable exists to remove, so the two are
@@ -1321,101 +1752,137 @@ Assert-CohortEntry -Name 'the builder and the coordinator agree on the prompt-as
 # builder published, driven to the last state before anything is launched.
 # -------------------------------------------------------------------------
 if ($IncludePreflight) {
-    Write-Host "preflight: $PreflightTarget with zero models" -ForegroundColor Cyan
-    $preflightSandbox = New-CohortEntrySandbox -Name 'preflight'
-    try {
-        $realToolkit = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-        $preflightFixture = New-CohortEntryFixture -Sandbox $preflightSandbox -RealToolkitRoot $realToolkit
-        $preflightResult = New-ReviewerCohortEntryEvidence -RequestPath $preflightFixture.RequestPath
-        $preparationRoot = ($preflightResult.Root.TrimEnd('\', '/') + '.preparation')
-        $reached = Invoke-ReviewerCohortEntryPreflight `
-            -Request (Read-ReviewerCohortEntryRequest -Path $preflightFixture.RequestPath) `
-            -CoordinatorRequestPath (Join-Path $preflightResult.Root 'entry/coordinator-request.json') `
-            -PreparationOutputRoot $preparationRoot -Target $PreflightTarget
-        Assert-CohortEntry -Name "the typed preflight reaches $PreflightTarget" -Condition ($reached -ceq $PreflightTarget)
-        $preflightIntents = @(Get-ChildItem -LiteralPath (Join-Path $preparationRoot 'coordinator/intents') -File -Force -Filter '*.intent.json' -ErrorAction SilentlyContinue)
-        $preflightSlotIntents = @($preflightIntents | Where-Object {
-                $intent = [IO.File]::ReadAllText($_.FullName) | ConvertFrom-Json -Depth 16
-                [string]$intent.slotName -or [string]$intent.setId -or [string]$intent.expectedTerminalPath
-            })
-        Assert-CohortEntry -Name 'the preflight launched no slot' -Condition ($preflightSlotIntents.Count -eq 0)
-        Assert-CohortEntry -Name 'the preflight launched only read-only preparation children' `
-            -Condition (@($preflightIntents | Where-Object { [string]$_.Name -notmatch 'stagePreparation|corpusSealValidate|snapshotValidate' }).Count -eq 0)
-        Assert-CohortEntry -Name 'the preflight started no model' -Condition ($preflightResult.ModelStarts -eq 0)
-        Assert-CohortEntry -Name 'the preflight wrote nothing to a provider' -Condition ($preflightResult.ProviderWrites -eq 0)
-        Assert-CohortEntry -Name 'the preflight left the sealed package intact' `
-            -Condition (Assert-ReviewerCohortEntryPublished -Root $preflightResult.Root -SealKeyPath $preflightFixture.SealKeyPath)
-        Assert-CohortEntry -Name 'the preflight wrote outside the sealed package' `
-            -Condition ((Test-Path -LiteralPath $preparationRoot -PathType Container) -and
-                (-not (Test-ReviewerCohortEntryPathWithin -Candidate $preparationRoot -Root $preflightResult.Root)))
+    function Invoke-CohortEntryPreflightVariant {
+        <#
+        .SYNOPSIS
+            One end-to-end no-model proof: build, drive the typed coordinator to
+            the last state before a launch, then hand the published entry to the
+            SHIPPING cohort reader.
 
-        # The claim "accepted directly by the cohort manifest, without
-        # translation" is checked against the SHIPPING C# reader rather than
-        # against a PowerShell restatement of what that reader wants. The entry
-        # node is the published cohort-entry.json verbatim - copied, not
-        # rebuilt - and the manifest around it is the minimum a manifest is.
-        #
-        # --rebuild-index is used because it is the one cohort verb that starts
-        # nothing at all. CohortManifest.Load runs first and validates the
-        # manifest and every entry field strictly; only afterwards does the
-        # runner discover it has no journal to rebuild from. So the exact
-        # refusal "there is no cohort journal ... to rebuild an index from" is
-        # proof that everything before it - the whole entry - was accepted.
-        # Any OTHER refusal is the entry being rejected, and fails this check.
-        $entryNode = [IO.File]::ReadAllText((Join-Path $preflightResult.Root 'entry/cohort-entry.json')) | ConvertFrom-Json -Depth 32
-        $cohortDll = Join-Path $realToolkit 'tools/ShadowRunCoordinator/bin/Release/net10.0/ShadowRunCoordinator.dll'
-        if (Test-Path -LiteralPath $cohortDll -PathType Leaf) {
-            $manifestPath = Join-Path $preflightSandbox 'cohort-manifest.json'
-            $manifest = [ordered]@{
-                contractVersion = 'devpilot.shadow-cohort.manifest.v3'
-                kind = 'shadow-cohort-run'
-                cohortId = 'cohort-entry-evidence-acceptance'
-                correlationId = [string]((([IO.File]::ReadAllText((Join-Path $preflightResult.Root 'entry/coordinator-request.json')) | ConvertFrom-Json -Depth 32)).correlationId)
-                toolkit = [ordered]@{
-                    repositoryRoot = $realToolkit
-                    head = (& git -C $realToolkit rev-parse HEAD).Trim()
-                    requiredRef = 'refs/heads/main'
-                }
-                execution = [ordered]@{
-                    concurrency = 1
-                    stopPolicy = 'failFast'
-                    authorizationKind = 'PreviewOnly'
-                    commandPath = 'dotnet'
-                    argumentPrefix = [string[]]@($cohortDll)
-                    target = 'runSetReady'
-                    entryTimeoutSeconds = 120
-                }
-                budgets = [ordered]@{
-                    maxPullRequests = 1
-                    # Taken FROM the entry: the entry's plan estimate is what a
-                    # real review of this subject would consume, and a manifest
-                    # whose ceiling is below its own sealed estimates is refused
-                    # before it starts. Nothing is consumed here - --rebuild-index
-                    # starts nothing - but the ceiling still has to be coherent.
-                    maxModelStarts = [int]$entryNode.planEstimate.modelStarts
-                    maxVerifierAssignments = [int]$entryNode.planEstimate.verifierAssignments
-                    maxWallClockSeconds = [int]$entryNode.planEstimate.wallClockSeconds
-                    providerWriteBudget = 0
-                }
-                journal = [ordered]@{ root = (Join-Path $preflightSandbox 'cohort-journal') }
-                audit = [ordered]@{ indexPath = (Join-Path $preflightSandbox 'cohort-index/index.json') }
-                entries = @($entryNode)
+        .DESCRIPTION
+            Run once for a v1 request and once for a v2 request carrying an
+            execution plan, because the claim under test is that BOTH shapes are
+            accepted verbatim - the v2 entry with its two declared slots inside
+            the hashed region, and the v1 entry unchanged beside it.
+        #>
+        param(
+            [Parameter(Mandatory)][string]$Label,
+            [Parameter(Mandatory)][string]$RealToolkitRoot,
+            [switch]$WithExecutionPlan
+        )
+        $sandbox = New-CohortEntrySandbox -Name "preflight-$Label"
+        try {
+            $mutate = if ($WithExecutionPlan) { { param($s) $s.SchemaVersion = 2; $s.WithExecutionPlan = $true } } else { $null }
+            $fixture = if ($mutate) {
+                New-CohortEntryFixture -Sandbox $sandbox -RealToolkitRoot $RealToolkitRoot -Mutate $mutate
             }
-            Write-CohortEntryJsonFile -Path $manifestPath -Value $manifest
-            $previousNative = $PSNativeCommandUseErrorActionPreference
-            $PSNativeCommandUseErrorActionPreference = $false
-            $acceptance = ''
-            try {
-                $acceptance = (& dotnet $cohortDll --cohort $manifestPath --authorized-by 'cohort-entry-test' --rebuild-index 2>&1 | Out-String)
+            else { New-CohortEntryFixture -Sandbox $sandbox -RealToolkitRoot $RealToolkitRoot }
+            $result = New-ReviewerCohortEntryEvidence -RequestPath $fixture.RequestPath
+            $preparationRoot = ($result.Root.TrimEnd('\', '/') + '.preparation')
+            $coordinatorRequestPath = Join-Path $result.Root 'entry/coordinator-request.json'
+            $coordinatorRequest = [IO.File]::ReadAllText($coordinatorRequestPath) | ConvertFrom-Json -Depth 32
+            if ($WithExecutionPlan) {
+                Assert-CohortEntry -Name "${Label}: the request handed to the coordinator already carries two slots" `
+                    -Condition (@($coordinatorRequest.slots.declared).Count -eq 2)
             }
-            finally { $PSNativeCommandUseErrorActionPreference = $previousNative }
-            Assert-CohortEntry -Name 'the shipping cohort manifest reader accepts the published entry verbatim' `
-                -Condition ($acceptance -match 'no cohort journal')
-            Assert-CohortEntry -Name 'the shipping cohort reader refuses nothing about the entry itself' `
-                -Condition ($acceptance -notmatch 'entry\s+\d+|entryId|ordinal|planEstimate|ruleBundle|subject')
+            $reached = Invoke-ReviewerCohortEntryPreflight `
+                -Request (Read-ReviewerCohortEntryRequest -Path $fixture.RequestPath) `
+                -CoordinatorRequestPath $coordinatorRequestPath `
+                -PreparationOutputRoot $preparationRoot -Target $PreflightTarget
+            Assert-CohortEntry -Name "${Label}: the typed preflight reaches $PreflightTarget" -Condition ($reached -ceq $PreflightTarget)
+            $preflightIntents = @(Get-ChildItem -LiteralPath (Join-Path $preparationRoot 'coordinator/intents') -File -Force -Filter '*.intent.json' -ErrorAction SilentlyContinue)
+            $preflightSlotIntents = @($preflightIntents | Where-Object {
+                    $intent = [IO.File]::ReadAllText($_.FullName) | ConvertFrom-Json -Depth 16
+                    # A set identifier alone is NOT a launch. Once the run set is
+                    # verified the coordinator stamps its setId on every subsequent
+                    # child, including the read-only status probe, so counting it
+                    # here would call any run-set-ready preflight a slot launch.
+                    [string]$intent.slotName -or [string]$intent.expectedTerminalPath
+                })
+            Assert-CohortEntry -Name "${Label}: the preflight launched no slot" -Condition ($preflightSlotIntents.Count -eq 0)
+            Assert-CohortEntry -Name "${Label}: the preflight launched only read-only preparation children" `
+                -Condition (@($preflightIntents | Where-Object { [string]$_.Name -notmatch 'stagePreparation|corpusSealValidate|snapshotValidate' }).Count -eq 0)
+            Assert-CohortEntry -Name "${Label}: the preflight started no model" -Condition ($result.ModelStarts -eq 0)
+            Assert-CohortEntry -Name "${Label}: the preflight wrote nothing to a provider" -Condition ($result.ProviderWrites -eq 0)
+            Assert-CohortEntry -Name "${Label}: the preflight left the sealed package intact" `
+                -Condition (Assert-ReviewerCohortEntryPublished -Root $result.Root -SealKeyPath $fixture.SealKeyPath)
+            Assert-CohortEntry -Name "${Label}: the preflight wrote outside the sealed package" `
+                -Condition ((Test-Path -LiteralPath $preparationRoot -PathType Container) -and
+                    (-not (Test-ReviewerCohortEntryPathWithin -Candidate $preparationRoot -Root $result.Root)))
+
+            # The claim "accepted directly by the cohort manifest, without
+            # translation" is checked against the SHIPPING C# reader rather than
+            # against a PowerShell restatement of what that reader wants. The entry
+            # node is the published cohort-entry.json verbatim - copied, not
+            # rebuilt - and the manifest around it is the minimum a manifest is.
+            #
+            # --rebuild-index is used because it is the one cohort verb that starts
+            # nothing at all. CohortManifest.Load runs first and validates the
+            # manifest and every entry field strictly; only afterwards does the
+            # runner discover it has no journal to rebuild from. So the exact
+            # refusal "there is no cohort journal ... to rebuild an index from" is
+            # proof that everything before it - the whole entry - was accepted.
+            # Any OTHER refusal is the entry being rejected, and fails this check.
+            $entryNode = [IO.File]::ReadAllText((Join-Path $result.Root 'entry/cohort-entry.json')) | ConvertFrom-Json -Depth 32
+            $cohortDll = Join-Path $RealToolkitRoot 'tools/ShadowRunCoordinator/bin/Release/net10.0/ShadowRunCoordinator.dll'
+            if (Test-Path -LiteralPath $cohortDll -PathType Leaf) {
+                $manifestPath = Join-Path $sandbox 'cohort-manifest.json'
+                $manifest = [ordered]@{
+                    contractVersion = 'devpilot.shadow-cohort.manifest.v3'
+                    kind = 'shadow-cohort-run'
+                    cohortId = 'cohort-entry-evidence-acceptance'
+                    correlationId = [string]$coordinatorRequest.correlationId
+                    toolkit = [ordered]@{
+                        repositoryRoot = $RealToolkitRoot
+                        head = (& git -C $RealToolkitRoot rev-parse HEAD).Trim()
+                        requiredRef = 'refs/heads/main'
+                    }
+                    execution = [ordered]@{
+                        concurrency = 1
+                        stopPolicy = 'failFast'
+                        authorizationKind = 'PreviewOnly'
+                        commandPath = 'dotnet'
+                        argumentPrefix = [string[]]@($cohortDll)
+                        target = 'runSetReady'
+                        entryTimeoutSeconds = 120
+                    }
+                    budgets = [ordered]@{
+                        maxPullRequests = 1
+                        # Taken FROM the entry: the entry's plan estimate is what a
+                        # real review of this subject would consume, and a manifest
+                        # whose ceiling is below its own sealed estimates is refused
+                        # before it starts. Nothing is consumed here - --rebuild-index
+                        # starts nothing - but the ceiling still has to be coherent.
+                        maxModelStarts = [int]$entryNode.planEstimate.modelStarts
+                        maxVerifierAssignments = [int]$entryNode.planEstimate.verifierAssignments
+                        maxWallClockSeconds = [int]$entryNode.planEstimate.wallClockSeconds
+                        providerWriteBudget = 0
+                    }
+                    journal = [ordered]@{ root = (Join-Path $sandbox 'cohort-journal') }
+                    audit = [ordered]@{ indexPath = (Join-Path $sandbox 'cohort-index/index.json') }
+                    entries = @($entryNode)
+                }
+                Write-CohortEntryJsonFile -Path $manifestPath -Value $manifest
+                $previousNative = $PSNativeCommandUseErrorActionPreference
+                $PSNativeCommandUseErrorActionPreference = $false
+                $acceptance = ''
+                try {
+                    $acceptance = (& dotnet $cohortDll --cohort $manifestPath --authorized-by 'cohort-entry-test' --rebuild-index 2>&1 | Out-String)
+                }
+                finally { $PSNativeCommandUseErrorActionPreference = $previousNative }
+                Assert-CohortEntry -Name "${Label}: the shipping cohort manifest reader accepts the published entry verbatim" `
+                    -Condition ($acceptance -match 'no cohort journal')
+                Assert-CohortEntry -Name "${Label}: the shipping cohort reader refuses nothing about the entry itself" `
+                    -Condition ($acceptance -notmatch 'entry\s+\d+|entryId|ordinal|planEstimate|ruleBundle|subject')
+            }
         }
+        finally { if (-not $KeepSandbox) { Remove-CohortEntrySandbox -Path $sandbox } else { Write-Host "sandbox kept: $sandbox" } }
     }
-    finally { if (-not $KeepSandbox) { Remove-CohortEntrySandbox -Path $preflightSandbox } else { Write-Host "sandbox kept: $preflightSandbox" } }
+
+    Write-Host "preflight: $PreflightTarget with zero models" -ForegroundColor Cyan
+    $realToolkit = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+    Invoke-CohortEntryPreflightVariant -Label 'v1' -RealToolkitRoot $realToolkit
+    Invoke-CohortEntryPreflightVariant -Label 'v2' -RealToolkitRoot $realToolkit -WithExecutionPlan
 }
 
 # -------------------------------------------------------------------------

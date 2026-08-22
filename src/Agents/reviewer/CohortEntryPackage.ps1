@@ -450,6 +450,38 @@ function Get-ReviewerCohortEntryConfigBinding {
         New-ReviewerCohortEntryRefusal -Code 'CE211' `
             -Detail "The reviewer configuration review.targetRefName is '$validatedRef', which is not a full refs/heads ref."
     }
+    # Optional by design, and read WITHOUT refusing when absent: a preparation-only
+    # entry is complete without them, and only an execution plan makes them
+    # load-bearing. Read here rather than in the plan reader so there is exactly
+    # one place that knows the reviewer's own spelling of these settings.
+    $specialistModel = ''
+    if ($review.PSObject.Properties['conventionSpecialistModel']) {
+        $specialistModel = [string]$review.conventionSpecialistModel
+    }
+    $verifierModel = ''
+    $verificationEnabled = $false
+    if ($review.PSObject.Properties['verification']) {
+        $verification = $review.verification
+        if ($verification -is [System.Management.Automation.PSCustomObject]) {
+            if ($verification.PSObject.Properties['enabled']) {
+                # NOT [bool]$verification.enabled. PowerShell reads the string
+                # "false" as $true, so a configuration that spelled this as a
+                # string would look to the CE706 pairing check like it enabled
+                # verification - and the reviewer agent's own reader
+                # (Get-AgentConfigBool) would then refuse the same file at
+                # startup, after the entry was sealed.
+                $enabledValue = $verification.enabled
+                if ($enabledValue -isnot [bool]) {
+                    New-ReviewerCohortEntryRefusal -Code 'CE211' `
+                        -Detail 'The reviewer configuration review.verification.enabled is not a boolean; the reviewer agent reads this field strictly and would refuse it at startup.'
+                }
+                $verificationEnabled = [bool]$enabledValue
+            }
+            if ($verification.PSObject.Properties['conventionVerifierModel']) {
+                $verifierModel = [string]$verification.conventionVerifierModel
+            }
+        }
+    }
     return [pscustomobject][ordered]@{
         Sha256 = (Get-ReviewerCorpusSealSha256 -Bytes $bytes)
         Organization = [string](Get-ReviewerCohortEntryProperty -Object $repository -Name 'organization' -Where 'reviewer configuration repository' -Code 'CE212')
@@ -457,6 +489,84 @@ function Get-ReviewerCohortEntryConfigBinding {
         Name = [string](Get-ReviewerCohortEntryProperty -Object $repository -Name 'name' -Where 'reviewer configuration repository' -Code 'CE212')
         Id = [string](Get-ReviewerCohortEntryProperty -Object $repository -Name 'id' -Where 'reviewer configuration repository' -Code 'CE212')
         ValidatedTargetRef = $validatedRef
+        ConventionSpecialistModel = $specialistModel
+        ConventionVerifierModel = $verifierModel
+        VerificationEnabled = $verificationEnabled
+    }
+}
+
+function Assert-ReviewerCohortEntryExecutionPlanBinding {
+    <#
+    .SYNOPSIS
+        Requires an execution plan to name the reviewed script that is actually on
+        disk, the models the registry actually carries, and the models this
+        reviewer configuration actually configures.
+
+    .DESCRIPTION
+        Every check here closes a failure that has already happened once at slot
+        startup rather than at build time, which is the worst possible place for
+        it: by then a run set is declared, a launch token is minted, two slots are
+        authorized, and the first one dies on a model identifier nobody can change
+        without re-declaring the set.
+
+        The generalist pair is DERIVED from the shared supported-model registry
+        and the plan's restatement is compared against it, never trusted. That is
+        the whole point of the registry's "newest first" comment: a wrapper that
+        names its own version is exactly how a retired Opus reached a slot.
+    #>
+    param(
+        [Parameter(Mandatory)]$Plan,
+        [Parameter(Mandatory)]$Binding
+    )
+
+    if (-not (Test-Path -LiteralPath $Plan.ReviewerScriptPath -PathType Leaf)) {
+        New-ReviewerCohortEntryRefusal -Code 'CE703' `
+            -Detail "The execution plan reviewer script '$($Plan.ReviewerScriptPath)' does not exist."
+    }
+    $observed = (Get-FileHash -LiteralPath $Plan.ReviewerScriptPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($observed -cne $Plan.ReviewerScriptSha256) {
+        New-ReviewerCohortEntryRefusal -Code 'CE703' `
+            -Detail "The execution plan pins the reviewer script at $($Plan.ReviewerScriptSha256) and '$($Plan.ReviewerScriptPath)' hashes to $observed."
+    }
+
+    $registry = Get-ReviewerCohortEntryModelRegistry
+    foreach ($model in @(@($Plan.GeneralistPair) + @($Plan.ConventionSpecialistModel, $Plan.ConventionVerifierModel))) {
+        if (@($registry.Supported) -cnotcontains [string]$model) {
+            New-ReviewerCohortEntryRefusal -Code 'CE704' `
+                -Detail "The execution plan names model '$model', which the supported-model registry does not carry."
+        }
+    }
+    $derived = [string[]]@($registry.GeneralistPair)
+    $declared = [string[]]@($Plan.GeneralistPair)
+    for ($i = 0; $i -lt $derived.Count; $i++) {
+        if ($declared[$i] -cne $derived[$i]) {
+            New-ReviewerCohortEntryRefusal -Code 'CE705' `
+                -Detail "The execution plan declares the generalist pair ($($declared -join ', ')) and the registry derives ($($derived -join ', '))."
+        }
+    }
+    # The reviewer refuses at startup when the discovery model is one of the two
+    # generalists, because a "second opinion" from a model that already voted is
+    # not one. Refused here so the refusal arrives before a run set exists.
+    if ($derived -ccontains $Plan.ConventionSpecialistModel) {
+        New-ReviewerCohortEntryRefusal -Code 'CE705' `
+            -Detail "The execution plan uses generalist '$($Plan.ConventionSpecialistModel)' as the convention specialist; the specialist must differ from both."
+    }
+
+    if ([string]::IsNullOrEmpty($Binding.ConventionSpecialistModel)) {
+        New-ReviewerCohortEntryRefusal -Code 'CE706' `
+            -Detail 'The reviewer configuration declares no review.conventionSpecialistModel, so an execution plan cannot be checked against it.'
+    }
+    if ($Plan.ConventionSpecialistModel -cne $Binding.ConventionSpecialistModel) {
+        New-ReviewerCohortEntryRefusal -Code 'CE706' `
+            -Detail "The execution plan uses specialist '$($Plan.ConventionSpecialistModel)' and the reviewer configuration configures '$($Binding.ConventionSpecialistModel)'."
+    }
+    if (-not $Binding.VerificationEnabled) {
+        New-ReviewerCohortEntryRefusal -Code 'CE706' `
+            -Detail 'The execution plan declares a convention verifier and the reviewer configuration disables review.verification; the agent would refuse the pairing at startup.'
+    }
+    if ($Plan.ConventionVerifierModel -cne $Binding.ConventionVerifierModel) {
+        New-ReviewerCohortEntryRefusal -Code 'CE706' `
+            -Detail "The execution plan uses verifier '$($Plan.ConventionVerifierModel)' and the reviewer configuration configures '$($Binding.ConventionVerifierModel)'."
     }
 }
 
@@ -496,10 +606,20 @@ function New-ReviewerCohortEntryCoordinatorRequest {
         C# reader accepts.
 
     .DESCRIPTION
-        Written with NO slots section. An entry this builder produces authorizes
-        a preparation and nothing else: there is no way to add a slot afterwards,
-        because a request that grew one would be a different request and its
-        digest - which is the digest the entry pins - would no longer match.
+        Written with NO slots section when the request carries no execution plan.
+        An entry that build produces authorizes a preparation and nothing else:
+        there is no way to add a slot afterwards, because a request that grew one
+        would be a different request and its digest - which is the digest the
+        entry pins - would no longer match.
+
+        When the request DOES carry an execution plan, the whole run declaration
+        is written here, in this one object, before anything is hashed: two
+        declared slots, the reconciliation that compares them and a preview-only
+        delivery. That ordering is the entire security property. The coordinator
+        digests the request file as a whole, the manifest entry pins that digest,
+        and both are computed after this function returns - so a slot appended
+        afterwards changes the digest the entry pins and is refused by the typed
+        reader before it reads a single field.
     #>
     param(
         [Parameter(Mandatory)]$Request,
@@ -514,7 +634,7 @@ function New-ReviewerCohortEntryCoordinatorRequest {
         [Parameter(Mandatory)][string]$SchemaSha256,
         [Parameter(Mandatory)][string]$PreparationOutputRoot
     )
-    return [ordered]@{
+    $emitted = [ordered]@{
         contractVersion = $script:ReviewerCohortEntryCoordinatorContract
         kind = 'shadow-run-preparation'
         correlationId = $Request.CorrelationId
@@ -555,6 +675,71 @@ function New-ReviewerCohortEntryCoordinatorRequest {
             runSetKeyPath = $Request.RunSetKeyPath
         }
     }
+
+    $plan = $Request.ExecutionPlan
+    if ($null -eq $plan) { return $emitted }
+
+    # Every output directory is JOINED under the preparation root rather than
+    # taken from the request, so the only thing an operator supplied is a leaf
+    # name. There is no string they can write that reaches outside this root -
+    # not '..', not a rooted path, not another volume - because none of what they
+    # wrote is used as a path.
+    $preparationRoot = [IO.Path]::GetFullPath($PreparationOutputRoot)
+    $reconciliationDirectory = [IO.Path]::GetFullPath((Join-Path $preparationRoot $plan.ReconciliationOutputDirName))
+    $deliveryDirectory = [IO.Path]::GetFullPath((Join-Path $preparationRoot $plan.DeliveryOutputDirName))
+    foreach ($directory in @($reconciliationDirectory, $deliveryDirectory)) {
+        if (-not (Test-ReviewerCohortEntryPathWithin -Candidate $directory -Root $preparationRoot)) {
+            New-ReviewerCohortEntryRefusal -Code 'CE711' `
+                -Detail "The emitted output directory '$directory' is outside the preparation root '$preparationRoot'."
+        }
+    }
+
+    $declared = [object[]]@(foreach ($slot in @($plan.Slots)) {
+            [ordered]@{
+                name = $slot.Name
+                # ONE script for both slots, by construction rather than by
+                # comparison: two slots running different reviewers are not two
+                # passes of the same reviewer, and the typed reader refuses a pair
+                # whose paths differ at all.
+                reviewerScriptPath = $plan.ReviewerScriptPath
+                launchAuthorizationTokenPath = $slot.LaunchAuthorizationTokenPath
+                supervisionGraceSeconds = $plan.SupervisionGraceSeconds
+                stateDirName = $slot.StateDirName
+                terminalName = $slot.TerminalName
+                modelPlan = [ordered]@{
+                    bindSealedArguments = $slot.BindSealedArguments
+                    opaqueArguments = [object[]]@($slot.OpaqueArguments)
+                }
+            }
+        })
+
+    $emitted['slots'] = [ordered]@{
+        shadowSlotsEnabled = $true
+        declared = $declared
+        reconciliation = [ordered]@{
+            reconciliationEnabled = $true
+            outputDirectory = $reconciliationDirectory
+            requiredRunCount = $declared.Count
+            launchAuthorizationTokenPath = $plan.ReconciliationTokenPath
+            supervisionGraceSeconds = $plan.SupervisionGraceSeconds
+        }
+        delivery = [ordered]@{
+            deliveryEnabled = $true
+            authorizationKind = 'PreviewOnly'
+            outputDirectory = $deliveryDirectory
+            requiredRunCount = $declared.Count
+            launchAuthorizationTokenPath = $plan.DeliveryTokenPath
+            supervisionGraceSeconds = $plan.SupervisionGraceSeconds
+            # Written as values rather than left out. An absent capability is a
+            # capability the next reader gets to decide about; a capability
+            # written false is one nobody can reinterpret.
+            commentsEnabled = $false
+            votesEnabled = $false
+            gatesEnabled = $false
+            providerWriteBudget = 0
+        }
+    }
+    return $emitted
 }
 
 function New-ReviewerCohortEntryManifestEntry {

@@ -19,11 +19,12 @@
 
     IT LAUNCHES NO MODEL. With -Preflight it starts the typed coordinator over
     the published request and drives it to a preparation state only, refusing if
-    any launch intent names a slot, a set or an expected terminal artifact.
+    any launch intent names a slot or an expected terminal artifact.
 
 .PARAMETER RequestPath
     The versioned operator request, validated against
-    src/Agents/reviewer/schemas/reviewer.cohort-entry-evidence-request.v1.json.
+    src/Agents/reviewer/schemas/reviewer.cohort-entry-evidence-request.v1.json, or
+    ...-request.v2.json when it carries an executionPlan.
 
 .PARAMETER Preflight
     Additionally drive the typed coordinator over the published request, proving
@@ -90,6 +91,7 @@ function Get-CohortEntryExitCode {
         '^CE4' { return 5 }
         '^CE5' { return 6 }
         '^CE6' { return 7 }
+        '^CE7' { return 8 }
     }
     return 1
 }

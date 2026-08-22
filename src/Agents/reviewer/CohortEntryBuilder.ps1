@@ -295,6 +295,13 @@ function New-ReviewerCohortEntryEvidence {
     $toolkitHead = Assert-ReviewerCohortEntryToolkit -Request $request
     $configBinding = Get-ReviewerCohortEntryConfigBinding -ConfigPath $request.ReviewerConfigPath
     Assert-ReviewerCohortEntryConfigBinding -Binding $configBinding -Request $request
+    # Checked BEFORE any read is issued. An execution plan that names a retired
+    # model or a script that is not on disk is a plan that dies at slot startup;
+    # discovering that after a whole corpus has been captured wastes the capture
+    # and, worse, teaches an operator to expect a build to fail late.
+    if ($null -ne $request.ExecutionPlan) {
+        Assert-ReviewerCohortEntryExecutionPlanBinding -Plan $request.ExecutionPlan -Binding $configBinding
+    }
     $declarationSha = Assert-ReviewerCohortEntryRuleDeclaration -Request $request
 
     $plan = [System.Collections.Generic.List[object]]::new()
@@ -644,15 +651,70 @@ function New-ReviewerCohortEntryEvidence {
     $coordinatorRequestSha = (Get-FileHash -LiteralPath $coordinatorRequestPath -Algorithm SHA256).Hash.ToLowerInvariant()
 
     $modelStartBoundPath = Join-Path $evidenceRoot 'model-start-bound.json'
-    $modelStartBound = [ordered]@{
-        kind = 'devpilot.shadow-cohort.model-start-bound.v2'
-        correlationId = $request.CorrelationId
-        entryId = $request.EntryId
-        plannedRunCount = $request.PlannedRunCount
-        modelStarts = $request.PlannedRunCount
-        verifierAssignments = $request.PlannedRunCount
-        wallClockSeconds = ($request.ChildTimeoutSeconds * $request.PlannedRunCount)
+    # The bound is DERIVED, not declared, and it is derived from whichever request
+    # was actually emitted. A preparation-only entry bounds the runs its
+    # qualification plans; an entry that carries a full run declaration bounds the
+    # slots it declared, with the supervision envelope those slots will actually
+    # be held to. A bound that came from the operator's intention rather than from
+    # the emitted request would be a budget for a run that was never declared.
+    $executionPlan = $request.ExecutionPlan
+    $boundSlots = if ($null -ne $executionPlan) { @($executionPlan.Slots).Count } else { $request.PlannedRunCount }
+    $modelStartBound = if ($null -ne $executionPlan) {
+        # Two slots, plus the reconciliation that compares them and the delivery
+        # that previews the result: four supervised children, each bounded by the
+        # slot timeout it may use and the grace it is given to stop.
+        $supervisedChildren = $boundSlots + 2
+        $wallClock = ([long]$executionPlan.SlotTimeoutSeconds + [long]$executionPlan.SupervisionGraceSeconds) * $supervisedChildren
+        [ordered]@{
+            kind = 'devpilot.shadow-cohort.model-start-bound.v3'
+            correlationId = $request.CorrelationId
+            entryId = $request.EntryId
+            plannedRunCount = $request.PlannedRunCount
+            modelStarts = $boundSlots
+            verifierAssignments = $boundSlots
+            wallClockSeconds = [int]$wallClock
+            supervision = [ordered]@{
+                declaredSlots = $boundSlots
+                perCallTimeoutSeconds = $executionPlan.PerCallTimeoutSeconds
+                slotTimeoutSeconds = $executionPlan.SlotTimeoutSeconds
+                progressTimeoutSeconds = $executionPlan.ProgressTimeoutSeconds
+                supervisionGraceSeconds = $executionPlan.SupervisionGraceSeconds
+            }
+            assignment = [ordered]@{
+                generalistPair = [object[]]@($executionPlan.GeneralistPair)
+                conventionSpecialistModel = $executionPlan.ConventionSpecialistModel
+                conventionVerifierModel = $executionPlan.ConventionVerifierModel
+                reviewerScriptSha256 = $executionPlan.ReviewerScriptSha256
+                deliveryAuthorizationKind = $executionPlan.DeliveryAuthorizationKind
+                providerWriteBudget = 0
+            }
+        }
     }
+    else {
+        [ordered]@{
+            kind = 'devpilot.shadow-cohort.model-start-bound.v2'
+            correlationId = $request.CorrelationId
+            entryId = $request.EntryId
+            plannedRunCount = $request.PlannedRunCount
+            modelStarts = $request.PlannedRunCount
+            verifierAssignments = $request.PlannedRunCount
+            wallClockSeconds = ($request.ChildTimeoutSeconds * $request.PlannedRunCount)
+        }
+    }
+    # A zero estimate is a budget that authorizes nothing and passes every check
+    # by being empty, which is the one way a bound can be wrong without anything
+    # noticing. Asserted rather than assumed, because both branches above compute
+    # it and only one of them is exercised by any given build.
+    foreach ($field in @('modelStarts', 'verifierAssignments', 'wallClockSeconds')) {
+        $value = $modelStartBound[$field]
+        if ($value -isnot [int] -or [int]$value -le 0) {
+            New-ReviewerCohortEntryRefusal -Code 'CE712' `
+                -Detail "The model start bound field '$field' is '$value'; a bound estimate is a positive 32-bit integer."
+        }
+    }
+    $estimatedModelStarts = [int]$modelStartBound['modelStarts']
+    $estimatedVerifierAssignments = [int]$modelStartBound['verifierAssignments']
+    $estimatedWallClockSeconds = [int]$modelStartBound['wallClockSeconds']
     [IO.File]::WriteAllBytes($modelStartBoundPath,
         $script:ReviewerCohortEntryUtf8.GetBytes((ConvertTo-AgentReplayCanonicalJson -Value $modelStartBound)))
     $modelStartBoundSha = (Get-FileHash -LiteralPath $modelStartBoundPath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -665,8 +727,8 @@ function New-ReviewerCohortEntryEvidence {
         -ConfigSha256 $configBinding.Sha256 -PromptSha256 $promptAssetSha -SchemaSha256 $stageSchemaSha `
         -ModelStartBoundPath (Join-Path $publishedEntryRoot 'model-start-bound.json') `
         -ModelStartBoundSha256 $modelStartBoundSha `
-        -EstimatedModelStarts $request.PlannedRunCount -EstimatedVerifierAssignments $request.PlannedRunCount `
-        -EstimatedWallClockSeconds ($request.ChildTimeoutSeconds * $request.PlannedRunCount)
+        -EstimatedModelStarts $estimatedModelStarts -EstimatedVerifierAssignments $estimatedVerifierAssignments `
+        -EstimatedWallClockSeconds $estimatedWallClockSeconds
     $entryPath = Join-Path $evidenceRoot 'cohort-entry.json'
     [IO.File]::WriteAllBytes($entryPath,
         $script:ReviewerCohortEntryUtf8.GetBytes((ConvertTo-AgentReplayCanonicalJson -Value $manifestEntry)))
@@ -695,6 +757,11 @@ function New-ReviewerCohortEntryEvidence {
         CoveragePercent = [int]$coverage.Percent
         CorpusIndexSha256 = $corpus.IndexSha256
         CoordinatorRequestSha256 = $coordinatorRequestSha
+        SchemaVersion = $request.SchemaVersion
+        DeclaredSlots = $(if ($null -ne $executionPlan) { @($executionPlan.Slots).Count } else { 0 })
+        ModelStartBoundKind = [string]$modelStartBound['kind']
+        EstimatedModelStarts = $estimatedModelStarts
+        EstimatedVerifierAssignments = $estimatedVerifierAssignments
         ModelStarts = 0
         ProviderWrites = 0
         PreflightState = $preflightState
@@ -785,9 +852,16 @@ function Invoke-ReviewerCohortEntryPreflight {
             $slotName = [string]$intent.slotName
             $setId = [string]$intent.setId
             $terminal = [string]$intent.expectedTerminalPath
-            if ($slotName -or $setId -or $terminal) {
+            # A SET ID ALONE IS NOT A LAUNCH. Once a run set is declared and
+            # verified, the coordinator labels every subsequent launch - including
+            # the read-only status child that confirms readiness - with the set it
+            # belongs to. Refusing on that would make -PreflightTarget runSetReady
+            # permanently unreachable and would report "launched slot '' of set X"
+            # for a child that started nothing. What names a run is a SLOT: a slot
+            # name, or the terminal artifact a slot is expected to publish.
+            if ($slotName -or $terminal) {
                 New-ReviewerCohortEntryRefusal -Code 'CE601' `
-                    -Detail "The preflight launched slot '$slotName' of set '$setId' in '$($intentFile.Name)'; a preparation-only run launches no slot."
+                    -Detail "The preflight launched slot '$slotName' of set '$setId' expecting '$terminal' in '$($intentFile.Name)'; a preparation-only run launches no slot."
             }
         }
     }
