@@ -31,6 +31,15 @@
     Skipped when absent, because the roots live outside the repository and only
     the machine that ran the pilot holds one.
 
+.PARAMETER FrozenSlotRoot
+    An optional real, already-frozen SLOT run root - the directory holding a
+    finished reviewer run's own `verification-previews` - read READ-ONLY and
+    accounted in assignments. Skipped when absent.
+
+.PARAMETER FrozenSlotExpectedAssignments
+    What that slot is expected to total. Zero means "whatever it totals", which
+    still proves the census reads it and that its breakdown adds up.
+
 .PARAMETER KeepSandbox
     Leave the sandbox in place for inspection after the run.
 #>
@@ -38,6 +47,8 @@
 param(
     [string]$RepoRoot = (Split-Path $PSScriptRoot -Parent),
     [string]$Pilot02Root = '',
+    [string]$FrozenSlotRoot = '',
+    [int]$FrozenSlotExpectedAssignments = 0,
     [switch]$KeepSandbox
 )
 
@@ -205,6 +216,177 @@ function New-CensusRunRoot {
         [IO.File]::WriteAllBytes(
             (Join-Path $previewDirectory 'preview-001.json'),
             ([Text.UTF8Encoding]::new($false)).GetBytes($envelope))
+    }
+    return [string]([IO.Path]::GetFullPath($Root))
+}
+
+function New-CensusAssignmentRoot {
+    <#
+    .SYNOPSIS
+        One reviewer run's sealed verification preview, written the way the
+        reviewed side writes it: assignments by identity, launches by nonce.
+
+    .DESCRIPTION
+        Deliberately separate from New-CensusRunRoot. That fixture is about the
+        cycle log the model start census reads; this one is about the sealed
+        preview the ASSIGNMENT census reads, and the two units are confused
+        often enough that sharing a fixture would invite writing one and
+        asserting the other.
+
+    .PARAMETER Cluster
+        One entry per cross-verifier cluster, each with a candidate count, the
+        reciprocal models required of every candidate in it, and the launch
+        nonces that served it. Assignments are candidates x models; processes
+        are the distinct nonces. Repeating a nonce models grouping; adding one
+        models a retry.
+
+    .PARAMETER RepublishPreview
+        Seal the same manifest a second time under another file name, which is
+        what a resumed phase does. The identities are unchanged, so the census
+        must not double-count them.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][AllowEmptyCollection()][array]$Cluster,
+        [bool]$WritePreviewDirectory = $true,
+        [bool]$RepublishPreview = $false,
+        [bool]$OmitAssignmentsKey = $false,
+        [bool]$BlankAssignmentId = $false,
+        [bool]$BlankVerifierModel = $false,
+        [bool]$TruncateEnvelope = $false,
+        [bool]$TamperManifestJson = $false,
+        [string]$Status = 'complete',
+        [bool]$EmergencySeal = $false,
+        [bool]$OmitDiagnostic = $false,
+        [bool]$NullAssignments = $false,
+        [bool]$NullAssignmentRow = $false,
+        [bool]$MalformedAssignmentId = $false,
+        [string]$AssignmentIdOverride = '',
+        [ValidateSet('', 'diagnostic', 'inputPath', 'digest')][string]$LossMarker = '',
+        [ValidateSet('', 'diagnostic', 'inputArtifactPath', 'inputManifestSha256')][string]$NullTupleField = '',
+        [bool]$NumericInputDigest = $false,
+        [string]$ConflictingRepublishModel = '',
+        [string]$RepublishNonceSuffix = ''
+    )
+    [void](New-Item -ItemType Directory -Force -Path $Root)
+    if (-not $WritePreviewDirectory) { return [string]([IO.Path]::GetFullPath($Root)) }
+    $previewDirectory = Join-Path $Root 'verification-previews'
+    [void](New-Item -ItemType Directory -Force -Path $previewDirectory)
+
+    $assignments = [System.Collections.Generic.List[object]]::new()
+    $runs = [System.Collections.Generic.List[object]]::new()
+    $clusterIndex = 0
+    foreach ($group in @($Cluster)) {
+        $clusterIndex++
+        for ($candidate = 1; $candidate -le [int]$group.Candidates; $candidate++) {
+            foreach ($model in @($group.Models)) {
+                # The identity the reviewed side mints: 'va1:' over a digest of
+                # the cluster, the candidate and the target model. Minted here
+                # for real so the fixture exercises the shape the census checks.
+                $identity = 'va1:' + [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+                        [Text.Encoding]::UTF8.GetBytes("cluster-$clusterIndex|candidate-$candidate|$model"))).ToLowerInvariant()
+                if ($MalformedAssignmentId) { $identity = 'va1:not-a-digest' }
+                if ($AssignmentIdOverride.Length -gt 0) { $identity = $AssignmentIdOverride }
+                $assignments.Add([ordered]@{
+                        assignmentId = [string]$(if ($BlankAssignmentId) { '' } else { $identity })
+                        verifierModel = [string]$(if ($BlankVerifierModel) { '' } else { $model })
+                        clusterId = "cluster-$clusterIndex"
+                    })
+            }
+        }
+        foreach ($nonce in @($group.Nonce)) {
+            $runs.Add([ordered]@{ nonceSha256 = [string]$nonce; clusterId = "cluster-$clusterIndex" })
+        }
+    }
+    # The record fields the census judges completeness on. The reviewed side's
+    # normal seal always carries a real input path and digest and an empty
+    # diagnostic; its evidence-loss writer is forced to publish the opposite
+    # tuple, and that - never the review's own 'degraded' conclusion - is what
+    # marks a pass as unmeasured.
+    $manifestBody = [ordered]@{ status = [string]$Status }
+    if (-not $OmitDiagnostic) {
+        $manifestBody['diagnostic'] = [string]$(if ($EmergencySeal -or $LossMarker -eq 'diagnostic') {
+                'the cross-verification pass faulted' } else { '' })
+    }
+    $manifestBody['inputArtifactPath'] = [string]$(if ($EmergencySeal -or $LossMarker -eq 'inputPath') { '' } else {
+            (Join-Path $Root 'verification-inputs\input.json') })
+    $manifestBody['inputManifestSha256'] = [string]$(if ($EmergencySeal -or $LossMarker -eq 'digest') { '0' * 64 } else {
+            [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+                [Text.Encoding]::UTF8.GetBytes($Root))).ToLowerInvariant() })
+    if ($NumericInputDigest) { $manifestBody['inputManifestSha256'] = 64 }
+    if ($NullTupleField.Length -gt 0) { $manifestBody[$NullTupleField] = $null }
+    if (-not $OmitAssignmentsKey) {
+        if ($NullAssignments) { $manifestBody['assignments'] = $null }
+        elseif ($NullAssignmentRow) {
+            $withNull = [System.Collections.Generic.List[object]]::new()
+            $withNull.Add(@($assignments)[0])
+            $withNull.Add($null)
+            $manifestBody['assignments'] = $withNull.ToArray()
+        }
+        else { $manifestBody['assignments'] = @($assignments) }
+    }
+    $manifestBody['verifierRuns'] = @($runs)
+    $manifestJson = ConvertTo-Json -InputObject ([pscustomobject]$manifestBody) -Depth 12 -Compress
+    if ($TamperManifestJson) { $manifestJson = '{"assignments": [' }
+    $envelope = ConvertTo-Json -InputObject ([ordered]@{
+            kind = 'reviewer.verification.preview.v1'
+            manifestJson = [string]$manifestJson
+            signature = ('0' * 64)
+        }) -Depth 8
+    if ($TruncateEnvelope) { $envelope = ([string]$envelope).Substring(0, 24) }
+    $encoding = [Text.UTF8Encoding]::new($false)
+    [IO.File]::WriteAllBytes((Join-Path $previewDirectory 'preview-001.json'), $encoding.GetBytes($envelope))
+    if ($RepublishPreview) {
+        $republished = $envelope
+        if ($RepublishNonceSuffix.Length -gt 0) {
+            # A second pass over the same candidates: identical assignment
+            # identities, freshly minted launch nonces. The identities dedupe and
+            # the nonces do not, which is why no ordering between the two totals
+            # can be required.
+            $freshRuns = [System.Collections.Generic.List[object]]::new()
+            foreach ($run in @($runs)) {
+                $freshRuns.Add([ordered]@{
+                        nonceSha256 = ([string]$run['nonceSha256'] + $RepublishNonceSuffix)
+                        clusterId = [string]$run['clusterId']
+                    })
+            }
+            $freshBody = [ordered]@{}
+            foreach ($key in @($manifestBody.Keys)) { $freshBody[$key] = $manifestBody[$key] }
+            $freshBody['verifierRuns'] = $freshRuns.ToArray()
+            $republished = ConvertTo-Json -InputObject ([ordered]@{
+                    kind = 'reviewer.verification.preview.v1'
+                    manifestJson = [string](ConvertTo-Json -InputObject ([pscustomobject]$freshBody) -Depth 12 -Compress)
+                    signature = ('0' * 64)
+                }) -Depth 8
+        }
+        [IO.File]::WriteAllBytes((Join-Path $previewDirectory 'preview-002.json'), $encoding.GetBytes($republished))
+    }
+    if ($ConflictingRepublishModel.Length -gt 0) {
+        # The same assignment identities, sealed a second time against a model
+        # they were not minted for. An identity is a digest over the model, so
+        # the two previews cannot both be describing the same run.
+        $conflicting = [System.Collections.Generic.List[object]]::new()
+        foreach ($row in @($assignments)) {
+            $conflicting.Add([ordered]@{
+                    assignmentId = [string]$row['assignmentId']
+                    verifierModel = [string]$ConflictingRepublishModel
+                    clusterId = [string]$row['clusterId']
+                })
+        }
+        $conflictJson = ConvertTo-Json -InputObject ([pscustomobject][ordered]@{
+                status = 'complete'
+                diagnostic = ''
+                inputArtifactPath = [string]$manifestBody['inputArtifactPath']
+                inputManifestSha256 = [string]$manifestBody['inputManifestSha256']
+                assignments = @($conflicting)
+                verifierRuns = @($runs)
+            }) -Depth 12 -Compress
+        $conflictEnvelope = ConvertTo-Json -InputObject ([ordered]@{
+                kind = 'reviewer.verification.preview.v1'
+                manifestJson = [string]$conflictJson
+                signature = ('0' * 64)
+            }) -Depth 8
+        [IO.File]::WriteAllBytes((Join-Path $previewDirectory 'preview-003.json'), $encoding.GetBytes($conflictEnvelope))
     }
     return [string]([IO.Path]::GetFullPath($Root))
 }
@@ -728,6 +910,351 @@ try {
         Assert-Census ($singleShotGuard -ge 0 -and $singleShotGuard -lt $firstIntent) `
             'The single-shot acquisition refusal no longer precedes the launch intent, so a refused second launch would be charged.'
     }
+
+    # -- 27. The verifier ceiling is spent in assignments, not in the states a
+    # run reached ------------------------------------------------------------
+    # The defect this section exists for. A cohort's verifier ceiling used to be
+    # compared against a count of committed verifier-backed terminal transitions
+    # - a list with eight members - while the run behind it stood on forty real
+    # reciprocal assignments. The census below reads the assignments themselves,
+    # off the same sealed previews the run signed.
+    Write-Host ''
+    Write-Host '27. Forty assignments across two required models are forty, not four' -ForegroundColor Cyan
+    $assignRoot = New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\forty') -Cluster @(
+        @{ Candidates = 10; Models = @('verifier-alpha', 'verifier-beta'); Nonce = @('n1', 'n2') },
+        @{ Candidates = 10; Models = @('verifier-alpha', 'verifier-beta'); Nonce = @('n3', 'n4') })
+    $assignCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $assignRoot -Argv $verifyingArgv
+    Assert-Census ([int]$assignCensus.realVerifierAssignments -eq 40) `
+        "Forty sealed assignments were counted as $($assignCensus.realVerifierAssignments)."
+    Assert-Census ([bool]$assignCensus.complete) 'A run whose previews are all readable reported an incomplete assignment census.'
+    Assert-Census (@($assignCensus.byVerifierModel).Count -eq 2) `
+        'The census did not break forty assignments down by the two reciprocal models that were required.'
+    Assert-Census (((@($assignCensus.byVerifierModel) | Measure-Object -Property assignmentCount -Sum).Sum ?? 0) -eq 40) `
+        'The per-model breakdown does not account for the total it is published beside.'
+    # Grouping is the whole reason the two numbers are published separately: four
+    # launches served all forty assignments, and neither figure may be derived
+    # from the other.
+    Assert-Census ([int]$assignCensus.verifierProcessStarts -eq 4) `
+        "Four grouped launches were counted as $($assignCensus.verifierProcessStarts) verifier processes."
+
+    Write-Host ''
+    Write-Host '28. A retried assignment is the same assignment, and a regrouped one is not' -ForegroundColor Cyan
+    # The assignment identity is candidate x required model. A launch that was
+    # retried serves the same assignments again under a new nonce: the assignment
+    # total is unchanged and the process total rises.
+    $retryRoot = New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\retry') -Cluster @(
+        @{ Candidates = 3; Models = @('verifier-alpha', 'verifier-beta'); Nonce = @('r1', 'r2', 'r3') })
+    $retryCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $retryRoot -Argv $verifyingArgv
+    Assert-Census ([int]$retryCensus.realVerifierAssignments -eq 6) `
+        "Three candidates against two required models is six assignments; the census said $($retryCensus.realVerifierAssignments)."
+    Assert-Census ([int]$retryCensus.verifierProcessStarts -eq 3) `
+        "A retried group is another process; the census said $($retryCensus.verifierProcessStarts)."
+    # The same assignment appearing in two previews - which is what a resumed
+    # phase republishes - is one assignment, because the identity is the record.
+    $dupRoot = New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\dup') -Cluster @(
+        @{ Candidates = 2; Models = @('verifier-alpha'); Nonce = @('d1') }) -RepublishPreview $true
+    $dupCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $dupRoot -Argv $verifyingArgv
+    Assert-Census ([int]$dupCensus.realVerifierAssignments -eq 2) `
+        "A republished preview double-counted its assignments as $($dupCensus.realVerifierAssignments); expected 2."
+
+    Write-Host ''
+    Write-Host '29. Nothing to verify is a reading; nothing published is not' -ForegroundColor Cyan
+    $emptyRoot = New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\empty') -Cluster @()
+    $emptyCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $emptyRoot -Argv $verifyingArgv
+    Assert-Census ([int]$emptyCensus.realVerifierAssignments -eq 0 -and [bool]$emptyCensus.complete) `
+        'A run whose sealed preview listed no assignments was not accounted at a complete zero.'
+    # An authorized verification that published no preview directory at all is
+    # incomplete rather than zero: the difference is a run that had nothing to do
+    # against a run whose evidence is missing.
+    $noneRoot = New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\none') -Cluster @() -WritePreviewDirectory $false
+    $noneCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $noneRoot -Argv $verifyingArgv
+    Assert-Census (-not [bool]$noneCensus.complete) `
+        'An authorized verification that published no previews at all reported a complete census.'
+    # A run that never authorized cross-verification is a complete zero, not a
+    # gap. A specialist-only run is exactly that shape.
+    $specialistOnly = Get-ReviewerVerifierAssignmentCensus -RunRoot $noneRoot -Argv @('-Model', 'a', '-EnableConventionSpecialist')
+    Assert-Census ([int]$specialistOnly.realVerifierAssignments -eq 0 -and [bool]$specialistOnly.complete) `
+        'A run that never enabled cross-verification was charged an unmeasured verifier gap.'
+
+    Write-Host ''
+    Write-Host '30. Evidence that cannot be trusted is a refusal, not a smaller number' -ForegroundColor Cyan
+    $refusals = @(
+        @{ Name = 'a preview with no assignments array'
+            Root = (New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\no-array') -Cluster @() -OmitAssignmentsKey $true) },
+        @{ Name = 'an assignment with no identity'
+            Root = (New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\no-id') -Cluster @(
+                    @{ Candidates = 1; Models = @('verifier-alpha'); Nonce = @('x1') }) -BlankAssignmentId $true) },
+        @{ Name = 'an assignment that names no verifier model'
+            Root = (New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\no-model') -Cluster @(
+                    @{ Candidates = 1; Models = @('verifier-alpha'); Nonce = @('x1') }) -BlankVerifierModel $true) },
+        @{ Name = 'a preview whose seal cannot be parsed'
+            Root = (New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\torn') -Cluster @(
+                    @{ Candidates = 1; Models = @('verifier-alpha'); Nonce = @('x1') }) -TruncateEnvelope $true) },
+        @{ Name = 'a preview whose sealed manifest was edited into nonsense'
+            Root = (New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\tamper') -Cluster @(
+                    @{ Candidates = 1; Models = @('verifier-alpha'); Nonce = @('x1') }) -TamperManifestJson $true) }
+    )
+    foreach ($refusal in $refusals) {
+        $message = Get-CensusRefusal { Get-ReviewerVerifierAssignmentCensus -RunRoot ([string]$refusal.Root) -Argv $verifyingArgv }
+        Assert-Census ($message -ne '') "Reading $($refusal.Name) returned a number instead of refusing."
+    }
+    $missingRoot = Get-CensusRefusal { Get-ReviewerVerifierAssignmentCensus -RunRoot (Join-Path $sandbox 'assign\does-not-exist') -Argv $verifyingArgv }
+    Assert-Census ($missingRoot -ne '') 'A run root that does not exist was accounted at zero assignments.'
+
+    Write-Host ''
+    Write-Host '31. The assignment bound is the plan''s own cap, read from the shipping runner' -ForegroundColor Cyan
+    $assignBound = Get-ReviewerVerifierAssignmentBound -Argv $verifyingArgv -ReviewerScriptPath $reviewerScript
+    $modelBound = Get-ReviewerModelStartBound -Argv $verifyingArgv -ReviewerScriptPath $reviewerScript
+    Assert-Census ([int]$assignBound.maxVerifierAssignments -gt 0) `
+        'The assignment bound for an authorized verification is zero, so no ceiling derived from it could ever be crossed.'
+    Assert-Census ([int]$assignBound.maxVerifierAssignments -eq [int]$modelBound.runnerBounds.maxVerifierLaunches) `
+        ("The assignment bound is $($assignBound.maxVerifierAssignments) against a runner cap of " +
+            "$($modelBound.runnerBounds.maxVerifierLaunches); the runner's cap IS the per-run assignment cap and must not be restated.")
+    # Two slots is twice one slot, which is the arithmetic a cohort preflight
+    # does - and it is the shipping bound writer, not this test, that has to do
+    # it. Read back from the artifact New-ShadowModelStartBound seals so a change
+    # to the runner cap moves the plan, the artifact and this expectation
+    # together.
+    $twoSlotBoundRoot = Join-Path $sandbox 'assign\two-slot-bound'
+    [void](New-Item -ItemType Directory -Path $twoSlotBoundRoot -Force)
+    $boundConfigPath = Join-Path $twoSlotBoundRoot 'reviewer.json'
+    $boundConfig = [ordered]@{
+        review = [ordered]@{
+            targetRefName = 'refs/heads/main'
+            verification = [ordered]@{ enabled = $true }
+        }
+    }
+    [IO.File]::WriteAllText($boundConfigPath, ($boundConfig | ConvertTo-Json -Depth 8 -Compress), [Text.UTF8Encoding]::new($false))
+    $boundConfigSha = [Convert]::ToHexString(
+        [Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($boundConfigPath))).ToLowerInvariant()
+    $boundRequestPath = Join-Path $twoSlotBoundRoot 'request.json'
+    $boundRequest = [ordered]@{
+        kind = 'shadow-run-preparation'
+        contractVersion = 'devpilot.shadow-run-coordinator.request.v1'
+        toolkit = [ordered]@{ repositoryRoot = $repo; head = ('0' * 40) }
+        qualification = [ordered]@{ reviewerConfigPath = $boundConfigPath; plannedRunCount = 2 }
+        digests = [ordered]@{ configSha256 = $boundConfigSha }
+        slots = [ordered]@{
+            shadowSlotsEnabled = $true
+            declared = @(
+                [ordered]@{ name = 'slot1'; reviewerScriptPath = $reviewerScript },
+                [ordered]@{ name = 'slot2'; reviewerScriptPath = $reviewerScript })
+        }
+    }
+    [IO.File]::WriteAllText($boundRequestPath, ($boundRequest | ConvertTo-Json -Depth 12 -Compress), [Text.UTF8Encoding]::new($false))
+    $twoSlotBoundPath = Join-Path $twoSlotBoundRoot 'bound.json'
+    $boundWriter = Join-Path $repo 'tools\New-ShadowModelStartBound.ps1'
+    & $boundWriter -RequestPath $boundRequestPath -OutputPath $twoSlotBoundPath -Force
+    Assert-Census ($LASTEXITCODE -eq 0) "The shipping bound writer refused a two-slot request (exit $LASTEXITCODE)."
+    $twoSlotBound = [IO.File]::ReadAllText($twoSlotBoundPath, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json -Depth 32
+    $perSlotSealed = [int]$twoSlotBound.slots[0].maxVerifierAssignments
+    Assert-Census ([int]$twoSlotBound.maxVerifierAssignments -eq ($perSlotSealed * 2)) `
+        ("The sealed two-slot bound is $($twoSlotBound.maxVerifierAssignments) against a per-slot cap of " +
+            "$perSlotSealed; a cohort ceiling proved from it would not cover both slots.")
+    Assert-Census ($perSlotSealed -eq [int]$assignBound.maxVerifierAssignments) `
+        ("The bound writer sealed $perSlotSealed assignment(s) for a slot the census bounds at " +
+            "$($assignBound.maxVerifierAssignments); the plan a cohort proves and the plan a run is given have drifted apart.")
+    $quietBound = Get-ReviewerVerifierAssignmentBound -Argv $quietArgv -ReviewerScriptPath $reviewerScript
+    Assert-Census ([int]$quietBound.maxVerifierAssignments -eq 0) `
+        'A run that never authorized cross-verification was bounded above zero assignments.'
+
+    Write-Host ''
+    Write-Host '32. An interrupted verification is charged what its plan could still have spent' -ForegroundColor Cyan
+    $allowanceComplete = Get-ReviewerVerifierAssignmentUnmeasuredAllowance -Argv $verifyingArgv `
+        -ReviewerScriptPath $reviewerScript -RunEndedComplete $true -Census $assignCensus
+    Assert-Census ([int]$allowanceComplete -eq 0) `
+        "A complete run with a complete census was charged an allowance of $allowanceComplete."
+    $allowanceKilled = Get-ReviewerVerifierAssignmentUnmeasuredAllowance -Argv $verifyingArgv `
+        -ReviewerScriptPath $reviewerScript -RunEndedComplete $false -Census $assignCensus
+    Assert-Census ([int]$allowanceKilled -eq ([int]$assignBound.maxVerifierAssignments - 40)) `
+        "A killed run was charged $allowanceKilled unmeasured assignments; expected its plan's remainder."
+    $allowanceBlind = Get-ReviewerVerifierAssignmentUnmeasuredAllowance -Argv $verifyingArgv `
+        -ReviewerScriptPath $reviewerScript -RunEndedComplete $false -Census $null
+    Assert-Census ([int]$allowanceBlind -eq [int]$assignBound.maxVerifierAssignments) `
+        'A run whose evidence could not be read at all was charged less than its whole plan.'
+    $allowanceQuiet = Get-ReviewerVerifierAssignmentUnmeasuredAllowance -Argv $quietArgv `
+        -ReviewerScriptPath $reviewerScript -RunEndedComplete $false -Census $null
+    Assert-Census ([int]$allowanceQuiet -eq 0) `
+        'A run that never authorized cross-verification was charged an unmeasured verifier allowance anyway.'
+
+    Write-Host ''
+    Write-Host '33. A frozen real run is accounted in assignments, read-only' -ForegroundColor Cyan
+    # The roots below belong to operators' machines. Each is read without being
+    # written, and the scenario is skipped rather than failed when one is absent.
+    $frozenRoots = @($FrozenSlotRoot) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) }
+    if (@($frozenRoots).Count -lt 1) {
+        Write-Host '  SKIP - no frozen slot root was given.' -ForegroundColor DarkGray
+    }
+    else {
+        foreach ($frozenSlot in @($frozenRoots)) {
+            $frozenCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $frozenSlot -Argv @('-EnableVerificationPreview')
+            Assert-Census ([int]$frozenCensus.realVerifierAssignments -gt 0) `
+                "The frozen slot '$frozenSlot' sealed a real verification and was accounted at zero assignments."
+            Assert-Census ((((@($frozenCensus.byVerifierModel) | Measure-Object -Property assignmentCount -Sum).Sum ?? 0)) -eq
+                [int]$frozenCensus.realVerifierAssignments) `
+                "The frozen slot '$frozenSlot' breaks its assignments down into a total it does not have."
+            Assert-Census ([bool]$frozenCensus.complete) `
+                "The frozen slot '$frozenSlot' sealed a real verification and was read as unmeasured."
+            if ($FrozenSlotExpectedAssignments -gt 0) {
+                Assert-Census ([int]$frozenCensus.realVerifierAssignments -eq $FrozenSlotExpectedAssignments) `
+                    ("The frozen slot '$frozenSlot' totalled $($frozenCensus.realVerifierAssignments) assignments; " +
+                        "expected $FrozenSlotExpectedAssignments.")
+            }
+            Write-Host ("  {0}: {1} assignment(s), {2} process start(s)" -f
+                (Split-Path $frozenSlot -Leaf), $frozenCensus.realVerifierAssignments, $frozenCensus.verifierProcessStarts) -ForegroundColor DarkGray
+        }
+    }
+
+    Write-Host ''
+    Write-Host '34. A verification that lost its evidence is unmeasured, never a measured zero' -ForegroundColor Cyan
+    # The failure this whole change exists to prevent, in its most dangerous
+    # shape. The reviewed side creates the preview directory before any review
+    # work happens and, when cross-verification faults, seals a preview carrying
+    # an empty assignment list and returns normally - so the run still ends
+    # cleanly. A census that judged completeness on the directory, or on the
+    # file, would publish a confident zero for a run that may have stood on its
+    # whole plan.
+    $lostRoot = New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\evidence-lost') -EmergencySeal $true -Cluster @()
+    $lostCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $lostRoot -Argv $verifyingArgv
+    Assert-Census ([int]$lostCensus.realVerifierAssignments -eq 0) `
+        'A preview that sealed no assignments was read as though it carried some.'
+    Assert-Census (-not [bool]$lostCensus.complete) `
+        'A run whose cross-verification lost its evidence was accounted as a complete census of zero.'
+    Assert-Census ([string]$lostCensus.incompleteReason -ne '') `
+        'An incomplete assignment census named no reason for being incomplete.'
+    $lostAllowance = Get-ReviewerVerifierAssignmentUnmeasuredAllowance -Argv $verifyingArgv `
+        -ReviewerScriptPath $reviewerScript -RunEndedComplete $true -Census $lostCensus
+    Assert-Census ([int]$lostAllowance -eq [int]$assignBound.maxVerifierAssignments) `
+        ("A run that ended cleanly having lost its verification evidence was charged $lostAllowance unmeasured " +
+            'assignment(s); the whole of its plan is unproven and must be charged however the run ended.')
+    # The inverse, and the one that matters just as much. A review can conclude
+    # 'degraded' for four ordinary reasons - one verifier invocation that timed
+    # out, a degraded specialist, a degraded convention plan, a withheld
+    # authoritative source - and in every one of them the FULL assignment list is
+    # still sealed. Reading that word as lost evidence would stop a whole cohort
+    # on a run that measured perfectly.
+    $degradedFullRoot = New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\degraded-full') -Status 'degraded' -Cluster @(
+        @{ Candidates = 4; Models = @('verifier-alpha', 'verifier-beta'); Nonce = @('n1', 'n2') })
+    $degradedFullCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $degradedFullRoot -Argv $verifyingArgv
+    Assert-Census ([int]$degradedFullCensus.realVerifierAssignments -eq 8) `
+        ("A degraded review that sealed all eight assignments was counted at " +
+            "$($degradedFullCensus.realVerifierAssignments).")
+    Assert-Census ([bool]$degradedFullCensus.complete) `
+        'A review that concluded degraded while sealing its whole assignment set was called unmeasured, which would stop a cohort on an ordinary run.'
+    $degradedFullAllowance = Get-ReviewerVerifierAssignmentUnmeasuredAllowance -Argv $verifyingArgv `
+        -ReviewerScriptPath $reviewerScript -RunEndedComplete $true -Census $degradedFullCensus
+    Assert-Census ([int]$degradedFullAllowance -eq 0) `
+        "A fully measured degraded run was charged $degradedFullAllowance unmeasured assignment(s)."
+    # One good pass does not cover a lost one. Completeness is a property of
+    # every pass the run sealed, not of the best one.
+    $mixedRoot = New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\mixed') -Cluster @(
+        @{ Candidates = 2; Models = @('verifier-alpha'); Nonce = @('n1') })
+    $mixedLost = New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\mixed-lost') -EmergencySeal $true -Cluster @()
+    Copy-Item -LiteralPath (Join-Path $mixedLost 'verification-previews\preview-001.json') `
+        -Destination (Join-Path $mixedRoot 'verification-previews\preview-009.json')
+    $mixedCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $mixedRoot -Argv $verifyingArgv
+    Assert-Census ([int]$mixedCensus.realVerifierAssignments -eq 2) `
+        'The surviving pass of a mixed run was not counted.'
+    Assert-Census (-not [bool]$mixedCensus.complete) `
+        'A run that sealed one good pass and lost another was called complete, so the lost pass would be scored as zero.'
+    $mixedAllowance = Get-ReviewerVerifierAssignmentUnmeasuredAllowance -Argv $verifyingArgv `
+        -ReviewerScriptPath $reviewerScript -RunEndedComplete $true -Census $mixedCensus
+    Assert-Census ([int]$mixedAllowance -eq ([int]$assignBound.maxVerifierAssignments - 2)) `
+        "A mixed run was charged $mixedAllowance unmeasured assignment(s); expected its plan's remainder above what survived."
+    # Each marker of the loss tuple stands alone. The evidence-loss writer
+    # publishes all three together, so a fixture that only ever sets all three
+    # would pass an implementation that demanded all three - and that
+    # implementation would score a partially written record as a measured zero.
+    foreach ($marker in @('diagnostic', 'inputPath', 'digest')) {
+        $markerRoot = New-CensusAssignmentRoot -Root (Join-Path $sandbox "assign\marker-$marker") -LossMarker $marker -Cluster @(
+            @{ Candidates = 1; Models = @('verifier-alpha'); Nonce = @('n1') })
+        $markerCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $markerRoot -Argv $verifyingArgv
+        Assert-Census (-not [bool]$markerCensus.complete) `
+            "A preview carrying only the '$marker' marker of a lost cross-verification was accounted as fully measured."
+    }
+    # An empty preview directory witnesses nothing either: it exists before the
+    # phase runs.
+    $emptyDirRoot = Join-Path $sandbox 'assign\empty-directory'
+    [void](New-Item -ItemType Directory -Force -Path (Join-Path $emptyDirRoot 'verification-previews'))
+    $emptyDirCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $emptyDirRoot -Argv $verifyingArgv
+    Assert-Census (-not [bool]$emptyDirCensus.complete) `
+        'An authorized run whose preview directory was created and never filled was accounted as a complete zero.'
+    # And a run that never authorized verification is still measured at zero,
+    # because the sealed vector proves it could stand on nothing.
+    $quietEmpty = Get-ReviewerVerifierAssignmentCensus -RunRoot $emptyDirRoot -Argv $quietArgv
+    Assert-Census ([bool]$quietEmpty.complete) `
+        'A run that never authorized cross-verification was called unmeasured for publishing no preview.'
+
+    Write-Host ''
+    Write-Host '35. An assignment set this build cannot read exactly is refused, not rounded' -ForegroundColor Cyan
+    $rowRefusals = @(
+        @{ Name = 'a preview publishing a null assignment list'
+            Root = (New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\null-list') -NullAssignments $true -Cluster @(
+                    @{ Candidates = 1; Models = @('verifier-alpha'); Nonce = @('n1') })) },
+        @{ Name = 'a preview carrying a null row among its assignments'
+            Root = (New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\null-row') -NullAssignmentRow $true -Cluster @(
+                    @{ Candidates = 2; Models = @('verifier-alpha'); Nonce = @('n1') })) },
+        @{ Name = 'the same assignment identity sealed against two different verifier models'
+            Root = (New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\conflict') -ConflictingRepublishModel 'verifier-omega' -Cluster @(
+                    @{ Candidates = 2; Models = @('verifier-alpha'); Nonce = @('n1') })) },
+        @{ Name = 'an assignment identity that is not the shape the reviewed side mints'
+            Root = (New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\malformed-id') -MalformedAssignmentId $true -Cluster @(
+                    @{ Candidates = 1; Models = @('verifier-alpha'); Nonce = @('n1') })) },
+        @{ Name = 'a preview that publishes no diagnostic at all'
+            Root = (New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\no-diagnostic') -OmitDiagnostic $true -Cluster @(
+                    @{ Candidates = 1; Models = @('verifier-alpha'); Nonce = @('n1') })) },
+        @{ Name = 'a single pass recording more distinct launches than assignment rows'
+            Root = (New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\over-launched') -Cluster @(
+                    @{ Candidates = 1; Models = @('verifier-alpha'); Nonce = @('n1', 'n2', 'n3') })) },
+        @{ Name = 'an assignment identity carrying uppercase hex'
+            Root = (New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\id-upper') `
+                    -AssignmentIdOverride ('va1:' + ('A' * 64)) -Cluster @(
+                    @{ Candidates = 1; Models = @('verifier-alpha'); Nonce = @('n1') })) },
+        @{ Name = 'an assignment identity one hex digit short'
+            Root = (New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\id-short') `
+                    -AssignmentIdOverride ('va1:' + ('a' * 63)) -Cluster @(
+                    @{ Candidates = 1; Models = @('verifier-alpha'); Nonce = @('n1') })) },
+        @{ Name = 'an assignment identity one hex digit long'
+            Root = (New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\id-long') `
+                    -AssignmentIdOverride ('va1:' + ('a' * 65)) -Cluster @(
+                    @{ Candidates = 1; Models = @('verifier-alpha'); Nonce = @('n1') })) },
+        @{ Name = 'a preview whose input manifest digest is a number rather than a digest'
+            Root = (New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\digest-numeric') -NumericInputDigest $true -Cluster @(
+                    @{ Candidates = 1; Models = @('verifier-alpha'); Nonce = @('n1') })) },
+        @{ Name = 'a preview publishing a null diagnostic'
+            Root = (New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\null-diagnostic') -NullTupleField 'diagnostic' -Cluster @(
+                    @{ Candidates = 1; Models = @('verifier-alpha'); Nonce = @('n1') })) },
+        @{ Name = 'a preview publishing a null input artifact path'
+            Root = (New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\null-input-path') -NullTupleField 'inputArtifactPath' -Cluster @(
+                    @{ Candidates = 1; Models = @('verifier-alpha'); Nonce = @('n1') })) },
+        @{ Name = 'a preview publishing a null input manifest digest'
+            Root = (New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\null-input-digest') -NullTupleField 'inputManifestSha256' -Cluster @(
+                    @{ Candidates = 1; Models = @('verifier-alpha'); Nonce = @('n1') })) }
+    )
+    foreach ($refusal in $rowRefusals) {
+        $message = Get-CensusRefusal { Get-ReviewerVerifierAssignmentCensus -RunRoot ([string]$refusal.Root) -Argv $verifyingArgv }
+        Assert-Census ($message -ne '') "Reading $($refusal.Name) returned a number instead of refusing."
+    }
+    # The same identity sealed twice against the SAME model is a resumed phase
+    # republishing its own work, and stays a single assignment.
+    $sameModelTwice = New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\republish-same') -RepublishPreview $true -Cluster @(
+        @{ Candidates = 3; Models = @('verifier-alpha', 'verifier-beta'); Nonce = @('n1') })
+    $sameModelCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $sameModelTwice -Argv $verifyingArgv
+    Assert-Census ([int]$sameModelCensus.realVerifierAssignments -eq 6) `
+        "A republished preview counted $($sameModelCensus.realVerifierAssignments) assignments where six identities exist."
+    # And a genuine second pass over the same candidates mints fresh launch
+    # nonces while the identities dedupe, so the run's totals legitimately carry
+    # more launches than assignments. No ordering between the two may be
+    # required of a run root.
+    $reverified = New-CensusAssignmentRoot -Root (Join-Path $sandbox 'assign\reverified') -RepublishPreview $true `
+        -RepublishNonceSuffix 'x' -Cluster @(@{ Candidates = 1; Models = @('verifier-alpha'); Nonce = @('n1') })
+    $reverifiedCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $reverified -Argv $verifyingArgv
+    Assert-Census ([int]$reverifiedCensus.realVerifierAssignments -eq 1) `
+        "A re-verified candidate counted $($reverifiedCensus.realVerifierAssignments) assignments where one identity exists."
+    Assert-Census ([int]$reverifiedCensus.verifierProcessStarts -eq 2) `
+        "A re-verified candidate counted $($reverifiedCensus.verifierProcessStarts) launches where two nonces were minted."
+    Assert-Census ([bool]$reverifiedCensus.complete) `
+        'A legitimate second verification pass was refused or read as unmeasured.'
 }
 finally {
     if (-not $KeepSandbox -and (Test-Path -LiteralPath $sandbox)) {

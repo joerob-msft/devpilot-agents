@@ -297,6 +297,297 @@ function Get-ReviewerVerifierLaunchNonce {
     }
 }
 
+function Get-ReviewerVerifierAssignmentCensus {
+    <#
+    .SYNOPSIS
+        The cross-verifier ASSIGNMENTS one reviewer run actually stood on, by
+        verifier model.
+
+    .DESCRIPTION
+        A second census, of a second unit, kept beside the model-start census
+        because the two are routinely confused and must never again be added to
+        each other.
+
+        WHAT AN ASSIGNMENT IS. The verification contract's own identity: one
+        candidate paired with one required reciprocal verifier model. The
+        reviewed side mints it as 'assignmentId' - a digest over the cluster, the
+        candidate hash and the target model - and requires exactly one assignment
+        per candidate per required model. So a run with eleven ready candidates
+        and two required models has twenty-two assignments, whatever the number
+        of processes that then served them.
+
+        WHY IT IS NOT A COUNT OF PROCESSES. Assignments are GROUPED: one launch
+        can serve every candidate in its cluster. Counting processes therefore
+        under-reports the work a verification phase was asked to do, and counting
+        terminal states - which is what the defect this replaces did - reports a
+        number bounded by the number of states the walk has, so forty assignments
+        and four assignments both came out as four. The grouped process starts
+        are still counted here, separately and by a name that says what they are,
+        because they are a useful diagnostic and a useless budget.
+
+        WHAT IS READ. The run's own sealed verification previews, and only their
+        'assignments' arrays. Distinct assignment ids across every preview, so a
+        run that seals more than one preview - a retry that re-seals, a phase
+        that seals in parts - is counted once per distinct assignment rather than
+        once per appearance. Nothing here reads a decision, a verdict, a severity
+        or any candidate text; the verifier model names are carried as opaque
+        strings for the breakdown and are compared to no list.
+
+        WHAT IS REFUSED. A preview that cannot be read, carries no manifest,
+        publishes no 'assignments', or carries an assignment without an id or
+        without a verifier model. None of those is a zero: a run whose evidence
+        cannot be read has an unknown assignment count, and the caller must stop
+        rather than budget against it.
+
+    .PARAMETER RunRoot
+        The run's own directory - '<slot state dir>/replay/<snapshot name>'.
+
+    .PARAMETER Argv
+        The sealed argument vector, which says whether the run was authorized to
+        verify at all. A run never authorized is complete with zero; a run
+        authorized that left no preview is incomplete.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$RunRoot,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Argv
+    )
+    if (-not (Test-Path -LiteralPath $RunRoot -PathType Container)) {
+        throw ("The run root '$RunRoot' does not exist, so the verifier assignments made under it cannot be counted. " +
+            'A missing run root is refused rather than counted as a run that verified nothing.')
+    }
+    $verificationEnabled = Test-ReviewerModelStartArgvSwitch -Argv @($Argv) -Name '-EnableVerificationPreview'
+    $directory = Join-Path $RunRoot 'verification-previews'
+    $evidencePresent = [bool](Test-Path -LiteralPath $directory -PathType Container)
+    $ids = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $nonces = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $byModel = [System.Collections.Generic.Dictionary[string, int]]::new([StringComparer]::Ordinal)
+    # Which verifier model each identity was minted against. An identity is a
+    # digest over the cluster, the candidate and the model, so the same id under
+    # two models cannot both be true and one of the two previews is wrong about
+    # what was assigned.
+    $idModel = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+    $previewCount = 0
+    $evidenceLostPreviewCount = 0
+    if ($evidencePresent) {
+        $previews = @(Get-ChildItem -LiteralPath $directory -Filter '*.json' -File -ErrorAction SilentlyContinue |
+                Sort-Object -Property Name | ForEach-Object { [string]$_.FullName })
+        $previewCount = [int]@($previews).Count
+        foreach ($path in @($previews)) {
+            $envelope = $null
+            try {
+                $envelope = [IO.File]::ReadAllText($path, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json -Depth 64
+            }
+            catch {
+                throw ("The sealed verification preview '$path' could not be read: $($_.Exception.Message) " +
+                    'The verifier assignments of a run whose preview cannot be read are not counted as none.')
+            }
+            if ($null -eq $envelope -or -not $envelope.PSObject.Properties['manifestJson']) {
+                throw "The sealed verification preview '$path' carries no manifest, so its verifier assignments cannot be counted."
+            }
+            $manifest = $null
+            try {
+                $manifest = [string]$envelope.manifestJson | ConvertFrom-Json -Depth 64
+            }
+            catch {
+                throw "The sealed verification preview '$path' carries a manifest this build cannot parse."
+            }
+            if ($null -eq $manifest -or -not $manifest.PSObject.Properties['assignments']) {
+                throw ("The sealed verification preview '$path' publishes no 'assignments', so the verifier work it " +
+                    'stands on cannot be counted.')
+            }
+            if ($null -eq $manifest.assignments) {
+                throw ("The sealed verification preview '$path' publishes a null 'assignments', which is not the same as " +
+                    'a run that was assigned nothing and is not counted as one.')
+            }
+            # Whether this preview is a complete record of what the phase was
+            # assigned, judged on the RECORD and never on the review's own
+            # conclusion. The seal reports 'degraded' for four ordinary reasons -
+            # a verifier invocation that timed out, a degraded specialist, a
+            # degraded convention plan, a withheld authoritative source - and in
+            # every one of them the full assignment list is still sealed. Reading
+            # that word as lost evidence would stop a whole cohort on a run that
+            # measured perfectly.
+            #
+            # What does distinguish the reviewed side's evidence-loss writer is
+            # the tuple it is forced to pass: a non-empty diagnostic, an empty
+            # input artifact path and an all-zero input manifest digest. It is
+            # the only caller that can produce any of the three, and it is the
+            # one that seals an EMPTY assignment list and lets the run end
+            # normally.
+            foreach ($required in @('diagnostic', 'inputArtifactPath', 'inputManifestSha256')) {
+                if (-not $manifest.PSObject.Properties[$required] -or $null -eq $manifest.$required) {
+                    throw ("The sealed verification preview '$path' publishes no '$required', so this build cannot tell a " +
+                        'complete record of what the phase was assigned from one that lost it.')
+                }
+            }
+            $previewDiagnostic = [string]$manifest.diagnostic
+            $previewInputPath = [string]$manifest.inputArtifactPath
+            $previewInputDigest = [string]$manifest.inputManifestSha256
+            if ($previewInputDigest -cnotmatch '^[0-9a-f]{64}$') {
+                throw ("The sealed verification preview '$path' carries an input manifest digest that is not a lowercase " +
+                    'SHA-256, so the record it stands on cannot be identified.')
+            }
+            if ($previewDiagnostic.Length -gt 0 -or $previewInputPath.Length -eq 0 -or
+                $previewInputDigest -ceq ('0' * 64)) {
+                $evidenceLostPreviewCount++
+            }
+            $previewAssignmentRowCount = 0
+            $previewNonces = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            foreach ($assignment in @($manifest.assignments)) {
+                if ($null -eq $assignment) {
+                    throw ("The sealed verification preview '$path' carries a null entry among its assignments, so the " +
+                        'set it publishes cannot be told apart from a shorter one.')
+                }
+                if (-not $assignment.PSObject.Properties['assignmentId']) {
+                    throw ("A verifier assignment in '$path' carries no 'assignmentId', so it cannot be told apart " +
+                        'from any other and the run''s assignment count is unknown.')
+                }
+                if (-not $assignment.PSObject.Properties['verifierModel']) {
+                    throw ("A verifier assignment in '$path' names no 'verifierModel', so the reciprocal breakdown " +
+                        'this census publishes cannot be taken over it.')
+                }
+                $id = [string]$assignment.assignmentId
+                if ($id.Length -eq 0) {
+                    throw "A verifier assignment in '$path' carries an empty 'assignmentId'."
+                }
+                if ($id -cnotmatch '^va1:[0-9a-f]{64}$') {
+                    throw ("A verifier assignment in '$path' carries the identity '$id', which is not the " +
+                        'digest-over-cluster-candidate-and-model shape the reviewed side mints. A census cannot count ' +
+                        'identities it cannot recognise.')
+                }
+                $model = [string]$assignment.verifierModel
+                if ($model.Length -eq 0) {
+                    throw "A verifier assignment in '$path' names an empty 'verifierModel'."
+                }
+                # Counted per row, before the cross-preview dedupe, because this
+                # is what THIS pass published and it is what this pass's launches
+                # are measured against.
+                $previewAssignmentRowCount++
+                if ($idModel.ContainsKey($id)) {
+                    if ([string]$idModel[$id] -cne $model) {
+                        throw ("The assignment '$id' is published in '$path' against verifier model '$model' and elsewhere " +
+                            "against '$([string]$idModel[$id])'. An assignment identity is a digest over the model it names, " +
+                            'so the two cannot both be true and the run''s assignment set is unknown.')
+                    }
+                    continue
+                }
+                $idModel[$id] = $model
+                [void]$ids.Add($id)
+                if ($byModel.ContainsKey($model)) { $byModel[$model] = [int]$byModel[$model] + 1 }
+                else { $byModel[$model] = 1 }
+            }
+            # The grouped launches the same previews record, kept apart. One
+            # nonce is minted per cross-verifier invocation and repeated onto
+            # every assignment it served, so this is the process census and never
+            # the assignment census.
+            if ($manifest.PSObject.Properties['verifierRuns']) {
+                foreach ($run in @($manifest.verifierRuns)) {
+                    if ($null -eq $run) { continue }
+                    if (-not $run.PSObject.Properties['nonceSha256']) { continue }
+                    $nonce = [string]$run.nonceSha256
+                    if ($nonce.Length -eq 0 -or $nonce -ceq $script:ReviewerUnlaunchedVerifierNonce) { continue }
+                    [void]$nonces.Add($nonce)
+                    [void]$previewNonces.Add($nonce)
+                }
+            }
+            # Within ONE pass a launch is grouped by cluster and model and its
+            # nonce is stamped onto every assignment it served, so a pass can
+            # never mint more distinct launches than it published assignment
+            # rows. Deliberately checked per preview and never over the run's
+            # totals: identities are content digests and dedupe across passes
+            # while nonces are minted fresh, so a re-verification of the same
+            # candidates legitimately leaves the totals with more launches than
+            # assignments.
+            if ($previewNonces.Count -gt $previewAssignmentRowCount) {
+                throw ("The sealed verification preview '$path' records $($previewNonces.Count) distinct verifier " +
+                    "launch(es) against $previewAssignmentRowCount assignment row(s). One pass stamps each launch onto " +
+                    'the assignments it served, so that preview contradicts itself.')
+            }
+        }
+    }
+
+    $complete = $true
+    $incompleteReason = ''
+    if ($verificationEnabled -and -not $evidencePresent) {
+        $complete = $false
+        $incompleteReason = ('The run was authorized to cross-verify and published no verification preview, so the ' +
+            'assignments it may have stood on cannot be counted.')
+    }
+    elseif ($verificationEnabled -and $previewCount -eq 0) {
+        $complete = $false
+        $incompleteReason = ('The run was authorized to cross-verify and its preview directory holds nothing. The ' +
+            'directory is created before any review work happens, so its existence witnesses nothing.')
+    }
+    elseif ($verificationEnabled -and $evidenceLostPreviewCount -gt 0) {
+        # The dangerous case, and the reason completeness is not judged on the
+        # file's existence. The reviewed side's fault path seals a preview with
+        # an EMPTY assignment list and returns normally, so the run still ends
+        # cleanly while the only witness to what it was assigned is gone.
+        # Charged as unmeasured rather than measured at zero. Counted over EVERY
+        # preview, not merely required of one: a run that sealed a good pass and
+        # then lost the next one is exactly as unmeasured as one that lost its
+        # only pass.
+        $complete = $false
+        $incompleteReason = ("The run sealed $evidenceLostPreviewCount verification preview(s) that record a lost " +
+            'cross-verification rather than a set of assignments, so what those passes stood on is unknown rather ' +
+            'than none.')
+    }
+    $breakdown = [System.Collections.Generic.List[object]]::new()
+    foreach ($model in @([string[]]@($byModel.Keys) | Sort-Object -CaseSensitive)) {
+        [void]$breakdown.Add([pscustomobject][ordered]@{
+                verifierModel = [string]$model
+                assignmentCount = [int]$byModel[$model]
+            })
+    }
+    return [pscustomobject][ordered]@{
+        censusVersion = 1
+        runRoot = [string]([IO.Path]::GetFullPath($RunRoot))
+        realVerifierAssignments = [int]$ids.Count
+        byVerifierModel = ([object[]]@($breakdown))
+        # Diagnostic only; no budget is ever checked against it. Grouping pushes it
+        # below the assignment count within a pass, but re-verification mints fresh
+        # nonces against identities that dedupe, so no ordering holds in aggregate.
+        verifierProcessStarts = [int]$nonces.Count
+        complete = [bool]$complete
+        incompleteReason = [string]$incompleteReason
+        verificationAuthorized = [bool]$verificationEnabled
+        verificationPreviewCount = [int]$previewCount
+        verificationEvidenceLostPreviewCount = [int]$evidenceLostPreviewCount
+        basis = 'sealedVerificationPreviewAssignments'
+    }
+}
+
+function Get-ReviewerVerifierAssignmentBound {
+    <#
+    .SYNOPSIS
+        The most cross-verifier assignments one sealed run could stand on.
+
+    .DESCRIPTION
+        Read from the runner's own bounds, never restated. The reviewed side
+        requires exactly one assignment per ready candidate per required
+        reciprocal model and refuses a plan whose required assignment count
+        exceeds the effective verifier ceiling, so that ceiling IS the per-run
+        assignment cap: the candidate cap and the two configured reciprocal
+        models are already multiplied into it upstream.
+
+        A run not authorized to verify is bounded at zero, which is a reading
+        from the sealed vector rather than an assumption.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Argv,
+        [Parameter(Mandatory)][string]$ReviewerScriptPath
+    )
+    $runner = Get-ReviewerModelStartRunnerBound -ReviewerScriptPath $ReviewerScriptPath
+    $verificationEnabled = Test-ReviewerModelStartArgvSwitch -Argv @($Argv) -Name '-EnableVerificationPreview'
+    $maximum = [int]$(if ($verificationEnabled) { [int]$runner.maxVerifierLaunches } else { 0 })
+    return [pscustomobject][ordered]@{
+        boundVersion = 1
+        maxVerifierAssignments = [int]$maximum
+        verificationAuthorized = [bool]$verificationEnabled
+        runnerBounds = $runner
+    }
+}
+
 function Get-ReviewerModelStartCensus {
     <#
     .SYNOPSIS
@@ -639,4 +930,52 @@ function Get-ReviewerModelStartUnmeasuredAllowance {
     if ($unspent -lt 0) { $unspent = 0 }
     if ($allowance -gt $unspent) { $allowance = $unspent }
     return [int]$allowance
+}
+
+function Get-ReviewerVerifierAssignmentUnmeasuredAllowance {
+    <#
+    .SYNOPSIS
+        How many cross-verifier assignments a run may have stood on that its own
+        evidence cannot account for.
+
+    .DESCRIPTION
+        The assignment counterpart of the model-start allowance, and charged on
+        the same terms and for the same reason: a ceiling checked against a
+        measured floor is not a ceiling.
+
+        A run that ended cleanly and sealed its previews has published every
+        assignment it was given, so nothing is unaccounted. A run that failed,
+        timed out or was killed may have been given assignments it never sealed -
+        the phase accumulates them in memory and seals once at the end - so the
+        whole of what its plan admits and its seal did not prove is charged.
+
+        Capped at what the run's own sealed plan could still admit, so the total
+        charged never exceeds the bound the cohort proved before it started.
+
+    .PARAMETER Census
+        The assignment census taken over the run, or $null when the run left
+        evidence this build could not read at all.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Argv,
+        [Parameter(Mandatory)][string]$ReviewerScriptPath,
+        [Parameter(Mandatory)][bool]$RunEndedComplete,
+        $Census
+    )
+    $bound = Get-ReviewerVerifierAssignmentBound -Argv @($Argv) -ReviewerScriptPath $ReviewerScriptPath
+    if (-not [bool]$bound.verificationAuthorized) {
+        # A run never authorized to cross-verify could stand on no assignment,
+        # however it ended. That is a reading of the sealed vector, not an
+        # assumption about the run.
+        return [int]0
+    }
+    if ($null -eq $Census) {
+        return [int]$bound.maxVerifierAssignments
+    }
+    if ($RunEndedComplete -and [bool]$Census.complete) {
+        return [int]0
+    }
+    $unproven = [int]$bound.maxVerifierAssignments - [int]$Census.realVerifierAssignments
+    if ($unproven -lt 0) { $unproven = 0 }
+    return [int]$unproven
 }

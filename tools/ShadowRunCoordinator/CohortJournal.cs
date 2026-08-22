@@ -116,7 +116,18 @@ internal sealed record CohortEntryRecord
     /// </summary>
     internal required int ModelStartUnmeasuredAllowance { get; init; }
 
+    /// <summary>
+    /// THE unit the verifier ceiling is spent in: one candidate paired with one
+    /// required reciprocal model, read from the entry's signed audit. Never a
+    /// count of terminal transitions.
+    /// </summary>
     internal required int VerifierAssignmentCount { get; init; }
+
+    /// <summary>
+    /// Assignments an interrupted entry may have been given without sealing
+    /// them. The ceiling is checked against the sum of both.
+    /// </summary>
+    internal required int VerifierAssignmentUnmeasuredAllowance { get; init; }
 
     internal required int SlotLaunchCount { get; init; }
 
@@ -145,6 +156,7 @@ internal sealed record CohortEntryRecord
         ModelStartCount = 0,
         ModelStartUnmeasuredAllowance = 0,
         VerifierAssignmentCount = 0,
+        VerifierAssignmentUnmeasuredAllowance = 0,
         SlotLaunchCount = 0,
         ProviderWriteCount = 0,
         WriteToolInvocationCount = 0,
@@ -168,6 +180,7 @@ internal sealed record CohortEntryRecord
         .Set("modelStartCount", ModelStartCount)
         .Set("modelStartUnmeasuredAllowance", ModelStartUnmeasuredAllowance)
         .Set("verifierAssignmentCount", VerifierAssignmentCount)
+        .Set("verifierAssignmentUnmeasuredAllowance", VerifierAssignmentUnmeasuredAllowance)
         .Set("slotLaunchCount", SlotLaunchCount)
         .Set("providerWriteCount", ProviderWriteCount)
         .Set("writeToolInvocationCount", WriteToolInvocationCount)
@@ -198,6 +211,7 @@ internal sealed record CohortEntryRecord
             "modelStartCount",
             "modelStartUnmeasuredAllowance",
             "verifierAssignmentCount",
+            "verifierAssignmentUnmeasuredAllowance",
             "slotLaunchCount",
             "providerWriteCount",
             "writeToolInvocationCount",
@@ -260,6 +274,7 @@ internal sealed record CohortEntryRecord
             ModelStartCount = StrictJson.RequireInt(node, "modelStartCount", label, 0, int.MaxValue),
             ModelStartUnmeasuredAllowance = StrictJson.RequireInt(node, "modelStartUnmeasuredAllowance", label, 0, int.MaxValue),
             VerifierAssignmentCount = StrictJson.RequireInt(node, "verifierAssignmentCount", label, 0, int.MaxValue),
+            VerifierAssignmentUnmeasuredAllowance = StrictJson.RequireInt(node, "verifierAssignmentUnmeasuredAllowance", label, 0, int.MaxValue),
             SlotLaunchCount = StrictJson.RequireInt(node, "slotLaunchCount", label, 0, int.MaxValue),
             ProviderWriteCount = StrictJson.RequireInt(node, "providerWriteCount", label, 0, int.MaxValue),
             WriteToolInvocationCount = StrictJson.RequireInt(node, "writeToolInvocationCount", label, 0, int.MaxValue),
@@ -311,7 +326,7 @@ internal sealed record CohortEntryRecord
 /// </remarks>
 internal sealed class CohortJournal
 {
-    internal const string ContractVersionValue = "devpilot.shadow-cohort.journal.v2";
+    internal const string ContractVersionValue = "devpilot.shadow-cohort.journal.v3";
     internal const string KindValue = "shadow-cohort-journal";
 
     private const string Label = "shadow cohort journal";
@@ -720,6 +735,7 @@ internal sealed class CohortJournal
         RequireInRange(record, "modelStartCount", record.ModelStartCount, 0, int.MaxValue);
         RequireInRange(record, "modelStartUnmeasuredAllowance", record.ModelStartUnmeasuredAllowance, 0, int.MaxValue);
         RequireInRange(record, "verifierAssignmentCount", record.VerifierAssignmentCount, 0, int.MaxValue);
+        RequireInRange(record, "verifierAssignmentUnmeasuredAllowance", record.VerifierAssignmentUnmeasuredAllowance, 0, int.MaxValue);
         RequireInRange(record, "slotLaunchCount", record.SlotLaunchCount, 0, int.MaxValue);
         RequireInRange(record, "providerWriteCount", record.ProviderWriteCount, 0, int.MaxValue);
         RequireInRange(record, "writeToolInvocationCount", record.WriteToolInvocationCount, 0, int.MaxValue);

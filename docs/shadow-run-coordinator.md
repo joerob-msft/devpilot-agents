@@ -523,7 +523,7 @@ The alias is an argument, not a manifest field, and that is the point. A cohort 
 authorization could be read out of a file would be a cohort a scheduled task could start by
 writing that file. There is no unattended path to this mode.
 
-**One manifest, sealed before anything runs.** `devpilot.shadow-cohort.manifest.v2` declares the
+**One manifest, sealed before anything runs.** `devpilot.shadow-cohort.manifest.v3` declares the
 cohort id and correlation, the exact toolkit checkout and required ref, the global ceilings, and
 an ordered list of entries. Each entry pins one already-written typed request by path *and*
 digest, restates that request's subject and its three configuration digests, declares where the
@@ -636,7 +636,7 @@ that proof rather than inheriting it: a journal recording an adoption whose arti
 support it blocks the index rather than repeating the word it was given.
 
 **Sequential, journalled, and never retried.** The cohort journal
-(`devpilot.shadow-cohort.journal.v2`) is signed and replaced atomically, and it moves an entry
+(`devpilot.shadow-cohort.journal.v3`) is signed and replaced atomically, and it moves an entry
 through `pending → launchIntended → running → ended`. The launch intent — including the entry's
 digests and the exact command — is committed *before* the process exists, and the child's process
 id and its exact start time are committed as soon as it does, which is what makes "did this entry
@@ -668,21 +668,49 @@ business. It re-hashes the reviewer configuration the request pins, rebuilds the
 with the reviewed builder, and multiplies the toolkit's own per-attempt limits: for each declared
 slot, the configured generalist passes times the generalist retry limit, plus the specialist
 retry limit when verification is authorized, plus the capped maximum verifier launches times
-their per-run attempt limit. Reconciliation and delivery contribute none.
+their per-run attempt limit. Reconciliation and delivery contribute none. The same artifact —
+`devpilot.shadow-cohort.model-start-bound.v2` — also publishes the per-slot maximum verifier
+*assignments*, which is a different unit and is summed into its own bound.
 
 Before anything launches, the runner checks that each bound file digests to what the manifest
 sealed, that it was taken over *this* entry's request bytes and this cohort's toolkit head, that
-the entry's declared `modelStarts` is not below the bound it publishes, and that the sum of the
-bounds fits the global ceiling. A missing, unreadable or mismatched bound is a refusal, and the
-bound is never re-derived here. `devpilot.shadow-cohort.manifest.v1` is refused by name: its
-model-start budget was measured in reviewer processes, so re-reading one under this build would
-silently reinterpret both halves of it.
+the entry's declared `modelStarts` is not below the bound it publishes, that its declared
+`verifierAssignments` is not below the assignment bound the same artifact publishes, and that the
+sum of each kind of bound fits its global ceiling. A missing, unreadable or mismatched bound is a
+refusal, and the bound is never re-derived here.
+
+Both superseded manifest contracts are refused **by name**, each with the reason its budget was
+unsafe, rather than being reported as an unrecognised version.
+`devpilot.shadow-cohort.manifest.v1` measured its model-start budget in reviewer processes.
+`devpilot.shadow-cohort.manifest.v2` measured its verifier budget in committed verifier-backed
+terminal transitions — a list with eight members — so a run standing on forty reciprocal
+assignments was scored as four, and no run could ever cross the ceiling. Re-reading either under
+this build would silently reinterpret an operator's authorized number, in one case by a factor of
+ten.
+
+**The verifier ceiling is spent in assignments, not in the states a run reached.** An assignment
+is the verification contract's own identity: one candidate paired with one required reciprocal
+verifier model, minted as an `assignmentId` over the cluster, the candidate hash and the target
+model, with exactly one assignment per candidate per required model. The bound is therefore the
+plan's own cap — the reviewed side refuses a plan whose required assignments exceed the effective
+verifier ceiling, so that ceiling *is* the per-run assignment cap — summed across the declared
+slots. The actual is read from each entry's signed audit, which takes it from the run's own sealed
+verification previews and binds the total together with a per-slot and per-verifier-model
+breakdown.
+
+Grouped verifier **process** starts are counted too, under their own name, and no budget is ever
+checked against them: within one pass a launch can serve a whole cluster, so a pass's launches are
+at most its assignment rows and routinely far below, while across passes the identities dedupe and
+fresh nonces do not. The two are cross-checked but never required to be ordered, because grouping
+and repeated verification move them independently; what is refused is a contradiction, such as a
+slot reporting verifier model starts while claiming no assignment existed.
 
 **An entry that spent more than the cohort was allowed ends it.** The estimates admit an entry;
 the actuals, read from each ended entry's signed audit, are what stop the set. When the real
 model starts already spent — plus the bounded allowance for slots that ended without a complete
 census — exceed the ceiling, the cohort ends at `budgetExceeded`, the entry's own result stands
-and is never re-run, and no further entry launches.
+and is never re-run, and no further entry launches. The verifier assignment ceiling is enforced on
+exactly the same terms and in its own unit.
 
 **An entry that left no evidence stops the cohort.** A child can die, hang or be killed part-way
 through a preparation, having already started models, without ever publishing an audit. Nothing it
@@ -747,7 +775,7 @@ blocks the cohort, never as a filesystem fault from underneath. The distinction 
 failure to *write* the index is treated leniently — the journal is authoritative and the next run
 rewrites the report — and a failure to *read* an audit must never be mistaken for one.
 
-**The index says what ran, never what was concluded.** `devpilot.shadow-cohort.index.v1` carries
+**The index says what ran, never what was concluded.** `devpilot.shadow-cohort.index.v3` carries
 one summary per declared entry, in declared order: the preparation's final state and terminal
 reason, the snapshot, run-set, reconciliation and delivery evidence digests, the model start, slot,
 supervised slot, verifier assignment and provider write counts, the wall time, and the entry's
@@ -928,14 +956,53 @@ because that role's only other witness is the end-of-phase seal — accumulated 
 serialized once, and written *empty* by the degraded fallback, which returns normally. Whatever
 that seal cannot prove is charged. That allowance is what lets a ceiling be checked against an
 upper bound rather than against a floor. `slotAttemptRecordCount` remains, renamed, as a
-diagnostic; `verifierAssignmentCount` is a third and separate thing, taken from committed
-transitions.
+diagnostic.
+
+A **real verifier assignment** is a third and separate unit, and it is the one the verifier
+ceiling is spent in. It is one candidate paired with one required reciprocal verifier model, and
+the census is taken over the distinct `assignmentId` values in the run's own sealed verification
+previews: `realVerifierAssignmentCount` with `realVerifierAssignmentsByModel`, which sums to it,
+`realVerifierAssignmentsObserved`, `realVerifierAssignmentCensusComplete` and
+`realVerifierAssignmentUnmeasuredAllowance` on exactly the same terms as their model-start
+counterparts. `verifierProcessStartCount` sits beside it as a diagnostic and no budget is checked
+against it: one launch can serve a whole cluster, so within a single pass it sits below the
+assignment count, but re-verification mints fresh nonces against identities that dedupe, so no
+ordering between the two holds in aggregate.
+
+It replaces a derivation that counted how many verifier-backed terminal transitions a run had
+committed. That census could not exceed the number of states it listed, so a run standing on forty
+assignments and a run standing on four both reported four, and a ceiling stated in it could never
+be crossed by any run.
+
+The assignment census has exactly one source, so completeness is judged strictly and on the record
+rather than on the review's conclusion. The reviewed side creates its preview directory before any
+review work happens, and its cross-verification fault path seals a preview carrying an *empty*
+assignment list and then returns normally — so neither the directory, the file, nor the run's own
+clean ending witnesses that anything was counted. That fault path is identified by the tuple it is
+forced to publish: a non-empty `diagnostic`, an empty `inputArtifactPath` and an all-zero
+`inputManifestSha256`. A census is complete only when an authorized run sealed at least one preview
+and *no* preview carries that tuple; otherwise the whole of what the sealed plan still admits is
+charged as unmeasured, however the run ended. The seal's own `status` is deliberately not consulted:
+a review reports `degraded` for four ordinary reasons — a verifier invocation that timed out, a
+degraded specialist, a degraded convention plan, a withheld authoritative source — and seals its
+full assignment list in every one of them.
+
+No ordering is required between assignments and process starts. Within one pass a launch is grouped
+by cluster and model and its nonce is stamped onto every assignment it served, so a pass can never
+mint more distinct launches than it published assignment rows — and that is checked per sealed
+preview. Across passes the relationship inverts: identities are content digests and dedupe, launch
+nonces are minted fresh, so a legitimate re-verification of the same candidates leaves a run root
+with more launches than assignments. One contradiction is refused per slot, where both figures
+describe one run: an assignment count of zero beside any verifier-role model start, because those
+two censuses are taken over the same phase and the model-start records survive an evidence loss the
+preview does not.
 
 A cohort refuses to spend a budget against an audit that cannot answer this. A missing
-`realModelStartsObserved`, an unreadable counter, a role breakdown that does not sum to its
-total, a census the preparation marked incomplete, or an audit that launched slots and
-supervised none of them to an ending all stop the whole cohort rather than the entry, because
-an unread counter is not a zero.
+`realModelStartsObserved` or `realVerifierAssignmentsObserved`, an unreadable counter, a role or
+per-model breakdown that does not sum to its total, a census the preparation marked incomplete, an
+entry claiming launches or verifier model starts while claiming no assignment existed, or an audit
+that launched slots and supervised none of them to an ending all stop the whole cohort rather than
+the entry, because an unread counter is not a zero.
 
 `preparationEnded` is asked before any of them. The audit is rewritten after every commit, so the
 copy on disk always describes the run as it then stood, and every way out of the walk — success,

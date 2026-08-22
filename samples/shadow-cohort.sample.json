@@ -1,5 +1,5 @@
 {
-  "contractVersion": "devpilot.shadow-cohort.manifest.v2",
+  "contractVersion": "devpilot.shadow-cohort.manifest.v3",
   "kind": "shadow-cohort-run",
   "cohortId": "pilot-two-active",
   "correlationId": "pilot-two-active-0001",
@@ -20,7 +20,7 @@
   "budgets": {
     "maxPullRequests": 2,
     "maxModelStarts": 540,
-    "maxVerifierAssignments": 10,
+    "maxVerifierAssignments": 512,
     "maxWallClockSeconds": 5400,
     "providerWriteBudget": 0
   },
@@ -64,7 +64,7 @@
       },
       "planEstimate": {
         "modelStarts": 270,
-        "verifierAssignments": 5,
+        "verifierAssignments": 256,
         "wallClockSeconds": 2700,
         "modelStartBound": {
           "path": "D:/shadow/pilot-two-active/bounds/entry-one.model-start-bound.json",
@@ -105,7 +105,7 @@
       },
       "planEstimate": {
         "modelStarts": 270,
-        "verifierAssignments": 5,
+        "verifierAssignments": 256,
         "wallClockSeconds": 2700,
         "modelStartBound": {
           "path": "D:/shadow/pilot-two-active/bounds/entry-two.model-start-bound.json",

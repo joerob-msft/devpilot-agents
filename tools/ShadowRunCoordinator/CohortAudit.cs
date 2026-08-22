@@ -47,6 +47,18 @@ internal sealed class CohortBlockedException(string message) : Exception(message
 /// the index an uninterrupted one would, and the whole index can be rebuilt from
 /// the per-entry artifacts without running anything.
 /// </remarks>
+/// <summary>
+/// One reciprocal verifier model and the number of assignments an entry stood on
+/// against it.
+/// </summary>
+/// <remarks>
+/// The model name is carried verbatim as the opaque request string it is. No
+/// line in this program compares it to anything or reads any meaning from it;
+/// it exists so an operator can see that a census of forty was two models of
+/// twenty rather than one model of forty.
+/// </remarks>
+internal readonly record struct VerifierModelAssignments(string VerifierModel, int AssignmentCount);
+
 internal sealed record CohortEntrySummary
 {
     internal required CohortEntry Entry { get; init; }
@@ -112,7 +124,33 @@ internal sealed record CohortEntrySummary
 
     internal required int SupervisedSlotCount { get; init; }
 
+    /// <summary>
+    /// THE unit a cohort's verifier ceiling is spent in: one candidate paired
+    /// with one required reciprocal model, counted from the entry's own sealed
+    /// per-slot preview manifests. Not a count of terminal states, which is what
+    /// scored a forty-assignment entry as four.
+    /// </summary>
     internal required int VerifierAssignmentCount { get; init; }
+
+    /// <summary>
+    /// Assignments an interrupted entry may have been given and could not seal,
+    /// bounded on the reviewed side against that run's own plan. The ceiling is
+    /// checked against the measured total plus this.
+    /// </summary>
+    internal required int VerifierAssignmentUnmeasuredAllowance { get; init; }
+
+    /// <summary>
+    /// The same census broken down by reciprocal model. Opaque: the model names
+    /// are request strings this program never reads for meaning.
+    /// </summary>
+    internal required IReadOnlyList<VerifierModelAssignments> VerifierAssignmentsByModel { get; init; }
+
+    /// <summary>
+    /// Grouped verifier subprocess launches. Diagnostic only - one process can
+    /// serve a cluster of assignments, so a ceiling spent in these would shrink
+    /// whenever grouping worked.
+    /// </summary>
+    internal required int VerifierProcessStartCount { get; init; }
 
     internal required int ProviderWriteCount { get; init; }
 
@@ -154,12 +192,25 @@ internal sealed record CohortEntrySummary
             .Set("slotLaunchCount", SlotLaunchCount)
             .Set("supervisedSlotCount", SupervisedSlotCount)
             .Set("verifierAssignmentCount", VerifierAssignmentCount)
+            .Set("verifierAssignmentUnmeasuredAllowance", VerifierAssignmentUnmeasuredAllowance)
+            .Set("verifierAssignmentsByModel", DescribeAssignmentsByModel())
+            .Set("verifierProcessStartCount", VerifierProcessStartCount)
             .Set("providerWriteCount", ProviderWriteCount)
             .Set("writeToolInvocationCount", WriteToolInvocationCount)
             .Set("wallClockSeconds", WallClockSeconds)
             .Set("deliveryMode", CohortIndex.PreviewOnlyMode);
         summary.Set("summarySha256", CanonicalJson.Sha256HexOfText(CanonicalJson.Canonical(summary)));
         return summary;
+    }
+
+    private ListNode DescribeAssignmentsByModel()
+    {
+        var rows = new ListNode();
+        foreach (var row in VerifierAssignmentsByModel)
+        {
+            rows.Add(new MapNode().Set("verifierModel", row.VerifierModel).Set("assignmentCount", row.AssignmentCount));
+        }
+        return rows;
     }
 
     /// <summary>The summary of an entry that never ran, which is a shape rather than a set of readings.</summary>
@@ -194,6 +245,9 @@ internal sealed record CohortEntrySummary
         SlotLaunchCount = 0,
         SupervisedSlotCount = 0,
         VerifierAssignmentCount = 0,
+        VerifierAssignmentUnmeasuredAllowance = 0,
+        VerifierAssignmentsByModel = [],
+        VerifierProcessStartCount = 0,
         ProviderWriteCount = record.ProviderWriteCount,
         WriteToolInvocationCount = record.WriteToolInvocationCount,
         WallClockSeconds = record.ElapsedSeconds
@@ -225,28 +279,9 @@ internal static class CohortSummaryReader
         Path.Combine(entry.OutputRoot, "coordinator", "state.key");
 
     /// <summary>
-    /// The states at which a reviewed verifier read something on this
-    /// preparation's behalf.
+    /// Reads one entry's signed preparation audit into the opaque summary the
+    /// cohort index publishes.
     /// </summary>
-    /// <remarks>
-    /// A structural list, not a policy. Each of these transitions is committed
-    /// only after the reviewed side has read an immutable artifact and reported
-    /// on it, so counting the committed ones counts the verifier assignments the
-    /// preparation actually stood on. No line here reads what any of them
-    /// reported.
-    /// </remarks>
-    private static readonly string[] VerifierBackedStates =
-    [
-        "slot1TerminalVerified",
-        "slot1TerminalFailed",
-        "slot1TerminalTimedOut",
-        "slot2TerminalVerified",
-        "slot2TerminalFailed",
-        "slot2TerminalTimedOut",
-        "reconciliationVerified",
-        "deliveryTerminalVerified"
-    ];
-
     internal static CohortEntrySummary Read(CohortEntry entry, CohortEntryRecord record, int wallClockSeconds, string expectedCorrelationId)
     {
         var path = AuditPathFor(entry);
@@ -302,14 +337,6 @@ internal static class CohortSummaryReader
         }
 
         var transitionDigests = ReadTransitionDigests(audit, label);
-        var verifierAssignments = 0;
-        foreach (var state in VerifierBackedStates)
-        {
-            if (transitionDigests.ContainsKey(state))
-            {
-                verifierAssignments++;
-            }
-        }
 
         var providerWrites = RequireWriteCount(audit, "providerWriteCount", label);
         var writeInvocations = RequireWriteCount(audit, "writeToolInvocations", label);
@@ -317,6 +344,7 @@ internal static class CohortSummaryReader
         RequireNoWriteCapability(entry, audit, label);
         RequireEnded(entry, audit, label);
         var starts = RequireRealModelStarts(entry, audit, label);
+        var assignments = RequireRealVerifierAssignments(entry, audit, label, starts.Verifier);
 
         return new CohortEntrySummary
         {
@@ -342,7 +370,10 @@ internal static class CohortSummaryReader
             SlotAttemptRecordCount = RequireRepresentable(SlotAttemptRecords(audit), "slotAttemptRecordCount", label),
             SlotLaunchCount = RequireRepresentable(ReadCount(audit, "slotLaunchCount"), "slotLaunchCount", label),
             SupervisedSlotCount = RequireRepresentable(ReadCount(audit, "supervisedSlotCount"), "supervisedSlotCount", label),
-            VerifierAssignmentCount = verifierAssignments,
+            VerifierAssignmentCount = assignments.Total,
+            VerifierAssignmentUnmeasuredAllowance = assignments.UnmeasuredAllowance,
+            VerifierAssignmentsByModel = assignments.ByModel,
+            VerifierProcessStartCount = assignments.ProcessStarts,
             ProviderWriteCount = providerWrites,
             WriteToolInvocationCount = writeInvocations,
             WallClockSeconds = wallClockSeconds
@@ -468,6 +499,133 @@ internal static class CohortSummaryReader
             RequireRepresentable(specialist, "realModelStartsSpecialist", label),
             RequireRepresentable(verifier, "realModelStartsVerifier", label),
             RequireRepresentable(unmeasured, "realModelStartUnmeasuredAllowance", label));
+    }
+
+    /// <summary>
+    /// The real cross-verifier assignments one entry stood on, read from its own
+    /// signed audit and refused rather than guessed.
+    /// </summary>
+    /// <remarks>
+    /// THE number a cohort's verifier ceiling is spent in, and a different unit
+    /// from a model start. One assignment is one candidate paired with one
+    /// required reciprocal model; the reviewed side mints an identity per pair
+    /// and seals them in its per-slot preview manifests, which is what this
+    /// reads through. The defect this replaced counted committed terminal
+    /// transitions instead, so an entry that stood on forty assignments was
+    /// accounted as four and could never have been accounted as more than eight.
+    ///
+    /// Grouped verifier PROCESS starts are read alongside and published as a
+    /// diagnostic only. They are deliberately not the ceiling's unit: one
+    /// subprocess can verify a whole cluster, so a budget spent in processes
+    /// would shrink every time grouping worked.
+    ///
+    /// The cross-check against the model-start census is one-sided on purpose.
+    /// Grouping and retries make the two disagree in either direction, so
+    /// equality is never required; but an entry cannot have started a verifier
+    /// process without an assignment for it to serve, and an audit reporting that
+    /// contradicts itself.
+    /// </remarks>
+    private static (int Total, int UnmeasuredAllowance, int ProcessStarts, IReadOnlyList<VerifierModelAssignments> ByModel)
+        RequireRealVerifierAssignments(CohortEntry entry, JsonElement audit, string label, int verifierModelStarts)
+    {
+        if (!audit.TryGetProperty("realVerifierAssignmentsObserved", out var flag)
+            || flag.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+        {
+            throw new CohortBlockedException(
+                $"The {label} publishes no 'realVerifierAssignmentsObserved'. This build spends a cohort's verifier ceiling in real " +
+                "cross-verifier assignments and refuses an audit that does not say whether it counted any: an unread counter is not a " +
+                "zero, and the audit of an entry that stood on forty assignments and cannot say so must not be scored as four.");
+        }
+        if (flag.ValueKind != JsonValueKind.True)
+        {
+            // Supervising no slot is only the same as standing on no assignment
+            // when no slot was launched either, on exactly the terms the model
+            // start census applies.
+            var launched = RequireCounter(audit, "realModelStartLaunchedSlotCount", label);
+            if (launched > 0)
+            {
+                throw new CohortBlockedException(
+                    $"Entry '{entry.EntryId}' published an audit that launched {launched.ToString(CultureInfo.InvariantCulture)} slot(s) and " +
+                    "supervised none of them to a durable ending, so the verifier assignments those launches stood on are unknown rather " +
+                    "than nothing. The cohort stops here.");
+            }
+            return (0, 0, 0, []);
+        }
+        var total = RequireCounter(audit, "realVerifierAssignmentCount", label);
+        var processStarts = RequireCounter(audit, "verifierProcessStartCount", label);
+        if (!audit.TryGetProperty("realVerifierAssignmentCensusComplete", out var complete) || complete.ValueKind != JsonValueKind.True)
+        {
+            throw new CohortBlockedException(
+                $"Entry '{entry.EntryId}' published an audit whose real verifier assignment census is not complete, so what it stood on " +
+                "is unknown rather than small. The cohort stops here instead of launching another entry against a ceiling it can no " +
+                "longer measure.");
+        }
+        var unmeasured = RequireCounter(audit, "realVerifierAssignmentUnmeasuredAllowance", label);
+        var byModel = ReadVerifierAssignmentsByModel(audit, label, total);
+        if (total == 0 && processStarts > 0)
+        {
+            throw new CohortBlockedException(
+                $"The {label} reports {processStarts.ToString(CultureInfo.InvariantCulture)} verifier process start(s) and no assignment " +
+                "at all. A verifier subprocess exists to serve assignments, so those two halves of the census contradict each other and " +
+                "the cohort stops rather than spend a ceiling against either.");
+        }
+        if (total == 0 && verifierModelStarts > 0)
+        {
+            throw new CohortBlockedException(
+                $"The {label} reports {verifierModelStarts.ToString(CultureInfo.InvariantCulture)} real model start(s) in the verifier role " +
+                "and no verifier assignment at all. Those two censuses are taken over the same phase of the same run and contradict each " +
+                "other, so the cohort stops here.");
+        }
+        // Deliberately no ordering between the two. Grouping puts launches below
+        // assignments within a pass and a repeated verification of the same
+        // candidates puts them above across passes, because identities dedupe
+        // and launch nonces do not.
+        return (
+            RequireRepresentable(total, "realVerifierAssignmentCount", label),
+            RequireRepresentable(unmeasured, "realVerifierAssignmentUnmeasuredAllowance", label),
+            RequireRepresentable(processStarts, "verifierProcessStartCount", label),
+            byModel);
+    }
+
+    /// <summary>
+    /// The per-model assignment breakdown, refused unless it accounts for the
+    /// total it is published beside.
+    /// </summary>
+    private static IReadOnlyList<VerifierModelAssignments> ReadVerifierAssignmentsByModel(JsonElement audit, string label, long total)
+    {
+        if (!audit.TryGetProperty("realVerifierAssignmentsByModel", out var byModel) || byModel.ValueKind != JsonValueKind.Array)
+        {
+            throw new CohortBlockedException(
+                $"The {label} publishes no readable 'realVerifierAssignmentsByModel'. A verifier census this build cannot break down is " +
+                "one it will not spend a ceiling against.");
+        }
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var rows = new List<VerifierModelAssignments>();
+        long sum = 0;
+        foreach (var entry in byModel.EnumerateArray())
+        {
+            if (entry.ValueKind != JsonValueKind.Object)
+            {
+                throw new CohortBlockedException($"The {label} breaks its verifier assignments down by an element that is not an object.");
+            }
+            var model = StrictJson.RequireString(entry, "verifierModel", label);
+            if (!seen.Add(model))
+            {
+                throw new CohortBlockedException(
+                    $"The {label} breaks its verifier assignments down by a model it names twice, so the breakdown is ambiguous and the cohort stops.");
+            }
+            var count = RequireCounter(entry, "assignmentCount", label);
+            sum += count;
+            rows.Add(new VerifierModelAssignments(model, RequireRepresentable(count, "assignmentCount", label)));
+        }
+        if (sum != total)
+        {
+            throw new CohortBlockedException(
+                $"The {label} reports {total.ToString(CultureInfo.InvariantCulture)} verifier assignment(s) and a per-model breakdown " +
+                $"summing to {sum.ToString(CultureInfo.InvariantCulture)}. The cohort stops rather than spend a ceiling against a census " +
+                "whose parts contradict its total.");
+        }
+        return rows;
     }
 
     /// <summary>
@@ -907,7 +1065,7 @@ internal static class CohortCompletionAdoption
 
 internal static class CohortIndex
 {
-    internal const string ContractVersionValue = "devpilot.shadow-cohort.index.v2";
+    internal const string ContractVersionValue = "devpilot.shadow-cohort.index.v3";
     internal const string KindValue = "shadow-cohort-index";
 
     /// <summary>The reviewed plan's own word for the posture, unchanged by scaling it across a set.</summary>
@@ -990,6 +1148,7 @@ internal static class CohortIndex
         var entries = new ListNode();
         long models = 0;
         long verifiers = 0;
+        long verifierProcesses = 0;
         long seconds = 0;
         long writes = 0;
         var completed = 0;
@@ -1000,6 +1159,7 @@ internal static class CohortIndex
             entries.Add(summary.Describe());
             models += summary.ModelStartCount;
             verifiers += summary.VerifierAssignmentCount;
+            verifierProcesses += summary.VerifierProcessStartCount;
             seconds += summary.WallClockSeconds;
             writes += summary.ProviderWriteCount;
             if (summary.Record.EndedComplete)
@@ -1064,6 +1224,10 @@ internal static class CohortIndex
             .Set("consumed", new MapNode()
                 .Set("modelStarts", models)
                 .Set("verifierAssignments", verifiers)
+                // Grouped launches, published beside the assignments they served
+                // so a reader can see the difference rather than infer it. No
+                // ceiling is checked against this.
+                .Set("verifierProcessStarts", verifierProcesses)
                 .Set("wallClockSeconds", seconds)
                 .Set("providerWrites", writes))
             .Set("entries", entries)

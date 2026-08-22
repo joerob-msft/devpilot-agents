@@ -1572,7 +1572,12 @@ internal sealed class PreparationMachine(
             "realModelStartsVerifier",
             "realModelStartCensusComplete",
             "realModelStartCensusExact",
-            "realModelStartUnmeasuredAllowance");
+            "realModelStartUnmeasuredAllowance",
+            "realVerifierAssignmentCount",
+            "realVerifierAssignmentsByModel",
+            "realVerifierAssignmentCensusComplete",
+            "realVerifierAssignmentUnmeasuredAllowance",
+            "verifierProcessStartCount");
         var label = $"'{stage.VerifyStep}' child result";
 
         // The bytes the verifier read must be the bytes this run observed. The
@@ -1658,6 +1663,59 @@ internal sealed class PreparationMachine(
                 "A run that published everything it was going to publish has nothing left unaccounted, and the two statements contradict each other.");
         }
 
+        // The assignment census, read on the same terms and kept in its own unit.
+        // A cross-verifier ASSIGNMENT is one candidate paired with one required
+        // reciprocal model; a verifier PROCESS may serve a whole cluster of them.
+        // The first is what a cohort's verifier ceiling is spent in, the second is
+        // a diagnostic, and this build refuses to let either stand in for the
+        // other.
+        var assignments = StrictJson.RequireInt(outcome.Result, "realVerifierAssignmentCount", label, 0, int.MaxValue);
+        var assignmentsByModel = ReadVerifierAssignmentsByModel(outcome.Result, label, assignments);
+        var assignmentCensusComplete = StrictJson.RequireBool(outcome.Result, "realVerifierAssignmentCensusComplete", label);
+        var assignmentAllowance = StrictJson.RequireInt(
+            outcome.Result, "realVerifierAssignmentUnmeasuredAllowance", label, 0, 65536);
+        var verifierProcessStarts = StrictJson.RequireInt(outcome.Result, "verifierProcessStartCount", label, 0, int.MaxValue);
+        // The one contradiction that is always a contradiction. Grouping and
+        // retries make the two censuses differ in either direction, so equality is
+        // never required; but a run cannot have started a verifier process without
+        // an assignment for it to serve, and a build that reported so would be
+        // reporting a phase whose evidence disagrees with itself.
+        if (assignments == 0 && verifierProcessStarts > 0)
+        {
+            throw new ContractException(
+                $"The slot reports {verifierProcessStarts.ToString(CultureInfo.InvariantCulture)} verifier process start(s) and no " +
+                "verifier assignment at all. A launch serves assignments, so the two halves of that census contradict each other.");
+        }
+        // The same contradiction against the other witness, and the one that
+        // matters most. The assignment census has exactly one source - the
+        // phase's sealed preview - and the reviewed side's fault path seals that
+        // preview with an EMPTY assignment list and returns normally. The model
+        // start census survives that, because every verifier launch publishes its
+        // own record as it returns. So a slot that started verifier models and
+        // reports no assignment is a slot whose assignment evidence was lost,
+        // and it is refused HERE, per slot, where both figures are for the same
+        // run. Checked only on the entry's totals it would be vacuous: one slot
+        // reporting forty would carry another reporting nothing.
+        if (assignments == 0 && realVerifier > 0)
+        {
+            throw new ContractException(
+                $"The slot reports {realVerifier.ToString(CultureInfo.InvariantCulture)} real model start(s) in the verifier role and no " +
+                "verifier assignment at all. Those two censuses are taken over the same phase of the same run, so the assignments it " +
+                "stood on were lost rather than never made, and this build refuses to publish the loss as a zero.");
+        }
+        // No ordering is required between the two censuses. Grouping pushes
+        // launches below assignments within one pass, and a re-verification of
+        // the same candidates pushes them above it across passes: identities are
+        // content digests and dedupe, launch nonces are minted fresh and do not.
+        // The one relationship that always holds is checked per sealed preview,
+        // on the reviewed side, where both figures belong to a single pass.
+        if (assignmentCensusComplete && censusExact && assignmentAllowance != 0)
+        {
+            throw new ContractException(
+                $"The slot reports a complete assignment census on a run that ended cleanly and an unmeasured allowance of " +
+                $"{assignmentAllowance.ToString(CultureInfo.InvariantCulture)}. Those two statements contradict each other.");
+        }
+
         var status = StrictJson.RequireString(outcome.Result, "terminalStatus", label);
         var timedOut = StrictJson.RequireBool(outcome.Result, "terminalTimedOut", label);
         var exitCode = StrictJson.RequireInt(outcome.Result, "terminalExitCode", label, int.MinValue, int.MaxValue);
@@ -1695,8 +1753,59 @@ internal sealed class PreparationMachine(
             .Set("realModelStartCensusComplete", censusComplete)
             .Set("realModelStartCensusExact", censusExact)
             .Set("realModelStartUnmeasuredAllowance", unmeasuredAllowance)
+            .Set("realVerifierAssignmentCount", assignments)
+            .Set("realVerifierAssignmentsByModel", assignmentsByModel)
+            .Set("realVerifierAssignmentCensusComplete", assignmentCensusComplete)
+            .Set("realVerifierAssignmentUnmeasuredAllowance", assignmentAllowance)
+            .Set("verifierProcessStartCount", verifierProcessStarts)
             .Set("childResultSha256", outcome.ResultSha256);
-        return (state, evidence, $"terminalStatus={status} attempts={attempts.ToString(CultureInfo.InvariantCulture)} realModelStarts={realStarts.ToString(CultureInfo.InvariantCulture)}");
+        return (state, evidence, $"terminalStatus={status} attempts={attempts.ToString(CultureInfo.InvariantCulture)} realModelStarts={realStarts.ToString(CultureInfo.InvariantCulture)} realVerifierAssignments={assignments.ToString(CultureInfo.InvariantCulture)}");
+    }
+
+    /// <summary>
+    /// Reads a slot's per-model assignment breakdown, refusing one that does not
+    /// account for the total it is published beside.
+    /// </summary>
+    private static ListNode ReadVerifierAssignmentsByModel(JsonElement result, string label, int total)
+    {
+        if (!result.TryGetProperty("realVerifierAssignmentsByModel", out var byModel) || byModel.ValueKind != JsonValueKind.Array)
+        {
+            throw new ContractException($"The {label} carries no 'realVerifierAssignmentsByModel' array.");
+        }
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var carried = new ListNode();
+        var sum = 0;
+        var index = 0;
+        foreach (var entry in byModel.EnumerateArray())
+        {
+            var entryLabel = $"{label} verifier assignment breakdown {index.ToString(CultureInfo.InvariantCulture)}";
+            if (entry.ValueKind != JsonValueKind.Object)
+            {
+                throw new ContractException($"The {entryLabel} is not an object.");
+            }
+            var model = StrictJson.RequireString(entry, "verifierModel", entryLabel);
+            if (model.Length is 0 or > 128)
+            {
+                throw new ContractException($"The {entryLabel} names a verifier model of an unusable length.");
+            }
+            if (!seen.Add(model))
+            {
+                throw new ContractException($"The {label} breaks its verifier assignments down by a model it names twice, so the breakdown is ambiguous.");
+            }
+            var count = StrictJson.RequireInt(entry, "assignmentCount", entryLabel, 0, int.MaxValue);
+            sum += count;
+            carried.Add(new MapNode().Set("verifierModel", model).Set("assignmentCount", count));
+            index++;
+        }
+        // The breakdown has to account for the total, or one of the two is being
+        // read as the census and the other is decoration.
+        if (sum != total)
+        {
+            throw new ContractException(
+                $"The {label} reports {total.ToString(CultureInfo.InvariantCulture)} verifier assignment(s) and a per-model " +
+                $"breakdown summing to {sum.ToString(CultureInfo.InvariantCulture)}, so its census does not account for itself.");
+        }
+        return carried;
     }
 
     /// <summary>
@@ -3569,6 +3678,11 @@ internal sealed class PreparationMachine(
         var censusComplete = true;
         var unmeasuredAllowance = 0;
         var launchedSlots = 0;
+        var assignmentTotal = 0;
+        var assignmentCensusComplete = true;
+        var assignmentAllowance = 0;
+        var verifierProcessTotal = 0;
+        var assignmentsByModel = new SortedDictionary<string, int>(StringComparer.Ordinal);
         foreach (var stage in Stages)
         {
             // A slot that was launched but never reached a durable ending
@@ -3628,6 +3742,58 @@ internal sealed class PreparationMachine(
                     unmeasuredAllowance += (int)slotAllowance;
                 }
             }
+            // The assignment census, summed in its own unit. A slot whose terminal
+            // does not carry one was written by an older build, and an audit that
+            // read that silence as zero would publish a verifier spend of nothing
+            // for a run that stood on forty assignments - which is precisely the
+            // under-count this replaced.
+            var slotAssignments = terminal.GetInteger("realVerifierAssignmentCount");
+            if (slotAssignments is null)
+            {
+                assignmentCensusComplete = false;
+            }
+            else
+            {
+                assignmentTotal += (int)slotAssignments;
+                verifierProcessTotal += (int)(terminal.GetInteger("verifierProcessStartCount") ?? 0);
+                if (terminal.GetFlag("realVerifierAssignmentCensusComplete") != true)
+                {
+                    assignmentCensusComplete = false;
+                }
+                var slotAssignmentAllowance = terminal.GetInteger("realVerifierAssignmentUnmeasuredAllowance");
+                if (slotAssignmentAllowance is null)
+                {
+                    assignmentCensusComplete = false;
+                }
+                else
+                {
+                    assignmentAllowance += (int)slotAssignmentAllowance;
+                }
+                if (terminal.Get("realVerifierAssignmentsByModel") is ListNode slotByModel)
+                {
+                    foreach (var item in slotByModel.Items)
+                    {
+                        if (item is not MapNode row)
+                        {
+                            continue;
+                        }
+                        var model = row.GetText("verifierModel");
+                        var count = row.GetInteger("assignmentCount");
+                        if (model is not { Length: > 0 } || count is null)
+                        {
+                            assignmentCensusComplete = false;
+                            continue;
+                        }
+                        assignmentsByModel[model] = assignmentsByModel.TryGetValue(model, out var running)
+                            ? running + (int)count
+                            : (int)count;
+                    }
+                }
+                else
+                {
+                    assignmentCensusComplete = false;
+                }
+            }
             // Every one of these is a passthrough of what the reviewed verifier
             // read out of the owner's immutable artifact. This coordinator adds
             // no interpretation, and the audit must not read as though it had.
@@ -3648,11 +3814,17 @@ internal sealed class PreparationMachine(
                 .Set("slotRealModelStartsVerifier", terminal.Get("realModelStartsVerifier") ?? Node.Null())
                 .Set("slotRealModelStartCensusComplete", terminal.Get("realModelStartCensusComplete") ?? Node.Null())
                 .Set("slotRealModelStartCensusExact", terminal.Get("realModelStartCensusExact") ?? Node.Null())
+                .Set("slotRealVerifierAssignmentCount", terminal.Get("realVerifierAssignmentCount") ?? Node.Null())
+                .Set("slotRealVerifierAssignmentsByModel", terminal.Get("realVerifierAssignmentsByModel") ?? Node.Null())
+                .Set("slotRealVerifierAssignmentCensusComplete", terminal.Get("realVerifierAssignmentCensusComplete") ?? Node.Null())
+                .Set("slotRealVerifierAssignmentUnmeasuredAllowance", terminal.Get("realVerifierAssignmentUnmeasuredAllowance") ?? Node.Null())
+                .Set("slotVerifierProcessStartCount", terminal.Get("verifierProcessStartCount") ?? Node.Null())
                 .Set("slotSupervision", _state.EvidenceFor(stage.TerminalObserved)?.Get("supervision") ?? Node.Null()));
         }
         if (launchedSlots > supervisedCount)
         {
             censusComplete = false;
+            assignmentCensusComplete = false;
         }
         // THE figure a cohort budget is spent in: real model subprocess starts,
         // every role, every attempt, summed from the per-slot censuses this run
@@ -3667,6 +3839,26 @@ internal sealed class PreparationMachine(
         audit.Set("realModelStartCensusComplete", censusComplete);
         audit.Set("realModelStartUnmeasuredAllowance", unmeasuredAllowance);
         audit.Set("realModelStartLaunchedSlotCount", launchedSlots);
+        // THE figure a cohort's VERIFIER ceiling is spent in, and a different unit
+        // from the one above: one assignment is one candidate paired with one
+        // required reciprocal model, counted from the sealed per-slot preview
+        // manifests. It is deliberately not derivable from any count of terminal
+        // states - that derivation is the defect this replaced, and a run that
+        // stood on forty assignments must publish forty rather than four.
+        audit.Set("realVerifierAssignmentsObserved", supervisedCount > 0);
+        audit.Set("realVerifierAssignmentCount", assignmentTotal);
+        var assignmentBreakdown = new ListNode();
+        foreach (var pair in assignmentsByModel)
+        {
+            assignmentBreakdown.Add(new MapNode().Set("verifierModel", pair.Key).Set("assignmentCount", pair.Value));
+        }
+        audit.Set("realVerifierAssignmentsByModel", assignmentBreakdown);
+        audit.Set("realVerifierAssignmentCensusComplete", assignmentCensusComplete);
+        audit.Set("realVerifierAssignmentUnmeasuredAllowance", assignmentAllowance);
+        // Grouped launches. A cluster of candidates can be verified by one
+        // subprocess, so this is always a diagnostic and never a budget unit: a
+        // ceiling checked against it would shrink every time grouping worked.
+        audit.Set("verifierProcessStartCount", verifierProcessTotal);
         audit.Set("declaredSlotCount", CoordinatorRequest.DeclaredSlotCount);
         audit.Set("supervisedSlotCount", supervisedCount);
         audit.Set("slots", slotRecords);

@@ -59,7 +59,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$BoundKind = 'devpilot.shadow-cohort.model-start-bound.v1'
+$BoundKind = 'devpilot.shadow-cohort.model-start-bound.v2'
 
 function Get-BoundJsonProperty {
     <#
@@ -161,6 +161,7 @@ try {
 
     $total = 0
     $byRole = [ordered]@{ generalist = 0; specialist = 0; verifier = 0 }
+    $assignmentTotal = 0
     $slotBounds = @()
     foreach ($slot in @($declaredSlots)) {
         $slotName = [string](Get-BoundJsonProperty -Object $slot -Name 'name' -Where 'sealed request slot')
@@ -179,14 +180,21 @@ try {
             -EnableVerificationPreview:$verificationEnabled `
             -ReplayRoot $toolkitRoot -ReplaySnapshotName 'bound' -ReplayManifestDigest ('0' * 64)
         $bound = Get-ReviewerModelStartBound -Argv ([string[]]$argv) -ReviewerScriptPath $reviewerScriptPath
+        # The second bound, in the second unit. The reviewed side's own cap on how
+        # many candidate-by-model assignments one run may be given, taken over the
+        # same vector so the two can never be built from different plans.
+        $assignmentBound = Get-ReviewerVerifierAssignmentBound -Argv ([string[]]$argv) `
+            -ReviewerScriptPath $reviewerScriptPath
         $total += [int]$bound.maxRealModelStarts
         $byRole['generalist'] += [int]$bound.byRole.generalist
         $byRole['specialist'] += [int]$bound.byRole.specialist
         $byRole['verifier'] += [int]$bound.byRole.verifier
+        $assignmentTotal += [int]$assignmentBound.maxVerifierAssignments
         $slotBounds += [pscustomobject][ordered]@{
             name = $slotName
             maxRealModelStarts = [int]$bound.maxRealModelStarts
             byRole = $bound.byRole
+            maxVerifierAssignments = [int]$assignmentBound.maxVerifierAssignments
             generalistPassCount = [int]$bound.generalistPassCount
             specialistAuthorized = [bool]$bound.specialistAuthorized
             verificationAuthorized = [bool]$bound.verificationAuthorized
@@ -205,6 +213,7 @@ try {
         plannedRunCount = [int]$plannedRunCount
         maxRealModelStarts = [int]$total
         byRole = [pscustomobject]$byRole
+        maxVerifierAssignments = [int]$assignmentTotal
         slots = @($slotBounds)
     }
 

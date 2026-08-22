@@ -33,13 +33,24 @@ namespace DevPilot.ShadowRunCoordinator;
 /// </remarks>
 internal sealed record CohortManifest
 {
-    internal const string ContractVersionValue = "devpilot.shadow-cohort.manifest.v2";
+    internal const string ContractVersionValue = "devpilot.shadow-cohort.manifest.v3";
 
     /// <summary>
-    /// The contract this one replaced. Named so that a v1 manifest is refused
-    /// with the reason it is refused for, rather than with a generic mismatch.
+    /// The contracts this one replaced, each named so that a manifest written
+    /// against one is refused with the reason it is refused for rather than with
+    /// a generic mismatch.
     /// </summary>
+    /// <remarks>
+    /// v1's model-start budget was measured in reviewer processes; v2 fixed that
+    /// and left the verifier ceiling measured in committed terminal transitions,
+    /// which capped at eight and in practice read four for an entry that stood on
+    /// forty assignments. Neither is silently rescored: an operator re-declares
+    /// the cohort against a sealed bound in the unit this build spends.
+    /// </remarks>
     internal const string UnsafeBudgetContractVersion = "devpilot.shadow-cohort.manifest.v1";
+
+    /// <summary>The contract whose verifier ceiling was declared in the wrong unit.</summary>
+    internal const string UnsafeVerifierBudgetContractVersion = "devpilot.shadow-cohort.manifest.v2";
 
     internal const string KindValue = "shadow-cohort-run";
 
@@ -181,6 +192,22 @@ internal sealed record CohortManifest
                 $"The {label} declares contract '{UnsafeBudgetContractVersion}', whose model-start budget was measured in reviewer processes " +
                 "rather than in real model subprocess starts and carried no proof that its estimate was an upper bound. This build does not " +
                 $"reinterpret it: re-declare the cohort as '{ContractVersionValue}' with a sealed model-start bound per entry.");
+        }
+        // A v2 manifest declared its verifier ceiling in a unit that could not
+        // count above eight: the runner it was written for derived the figure
+        // from committed terminal transitions, so an entry that stood on forty
+        // cross-verifier assignments was recorded as having stood on four. Its
+        // ceiling would be silently rescored into a unit forty times larger, so
+        // it is refused by name too.
+        if (root.TryGetProperty("contractVersion", out var priorVersion)
+            && priorVersion.ValueKind == JsonValueKind.String
+            && string.Equals(priorVersion.GetString(), UnsafeVerifierBudgetContractVersion, StringComparison.Ordinal))
+        {
+            throw new ContractException(
+                $"The {label} declares contract '{UnsafeVerifierBudgetContractVersion}', whose verifier-assignment budget was measured in committed " +
+                "terminal transitions rather than in real candidate-by-model assignments, so it could not count above eight however many " +
+                "assignments an entry really stood on. This build does not reinterpret it: re-declare the cohort as " +
+                $"'{ContractVersionValue}', whose per-entry sealed bound publishes a verifier-assignment maximum in the unit this build spends.");
         }
         StrictJson.RequireLiteral(root, "contractVersion", ContractVersionValue, label);
         var kind = StrictJson.RequireString(root, "kind", label);
@@ -953,6 +980,13 @@ internal sealed record CohortBudgets
 
     internal required int MaximumModelStarts { get; init; }
 
+    /// <summary>
+    /// The ceiling on real cross-verifier assignments - one candidate paired
+    /// with one required reciprocal model - across the whole cohort. Two slots
+    /// whose plans admit 128 assignments each bound at 256, so the range here is
+    /// sized for that unit rather than for the eight terminal transitions the
+    /// figure used to be derived from.
+    /// </summary>
     internal required int MaximumVerifierAssignments { get; init; }
 
     internal required int MaximumWallClockSeconds { get; init; }
@@ -1078,6 +1112,13 @@ internal sealed record CohortEntry
 
     internal required string ModelStartBoundSha256 { get; init; }
 
+    /// <summary>
+    /// The cross-verifier assignments this entry's sealed plan may hand out -
+    /// one candidate paired with one required reciprocal model, summed across
+    /// its declared slots. Proved against the same sealed bound artifact the
+    /// model-start estimate is proved against, and ranged for that unit: two
+    /// slots capped at 128 assignments each estimate 256.
+    /// </summary>
     internal required int EstimatedVerifierAssignments { get; init; }
 
     internal required int EstimatedWallClockSeconds { get; init; }
@@ -1171,7 +1212,7 @@ internal sealed record CohortEntry
             EstimatedModelStarts = StrictJson.RequireInt(estimate, "modelStarts", label + " planEstimate", 0, 8192),
             ModelStartBoundPath = CohortManifest.RequireRootedPath(StrictJson.RequireString(bound, "path", label + " planEstimate modelStartBound"), "model start bound path", label),
             ModelStartBoundSha256 = StrictJson.RequireHex(bound, "sha256", label + " planEstimate modelStartBound", 64),
-            EstimatedVerifierAssignments = StrictJson.RequireInt(estimate, "verifierAssignments", label + " planEstimate", 0, 1024),
+            EstimatedVerifierAssignments = StrictJson.RequireInt(estimate, "verifierAssignments", label + " planEstimate", 0, 4096),
             EstimatedWallClockSeconds = StrictJson.RequireInt(estimate, "wallClockSeconds", label + " planEstimate", 1, 86400)
         };
     }

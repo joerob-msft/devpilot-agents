@@ -268,7 +268,7 @@ internal static class Program
           --target        Stop once this state is reached. Defaults to runSetReady.
           --halt-after    Exit 9 immediately after committing this state. For fault tests.
                           A cohort declared 'shadow-cohort-run' may not forward it.
-          --cohort        Path to a devpilot.shadow-cohort.manifest.v2 JSON file. Runs the
+          --cohort        Path to a devpilot.shadow-cohort.manifest.v3 JSON file. Runs the
                           declared entries one at a time, each as its own preparation
                           against its own immutable output root.
           --authorized-by The operator alias this cohort is started under. Required for

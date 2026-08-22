@@ -535,11 +535,18 @@ if ($cohortPresent.Count -eq $cohortSources.Count) {
 
     # Every cohort document is versioned and every one of them is a file. Nothing
     # here answers on a stream.
-    foreach ($contract in @('devpilot.shadow-cohort.manifest.v2', 'devpilot.shadow-cohort.journal.v2',
-            'devpilot.shadow-cohort.index.v2', 'devpilot.shadow-cohort.launch-intent.v1',
-            'devpilot.shadow-cohort.lease.v1', 'devpilot.shadow-cohort.model-start-bound.v1')) {
+    foreach ($contract in @('devpilot.shadow-cohort.manifest.v3', 'devpilot.shadow-cohort.journal.v3',
+            'devpilot.shadow-cohort.index.v3', 'devpilot.shadow-cohort.launch-intent.v1',
+            'devpilot.shadow-cohort.lease.v1', 'devpilot.shadow-cohort.model-start-bound.v2')) {
         Assert-Coordinator ($cohortText.Contains($contract)) `
             "The cohort does not name the versioned contract '$contract'."
+    }
+    # Both superseded manifest contracts are still named, because each is refused
+    # by name with the reason its budget was unsafe. A build that simply stopped
+    # recognising them would report an unknown version and lose the explanation.
+    foreach ($superseded in @('devpilot.shadow-cohort.manifest.v1', 'devpilot.shadow-cohort.manifest.v2')) {
+        Assert-Coordinator ($cohortText.Contains($superseded)) `
+            "The cohort no longer names the superseded contract '$superseded'; it must be refused by name, with its reason."
     }
 
     # The budget the cohort spends is measured in real model subprocess starts,
@@ -554,6 +561,17 @@ if ($cohortPresent.Count -eq $cohortSources.Count) {
         'The cohort does not prove its per-entry model start estimates are upper bounds before launching.'
     Assert-Coordinator ($runnerText.IndexOf('RequireSealedModelStartBounds()') -lt $runnerText.IndexOf('RunEntry(')) `
         'The cohort proves its model start bounds after starting an entry against them.'
+
+    # The verifier ceiling is spent in the same kind of unit: authenticated
+    # assignment records, not committed terminal transitions. The old derivation
+    # counted how many verifier-backed states a run had reached - a list with
+    # eight members - and scored a forty-assignment entry as four.
+    Assert-Coordinator ($cohortAuditText.Contains('RequireRealVerifierAssignments')) `
+        'The cohort audit has no single reader for the real verifier assignment count its ceiling is spent in.'
+    Assert-Coordinator (-not $cohortAuditText.Contains('VerifierBackedStates')) `
+        'The cohort audit still derives its verifier spend from terminal transitions; that census cannot exceed the number of states it lists.'
+    Assert-Coordinator ($cohortAuditText.Contains('verifierProcessStartCount')) `
+        'The cohort audit does not publish grouped verifier process starts beside the assignments, so the two units cannot be told apart.'
     Assert-Coordinator ($cohortText.Contains('Console.Out.Write') -eq $false) `
         'The cohort writes to stdout; its documents travel in files and its progress on the error stream.'
 

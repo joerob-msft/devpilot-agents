@@ -88,7 +88,7 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
     /// The artifact this build accepts as proof of an entry's worst-case real
     /// model consumption, produced by tools/New-ShadowModelStartBound.ps1.
     /// </summary>
-    internal const string ModelStartBoundKind = "devpilot.shadow-cohort.model-start-bound.v1";
+    internal const string ModelStartBoundKind = "devpilot.shadow-cohort.model-start-bound.v2";
 
     internal static int Run(CohortManifest manifest, string operatorAlias, bool rebuildOnly, TextWriter log)
     {
@@ -600,6 +600,7 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
             ModelStartCount = summary.ModelStartCount,
             ModelStartUnmeasuredAllowance = summary.ModelStartUnmeasuredAllowance,
             VerifierAssignmentCount = summary.VerifierAssignmentCount,
+            VerifierAssignmentUnmeasuredAllowance = summary.VerifierAssignmentUnmeasuredAllowance,
             SlotLaunchCount = summary.SlotLaunchCount,
             ProviderWriteCount = summary.ProviderWriteCount,
             WriteToolInvocationCount = summary.WriteToolInvocationCount,
@@ -641,6 +642,7 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
             $"specialist={summary.ModelStartsSpecialist.ToString(CultureInfo.InvariantCulture)} " +
             $"verifier={summary.ModelStartsVerifier.ToString(CultureInfo.InvariantCulture)}) " +
             $"verifierAssignments={summary.VerifierAssignmentCount.ToString(CultureInfo.InvariantCulture)} " +
+            $"(verifierProcesses={summary.VerifierProcessStartCount.ToString(CultureInfo.InvariantCulture)}) " +
             $"providerWrites={summary.ProviderWriteCount.ToString(CultureInfo.InvariantCulture)}");
         return outcome;
     }
@@ -981,6 +983,7 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
     private void RequireSealedModelStartBounds()
     {
         long bounded = 0;
+        long boundedAssignments = 0;
         foreach (var entry in _manifest.Entries)
         {
             var label = $"entry '{entry.EntryId}' model start bound";
@@ -1025,6 +1028,22 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
                     "and a guess that runs low spends models nobody authorized.");
             }
             bounded += maximum;
+
+            // The second unit, proved on the same terms. A slot's plan caps how
+            // many candidate-by-model assignments the reviewed side may be given -
+            // its configured reciprocal models times its candidate cap - and the
+            // sum across the declared slots is what an entry may stand on. Read
+            // from the sealed artifact rather than restated here, so the two can
+            // never be derived from different plans.
+            var assignmentMaximum = StrictJson.RequireInt(root, "maxVerifierAssignments", label, 0, 65536);
+            if (entry.EstimatedVerifierAssignments < assignmentMaximum)
+            {
+                throw new ContractException(
+                    $"Entry '{entry.EntryId}' estimates {entry.EstimatedVerifierAssignments.ToString(CultureInfo.InvariantCulture)} verifier assignment(s) and its " +
+                    $"sealed bound admits up to {assignmentMaximum.ToString(CultureInfo.InvariantCulture)}. A verifier ceiling declared below the assignments the " +
+                    "plan may hand out is the under-declaration that scored a forty-assignment entry as four, and it is refused before anything launches.");
+            }
+            boundedAssignments += assignmentMaximum;
         }
 
         // Restated against the global ceiling. The manifest already refused a set
@@ -1038,6 +1057,13 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
                 $"The cohort's sealed bounds admit up to {bounded.ToString(CultureInfo.InvariantCulture)} real model start(s) across its entries and it " +
                 $"declares a ceiling of {_manifest.Budgets.MaximumModelStarts.ToString(CultureInfo.InvariantCulture)}. A cohort that cannot fit its own proven " +
                 "worst case is refused before it starts rather than stopped after it has produced evidence that will now be abandoned.");
+        }
+        if (boundedAssignments > _manifest.Budgets.MaximumVerifierAssignments)
+        {
+            throw new ContractException(
+                $"The cohort's sealed bounds admit up to {boundedAssignments.ToString(CultureInfo.InvariantCulture)} real verifier assignment(s) across its " +
+                $"entries and it declares a ceiling of {_manifest.Budgets.MaximumVerifierAssignments.ToString(CultureInfo.InvariantCulture)}. A verifier ceiling " +
+                "that cannot hold its own proven worst case is refused before anything launches.");
         }
     }
 
@@ -1068,7 +1094,7 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
                 continue;
             }
             models += record.ModelStartCount + record.ModelStartUnmeasuredAllowance;
-            verifiers += record.VerifierAssignmentCount;
+            verifiers += record.VerifierAssignmentCount + record.VerifierAssignmentUnmeasuredAllowance;
             seconds += record.ElapsedSeconds;
             started++;
         }
@@ -1131,7 +1157,7 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
                 continue;
             }
             models += record.ModelStartCount + record.ModelStartUnmeasuredAllowance;
-            verifiers += record.VerifierAssignmentCount;
+            verifiers += record.VerifierAssignmentCount + record.VerifierAssignmentUnmeasuredAllowance;
             seconds += record.ElapsedSeconds;
         }
         if (models > _manifest.Budgets.MaximumModelStarts)

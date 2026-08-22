@@ -42,12 +42,29 @@
     artifacts and checks the classification, then puts the original index back.
     Nothing is launched and no model is started. Absent, the scenario is skipped:
     the root belongs to an operator's machine, not to this repository.
+.PARAMETER FrozenVerifierRunRoot
+    An operator's real, already-finished single-entry output root whose slots
+    sealed cross-verifier previews, re-read read-only. When it is present the
+    suite takes the assignment census over that root's own sealed evidence and
+    checks it against the ceiling the cohort that produced it declared. Nothing
+    is launched and no model is started. Absent, the scenario is skipped.
+
+.PARAMETER FrozenVerifierExpectedAssignments
+    What that root is expected to total. Zero means "whatever it totals", which
+    still proves the census is above the ceiling the old unit could express.
+
+.PARAMETER FrozenVerifierDeclaredCeiling
+    The verifier ceiling the cohort that produced the frozen root declared, in
+    the old unit. The regression proves the real census exceeds it.
 #>
 [CmdletBinding()]
 param(
     [string]$RepoRoot = (Split-Path $PSScriptRoot -Parent),
     [switch]$KeepSandbox,
-    [string]$FrozenCohortManifest = ''
+    [string]$FrozenCohortManifest = '',
+    [string]$FrozenVerifierRunRoot = '',
+    [int]$FrozenVerifierExpectedAssignments = 0,
+    [int]$FrozenVerifierDeclaredCeiling = 4
 )
 
 Set-StrictMode -Version Latest
@@ -367,6 +384,25 @@ if ($control.writeAudit) {
         $audit['realModelStartUnmeasuredAllowance'] = [long]$control.realModelStartUnmeasuredAllowance
         $audit['realModelStartLaunchedSlotCount'] = [long]$control.realModelStartLaunchedSlotCount
     }
+    # The verifier assignment census, in its own unit and published exactly as a
+    # real preparation publishes it. Omitting it is its own scenario: a cohort
+    # must refuse an audit that cannot say how many assignments it stood on
+    # rather than score the silence as the four its terminal states used to imply.
+    if (-not $control.omitRealVerifierAssignments) {
+        $byModel = @()
+        foreach ($row in @($control.realVerifierAssignmentsByModel)) {
+            $byModel += [ordered]@{
+                verifierModel = [string]$row.verifierModel
+                assignmentCount = [long]$row.assignmentCount
+            }
+        }
+        $audit['realVerifierAssignmentsObserved'] = [bool]$control.realVerifierAssignmentsObserved
+        $audit['realVerifierAssignmentCount'] = [long]$control.realVerifierAssignmentCount
+        $audit['realVerifierAssignmentsByModel'] = @($byModel)
+        $audit['realVerifierAssignmentCensusComplete'] = [bool]$control.realVerifierAssignmentCensusComplete
+        $audit['realVerifierAssignmentUnmeasuredAllowance'] = [long]$control.realVerifierAssignmentUnmeasuredAllowance
+        $audit['verifierProcessStartCount'] = [long]$control.verifierProcessStartCount
+    }
     $selfHash = Get-Sha256Text -Text (ConvertTo-CanonicalText -Value $audit)
     if ($control.tamperSelfHash) { $selfHash = [string]$control.evidenceSha256 }
     $audit['auditSha256'] = $selfHash
@@ -419,6 +455,19 @@ function New-StubControl {
         [int]$RealModelStartUnmeasuredAllowance = 0,
         [int]$RealModelStartLaunchedSlotCount = 2,
         [bool]$OmitRealModelStarts = $false,
+        # The assignment census a two-slot stub stands on. Two candidates per slot
+        # against two required reciprocal models is eight assignments served by
+        # eight launches - a different unit from the four model starts above, and
+        # from the four terminal transitions the defect counted.
+        [int]$RealVerifierAssignmentCount = 8,
+        $RealVerifierAssignmentsByModel = @(
+            [ordered]@{ verifierModel = 'stub-verifier-a'; assignmentCount = 4 },
+            [ordered]@{ verifierModel = 'stub-verifier-b'; assignmentCount = 4 }),
+        [bool]$RealVerifierAssignmentsObserved = $true,
+        [bool]$RealVerifierAssignmentCensusComplete = $true,
+        [int]$RealVerifierAssignmentUnmeasuredAllowance = 0,
+        [int]$VerifierProcessStartCount = 8,
+        [bool]$OmitRealVerifierAssignments = $false,
         [bool]$OmitPreparationEnded = $false,
         [int]$SlotLaunchCount = 2,
         [int]$SupervisedSlotCount = 2,
@@ -473,6 +522,13 @@ function New-StubControl {
         realModelStartUnmeasuredAllowance = $RealModelStartUnmeasuredAllowance
         realModelStartLaunchedSlotCount = $RealModelStartLaunchedSlotCount
         omitRealModelStarts = $OmitRealModelStarts
+        realVerifierAssignmentCount = $RealVerifierAssignmentCount
+        realVerifierAssignmentsByModel = @($RealVerifierAssignmentsByModel | ForEach-Object { [pscustomobject]$_ })
+        realVerifierAssignmentsObserved = $RealVerifierAssignmentsObserved
+        realVerifierAssignmentCensusComplete = $RealVerifierAssignmentCensusComplete
+        realVerifierAssignmentUnmeasuredAllowance = $RealVerifierAssignmentUnmeasuredAllowance
+        verifierProcessStartCount = $VerifierProcessStartCount
+        omitRealVerifierAssignments = $OmitRealVerifierAssignments
         omitPreparationEnded = $OmitPreparationEnded
         slotLaunchCount = $SlotLaunchCount
         supervisedSlotCount = $SupervisedSlotCount
@@ -653,7 +709,8 @@ function New-CohortModelStartBound {
         [Parameter(Mandatory)][string]$RequestSha256,
         [Parameter(Mandatory)][string]$ToolkitHead,
         [Parameter(Mandatory)][int]$MaxRealModelStarts,
-        [string]$Kind = 'devpilot.shadow-cohort.model-start-bound.v1'
+        [int]$MaxVerifierAssignments = 0,
+        [string]$Kind = 'devpilot.shadow-cohort.model-start-bound.v2'
     )
     return (Write-StrictJsonFile -Path $Path -Value ([pscustomobject][ordered]@{
                 kind = $Kind
@@ -665,6 +722,7 @@ function New-CohortModelStartBound {
                 plannedRunCount = 2
                 maxRealModelStarts = $MaxRealModelStarts
                 byRole = [ordered]@{ generalist = $MaxRealModelStarts; specialist = 0; verifier = 0 }
+                maxVerifierAssignments = $MaxVerifierAssignments
                 slots = @()
             }))
 }
@@ -679,13 +737,14 @@ function New-CohortEntryDeclaration {
         [Parameter(Mandatory)][int]$Ordinal,
         [Parameter(Mandatory)][string]$RuleBundlePath,
         [int]$EstimatedModelStarts = 8,
-        [int]$EstimatedVerifierAssignments = 4,
+        [int]$EstimatedVerifierAssignments = 8,
         [int]$EstimatedWallClockSeconds = 300,
         [string]$OutputRootOverride,
         [hashtable]$SubjectOverride,
         [string]$ToolkitHead = $script:CohortHead,
         [int]$BoundMaxRealModelStarts = -1,
-        [string]$BoundKind = 'devpilot.shadow-cohort.model-start-bound.v1',
+        [int]$BoundMaxVerifierAssignments = -1,
+        [string]$BoundKind = 'devpilot.shadow-cohort.model-start-bound.v2',
         [string]$BoundRequestSha256Override = '',
         [string]$BoundHeadOverride = '',
         [string]$BoundSha256Override = '',
@@ -717,6 +776,8 @@ function New-CohortEntryDeclaration {
     if ($OutputRootOverride) { $outputRoot = $OutputRootOverride }
     $boundMaximum = $BoundMaxRealModelStarts
     if ($boundMaximum -lt 0) { $boundMaximum = $EstimatedModelStarts }
+    $boundAssignments = $BoundMaxVerifierAssignments
+    if ($boundAssignments -lt 0) { $boundAssignments = $EstimatedVerifierAssignments }
     $boundRequestSha256 = if ($BoundRequestSha256Override) { $BoundRequestSha256Override } else { [string]$Request.Sha256 }
     $boundHead = if ($BoundHeadOverride) { $BoundHeadOverride } else { [string]$ToolkitHead }
     # Named by what it says, not by where it came from. One request is declared
@@ -726,14 +787,15 @@ function New-CohortEntryDeclaration {
     # the request's own name is worse still: a pattern that fails to match writes
     # the bound on top of the request.
     $boundName = ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData(
-                ([Text.UTF8Encoding]::new($false, $true)).GetBytes("$BoundKind|$boundRequestSha256|$boundHead|$boundMaximum")))
+                ([Text.UTF8Encoding]::new($false, $true)).GetBytes("$BoundKind|$boundRequestSha256|$boundHead|$boundMaximum|$boundAssignments")))
     ).Replace('-', '').ToLowerInvariant().Substring(0, 16)
     $boundPath = Join-Path ([IO.Path]::GetDirectoryName([string]$Request.Path)) "model-start-bound-$boundName.json"
     if ($BoundPathOverride) { $boundPath = $BoundPathOverride }
     $boundSha256 = $BoundSha256Override
     if (-not $OmitBoundFile.IsPresent) {
         $written = New-CohortModelStartBound -Path $boundPath -RequestSha256 $boundRequestSha256 `
-            -ToolkitHead $boundHead -MaxRealModelStarts $boundMaximum -Kind $BoundKind
+            -ToolkitHead $boundHead -MaxRealModelStarts $boundMaximum `
+            -MaxVerifierAssignments $boundAssignments -Kind $BoundKind
         if (-not $boundSha256) { $boundSha256 = (Get-Sha256 -Path $written) }
     }
     if (-not $boundSha256) { $boundSha256 = (New-FakeDigest) }
@@ -786,7 +848,7 @@ function New-CohortManifestFile {
         [int]$MaxVerifierAssignments = 64,
         [int]$MaxWallClockSeconds = 3600,
         [int]$ProviderWriteBudget = 0,
-        [string]$ContractVersion = 'devpilot.shadow-cohort.manifest.v2',
+        [string]$ContractVersion = 'devpilot.shadow-cohort.manifest.v3',
         [string]$Kind = '',
         [hashtable]$ExtraRoot
     )
@@ -877,7 +939,7 @@ Write-Host "sandbox: $sandboxRoot" -ForegroundColor DarkGray
 
 try {
     # -----------------------------------------------------------------------
-    Write-Host '1/28 build the shipping coordinator' -ForegroundColor Cyan
+    Write-Host '1/30 build the shipping coordinator' -ForegroundColor Cyan
     $project = Join-Path $RepoRoot 'tools\ShadowRunCoordinator\ShadowRunCoordinator.csproj'
     $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
     $env:DOTNET_NOLOGO = '1'
@@ -902,7 +964,7 @@ try {
         })
 
     # -----------------------------------------------------------------------
-    Write-Host '2/28 three-entry cohort: complete, not-complete, complete' -ForegroundColor Cyan
+    Write-Host '2/30 three-entry cohort: complete, not-complete, complete' -ForegroundColor Cyan
     $caseA = Join-Path $sandboxRoot 'case-a'
     $a1 = New-CohortEntryRequest -Sandbox $caseA -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $a2 = New-CohortEntryRequest -Sandbox $caseA -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -944,8 +1006,14 @@ try {
     $summaryTwo = Get-CohortIndexEntry -Index $indexA -EntryId 'entry-two'
     Assert-Cohort ($summaryTwo.outcome -eq 'runNotComplete') "Entry two was recorded '$($summaryTwo.outcome)'; expected runNotComplete."
     Assert-Cohort ($summaryTwo.preparationFinalState -eq 'slot2TerminalFailed') 'The summary did not carry the preparation final state across.'
-    Assert-Cohort ($summaryTwo.verifierAssignmentCount -eq 2) `
-        "Entry two counted $($summaryTwo.verifierAssignmentCount) verifier assignments; expected 2 from its committed verifier-backed transitions."
+    # Eight, from the entry's own sealed assignment census - two candidates per
+    # slot against two required reciprocal models. The figure the defect produced
+    # here was two, because it counted committed verifier-backed transitions and
+    # a partially completed entry commits two of them.
+    Assert-Cohort ($summaryTwo.verifierAssignmentCount -eq 8) `
+        "Entry two counted $($summaryTwo.verifierAssignmentCount) verifier assignments; expected 8 from its signed assignment census."
+    Assert-Cohort ($summaryTwo.verifierProcessStartCount -eq 8) `
+        "Entry two counted $($summaryTwo.verifierProcessStartCount) verifier process starts; expected 8 published as a diagnostic beside the assignments."
     Assert-Cohort ($summaryTwo.modelStartCount -eq 2) 'A partially completed entry did not contribute its actual model starts.'
     # One key format across this program: the journal signs itself with 32 raw
     # bytes, which is what the preparation writes into every entry root and what
@@ -960,7 +1028,7 @@ try {
         'An entry signing key is not the 32 raw bytes the preparation writes.'
 
     # -----------------------------------------------------------------------
-    Write-Host '3/28 the summary carries no subject, finding text or judgement' -ForegroundColor Cyan
+    Write-Host '3/30 the summary carries no subject, finding text or judgement' -ForegroundColor Cyan
     $indexText = Get-Content -LiteralPath (Join-Path $caseA 'index\cohort-index.json') -Raw
     # The sentinel names are chosen not to occur inside a hexadecimal digest, so
     # their absence is evidence rather than luck. The field names are checked
@@ -975,7 +1043,7 @@ try {
     Assert-Cohort ($null -ne $indexA.indexSha256 -and $null -ne $indexA.signature) 'The index is neither self-hashed nor signed.'
 
     # -----------------------------------------------------------------------
-    Write-Host '4/28 an ended entry is never re-attempted' -ForegroundColor Cyan
+    Write-Host '4/30 an ended entry is never re-attempted' -ForegroundColor Cyan
     $rerunA = Invoke-Cohort -ManifestPath $manifestA
     Assert-Cohort ($rerunA.ExitCode -eq 5) "Re-running a finished cohort exited $($rerunA.ExitCode); expected the same 5."
     $journalA = Get-JsonFile -Path (Join-Path $caseA 'journal\cohort-journal.json')
@@ -987,7 +1055,7 @@ try {
     Assert-Cohort ($launchEvents.Count -eq 3) "The journal records $($launchEvents.Count) launch intents for three entries; expected exactly three."
 
     # -----------------------------------------------------------------------
-    Write-Host '5/28 the index is rebuildable from the journal and the entry audits' -ForegroundColor Cyan
+    Write-Host '5/30 the index is rebuildable from the journal and the entry audits' -ForegroundColor Cyan
     $indexPathA = Join-Path $caseA 'index\cohort-index.json'
     $beforeRebuild = Get-JsonFile -Path $indexPathA
     Remove-Item -LiteralPath $indexPathA -Force
@@ -1044,7 +1112,7 @@ try {
         "The rebuilt index says '$($afterRebuild.terminalReason)' and the run published '$($beforeRebuild.terminalReason)'."
 
     # -----------------------------------------------------------------------
-    Write-Host '6/28 failFast leaves the remaining entries pending' -ForegroundColor Cyan
+    Write-Host '6/30 failFast leaves the remaining entries pending' -ForegroundColor Cyan
     $caseB = Join-Path $sandboxRoot 'case-b'
     $b1 = New-CohortEntryRequest -Sandbox $caseB -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $b2 = New-CohortEntryRequest -Sandbox $caseB -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -1120,7 +1188,7 @@ try {
     Assert-Cohort ($recordB2c3.outcome -eq 'complete') 'The continue policy did not carry on past an accounted-for failure.'
 
     # -----------------------------------------------------------------------
-    Write-Host '7/28 a child that hangs is killed at its declared ceiling' -ForegroundColor Cyan
+    Write-Host '7/30 a child that hangs is killed at its declared ceiling' -ForegroundColor Cyan
     $caseC = Join-Path $sandboxRoot 'case-c'
     $c1 = New-CohortEntryRequest -Sandbox $caseC -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $c2 = New-CohortEntryRequest -Sandbox $caseC -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -1164,7 +1232,7 @@ try {
         'A resume over a refused entry started the entry after it.'
 
     # -----------------------------------------------------------------------
-    Write-Host '8/28 kill at a cohort transition, then refuse to run beside a live child' -ForegroundColor Cyan
+    Write-Host '8/30 kill at a cohort transition, then refuse to run beside a live child' -ForegroundColor Cyan
     $caseD = Join-Path $sandboxRoot 'case-d'
     $d1 = New-CohortEntryRequest -Sandbox $caseD -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $d2 = New-CohortEntryRequest -Sandbox $caseD -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -1220,7 +1288,7 @@ try {
         Start-Sleep -Milliseconds 500
     }
     # -----------------------------------------------------------------------
-    Write-Host '9/28 resume is idempotent and starts exactly the next entry' -ForegroundColor Cyan
+    Write-Host '9/30 resume is idempotent and starts exactly the next entry' -ForegroundColor Cyan
     [void](New-StubControl -Path $d2.ControlPath -ExitCode 0 -StartedMarker $markerD)
     $resumed = Invoke-Cohort -ManifestPath $manifestD
     Assert-Cohort ($resumed.ExitCode -eq 0) "The resumed cohort exited $($resumed.ExitCode); expected 0."
@@ -1236,7 +1304,7 @@ try {
         'The resumed cohort did not publish a completed index over all three entries.'
 
     # -----------------------------------------------------------------------
-    Write-Host '10/28 a journal edited after it was written is refused' -ForegroundColor Cyan
+    Write-Host '10/30 a journal edited after it was written is refused' -ForegroundColor Cyan
     $journalPathD = Join-Path $journalD 'cohort-journal.json'
     $tamperedJournal = (Get-Content -LiteralPath $journalPathD -Raw) -replace '"attempt": 2', '"attempt": 3'
     [IO.File]::WriteAllBytes($journalPathD, ([Text.UTF8Encoding]::new($false)).GetBytes($tamperedJournal))
@@ -1245,7 +1313,7 @@ try {
     Assert-Cohort ($tamperRun.Output -match 'signature') 'The refusal did not name the signature that failed.'
 
     # -----------------------------------------------------------------------
-    Write-Host '11/28 a manifest edited between runs is refused' -ForegroundColor Cyan
+    Write-Host '11/30 a manifest edited between runs is refused' -ForegroundColor Cyan
     $caseE = Join-Path $sandboxRoot 'case-e'
     $e1 = New-CohortEntryRequest -Sandbox $caseE -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     [void](New-StubControl -Path $e1.ControlPath -ExitCode 0)
@@ -1261,7 +1329,7 @@ try {
     Assert-Cohort ($editedRun.ExitCode -eq 2) "Resuming under an edited manifest exited $($editedRun.ExitCode); expected 2."
 
     # -----------------------------------------------------------------------
-    Write-Host '12/28 a journal key without its journal is not started over' -ForegroundColor Cyan
+    Write-Host '12/30 a journal key without its journal is not started over' -ForegroundColor Cyan
     Remove-Item -LiteralPath (Join-Path $caseE 'journal\cohort-journal.json') -Force
     $orphanKey = Invoke-Cohort -ManifestPath $manifestE
     Assert-Cohort ($orphanKey.ExitCode -eq 2) "A key without a journal exited $($orphanKey.ExitCode); expected 2."
@@ -1344,7 +1412,7 @@ try {
         "Resuming over a journal holding a negative exit code exited $($rerunE3.ExitCode); expected 11."
 
     # -----------------------------------------------------------------------
-    Write-Host '13/28 global budget exhaustion stops before the next entry' -ForegroundColor Cyan
+    Write-Host '13/30 global budget exhaustion stops before the next entry' -ForegroundColor Cyan
     $caseF = Join-Path $sandboxRoot 'case-f'
     $f1 = New-CohortEntryRequest -Sandbox $caseF -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $f2 = New-CohortEntryRequest -Sandbox $caseF -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -1411,7 +1479,7 @@ try {
         'The index does not report the unaccounted entry as ended.'
 
     # -----------------------------------------------------------------------
-    Write-Host '14/28 an observed provider write blocks the whole cohort' -ForegroundColor Cyan
+    Write-Host '14/30 an observed provider write blocks the whole cohort' -ForegroundColor Cyan
     $caseG = Join-Path $sandboxRoot 'case-g'
     $g1 = New-CohortEntryRequest -Sandbox $caseG -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $g2 = New-CohortEntryRequest -Sandbox $caseG -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -1457,7 +1525,7 @@ try {
         'The index totals report no provider write for a cohort that stopped because it observed one.'
 
     # -----------------------------------------------------------------------
-    Write-Host '15/28 an entry audit this build cannot read blocks the whole cohort' -ForegroundColor Cyan
+    Write-Host '15/30 an entry audit this build cannot read blocks the whole cohort' -ForegroundColor Cyan
     $caseH = Join-Path $sandboxRoot 'case-h'
     $h1 = New-CohortEntryRequest -Sandbox $caseH -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $h2 = New-CohortEntryRequest -Sandbox $caseH -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -1672,7 +1740,7 @@ try {
         "A completed entry with no audit published terminal reason '$($indexHollow.terminalReason)'; expected blocked."
 
     # -----------------------------------------------------------------------
-    Write-Host '16/28 identity drift between the manifest and the request is refused' -ForegroundColor Cyan
+    Write-Host '16/30 identity drift between the manifest and the request is refused' -ForegroundColor Cyan
     $caseI = Join-Path $sandboxRoot 'case-i'
     $i1 = New-CohortEntryRequest -Sandbox $caseI -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     [void](New-StubControl -Path $i1.ControlPath -ExitCode 0)
@@ -1689,7 +1757,7 @@ try {
     Assert-Cohort ($indexI.terminalReason -eq 'contractRefusal') 'The refusal was not published in the index.'
 
     # -----------------------------------------------------------------------
-    Write-Host '17/28 a request edited after the manifest sealed it is refused' -ForegroundColor Cyan
+    Write-Host '17/30 a request edited after the manifest sealed it is refused' -ForegroundColor Cyan
     $caseJ = Join-Path $sandboxRoot 'case-j'
     $j1 = New-CohortEntryRequest -Sandbox $caseJ -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     [void](New-StubControl -Path $j1.ControlPath -ExitCode 0)
@@ -1704,7 +1772,7 @@ try {
     Assert-Cohort ($runJ.Output -match 'nobody authorized') 'The refusal did not say the request was never authorized.'
 
     # -----------------------------------------------------------------------
-    Write-Host '18/28 a rule bundle that changed under the declaration is refused' -ForegroundColor Cyan
+    Write-Host '18/30 a rule bundle that changed under the declaration is refused' -ForegroundColor Cyan
     $caseK = Join-Path $sandboxRoot 'case-k'
     $bundleK = Write-StrictJsonFile -Path (Join-Path $caseK 'inputs\rule-bundle.json') -Value ([pscustomobject]@{ declaredPaths = @('a') })
     $k1 = New-CohortEntryRequest -Sandbox $caseK -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
@@ -1718,7 +1786,7 @@ try {
     Assert-Cohort ($runK.ExitCode -eq 2) "A changed rule bundle exited $($runK.ExitCode); expected 2."
 
     # -----------------------------------------------------------------------
-    Write-Host '19/28 a toolkit that moved under the cohort is refused' -ForegroundColor Cyan
+    Write-Host '19/30 a toolkit that moved under the cohort is refused' -ForegroundColor Cyan
     $caseL = Join-Path $sandboxRoot 'case-l'
     $movedToolkit = New-CohortToolkit -Root (Join-Path $caseL 'toolkit') -Head $head
     $l1 = New-CohortEntryRequest -Sandbox $caseL -EntryId 'entry-one' -ToolkitRoot $movedToolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
@@ -1735,7 +1803,7 @@ try {
         'An entry was started under a checkout the manifest no longer describes.'
 
     # -----------------------------------------------------------------------
-    Write-Host '20/28 manifest shapes this build never runs' -ForegroundColor Cyan
+    Write-Host '20/30 manifest shapes this build never runs' -ForegroundColor Cyan
     $caseM = Join-Path $sandboxRoot 'case-m'
     $m1 = New-CohortEntryRequest -Sandbox $caseM -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273
     $m2 = New-CohortEntryRequest -Sandbox $caseM -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918274
@@ -1889,7 +1957,7 @@ try {
     Assert-Cohort ((Invoke-Cohort -ManifestPath $writeBudget).ExitCode -eq 2) 'A cohort asking for a write budget was not refused.'
 
     # -----------------------------------------------------------------------
-    Write-Host '21/28 an entry that declares less than the full pipeline is refused' -ForegroundColor Cyan
+    Write-Host '21/30 an entry that declares less than the full pipeline is refused' -ForegroundColor Cyan
     $caseN = Join-Path $sandboxRoot 'case-n'
     $n1 = New-CohortEntryRequest -Sandbox $caseN -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -PullRequestId 918273 -WithoutDelivery
     [void](New-StubControl -Path $n1.ControlPath -ExitCode 0)
@@ -1903,7 +1971,7 @@ try {
         'An entry declaring less than the full pipeline was started anyway.'
 
     # -----------------------------------------------------------------------
-    Write-Host '22/28 a cohort is an operator action, not an invocation shape' -ForegroundColor Cyan
+    Write-Host '22/30 a cohort is an operator action, not an invocation shape' -ForegroundColor Cyan
     $noAlias = Invoke-Cohort -ManifestPath $manifestA -OmitAuthorization
     Assert-Cohort ($noAlias.ExitCode -eq 1) "A cohort without --authorized-by exited $($noAlias.ExitCode); expected 1."
     Assert-Cohort ($noAlias.Output -match 'never by a timer') 'The refusal did not say a cohort is started by an operator.'
@@ -1923,7 +1991,7 @@ try {
     Assert-Cohort ($rebuildAlone.ExitCode -eq 1) "--rebuild-index outside a cohort exited $($rebuildAlone.ExitCode); expected 1."
 
     # -----------------------------------------------------------------------
-    Write-Host '23/28 the key a real preparation writes is the key the cohort reads' -ForegroundColor Cyan
+    Write-Host '23/30 the key a real preparation writes is the key the cohort reads' -ForegroundColor Cyan
     # The one entry in this suite that is NOT a stub. Everything else here proves
     # accounting across processes and is faster and sharper for being stubbed;
     # this proves the one thing a stub cannot, which is that the bytes the real
@@ -2065,7 +2133,7 @@ try {
         'A real preparation that ran to its target published an audit that does not declare itself finished.'
 
     # -----------------------------------------------------------------------
-    Write-Host '24/28 the cohort budget is spent in real model starts' -ForegroundColor Cyan
+    Write-Host '24/30 the cohort budget is spent in real model starts' -ForegroundColor Cyan
     # Two slots reviewed by a generalist pair each is four model subprocess
     # starts. The shipped defect budgeted three for exactly this shape, because
     # it counted reviewer processes - one for the first slot, two after the
@@ -2204,7 +2272,7 @@ try {
     }
 
     # -----------------------------------------------------------------------
-    Write-Host '25/28 an estimate is an upper bound or the cohort does not start' -ForegroundColor Cyan
+    Write-Host '25/30 an estimate is an upper bound or the cohort does not start' -ForegroundColor Cyan
     # The ceiling of three was not a typo. Nothing in the shipped build required
     # an estimate to be anything in particular, so an operator number that had
     # never been checked against the plan became the budget. Every refusal here
@@ -2265,7 +2333,7 @@ try {
         'The refusal of a v1 manifest did not say that its model start budget is the reason.'
 
     # -----------------------------------------------------------------------
-    Write-Host '26/28 a production cohort cannot pass a fault argument' -ForegroundColor Cyan
+    Write-Host '26/30 a production cohort cannot pass a fault argument' -ForegroundColor Cyan
     # A real operator cohort forwarded '--halt-after deliveryTerminalVerified' to
     # three live pull requests. The first entry did exactly as it was told, exited
     # 9, and was recorded as a fault; the two behind it never ran. The argument
@@ -2429,7 +2497,7 @@ try {
     Assert-Cohort ($runBadKind.ExitCode -eq 2) "A manifest declaring an unknown kind exited $($runBadKind.ExitCode); expected 2."
 
     # -----------------------------------------------------------------------
-    Write-Host '27/28 an entry is reviewed against the branch it merges into' -ForegroundColor Cyan
+    Write-Host '27/30 an entry is reviewed against the branch it merges into' -ForegroundColor Cyan
     # The second entry of that same real cohort targeted a release branch and was
     # reviewed under a configuration bound to the trunk. Nothing compared the two,
     # so the mismatch was discovered by the preparation, halfway through, after it
@@ -2520,7 +2588,7 @@ try {
         "A cohort whose reviewer configuration is missing exited $($runGoneTarget.ExitCode); expected 11."
 
     # -----------------------------------------------------------------------
-    Write-Host '28/28 a chosen ending is read from the audit, not from the exit code' -ForegroundColor Cyan
+    Write-Host '28/30 a chosen ending is read from the audit, not from the exit code' -ForegroundColor Cyan
     # The first entry of the real cohort reached deliveryTerminalVerified, wrote
     # every artifact, wrote its ending, and exited 9 because it had been told to
     # stop there. It was recorded as a fault and the cohort abandoned the rest.
@@ -2722,29 +2790,297 @@ try {
     # because it belongs to an operator's machine and not to this repository.
     if ($FrozenCohortManifest -and (Test-Path -LiteralPath $FrozenCohortManifest -PathType Leaf)) {
         $frozen = Get-Content -LiteralPath $FrozenCohortManifest -Raw | ConvertFrom-Json -Depth 24
-        $frozenIndexPath = [string]$frozen.audit.indexPath
-        $frozenBackup = Join-Path $sandboxRoot 'frozen-index-before.json'
-        Copy-Item -LiteralPath $frozenIndexPath -Destination $frozenBackup -Force
-        try {
+        $frozenContract = [string]$frozen.contractVersion
+        # A frozen root declared against a superseded contract is refused by name
+        # rather than rebuilt. That is the point of the version: its verifier
+        # ceiling was declared in a unit this build no longer spends, and
+        # rebuilding it would rescore an operator's authorized number by a factor
+        # of forty without saying so.
+        if ($frozenContract -ne 'devpilot.shadow-cohort.manifest.v3') {
             $runFrozen = Invoke-Cohort -ManifestPath $FrozenCohortManifest -AuthorizedBy 'test-operator' -RebuildIndex
-            Assert-Cohort ($runFrozen.ExitCode -eq 0) `
-                "Rebuilding the frozen cohort index exited $($runFrozen.ExitCode); expected 0. $($runFrozen.Output)"
-            $frozenJson = Get-Content -LiteralPath $frozenIndexPath -Raw | ConvertFrom-Json -Depth 24
-            Assert-Cohort ($frozenJson.completedEntryCount -ge 1) `
-                "The frozen cohort rebuilt with $($frozenJson.completedEntryCount) complete entries; expected at least 1."
-            Assert-Cohort (@($frozenJson.adoptedCompleteEntryOrdinals) -contains 1) `
-                'The frozen cohort did not adopt its first entry, which halted at the declared target.'
-            Assert-Cohort ($frozenJson.entries[1].outcome -eq 'evidenceRefused') `
-                "The frozen cohort's second entry rebuilt as '$($frozenJson.entries[1].outcome)'; expected 'evidenceRefused'."
-            Assert-Cohort ($frozenJson.consumed.providerWrites -eq 0) `
-                'The frozen cohort rebuilt with a non-zero provider write count.'
+            Assert-Cohort ($runFrozen.ExitCode -eq 2) `
+                "Rebuilding a frozen '$frozenContract' cohort exited $($runFrozen.ExitCode); expected 2. $($runFrozen.Output)"
+            Assert-Cohort ($runFrozen.Output -match 'budget') `
+                'The refusal of a superseded frozen manifest did not name its budget as the reason.'
         }
-        finally {
-            Copy-Item -LiteralPath $frozenBackup -Destination $frozenIndexPath -Force
+        else {
+            $frozenIndexPath = [string]$frozen.audit.indexPath
+            $frozenBackup = Join-Path $sandboxRoot 'frozen-index-before.json'
+            Copy-Item -LiteralPath $frozenIndexPath -Destination $frozenBackup -Force
+            try {
+                $runFrozen = Invoke-Cohort -ManifestPath $FrozenCohortManifest -AuthorizedBy 'test-operator' -RebuildIndex
+                Assert-Cohort ($runFrozen.ExitCode -eq 0) `
+                    "Rebuilding the frozen cohort index exited $($runFrozen.ExitCode); expected 0. $($runFrozen.Output)"
+                $frozenJson = Get-Content -LiteralPath $frozenIndexPath -Raw | ConvertFrom-Json -Depth 24
+                Assert-Cohort ($frozenJson.completedEntryCount -ge 1) `
+                    "The frozen cohort rebuilt with $($frozenJson.completedEntryCount) complete entries; expected at least 1."
+                Assert-Cohort (@($frozenJson.adoptedCompleteEntryOrdinals) -contains 1) `
+                    'The frozen cohort did not adopt its first entry, which halted at the declared target.'
+                Assert-Cohort ($frozenJson.entries[1].outcome -eq 'evidenceRefused') `
+                    "The frozen cohort's second entry rebuilt as '$($frozenJson.entries[1].outcome)'; expected 'evidenceRefused'."
+                Assert-Cohort ($frozenJson.consumed.providerWrites -eq 0) `
+                    'The frozen cohort rebuilt with a non-zero provider write count.'
+            }
+            finally {
+                Copy-Item -LiteralPath $frozenBackup -Destination $frozenIndexPath -Force
+            }
         }
     }
     else {
         Write-Host '  frozen cohort root not present; skipped' -ForegroundColor DarkGray
+    }
+
+    # -----------------------------------------------------------------------
+    Write-Host '29/30 the verifier ceiling is spent in real assignments' -ForegroundColor Cyan
+    # The defect this section is about. A shadow run whose two slots stood on
+    # forty cross-verifier assignments published a cohort index saying four,
+    # because the figure was derived by counting how many verifier-backed
+    # terminal transitions had been committed - a list with eight members. A
+    # ceiling declared in that unit cannot be crossed by any run, however many
+    # assignments it really hands out.
+    $caseVer = Join-Path $sandboxRoot 'case-verifier'
+
+    # A run that stood on forty assignments is accounted as forty. Two slots,
+    # twenty per reciprocal model, served by twenty grouped subprocesses - which
+    # is the second census and is published beside it rather than instead of it.
+    $vf1 = New-CohortEntryRequest -Sandbox $caseVer -EntryId 'entry-one' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 990001
+    [void](New-StubControl -Path $vf1.ControlPath -ExitCode 0 -RealVerifierAssignmentCount 40 `
+            -RealVerifierAssignmentsByModel @(
+            [ordered]@{ verifierModel = 'stub-verifier-a'; assignmentCount = 20 },
+            [ordered]@{ verifierModel = 'stub-verifier-b'; assignmentCount = 20 }) `
+            -VerifierProcessStartCount 20 -RealModelStartsVerifier 20 -RealModelStartCount 24 `
+            -RealModelStartsGeneralist 4)
+    $verIndexPath = Join-Path $caseVer 'index\cohort-index.json'
+    $manifestVer = New-CohortManifestFile -Path (Join-Path $caseVer 'cohort.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -MaxModelStarts 64 -MaxVerifierAssignments 256 `
+        -JournalRoot (Join-Path $caseVer 'journal') -IndexPath $verIndexPath -StubPath $stub -Entries @(
+        (New-CohortEntryDeclaration -Request $vf1 -Ordinal 1 -RuleBundlePath $ruleBundle `
+            -EstimatedModelStarts 24 -BoundMaxRealModelStarts 24 `
+            -EstimatedVerifierAssignments 256 -BoundMaxVerifierAssignments 256))
+    $runVer = Invoke-Cohort -ManifestPath $manifestVer
+    Assert-Cohort ($runVer.ExitCode -eq 0) `
+        "A cohort whose entry stood on forty assignments exited $($runVer.ExitCode); expected 0. $($runVer.Output)"
+    $verJson = Get-Content -LiteralPath $verIndexPath -Raw | ConvertFrom-Json -Depth 24
+    Assert-Cohort ($verJson.consumed.verifierAssignments -eq 40) `
+        "The index totalled $($verJson.consumed.verifierAssignments) verifier assignments; expected 40, not the four its terminal states imply."
+    Assert-Cohort ($verJson.consumed.verifierProcessStarts -eq 20) `
+        "The index totalled $($verJson.consumed.verifierProcessStarts) verifier process starts; expected 20 published as a diagnostic."
+    $verSummary = Get-CohortIndexEntry -Index $verJson -EntryId 'entry-one'
+    Assert-Cohort (@($verSummary.verifierAssignmentsByModel).Count -eq 2) `
+        'The per-entry summary did not break its assignment census down by reciprocal model.'
+    Assert-Cohort (((@($verSummary.verifierAssignmentsByModel) | Measure-Object -Property assignmentCount -Sum).Sum ?? 0) -eq 40) `
+        'The per-model breakdown does not account for the total it is published beside.'
+    # The whole point of the two censuses being separate: the assignment total is
+    # not the verifier model start total, and neither is derived from the other.
+    Assert-Cohort ($verSummary.modelStartsVerifier -eq 20 -and $verSummary.verifierAssignmentCount -eq 40) `
+        'The assignment census was collapsed into the verifier model start census.'
+
+    # The ceiling now has teeth in the right unit. A cohort declaring the old
+    # four is refused before it starts, because the entry's own sealed bound
+    # proves it may hand out more than that.
+    $manifestVerLow = New-CohortManifestFile -Path (Join-Path $caseVer 'cohort-low.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -MaxModelStarts 64 -MaxVerifierAssignments 4 `
+        -JournalRoot (Join-Path $caseVer 'journal-low') -IndexPath (Join-Path $caseVer 'index\low.json') `
+        -StubPath $stub -Entries @(
+        (New-CohortEntryDeclaration -Request $vf1 -Ordinal 1 -RuleBundlePath $ruleBundle `
+            -EstimatedModelStarts 24 -BoundMaxRealModelStarts 24 `
+            -EstimatedVerifierAssignments 4 -BoundMaxVerifierAssignments 256))
+    $runVerLow = Invoke-Cohort -ManifestPath $manifestVerLow
+    Assert-Cohort ($runVerLow.ExitCode -eq 2) `
+        "A cohort declaring four verifier assignments over a bound of 256 exited $($runVerLow.ExitCode); expected 2. $($runVerLow.Output)"
+    Assert-Cohort ($runVerLow.Output -match 'verifier assignment') `
+        'The refusal of an under-declared verifier estimate did not name the unit.'
+
+    # A global ceiling that cannot hold the sum of the proven bounds is refused
+    # on the same terms as the model-start ceiling is.
+    $vf2 = New-CohortEntryRequest -Sandbox $caseVer -EntryId 'entry-two' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 990002
+    [void](New-StubControl -Path $vf2.ControlPath -ExitCode 0)
+    $manifestVerSum = New-CohortManifestFile -Path (Join-Path $caseVer 'cohort-sum.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -MaxModelStarts 64 -MaxVerifierAssignments 300 `
+        -JournalRoot (Join-Path $caseVer 'journal-sum') -IndexPath (Join-Path $caseVer 'index\sum.json') `
+        -StubPath $stub -Entries @(
+        (New-CohortEntryDeclaration -Request $vf1 -Ordinal 1 -RuleBundlePath $ruleBundle `
+            -EstimatedVerifierAssignments 256 -BoundMaxVerifierAssignments 256),
+        (New-CohortEntryDeclaration -Request $vf2 -Ordinal 2 -RuleBundlePath $ruleBundle `
+            -EstimatedVerifierAssignments 256 -BoundMaxVerifierAssignments 256))
+    $runVerSum = Invoke-Cohort -ManifestPath $manifestVerSum
+    Assert-Cohort ($runVerSum.ExitCode -eq 2) `
+        "A cohort whose bounds sum past its verifier ceiling exited $($runVerSum.ExitCode); expected 2. $($runVerSum.Output)"
+
+    # An entry whose actual assignments cross the ceiling stops the cohort, and
+    # the entry behind it is never launched. Its own result stands: the evidence
+    # it produced is not discarded, and it is not run again.
+    $vf3 = New-CohortEntryRequest -Sandbox $caseVer -EntryId 'entry-spend' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 990003
+    $vf4 = New-CohortEntryRequest -Sandbox $caseVer -EntryId 'entry-after' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 990004
+    [void](New-StubControl -Path $vf3.ControlPath -ExitCode 0 -RealVerifierAssignmentCount 40 `
+            -RealVerifierAssignmentsByModel @(
+            [ordered]@{ verifierModel = 'stub-verifier-a'; assignmentCount = 20 },
+            [ordered]@{ verifierModel = 'stub-verifier-b'; assignmentCount = 20 }) `
+            -VerifierProcessStartCount 20 -RealModelStartsVerifier 20 -RealModelStartCount 24 -RealModelStartsGeneralist 4)
+    [void](New-StubControl -Path $vf4.ControlPath -ExitCode 0)
+    $spendIndexPath = Join-Path $caseVer 'index\spend.json'
+    $manifestVerSpend = New-CohortManifestFile -Path (Join-Path $caseVer 'cohort-spend.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -MaxModelStarts 128 -MaxVerifierAssignments 16 `
+        -JournalRoot (Join-Path $caseVer 'journal-spend') -IndexPath $spendIndexPath -StubPath $stub -Entries @(
+        (New-CohortEntryDeclaration -Request $vf3 -Ordinal 1 -RuleBundlePath $ruleBundle `
+            -EstimatedModelStarts 24 -BoundMaxRealModelStarts 24 `
+            -EstimatedVerifierAssignments 8 -BoundMaxVerifierAssignments 8),
+        (New-CohortEntryDeclaration -Request $vf4 -Ordinal 2 -RuleBundlePath $ruleBundle `
+            -EstimatedVerifierAssignments 8 -BoundMaxVerifierAssignments 8))
+    $runVerSpend = Invoke-Cohort -ManifestPath $manifestVerSpend
+    Assert-Cohort ($runVerSpend.ExitCode -eq 10) `
+        "A cohort whose first entry overspent its verifier ceiling exited $($runVerSpend.ExitCode); expected 10. $($runVerSpend.Output)"
+    Assert-Cohort (-not (Test-Path -LiteralPath (Join-Path $vf4.OutputRoot 'coordinator\audit.json'))) `
+        'A cohort that had overspent its verifier ceiling launched the entry behind it anyway.'
+    $spendJson = Get-Content -LiteralPath $spendIndexPath -Raw | ConvertFrom-Json -Depth 24
+    Assert-Cohort ($spendJson.consumed.verifierAssignments -eq 40) `
+        "The overspent cohort recorded $($spendJson.consumed.verifierAssignments) assignments; expected the 40 its entry really stood on."
+    Assert-Cohort ($spendJson.pendingEntryCount -eq 1) `
+        "The overspent cohort left $($spendJson.pendingEntryCount) entries pending; expected 1."
+
+    # The refusals. Every one of these blocks the whole cohort rather than the
+    # entry, because an entry whose verifier spend is unknown is one the next
+    # entry must not be launched against.
+    $censusCases = @(
+        @{ Name = 'no assignment census at all'; Args = @{ OmitRealVerifierAssignments = $true } },
+        @{ Name = 'an incomplete census'; Args = @{ RealVerifierAssignmentCensusComplete = $false } },
+        @{ Name = 'a breakdown that does not add up'; Args = @{ RealVerifierAssignmentCount = 40 } },
+        @{ Name = 'a model named twice'; Args = @{ RealVerifierAssignmentCount = 8; RealVerifierAssignmentsByModel = @(
+                    [ordered]@{ verifierModel = 'stub-verifier-a'; assignmentCount = 4 },
+                    [ordered]@{ verifierModel = 'stub-verifier-a'; assignmentCount = 4 }) } },
+        @{ Name = 'processes without assignments'; Args = @{ RealVerifierAssignmentCount = 0; VerifierProcessStartCount = 6
+                RealVerifierAssignmentsByModel = @()
+            } },
+        @{ Name = 'verifier model starts without assignments'; Args = @{ RealVerifierAssignmentCount = 0; VerifierProcessStartCount = 0
+                RealVerifierAssignmentsByModel = @(); RealModelStartsVerifier = 6; RealModelStartCount = 8; RealModelStartsGeneralist = 2
+            } }
+    )
+    $censusIndex = 0
+    foreach ($censusCase in $censusCases) {
+        $censusIndex++
+        $vc = New-CohortEntryRequest -Sandbox $caseVer -EntryId "entry-census-$censusIndex" -ToolkitRoot $toolkit `
+            -Head $head -RequiredRef $requiredRef -PullRequestId (990100 + $censusIndex)
+        $censusArgs = [hashtable]$censusCase.Args
+        $censusArgs['Path'] = $vc.ControlPath
+        $censusArgs['ExitCode'] = 0
+        [void](New-StubControl @censusArgs)
+        $manifestCensus = New-CohortManifestFile -Path (Join-Path $caseVer "census-$censusIndex.json") `
+            -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -MaxVerifierAssignments 256 `
+            -JournalRoot (Join-Path $caseVer "journal-census-$censusIndex") `
+            -IndexPath (Join-Path $caseVer "index\census-$censusIndex.json") -StubPath $stub -Entries @(
+            (New-CohortEntryDeclaration -Request $vc -Ordinal 1 -RuleBundlePath $ruleBundle `
+                -EstimatedVerifierAssignments 256 -BoundMaxVerifierAssignments 256))
+        $runCensus = Invoke-Cohort -ManifestPath $manifestCensus
+        Assert-Cohort ($runCensus.ExitCode -eq 11) `
+            "A cohort reading '$($censusCase.Name)' exited $($runCensus.ExitCode); expected 11. $($runCensus.Output)"
+    }
+
+    # Zero candidates is a reading, not an absence. A run authorized to
+    # cross-verify that found nothing to verify stood on no assignment, started
+    # no verifier process, and is accounted at zero rather than refused.
+    $vz = New-CohortEntryRequest -Sandbox $caseVer -EntryId 'entry-zero' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 990200
+    [void](New-StubControl -Path $vz.ControlPath -ExitCode 0 -RealVerifierAssignmentCount 0 `
+            -RealVerifierAssignmentsByModel @() -VerifierProcessStartCount 0 -RealModelStartsVerifier 0)
+    $zeroIndexPath = Join-Path $caseVer 'index\zero.json'
+    $manifestZero = New-CohortManifestFile -Path (Join-Path $caseVer 'cohort-zero.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -MaxVerifierAssignments 256 `
+        -JournalRoot (Join-Path $caseVer 'journal-zero') -IndexPath $zeroIndexPath -StubPath $stub -Entries @(
+        (New-CohortEntryDeclaration -Request $vz -Ordinal 1 -RuleBundlePath $ruleBundle `
+            -EstimatedVerifierAssignments 256 -BoundMaxVerifierAssignments 256))
+    $runZero = Invoke-Cohort -ManifestPath $manifestZero
+    Assert-Cohort ($runZero.ExitCode -eq 0) `
+        "A cohort whose entry had nothing to verify exited $($runZero.ExitCode); expected 0. $($runZero.Output)"
+    $zeroJson = Get-Content -LiteralPath $zeroIndexPath -Raw | ConvertFrom-Json -Depth 24
+    Assert-Cohort ($zeroJson.consumed.verifierAssignments -eq 0) `
+        'An entry with no candidates was not accounted at zero assignments.'
+
+    # A manifest written against the contract whose verifier ceiling was declared
+    # in terminal transitions is refused by name, exactly as the v1 model-start
+    # contract is. Rescoring it would multiply an authorized number by forty.
+    $manifestVerLegacy = New-CohortManifestFile -Path (Join-Path $caseVer 'legacy-v2.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef `
+        -ContractVersion 'devpilot.shadow-cohort.manifest.v2' `
+        -JournalRoot (Join-Path $caseVer 'journal-legacy') -IndexPath (Join-Path $caseVer 'index\legacy-v2.json') `
+        -StubPath $stub -Entries @((New-CohortEntryDeclaration -Request $vf2 -Ordinal 1 -RuleBundlePath $ruleBundle))
+    $runVerLegacy = Invoke-Cohort -ManifestPath $manifestVerLegacy
+    Assert-Cohort ($runVerLegacy.ExitCode -eq 2) `
+        "A v2 manifest exited $($runVerLegacy.ExitCode); expected 2. $($runVerLegacy.Output)"
+    Assert-Cohort ($runVerLegacy.Output -match 'verifier-assignment budget') `
+        'The refusal of a v2 manifest did not say that its verifier budget is the reason.'
+
+    # An adopted entry is accounted in the same unit as a completed one, and a
+    # rebuild re-derives the census from the artifacts rather than inheriting the
+    # journal's word for it.
+    $va = New-CohortEntryRequest -Sandbox $caseVer -EntryId 'entry-adopt' -ToolkitRoot $toolkit -Head $head `
+        -RequiredRef $requiredRef -PullRequestId 990300
+    [void](New-StubControl -Path $va.ControlPath -ExitCode 9 -TerminalReason 'deliberateHalt' `
+            -RealVerifierAssignmentCount 40 -RealVerifierAssignmentsByModel @(
+            [ordered]@{ verifierModel = 'stub-verifier-a'; assignmentCount = 20 },
+            [ordered]@{ verifierModel = 'stub-verifier-b'; assignmentCount = 20 }) `
+            -VerifierProcessStartCount 20 -RealModelStartsVerifier 20 -RealModelStartCount 24 -RealModelStartsGeneralist 4)
+    $adoptVerIndexPath = Join-Path $caseVer 'index\adopt.json'
+    $manifestVerAdopt = New-CohortManifestFile -Path (Join-Path $caseVer 'cohort-adopt.json') `
+        -ToolkitRoot $toolkit -Head $head -RequiredRef $requiredRef -MaxModelStarts 64 -MaxVerifierAssignments 256 `
+        -JournalRoot (Join-Path $caseVer 'journal-adopt') -IndexPath $adoptVerIndexPath -StubPath $stub -Entries @(
+        (New-CohortEntryDeclaration -Request $va -Ordinal 1 -RuleBundlePath $ruleBundle `
+            -EstimatedModelStarts 24 -BoundMaxRealModelStarts 24 `
+            -EstimatedVerifierAssignments 256 -BoundMaxVerifierAssignments 256))
+    $runVerAdopt = Invoke-Cohort -ManifestPath $manifestVerAdopt
+    Assert-Cohort ($runVerAdopt.ExitCode -eq 0) `
+        "A cohort adopting an entry that halted at the target exited $($runVerAdopt.ExitCode); expected 0. $($runVerAdopt.Output)"
+    $rebuildVerAdopt = Invoke-Cohort -ManifestPath $manifestVerAdopt -RebuildIndex
+    Assert-Cohort ($rebuildVerAdopt.ExitCode -eq 0) `
+        "Rebuilding over an adopted entry exited $($rebuildVerAdopt.ExitCode); expected 0. $($rebuildVerAdopt.Output)"
+    $adoptVerJson = Get-Content -LiteralPath $adoptVerIndexPath -Raw | ConvertFrom-Json -Depth 24
+    Assert-Cohort ($adoptVerJson.consumed.verifierAssignments -eq 40) `
+        "A rebuild over an adopted entry recorded $($adoptVerJson.consumed.verifierAssignments) assignments; expected 40."
+
+    # -----------------------------------------------------------------------
+    Write-Host '30/30 the real assignment census over a frozen operator root' -ForegroundColor Cyan
+    # The run this whole change exists for, read where it still stands. Nothing
+    # is launched, no model is started and nothing in the root is written: the
+    # census is taken over the sealed previews the run left behind.
+    if ($FrozenVerifierRunRoot -and (Test-Path -LiteralPath $FrozenVerifierRunRoot -PathType Container)) {
+        . (Join-Path $RepoRoot 'src\Agents\reviewer\ModelStartCensus.ps1')
+        $frozenTotal = 0
+        $frozenProcesses = 0
+        $frozenByModel = @{}
+        $frozenSlots = 0
+        foreach ($slotRoot in @(Get-ChildItem -LiteralPath $FrozenVerifierRunRoot -Directory -Recurse -Filter 'verification-previews')) {
+            $frozenSlots++
+            $census = Get-ReviewerVerifierAssignmentCensus -RunRoot ([string]$slotRoot.Parent.FullName) `
+                -Argv @('-EnableVerificationPreview')
+            $frozenTotal += [int]$census.realVerifierAssignments
+            $frozenProcesses += [int]$census.verifierProcessStarts
+            foreach ($row in @($census.byVerifierModel)) {
+                $name = [string]$row.verifierModel
+                $frozenByModel[$name] = [int]$(if ($frozenByModel.ContainsKey($name)) { $frozenByModel[$name] } else { 0 }) + [int]$row.assignmentCount
+            }
+        }
+        Assert-Cohort ($frozenSlots -ge 1) 'The frozen verifier root carries no sealed verification previews.'
+        if ($FrozenVerifierExpectedAssignments -gt 0) {
+            Assert-Cohort ($frozenTotal -eq $FrozenVerifierExpectedAssignments) `
+                "The frozen root's real assignment census is $frozenTotal; expected $FrozenVerifierExpectedAssignments."
+        }
+        # The reclassification. The cohort that produced this root declared its
+        # verifier ceiling in the old unit, and the real census exceeds it - which
+        # under this build is a budget the entry crossed rather than a number
+        # nobody could reach.
+        Assert-Cohort ($frozenTotal -gt $FrozenVerifierDeclaredCeiling) `
+            "The frozen root totalled $frozenTotal assignments against a declared ceiling of $FrozenVerifierDeclaredCeiling; the regression proves the ceiling was crossed."
+        Assert-Cohort ((($frozenByModel.Values | Measure-Object -Sum).Sum ?? 0) -eq $frozenTotal) `
+            'The frozen root''s per-model breakdown does not account for its own total.'
+        Assert-Cohort ($frozenProcesses -le $frozenTotal) `
+            "The frozen root reports $frozenProcesses verifier processes against $frozenTotal assignments; a launch cannot serve more assignments than exist."
+        Write-Host "  frozen root: $frozenTotal assignments, $frozenProcesses processes, $($frozenByModel.Keys.Count) reciprocal model(s)" -ForegroundColor DarkGray
+    }
+    else {
+        Write-Host '  frozen verifier root not present; skipped' -ForegroundColor DarkGray
     }
 }
 finally {

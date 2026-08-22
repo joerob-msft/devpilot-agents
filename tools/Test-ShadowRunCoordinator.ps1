@@ -1006,6 +1006,12 @@ Write-StubResult -Fields ([ordered]@{
         realModelStartUnmeasuredAllowance = 0
         realModelStartCensusBasis = 'stubNoModelRun'
         realModelStartCensusDetail = 'stub'
+        realVerifierAssignmentCount = 0
+        realVerifierAssignmentsByModel = @()
+        realVerifierAssignmentCensusComplete = $true
+        realVerifierAssignmentUnmeasuredAllowance = 0
+        realVerifierAssignmentCensusDetail = 'stub'
+        verifierProcessStartCount = 0
         deliveryMode = 'PreviewOnly'
         promotable = $false
     })
@@ -3240,6 +3246,21 @@ try {
         Assert-Coordinator ([int]$setAudit.realModelStartLaunchedSlotCount -eq 2 -and
             [int]$setAudit.supervisedSlotCount -eq 2) `
             'The audit does not account for both launched slots.'
+        # The THIRD census, in its own unit. A cohort's verifier ceiling is spent
+        # in reciprocal ASSIGNMENTS - candidate by required model - and the
+        # grouped launches that served them are a separate figure that no budget
+        # is checked against. A stubbed set stands on neither, and what is
+        # asserted is that both are reported rather than inferred.
+        Assert-Coordinator ([bool]$setAudit.realVerifierAssignmentsObserved) `
+            'A set that supervised two slots did not record that it had counted their verifier assignments.'
+        Assert-Coordinator ([int]$setAudit.realVerifierAssignmentCount -eq 0 -and
+            [int]$setAudit.verifierProcessStartCount -eq 0) `
+            'The audit does not publish a verifier assignment census beside its grouped process count.'
+        Assert-Coordinator ([bool]$setAudit.realVerifierAssignmentCensusComplete -and
+            [int]$setAudit.realVerifierAssignmentUnmeasuredAllowance -eq 0) `
+            'A set whose slots both ended cleanly published an incomplete verifier assignment census.'
+        Assert-Coordinator (@($setAudit.realVerifierAssignmentsByModel).Count -eq 0) `
+            'A set that stood on no assignment published a reciprocal breakdown anyway.'
         foreach ($record in @($setAudit.slots)) {
             Assert-Coordinator ([int]$record.slotAttemptRecordCount -eq [int]$record.slotAttemptCount) `
                 "The audit does not carry '$([string]$record.slotName)' reviewer process census."

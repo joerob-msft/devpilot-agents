@@ -936,6 +936,51 @@ function Invoke-ShadowChildSlotVerify {
             'the model starts it made cannot be counted from its own evidence.')
     }
 
+    # The second census, of a second unit: the cross-verifier ASSIGNMENTS this
+    # slot's run stood on. Taken from the run's own sealed previews and kept
+    # entirely apart from the model-start census, because an assignment is not a
+    # process - grouping means one launch can serve a whole cluster - and adding
+    # or substituting one for the other is the defect this exists to remove.
+    $assignmentCensus = $null
+    $assignmentFault = ''
+    if (Test-Path -LiteralPath $runRoot -PathType Container) {
+        try {
+            $assignmentCensus = Get-ReviewerVerifierAssignmentCensus -RunRoot $runRoot -Argv ([string[]]$target.Arguments)
+        }
+        catch {
+            # Same asymmetry as the model-start census above: a run that ended
+            # cleanly and left unreadable assignment evidence contradicts itself
+            # and is refused; an interrupted one is charged its plan's bound.
+            if ($censusExact) { throw }
+            $assignmentFault = [string]$_.Exception.Message
+        }
+    }
+    elseif ($censusExact) {
+        throw ("Slot '$($target.Name)' reports a complete run and left no run directory at '$runRoot', so the verifier " +
+            'assignments it stood on cannot be counted. A completed run that published no evidence is refused, not read as zero.')
+    }
+    else {
+        $assignmentFault = "The run root '$runRoot' does not exist."
+    }
+    $assignmentAllowance = Get-ReviewerVerifierAssignmentUnmeasuredAllowance -Argv ([string[]]$target.Arguments) `
+        -ReviewerScriptPath ([string]$context.ReviewerScriptPath) -RunEndedComplete $censusExact -Census $assignmentCensus
+    $assignmentComplete = $true
+    $assignmentDetail = ''
+    $assignmentTotal = 0
+    $assignmentByModel = @()
+    $verifierProcessStarts = 0
+    if ($null -eq $assignmentCensus) {
+        $assignmentComplete = $false
+        $assignmentDetail = [string]$assignmentFault
+    }
+    else {
+        $assignmentComplete = [bool]$assignmentCensus.complete
+        $assignmentDetail = [string]$assignmentCensus.incompleteReason
+        $assignmentTotal = [int]$assignmentCensus.realVerifierAssignments
+        $assignmentByModel = @($assignmentCensus.byVerifierModel)
+        $verifierProcessStarts = [int]$assignmentCensus.verifierProcessStarts
+    }
+
     return @{
         terminalStatus = [string]$terminal.status
         terminalExitCode = [int]$terminal.exitCode
@@ -971,6 +1016,18 @@ function Invoke-ShadowChildSlotVerify {
         realModelStartUnmeasuredAllowance = [int]$unmeasuredAllowance
         realModelStartCensusBasis = [string]$census.basis
         realModelStartCensusDetail = [string]$censusDetail
+        # The assignment census. 'realVerifierAssignmentCount' is THE figure a
+        # cohort's verifier ceiling is spent in - one per candidate per required
+        # reciprocal model, distinct across every sealed preview. The process
+        # count beside it is the grouped launch census and is a diagnostic: a
+        # ceiling checked against it would be a ceiling that shrank the moment
+        # grouping worked.
+        realVerifierAssignmentCount = [int]$assignmentTotal
+        realVerifierAssignmentsByModel = @($assignmentByModel)
+        realVerifierAssignmentCensusComplete = [bool]$assignmentComplete
+        realVerifierAssignmentUnmeasuredAllowance = [int]$assignmentAllowance
+        realVerifierAssignmentCensusDetail = [string]$assignmentDetail
+        verifierProcessStartCount = [int]$verifierProcessStarts
         deliveryMode = [string]$plan.DeliveryMode
         promotable = [bool]$plan.Promotable
     }
