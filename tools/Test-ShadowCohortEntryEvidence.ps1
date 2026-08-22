@@ -372,6 +372,14 @@ function New-CohortEntryFixture {
         MutateExecutionPlan = $null
         ExecutionPlanIsNull = $false
         PlannedRunCount = 2
+        # The four attempt factors the fixture runner declares, and from which
+        # the shipping producer derives this fixture's bound. Deliberately not
+        # the production numbers.
+        FixtureGeneralistAttempts = 2
+        FixtureSpecialistAttempts = 3
+        FixtureVerifierAttempts = 1
+        FixtureVerifierCeiling = 7
+        FixtureVerifierPolicyRuns = 5
     }
     if ($Mutate) { & $Mutate $state }
 
@@ -409,6 +417,23 @@ function New-CohortEntryFixture {
             [IO.File]::WriteAllBytes(
                 (Join-Path $toolkit 'src/Agents/reviewer/review-cycle.prompt.md'),
                 [System.Text.UTF8Encoding]::new($false).GetBytes("# fixture review cycle`n"))
+            # The REAL model-start bound producer and the REAL sources it derives
+            # from, copied byte for byte. The builder does not compute a bound; it
+            # invokes this producer out of the toolkit the request pins, so a
+            # fixture toolkit that shipped a stand-in producer would prove the
+            # binding against arithmetic nobody runs.
+            $harnessSource = Join-Path $PSScriptRoot '../src/DevPilot.AgentHarness'
+            $harnessTarget = Join-Path $toolkit 'src/DevPilot.AgentHarness'
+            [void](New-Item -ItemType Directory -Force -Path $harnessTarget)
+            Copy-Item -Path (Join-Path $harnessSource '*') -Destination $harnessTarget -Recurse -Force
+            foreach ($module in @('QualificationPreflight.ps1', 'ReplayQualification.ps1', 'ModelStartCensus.ps1')) {
+                Copy-Item -LiteralPath (Join-Path $PSScriptRoot "../src/Agents/reviewer/$module") `
+                    -Destination (Join-Path $toolkit "src/Agents/reviewer/$module") -Force
+            }
+            $toolsTarget = Join-Path $toolkit 'tools'
+            [void](New-Item -ItemType Directory -Force -Path $toolsTarget)
+            Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'New-ShadowModelStartBound.ps1') `
+                -Destination (Join-Path $toolsTarget 'New-ShadowModelStartBound.ps1') -Force
             & git add -A | Out-Null
             & git commit --quiet -m 'fixture' | Out-Null
             $toolkitHead = ([string](& git rev-parse HEAD)).Trim()
@@ -559,8 +584,35 @@ function New-CohortEntryFixture {
     if ($state.WithExecutionPlan) {
         # A real file, hashed for real: the plan pins the reviewed script by
         # digest and the builder re-hashes what is on disk.
+        #
+        # It also DECLARES its attempt bounds the way the shipping runner does,
+        # because the model-start bound is read out of the runner's own sources.
+        # The numbers are deliberately not the production ones: a fixture that
+        # reused them could not tell a bound that was derived from one that was
+        # written down. The suite recomputes the expected total from these same
+        # four factors, so the assertion proves the formula rather than a total.
         $reviewerScriptPath = Join-Path $Sandbox 'Start-ReviewerAgent.fixture.ps1'
-        [IO.File]::WriteAllBytes($reviewerScriptPath, $script:Utf8.GetBytes("param()`n# fixture reviewer entry point`n"))
+        [IO.File]::WriteAllBytes($reviewerScriptPath, $script:Utf8.GetBytes(@(
+                    'param()'
+                    '# fixture reviewer entry point'
+                    "`$script:ReviewerMarkerRetryAttempts = $($state.FixtureGeneralistAttempts)"
+                    "`$script:ReviewerConventionSpecialistMarkerRetryAttempts = $($state.FixtureSpecialistAttempts)"
+                    'switch ($role) {'
+                    "    'verifier' { $($state.FixtureVerifierAttempts) }"
+                    '}'
+                    ''
+                ) -join "`n"))
+        # The two siblings the runner bound is read from: the launch ceiling the
+        # runner narrows policy by, and the policy that states how many verifier
+        # launches one run may make.
+        [IO.File]::WriteAllBytes((Join-Path $Sandbox 'CrossVerification.ps1'), $script:Utf8.GetBytes(@(
+                    "`$script:ReviewerVerificationMaxVerifierRuns = $($state.FixtureVerifierCeiling)"
+                    ''
+                ) -join "`n"))
+        $policyDirectory = Join-Path $Sandbox 'verification/v1'
+        [void](New-Item -ItemType Directory -Force -Path $policyDirectory)
+        [IO.File]::WriteAllBytes((Join-Path $policyDirectory 'policy.json'),
+            $script:Utf8.GetBytes("{`n  `"maxVerifierRuns`": $($state.FixtureVerifierPolicyRuns)`n}`n"))
         # Deliberately NOT created. The builder records the path and never mints,
         # reads or requires a launch authorization; a fixture that pre-created one
         # would be testing a builder that could launch itself.
@@ -682,6 +734,13 @@ function New-CohortEntryFixture {
         ConfigPath = $configPath
         Toolkit = $toolkit
         ToolkitHead = $toolkitHead
+        FixtureBoundFactors = [pscustomobject]@{
+            GeneralistAttemptsPerPass = [int]$state.FixtureGeneralistAttempts
+            SpecialistAttempts = [int]$state.FixtureSpecialistAttempts
+            VerifierAttemptsPerLaunch = [int]$state.FixtureVerifierAttempts
+            VerifierCeiling = [int]$state.FixtureVerifierCeiling
+            VerifierPolicyRuns = [int]$state.FixtureVerifierPolicyRuns
+        }
         GeneralistPair = $registryPair
         SpecialistModel = $fixtureSpecialist
         VerifierModel = $fixtureVerifier
@@ -1553,33 +1612,70 @@ try {
     Assert-CohortEntry -Name 'a slot added after the hash no longer matches the pinned digest' `
         -Condition ($augmentedSha -cne [string]$v2Entry.request.sha256)
 
-    # The bound, derived from the request that was actually emitted.
+    # ---------------------------------------------------------------------
+    # The bound. DERIVED by the shipping producer over the request that was
+    # actually emitted, never synthesized here. The expected totals are
+    # recomputed from the same four attempt factors the fixture runner
+    # declares, so this asserts the FORMULA rather than a number: a builder
+    # that went back to writing the slot count down would fail every one of
+    # these even though two slots is still two slots.
+    # ---------------------------------------------------------------------
     $v2Bound = [IO.File]::ReadAllText((Join-Path $v2Result.Root 'entry/model-start-bound.json')) | ConvertFrom-Json -Depth 32
-    Assert-CohortEntry -Name 'a v2 plan raises the model-start bound contract to v3' `
-        -Condition ([string]$v2Bound.kind -ceq 'devpilot.shadow-cohort.model-start-bound.v3')
-    Assert-CohortEntry -Name 'the bound estimates a non-zero finite model start count' `
-        -Condition (([int]$v2Bound.modelStarts -eq 2) -and ([int]$v2Bound.modelStarts -gt 0))
-    Assert-CohortEntry -Name 'the bound estimates a non-zero finite verifier assignment count' `
-        -Condition (([int]$v2Bound.verifierAssignments -eq 2) -and ([int]$v2Bound.verifierAssignments -gt 0))
-    Assert-CohortEntry -Name 'the bound wall clock covers both slots, the reconciliation and the delivery' `
-        -Condition ([int]$v2Bound.wallClockSeconds -eq ((5400 + 120) * 4))
-    Assert-CohortEntry -Name 'the bound records the supervision envelope the plan declared' `
-        -Condition (([int]$v2Bound.supervision.perCallTimeoutSeconds -eq 900) -and
-            ([int]$v2Bound.supervision.slotTimeoutSeconds -eq 5400) -and
-            ([int]$v2Bound.supervision.progressTimeoutSeconds -eq 1200) -and
-            ([int]$v2Bound.supervision.supervisionGraceSeconds -eq 120))
-    Assert-CohortEntry -Name 'the bound records the derived generalist pair' `
-        -Condition ((@($v2Bound.assignment.generalistPair) -join '|') -ceq (@($v2Fixture.GeneralistPair) -join '|'))
-    Assert-CohortEntry -Name 'the bound records the convention specialist and verifier' `
-        -Condition (([string]$v2Bound.assignment.conventionSpecialistModel -ceq $v2Fixture.SpecialistModel) -and
-            ([string]$v2Bound.assignment.conventionVerifierModel -ceq $v2Fixture.VerifierModel))
-    Assert-CohortEntry -Name 'the bound records a preview-only, zero-write assignment' `
-        -Condition (([string]$v2Bound.assignment.deliveryAuthorizationKind -ceq 'PreviewOnly') -and
-            ([int]$v2Bound.assignment.providerWriteBudget -eq 0))
-    Assert-CohortEntry -Name "the manifest entry's plan estimate is the bound" `
-        -Condition (([int]$v2Entry.planEstimate.modelStarts -eq [int]$v2Bound.modelStarts) -and
-            ([int]$v2Entry.planEstimate.verifierAssignments -eq [int]$v2Bound.verifierAssignments) -and
-            ([int]$v2Entry.planEstimate.wallClockSeconds -eq [int]$v2Bound.wallClockSeconds))
+    $factors = $v2Fixture.FixtureBoundFactors
+    $expectedLaunches = [Math]::Min([int]$factors.VerifierPolicyRuns, [int]$factors.VerifierCeiling)
+    $expectedPerSlot = (2 * [int]$factors.GeneralistAttemptsPerPass) + [int]$factors.SpecialistAttempts +
+        ($expectedLaunches * [int]$factors.VerifierAttemptsPerLaunch)
+    $expectedStarts = $expectedPerSlot * 2
+    $expectedAssignments = $expectedLaunches * 2
+    Assert-CohortEntry -Name 'the bound is the kind the cohort runner reads' `
+        -Condition ([string]$v2Bound.kind -ceq 'devpilot.shadow-cohort.model-start-bound.v2')
+    Assert-CohortEntry -Name 'the bound binds the digest of the request this entry emitted' `
+        -Condition ([string]$v2Bound.requestSha256 -ceq [string]$v2Entry.request.sha256)
+    Assert-CohortEntry -Name 'the bound binds the toolkit head this entry pins' `
+        -Condition ([string]$v2Bound.toolkitHead -ceq $v2Fixture.ToolkitHead)
+    Assert-CohortEntry -Name 'the bound binds the reviewer configuration the request sealed' `
+        -Condition ([string]$v2Bound.reviewerConfigSha256 -ceq [string]$v2Request.digests.configSha256)
+    Assert-CohortEntry -Name 'the bound counts the two slots the request declared' `
+        -Condition (([int]$v2Bound.declaredSlotCount -eq 2) -and ([int]$v2Bound.plannedRunCount -eq 2))
+    Assert-CohortEntry -Name 'the bound multiplies the runner attempt factors rather than the slot count' `
+        -Condition ([int]$v2Bound.maxRealModelStarts -eq $expectedStarts)
+    Assert-CohortEntry -Name 'the bound is far above the slot count it was once mistaken for' `
+        -Condition ([int]$v2Bound.maxRealModelStarts -gt [int]$v2Bound.declaredSlotCount)
+    Assert-CohortEntry -Name 'the bound splits its total across generalist, specialist and verifier' `
+        -Condition (([int]$v2Bound.byRole.generalist -eq (2 * [int]$factors.GeneralistAttemptsPerPass * 2)) -and
+            ([int]$v2Bound.byRole.specialist -eq ([int]$factors.SpecialistAttempts * 2)) -and
+            ([int]$v2Bound.byRole.verifier -eq ($expectedLaunches * [int]$factors.VerifierAttemptsPerLaunch * 2)))
+    Assert-CohortEntry -Name 'the bound derives verifier assignments from the launch ceiling' `
+        -Condition ([int]$v2Bound.maxVerifierAssignments -eq $expectedAssignments)
+    Assert-CohortEntry -Name 'the bound records a per-slot derivation for each declared slot' `
+        -Condition ((@($v2Bound.slots).Count -eq 2) -and
+            (@($v2Bound.slots | Where-Object { [int]$_.maxRealModelStarts -eq $expectedPerSlot }).Count -eq 2))
+    Assert-CohortEntry -Name 'the bound records that verification was authorized' `
+        -Condition ([bool]$v2Bound.verificationAuthorized)
+    Assert-CohortEntry -Name 'the bound carries no supervision or model assignment the runner would ignore' `
+        -Condition ((-not $v2Bound.PSObject.Properties['supervision']) -and
+            (-not $v2Bound.PSObject.Properties['assignment']))
+
+    # The estimate a cohort budgets against is TAKEN FROM the derived maxima, so
+    # "the estimate is an upper bound" holds by construction. The cohort runner
+    # refuses an entry that estimates below its own sealed bound, and that is the
+    # refusal a slot-count estimate would have walked into.
+    Assert-CohortEntry -Name "the manifest entry's plan estimate is the derived bound" `
+        -Condition (([int]$v2Entry.planEstimate.modelStarts -eq [int]$v2Bound.maxRealModelStarts) -and
+            ([int]$v2Entry.planEstimate.verifierAssignments -eq [int]$v2Bound.maxVerifierAssignments))
+    Assert-CohortEntry -Name "the manifest entry's plan estimate is never below the bound" `
+        -Condition (([int]$v2Entry.planEstimate.modelStarts -ge [int]$v2Bound.maxRealModelStarts) -and
+            ([int]$v2Entry.planEstimate.verifierAssignments -ge [int]$v2Bound.maxVerifierAssignments))
+    Assert-CohortEntry -Name 'the plan estimate is non-zero and finite' `
+        -Condition (([int]$v2Entry.planEstimate.modelStarts -gt 0) -and
+            ([int]$v2Entry.planEstimate.verifierAssignments -gt 0) -and
+            ([int]$v2Entry.planEstimate.modelStarts -lt 65536))
+    Assert-CohortEntry -Name 'the builder reports the derived maxima to its operator' `
+        -Condition ((([int]$v2Result.MaxRealModelStarts) -eq $expectedStarts) -and
+            (([int]$v2Result.MaxVerifierAssignments) -eq $expectedAssignments) -and
+            ([string]$v2Result.ModelStartBoundKind -ceq 'devpilot.shadow-cohort.model-start-bound.v2'))
+    Assert-CohortEntry -Name 'the wall clock estimate covers both slots, the reconciliation and the delivery' `
+        -Condition ([int]$v2Entry.planEstimate.wallClockSeconds -eq ((5400 + 120) * 4))
     Assert-CohortEntry -Name 'the v2 build started no model' -Condition ($v2Result.ModelStarts -eq 0)
     Assert-CohortEntry -Name 'the v2 build wrote nothing to a provider' -Condition ($v2Result.ProviderWrites -eq 0)
     # The builder mints no launch authorization, so the token the plan names must
@@ -1731,6 +1827,232 @@ Invoke-CohortEntryCase -ExpectedCode 'CE106' -Name 'a delivery capability writte
     -Mutate (& $withPlan { param($p, $s) $p.delivery.commentsEnabled = 'false' })
 
 # -------------------------------------------------------------------------
+# The bound the builder publishes is not the builder's to invent. It is taken
+# from the reviewed producer over the request that was emitted, and a bound that
+# does not bind THIS request at THIS head is refused rather than published -
+# because the entry that carries it is a budget, and a budget nobody derived is
+# the under-declaration the cohort runner exists to stop.
+# -------------------------------------------------------------------------
+Write-Host 'model-start bound: derivation, injection and sabotage' -ForegroundColor Cyan
+$boundSandbox = New-CohortEntrySandbox -Name 'bound'
+try {
+    $boundFixture = New-CohortEntryFixture -Sandbox $boundSandbox -Mutate {
+        param($s) $s.SchemaVersion = 2; $s.WithExecutionPlan = $true
+    }
+    $boundResult = New-ReviewerCohortEntryEvidence -RequestPath $boundFixture.RequestPath
+    $boundEntry = [IO.File]::ReadAllText((Join-Path $boundResult.Root 'entry/cohort-entry.json')) | ConvertFrom-Json -Depth 32
+    $derivedPath = Join-Path $boundResult.Root 'entry/model-start-bound.json'
+    $derivedText = [IO.File]::ReadAllText($derivedPath)
+    $emittedRequestPath = Join-Path $boundResult.Root 'entry/coordinator-request.json'
+    $emittedRequestSha = [string]$boundEntry.request.sha256
+
+    # The validator, exercised against what a PRODUCER published. A stub producer
+    # stands in for the reviewed one so the artifact that comes back can be made
+    # to say anything: what is under test is the builder re-reading the file it
+    # was handed rather than the arguments it passed.
+    $stubToolkits = 0
+    $checkDerived = {
+        param([scriptblock]$MutateBound, [int]$ProducerExit = 0)
+        $stubToolkits++
+        $stubRoot = Join-Path $boundSandbox ("stub-toolkit-$stubToolkits")
+        [void](New-Item -ItemType Directory -Force -Path (Join-Path $stubRoot 'tools'))
+        $parsed = $derivedText | ConvertFrom-Json -Depth 32
+        if ($MutateBound) { & $MutateBound $parsed }
+        $sourceText = [string]($parsed | ConvertTo-Json -Depth 12)
+        $sourceBytes = [byte[]]@($script:Utf8.GetBytes($sourceText))
+        [IO.File]::WriteAllBytes((Join-Path $stubRoot 'tools/bound-source.json'), $sourceBytes)
+        $stubProducer = @(
+            'param([string]$RequestPath, [string]$OutputPath, [switch]$Force)',
+            "if ($ProducerExit -ne 0) { [Console]::Error.Write('stub producer refused'); exit $ProducerExit }",
+            'Copy-Item -LiteralPath (Join-Path $PSScriptRoot ''bound-source.json'') -Destination $OutputPath -Force',
+            'exit 0',
+            ''
+        ) -join "`n"
+        $stubBytes = [byte[]]@($script:Utf8.GetBytes($stubProducer))
+        [IO.File]::WriteAllBytes((Join-Path $stubRoot 'tools/New-ShadowModelStartBound.ps1'), $stubBytes)
+        $destination = Join-Path $boundSandbox ("published-$stubToolkits.json")
+        return (Get-CohortEntryRefusalCode -Action {
+                $null = New-ReviewerCohortEntryModelStartBound -ToolkitRoot $stubRoot `
+                    -ToolkitHead $boundFixture.ToolkitHead -RequestPath $emittedRequestPath `
+                    -RequestSha256 $emittedRequestSha -OutputPath $destination
+            })
+    }
+
+    Assert-CohortEntry -Name 'a published bound that binds this request and head is accepted' `
+        -Condition ((& $checkDerived $null) -ceq '')
+    Assert-CohortEntry -Name 'a producer that refuses leaves the entry unbounded and CE714' `
+        -Condition ((& $checkDerived $null 3) -ceq 'CE714')
+    Assert-CohortEntry -Name 'a published bound wearing the v3 kind the runner never reads is refused as CE714' `
+        -Condition ((& $checkDerived { param($b) $b.kind = 'devpilot.shadow-cohort.model-start-bound.v3' }) -ceq 'CE714')
+    Assert-CohortEntry -Name 'a published bound with no toolkit head is refused as CE714' `
+        -Condition ((& $checkDerived { param($b) $b.PSObject.Properties.Remove('toolkitHead') }) -ceq 'CE714')
+    Assert-CohortEntry -Name 'a published bound taken at a different head is refused as CE714' `
+        -Condition ((& $checkDerived { param($b) $b.toolkitHead = ('f' * 40) }) -ceq 'CE714')
+    Assert-CohortEntry -Name 'a published bound taken over a different request is refused as CE714' `
+        -Condition ((& $checkDerived { param($b) $b.requestSha256 = ('0' * 64) }) -ceq 'CE714')
+    Assert-CohortEntry -Name 'a published bound with no maximum is refused as CE714' `
+        -Condition ((& $checkDerived { param($b) $b.PSObject.Properties.Remove('maxRealModelStarts') }) -ceq 'CE714')
+    Assert-CohortEntry -Name 'a published bound whose maximum is not a number is refused as CE714' `
+        -Condition ((& $checkDerived { param($b) $b.maxRealModelStarts = 'many' }) -ceq 'CE714')
+    Assert-CohortEntry -Name 'a published bound with no verifier assignment maximum is refused as CE714' `
+        -Condition ((& $checkDerived { param($b) $b.PSObject.Properties.Remove('maxVerifierAssignments') }) -ceq 'CE714')
+
+    # A supplied bound is an EXPECTATION, not a substitute. The producer runs
+    # either way and the supplied file has to be what it produced, because every
+    # field that binds a bound to a build - kind, request digest, head, slot
+    # count - is copyable out of a legitimate artifact while the maxima under
+    # them are rewritten. Nothing downstream would catch that: the estimate is
+    # taken FROM the maxima and the cohort sizes its ceiling from the same file,
+    # so a lowered bound would be discovered only after the models had run.
+    $checkSupplied = {
+        param([scriptblock]$MutateBound, [switch]$Verbatim)
+        $supplied = Join-Path $boundSandbox ('supplied-' + [guid]::NewGuid().ToString('n') + '.json')
+        if ($Verbatim) {
+            $verbatimBytes = [byte[]]@([IO.File]::ReadAllBytes($derivedPath))
+            [IO.File]::WriteAllBytes($supplied, $verbatimBytes)
+        }
+        else {
+            $parsed = $derivedText | ConvertFrom-Json -Depth 32
+            if ($MutateBound) { & $MutateBound $parsed }
+            $suppliedText = [string]($parsed | ConvertTo-Json -Depth 12)
+            $suppliedBytes = [byte[]]@($script:Utf8.GetBytes($suppliedText))
+            [IO.File]::WriteAllBytes($supplied, $suppliedBytes)
+        }
+        $destination = Join-Path $boundSandbox ('supplied-published-' + [guid]::NewGuid().ToString('n') + '.json')
+        return (Get-CohortEntryRefusalCode -Action {
+                $null = New-ReviewerCohortEntryModelStartBound -ToolkitRoot $boundFixture.Toolkit `
+                    -ToolkitHead $boundFixture.ToolkitHead -RequestPath $emittedRequestPath `
+                    -RequestSha256 $emittedRequestSha -OutputPath $destination -BoundArtifactPath $supplied
+            })
+    }
+
+    Assert-CohortEntry -Name 'a supplied bound that is the one this build derives is accepted' `
+        -Condition ((& $checkSupplied -Verbatim) -ceq '')
+    Assert-CohortEntry -Name 'a supplied bound understating its maxima behind intact bindings is refused as CE714' `
+        -Condition ((& $checkSupplied {
+                param($b)
+                $b.maxRealModelStarts = 4
+                $b.maxVerifierAssignments = 4
+            }) -ceq 'CE714')
+    Assert-CohortEntry -Name 'a supplied bound overstating its maxima behind intact bindings is refused as CE714' `
+        -Condition ((& $checkSupplied {
+                param($b)
+                $b.maxRealModelStarts = 65000
+                $b.maxVerifierAssignments = 65000
+            }) -ceq 'CE714')
+    Assert-CohortEntry -Name 'a supplied bound saying the same thing in different bytes is accepted' `
+        -Condition ((& $checkSupplied $null) -ceq '')
+    # A supplied bound that parses to something falsy - `null`, `false`, `0`,
+    # `[]`, `""` - is well-formed JSON and is exactly what a truncated or
+    # half-written artifact looks like. Skipping the comparison for those would
+    # be a gate reporting success without running, so each is refused.
+    foreach ($falsy in @('null', 'false', '0', '[]', '""')) {
+        $falsyPath = Join-Path $boundSandbox ('falsy-' + [guid]::NewGuid().ToString('n') + '.json')
+        $falsyBytes = [byte[]]@($script:Utf8.GetBytes($falsy))
+        [IO.File]::WriteAllBytes($falsyPath, $falsyBytes)
+        Assert-CohortEntry -Name "a supplied bound that is the JSON literal $falsy is refused as CE714" `
+            -Condition ((Get-CohortEntryRefusalCode -Action {
+                    $null = New-ReviewerCohortEntryModelStartBound -ToolkitRoot $boundFixture.Toolkit `
+                        -ToolkitHead $boundFixture.ToolkitHead -RequestPath $emittedRequestPath `
+                        -RequestSha256 $emittedRequestSha `
+                        -OutputPath (Join-Path $boundSandbox ('falsy-out-' + [guid]::NewGuid().ToString('n') + '.json')) `
+                        -BoundArtifactPath $falsyPath
+                }) -ceq 'CE714')
+    }
+    Assert-CohortEntry -Name 'a supplied bound that does not exist is refused as CE714' `
+        -Condition ((Get-CohortEntryRefusalCode -Action {
+                $null = New-ReviewerCohortEntryModelStartBound -ToolkitRoot $boundFixture.Toolkit `
+                    -ToolkitHead $boundFixture.ToolkitHead -RequestPath $emittedRequestPath `
+                    -RequestSha256 $emittedRequestSha -OutputPath (Join-Path $boundSandbox 'never.json') `
+                    -BoundArtifactPath (Join-Path $boundSandbox 'absent-bound.json')
+            }) -ceq 'CE714')
+    # A toolkit that does not ship the producer cannot be bounded, and a build
+    # over it is refused rather than given a number this file made up. A supplied
+    # bound does not rescue it: with nothing to derive there is nothing to agree
+    # with, which is exactly the case a pre-derived file would be asserted into.
+    $strippedToolkit = Join-Path $boundSandbox 'stripped'
+    [void](New-Item -ItemType Directory -Force -Path $strippedToolkit)
+    Assert-CohortEntry -Name 'a toolkit that ships no bound producer is refused as CE714' `
+        -Condition ((Get-CohortEntryRefusalCode -Action {
+                $null = New-ReviewerCohortEntryModelStartBound -ToolkitRoot $strippedToolkit `
+                    -ToolkitHead $boundFixture.ToolkitHead -RequestPath $emittedRequestPath `
+                    -RequestSha256 $emittedRequestSha -OutputPath (Join-Path $boundSandbox 'never2.json')
+            }) -ceq 'CE714')
+    Assert-CohortEntry -Name 'a supplied bound over a toolkit shipping no producer is refused as CE714' `
+        -Condition ((Get-CohortEntryRefusalCode -Action {
+                $null = New-ReviewerCohortEntryModelStartBound -ToolkitRoot $strippedToolkit `
+                    -ToolkitHead $boundFixture.ToolkitHead -RequestPath $emittedRequestPath `
+                    -RequestSha256 $emittedRequestSha -OutputPath (Join-Path $boundSandbox 'never3.json') `
+                    -BoundArtifactPath $derivedPath
+            }) -ceq 'CE714')
+}
+finally { Remove-CohortEntrySandbox -Path $boundSandbox }
+
+# An entry whose estimate sits below its own derived bound is the exact
+# under-declaration the cohort runner refuses at Walk(). It is cheaper to refuse
+# it at build time, so a preparation-only entry handed a slots-derived bound is
+# refused rather than published with a budget it cannot honour.
+$underSandbox = New-CohortEntrySandbox -Name 'under'
+try {
+    $underFixture = New-CohortEntryFixture -Sandbox $underSandbox
+    # Built once to learn the digest of the request these inputs emit, then the
+    # package is discarded and built again with a bound supplied against that
+    # exact digest. Identical inputs emit an identical request, so the supplied
+    # bound binds the second build as tightly as the first.
+    $firstResult = New-ReviewerCohortEntryEvidence -RequestPath $underFixture.RequestPath
+    $firstEntry = [IO.File]::ReadAllText((Join-Path $firstResult.Root 'entry/cohort-entry.json')) | ConvertFrom-Json -Depth 32
+    $firstBound = [IO.File]::ReadAllText((Join-Path $firstResult.Root 'entry/model-start-bound.json')) | ConvertFrom-Json -Depth 32
+    Assert-CohortEntry -Name 'a preparation-only entry derives a bound of zero real model starts' `
+        -Condition (([int]$firstBound.maxRealModelStarts -eq 0) -and ([int]$firstBound.declaredSlotCount -eq 0))
+    Assert-CohortEntry -Name 'a preparation-only entry still estimates the runs it plans' `
+        -Condition ([int]$firstEntry.planEstimate.modelStarts -eq 2)
+
+    $supplied = Join-Path $underSandbox 'supplied.json'
+    # Read the bytes out rather than copying the file: a published package is
+    # read-only, and a copy of it carries that attribute to the destination.
+    $firstBoundBytes = [byte[]]@([IO.File]::ReadAllBytes((Join-Path $firstResult.Root 'entry/model-start-bound.json')))
+    [IO.File]::WriteAllBytes($supplied, $firstBoundBytes)
+    Remove-CohortEntrySandbox -Path $firstResult.Root
+    # Identical inputs emit an identical request, and an identical request
+    # derives an identical bound. That reproducibility is what makes supplying a
+    # bound meaningful at all: the second build states what the first did, or it
+    # refuses.
+    $secondResult = New-ReviewerCohortEntryEvidence -RequestPath $underFixture.RequestPath -BoundArtifactPath $supplied
+    Assert-CohortEntry -Name 'a rebuild derives the same bound it was handed and is accepted' `
+        -Condition ($null -ne $secondResult -and (Test-Path -LiteralPath (Join-Path $secondResult.Root 'entry/model-start-bound.json') -PathType Leaf))
+    Remove-CohortEntrySandbox -Path $secondResult.Root
+
+    # The same file with its maxima rewritten and every binding left intact.
+    # Nothing downstream would catch this: the estimate is taken from the maxima
+    # and the cohort sizes its ceiling from the same file, so a bound nobody
+    # derived would be discovered only after the models had run.
+    $firstBound.maxRealModelStarts = 270
+    $firstBound.maxVerifierAssignments = 256
+    $overstatedText = [string]($firstBound | ConvertTo-Json -Depth 12)
+    $overstatedBytes = [byte[]]@($script:Utf8.GetBytes($overstatedText))
+    [IO.File]::WriteAllBytes($supplied, $overstatedBytes)
+    Assert-CohortEntry -Name 'a supplied bound this build does not derive is refused as CE714' `
+        -Condition ((Get-CohortEntryRefusalCode -Action {
+                New-ReviewerCohortEntryEvidence -RequestPath $underFixture.RequestPath -BoundArtifactPath $supplied
+            }) -ceq 'CE714')
+
+    # The same supplied bound, with the slot count it never declared. Two files
+    # describing different requests through one path is refused rather than
+    # reconciled.
+    $firstBound.maxRealModelStarts = 0
+    $firstBound.maxVerifierAssignments = 0
+    $firstBound.declaredSlotCount = 2
+    $miscountedText = [string]($firstBound | ConvertTo-Json -Depth 12)
+    $miscountedBytes = [byte[]]@($script:Utf8.GetBytes($miscountedText))
+    [IO.File]::WriteAllBytes($supplied, $miscountedBytes)
+    Assert-CohortEntry -Name 'a supplied bound counting slots this entry never declared is refused as CE714' `
+        -Condition ((Get-CohortEntryRefusalCode -Action {
+                New-ReviewerCohortEntryEvidence -RequestPath $underFixture.RequestPath -BoundArtifactPath $supplied
+            }) -ceq 'CE714')
+}
+finally { Remove-CohortEntrySandbox -Path $underSandbox }
+
+# -------------------------------------------------------------------------
 
 # a coordinator request is computed HERE in PowerShell, but the coordinator
 # recomputes it in C# and refuses a mismatch. Two implementations of one digest
@@ -1827,16 +2149,29 @@ if ($IncludePreflight) {
             $cohortDll = Join-Path $RealToolkitRoot 'tools/ShadowRunCoordinator/bin/Release/net10.0/ShadowRunCoordinator.dll'
             if (Test-Path -LiteralPath $cohortDll -PathType Leaf) {
                 $manifestPath = Join-Path $sandbox 'cohort-manifest.json'
+                $toolkitBlock = [ordered]@{
+                    repositoryRoot = $RealToolkitRoot
+                    head = (& git -C $RealToolkitRoot rev-parse HEAD).Trim()
+                    requiredRef = 'refs/heads/main'
+                }
+                # Taken FROM the entry: the entry's plan estimate is what a real
+                # review of this subject would consume, and a manifest whose
+                # ceiling is below its own sealed estimates is refused before it
+                # starts. Nothing is consumed here - the walk below starts a stub
+                # - but the ceiling still has to be coherent.
+                $budgetsBlock = [ordered]@{
+                    maxPullRequests = 1
+                    maxModelStarts = [int]$entryNode.planEstimate.modelStarts
+                    maxVerifierAssignments = [int]$entryNode.planEstimate.verifierAssignments
+                    maxWallClockSeconds = [int]$entryNode.planEstimate.wallClockSeconds
+                    providerWriteBudget = 0
+                }
                 $manifest = [ordered]@{
                     contractVersion = 'devpilot.shadow-cohort.manifest.v3'
                     kind = 'shadow-cohort-run'
                     cohortId = 'cohort-entry-evidence-acceptance'
                     correlationId = [string]$coordinatorRequest.correlationId
-                    toolkit = [ordered]@{
-                        repositoryRoot = $RealToolkitRoot
-                        head = (& git -C $RealToolkitRoot rev-parse HEAD).Trim()
-                        requiredRef = 'refs/heads/main'
-                    }
+                    toolkit = $toolkitBlock
                     execution = [ordered]@{
                         concurrency = 1
                         stopPolicy = 'failFast'
@@ -1846,18 +2181,7 @@ if ($IncludePreflight) {
                         target = 'runSetReady'
                         entryTimeoutSeconds = 120
                     }
-                    budgets = [ordered]@{
-                        maxPullRequests = 1
-                        # Taken FROM the entry: the entry's plan estimate is what a
-                        # real review of this subject would consume, and a manifest
-                        # whose ceiling is below its own sealed estimates is refused
-                        # before it starts. Nothing is consumed here - --rebuild-index
-                        # starts nothing - but the ceiling still has to be coherent.
-                        maxModelStarts = [int]$entryNode.planEstimate.modelStarts
-                        maxVerifierAssignments = [int]$entryNode.planEstimate.verifierAssignments
-                        maxWallClockSeconds = [int]$entryNode.planEstimate.wallClockSeconds
-                        providerWriteBudget = 0
-                    }
+                    budgets = $budgetsBlock
                     journal = [ordered]@{ root = (Join-Path $sandbox 'cohort-journal') }
                     audit = [ordered]@{ indexPath = (Join-Path $sandbox 'cohort-index/index.json') }
                     entries = @($entryNode)
@@ -1874,6 +2198,92 @@ if ($IncludePreflight) {
                     -Condition ($acceptance -match 'no cohort journal')
                 Assert-CohortEntry -Name "${Label}: the shipping cohort reader refuses nothing about the entry itself" `
                     -Condition ($acceptance -notmatch 'entry\s+\d+|entryId|ordinal|planEstimate|ruleBundle|subject')
+
+                # --------------------------------------------------------
+                # PAST the reader, into Walk(). RequireSealedModelStartBounds
+                # is only reached by a cohort that actually walks, and
+                # --rebuild-index never does - which is precisely why a
+                # builder that published an unreadable bound passed every
+                # acceptance check for as long as it did. This run has a
+                # journal and a key, starts a stub rather than a preparation,
+                # and therefore reaches the one check that reads the bound.
+                # --------------------------------------------------------
+                $stubPath = Join-Path $sandbox 'stub-preparation.ps1'
+                [IO.File]::WriteAllBytes($stubPath, $script:Utf8.GetBytes(@(
+                            'param([Parameter(ValueFromRemainingArguments = $true)]$Rest)'
+                            '# Starts nothing and publishes nothing. Its entry ends unsuccessfully,'
+                            '# which is after the bound check and therefore proves the bound passed.'
+                            'exit 0'
+                            ''
+                        ) -join "`n"))
+                $walkExecution = [ordered]@{
+                    concurrency = 1
+                    stopPolicy = 'failFast'
+                    authorizationKind = 'PreviewOnly'
+                    commandPath = (Get-Process -Id $PID).Path
+                    argumentPrefix = [string[]]@('-NoProfile', '-NonInteractive', '-File', $stubPath)
+                    target = 'runSetReady'
+                    entryTimeoutSeconds = 120
+                }
+                $runWalk = {
+                    param([string]$Name, $EntryNode)
+                    $walkManifest = [ordered]@{
+                        contractVersion = 'devpilot.shadow-cohort.manifest.v3'
+                        kind = 'shadow-cohort-test-run'
+                        cohortId = 'cohort-entry-evidence-walk'
+                        correlationId = [string]$coordinatorRequest.correlationId
+                        toolkit = $toolkitBlock
+                        execution = $walkExecution
+                        budgets = $budgetsBlock
+                        journal = [ordered]@{ root = (Join-Path $sandbox "walk-journal-$Name") }
+                        audit = [ordered]@{ indexPath = (Join-Path $sandbox "walk-index-$Name/index.json") }
+                        entries = @($EntryNode)
+                    }
+                    $walkPath = Join-Path $sandbox "walk-manifest-$Name.json"
+                    Write-CohortEntryJsonFile -Path $walkPath -Value $walkManifest
+                    $previous = $PSNativeCommandUseErrorActionPreference
+                    $PSNativeCommandUseErrorActionPreference = $false
+                    try { return (& dotnet $cohortDll --cohort $walkPath --authorized-by 'cohort-entry-test' 2>&1 | Out-String) }
+                    finally { $PSNativeCommandUseErrorActionPreference = $previous }
+                }
+
+                $walkAccepted = & $runWalk 'accepted' $entryNode
+                Assert-CohortEntry -Name "${Label}: the derived bound survives RequireSealedModelStartBounds" `
+                    -Condition ($walkAccepted -notmatch 'model start bound|bounds admit')
+                Assert-CohortEntry -Name "${Label}: the cohort walked past the bound check and reached its entry" `
+                    -Condition ($walkAccepted -match 'shadow-cohort-runner')
+
+                # The exact defect this fix exists for: an entry whose estimate
+                # is its slot count while its bound admits every attempt those
+                # slots may make. Nothing else about the entry changes. Only a
+                # variant that declares slots has a bound to fall short of; a
+                # preparation-only entry proves nothing here, because a bound of
+                # zero real model starts is one no estimate can sit below.
+                if ($WithExecutionPlan) {
+                    $understated = ([IO.File]::ReadAllText((Join-Path $result.Root 'entry/cohort-entry.json'))) | ConvertFrom-Json -Depth 32
+                    $understated.planEstimate.modelStarts = 2
+                    $understated.planEstimate.verifierAssignments = 2
+                    $walkUnderstated = & $runWalk 'understated' $understated
+                    Assert-CohortEntry -Name "${Label}: an entry estimating its slot count is refused against its own bound" `
+                        -Condition ($walkUnderstated -match 'model start\(s\) and its sealed bound|verifier assignment\(s\) and its')
+                }
+
+                # A bound wearing a kind this builder invented is not loadable at
+                # all, which is why the placeholder never became an under-declared
+                # budget - it became an unrunnable cohort instead.
+                $tamperedBound = Join-Path $sandbox 'tampered-bound.json'
+                $tamperedShape = ([IO.File]::ReadAllText((Join-Path $result.Root 'entry/model-start-bound.json'))) | ConvertFrom-Json -Depth 32
+                $tamperedShape.kind = 'devpilot.shadow-cohort.model-start-bound.v3'
+                $tamperedText = [string]($tamperedShape | ConvertTo-Json -Depth 12)
+                $tamperedBytes = [byte[]]@($script:Utf8.GetBytes($tamperedText))
+                [IO.File]::WriteAllBytes($tamperedBound, $tamperedBytes)
+                $tamperedEntry = ([IO.File]::ReadAllText((Join-Path $result.Root 'entry/cohort-entry.json'))) | ConvertFrom-Json -Depth 32
+                $tamperedEntry.planEstimate.modelStartBound.path = $tamperedBound
+                $tamperedEntry.planEstimate.modelStartBound.sha256 =
+                    (Get-FileHash -LiteralPath $tamperedBound -Algorithm SHA256).Hash.ToLowerInvariant()
+                $walkTampered = & $runWalk 'tampered' $tamperedEntry
+                Assert-CohortEntry -Name "${Label}: a bound wearing an invented kind is refused at Walk" `
+                    -Condition ($walkTampered -match "model start bound")
             }
         }
         finally { if (-not $KeepSandbox) { Remove-CohortEntrySandbox -Path $sandbox } else { Write-Host "sandbox kept: $sandbox" } }

@@ -56,6 +56,10 @@ $script:ReviewerCohortEntryUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
 $script:ReviewerCohortEntryRequestKind = 'reviewer-cohort-entry-evidence-request'
 $script:ReviewerCohortEntryPackageKind = 'devpilot.shadow-cohort.entry-evidence.v1'
 $script:ReviewerCohortEntryCoordinatorContract = 'devpilot.shadow-run-coordinator.request.v2'
+# The one kind the shipping cohort runner reads (CohortRunner.ModelStartBoundKind).
+# Bumping it here would make an artifact this builder invented loadable, which is
+# how a placeholder budget becomes an under-declared one.
+$script:ReviewerCohortEntryModelStartBoundKind = 'devpilot.shadow-cohort.model-start-bound.v2'
 $script:ReviewerCohortEntryChangedPathsContract = 'devpilot.shadow-run-coordinator.changed-paths.v1'
 # One leaf name, spelled the way the shipping reader spells it. The character
 # class alone would accept 's1..x': the leading class rules out '.' and '..'
@@ -140,6 +144,7 @@ $script:ReviewerCohortEntryErrorCatalog = [ordered]@{
     CE711 = 'The execution plan names a launch authorization inside the sealed package.'
     CE712 = 'The execution plan does not bound a non-zero finite model start and verifier estimate.'
     CE713 = 'The execution plan reconciliation and delivery outputs are the same directory.'
+    CE714 = 'The model start bound could not be derived, or the derived bound does not bind this request.'
 }
 
 function Get-ReviewerCohortEntryErrorCatalog {

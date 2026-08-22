@@ -38,6 +38,16 @@
     offline corpus seal recipe, which is a separate producer this builder does
     not emit. Pass runSetReady only when an operator has supplied that recipe.
 
+.PARAMETER BoundArtifactPath
+    A model-start bound derived earlier by tools/New-ShadowModelStartBound.ps1,
+    stated as the answer this build is expected to reach. It does NOT stand in
+    for the derivation: the producer runs either way, what gets published is
+    always what this build derived, and the supplied file has to state the same
+    kind, request digest, toolkit head, slot count and maxima. Anything else is
+    refused (CE714), including a build whose toolkit ships no producer to agree
+    with. Supplying a bound proves a build reproduces a number; it never
+    asserts one.
+
 .PARAMETER VerifyOnly
     Do not build. Re-verify an already published package at the request's output
     root: every inventoried file present at its recorded digest and length,
@@ -60,6 +70,7 @@ param(
     [switch]$Preflight,
     [ValidateSet('requestValidated', 'corpusValidated', 'recipePlanned', 'runSetReady')]
     [string]$PreflightTarget = 'recipePlanned',
+    [string]$BoundArtifactPath = '',
     [switch]$VerifyOnly
 )
 
@@ -111,7 +122,8 @@ try {
         exit 0
     }
 
-    $result = New-ReviewerCohortEntryEvidence -RequestPath $full -Preflight:$Preflight -PreflightTarget $PreflightTarget
+    $result = New-ReviewerCohortEntryEvidence -RequestPath $full -Preflight:$Preflight `
+        -PreflightTarget $PreflightTarget -BoundArtifactPath $BoundArtifactPath
     Write-Output (ConvertTo-Json -Depth 6 -Compress -InputObject ([ordered]@{
                 published = $true
                 root = $result.Root
@@ -130,6 +142,9 @@ try {
                 modelStarts = $result.ModelStarts
                 providerWrites = $result.ProviderWrites
                 preflightState = $result.PreflightState
+                modelStartBoundKind = $result.ModelStartBoundKind
+                maxRealModelStarts = $result.MaxRealModelStarts
+                maxVerifierAssignments = $result.MaxVerifierAssignments
             }))
     exit 0
 }

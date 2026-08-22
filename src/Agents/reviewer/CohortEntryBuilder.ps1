@@ -288,7 +288,12 @@ function New-ReviewerCohortEntryEvidence {
         [Parameter(Mandatory)][string]$RequestPath,
         [switch]$Preflight,
         [ValidateSet('requestValidated', 'corpusValidated', 'recipePlanned', 'runSetReady')]
-        [string]$PreflightTarget = 'recipePlanned'
+        [string]$PreflightTarget = 'recipePlanned',
+        # A bound derived elsewhere, for a build that runs where the producer
+        # cannot. It is validated against this build's request and head exactly as
+        # a freshly derived one is, so supplying it can only ever supply the same
+        # answer sooner - never a different one.
+        [string]$BoundArtifactPath = ''
     )
 
     $request = Read-ReviewerCohortEntryRequest -Path $RequestPath
@@ -651,73 +656,63 @@ function New-ReviewerCohortEntryEvidence {
     $coordinatorRequestSha = (Get-FileHash -LiteralPath $coordinatorRequestPath -Algorithm SHA256).Hash.ToLowerInvariant()
 
     $modelStartBoundPath = Join-Path $evidenceRoot 'model-start-bound.json'
-    # The bound is DERIVED, not declared, and it is derived from whichever request
-    # was actually emitted. A preparation-only entry bounds the runs its
-    # qualification plans; an entry that carries a full run declaration bounds the
-    # slots it declared, with the supervision envelope those slots will actually
-    # be held to. A bound that came from the operator's intention rather than from
-    # the emitted request would be a budget for a run that was never declared.
+    # DERIVED by the reviewed producer over the request that was actually
+    # emitted, and published verbatim. Nothing about the bound is computed here:
+    # a second arithmetic in this file would be a second answer, and the cohort
+    # runner would have no way to tell which one it was holding.
     $executionPlan = $request.ExecutionPlan
-    $boundSlots = if ($null -ne $executionPlan) { @($executionPlan.Slots).Count } else { $request.PlannedRunCount }
-    $modelStartBound = if ($null -ne $executionPlan) {
-        # Two slots, plus the reconciliation that compares them and the delivery
-        # that previews the result: four supervised children, each bounded by the
-        # slot timeout it may use and the grace it is given to stop.
-        $supervisedChildren = $boundSlots + 2
+    $derivedBound = New-ReviewerCohortEntryModelStartBound -ToolkitRoot $request.ToolkitRoot `
+        -ToolkitHead $request.ToolkitHead -RequestPath $coordinatorRequestPath `
+        -RequestSha256 $coordinatorRequestSha -OutputPath $modelStartBoundPath `
+        -BoundArtifactPath $BoundArtifactPath
+    # The declared slot count the producer read has to be the one this builder
+    # emitted, or the two are describing different requests through the same file.
+    $expectedSlotCount = if ($null -ne $executionPlan) { @($executionPlan.Slots).Count } else { 0 }
+    if ($derivedBound.DeclaredSlotCount -ne $expectedSlotCount) {
+        New-ReviewerCohortEntryRefusal -Code 'CE714' `
+            -Detail "The derived model start bound counts $($derivedBound.DeclaredSlotCount) declared slot(s); this entry emitted $expectedSlotCount."
+    }
+    # The ESTIMATE is the ceiling a cohort budgets against, and the cohort runner
+    # refuses an entry whose estimate is below its own sealed bound. Taking it
+    # FROM the derived maxima makes "estimate is an upper bound" true by
+    # construction rather than by an operator getting the arithmetic right.
+    # A preparation-only entry declares no slots, so its bound is zero real model
+    # starts and the run count it plans stays its published estimate.
+    if ($null -ne $executionPlan) {
+        $supervisedChildren = @($executionPlan.Slots).Count + 2
         $wallClock = ([long]$executionPlan.SlotTimeoutSeconds + [long]$executionPlan.SupervisionGraceSeconds) * $supervisedChildren
-        [ordered]@{
-            kind = 'devpilot.shadow-cohort.model-start-bound.v3'
-            correlationId = $request.CorrelationId
-            entryId = $request.EntryId
-            plannedRunCount = $request.PlannedRunCount
-            modelStarts = $boundSlots
-            verifierAssignments = $boundSlots
-            wallClockSeconds = [int]$wallClock
-            supervision = [ordered]@{
-                declaredSlots = $boundSlots
-                perCallTimeoutSeconds = $executionPlan.PerCallTimeoutSeconds
-                slotTimeoutSeconds = $executionPlan.SlotTimeoutSeconds
-                progressTimeoutSeconds = $executionPlan.ProgressTimeoutSeconds
-                supervisionGraceSeconds = $executionPlan.SupervisionGraceSeconds
-            }
-            assignment = [ordered]@{
-                generalistPair = [object[]]@($executionPlan.GeneralistPair)
-                conventionSpecialistModel = $executionPlan.ConventionSpecialistModel
-                conventionVerifierModel = $executionPlan.ConventionVerifierModel
-                reviewerScriptSha256 = $executionPlan.ReviewerScriptSha256
-                deliveryAuthorizationKind = $executionPlan.DeliveryAuthorizationKind
-                providerWriteBudget = 0
-            }
-        }
+        $estimatedModelStarts = [int]$derivedBound.MaxRealModelStarts
+        $estimatedVerifierAssignments = [int]$derivedBound.MaxVerifierAssignments
+        $estimatedWallClockSeconds = [int]$wallClock
     }
     else {
-        [ordered]@{
-            kind = 'devpilot.shadow-cohort.model-start-bound.v2'
-            correlationId = $request.CorrelationId
-            entryId = $request.EntryId
-            plannedRunCount = $request.PlannedRunCount
-            modelStarts = $request.PlannedRunCount
-            verifierAssignments = $request.PlannedRunCount
-            wallClockSeconds = ($request.ChildTimeoutSeconds * $request.PlannedRunCount)
-        }
+        $estimatedModelStarts = [int]$request.PlannedRunCount
+        $estimatedVerifierAssignments = [int]$request.PlannedRunCount
+        $estimatedWallClockSeconds = [int]($request.ChildTimeoutSeconds * $request.PlannedRunCount)
     }
     # A zero estimate is a budget that authorizes nothing and passes every check
     # by being empty, which is the one way a bound can be wrong without anything
     # noticing. Asserted rather than assumed, because both branches above compute
     # it and only one of them is exercised by any given build.
-    foreach ($field in @('modelStarts', 'verifierAssignments', 'wallClockSeconds')) {
-        $value = $modelStartBound[$field]
-        if ($value -isnot [int] -or [int]$value -le 0) {
+    foreach ($pair in @(
+            @{ Name = 'modelStarts'; Value = $estimatedModelStarts },
+            @{ Name = 'verifierAssignments'; Value = $estimatedVerifierAssignments },
+            @{ Name = 'wallClockSeconds'; Value = $estimatedWallClockSeconds })) {
+        if ([int]$pair['Value'] -le 0) {
             New-ReviewerCohortEntryRefusal -Code 'CE712' `
-                -Detail "The model start bound field '$field' is '$value'; a bound estimate is a positive 32-bit integer."
+                -Detail "The model start bound field '$($pair['Name'])' is '$($pair['Value'])'; a bound estimate is a positive 32-bit integer."
         }
     }
-    $estimatedModelStarts = [int]$modelStartBound['modelStarts']
-    $estimatedVerifierAssignments = [int]$modelStartBound['verifierAssignments']
-    $estimatedWallClockSeconds = [int]$modelStartBound['wallClockSeconds']
-    [IO.File]::WriteAllBytes($modelStartBoundPath,
-        $script:ReviewerCohortEntryUtf8.GetBytes((ConvertTo-AgentReplayCanonicalJson -Value $modelStartBound)))
-    $modelStartBoundSha = (Get-FileHash -LiteralPath $modelStartBoundPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    # Below its own bound is exactly the under-declaration the cohort runner
+    # refuses, and it is cheaper to refuse it here than after a cohort has been
+    # assembled around it.
+    if ($estimatedModelStarts -lt [int]$derivedBound.MaxRealModelStarts -or
+        $estimatedVerifierAssignments -lt [int]$derivedBound.MaxVerifierAssignments) {
+        New-ReviewerCohortEntryRefusal -Code 'CE714' `
+            -Detail ("This entry estimates $estimatedModelStarts model start(s) and $estimatedVerifierAssignments verifier assignment(s) " +
+                "against a derived bound of $($derivedBound.MaxRealModelStarts) and $($derivedBound.MaxVerifierAssignments).")
+    }
+    $modelStartBoundSha = [string]$derivedBound.Sha256
 
     $manifestEntry = New-ReviewerCohortEntryManifestEntry -Request $request -Identity $identity `
         -IterationId $iteration.IterationId `
@@ -759,7 +754,10 @@ function New-ReviewerCohortEntryEvidence {
         CoordinatorRequestSha256 = $coordinatorRequestSha
         SchemaVersion = $request.SchemaVersion
         DeclaredSlots = $(if ($null -ne $executionPlan) { @($executionPlan.Slots).Count } else { 0 })
-        ModelStartBoundKind = [string]$modelStartBound['kind']
+        ModelStartBoundKind = $script:ReviewerCohortEntryModelStartBoundKind
+        BoundSlotCount = [int]$derivedBound.DeclaredSlotCount
+        MaxRealModelStarts = [int]$derivedBound.MaxRealModelStarts
+        MaxVerifierAssignments = [int]$derivedBound.MaxVerifierAssignments
         EstimatedModelStarts = $estimatedModelStarts
         EstimatedVerifierAssignments = $estimatedVerifierAssignments
         ModelStarts = 0

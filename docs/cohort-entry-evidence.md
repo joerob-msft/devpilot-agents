@@ -92,6 +92,46 @@ reads the model registry only to check names against it. The `slots` block it em
 *declaration* that the typed coordinator will later act on under an operator's own
 authorization.
 
+## The model-start bound is derived, never declared
+
+The entry's `planEstimate` is the number a cohort budgets against, so the builder does not
+get to invent it. After the coordinator request is written and digested, the builder invokes
+`tools/New-ShadowModelStartBound.ps1` — the one reviewed derivation in the tree — as an
+isolated child process over that exact file, and publishes the artifact it produces
+**verbatim**. Nothing is recomputed here: a second arithmetic in a second file is a second
+answer, and the cohort runner has no way to tell which one it is holding.
+
+The producer reads the sealed request, re-hashes the reviewer configuration the request
+pins, rebuilds each declared slot's argument vector with the same reviewed builder the run
+will use, and multiplies the per-role attempt bounds out of the runner's own sources. It
+starts no model: the vector is built with placeholder model identifiers, because counting
+launches never needs to know which model makes them. For two slots against the shipping
+runner that is **270 real model starts and 256 verifier assignments** — not two, which is
+the slot count, and which is what an earlier version of this builder wrote down.
+
+The published bound is then re-read and checked to bind *this* build: `kind` must be the one
+`CohortRunner.ModelStartBoundKind` reads, `requestSha256` must equal the digest of the
+request this entry emitted, `toolkitHead` must equal the head this entry pins, and the two
+maxima must be present integers. `declaredSlotCount` must equal the slot count the builder
+emitted. Anything else refuses under **`CE714`** and no entry is published — because the
+alternative is an entry whose budget is a placeholder, which is exactly the under-declaration
+`RequireSealedModelStartBounds()` exists to stop.
+
+`planEstimate.modelStarts` and `planEstimate.verifierAssignments` are then taken *from* the
+derived maxima, so "the estimate is an upper bound" holds by construction rather than by an
+operator getting the arithmetic right. A preparation-only (v1) entry declares no slots, so
+its derived bound is zero real model starts and it keeps estimating the run count it plans.
+
+An operator may supply a bound derived earlier with `-BoundArtifactPath`, but it is an
+*expectation*, not a substitute: the producer still runs, what gets published is always what
+this build derived, and the supplied file has to state the same kind, request digest, toolkit
+head, slot count and — above all — the same two maxima. Admitting a supplied artifact on its
+bindings alone would admit one carrying the right labels over lowered maxima, and nothing
+downstream could catch that: the estimate is taken *from* the maxima, so it can never
+contradict them, and the cohort sizes its ceiling from the same file. The overspend would
+surface only after the models had run. So supplying a bound proves a build reproduces a
+number; it never asserts one.
+
 ## What it captures, and through what
 
 Every read goes through the reviewed capture seam, in a closed plan that is declared before
@@ -177,7 +217,7 @@ moved into place atomically, marked read-only, and re-verified **externally** af
     census.json                the ordinal changed-path census and its spans
     changed-paths.json         the coordinator's exact changed-path contract
     rule-bundle.json           the pinned bundle, per-section commit and digest
-    model-start-bound.json     the signed no-model bound and the verifier bounds
+    model-start-bound.json     the derived bound, verbatim from the shipping producer
   corpus/
     corpus-index.json          the payload index the typed stager verifies
     files/… evidence/…         the payloads, at corpus-relative paths
@@ -291,11 +331,11 @@ process exit code, because an exit code is one byte and the catalogue is not.
 | `CE4xx` | 5 | The census and coverage: ordering, duplicates, path traversal, reparse points, the changed-file cap (`CE402`), the thread cap (`CE406`), the byte cap, a right-hand path whose content was not stored or a content coverage under the declared floor (`CE403`), a span that runs past the end of the file it describes (`CE404`), an empty census (`CE407`), target ref or config mismatch. |
 | `CE5xx` | 6 | The package: a staging or publish failure, a package that is not read-only including its own inventory and seal (`CE502`), an inventoried file whose bytes changed, an unlisted file, or a declared file that is absent (`CE503`), a reparse point (`CE505`), an inventory path that is not a plain relative path inside the package (`CE506`), a seal that does not authenticate. |
 | `CE6xx` | 7 | The preflight: the coordinator did not reach its target (`CE600`), or it consumed a slot, a model or a launch token (`CE601`). |
-| `CE7xx` | 8 | The execution plan: declared at a version that does not carry it (`CE700`), the wrong slot count or the wrong names in the wrong order (`CE701`), colliding slot state directories or terminal artifacts (`CE702`), a reviewer script that is absent or drifted from its declared digest (`CE703`), a model outside the shared registry (`CE704`), a generalist pair that is not the derived pair or a specialist that is one of the generalists (`CE705`), models the reviewer configuration does not configure (`CE706`), any delivery capability enabled or a non-zero provider write budget (`CE707`), reconciliation disabled or requiring a run count that is not the slot count (`CE708`), a slot count that is not the planned run count (`CE709`), a per-call timeout that outlives its slot (`CE710`), an output path outside the preparation root or a launch authorization inside the sealed package (`CE711`), a model-start bound that is not a positive finite estimate (`CE712`). |
+| `CE7xx` | 8 | The execution plan: declared at a version that does not carry it (`CE700`), the wrong slot count or the wrong names in the wrong order (`CE701`), colliding slot state directories or terminal artifacts (`CE702`), a reviewer script that is absent or drifted from its declared digest (`CE703`), a model outside the shared registry (`CE704`), a generalist pair that is not the derived pair or a specialist that is one of the generalists (`CE705`), models the reviewer configuration does not configure (`CE706`), any delivery capability enabled or a non-zero provider write budget (`CE707`), reconciliation disabled or requiring a run count that is not the slot count (`CE708`), a slot count that is not the planned run count (`CE709`), a per-call timeout that outlives its slot (`CE710`), an output path outside the preparation root or a launch authorization inside the sealed package (`CE711`), a model-start bound that is not a positive finite estimate (`CE712`), a bound that could not be derived or that does not bind this request (`CE714`). |
 
 ## Tests
 
-`tools/Test-ShadowCohortEntryEvidence.ps1` — 249 checks offline, 268 with `-IncludePreflight`;
+`tools/Test-ShadowCohortEntryEvidence.ps1` — 283 checks offline, 309 with `-IncludePreflight`;
 no model, no network, everything in a temporary sandbox.
 
 - **Exact wrapper fixtures.** A synthetic but contract-exact replay snapshot for every tool
@@ -322,8 +362,19 @@ no model, no network, everything in a temporary sandbox.
 - **Cross-implementation parity.** The prompt-asset digest this builder binds is compared
   against the coordinator fixture's independent implementation of the same digest.
 - **v1 stays v1.** A v1 request and a v2 request without a plan are both asserted to emit no
-  `slots` section and to keep the v2 model-start bound contract, so the compatibility claim
-  is checked rather than assumed.
+  `slots` section and to derive a bound of zero real model starts while still estimating the
+  runs they plan, so the compatibility claim is checked rather than assumed.
+- **The bound is derived, and the derivation is reached.** The published bound's kind,
+  request digest, toolkit head, per-role split and per-slot totals are all asserted against
+  the *formula* — recomputed from the same four attempt factors the fixture runner declares
+  — rather than against a number, so a builder that went back to writing the slot count down
+  fails even though two slots is still two slots. A tampered kind, a foreign head, a foreign
+  request, a missing or non-numeric maximum, an absent producer and a slot count the entry
+  never declared each refuse as `CE714`. The preflight variants then run the *real*
+  `ShadowRunCoordinator` **without** `--rebuild-index`, so `Walk()` and
+  `RequireSealedModelStartBounds()` actually execute over the builder's own entry: the
+  derived bound passes, an entry re-estimated at its slot count is refused against it, and a
+  bound wearing an invented kind is refused outright.
 - **The execution plan cannot be widened.** Roughly thirty sabotage cases: one slot, three
   slots, slots out of order or misnamed, colliding state directories or terminal artifacts
   case-insensitively, a drifted reviewer script digest, a model outside the registry, a
@@ -364,8 +415,8 @@ which builds one from an empty offline feed.
 - **The execution plan declares supervision timeouts it does not itself impose.** Only
   `supervisionGraceSeconds` travels in the coordinator request; per-call, slot and activity
   timeouts are read by the coordinator from the sealed qualification plan child result. The
-  plan therefore *records* the envelope it expects and signs it into the entry's model-start
-  bound, and the two are reconciled where they meet rather than here.
+  plan therefore *records* the envelope it expects in the entry's wall-clock estimate, and
+  the two are reconciled where they meet rather than here.
 - **Live Azure DevOps identity is not exercised in CI.** The suite is entirely offline, so
   the `live` capture mode is proven only against the reviewed capture seam, not against a
   live tenant. It has been exercised by hand against a real tenant, which is how the six

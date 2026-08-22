@@ -806,6 +806,188 @@ function New-ReviewerCohortEntryManifestEntry {
     }
 }
 
+function New-ReviewerCohortEntryModelStartBound {
+    <#
+    .SYNOPSIS
+        The derived model-start bound for the request this entry emitted, taken
+        by the reviewed producer and never restated here.
+
+    .DESCRIPTION
+        There is exactly ONE derivation of this number in the tree, and it is not
+        this function: `tools/New-ShadowModelStartBound.ps1` reads the sealed
+        request, re-hashes the reviewer config the request pins, rebuilds each
+        declared slot's argument vector with the reviewed builder the run itself
+        will use, and multiplies the per-role attempt bounds out of the
+        reviewer's own sources and verification policy. This function invokes
+        that producer over the request that was actually written and publishes
+        its artifact verbatim.
+
+        It is invoked as a CHILD process rather than dot-sourced. The producer
+        imports the harness and dot-sources three reviewer modules; loading those
+        into the builder's own session would redefine functions the builder is
+        mid-way through using. A child cannot do that, and it launches no model:
+        the vector is built with placeholder model identifiers precisely because
+        counting launches never needs to know which model makes them.
+
+        A bound that could not be derived is not defaulted, estimated or skipped.
+        The entry that would have carried it is refused, because an entry whose
+        budget is a placeholder is the under-declaration the cohort runner exists
+        to refuse - and refusing it here costs an operator a rebuild, while
+        admitting it costs a cohort its ceiling.
+
+        A pre-derived artifact may be supplied, but it is an EXPECTATION rather
+        than a substitute: the producer still runs, and every number the supplied
+        file states has to be the number this build derives. Admitting a supplied
+        artifact on its bindings alone would admit any artifact carrying the
+        right labels and the wrong maxima - kind, request digest, head and slot
+        count are all copyable out of a legitimate bound, and lowering the maxima
+        underneath them cannot be caught downstream: the estimate is taken FROM
+        the maxima, so it can never contradict them, and the cohort runner sizes
+        its ceiling from the same file. The overspend would then be noticed only
+        after the models had run. So the only supplied bound this accepts is the
+        one it derives anyway, and supplying it proves a build reproduces a
+        number rather than asserting one. What is published is always the
+        artifact this build derived, never the one it was handed.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ToolkitRoot,
+        [Parameter(Mandatory)][string]$ToolkitHead,
+        [Parameter(Mandatory)][string]$RequestPath,
+        [Parameter(Mandatory)][string]$RequestSha256,
+        [Parameter(Mandatory)][string]$OutputPath,
+        [string]$BoundArtifactPath = ''
+    )
+    $supplied = $null
+    if ($BoundArtifactPath) {
+        if (-not (Test-Path -LiteralPath $BoundArtifactPath -PathType Leaf)) {
+            New-ReviewerCohortEntryRefusal -Code 'CE714' `
+                -Detail "The pre-derived model start bound '$BoundArtifactPath' does not exist."
+        }
+        try {
+            $suppliedText = $script:ReviewerCohortEntryUtf8.GetString([IO.File]::ReadAllBytes($BoundArtifactPath))
+            $supplied = ConvertFrom-Json -InputObject $suppliedText -Depth 32
+        }
+        catch {
+            New-ReviewerCohortEntryRefusal -Code 'CE714' `
+                -Detail "The pre-derived model start bound '$BoundArtifactPath' is not readable UTF-8 JSON."
+        }
+        # `null`, `false`, `0`, `[]` and `""` are all well-formed JSON that parse
+        # to something falsy, and a truncated or half-written artifact is exactly
+        # what an operator hands to a reproducibility check. Keying the
+        # comparison below on the parsed value would let those skip it silently -
+        # a gate reporting success without running. Supplied-ness comes from the
+        # path; the parse has to have produced an object.
+        if ($supplied -isnot [System.Management.Automation.PSCustomObject]) {
+            New-ReviewerCohortEntryRefusal -Code 'CE714' `
+                -Detail "The pre-derived model start bound '$BoundArtifactPath' is not a JSON object."
+        }
+    }
+
+    $producer = Join-Path $ToolkitRoot 'tools/New-ShadowModelStartBound.ps1'
+    if (-not (Test-Path -LiteralPath $producer -PathType Leaf)) {
+        New-ReviewerCohortEntryRefusal -Code 'CE714' `
+            -Detail "The model start bound producer '$producer' is not in the pinned toolkit, so no bound can be derived."
+    }
+    $shell = Join-Path $PSHOME 'pwsh.exe'
+    if (-not (Test-Path -LiteralPath $shell -PathType Leaf)) { $shell = 'pwsh' }
+    $stdErrPath = "$OutputPath.stderr"
+    $previousNative = $PSNativeCommandUseErrorActionPreference
+    $PSNativeCommandUseErrorActionPreference = $false
+    try {
+        $null = & $shell -NoProfile -NonInteractive -File $producer `
+            -RequestPath $RequestPath -OutputPath $OutputPath -Force 2>$stdErrPath
+    }
+    finally { $PSNativeCommandUseErrorActionPreference = $previousNative }
+    $producerExit = $LASTEXITCODE
+    $stdErr = ''
+    if (Test-Path -LiteralPath $stdErrPath -PathType Leaf) {
+        $stdErr = ([IO.File]::ReadAllText($stdErrPath)).Trim()
+        Remove-Item -LiteralPath $stdErrPath -Force -ErrorAction SilentlyContinue
+    }
+    if ($producerExit -ne 0 -or -not (Test-Path -LiteralPath $OutputPath -PathType Leaf)) {
+        New-ReviewerCohortEntryRefusal -Code 'CE714' `
+            -Detail "The model start bound producer exited $producerExit over '$RequestPath': $stdErr"
+    }
+    $derivedSha = (Get-FileHash -LiteralPath $OutputPath -Algorithm SHA256).Hash.ToLowerInvariant()
+
+    # Re-read what was published, rather than what was asked for. The producer
+    # is a separate process over a separate contract; the only thing that makes
+    # its artifact this entry's bound is that the artifact says so.
+    $boundText = ''
+    try { $boundText = $script:ReviewerCohortEntryUtf8.GetString([IO.File]::ReadAllBytes($OutputPath)) }
+    catch {
+        New-ReviewerCohortEntryRefusal -Code 'CE714' -Detail "The derived model start bound at '$OutputPath' is not UTF-8 without a byte-order mark."
+    }
+    $bound = $null
+    try { $bound = ConvertFrom-Json -InputObject $boundText -Depth 32 }
+    catch {
+        New-ReviewerCohortEntryRefusal -Code 'CE714' -Detail "The derived model start bound at '$OutputPath' is not readable JSON."
+    }
+    $kind = [string](Get-ReviewerCohortEntryProperty -Object $bound -Name 'kind' -Where 'derived model start bound' -Code 'CE714')
+    if ($kind -cne $script:ReviewerCohortEntryModelStartBoundKind) {
+        New-ReviewerCohortEntryRefusal -Code 'CE714' `
+            -Detail "The derived model start bound declares kind '$kind'; the cohort runner reads '$($script:ReviewerCohortEntryModelStartBoundKind)' only."
+    }
+    $boundRequestSha = ([string](Get-ReviewerCohortEntryProperty -Object $bound -Name 'requestSha256' -Where 'derived model start bound' -Code 'CE714')).ToLowerInvariant()
+    if ($boundRequestSha -cne $RequestSha256) {
+        New-ReviewerCohortEntryRefusal -Code 'CE714' `
+            -Detail "The derived model start bound was taken over a request digesting to $boundRequestSha; this entry emitted $RequestSha256."
+    }
+    $boundHead = [string](Get-ReviewerCohortEntryProperty -Object $bound -Name 'toolkitHead' -Where 'derived model start bound' -Code 'CE714')
+    if ($boundHead -cne $ToolkitHead) {
+        New-ReviewerCohortEntryRefusal -Code 'CE714' `
+            -Detail "The derived model start bound was taken at toolkit head $boundHead; this entry pins $ToolkitHead."
+    }
+    # The per-attempt limits the bound multiplies live in the toolkit, so a
+    # bound is only this build's bound while both of those hold.
+    $maxima = [ordered]@{}
+    foreach ($field in @('maxRealModelStarts', 'maxVerifierAssignments')) {
+        $value = Get-ReviewerCohortEntryProperty -Object $bound -Name $field -Where 'derived model start bound' -Code 'CE714'
+        $parsed = 0
+        if ($null -eq $value -or $value -is [string] -or -not [int]::TryParse([string]$value, [ref]$parsed) -or
+            $parsed -lt 0 -or $parsed -gt 65536) {
+            New-ReviewerCohortEntryRefusal -Code 'CE714' `
+                -Detail "The derived model start bound field '$field' is '$value'; the cohort runner reads a 0..65536 integer."
+        }
+        $maxima[$field] = [int]$parsed
+    }
+    $declaredSlotCount = [int](Get-ReviewerCohortEntryProperty -Object $bound -Name 'declaredSlotCount' -Where 'derived model start bound' -Code 'CE714')
+
+    # A supplied bound is compared to the derived one statement by statement
+    # rather than byte by byte, because the two legitimately name different
+    # request paths - an operator derives over the request they hold, this build
+    # over the request it just wrote. Everything the cohort runner reads out of
+    # the artifact has to agree, and the maxima above all: those are the numbers
+    # nothing downstream can second-guess.
+    if ($BoundArtifactPath) {
+        $expectations = @(
+            @('kind', $kind),
+            @('requestSha256', $boundRequestSha),
+            @('toolkitHead', $boundHead),
+            @('declaredSlotCount', $declaredSlotCount),
+            @('maxRealModelStarts', [int]$maxima['maxRealModelStarts']),
+            @('maxVerifierAssignments', [int]$maxima['maxVerifierAssignments'])
+        )
+        foreach ($expectation in $expectations) {
+            $field = [string]$expectation[0]
+            $stated = Get-ReviewerCohortEntryProperty -Object $supplied -Name $field `
+                -Where 'pre-derived model start bound' -Code 'CE714'
+            if ([string]$stated -cne [string]$expectation[1]) {
+                New-ReviewerCohortEntryRefusal -Code 'CE714' `
+                    -Detail ("The pre-derived model start bound states $field = '$stated'; this build derives " +
+                    "'$($expectation[1])'. A supplied bound is admitted only when it is the bound this build derives.")
+            }
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        MaxRealModelStarts = [int]$maxima['maxRealModelStarts']
+        MaxVerifierAssignments = [int]$maxima['maxVerifierAssignments']
+        DeclaredSlotCount = $declaredSlotCount
+        Sha256 = $derivedSha
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Atomic, read-only, inventoried, authenticated publication
 # ---------------------------------------------------------------------------
