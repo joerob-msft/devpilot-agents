@@ -105,11 +105,14 @@ refuses that entry by the same rule, for the same reason.
 
 **The cohort refuses it too, before anything starts.** `CohortRunner.Walk` checks every
 entry's declared authorization in the same pre-walk pass that proves the model start bounds
-— existence, single shared path across slots/reconciliation/delivery, and 64-hex shape. Only
-existence and shape: the token's digest is sealed into the run set's plan digest, and the
-reviewed prelaunch reproduces that plan only from the token that was minted into it, so a
-*substituted* well-formed token is deliberately left for the party that holds the plan to
-refuse rather than answered twice.
+— existence, single shared path across slots and reconciliation (and delivery, which is
+optional), and 64-hex shape. It asks this only of an entry whose preparation already stands
+at `runSetDeclared` or beyond: an entry starting from nothing mints its authorization *while*
+declaring the set, so demanding one earlier would refuse every entry that had not run yet and
+prove nothing. Only existence and shape are checked: the token's digest is sealed into the
+run set's plan digest, and the reviewed prelaunch reproduces that plan only from the token
+that was minted into it, so a *substituted* well-formed token is deliberately left for the
+party that holds the plan to refuse rather than answered twice.
 
 **No write-enabled value is representable.** The four delivery capability fields are fixed
 by `const` in the schema, and the builder re-checks each one after reading (`CE707`), so a
@@ -410,8 +413,11 @@ process exit code, because an exit code is one byte and the catalogue is not.
 
 ## Tests
 
-`tools/Test-ShadowCohortEntryEvidence.ps1` — 316 checks offline, 348 with `-IncludePreflight`;
-no model, no network, everything in a temporary sandbox.
+`tools/Test-ShadowCohortEntryEvidence.ps1` — 316 checks offline, 358 with `-IncludePreflight`;
+no model, no network, everything in a temporary sandbox. The `-IncludePreflight` set ends with
+one case that drives a build to `runSetReady` against a real run set declaration and then walks
+the published entry through the shipping cohort runner, which is the only place the *published*
+launch authorization and the *derived* one are shown to be the same file by construction.
 
 - **Exact wrapper fixtures.** A synthetic but contract-exact replay snapshot for every tool
   in the table above, sealed the way a real snapshot is sealed. The fixtures answer in the
