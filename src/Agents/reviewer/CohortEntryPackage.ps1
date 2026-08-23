@@ -547,7 +547,7 @@ function New-ReviewerCohortEntryOfflineSealRecipe {
             New-ReviewerCohortEntryRefusal -Code 'CE806' `
                 -Detail "The authoritative change set carries '$path' but declares no change type for it."
         }
-        $kinds = [string[]]@(@($changeKinds[$path]) | ForEach-Object { [string]$_ } | Sort-Object -CaseSensitive -Unique)
+        $kinds = [string[]]@(@($changeKinds.Item($path)) | ForEach-Object { [string]$_ } | Sort-Object -CaseSensitive -Unique)
         $kindsByPath[$path] = $kinds
         $spansByPath[$path] = @()
         if (-not $RightHandCorpusPaths.Contains($path)) {

@@ -1227,7 +1227,7 @@ try {
             if ($property.Name -ceq 'sourceCommit') { $aliased['lastMergeSourceCommit'] = $property.Value }
             else { $aliased[$property.Name] = $property.Value }
         }
-        $bytes = Set-CohortEntryScratchPayload -Context $ctx -CorpusPath $startIdentityPath -Value $aliased
+        $bytes = [byte[]](Set-CohortEntryScratchPayload -Context $ctx -CorpusPath $startIdentityPath -Value $aliased)
         $ctx.Recipe.capture.identity.sha256 = (Get-ReviewerCorpusSealSha256 -Bytes $bytes)
         $ctx.Recipe.capture.identity.byteLength = $bytes.Length
     }
@@ -1238,7 +1238,7 @@ try {
         $drifted = [ordered]@{}
         foreach ($property in @($payload.PSObject.Properties)) { $drifted[$property.Name] = $property.Value }
         $drifted['sourceCommit'] = ('d' * 40)
-        $bytes = Set-CohortEntryScratchPayload -Context $ctx -CorpusPath $endIdentityPath -Value $drifted
+        $bytes = [byte[]](Set-CohortEntryScratchPayload -Context $ctx -CorpusPath $endIdentityPath -Value $drifted)
         $ctx.Recipe.capture.endIdentity.sha256 = (Get-ReviewerCorpusSealSha256 -Bytes $bytes)
         $ctx.Recipe.capture.endIdentity.byteLength = $bytes.Length
     }
@@ -1246,15 +1246,15 @@ try {
         -Expected 'hunks' -Mutate {
         param($ctx)
         $payload = @(Get-CohortEntryCorpusPayload -CorpusRoot $ctx.CorpusRoot -CorpusPath $spanEvidencePath)
-        $aliased = @($payload | ForEach-Object {
-                [ordered]@{
-                    path = [string]$_.path
-                    lineDiffBlocks = @(@($_.hunks) | ForEach-Object {
-                            [ordered]@{ mLine = [int]$_.newStart; mLinesCount = [int]$_.newCount }
-                        })
-                }
-            })
-        $bytes = Set-CohortEntryScratchPayload -Context $ctx -CorpusPath $spanEvidencePath -Value ([object[]]$aliased)
+        $bytes = [byte[]](Set-CohortEntryScratchPayload -Context $ctx -CorpusPath $spanEvidencePath -Value ([object[]]@(
+                    $payload | ForEach-Object {
+                        [ordered]@{
+                            path = [string]$_.path
+                            lineDiffBlocks = [object[]]@(@($_.hunks) | ForEach-Object {
+                                    [ordered]@{ mLine = [int]$_.newStart; mLinesCount = [int]$_.newCount }
+                                })
+                        }
+                    })))
         $ctx.Recipe.changeSet.spanEvidence.sha256 = (Get-ReviewerCorpusSealSha256 -Bytes $bytes)
         $ctx.Recipe.changeSet.spanEvidence.byteLength = $bytes.Length
     }
@@ -1262,15 +1262,15 @@ try {
         -Expected 'span evidence derives' -Mutate {
         param($ctx)
         $payload = @(Get-CohortEntryCorpusPayload -CorpusRoot $ctx.CorpusRoot -CorpusPath $spanEvidencePath)
-        $moved = @($payload | ForEach-Object {
-                [ordered]@{
-                    path = [string]$_.path
-                    hunks = @(@($_.hunks) | ForEach-Object {
-                            [ordered]@{ newStart = ([int]$_.newStart + 1); newCount = [int]$_.newCount }
-                        })
-                }
-            })
-        $bytes = Set-CohortEntryScratchPayload -Context $ctx -CorpusPath $spanEvidencePath -Value ([object[]]$moved)
+        $bytes = [byte[]](Set-CohortEntryScratchPayload -Context $ctx -CorpusPath $spanEvidencePath -Value ([object[]]@(
+                    $payload | ForEach-Object {
+                        [ordered]@{
+                            path = [string]$_.path
+                            hunks = [object[]]@(@($_.hunks) | ForEach-Object {
+                                    [ordered]@{ newStart = ([int]$_.newStart + 1); newCount = [int]$_.newCount }
+                                })
+                        }
+                    })))
         $ctx.Recipe.changeSet.spanEvidence.sha256 = (Get-ReviewerCorpusSealSha256 -Bytes $bytes)
         $ctx.Recipe.changeSet.spanEvidence.byteLength = $bytes.Length
     }

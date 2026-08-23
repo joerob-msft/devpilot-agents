@@ -369,7 +369,7 @@ process exit code, because an exit code is one byte and the catalogue is not.
 
 ## Tests
 
-`tools/Test-ShadowCohortEntryEvidence.ps1` — 283 checks offline, 309 with `-IncludePreflight`;
+`tools/Test-ShadowCohortEntryEvidence.ps1` — 305 checks offline, 331 with `-IncludePreflight`;
 no model, no network, everything in a temporary sandbox.
 
 - **Exact wrapper fixtures.** A synthetic but contract-exact replay snapshot for every tool
@@ -433,6 +433,18 @@ no model, no network, everything in a temporary sandbox.
   `CE211`, so the model-pairing check can never see a coerced `$true`.
 - **Architecture and no-write.** No write tool, no credential and no model name is reachable
   from the capture surface; the schema carries no oracle-shaped field.
+- **The seal contract is proven by the sealer, not by a restatement of it.** The offline
+  happy path runs the shipping `tools/Save-CorpusReplaySeal.ps1 -ValidateOnly` over the
+  builder-produced entry and requires exit 0 and no replay root written; the preflight then
+  drives the real coordinator through `snapshotValidateOnly`, `snapshotSealed` and
+  `snapshotVerified` for both the v1 and the v2 shape. Seven sabotage cases take that same
+  entry, change exactly one thing, re-mint the corpus index so integrity is not what refuses,
+  and require the sealer's own refusal: a recipe carrying an extra field, a recipe binding no
+  start identity, a start identity naming `lastMergeSourceCommit` instead of `sourceCommit`,
+  an end identity whose source commit drifted mid-capture, a census written in
+  `lineDiffBlocks` form, a hunk moved one line off the span the changed file declares, and a
+  reversed digest order. A pinned toolkit shipping no source-transport policy refuses at
+  `CE803` at build time.
 
 Run the preflight section too with `-IncludePreflight`. It prefers an already-built
 coordinator assembly so it never reaches a network; CI runs it after the coordinator suite,
