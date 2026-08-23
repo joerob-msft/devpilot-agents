@@ -355,6 +355,19 @@ function New-CohortEntryFixture {
         RuleServedText = ''
         RuleResourceUri = ''
         OmitDiffVariant = $false
+        # The thread read the fixture RECORDS. It defaults to the one production
+        # value so the sealed corpus answers the plan exactly; a sabotage moves
+        # it to prove that a corpus recorded one thread off the live cycle's own
+        # read is refused rather than silently replayed.
+        ThreadListTop = (Get-ReviewerThreadListTop)
+        # The other four keys of the same recorded read, so a sabotage can move
+        # exactly one of them and prove each is matched on its own.
+        ThreadReadProjectOverride = ''
+        ThreadReadRepositoryOverride = ''
+        ThreadReadPullRequestOverride = 0
+        # What the operator REQUEST caps threads at, as opposed to what the read
+        # asks for. They are different numbers with different owners.
+        MaxThreads = (Get-ReviewerThreadListTop)
         RequestWithBom = $false
         MaxSiblingFiles = 1
         MinCoveragePercent = 60
@@ -621,8 +634,14 @@ function New-CohortEntryFixture {
             })
     }
     [void]$reads.Add(@{
-            Tool = 'repo_pull_request_thread'
-            Arguments = [ordered]@{ action = 'list'; project = $state.Project; repositoryId = $state.RepositoryName; pullRequestId = $state.PullRequestId; top = 201 }
+            Tool = (Get-ReviewerThreadListToolName)
+            Arguments = [ordered]@{
+                action = 'list'
+                project = $(if ($state.ThreadReadProjectOverride) { $state.ThreadReadProjectOverride } else { $state.Project })
+                repositoryId = $(if ($state.ThreadReadRepositoryOverride) { $state.ThreadReadRepositoryOverride } else { $state.RepositoryName })
+                pullRequestId = $(if ([int]$state.ThreadReadPullRequestOverride -gt 0) { [int]$state.ThreadReadPullRequestOverride } else { $state.PullRequestId })
+                top = $state.ThreadListTop
+            }
             Bytes = (New-CohortEntryTextEnvelope -Value $state.ThreadsBody)
         })
     foreach ($path in @($state.FileTexts.Keys)) {
@@ -795,7 +814,7 @@ function New-CohortEntryFixture {
                 maxChangedFiles = 50
                 maxFileBytes = 65536
                 maxSiblingFiles = $state.MaxSiblingFiles
-                maxThreads = 200
+                maxThreads = $state.MaxThreads
                 minChangedPathCoveragePercent = $state.MinCoveragePercent
             }
             output = [ordered]@{
@@ -955,6 +974,11 @@ foreach ($file in $surfaceFiles) {
     Assert-CohortEntry -Name "$name starts no model" -Condition ($body -inotmatch 'copilot\s+-p|Start-CopilotAgent|--allow-all-tools')
 }
 $builderBody = [IO.File]::ReadAllText((Join-Path $repoRoot 'src/Agents/reviewer/CohortEntryBuilder.ps1'))
+$evidenceBody = [IO.File]::ReadAllText((Join-Path $repoRoot 'src/Agents/reviewer/CohortEntryEvidence.ps1'))
+$sourceTransportBody = [IO.File]::ReadAllText((Join-Path $repoRoot 'src/Agents/reviewer/SourceTransport.ps1'))
+$reviewerAgentBody = [IO.File]::ReadAllText((Join-Path $repoRoot 'src/Agents/reviewer/Start-ReviewerAgent.ps1'))
+$factPolicyForThreads = Get-Content -LiteralPath (Join-Path $repoRoot 'src/Agents/reviewer/facts/v1/policy.json') -Raw |
+    ConvertFrom-Json -Depth 32
 foreach ($secretName in @('AZURE_DEVOPS_EXT_PAT', 'SYSTEM_ACCESSTOKEN', 'COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')) {
     Assert-CohortEntry -Name "the live session scrubs $secretName from the tool child" `
         -Condition ($builderBody -cmatch [regex]::Escape("'$secretName'"))
@@ -991,8 +1015,49 @@ $plainPlan = @(Get-ReviewerCohortEntryIdentityReadPlan -Request ([pscustomobject
 Assert-CohortEntry -Name 'the change reads ask one above the declared cap so a truncated answer is visible' `
     -Condition (@($plainPlan | Where-Object { $_.Arguments['action'] -ceq 'get_changes' } |
             Where-Object { [int]$_.Arguments['top'] -ne 301 }).Count -eq 0)
-Assert-CohortEntry -Name 'the thread read asks one above the declared thread cap' `
-    -Condition ([int](@($plainPlan | Where-Object { $_.Id -ceq 'threads' })[0].Arguments['top']) -eq 201)
+
+# THE thread-read contract. A replay answers the arguments it recorded and never
+# falls through to a live read, so the builder's thread read has to be the live
+# cycle's thread read - name, keys, values and all. A shadow slot once died
+# mid-cycle because the builder asked for cap+1 threads (right for the change
+# reads, which are its own) while the reviewer asked for the production page.
+# These assertions compare the plan against the SHARED constructor and against
+# the live agent's own source text, so restating the vector in either place
+# fails here rather than in a slot.
+$threadPlanRead = @($plainPlan | Where-Object { $_.Id -ceq 'threads' })[0]
+$sharedThreadRequest = New-ReviewerThreadListRequest -Project 'Contoso' -RepositoryName 'toolkit' -PullRequestId 1
+Assert-CohortEntry -Name 'the planned thread read is the shared thread-list request, tool and all' `
+    -Condition (
+        $threadPlanRead.Tool -ceq $sharedThreadRequest.Name -and
+        (($threadPlanRead.Arguments.Keys | ForEach-Object { [string]$_ }) -join ',') -ceq
+        (($sharedThreadRequest.Arguments.Keys | ForEach-Object { [string]$_ }) -join ',') -and
+        (@($sharedThreadRequest.Arguments.Keys | Where-Object {
+                    [string]$threadPlanRead.Arguments[$_] -cne [string]$sharedThreadRequest.Arguments[$_]
+                }).Count -eq 0))
+Assert-CohortEntry -Name 'the planned thread read asks for the production page, not the declared cap plus one' `
+    -Condition ([int]$threadPlanRead.Arguments['top'] -eq (Get-ReviewerThreadListTop) -and
+        [int]$threadPlanRead.Arguments['top'] -ne 201)
+# The value itself, pinned. 200 is what the shipping fact policy caps threads at
+# and what the live cycle asks for; a change to either is a change to the corpus
+# every existing entry was built under, so it is not allowed to happen quietly.
+Assert-CohortEntry -Name 'the shared thread page is the production 200' `
+    -Condition ((Get-ReviewerThreadListTop) -eq 200 -and
+        [int]$factPolicyForThreads.threads.maxThreads -eq (Get-ReviewerThreadListTop))
+# The live agent must not carry its own copy of the vector. Two copies is how the
+# first one drifted: the reviewer's literal and the builder's cap+1 were each
+# individually defensible and jointly fatal.
+Assert-CohortEntry -Name 'the live reviewer builds its thread reads through the shared constructor only' `
+    -Condition (
+        ([regex]::Matches($reviewerAgentBody, 'New-ReviewerThreadListRequest\s+-Project').Count -ge 2) -and
+        ($reviewerAgentBody -cnotmatch '(?m)^\s*.*repo_pull_request_thread"\s+-Arguments\s*@\{'))
+# and neither may the builder. The literal is allowed in exactly one function.
+Assert-CohortEntry -Name 'the builder restates neither the thread tool name nor its page size' `
+    -Condition (
+        ($evidenceBody -cnotmatch "'repo_pull_request_thread'") -and
+        ($evidenceBody -cnotmatch '(?m)top\s*=\s*\(\$Request\.MaxThreads') -and
+        ($builderBody -cnotmatch "'repo_pull_request_thread'"))
+Assert-CohortEntry -Name 'the shared thread page size is written down exactly once' `
+    -Condition ([regex]::Matches($sourceTransportBody, '(?m)^\s*return\s+200\s*$').Count -eq 1)
 Assert-CohortEntry -Name 'the identity plan reads the repository by GUID under repositoryNameOrId' `
     -Condition (@($plainPlan | Where-Object { $_.Tool -ceq 'repo_repository' })[0].Arguments['repositoryNameOrId'] -ceq 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa')
 Assert-CohortEntry -Name 'the identity plan reads the pull request by repository NAME' `
@@ -1138,6 +1203,25 @@ try {
         -Condition ((@($recipe.resources).Count) -eq (@($recipe.resources | ForEach-Object { (Get-AgentReplayRequestKey -Name $_.tool -Arguments $_.arguments).Key } | Sort-Object -Unique).Count)
 
     )
+
+    # THE assertion the shadow #10 failure was missing. A slot resolves a read by
+    # its request KEY, and a key that is not in the published corpus is a cycle
+    # that stops: a replay never falls through to a live read. So compute the key
+    # the LIVE cycle will compute, from the shared constructor and this subject's
+    # own identity, and require the corpus the builder just published to answer
+    # it. Comparing the recipe's arguments against a restatement here would only
+    # prove the restatement matched; comparing keys proves the reviewer can read.
+    $liveThreadRequest = New-ReviewerThreadListRequest -Project $fixture.State.Project `
+        -RepositoryName $fixture.State.RepositoryName -PullRequestId $fixture.State.PullRequestId
+    $liveThreadKey = (Get-AgentReplayRequestKey -Name $liveThreadRequest.Name `
+            -Arguments ([hashtable]$liveThreadRequest.Arguments)).Key
+    $recipeThreadKeys = [string[]]@($recipe.resources |
+            Where-Object { [string]$_.tool -ceq (Get-ReviewerThreadListToolName) } |
+            ForEach-Object { (Get-AgentReplayRequestKey -Name $_.tool -Arguments $_.arguments).Key })
+    Assert-CohortEntry -Name 'the published corpus answers the exact thread read the live cycle issues' `
+        -Condition ($recipeThreadKeys -ccontains $liveThreadKey)
+    Assert-CohortEntry -Name 'the published corpus declares exactly one thread read' `
+        -Condition ($recipeThreadKeys.Count -eq 1)
 
     # ------------------------------------------------------------------
     # The PRODUCTION corpus seal contract. The builder used to emit a recipe
@@ -1689,6 +1773,52 @@ Invoke-CohortEntryCase -Name 'a change set carrying no changed path at all' -Exp
 # - and an operator matching on the code has to be able to tell them apart.
 Invoke-CohortEntryCase -Name 'a snapshot missing the get_changes diff variant' -ExpectedCode 'CE307' -Mutate {
     param($state) $state.OmitDiffVariant = $true
+}
+
+# THE shadow #10 defect, as a test. The corpus recorded the thread list under
+# top=201 - one above the operator's cap, which is the right instinct for a read
+# the builder owns and the wrong one for a read it does not - while the live
+# cycle asks for the production page. The slot reached its first cycle, asked for
+# threads, got nothing, and died before a single model start. It must not be
+# possible to publish that corpus again: same code, same shape, refused at build.
+Invoke-CohortEntryCase -Name 'a corpus recording the thread list one above the reviewer page' -ExpectedCode 'CE307' -Mutate {
+    param($state) $state.ThreadListTop = (Get-ReviewerThreadListTop) + 1
+}
+
+Invoke-CohortEntryCase -Name 'a corpus recording the thread list one below the reviewer page' -ExpectedCode 'CE307' -Mutate {
+    param($state) $state.ThreadListTop = (Get-ReviewerThreadListTop) - 1
+}
+
+# The identity keys of the same read, each on its own, because a corpus that got
+# the page right and the project wrong fails exactly as fatally and an operator
+# has to see which key moved.
+Invoke-CohortEntryCase -Name 'a corpus recording the thread list under another project' -ExpectedCode 'CE307' -Mutate {
+    param($state) $state.ThreadReadProjectOverride = 'OtherProject'
+}
+
+Invoke-CohortEntryCase -Name 'a corpus recording the thread list under the repository GUID' -ExpectedCode 'CE307' -Mutate {
+    param($state) $state.ThreadReadRepositoryOverride = $state.RepositoryId
+}
+
+Invoke-CohortEntryCase -Name 'a corpus recording the thread list for another pull request' -ExpectedCode 'CE307' -Mutate {
+    param($state) $state.ThreadReadPullRequestOverride = ([int]$state.PullRequestId + 1)
+}
+
+# The cap policy, stated where it is decided. The read asks for the production
+# page, so a cap ABOVE that page is a ceiling this build could never watch being
+# crossed - it would call a truncated census complete.
+Invoke-CohortEntryCase -Name 'a request capping threads above the page the reviewer asks for' -ExpectedCode 'CE408' -Mutate {
+    param($state) $state.MaxThreads = (Get-ReviewerThreadListTop) + 1
+}
+
+# And a list that FILLS the page proves nothing either way, so it is refused
+# rather than assumed complete.
+Invoke-CohortEntryCase -Name 'a thread list that exactly fills the reviewer page' -ExpectedCode 'CE408' -Mutate {
+    param($state)
+    $state.MaxThreads = (Get-ReviewerThreadListTop)
+    $state.ThreadsBody = [ordered]@{ value = @(1..(Get-ReviewerThreadListTop) | ForEach-Object {
+                [ordered]@{ id = $_; status = 'active'; comments = @([ordered]@{ id = $_; content = "c$_"; commentType = 'text' }) }
+            }) }
 }
 
 Invoke-CohortEntryCase -Name 'a file served under a URI nobody requested' -ExpectedCode 'CE304' -Mutate {

@@ -192,14 +192,32 @@ the first read and checked after the last. Nothing interprets a raw REST respons
 | pull request | `repo_pull_request` | `action=get`, `project`, `repositoryId` = repository **name**, `pullRequestId` |
 | changes | `repo_pull_request` | `action=get_changes`, … `top` = `maxChangedFiles` **+ 1** |
 | changes with content | `repo_pull_request` | the same, plus `includeDiffs=true`, `includeLineContent=true` — a **distinct** request key |
-| threads | `repo_pull_request_thread` | `action=list`, `project`, `repositoryId` = repository **name**, `pullRequestId`, `top` = `maxThreads` **+ 1** |
+| threads | `repo_pull_request_thread` | **not shaped here** — the live cycle's own request, from the one shared constructor: `action=list`, `project`, `repositoryId` = repository **name**, `pullRequestId`, `top` = **200** |
 | changed file, sibling, rule section | `repo_file` | `action=get_content`, `project`, `repositoryId` = repository **id**, `path`, `versionType=Commit`, `version` = 40-hex commit |
 
-The `+ 1` on the two capped reads is not an off-by-one. A provider asked for exactly the cap
+The `+ 1` on the two **change** reads is not an off-by-one. A provider asked for exactly the cap
 answers exactly the cap when there are more, so a count equal to the cap is indistinguishable
 from a complete answer — which is how a truncated census once looked whole and admitted a
 subject larger than the operator authorized. Asking for one above the cap makes the
-difference observable: above the cap is `CE402`/`CE406`, at the cap is genuinely all there is.
+difference observable: above the cap is `CE402`, at the cap is genuinely all there is.
+
+That trick is sound only for a cap the **builder owns**, and the thread page is not one. A
+replay answers the arguments it recorded and never falls through to a live read, so the thread
+read has to be the read the live cycle issues — byte for byte, or the reviewer stops mid-cycle
+on a read it can prove it needs and cannot get. It once did: a corpus captured at `top=201`
+(the cap+1 instinct, applied to a read the builder does not own) met a cycle asking for
+`top=200`, and the slot died before its first model start.
+
+So the vector is built by one shared constructor, `New-ReviewerThreadListRequest` in
+`SourceTransport.ps1`, which both the live agent and this builder call. The page size is
+written down once, and the shipping fact policy's `threads.maxThreads` is checked against it
+when the agent loads. Thread completeness is then **accounted** rather than probed:
+
+- more threads than the operator's cap → `CE406`;
+- a list that reaches the page the reviewer asks for → `CE408`, because a full page is what a
+  truncated list and a complete-and-exactly-full list both look like;
+- a request whose `maxThreads` is above that page → `CE408` at validation, since it declares a
+  ceiling this build could never watch being crossed.
 
 The two identity reads are the same question asked twice, and the second one is **declared in
 the plan before the first read is issued**, carrying `DuplicateOf` naming the first. That is

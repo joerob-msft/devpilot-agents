@@ -64,6 +64,28 @@ $script:ReviewerSourceCommitIdPattern = '^[0-9a-f]{40}$'
 $script:ReviewerSourceRefHeadPattern = '^refs/heads/[^\x00-\x1f\x7f\\]+$'
 $script:ReviewerSourceChangePageSize = 200
 $script:ReviewerSourceChangeLimit = 1000
+# The thread-list tool contract, in exactly one place.
+#
+# WHY IT LIVES HERE. A replay answers the arguments it recorded and nothing else:
+# there is no live seam to fall through to. So the offline corpus must be
+# captured under the SAME argument vector the live cycle issues, byte for byte,
+# or the reviewer stops mid-cycle on a read it can prove it needs and cannot get.
+# That is not hypothetical - a builder that asked for one thread MORE than the
+# reviewer asks for (a cap+1 overflow probe, correct for the change-set reads
+# where the builder itself enforces the cap) produced a corpus whose thread read
+# no answer matched, and the slot died before its first model start.
+#
+# The cap+1 trick cannot apply to this read, because this read is not the
+# builder's to shape: it belongs to the live cycle. Completeness is therefore
+# ACCOUNTED rather than probed - a count that reaches the top is a count that
+# cannot be proven complete, and the builder refuses instead of guessing.
+#
+# The two values are held INSIDE their accessors rather than in $script: state,
+# for the reason this file already gives above: a dot-sourced library resolves
+# $script: against whoever runs it, and these accessors are reached through
+# several different load chains (the live agent, the evidence builder, the
+# builder's own callers). A function that carries its answer cannot be reached
+# from a scope that never got the variable.
 $script:ReviewerSourceAzMaxResponseBytes = 1048576
 $script:ReviewerSourceAzMaxErrorBytes = 16384
 $script:ReviewerSourceAzTimeoutSeconds = 30
@@ -221,6 +243,49 @@ function Add-ReviewerSourceResourceBinding {
         }
     }
     return $Resource
+}
+
+function Get-ReviewerThreadListTop {
+    <# The one thread-list page size. Read it; never restate it. #>
+    return 200
+}
+
+function Get-ReviewerThreadListToolName {
+    <# The one thread-list tool name. Read it; never restate it. #>
+    return 'repo_pull_request_thread'
+}
+
+function New-ReviewerThreadListRequest {
+    <#
+    .SYNOPSIS
+        The one construction of the reviewer's thread-list tool call: its name
+        and its exact argument vector.
+
+    .DESCRIPTION
+        Both the live cycle and the offline-corpus builder call this. They must,
+        because a replay matches a recorded request exactly and never falls
+        through to a live read - so a second copy of these five keys anywhere is
+        a corpus that stops a slot the first time the copies drift.
+
+        The vector is returned in the live cycle's own key order. Callers that
+        need a plain hashtable (the MCP wrapper takes one) cast it; the cast
+        preserves both the keys and their types.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Project,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$RepositoryName,
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$PullRequestId
+    )
+    return [pscustomobject]@{
+        Name = (Get-ReviewerThreadListToolName)
+        Arguments = [ordered]@{
+            action = 'list'
+            project = $Project
+            repositoryId = $RepositoryName
+            pullRequestId = $PullRequestId
+            top = (Get-ReviewerThreadListTop)
+        }
+    }
 }
 
 function Test-ReviewerSourceGetChangesCapability {

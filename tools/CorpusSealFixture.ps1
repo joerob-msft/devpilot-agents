@@ -540,7 +540,8 @@ function New-ReviewerCorpusFixtureRecipe {
             },
             [ordered]@{
                 tool = 'repo_pull_request_thread'
-                arguments = [ordered]@{ action = 'list'; project = $Identity.Project; repositoryId = $Identity.RepositoryName; pullRequestId = $Identity.PullRequestId; top = 200 }
+                arguments = (New-ReviewerThreadListRequest -Project $Identity.Project `
+                        -RepositoryName $Identity.RepositoryName -PullRequestId $Identity.PullRequestId).Arguments
                 envelope = 'mcpTextContent'
                 payloadFile = 'payloads/threads.json'
                 corpusPayload = (New-ReviewerCorpusFixtureBinding -Relative 'live/threads.json' -Text ([string]$files['live/threads.json']))

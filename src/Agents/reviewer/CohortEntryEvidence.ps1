@@ -121,6 +121,7 @@ $script:ReviewerCohortEntryErrorCatalog = [ordered]@{
     CE404 = 'A span is out of range, empty or out of order.'
     CE406 = 'The thread count exceeds the declared cap.'
     CE407 = 'The changed-path census is empty.'
+    CE408 = 'The thread list reached the page the reviewer''s own read asks for, so it cannot be proven complete.'
     CE500 = 'The private output root already holds a package.'
     CE501 = 'The atomic publish did not complete.'
     CE502 = 'The published package is not read-only.'
@@ -955,6 +956,19 @@ function Read-ReviewerCohortEntryRequest {
         }
     }
 
+    # The thread cap is the operator's ceiling on the SUBJECT, not on the read.
+    # The read asks for exactly the page the live cycle asks for, so a ceiling
+    # above that page is a ceiling this build could never observe being crossed:
+    # it would admit a subject with more threads than the operator authorized and
+    # call the census complete. Refuse the request rather than the evidence.
+    $declaredThreadCap = Get-ReviewerCohortEntryInt -Object $coverage -Name 'maxThreads' `
+        -Where 'request coverage' -Minimum 1 -Maximum 1000
+    if ($declaredThreadCap -gt (Get-ReviewerThreadListTop)) {
+        New-ReviewerCohortEntryRefusal -Code 'CE408' `
+            -Detail ("The request caps threads at $declaredThreadCap and the reviewer's own thread read asks " +
+                "for $(Get-ReviewerThreadListTop).")
+    }
+
     return [pscustomobject][ordered]@{
         SchemaVersion = $schemaVersion
         Kind = $kind
@@ -990,7 +1004,7 @@ function Read-ReviewerCohortEntryRequest {
         MaxChangedFiles = (Get-ReviewerCohortEntryInt -Object $coverage -Name 'maxChangedFiles' -Where 'request coverage' -Minimum 1 -Maximum 1000)
         MaxFileBytes = (Get-ReviewerCohortEntryInt -Object $coverage -Name 'maxFileBytes' -Where 'request coverage' -Minimum 1 -Maximum 5242880)
         MaxSiblingFiles = (Get-ReviewerCohortEntryInt -Object $coverage -Name 'maxSiblingFiles' -Where 'request coverage' -Minimum 0 -Maximum 256)
-        MaxThreads = (Get-ReviewerCohortEntryInt -Object $coverage -Name 'maxThreads' -Where 'request coverage' -Minimum 1 -Maximum 1000)
+        MaxThreads = $declaredThreadCap
         MinChangedPathCoveragePercent = (Get-ReviewerCohortEntryInt -Object $coverage -Name 'minChangedPathCoveragePercent' -Where 'request coverage' -Minimum 1 -Maximum 100)
         OutputRoot = $outputRoot
         EntryId = (Get-ReviewerCohortEntryString -Object $output -Name 'entryId' -Where 'request output' -Pattern '^[A-Za-z0-9][A-Za-z0-9._-]{3,63}$' -MaxLength 64)
@@ -1128,13 +1142,15 @@ function Get-ReviewerCohortEntryIdentityReadPlan {
     # snapshot that recorded only the plain one leaves the reviewer's diff-
     # bearing read unanswered at the moment it is issued - which is a live
     # fallback in a mode that has no live seam.
-    # 'top' is asked ONE ABOVE the declared cap, deliberately. A provider asked
-    # for exactly the cap answers exactly the cap when there are more, and a
-    # count-equals-cap answer is indistinguishable from a complete one - which is
-    # how a capped census once looked complete and admitted a subject larger than
-    # the operator authorized. Asking for cap+1 makes overflow observable: a
-    # count above the cap is a refusal, and a count at the cap is genuinely all
-    # there is.
+    # 'top' is asked ONE ABOVE the declared cap on THESE reads, deliberately. A
+    # provider asked for exactly the cap answers exactly the cap when there are
+    # more, and a count-equals-cap answer is indistinguishable from a complete
+    # one - which is how a capped census once looked complete and admitted a
+    # subject larger than the operator authorized. Asking for cap+1 makes
+    # overflow observable: a count above the cap is a refusal, and a count at the
+    # cap is genuinely all there is. This is sound only because the change-set
+    # cap is the BUILDER's own; see the thread read below for the read that is
+    # not.
     [void]$reads.Add((New-ReviewerCohortEntryRead -Id 'changes-plain' -Tool 'repo_pull_request' -Role 'change' `
                 -Arguments ([ordered]@{
                     action = 'get_changes'
@@ -1155,14 +1171,17 @@ function Get-ReviewerCohortEntryIdentityReadPlan {
                     top = ($Request.MaxChangedFiles + 1)
                 }) -Envelope 'mcpTextContent' -PayloadFile 'payloads/changes-diffs.json'))
 
-    [void]$reads.Add((New-ReviewerCohortEntryRead -Id 'threads' -Tool 'repo_pull_request_thread' -Role 'thread' `
-                -Arguments ([ordered]@{
-                    action = 'list'
-                    project = $Request.Project
-                    repositoryId = $Request.RepositoryName
-                    pullRequestId = $Request.PullRequestId
-                    top = ($Request.MaxThreads + 1)
-                }) -Envelope 'mcpTextContent' -PayloadFile 'payloads/threads.json'))
+    # The thread read is NOT shaped here. It is the live cycle's read, taken from
+    # the one shared helper, because a replay answers the arguments it recorded
+    # and never falls through to a live one: a thread vector assembled
+    # independently here is a slot that dies mid-cycle on a read it needs. The
+    # cap+1 probe above is correct for the change-set reads, which this builder
+    # does own; it is wrong for this one, so thread completeness is accounted
+    # after the fact instead (CE406/CE408).
+    $threadRequest = New-ReviewerThreadListRequest -Project $Request.Project `
+        -RepositoryName $Request.RepositoryName -PullRequestId $Request.PullRequestId
+    [void]$reads.Add((New-ReviewerCohortEntryRead -Id 'threads' -Tool $threadRequest.Name -Role 'thread' `
+                -Arguments $threadRequest.Arguments -Envelope 'mcpTextContent' -PayloadFile 'payloads/threads.json'))
 
     return [object[]]$reads.ToArray()
 }

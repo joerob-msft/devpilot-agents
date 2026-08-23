@@ -371,13 +371,21 @@ function New-ReviewerCohortEntryEvidence {
         $census = @(Get-ReviewerCohortEntryChangedPathCensus -Changes $byId['changes-plain'].Parsed -Request $request)
         Assert-ReviewerCohortEntryCensusOrder -Census $census
 
-        # Asked for MaxThreads + 1 above, so an answer AT the cap is genuinely
-        # all there is and an answer above it is real overflow. A build that
-        # asked for exactly the cap could not tell those two apart.
+        # The read asked for exactly the page the live cycle asks for, so it is
+        # NOT a cap+1 probe and an answer that fills the page proves nothing: a
+        # full page is what a truncated list and a complete-and-exactly-full list
+        # both look like. Completeness is therefore accounted here - above the
+        # operator's cap is CE406, at the reviewer's page is CE408 - rather than
+        # assumed from a count.
         $threadRecords = @(Get-ReviewerCohortEntryThreadRecords -Threads $byId['threads'].Parsed)
         if ($threadRecords.Count -gt $request.MaxThreads) {
             New-ReviewerCohortEntryRefusal -Code 'CE406' `
                 -Detail "The thread list carries at least $($threadRecords.Count) threads and the request caps them at $($request.MaxThreads)."
+        }
+        if ($threadRecords.Count -ge (Get-ReviewerThreadListTop)) {
+            New-ReviewerCohortEntryRefusal -Code 'CE408' `
+                -Detail ("The thread list came back with $($threadRecords.Count) threads, filling the page of " +
+                    "$(Get-ReviewerThreadListTop) the reviewer's own read asks for, so it cannot be shown to be the whole list.")
         }
 
         # The plan is extended EXACTLY ONCE, from evidence captured under the

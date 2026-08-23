@@ -685,6 +685,18 @@ foreach ($requiredFactAsset in @($ReviewFactPolicyPath, $ReviewFactSchemaPath)) 
     }
 }
 $ReviewFactPolicy = Get-Content -LiteralPath $ReviewFactPolicyPath -Raw | ConvertFrom-Json -Depth 32
+# The fact layer decides thread COMPLETENESS by comparing what came back against
+# this policy number, while the request itself is now built by the one shared
+# thread-list helper. Those two numbers have to be the same number: a policy that
+# drifted above the page actually asked for would call a truncated thread list
+# complete, and a policy that drifted below it would call a complete one
+# truncated. Neither is allowed to happen quietly, so the disagreement is fatal
+# at load rather than discovered mid-cycle.
+if ([int]$ReviewFactPolicy.threads.maxThreads -ne (Get-ReviewerThreadListTop)) {
+    throw ("Review-fact policy '$ReviewFactPolicyPath' caps threads at " +
+        "$([int]$ReviewFactPolicy.threads.maxThreads) but the shared thread-list request asks for " +
+        "$(Get-ReviewerThreadListTop).")
+}
 
 $ResultMarkerPrefix = "REVIEWER_RESULT_V1:"
 # One retry, in a fresh session with a fresh nonce, and only when the pass ran
@@ -4446,10 +4458,10 @@ function Get-ReviewerFactInputs {
     }
 
     try {
-        $rawThreads = Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request_thread" -Arguments @{
-            action = "list"; project = $ExpectedProject; repositoryId = $RepositoryName
-            pullRequestId = $PrId; top = [int]$ReviewFactPolicy.threads.maxThreads
-        }
+        $factThreadRequest = New-ReviewerThreadListRequest -Project $ExpectedProject `
+            -RepositoryName $RepositoryName -PullRequestId $PrId
+        $rawThreads = Invoke-AgentMcpTool -Session $Session -Name $factThreadRequest.Name `
+            -Arguments ([hashtable]$factThreadRequest.Arguments)
         $threadSet = ConvertTo-ReviewerFactThreadSet -Response $rawThreads
         $normalizedThreads = @($threadSet.Entries | Where-Object { $null -ne $_ } | ForEach-Object {
                 ConvertTo-ReviewerThread -RawThread $_
@@ -8855,10 +8867,10 @@ function Get-ReviewerPullRequestThreads {
     <# Normalized threads for one PR, fetched once and reused for both the
        prompt digest and the posting-idempotency fingerprints. #>
     param([Parameter(Mandatory)][hashtable]$Session, [Parameter(Mandatory)][int]$PrId)
-    $raw = Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request_thread" -Arguments @{
-        action = 'list'; project = $ExpectedProject; repositoryId = $RepositoryName
-        pullRequestId = $PrId; top = 200
-    }
+    $threadRequest = New-ReviewerThreadListRequest -Project $ExpectedProject `
+        -RepositoryName $RepositoryName -PullRequestId $PrId
+    $raw = Invoke-AgentMcpTool -Session $Session -Name $threadRequest.Name `
+        -Arguments ([hashtable]$threadRequest.Arguments)
     $normalized = New-Object System.Collections.Generic.List[object]
     foreach ($rt in @($raw)) { if ($rt) { $normalized.Add((ConvertTo-ReviewerThread -RawThread $rt)) } }
     return , ($normalized.ToArray())
