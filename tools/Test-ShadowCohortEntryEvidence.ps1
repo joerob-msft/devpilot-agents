@@ -412,6 +412,14 @@ function New-CohortEntryFixture {
             [void](New-Item -ItemType Directory -Force -Path $schemaDir)
             Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../src/Agents/reviewer/schemas/reviewer.stage-producer-contracts.v1.json') `
                 -Destination (Join-Path $schemaDir 'reviewer.stage-producer-contracts.v1.json') -Force
+            # The REAL source-transport policy, byte for byte. The builder puts
+            # these bytes in the corpus and the seal derives the transport
+            # artifact under them; a fixture stand-in would prove the derivation
+            # against rules the production sealer never applies.
+            $policyDir = Join-Path $toolkit 'src/Agents/reviewer/source/v1'
+            [void](New-Item -ItemType Directory -Force -Path $policyDir)
+            Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../src/Agents/reviewer/source/v1/policy.json') `
+                -Destination (Join-Path $policyDir 'policy.json') -Force
             # One reviewer prompt asset, because the coordinator binds a run to
             # the set of them and refuses a toolkit that ships none.
             [IO.File]::WriteAllBytes(
@@ -1042,6 +1050,236 @@ try {
 
     )
 
+    # ------------------------------------------------------------------
+    # The PRODUCTION corpus seal contract. The builder used to emit a recipe
+    # of its own invention that nothing in the tree read, so an entry could be
+    # published, accepted by a cohort manifest and only refused by the sealer
+    # four states into a run. Everything below is checked against the shipping
+    # sealer rather than against a restatement of what it wants.
+    # ------------------------------------------------------------------
+    $recipePath = Join-Path $result.Root 'entry/corpus-seal-recipe.json'
+    $recipeKeys = [string[]]@($recipe.PSObject.Properties.Name)
+    Assert-CohortEntry -Name 'the recipe is the recipe the shipping sealer reads' `
+        -Condition ([string]$recipe.kind -ceq 'reviewer-offline-corpus-seal-recipe')
+    Assert-CohortEntry -Name 'the recipe carries none of the builder-only fields the sealer refused' `
+        -Condition (@($recipeKeys | Where-Object { $_ -cin @('corpusRoot', 'correlationId', 'subject') }).Count -eq 0)
+    Assert-CohortEntry -Name 'the recipe declares exactly the production key set' `
+        -Condition ((($recipeKeys | Sort-Object -CaseSensitive) -join ',') -ceq ((@(
+                    'binding', 'bindings', 'capture', 'capturedUtc', 'changeSet', 'changedFiles', 'corpus', 'evidence',
+                    'hashes', 'kind', 'nonPromotable', 'provider', 'resources', 'schemaVersion', 'sealKind', 'snapshotId',
+                    'sourceCensus', 'sourceTransport') | Sort-Object -CaseSensitive) -join ','))
+    Assert-CohortEntry -Name 'the recipe binds a start identity and an end identity payload' `
+        -Condition ([string]$recipe.capture.identity.corpusPath -cne [string]$recipe.capture.endIdentity.corpusPath -and
+            [string]$recipe.capture.identity.corpusPath -and [string]$recipe.capture.endIdentity.corpusPath)
+
+    function Get-CohortEntryCorpusPayload {
+        param([Parameter(Mandatory)][string]$CorpusRoot, [Parameter(Mandatory)][string]$CorpusPath)
+        $full = $CorpusRoot
+        foreach ($segment in @($CorpusPath -split '/')) { $full = Join-Path $full $segment }
+        return ([IO.File]::ReadAllText($full) | ConvertFrom-Json -Depth 32)
+    }
+    $corpusRootPath = Join-Path $result.Root 'corpus'
+    $startIdentity = Get-CohortEntryCorpusPayload -CorpusRoot $corpusRootPath -CorpusPath ([string]$recipe.capture.identity.corpusPath)
+    $endIdentity = Get-CohortEntryCorpusPayload -CorpusRoot $corpusRootPath -CorpusPath ([string]$recipe.capture.endIdentity.corpusPath)
+    Assert-CohortEntry -Name 'the start identity payload is FLAT and carries every field the seal binds by name' `
+        -Condition (@(@('commonCommit', 'isDraft', 'iterationId', 'pullRequestId', 'repositoryId', 'sourceCommit', 'status', 'targetCommit') |
+                Where-Object { -not $startIdentity.PSObject.Properties[$_] }).Count -eq 0)
+    Assert-CohortEntry -Name 'the start identity payload names no alias the seal would not read' `
+        -Condition (-not $startIdentity.PSObject.Properties['lastMergeSourceCommit'])
+    Assert-CohortEntry -Name 'the identity payloads carry no read timestamp to drift on' `
+        -Condition (@(@(@($startIdentity.PSObject.Properties.Name) + @($endIdentity.PSObject.Properties.Name)) |
+                Where-Object { $_ -match '(?i)utc|timestamp|readAt' }).Count -eq 0)
+    Assert-CohortEntry -Name 'the end identity states that it matches the start of capture' `
+        -Condition ([bool]$endIdentity.matchesInitialCapture)
+    Assert-CohortEntry -Name 'the two identity reads agree on the source commit byte for byte' `
+        -Condition ([string]$endIdentity.sourceCommit -ceq [string]$startIdentity.sourceCommit)
+
+    # The census the seal derives spans from, in the sealer's own hunk form.
+    # This is the same span evidence the witness publishes - one derivation,
+    # rendered once - so a builder that hand-mapped an alias here would put the
+    # recipe and its own witness at odds.
+    $censusPayload = @(Get-CohortEntryCorpusPayload -CorpusRoot $corpusRootPath `
+            -CorpusPath ([string]$recipe.changeSet.spanEvidence.corpusPath))
+    $censusA = @($censusPayload | Where-Object { [string]$_.path -ceq '/src/a.ps1' })[0]
+    Assert-CohortEntry -Name 'the span evidence payload is in the canonical newStart/newCount form' `
+        -Condition ($censusA.hunks[0].PSObject.Properties['newStart'] -and $censusA.hunks[0].PSObject.Properties['newCount'])
+    Assert-CohortEntry -Name 'the span evidence hunk is the span the witness publishes' `
+        -Condition ([int]$censusA.hunks[0].newStart -eq [int]$spanA[0].start -and
+            [int]$censusA.hunks[0].newCount -eq [int]$spanA[0].count)
+    Assert-CohortEntry -Name 'the span evidence names no path with no right hand to show' `
+        -Condition (@($censusPayload | Where-Object { [string]$_.path -ceq '/src/z-old.ps1' }).Count -eq 0)
+
+    # The acceptance claim, run through the SHIPPING sealer script, in a child
+    # process, exactly as the coordinator's snapshotValidateOnly stage runs it.
+    function Invoke-CohortEntrySealValidate {
+        param(
+            [Parameter(Mandatory)][string]$CorpusRoot,
+            [Parameter(Mandatory)][string]$CorpusIndexSha256,
+            [Parameter(Mandatory)][string]$RecipePath,
+            [Parameter(Mandatory)][string]$ReplayRoot
+        )
+        $previous = $PSNativeCommandUseErrorActionPreference
+        $PSNativeCommandUseErrorActionPreference = $false
+        try {
+            $output = & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Save-CorpusReplaySeal.ps1') `
+                -CorpusRoot $CorpusRoot -CorpusIndexSha256 $CorpusIndexSha256 `
+                -Recipe $RecipePath -ReplayRoot $ReplayRoot -ValidateOnly 2>&1
+            return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Text = ([string[]]@($output) -join "`n") }
+        }
+        finally { $PSNativeCommandUseErrorActionPreference = $previous }
+    }
+    $validated = Invoke-CohortEntrySealValidate -CorpusRoot $corpusRootPath -CorpusIndexSha256 $result.CorpusIndexSha256 `
+        -RecipePath $recipePath -ReplayRoot (Join-Path $sandbox 'replay-accept')
+    Assert-CohortEntry -Name 'the shipping sealer validates the builder-produced entry' -Condition ($validated.ExitCode -eq 0)
+    Assert-CohortEntry -Name 'the shipping sealer wrote nothing under -ValidateOnly' `
+        -Condition (-not (Test-Path -LiteralPath (Join-Path $sandbox 'replay-accept') -PathType Container))
+
+    # Sabotage. Each case is the SAME entry with one thing changed, re-indexed
+    # with the production index writer so the refusal under test is the seal
+    # contract and never a corpus integrity check standing in front of it.
+    function Invoke-CohortEntrySealSabotage {
+        param(
+            [Parameter(Mandatory)][string]$Name,
+            [Parameter(Mandatory)][scriptblock]$Mutate,
+            [Parameter(Mandatory)][string]$Expected
+        )
+        $scratch = Join-Path $sandbox ("seal-" + [Guid]::NewGuid().ToString('n').Substring(0, 8))
+        [void](New-Item -ItemType Directory -Force -Path $scratch)
+        Copy-Item -LiteralPath $corpusRootPath -Destination (Join-Path $scratch 'corpus') -Recurse -Force
+        Copy-Item -LiteralPath $recipePath -Destination (Join-Path $scratch 'recipe.json') -Force
+        foreach ($file in @(Get-ChildItem -LiteralPath $scratch -Recurse -File -Force)) {
+            $file.Attributes = [IO.FileAttributes]::Normal
+        }
+        $scratchCorpus = Join-Path $scratch 'corpus'
+        $scratchRecipe = Join-Path $scratch 'recipe.json'
+        $context = [pscustomobject]@{
+            CorpusRoot = $scratchCorpus
+            RecipePath = $scratchRecipe
+            Recipe = ([IO.File]::ReadAllText($scratchRecipe) | ConvertFrom-Json -Depth 32)
+        }
+        & $Mutate $context
+        # Re-mint the index over whatever the mutation left behind, in the exact
+        # bytes New-ReviewerCohortEntryCorpus mints, so the sealer's integrity
+        # check passes and its CONTRACT check is what speaks.
+        $indexPath = Join-Path $scratchCorpus 'corpus-index.json'
+        $existingIndex = [IO.File]::ReadAllText($indexPath) | ConvertFrom-Json -Depth 32
+        $payloadFiles = @(Get-ChildItem -LiteralPath $scratchCorpus -Recurse -File -Force |
+                Where-Object { $_.FullName -cne ([IO.Path]::GetFullPath($indexPath)) })
+        $relatives = [string[]]@($payloadFiles | ForEach-Object {
+                ([string]$_.FullName).Substring(([string]([IO.Path]::GetFullPath($scratchCorpus))).Length + 1).Replace('\', '/')
+            })
+        [Array]::Sort($relatives, [StringComparer]::Ordinal)
+        $entries = @($relatives | ForEach-Object {
+                $full = $scratchCorpus
+                foreach ($segment in @($_ -split '/')) { $full = Join-Path $full $segment }
+                $bytes = [IO.File]::ReadAllBytes($full)
+                [ordered]@{ path = $_; sha256 = (Get-ReviewerCorpusSealSha256 -Bytes $bytes); length = $bytes.Length }
+            })
+        $rebuilt = [ordered]@{
+            kind = 'private-immutable-non-promotable-research-corpus'
+            repository = [string]$existingIndex.repository
+            payloadCount = $entries.Count
+            identities = $existingIndex.identities
+            payloads = [object[]]$entries
+        }
+        [IO.File]::WriteAllBytes($indexPath, $script:Utf8.GetBytes((ConvertTo-AgentReplayCanonicalJson -Value $rebuilt)))
+        $rebuiltIndexSha = (Get-FileHash -LiteralPath $indexPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        # The recipe binds the index it was written for. Re-binding it here is what
+        # makes every case below a statement about the SEAL contract rather than
+        # about corpus integrity, which is already proven elsewhere.
+        if ($context.Recipe.PSObject.Properties['corpus']) {
+            $context.Recipe.corpus.indexSha256 = $rebuiltIndexSha
+            $context.Recipe.corpus.payloadCount = $entries.Count
+        }
+        Write-CohortEntryJsonFile -Path $scratchRecipe -Value $context.Recipe
+        $sabotaged = Invoke-CohortEntrySealValidate -CorpusRoot $scratchCorpus `
+            -CorpusIndexSha256 $rebuiltIndexSha `
+            -RecipePath $scratchRecipe -ReplayRoot (Join-Path $scratch 'replay')
+        Assert-CohortEntry -Name $Name -Condition ($sabotaged.ExitCode -ne 0 -and $sabotaged.Text -clike "*$Expected*")
+    }
+    function Set-CohortEntryScratchPayload {
+        param([Parameter(Mandatory)]$Context, [Parameter(Mandatory)][string]$CorpusPath, [Parameter(Mandatory)]$Value)
+        $full = $Context.CorpusRoot
+        foreach ($segment in @($CorpusPath -split '/')) { $full = Join-Path $full $segment }
+        $bytes = $script:Utf8.GetBytes((ConvertTo-AgentReplayCanonicalJson -Value $Value))
+        [IO.File]::WriteAllBytes($full, $bytes)
+        return $bytes
+    }
+    $startIdentityPath = [string]$recipe.capture.identity.corpusPath
+    $endIdentityPath = [string]$recipe.capture.endIdentity.corpusPath
+    $spanEvidencePath = [string]$recipe.changeSet.spanEvidence.corpusPath
+
+    Invoke-CohortEntrySealSabotage -Name 'a recipe carrying an extra field is refused by the sealer' `
+        -Expected 'unexpected field' -Mutate {
+        param($ctx) $ctx.Recipe | Add-Member -NotePropertyName 'corpusRoot' -NotePropertyValue 'C:/somewhere'
+    }
+    Invoke-CohortEntrySealSabotage -Name 'a recipe that binds no start identity is refused by the sealer' `
+        -Expected 'identity' -Mutate {
+        param($ctx) $ctx.Recipe.capture.PSObject.Properties.Remove('identity')
+    }
+    Invoke-CohortEntrySealSabotage -Name 'a start identity payload naming an alias instead of the field is refused' `
+        -Expected "omits 'sourceCommit'" -Mutate {
+        param($ctx)
+        $payload = Get-CohortEntryCorpusPayload -CorpusRoot $ctx.CorpusRoot -CorpusPath $startIdentityPath
+        $aliased = [ordered]@{}
+        foreach ($property in @($payload.PSObject.Properties)) {
+            if ($property.Name -ceq 'sourceCommit') { $aliased['lastMergeSourceCommit'] = $property.Value }
+            else { $aliased[$property.Name] = $property.Value }
+        }
+        $bytes = Set-CohortEntryScratchPayload -Context $ctx -CorpusPath $startIdentityPath -Value $aliased
+        $ctx.Recipe.capture.identity.sha256 = (Get-ReviewerCorpusSealSha256 -Bytes $bytes)
+        $ctx.Recipe.capture.identity.byteLength = $bytes.Length
+    }
+    Invoke-CohortEntrySealSabotage -Name 'an end identity whose source commit drifted mid-capture is refused' `
+        -Expected 'moved while it was being captured' -Mutate {
+        param($ctx)
+        $payload = Get-CohortEntryCorpusPayload -CorpusRoot $ctx.CorpusRoot -CorpusPath $endIdentityPath
+        $drifted = [ordered]@{}
+        foreach ($property in @($payload.PSObject.Properties)) { $drifted[$property.Name] = $property.Value }
+        $drifted['sourceCommit'] = ('d' * 40)
+        $bytes = Set-CohortEntryScratchPayload -Context $ctx -CorpusPath $endIdentityPath -Value $drifted
+        $ctx.Recipe.capture.endIdentity.sha256 = (Get-ReviewerCorpusSealSha256 -Bytes $bytes)
+        $ctx.Recipe.capture.endIdentity.byteLength = $bytes.Length
+    }
+    Invoke-CohortEntrySealSabotage -Name 'a census in lineDiffBlocks form rather than hunks is refused' `
+        -Expected 'hunks' -Mutate {
+        param($ctx)
+        $payload = @(Get-CohortEntryCorpusPayload -CorpusRoot $ctx.CorpusRoot -CorpusPath $spanEvidencePath)
+        $aliased = @($payload | ForEach-Object {
+                [ordered]@{
+                    path = [string]$_.path
+                    lineDiffBlocks = @(@($_.hunks) | ForEach-Object {
+                            [ordered]@{ mLine = [int]$_.newStart; mLinesCount = [int]$_.newCount }
+                        })
+                }
+            })
+        $bytes = Set-CohortEntryScratchPayload -Context $ctx -CorpusPath $spanEvidencePath -Value ([object[]]$aliased)
+        $ctx.Recipe.changeSet.spanEvidence.sha256 = (Get-ReviewerCorpusSealSha256 -Bytes $bytes)
+        $ctx.Recipe.changeSet.spanEvidence.byteLength = $bytes.Length
+    }
+    Invoke-CohortEntrySealSabotage -Name 'a census hunk that is not the span the changed file declares is refused' `
+        -Expected 'span evidence derives' -Mutate {
+        param($ctx)
+        $payload = @(Get-CohortEntryCorpusPayload -CorpusRoot $ctx.CorpusRoot -CorpusPath $spanEvidencePath)
+        $moved = @($payload | ForEach-Object {
+                [ordered]@{
+                    path = [string]$_.path
+                    hunks = @(@($_.hunks) | ForEach-Object {
+                            [ordered]@{ newStart = ([int]$_.newStart + 1); newCount = [int]$_.newCount }
+                        })
+                }
+            })
+        $bytes = Set-CohortEntryScratchPayload -Context $ctx -CorpusPath $spanEvidencePath -Value ([object[]]$moved)
+        $ctx.Recipe.changeSet.spanEvidence.sha256 = (Get-ReviewerCorpusSealSha256 -Bytes $bytes)
+        $ctx.Recipe.changeSet.spanEvidence.byteLength = $bytes.Length
+    }
+    Invoke-CohortEntrySealSabotage -Name 'a digest order that is not the order the change set names is refused' `
+        -Expected 'order' -Mutate {
+        param($ctx)
+        $order = [string[]]@($ctx.Recipe.changeSet.digestOrder)
+        $ctx.Recipe.changeSet.digestOrder = [string[]]@($order[($order.Count - 1)..0])
+    }
+
     Assert-CohortEntry -Name 'the published package re-verifies' `
         -Condition (Assert-ReviewerCohortEntryPublished -Root $result.Root -SealKeyPath $fixture.SealKeyPath)
 
@@ -1135,6 +1373,30 @@ try {
     # The output root already holds a package, so a second build must refuse.
     Assert-CohortEntry -Name 'a second build into an occupied root refuses CE500' `
         -Condition ((Get-CohortEntryRefusalCode -Action { New-ReviewerCohortEntryEvidence -RequestPath $fixture.RequestPath }) -ceq 'CE500')
+}
+finally { Remove-CohortEntrySandbox -Path $sandbox }
+
+# -------------------------------------------------------------------------
+# A toolkit that ships no source-transport policy cannot produce a sealable
+# entry, because the seal derives its transport artifact UNDER that policy.
+# Refusing at build time is the whole point: the alternative is an entry that
+# publishes, is accepted by a manifest and dies four coordinator states later.
+$sandbox = New-CohortEntrySandbox -Name 'no-policy'
+try {
+    $fixture = New-CohortEntryFixture -Sandbox $sandbox
+    $policyPath = Join-Path $fixture.Toolkit 'src/Agents/reviewer/source/v1/policy.json'
+    Remove-Item -LiteralPath $policyPath -Force
+    # Committed, so the toolkit tree is CLEAN and the refusal under test is the
+    # missing policy rather than the dirty-tree guard standing in front of it.
+    [void](& git -C $fixture.Toolkit add -A 2>&1)
+    [void](& git -C $fixture.Toolkit -c user.name=fixture -c user.email=fixture@local commit -m 'drop policy' --quiet 2>&1)
+    $noPolicyHead = ([string](& git -C $fixture.Toolkit rev-parse HEAD)).Trim()
+    $noPolicyRequest = [IO.File]::ReadAllText($fixture.RequestPath) | ConvertFrom-Json -Depth 32
+    $noPolicyRequest.toolkit.head = $noPolicyHead
+    Write-CohortEntryJsonFile -Path $fixture.RequestPath -Value $noPolicyRequest
+    $noPolicyCode = Get-CohortEntryRefusalCode -Action { New-ReviewerCohortEntryEvidence -RequestPath $fixture.RequestPath }
+    Assert-CohortEntry -Name "a pinned toolkit shipping no source-transport policy refuses CE803 (observed '$noPolicyCode')" `
+        -Condition ($noPolicyCode -ceq 'CE803')
 }
 finally { Remove-CohortEntrySandbox -Path $sandbox }
 

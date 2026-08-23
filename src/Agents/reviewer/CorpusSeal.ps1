@@ -1628,6 +1628,100 @@ function Get-ReviewerCorpusSealPolicyPayload {
     }
 }
 
+function Get-ReviewerCorpusSealTransportPolicy {
+    <#
+        The source-transport policy object, from the exact policy bytes a seal
+        derives under.
+
+        The reviewer's own loader drops the documentation key before validating,
+        so this has to as well; otherwise a byte-identical policy file would be
+        accepted in production and refused here. Shared rather than repeated,
+        because a builder that wants to state a transport digest in advance has
+        to load the policy the SAME way the seal will, and two loaders that drift
+        produce two policies and therefore two irreconcilable digests.
+    #>
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+    $policyJson = $script:ReviewerCorpusSealUtf8.GetString($Bytes) | ConvertFrom-Json -Depth 32
+    $policyProperties = [ordered]@{}
+    foreach ($property in $policyJson.PSObject.Properties) {
+        if ($property.Name -ceq "_note") { continue }
+        $policyProperties[$property.Name] = $property.Value
+    }
+    return (New-ReviewerSourceTransportPolicy -Policy ([pscustomobject]$policyProperties))
+}
+
+function New-ReviewerCorpusSealDerivedTransportArtifact {
+    <#
+        Derives the canonical source-transport replay artifact offline from
+        captured right-hand content, and reports every digest the recipe has to
+        declare about it.
+
+        This is THE derivation. The seal calls it to produce the artifact it is
+        sealing, and an evidence builder calls it to learn what the seal will
+        produce so its recipe can state those values independently. One function
+        means the recipe's "independent claim" is a claim about a value the
+        builder could not have guessed and cannot have computed differently -
+        it either handed the same inputs to the same code or it did not.
+
+        Derivation is not invention: it runs the reviewer's OWN transport report,
+        coverage record, gate and sealed-block renderer over the exact captured
+        bytes, with a reader that can only return indexed corpus payloads. There
+        is no fallback branch - a path the corpus does not carry reads as
+        unreadable, which lands in the coverage accounting as an uncovered file
+        rather than as a silent live fetch.
+    #>
+    param(
+        [Parameter(Mandatory)]$Policy,
+        [Parameter(Mandatory)][string]$PolicySha256,
+        [Parameter(Mandatory)][string]$Mode,
+        [Parameter(Mandatory)]$Binding,
+        [Parameter(Mandatory)]$SpansByPath,
+        [Parameter(Mandatory)]$ChangeKindsByPath,
+        [Parameter(Mandatory)]$RightHandByPath,
+        [Parameter(Mandatory)][string[]]$AuthoritativePaths,
+        [Parameter(Mandatory)][string]$BlockNonce
+    )
+    if ($BlockNonce -cnotmatch '^[A-Z0-9]{8,128}\z') {
+        throw "The sealed source block nonce is not 8 to 128 upper-case alphanumeric characters."
+    }
+    $rightHand = $RightHandByPath
+    $reader = {
+        param([string]$path)
+        if (-not $rightHand.ContainsKey($path)) { return $null }
+        $entry = $rightHand[$path]
+        $text = ([System.Text.UTF8Encoding]::new($false, $true)).GetString($entry.Bytes)
+        return [pscustomobject]@{
+            Text = $text
+            ByteLength = [int]$entry.ByteLength
+            Sha256 = [string]$entry.Sha256
+            MimeType = "text/plain"
+        }
+    }.GetNewClosure()
+    $nonce = $BlockNonce
+    $report = New-ReviewerSourceTransportReport -CommitSha ([string]$Binding.sourceCommit) `
+        -ChangedPaths ([string[]]@($AuthoritativePaths)) -SpansByPath $SpansByPath -Policy $Policy -Reader $reader `
+        -ChangeKindsByPath $ChangeKindsByPath `
+        -RecoveryBaseCommit ([string]$Binding.commonCommit) `
+        -RecoveryIterationId ([int]$Binding.iterationId)
+    $blockText = Format-ReviewerSealedSourceBlock -Report $report -NonceFactory { $nonce }.GetNewClosure()
+    $artifactBytes = New-ReviewerSourceTransportReplayArtifact -Report $report -BlockText $blockText `
+        -Policy $Policy -PolicySha256 $PolicySha256 -Mode $Mode -Binding $Binding
+    $artifact = ($script:ReviewerCorpusSealUtf8.GetString($artifactBytes) | ConvertFrom-Json -AsHashtable -Depth 64)
+    $coverageRecord = $artifact.coverageRecord
+    $gate = $artifact.gate
+    return @{
+        Bytes = [byte[]]$artifactBytes
+        Sha256 = (Get-ReviewerCorpusSealSha256 -Bytes $artifactBytes)
+        ByteLength = [long]$artifactBytes.Length
+        BlockText = [string]$blockText
+        BlockSha256 = (Get-ReviewerSourceSha256 -Text $blockText)
+        CoverageRecord = $coverageRecord
+        CoverageRecordSha256 = (Get-ReviewerSourceSha256 -Text (Get-ReviewerSourceReplayCanonicalJson -Value $coverageRecord))
+        GateOk = [bool]$gate.ok
+        GateReasonCodes = [string[]]@(@($gate.reasonCodes) | ForEach-Object { [string]$_ })
+    }
+}
+
 function New-ReviewerCorpusSealSourceTransport {
     <#
         Produces the canonical source-transport replay artifact this snapshot
@@ -1695,16 +1789,7 @@ function New-ReviewerCorpusSealSourceTransport {
     if ($policyPayload.Sha256 -cne $PolicySha256) {
         throw "The sealed source-transport policy does not hash to the recipe's declared policySha256."
     }
-    $policyJson = $script:ReviewerCorpusSealUtf8.GetString($policyPayload.Bytes) | ConvertFrom-Json -Depth 32
-    # The reviewer's own loader drops the documentation key before validating, so
-    # the seal has to as well; otherwise a byte-identical policy file would be
-    # accepted in production and refused here.
-    $policyProperties = [ordered]@{}
-    foreach ($property in $policyJson.PSObject.Properties) {
-        if ($property.Name -ceq "_note") { continue }
-        $policyProperties[$property.Name] = $property.Value
-    }
-    $policy = New-ReviewerSourceTransportPolicy -Policy ([pscustomobject]$policyProperties)
+    $policy = Get-ReviewerCorpusSealTransportPolicy -Bytes ([byte[]]$policyPayload.Bytes)
 
     if ($kind -ceq "capturedArtifact") {
         $captured = Get-ReviewerCorpusSealProperty -Object $source -Name "capturedArtifact" -Type object -Where "Corpus seal recipe sourceTransport"
@@ -1726,35 +1811,14 @@ function New-ReviewerCorpusSealSourceTransport {
     else {
         $blockNonce = Get-ReviewerCorpusSealProperty -Object $source -Name "blockNonce" -Type string `
             -Where "Corpus seal recipe sourceTransport" -Pattern '^[A-Z0-9]{8,128}\z'
-        # The reader can ONLY return indexed corpus bytes for a path this recipe
-        # sealed. There is no fallback branch: a path the corpus does not carry
-        # reads as unreadable, which lands in the coverage accounting as an
-        # uncovered file rather than as a silent live fetch.
-        $rightHand = $RightHandByPath
-        $reader = {
-            param([string]$path)
-            if (-not $rightHand.ContainsKey($path)) { return $null }
-            $entry = $rightHand[$path]
-            $text = ([System.Text.UTF8Encoding]::new($false, $true)).GetString($entry.Bytes)
-            return [pscustomobject]@{
-                Text = $text
-                ByteLength = [int]$entry.ByteLength
-                Sha256 = [string]$entry.Sha256
-                MimeType = "text/plain"
-            }
-        }.GetNewClosure()
-        $changedPaths = [string[]]@($AuthoritativePaths)
-        $report = New-ReviewerSourceTransportReport -CommitSha ([string]$Binding.sourceCommit) `
-            -ChangedPaths $changedPaths -SpansByPath $SpansByPath -Policy $policy -Reader $reader `
-            -ChangeKindsByPath $ChangeKindsByPath `
-            -RecoveryBaseCommit ([string]$Binding.commonCommit) `
-            -RecoveryIterationId ([int]$Binding.iterationId)
-        $blockText = Format-ReviewerSealedSourceBlock -Report $report -NonceFactory { $blockNonce }.GetNewClosure()
-        $artifactBytes = New-ReviewerSourceTransportReplayArtifact -Report $report -BlockText $blockText `
-            -Policy $policy -PolicySha256 $PolicySha256 -Mode $mode -Binding $replayBinding
-        $artifact = ($script:ReviewerCorpusSealUtf8.GetString($artifactBytes) | ConvertFrom-Json -AsHashtable -Depth 64)
-        $coverageRecord = $artifact.coverageRecord
-        $gate = $artifact.gate
+        $derived = New-ReviewerCorpusSealDerivedTransportArtifact -Policy $policy -PolicySha256 $PolicySha256 `
+            -Mode $mode -Binding $replayBinding -SpansByPath $SpansByPath -ChangeKindsByPath $ChangeKindsByPath `
+            -RightHandByPath $RightHandByPath -AuthoritativePaths ([string[]]@($AuthoritativePaths)) `
+            -BlockNonce $blockNonce
+        $artifactBytes = $derived.Bytes
+        $blockText = $derived.BlockText
+        $coverageRecord = $derived.CoverageRecord
+        $gate = [ordered]@{ ok = [bool]$derived.GateOk; reasonCodes = [string[]]@($derived.GateReasonCodes) }
     }
 
     # -- the recipe's independent claims about the artifact -----------------

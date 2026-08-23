@@ -337,10 +337,19 @@ function New-ReviewerCohortEntryResourceDeclaration {
         One recipe resource declaration for one captured read, carrying the exact
         tool, the exact arguments, the declared envelope, the wrapper-requested
         URI and the digest and length the sealed payload must have.
+
+    .DESCRIPTION
+        `expected` is a claim about the bytes a REPLAY SERVES, which is the
+        envelope-wrapped payload, not the payload alone. The two differ by the
+        wrapper the reviewer asked for, and a declaration that stated the raw
+        digest under an envelope name would be refused by the sealer for a
+        mismatch the operator could not act on - so the envelope bytes the
+        round-trip check already built are the ones measured here.
     #>
     param(
         [Parameter(Mandatory)]$Captured,
-        [Parameter(Mandatory)][string]$CorpusRelativePath
+        [Parameter(Mandatory)][string]$CorpusRelativePath,
+        [Parameter(Mandatory)][byte[]]$EnvelopeBytes
     )
     $read = $Captured.Read
     return [ordered]@{
@@ -349,17 +358,365 @@ function New-ReviewerCohortEntryResourceDeclaration {
         envelope = [string]$read.Envelope
         payloadFile = [string]$read.PayloadFile
         corpusPayload = [ordered]@{
-            path = $CorpusRelativePath
+            corpusPath = $CorpusRelativePath
             sha256 = [string]$Captured.Sha256
             byteLength = [int]$Captured.ByteLength
         }
         resourceUri = [string]$read.ResourceUri
         mimeType = [string]$read.MimeType
         expected = [ordered]@{
-            payloadSha256 = [string]$Captured.Sha256
-            payloadByteLength = [int]$Captured.ByteLength
+            payloadSha256 = (Get-ReviewerCorpusSealSha256 -Bytes $EnvelopeBytes)
+            payloadByteLength = [int]$EnvelopeBytes.Length
         }
     }
+}
+
+function New-ReviewerCohortEntryCaptureIdentityPayload {
+    <#
+    .SYNOPSIS
+        The flat identity payload the shipping sealer reads, from one of this
+        build's two live identity reads.
+
+    .DESCRIPTION
+        The sealer compares these fields by name, ordinally, with no aliases: a
+        payload that carried the provider's own `lastMergeSourceCommit` spelling
+        would read as an identity that omits the source commit entirely. That is
+        exactly the defect that made every hand-assembled corpus need a
+        hand-written identity file beside it.
+
+        No timestamp is written. The seal binds these bytes, and a captured-at
+        field would make two reads of an unchanged pull request produce two
+        different payloads - a difference that says nothing about the subject and
+        breaks byte-stability for no gain.
+    #>
+    param(
+        [Parameter(Mandatory)]$Request,
+        [Parameter(Mandatory)]$Identity,
+        [Parameter(Mandatory)][int]$IterationId,
+        [switch]$End
+    )
+    foreach ($name in @('SourceCommit', 'TargetCommit', 'CommonCommit', 'Status')) {
+        if (-not [string]$Identity.$name) {
+            New-ReviewerCohortEntryRefusal -Code 'CE800' `
+                -Detail "The live identity read carries no '$name'; a corpus seal binds every identity field by name."
+        }
+    }
+    $payload = [ordered]@{
+        commonCommit = [string]$Identity.CommonCommit
+        isDraft = [bool]$Identity.IsDraft
+        iterationId = [int]$IterationId
+        pullRequestId = [int]$Request.PullRequestId
+        repositoryId = [string]$Request.RepositoryId
+        sourceCommit = [string]$Identity.SourceCommit
+        status = [string]$Identity.Status
+        targetCommit = [string]$Identity.TargetCommit
+    }
+    if ($End) {
+        # Declared only on the closing read, and only ever true: the builder has
+        # already refused a moved identity by the time this is written, so the
+        # field records the check that happened rather than asserting one.
+        $payload['matchesInitialCapture'] = $true
+    }
+    return $payload
+}
+
+function New-ReviewerCohortEntryHunkCensusPayload {
+    <#
+    .SYNOPSIS
+        The canonical per-path hunk census, in the right-hand `newStart`/
+        `newCount` form the sealer derives spans from.
+
+    .DESCRIPTION
+        The hunks are the spans this build already derived through the reviewer's
+        own right-hand extractor and validated against the captured file's line
+        count. Nothing is re-read from the provider response here and no alias is
+        mapped: this is a RESTATEMENT of an evidence structure that already
+        exists, in the one shape the sealer accepts.
+    #>
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$SpanEvidence)
+    $entries = [System.Collections.Generic.List[object]]::new()
+    foreach ($path in @($SpanEvidence.Keys)) {
+        $spans = @($SpanEvidence[[string]$path])
+        if ($spans.Count -lt 1) {
+            New-ReviewerCohortEntryRefusal -Code 'CE802' `
+                -Detail ("The changed path '$path' carries right-hand content but no right-hand span; a seal cannot " +
+                'show a file it can name no changed line of.')
+        }
+        [void]$entries.Add([ordered]@{
+                path = [string]$path
+                hunks = [object[]]@($spans | ForEach-Object {
+                        [ordered]@{ newCount = [int]$_.count; newStart = [int]$_.start }
+                    })
+            })
+    }
+    return [object[]]$entries.ToArray()
+}
+
+function New-ReviewerCohortEntryCorpusReference {
+    <#
+    .SYNOPSIS
+        One `{ corpusPath, sha256, byteLength }` declaration for a payload this
+        build is staging, measured from the bytes rather than restated.
+    #>
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Files,
+        [Parameter(Mandatory)][string]$CorpusPath
+    )
+    if (-not $Files.Contains($CorpusPath)) {
+        New-ReviewerCohortEntryRefusal -Code 'CE806' `
+            -Detail "The corpus seal recipe cites '$CorpusPath', which this build did not stage."
+    }
+    $bytes = [byte[]]$Files[$CorpusPath]
+    return [ordered]@{
+        corpusPath = $CorpusPath
+        sha256 = (Get-ReviewerCorpusSealSha256 -Bytes $bytes)
+        byteLength = [int]$bytes.Length
+    }
+}
+
+function New-ReviewerCohortEntryOfflineSealRecipe {
+    <#
+    .SYNOPSIS
+        The complete production `reviewer-offline-corpus-seal-recipe` for this
+        entry's corpus - the one the shipping sealer consumes, not a builder
+        dialect of it.
+
+    .DESCRIPTION
+        Every value here is taken from a typed declaration this build already
+        holds, or derived by the SAME production function the sealer will use to
+        check it. Nothing is re-read from a provider response and reinterpreted:
+        the change-set digest, the authoritative path order, the per-path change
+        kinds and the whole source-transport artifact all come from the reviewer's
+        own helpers, so the recipe's "independent claim" is a claim about a value
+        the builder obtained the only way the sealer can obtain it.
+
+        The earlier builder wrote a five-key recipe of its own invention. It
+        hashed, it published, it pinned into the coordinator request, and no
+        consumer in the tree could read it - so every entry that carried one was
+        unsealable, and nothing said so until a coordinator reached the seal.
+    #>
+    param(
+        [Parameter(Mandatory)]$Request,
+        [Parameter(Mandatory)]$Identity,
+        [Parameter(Mandatory)][int]$IterationId,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Files,
+        [Parameter(Mandatory)]$Corpus,
+        [Parameter(Mandatory)][object[]]$Resources,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$SpanEvidence,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$RightHandCorpusPaths,
+        [Parameter(Mandatory)]$ChangeSetResponse,
+        [Parameter(Mandatory)][string]$ChangeSetCorpusPath,
+        [Parameter(Mandatory)][string]$SpanEvidenceCorpusPath,
+        [Parameter(Mandatory)][string]$StartIdentityCorpusPath,
+        [Parameter(Mandatory)][string]$EndIdentityCorpusPath,
+        [Parameter(Mandatory)][string]$PolicyCorpusPath,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$SiblingCorpusPaths,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$RuleCorpusPaths,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$ThreadCorpusPaths,
+        [Parameter(Mandatory)][string]$ConfigSha256,
+        [Parameter(Mandatory)][string]$ScriptSha256,
+        [Parameter(Mandatory)][string]$PromptSha256,
+        [Parameter(Mandatory)][string]$SchemaSha256,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Models,
+        [Parameter(Mandatory)][string]$CapturedUtc
+    )
+    # The authoritative order is the sealer's own extraction over the same
+    # payload, never this builder's census order. The two agree today; if a
+    # provider ever emitted them differently, the one that decides the seal is
+    # the one that has to decide the recipe.
+    $authoritative = [System.Collections.Generic.List[string]]::new()
+    foreach ($raw in @(Get-ReviewerSourceRawChangedPaths -Response $ChangeSetResponse)) {
+        $normalized = ConvertTo-ReviewerSourcePath -Path ([string]$raw)
+        if (-not $normalized) {
+            New-ReviewerCohortEntryRefusal -Code 'CE806' `
+                -Detail "The authoritative change set carries the path '$raw', which does not normalize to a repository path."
+        }
+        if ($authoritative -ccontains $normalized) { continue }
+        [void]$authoritative.Add($normalized)
+    }
+    $changeKinds = Get-ReviewerSourceChangeKindsByPath -Response $ChangeSetResponse
+    $policyReference = New-ReviewerCohortEntryCorpusReference -Files $Files -CorpusPath $PolicyCorpusPath
+
+    $changedFiles = [System.Collections.Generic.List[object]]::new()
+    $spansByPath = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
+    $kindsByPath = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
+    $rightHandByPath = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $noRightHand = [System.Collections.Generic.List[string]]::new()
+    foreach ($path in $authoritative) {
+        if (-not $changeKinds.Contains($path)) {
+            New-ReviewerCohortEntryRefusal -Code 'CE806' `
+                -Detail "The authoritative change set carries '$path' but declares no change type for it."
+        }
+        $kinds = [string[]]@(@($changeKinds[$path]) | ForEach-Object { [string]$_ } | Sort-Object -CaseSensitive -Unique)
+        $kindsByPath[$path] = $kinds
+        $spansByPath[$path] = @()
+        if (-not $RightHandCorpusPaths.Contains($path)) {
+            [void]$noRightHand.Add($path)
+            continue
+        }
+        $spans = @($SpanEvidence[$path])
+        $reference = New-ReviewerCohortEntryCorpusReference -Files $Files -CorpusPath ([string]$RightHandCorpusPaths[$path])
+        $rightHandByPath[$path] = @{
+            Path = [string]$reference.corpusPath
+            Sha256 = [string]$reference.sha256
+            ByteLength = [long]$reference.byteLength
+            Bytes = [byte[]]$Files[[string]$reference.corpusPath]
+        }
+        $spansByPath[$path] = @($spans | ForEach-Object {
+                @{ Start = [int]$_.start; End = ([int]$_.start + [int]$_.count - 1) }
+            })
+        [void]$changedFiles.Add([ordered]@{
+                changeKinds = [string[]]@($kinds)
+                path = $path
+                rightHand = $reference
+                spans = [object[]]@($spans | ForEach-Object { [ordered]@{ count = [int]$_.count; start = [int]$_.start } })
+            })
+    }
+
+    # The nonce is DECLARED, never generated at seal time: a seal that minted its
+    # own would produce different bytes on every run over an identical corpus, and
+    # the recipe could not state the artifact digest at all. Derived from this
+    # entry's own identity so it is stable for this subject and unique between
+    # subjects.
+    $nonceSeed = "$($Request.Organization)/$($Request.Project)/$($Request.RepositoryId)/$($Request.PullRequestId)/$IterationId/$($Identity.SourceCommit)"
+    $blockNonce = 'N' + (Get-ReviewerSourceSha256 -Text $nonceSeed).ToUpperInvariant().Substring(0, 31)
+    $replayBinding = [ordered]@{
+        organization = [string]$Request.Organization
+        project = [string]$Request.Project
+        repositoryId = [string]$Request.RepositoryId
+        pullRequestId = [int]$Request.PullRequestId
+        iterationId = [int]$IterationId
+        commonCommit = [string]$Identity.CommonCommit
+        sourceCommit = [string]$Identity.SourceCommit
+        targetCommit = [string]$Identity.TargetCommit
+        changeSetSha256 = (Get-ReviewerSourceChangeIdentityDigest -Response $ChangeSetResponse)
+    }
+    $policy = Get-ReviewerCorpusSealTransportPolicy -Bytes ([byte[]]$Files[$PolicyCorpusPath])
+    $derived = New-ReviewerCorpusSealDerivedTransportArtifact -Policy $policy `
+        -PolicySha256 ([string]$policyReference.sha256) -Mode 'mcpFlat' -Binding $replayBinding `
+        -SpansByPath $spansByPath -ChangeKindsByPath $kindsByPath -RightHandByPath $rightHandByPath `
+        -AuthoritativePaths ([string[]]@($authoritative.ToArray())) -BlockNonce $blockNonce
+
+    return [ordered]@{
+        schemaVersion = 1
+        kind = 'reviewer-offline-corpus-seal-recipe'
+        snapshotId = "pr$($Request.PullRequestId)-i$IterationId-offlinecorpusseal"
+        provider = 'azuredevops'
+        capturedUtc = $CapturedUtc
+        nonPromotable = $true
+        sealKind = 'offlineCorpusSeal'
+        corpus = [ordered]@{
+            indexSha256 = [string]$Corpus.IndexSha256
+            payloadCount = [int]$Corpus.PayloadCount
+        }
+        binding = [ordered]@{
+            organization = [string]$Request.Organization
+            project = [string]$Request.Project
+            repositoryId = [string]$Request.RepositoryId
+            repositoryName = [string]$Request.RepositoryName
+            pullRequestId = [int]$Request.PullRequestId
+            iterationId = [int]$IterationId
+            sourceCommit = [string]$Identity.SourceCommit
+            commonCommit = [string]$Identity.CommonCommit
+            targetCommit = [string]$Identity.TargetCommit
+            changeSetSha256 = [string]$replayBinding.changeSetSha256
+        }
+        capture = [ordered]@{
+            identity = (New-ReviewerCohortEntryCorpusReference -Files $Files -CorpusPath $StartIdentityCorpusPath)
+            endIdentity = (New-ReviewerCohortEntryCorpusReference -Files $Files -CorpusPath $EndIdentityCorpusPath)
+            statusAtCapture = [string]$Identity.Status
+            isDraft = [bool]$Identity.IsDraft
+            mode = 'offlineCorpusCapture'
+            livePostReadRaceCheck = 'notPerformed'
+        }
+        bindings = [ordered]@{
+            configSha256 = $ConfigSha256
+            scriptSha256 = $ScriptSha256
+            promptSha256 = $PromptSha256
+            models = [string[]]@($Models)
+        }
+        hashes = [ordered]@{
+            policySha256 = [string]$policyReference.sha256
+            configSha256 = $ConfigSha256
+            scriptSha256 = $ScriptSha256
+            schemaSha256 = $SchemaSha256
+            promptSha256 = $PromptSha256
+        }
+        changeSet = [ordered]@{
+            authoritative = (New-ReviewerCohortEntryCorpusReference -Files $Files -CorpusPath $ChangeSetCorpusPath)
+            spanEvidence = (New-ReviewerCohortEntryCorpusReference -Files $Files -CorpusPath $SpanEvidenceCorpusPath)
+            digestOrder = [string[]]@($authoritative.ToArray())
+        }
+        changedFiles = [object[]]$changedFiles.ToArray()
+        sourceCensus = [ordered]@{
+            authoritativeChangedPathCount = $authoritative.Count
+            rightHandCoveredPathCount = $changedFiles.Count
+            noRightHandPaths = [string[]]@($noRightHand.ToArray())
+        }
+        evidence = [ordered]@{
+            siblings = [object[]]@($SiblingCorpusPaths | ForEach-Object {
+                    New-ReviewerCohortEntryCorpusReference -Files $Files -CorpusPath ([string]$_)
+                })
+            rules = [object[]]@($RuleCorpusPaths | ForEach-Object {
+                    New-ReviewerCohortEntryCorpusReference -Files $Files -CorpusPath ([string]$_)
+                })
+            threads = [object[]]@($ThreadCorpusPaths | ForEach-Object {
+                    New-ReviewerCohortEntryCorpusReference -Files $Files -CorpusPath ([string]$_)
+                })
+            facts = [object[]]@()
+        }
+        sourceTransport = [ordered]@{
+            kind = 'derivedFromCorpus'
+            mode = 'mcpFlat'
+            artifactFile = 'source-transport.json'
+            policy = $policyReference
+            blockNonce = $blockNonce
+            capturedArtifact = $null
+            expected = [ordered]@{
+                artifactSha256 = [string]$derived.Sha256
+                artifactByteLength = [long]$derived.ByteLength
+                blockSha256 = [string]$derived.BlockSha256
+                coverageRecordSha256 = [string]$derived.CoverageRecordSha256
+                gateOk = [bool]$derived.GateOk
+                gateReasonCodes = [string[]]@($derived.GateReasonCodes)
+            }
+        }
+        resources = [object[]]@($Resources)
+    }
+}
+
+function Assert-ReviewerCohortEntrySealable {
+    <#
+    .SYNOPSIS
+        Requires the emitted recipe and the staged corpus to be acceptable to the
+        SHIPPING sealer, before either is published.
+
+    .DESCRIPTION
+        Run through the sealer's own importer and planner rather than through a
+        restatement of their rules. The entire class of defect this fix exists to
+        remove is a builder that emitted something only it could read; a check
+        written here in this file's own terms would be exactly that defect again,
+        one level up.
+
+        Nothing is written. The planner derives, hashes and compares, and the
+        seal itself is left to the typed coordinator's own corpus-seal child.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$CorpusRoot,
+        [Parameter(Mandatory)][string]$CorpusIndexSha256,
+        [Parameter(Mandatory)][string]$RecipePath,
+        [Parameter(Mandatory)][string]$ToolkitRoot
+    )
+    try {
+        $index = Import-ReviewerCorpusIndex -CorpusRoot $CorpusRoot -ExpectedIndexSha256 $CorpusIndexSha256
+        $recipeObject = Import-ReviewerCorpusSealRecipe -Path $RecipePath
+        [void](New-ReviewerCorpusSealPlan -Index $index -Recipe $recipeObject -ToolkitRoot $ToolkitRoot)
+    }
+    catch {
+        New-ReviewerCohortEntryRefusal -Code 'CE805' `
+            -Detail "The corpus seal recipe this build emitted is not sealable: $($_.Exception.Message)"
+    }
+    return $true
 }
 
 function Test-ReviewerCohortEntryEnvelopeRoundTrip {

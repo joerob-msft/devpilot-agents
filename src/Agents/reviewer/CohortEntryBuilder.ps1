@@ -497,9 +497,10 @@ function New-ReviewerCohortEntryEvidence {
 
     $corpusFiles = [ordered]@{}
     $resources = [System.Collections.Generic.List[object]]::new()
+    $corpusPathByReadId = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
     $fileOrdinal = 0
     foreach ($record in $captured) {
-        [void](Test-ReviewerCohortEntryEnvelopeRoundTrip -Captured $record)
+        $envelopeBytes = Test-ReviewerCohortEntryEnvelopeRoundTrip -Captured $record
         # A declared re-read asks a question the corpus already answers. Storing
         # it again would put two resources under one request key into a corpus
         # whose replay loader resolves by request key, and the second one would
@@ -508,29 +509,55 @@ function New-ReviewerCohortEntryEvidence {
         $fileOrdinal++
         $relative = Get-ReviewerCohortEntryCorpusRelativePath -Read $record.Read -Ordinal $fileOrdinal
         $corpusFiles[$relative] = [byte[]]$record.Bytes
-        [void]$resources.Add((New-ReviewerCohortEntryResourceDeclaration -Captured $record -CorpusRelativePath $relative))
+        $corpusPathByReadId[[string]$record.Read.Id] = $relative
+        [void]$resources.Add((New-ReviewerCohortEntryResourceDeclaration -Captured $record `
+                    -CorpusRelativePath $relative -EnvelopeBytes $envelopeBytes))
     }
+
+    # ---- the payloads the shipping sealer reads --------------------------
+    # A corpus that carries only the provider's own responses is a corpus no
+    # supported sealer can seal: the seal binds a FLAT identity, a right-hand
+    # hunk census and the transport policy, and none of those is a shape any
+    # provider response has. They are written from this build's own typed
+    # declarations, and they are written HERE - before the index is minted -
+    # because a payload added after the index is a payload outside the integrity
+    # claim the whole seal rests on.
+    $startIdentityCorpusPath = 'capture/start-identity.json'
+    $endIdentityCorpusPath = 'capture/end-identity.json'
+    $hunkCensusCorpusPath = 'census/right-hand-hunks.json'
+    $policyCorpusPath = 'policy/source-transport-policy.json'
+    $corpusFiles[$startIdentityCorpusPath] = $script:ReviewerCohortEntryUtf8.GetBytes(
+        (ConvertTo-AgentReplayCanonicalJson -Value (New-ReviewerCohortEntryCaptureIdentityPayload `
+                    -Request $request -Identity $identity -IterationId $iteration.IterationId)))
+    $corpusFiles[$endIdentityCorpusPath] = $script:ReviewerCohortEntryUtf8.GetBytes(
+        (ConvertTo-AgentReplayCanonicalJson -Value (New-ReviewerCohortEntryCaptureIdentityPayload `
+                    -Request $request -Identity $liveIdentity -IterationId $iteration.IterationId -End)))
+    $corpusFiles[$hunkCensusCorpusPath] = $script:ReviewerCohortEntryUtf8.GetBytes(
+        (ConvertTo-AgentReplayCanonicalJson -Value (New-ReviewerCohortEntryHunkCensusPayload -SpanEvidence $spanEvidence)))
+    # The policy comes out of the pinned toolkit, as bytes, into the corpus. The
+    # seal will derive under exactly these bytes, and putting them INSIDE the
+    # index means the derivation is bound by the same integrity claim as the
+    # content it runs over rather than by a checkout that has to still exist.
+    $policySourcePath = Join-Path $request.ToolkitRoot 'src/Agents/reviewer/source/v1/policy.json'
+    if (-not (Test-Path -LiteralPath $policySourcePath -PathType Leaf)) {
+        New-ReviewerCohortEntryRefusal -Code 'CE803' `
+            -Detail "The source-transport policy '$policySourcePath' does not exist in the pinned toolkit."
+    }
+    $corpusFiles[$policyCorpusPath] = [IO.File]::ReadAllBytes($policySourcePath)
+
+    $rightHandCorpusPaths = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
+    foreach ($record in $census) {
+        if (-not [bool]$record.HasRightHand) { continue }
+        $suffix = ([int]$record.Ordinal).ToString('000', [Globalization.CultureInfo]::InvariantCulture)
+        $rightHandCorpusPaths[[string]$record.Path] = [string]$corpusPathByReadId["changed-$suffix"]
+    }
+    $siblingCorpusPaths = [string[]]@(@($siblings) | ForEach-Object {
+            [string]$corpusPathByReadId["baseline-$(([int]$_.Ordinal).ToString('000', [Globalization.CultureInfo]::InvariantCulture))"]
+        })
+    $ruleCorpusPaths = [string[]]@(@($ruleReads) | ForEach-Object { [string]$corpusPathByReadId[[string]$_.ReadId] })
 
     $corpus = New-ReviewerCohortEntryCorpus -Root $corpusRoot -Files $corpusFiles -Request $request `
         -Identity $identity -IterationId $iteration.IterationId
-
-    $recipe = [ordered]@{
-        kind = 'devpilot.reviewer.corpus-seal-recipe.v1'
-        correlationId = $request.CorrelationId
-        subject = [ordered]@{
-            organization = $request.Organization
-            project = $request.Project
-            repository = $request.RepositoryName
-            repositoryId = $request.RepositoryId
-            pullRequestId = $request.PullRequestId
-            iterationId = $iteration.IterationId
-        }
-        corpusRoot = $publishedCorpusRoot
-        resources = [object[]]$resources.ToArray()
-    }
-    $recipePath = Join-Path $evidenceRoot 'corpus-seal-recipe.json'
-    [IO.File]::WriteAllBytes($recipePath,
-        $script:ReviewerCohortEntryUtf8.GetBytes((ConvertTo-AgentReplayCanonicalJson -Value $recipe)))
 
     # The census the typed coordinator reads is a SET of paths in ordinal
     # ascending order - that is its contract, and it is a different statement
@@ -638,6 +665,49 @@ function New-ReviewerCohortEntryEvidence {
     }
     $stageSchemaSha = (Get-FileHash -LiteralPath $stageSchemaPath -Algorithm SHA256).Hash.ToLowerInvariant()
     $promptAssetSha = Get-ReviewerCohortEntryPromptAssetDigest -ToolkitRoot $request.ToolkitRoot
+
+    # ---- the corpus seal recipe the shipping sealer consumes --------------
+    # The production nineteen-key recipe, not a builder dialect of one. It is
+    # written before the coordinator request so the request can bind its path and
+    # digest, and self-validated below through the SAME importer and planner the
+    # sealer runs - so "this entry is sealable" is a property this build proved,
+    # not a hope the first coordinator to reach state 6 gets to test.
+    $reviewerScriptSha = if ($null -ne $request.ExecutionPlan) {
+        [string]$request.ExecutionPlan.ReviewerScriptSha256
+    }
+    else {
+        # A preparation-only entry declares no reviewer script, so the script that
+        # produced this evidence is the one bound: something real, digested where
+        # it ran, rather than a placeholder that would bind nothing.
+        (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    # Assigned, then narrowed. An `if` that yields an empty array yields NOTHING
+    # through the pipeline, so a prep-only entry would hand a mandatory parameter
+    # $null rather than the empty binding it means.
+    $recipeModels = [string[]]@()
+    if ($null -ne $request.ExecutionPlan) {
+        $recipeModels = [string[]]@(@([string[]]@($request.ExecutionPlan.GeneralistPair) +
+                [string]$request.ExecutionPlan.ConventionSpecialistModel +
+                [string]$request.ExecutionPlan.ConventionVerifierModel) | Sort-Object -CaseSensitive -Unique)
+    }
+    $recipe = New-ReviewerCohortEntryOfflineSealRecipe -Request $request -Identity $identity `
+        -IterationId $iteration.IterationId -Files $corpusFiles -Corpus $corpus `
+        -Resources ([object[]]$resources.ToArray()) -SpanEvidence $spanEvidence `
+        -RightHandCorpusPaths $rightHandCorpusPaths -ChangeSetResponse $byId['changes-plain'].Parsed `
+        -ChangeSetCorpusPath ([string]$corpusPathByReadId['changes-plain']) `
+        -SpanEvidenceCorpusPath $hunkCensusCorpusPath `
+        -StartIdentityCorpusPath $startIdentityCorpusPath -EndIdentityCorpusPath $endIdentityCorpusPath `
+        -PolicyCorpusPath $policyCorpusPath -SiblingCorpusPaths $siblingCorpusPaths `
+        -RuleCorpusPaths $ruleCorpusPaths `
+        -ThreadCorpusPaths ([string[]]@([string]$corpusPathByReadId['threads'])) `
+        -ConfigSha256 $configBinding.Sha256 -ScriptSha256 $reviewerScriptSha -PromptSha256 $promptAssetSha `
+        -SchemaSha256 $stageSchemaSha -Models $recipeModels `
+        -CapturedUtc ([DateTime]::UtcNow.ToString('yyyyMMdd\THHmmss\Z', [Globalization.CultureInfo]::InvariantCulture))
+    $recipePath = Join-Path $evidenceRoot 'corpus-seal-recipe.json'
+    [IO.File]::WriteAllBytes($recipePath,
+        $script:ReviewerCohortEntryUtf8.GetBytes((ConvertTo-AgentReplayCanonicalJson -Value $recipe)))
+    [void](Assert-ReviewerCohortEntrySealable -CorpusRoot $corpusRoot -CorpusIndexSha256 $corpus.IndexSha256 `
+            -RecipePath $recipePath -ToolkitRoot $request.ToolkitRoot)
 
     # The preparation root is a SIBLING of the package, never inside it. The
     # package is sealed and read-only the moment it is published; the coordinator

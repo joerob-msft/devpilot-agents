@@ -145,6 +145,11 @@ $script:ReviewerCohortEntryErrorCatalog = [ordered]@{
     CE712 = 'The execution plan does not bound a non-zero finite model start and verifier estimate.'
     CE713 = 'The execution plan reconciliation and delivery outputs are the same directory.'
     CE714 = 'The model start bound could not be derived, or the derived bound does not bind this request.'
+    CE800 = 'A live identity read carries no value for a field the corpus seal binds by name.'
+    CE802 = 'A changed path carries right-hand content but no right-hand span.'
+    CE803 = 'The pinned toolkit ships no source-transport policy to derive the seal under.'
+    CE805 = 'The emitted corpus seal recipe is not acceptable to the shipping sealer.'
+    CE806 = 'The corpus seal recipe cites a payload or a change-set path this build did not stage.'
 }
 
 function Get-ReviewerCohortEntryErrorCatalog {
