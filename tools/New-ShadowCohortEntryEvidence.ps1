@@ -104,6 +104,7 @@ function Get-CohortEntryExitCode {
         '^CE5' { return 6 }
         '^CE6' { return 7 }
         '^CE7' { return 8 }
+        '^CE8' { return 9 }
     }
     return 1
 }

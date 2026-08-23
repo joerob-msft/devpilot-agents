@@ -319,19 +319,21 @@ that it reached a named preparation state:
 | --- | --- |
 | `requestValidated` | The typed reader accepts every field, digest and path in the request. |
 | `corpusValidated` | The typed C# corpus stager published and verified the corpus index. |
-| `recipePlanned` (default) | …and the stage-artifact recipe planned in full. |
-| `runSetReady` | The whole preparation, **including** the offline corpus seal. |
+| `recipePlanned` | …and the stage-artifact recipe planned in full. |
+| `snapshotValidateOnly` | …and the shipping sealer accepted the emitted corpus seal recipe. |
+| `snapshotVerified` (default) | …and the offline corpus seal was sealed and re-verified. |
+| `runSetReady` | The whole preparation, including the declared and verified run set. |
 
-The default is `recipePlanned` because that is the furthest state a cohort-entry package
-reaches **from its own inputs**. The next state, `snapshotValidateOnly`, additionally
-requires an *offline corpus seal recipe* — a nineteen-key artifact owned by the reviewer's
-acquisition path, not by this builder. An operator who has one passes
-`-PreflightTarget runSetReady`. Defaulting to `runSetReady` would make this tool claim a
-proof it cannot produce, so it does not.
+The default is `snapshotVerified` because that is the furthest state a cohort-entry package
+reaches **from its own inputs**. It used to be `recipePlanned`, because the seal states
+needed an offline corpus seal recipe this builder did not emit; it emits the production one
+now, so `snapshotValidateOnly`, `snapshotSealed` and `snapshotVerified` are all reached from
+the package alone.
 
-`runSetReady` additionally requires a **launch authorization token on disk**, held by the
-operator. The builder mints none — that is the property that makes it a no-model tool — so
-`runSetReady` stays reachable only for an operator who already holds one. The tests assert
+The next state, `runSetDeclared`, requires a **launch authorization token on disk**, held by
+the operator. The builder mints none — that is the property that makes it a no-model tool —
+so `runSetReady` stays reachable only for an operator who already holds one. Defaulting to
+it would make this tool claim a proof it cannot produce from its own inputs. The tests assert
 that after a complete v2 build the token path the plan names still does not exist.
 
 **Zero slots, models and tokens are consumed at any target.** The coordinator writes a
@@ -363,6 +365,7 @@ process exit code, because an exit code is one byte and the catalogue is not.
 | `CE5xx` | 6 | The package: a staging or publish failure, a package that is not read-only including its own inventory and seal (`CE502`), an inventoried file whose bytes changed, an unlisted file, or a declared file that is absent (`CE503`), a reparse point (`CE505`), an inventory path that is not a plain relative path inside the package (`CE506`), a seal that does not authenticate. |
 | `CE6xx` | 7 | The preflight: the coordinator did not reach its target (`CE600`), or it consumed a slot, a model or a launch token (`CE601`). |
 | `CE7xx` | 8 | The execution plan: declared at a version that does not carry it (`CE700`), the wrong slot count or the wrong names in the wrong order (`CE701`), colliding slot state directories or terminal artifacts (`CE702`), a reviewer script that is absent or drifted from its declared digest (`CE703`), a model outside the shared registry (`CE704`), a generalist pair that is not the derived pair or a specialist that is one of the generalists (`CE705`), models the reviewer configuration does not configure (`CE706`), any delivery capability enabled or a non-zero provider write budget (`CE707`), reconciliation disabled or requiring a run count that is not the slot count (`CE708`), a slot count that is not the planned run count (`CE709`), a per-call timeout that outlives its slot (`CE710`), an output path outside the preparation root or a launch authorization inside the sealed package (`CE711`), a model-start bound that is not a positive finite estimate (`CE712`), a bound that could not be derived or that does not bind this request (`CE714`). |
+| `CE8xx` | 9 | The corpus seal recipe: a live identity read carrying no value for a field the seal binds by name (`CE800`), a changed path with right-hand content but no right-hand span (`CE802`), a pinned toolkit shipping no source-transport policy (`CE803`), an emitted recipe the shipping sealer's own importer and planner will not accept (`CE805`), a recipe citing a payload or a change-set path this build did not stage (`CE806`). |
 
 ## Tests
 
@@ -437,12 +440,16 @@ which builds one from an empty offline feed.
 
 ## Known residuals
 
-- **`runSetReady` needs a seal recipe this builder does not emit.** The offline corpus seal
-  recipe is a separate producer (`src/Agents/reviewer/CorpusSeal.ps1`), whose
-  `sourceTransport` expectations are *converged* by probing the planner rather than
-  computed. Until a cohort entry emits one, the honest default target is `recipePlanned`.
-  `runSetReady` also requires an operator-held launch authorization token, which this builder
-  deliberately never mints.
+- **`runSetReady` needs an operator-held launch authorization token.** Everything up to and
+  including the offline corpus seal is reached from the package alone, which is why the
+  default target is now `snapshotVerified`. `runSetDeclared` requires a launch authorization
+  token on disk, which this builder deliberately never mints; an operator who holds one can
+  drive the whole preparation with `-PreflightTarget runSetReady`.
+- **A right-hand path with no derived span cannot be sealed.** The seal shows the reviewer
+  exactly the lines a span names, so a changed path that carries right-hand content but whose
+  extractor derives no span refuses at `CE802` rather than sealing a file with nothing to
+  point at. A subject in that shape is not buildable as a runnable entry, and that is the
+  intended answer rather than a silent whole-file span.
 - **The execution plan declares supervision timeouts it does not itself impose.** Only
   `supervisionGraceSeconds` travels in the coordinator request; per-call, slot and activity
   timeouts are read by the coordinator from the sealed qualification plan child result. The
