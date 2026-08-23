@@ -107,6 +107,14 @@
       {
         "sha256": "f3bf51bbef917da38c52c84ea490277ddf0e69f1f6903cbe10aec05a61313b02",
         "reason": "In offline replay, say that this pass holds no repository read tool and that the wrapper already verified the binding against the sealed snapshot. Without it a correct pass fails closed for the wrong reason: the prompt tells it to re-read the pull request and stop without a marker if it cannot, and in replay it cannot."
+      },
+      {
+        "sha256": "155df6c4da3408de56c061b0e3bd1106e14c51eac71592d8697bb4fcadb55661",
+        "reason": "History only, superseded below. Give the generalist an ordered wrapper-built result scaffold with every trusted binding and nonce already present, empty findings, and deliberately empty model-owned vote and summary placeholders, so it never has to transcribe wrapper-known values."
+      },
+      {
+        "sha256": "f09eb97aefdd2ef05aaa303a1e57167e176280d06d3ccfa3be1a90cefecba37e",
+        "reason": "CURRENT and authoritative. Accept the bound project explicitly instead of through dynamic scope, and fail closed before launch if the ordered scaffold keys ever drift from the production marker schema."
       }
     ],
     "Invoke-ReviewerModelPass": [
@@ -148,7 +156,11 @@
       },
       {
         "sha256": "04db3321210d1a35b27a18ec525be69539ea2e64aa7a1c53f878c094cd177841",
-        "reason": "CURRENT and authoritative. Name the counted role at the generalist launch call, passing -CensusRole 'generalist' so the subprocess boundary can publish a launch intent before a process can exist. The intent closes the window between Process.Start succeeding inside the harness and the accounting record being written after it returns, during which a throw would lose a real model start. Only the argument list of the existing call changes; the launch, its arguments, the tool grant, the gating and the disabled discovery/delivery paths are untouched."
+        "reason": "History only, superseded below. Name the counted role at the generalist launch call, passing -CensusRole 'generalist' so the subprocess boundary can publish a launch intent before a process can exist. The intent closes the window between Process.Start succeeding inside the harness and the accounting record being written after it returns, during which a throw would lose a real model start. Only the argument list of the existing call changes; the launch, its arguments, the tool grant, the gating and the disabled discovery/delivery paths are untouched."
+      },
+      {
+        "sha256": "2d61a146e738376f65a954fb5eced57a8e47948882217ed149e3113dd56ddf40",
+        "reason": "CURRENT and authoritative. Pass the expected project explicitly into the runtime-context builder so the scaffold's trusted project binding cannot depend on PowerShell dynamic scope; model launch behavior is otherwise unchanged."
       }
     ],
     "Invoke-ReviewerPullRequest": [
@@ -233,6 +245,14 @@
     {
       "sha256": "965539c145efca0accecfe7ec962ce4c9884356b481dd9f7c62fdf3a18fe7fcd",
       "reason": "Name the new reason for a path the repository host ALONE called non-text, and tell the model to treat it with particular care: the pull request's own path for it looks like ordinary source, so that omission rests entirely on the party this layer exists to distrust."
+    },
+    {
+      "sha256": "02630ea03577d5cf64f2a40f846d38380df34378eb3550553cbc87caaa0cb320",
+      "reason": "History only, superseded below. Tell the generalist to fill only findings, recommendedVote and summary in the wrapper-built marker scaffold, preserve every wrapper-owned scalar and key position, and emit that scaffold instead of hand-transcribing a nonce-bearing result template."
+    },
+    {
+      "sha256": "2078d187724bbf545e4c34c7284cac955b01d911e9c31a1416b75f3c5cc8f4bf",
+      "reason": "CURRENT and authoritative. Preserve the scaffold-only top-level contract while restoring the exact ordered finding-item keys that an empty findings array cannot demonstrate, and explicitly emit the inner scaffold rather than its runtime-data envelope."
     }
   ]
 }

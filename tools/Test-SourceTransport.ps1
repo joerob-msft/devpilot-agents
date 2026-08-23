@@ -2506,7 +2506,7 @@ Assert-Source ($passText -notmatch 'throw "Reviewer model input is') `
     "an oversized model input is no longer thrown out of the pass"
 Assert-Source ($passText -match 'above the code-defined \$script:ReviewerMaxModelInputBytes-byte bound[\s\S]{0,1400}?return @\{ Model') `
     "an oversized model input returns a bounded pass failure instead"
-Assert-Source ($passText -match 'limitBytes = \$script:ReviewerMaxModelInputBytes[\s\S]{0,900}?EnvironmentFault = \$false') `
+Assert-Source ($passText -match 'limitBytes = \$script:ReviewerMaxModelInputBytes[\s\S]{0,1400}?EnvironmentFault = \$false') `
     "an oversized model input is attributed to the pull request, so it retires visibly instead of retrying forever"
 Assert-Source ($cycleText -match 'try \{[\s\S]{0,400}?Invoke-ReviewerPullRequest -Session[\s\S]{0,600}?catch') `
     "the per-pull-request review is isolated so one failure cannot end the cycle"
