@@ -2612,8 +2612,54 @@ if ($IncludePreflight) {
                 $walkAccepted = & $runWalk 'accepted' $entryNode
                 Assert-CohortEntry -Name "${Label}: the derived bound survives RequireSealedModelStartBounds" `
                     -Condition ($walkAccepted -notmatch 'model start bound|bounds admit')
-                Assert-CohortEntry -Name "${Label}: the cohort walked past the bound check and reached its entry" `
-                    -Condition ($walkAccepted -match 'shadow-cohort-runner')
+                if ($WithExecutionPlan) {
+                    # A slots-carrying entry built -PreparationOnly names a launch
+                    # authorization no declaration has published yet. That entry is
+                    # not runnable, and the cohort has to say so BEFORE it starts
+                    # anything - which is the whole correction here. The walk that
+                    # reaches its entry is asserted below only for the
+                    # preparation-only shape, because this one must not.
+                    Assert-CohortEntry -Name "${Label}: a cohort refuses an entry whose launch authorization was never published" `
+                        -Condition ($walkAccepted -match 'declares slots authorized by')
+                    Assert-CohortEntry -Name "${Label}: that refusal happens before any entry starts" `
+                        -Condition ($walkAccepted -notmatch 'shadow-cohort-runner-entry-start')
+                }
+                else {
+                    Assert-CohortEntry -Name "${Label}: the cohort walked past the bound check and reached its entry" `
+                        -Condition ($walkAccepted -match 'shadow-cohort-runner')
+                }
+
+                if ($WithExecutionPlan) {
+                    # The positive half, and the sabotages that share its shape. A
+                    # token is written at the one derived path - which is what a
+                    # real declaration would have published there - and the cohort
+                    # walks past the check it was refused by a moment ago.
+                    $walkRunSet = Join-Path ($result.Root.TrimEnd('\', '/') + '.preparation') 'qualification/runset'
+                    [void](New-Item -ItemType Directory -Force -Path $walkRunSet)
+                    $walkToken = Join-Path $walkRunSet 'launch-authorization.token'
+                    $writeWalkToken = { param([string]$Text) [IO.File]::WriteAllBytes($walkToken, $script:Utf8.GetBytes($Text)) }
+                    & $writeWalkToken ('a' * 64)
+                    Assert-CohortEntry -Name "${Label}: a published launch authorization lets the cohort reach its entry" `
+                        -Condition ((& $runWalk 'authorized' $entryNode) -notmatch 'declares slots authorized by')
+                    & $writeWalkToken ('a' * 63)
+                    Assert-CohortEntry -Name "${Label}: a launch authorization of the wrong length is refused" `
+                        -Condition ((& $runWalk 'shorttoken' $entryNode) -match 'not the 64 lowercase hex characters')
+                    & $writeWalkToken (('A' * 64))
+                    Assert-CohortEntry -Name "${Label}: a launch authorization that is not lowercase hex is refused" `
+                        -Condition ((& $runWalk 'uppertoken' $entryNode) -match 'not the 64 lowercase hex characters')
+                    # Substituted after everything else about the entry was
+                    # published and sealed. The cohort still sees a well-formed
+                    # token here; what refuses it is the reviewed prelaunch, which
+                    # reproduces the run set plan only from the token that was
+                    # minted into it. This asserts the cohort does not pretend to
+                    # settle that question itself.
+                    & $writeWalkToken ('b' * 64)
+                    Assert-CohortEntry -Name "${Label}: a substituted well-formed token is left for the prelaunch to refuse" `
+                        -Condition ((& $runWalk 'substituted' $entryNode) -notmatch 'declares slots authorized by')
+                    Remove-Item -LiteralPath $walkToken -Force
+                    Assert-CohortEntry -Name "${Label}: a launch authorization removed after publication is refused" `
+                        -Condition ((& $runWalk 'removedtoken' $entryNode) -match 'declares slots authorized by')
+                }
 
                 # The exact defect this fix exists for: an entry whose estimate
                 # is its slot count while its bound admits every attempt those
