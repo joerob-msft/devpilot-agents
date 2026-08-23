@@ -287,8 +287,9 @@ function New-ReviewerCohortEntryEvidence {
     param(
         [Parameter(Mandatory)][string]$RequestPath,
         [switch]$Preflight,
-        [ValidateSet('requestValidated', 'corpusValidated', 'recipePlanned', 'runSetReady')]
-        [string]$PreflightTarget = 'recipePlanned',
+        [ValidateSet('requestValidated', 'corpusValidated', 'recipePlanned', 'snapshotValidateOnly',
+            'snapshotVerified', 'runSetReady')]
+        [string]$PreflightTarget = 'snapshotVerified',
         # A bound derived elsewhere, for a build that runs where the producer
         # cannot. It is validated against this build's request and head exactly as
         # a freshly derived one is, so supplying it can only ever supply the same
@@ -850,22 +851,26 @@ function Invoke-ReviewerCohortEntryPreflight {
         all, and it is obtained by running the real coordinator rather than by
         re-implementing its reader.
 
-        The default target is 'recipePlanned', which is the furthest state a
+        The default target is 'snapshotVerified', which is the furthest state a
         cohort-entry evidence package can reach ON ITS OWN: it covers
         requestValidated, corpusStaging, corpusPublished and corpusValidated
-        through the typed C# corpus stager, plus the stage-artifact recipe. The
-        states beyond it seal an OFFLINE CORPUS SEAL snapshot, which is a
-        different producer's artifact - the reviewer's acquisition path owns the
-        seal recipe - so an operator who has one passes -Target runSetReady and
-        gets the whole preparation checked. Defaulting to runSetReady would make
-        this function claim a proof it cannot produce from its own inputs.
+        through the typed C# corpus stager, the stage-artifact recipe, and then
+        the OFFLINE CORPUS SEAL itself - validated, sealed and verified - because
+        this builder now emits the production seal recipe the sealer reads. The
+        one state beyond it, runSetDeclared, requires an operator-held LAUNCH
+        AUTHORIZATION token; this builder mints none, which is the property that
+        makes it a no-model tool. An operator who holds one passes -Target
+        runSetReady and gets the whole preparation checked. Defaulting to
+        runSetReady would make this function claim a proof it cannot produce from
+        its own inputs.
     #>
     param(
         [Parameter(Mandatory)]$Request,
         [Parameter(Mandatory)][string]$CoordinatorRequestPath,
         [Parameter(Mandatory)][string]$PreparationOutputRoot,
-        [ValidateSet('requestValidated', 'corpusValidated', 'recipePlanned', 'runSetReady')]
-        [string]$Target = 'recipePlanned'
+        [ValidateSet('requestValidated', 'corpusValidated', 'recipePlanned', 'snapshotValidateOnly',
+            'snapshotVerified', 'runSetReady')]
+        [string]$Target = 'snapshotVerified'
     )
     $projectPath = Join-Path $Request.ToolkitRoot 'tools/ShadowRunCoordinator/ShadowRunCoordinator.csproj'
     if (-not (Test-Path -LiteralPath $projectPath -PathType Leaf)) {

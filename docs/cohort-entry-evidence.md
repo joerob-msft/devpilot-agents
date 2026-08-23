@@ -212,6 +212,7 @@ moved into place atomically, marked read-only, and re-verified **externally** af
   entry/
     entry.json                 the cohort manifest entry, as the C# reader requires it
     coordinator-request.json   the typed coordinator request
+    corpus-seal-recipe.json    the production offline corpus seal recipe
     identity-witness.json      candidate and live identity, and the re-read count
     config-validation.json     the validated reviewer config, targetRef exact
     census.json                the ordinal changed-path census and its spans
@@ -220,6 +221,9 @@ moved into place atomically, marked read-only, and re-verified **externally** af
     model-start-bound.json     the derived bound, verbatim from the shipping producer
   corpus/
     corpus-index.json          the payload index the typed stager verifies
+    capture/…                  the flat start and end identity of the capture
+    census/…                   the right-hand hunk census the seal derives spans from
+    policy/…                   the pinned toolkit's source-transport policy
     files/… evidence/…         the payloads, at corpus-relative paths
   inventory.json               every published file, its digest and its length
   seal.json                    HMAC-SHA256 over the inventory, under the request's key
@@ -279,7 +283,34 @@ deterministic baseline rather than refused. The caps that do fail closed — `CE
 files, `CE406` on threads, `CE305` on bytes — bound counts the *provider* supplied, which is a
 different statement about a different kind of surprise.
 
-## The no-model preflight
+## The corpus seal recipe
+
+The package carries `entry/corpus-seal-recipe.json`: the **production**
+`reviewer-offline-corpus-seal-recipe`, the nineteen-key artifact
+`Import-ReviewerCorpusSealRecipe` and `tools/Save-CorpusReplaySeal.ps1` read. It is not a
+description of one — it is the thing itself, and the builder proves that by running the
+sealer's own importer and planner over the staged corpus and the emitted recipe **before
+publishing**, refusing at `CE805` if they do not accept it. An entry that would die at the
+coordinator's `snapshotValidateOnly` state therefore never publishes at all.
+
+Three payload classes exist for the seal and are staged from evidence this build already
+holds, never from a second reading of a provider response:
+
+| Payload | Where it comes from |
+| --- | --- |
+| `capture/start-identity.json`, `capture/end-identity.json` | The two live identity reads the builder already performs, written **flat** and under the exact field names the seal binds by — `pullRequestId`, `repositoryId`, `sourceCommit`, `targetCommit`, `commonCommit`, `iterationId`, `status`, `isDraft`. No alias, and no read timestamp: the end identity must be byte-comparable to the start, and a field that always differs would make drift undetectable. The end identity additionally states `matchesInitialCapture`. |
+| `census/right-hand-hunks.json` | The span evidence in the sealer's canonical `newStart`/`newCount` hunk form — a restatement of the spans `Get-ReviewerSourceChangedSpans` already derived and this build already validated against the captured file, not a second mapping of `lineDiffBlocks`. |
+| `policy/source-transport-policy.json` | The pinned toolkit's own `src/Agents/reviewer/source/v1/policy.json`, in the corpus so the seal is self-contained. A toolkit that ships none refuses at `CE803`. |
+
+The recipe's `sourceTransport.expected` block is the artifact digest, block digest, coverage
+digest and gate outcome the sealer will re-derive for itself. Both sides call the same
+`New-ReviewerCorpusSealDerivedTransportArtifact`, which was **extracted from** the sealer
+rather than restated here, so there is one derivation and the two cannot disagree.
+
+Every entry carries a recipe, including a preparation-only v1 entry, which binds no models
+and names the builder's own digest as its script hash. What makes an entry runnable is the
+`executionPlan`; what makes it *sealable* is this recipe, and the two are separate claims.
+
 
 `-Preflight` runs the **real** typed coordinator over the published request and requires
 that it reached a named preparation state:

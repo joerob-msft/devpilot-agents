@@ -68,8 +68,9 @@
 param(
     [Parameter(Mandatory)][string]$RequestPath,
     [switch]$Preflight,
-    [ValidateSet('requestValidated', 'corpusValidated', 'recipePlanned', 'runSetReady')]
-    [string]$PreflightTarget = 'recipePlanned',
+    [ValidateSet('requestValidated', 'corpusValidated', 'recipePlanned', 'snapshotValidateOnly',
+        'snapshotVerified', 'runSetReady')]
+    [string]$PreflightTarget = 'snapshotVerified',
     [string]$BoundArtifactPath = '',
     [switch]$VerifyOnly
 )

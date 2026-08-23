@@ -41,8 +41,9 @@
 param(
     [switch]$IncludePreflight,
     [switch]$KeepSandbox,
-    [ValidateSet('requestValidated', 'corpusValidated', 'recipePlanned', 'runSetReady')]
-    [string]$PreflightTarget = 'recipePlanned'
+    [ValidateSet('requestValidated', 'corpusValidated', 'recipePlanned', 'snapshotValidateOnly',
+        'snapshotVerified', 'runSetReady')]
+    [string]$PreflightTarget = 'snapshotVerified'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -2385,7 +2386,9 @@ if ($IncludePreflight) {
                 })
             Assert-CohortEntry -Name "${Label}: the preflight launched no slot" -Condition ($preflightSlotIntents.Count -eq 0)
             Assert-CohortEntry -Name "${Label}: the preflight launched only read-only preparation children" `
-                -Condition (@($preflightIntents | Where-Object { [string]$_.Name -notmatch 'stagePreparation|corpusSealValidate|snapshotValidate' }).Count -eq 0)
+                -Condition (@($preflightIntents | Where-Object {
+                        [string]$_.Name -notmatch 'stagePreparation|corpusSealValidate|corpusSeal|snapshotValidate|runSetDeclare|runSetVerify'
+                    }).Count -eq 0)
             Assert-CohortEntry -Name "${Label}: the preflight started no model" -Condition ($result.ModelStarts -eq 0)
             Assert-CohortEntry -Name "${Label}: the preflight wrote nothing to a provider" -Condition ($result.ProviderWrites -eq 0)
             Assert-CohortEntry -Name "${Label}: the preflight left the sealed package intact" `
