@@ -503,8 +503,9 @@ function New-CohortEntryFixture {
         # reads. The shipped sample is that shape, so the one case that declares
         # a real set starts from it instead of from a second hand-written copy
         # that could drift from what the agent actually accepts.
-        $sample = ([IO.File]::ReadAllText((Join-Path $toolkit 'samples/reviewer-ado.config.json'))) |
-            ConvertFrom-Json -Depth 32 -AsHashtable
+        $sampleRead = @(([IO.File]::ReadAllText((Join-Path $toolkit 'samples/reviewer-ado.config.json'))) |
+                ConvertFrom-Json -Depth 32 -AsHashtable)
+        $sample = [hashtable]$sampleRead[0]
         # The sample's convention sources name the sample's own organization, and
         # the agent refuses a source outside the reviewed repository's. The
         # section cannot simply go, because naming a convention specialist
@@ -2699,7 +2700,7 @@ if ($IncludePreflight) {
                     $walkState = ([IO.File]::ReadAllText($walkStatePath)) | ConvertFrom-Json -Depth 32
                     $walkState.state = 'runSetDeclared'
                     [IO.File]::WriteAllBytes($walkStatePath,
-                        $script:Utf8.GetBytes([string]($walkState | ConvertTo-Json -Depth 32)))
+                        $script:Utf8.GetBytes([string]($walkState | ConvertTo-Json -Depth 32 -Compress)))
                 }
 
                 $walkAccepted = & $runWalk 'accepted' $entryNode
