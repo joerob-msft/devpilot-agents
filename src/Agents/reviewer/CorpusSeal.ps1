@@ -1122,7 +1122,14 @@ function New-ReviewerCorpusSealPlan {
         -Declaration (Get-ReviewerCorpusSealProperty -Object $changeSet -Name "spanEvidence" -Type object `
             -Where "Corpus seal recipe changeSet") `
         -Where "Corpus seal span evidence"
-    $spanEvidenceJson = $script:ReviewerCorpusSealUtf8.GetString($spanEvidencePayload.Bytes) | ConvertFrom-Json -Depth 32
+    # -NoEnumerate, because the census of a pull request that changed ONE file is
+    # a one-element JSON array, and an enumerated parse hands the assignment that
+    # single element instead of the array. The list check below would then read a
+    # perfectly well-formed census as "not an array" and refuse an ordinary
+    # subject. It also keeps a census that really is a JSON object refusable: the
+    # switch stops the enumeration, it does not wrap a non-array in a list.
+    $spanEvidenceJson = $script:ReviewerCorpusSealUtf8.GetString($spanEvidencePayload.Bytes) |
+        ConvertFrom-Json -Depth 32 -NoEnumerate
     $authoritativeSpansByPath = Get-ReviewerCorpusSealSpanEvidence -Evidence $spanEvidenceJson `
         -Where "Corpus seal span evidence '$($spanEvidencePayload.Path)'"
     foreach ($evidencePath in @($authoritativeSpansByPath.Keys)) {

@@ -1274,6 +1274,19 @@ try {
         $ctx.Recipe.changeSet.spanEvidence.sha256 = (Get-ReviewerCorpusSealSha256 -Bytes $bytes)
         $ctx.Recipe.changeSet.spanEvidence.byteLength = $bytes.Length
     }
+    Invoke-CohortEntrySealSabotage -Name 'a census rendered as one object rather than a list is refused' `
+        -Expected 'must be a JSON array' -Mutate {
+        param($ctx)
+        $payload = @(Get-CohortEntryCorpusPayload -CorpusRoot $ctx.CorpusRoot -CorpusPath $spanEvidencePath)
+        $bytes = [byte[]](Set-CohortEntryScratchPayload -Context $ctx -CorpusPath $spanEvidencePath -Value ([ordered]@{
+                    path = [string]$payload[0].path
+                    hunks = [object[]]@(@($payload[0].hunks) | ForEach-Object {
+                            [ordered]@{ newStart = [int]$_.newStart; newCount = [int]$_.newCount }
+                        })
+                }))
+        $ctx.Recipe.changeSet.spanEvidence.sha256 = (Get-ReviewerCorpusSealSha256 -Bytes $bytes)
+        $ctx.Recipe.changeSet.spanEvidence.byteLength = $bytes.Length
+    }
     Invoke-CohortEntrySealSabotage -Name 'a digest order that is not the order the change set names is refused' `
         -Expected 'order' -Mutate {
         param($ctx)
@@ -1400,6 +1413,57 @@ try {
         -Condition ($noPolicyCode -ceq 'CE803')
 }
 finally { Remove-CohortEntrySandbox -Path $sandbox }
+
+# -------------------------------------------------------------------------
+# ONE changed file is an ordinary pull request, and the shape where a census
+# built through the pipeline stops being a list: PowerShell unrolls a one-element
+# array, the canonical writer renders a JSON object, and the sealer refuses a
+# census that is not an array. The default fixture carries two right-hand paths,
+# so only a deliberately single-path build sees it.
+Write-Host 'a single changed file still censuses as a list' -ForegroundColor Cyan
+$sandbox = New-CohortEntrySandbox -Name 'one-file'
+try {
+    $oneFile = New-CohortEntryFixture -Sandbox $sandbox -Mutate {
+        param($state)
+        $state.ChangesBody = [ordered]@{
+            iterationId = 3
+            changes = @(
+                [ordered]@{ changeId = 1; changeType = 'Edit'; item = [ordered]@{ path = '/src/a.ps1'; isFolder = $false } }
+            )
+        }
+        $state.DiffChangesBody = [ordered]@{
+            iterationId = 3
+            changes = @(
+                [ordered]@{
+                    changeId = 1; changeType = 'Edit'; item = [ordered]@{ path = '/src/a.ps1'; isFolder = $false }
+                    diff = [ordered]@{
+                        path = '/src/a.ps1'
+                        lineDiffBlocks = @(
+                            [ordered]@{ changeType = 0; originalLineNumberStart = 1; originalLinesCount = 1; modifiedLineNumberStart = 1; modifiedLinesCount = 1 },
+                            [ordered]@{ changeType = 1; originalLineNumberStart = 0; originalLinesCount = 0; modifiedLineNumberStart = 2; modifiedLinesCount = 2 }
+                        )
+                    }
+                }
+            )
+        }
+        $state.FileTexts = [ordered]@{ '/src/a.ps1' = "function A {`n    'right hand'`n}`n" }
+    }
+    $oneResult = New-ReviewerCohortEntryEvidence -RequestPath $oneFile.RequestPath
+    $oneCorpusRoot = Join-Path ([string]$oneResult.Root) 'corpus'
+    $oneCensusText = [IO.File]::ReadAllText((Join-Path $oneCorpusRoot 'census/right-hand-hunks.json'))
+    Assert-CohortEntry -Name 'a one-path census is still a JSON array' `
+        -Condition ($oneCensusText.TrimStart().StartsWith('['))
+    $oneCensus = @($oneCensusText | ConvertFrom-Json -Depth 20)
+    Assert-CohortEntry -Name 'the one-path census names the one right-hand path' `
+        -Condition (@($oneCensus).Count -eq 1 -and [string]@($oneCensus)[0].path -ceq '/src/a.ps1')
+    $oneRecipePath = Join-Path ([string]$oneResult.Root) 'entry/corpus-seal-recipe.json'
+    $oneIndexSha = [string]$oneResult.CorpusIndexSha256
+    $oneSeal = Invoke-CohortEntrySealValidate -CorpusRoot $oneCorpusRoot -CorpusIndexSha256 $oneIndexSha `
+        -RecipePath $oneRecipePath -ReplayRoot (Join-Path $sandbox 'one-file-replay')
+    Assert-CohortEntry -Name 'the shipping sealer accepts a single-file entry' `
+        -Condition ($oneSeal.ExitCode -eq 0)
+}
+finally { if (-not $KeepSandbox) { Remove-CohortEntrySandbox -Path $sandbox } else { Write-Host "sandbox kept: $sandbox" } }
 
 # -------------------------------------------------------------------------
 Write-Host 'sabotage: one case per historical assembly incident' -ForegroundColor Cyan

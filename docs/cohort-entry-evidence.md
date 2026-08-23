@@ -324,17 +324,21 @@ that it reached a named preparation state:
 | `snapshotVerified` (default) | …and the offline corpus seal was sealed and re-verified. |
 | `runSetReady` | The whole preparation, including the declared and verified run set. |
 
-The default is `snapshotVerified` because that is the furthest state a cohort-entry package
-reaches **from its own inputs**. It used to be `recipePlanned`, because the seal states
-needed an offline corpus seal recipe this builder did not emit; it emits the production one
-now, so `snapshotValidateOnly`, `snapshotSealed` and `snapshotVerified` are all reached from
-the package alone.
+The default is `snapshotVerified` because that is the furthest state the **offline fixture**
+reaches. It used to be `recipePlanned`, because the seal states needed an offline corpus seal
+recipe this builder did not emit; it emits the production one now, so `snapshotValidateOnly`,
+`snapshotSealed` and `snapshotVerified` are all reached from the package alone.
 
-The next state, `runSetDeclared`, requires a **launch authorization token on disk**, held by
-the operator. The builder mints none — that is the property that makes it a no-model tool —
-so `runSetReady` stays reachable only for an operator who already holds one. Defaulting to
-it would make this tool claim a proof it cannot produce from its own inputs. The tests assert
-that after a complete v2 build the token path the plan names still does not exist.
+`runSetDeclared` is where the run set is declared, and the declaring tool re-reads the
+**reviewer configuration as a full harness agent config** — schema version, prompt file, the
+whole repo-specific shape. The suite's synthetic configuration carries only the fields the
+builder itself reads, so the fixture stops there; a real operator configuration does not, and
+a live build run with `-PreflightTarget runSetReady` walks the whole preparation — declared
+run set, verified run set, `runSetReady` — with **zero models and zero provider writes**. The
+launch authorization token is minted by the declaration itself, inside its publish
+transaction, so reaching `runSetReady` needs no token the operator holds in advance; what a
+token authorizes is the *launch*, and the builder never asks for one. The tests assert that
+after a complete v2 build the token path the plan names still does not exist.
 
 **Zero slots, models and tokens are consumed at any target.** The coordinator writes a
 launch intent before every child, including the short read-only PowerShell tools that stage
@@ -452,11 +456,11 @@ which builds one from an empty offline feed.
 
 ## Known residuals
 
-- **`runSetReady` needs an operator-held launch authorization token.** Everything up to and
-  including the offline corpus seal is reached from the package alone, which is why the
-  default target is now `snapshotVerified`. `runSetDeclared` requires a launch authorization
-  token on disk, which this builder deliberately never mints; an operator who holds one can
-  drive the whole preparation with `-PreflightTarget runSetReady`.
+- **The offline fixture stops at `snapshotVerified`.** The declaring child re-reads the
+  reviewer configuration as a full harness agent config, and the fixture writes only the
+  fields the builder itself consumes, so `runSetDeclared` is out of reach in CI. Against a
+  real operator configuration the whole preparation runs: a live build on this head reached
+  `runSetReady` with zero models, zero provider writes and no token held in advance.
 - **A right-hand path with no derived span cannot be sealed.** The seal shows the reviewer
   exactly the lines a span names, so a changed path that carries right-hand content but whose
   extractor derives no span refuses at `CE802` rather than sealing a file with nothing to

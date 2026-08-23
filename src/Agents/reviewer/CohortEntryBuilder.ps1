@@ -533,8 +533,12 @@ function New-ReviewerCohortEntryEvidence {
     $corpusFiles[$endIdentityCorpusPath] = $script:ReviewerCohortEntryUtf8.GetBytes(
         (ConvertTo-AgentReplayCanonicalJson -Value (New-ReviewerCohortEntryCaptureIdentityPayload `
                     -Request $request -Identity $liveIdentity -IterationId $iteration.IterationId -End)))
+    # The census is a LIST even when one path changed. PowerShell unrolls an array
+    # returned through the pipeline, so a single-file pull request would otherwise
+    # canonicalize to a JSON object and the sealer would refuse the entry.
+    $hunkCensus = [object[]]@(New-ReviewerCohortEntryHunkCensusPayload -SpanEvidence $spanEvidence)
     $corpusFiles[$hunkCensusCorpusPath] = $script:ReviewerCohortEntryUtf8.GetBytes(
-        (ConvertTo-AgentReplayCanonicalJson -Value (New-ReviewerCohortEntryHunkCensusPayload -SpanEvidence $spanEvidence)))
+        (ConvertTo-AgentReplayCanonicalJson -Value $hunkCensus))
     # The policy comes out of the pinned toolkit, as bytes, into the corpus. The
     # seal will derive under exactly these bytes, and putting them INSIDE the
     # index means the derivation is bound by the same integrity claim as the
