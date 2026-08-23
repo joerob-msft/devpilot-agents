@@ -220,8 +220,12 @@ Completeness is then **accounted** rather than probed:
 - more threads than the operator's cap → `CE406`; more changed files → `CE402`;
 - a list that reaches the page the reviewer asks for → `CE408` for threads, `CE409` for
   changes, because a full page is what a truncated list and a complete-and-exactly-full list
-  both look like. A change set that states a continuation (`continuationToken`, `nextLink`,
-  `hasMoreChanges`) is `CE409` too, even below the page;
+  both look like. A change set that states a continuation is `CE409` too, even below the
+  page — *states*, not *carries*: every change response answers `nextSkip` and `nextTop`, and
+  answers them `0` when there is no next page, so the values are read rather than the keys
+  counted. A non-empty `continuationToken` or `nextLink`, a `nextSkip`/`nextTop` above zero,
+  or a true `hasMoreChanges` refuses; a page offset that is not a number at all is `CE210`,
+  because that is a response shape the wrapper does not produce;
 - a request whose `maxThreads` is above that page → `CE113` at validation, since it declares a
   ceiling this build could never watch being crossed. It is a request-band code because the
   operator fixes it by editing the request; `CE408` means the subject itself is too large and no
@@ -556,7 +560,8 @@ which builds one from an empty offline feed.
   live tenant. It has been exercised by hand against a real tenant, which is how the six
   contract divergences above were found; a fixture now pins each of them.
 - **`changes` pagination is not consumed.** The wrapper answers `nextSkip`/`nextTop`
-  alongside `changes`. This builder reads one page under the live cycle's own `top` and
+  alongside `changes` on every response, `0` meaning there is no next page. This builder reads
+  one page under the live cycle's own `top` and
   refuses rather than paging silently: `CE402` above `coverage.maxChangedFiles`, and `CE409`
   when the response fills that page or states a continuation. So a subject larger than the
   declared cap, or one whose size cannot be established at all, is a refusal rather than a
