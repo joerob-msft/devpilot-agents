@@ -373,7 +373,7 @@ process exit code, because an exit code is one byte and the catalogue is not.
 
 ## Tests
 
-`tools/Test-ShadowCohortEntryEvidence.ps1` — 305 checks offline, 331 with `-IncludePreflight`;
+`tools/Test-ShadowCohortEntryEvidence.ps1` — 309 checks offline, 335 with `-IncludePreflight`;
 no model, no network, everything in a temporary sandbox.
 
 - **Exact wrapper fixtures.** A synthetic but contract-exact replay snapshot for every tool
@@ -441,14 +441,18 @@ no model, no network, everything in a temporary sandbox.
   happy path runs the shipping `tools/Save-CorpusReplaySeal.ps1 -ValidateOnly` over the
   builder-produced entry and requires exit 0 and no replay root written; the preflight then
   drives the real coordinator through `snapshotValidateOnly`, `snapshotSealed` and
-  `snapshotVerified` for both the v1 and the v2 shape. Seven sabotage cases take that same
+  `snapshotVerified` for both the v1 and the v2 shape. Eight sabotage cases take that same
   entry, change exactly one thing, re-mint the corpus index so integrity is not what refuses,
   and require the sealer's own refusal: a recipe carrying an extra field, a recipe binding no
   start identity, a start identity naming `lastMergeSourceCommit` instead of `sourceCommit`,
   an end identity whose source commit drifted mid-capture, a census written in
-  `lineDiffBlocks` form, a hunk moved one line off the span the changed file declares, and a
-  reversed digest order. A pinned toolkit shipping no source-transport policy refuses at
-  `CE803` at build time.
+  `lineDiffBlocks` form, a census written as one object rather than a list, a hunk moved one
+  line off the span the changed file declares, and a reversed digest order. A pinned toolkit
+  shipping no source-transport policy refuses at `CE803` at build time.
+- **One changed file is built end to end.** A pull request that changes exactly one file is
+  the shape where a census assembled through the pipeline stops being a list, so a separate
+  build carries a single right-hand path and requires that the emitted census is still a JSON
+  array and that the shipping sealer validates the entry.
 
 Run the preflight section too with `-IncludePreflight`. It prefers an already-built
 coordinator assembly so it never reaches a network; CI runs it after the coordinator suite,
