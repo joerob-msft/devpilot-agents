@@ -48,6 +48,15 @@
     with. Supplying a bound proves a build reproduces a number; it never
     asserts one.
 
+.PARAMETER PreparationOnly
+    Build a slots-carrying entry without demanding that it already stands at
+    `runSetReady` under a published launch authorization. The package is emitted
+    and sealed, and it reports `cohortReady:false` — because an entry whose run
+    set has not been declared names an authorization no declaration has minted
+    yet, and the cohort runner refuses it for exactly that reason. Use it to
+    prepare and inspect an entry where no run set key is held; a build meant to
+    be run has to reach `runSetReady` instead, and refuses `CE715` without it.
+
 .PARAMETER VerifyOnly
     Do not build. Re-verify an already published package at the request's output
     root: every inventoried file present at its recorded digest and length,
@@ -72,6 +81,7 @@ param(
         'snapshotVerified', 'runSetReady')]
     [string]$PreflightTarget = 'snapshotVerified',
     [string]$BoundArtifactPath = '',
+    [switch]$PreparationOnly,
     [switch]$VerifyOnly
 )
 
@@ -125,7 +135,8 @@ try {
     }
 
     $result = New-ReviewerCohortEntryEvidence -RequestPath $full -Preflight:$Preflight `
-        -PreflightTarget $PreflightTarget -BoundArtifactPath $BoundArtifactPath
+        -PreflightTarget $PreflightTarget -BoundArtifactPath $BoundArtifactPath `
+        -PreparationOnly:$PreparationOnly
     Write-Output (ConvertTo-Json -Depth 6 -Compress -InputObject ([ordered]@{
                 published = $true
                 root = $result.Root
@@ -147,6 +158,11 @@ try {
                 modelStartBoundKind = $result.ModelStartBoundKind
                 maxRealModelStarts = $result.MaxRealModelStarts
                 maxVerifierAssignments = $result.MaxVerifierAssignments
+                cohortReady = $result.CohortReady
+                runSetId = $result.RunSetId
+                runSetSha256 = $result.RunSetSha256
+                launchAuthorizationPath = $result.LaunchAuthorizationPath
+                launchAuthorizationSha256 = $result.LaunchAuthorizationSha256
             }))
     exit 0
 }
