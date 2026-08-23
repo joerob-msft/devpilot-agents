@@ -190,36 +190,43 @@ the first read and checked after the last. Nothing interprets a raw REST respons
 | repository | `repo_repository` | `action=get`, `project`, `repositoryNameOrId` = repository **id** |
 | branch | `repo_branch` | `action=get`, `project`, `repositoryId` = repository **id**, `branchName` = short name |
 | pull request | `repo_pull_request` | `action=get`, `project`, `repositoryId` = repository **name**, `pullRequestId` |
-| changes | `repo_pull_request` | `action=get_changes`, … `top` = `maxChangedFiles` **+ 1** |
+| changes | `repo_pull_request` | **not shaped here** — the live cycle's own request, from the one shared constructor: `action=get_changes`, `project`, `repositoryId` = repository **name**, `pullRequestId`, `top` = **1000** |
 | changes with content | `repo_pull_request` | the same, plus `includeDiffs=true`, `includeLineContent=true` — a **distinct** request key |
 | threads | `repo_pull_request_thread` | **not shaped here** — the live cycle's own request, from the one shared constructor: `action=list`, `project`, `repositoryId` = repository **name**, `pullRequestId`, `top` = **200** |
 | changed file, sibling, rule section | `repo_file` | `action=get_content`, `project`, `repositoryId` = repository **id**, `path`, `versionType=Commit`, `version` = 40-hex commit |
 
-The `+ 1` on the two **change** reads is not an off-by-one. A provider asked for exactly the cap
-answers exactly the cap when there are more, so a count equal to the cap is indistinguishable
-from a complete answer — which is how a truncated census once looked whole and admitted a
-subject larger than the operator authorized. Asking for one above the cap makes the
-difference observable: above the cap is `CE402`, at the cap is genuinely all there is.
+None of the three provider-list reads is shaped by this builder, and the reason is the same
+for all of them. A replay answers the arguments it recorded and never falls through to a live
+read, so a read the live cycle issues has to be captured **byte for byte** or the reviewer
+stops mid-cycle on a read it can prove it needs and cannot get.
 
-That trick is sound only for a cap the **builder owns**, and the thread page is not one. A
-replay answers the arguments it recorded and never falls through to a live read, so the thread
-read has to be the read the live cycle issues — byte for byte, or the reviewer stops mid-cycle
-on a read it can prove it needs and cannot get. It once did: a corpus captured at `top=201`
-(the cap+1 instinct, applied to a read the builder does not own) met a cycle asking for
-`top=200`, and the slot died before its first model start.
+It happened twice. A corpus captured at `top=201` — the cap+1 instinct, which asks one above
+the operator's ceiling so that overflow is observable, and which is right for a cap the
+*builder* owns — met a cycle asking for `top=200`, and the slot died before its first model
+start. The fix moved the thread vector to one shared constructor. The next shadow got past
+the thread read, printed its scope, computed 100% pinned-source coverage, and died on the
+change reads: `top=61` in the corpus against `top=1000` from the live convention planner.
 
-So the vector is built by one shared constructor, `New-ReviewerThreadListRequest` in
-`SourceTransport.ps1`, which both the live agent and this builder call. The page size is
-written down once, and the shipping fact policy's `threads.maxThreads` is checked against it
-when the agent loads. Thread completeness is then **accounted** rather than probed:
+So both vectors are built by shared constructors in `SourceTransport.ps1` —
+`New-ReviewerThreadListRequest` and `New-ReviewerChangeListRequest` (the latter in both
+variants, plain and `-IncludeDiffs`) — which the live agent and this builder both call. Each
+page size is written down once; the shipping fact policy's `threads.maxThreads` and the
+transport's own `ReviewerSourceChangeLimit` are checked against them when the agent loads.
+A syntax-tree guard walks every `Invoke-AgentMcpTool` in the agent and fails the suite if any
+`action=list` thread read or `action=get_changes` change read is assembled inline again.
 
-- more threads than the operator's cap → `CE406`;
-- a list that reaches the page the reviewer asks for → `CE408`, because a full page is what a
-  truncated list and a complete-and-exactly-full list both look like;
+Completeness is then **accounted** rather than probed:
+
+- more threads than the operator's cap → `CE406`; more changed files → `CE402`;
+- a list that reaches the page the reviewer asks for → `CE408` for threads, `CE409` for
+  changes, because a full page is what a truncated list and a complete-and-exactly-full list
+  both look like. A change set that states a continuation (`continuationToken`, `nextLink`,
+  `hasMoreChanges`) is `CE409` too, even below the page;
 - a request whose `maxThreads` is above that page → `CE113` at validation, since it declares a
   ceiling this build could never watch being crossed. It is a request-band code because the
   operator fixes it by editing the request; `CE408` means the subject itself is too large and no
-  edit to the request helps.
+  edit to the request helps. `maxChangedFiles` is range-bound to the change page for the same
+  reason.
 
 The two identity reads are the same question asked twice, and the second one is **declared in
 the plan before the first read is issued**, carrying `DuplicateOf` naming the first. That is
@@ -431,7 +438,7 @@ process exit code, because an exit code is one byte and the catalogue is not.
 | `CE1xx` | 2 | The request: schema, version, missing or extra field, unreadable file, BOM, path shape, toolkit head or ref drift, a `maxThreads` above the page the reviewer's own thread read asks for (`CE113`). |
 | `CE2xx` | 3 | The subject: pull request drift, draft, inactive; repository or project id **shape** mismatch; branch mismatch; the raw provider shape where the reduced contract shape is required (`CE203`); a change set that arrived as a singleton object (`CE210`); a toolkit working tree carrying tracked modifications (`CE213`). |
 | `CE3xx` | 4 | The capture: a planned read never performed (`CE300`), a read performed but never planned or performed more times than planned (`CE301`), a MIME outside the allow-list (`CE302`), a resource URI that did not match exactly (`CE304`), a payload count outside its bound (`CE305`), a byte-order mark (`CE306`), a replay that has no record of a planned read and will not reach the provider for it (`CE307`), a write or a write authorization in a replay (`CE308`), an undeclared duplicate request key or a re-read that asks a different question (`CE309`), a rule section drifted from its pin (`CE310`). |
-| `CE4xx` | 5 | The census and coverage: ordering, duplicates, path traversal, reparse points, the changed-file cap (`CE402`), the thread cap (`CE406`), a thread list that reaches the reviewer's own page and so cannot be proven complete (`CE408`), the byte cap, a right-hand path whose content was not stored or a content coverage under the declared floor (`CE403`), a span that runs past the end of the file it describes (`CE404`), an empty census (`CE407`), target ref or config mismatch. |
+| `CE4xx` | 5 | The census and coverage: ordering, duplicates, path traversal, reparse points, the changed-file cap (`CE402`), the thread cap (`CE406`), a thread list that reaches the reviewer's own page and so cannot be proven complete (`CE408`), a change set that reaches the reviewer's own page or states a continuation (`CE409`), the byte cap, a right-hand path whose content was not stored or a content coverage under the declared floor (`CE403`), a span that runs past the end of the file it describes (`CE404`), an empty census (`CE407`), target ref or config mismatch. |
 | `CE5xx` | 6 | The package: a staging or publish failure, a package that is not read-only including its own inventory and seal (`CE502`), an inventoried file whose bytes changed, an unlisted file, or a declared file that is absent (`CE503`), a reparse point (`CE505`), an inventory path that is not a plain relative path inside the package (`CE506`), a seal that does not authenticate. |
 | `CE6xx` | 7 | The preflight: the coordinator did not reach its target (`CE600`), or it consumed a slot, a model or a launch token (`CE601`). |
 | `CE7xx` | 10 | The execution plan: declared at a version that does not carry it (`CE700`), the wrong slot count or the wrong names in the wrong order (`CE701`), colliding slot state directories or terminal artifacts (`CE702`), a reviewer script that is absent or drifted from its declared digest (`CE703`), a model outside the shared registry (`CE704`), a generalist pair that is not the derived pair or a specialist that is one of the generalists (`CE705`), models the reviewer configuration does not configure (`CE706`), any delivery capability enabled or a non-zero provider write budget (`CE707`), reconciliation disabled or requiring a run count that is not the slot count (`CE708`), a slot count that is not the planned run count (`CE709`), a per-call timeout that outlives its slot (`CE710`), an output path outside the preparation root or a derived launch authorization that landed inside the sealed package (`CE711`), a model-start bound that is not a positive finite estimate (`CE712`), a bound that could not be derived or that does not bind this request (`CE714`), a slots-carrying entry with no declared run set and launch authorization to run under (`CE715`), and a request that names a launch authorization the builder derives for itself (`CE716`). |
@@ -549,7 +556,9 @@ which builds one from an empty offline feed.
   live tenant. It has been exercised by hand against a real tenant, which is how the six
   contract divergences above were found; a fixture now pins each of them.
 - **`changes` pagination is not consumed.** The wrapper answers `nextSkip`/`nextTop`
-  alongside `changes`. This builder reads one page under an explicit `top` and refuses at
-  `CE402` above `coverage.maxChangedFiles` rather than paging silently, so a subject larger
-  than the declared cap is a refusal rather than a partial census. Paging would be a
-  contract change, not a bug fix.
+  alongside `changes`. This builder reads one page under the live cycle's own `top` and
+  refuses rather than paging silently: `CE402` above `coverage.maxChangedFiles`, and `CE409`
+  when the response fills that page or states a continuation. So a subject larger than the
+  declared cap, or one whose size cannot be established at all, is a refusal rather than a
+  partial census. Paging would be a contract change, not a bug fix — and it would have to be
+  made in the live cycle first, since the corpus may only record what the cycle asks for.

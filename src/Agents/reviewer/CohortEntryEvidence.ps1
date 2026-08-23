@@ -123,6 +123,7 @@ $script:ReviewerCohortEntryErrorCatalog = [ordered]@{
     CE406 = 'The thread count exceeds the declared cap.'
     CE407 = 'The changed-path census is empty.'
     CE408 = 'The thread list reached the page the reviewer''s own read asks for, so it cannot be proven complete.'
+    CE409 = 'The change set reached the page the reviewer''s own read asks for, or states another page follows, so it cannot be proven complete.'
     CE500 = 'The private output root already holds a package.'
     CE501 = 'The atomic publish did not complete.'
     CE502 = 'The published package is not read-only.'
@@ -1008,7 +1009,7 @@ function Read-ReviewerCohortEntryRequest {
         ReplayManifestDigest = $replayManifestDigest
         AgencyPath = $agencyPath
         RequestTimeoutSeconds = $requestTimeoutSeconds
-        MaxChangedFiles = (Get-ReviewerCohortEntryInt -Object $coverage -Name 'maxChangedFiles' -Where 'request coverage' -Minimum 1 -Maximum 1000)
+        MaxChangedFiles = (Get-ReviewerCohortEntryInt -Object $coverage -Name 'maxChangedFiles' -Where 'request coverage' -Minimum 1 -Maximum (Get-ReviewerChangeListTop))
         MaxFileBytes = (Get-ReviewerCohortEntryInt -Object $coverage -Name 'maxFileBytes' -Where 'request coverage' -Minimum 1 -Maximum 5242880)
         MaxSiblingFiles = (Get-ReviewerCohortEntryInt -Object $coverage -Name 'maxSiblingFiles' -Where 'request coverage' -Minimum 0 -Maximum 256)
         MaxThreads = $declaredThreadCap
@@ -1145,46 +1146,35 @@ function Get-ReviewerCohortEntryIdentityReadPlan {
                     branchName = $branch
                 }) -Envelope 'mcpTextContent' -PayloadFile 'payloads/target-branch.json'))
 
-    # Both get_changes variants, because they are two distinct read keys and a
-    # snapshot that recorded only the plain one leaves the reviewer's diff-
-    # bearing read unanswered at the moment it is issued - which is a live
-    # fallback in a mode that has no live seam.
-    # 'top' is asked ONE ABOVE the declared cap on THESE reads, deliberately. A
-    # provider asked for exactly the cap answers exactly the cap when there are
-    # more, and a count-equals-cap answer is indistinguishable from a complete
-    # one - which is how a capped census once looked complete and admitted a
-    # subject larger than the operator authorized. Asking for cap+1 makes
-    # overflow observable: a count above the cap is a refusal, and a count at the
-    # cap is genuinely all there is. This is sound only because the change-set
-    # cap is the BUILDER's own; see the thread read below for the read that is
-    # not.
-    [void]$reads.Add((New-ReviewerCohortEntryRead -Id 'changes-plain' -Tool 'repo_pull_request' -Role 'change' `
-                -Arguments ([ordered]@{
-                    action = 'get_changes'
-                    project = $Request.Project
-                    repositoryId = $Request.RepositoryName
-                    pullRequestId = $Request.PullRequestId
-                    top = ($Request.MaxChangedFiles + 1)
-                }) -Envelope 'mcpTextContent' -PayloadFile 'payloads/changes.json'))
+    # Neither change read is shaped here, for the same reason the thread read is
+    # not: both are the live cycle's reads, and a replay answers the arguments it
+    # recorded rather than falling through to a live one. The cap+1 probe that
+    # used to stand here - ask one above the declared cap so that overflow is
+    # observable - was defensible only while the change-set page was the
+    # BUILDER's to choose. It is not: the live convention planner asks the
+    # production page, and a corpus recorded at cap+1 answered none of its reads.
+    # A slot died there, past the thread read, with the same failure shape.
+    #
+    # Both variants are recorded, because they are two distinct read keys and a
+    # snapshot holding only the plain one leaves the diff-bearing read unanswered
+    # at the moment it is issued.
+    #
+    # Completeness is therefore ACCOUNTED after the fact, not probed: above the
+    # operator's cap is CE402, and a count that reaches the production page - or
+    # a response that says another page follows - is CE409.
+    $plainChangeRequest = New-ReviewerChangeListRequest -Project $Request.Project `
+        -RepositoryName $Request.RepositoryName -PullRequestId $Request.PullRequestId
+    [void]$reads.Add((New-ReviewerCohortEntryRead -Id 'changes-plain' -Tool $plainChangeRequest.Name -Role 'change' `
+                -Arguments $plainChangeRequest.Arguments -Envelope 'mcpTextContent' -PayloadFile 'payloads/changes.json'))
 
-    [void]$reads.Add((New-ReviewerCohortEntryRead -Id 'changes-diffs' -Tool 'repo_pull_request' -Role 'change' `
-                -Arguments ([ordered]@{
-                    action = 'get_changes'
-                    project = $Request.Project
-                    repositoryId = $Request.RepositoryName
-                    pullRequestId = $Request.PullRequestId
-                    includeDiffs = $true
-                    includeLineContent = $true
-                    top = ($Request.MaxChangedFiles + 1)
-                }) -Envelope 'mcpTextContent' -PayloadFile 'payloads/changes-diffs.json'))
+    $diffChangeRequest = New-ReviewerChangeListRequest -Project $Request.Project `
+        -RepositoryName $Request.RepositoryName -PullRequestId $Request.PullRequestId -IncludeDiffs
+    [void]$reads.Add((New-ReviewerCohortEntryRead -Id 'changes-diffs' -Tool $diffChangeRequest.Name -Role 'change' `
+                -Arguments $diffChangeRequest.Arguments -Envelope 'mcpTextContent' -PayloadFile 'payloads/changes-diffs.json'))
 
-    # The thread read is NOT shaped here. It is the live cycle's read, taken from
-    # the one shared helper, because a replay answers the arguments it recorded
-    # and never falls through to a live one: a thread vector assembled
-    # independently here is a slot that dies mid-cycle on a read it needs. The
-    # cap+1 probe above is correct for the change-set reads, which this builder
-    # does own; it is wrong for this one, so thread completeness is accounted
-    # after the fact instead (CE406/CE408).
+    # The thread read is NOT shaped here either, and is taken from the one shared
+    # helper for the reason given above. Thread completeness is likewise
+    # accounted after the fact (CE406/CE408).
     $threadRequest = New-ReviewerThreadListRequest -Project $Request.Project `
         -RepositoryName $Request.RepositoryName -PullRequestId $Request.PullRequestId
     [void]$reads.Add((New-ReviewerCohortEntryRead -Id 'threads' -Tool $threadRequest.Name -Role 'thread' `
@@ -1576,6 +1566,38 @@ function Get-ReviewerCohortEntryChangedPathCensus {
     if ($entries.Count -gt $Request.MaxChangedFiles) {
         New-ReviewerCohortEntryRefusal -Code 'CE402' `
             -Detail "The change set carries $($entries.Count) entries and the request caps changed files at $($Request.MaxChangedFiles)."
+    }
+    # The read asks for exactly the page the live cycle asks for, so it is NOT a
+    # cap+1 probe: a response that FILLS that page proves nothing, because a
+    # truncated list and a complete-and-exactly-full list look identical. The
+    # reviewer's own convention planner refuses on the same rule, so a subject
+    # this builder accepted here and the reviewer would refuse later cannot
+    # exist.
+    $changePageLimit = Get-ReviewerChangeListTop
+    if ($entries.Count -ge $changePageLimit) {
+        New-ReviewerCohortEntryRefusal -Code 'CE409' `
+            -Detail ("The change set came back with $($entries.Count) entries, filling the page of " +
+                "$changePageLimit the reviewer's own read asks for, so it cannot be shown to be the whole set.")
+    }
+    # A stated continuation is the same doubt arriving explicitly. It is refused
+    # even below the page, because the only honest reading of "there is more" is
+    # that this response is not the change set.
+    foreach ($moreName in @('continuationToken', 'nextLink', '@odata.nextLink', 'nextSkip', 'hasMoreChanges')) {
+        $moreValue = $null
+        if ($Changes -is [System.Collections.IDictionary]) {
+            if (-not $Changes.Contains($moreName)) { continue }
+            $moreValue = $Changes[$moreName]
+        }
+        else {
+            $moreProperty = $Changes.PSObject.Properties[$moreName]
+            if ($null -eq $moreProperty) { continue }
+            $moreValue = $moreProperty.Value
+        }
+        if ($null -eq $moreValue) { continue }
+        if ($moreValue -is [string] -and [string]::IsNullOrEmpty($moreValue)) { continue }
+        if ($moreValue -is [bool] -and -not $moreValue) { continue }
+        New-ReviewerCohortEntryRefusal -Code 'CE409' `
+            -Detail "The change set carries '$moreName', so it states that another page follows it."
     }
     # An empty authoritative census is refused rather than published. A package
     # built from it would declare 100% coverage of nothing and an empty

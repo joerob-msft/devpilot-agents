@@ -697,6 +697,17 @@ if ([int]$ReviewFactPolicy.threads.maxThreads -ne (Get-ReviewerThreadListTop)) {
         "$([int]$ReviewFactPolicy.threads.maxThreads) but the shared thread-list request asks for " +
         "$(Get-ReviewerThreadListTop).")
 }
+# Same argument for the change list. The flat read's page and the paginated
+# contract's accumulation bound are the SAME bound stated twice - once inside the
+# shared constructor (which must carry its own answer, because a dot-sourced
+# library cannot rely on reaching $script: state through every load chain) and
+# once as the library's own limit. If they drift, the flat read and the paginated
+# read disagree about what the change set for a subject even is.
+if ([int]$script:ReviewerSourceChangeLimit -ne (Get-ReviewerChangeListTop)) {
+    throw ("The source transport accumulates changes up to " +
+        "$([int]$script:ReviewerSourceChangeLimit) but the shared change-list request asks for " +
+        "$(Get-ReviewerChangeListTop).")
+}
 
 $ResultMarkerPrefix = "REVIEWER_RESULT_V1:"
 # One retry, in a fresh session with a fresh nonce, and only when the pass ran
@@ -8928,10 +8939,10 @@ function Get-ReviewerChangedPaths {
        first time ADO returns an unexpected shape. #>
     param([Parameter(Mandatory)][hashtable]$Session, [Parameter(Mandatory)][int]$PrId)
     try {
-        $changes = Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments @{
-            action = 'get_changes'; project = $ExpectedProject; repositoryId = $RepositoryName
-            pullRequestId = $PrId; top = 1000
-        }
+        $changeRequest = New-ReviewerChangeListRequest -Project $ExpectedProject `
+            -RepositoryName $RepositoryName -PullRequestId $PrId
+        $changes = Invoke-AgentMcpTool -Session $Session -Name $changeRequest.Name `
+            -Arguments ([hashtable]$changeRequest.Arguments)
         $paths = Get-ReviewerChangePathsFromResponse -Response $changes
         if (@($paths).Count -eq 0) { Write-Warning "PR $PrId reported no changed files; anchor scoping is disabled for this PR." }
         return , (@($paths))
@@ -9155,10 +9166,10 @@ function Get-ReviewerSourceTransport {
         }
     }
     # -- Legacy get_changes path (unchanged) --
-    $changes = Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments @{
-        action = 'get_changes'; project = $ExpectedProject; repositoryId = $RepositoryName
-        pullRequestId = $PrId; includeDiffs = $true; includeLineContent = $true; top = 1000
-    }
+    $legacyChangeRequest = New-ReviewerChangeListRequest -Project $ExpectedProject `
+        -RepositoryName $RepositoryName -PullRequestId $PrId -IncludeDiffs
+    $changes = Invoke-AgentMcpTool -Session $Session -Name $legacyChangeRequest.Name `
+        -Arguments ([hashtable]$legacyChangeRequest.Arguments)
     $aggregateSpansByPath = Get-ReviewerSourceChangedSpans -Response $changes
     $changeKindsByPath = Get-ReviewerSourceChangeKindsByPath -Response $changes
     # Assign directly: Get-ReviewerChangePathsFromResponse returns its array
@@ -9251,11 +9262,14 @@ function Get-ReviewerSourceTransportNewContract {
         param([hashtable]$Arguments)
         return & $mcpInvokerFunction -Session $Session -Name "repo_pull_request" -Arguments $Arguments
     }.GetNewClosure()
+    # Built before the closure so the closure captures the finished vector rather
+    # than reassembling one; the aggregate read is the same key the offline
+    # corpus records.
+    $aggregateRequest = New-ReviewerChangeListRequest -Project $project `
+        -RepositoryName $repositoryName -PullRequestId $PrId -IncludeDiffs
     $aggregateReader = {
-        return & $mcpInvokerFunction -Session $Session -Name "repo_pull_request" -Arguments @{
-            action = 'get_changes'; project = $project; repositoryId = $repositoryName
-            pullRequestId = $PrId; includeDiffs = $true; includeLineContent = $true; top = 1000
-        }
+        return & $mcpInvokerFunction -Session $Session -Name $aggregateRequest.Name `
+            -Arguments ([hashtable]$aggregateRequest.Arguments)
     }.GetNewClosure()
     $sourceReader = {
         param([string]$Path, [string[]]$Kinds)
@@ -9314,11 +9328,11 @@ function Get-ReviewerSourceTransportAzCliFallback {
         return & $azCaptureFunction -AzInvoker $azInvoker -Project $project `
             -RepositoryId $repositoryId -PrId $PrId -SourceCommit $SourceCommit
     }.GetNewClosure()
+    $aggregateRequest = New-ReviewerChangeListRequest -Project $project `
+        -RepositoryName $repositoryName -PullRequestId $PrId -IncludeDiffs
     $aggregateReader = {
-        return & $mcpInvokerFunction -Session $Session -Name "repo_pull_request" -Arguments @{
-            action = 'get_changes'; project = $project; repositoryId = $repositoryName
-            pullRequestId = $PrId; includeDiffs = $true; includeLineContent = $true; top = 1000
-        }
+        return & $mcpInvokerFunction -Session $Session -Name $aggregateRequest.Name `
+            -Arguments ([hashtable]$aggregateRequest.Arguments)
     }.GetNewClosure()
     $sourceReader = {
         param([string]$Path, [string[]]$Kinds)
@@ -9393,11 +9407,11 @@ function Get-ReviewerPinnedConventionChangeSet {
         [Parameter(Mandatory)][string]$ExpectedSourceCommit
     )
     $targetBefore = Get-ReviewerConventionTargetCommit -Session $Session
+    $changeRequest = New-ReviewerChangeListRequest -Project $ExpectedProject `
+        -RepositoryName $RepositoryName -PullRequestId $PrId
     try {
-        $firstRaw = Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments @{
-            action = "get_changes"; project = $ExpectedProject; repositoryId = $RepositoryName
-            pullRequestId = $PrId; top = 1000
-        }
+        $firstRaw = Invoke-AgentMcpTool -Session $Session -Name $changeRequest.Name `
+            -Arguments ([hashtable]$changeRequest.Arguments)
     }
     catch {
         throw (New-ReviewerConventionEnvironmentException -Operation "read first PR change set" -InnerException $_.Exception)
@@ -9416,10 +9430,8 @@ function Get-ReviewerPinnedConventionChangeSet {
                 -InnerException ([InvalidOperationException]::new("PR $PrId moved while its convention change set was being pinned.")))
     }
     try {
-        $secondRaw = Invoke-AgentMcpTool -Session $Session -Name "repo_pull_request" -Arguments @{
-            action = "get_changes"; project = $ExpectedProject; repositoryId = $RepositoryName
-            pullRequestId = $PrId; top = 1000
-        }
+        $secondRaw = Invoke-AgentMcpTool -Session $Session -Name $changeRequest.Name `
+            -Arguments ([hashtable]$changeRequest.Arguments)
     }
     catch {
         throw (New-ReviewerConventionEnvironmentException -Operation "read second PR change set" -InnerException $_.Exception)
@@ -9429,9 +9441,10 @@ function Get-ReviewerPinnedConventionChangeSet {
         throw (New-ReviewerConventionEnvironmentException -Operation "pin target branch commit" `
                 -InnerException ([InvalidOperationException]::new("The target branch moved while PR $PrId's convention change set was being pinned.")))
     }
-    if ((Test-ReviewerConventionResponseTruncated -Response $firstRaw -Limit 1000) -or
-        (Test-ReviewerConventionResponseTruncated -Response $secondRaw -Limit 1000)) {
-        throw "PR $PrId's convention change set may be truncated at the 1000-entry transport limit."
+    $changePageLimit = Get-ReviewerChangeListTop
+    if ((Test-ReviewerConventionResponseTruncated -Response $firstRaw -Limit $changePageLimit) -or
+        (Test-ReviewerConventionResponseTruncated -Response $secondRaw -Limit $changePageLimit)) {
+        throw "PR $PrId's convention change set may be truncated at the $changePageLimit-entry transport limit."
     }
     $first = @(ConvertTo-ReviewerConventionChangeSet -Response $firstRaw)
     $second = @(ConvertTo-ReviewerConventionChangeSet -Response $secondRaw)

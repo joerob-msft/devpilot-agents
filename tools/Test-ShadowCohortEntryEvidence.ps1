@@ -368,7 +368,20 @@ function New-CohortEntryFixture {
         # What the operator REQUEST caps threads at, as opposed to what the read
         # asks for. They are different numbers with different owners.
         MaxThreads = (Get-ReviewerThreadListTop)
+        # The change reads the fixture RECORDS, on the same footing as the thread
+        # read above: the production page by default, plus the include flags and
+        # the key spellings, so a sabotage can move exactly one and prove each is
+        # matched on its own.
+        ChangeListTop = (Get-ReviewerChangeListTop)
+        ChangeReadProjectOverride = ''
+        ChangeReadRepositoryOverride = ''
+        ChangeReadPullRequestOverride = 0
+        ChangeReadIncludeDiffs = $true
+        ChangeReadIncludeLineContent = $true
+        ChangeReadTopAsString = $false
         RequestWithBom = $false
+        MaxChangedFiles = 50
+        MaxFileBytes = 65536
         MaxSiblingFiles = 1
         MinCoveragePercent = 60
         # -- v2 execution plan -------------------------------------------
@@ -621,15 +634,23 @@ function New-CohortEntryFixture {
             Arguments = [ordered]@{ action = 'get'; project = $state.Project; repositoryId = $state.RepositoryId; branchName = 'main' }
             Bytes = (New-CohortEntryTextEnvelope -Value $state.BranchBody)
         })
+    $changeProject = $(if ($state.ChangeReadProjectOverride) { $state.ChangeReadProjectOverride } else { $state.Project })
+    $changeRepository = $(if ($state.ChangeReadRepositoryOverride) { $state.ChangeReadRepositoryOverride } else { $state.RepositoryName })
+    $changePr = $(if ([int]$state.ChangeReadPullRequestOverride -gt 0) { [int]$state.ChangeReadPullRequestOverride } else { $state.PullRequestId })
+    $changeTop = $(if ($state.ChangeReadTopAsString) { [string]$state.ChangeListTop } else { [int]$state.ChangeListTop })
     [void]$reads.Add(@{
             Tool = 'repo_pull_request'
-            Arguments = [ordered]@{ action = 'get_changes'; project = $state.Project; repositoryId = $state.RepositoryName; pullRequestId = $state.PullRequestId; top = 51 }
+            Arguments = [ordered]@{ action = 'get_changes'; project = $changeProject; repositoryId = $changeRepository; pullRequestId = $changePr; top = $changeTop }
             Bytes = (New-CohortEntryTextEnvelope -Value $state.ChangesBody)
         })
     if (-not $state.OmitDiffVariant) {
+        $diffArguments = [ordered]@{ action = 'get_changes'; project = $changeProject; repositoryId = $changeRepository; pullRequestId = $changePr }
+        if ($state.ChangeReadIncludeDiffs) { $diffArguments['includeDiffs'] = $true }
+        if ($state.ChangeReadIncludeLineContent) { $diffArguments['includeLineContent'] = $true }
+        $diffArguments['top'] = $changeTop
         [void]$reads.Add(@{
                 Tool = 'repo_pull_request'
-                Arguments = [ordered]@{ action = 'get_changes'; project = $state.Project; repositoryId = $state.RepositoryName; pullRequestId = $state.PullRequestId; includeDiffs = $true; includeLineContent = $true; top = 51 }
+                Arguments = $diffArguments
                 Bytes = (New-CohortEntryTextEnvelope -Value $state.DiffChangesBody)
             })
     }
@@ -811,8 +832,8 @@ function New-CohortEntryFixture {
                 replayManifestDigest = $manifestDigest
             }
             coverage = [ordered]@{
-                maxChangedFiles = 50
-                maxFileBytes = 65536
+                maxChangedFiles = $state.MaxChangedFiles
+                maxFileBytes = $state.MaxFileBytes
                 maxSiblingFiles = $state.MaxSiblingFiles
                 maxThreads = $state.MaxThreads
                 minChangedPathCoveragePercent = $state.MinCoveragePercent
@@ -1012,9 +1033,30 @@ $plainPlan = @(Get-ReviewerCohortEntryIdentityReadPlan -Request ([pscustomobject
             Project = 'Contoso'; RepositoryName = 'toolkit'; RepositoryId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
             PullRequestId = 1; TargetRefName = 'refs/heads/main'; MaxThreads = 200; MaxChangedFiles = 300
         }))
-Assert-CohortEntry -Name 'the change reads ask one above the declared cap so a truncated answer is visible' `
-    -Condition (@($plainPlan | Where-Object { $_.Arguments['action'] -ceq 'get_changes' } |
-            Where-Object { [int]$_.Arguments['top'] -ne 301 }).Count -eq 0)
+Assert-CohortEntry -Name 'the planned change reads are the shared change-list requests, tool and all' `
+    -Condition (
+        $(
+            $planChangeReads = @($plainPlan | Where-Object { $_.Arguments['action'] -ceq 'get_changes' })
+            $sharedPlainChange = New-ReviewerChangeListRequest -Project 'Contoso' -RepositoryName 'toolkit' -PullRequestId 1
+            $sharedDiffChange = New-ReviewerChangeListRequest -Project 'Contoso' -RepositoryName 'toolkit' -PullRequestId 1 -IncludeDiffs
+            $sharedChangeReads = @($sharedPlainChange, $sharedDiffChange)
+            $changeMismatches = 0
+            if ($planChangeReads.Count -ne $sharedChangeReads.Count) { $changeMismatches++ }
+            else {
+                for ($i = 0; $i -lt $sharedChangeReads.Count; $i++) {
+                    $planned = $planChangeReads[$i]
+                    $shared = $sharedChangeReads[$i]
+                    if ($planned.Tool -cne $shared.Name) { $changeMismatches++; continue }
+                    if ((($planned.Arguments.Keys | ForEach-Object { [string]$_ }) -join ',') -cne
+                        (($shared.Arguments.Keys | ForEach-Object { [string]$_ }) -join ',')) { $changeMismatches++; continue }
+                    foreach ($key in $shared.Arguments.Keys) {
+                        if ([string]$planned.Arguments[$key] -cne [string]$shared.Arguments[$key]) { $changeMismatches++ }
+                        if ($planned.Arguments[$key].GetType() -ne $shared.Arguments[$key].GetType()) { $changeMismatches++ }
+                    }
+                }
+            }
+            $changeMismatches -eq 0
+        ))
 
 # THE thread-read contract. A replay answers the arguments it recorded and never
 # falls through to a live read, so the builder's thread read has to be the live
@@ -1040,7 +1082,7 @@ Assert-CohortEntry -Name 'the planned thread read is the shared thread-list requ
 # first conjunct and the check proves nothing.
 $offCapPlan = @(Get-ReviewerCohortEntryIdentityReadPlan -Request ([pscustomobject]@{
             Project = 'Contoso'; RepositoryName = 'toolkit'; RepositoryId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
-            PullRequestId = 1; TargetRefName = 'refs/heads/main'; MaxThreads = 50; MaxChangedFiles = 300
+            PullRequestId = 1; TargetRefName = 'refs/heads/main'; MaxThreads = 50; MaxChangedFiles = 42
         }))
 $offCapThreadRead = @($offCapPlan | Where-Object { $_.Id -ceq 'threads' })[0]
 Assert-CohortEntry -Name 'the planned thread read asks for the production page, not the declared cap plus one' `
@@ -1048,10 +1090,23 @@ Assert-CohortEntry -Name 'the planned thread read asks for the production page, 
         [int]$offCapThreadRead.Arguments['top'] -eq (Get-ReviewerThreadListTop) -and
         [int]$offCapThreadRead.Arguments['top'] -ne 51 -and
         [int]$offCapThreadRead.Arguments['top'] -ne 50)
-# and the change reads, whose cap IS the builder's own, still move with it.
-Assert-CohortEntry -Name 'the change reads still track the declared cap the thread read ignores' `
+# and the change reads, which are no longer the builder's to shape either, stop
+# tracking it. Under a 42-file cap "the production page", "the cap" and "the cap
+# plus one" are three different numbers, so this can tell them apart.
+Assert-CohortEntry -Name 'the planned change reads ask for the production page, not the declared cap plus one' `
     -Condition (@($offCapPlan | Where-Object { $_.Arguments['action'] -ceq 'get_changes' } |
-            Where-Object { [int]$_.Arguments['top'] -ne 301 }).Count -eq 0)
+            Where-Object {
+                [int]$_.Arguments['top'] -ne (Get-ReviewerChangeListTop) -or
+                [int]$_.Arguments['top'] -eq 43 -or [int]$_.Arguments['top'] -eq 42
+            }).Count -eq 0 -and
+        @($offCapPlan | Where-Object { $_.Arguments['action'] -ceq 'get_changes' }).Count -eq 2)
+# The value itself, pinned, and pinned against the transport limit it has to
+# equal. The flat read's page and the paginated contract's accumulation bound are
+# the same bound: if they drift, the two reads answer different change sets for
+# the same subject.
+Assert-CohortEntry -Name 'the shared change page is the production 1000 and equals the transport limit' `
+    -Condition ((Get-ReviewerChangeListTop) -eq 1000 -and
+        $sourceTransportBody -cmatch '\$script:ReviewerSourceChangeLimit\s*=\s*1000\b')
 # The value itself, pinned. 200 is what the shipping fact policy caps threads at
 # and what the live cycle asks for; a change to either is a change to the corpus
 # every existing entry was built under, so it is not allowed to happen quietly.
@@ -1081,52 +1136,64 @@ $threadListActionInHashtable = {
     }
     return $false
 }
-$inlineThreadListReads = @(
-    $reviewerAgentAst.FindAll({
-            param($node)
-            if ($node -isnot [System.Management.Automation.Language.CommandAst]) { return $false }
-            if ([string]$node.GetCommandName() -cne 'Invoke-AgentMcpTool') { return $false }
-            $elements = @($node.CommandElements)
-            $named = @{}
-            for ($i = 0; $i -lt $elements.Count - 1; $i++) {
-                if ($elements[$i] -is [System.Management.Automation.Language.CommandParameterAst]) {
-                    $named[[string]$elements[$i].ParameterName] = $elements[$i + 1]
+# The same walk, asked about a different tool and a different action. Written
+# once and called twice, because a second copy of it is exactly the duplication
+# these guards exist to catch.
+function Get-InlineMcpReads {
+    param(
+        [Parameter(Mandatory)]$Ast,
+        [Parameter(Mandatory)][string]$ToolName,
+        [Parameter(Mandatory)][scriptblock]$ActionMatcher
+    )
+    return @(
+        $Ast.FindAll({
+                param($node)
+                if ($node -isnot [System.Management.Automation.Language.CommandAst]) { return $false }
+                if ([string]$node.GetCommandName() -cne 'Invoke-AgentMcpTool') { return $false }
+                $elements = @($node.CommandElements)
+                $named = @{}
+                for ($i = 0; $i -lt $elements.Count - 1; $i++) {
+                    if ($elements[$i] -is [System.Management.Automation.Language.CommandParameterAst]) {
+                        $named[[string]$elements[$i].ParameterName] = $elements[$i + 1]
+                    }
                 }
-            }
-            $nameAst = $named['Name']
-            if ($nameAst -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { return $false }
-            if ([string]$nameAst.Value -cne (Get-ReviewerThreadListToolName)) { return $false }
-            return $true
-        }, $true) |
-        Where-Object {
-            $elements = @($_.CommandElements)
-            $argumentsAst = $null
-            for ($i = 0; $i -lt $elements.Count - 1; $i++) {
-                if ($elements[$i] -is [System.Management.Automation.Language.CommandParameterAst] -and
-                    [string]$elements[$i].ParameterName -eq 'Arguments') { $argumentsAst = $elements[$i + 1] }
-            }
-            if ($argumentsAst -is [System.Management.Automation.Language.HashtableAst]) {
-                return (& $threadListActionInHashtable $argumentsAst)
-            }
-            if ($argumentsAst -isnot [System.Management.Automation.Language.VariableExpressionAst]) { return $true }
-            $scope = $_
-            while ($null -ne $scope -and
-                $scope -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $scope = $scope.Parent }
-            if ($null -eq $scope) { return $true }
-            $variableName = [string]$argumentsAst.VariablePath.UserPath
-            $seeded = @($scope.FindAll({
-                        param($inner)
-                        if ($inner -isnot [System.Management.Automation.Language.AssignmentStatementAst]) { return $false }
-                        if ($inner.Left -isnot [System.Management.Automation.Language.VariableExpressionAst]) { return $false }
-                        return ([string]$inner.Left.VariablePath.UserPath -eq $variableName)
-                    }, $true) |
-                    ForEach-Object { $_.Right.Find({
-                                param($inner) $inner -is [System.Management.Automation.Language.HashtableAst]
-                            }, $true) } |
-                    Where-Object { $null -ne $_ })
-            if ($seeded.Count -eq 0) { return $true }
-            return (@($seeded | Where-Object { & $threadListActionInHashtable $_ }).Count -gt 0)
-        })
+                $nameAst = $named['Name']
+                if ($nameAst -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { return $false }
+                if ([string]$nameAst.Value -cne $ToolName) { return $false }
+                return $true
+            }, $true) |
+            Where-Object {
+                $elements = @($_.CommandElements)
+                $argumentsAst = $null
+                for ($i = 0; $i -lt $elements.Count - 1; $i++) {
+                    if ($elements[$i] -is [System.Management.Automation.Language.CommandParameterAst] -and
+                        [string]$elements[$i].ParameterName -eq 'Arguments') { $argumentsAst = $elements[$i + 1] }
+                }
+                if ($argumentsAst -is [System.Management.Automation.Language.HashtableAst]) {
+                    return (& $ActionMatcher $argumentsAst)
+                }
+                if ($argumentsAst -isnot [System.Management.Automation.Language.VariableExpressionAst]) { return $true }
+                $scope = $_
+                while ($null -ne $scope -and
+                    $scope -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $scope = $scope.Parent }
+                if ($null -eq $scope) { return $true }
+                $variableName = [string]$argumentsAst.VariablePath.UserPath
+                $seeded = @($scope.FindAll({
+                            param($inner)
+                            if ($inner -isnot [System.Management.Automation.Language.AssignmentStatementAst]) { return $false }
+                            if ($inner.Left -isnot [System.Management.Automation.Language.VariableExpressionAst]) { return $false }
+                            return ([string]$inner.Left.VariablePath.UserPath -eq $variableName)
+                        }, $true) |
+                        ForEach-Object { $_.Right.Find({
+                                    param($inner) $inner -is [System.Management.Automation.Language.HashtableAst]
+                                }, $true) } |
+                        Where-Object { $null -ne $_ })
+                if ($seeded.Count -eq 0) { return $true }
+                return (@($seeded | Where-Object { & $ActionMatcher $_ }).Count -gt 0)
+            })
+}
+$inlineThreadListReads = @(Get-InlineMcpReads -Ast $reviewerAgentAst `
+        -ToolName (Get-ReviewerThreadListToolName) -ActionMatcher $threadListActionInHashtable)
 Assert-CohortEntry -Name "the live reviewer builds its thread reads through the shared constructor only ($($inlineThreadListReads.Count) inline)" `
     -Condition (
         ([regex]::Matches($reviewerAgentBody, 'New-ReviewerThreadListRequest\s+-Project').Count -ge 2) -and
@@ -1160,6 +1227,55 @@ Assert-CohortEntry -Name 'the request thread ceiling and the full-page evidence 
         ($evidenceBody -cnotmatch "-Code\s+'CE408'") -and
         ($builderBody -cmatch "-Code\s+'CE408'") -and
         ($builderBody -cnotmatch "-Code\s+'CE113'"))
+# The same three guards for the change reads, which failed the same way one
+# shadow later: the reviewer's own literal and the builder's cap+1 were each
+# defensible alone and jointly fatal, and a slot died in convention planning on a
+# read it could prove it needed and could not get.
+$getChangesActionInHashtable = {
+    param($hashtableAst)
+    foreach ($pair in $hashtableAst.KeyValuePairs) {
+        if ([string]$pair.Item1.Extent.Text -notmatch 'action') { continue }
+        if ([string]$pair.Item2.Extent.Text -match 'get_changes') { return $true }
+    }
+    return $false
+}
+$inlineGetChangesReads = @(Get-InlineMcpReads -Ast $reviewerAgentAst `
+        -ToolName (Get-ReviewerChangeListToolName) -ActionMatcher $getChangesActionInHashtable)
+Assert-CohortEntry -Name "the live reviewer builds its change reads through the shared constructor only ($($inlineGetChangesReads.Count) inline)" `
+    -Condition (
+        ([regex]::Matches($reviewerAgentBody, 'New-ReviewerChangeListRequest\s+-Project').Count -ge 4) -and
+        ($inlineGetChangesReads.Count -eq 0))
+# Other actions on the same tool are a different contract and must stay
+# reachable, so the walk has to discriminate on the ACTION rather than the tool.
+# If it did not, this count would be zero and the guard above would be passing
+# for the wrong reason.
+Assert-CohortEntry -Name 'the change-read guard leaves the other repo_pull_request actions alone' `
+    -Condition (@(Get-InlineMcpReads -Ast $reviewerAgentAst -ToolName (Get-ReviewerChangeListToolName) `
+                -ActionMatcher { param($hashtableAst) $true }).Count -gt 0)
+# Neither the evidence plan nor the builder may spell the action at all: both now
+# take the whole vector from the shared constructor, so a quoted 'get_changes'
+# anywhere in either file is a second author.
+Assert-CohortEntry -Name 'the builder restates neither change-read variant' `
+    -Condition (
+        ([regex]::Matches($evidenceBody, "['`"]get_changes['`"]").Count -eq 0) -and
+        ([regex]::Matches($builderBody, "['`"]get_changes['`"]").Count -eq 0) -and
+        ($evidenceBody -cnotmatch '(?m)top\s*=\s*\(?\s*\$Request\.MaxChangedFiles'))
+$changePageRestatements = 0
+foreach ($restatementBody in @($reviewerAgentBody, $evidenceBody, $builderBody)) {
+    $changePageRestatements += [regex]::Matches($restatementBody, '\btop\s*=\s*1000\b').Count
+    $changePageRestatements += [regex]::Matches($restatementBody, '-Limit\s+1000\b').Count
+}
+Assert-CohortEntry -Name "the shared change page size is written down exactly once ($changePageRestatements restatements)" `
+    -Condition ($changePageRestatements -eq 0 -and
+        [regex]::Matches($sourceTransportBody, '(?m)^\s*return\s+1000\b').Count -eq 1)
+# and the two change ceilings are two failures with opposite answers, exactly as
+# the thread pair is: CE402 says the operator authorized fewer files than this
+# subject has, CE409 says nobody can tell how many it has.
+Assert-CohortEntry -Name 'the changed-file cap and the full-page evidence carry different codes' `
+    -Condition (
+        ($evidenceBody -cmatch "-Code\s+'CE402'") -and
+        ($evidenceBody -cmatch "-Code\s+'CE409'") -and
+        ([regex]::Matches($evidenceBody, "-Code\s+'CE402'").Count -eq 1))
 Assert-CohortEntry -Name 'the identity plan reads the repository by GUID under repositoryNameOrId' `
     -Condition (@($plainPlan | Where-Object { $_.Tool -ceq 'repo_repository' })[0].Arguments['repositoryNameOrId'] -ceq 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa')
 Assert-CohortEntry -Name 'the identity plan reads the pull request by repository NAME' `
@@ -1923,6 +2039,94 @@ Invoke-CohortEntryCase -Name 'a thread list that exactly fills the reviewer page
     $state.ThreadsBody = [ordered]@{ value = @(1..(Get-ReviewerThreadListTop) | ForEach-Object {
                 [ordered]@{ id = $_; status = 'active'; comments = @([ordered]@{ id = $_; content = "c$_"; commentType = 'text' }) }
             }) }
+}
+
+# THE shadow #10 defect the SECOND time, in the read next door. The corpus
+# recorded both change reads at the operator cap plus one - the same defensible
+# instinct, the same fatal result - while the live convention planner asked for
+# the production page. That slot got PAST the corrected thread read, printed its
+# scope, computed its coverage, and died on this. Same code, same shape, refused
+# at build so the corpus cannot be published again.
+Invoke-CohortEntryCase -Name 'a corpus recording the change reads at the operator cap plus one' -ExpectedCode 'CE307' -Mutate {
+    param($state) $state.ChangeListTop = ([int]$state.MaxChangedFiles + 1)
+}
+
+Invoke-CohortEntryCase -Name 'a corpus recording the change reads one above the reviewer page' -ExpectedCode 'CE307' -Mutate {
+    param($state) $state.ChangeListTop = (Get-ReviewerChangeListTop) + 1
+}
+
+Invoke-CohortEntryCase -Name 'a corpus recording the change reads one below the reviewer page' -ExpectedCode 'CE307' -Mutate {
+    param($state) $state.ChangeListTop = (Get-ReviewerChangeListTop) - 1
+}
+
+# The page as a STRING. It replays through any comparison that stringifies and
+# fails the one the wrapper actually keys on, which is the whole request object -
+# so a corpus that looks right in a diff answers nothing.
+Invoke-CohortEntryCase -Name 'a corpus recording the change page as a string' -ExpectedCode 'CE307' -Mutate {
+    param($state) $state.ChangeReadTopAsString = $true
+}
+
+# The include flags are what make the diff-bearing read a DIFFERENT read. Drop
+# either one and the recorded key is the plain read's key wearing the diff read's
+# payload, so the diff read itself goes unanswered.
+Invoke-CohortEntryCase -Name 'a corpus recording the diff variant without includeDiffs' -ExpectedCode 'CE307' -Mutate {
+    param($state) $state.ChangeReadIncludeDiffs = $false
+}
+
+Invoke-CohortEntryCase -Name 'a corpus recording the diff variant without includeLineContent' -ExpectedCode 'CE307' -Mutate {
+    param($state) $state.ChangeReadIncludeLineContent = $false
+}
+
+# The identity keys of the change reads, each on its own, for the same reason the
+# thread read's are checked one at a time.
+Invoke-CohortEntryCase -Name 'a corpus recording the change reads under another project' -ExpectedCode 'CE307' -Mutate {
+    param($state) $state.ChangeReadProjectOverride = 'OtherProject'
+}
+
+Invoke-CohortEntryCase -Name 'a corpus recording the change reads under the repository GUID' -ExpectedCode 'CE307' -Mutate {
+    param($state) $state.ChangeReadRepositoryOverride = $state.RepositoryId
+}
+
+Invoke-CohortEntryCase -Name 'a corpus recording the change reads for another pull request' -ExpectedCode 'CE307' -Mutate {
+    param($state) $state.ChangeReadPullRequestOverride = ([int]$state.PullRequestId + 1)
+}
+
+# The change-set cap policy, on the same footing as the thread one. Above the
+# operator's ceiling is CE402 and the operator can fix it by editing JSON; at the
+# reviewer's page, or with a stated continuation, nobody can say what the change
+# set is and CE409 says so.
+Invoke-CohortEntryCase -Name 'a change set carrying more paths than the request caps' -ExpectedCode 'CE402' -Mutate {
+    param($state)
+    $state.MaxChangedFiles = 1
+    $state.ChangesBody.changes = @(
+        [ordered]@{ changeId = 1; changeType = 'Edit'; item = [ordered]@{ path = '/src/a.ps1' } },
+        [ordered]@{ changeId = 2; changeType = 'Edit'; item = [ordered]@{ path = '/src/b.ps1' } })
+}
+
+Invoke-CohortEntryCase -Name 'a change set that exactly fills the reviewer page' -ExpectedCode 'CE409' -Mutate {
+    param($state)
+    $state.MaxChangedFiles = (Get-ReviewerChangeListTop)
+    # Raised so the page-fill refusal is what this case observes. At the default
+    # cap a thousand-entry response trips the byte ceiling first, and the case
+    # would pass for a reason that has nothing to do with the page.
+    $state.MaxFileBytes = 1048576
+    $state.ChangesBody.changes = @(1..(Get-ReviewerChangeListTop) | ForEach-Object {
+            [ordered]@{ changeId = $_; changeType = 'Edit'; item = [ordered]@{ path = "/src/f$_.ps1" } }
+        })
+}
+
+Invoke-CohortEntryCase -Name 'a change set stating that another page follows it' -ExpectedCode 'CE409' -Mutate {
+    param($state) $state.ChangesBody['continuationToken'] = '1001'
+}
+
+Invoke-CohortEntryCase -Name 'a change set stating it has more changes' -ExpectedCode 'CE409' -Mutate {
+    param($state) $state.ChangesBody['hasMoreChanges'] = $true
+}
+
+# and a continuation field that says the opposite is not a refusal. Without this
+# the two cases above would pass for a provider that always answers 'false'.
+Invoke-CohortEntryCase -Name 'a change set stating it has no more changes' -ExpectedCode '' -Mutate {
+    param($state) $state.ChangesBody['hasMoreChanges'] = $false
 }
 
 Invoke-CohortEntryCase -Name 'a file served under a URI nobody requested' -ExpectedCode 'CE304' -Mutate {
