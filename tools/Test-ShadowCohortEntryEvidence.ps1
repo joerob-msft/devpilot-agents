@@ -2701,6 +2701,107 @@ if ($IncludePreflight) {
     $realToolkit = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
     Invoke-CohortEntryPreflightVariant -Label 'v1' -RealToolkitRoot $realToolkit
     Invoke-CohortEntryPreflightVariant -Label 'v2' -RealToolkitRoot $realToolkit -WithExecutionPlan
+
+    # ------------------------------------------------------------------
+    # The whole claim, in one run: a slots-carrying build that DECLARES its
+    # own run set, mints its own launch authorization through the reviewed
+    # qualification tool, and comes back cohort-ready - then is handed to
+    # the shipping cohort runner, which walks past the check that refuses
+    # every entry above and starts the entry's own preparation.
+    #
+    # Nothing here is hand-written. The token is the one the declaration
+    # published, so this is also the only place the derived path is proved
+    # to be the published path by construction rather than by comparison.
+    # ------------------------------------------------------------------
+    Write-Host 'cohort-ready: a builder-produced entry that declared its own run set' -ForegroundColor Cyan
+    $readySandbox = New-CohortEntrySandbox -Name 'cohort-ready'
+    try {
+        $readyFixture = New-CohortEntryFixture -Sandbox $readySandbox -RealToolkitRoot $realToolkit `
+            -Mutate { param($s) $s.SchemaVersion = 2; $s.WithExecutionPlan = $true }
+        $readyResult = New-ReviewerCohortEntryEvidence -RequestPath $readyFixture.RequestPath `
+            -Preflight -PreflightTarget 'runSetReady'
+        Assert-CohortEntry -Name 'a build that reached runSetReady reports itself cohort-ready' `
+            -Condition ([bool]$readyResult.CohortReady)
+        Assert-CohortEntry -Name 'the build reports the run set it declared' `
+            -Condition (([string]$readyResult.RunSetId) -cmatch '^[0-9a-f]{32}$')
+        Assert-CohortEntry -Name 'the build reports the digest of the authorization it bound to' `
+            -Condition (([string]$readyResult.LaunchAuthorizationSha256) -cmatch '^[0-9a-f]{64}$')
+        $readyPrep = $readyResult.Root.TrimEnd('\', '/') + '.preparation'
+        $readyToken = Join-Path (Join-Path $readyPrep 'qualification/runset') 'launch-authorization.token'
+        Assert-CohortEntry -Name 'the declaration published its authorization at the derived path' `
+            -Condition (([string]$readyResult.LaunchAuthorizationPath) -ceq $readyToken)
+        Assert-CohortEntry -Name 'the published authorization exists and is read-only' `
+            -Condition ((Test-Path -LiteralPath $readyToken -PathType Leaf) -and
+                (Get-Item -LiteralPath $readyToken -Force).IsReadOnly)
+        $readyEmitted = [IO.File]::ReadAllText((Join-Path $readyResult.Root 'entry/coordinator-request.json')) |
+            ConvertFrom-Json -Depth 32
+        Assert-CohortEntry -Name 'both slots carry the authorization the declaration actually published' `
+            -Condition (@($readyEmitted.slots.declared | Where-Object {
+                        ([string]$_.launchAuthorizationTokenPath) -ceq $readyToken
+                    }).Count -eq 2)
+        Assert-CohortEntry -Name 'the build started no model reaching runSetReady' `
+            -Condition (($readyResult.ModelStarts -eq 0) -and ($readyResult.ProviderWrites -eq 0))
+
+        $readyDll = Join-Path $realToolkit 'tools/ShadowRunCoordinator/bin/Release/net10.0/ShadowRunCoordinator.dll'
+        if (Test-Path -LiteralPath $readyDll -PathType Leaf) {
+            $readyEntry = [IO.File]::ReadAllText((Join-Path $readyResult.Root 'entry/cohort-entry.json')) |
+                ConvertFrom-Json -Depth 32
+            $readyStub = Join-Path $readySandbox 'ready-stub.ps1'
+            [IO.File]::WriteAllBytes($readyStub, $script:Utf8.GetBytes(@(
+                        'param([Parameter(ValueFromRemainingArguments = $true)]$Rest)'
+                        '# Stands in for the entry preparation. Starts no model and'
+                        '# publishes no terminal, so the entry ends unsuccessfully - which'
+                        '# is AFTER the launch authorization check this run is about.'
+                        'exit 0'
+                        ''
+                    ) -join "`n"))
+            $readyManifest = [ordered]@{
+                contractVersion = 'devpilot.shadow-cohort.manifest.v3'
+                kind = 'shadow-cohort-test-run'
+                cohortId = 'cohort-entry-ready'
+                correlationId = [string]$readyEmitted.correlationId
+                toolkit = [ordered]@{
+                    repositoryRoot = $realToolkit
+                    head = (& git -C $realToolkit rev-parse HEAD).Trim()
+                    requiredRef = 'refs/heads/main'
+                }
+                execution = [ordered]@{
+                    concurrency = 1
+                    stopPolicy = 'failFast'
+                    authorizationKind = 'PreviewOnly'
+                    commandPath = (Get-Process -Id $PID).Path
+                    argumentPrefix = [string[]]@('-NoProfile', '-NonInteractive', '-File', $readyStub)
+                    target = 'runSetReady'
+                    entryTimeoutSeconds = 120
+                }
+                budgets = [ordered]@{
+                    maxPullRequests = 1
+                    maxModelStarts = [int]$readyEntry.planEstimate.modelStarts
+                    maxVerifierAssignments = [int]$readyEntry.planEstimate.verifierAssignments
+                    maxWallClockSeconds = [int]$readyEntry.planEstimate.wallClockSeconds
+                    providerWriteBudget = 0
+                }
+                journal = [ordered]@{ root = (Join-Path $readySandbox 'ready-journal') }
+                audit = [ordered]@{ indexPath = (Join-Path $readySandbox 'ready-index/index.json') }
+                entries = @($readyEntry)
+            }
+            $readyManifestPath = Join-Path $readySandbox 'ready-manifest.json'
+            Write-CohortEntryJsonFile -Path $readyManifestPath -Value $readyManifest
+            $previousReady = $PSNativeCommandUseErrorActionPreference
+            $PSNativeCommandUseErrorActionPreference = $false
+            try {
+                $readyWalk = (& dotnet $readyDll --cohort $readyManifestPath --authorized-by 'cohort-entry-test' 2>&1 | Out-String)
+            }
+            finally { $PSNativeCommandUseErrorActionPreference = $previousReady }
+            Assert-CohortEntry -Name 'the cohort accepts a builder-produced entry that declared its own run set' `
+                -Condition ($readyWalk -notmatch 'declares slots authorized by|not the 64 lowercase hex')
+            Assert-CohortEntry -Name 'the cohort walked past every pre-walk check and started the entry' `
+                -Condition ($readyWalk -match 'shadow-cohort-runner')
+            Assert-CohortEntry -Name 'the cohort walk started no model' `
+                -Condition ($readyWalk -notmatch 'realModelStart(s|Count)=[1-9]')
+        }
+    }
+    finally { if (-not $KeepSandbox) { Remove-CohortEntrySandbox -Path $readySandbox } else { Write-Host "sandbox kept: $readySandbox" } }
 }
 
 # -------------------------------------------------------------------------

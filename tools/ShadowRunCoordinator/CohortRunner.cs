@@ -1877,6 +1877,13 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
     /// already refused there, by the party that holds the plan. Re-deriving the
     /// plan digest in this pass would be a second answer to a question the
     /// signed declaration already answers.
+    ///
+    /// And only for entries whose preparation has ALREADY declared its run set.
+    /// An entry starting from nothing mints its authorization during the run, as
+    /// part of declaring the set; demanding one before it has run would refuse
+    /// every fresh entry. What this catches is the other case - a preparation
+    /// that is past that point, so its authorization exists somewhere, and the
+    /// path its request names is not where.
     /// </remarks>
     private void RequireDeclaredLaunchAuthorizations()
     {
@@ -1891,13 +1898,31 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
                 continue;
             }
 
-            var seen = new SortedSet<string>(StringComparer.Ordinal);
-            foreach (var declared in StrictJson.RequireArray(slots, "declared", label))
+            var statePath = Path.Combine(entry.OutputRoot, "coordinator", "state.json");
+            if (!File.Exists(statePath))
             {
-                seen.Add(StrictJson.RequireString(declared, "launchAuthorizationTokenPath", label));
+                continue;
+            }
+            var stateLabel = $"entry '{entry.EntryId}' coordinator state";
+            var declared = PreparationStateNames.Parse(
+                StrictJson.RequireString(StrictJson.ReadObjectFile(statePath, stateLabel), "state", stateLabel));
+            if (PreparationStateNames.RankOf(declared) < PreparationStateNames.RankOf(PreparationState.RunSetDeclared))
+            {
+                continue;
+            }
+
+            var seen = new SortedSet<string>(StringComparer.Ordinal);
+            foreach (var slot in StrictJson.RequireArray(slots, "declared", label))
+            {
+                seen.Add(StrictJson.RequireString(slot, "launchAuthorizationTokenPath", label));
             }
             seen.Add(StrictJson.RequireString(StrictJson.RequireObject(slots, "reconciliation", label), "launchAuthorizationTokenPath", label));
-            seen.Add(StrictJson.RequireString(StrictJson.RequireObject(slots, "delivery", label), "launchAuthorizationTokenPath", label));
+            // Delivery is optional in this contract; a preparation may declare
+            // slots and reconcile them without publishing anything at all.
+            if (slots.TryGetProperty("delivery", out var delivery) && delivery.ValueKind == System.Text.Json.JsonValueKind.Object)
+            {
+                seen.Add(StrictJson.RequireString(delivery, "launchAuthorizationTokenPath", label));
+            }
             if (seen.Count != 1)
             {
                 throw new ContractException(
@@ -1910,9 +1935,9 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
             if (!File.Exists(tokenPath))
             {
                 throw new ContractException(
-                    $"Entry '{entry.EntryId}' declares slots authorized by '{tokenPath}', and there is no such file. A run set declaration publishes that " +
-                    "token; an entry naming one that was never published cannot launch a single slot, and the cohort refuses it here rather than at the " +
-                    "first prelaunch, after the run it was going to spend is gone.");
+                    $"Entry '{entry.EntryId}' stands at '{PreparationStateNames.ToName(declared)}' with its slots authorized by '{tokenPath}', and there is " +
+                    "no such file. Its run set declaration published a token somewhere; an entry naming one that was never published cannot launch a single " +
+                    "slot, and the cohort refuses it here rather than at the first prelaunch, after the run it was going to spend is gone.");
             }
             var text = StrictJson.StrictUtf8.GetString(StrictJson.ReadFileBytes(tokenPath, $"entry '{entry.EntryId}' launch authorization", 4096));
             if (text.Length != 64 || !StrictJson.IsLowerHex(text))

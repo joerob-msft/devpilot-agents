@@ -74,6 +74,43 @@ appending a slot to the published request and showing the digest no longer match
 | `reconciliation` | Enabled, with a required run count that equals the declared slot count. |
 | `delivery` | `PreviewOnly`, comments/votes/gates all `false`, `providerWriteBudget` exactly `0` — every one of them a schema `const`. |
 
+**The launch authorization is derived, never supplied.** A request may not name
+`launchAuthorizationTokenPath` anywhere — not on a slot, not on the reconciliation, not on
+the delivery. Doing so refuses under **`CE716`**. The builder derives the one path a
+published authorization can occupy:
+
+```
+<output.root>.preparation/qualification/runset/launch-authorization.token
+```
+
+which is exactly where `Invoke-ReviewerReplayQualification.ps1 -Mode Declare` mints and
+publishes it, read-only, inside its publish transaction. That path is known from the output
+root the request already declares, so it is stamped into the plan *before* the coordinator
+request is hashed; nothing is rewritten afterwards.
+
+This closes a real defect. Previously the operator supplied that path and nothing compared
+it to the run set the entry's own preparation would publish. An entry could seal, pass
+`Assert-ReviewerCohortEntrySealable`, pass a cohort walk and stand at `runSetReady` while
+naming a file no declaration was ever going to write — and the first thing to notice would
+have been the first slot prelaunch, after a cohort had been assembled around it and an
+operator had spent the one execution they were authorized.
+
+**A runnable entry requires a run set that exists.** A slots-carrying build refuses
+**`CE715`** unless it reached `runSetReady` *and* the authorization beside the declaration
+is a real, read-only, non-reparse, 64-lowercase-hex file whose run set was verified against
+this entry's own request digest. Pass `-Preflight -PreflightTarget runSetReady` to produce
+one. Where no operator key is held, `-PreparationOnly` builds a slots-carrying entry that
+states outright that it is **not** cohort-ready (`CohortReady = $false`); the cohort runner
+refuses that entry by the same rule, for the same reason.
+
+**The cohort refuses it too, before anything starts.** `CohortRunner.Walk` checks every
+entry's declared authorization in the same pre-walk pass that proves the model start bounds
+— existence, single shared path across slots/reconciliation/delivery, and 64-hex shape. Only
+existence and shape: the token's digest is sealed into the run set's plan digest, and the
+reviewed prelaunch reproduces that plan only from the token that was minted into it, so a
+*substituted* well-formed token is deliberately left for the party that holds the plan to
+refuse rather than answered twice.
+
 **No write-enabled value is representable.** The four delivery capability fields are fixed
 by `const` in the schema, and the builder re-checks each one after reading (`CE707`), so a
 hand-edited request that never met the schema is refused a second time. `providerWriteBudget`
@@ -368,12 +405,12 @@ process exit code, because an exit code is one byte and the catalogue is not.
 | `CE4xx` | 5 | The census and coverage: ordering, duplicates, path traversal, reparse points, the changed-file cap (`CE402`), the thread cap (`CE406`), the byte cap, a right-hand path whose content was not stored or a content coverage under the declared floor (`CE403`), a span that runs past the end of the file it describes (`CE404`), an empty census (`CE407`), target ref or config mismatch. |
 | `CE5xx` | 6 | The package: a staging or publish failure, a package that is not read-only including its own inventory and seal (`CE502`), an inventoried file whose bytes changed, an unlisted file, or a declared file that is absent (`CE503`), a reparse point (`CE505`), an inventory path that is not a plain relative path inside the package (`CE506`), a seal that does not authenticate. |
 | `CE6xx` | 7 | The preflight: the coordinator did not reach its target (`CE600`), or it consumed a slot, a model or a launch token (`CE601`). |
-| `CE7xx` | 8 | The execution plan: declared at a version that does not carry it (`CE700`), the wrong slot count or the wrong names in the wrong order (`CE701`), colliding slot state directories or terminal artifacts (`CE702`), a reviewer script that is absent or drifted from its declared digest (`CE703`), a model outside the shared registry (`CE704`), a generalist pair that is not the derived pair or a specialist that is one of the generalists (`CE705`), models the reviewer configuration does not configure (`CE706`), any delivery capability enabled or a non-zero provider write budget (`CE707`), reconciliation disabled or requiring a run count that is not the slot count (`CE708`), a slot count that is not the planned run count (`CE709`), a per-call timeout that outlives its slot (`CE710`), an output path outside the preparation root or a launch authorization inside the sealed package (`CE711`), a model-start bound that is not a positive finite estimate (`CE712`), a bound that could not be derived or that does not bind this request (`CE714`). |
+| `CE7xx` | 10 | The execution plan: declared at a version that does not carry it (`CE700`), the wrong slot count or the wrong names in the wrong order (`CE701`), colliding slot state directories or terminal artifacts (`CE702`), a reviewer script that is absent or drifted from its declared digest (`CE703`), a model outside the shared registry (`CE704`), a generalist pair that is not the derived pair or a specialist that is one of the generalists (`CE705`), models the reviewer configuration does not configure (`CE706`), any delivery capability enabled or a non-zero provider write budget (`CE707`), reconciliation disabled or requiring a run count that is not the slot count (`CE708`), a slot count that is not the planned run count (`CE709`), a per-call timeout that outlives its slot (`CE710`), an output path outside the preparation root or a derived launch authorization that landed inside the sealed package (`CE711`), a model-start bound that is not a positive finite estimate (`CE712`), a bound that could not be derived or that does not bind this request (`CE714`), a slots-carrying entry with no declared run set and launch authorization to run under (`CE715`), and a request that names a launch authorization the builder derives for itself (`CE716`). |
 | `CE8xx` | 9 | The corpus seal recipe: a live identity read carrying no value for a field the seal binds by name (`CE800`), a changed path with right-hand content but no right-hand span (`CE802`), a pinned toolkit shipping no source-transport policy (`CE803`), an emitted recipe the shipping sealer's own importer and planner will not accept (`CE805`), a recipe citing a payload or a change-set path this build did not stage (`CE806`). |
 
 ## Tests
 
-`tools/Test-ShadowCohortEntryEvidence.ps1` — 309 checks offline, 335 with `-IncludePreflight`;
+`tools/Test-ShadowCohortEntryEvidence.ps1` — 316 checks offline, 348 with `-IncludePreflight`;
 no model, no network, everything in a temporary sandbox.
 
 - **Exact wrapper fixtures.** A synthetic but contract-exact replay snapshot for every tool

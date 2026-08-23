@@ -603,6 +603,13 @@ function New-CohortEntryRequest {
         targetCommit = (New-FakeCommit)
     }
     $token = [string]([IO.Path]::GetFullPath((Join-Path $Sandbox "inputs\$EntryId.token")))
+    # Written, not merely named. These entries declare slots authorized by this
+    # token, and a cohort refuses an entry whose authorization was never
+    # published - which is the correction that made a fixture declaring one it
+    # never wrote a fixture describing an entry that could not have run.
+    [void](New-Item -ItemType Directory -Force -Path (Split-Path -Parent $token))
+    [IO.File]::WriteAllBytes($token,
+        ([System.Text.UTF8Encoding]::new($false)).GetBytes(((1..32 | ForEach-Object { '{0:x2}' -f (Get-Random -Minimum 0 -Maximum 256) }) -join '')))
     $slot = {
         param($name, $stateDir, $terminal)
         [ordered]@{
