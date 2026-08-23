@@ -1414,6 +1414,23 @@ $guardBypassMisses = @($guardBypassCases | Where-Object {
     })
 Assert-CohortEntry -Name "the read guard answers every known bypass shape correctly ($($guardBypassCases.Count - $guardBypassMisses.Count)/$($guardBypassCases.Count)$(if ($guardBypassMisses.Count) { ': ' + (($guardBypassMisses | ForEach-Object { $_.Name }) -join '; ') }))" `
     -Condition ($guardBypassMisses.Count -eq 0)
+# The optional-field reader answers the same way over both shapes the JSON
+# reader can hand back, and over either capitalisation. A field this build
+# refuses on is not a field it may miss because the provider capitalised it, and
+# an ordered dictionary - what -AsHashtable returns - does not agree with a
+# property bag about that unless it is made to.
+$optionalShapes = @(
+    @{ Label = 'a property bag'; Object = ([pscustomobject][ordered]@{ nextSkip = 7 }) },
+    @{ Label = 'an ordered dictionary'; Object = ([ordered]@{ nextSkip = 7 }) },
+    @{ Label = 'a hashtable'; Object = (@{ nextSkip = 7 }) })
+$optionalMisreads = @($optionalShapes | Where-Object {
+        (Get-ReviewerCohortEntryOptionalValue -Object $_.Object -Name 'nextSkip') -ne 7 -or
+        (Get-ReviewerCohortEntryOptionalValue -Object $_.Object -Name 'NEXTSKIP') -ne 7 -or
+        $null -ne (Get-ReviewerCohortEntryOptionalValue -Object $_.Object -Name 'nextSkipped')
+    })
+Assert-CohortEntry -Name "an optional provider field reads the same over every shape and capitalisation ($($optionalShapes.Count - $optionalMisreads.Count)/$($optionalShapes.Count))" `
+    -Condition ($optionalMisreads.Count -eq 0 -and
+        $null -eq (Get-ReviewerCohortEntryOptionalValue -Object $null -Name 'nextSkip'))
 # Neither the evidence plan nor the builder may spell the action at all: both now
 # take the whole vector from the shared constructor, so a quoted 'get_changes'
 # anywhere in either file is a second author.

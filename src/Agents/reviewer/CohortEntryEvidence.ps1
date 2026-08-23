@@ -1297,6 +1297,12 @@ function Get-ReviewerCohortEntryOptionalValue {
         Absence and a null value are deliberately the same answer. Every caller
         of this reads a field whose meaning is "if this is set, it says
         something", and a field that is present and null says nothing.
+
+        The lookup is case-insensitive in BOTH shapes. A property bag from the
+        JSON reader is case-insensitive already; an ordered dictionary is not,
+        so a provider that answered 'NextSkip' would be read one way and not the
+        other. A field this build refuses on is not a field it may miss because
+        of a capital letter.
     #>
     param(
         [Parameter(Mandatory)][AllowNull()]$Object,
@@ -1304,8 +1310,10 @@ function Get-ReviewerCohortEntryOptionalValue {
     )
     if ($null -eq $Object) { return $null }
     if ($Object -is [System.Collections.IDictionary]) {
-        if (-not $Object.Contains($Name)) { return $null }
-        return $Object[$Name]
+        foreach ($key in @($Object.Keys)) {
+            if ([string]$key -ieq $Name) { return $Object[$key] }
+        }
+        return $null
     }
     $property = $Object.PSObject.Properties[$Name]
     if ($null -eq $property) { return $null }
