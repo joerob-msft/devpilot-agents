@@ -99,9 +99,12 @@ operator had spent the one execution they were authorized.
 **`CE715`** unless it reached `runSetReady` *and* the authorization beside the declaration
 is a real, read-only, non-reparse, 64-lowercase-hex file whose run set was verified against
 this entry's own request digest. Pass `-Preflight -PreflightTarget runSetReady` to produce
-one. Where no operator key is held, `-PreparationOnly` builds a slots-carrying entry that
-states outright that it is **not** cohort-ready (`CohortReady = $false`); the cohort runner
-refuses that entry by the same rule, for the same reason.
+one. A refusal here **withdraws the package it published**: a slots-carrying build has to
+publish before its preparation can run, so a refusal that left the directory standing would
+leave a sealed, seal-verifiable entry a manifest could name. Where no operator key is held,
+`-PreparationOnly` builds a slots-carrying entry that states outright that it is **not**
+cohort-ready (`CohortReady = $false`); that entry declares no run set, so a cohort naming it
+runs the preparation from scratch and mints the authorization itself rather than trusting one.
 
 **The cohort refuses it too, before anything starts.** `CohortRunner.Walk` checks every
 entry's declared authorization in the same pre-walk pass that proves the model start bounds
@@ -112,7 +115,10 @@ declaring the set, so demanding one earlier would refuse every entry that had no
 prove nothing. Only existence and shape are checked: the token's digest is sealed into the
 run set's plan digest, and the reviewed prelaunch reproduces that plan only from the token
 that was minted into it, so a *substituted* well-formed token is deliberately left for the
-party that holds the plan to refuse rather than answered twice.
+party that holds the plan to refuse rather than answered twice. The state record is read for
+that one fact and is not authenticated in this pass, which holds no coordinator key: a record
+that understates its state buys nothing, because the entry's very next act is to run its
+coordinator, which loads the same record under its signing key.
 
 **No write-enabled value is representable.** The four delivery capability fields are fixed
 by `const` in the schema, and the builder re-checks each one after reading (`CE707`), so a
@@ -413,7 +419,7 @@ process exit code, because an exit code is one byte and the catalogue is not.
 
 ## Tests
 
-`tools/Test-ShadowCohortEntryEvidence.ps1` — 316 checks offline, 358 with `-IncludePreflight`;
+`tools/Test-ShadowCohortEntryEvidence.ps1` — 316 checks offline, 361 with `-IncludePreflight`;
 no model, no network, everything in a temporary sandbox. The `-IncludePreflight` set ends with
 one case that drives a build to `runSetReady` against a real run set declaration and then walks
 the published entry through the shipping cohort runner, which is the only place the *published*
