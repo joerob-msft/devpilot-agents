@@ -306,6 +306,12 @@ function New-CohortEntryFixture {
         BranchBody = [ordered]@{ name = $targetRefName; objectId = $targetCommit }
         ChangesBody = [ordered]@{
             iterationId = 3
+            # The wrapper answers these on EVERY change response and writes them
+            # as zero to mean "there is no next page". A fixture without them is
+            # a shape no provider produces, and a completeness check written
+            # against it can pass while refusing every real capture.
+            nextSkip = 0
+            nextTop = 0
             changes = @(
                 [ordered]@{ changeId = 1; changeType = 'Edit'; item = [ordered]@{ path = '/src/a.ps1'; isFolder = $false } },
                 [ordered]@{ changeId = 2; changeType = 'Add'; item = [ordered]@{ path = '/src/b.ps1'; isFolder = $false } },
@@ -317,6 +323,8 @@ function New-CohortEntryFixture {
         # moving the census the span belongs to.
         DiffChangesBody = [ordered]@{
             iterationId = 3
+            nextSkip = 0
+            nextTop = 0
             changes = @(
                 [ordered]@{
                     changeId = 1; changeType = 'Edit'; item = [ordered]@{ path = '/src/a.ps1'; isFolder = $false }
@@ -1145,45 +1153,119 @@ function Get-InlineMcpReads {
         [Parameter(Mandatory)][string]$ToolName,
         [Parameter(Mandatory)][scriptblock]$ActionMatcher
     )
+    # The wrapper is reached two ways: by name, and through a function reference
+    # captured into a variable so a closure can carry it. Both are the same call
+    # and both must be walked - the second is what the aggregate readers use, so
+    # a walk that only knows the first is blind to exactly the sites this change
+    # converted.
+    # An argument vector reaches the wrapper wearing whatever parentheses and
+    # casts the call site needed - ([hashtable]$request.Arguments) is the shape
+    # this change produces everywhere. Peel those off on the tree rather than
+    # off the text: a text peel has to anticipate the spacing and the nesting,
+    # and gets the answer wrong in the safe direction, which here means calling
+    # a converted site inline and burying the guard in false alarms.
+    $unwrapAst = {
+        param($node)
+        while ($true) {
+            if ($node -is [System.Management.Automation.Language.ParenExpressionAst]) {
+                $inner = @($node.Pipeline.PipelineElements)[0]
+                if ($inner -isnot [System.Management.Automation.Language.CommandExpressionAst]) { break }
+                $node = $inner.Expression
+                continue
+            }
+            if ($node -is [System.Management.Automation.Language.ConvertExpressionAst]) { $node = $node.Child; continue }
+            break
+        }
+        return $node
+    }
+    $invokerVariables = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($assignment in @($Ast.FindAll({
+                    param($node) $node -is [System.Management.Automation.Language.AssignmentStatementAst]
+                }, $true))) {
+        if ($assignment.Left -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+        if ([string]$assignment.Right.Extent.Text -notmatch '\$\{?function:Invoke-AgentMcpTool\}?') { continue }
+        [void]$invokerVariables.Add([string]$assignment.Left.VariablePath.UserPath)
+    }
     return @(
         $Ast.FindAll({
                 param($node)
                 if ($node -isnot [System.Management.Automation.Language.CommandAst]) { return $false }
-                if ([string]$node.GetCommandName() -cne 'Invoke-AgentMcpTool') { return $false }
-                $elements = @($node.CommandElements)
-                $named = @{}
-                for ($i = 0; $i -lt $elements.Count - 1; $i++) {
-                    if ($elements[$i] -is [System.Management.Automation.Language.CommandParameterAst]) {
-                        $named[[string]$elements[$i].ParameterName] = $elements[$i + 1]
-                    }
-                }
-                $nameAst = $named['Name']
-                if ($nameAst -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { return $false }
-                if ([string]$nameAst.Value -cne $ToolName) { return $false }
-                return $true
+                if ([string]$node.GetCommandName() -ceq 'Invoke-AgentMcpTool') { return $true }
+                $first = @($node.CommandElements)[0]
+                if ($first -isnot [System.Management.Automation.Language.VariableExpressionAst]) { return $false }
+                return $invokerVariables.Contains([string]$first.VariablePath.UserPath)
             }, $true) |
             Where-Object {
                 $elements = @($_.CommandElements)
                 $argumentsAst = $null
+                $nameAst = $null
                 for ($i = 0; $i -lt $elements.Count - 1; $i++) {
-                    if ($elements[$i] -is [System.Management.Automation.Language.CommandParameterAst] -and
-                        [string]$elements[$i].ParameterName -eq 'Arguments') { $argumentsAst = $elements[$i + 1] }
+                    if ($elements[$i] -isnot [System.Management.Automation.Language.CommandParameterAst]) { continue }
+                    switch ([string]$elements[$i].ParameterName) {
+                        'Arguments' { $argumentsAst = (& $unwrapAst $elements[$i + 1]) }
+                        'Name' { $nameAst = (& $unwrapAst $elements[$i + 1]) }
+                    }
                 }
+                # A call that names a DIFFERENT tool outright is a different
+                # contract and is left alone. Anything whose tool cannot be read
+                # is inspected rather than waved through, because "unreadable"
+                # is what every bypass looks like.
+                if ($nameAst -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+                    [string]$nameAst.Value -cne $ToolName) { return $false }
+                # Both halves taken from one shared-constructor result is the
+                # shape this change exists to produce.
+                if ($nameAst -is [System.Management.Automation.Language.MemberExpressionAst] -and
+                    $argumentsAst -is [System.Management.Automation.Language.MemberExpressionAst] -and
+                    [string]$nameAst.Member.Extent.Text -eq 'Name' -and
+                    [string]$argumentsAst.Member.Extent.Text -eq 'Arguments' -and
+                    [string]$nameAst.Expression.Extent.Text -ceq [string]$argumentsAst.Expression.Extent.Text) { return $false }
                 if ($argumentsAst -is [System.Management.Automation.Language.HashtableAst]) {
                     return (& $ActionMatcher $argumentsAst)
                 }
                 if ($argumentsAst -isnot [System.Management.Automation.Language.VariableExpressionAst]) { return $true }
                 $scope = $_
                 while ($null -ne $scope -and
-                    $scope -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $scope = $scope.Parent }
+                    $scope -isnot [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                    $scope -isnot [System.Management.Automation.Language.ScriptBlockExpressionAst]) { $scope = $scope.Parent }
                 if ($null -eq $scope) { return $true }
                 $variableName = [string]$argumentsAst.VariablePath.UserPath
-                $seeded = @($scope.FindAll({
+                # A vector that arrives as a PARAMETER is not authored here, so
+                # this is not the site that could restate it. The paginated
+                # contract's own invoker is exactly this shape.
+                $parameters = @()
+                if ($scope -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+                    if ($null -ne $scope.Body.ParamBlock) { $parameters += @($scope.Body.ParamBlock.Parameters) }
+                    if ($null -ne $scope.Parameters) { $parameters += @($scope.Parameters) }
+                }
+                elseif ($null -ne $scope.ScriptBlock.ParamBlock) { $parameters = @($scope.ScriptBlock.ParamBlock.Parameters) }
+                foreach ($parameter in @($parameters | Where-Object { $null -ne $_ })) {
+                    if ([string]$parameter.Name.VariablePath.UserPath -eq $variableName) { return $false }
+                }
+                $assignments = @($scope.FindAll({
                             param($inner)
                             if ($inner -isnot [System.Management.Automation.Language.AssignmentStatementAst]) { return $false }
-                            if ($inner.Left -isnot [System.Management.Automation.Language.VariableExpressionAst]) { return $false }
-                            return ([string]$inner.Left.VariablePath.UserPath -eq $variableName)
-                        }, $true) |
+                            return ([string]$inner.Left.Extent.Text -match
+                                ('^\$' + [regex]::Escape($variableName) + '(\[|\.|$)'))
+                        }, $true))
+                # A hashtable filled in after it was created cannot be read off
+                # its literal alone. Only the key that decides the contract
+                # matters: a later write to 'action' - or to a key that cannot be
+                # read at all - defeats the literal and is flagged, while the
+                # anchor fields the thread WRITE fills in conditionally are not
+                # the action and leave the answer intact.
+                foreach ($assignment in $assignments) {
+                    if ($assignment.Left -is [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+                    $keyAst = $null
+                    if ($assignment.Left -is [System.Management.Automation.Language.IndexExpressionAst]) {
+                        $keyAst = (& $unwrapAst $assignment.Left.Index)
+                    }
+                    elseif ($assignment.Left -is [System.Management.Automation.Language.MemberExpressionAst]) {
+                        $keyAst = $assignment.Left.Member
+                    }
+                    if ($keyAst -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { return $true }
+                    if ([string]$keyAst.Value -match 'action') { return $true }
+                }
+                $seeded = @($assignments |
                         ForEach-Object { $_.Right.Find({
                                     param($inner) $inner -is [System.Management.Automation.Language.HashtableAst]
                                 }, $true) } |
@@ -1243,8 +1325,37 @@ $inlineGetChangesReads = @(Get-InlineMcpReads -Ast $reviewerAgentAst `
         -ToolName (Get-ReviewerChangeListToolName) -ActionMatcher $getChangesActionInHashtable)
 Assert-CohortEntry -Name "the live reviewer builds its change reads through the shared constructor only ($($inlineGetChangesReads.Count) inline)" `
     -Condition (
-        ([regex]::Matches($reviewerAgentBody, 'New-ReviewerChangeListRequest\s+-Project').Count -ge 4) -and
+        ([regex]::Matches($reviewerAgentBody, 'New-ReviewerChangeListRequest\s+-Project').Count -eq 5) -and
         ($inlineGetChangesReads.Count -eq 0))
+# and the stronger statement the call-site walk cannot make on its own. A walk
+# can always be routed around - through a wrapper, a splat, a hashtable filled in
+# after it was built - so this asks a question with no such escapes: does a
+# hashtable naming this action EXIST anywhere in the file, reached or not? The
+# action string is unique to this one contract, so the answer is exact, and the
+# only way past it is to compute the string, which is not a thing this code does
+# anywhere.
+$getChangesLiterals = @{}
+foreach ($scannedFile in @(
+        'src/Agents/reviewer/Start-ReviewerAgent.ps1',
+        'src/Agents/reviewer/CohortEntryEvidence.ps1',
+        'src/Agents/reviewer/CohortEntryBuilder.ps1')) {
+    $scannedAst = [System.Management.Automation.Language.Parser]::ParseFile(
+        (Join-Path $repoRoot $scannedFile), [ref]$null, [ref]$null)
+    $getChangesLiterals[$scannedFile] = @($scannedAst.FindAll({
+                param($node) $node -is [System.Management.Automation.Language.HashtableAst]
+            }, $true) | Where-Object { & $getChangesActionInHashtable $_ }).Count
+}
+Assert-CohortEntry -Name "no change-read vector is written outside the shared constructor ($(($getChangesLiterals.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' '))" `
+    -Condition (@($getChangesLiterals.Values | Where-Object { $_ -ne 0 }).Count -eq 0)
+# and the same scan finds the one in the library, so it is not passing by
+# looking for something that never existed.
+$transportGetChangesLiterals = @(
+    [System.Management.Automation.Language.Parser]::ParseFile(
+        (Join-Path $repoRoot 'src/Agents/reviewer/SourceTransport.ps1'), [ref]$null, [ref]$null).FindAll({
+            param($node) $node -is [System.Management.Automation.Language.HashtableAst]
+        }, $true) | Where-Object { & $getChangesActionInHashtable $_ })
+Assert-CohortEntry -Name "the change-read vector is written in the library that owns it ($($transportGetChangesLiterals.Count))" `
+    -Condition ($transportGetChangesLiterals.Count -ge 1)
 # Other actions on the same tool are a different contract and must stay
 # reachable, so the walk has to discriminate on the ACTION rather than the tool.
 # If it did not, this count would be zero and the guard above would be passing
@@ -1252,6 +1363,57 @@ Assert-CohortEntry -Name "the live reviewer builds its change reads through the 
 Assert-CohortEntry -Name 'the change-read guard leaves the other repo_pull_request actions alone' `
     -Condition (@(Get-InlineMcpReads -Ast $reviewerAgentAst -ToolName (Get-ReviewerChangeListToolName) `
                 -ActionMatcher { param($hashtableAst) $true }).Count -gt 0)
+# A guard that has never been shown to fail is a guard nobody has read. Every
+# bypass the walk was built to catch is stated here as code and fed through it,
+# so "0 inline" above means the walk looked and found nothing rather than the
+# walk being blind. Three of these - the ampersand-invoked reference, the tool
+# name behind a variable, the hashtable filled in after it was built - are shapes
+# an earlier version of this walk waved through, which is why they are written
+# down rather than remembered.
+$guardBypassCases = @(
+    @{ Name = 'a plain named call with an inline vector'; Expect = 1; Body = @'
+function Probe { Invoke-AgentMcpTool -Session $s -Name 'repo_pull_request' -Arguments @{ action = 'get_changes'; top = 61 } }
+'@ },
+    @{ Name = 'the wrapper reached through a function reference'; Expect = 1; Body = @'
+function Probe { $i = ${function:Invoke-AgentMcpTool}
+    & $i -Session $s -Name 'repo_pull_request' -Arguments @{ action = 'get_changes'; top = 61 } }
+'@ },
+    @{ Name = 'a vector filled in after it was created'; Expect = 1; Body = @'
+function Probe { $a = @{}
+    $a['action'] = 'get_changes'
+    Invoke-AgentMcpTool -Session $s -Name 'repo_pull_request' -Arguments $a }
+'@ },
+    @{ Name = 'the tool name hidden behind a variable'; Expect = 1; Body = @'
+function Probe { $t = 'repo_pull_request'
+    Invoke-AgentMcpTool -Session $s -Name $t -Arguments @{ action = 'get_changes'; top = 61 } }
+'@ },
+    @{ Name = 'a vector hoisted into a local'; Expect = 1; Body = @'
+function Probe { $v = @{ action = 'get_changes'; top = 61 }
+    Invoke-AgentMcpTool -Session $s -Name 'repo_pull_request' -Arguments $v }
+'@ },
+    @{ Name = 'a key computed at run time'; Expect = 1; Body = @'
+function Probe { $v = @{ top = 61 }
+    $k = 'act' + 'ion'
+    $v[$k] = 'get_changes'
+    Invoke-AgentMcpTool -Session $s -Name 'repo_pull_request' -Arguments $v }
+'@ },
+    @{ Name = 'the converted shared-constructor site'; Expect = 0; Body = @'
+function Probe { $r = New-ReviewerChangeListRequest -Project $p -RepositoryName $n -PullRequestId $i
+    Invoke-AgentMcpTool -Session $s -Name $r.Name -Arguments ([hashtable]$r.Arguments) }
+'@ },
+    @{ Name = 'a different action on the same tool'; Expect = 0; Body = @'
+function Probe { Invoke-AgentMcpTool -Session $s -Name 'repo_pull_request' -Arguments @{ action = 'get_pull_request'; pullRequestId = 1 } }
+'@ },
+    @{ Name = 'a vector that arrives as a parameter'; Expect = 0; Body = @'
+function Probe { param($Arguments)
+    Invoke-AgentMcpTool -Session $s -Name 'repo_pull_request' -Arguments $Arguments }
+'@ })
+$guardBypassMisses = @($guardBypassCases | Where-Object {
+        @(Get-InlineMcpReads -ToolName (Get-ReviewerChangeListToolName) -ActionMatcher $getChangesActionInHashtable `
+                -Ast ([System.Management.Automation.Language.Parser]::ParseInput($_.Body, [ref]$null, [ref]$null))).Count -ne $_.Expect
+    })
+Assert-CohortEntry -Name "the read guard answers every known bypass shape correctly ($($guardBypassCases.Count - $guardBypassMisses.Count)/$($guardBypassCases.Count)$(if ($guardBypassMisses.Count) { ': ' + (($guardBypassMisses | ForEach-Object { $_.Name }) -join '; ') }))" `
+    -Condition ($guardBypassMisses.Count -eq 0)
 # Neither the evidence plan nor the builder may spell the action at all: both now
 # take the whole vector from the shared constructor, so a quoted 'get_changes'
 # anywhere in either file is a second author.
@@ -1261,13 +1423,26 @@ Assert-CohortEntry -Name 'the builder restates neither change-read variant' `
         ([regex]::Matches($builderBody, "['`"]get_changes['`"]").Count -eq 0) -and
         ($evidenceBody -cnotmatch '(?m)top\s*=\s*\(?\s*\$Request\.MaxChangedFiles'))
 $changePageRestatements = 0
-foreach ($restatementBody in @($reviewerAgentBody, $evidenceBody, $builderBody)) {
+foreach ($restatementBody in @($reviewerAgentBody, $evidenceBody, $builderBody,
+        [IO.File]::ReadAllText((Join-Path $repoRoot 'src/Agents/reviewer/ConventionPacks.ps1')))) {
     $changePageRestatements += [regex]::Matches($restatementBody, '\btop\s*=\s*1000\b').Count
     $changePageRestatements += [regex]::Matches($restatementBody, '-Limit\s+1000\b').Count
+    $changePageRestatements += [regex]::Matches($restatementBody, '\$Limit\s*=\s*1000\b').Count
 }
 Assert-CohortEntry -Name "the shared change page size is written down exactly once ($changePageRestatements restatements)" `
     -Condition ($changePageRestatements -eq 0 -and
         [regex]::Matches($sourceTransportBody, '(?m)^\s*return\s+1000\b').Count -eq 1)
+# The request schema states the same ceiling a second time, in a language the
+# reader cannot call into. So it is compared here instead: a schema that admits
+# a cap the reader refuses turns a fixable request into an unexplained failure
+# one layer down.
+foreach ($schemaVersionName in @('v1', 'v2')) {
+    $capSchema = Get-Content -LiteralPath (Join-Path $repoRoot `
+            "src/Agents/reviewer/schemas/reviewer.cohort-entry-evidence-request.$schemaVersionName.json") -Raw |
+        ConvertFrom-Json -Depth 32
+    Assert-CohortEntry -Name "the $schemaVersionName request schema caps maxChangedFiles at the reviewer's own page" `
+        -Condition ([int]$capSchema.properties.coverage.properties.maxChangedFiles.maximum -eq (Get-ReviewerChangeListTop))
+}
 # and the two change ceilings are two failures with opposite answers, exactly as
 # the thread pair is: CE402 says the operator authorized fewer files than this
 # subject has, CE409 says nobody can tell how many it has.
@@ -2123,10 +2298,35 @@ Invoke-CohortEntryCase -Name 'a change set stating it has more changes' -Expecte
     param($state) $state.ChangesBody['hasMoreChanges'] = $true
 }
 
-# and a continuation field that says the opposite is not a refusal. Without this
-# the two cases above would pass for a provider that always answers 'false'.
+Invoke-CohortEntryCase -Name 'a change set naming the skip a next page would start at' -ExpectedCode 'CE409' -Mutate {
+    param($state) $state.ChangesBody['nextSkip'] = 3
+}
+
+Invoke-CohortEntryCase -Name 'a change set naming the size a next page would have' -ExpectedCode 'CE409' -Mutate {
+    param($state) $state.ChangesBody['nextTop'] = 1000
+}
+
+Invoke-CohortEntryCase -Name 'a change set whose page position is not a number' -ExpectedCode 'CE210' -Mutate {
+    param($state) $state.ChangesBody['nextSkip'] = 'more'
+}
+
+# The other half of the same rule, and the half that matters most: the wrapper
+# writes these fields on EVERY response, so a check that refuses on their
+# presence refuses every well-formed capture. The transport's own binding
+# requires nextSkip and nextTop to be zero exactly when there is no next page,
+# and that is the reading used here.
+Invoke-CohortEntryCase -Name 'a change set whose page position is the zero that means no next page' -ExpectedCode '' -Mutate {
+    param($state)
+    $state.ChangesBody['nextSkip'] = 0
+    $state.ChangesBody['nextTop'] = 0
+}
+
 Invoke-CohortEntryCase -Name 'a change set stating it has no more changes' -ExpectedCode '' -Mutate {
     param($state) $state.ChangesBody['hasMoreChanges'] = $false
+}
+
+Invoke-CohortEntryCase -Name 'a change set carrying an empty continuation token' -ExpectedCode '' -Mutate {
+    param($state) $state.ChangesBody['continuationToken'] = ''
 }
 
 Invoke-CohortEntryCase -Name 'a file served under a URI nobody requested' -ExpectedCode 'CE304' -Mutate {

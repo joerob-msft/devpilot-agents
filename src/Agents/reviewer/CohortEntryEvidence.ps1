@@ -1287,6 +1287,31 @@ function Get-ReviewerCohortEntryProperty {
     return $Object.$Name
 }
 
+function Get-ReviewerCohortEntryOptionalValue {
+    <#
+    .SYNOPSIS
+        One property of a parsed provider result if it is there, $null if it is
+        not, over either shape the JSON reader can hand back.
+
+    .DESCRIPTION
+        Absence and a null value are deliberately the same answer. Every caller
+        of this reads a field whose meaning is "if this is set, it says
+        something", and a field that is present and null says nothing.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowNull()]$Object,
+        [Parameter(Mandatory)][string]$Name
+    )
+    if ($null -eq $Object) { return $null }
+    if ($Object -is [System.Collections.IDictionary]) {
+        if (-not $Object.Contains($Name)) { return $null }
+        return $Object[$Name]
+    }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
 function Assert-ReviewerCohortEntryRepositoryIdentity {
     <#
     .SYNOPSIS
@@ -1579,25 +1604,35 @@ function Get-ReviewerCohortEntryChangedPathCensus {
             -Detail ("The change set came back with $($entries.Count) entries, filling the page of " +
                 "$changePageLimit the reviewer's own read asks for, so it cannot be shown to be the whole set.")
     }
-    # A stated continuation is the same doubt arriving explicitly. It is refused
-    # even below the page, because the only honest reading of "there is more" is
-    # that this response is not the change set.
-    foreach ($moreName in @('continuationToken', 'nextLink', '@odata.nextLink', 'nextSkip', 'hasMoreChanges')) {
-        $moreValue = $null
-        if ($Changes -is [System.Collections.IDictionary]) {
-            if (-not $Changes.Contains($moreName)) { continue }
-            $moreValue = $Changes[$moreName]
-        }
-        else {
-            $moreProperty = $Changes.PSObject.Properties[$moreName]
-            if ($null -eq $moreProperty) { continue }
-            $moreValue = $moreProperty.Value
-        }
+    # A stated continuation is the same doubt arriving explicitly, and is refused
+    # even below the page. What counts as "stated" is the transport's own
+    # definition, not the mere presence of a field: the wrapper answers
+    # nextSkip/nextTop on EVERY response and writes them as zero to mean "there
+    # is no next page" - `Get-ReviewerSourceIterationPageBinding` requires
+    # exactly that when hasMoreChanges is false. Refusing on presence would
+    # refuse every well-formed single-page answer the provider gives.
+    $continuationDetail = ''
+    foreach ($moreName in @('continuationToken', 'nextLink', '@odata.nextLink')) {
+        $moreValue = Get-ReviewerCohortEntryOptionalValue -Object $Changes -Name $moreName
         if ($null -eq $moreValue) { continue }
-        if ($moreValue -is [string] -and [string]::IsNullOrEmpty($moreValue)) { continue }
-        if ($moreValue -is [bool] -and -not $moreValue) { continue }
+        if ([string]::IsNullOrEmpty([string]$moreValue)) { continue }
+        $continuationDetail = "carries a non-empty '$moreName'"
+    }
+    foreach ($moreName in @('nextSkip', 'nextTop')) {
+        $moreValue = Get-ReviewerCohortEntryOptionalValue -Object $Changes -Name $moreName
+        if ($null -eq $moreValue) { continue }
+        $moreNumber = 0L
+        if (-not [long]::TryParse([string]$moreValue, [ref]$moreNumber)) {
+            New-ReviewerCohortEntryRefusal -Code 'CE210' `
+                -Detail "The change set's '$moreName' is not an integer, so no page position can be read from it."
+        }
+        if ($moreNumber -gt 0) { $continuationDetail = "sets '$moreName' to $moreNumber" }
+    }
+    $hasMoreChanges = Get-ReviewerCohortEntryOptionalValue -Object $Changes -Name 'hasMoreChanges'
+    if ($null -ne $hasMoreChanges -and [bool]$hasMoreChanges) { $continuationDetail = "states 'hasMoreChanges'" }
+    if ($continuationDetail) {
         New-ReviewerCohortEntryRefusal -Code 'CE409' `
-            -Detail "The change set carries '$moreName', so it states that another page follows it."
+            -Detail "The change set $continuationDetail, so it states that another page follows it."
     }
     # An empty authoritative census is refused rather than published. A package
     # built from it would declare 100% coverage of nothing and an empty

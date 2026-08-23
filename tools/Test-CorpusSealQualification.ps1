@@ -335,7 +335,7 @@ function New-SealRecipe {
             },
             [ordered]@{
                 tool = "repo_pull_request"
-                arguments = [ordered]@{ action = "get_changes"; project = $project; repositoryId = $repositoryName; pullRequestId = $pullRequestId; iterationId = $iterationId; top = 1000 }
+                arguments = [ordered]@{ action = "get_changes"; project = $project; repositoryId = $repositoryName; pullRequestId = $pullRequestId; iterationId = $iterationId; top = (Get-ReviewerChangeListTop) }
                 envelope = "mcpTextContent"
                 payloadFile = "payloads/changes.json"
                 corpusPayload = (New-BoundDeclaration -Relative "live/changes.json" -Text $changeSetText)
