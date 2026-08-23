@@ -114,8 +114,12 @@
       },
       {
         "sha256": "f09eb97aefdd2ef05aaa303a1e57167e176280d06d3ccfa3be1a90cefecba37e",
-        "reason": "CURRENT and authoritative. Accept the bound project explicitly instead of through dynamic scope, and fail closed before launch if the ordered scaffold keys ever drift from the production marker schema."
-      }
+        "reason": "History only, superseded below. Accept the bound project explicitly instead of through dynamic scope, and fail closed before launch if the ordered scaffold keys ever drift from the production marker schema."
+      },
+    {
+      "sha256": "d4de522080a6463da9a85bdc33b781f4c943447c897801b2eab500de974ba71e",
+      "reason": "CURRENT and authoritative. Issue the nonce to the generalist as a standalone challenge line and publish the closed v2 payload shape alongside the existing scaffold, which remains a formatting aid only."
+    }
     ],
     "Invoke-ReviewerModelPass": [
       {
@@ -160,8 +164,12 @@
       },
       {
         "sha256": "2d61a146e738376f65a954fb5eced57a8e47948882217ed149e3113dd56ddf40",
-        "reason": "CURRENT and authoritative. Pass the expected project explicitly into the runtime-context builder so the scaffold's trusted project binding cannot depend on PowerShell dynamic scope; model launch behavior is otherwise unchanged."
-      }
+        "reason": "History only, superseded below. Pass the expected project explicitly into the runtime-context builder so the scaffold's trusted project binding cannot depend on PowerShell dynamic scope; model launch behavior is otherwise unchanged."
+      },
+    {
+      "sha256": "188345f9fc878e9913281baa4cf901b43d806200d0c676b154a4656a70efe3c5",
+      "reason": "CURRENT and authoritative. Read the generalist answer under the v2 two-part response contract in addition to the v1 marker, seal the result into a signed response envelope that is persisted per attempt, and classify an answer whose nonce challenge line is absent as evidenceOnly - kept and counted, never voted."
+    }
     ],
     "Invoke-ReviewerPullRequest": [
       {
@@ -194,8 +202,12 @@
       },
       {
         "sha256": "404ec46ae7d3875731a9ed0c7d153b02d2b7af290016e4b2a6d09edfd4ff5d69",
-        "reason": "CURRENT and authoritative. Publish the generalist attempt-accounting record through Write-ReviewerModelStartAccounting instead of the plain cycle writer, so a failure to record a model start that was really made is fatal rather than swallowed into a run that would still report a complete, exact census. Only the writer the record travels through changed: the record's own fields, and every gate, launch, retry, discovery, cross-verification and delivery decision in this function, are untouched, and the disabled generalist paths are unchanged."
-      }
+        "reason": "History only, superseded below. Publish the generalist attempt-accounting record through Write-ReviewerModelStartAccounting instead of the plain cycle writer, so a failure to record a model start that was really made is fatal rather than swallowed into a run that would still report a complete, exact census. Only the writer the record travels through changed: the record's own fields, and every gate, launch, retry, discovery, cross-verification and delivery decision in this function, are untouched, and the disabled generalist paths are unchanged."
+      },
+    {
+      "sha256": "000a76163440579cffc881e7cfc58e4ec48ff4237b2c6d555b60114015736928",
+      "reason": "CURRENT and authoritative. Record the v2 auth tier per attempt and per pass so an evidenceOnly reviewer appears in the census as a reviewer that answered, and make evidenceOnly terminal rather than spending a retry on evidence already in hand."
+    }
     ],
     "Write-ReviewerConventionSpecialistPreview": [
       {
@@ -252,7 +264,11 @@
     },
     {
       "sha256": "2078d187724bbf545e4c34c7284cac955b01d911e9c31a1416b75f3c5cc8f4bf",
-      "reason": "CURRENT and authoritative. Preserve the scaffold-only top-level contract while restoring the exact ordered finding-item keys that an empty findings array cannot demonstrate, and explicitly emit the inner scaffold rather than its runtime-data envelope."
-    }
+      "reason": "History only, superseded below. Preserve the scaffold-only top-level contract while restoring the exact ordered finding-item keys that an empty findings array cannot demonstrate, and explicitly emit the inner scaffold rather than its runtime-data envelope."
+    },
+  {
+    "sha256": "c79337f2fb57b0fac1b34c11a01c47c16c6252ea188f19ec001582ba98c04017",
+    "reason": "CURRENT and authoritative. Describe the v2 two-part response contract as the current generalist emission path, keep the v1 single-marker contract as the documented legacy path, and state what omitting the nonce line costs."
+  }
   ]
 }

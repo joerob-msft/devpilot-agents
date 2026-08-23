@@ -279,6 +279,14 @@ jobs:
         shell: pwsh
         run: ./tools/Test-ConventionSpecialist.ps1
 
+      # The v2 generalist response contract: nonce challenge extraction, payload
+      # bounds, auth-tier classification, envelope sealing, and the offline
+      # adapter round trip. Offline by construction - the only process it starts
+      # is the committed deterministic adapter.
+      - name: generalist model response envelope v2
+        shell: pwsh
+        run: ./tools/Test-ReviewerModelResponseEnvelope.ps1
+
       # Layer 9: offline snapshot replay of the whole read seam, and the
       # specialist's rule-coverage accounting. Offline by construction: the
       # checks drive a committed synthetic snapshot with no host, no network

@@ -178,6 +178,46 @@ try {
     }
 
     if ($behavior -in 'stdoutSaturation', 'stderrSaturation') { exit 0 }
+    # The v2 generalist response contract, when the role pre-authors one. It is
+    # emitted ALONGSIDE the v1 marker rather than instead of it, because the
+    # wrapper reads both and the fixtures have to be able to exercise the two
+    # contracts disagreeing. Prefixes are pre-authored in the manifest, never
+    # known to this script: an adapter that carried production's marker
+    # constants could pass a fixture the production parser would reject.
+    $responseV2Text = ''
+    $emitAssistantEvent = $true
+    if ($roleSpec.PSObject.Properties['responseV2']) {
+        $v2 = $roleSpec.responseV2
+        $v2Mode = [string]$v2.mode
+        $v2Payload = Expand-AdapterTemplate -Value $v2.payloadTemplate -Context $context
+        $v2PayloadJson = ConvertTo-Json -InputObject $v2Payload -Depth 64 -Compress
+        $v2Nonce = [string]$binding.nonce
+        if ($v2Mode -eq 'wrongNonce') { $v2Nonce = 'wrong-nonce' }
+        $v2Lines = [System.Collections.Generic.List[string]]::new()
+        # nonceAbsent is the exact Opus behaviour this contract exists for: a
+        # complete, well-formed answer with the challenge line simply not
+        # written. It must reach the wrapper as evidence, not as nothing.
+        if ($v2Mode -cne 'nonceAbsent') {
+            $v2Lines.Add("$([string]$v2.noncePrefix) $v2Nonce")
+        }
+        $v2Lines.Add("$([string]$v2.payloadPrefix) $v2PayloadJson")
+        if ($v2Mode -eq 'conflictingPayload') {
+            $conflicting = Expand-AdapterTemplate -Value $v2.payloadTemplate -Context $context
+            $conflicting.summary = "$([string]$conflicting.summary) (restated differently)"
+            $v2Lines.Add("$([string]$v2.payloadPrefix) $(ConvertTo-Json -InputObject $conflicting -Depth 64 -Compress)")
+        }
+        if ($v2Mode -eq 'duplicatePayload') {
+            $v2Lines.Add("$([string]$v2.payloadPrefix) $v2PayloadJson")
+        }
+        $responseV2Text = [string]::Join("`n", $v2Lines)
+        # noAssistantEvents models the environment fault where the CLI produced
+        # output but never framed an assistant turn. The text still lands on raw
+        # stdout so the fallback path has something to find and downgrade.
+        if ($v2Mode -eq 'noAssistantEvents') { $emitAssistantEvent = $false }
+    }
+    if ($responseV2Text) {
+        $answer = if ($answer) { "$answer`n$responseV2Text" } else { $responseV2Text }
+    }
     # The reported CLI-envelope model is the run model unless the role pre-authors a
     # reportedModelOverride, which drives the verifier's exact-production modelMismatch
     # classification (the envelope model != the authorized verifier model). This never
@@ -187,10 +227,15 @@ try {
         $override = [string]$roleSpec.reportedModelOverride
         if ($override) { $reportedModel = $override }
     }
-    [pscustomobject]@{
-        type = 'assistant.message'
-        data = [pscustomobject]@{ content = $answer; model = $reportedModel }
-    } | ConvertTo-Json -Compress -Depth 8
+    if ($emitAssistantEvent) {
+        [pscustomobject]@{
+            type = 'assistant.message'
+            data = [pscustomobject]@{ content = $answer; model = $reportedModel }
+        } | ConvertTo-Json -Compress -Depth 8
+    }
+    else {
+        [Console]::Out.Write("$answer`n")
+    }
     [pscustomobject]@{
         type = 'result'
         exitCode = 0
