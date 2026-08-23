@@ -826,32 +826,40 @@ function New-ReviewerCohortEntryEvidence {
 
     # A slots-carrying entry is a claim that a cohort may LAUNCH it. Nothing in
     # the package can substantiate that claim on its own: the launch
-    # authorization is minted by the run set declaration, which happens after
-    # publish, against the published request. So the claim is settled here, on
-    # the real preparation, and an entry that cannot substantiate it is refused
-    # rather than published as if it could - which is exactly what a cohort
-    # spending its one authorized execution on a token that was never going to
-    # exist would otherwise discover at the first slot prelaunch.
+    # authorization is minted by the run set declaration, which runs against the
+    # published request and so cannot precede the publish. The claim is settled
+    # here, on the real preparation, and an entry that cannot substantiate it is
+    # WITHDRAWN - the package it published is deleted - rather than left on disk
+    # where a manifest could name it. Otherwise a cohort would spend its one
+    # authorized execution on a token that was never going to exist, and find out
+    # at the first slot prelaunch.
     $launchAuthorization = $null
     $cohortReady = $false
     if ($null -ne $executionPlan) {
         if ($PreparationOnly) {
             # An explicit, recorded claim of NOT being ready. The entry is still
             # built and still sealed - that is how a slots-carrying request is
-            # exercised without an operator key - but the operator is told in the
-            # result, and the cohort runner refuses it at its pre-walk pass
-            # because the authorization it names does not exist yet.
+            # exercised without an operator key - but it carries no declared run
+            # set, so a cohort that names it runs the preparation from scratch
+            # and mints the authorization itself rather than trusting one.
             Write-Verbose "The entry declares $(@($executionPlan.Slots).Count) slot(s) and was built -PreparationOnly; it is not cohort-ready."
         }
         elseif ($preflightState -cne 'runSetReady') {
+            Remove-ReviewerCohortEntryPublishedPackage -Root $published
             New-ReviewerCohortEntryRefusal -Code 'CE715' `
-                -Detail ("The request declares $(@($executionPlan.Slots).Count) slot(s) and this build reached '$preflightState'. " +
+                -Detail ("The request declares $(@($executionPlan.Slots).Count) slot(s) and this build reached '$preflightState'; its package has been withdrawn. " +
                     "Run with -Preflight -PreflightTarget runSetReady so the preparation declares the run set and mints the launch authorization this entry names, " +
                     "or pass -PreparationOnly to build an entry that states it is not cohort-ready.")
         }
         else {
-            $launchAuthorization = Assert-ReviewerCohortEntryLaunchAuthorization `
-                -PreparationOutputRoot $preparationOutputRoot -CoordinatorRequestSha256 $coordinatorRequestSha
+            try {
+                $launchAuthorization = Assert-ReviewerCohortEntryLaunchAuthorization `
+                    -PreparationOutputRoot $preparationOutputRoot -CoordinatorRequestSha256 $coordinatorRequestSha
+            }
+            catch {
+                Remove-ReviewerCohortEntryPublishedPackage -Root $published
+                throw
+            }
             $cohortReady = $true
         }
     }

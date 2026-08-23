@@ -1617,6 +1617,34 @@ function Publish-ReviewerCohortEntryPackage {
     return $destination
 }
 
+function Remove-ReviewerCohortEntryPublishedPackage {
+    <#
+    .SYNOPSIS
+        Withdraws a published package, frozen files and all.
+
+    .DESCRIPTION
+        Publishing has to happen before the preparation runs, because the
+        preparation reads the published, read-only request. So a build can only
+        discover after publishing that the entry it made is not one a cohort may
+        launch. Leaving that package on disk would be the whole defect back
+        again: a sealed, seal-verifiable, read-only directory that a manifest
+        could name, indistinguishable from one that reached a declared run set.
+        A refusal therefore takes its evidence with it.
+
+        Read-only is cleared deepest-first before the delete, because that is the
+        attribute publication set on every file and Remove-Item will not delete
+        through it.
+    #>
+    param([Parameter(Mandatory)][string]$Root)
+    $root = [IO.Path]::GetFullPath($Root)
+    if (-not (Test-Path -LiteralPath $root)) { return }
+    $files = @(Get-ChildItem -LiteralPath $root -Recurse -Force -File)
+    foreach ($file in $files) {
+        $file.Attributes = $file.Attributes -band (-bnot [IO.FileAttributes]::ReadOnly)
+    }
+    Remove-Item -LiteralPath $root -Force -Recurse
+}
+
 function Assert-ReviewerCohortEntryLaunchAuthorization {
     <#
     .SYNOPSIS
@@ -1718,8 +1746,17 @@ function Assert-ReviewerCohortEntryLaunchAuthorization {
 
     # The coordinator's OWN answer about the declaration it verified, bound to
     # the bytes on disk now. It lives in the state transition rather than in the
-    # child result, and the state carries an HMAC over the whole transition list,
-    # so this is the authenticated record of what was verified.
+    # child result.
+    #
+    # The record is read as text here and its HMAC is NOT recomputed - that would
+    # be a second derivation of a composition the coordinator owns, and this
+    # build holds no independent reason to trust its own copy of the answer over
+    # the coordinator's. What makes the record trustworthy at this instant is
+    # that the preflight immediately above ran the typed coordinator over this
+    # very root under the operator's key, and every one of its children loaded
+    # this record through the signed loader before doing anything. A record that
+    # did not match its signature would have refused the preflight this assert
+    # only runs after.
     $verifiedTransition = [object[]]@($state.transitions | Where-Object { ([string]$_.state) -ceq 'runSetVerified' })
     if ($verifiedTransition.Count -ne 1) {
         New-ReviewerCohortEntryRefusal -Code 'CE715' `

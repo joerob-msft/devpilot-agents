@@ -859,7 +859,11 @@ function Invoke-CohortEntryCase {
         [Parameter(Mandatory)][scriptblock]$Mutate,
         # Builds WITHOUT the preparation-only acknowledgement, for the one case
         # that is about that acknowledgement being required.
-        [switch]$ClaimingCohortReady
+        [switch]$ClaimingCohortReady,
+        # A refusal that arrives AFTER the package was published has to take the
+        # package with it, or it leaves a sealed, read-only, seal-verifiable
+        # directory that a manifest could name and a cohort would accept.
+        [switch]$RequireOutputRootWithdrawn
     )
     $sandbox = New-CohortEntrySandbox -Name 'sabotage'
     try {
@@ -873,6 +877,10 @@ function Invoke-CohortEntryCase {
         # have run is a false refusal, not a stricter check.
         $label = if ($ExpectedCode) { "refuses $ExpectedCode" } else { 'is accepted' }
         Assert-CohortEntry -Name "$Name $label (observed '$observed')" -Condition ($observed -ceq $ExpectedCode)
+        if ($RequireOutputRootWithdrawn) {
+            $standing = @(Get-ChildItem -LiteralPath $fixture.OutputRoot -Force -ErrorAction SilentlyContinue)
+            Assert-CohortEntry -Name "$Name leaves no published package behind" -Condition ($standing.Count -eq 0)
+        }
     }
     finally { Remove-CohortEntrySandbox -Path $sandbox }
 }
@@ -2229,7 +2237,7 @@ Invoke-CohortEntryCase -ExpectedCode 'CE709' -Name 'a plan whose slot count is n
 }
 Invoke-CohortEntryCase -ExpectedCode 'CE710' -Name 'a per-call timeout that outlives the slot supervising it' `
     -Mutate (& $withPlan { param($p, $s) $p.timeouts.perCallTimeoutSeconds = 7200 })
-Invoke-CohortEntryCase -ExpectedCode 'CE715' -ClaimingCohortReady `
+Invoke-CohortEntryCase -ExpectedCode 'CE715' -ClaimingCohortReady -RequireOutputRootWithdrawn `
     -Name 'a slots-carrying build that declared no run set' -Mutate (& $withPlan { param($p, $s) })
 Invoke-CohortEntryCase -ExpectedCode 'CE716' -Name 'a slot naming its own launch authorization' `
     -Mutate (& $withPlan {
@@ -2591,8 +2599,13 @@ if ($IncludePreflight) {
                 $manifestPath = Join-Path $sandbox 'cohort-manifest.json'
                 $toolkitBlock = [ordered]@{
                     repositoryRoot = $RealToolkitRoot
-                    head = (& git -C $RealToolkitRoot rev-parse HEAD).Trim()
-                    requiredRef = 'refs/heads/main'
+                    head = [string]$coordinatorRequest.toolkit.head
+                    # The ref and head THIS entry pins, not names a checkout might
+                    # not be standing on. A cohort that disagrees with its entry
+                    # about either is refused before it looks at anything else -
+                    # which is a real check, and not the one any assertion here is
+                    # about.
+                    requiredRef = [string]$coordinatorRequest.qualification.requiredRef
                 }
                 # Taken FROM the entry: the entry's plan estimate is what a real
                 # review of this subject would consume, and a manifest whose
@@ -2683,7 +2696,15 @@ if ($IncludePreflight) {
                     Write-CohortEntryJsonFile -Path $walkPath -Value $walkManifest
                     $previous = $PSNativeCommandUseErrorActionPreference
                     $PSNativeCommandUseErrorActionPreference = $false
-                    try { return (& dotnet $cohortDll --cohort $walkPath --authorized-by 'cohort-entry-test' 2>&1 | Out-String) }
+                    try {
+                        $text = (& dotnet $cohortDll --cohort $walkPath --authorized-by 'cohort-entry-test' 2>&1 | Out-String)
+                        # The exit code is what separates a pre-walk refusal from a
+                        # walk that reached its entry. Output alone cannot: the
+                        # runner prints its banner before either happens.
+                        $script:WalkExitCode = $LASTEXITCODE
+                        [IO.File]::WriteAllText((Join-Path $sandbox "walk-output-$Name.txt"), "exit=$script:WalkExitCode`n$text")
+                        return $text
+                    }
                     finally { $PSNativeCommandUseErrorActionPreference = $previous }
                 }
 
@@ -2715,12 +2736,26 @@ if ($IncludePreflight) {
                     # preparation-only shape, because this one must not.
                     Assert-CohortEntry -Name "${Label}: a cohort refuses an entry whose launch authorization was never published" `
                         -Condition ($walkAccepted -match 'with its slots authorized by')
+                    # The refusal has to arrive before the entry is started, not
+                    # after. Two independent witnesses, because the runner's
+                    # startup banner is printed either way and proves nothing: the
+                    # per-entry line the walk writes when it begins an attempt is
+                    # absent, and the run ended non-zero without publishing an
+                    # index for the entry to be recorded in.
                     Assert-CohortEntry -Name "${Label}: that refusal happens before any entry starts" `
-                        -Condition ($walkAccepted -notmatch 'shadow-cohort-runner-entry-start')
+                        -Condition ($walkAccepted -notmatch 'attempt 1 subject=')
+                    Assert-CohortEntry -Name "${Label}: the refused walk ends non-zero" `
+                        -Condition ($script:WalkExitCode -ne 0)
                 }
                 else {
-                    Assert-CohortEntry -Name "${Label}: the cohort walked past the bound check and reached its entry" `
-                        -Condition ($walkAccepted -match 'shadow-cohort-runner')
+                    # A v1 entry authorizes no launch, so the cohort refuses it for
+                    # having no slots - which is a refusal from PAST both pre-walk
+                    # gates. Asserting that exact refusal is what proves the bound
+                    # check and the authorization check both admitted it; asserting
+                    # the runner's startup banner would prove nothing, because the
+                    # banner is printed before either gate runs.
+                    Assert-CohortEntry -Name "${Label}: the cohort walked past the bound and authorization checks" `
+                        -Condition ($walkAccepted -match "carries no 'slots' section")
                 }
 
                 if ($WithExecutionPlan) {
@@ -2856,8 +2891,8 @@ if ($IncludePreflight) {
                 correlationId = [string]$readyEmitted.correlationId
                 toolkit = [ordered]@{
                     repositoryRoot = $realToolkit
-                    head = (& git -C $realToolkit rev-parse HEAD).Trim()
-                    requiredRef = 'refs/heads/main'
+                    head = [string]$readyEmitted.toolkit.head
+                    requiredRef = [string]$readyEmitted.qualification.requiredRef
                 }
                 execution = [ordered]@{
                     concurrency = 1
@@ -2883,16 +2918,26 @@ if ($IncludePreflight) {
             Write-CohortEntryJsonFile -Path $readyManifestPath -Value $readyManifest
             $previousReady = $PSNativeCommandUseErrorActionPreference
             $PSNativeCommandUseErrorActionPreference = $false
+            $readyExit = 0
             try {
                 $readyWalk = (& dotnet $readyDll --cohort $readyManifestPath --authorized-by 'cohort-entry-test' 2>&1 | Out-String)
+                $readyExit = $LASTEXITCODE
             }
             finally { $PSNativeCommandUseErrorActionPreference = $previousReady }
+            Write-Verbose "ready walk exit=$readyExit`n$readyWalk"
+            [IO.File]::WriteAllText((Join-Path $readySandbox 'ready-walk-output.txt'), "exit=$readyExit`n$readyWalk")
             Assert-CohortEntry -Name 'the cohort accepts a builder-produced entry that declared its own run set' `
                 -Condition ($readyWalk -notmatch 'with its slots authorized by|not the 64 lowercase hex')
+            # NOT the startup banner: that is printed before the pre-walk pass runs
+            # and so is printed by a refusal too. The per-entry attempt line is
+            # written only from inside the entry loop, which is past every
+            # pre-walk check.
             Assert-CohortEntry -Name 'the cohort walked past every pre-walk check and started the entry' `
-                -Condition ($readyWalk -match 'shadow-cohort-runner')
+                -Condition ($readyWalk -match "attempt 1 subject=")
+            Assert-CohortEntry -Name 'the cohort recorded that entry in its journal' `
+                -Condition (@(Get-ChildItem -LiteralPath (Join-Path $readySandbox 'ready-journal') -Recurse -File -ErrorAction SilentlyContinue).Count -gt 0)
             Assert-CohortEntry -Name 'the cohort walk started no model' `
-                -Condition ($readyWalk -notmatch 'realModelStart(s|Count)=[1-9]')
+                -Condition ($readyWalk -match 'modelStarts=0' -and $readyWalk -notmatch 'modelStarts=[1-9]')
         }
     }
     finally { if (-not $KeepSandbox) { Remove-CohortEntrySandbox -Path $readySandbox } else { Write-Host "sandbox kept: $readySandbox" } }

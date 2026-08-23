@@ -1884,6 +1884,16 @@ internal sealed class CohortRunner(CohortManifest manifest, string operatorAlias
     /// every fresh entry. What this catches is the other case - a preparation
     /// that is past that point, so its authorization exists somewhere, and the
     /// path its request names is not where.
+    ///
+    /// The state record is read here for that one fact and is NOT authenticated
+    /// here: this pass holds no coordinator key, and the key for a foreign entry
+    /// stands in that entry's own root. Nothing rests on it. A record that
+    /// understates its state - truncated, stale, or edited to slip past this pass
+    /// - buys nothing, because the very next thing the entry does is run its
+    /// coordinator, which loads the same record under its signing key and refuses
+    /// a signature, correlation or request digest that does not match. This pass
+    /// brings the refusal EARLIER for the honest case; it is not the thing that
+    /// makes forgery unprofitable.
     /// </remarks>
     private void RequireDeclaredLaunchAuthorizations()
     {
